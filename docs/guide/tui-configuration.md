@@ -4,16 +4,18 @@
 
 ## 初始化
 
-默认配置路径是 `$LUCIA_HOME/config.toml`。未设置 `LUCIA_HOME` 时使用 `$HOME/.lucia/config.toml`：
+安装后直接运行：
 
 ```bash
-bun run init:tui
+lucia
 ```
 
-也可以初始化指定文件：
+首次启动会自动创建默认配置。默认配置路径是 `$LUCIA_HOME/config.toml`，未设置 `LUCIA_HOME` 时使用 `$HOME/.lucia/config.toml`。未检测到模型密钥时，TUI 会进入本地演示模式，并在主事件区显示配置提示。
+
+也可以显式初始化指定文件后退出：
 
 ```bash
-cargo run -p lucia -- --config ./lucia.toml --init
+lucia --config ./lucia.toml --init
 ```
 
 初始化使用原子排他创建，不会覆盖已有文件。模板通过 `OPENAI_API_KEY` 环境变量读取密钥；运行前需要确认 `model.model` 是账号可用的模型 ID。

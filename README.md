@@ -207,20 +207,24 @@ bun run docs:build
 
 ## TUI 配置与会话
 
-首次运行先初始化用户配置：
+在仓库中安装一次纯 Core 版命令：
 
 ```bash
-bun run init:tui
+bun run install:tui
 ```
 
-默认写入 `$HOME/.lucia/config.toml`，且不会覆盖已有文件。设置模板引用的 API key 环境变量并确认模型 ID 后，直接运行 `lucia` 即可自动读取配置。`LUCIA_HOME`、`LUCIA_CONFIG` 和 `--config` 可以覆盖默认位置。
+之后直接运行 `lucia`。首次启动会自动创建 `$HOME/.lucia/config.toml`；未设置模型密钥时进入本地演示模式，并在主事件区提示配置方式。设置模板引用的 API key 环境变量并确认模型 ID 后，再次运行 `lucia` 即连接真实模型。`LUCIA_HOME`、`LUCIA_CONFIG` 和 `--config` 可以覆盖默认位置。
+
+```bash
+lucia
+lucia --resume-latest
+lucia --session-id design-review
+```
 
 会话默认保存在 `$HOME/.lucia/sessions`。TUI 会自动恢复配置中的默认 Session，并把用户、助手和工具历史重新显示在主事件列表：
 
 ```bash
 lucia --list-sessions
-lucia --session-id design-review
-lucia --resume-latest
 ```
 
 配置字段、路径优先级和 CAS 行为见 [TUI 配置与会话](docs/guide/tui-configuration.md)。

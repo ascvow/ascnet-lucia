@@ -58,25 +58,19 @@ bun run build:plugin-manager
 
 ## 本地安装
 
-安装纯 Core 版本：
+使用 Bun 管理安装脚本。默认安装纯 Core 版本：
 
 ```bash
-cargo install \
-  --path crates/ascnet-lucia-tui \
-  --locked \
-  --no-default-features
+bun run install:tui
 ```
 
 安装插件版本：
 
 ```bash
-cargo install \
-  --path crates/ascnet-lucia-tui \
-  --locked \
-  --features plugins
+bun run install:tui:plugins
 ```
 
-两个版本的命令名均为 `lucia`，因此同一 Cargo bin 目录内后安装的版本会覆盖前一个。分发两个压缩包时应使用独立 `--target-dir` 构建，并在归档名称中区分 `lucia-core` 与 `lucia-plugins`。
+安装后日常使用不依赖 Bun、Cargo 或仓库路径，直接运行 `lucia`，参数也直接附加到该命令。两个版本的命令名均为 `lucia`，因此同一 Cargo bin 目录内后安装的版本会覆盖前一个。分发两个压缩包时应使用独立 `--target-dir` 构建，并在归档名称中区分 `lucia-core` 与 `lucia-plugins`。
 
 ## 验证边界
 

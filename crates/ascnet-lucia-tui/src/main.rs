@@ -1834,9 +1834,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let config_exists = config_path.is_file();
+    let mut config_exists = config_path.is_file();
     if args.config.is_some() && !config_exists {
         return Err(anyhow!("配置文件不存在：{}", config_path.display()));
+    }
+    let auto_initialized = !config_exists && !args.demo && !args.list_sessions;
+    if auto_initialized {
+        initialize_config(&config_path)?;
+        config_exists = true;
     }
     let tui_settings = if config_exists {
         load_tui_settings(&config_path)?
@@ -1879,20 +1884,50 @@ async fn main() -> Result<()> {
         capability_selection.extend(plugin_runtime.capability_selection);
     }
 
-    let (gateway, options) = if args.demo {
-        build_demo_gateway()
+    let (gateway, options, demo_mode, mut startup_notices) = if args.demo {
+        let (gateway, options) = build_demo_gateway();
+        (
+            gateway,
+            options,
+            true,
+            vec!["当前使用本地演示模型，不会连接外部模型服务".to_string()],
+        )
     } else if config_exists {
         let config = LuciaConfig::load(&config_path)?;
-        (config.build_gateway()?, config.agent_options())
+        if configured_model_key_is_available(&config) {
+            (
+                config.build_gateway()?,
+                config.agent_options(),
+                false,
+                Vec::new(),
+            )
+        } else {
+            let key_hint = config
+                .model
+                .api_key_env
+                .as_deref()
+                .map(|name| format!("设置环境变量 {name}"))
+                .unwrap_or_else(|| "在配置中设置 model.api_key_env".to_string());
+            let (gateway, options) = build_demo_gateway();
+            (
+                gateway,
+                options,
+                true,
+                vec![format!(
+                    "未检测到模型密钥，当前使用本地演示模型；{key_hint} 后重新运行 lucia"
+                )],
+            )
+        }
     } else {
-        return Err(anyhow!(
-            "未找到 Lucia 配置：{}；请先运行 `lucia --init`，或传入 --demo",
-            config_path.display()
-        ));
+        let (gateway, options) = build_demo_gateway();
+        (gateway, options, true, Vec::new())
     };
+    if auto_initialized {
+        startup_notices.insert(0, format!("已创建默认配置：{}", config_path.display()));
+    }
 
     let mut native_tools = ToolRegistry::new();
-    if args.demo {
+    if demo_mode {
         native_tools.register(JsonTool::new(echo_spec(), |args| async move {
             let text = args
                 .get("text")
@@ -1959,6 +1994,11 @@ async fn main() -> Result<()> {
     });
 
     let mut app = App::new(tx, model_name).with_persistent_session(session_store, session_record);
+    app.messages.extend(
+        startup_notices
+            .into_iter()
+            .map(|notice| Msg::new(MsgKind::Info, notice)),
+    );
     #[cfg(feature = "plugins")]
     {
         app = app.with_plugin_views(plugin_views);
@@ -2120,6 +2160,24 @@ async fn main() -> Result<()> {
 
 // ─── Demo 模型 ───
 
+/// 判断配置中的模型密钥是否可以用于本次启动。
+///
+/// 明文密钥和环境变量任一包含非空值即视为可用；该检查不会读取或记录密钥内容。
+fn configured_model_key_is_available(config: &LuciaConfig) -> bool {
+    config
+        .model
+        .api_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || config
+            .model
+            .api_key_env
+            .as_deref()
+            .and_then(std::env::var_os)
+            .is_some_and(|value| !value.is_empty())
+}
+
+/// 构建无需外部模型服务的确定性演示运行时。
 fn build_demo_gateway() -> (ModelGateway, AgentOptions) {
     let mut gateway = ModelGateway::new();
     gateway
@@ -2247,6 +2305,32 @@ mod tests {
         assert!(text.contains("MessageLucia..."), "{text:?}");
         assert!(!text.contains("agentruntime"), "{text:?}");
         assert!(!text.contains("ReAct"), "{text:?}");
+    }
+
+    /// 验证空模型密钥触发演示模式，而非空明文密钥允许构建真实模型运行时。
+    #[test]
+    fn model_key_availability_rejects_empty_values() {
+        let without_key: LuciaConfig = toml::from_str(
+            r#"
+                [model]
+                provider = "open-ai"
+                model = "test-model"
+                api_key = "   "
+            "#,
+        )
+        .expect("解析无密钥测试配置");
+        assert!(!configured_model_key_is_available(&without_key));
+
+        let with_key: LuciaConfig = toml::from_str(
+            r#"
+                [model]
+                provider = "open-ai"
+                model = "test-model"
+                api_key = "test-key"
+            "#,
+        )
+        .expect("解析有密钥测试配置");
+        assert!(configured_model_key_is_available(&with_key));
     }
 
     /// 验证运行状态使用 steering 文案，并在窄终端隐藏目录信息。
