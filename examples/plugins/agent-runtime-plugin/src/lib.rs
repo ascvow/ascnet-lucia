@@ -3,11 +3,11 @@
 //! 插件只负责把模型工具调用映射到类型化 [`PluginHostApi`]；模型、服务商配置、
 //! Agent 权限和运行资源始终由 Host 注册的 profile 决定。
 
-use anyhow::{anyhow, Context};
 use agent_plugin::{
-    export_plugin, AgentContinueRequest, AgentId, AgentMessageRequest, AgentSpawnRequest,
-    AgentPlugin, PluginHostApi, Result, ToolCall, ToolResult, ToolSpec,
+    export_plugin, AgentContinueRequest, AgentId, AgentPlugin, AgentSpawnRequest, PluginHostApi,
+    Result, ToolCall, ToolResult, ToolSpec,
 };
+use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
 
 /// manifest 允许该插件请求的唯一 Agent 派生策略。
@@ -74,40 +74,12 @@ impl AgentPlugin for AgentRuntimePlugin {
                 "agent_runtime_cancel",
                 "级联取消 controller 的指定后代任务，并返回本次是否执行了取消。",
             ),
-            ToolSpec::new(
-                "agent_runtime_send",
-                "以当前 controller 的可信身份向同一 owner、同一派生树内的 Agent 发送结构化消息。",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "recipient": {
-                            "type": "string",
-                            "description": "接收者 Agent ID。",
-                            "minLength": 1
-                        },
-                        "topic": {
-                            "type": "string",
-                            "description": "由插件协议解释的非空消息主题。",
-                            "minLength": 1
-                        },
-                        "payload": {
-                            "description": "由插件协议解释的任意 JSON 载荷。"
-                        }
-                    },
-                    "required": ["recipient", "topic"],
-                    "additionalProperties": false
-                }),
-            ),
-            empty_tool(
-                "agent_runtime_receive",
-                "非阻塞读取 controller 邮箱中的下一条消息；空邮箱立即返回 available=false。",
-            ),
         ]
     }
 
     /// 使用类型化 Host API 执行短控制面操作。
     ///
-    /// 该入口不会在 Guest 内等待后台 Agent 完成；派生、观察和收信均为单次调用。
+    /// 该入口不会在 Guest 内等待后台 Agent 完成；派生、继续和观察均为单次调用。
     fn call_tool_with_host(
         &mut self,
         host: &dyn PluginHostApi,
@@ -165,27 +137,6 @@ impl AgentPlugin for AgentRuntimePlugin {
                 let target = target_id(&call.args)?;
                 let cancelled = host.cancel_agent(&target)?;
                 success(call, json!({ "cancelled": cancelled }))
-            }
-            "agent_runtime_send" => {
-                let recipient = AgentId::parse(required_string(&call.args, "recipient")?)?;
-                let topic = required_string(&call.args, "topic")?.to_string();
-                let payload = call.args.get("payload").cloned().unwrap_or(Value::Null);
-                let message_id = host.send_agent_message(&AgentMessageRequest {
-                    recipient,
-                    topic,
-                    payload,
-                })?;
-                success(call, json!({ "message_id": message_id }))
-            }
-            "agent_runtime_receive" => {
-                let message = host.try_receive_agent_message()?;
-                success(
-                    call,
-                    json!({
-                        "available": message.is_some(),
-                        "message": message
-                    }),
-                )
             }
             _ => Ok(ToolResult::error(
                 call.id,

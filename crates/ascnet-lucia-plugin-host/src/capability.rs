@@ -6,9 +6,7 @@ use crate::{
     service::{PluginService, PluginServiceCall, ServiceRegistry},
     AgentRuntimeHostServices,
 };
-use agent_runtime::{
-    AgentId, AgentMessageRequest, AgentRuntimeApi, AgentSpawnRequest, RuntimePrincipal,
-};
+use agent_runtime::{AgentId, AgentRuntimeApi, AgentSpawnRequest, RuntimePrincipal};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -179,15 +177,6 @@ struct AgentTargetRequest {
     target: String,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GuestAgentMessageRequest {
-    recipient: String,
-    topic: String,
-    #[serde(default)]
-    payload: Value,
-}
-
 impl CapabilityState {
     /// 创建绑定到插件目录和 manifest 权限的能力状态。
     pub(crate) fn new(
@@ -317,43 +306,6 @@ impl CapabilityState {
                     .await
                     .map_err(|error| anyhow!(error.to_string()))?;
                 Ok(json!(cancelled))
-            }
-            "send" => {
-                permissions.require_message()?;
-                let request: GuestAgentMessageRequest =
-                    serde_json::from_value(request.request).context("解析 Agent 消息请求失败")?;
-                let recipient =
-                    AgentId::from_str(&request.recipient).context("Agent 消息接收者 ID 无效")?;
-                let id = binding
-                    .api
-                    .send(AgentMessageRequest {
-                        recipient,
-                        topic: request.topic,
-                        payload: request.payload,
-                    })
-                    .await
-                    .map_err(|error| anyhow!(error.to_string()))?;
-                Ok(json!(id.to_string()))
-            }
-            "try_receive" => {
-                require_empty_agent_request(&request.request)?;
-                permissions.require_message()?;
-                let message = binding
-                    .api
-                    .try_receive()
-                    .await
-                    .map_err(|error| anyhow!(error.to_string()))?;
-                Ok(match message {
-                    Some(message) => json!({
-                        "id": message.id.to_string(),
-                        "sender": message.sender,
-                        "recipient": message.recipient,
-                        "topic": message.topic,
-                        "payload": message.payload,
-                        "sent_at_ms": message.sent_at_ms,
-                    }),
-                    None => Value::Null,
-                })
             }
             operation => Err(anyhow!("未知 Agent Runtime 操作：`{operation}`")),
         }
@@ -690,14 +642,13 @@ impl AgentRuntimeBinding {
 trait AgentCapabilityChecks {
     fn require_any(&self) -> Result<()>;
     fn require_spawn(&self) -> Result<()>;
-    fn require_message(&self) -> Result<()>;
     fn require_observe(&self) -> Result<()>;
     fn require_cancel(&self) -> Result<()>;
 }
 
 impl AgentCapabilityChecks for AgentCapabilitySection {
     fn require_any(&self) -> Result<()> {
-        if self.spawn || self.message || self.observe || self.cancel {
+        if self.spawn || self.observe || self.cancel {
             Ok(())
         } else {
             Err(anyhow!("插件 manifest 未声明 Agent Runtime 能力"))
@@ -709,14 +660,6 @@ impl AgentCapabilityChecks for AgentCapabilitySection {
             Ok(())
         } else {
             Err(anyhow!("插件 manifest 未声明 capabilities.agent.spawn"))
-        }
-    }
-
-    fn require_message(&self) -> Result<()> {
-        if self.message {
-            Ok(())
-        } else {
-            Err(anyhow!("插件 manifest 未声明 capabilities.agent.message"))
         }
     }
 
@@ -798,12 +741,11 @@ fn validate_state_key(key: &str) -> Result<()> {
 mod tests {
     use super::*;
     use agent_runtime::{
-        AgentDeriveConfig, AgentHandle, AgentLineage, AgentMessage, AgentOutcome, AgentPermissions,
+        AgentDeriveConfig, AgentHandle, AgentLineage, AgentOutcome, AgentPermissions,
         AgentProfileId, AgentRuntimeError, AgentRuntimeProvisioner, AgentSnapshot, AgentStatus,
         ProvisionedAgentRuntime, RuntimeResult,
     };
     use async_trait::async_trait;
-    use uuid::Uuid;
 
     struct MockAgentRuntime {
         principal: RuntimePrincipal,
@@ -870,26 +812,6 @@ mod tests {
 
         async fn cancel(&self, _target: &AgentId) -> RuntimeResult<bool> {
             Ok(true)
-        }
-
-        async fn send(&self, _request: AgentMessageRequest) -> RuntimeResult<Uuid> {
-            Ok(Uuid::nil())
-        }
-
-        async fn try_receive(&self) -> RuntimeResult<Option<AgentMessage>> {
-            Ok(Some(AgentMessage {
-                id: Uuid::nil(),
-                sender: self.child.clone(),
-                sender_principal: self.principal.clone(),
-                recipient: self.controller.clone(),
-                topic: "task.done".into(),
-                payload: json!({"ok": true}),
-                sent_at_ms: 1,
-            }))
-        }
-
-        async fn receive(&self) -> RuntimeResult<AgentMessage> {
-            panic!("WASM dispatcher 不得调用长期等待式 receive")
         }
     }
 
@@ -958,7 +880,6 @@ mod tests {
         (
             AgentCapabilitySection {
                 spawn: true,
-                message: true,
                 observe: true,
                 cancel: true,
                 profiles: vec!["reviewer".into()],
@@ -1079,15 +1000,18 @@ mod tests {
         assert_eq!(status["status"], "running");
         assert!(status.get("owner").is_none());
 
-        let received = CapabilityState::call_agent_runtime_with(
+        let cancelled = CapabilityState::call_agent_runtime_with(
             permissions,
             Some(binding),
-            r#"{"operation":"try_receive"}"#,
+            &json!({
+                "operation": "cancel",
+                "request": {"target": child.to_string()},
+            })
+            .to_string(),
         )
         .await
-        .expect("非阻塞读取消息");
-        assert_eq!(received["topic"], "task.done");
-        assert!(received.get("sender_principal").is_none());
+        .expect("取消派生 Agent");
+        assert_eq!(cancelled, json!(true));
     }
 
     /// Manifest 未授权的 profile 必须在调用 Runtime 前被 Host 拒绝。

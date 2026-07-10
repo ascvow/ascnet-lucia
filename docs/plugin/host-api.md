@@ -88,12 +88,10 @@ host.kill_process(handle)?;
 | `agent_status(target)` | 查询 controller 或其后代的状态、谱系和有效权限 |
 | `agent_result(target)` | 非阻塞读取终态结果；未完成时返回 `None` |
 | `cancel_agent(target)` | 幂等、级联取消指定后代 |
-| `send_agent_message(request)` | 以可信 controller 身份发送结构化消息 |
-| `try_receive_agent_message()` | 非阻塞读取 controller 邮箱 |
 
 Guest 的 `AgentSpawnRequest` 只包含 profile 名称和任务输入；`AgentContinueRequest` 只包含目标 ID 和新增输入。模型、provider、工具权限与派生参数由应用注册的 profile 或目标运行决定，插件不能提交 owner、parent、sender、原始 Session、API key 或 provider options。
 
-WASM Host API 不开放阻塞式 `wait` 和 `receive`。插件应保存 `AgentHandle`，在后续工具调用或 UI 帧中查询状态和结果，避免同步 component 调用长期占用 store。完整模型见 [Agent Runtime](/agent/agent-runtime)，可运行插件见 `examples/plugins/agent-runtime-plugin`。
+WASM Host API 不开放阻塞式 `wait`。插件应保存 `AgentHandle`，在后续工具调用或 UI 帧中查询状态和结果，避免同步 component 调用长期占用 store。teammate 邮箱由插件通过自身状态、持久 KV 或版本化 service 实现，不属于 Agent Runtime API。完整模型见 [Agent Runtime](/agent/agent-runtime)，可运行插件见 `examples/plugins/agent-runtime-plugin`。
 
 ## 错误信封
 

@@ -6,9 +6,7 @@
 - 使用 Host 注册并授权的 `worker` profile 派生 Agent；
 - 从成功终态 Agent 的私有会话创建后续运行；
 - 查询派生 Agent 的状态和终态结果；
-- 级联取消派生任务；
-- 以 controller 的可信身份发送消息；
-- 非阻塞读取 controller 邮箱。
+- 级联取消派生任务。
 
 ## 构建
 
@@ -33,8 +31,6 @@ target/wasm32-wasip2/release/agent_runtime_plugin.wasm
 
 WASM Guest 的工具入口是同步接口，插件内禁止循环阻塞等待 Agent 完成。长时间等待会占用组件实例和 Host 调用线程，也会放大并发任务的排队延迟。轮询频率与超时策略应由 Agent、workflow 或上层应用决定。
 
-`agent_runtime_receive` 同样是非阻塞读取：空邮箱会返回 `available = false`。插件不在同步调用中等待新消息。
-
 ## 工具
 
 - `agent_runtime_identity`：返回 controller Agent ID。
@@ -43,7 +39,13 @@ WASM Guest 的工具入口是同步接口，插件内禁止循环阻塞等待 Ag
 - `agent_runtime_status`：查询 controller 或其后代的状态与权限快照。
 - `agent_runtime_result`：读取幂等终态结果；未完成时返回 `completed = false`。
 - `agent_runtime_cancel`：级联取消指定后代任务。
-- `agent_runtime_send`：向同一 owner、同一派生树内的 Agent 发送结构化消息。
-- `agent_runtime_receive`：非阻塞读取 controller 邮箱中的下一条消息。
 
-本示例暂不包含 smoke test。待应用侧 Agent Runtime loader 配置 API 稳定后，再补充加载真实 WASM 组件、注册 `worker` profile 和验证完整调用链的测试。
+本插件只展示 Agent Runtime 控制面，不实现 teammate 邮箱。teammate 插件应自行定义消息结构、队列、投递、重试和消息注入上下文的规则，并可通过通用插件 service 对外暴露这些能力。
+
+运行真实 WASM 端到端测试：
+
+```bash
+bun run test:plugin:agent-runtime
+```
+
+测试会注入离线固定模型和 Runtime，加载真实 component，并验证 spawn、result、continue 与卸载撤销链路，不访问外部网络。

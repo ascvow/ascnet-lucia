@@ -8,7 +8,6 @@ description = "通过受限宿主 API 展示 Agent 派生、观察、取消和�
 
 [capabilities.agent]
 spawn = true
-message = true
 observe = true
 cancel = true
 profiles = ["worker"]

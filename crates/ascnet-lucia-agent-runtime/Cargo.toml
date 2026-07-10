@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Lucia 的通用 Agent 派生、生命周期与可信通信运行时。"
+description = "Lucia 的通用 Agent 派生、私有会话续跑与生命周期运行时。"
 
 [dependencies]
 anyhow.workspace = true

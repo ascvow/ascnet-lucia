@@ -32,9 +32,9 @@ ABI 使用 JSON 字符串承载 serde 类型。完整源文件位于 `wit/plugin
 | `host-process-kill` | `kill_process` |
 | `host-agent-runtime-call` | Agent Runtime 的类型化短控制面方法 |
 
-`host-agent-runtime-call` 使用一个带 `operation` 的 JSON 请求承载 `identity`、`spawn`、`status`、`result`、`cancel`、`send` 和 `try_receive`。Rust Guest SDK 将其封装为 `agent_identity`、`spawn_agent`、`agent_status`、`agent_result`、`cancel_agent`、`send_agent_message` 和 `try_receive_agent_message`，插件不需要手工拼接 operation。
+`host-agent-runtime-call` 使用一个带 `operation` 的 JSON 请求承载 `identity`、`spawn`、`continue`、`status`、`result` 和 `cancel`。Rust Guest SDK 将其封装为 `agent_identity`、`spawn_agent`、`continue_agent`、`agent_status`、`agent_result` 和 `cancel_agent`，插件不需要手工拼接 operation。
 
-该 import 不提供阻塞式 wait 或 receive。派生任务立即返回 handle，插件随后轮询状态或结果，避免在同步 component 调用期间占用 WASM store 锁。
+该 import 不提供阻塞式 wait。派生与续跑立即返回 handle，插件随后轮询状态或结果，避免在同步 component 调用期间占用 WASM store 锁。teammate 邮箱不是 WIT Agent Runtime 的一部分。
 
 ## Guest exports
 

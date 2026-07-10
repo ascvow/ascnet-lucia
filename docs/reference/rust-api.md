@@ -41,10 +41,10 @@
 | --- | --- |
 | `AgentTemplate`、`AgentDeriveConfig` | 从 Core Agent 派生独立实例 |
 | `AgentPermissions`、`ToolAccess` | 只能收缩的工具权限 |
-| `AgentRuntimeApi` | spawn/continue_agent/status/result/wait/cancel/send/receive |
+| `AgentRuntimeApi` | spawn/continue_agent/status/result/wait/cancel |
 | `AgentRuntimeProvisioner` | controller profile 的 grant/provision/revoke |
 | `AgentId`、`AgentLineage`、`RuntimePrincipal` | 可信身份、父子谱系和 owner |
-| `RuntimeLimits` | 深度、子节点、并发、邮箱与消息上限 |
+| `RuntimeLimits` | 深度、子节点与模型运行并发上限 |
 
 ## agent-plugin-host
 

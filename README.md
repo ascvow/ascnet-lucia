@@ -28,7 +28,7 @@ agent-session
 
 agent-runtime
   Agent derivation and lifecycle / Agent 派生与生命周期
-  Permission narrowing and bounded messaging / 权限收缩与有界消息
+  Permission narrowing and private session continuation / 权限收缩与私有会话续跑
 
 agent-plugin
   Guest SDK / 插件侧 SDK
@@ -178,7 +178,7 @@ ABI 故意使用 JSON 字符串。这样 WIT 边界保持稳定，同时 Rust �
 
 通用 stdio MCP 实现位于 [`examples/plugins/mcp-plugin`](examples/plugins/mcp-plugin/README.md)。MCP 配置扫描、JSON-RPC 初始化、工具解析和 `tools/call` 都由该插件完成；Plugin Host 只提供受控文件读取、子进程 stdio、动态工具注册和 owner 路由，不理解 MCP 或 MasterGo 协议。
 
-受限 Agent 派生与通信示例见 [`examples/plugins/agent-runtime-plugin`](examples/plugins/agent-runtime-plugin/README.md)。Host 只提供 profile 授权、生命周期、状态、结果、取消和可信消息，sub-agent、workflow、multi-agent 与 teammate 的角色和协议由插件定义。
+受限 Agent 派生与续跑示例见 [`examples/plugins/agent-runtime-plugin`](examples/plugins/agent-runtime-plugin/README.md)。Host 只提供 profile 授权、生命周期、状态、结果和取消；sub-agent、workflow、multi-agent 与 teammate 的角色、邮箱和消息协议由插件定义。
 
 上下文完整替换链路见 [`examples/plugins/context-replacement-plugin`](examples/plugins/context-replacement-plugin/README.md)。该测试插件声明独占的 `agent.context-loader` 能力，模型只会收到插件返回的摘要；真实压缩策略仍由插件作者实现。
 

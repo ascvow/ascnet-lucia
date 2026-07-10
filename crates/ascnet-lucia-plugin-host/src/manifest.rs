@@ -291,7 +291,6 @@ manifest = "/opt/lucia/plugin.toml"
 
                 [capabilities.agent]
                 spawn = true
-                message = true
                 observe = true
                 cancel = true
                 profiles = ["reviewer", "coder"]
@@ -715,9 +714,6 @@ pub struct AgentCapabilitySection {
     /// 允许读取当前 controller 身份并启动派生 Agent。
     #[serde(default)]
     pub spawn: bool,
-    /// 允许以 controller 身份发送和非阻塞接收消息。
-    #[serde(default)]
-    pub message: bool,
     /// 允许查询 controller 及其后代的状态和终态结果。
     #[serde(default)]
     pub observe: bool,
@@ -732,7 +728,7 @@ pub struct AgentCapabilitySection {
 impl AgentCapabilitySection {
     /// 判断插件是否请求了任何 Agent Runtime 权限。
     pub fn is_requested(&self) -> bool {
-        self.spawn || self.message || self.observe || self.cancel || !self.profiles.is_empty()
+        self.spawn || self.observe || self.cancel || !self.profiles.is_empty()
     }
 
     /// 判断 manifest 是否允许指定 spawn profile。

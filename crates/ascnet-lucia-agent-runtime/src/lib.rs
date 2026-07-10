@@ -705,7 +705,6 @@ pub trait AgentRuntimeApi: Send + Sync {
     /// 目标及其全部后代会级联取消。至少一个节点首次进入取消状态时返回 `true`；
     /// 重复取消且没有新增变化时返回 `false`。
     async fn cancel(&self, target: &AgentId) -> RuntimeResult<bool>;
-
 }
 
 /// Host provisioner 创建的独立 controller 与身份绑定 API。
@@ -1172,7 +1171,6 @@ impl AgentRuntime {
         }
         Ok(changed)
     }
-
 }
 
 /// 身份绑定 API 的私有实现，阻止调用方自行填写发送者或父节点。
@@ -1227,7 +1225,6 @@ impl AgentRuntimeApi for BoundAgentRuntime {
             .cancel_for(&self.principal, &self.identity, target)
             .await
     }
-
 }
 
 #[async_trait]
@@ -1571,14 +1568,6 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// 返回当前 Unix 毫秒时间戳；系统时间早于 epoch 时退化为零。
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1807,86 +1796,6 @@ mod tests {
             error,
             AgentRuntimeError::MaxDepthExceeded { limit: 1 }
         ));
-    }
-
-    /// 消息发送者必须来自绑定身份，且邮箱满时应立即返回错误。
-    #[tokio::test]
-    async fn mailbox_injects_trusted_sender_and_enforces_capacity() {
-        let limits = RuntimeLimits {
-            mailbox_capacity: 1,
-            ..RuntimeLimits::default()
-        };
-        let runtime = AgentRuntime::new(limits).expect("创建 Runtime");
-        let entered = Arc::new(AtomicBool::new(false));
-        let root = runtime
-            .attach_root(
-                template(
-                    Arc::new(BlockingModel {
-                        entered,
-                        release: Arc::new(Notify::new()),
-                    }),
-                    "blocking",
-                    &[],
-                ),
-                AgentPermissions::default(),
-            )
-            .await
-            .expect("挂载发送者");
-        let sender_api = runtime.api(&root.id).await.expect("绑定发送者 API");
-        let child = sender_api
-            .spawn(AgentSpawnRequest::new("等待消息"))
-            .await
-            .expect("派生接收者");
-        let receiver_api = runtime.api(&child.id).await.expect("绑定接收者 API");
-
-        sender_api
-            .send(AgentMessageRequest {
-                recipient: child.id.clone(),
-                topic: "task.assigned".to_string(),
-                payload: json!({"task": 1}),
-            })
-            .await
-            .expect("第一条消息应成功");
-        let error = sender_api
-            .send(AgentMessageRequest {
-                recipient: child.id.clone(),
-                topic: "task.assigned".to_string(),
-                payload: json!({"task": 2}),
-            })
-            .await
-            .expect_err("满邮箱应拒绝消息");
-        assert_eq!(error, AgentRuntimeError::MailboxFull(child.id.clone()));
-
-        let message = receiver_api
-            .try_receive()
-            .await
-            .expect("读取邮箱")
-            .expect("应存在消息");
-        assert_eq!(message.sender, root.id);
-        assert_eq!(message.sender_principal, RuntimePrincipal::host());
-        assert_eq!(message.recipient, child.id);
-        assert_eq!(message.topic, "task.assigned");
-
-        let unrelated = runtime
-            .attach_root(
-                template(Arc::new(FixedModel), "fixed", &[]),
-                AgentPermissions::default(),
-            )
-            .await
-            .expect("挂载无关根节点");
-        let error = sender_api
-            .send(AgentMessageRequest {
-                recipient: unrelated.id.clone(),
-                topic: "cross-tree".to_string(),
-                payload: Value::Null,
-            })
-            .await
-            .expect_err("跨派生树消息应被拒绝");
-        assert!(matches!(
-            error,
-            AgentRuntimeError::CommunicationDenied { .. }
-        ));
-        assert!(sender_api.cancel(&child.id).await.expect("清理接收者"));
     }
 
     /// 全局并发限制必须让额外任务保持排队，且每个任务仍使用独立 Agent。

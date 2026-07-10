@@ -77,13 +77,12 @@ Host 不继承 WASI 环境变量、预打开目录或 stdio。需要 I/O 的插�
 spawn = true
 observe = true
 cancel = true
-message = true
 profiles = ["worker", "reviewer"]
 ```
 
-四个布尔字段分别控制派生、查询、取消和消息。声明 `spawn = true` 时必须至少配置一个 profile；未声明 spawn 时不能配置 profiles。Manifest 只描述插件请求的上限，应用还必须通过 `PluginHostServices` 注册同名 profile 并向当前 principal 授权，二者任一缺失都会拒绝加载或调用。
+三个布尔字段分别控制派生与续跑、查询和取消。声明 `spawn = true` 时必须至少配置一个 profile；未声明 spawn 时不能配置 profiles。Manifest 只描述插件请求的上限，应用还必须通过 `PluginHostServices` 注册同名 profile 并向当前 principal 授权，二者任一缺失都会拒绝加载或调用。
 
-每次插件激活使用唯一 principal。Host 注入 owner、controller 和消息 sender，并在激活失败或卸载时撤销该 principal 的全部 Agent Runtime 资源。旧 ABI 插件不能申请这组权限。
+每次插件激活使用唯一 principal。Host 注入 owner 和 controller，并在激活失败或卸载时撤销该 principal 的全部 Agent Runtime 资源。teammate 消息权限由 teammate 插件自己的 manifest、服务和配置定义。旧 ABI 插件不能申请 Agent Runtime 权限。
 
 ## 子进程安全
 

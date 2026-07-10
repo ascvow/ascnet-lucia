@@ -7,7 +7,7 @@
 | `agent-core` | Session、ContextLoader、ModelGateway、ReAct、工具调用、事件 | WASM、manifest、插件 UI、MCP、Skill |
 | `agent-tool` | ToolSpec、ToolCall、ToolResult、原生 ToolRegistry | Agent 循环、插件加载 |
 | `agent-session` | 版本化会话记录、CAS、内存与原子文件存储 | 模型配置、Agent 调度、插件状态 |
-| `agent-runtime` | Agent 派生、身份、生命周期、权限收缩、限额与消息 | workflow、multi-agent、teammate 的业务规则 |
+| `agent-runtime` | Agent 派生、身份、生命周期、私有会话续跑、权限收缩与限额 | workflow、multi-agent、teammate 的编排、邮箱与消息协议 |
 | `agent-plugin-host` | ABI、生命周期、权限、贡献注册、owner 路由、UI 协议 | 具体扩展协议和业务规则 |
 | `agent-plugin` | Guest SDK、WIT 绑定、导出宏 | component 加载、终端渲染 |
 | 独立插件 crate | MCP、Skill、压缩、业务集成 | 修改 Core 或 Host 语义 |

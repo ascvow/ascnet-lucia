@@ -59,7 +59,7 @@ control.clear_follow_ups();
 
 Steering 在当前工具完成后注入，并跳过本轮剩余工具。Follow-up 在当前任务正常结束后注入。
 
-需要稳定派生、父子生命周期、限额和 Agent 邮箱时，使用独立的 [Agent Runtime](/agent/agent-runtime)，不要把编排规则加入 Core。
+需要稳定派生、父子生命周期、私有会话续跑和限额时，使用独立的 [Agent Runtime](/agent/agent-runtime)。teammate 邮箱和编排规则由插件实现，不加入 Core 或 Runtime。
 
 ## 外部事件
 

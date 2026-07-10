@@ -691,36 +691,6 @@ pub struct AgentSnapshot {
     pub permissions: AgentPermissions,
 }
 
-/// 插件向同一 owner、同一派生树内的 Agent 发送消息的请求。
-///
-/// 请求不包含 sender 或 principal；Runtime 始终使用当前插件 controller 的可信身份。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AgentMessageRequest {
-    /// 接收者 Agent 身份。
-    pub recipient: AgentId,
-    /// 由插件协议解释的消息主题。
-    pub topic: String,
-    /// 由插件协议解释的结构化载荷。
-    pub payload: serde_json::Value,
-}
-
-/// Runtime 投递给当前插件 controller 的可信消息。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AgentMessage {
-    /// 消息唯一 ID。
-    pub id: String,
-    /// Runtime 注入的可信发送者 Agent 身份。
-    pub sender: AgentId,
-    /// 接收者 Agent 身份。
-    pub recipient: AgentId,
-    /// 由插件协议解释的消息主题。
-    pub topic: String,
-    /// 由插件协议解释的结构化载荷。
-    pub payload: serde_json::Value,
-    /// Runtime 接收消息时的 Unix 毫秒时间戳。
-    pub sent_at_ms: u64,
-}
-
 /// 插件可调用的协议无关宿主 API。
 pub trait PluginHostApi {
     /// 注册或替换工具，返回暴露给模型的公开工具名。
@@ -813,18 +783,6 @@ pub trait PluginHostApi {
 
     /// 级联取消当前 controller 的指定后代 Agent。
     fn cancel_agent(&self, _target: &AgentId) -> Result<bool> {
-        Err(anyhow!("宿主未提供 Agent Runtime API"))
-    }
-
-    /// 以当前 controller 的可信身份发送 Agent 消息，并返回消息 ID。
-    fn send_agent_message(&self, _request: &AgentMessageRequest) -> Result<String> {
-        Err(anyhow!("宿主未提供 Agent Runtime API"))
-    }
-
-    /// 非阻塞读取当前 controller 邮箱中的下一条消息。
-    ///
-    /// 空邮箱返回 `None`；长期等待式接收不会暴露给同步 WASM Guest。
-    fn try_receive_agent_message(&self) -> Result<Option<AgentMessage>> {
         Err(anyhow!("宿主未提供 Agent Runtime API"))
     }
 }
@@ -1263,29 +1221,6 @@ world plugin {
                     ))
                 }
 
-                fn send_agent_message(
-                    &self,
-                    message: &$crate::AgentMessageRequest,
-                ) -> $crate::Result<String> {
-                    let request = $crate::__serde_json::json!({
-                        "operation": "send",
-                        "request": message,
-                    });
-                    $crate::decode_host_response(&host_agent_runtime_call(
-                        &$crate::to_json_string(&request),
-                    ))
-                }
-
-                fn try_receive_agent_message(
-                    &self,
-                ) -> $crate::Result<Option<$crate::AgentMessage>> {
-                    let request = $crate::__serde_json::json!({
-                        "operation": "try_receive",
-                    });
-                    $crate::decode_host_response(&host_agent_runtime_call(
-                        &$crate::to_json_string(&request),
-                    ))
-                }
             }
 
             static PLUGIN: std::sync::OnceLock<std::sync::Mutex<$plugin_ty>> =

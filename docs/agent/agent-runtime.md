@@ -1,6 +1,6 @@
 # Agent Runtime
 
-`agent-runtime` 是 Core 之上的机制层。Core 仍只运行单个 ReAct Agent；Runtime 负责安全派生、生命周期、限额、身份和消息，workflow、multi-agent、sub-agent 与 teammate 的具体规则仍由应用或插件实现。
+`agent-runtime` 是 Core 之上的机制层。Core 仍只运行单个 ReAct Agent；Runtime 负责安全派生、私有会话续跑、生命周期、限额和身份，workflow、multi-agent、sub-agent 与 teammate 的具体规则仍由应用或插件实现。
 
 ## 现有 API 状态
 
@@ -10,8 +10,8 @@
 | 手工组装独立 Agent | 已满足 | Core 已公开 gateway、options、tools、extension、event sink 和 context loader |
 | 稳定派生与权限收缩 | Runtime 新增 | `AgentTemplate` 和 `AgentDeriveConfig` |
 | 生命周期与结果 | Runtime 新增 | `spawn`、`continue_agent`、`status`、`result`、`wait`、`cancel` |
-| Agent 间通信 | Runtime 新增 | 有界邮箱、可信 sender、消息大小与派生树边界 |
-| workflow / teammate 业务语义 | 插件负责 | Runtime 不定义步骤 DSL、角色协议或消息内容 |
+| teammate 邮箱与通信 | 插件负责 | Runtime 不定义邮箱、消息主题、投递、重试或上下文注入 |
+| workflow / teammate 业务语义 | 插件负责 | Runtime 不定义步骤 DSL、角色协议或协作规则 |
 
 ## 派生模板
 
@@ -27,7 +27,7 @@
 Queued -> Running -> Succeeded | Failed | Cancelled
 ```
 
-终态不可覆盖。取消父节点会级联取消后代；重复取消保持幂等。`RuntimeLimits` 约束最大深度、每个父节点的累计子节点数、全局并发、邮箱容量和单条消息大小。
+终态不可覆盖。取消父节点会级联取消后代；重复取消保持幂等。`RuntimeLimits` 约束最大深度、每个父节点的累计子节点数和全局模型运行并发。
 
 ## 原生调用
 
@@ -63,11 +63,11 @@ let follow_up = provisioned
     .await?;
 ```
 
-`wait` 和阻塞式 `receive` 只供原生异步调用方使用。WASM 插件持有 component store 锁时不能长期等待，因此 Guest API 只开放立即返回的 spawn、continue、status、result、cancel、send 和 `try_receive`。成功终态的 Session 只保存在 Runtime 内部；continue 只接受目标与新增输入，并继承目标的模板和有效权限。
+`wait` 只供原生异步调用方使用。WASM 插件持有 component store 锁时不能长期等待，因此 Guest API 只开放立即返回的 spawn、continue、status、result 和 cancel。成功终态的 Session 只保存在 Runtime 内部；continue 只接受目标与新增输入，并继承目标的模板和有效权限。
 
 ## Principal 与 profile
 
-Host 为每次受限组件激活创建唯一 `RuntimePrincipal`。principal 拥有独立 controller、邮箱和派生树；插件请求不能填写 owner、parent 或 sender。插件卸载时，Host 通过 provisioner 撤销 principal，取消并清理其全部 Runtime 资源。
+Host 为每次受限组件激活创建唯一 `RuntimePrincipal`。principal 拥有独立 controller 和派生树；插件请求不能填写 owner 或 parent。插件卸载时，Host 通过 provisioner 撤销 principal，取消并清理其全部 Runtime 资源。
 
 Runtime 的 controller profile 由应用注册，决定基础模型、工具和权限。Plugin Host 还会把 Guest 可见的 spawn profile 映射为受控的 `AgentDeriveConfig`。Guest 只能提交 profile 名称和任务输入，不能直接传入 provider、API key、provider options 或工具权限。
 
@@ -93,10 +93,16 @@ let plugin = WasmPluginHost::load_from_manifest_with_services(
 
 不调用 `with_agent_runtime` 时，原有 loader 保持纯插件宿主行为；申请 Agent 权限的插件会被明确拒绝，不会获得隐式默认 Agent。
 
-## 消息边界
+## Teammate 边界
 
-`AgentMessageRequest` 不包含 sender。Runtime 从身份绑定 API 注入可信 `AgentId` 和 principal，并只允许在同一 owner、同一派生树内投递。邮箱是有界 FIFO，满载时立即返回背压错误。
+Runtime 的 `AgentId`、谱系和状态可作为 teammate 插件的成员地址与执行状态，但 Runtime 不创建邮箱。teammate 插件自行定义：
 
-Runtime 只投递结构化消息，不决定消息如何进入模型上下文。teammate 或 workflow 插件可以把消息解释为任务、回复、控制指令或自定义协议，并自行决定何时启动下一次 Agent 运行。
+- 邮件 DTO、主题和角色身份；
+- 队列容量、背压、确认、重试和过期策略；
+- 消息的持久化、可见范围与权限；
+- 何时把一条消息转换为 `continue_agent` 的新增输入；
+- 邮箱事件如何显示在 TUI 或 Agent 事件列表。
 
-当前派生 Agent 是一次性运行，成功结果只返回执行摘要。消息传输已可供原生 orchestrator 使用，但 WASM 插件不能把新消息自动注入一个已结束或正在执行的派生 Agent。长期 teammate 应在后续通过受控的 session/continue handle 实现；这属于 Runtime 机制扩展，不改变 Core 的单 Agent ReAct 边界。
+插件可以先使用实例状态保存短期队列，并通过版本化 plugin service 提供 send/list/ack 等协议；需要跨重启时使用后续的持久插件 KV。Host 只注入可信插件 owner 和 service caller，不理解 teammate 消息内容。
+
+这种拆分允许不同 teammate 插件实现 actor mailbox、共享频道、黑板或事件溯源等不同模型，同时保持 Core 与 Runtime 不依赖任何一种协作协议。

@@ -13,6 +13,7 @@
     "plugin": "cargo run -p agent-plugin-manager --",
     "test:session": "cargo test -p agent-session",
     "test:agent-runtime": "cargo test -p agent-runtime",
+    "test:plugin:agent-runtime": "bun run build:plugin:agent-runtime && cargo test --offline --manifest-path examples/plugins/agent-runtime-plugin/smoke-tests/Cargo.toml",
     "test:plugin:manager": "cargo test -p agent-plugin-manager",
     "test:plugin:context": "bun run build:plugin:context && cargo test --offline --manifest-path examples/plugins/context-replacement-plugin/smoke-tests/Cargo.toml",
     "perf:plugin:host": "cargo bench -p agent-plugin-host --bench plugin_overhead --no-default-features",

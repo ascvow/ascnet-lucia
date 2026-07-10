@@ -7,14 +7,14 @@ Host API 的目标不是预先实现所有插件，而是提供可复用、可�
 | 领域 | 已提供的通用 API | 典型插件 |
 | --- | --- | --- |
 | 身份与生命周期 | 可信 plugin ID、activate、deactivate、owner 注入 | 全部插件 |
-| Agent Runtime | profile 派生、私有会话续跑、状态、结果、取消、有界消息 | sub-agent、multi-agent、workflow、teammate |
+| Agent Runtime | profile 派生、私有会话续跑、状态、结果、取消 | sub-agent、multi-agent、workflow、teammate |
 | Agent 贡献 | 工具、developer prompt、结构化事件 | MCP、Skill、命令 |
 | 上下文 | 每次模型请求前完整替换上下文 | 压缩、检索、记忆 |
 | UI 与输入 | 四向插槽、Dialog、frame、样式、键鼠输入 | 监控、表单、交互工具 |
 | 插件协作 | 依赖、能力声明、版本化 JSON 服务 | command provider、公共基础插件 |
 | 实例状态 | component 实例内 JSON KV | 计数、短期连接状态 |
 | 文件与进程 | 受控只读文件、无 shell 子进程 stdio | Skill 扫描、MCP client |
-| 资源限制 | fuel、线性内存、进程数、超时、消息与 Agent 限额 | 全部插件 |
+| 资源限制 | fuel、线性内存、进程数、超时与 Agent 限额 | 全部插件 |
 | 会话持久化 | 原生 `SessionStore` trait、内存与文件实现 | 应用、原生扩展 |
 
 ## 能力分层
@@ -28,7 +28,7 @@ Host API 的目标不是预先实现所有插件，而是提供可复用、可�
 | 状态 | 隔离、持久化、revision、quota | key、schema、迁移与业务数据含义 |
 | 治理 | 身份、授权、限额、撤销、审计 | 最小 capability 声明和错误处理 |
 
-例如 MCP 只需要文件、进程、动态工具与 Secret 引用；Host 不应增加 `register_mcp`。Skill 只需要文件扫描、动态提示与可选 watcher；Host 不应解析 `SKILL.md`。同理，Agent Runtime 提供派生与传输，但不增加 `create_teammate` 或 workflow DSL。
+例如 MCP 只需要文件、进程、动态工具与 Secret 引用；Host 不应增加 `register_mcp`。Skill 只需要文件扫描、动态提示与可选 watcher；Host 不应解析 `SKILL.md`。同理，Agent Runtime 提供派生与续跑，但不增加邮箱、`create_teammate` 或 workflow DSL。
 
 ## 后续优先项
 
@@ -49,13 +49,13 @@ Host API 的目标不是预先实现所有插件，而是提供可复用、可�
 
 P0 表示大量插件无法可靠自行实现且必须由 Host 掌握权限边界；P1 表示现有原语可绕行，但统一契约能避免生态分裂；P2 应先通过版本化插件服务试验，确认通用语义后再进入 ABI。
 
-当前 Agent 消息是可信、有界的传输原语，不会自动进入派生 Agent 的模型上下文。一次性 sub-agent、workflow fan-out 和由插件显式驱动的长期 teammate 续跑均可实现；Runtime 不会自动把邮箱消息注入模型上下文，也不会在 Core 中硬编码 teammate 角色。
+一次性 sub-agent、workflow fan-out 和由插件显式驱动的长期 Agent 续跑已经可实现。teammate 插件以 Runtime 的 `AgentId` 作为地址，自行实现邮箱、消息主题、队列、背压、重试和上下文注入；Runtime 和 Core 都不持有 teammate 邮箱。
 
 ## API 设计规则
 
 - 暴露稳定 handle 和 DTO，不暴露具体运行时对象。
-- plugin ID、principal、sender 和 owner 一律由 Host 注入。
-- 所有队列、消息、文件、响应和并发都必须有上限。
+- plugin ID、principal 和 owner 一律由 Host 注入；插件协议中的 actor 身份由插件校验。
+- 插件实现的队列、消息、文件、响应和并发都必须有上限。
 - 长任务使用 start/status/result/cancel，不在同步 WASM import 中等待完成。
 - manifest 只声明请求范围；Host 服务注册表和应用配置决定实际可用范围。
 - 子 Agent 权限只能收缩，不能扩大父模板权限。
