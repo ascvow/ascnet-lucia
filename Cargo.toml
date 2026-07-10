@@ -18,6 +18,7 @@ exclude = [
     "examples/plugins/echo-plugin",
     "examples/plugins/context-replacement-plugin",
     "examples/plugins/mcp-plugin",
+    "examples/plugins/skill-plugin",
     "examples/plugins/ui-showcase-plugin",
     "examples/plugins/agent-runtime-plugin",
 ]

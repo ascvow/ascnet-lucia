@@ -1,6 +1,6 @@
-# 通用 MCP 插件
+# Lucia 官方 MCP 插件
 
-该插件不包含 MasterGo、Figma 或其他服务的业务逻辑。它在启动时扫描 MCP JSON 配置，启动其中声明的 stdio Server，执行 MCP 初始化和工具发现，然后通过 Lucia 宿主 API 动态注册工具。模型调用公开工具后，Plugin Host 根据 owner 路由回本插件，本插件再向原 Server 发送 `tools/call`。
+这是 Lucia 首批官方插件之一，不包含 MasterGo、Figma 或其他服务的业务逻辑。它在启动时扫描 MCP JSON 配置，启动其中声明的 stdio Server，执行 MCP 初始化和工具发现，然后通过 Lucia 宿主 API 动态注册工具。模型调用公开工具后，Plugin Host 根据 owner 路由回本插件，本插件再向原 Server 发送 `tools/call`。
 
 ## 配置
 

@@ -1,10 +1,10 @@
 [package]
-name = "mcp-plugin"
+name = "skill-plugin"
 version = "0.1.0"
 edition = "2021"
 authors = ["ascvow"]
 license = "MIT"
-description = "通过 Lucia 宿主开放 API 加载 stdio MCP Server 的官方插件。"
+description = "扫描并向 Lucia Agent 提供本地 Skill 的官方插件。"
 
 [lib]
 crate-type = ["cdylib"]
@@ -22,3 +22,6 @@ opt-level = "s"
 debug = false
 strip = true
 lto = true
+
+# 官方 WASM Guest 独立于原生 workspace 构建，避免宿主 target 编译 component exports。
+[workspace]

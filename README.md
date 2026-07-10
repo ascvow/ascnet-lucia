@@ -174,9 +174,11 @@ ABI 故意使用 JSON 字符串。这样 WIT 边界保持稳定，同时 Rust �
 
 完整能力展示见 [`examples/plugins/ui-showcase-plugin`](examples/plugins/ui-showcase-plugin/README.md)，该插件同时实现四向插槽、模态对话框、样式、键鼠输入、Agent 事件和工具驱动状态。
 
-### MCP 插件
+### 官方插件
 
-通用 stdio MCP 实现位于 [`examples/plugins/mcp-plugin`](examples/plugins/mcp-plugin/README.md)。MCP 配置扫描、JSON-RPC 初始化、工具解析和 `tools/call` 都由该插件完成；Plugin Host 只提供受控文件读取、子进程 stdio、动态工具注册和 owner 路由，不理解 MCP 或 MasterGo 协议。
+官方 stdio MCP 插件位于 [`examples/plugins/mcp-plugin`](examples/plugins/mcp-plugin/README.md)。MCP 配置扫描、JSON-RPC 初始化、工具解析和 `tools/call` 都由该插件完成；Plugin Host 只提供受控文件读取、子进程 stdio、动态工具注册和 owner 路由，不理解 MCP 或 MasterGo 协议。
+
+官方 Skill 插件位于 [`examples/plugins/skill-plugin`](examples/plugins/skill-plugin/README.md)。它扫描 `SKILL.md`，只把名称和描述注入 Agent，并通过 `skill_read` 按需加载完整指令；Core 和 Host 不解析 Skill 格式。
 
 受限 Agent 派生与续跑示例见 [`examples/plugins/agent-runtime-plugin`](examples/plugins/agent-runtime-plugin/README.md)。Host 只提供 profile 授权、生命周期、状态、结果和取消；sub-agent、workflow、multi-agent 与 teammate 的角色、邮箱和消息协议由插件定义。
 

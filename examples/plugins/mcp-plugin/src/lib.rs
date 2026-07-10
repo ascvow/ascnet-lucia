@@ -1,10 +1,10 @@
 //! 通用 stdio MCP 插件。
 
-use anyhow::{anyhow, Context, Result};
 use agent_plugin::{
-    export_plugin, ActivationContext, EventPresentation, EventPresentationTone, ExtensionEvent,
-    AgentPlugin, PluginHostApi, ProcessSpec, PromptContribution, ToolCall, ToolResult, ToolSpec,
+    export_plugin, ActivationContext, AgentPlugin, EventPresentation, EventPresentationTone,
+    ExtensionEvent, PluginHostApi, ProcessSpec, PromptContribution, ToolCall, ToolResult, ToolSpec,
 };
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -71,7 +71,7 @@ impl AgentPlugin for McpPlugin {
             .with_context(|| format!("扫描 MCP 配置目录失败：{config_dir}"))?;
         let config_paths = config_entries
             .into_iter()
-            .filter(|entry| !entry.is_dir && entry.path.ends_with(".json"))
+            .filter(|entry| !entry.is_dir && is_mcp_config_path(&entry.path))
             .map(|entry| entry.path)
             .collect::<Vec<_>>();
         if config_paths.is_empty() {
@@ -377,6 +377,11 @@ fn default_inherit_stderr() -> bool {
     true
 }
 
+/// 判断目录项是否为应实际启动的 MCP 配置，并排除随插件分发的示例文件。
+fn is_mcp_config_path(path: &str) -> bool {
+    path.ends_with(".json") && !path.ends_with(".example.json")
+}
+
 export_plugin!(McpPlugin);
 
 #[cfg(test)]
@@ -410,5 +415,13 @@ mod tests {
             .all(|character| character.is_ascii_alphanumeric()
                 || character == '_'
                 || character == '-'));
+    }
+
+    /// 验证官方插件分发的示例配置不会被当成真实 Server 启动。
+    #[test]
+    fn example_configs_are_not_loaded() {
+        assert!(is_mcp_config_path("config/mastergo.json"));
+        assert!(!is_mcp_config_path("config/mastergo.example.json"));
+        assert!(!is_mcp_config_path("config/readme.md"));
     }
 }

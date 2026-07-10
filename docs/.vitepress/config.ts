@@ -60,6 +60,7 @@ export default defineConfig({
         {
           text: "WASM 插件开发",
           items: [
+            { text: "官方插件", link: "/plugin/official" },
             { text: "创建插件", link: "/plugin/quick-start" },
             { text: "生命周期", link: "/plugin/lifecycle" },
             { text: "Host API", link: "/plugin/host-api" },
@@ -73,7 +74,7 @@ export default defineConfig({
       "/examples/": [
         {
           text: "示例",
-          items: [{ text: "通用 MCP 插件", link: "/examples/mcp" }],
+          items: [{ text: "官方 MCP 插件", link: "/examples/mcp" }],
         },
       ],
       "/reference/": [

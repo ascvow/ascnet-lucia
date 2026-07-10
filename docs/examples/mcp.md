@@ -1,6 +1,6 @@
-# 通用 MCP 插件
+# Lucia 官方 MCP 插件
 
-仓库中的 `examples/plugins/mcp-plugin` 是协议插件示例。Plugin Host 不理解 MCP；插件通过文件和进程 API 自己完成全部协议行为。
+仓库中的 `examples/plugins/mcp-plugin` 是官方通用协议插件。Plugin Host 不理解 MCP；插件通过文件和进程 API 自己完成全部协议行为。
 
 ## 启动流程
 
