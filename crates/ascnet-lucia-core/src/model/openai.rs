@@ -22,11 +22,14 @@ use agent_tool::{ToolCall, ToolSpec};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// Codex Desktop 请求使用的客户端标识，用于兼容依赖官方客户端身份的模型网关。
+const CODEX_DESKTOP_USER_AGENT: &str =
+    "Codex Desktop/0.144.0-alpha.4 (Mac OS 26.5.2; arm64) unknown (Codex Desktop; 26.707.31428)";
 
 // ---------------------------------------------------------------------------
 // Responses API 参数白名单（参考 LiteLLM get_supported_openai_params）
@@ -147,6 +150,7 @@ impl ChatModel for OpenAiResponsesAdapter {
             .client
             .post(url)
             .headers(self.extra_headers.clone())
+            .header(USER_AGENT, CODEX_DESKTOP_USER_AGENT)
             .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
             .header(CONTENT_TYPE, "application/json")
             .json(&body)
@@ -216,6 +220,7 @@ impl ChatModel for OpenAiChatCompletionsAdapter {
             .client
             .post(url)
             .headers(self.extra_headers.clone())
+            .header(USER_AGENT, CODEX_DESKTOP_USER_AGENT)
             .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
             .header(CONTENT_TYPE, "application/json")
             .json(&body)
@@ -282,6 +287,7 @@ fn spawn_openai_stream(
             let response = client
                 .post(url)
                 .headers(headers)
+                .header(USER_AGENT, CODEX_DESKTOP_USER_AGENT)
                 .header(AUTHORIZATION, format!("Bearer {api_key}"))
                 .header(CONTENT_TYPE, "application/json")
                 .json(&body)

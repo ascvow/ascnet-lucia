@@ -9,12 +9,14 @@ use super::{
 use agent_tool::{ToolCall, ToolSpec};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, CONTENT_TYPE, USER_AGENT};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Claude Code CLI 请求使用的客户端标识，用于兼容依赖官方客户端身份的模型网关。
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.80 (external, cli)";
 
 /// Adapter for Anthropic Messages API.
 /// Anthropic Messages API 适配器。
@@ -49,6 +51,7 @@ impl ChatModel for AnthropicMessagesAdapter {
             .client
             .post(url)
             .headers(self.extra_headers.clone())
+            .header(USER_AGENT, CLAUDE_CODE_USER_AGENT)
             .header("x-api-key", self.api_key.as_str())
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header(CONTENT_TYPE, "application/json")
