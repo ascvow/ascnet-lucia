@@ -1,0 +1,10 @@
+[plugin]
+id = "echo"
+name = "Echo Plugin"
+version = "0.1.0"
+api_version = "0.6.0"
+wasm = "target/wasm32-wasip2/release/echo_plugin.wasm"
+description = "Example ascnet-lucia WASM plugin that provides an echo tool."
+
+[capabilities]
+# 该插件为纯计算插件，不申请 HTTP、文件系统、进程或 secret 能力。

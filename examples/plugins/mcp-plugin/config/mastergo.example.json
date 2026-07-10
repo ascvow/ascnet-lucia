@@ -1,0 +1,13 @@
+{
+  "args": [
+    "@mastergo/magic-mcp",
+    "--token=请替换为本地_MASTERGO_TOKEN",
+    "--url=https://mastergo.com",
+    "--verbose"
+  ],
+  "command": "bunx",
+  "env": {
+    "NPM_CONFIG_REGISTRY": "https://registry.npmjs.org/"
+  },
+  "inheritStderr": true
+}

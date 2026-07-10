@@ -1,0 +1,100 @@
+package ascnet:lucia-plugin@0.6.0;
+
+/// ascnet-lucia 的 WASM 插件 world。
+///
+/// ABI 故意使用 JSON 字符串。这样 WIT ABI 保持稳定，同时 Rust 结构体可以通过 serde 兼容字段继续演进。
+world plugin {
+  /// 注册或替换动态工具。
+  import host-agent-upsert-tool: func(request-json: string) -> string;
+
+  /// 删除动态工具。
+  import host-agent-remove-tool: func(request-json: string) -> string;
+
+  /// 注册或替换 developer 提示贡献。
+  import host-agent-upsert-prompt: func(request-json: string) -> string;
+
+  /// 删除提示贡献。
+  import host-agent-remove-prompt: func(request-json: string) -> string;
+
+  /// 发布结构化扩展事件。
+  import host-agent-emit-event: func(request-json: string) -> string;
+
+  /// 读取插件实例内存状态。
+  import host-state-get: func(request-json: string) -> string;
+
+  /// 写入插件实例内存状态。
+  import host-state-set: func(request-json: string) -> string;
+
+  /// 删除插件实例内存状态。
+  import host-state-remove: func(request-json: string) -> string;
+
+  /// 注册或替换当前插件拥有的服务。
+  import host-service-upsert: func(request-json: string) -> string;
+
+  /// 删除当前插件拥有的服务。
+  import host-service-remove: func(request-json: string) -> string;
+
+  /// 查询插件服务目录。
+  import host-service-list: func(request-json: string) -> string;
+
+  /// 调用目标插件服务。
+  import host-service-call: func(request-json: string) -> string;
+
+  /// 读取 manifest 允许的 UTF-8 文件。
+  import host-fs-read: func(request-json: string) -> string;
+
+  /// 列出 manifest 允许的一层目录项。
+  import host-fs-list: func(request-json: string) -> string;
+
+  /// 启动 manifest 允许的长驻子进程。
+  import host-process-spawn: func(request-json: string) -> string;
+
+  /// 向子进程 stdin 写入原始数据。
+  import host-process-write: func(request-json: string) -> string;
+
+  /// 从子进程 stdout 读取一行。
+  import host-process-read-line: func(request-json: string) -> string;
+
+  /// 终止并释放子进程。
+  import host-process-kill: func(request-json: string) -> string;
+
+  /// 调用受权限约束的 Agent Runtime 短控制面操作。
+  import host-agent-runtime-call: func(request-json: string) -> string;
+
+  /// 插件启动钩子。空字符串表示成功，其他内容表示加载错误。
+  export activate: func(context-json: string) -> string;
+
+  /// 插件卸载钩子。空字符串表示成功，其他内容表示卸载错误。
+  export deactivate: func() -> string;
+
+  /// 处理其他插件发起的服务调用，返回 JSON 响应信封。
+  export handle-service: func(call-json: string) -> string;
+
+  /// 返回 ToolSpec 对象的 JSON 数组。
+  export list-tools: func() -> string;
+
+  /// 执行工具调用。输入为 ToolCall JSON，输出为 ToolResult JSON。
+  export call-tool: func(call-json: string) -> string;
+
+  /// 策略 hook。输入为 ToolCall JSON，输出为 ToolDecision JSON。
+  export before-tool: func(call-json: string) -> string;
+
+  /// 工具完成后的观察 hook。
+  export after-tool: func(result-json: string);
+
+  /// core 生命周期事件 hook。
+  export on-event: func(event-json: string);
+
+  /// 为一次模型请求返回完整替换上下文的响应信封。
+  export load-context: func(request-json: string) -> string;
+
+  /// 声明插件 UI 视图。输出为 UiDeclaration JSON 数组，空数组表示无 UI。
+  /// 宿主以探测方式获取该导出：未实现的旧插件自动降级为纯工具插件。
+  export describe-ui: func() -> string;
+
+  /// 渲染插件 UI。输入为 UiRenderRequest JSON，输出为 UiFrame JSON，空字符串表示不更新。
+  export render-ui: func(request-json: string) -> string;
+
+  /// 处理路由给焦点插件视图的输入。输入为 UiInput JSON。
+  export on-ui-input: func(input-json: string);
+}

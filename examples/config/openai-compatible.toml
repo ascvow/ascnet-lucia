@@ -1,0 +1,10 @@
+[model]
+name = "default"
+provider = "open-ai-compatible"
+model = "local-model"
+api_key = "local"
+base_url = "http://localhost:11434/v1"
+openai_protocol = "chat-completions"
+
+[agent]
+max_steps = 8

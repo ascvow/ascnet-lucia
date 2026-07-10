@@ -1,0 +1,52 @@
+# 插件生命周期
+
+## 调用顺序
+
+<div class="arch-flow">instantiate component
+  -> list-tools（兼容静态工具）
+  -> activate(context)
+  -> describe-ui
+  -> prompt/list/call/event/ui hooks
+  -> deactivate()</div>
+
+## activate
+
+`activate` 收到 `ActivationContext`：可信插件 ID 和 manifest metadata。适合：
+
+- 扫描插件配置。
+- 启动长驻子进程。
+- 动态注册工具和提示。
+- 注册供其他插件复用的服务。
+- 初始化实例状态。
+- 发布 ready 事件。
+
+返回错误会阻止插件加载，不会产生半初始化实例。
+
+## 工具方法
+
+- `list_tools`：兼容静态工具。动态插件可以返回空数组。
+- `call_tool`：不需要 Host I/O 的旧式执行入口。
+- `call_tool_with_host`：需要文件、状态或子进程 API 时覆盖；默认调用 `call_tool`。
+- `before_tool`：观察所有工具调用，可允许、阻止或重写。
+- `after_tool`：观察最终结果。
+
+Host 在调用 component 前把公开工具名替换为注册时的本地 ID。
+
+## 事件与 UI
+
+- `on_event` 接收 Core 生命周期事件。
+- `describe_ui` 返回静态视图声明。
+- `render_ui` 根据 Host 分配尺寸渲染一帧。
+- `on_ui_input` 接收焦点视图的键盘或鼠标事件。
+
+## 插件服务
+
+- `handle_service` 接收 Host 已按 owner 路由的调用。
+- 调用方 ID 由 Host 注入，不能由 Guest 伪造。
+- 服务注册、发现和调用见[依赖与服务](/plugin/dependencies-services)。
+
+## deactivate
+
+应用调用 `PluginHost::shutdown` 或 `WasmPluginHost::deactivate` 时触发。插件应终止长驻任务并清理临时贡献。
+
+旧 component 没有 `deactivate` 导出时，Host 将其视为空操作。组合宿主按加载顺序的反向关闭，使依赖方先于 provider 清理。应用单独移除宿主时不会自动 shutdown，因为调用方可能需要自定义错误策略。

@@ -1,0 +1,15 @@
+[plugin]
+id = "context-replacement"
+name = "上下文替换测试插件"
+version = "0.1.0"
+api_version = "0.6.0"
+wasm = "target/wasm32-wasip2/release/context_replacement_plugin.wasm"
+description = "用固定摘要完整替换模型上下文，用于验证 Host 与 Agent Core 的桥接。"
+
+[[provides]]
+id = "agent.context-loader"
+version = "1.0.0"
+mode = "exclusive"
+
+[capabilities]
+# 测试插件只进行内存计算和事件发布，不申请外部资源权限。

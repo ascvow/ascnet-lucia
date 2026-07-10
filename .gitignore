@@ -1,0 +1,21 @@
+# VitePress 依赖与构建产物。
+/node_modules/
+/docs/.vitepress/cache/
+/docs/.vitepress/dist/
+
+# Rust 工作区与示例项目的构建产物。
+target/
+
+# 本地环境配置与测试覆盖率产物。
+.env
+.env.*
+!.env.example
+coverage/
+*.profraw
+*.profdata
+lcov.info
+
+# 操作系统和编辑器生成的本地文件。
+.DS_Store
+.idea/
+.vscode/

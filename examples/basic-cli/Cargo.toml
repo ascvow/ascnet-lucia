@@ -1,0 +1,19 @@
+[package]
+name = "agent-basic-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "A tiny CLI demonstrating ascnet-lucia core and WASM plugins."
+
+[dependencies]
+anyhow.workspace = true
+agent-core = { path = "../../crates/ascnet-lucia-core" }
+agent-plugin-host = { path = "../../crates/ascnet-lucia-plugin-host" }
+agent-tool = { path = "../../crates/ascnet-lucia-tool" }
+async-trait.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

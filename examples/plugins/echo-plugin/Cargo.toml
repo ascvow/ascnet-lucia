@@ -1,0 +1,23 @@
+[package]
+name = "echo-plugin"
+version = "0.1.0"
+edition = "2021"
+authors = ["ascvow"]
+license = "MIT"
+description = "A sample ascnet-lucia WASM echo plugin."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+agent-plugin = { path = "../../../crates/ascnet-lucia-plugin" }
+serde_json = "1"
+wit-bindgen = "0.59"
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+debug = false
+strip = true
+lto = true

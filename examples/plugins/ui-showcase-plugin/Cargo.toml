@@ -1,0 +1,23 @@
+[package]
+name = "ui-showcase-plugin"
+version = "0.1.0"
+edition = "2021"
+authors = ["ascvow"]
+license = "MIT"
+description = "用于展示 ascnet-lucia 插件 TUI 能力的测试插件。"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+agent-plugin = { path = "../../../crates/ascnet-lucia-plugin" }
+serde_json = "1"
+wit-bindgen = "0.59"
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+debug = false
+strip = true
+lto = true

@@ -1,0 +1,16 @@
+# 真实模型验收配置模板。密钥只从环境变量读取，不要写入本文件。
+[model]
+name = "live-test"
+provider = "open-ai-compatible"
+model = "replace-with-model-id"
+api_key_env = "LUCIA_LIVE_API_KEY"
+base_url = "https://replace-with-provider.example/v1"
+openai_protocol = "chat-completions"
+
+[agent]
+max_steps = 8
+max_tokens = 1024
+
+# plugin 或 all 场景会加载这个真实 WASM component。
+[[plugins]]
+manifest = "../plugins/echo-plugin/plugin.toml"

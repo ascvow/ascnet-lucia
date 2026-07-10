@@ -1,0 +1,30 @@
+{
+  "name": "lucia-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:tui": "bun run build:tui:core && bun run build:tui:plugins",
+    "build:tui:core": "cargo build -p lucia --release --no-default-features --target-dir target/core-tui",
+    "build:tui:plugins": "cargo build -p lucia --release --features plugins --target-dir target/plugin-tui",
+    "build:plugin-manager": "cargo build -p agent-plugin-manager --release --target-dir target/plugin-manager",
+    "build:plugin:echo": "cargo build --offline --manifest-path examples/plugins/echo-plugin/Cargo.toml --release --target wasm32-wasip2",
+    "build:plugin:context": "cargo build --offline --manifest-path examples/plugins/context-replacement-plugin/Cargo.toml --release --target wasm32-wasip2",
+    "build:plugin:agent-runtime": "cargo build --offline --manifest-path examples/plugins/agent-runtime-plugin/Cargo.toml --release --target wasm32-wasip2",
+    "plugin": "cargo run -p agent-plugin-manager --",
+    "test:session": "cargo test -p agent-session",
+    "test:agent-runtime": "cargo test -p agent-runtime",
+    "test:plugin:manager": "cargo test -p agent-plugin-manager",
+    "test:plugin:context": "bun run build:plugin:context && cargo test --offline --manifest-path examples/plugins/context-replacement-plugin/smoke-tests/Cargo.toml",
+    "perf:plugin:host": "cargo bench -p agent-plugin-host --bench plugin_overhead --no-default-features",
+    "perf:plugin:wasm": "bun run build:plugin:context && cargo run --offline --release --manifest-path examples/plugins/context-replacement-plugin/smoke-tests/Cargo.toml --example perf",
+    "perf:plugin:gate": "LUCIA_PERF_ENFORCE=1 bun run perf:plugin:wasm",
+    "test:live:unit": "cargo test --offline --manifest-path tools/lucia-live-tests/Cargo.toml",
+    "test:live": "bun run build:plugin:echo && cargo run --offline --manifest-path tools/lucia-live-tests/Cargo.toml --",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.4"
+  }
+}

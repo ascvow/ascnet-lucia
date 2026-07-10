@@ -1,0 +1,6 @@
+{
+  "args": ["tests/mock-mcp-server.ts"],
+  "command": "bun",
+  "env": {},
+  "inheritStderr": true
+}

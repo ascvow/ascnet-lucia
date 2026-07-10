@@ -1,0 +1,10 @@
+[model]
+name = "default"
+provider = "open-ai"
+model = "gpt-5.5"
+base_url = "https://api.phrolova.uno"
+api_key_env = "OPENAI_API_KEY"
+openai_protocol = "responses"
+
+[agent]
+max_steps = 8
