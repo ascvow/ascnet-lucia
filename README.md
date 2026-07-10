@@ -205,6 +205,26 @@ bun run docs:build
 - [插件性能分析](docs/guide/performance.md)：纯 Core 编译边界、Host 微基准和真实 WASM p95 门禁。
 - [真实模型分层测试](docs/guide/live-testing.md)：依次验证最小响应、ReAct、复杂工具链和插件调用。
 
+## TUI 配置与会话
+
+首次运行先初始化用户配置：
+
+```bash
+bun run init:tui
+```
+
+默认写入 `$HOME/.lucia/config.toml`，且不会覆盖已有文件。设置模板引用的 API key 环境变量并确认模型 ID 后，直接运行 `lucia` 即可自动读取配置。`LUCIA_HOME`、`LUCIA_CONFIG` 和 `--config` 可以覆盖默认位置。
+
+会话默认保存在 `$HOME/.lucia/sessions`。TUI 会自动恢复配置中的默认 Session，并把用户、助手和工具历史重新显示在主事件列表：
+
+```bash
+lucia --list-sessions
+lucia --session-id design-review
+lucia --resume-latest
+```
+
+配置字段、路径优先级和 CAS 行为见 [TUI 配置与会话](docs/guide/tui-configuration.md)。
+
 ## Build / 构建
 
 默认构建是不包含 Plugin Host、Wasmtime 和插件 UI 的纯 Core TUI：

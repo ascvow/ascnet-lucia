@@ -110,9 +110,11 @@ async fn persist_and_resume(agent: &Agent) -> Result<()> {
 
 ## TUI 持久化闭环
 
-`lucia` TUI 默认把会话保存到当前工作目录的 `.lucia/sessions`，并使用稳定标识
-`default`。可通过 `--sessions-dir <目录>` 和 `--session-id <标识>` 覆盖。启动时会先
-加载对应 `SessionRecord`；记录不存在时创建 revision 为 `0` 的空记录。
+`lucia` TUI 默认把会话保存到 `$LUCIA_HOME/sessions`，未设置 `LUCIA_HOME` 时使用
+`$HOME/.lucia/sessions`。可通过配置文件 `[tui]`、`--sessions-dir <目录>` 和
+`--session-id <标识>` 覆盖，也可使用 `--resume-latest` 恢复最近记录。启动时会把
+Session 的用户、助手和工具消息恢复到主事件列表；记录不存在时创建 revision 为 `0`
+的空记录。完整启动规则见 [TUI 配置与会话](/guide/tui-configuration)。
 
 每轮 Agent 成功后，TUI 使用启动或上轮保存返回的 revision 执行 CAS，并只在保存
 成功后替换内存中的当前记录。Agent 运行失败、文件写入失败或 revision 冲突时，原会话

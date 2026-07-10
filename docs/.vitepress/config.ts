@@ -26,6 +26,7 @@ export default defineConfig({
           items: [
             { text: "五分钟接入", link: "/guide/quick-start" },
             { text: "架构边界", link: "/guide/architecture" },
+            { text: "TUI 配置与会话", link: "/guide/tui-configuration" },
             { text: "构建与打包", link: "/guide/distribution" },
             { text: "插件管理", link: "/guide/plugin-management" },
             { text: "插件性能", link: "/guide/performance" },

@@ -1,5 +1,7 @@
 //! Lucia 交互式 TUI（基于 Ratatui）。
 
+mod app_config;
+
 use agent_core::{
     config::LuciaConfig,
     event::{AgentEvent, AgentEventKind, CompositeEventSink, EventSink, JsonlEventSink},
@@ -22,6 +24,10 @@ use agent_plugin_host::{
 use agent_session::{FileSessionStore, MemorySessionStore, SessionId, SessionRecord, SessionStore};
 use agent_tool::{JsonTool, ToolCall, ToolRegistry, ToolSpec};
 use anyhow::{anyhow, Result};
+use app_config::{
+    initialize_config, load_tui_settings, lucia_home_dir, resolve_config_path,
+    resolve_config_relative_path, TuiSettings,
+};
 use async_trait::async_trait;
 use clap::Parser;
 #[cfg(feature = "plugins")]
@@ -31,7 +37,7 @@ use ratatui::{prelude::*, widgets::*};
 use serde_json::{json, Value};
 #[cfg(feature = "plugins")]
 use std::collections::HashMap;
-use std::{path::PathBuf, sync::Arc};
+use std::{path::Path, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
 
 // ─── CLI 参数 ───
@@ -39,11 +45,15 @@ use tokio::sync::mpsc;
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Lucia 交互式 ReAct Agent")]
 struct Args {
+    /// 初始化配置文件后退出；默认写入 `$LUCIA_HOME/config.toml`。
+    #[arg(long = "init", alias = "init-config")]
+    init: bool,
+
     /// 使用内置脚本模型。
     #[arg(long)]
     demo: bool,
 
-    /// TOML 配置文件路径。
+    /// TOML 配置文件路径；默认读取 `LUCIA_CONFIG` 或 `$LUCIA_HOME/config.toml`。
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -51,13 +61,21 @@ struct Args {
     #[arg(long = "events-jsonl")]
     events_jsonl: Option<PathBuf>,
 
-    /// 会话文件目录；默认在当前工作目录的 `.lucia/sessions` 下持久化。
-    #[arg(long = "sessions-dir", default_value = ".lucia/sessions")]
-    sessions_dir: PathBuf,
+    /// 会话文件目录；覆盖配置文件和 `$LUCIA_HOME/sessions` 默认值。
+    #[arg(long = "sessions-dir")]
+    sessions_dir: Option<PathBuf>,
 
-    /// 要恢复和持续更新的稳定会话标识。
-    #[arg(long = "session-id", default_value = "default")]
-    session_id: String,
+    /// 要恢复和持续更新的稳定会话标识；覆盖配置中的默认值。
+    #[arg(long = "session-id")]
+    session_id: Option<String>,
+
+    /// 恢复最近更新的持久化会话；显式 `--session-id` 优先。
+    #[arg(long = "resume-latest")]
+    resume_latest: bool,
+
+    /// 列出持久化会话后退出，不连接模型服务。
+    #[arg(long = "list-sessions")]
+    list_sessions: bool,
 
     /// 插件 manifest 路径；可以重复传入并按参数顺序占用 UI 插槽。
     #[cfg(feature = "plugins")]
@@ -95,7 +113,7 @@ enum UiEvent {
     /// 最近一次模型请求消耗的上下文 token 数。
     ContextUsage(u64),
     /// Agent 运行及 CAS 持久化均完成，成功值携带最新会话记录。
-    AgentDone(Result<(AgentRun, SessionRecord)>),
+    AgentDone(Box<Result<(AgentRun, SessionRecord)>>),
 }
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -506,6 +524,76 @@ fn truncate_line(text: &str, max_width: usize) -> String {
     output
 }
 
+/// 将持久化的 provider-neutral Session 恢复为主事件列表消息。
+///
+/// system、developer 和 thinking 内容不会直接展示；工具调用与后续结果会合并为一条
+/// 工具事件，避免恢复后出现重复块。
+fn restore_session_messages(session: &Session) -> Vec<Msg> {
+    let mut messages = Vec::new();
+    for message in session.messages() {
+        match message.role {
+            MessageRole::User => {
+                let text = message.text_content();
+                if !text.is_empty() {
+                    messages.push(Msg::new(MsgKind::User, text));
+                }
+            }
+            MessageRole::Assistant => {
+                let text = message.text_content();
+                if !text.is_empty() {
+                    messages.push(Msg::new(MsgKind::Assistant, text));
+                }
+                for block in &message.content {
+                    if let ContentBlock::ToolCall { call } = block {
+                        let mut restored = Msg::new(MsgKind::ToolRunning, call.name.clone());
+                        let args = summarize_json(&call.args, 64);
+                        restored.args = (!args.is_empty()).then_some(args);
+                        messages.push(restored);
+                    }
+                }
+            }
+            MessageRole::Tool => {
+                for block in &message.content {
+                    let ContentBlock::ToolResult { result } = block else {
+                        continue;
+                    };
+                    let kind = if result.is_error {
+                        MsgKind::ToolError
+                    } else {
+                        MsgKind::ToolOk
+                    };
+                    let summary = summarize_json(&result.content, 96);
+                    if let Some(restored) = messages.iter_mut().rev().find(|candidate| {
+                        matches!(candidate.kind, MsgKind::ToolRunning)
+                            && candidate.text == result.name
+                    }) {
+                        restored.kind = kind;
+                        restored.result = (!summary.is_empty()).then_some(summary);
+                    } else {
+                        let mut restored = Msg::new(kind, result.name.clone());
+                        restored.result = (!summary.is_empty()).then_some(summary);
+                        messages.push(restored);
+                    }
+                }
+            }
+            MessageRole::System | MessageRole::Developer => {}
+        }
+    }
+    messages
+}
+
+/// 从首次用户输入生成适合会话列表的短标题。
+fn session_title(input: &str) -> Option<String> {
+    let text = input.lines().find(|line| !line.trim().is_empty())?.trim();
+    let mut chars = text.chars();
+    let title = chars.by_ref().take(60).collect::<String>();
+    Some(if chars.next().is_some() {
+        format!("{title}…")
+    } else {
+        title
+    })
+}
+
 // ─── 应用状态 ───
 
 struct App {
@@ -603,6 +691,7 @@ impl App {
         session_store: Arc<dyn SessionStore>,
         session_record: SessionRecord,
     ) -> Self {
+        self.messages = restore_session_messages(&session_record.session);
         self.session_store = session_store;
         self.session_record = session_record;
         self
@@ -941,7 +1030,7 @@ impl App {
                 &input,
             )
             .await;
-            let _ = tx.send(UiEvent::AgentDone(result));
+            let _ = tx.send(UiEvent::AgentDone(Box::new(result)));
         });
     }
 
@@ -1025,6 +1114,9 @@ async fn run_and_persist(
             .await?
     };
     session_record.session = run.session.clone();
+    if session_record.title.is_none() {
+        session_record.title = session_title(input);
+    }
     let saved_record = session_store
         .save(session_record, expected_revision)
         .await?;
@@ -1373,7 +1465,22 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         app.model_name.as_str(),
         Style::new().fg(COLOR_TEXT),
     )];
-    if workspace.width >= 72 {
+    if workspace.width >= 64 {
+        footer.extend([
+            Span::styled("  ·  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+            Span::styled(
+                truncate_line(
+                    &format!(
+                        "session {} · r{}",
+                        app.session_record.id, app.session_record.revision
+                    ),
+                    30,
+                ),
+                Style::new().fg(COLOR_MUTED),
+            ),
+        ]);
+    }
+    if workspace.width >= 96 {
         footer.extend([
             Span::styled("  ·  ", Style::new().fg(COLOR_BORDER_FOCUS)),
             Span::styled(cwd_display, Style::new().fg(COLOR_MUTED)),
@@ -1642,28 +1749,145 @@ async fn dispatch_plugin_input(plugin_host: &dyn PluginHost, input: &UiInput) ->
 
 // ─── 主函数 ───
 
+/// 解析 TUI 配置中的路径；CLI 路径保持相对当前工作目录的既有语义。
+fn resolve_tui_path(
+    cli_path: Option<&Path>,
+    configured_path: Option<&Path>,
+    config_path: &Path,
+    fallback: PathBuf,
+) -> PathBuf {
+    if let Some(path) = cli_path {
+        path.to_path_buf()
+    } else if let Some(path) = configured_path {
+        resolve_config_relative_path(config_path, path)
+    } else {
+        fallback
+    }
+}
+
+/// 按 CLI、最近会话和配置默认值的优先级选择启动会话。
+async fn load_startup_session(
+    store: &dyn SessionStore,
+    cli_session_id: Option<&str>,
+    settings: &TuiSettings,
+    cli_resume_latest: bool,
+) -> Result<SessionRecord> {
+    if cli_session_id.is_none() && (cli_resume_latest || settings.resume_latest) {
+        let mut records = store.list().await?;
+        records.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if let Some(record) = records.into_iter().next() {
+            return Ok(record);
+        }
+    }
+
+    let id = cli_session_id
+        .or(settings.default_session.as_deref())
+        .unwrap_or("default");
+    let id = SessionId::new(id)?;
+    Ok(match store.load(&id).await? {
+        Some(record) => record,
+        None => SessionRecord::new(id, Session::new())?,
+    })
+}
+
+/// 输出按最近更新时间排序的持久化会话摘要。
+async fn print_persisted_sessions(store: &dyn SessionStore) -> Result<()> {
+    let mut records = store.list().await?;
+    records.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if records.is_empty() {
+        println!("没有持久化会话");
+        return Ok(());
+    }
+
+    println!("SESSION\tREVISION\tMESSAGES\tUPDATED_MS\tTITLE");
+    for record in records {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            record.id,
+            record.revision,
+            record.session.messages().len(),
+            record.updated_at_ms,
+            record.title.as_deref().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let config_path = resolve_config_path(args.config.as_deref())?;
+    if args.init {
+        initialize_config(&config_path)?;
+        println!("已创建 Lucia 配置：{}", config_path.display());
+        println!("设置 OPENAI_API_KEY 并确认 model.model 后即可运行 lucia");
+        return Ok(());
+    }
+
+    let config_exists = config_path.is_file();
+    if args.config.is_some() && !config_exists {
+        return Err(anyhow!("配置文件不存在：{}", config_path.display()));
+    }
+    let tui_settings = if config_exists {
+        load_tui_settings(&config_path)?
+    } else {
+        TuiSettings::default()
+    };
+    let lucia_home = lucia_home_dir()?;
+    let sessions_dir = resolve_tui_path(
+        args.sessions_dir.as_deref(),
+        tui_settings.sessions_dir.as_deref(),
+        &config_path,
+        lucia_home.join("sessions"),
+    );
+    let events_jsonl = args.events_jsonl.clone().or_else(|| {
+        tui_settings
+            .events_jsonl
+            .as_deref()
+            .map(|path| resolve_config_relative_path(&config_path, path))
+    });
+    let session_store = Arc::new(FileSessionStore::open(&sessions_dir).await?);
+    if args.list_sessions {
+        return print_persisted_sessions(session_store.as_ref()).await;
+    }
+    let session_record = load_startup_session(
+        session_store.as_ref(),
+        args.session_id.as_deref(),
+        &tui_settings,
+        args.resume_latest,
+    )
+    .await?;
+
     #[cfg(feature = "plugins")]
     let mut plugin_manifests = args.plugin_manifests.clone();
     #[cfg(feature = "plugins")]
     let mut capability_selection = HashMap::new();
+    #[cfg(feature = "plugins")]
+    if config_exists {
+        let plugin_runtime = load_plugin_runtime_config(&config_path)?;
+        plugin_manifests.extend(plugin_runtime.manifest_paths);
+        capability_selection.extend(plugin_runtime.capability_selection);
+    }
 
     let (gateway, options) = if args.demo {
         build_demo_gateway()
-    } else if let Some(path) = &args.config {
-        let config = LuciaConfig::load(path)?;
-        #[cfg(feature = "plugins")]
-        {
-            let plugin_runtime = load_plugin_runtime_config(path)?;
-            plugin_manifests.extend(plugin_runtime.manifest_paths);
-            capability_selection.extend(plugin_runtime.capability_selection);
-        }
+    } else if config_exists {
+        let config = LuciaConfig::load(&config_path)?;
         (config.build_gateway()?, config.agent_options())
     } else {
         return Err(anyhow!(
-            "请传入 --demo 使用脚本模型，或 --config <file> 使用真实服务商"
+            "未找到 Lucia 配置：{}；请先运行 `lucia --init`，或传入 --demo",
+            config_path.display()
         ));
     };
 
@@ -1685,17 +1909,10 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let model_name = options.model.clone();
 
-    let session_id = SessionId::new(args.session_id)?;
-    let session_store = Arc::new(FileSessionStore::open(&args.sessions_dir).await?);
-    let session_record = match session_store.load(&session_id).await? {
-        Some(record) => record,
-        None => SessionRecord::new(session_id, Session::new())?,
-    };
-
     // UI 通道 sink 之外，可选叠加 JSONL sink 用于排查请求与工具调用。
     let mut sink = CompositeEventSink::new();
     sink.push(Arc::new(ChannelEventSink(tx.clone())));
-    if let Some(path) = &args.events_jsonl {
+    if let Some(path) = events_jsonl {
         sink.push(Arc::new(JsonlEventSink::new(path.clone())));
     }
 
@@ -1832,7 +2049,7 @@ async fn main() -> Result<()> {
                 app.context_tokens = Some(tokens);
             }
             Some(UiEvent::AgentDone(result)) => {
-                app.handle_agent_done(result);
+                app.handle_agent_done(*result);
             }
             Some(UiEvent::Tick) => {
                 if app.running {
@@ -2083,6 +2300,81 @@ mod tests {
         assert_eq!(summary, "path: src, entries: [2 项], meta: {…}");
     }
 
+    /// 验证持久化 Session 会恢复用户、助手和已完成工具事件，而不展示系统提示词。
+    #[test]
+    fn persisted_session_hydrates_main_event_list() {
+        let mut session = Session::new();
+        session.set_system("不应显示的系统提示词");
+        session.push_user("读取项目配置");
+        session.push_assistant_blocks(vec![ContentBlock::ToolCall {
+            call: ToolCall::new("call-1", "read_file", json!({"path": "config.toml"})),
+        }]);
+        session.push_tool_result(agent_tool::ToolResult::success(
+            "call-1",
+            "read_file",
+            json!({"content": "配置内容"}),
+        ));
+        session.push_assistant_text("配置已经读取");
+
+        let messages = restore_session_messages(&session);
+
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(messages[0].kind, MsgKind::User));
+        assert_eq!(messages[0].text, "读取项目配置");
+        assert!(matches!(messages[1].kind, MsgKind::ToolOk));
+        assert_eq!(messages[1].text, "read_file");
+        assert_eq!(messages[1].args.as_deref(), Some("path: config.toml"));
+        assert!(messages[1]
+            .result
+            .as_deref()
+            .is_some_and(|result| result.contains("配置内容")));
+        assert!(matches!(messages[2].kind, MsgKind::Assistant));
+        assert_eq!(messages[2].text, "配置已经读取");
+    }
+
+    /// 显式会话 ID 必须优先于最近恢复，未显式指定时选择最新记录。
+    #[tokio::test]
+    async fn startup_session_respects_explicit_and_latest_priority() {
+        let store = MemorySessionStore::new();
+        let older = store
+            .save(
+                SessionRecord::new(
+                    SessionId::new("older").expect("创建旧会话 ID"),
+                    Session::new(),
+                )
+                .expect("创建旧会话"),
+                None,
+            )
+            .await
+            .expect("保存旧会话");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let newer = store
+            .save(
+                SessionRecord::new(
+                    SessionId::new("newer").expect("创建新会话 ID"),
+                    Session::new(),
+                )
+                .expect("创建新会话"),
+                None,
+            )
+            .await
+            .expect("保存新会话");
+        let settings = TuiSettings {
+            resume_latest: true,
+            ..TuiSettings::default()
+        };
+
+        let latest = load_startup_session(&store, None, &settings, false)
+            .await
+            .expect("恢复最近会话");
+        assert_eq!(latest.id, newer.id);
+
+        let explicit = load_startup_session(&store, Some(older.id.as_str()), &settings, true)
+            .await
+            .expect("恢复显式会话");
+        assert_eq!(explicit.id, older.id);
+    }
+
     /// 验证 Markdown 表格排版为对齐行：分隔行转为横线，中文列按显示宽度补齐。
     #[test]
     fn markdown_tables_render_aligned() {
@@ -2212,12 +2504,14 @@ mod tests {
             .await
             .expect("首次运行和保存应成功");
         assert_eq!(first.revision, 1);
+        assert_eq!(first.title.as_deref(), Some("第一轮"));
 
         let (_, second) = run_and_persist(&agent, &store, first.clone(), "第二轮")
             .await
             .expect("继续运行和保存应成功");
         assert_eq!(second.id, first.id);
         assert_eq!(second.revision, 2);
+        assert_eq!(second.title.as_deref(), first.title.as_deref());
         assert_eq!(
             store.load(&second.id).await.expect("读取测试会话"),
             Some(second)
