@@ -2,6 +2,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     env, fs,
     io::Write,
@@ -10,15 +12,17 @@ use std::{
 
 /// 首次初始化写入的安全配置模板。
 ///
-/// 模板只引用环境变量，不保存 API key 明文；用户需要按实际账号修改模型 ID。
+/// 模板集中声明模型 URL、模型 ID 和密钥，并保留环境变量密钥的替代配置。
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Lucia TUI 配置
-# API key 请放入环境变量，不要直接写入本文件。
+# api_key 与 api_key_env 二选一；推荐使用环境变量，避免保存密钥明文。
 
 [model]
 name = "default"
 provider = "open-ai"
+base_url = "https://api.openai.com/v1"
 model = "gpt-5"
-api_key_env = "OPENAI_API_KEY"
+api_key = ""
+# api_key_env = "OPENAI_API_KEY"
 openai_protocol = "responses"
 
 [agent]
@@ -94,17 +98,17 @@ pub(crate) fn initialize_config(path: &Path) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建配置目录失败：{}", parent.display()))?;
     }
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                anyhow!("配置文件已存在，未覆盖：{}", path.display())
-            } else {
-                anyhow!("创建配置文件失败 {}：{error}", path.display())
-            }
-        })?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow!("配置文件已存在，未覆盖：{}", path.display())
+        } else {
+            anyhow!("创建配置文件失败 {}：{error}", path.display())
+        }
+    })?;
     file.write_all(DEFAULT_CONFIG_TEMPLATE.as_bytes())
         .with_context(|| format!("写入配置文件失败：{}", path.display()))?;
     file.sync_all()
@@ -149,6 +153,26 @@ mod tests {
         let root = temp_dir();
         let path = root.join("config.toml");
         initialize_config(&path).expect("首次初始化应成功");
+
+        let model_config =
+            agent_core::config::LuciaConfig::load(&path).expect("模板中的模型配置应可由 Core 解析");
+        assert_eq!(
+            model_config.model.base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(model_config.model.model, "gpt-5");
+        assert_eq!(model_config.model.api_key.as_deref(), Some(""));
+        assert!(model_config.model.api_key_env.is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path)
+                .expect("读取配置文件权限")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
 
         let settings = load_tui_settings(&path).expect("模板应可解析");
         assert_eq!(settings.sessions_dir, Some(PathBuf::from("sessions")));

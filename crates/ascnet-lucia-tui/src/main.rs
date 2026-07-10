@@ -1830,7 +1830,9 @@ async fn main() -> Result<()> {
     if args.init {
         initialize_config(&config_path)?;
         println!("已创建 Lucia 配置：{}", config_path.display());
-        println!("设置 OPENAI_API_KEY 并确认 model.model 后即可运行 lucia");
+        println!(
+            "填写 model.api_key（或配置 model.api_key_env）并确认 model.model 后即可运行 lucia"
+        );
         return Ok(());
     }
 
@@ -1907,7 +1909,7 @@ async fn main() -> Result<()> {
                 .api_key_env
                 .as_deref()
                 .map(|name| format!("设置环境变量 {name}"))
-                .unwrap_or_else(|| "在配置中设置 model.api_key_env".to_string());
+                .unwrap_or_else(|| "在配置中设置 model.api_key 或 model.api_key_env".to_string());
             let (gateway, options) = build_demo_gateway();
             (
                 gateway,

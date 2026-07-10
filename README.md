@@ -213,7 +213,7 @@ bun run docs:build
 bun run install:tui
 ```
 
-之后直接运行 `lucia`。首次启动会自动创建 `$HOME/.lucia/config.toml`；未设置模型密钥时进入本地演示模式，并在主事件区提示配置方式。设置模板引用的 API key 环境变量并确认模型 ID 后，再次运行 `lucia` 即连接真实模型。`LUCIA_HOME`、`LUCIA_CONFIG` 和 `--config` 可以覆盖默认位置。
+之后直接运行 `lucia`。首次启动会自动创建 `$HOME/.lucia/config.toml`；模型 URL、密钥和模型名称分别从 `model.base_url`、`model.api_key`/`model.api_key_env` 和 `model.model` 读取。未设置模型密钥时进入本地演示模式，并在主事件区提示配置方式。`LUCIA_HOME`、`LUCIA_CONFIG` 和 `--config` 可以覆盖默认位置。
 
 ```bash
 lucia

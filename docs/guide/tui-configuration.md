@@ -12,13 +12,27 @@ lucia
 
 首次启动会自动创建默认配置。默认配置路径是 `$LUCIA_HOME/config.toml`，未设置 `LUCIA_HOME` 时使用 `$HOME/.lucia/config.toml`。未检测到模型密钥时，TUI 会进入本地演示模式，并在主事件区显示配置提示。
 
+模型服务完全由配置文件决定：
+
+```toml
+[model]
+name = "default"
+provider = "open-ai"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5"
+api_key = "sk-..."
+openai_protocol = "responses"
+```
+
+`base_url` 是模型服务 URL，`model` 是请求使用的模型名称。密钥默认使用 `api_key = "..."` 直接配置，也可以删除该字段并改用 `api_key_env = "OPENAI_API_KEY"` 指定环境变量名；两者同时存在时 `api_key` 优先。修改配置后重新运行 `lucia` 即可生效。
+
 也可以显式初始化指定文件后退出：
 
 ```bash
 lucia --config ./lucia.toml --init
 ```
 
-初始化使用原子排他创建，不会覆盖已有文件。模板通过 `OPENAI_API_KEY` 环境变量读取密钥；运行前需要确认 `model.model` 是账号可用的模型 ID。
+初始化使用原子排他创建，不会覆盖已有文件。macOS/Linux 下配置文件权限为 `0600`；运行前需要填写密钥，并确认 `model.model` 是账号可用的模型 ID。
 
 ## 自动读取
 
@@ -78,4 +92,4 @@ lucia --list-sessions
 | 会话 ID | `--session-id` | `tui.default_session` | `default` |
 | 事件日志 | `--events-jsonl` | `tui.events_jsonl` | 不写入 |
 
-不要在配置中保存 API key。优先使用 `model.api_key_env`，并让 shell、密钥管理器或部署环境提供对应变量。
+配置支持保存 `model.api_key`，但包含明文密钥的文件不得提交到版本库。生产环境优先使用 `model.api_key_env`，并让 shell、密钥管理器或部署环境提供对应变量。
