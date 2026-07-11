@@ -1,0 +1,36 @@
+# Teammate 协作插件
+
+该插件在 Agent Runtime 控制面之上实现独立的 teammate 业务协议。Runtime 仍只负责可信身份、派生、续跑、状态和取消，不保存成员角色或邮箱。
+
+## 行为边界
+
+- `worker` profile 由应用注册并授权，Guest 不能选择模型、凭证或扩大工具权限。
+- 首次派生返回的 Agent ID 是稳定成员地址；续跑产生的新 Agent ID 仅作为该成员的当前执行句柄。
+- 工具调用的发送者固定为 Host 注入的 controller Agent ID；服务调用的发送者固定为 Host 注入的 `caller_id`，请求不能自行声明发送者。
+- 每个 owner 最多创建 16 个成员，每个邮箱最多保留 64 条未确认消息，单条 JSON payload 最大 64 KiB。
+- `dispatch` 失败时保留消息并累计尝试次数，最多尝试 5 次；成功后自动确认消息并把当前执行句柄更新为续跑句柄。
+- 消息不设置时间过期；确认、取消成员或插件卸载前一直保留。当前版本只使用实例内存，不提供跨重启持久化。
+- 版本化服务名为 `teammate.mailbox`，版本为 `1.0.0`。不同 `caller_id` 的成员和邮箱相互隔离。
+
+## 工具
+
+- `teammate_spawn`：创建带角色的成员并异步执行首个任务。
+- `teammate_list`：列出当前 owner 的成员地址和当前执行句柄。
+- `teammate_status`、`teammate_result`、`teammate_cancel`：操作成员的当前执行句柄。
+- `teammate_remove`：取消并删除成员及其未确认消息，释放成员配额。
+- `teammate_send`：向成员地址投递消息。
+- `teammate_inbox`：列出未确认消息。
+- `teammate_ack`：显式确认并删除消息。
+- `teammate_dispatch`：把指定消息转换为成功会话的新增输入；调用立即返回新句柄，不等待模型完成。
+
+服务 payload 使用相同操作名：`spawn`、`list`、`status`、`result`、`cancel`、`remove`、`send`、`inbox`、`ack`、`dispatch`。`operation` 之外的字段与对应工具参数一致。
+
+## 构建与验证
+
+```bash
+cargo test --offline
+cargo build --offline --target wasm32-wasip2 --release
+cargo test --offline --manifest-path smoke-tests/Cargo.toml
+```
+
+应用加载插件前必须向 `PluginHostServices` 注入 Agent Runtime，并注册 controller profile 与 `worker` 派生配置。插件不会在同步 WASM 调用中等待后台 Agent 完成；调用方应轮询 `teammate_result`。

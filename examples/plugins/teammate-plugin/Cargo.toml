@@ -1,0 +1,26 @@
+[package]
+name = "teammate-plugin"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "提供受限 Agent 成员管理与有界邮箱的官方 WASM 插件。"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+agent-plugin = { path = "../../../crates/agent-plugin" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wit-bindgen = "0.59"
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+debug = false
+strip = true
+lto = true
+
+# 具体插件保持独立 workspace，避免原生 workspace 构建 component exports。
+[workspace]
