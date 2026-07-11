@@ -2,6 +2,8 @@
 
 mod app_config;
 
+#[cfg(feature = "plugins")]
+use agent_core::AgentExtension;
 use agent_core::{
     config::LuciaConfig,
     event::{AgentEvent, AgentEventKind, CompositeEventSink, EventSink, JsonlEventSink},
@@ -134,6 +136,10 @@ const COLOR_SUCCESS: Color = Color::Rgb(104, 190, 126);
 const COLOR_WARNING: Color = Color::Rgb(197, 164, 103);
 /// 错误状态颜色。
 const COLOR_DANGER: Color = Color::Rgb(205, 101, 101);
+/// Number of 80 ms UI ticks before startup plugin details collapse into the compact counter.
+/// 启动插件详情收敛为紧凑计数前保留的 80 毫秒 UI tick 数。
+#[cfg(feature = "plugins")]
+const PLUGIN_STATUS_DETAIL_TICKS: u16 = 75;
 
 // ─── 聊天消息 ───
 
@@ -598,6 +604,36 @@ fn session_title(input: &str) -> Option<String> {
 
 // ─── 应用状态 ───
 
+/// Builds load-order-preserving summaries from plugin activation events.
+///
+/// 根据插件激活事件生成保持加载顺序的启动摘要；没有事件文本的插件仅显示 ID。
+#[cfg(feature = "plugins")]
+fn plugin_startup_details(plugin_ids: &[String], events: &[Value]) -> Vec<String> {
+    let mut status_by_id = HashMap::new();
+    for event in events {
+        let Some(plugin_id) = event.pointer("/source/id").and_then(Value::as_str) else {
+            continue;
+        };
+        let text = event
+            .pointer("/presentation/text")
+            .and_then(Value::as_str)
+            .or_else(|| event.pointer("/data/text").and_then(Value::as_str))
+            .or_else(|| event.get("name").and_then(Value::as_str));
+        if let Some(text) = text {
+            status_by_id.insert(plugin_id, text);
+        }
+    }
+    plugin_ids
+        .iter()
+        .map(|plugin_id| {
+            status_by_id
+                .get(plugin_id.as_str())
+                .map(|text| format!("{plugin_id}: {text}"))
+                .unwrap_or_else(|| plugin_id.clone())
+        })
+        .collect()
+}
+
 struct App {
     messages: Vec<Msg>,
     input: String,
@@ -632,6 +668,15 @@ struct App {
     /// 控制插件 UI 刷新频率的主循环 tick 计数。
     #[cfg(feature = "plugins")]
     plugin_tick: u8,
+    /// Loaded plugin IDs shown by the compact status counter. 紧凑状态计数展示的插件 ID。
+    #[cfg(feature = "plugins")]
+    plugin_ids: Vec<String>,
+    /// Startup activation summaries shown once below the input. 输入框下方一次性展示的启动摘要。
+    #[cfg(feature = "plugins")]
+    plugin_startup_details: Vec<String>,
+    /// Remaining ticks before startup details collapse. 启动详情收敛前的剩余 tick 数。
+    #[cfg(feature = "plugins")]
+    plugin_status_ticks: u16,
 }
 
 /// 主 TUI 为单个插件视图维护的运行时状态。
@@ -684,6 +729,12 @@ impl App {
             plugin_frame: 0,
             #[cfg(feature = "plugins")]
             plugin_tick: 0,
+            #[cfg(feature = "plugins")]
+            plugin_ids: Vec::new(),
+            #[cfg(feature = "plugins")]
+            plugin_startup_details: Vec::new(),
+            #[cfg(feature = "plugins")]
+            plugin_status_ticks: 0,
         }
     }
 
@@ -711,6 +762,47 @@ impl App {
             })
             .collect();
         self
+    }
+
+    /// Stores loaded plugin IDs and consumes activation events for one-time startup display.
+    ///
+    /// 保存已加载插件 ID，并把激活阶段事件转换为一次性启动状态文本。
+    #[cfg(feature = "plugins")]
+    fn with_plugin_status(mut self, plugin_ids: Vec<String>, startup_events: Vec<Value>) -> Self {
+        self.plugin_startup_details = plugin_startup_details(&plugin_ids, &startup_events);
+        self.plugin_ids = plugin_ids;
+        self.plugin_status_ticks = PLUGIN_STATUS_DETAIL_TICKS;
+        self
+    }
+
+    /// Advances the transient startup status toward the compact counter.
+    ///
+    /// 推进一次性启动状态，并在计时结束后切换为紧凑计数。
+    #[cfg(feature = "plugins")]
+    fn tick_plugin_status(&mut self) {
+        self.plugin_status_ticks = self.plugin_status_ticks.saturating_sub(1);
+    }
+
+    /// Returns the current plugin status icon and text for the line below the input.
+    ///
+    /// 返回输入框下方插件状态行当前使用的图标和文本。
+    #[cfg(feature = "plugins")]
+    fn plugin_status_content(&self) -> (&'static str, String) {
+        if self.plugin_status_ticks > 0 {
+            let details = if self.plugin_startup_details.is_empty() {
+                self.plugin_ids.join(" · ")
+            } else {
+                self.plugin_startup_details.join(" · ")
+            };
+            let text = if details.is_empty() {
+                "未加载插件".to_string()
+            } else {
+                format!("插件加载完成 · {details}")
+            };
+            ("✓", text)
+        } else {
+            ("◈", format!("{} plugins", self.plugin_ids.len()))
+        }
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers, agent: &Arc<Agent>) {
@@ -1455,6 +1547,25 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         }
     }
 
+    // Render startup plugin details once, then retain only the icon and current count.
+    // 启动时一次性展示插件详情，随后仅保留图标与当前数量。
+    #[cfg(feature = "plugins")]
+    {
+        let (icon, status) = app.plugin_status_content();
+        let status = truncate_line(
+            &status,
+            usize::from(workspace.width.saturating_sub(5).max(1)),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{icon} "), Style::new().fg(COLOR_SUCCESS)),
+                Span::styled(status, Style::new().fg(COLOR_MUTED)),
+            ]))
+            .block(Block::new().padding(Padding::horizontal(1))),
+            sections[2],
+        );
+    }
+
     // 底部信息行：模型、工作目录与当前上下文 token 数，窄终端时隐藏目录。
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -1987,8 +2098,18 @@ async fn main() -> Result<()> {
     #[cfg(feature = "plugins")]
     let plugin_host =
         Arc::new(load_wasm_plugins_with_selection(&plugin_manifests, &capability_selection).await?);
+    // Consume activation events before the first Agent run so startup notices stay outside chat.
+    // 在 Agent 首次运行前消费激活事件，使启动通知不会延迟进入对话列表。
+    #[cfg(feature = "plugins")]
+    let plugin_ids = plugin_host
+        .host_ids()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     #[cfg(feature = "plugins")]
     let plugin_views = plugin_host.ui_declarations().await?;
+    #[cfg(feature = "plugins")]
+    let plugin_startup_events = plugin_host.drain_events().await?;
 
     let agent = Agent::new(gateway, options)
         .with_tools(native_tools)
@@ -2034,7 +2155,9 @@ async fn main() -> Result<()> {
     );
     #[cfg(feature = "plugins")]
     {
-        app = app.with_plugin_views(plugin_views);
+        app = app
+            .with_plugin_views(plugin_views)
+            .with_plugin_status(plugin_ids, plugin_startup_events);
     }
     #[cfg(feature = "plugins")]
     refresh_plugin_views(&mut app, plugin_host.as_ref()).await;
@@ -2130,6 +2253,7 @@ async fn main() -> Result<()> {
                 }
                 #[cfg(feature = "plugins")]
                 {
+                    app.tick_plugin_status();
                     app.plugin_tick = app.plugin_tick.wrapping_add(1);
                     if app.plugin_tick >= 3 {
                         app.plugin_tick = 0;
@@ -2340,6 +2464,57 @@ mod tests {
         assert!(text.contains("MessageLucia..."), "{text:?}");
         assert!(!text.contains("agentruntime"), "{text:?}");
         assert!(!text.contains("ReAct"), "{text:?}");
+    }
+
+    /// Startup activation events render below the input once, then collapse into a plugin count.
+    ///
+    /// 启动激活事件应在输入框下方展示一次，随后收敛为插件数量。
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn plugin_status_shows_startup_details_then_compact_count() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into()).with_plugin_status(
+            vec!["mcp".into(), "skill".into()],
+            vec![
+                json!({
+                    "source": {"id": "mcp"},
+                    "data": {"text": "MCP 插件等待配置"}
+                }),
+                json!({
+                    "source": {"id": "skill"},
+                    "presentation": {"text": "已加载 1 个 Skill"}
+                }),
+            ],
+        );
+        assert_eq!(
+            app.plugin_status_content(),
+            (
+                "✓",
+                "插件加载完成 · mcp: MCP 插件等待配置 · skill: 已加载 1 个 Skill".into()
+            )
+        );
+
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).expect("创建插件状态测试终端");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("渲染插件启动状态");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(rendered.contains("插件加载完成"), "{rendered:?}");
+
+        for _ in 0..PLUGIN_STATUS_DETAIL_TICKS {
+            app.tick_plugin_status();
+        }
+        assert_eq!(app.plugin_status_content(), ("◈", "2 plugins".into()));
     }
 
     /// 验证空模型密钥触发演示模式，而非空明文密钥允许构建真实模型运行时。
