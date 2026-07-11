@@ -61,3 +61,12 @@ Rust SDK 的 `export_plugin!` 会生成这些导出、保持单例插件状态�
 - `0.1.0` 到 `0.5.0` 作为兼容版本继续加载，但不能申请 Agent Runtime 权限。
 - 新增 guest export 应先由 Host 探测为可选，再在主版本中收紧。
 - 新增 JSON 字段必须使用 serde 默认值保持向后兼容。
+- Host 能力响应包含 `schema_version = 1`；Guest 必须忽略未知加法字段，Host 必须对新增可选请求字段提供默认值。
+- `agent-plugin` 的独立 ABI 契约测试负责验证旧最小请求、加法字段和响应信封兼容性。
+
+| 版本 | 所有者 | 兼容含义 |
+| --- | --- | --- |
+| Workspace crate 版本 | Rust workspace | Rust 包发布版本，不代表插件 ABI |
+| Manifest `api_version = 0.6.0` | Plugin Host | WIT world、可选导出和宿主能力契约 |
+| `[[provides]].version` | 具体插件 | 插件间 JSON 服务的独立 SemVer |
+| Lock `schema_version` | Plugin Manager | 本地插件锁文件格式，与运行时 ABI 独立 |

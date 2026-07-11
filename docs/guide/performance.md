@@ -4,7 +4,7 @@ Lucia 把性能验证分成编译边界、Host 微基准和真实 WASM 探针。
 
 ## 纯 Core 边界
 
-默认 TUI 构建不启用 `plugins` feature，因此不会编译或链接 Plugin Host、Wasmtime、WASI 和插件 UI：
+常规 TUI 构建默认启用 `plugins` feature。需要验证纯 Core 边界时，必须显式使用 `--no-default-features`，该构建不会编译或链接 Plugin Host、Wasmtime、WASI 和插件 UI：
 
 ```bash
 bun run build:tui:core

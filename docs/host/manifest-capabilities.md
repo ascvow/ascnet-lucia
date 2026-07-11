@@ -92,6 +92,8 @@ profiles = ["worker", "reviewer"]
 - Host 不经过 shell，`command` 与 `args` 分开传递。
 - 子进程环境先清空，只保留 PATH、HOME、TMPDIR、LANG、LC_ALL，再叠加请求环境。
 - 每个插件实例最多同时运行 16 个进程。
+- Host 限制启动请求、参数数量、环境变量总量、单次 stdin 写入和单行 stdout 大小，避免高权限入口接收无界载荷。
+- `process_exec` 仍等价于授予插件当前操作系统用户的原生进程权限；上述结构限制不能替代插件来源校验和用户信任决策。
 - stdout 单行限制为 4 MiB，读取超时上限为 120 秒。
 - token 应放在被忽略的本地配置，不写入 manifest 或源码。
 

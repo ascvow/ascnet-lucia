@@ -26,9 +26,18 @@ use tokio::{
 
 const MAX_PLUGIN_PROCESSES: usize = 16;
 const MAX_PROCESS_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROCESS_WRITE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROCESS_COMMAND_BYTES: usize = 4 * 1024;
+const MAX_PROCESS_ARGUMENTS: usize = 256;
+const MAX_PROCESS_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_PROCESS_ENV_ENTRIES: usize = 128;
+const MAX_PROCESS_ENV_BYTES: usize = 256 * 1024;
+const MAX_PROCESS_CWD_BYTES: usize = 4 * 1024;
+const MAX_HOST_CAPABILITY_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const MAX_READ_TIMEOUT_MS: u64 = 120_000;
 const MAX_AGENT_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024;
+const HOST_RESPONSE_SCHEMA_VERSION: u32 = 1;
 
 /// 单个插件实例可访问的受控宿主能力状态。
 pub(crate) struct CapabilityState {
@@ -479,9 +488,7 @@ impl CapabilityState {
         }
 
         let request: ProcessSpawnRequest = parse_request(request_json)?;
-        if request.command.trim().is_empty() {
-            return Err(anyhow!("插件进程命令不能为空"));
-        }
+        validate_process_spawn_request(&request)?;
 
         let cwd = self.resolve_process_cwd(request.cwd.as_deref())?;
         let mut command = Command::new(&request.command);
@@ -522,6 +529,11 @@ impl CapabilityState {
     pub(crate) async fn write_process(&mut self, request_json: &str) -> Result<Value> {
         self.require_process_exec()?;
         let request: ProcessWriteRequest = parse_request(request_json)?;
+        if request.data.len() > MAX_PROCESS_WRITE_BYTES {
+            return Err(anyhow!(
+                "插件进程单次 stdin 写入超过 {MAX_PROCESS_WRITE_BYTES} 字节限制"
+            ));
+        }
         let process = self
             .processes
             .get_mut(&request.handle)
@@ -697,13 +709,80 @@ fn require_empty_agent_request(value: &Value) -> Result<()> {
 /// 把宿主能力调用结果编码成稳定的 JSON 信封。
 pub(crate) fn encode_host_response(result: Result<Value>) -> String {
     match result {
-        Ok(value) => json!({"ok": true, "value": value}).to_string(),
-        Err(error) => json!({"ok": false, "error": error.to_string()}).to_string(),
+        Ok(value) => json!({
+            "schema_version": HOST_RESPONSE_SCHEMA_VERSION,
+            "ok": true,
+            "value": value,
+        })
+        .to_string(),
+        Err(error) => json!({
+            "schema_version": HOST_RESPONSE_SCHEMA_VERSION,
+            "ok": false,
+            "error": error.to_string(),
+        })
+        .to_string(),
     }
 }
 
 fn parse_request<T: for<'de> Deserialize<'de>>(request_json: &str) -> Result<T> {
+    if request_json.len() > MAX_HOST_CAPABILITY_REQUEST_BYTES {
+        return Err(anyhow!(
+            "插件宿主能力请求超过 {MAX_HOST_CAPABILITY_REQUEST_BYTES} 字节限制"
+        ));
+    }
     serde_json::from_str(request_json).context("解析插件宿主能力请求失败")
+}
+
+/// 校验原生进程启动请求的结构上限，避免高权限能力接收无界输入。
+fn validate_process_spawn_request(request: &ProcessSpawnRequest) -> Result<()> {
+    if request.command.trim().is_empty() {
+        return Err(anyhow!("插件进程命令不能为空"));
+    }
+    validate_process_text("命令", &request.command, MAX_PROCESS_COMMAND_BYTES)?;
+    if request.args.len() > MAX_PROCESS_ARGUMENTS {
+        return Err(anyhow!(
+            "插件进程参数数量超过 {MAX_PROCESS_ARGUMENTS} 项限制"
+        ));
+    }
+    for argument in &request.args {
+        validate_process_text("参数", argument, MAX_PROCESS_ARGUMENT_BYTES)?;
+    }
+    if request.env.len() > MAX_PROCESS_ENV_ENTRIES {
+        return Err(anyhow!(
+            "插件进程环境变量数量超过 {MAX_PROCESS_ENV_ENTRIES} 项限制"
+        ));
+    }
+    let mut environment_bytes = 0usize;
+    for (key, value) in &request.env {
+        if key.is_empty() || key.contains('=') {
+            return Err(anyhow!("插件进程环境变量名称无效：`{key}`"));
+        }
+        validate_process_text("环境变量名称", key, MAX_PROCESS_ENV_BYTES)?;
+        validate_process_text("环境变量值", value, MAX_PROCESS_ENV_BYTES)?;
+        environment_bytes = environment_bytes
+            .saturating_add(key.len())
+            .saturating_add(value.len());
+    }
+    if environment_bytes > MAX_PROCESS_ENV_BYTES {
+        return Err(anyhow!(
+            "插件进程环境变量总大小超过 {MAX_PROCESS_ENV_BYTES} 字节限制"
+        ));
+    }
+    if let Some(cwd) = &request.cwd {
+        validate_process_text("工作目录", cwd, MAX_PROCESS_CWD_BYTES)?;
+    }
+    Ok(())
+}
+
+/// 校验传给操作系统进程 API 的单个字符串字段。
+fn validate_process_text(label: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if value.len() > max_bytes {
+        return Err(anyhow!("插件进程{label}超过 {max_bytes} 字节限制"));
+    }
+    if value.contains('\0') {
+        return Err(anyhow!("插件进程{label}不能包含 NUL 字节"));
+    }
+    Ok(())
 }
 
 fn resolve_from(base: &Path, path: &str) -> PathBuf {
@@ -946,6 +1025,49 @@ mod tests {
         let events = contributions.drain_events().expect("读取事件应成功");
         assert_eq!(events[0]["source"]["id"], "trusted-id");
         assert_eq!(events[0]["name"], "demo.ready");
+    }
+
+    /// 宿主响应必须携带稳定版本，且成功和失败信封保持同一结构入口。
+    #[test]
+    fn host_response_includes_schema_version() {
+        let success: Value =
+            serde_json::from_str(&encode_host_response(Ok(json!(7)))).expect("解析成功响应");
+        let failure: Value = serde_json::from_str(&encode_host_response(Err(anyhow!("失败"))))
+            .expect("解析失败响应");
+
+        assert_eq!(success["schema_version"], HOST_RESPONSE_SCHEMA_VERSION);
+        assert_eq!(success["value"], 7);
+        assert_eq!(failure["schema_version"], HOST_RESPONSE_SCHEMA_VERSION);
+        assert_eq!(failure["error"], "失败");
+    }
+
+    /// 进程能力必须在调用操作系统前拒绝无界或无效字段。
+    #[test]
+    fn process_spawn_request_has_structural_limits() {
+        let valid = ProcessSpawnRequest {
+            command: "bun".into(),
+            args: vec!["run".into(), "server.ts".into()],
+            env: HashMap::from([("MODE".into(), "stdio".into())]),
+            cwd: Some("config".into()),
+            inherit_stderr: false,
+        };
+        assert!(validate_process_spawn_request(&valid).is_ok());
+
+        let mut invalid = valid;
+        invalid.args = vec!["x".into(); MAX_PROCESS_ARGUMENTS + 1];
+        assert!(validate_process_spawn_request(&invalid).is_err());
+        invalid.args.clear();
+        invalid.env = HashMap::from([("BAD=KEY".into(), "value".into())]);
+        assert!(validate_process_spawn_request(&invalid).is_err());
+    }
+
+    /// 所有 JSON 宿主能力入口必须共享请求大小上限。
+    #[test]
+    fn host_capability_request_size_is_bounded() {
+        let oversized = "x".repeat(MAX_HOST_CAPABILITY_REQUEST_BYTES + 1);
+        let error = parse_request::<Value>(&oversized).expect_err("超大请求必须被拒绝");
+
+        assert!(error.to_string().contains("请求超过"));
     }
 
     /// Dispatcher 只暴露短控制面操作，并返回可跨 ABI 使用的脱敏结构。
