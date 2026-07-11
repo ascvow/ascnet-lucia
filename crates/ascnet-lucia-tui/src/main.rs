@@ -783,9 +783,9 @@ impl App {
         self.plugin_status_ticks = self.plugin_status_ticks.saturating_sub(1);
     }
 
-    /// Returns the current plugin status icon and text for the line below the input.
+    /// Returns the current plugin status icon and text for the footer's right side.
     ///
-    /// 返回输入框下方插件状态行当前使用的图标和文本。
+    /// 返回底部信息栏右侧当前使用的插件状态图标和文本。
     #[cfg(feature = "plugins")]
     fn plugin_status_content(&self) -> (&'static str, String) {
         if self.plugin_status_ticks > 0 {
@@ -1442,11 +1442,11 @@ fn render(frame: &mut Frame, app: &mut App) {
 
 /// 在插件占用后的中心区域渲染 Lucia 主界面。
 fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
-    // 输入行与底部信息行之间保留一行空白间距。
+    // Keep the input and footer compact so the released status row returns to the chat viewport.
+    // 输入区与底栏保持紧凑，将释放的插件状态行归还给对话视口。
     let sections = Layout::vertical([
         Constraint::Min(4),
         Constraint::Length(2),
-        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(workspace);
@@ -1547,25 +1547,6 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         }
     }
 
-    // Render startup plugin details once, then retain only the icon and current count.
-    // 启动时一次性展示插件详情，随后仅保留图标与当前数量。
-    #[cfg(feature = "plugins")]
-    {
-        let (icon, status) = app.plugin_status_content();
-        let status = truncate_line(
-            &status,
-            usize::from(workspace.width.saturating_sub(5).max(1)),
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{icon} "), Style::new().fg(COLOR_SUCCESS)),
-                Span::styled(status, Style::new().fg(COLOR_MUTED)),
-            ]))
-            .block(Block::new().padding(Padding::horizontal(1))),
-            sections[2],
-        );
-    }
-
     // 底部信息行：模型、工作目录与当前上下文 token 数，窄终端时隐藏目录。
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -1605,10 +1586,44 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             Span::styled(format!("ctx {tokens}"), Style::new().fg(COLOR_MUTED)),
         ]);
     }
+    let footer_area = sections[2];
+    #[cfg(feature = "plugins")]
+    let (metadata_area, plugin_area, plugin_icon, plugin_status) = {
+        let (icon, status) = app.plugin_status_content();
+        let desired_width =
+            unicode_width::UnicodeWidthStr::width(format!("{icon} {status}").as_str())
+                .saturating_add(2);
+        let plugin_width = u16::try_from(desired_width)
+            .unwrap_or(u16::MAX)
+            .min(footer_area.width / 2);
+        let columns = Layout::horizontal([Constraint::Min(0), Constraint::Length(plugin_width)])
+            .split(footer_area);
+        (columns[0], columns[1], icon, status)
+    };
+    #[cfg(not(feature = "plugins"))]
+    let metadata_area = footer_area;
     frame.render_widget(
         Paragraph::new(Line::from(footer)).block(Block::new().padding(Padding::horizontal(1))),
-        sections[3],
+        metadata_area,
     );
+    // Reserve a right-aligned footer region for plugin details without overlapping metadata.
+    // 在底栏右侧为插件详情预留独立区域，避免覆盖左侧元数据。
+    #[cfg(feature = "plugins")]
+    {
+        let status = truncate_line(
+            &plugin_status,
+            usize::from(plugin_area.width.saturating_sub(4).max(1)),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{plugin_icon} "), Style::new().fg(COLOR_SUCCESS)),
+                Span::styled(status, Style::new().fg(COLOR_MUTED)),
+            ]))
+            .alignment(Alignment::Right)
+            .block(Block::new().padding(Padding::horizontal(1))),
+            plugin_area,
+        );
+    }
 }
 
 /// 按加载顺序分配四向停靠插槽，并返回剩余的主界面区域。
@@ -2466,9 +2481,9 @@ mod tests {
         assert!(!text.contains("ReAct"), "{text:?}");
     }
 
-    /// Startup activation events render below the input once, then collapse into a plugin count.
+    /// Startup activation events render in the footer once, then collapse into a plugin count.
     ///
-    /// 启动激活事件应在输入框下方展示一次，随后收敛为插件数量。
+    /// 启动激活事件应在底部信息栏右侧展示一次，随后收敛为插件数量。
     #[cfg(feature = "plugins")]
     #[test]
     fn plugin_status_shows_startup_details_then_compact_count() {
