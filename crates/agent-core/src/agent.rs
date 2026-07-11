@@ -25,7 +25,7 @@ use std::{collections::HashSet, sync::Arc};
 /// Lucia 实用型 Agent 的默认 system prompt。
 pub const DEFAULT_REACT_SYSTEM_PROMPT: &str = r#"You are lucia, a helpful AI agent.
 
-You may call tools when they are useful. Use tools only through the provided tool-calling interface.
+When tools are available, choose and use the appropriate tools for the task. Use tools only through the provided tool-calling interface.
 When you receive tool results, continue reasoning and answer the user directly.
 Do not claim that you executed tools unless tool results were actually returned.
 "#;
@@ -1039,10 +1039,12 @@ mod tests {
         }
     }
 
-    /// 默认系统提示必须使用稳定的小写 Agent 名称。
+    /// 默认系统提示必须使用稳定的小写 Agent 名称，并要求自主选择可用工具。
     #[test]
-    fn default_prompt_uses_lucia_agent_name() {
+    fn default_prompt_identifies_lucia_and_selects_available_tools() {
         assert!(DEFAULT_REACT_SYSTEM_PROMPT.starts_with("You are lucia,"));
+        assert!(DEFAULT_REACT_SYSTEM_PROMPT
+            .contains("When tools are available, choose and use the appropriate tools"));
     }
 
     /// 扩展提示应进入模型请求，但不能污染调用方持有的会话历史。
