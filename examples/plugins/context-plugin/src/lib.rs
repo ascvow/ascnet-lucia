@@ -1,11 +1,11 @@
 //! 基于 Claude Code 分层策略的 Lucia 上下文压缩插件。
 
 use agent_plugin::{
-    export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentPlugin, ContextLoadRequest,
-    EventPresentation, EventPresentationTone, ExtensionEvent, LoadedContext, PluginHostApi, Result,
-    ServiceCall, ServiceSpec,
+    export_plugin, ActivationContext, AgentPlugin, ContextLoadRequest, EventPresentation,
+    EventPresentationTone, ExtensionEvent, LoadedContext, PluginHostApi, Result, ServiceCall,
+    ServiceSpec,
 };
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
 
 /// 200k 上下文扣除 20k 摘要输出预算和 13k 下一轮缓冲后的自动压缩阈值。
@@ -24,54 +24,47 @@ const RECENT_TOOL_RESULTS_TO_KEEP: usize = 3;
 const SUMMARY_CHARACTER_LIMIT: usize = 24_000;
 /// 被微压缩的工具结果占位文本。
 const CLEARED_TOOL_RESULT: &str = "[旧工具结果内容已清理]";
-/// 官方 Command Provider 的稳定插件 ID。
-const COMMAND_PLUGIN_ID: &str = "command";
+/// 原生 TUI 调用主动压缩服务时使用的稳定身份。
+const TUI_PLUGIN_ID: &str = "lucia-tui";
 /// Context 插件接收主动压缩请求的服务名。
 const CONTEXT_COMPACT_SERVICE: &str = "context.compact";
-/// Command 协议当前版本。
-const COMMAND_PROTOCOL_VERSION: &str = "1.0.0";
-/// 主动压缩回调处理器的稳定名称。
-const COMPACT_HANDLER_ID: &str = "compact";
+/// 主动压缩服务当前版本。
+const CONTEXT_SERVICE_VERSION: &str = "1.0.0";
 
 /// 提供分层上下文压缩能力的插件。
 #[derive(Default)]
-struct ContextPlugin {
-    /// 下一次 Agent run 是否需要强制压缩。
-    manual_compaction_pending: bool,
-    /// 当前需要在全部 ReAct step 中持续压缩的 run ID。
-    manual_compaction_run_id: Option<String>,
-}
+struct ContextPlugin;
 
 impl AgentPlugin for ContextPlugin {
     /// 注册主动压缩服务；命令定义由官方 Command 插件维护。
     fn activate(&mut self, host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
         host.upsert_service(&ServiceSpec {
             name: CONTEXT_COMPACT_SERVICE.into(),
-            version: COMMAND_PROTOCOL_VERSION.into(),
-            description: Some("登记下一次 Agent run 的主动上下文压缩".into()),
+            version: CONTEXT_SERVICE_VERSION.into(),
+            description: Some("立即压缩原生 TUI 提供的完整 Session 上下文".into()),
         })?;
         Ok(())
     }
 
-    /// 注销主动压缩服务并清理运行期状态。
+    /// 注销主动压缩服务。
     fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
         host.remove_service(CONTEXT_COMPACT_SERVICE)?;
-        self.manual_compaction_pending = false;
-        self.manual_compaction_run_id = None;
         Ok(())
     }
 
-    /// 接收 Command Provider 的可信回调并登记下一次手动压缩。
-    fn handle_service(&mut self, _host: &dyn PluginHostApi, call: ServiceCall) -> Result<Value> {
+    /// 接收原生 TUI 的完整 Session，并同步返回压缩后的替换上下文。
+    fn handle_service(&mut self, host: &dyn PluginHostApi, call: ServiceCall) -> Result<Value> {
         if call.name != CONTEXT_COMPACT_SERVICE {
             return Err(anyhow!("Context 插件未实现服务 `{}`", call.name));
         }
-        if call.caller_id != COMMAND_PLUGIN_ID {
+        if call.caller_id != TUI_PLUGIN_ID {
             return Err(anyhow!("调用方 `{}` 无权请求上下文压缩", call.caller_id));
         }
-        let response = handle_compact_command(&call.payload)?;
-        self.manual_compaction_pending = true;
-        Ok(response)
+        let outcome = compact_service_request(call.payload)?;
+        if let Some(event) = outcome.event {
+            host.emit_event(&event)?;
+        }
+        serde_json::to_value(outcome.context).context("序列化主动压缩结果失败")
     }
 
     /// 根据估算 token 水位透传、微压缩或完整压缩上下文，并发布对应事件。
@@ -80,29 +73,11 @@ impl AgentPlugin for ContextPlugin {
         host: &dyn PluginHostApi,
         request: ContextLoadRequest,
     ) -> Result<Option<LoadedContext>> {
-        let run_id = request.run_id.clone();
-        let manual = self.manual_compaction_pending
-            || self.manual_compaction_run_id.as_deref() == Some(run_id.as_str());
-        let outcome = compress_context(request, manual);
+        let outcome = compress_context(request, false);
         if let Some(event) = outcome.event {
             host.emit_event(&event)?;
         }
-        if self.manual_compaction_pending {
-            self.manual_compaction_pending = false;
-            self.manual_compaction_run_id = Some(run_id);
-        }
         Ok(Some(outcome.context))
-    }
-
-    /// Agent run 结束或达到步数上限后释放手动压缩状态。
-    fn on_event(&mut self, event: AgentEvent) {
-        if matches!(
-            event.kind,
-            AgentEventKind::RunFinished | AgentEventKind::StepLimitReached
-        ) && self.manual_compaction_run_id.as_deref() == Some(event.run_id.as_str())
-        {
-            self.manual_compaction_run_id = None;
-        }
     }
 }
 
@@ -211,17 +186,10 @@ fn compress_context(request: ContextLoadRequest, manual: bool) -> CompressionOut
     }
 }
 
-/// 校验 `/compact` 执行回调并生成 TUI 展示文本。
-fn handle_compact_command(payload: &Value) -> Result<Value> {
-    if payload.get("type").and_then(Value::as_str) != Some("execute")
-        || payload.get("handler_id").and_then(Value::as_str) != Some(COMPACT_HANDLER_ID)
-    {
-        return Err(anyhow!("无效的 `/compact` 命令回调"));
-    }
-    Ok(json!({
-        "type": "executed",
-        "result": "已请求上下文压缩，将在下一条消息发送前执行"
-    }))
+/// 解析原生 TUI 提供的完整请求，并立即执行不受自动水位限制的压缩。
+fn compact_service_request(payload: Value) -> Result<CompressionOutcome> {
+    let request = serde_json::from_value(payload).context("解析主动压缩请求失败")?;
+    Ok(compress_context(request, true))
 }
 
 /// 根据 Claude Code 的 `[1m]` 模型标记返回微压缩和完整压缩水位。
@@ -746,25 +714,34 @@ mod tests {
         );
     }
 
-    /// `/compact` 回调只接受 Command Provider 生成的执行载荷。
+    /// 主动压缩服务立即返回替换上下文，不保留下一轮待处理状态。
     #[test]
-    fn compact_command_callback_arms_manual_compaction() {
-        let response = handle_compact_command(&json!({
-            "type": "execute",
-            "handler_id": "compact",
-            "invocation": {
-                "command": "compact",
-                "input": "/compact",
-                "arguments": {}
-            }
-        }))
-        .expect("合法命令回调应成功");
+    fn compact_service_returns_replacement_immediately() {
+        let request = ContextLoadRequest {
+            run_id: "compact-now".into(),
+            step: 0,
+            provider: "manual".into(),
+            model: "test-model".into(),
+            system: None,
+            messages: vec![
+                text_message("user", "较早请求"),
+                text_message("assistant", "较早回复"),
+                text_message("user", "中间请求"),
+                text_message("assistant", "中间回复"),
+                text_message("user", "当前请求"),
+            ],
+        };
+        let outcome =
+            compact_service_request(serde_json::to_value(request).expect("主动压缩请求应能序列化"))
+                .expect("主动压缩服务应立即返回结果");
 
-        assert_eq!(response["type"], "executed");
-        assert!(handle_compact_command(&json!({
-            "type": "execute",
-            "handler_id": "other"
-        }))
-        .is_err());
+        assert_eq!(outcome.context.messages.len(), 3);
+        assert!(outcome.context.messages[0]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("本会话早期上下文已压缩")));
+        assert_eq!(
+            outcome.event.expect("应发布压缩事件").data["trigger"],
+            "manual"
+        );
     }
 }
