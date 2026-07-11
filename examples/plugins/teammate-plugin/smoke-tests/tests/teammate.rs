@@ -5,7 +5,9 @@ use agent_core::{
     ProviderAdapter,
 };
 use agent_plugin_host::{
-    wasm::WasmPluginHost, PluginHost, PluginHostServices, PluginServiceCall,
+    ui::{UiInput, UiInputEvent, UiPlacement, UiRenderRequest, UI_NAVIGATION_EVENT},
+    wasm::WasmPluginHost,
+    PluginHost, PluginHostServices, PluginServiceCall,
 };
 use agent_runtime::{
     AgentDeriveConfig, AgentPermissions, AgentProfileId, AgentRuntime, AgentTemplate, RuntimeLimits,
@@ -94,6 +96,50 @@ async fn component_runs_mailbox_dispatch_flow() {
         .await
         .expect("插件工具应可读取");
     assert_eq!(tools.len(), 10);
+    let declarations = PluginHost::ui_declarations(&host)
+        .await
+        .expect("团队 UI 声明应可读取");
+    assert_eq!(declarations.len(), 2);
+    assert_eq!(declarations[0].placement, UiPlacement::Right);
+    assert_eq!(declarations[1].placement, UiPlacement::Subview);
+    let dock = PluginHost::render_ui(
+        &host,
+        &UiRenderRequest {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-team-dock".into(),
+            instance_id: None,
+            width: 30,
+            height: 16,
+            focused: true,
+            frame: 1,
+        },
+    )
+    .await
+    .expect("团队摘要渲染不应失败")
+    .expect("团队摘要应返回可见帧");
+    assert!(dock.visible);
+    PluginHost::on_ui_input(
+        &host,
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-team-dock".into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: "enter".into(),
+                modifiers: Vec::new(),
+            },
+        },
+    )
+    .await
+    .expect("团队入口按键路由不应失败");
+    let navigation_events = AgentExtension::drain_events(&host)
+        .await
+        .expect("团队导航事件应可读取");
+    assert!(navigation_events.iter().any(|event| {
+        event["name"] == UI_NAVIGATION_EVENT
+            && event["data"]["action"]["push"]["view"]["view_id"]
+                == "teammate-team-workspace"
+    }));
     let services = PluginHost::services(&host)
         .await
         .expect("插件服务目录应可读取");
