@@ -1,0 +1,26 @@
+[package]
+name = "workflow-plugin"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "基于 Agent Runtime 的动态 DAG 工作流插件。"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+agent-plugin = { path = "../../../crates/agent-plugin" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wit-bindgen = "0.59"
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+debug = false
+strip = true
+lto = true
+
+# 该 WASM Guest 独立于原生 workspace 构建，避免宿主 target 编译 component exports。
+[workspace]
