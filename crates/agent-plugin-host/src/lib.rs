@@ -324,6 +324,9 @@ impl AgentExtension for CompositePluginHost {
             match host.before_tool(&current).await? {
                 ToolDecision::Allow => {}
                 ToolDecision::Block { reason } => return Ok(ToolDecision::Block { reason }),
+                ToolDecision::CancelRun { reason } => {
+                    return Ok(ToolDecision::CancelRun { reason });
+                }
                 ToolDecision::Rewrite { call } => current = call,
                 decision @ ToolDecision::RequireApproval { .. } => return Ok(decision),
             }
@@ -336,6 +339,9 @@ impl AgentExtension for CompositePluginHost {
             match policy.before_tool(&current).await? {
                 ToolDecision::Allow => {}
                 ToolDecision::Block { reason } => return Ok(ToolDecision::Block { reason }),
+                ToolDecision::CancelRun { reason } => {
+                    return Ok(ToolDecision::CancelRun { reason });
+                }
                 ToolDecision::Rewrite { call } => current = call,
                 decision @ ToolDecision::RequireApproval { .. } => return Ok(decision),
             }

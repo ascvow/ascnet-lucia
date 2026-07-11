@@ -381,6 +381,14 @@ pub enum ToolDecision {
         reason: String,
     },
 
+    /// Cancel the current Agent run while preserving its session.
+    /// 取消当前 Agent 运行，并保留会话供后续继续。
+    CancelRun {
+        /// User-facing cancellation reason without sensitive host data.
+        /// 不包含敏感宿主信息的取消原因。
+        reason: String,
+    },
+
     /// Rewrite the call before execution.
     /// 在执行前重写工具调用。
     Rewrite {

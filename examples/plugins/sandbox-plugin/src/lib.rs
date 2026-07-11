@@ -4,7 +4,10 @@ use agent_plugin::{
     export_plugin, AgentPlugin, ToolCall, ToolDecision, UiColor, UiDeclaration, UiFrame, UiInput,
     UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
-use std::{collections::BTreeMap, path::Component};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Component,
+};
 
 const APPROVAL_VIEW: &str = "sandbox-approval";
 
@@ -12,7 +15,6 @@ const APPROVAL_VIEW: &str = "sandbox-approval";
 #[derive(Debug, Clone)]
 enum ApprovalResolution {
     Allow,
-    Deny,
     Cancel,
 }
 
@@ -22,6 +24,7 @@ struct PendingApproval {
     call_id: String,
     tool_name: String,
     summary: String,
+    rule_key: String,
 }
 
 /// 沙盒插件状态；策略只检查调用参数，不持有宿主文件、进程或网络能力。
@@ -29,6 +32,8 @@ struct PendingApproval {
 pub struct SandboxPlugin {
     pending: Vec<PendingApproval>,
     resolutions: BTreeMap<String, ApprovalResolution>,
+    allowed_similar: BTreeSet<String>,
+    allow_all: bool,
     selected: usize,
 }
 
@@ -37,11 +42,8 @@ impl AgentPlugin for SandboxPlugin {
         if let Some(resolution) = self.resolutions.remove(&call.id) {
             return match resolution {
                 ApprovalResolution::Allow => ToolDecision::Allow,
-                ApprovalResolution::Deny => ToolDecision::Block {
-                    reason: format!("用户拒绝执行工具 `{}`", call.name),
-                },
-                ApprovalResolution::Cancel => ToolDecision::Block {
-                    reason: format!("用户取消工具 `{}` 的本次调用", call.name),
+                ApprovalResolution::Cancel => ToolDecision::CancelRun {
+                    reason: format!("用户取消工具 `{}` 并暂停当前 Agent 运行", call.name),
                 },
             };
         }
@@ -51,6 +53,11 @@ impl AgentPlugin for SandboxPlugin {
         }
 
         if !requires_approval(&call) {
+            return ToolDecision::Allow;
+        }
+
+        let rule_key = approval_rule_key(&call);
+        if self.allow_all || self.allowed_similar.contains(&rule_key) {
             return ToolDecision::Allow;
         }
 
@@ -64,6 +71,7 @@ impl AgentPlugin for SandboxPlugin {
                 call_id: call.id.clone(),
                 tool_name: call.name.clone(),
                 summary: approval_summary(&call),
+                rule_key,
             });
         }
         ToolDecision::RequireApproval {
@@ -81,7 +89,7 @@ impl AgentPlugin for SandboxPlugin {
             placement: UiPlacement::Input,
             size: UiSize {
                 width: None,
-                height: Some(3),
+                height: Some(6),
             },
             focusable: true,
         }]
@@ -104,11 +112,23 @@ impl AgentPlugin for SandboxPlugin {
             visible: true,
             lines: vec![
                 styled_line(
-                    format!("› 审批 {} · {}", pending.tool_name, pending.summary),
+                    format!("审批 {} · {}", pending.tool_name, pending.summary),
                     UiColor::Yellow,
                     true,
                 ),
-                approval_options(self.selected),
+                option_line("Y", "允许一次", self.selected == 0, UiColor::Green),
+                option_line("S", "允许相似调用", self.selected == 1, UiColor::Green),
+                option_line(
+                    "Cmd+A",
+                    if self.allow_all {
+                        "全部放行：已开启"
+                    } else {
+                        "全部放行：未开启"
+                    },
+                    self.selected == 2,
+                    UiColor::Yellow,
+                ),
+                option_line("C", "取消并暂停 Agent", self.selected == 3, UiColor::Red),
             ],
         })
     }
@@ -117,26 +137,26 @@ impl AgentPlugin for SandboxPlugin {
         if input.view_id != APPROVAL_VIEW || self.pending.is_empty() {
             return;
         }
-        let UiInputEvent::Key { code, .. } = input.event else {
+        let UiInputEvent::Key { code, modifiers } = input.event else {
             return;
         };
+        if matches!(code.as_str(), "a" | "A") && modifiers.iter().any(|value| value == "meta") {
+            self.resolve_current(2);
+            return;
+        }
         match code.as_str() {
             "left" | "up" => {
-                self.selected = self.selected.checked_sub(1).unwrap_or(2);
+                self.selected = self.selected.checked_sub(1).unwrap_or(3);
                 return;
             }
             "right" | "down" | "tab" => {
-                self.selected = (self.selected + 1) % 3;
+                self.selected = (self.selected + 1) % 4;
                 return;
             }
-            "y" | "Y" => self.resolve_current(ApprovalResolution::Allow),
-            "n" | "N" => self.resolve_current(ApprovalResolution::Deny),
-            "c" | "C" | "escape" => self.resolve_current(ApprovalResolution::Cancel),
-            "enter" => match self.selected {
-                0 => self.resolve_current(ApprovalResolution::Allow),
-                1 => self.resolve_current(ApprovalResolution::Deny),
-                _ => self.resolve_current(ApprovalResolution::Cancel),
-            },
+            "y" | "Y" => self.resolve_current(0),
+            "s" | "S" => self.resolve_current(1),
+            "c" | "C" | "escape" => self.resolve_current(3),
+            "enter" => self.resolve_current(self.selected),
             _ => {}
         }
     }
@@ -144,11 +164,23 @@ impl AgentPlugin for SandboxPlugin {
 
 impl SandboxPlugin {
     /// 处理当前审批并重置下一条请求的默认选项。
-    fn resolve_current(&mut self, resolution: ApprovalResolution) {
+    fn resolve_current(&mut self, action: usize) {
         if self.pending.is_empty() {
             return;
         }
         let pending = self.pending.remove(0);
+        let resolution = match action {
+            0 => ApprovalResolution::Allow,
+            1 => {
+                self.allowed_similar.insert(pending.rule_key);
+                ApprovalResolution::Allow
+            }
+            2 => {
+                self.allow_all = true;
+                ApprovalResolution::Allow
+            }
+            _ => ApprovalResolution::Cancel,
+        };
         self.resolutions.insert(pending.call_id, resolution);
         self.selected = 0;
     }
@@ -175,6 +207,48 @@ fn requires_approval(call: &ToolCall) -> bool {
         call.name.as_str(),
         "read_file" | "list_directory" | "search_files"
     )
+}
+
+/// 构造“允许相似调用”使用的保守规则键。
+fn approval_rule_key(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "shell" => {
+            let command = call
+                .args
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            format!("shell:{}", shell_command_family(command))
+        }
+        "write_file" => {
+            let parent = call
+                .args
+                .get("path")
+                .and_then(|value| value.as_str())
+                .and_then(|path| std::path::Path::new(path).parent())
+                .and_then(|path| path.to_str())
+                .filter(|path| !path.is_empty())
+                .unwrap_or(".");
+            format!("write_file:{parent}")
+        }
+        name => format!("tool:{name}"),
+    }
+}
+
+/// 提取 Shell 命令的前两个命令族词，避免按完整动态参数过度细分。
+fn shell_command_family(command: &str) -> String {
+    let family = command
+        .split_whitespace()
+        .filter(|token| !token.contains('='))
+        .take(2)
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if family.is_empty() {
+        "unknown".into()
+    } else {
+        family
+    }
 }
 
 /// 生成不包含文件内容或密钥值的审批摘要。
@@ -256,28 +330,19 @@ fn styled_line(text: impl Into<String>, color: UiColor, bold: bool) -> UiLine {
     }
 }
 
-/// 渲染可用方向键切换的审批选项行。
-fn approval_options(selected: usize) -> UiLine {
+/// 渲染一个纵向审批选项。
+fn option_line(shortcut: &str, label: &str, selected: bool, color: UiColor) -> UiLine {
     UiLine {
         spans: vec![
-            option_span(" Y 允许一次 ", selected == 0, UiColor::Green),
             UiSpan {
-                text: "  ".into(),
-                style: UiStyle::default(),
-            },
-            option_span(" N 拒绝 ", selected == 1, UiColor::Red),
-            UiSpan {
-                text: "  ".into(),
-                style: UiStyle::default(),
-            },
-            option_span(" C 取消调用 ", selected == 2, UiColor::Yellow),
-            UiSpan {
-                text: "  ←/→ 选择 · Enter 确认".into(),
+                text: if selected { "› " } else { "  " }.into(),
                 style: UiStyle {
-                    foreground: Some(UiColor::Cyan),
+                    foreground: Some(color),
+                    bold: selected,
                     ..UiStyle::default()
                 },
             },
+            option_span(&format!(" {shortcut} {label} "), selected, color),
         ],
     }
 }
@@ -346,16 +411,16 @@ mod tests {
         assert!(matches!(decision, ToolDecision::Block { .. }));
     }
 
-    /// 方向键切换到拒绝后，Enter 应拒绝当前调用。
+    /// 方向键切换到取消后，Enter 应暂停当前 Agent 运行。
     #[test]
-    fn arrow_selection_confirms_denial() {
+    fn arrow_selection_cancels_run() {
         let call = ToolCall::new("shell-1", "shell", json!({"command": "cargo test"}));
         let mut plugin = SandboxPlugin::default();
         assert!(matches!(
             plugin.before_tool(call.clone()),
             ToolDecision::RequireApproval { .. }
         ));
-        for code in ["right", "enter"] {
+        for code in ["right", "right", "right", "enter"] {
             plugin.on_ui_input(UiInput {
                 plugin_id: "sandbox".into(),
                 view_id: APPROVAL_VIEW.into(),
@@ -368,7 +433,7 @@ mod tests {
         }
         assert!(matches!(
             plugin.before_tool(call),
-            ToolDecision::Block { .. }
+            ToolDecision::CancelRun { .. }
         ));
     }
 
@@ -388,5 +453,61 @@ mod tests {
             },
         });
         assert_eq!(plugin.before_tool(call), ToolDecision::Allow);
+    }
+
+    /// 允许相似 Shell 调用只应放行同一命令族。
+    #[test]
+    fn similar_mode_matches_shell_command_family() {
+        let first = ToolCall::new("first", "shell", json!({"command": "cargo test -p one"}));
+        let similar = ToolCall::new("second", "shell", json!({"command": "cargo test -p two"}));
+        let different = ToolCall::new("third", "shell", json!({"command": "cargo check"}));
+        let mut plugin = SandboxPlugin::default();
+        plugin.before_tool(first.clone());
+        plugin.on_ui_input(UiInput {
+            plugin_id: "sandbox".into(),
+            view_id: APPROVAL_VIEW.into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: "s".into(),
+                modifiers: Vec::new(),
+            },
+        });
+
+        assert_eq!(plugin.before_tool(first), ToolDecision::Allow);
+        assert_eq!(plugin.before_tool(similar), ToolDecision::Allow);
+        assert!(matches!(
+            plugin.before_tool(different),
+            ToolDecision::RequireApproval { .. }
+        ));
+    }
+
+    /// Cmd+A 应开启全部放行，且不得绕过敏感路径硬拒绝。
+    #[test]
+    fn allow_all_keeps_sensitive_path_blocked() {
+        let shell = ToolCall::new("shell-all", "shell", json!({"command": "cargo test"}));
+        let write = ToolCall::new(
+            "write-all",
+            "write_file",
+            json!({"path": "src/lib.rs", "content": ""}),
+        );
+        let secret = ToolCall::new("secret-all", "read_file", json!({"path": ".env"}));
+        let mut plugin = SandboxPlugin::default();
+        plugin.before_tool(shell.clone());
+        plugin.on_ui_input(UiInput {
+            plugin_id: "sandbox".into(),
+            view_id: APPROVAL_VIEW.into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: "a".into(),
+                modifiers: vec!["meta".into()],
+            },
+        });
+
+        assert_eq!(plugin.before_tool(shell), ToolDecision::Allow);
+        assert_eq!(plugin.before_tool(write), ToolDecision::Allow);
+        assert!(matches!(
+            plugin.before_tool(secret),
+            ToolDecision::Block { .. }
+        ));
     }
 }

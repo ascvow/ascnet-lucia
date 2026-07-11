@@ -22,6 +22,11 @@ pub enum ToolDecision {
         /// 返回给模型和事件消费者的阻止原因，不应包含敏感宿主信息。
         reason: String,
     },
+    /// 取消当前 Agent 运行，并保留会话供后续继续。
+    CancelRun {
+        /// 返回给事件消费者的取消原因，不应包含敏感宿主信息。
+        reason: String,
+    },
     /// 在执行前重写工具调用。
     Rewrite {
         /// 替换原调用的完整工具调用；调用 ID 应保持可关联性。
@@ -164,6 +169,9 @@ impl AgentExtension for CompositeAgentExtension {
             match decision {
                 ToolDecision::Allow => {}
                 ToolDecision::Block { reason } => return Ok(ToolDecision::Block { reason }),
+                ToolDecision::CancelRun { reason } => {
+                    return Ok(ToolDecision::CancelRun { reason });
+                }
                 ToolDecision::Rewrite { call } => current = Some(call),
                 decision @ ToolDecision::RequireApproval { .. } => return Ok(decision),
             }

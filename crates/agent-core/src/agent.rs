@@ -892,6 +892,26 @@ impl Agent {
                     .await?;
                 results.push(result);
 
+                // 工具策略可以在审批点取消当前运行；立即跳过同一批剩余工具。
+                if self.take_cancelled() {
+                    for skipped in &tool_calls[index + 1..] {
+                        self.emit(
+                            &run_id,
+                            AgentEventKind::ToolSkipped,
+                            step,
+                            json!({ "id": &skipped.id, "name": &skipped.name }),
+                        )
+                        .await?;
+                        results.push(ToolResult::error(
+                            skipped.id.clone(),
+                            skipped.name.clone(),
+                            "Skipped due to cancelled run",
+                        ));
+                    }
+                    run_cancelled = true;
+                    break;
+                }
+
                 if let Some(message) = self.pop_steering() {
                     // 剩余工具标记为 Skipped，让模型知道它们没有执行。
                     for skipped in &tool_calls[index + 1..] {
@@ -1011,6 +1031,12 @@ impl Agent {
             ToolDecision::Allow => call,
             ToolDecision::Rewrite { call } => call,
             ToolDecision::Block { reason } => {
+                let result = ToolResult::error(original_call.id, original_call.name, reason);
+                self.extension.after_tool(&result).await?;
+                return Ok(result);
+            }
+            ToolDecision::CancelRun { reason } => {
+                self.control().cancel();
                 let result = ToolResult::error(original_call.id, original_call.name, reason);
                 self.extension.after_tool(&result).await?;
                 return Ok(result);
@@ -1177,6 +1203,9 @@ mod tests {
         checks: AtomicUsize,
     }
 
+    /// 在工具执行前取消当前运行的测试扩展。
+    struct CancelRunExtension;
+
     #[async_trait]
     impl AgentExtension for DeferredApprovalExtension {
         async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
@@ -1188,6 +1217,15 @@ mod tests {
                 });
             }
             Ok(ToolDecision::Allow)
+        }
+    }
+
+    #[async_trait]
+    impl AgentExtension for CancelRunExtension {
+        async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
+            Ok(ToolDecision::CancelRun {
+                reason: "用户取消审批".into(),
+            })
         }
     }
 
@@ -1430,6 +1468,34 @@ mod tests {
 
         assert_eq!(run.final_text, "审批后完成");
         assert_eq!(run.steps_used, 2);
+    }
+
+    /// 工具策略取消应结束当前运行，并把尚未执行的工具标记为跳过。
+    #[tokio::test]
+    async fn tool_policy_can_cancel_current_run() {
+        let calls = vec![
+            ToolCall::new("cancelled", "echo", json!({"value": "一"})),
+            ToolCall::new("skipped", "echo", json!({"value": "二"})),
+        ];
+        let agent = agent_with_script(vec![ModelResponse::tool_calls(calls)])
+            .with_extension(Arc::new(CancelRunExtension));
+
+        let run = agent.run("测试取消").await.expect("取消应优雅结束运行");
+
+        assert!(run.cancelled);
+        let results: Vec<_> = run
+            .session
+            .messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                crate::model::ContentBlock::ToolResult { result } => Some(result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].content_text().contains("用户取消审批"));
+        assert!(results[1].content_text().contains("Skipped"));
     }
 
     /// Agent 会转发模型文本增量，同时保留完整最终响应。

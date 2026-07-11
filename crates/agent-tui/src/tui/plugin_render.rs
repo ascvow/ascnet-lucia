@@ -225,13 +225,20 @@ pub(crate) fn render_plugin_input(frame: &mut Frame, app: &mut App, workspace: R
     else {
         return;
     };
+    let requested_height = app.plugin_views[index]
+        .declaration
+        .size
+        .height
+        .unwrap_or(3)
+        .max(3)
+        .min(workspace.height.saturating_sub(1));
     let area = Rect::new(
         workspace.x,
         workspace
             .y
-            .saturating_add(workspace.height.saturating_sub(4)),
+            .saturating_add(workspace.height.saturating_sub(requested_height + 1)),
         workspace.width,
-        3.min(workspace.height.saturating_sub(1)),
+        requested_height,
     );
     if area.is_empty() {
         return;

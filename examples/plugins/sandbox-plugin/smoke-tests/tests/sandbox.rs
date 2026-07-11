@@ -50,7 +50,7 @@ async fn wasm_host_routes_sandbox_approval() {
             view_id: APPROVAL_VIEW.into(),
             instance_id: None,
             width: 68,
-            height: 3,
+            height: 6,
             focused: true,
             frame: 1,
         })
