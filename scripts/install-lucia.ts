@@ -55,6 +55,10 @@ const bundles: OfficialPluginBundle[] = [
     id: 'plan',
     files: ['plugin.toml', 'target/wasm32-wasip2/release/plan_plugin.wasm'],
   },
+  {
+    id: 'sandbox',
+    files: ['plugin.toml', 'target/wasm32-wasip2/release/sandbox_plugin.wasm'],
+  },
 ]
 
 /**

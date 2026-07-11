@@ -15,6 +15,9 @@ pub const SUPPORTED_PLUGIN_API_VERSION: &str = "0.6.0";
 /// 上下文加载器使用的标准能力 ID。
 pub const CONTEXT_LOADER_CAPABILITY: &str = "agent.context-loader";
 
+/// 最终工具策略使用的标准独占能力 ID。
+pub const TOOL_POLICY_CAPABILITY: &str = "agent.tool-policy";
+
 /// 应用配置文件中的插件列表部分。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PluginListConfig {

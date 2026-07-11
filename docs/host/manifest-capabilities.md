@@ -45,6 +45,17 @@ version = "1.0.0"
 mode = "exclusive"
 ```
 
+最终工具策略同样使用独占能力声明：
+
+```toml
+[[provides]]
+id = "agent.tool-policy"
+version = "1.0.0"
+mode = "exclusive"
+```
+
+Host 会先串联普通插件的工具 Rewrite，再把最终调用交给选中的策略 owner。策略可以允许、阻止、重写或请求用户审批，避免后续 Rewrite 绕过安全检查。
+
 `multi` 允许多个 provider 同时存在；`exclusive` 在同一运行时只能选择一个。Host 在实例化任意 component 前校验能力 ID、SemVer、基数一致性和独占冲突，但不理解能力背后的压缩、MCP 或 Skill 业务。
 
 当多个插件提供同一独占能力时，应用配置必须显式选择 owner：

@@ -56,6 +56,9 @@ pub async fn load_wasm_plugins_with_selection_and_services<P: AsRef<Path>>(
     if let Some(owner) = resolved_capabilities.exclusive_owner(CONTEXT_LOADER_CAPABILITY) {
         composite.set_capability_owner(CONTEXT_LOADER_CAPABILITY, owner);
     }
+    if let Some(owner) = resolved_capabilities.exclusive_owner(TOOL_POLICY_CAPABILITY) {
+        composite.set_capability_owner(TOOL_POLICY_CAPABILITY, owner);
+    }
     for index in order {
         let (manifest, wasm_path, plugin_dir) = pending[index].clone();
         let loading = WasmPluginHost::load_with_limits_in_dir(
@@ -409,6 +412,9 @@ pub async fn load_wasm_plugins_resilient_with_selection_and_services<P: AsRef<Pa
     let selected_context_owner = resolved_capabilities
         .exclusive_owner(CONTEXT_LOADER_CAPABILITY)
         .map(str::to_string);
+    let selected_tool_policy_owner = resolved_capabilities
+        .exclusive_owner(TOOL_POLICY_CAPABILITY)
+        .map(str::to_string);
     let services = Arc::new(ServiceRegistry::default());
     let mut composite = CompositePluginHost::new();
     failures.extend(dependency_failures);
@@ -458,6 +464,11 @@ pub async fn load_wasm_plugins_resilient_with_selection_and_services<P: AsRef<Pa
     if let Some(owner) = selected_context_owner {
         if composite.get(&owner).is_some() {
             composite.set_capability_owner(CONTEXT_LOADER_CAPABILITY, owner);
+        }
+    }
+    if let Some(owner) = selected_tool_policy_owner {
+        if composite.get(&owner).is_some() {
+            composite.set_capability_owner(TOOL_POLICY_CAPABILITY, owner);
         }
     }
     Ok(PluginLoadReport {

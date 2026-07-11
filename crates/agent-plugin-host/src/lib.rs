@@ -311,11 +311,33 @@ impl AgentExtension for CompositePluginHost {
 
     async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
         let mut current = call.clone();
+        let policy_owner = self
+            .capability_owner(manifest::TOOL_POLICY_CAPABILITY)
+            .map(str::to_string);
         for host in &self.hosts {
+            if host
+                .id()
+                .is_some_and(|id| Some(id) == policy_owner.as_deref())
+            {
+                continue;
+            }
             match host.before_tool(&current).await? {
                 ToolDecision::Allow => {}
                 ToolDecision::Block { reason } => return Ok(ToolDecision::Block { reason }),
                 ToolDecision::Rewrite { call } => current = call,
+                decision @ ToolDecision::RequireApproval { .. } => return Ok(decision),
+            }
+        }
+
+        if let Some(owner) = policy_owner {
+            let policy = self
+                .get(&owner)
+                .ok_or_else(|| anyhow!("工具策略能力 owner `{owner}` 未加载"))?;
+            match policy.before_tool(&current).await? {
+                ToolDecision::Allow => {}
+                ToolDecision::Block { reason } => return Ok(ToolDecision::Block { reason }),
+                ToolDecision::Rewrite { call } => current = call,
+                decision @ ToolDecision::RequireApproval { .. } => return Ok(decision),
             }
         }
 
@@ -481,6 +503,51 @@ mod tests {
         id: &'static str,
         tool: ToolSpec,
         calls: Arc<AtomicUsize>,
+    }
+
+    /// 将任意工具重写为指定名称的测试宿主。
+    struct RewritePluginHost {
+        id: &'static str,
+        target: &'static str,
+    }
+
+    #[async_trait]
+    impl AgentExtension for RewritePluginHost {
+        async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
+            let mut call = call.clone();
+            call.name = self.target.into();
+            Ok(ToolDecision::Rewrite { call })
+        }
+    }
+
+    #[async_trait]
+    impl PluginHost for RewritePluginHost {
+        fn id(&self) -> Option<&str> {
+            Some(self.id)
+        }
+    }
+
+    /// 只允许看到最终工具名的测试策略宿主。
+    struct FinalPolicyPluginHost;
+
+    #[async_trait]
+    impl AgentExtension for FinalPolicyPluginHost {
+        async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
+            if call.name == "rewritten" {
+                Ok(ToolDecision::Block {
+                    reason: "最终策略已检查重写调用".into(),
+                })
+            } else {
+                Ok(ToolDecision::Allow)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PluginHost for FinalPolicyPluginHost {
+        fn id(&self) -> Option<&str> {
+            Some("policy")
+        }
     }
 
     #[async_trait]
@@ -688,6 +755,25 @@ mod tests {
         assert_eq!(result.content["owner"], "second_tool");
         assert_eq!(first_calls.load(Ordering::SeqCst), 0);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 独占工具策略 owner 必须在其他插件完成 Rewrite 后执行。
+    #[tokio::test]
+    async fn selected_tool_policy_checks_final_rewritten_call() {
+        let mut host = CompositePluginHost::new();
+        host.push(Arc::new(FinalPolicyPluginHost));
+        host.push(Arc::new(RewritePluginHost {
+            id: "rewriter",
+            target: "rewritten",
+        }));
+        host.set_capability_owner(manifest::TOOL_POLICY_CAPABILITY, "policy");
+
+        let decision = host
+            .before_tool(&ToolCall::new("call", "original", json!({})))
+            .await
+            .expect("最终策略检查不应失败");
+
+        assert!(matches!(decision, ToolDecision::Block { .. }));
     }
 
     /// UI 声明必须使用可信宿主 ID，渲染和输入只能调用对应 owner。

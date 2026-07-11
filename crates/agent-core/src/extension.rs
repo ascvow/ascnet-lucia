@@ -27,6 +27,20 @@ pub enum ToolDecision {
         /// 替换原调用的完整工具调用；调用 ID 应保持可关联性。
         call: ToolCall,
     },
+    /// 暂停工具执行，等待扩展侧完成用户审批后重新检查同一调用。
+    RequireApproval {
+        /// 扩展生成的稳定审批请求 ID，用于 UI 与审计关联。
+        request_id: String,
+        /// 面向用户的审批说明，不应包含未脱敏的密钥或工具参数。
+        reason: String,
+        /// Core 再次询问策略前的等待毫秒数；会被限制在安全范围内。
+        #[serde(default = "default_approval_poll_interval_ms")]
+        poll_interval_ms: u64,
+    },
+}
+
+fn default_approval_poll_interval_ms() -> u64 {
+    100
 }
 
 /// Agent 运行循环支持的最小宿主扩展接口。
@@ -151,6 +165,7 @@ impl AgentExtension for CompositeAgentExtension {
                 ToolDecision::Allow => {}
                 ToolDecision::Block { reason } => return Ok(ToolDecision::Block { reason }),
                 ToolDecision::Rewrite { call } => current = Some(call),
+                decision @ ToolDecision::RequireApproval { .. } => return Ok(decision),
             }
         }
         Ok(match current {

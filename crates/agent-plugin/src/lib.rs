@@ -384,6 +384,25 @@ pub enum ToolDecision {
         /// Guest 希望宿主改为执行的完整工具调用。
         call: ToolCall,
     },
+
+    /// Pause execution until the plugin UI resolves this approval request.
+    /// 暂停执行，直到插件 UI 处理该审批请求。
+    RequireApproval {
+        /// Stable request ID used by UI and audit records.
+        /// UI 与审计记录使用的稳定请求 ID。
+        request_id: String,
+        /// User-facing explanation without sensitive argument values.
+        /// 不包含敏感参数值的用户审批说明。
+        reason: String,
+        /// Delay before Core asks the policy again.
+        /// Core 再次询问策略前的等待毫秒数。
+        #[serde(default = "default_approval_poll_interval_ms")]
+        poll_interval_ms: u64,
+    },
+}
+
+fn default_approval_poll_interval_ms() -> u64 {
+    100
 }
 
 /// 插件启动时由宿主提供的只读上下文。

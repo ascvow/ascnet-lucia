@@ -19,7 +19,7 @@ use agent_tool::{ToolCall, ToolRegistry, ToolResult, ToolSpec};
 use anyhow::{anyhow, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 /// Default system prompt for the helpful Lucia agent.
 /// Lucia 实用型 Agent 的默认 system prompt。
@@ -990,7 +990,23 @@ impl Agent {
         step: usize,
     ) -> Result<ToolResult> {
         let original_call = call.clone();
-        let decision = self.extension.before_tool(&call).await?;
+        let decision = loop {
+            let decision = self.extension.before_tool(&call).await?;
+            match decision {
+                ToolDecision::RequireApproval {
+                    poll_interval_ms, ..
+                } => {
+                    if self.control().cancel_requested() {
+                        break ToolDecision::Block {
+                            reason: "工具审批等待已取消".to_string(),
+                        };
+                    }
+                    tokio::time::sleep(Duration::from_millis(poll_interval_ms.clamp(50, 1_000)))
+                        .await;
+                }
+                decision => break decision,
+            }
+        };
         let call = match decision {
             ToolDecision::Allow => call,
             ToolDecision::Rewrite { call } => call,
@@ -999,6 +1015,7 @@ impl Agent {
                 self.extension.after_tool(&result).await?;
                 return Ok(result);
             }
+            ToolDecision::RequireApproval { .. } => unreachable!("审批决策已在执行前处理"),
         };
 
         self.emit(
@@ -1153,6 +1170,25 @@ mod tests {
     /// 发布一次扩展事件的测试扩展。
     struct PublishingExtension {
         events: std::sync::Mutex<Vec<Value>>,
+    }
+
+    /// 首次检查请求审批、再次检查放行的测试扩展。
+    struct DeferredApprovalExtension {
+        checks: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentExtension for DeferredApprovalExtension {
+        async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
+            if self.checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(ToolDecision::RequireApproval {
+                    request_id: format!("approval-{}", call.id),
+                    reason: "等待测试审批".into(),
+                    poll_interval_ms: 1,
+                });
+            }
+            Ok(ToolDecision::Allow)
+        }
     }
 
     #[async_trait]
@@ -1372,6 +1408,28 @@ mod tests {
             ToolSpec::new("echo", "回显输入", ToolSpec::empty_object_schema()),
             |args| async move { Ok(args) },
         )
+    }
+
+    /// Core 必须等待审批扩展给出最终决策后再执行原工具调用。
+    #[tokio::test]
+    async fn tool_execution_waits_for_deferred_approval() {
+        let call = ToolCall::new("approval-call", "echo", json!({"value": "测试"}));
+        let mut agent = agent_with_script(vec![
+            ModelResponse::tool_calls(vec![call]),
+            ModelResponse::text("审批后完成"),
+        ])
+        .with_extension(Arc::new(DeferredApprovalExtension {
+            checks: AtomicUsize::new(0),
+        }));
+        agent
+            .tools_mut()
+            .register(echo_tool())
+            .expect("注册审批测试工具");
+
+        let run = agent.run("执行审批工具").await.expect("审批后应继续执行");
+
+        assert_eq!(run.final_text, "审批后完成");
+        assert_eq!(run.steps_used, 2);
     }
 
     /// Agent 会转发模型文本增量，同时保留完整最终响应。

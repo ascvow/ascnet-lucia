@@ -8,7 +8,7 @@ use super::{
     contribution::ContributionRegistry,
     manifest::{
         resolve_plugin_capabilities, resolve_plugin_load_order, PluginManifest,
-        CONTEXT_LOADER_CAPABILITY,
+        CONTEXT_LOADER_CAPABILITY, TOOL_POLICY_CAPABILITY,
     },
     service::{PluginService, PluginServiceCall, ServiceHandler, ServiceRegistry},
     AgentEvent, AgentRuntimeHostServices, CompositePluginHost, PluginHost, PluginHostServices,
