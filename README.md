@@ -140,6 +140,14 @@ bun install
 bun run docs:dev
 ```
 
+生成包含每个公开模块、类型、字段、trait 和函数的 Rustdoc API 手册：
+
+```bash
+bun run docs:rust
+```
+
+需要同时查看私有实现时使用 `bun run docs:rust:private`。详细入口见 [Rust API 手册](docs/reference/rust-api.md)。
+
 ## 开发与验证
 
 ```bash

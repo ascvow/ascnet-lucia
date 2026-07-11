@@ -18,9 +18,15 @@ pub enum ToolDecision {
     #[default]
     Allow,
     /// 阻止工具调用，并将原因作为工具错误返回给模型。
-    Block { reason: String },
+    Block {
+        /// 返回给模型和事件消费者的阻止原因，不应包含敏感宿主信息。
+        reason: String,
+    },
     /// 在执行前重写工具调用。
-    Rewrite { call: ToolCall },
+    Rewrite {
+        /// 替换原调用的完整工具调用；调用 ID 应保持可关联性。
+        call: ToolCall,
+    },
 }
 
 /// Agent 运行循环支持的最小宿主扩展接口。

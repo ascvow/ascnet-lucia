@@ -49,7 +49,9 @@
     "test:live": "bun run build:plugin:echo && cargo run --offline --manifest-path tools/lucia-live-tests/Cargo.toml --",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
-    "docs:preview": "vitepress preview docs"
+    "docs:preview": "vitepress preview docs",
+    "docs:rust": "cargo doc -p agent-core -p agent-tool -p agent-session -p agent-runtime -p agent-plugin-host -p agent-plugin -p agent-plugin-manager --lib --no-deps",
+    "docs:rust:private": "cargo doc -p agent-core -p agent-tool -p agent-session -p agent-runtime -p agent-plugin-host -p agent-plugin -p agent-plugin-manager --lib --no-deps --document-private-items"
   },
   "devDependencies": {
     "vitepress": "^1.6.4"

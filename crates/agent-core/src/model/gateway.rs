@@ -12,8 +12,11 @@ use std::{collections::HashMap, sync::Arc};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
+    /// OpenAI 官方接口，可选择 Responses 或 Chat Completions 协议。
     OpenAi,
+    /// 实现 OpenAI Chat Completions 兼容协议的第三方或本地服务。
     OpenAiCompatible,
+    /// Anthropic Messages 接口。
     Anthropic,
 }
 
@@ -22,7 +25,9 @@ pub enum ProviderKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum OpenAiProtocol {
+    /// OpenAI Responses API；支持 Responses 特有的输入和推理字段。
     Responses,
+    /// OpenAI Chat Completions API 及其兼容实现。
     ChatCompletions,
 }
 

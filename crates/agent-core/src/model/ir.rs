@@ -16,10 +16,15 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
+    /// 最高优先级的系统指令，由应用或 Agent 配置提供。
     System,
+    /// 应用或扩展注入的开发者指令，优先级低于系统指令。
     Developer,
+    /// 最终用户输入，包括文本和附件。
     User,
+    /// 模型生成的文本、推理或工具调用。
     Assistant,
+    /// 宿主执行工具后返回给模型的结果。
     Tool,
 }
 
@@ -44,7 +49,10 @@ impl MessageRole {
 pub enum ContentBlock {
     /// Plain text content.
     /// 普通文本内容。
-    Text { text: String },
+    Text {
+        /// UTF-8 文本；适配器负责按目标协议进行转义和分块。
+        text: String,
+    },
 
     /// Thinking / reasoning content emitted by the model.
     /// 模型输出的思维链/推理内容。
@@ -53,22 +61,35 @@ pub enum ContentBlock {
     /// OpenAI 加密推理签名等）。跨 provider 转换时应丢弃 signature 并将
     /// thinking 降级为纯文本。
     Thinking {
+        /// 模型返回的完整推理文本；是否向最终用户展示由应用决定。
         thinking: String,
+        /// 服务商用于跨轮验证推理块的可选签名，只能回传给同一服务商。
         signature: Option<String>,
     },
 
     /// Tool call block emitted by the model.
     /// 模型输出的工具调用块。
-    ToolCall { call: ToolCall },
+    ToolCall {
+        /// 模型请求宿主执行的结构化工具调用。
+        call: ToolCall,
+    },
 
     /// 宿主工具或扩展返回的工具结果块。
-    ToolResult { result: ToolResult },
+    ToolResult {
+        /// 与先前调用 ID 对应的成功值或错误结果。
+        result: ToolResult,
+    },
 
     /// 用户提供的图片附件。
     ///
     /// `data` 为 base64 编码的原始图片字节；`media_type` 为标准 MIME 类型
     /// （如 `image/png`）。适配器负责映射为各 provider 的图片输入格式。
-    Image { media_type: String, data: String },
+    Image {
+        /// 图片 MIME 类型，例如 `image/png` 或 `image/jpeg`。
+        media_type: String,
+        /// 原始图片字节的 base64 编码，不包含 data URL 前缀。
+        data: String,
+    },
 
     /// 用户提供的文件附件。
     ///
@@ -76,8 +97,11 @@ pub enum ContentBlock {
     /// 原生支持的类型（如 PDF）走 provider 文档输入，文本类型内联为文本，
     /// 其余类型降级为占位说明，不会静默丢弃。
     File {
+        /// 提供给模型和诊断事件的原始文件名，不作为宿主文件路径使用。
         name: String,
+        /// 文件 MIME 类型，用于选择 provider 输入映射。
         media_type: String,
+        /// 原始文件字节的 base64 编码，不包含 data URL 前缀。
         data: String,
     },
 }
@@ -106,7 +130,9 @@ impl ContentBlock {
 /// 与服务商无关的会话消息。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelMessage {
+    /// 消息在会话协议中的角色，决定适配器使用的目标消息类型。
     pub role: MessageRole,
+    /// 有序内容块；顺序在跨服务商转换时必须保持。
     pub content: Vec<ContentBlock>,
 }
 
@@ -211,7 +237,10 @@ pub enum ToolChoice {
 
     /// Force a specific tool.
     /// 强制调用指定工具。
-    Tool { name: String },
+    Tool {
+        /// 必须调用的公开工具名称；应与请求中的 [`ToolSpec`] 名称一致。
+        name: String,
+    },
 }
 
 impl Default for ToolChoice {
@@ -224,12 +253,19 @@ impl Default for ToolChoice {
 /// ReAct loop 发送给模型适配器的请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRequest {
+    /// 发送给服务商的模型 ID，不是逻辑 provider 名称。
     pub model: String,
+    /// 本轮系统提示；适配器按目标协议放入专用字段或系统消息。
     pub system: Option<String>,
+    /// 组成模型上下文的有序消息列表。
     pub messages: Vec<ModelMessage>,
+    /// 本轮允许模型调用的工具定义。
     pub tools: Vec<ToolSpec>,
+    /// 自动、禁用或强制指定工具的选择策略。
     pub tool_choice: ToolChoice,
+    /// 本轮最大输出 token 数；`None` 使用服务商默认值。
     pub max_tokens: Option<u32>,
+    /// 本轮采样温度；`None` 使用服务商默认值。
     pub temperature: Option<f32>,
 
     /// 推理/思维链级别。各适配器负责映射为 provider 特有参数。
@@ -265,11 +301,17 @@ impl ModelRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
+    /// 模型自然停止或命中停止序列。
     Stop,
+    /// 模型要求执行一个或多个工具调用。
     ToolCalls,
+    /// 响应达到输出长度限制。
     Length,
+    /// 模型拒绝处理请求。
     Refusal,
+    /// 服务商报告请求或生成错误。
     Error,
+    /// 服务商返回了当前适配器无法识别的停止原因。
     Unknown,
 }
 
@@ -277,8 +319,11 @@ pub enum FinishReason {
 /// Token 用量；如果服务商返回该信息则填充。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenUsage {
+    /// 服务商报告的输入 token 数；未提供时为 `None`。
     pub input_tokens: Option<u64>,
+    /// 服务商报告的输出 token 数；未提供时为 `None`。
     pub output_tokens: Option<u64>,
+    /// 服务商报告或由输入输出相加得到的总 token 数。
     pub total_tokens: Option<u64>,
 }
 
@@ -472,9 +517,13 @@ fn value_as_f64(value: &Value) -> Option<f64> {
 /// 与服务商无关的模型响应。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelResponse {
+    /// 服务商无关的有序内容块。
     pub content: Vec<ContentBlock>,
+    /// 从内容块中提取并规范化后的工具调用列表。
     pub tool_calls: Vec<ToolCall>,
+    /// 规范化后的停止原因，用于决定 ReAct 是否继续。
     pub finish_reason: FinishReason,
+    /// 服务商返回的 token 用量；服务商未提供时为 `None`。
     pub usage: Option<TokenUsage>,
 
     /// Provider-reported billing or cost fields, if present.

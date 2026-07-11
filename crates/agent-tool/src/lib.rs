@@ -3,6 +3,8 @@
 //! 工具抽象层：这里不关心 OpenAI / Anthropic，也不关心 WASM 运行时。
 //! Tool layer: this crate does not know about OpenAI / Anthropic or the WASM runtime.
 
+#![deny(missing_docs)]
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};

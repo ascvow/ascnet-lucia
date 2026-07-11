@@ -96,10 +96,16 @@ pub struct UiViewInstance {
 pub enum UiNavigationAction {
     /// Pushes a subview above the current view.
     /// 在当前视图之上压入一个子视图。
-    Push { view: UiViewInstance },
+    Push {
+        /// 要压入导航栈的动态视图实例。
+        view: UiViewInstance,
+    },
     /// Replaces the current plugin-owned subview.
     /// 用新子视图替换当前插件子视图。
-    Replace { view: UiViewInstance },
+    Replace {
+        /// 替换当前栈顶的动态视图实例。
+        view: UiViewInstance,
+    },
     /// Closes the current plugin-owned subview and returns to its parent.
     /// 关闭当前插件子视图，返回上一层。
     Pop,

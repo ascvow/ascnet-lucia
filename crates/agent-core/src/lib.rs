@@ -9,6 +9,8 @@
 //! - Billing data comes from provider responses; core does not keep local price tables.
 //!   计费数据来自服务商响应；core 不维护本地价格表。
 
+#![deny(missing_docs)]
+
 pub mod agent;
 pub mod config;
 pub mod context;

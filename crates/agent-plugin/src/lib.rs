@@ -3,6 +3,8 @@
 //! 插件侧 SDK：插件作者实现 [`AgentPlugin`]，然后调用 [`export_plugin!`] 即可导出 WIT world。
 //! Guest SDK: implement [`AgentPlugin`] and invoke [`export_plugin!`] to export the WIT world.
 
+#![deny(missing_docs)]
+
 pub use agent_tool::{JsonSchema, ToolCall, ToolResult, ToolSpec};
 pub use anyhow::{anyhow, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -144,10 +146,16 @@ pub struct UiViewInstance {
 pub enum UiNavigationAction {
     /// Pushes a subview above the current view.
     /// 在当前视图之上压入一个子视图。
-    Push { view: UiViewInstance },
+    Push {
+        /// 要压入导航栈的动态视图实例。
+        view: UiViewInstance,
+    },
     /// Replaces the current plugin-owned subview.
     /// 用新子视图替换当前插件子视图。
-    Replace { view: UiViewInstance },
+    Replace {
+        /// 替换当前栈顶的动态视图实例。
+        view: UiViewInstance,
+    },
     /// Closes the current plugin-owned subview and returns to its parent.
     /// 关闭当前插件子视图，返回上一层。
     Pop,
@@ -306,8 +314,11 @@ pub struct AgentEvent {
     #[serde(default)]
     pub timestamp_ms: u64,
 
+    /// 事件的稳定语义类型，用于 Guest 选择处理分支。
     pub kind: AgentEventKind,
+    /// 事件产生时的 ReAct 步数；run 级事件使用当前或最终步数。
     pub step: usize,
+    /// 与事件类型对应的 provider-neutral JSON 载荷。
     pub payload: serde_json::Value,
 }
 
@@ -362,11 +373,17 @@ pub enum ToolDecision {
 
     /// Block the call and report the reason to the model.
     /// 阻止工具调用，并把原因回传给模型。
-    Block { reason: String },
+    Block {
+        /// 返回给模型的阻止原因，不应包含宿主敏感信息。
+        reason: String,
+    },
 
     /// Rewrite the call before execution.
     /// 在执行前重写工具调用。
-    Rewrite { call: ToolCall },
+    Rewrite {
+        /// Guest 希望宿主改为执行的完整工具调用。
+        call: ToolCall,
+    },
 }
 
 /// 插件启动时由宿主提供的只读上下文。

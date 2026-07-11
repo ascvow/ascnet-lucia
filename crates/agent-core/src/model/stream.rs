@@ -18,28 +18,64 @@ pub enum ModelStreamEvent {
     Start,
 
     /// 文本增量。
-    TextDelta { index: usize, delta: String },
+    TextDelta {
+        /// 目标文本块在本次响应中的稳定序号。
+        index: usize,
+        /// 本次新增的文本片段。
+        delta: String,
+    },
 
     /// 文本块结束，携带完整文本。
-    TextEnd { index: usize, text: String },
+    TextEnd {
+        /// 已完成文本块的稳定序号。
+        index: usize,
+        /// 将此前增量合并后的完整文本。
+        text: String,
+    },
 
     /// 思维链增量。
-    ThinkingDelta { index: usize, delta: String },
+    ThinkingDelta {
+        /// 目标推理块在本次响应中的稳定序号。
+        index: usize,
+        /// 本次新增的推理文本片段。
+        delta: String,
+    },
 
     /// 思维链块结束，携带完整推理内容。
-    ThinkingEnd { index: usize, thinking: String },
+    ThinkingEnd {
+        /// 已完成推理块的稳定序号。
+        index: usize,
+        /// 将此前增量合并后的完整推理文本。
+        thinking: String,
+    },
 
     /// 工具调用参数增量（原始 JSON 片段）。
-    ToolCallDelta { index: usize, delta: String },
+    ToolCallDelta {
+        /// 目标工具调用块在本次响应中的稳定序号。
+        index: usize,
+        /// 原始参数 JSON 片段，单个片段不保证可独立解析。
+        delta: String,
+    },
 
     /// 工具调用块结束，携带解析后的完整调用。
-    ToolCallEnd { index: usize, call: ToolCall },
+    ToolCallEnd {
+        /// 已完成工具调用块的稳定序号。
+        index: usize,
+        /// 适配器解析并校验后的完整工具调用。
+        call: ToolCall,
+    },
 
     /// 响应完成，携带最终响应。
-    Done { response: ModelResponse },
+    Done {
+        /// 合并所有流式块后的最终 provider-neutral 响应。
+        response: ModelResponse,
+    },
 
     /// 响应失败，携带错误描述。
-    Error { message: String },
+    Error {
+        /// 可供调用方诊断的错误描述；流在此事件后终止。
+        message: String,
+    },
 }
 
 impl ModelStreamEvent {

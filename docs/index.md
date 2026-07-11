@@ -26,6 +26,7 @@ Lucia 是一个 Rust ReAct Agent 运行时。它既可以作为终端应用直�
 
 ### 嵌入 Rust 应用
 
+- [Rust API 手册](/reference/rust-api)：按 crate 和源码文件浏览全部公开项，并生成包含私有实现的内部手册。
 - [Agent API](/agent/api)：构造 Agent、运行请求和控制执行。
 - [工具与事件](/agent/tools-events)：注册原生工具并消费生命周期事件。
 - [会话持久化](/agent/session-persistence)：使用 CAS 和文件存储保存会话。

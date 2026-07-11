@@ -76,6 +76,7 @@ impl AgentEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentEventKind {
+    /// 一次 Agent run 已创建，尚未开始首轮模型请求。
     RunStarted,
 
     /// 通用扩展发布的结构化事件。
@@ -84,6 +85,7 @@ pub enum AgentEventKind {
     /// 一轮（一次模型调用 + 其工具执行）开始。
     TurnStarted,
 
+    /// 即将把 provider-neutral 请求发送给模型网关。
     ModelRequest,
 
     /// 模型输出的文本增量，可用于实时界面渲染。
@@ -92,13 +94,16 @@ pub enum AgentEventKind {
     /// 模型输出的推理增量，可用于实时状态展示。
     ModelThinkingDelta,
 
+    /// 模型已返回完整响应；流式增量事件会在它之前发布。
     ModelResponse,
 
     /// Billing data event emitted when a provider returns usage or cost fields.
     /// 当服务商返回 usage 或费用字段时发出的计费数据事件。
     BillingUsage,
 
+    /// 工具调用已通过前置检查并开始执行。
     ToolStarted,
+    /// 工具执行结束，载荷包含成功结果或结构化错误。
     ToolFinished,
 
     /// 工具因 steering 消息插入而被跳过。
@@ -113,7 +118,9 @@ pub enum AgentEventKind {
     /// follow-up 消息被注入会话。
     FollowUpInjected,
 
+    /// Agent run 正常结束并产生最终文本。
     RunFinished,
+    /// ReAct 循环达到最大步数，未继续请求模型。
     StepLimitReached,
 }
 

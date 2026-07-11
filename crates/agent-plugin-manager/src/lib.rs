@@ -2,6 +2,8 @@
 //!
 //! 管理器只处理本地 bundle，不执行网络访问，也不负责实例化插件。
 
+#![deny(missing_docs)]
+
 use agent_plugin_host::manifest::{
     resolve_plugin_capabilities, resolve_plugin_load_order, PluginManifest, PluginRuntimeConfig,
 };

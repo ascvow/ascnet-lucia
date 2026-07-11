@@ -330,6 +330,7 @@ manifest = "/opt/lucia/plugin.toml"
 /// plugin.toml 的结构。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
+    /// 插件身份、ABI 版本和 component 路径。
     pub plugin: PluginSection,
 
     /// 当前插件依赖的其他插件及版本约束。
@@ -642,8 +643,11 @@ fn default_dependency_version() -> String {
 /// 插件基础身份信息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginSection {
+    /// 安装、依赖和 owner 路由使用的稳定插件 ID。
     pub id: String,
+    /// 面向用户展示的插件名称，不参与协议路由。
     pub name: String,
+    /// 插件实现版本，必须是有效 SemVer。
     pub version: String,
 
     /// ascnet-lucia 插件 WIT 契约的 ABI 版本。
@@ -653,6 +657,7 @@ pub struct PluginSection {
     /// `.wasm` component 路径，相对于 plugin.toml。
     pub wasm: String,
 
+    /// 面向用户的可选功能说明，不参与权限判定。
     pub description: Option<String>,
 }
 

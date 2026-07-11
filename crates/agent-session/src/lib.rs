@@ -2,6 +2,8 @@
 //!
 //! 本 crate 只保存与服务商无关的会话，不负责模型配置、密钥、插件状态或 Agent 调度。
 
+#![deny(missing_docs)]
+
 mod file_lock;
 mod file_store;
 mod memory;

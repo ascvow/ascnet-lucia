@@ -2,6 +2,8 @@
 //!
 //! 该 crate 依赖 core 的通用扩展点，并负责把 WASM 插件适配到 Agent 和 TUI。
 
+#![deny(missing_docs)]
+
 pub mod manifest;
 pub mod service;
 pub mod ui;

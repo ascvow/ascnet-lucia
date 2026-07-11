@@ -14,8 +14,10 @@ use std::{collections::HashMap, fs, path::Path};
 /// 根配置文件。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRootConfig {
+    /// 唯一模型服务商和模型选择；构建网关时会解析其中的凭据来源。
     pub model: ModelConfig,
 
+    /// ReAct 循环参数；缺省字段沿用 [`AgentOptions`] 的默认值。
     #[serde(default)]
     pub agent: AgentConfig,
 }
@@ -168,8 +170,11 @@ fn default_provider_name() -> String {
 pub struct AgentConfig {
     /// 单条用户指令允许连续执行的最大 ReAct 步数。
     pub max_steps: Option<usize>,
+    /// 覆盖 Core 默认系统提示；`None` 表示保留默认提示。
     pub system_prompt: Option<String>,
+    /// 单次模型响应允许生成的最大 token 数；具体支持程度由服务商决定。
     pub max_tokens: Option<u32>,
+    /// 模型采样温度；Core 原样传递，合法范围由服务商适配器校验。
     pub temperature: Option<f32>,
 
     /// Provider-specific options shallow-merged into the request.
