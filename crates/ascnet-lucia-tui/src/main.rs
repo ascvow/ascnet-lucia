@@ -21,7 +21,7 @@ use agent_plugin_host::{
         UiPlacement, UiRenderRequest, UiSpan, UiStyle,
     },
     wasm::load_wasm_plugins_with_selection,
-    PluginHost,
+    CompositePluginHost, PluginHost,
 };
 use agent_session::{FileSessionStore, MemorySessionStore, SessionId, SessionRecord, SessionStore};
 use agent_tool::{JsonTool, ToolCall, ToolRegistry, ToolSpec};
@@ -39,6 +39,7 @@ use crossterm::event::MouseEvent;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{prelude::*, widgets::*};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 #[cfg(feature = "plugins")]
 use std::collections::{HashMap, HashSet};
 use std::{path::Path, path::PathBuf, sync::Arc};
@@ -118,6 +119,25 @@ enum UiEvent {
     ContextUsage(u64),
     /// Agent 运行及 CAS 持久化均完成，成功值携带最新会话记录。
     AgentDone(Box<Result<(AgentRun, SessionRecord)>>),
+    /// Background plugin loading completed and can now be attached to the pending Agent.
+    /// 后台插件加载结束，可挂载到等待中的 Agent。
+    #[cfg(feature = "plugins")]
+    PluginsLoaded(Box<Result<LoadedPlugins>>),
+}
+
+/// Plugin runtime data prepared off the TUI event loop.
+///
+/// 在 TUI 事件循环之外准备完成的插件运行时数据。
+#[cfg(feature = "plugins")]
+struct LoadedPlugins {
+    /// Composite host containing every successfully activated plugin. 已激活插件的组合宿主。
+    host: Arc<CompositePluginHost>,
+    /// Stable plugin IDs in dependency-resolved load order. 按依赖解析顺序排列的稳定插件 ID。
+    plugin_ids: Vec<String>,
+    /// UI declarations collected after activation. 激活后收集的 UI 声明。
+    plugin_views: Vec<UiDeclaration>,
+    /// Activation events consumed before the first Agent run. 首次 Agent 运行前消费的激活事件。
+    startup_events: Vec<Value>,
 }
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -637,6 +657,8 @@ fn plugin_startup_details(plugin_ids: &[String], events: &[Value]) -> Vec<String
 struct App {
     messages: Vec<Msg>,
     input: String,
+    /// FIFO inputs accepted before the Agent becomes ready. Agent 就绪前接收的 FIFO 输入队列。
+    queued_inputs: VecDeque<String>,
     /// 光标在 input 中的字节偏移。
     cursor: usize,
     running: bool,
@@ -677,6 +699,12 @@ struct App {
     /// Remaining ticks before startup details collapse. 启动详情收敛前的剩余 tick 数。
     #[cfg(feature = "plugins")]
     plugin_status_ticks: u16,
+    /// Whether plugin activation is still running in the background. 插件是否仍在后台激活。
+    #[cfg(feature = "plugins")]
+    plugins_loading: bool,
+    /// Plugin startup failure shown persistently in the footer. 底栏持续展示的插件启动错误。
+    #[cfg(feature = "plugins")]
+    plugin_load_error: Option<String>,
 }
 
 /// 主 TUI 为单个插件视图维护的运行时状态。
@@ -709,6 +737,7 @@ impl App {
         Self {
             messages: Vec::new(),
             input: String::new(),
+            queued_inputs: VecDeque::new(),
             cursor: 0,
             running: false,
             should_quit: false,
@@ -735,6 +764,10 @@ impl App {
             plugin_startup_details: Vec::new(),
             #[cfg(feature = "plugins")]
             plugin_status_ticks: 0,
+            #[cfg(feature = "plugins")]
+            plugins_loading: false,
+            #[cfg(feature = "plugins")]
+            plugin_load_error: None,
         }
     }
 
@@ -750,9 +783,11 @@ impl App {
         self
     }
 
-    /// 挂载启动时从插件宿主收集的视图声明。
+    /// Replaces plugin view state after background activation completes.
+    ///
+    /// 后台激活完成后替换插件视图状态。
     #[cfg(feature = "plugins")]
-    fn with_plugin_views(mut self, declarations: Vec<UiDeclaration>) -> Self {
+    fn set_plugin_views(&mut self, declarations: Vec<UiDeclaration>) {
         self.plugin_views = declarations
             .into_iter()
             .map(|declaration| PluginViewState {
@@ -761,18 +796,41 @@ impl App {
                 area: Rect::default(),
             })
             .collect();
-        self
     }
 
-    /// Stores loaded plugin IDs and consumes activation events for one-time startup display.
+    /// Switches the footer from loading to ready using activation event summaries.
     ///
-    /// 保存已加载插件 ID，并把激活阶段事件转换为一次性启动状态文本。
+    /// 使用激活事件摘要将底栏从加载状态切换为就绪状态。
     #[cfg(feature = "plugins")]
-    fn with_plugin_status(mut self, plugin_ids: Vec<String>, startup_events: Vec<Value>) -> Self {
+    fn finish_plugin_loading(&mut self, plugin_ids: Vec<String>, startup_events: Vec<Value>) {
         self.plugin_startup_details = plugin_startup_details(&plugin_ids, &startup_events);
         self.plugin_ids = plugin_ids;
         self.plugin_status_ticks = PLUGIN_STATUS_DETAIL_TICKS;
+        self.plugins_loading = false;
+        self.plugin_load_error = None;
+    }
+
+    /// Marks plugin IDs as loading while keeping the input queue available.
+    ///
+    /// 标记正在加载的插件 ID，同时保持输入队列可用。
+    #[cfg(feature = "plugins")]
+    fn with_loading_plugins(mut self, plugin_ids: Vec<String>) -> Self {
+        self.plugin_ids = plugin_ids;
+        self.plugins_loading = true;
+        self.plugin_load_error = None;
         self
+    }
+
+    /// Records a plugin loading failure and switches the footer to a persistent error state.
+    ///
+    /// 记录插件加载失败，并将底栏切换为持续错误状态。
+    #[cfg(feature = "plugins")]
+    fn set_plugin_load_error(&mut self, error: &anyhow::Error) {
+        self.plugins_loading = false;
+        self.plugin_ids.clear();
+        self.plugin_startup_details.clear();
+        self.plugin_status_ticks = 0;
+        self.plugin_load_error = Some(error.to_string());
     }
 
     /// Advances the transient startup status toward the compact counter.
@@ -780,7 +838,9 @@ impl App {
     /// 推进一次性启动状态，并在计时结束后切换为紧凑计数。
     #[cfg(feature = "plugins")]
     fn tick_plugin_status(&mut self) {
-        self.plugin_status_ticks = self.plugin_status_ticks.saturating_sub(1);
+        if !self.plugins_loading {
+            self.plugin_status_ticks = self.plugin_status_ticks.saturating_sub(1);
+        }
     }
 
     /// Returns the current plugin status icon and text for the footer's right side.
@@ -788,6 +848,23 @@ impl App {
     /// 返回底部信息栏右侧当前使用的插件状态图标和文本。
     #[cfg(feature = "plugins")]
     fn plugin_status_content(&self) -> (&'static str, String) {
+        if self.plugins_loading {
+            let plugins = self.plugin_ids.join(" · ");
+            let queue = if self.queued_inputs.is_empty() {
+                String::new()
+            } else {
+                format!(" · queued {}", self.queued_inputs.len())
+            };
+            let text = if plugins.is_empty() {
+                format!("正在加载插件{queue}")
+            } else {
+                format!("正在加载插件 · {plugins}{queue}")
+            };
+            return (SPINNER[self.spinner_frame % SPINNER.len()], text);
+        }
+        if let Some(error) = &self.plugin_load_error {
+            return ("✗", format!("插件加载失败 · {error}"));
+        }
         if self.plugin_status_ticks > 0 {
             let details = if self.plugin_startup_details.is_empty() {
                 self.plugin_ids.join(" · ")
@@ -805,7 +882,7 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers, agent: &Arc<Agent>) {
+    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers, agent: Option<&Arc<Agent>>) {
         if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
             self.should_quit = true;
             return;
@@ -813,10 +890,14 @@ impl App {
 
         match code {
             KeyCode::Enter => {
-                if self.running {
-                    self.submit_steering(agent);
+                if let Some(agent) = agent {
+                    if self.running {
+                        self.submit_steering(agent);
+                    } else {
+                        self.submit(agent);
+                    }
                 } else {
-                    self.submit(agent);
+                    self.queue_input_until_ready();
                 }
             }
             KeyCode::Esc => self.should_quit = true,
@@ -1066,14 +1147,57 @@ impl App {
         }
     }
 
-    /// 运行中提交 steering 插话：跳过剩余工具，让模型立即响应新指令。
-    fn submit_steering(&mut self, agent: &Arc<Agent>) {
+    /// Takes and clears the current editor value, returning `None` for blank input.
+    ///
+    /// 取出并清空当前编辑器内容；空白输入返回 `None`。
+    fn take_input(&mut self) -> Option<String> {
         let input = self.input.trim().to_string();
         self.input.clear();
         self.cursor = 0;
-        if input.is_empty() {
+        (!input.is_empty()).then_some(input)
+    }
+
+    /// Handles commands that do not require a ready Agent and reports whether input was consumed.
+    ///
+    /// 处理无需 Agent 就绪的本地命令，并返回输入是否已被消费。
+    fn handle_local_command(&mut self, input: &str) -> bool {
+        match input {
+            "/quit" | "/exit" => {
+                self.should_quit = true;
+                true
+            }
+            "/clear" => {
+                self.session_record.session = Session::new();
+                self.messages.clear();
+                self.queued_inputs.clear();
+                self.streaming_message = None;
+                self.messages.push(Msg::new(MsgKind::Info, "会话已清空"));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Queues one complete input while plugin loading keeps the Agent unavailable.
+    ///
+    /// 插件加载导致 Agent 尚不可用时，将一条完整输入加入 FIFO 队列。
+    fn queue_input_until_ready(&mut self) {
+        let Some(input) = self.take_input() else {
+            return;
+        };
+        if self.handle_local_command(&input) {
             return;
         }
+        self.messages.push(Msg::new(MsgKind::User, input.clone()));
+        self.queued_inputs.push_back(input);
+        self.scroll = None;
+    }
+
+    /// 运行中提交 steering 插话：跳过剩余工具，让模型立即响应新指令。
+    fn submit_steering(&mut self, agent: &Arc<Agent>) {
+        let Some(input) = self.take_input() else {
+            return;
+        };
         agent.steer(input.clone());
         self.messages.push(Msg::new(MsgKind::User, input));
         self.messages.push(Msg::new(
@@ -1082,31 +1206,26 @@ impl App {
         ));
     }
 
+    /// Submits the current editor value immediately to a ready Agent.
+    ///
+    /// 将当前编辑器内容立即提交给已就绪的 Agent。
     fn submit(&mut self, agent: &Arc<Agent>) {
-        let input = self.input.trim().to_string();
-        self.input.clear();
-        self.cursor = 0;
-
-        if input.is_empty() {
+        let Some(input) = self.take_input() else {
+            return;
+        };
+        if self.handle_local_command(&input) {
             return;
         }
+        self.start_input_run(agent, input, true);
+    }
 
-        match input.as_str() {
-            "/quit" | "/exit" => {
-                self.should_quit = true;
-                return;
-            }
-            "/clear" => {
-                self.session_record.session = Session::new();
-                self.messages.clear();
-                self.streaming_message = None;
-                self.messages.push(Msg::new(MsgKind::Info, "会话已清空"));
-                return;
-            }
-            _ => {}
+    /// Starts one Agent run and optionally appends the user message to the visible history.
+    ///
+    /// 启动一次 Agent 运行，并按需把用户消息追加到可见历史。
+    fn start_input_run(&mut self, agent: &Arc<Agent>, input: String, show_user_message: bool) {
+        if show_user_message {
+            self.messages.push(Msg::new(MsgKind::User, input.clone()));
         }
-
-        self.messages.push(Msg::new(MsgKind::User, input.clone()));
         self.running = true;
         self.streaming_message = None;
         self.scroll = None;
@@ -1126,6 +1245,18 @@ impl App {
             .await;
             let _ = tx.send(UiEvent::AgentDone(Box::new(result)));
         });
+    }
+
+    /// Starts the next pre-ready input after the Agent becomes idle.
+    ///
+    /// Agent 就绪且空闲后启动下一条预加载输入。
+    fn run_next_queued(&mut self, agent: &Arc<Agent>) {
+        if self.running {
+            return;
+        }
+        if let Some(input) = self.queued_inputs.pop_front() {
+            self.start_input_run(agent, input, false);
+        }
     }
 
     /// 开始一个新的模型响应轮次，后续增量会写入新的助手消息。
@@ -1495,7 +1626,11 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
 
     // 输入区仅保留顶部规则线，形成稳定的底部命令栏。
     let input_area = sections[1];
-    let input_color = if app.running {
+    #[cfg(feature = "plugins")]
+    let agent_waiting = app.plugins_loading;
+    #[cfg(not(feature = "plugins"))]
+    let agent_waiting = false;
+    let input_color = if app.running || agent_waiting {
         COLOR_WARNING
     } else {
         COLOR_USER
@@ -1506,7 +1641,7 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let main_input_focused = true;
     let input_block = Block::new()
         .borders(Borders::TOP)
-        .border_style(Style::new().fg(if app.running {
+        .border_style(Style::new().fg(if app.running || agent_waiting {
             COLOR_WARNING
         } else if main_input_focused {
             COLOR_BORDER_FOCUS
@@ -1517,7 +1652,9 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let input_inner = input_block.inner(input_area);
 
     if app.input.is_empty() {
-        let placeholder = if app.running {
+        let placeholder = if agent_waiting {
+            "Queue while plugins load..."
+        } else if app.running {
             "Steer the current run..."
         } else {
             "Message Lucia..."
@@ -1975,6 +2112,49 @@ fn merge_official_plugin_manifests(
     Ok(())
 }
 
+/// Reads stable plugin IDs for the loading footer before components are activated.
+///
+/// 在 component 激活前读取稳定插件 ID，供加载中的底栏展示。
+#[cfg(feature = "plugins")]
+fn plugin_manifest_ids(manifests: &[PathBuf]) -> Result<Vec<String>> {
+    manifests
+        .iter()
+        .map(PluginManifest::load)
+        .map(|manifest| manifest.map(|manifest| manifest.plugin.id))
+        .collect()
+}
+
+/// Loads and activates plugins away from the TUI event loop.
+///
+/// 在 TUI 事件循环之外加载并激活插件；后续准备失败时会主动关闭已创建的宿主。
+#[cfg(feature = "plugins")]
+async fn load_plugins_for_tui(
+    manifests: Vec<PathBuf>,
+    capability_selection: HashMap<String, String>,
+) -> Result<LoadedPlugins> {
+    let host = Arc::new(load_wasm_plugins_with_selection(&manifests, &capability_selection).await?);
+    let prepared = async {
+        let plugin_ids = host
+            .host_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let plugin_views = host.ui_declarations().await?;
+        let startup_events = host.drain_events().await?;
+        Ok(LoadedPlugins {
+            host: host.clone(),
+            plugin_ids,
+            plugin_views,
+            startup_events,
+        })
+    }
+    .await;
+    if prepared.is_err() {
+        let _ = host.shutdown().await;
+    }
+    prepared
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -2110,33 +2290,19 @@ async fn main() -> Result<()> {
         sink.push(Arc::new(JsonlEventSink::new(path.clone())));
     }
 
-    #[cfg(feature = "plugins")]
-    let plugin_host =
-        Arc::new(load_wasm_plugins_with_selection(&plugin_manifests, &capability_selection).await?);
-    // Consume activation events before the first Agent run so startup notices stay outside chat.
-    // 在 Agent 首次运行前消费激活事件，使启动通知不会延迟进入对话列表。
-    #[cfg(feature = "plugins")]
-    let plugin_ids = plugin_host
-        .host_ids()
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    #[cfg(feature = "plugins")]
-    let plugin_views = plugin_host.ui_declarations().await?;
-    #[cfg(feature = "plugins")]
-    let plugin_startup_events = plugin_host.drain_events().await?;
-
-    let agent = Agent::new(gateway, options)
+    let base_agent = Agent::new(gateway, options)
         .with_tools(native_tools)
         .with_event_sink(Arc::new(sink));
     #[cfg(feature = "plugins")]
-    let agent = {
-        let mut agent = agent;
-        agent.set_extension(plugin_host.clone());
-        agent.set_context_loader(plugin_host.clone());
-        agent
-    };
-    let agent = Arc::new(agent);
+    let mut pending_agent = Some(base_agent);
+    #[cfg(feature = "plugins")]
+    let mut agent: Option<Arc<Agent>> = None;
+    #[cfg(not(feature = "plugins"))]
+    let agent = Some(Arc::new(base_agent));
+    #[cfg(feature = "plugins")]
+    let mut plugin_host: Option<Arc<CompositePluginHost>> = None;
+    #[cfg(feature = "plugins")]
+    let loading_plugin_ids = plugin_manifest_ids(&plugin_manifests)?;
 
     let mut terminal = ratatui::init();
     // 启用鼠标捕获，支持滚轮滚动对话区
@@ -2162,20 +2328,22 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut app = App::new(tx, model_name).with_persistent_session(session_store, session_record);
+    let mut app =
+        App::new(tx.clone(), model_name).with_persistent_session(session_store, session_record);
     app.messages.extend(
         startup_notices
             .into_iter()
             .map(|notice| Msg::new(MsgKind::Info, notice)),
     );
     #[cfg(feature = "plugins")]
-    {
-        app = app
-            .with_plugin_views(plugin_views)
-            .with_plugin_status(plugin_ids, plugin_startup_events);
-    }
-    #[cfg(feature = "plugins")]
-    refresh_plugin_views(&mut app, plugin_host.as_ref()).await;
+    let plugin_load_task = {
+        app = app.with_loading_plugins(loading_plugin_ids);
+        let load_tx = tx.clone();
+        tokio::spawn(async move {
+            let result = load_plugins_for_tui(plugin_manifests, capability_selection).await;
+            let _ = load_tx.send(UiEvent::PluginsLoaded(Box::new(result)));
+        })
+    };
 
     loop {
         terminal.draw(|frame| render(frame, &mut app))?;
@@ -2186,22 +2354,52 @@ async fn main() -> Result<()> {
                     #[cfg(feature = "plugins")]
                     match app.route_plugin_key(key.code, key.modifiers) {
                         PluginKeyRoute::Main => {
-                            app.handle_key(key.code, key.modifiers, &agent);
+                            app.handle_key(key.code, key.modifiers, agent.as_ref());
                         }
                         PluginKeyRoute::Consumed => {}
                         PluginKeyRoute::Input(input) => {
-                            if let Err(error) =
-                                dispatch_plugin_input(plugin_host.as_ref(), &input).await
-                            {
-                                app.set_plugin_ui_error(&input.plugin_id, &input.view_id, &error);
-                            } else {
-                                refresh_plugin_views(&mut app, plugin_host.as_ref()).await;
+                            if let Some(host) = plugin_host.as_ref() {
+                                if let Err(error) =
+                                    dispatch_plugin_input(host.as_ref(), &input).await
+                                {
+                                    app.set_plugin_ui_error(
+                                        &input.plugin_id,
+                                        &input.view_id,
+                                        &error,
+                                    );
+                                } else {
+                                    refresh_plugin_views(&mut app, host.as_ref()).await;
+                                }
                             }
                         }
                     }
                     #[cfg(not(feature = "plugins"))]
-                    app.handle_key(key.code, key.modifiers, &agent);
+                    app.handle_key(key.code, key.modifiers, agent.as_ref());
                 }
+            }
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::PluginsLoaded(result)) => {
+                let mut ready_agent = pending_agent.take().expect("插件加载完成事件只能处理一次");
+                match *result {
+                    Ok(loaded) => {
+                        ready_agent.set_extension(loaded.host.clone());
+                        ready_agent.set_context_loader(loaded.host.clone());
+                        app.set_plugin_views(loaded.plugin_views);
+                        app.finish_plugin_loading(loaded.plugin_ids, loaded.startup_events);
+                        refresh_plugin_views(&mut app, loaded.host.as_ref()).await;
+                        plugin_host = Some(loaded.host);
+                    }
+                    Err(error) => {
+                        app.set_plugin_load_error(&error);
+                        app.messages.push(Msg::new(
+                            MsgKind::Error,
+                            format!("插件加载失败，已切换为 Core Agent：{error}"),
+                        ));
+                    }
+                }
+                let ready_agent = Arc::new(ready_agent);
+                app.run_next_queued(&ready_agent);
+                agent = Some(ready_agent);
             }
             Some(UiEvent::ModelStarted) => {
                 app.start_model_response();
@@ -2261,9 +2459,16 @@ async fn main() -> Result<()> {
             }
             Some(UiEvent::AgentDone(result)) => {
                 app.handle_agent_done(*result);
+                if let Some(agent) = agent.as_ref() {
+                    app.run_next_queued(agent);
+                }
             }
             Some(UiEvent::Tick) => {
-                if app.running {
+                #[cfg(feature = "plugins")]
+                let animate_spinner = app.running || app.plugins_loading;
+                #[cfg(not(feature = "plugins"))]
+                let animate_spinner = app.running;
+                if animate_spinner {
                     app.spinner_frame = app.spinner_frame.wrapping_add(1);
                 }
                 #[cfg(feature = "plugins")]
@@ -2272,7 +2477,9 @@ async fn main() -> Result<()> {
                     app.plugin_tick = app.plugin_tick.wrapping_add(1);
                     if app.plugin_tick >= 3 {
                         app.plugin_tick = 0;
-                        refresh_plugin_views(&mut app, plugin_host.as_ref()).await;
+                        if let Some(host) = plugin_host.as_ref() {
+                            refresh_plugin_views(&mut app, host.as_ref()).await;
+                        }
                     }
                 }
             }
@@ -2281,12 +2488,12 @@ async fn main() -> Result<()> {
                 {
                     let dialog_active = app.active_dialog_index().is_some();
                     if let Some(input) = app.route_plugin_mouse(&mouse) {
-                        if let Err(error) =
-                            dispatch_plugin_input(plugin_host.as_ref(), &input).await
-                        {
-                            app.set_plugin_ui_error(&input.plugin_id, &input.view_id, &error);
-                        } else {
-                            refresh_plugin_views(&mut app, plugin_host.as_ref()).await;
+                        if let Some(host) = plugin_host.as_ref() {
+                            if let Err(error) = dispatch_plugin_input(host.as_ref(), &input).await {
+                                app.set_plugin_ui_error(&input.plugin_id, &input.view_id, &error);
+                            } else {
+                                refresh_plugin_views(&mut app, host.as_ref()).await;
+                            }
                         }
                     } else if !dialog_active {
                         match mouse.kind {
@@ -2313,13 +2520,19 @@ async fn main() -> Result<()> {
     }
 
     #[cfg(feature = "plugins")]
-    let plugin_shutdown_error =
-        match tokio::time::timeout(std::time::Duration::from_secs(5), plugin_host.shutdown()).await
-        {
+    plugin_load_task.abort();
+    #[cfg(feature = "plugins")]
+    let _ = plugin_load_task.await;
+    #[cfg(feature = "plugins")]
+    let plugin_shutdown_error = if let Some(host) = plugin_host {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), host.shutdown()).await {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(error),
             Err(_) => Some(anyhow!("插件宿主卸载超时")),
-        };
+        }
+    } else {
+        None
+    };
 
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
@@ -2488,7 +2701,8 @@ mod tests {
     #[test]
     fn plugin_status_shows_startup_details_then_compact_count() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut app = App::new(tx, "测试模型".into()).with_plugin_status(
+        let mut app = App::new(tx, "测试模型".into());
+        app.finish_plugin_loading(
             vec!["mcp".into(), "skill".into()],
             vec![
                 json!({
@@ -2530,6 +2744,90 @@ mod tests {
             app.tick_plugin_status();
         }
         assert_eq!(app.plugin_status_content(), ("◈", "2 plugins".into()));
+    }
+
+    /// Inputs entered before readiness stay FIFO-ordered and remain visible in the loading footer.
+    ///
+    /// Agent 就绪前输入应保持 FIFO 顺序，并在加载底栏显示排队数量。
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn plugin_loading_queues_inputs_until_agent_is_ready() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into())
+            .with_loading_plugins(vec!["mcp".into(), "skill".into()]);
+
+        for input in ["第一条任务", "第二条任务"] {
+            app.input = input.into();
+            app.cursor = app.input.len();
+            app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
+        }
+
+        assert_eq!(
+            app.queued_inputs
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["第一条任务", "第二条任务"]
+        );
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|message| matches!(message.kind, MsgKind::User))
+                .count(),
+            2
+        );
+        let (_, status) = app.plugin_status_content();
+        assert!(status.contains("queued 2"), "{status}");
+
+        app.input = "/clear".into();
+        app.cursor = app.input.len();
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
+        assert!(app.queued_inputs.is_empty());
+    }
+
+    /// Queued startup inputs execute sequentially and persist into one continuing session.
+    ///
+    /// 启动队列中的输入应逐条执行，并持久化到同一个连续 Session。
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn ready_agent_drains_startup_queue_in_fifo_order() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into()).with_loading_plugins(vec!["skill".into()]);
+        for input in ["第一条任务", "第二条任务"] {
+            app.input = input.into();
+            app.cursor = app.input.len();
+            app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
+        }
+
+        let (gateway, options) = build_demo_gateway();
+        let agent = Arc::new(Agent::new(gateway, options));
+        app.run_next_queued(&agent);
+        for expected_revision in [1, 2] {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(UiEvent::AgentDone(result)) = rx.recv().await {
+                        break *result;
+                    }
+                }
+            })
+            .await
+            .expect("等待排队任务完成不应超时");
+            app.handle_agent_done(result);
+            assert_eq!(app.session_record.revision, expected_revision);
+            app.run_next_queued(&agent);
+        }
+
+        assert!(app.queued_inputs.is_empty());
+        assert!(!app.running);
+        let user_messages = app
+            .session_record
+            .session
+            .messages()
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .map(|message| message.text_content())
+            .collect::<Vec<_>>();
+        assert_eq!(user_messages, vec!["第一条任务", "第二条任务"]);
     }
 
     /// 验证空模型密钥触发演示模式，而非空明文密钥允许构建真实模型运行时。
