@@ -819,12 +819,23 @@ fn validate_state_key(key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::ServiceHandler;
     use agent_runtime::{
         AgentDeriveConfig, AgentHandle, AgentLineage, AgentOutcome, AgentPermissions,
         AgentProfileId, AgentRuntimeError, AgentRuntimeProvisioner, AgentSnapshot, AgentStatus,
         ProvisionedAgentRuntime, RuntimeResult,
     };
     use async_trait::async_trait;
+
+    /// 回显 Host 最终注入调用方的测试服务。
+    struct CallerEchoService;
+
+    #[async_trait]
+    impl ServiceHandler for CallerEchoService {
+        async fn handle(&self, call: PluginServiceCall) -> Result<Value> {
+            Ok(json!({"caller_id": call.caller_id}))
+        }
+    }
 
     struct MockAgentRuntime {
         principal: RuntimePrincipal,
@@ -1171,5 +1182,35 @@ mod tests {
         .expect_err("伪造 principal 必须失败");
 
         assert!(error.to_string().contains("解析插件宿主能力请求失败"));
+    }
+
+    /// Guest 请求体中的 caller_id 不得覆盖 Host 从当前 Store 注入的可信插件 ID。
+    #[tokio::test]
+    async fn service_call_ignores_forged_caller_id() {
+        let services = Arc::new(ServiceRegistry::default());
+        services
+            .register_handler("provider", Arc::new(CallerEchoService))
+            .expect("注册测试服务处理器");
+        services
+            .upsert(
+                "provider",
+                PluginService {
+                    plugin_id: String::new(),
+                    name: "identity.echo".into(),
+                    version: "1.0.0".into(),
+                    description: None,
+                },
+            )
+            .expect("注册测试服务");
+
+        let response = CapabilityState::call_service_with(
+            "trusted-consumer".into(),
+            services,
+            r#"{"plugin_id":"provider","name":"identity.echo","caller_id":"forged"}"#,
+        )
+        .await
+        .expect("服务调用应成功");
+
+        assert_eq!(response["caller_id"], "trusted-consumer");
     }
 }

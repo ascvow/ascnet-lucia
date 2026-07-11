@@ -1,13 +1,15 @@
 //! 官方 Command 插件的真实 WASM 端到端测试。
 
 use agent_plugin_host::{
-    ui::{UiPlacement, UiRenderRequest},
-    wasm::WasmPluginHost,
+    ui::{UiInput, UiInputEvent, UiPlacement, UiRenderRequest},
+    wasm::{load_wasm_plugins, WasmPluginHost},
     PluginHost, PluginServiceCall,
 };
 use command_protocol::{
-    CommandSnapshot, PrepareExecuteRequest, PrepareExecuteResponse, SnapshotRequest, SurfaceAction,
+    CommandSnapshot, PrepareExecuteRequest, PrepareExecuteResponse, SessionListStatus,
+    SnapshotRequest, SurfaceAction, SurfaceEffect, SurfaceEffectsResponse, SurfaceUpdateRequest,
     PREPARE_EXECUTE_SERVICE, PROTOCOL_VERSION, SESSION_DIALOG_VIEW, SNAPSHOT_SERVICE,
+    SURFACE_POLL_EFFECTS_SERVICE, SURFACE_UPDATE_SERVICE,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -127,4 +129,107 @@ async fn component_routes_builtin_commands_and_dialog() {
         .expect("打开后的 Command Dialog 必须返回帧");
     assert!(frame.visible);
     assert_eq!(frame.view_id, SESSION_DIALOG_VIEW);
+
+    let effects_value =
+        call_service(&host, SURFACE_POLL_EFFECTS_SERVICE, serde_json::json!({})).await;
+    let effects: SurfaceEffectsResponse =
+        serde_json::from_value(effects_value).expect("解析 surface effect");
+    let request_id = effects
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            SurfaceEffect::QuerySessions { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .expect("/resume 必须请求会话摘要");
+
+    let update = call_service(
+        &host,
+        SURFACE_UPDATE_SERVICE,
+        serde_json::to_value(SurfaceUpdateRequest {
+            request_id,
+            status: SessionListStatus::Empty,
+        })
+        .expect("序列化 surface 更新"),
+    )
+    .await;
+    assert_eq!(update["accepted"], true);
+
+    host.on_ui_input(&UiInput {
+        plugin_id: "command".into(),
+        view_id: SESSION_DIALOG_VIEW.into(),
+        instance_id: None,
+        event: UiInputEvent::Key {
+            code: "escape".into(),
+            modifiers: Vec::new(),
+        },
+    })
+    .await
+    .expect("真实 WIT 输入路由不应失败");
+    let effects_value =
+        call_service(&host, SURFACE_POLL_EFFECTS_SERVICE, serde_json::json!({})).await;
+    let effects: SurfaceEffectsResponse =
+        serde_json::from_value(effects_value).expect("解析关闭 effect");
+    assert_eq!(effects.effects, vec![SurfaceEffect::CloseSurface]);
+
+    let error = host
+        .call_service(&PluginServiceCall {
+            caller_id: "untrusted-plugin".into(),
+            plugin_id: "command".into(),
+            name: SURFACE_UPDATE_SERVICE.into(),
+            payload: serde_json::to_value(SurfaceUpdateRequest {
+                request_id,
+                status: SessionListStatus::Empty,
+            })
+            .expect("序列化未授权更新"),
+        })
+        .await
+        .expect_err("Host 注入的非授权调用方必须被 Command component 拒绝");
+    assert!(error.to_string().contains("无权访问 Command surface"));
+}
+
+/// 验证组合宿主卸载 Command 后会同步清除服务、回调与 UI owner 路由。
+#[tokio::test]
+async fn component_unload_clears_all_host_routes() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
+    let mut host = load_wasm_plugins(&[manifest])
+        .await
+        .expect("Command component 应加载成功");
+    assert_eq!(host.ui_declarations().await.expect("读取 UI 声明").len(), 1);
+    assert_eq!(host.services().await.expect("读取服务目录").len(), 7);
+
+    let removed = host.clear();
+    assert!(host
+        .ui_declarations()
+        .await
+        .expect("刷新空 UI 路由")
+        .is_empty());
+    assert!(host.services().await.expect("刷新空服务目录").is_empty());
+    assert!(host
+        .call_service(&PluginServiceCall {
+            caller_id: "lucia-tui".into(),
+            plugin_id: "command".into(),
+            name: SNAPSHOT_SERVICE.into(),
+            payload: serde_json::json!({}),
+        })
+        .await
+        .expect("空宿主服务调用不应失败")
+        .is_none());
+    assert!(host
+        .render_ui(&UiRenderRequest {
+            plugin_id: "command".into(),
+            view_id: SESSION_DIALOG_VIEW.into(),
+            instance_id: None,
+            width: 80,
+            height: 24,
+            focused: true,
+            frame: 2,
+        })
+        .await
+        .expect("空宿主 UI 路由不应失败")
+        .is_none());
+
+    for plugin in removed {
+        plugin.shutdown().await.expect("卸载钩子必须完成清理");
+    }
 }

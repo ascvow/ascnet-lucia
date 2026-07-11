@@ -12,8 +12,6 @@ use std::{
 /// 当前支持的插件 ABI 版本。
 pub const SUPPORTED_PLUGIN_API_VERSION: &str = "0.6.0";
 
-const LEGACY_PLUGIN_API_VERSIONS: [&str; 5] = ["0.1.0", "0.2.0", "0.3.0", "0.4.0", "0.5.0"];
-
 /// 上下文加载器使用的标准能力 ID。
 pub const CONTEXT_LOADER_CAPABILITY: &str = "agent.context-loader";
 
@@ -304,20 +302,16 @@ manifest = "/opt/lucia/plugin.toml"
         assert!(!manifest.capabilities.agent.allows_profile("admin"));
     }
 
-    /// 旧 ABI 可以继续加载普通插件，但不能声明 0.6 新增的 Agent Runtime import。
+    /// Host 只接受当前 ABI，避免为缺失导出的旧 component 保留分支。
     #[test]
-    fn legacy_api_cannot_request_agent_runtime() {
+    fn legacy_api_is_rejected() {
         let mut manifest = test_manifest("legacy", "1.0.0", Vec::new());
         manifest.plugin.api_version = "0.5.0".into();
-        manifest.capabilities.agent = AgentCapabilitySection {
-            observe: true,
-            ..AgentCapabilitySection::default()
-        };
 
         let error = manifest
             .validate()
-            .expect_err("旧 ABI 声明 Agent Runtime 能力必须失败");
-        assert!(error.to_string().contains("需要 api_version `0.6.0`"));
+            .expect_err("旧 ABI manifest 必须在 component 加载前失败");
+        assert!(error.to_string().contains("仅支持当前版本 `0.6.0`"));
     }
 
     /// Spawn 权限必须同时声明至少一个可请求的 profile。
@@ -380,21 +374,11 @@ impl PluginManifest {
         }
         Version::parse(&self.plugin.version)
             .map_err(|error| anyhow!("plugin.version 不是有效语义化版本：{error}"))?;
-        if self.plugin.api_version != SUPPORTED_PLUGIN_API_VERSION
-            && !LEGACY_PLUGIN_API_VERSIONS.contains(&self.plugin.api_version.as_str())
-        {
+        if self.plugin.api_version != SUPPORTED_PLUGIN_API_VERSION {
             return Err(anyhow!(
-                "不支持插件 api_version `{}`；当前版本 `{}`，兼容版本 `{}`",
+                "不支持插件 api_version `{}`；仅支持当前版本 `{}`",
                 self.plugin.api_version,
                 SUPPORTED_PLUGIN_API_VERSION,
-                LEGACY_PLUGIN_API_VERSIONS.join("、"),
-            ));
-        }
-        if self.capabilities.agent.is_requested()
-            && self.plugin.api_version != SUPPORTED_PLUGIN_API_VERSION
-        {
-            return Err(anyhow!(
-                "插件 Agent Runtime 能力需要 api_version `{SUPPORTED_PLUGIN_API_VERSION}`"
             ));
         }
         if self.plugin.wasm.trim().is_empty() {

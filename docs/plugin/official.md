@@ -52,7 +52,7 @@ bun run build:plugin:command
 bun run test:plugin:command
 ```
 
-Manifest：`examples/plugins/command-plugin/plugin.toml`。公开协议与开发 SDK 分别位于 `crates/command-protocol` 和 `crates/command-sdk`。
+Manifest：`examples/plugins/command-plugin/plugin.toml`。公开协议与开发 SDK 分别位于 `examples/plugins/command-plugin/crates/command-protocol` 和 `examples/plugins/command-plugin/crates/command-sdk`。
 
 ## Teammate 插件
 

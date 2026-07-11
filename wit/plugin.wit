@@ -89,7 +89,6 @@ world plugin {
   export load-context: func(request-json: string) -> string;
 
   /// 声明插件 UI 视图。输出为 UiDeclaration JSON 数组，空数组表示无 UI。
-  /// 宿主以探测方式获取该导出：未实现的旧插件自动降级为纯工具插件。
   export describe-ui: func() -> string;
 
   /// 渲染插件 UI。输入为 UiRenderRequest JSON，输出为 UiFrame JSON，空字符串表示不更新。

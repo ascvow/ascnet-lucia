@@ -68,8 +68,8 @@ impl ContributionRegistry {
         Ok(public_name)
     }
 
-    /// 注册旧 ABI 通过 `list-tools` 返回的静态工具。
-    pub(crate) fn upsert_legacy_tools(&self, tools: Vec<ToolSpec>) -> Result<()> {
+    /// 注册 component 通过 `list-tools` 返回的初始静态工具。
+    pub(crate) fn upsert_static_tools(&self, tools: Vec<ToolSpec>) -> Result<()> {
         for spec in tools {
             let local_name = spec.name.clone();
             self.upsert_tool(ToolRegistrationRequest { local_name, spec })?;

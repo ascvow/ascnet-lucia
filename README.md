@@ -127,43 +127,19 @@ Example billing payload / 计费事件载荷示例：
 
 ## WASM plugin ABI / WASM 插件 ABI
 
-The plugin contract is WIT-based and exported as a WASM Component:
+The plugin contract is WIT-based and exported as a WASM Component. The canonical, complete world is maintained only in [`wit/plugin.wit`](wit/plugin.wit):
 
-插件契约基于 WIT，并以 WASM Component 形式导出：
-
-```wit
-package ascnet:lucia-plugin@0.6.0;
-
-world plugin {
-  import host-agent-upsert-tool: func(request-json: string) -> string;
-  import host-agent-upsert-prompt: func(request-json: string) -> string;
-  import host-fs-read: func(request-json: string) -> string;
-  import host-process-spawn: func(request-json: string) -> string;
-  import host-process-write: func(request-json: string) -> string;
-  import host-process-read-line: func(request-json: string) -> string;
-  import host-agent-runtime-call: func(request-json: string) -> string;
-  export activate: func(context-json: string) -> string;
-  export list-tools: func() -> string;
-  export call-tool: func(call-json: string) -> string;
-  export before-tool: func(call-json: string) -> string;
-  export after-tool: func(result-json: string);
-  export on-event: func(event-json: string);
-  export load-context: func(request-json: string) -> string;
-  export describe-ui: func() -> string;
-  export render-ui: func(request-json: string) -> string;
-  export on-ui-input: func(input-json: string);
-}
-```
+插件契约基于 WIT，并以 WASM Component 形式导出。完整 world 只在 [`wit/plugin.wit`](wit/plugin.wit) 维护，README 不复制函数表面；`agent-plugin` 契约测试会校验规范 WIT、Guest 内嵌 WIT 与 Host 绑定一致。
 
 The ABI uses JSON strings intentionally. This keeps the WIT boundary stable while Rust-side structs can evolve through serde-compatible fields.
 
 ABI 故意使用 JSON 字符串。这样 WIT 边界保持稳定，同时 Rust 侧结构体可以通过 serde 兼容字段继续演进。
 
-`agent-plugin-host` 提供端到端宿主实现：它会加载 `plugin.toml`，用 Wasmtime 编译 `.wasm` component，执行可选的 `activate`，并维护公开工具名到 owner 插件及本地工具 ID 的直接路由。旧插件仍可通过 `list-tools` 提供静态工具；新插件可以在运行时注册工具和 developer 提示。
+`agent-plugin-host` 提供端到端宿主实现：它会加载 `plugin.toml`，严格校验当前 ABI，用 Wasmtime 编译 `.wasm` component，执行 `activate`，并维护公开工具名到 owner 插件及本地工具 ID 的直接路由。插件可通过 `list-tools` 提供初始静态工具，也可以在运行时注册工具和 developer 提示。
 
 ### 插件 TUI
 
-插件可以通过三个可选 UI 导出提供自己的终端界面。宿主探测不到 `describe-ui` 时，会把旧插件作为纯工具插件加载；探测到该导出后，`render-ui` 和 `on-ui-input` 必须同时存在。
+插件通过 `describe-ui`、`render-ui` 和 `on-ui-input` 提供终端界面；无 UI 插件由 `describe-ui` 返回空数组。当前 ABI 要求三个导出完整存在，不再保留缺失导出的旧 component 加载分支。
 
 - `describe-ui` 返回 `UiDeclaration` 数组。每个视图可以挂载到 `top`、`right`、`bottom`、`left` 四个插槽、`dialog` 模态层或动态 `subview` 类型。
 - `render-ui` 接收宿主实际分配的尺寸和焦点状态，返回由行、文本片段和便携样式组成的 `UiFrame`。插件不能访问 Ratatui `Frame`、终端句柄或发送 ANSI 控制序列。
@@ -181,7 +157,7 @@ ABI 故意使用 JSON 字符串。这样 WIT 边界保持稳定，同时 Rust �
 
 官方 Skill 插件位于 [`examples/plugins/skill-plugin`](examples/plugins/skill-plugin/README.md)。它扫描 `SKILL.md`，只把名称和描述注入 Agent，并通过 `skill_read` 按需加载完整指令；Core 和 Host 不解析 Skill 格式。
 
-官方 Command 插件位于 [`examples/plugins/command-plugin`](examples/plugins/command-plugin)。它提供 `/help`、`/resume`、`/new`、`/sessions`、`/clear` 和 `/exit`，并通过版本化协议与类型化 SDK 向其他插件开放命令定义、参数、候选补全、注册、注销和执行回调。命令预览与会话选择 Dialog 由插件声明，TUI 只负责渲染和执行受控的会话动作。
+官方 Command 插件位于 [`examples/plugins/command-plugin`](examples/plugins/command-plugin)。它提供 `/help`、`/resume`、`/new`、`/sessions`、`/clear`、`/compact` 和 `/exit`，并通过版本化协议与类型化 SDK 向其他插件开放命令定义、参数、候选补全、注册、注销和执行回调。命令预览与会话选择 Dialog 由插件声明，TUI 只负责渲染和执行受控的会话动作。
 
 受限 Agent 派生与续跑示例见 [`examples/plugins/agent-runtime-plugin`](examples/plugins/agent-runtime-plugin/README.md)。Host 只提供 profile 授权、生命周期、状态、结果和取消；sub-agent、workflow、multi-agent 与 teammate 的角色、邮箱和消息协议由插件定义。
 

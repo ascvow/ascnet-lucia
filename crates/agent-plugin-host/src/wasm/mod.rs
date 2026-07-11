@@ -26,90 +26,31 @@ use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Weak},
+    sync::{Arc, Weak},
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use wasmtime::component::{
-    Component, ComponentNamedList, Instance, Lift, Linker, Lower, ResourceTable, TypedFunc,
+    Component, ComponentNamedList, Instance, Lift, Linker, Lower, TypedFunc,
 };
-use wasmtime::{
-    Cache, CacheConfig, Config, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
+#[cfg(test)]
+use wasmtime::Engine;
+use wasmtime::{Store, StoreContextMut, StoreLimitsBuilder};
+use wasmtime_wasi::WasiCtxBuilder;
+
+mod engine;
+mod loader;
+
+pub use engine::WasmPluginLimits;
+use engine::{shared_wasm_engine, IntoAnyhow, PluginWasiState};
+
+#[cfg(test)]
+use loader::{failed_required_dependencies, resilient_dependency_plan};
+pub use loader::{
+    load_wasm_plugins, load_wasm_plugins_resilient, load_wasm_plugins_resilient_with_selection,
+    load_wasm_plugins_resilient_with_selection_and_services, load_wasm_plugins_with_selection,
+    load_wasm_plugins_with_selection_and_services, load_wasm_plugins_with_services,
 };
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-
-const DEFAULT_FUEL_PER_PLUGIN: u64 = 50_000_000;
-const DEFAULT_FUEL_YIELD_INTERVAL: u64 = 250_000;
-/// 单个插件线性内存的默认上限。
-const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
-
-/// 进程内所有 WASM 插件共享的 Wasmtime Engine。
-///
-/// Engine 的克隆只会增加内部引用计数；共享实例可复用编译器、类型注册表和代码缓存，
-/// 同时每个插件仍持有独立的 Store、燃料和内存限制。
-static SHARED_WASM_ENGINE: LazyLock<std::result::Result<Engine, String>> = LazyLock::new(|| {
-    let mut config = Config::new();
-    config.wasm_component_model(true);
-    config.consume_fuel(true);
-    // 缓存不可用时保持无缓存启动，避免本地目录权限问题使插件系统整体失败。
-    if let Ok(cache) = Cache::new(CacheConfig::new()) {
-        config.cache(Some(cache));
-    }
-    Engine::new(&config).map_err(|error| format!("{error:?}"))
-});
-
-/// 将 wasmtime 结果转换为 anyhow 结果。
-/// wasmtime 46 起使用自有 Error 类型，不再实现 std Error，无法直接配合 anyhow。
-trait IntoAnyhow<T> {
-    fn into_anyhow(self) -> Result<T>;
-}
-
-impl<T> IntoAnyhow<T> for std::result::Result<T, wasmtime::Error> {
-    fn into_anyhow(self) -> Result<T> {
-        self.map_err(|err| anyhow::anyhow!("{err:?}"))
-    }
-}
-
-/// 获取进程级共享 Engine 的浅克隆。
-///
-/// 初始化失败会被缓存，避免并发插件加载重复执行昂贵且注定失败的初始化。
-fn shared_wasm_engine() -> Result<Engine> {
-    match &*SHARED_WASM_ENGINE {
-        Ok(engine) => Ok(engine.clone()),
-        Err(error) => Err(anyhow!("failed to create Wasmtime engine: {error}")),
-    }
-}
-
-/// WASI Preview 2 所需的宿主状态。
-struct PluginWasiState {
-    wasi: WasiCtx,
-    table: ResourceTable,
-    capabilities: CapabilityState,
-    /// Wasmtime 在实例化和内存增长时应用的资源上限。
-    store_limits: StoreLimits,
-}
-
-impl WasiView for PluginWasiState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
-        }
-    }
-}
-
-/// WASM 插件运行时限制。
-#[derive(Debug, Clone)]
-pub struct WasmPluginLimits {
-    /// 分配给插件 store 的 fuel。
-    pub fuel: u64,
-
-    /// 协作式 async yield 的 fuel 间隔。
-    pub fuel_yield_interval: Option<u64>,
-
-    /// 单个线性内存允许增长到的最大字节数。
-    pub max_memory_bytes: usize,
-}
 
 /// One plugin excluded from a resilient load attempt.
 ///
@@ -135,23 +76,12 @@ pub struct PluginLoadReport {
     pub failures: Vec<PluginLoadFailure>,
 }
 
-impl Default for WasmPluginLimits {
-    fn default() -> Self {
-        Self {
-            fuel: DEFAULT_FUEL_PER_PLUGIN,
-            fuel_yield_interval: Some(DEFAULT_FUEL_YIELD_INTERVAL),
-            max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
-        }
-    }
-}
-
 /// 已加载的 WASM 插件。
 pub struct WasmPluginHost {
     manifest: PluginManifest,
     contributions: Arc<ContributionRegistry>,
     services: Arc<ServiceRegistry>,
     known_ui: Vec<UiDeclaration>,
-    has_context_loader: bool,
     agent_runtime: Option<AgentRuntimeBinding>,
     state: Arc<Mutex<WasmPluginState>>,
 }
@@ -164,11 +94,11 @@ struct WasmPluginState {
     before_tool: TypedFunc<(String,), (String,)>,
     after_tool: TypedFunc<(String,), ()>,
     on_event: TypedFunc<(String,), ()>,
-    load_context: Option<TypedFunc<(String,), (String,)>>,
-    handle_service: Option<TypedFunc<(String,), (String,)>>,
-    deactivate: Option<TypedFunc<(), (String,)>>,
-    render_ui: Option<TypedFunc<(String,), (String,)>>,
-    on_ui_input: Option<TypedFunc<(String,), ()>>,
+    load_context: TypedFunc<(String,), (String,)>,
+    handle_service: TypedFunc<(String,), (String,)>,
+    deactivate: TypedFunc<(), (String,)>,
+    render_ui: TypedFunc<(String,), (String,)>,
+    on_ui_input: TypedFunc<(String,), ()>,
     limits: WasmPluginLimits,
 }
 
@@ -201,9 +131,7 @@ impl ServiceHandler for WasmServiceEndpoint {
             .ok_or_else(|| anyhow!("插件 `{}` 已卸载", self.plugin_id))?;
         let mut state = state.lock().await;
         refill_fuel(&mut state)?;
-        let Some(handle_service) = state.handle_service else {
-            return Err(anyhow!("插件 `{}` 未导出服务处理函数", self.plugin_id));
-        };
+        let handle_service = state.handle_service;
         let request = serde_json::to_string(&serde_json::json!({
             "caller_id": call.caller_id,
             "name": call.name,
@@ -380,10 +308,9 @@ impl WasmPluginHost {
                 .build();
             let mut store = Store::new(
                 &engine,
-                PluginWasiState {
-                    wasi: wasi.build(),
-                    table: ResourceTable::new(),
-                    capabilities: CapabilityState::new(
+                PluginWasiState::new(
+                    wasi.build(),
+                    CapabilityState::new(
                         manifest.plugin.id.clone(),
                         plugin_dir,
                         manifest.capabilities.clone(),
@@ -392,7 +319,7 @@ impl WasmPluginHost {
                         agent_runtime.clone(),
                     ),
                     store_limits,
-                },
+                ),
             );
             store.limiter(|state| &mut state.store_limits);
             store
@@ -422,40 +349,28 @@ impl WasmPluginHost {
                 get_required_func::<(String,), ()>(&instance, &mut store, "after-tool")?;
             let on_event = get_required_func::<(String,), ()>(&instance, &mut store, "on-event")?;
             let load_context =
-                get_optional_func::<(String,), (String,)>(&instance, &mut store, "load-context")?;
+                get_required_func::<(String,), (String,)>(&instance, &mut store, "load-context")?;
             let activate =
-                get_optional_func::<(String,), (String,)>(&instance, &mut store, "activate")?;
+                get_required_func::<(String,), (String,)>(&instance, &mut store, "activate")?;
             let deactivate =
-                get_optional_func::<(), (String,)>(&instance, &mut store, "deactivate")?;
+                get_required_func::<(), (String,)>(&instance, &mut store, "deactivate")?;
             let handle_service =
-                get_optional_func::<(String,), (String,)>(&instance, &mut store, "handle-service")?;
+                get_required_func::<(String,), (String,)>(&instance, &mut store, "handle-service")?;
             let describe_ui =
-                get_optional_func::<(), (String,)>(&instance, &mut store, "describe-ui")?;
-            let (render_ui, on_ui_input) = if describe_ui.is_some() {
-                (
-                    Some(get_required_func::<(String,), (String,)>(
-                        &instance,
-                        &mut store,
-                        "render-ui",
-                    )?),
-                    Some(get_required_func::<(String,), ()>(
-                        &instance,
-                        &mut store,
-                        "on-ui-input",
-                    )?),
-                )
-            } else {
-                (None, None)
-            };
+                get_required_func::<(), (String,)>(&instance, &mut store, "describe-ui")?;
+            let render_ui =
+                get_required_func::<(String,), (String,)>(&instance, &mut store, "render-ui")?;
+            let on_ui_input =
+                get_required_func::<(String,), ()>(&instance, &mut store, "on-ui-input")?;
 
             let (tools_json,) = list_tools
                 .call_async(&mut store, ())
                 .await
                 .into_anyhow()
                 .context("plugin `list-tools` failed")?;
-            let legacy_tools: Vec<ToolSpec> = serde_json::from_str(&tools_json)
+            let static_tools: Vec<ToolSpec> = serde_json::from_str(&tools_json)
                 .with_context(|| "plugin `list-tools` returned invalid ToolSpec JSON")?;
-            contributions.upsert_legacy_tools(legacy_tools)?;
+            contributions.upsert_static_tools(static_tools)?;
 
             let plugin_id = manifest.plugin.id.clone();
             let state = Arc::new(Mutex::new(WasmPluginState {
@@ -482,28 +397,22 @@ impl WasmPluginHost {
 
             let initialization = async {
                 let mut state = state.lock().await;
-                if let Some(activate) = activate {
-                    refill_fuel(&mut state)?;
-                    let context_json = serde_json::to_string(&serde_json::json!({
-                        "plugin_id": &plugin_id,
-                        "metadata": &manifest.metadata,
-                    }))?;
-                    let (activation_error,) = activate
-                        .call_async(&mut state.store, (context_json,))
-                        .await
-                        .into_anyhow()
-                        .with_context(|| format!("plugin `{plugin_id}` activate failed"))?;
-                    if !activation_error.is_empty() {
-                        return Err(anyhow!(
-                            "plugin `{plugin_id}` activation failed: {activation_error}"
-                        ));
-                    }
+                refill_fuel(&mut state)?;
+                let context_json = serde_json::to_string(&serde_json::json!({
+                    "plugin_id": &plugin_id,
+                    "metadata": &manifest.metadata,
+                }))?;
+                let (activation_error,) = activate
+                    .call_async(&mut state.store, (context_json,))
+                    .await
+                    .into_anyhow()
+                    .with_context(|| format!("plugin `{plugin_id}` activate failed"))?;
+                if !activation_error.is_empty() {
+                    return Err(anyhow!(
+                        "plugin `{plugin_id}` activation failed: {activation_error}"
+                    ));
                 }
 
-                // UI 导出是可选能力，未实现 describe-ui 的旧插件继续作为纯工具插件加载。
-                let Some(describe_ui) = describe_ui else {
-                    return Ok(Vec::new());
-                };
                 refill_fuel(&mut state)?;
                 let (declarations_json,) = describe_ui
                     .call_async(&mut state.store, ())
@@ -531,7 +440,6 @@ impl WasmPluginHost {
                 contributions,
                 services,
                 known_ui,
-                has_context_loader: load_context.is_some(),
                 agent_runtime,
                 state,
             })
@@ -555,18 +463,11 @@ impl WasmPluginHost {
         &self.manifest
     }
 
-    /// 返回组件是否导出了上下文加载入口。
-    pub fn supports_context_loading(&self) -> bool {
-        self.has_context_loader
-    }
-
-    /// 调用 component 的可选卸载钩子。
+    /// 调用 component 的卸载钩子并撤销其全部宿主资源。
     pub async fn deactivate(&self) -> Result<()> {
         let mut state = self.state.lock().await;
         let deactivation = async {
-            let Some(deactivate) = state.deactivate else {
-                return Ok(());
-            };
+            let deactivate = state.deactivate;
             refill_fuel(&mut state)?;
             let (deactivation_error,) = deactivate
                 .call_async(&mut state.store, ())
@@ -681,9 +582,7 @@ impl PluginHost for WasmPluginHost {
         let request_json = serde_json::to_string(request)?;
         let mut state = self.state.lock().await;
         refill_fuel(&mut state)?;
-        let Some(load_context) = state.load_context else {
-            return Ok(None);
-        };
+        let load_context = state.load_context;
         let (response_json,) = load_context
             .call_async(&mut state.store, (request_json,))
             .await
@@ -720,9 +619,7 @@ impl PluginHost for WasmPluginHost {
         let request_json = serde_json::to_string(request)?;
         let mut state = self.state.lock().await;
         refill_fuel(&mut state)?;
-        let Some(render_ui) = state.render_ui else {
-            return Ok(None);
-        };
+        let render_ui = state.render_ui;
         let (frame_json,) = render_ui
             .call_async(&mut state.store, (request_json,))
             .await
@@ -760,9 +657,7 @@ impl PluginHost for WasmPluginHost {
         let input_json = serde_json::to_string(input)?;
         let mut state = self.state.lock().await;
         refill_fuel(&mut state)?;
-        let Some(on_ui_input) = state.on_ui_input else {
-            return Ok(());
-        };
+        let on_ui_input = state.on_ui_input;
         on_ui_input
             .call_async(&mut state.store, (input_json,))
             .await
@@ -1057,495 +952,6 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
     Ok(())
 }
 
-/// 将多个 WASM 插件 manifest 加载为一个组合宿主。
-pub async fn load_wasm_plugins<P: AsRef<Path>>(paths: &[P]) -> Result<CompositePluginHost> {
-    load_wasm_plugins_with_selection(paths, &HashMap::new()).await
-}
-
-/// 使用可扩展宿主服务加载多个 WASM 插件。
-pub async fn load_wasm_plugins_with_services<P: AsRef<Path>>(
-    paths: &[P],
-    host_services: PluginHostServices,
-) -> Result<CompositePluginHost> {
-    load_wasm_plugins_with_selection_and_services(paths, &HashMap::new(), host_services).await
-}
-
-/// 使用应用显式选择解析独占能力并加载多个 WASM 插件。
-pub async fn load_wasm_plugins_with_selection<P: AsRef<Path>>(
-    paths: &[P],
-    capability_selection: &HashMap<String, String>,
-) -> Result<CompositePluginHost> {
-    load_wasm_plugins_with_selection_and_services(
-        paths,
-        capability_selection,
-        PluginHostServices::default(),
-    )
-    .await
-}
-
-/// 使用独占能力选择和可扩展宿主服务加载多个 WASM 插件。
-pub async fn load_wasm_plugins_with_selection_and_services<P: AsRef<Path>>(
-    paths: &[P],
-    capability_selection: &HashMap<String, String>,
-    host_services: PluginHostServices,
-) -> Result<CompositePluginHost> {
-    let mut pending = Vec::with_capacity(paths.len());
-    for path in paths {
-        let manifest_path = path.as_ref();
-        let manifest = PluginManifest::load(manifest_path)?;
-        let plugin_dir = manifest_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        let wasm_path = plugin_dir.join(&manifest.plugin.wasm);
-        pending.push((manifest, wasm_path, plugin_dir));
-    }
-    let manifests = pending
-        .iter()
-        .map(|(manifest, _, _)| manifest.clone())
-        .collect::<Vec<_>>();
-    let resolved_capabilities = resolve_plugin_capabilities(&manifests, capability_selection)?;
-    let order = resolve_plugin_load_order(&manifests)?;
-    let services = Arc::new(ServiceRegistry::default());
-    let mut composite = CompositePluginHost::new();
-    if let Some(owner) = resolved_capabilities.exclusive_owner(CONTEXT_LOADER_CAPABILITY) {
-        composite.set_capability_owner(CONTEXT_LOADER_CAPABILITY, owner);
-    }
-    for index in order {
-        let (manifest, wasm_path, plugin_dir) = pending[index].clone();
-        let loading = WasmPluginHost::load_with_limits_in_dir(
-            manifest,
-            wasm_path,
-            plugin_dir,
-            WasmPluginLimits::default(),
-            services.clone(),
-            host_services.clone(),
-        )
-        .await;
-        let host = match loading {
-            Ok(host) => host,
-            Err(error) => {
-                let _ = composite.shutdown().await;
-                return Err(error);
-            }
-        };
-        if composite.capability_owner(CONTEXT_LOADER_CAPABILITY) == Some(host.id())
-            && !host.supports_context_loading()
-        {
-            let _ = host.shutdown().await;
-            let _ = composite.shutdown().await;
-            return Err(anyhow!(
-                "插件 `{}` 声明了 `{CONTEXT_LOADER_CAPABILITY}`，但未导出 load-context",
-                host.id()
-            ));
-        }
-        composite.push(Arc::new(host));
-    }
-    Ok(composite)
-}
-
-/// Loads plugins independently and retains unrelated successes after activation failures.
-///
-/// 独立加载插件；激活失败后保留无关的成功插件，并按依赖关系跳过必选依赖方。
-pub async fn load_wasm_plugins_resilient<P: AsRef<Path>>(paths: &[P]) -> Result<PluginLoadReport> {
-    load_wasm_plugins_resilient_with_selection(paths, &HashMap::new()).await
-}
-
-/// Loads plugins resiliently with explicit exclusive-capability selections.
-///
-/// 使用显式独占能力选择进行容错加载。
-pub async fn load_wasm_plugins_resilient_with_selection<P: AsRef<Path>>(
-    paths: &[P],
-    capability_selection: &HashMap<String, String>,
-) -> Result<PluginLoadReport> {
-    load_wasm_plugins_resilient_with_selection_and_services(
-        paths,
-        capability_selection,
-        PluginHostServices::default(),
-    )
-    .await
-}
-
-/// Returns failed required dependencies while ignoring optional ones.
-///
-/// 返回加载失败的必选依赖，并忽略可选依赖。
-fn failed_required_dependencies(
-    manifest: &PluginManifest,
-    failed_ids: &HashSet<String>,
-) -> Vec<String> {
-    manifest
-        .dependencies
-        .iter()
-        .filter(|dependency| !dependency.optional && failed_ids.contains(&dependency.id))
-        .map(|dependency| dependency.id.clone())
-        .collect()
-}
-
-/// Builds a partial dependency plan and isolates invalid required dependency closures.
-///
-/// 生成容错依赖计划，仅隔离必选依赖无效的插件及其依赖闭包。
-///
-/// Missing optional dependencies and optional dependencies whose provider was excluded do not
-/// block a plugin. An installed optional dependency with an incompatible version keeps the strict
-/// manifest semantics and excludes the dependent plugin.
-///
-/// 缺失的可选依赖、或已被隔离的可选依赖不会阻止插件；已安装但版本不兼容的
-/// 可选依赖仍遵循严格 manifest 语义，剔除对应依赖方。
-fn resilient_dependency_plan(
-    manifests: &[PluginManifest],
-) -> Result<(Vec<usize>, Vec<PluginLoadFailure>)> {
-    let mut by_id = HashMap::new();
-    for (index, manifest) in manifests.iter().enumerate() {
-        if by_id.insert(manifest.plugin.id.as_str(), index).is_some() {
-            return Err(anyhow!("插件 ID 重复：`{}`", manifest.plugin.id));
-        }
-    }
-
-    let mut failed = vec![None; manifests.len()];
-    for (index, manifest) in manifests.iter().enumerate() {
-        for dependency in &manifest.dependencies {
-            let Some(&provider_index) = by_id.get(dependency.id.as_str()) else {
-                if !dependency.optional {
-                    failed[index] = Some(PluginLoadFailure {
-                        plugin_id: manifest.plugin.id.clone(),
-                        reason: format!("缺少必选依赖 `{}`", dependency.id),
-                        blocked_by: vec![dependency.id.clone()],
-                    });
-                    break;
-                }
-                continue;
-            };
-            let requirement = VersionReq::parse(&dependency.version)?;
-            let provider_version = Version::parse(&manifests[provider_index].plugin.version)?;
-            if !requirement.matches(&provider_version) {
-                failed[index] = Some(PluginLoadFailure {
-                    plugin_id: manifest.plugin.id.clone(),
-                    reason: format!(
-                        "依赖 `{}` 需要版本 `{}`，当前为 `{provider_version}`",
-                        dependency.id, dependency.version
-                    ),
-                    blocked_by: if dependency.optional {
-                        Vec::new()
-                    } else {
-                        vec![dependency.id.clone()]
-                    },
-                });
-                break;
-            }
-        }
-    }
-
-    // Propagate required failures layer by layer while preserving optional dependents.
-    // 逐层传播必选依赖失败，保留只声明了可选依赖的插件。
-    loop {
-        let failed_ids = failed
-            .iter()
-            .filter_map(|failure| failure.as_ref().map(|failure| failure.plugin_id.clone()))
-            .collect::<HashSet<_>>();
-        let mut changed = false;
-        for (index, manifest) in manifests.iter().enumerate() {
-            if failed[index].is_some() {
-                continue;
-            }
-            let blocked_by = manifest
-                .dependencies
-                .iter()
-                .filter(|dependency| {
-                    !dependency.optional && failed_ids.contains(dependency.id.as_str())
-                })
-                .map(|dependency| dependency.id.clone())
-                .collect::<Vec<_>>();
-            if blocked_by.is_empty() {
-                continue;
-            }
-            failed[index] = Some(PluginLoadFailure {
-                plugin_id: manifest.plugin.id.clone(),
-                reason: format!("必选依赖加载失败：{}", blocked_by.join("、")),
-                blocked_by,
-            });
-            changed = true;
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    let mut outgoing = vec![Vec::new(); manifests.len()];
-    let mut indegree = vec![0usize; manifests.len()];
-    for (dependent_index, manifest) in manifests.iter().enumerate() {
-        if failed[dependent_index].is_some() {
-            continue;
-        }
-        for dependency in manifest
-            .dependencies
-            .iter()
-            .filter(|dependency| !dependency.optional)
-        {
-            let provider_index = by_id[dependency.id.as_str()];
-            if failed[provider_index].is_none() {
-                outgoing[provider_index].push(dependent_index);
-                indegree[dependent_index] += 1;
-            }
-        }
-    }
-
-    let required_order = topological_order(&outgoing, &indegree, &failed);
-    let expected = failed.iter().filter(|failure| failure.is_none()).count();
-    if required_order.len() != expected {
-        let ordered = required_order.iter().copied().collect::<HashSet<_>>();
-        let blocked = failed
-            .iter()
-            .enumerate()
-            .filter_map(|(index, failure)| {
-                (failure.is_none() && !ordered.contains(&index)).then_some(index)
-            })
-            .collect::<Vec<_>>();
-        let blocked_ids = blocked
-            .iter()
-            .map(|index| manifests[*index].plugin.id.as_str())
-            .collect::<Vec<_>>();
-        let reason = format!("必选依赖链存在循环：{}", blocked_ids.join("、"));
-        let blocked_set = blocked.iter().copied().collect::<HashSet<_>>();
-        for index in blocked {
-            let blocked_by = manifests[index]
-                .dependencies
-                .iter()
-                .filter(|dependency| !dependency.optional)
-                .filter_map(|dependency| by_id.get(dependency.id.as_str()).copied())
-                .filter(|provider| blocked_set.contains(provider))
-                .map(|provider| manifests[provider].plugin.id.clone())
-                .collect();
-            failed[index] = Some(PluginLoadFailure {
-                plugin_id: manifests[index].plugin.id.clone(),
-                reason: reason.clone(),
-                blocked_by,
-            });
-        }
-    }
-
-    // Add optional edges only when they preserve the required DAG, preferring provider-first load.
-    // 必选图无环后，尽量加入不会制造循环的可选依赖边，让可选 provider 优先加载。
-    let mut outgoing = vec![Vec::new(); manifests.len()];
-    let mut indegree = vec![0usize; manifests.len()];
-    for (dependent_index, manifest) in manifests.iter().enumerate() {
-        if failed[dependent_index].is_some() {
-            continue;
-        }
-        for dependency in manifest
-            .dependencies
-            .iter()
-            .filter(|dependency| !dependency.optional)
-        {
-            let provider_index = by_id[dependency.id.as_str()];
-            if failed[provider_index].is_some() {
-                continue;
-            }
-            outgoing[provider_index].push(dependent_index);
-            indegree[dependent_index] += 1;
-        }
-    }
-    for (dependent_index, manifest) in manifests.iter().enumerate() {
-        if failed[dependent_index].is_some() {
-            continue;
-        }
-        for dependency in manifest
-            .dependencies
-            .iter()
-            .filter(|dependency| dependency.optional)
-        {
-            let Some(&provider_index) = by_id.get(dependency.id.as_str()) else {
-                continue;
-            };
-            if failed[provider_index].is_some()
-                || path_exists(&outgoing, dependent_index, provider_index)
-            {
-                continue;
-            }
-            outgoing[provider_index].push(dependent_index);
-            indegree[dependent_index] += 1;
-        }
-    }
-
-    let order = topological_order(&outgoing, &indegree, &failed);
-    let failures = failed.into_iter().flatten().collect();
-    Ok((order, failures))
-}
-
-/// Returns a deterministic topological order for nodes that have not failed.
-///
-/// 返回未失败节点的稳定拓扑顺序。
-fn topological_order(
-    outgoing: &[Vec<usize>],
-    indegree: &[usize],
-    failed: &[Option<PluginLoadFailure>],
-) -> Vec<usize> {
-    let mut indegree = indegree.to_vec();
-    let mut ready = indegree
-        .iter()
-        .enumerate()
-        .filter_map(|(index, degree)| (failed[index].is_none() && *degree == 0).then_some(index))
-        .collect::<BTreeSet<_>>();
-    let mut order = Vec::new();
-    while let Some(index) = ready.pop_first() {
-        order.push(index);
-        for &dependent in &outgoing[index] {
-            indegree[dependent] -= 1;
-            if indegree[dependent] == 0 {
-                ready.insert(dependent);
-            }
-        }
-    }
-    order
-}
-
-/// Returns whether the current directed graph contains a path between two nodes.
-///
-/// 判断当前有向图中两个节点之间是否已存在路径。
-fn path_exists(outgoing: &[Vec<usize>], start: usize, target: usize) -> bool {
-    let mut stack = vec![start];
-    let mut visited = HashSet::new();
-    while let Some(index) = stack.pop() {
-        if index == target {
-            return true;
-        }
-        if visited.insert(index) {
-            stack.extend(outgoing[index].iter().copied());
-        }
-    }
-    false
-}
-
-/// Loads plugins resiliently with capability selections and application host services.
-///
-/// 使用独占能力选择和应用宿主服务进行容错加载。
-///
-/// Invalid manifests, dependency incompatibilities, dependency cycles, and runtime activation
-/// failures only remove the affected plugin and plugins whose required dependencies are
-/// unavailable. Optional dependents and unrelated plugins continue loading. Duplicate stable IDs
-/// and invalid capability selections remain global configuration errors because ownership would
-/// otherwise be ambiguous.
-///
-/// 无效 manifest、依赖不兼容、依赖循环和运行时激活失败，只会剔除受影响插件及必选依赖
-/// 不可用的依赖方；可选依赖方和无关插件继续加载。重复稳定 ID 和无效能力选择仍是
-/// 全局配置错误，因为宿主无法安全确定 owner。
-pub async fn load_wasm_plugins_resilient_with_selection_and_services<P: AsRef<Path>>(
-    paths: &[P],
-    capability_selection: &HashMap<String, String>,
-    host_services: PluginHostServices,
-) -> Result<PluginLoadReport> {
-    let mut pending = Vec::with_capacity(paths.len());
-    let mut failures = Vec::new();
-    for path in paths {
-        let manifest_path = path.as_ref();
-        let manifest = match PluginManifest::load(manifest_path) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                let plugin_id = manifest_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| manifest_path.display().to_string());
-                failures.push(PluginLoadFailure {
-                    plugin_id,
-                    reason: error.to_string(),
-                    blocked_by: Vec::new(),
-                });
-                continue;
-            }
-        };
-        let plugin_dir = manifest_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        let wasm_path = plugin_dir.join(&manifest.plugin.wasm);
-        pending.push((manifest, wasm_path, plugin_dir));
-    }
-    let manifests = pending
-        .iter()
-        .map(|(manifest, _, _)| manifest.clone())
-        .collect::<Vec<_>>();
-    let (order, dependency_failures) = resilient_dependency_plan(&manifests)?;
-    let eligible_manifests = order
-        .iter()
-        .map(|index| manifests[*index].clone())
-        .collect::<Vec<_>>();
-    let resolved_capabilities =
-        resolve_plugin_capabilities(&eligible_manifests, capability_selection)?;
-    let selected_context_owner = resolved_capabilities
-        .exclusive_owner(CONTEXT_LOADER_CAPABILITY)
-        .map(str::to_string);
-    let services = Arc::new(ServiceRegistry::default());
-    let mut composite = CompositePluginHost::new();
-    failures.extend(dependency_failures);
-    let mut failed_ids = failures
-        .iter()
-        .map(|failure| failure.plugin_id.clone())
-        .collect::<HashSet<_>>();
-
-    for index in order {
-        let (manifest, wasm_path, plugin_dir) = pending[index].clone();
-        let plugin_id = manifest.plugin.id.clone();
-        let blocked_by = failed_required_dependencies(&manifest, &failed_ids);
-        if !blocked_by.is_empty() {
-            failed_ids.insert(plugin_id.clone());
-            failures.push(PluginLoadFailure {
-                plugin_id,
-                reason: format!("必选依赖加载失败：{}", blocked_by.join("、")),
-                blocked_by,
-            });
-            continue;
-        }
-
-        let loading = WasmPluginHost::load_with_limits_in_dir(
-            manifest,
-            wasm_path,
-            plugin_dir,
-            WasmPluginLimits::default(),
-            services.clone(),
-            host_services.clone(),
-        )
-        .await;
-        let host = match loading {
-            Ok(host) => host,
-            Err(error) => {
-                failed_ids.insert(plugin_id.clone());
-                failures.push(PluginLoadFailure {
-                    plugin_id,
-                    reason: error.to_string(),
-                    blocked_by: Vec::new(),
-                });
-                continue;
-            }
-        };
-        if selected_context_owner.as_deref() == Some(host.id()) && !host.supports_context_loading()
-        {
-            let reason = format!(
-                "插件 `{}` 声明了 `{CONTEXT_LOADER_CAPABILITY}`，但未导出 load-context",
-                host.id()
-            );
-            let _ = host.shutdown().await;
-            failed_ids.insert(plugin_id.clone());
-            failures.push(PluginLoadFailure {
-                plugin_id,
-                reason,
-                blocked_by: Vec::new(),
-            });
-            continue;
-        }
-        composite.push(Arc::new(host));
-    }
-
-    if let Some(owner) = selected_context_owner {
-        if composite.get(&owner).is_some() {
-            composite.set_capability_owner(CONTEXT_LOADER_CAPABILITY, owner);
-        }
-    }
-    Ok(PluginLoadReport {
-        host: composite,
-        failures,
-    })
-}
-
 fn refill_fuel(state: &mut WasmPluginState) -> Result<()> {
     let fuel = state.limits.fuel;
     state
@@ -1593,22 +999,6 @@ fn validate_ui_instance(declaration: &UiDeclaration, instance_id: Option<&str>) 
             declaration.view_id
         )),
     }
-}
-
-/// 探测可选 component 导出；导出存在但类型不匹配时仍视为加载错误。
-fn get_optional_func<Params, Results>(
-    instance: &Instance,
-    store: &mut Store<PluginWasiState>,
-    name: &str,
-) -> Result<Option<TypedFunc<Params, Results>>>
-where
-    Params: ComponentNamedList + Lower + Send + Sync + 'static,
-    Results: ComponentNamedList + Lift + Send + Sync + 'static,
-{
-    if instance.get_func(&mut *store, name).is_none() {
-        return Ok(None);
-    }
-    get_required_func(instance, store, name).map(Some)
 }
 
 fn get_required_func<Params, Results>(

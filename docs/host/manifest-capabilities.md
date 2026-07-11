@@ -99,4 +99,4 @@ profiles = ["worker", "reviewer"]
 
 ## ABI 兼容
 
-当前 manifest 版本是 `0.6.0`。Host 继续接受 `0.1.0` 到 `0.5.0`，可选导出通过探测加载；Agent Runtime import 只允许 `0.6.0` 插件使用。新插件应始终使用当前版本。
+当前 manifest 版本是 `0.6.0`，Host 只接受该版本并要求 WIT 导出完整存在。WIT 函数表面发生破坏性变化时必须升级 ABI；当前 Host 不保留旧 component 的探测加载分支。
