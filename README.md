@@ -165,10 +165,11 @@ ABI 故意使用 JSON 字符串。这样 WIT 边界保持稳定，同时 Rust �
 
 插件可以通过三个可选 UI 导出提供自己的终端界面。宿主探测不到 `describe-ui` 时，会把旧插件作为纯工具插件加载；探测到该导出后，`render-ui` 和 `on-ui-input` 必须同时存在。
 
-- `describe-ui` 返回 `UiDeclaration` 数组。每个视图可以挂载到 `top`、`right`、`bottom`、`left` 四个插槽或 `dialog` 模态层。
+- `describe-ui` 返回 `UiDeclaration` 数组。每个视图可以挂载到 `top`、`right`、`bottom`、`left` 四个插槽、`dialog` 模态层或动态 `subview` 类型。
 - `render-ui` 接收宿主实际分配的尺寸和焦点状态，返回由行、文本片段和便携样式组成的 `UiFrame`。插件不能访问 Ratatui `Frame`、终端句柄或发送 ANSI 控制序列。
 - `on-ui-input` 只接收当前焦点视图的宿主无关输入事件。`Tab` 在主输入区和可聚焦停靠视图之间切换；可见 `dialog` 始终优先接收输入。
 - 多个插件占用同一插槽时按配置加载顺序堆叠，宿主始终为中心主界面保留最小空间；多个可见对话框只显示最后加载的一个。
+- `subview` 通过 `Push`、`Replace`、`Pop` 组成以 Lucia 主视图为根的导航栈。Host 只路由不透明 `instance_id`，sub-agent、workflow 等实例含义完全由插件定义。
 
 主 TUI 默认启用插件能力，并自动发现 `$LUCIA_HOME/official-plugins/*/plugin.toml`。配置中的 `[[plugins]]` 和 `--plugin-manifest` 仍可加载其他插件；同 ID 的显式声明优先于官方默认插件。同一个组合宿主以 `AgentExtension` 挂到 core，并以 `PluginHost` 服务 UI 循环；core 不接触插件 UI 或加载细节。插件 UI 运行时错误只会显示在对应视图内，不会退出主 TUI。
 
@@ -180,7 +181,11 @@ ABI 故意使用 JSON 字符串。这样 WIT 边界保持稳定，同时 Rust �
 
 官方 Skill 插件位于 [`examples/plugins/skill-plugin`](examples/plugins/skill-plugin/README.md)。它扫描 `SKILL.md`，只把名称和描述注入 Agent，并通过 `skill_read` 按需加载完整指令；Core 和 Host 不解析 Skill 格式。
 
+官方 Command 插件位于 [`examples/plugins/command-plugin`](examples/plugins/command-plugin)。它提供 `/help`、`/resume`、`/new`、`/sessions`、`/clear` 和 `/exit`，并通过版本化协议与类型化 SDK 向其他插件开放命令定义、参数、候选补全、注册、注销和执行回调。命令预览与会话选择 Dialog 由插件声明，TUI 只负责渲染和执行受控的会话动作。
+
 受限 Agent 派生与续跑示例见 [`examples/plugins/agent-runtime-plugin`](examples/plugins/agent-runtime-plugin/README.md)。Host 只提供 profile 授权、生命周期、状态、结果和取消；sub-agent、workflow、multi-agent 与 teammate 的角色、邮箱和消息协议由插件定义。
+
+官方 Teammate 插件位于 [`examples/plugins/teammate-plugin`](examples/plugins/teammate-plugin/README.md)。它提供受限成员派生、有界邮箱、确认与续跑注入，并通过右侧团队入口打开全屏团队工作台；插件版 TUI 会注入 `worker` profile 并由默认安装器分发。
 
 官方 Context 插件位于 [`examples/plugins/context-plugin`](examples/plugins/context-plugin/README.md)。它声明独占的 `agent.context-loader` 能力，按上下文水位清理旧工具结果或将较旧 API 轮次替换为结构化摘要，同时原样保留近期工作上下文。
 
@@ -223,7 +228,7 @@ lucia --resume-latest
 lucia --session-id design-review
 ```
 
-会话默认保存在 `$HOME/.lucia/sessions`。TUI 会自动恢复配置中的默认 Session，并把用户、助手和工具历史重新显示在主事件列表：
+`lucia` 把启动目录作为项目工作目录。普通启动总是进入空白 Draft，不读取上一次会话；用户发送第一条消息后，记录才写入 `$HOME/.lucia/projects/<project-id>/sessions`。输入 `/resume` 会打开当前项目的会话列表，选择后恢复用户、助手和工具历史。CLI 仍支持显式恢复和只读列举：
 
 ```bash
 lucia --list-sessions
@@ -348,7 +353,7 @@ export_plugin!(MyPlugin);
 crate-type = ["cdylib"]
 
 [dependencies]
-agent-plugin = { path = "../../crates/ascnet-lucia-plugin" }
+agent-plugin = { path = "../../crates/agent-plugin" }
 serde_json = "1"
 wit-bindgen = "0.59"
 ```
