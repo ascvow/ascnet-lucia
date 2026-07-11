@@ -13,7 +13,7 @@ use agent_core::{
 };
 #[cfg(feature = "plugins")]
 use agent_plugin_host::{
-    manifest::load_plugin_runtime_config,
+    manifest::{load_plugin_runtime_config, PluginManifest},
     ui::{
         UiColor, UiDeclaration, UiFrame as PluginUiFrame, UiInput, UiInputEvent, UiLine,
         UiPlacement, UiRenderRequest, UiSpan, UiStyle,
@@ -24,6 +24,8 @@ use agent_plugin_host::{
 use agent_session::{FileSessionStore, MemorySessionStore, SessionId, SessionRecord, SessionStore};
 use agent_tool::{JsonTool, ToolCall, ToolRegistry, ToolSpec};
 use anyhow::{anyhow, Result};
+#[cfg(feature = "plugins")]
+use app_config::discover_official_plugin_manifests;
 use app_config::{
     initialize_config, load_tui_settings, lucia_home_dir, resolve_config_path,
     resolve_config_relative_path, TuiSettings,
@@ -36,7 +38,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKin
 use ratatui::{prelude::*, widgets::*};
 use serde_json::{json, Value};
 #[cfg(feature = "plugins")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{path::Path, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
 
@@ -1823,6 +1825,30 @@ async fn print_persisted_sessions(store: &dyn SessionStore) -> Result<()> {
     Ok(())
 }
 
+/// Appends default official plugins while preserving explicit manifests with the same ID.
+///
+/// 将默认官方插件补充到显式插件列表，并让同 ID 的显式声明优先。
+#[cfg(feature = "plugins")]
+fn merge_official_plugin_manifests(
+    manifests: &mut Vec<PathBuf>,
+    official_manifests: Vec<PathBuf>,
+) -> Result<()> {
+    let mut plugin_ids = manifests
+        .iter()
+        .map(PluginManifest::load)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|manifest| manifest.plugin.id)
+        .collect::<HashSet<_>>();
+    for path in official_manifests {
+        let manifest = PluginManifest::load(&path)?;
+        if plugin_ids.insert(manifest.plugin.id) {
+            manifests.push(path);
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1885,6 +1911,11 @@ async fn main() -> Result<()> {
         plugin_manifests.extend(plugin_runtime.manifest_paths);
         capability_selection.extend(plugin_runtime.capability_selection);
     }
+    #[cfg(feature = "plugins")]
+    merge_official_plugin_manifests(
+        &mut plugin_manifests,
+        discover_official_plugin_manifests(&lucia_home)?,
+    )?;
 
     let (gateway, options, demo_mode, mut startup_notices) = if args.demo {
         let (gateway, options) = build_demo_gateway();
@@ -2268,6 +2299,8 @@ fn latest_tool_result_text(req: &ModelRequest) -> Option<String> {
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+    #[cfg(feature = "plugins")]
+    use std::{fs, time::SystemTime};
 
     /// 将测试终端缓冲区转换为去除宽字符占位空格的纯文本。
     fn render_text(width: u16, height: u16, running: bool) -> String {
@@ -2614,6 +2647,46 @@ mod tests {
         app.handle_agent_done(Err(anyhow!("模拟运行失败")));
 
         assert_eq!(app.session_record, original);
+    }
+
+    /// Explicit manifests override same-ID official plugins while retaining other defaults.
+    ///
+    /// 显式插件应覆盖同 ID 官方插件，同时保留其他官方插件。
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn explicit_plugin_manifest_overrides_official_manifest() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("生成测试时间戳")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "lucia-official-plugin-merge-{}-{nonce}",
+            std::process::id()
+        ));
+        let explicit = root.join("explicit.toml");
+        let official_same = root.join("official-same.toml");
+        let official_other = root.join("official-other.toml");
+        fs::create_dir_all(&root).expect("创建插件合并测试目录");
+        let manifest = |id: &str, name: &str| {
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"{name}\"\nversion = \"1.0.0\"\napi_version = \"0.6.0\"\nwasm = \"plugin.wasm\"\n"
+            )
+        };
+        fs::write(&explicit, manifest("mcp", "显式 MCP")).expect("写入显式插件 manifest");
+        fs::write(&official_same, manifest("mcp", "官方 MCP"))
+            .expect("写入同 ID 官方插件 manifest");
+        fs::write(&official_other, manifest("skill", "官方 Skill"))
+            .expect("写入其他官方插件 manifest");
+
+        let mut manifests = vec![explicit.clone()];
+        merge_official_plugin_manifests(
+            &mut manifests,
+            vec![official_same, official_other.clone()],
+        )
+        .expect("合并官方插件 manifest");
+
+        assert_eq!(manifests, vec![explicit, official_other]);
+        fs::remove_dir_all(root).expect("清理插件合并测试目录");
     }
 
     /// 创建测试插件视图，覆盖停靠、对话框和焦点路由测试。

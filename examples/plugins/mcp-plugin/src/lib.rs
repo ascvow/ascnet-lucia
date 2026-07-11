@@ -75,7 +75,21 @@ impl AgentPlugin for McpPlugin {
             .map(|entry| entry.path)
             .collect::<Vec<_>>();
         if config_paths.is_empty() {
-            return Err(anyhow!("MCP 配置目录中没有 .json 文件：{config_dir}"));
+            // An empty MCP directory is a valid not-yet-configured state for default loading.
+            // 默认加载时，空 MCP 目录表示尚未配置，不应阻止 Agent 启动。
+            host.set_state("connected_servers", &json!([]))?;
+            host.emit_event(&ExtensionEvent {
+                name: "mcp.servers.empty".into(),
+                data: json!({
+                    "servers": [],
+                    "text": "MCP 插件等待配置",
+                }),
+                presentation: Some(EventPresentation::divider(
+                    "MCP 插件等待配置",
+                    EventPresentationTone::Muted,
+                )),
+            })?;
+            return Ok(());
         }
 
         for config_path in config_paths {

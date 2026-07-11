@@ -7,8 +7,9 @@ license.workspace = true
 description = "Lucia ReAct 智能体的交互式终端界面。"
 
 [features]
-# 默认发布纯 Core TUI；插件版必须显式启用，避免把 Wasmtime 带入基础包。
-default = []
+# Regular builds include plugins; use `--no-default-features` for the isolated Core binary.
+# 常规构建默认提供插件能力；纯 Core 产物使用 `--no-default-features` 保持依赖边界。
+default = ["plugins"]
 plugins = ["dep:agent-plugin-host"]
 
 [dependencies]

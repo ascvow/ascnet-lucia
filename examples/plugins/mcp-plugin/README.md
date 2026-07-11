@@ -37,21 +37,16 @@
 
 `command` 和 `args` 会按原样传给宿主进程 API，因此已有的 stdio MCP 配置无需协议适配。公开工具名采用 `mcp__<server-id>__<tool-name>`；插件内部仍保存 Server 原始工具名。
 
-将 [mastergo.example.json](./config/mastergo.example.json) 另存为 `config/mastergo.json` 并填写本地 token。`config/*.json` 已被忽略，不应提交 token。
+默认安装后，将 `$LUCIA_HOME/official-plugins/mcp/config/mastergo.example.json` 另存为同目录下的 `mastergo.json` 并填写本地 token。没有有效配置时插件保持待配置状态，不会阻止 TUI 启动。`config/*.json` 已被忽略，不应提交 token。
 
 ## 构建和运行
 
 ```bash
-cargo build --offline \
-  --manifest-path examples/plugins/mcp-plugin/Cargo.toml \
-  --lib \
-  --release \
-  --target wasm32-wasip2
-
-cargo run -p lucia -- \
-  --config examples/config/openai-responses.toml \
-  --plugin-manifest examples/plugins/mcp-plugin/plugin.toml
+bun run install:tui
+lucia
 ```
+
+默认安装会构建 MCP component 并同步官方 bundle；`lucia` 启动时自动加载，无需传入 `--plugin-manifest`。
 
 Agent 启动后会直接看到 MCP Server 返回的工具定义。提供 MasterGo 原型地址或节点信息时，模型可以选择对应的 `mcp__mastergo__...` 工具访问原型。
 

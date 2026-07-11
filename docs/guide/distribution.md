@@ -1,6 +1,6 @@
 # 构建与打包
 
-Lucia TUI 提供两个编译形态。默认形态只包含 Agent Core、模型适配器、原生工具和 Ratatui 界面；插件系统必须通过 Cargo feature 显式启用。
+Lucia TUI 提供两个编译形态。常规构建默认启用插件系统；纯 Core 形态通过 `--no-default-features` 排除 Plugin Host 和 Wasmtime。
 
 ## 纯 Core TUI
 
@@ -36,6 +36,8 @@ bun run build:tui:plugins
 target/plugin-tui/release/lucia
 ```
 
+该版本会自动加载 `$LUCIA_HOME/official-plugins/*/plugin.toml`。配置中的 `[[plugins]]` 和 `--plugin-manifest` 用于补充其他插件；同 ID 的显式插件优先。
+
 该版本包含 Plugin Host、WASM component 加载、依赖解析、插件服务和插件 TUI。
 
 ## 同时构建
@@ -58,19 +60,19 @@ bun run build:plugin-manager
 
 ## 本地安装
 
-使用 Bun 管理安装脚本。默认安装纯 Core 版本：
+使用 Bun 管理安装脚本。默认安装插件版本、构建并同步官方插件，同时确保新 zsh 会话可以找到 Cargo bin：
 
 ```bash
 bun run install:tui
 ```
 
-安装插件版本：
+只安装纯 Core 版本：
 
 ```bash
-bun run install:tui:plugins
+bun run install:tui:core
 ```
 
-安装后日常使用不依赖 Bun、Cargo 或仓库路径，直接运行 `lucia`，参数也直接附加到该命令。两个版本的命令名均为 `lucia`，因此同一 Cargo bin 目录内后安装的版本会覆盖前一个。分发两个压缩包时应使用独立 `--target-dir` 构建，并在归档名称中区分 `lucia-core` 与 `lucia-plugins`。
+默认安装会把官方 MCP 与 Skill bundle 同步到 `$LUCIA_HOME/official-plugins`，不会删除其中的用户配置或 Skill 文件。安装后直接运行 `lucia`，无需额外插件参数。两个版本的命令名均为 `lucia`，因此同一 Cargo bin 目录内后安装的版本会覆盖前一个。分发两个压缩包时应使用独立 `--target-dir` 构建，并在归档名称中区分 `lucia-core` 与 `lucia-plugins`。
 
 ## 验证边界
 

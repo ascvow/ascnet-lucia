@@ -32,11 +32,11 @@ bun run build:plugin:skill
 bun run test:plugin:skill
 ```
 
-在插件版 TUI 中加载：
+默认安装后，官方 Skill bundle 会同步到 `$LUCIA_HOME/official-plugins/skill`，并在启动时自动加载：
 
 ```bash
-bun run install:tui:plugins
-lucia --plugin-manifest examples/plugins/skill-plugin/plugin.toml
+bun run install:tui
+lucia
 ```
 
 可以通过 manifest 的 `metadata.skills_dir` 修改扫描目录，但该目录必须同时包含在 `capabilities.fs_read` 中。

@@ -170,7 +170,7 @@ ABI 故意使用 JSON 字符串。这样 WIT 边界保持稳定，同时 Rust �
 - `on-ui-input` 只接收当前焦点视图的宿主无关输入事件。`Tab` 在主输入区和可聚焦停靠视图之间切换；可见 `dialog` 始终优先接收输入。
 - 多个插件占用同一插槽时按配置加载顺序堆叠，宿主始终为中心主界面保留最小空间；多个可见对话框只显示最后加载的一个。
 
-主 TUI 通过 plugin-host 读取配置中的 `[[plugins]]` 条目。同一个组合宿主以 `AgentExtension` 挂到 core，并以 `PluginHost` 服务 UI 循环；core 不接触插件 UI 或加载细节。插件 UI 运行时错误只会显示在对应视图内，不会退出主 TUI。
+主 TUI 默认启用插件能力，并自动发现 `$LUCIA_HOME/official-plugins/*/plugin.toml`。配置中的 `[[plugins]]` 和 `--plugin-manifest` 仍可加载其他插件；同 ID 的显式声明优先于官方默认插件。同一个组合宿主以 `AgentExtension` 挂到 core，并以 `PluginHost` 服务 UI 循环；core 不接触插件 UI 或加载细节。插件 UI 运行时错误只会显示在对应视图内，不会退出主 TUI。
 
 完整能力展示见 [`examples/plugins/ui-showcase-plugin`](examples/plugins/ui-showcase-plugin/README.md)，该插件同时实现四向插槽、模态对话框、样式、键鼠输入、Agent 事件和工具驱动状态。
 
@@ -209,13 +209,13 @@ bun run docs:build
 
 ## TUI 配置与会话
 
-在仓库中安装一次纯 Core 版命令：
+在仓库中安装最新的插件版命令、同步官方插件并注册 zsh PATH：
 
 ```bash
 bun run install:tui
 ```
 
-之后直接运行 `lucia`。首次启动会自动创建 `$HOME/.lucia/config.toml`；模型 URL、密钥和模型名称分别从 `model.base_url`、`model.api_key`/`model.api_key_env` 和 `model.model` 读取。未设置模型密钥时进入本地演示模式，并在主事件区提示配置方式。`LUCIA_HOME`、`LUCIA_CONFIG` 和 `--config` 可以覆盖默认位置。
+之后直接运行 `lucia`，无需传入插件参数。首次启动会自动创建 `$HOME/.lucia/config.toml`；模型 URL、密钥和模型名称分别从 `model.base_url`、`model.api_key`/`model.api_key_env` 和 `model.model` 读取。未设置模型密钥时进入本地演示模式，并在主事件区提示配置方式。`LUCIA_HOME`、`LUCIA_CONFIG` 和 `--config` 可以覆盖默认位置。
 
 ```bash
 lucia
@@ -233,16 +233,16 @@ lucia --list-sessions
 
 ## Build / 构建
 
-默认构建是不包含 Plugin Host、Wasmtime 和插件 UI 的纯 Core TUI：
-
-```bash
-bun run build:tui:core
-```
-
-需要插件系统时显式启用 `plugins` feature，并使用独立输出目录：
+常规构建默认包含 Plugin Host、官方插件加载和插件 UI：
 
 ```bash
 bun run build:tui:plugins
+```
+
+需要不包含 Plugin Host、Wasmtime 和插件 UI 的纯 Core TUI 时：
+
+```bash
+bun run build:tui:core
 ```
 
 使用 `bun run build:tui` 可以依次构建两个版本。对应产物分别位于 `target/core-tui/release/lucia` 和 `target/plugin-tui/release/lucia`。完整说明见[构建与打包](docs/guide/distribution.md)。

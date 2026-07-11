@@ -10,7 +10,7 @@
 lucia
 ```
 
-首次启动会自动创建默认配置。默认配置路径是 `$LUCIA_HOME/config.toml`，未设置 `LUCIA_HOME` 时使用 `$HOME/.lucia/config.toml`。未检测到模型密钥时，TUI 会进入本地演示模式，并在主事件区显示配置提示。
+首次启动会自动创建默认配置。默认配置路径是 `$LUCIA_HOME/config.toml`，未设置 `LUCIA_HOME` 时使用 `$HOME/.lucia/config.toml`。插件版会自动加载 `$LUCIA_HOME/official-plugins/*/plugin.toml`，无需额外启动参数。未检测到模型密钥时，TUI 会进入本地演示模式，并在主事件区显示配置提示。
 
 模型服务完全由配置文件决定：
 

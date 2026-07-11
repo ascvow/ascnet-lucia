@@ -2,11 +2,13 @@
 
 官方插件与第三方插件使用同一套 WASM ABI、manifest 和 Host API，不拥有绕过权限或直接访问 Core 的内部接口。官方身份只表示该插件由 Lucia 仓库维护，并包含真实 component 路由测试。
 
-使用前需要安装支持插件的 TUI：
+默认安装命令会构建插件版 TUI、同步官方 bundle，并注册 zsh PATH：
 
 ```bash
-bun run install:tui:plugins
+bun run install:tui
 ```
+
+官方插件安装在 `$LUCIA_HOME/official-plugins`，启动 `lucia` 时自动加载，无需传入 `--plugin-manifest`。显式配置同 ID 插件时，显式版本优先。
 
 ## MCP
 
