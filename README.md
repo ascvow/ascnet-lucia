@@ -248,6 +248,12 @@ bun run build:all
 
 该命令只生成构建产物，不执行安装。主程序产物位于 `target/plugin-tui/release/lucia`，各插件产物位于自身目录的 `target/wasm32-wasip2/release`。
 
+需要同时构建全部插件、安装主 TUI 并同步官方插件时：
+
+```bash
+bun run install:all
+```
+
 常规构建默认包含 Plugin Host、官方插件加载和插件 UI：
 
 ```bash

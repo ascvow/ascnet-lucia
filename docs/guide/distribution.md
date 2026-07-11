@@ -60,7 +60,13 @@ bun run build:plugin-manager
 
 ## 本地安装
 
-使用 Bun 管理安装脚本。默认安装插件版本、构建并同步官方插件，同时确保新 zsh 会话可以找到 Cargo bin：
+构建全部官方与示例插件、安装插件版 TUI 并同步官方 bundle：
+
+```bash
+bun run install:all
+```
+
+只构建并安装插件版 TUI 与默认官方 bundle，同时确保新 zsh 会话可以找到 Cargo bin：
 
 ```bash
 bun run install:tui
