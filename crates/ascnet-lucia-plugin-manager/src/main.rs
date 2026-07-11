@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// Lucia 插件管理命令。
 #[derive(Debug, Parser)]
-#[command(name = "lucia-plugin", version, about = "管理本地 Lucia 插件")]
+#[command(name = "agent-plugin", version, about = "管理本地 Agent 插件")]
 struct Cli {
     /// 插件管理根目录，也可通过 `LUCIA_PLUGIN_ROOT` 指定。
     #[arg(long, env = "LUCIA_PLUGIN_ROOT")]

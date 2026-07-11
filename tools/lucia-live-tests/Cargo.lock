@@ -30,6 +30,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-live-tests"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-plugin-host",
+ "agent-tool",
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "agent-plugin-host"
 version = "0.1.0"
 dependencies = [
@@ -1280,20 +1294,6 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
-
-[[package]]
-name = "lucia-live-tests"
-version = "0.1.0"
-dependencies = [
- "agent-core",
- "agent-plugin-host",
- "agent-tool",
- "anyhow",
- "clap",
- "serde",
- "serde_json",
- "tokio",
-]
 
 [[package]]
 name = "mach2"

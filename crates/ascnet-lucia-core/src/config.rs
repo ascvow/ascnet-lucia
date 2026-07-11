@@ -13,14 +13,14 @@ use std::{collections::HashMap, fs, path::Path};
 /// Root configuration file.
 /// 根配置文件。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LuciaConfig {
+pub struct AgentRootConfig {
     pub model: ModelConfig,
 
     #[serde(default)]
     pub agent: AgentConfig,
 }
 
-impl LuciaConfig {
+impl AgentRootConfig {
     /// Load config from TOML.
     /// 从 TOML 加载配置。
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {

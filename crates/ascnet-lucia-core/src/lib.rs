@@ -18,7 +18,7 @@ pub mod model;
 pub mod session;
 
 pub use agent::{Agent, AgentControl, AgentModelConfig, AgentOptions, AgentRun};
-pub use config::{AgentConfig, LuciaConfig, ModelConfig};
+pub use config::{AgentConfig, AgentRootConfig, ModelConfig};
 pub use context::{
     ContextLoadRequest, ContextLoader, ContextTransform, LoadedContext, PassthroughContextLoader,
     TransformContextLoader,

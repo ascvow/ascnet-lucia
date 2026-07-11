@@ -1,6 +1,6 @@
 # 插件管理
 
-`lucia-plugin` 管理本地插件 bundle、启用状态、独占能力选择和完整性锁文件。它不加载 WASM，也不实现 MCP、Skill 或上下文压缩；应用通过 `PluginManager::runtime_config()` 把校验后的 manifest 路径和能力选择交给 Plugin Host。
+`agent-plugin` 管理本地插件 bundle、启用状态、独占能力选择和完整性锁文件。它不加载 WASM，也不实现 MCP、Skill 或上下文压缩；应用通过 `PluginManager::runtime_config()` 把校验后的 manifest 路径和能力选择交给 Plugin Host。
 
 ## 安装命令
 
@@ -14,17 +14,17 @@ export LUCIA_PLUGIN_ROOT="$HOME/.lucia"
 安装源必须是本地目录，根目录包含 `plugin.toml`，manifest 中的 WASM 文件也必须已经存在：
 
 ```bash
-lucia-plugin install ./dist/example-plugin
-lucia-plugin list
+agent-plugin install ./dist/example-plugin
+agent-plugin list
 ```
 
 默认安装后立即启用。需要先准备依赖或解决能力冲突时，先以禁用状态安装：
 
 ```bash
-lucia-plugin install ./dist/context-plugin-b --disabled
-lucia-plugin enable context-plugin-b
-lucia-plugin disable context-plugin-b
-lucia-plugin remove context-plugin-b
+agent-plugin install ./dist/context-plugin-b --disabled
+agent-plugin enable context-plugin-b
+agent-plugin disable context-plugin-b
+agent-plugin remove context-plugin-b
 ```
 
 也可以不设置环境变量，在每条命令中传入 `--root /path/to/root`。
@@ -55,7 +55,7 @@ optional = false
 1. 以禁用状态安装 provider 和 dependent。
 2. 先启用 provider。
 3. 再启用 dependent。
-4. 运行 `lucia-plugin doctor`。
+4. 运行 `agent-plugin doctor`。
 
 依赖只表达安装和加载顺序；实际跨插件调用仍使用[插件服务 API](/plugin/dependencies-services)。
 
@@ -64,7 +64,7 @@ optional = false
 多个插件可以声明同一个 `exclusive` 能力，但 Host 不会按安装顺序覆盖。先安装候选插件，再显式选择 owner：
 
 ```bash
-lucia-plugin select agent.context-loader context-plugin-b
+agent-plugin select agent.context-loader context-plugin-b
 ```
 
 `select` 会启用目标插件，并把选择写入锁文件。目标插件必须声明对应的独占能力；为 `multi` 能力选择 owner 会失败。
@@ -72,7 +72,7 @@ lucia-plugin select agent.context-loader context-plugin-b
 清除选择使用：
 
 ```bash
-lucia-plugin unselect agent.context-loader
+agent-plugin unselect agent.context-loader
 ```
 
 清除后若仍有多个已启用 provider，操作会被拒绝。应先禁用多余 provider，再执行 `unselect`。
@@ -80,7 +80,7 @@ lucia-plugin unselect agent.context-loader
 ## 完整性诊断
 
 ```bash
-lucia-plugin doctor
+agent-plugin doctor
 ```
 
 诊断会检查：

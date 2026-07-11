@@ -1,5 +1,5 @@
 [package]
-name = "lucia-live-tests"
+name = "agent-live-tests"
 version = "0.1.0"
 edition = "2021"
 authors = ["ascvow"]

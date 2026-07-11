@@ -12,7 +12,7 @@
 | `event` | `AgentEvent`、`AgentEventKind`、`EventSink` 与内置 sink |
 | `model` | `ModelGateway`、provider 配置、IR、stream、adapter trait |
 | `session` | `Session` 与消息追加/读取 |
-| `config` | `LuciaConfig`、`ModelConfig`、`AgentConfig` |
+| `config` | `AgentRootConfig`、`ModelConfig`、`AgentConfig` |
 
 ## agent-tool
 

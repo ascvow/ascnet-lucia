@@ -5,7 +5,7 @@ mod app_config;
 #[cfg(feature = "plugins")]
 use agent_core::AgentExtension;
 use agent_core::{
-    config::LuciaConfig,
+    config::AgentRootConfig,
     event::{AgentEvent, AgentEventKind, CompositeEventSink, EventSink, JsonlEventSink},
     model::{
         ChatModel, ContentBlock, MessageRole, ModelGateway, ModelRequest, ModelResponse,
@@ -2306,7 +2306,7 @@ async fn main() -> Result<()> {
             vec!["当前使用本地演示模型，不会连接外部模型服务".to_string()],
         )
     } else if config_exists {
-        let config = LuciaConfig::load(&config_path)?;
+        let config = AgentRootConfig::load(&config_path)?;
         if configured_model_key_is_available(&config) {
             (
                 config.build_gateway()?,
@@ -2626,7 +2626,7 @@ async fn main() -> Result<()> {
 /// 判断配置中的模型密钥是否可以用于本次启动。
 ///
 /// 明文密钥和环境变量任一包含非空值即视为可用；该检查不会读取或记录密钥内容。
-fn configured_model_key_is_available(config: &LuciaConfig) -> bool {
+fn configured_model_key_is_available(config: &AgentRootConfig) -> bool {
     config
         .model
         .api_key
@@ -2942,7 +2942,7 @@ mod tests {
     /// 验证空模型密钥触发演示模式，而非空明文密钥允许构建真实模型运行时。
     #[test]
     fn model_key_availability_rejects_empty_values() {
-        let without_key: LuciaConfig = toml::from_str(
+        let without_key: AgentRootConfig = toml::from_str(
             r#"
                 [model]
                 provider = "open-ai"
@@ -2953,7 +2953,7 @@ mod tests {
         .expect("解析无密钥测试配置");
         assert!(!configured_model_key_is_available(&without_key));
 
-        let with_key: LuciaConfig = toml::from_str(
+        let with_key: AgentRootConfig = toml::from_str(
             r#"
                 [model]
                 provider = "open-ai"

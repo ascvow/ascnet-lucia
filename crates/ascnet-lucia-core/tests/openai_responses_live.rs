@@ -1,4 +1,4 @@
-use agent_core::LuciaConfig;
+use agent_core::AgentRootConfig;
 use std::path::PathBuf;
 
 /// 返回仓库内 OpenAI Responses 示例配置路径。
@@ -12,7 +12,7 @@ fn openai_responses_config_path() -> PathBuf {
 #[tokio::test]
 #[ignore = "需要 OPENAI_API_KEY，且会发起真实 OpenAI Responses 请求"]
 async fn openai_responses_config_runs_core_agent() -> Result<(), Box<dyn std::error::Error>> {
-    let config = LuciaConfig::load(openai_responses_config_path())?;
+    let config = AgentRootConfig::load(openai_responses_config_path())?;
     let mut agent = config.build_agent()?;
 
     agent.options_mut().max_steps = 1;

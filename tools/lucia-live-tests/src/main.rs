@@ -6,7 +6,7 @@
 use anyhow::Result;
 use agent_core::{
     extension::AgentExtension, Agent, AgentEvent, AgentEventKind, AgentRun, InMemoryEventSink,
-    LuciaConfig, TokenUsage,
+    AgentRootConfig, TokenUsage,
 };
 use agent_plugin_host::{
     manifest::load_plugin_runtime_config, wasm::load_wasm_plugins, PluginHost,
@@ -215,7 +215,7 @@ async fn main() {
 async fn run_suite(args: &Args) -> SuiteReport {
     let suite_started = Instant::now();
     let selected = args.scenario.scenarios();
-    let config = match LuciaConfig::load(&args.config) {
+    let config = match AgentRootConfig::load(&args.config) {
         Ok(config) => config,
         Err(_) => {
             let reports = selected
@@ -264,7 +264,7 @@ fn resolve_plugin_manifest(args: &Args) -> Option<PathBuf> {
 }
 
 /// 运行不依赖插件的真实模型场景。
-async fn run_core_scenario(config: &LuciaConfig, scenario: LiveScenario) -> ScenarioReport {
+async fn run_core_scenario(config: &AgentRootConfig, scenario: LiveScenario) -> ScenarioReport {
     let started = Instant::now();
     let sink = Arc::new(InMemoryEventSink::new());
     let (tools, prompt, minimum_steps) = match scenario {
@@ -301,7 +301,7 @@ async fn run_core_scenario(config: &LuciaConfig, scenario: LiveScenario) -> Scen
 }
 
 /// 加载真实 WASM 插件并运行插件工具场景。
-async fn run_plugin_scenario(config: &LuciaConfig, manifest: &Path) -> ScenarioReport {
+async fn run_plugin_scenario(config: &AgentRootConfig, manifest: &Path) -> ScenarioReport {
     let scenario = LiveScenario::Plugin;
     let started = Instant::now();
     let host = match load_wasm_plugins(&[manifest]).await {
@@ -358,7 +358,7 @@ async fn run_plugin_scenario(config: &LuciaConfig, manifest: &Path) -> ScenarioR
 
 /// 从配置创建场景 Agent，并设置事件收集器与最低 ReAct 步数。
 fn build_agent(
-    config: &LuciaConfig,
+    config: &AgentRootConfig,
     tools: ToolRegistry,
     sink: Arc<InMemoryEventSink>,
     minimum_steps: usize,

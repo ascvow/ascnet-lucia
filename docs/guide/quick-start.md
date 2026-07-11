@@ -50,11 +50,11 @@ API key、provider 选择和配置文件始终由调用方持有，Core 不持�
 
 ```rust
 use anyhow::Result;
-use agent_core::LuciaConfig;
+use agent_core::AgentRootConfig;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = LuciaConfig::load("examples/config/openai-responses.toml")?;
+    let config = AgentRootConfig::load("examples/config/openai-responses.toml")?;
     let agent = config.build_agent()?;
     let run = agent.run("你好").await?;
     println!("{}", run.final_text);

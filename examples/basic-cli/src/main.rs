@@ -2,7 +2,7 @@
 //! ascnet-lucia 极简 CLI。
 
 use agent_core::{
-    config::LuciaConfig,
+    config::AgentRootConfig,
     model::{
         ChatModel, ContentBlock, FinishReason, MessageRole, ModelGateway, ModelRequest,
         ModelResponse, ProviderAdapter,
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
     let (gateway, options) = if args.demo {
         build_demo_gateway()
     } else if let Some(path) = &args.config {
-        let config = LuciaConfig::load(path)?;
+        let config = AgentRootConfig::load(path)?;
         plugin_manifests.extend(load_plugin_manifest_paths(path)?);
         (config.build_gateway()?, config.agent_options())
     } else {

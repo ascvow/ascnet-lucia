@@ -186,8 +186,8 @@ mod tests {
         let path = root.join("config.toml");
         initialize_config(&path).expect("首次初始化应成功");
 
-        let model_config =
-            agent_core::config::LuciaConfig::load(&path).expect("模板中的模型配置应可由 Core 解析");
+        let model_config = agent_core::config::AgentRootConfig::load(&path)
+            .expect("模板中的模型配置应可由 Core 解析");
         assert_eq!(
             model_config.model.base_url.as_deref(),
             Some("https://api.openai.com/v1")

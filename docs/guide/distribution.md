@@ -56,7 +56,7 @@ bun run build:tui
 bun run build:plugin-manager
 ```
 
-产物位于 `target/plugin-manager/release/lucia-plugin`。该程序只管理本地 bundle、锁文件和运行时配置，不加载 WASM component。
+产物位于 `target/plugin-manager/release/agent-plugin`。该程序只管理本地 bundle、锁文件和运行时配置，不加载 WASM component。
 
 ## 本地安装
 
