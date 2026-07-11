@@ -1557,6 +1557,7 @@ version = "0.1.0"
 dependencies = [
  "agent-core",
  "agent-plugin-host",
+ "agent-runtime",
  "agent-session",
  "agent-tool",
  "anyhow",

@@ -25,6 +25,19 @@
 
 服务 payload 使用相同操作名：`spawn`、`list`、`status`、`result`、`cancel`、`remove`、`send`、`inbox`、`ack`、`dispatch`。`operation` 之外的字段与对应工具参数一致。
 
+## 团队界面
+
+插件声明一个右侧“团队”摘要视图和一个全屏“团队工作台”子视图。右侧视图显示成员数、运行数、未确认消息数和成员状态；聚焦该视图后确认即可进入团队工作台。工作台支持选择成员并刷新 Runtime 状态，`Esc` 返回主会话。
+
+使用默认插件版：
+
+```bash
+bun run install:tui:plugins
+lucia
+```
+
+启动后按 `Tab` 将焦点切换到右侧“团队”视图，再按 `Enter` 进入团队工作台。开发目录也可以先构建插件，再通过 `--plugin-manifest examples/plugins/teammate-plugin/plugin.toml` 显式加载；TUI 会为它注入受限 Runtime 和 `worker` profile。
+
 ## 构建与验证
 
 ```bash

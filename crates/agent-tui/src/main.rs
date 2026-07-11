@@ -22,8 +22,12 @@ use agent_plugin_host::{
         UiColor, UiDeclaration, UiFrame as PluginUiFrame, UiInput, UiInputEvent, UiLine,
         UiNavigationRequest, UiPlacement, UiRenderRequest, UiSpan, UiStyle, UI_NAVIGATION_EVENT,
     },
-    wasm::{load_wasm_plugins_resilient_with_selection, PluginLoadFailure},
-    CompositePluginHost, PluginHost, PluginServiceCall,
+    wasm::{load_wasm_plugins_resilient_with_selection_and_services, PluginLoadFailure},
+    CompositePluginHost, PluginHost, PluginHostServices, PluginServiceCall,
+};
+#[cfg(feature = "plugins")]
+use agent_runtime::{
+    AgentDeriveConfig, AgentPermissions, AgentProfileId, AgentRuntime, AgentTemplate, RuntimeLimits,
 };
 use agent_session::{
     FileSessionStore, MemorySessionStore, SessionId, SessionRecord, SessionStore,
@@ -3908,9 +3912,30 @@ fn plugin_manifest_ids(manifests: &[PathBuf]) -> Vec<String> {
 async fn load_plugins_for_tui(
     manifests: Vec<PathBuf>,
     capability_selection: HashMap<String, String>,
+    agent_template: AgentTemplate,
 ) -> Result<LoadedPlugins> {
-    let report =
-        load_wasm_plugins_resilient_with_selection(&manifests, &capability_selection).await?;
+    let runtime = AgentRuntime::new(RuntimeLimits::default()).context("创建 TUI Agent Runtime 失败")?;
+    let controller_profile =
+        AgentProfileId::new("tui-controller").context("创建 TUI controller profile 失败")?;
+    runtime
+        .register_profile(
+            controller_profile.clone(),
+            agent_template,
+            AgentPermissions::default(),
+        )
+        .await
+        .context("注册 TUI controller profile 失败")?;
+    let host_services = PluginHostServices::new().with_agent_runtime(
+        Arc::new(runtime),
+        controller_profile,
+        HashMap::from([("worker".to_string(), AgentDeriveConfig::default())]),
+    )?;
+    let report = load_wasm_plugins_resilient_with_selection_and_services(
+        &manifests,
+        &capability_selection,
+        host_services,
+    )
+    .await?;
     let host = Arc::new(report.host);
     let failures = report.failures;
     let prepared = async {
@@ -4077,6 +4102,8 @@ async fn main() -> Result<()> {
         .with_tools(native_tools)
         .with_event_sink(Arc::new(sink));
     #[cfg(feature = "plugins")]
+    let plugin_agent_template = AgentTemplate::from_agent(&base_agent);
+    #[cfg(feature = "plugins")]
     let mut pending_agent = Some(base_agent);
     #[cfg(feature = "plugins")]
     let mut agent: Option<Arc<Agent>> = None;
@@ -4133,7 +4160,12 @@ async fn main() -> Result<()> {
         app = app.with_loading_plugins(loading_plugin_ids);
         let load_tx = tx.clone();
         tokio::spawn(async move {
-            let result = load_plugins_for_tui(plugin_manifests, capability_selection).await;
+            let result = load_plugins_for_tui(
+                plugin_manifests,
+                capability_selection,
+                plugin_agent_template,
+            )
+            .await;
             let _ = load_tx.send(UiEvent::PluginsLoaded(Box::new(result)));
         })
     };

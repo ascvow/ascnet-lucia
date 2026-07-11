@@ -54,6 +54,12 @@ bun run test:plugin:command
 
 Manifest：`examples/plugins/command-plugin/plugin.toml`。公开协议与开发 SDK 分别位于 `crates/command-protocol` 和 `crates/command-sdk`。
 
+## Teammate 插件
+
+Teammate 插件负责成员角色、稳定成员地址、有界邮箱、确认、dispatch 重试与消息注入规则，并通过 `teammate.mailbox@1.0.0` 向其他插件提供 owner 隔离的版本化服务。插件同时声明右侧团队摘要和全屏团队工作台，TUI 只负责通用视图渲染、焦点和导航。
+
+Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置。
+
 ## 统一验证
 
 ```bash
