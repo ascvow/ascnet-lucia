@@ -3,8 +3,8 @@
 //! 插件拥有工作流定义、依赖调度和失败传播；Host 只提供受限 Agent 派生、观察与取消。
 
 use agent_plugin::{
-    export_plugin, AgentId, AgentOutcome, AgentPlugin, AgentSpawnRequest, PluginHostApi, Result,
-    ToolCall, ToolResult, ToolSpec,
+    export_plugin, ActivationContext, AgentId, AgentOutcome, AgentPlugin, AgentSpawnRequest,
+    PluginHostApi, PromptContribution, Result, ToolCall, ToolResult, ToolSpec,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,10 @@ const WORKER_PROFILE: &str = "worker";
 const MAX_PARALLELISM: usize = 32;
 /// 节点提示词的最大字节数，避免状态和跨 ABI 请求无限增长。
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
+/// 引导主 Agent 合理创建 DAG 工作流的 developer 提示 ID。
+const WORKFLOW_ORCHESTRATION_PROMPT_ID: &str = "workflow-orchestration";
+/// 引导主 Agent 选择工作流工具的编排规则。
+const WORKFLOW_ORCHESTRATION_PROMPT: &str = "当任务包含明确依赖关系、可并行的多个阶段，或需要可追踪的失败传播时，优先使用 workflow_create 建立 DAG 工作流。先定义节点与依赖，再在节点齐备后使用 workflow_seal，并通过 workflow_tick 推进和观察执行。简单的一次性任务、无法明确依赖关系的探索任务不要创建工作流。";
 
 /// 保存当前组件实例内所有动态工作流。
 #[derive(Default)]
@@ -126,6 +130,21 @@ struct AddNodeArgs {
 }
 
 impl AgentPlugin for WorkflowPlugin {
+    /// 注册工作流编排提示，使主 Agent 能在适合的任务中主动选择 DAG 工具。
+    fn activate(&mut self, host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
+        host.upsert_prompt(&PromptContribution {
+            id: WORKFLOW_ORCHESTRATION_PROMPT_ID.into(),
+            content: WORKFLOW_ORCHESTRATION_PROMPT.into(),
+            priority: 110,
+        })?;
+        Ok(())
+    }
+
+    /// 删除本插件注册的工作流编排提示，避免插件卸载后继续影响模型决策。
+    fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
+        host.remove_prompt(WORKFLOW_ORCHESTRATION_PROMPT_ID)
+    }
+
     /// 返回动态工作流控制面工具。
     fn list_tools(&self) -> Vec<ToolSpec> {
         vec![

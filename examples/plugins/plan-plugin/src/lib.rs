@@ -1,9 +1,9 @@
 //! 为 Agent 提供结构化计划管理和声明式 TUI 状态面板。
 
 use agent_plugin::{
-    export_plugin, ActivationContext, AgentPlugin, PluginHostApi, Result, ToolCall, ToolResult,
-    ToolSpec, UiColor, UiDeclaration, UiFrame, UiLine, UiPlacement, UiRenderRequest, UiSize,
-    UiSpan, UiStyle,
+    export_plugin, ActivationContext, AgentPlugin, PluginHostApi, PromptContribution, Result,
+    ToolCall, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiLine, UiPlacement,
+    UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,10 @@ const GET_PLAN_TOOL: &str = "get_plan";
 const PLAN_STATE_KEY: &str = "current_plan";
 const PLAN_VIEW: &str = "plan-status";
 const PLAN_SCHEMA_VERSION: u32 = 1;
+/// 引导主 Agent 使用结构化计划的 developer 提示 ID。
+const PLAN_MANAGEMENT_PROMPT_ID: &str = "plan-management";
+/// 引导主 Agent 在复杂任务中维护结构化计划的规则。
+const PLAN_MANAGEMENT_PROMPT: &str = "面对多步骤、持续时间较长，或需要向用户清晰呈现进度的任务时，先使用 update_plan 建立简短、可验证的计划。执行过程中及时将已完成步骤标记为 completed，并保持至多一个 in_progress 步骤。简单的一步问答或无需追踪的任务不要创建计划。";
 
 /// 单个计划步骤的执行状态。
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -147,7 +151,7 @@ struct PlanPlugin {
 }
 
 impl AgentPlugin for PlanPlugin {
-    /// 恢复 Host 中同一插件实例的状态，并拒绝不兼容或损坏的数据。
+    /// 恢复 Host 中同一插件实例的状态、注册计划提示，并拒绝不兼容或损坏的数据。
     fn activate(&mut self, host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
         if let Some(value) = host.get_state(PLAN_STATE_KEY)? {
             let state: PlanState = serde_json::from_value(value).context("解析计划状态失败")?;
@@ -156,7 +160,17 @@ impl AgentPlugin for PlanPlugin {
         } else {
             host.set_state(PLAN_STATE_KEY, &serde_json::to_value(&self.state)?)?;
         }
+        host.upsert_prompt(&PromptContribution {
+            id: PLAN_MANAGEMENT_PROMPT_ID.into(),
+            content: PLAN_MANAGEMENT_PROMPT.into(),
+            priority: 110,
+        })?;
         Ok(())
+    }
+
+    /// 删除本插件注册的计划提示，保留持久化计划状态供下次激活恢复。
+    fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
+        host.remove_prompt(PLAN_MANAGEMENT_PROMPT_ID)
     }
 
     /// 返回更新和读取当前计划的模型工具。

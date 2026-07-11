@@ -92,6 +92,13 @@ async fn component_runs_mailbox_dispatch_flow() {
         .await
         .expect("Teammate component 应加载成功");
 
+    let prompts = AgentExtension::prompt_messages(&host)
+        .await
+        .expect("Teammate 协作提示应可读取");
+    assert!(prompts
+        .iter()
+        .any(|prompt| prompt.text_content().contains("teammate_spawn")));
+
     let tools = AgentExtension::list_tools(&host)
         .await
         .expect("插件工具应可读取");

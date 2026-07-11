@@ -5,10 +5,10 @@
 
 use agent_plugin::{
     export_plugin, ActivationContext, AgentHandle, AgentId, AgentOutcome, AgentPlugin,
-    AgentSpawnRequest, AgentStatus, ExtensionEvent, PluginHostApi, Result, ServiceCall,
-    ServiceSpec, ToolCall, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput,
-    UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest,
-    UiSize, UiSpan, UiStyle, UiViewInstance,
+    AgentSpawnRequest, AgentStatus, ExtensionEvent, PluginHostApi, PromptContribution, Result,
+    ServiceCall, ServiceSpec, ToolCall, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame,
+    UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement,
+    UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,10 @@ const WORKER_PROFILE: &str = "worker";
 const TEAMMATE_SERVICE: &str = "teammate.mailbox";
 /// 当前邮箱服务协议版本。
 const TEAMMATE_SERVICE_VERSION: &str = "1.0.0";
+/// 引导主 Agent 合理拆分协作任务的 developer 提示 ID。
+const TEAMMATE_ORCHESTRATION_PROMPT_ID: &str = "teammate-orchestration";
+/// 引导主 Agent 选择 teammate 工具的协作规则。
+const TEAMMATE_ORCHESTRATION_PROMPT: &str = "当任务可拆分为两个或更多相互独立的子任务、需要并行调研，或需要独立审查时，优先使用 teammate_spawn 创建角色明确的 teammate。向成员提供完整且可执行的任务输入；完成后使用 teammate_result 获取结果并整合。简单、顺序依赖强或拆分成本高的任务不要创建 teammate。";
 /// 单个 owner 可创建的最大成员数。
 const MAX_MEMBERS_PER_OWNER: usize = 16;
 /// 单个成员邮箱可保留的最大未确认消息数。
@@ -857,18 +861,25 @@ impl TeammatePlugin {
 }
 
 impl AgentPlugin for TeammatePlugin {
-    /// 保存可信插件 ID 并注册版本化 mailbox service。
+    /// 保存可信插件 ID、注册协作提示并提供版本化 mailbox service。
     fn activate(&mut self, host: &dyn PluginHostApi, context: ActivationContext) -> Result<()> {
         self.plugin_id = Some(context.plugin_id);
         host.upsert_service(&ServiceSpec {
             name: TEAMMATE_SERVICE.into(),
             version: TEAMMATE_SERVICE_VERSION.into(),
             description: Some("管理隔离的 teammate 成员、短期邮箱、确认和续跑注入".into()),
-        })
+        })?;
+        host.upsert_prompt(&PromptContribution {
+            id: TEAMMATE_ORCHESTRATION_PROMPT_ID.into(),
+            content: TEAMMATE_ORCHESTRATION_PROMPT.into(),
+            priority: 110,
+        })?;
+        Ok(())
     }
 
-    /// 注销 service 并清空仅对当前激活实例有效的短期状态。
+    /// 注销协作提示和 service，并清空仅对当前激活实例有效的短期状态。
     fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
+        host.remove_prompt(TEAMMATE_ORCHESTRATION_PROMPT_ID)?;
         host.remove_service(TEAMMATE_SERVICE)?;
         self.plugin_id = None;
         self.state = TeamState::default();

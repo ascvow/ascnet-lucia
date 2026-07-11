@@ -134,6 +134,13 @@ async fn component_runs_dynamic_workflow() {
         .await
         .expect("动态工作流 component 应加载成功");
 
+    let prompts = AgentExtension::prompt_messages(&host)
+        .await
+        .expect("工作流编排提示应可读取");
+    assert!(prompts
+        .iter()
+        .any(|prompt| prompt.text_content().contains("workflow_create")));
+
     let tools = AgentExtension::list_tools(&host)
         .await
         .expect("插件工具应可读取");

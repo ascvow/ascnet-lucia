@@ -2,6 +2,8 @@
 
 该插件在 WASM Guest 内维护可动态扩展的 DAG，并通过 `PluginHostApi` 使用 Host 授权的 `worker` profile 派生 Agent。工作流协议、依赖调度和失败传播都归插件所有；模型、服务商、工具权限与全局资源上限仍由 Host 控制。
 
+插件激活时会注入独立的 developer 提示：仅在任务具有明确依赖、并行阶段或失败传播需求时创建并推进工作流，无需安装 Skill 插件。
+
 ## 生命周期
 
 1. 使用 `workflow_create` 创建开放工作流，可同时提供初始节点。
