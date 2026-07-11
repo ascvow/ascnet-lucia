@@ -41,7 +41,7 @@ bun run perf:plugin:wasm
 
 - `wasm_component_load`：component 编译、实例化和激活耗时。
 - `core_context_passthrough`：Core 直通 ContextLoader 基线。
-- `wasm_context_replacement`：经过 Host、WIT 和 guest 的上下文替换耗时。
+- `wasm_context_compression`：经过 Host、WIT 和 guest 的上下文压缩耗时。
 
 每组调用结果使用纳秒输出，包含 `total_ns`、`p50_ns`、`p95_ns` 和 `max_ns`。`LUCIA_PERF_ITERATIONS` 可调整正式样本数，默认值是 200，且至少执行 10 次。
 
@@ -51,7 +51,7 @@ bun run perf:plugin:wasm
 bun run perf:plugin:gate
 ```
 
-门禁同时检查两项预算：`wasm_context_replacement` 的 p95 默认不超过 500 微秒，`wasm_component_load` 的冷启动默认不超过 250 毫秒。输出仍使用纳秒，环境变量分别使用微秒和毫秒，避免门禁配置出现过长数值。
+门禁同时检查两项预算：`wasm_context_compression` 的 p95 默认不超过 500 微秒，`wasm_component_load` 的冷启动默认不超过 250 毫秒。输出仍使用纳秒，环境变量分别使用微秒和毫秒，避免门禁配置出现过长数值。
 
 可以按稳定测试机的历史基线收紧两项预算：
 

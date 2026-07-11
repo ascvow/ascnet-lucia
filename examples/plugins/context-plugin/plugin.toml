@@ -1,0 +1,15 @@
+[plugin]
+id = "context"
+name = "上下文压缩插件"
+version = "0.1.0"
+api_version = "0.6.0"
+wasm = "target/wasm32-wasip2/release/context_plugin.wasm"
+description = "按 token 水位清理旧工具结果，并用结构化摘要替换较旧 API 轮次。"
+
+[[provides]]
+id = "agent.context-loader"
+version = "1.0.0"
+mode = "exclusive"
+
+[capabilities]
+# 插件只进行内存计算和事件发布，不申请外部资源权限。

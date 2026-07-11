@@ -24,6 +24,10 @@ const cargoPathLine = 'export PATH="$HOME/.cargo/bin:$PATH"'
 /** Official bundles included in the default Lucia installation. Lucia 默认安装包含的官方 bundle。 */
 const bundles: OfficialPluginBundle[] = [
   {
+    id: 'context',
+    files: ['plugin.toml', 'target/wasm32-wasip2/release/context_plugin.wasm'],
+  },
+  {
     id: 'mcp',
     files: [
       'plugin.toml',

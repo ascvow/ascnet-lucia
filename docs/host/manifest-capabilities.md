@@ -51,7 +51,7 @@ mode = "exclusive"
 
 ```toml
 [capability_selection]
-"agent.context-loader" = "context-replacement"
+"agent.context-loader" = "context"
 ```
 
 未选择、选择未声明该能力的插件、为 `multi` 能力指定唯一 owner 都会阻止启动。Host 不使用加载顺序静默覆盖插件。

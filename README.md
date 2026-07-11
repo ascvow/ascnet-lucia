@@ -182,7 +182,7 @@ ABI 故意使用 JSON 字符串。这样 WIT 边界保持稳定，同时 Rust �
 
 受限 Agent 派生与续跑示例见 [`examples/plugins/agent-runtime-plugin`](examples/plugins/agent-runtime-plugin/README.md)。Host 只提供 profile 授权、生命周期、状态、结果和取消；sub-agent、workflow、multi-agent 与 teammate 的角色、邮箱和消息协议由插件定义。
 
-上下文完整替换链路见 [`examples/plugins/context-replacement-plugin`](examples/plugins/context-replacement-plugin/README.md)。该测试插件声明独占的 `agent.context-loader` 能力，模型只会收到插件返回的摘要；真实压缩策略仍由插件作者实现。
+官方 Context 插件位于 [`examples/plugins/context-plugin`](examples/plugins/context-plugin/README.md)。它声明独占的 `agent.context-loader` 能力，按上下文水位清理旧工具结果或将较旧 API 轮次替换为结构化摘要，同时原样保留近期工作上下文。
 
 插件可以在 manifest 中使用 SemVer 声明必选或可选依赖。Host 在加载前解析依赖图，并提供版本化 JSON 服务的注册、发现与调用 API；command、Skill 等插件协议仍由插件自行定义。
 

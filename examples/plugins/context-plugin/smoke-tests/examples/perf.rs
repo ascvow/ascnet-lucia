@@ -1,11 +1,11 @@
-//! 上下文替换插件的真实 WASM 性能探针。
+//! 官方上下文管理插件的真实 WASM 性能探针。
 
-use anyhow::{anyhow, Result};
 use agent_core::{
     AgentExtension, ContextLoadRequest, ContextLoader, MessageRole, ModelMessage,
     PassthroughContextLoader,
 };
 use agent_plugin_host::wasm::load_wasm_plugins;
+use anyhow::{anyhow, Result};
 use std::{path::Path, time::Instant};
 
 /// 单组延迟样本的汇总。
@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
         plugin_samples.push(started.elapsed().as_nanos());
     }
     let plugin = LatencySummary::from_samples(plugin_samples);
-    plugin.print_json("wasm_context_replacement");
+    plugin.print_json("wasm_context_compression");
 
     if std::env::var("LUCIA_PERF_ENFORCE").as_deref() == Ok("1") {
         let context_budget_us = std::env::var("LUCIA_PLUGIN_CONTEXT_P95_US")

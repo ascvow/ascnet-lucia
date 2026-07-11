@@ -1,10 +1,10 @@
 [package]
-name = "context-replacement-plugin"
+name = "context-plugin"
 version = "0.1.0"
 edition = "2021"
 authors = ["ascvow"]
 license = "MIT"
-description = "验证 Lucia 上下文完整替换能力的 WASM 插件。"
+description = "管理并压缩 Lucia Agent 上下文的官方 WASM 插件。"
 
 [lib]
 crate-type = ["cdylib"]

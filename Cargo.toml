@@ -12,11 +12,11 @@ members = [
 ]
 resolver = "2"
 
-# The sample WASM plugin is intentionally excluded from the native workspace.
-# 示例 WASM 插件故意不加入原生 workspace，避免 `cargo check` 在宿主 target 上构建 component exports。
+# Independent WASM plugins are intentionally excluded from the native workspace.
+# 独立 WASM 插件不加入原生 workspace，避免 `cargo check` 在宿主 target 上构建 component exports。
 exclude = [
     "examples/plugins/echo-plugin",
-    "examples/plugins/context-replacement-plugin",
+    "examples/plugins/context-plugin",
     "examples/plugins/mcp-plugin",
     "examples/plugins/skill-plugin",
     "examples/plugins/ui-showcase-plugin",

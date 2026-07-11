@@ -1,10 +1,10 @@
 [package]
-name = "context-replacement-plugin-smoke-tests"
+name = "context-plugin-smoke-tests"
 version = "0.1.0"
 edition = "2021"
 authors = ["ascvow"]
 license = "MIT"
-description = "上下文替换插件的独立端到端测试。"
+description = "官方上下文管理插件的独立端到端测试。"
 
 [workspace]
 

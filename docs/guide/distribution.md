@@ -72,7 +72,7 @@ bun run install:tui
 bun run install:tui:core
 ```
 
-默认安装会把官方 MCP 与 Skill bundle 同步到 `$LUCIA_HOME/official-plugins`，不会删除其中的用户配置或 Skill 文件。安装后直接运行 `lucia`，无需额外插件参数。两个版本的命令名均为 `lucia`，因此同一 Cargo bin 目录内后安装的版本会覆盖前一个。分发两个压缩包时应使用独立 `--target-dir` 构建，并在归档名称中区分 `lucia-core` 与 `lucia-plugins`。
+默认安装会把官方 Context、MCP 与 Skill bundle 同步到 `$LUCIA_HOME/official-plugins`，不会删除其中的用户配置或 Skill 文件。安装后直接运行 `lucia`，无需额外插件参数。两个版本的命令名均为 `lucia`，因此同一 Cargo bin 目录内后安装的版本会覆盖前一个。分发两个压缩包时应使用独立 `--target-dir` 构建，并在归档名称中区分 `lucia-core` 与 `lucia-plugins`。
 
 ## 验证边界
 

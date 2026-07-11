@@ -10,6 +10,17 @@ bun run install:tui
 
 官方插件安装在 `$LUCIA_HOME/official-plugins`，启动 `lucia` 时自动加载，无需传入 `--plugin-manifest`。显式配置同 ID 插件时，显式版本优先。
 
+## Context
+
+`context` 提供官方上下文管理与压缩能力。它在约 120k token 时清理旧工具结果，在约 167k token 时把较旧 API 轮次替换为结构化摘要，并保留近期完整轮次；`[1m]` 模型使用对应的百万上下文水位。
+
+```bash
+bun run build:plugin:context
+bun run test:plugin:context
+```
+
+Manifest：`examples/plugins/context-plugin/plugin.toml`。
+
 ## MCP
 
 `mcp` 扫描 JSON 配置、启动 stdio MCP Server、完成初始化与工具发现，并把 Server 工具动态注册给 Agent。它不包含 MasterGo、Figma 等服务的业务逻辑。
@@ -39,4 +50,4 @@ bun run build:plugin:official
 bun run test:plugin:official
 ```
 
-MCP 和 Skill 都是独立 `cdylib` crate，不加入原生 Workspace。它们的扫描、解析、协议和业务规则不会进入 Agent Core 或 Plugin Host。
+Context、MCP 和 Skill 都是独立 `cdylib` crate，不加入原生 Workspace。它们的扫描、解析、协议和业务规则不会进入 Agent Core 或 Plugin Host。
