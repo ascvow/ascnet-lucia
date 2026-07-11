@@ -27,7 +27,7 @@ pub use event::{
     AgentEvent, AgentEventKind, BillingUsage, CompositeEventSink, EventSink, InMemoryEventSink,
     JsonlEventSink, NoopEventSink,
 };
-pub use extension::{AgentExtension, NoopAgentExtension, ToolDecision};
+pub use extension::{AgentExtension, CompositeAgentExtension, NoopAgentExtension, ToolDecision};
 pub use model::{
     ChatModel, ContentBlock, FinishReason, MessageRole, ModelGateway, ModelMessage,
     ModelProviderConfig, ModelRequest, ModelResponse, OpenAiProtocol, ProviderAdapter,

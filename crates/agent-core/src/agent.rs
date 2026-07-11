@@ -200,6 +200,12 @@ pub struct AgentRun {
     /// Final provider-neutral session.
     /// 最终的服务商无关会话。
     pub session: Session,
+
+    /// 本次运行是否因取消请求而提前收尾。
+    ///
+    /// 取消是优雅收尾：已完成的轮次和部分流式文本保留在 `session` 中，
+    /// 未执行的工具以 Skipped 结果补全，不会留下孤立 tool call。
+    pub cancelled: bool,
 }
 
 /// 可独立持有的 Agent 运行控制句柄。
@@ -207,6 +213,7 @@ pub struct AgentRun {
 pub struct AgentControl {
     steering: Arc<std::sync::Mutex<Vec<String>>>,
     follow_ups: Arc<std::sync::Mutex<Vec<String>>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgentControl {
@@ -254,6 +261,21 @@ impl AgentControl {
             .expect("follow_ups lock poisoned")
             .clear();
     }
+
+    /// 请求取消当前运行。
+    ///
+    /// Agent 在下一个检查点（模型流事件之间、工具执行之间或下一步开始前）
+    /// 优雅收尾并返回 `cancelled = true` 的 [`AgentRun`]。取消只作用于当前
+    /// 运行：新一次运行开始时会清除未消费的取消请求。
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 返回是否存在尚未被运行循环消费的取消请求。
+    pub fn cancel_requested(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Minimal ReAct agent.
@@ -271,6 +293,9 @@ pub struct Agent {
     /// follow-up 消息队列：当前任务完成后注入，继续循环。
     follow_ups: Arc<std::sync::Mutex<Vec<String>>>,
 
+    /// 取消标志：运行循环在检查点消费后优雅收尾。
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+
     /// 每次模型请求使用的上下文加载器。
     context_loader: Arc<dyn ContextLoader>,
 }
@@ -286,6 +311,7 @@ impl Agent {
             options,
             steering: Arc::new(std::sync::Mutex::new(Vec::new())),
             follow_ups: Arc::new(std::sync::Mutex::new(Vec::new())),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             context_loader: Arc::new(PassthroughContextLoader),
         }
     }
@@ -541,6 +567,7 @@ impl Agent {
         AgentControl {
             steering: self.steering.clone(),
             follow_ups: self.follow_ups.clone(),
+            cancelled: self.cancelled.clone(),
         }
     }
 
@@ -559,6 +586,17 @@ impl Agent {
     /// 而不是结束 run。
     pub fn follow_up(&self, text: impl Into<String>) {
         self.control().follow_up(text);
+    }
+
+    /// 请求取消当前运行；语义见 [`AgentControl::cancel`]。
+    pub fn cancel(&self) {
+        self.control().cancel();
+    }
+
+    /// 消费一次取消请求；运行循环在检查点调用。
+    fn take_cancelled(&self) -> bool {
+        self.cancelled
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 取出下一条 steering 消息。
@@ -628,9 +666,15 @@ impl Agent {
     }
 
     /// 直接运行调用方构造的会话，不自动追加用户消息或替换 system 提示。
+    ///
+    /// 收到取消请求（[`AgentControl::cancel`]）时在最近的检查点优雅收尾，
+    /// 返回 `cancelled = true` 的 [`AgentRun`]，会话保留已完成的内容。
     pub async fn run_session(&self, mut session: Session) -> Result<AgentRun> {
         let run_id = uuid::Uuid::new_v4().to_string();
         let mut total_usage = TokenUsage::default();
+        // 取消只作用于当前运行：清除上一次运行结束后残留的取消请求。
+        self.cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
 
         self.emit(
             &run_id,
@@ -644,6 +688,12 @@ impl Agent {
         .await?;
 
         for step in 0..self.options.max_steps {
+            // 检查点：follow-up 续跑或上一轮收尾期间到达的取消请求。
+            if self.take_cancelled() {
+                return self
+                    .finish_cancelled(&run_id, step, step, total_usage, session)
+                    .await;
+            }
             self.emit(&run_id, AgentEventKind::TurnStarted, step, json!({}))
                 .await?;
 
@@ -689,9 +739,24 @@ impl Agent {
             .await?;
 
             let mut model_stream = self.gateway.stream(&self.options.provider, req).await?;
+            // 累积文本增量：取消发生在流中途时，把已生成的部分文本保留进会话。
+            let mut streamed_text = String::new();
             while let Some(event) = model_stream.next().await {
+                // 检查点：流事件之间响应取消；丢弃流即中止本次模型请求。
+                if self.take_cancelled() {
+                    drop(model_stream);
+                    if !streamed_text.is_empty() {
+                        session.push_assistant_blocks(vec![crate::model::ContentBlock::Text {
+                            text: streamed_text,
+                        }]);
+                    }
+                    return self
+                        .finish_cancelled(&run_id, step, step + 1, total_usage, session)
+                        .await;
+                }
                 match event {
                     ModelStreamEvent::TextDelta { index, delta } => {
+                        streamed_text.push_str(&delta);
                         self.emit(
                             &run_id,
                             AgentEventKind::ModelTextDelta,
@@ -789,13 +854,35 @@ impl Agent {
                     steps_used: step + 1,
                     usage: total_usage,
                     session,
+                    cancelled: false,
                 });
             }
 
-            // 逐个执行工具；每个工具完成后检查 steering 队列。
+            // 逐个执行工具；每个工具执行前检查取消，完成后检查 steering 队列。
             let mut results = Vec::new();
             let mut steering_message = None;
+            let mut run_cancelled = false;
             for (index, call) in tool_calls.iter().enumerate() {
+                // 检查点：取消优先于 steering，跳过所有尚未执行的工具。
+                if self.take_cancelled() {
+                    for skipped in &tool_calls[index..] {
+                        self.emit(
+                            &run_id,
+                            AgentEventKind::ToolSkipped,
+                            step,
+                            json!({ "id": &skipped.id, "name": &skipped.name }),
+                        )
+                        .await?;
+                        results.push(ToolResult::error(
+                            skipped.id.clone(),
+                            skipped.name.clone(),
+                            "Skipped due to cancelled run",
+                        ));
+                    }
+                    run_cancelled = true;
+                    break;
+                }
+
                 let result = self
                     .execute_tool_with_hooks(&run_id, call.clone(), step)
                     .await?;
@@ -823,6 +910,12 @@ impl Agent {
             }
             session.push_tool_results(results);
 
+            if run_cancelled {
+                return self
+                    .finish_cancelled(&run_id, step, step + 1, total_usage, session)
+                    .await;
+            }
+
             if let Some(message) = steering_message {
                 self.emit(
                     &run_id,
@@ -849,6 +942,33 @@ impl Agent {
             "max ReAct steps reached: {}",
             self.options.max_steps
         ))
+    }
+
+    /// 以取消终态收尾当前运行：发出带 `cancelled: true` 的 RunFinished 事件，
+    /// 并返回保留已完成内容的 [`AgentRun`]。
+    async fn finish_cancelled(
+        &self,
+        run_id: &str,
+        step: usize,
+        steps_used: usize,
+        total_usage: TokenUsage,
+        session: Session,
+    ) -> Result<AgentRun> {
+        self.emit(
+            run_id,
+            AgentEventKind::RunFinished,
+            step,
+            json!({ "steps_used": steps_used, "usage": &total_usage, "cancelled": true }),
+        )
+        .await?;
+        Ok(AgentRun {
+            run_id: run_id.to_string(),
+            final_text: session.last_assistant_text(),
+            steps_used,
+            usage: total_usage,
+            session,
+            cancelled: true,
+        })
     }
 
     async fn execute_tool_with_hooks(
@@ -1327,5 +1447,115 @@ mod tests {
             .expect("call_2 应有结果");
         assert!(skipped.is_error);
         assert!(skipped.content_text().contains("Skipped"));
+    }
+
+    /// 运行开始时清除残留取消请求：取消只作用于当前运行。
+    #[tokio::test]
+    async fn stale_cancel_request_is_cleared_at_run_start() {
+        let agent = agent_with_script(vec![ModelResponse::text("正常完成")]);
+        let control = agent.control();
+        control.cancel();
+        assert!(control.cancel_requested());
+
+        let run = agent.run("你好").await.expect("run 应该成功");
+
+        assert!(!run.cancelled);
+        assert_eq!(run.final_text, "正常完成");
+        assert!(!control.cancel_requested());
+    }
+
+    /// 工具执行期间取消：剩余工具补 Skipped 结果，运行以取消终态返回。
+    #[tokio::test]
+    async fn cancel_during_tools_skips_remaining_and_finishes() {
+        let calls = vec![
+            ToolCall::new("call_1", "cancel_self", json!({})),
+            ToolCall::new("call_2", "cancel_self", json!({})),
+        ];
+        let mut agent = agent_with_script(vec![ModelResponse::tool_calls(calls)]);
+        let control = agent.control();
+        let cancel_tool = JsonTool::new(
+            ToolSpec::new(
+                "cancel_self",
+                "执行时请求取消",
+                ToolSpec::empty_object_schema(),
+            ),
+            move |args| {
+                let control = control.clone();
+                async move {
+                    control.cancel();
+                    Ok(args)
+                }
+            },
+        );
+        agent
+            .tools_mut()
+            .register(cancel_tool)
+            .expect("注册取消工具应成功");
+
+        let run = agent.run("执行两个工具").await.expect("取消应优雅返回");
+
+        assert!(run.cancelled);
+        // 第二个工具未执行，结果为取消跳过的错误，避免孤立 tool call。
+        let skipped = run
+            .session
+            .messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|block| match block {
+                crate::model::ContentBlock::ToolResult { result } => Some(result),
+                _ => None,
+            })
+            .find(|result| result.call_id == "call_2")
+            .expect("call_2 应有结果");
+        assert!(skipped.is_error);
+        assert!(skipped.content_text().contains("cancelled"));
+    }
+
+    /// 在首个文本增量上请求取消的事件 sink。
+    struct CancelOnDelta {
+        control: AgentControl,
+    }
+
+    #[async_trait]
+    impl EventSink for CancelOnDelta {
+        async fn record(&self, event: &AgentEvent) -> Result<()> {
+            if event.kind == AgentEventKind::ModelTextDelta {
+                self.control.cancel();
+            }
+            Ok(())
+        }
+    }
+
+    /// 流中途取消：已生成的部分文本保留进会话，RunFinished 标记 cancelled。
+    #[tokio::test]
+    async fn cancel_mid_stream_keeps_partial_text() {
+        let mut gateway = ModelGateway::new();
+        gateway
+            .register("stream", Arc::new(StreamingModel))
+            .expect("注册流式模型");
+        let agent = Agent::new(
+            gateway,
+            AgentOptions::default().with_model_route("stream", "stream-model"),
+        );
+        let memory = Arc::new(InMemoryEventSink::new());
+        let mut sink = crate::event::CompositeEventSink::new();
+        sink.push(memory.clone());
+        sink.push(Arc::new(CancelOnDelta {
+            control: agent.control(),
+        }));
+        let agent = agent.with_event_sink(Arc::new(sink));
+
+        let run = agent.run("你好").await.expect("取消应优雅返回");
+
+        // 首个增量“你”之后取消，第二个增量“好”不再处理。
+        assert!(run.cancelled);
+        assert_eq!(run.final_text, "你");
+        assert_eq!(run.session.last_assistant_text(), "你");
+        let events = memory.events().await;
+        let finished = events
+            .iter()
+            .find(|event| event.kind == AgentEventKind::RunFinished)
+            .expect("应有 RunFinished 事件");
+        assert_eq!(finished.payload["cancelled"], true);
     }
 }
