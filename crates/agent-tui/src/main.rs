@@ -2975,14 +2975,14 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let sections = Layout::vertical([
         Constraint::Min(4),
         Constraint::Length(command_preview_height),
-        Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Length(1),
     ])
     .split(workspace);
     #[cfg(not(feature = "plugins"))]
     let sections = Layout::vertical([
         Constraint::Min(4),
-        Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Length(1),
     ])
     .split(workspace);
@@ -3039,7 +3039,7 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         render_command_preview(frame, app, command_section, &command_matches);
     }
 
-    // 输入区仅保留顶部规则线，形成稳定的底部命令栏。
+    // 输入区在顶部规则线后保留一行空白，使边线与编辑文本保持稳定间距。
     let input_area = input_section;
     #[cfg(feature = "plugins")]
     let agent_waiting = app.plugins_loading;
@@ -3063,7 +3063,7 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         } else {
             COLOR_MUTED
         }))
-        .padding(Padding::horizontal(1));
+        .padding(Padding::new(1, 1, 1, 0));
     let input_inner = input_block.inner(input_area);
 
     if app.input.is_empty() {
@@ -4804,6 +4804,34 @@ mod tests {
         assert!(text.contains("MessageLucia..."), "{text:?}");
         assert!(!text.contains("agentruntime"), "{text:?}");
         assert!(!text.contains("ReAct"), "{text:?}");
+    }
+
+    /// 输入框顶部规则线与提示文本之间必须保留一行空白。
+    #[test]
+    fn input_rule_has_spacing_before_editor_text() {
+        let width = 80;
+        let backend = TestBackend::new(width, 16);
+        let mut terminal = Terminal::new(backend).expect("创建输入间距测试终端");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+
+        terminal
+            .draw(|frame| render_root(frame, &mut app))
+            .expect("渲染输入间距测试界面");
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let rule_row = rows
+            .iter()
+            .position(|row| row.chars().filter(|character| *character == '─').count() > 20)
+            .expect("输入框顶部规则线应存在");
+
+        assert!(rows[rule_row + 1].trim().is_empty());
+        assert!(rows[rule_row + 2].contains("Message Lucia..."));
     }
 
     /// Startup activation events render in the footer once, then collapse into a plugin count.
