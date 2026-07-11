@@ -62,23 +62,23 @@ impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "shell",
-            "执行 shell 命令，返回 stdout、stderr 和退出码。",
+            "Run a shell command through sh -c and return stdout, stderr, and the exit code. Use this for builds, tests, version-control operations, or tasks without a dedicated tool. Prefer the dedicated tools for reading, writing, listing, and searching files. Each output stream is limited to 100 KiB.",
             json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "要执行的 shell 命令"
+                        "description": "Complete command passed to sh -c; the command may cause system side effects"
                     },
                     "timeout_ms": {
                         "type": "integer",
-                        "description": "超时时间（毫秒），默认 30000，最大 600000",
+                        "description": "Command timeout in milliseconds; default 30000, maximum 600000",
                         "minimum": 1,
                         "maximum": 600000
                     },
                     "working_directory": {
                         "type": "string",
-                        "description": "工作目录，默认为当前目录"
+                        "description": "Working directory for the command; defaults to the current process directory"
                     }
                 },
                 "required": ["command"],

@@ -203,25 +203,25 @@ impl Tool for SearchFilesTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "search_files",
-            "在目录中递归搜索包含指定文本的文件，返回匹配行及其位置。",
+            "Recursively search a directory tree for a case-sensitive literal substring and return the matching file, 1-based line number, and line content. Use this to locate files by known text or identifiers. Regular expressions are not supported. Common dependency and build directories, binary or non-UTF-8 files, and files larger than 1 MiB are skipped.",
             json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "要搜索的文本（大小写敏感的子串匹配）"
+                        "description": "Case-sensitive literal text to find; matched as a substring, not a regular expression"
                     },
                     "path": {
                         "type": "string",
-                        "description": "搜索起始目录，默认当前目录"
+                        "description": "Root directory for the recursive search; defaults to the current directory"
                     },
                     "include": {
                         "type": "string",
-                        "description": "文件名过滤（如 *.rs），不指定则搜索所有文件"
+                        "description": "Optional file-name filter; supports only an exact name or a *suffix pattern such as *.rs"
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "最大返回结果数，默认 50",
+                        "description": "Maximum number of matching lines to return; default 50, with truncated=true at the limit",
                         "minimum": 1,
                         "maximum": 500
                     }

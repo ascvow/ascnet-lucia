@@ -23,17 +23,17 @@ impl Tool for WriteFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "write_file",
-            "将内容写入文件。如果文件已存在则覆盖，不存在则自动创建（含父目录）。",
+            "Create or overwrite a file with complete content, creating parent directories when needed. Use this only for a new file or when full replacement is intended. It does not support partial edits or appends, and overwriting discards all existing content. Returns the path and number of bytes written.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "文件路径"
+                        "description": "Destination file path; an existing file will be completely overwritten"
                     },
                     "content": {
                         "type": "string",
-                        "description": "要写入的内容"
+                        "description": "Complete file content to write, not a patch or append fragment"
                     }
                 },
                 "required": ["path", "content"],

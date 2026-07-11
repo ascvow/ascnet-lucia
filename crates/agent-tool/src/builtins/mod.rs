@@ -26,3 +26,35 @@ pub fn register_builtins(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(SearchFilesTool::default())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Tool;
+
+    /// 内置工具描述必须给出明确选择场景和关键限制，帮助模型选择专用能力。
+    #[test]
+    fn builtin_specs_explain_selection_and_limits() {
+        let specs = [
+            ReadFileTool.spec(),
+            WriteFileTool.spec(),
+            ListDirectoryTool.spec(),
+            ShellTool::default().spec(),
+            SearchFilesTool::default().spec(),
+        ];
+
+        let description = |name: &str| {
+            specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .map(|spec| spec.description.as_str())
+                .expect("内置工具定义必须存在")
+        };
+
+        assert!(description("read_file").contains("locate it with search_files first"));
+        assert!(description("write_file").contains("does not support partial edits or appends"));
+        assert!(description("list_directory").contains("without recursing"));
+        assert!(description("shell").contains("Prefer the dedicated tools"));
+        assert!(description("search_files").contains("Regular expressions are not supported"));
+    }
+}

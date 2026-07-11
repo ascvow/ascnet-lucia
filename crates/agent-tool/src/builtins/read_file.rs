@@ -25,22 +25,22 @@ impl Tool for ReadFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "read_file",
-            "读取文件内容，返回带行号的文本。支持按行偏移和行数限制。",
+            "Read a known UTF-8 text file and return content with 1-based line numbers plus pagination metadata. Use this to inspect a file when its path is known. For large files, page with offset and limit; if the path is unknown, locate it with search_files first.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "文件路径"
+                        "description": "Path to the UTF-8 text file to read"
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "起始行偏移（0 表示第一行），默认 0",
+                        "description": "0-based line offset at which to start; 0 is the first line, default 0",
                         "minimum": 0
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "最多读取行数，默认 2000",
+                        "description": "Maximum number of lines to return; default 2000, increase offset to continue",
                         "minimum": 1
                     }
                 },

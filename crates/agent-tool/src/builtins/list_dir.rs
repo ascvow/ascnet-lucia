@@ -21,13 +21,13 @@ impl Tool for ListDirectoryTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "list_directory",
-            "列出目录下的文件和子目录，返回名称、类型和文件大小。",
+            "List the direct children of a directory without recursing, returning each entry's name, type, and file size. Use this to inspect a known directory. To locate files recursively by content, use search_files instead.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "目录路径"
+                        "description": "Directory path to inspect; only direct children are returned"
                     }
                 },
                 "required": ["path"],
