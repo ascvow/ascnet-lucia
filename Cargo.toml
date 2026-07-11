@@ -48,3 +48,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 wasmtime = { version = "46", features = ["component-model", "async"] }
 wasmtime-wasi = "46"
 wit-bindgen = "0.59"
+
+# 发布产物优先控制分发体积；调试构建保留完整符号，不能用于打包。
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+strip = true
+lto = true
