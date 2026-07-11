@@ -1,0 +1,27 @@
+[package]
+name = "plan-plugin"
+version = "0.1.0"
+edition = "2021"
+authors = ["ascvow"]
+license = "MIT"
+description = "为 Agent 提供计划更新、查询和 TUI 展示能力的 WASM 插件。"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+agent-plugin = { path = "../../../crates/agent-plugin" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-width = "0.2"
+wit-bindgen = "0.59"
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+debug = false
+strip = true
+lto = true
+
+[workspace]
