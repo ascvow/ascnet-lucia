@@ -714,9 +714,11 @@ impl TeammatePlugin {
                 ),
                 ui_span(format!(" {}", clipped(&member.role, 18)), None, false),
                 ui_span(
-                    (member.unread_messages > 0)
-                        .then(|| format!("  {}", member.unread_messages))
-                        .unwrap_or_default(),
+                    if member.unread_messages > 0 {
+                        format!("  {}", member.unread_messages)
+                    } else {
+                        String::new()
+                    },
                     Some(UiColor::Yellow),
                     false,
                 ),
@@ -771,9 +773,11 @@ impl TeammatePlugin {
                     false,
                 ),
                 ui_span(
-                    (member.unread_messages > 0)
-                        .then(|| format!("  {} 条消息", member.unread_messages))
-                        .unwrap_or_default(),
+                    if member.unread_messages > 0 {
+                        format!("  {} 条消息", member.unread_messages)
+                    } else {
+                        String::new()
+                    },
                     Some(UiColor::Yellow),
                     false,
                 ),
@@ -1346,6 +1350,25 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("团队"), "{text}");
         assert!(text.contains("reviewer"), "{text}");
-        assert!(text.contains("排队"), "{text}");
+        assert!(text.contains('◌'), "{text}");
+
+        let workspace = plugin
+            .render_ui(UiRenderRequest {
+                plugin_id: "teammate".into(),
+                view_id: TEAM_WORKSPACE_VIEW.into(),
+                instance_id: Some("team".into()),
+                width: 80,
+                height: 24,
+                focused: true,
+                frame: 2,
+            })
+            .expect("团队工作台应返回可见帧");
+        let workspace_text = workspace
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(workspace_text.contains("排队"), "{workspace_text}");
     }
 }

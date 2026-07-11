@@ -137,8 +137,8 @@ async fn component_runs_mailbox_dispatch_flow() {
         .expect("团队导航事件应可读取");
     assert!(navigation_events.iter().any(|event| {
         event["name"] == UI_NAVIGATION_EVENT
-            && event["data"]["action"]["push"]["view"]["view_id"]
-                == "teammate-team-workspace"
+            && event["data"]["action"]["action"] == "push"
+            && event["data"]["action"]["view"]["view_id"] == "teammate-team-workspace"
     }));
     let services = PluginHost::services(&host)
         .await

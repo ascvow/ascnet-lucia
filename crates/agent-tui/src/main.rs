@@ -7,7 +7,6 @@ mod tui;
 use agent_core::AgentExtension;
 use agent_core::{
     config::AgentRootConfig,
-    context::{ContextLoadRequest, LoadedContext},
     event::{AgentEvent, AgentEventKind, CompositeEventSink, EventSink, JsonlEventSink},
     model::{
         ChatModel, ContentBlock, MessageRole, ModelGateway, ModelRequest, ModelResponse,
@@ -15,6 +14,8 @@ use agent_core::{
     },
     Agent, AgentOptions, AgentRun, Session,
 };
+#[cfg(feature = "plugins")]
+use agent_core::{ContextLoadRequest, LoadedContext};
 #[cfg(feature = "plugins")]
 use agent_plugin_host::{
     manifest::{load_plugin_runtime_config, PluginManifest},
@@ -3914,7 +3915,8 @@ async fn load_plugins_for_tui(
     capability_selection: HashMap<String, String>,
     agent_template: AgentTemplate,
 ) -> Result<LoadedPlugins> {
-    let runtime = AgentRuntime::new(RuntimeLimits::default()).context("创建 TUI Agent Runtime 失败")?;
+    let runtime =
+        AgentRuntime::new(RuntimeLimits::default()).context("创建 TUI Agent Runtime 失败")?;
     let controller_profile =
         AgentProfileId::new("tui-controller").context("创建 TUI controller profile 失败")?;
     runtime
