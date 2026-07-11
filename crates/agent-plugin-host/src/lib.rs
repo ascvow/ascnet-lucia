@@ -557,6 +557,7 @@ mod tests {
         UiRenderRequest {
             plugin_id: plugin_id.to_string(),
             view_id: view_id.to_string(),
+            instance_id: None,
             width: 40,
             height: 12,
             focused: true,
@@ -569,6 +570,7 @@ mod tests {
         UiInput {
             plugin_id: plugin_id.to_string(),
             view_id: view_id.to_string(),
+            instance_id: None,
             event: UiInputEvent::Key {
                 code: "enter".to_string(),
                 modifiers: Vec::new(),

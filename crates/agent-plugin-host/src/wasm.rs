@@ -14,6 +14,7 @@ use super::{
     AgentEvent, AgentRuntimeHostServices, CompositePluginHost, PluginHost, PluginHostServices,
     ToolDecision, UiDeclaration, UiFrame, UiInput, UiRenderRequest,
 };
+use crate::ui::UiPlacement;
 use agent_core::{model::ModelMessage, AgentExtension, ContextLoadRequest, LoadedContext};
 use agent_runtime::RuntimePrincipal;
 use agent_tool::{ToolCall, ToolResult, ToolSpec};
@@ -25,20 +26,37 @@ use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::{Arc, LazyLock, Weak},
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use wasmtime::component::{
     Component, ComponentNamedList, Instance, Lift, Linker, Lower, ResourceTable, TypedFunc,
 };
-use wasmtime::{Config, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    Cache, CacheConfig, Config, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder,
+};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 const DEFAULT_FUEL_PER_PLUGIN: u64 = 50_000_000;
 const DEFAULT_FUEL_YIELD_INTERVAL: u64 = 250_000;
 /// 单个插件线性内存的默认上限。
 const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+
+/// 进程内所有 WASM 插件共享的 Wasmtime Engine。
+///
+/// Engine 的克隆只会增加内部引用计数；共享实例可复用编译器、类型注册表和代码缓存，
+/// 同时每个插件仍持有独立的 Store、燃料和内存限制。
+static SHARED_WASM_ENGINE: LazyLock<std::result::Result<Engine, String>> = LazyLock::new(|| {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.consume_fuel(true);
+    // 缓存不可用时保持无缓存启动，避免本地目录权限问题使插件系统整体失败。
+    if let Ok(cache) = Cache::new(CacheConfig::new()) {
+        config.cache(Some(cache));
+    }
+    Engine::new(&config).map_err(|error| format!("{error:?}"))
+});
 
 /// 将 wasmtime 结果转换为 anyhow 结果。
 /// wasmtime 46 起使用自有 Error 类型，不再实现 std Error，无法直接配合 anyhow。
@@ -49,6 +67,16 @@ trait IntoAnyhow<T> {
 impl<T> IntoAnyhow<T> for std::result::Result<T, wasmtime::Error> {
     fn into_anyhow(self) -> Result<T> {
         self.map_err(|err| anyhow::anyhow!("{err:?}"))
+    }
+}
+
+/// 获取进程级共享 Engine 的浅克隆。
+///
+/// 初始化失败会被缓存，避免并发插件加载重复执行昂贵且注定失败的初始化。
+fn shared_wasm_engine() -> Result<Engine> {
+    match &*SHARED_WASM_ENGINE {
+        Ok(engine) => Ok(engine.clone()),
+        Err(error) => Err(anyhow!("failed to create Wasmtime engine: {error}")),
     }
 }
 
@@ -322,13 +350,7 @@ impl WasmPluginHost {
     ) -> Result<Self> {
         manifest.validate()?;
 
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        config.consume_fuel(true);
-
-        let engine = Engine::new(&config)
-            .into_anyhow()
-            .context("failed to create Wasmtime engine")?;
+        let engine = shared_wasm_engine()?;
         let component = Component::from_file(&engine, wasm_path.as_ref())
             .into_anyhow()
             .with_context(|| {
@@ -683,14 +705,17 @@ impl PluginHost for WasmPluginHost {
     }
 
     async fn render_ui(&self, request: &UiRenderRequest) -> Result<Option<UiFrame>> {
-        if request.plugin_id != self.id()
-            || !self
-                .known_ui
-                .iter()
-                .any(|declaration| declaration.view_id == request.view_id)
-        {
+        if request.plugin_id != self.id() {
             return Ok(None);
         }
+        let Some(declaration) = self
+            .known_ui
+            .iter()
+            .find(|declaration| declaration.view_id == request.view_id)
+        else {
+            return Ok(None);
+        };
+        validate_ui_instance(declaration, request.instance_id.as_deref())?;
 
         let request_json = serde_json::to_string(request)?;
         let mut state = self.state.lock().await;
@@ -720,14 +745,17 @@ impl PluginHost for WasmPluginHost {
     }
 
     async fn on_ui_input(&self, input: &UiInput) -> Result<()> {
-        if input.plugin_id != self.id()
-            || !self
-                .known_ui
-                .iter()
-                .any(|declaration| declaration.view_id == input.view_id)
-        {
+        if input.plugin_id != self.id() {
             return Ok(());
         }
+        let Some(declaration) = self
+            .known_ui
+            .iter()
+            .find(|declaration| declaration.view_id == input.view_id)
+        else {
+            return Ok(());
+        };
+        validate_ui_instance(declaration, input.instance_id.as_deref())?;
 
         let input_json = serde_json::to_string(input)?;
         let mut state = self.state.lock().await;
@@ -1545,6 +1573,28 @@ fn validate_ui_declarations(plugin_id: &str, declarations: &mut [UiDeclaration])
     Ok(())
 }
 
+/// 校验静态视图与动态子视图的实例路由是否匹配。
+fn validate_ui_instance(declaration: &UiDeclaration, instance_id: Option<&str>) -> Result<()> {
+    match (declaration.placement, instance_id) {
+        (UiPlacement::Subview, Some(instance_id))
+            if !instance_id.is_empty()
+                && instance_id.len() <= 256
+                && !instance_id.chars().any(char::is_control) =>
+        {
+            Ok(())
+        }
+        (UiPlacement::Subview, _) => Err(anyhow!(
+            "subview `{}` 需要有效 instance_id",
+            declaration.view_id
+        )),
+        (_, None) => Ok(()),
+        (_, Some(_)) => Err(anyhow!(
+            "非 subview `{}` 不允许携带 instance_id",
+            declaration.view_id
+        )),
+    }
+}
+
 /// 探测可选 component 导出；导出存在但类型不匹配时仍视为加载错误。
 fn get_optional_func<Params, Results>(
     instance: &Instance,
@@ -1582,6 +1632,7 @@ where
 mod tests {
     use super::*;
     use crate::manifest::{PluginDependency, PluginSection, SUPPORTED_PLUGIN_API_VERSION};
+    use crate::ui::UiSize;
 
     /// 默认运行时限制必须同时约束计算量和线性内存。
     #[test]
@@ -1590,6 +1641,35 @@ mod tests {
 
         assert!(limits.fuel > 0);
         assert_eq!(limits.max_memory_bytes, 64 * 1024 * 1024);
+    }
+
+    /// 多次请求运行时 Engine 时必须复用同一个底层实例。
+    #[test]
+    fn wasm_plugin_loads_share_process_engine() -> Result<()> {
+        let first = shared_wasm_engine()?;
+        let second = shared_wasm_engine()?;
+
+        assert!(Engine::same(&first, &second));
+        Ok(())
+    }
+
+    /// Subviews require a valid instance ID, while static views reject dynamic routing.
+    /// 子视图必须携带有效实例 ID，静态视图则拒绝动态实例路由。
+    #[test]
+    fn ui_instance_routing_matches_declared_placement() {
+        let declaration = |placement| UiDeclaration {
+            plugin_id: "demo".into(),
+            view_id: "detail".into(),
+            title: "详情".into(),
+            placement,
+            size: UiSize::default(),
+            focusable: true,
+        };
+
+        assert!(validate_ui_instance(&declaration(UiPlacement::Subview), Some("task-1")).is_ok());
+        assert!(validate_ui_instance(&declaration(UiPlacement::Subview), None).is_err());
+        assert!(validate_ui_instance(&declaration(UiPlacement::Right), None).is_ok());
+        assert!(validate_ui_instance(&declaration(UiPlacement::Right), Some("task-1")).is_err());
     }
 
     /// Required dependency failures propagate transitively while optional failures do not block.

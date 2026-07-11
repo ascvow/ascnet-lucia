@@ -1,9 +1,10 @@
 //! ascnet-lucia 插件 TUI 能力展示组件。
 
 use agent_plugin::{
-    export_plugin, AgentEvent, AgentPlugin, Result, ToolCall, ToolDecision, ToolResult, ToolSpec,
-    UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest,
-    UiSize, UiSpan, UiStyle,
+    export_plugin, AgentEvent, AgentPlugin, PluginHostApi, Result, ToolCall, ToolDecision,
+    ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
+    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    UiViewInstance,
 };
 use serde_json::json;
 
@@ -12,6 +13,7 @@ const RIGHT_VIEW: &str = "showcase-right";
 const BOTTOM_VIEW: &str = "showcase-bottom";
 const LEFT_VIEW: &str = "showcase-left";
 const DIALOG_VIEW: &str = "showcase-dialog";
+const SUBVIEW: &str = "showcase-detail";
 
 /// 保存工具、事件和界面输入共同修改的展示状态。
 struct UiShowcasePlugin {
@@ -142,6 +144,7 @@ impl AgentPlugin for UiShowcasePlugin {
                 Some(56),
                 Some(13),
             ),
+            declaration(SUBVIEW, "动态子视图", UiPlacement::Subview, None, None),
         ]
     }
 
@@ -152,6 +155,7 @@ impl AgentPlugin for UiShowcasePlugin {
             RIGHT_VIEW => self.render_right(&request),
             BOTTOM_VIEW => self.render_bottom(&request),
             DIALOG_VIEW => self.render_dialog(&request),
+            SUBVIEW => self.render_subview(&request),
             _ => return None,
         };
         Some(UiFrame {
@@ -173,6 +177,30 @@ impl AgentPlugin for UiShowcasePlugin {
                 }
             }
             UiInputEvent::Mouse { .. } => {}
+        }
+    }
+
+    /// 展示插件可在不暴露业务字段的前提下创建动态子视图。
+    fn on_ui_input_with_host(&mut self, host: &dyn PluginHostApi, input: UiInput) {
+        let open_subview = input.view_id == RIGHT_VIEW
+            && matches!(input.event, UiInputEvent::Key { ref code, .. } if code == "s");
+        self.on_ui_input(input);
+        if open_subview {
+            self.interactions = self.interactions.saturating_add(1);
+            let instance_id = format!("detail-{}", self.interactions);
+            let request = UiNavigationRequest {
+                request_id: format!("open-{instance_id}"),
+                action: UiNavigationAction::Push {
+                    view: UiViewInstance {
+                        view_id: SUBVIEW.into(),
+                        instance_id: instance_id.clone(),
+                        title: Some(format!("展示实例 {instance_id}")),
+                    },
+                },
+            };
+            if let Err(error) = host.navigate_view(request) {
+                self.message = format!("子视图导航失败：{error}");
+            }
         }
     }
 }
@@ -223,7 +251,7 @@ impl UiShowcasePlugin {
             ))]),
             line(vec![plain(&format!("输入：{}", self.interactions))]),
             line(vec![styled(&self.last_event, UiColor::Gray, false)]),
-            line(vec![plain("d / Enter  打开对话框")]),
+            line(vec![plain("d / Enter 对话框  s 子视图")]),
             focus_line(request.focused),
         ]
     }
@@ -266,6 +294,23 @@ impl UiShowcasePlugin {
             line(vec![plain("")]),
             line(vec![styled("按 Esc、Enter 或 d 关闭", UiColor::Cyan, true)]),
             line(vec![reversed(" DIALOG FOCUS ")]),
+        ]
+    }
+
+    /// 渲染一个与业务无关的动态视图实例，实例 ID 由宿主原样回传。
+    fn render_subview(&self, request: &UiRenderRequest) -> Vec<UiLine> {
+        let instance_id = request.instance_id.as_deref().unwrap_or("未知实例");
+        vec![
+            line(vec![styled("插件动态子视图", UiColor::Cyan, true)]),
+            line(vec![plain("")]),
+            line(vec![plain(&format!("实例 ID：{instance_id}"))]),
+            line(vec![plain(&format!(
+                "宿主分配尺寸：{}x{}",
+                request.width, request.height
+            ))]),
+            line(vec![plain("")]),
+            line(vec![plain("这里可以由插件渲染 sub-agent、workflow 或任意业务实例。")]),
+            line(vec![styled("Esc 返回上一层", UiColor::Yellow, true)]),
         ]
     }
 

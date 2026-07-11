@@ -8,7 +8,7 @@ description = "Guest-side WASM plugin SDK for ascnet-lucia."
 
 [dependencies]
 anyhow.workspace = true
-agent-tool = { path = "../ascnet-lucia-tool", default-features = false }
+agent-tool = { path = "../agent-tool", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 wit-bindgen.workspace = true

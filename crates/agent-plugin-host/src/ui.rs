@@ -18,6 +18,9 @@ pub enum UiPlacement {
     Left,
     /// 覆盖主界面的模态对话框。
     Dialog,
+    /// A full-screen subview type whose instances are created by navigation requests.
+    /// 替换主视图的全屏子视图类型，由导航请求创建实例。
+    Subview,
 }
 
 /// 插件界面期望尺寸，宿主可按终端空间缩小该尺寸。
@@ -56,6 +59,10 @@ pub struct UiRenderRequest {
     pub plugin_id: String,
     /// 目标视图 ID。
     pub view_id: String,
+    /// Dynamic subview instance ID; docked views and dialogs use `None`.
+    /// 动态子视图实例 ID；停靠视图和对话框为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     /// 当前可用宽度。
     pub width: u16,
     /// 当前可用高度。
@@ -65,6 +72,54 @@ pub struct UiRenderRequest {
     /// 宿主单调递增的渲染帧序号。
     pub frame: u64,
 }
+
+/// A dynamic subview instance created by a plugin.
+/// 插件创建的动态子视图实例。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiViewInstance {
+    /// View type matching [`UiDeclaration::view_id`].
+    /// 对应 [`UiDeclaration::view_id`] 的视图类型。
+    pub view_id: String,
+    /// Stable plugin-local instance ID, such as an opaque task or Agent ID.
+    /// 插件内稳定唯一的实例 ID，例如某个任务或 Agent 的不透明 ID。
+    pub instance_id: String,
+    /// Optional instance title overriding the static declaration title.
+    /// 覆盖静态声明标题的可选实例标题。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// Navigation actions between the main view and plugin subviews.
+/// 主视图与插件子视图之间的导航动作。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum UiNavigationAction {
+    /// Pushes a subview above the current view.
+    /// 在当前视图之上压入一个子视图。
+    Push { view: UiViewInstance },
+    /// Replaces the current plugin-owned subview.
+    /// 用新子视图替换当前插件子视图。
+    Replace { view: UiViewInstance },
+    /// Closes the current plugin-owned subview and returns to its parent.
+    /// 关闭当前插件子视图，返回上一层。
+    Pop,
+}
+
+/// An idempotent view navigation request sent by a plugin.
+/// 插件发送给应用的幂等视图导航请求。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiNavigationRequest {
+    /// Plugin-local monotonic or random request ID used for deduplication.
+    /// 插件内单调或随机的请求 ID，用于忽略重复交付。
+    pub request_id: String,
+    /// Navigation action to be applied by the application.
+    /// 应用需执行的导航动作。
+    pub action: UiNavigationAction,
+}
+
+/// Stable extension event name used for plugin view navigation.
+/// 插件视图导航使用的稳定扩展事件名。
+pub const UI_NAVIGATION_EVENT: &str = "ui.view.navigation";
 
 /// 插件返回的一帧声明式终端内容。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,6 +208,10 @@ pub struct UiInput {
     pub plugin_id: String,
     /// 目标视图 ID。
     pub view_id: String,
+    /// Dynamic subview instance ID; static views use `None`.
+    /// 动态子视图实例 ID；静态视图为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     /// 已转换为宿主无关形式的事件。
     pub event: UiInputEvent,
 }
@@ -178,4 +237,47 @@ pub enum UiInputEvent {
         /// 内容区纵坐标。
         y: u16,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 旧插件不携带 instance_id 的 JSON 必须继续可被新 Host 解析。
+    #[test]
+    fn legacy_ui_requests_default_to_static_view() {
+        let request: UiRenderRequest = serde_json::from_value(json!({
+            "plugin_id": "demo",
+            "view_id": "panel",
+            "width": 40,
+            "height": 12,
+            "focused": false,
+            "frame": 1
+        }))
+        .expect("解析旧版渲染请求");
+
+        assert_eq!(request.instance_id, None);
+    }
+
+    /// 子视图导航请求必须保留动作和动态实例身份。
+    #[test]
+    fn subview_navigation_round_trips_through_json() {
+        let request = UiNavigationRequest {
+            request_id: "open-1".into(),
+            action: UiNavigationAction::Push {
+                view: UiViewInstance {
+                    view_id: "agent-detail".into(),
+                    instance_id: "agent-1".into(),
+                    title: Some("Reviewer".into()),
+                },
+            },
+        };
+
+        let encoded = serde_json::to_value(&request).expect("序列化导航请求");
+        let decoded: UiNavigationRequest =
+            serde_json::from_value(encoded).expect("反序列化导航请求");
+
+        assert_eq!(decoded, request);
+    }
 }

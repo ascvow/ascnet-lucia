@@ -12,9 +12,9 @@ wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dependencies]
 anyhow.workspace = true
-agent-runtime = { path = "../ascnet-lucia-agent-runtime" }
-agent-core = { path = "../ascnet-lucia-core", default-features = false }
-agent-tool = { path = "../ascnet-lucia-tool", default-features = false }
+agent-runtime = { path = "../agent-runtime" }
+agent-core = { path = "../agent-core", default-features = false }
+agent-tool = { path = "../agent-tool", default-features = false }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

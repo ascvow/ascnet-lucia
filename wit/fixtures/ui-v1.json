@@ -1,0 +1,66 @@
+{
+  "declaration": {
+    "plugin_id": "fixture-plugin",
+    "view_id": "detail",
+    "title": "详情",
+    "placement": "subview",
+    "size": {
+      "width": 72,
+      "height": 24
+    },
+    "focusable": true
+  },
+  "render_request": {
+    "plugin_id": "fixture-plugin",
+    "view_id": "detail",
+    "instance_id": "task-1",
+    "width": 72,
+    "height": 24,
+    "focused": true,
+    "frame": 9
+  },
+  "frame": {
+    "view_id": "detail",
+    "visible": true,
+    "lines": [
+      {
+        "spans": [
+          {
+            "text": "运行中",
+            "style": {
+              "foreground": "cyan",
+              "background": "black",
+              "bold": true,
+              "italic": false,
+              "underlined": false,
+              "reversed": false
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "input": {
+    "plugin_id": "fixture-plugin",
+    "view_id": "detail",
+    "instance_id": "task-1",
+    "event": {
+      "type": "key",
+      "code": "enter",
+      "modifiers": [
+        "control"
+      ]
+    }
+  },
+  "navigation": {
+    "request_id": "open-1",
+    "action": {
+      "action": "push",
+      "view": {
+        "view_id": "detail",
+        "instance_id": "task-1",
+        "title": "任务 1"
+      }
+    }
+  }
+}

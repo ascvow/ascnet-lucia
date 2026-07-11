@@ -310,6 +310,7 @@ async fn main() -> Result<()> {
     let ui_request = UiRenderRequest {
         plugin_id: routed_plugin.id.clone(),
         view_id: routed_plugin.view_id.clone(),
+        instance_id: None,
         width: 40,
         height: 12,
         focused: true,
@@ -346,6 +347,7 @@ async fn main() -> Result<()> {
     let ui_input = UiInput {
         plugin_id: routed_plugin.id.clone(),
         view_id: routed_plugin.view_id.clone(),
+        instance_id: None,
         event: UiInputEvent::Key {
             code: "enter".to_string(),
             modifiers: Vec::new(),

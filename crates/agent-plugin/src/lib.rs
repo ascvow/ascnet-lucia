@@ -66,6 +66,9 @@ pub enum UiPlacement {
     Left,
     /// 覆盖主界面的模态对话框。
     Dialog,
+    /// A full-screen subview type whose instances are created by navigation requests.
+    /// 替换主视图的全屏子视图类型，由导航请求创建实例。
+    Subview,
 }
 
 /// 插件界面期望尺寸，宿主可按终端空间缩小该尺寸。
@@ -104,6 +107,10 @@ pub struct UiRenderRequest {
     pub plugin_id: String,
     /// 目标视图 ID。
     pub view_id: String,
+    /// Dynamic subview instance ID; docked views and dialogs use `None`.
+    /// 动态子视图实例 ID；停靠视图和对话框为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     /// 当前可用宽度。
     pub width: u16,
     /// 当前可用高度。
@@ -113,6 +120,54 @@ pub struct UiRenderRequest {
     /// 宿主单调递增的渲染帧序号。
     pub frame: u64,
 }
+
+/// A dynamic subview instance created by a plugin.
+/// 插件创建的动态子视图实例。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiViewInstance {
+    /// View type matching [`UiDeclaration::view_id`].
+    /// 对应 [`UiDeclaration::view_id`] 的视图类型。
+    pub view_id: String,
+    /// Stable plugin-local instance ID, such as an opaque task or Agent ID.
+    /// 插件内稳定唯一的实例 ID，可用于某个任务或 Agent。
+    pub instance_id: String,
+    /// Optional instance title overriding the static declaration title.
+    /// 覆盖静态声明标题的可选实例标题。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// Navigation actions between the main view and plugin subviews.
+/// 主视图与插件子视图之间的导航动作。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum UiNavigationAction {
+    /// Pushes a subview above the current view.
+    /// 在当前视图之上压入一个子视图。
+    Push { view: UiViewInstance },
+    /// Replaces the current plugin-owned subview.
+    /// 用新子视图替换当前插件子视图。
+    Replace { view: UiViewInstance },
+    /// Closes the current plugin-owned subview and returns to its parent.
+    /// 关闭当前插件子视图，返回上一层。
+    Pop,
+}
+
+/// An idempotent view navigation request sent by a plugin.
+/// 插件发送给应用的幂等视图导航请求。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiNavigationRequest {
+    /// Plugin-local monotonic or random request ID used for deduplication.
+    /// 插件内单调或随机的请求 ID，用于忽略重复交付。
+    pub request_id: String,
+    /// Navigation action to be applied by the application.
+    /// 应用需执行的导航动作。
+    pub action: UiNavigationAction,
+}
+
+/// Stable extension event name used for plugin view navigation.
+/// 插件视图导航使用的稳定扩展事件名。
+pub const UI_NAVIGATION_EVENT: &str = "ui.view.navigation";
 
 /// 插件返回的一帧声明式终端内容。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -201,6 +256,10 @@ pub struct UiInput {
     pub plugin_id: String,
     /// 目标视图 ID。
     pub view_id: String,
+    /// Dynamic subview instance ID; static views use `None`.
+    /// 动态子视图实例 ID；静态视图为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     /// 已转换为宿主无关形式的事件。
     pub event: UiInputEvent,
 }
@@ -378,6 +437,18 @@ pub struct ExtensionEvent {
     /// 可选的 UI 展示提示；无界面消费者可以忽略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<EventPresentation>,
+}
+
+impl ExtensionEvent {
+    /// Creates a subview navigation event without application-specific semantics.
+    /// 创建一条不携带业务语义的子视图导航事件。
+    pub fn view_navigation(request: UiNavigationRequest) -> Result<Self> {
+        Ok(Self {
+            name: UI_NAVIGATION_EVENT.to_string(),
+            data: serde_json::to_value(request)?,
+            presentation: None,
+        })
+    }
 }
 
 /// 扩展事件希望展示的位置。
@@ -708,6 +779,12 @@ pub trait PluginHostApi {
     /// 发布一条结构化扩展事件。
     fn emit_event(&self, event: &ExtensionEvent) -> Result<()>;
 
+    /// Requests one idempotent navigation operation for a plugin subview.
+    /// 请求应用对插件子视图执行一次幂等导航。
+    fn navigate_view(&self, request: UiNavigationRequest) -> Result<()> {
+        self.emit_event(&ExtensionEvent::view_navigation(request)?)
+    }
+
     /// 读取插件实例内存状态；实例卸载后状态不会保留。
     fn get_state(&self, key: &str) -> Result<Option<serde_json::Value>>;
 
@@ -875,6 +952,12 @@ pub trait AgentPlugin: Default + Send + 'static {
 
     /// 处理宿主路由给焦点视图的输入事件。
     fn on_ui_input(&mut self, _input: UiInput) {}
+
+    /// Handles view input with Host APIs; the default forwards to [`AgentPlugin::on_ui_input`].
+    /// 使用宿主 API 处理视图输入；默认转发给旧的 [`AgentPlugin::on_ui_input`]。
+    fn on_ui_input_with_host(&mut self, _host: &dyn PluginHostApi, input: UiInput) {
+        self.on_ui_input(input);
+    }
 }
 
 /// Serialize a value to a JSON string for the WIT ABI.
@@ -1385,7 +1468,9 @@ world plugin {
 
                 fn on_ui_input(input_json: String) {
                     if let Ok(input) = $crate::from_json_string::<$crate::UiInput>(&input_json) {
-                        with_plugin(|plugin| plugin.on_ui_input(input));
+                        with_plugin(|plugin| {
+                            plugin.on_ui_input_with_host(&ComponentHostApi, input)
+                        });
                     }
                 }
             }
@@ -1393,4 +1478,31 @@ world plugin {
             export!(Component);
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The navigation helper emits a stable name and request data without presentation effects.
+    /// 导航便捷构造器应生成稳定事件名和无展示副作用的请求数据。
+    #[test]
+    fn view_navigation_event_uses_stable_protocol() {
+        let event = ExtensionEvent::view_navigation(UiNavigationRequest {
+            request_id: "open-1".into(),
+            action: UiNavigationAction::Push {
+                view: UiViewInstance {
+                    view_id: "agent-detail".into(),
+                    instance_id: "agent-1".into(),
+                    title: None,
+                },
+            },
+        })
+        .expect("创建导航事件");
+
+        assert_eq!(event.name, UI_NAVIGATION_EVENT);
+        assert_eq!(event.data["action"]["action"], "push");
+        assert_eq!(event.data["action"]["view"]["instance_id"], "agent-1");
+        assert_eq!(event.presentation, None);
+    }
 }
