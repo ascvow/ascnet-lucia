@@ -4,7 +4,7 @@ name = "上下文压缩插件"
 version = "0.1.0"
 api_version = "0.6.0"
 wasm = "target/wasm32-wasip2/release/context_plugin.wasm"
-description = "按 token 水位清理旧工具结果，并用结构化摘要替换较旧 API 轮次。"
+description = "支持自动水位与 /compact 主动触发的上下文压缩。"
 
 [[provides]]
 id = "agent.context-loader"

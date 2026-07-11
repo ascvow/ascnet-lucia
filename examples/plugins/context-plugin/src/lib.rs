@@ -1,9 +1,11 @@
 //! 基于 Claude Code 分层策略的 Lucia 上下文压缩插件。
 
 use agent_plugin::{
-    export_plugin, AgentPlugin, ContextLoadRequest, EventPresentation, EventPresentationTone,
-    ExtensionEvent, LoadedContext, PluginHostApi, Result,
+    export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentPlugin, ContextLoadRequest,
+    EventPresentation, EventPresentationTone, ExtensionEvent, LoadedContext, PluginHostApi, Result,
+    ServiceCall, ServiceSpec,
 };
+use anyhow::anyhow;
 use serde_json::{json, Value};
 
 /// 200k 上下文扣除 20k 摘要输出预算和 13k 下一轮缓冲后的自动压缩阈值。
@@ -22,23 +24,85 @@ const RECENT_TOOL_RESULTS_TO_KEEP: usize = 3;
 const SUMMARY_CHARACTER_LIMIT: usize = 24_000;
 /// 被微压缩的工具结果占位文本。
 const CLEARED_TOOL_RESULT: &str = "[旧工具结果内容已清理]";
+/// 官方 Command Provider 的稳定插件 ID。
+const COMMAND_PLUGIN_ID: &str = "command";
+/// Context 插件接收主动压缩请求的服务名。
+const CONTEXT_COMPACT_SERVICE: &str = "context.compact";
+/// Command 协议当前版本。
+const COMMAND_PROTOCOL_VERSION: &str = "1.0.0";
+/// 主动压缩回调处理器的稳定名称。
+const COMPACT_HANDLER_ID: &str = "compact";
 
 /// 提供分层上下文压缩能力的插件。
 #[derive(Default)]
-struct ContextPlugin;
+struct ContextPlugin {
+    /// 下一次 Agent run 是否需要强制压缩。
+    manual_compaction_pending: bool,
+    /// 当前需要在全部 ReAct step 中持续压缩的 run ID。
+    manual_compaction_run_id: Option<String>,
+}
 
 impl AgentPlugin for ContextPlugin {
+    /// 注册主动压缩服务；命令定义由官方 Command 插件维护。
+    fn activate(&mut self, host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
+        host.upsert_service(&ServiceSpec {
+            name: CONTEXT_COMPACT_SERVICE.into(),
+            version: COMMAND_PROTOCOL_VERSION.into(),
+            description: Some("登记下一次 Agent run 的主动上下文压缩".into()),
+        })?;
+        Ok(())
+    }
+
+    /// 注销主动压缩服务并清理运行期状态。
+    fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
+        host.remove_service(CONTEXT_COMPACT_SERVICE)?;
+        self.manual_compaction_pending = false;
+        self.manual_compaction_run_id = None;
+        Ok(())
+    }
+
+    /// 接收 Command Provider 的可信回调并登记下一次手动压缩。
+    fn handle_service(&mut self, _host: &dyn PluginHostApi, call: ServiceCall) -> Result<Value> {
+        if call.name != CONTEXT_COMPACT_SERVICE {
+            return Err(anyhow!("Context 插件未实现服务 `{}`", call.name));
+        }
+        if call.caller_id != COMMAND_PLUGIN_ID {
+            return Err(anyhow!("调用方 `{}` 无权请求上下文压缩", call.caller_id));
+        }
+        let response = handle_compact_command(&call.payload)?;
+        self.manual_compaction_pending = true;
+        Ok(response)
+    }
+
     /// 根据估算 token 水位透传、微压缩或完整压缩上下文，并发布对应事件。
     fn load_context(
         &mut self,
         host: &dyn PluginHostApi,
         request: ContextLoadRequest,
     ) -> Result<Option<LoadedContext>> {
-        let outcome = compress_context(request);
+        let run_id = request.run_id.clone();
+        let manual = self.manual_compaction_pending
+            || self.manual_compaction_run_id.as_deref() == Some(run_id.as_str());
+        let outcome = compress_context(request, manual);
         if let Some(event) = outcome.event {
             host.emit_event(&event)?;
         }
+        if self.manual_compaction_pending {
+            self.manual_compaction_pending = false;
+            self.manual_compaction_run_id = Some(run_id);
+        }
         Ok(Some(outcome.context))
+    }
+
+    /// Agent run 结束或达到步数上限后释放手动压缩状态。
+    fn on_event(&mut self, event: AgentEvent) {
+        if matches!(
+            event.kind,
+            AgentEventKind::RunFinished | AgentEventKind::StepLimitReached
+        ) && self.manual_compaction_run_id.as_deref() == Some(event.run_id.as_str())
+        {
+            self.manual_compaction_run_id = None;
+        }
     }
 }
 
@@ -48,14 +112,14 @@ struct CompressionOutcome {
     event: Option<ExtensionEvent>,
 }
 
-/// 按模型窗口和当前输入规模选择分层压缩策略。
-fn compress_context(request: ContextLoadRequest) -> CompressionOutcome {
+/// 按模型窗口、当前输入规模和手动请求选择分层压缩策略。
+fn compress_context(request: ContextLoadRequest, manual: bool) -> CompressionOutcome {
     let before_messages = request.messages.len();
     let before_tokens = estimate_context_tokens(request.system.as_deref(), &request.messages);
     let (micro_threshold, compact_threshold) = thresholds_for_model(&request.model);
 
-    if before_tokens >= compact_threshold {
-        if let Some((messages, summarized_messages)) = compact_messages(&request.messages) {
+    if manual || before_tokens >= compact_threshold {
+        if let Some((messages, summarized_messages)) = compact_messages(&request.messages, manual) {
             let after_tokens = estimate_context_tokens(request.system.as_deref(), &messages);
             return CompressionOutcome {
                 context: LoadedContext {
@@ -72,6 +136,7 @@ fn compress_context(request: ContextLoadRequest) -> CompressionOutcome {
                         "summarized_messages": summarized_messages,
                         "estimated_tokens_before": before_tokens,
                         "estimated_tokens_after": after_tokens,
+                        "trigger": if manual { "manual" } else { "auto" },
                         "strategy": "structured_summary_with_recent_tail"
                     }),
                     presentation: Some(EventPresentation::divider(
@@ -83,7 +148,7 @@ fn compress_context(request: ContextLoadRequest) -> CompressionOutcome {
         }
     }
 
-    if before_tokens >= micro_threshold {
+    if manual || before_tokens >= micro_threshold {
         let (messages, cleared_results) = micro_compact_tool_results(&request.messages);
         if cleared_results > 0 {
             let after_tokens = estimate_context_tokens(request.system.as_deref(), &messages);
@@ -102,6 +167,7 @@ fn compress_context(request: ContextLoadRequest) -> CompressionOutcome {
                         "cleared_tool_results": cleared_results,
                         "estimated_tokens_before": before_tokens,
                         "estimated_tokens_after": after_tokens,
+                        "trigger": if manual { "manual" } else { "auto" },
                         "strategy": "clear_old_tool_results"
                     }),
                     presentation: Some(EventPresentation::divider(
@@ -113,6 +179,29 @@ fn compress_context(request: ContextLoadRequest) -> CompressionOutcome {
         }
     }
 
+    if manual {
+        return CompressionOutcome {
+            context: LoadedContext {
+                system: request.system,
+                messages: request.messages,
+            },
+            event: Some(ExtensionEvent {
+                name: "context.compaction.skipped".into(),
+                data: json!({
+                    "run_id": request.run_id,
+                    "step": request.step,
+                    "estimated_tokens": before_tokens,
+                    "reason": "no_compressible_history",
+                    "trigger": "manual"
+                }),
+                presentation: Some(EventPresentation::divider(
+                    "没有可压缩的历史上下文",
+                    EventPresentationTone::Muted,
+                )),
+            }),
+        };
+    }
+
     CompressionOutcome {
         context: LoadedContext {
             system: request.system,
@@ -120,6 +209,19 @@ fn compress_context(request: ContextLoadRequest) -> CompressionOutcome {
         },
         event: None,
     }
+}
+
+/// 校验 `/compact` 执行回调并生成 TUI 展示文本。
+fn handle_compact_command(payload: &Value) -> Result<Value> {
+    if payload.get("type").and_then(Value::as_str) != Some("execute")
+        || payload.get("handler_id").and_then(Value::as_str) != Some(COMPACT_HANDLER_ID)
+    {
+        return Err(anyhow!("无效的 `/compact` 命令回调"));
+    }
+    Ok(json!({
+        "type": "executed",
+        "result": "已请求上下文压缩，将在下一条消息发送前执行"
+    }))
 }
 
 /// 根据 Claude Code 的 `[1m]` 模型标记返回微压缩和完整压缩水位。
@@ -208,14 +310,14 @@ fn tool_result_count(message: &Value) -> usize {
         .unwrap_or(0)
 }
 
-/// 把较旧 API 轮次替换为结构化摘要，并原样保留近期完整轮次。
-fn compact_messages(messages: &[Value]) -> Option<(Vec<Value>, usize)> {
+/// 把较旧 API 轮次替换为结构化摘要；手动模式只保留最新完整轮次。
+fn compact_messages(messages: &[Value], manual: bool) -> Option<(Vec<Value>, usize)> {
     let group_starts = api_round_group_starts(messages);
     if group_starts.len() < 2 {
         return None;
     }
 
-    let split_index = recent_tail_start(messages, &group_starts);
+    let split_index = recent_tail_start(messages, &group_starts, manual);
     if split_index == 0 || split_index >= messages.len() {
         return None;
     }
@@ -246,8 +348,11 @@ fn api_round_group_starts(messages: &[Value]) -> Vec<usize> {
     starts
 }
 
-/// 从尾部累计完整 API 轮次，至少保留一个轮次且尽量不超过近期 token 目标。
-fn recent_tail_start(messages: &[Value], group_starts: &[usize]) -> usize {
+/// 自动模式保留约 40k 尾部；手动模式只保留最新完整轮次以确保实际发生压缩。
+fn recent_tail_start(messages: &[Value], group_starts: &[usize], manual: bool) -> usize {
+    if manual {
+        return *group_starts.last().unwrap_or(&0);
+    }
     let mut preserved_tokens: usize = 0;
     let mut start = *group_starts.last().unwrap_or(&0);
 
@@ -489,14 +594,17 @@ mod tests {
     #[test]
     fn keeps_small_context_unchanged() {
         let messages = vec![text_message("user", "检查当前实现")];
-        let outcome = compress_context(ContextLoadRequest {
-            run_id: "run-small".into(),
-            step: 0,
-            provider: "test".into(),
-            model: "test-model".into(),
-            system: Some("保持准确".into()),
-            messages: messages.clone(),
-        });
+        let outcome = compress_context(
+            ContextLoadRequest {
+                run_id: "run-small".into(),
+                step: 0,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: Some("保持准确".into()),
+                messages: messages.clone(),
+            },
+            false,
+        );
 
         assert_eq!(outcome.context.messages, messages);
         assert!(outcome.event.is_none());
@@ -508,14 +616,17 @@ mod tests {
         let messages = (0..6)
             .map(|index| tool_result_message(index, 70_000))
             .collect::<Vec<_>>();
-        let outcome = compress_context(ContextLoadRequest {
-            run_id: "run-micro".into(),
-            step: 1,
-            provider: "test".into(),
-            model: "test-model".into(),
-            system: None,
-            messages,
-        });
+        let outcome = compress_context(
+            ContextLoadRequest {
+                run_id: "run-micro".into(),
+                step: 1,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages,
+            },
+            false,
+        );
 
         assert_eq!(
             outcome.event.as_ref().map(|event| event.name.as_str()),
@@ -547,14 +658,17 @@ mod tests {
             text_message("user", recent_request),
             text_message("assistant", "正在处理最新用例"),
         ];
-        let outcome = compress_context(ContextLoadRequest {
-            run_id: "run-full".into(),
-            step: 2,
-            provider: "test".into(),
-            model: "test-model".into(),
-            system: None,
-            messages,
-        });
+        let outcome = compress_context(
+            ContextLoadRequest {
+                run_id: "run-full".into(),
+                step: 2,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages,
+            },
+            false,
+        );
 
         assert_eq!(
             outcome.event.as_ref().map(|event| event.name.as_str()),
@@ -576,18 +690,21 @@ mod tests {
     #[test]
     fn full_compaction_handles_two_api_rounds() {
         let recent_request = "保留当前请求";
-        let outcome = compress_context(ContextLoadRequest {
-            run_id: "run-two-rounds".into(),
-            step: 1,
-            provider: "test".into(),
-            model: "test-model".into(),
-            system: None,
-            messages: vec![
-                text_message("user", "x".repeat(520_000)),
-                text_message("assistant", "已接收旧请求"),
-                text_message("user", recent_request),
-            ],
-        });
+        let outcome = compress_context(
+            ContextLoadRequest {
+                run_id: "run-two-rounds".into(),
+                step: 1,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages: vec![
+                    text_message("user", "x".repeat(520_000)),
+                    text_message("assistant", "已接收旧请求"),
+                    text_message("user", recent_request),
+                ],
+            },
+            false,
+        );
 
         assert_eq!(
             outcome.event.as_ref().map(|event| event.name.as_str()),
@@ -598,5 +715,56 @@ mod tests {
             .messages
             .iter()
             .any(|message| { message["content"][0]["text"].as_str() == Some(recent_request) }));
+    }
+
+    /// 手动压缩不受自动水位限制，并在存在历史轮次时生成完整摘要。
+    #[test]
+    fn manual_compaction_bypasses_automatic_threshold() {
+        let outcome = compress_context(
+            ContextLoadRequest {
+                run_id: "run-manual".into(),
+                step: 0,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages: vec![
+                    text_message("user", "较早请求"),
+                    text_message("assistant", "较早回复"),
+                    text_message("user", "当前请求"),
+                ],
+            },
+            true,
+        );
+
+        assert_eq!(
+            outcome.event.as_ref().map(|event| event.name.as_str()),
+            Some("context.compaction.completed")
+        );
+        assert_eq!(
+            outcome.event.expect("应发布压缩事件").data["trigger"],
+            "manual"
+        );
+    }
+
+    /// `/compact` 回调只接受 Command Provider 生成的执行载荷。
+    #[test]
+    fn compact_command_callback_arms_manual_compaction() {
+        let response = handle_compact_command(&json!({
+            "type": "execute",
+            "handler_id": "compact",
+            "invocation": {
+                "command": "compact",
+                "input": "/compact",
+                "arguments": {}
+            }
+        }))
+        .expect("合法命令回调应成功");
+
+        assert_eq!(response["type"], "executed");
+        assert!(handle_compact_command(&json!({
+            "type": "execute",
+            "handler_id": "other"
+        }))
+        .is_err());
     }
 }
