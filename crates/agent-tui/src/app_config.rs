@@ -30,9 +30,7 @@ max_steps = 8
 max_tokens = 4096
 
 [tui]
-sessions_dir = "sessions"
-default_session = "default"
-resume_latest = false
+sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
 "#;
 
@@ -42,9 +40,9 @@ resume_latest = false
 pub(crate) struct TuiSettings {
     /// 会话目录；相对路径以配置文件目录为基准。
     pub(crate) sessions_dir: Option<PathBuf>,
-    /// 未传 CLI 参数时使用的稳定会话 ID。
+    /// 旧版默认会话 ID；仅为兼容已有配置保留，普通启动不再自动恢复。
     pub(crate) default_session: Option<String>,
-    /// 启动时是否优先恢复最近更新的会话。
+    /// 旧版自动恢复开关；仅为兼容已有配置保留，普通启动始终创建 Draft。
     pub(crate) resume_latest: bool,
     /// Agent 事件 JSONL 路径；相对路径以配置文件目录为基准。
     pub(crate) events_jsonl: Option<PathBuf>,
@@ -207,8 +205,8 @@ mod tests {
         }
 
         let settings = load_tui_settings(&path).expect("模板应可解析");
-        assert_eq!(settings.sessions_dir, Some(PathBuf::from("sessions")));
-        assert_eq!(settings.default_session.as_deref(), Some("default"));
+        assert_eq!(settings.sessions_dir, Some(PathBuf::from("projects")));
+        assert_eq!(settings.default_session, None);
         assert!(!settings.resume_latest);
 
         let error = initialize_config(&path).expect_err("重复初始化必须拒绝覆盖");

@@ -10,20 +10,25 @@ description = "Lucia ReAct 智能体的交互式终端界面。"
 # Regular builds include plugins; use `--no-default-features` for the isolated Core binary.
 # 常规构建默认提供插件能力；纯 Core 产物使用 `--no-default-features` 保持依赖边界。
 default = ["plugins"]
-plugins = ["dep:agent-plugin-host"]
+plugins = ["dep:agent-plugin-host", "dep:command-protocol"]
 
 [dependencies]
 anyhow.workspace = true
-agent-core = { path = "../ascnet-lucia-core", default-features = false, features = ["openai", "anthropic"] }
-agent-plugin-host = { path = "../ascnet-lucia-plugin-host", optional = true }
-agent-session = { path = "../ascnet-lucia-session" }
-agent-tool = { path = "../ascnet-lucia-tool" }
+agent-core = { path = "../agent-core", default-features = false, features = ["openai", "anthropic"] }
+agent-plugin-host = { path = "../agent-plugin-host", optional = true }
+agent-session = { path = "../agent-session" }
+agent-tool = { path = "../agent-tool" }
 async-trait.workspace = true
+base64.workspace = true
 clap.workspace = true
-crossterm = "0.28"
+command-protocol = { path = "../../examples/plugins/command-plugin/crates/command-protocol", optional = true }
+# bracketed-paste：接收终端粘贴事件，用于把拖入的文件路径转换为附件
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
+futures-util.workspace = true
 ratatui = "0.29"
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 tokio.workspace = true
 toml.workspace = true
 # Markdown 转 ratatui Text；关闭默认的 syntect 代码高亮以减小依赖

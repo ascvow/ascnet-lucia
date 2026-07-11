@@ -1,11 +1,13 @@
 //! Lucia 交互式 TUI（基于 Ratatui）。
 
 mod app_config;
+mod tui;
 
 #[cfg(feature = "plugins")]
 use agent_core::AgentExtension;
 use agent_core::{
     config::AgentRootConfig,
+    context::{ContextLoadRequest, LoadedContext},
     event::{AgentEvent, AgentEventKind, CompositeEventSink, EventSink, JsonlEventSink},
     model::{
         ChatModel, ContentBlock, MessageRole, ModelGateway, ModelRequest, ModelResponse,
@@ -18,13 +20,18 @@ use agent_plugin_host::{
     manifest::{load_plugin_runtime_config, PluginManifest},
     ui::{
         UiColor, UiDeclaration, UiFrame as PluginUiFrame, UiInput, UiInputEvent, UiLine,
-        UiPlacement, UiRenderRequest, UiSpan, UiStyle,
+        UiNavigationRequest, UiPlacement, UiRenderRequest, UiSpan, UiStyle, UI_NAVIGATION_EVENT,
     },
     wasm::{load_wasm_plugins_resilient_with_selection, PluginLoadFailure},
-    CompositePluginHost, PluginHost,
+    CompositePluginHost, PluginHost, PluginServiceCall,
 };
-use agent_session::{FileSessionStore, MemorySessionStore, SessionId, SessionRecord, SessionStore};
+use agent_session::{
+    FileSessionStore, MemorySessionStore, SessionId, SessionRecord, SessionStore,
+    SessionStoreError, SessionSummary,
+};
 use agent_tool::{JsonTool, ToolCall, ToolRegistry, ToolSpec};
+#[cfg(feature = "plugins")]
+use anyhow::Context;
 use anyhow::{anyhow, Result};
 #[cfg(feature = "plugins")]
 use app_config::discover_official_plugin_manifests;
@@ -35,15 +42,188 @@ use app_config::{
 use async_trait::async_trait;
 use clap::Parser;
 #[cfg(feature = "plugins")]
+use command_protocol::{
+    CommandAvailability, CommandCallbackResponse, CommandSnapshot, CommandSpec, CompletionContext,
+    CompletionItem, PrepareCompletionRequest, PrepareCompletionResponse, PrepareExecuteRequest,
+    PrepareExecuteResponse, SessionListStatus, SessionSummary as CommandSessionSummary,
+    SnapshotRequest, SurfaceAction, SurfaceEffect, SurfaceEffectsResponse, SurfaceUpdateRequest,
+    PREPARE_COMPLETION_SERVICE, PREPARE_EXECUTE_SERVICE, PROVIDER_PLUGIN_ID,
+    SESSION_COMPLETION_SOURCE, SESSION_DIALOG_VIEW, SNAPSHOT_SERVICE, SURFACE_POLL_EFFECTS_SERVICE,
+    SURFACE_UPDATE_SERVICE,
+};
+#[cfg(feature = "plugins")]
 use crossterm::event::MouseEvent;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{prelude::*, widgets::*};
+#[cfg(feature = "plugins")]
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 #[cfg(feature = "plugins")]
 use std::collections::{HashMap, HashSet};
-use std::{path::Path, path::PathBuf, sync::Arc};
+use std::{
+    path::Path,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::mpsc;
+use tui::render_root;
+#[cfg(feature = "plugins")]
+use tui::{
+    apply_plugin_navigation_event, dispatch_plugin_input, drain_plugin_ui_events,
+    refresh_plugin_view, refresh_plugin_views, view::ViewStack,
+};
+
+/// 启动目录派生出的稳定项目上下文。
+#[derive(Debug, Clone)]
+struct WorkspaceContext {
+    /// 规范化后的项目工作目录。
+    cwd: PathBuf,
+    /// 用于隔离项目会话空间的稳定摘要。
+    project_id: String,
+}
+
+impl WorkspaceContext {
+    /// 捕获当前进程工作目录并生成稳定项目标识。
+    fn capture() -> Result<Self> {
+        let cwd = std::env::current_dir()?.canonicalize()?;
+        let project_id = workspace_project_id(&cwd);
+        Ok(Self { cwd, project_id })
+    }
+
+    /// 创建尚未落盘的空白会话记录，并绑定当前项目标识。
+    fn draft_record(&self) -> Result<SessionRecord> {
+        self.record_with_id(SessionId::generate())
+    }
+
+    /// 使用指定标识创建绑定当前项目的空白会话记录。
+    fn record_with_id(&self, id: SessionId) -> Result<SessionRecord> {
+        let mut record = SessionRecord::new(id, Session::new())?;
+        record.metadata.insert(
+            "lucia.project_id".to_string(),
+            Value::String(self.project_id.clone()),
+        );
+        Ok(record)
+    }
+
+    /// 返回当前项目的会话存储目录。
+    fn sessions_dir(&self, root: &Path) -> PathBuf {
+        root.join(&self.project_id).join("sessions")
+    }
+}
+
+/// 使用操作系统原始路径表示生成稳定项目标识，避免有损字符串转换造成目录碰撞。
+fn workspace_project_id(cwd: &Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"lucia-project-v1\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        digest.update(cwd.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in cwd.as_os_str().encode_wide() {
+            digest.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    digest.update(cwd.to_string_lossy().as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+/// 只在首次实际读取已有目录或保存消息时打开文件会话存储。
+struct LazyFileSessionStore {
+    /// 当前项目的最终会话目录。
+    root: PathBuf,
+    /// 首次实际打开后复用的文件存储实例。
+    store: tokio::sync::OnceCell<FileSessionStore>,
+}
+
+impl LazyFileSessionStore {
+    /// 创建不会触碰文件系统的惰性存储句柄。
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            store: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// 打开存储目录；只有保存路径会在目录不存在时调用本方法。
+    async fn open(&self) -> Result<&FileSessionStore, SessionStoreError> {
+        self.store
+            .get_or_try_init(|| async { FileSessionStore::open(&self.root).await })
+            .await
+    }
+
+    /// 目录不存在时保持惰性，已有目录则通过文件存储完成安全校验。
+    async fn existing(&self) -> Result<Option<&FileSessionStore>, SessionStoreError> {
+        if let Some(store) = self.store.get() {
+            return Ok(Some(store));
+        }
+        match tokio::fs::symlink_metadata(&self.root).await {
+            Ok(_) => self.open().await.map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(SessionStoreError::Io {
+                operation: "检查会话存储目录",
+                path: self.root.clone(),
+                source,
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionStore for LazyFileSessionStore {
+    async fn load(&self, id: &SessionId) -> Result<Option<SessionRecord>, SessionStoreError> {
+        match self.existing().await? {
+            Some(store) => store.load(id).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn save(
+        &self,
+        record: SessionRecord,
+        expected_revision: Option<u64>,
+    ) -> Result<SessionRecord, SessionStoreError> {
+        self.open().await?.save(record, expected_revision).await
+    }
+
+    async fn delete(
+        &self,
+        id: &SessionId,
+        expected_revision: u64,
+    ) -> Result<(), SessionStoreError> {
+        match self.existing().await? {
+            Some(store) => store.delete(id, expected_revision).await,
+            None => Err(SessionStoreError::RevisionConflict {
+                id: id.clone(),
+                expected: Some(expected_revision),
+                actual: None,
+            }),
+        }
+    }
+
+    async fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
+        match self.existing().await? {
+            Some(store) => store.list().await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn list_summaries(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        match self.existing().await? {
+            Some(store) => store.list_summaries().await,
+            None => Ok(Vec::new()),
+        }
+    }
+}
 
 // ─── CLI 参数 ───
 
@@ -66,7 +246,7 @@ struct Args {
     #[arg(long = "events-jsonl")]
     events_jsonl: Option<PathBuf>,
 
-    /// 会话文件目录；覆盖配置文件和 `$LUCIA_HOME/sessions` 默认值。
+    /// 项目会话根目录；覆盖配置文件和 `$LUCIA_HOME/projects` 默认值。
     #[arg(long = "sessions-dir")]
     sessions_dir: Option<PathBuf>,
 
@@ -115,14 +295,133 @@ enum UiEvent {
         color: Color,
         divider: bool,
     },
+    /// 插件请求主应用更新子视图导航栈。
+    #[cfg(feature = "plugins")]
+    ViewNavigation {
+        plugin_id: String,
+        request: UiNavigationRequest,
+    },
     /// 最近一次模型请求消耗的上下文 token 数。
     ContextUsage(u64),
-    /// Agent 运行及 CAS 持久化均完成，成功值携带最新会话记录。
-    AgentDone(Box<Result<(AgentRun, SessionRecord)>>),
+    /// Agent 运行结束，携带至少一次持久化后的会话状态。
+    AgentDone(Box<AgentCompletion>),
+    /// 后台会话摘要查询完成，等待注入 Command 插件界面。
+    #[cfg(feature = "plugins")]
+    CommandSurfaceUpdate {
+        request_id: u64,
+        status: SessionListStatus,
+    },
+    /// 后台取得新的命令注册表快照。
+    #[cfg(feature = "plugins")]
+    CommandSnapshotLoaded(Box<Result<Option<CommandSnapshot>>>),
+    /// 显式参数补全请求完成。
+    #[cfg(feature = "plugins")]
+    CommandCompletionLoaded {
+        generation: u64,
+        result: Box<Result<Option<ResolvedCommandCompletion>>>,
+    },
     /// Background plugin loading completed and can now be attached to the pending Agent.
     /// 后台插件加载结束，可挂载到等待中的 Agent。
     #[cfg(feature = "plugins")]
     PluginsLoaded(Box<Result<LoadedPlugins>>),
+}
+
+/// 输入框中等待随下一条消息发送的附件。
+#[derive(Clone, Debug, PartialEq)]
+struct PendingAttachment {
+    /// 输入框中展示的引用标签，如 `[Image#1]`、`[FILE#report.pdf]`。
+    label: String,
+    /// 文件名（不含路径）。
+    name: String,
+    /// MIME 类型。
+    media_type: String,
+    /// base64 编码的文件内容。
+    data: String,
+    /// 是否图片附件。
+    is_image: bool,
+}
+
+/// 一次用户提交：含附件引用标签的文本与对应附件。
+#[derive(Clone, Debug, PartialEq)]
+struct UserSubmission {
+    /// 含附件引用标签的输入文本。
+    text: String,
+    /// 与文本中引用标签对应的附件，按插入顺序排列。
+    attachments: Vec<PendingAttachment>,
+}
+
+impl UserSubmission {
+    /// 转换为一次用户消息的内容块：文本在前，附件按加入顺序排在其后。
+    fn blocks(&self) -> Vec<ContentBlock> {
+        let mut blocks = Vec::with_capacity(self.attachments.len() + 1);
+        if !self.text.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: self.text.clone(),
+            });
+        }
+        for attachment in &self.attachments {
+            blocks.push(if attachment.is_image {
+                ContentBlock::Image {
+                    media_type: attachment.media_type.clone(),
+                    data: attachment.data.clone(),
+                }
+            } else {
+                ContentBlock::File {
+                    name: attachment.name.clone(),
+                    media_type: attachment.media_type.clone(),
+                    data: attachment.data.clone(),
+                }
+            });
+        }
+        blocks
+    }
+}
+
+impl From<&str> for UserSubmission {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            attachments: Vec::new(),
+        }
+    }
+}
+
+impl From<String> for UserSubmission {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            attachments: Vec::new(),
+        }
+    }
+}
+
+/// 一次用户输入从先行持久化到模型运行结束的完整结果。
+struct AgentCompletion {
+    /// 模型已成功完成时携带运行结果。
+    run: Option<AgentRun>,
+    /// 下一轮必须使用的完整记录；最终保存失败时可能是尚未落盘的 dirty 完成态。
+    session_record: SessionRecord,
+    /// 保存或模型运行失败时的错误。
+    error: Option<anyhow::Error>,
+    /// 用户输入是否已经写入会话存储。
+    input_committed: bool,
+    /// 当前完成态是否允许自动执行下一条 FIFO 输入。
+    queue_may_advance: bool,
+    /// 用于保存失败时恢复编辑器内容的原始输入。
+    input: UserSubmission,
+}
+
+/// 一次与输入快照绑定的参数候选结果。
+#[cfg(feature = "plugins")]
+struct ResolvedCommandCompletion {
+    /// 发起请求时的完整编辑器内容。
+    source_input: String,
+    /// 发起请求时的 UTF-8 字节光标。
+    source_cursor: usize,
+    /// Provider 校验后的参数位置与替换区间。
+    context: CompletionContext,
+    /// 已经过 Provider、SDK 或宿主数据源限制的候选。
+    items: Vec<CompletionItem>,
 }
 
 /// Plugin runtime data prepared off the TUI event loop.
@@ -143,6 +442,15 @@ struct LoadedPlugins {
 }
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// 原生 TUI 调用 Command Provider 时使用的稳定身份。
+#[cfg(feature = "plugins")]
+const TUI_COMMAND_CALLER: &str = "lucia-tui";
+/// 官方 Context 插件的稳定 ID。
+#[cfg(feature = "plugins")]
+const CONTEXT_PLUGIN_ID: &str = "context";
+/// 官方 Context 插件立即压缩当前 Session 的服务名。
+#[cfg(feature = "plugins")]
+const CONTEXT_COMPACT_SERVICE: &str = "context.compact";
 
 /// 输入区域的聚焦边框颜色。
 const COLOR_BORDER_FOCUS: Color = Color::Rgb(112, 110, 104);
@@ -162,6 +470,16 @@ const COLOR_DANGER: Color = Color::Rgb(205, 101, 101);
 /// 启动插件详情收敛为紧凑计数前保留的 80 毫秒 UI tick 数。
 #[cfg(feature = "plugins")]
 const PLUGIN_STATUS_DETAIL_TICKS: u16 = 75;
+/// UI 动画和后台维护使用的基础 tick 间隔。
+const UI_TICK_INTERVAL_MS: u64 = 80;
+/// 单个附件大小上限（10 MiB），兼顾常见模型接口的请求体限制。
+const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+/// 周期插件视图刷新间隔，约为一秒。
+#[cfg(feature = "plugins")]
+const PLUGIN_REFRESH_TICKS: u8 = 12;
+/// Command 注册表兜底刷新间隔，约为十五秒。
+#[cfg(feature = "plugins")]
+const COMMAND_SNAPSHOT_REFRESH_TICKS: u8 = 188;
 
 // ─── 聊天消息 ───
 
@@ -554,6 +872,171 @@ fn truncate_line(text: &str, max_width: usize) -> String {
     output
 }
 
+/// 从粘贴内容解析拖拽的单个文件路径。
+///
+/// 支持引号包裹与反斜杠转义（macOS 终端拖入文件的两种形态）以及 `~/` 前缀；
+/// 仅接受指向普通文件的绝对路径，其余内容按普通文本粘贴处理。
+fn pasted_file_path(pasted: &str) -> Option<PathBuf> {
+    let trimmed = pasted.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| unescape_shell_path(trimmed));
+    let path = if let Some(rest) = unquoted.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(home) if !home.is_empty() => PathBuf::from(home).join(rest),
+            _ => return None,
+        }
+    } else {
+        PathBuf::from(&unquoted)
+    };
+    if !path.is_absolute() {
+        return None;
+    }
+    std::fs::metadata(&path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|_| path)
+}
+
+/// 去掉终端拖拽路径中的反斜杠转义（如 `\ ` 与 `\(`）。
+fn unescape_shell_path(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 根据扩展名与内容推断附件 MIME 类型，返回 `(media_type, 是否图片)`。
+///
+/// 图片仅识别主流模型接口支持的四种格式；未知扩展名按内容判断：
+/// 可解码为 UTF-8 视为文本，否则视为二进制。
+fn attachment_media_type(path: &Path, bytes: &[u8]) -> (String, bool) {
+    let extension = path
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let media_type = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        _ => {
+            if std::str::from_utf8(bytes).is_ok() {
+                "text/plain"
+            } else {
+                "application/octet-stream"
+            }
+        }
+    };
+    (media_type.to_string(), media_type.starts_with("image/"))
+}
+
+/// 将文本复制到系统剪贴板。
+///
+/// 优先调用平台剪贴板命令（pbcopy/wl-copy/xclip/xsel/clip）；命令不可用时
+/// 回退为 OSC 52 转义序列，支持 SSH 远程终端。
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use base64::Engine;
+    use std::io::Write;
+
+    if copy_via_command(text) {
+        return Ok(());
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut stdout = std::io::stdout();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// 尝试通过平台剪贴板命令写入文本，返回是否成功。
+fn copy_via_command(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "macos")]
+    let candidates: &[&[&str]] = &[&["pbcopy"]];
+    #[cfg(target_os = "windows")]
+    let candidates: &[&[&str]] = &[&["clip"]];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let candidates: &[&[&str]] = &[
+        &["wl-copy"],
+        &["xclip", "-selection", "clipboard"],
+        &["xsel", "--clipboard", "--input"],
+    ];
+
+    for candidate in candidates {
+        let Ok(mut child) = Command::new(candidate[0])
+            .args(&candidate[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let written = child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+        if written && child.wait().is_ok_and(|status| status.success()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 将输入文本切分为普通文本与附件引用标签片段，标签使用高亮样式。
+fn input_ref_spans<'a>(input: &'a str, attachments: &'a [PendingAttachment]) -> Vec<Span<'a>> {
+    let base = Style::new().fg(COLOR_TEXT);
+    let clip = Style::new().fg(COLOR_WARNING).bold();
+    if attachments.is_empty() {
+        return vec![Span::styled(input, base)];
+    }
+    let mut spans = Vec::new();
+    let mut rest = input;
+    while !rest.is_empty() {
+        // 取最靠前的附件标签作为下一个高亮片段。
+        let earliest = attachments
+            .iter()
+            .filter_map(|a| rest.find(&a.label).map(|pos| (pos, a.label.len())))
+            .min_by_key(|(pos, _)| *pos);
+        let Some((start, len)) = earliest else {
+            spans.push(Span::styled(rest, base));
+            break;
+        };
+        if start > 0 {
+            spans.push(Span::styled(&rest[..start], base));
+        }
+        spans.push(Span::styled(&rest[start..start + len], clip));
+        rest = &rest[start + len..];
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled("", base));
+    }
+    spans
+}
+
 /// 将持久化的 provider-neutral Session 恢复为主事件列表消息。
 ///
 /// system、developer 和 thinking 内容不会直接展示；工具调用与后续结果会合并为一条
@@ -563,7 +1046,21 @@ fn restore_session_messages(session: &Session) -> Vec<Msg> {
     for message in session.messages() {
         match message.role {
             MessageRole::User => {
-                let text = message.text_content();
+                let mut text = message.text_content();
+                // TUI 提交的附件引用标签内嵌在文本中；其他来源的纯附件消息
+                // 没有文本时补充占位标签，保证恢复后可见。
+                if text.is_empty() {
+                    let labels: Vec<String> = message
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Image { .. } => Some("[Image]".to_string()),
+                            ContentBlock::File { name, .. } => Some(format!("[FILE#{name}]")),
+                            _ => None,
+                        })
+                        .collect();
+                    text = labels.join(" ");
+                }
                 if !text.is_empty() {
                     messages.push(Msg::new(MsgKind::User, text));
                 }
@@ -657,15 +1154,21 @@ fn plugin_startup_details(plugin_ids: &[String], events: &[Value]) -> Vec<String
 }
 
 struct App {
+    /// 本次进程固定使用的项目工作目录。
+    workspace: WorkspaceContext,
     messages: Vec<Msg>,
     input: String,
+    /// 等待随下一条消息发送的附件；引用标签内嵌在 `input` 文本中。
+    attachments: Vec<PendingAttachment>,
     /// FIFO inputs accepted before the Agent becomes ready. Agent 就绪前接收的 FIFO 输入队列。
-    queued_inputs: VecDeque<String>,
+    queued_inputs: VecDeque<UserSubmission>,
+    /// 当前运行是否来自 FIFO 队首；成功预写后才允许移除对应输入。
+    queued_run_active: bool,
     /// 光标在 input 中的字节偏移。
     cursor: usize,
     running: bool,
     should_quit: bool,
-    /// 当前已确认的会话记录；运行或保存失败时保持不变。
+    /// 下一轮使用的完整会话记录；最终保存失败时可暂存 dirty 完成态。
     session_record: SessionRecord,
     /// 执行 revision 比较并交换的会话存储。
     session_store: Arc<dyn SessionStore>,
@@ -680,6 +1183,8 @@ struct App {
     last_max_scroll: u16,
     /// 最近一次模型请求消耗的上下文 token 数。
     context_tokens: Option<u64>,
+    /// 鼠标捕获是否开启；暂停后终端可用原生选择复制消息文本。
+    mouse_capture: bool,
     /// 插件声明的视图及宿主缓存的最近一帧。
     #[cfg(feature = "plugins")]
     plugin_views: Vec<PluginViewState>,
@@ -710,6 +1215,39 @@ struct App {
     /// Per-plugin failures retained alongside successful plugins. 与成功插件并存的单插件失败摘要。
     #[cfg(feature = "plugins")]
     plugin_failures: Vec<String>,
+    /// 主视图之上的插件子视图导航栈。
+    #[cfg(feature = "plugins")]
+    view_stack: ViewStack,
+    /// Command Provider 发布的只读命令快照。
+    #[cfg(feature = "plugins")]
+    command_snapshot: Option<CommandSnapshot>,
+    /// 当前命令预览中的选中项。
+    #[cfg(feature = "plugins")]
+    command_selection: usize,
+    /// 用户按 Esc 后临时隐藏当前输入对应的命令预览。
+    #[cfg(feature = "plugins")]
+    command_preview_hidden: bool,
+    /// 最近一次会话摘要查询任务；新输入会中止尚未完成的旧查询。
+    #[cfg(feature = "plugins")]
+    command_query_task: Option<tokio::task::JoinHandle<()>>,
+    /// 控制运行期命令快照低频刷新。
+    #[cfg(feature = "plugins")]
+    command_snapshot_tick: u8,
+    /// 防止同一时间存在多个命令快照请求。
+    #[cfg(feature = "plugins")]
+    command_snapshot_refreshing: bool,
+    /// 当前输入可展示并选择的参数候选。
+    #[cfg(feature = "plugins")]
+    command_completion: Option<ResolvedCommandCompletion>,
+    /// 正在运行的显式参数候选请求；输入变化时会中止。
+    #[cfg(feature = "plugins")]
+    command_completion_task: Option<tokio::task::JoinHandle<()>>,
+    /// 参数候选请求是否尚未返回。
+    #[cfg(feature = "plugins")]
+    command_completion_loading: bool,
+    /// 用于丢弃取消后仍到达的过期参数候选。
+    #[cfg(feature = "plugins")]
+    command_completion_generation: u64,
 }
 
 /// 主 TUI 为单个插件视图维护的运行时状态。
@@ -740,9 +1278,12 @@ impl App {
         let session_record = SessionRecord::new(SessionId::generate(), Session::new())
             .expect("创建进程内默认会话记录");
         Self {
+            workspace: WorkspaceContext::capture().expect("当前工作目录应可用"),
             messages: Vec::new(),
             input: String::new(),
+            attachments: Vec::new(),
             queued_inputs: VecDeque::new(),
+            queued_run_active: false,
             cursor: 0,
             running: false,
             should_quit: false,
@@ -755,6 +1296,7 @@ impl App {
             scroll: None,
             last_max_scroll: 0,
             context_tokens: None,
+            mouse_capture: true,
             #[cfg(feature = "plugins")]
             plugin_views: Vec::new(),
             #[cfg(feature = "plugins")]
@@ -775,7 +1317,35 @@ impl App {
             plugin_load_error: None,
             #[cfg(feature = "plugins")]
             plugin_failures: Vec::new(),
+            #[cfg(feature = "plugins")]
+            view_stack: ViewStack::default(),
+            #[cfg(feature = "plugins")]
+            command_snapshot: None,
+            #[cfg(feature = "plugins")]
+            command_selection: 0,
+            #[cfg(feature = "plugins")]
+            command_preview_hidden: false,
+            #[cfg(feature = "plugins")]
+            command_query_task: None,
+            #[cfg(feature = "plugins")]
+            command_snapshot_tick: 0,
+            #[cfg(feature = "plugins")]
+            command_snapshot_refreshing: false,
+            #[cfg(feature = "plugins")]
+            command_completion: None,
+            #[cfg(feature = "plugins")]
+            command_completion_task: None,
+            #[cfg(feature = "plugins")]
+            command_completion_loading: false,
+            #[cfg(feature = "plugins")]
+            command_completion_generation: 0,
         }
+    }
+
+    /// 注入主函数启动时捕获的项目上下文。
+    fn with_workspace(mut self, workspace: WorkspaceContext) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     /// 注入启动时加载的持久化记录及其存储实现。
@@ -790,11 +1360,39 @@ impl App {
         self
     }
 
+    /// 用完整记录替换当前会话，并清理只属于旧会话的瞬时界面状态。
+    #[cfg(feature = "plugins")]
+    fn replace_session(&mut self, session_record: SessionRecord, notice: Option<&str>) {
+        self.messages = restore_session_messages(&session_record.session);
+        self.session_record = session_record;
+        self.input.clear();
+        self.attachments.clear();
+        self.cursor = 0;
+        self.queued_inputs.clear();
+        self.streaming_message = None;
+        self.scroll = None;
+        self.context_tokens = None;
+        #[cfg(feature = "plugins")]
+        self.clear_command_completion();
+        if let Some(notice) = notice {
+            self.messages.push(Msg::new(MsgKind::Info, notice));
+        }
+    }
+
+    /// 进入当前项目下尚未持久化的全新空白草稿。
+    #[cfg(feature = "plugins")]
+    fn start_new_draft(&mut self, notice: &str) -> Result<()> {
+        let draft = self.workspace.draft_record()?;
+        self.replace_session(draft, Some(notice));
+        Ok(())
+    }
+
     /// Replaces plugin view state after background activation completes.
     ///
     /// 后台激活完成后替换插件视图状态。
     #[cfg(feature = "plugins")]
     fn set_plugin_views(&mut self, declarations: Vec<UiDeclaration>) {
+        self.view_stack = ViewStack::default();
         self.plugin_views = declarations
             .into_iter()
             .map(|declaration| PluginViewState {
@@ -803,6 +1401,25 @@ impl App {
                 area: Rect::default(),
             })
             .collect();
+    }
+
+    /// 在应用导航栈上执行一次经 Host 标记来源的插件视图请求。
+    #[cfg(feature = "plugins")]
+    fn apply_view_navigation(
+        &mut self,
+        plugin_id: &str,
+        request: UiNavigationRequest,
+    ) -> Result<bool> {
+        let declarations = self
+            .plugin_views
+            .iter()
+            .map(|view| view.declaration.clone())
+            .collect::<Vec<_>>();
+        let changed = self.view_stack.apply(plugin_id, request, &declarations)?;
+        if changed {
+            self.plugin_focus = None;
+        }
+        Ok(changed)
     }
 
     /// Switches the footer from loading to ready using activation event summaries.
@@ -944,9 +1561,267 @@ impl App {
         }
     }
 
+    /// 替换 Command Provider 快照，并重置本地预览状态。
+    #[cfg(feature = "plugins")]
+    fn set_command_snapshot(&mut self, snapshot: Option<CommandSnapshot>) {
+        self.clear_command_completion();
+        self.command_snapshot = snapshot;
+        self.command_selection = 0;
+        self.command_preview_hidden = false;
+    }
+
+    /// 返回与当前斜杠输入匹配的命令定义。
+    #[cfg(feature = "plugins")]
+    fn command_matches(&self) -> Vec<CommandSpec> {
+        if self.command_preview_hidden {
+            return Vec::new();
+        }
+        let Some(body) = self.input.strip_prefix('/') else {
+            return Vec::new();
+        };
+        let prefix = body.split_whitespace().next().unwrap_or_default();
+        let Some(snapshot) = &self.command_snapshot else {
+            return Vec::new();
+        };
+        snapshot
+            .commands
+            .iter()
+            .filter(|command| {
+                command.name.starts_with(prefix)
+                    || command
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.starts_with(prefix))
+            })
+            .take(6)
+            .cloned()
+            .collect()
+    }
+
+    /// 根据用户输入解析当前命令定义，仅用于宿主状态校验和展示。
+    #[cfg(feature = "plugins")]
+    fn command_spec_for_input(&self, input: &str) -> Option<&CommandSpec> {
+        let name = input
+            .trim()
+            .strip_prefix('/')?
+            .split_whitespace()
+            .next()?
+            .to_ascii_lowercase();
+        self.command_snapshot
+            .as_ref()?
+            .commands
+            .iter()
+            .find(|command| {
+                command.name == name || command.aliases.iter().any(|alias| alias == &name)
+            })
+    }
+
+    /// 启动可取消的后台会话摘要查询，并通过 UI 事件返回类型化结果。
+    #[cfg(feature = "plugins")]
+    fn start_command_query(
+        &mut self,
+        request_id: u64,
+        query: String,
+        cursor: Option<String>,
+        limit: u16,
+    ) {
+        if let Some(task) = self.command_query_task.take() {
+            task.abort();
+        }
+        let session_store = Arc::clone(&self.session_store);
+        let active_session_id = self.session_record.id.clone();
+        let tx = self.tx.clone();
+        self.command_query_task = Some(tokio::spawn(async move {
+            // 搜索输入短暂防抖，连续键入只扫描一次项目会话目录。
+            if cursor.is_none() && !query.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            }
+            let status = command_session_page(
+                session_store.as_ref(),
+                &active_session_id,
+                &query,
+                cursor.as_deref(),
+                limit,
+            )
+            .await;
+            let _ = tx.send(UiEvent::CommandSurfaceUpdate { request_id, status });
+        }));
+    }
+
+    /// 在后台低频刷新命令注册表，不让运行期注册或注销阻塞输入线程。
+    #[cfg(feature = "plugins")]
+    fn schedule_command_snapshot_refresh(&mut self, plugin_host: Arc<CompositePluginHost>) {
+        if self.command_snapshot_refreshing
+            || !self
+                .plugin_ids
+                .iter()
+                .any(|plugin_id| plugin_id == PROVIDER_PLUGIN_ID)
+        {
+            return;
+        }
+        self.command_snapshot_refreshing = true;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = load_command_snapshot(plugin_host.as_ref()).await;
+            let _ = tx.send(UiEvent::CommandSnapshotLoaded(Box::new(result)));
+        });
+    }
+
+    /// 清理参数候选并使尚未返回的旧请求失效。
+    #[cfg(feature = "plugins")]
+    fn clear_command_completion(&mut self) {
+        if let Some(task) = self.command_completion_task.take() {
+            task.abort();
+        }
+        self.command_completion = None;
+        self.command_completion_loading = false;
+        self.command_completion_generation = self.command_completion_generation.wrapping_add(1);
+    }
+
+    /// 在后台执行一次显式参数补全请求。
+    #[cfg(feature = "plugins")]
+    fn schedule_command_completion(&mut self, plugin_host: Arc<CompositePluginHost>) {
+        self.clear_command_completion();
+        self.command_completion_loading = true;
+        let generation = self.command_completion_generation;
+        let source_input = self.input.clone();
+        let source_cursor = self.cursor;
+        let session_store = Arc::clone(&self.session_store);
+        let tx = self.tx.clone();
+        self.command_completion_task = Some(tokio::spawn(async move {
+            let result = resolve_command_completion(
+                plugin_host.as_ref(),
+                session_store.as_ref(),
+                source_input,
+                source_cursor,
+            )
+            .await;
+            let _ = tx.send(UiEvent::CommandCompletionLoaded {
+                generation,
+                result: Box::new(result),
+            });
+        }));
+    }
+
+    /// 将当前选中的参数候选写入 Provider 指定的 UTF-8 替换区间。
+    #[cfg(feature = "plugins")]
+    fn apply_selected_command_completion(&mut self) -> bool {
+        let Some(completion) = self.command_completion.as_ref() else {
+            return false;
+        };
+        if completion.source_input != self.input || completion.source_cursor != self.cursor {
+            self.clear_command_completion();
+            return false;
+        }
+        let start = usize::try_from(completion.context.replacement_start).ok();
+        let end = usize::try_from(completion.context.replacement_end).ok();
+        let selected = self
+            .command_selection
+            .min(completion.items.len().saturating_sub(1));
+        let Some((start, end, item)) = start.zip(end).and_then(|(start, end)| {
+            completion
+                .items
+                .get(selected)
+                .map(|item| (start, end, item))
+        }) else {
+            self.clear_command_completion();
+            return false;
+        };
+        if start > end
+            || end > self.input.len()
+            || !self.input.is_char_boundary(start)
+            || !self.input.is_char_boundary(end)
+        {
+            self.clear_command_completion();
+            return false;
+        }
+        let insert_text = item.insert_text.clone();
+        self.input.replace_range(start..end, &insert_text);
+        self.cursor = start + insert_text.len();
+        self.clear_command_completion();
+        self.command_selection = 0;
+        self.command_preview_hidden = false;
+        true
+    }
+
+    /// 在命令预览打开时处理选择、补全与关闭操作。
+    #[cfg(feature = "plugins")]
+    fn handle_command_preview_key(&mut self, code: KeyCode) -> bool {
+        let completion_len = self
+            .command_completion
+            .as_ref()
+            .map(|completion| completion.items.len())
+            .unwrap_or(0);
+        if completion_len > 0 {
+            return match code {
+                KeyCode::Up => {
+                    self.command_selection = self.command_selection.saturating_sub(1);
+                    true
+                }
+                KeyCode::Down => {
+                    self.command_selection =
+                        (self.command_selection + 1).min(completion_len.saturating_sub(1));
+                    true
+                }
+                KeyCode::Tab => self.apply_selected_command_completion(),
+                KeyCode::Esc => {
+                    self.clear_command_completion();
+                    self.command_preview_hidden = true;
+                    true
+                }
+                _ => false,
+            };
+        }
+
+        let matches = self.command_matches();
+        if matches.is_empty() {
+            return false;
+        }
+        match code {
+            KeyCode::Up => {
+                self.command_selection = self.command_selection.saturating_sub(1);
+                true
+            }
+            KeyCode::Down => {
+                self.command_selection =
+                    (self.command_selection + 1).min(matches.len().saturating_sub(1));
+                true
+            }
+            KeyCode::Tab => {
+                let body = self.input.strip_prefix('/').unwrap_or_default();
+                if body.chars().any(char::is_whitespace) {
+                    return false;
+                }
+                let selected = self.command_selection.min(matches.len().saturating_sub(1));
+                self.input = format!("/{} ", matches[selected].name);
+                self.cursor = self.input.len();
+                self.command_selection = 0;
+                true
+            }
+            KeyCode::Esc => {
+                self.command_preview_hidden = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers, agent: Option<&Arc<Agent>>) {
         if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
             self.should_quit = true;
+            return;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('y')) {
+            self.copy_last_assistant_message();
+            return;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('t')) {
+            self.toggle_mouse_capture();
+            return;
+        }
+
+        #[cfg(feature = "plugins")]
+        if self.handle_command_preview_key(code) {
             return;
         }
 
@@ -954,7 +1829,15 @@ impl App {
             KeyCode::Enter => {
                 if let Some(agent) = agent {
                     if self.running {
-                        self.submit_steering(agent);
+                        // steering 只支持纯文本，附件必须等当前回合结束后随消息发送。
+                        if self.attachments.is_empty() {
+                            self.submit_steering(agent);
+                        } else {
+                            self.messages.push(Msg::new(
+                                MsgKind::Info,
+                                "运行中无法发送附件，请等待本轮完成后再提交",
+                            ));
+                        }
                     } else {
                         self.submit(agent);
                     }
@@ -970,25 +1853,55 @@ impl App {
             KeyCode::Char(c) => {
                 self.input.insert(self.cursor, c);
                 self.cursor += c.len_utf8();
+                // 插入可能拆散附件引用标签，同步丢弃失去标签的附件。
+                self.prune_attachments();
+                #[cfg(feature = "plugins")]
+                {
+                    self.clear_command_completion();
+                    self.command_selection = 0;
+                    self.command_preview_hidden = false;
+                }
             }
             KeyCode::Backspace => {
-                if let Some(prev) = self.input[..self.cursor].chars().last() {
-                    self.cursor -= prev.len_utf8();
-                    self.input.remove(self.cursor);
+                // 光标紧跟附件引用标签时整体删除标签与附件。
+                if !self.remove_attachment_before_cursor() {
+                    if let Some(prev) = self.input[..self.cursor].chars().last() {
+                        self.cursor -= prev.len_utf8();
+                        self.input.remove(self.cursor);
+                    }
+                    self.prune_attachments();
+                }
+                #[cfg(feature = "plugins")]
+                {
+                    self.clear_command_completion();
+                    self.command_selection = 0;
+                    self.command_preview_hidden = false;
                 }
             }
             KeyCode::Left => {
                 if let Some(prev) = self.input[..self.cursor].chars().last() {
                     self.cursor -= prev.len_utf8();
                 }
+                #[cfg(feature = "plugins")]
+                self.clear_command_completion();
             }
             KeyCode::Right => {
                 if let Some(next) = self.input[self.cursor..].chars().next() {
                     self.cursor += next.len_utf8();
                 }
+                #[cfg(feature = "plugins")]
+                self.clear_command_completion();
             }
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.len(),
+            KeyCode::Home => {
+                self.cursor = 0;
+                #[cfg(feature = "plugins")]
+                self.clear_command_completion();
+            }
+            KeyCode::End => {
+                self.cursor = self.input.len();
+                #[cfg(feature = "plugins")]
+                self.clear_command_completion();
+            }
             _ => {}
         }
     }
@@ -1000,8 +1913,29 @@ impl App {
             return PluginKeyRoute::Main;
         }
 
+        if self.view_stack.active().is_some() {
+            if matches!(code, KeyCode::Esc) {
+                self.view_stack.pop_for_user();
+                return PluginKeyRoute::Consumed;
+            }
+            let active = self.view_stack.active().expect("子视图已确认存在");
+            return PluginKeyRoute::Input(UiInput {
+                plugin_id: active.plugin_id.clone(),
+                view_id: active.view.view_id.clone(),
+                instance_id: Some(active.view.instance_id.clone()),
+                event: UiInputEvent::Key {
+                    code: plugin_key_code(code),
+                    modifiers: plugin_key_modifiers(modifiers),
+                },
+            });
+        }
+
         if let Some(index) = self.active_dialog_index() {
             return PluginKeyRoute::Input(self.plugin_key_input(index, code, modifiers));
+        }
+
+        if matches!(code, KeyCode::Tab) && self.input.trim_start().starts_with('/') {
+            return PluginKeyRoute::Main;
         }
 
         if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
@@ -1025,6 +1959,21 @@ impl App {
     /// 将插件内容区内的鼠标事件转换为相对坐标，并在点击插件外区域时恢复主输入焦点。
     #[cfg(feature = "plugins")]
     fn route_plugin_mouse(&mut self, mouse: &MouseEvent) -> Option<UiInput> {
+        if let Some(active) = self.view_stack.active() {
+            if !point_in_rect(mouse.column, mouse.row, active.area) {
+                return None;
+            }
+            return Some(UiInput {
+                plugin_id: active.plugin_id.clone(),
+                view_id: active.view.view_id.clone(),
+                instance_id: Some(active.view.instance_id.clone()),
+                event: UiInputEvent::Mouse {
+                    kind: plugin_mouse_kind(mouse.kind),
+                    x: mouse.column.saturating_sub(active.area.x),
+                    y: mouse.row.saturating_sub(active.area.y),
+                },
+            });
+        }
         let active_dialog = self.active_dialog_index();
         let target = active_dialog.or_else(|| {
             self.plugin_views
@@ -1052,6 +2001,7 @@ impl App {
         Some(UiInput {
             plugin_id: view.declaration.plugin_id.clone(),
             view_id: view.declaration.view_id.clone(),
+            instance_id: None,
             event: UiInputEvent::Mouse {
                 kind: plugin_mouse_kind(mouse.kind),
                 x: mouse.column.saturating_sub(view.area.x),
@@ -1067,6 +2017,7 @@ impl App {
         UiInput {
             plugin_id: declaration.plugin_id.clone(),
             view_id: declaration.view_id.clone(),
+            instance_id: None,
             event: UiInputEvent::Key {
                 code: plugin_key_code(code),
                 modifiers: plugin_key_modifiers(modifiers),
@@ -1126,12 +2077,15 @@ impl App {
     fn plugin_render_requests(&mut self) -> Vec<UiRenderRequest> {
         self.plugin_frame = self.plugin_frame.wrapping_add(1);
         let active_dialog = self.active_dialog_index();
-        self.plugin_views
+        let mut requests = self
+            .plugin_views
             .iter()
             .enumerate()
+            .filter(|(_, view)| view.declaration.placement != UiPlacement::Subview)
             .map(|(index, view)| UiRenderRequest {
                 plugin_id: view.declaration.plugin_id.clone(),
                 view_id: view.declaration.view_id.clone(),
+                instance_id: None,
                 width: if view.area.width == 0 {
                     view.declaration
                         .size
@@ -1151,12 +2105,61 @@ impl App {
                 focused: active_dialog == Some(index) || self.plugin_focus == Some(index),
                 frame: self.plugin_frame,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if let Some(active) = self
+            .view_stack
+            .active()
+            .filter(|active| !active.area.is_empty())
+        {
+            requests.push(UiRenderRequest {
+                plugin_id: active.plugin_id.clone(),
+                view_id: active.view.view_id.clone(),
+                instance_id: Some(active.view.instance_id.clone()),
+                width: active.area.width.max(1),
+                height: active.area.height.max(1),
+                focused: true,
+                frame: self.plugin_frame,
+            });
+        }
+        requests
+    }
+
+    /// 构造周期刷新请求，并跳过由用户操作定向刷新的隐藏 Command Dialog。
+    #[cfg(feature = "plugins")]
+    fn periodic_plugin_render_requests(&mut self) -> Vec<UiRenderRequest> {
+        let command_dialog_hidden = self.plugin_views.iter().any(|view| {
+            view.declaration.plugin_id == PROVIDER_PLUGIN_ID
+                && view.declaration.view_id == SESSION_DIALOG_VIEW
+                && view.frame.as_ref().is_some_and(|frame| !frame.visible)
+        });
+        let mut requests = self.plugin_render_requests();
+        if command_dialog_hidden {
+            requests.retain(|request| {
+                request.plugin_id != PROVIDER_PLUGIN_ID || request.view_id != SESSION_DIALOG_VIEW
+            });
+        }
+        requests
     }
 
     /// 用插件返回的新帧更新对应视图缓存。
     #[cfg(feature = "plugins")]
-    fn update_plugin_frame(&mut self, plugin_id: &str, frame: PluginUiFrame) {
+    fn update_plugin_frame(
+        &mut self,
+        plugin_id: &str,
+        instance_id: Option<&str>,
+        frame: PluginUiFrame,
+    ) {
+        if let Some(instance_id) = instance_id {
+            if let Some(active) = self.view_stack.active_mut() {
+                if active.plugin_id == plugin_id
+                    && active.view.view_id == frame.view_id
+                    && active.view.instance_id == instance_id
+                {
+                    active.frame = Some(frame);
+                }
+            }
+            return;
+        }
         if let Some(view) = self.plugin_views.iter_mut().find(|view| {
             view.declaration.plugin_id == plugin_id && view.declaration.view_id == frame.view_id
         }) {
@@ -1172,9 +2175,16 @@ impl App {
 
     /// 将单个插件的运行时 UI 错误限制在对应视图内展示。
     #[cfg(feature = "plugins")]
-    fn set_plugin_ui_error(&mut self, plugin_id: &str, view_id: &str, error: &anyhow::Error) {
+    fn set_plugin_ui_error(
+        &mut self,
+        plugin_id: &str,
+        view_id: &str,
+        instance_id: Option<&str>,
+        error: &anyhow::Error,
+    ) {
         self.update_plugin_frame(
             plugin_id,
+            instance_id,
             PluginUiFrame {
                 view_id: view_id.to_string(),
                 visible: true,
@@ -1209,49 +2219,218 @@ impl App {
         }
     }
 
+    /// 处理终端粘贴：单个存在的文件路径转为附件，其余内容压平为单行插入光标处。
+    fn handle_paste(&mut self, pasted: &str) {
+        if let Some(path) = pasted_file_path(pasted) {
+            self.attach_file(&path);
+            return;
+        }
+        // 输入框为单行编辑器，换行和制表符统一替换为空格。
+        let text: String = pasted
+            .chars()
+            .map(|c| {
+                if matches!(c, '\n' | '\r' | '\t') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        if text.is_empty() {
+            return;
+        }
+        self.input.insert_str(self.cursor, &text);
+        self.cursor += text.len();
+        #[cfg(feature = "plugins")]
+        {
+            self.clear_command_completion();
+            self.command_selection = 0;
+            self.command_preview_hidden = false;
+        }
+    }
+
+    /// 读取文件并加入待发送附件，同时在光标处插入引用标签。
+    ///
+    /// 读取失败或超过 [`MAX_ATTACHMENT_BYTES`] 时追加错误消息，不修改输入。
+    fn attach_file(&mut self, path: &Path) {
+        use base64::Engine;
+
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.messages.push(Msg::new(
+                    MsgKind::Error,
+                    format!("读取附件失败（{}）：{error}", path.display()),
+                ));
+                return;
+            }
+        };
+        if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
+            self.messages.push(Msg::new(
+                MsgKind::Error,
+                format!(
+                    "附件超过 {} MiB 上限：{}",
+                    MAX_ATTACHMENT_BYTES / 1024 / 1024,
+                    path.display()
+                ),
+            ));
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "attachment".to_string());
+        let (media_type, is_image) = attachment_media_type(path, &bytes);
+        let label = self.next_attachment_label(&name, is_image);
+        self.attachments.push(PendingAttachment {
+            label: label.clone(),
+            name,
+            media_type,
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            is_image,
+        });
+        let clip = format!("{label} ");
+        self.input.insert_str(self.cursor, &clip);
+        self.cursor += clip.len();
+    }
+
+    /// 生成不与现有附件冲突的引用标签：图片使用递增序号，文件使用文件名。
+    fn next_attachment_label(&self, name: &str, is_image: bool) -> String {
+        let taken = |label: &str| self.attachments.iter().any(|a| a.label == label);
+        if is_image {
+            let mut index = self.attachments.iter().filter(|a| a.is_image).count() + 1;
+            loop {
+                let label = format!("[Image#{index}]");
+                if !taken(&label) {
+                    return label;
+                }
+                index += 1;
+            }
+        }
+        let base = format!("[FILE#{name}]");
+        if !taken(&base) {
+            return base;
+        }
+        let mut index = 2;
+        loop {
+            let label = format!("[FILE#{name}#{index}]");
+            if !taken(&label) {
+                return label;
+            }
+            index += 1;
+        }
+    }
+
+    /// 丢弃引用标签已不在输入文本中的附件，保持标签与附件一一对应。
+    fn prune_attachments(&mut self) {
+        if self.attachments.is_empty() {
+            return;
+        }
+        let input = &self.input;
+        self.attachments.retain(|a| input.contains(&a.label));
+    }
+
+    /// 光标紧跟附件引用标签时整体删除标签及对应附件，返回是否命中。
+    fn remove_attachment_before_cursor(&mut self) -> bool {
+        let prefix = &self.input[..self.cursor];
+        let Some(index) = self
+            .attachments
+            .iter()
+            .position(|a| prefix.ends_with(&a.label))
+        else {
+            return false;
+        };
+        let start = self.cursor - self.attachments[index].label.len();
+        self.input.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.attachments.remove(index);
+        true
+    }
+
+    /// 复制最近一条助手回复原文（Markdown）到系统剪贴板。
+    fn copy_last_assistant_message(&mut self) {
+        let Some(text) = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.kind, MsgKind::Assistant) && !m.text.is_empty())
+            .map(|m| m.text.clone())
+        else {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "没有可复制的助手回复"));
+            return;
+        };
+        match copy_to_clipboard(&text) {
+            Ok(()) => self
+                .messages
+                .push(Msg::new(MsgKind::Info, "已复制最近一条回复到剪贴板")),
+            Err(error) => self
+                .messages
+                .push(Msg::new(MsgKind::Error, format!("复制失败：{error}"))),
+        }
+    }
+
+    /// 切换鼠标捕获：暂停后终端可用原生选择复制任意消息文本，恢复后支持滚轮滚动。
+    fn toggle_mouse_capture(&mut self) {
+        let result = if self.mouse_capture {
+            crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)
+        } else {
+            crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)
+        };
+        if result.is_err() {
+            return;
+        }
+        self.mouse_capture = !self.mouse_capture;
+        let notice = if self.mouse_capture {
+            "已恢复鼠标捕获与滚轮滚动"
+        } else {
+            "已暂停鼠标捕获：现在可用鼠标选择并复制文本，Ctrl+T 恢复"
+        };
+        self.messages.push(Msg::new(MsgKind::Info, notice));
+    }
+
     /// Takes and clears the current editor value, returning `None` for blank input.
     ///
-    /// 取出并清空当前编辑器内容；空白输入返回 `None`。
+    /// 取出并清空当前编辑器内容；空白输入返回 `None`。斜杠命令等纯文本路径
+    /// 不携带附件，残留附件一并清除，避免引用标签消失后附件悬挂。
     fn take_input(&mut self) -> Option<String> {
         let input = self.input.trim().to_string();
         self.input.clear();
+        self.attachments.clear();
         self.cursor = 0;
+        #[cfg(feature = "plugins")]
+        self.clear_command_completion();
         (!input.is_empty()).then_some(input)
     }
 
-    /// Handles commands that do not require a ready Agent and reports whether input was consumed.
-    ///
-    /// 处理无需 Agent 就绪的本地命令，并返回输入是否已被消费。
-    fn handle_local_command(&mut self, input: &str) -> bool {
-        match input {
-            "/quit" | "/exit" => {
-                self.should_quit = true;
-                true
-            }
-            "/clear" => {
-                self.session_record.session = Session::new();
-                self.messages.clear();
-                self.queued_inputs.clear();
-                self.streaming_message = None;
-                self.messages.push(Msg::new(MsgKind::Info, "会话已清空"));
-                true
-            }
-            _ => false,
+    /// 取出并清空当前输入与附件；文本和附件都为空时返回 `None`。
+    fn take_submission(&mut self) -> Option<UserSubmission> {
+        let text = self.input.trim().to_string();
+        let attachments = std::mem::take(&mut self.attachments);
+        self.input.clear();
+        self.cursor = 0;
+        #[cfg(feature = "plugins")]
+        self.clear_command_completion();
+        if text.is_empty() && attachments.is_empty() {
+            return None;
         }
+        Some(UserSubmission { text, attachments })
     }
 
     /// Queues one complete input while plugin loading keeps the Agent unavailable.
     ///
     /// 插件加载导致 Agent 尚不可用时，将一条完整输入加入 FIFO 队列。
     fn queue_input_until_ready(&mut self) {
-        let Some(input) = self.take_input() else {
-            return;
-        };
-        if self.handle_local_command(&input) {
+        // 斜杠命令必须等待官方插件完成加载，不能误入 Agent 消息队列。
+        if self.input.trim_start().starts_with('/') {
             return;
         }
-        self.messages.push(Msg::new(MsgKind::User, input.clone()));
-        self.queued_inputs.push_back(input);
+        let Some(submission) = self.take_submission() else {
+            return;
+        };
+        self.messages
+            .push(Msg::new(MsgKind::User, submission.text.clone()));
+        self.queued_inputs.push_back(submission);
         self.scroll = None;
     }
 
@@ -1272,21 +2451,25 @@ impl App {
     ///
     /// 将当前编辑器内容立即提交给已就绪的 Agent。
     fn submit(&mut self, agent: &Arc<Agent>) {
-        let Some(input) = self.take_input() else {
+        let Some(submission) = self.take_submission() else {
             return;
         };
-        if self.handle_local_command(&input) {
-            return;
-        }
-        self.start_input_run(agent, input, true);
+        self.queued_run_active = false;
+        self.start_input_run(agent, submission, true);
     }
 
     /// Starts one Agent run and optionally appends the user message to the visible history.
     ///
     /// 启动一次 Agent 运行，并按需把用户消息追加到可见历史。
-    fn start_input_run(&mut self, agent: &Arc<Agent>, input: String, show_user_message: bool) {
+    fn start_input_run(
+        &mut self,
+        agent: &Arc<Agent>,
+        submission: UserSubmission,
+        show_user_message: bool,
+    ) {
         if show_user_message {
-            self.messages.push(Msg::new(MsgKind::User, input.clone()));
+            self.messages
+                .push(Msg::new(MsgKind::User, submission.text.clone()));
         }
         self.running = true;
         self.streaming_message = None;
@@ -1302,7 +2485,7 @@ impl App {
                 agent.as_ref(),
                 session_store.as_ref(),
                 session_record,
-                &input,
+                submission,
             )
             .await;
             let _ = tx.send(UiEvent::AgentDone(Box::new(result)));
@@ -1316,8 +2499,9 @@ impl App {
         if self.running {
             return;
         }
-        if let Some(input) = self.queued_inputs.pop_front() {
-            self.start_input_run(agent, input, false);
+        if let Some(submission) = self.queued_inputs.front().cloned() {
+            self.queued_run_active = true;
+            self.start_input_run(agent, submission, false);
         }
     }
 
@@ -1343,71 +2527,205 @@ impl App {
         }
     }
 
-    /// 完成 Agent 运行，用最终文本校准流式消息并保存会话；保留用户当前滚动位置。
-    fn handle_agent_done(&mut self, result: Result<(AgentRun, SessionRecord)>) {
+    /// 完成 Agent 运行，以完整 Session 校准界面，并返回是否可自动推进 FIFO。
+    fn handle_agent_done(&mut self, completion: AgentCompletion) -> bool {
+        let AgentCompletion {
+            run,
+            session_record,
+            error,
+            input_committed,
+            queue_may_advance,
+            input,
+        } = completion;
         self.running = false;
-        match result {
-            Ok((run, saved_record)) => {
-                let text = if run.final_text.trim().is_empty() {
-                    "（模型返回了空回复）".to_string()
-                } else {
-                    run.final_text.clone()
-                };
-                if let Some(index) = self.streaming_message.take() {
-                    if let Some(message) = self.messages.get_mut(index) {
-                        message.text = text;
-                    }
-                } else {
-                    self.messages.push(Msg::new(MsgKind::Assistant, text));
-                }
-                if !run.usage.is_empty() {
-                    self.messages.push(Msg::new(
-                        MsgKind::Info,
-                        format!(
-                            "↑{} ↓{} Σ{} tokens · {} 步",
-                            run.usage.input_tokens.unwrap_or(0),
-                            run.usage.output_tokens.unwrap_or(0),
-                            run.usage.total_tokens.unwrap_or(0),
-                            run.steps_used,
-                        ),
-                    ));
-                }
-                self.session_record = saved_record;
+        let queued_run = std::mem::take(&mut self.queued_run_active);
+        if queued_run && input_committed {
+            let committed_input = self
+                .queued_inputs
+                .pop_front()
+                .expect("队列运行必须对应一个 FIFO 输入");
+            debug_assert_eq!(committed_input, input);
+        }
+
+        if input_committed {
+            self.session_record = session_record;
+            self.messages = restore_session_messages(&self.session_record.session);
+            self.messages.extend(
+                self.queued_inputs
+                    .iter()
+                    .map(|pending| Msg::new(MsgKind::User, pending.text.clone())),
+            );
+        } else {
+            // 队列首存失败时保留原队列和已展示顺序，等待后续重试同一队首。
+            if !queued_run && self.input.is_empty() && self.attachments.is_empty() {
+                self.input = input.text.clone();
+                self.cursor = self.input.len();
+                self.attachments = input.attachments.clone();
             }
-            Err(e) => {
-                self.streaming_message = None;
-                self.messages.push(Msg::new(MsgKind::Error, e.to_string()));
+            if !queued_run
+                && self.messages.last().is_some_and(|message| {
+                    matches!(message.kind, MsgKind::User) && message.text == input.text
+                })
+            {
+                self.messages.pop();
             }
         }
+
+        self.streaming_message = None;
+        if let Some(run) = run {
+            if !run.usage.is_empty() {
+                self.messages.push(Msg::new(
+                    MsgKind::Info,
+                    format!(
+                        "↑{} ↓{} Σ{} tokens · {} 步",
+                        run.usage.input_tokens.unwrap_or(0),
+                        run.usage.output_tokens.unwrap_or(0),
+                        run.usage.total_tokens.unwrap_or(0),
+                        run.steps_used,
+                    ),
+                ));
+            }
+        }
+        if let Some(error) = error {
+            self.messages
+                .push(Msg::new(MsgKind::Error, error.to_string()));
+        }
+        queue_may_advance
     }
 }
 
-/// 在当前已确认会话上运行一轮 Agent，并以原 revision 执行 CAS 保存。
+/// 判断回读记录是否包含一次 save 尝试的同一业务 payload。
 ///
-/// 只有 Agent 和存储均成功时才返回新记录。调用方应在错误时继续持有传入记录，
-/// 避免把未完成或未持久化的会话暴露为当前状态。
+/// 存储成功时会自行更新 revision 与更新时间，因此这两个规范化字段不参与比较。
+fn session_record_payload_matches(stored: &SessionRecord, attempted: &SessionRecord) -> bool {
+    stored.schema_version == attempted.schema_version
+        && stored.id == attempted.id
+        && stored.created_at_ms == attempted.created_at_ms
+        && stored.title == attempted.title
+        && stored.metadata == attempted.metadata
+        && stored.session == attempted.session
+}
+
+/// 保存记录，并通过同 ID 回读协调“已写入但返回错误”的不确定提交。
+async fn save_session_record_reconciled(
+    session_store: &dyn SessionStore,
+    record: SessionRecord,
+    expected_revision: Option<u64>,
+) -> Result<SessionRecord, SessionStoreError> {
+    match session_store.save(record.clone(), expected_revision).await {
+        Ok(saved) => Ok(saved),
+        Err(error) => match session_store.load(&record.id).await {
+            Ok(Some(stored)) if session_record_payload_matches(&stored, &record) => Ok(stored),
+            _ => Err(error),
+        },
+    }
+}
+
+/// 先保存用户输入，再运行 Agent 并保存完整回复。
+///
+/// save 返回错误时先回读并协调可能已经落盘的不确定提交。确认未落盘后，最终保存失败
+/// 才会分叉完整 Session；分叉也失败则返回 dirty 完成态，避免从旧记录继续。
 async fn run_and_persist(
     agent: &Agent,
     session_store: &dyn SessionStore,
     mut session_record: SessionRecord,
-    input: &str,
-) -> Result<(AgentRun, SessionRecord)> {
+    input: impl Into<UserSubmission>,
+) -> AgentCompletion {
+    let submission: UserSubmission = input.into();
     let expected_revision = (session_record.revision > 0).then_some(session_record.revision);
-    let run = if session_record.session.messages().is_empty() {
-        agent.run(input).await?
-    } else {
-        agent
-            .run_continue(session_record.session.clone(), input)
-            .await?
-    };
-    session_record.session = run.session.clone();
+    session_record.session =
+        agent.prepare_session_blocks(session_record.session.clone(), submission.blocks());
     if session_record.title.is_none() {
-        session_record.title = session_title(input);
+        // 纯附件输入没有可用文本时，用首个附件引用标签作为会话标题。
+        session_record.title = session_title(&submission.text)
+            .or_else(|| submission.attachments.first().map(|a| a.label.clone()));
     }
-    let saved_record = session_store
-        .save(session_record, expected_revision)
-        .await?;
-    Ok((run, saved_record))
+    let committed_record = match save_session_record_reconciled(
+        session_store,
+        session_record.clone(),
+        expected_revision,
+    )
+    .await
+    {
+        Ok(record) => record,
+        Err(error) => {
+            return AgentCompletion {
+                run: None,
+                session_record,
+                error: Some(error.into()),
+                input_committed: false,
+                queue_may_advance: false,
+                input: submission,
+            };
+        }
+    };
+
+    let run = match agent.run_session(committed_record.session.clone()).await {
+        Ok(run) => run,
+        Err(error) => {
+            return AgentCompletion {
+                run: None,
+                session_record: committed_record,
+                error: Some(error),
+                input_committed: true,
+                queue_may_advance: true,
+                input: submission,
+            };
+        }
+    };
+
+    let mut completed_record = committed_record.clone();
+    completed_record.session = run.session.clone();
+    match save_session_record_reconciled(
+        session_store,
+        completed_record.clone(),
+        Some(committed_record.revision),
+    )
+    .await
+    {
+        Ok(saved_record) => AgentCompletion {
+            run: Some(run),
+            session_record: saved_record,
+            error: None,
+            input_committed: true,
+            queue_may_advance: true,
+            input: submission,
+        },
+        Err(save_error) => {
+            let fork_result =
+                match SessionRecord::new(SessionId::generate(), completed_record.session.clone()) {
+                    Ok(mut fork_record) => {
+                        fork_record.title = completed_record.title.clone();
+                        fork_record.metadata = completed_record.metadata.clone();
+                        save_session_record_reconciled(session_store, fork_record, None).await
+                    }
+                    Err(error) => Err(error),
+                };
+            match fork_result {
+                Ok(fork_record) => AgentCompletion {
+                    run: Some(run),
+                    error: Some(anyhow!(
+                        "原会话的模型回复保存失败（{save_error}），完整回复已分叉保存为会话 {}",
+                        fork_record.id
+                    )),
+                    session_record: fork_record,
+                    input_committed: true,
+                    queue_may_advance: true,
+                    input: submission,
+                },
+                Err(fork_error) => AgentCompletion {
+                    run: Some(run),
+                    session_record: completed_record,
+                    error: Some(anyhow!(
+                        "模型回复未能保存：{save_error}；分叉保存也失败：{fork_error}。完整回复已保留在当前内存会话中"
+                    )),
+                    input_committed: true,
+                    queue_may_advance: false,
+                    input: submission,
+                },
+            }
+        }
+    }
 }
 
 /// 判断插件视图是否已经返回可见帧。
@@ -1454,8 +2772,8 @@ fn plugin_key_code(code: KeyCode) -> String {
         KeyCode::Down => "down".into(),
         KeyCode::Home => "home".into(),
         KeyCode::End => "end".into(),
-        KeyCode::PageUp => "page_up".into(),
-        KeyCode::PageDown => "page_down".into(),
+        KeyCode::PageUp => "pageup".into(),
+        KeyCode::PageDown => "pagedown".into(),
         KeyCode::Tab => "tab".into(),
         KeyCode::BackTab => "back_tab".into(),
         KeyCode::Delete => "delete".into(),
@@ -1487,7 +2805,7 @@ fn plugin_key_modifiers(modifiers: KeyModifiers) -> Vec<String> {
 fn default_plugin_width(placement: UiPlacement) -> u16 {
     match placement {
         UiPlacement::Left | UiPlacement::Right => 28,
-        UiPlacement::Dialog => 60,
+        UiPlacement::Dialog | UiPlacement::Subview => 60,
         UiPlacement::Top | UiPlacement::Bottom => 40,
     }
 }
@@ -1497,7 +2815,7 @@ fn default_plugin_width(placement: UiPlacement) -> u16 {
 fn default_plugin_height(placement: UiPlacement) -> u16 {
     match placement {
         UiPlacement::Top | UiPlacement::Bottom => 6,
-        UiPlacement::Dialog => 20,
+        UiPlacement::Dialog | UiPlacement::Subview => 20,
         UiPlacement::Left | UiPlacement::Right => 10,
     }
 }
@@ -1572,6 +2890,22 @@ impl EventSink for ChannelEventSink {
                 let _ = self.0.send(UiEvent::FollowUpInjected);
             }
             AgentEventKind::Extension => {
+                #[cfg(feature = "plugins")]
+                if event.payload.get("name").and_then(Value::as_str) == Some(UI_NAVIGATION_EVENT) {
+                    let plugin_id = event
+                        .payload
+                        .pointer("/source/id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("视图导航事件缺少可信插件来源"))?;
+                    let request = serde_json::from_value::<UiNavigationRequest>(
+                        event.payload.get("data").cloned().unwrap_or(Value::Null),
+                    )?;
+                    let _ = self.0.send(UiEvent::ViewNavigation {
+                        plugin_id: plugin_id.to_string(),
+                        request,
+                    });
+                    return Ok(());
+                }
                 let presentation = event.payload.get("presentation");
                 let target = presentation
                     .and_then(|value| value.get("target"))
@@ -1614,38 +2948,52 @@ impl EventSink for ChannelEventSink {
 
 // ─── 渲染 ───
 
-/// 渲染完整界面，并同步当前对话区的最大滚动位置。
-fn render(frame: &mut Frame, app: &mut App) {
-    #[cfg(feature = "plugins")]
-    for view in &mut app.plugin_views {
-        view.area = Rect::default();
-    }
-    let outer = frame.area().inner(Margin {
-        horizontal: 1,
-        vertical: 0,
-    });
-    #[cfg(feature = "plugins")]
-    let workspace = render_docked_plugin_views(frame, app, outer);
-    #[cfg(not(feature = "plugins"))]
-    let workspace = outer;
-    render_main(frame, app, workspace);
-    #[cfg(feature = "plugins")]
-    render_plugin_dialog(frame, app, outer);
-}
-
 /// 在插件占用后的中心区域渲染 Lucia 主界面。
 fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     // Keep the input and footer compact so the released status row returns to the chat viewport.
     // 输入区与底栏保持紧凑，将释放的插件状态行归还给对话视口。
+    #[cfg(feature = "plugins")]
+    let command_matches = if workspace.height >= 10 {
+        app.command_matches()
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "plugins")]
+    let command_preview_items = app
+        .command_completion
+        .as_ref()
+        .map(|completion| completion.items.len())
+        .unwrap_or(command_matches.len())
+        .min(6);
+    #[cfg(feature = "plugins")]
+    let command_preview_height = if app.command_preview_hidden || command_preview_items == 0 {
+        0
+    } else {
+        u16::try_from(command_preview_items + 2).unwrap_or(8)
+    };
+    #[cfg(feature = "plugins")]
+    let sections = Layout::vertical([
+        Constraint::Min(4),
+        Constraint::Length(command_preview_height),
+        Constraint::Length(2),
+        Constraint::Length(1),
+    ])
+    .split(workspace);
+    #[cfg(not(feature = "plugins"))]
     let sections = Layout::vertical([
         Constraint::Min(4),
         Constraint::Length(2),
         Constraint::Length(1),
     ])
     .split(workspace);
+    #[cfg(feature = "plugins")]
+    let (chat_section, command_section, input_section, footer_section) =
+        (sections[0], sections[1], sections[2], sections[3]);
+    #[cfg(not(feature = "plugins"))]
+    let (chat_section, input_section, footer_section) = (sections[0], sections[1], sections[2]);
 
     // 消息流不使用容器边框，宽屏下由居中工作区控制阅读长度。
-    let chat_area = sections[0].inner(Margin {
+    let chat_area = chat_section.inner(Margin {
         horizontal: 1,
         vertical: 1,
     });
@@ -1686,8 +3034,13 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         .scroll((scroll, 0));
     frame.render_widget(chat, chat_area);
 
+    #[cfg(feature = "plugins")]
+    if command_preview_height > 0 {
+        render_command_preview(frame, app, command_section, &command_matches);
+    }
+
     // 输入区仅保留顶部规则线，形成稳定的底部命令栏。
-    let input_area = sections[1];
+    let input_area = input_section;
     #[cfg(feature = "plugins")]
     let agent_waiting = app.plugins_loading;
     #[cfg(not(feature = "plugins"))]
@@ -1733,11 +3086,10 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             frame.set_cursor_position((input_inner.x + 2, input_inner.y));
         }
     } else {
-        let input_widget = Paragraph::new(Line::from(vec![
-            Span::styled("› ", Style::new().fg(input_color).bold()),
-            Span::styled(app.input.as_str(), Style::new().fg(COLOR_TEXT)),
-        ]))
-        .block(input_block);
+        // 附件引用标签（如 [Image#1]）以高亮 clip 样式区别于普通文本。
+        let mut spans = vec![Span::styled("› ", Style::new().fg(input_color).bold())];
+        spans.extend(input_ref_spans(&app.input, &app.attachments));
+        let input_widget = Paragraph::new(Line::from(spans)).block(input_block);
         frame.render_widget(input_widget, input_area);
         // 使用显示宽度定位光标，确保中文等全角字符不会造成偏移。
         let cursor_width = unicode_width::UnicodeWidthStr::width(&app.input[..app.cursor]) as u16;
@@ -1747,9 +3099,7 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     }
 
     // 底部信息行：模型、工作目录与当前上下文 token 数，窄终端时隐藏目录。
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "?".into());
+    let cwd = app.workspace.cwd.display().to_string();
     let cwd_display = match std::env::var("HOME") {
         Ok(home) if !home.is_empty() => cwd.replacen(&home, "~", 1),
         _ => cwd,
@@ -1785,7 +3135,7 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             Span::styled(format!("ctx {tokens}"), Style::new().fg(COLOR_MUTED)),
         ]);
     }
-    let footer_area = sections[2];
+    let footer_area = footer_section;
     #[cfg(feature = "plugins")]
     let (metadata_area, plugin_area, plugin_icon, plugin_status, plugin_color) = {
         let (icon, status) = app.plugin_status_content();
@@ -1826,253 +3176,608 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     }
 }
 
-/// 按加载顺序分配四向停靠插槽，并返回剩余的主界面区域。
+/// 渲染内存命令快照中的匹配项和当前选中命令说明。
 #[cfg(feature = "plugins")]
-fn render_docked_plugin_views(frame: &mut Frame, app: &mut App, outer: Rect) -> Rect {
-    let mut remaining = outer;
-    for placement in [
-        UiPlacement::Top,
-        UiPlacement::Bottom,
-        UiPlacement::Left,
-        UiPlacement::Right,
-    ] {
-        let indices: Vec<usize> = app
-            .plugin_views
-            .iter()
-            .enumerate()
-            .filter(|(_, view)| {
-                view.declaration.placement == placement && plugin_view_visible(view)
-            })
-            .map(|(index, _)| index)
-            .collect();
-        for index in indices {
-            let requested = match placement {
-                UiPlacement::Top | UiPlacement::Bottom => app.plugin_views[index]
-                    .declaration
-                    .size
-                    .height
-                    .unwrap_or_else(|| default_plugin_height(placement)),
-                UiPlacement::Left | UiPlacement::Right => app.plugin_views[index]
-                    .declaration
-                    .size
-                    .width
-                    .unwrap_or_else(|| default_plugin_width(placement)),
-                UiPlacement::Dialog => 0,
-            };
-            let (plugin_area, next_remaining) = split_plugin_area(remaining, placement, requested);
-            remaining = next_remaining;
-            if plugin_area.is_empty() {
-                continue;
-            }
-            let focused = app.plugin_focus == Some(index);
-            render_plugin_view(frame, &mut app.plugin_views[index], plugin_area, focused);
-        }
-    }
-    remaining
-}
-
-/// 从剩余区域的一侧切出插件区域，同时为主界面保留最小可用空间。
-#[cfg(feature = "plugins")]
-fn split_plugin_area(area: Rect, placement: UiPlacement, requested: u16) -> (Rect, Rect) {
-    match placement {
-        UiPlacement::Top => {
-            let size = requested.min(area.height.saturating_sub(6));
-            (
-                Rect::new(area.x, area.y, area.width, size),
-                Rect::new(
-                    area.x,
-                    area.y.saturating_add(size),
-                    area.width,
-                    area.height.saturating_sub(size),
-                ),
-            )
-        }
-        UiPlacement::Bottom => {
-            let size = requested.min(area.height.saturating_sub(6));
-            (
-                Rect::new(
-                    area.x,
-                    area.y.saturating_add(area.height.saturating_sub(size)),
-                    area.width,
-                    size,
-                ),
-                Rect::new(area.x, area.y, area.width, area.height.saturating_sub(size)),
-            )
-        }
-        UiPlacement::Left => {
-            let size = requested.min(area.width.saturating_sub(24));
-            (
-                Rect::new(area.x, area.y, size, area.height),
-                Rect::new(
-                    area.x.saturating_add(size),
-                    area.y,
-                    area.width.saturating_sub(size),
-                    area.height,
-                ),
-            )
-        }
-        UiPlacement::Right => {
-            let size = requested.min(area.width.saturating_sub(24));
-            (
-                Rect::new(
-                    area.x.saturating_add(area.width.saturating_sub(size)),
-                    area.y,
-                    size,
-                    area.height,
-                ),
-                Rect::new(area.x, area.y, area.width.saturating_sub(size), area.height),
-            )
-        }
-        UiPlacement::Dialog => (Rect::default(), area),
-    }
-}
-
-/// 渲染一个插件视图并记录去除边框后的实际内容区。
-#[cfg(feature = "plugins")]
-fn render_plugin_view(frame: &mut Frame, view: &mut PluginViewState, area: Rect, focused: bool) {
-    let border_color = if focused {
-        COLOR_BORDER_FOCUS
-    } else {
-        COLOR_MUTED
-    };
-    let block = Block::bordered()
-        .title(format!(" {} ", view.declaration.title))
-        .border_style(Style::new().fg(border_color));
-    let content_area = block.inner(area);
-    view.area = content_area;
-    let lines = view
-        .frame
-        .as_ref()
-        .map(plugin_frame_lines)
-        .unwrap_or_default();
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-    if focused && !content_area.is_empty() {
-        frame.set_cursor_position((content_area.x, content_area.y));
-    }
-}
-
-/// 在主界面之上渲染最后一个可见对话框，并让它优先获得终端光标。
-#[cfg(feature = "plugins")]
-fn render_plugin_dialog(frame: &mut Frame, app: &mut App, outer: Rect) {
-    let Some(index) = app.active_dialog_index() else {
-        return;
-    };
-    let declaration = &app.plugin_views[index].declaration;
-    let width = declaration
-        .size
-        .width
-        .unwrap_or_else(|| default_plugin_width(UiPlacement::Dialog))
-        .min(outer.width.saturating_sub(2));
-    let height = declaration
-        .size
-        .height
-        .unwrap_or_else(|| default_plugin_height(UiPlacement::Dialog))
-        .min(outer.height.saturating_sub(2));
-    let area = Rect::new(
-        outer
-            .x
-            .saturating_add(outer.width.saturating_sub(width) / 2),
-        outer
-            .y
-            .saturating_add(outer.height.saturating_sub(height) / 2),
-        width,
-        height,
-    );
+fn render_command_preview(frame: &mut Frame, app: &App, area: Rect, matches: &[CommandSpec]) {
     if area.is_empty() {
         return;
     }
-    frame.render_widget(Clear, area);
-    render_plugin_view(frame, &mut app.plugin_views[index], area, true);
-}
-
-/// 将插件声明式文本帧转换成 Ratatui 行。
-#[cfg(feature = "plugins")]
-fn plugin_frame_lines(plugin_frame: &PluginUiFrame) -> Vec<Line<'static>> {
-    plugin_frame
-        .lines
-        .iter()
-        .map(|line| {
-            Line::from(
-                line.spans
+    if let Some(completion) = app.command_completion.as_ref() {
+        let visible = completion.items.iter().take(6).collect::<Vec<_>>();
+        if visible.is_empty() {
+            return;
+        }
+        let selected = app.command_selection.min(visible.len().saturating_sub(1));
+        let mut lines = visible
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let selected = index == selected;
+                let marker = if selected { "› " } else { "  " };
+                Line::from(vec![
+                    Span::styled(
+                        marker,
+                        Style::new().fg(if selected { COLOR_USER } else { COLOR_MUTED }),
+                    ),
+                    Span::styled(
+                        item.label.as_str(),
+                        Style::new()
+                            .fg(if selected { COLOR_TEXT } else { COLOR_MUTED })
+                            .bold(),
+                    ),
+                    Span::styled("  ", Style::new()),
+                    Span::styled(
+                        item.description.as_deref().unwrap_or_default(),
+                        Style::new().fg(COLOR_MUTED),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let detail = app
+            .command_snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .commands
                     .iter()
-                    .map(|span| Span::styled(span.text.clone(), plugin_style(&span.style)))
-                    .collect::<Vec<_>>(),
-            )
+                    .find(|command| command.name == completion.context.command)
+            })
+            .and_then(|command| {
+                command
+                    .arguments
+                    .get(usize::from(completion.context.argument_index))
+            })
+            .map(|argument| argument.description.as_str())
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "/{} · {}",
+                    completion.context.command, completion.context.argument
+                ),
+                Style::new().fg(COLOR_BORDER_FOCUS),
+            ),
+            Span::styled("  ", Style::new()),
+            Span::styled(
+                truncate_line(detail, usize::from(area.width.saturating_sub(24).max(1))),
+                Style::new().fg(COLOR_MUTED),
+            ),
+        ]));
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::new()
+                    .borders(Borders::TOP)
+                    .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
+                    .padding(Padding::horizontal(1)),
+            ),
+            area,
+        );
+        return;
+    }
+    if matches.is_empty() {
+        return;
+    }
+    let visible = matches.iter().take(6).collect::<Vec<_>>();
+    let selected = app.command_selection.min(visible.len().saturating_sub(1));
+    let mut lines = visible
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let selected = index == selected;
+            let marker = if selected { "› " } else { "  " };
+            Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::new().fg(if selected { COLOR_USER } else { COLOR_MUTED }),
+                ),
+                Span::styled(
+                    command.display_usage(),
+                    Style::new()
+                        .fg(if selected { COLOR_TEXT } else { COLOR_MUTED })
+                        .bold(),
+                ),
+                Span::styled("  ", Style::new()),
+                Span::styled(command.summary.as_str(), Style::new().fg(COLOR_MUTED)),
+            ])
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let selected_command = visible[selected];
+    let availability = if app.command_completion_loading {
+        "  候选加载中..."
+    } else if app.running && selected_command.availability == CommandAvailability::IdleOnly {
+        "  Agent 运行结束后可用"
+    } else {
+        ""
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            truncate_line(
+                &selected_command.description,
+                usize::from(area.width.saturating_sub(24).max(1)),
+            ),
+            Style::new().fg(COLOR_MUTED),
+        ),
+        Span::styled(availability, Style::new().fg(COLOR_BORDER_FOCUS)),
+    ]));
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::new()
+                .borders(Borders::TOP)
+                .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
+                .padding(Padding::horizontal(1)),
+        ),
+        area,
+    );
 }
 
-/// 将稳定插件样式子集映射到当前 Ratatui 样式。
+/// 调用插件的类型化服务，并统一限制原生 TUI 的等待时间。
 #[cfg(feature = "plugins")]
-fn plugin_style(plugin_style: &UiStyle) -> Style {
-    let mut style = Style::new();
-    if let Some(color) = plugin_style.foreground {
-        style = style.fg(plugin_color(color));
-    }
-    if let Some(color) = plugin_style.background {
-        style = style.bg(plugin_color(color));
-    }
-    if plugin_style.bold {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if plugin_style.italic {
-        style = style.add_modifier(Modifier::ITALIC);
-    }
-    if plugin_style.underlined {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    if plugin_style.reversed {
-        style = style.add_modifier(Modifier::REVERSED);
-    }
-    style
+async fn call_typed_plugin_service<Request, Response>(
+    plugin_host: &dyn PluginHost,
+    caller_id: &str,
+    plugin_id: &str,
+    service: &str,
+    request: &Request,
+) -> Result<Option<Response>>
+where
+    Request: Serialize,
+    Response: DeserializeOwned,
+{
+    let payload = serde_json::to_value(request)
+        .with_context(|| format!("序列化插件服务 `{service}` 请求失败"))?;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        plugin_host.call_service(&PluginServiceCall {
+            caller_id: caller_id.to_string(),
+            plugin_id: plugin_id.to_string(),
+            name: service.to_string(),
+            payload,
+        }),
+    )
+    .await
+    .map_err(|_| anyhow!("插件服务 `{service}` 调用超时"))??;
+    response
+        .map(|value| {
+            serde_json::from_value(value)
+                .with_context(|| format!("解析插件服务 `{service}` 响应失败"))
+        })
+        .transpose()
 }
 
-/// 将插件便携颜色映射到 Ratatui 颜色。
+/// 从官方 Command Provider 读取可在输入热路径中复用的命令快照。
 #[cfg(feature = "plugins")]
-fn plugin_color(color: UiColor) -> Color {
-    match color {
-        UiColor::Black => Color::Black,
-        UiColor::Red => Color::Red,
-        UiColor::Green => Color::Green,
-        UiColor::Yellow => Color::Yellow,
-        UiColor::Blue => Color::Blue,
-        UiColor::Magenta => Color::Magenta,
-        UiColor::Cyan => Color::Cyan,
-        UiColor::White => Color::White,
-        UiColor::Gray => Color::DarkGray,
-    }
+async fn load_command_snapshot(plugin_host: &dyn PluginHost) -> Result<Option<CommandSnapshot>> {
+    call_typed_plugin_service(
+        plugin_host,
+        TUI_COMMAND_CALLER,
+        PROVIDER_PLUGIN_ID,
+        SNAPSHOT_SERVICE,
+        &SnapshotRequest::default(),
+    )
+    .await
 }
 
-/// 异步请求所有插件的新帧，并在主线程绘制前更新缓存。
+/// 按 Provider 计划解析一次显式参数候选请求。
 #[cfg(feature = "plugins")]
-async fn refresh_plugin_views(app: &mut App, plugin_host: &dyn PluginHost) {
-    for request in app.plugin_render_requests() {
-        let plugin_id = request.plugin_id.clone();
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            plugin_host.render_ui(&request),
-        )
-        .await
-        {
-            Ok(Ok(Some(frame))) => app.update_plugin_frame(&plugin_id, frame),
-            Ok(Ok(None)) => {}
-            Ok(Err(error)) => app.set_plugin_ui_error(&plugin_id, &request.view_id, &error),
-            Err(_) => {
-                app.set_plugin_ui_error(&plugin_id, &request.view_id, &anyhow!("插件界面渲染超时"))
+async fn resolve_command_completion(
+    plugin_host: &dyn PluginHost,
+    session_store: &dyn SessionStore,
+    source_input: String,
+    source_cursor: usize,
+) -> Result<Option<ResolvedCommandCompletion>> {
+    let cursor = u32::try_from(source_cursor).context("命令补全光标超出协议范围")?;
+    let response: PrepareCompletionResponse = call_typed_plugin_service(
+        plugin_host,
+        TUI_COMMAND_CALLER,
+        PROVIDER_PLUGIN_ID,
+        PREPARE_COMPLETION_SERVICE,
+        &PrepareCompletionRequest {
+            input: source_input.clone(),
+            cursor: Some(cursor),
+            limit: 6,
+        },
+    )
+    .await?
+    .ok_or_else(|| anyhow!("Command 插件不可用，无法补全参数"))?;
+
+    match response {
+        PrepareCompletionResponse::Candidates { context, items } => Ok(
+            resolved_command_completion(&source_input, source_cursor, context, items),
+        ),
+        PrepareCompletionResponse::Callback {
+            context,
+            owner_plugin_id,
+            service,
+            request,
+        } => {
+            let response: CommandCallbackResponse = call_typed_plugin_service(
+                plugin_host,
+                PROVIDER_PLUGIN_ID,
+                &owner_plugin_id,
+                &service,
+                &request,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("候选提供插件 `{owner_plugin_id}` 不可用"))?;
+            match response {
+                CommandCallbackResponse::Completed { items } => Ok(resolved_command_completion(
+                    &source_input,
+                    source_cursor,
+                    context,
+                    items,
+                )),
+                CommandCallbackResponse::Executed { .. } => {
+                    Err(anyhow!("参数补全回调返回了执行结果"))
+                }
             }
+        }
+        PrepareCompletionResponse::Surface { context, request } => {
+            if request.source != SESSION_COMPLETION_SOURCE {
+                return Err(anyhow!("不支持的命令候选数据源：{}", request.source));
+            }
+            let items = session_completion_items(
+                session_store,
+                &request.request.prefix,
+                request.request.limit,
+            )
+            .await?;
+            Ok(resolved_command_completion(
+                &source_input,
+                source_cursor,
+                context,
+                items,
+            ))
+        }
+        PrepareCompletionResponse::NoMatch => Ok(None),
+        PrepareCompletionResponse::Error { message } => Err(anyhow!(message)),
+    }
+}
+
+/// 构造最多六项的稳定 TUI 参数候选。
+#[cfg(feature = "plugins")]
+fn resolved_command_completion(
+    source_input: &str,
+    source_cursor: usize,
+    context: CompletionContext,
+    mut items: Vec<CompletionItem>,
+) -> Option<ResolvedCommandCompletion> {
+    items.truncate(6);
+    (!items.is_empty()).then(|| ResolvedCommandCompletion {
+        source_input: source_input.to_string(),
+        source_cursor,
+        context,
+        items,
+    })
+}
+
+/// 从当前项目的轻量摘要生成 Session 参数候选。
+#[cfg(feature = "plugins")]
+async fn session_completion_items(
+    session_store: &dyn SessionStore,
+    prefix: &str,
+    limit: u16,
+) -> Result<Vec<CompletionItem>> {
+    let mut summaries = session_store.list_summaries().await?;
+    summaries.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let prefix = prefix.to_lowercase();
+    Ok(summaries
+        .into_iter()
+        .filter(|summary| {
+            prefix.is_empty()
+                || summary.id.as_str().to_lowercase().contains(&prefix)
+                || summary
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| title.to_lowercase().contains(&prefix))
+        })
+        .take(usize::from(limit.clamp(1, 6)))
+        .map(|summary| CompletionItem {
+            label: summary
+                .title
+                .clone()
+                .unwrap_or_else(|| summary.id.to_string()),
+            insert_text: summary.id.to_string(),
+            description: Some(format!(
+                "{} 条消息 · {}",
+                summary.message_count,
+                relative_time_label(summary.updated_at_ms)
+            )),
+        })
+        .collect())
+}
+
+/// 执行 Command Provider 生成的受控计划，并刷新可能变化的命令快照。
+#[cfg(feature = "plugins")]
+async fn execute_command(app: &mut App, plugin_host: &dyn PluginHost, input: String) -> Result<()> {
+    if app.running
+        && app
+            .command_spec_for_input(&input)
+            .is_some_and(|spec| spec.availability == CommandAvailability::IdleOnly)
+    {
+        app.messages
+            .push(Msg::new(MsgKind::Error, "该命令只能在 Agent 空闲时执行"));
+        return Ok(());
+    }
+
+    let response: PrepareExecuteResponse = call_typed_plugin_service(
+        plugin_host,
+        TUI_COMMAND_CALLER,
+        PROVIDER_PLUGIN_ID,
+        PREPARE_EXECUTE_SERVICE,
+        &PrepareExecuteRequest {
+            input,
+            agent_idle: !app.running,
+        },
+    )
+    .await?
+    .ok_or_else(|| anyhow!("Command 插件不可用，无法执行斜杠命令"))?;
+
+    match response {
+        PrepareExecuteResponse::Callback {
+            owner_plugin_id,
+            service,
+            request,
+        } => {
+            let response: CommandCallbackResponse = call_typed_plugin_service(
+                plugin_host,
+                PROVIDER_PLUGIN_ID,
+                &owner_plugin_id,
+                &service,
+                &request,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("命令处理插件 `{owner_plugin_id}` 不可用"))?;
+            match response {
+                CommandCallbackResponse::Executed { result } => {
+                    let content = match result {
+                        Value::Null => "命令执行完成".to_string(),
+                        Value::String(content) => content,
+                        value => serde_json::to_string_pretty(&value)
+                            .context("格式化命令执行结果失败")?,
+                    };
+                    app.messages
+                        .push(Msg::new(MsgKind::Info, truncate_line(&content, 4_000)));
+                }
+                CommandCallbackResponse::Completed { .. } => {
+                    return Err(anyhow!("命令执行回调返回了补全结果"));
+                }
+            }
+        }
+        PrepareExecuteResponse::SurfaceAction { action } => match action {
+            SurfaceAction::NewSession => app.start_new_draft("已新建空白会话")?,
+            SurfaceAction::ClearSession => app.start_new_draft("会话上下文已清空")?,
+            SurfaceAction::CompactSession => compact_current_session(app, plugin_host).await?,
+            SurfaceAction::ExitApplication => app.should_quit = true,
+        },
+        PrepareExecuteResponse::SurfaceOpened { view_id } => {
+            if view_id != SESSION_DIALOG_VIEW {
+                return Err(anyhow!("Command 插件返回了未知界面：{view_id}"));
+            }
+            process_command_surface_effects(app, plugin_host).await?;
+            refresh_plugin_view(app, plugin_host, PROVIDER_PLUGIN_ID, SESSION_DIALOG_VIEW).await;
+        }
+        PrepareExecuteResponse::Output { content } => {
+            app.messages.push(Msg::new(MsgKind::Info, content));
+        }
+        PrepareExecuteResponse::Error { message, usage } => {
+            let content = usage
+                .filter(|usage| !usage.trim().is_empty())
+                .map(|usage| format!("{message}\n用法：{usage}"))
+                .unwrap_or(message);
+            app.messages.push(Msg::new(MsgKind::Error, content));
+        }
+    }
+
+    if let Some(snapshot) = load_command_snapshot(plugin_host).await? {
+        app.set_command_snapshot(Some(snapshot));
+    }
+    Ok(())
+}
+
+/// 立即调用 Context 插件压缩当前 Session，成功持久化后再替换内存与界面状态。
+#[cfg(feature = "plugins")]
+async fn compact_current_session(app: &mut App, plugin_host: &dyn PluginHost) -> Result<()> {
+    let before_session = app.session_record.session.clone();
+    let request = ContextLoadRequest {
+        run_id: format!(
+            "compact:{}:{}",
+            app.session_record.id, app.session_record.revision
+        ),
+        step: 0,
+        provider: "manual".into(),
+        model: app.model_name.clone(),
+        system: before_session.system().cloned(),
+        messages: before_session.model_messages(),
+    };
+    let before_messages = request.messages.len();
+    let loaded: LoadedContext = call_typed_plugin_service(
+        plugin_host,
+        TUI_COMMAND_CALLER,
+        CONTEXT_PLUGIN_ID,
+        CONTEXT_COMPACT_SERVICE,
+        &request,
+    )
+    .await?
+    .ok_or_else(|| anyhow!("Context 插件不可用，无法压缩当前会话"))?;
+
+    if loaded.system == request.system && loaded.messages == request.messages {
+        app.messages
+            .push(Msg::new(MsgKind::Info, "当前会话没有可压缩的历史上下文"));
+        return Ok(());
+    }
+
+    let after_messages = loaded.messages.len();
+    let mut compacted_record = app.session_record.clone();
+    compacted_record.session = Session::from_parts(loaded.system, loaded.messages);
+    let expected_revision = (compacted_record.revision > 0).then_some(compacted_record.revision);
+    let saved = save_session_record_reconciled(
+        app.session_store.as_ref(),
+        compacted_record,
+        expected_revision,
+    )
+    .await?;
+    let notice = format!("上下文已立即压缩：{before_messages} 条消息变为 {after_messages} 条");
+    app.replace_session(saved, Some(&notice));
+    Ok(())
+}
+
+/// 处理 Command 会话界面产生的查询、恢复和关闭动作。
+#[cfg(feature = "plugins")]
+async fn process_command_surface_effects(
+    app: &mut App,
+    plugin_host: &dyn PluginHost,
+) -> Result<()> {
+    // 单次输入最多处理有限轮 effect，避免异常插件使事件循环无法返回。
+    for _ in 0..8 {
+        let response: SurfaceEffectsResponse = call_typed_plugin_service(
+            plugin_host,
+            TUI_COMMAND_CALLER,
+            PROVIDER_PLUGIN_ID,
+            SURFACE_POLL_EFFECTS_SERVICE,
+            &SnapshotRequest::default(),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("Command 插件在会话界面打开后不可用"))?;
+        if response.effects.is_empty() {
+            return Ok(());
+        }
+
+        for effect in response.effects {
+            match effect {
+                SurfaceEffect::QuerySessions {
+                    request_id,
+                    query,
+                    cursor,
+                    limit,
+                } => {
+                    app.start_command_query(request_id, query, cursor, limit);
+                }
+                SurfaceEffect::ResumeSession {
+                    session_id,
+                    revision,
+                } => {
+                    resume_selected_session(app, &session_id, revision).await?;
+                    app.plugin_focus = None;
+                }
+                SurfaceEffect::CloseSurface => app.plugin_focus = None,
+            }
+        }
+    }
+    Err(anyhow!("Command 会话界面产生了过多连续动作"))
+}
+
+/// 读取、过滤并分页当前项目的轻量会话摘要。
+#[cfg(feature = "plugins")]
+async fn command_session_page(
+    session_store: &dyn SessionStore,
+    active_session_id: &SessionId,
+    query: &str,
+    cursor: Option<&str>,
+    limit: u16,
+) -> SessionListStatus {
+    let mut summaries = match session_store.list_summaries().await {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            return SessionListStatus::Error {
+                message: format!("读取会话列表失败：{error}"),
+            };
+        }
+    };
+    let query = query.trim().to_lowercase();
+    summaries.retain(|summary| {
+        query.is_empty()
+            || summary.id.as_str().to_lowercase().contains(&query)
+            || summary
+                .title
+                .as_deref()
+                .is_some_and(|title| title.to_lowercase().contains(&query))
+    });
+    summaries.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let offset = cursor
+        .and_then(|cursor| cursor.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(summaries.len());
+    let page_limit = usize::from(limit.clamp(1, 100));
+    let page_end = offset.saturating_add(page_limit).min(summaries.len());
+    let items = summaries[offset..page_end]
+        .iter()
+        .map(|summary| command_session_summary(active_session_id, summary))
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        SessionListStatus::Empty
+    } else {
+        SessionListStatus::Ready {
+            items,
+            next_cursor: (page_end < summaries.len()).then(|| page_end.to_string()),
         }
     }
 }
 
-/// 向焦点插件发送输入，并限制单次调用阻塞主事件循环的时间。
+/// 将存储层摘要映射为 Command 插件稳定协议。
 #[cfg(feature = "plugins")]
-async fn dispatch_plugin_input(plugin_host: &dyn PluginHost, input: &UiInput) -> Result<()> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        plugin_host.on_ui_input(input),
-    )
-    .await
-    .map_err(|_| anyhow!("插件输入处理超时"))?
+fn command_session_summary(
+    active_session_id: &SessionId,
+    summary: &SessionSummary,
+) -> CommandSessionSummary {
+    CommandSessionSummary {
+        id: summary.id.to_string(),
+        title: summary
+            .title
+            .clone()
+            .unwrap_or_else(|| summary.id.to_string()),
+        preview: String::new(),
+        message_count: u64::try_from(summary.message_count).unwrap_or(u64::MAX),
+        updated_at_ms: summary.updated_at_ms,
+        updated_label: relative_time_label(summary.updated_at_ms),
+        revision: summary.revision,
+        active: &summary.id == active_session_id,
+    }
+}
+
+/// 生成人类可读且无需额外依赖的会话更新时间标签。
+#[cfg(feature = "plugins")]
+fn relative_time_label(updated_at_ms: u64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(updated_at_ms);
+    let elapsed_seconds = now_ms.saturating_sub(updated_at_ms) / 1_000;
+    match elapsed_seconds {
+        0..=59 => "刚刚".into(),
+        60..=3_599 => format!("{} 分钟前", elapsed_seconds / 60),
+        3_600..=86_399 => format!("{} 小时前", elapsed_seconds / 3_600),
+        _ => format!("{} 天前", elapsed_seconds / 86_400),
+    }
+}
+
+/// 在切换前重新读取并校验用户选择的会话修订号。
+#[cfg(feature = "plugins")]
+async fn resume_selected_session(app: &mut App, session_id: &str, revision: u64) -> Result<()> {
+    let id = SessionId::new(session_id)?;
+    let record = app
+        .session_store
+        .load(&id)
+        .await?
+        .ok_or_else(|| anyhow!("会话 `{session_id}` 已不存在"))?;
+    if record.revision != revision {
+        return Err(anyhow!(
+            "会话 `{session_id}` 已更新，请重新打开 /resume 后选择"
+        ));
+    }
+    let notice = format!("已恢复会话 {}", record.id);
+    app.replace_session(record, Some(&notice));
+    Ok(())
 }
 
 // ─── 主函数 ───
@@ -2093,59 +3798,61 @@ fn resolve_tui_path(
     }
 }
 
-/// 按 CLI、最近会话和配置默认值的优先级选择启动会话。
+/// 普通启动创建空白 Draft；只有显式 CLI 参数才恢复已有会话。
 async fn load_startup_session(
     store: &dyn SessionStore,
     cli_session_id: Option<&str>,
-    settings: &TuiSettings,
+    workspace: &WorkspaceContext,
     cli_resume_latest: bool,
 ) -> Result<SessionRecord> {
-    if cli_session_id.is_none() && (cli_resume_latest || settings.resume_latest) {
-        let mut records = store.list().await?;
-        records.sort_by(|left, right| {
+    if cli_session_id.is_none() && cli_resume_latest {
+        let mut summaries = store.list_summaries().await?;
+        summaries.sort_by(|left, right| {
             right
                 .updated_at_ms
                 .cmp(&left.updated_at_ms)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        if let Some(record) = records.into_iter().next() {
-            return Ok(record);
+        if let Some(summary) = summaries.into_iter().next() {
+            if let Some(record) = store.load(&summary.id).await? {
+                return Ok(record);
+            }
         }
     }
 
-    let id = cli_session_id
-        .or(settings.default_session.as_deref())
-        .unwrap_or("default");
+    let Some(id) = cli_session_id else {
+        return workspace.draft_record();
+    };
     let id = SessionId::new(id)?;
     Ok(match store.load(&id).await? {
         Some(record) => record,
-        None => SessionRecord::new(id, Session::new())?,
+        None => workspace.record_with_id(id)?,
     })
 }
 
 /// 输出按最近更新时间排序的持久化会话摘要。
 async fn print_persisted_sessions(store: &dyn SessionStore) -> Result<()> {
-    let mut records = store.list().await?;
-    records.sort_by(|left, right| {
+    let mut summaries = store.list_summaries().await?;
+    summaries.sort_by(|left, right| {
         right
             .updated_at_ms
             .cmp(&left.updated_at_ms)
             .then_with(|| left.id.cmp(&right.id))
     });
-    if records.is_empty() {
+    if summaries.is_empty() {
         println!("没有持久化会话");
         return Ok(());
     }
 
     println!("SESSION\tREVISION\tMESSAGES\tUPDATED_MS\tTITLE");
-    for record in records {
+    for summary in summaries {
         println!(
             "{}\t{}\t{}\t{}\t{}",
-            record.id,
-            record.revision,
-            record.session.messages().len(),
-            record.updated_at_ms,
-            record.title.as_deref().unwrap_or("")
+            summary.id,
+            summary.revision,
+            summary.message_count,
+            summary.updated_at_ms,
+            summary.title.as_deref().unwrap_or("")
         );
     }
     Ok(())
@@ -2232,6 +3939,7 @@ async fn load_plugins_for_tui(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let workspace = WorkspaceContext::capture()?;
     let config_path = resolve_config_path(args.config.as_deref())?;
     if args.init {
         initialize_config(&config_path)?;
@@ -2257,26 +3965,27 @@ async fn main() -> Result<()> {
         TuiSettings::default()
     };
     let lucia_home = lucia_home_dir()?;
-    let sessions_dir = resolve_tui_path(
+    let sessions_root = resolve_tui_path(
         args.sessions_dir.as_deref(),
         tui_settings.sessions_dir.as_deref(),
         &config_path,
-        lucia_home.join("sessions"),
+        lucia_home.join("projects"),
     );
+    let sessions_dir = workspace.sessions_dir(&sessions_root);
     let events_jsonl = args.events_jsonl.clone().or_else(|| {
         tui_settings
             .events_jsonl
             .as_deref()
             .map(|path| resolve_config_relative_path(&config_path, path))
     });
-    let session_store = Arc::new(FileSessionStore::open(&sessions_dir).await?);
+    let session_store: Arc<dyn SessionStore> = Arc::new(LazyFileSessionStore::new(sessions_dir));
     if args.list_sessions {
         return print_persisted_sessions(session_store.as_ref()).await;
     }
     let session_record = load_startup_session(
         session_store.as_ref(),
         args.session_id.as_deref(),
-        &tui_settings,
+        &workspace,
         args.resume_latest,
     )
     .await?;
@@ -2381,6 +4090,8 @@ async fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     // 启用鼠标捕获，支持滚轮滚动对话区
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    // 启用 bracketed paste，将拖入的文件路径识别为附件
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
 
     let input_tx = tx.clone();
     std::thread::spawn(move || {
@@ -2392,18 +4103,26 @@ async fn main() -> Result<()> {
     });
 
     let tick_tx = tx.clone();
+    let tick_pending = Arc::new(AtomicBool::new(false));
+    let producer_tick_pending = Arc::clone(&tick_pending);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(80));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(UI_TICK_INTERVAL_MS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            if producer_tick_pending.swap(true, Ordering::Relaxed) {
+                continue;
+            }
             if tick_tx.send(UiEvent::Tick).is_err() {
                 break;
             }
         }
     });
 
-    let mut app =
-        App::new(tx.clone(), model_name).with_persistent_session(session_store, session_record);
+    let mut app = App::new(tx.clone(), model_name)
+        .with_workspace(workspace)
+        .with_persistent_session(session_store, session_record);
     app.messages.extend(
         startup_notices
             .into_iter()
@@ -2420,7 +4139,7 @@ async fn main() -> Result<()> {
     };
 
     loop {
-        terminal.draw(|frame| render(frame, &mut app))?;
+        terminal.draw(|frame| render_root(frame, &mut app))?;
 
         match rx.recv().await {
             Some(UiEvent::Input(Event::Key(key))) => {
@@ -2428,7 +4147,48 @@ async fn main() -> Result<()> {
                     #[cfg(feature = "plugins")]
                     match app.route_plugin_key(key.code, key.modifiers) {
                         PluginKeyRoute::Main => {
-                            app.handle_key(key.code, key.modifiers, agent.as_ref());
+                            let argument_completion = matches!(key.code, KeyCode::Tab)
+                                && app
+                                    .input
+                                    .trim_start()
+                                    .strip_prefix('/')
+                                    .is_some_and(|body| body.chars().any(char::is_whitespace));
+                            let command_submission = matches!(key.code, KeyCode::Enter)
+                                && app.input.trim_start().starts_with('/');
+                            if argument_completion && !app.plugins_loading {
+                                if !app.apply_selected_command_completion()
+                                    && !app.command_completion_loading
+                                {
+                                    if let Some(host) = plugin_host.as_ref() {
+                                        app.schedule_command_completion(Arc::clone(host));
+                                    } else {
+                                        app.messages.push(Msg::new(
+                                            MsgKind::Error,
+                                            "Command 插件不可用，无法补全参数",
+                                        ));
+                                    }
+                                }
+                            } else if command_submission && !app.plugins_loading {
+                                if let Some(input) = app.take_input() {
+                                    if let Some(host) = plugin_host.as_ref() {
+                                        if let Err(error) =
+                                            execute_command(&mut app, host.as_ref(), input).await
+                                        {
+                                            app.messages.push(Msg::new(
+                                                MsgKind::Error,
+                                                format!("命令执行失败：{error}"),
+                                            ));
+                                        }
+                                    } else {
+                                        app.messages.push(Msg::new(
+                                            MsgKind::Error,
+                                            "Command 插件不可用，无法执行斜杠命令",
+                                        ));
+                                    }
+                                }
+                            } else {
+                                app.handle_key(key.code, key.modifiers, agent.as_ref());
+                            }
                         }
                         PluginKeyRoute::Consumed => {}
                         PluginKeyRoute::Input(input) => {
@@ -2439,10 +4199,38 @@ async fn main() -> Result<()> {
                                     app.set_plugin_ui_error(
                                         &input.plugin_id,
                                         &input.view_id,
+                                        input.instance_id.as_deref(),
                                         &error,
                                     );
                                 } else {
-                                    refresh_plugin_views(&mut app, host.as_ref()).await;
+                                    if let Err(error) =
+                                        drain_plugin_ui_events(&mut app, host.as_ref()).await
+                                    {
+                                        app.messages.push(Msg::new(
+                                            MsgKind::Error,
+                                            format!("插件 UI 事件处理失败：{error}"),
+                                        ));
+                                    }
+                                    if input.plugin_id == PROVIDER_PLUGIN_ID
+                                        && input.view_id == SESSION_DIALOG_VIEW
+                                    {
+                                        if let Err(error) =
+                                            process_command_surface_effects(&mut app, host.as_ref())
+                                                .await
+                                        {
+                                            app.messages.push(Msg::new(
+                                                MsgKind::Error,
+                                                format!("会话界面操作失败：{error}"),
+                                            ));
+                                        }
+                                    }
+                                    refresh_plugin_view(
+                                        &mut app,
+                                        host.as_ref(),
+                                        &input.plugin_id,
+                                        &input.view_id,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -2459,11 +4247,26 @@ async fn main() -> Result<()> {
                         ready_agent.set_extension(loaded.host.clone());
                         ready_agent.set_context_loader(loaded.host.clone());
                         app.set_plugin_views(loaded.plugin_views);
+                        for event in &loaded.startup_events {
+                            if let Err(error) = apply_plugin_navigation_event(&mut app, event) {
+                                app.messages.push(Msg::new(
+                                    MsgKind::Error,
+                                    format!("插件视图导航失败：{error}"),
+                                ));
+                            }
+                        }
                         app.finish_plugin_loading(
                             loaded.plugin_ids,
                             loaded.startup_events,
                             loaded.failures,
                         );
+                        match load_command_snapshot(loaded.host.as_ref()).await {
+                            Ok(snapshot) => app.set_command_snapshot(snapshot),
+                            Err(error) => app.messages.push(Msg::new(
+                                MsgKind::Error,
+                                format!("Command 命令快照加载失败：{error}"),
+                            )),
+                        }
                         refresh_plugin_views(&mut app, loaded.host.as_ref()).await;
                         plugin_host = Some(loaded.host);
                     }
@@ -2478,6 +4281,79 @@ async fn main() -> Result<()> {
                 let ready_agent = Arc::new(ready_agent);
                 app.run_next_queued(&ready_agent);
                 agent = Some(ready_agent);
+            }
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::CommandSurfaceUpdate { request_id, status }) => {
+                if let Some(host) = plugin_host.as_ref() {
+                    let update = SurfaceUpdateRequest { request_id, status };
+                    match call_typed_plugin_service::<_, Value>(
+                        host.as_ref(),
+                        TUI_COMMAND_CALLER,
+                        PROVIDER_PLUGIN_ID,
+                        SURFACE_UPDATE_SERVICE,
+                        &update,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => {
+                            refresh_plugin_view(
+                                &mut app,
+                                host.as_ref(),
+                                PROVIDER_PLUGIN_ID,
+                                SESSION_DIALOG_VIEW,
+                            )
+                            .await
+                        }
+                        Ok(None) => app.messages.push(Msg::new(
+                            MsgKind::Error,
+                            "Command 插件在会话查询完成前已不可用",
+                        )),
+                        Err(error) => app.messages.push(Msg::new(
+                            MsgKind::Error,
+                            format!("更新会话界面失败：{error}"),
+                        )),
+                    }
+                }
+            }
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::CommandSnapshotLoaded(result)) => {
+                app.command_snapshot_refreshing = false;
+                if let Ok(snapshot) = *result {
+                    let changed = snapshot.as_ref().map(|snapshot| snapshot.generation)
+                        != app
+                            .command_snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.generation);
+                    if changed {
+                        app.set_command_snapshot(snapshot);
+                    }
+                }
+            }
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::CommandCompletionLoaded { generation, result }) => {
+                if generation == app.command_completion_generation {
+                    app.command_completion_loading = false;
+                    app.command_completion_task = None;
+                    match *result {
+                        Ok(Some(completion))
+                            if completion.source_input == app.input
+                                && completion.source_cursor == app.cursor =>
+                        {
+                            let apply_immediately = completion.items.len() == 1;
+                            app.command_completion = Some(completion);
+                            app.command_selection = 0;
+                            app.command_preview_hidden = false;
+                            if apply_immediately {
+                                app.apply_selected_command_completion();
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => app.messages.push(Msg::new(
+                            MsgKind::Error,
+                            format!("命令参数补全失败：{error}"),
+                        )),
+                    }
+                }
             }
             Some(UiEvent::ModelStarted) => {
                 app.start_model_response();
@@ -2532,16 +4408,28 @@ async fn main() -> Result<()> {
             }) => {
                 app.messages.push(Msg::extension(text, color, divider));
             }
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::ViewNavigation { plugin_id, request }) => {
+                if let Err(error) = app.apply_view_navigation(&plugin_id, request) {
+                    app.messages.push(Msg::new(
+                        MsgKind::Error,
+                        format!("插件视图导航失败：{error}"),
+                    ));
+                }
+            }
             Some(UiEvent::ContextUsage(tokens)) => {
                 app.context_tokens = Some(tokens);
             }
             Some(UiEvent::AgentDone(result)) => {
-                app.handle_agent_done(*result);
-                if let Some(agent) = agent.as_ref() {
-                    app.run_next_queued(agent);
+                let queue_may_advance = app.handle_agent_done(*result);
+                if queue_may_advance {
+                    if let Some(agent) = agent.as_ref() {
+                        app.run_next_queued(agent);
+                    }
                 }
             }
             Some(UiEvent::Tick) => {
+                tick_pending.store(false, Ordering::Relaxed);
                 #[cfg(feature = "plugins")]
                 let animate_spinner = app.running || app.plugins_loading;
                 #[cfg(not(feature = "plugins"))]
@@ -2553,10 +4441,17 @@ async fn main() -> Result<()> {
                 {
                     app.tick_plugin_status();
                     app.plugin_tick = app.plugin_tick.wrapping_add(1);
-                    if app.plugin_tick >= 3 {
+                    if app.plugin_tick >= PLUGIN_REFRESH_TICKS {
                         app.plugin_tick = 0;
                         if let Some(host) = plugin_host.as_ref() {
                             refresh_plugin_views(&mut app, host.as_ref()).await;
+                        }
+                    }
+                    app.command_snapshot_tick = app.command_snapshot_tick.wrapping_add(1);
+                    if app.command_snapshot_tick >= COMMAND_SNAPSHOT_REFRESH_TICKS {
+                        app.command_snapshot_tick = 0;
+                        if let Some(host) = plugin_host.as_ref() {
+                            app.schedule_command_snapshot_refresh(Arc::clone(host));
                         }
                     }
                 }
@@ -2568,9 +4463,41 @@ async fn main() -> Result<()> {
                     if let Some(input) = app.route_plugin_mouse(&mouse) {
                         if let Some(host) = plugin_host.as_ref() {
                             if let Err(error) = dispatch_plugin_input(host.as_ref(), &input).await {
-                                app.set_plugin_ui_error(&input.plugin_id, &input.view_id, &error);
+                                app.set_plugin_ui_error(
+                                    &input.plugin_id,
+                                    &input.view_id,
+                                    input.instance_id.as_deref(),
+                                    &error,
+                                );
                             } else {
-                                refresh_plugin_views(&mut app, host.as_ref()).await;
+                                if let Err(error) =
+                                    drain_plugin_ui_events(&mut app, host.as_ref()).await
+                                {
+                                    app.messages.push(Msg::new(
+                                        MsgKind::Error,
+                                        format!("插件 UI 事件处理失败：{error}"),
+                                    ));
+                                }
+                                if input.plugin_id == PROVIDER_PLUGIN_ID
+                                    && input.view_id == SESSION_DIALOG_VIEW
+                                {
+                                    if let Err(error) =
+                                        process_command_surface_effects(&mut app, host.as_ref())
+                                            .await
+                                    {
+                                        app.messages.push(Msg::new(
+                                            MsgKind::Error,
+                                            format!("会话界面操作失败：{error}"),
+                                        ));
+                                    }
+                                }
+                                refresh_plugin_view(
+                                    &mut app,
+                                    host.as_ref(),
+                                    &input.plugin_id,
+                                    &input.view_id,
+                                )
+                                .await;
                             }
                         }
                     } else if !dialog_active {
@@ -2586,6 +4513,18 @@ async fn main() -> Result<()> {
                     MouseEventKind::ScrollUp => app.scroll_up(3),
                     MouseEventKind::ScrollDown => app.scroll_down(3),
                     _ => {}
+                }
+            }
+            Some(UiEvent::Input(Event::Paste(pasted))) => {
+                // 粘贴只进入主输入框；插件视图聚焦或模态层激活时忽略。
+                #[cfg(feature = "plugins")]
+                let main_input_focused = app.plugin_focus.is_none()
+                    && app.active_dialog_index().is_none()
+                    && app.view_stack.is_main();
+                #[cfg(not(feature = "plugins"))]
+                let main_input_focused = true;
+                if main_input_focused {
+                    app.handle_paste(&pasted);
                 }
             }
             Some(UiEvent::Input(_)) => {}
@@ -2612,6 +4551,7 @@ async fn main() -> Result<()> {
         None
     };
 
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     #[cfg(feature = "plugins")]
@@ -2728,6 +4668,8 @@ fn latest_tool_result_text(req: &ModelRequest) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "plugins")]
+    use agent_plugin_host::ui::{UiNavigationAction, UiViewInstance};
     use ratatui::{backend::TestBackend, Terminal};
     #[cfg(feature = "plugins")]
     use std::{fs, time::SystemTime};
@@ -2745,7 +4687,7 @@ mod tests {
         ]);
 
         terminal
-            .draw(|frame| render(frame, &mut app))
+            .draw(|frame| render_root(frame, &mut app))
             .expect("渲染测试界面");
         terminal
             .backend()
@@ -2757,6 +4699,98 @@ mod tests {
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect()
+    }
+
+    /// 测试存储在指定 save 调用上注入错误，其余操作委托给内存存储。
+    #[derive(Clone)]
+    struct ScriptedSaveStore {
+        /// 保存成功时使用的真实内存存储。
+        inner: MemorySessionStore,
+        /// 从一开始计数的 save 调用次数。
+        save_calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// 需要失败的 save 调用序号。
+        failing_calls: Arc<Vec<usize>>,
+        /// 注入的错误类型。
+        failure: ScriptedSaveFailure,
+    }
+
+    /// 测试所需的保存失败时序与错误类型。
+    #[derive(Clone, Copy)]
+    enum ScriptedSaveFailure {
+        /// 模拟另一进程抢先更新记录。
+        RevisionConflict,
+        /// 模拟底层文件写入失败。
+        Io,
+        /// 模拟 payload 已写入，但提交确认阶段返回 I/O 错误。
+        IoAfterCommit,
+    }
+
+    impl ScriptedSaveStore {
+        /// 创建按调用序号失败的测试存储。
+        fn new(failing_calls: Vec<usize>, failure: ScriptedSaveFailure) -> Self {
+            Self {
+                inner: MemorySessionStore::new(),
+                save_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                failing_calls: Arc::new(failing_calls),
+                failure,
+            }
+        }
+
+        /// 构造与当前保存记录匹配的模拟错误。
+        fn failure_for(&self, record: &SessionRecord) -> SessionStoreError {
+            match self.failure {
+                ScriptedSaveFailure::RevisionConflict => SessionStoreError::RevisionConflict {
+                    id: record.id.clone(),
+                    expected: Some(record.revision),
+                    actual: Some(record.revision.saturating_add(1)),
+                },
+                ScriptedSaveFailure::Io | ScriptedSaveFailure::IoAfterCommit => {
+                    SessionStoreError::Io {
+                        operation: "模拟保存会话",
+                        path: PathBuf::from("scripted-session.json"),
+                        source: std::io::Error::other("模拟写入失败"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SessionStore for ScriptedSaveStore {
+        async fn load(&self, id: &SessionId) -> Result<Option<SessionRecord>, SessionStoreError> {
+            self.inner.load(id).await
+        }
+
+        async fn save(
+            &self,
+            record: SessionRecord,
+            expected_revision: Option<u64>,
+        ) -> Result<SessionRecord, SessionStoreError> {
+            let call = self
+                .save_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if self.failing_calls.contains(&call) {
+                let error = self.failure_for(&record);
+                if matches!(self.failure, ScriptedSaveFailure::IoAfterCommit) {
+                    self.inner.save(record, expected_revision).await?;
+                }
+                return Err(error);
+            }
+            self.inner.save(record, expected_revision).await
+        }
+
+        async fn delete(
+            &self,
+            id: &SessionId,
+            expected_revision: u64,
+        ) -> Result<(), SessionStoreError> {
+            self.inner.delete(id, expected_revision).await
+        }
+
+        async fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
+            self.inner.list().await
+        }
     }
 
     /// 验证常规尺寸下角色标记、输入提示和底部信息行均可见。
@@ -2805,7 +4839,7 @@ mod tests {
         let backend = TestBackend::new(100, 18);
         let mut terminal = Terminal::new(backend).expect("创建插件状态测试终端");
         terminal
-            .draw(|frame| render(frame, &mut app))
+            .draw(|frame| render_root(frame, &mut app))
             .expect("渲染插件启动状态");
         let rendered = terminal
             .backend()
@@ -2874,7 +4908,7 @@ mod tests {
         assert_eq!(
             app.queued_inputs
                 .iter()
-                .map(String::as_str)
+                .map(|submission| submission.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["第一条任务", "第二条任务"]
         );
@@ -2891,7 +4925,15 @@ mod tests {
         app.input = "/clear".into();
         app.cursor = app.input.len();
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
-        assert!(app.queued_inputs.is_empty());
+        assert_eq!(app.input, "/clear");
+        assert_eq!(app.queued_inputs.len(), 2);
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|message| matches!(message.kind, MsgKind::User))
+                .count(),
+            2
+        );
     }
 
     /// Queued startup inputs execute sequentially and persist into one continuing session.
@@ -2911,7 +4953,7 @@ mod tests {
         let (gateway, options) = build_demo_gateway();
         let agent = Arc::new(Agent::new(gateway, options));
         app.run_next_queued(&agent);
-        for expected_revision in [1, 2] {
+        for expected_revision in [2, 4] {
             let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
                     if let Some(UiEvent::AgentDone(result)) = rx.recv().await {
@@ -2921,9 +4963,11 @@ mod tests {
             })
             .await
             .expect("等待排队任务完成不应超时");
-            app.handle_agent_done(result);
+            let queue_may_advance = app.handle_agent_done(result);
             assert_eq!(app.session_record.revision, expected_revision);
-            app.run_next_queued(&agent);
+            if queue_may_advance {
+                app.run_next_queued(&agent);
+            }
         }
 
         assert!(app.queued_inputs.is_empty());
@@ -3048,7 +5092,20 @@ mod tests {
         assert_eq!(messages[2].text, "配置已经读取");
     }
 
-    /// 显式会话 ID 必须优先于最近恢复，未显式指定时选择最新记录。
+    /// 非 UTF-8 路径即使有损文本相同，也必须映射到不同项目空间。
+    #[cfg(unix)]
+    #[test]
+    fn workspace_id_hashes_raw_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let left = PathBuf::from(OsString::from_vec(vec![b'/', b'p', 0x80]));
+        let right = PathBuf::from(OsString::from_vec(vec![b'/', b'p', 0x81]));
+        assert_eq!(left.to_string_lossy(), right.to_string_lossy());
+        assert_ne!(workspace_project_id(&left), workspace_project_id(&right));
+    }
+
+    /// 普通启动必须创建 Draft，显式参数仍可恢复最近或指定会话。
     #[tokio::test]
     async fn startup_session_respects_explicit_and_latest_priority() {
         let store = MemorySessionStore::new();
@@ -3075,20 +5132,50 @@ mod tests {
             )
             .await
             .expect("保存新会话");
-        let settings = TuiSettings {
-            resume_latest: true,
-            ..TuiSettings::default()
-        };
+        let workspace = WorkspaceContext::capture().expect("捕获测试工作目录");
 
-        let latest = load_startup_session(&store, None, &settings, false)
+        let draft = load_startup_session(&store, None, &workspace, false)
+            .await
+            .expect("创建启动 Draft");
+        assert_ne!(draft.id, older.id);
+        assert_ne!(draft.id, newer.id);
+        assert_eq!(draft.revision, 0);
+
+        let latest = load_startup_session(&store, None, &workspace, true)
             .await
             .expect("恢复最近会话");
         assert_eq!(latest.id, newer.id);
 
-        let explicit = load_startup_session(&store, Some(older.id.as_str()), &settings, true)
+        let explicit = load_startup_session(&store, Some(older.id.as_str()), &workspace, true)
             .await
             .expect("恢复显式会话");
         assert_eq!(explicit.id, older.id);
+    }
+
+    /// 验证普通空白启动不会创建项目会话目录，首次保存才创建。
+    #[tokio::test]
+    async fn lazy_session_store_creates_directory_on_first_save() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("生成测试时间戳")
+            .as_nanos();
+        let parent =
+            std::env::temp_dir().join(format!("lucia-lazy-session-{}-{nonce}", std::process::id()));
+        let root = parent.join("project").join("sessions");
+        let store = LazyFileSessionStore::new(root.clone());
+
+        assert!(store.list().await.expect("列出空存储").is_empty());
+        assert!(!root.exists());
+
+        let record = SessionRecord::new(
+            SessionId::new("lazy-session").expect("创建测试会话标识"),
+            Session::new(),
+        )
+        .expect("创建测试会话");
+        store.save(record, None).await.expect("首次保存会话");
+        assert!(root.is_dir());
+
+        std::fs::remove_dir_all(parent).expect("清理惰性会话测试目录");
     }
 
     /// 验证 Markdown 表格排版为对齐行：分隔行转为横线，中文列按显示宽度补齐。
@@ -3160,16 +5247,20 @@ mod tests {
 
         app.append_model_delta("新的输出");
         let saved_record = app.session_record.clone();
-        app.handle_agent_done(Ok((
-            AgentRun {
+        app.handle_agent_done(AgentCompletion {
+            run: Some(AgentRun {
                 run_id: "run-scroll".into(),
                 final_text: "完成".into(),
                 steps_used: 1,
                 usage: Default::default(),
                 session: Session::new(),
-            },
-            saved_record,
-        )));
+            }),
+            session_record: saved_record,
+            error: None,
+            input_committed: true,
+            queue_may_advance: true,
+            input: "测试".into(),
+        });
 
         assert_eq!(app.scroll, Some(30));
     }
@@ -3187,17 +5278,24 @@ mod tests {
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.messages[0].text, "你好");
 
-        let saved_record = app.session_record.clone();
-        app.handle_agent_done(Ok((
-            AgentRun {
+        let mut completed_session = Session::new();
+        completed_session.push_assistant_text("你好！");
+        let mut saved_record = app.session_record.clone();
+        saved_record.session = completed_session.clone();
+        app.handle_agent_done(AgentCompletion {
+            run: Some(AgentRun {
                 run_id: "run-test".into(),
                 final_text: "你好！".into(),
                 steps_used: 1,
                 usage: Default::default(),
-                session: Session::new(),
-            },
-            saved_record,
-        )));
+                session: completed_session,
+            }),
+            session_record: saved_record,
+            error: None,
+            input_committed: true,
+            queue_may_advance: true,
+            input: "测试".into(),
+        });
 
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.messages[0].text, "你好！");
@@ -3216,22 +5314,211 @@ mod tests {
         )
         .expect("创建测试会话记录");
 
-        let (_, first) = run_and_persist(&agent, &store, record, "第一轮")
-            .await
-            .expect("首次运行和保存应成功");
-        assert_eq!(first.revision, 1);
+        let first_completion = run_and_persist(&agent, &store, record, "第一轮").await;
+        assert!(first_completion.error.is_none());
+        assert!(first_completion.run.is_some());
+        let first = first_completion.session_record;
+        assert_eq!(first.revision, 2);
         assert_eq!(first.title.as_deref(), Some("第一轮"));
 
-        let (_, second) = run_and_persist(&agent, &store, first.clone(), "第二轮")
-            .await
-            .expect("继续运行和保存应成功");
+        let second_completion = run_and_persist(&agent, &store, first.clone(), "第二轮").await;
+        assert!(second_completion.error.is_none());
+        assert!(second_completion.run.is_some());
+        let second = second_completion.session_record;
         assert_eq!(second.id, first.id);
-        assert_eq!(second.revision, 2);
+        assert_eq!(second.revision, 4);
         assert_eq!(second.title.as_deref(), first.title.as_deref());
         assert_eq!(
             store.load(&second.id).await.expect("读取测试会话"),
             Some(second)
         );
+    }
+
+    /// 首次 save 已写入但返回错误时，应通过回读协调后继续模型运行。
+    #[tokio::test]
+    async fn reconciles_indeterminate_initial_save_before_running() {
+        let (gateway, options) = build_demo_gateway();
+        let agent = Agent::new(gateway, options);
+        let store = ScriptedSaveStore::new(vec![1], ScriptedSaveFailure::IoAfterCommit);
+        let record = SessionRecord::new(
+            SessionId::new("initial-after-commit").expect("创建首次协调会话标识"),
+            Session::new(),
+        )
+        .expect("创建首次协调测试会话");
+
+        let completion = run_and_persist(&agent, &store, record, "首次提交需要协调").await;
+
+        assert!(completion.error.is_none());
+        assert!(completion.run.is_some());
+        assert!(completion.input_committed);
+        assert!(completion.queue_may_advance);
+        assert_eq!(completion.session_record.revision, 2);
+        assert_eq!(
+            store
+                .load(&completion.session_record.id)
+                .await
+                .expect("读取首次协调后的会话"),
+            Some(completion.session_record)
+        );
+    }
+
+    /// 最终 save 已写入但返回错误时，应采用原会话回读结果而不是创建分叉。
+    #[tokio::test]
+    async fn reconciles_indeterminate_final_save_without_forking() {
+        let (gateway, options) = build_demo_gateway();
+        let agent = Agent::new(gateway, options);
+        let store = ScriptedSaveStore::new(vec![2], ScriptedSaveFailure::IoAfterCommit);
+        let record = SessionRecord::new(
+            SessionId::new("final-after-commit").expect("创建最终协调会话标识"),
+            Session::new(),
+        )
+        .expect("创建最终协调测试会话");
+        let original_id = record.id.clone();
+
+        let completion = run_and_persist(&agent, &store, record, "最终提交需要协调").await;
+
+        assert!(completion.error.is_none());
+        assert!(completion.run.is_some());
+        assert_eq!(completion.session_record.id, original_id);
+        assert_eq!(completion.session_record.revision, 2);
+        assert_eq!(store.list().await.expect("列出协调后的会话").len(), 1);
+        assert!(restore_session_messages(&completion.session_record.session)
+            .iter()
+            .any(|message| matches!(message.kind, MsgKind::Assistant)));
+    }
+
+    /// 最终 CAS 冲突时应把完整回复保存为新会话，并切换到分叉记录。
+    #[tokio::test]
+    async fn final_save_conflict_forks_completed_session() {
+        let (gateway, options) = build_demo_gateway();
+        let agent = Agent::new(gateway, options);
+        let store = ScriptedSaveStore::new(vec![2], ScriptedSaveFailure::RevisionConflict);
+        let mut record = SessionRecord::new(
+            SessionId::new("conflicted-session").expect("创建冲突会话标识"),
+            Session::new(),
+        )
+        .expect("创建冲突测试会话");
+        record
+            .metadata
+            .insert("lucia.project_id".into(), Value::String("project-a".into()));
+        let original_id = record.id.clone();
+
+        let completion = run_and_persist(&agent, &store, record, "需要完整回复").await;
+
+        assert!(completion.run.is_some());
+        assert!(completion.input_committed);
+        assert!(completion.queue_may_advance);
+        assert_ne!(completion.session_record.id, original_id);
+        assert_eq!(completion.session_record.revision, 1);
+        assert_eq!(
+            completion.session_record.metadata.get("lucia.project_id"),
+            Some(&Value::String("project-a".into()))
+        );
+        assert!(restore_session_messages(&completion.session_record.session)
+            .iter()
+            .any(|message| matches!(message.kind, MsgKind::Assistant)));
+        assert_eq!(
+            store
+                .load(&completion.session_record.id)
+                .await
+                .expect("读取分叉会话"),
+            Some(completion.session_record.clone())
+        );
+        assert!(completion
+            .error
+            .as_ref()
+            .is_some_and(|error| error.to_string().contains("已分叉保存")));
+    }
+
+    /// 最终保存与分叉均失败时应保留 dirty 完成态，并以该 Session 重建界面。
+    #[tokio::test]
+    async fn failed_final_and_fork_saves_keep_dirty_completed_session() {
+        let (gateway, options) = build_demo_gateway();
+        let agent = Agent::new(gateway, options);
+        let store = ScriptedSaveStore::new(vec![2, 3], ScriptedSaveFailure::Io);
+        let record = SessionRecord::new(
+            SessionId::new("dirty-session").expect("创建 dirty 会话标识"),
+            Session::new(),
+        )
+        .expect("创建 dirty 测试会话");
+
+        let completion = run_and_persist(&agent, &store, record, "保留这次回复").await;
+        let dirty_record = completion.session_record.clone();
+        let expected_assistant = restore_session_messages(&dirty_record.session)
+            .into_iter()
+            .filter(|message| matches!(message.kind, MsgKind::Assistant))
+            .map(|message| message.text)
+            .collect::<Vec<_>>();
+        assert!(!expected_assistant.is_empty());
+        assert!(completion.run.is_some());
+        assert!(completion.input_committed);
+        assert!(!completion.queue_may_advance);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.running = true;
+        app.append_model_delta("尚未校准的流式文本");
+        let queue_may_advance = app.handle_agent_done(completion);
+        let actual_assistant = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.kind, MsgKind::Assistant))
+            .map(|message| message.text.clone())
+            .collect::<Vec<_>>();
+
+        assert!(!queue_may_advance);
+        assert_eq!(app.session_record, dirty_record);
+        assert_eq!(actual_assistant, expected_assistant);
+        assert!(app.messages.iter().any(|message| {
+            matches!(message.kind, MsgKind::Error)
+                && message.text.contains("完整回复已保留在当前内存会话中")
+        }));
+    }
+
+    /// FIFO 队首预写失败时不得出队或自动推进，所有待处理输入保持原顺序。
+    #[test]
+    fn queued_initial_save_failure_preserves_fifo_order() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        let original_record = app.session_record.clone();
+        app.queued_inputs = VecDeque::from(["第一条".into(), "第二条".into()]);
+        app.messages.extend([
+            Msg::new(MsgKind::User, "第一条"),
+            Msg::new(MsgKind::User, "第二条"),
+        ]);
+        app.queued_run_active = true;
+        app.running = true;
+        let mut attempted_record = original_record.clone();
+        attempted_record.session.push_user("第一条");
+
+        let queue_may_advance = app.handle_agent_done(AgentCompletion {
+            run: None,
+            session_record: attempted_record,
+            error: Some(anyhow!("模拟首次保存失败")),
+            input_committed: false,
+            queue_may_advance: false,
+            input: "第一条".into(),
+        });
+
+        assert!(!queue_may_advance);
+        assert_eq!(app.session_record, original_record);
+        assert_eq!(
+            app.queued_inputs
+                .iter()
+                .map(|submission| submission.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["第一条", "第二条"]
+        );
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|message| matches!(message.kind, MsgKind::User))
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["第一条", "第二条"]
+        );
+        assert!(app.input.is_empty());
+        assert!(!app.queued_run_active);
     }
 
     /// 验证运行或保存错误不会替换应用持有的原会话记录。
@@ -3241,7 +5528,14 @@ mod tests {
         let mut app = App::new(tx, "测试模型".into());
         let original = app.session_record.clone();
 
-        app.handle_agent_done(Err(anyhow!("模拟运行失败")));
+        app.handle_agent_done(AgentCompletion {
+            run: None,
+            session_record: original.clone(),
+            error: Some(anyhow!("模拟运行失败")),
+            input_committed: false,
+            queue_may_advance: false,
+            input: "失败输入".into(),
+        });
 
         assert_eq!(app.session_record, original);
     }
@@ -3326,6 +5620,22 @@ mod tests {
         }
     }
 
+    /// 隐藏的 Command Dialog 只接受定向刷新，不参与周期性跨 WASM 轮询。
+    #[test]
+    #[cfg(feature = "plugins")]
+    fn hidden_command_dialog_is_excluded_from_periodic_refresh() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        let mut view = test_plugin_view(UiPlacement::Dialog, "会话");
+        view.declaration.plugin_id = PROVIDER_PLUGIN_ID.into();
+        view.declaration.view_id = SESSION_DIALOG_VIEW.into();
+        view.frame.as_mut().expect("测试视图应包含帧").visible = false;
+        app.plugin_views.push(view);
+
+        assert!(app.periodic_plugin_render_requests().is_empty());
+        assert_eq!(app.plugin_render_requests().len(), 1);
+    }
+
     /// 验证右侧插槽与主界面可以同时渲染，且插件获得实际内容尺寸。
     #[test]
     #[cfg(feature = "plugins")]
@@ -3339,7 +5649,7 @@ mod tests {
             .push(test_plugin_view(UiPlacement::Right, "右侧插件"));
 
         terminal
-            .draw(|frame| render(frame, &mut app))
+            .draw(|frame| render_root(frame, &mut app))
             .expect("渲染带插件的界面");
         let text = terminal
             .backend()
@@ -3380,6 +5690,76 @@ mod tests {
         ));
     }
 
+    /// A dynamic subview replaces the main view while preserving instance input routing.
+    /// 动态子视图应替换主视图，并保留实例化输入路由。
+    #[test]
+    #[cfg(feature = "plugins")]
+    fn plugin_subview_replaces_main_view_and_routes_instance_input() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("创建测试终端");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.messages
+            .push(Msg::new(MsgKind::User, "main-view-content"));
+        app.plugin_views
+            .push(test_plugin_view(UiPlacement::Subview, "Agent 详情"));
+        app.apply_view_navigation(
+            "test-plugin",
+            UiNavigationRequest {
+                request_id: "open-agent-1".into(),
+                action: UiNavigationAction::Push {
+                    view: UiViewInstance {
+                        view_id: "subview".into(),
+                        instance_id: "agent-1".into(),
+                        title: Some("Reviewer Agent".into()),
+                    },
+                },
+            },
+        )
+        .expect("打开插件子视图");
+        app.update_plugin_frame(
+            "test-plugin",
+            Some("agent-1"),
+            PluginUiFrame {
+                view_id: "subview".into(),
+                visible: true,
+                lines: vec![UiLine {
+                    spans: vec![UiSpan {
+                        text: "subview-content".into(),
+                        style: UiStyle::default(),
+                    }],
+                }],
+            },
+        );
+
+        terminal
+            .draw(|frame| render_root(frame, &mut app))
+            .expect("渲染子视图");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Reviewer Agent"), "{rendered:?}");
+        assert!(rendered.contains("subview-content"), "{rendered:?}");
+        assert!(!rendered.contains("main-view-content"), "{rendered:?}");
+
+        let PluginKeyRoute::Input(input) = app.route_plugin_key(KeyCode::Enter, KeyModifiers::NONE)
+        else {
+            panic!("子视图应接收键盘输入");
+        };
+        assert_eq!(input.instance_id.as_deref(), Some("agent-1"));
+        assert_eq!(input.view_id, "subview");
+
+        assert!(matches!(
+            app.route_plugin_key(KeyCode::Esc, KeyModifiers::NONE),
+            PluginKeyRoute::Consumed
+        ));
+        assert!(app.view_stack.is_main());
+    }
+
     /// 验证 Tab 在主输入区与可聚焦停靠视图之间循环。
     #[test]
     #[cfg(feature = "plugins")]
@@ -3399,6 +5779,148 @@ mod tests {
             PluginKeyRoute::Consumed
         ));
         assert_eq!(app.plugin_focus, None);
+    }
+
+    /// 验证参数候选使用 Provider 给出的 UTF-8 字节区间替换中文输入。
+    #[test]
+    #[cfg(feature = "plugins")]
+    fn command_completion_replaces_utf8_argument_range() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.input = "/deploy 北京".into();
+        app.cursor = app.input.len();
+        app.command_selection = 1;
+        app.command_completion = Some(ResolvedCommandCompletion {
+            source_input: app.input.clone(),
+            source_cursor: app.cursor,
+            context: CompletionContext {
+                command: "deploy".into(),
+                argument: "region".into(),
+                argument_index: 0,
+                replacement_start: 8,
+                replacement_end: u32::try_from(app.input.len()).expect("输入长度应可转换"),
+                prefix: "北京".into(),
+            },
+            items: vec![
+                CompletionItem {
+                    label: "北京".into(),
+                    insert_text: "北京".into(),
+                    description: None,
+                },
+                CompletionItem {
+                    label: "上海".into(),
+                    insert_text: "上海".into(),
+                    description: Some("华东".into()),
+                },
+            ],
+        });
+
+        assert!(app.apply_selected_command_completion());
+        assert_eq!(app.input, "/deploy 上海");
+        assert_eq!(app.cursor, app.input.len());
+        assert!(app.command_completion.is_none());
+    }
+
+    /// 验证输入斜杠时展示命令用法、摘要和详细说明。
+    #[test]
+    #[cfg(feature = "plugins")]
+    fn command_preview_renders_descriptive_snapshot() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("创建命令预览测试终端");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.input = "/res".into();
+        app.cursor = app.input.len();
+        app.set_command_snapshot(Some(CommandSnapshot {
+            generation: 1,
+            commands: vec![CommandSpec::new(
+                "resume",
+                "恢复历史会话",
+                "打开当前项目的会话列表并选择恢复。",
+            )],
+        }));
+
+        terminal
+            .draw(|frame| render_root(frame, &mut app))
+            .expect("渲染命令预览");
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(text.contains("/resume"), "{text}");
+        assert!(text.contains("恢复历史会话"), "{text}");
+        assert!(
+            text.contains("打开当前项目的会话列表并选择恢复。"),
+            "{text}"
+        );
+    }
+
+    /// 验证 Session 参数候选只读取轻量摘要并按标题过滤。
+    #[tokio::test]
+    #[cfg(feature = "plugins")]
+    async fn session_completion_uses_summary_titles() {
+        let store = MemorySessionStore::new();
+        for (id, title) in [("alpha", "架构讨论"), ("beta", "发布计划")] {
+            let mut record = SessionRecord::new(
+                SessionId::new(id).expect("创建候选会话标识"),
+                Session::new(),
+            )
+            .expect("创建候选会话");
+            record.title = Some(title.into());
+            store.save(record, None).await.expect("保存候选会话");
+        }
+
+        let items = session_completion_items(&store, "架构", 6)
+            .await
+            .expect("读取 Session 候选");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "架构讨论");
+        assert_eq!(items[0].insert_text, "alpha");
+    }
+
+    /// 验证恢复会话前必须重新读取并严格匹配用户选择时看到的 revision。
+    #[tokio::test]
+    #[cfg(feature = "plugins")]
+    async fn resume_selection_rejects_stale_revision() {
+        let store = MemorySessionStore::new();
+        let mut session = Session::new();
+        session.push_user("历史消息");
+        let saved = store
+            .save(
+                SessionRecord::new(
+                    SessionId::new("resume-target").expect("创建恢复目标标识"),
+                    session,
+                )
+                .expect("创建恢复目标"),
+                None,
+            )
+            .await
+            .expect("保存恢复目标");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.session_store = Arc::new(store);
+        let original_id = app.session_record.id.clone();
+
+        let error = resume_selected_session(&mut app, saved.id.as_str(), 0)
+            .await
+            .expect_err("过期 revision 必须被拒绝");
+        assert!(error.to_string().contains("已更新"));
+        assert_eq!(app.session_record.id, original_id);
+
+        resume_selected_session(&mut app, saved.id.as_str(), saved.revision)
+            .await
+            .expect("最新 revision 应恢复成功");
+        assert_eq!(app.session_record.id, saved.id);
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.text.contains("历史消息")));
     }
 
     /// 验证点击插件外的主界面会释放插件焦点，使字符重新进入主输入框。
@@ -3425,5 +5947,164 @@ mod tests {
             app.route_plugin_key(KeyCode::Char('a'), KeyModifiers::NONE),
             PluginKeyRoute::Main
         ));
+    }
+
+    /// 写入一个测试附件文件，返回路径；测试结束由调用方删除。
+    fn write_temp_attachment(name: &str, bytes: &[u8]) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("系统时间应晚于 UNIX 纪元")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "lucia-attach-test-{}-{unique}-{name}",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).expect("写入测试附件");
+        path
+    }
+
+    /// 拖入图片生成 [Image#N] 引用标签，提交时转换为文本加图片内容块。
+    #[test]
+    fn attached_image_becomes_ref_clip_and_blocks() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        let path = write_temp_attachment("图.png", b"\x89PNG\r\n\x1a\n");
+
+        app.input = "看这张 ".to_string();
+        app.cursor = app.input.len();
+        app.attach_file(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(app.input, "看这张 [Image#1] ");
+        assert_eq!(app.attachments.len(), 1);
+        assert!(app.attachments[0].is_image);
+        assert_eq!(app.attachments[0].media_type, "image/png");
+
+        let submission = app.take_submission().expect("应有提交内容");
+        let blocks = submission.blocks();
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text.contains("[Image#1]")));
+        assert!(
+            matches!(&blocks[1], ContentBlock::Image { media_type, .. } if media_type == "image/png")
+        );
+        assert!(app.attachments.is_empty());
+        assert!(app.input.is_empty());
+    }
+
+    /// 非图片文件使用 [FILE#文件名] 标签，重名时追加序号后缀。
+    #[test]
+    fn attached_files_use_name_labels_with_dedup() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        let path = write_temp_attachment("note.txt", "内容".as_bytes());
+
+        app.attach_file(&path);
+        app.attach_file(&path);
+        std::fs::remove_file(&path).ok();
+
+        let labels: Vec<&str> = app
+            .attachments
+            .iter()
+            .map(|attachment| attachment.label.as_str())
+            .collect();
+        assert!(labels[0].starts_with("[FILE#"));
+        assert_ne!(labels[0], labels[1]);
+        assert!(app.input.contains(labels[0]));
+        assert!(app.input.contains(labels[1]));
+    }
+
+    /// Backspace 紧跟引用标签时整体删除标签与对应附件。
+    #[test]
+    fn backspace_removes_whole_ref_clip() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        let path = write_temp_attachment("pic.png", b"png");
+        app.attach_file(&path);
+        std::fs::remove_file(&path).ok();
+        // 删除标签后自动附加的空格，使光标紧跟标签结尾
+        app.handle_key(KeyCode::Backspace, KeyModifiers::NONE, None);
+
+        app.handle_key(KeyCode::Backspace, KeyModifiers::NONE, None);
+
+        assert!(app.input.is_empty());
+        assert!(app.attachments.is_empty());
+    }
+
+    /// 手动编辑拆散引用标签时，失去标签的附件被同步丢弃。
+    #[test]
+    fn broken_ref_label_prunes_attachment() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        let path = write_temp_attachment("pic.png", b"png");
+        app.attach_file(&path);
+        std::fs::remove_file(&path).ok();
+
+        // 在标签中间插入字符，标签失效
+        app.cursor = app.input.len() - 2;
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE, None);
+
+        assert!(app.attachments.is_empty());
+    }
+
+    /// 粘贴的引号包裹或转义路径解析为文件；普通文本返回 None。
+    #[test]
+    fn pasted_file_path_parses_dropped_paths() {
+        let path = write_temp_attachment("带 空格.txt", b"x");
+        let display = path.display().to_string();
+
+        let quoted = format!("'{display}'");
+        assert_eq!(pasted_file_path(&quoted), Some(path.clone()));
+
+        let escaped = display.replace(' ', "\\ ");
+        assert_eq!(pasted_file_path(&escaped), Some(path.clone()));
+
+        std::fs::remove_file(&path).ok();
+        assert_eq!(pasted_file_path("普通粘贴文本"), None);
+        assert_eq!(pasted_file_path(&display), None);
+    }
+
+    /// 粘贴非路径文本时插入输入框，换行压平为空格。
+    #[test]
+    fn paste_inserts_flattened_text() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+
+        app.handle_paste("第一行\n第二行");
+
+        assert_eq!(app.input, "第一行 第二行");
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    /// MIME 推断：图片按扩展名，未知扩展按内容区分文本与二进制。
+    #[test]
+    fn attachment_media_type_detects_kinds() {
+        let png = attachment_media_type(Path::new("a.PNG"), b"binary");
+        assert_eq!(png, ("image/png".to_string(), true));
+
+        let pdf = attachment_media_type(Path::new("b.pdf"), b"%PDF");
+        assert_eq!(pdf, ("application/pdf".to_string(), false));
+
+        let text = attachment_media_type(Path::new("c.rs"), "fn main() {}".as_bytes());
+        assert_eq!(text, ("text/plain".to_string(), false));
+
+        let binary = attachment_media_type(Path::new("d.bin"), &[0u8, 159, 146, 150]);
+        assert_eq!(binary, ("application/octet-stream".to_string(), false));
+    }
+
+    /// 输入渲染将引用标签切分为独立的高亮片段。
+    #[test]
+    fn input_ref_spans_highlight_labels() {
+        let attachments = vec![PendingAttachment {
+            label: "[Image#1]".to_string(),
+            name: "pic.png".to_string(),
+            media_type: "image/png".to_string(),
+            data: String::new(),
+            is_image: true,
+        }];
+
+        let spans = input_ref_spans("看 [Image#1] 这个", &attachments);
+        let contents: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+
+        assert_eq!(contents, vec!["看 ", "[Image#1]", " 这个"]);
     }
 }
