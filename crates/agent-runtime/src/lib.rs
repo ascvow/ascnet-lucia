@@ -7,8 +7,9 @@
 #![deny(missing_docs)]
 
 use agent_core::{
-    Agent, AgentEvent, AgentExtension, AgentOptions, AgentRun, ContextLoader, EventSink,
-    ModelGateway, ModelMessage, ReasoningLevel, Session, TokenUsage, ToolChoice, ToolDecision,
+    Agent, AgentEvent, AgentExtension, AgentOptions, AgentRun, CompositeEventSink, ContextLoader,
+    EventSink, ModelGateway, ModelMessage, ReasoningLevel, Session, TokenUsage, ToolChoice,
+    ToolDecision,
 };
 use agent_tool::{ToolCall, ToolRegistry, ToolResult, ToolSpec};
 use anyhow::Result as AnyResult;
@@ -28,7 +29,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock, Semaphore},
+    sync::{mpsc, Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock, Semaphore},
     task::AbortHandle,
 };
 use uuid::Uuid;
@@ -667,6 +668,40 @@ pub struct AgentSnapshot {
     pub permissions: AgentPermissions,
 }
 
+/// 订阅单个 Agent 生命周期事件的流句柄。
+///
+/// 事件在订阅之后开始投递：订阅前已发出的事件不会补发。目标进入终态并且
+/// 缓冲事件全部取出后，[`next`](Self::next) 返回 `None`，流自然结束。
+#[derive(Debug)]
+pub struct AgentEventStream {
+    receiver: mpsc::UnboundedReceiver<AgentEvent>,
+}
+
+impl AgentEventStream {
+    /// 取出下一条事件；目标终态且缓冲耗尽后返回 `None`。
+    pub async fn next(&mut self) -> Option<AgentEvent> {
+        self.receiver.recv().await
+    }
+}
+
+/// 把 Core Agent 事件转发给当前订阅者的事件 sink。
+///
+/// 发送失败（订阅方已放弃接收）的通道会被移除，不影响其余订阅者。
+struct SubscriberEventSink {
+    subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<AgentEvent>>>>,
+}
+
+#[async_trait]
+impl EventSink for SubscriberEventSink {
+    async fn record(&self, event: &AgentEvent) -> AnyResult<()> {
+        self.subscribers
+            .lock()
+            .expect("事件订阅者锁不应中毒")
+            .retain(|sender| sender.send(event.clone()).is_ok());
+        Ok(())
+    }
+}
+
 /// 可由 Host 注入的身份绑定 Agent Runtime API。
 ///
 /// `spawn`、`continue_agent`、查询和取消是通用控制面调用。teammate 邮箱、消息主题、
@@ -705,6 +740,12 @@ pub trait AgentRuntimeApi: Send + Sync {
     /// 目标及其全部后代会级联取消。至少一个节点首次进入取消状态时返回 `true`；
     /// 重复取消且没有新增变化时返回 `false`。
     async fn cancel(&self, target: &AgentId) -> RuntimeResult<bool>;
+
+    /// 订阅自身或后代 Agent 的生命周期事件流。
+    ///
+    /// 只投递订阅之后发出的事件；目标已处于终态时返回立即结束的空流。
+    /// 事件通道不限量缓冲，订阅方应及时消费，避免长时间滞留占用内存。
+    async fn subscribe(&self, target: &AgentId) -> RuntimeResult<AgentEventStream>;
 }
 
 /// Host provisioner 创建的独立 controller 与身份绑定 API。
@@ -1151,6 +1192,18 @@ impl AgentRuntime {
         }
     }
 
+    async fn subscribe_for(
+        &self,
+        principal: &RuntimePrincipal,
+        caller: &AgentId,
+        target: &AgentId,
+    ) -> RuntimeResult<AgentEventStream> {
+        self.inner
+            .ensure_manageable(principal, caller, target)
+            .await?;
+        Ok(self.inner.entry(target).await?.subscribe())
+    }
+
     async fn cancel_for(
         &self,
         principal: &RuntimePrincipal,
@@ -1223,6 +1276,12 @@ impl AgentRuntimeApi for BoundAgentRuntime {
     async fn cancel(&self, target: &AgentId) -> RuntimeResult<bool> {
         self.runtime
             .cancel_for(&self.principal, &self.identity, target)
+            .await
+    }
+
+    async fn subscribe(&self, target: &AgentId) -> RuntimeResult<AgentEventStream> {
+        self.runtime
+            .subscribe_for(&self.principal, &self.identity, target)
             .await
     }
 }
@@ -1383,6 +1442,9 @@ struct AgentEntry {
     finished: Notify,
     abort_handle: Mutex<Option<AbortHandle>>,
     child_count: AtomicUsize,
+    /// 当前事件订阅者；运行任务通过 [`SubscriberEventSink`] 共享此列表，
+    /// 终态时清空以结束所有订阅流。
+    subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<AgentEvent>>>>,
 }
 
 impl AgentEntry {
@@ -1408,6 +1470,7 @@ impl AgentEntry {
             finished: Notify::new(),
             abort_handle: Mutex::new(None),
             child_count: AtomicUsize::new(0),
+            subscribers: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -1470,7 +1533,23 @@ impl AgentEntry {
         *status = outcome.status();
         drop(status);
         self.finished.notify_waiters();
+        // 丢弃所有订阅发送端，让事件流在缓冲耗尽后自然结束。
+        self.subscribers
+            .lock()
+            .expect("事件订阅者锁不应中毒")
+            .clear();
         true
+    }
+
+    /// 创建一个新的事件订阅流；目标已处于终态时返回立即结束的空流。
+    fn subscribe(&self) -> AgentEventStream {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut subscribers = self.subscribers.lock().expect("事件订阅者锁不应中毒");
+        // 在持有订阅者锁的前提下检查终态，避免与 finish 清空订阅者竞争。
+        if !self.status().is_terminal() {
+            subscribers.push(sender);
+        }
+        AgentEventStream { receiver }
     }
 
     fn set_abort_handle(&self, handle: AbortHandle) {
@@ -1520,7 +1599,7 @@ async fn run_agent_task(
         };
     }
 
-    let (agent, _) = match entry.template.instantiate(
+    let (mut agent, _) = match entry.template.instantiate(
         &entry.permissions,
         &AgentDeriveConfig {
             options: entry.run_options.clone(),
@@ -1538,12 +1617,25 @@ async fn run_agent_task(
         }
     };
 
+    // 在模板 sink 之外叠加订阅转发，让 subscribe 拿到本 Agent 的事件流。
+    let mut sink = CompositeEventSink::new();
+    sink.push(agent.event_sink());
+    sink.push(Arc::new(SubscriberEventSink {
+        subscribers: entry.subscribers.clone(),
+    }));
+    agent.set_event_sink(Arc::new(sink));
+
     let result = match session {
         Some(session) => agent.run_continue(session, input).await,
         None => agent.run(input).await,
     };
     drop(permit);
     match result {
+        // Core 层优雅取消映射为 Runtime 的取消终态，不保留续跑会话。
+        Ok(run) if run.cancelled => AgentTaskCompletion {
+            outcome: AgentOutcome::Cancelled,
+            session: None,
+        },
         Ok(run) => AgentTaskCompletion {
             session: Some(run.session.clone()),
             outcome: AgentOutcome::Succeeded { result: run.into() },
@@ -1993,6 +2085,104 @@ mod tests {
             .status(&second.id)
             .await
             .expect_err("兄弟节点不能读取状态");
+        assert!(matches!(error, AgentRuntimeError::PermissionDenied { .. }));
+    }
+
+    /// 订阅应收到订阅之后的事件，并在目标进入终态后自然结束。
+    #[tokio::test]
+    async fn subscribe_streams_events_until_terminal() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(Notify::new());
+        let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
+        let root = runtime
+            .attach_root(
+                template(
+                    Arc::new(BlockingModel {
+                        entered: entered.clone(),
+                        release: release.clone(),
+                    }),
+                    "blocking",
+                    &[],
+                ),
+                AgentPermissions::default(),
+            )
+            .await
+            .expect("挂载根 Agent");
+        let api = runtime.api(&root.id).await.expect("绑定根 API");
+        let child = api
+            .spawn(AgentSpawnRequest::new("阻塞任务"))
+            .await
+            .expect("派生阻塞 Agent");
+
+        let mut stream = api.subscribe(&child.id).await.expect("订阅子 Agent 事件");
+        for _ in 0..100 {
+            if entered.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(entered.load(Ordering::Acquire));
+        release.notify_one();
+
+        let mut kinds = Vec::new();
+        while let Some(event) = stream.next().await {
+            kinds.push(event.kind);
+        }
+        assert!(kinds.contains(&agent_core::AgentEventKind::RunFinished));
+        assert_eq!(
+            api.wait(&child.id).await.expect("读取终态").status(),
+            AgentStatus::Succeeded
+        );
+    }
+
+    /// 目标已处于终态时订阅返回立即结束的空流。
+    #[tokio::test]
+    async fn subscribe_after_terminal_returns_ended_stream() {
+        let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
+        let root = runtime
+            .attach_root(
+                template(Arc::new(FixedModel), "fixed", &[]),
+                AgentPermissions::default(),
+            )
+            .await
+            .expect("挂载根 Agent");
+        let api = runtime.api(&root.id).await.expect("绑定根 API");
+        let child = api
+            .spawn(AgentSpawnRequest::new("执行任务"))
+            .await
+            .expect("派生 Agent");
+        api.wait(&child.id).await.expect("等待终态");
+
+        let mut stream = api.subscribe(&child.id).await.expect("终态后订阅");
+        assert!(stream.next().await.is_none());
+    }
+
+    /// 订阅受后代范围限制：兄弟节点不能订阅彼此的事件。
+    #[tokio::test]
+    async fn subscribe_is_descendant_scoped() {
+        let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
+        let root = runtime
+            .attach_root(
+                template(Arc::new(FixedModel), "fixed", &[]),
+                AgentPermissions::default(),
+            )
+            .await
+            .expect("挂载根 Agent");
+        let root_api = runtime.api(&root.id).await.expect("绑定根 API");
+        let first = root_api
+            .spawn(AgentSpawnRequest::new("一"))
+            .await
+            .expect("派生第一个");
+        let second = root_api
+            .spawn(AgentSpawnRequest::new("二"))
+            .await
+            .expect("派生第二个");
+        let first_api = runtime.api(&first.id).await.expect("绑定第一个 API");
+
+        let error = first_api
+            .subscribe(&second.id)
+            .await
+            .expect_err("兄弟节点不能订阅事件");
         assert!(matches!(error, AgentRuntimeError::PermissionDenied { .. }));
     }
 }

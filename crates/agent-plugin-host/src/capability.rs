@@ -892,6 +892,13 @@ mod tests {
         async fn cancel(&self, _target: &AgentId) -> RuntimeResult<bool> {
             Ok(true)
         }
+
+        async fn subscribe(
+            &self,
+            _target: &AgentId,
+        ) -> RuntimeResult<agent_runtime::AgentEventStream> {
+            panic!("WASM dispatcher 尚未桥接事件订阅")
+        }
     }
 
     struct NoopProvisioner;
