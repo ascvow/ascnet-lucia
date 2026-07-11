@@ -68,6 +68,9 @@ pub enum UiPlacement {
     Left,
     /// 覆盖主界面的模态对话框。
     Dialog,
+    /// Replace the main text input while visible and receive keys immediately.
+    /// 可见时替换主输入区并立即接收按键。
+    Input,
     /// A full-screen subview type whose instances are created by navigation requests.
     /// 替换主视图的全屏子视图类型，由导航请求创建实例。
     Subview,

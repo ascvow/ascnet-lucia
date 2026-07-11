@@ -2,7 +2,9 @@
 //! Lucia TUI 的根视图编排组件。
 
 #[cfg(feature = "plugins")]
-use super::{render_docked_plugin_views, render_plugin_dialog, render_plugin_subview};
+use super::{
+    render_docked_plugin_views, render_plugin_dialog, render_plugin_input, render_plugin_subview,
+};
 use crate::*;
 
 /// Selects and renders the main view, plugin slots, dialogs, or the active subview.
@@ -26,6 +28,8 @@ pub(crate) fn render_root(frame: &mut Frame, app: &mut App) {
     #[cfg(not(feature = "plugins"))]
     let workspace = outer;
     render_main(frame, app, workspace);
+    #[cfg(feature = "plugins")]
+    render_plugin_input(frame, app, workspace);
     #[cfg(feature = "plugins")]
     render_plugin_dialog(frame, app, outer);
 }

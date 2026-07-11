@@ -3,7 +3,7 @@
 use agent_core::{AgentExtension, ToolDecision};
 use agent_plugin_host::{
     manifest::TOOL_POLICY_CAPABILITY,
-    ui::{UiInput, UiInputEvent, UiRenderRequest},
+    ui::{UiInput, UiInputEvent, UiPlacement, UiRenderRequest},
     wasm::load_wasm_plugins,
     PluginHost,
 };
@@ -21,7 +21,8 @@ async fn wasm_host_routes_sandbox_approval() {
         .await
         .expect("加载 Sandbox WASM 插件");
     assert_eq!(host.capability_owner(TOOL_POLICY_CAPABILITY), Some("sandbox"));
-    host.ui_declarations().await.expect("建立 Sandbox UI 路由");
+    let declarations = host.ui_declarations().await.expect("建立 Sandbox UI 路由");
+    assert_eq!(declarations[0].placement, UiPlacement::Input);
 
     let secret = ToolCall::new("secret", "read_file", json!({"path": ".env"}));
     assert!(matches!(
@@ -49,7 +50,7 @@ async fn wasm_host_routes_sandbox_approval() {
             view_id: APPROVAL_VIEW.into(),
             instance_id: None,
             width: 68,
-            height: 12,
+            height: 3,
             focused: true,
             frame: 1,
         })

@@ -52,6 +52,8 @@ Dialog 可见时优先接收输入。普通停靠视图通过 Tab 与主输入�
 
 Lucia 主视图是导航栈的固定根节点。插件可以声明 `UiPlacement::Subview` 视图类型，再通过 `PluginHostApi::navigate_view` 请求 `Push`、`Replace` 或 `Pop`。Host 只提供导航、所有权校验、幂等去重、渲染和输入路由，不理解 sub-agent、workflow、邮箱或其他业务语义。
 
+`UiPlacement::Input` 用于短时、必须立即处理的交互。视图可见时替换主文本输入区并自动获取按键焦点，隐藏后恢复主输入；适合审批和确认，不适合承载长内容。插件仍只返回声明式文本与样式，具体快捷键语义由插件处理。
+
 ```rust
 fn describe_ui(&self) -> Vec<UiDeclaration> {
     vec![UiDeclaration {

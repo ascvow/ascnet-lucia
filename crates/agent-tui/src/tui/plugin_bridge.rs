@@ -13,7 +13,10 @@ pub(crate) async fn refresh_plugin_views(app: &mut App, plugin_host: &dyn Plugin
     .await;
     for (plugin_id, view_id, instance_id, result) in rendered {
         match result {
-            Ok(Some(frame)) => app.update_plugin_frame(&plugin_id, instance_id.as_deref(), frame),
+            Ok(Some(frame)) => {
+                app.update_plugin_frame(&plugin_id, instance_id.as_deref(), frame);
+                focus_visible_input_view(app);
+            }
             Ok(None) => {}
             Err(error) => {
                 app.set_plugin_ui_error(&plugin_id, &view_id, instance_id.as_deref(), &error)
@@ -39,9 +42,28 @@ pub(crate) async fn refresh_plugin_view(
     let (plugin_id, view_id, instance_id, result) =
         render_plugin_request(plugin_host, request).await;
     match result {
-        Ok(Some(frame)) => app.update_plugin_frame(&plugin_id, instance_id.as_deref(), frame),
+        Ok(Some(frame)) => {
+            app.update_plugin_frame(&plugin_id, instance_id.as_deref(), frame);
+            focus_visible_input_view(app);
+        }
         Ok(None) => {}
         Err(error) => app.set_plugin_ui_error(&plugin_id, &view_id, instance_id.as_deref(), &error),
+    }
+}
+
+/// 可见 Input 视图自动占用主输入焦点，隐藏后由 App 恢复主输入。
+fn focus_visible_input_view(app: &mut App) {
+    if let Some(index) = app
+        .plugin_views
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, view)| {
+            (view.declaration.placement == UiPlacement::Input && plugin_view_visible(view))
+                .then_some(index)
+        })
+    {
+        app.plugin_focus = Some(index);
     }
 }
 

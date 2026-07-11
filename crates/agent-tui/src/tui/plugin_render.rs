@@ -32,7 +32,7 @@ pub(crate) fn render_docked_plugin_views(frame: &mut Frame, app: &mut App, outer
                     .size
                     .width
                     .unwrap_or_else(|| default_plugin_width(placement)),
-                UiPlacement::Dialog | UiPlacement::Subview => 0,
+                UiPlacement::Dialog | UiPlacement::Input | UiPlacement::Subview => 0,
             };
             let (plugin_area, next_remaining) = split_plugin_area(remaining, placement, requested);
             remaining = next_remaining;
@@ -97,7 +97,7 @@ fn split_plugin_area(area: Rect, placement: UiPlacement, requested: u16) -> (Rec
                 Rect::new(area.x, area.y, area.width.saturating_sub(size), area.height),
             )
         }
-        UiPlacement::Dialog | UiPlacement::Subview => (Rect::default(), area),
+        UiPlacement::Dialog | UiPlacement::Input | UiPlacement::Subview => (Rect::default(), area),
     }
 }
 
@@ -209,6 +209,45 @@ fn plugin_frame_lines(plugin_frame: &PluginUiFrame) -> Vec<Line<'static>> {
             )
         })
         .collect()
+}
+
+/// 用可见的 Input 插件视图替换主文本输入区。
+pub(crate) fn render_plugin_input(frame: &mut Frame, app: &mut App, workspace: Rect) {
+    let Some(index) = app
+        .plugin_views
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, view)| {
+            view.declaration.placement == UiPlacement::Input && plugin_view_visible(view)
+        })
+        .map(|(index, _)| index)
+    else {
+        return;
+    };
+    let area = Rect::new(
+        workspace.x,
+        workspace
+            .y
+            .saturating_add(workspace.height.saturating_sub(4)),
+        workspace.width,
+        3.min(workspace.height.saturating_sub(1)),
+    );
+    if area.is_empty() {
+        return;
+    }
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
+        .padding(Padding::new(1, 1, 0, 0));
+    app.plugin_views[index].area = block.inner(area);
+    let lines = app.plugin_views[index]
+        .frame
+        .as_ref()
+        .map(plugin_frame_lines)
+        .unwrap_or_default();
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// 将稳定插件样式子集映射到当前 Ratatui 样式。

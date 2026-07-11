@@ -2051,6 +2051,7 @@ impl App {
             .filter(|(_, view)| {
                 view.declaration.focusable
                     && view.declaration.placement != UiPlacement::Dialog
+                    && view.declaration.placement != UiPlacement::Input
                     && plugin_view_visible(view)
             })
             .map(|(index, _)| index)
@@ -2826,6 +2827,7 @@ fn default_plugin_width(placement: UiPlacement) -> u16 {
     match placement {
         UiPlacement::Left | UiPlacement::Right => 28,
         UiPlacement::Dialog | UiPlacement::Subview => 60,
+        UiPlacement::Input => 40,
         UiPlacement::Top | UiPlacement::Bottom => 40,
     }
 }
@@ -2836,6 +2838,7 @@ fn default_plugin_height(placement: UiPlacement) -> u16 {
     match placement {
         UiPlacement::Top | UiPlacement::Bottom => 6,
         UiPlacement::Dialog | UiPlacement::Subview => 20,
+        UiPlacement::Input => 3,
         UiPlacement::Left | UiPlacement::Right => 10,
     }
 }

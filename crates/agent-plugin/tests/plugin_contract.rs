@@ -77,6 +77,7 @@ fn guest_ui_types_match_contract_fixture() {
     let fixture = ui_fixture();
 
     assert_round_trip::<UiDeclaration>(&fixture["declaration"]);
+    assert_round_trip::<UiDeclaration>(&fixture["input_declaration"]);
     assert_round_trip::<UiRenderRequest>(&fixture["render_request"]);
     assert_round_trip::<UiFrame>(&fixture["frame"]);
     assert_round_trip::<UiInput>(&fixture["input"]);

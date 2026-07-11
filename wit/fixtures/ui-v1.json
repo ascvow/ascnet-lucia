@@ -10,6 +10,17 @@
     },
     "focusable": true
   },
+  "input_declaration": {
+    "plugin_id": "fixture-plugin",
+    "view_id": "approval",
+    "title": "审批",
+    "placement": "input",
+    "size": {
+      "width": null,
+      "height": 3
+    },
+    "focusable": true
+  },
   "render_request": {
     "plugin_id": "fixture-plugin",
     "view_id": "detail",

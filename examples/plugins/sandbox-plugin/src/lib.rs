@@ -1,8 +1,8 @@
 //! Agent 工具策略与交互审批插件。
 
 use agent_plugin::{
-    export_plugin, AgentPlugin, ToolCall, ToolDecision, ToolResult, UiColor, UiDeclaration,
-    UiFrame, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    export_plugin, AgentPlugin, ToolCall, ToolDecision, UiColor, UiDeclaration, UiFrame, UiInput,
+    UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
 use std::{collections::BTreeMap, path::Component};
 
@@ -13,12 +13,12 @@ const APPROVAL_VIEW: &str = "sandbox-approval";
 enum ApprovalResolution {
     Allow,
     Deny,
+    Cancel,
 }
 
 /// 等待用户处理的一次工具调用。
 #[derive(Debug, Clone)]
 struct PendingApproval {
-    request_id: String,
     call_id: String,
     tool_name: String,
     summary: String,
@@ -29,35 +29,28 @@ struct PendingApproval {
 pub struct SandboxPlugin {
     pending: Vec<PendingApproval>,
     resolutions: BTreeMap<String, ApprovalResolution>,
-    allowed: u64,
-    denied: u64,
-    completed: u64,
+    selected: usize,
 }
 
 impl AgentPlugin for SandboxPlugin {
     fn before_tool(&mut self, call: ToolCall) -> ToolDecision {
         if let Some(resolution) = self.resolutions.remove(&call.id) {
             return match resolution {
-                ApprovalResolution::Allow => {
-                    self.allowed = self.allowed.saturating_add(1);
-                    ToolDecision::Allow
-                }
-                ApprovalResolution::Deny => {
-                    self.denied = self.denied.saturating_add(1);
-                    ToolDecision::Block {
-                        reason: format!("用户拒绝执行工具 `{}`", call.name),
-                    }
-                }
+                ApprovalResolution::Allow => ToolDecision::Allow,
+                ApprovalResolution::Deny => ToolDecision::Block {
+                    reason: format!("用户拒绝执行工具 `{}`", call.name),
+                },
+                ApprovalResolution::Cancel => ToolDecision::Block {
+                    reason: format!("用户取消工具 `{}` 的本次调用", call.name),
+                },
             };
         }
 
         if let Some(reason) = blocked_reason(&call) {
-            self.denied = self.denied.saturating_add(1);
             return ToolDecision::Block { reason };
         }
 
         if !requires_approval(&call) {
-            self.allowed = self.allowed.saturating_add(1);
             return ToolDecision::Allow;
         }
 
@@ -68,7 +61,6 @@ impl AgentPlugin for SandboxPlugin {
             .any(|pending| pending.call_id == call.id)
         {
             self.pending.push(PendingApproval {
-                request_id: request_id.clone(),
                 call_id: call.id.clone(),
                 tool_name: call.name.clone(),
                 summary: approval_summary(&call),
@@ -81,19 +73,15 @@ impl AgentPlugin for SandboxPlugin {
         }
     }
 
-    fn after_tool(&mut self, _result: ToolResult) {
-        self.completed = self.completed.saturating_add(1);
-    }
-
     fn describe_ui(&self) -> Vec<UiDeclaration> {
         vec![UiDeclaration {
             plugin_id: String::new(),
             view_id: APPROVAL_VIEW.into(),
             title: "Agent 工具审批".into(),
-            placement: UiPlacement::Dialog,
+            placement: UiPlacement::Input,
             size: UiSize {
-                width: Some(68),
-                height: Some(12),
+                width: None,
+                height: Some(3),
             },
             focusable: true,
         }]
@@ -115,16 +103,12 @@ impl AgentPlugin for SandboxPlugin {
             view_id: APPROVAL_VIEW.into(),
             visible: true,
             lines: vec![
-                styled_line("Agent 请求执行受控工具", UiColor::Yellow, true),
-                plain_line(format!("工具：{}", pending.tool_name)),
-                plain_line(format!("请求：{}", pending.request_id)),
-                plain_line(format!("摘要：{}", pending.summary)),
-                plain_line(""),
-                styled_line("Enter 允许一次    Esc/D 拒绝", UiColor::Cyan, false),
-                plain_line(format!(
-                    "已允许 {} · 已拒绝 {} · 已完成 {}",
-                    self.allowed, self.denied, self.completed
-                )),
+                styled_line(
+                    format!("› 审批 {} · {}", pending.tool_name, pending.summary),
+                    UiColor::Yellow,
+                    true,
+                ),
+                approval_options(self.selected),
             ],
         })
     }
@@ -133,17 +117,40 @@ impl AgentPlugin for SandboxPlugin {
         if input.view_id != APPROVAL_VIEW || self.pending.is_empty() {
             return;
         }
-        let resolution = match input.event {
-            UiInputEvent::Key { ref code, .. } if code == "enter" => ApprovalResolution::Allow,
-            UiInputEvent::Key { ref code, .. }
-                if code == "escape" || code.eq_ignore_ascii_case("d") =>
-            {
-                ApprovalResolution::Deny
-            }
-            _ => return,
+        let UiInputEvent::Key { code, .. } = input.event else {
+            return;
         };
+        match code.as_str() {
+            "left" | "up" => {
+                self.selected = self.selected.checked_sub(1).unwrap_or(2);
+                return;
+            }
+            "right" | "down" | "tab" => {
+                self.selected = (self.selected + 1) % 3;
+                return;
+            }
+            "y" | "Y" => self.resolve_current(ApprovalResolution::Allow),
+            "n" | "N" => self.resolve_current(ApprovalResolution::Deny),
+            "c" | "C" | "escape" => self.resolve_current(ApprovalResolution::Cancel),
+            "enter" => match self.selected {
+                0 => self.resolve_current(ApprovalResolution::Allow),
+                1 => self.resolve_current(ApprovalResolution::Deny),
+                _ => self.resolve_current(ApprovalResolution::Cancel),
+            },
+            _ => {}
+        }
+    }
+}
+
+impl SandboxPlugin {
+    /// 处理当前审批并重置下一条请求的默认选项。
+    fn resolve_current(&mut self, resolution: ApprovalResolution) {
+        if self.pending.is_empty() {
+            return;
+        }
         let pending = self.pending.remove(0);
         self.resolutions.insert(pending.call_id, resolution);
+        self.selected = 0;
     }
 }
 
@@ -236,15 +243,6 @@ fn redact_command(command: &str) -> String {
     }
 }
 
-fn plain_line(text: impl Into<String>) -> UiLine {
-    UiLine {
-        spans: vec![UiSpan {
-            text: text.into(),
-            style: UiStyle::default(),
-        }],
-    }
-}
-
 fn styled_line(text: impl Into<String>, color: UiColor, bold: bool) -> UiLine {
     UiLine {
         spans: vec![UiSpan {
@@ -255,6 +253,44 @@ fn styled_line(text: impl Into<String>, color: UiColor, bold: bool) -> UiLine {
                 ..UiStyle::default()
             },
         }],
+    }
+}
+
+/// 渲染可用方向键切换的审批选项行。
+fn approval_options(selected: usize) -> UiLine {
+    UiLine {
+        spans: vec![
+            option_span(" Y 允许一次 ", selected == 0, UiColor::Green),
+            UiSpan {
+                text: "  ".into(),
+                style: UiStyle::default(),
+            },
+            option_span(" N 拒绝 ", selected == 1, UiColor::Red),
+            UiSpan {
+                text: "  ".into(),
+                style: UiStyle::default(),
+            },
+            option_span(" C 取消调用 ", selected == 2, UiColor::Yellow),
+            UiSpan {
+                text: "  ←/→ 选择 · Enter 确认".into(),
+                style: UiStyle {
+                    foreground: Some(UiColor::Cyan),
+                    ..UiStyle::default()
+                },
+            },
+        ],
+    }
+}
+
+fn option_span(text: &str, selected: bool, color: UiColor) -> UiSpan {
+    UiSpan {
+        text: text.into(),
+        style: UiStyle {
+            foreground: Some(color),
+            bold: selected,
+            reversed: selected,
+            ..UiStyle::default()
+        },
     }
 }
 
@@ -308,5 +344,49 @@ mod tests {
             json!({"path": "../important.txt"}),
         ));
         assert!(matches!(decision, ToolDecision::Block { .. }));
+    }
+
+    /// 方向键切换到拒绝后，Enter 应拒绝当前调用。
+    #[test]
+    fn arrow_selection_confirms_denial() {
+        let call = ToolCall::new("shell-1", "shell", json!({"command": "cargo test"}));
+        let mut plugin = SandboxPlugin::default();
+        assert!(matches!(
+            plugin.before_tool(call.clone()),
+            ToolDecision::RequireApproval { .. }
+        ));
+        for code in ["right", "enter"] {
+            plugin.on_ui_input(UiInput {
+                plugin_id: "sandbox".into(),
+                view_id: APPROVAL_VIEW.into(),
+                instance_id: None,
+                event: UiInputEvent::Key {
+                    code: code.into(),
+                    modifiers: Vec::new(),
+                },
+            });
+        }
+        assert!(matches!(
+            plugin.before_tool(call),
+            ToolDecision::Block { .. }
+        ));
+    }
+
+    /// Y 快捷键应无需移动选择直接允许一次。
+    #[test]
+    fn y_shortcut_approves_once() {
+        let call = ToolCall::new("shell-y", "shell", json!({"command": "cargo check"}));
+        let mut plugin = SandboxPlugin::default();
+        plugin.before_tool(call.clone());
+        plugin.on_ui_input(UiInput {
+            plugin_id: "sandbox".into(),
+            view_id: APPROVAL_VIEW.into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: "y".into(),
+                modifiers: Vec::new(),
+            },
+        });
+        assert_eq!(plugin.before_tool(call), ToolDecision::Allow);
     }
 }
