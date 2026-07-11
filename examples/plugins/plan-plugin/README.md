@@ -1,5 +1,7 @@
 # Plan 插件
 
+Plan 是 Lucia 官方独立插件，随 `install:tui` 同步到 `$LUCIA_HOME/official-plugins/plan`，启动插件版 TUI 时自动加载。开发目录中也可以通过 `--plugin-manifest examples/plugins/plan-plugin/plugin.toml` 显式加载。
+
 Plan 插件向 Agent 提供两个工具：
 
 - `update_plan`：整体替换当前计划，允许附带本次调整说明。
@@ -14,10 +16,8 @@ Plan 插件向 Agent 提供两个工具：
 ## 验证
 
 ```bash
-cargo test --manifest-path examples/plugins/plan-plugin/Cargo.toml
-cargo build --manifest-path examples/plugins/plan-plugin/Cargo.toml \
-  --release \
-  --target wasm32-wasip2
+cargo test --offline --manifest-path examples/plugins/plan-plugin/Cargo.toml
+bun run build:plugin:plan
 ```
 
 构建完成后，可通过 `examples/plugins/plan-plugin/plugin.toml` 加载生成的 WASM component。

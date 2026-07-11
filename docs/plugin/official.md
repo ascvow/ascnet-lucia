@@ -60,6 +60,17 @@ Teammate 插件负责成员角色、稳定成员地址、有界邮箱、确认�
 
 Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置。
 
+## Plan 插件
+
+Plan 插件提供结构化计划的整体更新、只读查询、状态校验和右侧进度面板。计划最多只能有一个 `in_progress` 步骤，空计划表示显式清空；状态只在当前插件实例内保存。
+
+```bash
+bun run build:plugin:plan
+bun run test:plugin:plan
+```
+
+Manifest：`examples/plugins/plan-plugin/plugin.toml`。
+
 ## 统一验证
 
 ```bash
@@ -67,4 +78,4 @@ bun run build:plugin:official
 bun run test:plugin:official
 ```
 
-Context、MCP、Skill 和 Command 都以独立插件 workspace 构建，不加入原生 Workspace；每个 bundle 都包含独立 `cdylib` component。它们的扫描、解析、协议和业务规则不会进入 Agent Core 或 Plugin Host。
+Context、MCP、Skill、Command、Teammate 和 Plan 都以独立插件 workspace 构建，不加入原生 Workspace；每个 bundle 都包含独立 `cdylib` component。它们的扫描、解析、协议和业务规则不会进入 Agent Core 或 Plugin Host。

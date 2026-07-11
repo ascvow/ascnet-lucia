@@ -189,6 +189,8 @@ ABI 故意使用 JSON 字符串。这样 WIT 边界保持稳定，同时 Rust �
 
 官方 Context 插件位于 [`examples/plugins/context-plugin`](examples/plugins/context-plugin/README.md)。它声明独占的 `agent.context-loader` 能力，按上下文水位清理旧工具结果或将较旧 API 轮次替换为结构化摘要，同时原样保留近期工作上下文。
 
+官方 Plan 插件位于 [`examples/plugins/plan-plugin`](examples/plugins/plan-plugin/README.md)。它向 Agent 提供结构化计划更新与查询工具，并在右侧面板展示当前进度；默认安装器会分发并自动加载该插件。
+
 插件可以在 manifest 中使用 SemVer 声明必选或可选依赖。Host 在加载前解析依赖图，并提供版本化 JSON 服务的注册、发现与调用 API；command、Skill 等插件协议仍由插件自行定义。
 
 ## Documentation / 开发文档
@@ -237,6 +239,14 @@ lucia --list-sessions
 配置字段、路径优先级和 CAS 行为见 [TUI 配置与会话](docs/guide/tui-configuration.md)。
 
 ## Build / 构建
+
+一键构建带插件能力的主 TUI 和仓库内全部官方、示例插件：
+
+```bash
+bun run build:all
+```
+
+该命令只生成构建产物，不执行安装。主程序产物位于 `target/plugin-tui/release/lucia`，各插件产物位于自身目录的 `target/wasm32-wasip2/release`。
 
 常规构建默认包含 Plugin Host、官方插件加载和插件 UI：
 

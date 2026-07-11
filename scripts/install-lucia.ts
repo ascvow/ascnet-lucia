@@ -51,6 +51,10 @@ const bundles: OfficialPluginBundle[] = [
     id: 'teammate',
     files: ['plugin.toml', 'target/wasm32-wasip2/release/teammate_plugin.wasm'],
   },
+  {
+    id: 'plan',
+    files: ['plugin.toml', 'target/wasm32-wasip2/release/plan_plugin.wasm'],
+  },
 ]
 
 /**
