@@ -55,6 +55,17 @@ impl Session {
             .push(ModelMessage::text(MessageRole::User, text.into()));
     }
 
+    /// Push user content blocks, including image or file attachments.
+    /// 追加用户内容块，包括图片或文件附件；`content` 为空时不追加消息。
+    pub fn push_user_blocks(&mut self, content: Vec<ContentBlock>) {
+        if !content.is_empty() {
+            self.messages.push(ModelMessage {
+                role: MessageRole::User,
+                content,
+            });
+        }
+    }
+
     /// Push an assistant text message.
     /// 追加 assistant 文本消息。
     pub fn push_assistant_text(&mut self, text: impl Into<String>) {

@@ -11,7 +11,8 @@
 //! provider 特有参数（在过滤之后合并，不受白名单约束）。
 
 use super::util::{
-    decode_json_response, endpoint_url, ensure_output_text, header_map, merge_provider_options,
+    decode_json_response, endpoint_url, ensure_output_text, file_attachment_fallback_text,
+    header_map, merge_provider_options,
 };
 use super::{
     ChatModel, ContentBlock, FinishReason, MessageRole, ModelEventSender, ModelEventStream,
@@ -755,7 +756,10 @@ fn messages_to_responses_input(messages: &[super::ModelMessage]) -> Result<Value
                 push_text_input(&mut input, "developer", message.text_content());
             }
             MessageRole::User => {
-                push_text_input(&mut input, "user", message.text_content());
+                let parts = user_blocks_to_responses_content(&message.content);
+                if !parts.is_empty() {
+                    input.push(json!({ "role": "user", "content": parts }));
+                }
             }
             MessageRole::Assistant => {
                 let text = message.text_content();
@@ -802,17 +806,121 @@ fn push_text_input(input: &mut Vec<Value>, role: &str, text: String) {
     }
 }
 
+/// 将用户消息内容块转换为 Responses API 的 `input` 内容部件。
+///
+/// 图片映射为 data URL 形式的 `input_image`，PDF 走原生 `input_file`，
+/// 其余文件类型降级为内联文本或占位说明。
+fn user_blocks_to_responses_content(blocks: &[ContentBlock]) -> Vec<Value> {
+    let mut parts = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                parts.push(json!({ "type": "input_text", "text": text }));
+            }
+            ContentBlock::Image { media_type, data } => {
+                parts.push(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{media_type};base64,{data}"),
+                }));
+            }
+            ContentBlock::File {
+                name,
+                media_type,
+                data,
+            } => {
+                if media_type == "application/pdf" {
+                    parts.push(json!({
+                        "type": "input_file",
+                        "filename": name,
+                        "file_data": format!("data:{media_type};base64,{data}"),
+                    }));
+                } else {
+                    parts.push(json!({
+                        "type": "input_text",
+                        "text": file_attachment_fallback_text(name, media_type, data),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    parts
+}
+
+/// 将用户消息内容块转换为 Chat Completions 的 content 部件数组。
+///
+/// 与 Responses 版本的差异只在字段命名：图片使用 `image_url` 对象，PDF 使用
+/// `file` 部件（官方 OpenAI 支持），其余文件类型降级为内联文本或占位说明。
+fn user_blocks_to_chat_content(blocks: &[ContentBlock]) -> Vec<Value> {
+    let mut parts = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                parts.push(json!({ "type": "text", "text": text }));
+            }
+            ContentBlock::Image { media_type, data } => {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{media_type};base64,{data}") },
+                }));
+            }
+            ContentBlock::File {
+                name,
+                media_type,
+                data,
+            } => {
+                if media_type == "application/pdf" {
+                    parts.push(json!({
+                        "type": "file",
+                        "file": {
+                            "filename": name,
+                            "file_data": format!("data:{media_type};base64,{data}"),
+                        },
+                    }));
+                } else {
+                    parts.push(json!({
+                        "type": "text",
+                        "text": file_attachment_fallback_text(name, media_type, data),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    parts
+}
+
 fn message_to_openai_chat_messages(message: &super::ModelMessage) -> Result<Vec<Value>> {
     let mut out = Vec::new();
 
     match &message.role {
-        MessageRole::System | MessageRole::Developer | MessageRole::User => {
+        MessageRole::System | MessageRole::Developer => {
             let text = message.text_content();
             if !text.is_empty() {
                 out.push(json!({
                     "role": message.role.as_str(),
                     "content": text,
                 }));
+            }
+        }
+        MessageRole::User => {
+            let has_attachment = message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Image { .. } | ContentBlock::File { .. }
+                )
+            });
+            if has_attachment {
+                let parts = user_blocks_to_chat_content(&message.content);
+                if !parts.is_empty() {
+                    out.push(json!({ "role": "user", "content": parts }));
+                }
+            } else {
+                // 纯文本保持字符串 content，兼容不支持数组 content 的网关。
+                let text = message.text_content();
+                if !text.is_empty() {
+                    out.push(json!({ "role": "user", "content": text }));
+                }
             }
         }
         MessageRole::Assistant => {
@@ -1112,6 +1220,66 @@ fn normalize_openai_base_url(base_url: Option<String>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造带文本、图片和 PDF 的用户消息，覆盖附件转换路径。
+    fn attachment_message() -> super::super::ModelMessage {
+        super::super::ModelMessage {
+            role: MessageRole::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "看看 [Image#1] 和 [FILE#报告.pdf]".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "aGVsbG8=".to_string(),
+                },
+                ContentBlock::File {
+                    name: "报告.pdf".to_string(),
+                    media_type: "application/pdf".to_string(),
+                    data: "cGRm".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// Responses 输入中的用户附件映射为 input_image 与 input_file 部件。
+    #[test]
+    fn responses_user_attachments_map_to_parts() {
+        let input = messages_to_responses_input(&[attachment_message()]).expect("转换应成功");
+        let parts = input[0]["content"].as_array().expect("content 应为数组");
+
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["image_url"], "data:image/png;base64,aGVsbG8=");
+        assert_eq!(parts[2]["type"], "input_file");
+        assert_eq!(parts[2]["filename"], "报告.pdf");
+    }
+
+    /// Chat Completions 中带附件的用户消息使用 content 部件数组。
+    #[test]
+    fn chat_user_attachments_map_to_parts() {
+        let out = message_to_openai_chat_messages(&attachment_message()).expect("转换应成功");
+        let parts = out[0]["content"].as_array().expect("content 应为数组");
+
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        assert_eq!(parts[2]["type"], "file");
+        assert_eq!(parts[2]["file"]["filename"], "报告.pdf");
+    }
+
+    /// 纯文本用户消息在 Chat Completions 中保持字符串 content 形态。
+    #[test]
+    fn chat_text_only_user_message_keeps_string_content() {
+        let message = super::super::ModelMessage::text(MessageRole::User, "你好");
+        let out = message_to_openai_chat_messages(&message).expect("转换应成功");
+
+        assert_eq!(out[0]["content"], "你好");
+    }
 
     /// 裸域名形式的 OpenAI 兼容地址会自动补 `/v1`。
     #[test]

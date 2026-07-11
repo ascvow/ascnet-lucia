@@ -188,6 +188,41 @@ pub(super) fn endpoint_url(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
 }
 
+/// 判断附件媒体类型是否可以安全地内联为纯文本。
+pub(super) fn is_text_media_type(media_type: &str) -> bool {
+    media_type.starts_with("text/")
+        || media_type.ends_with("+json")
+        || media_type.ends_with("+xml")
+        || matches!(
+            media_type,
+            "application/json"
+                | "application/xml"
+                | "application/javascript"
+                | "application/toml"
+                | "application/yaml"
+                | "application/x-yaml"
+        )
+}
+
+/// 将 provider 不原生支持的文件附件降级为文本。
+///
+/// 文本类型解码后内联文件内容；解码失败或二进制类型生成占位说明，
+/// 保证模型始终能看到附件存在，而不是被静默丢弃。
+pub(super) fn file_attachment_fallback_text(name: &str, media_type: &str, data: &str) -> String {
+    use base64::Engine;
+
+    if is_text_media_type(media_type) {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        if let Some(text) = decoded {
+            return format!("[附件 {name}]\n{text}");
+        }
+    }
+    format!("[附件 {name}（{media_type}）无法内联发送，内容已省略]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

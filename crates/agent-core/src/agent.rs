@@ -329,8 +329,8 @@ impl Agent {
     /// 注册或替换 provider，并选择后续 run 使用的模型。
     ///
     /// This is the main function entry for systems that keep model configuration
-    /// outside ascnet-lucia-core.
-    /// 对于在 ascnet-lucia-core 外部维护模型配置的系统，这是主要函数入口。
+    /// outside agent-core.
+    /// 对于在 agent-core 外部维护模型配置的系统，这是主要函数入口。
     pub fn set_model_config(&mut self, config: AgentModelConfig) -> Result<&mut Self> {
         let provider_name = config.provider.name.clone();
         self.gateway.upsert_from_config(config.provider)?;
@@ -578,12 +578,38 @@ impl Agent {
         }
     }
 
+    /// 为一次用户输入准备可先行持久化的会话。
+    ///
+    /// 空会话会补充当前 Agent 的 system 提示，随后只追加一次用户消息。应用层可先保存
+    /// 返回值，再调用 [`Agent::run_session`]，从而保证模型请求失败时仍保留用户输入。
+    pub fn prepare_session(&self, mut session: Session, input: impl Into<String>) -> Session {
+        if session.system().is_none() {
+            session.set_system(self.options.system_prompt.clone());
+        }
+        session.push_user(input.into());
+        session
+    }
+
+    /// 为一次多内容块的用户输入准备可先行持久化的会话。
+    ///
+    /// 行为与 [`Agent::prepare_session`] 一致，但允许调用方提供文本、图片、
+    /// 文件附件等任意用户内容块组合；`content` 为空时不追加用户消息。
+    pub fn prepare_session_blocks(
+        &self,
+        mut session: Session,
+        content: Vec<crate::model::ContentBlock>,
+    ) -> Session {
+        if session.system().is_none() {
+            session.set_system(self.options.system_prompt.clone());
+        }
+        session.push_user_blocks(content);
+        session
+    }
+
     /// Run the ReAct loop for one user input.
     /// 对一次用户输入运行 ReAct 循环。
     pub async fn run(&self, input: impl Into<String>) -> Result<AgentRun> {
-        let mut session = Session::new();
-        session.set_system(self.options.system_prompt.clone());
-        session.push_user(input.into());
+        let session = self.prepare_session(Session::new(), input);
         self.run_session(session).await
     }
 
@@ -591,10 +617,10 @@ impl Agent {
     /// Continue the ReAct loop on an existing session.
     pub async fn run_continue(
         &self,
-        mut session: Session,
+        session: Session,
         input: impl Into<String>,
     ) -> Result<AgentRun> {
-        session.push_user(input.into());
+        let session = self.prepare_session(session, input);
         self.run_session(session).await
     }
 

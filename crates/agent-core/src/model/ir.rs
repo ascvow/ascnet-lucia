@@ -63,6 +63,23 @@ pub enum ContentBlock {
 
     /// 宿主工具或扩展返回的工具结果块。
     ToolResult { result: ToolResult },
+
+    /// 用户提供的图片附件。
+    ///
+    /// `data` 为 base64 编码的原始图片字节；`media_type` 为标准 MIME 类型
+    /// （如 `image/png`）。适配器负责映射为各 provider 的图片输入格式。
+    Image { media_type: String, data: String },
+
+    /// 用户提供的文件附件。
+    ///
+    /// `data` 为 base64 编码的原始文件字节。适配器按 `media_type` 选择映射：
+    /// 原生支持的类型（如 PDF）走 provider 文档输入，文本类型内联为文本，
+    /// 其余类型降级为占位说明，不会静默丢弃。
+    File {
+        name: String,
+        media_type: String,
+        data: String,
+    },
 }
 
 impl ContentBlock {
