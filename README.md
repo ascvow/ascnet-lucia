@@ -1,363 +1,153 @@
 # Lucia
 
-`Lucia` 是一个 Rust workspace，用于实现最小 ReAct Agent 核心、模型协议转换层，以及 WASM Component Model 插件系统。
+Lucia 是一个用 Rust 实现的可嵌入 ReAct Agent 运行时，同时提供交互式 TUI 和基于 WASM Component Model 的插件系统。
 
-Author / 作者：`ascvow`
+你可以用它完成三类工作：
 
-## Design boundary / 设计边界
+- 直接运行 `lucia`，获得带会话、工具和官方插件的终端 Agent。
+- 在 Rust 应用中使用 `agent-core`，自行控制模型、工具、事件和会话。
+- 编写独立 WASM 插件，在不修改 Core 的情况下接入 MCP、Skill、命令、工作流或自定义界面。
 
-core 只负责 ReAct 循环、会话状态、模型协议转换、事件和通用扩展点，不依赖插件 manifest、UI 协议、Wasmtime 或插件宿主 crate。
+## 先运行起来
 
-```text
-agent-core
-  ReAct loop / ReAct 循环
-  Session / 会话
-  ModelGateway / 模型协议转换层
-  OpenAI Responses adapter / OpenAI Responses 适配器
-  OpenAI Chat Completions adapter / OpenAI-compatible 适配器
-  Anthropic Messages adapter / Anthropic Messages 适配器
-  AgentExtension / 通用 Agent 扩展点
+环境要求：Rust stable、[Bun](https://bun.sh/)；WASM 插件使用 `wasm32-wasip2` target。仓库的 `rust-toolchain.toml` 已声明所需 target。
 
-agent-tool
-  ToolSpec / ToolCall / ToolResult
-  Tool trait / ToolRegistry
+先用内置脚本模型验证完整 ReAct 和工具调用流程，不需要 API key：
 
-agent-session
-  Versioned session record / 版本化会话记录
-  Memory and atomic file stores / 内存与原子文件存储
-
-agent-runtime
-  Agent derivation and lifecycle / Agent 派生与生命周期
-  Permission narrowing and private session continuation / 权限收缩与私有会话续跑
-
-agent-plugin
-  Guest SDK / 插件侧 SDK
-  AgentPlugin trait
-  export_plugin! macro
-
-agent-plugin-host
-  Plugin manifest / 插件 manifest
-  WASM host / Wasmtime 插件宿主
-  Plugin UI protocol / 插件 UI 协议
-  AgentExtension adapter / core 扩展适配器
-
-agent-plugin-manager
-  Local bundle install / 本地 bundle 安装
-  Dependency and capability checks / 依赖与能力检查
-  Integrity lock and diagnostics / 完整性锁与诊断
+```bash
+cargo run -p agent-basic-cli -- --demo "你好"
 ```
 
-`agent-core` 只能定义 Agent 运行所需的通用消息、上下文、工具、事件和扩展契约，不得依赖 Plugin Host、WASM ABI、插件 manifest 或 UI。`agent-plugin-host` 只负责 ABI、生命周期、能力鉴权、贡献注册和 owner 路由，不得解析或实现 MCP、Skill、上下文压缩等具体扩展需求。具体协议和业务能力必须位于独立插件 crate，其端到端测试也归插件所有。
+预期输出包含原生 `echo` 工具返回的输入内容。然后安装完整 TUI 和官方插件：
 
-There is no independent HTTP proxy server in this project. Provider wire formats are converted in-process through `ModelGateway` and provider adapters.
+```bash
+bun run install:tui
+lucia --demo
+```
 
-本项目没有独立 HTTP proxy server。不同服务商的 wire format 通过进程内 `ModelGateway` 和 provider adapter 完成转换。
+首次直接运行 `lucia` 时会创建 `$HOME/.lucia/config.toml`。没有配置模型密钥时，TUI 自动使用本地演示模型。
 
-## Runtime model config / 运行时模型配置
+更完整的首次运行说明见[快速开始](docs/guide/quick-start.md)。
 
-`agent-core` does not persist model configuration. The caller owns API keys, selected provider, model id, and config storage. Core provides explicit runtime entry points: `Agent::from_model_config`, `Agent::set_model_config`, `Agent::set_model_provider_config`, `Agent::set_model_selection`, `Agent::set_model_route`, `Agent::set_provider_options`, `Agent::options_mut`, and `ModelGateway::upsert_from_config`.
+## 配置真实模型
 
-`agent-core` 不持久化模型配置。API key、当前服务商、模型 ID 和配置存储都由调用方维护。core 提供明确的运行时入口：`Agent::from_model_config`、`Agent::set_model_config`、`Agent::set_model_provider_config`、`Agent::set_model_selection`、`Agent::set_model_route`、`Agent::set_provider_options`、`Agent::options_mut` 和 `ModelGateway::upsert_from_config`。
+推荐让配置文件只保存环境变量名，不保存密钥。编辑 `$HOME/.lucia/config.toml`：
+
+```toml
+[model]
+name = "default"
+provider = "open-ai"
+base_url = "https://api.openai.com/v1"
+model = "替换为账号可用的模型 ID"
+api_key_env = "OPENAI_API_KEY"
+openai_protocol = "responses"
+
+[agent]
+max_steps = 8
+max_tokens = 4096
+```
+
+设置密钥并启动：
+
+```bash
+export OPENAI_API_KEY="你的密钥"
+lucia
+```
+
+Anthropic、OpenAI-compatible 服务和自定义配置路径见 [TUI 配置与会话](docs/guide/tui-configuration.md)。
+
+## 常用例子
+
+### 恢复会话
+
+普通启动会创建空白会话。可以在 TUI 输入 `/resume`，也可以从命令行恢复：
+
+```bash
+lucia --list-sessions
+lucia --resume-latest
+lucia --session-id design-review
+```
+
+### 记录 Agent 事件
+
+```bash
+lucia --events-jsonl ./runs/events.jsonl
+```
+
+JSONL 文件会记录模型、工具和 ReAct 生命周期事件，适合定位请求与路由问题。
+
+### 加载一个 WASM 插件
+
+```bash
+bun run build:plugin:echo
+cargo run -p agent-basic-cli -- --demo \
+  --plugin-manifest examples/plugins/echo-plugin/plugin.toml \
+  "hello from wasm"
+```
+
+这个例子会把 `echo` 工具交给 WASM 插件处理。完整插件教程见[创建 WASM 插件](docs/plugin/quick-start.md)。
+
+更多可直接复用的命令和代码见[常用场景示例](docs/guide/examples.md)。
+
+## 在 Rust 中嵌入
+
+仓库内可以通过 TOML 配置构造 Agent：
 
 ```rust
-use agent_core::{Agent, AgentModelConfig, ModelProviderConfig};
+use agent_core::AgentRootConfig;
+use anyhow::Result;
 
-let provider = ModelProviderConfig::openai(
-    "default",
-    std::env::var("OPENAI_API_KEY")?,
-);
-
-let mut model_config = AgentModelConfig::new(provider, "gpt-5.5");
-model_config.max_tokens = Some(4096);
-
-let mut agent = Agent::from_model_config(model_config)?;
-
-// Later, the caller can replace provider config without any core-side persistence.
-// 稍后，调用方可以替换服务商配置；core 不做任何配置持久化。
-agent.set_model_config(AgentModelConfig::new(
-    ModelProviderConfig::anthropic("default", std::env::var("ANTHROPIC_API_KEY")?),
-    "claude-model-id",
-))?;
-
-// Or switch to an already-registered provider/model pair.
-// 或切换到已经注册的 provider/model 组合。
-agent.set_model_selection("default", "another-model-id")?;
-```
-
-## Event persistence and provider billing fields / 事件保存与服务商计费字段
-
-Core emits structured events for the whole ReAct lifecycle. Persistence is caller-owned through `EventSink`; built-in sinks include `JsonlEventSink`, `InMemoryEventSink`, `CompositeEventSink`, and `NoopEventSink`.
-
-core 会为整个 ReAct 生命周期产出结构化事件。事件持久化由调用方通过 `EventSink` 维护；内置 sink 包括 `JsonlEventSink`、`InMemoryEventSink`、`CompositeEventSink` 和 `NoopEventSink`。
-
-```rust
-use agent_core::JsonlEventSink;
-use std::sync::Arc;
-
-let agent = agent.with_event_sink(Arc::new(JsonlEventSink::new("runs/events.jsonl")));
-let run = agent.run("hello").await?;
-println!("run_id={}, total_tokens={:?}", run.run_id, run.usage.total_tokens);
-```
-
-Whenever a provider returns token usage or billing/cost fields, core emits a `billing_usage` event. Core does not keep a local price table and does not estimate cost. It forwards provider-returned cost fields into `provider_billing`.
-
-只要服务商返回 token usage 或费用/计费字段，core 就会发出 `billing_usage` 事件。core 不维护本地价格表，也不估算费用；它会把服务商接口返回的费用字段转发到 `provider_billing`。
-
-Example billing payload / 计费事件载荷示例：
-
-```json
-{
-  "provider": "default",
-  "model": "gpt-5.5",
-  "usage": {
-    "input_tokens": 1200,
-    "output_tokens": 300,
-    "total_tokens": 1500
-  },
-  "provider_billing": {
-    "amount": 0.0123,
-    "currency": "USD",
-    "fields": {
-      "usage.cost": 0.0123,
-      "usage.currency": "USD"
-    }
-  }
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = AgentRootConfig::load("examples/config/openai-responses.toml")?;
+    let agent = config.build_agent()?;
+    let run = agent.run("列出当前任务").await?;
+    println!("{}", run.final_text);
+    Ok(())
 }
 ```
 
-## WASM plugin ABI / WASM 插件 ABI
+Core 不保存 API key、服务商选择或配置文件；这些状态由调用方持有。构造方式、工具注册和事件接口见 [Agent API](docs/agent/api.md)。
 
-The plugin contract is WIT-based and exported as a WASM Component. The canonical, complete world is maintained only in [`wit/plugin.wit`](wit/plugin.wit):
+## 项目边界
 
-插件契约基于 WIT，并以 WASM Component 形式导出。完整 world 只在 [`wit/plugin.wit`](wit/plugin.wit) 维护，README 不复制函数表面；`agent-plugin` 契约测试会校验规范 WIT、Guest 内嵌 WIT 与 Host 绑定一致。
+```text
+应用 / TUI
+  -> agent-core          ReAct、模型、上下文、工具调用、事件
+  -> agent-session       版本化会话记录与存储
+  -> agent-runtime       Agent 身份、派生、生命周期与资源限制
+  -> agent-plugin-host   WASM ABI、权限、贡献注册与 owner 路由
+       -> 独立插件        MCP、Skill、Command、Context、Plan 等具体协议
+```
 
-The ABI uses JSON strings intentionally. This keeps the WIT boundary stable while Rust-side structs can evolve through serde-compatible fields.
+`agent-core` 不依赖 Plugin Host、WASM ABI、manifest 或插件 UI。Plugin Host 不实现 MCP、Skill 等具体协议。独立插件不加入原生 workspace，避免宿主 target 与 component 导出目标冲突。
 
-ABI 故意使用 JSON 字符串。这样 WIT 边界保持稳定，同时 Rust 侧结构体可以通过 serde 兼容字段继续演进。
+插件 ABI 使用 JSON 字符串维持 WIT 边界稳定，规范定义位于 [`wit/plugin.wit`](wit/plugin.wit)。插件默认没有文件、进程、HTTP、secret 或写入能力；权限与子进程风险见 [Manifest 与权限](docs/host/manifest-capabilities.md)。
 
-`agent-plugin-host` 提供端到端宿主实现：它会加载 `plugin.toml`，严格校验当前 ABI，用 Wasmtime 编译 `.wasm` component，执行 `activate`，并维护公开工具名到 owner 插件及本地工具 ID 的直接路由。插件可通过 `list-tools` 提供初始静态工具，也可以在运行时注册工具和 developer 提示。
+## 文档导航
 
-### 插件 TUI
+- [文档首页](docs/index.md)：按使用目标选择阅读路径。
+- [快速开始](docs/guide/quick-start.md)：离线演示、TUI 安装和真实模型配置。
+- [常用场景示例](docs/guide/examples.md)：会话、事件、本地模型、插件和 Rust 嵌入。
+- [架构边界](docs/guide/architecture.md)：crate 职责与依赖方向。
+- [官方插件](docs/plugin/official.md)：Context、MCP、Skill、Command、Teammate 和 Plan。
+- [Rust API 索引](docs/reference/rust-api.md) 与 [WIT ABI](docs/reference/wit.md)：接口参考。
 
-插件通过 `describe-ui`、`render-ui` 和 `on-ui-input` 提供终端界面；无 UI 插件由 `describe-ui` 返回空数组。当前 ABI 要求三个导出完整存在，不再保留缺失导出的旧 component 加载分支。
-
-- `describe-ui` 返回 `UiDeclaration` 数组。每个视图可以挂载到 `top`、`right`、`bottom`、`left` 四个插槽、`dialog` 模态层或动态 `subview` 类型。
-- `render-ui` 接收宿主实际分配的尺寸和焦点状态，返回由行、文本片段和便携样式组成的 `UiFrame`。插件不能访问 Ratatui `Frame`、终端句柄或发送 ANSI 控制序列。
-- `on-ui-input` 只接收当前焦点视图的宿主无关输入事件。`Tab` 在主输入区和可聚焦停靠视图之间切换；可见 `dialog` 始终优先接收输入。
-- 多个插件占用同一插槽时按配置加载顺序堆叠，宿主始终为中心主界面保留最小空间；多个可见对话框只显示最后加载的一个。
-- `subview` 通过 `Push`、`Replace`、`Pop` 组成以 Lucia 主视图为根的导航栈。Host 只路由不透明 `instance_id`，sub-agent、workflow 等实例含义完全由插件定义。
-
-主 TUI 默认启用插件能力，并自动发现 `$LUCIA_HOME/official-plugins/*/plugin.toml`。配置中的 `[[plugins]]` 和 `--plugin-manifest` 仍可加载其他插件；同 ID 的显式声明优先于官方默认插件。同一个组合宿主以 `AgentExtension` 挂到 core，并以 `PluginHost` 服务 UI 循环；core 不接触插件 UI 或加载细节。插件 UI 运行时错误只会显示在对应视图内，不会退出主 TUI。
-
-完整能力展示见 [`examples/plugins/ui-showcase-plugin`](examples/plugins/ui-showcase-plugin/README.md)，该插件同时实现四向插槽、模态对话框、样式、键鼠输入、Agent 事件和工具驱动状态。
-
-### 官方插件
-
-官方 stdio MCP 插件位于 [`examples/plugins/mcp-plugin`](examples/plugins/mcp-plugin/README.md)。MCP 配置扫描、JSON-RPC 初始化、工具解析和 `tools/call` 都由该插件完成；Plugin Host 只提供受控文件读取、子进程 stdio、动态工具注册和 owner 路由，不理解 MCP 或 MasterGo 协议。
-
-官方 Skill 插件位于 [`examples/plugins/skill-plugin`](examples/plugins/skill-plugin/README.md)。它扫描 `SKILL.md`，只把名称和描述注入 Agent，并通过 `skill_read` 按需加载完整指令；Core 和 Host 不解析 Skill 格式。
-
-官方 Command 插件位于 [`examples/plugins/command-plugin`](examples/plugins/command-plugin)。它提供 `/help`、`/resume`、`/new`、`/sessions`、`/clear`、`/compact` 和 `/exit`，并通过版本化协议与类型化 SDK 向其他插件开放命令定义、参数、候选补全、注册、注销和执行回调。命令预览与会话选择 Dialog 由插件声明，TUI 只负责渲染和执行受控的会话动作。
-
-受限 Agent 派生与续跑示例见 [`examples/plugins/agent-runtime-plugin`](examples/plugins/agent-runtime-plugin/README.md)。Host 只提供 profile 授权、生命周期、状态、结果和取消；sub-agent、workflow、multi-agent 与 teammate 的角色、邮箱和消息协议由插件定义。
-
-官方 Teammate 插件位于 [`examples/plugins/teammate-plugin`](examples/plugins/teammate-plugin/README.md)。它提供受限成员派生、有界邮箱、确认与续跑注入，并通过右侧团队入口打开全屏团队工作台；插件版 TUI 会注入 `worker` profile 并由默认安装器分发。
-
-官方 Context 插件位于 [`examples/plugins/context-plugin`](examples/plugins/context-plugin/README.md)。它声明独占的 `agent.context-loader` 能力，按上下文水位清理旧工具结果或将较旧 API 轮次替换为结构化摘要，同时原样保留近期工作上下文。
-
-官方 Plan 插件位于 [`examples/plugins/plan-plugin`](examples/plugins/plan-plugin/README.md)。它向 Agent 提供结构化计划更新与查询工具，并在右侧面板展示当前进度；默认安装器会分发并自动加载该插件。
-
-插件可以在 manifest 中使用 SemVer 声明必选或可选依赖。Host 在加载前解析依赖图，并提供版本化 JSON 服务的注册、发现与调用 API；command、Skill 等插件协议仍由插件自行定义。
-
-## Documentation / 开发文档
-
-文档站覆盖 Agent Core、Plugin Host、Guest API、WIT ABI、TUI 扩展和 WASM 插件开发。JavaScript 工具链统一使用 Bun：
+本地启动文档站：
 
 ```bash
 bun install
 bun run docs:dev
 ```
 
-生产构建使用：
+## 开发与验证
 
 ```bash
+cargo check --workspace
+bun run build:all
 bun run docs:build
 ```
 
-工程化指南：
+`build:all` 构建插件版 TUI 以及仓库中的官方、示例插件。纯 Core 与插件版的独立构建方式见[构建与打包](docs/guide/distribution.md)。
 
-- [插件管理](docs/guide/plugin-management.md)：安装、启用、依赖检查、独占能力选择和完整性诊断。
-- [插件性能分析](docs/guide/performance.md)：纯 Core 编译边界、Host 微基准和真实 WASM p95 门禁。
-- [真实模型分层测试](docs/guide/live-testing.md)：依次验证最小响应、ReAct、复杂工具链和插件调用。
-
-## TUI 配置与会话
-
-在仓库中安装最新的插件版命令、同步官方插件并注册 zsh PATH：
-
-```bash
-bun run install:tui
-```
-
-之后直接运行 `lucia`，无需传入插件参数。首次启动会自动创建 `$HOME/.lucia/config.toml`；模型 URL、密钥和模型名称分别从 `model.base_url`、`model.api_key`/`model.api_key_env` 和 `model.model` 读取。未设置模型密钥时进入本地演示模式，并在主事件区提示配置方式。`LUCIA_HOME`、`LUCIA_CONFIG` 和 `--config` 可以覆盖默认位置。
-
-```bash
-lucia
-lucia --resume-latest
-lucia --session-id design-review
-```
-
-`lucia` 把启动目录作为项目工作目录。普通启动总是进入空白 Draft，不读取上一次会话；用户发送第一条消息后，记录才写入 `$HOME/.lucia/projects/<project-id>/sessions`。输入 `/resume` 会打开当前项目的会话列表，选择后恢复用户、助手和工具历史。CLI 仍支持显式恢复和只读列举：
-
-```bash
-lucia --list-sessions
-```
-
-配置字段、路径优先级和 CAS 行为见 [TUI 配置与会话](docs/guide/tui-configuration.md)。
-
-## Build / 构建
-
-一键构建带插件能力的主 TUI 和仓库内全部官方、示例插件：
-
-```bash
-bun run build:all
-```
-
-该命令只生成构建产物，不执行安装。主程序产物位于 `target/plugin-tui/release/lucia`，各插件产物位于自身目录的 `target/wasm32-wasip2/release`。
-
-需要同时构建全部插件、安装主 TUI 并同步官方插件时：
-
-```bash
-bun run install:all
-```
-
-常规构建默认包含 Plugin Host、官方插件加载和插件 UI：
-
-```bash
-bun run build:tui:plugins
-```
-
-需要不包含 Plugin Host、Wasmtime 和插件 UI 的纯 Core TUI 时：
-
-```bash
-bun run build:tui:core
-```
-
-使用 `bun run build:tui` 可以依次构建两个版本。对应产物分别位于 `target/core-tui/release/lucia` 和 `target/plugin-tui/release/lucia`。完整说明见[构建与打包](docs/guide/distribution.md)。
-
-```bash
-cargo check
-```
-
-Build the sample plugin:
-
-构建示例插件：
-
-```bash
-cd examples/plugins/echo-plugin
-cargo build --release --target wasm32-wasip2
-```
-
-Run the demo model with the WASM plugin:
-
-用 demo 模型加载 WASM 插件运行：
-
-```bash
-cd ../../..
-cargo run -p agent-basic-cli -- --demo \
-  --plugin-manifest examples/plugins/echo-plugin/plugin.toml \
-  --events-jsonl runs/events.jsonl \
-  "hello from wasm"
-```
-
-Run the demo model without a WASM plugin. The CLI will use a native echo fallback, so the ReAct loop can be tested immediately:
-
-不加载 WASM 插件运行 demo 模型。CLI 会使用原生 echo fallback，因此可以立即测试 ReAct loop：
-
-```bash
-cargo run -p agent-basic-cli -- --demo "hello"
-```
-
-## Real providers / 真实模型服务商
-
-Edit the `model` field in the example config before using a real provider.
-
-使用真实模型服务商前，请先把示例配置里的 `model` 字段改成你账号可用的模型 ID。
-
-OpenAI Responses:
-
-```bash
-OPENAI_API_KEY=... cargo run -p agent-basic-cli -- \
-  --config examples/config/openai-responses.toml \
-  "Say hello"
-```
-
-OpenAI-compatible Chat Completions:
-
-```bash
-cargo run -p agent-basic-cli -- \
-  --config examples/config/openai-compatible.toml \
-  "Say hello"
-```
-
-Anthropic Messages:
-
-```bash
-ANTHROPIC_API_KEY=... cargo run -p agent-basic-cli -- \
-  --config examples/config/anthropic.toml \
-  "Say hello"
-```
-
-## Write a plugin / 编写插件
-
-```rust
-use agent_plugin::{export_plugin, AgentPlugin, Result, ToolCall, ToolResult, ToolSpec};
-use serde_json::json;
-
-#[derive(Default)]
-struct MyPlugin;
-
-impl AgentPlugin for MyPlugin {
-    fn list_tools(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec::new(
-            "echo",
-            "Echo text. / 回显文本。",
-            json!({
-                "type": "object",
-                "properties": { "text": { "type": "string" } },
-                "required": ["text"],
-                "additionalProperties": false
-            }),
-        )]
-    }
-
-    fn call_tool(&mut self, call: ToolCall) -> Result<ToolResult> {
-        Ok(ToolResult::success(call.id, call.name, call.args))
-    }
-}
-
-export_plugin!(MyPlugin);
-```
-
-`Cargo.toml`:
-
-```toml
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-agent-plugin = { path = "../../crates/agent-plugin" }
-serde_json = "1"
-wit-bindgen = "0.59"
-```
-
-Build:
-
-```bash
-cargo build --release --target wasm32-wasip2
-```
-
-## Security model / 安全模型
-
-插件默认没有文件、进程、HTTP、secret 或写入能力，并受 Wasmtime fuel 与默认 `64 MiB` 单线性内存上限约束。`fs_read` 只允许读取 manifest 声明的路径；`process_exec = true` 才能使用无 shell 的子进程 stdio API。HTTP、secret 和文件写入尚未实现，申请这些能力会在加载阶段失败。
-
-进程能力具有较高权限，因为被启动的原生程序不受 WASM 沙箱约束。只应向可信插件授予该能力，并把 token 等凭据保存在被忽略的本地配置中。
+许可证：MIT。作者：`ascvow`。

@@ -1,78 +1,92 @@
-# 五分钟接入
+# 快速开始
+
+这条路径先使用内置模型跑通流程，再安装 TUI，最后接入真实模型。第一次验证不需要 API key 或网络请求。
 
 ## 环境
 
-- Rust toolchain 以仓库的 `rust-toolchain.toml` 为准。
-- JavaScript、VitePress 和辅助脚本统一使用 Bun。
-- WASM 插件需要 `wasm32-wasip2` target。
+- Rust stable；版本与组件以仓库的 `rust-toolchain.toml` 为准。
+- Bun；文档、构建和安装脚本统一通过 Bun 运行。
+- `wasm32-wasip2`；工具链文件已经声明该 target，缺失时可手动安装。
 
 ```bash
 rustup target add wasm32-wasip2
 cargo check --workspace
 ```
 
-## 创建 Agent
+## 1. 运行离线示例
 
-当前仓库内嵌时使用 path dependency：
+在仓库根目录执行：
+
+```bash
+cargo run -p agent-basic-cli -- --demo "你好"
+```
+
+这个命令使用确定性的内置模型，不会连接外部服务。模型会调用原生 `echo` 工具，随后输出工具结果，因此可以同时验证模型循环、工具注册和结果回传。
+
+## 2. 安装并启动 TUI
+
+构建插件版 TUI、安装 `lucia` 命令并同步官方插件：
+
+```bash
+bun run install:tui
+lucia --demo
+```
+
+`--demo` 强制使用内置模型。退出后直接运行 `lucia` 即可按配置连接真实服务。
+
+首次运行时，Lucia 会创建 `$HOME/.lucia/config.toml`。也可以只初始化配置并退出：
+
+```bash
+lucia --init
+```
+
+初始化不会覆盖已有文件。未设置模型密钥时，普通 `lucia` 启动也会进入本地演示模式，并在界面中显示配置提示。
+
+## 3. 配置真实模型
+
+编辑 `$HOME/.lucia/config.toml`：
 
 ```toml
-[dependencies]
-anyhow = "1"
-agent-core = { path = "../ascnet-lucia/crates/agent-core" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+[model]
+name = "default"
+provider = "open-ai"
+base_url = "https://api.openai.com/v1"
+model = "替换为账号可用的模型 ID"
+api_key_env = "OPENAI_API_KEY"
+openai_protocol = "responses"
+
+[agent]
+max_steps = 8
+max_tokens = 4096
+
+[tui]
+sessions_dir = "projects"
 ```
 
-通过运行时模型配置创建 Agent：
+`api_key_env` 保存的是环境变量名。设置密钥后启动：
 
-```rust
-use anyhow::Result;
-use agent_core::{
-    Agent, AgentModelConfig, ModelProviderConfig, ProviderKind,
-};
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let provider = ModelProviderConfig::new(
-        "openai",
-        ProviderKind::OpenAi,
-        std::env::var("OPENAI_API_KEY")?,
-    );
-    let agent = Agent::from_model_config(AgentModelConfig::new(provider, "gpt-5"))?;
-    let run = agent.run("列出当前任务").await?;
-    println!("{}", run.final_text);
-    Ok(())
-}
+```bash
+export OPENAI_API_KEY="你的密钥"
+lucia
 ```
 
-API key、provider 选择和配置文件始终由调用方持有，Core 不持久化凭据。
+要使用 Anthropic 或本地 OpenAI-compatible 服务，参考[常用场景示例](/guide/examples)。配置路径优先级和全部 TUI 字段见 [TUI 配置与会话](/guide/tui-configuration)。
 
-## 从 TOML 创建
+## 4. 使用会话
 
-```rust
-use anyhow::Result;
-use agent_core::AgentRootConfig;
+普通启动先进入空白 Draft，发送第一条消息后才写入当前项目的会话目录。TUI 中输入 `/resume` 可以选择历史会话；CLI 也提供显式操作：
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let config = AgentRootConfig::load("examples/config/openai-responses.toml")?;
-    let agent = config.build_agent()?;
-    let run = agent.run("你好").await?;
-    println!("{}", run.final_text);
-    Ok(())
-}
+```bash
+lucia --list-sessions
+lucia --resume-latest
+lucia --session-id design-review
 ```
 
-## 加载 WASM 插件
+Lucia 按启动目录隔离项目会话。在不同目录运行时，看到的会话列表可能不同。
 
-Plugin Host 在应用层组装，再作为通用 `AgentExtension` 挂到 Agent：
+## 5. 选择下一步
 
-```rust
-use agent_core::Agent;
-use agent_plugin_host::wasm::load_wasm_plugins;
-use std::sync::Arc;
-
-let host = Arc::new(load_wasm_plugins(&["plugins/example/plugin.toml"]).await?);
-let agent = Agent::new(gateway, options).with_extension(host);
-```
-
-下一步可以阅读 [Agent API](/agent/api) 或 [创建 WASM 插件](/plugin/quick-start)。
+- 想直接使用：阅读[常用场景示例](/guide/examples)和 [TUI 配置与会话](/guide/tui-configuration)。
+- 想嵌入 Rust：阅读 [Agent API](/agent/api)和[工具与事件](/agent/tools-events)。
+- 想扩展能力：阅读[创建 WASM 插件](/plugin/quick-start)和[测试与调试](/plugin/testing)。
+- 想理解仓库：阅读[架构边界](/guide/architecture)。

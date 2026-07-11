@@ -14,6 +14,7 @@ export default defineConfig({
   themeConfig: {
     nav: [
       { text: "快速开始", link: "/guide/quick-start" },
+      { text: "使用示例", link: "/guide/examples" },
       { text: "Agent Core", link: "/agent/api" },
       { text: "Plugin Host", link: "/host/overview" },
       { text: "WASM 插件", link: "/plugin/quick-start" },
@@ -24,7 +25,8 @@ export default defineConfig({
         {
           text: "开始",
           items: [
-            { text: "五分钟接入", link: "/guide/quick-start" },
+            { text: "快速开始", link: "/guide/quick-start" },
+            { text: "常用场景示例", link: "/guide/examples" },
             { text: "架构边界", link: "/guide/architecture" },
             { text: "TUI 配置与会话", link: "/guide/tui-configuration" },
             { text: "构建与打包", link: "/guide/distribution" },

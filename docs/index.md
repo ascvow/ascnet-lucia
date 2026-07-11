@@ -1,49 +1,89 @@
-# Lucia 开发文档
+# Lucia 文档
 
-<div class="lucia-intro">
-Lucia 是一个边界清晰的 Rust Agent 运行时。Core 只处理模型、上下文、工具、事件和 ReAct 循环；Plugin Host 只处理 ABI、权限与路由；MCP、Skill、上下文压缩等能力由独立 WASM 插件实现。
-</div>
+Lucia 是一个 Rust ReAct Agent 运行时。它既可以作为终端应用直接使用，也可以作为 Core 嵌入 Rust 程序，还可以通过 WASM 插件扩展工具、协议和界面。
 
-<div class="status-line">
-  <span>WASM ABI <code>0.6.0</code></span>
-  <span>Rust edition <code>2021</code></span>
-  <span>插件目标 <code>wasm32-wasip2</code></span>
-  <span>JS 工具链 <code>Bun</code></span>
-</div>
+这套文档按任务组织。先选择你要完成的事情，不需要从 API 参考开始阅读。
 
-## 从哪里开始
+## 第一次使用
 
-<div class="api-grid">
-  <a href="/guide/quick-start"><strong>嵌入 Agent</strong><span>配置模型、注册工具并运行第一次会话。</span></a>
-  <a href="/guide/distribution"><strong>打包 TUI</strong><span>分别构建纯 Core 与完整插件版本。</span></a>
-  <a href="/agent/context-loader"><strong>控制上下文</strong><span>裁剪、摘要或完全替换模型实际看到的消息。</span></a>
-  <a href="/host/overview"><strong>嵌入 Plugin Host</strong><span>加载 component、管理实例并按 owner 路由工具。</span></a>
-  <a href="/plugin/official"><strong>使用官方插件</strong><span>启用 MCP 与 Skill，复用稳定的插件能力。</span></a>
-  <a href="/plugin/quick-start"><strong>开发 WASM 插件</strong><span>从 Cargo crate、manifest 到 component 构建。</span></a>
-  <a href="/plugin/dependencies-services"><strong>复用插件能力</strong><span>声明 SemVer 依赖，通过通用服务 API 组合插件。</span></a>
-  <a href="/plugin/tui"><strong>插入主 TUI</strong><span>声明四向插槽、Dialog、样式和输入事件。</span></a>
-  <a href="/examples/mcp"><strong>官方 MCP 插件</strong><span>扫描配置、启动 stdio Server 并动态注册工具。</span></a>
-  <a href="/guide/plugin-management"><strong>管理插件</strong><span>安装 bundle、校验依赖并选择独占能力 owner。</span></a>
-  <a href="/guide/performance"><strong>分析插件性能</strong><span>测量 Host 路由开销和真实 WASM p95。</span></a>
-  <a href="/guide/live-testing"><strong>测试真实模型</strong><span>从最小响应逐层验证 ReAct、复杂工具链和插件。</span></a>
-</div>
+从[快速开始](/guide/quick-start)开始。它会依次带你完成：
+
+1. 不使用 API key 运行离线 ReAct 示例。
+2. 安装并启动交互式 TUI。
+3. 配置 OpenAI Responses 或其他真实模型服务。
+4. 确认会话和配置保存位置。
+
+只想查命令时，直接打开[常用场景示例](/guide/examples)。
+
+## 按目标阅读
+
+### 使用终端 Agent
+
+- [快速开始](/guide/quick-start)：从离线演示到第一次真实模型请求。
+- [TUI 配置与会话](/guide/tui-configuration)：配置优先级、会话恢复、路径覆盖和事件文件。
+- [常用场景示例](/guide/examples)：本地模型、指定会话、记录事件和手动加载插件。
+- [插件管理](/guide/plugin-management)：安装、启用、依赖检查和完整性诊断。
+
+### 嵌入 Rust 应用
+
+- [Agent API](/agent/api)：构造 Agent、运行请求和控制执行。
+- [工具与事件](/agent/tools-events)：注册原生工具并消费生命周期事件。
+- [会话持久化](/agent/session-persistence)：使用 CAS 和文件存储保存会话。
+- [上下文加载](/agent/context-loader)：裁剪或替换模型实际看到的消息。
+- [Agent Runtime](/agent/agent-runtime)：派生受限 Agent 并管理生命周期。
+
+### 开发 WASM 插件
+
+- [创建 WASM 插件](/plugin/quick-start)：从 crate、实现、manifest 到构建和运行。
+- [生命周期](/plugin/lifecycle)：理解 activate、工具调用、事件、UI 和 deactivate。
+- [Guest Host API](/plugin/host-api)：文件、进程、服务和 Agent Runtime 能力。
+- [Manifest 与权限](/host/manifest-capabilities)：声明权限、依赖和独占能力。
+- [测试与调试](/plugin/testing)：component 编译、smoke test 和常见错误。
+
+### 理解系统边界
+
+- [架构边界](/guide/architecture)：各 crate 的职责和允许的依赖方向。
+- [Plugin Host API](/host/overview)：宿主加载、组合与路由接口。
+- [插件依赖与服务](/plugin/dependencies-services)：跨插件的版本化服务调用。
+- [WIT ABI 0.6](/reference/wit)：Host imports、Guest exports 和兼容策略。
+
+## 示例在哪里
+
+| 目标 | 可运行示例 |
+|---|---|
+| 最小 ReAct 和原生工具 | `examples/basic-cli` |
+| 最小 WASM 工具插件 | `examples/plugins/echo-plugin` |
+| stdio MCP 接入 | `examples/plugins/mcp-plugin` |
+| Skill 按需加载 | `examples/plugins/skill-plugin` |
+| 上下文压缩 | `examples/plugins/context-plugin` |
+| 命令与 Dialog | `examples/plugins/command-plugin` |
+| Agent 派生与续跑 | `examples/plugins/agent-runtime-plugin` |
+| 多 Agent 协作 | `examples/plugins/teammate-plugin` |
+| 结构化计划 | `examples/plugins/plan-plugin` |
+| 插件 TUI 能力 | `examples/plugins/ui-showcase-plugin` |
+
+每个插件都保持为独立 crate，并在自己的目录中提供 README 和测试。官方插件的用途与统一构建命令见[官方插件](/plugin/official)。
 
 ## 一次请求经过哪些层
 
-<div class="arch-flow">应用输入
-  -> Agent Core: Session + ContextLoader + ModelGateway
-  -> 模型返回 ToolCall
-  -> Plugin Host: public tool name -> owner -> local tool id
-  -> WASM 插件: 协议或业务实现
-  -> ToolResult -> Agent Core -> 模型继续生成</div>
-
-Core 不加载插件，Host 不解析 MCP，插件也不能直接持有 Ratatui `Frame`。每层只通过公开 API 协作，详见[架构边界](/guide/architecture)。
-
-## 五分钟运行
-
-```bash
-cargo check --workspace
-cargo run -p lucia -- --demo
+```text
+用户输入
+  -> 应用或 TUI
+  -> Agent Core：组装上下文并请求模型
+  -> 模型返回文本或 ToolCall
+  -> 原生工具注册表，或 Plugin Host 的 owner 路由
+  -> WASM 插件执行具体协议或业务能力
+  -> ToolResult 返回 Core，继续 ReAct 循环
+  -> 应用保存事件和会话
 ```
 
-开发 WASM 插件前，先安装 Rust 的 `wasm32-wasip2` target，然后阅读[创建插件](/plugin/quick-start)。
+Core 只定义通用 Agent 机制；Plugin Host 只负责 ABI、权限、贡献注册和路由；MCP、Skill、Command 等规则属于对应插件。需要判断一个功能应该放在哪里时，阅读[架构边界](/guide/architecture)。
+
+## 本地运行文档
+
+```bash
+bun install
+bun run docs:dev
+```
+
+生产构建使用 `bun run docs:build`。
