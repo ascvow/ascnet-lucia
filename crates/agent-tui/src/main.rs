@@ -1850,7 +1850,18 @@ impl App {
                     self.queue_input_until_ready();
                 }
             }
-            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Esc => {
+                // 运行中 Esc 请求优雅取消当前回合；空闲时保持原退出行为。
+                if self.running {
+                    if let Some(agent) = agent {
+                        agent.cancel();
+                        self.messages
+                            .push(Msg::new(MsgKind::Info, "正在取消当前运行..."));
+                    }
+                } else {
+                    self.should_quit = true;
+                }
+            }
             KeyCode::PageUp => self.scroll_up(5),
             KeyCode::PageDown => self.scroll_down(5),
             KeyCode::Up => self.scroll_up(1),
@@ -2578,6 +2589,10 @@ impl App {
 
         self.streaming_message = None;
         if let Some(run) = run {
+            if run.cancelled {
+                self.messages
+                    .push(Msg::new(MsgKind::Info, "本轮运行已取消，已生成内容保留"));
+            }
             if !run.usage.is_empty() {
                 self.messages.push(Msg::new(
                     MsgKind::Info,
@@ -5316,6 +5331,7 @@ mod tests {
                 steps_used: 1,
                 usage: Default::default(),
                 session: Session::new(),
+                cancelled: false,
             }),
             session_record: saved_record,
             error: None,
@@ -5351,6 +5367,7 @@ mod tests {
                 steps_used: 1,
                 usage: Default::default(),
                 session: completed_session,
+                cancelled: false,
             }),
             session_record: saved_record,
             error: None,
