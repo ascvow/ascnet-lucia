@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashSet, sync::Arc};
 
-/// Default system prompt for the minimal ReAct core.
-/// 最小 ReAct core 的默认 system prompt。
-pub const DEFAULT_REACT_SYSTEM_PROMPT: &str = r#"You are lucia, a minimal ReAct agent.
+/// Default system prompt for the helpful Lucia agent.
+/// Lucia 实用型 Agent 的默认 system prompt。
+pub const DEFAULT_REACT_SYSTEM_PROMPT: &str = r#"You are lucia, a helpful AI agent.
 
 You may call tools when they are useful. Use tools only through the provided tool-calling interface.
 When you receive tool results, continue reasoning and answer the user directly.
