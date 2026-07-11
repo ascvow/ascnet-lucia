@@ -20,7 +20,7 @@ use agent_plugin_host::{
         UiColor, UiDeclaration, UiFrame as PluginUiFrame, UiInput, UiInputEvent, UiLine,
         UiPlacement, UiRenderRequest, UiSpan, UiStyle,
     },
-    wasm::load_wasm_plugins_with_selection,
+    wasm::{load_wasm_plugins_resilient_with_selection, PluginLoadFailure},
     CompositePluginHost, PluginHost,
 };
 use agent_session::{FileSessionStore, MemorySessionStore, SessionId, SessionRecord, SessionStore};
@@ -138,6 +138,8 @@ struct LoadedPlugins {
     plugin_views: Vec<UiDeclaration>,
     /// Activation events consumed before the first Agent run. 首次 Agent 运行前消费的激活事件。
     startup_events: Vec<Value>,
+    /// Plugins excluded by activation failures or required dependencies. 因激活或必选依赖失败而被剔除的插件。
+    failures: Vec<PluginLoadFailure>,
 }
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -705,6 +707,9 @@ struct App {
     /// Plugin startup failure shown persistently in the footer. 底栏持续展示的插件启动错误。
     #[cfg(feature = "plugins")]
     plugin_load_error: Option<String>,
+    /// Per-plugin failures retained alongside successful plugins. 与成功插件并存的单插件失败摘要。
+    #[cfg(feature = "plugins")]
+    plugin_failures: Vec<String>,
 }
 
 /// 主 TUI 为单个插件视图维护的运行时状态。
@@ -768,6 +773,8 @@ impl App {
             plugins_loading: false,
             #[cfg(feature = "plugins")]
             plugin_load_error: None,
+            #[cfg(feature = "plugins")]
+            plugin_failures: Vec::new(),
         }
     }
 
@@ -802,8 +809,29 @@ impl App {
     ///
     /// 使用激活事件摘要将底栏从加载状态切换为就绪状态。
     #[cfg(feature = "plugins")]
-    fn finish_plugin_loading(&mut self, plugin_ids: Vec<String>, startup_events: Vec<Value>) {
-        self.plugin_startup_details = plugin_startup_details(&plugin_ids, &startup_events);
+    fn finish_plugin_loading(
+        &mut self,
+        plugin_ids: Vec<String>,
+        startup_events: Vec<Value>,
+        failures: Vec<PluginLoadFailure>,
+    ) {
+        let mut details = plugin_startup_details(&plugin_ids, &startup_events);
+        self.plugin_failures = failures
+            .into_iter()
+            .map(|failure| {
+                let blocked = if failure.blocked_by.is_empty() {
+                    String::new()
+                } else {
+                    format!("，依赖 {}", failure.blocked_by.join("、"))
+                };
+                format!(
+                    "{}: 加载失败{blocked} · {}",
+                    failure.plugin_id, failure.reason
+                )
+            })
+            .collect();
+        details.extend(self.plugin_failures.iter().cloned());
+        self.plugin_startup_details = details;
         self.plugin_ids = plugin_ids;
         self.plugin_status_ticks = PLUGIN_STATUS_DETAIL_TICKS;
         self.plugins_loading = false;
@@ -818,6 +846,7 @@ impl App {
         self.plugin_ids = plugin_ids;
         self.plugins_loading = true;
         self.plugin_load_error = None;
+        self.plugin_failures.clear();
         self
     }
 
@@ -831,6 +860,7 @@ impl App {
         self.plugin_startup_details.clear();
         self.plugin_status_ticks = 0;
         self.plugin_load_error = Some(error.to_string());
+        self.plugin_failures.clear();
     }
 
     /// Advances the transient startup status toward the compact counter.
@@ -873,12 +903,44 @@ impl App {
             };
             let text = if details.is_empty() {
                 "未加载插件".to_string()
-            } else {
+            } else if self.plugin_failures.is_empty() {
                 format!("插件加载完成 · {details}")
+            } else {
+                format!("插件部分加载 · {details}")
             };
-            ("✓", text)
-        } else {
+            (
+                if self.plugin_failures.is_empty() {
+                    "✓"
+                } else {
+                    "!"
+                },
+                text,
+            )
+        } else if self.plugin_failures.is_empty() {
             ("◈", format!("{} plugins", self.plugin_ids.len()))
+        } else {
+            (
+                "◈",
+                format!(
+                    "{} plugins · ✗ {}",
+                    self.plugin_ids.len(),
+                    self.plugin_failures.len()
+                ),
+            )
+        }
+    }
+
+    /// Returns the semantic color for the current plugin footer state.
+    ///
+    /// 返回当前插件底栏状态的语义颜色。
+    #[cfg(feature = "plugins")]
+    fn plugin_status_color(&self) -> Color {
+        if self.plugin_load_error.is_some() {
+            COLOR_DANGER
+        } else if self.plugins_loading || !self.plugin_failures.is_empty() {
+            COLOR_WARNING
+        } else {
+            COLOR_SUCCESS
         }
     }
 
@@ -1725,8 +1787,9 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     }
     let footer_area = sections[2];
     #[cfg(feature = "plugins")]
-    let (metadata_area, plugin_area, plugin_icon, plugin_status) = {
+    let (metadata_area, plugin_area, plugin_icon, plugin_status, plugin_color) = {
         let (icon, status) = app.plugin_status_content();
+        let color = app.plugin_status_color();
         let desired_width =
             unicode_width::UnicodeWidthStr::width(format!("{icon} {status}").as_str())
                 .saturating_add(2);
@@ -1735,7 +1798,7 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             .min(footer_area.width / 2);
         let columns = Layout::horizontal([Constraint::Min(0), Constraint::Length(plugin_width)])
             .split(footer_area);
-        (columns[0], columns[1], icon, status)
+        (columns[0], columns[1], icon, status, color)
     };
     #[cfg(not(feature = "plugins"))]
     let metadata_area = footer_area;
@@ -1753,7 +1816,7 @@ fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         );
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(format!("{plugin_icon} "), Style::new().fg(COLOR_SUCCESS)),
+                Span::styled(format!("{plugin_icon} "), Style::new().fg(plugin_color)),
                 Span::styled(status, Style::new().fg(COLOR_MUTED)),
             ]))
             .alignment(Alignment::Right)
@@ -2092,35 +2155,42 @@ async fn print_persisted_sessions(store: &dyn SessionStore) -> Result<()> {
 ///
 /// 将默认官方插件补充到显式插件列表，并让同 ID 的显式声明优先。
 #[cfg(feature = "plugins")]
-fn merge_official_plugin_manifests(
-    manifests: &mut Vec<PathBuf>,
-    official_manifests: Vec<PathBuf>,
-) -> Result<()> {
+fn merge_official_plugin_manifests(manifests: &mut Vec<PathBuf>, official_manifests: Vec<PathBuf>) {
     let mut plugin_ids = manifests
         .iter()
         .map(PluginManifest::load)
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
+        .filter_map(Result::ok)
         .map(|manifest| manifest.plugin.id)
         .collect::<HashSet<_>>();
     for path in official_manifests {
-        let manifest = PluginManifest::load(&path)?;
-        if plugin_ids.insert(manifest.plugin.id) {
+        let should_append = PluginManifest::load(&path)
+            .map(|manifest| plugin_ids.insert(manifest.plugin.id))
+            // Keep invalid manifests for the background resilient loader to report after first paint.
+            // 保留无效 manifest，由后台容错加载器报告，不在 TUI 首帧前中断。
+            .unwrap_or(true);
+        if should_append {
             manifests.push(path);
         }
     }
-    Ok(())
 }
 
 /// Reads stable plugin IDs for the loading footer before components are activated.
 ///
 /// 在 component 激活前读取稳定插件 ID，供加载中的底栏展示。
 #[cfg(feature = "plugins")]
-fn plugin_manifest_ids(manifests: &[PathBuf]) -> Result<Vec<String>> {
+fn plugin_manifest_ids(manifests: &[PathBuf]) -> Vec<String> {
     manifests
         .iter()
-        .map(PluginManifest::load)
-        .map(|manifest| manifest.map(|manifest| manifest.plugin.id))
+        .map(|path| {
+            PluginManifest::load(path)
+                .map(|manifest| manifest.plugin.id)
+                .unwrap_or_else(|_| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| path.display().to_string())
+                })
+        })
         .collect()
 }
 
@@ -2132,7 +2202,10 @@ async fn load_plugins_for_tui(
     manifests: Vec<PathBuf>,
     capability_selection: HashMap<String, String>,
 ) -> Result<LoadedPlugins> {
-    let host = Arc::new(load_wasm_plugins_with_selection(&manifests, &capability_selection).await?);
+    let report =
+        load_wasm_plugins_resilient_with_selection(&manifests, &capability_selection).await?;
+    let host = Arc::new(report.host);
+    let failures = report.failures;
     let prepared = async {
         let plugin_ids = host
             .host_ids()
@@ -2146,6 +2219,7 @@ async fn load_plugins_for_tui(
             plugin_ids,
             plugin_views,
             startup_events,
+            failures,
         })
     }
     .await;
@@ -2221,7 +2295,7 @@ async fn main() -> Result<()> {
     merge_official_plugin_manifests(
         &mut plugin_manifests,
         discover_official_plugin_manifests(&lucia_home)?,
-    )?;
+    );
 
     let (gateway, options, demo_mode, mut startup_notices) = if args.demo {
         let (gateway, options) = build_demo_gateway();
@@ -2302,7 +2376,7 @@ async fn main() -> Result<()> {
     #[cfg(feature = "plugins")]
     let mut plugin_host: Option<Arc<CompositePluginHost>> = None;
     #[cfg(feature = "plugins")]
-    let loading_plugin_ids = plugin_manifest_ids(&plugin_manifests)?;
+    let loading_plugin_ids = plugin_manifest_ids(&plugin_manifests);
 
     let mut terminal = ratatui::init();
     // 启用鼠标捕获，支持滚轮滚动对话区
@@ -2385,7 +2459,11 @@ async fn main() -> Result<()> {
                         ready_agent.set_extension(loaded.host.clone());
                         ready_agent.set_context_loader(loaded.host.clone());
                         app.set_plugin_views(loaded.plugin_views);
-                        app.finish_plugin_loading(loaded.plugin_ids, loaded.startup_events);
+                        app.finish_plugin_loading(
+                            loaded.plugin_ids,
+                            loaded.startup_events,
+                            loaded.failures,
+                        );
                         refresh_plugin_views(&mut app, loaded.host.as_ref()).await;
                         plugin_host = Some(loaded.host);
                     }
@@ -2714,6 +2792,7 @@ mod tests {
                     "presentation": {"text": "已加载 1 个 Skill"}
                 }),
             ],
+            Vec::new(),
         );
         assert_eq!(
             app.plugin_status_content(),
@@ -2744,6 +2823,36 @@ mod tests {
             app.tick_plugin_status();
         }
         assert_eq!(app.plugin_status_content(), ("◈", "2 plugins".into()));
+    }
+
+    /// Partial plugin failures retain successes and remain visible in the compact footer count.
+    ///
+    /// 单插件失败应保留成功插件，并在紧凑底栏中持续显示失败数量。
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn plugin_status_keeps_partial_successes() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.finish_plugin_loading(
+            vec!["skill".into()],
+            Vec::new(),
+            vec![PluginLoadFailure {
+                plugin_id: "mcp".into(),
+                reason: "初始化超时".into(),
+                blocked_by: Vec::new(),
+            }],
+        );
+
+        let (icon, status) = app.plugin_status_content();
+        assert_eq!(icon, "!");
+        assert!(status.contains("插件部分加载"), "{status}");
+        assert!(status.contains("mcp: 加载失败"), "{status}");
+        assert_eq!(app.plugin_status_color(), COLOR_WARNING);
+
+        for _ in 0..PLUGIN_STATUS_DETAIL_TICKS {
+            app.tick_plugin_status();
+        }
+        assert_eq!(app.plugin_status_content(), ("◈", "1 plugins · ✗ 1".into()));
     }
 
     /// Inputs entered before readiness stay FIFO-ordered and remain visible in the loading footer.
@@ -3170,11 +3279,22 @@ mod tests {
         merge_official_plugin_manifests(
             &mut manifests,
             vec![official_same, official_other.clone()],
-        )
-        .expect("合并官方插件 manifest");
+        );
 
         assert_eq!(manifests, vec![explicit, official_other]);
         fs::remove_dir_all(root).expect("清理插件合并测试目录");
+    }
+
+    /// Invalid manifests remain visible to background loading instead of blocking first paint.
+    ///
+    /// 无效 manifest 应交给后台加载器报告，不应阻断 TUI 首帧。
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn invalid_plugin_manifest_does_not_block_startup_labels() {
+        let invalid = PathBuf::from("/tmp/lucia-invalid-plugin.toml");
+        let labels = plugin_manifest_ids(std::slice::from_ref(&invalid));
+
+        assert_eq!(labels, vec!["lucia-invalid-plugin.toml"]);
     }
 
     /// 创建测试插件视图，覆盖停靠、对话框和焦点路由测试。
