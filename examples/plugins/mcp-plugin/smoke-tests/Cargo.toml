@@ -9,8 +9,8 @@ description = "通用 MCP 插件的独立端到端测试。"
 [workspace]
 
 [dev-dependencies]
-agent-core = { path = "../../../../crates/ascnet-lucia-core", default-features = false }
-agent-plugin-host = { path = "../../../../crates/ascnet-lucia-plugin-host" }
-agent-tool = { path = "../../../../crates/ascnet-lucia-tool", default-features = false }
+agent-core = { path = "../../../../crates/agent-core", default-features = false }
+agent-plugin-host = { path = "../../../../crates/agent-plugin-host" }
+agent-tool = { path = "../../../../crates/agent-tool", default-features = false }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

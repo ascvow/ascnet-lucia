@@ -1,0 +1,14 @@
+[plugin]
+id = "command"
+name = "Command Plugin"
+version = "1.0.0"
+api_version = "0.6.0"
+wasm = "target/wasm32-wasip2/release/command_plugin.wasm"
+description = "提供斜杠命令注册、预览、执行和会话选择界面。"
+
+[capabilities]
+# 命令插件仅使用宿主服务与声明式 UI，不申请文件、网络、进程或密钥能力。
+
+[metadata]
+surface_authority = "lucia-tui"
+

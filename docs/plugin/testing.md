@@ -36,6 +36,8 @@ cargo test --offline \
 
 独立测试 crate 可以依赖 Plugin Host，但 Host 的自身测试不能反向引用具体插件。
 
+Command 等关键官方插件必须在构建 component 后运行独立 smoke test，至少验证真实 Host 加载、服务注册、服务调用和 UI 路由。原生 workspace 单元测试或仅执行 `cargo check --target wasm32-wasip2` 不能替代该门禁。
+
 ## 常见加载错误
 
 | 错误 | 检查 |

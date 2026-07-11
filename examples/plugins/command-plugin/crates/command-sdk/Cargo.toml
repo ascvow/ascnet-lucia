@@ -1,0 +1,13 @@
+[package]
+name = "command-sdk"
+version = "1.0.0"
+edition = "2021"
+authors = ["ascvow"]
+license = "MIT"
+description = "第三方 Lucia 插件使用的 Command 类型化 SDK。"
+
+[dependencies]
+agent-plugin = { path = "../../../../../crates/agent-plugin" }
+anyhow = "1"
+command-protocol = { path = "../command-protocol" }
+serde_json = "1"

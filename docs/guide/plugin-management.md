@@ -7,7 +7,7 @@
 先安装管理器并指定受管理根目录：
 
 ```bash
-cargo install --path crates/ascnet-lucia-plugin-manager --locked
+cargo install --path crates/agent-plugin-manager --locked
 export LUCIA_PLUGIN_ROOT="$HOME/.lucia"
 ```
 

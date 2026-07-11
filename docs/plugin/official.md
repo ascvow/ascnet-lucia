@@ -12,7 +12,7 @@ bun run install:tui
 
 ## Context
 
-`context` 提供官方上下文管理与压缩能力。它在约 120k token 时清理旧工具结果，在约 167k token 时把较旧 API 轮次替换为结构化摘要，并保留近期完整轮次；`[1m]` 模型使用对应的百万上下文水位。
+`context` 提供官方上下文管理与压缩能力。它在约 120k token 时清理旧工具结果，在约 167k token 时把较旧 API 轮次替换为结构化摘要，并保留近期完整轮次；`[1m]` 模型使用对应的百万上下文水位。Command 插件内置的 `/compact` 会立即调用 `context.compact`，成功持久化压缩结果后当场替换当前 Session，不需要再发送一条消息。
 
 ```bash
 bun run build:plugin:context
@@ -43,6 +43,17 @@ bun run test:plugin:skill
 
 Manifest：`examples/plugins/skill-plugin/plugin.toml`。
 
+## Command
+
+`command` 提供斜杠命令注册表、输入预览、参数校验、候选补全和执行路由。内置命令包括 `/help`、`/resume`、`/new`、`/sessions`、`/clear`、`/compact` 与 `/exit`；`/quit` 是 `/exit` 的别名。`/resume` 和 `/sessions` 使用插件 Dialog 展示当前项目的轻量会话摘要，完整 Session 只由 TUI 在用户确认后加载。
+
+```bash
+bun run build:plugin:command
+bun run test:plugin:command
+```
+
+Manifest：`examples/plugins/command-plugin/plugin.toml`。公开协议与开发 SDK 分别位于 `crates/command-protocol` 和 `crates/command-sdk`。
+
 ## 统一验证
 
 ```bash
@@ -50,4 +61,4 @@ bun run build:plugin:official
 bun run test:plugin:official
 ```
 
-Context、MCP 和 Skill 都是独立 `cdylib` crate，不加入原生 Workspace。它们的扫描、解析、协议和业务规则不会进入 Agent Core 或 Plugin Host。
+Context、MCP、Skill 和 Command 都以独立插件 workspace 构建，不加入原生 Workspace；每个 bundle 都包含独立 `cdylib` component。它们的扫描、解析、协议和业务规则不会进入 Agent Core 或 Plugin Host。

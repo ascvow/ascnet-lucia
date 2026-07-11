@@ -11,6 +11,7 @@
 - `Bottom`
 - `Left`
 - `Dialog`
+- `Subview`
 
 ```rust
 fn describe_ui(&self) -> Vec<UiDeclaration> {
@@ -20,7 +21,6 @@ fn describe_ui(&self) -> Vec<UiDeclaration> {
         title: "服务状态".into(),
         placement: UiPlacement::Right,
         size: UiSize { width: Some(32), height: None },
-        initially_visible: true,
         focusable: true,
     }]
 }
@@ -48,13 +48,51 @@ Host 会验证返回的 `view_id` 与请求一致。空帧或错误只影响对�
 
 Dialog 可见时优先接收输入。普通停靠视图通过 Tab 与主输入区切换焦点。
 
+## 主视图与子视图
+
+Lucia 主视图是导航栈的固定根节点。插件可以声明 `UiPlacement::Subview` 视图类型，再通过 `PluginHostApi::navigate_view` 请求 `Push`、`Replace` 或 `Pop`。Host 只提供导航、所有权校验、幂等去重、渲染和输入路由，不理解 sub-agent、workflow、邮箱或其他业务语义。
+
+```rust
+fn describe_ui(&self) -> Vec<UiDeclaration> {
+    vec![UiDeclaration {
+        plugin_id: String::new(),
+        view_id: "agent-detail".into(),
+        title: "Agent 详情".into(),
+        placement: UiPlacement::Subview,
+        size: UiSize::default(),
+        focusable: true,
+    }]
+}
+
+host.navigate_view(UiNavigationRequest {
+    request_id: "open-reviewer-1".into(),
+    action: UiNavigationAction::Push {
+        view: UiViewInstance {
+            view_id: "agent-detail".into(),
+            instance_id: "reviewer-1".into(),
+            title: Some("Reviewer".into()),
+        },
+    },
+})?;
+```
+
+`view_id` 标识静态声明的视图类型；`instance_id` 是插件拥有的不透明动态实例键，同一种视图可以同时对应多个实例。Host 会在后续 `UiRenderRequest` 和 `UiInput` 中原样回传 `instance_id`。插件可将它映射到 sub-agent、任务或任意内部对象，但这些映射不会进入 TUI 或 Plugin Host。
+
+同一个插件重复提交相同 `request_id` 时不会重复导航。插件只能 `Replace` 或 `Pop` 自己当前激活的子视图；用户按 Esc 可以执行宿主级返回。重新 `Push` 已存在的同一实例会返回该实例并截断其后的导航层级。
+
+## Command 预览与会话 Dialog
+
+官方 Command 插件把命令定义、参数说明和候选来源放在版本化快照中。TUI 在插件加载完成后读取快照，并以低频后台请求同步运行期注册变化；用户输入 `/` 时直接在内存中筛选并展示命令摘要、详细说明和用法，不会逐键跨越 WASM 边界。命令名由本地快照补全；只有用户在参数位置显式按 Tab 时，TUI 才调用 `command.prepare-completion`，再按受控计划取得静态候选、`command-sdk` 动态回调候选或 Session 数据源候选。
+
+`/resume` 和 `/sessions` 会打开 Command 插件声明的 `command-session-dialog`。插件负责查询、加载、空结果、错误、选择和关闭状态；TUI 只向插件提供当前项目的分页 `SessionSummary`，并在收到 `resume_session` 副作用后校验 revision、加载完整记录。这样插件无法直接读取会话正文，也不会把 Session 存储契约耦合进 Plugin Host。
+
 ## 启动插件状态
 
 插件版 TUI 会先显示首帧，再在后台加载插件。加载期间输入框保持可编辑，按 Enter 提交的完整输入进入 FIFO 队列，底栏同步显示 `queued N`；Agent 就绪后自动逐条执行。
 
 单个插件的 manifest、依赖或激活失败不会关闭整个插件系统。Host 仅剔除该插件以及必选依赖它的下游插件；可选依赖方和无关插件继续加载。底栏会显示成功数量和失败数量。只有重复稳定 ID、无法确定独占能力 owner 等全局配置错误才会整体降级为 Core Agent，启动队列仍会继续执行。
 
-TUI 会在 Agent 首次运行前消费插件激活阶段产生的事件，并在底部信息栏右侧一次性显示按加载顺序排列的插件状态，例如 `mcp: MCP 插件等待配置` 和 `skill: 已加载 1 个 Skill`。数秒后该区域收敛为 `◈ 2 plugins`，持续显示当前已加载插件数量，不额外占用对话区高度。
+TUI 会在 Agent 首次运行前消费插件激活阶段产生的事件，并在底部信息栏右侧一次性显示按加载顺序排列的插件状态，例如 `mcp: MCP 插件等待配置` 和 `skill: 已加载 1 个 Skill`。数秒后该区域收敛为 `◈ N plugins`，持续显示当前已加载插件数量，不额外占用对话区高度。
 
 只有启动激活阶段的事件进入该状态行。工具调用、上下文压缩及其他运行期插件事件仍按 `presentation.target` 进入主事件列表，插件无需为此修改运行期事件协议。
 
@@ -81,4 +119,4 @@ Rust 插件应使用 `EventPresentation`、`EventPresentationTarget`、`EventPre
 
 交互动作应通过插件视图的 `UiInputEvent` 返回，不把回调函数或 UI 框架对象放进事件 payload。
 
-完整示例见 `examples/plugins/ui-showcase-plugin`。
+完整示例见 `examples/plugins/ui-showcase-plugin`；在右侧面板按 `s` 可以创建动态子视图实例。

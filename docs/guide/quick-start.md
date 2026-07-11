@@ -18,7 +18,7 @@ cargo check --workspace
 ```toml
 [dependencies]
 anyhow = "1"
-agent-core = { path = "../ascnet-lucia/crates/ascnet-lucia-core" }
+agent-core = { path = "../ascnet-lucia/crates/agent-core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

@@ -10,10 +10,10 @@ description = "Agent Runtime 插件的独立 WASM 端到端测试。"
 
 [dev-dependencies]
 anyhow = "1"
-agent-core = { path = "../../../../crates/ascnet-lucia-core", default-features = false }
-agent-plugin-host = { path = "../../../../crates/ascnet-lucia-plugin-host" }
-agent-runtime = { path = "../../../../crates/ascnet-lucia-agent-runtime" }
-agent-tool = { path = "../../../../crates/ascnet-lucia-tool", default-features = false }
+agent-core = { path = "../../../../crates/agent-core", default-features = false }
+agent-plugin-host = { path = "../../../../crates/agent-plugin-host" }
+agent-runtime = { path = "../../../../crates/agent-runtime" }
+agent-tool = { path = "../../../../crates/agent-tool", default-features = false }
 async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

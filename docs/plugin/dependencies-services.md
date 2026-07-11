@@ -28,72 +28,67 @@ optional = false
 
 Host 保持原配置中无关插件的相对顺序，并保证 provider 先于 dependent 激活。组合宿主关闭时使用相反顺序，让 dependent 先完成清理。
 
-## Provider 注册服务
+## Command Provider 服务
 
-command 插件可以把命令注册和执行定义为自己的协议。Host 只保存服务描述并路由 JSON：
+官方 Command 插件在激活时注册 `command.register`、`command.unregister`、`command.snapshot`、`command.prepare-completion`、`command.prepare-execute`、`command.surface.update` 和 `command.surface.poll-effects` 七个 `1.0.0` 服务。Host 只保存服务描述、注入可信 `caller_id` 并路由 JSON；命令所有权、名称冲突、参数解析、补全和 `/` 输入规则都由 Command 插件处理。
+
+公开类型位于 `command-protocol`：
+
+- `CommandSpec` 定义规范名称、别名、摘要、说明、用法、参数和可用状态；
+- `ArgumentSpec` 定义必填、可选或可变位置参数，类型支持字符串、整数、布尔值、枚举和 Session；
+- `CompletionSource` 支持随快照下发的静态候选、owner 回调候选和 TUI 数据源候选；
+- `PrepareCompletionRequest` 与 `PrepareCompletionResponse` 让 Provider 返回 UTF-8 替换区间、本地候选或受控回调计划；
+- `RegisterCommandRequest`、`UnregisterCommandRequest` 与 `CommandCallbackRequest` 是版本化服务载荷。
+
+注册表按 Host 注入的插件 ID 记录 owner。插件只能替换或注销自己拥有的命令；执行计划始终携带注册时保存的 owner 与回调服务，不接受调用方覆盖目标。
+
+## 使用类型化 SDK
+
+下游插件通过 `command-sdk` 安装统一回调服务，再注册命令定义和本地处理器：
 
 ```rust
-use agent_plugin::{PluginHostApi, ServiceCall, ServiceSpec};
+use agent_plugin::{PluginHostApi, ServiceCall};
+use anyhow::Result;
+use command_protocol::{
+    ArgumentKind, ArgumentSpec, CommandInvocation, CommandSpec, CompletionItem,
+    CommandCompletionRequest, CompletionSource,
+};
+use command_sdk::{CommandHandler, CommandRouter};
 use serde_json::{json, Value};
 
-fn activate(host: &dyn PluginHostApi) -> anyhow::Result<()> {
-    host.upsert_service(&ServiceSpec {
-        name: "command.register".into(),
-        version: "1.0.0".into(),
-        description: Some("注册斜杠命令".into()),
-    })?;
-    host.upsert_service(&ServiceSpec {
-        name: "command.execute".into(),
-        version: "1.0.0".into(),
-        description: Some("执行斜杠命令".into()),
-    })
-}
+struct HelloCommand;
 
-fn handle_service(call: ServiceCall) -> anyhow::Result<Value> {
-    match call.name.as_str() {
-        "command.register" => {
-            // call.caller_id 是 Host 注入的可信插件 ID，可作为 handler owner。
-            register_command(call.caller_id, call.payload)?;
-            Ok(json!({"registered": true}))
-        }
-        "command.execute" => execute_command(call.payload),
-        _ => anyhow::bail!("未知 command 服务：{}", call.name),
+impl CommandHandler for HelloCommand {
+    fn execute(&mut self, invocation: CommandInvocation) -> Result<Value> {
+        Ok(json!({ "name": invocation.arguments["name"][0] }))
+    }
+
+    fn complete(&mut self, _request: CommandCompletionRequest) -> Result<Vec<CompletionItem>> {
+        Ok(vec![CompletionItem {
+            label: "Lucia".into(),
+            insert_text: "Lucia".into(),
+            description: Some("默认称呼".into()),
+        }])
     }
 }
+
+fn register_commands(router: &mut CommandRouter, host: &dyn PluginHostApi) -> Result<()> {
+    router.install_callback_service(host)?;
+    let spec = CommandSpec::new("hello", "发送问候", "向指定对象发送问候。")
+        .with_argument(
+            ArgumentSpec::required("name", "问候对象", ArgumentKind::String)
+                .with_completion(CompletionSource::Callback),
+        );
+    router.register(host, spec, "hello-handler", HelloCommand)?;
+    Ok(())
+}
+
+fn handle_command_service(router: &mut CommandRouter, call: ServiceCall) -> Result<Value> {
+    router.handle_service(call)
+}
 ```
 
-实际插件在 `AgentPlugin::activate` 和 `AgentPlugin::handle_service` 中调用这些逻辑。`command.register` 的字段、命令冲突规则、补全和 `/` 输入处理都属于 command 插件，不进入 Host。
-
-## Dependent 复用服务
-
-下游插件先注册自己的回调服务，再向 command provider 注册命令：
-
-```rust
-host.upsert_service(&ServiceSpec {
-    name: "hello-command.execute".into(),
-    version: "1.0.0".into(),
-    description: Some("处理 hello 命令".into()),
-})?;
-
-host.call_service(
-    "command",
-    "command.register",
-    &json!({
-        "name": "hello",
-        "handler_service": "hello-command.execute"
-    }),
-)?;
-```
-
-command 插件执行 `/hello Lucia` 时，可根据注册信息回调 owner：
-
-```rust
-let result = host.call_service(
-    &registration.plugin_id,
-    &registration.handler_service,
-    &json!({"args": ["Lucia"]}),
-)?;
-```
+插件应在 `AgentPlugin::activate` 中调用 `register_commands`，并在 `AgentPlugin::handle_service` 中把 `command.callback` 交给 `CommandRouter::handle_service`。动态候选最多返回 20 项；TUI 只在显式 Tab 时调用补全服务，并以 `caller_id=command` 执行 Provider 刚生成的可信回调计划。卸载单个命令时调用 `CommandRouter::unregister`，Provider 确认移除后 SDK 才释放本地处理器。
 
 ## 服务发现与宿主调用
 

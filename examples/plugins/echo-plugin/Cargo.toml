@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1"
-agent-plugin = { path = "../../../crates/ascnet-lucia-plugin" }
+agent-plugin = { path = "../../../crates/agent-plugin" }
 serde_json = "1"
 wit-bindgen = "0.59"
 

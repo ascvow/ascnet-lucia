@@ -8,8 +8,8 @@ description = "Lucia 的通用 Agent 派生、私有会话续跑与生命周期�
 
 [dependencies]
 anyhow.workspace = true
-agent-core = { path = "../ascnet-lucia-core", default-features = false }
-agent-tool = { path = "../ascnet-lucia-tool", default-features = false }
+agent-core = { path = "../agent-core", default-features = false }
+agent-tool = { path = "../agent-tool", default-features = false }
 async-trait.workspace = true
 futures-util.workspace = true
 serde.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "command-protocol"
+version = "1.0.0"
+edition = "2021"
+authors = ["ascvow"]
+license = "MIT"
+description = "Command 插件公开的版本化数据协议。"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+

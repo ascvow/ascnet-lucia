@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -43,6 +43,10 @@ const bundles: OfficialPluginBundle[] = [
       'skills/lucia-plugin-development/SKILL.md',
     ],
   },
+  {
+    id: 'command',
+    files: ['plugin.toml', 'target/wasm32-wasip2/release/command_plugin.wasm'],
+  },
 ]
 
 /**
@@ -52,11 +56,28 @@ const bundles: OfficialPluginBundle[] = [
 async function syncBundle(bundle: OfficialPluginBundle): Promise<void> {
   const sourceRoot = join(repositoryRoot, 'examples', 'plugins', `${bundle.id}-plugin`)
   const destinationRoot = join(officialRoot, bundle.id)
-  for (const relativePath of bundle.files) {
+  await Promise.all(
+    bundle.files.map(async (relativePath) => {
+      const sourceStat = await stat(join(sourceRoot, relativePath))
+      if (!sourceStat.isFile()) {
+        throw new Error(`官方插件文件不是普通文件：${relativePath}`)
+      }
+    }),
+  )
+  const publishOrder = [...bundle.files].sort(
+    (left, right) => Number(left === 'plugin.toml') - Number(right === 'plugin.toml'),
+  )
+  for (const relativePath of publishOrder) {
     const source = join(sourceRoot, relativePath)
     const destination = join(destinationRoot, relativePath)
     await mkdir(dirname(destination), { recursive: true })
-    await copyFile(source, destination)
+    const temporary = `${destination}.lucia-install-${process.pid}`
+    try {
+      await copyFile(source, temporary)
+      await rename(temporary, destination)
+    } finally {
+      await rm(temporary, { force: true })
+    }
   }
 }
 

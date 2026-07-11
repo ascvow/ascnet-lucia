@@ -8,9 +8,9 @@ description = "A tiny CLI demonstrating ascnet-lucia core and WASM plugins."
 
 [dependencies]
 anyhow.workspace = true
-agent-core = { path = "../../crates/ascnet-lucia-core" }
-agent-plugin-host = { path = "../../crates/ascnet-lucia-plugin-host" }
-agent-tool = { path = "../../crates/ascnet-lucia-tool" }
+agent-core = { path = "../../crates/agent-core" }
+agent-plugin-host = { path = "../../crates/agent-plugin-host" }
+agent-tool = { path = "../../crates/agent-tool" }
 async-trait.workspace = true
 clap.workspace = true
 serde_json.workspace = true
