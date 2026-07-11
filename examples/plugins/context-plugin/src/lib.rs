@@ -33,7 +33,60 @@ const CONTEXT_SERVICE_VERSION: &str = "1.0.0";
 
 /// 提供分层上下文压缩能力的插件。
 #[derive(Default)]
-struct ContextPlugin;
+struct ContextPlugin {
+    /// 最近一次自动压缩结果，用于增量追加后续消息，避免重复处理同一历史前缀。
+    cache: Option<CompressionCache>,
+}
+
+/// 最近一次自动压缩的原始前缀与有效模型上下文。
+struct CompressionCache {
+    provider: String,
+    model: String,
+    system: Option<String>,
+    source_messages: Vec<Value>,
+    loaded_messages: Vec<Value>,
+}
+
+impl ContextPlugin {
+    /// 复用已压缩历史，只把当前请求新增的消息追加到有效上下文后再判断水位。
+    fn compress_incrementally(&mut self, request: ContextLoadRequest) -> CompressionOutcome {
+        let cache_hit = self.cache.as_ref().is_some_and(|cache| {
+            cache.provider == request.provider
+                && cache.model == request.model
+                && cache.system == request.system
+                && request.messages.starts_with(&cache.source_messages)
+        });
+        let source_messages = request.messages.clone();
+        let provider = request.provider.clone();
+        let model = request.model.clone();
+        let system = request.system.clone();
+        let effective_request = if cache_hit {
+            let cache = self.cache.as_ref().expect("命中缓存时必须存在缓存内容");
+            let mut messages = cache.loaded_messages.clone();
+            messages.extend_from_slice(&request.messages[cache.source_messages.len()..]);
+            ContextLoadRequest {
+                messages,
+                ..request
+            }
+        } else {
+            request
+        };
+        let outcome = compress_context(effective_request, false);
+
+        if cache_hit || outcome.event.is_some() {
+            self.cache = Some(CompressionCache {
+                provider,
+                model,
+                system,
+                source_messages,
+                loaded_messages: outcome.context.messages.clone(),
+            });
+        } else {
+            self.cache = None;
+        }
+        outcome
+    }
+}
 
 impl AgentPlugin for ContextPlugin {
     /// 注册主动压缩服务；命令定义由官方 Command 插件维护。
@@ -46,9 +99,10 @@ impl AgentPlugin for ContextPlugin {
         Ok(())
     }
 
-    /// 注销主动压缩服务。
+    /// 注销主动压缩服务，并释放仅服务于运行期请求的压缩缓存。
     fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
         host.remove_service(CONTEXT_COMPACT_SERVICE)?;
+        self.cache = None;
         Ok(())
     }
 
@@ -60,6 +114,7 @@ impl AgentPlugin for ContextPlugin {
         if call.caller_id != TUI_PLUGIN_ID {
             return Err(anyhow!("调用方 `{}` 无权请求上下文压缩", call.caller_id));
         }
+        self.cache = None;
         let outcome = compact_service_request(call.payload)?;
         if let Some(event) = outcome.event {
             host.emit_event(&event)?;
@@ -73,7 +128,7 @@ impl AgentPlugin for ContextPlugin {
         host: &dyn PluginHostApi,
         request: ContextLoadRequest,
     ) -> Result<Option<LoadedContext>> {
-        let outcome = compress_context(request, false);
+        let outcome = self.compress_incrementally(request);
         if let Some(event) = outcome.event {
             host.emit_event(&event)?;
         }
@@ -711,6 +766,49 @@ mod tests {
         assert_eq!(
             outcome.event.expect("应发布压缩事件").data["trigger"],
             "manual"
+        );
+    }
+
+    /// 自动压缩后新增消息应复用已压缩前缀，且不重复发布压缩事件。
+    #[test]
+    fn incremental_compaction_reuses_compacted_prefix() {
+        let large_history = "历史工具输出".repeat(90_000);
+        let original_messages = vec![
+            text_message("user", &large_history),
+            text_message("assistant", "已分析历史"),
+            text_message("user", "继续处理"),
+            text_message("assistant", "正在处理"),
+        ];
+        let mut plugin = ContextPlugin::default();
+        let first = plugin.compress_incrementally(ContextLoadRequest {
+            run_id: "incremental-run".into(),
+            step: 0,
+            provider: "test".into(),
+            model: "test-model".into(),
+            system: None,
+            messages: original_messages.clone(),
+        });
+        assert!(first.event.is_some(), "首轮超过水位时应执行自动压缩");
+
+        let mut extended_messages = original_messages;
+        extended_messages.push(text_message("user", "检查刚才的修改"));
+        let second = plugin.compress_incrementally(ContextLoadRequest {
+            run_id: "incremental-run".into(),
+            step: 1,
+            provider: "test".into(),
+            model: "test-model".into(),
+            system: None,
+            messages: extended_messages,
+        });
+
+        assert!(second.event.is_none(), "复用压缩前缀时不应重复发布压缩事件");
+        assert_eq!(
+            second.context.messages.len(),
+            first.context.messages.len() + 1
+        );
+        assert_eq!(
+            second.context.messages.last(),
+            Some(&text_message("user", "检查刚才的修改"))
         );
     }
 

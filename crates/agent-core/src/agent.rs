@@ -45,8 +45,8 @@ pub struct AgentOptions {
     /// 发送给服务商适配器的模型名称。
     pub model: String,
 
-    /// Maximum ReAct steps.
-    /// 最大 ReAct 步数。
+    /// Maximum consecutive ReAct steps for one user instruction.
+    /// 单条用户指令允许连续执行的最大 ReAct 步数；steering 与 follow-up 会开启新预算。
     pub max_steps: usize,
 
     /// System prompt.
@@ -687,7 +687,9 @@ impl Agent {
         )
         .await?;
 
-        for step in 0..self.options.max_steps {
+        let mut step = 0;
+        let mut steps_since_user_input = 0;
+        while steps_since_user_input < self.options.max_steps {
             // 检查点：follow-up 续跑或上一轮收尾期间到达的取消请求。
             if self.take_cancelled() {
                 return self
@@ -838,6 +840,8 @@ impl Agent {
                     )
                     .await?;
                     session.push_user(follow_up);
+                    step += 1;
+                    steps_since_user_input = 0;
                     continue;
                 }
 
@@ -925,17 +929,25 @@ impl Agent {
                 )
                 .await?;
                 session.push_user(message);
+                steps_since_user_input = 0;
+            } else {
+                steps_since_user_input += 1;
             }
 
             self.emit(&run_id, AgentEventKind::TurnFinished, step, json!({}))
                 .await?;
+            step += 1;
         }
 
         self.emit(
             &run_id,
             AgentEventKind::StepLimitReached,
-            self.options.max_steps,
-            json!({ "max_steps": self.options.max_steps, "usage": &total_usage }),
+            step,
+            json!({
+                "max_steps": self.options.max_steps,
+                "steps_used": step,
+                "usage": &total_usage
+            }),
         )
         .await?;
         Err(anyhow!(
@@ -1391,10 +1403,11 @@ mod tests {
     /// follow-up 消息在任务完成后注入并继续循环。
     #[tokio::test]
     async fn follow_up_continues_the_loop() {
-        let agent = agent_with_script(vec![
+        let mut agent = agent_with_script(vec![
             ModelResponse::text("第一轮回答"),
             ModelResponse::text("第二轮回答"),
         ]);
+        agent.options_mut().max_steps = 1;
         agent.follow_up("继续下一个问题");
 
         let run = agent.run("你好").await.expect("run 应该成功");
@@ -1409,6 +1422,29 @@ mod tests {
             .filter(|m| m.role == crate::model::MessageRole::User)
             .count();
         assert_eq!(user_count, 2);
+    }
+
+    /// steering 注入新用户指令后应获得独立步数预算，同时保留总步数统计。
+    #[tokio::test]
+    async fn steering_resets_step_budget() {
+        let calls = vec![ToolCall::new("call_1", "echo", json!({"n": 1}))];
+        let mut tools = ToolRegistry::new();
+        tools.register(echo_tool()).expect("register echo");
+        let mut agent = agent_with_script(vec![
+            ModelResponse::tool_calls(calls),
+            ModelResponse::text("按新指令完成"),
+        ])
+        .with_tools(tools);
+        agent.options_mut().max_steps = 1;
+        agent.steer("修改后再检查");
+
+        let run = agent
+            .run("执行原任务")
+            .await
+            .expect("steering 后应继续运行");
+
+        assert_eq!(run.final_text, "按新指令完成");
+        assert_eq!(run.steps_used, 2);
     }
 
     /// steering 消息使剩余工具被跳过并注入新指令。

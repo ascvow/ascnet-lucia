@@ -166,6 +166,7 @@ fn default_provider_name() -> String {
 /// TOML 中的 agent 级选项。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentConfig {
+    /// 单条用户指令允许连续执行的最大 ReAct 步数。
     pub max_steps: Option<usize>,
     pub system_prompt: Option<String>,
     pub max_tokens: Option<u32>,
