@@ -63,13 +63,17 @@ system 和 messages 仍由 `ContextLoader` 决定。
 3. 使用 rename 原子替换目标文件；
 4. 同步存储目录。
 
-存储打开时会固定规范化根目录，并拒绝根目录、会话文件或列表项上的符号链接，也会
-拒绝文件名 ID 与记录 ID 不一致的内容。同一进程内，指向相同规范化目录的所有
-`FileSessionStore` 实例共享操作锁，因此 CAS 不会交错。
+存储打开时会固定规范化根目录，并拒绝根目录、会话文件、列表项或锁文件上的符号链接，
+也会拒绝文件名 ID 与记录 ID 不一致的内容。指向相同规范化目录的所有实例先获取进程内
+异步锁，再获取 `.lucia-session.lock` 跨进程独占锁；读取旧 revision、CAS 校验和原子替换
+位于同一锁周期，因此多个 Lucia 进程协作写入时不会双写同一 revision。绕过
+`FileSessionStore` 直接修改 JSON 的外部程序不受协作锁保护。临时文件与目标文件必须位于
+同一文件系统，才能依赖 rename 的原子替换语义。
 
-文件实现不提供跨进程锁。多个进程同时写入同一目录可能破坏 CAS 语义；部署时应为
-该目录指定唯一写进程，或在应用层增加数据库、文件锁等跨进程协调机制。临时文件与
-目标文件必须位于同一文件系统，才能依赖 rename 的原子替换语义。
+会话列表使用同目录下的 `.lucia-session-index` 摘要索引。正常的 `list_summaries` 只读取
+这一个小文件，不扫描完整消息历史；`save` 与 `delete` 在同一跨进程锁周期内同步失效并
+原子更新索引。旧目录首次读取、索引缺失或索引损坏时，会从现有 Session JSON 一次性
+重建，因此不要求用户迁移已有会话。
 
 ## 最小示例
 
@@ -110,13 +114,17 @@ async fn persist_and_resume(agent: &Agent) -> Result<()> {
 
 ## TUI 持久化闭环
 
-`lucia` TUI 默认把会话保存到 `$LUCIA_HOME/sessions`，未设置 `LUCIA_HOME` 时使用
-`$HOME/.lucia/sessions`。可通过配置文件 `[tui]`、`--sessions-dir <目录>` 和
-`--session-id <标识>` 覆盖，也可使用 `--resume-latest` 恢复最近记录。启动时会把
-Session 的用户、助手和工具消息恢复到主事件列表；记录不存在时创建 revision 为 `0`
-的空记录。完整启动规则见 [TUI 配置与会话](/guide/tui-configuration)。
+`lucia` TUI 默认把项目会话根目录设为 `$LUCIA_HOME/projects`，未设置 `LUCIA_HOME` 时
+使用 `$HOME/.lucia/projects`。启动目录经过规范化并映射为稳定 `project-id`，实际存储
+目录为 `<会话根目录>/<project-id>/sessions`。配置文件 `[tui]` 与 `--sessions-dir <目录>`
+覆盖的是根目录，而不是绕过项目隔离。完整启动规则见 [TUI 配置与会话](/guide/tui-configuration)。
 
-每轮 Agent 成功后，TUI 使用启动或上轮保存返回的 revision 执行 CAS，并只在保存
-成功后替换内存中的当前记录。Agent 运行失败、文件写入失败或 revision 冲突时，原会话
-和原 revision 都会保留，避免后续轮次建立在未持久化状态上。`/clear` 保留相同会话 ID
-及 revision，仅清空会话内容，下一轮成功时仍通过 CAS 更新原记录。
+普通启动只创建内存 Draft。首次普通消息到达后，TUI 先通过 CAS 保存包含用户输入的
+记录，再把该 Session 交给 Agent；模型成功后再次保存助手与工具结果。因此一次完整轮次
+通常推进两个 revision。第一次保存失败时，输入会恢复到编辑框且 Agent 不会启动；模型
+运行失败时，已经确认的用户输入仍留在会话记录中，后续可以继续或重试。`/new` 和
+`/clear` 都切换到新的空白 Draft，不会覆盖原会话文件。
+
+若最终回复保存时发现其他进程已经推进同一 revision，TUI 会把包含完整助手与工具结果的
+完成态保存为新的分叉会话并切换过去，避免覆盖并发进程或丢失回复。分叉也无法落盘时，
+完整完成态会保留在当前进程内存中，启动队列暂停自动推进，下一次保存可以继续协调。
