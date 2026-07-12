@@ -23,7 +23,7 @@
 wasm guest plugin
   -> agent-plugin -> agent-tool</div>
 
-Core 不依赖 Plugin Host。Guest SDK 不依赖 Host 实现。具体插件不进入原生 workspace，避免宿主 target 编译 component exports。
+Core 不依赖 Plugin Host。Guest SDK 不依赖 Host 实现。仓库内插件属于统一 Cargo workspace，但不属于默认成员；插件必须按包名和 `wasm32-wasip2` 目标单独构建，避免宿主 target 编译 component exports。
 
 ## 为什么使用 JSON ABI
 

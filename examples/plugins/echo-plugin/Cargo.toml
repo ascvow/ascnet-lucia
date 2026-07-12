@@ -14,10 +14,3 @@ anyhow = "1"
 agent-plugin = { path = "../../../crates/agent-plugin" }
 serde_json = "1"
 wit-bindgen = "0.59"
-
-[profile.release]
-codegen-units = 1
-opt-level = "s"
-debug = false
-strip = true
-lto = true

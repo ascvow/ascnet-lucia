@@ -6,8 +6,6 @@ authors = ["ascvow"]
 license = "MIT"
 description = "Agent Runtime 插件的独立 WASM 端到端测试。"
 
-[workspace]
-
 [dev-dependencies]
 anyhow = "1"
 agent-core = { path = "../../../../crates/agent-core", default-features = false }

@@ -9,19 +9,41 @@ members = [
     "crates/agent-session",
     "examples/basic-cli",
     "crates/agent-tui",
-]
-resolver = "2"
-
-# Independent WASM plugins are intentionally excluded from the native workspace.
-# 独立 WASM 插件不加入原生 workspace，避免 `cargo check` 在宿主 target 上构建 component exports。
-exclude = [
     "examples/plugins/echo-plugin",
     "examples/plugins/context-plugin",
+    "examples/plugins/context-plugin/smoke-tests",
     "examples/plugins/mcp-plugin",
+    "examples/plugins/mcp-plugin/smoke-tests",
     "examples/plugins/skill-plugin",
-    "examples/plugins/ui-showcase-plugin",
+    "examples/plugins/skill-plugin/smoke-tests",
+    "examples/plugins/command-plugin",
+    "examples/plugins/command-plugin/crates/command-protocol",
+    "examples/plugins/command-plugin/crates/command-sdk",
+    "examples/plugins/command-plugin/smoke-tests",
+    "examples/plugins/teammate-plugin",
+    "examples/plugins/teammate-plugin/smoke-tests",
     "examples/plugins/agent-runtime-plugin",
+    "examples/plugins/agent-runtime-plugin/smoke-tests",
+    "examples/plugins/ui-showcase-plugin",
+    "examples/plugins/workflow-plugin",
+    "examples/plugins/workflow-plugin/smoke-tests",
+    "examples/plugins/plan-plugin",
+    "examples/plugins/sandbox-plugin",
+    "examples/plugins/sandbox-plugin/smoke-tests",
+    "tools/lucia-live-tests",
 ]
+default-members = [
+    "crates/agent-tool",
+    "crates/agent-plugin",
+    "crates/agent-plugin-host",
+    "crates/agent-plugin-manager",
+    "crates/agent-core",
+    "crates/agent-runtime",
+    "crates/agent-session",
+    "examples/basic-cli",
+    "crates/agent-tui",
+]
+resolver = "2"
 
 [workspace.package]
 version = "0.1.0"

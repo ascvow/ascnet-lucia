@@ -10,5 +10,3 @@ agent-plugin-host = { path = "../../../../crates/agent-plugin-host" }
 agent-tool = { path = "../../../../crates/agent-tool" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-[workspace]

@@ -2,7 +2,7 @@
 
 ## Cargo crate
 
-插件是独立 `cdylib` crate，不加入原生 workspace：
+插件是独立 `cdylib` crate。仓库内插件应加入根 Cargo workspace，但不要加入 `default-members`；仓库外的第三方插件可以使用自己的 workspace：
 
 ```toml
 [package]

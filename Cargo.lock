@@ -47,6 +47,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-live-tests"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-plugin-host",
+ "agent-tool",
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "agent-plugin"
 version = "0.1.0"
 dependencies = [
@@ -102,6 +116,30 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "agent-runtime-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "agent-runtime-plugin-smoke-tests"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-plugin-host",
+ "agent-runtime",
+ "agent-tool",
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -447,10 +485,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "command-plugin"
+version = "1.0.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "command-protocol",
+ "serde",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "command-plugin-smoke-tests"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin-host",
+ "command-protocol",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "command-protocol"
 version = "1.0.0"
 dependencies = [
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "command-sdk"
+version = "1.0.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "command-protocol",
  "serde_json",
 ]
 
@@ -466,6 +536,29 @@ dependencies = [
  "rustversion",
  "ryu",
  "static_assertions",
+]
+
+[[package]]
+name = "context-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "context-plugin-smoke-tests"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-plugin-host",
+ "agent-tool",
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -805,6 +898,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "echo-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "serde_json",
+ "wit-bindgen",
 ]
 
 [[package]]
@@ -1610,6 +1713,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
+name = "mcp-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "mcp-plugin-smoke-tests"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-plugin-host",
+ "agent-tool",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1725,6 +1850,18 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "plan-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "unicode-width 0.2.0",
+ "wit-bindgen",
+]
 
 [[package]]
 name = "postcard"
@@ -2225,6 +2362,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "sandbox-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "sandbox-plugin-smoke-tests"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-plugin-host",
+ "agent-tool",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2363,6 +2520,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "skill-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "skill-plugin-smoke-tests"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-plugin-host",
+ "agent-tool",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2469,6 +2648,31 @@ name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+
+[[package]]
+name = "teammate-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "teammate-plugin-smoke-tests"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-plugin-host",
+ "agent-runtime",
+ "agent-tool",
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "tempfile"
@@ -2807,6 +3011,16 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "ui-showcase-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "serde_json",
+ "wit-bindgen",
+]
 
 [[package]]
 name = "unicase"
@@ -3785,6 +3999,31 @@ dependencies = [
  "log",
  "thiserror 1.0.69",
  "wast 35.0.2",
+]
+
+[[package]]
+name = "workflow-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "workflow-plugin-smoke-tests"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-plugin-host",
+ "agent-runtime",
+ "agent-tool",
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

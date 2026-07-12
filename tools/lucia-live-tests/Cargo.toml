@@ -15,6 +15,3 @@ clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-# 该工具保持独立，避免为了真实测试入口修改根工作区成员列表。
-[workspace]

@@ -6,8 +6,6 @@ authors = ["ascvow"]
 license = "MIT"
 description = "通用 MCP 插件的独立端到端测试。"
 
-[workspace]
-
 [dev-dependencies]
 agent-core = { path = "../../../../crates/agent-core", default-features = false }
 agent-plugin-host = { path = "../../../../crates/agent-plugin-host" }
