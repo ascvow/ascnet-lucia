@@ -1,9 +1,9 @@
 //! 为 Agent 提供结构化计划管理和声明式 TUI 状态面板。
 
 use agent_plugin::{
-    export_plugin, ActivationContext, AgentPlugin, PluginHostApi, PromptContribution, Result,
-    ToolCall, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiLine, UiPlacement,
-    UiRenderRequest, UiSize, UiSpan, UiStyle,
+    export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentPlugin, PluginHostApi,
+    PromptContribution, Result, ToolCall, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame,
+    UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -178,6 +178,27 @@ impl AgentPlugin for PlanPlugin {
         vec![update_plan_tool(), get_plan_tool()]
     }
 
+    /// 正常运行结束时收敛当前执行项，避免最终回复与计划面板状态不一致。
+    ///
+    /// 取消运行时保留原状态，防止把中断任务误标为完成。
+    fn on_event(&mut self, event: AgentEvent) {
+        if event.kind != AgentEventKind::RunFinished
+            || event.payload["cancelled"].as_bool().unwrap_or(false)
+        {
+            return;
+        }
+        let mut changed = false;
+        for item in &mut self.state.plan {
+            if item.status == PlanStatus::InProgress {
+                item.status = PlanStatus::Completed;
+                changed = true;
+            }
+        }
+        if changed {
+            self.state.revision = self.state.revision.saturating_add(1);
+        }
+    }
+
     /// 校验并原子替换计划，或返回当前只读快照。
     fn call_tool_with_host(
         &mut self,
@@ -211,6 +232,8 @@ impl AgentPlugin for PlanPlugin {
     }
 
     /// 按宿主分配的宽高渲染完成进度、更新说明和步骤状态。
+    ///
+    /// 没有计划或全部步骤完成时返回隐藏帧，使宿主自动收回右侧面板空间。
     fn render_ui(&mut self, request: UiRenderRequest) -> Option<UiFrame> {
         if request.view_id != PLAN_VIEW {
             return None;
@@ -259,7 +282,11 @@ impl AgentPlugin for PlanPlugin {
 
         Some(UiFrame {
             view_id: request.view_id,
-            visible: true,
+            visible: self
+                .state
+                .plan
+                .iter()
+                .any(|item| item.status != PlanStatus::Completed),
             lines,
         })
     }
@@ -485,6 +512,58 @@ mod tests {
         .expect("空计划应表示清空");
 
         assert!(state.plan.is_empty());
+    }
+
+    /// 空计划和已完成计划不应占用右侧面板，未完成计划仍应显示。
+    #[test]
+    fn panel_is_visible_only_while_plan_is_incomplete() {
+        let request = || UiRenderRequest {
+            plugin_id: "plan".into(),
+            view_id: PLAN_VIEW.into(),
+            instance_id: None,
+            width: 24,
+            height: 8,
+            focused: false,
+            frame: 1,
+        };
+        let mut plugin = PlanPlugin::default();
+
+        assert!(!plugin.render_ui(request()).expect("空计划应返回帧").visible);
+        plugin.state.plan = vec![item("检查实现", PlanStatus::Pending)];
+        assert!(
+            plugin
+                .render_ui(request())
+                .expect("未完成计划应返回帧")
+                .visible
+        );
+        plugin.state.plan[0].status = PlanStatus::Completed;
+        assert!(
+            !plugin
+                .render_ui(request())
+                .expect("完成计划应返回帧")
+                .visible
+        );
+    }
+
+    /// 正常完成应收敛执行中步骤，取消运行必须保留原状态。
+    #[test]
+    fn run_finished_completes_only_successful_active_step() {
+        let event = |cancelled| AgentEvent {
+            id: "event".into(),
+            run_id: "run".into(),
+            timestamp_ms: 1,
+            kind: AgentEventKind::RunFinished,
+            step: 1,
+            payload: json!({"cancelled": cancelled}),
+        };
+        let mut plugin = PlanPlugin::default();
+        plugin.state.plan = vec![item("汇总评价", PlanStatus::InProgress)];
+
+        plugin.on_event(event(true));
+        assert_eq!(plugin.state.plan[0].status, PlanStatus::InProgress);
+        plugin.on_event(event(false));
+        assert_eq!(plugin.state.plan[0].status, PlanStatus::Completed);
+        assert_eq!(plugin.state.revision, 1);
     }
 
     /// 验证计划面板遵守 Host 分配的宽高限制。

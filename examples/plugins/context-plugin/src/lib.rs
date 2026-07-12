@@ -38,12 +38,15 @@ struct ContextPlugin {
     cache: Option<CompressionCache>,
 }
 
-/// 最近一次自动压缩的原始前缀与有效模型上下文。
+/// 最近一次自动压缩的追加边界与有效模型上下文。
 struct CompressionCache {
+    /// 同一 Agent 运行内的会话消息只会追加，跨运行必须使缓存失效。
+    run_id: String,
     provider: String,
     model: String,
     system: Option<String>,
-    source_messages: Vec<Value>,
+    /// 生成压缩结果时原始上下文的消息数，用于识别后续追加内容。
+    source_message_count: usize,
     loaded_messages: Vec<Value>,
 }
 
@@ -51,19 +54,23 @@ impl ContextPlugin {
     /// 复用已压缩历史，只把当前请求新增的消息追加到有效上下文后再判断水位。
     fn compress_incrementally(&mut self, request: ContextLoadRequest) -> CompressionOutcome {
         let cache_hit = self.cache.as_ref().is_some_and(|cache| {
-            cache.provider == request.provider
+            // Agent 在单次 run 中只会向 Session 追加消息；避免比较超大 JSON 前缀，
+            // 否则微压缩后的下一轮会在 Guest 内耗尽 fuel。
+            cache.run_id == request.run_id
+                && cache.provider == request.provider
                 && cache.model == request.model
                 && cache.system == request.system
-                && request.messages.starts_with(&cache.source_messages)
+                && request.messages.len() >= cache.source_message_count
         });
-        let source_messages = request.messages.clone();
+        let source_message_count = request.messages.len();
+        let run_id = request.run_id.clone();
         let provider = request.provider.clone();
         let model = request.model.clone();
         let system = request.system.clone();
         let effective_request = if cache_hit {
             let cache = self.cache.as_ref().expect("命中缓存时必须存在缓存内容");
             let mut messages = cache.loaded_messages.clone();
-            messages.extend_from_slice(&request.messages[cache.source_messages.len()..]);
+            messages.extend_from_slice(&request.messages[cache.source_message_count..]);
             ContextLoadRequest {
                 messages,
                 ..request
@@ -75,10 +82,11 @@ impl ContextPlugin {
 
         if cache_hit || outcome.event.is_some() {
             self.cache = Some(CompressionCache {
+                run_id,
                 provider,
                 model,
                 system,
-                source_messages,
+                source_message_count,
                 loaded_messages: outcome.context.messages.clone(),
             });
         } else {
@@ -128,11 +136,21 @@ impl AgentPlugin for ContextPlugin {
         host: &dyn PluginHostApi,
         request: ContextLoadRequest,
     ) -> Result<Option<LoadedContext>> {
+        let cache_hit = self.cache.as_ref().is_some_and(|cache| {
+            cache.run_id == request.run_id
+                && cache.provider == request.provider
+                && cache.model == request.model
+                && cache.system == request.system
+                && request.messages.len() >= cache.source_message_count
+        });
         let outcome = self.compress_incrementally(request);
         if let Some(event) = outcome.event {
             host.emit_event(&event)?;
+            return Ok(Some(outcome.context));
         }
-        Ok(Some(outcome.context))
+        // 未压缩的完整历史已由 Host 持有，无需跨 WASM 边界往返序列化。
+        // 命中缓存时仍须返回插件维护的已压缩上下文及本轮追加消息。
+        Ok(cache_hit.then_some(outcome.context))
     }
 }
 
