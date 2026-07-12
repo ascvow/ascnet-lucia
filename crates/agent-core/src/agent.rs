@@ -14,6 +14,7 @@ use crate::{
         TokenUsage, ToolChoice,
     },
     session::Session,
+    state::{AgentPhase, AgentState, AgentToolCallState, AgentToolCallStatus},
 };
 use agent_tool::{ToolCall, ToolRegistry, ToolResult, ToolSpec};
 use anyhow::{anyhow, Context as _, Result};
@@ -214,6 +215,7 @@ pub struct AgentControl {
     steering: Arc<std::sync::Mutex<Vec<String>>>,
     follow_ups: Arc<std::sync::Mutex<Vec<String>>>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<std::sync::Mutex<AgentState>>,
 }
 
 impl AgentControl {
@@ -276,6 +278,17 @@ impl AgentControl {
     pub fn cancel_requested(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// 返回 Agent 当前完整状态的只读快照。
+    ///
+    /// 队列长度和取消标志在读取时合并，保证控制面瞬时状态不会依赖 ReAct 检查点刷新。
+    pub fn state(&self) -> AgentState {
+        let mut state = self.state.lock().expect("Agent 状态锁不应中毒").clone();
+        state.pending_steering = self.pending_steering();
+        state.pending_follow_ups = self.pending_follow_ups();
+        state.cancel_requested = self.cancel_requested();
+        state
+    }
 }
 
 /// Minimal ReAct agent.
@@ -296,6 +309,9 @@ pub struct Agent {
     /// 取消标志：运行循环在检查点消费后优雅收尾。
     cancelled: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Core Agent 的唯一运行状态；通过快照读取，禁止调用方直接修改。
+    state: Arc<std::sync::Mutex<AgentState>>,
+
     /// 每次模型请求使用的上下文加载器。
     context_loader: Arc<dyn ContextLoader>,
 }
@@ -312,6 +328,7 @@ impl Agent {
             steering: Arc::new(std::sync::Mutex::new(Vec::new())),
             follow_ups: Arc::new(std::sync::Mutex::new(Vec::new())),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            state: Arc::new(std::sync::Mutex::new(AgentState::default())),
             context_loader: Arc::new(PassthroughContextLoader),
         }
     }
@@ -568,7 +585,13 @@ impl Agent {
             steering: self.steering.clone(),
             follow_ups: self.follow_ups.clone(),
             cancelled: self.cancelled.clone(),
+            state: self.state.clone(),
         }
+    }
+
+    /// 返回 Agent 当前完整状态的只读快照。
+    pub fn state(&self) -> AgentState {
+        self.control().state()
     }
 
     /// 排队一条 steering 消息。
@@ -669,8 +692,20 @@ impl Agent {
     ///
     /// 收到取消请求（[`AgentControl::cancel`]）时在最近的检查点优雅收尾，
     /// 返回 `cancelled = true` 的 [`AgentRun`]，会话保留已完成的内容。
-    pub async fn run_session(&self, mut session: Session) -> Result<AgentRun> {
+    pub async fn run_session(&self, session: Session) -> Result<AgentRun> {
         let run_id = uuid::Uuid::new_v4().to_string();
+        self.begin_run(&run_id, &session)?;
+
+        let result = self.run_session_inner(run_id, session).await;
+        match &result {
+            Ok(run) => self.finish_state(run),
+            Err(error) => self.fail_state(error),
+        }
+        result
+    }
+
+    /// 执行已取得唯一运行槽位的 ReAct 循环，所有退出由外层统一收敛状态。
+    async fn run_session_inner(&self, run_id: String, mut session: Session) -> Result<AgentRun> {
         let mut total_usage = TokenUsage::default();
         // 取消只作用于当前运行：清除上一次运行结束后残留的取消请求。
         self.cancelled
@@ -690,6 +725,14 @@ impl Agent {
         let mut step = 0;
         let mut steps_since_user_input = 0;
         while steps_since_user_input < self.options.max_steps {
+            self.update_state(|state| {
+                state.phase = AgentPhase::Preparing;
+                state.step = step;
+                state.session = session.clone();
+                state.streamed_text.clear();
+                state.thinking_text.clear();
+                state.tool_calls.clear();
+            });
             // 检查点：follow-up 续跑或上一轮收尾期间到达的取消请求。
             if self.take_cancelled() {
                 return self
@@ -727,6 +770,8 @@ impl Agent {
                 provider_options: self.options.provider_options.clone(),
             };
 
+            self.update_state(|state| state.phase = AgentPhase::RequestingModel);
+
             self.emit(
                 &run_id,
                 AgentEventKind::ModelRequest,
@@ -741,6 +786,7 @@ impl Agent {
             .await?;
 
             let mut model_stream = self.gateway.stream(&self.options.provider, req).await?;
+            self.update_state(|state| state.phase = AgentPhase::StreamingModel);
             // 累积文本增量：取消发生在流中途时，把已生成的部分文本保留进会话。
             let mut streamed_text = String::new();
             while let Some(event) = model_stream.next().await {
@@ -759,6 +805,7 @@ impl Agent {
                 match event {
                     ModelStreamEvent::TextDelta { index, delta } => {
                         streamed_text.push_str(&delta);
+                        self.update_state(|state| state.streamed_text.push_str(&delta));
                         self.emit(
                             &run_id,
                             AgentEventKind::ModelTextDelta,
@@ -768,6 +815,7 @@ impl Agent {
                         .await?;
                     }
                     ModelStreamEvent::ThinkingDelta { index, delta } => {
+                        self.update_state(|state| state.thinking_text.push_str(&delta));
                         self.emit(
                             &run_id,
                             AgentEventKind::ModelThinkingDelta,
@@ -786,6 +834,15 @@ impl Agent {
             let usage = response.usage.clone();
             let provider_billing = response.billing.clone();
             session.push_assistant_blocks(response.content.clone());
+            self.update_state(|state| {
+                state.session = session.clone();
+                state.streamed_text.clear();
+                state.tool_calls = tool_calls
+                    .iter()
+                    .cloned()
+                    .map(AgentToolCallState::pending)
+                    .collect();
+            });
 
             self.emit(
                 &run_id,
@@ -803,6 +860,7 @@ impl Agent {
 
             if let Some(usage) = &usage {
                 total_usage.add_assign(usage);
+                self.update_state(|state| state.usage = total_usage.clone());
             }
 
             let billing = BillingUsage::new(
@@ -840,6 +898,7 @@ impl Agent {
                     )
                     .await?;
                     session.push_user(follow_up);
+                    self.update_state(|state| state.session = session.clone());
                     step += 1;
                     steps_since_user_input = 0;
                     continue;
@@ -863,6 +922,7 @@ impl Agent {
             }
 
             // 逐个执行工具；每个工具执行前检查取消，完成后检查 steering 队列。
+            self.update_state(|state| state.phase = AgentPhase::ExecutingTools);
             let mut results = Vec::new();
             let mut steering_message = None;
             let mut run_cancelled = false;
@@ -882,6 +942,7 @@ impl Agent {
                             skipped.name.clone(),
                             "Skipped due to cancelled run",
                         ));
+                        self.mark_tool_skipped(&skipped.id);
                     }
                     run_cancelled = true;
                     break;
@@ -907,6 +968,7 @@ impl Agent {
                             skipped.name.clone(),
                             "Skipped due to cancelled run",
                         ));
+                        self.mark_tool_skipped(&skipped.id);
                     }
                     run_cancelled = true;
                     break;
@@ -927,12 +989,14 @@ impl Agent {
                             skipped.name.clone(),
                             "Skipped due to queued user message",
                         ));
+                        self.mark_tool_skipped(&skipped.id);
                     }
                     steering_message = Some(message);
                     break;
                 }
             }
             session.push_tool_results(results);
+            self.update_state(|state| state.session = session.clone());
 
             if run_cancelled {
                 return self
@@ -949,6 +1013,7 @@ impl Agent {
                 )
                 .await?;
                 session.push_user(message);
+                self.update_state(|state| state.session = session.clone());
                 steps_since_user_input = 0;
             } else {
                 steps_since_user_input += 1;
@@ -1033,16 +1098,29 @@ impl Agent {
             ToolDecision::Block { reason } => {
                 let result = ToolResult::error(original_call.id, original_call.name, reason);
                 self.extension.after_tool(&result).await?;
+                self.finish_tool_state(&result);
                 return Ok(result);
             }
             ToolDecision::CancelRun { reason } => {
                 self.control().cancel();
                 let result = ToolResult::error(original_call.id, original_call.name, reason);
                 self.extension.after_tool(&result).await?;
+                self.finish_tool_state(&result);
                 return Ok(result);
             }
             ToolDecision::RequireApproval { .. } => unreachable!("审批决策已在执行前处理"),
         };
+
+        self.update_state(|state| {
+            if let Some(tool) = state
+                .tool_calls
+                .iter_mut()
+                .find(|tool| tool.call.id == call.id)
+            {
+                tool.call = call.clone();
+                tool.status = AgentToolCallStatus::Running;
+            }
+        });
 
         self.emit(
             run_id,
@@ -1066,6 +1144,7 @@ impl Agent {
         };
 
         self.extension.after_tool(&result).await?;
+        self.finish_tool_state(&result);
         self.emit(
             run_id,
             AgentEventKind::ToolFinished,
@@ -1080,6 +1159,83 @@ impl Agent {
         )
         .await?;
         Ok(result)
+    }
+
+    /// 取得唯一运行槽位并用输入会话初始化完整状态。
+    fn begin_run(&self, run_id: &str, session: &Session) -> Result<()> {
+        let mut state = self.state.lock().expect("Agent 状态锁不应中毒");
+        if state.phase.is_running() {
+            return Err(anyhow!("agent is already running"));
+        }
+        *state = AgentState {
+            phase: AgentPhase::Preparing,
+            run_id: Some(run_id.to_string()),
+            session: session.clone(),
+            ..AgentState::default()
+        };
+        Ok(())
+    }
+
+    /// 将成功或取消结果收敛为稳定终态快照。
+    fn finish_state(&self, run: &AgentRun) {
+        self.update_state(|state| {
+            state.phase = if run.cancelled {
+                AgentPhase::Cancelled
+            } else {
+                AgentPhase::Succeeded
+            };
+            state.run_id = Some(run.run_id.clone());
+            state.step = run.steps_used.saturating_sub(1);
+            state.session = run.session.clone();
+            state.streamed_text.clear();
+            state.thinking_text.clear();
+            state.usage = run.usage.clone();
+            state.error = None;
+        });
+    }
+
+    /// 将任意 ReAct 错误收敛为失败终态，同时保留最后已确认的运行上下文。
+    fn fail_state(&self, error: &anyhow::Error) {
+        self.update_state(|state| {
+            state.phase = AgentPhase::Failed;
+            state.error = Some(format!("{error:#}"));
+        });
+    }
+
+    /// 在内部锁保护下执行一次不可观察的原子状态更新。
+    fn update_state(&self, update: impl FnOnce(&mut AgentState)) {
+        update(&mut self.state.lock().expect("Agent 状态锁不应中毒"));
+    }
+
+    /// 将工具结果写入对应调用状态；未知调用不会扩张模型声明的调用集合。
+    fn finish_tool_state(&self, result: &ToolResult) {
+        self.update_state(|state| {
+            if let Some(tool) = state
+                .tool_calls
+                .iter_mut()
+                .find(|tool| tool.call.id == result.call_id)
+            {
+                tool.status = if result.is_error {
+                    AgentToolCallStatus::Failed
+                } else {
+                    AgentToolCallStatus::Succeeded
+                };
+                tool.result = Some(result.clone());
+            }
+        });
+    }
+
+    /// 将未执行的工具调用标记为跳过，并保留其原始参数供诊断。
+    fn mark_tool_skipped(&self, call_id: &str) {
+        self.update_state(|state| {
+            if let Some(tool) = state
+                .tool_calls
+                .iter_mut()
+                .find(|tool| tool.call.id == call_id)
+            {
+                tool.status = AgentToolCallStatus::Skipped;
+            }
+        });
     }
 
     /// 返回当前实际暴露给模型的原生工具与扩展工具定义。
@@ -1330,6 +1486,10 @@ mod tests {
         control.follow_up("后续处理");
         assert_eq!(control.pending_steering(), 1);
         assert_eq!(control.pending_follow_ups(), 1);
+        let state = control.state();
+        assert_eq!(state.phase, AgentPhase::Idle);
+        assert_eq!(state.pending_steering, 1);
+        assert_eq!(state.pending_follow_ups, 1);
         control.clear_steering();
         control.clear_follow_ups();
         assert_eq!(control.pending_steering(), 0);
@@ -1428,6 +1588,66 @@ mod tests {
         }
     }
 
+    /// 由通知器控制返回时机的模型，用于验证单 Agent 运行槽位。
+    struct BlockingModel {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ChatModel for BlockingModel {
+        async fn complete(&self, _req: ModelRequest) -> Result<ModelResponse> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(ModelResponse::text("完成"))
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for BlockingModel {
+        fn name(&self) -> &'static str {
+            "blocking"
+        }
+    }
+
+    /// 在事件回调时读取 Core 状态，验证事件与状态转换的先后顺序。
+    struct StateObserver {
+        control: AgentControl,
+        observed: std::sync::Mutex<Vec<(AgentEventKind, AgentState)>>,
+    }
+
+    impl StateObserver {
+        /// 创建绑定到同一 Agent 控制面的状态观察器。
+        fn new(control: AgentControl) -> Self {
+            Self {
+                control,
+                observed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// 返回指定事件发生时记录的第一份状态快照。
+        fn state_for(&self, kind: AgentEventKind) -> AgentState {
+            self.observed
+                .lock()
+                .expect("状态观察器锁不应中毒")
+                .iter()
+                .find(|(event_kind, _)| *event_kind == kind)
+                .map(|(_, state)| state.clone())
+                .expect("指定事件应记录状态快照")
+        }
+    }
+
+    #[async_trait]
+    impl EventSink for StateObserver {
+        async fn record(&self, event: &AgentEvent) -> Result<()> {
+            self.observed
+                .lock()
+                .expect("状态观察器锁不应中毒")
+                .push((event.kind.clone(), self.control.state()));
+            Ok(())
+        }
+    }
+
     /// 构造使用脚本化模型的 agent。
     fn agent_with_script(responses: Vec<ModelResponse>) -> Agent {
         let mut gateway = ModelGateway::new();
@@ -1446,6 +1666,129 @@ mod tests {
             ToolSpec::new("echo", "回显输入", ToolSpec::empty_object_schema()),
             |args| async move { Ok(args) },
         )
+    }
+
+    /// 状态快照应覆盖模型流式阶段，并在成功后保留完整会话和运行摘要。
+    #[tokio::test]
+    async fn state_tracks_streaming_and_success_terminal_snapshot() {
+        let mut gateway = ModelGateway::new();
+        gateway
+            .register("stream", Arc::new(StreamingModel))
+            .expect("注册流式模型");
+        let agent = Agent::new(
+            gateway,
+            AgentOptions::default().with_model_route("stream", "stream-model"),
+        );
+        let observer = Arc::new(StateObserver::new(agent.control()));
+        let agent = agent.with_event_sink(observer.clone());
+
+        let run = agent.run("你好").await.expect("流式运行应成功");
+
+        let streaming = observer.state_for(AgentEventKind::ModelTextDelta);
+        assert_eq!(streaming.phase, AgentPhase::StreamingModel);
+        assert_eq!(streaming.streamed_text, "你");
+        assert_eq!(streaming.step, 0);
+
+        let completed = agent.state();
+        assert_eq!(completed.phase, AgentPhase::Succeeded);
+        assert_eq!(completed.run_id.as_deref(), Some(run.run_id.as_str()));
+        assert_eq!(completed.session, run.session);
+        assert_eq!(completed.usage, run.usage);
+        assert!(completed.streamed_text.is_empty());
+        assert!(completed.error.is_none());
+    }
+
+    /// 工具事件发出时，状态应分别反映执行中与已完成结果。
+    #[tokio::test]
+    async fn state_tracks_tool_call_lifecycle() {
+        let call = ToolCall::new("state-call", "echo", json!({"value": "测试"}));
+        let mut agent = agent_with_script(vec![
+            ModelResponse::tool_calls(vec![call.clone()]),
+            ModelResponse::text("完成"),
+        ]);
+        agent
+            .tools_mut()
+            .register(echo_tool())
+            .expect("注册 echo 工具");
+        let observer = Arc::new(StateObserver::new(agent.control()));
+        agent.set_event_sink(observer.clone());
+
+        agent.run("执行工具").await.expect("工具运行应成功");
+
+        let started = observer.state_for(AgentEventKind::ToolStarted);
+        assert_eq!(started.phase, AgentPhase::ExecutingTools);
+        assert_eq!(started.tool_calls[0].call, call);
+        assert_eq!(started.tool_calls[0].status, AgentToolCallStatus::Running);
+
+        let finished = observer.state_for(AgentEventKind::ToolFinished);
+        assert_eq!(
+            finished.tool_calls[0].status,
+            AgentToolCallStatus::Succeeded
+        );
+        assert!(finished.tool_calls[0].result.is_some());
+    }
+
+    /// ReAct 错误应形成可查询的失败终态，并保留最后已确认的会话。
+    #[tokio::test]
+    async fn state_preserves_failure_diagnostics_and_session() {
+        let call = ToolCall::new("limit-call", "echo", json!({"value": "测试"}));
+        let mut agent = agent_with_script(vec![ModelResponse::tool_calls(vec![call])]);
+        agent.options_mut().max_steps = 1;
+        agent
+            .tools_mut()
+            .register(echo_tool())
+            .expect("注册 echo 工具");
+
+        let error = agent
+            .run("执行到步数上限")
+            .await
+            .expect_err("运行应达到步数上限");
+        let error_message = error.to_string();
+        let failed = agent.state();
+
+        assert_eq!(failed.phase, AgentPhase::Failed);
+        assert_eq!(failed.error.as_deref(), Some(error_message.as_str()));
+        assert!(!failed.session.messages().is_empty());
+        assert!(failed.phase.is_terminal());
+    }
+
+    /// 一份状态只能对应一个 ReAct 循环，并发启动不能覆盖正在运行的快照。
+    #[tokio::test]
+    async fn state_rejects_concurrent_runs_on_the_same_agent() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut gateway = ModelGateway::new();
+        gateway
+            .register(
+                "blocking",
+                Arc::new(BlockingModel {
+                    started: started.clone(),
+                    release: release.clone(),
+                }),
+            )
+            .expect("注册阻塞模型");
+        let agent = Arc::new(Agent::new(
+            gateway,
+            AgentOptions::default().with_model_route("blocking", "blocking-model"),
+        ));
+        let running_agent = agent.clone();
+        let running = tokio::spawn(async move { running_agent.run("第一次运行").await });
+        started.notified().await;
+        let active_run_id = agent.state().run_id;
+
+        let error = agent
+            .run("并发运行")
+            .await
+            .expect_err("同一 Agent 不应接受并发运行");
+
+        assert_eq!(error.to_string(), "agent is already running");
+        assert_eq!(agent.state().run_id, active_run_id);
+        release.notify_one();
+        running
+            .await
+            .expect("运行任务不应 panic")
+            .expect("首个运行应完成");
+        assert_eq!(agent.state().phase, AgentPhase::Succeeded);
     }
 
     /// Core 必须等待审批扩展给出最终决策后再执行原工具调用。

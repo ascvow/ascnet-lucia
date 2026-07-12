@@ -18,6 +18,7 @@ pub mod event;
 pub mod extension;
 pub mod model;
 pub mod session;
+pub mod state;
 
 pub use agent::{Agent, AgentControl, AgentModelConfig, AgentOptions, AgentRun};
 pub use config::{AgentConfig, AgentRootConfig, ModelConfig};
@@ -36,3 +37,4 @@ pub use model::{
     ProviderBilling, ProviderKind, ReasoningLevel, TokenUsage, ToolChoice,
 };
 pub use session::Session;
+pub use state::{AgentPhase, AgentState, AgentToolCallState, AgentToolCallStatus};
