@@ -22,19 +22,14 @@ pub enum ProviderKind {
 
 /// OpenAI-compatible protocol variant.
 /// OpenAI 兼容协议变体。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum OpenAiProtocol {
     /// OpenAI Responses API；支持 Responses 特有的输入和推理字段。
+    #[default]
     Responses,
     /// OpenAI Chat Completions API 及其兼容实现。
     ChatCompletions,
-}
-
-impl Default for OpenAiProtocol {
-    fn default() -> Self {
-        Self::Responses
-    }
 }
 
 /// Configuration used to create a provider adapter.
@@ -210,14 +205,14 @@ impl ModelGateway {
                 #[cfg(feature = "openai")]
                 {
                     use super::openai::{OpenAiChatCompletionsAdapter, OpenAiResponsesAdapter};
-                    return match config.openai_protocol.clone() {
+                    match config.openai_protocol.clone() {
                         OpenAiProtocol::Responses => {
                             Ok(Arc::new(OpenAiResponsesAdapter::new(config)?))
                         }
                         OpenAiProtocol::ChatCompletions => {
                             Ok(Arc::new(OpenAiChatCompletionsAdapter::new(config)?))
                         }
-                    };
+                    }
                 }
 
                 #[cfg(not(feature = "openai"))]

@@ -220,11 +220,12 @@ pub enum ReasoningLevel {
 
 /// How the model should use tools.
 /// 模型应该如何使用工具。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolChoice {
     /// Let the model decide.
     /// 让模型自行决定。
+    #[default]
     Auto,
 
     /// Prevent tool calls.
@@ -241,12 +242,6 @@ pub enum ToolChoice {
         /// 必须调用的公开工具名称；应与请求中的 [`ToolSpec`] 名称一致。
         name: String,
     },
-}
-
-impl Default for ToolChoice {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// Request sent from ReAct loop to a model adapter.
@@ -411,7 +406,7 @@ impl ProviderBilling {
     pub fn is_empty(&self) -> bool {
         self.amount.is_none()
             && self.currency.is_none()
-            && self.fields.as_object().map_or(true, Map::is_empty)
+            && self.fields.as_object().is_none_or(Map::is_empty)
     }
 }
 

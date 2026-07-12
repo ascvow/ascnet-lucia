@@ -173,7 +173,7 @@ impl BillingUsage {
             && self
                 .provider_billing
                 .as_ref()
-                .map_or(true, ProviderBilling::is_empty)
+                .is_none_or(ProviderBilling::is_empty)
     }
 }
 
