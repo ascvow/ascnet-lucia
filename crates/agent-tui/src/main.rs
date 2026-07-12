@@ -279,7 +279,8 @@ enum UiEvent {
     Input(Event),
     Tick,
     ModelStarted,
-    ModelTextDelta(String),
+    /// 共享文本缓冲区已有尚未渲染的模型增量。
+    ModelTextReady,
     ToolStarted {
         name: String,
         /// 调用参数的单行摘要。
@@ -2845,7 +2846,46 @@ fn default_plugin_height(placement: UiPlacement) -> u16 {
 
 // ─── 事件 Sink：将 agent 事件转发到 UI 通道 ───
 
-struct ChannelEventSink(mpsc::UnboundedSender<UiEvent>);
+/// 合并高频模型文本增量，避免为每个 token 创建独立 UI 通知。
+#[derive(Default)]
+struct ModelDeltaBuffer {
+    /// 尚未由 UI 线程消费的文本。
+    text: String,
+    /// 是否已有一个排队中的就绪通知。
+    notification_pending: bool,
+}
+
+impl ModelDeltaBuffer {
+    /// 追加文本，并返回本次追加是否需要创建 UI 通知。
+    fn push(&mut self, delta: &str) -> bool {
+        self.text.push_str(delta);
+        if self.notification_pending {
+            false
+        } else {
+            self.notification_pending = true;
+            true
+        }
+    }
+
+    /// 取出当前全部文本，并允许生产者创建下一次通知。
+    fn take(&mut self) -> String {
+        self.notification_pending = false;
+        std::mem::take(&mut self.text)
+    }
+}
+
+struct ChannelEventSink(
+    mpsc::UnboundedSender<UiEvent>,
+    Arc<std::sync::Mutex<ModelDeltaBuffer>>,
+);
+
+impl ChannelEventSink {
+    /// 创建 UI 事件 sink，并返回由 UI 线程排空的共享模型增量缓冲区。
+    fn new(tx: mpsc::UnboundedSender<UiEvent>) -> (Self, Arc<std::sync::Mutex<ModelDeltaBuffer>>) {
+        let model_deltas = Arc::new(std::sync::Mutex::new(ModelDeltaBuffer::default()));
+        (Self(tx, Arc::clone(&model_deltas)), model_deltas)
+    }
+}
 
 #[async_trait]
 impl EventSink for ChannelEventSink {
@@ -2874,7 +2914,14 @@ impl EventSink for ChannelEventSink {
             }
             AgentEventKind::ModelTextDelta => {
                 if let Some(delta) = event.payload.get("delta").and_then(Value::as_str) {
-                    let _ = self.0.send(UiEvent::ModelTextDelta(delta.to_string()));
+                    let should_notify = self
+                        .1
+                        .lock()
+                        .expect("模型增量缓冲区锁不应中毒")
+                        .push(delta);
+                    if should_notify {
+                        let _ = self.0.send(UiEvent::ModelTextReady);
+                    }
                 }
             }
             AgentEventKind::ToolStarted => {
@@ -4113,7 +4160,8 @@ async fn main() -> Result<()> {
 
     // UI 通道 sink 之外，可选叠加 JSONL sink 用于排查请求与工具调用。
     let mut sink = CompositeEventSink::new();
-    sink.push(Arc::new(ChannelEventSink(tx.clone())));
+    let (ui_sink, model_deltas) = ChannelEventSink::new(tx.clone());
+    sink.push(Arc::new(ui_sink));
     if let Some(path) = events_jsonl {
         sink.push(Arc::new(JsonlEventSink::new(path.clone())));
     }
@@ -4410,8 +4458,14 @@ async fn main() -> Result<()> {
             Some(UiEvent::ModelStarted) => {
                 app.start_model_response();
             }
-            Some(UiEvent::ModelTextDelta(delta)) => {
-                app.append_model_delta(&delta);
+            Some(UiEvent::ModelTextReady) => {
+                let delta = model_deltas
+                    .lock()
+                    .expect("模型增量缓冲区锁不应中毒")
+                    .take();
+                if !delta.is_empty() {
+                    app.append_model_delta(&delta);
+                }
             }
             Some(UiEvent::ToolStarted { name, args }) => {
                 let mut msg = Msg::new(MsgKind::ToolRunning, name);

@@ -665,6 +665,41 @@ fn streamed_deltas_update_one_assistant_message() {
     assert!(app.streaming_message.is_none());
 }
 
+/// 高频模型增量只排队一个 UI 通知，消费后才能创建下一次通知。
+#[tokio::test]
+async fn channel_event_sink_coalesces_model_text_notifications() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, model_deltas) = ChannelEventSink::new(tx);
+    let first = AgentEvent::new(
+        "run-test",
+        AgentEventKind::ModelTextDelta,
+        0,
+        json!({ "delta": "你" }),
+    );
+    let second = AgentEvent::new(
+        "run-test",
+        AgentEventKind::ModelTextDelta,
+        0,
+        json!({ "delta": "好" }),
+    );
+
+    sink.record(&first).await.expect("记录首个模型增量");
+    sink.record(&second).await.expect("记录第二个模型增量");
+
+    assert!(matches!(rx.recv().await, Some(UiEvent::ModelTextReady)));
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        model_deltas
+            .lock()
+            .expect("模型增量缓冲区锁不应中毒")
+            .take(),
+        "你好"
+    );
+
+    sink.record(&first).await.expect("消费后应允许再次通知");
+    assert!(matches!(rx.recv().await, Some(UiEvent::ModelTextReady)));
+}
+
 /// 验证成功轮次创建并更新同一稳定会话，且每次保存都会推进 revision。
 #[tokio::test]
 async fn successful_runs_persist_with_cas_revision() {
