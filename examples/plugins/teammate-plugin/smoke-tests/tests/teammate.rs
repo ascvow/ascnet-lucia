@@ -106,7 +106,7 @@ async fn component_runs_mailbox_dispatch_flow() {
     let declarations = PluginHost::ui_declarations(&host)
         .await
         .expect("团队 UI 声明应可读取");
-    assert_eq!(declarations.len(), 2);
+    assert_eq!(declarations.len(), 3);
     assert_eq!(declarations[0].placement, UiPlacement::Right);
     assert_eq!(declarations[1].placement, UiPlacement::Subview);
     let dock = PluginHost::render_ui(
@@ -183,6 +183,84 @@ async fn component_runs_mailbox_dispatch_flow() {
         .expect("spawn 应返回稳定成员地址");
     wait_result(&host, member_id).await;
 
+    PluginHost::on_ui_input(
+        &host,
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-team-workspace".into(),
+            instance_id: Some("team".into()),
+            event: UiInputEvent::Key {
+                code: "enter".into(),
+                modifiers: Vec::new(),
+            },
+        },
+    )
+    .await
+    .expect("选中成员应能打开实时会话");
+    let member_navigation = AgentExtension::drain_events(&host)
+        .await
+        .expect("成员会话导航事件应可读取");
+    assert!(member_navigation.iter().any(|event| {
+        event["name"] == UI_NAVIGATION_EVENT
+            && event["data"]["action"]["view"]["view_id"] == "teammate-member-session"
+            && event["data"]["action"]["view"]["instance_id"] == member_id
+    }));
+    let session = PluginHost::render_ui(
+        &host,
+        &UiRenderRequest {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-member-session".into(),
+            instance_id: Some(member_id.into()),
+            width: 80,
+            height: 24,
+            focused: true,
+            frame: 2,
+        },
+    )
+    .await
+    .expect("成员实时会话渲染不应失败")
+    .expect("成员实时会话应返回可见帧");
+    let session_text = session
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    assert!(session_text.contains("运行完成"), "{session_text}");
+
+    for code in ["r", "e", "v", "i", "e", "w"] {
+        PluginHost::on_ui_input(
+            &host,
+            &UiInput {
+                plugin_id: "teammate".into(),
+                view_id: "teammate-member-session".into(),
+                instance_id: Some(member_id.into()),
+                event: UiInputEvent::Key {
+                    code: code.into(),
+                    modifiers: Vec::new(),
+                },
+            },
+        )
+        .await
+        .expect("成员会话文本输入不应失败");
+    }
+    PluginHost::on_ui_input(
+        &host,
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-member-session".into(),
+            instance_id: Some(member_id.into()),
+            event: UiInputEvent::Key {
+                code: "enter".into(),
+                modifiers: Vec::new(),
+            },
+        },
+    )
+    .await
+    .expect("成员会话消息发送不应失败");
+    let interactive_result = wait_result(&host, member_id).await;
+    assert_eq!(interactive_result["outcome"]["status"], "succeeded");
+
     let sent = call_tool(
         &host,
         "teammate_send",
@@ -194,16 +272,9 @@ async fn component_runs_mailbox_dispatch_flow() {
     )
     .await;
     assert_eq!(sent["message"]["sender"]["kind"], "controller");
-    let message_id = sent["message"]["id"]
-        .as_u64()
-        .expect("send 应返回消息 ID");
+    let message_id = sent["message"]["id"].as_u64().expect("send 应返回消息 ID");
 
-    let inbox = call_tool(
-        &host,
-        "teammate_inbox",
-        json!({"member_id": member_id}),
-    )
-    .await;
+    let inbox = call_tool(&host, "teammate_inbox", json!({"member_id": member_id})).await;
     assert_eq!(inbox["messages"].as_array().map(Vec::len), Some(1));
 
     let dispatched = call_tool(
@@ -217,23 +288,13 @@ async fn component_runs_mailbox_dispatch_flow() {
     let second_result = wait_result(&host, member_id).await;
     assert_eq!(second_result["outcome"]["status"], "succeeded");
 
-    let empty_inbox = call_tool(
-        &host,
-        "teammate_inbox",
-        json!({"member_id": member_id}),
-    )
-    .await;
+    let empty_inbox = call_tool(&host, "teammate_inbox", json!({"member_id": member_id})).await;
     assert!(empty_inbox["messages"]
         .as_array()
         .expect("inbox 应返回数组")
         .is_empty());
 
-    let removed = call_tool(
-        &host,
-        "teammate_remove",
-        json!({"member_id": member_id}),
-    )
-    .await;
+    let removed = call_tool(&host, "teammate_remove", json!({"member_id": member_id})).await;
     assert_eq!(removed["removed"], true);
     let members = call_tool(&host, "teammate_list", json!({})).await;
     assert!(members["members"]

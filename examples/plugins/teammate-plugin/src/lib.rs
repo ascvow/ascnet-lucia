@@ -4,11 +4,11 @@
 //! 身份、受限 Agent 派生及生命周期操作。
 
 use agent_plugin::{
-    export_plugin, ActivationContext, AgentHandle, AgentId, AgentOutcome, AgentPlugin,
-    AgentSpawnRequest, AgentStatus, ExtensionEvent, PluginHostApi, PromptContribution, Result,
-    ServiceCall, ServiceSpec, ToolCall, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame,
-    UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement,
-    UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
+    export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentHandle, AgentId,
+    AgentOutcome, AgentPlugin, AgentSpawnRequest, AgentStatus, ExtensionEvent, PluginHostApi,
+    PromptContribution, Result, ServiceCall, ServiceSpec, ToolCall, ToolResult, ToolSpec, UiColor,
+    UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest,
+    UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,10 @@ const MAX_DISPATCH_ATTEMPTS: u32 = 5;
 const TEAM_DOCK_VIEW: &str = "teammate-team-dock";
 /// 替换主界面的团队工作台子视图。
 const TEAM_WORKSPACE_VIEW: &str = "teammate-team-workspace";
+/// 展示单个成员实时执行过程并接收交互消息的子视图。
+const TEAM_SESSION_VIEW: &str = "teammate-member-session";
+/// 单个成员会话视图在 Guest 内保留的最大事件数。
+const MEMBER_SESSION_EVENT_LIMIT: usize = 512;
 
 /// Teammate 消息的可信发送方。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -406,6 +410,68 @@ struct TeammatePlugin {
     state: TeamState,
     selected_member: usize,
     navigation_sequence: u64,
+    member_sessions: BTreeMap<AgentId, MemberSessionView>,
+    controller_activity: ControllerActivity,
+}
+
+/// 主 Agent 在团队栏中展示的紧凑活动状态。
+#[derive(Default)]
+enum ControllerActivity {
+    /// 当前没有运行任务。
+    #[default]
+    Waiting,
+    /// 模型正在分析或生成响应。
+    Analyzing,
+    /// 当前轮次正在执行工具。
+    Working,
+}
+
+impl ControllerActivity {
+    /// 返回团队栏使用的简体中文活动标签。
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Waiting => "等待",
+            Self::Analyzing => "分析中",
+            Self::Working => "执行工具",
+        }
+    }
+
+    /// 返回与活动语义一致的终端颜色。
+    fn color(&self) -> UiColor {
+        match self {
+            Self::Waiting => UiColor::Gray,
+            Self::Analyzing => UiColor::Cyan,
+            Self::Working => UiColor::Yellow,
+        }
+    }
+}
+
+/// 单个成员会话视图的实时事件、输入和最近交互状态。
+struct MemberSessionView {
+    target: AgentId,
+    timeline: VecDeque<MemberTimelineItem>,
+    input: String,
+    feedback: Option<std::result::Result<String, String>>,
+}
+
+/// 成员会话中按到达顺序保存的 Runtime 事件或本地用户消息。
+enum MemberTimelineItem {
+    /// Runtime 回放或实时推送的 Agent 事件。
+    Event(AgentEvent),
+    /// 用户从成员会话视图发送的消息。
+    User(String),
+}
+
+impl MemberSessionView {
+    /// 为成员当前运行句柄创建空的实时视图状态。
+    fn new(target: AgentId) -> Self {
+        Self {
+            target,
+            timeline: VecDeque::new(),
+            input: String::new(),
+            feedback: None,
+        }
+    }
 }
 
 impl TeammatePlugin {
@@ -706,9 +772,17 @@ impl TeammatePlugin {
                 None,
                 false,
             )]),
+            ui_line(vec![
+                ui_span("● 队长  ", Some(self.controller_activity.color()), true),
+                ui_span(
+                    self.controller_activity.label(),
+                    Some(self.controller_activity.color()),
+                    false,
+                ),
+            ]),
             ui_line(Vec::new()),
         ];
-        let available = usize::from(request.height).saturating_sub(5);
+        let available = usize::from(request.height).saturating_sub(6);
         for member in members.iter().take(available) {
             lines.push(ui_line(vec![
                 ui_span(
@@ -717,6 +791,11 @@ impl TeammatePlugin {
                     true,
                 ),
                 ui_span(format!(" {}", clipped(&member.role, 18)), None, false),
+                ui_span(
+                    format!("  {}", status_label(member.status)),
+                    Some(UiColor::Gray),
+                    false,
+                ),
                 ui_span(
                     if member.unread_messages > 0 {
                         format!("  {}", member.unread_messages)
@@ -822,7 +901,86 @@ impl TeammatePlugin {
                 Some(UiColor::Gray),
                 false,
             )]));
+            lines.push(ui_line(vec![ui_span(
+                "查看成员会话",
+                Some(UiColor::Green),
+                true,
+            )]));
         }
+        lines
+    }
+
+    /// 渲染成员实时事件和可编辑消息输入行。
+    fn render_member_session(&self, request: &UiRenderRequest) -> Vec<UiLine> {
+        let Some(instance_id) = request.instance_id.as_deref() else {
+            return vec![ui_line(vec![ui_span(
+                "成员会话缺少实例 ID",
+                Some(UiColor::Red),
+                false,
+            )])];
+        };
+        let owner = self.plugin_id.as_deref().unwrap_or_default();
+        let Some(member) = self
+            .state
+            .list_members(owner)
+            .into_iter()
+            .find(|member| member.id.as_str() == instance_id)
+        else {
+            return vec![ui_line(vec![ui_span(
+                "成员不存在",
+                Some(UiColor::Red),
+                false,
+            )])];
+        };
+        let Some(session) = self.member_sessions.get(&member.id) else {
+            return vec![ui_line(vec![ui_span(
+                "正在连接成员会话",
+                Some(UiColor::Gray),
+                false,
+            )])];
+        };
+        let mut lines = vec![
+            ui_line(vec![
+                ui_span(member.role, Some(UiColor::Cyan), true),
+                ui_span(
+                    format!("  {}", status_label(member.status)),
+                    Some(status_color(member.status)),
+                    false,
+                ),
+            ]),
+            ui_line(vec![ui_span(
+                format!("Agent  {}", session.target.as_str()),
+                Some(UiColor::Gray),
+                false,
+            )]),
+            ui_line(Vec::new()),
+        ];
+        let available = usize::from(request.height).saturating_sub(7);
+        let event_lines = member_event_lines(&session.timeline, usize::from(request.width));
+        lines.extend(event_lines.into_iter().rev().take(available).rev());
+        if lines.len() == 3 {
+            lines.push(ui_line(vec![ui_span(
+                if member.status == AgentStatus::Queued {
+                    "等待运行资源"
+                } else {
+                    "等待成员事件"
+                },
+                Some(UiColor::Gray),
+                false,
+            )]));
+        }
+        lines.push(ui_line(Vec::new()));
+        if let Some(feedback) = &session.feedback {
+            let (text, color) = match feedback {
+                Ok(text) => (text.as_str(), UiColor::Green),
+                Err(text) => (text.as_str(), UiColor::Red),
+            };
+            lines.push(ui_line(vec![ui_span(text, Some(color), false)]));
+        }
+        lines.push(ui_line(vec![
+            ui_span("> ", Some(UiColor::Green), true),
+            ui_span(session.input.clone(), None, false),
+        ]));
         lines
     }
 
@@ -844,6 +1002,43 @@ impl TeammatePlugin {
         }
     }
 
+    /// 拉取成员当前句柄的状态与事件，并追加到有界会话视图缓存。
+    fn refresh_member_session(&mut self, host: &dyn PluginHostApi, instance_id: &str) {
+        let owner = self.plugin_id.clone().unwrap_or_default();
+        let Some(member) = self
+            .state
+            .list_members(&owner)
+            .into_iter()
+            .find(|member| member.id.as_str() == instance_id)
+        else {
+            return;
+        };
+        if let Ok(snapshot) = host.agent_status(&member.current_agent_id) {
+            if let Ok(stored) = self.state.member_mut(&owner, &member.id) {
+                stored.status = snapshot.status;
+            }
+        }
+        let session = self
+            .member_sessions
+            .entry(member.id.clone())
+            .or_insert_with(|| MemberSessionView::new(member.current_agent_id.clone()));
+        if session.target != member.current_agent_id {
+            session.target = member.current_agent_id.clone();
+        }
+        match host.agent_events(&session.target, 256) {
+            Ok(events) => {
+                session.feedback = session.feedback.take().filter(|result| result.is_err());
+                for event in events {
+                    if session.timeline.len() >= MEMBER_SESSION_EVENT_LIMIT {
+                        session.timeline.pop_front();
+                    }
+                    session.timeline.push_back(MemberTimelineItem::Event(event));
+                }
+            }
+            Err(error) => session.feedback = Some(Err(format!("读取实时事件失败：{error}"))),
+        }
+    }
+
     /// 请求宿主把团队工作台压入通用子视图导航栈。
     fn open_team_workspace(&mut self, host: &dyn PluginHostApi) {
         self.navigation_sequence = self.navigation_sequence.saturating_add(1);
@@ -857,6 +1052,82 @@ impl TeammatePlugin {
                 },
             },
         });
+    }
+
+    /// 打开当前选中成员的实时会话子视图。
+    fn open_selected_member_session(&mut self, host: &dyn PluginHostApi) {
+        let owner = self.plugin_id.clone().unwrap_or_default();
+        let members = self.state.list_members(&owner);
+        let Some(member) = members.get(self.selected_member) else {
+            return;
+        };
+        self.member_sessions
+            .entry(member.id.clone())
+            .or_insert_with(|| MemberSessionView::new(member.current_agent_id.clone()));
+        self.navigation_sequence = self.navigation_sequence.saturating_add(1);
+        let _ = host.navigate_view(UiNavigationRequest {
+            request_id: format!("teammate-member-{}", self.navigation_sequence),
+            action: UiNavigationAction::Push {
+                view: UiViewInstance {
+                    view_id: TEAM_SESSION_VIEW.into(),
+                    instance_id: member.id.as_str().into(),
+                    title: Some(member.role.clone()),
+                },
+            },
+        });
+    }
+
+    /// 将会话输入发送给运行中成员，或基于成功终态会话启动后续运行。
+    fn send_member_input(&mut self, host: &dyn PluginHostApi, instance_id: &str) {
+        let owner = self.plugin_id.clone().unwrap_or_default();
+        let Some(snapshot) = self
+            .state
+            .list_members(&owner)
+            .into_iter()
+            .find(|member| member.id.as_str() == instance_id)
+        else {
+            return;
+        };
+        let Some(session) = self.member_sessions.get_mut(&snapshot.id) else {
+            return;
+        };
+        let input = session.input.trim().to_string();
+        if input.is_empty() {
+            return;
+        }
+        let result = match snapshot.status {
+            AgentStatus::Queued | AgentStatus::Running => host
+                .steer_agent(&snapshot.current_agent_id, &input)
+                .map(|_| "消息已发送给成员".to_string()),
+            AgentStatus::Succeeded => host
+                .continue_agent(&agent_plugin::AgentContinueRequest::new(
+                    snapshot.current_agent_id.clone(),
+                    input.clone(),
+                ))
+                .and_then(|handle| {
+                    let member = self.state.member_mut(&owner, &snapshot.id)?;
+                    member.current = handle.clone();
+                    member.status = AgentStatus::Queued;
+                    session.target = handle.id;
+                    Ok("已开始成员后续会话".to_string())
+                }),
+            AgentStatus::Ready | AgentStatus::Failed | AgentStatus::Cancelled => {
+                Err(anyhow!("成员当前状态不能接收消息"))
+            }
+        };
+        match result {
+            Ok(message) => {
+                if session.timeline.len() >= MEMBER_SESSION_EVENT_LIMIT {
+                    session.timeline.pop_front();
+                }
+                session
+                    .timeline
+                    .push_back(MemberTimelineItem::User(input.clone()));
+                session.input.clear();
+                session.feedback = Some(Ok(message));
+            }
+            Err(error) => session.feedback = Some(Err(error.to_string())),
+        }
     }
 }
 
@@ -883,12 +1154,37 @@ impl AgentPlugin for TeammatePlugin {
         host.remove_service(TEAMMATE_SERVICE)?;
         self.plugin_id = None;
         self.state = TeamState::default();
+        self.member_sessions.clear();
+        self.controller_activity = ControllerActivity::default();
         Ok(())
     }
 
     /// 返回模型可调用的 teammate 控制面工具。
     fn list_tools(&self) -> Vec<ToolSpec> {
         teammate_tools()
+    }
+
+    /// 根据主 Agent 生命周期事件更新团队栏中的队长活动状态。
+    fn on_event(&mut self, event: AgentEvent) {
+        self.controller_activity = match event.kind {
+            AgentEventKind::RunFinished | AgentEventKind::StepLimitReached => {
+                ControllerActivity::Waiting
+            }
+            AgentEventKind::ToolStarted => ControllerActivity::Working,
+            AgentEventKind::RunStarted
+            | AgentEventKind::TurnStarted
+            | AgentEventKind::ModelRequest
+            | AgentEventKind::ModelTextDelta
+            | AgentEventKind::ToolFinished
+            | AgentEventKind::ToolSkipped
+            | AgentEventKind::SteeringInjected
+            | AgentEventKind::FollowUpInjected => ControllerActivity::Analyzing,
+            AgentEventKind::Extension
+            | AgentEventKind::ModelThinkingDelta
+            | AgentEventKind::ModelResponse
+            | AgentEventKind::BillingUsage
+            | AgentEventKind::TurnFinished => return,
+        };
     }
 
     /// 执行 teammate 工具，并使用 Host 注入的 controller 身份作为发送者。
@@ -965,21 +1261,51 @@ impl AgentPlugin for TeammatePlugin {
                 size: UiSize::default(),
                 focusable: true,
             },
+            UiDeclaration {
+                plugin_id: String::new(),
+                view_id: TEAM_SESSION_VIEW.into(),
+                title: "成员会话".into(),
+                placement: UiPlacement::Subview,
+                size: UiSize::default(),
+                focusable: true,
+            },
         ]
     }
 
     /// 根据宿主分配尺寸渲染团队摘要或全屏工作台。
+    ///
+    /// 团队摘要在当前 owner 没有成员时返回隐藏帧，子视图不受该条件影响。
     fn render_ui(&mut self, request: UiRenderRequest) -> Option<UiFrame> {
+        let visible = request.view_id != TEAM_DOCK_VIEW || !self.ui_members().is_empty();
         let lines = match request.view_id.as_str() {
             TEAM_DOCK_VIEW => self.render_team_dock(&request),
             TEAM_WORKSPACE_VIEW => self.render_team_workspace(&request),
+            TEAM_SESSION_VIEW => self.render_member_session(&request),
             _ => return None,
         };
         Some(UiFrame {
             view_id: request.view_id,
-            visible: true,
+            visible,
             lines,
         })
+    }
+
+    /// 周期渲染前刷新成员状态和会话事件，再复用纯渲染逻辑生成帧。
+    fn render_ui_with_host(
+        &mut self,
+        host: &dyn PluginHostApi,
+        request: UiRenderRequest,
+    ) -> Option<UiFrame> {
+        match request.view_id.as_str() {
+            TEAM_DOCK_VIEW | TEAM_WORKSPACE_VIEW => self.refresh_ui_statuses(host),
+            TEAM_SESSION_VIEW => {
+                if let Some(instance_id) = request.instance_id.as_deref() {
+                    self.refresh_member_session(host, instance_id);
+                }
+            }
+            _ => {}
+        }
+        self.render_ui(request)
     }
 
     /// 处理团队入口、成员选择和状态刷新输入，并通过通用导航 API 打开工作台。
@@ -1006,7 +1332,39 @@ impl AgentPlugin for TeammatePlugin {
                             (self.selected_member + 1).min(member_count.saturating_sub(1));
                     }
                     "r" => self.refresh_ui_statuses(host),
+                    "enter" => self.open_selected_member_session(host),
                     _ => {}
+                }
+            }
+            UiInputEvent::Key { code, modifiers } if input.view_id == TEAM_SESSION_VIEW => {
+                let Some(instance_id) = input.instance_id.as_deref() else {
+                    return;
+                };
+                if code == "enter" {
+                    self.send_member_input(host, instance_id);
+                } else if code == "backspace" {
+                    if let Some(session) = self
+                        .member_sessions
+                        .iter_mut()
+                        .find(|(member_id, _)| member_id.as_str() == instance_id)
+                        .map(|(_, session)| session)
+                    {
+                        session.input.pop();
+                    }
+                } else if code.chars().count() == 1
+                    && !modifiers.iter().any(|modifier| {
+                        matches!(modifier.as_str(), "control" | "alt" | "super" | "meta")
+                    })
+                {
+                    if let Some(session) = self
+                        .member_sessions
+                        .iter_mut()
+                        .find(|(member_id, _)| member_id.as_str() == instance_id)
+                        .map(|(_, session)| session)
+                    {
+                        session.input.push_str(&code);
+                        session.feedback = None;
+                    }
                 }
             }
             UiInputEvent::Mouse { kind, y, .. }
@@ -1019,6 +1377,109 @@ impl AgentPlugin for TeammatePlugin {
             _ => {}
         }
     }
+}
+
+/// 将 Agent 事件转换为适合会话视图的可见过程行，并聚合连续文本增量。
+fn member_event_lines(timeline: &VecDeque<MemberTimelineItem>, width: usize) -> Vec<UiLine> {
+    let text_width = width.saturating_sub(4).max(12);
+    let mut rows: Vec<(String, UiColor)> = Vec::new();
+    for item in timeline {
+        let event = match item {
+            MemberTimelineItem::Event(event) => event,
+            MemberTimelineItem::User(message) => {
+                rows.push((format!("你  {message}"), UiColor::Green));
+                continue;
+            }
+        };
+        match event.kind {
+            AgentEventKind::RunStarted => rows.push(("开始运行".into(), UiColor::Cyan)),
+            AgentEventKind::TurnStarted => {
+                rows.push((format!("分析中 · 第 {} 步", event.step + 1), UiColor::Blue))
+            }
+            AgentEventKind::ModelTextDelta => {
+                let delta = event.payload["delta"].as_str().unwrap_or_default();
+                if let Some((text, _)) = rows
+                    .last_mut()
+                    .filter(|(text, _)| text.starts_with("回复  "))
+                {
+                    text.push_str(delta);
+                } else if !delta.is_empty() {
+                    rows.push((format!("回复  {delta}"), UiColor::White));
+                }
+            }
+            AgentEventKind::ToolStarted => {
+                let name = event.payload["name"].as_str().unwrap_or("tool");
+                let args = compact_json(&event.payload["args"], 120);
+                rows.push((
+                    format!(
+                        "调用  {name}{}",
+                        if args.is_empty() {
+                            args
+                        } else {
+                            format!("  {args}")
+                        }
+                    ),
+                    UiColor::Yellow,
+                ));
+            }
+            AgentEventKind::ToolFinished => {
+                let name = event.payload["name"].as_str().unwrap_or("tool");
+                let failed = event.payload["is_error"].as_bool().unwrap_or(false);
+                let result = compact_json(&event.payload["result"], 120);
+                rows.push((
+                    format!(
+                        "{}  {name}{}",
+                        if failed { "失败" } else { "完成" },
+                        if result.is_empty() {
+                            result
+                        } else {
+                            format!("  {result}")
+                        }
+                    ),
+                    if failed { UiColor::Red } else { UiColor::Green },
+                ));
+            }
+            AgentEventKind::ToolSkipped => {
+                let name = event.payload["name"].as_str().unwrap_or("tool");
+                rows.push((format!("跳过  {name}"), UiColor::Gray));
+            }
+            AgentEventKind::SteeringInjected => {
+                rows.push(("已接收新的互动消息".into(), UiColor::Cyan));
+            }
+            AgentEventKind::RunFinished => rows.push(("运行完成".into(), UiColor::Green)),
+            AgentEventKind::StepLimitReached => {
+                rows.push(("达到运行步数上限".into(), UiColor::Red));
+            }
+            AgentEventKind::Extension
+            | AgentEventKind::ModelRequest
+            | AgentEventKind::ModelThinkingDelta
+            | AgentEventKind::ModelResponse
+            | AgentEventKind::BillingUsage
+            | AgentEventKind::TurnFinished
+            | AgentEventKind::FollowUpInjected => {}
+        }
+    }
+    rows.into_iter()
+        .map(|(text, color)| {
+            ui_line(vec![ui_span(
+                clipped(&text, text_width),
+                Some(color),
+                false,
+            )])
+        })
+        .collect()
+}
+
+/// 将事件中的 JSON 参数或结果压成单行摘要，避免成员会话被大块输出淹没。
+fn compact_json(value: &Value, max_chars: usize) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    let text = match value {
+        Value::String(text) => text.clone(),
+        value => value.to_string(),
+    };
+    clipped(&text.replace(['\n', '\r'], " "), max_chars)
 }
 
 /// 构造一行协议无关终端内容。
@@ -1337,7 +1798,7 @@ mod tests {
             .expect("UI 测试成员应登记成功");
 
         let declarations = plugin.describe_ui();
-        assert_eq!(declarations.len(), 2);
+        assert_eq!(declarations.len(), 3);
         assert_eq!(declarations[0].placement, UiPlacement::Right);
         assert!(declarations[0].focusable);
         assert_eq!(declarations[1].placement, UiPlacement::Subview);
@@ -1362,6 +1823,8 @@ mod tests {
         assert!(text.contains("团队"), "{text}");
         assert!(text.contains("reviewer"), "{text}");
         assert!(text.contains('◌'), "{text}");
+        assert!(text.contains("队长  等待"), "{text}");
+        assert!(text.contains("排队"), "{text}");
 
         let workspace = plugin
             .render_ui(UiRenderRequest {
@@ -1381,5 +1844,65 @@ mod tests {
             .map(|span| span.text.as_str())
             .collect::<String>();
         assert!(workspace_text.contains("排队"), "{workspace_text}");
+        assert!(workspace_text.contains("查看成员会话"), "{workspace_text}");
+
+        let member = plugin.state.list_members("teammate").remove(0);
+        plugin.member_sessions.insert(
+            member.id.clone(),
+            MemberSessionView {
+                target: member.current_agent_id.clone(),
+                timeline: VecDeque::from([MemberTimelineItem::Event(AgentEvent {
+                    id: "event-1".into(),
+                    run_id: "run-1".into(),
+                    timestamp_ms: 1,
+                    kind: AgentEventKind::ToolStarted,
+                    step: 0,
+                    payload: json!({"name": "read_file"}),
+                })]),
+                input: "请继续检查".into(),
+                feedback: None,
+            },
+        );
+        let session = plugin
+            .render_ui(UiRenderRequest {
+                plugin_id: "teammate".into(),
+                view_id: TEAM_SESSION_VIEW.into(),
+                instance_id: Some(member.id.as_str().into()),
+                width: 80,
+                height: 24,
+                focused: true,
+                frame: 3,
+            })
+            .expect("成员会话应返回可见帧");
+        let session_text = session
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(session_text.contains("调用  read_file"), "{session_text}");
+        assert!(session_text.contains("请继续检查"), "{session_text}");
+    }
+
+    /// 当前 owner 没有成员时，团队摘要不应占用右侧面板。
+    #[test]
+    fn team_dock_is_hidden_without_members() {
+        let mut plugin = TeammatePlugin {
+            plugin_id: Some("teammate".into()),
+            ..TeammatePlugin::default()
+        };
+        let frame = plugin
+            .render_ui(UiRenderRequest {
+                plugin_id: "teammate".into(),
+                view_id: TEAM_DOCK_VIEW.into(),
+                instance_id: None,
+                width: 30,
+                height: 16,
+                focused: false,
+                frame: 1,
+            })
+            .expect("团队摘要应返回帧");
+
+        assert!(!frame.visible);
     }
 }
