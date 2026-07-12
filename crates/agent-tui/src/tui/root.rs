@@ -1,6 +1,7 @@
 //! Root view composition for Lucia TUI.
 //! Lucia TUI 的根视图编排组件。
 
+use super::render_main;
 #[cfg(feature = "plugins")]
 use super::{
     render_docked_plugin_views, render_plugin_dialog, render_plugin_input, render_plugin_subview,

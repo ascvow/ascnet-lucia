@@ -1,5 +1,6 @@
 //! Lucia TUI 的组件、视图状态和插件 UI 桥接。
 
+mod chat;
 mod root;
 
 #[cfg(feature = "plugins")]
@@ -9,6 +10,7 @@ pub(crate) mod plugin_render;
 #[cfg(feature = "plugins")]
 pub(crate) mod view;
 
+pub(crate) use chat::render_main;
 #[cfg(feature = "plugins")]
 pub(crate) use plugin_bridge::{
     apply_plugin_navigation_event, dispatch_plugin_input, drain_plugin_ui_events,

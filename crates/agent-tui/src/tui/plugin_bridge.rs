@@ -67,7 +67,7 @@ fn focus_visible_input_view(app: &mut App) {
     }
 }
 
-/// 渲染单个插件请求，并把超时统一转换为可展示错误。
+/// 渲染单个插件请求，并保留可信 owner 信息供界面更新。
 async fn render_plugin_request(
     plugin_host: &dyn PluginHost,
     request: UiRenderRequest,
@@ -80,29 +80,17 @@ async fn render_plugin_request(
     let plugin_id = request.plugin_id.clone();
     let view_id = request.view_id.clone();
     let instance_id = request.instance_id.clone();
-    let result = match tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        plugin_host.render_ui(&request),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(anyhow!("插件界面渲染超时")),
-    };
+    // WASM component 调用不可通过丢弃 future 取消，否则后续调用和卸载无法重新进入实例。
+    let result = plugin_host.render_ui(&request).await;
     (plugin_id, view_id, instance_id, result)
 }
 
-/// 向焦点插件发送输入，并限制单次调用阻塞主事件循环的时间。
+/// 向焦点插件发送输入；执行资源由 WASM Host 的运行限额约束。
 pub(crate) async fn dispatch_plugin_input(
     plugin_host: &dyn PluginHost,
     input: &UiInput,
 ) -> Result<()> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        plugin_host.on_ui_input(input),
-    )
-    .await
-    .map_err(|_| anyhow!("插件输入处理超时"))?
+    plugin_host.on_ui_input(input).await
 }
 
 /// 解析并应用一条带可信来源的插件视图导航事件。

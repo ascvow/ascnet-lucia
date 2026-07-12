@@ -26,7 +26,8 @@ api_key = ""
 openai_protocol = "responses"
 
 [agent]
-max_steps = 8
+# 0 表示交互主会话不设置总 ReAct 步数上限。
+max_steps = 0
 max_tokens = 4096
 
 [tui]
@@ -193,6 +194,7 @@ mod tests {
         assert_eq!(model_config.model.model, "gpt-5");
         assert_eq!(model_config.model.api_key.as_deref(), Some(""));
         assert!(model_config.model.api_key_env.is_none());
+        assert_eq!(model_config.agent.max_steps, Some(0));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

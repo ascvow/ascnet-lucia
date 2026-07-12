@@ -77,13 +77,11 @@ impl ScriptedSaveStore {
                 expected: Some(record.revision),
                 actual: Some(record.revision.saturating_add(1)),
             },
-            ScriptedSaveFailure::Io | ScriptedSaveFailure::IoAfterCommit => {
-                SessionStoreError::Io {
-                    operation: "模拟保存会话",
-                    path: PathBuf::from("scripted-session.json"),
-                    source: std::io::Error::other("模拟写入失败"),
-                }
-            }
+            ScriptedSaveFailure::Io | ScriptedSaveFailure::IoAfterCommit => SessionStoreError::Io {
+                operation: "模拟保存会话",
+                path: PathBuf::from("scripted-session.json"),
+                source: std::io::Error::other("模拟写入失败"),
+            },
         }
     }
 }
@@ -132,16 +130,16 @@ fn render_shows_visual_hierarchy() {
     let text = render_text(100, 24, false);
 
     assert!(text.contains("测试模型"), "{text:?}");
-    assert!(text.contains("❯测试消息"), "{text:?}");
+    assert!(text.contains("▌测试消息"), "{text:?}");
     assert!(text.contains("●测试回复"), "{text:?}");
     assert!(text.contains("MessageLucia..."), "{text:?}");
     assert!(!text.contains("agentruntime"), "{text:?}");
     assert!(!text.contains("ReAct"), "{text:?}");
 }
 
-/// 输入框顶部规则线与提示文本之间必须保留一行空白。
+/// 输入提示应紧跟输入盒上边框，下边框之后立即进入状态栏。
 #[test]
-fn input_rule_has_spacing_before_editor_text() {
+fn input_editor_starts_immediately_after_rule() {
     let width = 80;
     let backend = TestBackend::new(width, 16);
     let mut terminal = Terminal::new(backend).expect("创建输入间距测试终端");
@@ -161,10 +159,18 @@ fn input_rule_has_spacing_before_editor_text() {
     let rule_row = rows
         .iter()
         .position(|row| row.chars().filter(|character| *character == '─').count() > 20)
-        .expect("输入框顶部规则线应存在");
+        .expect("输入盒上边框应存在");
 
-    assert!(rows[rule_row + 1].trim().is_empty());
-    assert!(rows[rule_row + 2].contains("Message Lucia..."));
+    assert!(rows[rule_row + 1].contains("Message Lucia..."));
+    // 编辑行之后是输入盒下边框，再往下一行是状态栏。
+    assert!(
+        rows[rule_row + 2]
+            .chars()
+            .filter(|character| *character == '─')
+            .count()
+            > 20
+    );
+    assert!(!rows[rule_row + 3].trim().is_empty());
 }
 
 /// Startup activation events render in the footer once, then collapse into a plugin count.
@@ -257,8 +263,8 @@ fn plugin_status_keeps_partial_successes() {
 #[test]
 fn plugin_loading_queues_inputs_until_agent_is_ready() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into())
-        .with_loading_plugins(vec!["mcp".into(), "skill".into()]);
+    let mut app =
+        App::new(tx, "测试模型".into()).with_loading_plugins(vec!["mcp".into(), "skill".into()]);
 
     for input in ["第一条任务", "第二条任务"] {
         app.input = input.into();
@@ -938,6 +944,67 @@ fn failed_completion_preserves_confirmed_session() {
     assert_eq!(app.session_record, original);
 }
 
+/// 上下文加载失败必须向界面保留插件或 WASM 层的完整错误链。
+#[test]
+fn failed_completion_shows_context_loader_root_cause() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let original = app.session_record.clone();
+    let error = anyhow!("插件 `context` context load failed: guest trap").context("上下文加载失败");
+
+    app.handle_agent_done(AgentCompletion {
+        run: None,
+        session_record: original,
+        error: Some(error),
+        input_committed: true,
+        queue_may_advance: false,
+        input: "继续任务".into(),
+    });
+
+    let displayed = app
+        .messages
+        .iter()
+        .find(|message| matches!(message.kind, MsgKind::Error))
+        .expect("上下文加载失败应显示在界面中");
+    assert!(displayed.text.contains("上下文加载失败"));
+    assert!(displayed.text.contains("guest trap"));
+}
+
+/// 已提交运行失败时应保留界面分析历史，诊断文本不得写入下一次模型使用的 Session。
+#[test]
+fn failed_completion_preserves_visible_history_without_persisting_diagnostic() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut persisted = app.session_record.clone();
+    persisted.session.push_assistant_text("已完成架构分析");
+    app.messages = restore_session_messages(&persisted.session);
+    let diagnostic = "上下文加载失败：WASM fuel 耗尽";
+
+    app.handle_agent_done(AgentCompletion {
+        run: None,
+        session_record: persisted,
+        error: Some(anyhow!(diagnostic)),
+        input_committed: true,
+        queue_may_advance: false,
+        input: "继续分析".into(),
+    });
+
+    assert!(app
+        .messages
+        .iter()
+        .any(|message| message.text == "已完成架构分析"));
+    assert!(app
+        .messages
+        .iter()
+        .any(|message| matches!(message.kind, MsgKind::Error) && message.text == diagnostic));
+    assert!(app
+        .session_record
+        .session
+        .messages()
+        .iter()
+        .all(|message| !message.text_content().contains(diagnostic)));
+}
+
 /// Explicit manifests override same-ID official plugins while retaining other defaults.
 ///
 /// 显式插件应覆盖同 ID 官方插件，同时保留其他官方插件。
@@ -962,16 +1029,11 @@ fn explicit_plugin_manifest_overrides_official_manifest() {
         )
     };
     fs::write(&explicit, manifest("mcp", "显式 MCP")).expect("写入显式插件 manifest");
-    fs::write(&official_same, manifest("mcp", "官方 MCP"))
-        .expect("写入同 ID 官方插件 manifest");
-    fs::write(&official_other, manifest("skill", "官方 Skill"))
-        .expect("写入其他官方插件 manifest");
+    fs::write(&official_same, manifest("mcp", "官方 MCP")).expect("写入同 ID 官方插件 manifest");
+    fs::write(&official_other, manifest("skill", "官方 Skill")).expect("写入其他官方插件 manifest");
 
     let mut manifests = vec![explicit.clone()];
-    merge_official_plugin_manifests(
-        &mut manifests,
-        vec![official_same, official_other.clone()],
-    );
+    merge_official_plugin_manifests(&mut manifests, vec![official_same, official_other.clone()]);
 
     assert_eq!(manifests, vec![explicit, official_other]);
     fs::remove_dir_all(root).expect("清理插件合并测试目录");
