@@ -895,6 +895,11 @@ pub trait PluginHostApi {
         Err(anyhow!("宿主未提供 Agent Runtime API"))
     }
 
+    /// 向排队或运行中的 Agent 注入实时用户消息。
+    fn steer_agent(&self, _target: &AgentId, _input: &str) -> Result<()> {
+        Err(anyhow!("宿主未提供 Agent Runtime API"))
+    }
+
     /// 查询当前 controller 或其后代 Agent 的状态。
     fn agent_status(&self, _target: &AgentId) -> Result<AgentSnapshot> {
         Err(anyhow!("宿主未提供 Agent Runtime API"))
@@ -902,6 +907,11 @@ pub trait PluginHostApi {
 
     /// 查询派生 Agent 的终态结果；尚未结束时返回 `None`。
     fn agent_result(&self, _target: &AgentId) -> Result<Option<AgentOutcome>> {
+        Err(anyhow!("宿主未提供 Agent Runtime API"))
+    }
+
+    /// 非阻塞读取派生 Agent 的历史回放和后续实时事件。
+    fn agent_events(&self, _target: &AgentId, _limit: usize) -> Result<Vec<AgentEvent>> {
         Err(anyhow!("宿主未提供 Agent Runtime API"))
     }
 
@@ -995,6 +1005,15 @@ pub trait AgentPlugin: Default + Send + 'static {
     /// 根据宿主分配的尺寸渲染指定视图；返回 `None` 表示该帧不更新。
     fn render_ui(&mut self, _request: UiRenderRequest) -> Option<UiFrame> {
         None
+    }
+
+    /// 使用宿主 API 渲染视图；默认转发给 [`AgentPlugin::render_ui`]。
+    fn render_ui_with_host(
+        &mut self,
+        _host: &dyn PluginHostApi,
+        request: UiRenderRequest,
+    ) -> Option<UiFrame> {
+        self.render_ui(request)
     }
 
     /// 处理宿主路由给焦点视图的输入事件。
@@ -1315,6 +1334,20 @@ world plugin {
                     ))
                 }
 
+                fn steer_agent(
+                    &self,
+                    target: &$crate::AgentId,
+                    input: &str,
+                ) -> $crate::Result<()> {
+                    let request = $crate::__serde_json::json!({
+                        "operation": "steer",
+                        "request": {"target": target, "input": input},
+                    });
+                    $crate::decode_host_response(&host_agent_runtime_call(
+                        &$crate::to_json_string(&request),
+                    ))
+                }
+
                 fn agent_status(
                     &self,
                     target: &$crate::AgentId,
@@ -1335,6 +1368,20 @@ world plugin {
                     let request = $crate::__serde_json::json!({
                         "operation": "result",
                         "request": {"target": target},
+                    });
+                    $crate::decode_host_response(&host_agent_runtime_call(
+                        &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn agent_events(
+                    &self,
+                    target: &$crate::AgentId,
+                    limit: usize,
+                ) -> $crate::Result<Vec<$crate::AgentEvent>> {
+                    let request = $crate::__serde_json::json!({
+                        "operation": "events",
+                        "request": {"target": target, "limit": limit},
                     });
                     $crate::decode_host_response(&host_agent_runtime_call(
                         &$crate::to_json_string(&request),
@@ -1507,7 +1554,7 @@ world plugin {
                         };
                     with_plugin(|plugin| {
                         plugin
-                            .render_ui(request)
+                            .render_ui_with_host(&ComponentHostApi, request)
                             .map(|frame| $crate::to_json_string(&frame))
                             .unwrap_or_default()
                     })

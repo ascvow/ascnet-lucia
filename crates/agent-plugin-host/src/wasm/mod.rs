@@ -38,6 +38,11 @@ use wasmtime::Engine;
 use wasmtime::{Store, StoreContextMut, StoreLimitsBuilder};
 use wasmtime_wasi::WasiCtxBuilder;
 
+/// 上下文加载每个序列化输入字节追加的 WASM fuel，覆盖 JSON 遍历与压缩成本。
+const CONTEXT_FUEL_PER_INPUT_BYTE: u64 = 512;
+/// 单次上下文加载允许使用的最高 fuel，避免超大请求解除计算资源上限。
+const MAX_CONTEXT_FUEL: u64 = 500_000_000;
+
 mod engine;
 mod loader;
 
@@ -581,7 +586,8 @@ impl PluginHost for WasmPluginHost {
     async fn load_context(&self, request: &ContextLoadRequest) -> Result<Option<LoadedContext>> {
         let request_json = serde_json::to_string(request)?;
         let mut state = self.state.lock().await;
-        refill_fuel(&mut state)?;
+        let fuel = context_fuel_budget(&state.limits, request_json.len());
+        set_fuel(&mut state, fuel)?;
         let load_context = state.load_context;
         let (response_json,) = load_context
             .call_async(&mut state.store, (request_json,))
@@ -953,7 +959,22 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
 }
 
 fn refill_fuel(state: &mut WasmPluginState) -> Result<()> {
-    let fuel = state.limits.fuel;
+    set_fuel(state, state.limits.fuel)
+}
+
+/// 按单次上下文输入大小分配 fuel，并保留显式的最大计算预算。
+fn context_fuel_budget(limits: &WasmPluginLimits, input_bytes: usize) -> u64 {
+    let extra = u64::try_from(input_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(CONTEXT_FUEL_PER_INPUT_BYTE);
+    limits
+        .fuel
+        .saturating_add(extra)
+        .min(MAX_CONTEXT_FUEL.max(limits.fuel))
+}
+
+/// 将指定 fuel 重置到单插件 store。
+fn set_fuel(state: &mut WasmPluginState, fuel: u64) -> Result<()> {
     state
         .store
         .set_fuel(fuel)
@@ -1031,6 +1052,18 @@ mod tests {
 
         assert!(limits.fuel > 0);
         assert_eq!(limits.max_memory_bytes, 64 * 1024 * 1024);
+    }
+
+    /// 上下文输入应按大小获得额外 fuel，且不得突破全局硬上限。
+    #[test]
+    fn context_fuel_budget_scales_with_input_and_stays_bounded() {
+        let limits = WasmPluginLimits::default();
+        assert_eq!(context_fuel_budget(&limits, 0), limits.fuel);
+        assert_eq!(
+            context_fuel_budget(&limits, 300_000),
+            limits.fuel + 300_000 * CONTEXT_FUEL_PER_INPUT_BYTE
+        );
+        assert_eq!(context_fuel_budget(&limits, usize::MAX), MAX_CONTEXT_FUEL);
     }
 
     /// 多次请求运行时 Engine 时必须复用同一个底层实例。

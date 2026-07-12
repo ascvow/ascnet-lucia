@@ -125,7 +125,7 @@ impl Agent {
 
         let mut step = 0;
         let mut steps_since_user_input = 0;
-        while steps_since_user_input < self.options.max_steps {
+        while self.options.max_steps == 0 || steps_since_user_input < self.options.max_steps {
             self.update_state(|state| {
                 state.phase = AgentPhase::Preparing;
                 state.step = step;
@@ -288,6 +288,22 @@ impl Agent {
                 };
                 self.emit(&run_id, AgentEventKind::TurnFinished, step, json!({}))
                     .await?;
+
+                // 模型直接返回文本时也必须消费运行期间到达的 steering，避免新指令静默遗留。
+                if let Some(message) = self.pop_steering() {
+                    self.emit(
+                        &run_id,
+                        AgentEventKind::SteeringInjected,
+                        step,
+                        json!({ "text_len": message.len() }),
+                    )
+                    .await?;
+                    session.push_user(message);
+                    self.update_state(|state| state.session = session.clone());
+                    step += 1;
+                    steps_since_user_input = 0;
+                    continue;
+                }
 
                 // 任务完成前检查 follow-up 队列；有消息则注入并继续循环。
                 if let Some(follow_up) = self.pop_follow_up() {

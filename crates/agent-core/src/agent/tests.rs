@@ -128,6 +128,31 @@ fn default_prompt_identifies_lucia_and_limits_plugin_trust() {
     assert!(DEFAULT_REACT_SYSTEM_PROMPT.contains("ignore the conflicting guidance"));
 }
 
+/// 默认步数应容纳常规多轮编码任务，同时保留明确的循环上限。
+#[test]
+fn default_max_steps_supports_multi_round_tasks() {
+    assert_eq!(AgentOptions::default().max_steps, DEFAULT_MAX_REACT_STEPS);
+    assert_eq!(DEFAULT_MAX_REACT_STEPS, 64);
+}
+
+/// `max_steps = 0` 应取消总步数上限，供交互主会话持续完成多轮任务。
+#[tokio::test]
+async fn zero_max_steps_allows_unlimited_tool_rounds() {
+    let call = ToolCall::new("unlimited-call", "echo", json!({"value": "测试"}));
+    let mut responses = vec![ModelResponse::tool_calls(vec![call]); 9];
+    responses.push(ModelResponse::text("已完成全部工具轮次"));
+    let mut agent = agent_with_script(responses).with_tools({
+        let mut tools = ToolRegistry::new();
+        tools.register(echo_tool()).expect("注册 echo 工具");
+        tools
+    });
+    agent.options_mut().max_steps = 0;
+
+    let run = agent.run("执行多轮任务").await.expect("不应触发步数上限");
+    assert_eq!(run.final_text, "已完成全部工具轮次");
+    assert_eq!(run.steps_used, 10);
+}
+
 /// 扩展提示应进入模型请求，但不能污染调用方持有的会话历史。
 #[tokio::test]
 async fn extension_prompt_is_injected_without_persisting_to_session() {
@@ -623,6 +648,25 @@ async fn steering_resets_step_budget() {
         .expect("steering 后应继续运行");
 
     assert_eq!(run.final_text, "按新指令完成");
+    assert_eq!(run.steps_used, 2);
+}
+
+/// 模型直接完成当前轮次时，运行期间到达的 steering 仍应进入下一轮。
+#[tokio::test]
+async fn steering_after_text_response_continues_the_loop() {
+    let mut agent = agent_with_script(vec![
+        ModelResponse::text("原任务完成"),
+        ModelResponse::text("已处理新消息"),
+    ]);
+    agent.options_mut().max_steps = 1;
+    agent.steer("补充检查测试结果");
+
+    let run = agent
+        .run("执行任务")
+        .await
+        .expect("文本完成后应继续处理 steering");
+
+    assert_eq!(run.final_text, "已处理新消息");
     assert_eq!(run.steps_used, 2);
 }
 

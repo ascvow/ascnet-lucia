@@ -6,7 +6,10 @@ use crate::{
     service::{PluginService, PluginServiceCall, ServiceRegistry},
     AgentRuntimeHostServices,
 };
-use agent_runtime::{AgentId, AgentRuntimeApi, AgentSpawnRequest, RuntimePrincipal};
+use agent_core::AgentEvent;
+use agent_runtime::{
+    AgentEventStream, AgentId, AgentRuntimeApi, AgentSpawnRequest, RuntimePrincipal,
+};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -58,6 +61,7 @@ pub(crate) struct AgentRuntimeBinding {
     principal: RuntimePrincipal,
     api: Arc<dyn AgentRuntimeApi>,
     host_services: AgentRuntimeHostServices,
+    event_streams: Arc<tokio::sync::Mutex<HashMap<AgentId, AgentEventStream>>>,
 }
 
 struct ManagedProcess {
@@ -186,6 +190,18 @@ struct AgentTargetRequest {
     target: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentEventsRequest {
+    target: String,
+    #[serde(default = "default_agent_event_limit")]
+    limit: usize,
+}
+
+fn default_agent_event_limit() -> usize {
+    128
+}
+
 impl CapabilityState {
     /// 创建绑定到插件目录和 manifest 权限的能力状态。
     pub(crate) fn new(
@@ -281,6 +297,22 @@ impl CapabilityState {
                     .map_err(|error| anyhow!(error.to_string()))?;
                 Ok(serde_json::to_value(handle)?)
             }
+            "steer" => {
+                permissions.require_spawn()?;
+                let request: GuestAgentContinueRequest =
+                    serde_json::from_value(request.request).context("解析 Agent steer 请求失败")?;
+                if request.input.trim().is_empty() {
+                    return Err(anyhow!("Agent steer 输入不能为空"));
+                }
+                let target =
+                    AgentId::from_str(&request.target).context("解析 Agent steer 目标失败")?;
+                binding
+                    .api
+                    .steer(&target, request.input)
+                    .await
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                Ok(Value::Null)
+            }
             "status" => {
                 permissions.require_observe()?;
                 let target = parse_agent_target(request.request)?;
@@ -305,6 +337,18 @@ impl CapabilityState {
                     .await
                     .map_err(|error| anyhow!(error.to_string()))?;
                 Ok(serde_json::to_value(result)?)
+            }
+            "events" => {
+                permissions.require_observe()?;
+                let request: AgentEventsRequest = serde_json::from_value(request.request)
+                    .context("解析 Agent events 请求失败")?;
+                let target =
+                    AgentId::from_str(&request.target).context("解析 Agent events 目标失败")?;
+                let events = binding
+                    .poll_events(&target, request.limit.clamp(1, 512))
+                    .await
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                Ok(serde_json::to_value(events)?)
             }
             "cancel" => {
                 permissions.require_cancel()?;
@@ -642,7 +686,29 @@ impl AgentRuntimeBinding {
             principal,
             api,
             host_services,
+            event_streams: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// 复用目标订阅流并非阻塞取出一批已到达事件。
+    async fn poll_events(
+        &self,
+        target: &AgentId,
+        limit: usize,
+    ) -> agent_runtime::RuntimeResult<Vec<AgentEvent>> {
+        let needs_subscription = !self.event_streams.lock().await.contains_key(target);
+        if needs_subscription {
+            let stream = self.api.subscribe(target).await?;
+            self.event_streams
+                .lock()
+                .await
+                .insert(target.clone(), stream);
+        }
+        let mut streams = self.event_streams.lock().await;
+        let stream = streams
+            .get_mut(target)
+            .expect("已创建的 Agent 事件订阅必须存在");
+        Ok((0..limit).filter_map(|_| stream.try_next()).collect())
     }
 
     /// 撤销当前插件激活 principal，并取消、清理其 controller 与全部后代。
@@ -879,6 +945,10 @@ mod tests {
             })
         }
 
+        async fn steer(&self, _target: &AgentId, _input: String) -> RuntimeResult<()> {
+            Ok(())
+        }
+
         async fn status(&self, target: &AgentId) -> RuntimeResult<AgentSnapshot> {
             Ok(AgentSnapshot {
                 id: target.clone(),
@@ -908,7 +978,7 @@ mod tests {
             &self,
             _target: &AgentId,
         ) -> RuntimeResult<agent_runtime::AgentEventStream> {
-            panic!("WASM dispatcher 尚未桥接事件订阅")
+            Ok(agent_runtime::AgentEventStream::empty())
         }
     }
 
@@ -1139,6 +1209,30 @@ mod tests {
         .expect("查询状态");
         assert_eq!(status["status"], "running");
         assert!(status.get("owner").is_none());
+
+        CapabilityState::call_agent_runtime_with(
+            permissions.clone(),
+            Some(binding.clone()),
+            &json!({
+                "operation": "steer",
+                "request": {"target": child.to_string(), "input": "实时补充"},
+            })
+            .to_string(),
+        )
+        .await
+        .expect("向运行中 Agent 注入消息");
+        let events = CapabilityState::call_agent_runtime_with(
+            permissions.clone(),
+            Some(binding.clone()),
+            &json!({
+                "operation": "events",
+                "request": {"target": child.to_string(), "limit": 32},
+            })
+            .to_string(),
+        )
+        .await
+        .expect("轮询 Agent 事件");
+        assert_eq!(events, json!([]));
 
         let cancelled = CapabilityState::call_agent_runtime_with(
             permissions,
