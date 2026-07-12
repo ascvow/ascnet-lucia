@@ -245,6 +245,10 @@ impl ToolRegistry {
 
     /// Register a tool.
     /// 注册一个工具。
+    ///
+    /// # Errors
+    ///
+    /// 工具名称不符合跨服务商规则，或注册表中已存在同名工具时返回错误。
     pub fn register<T>(&mut self, tool: T) -> Result<&mut Self>
     where
         T: Tool + 'static,
@@ -254,6 +258,10 @@ impl ToolRegistry {
 
     /// Register an already shared tool.
     /// 注册一个已经被 Arc 包装的工具。
+    ///
+    /// # Errors
+    ///
+    /// 工具名称不符合跨服务商规则，或注册表中已存在同名工具时返回错误。
     pub fn register_arc(&mut self, tool: Arc<dyn Tool>) -> Result<&mut Self> {
         let spec = tool.spec();
         spec.validate_name()?;
@@ -279,7 +287,11 @@ impl ToolRegistry {
 
     /// 按名称构造当前注册表的子集。
     ///
-    /// 子集复用原工具实例，但拥有独立的名称映射。名称不存在或输入包含重复名称时返回错误。
+    /// 子集复用原工具实例，但拥有独立的名称映射。
+    ///
+    /// # Errors
+    ///
+    /// 任一名称不存在，或输入包含重复名称时返回错误。
     pub fn subset<I, S>(&self, names: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -296,14 +308,26 @@ impl ToolRegistry {
         Ok(subset)
     }
 
-    /// Return all tool specs.
-    /// 返回所有工具定义。
+    /// Return all tool specs sorted by name.
+    /// 按名称稳定排序并返回所有工具定义。
+    ///
+    /// 稳定顺序用于保证模型请求、提示缓存键和测试快照可复现，不反映注册顺序。
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.values().map(|tool| tool.spec()).collect()
+        let mut specs = self
+            .tools
+            .values()
+            .map(|tool| tool.spec())
+            .collect::<Vec<_>>();
+        specs.sort_by(|left, right| left.name.cmp(&right.name));
+        specs
     }
 
     /// Execute a tool call.
     /// 执行一次工具调用。
+    ///
+    /// # Errors
+    ///
+    /// 调用引用未知工具，或工具实现执行失败时返回错误。
     pub async fn call(&self, call: ToolCall) -> Result<ToolResult> {
         let Some(tool) = self.tools.get(&call.name) else {
             return Err(anyhow!("unknown tool: {}", call.name));
@@ -329,6 +353,11 @@ pub mod builtins;
 
 /// Validate a provider-portable tool name.
 /// 校验跨服务商可移植的工具名称。
+///
+/// # Errors
+///
+/// 名称为空、超过 64 个字符，或包含 ASCII 字母、数字、下划线和连字符之外的字符时
+/// 返回错误。
 pub fn validate_tool_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(anyhow!("tool name cannot be empty"));
@@ -345,4 +374,41 @@ pub fn validate_tool_name(name: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 构造只用于注册表顺序测试的 JSON 工具。
+    fn test_tool(name: &str) -> JsonTool {
+        JsonTool::new(
+            ToolSpec::new(name, "测试工具", ToolSpec::empty_object_schema()),
+            |_| async { Ok(json!({ "ok": true })) },
+        )
+    }
+
+    /// 工具定义顺序必须独立于 HashMap 迭代顺序和注册顺序。
+    #[test]
+    fn specs_are_sorted_by_name() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(test_tool("zeta"))
+            .expect("注册 zeta 工具");
+        registry
+            .register(test_tool("alpha"))
+            .expect("注册 alpha 工具");
+        registry
+            .register(test_tool("middle"))
+            .expect("注册 middle 工具");
+
+        let names = registry
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["alpha", "middle", "zeta"]);
+    }
 }
