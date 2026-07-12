@@ -5,5 +5,6 @@ model = "replace-with-anthropic-model"
 api_key_env = "ANTHROPIC_API_KEY"
 
 [agent]
-max_steps = 8
+# 0 表示交互主会话不设置总 ReAct 步数上限。
+max_steps = 0
 max_tokens = 4096

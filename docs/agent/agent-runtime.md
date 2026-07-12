@@ -9,7 +9,7 @@
 | 在已有 Session 上继续 | 已满足 | Core 已提供 `run_continue` 和 `run_session` |
 | 手工组装独立 Agent | 已满足 | Core 已公开 gateway、options、tools、extension、event sink 和 context loader |
 | 稳定派生与权限收缩 | Runtime 新增 | `AgentTemplate` 和 `AgentDeriveConfig` |
-| 生命周期与结果 | Runtime 新增 | `spawn`、`continue_agent`、`status`、`result`、`wait`、`cancel` |
+| 生命周期与结果 | Runtime 新增 | `spawn`、`continue_agent`、`steer`、`status`、`result`、`wait`、`cancel`、`subscribe` |
 | teammate 邮箱与通信 | 插件负责 | Runtime 不定义邮箱、消息主题、投递、重试或上下文注入 |
 | workflow / teammate 业务语义 | 插件负责 | Runtime 不定义步骤 DSL、角色协议或协作规则 |
 
@@ -28,6 +28,8 @@ Queued -> Running -> Succeeded | Failed | Cancelled
 ```
 
 终态不可覆盖。取消父节点会级联取消后代；重复取消保持幂等。`RuntimeLimits` 约束最大深度、每个父节点的累计子节点数和全局模型运行并发。
+
+`steer` 只接受排队或运行中的自身/后代 Agent。排队阶段最多暂存 32 条消息，Core Agent 启动后按顺序注入；目标进入终态后拒绝实时消息。`subscribe` 为晚加入观察者回放最近 512 条事件，再持续发送实时事件，终态且缓冲耗尽后自然结束。
 
 ## 原生调用
 
@@ -63,7 +65,7 @@ let follow_up = provisioned
     .await?;
 ```
 
-`wait` 只供原生异步调用方使用。WASM 插件持有 component store 锁时不能长期等待，因此 Guest API 只开放立即返回的 spawn、continue、status、result 和 cancel。成功终态的 Session 只保存在 Runtime 内部；continue 只接受目标与新增输入，并继承目标的模板和有效权限。
+`wait` 只供原生异步调用方使用。WASM 插件持有 component store 锁时不能长期等待，因此 Guest API 只开放立即返回或非阻塞的 spawn、continue、steer、status、result、events 和 cancel。成功终态的 Session 只保存在 Runtime 内部；continue 只接受目标与新增输入，并继承目标的模板和有效权限。
 
 ## Principal 与 profile
 

@@ -7,4 +7,5 @@ base_url = "http://localhost:11434/v1"
 openai_protocol = "chat-completions"
 
 [agent]
-max_steps = 8
+# 0 表示交互主会话不设置总 ReAct 步数上限。
+max_steps = 0

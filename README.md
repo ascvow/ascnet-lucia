@@ -12,6 +12,8 @@ Lucia 是一个用 Rust 实现的可嵌入 ReAct Agent 运行时，同时提供�
 
 环境要求：Rust stable、[Bun](https://bun.sh/)；WASM 插件使用 `wasm32-wasip2` target。仓库的 `rust-toolchain.toml` 已声明所需 target。
 
+所有 Host、WASM 插件、smoke test 和 live test 都属于根 Cargo workspace，共用根 `Cargo.lock` 与 `target`。默认成员只包含 Host/Core，避免普通本机构建误编译 WASM Guest；`bun run build:plugin:*` 会按 `wasm32-wasip2` 目标构建指定插件，并仅将最终 WASM 回拷到插件 manifest 约定的位置。
+
 先用内置脚本模型验证完整 ReAct 和工具调用流程，不需要 API key：
 
 ```bash
@@ -43,7 +45,8 @@ api_key_env = "OPENAI_API_KEY"
 openai_protocol = "responses"
 
 [agent]
-max_steps = 8
+# 0 表示交互主会话不设置总 ReAct 步数上限。
+max_steps = 0
 max_tokens = 4096
 ```
 
@@ -120,7 +123,7 @@ Core 不保存 API key、服务商选择或配置文件；这些状态由调用�
        -> 独立插件        MCP、Skill、Command、Context、Plan 等具体协议
 ```
 
-`agent-core` 不依赖 Plugin Host、WASM ABI、manifest 或插件 UI。Plugin Host 不实现 MCP、Skill 等具体协议。独立插件不加入原生 workspace，避免宿主 target 与 component 导出目标冲突。
+`agent-core` 不依赖 Plugin Host、WASM ABI、manifest 或插件 UI。Plugin Host 不实现 MCP、Skill 等具体协议。WASM 插件虽然属于统一 workspace，但不属于默认成员，必须按插件包名和 `wasm32-wasip2` 目标单独构建，避免宿主 target 与 component 导出目标冲突。
 
 插件 ABI 使用 JSON 字符串维持 WIT 边界稳定，规范定义位于 [`wit/plugin.wit`](wit/plugin.wit)。插件默认没有文件、进程、HTTP、secret 或写入能力；权限与子进程风险见 [Manifest 与权限](docs/host/manifest-capabilities.md)。
 

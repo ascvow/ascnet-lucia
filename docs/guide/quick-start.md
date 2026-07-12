@@ -56,7 +56,8 @@ api_key_env = "OPENAI_API_KEY"
 openai_protocol = "responses"
 
 [agent]
-max_steps = 8
+# 0 表示交互主会话不设置总 ReAct 步数上限。
+max_steps = 0
 max_tokens = 4096
 
 [tui]
