@@ -48,15 +48,11 @@ bun run build:tui
 
 该命令依次构建纯 Core TUI 与插件版 TUI，并分别写入上述目录。
 
-## 插件管理器
+## 管理命令
 
-插件安装与诊断 CLI 使用独立输出目录：
-
-```bash
-bun run build:plugin-manager
-```
-
-产物位于 `target/plugin-manager/release/agent-plugin`。该程序只管理本地 bundle、锁文件和运行时配置，不加载 WASM component。
+插件版 `lucia` 同时包含 `lucia plugin` 和全局 `lucia doctor`。插件管理器仍是独立 library
+crate，负责下载、安装和完整性规则，但不再分发单独的 `agent-plugin` 可执行程序。纯 Core
+版本保留 `lucia doctor`，并跳过插件运行时检查。
 
 ## 本地安装
 

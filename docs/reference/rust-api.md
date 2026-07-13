@@ -70,6 +70,7 @@ Rustdoc 入口：`target/doc/agent_tool/index.html`。
 | `protocol.rs` | `SessionId`、`SessionRecord`、`SessionSummary`、`SessionStore` | schema、revision、错误与异步存储契约 |
 | `memory.rs` | `MemorySessionStore` | 测试和短生命周期进程的内存实现 |
 | `file_store.rs` | `FileSessionStore` | 原子文件写入、跨进程锁和摘要索引 |
+| `diagnostic.rs` | `diagnose_file_session_store`、`SessionDiagnosticReport` | 不创建锁或索引的只读记录诊断 |
 
 Rustdoc 入口：`target/doc/agent_session/index.html`。
 
@@ -120,14 +121,16 @@ Rustdoc 入口：`target/doc/agent_plugin/index.html`。
 
 ## agent-plugin-manager
 
-本地插件 bundle 的安装、启用、完整性锁和诊断。它不访问网络，也不实例化 WASM 插件。
+GitHub Release 获取、本地插件 bundle 安装、启用、完整性锁和只读诊断。它不会构建源码或
+实例化 WASM 插件。
 
 | API | 用途 |
 | --- | --- |
 | `PluginManager` | 管理插件根目录及安装状态 |
-| `PluginInstallOptions` | 控制安装时的启用和覆盖行为 |
+| `InstallOptions`、`GithubInstallOptions` | 控制本地与 GitHub 安装行为 |
+| `GithubPluginSource`、`GithubInstallResult` | 规范化 GitHub 来源和安装结果 |
 | `InstalledPlugin`、`PluginLock` | 持久化 bundle 来源、摘要和状态 |
-| `PluginDiagnosticReport`、`PluginDiagnosticIssue` | 依赖、文件完整性和能力选择诊断 |
+| `DoctorReport`、`DoctorIssue` | 依赖、文件完整性和能力选择诊断 |
 
 Rustdoc 入口：`target/doc/agent_plugin_manager/index.html`。
 

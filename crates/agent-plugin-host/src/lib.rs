@@ -16,10 +16,10 @@ mod capability;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-#[cfg(feature = "wasm")]
 use agent_core::{
     model::ModelMessage, AgentExtension, ContextLoadRequest, ContextLoader, LoadedContext,
 };
+#[cfg(feature = "wasm")]
 use agent_runtime::{AgentDeriveConfig, AgentProfileId, AgentRuntimeProvisioner};
 use agent_tool::{ToolCall, ToolResult, ToolSpec};
 use anyhow::{anyhow, Result};

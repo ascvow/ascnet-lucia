@@ -1,8 +1,15 @@
-//! Lucia 本地插件的安装、状态管理和完整性诊断。
+//! Lucia 插件的可信获取、安装、状态管理和完整性诊断。
 //!
-//! 管理器只处理本地 bundle，不执行网络访问，也不负责实例化插件。
+//! 管理器负责可信来源获取和本地 bundle 状态，但不负责实例化插件。
 
 #![deny(missing_docs)]
+
+mod github;
+
+pub use github::{
+    check_github_connectivity, GithubInstallOptions, GithubInstallResult, GithubPluginSource,
+    DEFAULT_GITHUB_PUBLISHER,
+};
 
 use agent_plugin_host::manifest::{
     resolve_plugin_capabilities, resolve_plugin_load_order, PluginManifest, PluginRuntimeConfig,
@@ -41,7 +48,7 @@ pub struct InstalledPlugin {
     pub manifest: String,
     /// bundle 的 SHA-256 摘要。
     pub sha256: String,
-    /// 安装时使用的本地 bundle 绝对路径。
+    /// 本地 bundle 绝对路径或不可变 GitHub Release 来源。
     pub source: String,
 }
 
@@ -82,7 +89,8 @@ impl Default for InstallOptions {
 }
 
 /// 诊断问题的严重程度。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DoctorSeverity {
     /// 会阻止插件可靠加载的问题。
     Error,
@@ -91,7 +99,7 @@ pub enum DoctorSeverity {
 }
 
 /// 单项插件诊断结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DoctorIssue {
     /// 问题严重程度。
     pub severity: DoctorSeverity,
@@ -102,7 +110,7 @@ pub struct DoctorIssue {
 }
 
 /// 插件管理目录的完整诊断报告。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DoctorReport {
     /// 锁文件中检查的插件数量。
     pub checked_plugins: usize,
@@ -158,6 +166,16 @@ impl PluginManager {
         &self,
         bundle: impl AsRef<Path>,
         options: InstallOptions,
+    ) -> Result<InstalledPlugin> {
+        self.install_with_source(bundle, options, None)
+    }
+
+    /// 从目录安装 bundle，并允许可信获取层覆盖持久化来源描述。
+    pub(crate) fn install_with_source(
+        &self,
+        bundle: impl AsRef<Path>,
+        options: InstallOptions,
+        source_description: Option<String>,
     ) -> Result<InstalledPlugin> {
         self.ensure_layout()?;
         let source = bundle.as_ref();
@@ -227,7 +245,8 @@ impl PluginManager {
                 enabled: options.enabled,
                 manifest: path_to_lock_string(&relative_manifest)?,
                 sha256,
-                source: canonical_source.to_string_lossy().into_owned(),
+                source: source_description
+                    .unwrap_or_else(|| canonical_source.to_string_lossy().into_owned()),
             };
             lock.plugins.push(installed.clone());
             sort_lock_plugins(&mut lock.plugins);
@@ -381,6 +400,7 @@ impl PluginManager {
                 format!("启用插件的能力声明无效：{error:#}"),
             );
         }
+        self.inspect_unmanaged_entries(&lock, &mut report)?;
         Ok(report)
     }
 
@@ -481,6 +501,68 @@ impl PluginManager {
             );
         }
         Ok(self.root.join(relative))
+    }
+
+    /// 只读检查插件目录中未被锁文件管理的条目，并以警告形式加入报告。
+    fn inspect_unmanaged_entries(
+        &self,
+        lock: &PluginLock,
+        report: &mut DoctorReport,
+    ) -> Result<()> {
+        let plugins_dir = self.plugins_dir();
+        let metadata = match fs::symlink_metadata(&plugins_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("无法检查插件目录元数据"),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            push_issue(
+                report,
+                None,
+                format!("插件根路径必须是非符号链接目录：{}", plugins_dir.display()),
+            );
+            return Ok(());
+        }
+        let managed = lock
+            .plugins
+            .iter()
+            .map(|plugin| (plugin.id.as_str(), plugin.version.as_str()))
+            .collect::<HashSet<_>>();
+        for plugin_entry in fs::read_dir(&plugins_dir).context("无法读取受管理插件根目录")?
+        {
+            let plugin_entry = plugin_entry.context("无法读取插件目录项")?;
+            let plugin_path = plugin_entry.path();
+            let plugin_id = plugin_entry.file_name().to_string_lossy().into_owned();
+            let file_type = plugin_entry
+                .file_type()
+                .with_context(|| format!("无法检查插件目录项：{}", plugin_path.display()))?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                push_warning(
+                    report,
+                    None,
+                    format!(
+                        "插件目录包含未受管理的非目录条目：{}",
+                        plugin_path.display()
+                    ),
+                );
+                continue;
+            }
+            for version_entry in fs::read_dir(&plugin_path)
+                .with_context(|| format!("无法读取插件版本目录：{}", plugin_path.display()))?
+            {
+                let version_entry = version_entry.context("无法读取插件版本目录项")?;
+                let version_path = version_entry.path();
+                let version = version_entry.file_name().to_string_lossy().into_owned();
+                if !managed.contains(&(plugin_id.as_str(), version.as_str())) {
+                    push_warning(
+                        report,
+                        Some(&plugin_id),
+                        format!("发现未被锁文件管理的插件目录：{}", version_path.display()),
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn load_lock(&self) -> Result<PluginLock> {
@@ -799,6 +881,15 @@ fn push_issue(report: &mut DoctorReport, plugin_id: Option<&str>, message: Strin
     });
 }
 
+/// 向诊断报告追加不会阻止插件加载的警告。
+fn push_warning(report: &mut DoctorReport, plugin_id: Option<&str>, message: String) {
+    report.issues.push(DoctorIssue {
+        severity: DoctorSeverity::Warning,
+        plugin_id: plugin_id.map(str::to_string),
+        message,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,6 +1081,22 @@ mod tests {
         assert!(!report.is_healthy());
         assert!(report.issues[0].message.contains("SHA-256 不匹配"));
         assert!(manager.runtime_config().is_err());
+    }
+
+    /// 锁文件之外的遗留安装目录应被报告为警告，但不阻止已锁定插件加载。
+    #[test]
+    fn doctor_warns_about_unmanaged_plugin_directories() {
+        let directory = TestDirectory::new("unmanaged");
+        let manager = PluginManager::new(directory.path.join("managed"));
+        fs::create_dir_all(directory.path.join("managed/plugins/orphan/1.0.0"))
+            .expect("创建遗留插件目录");
+
+        let report = manager.doctor().expect("诊断应生成报告");
+
+        assert!(report.is_healthy());
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].severity, DoctorSeverity::Warning);
+        assert!(report.issues[0].message.contains("未被锁文件管理"));
     }
 
     /// 被篡改的禁用插件不能绕过完整性检查重新启用。

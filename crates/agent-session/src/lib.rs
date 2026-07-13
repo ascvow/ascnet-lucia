@@ -4,11 +4,15 @@
 
 #![deny(missing_docs)]
 
+mod diagnostic;
 mod file_lock;
 mod file_store;
 mod memory;
 mod protocol;
 
+pub use diagnostic::{
+    diagnose_file_session_store, SessionDiagnosticIssue, SessionDiagnosticReport,
+};
 pub use file_store::FileSessionStore;
 pub use memory::MemorySessionStore;
 pub(crate) use protocol::{

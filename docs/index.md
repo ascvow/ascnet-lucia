@@ -22,7 +22,8 @@ Lucia 是一个 Rust ReAct Agent 运行时。它既可以作为终端应用直�
 - [快速开始](/guide/quick-start)：从离线演示到第一次真实模型请求。
 - [TUI 配置与会话](/guide/tui-configuration)：配置优先级、会话恢复、路径覆盖和事件文件。
 - [常用场景示例](/guide/examples)：本地模型、指定会话、记录事件和手动加载插件。
-- [插件管理](/guide/plugin-management)：安装、启用、依赖检查和完整性诊断。
+- [全局诊断](/guide/doctor)：无侵入检查配置、Session、插件和可选网络状态。
+- [插件管理](/guide/plugin-management)：从 GitHub 或本地安装、启用和选择插件。
 
 ### 嵌入 Rust 应用
 

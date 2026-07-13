@@ -1,96 +1,70 @@
 # 插件管理
 
-`agent-plugin` 管理本地插件 bundle、启用状态、独占能力选择和完整性锁文件。它不加载 WASM，也不实现 MCP、Skill 或上下文压缩；应用通过 `PluginManager::runtime_config()` 把校验后的 manifest 路径和能力选择交给 Plugin Host。
+插件版 `lucia` 内置插件安装和状态管理命令。应用层只处理命令参数和输出；GitHub 获取、
+安全解包、manifest 校验、依赖解析、完整性锁和原子安装由 `agent-plugin-manager` 负责。
+Plugin Host 只消费验证后的运行时配置，不参与下载或安装。
 
-## 安装命令
+## 从 GitHub 安装
 
-先安装管理器并指定受管理根目录：
-
-```bash
-cargo install --path crates/agent-plugin-manager --locked
-export LUCIA_PLUGIN_ROOT="$HOME/.lucia"
-```
-
-安装源必须是本地目录，根目录包含 `plugin.toml`，manifest 中的 WASM 文件也必须已经存在：
+裸名称默认解析为 `ascvow/<name>`，第三方插件使用 `owner/repository` 或完整 GitHub URL：
 
 ```bash
-agent-plugin install ./dist/example-plugin
-agent-plugin list
+lucia plugin install example-plugin
+lucia plugin install owner/example-plugin
+lucia plugin install https://github.com/owner/example-plugin
 ```
 
-默认安装后立即启用。需要先准备依赖或解决能力冲突时，先以禁用状态安装：
+安装器读取 latest GitHub Release。指定版本或包含多个 ZIP 时使用：
 
 ```bash
-agent-plugin install ./dist/context-plugin-b --disabled
-agent-plugin enable context-plugin-b
-agent-plugin disable context-plugin-b
-agent-plugin remove context-plugin-b
+lucia plugin install owner/example-plugin --tag v1.2.0
+lucia plugin install owner/example-plugin --asset lucia-plugin-example.zip
 ```
 
-也可以不设置环境变量，在每条命令中传入 `--root /path/to/root`。
+Release 必须包含预构建 ZIP bundle，且 ZIP 内只能有一个 `plugin.toml`。安装器不会克隆仓库、
+构建源码或执行插件代码；它会限制下载和解压大小，拒绝符号链接、特殊文件及路径穿越。
+Release 可以同时提供 `<asset>.sha256` 或同名 `.sha256` 文件，存在时安装前必须校验通过。
+私有仓库可通过 `GITHUB_TOKEN` 授权，命令不会展示或保存 token。
 
-仓库开发时可由 Bun 统一启动同一个 CLI，例如：
+默认安装后立即启用。需要先处理依赖或独占能力冲突时使用：
 
 ```bash
-bun run plugin -- --root /path/to/root list
+lucia plugin install owner/example-plugin --disabled
+lucia plugin enable example-plugin
+lucia plugin disable example-plugin
+lucia plugin remove example-plugin
 ```
 
-管理器把 bundle 复制到 `<root>/plugins/<id>/<version>/`，并原子更新 `<root>/plugins.lock.toml`。锁文件记录插件身份、启用状态、manifest 相对路径和 bundle SHA-256；不要手工移动受管理目录或修改锁文件。
+## 本地 bundle
 
-## 依赖约束
-
-插件依赖由 manifest 的 `[[dependencies]]` 声明：
-
-```toml
-[[dependencies]]
-id = "command"
-version = "^1.2"
-optional = false
-```
-
-启用插件前，管理器会验证必选依赖是否已安装并启用、版本是否符合 SemVer 约束，以及依赖图是否存在循环。仍被启用插件依赖的 provider 不能禁用或移除。
-
-建议按以下顺序安装一组互相依赖的插件：
-
-1. 以禁用状态安装 provider 和 dependent。
-2. 先启用 provider。
-3. 再启用 dependent。
-4. 运行 `agent-plugin doctor`。
-
-依赖只表达安装和加载顺序；实际跨插件调用仍使用[插件服务 API](/plugin/dependencies-services)。
-
-## 选择独占能力
-
-多个插件可以声明同一个 `exclusive` 能力，但 Host 不会按安装顺序覆盖。先安装候选插件，再显式选择 owner：
+开发中的 bundle 可以从本地目录安装，根目录必须包含 `plugin.toml` 和 manifest 指向的 WASM：
 
 ```bash
-agent-plugin select agent.context-loader context-plugin-b
+lucia plugin install ./dist/example-plugin --local
 ```
 
-`select` 会启用目标插件，并把选择写入锁文件。目标插件必须声明对应的独占能力；为 `multi` 能力选择 owner 会失败。
+本地与 GitHub 安装进入同一个 `$LUCIA_HOME/plugins/<id>/<version>/` 目录，并原子更新
+`$LUCIA_HOME/plugins.lock.toml`。锁文件记录来源、启用状态、manifest 路径和 bundle SHA-256。
 
-清除选择使用：
+## 列举与能力选择
 
 ```bash
-agent-plugin unselect agent.context-loader
+lucia plugin list
+lucia plugin select agent.context-loader context-plugin-b
+lucia plugin unselect agent.context-loader
 ```
 
-清除后若仍有多个已启用 provider，操作会被拒绝。应先禁用多余 provider，再执行 `unselect`。
+依赖由 manifest 的 `[[dependencies]]` 声明。启用插件前会验证必选依赖是否已经安装并启用、
+版本是否符合 SemVer 约束，以及依赖图是否存在循环。多个插件声明同一个 `exclusive` 能力时，
+必须通过 `select` 明确 owner。
 
-## 完整性诊断
+## 运行时加载
 
-```bash
-agent-plugin doctor
-```
+普通 `lucia` 启动按以下优先级合并插件：
 
-诊断会检查：
+1. `--plugin-manifest` 和配置文件 `[[plugins]]`。
+2. `lucia plugin install` 管理的已启用插件。
+3. 安装器同步到 `$LUCIA_HOME/official-plugins` 的官方插件。
 
-- 锁文件版本、重复插件 ID 和受管理路径。
-- manifest 与 WASM 是否存在且有效。
-- bundle 当前 SHA-256 是否与安装记录一致。
-- 已启用插件的依赖、版本约束和循环依赖。
-- 独占能力冲突及 owner 选择。
-
-`list` 只读取锁文件，不重新计算完整性；发布、升级或启动插件版应用前应运行 `doctor`。诊断失败会返回非零退出码。
-
-安装过程拒绝符号链接和特殊文件，避免 bundle 越过受管理根目录。凭据仍应放在应用忽略的本地配置或环境变量中，不应打入 bundle。
+同 ID 的高优先级声明覆盖低优先级来源。受管理插件在进入 Host 前必须通过锁文件、完整性、
+依赖和能力检查；诊断所有来源的实际启动组合使用 [`lucia doctor`](/guide/doctor)。

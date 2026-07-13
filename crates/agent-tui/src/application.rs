@@ -2,8 +2,7 @@
 
 use super::*;
 
-pub(crate) async fn run() -> Result<()> {
-    let args = Args::parse();
+pub(crate) async fn run(args: Args) -> Result<()> {
     let workspace = WorkspaceContext::capture()?;
     let config_path = resolve_config_path(args.config.as_deref())?;
     if args.init {
@@ -64,6 +63,16 @@ pub(crate) async fn run() -> Result<()> {
         let plugin_runtime = load_plugin_runtime_config(&config_path)?;
         plugin_manifests.extend(plugin_runtime.manifest_paths);
         capability_selection.extend(plugin_runtime.capability_selection);
+    }
+    #[cfg(feature = "plugins")]
+    {
+        let managed_runtime = agent_plugin_manager::PluginManager::new(&lucia_home)
+            .runtime_config()
+            .context("读取受管理插件配置失败；请运行 `lucia doctor`")?;
+        merge_official_plugin_manifests(&mut plugin_manifests, managed_runtime.manifest_paths);
+        for (capability, owner) in managed_runtime.capability_selection {
+            capability_selection.entry(capability).or_insert(owner);
+        }
     }
     #[cfg(feature = "plugins")]
     merge_official_plugin_manifests(

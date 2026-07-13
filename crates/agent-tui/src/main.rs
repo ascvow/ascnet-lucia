@@ -6,6 +6,9 @@ mod application;
 #[cfg(feature = "plugins")]
 mod command_surface;
 mod conversation;
+mod doctor;
+#[cfg(feature = "plugins")]
+mod plugin_cli;
 #[cfg(feature = "plugins")]
 mod plugin_startup;
 mod session_coordination;
@@ -61,7 +64,7 @@ use app_config::{
 };
 use app_state::*;
 use async_trait::async_trait;
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand};
 #[cfg(feature = "plugins")]
 use command_protocol::{
     CommandAvailability, CommandCallbackResponse, CommandSnapshot, CommandSpec, CompletionContext,
@@ -104,6 +107,10 @@ use tui::{
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Lucia 交互式 ReAct Agent")]
 struct Args {
+    /// 不启动 TUI，执行指定的 Lucia 管理命令。
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// 初始化配置文件后退出；默认写入 `$LUCIA_HOME/config.toml`。
     #[arg(long = "init", alias = "init-config")]
     init: bool,
@@ -113,7 +120,7 @@ struct Args {
     demo: bool,
 
     /// TOML 配置文件路径；默认读取 `LUCIA_CONFIG` 或 `$LUCIA_HOME/config.toml`。
-    #[arg(long)]
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
 
     /// 可选的 agent 事件 JSONL 输出文件，用于排查模型请求与工具调用。
@@ -140,6 +147,88 @@ struct Args {
     #[cfg(feature = "plugins")]
     #[arg(long = "plugin-manifest")]
     plugin_manifests: Vec<PathBuf>,
+}
+
+/// Lucia 的非交互式管理命令。
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// 对整个 Lucia 安装执行无侵入只读诊断。
+    Doctor(DoctorArgs),
+    /// 安装和管理受控插件。
+    #[cfg(feature = "plugins")]
+    Plugin(PluginArgs),
+}
+
+/// 全局诊断参数。
+#[derive(Debug, ClapArgs)]
+struct DoctorArgs {
+    /// 使用稳定 JSON 结构输出诊断报告。
+    #[arg(long)]
+    json: bool,
+    /// 额外检查 GitHub API 连通性；默认诊断不联网。
+    #[arg(long)]
+    network: bool,
+}
+
+/// 插件管理命令参数。
+#[cfg(feature = "plugins")]
+#[derive(Debug, ClapArgs)]
+struct PluginArgs {
+    /// 要执行的插件管理操作。
+    #[command(subcommand)]
+    command: PluginCommand,
+}
+
+/// `lucia plugin` 支持的操作。
+#[cfg(feature = "plugins")]
+#[derive(Debug, Subcommand)]
+enum PluginCommand {
+    /// 从 GitHub Release 或本地 bundle 安装插件。
+    Install {
+        /// 裸名称、owner/repository、GitHub URL 或本地 bundle 路径。
+        source: String,
+        /// 从本地 bundle 目录安装，不访问 GitHub。
+        #[arg(long)]
+        local: bool,
+        /// 指定 GitHub Release tag；默认使用 latest release。
+        #[arg(long)]
+        tag: Option<String>,
+        /// 指定 GitHub Release 中的 ZIP asset 名称。
+        #[arg(long)]
+        asset: Option<String>,
+        /// 安装完成后保持禁用状态。
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// 列出全部受管理插件。
+    List,
+    /// 启用指定插件。
+    Enable {
+        /// 插件稳定 ID。
+        id: String,
+    },
+    /// 禁用指定插件。
+    Disable {
+        /// 插件稳定 ID。
+        id: String,
+    },
+    /// 为独占能力选择 owner，并启用目标插件。
+    Select {
+        /// 稳定能力 ID。
+        capability: String,
+        /// 提供该能力的插件稳定 ID。
+        plugin: String,
+    },
+    /// 清除指定独占能力的 owner 选择。
+    Unselect {
+        /// 稳定能力 ID。
+        capability: String,
+    },
+    /// 移除指定插件。
+    Remove {
+        /// 插件稳定 ID。
+        id: String,
+    },
 }
 
 // ─── UI 事件 ───
@@ -289,7 +378,13 @@ const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 const PLUGIN_REFRESH_TICKS: u8 = 12;
 #[tokio::main]
 async fn main() -> Result<()> {
-    application::run().await
+    let mut args = Args::parse();
+    match args.command.take() {
+        Some(Command::Doctor(options)) => doctor::run(&args, options).await,
+        #[cfg(feature = "plugins")]
+        Some(Command::Plugin(options)) => plugin_cli::run(options).await,
+        None => application::run(args).await,
+    }
 }
 
 /// 明文密钥和环境变量任一包含非空值即视为可用；该检查不会读取或记录密钥内容。
