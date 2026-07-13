@@ -218,6 +218,7 @@ fn plugin_status_shows_startup_details_then_compact_count() {
             "source": {"id": "mcp"},
             "data": {"text": "MCP 插件等待配置"}
         })],
+        0,
     );
     app.mark_plugin_ready(
         "skill".into(),
@@ -225,6 +226,7 @@ fn plugin_status_shows_startup_details_then_compact_count() {
             "source": {"id": "skill"},
             "presentation": {"text": "已加载 1 个 Skill"}
         })],
+        0,
     );
     app.finish_progressive_plugin_loading();
     assert_eq!(
@@ -266,7 +268,7 @@ fn plugin_status_reports_progressive_ready_count() {
     let mut app =
         App::new(tx, "测试模型".into()).with_loading_plugins(vec!["command".into(), "mcp".into()]);
 
-    app.mark_plugin_ready("command".into(), &[]);
+    app.mark_plugin_ready("command".into(), &[], 0);
 
     let (_, status) = app.plugin_status_content();
     assert!(status.contains("mcp"), "{status}");
@@ -283,7 +285,7 @@ fn plugin_status_keeps_partial_successes() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app = app.with_loading_plugins(vec!["skill".into(), "mcp".into()]);
-    app.mark_plugin_ready("skill".into(), &[]);
+    app.mark_plugin_ready("skill".into(), &[], 0);
     app.mark_plugin_failed(PluginLoadFailure {
         plugin_id: "mcp".into(),
         reason: "初始化超时".into(),
@@ -1137,6 +1139,35 @@ fn invalid_plugin_manifest_does_not_block_startup_labels() {
     let labels = plugin_manifest_ids(std::slice::from_ref(&invalid));
 
     assert_eq!(labels, vec!["lucia-invalid-plugin.toml"]);
+}
+
+/// 周期插件视图刷新运行期间的新请求必须合并，不能并行堆积后台任务。
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn plugin_view_refresh_coalesces_pending_requests() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.plugin_views
+        .push(test_plugin_view(UiPlacement::Right, "后台刷新"));
+    let host = Arc::new(LivePluginHost::new());
+
+    app.schedule_plugin_views_refresh(host.clone());
+    assert!(app.plugin_refresh_task.is_some());
+    assert!(!app.plugin_refresh_pending);
+
+    app.schedule_plugin_views_refresh(host);
+    assert!(app.plugin_refresh_pending);
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("后台插件刷新应按时返回")
+        .expect("后台插件刷新通道不应关闭");
+    assert!(matches!(event, UiEvent::PluginFramesLoaded(_)));
+    app.plugin_refresh_task
+        .take()
+        .expect("后台刷新任务应存在")
+        .await
+        .expect("后台刷新任务不应 panic");
 }
 
 /// 创建测试插件视图，覆盖停靠、对话框和焦点路由测试。

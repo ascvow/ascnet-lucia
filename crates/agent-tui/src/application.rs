@@ -55,6 +55,17 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         TuiSettings::default()
     };
     let lucia_home = lucia_home_dir()?;
+    #[cfg(feature = "plugins")]
+    {
+        let absolute_home = if lucia_home.is_absolute() {
+            lucia_home.clone()
+        } else {
+            std::env::current_dir()
+                .context("解析 Lucia Home 绝对路径失败")?
+                .join(&lucia_home)
+        };
+        configure_wasm_cache_directory(absolute_home.join("cache/wasmtime"))?;
+    }
     let sessions_root = resolve_tui_path(
         args.sessions_dir.as_deref(),
         tui_settings.sessions_dir.as_deref(),
@@ -383,9 +394,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     plugin_id,
                     startup_events,
                     ui_declarations,
-                    load_duration_ms: _,
+                    load_duration_ms,
                 } => {
-                    app.mark_plugin_ready(plugin_id.clone(), &startup_events);
+                    app.mark_plugin_ready(plugin_id.clone(), &startup_events, load_duration_ms);
                     app.add_plugin_views(ui_declarations);
                     for event in &startup_events {
                         if let Err(error) = apply_plugin_navigation_event(&mut app, event) {
@@ -415,13 +426,24 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                 format!("插件 UI 声明刷新失败：{error}"),
                             ));
                         }
-                        refresh_plugin_views(&mut app, host.as_ref()).await;
+                        app.schedule_plugin_views_refresh(Arc::clone(host));
                     }
                 }
                 ProgressivePluginLoadUpdate::Failed(failure) => {
                     app.mark_plugin_failed(failure);
                 }
             },
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::PluginFramesLoaded(rendered)) => {
+                app.plugin_refresh_task = None;
+                apply_plugin_frames(&mut app, rendered);
+                if app.plugin_refresh_pending {
+                    app.plugin_refresh_pending = false;
+                    if let Some(host) = plugin_host.as_ref() {
+                        app.schedule_plugin_views_refresh(Arc::clone(host));
+                    }
+                }
+            }
             #[cfg(feature = "plugins")]
             Some(UiEvent::PluginsLoaded(result)) => match *result {
                 Ok(()) => {
@@ -587,7 +609,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 let queue_may_advance = app.handle_agent_done(*result);
                 #[cfg(feature = "plugins")]
                 if let Some(host) = plugin_host.as_ref() {
-                    refresh_plugin_views(&mut app, host.as_ref()).await;
+                    app.schedule_plugin_views_refresh(Arc::clone(host));
                 }
                 if queue_may_advance {
                     if let Some(agent) = agent.as_ref() {
@@ -611,7 +633,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     if app.plugin_tick >= PLUGIN_REFRESH_TICKS {
                         app.plugin_tick = 0;
                         if let Some(host) = plugin_host.as_ref() {
-                            refresh_plugin_views(&mut app, host.as_ref()).await;
+                            app.schedule_plugin_views_refresh(Arc::clone(host));
                         }
                     }
                     app.command_snapshot_tick = app.command_snapshot_tick.wrapping_add(1);
@@ -703,6 +725,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         }
     }
 
+    #[cfg(feature = "plugins")]
+    if let Some(refresh_task) = app.plugin_refresh_task.take() {
+        let _ = refresh_task.await;
+    }
     #[cfg(feature = "plugins")]
     plugin_load_task.abort();
     #[cfg(feature = "plugins")]

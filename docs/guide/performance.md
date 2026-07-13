@@ -31,6 +31,11 @@ bun run perf:plugin:host
 
 Host 微基准标记为 `informational_only`，不会自行判定回归。共享 CI 的调度和频率变化容易让纳秒级结果抖动，应在相同机器和 release 配置下保存历史结果，再比较趋势。
 
+插件版 TUI 在首次创建 Wasmtime Engine 前把持久化编译缓存配置为
+`$LUCIA_HOME/cache/wasmtime`。缓存目录不可用时自动退回无缓存模式，不阻止启动。
+渐进加载状态会记录每个插件从 component 编译到 Ready 的总毫秒数，用于定位需要继续
+拆分 `activate` 或外部服务初始化的长尾插件。
+
 ## 真实 WASM 探针
 
 ```bash

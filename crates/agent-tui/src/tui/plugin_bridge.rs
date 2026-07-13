@@ -3,14 +3,29 @@
 use crate::*;
 use futures_util::future::join_all;
 
-/// 异步请求所有插件的新帧，并在主线程绘制前更新缓存。
-pub(crate) async fn refresh_plugin_views(app: &mut App, plugin_host: &dyn PluginHost) {
-    let rendered = join_all(
-        app.periodic_plugin_render_requests()
+/// 单个插件视图后台渲染结果，保留可信 owner 和实例定位信息。
+pub(crate) type PluginRenderResult = (
+    String,
+    String,
+    Option<String>,
+    Result<Option<PluginUiFrame>>,
+);
+
+/// 在 TUI 事件循环之外并发请求一批插件视图帧。
+pub(crate) async fn render_plugin_views(
+    plugin_host: Arc<LivePluginHost>,
+    requests: Vec<UiRenderRequest>,
+) -> Vec<PluginRenderResult> {
+    join_all(
+        requests
             .into_iter()
-            .map(|request| render_plugin_request(plugin_host, request)),
+            .map(|request| render_plugin_request(plugin_host.as_ref(), request)),
     )
-    .await;
+    .await
+}
+
+/// 把后台完成的插件视图帧提交到 App 缓存。
+pub(crate) fn apply_plugin_frames(app: &mut App, rendered: Vec<PluginRenderResult>) {
     for (plugin_id, view_id, instance_id, result) in rendered {
         match result {
             Ok(Some(frame)) => {
@@ -71,12 +86,7 @@ fn focus_visible_input_view(app: &mut App) {
 async fn render_plugin_request(
     plugin_host: &dyn PluginHost,
     request: UiRenderRequest,
-) -> (
-    String,
-    String,
-    Option<String>,
-    Result<Option<PluginUiFrame>>,
-) {
+) -> PluginRenderResult {
     let plugin_id = request.plugin_id.clone();
     let view_id = request.view_id.clone();
     let instance_id = request.instance_id.clone();

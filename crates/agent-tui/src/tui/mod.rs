@@ -15,8 +15,8 @@ pub(crate) use chat::context_status;
 pub(crate) use chat::render_main;
 #[cfg(feature = "plugins")]
 pub(crate) use plugin_bridge::{
-    apply_plugin_navigation_event, dispatch_plugin_input, drain_plugin_ui_events,
-    refresh_plugin_view, refresh_plugin_views,
+    apply_plugin_frames, apply_plugin_navigation_event, dispatch_plugin_input,
+    drain_plugin_ui_events, refresh_plugin_view, render_plugin_views, PluginRenderResult,
 };
 #[cfg(feature = "plugins")]
 pub(crate) use plugin_render::{

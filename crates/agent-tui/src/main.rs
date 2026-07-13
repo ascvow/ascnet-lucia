@@ -40,6 +40,7 @@ use agent_plugin_host::{
         UiNavigationRequest, UiPlacement, UiRenderRequest, UiSpan, UiStyle, UI_NAVIGATION_EVENT,
     },
     wasm::{
+        configure_wasm_cache_directory,
         load_wasm_plugins_progressively_with_selection_and_services, PluginLoadFailure,
         ProgressivePluginLoadUpdate,
     },
@@ -99,8 +100,9 @@ use tokio::sync::mpsc;
 use tui::render_root;
 #[cfg(feature = "plugins")]
 use tui::{
-    apply_plugin_navigation_event, dispatch_plugin_input, drain_plugin_ui_events,
-    refresh_plugin_view, refresh_plugin_views, view::ViewStack,
+    apply_plugin_frames, apply_plugin_navigation_event, dispatch_plugin_input,
+    drain_plugin_ui_events, refresh_plugin_view, render_plugin_views, view::ViewStack,
+    PluginRenderResult,
 };
 
 // ─── CLI 参数 ───
@@ -306,6 +308,9 @@ enum UiEvent {
     /// 单个插件的渐进加载状态已经提交到动态宿主。
     #[cfg(feature = "plugins")]
     PluginLoadUpdate(ProgressivePluginLoadUpdate),
+    /// 后台插件视图批量渲染完成。
+    #[cfg(feature = "plugins")]
+    PluginFramesLoaded(Vec<PluginRenderResult>),
     /// 后台渐进加载全部结束，或全局规划失败。
     #[cfg(feature = "plugins")]
     PluginsLoaded(Box<Result<()>>),

@@ -90,6 +90,12 @@ pub(crate) struct App {
     /// 控制插件 UI 刷新频率的主循环 tick 计数。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_tick: u8,
+    /// 当前唯一的后台插件视图刷新任务。
+    #[cfg(feature = "plugins")]
+    pub(crate) plugin_refresh_task: Option<tokio::task::JoinHandle<()>>,
+    /// 刷新任务运行期间是否又收到了一次合并后的刷新请求。
+    #[cfg(feature = "plugins")]
+    pub(crate) plugin_refresh_pending: bool,
     /// Loaded plugin IDs shown by the compact status counter. 紧凑状态计数展示的插件 ID。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_ids: Vec<String>,
@@ -206,6 +212,10 @@ impl App {
             plugin_frame: 0,
             #[cfg(feature = "plugins")]
             plugin_tick: 0,
+            #[cfg(feature = "plugins")]
+            plugin_refresh_task: None,
+            #[cfg(feature = "plugins")]
+            plugin_refresh_pending: false,
             #[cfg(feature = "plugins")]
             plugin_ids: Vec::new(),
             #[cfg(feature = "plugins")]
@@ -341,15 +351,23 @@ impl App {
 
     /// 记录一个渐进加载完成的插件，使其立即进入 Ready 计数并移出加载列表。
     #[cfg(feature = "plugins")]
-    pub(crate) fn mark_plugin_ready(&mut self, plugin_id: String, events: &[Value]) {
+    pub(crate) fn mark_plugin_ready(
+        &mut self,
+        plugin_id: String,
+        events: &[Value],
+        load_duration_ms: u64,
+    ) {
         self.plugin_loading_ids.retain(|id| id != &plugin_id);
         if !self.plugin_ids.contains(&plugin_id) {
             self.plugin_ids.push(plugin_id.clone());
         }
-        self.plugin_startup_details.extend(plugin_startup_details(
-            std::slice::from_ref(&plugin_id),
-            events,
-        ));
+        let mut details = plugin_startup_details(std::slice::from_ref(&plugin_id), events);
+        if load_duration_ms > 0 {
+            for detail in &mut details {
+                detail.push_str(&format!(" · {load_duration_ms} ms"));
+            }
+        }
+        self.plugin_startup_details.extend(details);
     }
 
     /// 记录一个渐进加载失败的插件并立即从加载列表移除。
@@ -368,6 +386,24 @@ impl App {
         );
         self.plugin_failures.push(detail.clone());
         self.plugin_startup_details.push(detail);
+    }
+
+    /// 启动或合并一次后台插件视图刷新，保证任一时刻至多存在一个渲染批次。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn schedule_plugin_views_refresh(&mut self, host: Arc<LivePluginHost>) {
+        if self.plugin_refresh_task.is_some() {
+            self.plugin_refresh_pending = true;
+            return;
+        }
+        let requests = self.periodic_plugin_render_requests();
+        if requests.is_empty() {
+            return;
+        }
+        let tx = self.tx.clone();
+        self.plugin_refresh_task = Some(tokio::spawn(async move {
+            let rendered = render_plugin_views(host, requests).await;
+            let _ = tx.send(UiEvent::PluginFramesLoaded(rendered));
+        }));
     }
 
     /// 结束渐进加载并保留已经逐项收集的成功详情与失败信息。
