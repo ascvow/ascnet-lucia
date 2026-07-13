@@ -1,10 +1,10 @@
 import { defineConfig } from "vitepress";
 
-/** Lucia 中文开发文档站配置。 */
+/** Lucia 中文文档站配置，按使用与开发两个一级板块组织导航。 */
 export default defineConfig({
   lang: "zh-CN",
   title: "Lucia",
-  description: "Lucia Agent Core、Plugin Host 与 WASM 插件开发文档",
+  description: "Lucia TUI、CLI、插件管理与 Rust 开发文档",
   cleanUrls: true,
   lastUpdated: true,
   head: [
@@ -13,24 +13,59 @@ export default defineConfig({
   ],
   themeConfig: {
     nav: [
-      { text: "快速开始", link: "/guide/quick-start" },
-      { text: "使用示例", link: "/guide/examples" },
-      { text: "Agent Core", link: "/agent/api" },
-      { text: "Plugin Host", link: "/host/overview" },
-      { text: "WASM 插件", link: "/plugin/quick-start" },
-      { text: "API 参考", link: "/reference/rust-api" },
+      {
+        text: "使用",
+        items: [
+          { text: "TUI 使用", link: "/usage/tui" },
+          { text: "CLI 使用", link: "/usage/cli" },
+          { text: "插件管理", link: "/usage/plugin-management" },
+          { text: "其他", link: "/usage/other" },
+        ],
+      },
+      {
+        text: "开发",
+        items: [
+          { text: "插件开发", link: "/development/plugin" },
+          { text: "二次开发", link: "/development/custom" },
+        ],
+      },
+      {
+        text: "参考",
+        items: [
+          { text: "架构边界", link: "/guide/architecture" },
+          { text: "Rust API", link: "/reference/rust-api" },
+          { text: "WIT ABI", link: "/reference/wit" },
+        ],
+      },
     ],
     sidebar: {
+      "/usage/": [
+        {
+          text: "使用",
+          items: [
+            { text: "TUI 使用", link: "/usage/tui" },
+            { text: "CLI 使用", link: "/usage/cli" },
+            { text: "插件管理", link: "/usage/plugin-management" },
+            { text: "其他", link: "/usage/other" },
+          ],
+        },
+      ],
+      "/development/": [
+        {
+          text: "开发",
+          items: [
+            { text: "插件开发", link: "/development/plugin" },
+            { text: "二次开发", link: "/development/custom" },
+          ],
+        },
+      ],
       "/guide/": [
         {
-          text: "开始",
+          text: "指南与架构",
           items: [
             { text: "快速开始", link: "/guide/quick-start" },
-            { text: "常用场景示例", link: "/guide/examples" },
             { text: "架构边界", link: "/guide/architecture" },
-            { text: "TUI 配置与会话", link: "/guide/tui-configuration" },
             { text: "构建与打包", link: "/guide/distribution" },
-            { text: "插件管理", link: "/guide/plugin-management" },
             { text: "插件性能", link: "/guide/performance" },
             { text: "真实模型测试", link: "/guide/live-testing" },
           ],
@@ -60,10 +95,9 @@ export default defineConfig({
       ],
       "/plugin/": [
         {
-          text: "WASM 插件开发",
+          text: "WASM 插件参考",
           items: [
             { text: "官方插件", link: "/plugin/official" },
-            { text: "创建插件", link: "/plugin/quick-start" },
             { text: "生命周期", link: "/plugin/lifecycle" },
             { text: "Host API", link: "/plugin/host-api" },
             { text: "API 能力地图", link: "/plugin/api-capability-map" },
@@ -81,7 +115,7 @@ export default defineConfig({
       ],
       "/reference/": [
         {
-          text: "API 参考",
+          text: "参考",
           items: [
             { text: "Rust API 索引", link: "/reference/rust-api" },
             { text: "WIT ABI 0.6", link: "/reference/wit" },
