@@ -3,15 +3,15 @@
 //! 运行器只把固定标记、工具事件摘要、用量和脱敏错误写入报告，不保存模型原文、
 //! API key 或服务商原始响应。
 
-use anyhow::Result;
 use agent_core::{
-    extension::AgentExtension, Agent, AgentEvent, AgentEventKind, AgentRun, InMemoryEventSink,
-    AgentRootConfig, TokenUsage,
+    extension::AgentExtension, Agent, AgentEvent, AgentEventKind, AgentRootConfig, AgentRun,
+    InMemoryEventSink, TokenUsage,
 };
 use agent_plugin_host::{
     manifest::load_plugin_runtime_config, wasm::load_wasm_plugins, PluginHost,
 };
 use agent_tool::{JsonTool, ToolRegistry, ToolSpec};
+use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use serde_json::{json, Value};
