@@ -55,6 +55,15 @@ pub(crate) struct CapabilityState {
     state: HashMap<String, Value>,
 }
 
+impl Drop for CapabilityState {
+    fn drop(&mut self) {
+        // 加载 future 被取消时无法执行 Guest deactivate，必须由 Host 兜底终止子进程。
+        for process in self.processes.values_mut() {
+            process.start_kill_tree();
+        }
+    }
+}
+
 /// 单个插件激活实例可使用的身份绑定 Agent Runtime。
 #[derive(Clone)]
 pub(crate) struct AgentRuntimeBinding {
@@ -68,6 +77,25 @@ struct ManagedProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
+    /// Unix 下由子进程 PID 建立的独立进程组，用于回收命令启动的全部后代。
+    #[cfg(unix)]
+    process_group: u32,
+}
+
+impl ManagedProcess {
+    /// 请求终止插件进程及其派生的整个进程树。
+    fn start_kill_tree(&mut self) {
+        #[cfg(unix)]
+        {
+            // 子进程启动时已成为同 PID 的进程组 leader，负 PID 表示向整组发送信号。
+            if let Ok(group) = i32::try_from(self.process_group) {
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+        }
+        let _ = self.child.start_kill();
+    }
 }
 
 /// 文件列表返回给插件的稳定结构。
@@ -536,6 +564,8 @@ impl CapabilityState {
 
         let cwd = self.resolve_process_cwd(request.cwd.as_deref())?;
         let mut command = Command::new(&request.command);
+        #[cfg(unix)]
+        command.process_group(0);
         command
             .args(&request.args)
             .current_dir(cwd)
@@ -554,6 +584,8 @@ impl CapabilityState {
         let mut child = command
             .spawn()
             .with_context(|| format!("启动插件进程失败：{}", request.command))?;
+        #[cfg(unix)]
+        let process_group = child.id().context("插件子进程缺少 PID")?;
         let stdin = child.stdin.take().context("插件进程缺少 stdin 管道")?;
         let stdout = child.stdout.take().context("插件进程缺少 stdout 管道")?;
         let handle = self.next_process_handle;
@@ -564,6 +596,8 @@ impl CapabilityState {
                 child,
                 stdin,
                 stdout: BufReader::new(stdout).lines(),
+                #[cfg(unix)]
+                process_group,
             },
         );
         Ok(json!(handle))
@@ -631,7 +665,8 @@ impl CapabilityState {
             .processes
             .remove(&request.handle)
             .ok_or_else(|| anyhow!("未知插件进程句柄：{}", request.handle))?;
-        process.child.kill().await.context("终止插件进程失败")?;
+        process.start_kill_tree();
+        process.child.wait().await.context("等待插件进程终止失败")?;
         Ok(Value::Null)
     }
 

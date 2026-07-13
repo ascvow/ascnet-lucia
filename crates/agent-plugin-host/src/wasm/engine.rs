@@ -2,7 +2,11 @@
 
 use crate::capability::CapabilityState;
 use anyhow::{anyhow, Result};
-use std::sync::LazyLock;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::{LazyLock, OnceLock},
+};
 use wasmtime::component::ResourceTable;
 use wasmtime::{Cache, CacheConfig, Config, Engine, StoreLimits};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -12,20 +16,55 @@ const DEFAULT_FUEL_YIELD_INTERVAL: u64 = 250_000;
 /// 单个插件线性内存的默认上限。
 const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
+/// 应用在首次创建 Engine 前注入的持久化编译缓存目录。
+static WASM_CACHE_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+
+/// 配置进程级 Wasmtime 编译缓存目录。
+///
+/// 必须在首次加载 component 前调用；重复设置相同目录是幂等操作，不同目录会返回错误。
+pub fn configure_wasm_cache_directory(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref().to_path_buf();
+    if let Some(configured) = WASM_CACHE_DIRECTORY.get() {
+        if configured == &path {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "Wasmtime 缓存目录已经配置为 {}",
+            configured.display()
+        ));
+    }
+    WASM_CACHE_DIRECTORY
+        .set(path)
+        .map_err(|_| anyhow!("Wasmtime 缓存目录配置失败"))
+}
+
 /// 进程内所有 WASM 插件共享的 Wasmtime Engine。
 ///
 /// Engine 的克隆只会增加内部引用计数；共享实例可复用编译器、类型注册表和代码缓存，
 /// 同时每个插件仍持有独立的 Store、燃料和内存限制。
 static SHARED_WASM_ENGINE: LazyLock<std::result::Result<Engine, String>> = LazyLock::new(|| {
+    create_wasm_engine(WASM_CACHE_DIRECTORY.get().map(PathBuf::as_path))
+        .map_err(|error| format!("{error:#}"))
+});
+
+/// 按可选持久化缓存目录创建共享配置一致的 Wasmtime Engine。
+fn create_wasm_engine(cache_directory: Option<&Path>) -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     config.consume_fuel(true);
     // 缓存不可用时保持无缓存启动，避免本地目录权限问题使插件系统整体失败。
-    if let Ok(cache) = Cache::new(CacheConfig::new()) {
-        config.cache(Some(cache));
+    if let Some(directory) = cache_directory {
+        let cache = fs::create_dir_all(directory).ok().and_then(|_| {
+            let mut cache_config = CacheConfig::new();
+            cache_config.with_directory(directory);
+            Cache::new(cache_config).ok()
+        });
+        if let Some(cache) = cache {
+            config.cache(Some(cache));
+        }
     }
-    Engine::new(&config).map_err(|error| format!("{error:?}"))
-});
+    Engine::new(&config).map_err(|error| anyhow!("{error:?}"))
+}
 
 /// 将 wasmtime 结果转换为 anyhow 结果。
 /// wasmtime 46 起使用自有 Error 类型，不再实现 std Error，无法直接配合 anyhow。
@@ -80,6 +119,24 @@ impl WasiView for PluginWasiState {
             ctx: &mut self.wasi,
             table: &mut self.table,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 显式缓存目录必须被 Wasmtime 验证并创建。
+    #[test]
+    fn explicit_cache_directory_is_created() {
+        let directory =
+            std::env::temp_dir().join(format!("lucia-wasmtime-cache-{}", uuid::Uuid::new_v4()));
+
+        let engine = create_wasm_engine(Some(&directory)).expect("创建带缓存的 Engine");
+        assert!(directory.is_dir());
+
+        drop(engine);
+        let _ = fs::remove_dir_all(directory);
     }
 }
 

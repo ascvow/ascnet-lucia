@@ -46,7 +46,7 @@ const MAX_CONTEXT_FUEL: u64 = 500_000_000;
 mod engine;
 mod loader;
 
-pub use engine::WasmPluginLimits;
+pub use engine::{configure_wasm_cache_directory, WasmPluginLimits};
 use engine::{shared_wasm_engine, IntoAnyhow, PluginWasiState};
 
 #[cfg(test)]
@@ -93,6 +93,41 @@ pub struct WasmPluginHost {
     known_ui: Vec<UiDeclaration>,
     agent_runtime: Option<AgentRuntimeBinding>,
     state: Arc<Mutex<WasmPluginState>>,
+}
+
+/// 插件加载被取消时异步撤销尚未转交给宿主实例的 Agent Runtime principal。
+struct AgentRuntimeLoadGuard {
+    binding: Option<AgentRuntimeBinding>,
+}
+
+impl AgentRuntimeLoadGuard {
+    /// 创建持有可选临时绑定的加载守卫。
+    fn new(binding: Option<AgentRuntimeBinding>) -> Self {
+        Self { binding }
+    }
+
+    /// 正常加载失败时取出绑定，由当前 future 等待完整撤销。
+    fn take(&mut self) -> Option<AgentRuntimeBinding> {
+        self.binding.take()
+    }
+
+    /// 宿主实例已经接管绑定后解除取消兜底。
+    fn disarm(&mut self) {
+        self.binding = None;
+    }
+}
+
+impl Drop for AgentRuntimeLoadGuard {
+    fn drop(&mut self) {
+        let Some(binding) = self.binding.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                binding.revoke().await;
+            });
+        }
+    }
 }
 
 struct WasmPluginState {
@@ -305,7 +340,7 @@ impl WasmPluginHost {
 
         let agent_runtime =
             provision_agent_runtime(&manifest, host_services.agent_runtime()).await?;
-        let cleanup_agent_runtime = agent_runtime.clone();
+        let mut cleanup_agent_runtime = AgentRuntimeLoadGuard::new(agent_runtime.clone());
         let loading: Result<Self> = async {
             let mut wasi = WasiCtxBuilder::new();
             // 刻意保持最小 WASI：不继承环境变量、不预打开目录、不继承 stdio。
@@ -455,9 +490,11 @@ impl WasmPluginHost {
         }
         .await;
         if loading.is_err() {
-            if let Some(binding) = cleanup_agent_runtime {
+            if let Some(binding) = cleanup_agent_runtime.take() {
                 binding.revoke().await;
             }
+        } else {
+            cleanup_agent_runtime.disarm();
         }
         loading
     }

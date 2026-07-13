@@ -17,6 +17,7 @@ agent-core = { path = "../agent-core", default-features = false }
 agent-tool = { path = "../agent-tool", default-features = false }
 async-trait.workspace = true
 futures-util.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true

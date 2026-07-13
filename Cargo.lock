@@ -87,6 +87,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures-util",
+ "libc",
  "semver",
  "serde",
  "serde_json",
