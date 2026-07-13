@@ -342,7 +342,7 @@ fn topological_order(
 }
 
 /// 在保持依赖拓扑的前提下，把关键能力 owner 及其依赖移动到加载计划前部。
-fn prioritize_progressive_order(
+pub(super) fn prioritize_progressive_order(
     manifests: &[PluginManifest],
     order: &[usize],
     priority_plugin_ids: &[String],
