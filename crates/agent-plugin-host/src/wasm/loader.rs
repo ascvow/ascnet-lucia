@@ -1,6 +1,10 @@
 //! 多插件依赖规划、能力选择与容错加载。
 
 use super::*;
+use futures_util::{stream::FuturesUnordered, StreamExt};
+
+/// 后台实例化允许的最大并发数，限制冷编译的 CPU 和内存峰值。
+const MAX_PROGRESSIVE_LOAD_CONCURRENCY: usize = 3;
 
 /// 将多个 WASM 插件 manifest 加载为一个组合宿主。
 pub async fn load_wasm_plugins<P: AsRef<Path>>(paths: &[P]) -> Result<CompositePluginHost> {
@@ -475,4 +479,163 @@ pub async fn load_wasm_plugins_resilient_with_selection_and_services<P: AsRef<Pa
         host: composite,
         failures,
     })
+}
+
+/// 渐进加载过程中发布的单插件状态变化。
+#[derive(Debug, Clone)]
+pub enum ProgressivePluginLoadUpdate {
+    /// 插件已完成激活并发布到动态宿主。
+    Ready {
+        /// 已 Ready 插件的稳定 ID。
+        plugin_id: String,
+        /// 激活阶段发布、等待应用展示的结构化事件。
+        startup_events: Vec<Value>,
+        /// 插件在激活阶段声明的 UI 视图。
+        ui_declarations: Vec<UiDeclaration>,
+    },
+    /// 插件加载失败或因必选依赖失败被跳过。
+    Failed(PluginLoadFailure),
+}
+
+/// 按依赖顺序容错加载插件，并在每个插件 Ready 后立即发布到动态宿主。
+///
+/// `on_update` 在状态已经提交后同步调用，调用方可以把轻量事件转发到自己的事件循环；
+/// 插件实例化、激活和依赖判断仍由 Host 持有，不向应用层泄漏 WASM 生命周期细节。
+pub async fn load_wasm_plugins_progressively_with_selection_and_services<P, F>(
+    paths: &[P],
+    capability_selection: &HashMap<String, String>,
+    host_services: PluginHostServices,
+    live_host: &LivePluginHost,
+    mut on_update: F,
+) -> Result<Vec<PluginLoadFailure>>
+where
+    P: AsRef<Path>,
+    F: FnMut(ProgressivePluginLoadUpdate),
+{
+    let mut pending = Vec::with_capacity(paths.len());
+    let mut failures = Vec::new();
+    for path in paths {
+        let manifest_path = path.as_ref();
+        let manifest = match PluginManifest::load(manifest_path) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let failure = PluginLoadFailure {
+                    plugin_id: manifest_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| manifest_path.display().to_string()),
+                    reason: error.to_string(),
+                    blocked_by: Vec::new(),
+                };
+                on_update(ProgressivePluginLoadUpdate::Failed(failure.clone()));
+                failures.push(failure);
+                continue;
+            }
+        };
+        let plugin_dir = manifest_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let wasm_path = plugin_dir.join(&manifest.plugin.wasm);
+        pending.push((manifest, wasm_path, plugin_dir));
+    }
+
+    let manifests = pending
+        .iter()
+        .map(|(manifest, _, _)| manifest.clone())
+        .collect::<Vec<_>>();
+    let (order, dependency_failures) = resilient_dependency_plan(&manifests)?;
+    let eligible_manifests = order
+        .iter()
+        .map(|index| manifests[*index].clone())
+        .collect::<Vec<_>>();
+    let resolved_capabilities =
+        resolve_plugin_capabilities(&eligible_manifests, capability_selection)?;
+    if let Some(owner) = resolved_capabilities.exclusive_owner(CONTEXT_LOADER_CAPABILITY) {
+        live_host.set_capability_owner(CONTEXT_LOADER_CAPABILITY, owner)?;
+    }
+    if let Some(owner) = resolved_capabilities.exclusive_owner(TOOL_POLICY_CAPABILITY) {
+        live_host.set_capability_owner(TOOL_POLICY_CAPABILITY, owner)?;
+    }
+    live_host.finish_capability_planning()?;
+
+    for failure in dependency_failures {
+        on_update(ProgressivePluginLoadUpdate::Failed(failure.clone()));
+        failures.push(failure);
+    }
+    let mut failed_ids = failures
+        .iter()
+        .map(|failure| failure.plugin_id.clone())
+        .collect::<HashSet<_>>();
+    let services = Arc::new(ServiceRegistry::default());
+
+    for index in order {
+        let (manifest, wasm_path, plugin_dir) = pending[index].clone();
+        let plugin_id = manifest.plugin.id.clone();
+        let blocked_by = failed_required_dependencies(&manifest, &failed_ids);
+        if !blocked_by.is_empty() {
+            failed_ids.insert(plugin_id.clone());
+            let failure = PluginLoadFailure {
+                plugin_id,
+                reason: format!("必选依赖加载失败：{}", blocked_by.join("、")),
+                blocked_by,
+            };
+            on_update(ProgressivePluginLoadUpdate::Failed(failure.clone()));
+            failures.push(failure);
+            continue;
+        }
+
+        let loading = WasmPluginHost::load_with_limits_in_dir(
+            manifest,
+            wasm_path,
+            plugin_dir,
+            WasmPluginLimits::default(),
+            services.clone(),
+            host_services.clone(),
+        )
+        .await;
+        match loading {
+            Ok(host) => {
+                let startup_events = AgentExtension::drain_events(&host).await;
+                let ui_declarations = PluginHost::ui_declarations(&host).await;
+                match (startup_events, ui_declarations) {
+                    (Ok(startup_events), Ok(ui_declarations)) => {
+                        live_host.publish(Arc::new(host))?;
+                        on_update(ProgressivePluginLoadUpdate::Ready {
+                            plugin_id,
+                            startup_events,
+                            ui_declarations,
+                        });
+                    }
+                    (events, declarations) => {
+                        let error = events
+                            .err()
+                            .or_else(|| declarations.err())
+                            .expect("插件准备失败分支必须包含错误");
+                        let _ = PluginHost::shutdown(&host).await;
+                        failed_ids.insert(plugin_id.clone());
+                        let failure = PluginLoadFailure {
+                            plugin_id,
+                            reason: error.to_string(),
+                            blocked_by: Vec::new(),
+                        };
+                        on_update(ProgressivePluginLoadUpdate::Failed(failure.clone()));
+                        failures.push(failure);
+                    }
+                }
+            }
+            Err(error) => {
+                failed_ids.insert(plugin_id.clone());
+                let failure = PluginLoadFailure {
+                    plugin_id,
+                    reason: error.to_string(),
+                    blocked_by: Vec::new(),
+                };
+                on_update(ProgressivePluginLoadUpdate::Failed(failure.clone()));
+                failures.push(failure);
+            }
+        }
+    }
+    Ok(failures)
 }

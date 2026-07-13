@@ -455,7 +455,7 @@ pub struct LoadedContext {
 /// WASM 上下文导出的稳定响应信封。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ContextLoadResponse {
-    /// 插件提供的完整替换上下文；`None` 表示当前插件不参与加载。
+    /// 插件提供的完整替换上下文；`None` 表示本轮显式透传原始上下文。
     pub context: Option<LoadedContext>,
     /// 插件执行失败时返回的错误文本。
     pub error: Option<String>,
@@ -989,6 +989,9 @@ pub trait AgentPlugin: Default + Send + 'static {
     fn on_event(&mut self, _event: AgentEvent) {}
 
     /// 为一次模型请求返回完整替换上下文；默认不参与上下文加载。
+    ///
+    /// 返回 `None` 表示本轮显式透传：宿主继续使用原始完整历史，
+    /// 无需把未修改的上下文跨 WASM 边界回传。
     fn load_context(
         &mut self,
         _host: &dyn PluginHostApi,

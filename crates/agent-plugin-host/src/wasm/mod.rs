@@ -11,8 +11,8 @@ use super::{
         CONTEXT_LOADER_CAPABILITY, TOOL_POLICY_CAPABILITY,
     },
     service::{PluginService, PluginServiceCall, ServiceHandler, ServiceRegistry},
-    AgentEvent, AgentRuntimeHostServices, CompositePluginHost, PluginHost, PluginHostServices,
-    ToolDecision, UiDeclaration, UiFrame, UiInput, UiRenderRequest,
+    AgentEvent, AgentRuntimeHostServices, CompositePluginHost, LivePluginHost, PluginHost,
+    PluginHostServices, ToolDecision, UiDeclaration, UiFrame, UiInput, UiRenderRequest,
 };
 use crate::ui::UiPlacement;
 use agent_core::{model::ModelMessage, AgentExtension, ContextLoadRequest, LoadedContext};
@@ -52,9 +52,11 @@ use engine::{shared_wasm_engine, IntoAnyhow, PluginWasiState};
 #[cfg(test)]
 use loader::{failed_required_dependencies, resilient_dependency_plan};
 pub use loader::{
-    load_wasm_plugins, load_wasm_plugins_resilient, load_wasm_plugins_resilient_with_selection,
+    load_wasm_plugins, load_wasm_plugins_progressively_with_selection_and_services,
+    load_wasm_plugins_resilient, load_wasm_plugins_resilient_with_selection,
     load_wasm_plugins_resilient_with_selection_and_services, load_wasm_plugins_with_selection,
     load_wasm_plugins_with_selection_and_services, load_wasm_plugins_with_services,
+    ProgressivePluginLoadUpdate,
 };
 
 /// One plugin excluded from a resilient load attempt.
