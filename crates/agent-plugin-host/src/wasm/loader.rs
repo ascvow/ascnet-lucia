@@ -2,6 +2,7 @@
 
 use super::*;
 use futures_util::{stream::FuturesUnordered, StreamExt};
+use std::time::Instant;
 
 /// 后台实例化允许的最大并发数，限制冷编译的 CPU 和内存峰值。
 const MAX_PROGRESSIVE_LOAD_CONCURRENCY: usize = 3;
@@ -340,6 +341,113 @@ fn topological_order(
     order
 }
 
+/// 在保持依赖拓扑的前提下，把关键能力 owner 及其依赖移动到加载计划前部。
+fn prioritize_progressive_order(
+    manifests: &[PluginManifest],
+    order: &[usize],
+    priority_plugin_ids: &[String],
+) -> Vec<usize> {
+    let by_id = manifests
+        .iter()
+        .enumerate()
+        .map(|(index, manifest)| (manifest.plugin.id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let positions = order
+        .iter()
+        .enumerate()
+        .map(|(position, index)| (*index, position))
+        .collect::<HashMap<_, _>>();
+    let eligible = order.iter().copied().collect::<HashSet<_>>();
+    let mut emitted = HashSet::new();
+    let mut prioritized = Vec::with_capacity(order.len());
+
+    fn emit_with_dependencies(
+        index: usize,
+        manifests: &[PluginManifest],
+        by_id: &HashMap<&str, usize>,
+        positions: &HashMap<usize, usize>,
+        eligible: &HashSet<usize>,
+        emitted: &mut HashSet<usize>,
+        prioritized: &mut Vec<usize>,
+    ) {
+        if emitted.contains(&index) {
+            return;
+        }
+        let current_position = positions[&index];
+        let mut dependencies = manifests[index]
+            .dependencies
+            .iter()
+            .filter_map(|dependency| by_id.get(dependency.id.as_str()).copied())
+            .filter(|provider| eligible.contains(provider))
+            // 可选依赖环中被拓扑计划舍弃的反向边不得重新引入。
+            .filter(|provider| positions[provider] < current_position)
+            .collect::<Vec<_>>();
+        dependencies.sort_by_key(|provider| positions[provider]);
+        for provider in dependencies {
+            emit_with_dependencies(
+                provider,
+                manifests,
+                by_id,
+                positions,
+                eligible,
+                emitted,
+                prioritized,
+            );
+        }
+        if emitted.insert(index) {
+            prioritized.push(index);
+        }
+    }
+
+    for plugin_id in priority_plugin_ids {
+        if let Some(index) = by_id.get(plugin_id.as_str()).copied() {
+            if eligible.contains(&index) {
+                emit_with_dependencies(
+                    index,
+                    manifests,
+                    &by_id,
+                    &positions,
+                    &eligible,
+                    &mut emitted,
+                    &mut prioritized,
+                );
+            }
+        }
+    }
+    for index in order {
+        emit_with_dependencies(
+            *index,
+            manifests,
+            &by_id,
+            &positions,
+            &eligible,
+            &mut emitted,
+            &mut prioritized,
+        );
+    }
+    prioritized
+}
+
+/// 返回当前插件在稳定计划中需要等待的已安装依赖是否全部结束。
+fn progressive_dependencies_settled(
+    index: usize,
+    manifests: &[PluginManifest],
+    by_id: &HashMap<String, usize>,
+    positions: &HashMap<usize, usize>,
+    completed_ids: &HashSet<String>,
+) -> bool {
+    let current_position = positions[&index];
+    manifests[index].dependencies.iter().all(|dependency| {
+        let Some(provider) = by_id.get(&dependency.id).copied() else {
+            return true;
+        };
+        positions
+            .get(&provider)
+            .is_none_or(|position| *position >= current_position)
+            || completed_ids.contains(&dependency.id)
+    })
+}
+
 /// Returns whether the current directed graph contains a path between two nodes.
 ///
 /// 判断当前有向图中两个节点之间是否已存在路径。
@@ -492,9 +600,58 @@ pub enum ProgressivePluginLoadUpdate {
         startup_events: Vec<Value>,
         /// 插件在激活阶段声明的 UI 视图。
         ui_declarations: Vec<UiDeclaration>,
+        /// 从 component 编译到 Ready 的总耗时，单位为毫秒。
+        load_duration_ms: u64,
     },
     /// 插件加载失败或因必选依赖失败被跳过。
     Failed(PluginLoadFailure),
+}
+
+/// 并发实例化完成、等待动态宿主按稳定计划发布的插件。
+struct PreparedProgressivePlugin {
+    host: WasmPluginHost,
+    startup_events: Vec<Value>,
+    ui_declarations: Vec<UiDeclaration>,
+    load_duration_ms: u64,
+}
+
+/// 完成单插件编译、实例化、激活和发布前准备；失败时主动卸载已构建实例。
+async fn prepare_progressive_plugin(
+    manifest: PluginManifest,
+    wasm_path: PathBuf,
+    plugin_dir: PathBuf,
+    services: Arc<ServiceRegistry>,
+    host_services: PluginHostServices,
+) -> Result<PreparedProgressivePlugin> {
+    let started = Instant::now();
+    let host = WasmPluginHost::load_with_limits_in_dir(
+        manifest,
+        wasm_path,
+        plugin_dir,
+        WasmPluginLimits::default(),
+        services,
+        host_services,
+    )
+    .await?;
+    let prepared = async {
+        let startup_events = AgentExtension::drain_events(&host).await?;
+        let ui_declarations = PluginHost::ui_declarations(&host).await?;
+        Ok::<_, anyhow::Error>((startup_events, ui_declarations))
+    }
+    .await;
+    let (startup_events, ui_declarations) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = PluginHost::shutdown(&host).await;
+            return Err(error);
+        }
+    };
+    Ok(PreparedProgressivePlugin {
+        host,
+        startup_events,
+        ui_declarations,
+        load_duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    })
 }
 
 /// 按依赖顺序容错加载插件，并在每个插件 Ready 后立即发布到动态宿主。
@@ -545,17 +702,34 @@ where
         .iter()
         .map(|(manifest, _, _)| manifest.clone())
         .collect::<Vec<_>>();
-    let (order, dependency_failures) = resilient_dependency_plan(&manifests)?;
-    let eligible_manifests = order
+    let (base_order, dependency_failures) = resilient_dependency_plan(&manifests)?;
+    let eligible_manifests = base_order
         .iter()
         .map(|index| manifests[*index].clone())
         .collect::<Vec<_>>();
     let resolved_capabilities =
         resolve_plugin_capabilities(&eligible_manifests, capability_selection)?;
-    if let Some(owner) = resolved_capabilities.exclusive_owner(CONTEXT_LOADER_CAPABILITY) {
+    let selected_tool_policy_owner = resolved_capabilities
+        .exclusive_owner(TOOL_POLICY_CAPABILITY)
+        .map(str::to_string);
+    let selected_context_owner = resolved_capabilities
+        .exclusive_owner(CONTEXT_LOADER_CAPABILITY)
+        .map(str::to_string);
+    let priority_plugin_ids = selected_tool_policy_owner
+        .iter()
+        .chain(selected_context_owner.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let order = prioritize_progressive_order(&manifests, &base_order, &priority_plugin_ids);
+    let ordered_plugin_ids = order
+        .iter()
+        .map(|index| manifests[*index].plugin.id.clone())
+        .collect::<Vec<_>>();
+    live_host.set_plugin_order(&ordered_plugin_ids)?;
+    if let Some(owner) = selected_context_owner.as_deref() {
         live_host.set_capability_owner(CONTEXT_LOADER_CAPABILITY, owner)?;
     }
-    if let Some(owner) = resolved_capabilities.exclusive_owner(TOOL_POLICY_CAPABILITY) {
+    if let Some(owner) = selected_tool_policy_owner.as_deref() {
         live_host.set_capability_owner(TOOL_POLICY_CAPABILITY, owner)?;
     }
     live_host.finish_capability_planning()?;
@@ -568,62 +742,102 @@ where
         .iter()
         .map(|failure| failure.plugin_id.clone())
         .collect::<HashSet<_>>();
+    let mut completed_ids = failed_ids.clone();
     let services = Arc::new(ServiceRegistry::default());
+    let by_id = manifests
+        .iter()
+        .enumerate()
+        .map(|(index, manifest)| (manifest.plugin.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let positions = order
+        .iter()
+        .enumerate()
+        .map(|(position, index)| (*index, position))
+        .collect::<HashMap<_, _>>();
+    let policy_gate_position = selected_tool_policy_owner
+        .as_ref()
+        .and_then(|owner| by_id.get(owner))
+        .and_then(|index| positions.get(index))
+        .copied();
+    let mut policy_gate_complete = policy_gate_position.is_none();
+    let mut pending_indices = order.iter().copied().collect::<HashSet<_>>();
+    let mut running = FuturesUnordered::new();
 
-    for index in order {
-        let (manifest, wasm_path, plugin_dir) = pending[index].clone();
-        let plugin_id = manifest.plugin.id.clone();
-        let blocked_by = failed_required_dependencies(&manifest, &failed_ids);
-        if !blocked_by.is_empty() {
-            failed_ids.insert(plugin_id.clone());
-            let failure = PluginLoadFailure {
-                plugin_id,
-                reason: format!("必选依赖加载失败：{}", blocked_by.join("、")),
-                blocked_by,
+    while !pending_indices.is_empty() || !running.is_empty() {
+        while running.len() < MAX_PROGRESSIVE_LOAD_CONCURRENCY {
+            let candidate = order.iter().copied().find(|index| {
+                if !pending_indices.contains(index) {
+                    return false;
+                }
+                if !policy_gate_complete
+                    && positions[index] > policy_gate_position.expect("策略门禁位置必须存在")
+                {
+                    return false;
+                }
+                progressive_dependencies_settled(
+                    *index,
+                    &manifests,
+                    &by_id,
+                    &positions,
+                    &completed_ids,
+                )
+            });
+            let Some(index) = candidate else {
+                break;
             };
-            on_update(ProgressivePluginLoadUpdate::Failed(failure.clone()));
-            failures.push(failure);
-            continue;
+            pending_indices.remove(&index);
+            let (manifest, wasm_path, plugin_dir) = pending[index].clone();
+            let plugin_id = manifest.plugin.id.clone();
+            let blocked_by = failed_required_dependencies(&manifest, &failed_ids);
+            if !blocked_by.is_empty() {
+                failed_ids.insert(plugin_id.clone());
+                completed_ids.insert(plugin_id.clone());
+                if positions[&index] == policy_gate_position.unwrap_or(usize::MAX) {
+                    policy_gate_complete = true;
+                }
+                let failure = PluginLoadFailure {
+                    plugin_id,
+                    reason: format!("必选依赖加载失败：{}", blocked_by.join("、")),
+                    blocked_by,
+                };
+                on_update(ProgressivePluginLoadUpdate::Failed(failure.clone()));
+                failures.push(failure);
+                continue;
+            }
+            let plugin_services = services.clone();
+            let plugin_host_services = host_services.clone();
+            running.push(async move {
+                let prepared = prepare_progressive_plugin(
+                    manifest,
+                    wasm_path,
+                    plugin_dir,
+                    plugin_services,
+                    plugin_host_services,
+                )
+                .await;
+                (index, plugin_id, prepared)
+            });
         }
 
-        let loading = WasmPluginHost::load_with_limits_in_dir(
-            manifest,
-            wasm_path,
-            plugin_dir,
-            WasmPluginLimits::default(),
-            services.clone(),
-            host_services.clone(),
-        )
-        .await;
-        match loading {
-            Ok(host) => {
-                let startup_events = AgentExtension::drain_events(&host).await;
-                let ui_declarations = PluginHost::ui_declarations(&host).await;
-                match (startup_events, ui_declarations) {
-                    (Ok(startup_events), Ok(ui_declarations)) => {
-                        live_host.publish(Arc::new(host))?;
-                        on_update(ProgressivePluginLoadUpdate::Ready {
-                            plugin_id,
-                            startup_events,
-                            ui_declarations,
-                        });
-                    }
-                    (events, declarations) => {
-                        let error = events
-                            .err()
-                            .or_else(|| declarations.err())
-                            .expect("插件准备失败分支必须包含错误");
-                        let _ = PluginHost::shutdown(&host).await;
-                        failed_ids.insert(plugin_id.clone());
-                        let failure = PluginLoadFailure {
-                            plugin_id,
-                            reason: error.to_string(),
-                            blocked_by: Vec::new(),
-                        };
-                        on_update(ProgressivePluginLoadUpdate::Failed(failure.clone()));
-                        failures.push(failure);
-                    }
-                }
+        let Some((index, plugin_id, prepared)) = running.next().await else {
+            if pending_indices.is_empty() {
+                break;
+            }
+            return Err(anyhow!("渐进插件加载计划无法继续推进"));
+        };
+        completed_ids.insert(plugin_id.clone());
+        if positions[&index] == policy_gate_position.unwrap_or(usize::MAX) {
+            policy_gate_complete = true;
+        }
+        match prepared {
+            Ok(prepared) => {
+                live_host.publish(Arc::new(prepared.host))?;
+                on_update(ProgressivePluginLoadUpdate::Ready {
+                    plugin_id,
+                    startup_events: prepared.startup_events,
+                    ui_declarations: prepared.ui_declarations,
+                    load_duration_ms: prepared.load_duration_ms,
+                });
             }
             Err(error) => {
                 failed_ids.insert(plugin_id.clone());
