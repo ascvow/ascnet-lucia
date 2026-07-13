@@ -389,4 +389,4 @@ async fn save(
 
 需要后台并发、父子身份、私有会话续跑、profile 权限收缩、token/时间上限或级联取消时，使用 `agent-runtime`。Runtime 负责通用生命周期；workflow、teammate 消息和多 Agent 编排规则仍应位于插件。
 
-继续阅读 [Agent Runtime](/agent/agent-runtime)和[架构边界](/guide/architecture)。完整符号和 Rustdoc 生成方法见 [Rust API 索引](/reference/rust-api)。
+继续阅读 [Agent Runtime](/agent/agent-runtime)和[架构边界](/guide/architecture)。按函数查询时使用 [Core、工具、会话与 Runtime API](/reference/rust-core)。

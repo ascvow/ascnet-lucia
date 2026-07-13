@@ -21,19 +21,19 @@ lucia --demo
 
 首次运行会创建 `$HOME/.lucia/config.toml`。没有可用模型密钥时，`lucia` 会进入本地演示模式。
 
-## 使用
+## 用户指南
 
 - [TUI 使用](docs/usage/tui.md)：安装、启动、模型配置、会话、输入与插件界面。
 - [CLI 使用](docs/usage/cli.md)：启动参数、会话参数、诊断命令及参数优先级。
 - [插件管理](docs/usage/plugin-management.md)：搜索、安装、更新、启停、删除和独占能力选择。
 - [其他使用方式](docs/usage/other.md)：离线示例、构建分发、诊断、事件日志和真实模型测试。
 
-## 开发
+## 开发者指南
 
 - [插件开发](docs/development/plugin.md)：插件工程、`AgentPlugin` 生命周期函数、Host API、manifest、构建与测试。
 - [二次开发](docs/development/custom.md)：嵌入 Core、配置模型、注册工具、运行 Agent、控制任务与持久化会话。
 
-开发章节不只是 API 名称索引。每个主要函数都说明用途、参数含义、返回值、错误条件和副作用；完整符号列表仍可在 [Rust API 索引](docs/reference/rust-api.md)中查询。
+开发章节不只是 API 名称索引。每个主要函数都说明用途、参数含义、返回值、错误条件和副作用；按模块查询时从 [Rust API 手册](docs/reference/rust-api.md)进入。
 
 ## 模块边界
 
@@ -47,13 +47,4 @@ lucia --demo
   -> agent-plugin        Guest SDK、共享协议类型和导出宏
 ```
 
-具体插件协议属于独立插件，不进入 Core 或 Host。修改跨 crate 行为前先阅读[架构边界](docs/guide/architecture.md)；修改 WIT 或公共 JSON 类型前阅读 [WIT ABI 0.6](docs/reference/wit.md)。
-
-## 文档开发
-
-```bash
-bun install
-bun run docs:dev
-```
-
-生产构建使用 `bun run docs:build`，Rustdoc 使用 `bun run docs:rust`。
+具体插件协议属于独立插件，不进入 Core 或 Host。修改跨 crate 行为前先阅读[架构边界](docs/guide/architecture.md)；修改 WIT 或公共 JSON 类型前阅读 [WIT API](docs/reference/wit.md)。

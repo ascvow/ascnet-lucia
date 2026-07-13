@@ -14,7 +14,7 @@ export default defineConfig({
   themeConfig: {
     nav: [
       {
-        text: "使用",
+        text: "用户指南",
         items: [
           { text: "TUI 使用", link: "/usage/tui" },
           { text: "CLI 使用", link: "/usage/cli" },
@@ -23,25 +23,26 @@ export default defineConfig({
         ],
       },
       {
-        text: "开发",
+        text: "开发者指南",
         items: [
           { text: "插件开发", link: "/development/plugin" },
           { text: "二次开发", link: "/development/custom" },
         ],
       },
       {
-        text: "参考",
+        text: "API 参考",
         items: [
-          { text: "架构边界", link: "/guide/architecture" },
-          { text: "Rust API", link: "/reference/rust-api" },
-          { text: "WIT ABI", link: "/reference/wit" },
+          { text: "Rust API 总览", link: "/reference/rust-api" },
+          { text: "Core 与 Runtime API", link: "/reference/rust-core" },
+          { text: "插件 API", link: "/reference/rust-plugin" },
+          { text: "WIT API 0.6", link: "/reference/wit" },
         ],
       },
     ],
     sidebar: {
       "/usage/": [
         {
-          text: "使用",
+          text: "用户指南",
           items: [
             { text: "TUI 使用", link: "/usage/tui" },
             { text: "CLI 使用", link: "/usage/cli" },
@@ -52,7 +53,7 @@ export default defineConfig({
       ],
       "/development/": [
         {
-          text: "开发",
+          text: "开发者指南",
           items: [
             { text: "插件开发", link: "/development/plugin" },
             { text: "二次开发", link: "/development/custom" },
@@ -115,10 +116,12 @@ export default defineConfig({
       ],
       "/reference/": [
         {
-          text: "参考",
+          text: "API 参考",
           items: [
-            { text: "Rust API 索引", link: "/reference/rust-api" },
-            { text: "WIT ABI 0.6", link: "/reference/wit" },
+            { text: "Rust API 总览", link: "/reference/rust-api" },
+            { text: "Core 与 Runtime API", link: "/reference/rust-core" },
+            { text: "插件 API", link: "/reference/rust-plugin" },
+            { text: "WIT API 0.6", link: "/reference/wit" },
           ],
         },
       ],

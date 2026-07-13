@@ -1,6 +1,6 @@
 # 其他使用方式
 
-本章收录不属于日常 TUI、CLI 参数或插件管理的运行方式，包括离线示例、不同分发形态、诊断、事件排障、真实模型测试和文档预览。
+本章收录不属于日常 TUI、CLI 参数或插件管理的运行方式，包括离线示例、不同分发形态、诊断、事件排障和真实模型测试。
 
 ## 离线 CLI 示例
 
@@ -92,25 +92,3 @@ bun run perf:plugin:wasm
 ```
 
 Host 微基准用于比较组合、路由和 UI 开销；WASM 性能示例覆盖真实 component 边界。需要把阈值作为失败门禁时运行 `bun run perf:plugin:gate`。
-
-## 本地文档
-
-```bash
-bun install
-bun run docs:dev
-```
-
-生产构建和预览：
-
-```bash
-bun run docs:build
-bun run docs:preview
-```
-
-生成 Rust API 文档：
-
-```bash
-bun run docs:rust
-# 包含私有项
-bun run docs:rust:private
-```
