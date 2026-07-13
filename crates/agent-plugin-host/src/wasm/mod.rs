@@ -50,7 +50,9 @@ pub use engine::WasmPluginLimits;
 use engine::{shared_wasm_engine, IntoAnyhow, PluginWasiState};
 
 #[cfg(test)]
-use loader::{failed_required_dependencies, resilient_dependency_plan};
+use loader::{
+    failed_required_dependencies, prioritize_progressive_order, resilient_dependency_plan,
+};
 pub use loader::{
     load_wasm_plugins, load_wasm_plugins_progressively_with_selection_and_services,
     load_wasm_plugins_resilient, load_wasm_plugins_resilient_with_selection,
@@ -1227,5 +1229,46 @@ mod tests {
         assert!(failures
             .iter()
             .all(|failure| failure.reason.contains("循环")));
+    }
+
+    /// 关键能力 owner 应提前加载，同时保持其必选依赖位于 owner 之前。
+    #[test]
+    fn progressive_order_prioritizes_critical_owner_with_dependencies() {
+        let manifest = |id: &str, dependency_id: Option<&str>| PluginManifest {
+            plugin: PluginSection {
+                id: id.into(),
+                name: id.into(),
+                version: "1.0.0".into(),
+                api_version: SUPPORTED_PLUGIN_API_VERSION.into(),
+                wasm: format!("{id}.wasm"),
+                description: None,
+            },
+            dependencies: dependency_id
+                .map(|dependency_id| PluginDependency {
+                    id: dependency_id.into(),
+                    version: "*".into(),
+                    optional: false,
+                })
+                .into_iter()
+                .collect(),
+            provides: Vec::new(),
+            capabilities: Default::default(),
+            metadata: HashMap::new(),
+        };
+        let manifests = vec![
+            manifest("command", None),
+            manifest("policy-support", None),
+            manifest("sandbox", Some("policy-support")),
+            manifest("mcp", None),
+        ];
+
+        let order =
+            prioritize_progressive_order(&manifests, &[0, 1, 2, 3], &["sandbox".to_string()]);
+        let ids = order
+            .iter()
+            .map(|index| manifests[*index].plugin.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["policy-support", "sandbox", "command", "mcp"]);
     }
 }

@@ -1332,6 +1332,35 @@ mod tests {
         assert_eq!(first_calls.load(Ordering::SeqCst), 0);
     }
 
+    /// 并发加载完成顺序不得改变计划中的工具顺序。
+    #[tokio::test]
+    async fn live_host_publishes_plugins_in_planned_order() {
+        let live = LivePluginHost::new();
+        live.set_plugin_order(&["first".into(), "second".into()])
+            .expect("设置稳定计划顺序");
+        live.publish(Arc::new(CountingPluginHost {
+            id: "second",
+            tool: ToolSpec::new("second_tool", "第二个工具", json!({"type": "object"})),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }))
+        .expect("先发布后完成插件");
+        live.publish(Arc::new(CountingPluginHost {
+            id: "first",
+            tool: ToolSpec::new("first_tool", "第一个工具", json!({"type": "object"})),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }))
+        .expect("后发布先计划插件");
+
+        let tools = live
+            .list_tools()
+            .await
+            .expect("读取稳定工具顺序")
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(tools, vec!["first_tool", "second_tool"]);
+    }
+
     /// 独占工具策略 owner 尚未 Ready 时必须阻止工具，不能在加载窗口绕过策略。
     #[tokio::test]
     async fn live_host_blocks_tools_until_selected_policy_is_ready() {
