@@ -2,6 +2,32 @@
 
 use super::*;
 
+/// 终端状态守卫：正常退出、`?` 提前返回或 panic 展开时都恢复终端。
+///
+/// raw mode 或 bracketed paste 残留会让外层 shell 换行不回车、粘贴出现
+/// 转义序列，且 `clear` 无法恢复，因此恢复必须挂在 Drop 上而不是顺序代码。
+struct TerminalGuard {
+    /// 启动时是否推送了键盘增强协议，退出时需要对应弹出。
+    keyboard_enhanced: bool,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.keyboard_enhanced {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::PopKeyboardEnhancementFlags
+            );
+        }
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableBracketedPaste,
+            crossterm::event::DisableMouseCapture
+        );
+        ratatui::restore();
+    }
+}
+
 pub(crate) async fn run(args: Args) -> Result<()> {
     let workspace = WorkspaceContext::capture()?;
     let config_path = resolve_config_path(args.config.as_deref())?;
@@ -154,17 +180,34 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     #[cfg(feature = "plugins")]
     let plugin_agent_template = AgentTemplate::from_agent(&base_agent);
     #[cfg(feature = "plugins")]
-    let mut pending_agent = Some(base_agent);
+    let live_plugin_host = Arc::new(LivePluginHost::new());
     #[cfg(feature = "plugins")]
-    let mut agent: Option<Arc<Agent>> = None;
+    let agent = Some(Arc::new(
+        base_agent
+            .with_extension(live_plugin_host.clone())
+            .with_context_loader(live_plugin_host.clone()),
+    ));
     #[cfg(not(feature = "plugins"))]
     let agent = Some(Arc::new(base_agent));
     #[cfg(feature = "plugins")]
-    let mut plugin_host: Option<Arc<CompositePluginHost>> = None;
+    let plugin_host = Some(Arc::clone(&live_plugin_host));
     #[cfg(feature = "plugins")]
     let loading_plugin_ids = plugin_manifest_ids(&plugin_manifests);
 
     let mut terminal = ratatui::init();
+    // 键盘增强协议让 Shift+Enter 等修饰组合可被区分（传统协议下它就是裸 Enter）。
+    // 该查询会读取终端应答，必须在输入读取线程启动前完成，否则应答被线程吞掉。
+    let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        );
+    }
+    // 守卫覆盖所有退出路径，包括 draw 失败的 `?` 提前返回。
+    let terminal_guard = TerminalGuard { keyboard_enhanced };
     // 默认保留终端原生鼠标选择，用户可通过 Ctrl+T 启用滚轮滚动。
     // 启用 bracketed paste，将拖入的文件路径识别为附件
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
@@ -198,6 +241,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
 
     let mut app = App::new(tx.clone(), model_name)
         .with_workspace(workspace)
+        .with_context_window(tui_settings.context_window)
         .with_persistent_session(session_store, session_record);
     app.messages.extend(
         startup_notices
@@ -208,11 +252,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let plugin_load_task = {
         app = app.with_loading_plugins(loading_plugin_ids);
         let load_tx = tx.clone();
+        let load_host = Arc::clone(&live_plugin_host);
         tokio::spawn(async move {
             let result = load_plugins_for_tui(
                 plugin_manifests,
                 capability_selection,
                 plugin_agent_template,
+                load_host,
+                load_tx.clone(),
             )
             .await;
             let _ = load_tx.send(UiEvent::PluginsLoaded(Box::new(result)));
@@ -234,9 +281,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                     .trim_start()
                                     .strip_prefix('/')
                                     .is_some_and(|body| body.chars().any(char::is_whitespace));
+                            // 带修饰键的 Enter 是换行手势，必须留给输入编辑器。
                             let command_submission = matches!(key.code, KeyCode::Enter)
+                                && key.modifiers.is_empty()
                                 && app.input.trim_start().starts_with('/');
-                            if argument_completion && !app.plugins_loading {
+                            let command_ready = plugin_host.as_ref().is_some_and(|host| {
+                                host.is_ready(PROVIDER_PLUGIN_ID).unwrap_or(false)
+                            });
+                            if argument_completion && command_ready {
                                 if !app.apply_selected_command_completion()
                                     && !app.command_completion_loading
                                 {
@@ -249,7 +301,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                         ));
                                     }
                                 }
-                            } else if command_submission && !app.plugins_loading {
+                            } else if command_submission && command_ready {
                                 if let Some(input) = app.take_input() {
                                     if let Some(host) = plugin_host.as_ref() {
                                         if let Err(error) =
@@ -267,6 +319,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                         ));
                                     }
                                 }
+                            } else if command_submission {
+                                app.messages.push(Msg::new(
+                                    MsgKind::Info,
+                                    "Command 插件仍在加载，命令已保留在输入框",
+                                ));
                             } else {
                                 app.handle_key(key.code, key.modifiers, agent.as_ref());
                             }
@@ -321,48 +378,62 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             #[cfg(feature = "plugins")]
-            Some(UiEvent::PluginsLoaded(result)) => {
-                let mut ready_agent = pending_agent.take().expect("插件加载完成事件只能处理一次");
-                match *result {
-                    Ok(loaded) => {
-                        ready_agent.set_extension(loaded.host.clone());
-                        ready_agent.set_context_loader(loaded.host.clone());
-                        app.set_plugin_views(loaded.plugin_views);
-                        for event in &loaded.startup_events {
-                            if let Err(error) = apply_plugin_navigation_event(&mut app, event) {
-                                app.messages.push(Msg::new(
-                                    MsgKind::Error,
-                                    format!("插件视图导航失败：{error}"),
-                                ));
-                            }
+            Some(UiEvent::PluginLoadUpdate(update)) => match update {
+                ProgressivePluginLoadUpdate::Ready {
+                    plugin_id,
+                    startup_events,
+                    ui_declarations,
+                } => {
+                    app.mark_plugin_ready(plugin_id.clone(), &startup_events);
+                    app.add_plugin_views(ui_declarations);
+                    for event in &startup_events {
+                        if let Err(error) = apply_plugin_navigation_event(&mut app, event) {
+                            app.messages.push(Msg::new(
+                                MsgKind::Error,
+                                format!("插件视图导航失败：{error}"),
+                            ));
                         }
-                        app.finish_plugin_loading(
-                            loaded.plugin_ids,
-                            loaded.startup_events,
-                            loaded.failures,
-                        );
-                        match load_command_snapshot(loaded.host.as_ref()).await {
+                    }
+                    if plugin_id == PROVIDER_PLUGIN_ID {
+                        match load_command_snapshot(
+                            plugin_host.as_ref().expect("动态插件宿主必须存在").as_ref(),
+                        )
+                        .await
+                        {
                             Ok(snapshot) => app.set_command_snapshot(snapshot),
                             Err(error) => app.messages.push(Msg::new(
                                 MsgKind::Error,
                                 format!("Command 命令快照加载失败：{error}"),
                             )),
                         }
-                        refresh_plugin_views(&mut app, loaded.host.as_ref()).await;
-                        plugin_host = Some(loaded.host);
                     }
-                    Err(error) => {
-                        app.set_plugin_load_error(&error);
-                        app.messages.push(Msg::new(
-                            MsgKind::Error,
-                            format!("插件加载失败，已切换为 Core Agent：{error}"),
-                        ));
+                    if let Some(host) = plugin_host.as_ref() {
+                        if let Err(error) = host.ui_declarations().await {
+                            app.messages.push(Msg::new(
+                                MsgKind::Error,
+                                format!("插件 UI 声明刷新失败：{error}"),
+                            ));
+                        }
+                        refresh_plugin_views(&mut app, host.as_ref()).await;
                     }
                 }
-                let ready_agent = Arc::new(ready_agent);
-                app.run_next_queued(&ready_agent);
-                agent = Some(ready_agent);
-            }
+                ProgressivePluginLoadUpdate::Failed(failure) => {
+                    app.mark_plugin_failed(failure);
+                }
+            },
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::PluginsLoaded(result)) => match *result {
+                Ok(()) => {
+                    app.finish_progressive_plugin_loading();
+                }
+                Err(error) => {
+                    app.set_progressive_plugin_load_error(&error);
+                    app.messages.push(Msg::new(
+                        MsgKind::Error,
+                        format!("插件加载规划失败，已保留当前 Ready 插件：{error}"),
+                    ));
+                }
+            },
             #[cfg(feature = "plugins")]
             Some(UiEvent::CommandSurfaceUpdate { request_id, status }) => {
                 if let Some(host) = plugin_host.as_ref() {
@@ -457,8 +528,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 name,
                 is_error,
                 result,
+                detail,
             }) => {
-                // 把对应的"运行中"条目更新为最终状态，并挂上返回内容摘要
+                // 把对应的"运行中"条目更新为最终状态，并挂上返回内容预览
                 let kind = if is_error {
                     MsgKind::ToolError
                 } else {
@@ -473,9 +545,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 {
                     msg.kind = kind;
                     msg.result = result;
+                    msg.detail = detail;
                 } else {
                     let mut msg = Msg::new(kind, name);
                     msg.result = result;
+                    msg.detail = detail;
                     app.messages.push(msg);
                 }
             }
@@ -643,9 +717,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         None
     };
 
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
-    ratatui::restore();
+    // 终端恢复由 TerminalGuard 的 Drop 统一执行。
+    drop(terminal_guard);
     #[cfg(feature = "plugins")]
     if let Some(error) = plugin_shutdown_error {
         return Err(error);

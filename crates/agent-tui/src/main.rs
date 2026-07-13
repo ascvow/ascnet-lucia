@@ -21,8 +21,6 @@ use conversation::*;
 use plugin_startup::*;
 use session_coordination::*;
 
-#[cfg(feature = "plugins")]
-use agent_core::AgentExtension;
 use agent_core::{
     config::AgentRootConfig,
     event::{AgentEvent, AgentEventKind, CompositeEventSink, EventSink, JsonlEventSink},
@@ -41,8 +39,11 @@ use agent_plugin_host::{
         UiColor, UiDeclaration, UiFrame as PluginUiFrame, UiInput, UiInputEvent, UiLine,
         UiNavigationRequest, UiPlacement, UiRenderRequest, UiSpan, UiStyle, UI_NAVIGATION_EVENT,
     },
-    wasm::{load_wasm_plugins_resilient_with_selection_and_services, PluginLoadFailure},
-    CompositePluginHost, PluginHost, PluginHostServices, PluginServiceCall,
+    wasm::{
+        load_wasm_plugins_progressively_with_selection_and_services, PluginLoadFailure,
+        ProgressivePluginLoadUpdate,
+    },
+    LivePluginHost, PluginHost, PluginHostServices, PluginServiceCall,
 };
 #[cfg(feature = "plugins")]
 use agent_runtime::{
@@ -183,13 +184,16 @@ struct PluginArgs {
 #[cfg(feature = "plugins")]
 #[derive(Debug, Subcommand)]
 enum PluginCommand {
-    /// 从 GitHub Release 或本地 bundle 安装插件。
+    /// 从 Registry、GitHub Release 或本地 bundle 安装插件。
     Install {
-        /// 裸名称、owner/repository、GitHub URL 或本地 bundle 路径。
+        /// Registry 的 name[@semver]、GitHub 仓库或本地 bundle 路径。
         source: String,
         /// 从本地 bundle 目录安装，不访问 GitHub。
         #[arg(long)]
         local: bool,
+        /// 将来源按 GitHub owner/repository 或 URL 解析，绕过 Registry。
+        #[arg(long)]
+        github: bool,
         /// 指定 GitHub Release tag；默认使用 latest release。
         #[arg(long)]
         tag: Option<String>,
@@ -199,6 +203,19 @@ enum PluginCommand {
         /// 安装完成后保持禁用状态。
         #[arg(long)]
         disabled: bool,
+    },
+    /// 搜索官方 Registry 中当前 ABI 可安装的插件。
+    Search {
+        /// 按插件名称或说明过滤；省略时列出全部插件。
+        #[arg(default_value = "")]
+        query: String,
+    },
+    /// 列出 Registry 中存在更高兼容版本的已安装插件。
+    Outdated,
+    /// 将一个或全部已安装插件更新到 Registry 最新兼容版本。
+    Update {
+        /// 要更新的插件 ID；省略时更新全部可更新插件。
+        id: Option<String>,
     },
     /// 列出全部受管理插件。
     List,
@@ -247,8 +264,10 @@ enum UiEvent {
     ToolFinished {
         name: String,
         is_error: bool,
-        /// 返回内容的单行摘要。
+        /// 返回内容的首行摘要。
         result: String,
+        /// 返回内容的后续预览行。
+        detail: Vec<String>,
     },
     ToolSkipped(String),
     SteeringInjected,
@@ -284,10 +303,12 @@ enum UiEvent {
         generation: u64,
         result: Box<Result<Option<ResolvedCommandCompletion>>>,
     },
-    /// Background plugin loading completed and can now be attached to the pending Agent.
-    /// 后台插件加载结束，可挂载到等待中的 Agent。
+    /// 单个插件的渐进加载状态已经提交到动态宿主。
     #[cfg(feature = "plugins")]
-    PluginsLoaded(Box<Result<LoadedPlugins>>),
+    PluginLoadUpdate(ProgressivePluginLoadUpdate),
+    /// 后台渐进加载全部结束，或全局规划失败。
+    #[cfg(feature = "plugins")]
+    PluginsLoaded(Box<Result<()>>),
 }
 
 /// 一次用户输入从先行持久化到模型运行结束的完整结果。
@@ -319,23 +340,6 @@ struct ResolvedCommandCompletion {
     items: Vec<CompletionItem>,
 }
 
-/// Plugin runtime data prepared off the TUI event loop.
-///
-/// 在 TUI 事件循环之外准备完成的插件运行时数据。
-#[cfg(feature = "plugins")]
-struct LoadedPlugins {
-    /// Composite host containing every successfully activated plugin. 已激活插件的组合宿主。
-    host: Arc<CompositePluginHost>,
-    /// Stable plugin IDs in dependency-resolved load order. 按依赖解析顺序排列的稳定插件 ID。
-    plugin_ids: Vec<String>,
-    /// UI declarations collected after activation. 激活后收集的 UI 声明。
-    plugin_views: Vec<UiDeclaration>,
-    /// Activation events consumed before the first Agent run. 首次 Agent 运行前消费的激活事件。
-    startup_events: Vec<Value>,
-    /// Plugins excluded by activation failures or required dependencies. 因激活或必选依赖失败而被剔除的插件。
-    failures: Vec<PluginLoadFailure>,
-}
-
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// 原生 TUI 调用 Command Provider 时使用的稳定身份。
 #[cfg(feature = "plugins")]
@@ -353,18 +357,16 @@ const COLOR_BORDER_FOCUS: Color = Color::Rgb(112, 110, 104);
 const COLOR_TEXT: Color = Color::Rgb(224, 222, 216);
 /// 次要文字和边框颜色。
 const COLOR_MUTED: Color = Color::Rgb(124, 122, 116);
-/// 用户消息强调色。
-const COLOR_USER: Color = Color::Rgb(104, 190, 126);
+/// 用户消息强调色：露西亚主题绯红。
+const COLOR_USER: Color = Color::Rgb(226, 61, 82);
 /// 成功状态颜色。
 const COLOR_SUCCESS: Color = Color::Rgb(104, 190, 126);
 /// 运行和等待状态颜色。
 const COLOR_WARNING: Color = Color::Rgb(197, 164, 103);
 /// 错误状态颜色。
 const COLOR_DANGER: Color = Color::Rgb(205, 101, 101);
-/// 用户消息块背景色，用于与助手正文区分。
-const COLOR_USER_BG: Color = Color::Rgb(42, 56, 46);
-/// 状态栏品牌块前景色，配合 COLOR_USER 背景使用。
-const COLOR_CHIP_FG: Color = Color::Rgb(28, 30, 28);
+/// 用户消息块背景色：与绯红强调同系的暗红灰，用于与助手正文区分。
+const COLOR_USER_BG: Color = Color::Rgb(58, 38, 43);
 /// Number of 80 ms UI ticks before startup plugin details collapse into the compact counter.
 /// 启动插件详情收敛为紧凑计数前保留的 80 毫秒 UI tick 数。
 #[cfg(feature = "plugins")]

@@ -2,7 +2,7 @@
 
 use super::{lucia_home_dir, PluginArgs, PluginCommand};
 use agent_plugin_manager::{
-    GithubInstallOptions, GithubPluginSource, InstallOptions, PluginManager,
+    GithubInstallOptions, GithubPluginSource, InstallOptions, PluginManager, RegistryRequest,
 };
 use anyhow::{bail, Result};
 use std::path::Path;
@@ -14,10 +14,14 @@ pub(crate) async fn run(args: PluginArgs) -> Result<()> {
         PluginCommand::Install {
             source,
             local,
+            github,
             tag,
             asset,
             disabled,
         } => {
+            if local && github {
+                bail!("--local 与 --github 不能同时使用");
+            }
             if local {
                 if tag.is_some() || asset.is_some() {
                     bail!("本地安装不能使用 --tag 或 --asset");
@@ -32,7 +36,7 @@ pub(crate) async fn run(args: PluginArgs) -> Result<()> {
                     plugin.version,
                     state_label(plugin.enabled)
                 );
-            } else {
+            } else if github {
                 let github = GithubPluginSource::parse(&source)?;
                 let result = manager
                     .install_github(
@@ -60,6 +64,69 @@ pub(crate) async fn run(args: PluginArgs) -> Result<()> {
                         "警告：Release 未提供 {}.sha256，已记录安装后 bundle 摘要",
                         result.asset_name
                     );
+                }
+            } else {
+                if tag.is_some() || asset.is_some() {
+                    bail!("Registry 安装不能使用 --tag 或 --asset；任意 Release 请增加 --github");
+                }
+                let request = RegistryRequest::parse(&source)?;
+                let result = manager.install_registry(&request, !disabled).await?;
+                if result.already_satisfied {
+                    println!("{} 已安装且满足 {}", result.requested, request.requirement);
+                } else {
+                    for plugin in result.installed {
+                        println!(
+                            "已安装 {} {}（{}）",
+                            plugin.id,
+                            plugin.version,
+                            state_label(plugin.enabled)
+                        );
+                    }
+                }
+            }
+        }
+        PluginCommand::Search { query } => {
+            let results = manager.search_registry(&query).await?;
+            if results.is_empty() {
+                println!("Registry 中没有匹配插件");
+            } else {
+                for plugin in results {
+                    let ownership = if plugin.official {
+                        "官方"
+                    } else {
+                        "第三方"
+                    };
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        plugin.name,
+                        plugin.latest_version,
+                        ownership,
+                        plugin.publisher,
+                        plugin.description
+                    );
+                }
+            }
+        }
+        PluginCommand::Outdated => {
+            let plugins = manager.outdated_registry().await?;
+            if plugins.is_empty() {
+                println!("已安装插件均为 Registry 中的最新兼容版本");
+            } else {
+                for plugin in plugins {
+                    println!(
+                        "{}\t{} -> {}",
+                        plugin.name, plugin.current_version, plugin.latest_version
+                    );
+                }
+            }
+        }
+        PluginCommand::Update { id } => {
+            let result = manager.update_registry(id.as_deref()).await?;
+            if result.updated.is_empty() {
+                println!("没有可更新的 Registry 插件");
+            } else {
+                for plugin in result.updated {
+                    println!("已更新 {} 到 {}", plugin.id, plugin.version);
                 }
             }
         }

@@ -9,6 +9,8 @@ pub(crate) struct WorkspaceContext {
     pub(crate) cwd: PathBuf,
     /// 用于隔离项目会话空间的稳定摘要。
     pub(crate) project_id: String,
+    /// 启动时探测到的 git 分支；非仓库为 `None`。
+    pub(crate) git_branch: Option<String>,
 }
 
 impl WorkspaceContext {
@@ -16,7 +18,12 @@ impl WorkspaceContext {
     pub(crate) fn capture() -> Result<Self> {
         let cwd = std::env::current_dir()?.canonicalize()?;
         let project_id = workspace_project_id(&cwd);
-        Ok(Self { cwd, project_id })
+        let git_branch = detect_git_branch(&cwd);
+        Ok(Self {
+            cwd,
+            project_id,
+            git_branch,
+        })
     }
 
     /// 创建尚未落盘的空白会话记录，并绑定当前项目标识。
@@ -38,6 +45,39 @@ impl WorkspaceContext {
     pub(crate) fn sessions_dir(&self, root: &Path) -> PathBuf {
         root.join(&self.project_id).join("sessions")
     }
+}
+
+/// 读取工作目录所属 git 仓库的当前分支；非仓库或读取失败返回 `None`。
+///
+/// 自当前目录向上查找 `.git`，兼容 worktree（`.git` 为指向真实 gitdir 的
+/// 文件）；detached HEAD 显示提交短哈希。仅在启动时读取一次。
+pub(crate) fn detect_git_branch(cwd: &Path) -> Option<String> {
+    let mut dir = cwd;
+    let git_path = loop {
+        let candidate = dir.join(".git");
+        if candidate.exists() {
+            break candidate;
+        }
+        dir = dir.parent()?;
+    };
+    let head_path = if git_path.is_dir() {
+        git_path.join("HEAD")
+    } else {
+        let content = std::fs::read_to_string(&git_path).ok()?;
+        let gitdir = PathBuf::from(content.strip_prefix("gitdir:")?.trim());
+        let base = if gitdir.is_absolute() {
+            gitdir
+        } else {
+            dir.join(gitdir)
+        };
+        base.join("HEAD")
+    };
+    let head = std::fs::read_to_string(head_path).ok()?;
+    let head = head.trim();
+    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+        return Some(branch.to_string());
+    }
+    Some(head.chars().take(8).collect())
 }
 
 /// 使用操作系统原始路径表示生成稳定项目标识，避免有损字符串转换造成目录碰撞。
@@ -201,16 +241,25 @@ pub(crate) fn restore_session_messages(session: &Session) -> Vec<Msg> {
                     } else {
                         MsgKind::ToolOk
                     };
-                    let summary = summarize_json(&result.content, 96);
+                    // 与实时路径一致：首行作摘要，其余行作缩进预览。
+                    let mut lines =
+                        tool_result_lines(&result.content, TOOL_RESULT_PREVIEW_LINES, 96);
+                    let summary = if lines.is_empty() {
+                        String::new()
+                    } else {
+                        lines.remove(0)
+                    };
                     if let Some(restored) = messages.iter_mut().rev().find(|candidate| {
                         matches!(candidate.kind, MsgKind::ToolRunning)
                             && candidate.text == result.name
                     }) {
                         restored.kind = kind;
                         restored.result = (!summary.is_empty()).then_some(summary);
+                        restored.detail = lines;
                     } else {
                         let mut restored = Msg::new(kind, result.name.clone());
                         restored.result = (!summary.is_empty()).then_some(summary);
+                        restored.detail = lines;
                         messages.push(restored);
                     }
                 }

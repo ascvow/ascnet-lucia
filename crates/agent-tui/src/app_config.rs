@@ -23,6 +23,7 @@ base_url = "https://api.openai.com/v1"
 model = "gpt-5"
 api_key = ""
 # api_key_env = "OPENAI_API_KEY"
+# context_window = 200000
 openai_protocol = "responses"
 
 [agent]
@@ -39,6 +40,9 @@ sessions_dir = "projects"
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct TuiSettings {
+    /// 模型上下文窗口，仅供状态栏计算占比，不传入模型请求。
+    #[serde(skip)]
+    pub(crate) context_window: Option<u64>,
     /// 会话目录；相对路径以配置文件目录为基准。
     pub(crate) sessions_dir: Option<PathBuf>,
     /// 旧版默认会话 ID；仅为兼容已有配置保留，普通启动不再自动恢复。
@@ -53,7 +57,16 @@ pub(crate) struct TuiSettings {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct TuiConfigEnvelope {
+    model: TuiModelSettings,
     tui: TuiSettings,
+}
+
+/// TUI 从 `[model]` 读取的展示元数据，不参与 Core 模型网关配置。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct TuiModelSettings {
+    /// 模型上下文窗口 token 上限；零值视为未配置。
+    context_window: Option<u64>,
 }
 
 /// 返回 Lucia 应用数据目录。
@@ -121,7 +134,9 @@ pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
         .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
     let config: TuiConfigEnvelope =
         toml::from_str(&text).with_context(|| format!("解析 TUI 配置失败：{}", path.display()))?;
-    Ok(config.tui)
+    let mut settings = config.tui;
+    settings.context_window = config.model.context_window.filter(|window| *window > 0);
+    Ok(settings)
 }
 
 /// 以配置文件所在目录为基准解析应用路径。
@@ -208,12 +223,34 @@ mod tests {
 
         let settings = load_tui_settings(&path).expect("模板应可解析");
         assert_eq!(settings.sessions_dir, Some(PathBuf::from("projects")));
+        assert_eq!(settings.context_window, None);
         assert_eq!(settings.default_session, None);
         assert!(!settings.resume_latest);
 
         let error = initialize_config(&path).expect_err("重复初始化必须拒绝覆盖");
         assert!(error.to_string().contains("未覆盖"));
         fs::remove_dir_all(root).expect("清理测试目录");
+    }
+
+    /// 模型上下文窗口由 TUI 作为展示元数据读取，零值按未配置处理。
+    #[test]
+    fn loads_model_context_window_for_status_display() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("创建配置测试目录");
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "[model]\ncontext_window = 200000\n[tui]\nsessions_dir = \"sessions\"\n",
+        )
+        .expect("写入上下文窗口配置");
+
+        let settings = load_tui_settings(&path).expect("读取上下文窗口配置");
+        assert_eq!(settings.context_window, Some(200_000));
+
+        fs::write(&path, "[model]\ncontext_window = 0\n").expect("写入零窗口配置");
+        let settings = load_tui_settings(&path).expect("读取零窗口配置");
+        assert_eq!(settings.context_window, None);
+        fs::remove_dir_all(root).expect("清理配置测试目录");
     }
 
     /// TUI 路径必须相对配置文件目录解析，而不是相对启动工作目录。

@@ -78,15 +78,18 @@ pub(crate) fn plugin_manifest_ids(manifests: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// Loads and activates plugins away from the TUI event loop.
+/// 在 TUI 事件循环之外渐进加载插件，并把每个 Ready/Failed 状态立即发回主循环。
 ///
-/// 在 TUI 事件循环之外加载并激活插件；后续准备失败时会主动关闭已创建的宿主。
+/// 全局 manifest、依赖或能力规划错误会终止加载；单插件激活失败由 Host 转换为
+/// `PluginLoadUpdate`，不会撤销此前已经发布的无关插件。
 #[cfg(feature = "plugins")]
 pub(crate) async fn load_plugins_for_tui(
     manifests: Vec<PathBuf>,
     capability_selection: HashMap<String, String>,
     agent_template: AgentTemplate,
-) -> Result<LoadedPlugins> {
+    live_host: Arc<LivePluginHost>,
+    tx: mpsc::UnboundedSender<UiEvent>,
+) -> Result<()> {
     let runtime =
         AgentRuntime::new(RuntimeLimits::default()).context("创建 TUI Agent Runtime 失败")?;
     let controller_profile =
@@ -104,33 +107,15 @@ pub(crate) async fn load_plugins_for_tui(
         controller_profile,
         HashMap::from([("worker".to_string(), AgentDeriveConfig::default())]),
     )?;
-    let report = load_wasm_plugins_resilient_with_selection_and_services(
+    let _failures = load_wasm_plugins_progressively_with_selection_and_services(
         &manifests,
         &capability_selection,
         host_services,
+        live_host.as_ref(),
+        |update| {
+            let _ = tx.send(UiEvent::PluginLoadUpdate(update));
+        },
     )
     .await?;
-    let host = Arc::new(report.host);
-    let failures = report.failures;
-    let prepared = async {
-        let plugin_ids = host
-            .host_ids()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let plugin_views = host.ui_declarations().await?;
-        let startup_events = host.drain_events().await?;
-        Ok(LoadedPlugins {
-            host: host.clone(),
-            plugin_ids,
-            plugin_views,
-            startup_events,
-            failures,
-        })
-    }
-    .await;
-    if prepared.is_err() {
-        let _ = host.shutdown().await;
-    }
-    prepared
+    Ok(())
 }

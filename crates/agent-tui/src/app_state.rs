@@ -49,7 +49,13 @@ pub(crate) struct App {
     pub(crate) queued_run_active: bool,
     /// 光标在 input 中的字节偏移。
     pub(crate) cursor: usize,
+    /// 最近成功提交的输入，供空输入框使用上下方向键回溯。
+    pub(crate) input_history: Vec<String>,
+    /// 当前回溯到的历史下标；`None` 表示正在编辑新输入。
+    pub(crate) input_history_cursor: Option<usize>,
     pub(crate) running: bool,
+    /// 当前运行的起始时间，用于渲染运行耗时。
+    pub(crate) run_started_at: Option<std::time::Instant>,
     pub(crate) should_quit: bool,
     /// 下一轮使用的完整会话记录；最终保存失败时可暂存 dirty 完成态。
     pub(crate) session_record: SessionRecord,
@@ -64,8 +70,12 @@ pub(crate) struct App {
     pub(crate) scroll: Option<u16>,
     /// 上一帧计算出的最大滚动偏移，供滚动操作作为起点。
     pub(crate) last_max_scroll: u16,
+    /// 最近一次渲染得到的消息区高度，用于整页滚动。
+    pub(crate) last_viewport: u16,
     /// 最近一次模型请求消耗的上下文 token 数。
     pub(crate) context_tokens: Option<u64>,
+    /// 配置的模型上下文窗口，用于状态栏计算占比。
+    pub(crate) context_window: Option<u64>,
     /// 鼠标捕获是否开启；默认关闭以便终端可原生选择复制消息文本。
     pub(crate) mouse_capture: bool,
     /// 插件声明的视图及宿主缓存的最近一帧。
@@ -83,6 +93,9 @@ pub(crate) struct App {
     /// Loaded plugin IDs shown by the compact status counter. 紧凑状态计数展示的插件 ID。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_ids: Vec<String>,
+    /// 尚未结束激活的插件 ID，按 manifest 发现顺序展示。
+    #[cfg(feature = "plugins")]
+    pub(crate) plugin_loading_ids: Vec<String>,
     /// Startup activation summaries shown once below the input. 输入框下方一次性展示的启动摘要。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_startup_details: Vec<String>,
@@ -168,7 +181,10 @@ impl App {
             queued_inputs: VecDeque::new(),
             queued_run_active: false,
             cursor: 0,
+            input_history: Vec::new(),
+            input_history_cursor: None,
             running: false,
+            run_started_at: None,
             should_quit: false,
             session_record,
             session_store: Arc::new(MemorySessionStore::new()),
@@ -178,7 +194,9 @@ impl App {
             streaming_message: None,
             scroll: None,
             last_max_scroll: 0,
+            last_viewport: 0,
             context_tokens: None,
+            context_window: None,
             mouse_capture: false,
             #[cfg(feature = "plugins")]
             plugin_views: Vec::new(),
@@ -190,6 +208,8 @@ impl App {
             plugin_tick: 0,
             #[cfg(feature = "plugins")]
             plugin_ids: Vec::new(),
+            #[cfg(feature = "plugins")]
+            plugin_loading_ids: Vec::new(),
             #[cfg(feature = "plugins")]
             plugin_startup_details: Vec::new(),
             #[cfg(feature = "plugins")]
@@ -228,6 +248,12 @@ impl App {
     /// 注入主函数启动时捕获的项目上下文。
     pub(crate) fn with_workspace(mut self, workspace: WorkspaceContext) -> Self {
         self.workspace = workspace;
+        self
+    }
+
+    /// 注入模型上下文窗口；该值只影响状态栏展示。
+    pub(crate) fn with_context_window(mut self, context_window: Option<u64>) -> Self {
+        self.context_window = context_window;
         self
     }
 
@@ -270,20 +296,15 @@ impl App {
         Ok(())
     }
 
-    /// Replaces plugin view state after background activation completes.
-    ///
-    /// 后台激活完成后替换插件视图状态。
+    /// 追加一个刚 Ready 插件的视图声明，不重置其他插件的帧、焦点或导航栈。
     #[cfg(feature = "plugins")]
-    pub(crate) fn set_plugin_views(&mut self, declarations: Vec<UiDeclaration>) {
-        self.view_stack = ViewStack::default();
-        self.plugin_views = declarations
-            .into_iter()
-            .map(|declaration| PluginViewState {
+    pub(crate) fn add_plugin_views(&mut self, declarations: Vec<UiDeclaration>) {
+        self.plugin_views
+            .extend(declarations.into_iter().map(|declaration| PluginViewState {
                 declaration,
                 frame: None,
                 area: Rect::default(),
-            })
-            .collect();
+            }));
     }
 
     /// 在应用导航栈上执行一次经 Host 标记来源的插件视图请求。
@@ -305,62 +326,66 @@ impl App {
         Ok(changed)
     }
 
-    /// Switches the footer from loading to ready using activation event summaries.
-    ///
-    /// 使用激活事件摘要将底栏从加载状态切换为就绪状态。
-    #[cfg(feature = "plugins")]
-    pub(crate) fn finish_plugin_loading(
-        &mut self,
-        plugin_ids: Vec<String>,
-        startup_events: Vec<Value>,
-        failures: Vec<PluginLoadFailure>,
-    ) {
-        let mut details = plugin_startup_details(&plugin_ids, &startup_events);
-        self.plugin_failures = failures
-            .into_iter()
-            .map(|failure| {
-                let blocked = if failure.blocked_by.is_empty() {
-                    String::new()
-                } else {
-                    format!("，依赖 {}", failure.blocked_by.join("、"))
-                };
-                format!(
-                    "{}: 加载失败{blocked} · {}",
-                    failure.plugin_id, failure.reason
-                )
-            })
-            .collect();
-        details.extend(self.plugin_failures.iter().cloned());
-        self.plugin_startup_details = details;
-        self.plugin_ids = plugin_ids;
-        self.plugin_status_ticks = PLUGIN_STATUS_DETAIL_TICKS;
-        self.plugins_loading = false;
-        self.plugin_load_error = None;
-    }
-
     /// Marks plugin IDs as loading while keeping the input queue available.
     ///
     /// 标记正在加载的插件 ID，同时保持输入队列可用。
     #[cfg(feature = "plugins")]
     pub(crate) fn with_loading_plugins(mut self, plugin_ids: Vec<String>) -> Self {
-        self.plugin_ids = plugin_ids;
+        self.plugin_ids.clear();
+        self.plugin_loading_ids = plugin_ids;
         self.plugins_loading = true;
         self.plugin_load_error = None;
         self.plugin_failures.clear();
         self
     }
 
-    /// Records a plugin loading failure and switches the footer to a persistent error state.
-    ///
-    /// 记录插件加载失败，并将底栏切换为持续错误状态。
+    /// 记录一个渐进加载完成的插件，使其立即进入 Ready 计数并移出加载列表。
     #[cfg(feature = "plugins")]
-    pub(crate) fn set_plugin_load_error(&mut self, error: &anyhow::Error) {
+    pub(crate) fn mark_plugin_ready(&mut self, plugin_id: String, events: &[Value]) {
+        self.plugin_loading_ids.retain(|id| id != &plugin_id);
+        if !self.plugin_ids.contains(&plugin_id) {
+            self.plugin_ids.push(plugin_id.clone());
+        }
+        self.plugin_startup_details.extend(plugin_startup_details(
+            std::slice::from_ref(&plugin_id),
+            events,
+        ));
+    }
+
+    /// 记录一个渐进加载失败的插件并立即从加载列表移除。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn mark_plugin_failed(&mut self, failure: PluginLoadFailure) {
+        self.plugin_loading_ids
+            .retain(|id| id != &failure.plugin_id);
+        let blocked = if failure.blocked_by.is_empty() {
+            String::new()
+        } else {
+            format!("，依赖 {}", failure.blocked_by.join("、"))
+        };
+        let detail = format!(
+            "{}: 加载失败{blocked} · {}",
+            failure.plugin_id, failure.reason
+        );
+        self.plugin_failures.push(detail.clone());
+        self.plugin_startup_details.push(detail);
+    }
+
+    /// 结束渐进加载并保留已经逐项收集的成功详情与失败信息。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn finish_progressive_plugin_loading(&mut self) {
+        self.plugin_loading_ids.clear();
         self.plugins_loading = false;
-        self.plugin_ids.clear();
-        self.plugin_startup_details.clear();
+        self.plugin_load_error = None;
+        self.plugin_status_ticks = PLUGIN_STATUS_DETAIL_TICKS;
+    }
+
+    /// 记录渐进加载的全局规划错误，保留此前已经 Ready 的插件。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn set_progressive_plugin_load_error(&mut self, error: &anyhow::Error) {
+        self.plugins_loading = false;
+        self.plugin_loading_ids.clear();
         self.plugin_status_ticks = 0;
         self.plugin_load_error = Some(error.to_string());
-        self.plugin_failures.clear();
     }
 
     /// Advances the transient startup status toward the compact counter.
@@ -379,16 +404,21 @@ impl App {
     #[cfg(feature = "plugins")]
     pub(crate) fn plugin_status_content(&self) -> (&'static str, String) {
         if self.plugins_loading {
-            let plugins = self.plugin_ids.join(" · ");
+            let plugins = self.plugin_loading_ids.join(" · ");
+            let ready = if self.plugin_ids.is_empty() {
+                String::new()
+            } else {
+                format!(" · 已就绪 {}", self.plugin_ids.len())
+            };
             let queue = if self.queued_inputs.is_empty() {
                 String::new()
             } else {
                 format!(" · queued {}", self.queued_inputs.len())
             };
             let text = if plugins.is_empty() {
-                format!("正在加载插件{queue}")
+                format!("正在加载插件{ready}{queue}")
             } else {
-                format!("正在加载插件 · {plugins}{queue}")
+                format!("正在加载插件 · {plugins}{ready}{queue}")
             };
             return (SPINNER[self.spinner_frame % SPINNER.len()], text);
         }
@@ -533,10 +563,7 @@ impl App {
 
     /// 在后台低频刷新命令注册表，不让运行期注册或注销阻塞输入线程。
     #[cfg(feature = "plugins")]
-    pub(crate) fn schedule_command_snapshot_refresh(
-        &mut self,
-        plugin_host: Arc<CompositePluginHost>,
-    ) {
+    pub(crate) fn schedule_command_snapshot_refresh(&mut self, plugin_host: Arc<LivePluginHost>) {
         if self.command_snapshot_refreshing
             || !self
                 .plugin_ids
@@ -566,7 +593,7 @@ impl App {
 
     /// 在后台执行一次显式参数补全请求。
     #[cfg(feature = "plugins")]
-    pub(crate) fn schedule_command_completion(&mut self, plugin_host: Arc<CompositePluginHost>) {
+    pub(crate) fn schedule_command_completion(&mut self, plugin_host: Arc<LivePluginHost>) {
         self.clear_command_completion();
         self.command_completion_loading = true;
         let generation = self.command_completion_generation;
@@ -710,6 +737,30 @@ impl App {
             self.toggle_mouse_capture();
             return;
         }
+        // 历史输入回溯入口用 Ctrl+P/Ctrl+N：↑/↓ 必须保留给消息滚动，
+        // 备用屏下鼠标滚轮会被终端映射为方向键，劫持它们等于禁用滚动。
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('p')) {
+            // 仅空输入或已处于回溯态时生效，避免覆盖未发送的内容。
+            if self.input.is_empty() || self.input_history_cursor.is_some() {
+                self.recall_older_input();
+            }
+            return;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('n')) {
+            if self.input_history_cursor.is_some() {
+                self.recall_newer_input();
+            }
+            return;
+        }
+        // 多行编辑键优先于命令预览，避免补全弹层吞掉换行手势。
+        // Shift+Enter 依赖键盘增强协议；Alt+Enter 与 Ctrl+J 在传统终端也可用。
+        if (matches!(code, KeyCode::Enter)
+            && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
+            || (modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('j')))
+        {
+            self.insert_input_text("\n");
+            return;
+        }
 
         #[cfg(feature = "plugins")]
         if self.handle_command_preview_key(code) {
@@ -717,6 +768,27 @@ impl App {
         }
 
         match code {
+            KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+                let start = previous_word_boundary(&self.input, self.cursor);
+                if start < self.cursor {
+                    self.input.replace_range(start..self.cursor, "");
+                    self.cursor = start;
+                    self.finish_input_edit();
+                }
+            }
+            KeyCode::End if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll = None;
+            }
+            KeyCode::Left if modifiers.contains(KeyModifiers::ALT) => {
+                self.cursor = previous_word_boundary(&self.input, self.cursor);
+                #[cfg(feature = "plugins")]
+                self.clear_command_completion();
+            }
+            KeyCode::Right if modifiers.contains(KeyModifiers::ALT) => {
+                self.cursor = next_word_boundary(&self.input, self.cursor);
+                #[cfg(feature = "plugins")]
+                self.clear_command_completion();
+            }
             KeyCode::Enter => {
                 if let Some(agent) = agent {
                     if self.running {
@@ -737,32 +809,58 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                // 运行中 Esc 请求优雅取消当前回合；空闲时保持原退出行为。
+                // Esc 三级行为：运行中请求取消，输入非空先清空，空闲才退出，
+                // 避免打字中途误触直接丢内容退程序。
                 if self.running {
                     if let Some(agent) = agent {
                         agent.cancel();
                         self.messages
                             .push(Msg::new(MsgKind::Info, "正在取消当前运行..."));
                     }
+                } else if !self.input.is_empty() {
+                    self.input.clear();
+                    self.cursor = 0;
+                    self.input_history_cursor = None;
+                    self.prune_attachments();
+                    #[cfg(feature = "plugins")]
+                    {
+                        self.clear_command_completion();
+                        self.command_selection = 0;
+                        self.command_preview_hidden = false;
+                    }
                 } else {
                     self.should_quit = true;
                 }
             }
-            KeyCode::PageUp => self.scroll_up(5),
-            KeyCode::PageDown => self.scroll_down(5),
-            KeyCode::Up => self.scroll_up(1),
-            KeyCode::Down => self.scroll_down(1),
-            KeyCode::Char(c) => {
-                self.input.insert(self.cursor, c);
-                self.cursor += c.len_utf8();
-                // 插入可能拆散附件引用标签，同步丢弃失去标签的附件。
-                self.prune_attachments();
-                #[cfg(feature = "plugins")]
+            KeyCode::PageUp => self.scroll_up(self.last_viewport.saturating_sub(1).max(1)),
+            KeyCode::PageDown => self.scroll_down(self.last_viewport.saturating_sub(1).max(1)),
+            KeyCode::Up => {
+                if self.input_history_cursor.is_some() {
+                    self.recall_older_input();
+                } else if self.input.contains('\n')
+                    && move_cursor_vertically(&self.input, &mut self.cursor, true)
                 {
+                    #[cfg(feature = "plugins")]
                     self.clear_command_completion();
-                    self.command_selection = 0;
-                    self.command_preview_hidden = false;
+                } else {
+                    self.scroll_up(1);
                 }
+            }
+            KeyCode::Down => {
+                if self.input_history_cursor.is_some() {
+                    self.recall_newer_input();
+                } else if self.input.contains('\n')
+                    && move_cursor_vertically(&self.input, &mut self.cursor, false)
+                {
+                    #[cfg(feature = "plugins")]
+                    self.clear_command_completion();
+                } else {
+                    self.scroll_down(1);
+                }
+            }
+            KeyCode::Char(c) => {
+                let mut encoded = [0; 4];
+                self.insert_input_text(c.encode_utf8(&mut encoded));
             }
             KeyCode::Backspace => {
                 // 光标紧跟附件引用标签时整体删除标签与附件。
@@ -773,11 +871,19 @@ impl App {
                     }
                     self.prune_attachments();
                 }
+                self.finish_input_edit();
                 #[cfg(feature = "plugins")]
                 {
                     self.clear_command_completion();
                     self.command_selection = 0;
                     self.command_preview_hidden = false;
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(next) = self.input[self.cursor..].chars().next() {
+                    let end = self.cursor + next.len_utf8();
+                    self.input.replace_range(self.cursor..end, "");
+                    self.finish_input_edit();
                 }
             }
             KeyCode::Left => {
@@ -795,12 +901,18 @@ impl App {
                 self.clear_command_completion();
             }
             KeyCode::Home => {
-                self.cursor = 0;
+                // 多行输入时回到当前逻辑行行首；单行输入等价于整段开头。
+                self.cursor = self.input[..self.cursor]
+                    .rfind('\n')
+                    .map_or(0, |index| index + 1);
                 #[cfg(feature = "plugins")]
                 self.clear_command_completion();
             }
             KeyCode::End => {
-                self.cursor = self.input.len();
+                // 多行输入时到当前逻辑行行尾；单行输入等价于整段末尾。
+                self.cursor = self.input[self.cursor..]
+                    .find('\n')
+                    .map_or(self.input.len(), |index| self.cursor + index);
                 #[cfg(feature = "plugins")]
                 self.clear_command_completion();
             }
@@ -1131,34 +1243,84 @@ impl App {
         }
     }
 
-    /// 处理终端粘贴：单个存在的文件路径转为附件，其余内容压平为单行插入光标处。
-    pub(crate) fn handle_paste(&mut self, pasted: &str) {
-        if let Some(path) = pasted_file_path(pasted) {
-            self.attach_file(&path);
-            return;
-        }
-        // 输入框为单行编辑器，换行和制表符统一替换为空格。
-        let text: String = pasted
-            .chars()
-            .map(|c| {
-                if matches!(c, '\n' | '\r' | '\t') {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .collect();
-        if text.is_empty() {
-            return;
-        }
-        self.input.insert_str(self.cursor, &text);
+    /// 在当前光标处插入文本，并退出历史回溯态、同步附件与命令补全状态。
+    fn insert_input_text(&mut self, text: &str) {
+        self.input.insert_str(self.cursor, text);
         self.cursor += text.len();
+        self.finish_input_edit();
+    }
+
+    /// 完成一次输入内容修改后的统一清理。
+    fn finish_input_edit(&mut self) {
+        self.input_history_cursor = None;
+        self.prune_attachments();
         #[cfg(feature = "plugins")]
         {
             self.clear_command_completion();
             self.command_selection = 0;
             self.command_preview_hidden = false;
         }
+    }
+
+    /// 召回更早的一条输入；空历史保持当前编辑器不变。
+    fn recall_older_input(&mut self) {
+        let Some(index) = self.input_history_cursor.map_or_else(
+            || self.input_history.len().checked_sub(1),
+            |current| current.checked_sub(1),
+        ) else {
+            return;
+        };
+        self.input_history_cursor = Some(index);
+        self.input.clone_from(&self.input_history[index]);
+        self.cursor = self.input.len();
+        self.prune_attachments();
+    }
+
+    /// 向较新的输入回溯；越过最新记录时恢复空编辑器。
+    fn recall_newer_input(&mut self) {
+        let Some(current) = self.input_history_cursor else {
+            return;
+        };
+        if current + 1 < self.input_history.len() {
+            let index = current + 1;
+            self.input_history_cursor = Some(index);
+            self.input.clone_from(&self.input_history[index]);
+        } else {
+            self.input_history_cursor = None;
+            self.input.clear();
+        }
+        self.cursor = self.input.len();
+        self.prune_attachments();
+    }
+
+    /// 记录成功提交的非空输入，忽略连续重复并只保留最近五十条。
+    fn remember_input(&mut self, input: &str) {
+        if input.is_empty() || self.input_history.last().is_some_and(|last| last == input) {
+            self.input_history_cursor = None;
+            return;
+        }
+        if self.input_history.len() == 50 {
+            self.input_history.remove(0);
+        }
+        self.input_history.push(input.to_string());
+        self.input_history_cursor = None;
+    }
+
+    /// 处理终端粘贴：单个存在的文件路径转为附件，其余内容保留换行插入光标处。
+    pub(crate) fn handle_paste(&mut self, pasted: &str) {
+        if let Some(path) = pasted_file_path(pasted) {
+            self.attach_file(&path);
+            return;
+        }
+        // 统一平台换行，制表符仍降级为空格以避免终端宽度不一致。
+        let text = pasted
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', " ");
+        if text.is_empty() {
+            return;
+        }
+        self.insert_input_text(&text);
     }
 
     /// 读取文件并加入待发送附件，同时在光标处插入引用标签。
@@ -1204,6 +1366,7 @@ impl App {
         let clip = format!("{label} ");
         self.input.insert_str(self.cursor, &clip);
         self.cursor += clip.len();
+        self.finish_input_edit();
     }
 
     /// 生成不与现有附件冲突的引用标签：图片使用递增序号，文件使用文件名。
@@ -1312,7 +1475,11 @@ impl App {
         self.cursor = 0;
         #[cfg(feature = "plugins")]
         self.clear_command_completion();
-        (!input.is_empty()).then_some(input)
+        if input.is_empty() {
+            return None;
+        }
+        self.remember_input(&input);
+        Some(input)
     }
 
     /// 取出并清空当前输入与附件；文本和附件都为空时返回 `None`。
@@ -1326,6 +1493,7 @@ impl App {
         if text.is_empty() && attachments.is_empty() {
             return None;
         }
+        self.remember_input(&text);
         Some(UserSubmission { text, attachments })
     }
 
@@ -1384,6 +1552,7 @@ impl App {
                 .push(Msg::new(MsgKind::User, submission.text.clone()));
         }
         self.running = true;
+        self.run_started_at = Some(std::time::Instant::now());
         self.streaming_message = None;
         self.scroll = None;
 
@@ -1455,6 +1624,7 @@ impl App {
         // 完整会话，必须以它重建界面，避免保留过期的流式内容。
         let preserve_visible_history = run.is_none() && error.is_some();
         self.running = false;
+        self.run_started_at = None;
         let queued_run = std::mem::take(&mut self.queued_run_active);
         if queued_run && input_committed {
             let committed_input = self
@@ -1661,6 +1831,90 @@ impl ChannelEventSink {
     }
 }
 
+/// 判断字符是否为按词移动与删除使用的分隔符。
+fn is_word_separator(ch: char) -> bool {
+    ch.is_whitespace() || ch.is_ascii_punctuation()
+}
+
+/// 返回光标左侧一个词的起始字节位置。
+fn previous_word_boundary(input: &str, cursor: usize) -> usize {
+    let mut position = cursor;
+    while let Some(ch) = input[..position].chars().next_back() {
+        if !is_word_separator(ch) {
+            break;
+        }
+        position -= ch.len_utf8();
+    }
+    while let Some(ch) = input[..position].chars().next_back() {
+        if is_word_separator(ch) {
+            break;
+        }
+        position -= ch.len_utf8();
+    }
+    position
+}
+
+/// 返回光标右侧下一个词的起始字节位置。
+fn next_word_boundary(input: &str, cursor: usize) -> usize {
+    let mut position = cursor;
+    while let Some(ch) = input[position..].chars().next() {
+        if is_word_separator(ch) {
+            break;
+        }
+        position += ch.len_utf8();
+    }
+    while let Some(ch) = input[position..].chars().next() {
+        if !is_word_separator(ch) {
+            break;
+        }
+        position += ch.len_utf8();
+    }
+    position
+}
+
+/// 在目标逻辑行中找到不超过指定显示列的字节位置。
+fn byte_at_display_column(line: &str, target: usize) -> usize {
+    let mut width = 0;
+    let mut offset = 0;
+    for ch in line.chars() {
+        let next = width + unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if next > target {
+            break;
+        }
+        width = next;
+        offset += ch.len_utf8();
+    }
+    offset
+}
+
+/// 按显示列在相邻逻辑行间移动光标；到达首行或末行时返回 `false`。
+fn move_cursor_vertically(input: &str, cursor: &mut usize, upward: bool) -> bool {
+    let line_start = input[..*cursor].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = input[*cursor..]
+        .find('\n')
+        .map_or(input.len(), |index| *cursor + index);
+    let column = unicode_width::UnicodeWidthStr::width(&input[line_start..*cursor]);
+    let (target_start, target_end) = if upward {
+        if line_start == 0 {
+            return false;
+        }
+        let end = line_start - 1;
+        let start = input[..end].rfind('\n').map_or(0, |index| index + 1);
+        (start, end)
+    } else {
+        if line_end == input.len() {
+            return false;
+        }
+        let start = line_end + 1;
+        let end = input[start..]
+            .find('\n')
+            .map_or(input.len(), |index| start + index);
+        (start, end)
+    };
+    *cursor = target_start + byte_at_display_column(&input[target_start..target_end], column);
+    true
+}
+
 #[async_trait]
 impl EventSink for ChannelEventSink {
     async fn record(&self, event: &AgentEvent) -> Result<()> {
@@ -1713,15 +1967,22 @@ impl EventSink for ChannelEventSink {
                     .get("is_error")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let result = event
+                // 文本结果保留多行预览，首行作为摘要行展示。
+                let mut lines = event
                     .payload
                     .get("result")
-                    .map(|value| summarize_json(value, 96))
+                    .map(|value| tool_result_lines(value, TOOL_RESULT_PREVIEW_LINES, 96))
                     .unwrap_or_default();
+                let result = if lines.is_empty() {
+                    String::new()
+                } else {
+                    lines.remove(0)
+                };
                 let _ = self.tx.send(UiEvent::ToolFinished {
                     name: name(),
                     is_error,
                     result,
+                    detail: lines,
                 });
             }
             AgentEventKind::ToolSkipped => {

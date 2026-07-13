@@ -4,7 +4,12 @@ use crate::*;
 
 /// 在插件占用后的中心区域渲染 Lucia 主界面。
 pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
-    // 输入区是三行高的圆角输入盒，命令预览与状态栏分列其上下。
+    // 输入区随逻辑行数在一至六行间增长，边框额外占两行。
+    let desired_input_rows = u16::try_from(app.input.split('\n').count())
+        .unwrap_or(6)
+        .clamp(1, 6);
+    let input_rows = desired_input_rows.min(workspace.height.saturating_sub(5).clamp(1, 6));
+    let input_height = input_rows + 2;
     #[cfg(feature = "plugins")]
     let command_matches = if workspace.height >= 10 {
         app.command_matches()
@@ -28,14 +33,14 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let sections = Layout::vertical([
         Constraint::Min(4),
         Constraint::Length(command_preview_height),
-        Constraint::Length(3),
+        Constraint::Length(input_height),
         Constraint::Length(1),
     ])
     .split(workspace);
     #[cfg(not(feature = "plugins"))]
     let sections = Layout::vertical([
         Constraint::Min(4),
-        Constraint::Length(3),
+        Constraint::Length(input_height),
         Constraint::Length(1),
     ])
     .split(workspace);
@@ -59,44 +64,74 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     if app.messages.is_empty() && !app.running {
         // 空会话时以首屏替代消息流，首条消息或运行开始后自动消失。
         app.last_max_scroll = 0;
+        app.last_viewport = chat_area.height;
         render_hero(frame, chat_area, &cwd_display);
     } else {
+        let inner_width = chat_area.width.max(1);
         let mut lines: Vec<Line> = app
             .messages
             .iter()
             .enumerate()
-            .flat_map(|(index, message)| message.to_lines(app.streaming_message == Some(index)))
+            .flat_map(|(index, message)| {
+                message.to_lines(app.streaming_message == Some(index), inner_width)
+            })
             .collect();
         if app.running && app.streaming_message.is_none() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!("{spinner} "), Style::new().fg(COLOR_WARNING)),
                 Span::styled("Working...", Style::new().fg(COLOR_MUTED)),
-            ]));
+            ];
+            // 运行耗时随 UI tick 刷新，长任务时可感知进展。
+            if let Some(started) = app.run_started_at {
+                spans.push(Span::styled(
+                    format!(" {}", format_elapsed(started.elapsed())),
+                    Style::new().fg(COLOR_MUTED),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
 
-        // 按换行后的实际显示行数计算滚动范围，兼容中文等宽字符。
-        let inner_width = chat_area.width.max(1);
-        let wrapped_height: u16 = lines
-            .iter()
-            .map(|line| {
-                let width = line.width() as u16;
-                width.div_ceil(inner_width).max(1)
-            })
-            .sum();
+        // 按 Paragraph 的词边界规则计算高度，保证滚动范围与实际渲染一致。
+        let wrapped_height = lines.iter().fold(0u16, |height, line| {
+            height.saturating_add(wrapped_line_count(line, inner_width))
+        });
+        let chat = Paragraph::new(lines).wrap(Wrap { trim: false });
         let viewport = chat_area.height;
         let max_scroll = wrapped_height.saturating_sub(viewport);
         app.last_max_scroll = max_scroll;
+        app.last_viewport = viewport;
         // 手动滚动位置到达底部后恢复自动跟随。
         if app.scroll.is_some_and(|value| value >= max_scroll) {
             app.scroll = None;
         }
         let scroll = app.scroll.unwrap_or(max_scroll);
 
-        let chat = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0));
+        let chat = chat.scroll((scroll, 0));
         frame.render_widget(chat, chat_area);
+
+        // 手动翻阅时在消息区右下角提示距底部的行数。
+        if let Some(position) = app.scroll {
+            let below = max_scroll.saturating_sub(position);
+            if below > 0 && chat_area.height > 0 {
+                let hint = format!(" ↓ {below} 行 ");
+                let hint_width = unicode_width::UnicodeWidthStr::width(hint.as_str()) as u16;
+                let width = hint_width.min(chat_area.width);
+                let hint_area = Rect {
+                    x: chat_area.x + chat_area.width - width,
+                    y: chat_area.y + chat_area.height - 1,
+                    width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        hint,
+                        Style::new().fg(COLOR_WARNING),
+                    ))),
+                    hint_area,
+                );
+            }
+        }
     }
 
     #[cfg(feature = "plugins")]
@@ -104,13 +139,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         render_command_preview(frame, app, command_section, &command_matches);
     }
 
-    // 输入区是四边圆角边框的输入盒：上边框、编辑行与下边框恰好占满三行高度。
+    // 输入区是四边圆角边框的多行输入盒，内容超过六行后内部垂直滚动。
     let input_area = input_section;
-    #[cfg(feature = "plugins")]
-    let agent_waiting = app.plugins_loading;
-    #[cfg(not(feature = "plugins"))]
-    let agent_waiting = false;
-    let input_color = if app.running || agent_waiting {
+    let input_color = if app.running {
         COLOR_WARNING
     } else {
         COLOR_USER
@@ -122,7 +153,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let mut input_block = Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if app.running || agent_waiting {
+        .border_style(Style::new().fg(if app.running {
             COLOR_WARNING
         } else if main_input_focused {
             COLOR_BORDER_FOCUS
@@ -130,13 +161,8 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             COLOR_MUTED
         }))
         .padding(Padding::new(1, 1, 0, 0));
-    // 运行与排队状态在上边框以标题提示，空闲时保持无标题的干净边框。
-    let queued = app.queued_inputs.len();
-    let state_title = if agent_waiting && queued > 0 {
-        format!(" 插件加载中 · {queued} 条排队 ")
-    } else if agent_waiting {
-        " 插件加载中 ".to_string()
-    } else if app.running {
+    // 插件渐进加载不会阻塞输入，只有 Agent 运行状态占用输入盒标题。
+    let state_title = if app.running {
         " 运行中 · Esc 中断 ".to_string()
     } else {
         String::new()
@@ -147,9 +173,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let input_inner = input_block.inner(input_area);
 
     if app.input.is_empty() {
-        let placeholder = if agent_waiting {
-            "Queue while plugins load..."
-        } else if app.running {
+        let placeholder = if app.running {
             "Steer the current run..."
         } else {
             "Message Lucia..."
@@ -166,68 +190,101 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             frame.set_cursor_position((input_inner.x + 2, input_inner.y));
         }
     } else {
-        // 附件引用标签（如 [Image#1]）以高亮 clip 样式区别于普通文本。
-        let mut spans = vec![Span::styled("› ", Style::new().fg(input_color).bold())];
-        spans.extend(input_ref_spans(&app.input, &app.attachments));
-        let input_widget = Paragraph::new(Line::from(spans)).block(input_block);
+        // 每个逻辑行独立渲染，附件引用标签继续沿用高亮样式。
+        let input_lines: Vec<Line> = app
+            .input
+            .split('\n')
+            .enumerate()
+            .map(|(index, line)| {
+                let prefix = if index == 0 { "› " } else { "  " };
+                let mut spans = vec![Span::styled(prefix, Style::new().fg(input_color).bold())];
+                spans.extend(input_ref_spans(line, &app.attachments));
+                Line::from(spans)
+            })
+            .collect();
+        let cursor_line = u16::try_from(
+            app.input[..app.cursor]
+                .bytes()
+                .filter(|b| *b == b'\n')
+                .count(),
+        )
+        .unwrap_or(u16::MAX);
+        let cursor_line_start = app.input[..app.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let cursor_column = u16::try_from(unicode_width::UnicodeWidthStr::width(
+            &app.input[cursor_line_start..app.cursor],
+        ))
+        .unwrap_or(u16::MAX);
+        let vertical_scroll = cursor_line.saturating_sub(input_rows.saturating_sub(1));
+        let available = input_inner.width.saturating_sub(1);
+        let horizontal_scroll = cursor_column.saturating_add(2).saturating_sub(available);
+        let input_widget = Paragraph::new(input_lines)
+            .scroll((vertical_scroll, horizontal_scroll))
+            .block(input_block);
         frame.render_widget(input_widget, input_area);
-        // 使用显示宽度定位光标，确保中文等全角字符不会造成偏移。
-        let cursor_width = unicode_width::UnicodeWidthStr::width(&app.input[..app.cursor]) as u16;
         if main_input_focused {
-            frame.set_cursor_position((input_inner.x + 2 + cursor_width, input_inner.y));
+            frame.set_cursor_position((
+                input_inner.x + 2 + cursor_column - horizontal_scroll,
+                input_inner.y + cursor_line - vertical_scroll,
+            ));
         }
     }
 
-    // 底部信息行：品牌块、模型、工作目录与当前上下文 token 数，窄终端时隐藏目录。
+    // 底部信息行：品牌标识、模型、工作目录与当前上下文 token 数，窄终端时隐藏目录。
     let mut footer = vec![
-        Span::styled(
-            " lucia ",
-            Style::new().fg(COLOR_CHIP_FG).bg(COLOR_USER).bold(),
-        ),
+        Span::styled("lucia", Style::new().fg(COLOR_USER).bold()),
         Span::raw("  "),
         Span::styled(app.model_name.as_str(), Style::new().fg(COLOR_TEXT)),
     ];
-    if workspace.width >= 64 {
-        footer.extend([
-            Span::styled("  ·  ", Style::new().fg(COLOR_BORDER_FOCUS)),
-            Span::styled(
-                truncate_line(
-                    &format!(
-                        "session {} · r{}",
-                        app.session_record.id, app.session_record.revision
-                    ),
-                    30,
-                ),
-                Style::new().fg(COLOR_MUTED),
-            ),
-        ]);
-    }
     if workspace.width >= 96 {
         footer.extend([
-            Span::styled("  ·  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+            Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
             Span::styled(cwd_display, Style::new().fg(COLOR_MUTED)),
         ]);
     }
+    if workspace.width >= 64 {
+        if let Some(branch) = app.workspace.git_branch.as_deref() {
+            footer.extend([
+                Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+                Span::styled(
+                    format!("⎇ {}", truncate_line(branch, 24)),
+                    Style::new().fg(COLOR_MUTED),
+                ),
+            ]);
+        }
+    }
     if let Some(tokens) = app.context_tokens {
+        let (label, color) = context_status(tokens, app.context_window);
         footer.extend([
-            Span::styled("  ·  ", Style::new().fg(COLOR_BORDER_FOCUS)),
-            Span::styled(format!("ctx {tokens}"), Style::new().fg(COLOR_MUTED)),
+            Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+            Span::styled(format!("◔ {label}"), Style::new().fg(color)),
         ]);
     }
     let footer_area = footer_section;
+    // 稳定运行期隐藏常驻插件计数，仅在加载中、启动详情或存在失败时占用右侧区域。
     #[cfg(feature = "plugins")]
-    let (metadata_area, plugin_area, plugin_icon, plugin_status, plugin_color) = {
-        let (icon, status) = app.plugin_status_content();
-        let color = app.plugin_status_color();
-        let desired_width =
-            unicode_width::UnicodeWidthStr::width(format!("{icon} {status}").as_str())
-                .saturating_add(2);
-        let plugin_width = u16::try_from(desired_width)
-            .unwrap_or(u16::MAX)
-            .min(footer_area.width / 2);
-        let columns = Layout::horizontal([Constraint::Min(0), Constraint::Length(plugin_width)])
-            .split(footer_area);
-        (columns[0], columns[1], icon, status, color)
+    let (metadata_area, plugin_footer) = {
+        let visible = app.plugins_loading
+            || app.plugin_load_error.is_some()
+            || app.plugin_status_ticks > 0
+            || !app.plugin_failures.is_empty();
+        if visible {
+            let (icon, status) = app.plugin_status_content();
+            let color = app.plugin_status_color();
+            let desired_width =
+                unicode_width::UnicodeWidthStr::width(format!("{icon} {status}").as_str())
+                    .saturating_add(2);
+            let plugin_width = u16::try_from(desired_width)
+                .unwrap_or(u16::MAX)
+                .min(footer_area.width / 2);
+            let columns =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(plugin_width)])
+                    .split(footer_area);
+            (columns[0], Some((columns[1], icon, status, color)))
+        } else {
+            (footer_area, None)
+        }
     };
     #[cfg(not(feature = "plugins"))]
     let metadata_area = footer_area;
@@ -235,10 +292,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         Paragraph::new(Line::from(footer)).block(Block::new().padding(Padding::horizontal(1))),
         metadata_area,
     );
-    // Reserve a right-aligned footer region for plugin details without overlapping metadata.
     // 在底栏右侧为插件详情预留独立区域，避免覆盖左侧元数据。
     #[cfg(feature = "plugins")]
-    {
+    if let Some((plugin_area, plugin_icon, plugin_status, plugin_color)) = plugin_footer {
         let status = truncate_line(
             &plugin_status,
             usize::from(plugin_area.width.saturating_sub(4).max(1)),
@@ -255,24 +311,185 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     }
 }
 
+/// 按 Ratatui `Wrap { trim: false }` 的词边界行为计算单个逻辑行的视觉行数。
+fn wrapped_line_count(line: &Line<'_>, max_width: u16) -> u16 {
+    if max_width == 0 {
+        return 0;
+    }
+    let mut rows = 0u16;
+    let mut line_width = 0u16;
+    let mut word_width = 0u16;
+    let mut whitespace = VecDeque::new();
+    let mut whitespace_width = 0u16;
+    let mut previous_was_word = false;
+
+    for ch in line.spans.iter().flat_map(|span| span.content.chars()) {
+        let is_whitespace = ch.is_whitespace();
+        let width = u16::try_from(unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+            .unwrap_or(u16::MAX);
+        if width > max_width {
+            continue;
+        }
+        let segment_finished = previous_was_word && is_whitespace;
+        let segment_overflow = line_width == 0
+            && word_width
+                .saturating_add(whitespace_width)
+                .saturating_add(width)
+                > max_width;
+        if segment_finished || segment_overflow {
+            line_width = line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width);
+            whitespace.clear();
+            whitespace_width = 0;
+            word_width = 0;
+        }
+
+        let line_full = line_width >= max_width;
+        let pending_overflow = width > 0
+            && line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width)
+                >= max_width;
+        if line_full || pending_overflow {
+            let mut remaining = max_width.saturating_sub(line_width);
+            rows = rows.saturating_add(1);
+            line_width = 0;
+            while let Some(front) = whitespace.front().copied() {
+                if front > remaining {
+                    break;
+                }
+                whitespace.pop_front();
+                whitespace_width = whitespace_width.saturating_sub(front);
+                remaining = remaining.saturating_sub(front);
+            }
+            if is_whitespace && whitespace.is_empty() {
+                previous_was_word = false;
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace.push_back(width);
+            whitespace_width = whitespace_width.saturating_add(width);
+        } else {
+            word_width = word_width.saturating_add(width);
+        }
+        previous_was_word = !is_whitespace;
+    }
+
+    if line_width > 0 || word_width > 0 || whitespace_width > 0 {
+        rows = rows.saturating_add(1);
+    }
+    rows.max(1)
+}
+
+/// 将运行耗时格式化为 `47s` 或 `3m21s` 的紧凑显示。
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let total = elapsed.as_secs();
+    if total < 60 {
+        format!("{total}s")
+    } else {
+        format!("{}m{:02}s", total / 60, total % 60)
+    }
+}
+
+/// 将 token 数格式化为紧凑显示：千以下原样，千级以 `x.xk`、百万级以 `x.xm` 表示。
+fn format_token_count(tokens: u64) -> String {
+    if tokens < 1_000 {
+        tokens.to_string()
+    } else if tokens < 1_000_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    }
+}
+
+/// 格式化上下文用量；配置窗口后追加百分比，并按 80% 与 95% 阈值着色。
+pub(crate) fn context_status(tokens: u64, context_window: Option<u64>) -> (String, Color) {
+    let Some(window) = context_window.filter(|window| *window > 0) else {
+        return (format_token_count(tokens), COLOR_MUTED);
+    };
+    let scaled = u128::from(tokens) * 100;
+    let window = u128::from(window);
+    let percentage = (scaled + window / 2) / window;
+    let color = if scaled > window * 95 {
+        COLOR_DANGER
+    } else if scaled > window * 80 {
+        COLOR_WARNING
+    } else {
+        COLOR_MUTED
+    };
+    (
+        format!("{percentage}% · {}", format_token_count(tokens)),
+        color,
+    )
+}
+
+/// LUCIA 字标点阵：`#` 为实心像素，渲染时每个像素横向放大为两个全块字符，
+/// 并向右下偏移一个像素投射纹理阴影。
+const HERO_LOGO: [&str; 5] = [
+    "#.... #...# .#### ### .###.",
+    "#.... #...# #.... .#. #...#",
+    "#.... #...# #.... .#. #####",
+    "#.... #...# #.... .#. #...#",
+    "##### .###. .#### ### #...#",
+];
+/// 字标纵向渐变的起始色（浅绯红）。
+const HERO_LOGO_TOP: (u8, u8, u8) = (255, 128, 138);
+/// 字标纵向渐变的结束色（深绯红）。
+const HERO_LOGO_BOTTOM: (u8, u8, u8) = (168, 32, 58);
+/// 字标阴影颜色（暗绯红）。
+const HERO_LOGO_SHADOW: Color = Color::Rgb(96, 26, 38);
+
+/// 在两个 RGB 颜色间按比例线性插值。
+fn lerp_color(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> Color {
+    let channel = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    Color::Rgb(
+        channel(from.0, to.0),
+        channel(from.1, to.1),
+        channel(from.2, to.2),
+    )
+}
+
 /// 空会话首屏：垂直居中展示字标、版本、工作目录与快捷键速查。
 ///
-/// 高度不足以容纳字标时退化为纯文字信息，区域过小则完全不绘制。
+/// 尺寸不足以容纳字标时退化为纯文字信息，区域过小则完全不绘制。
 fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
     if area.width < 30 || area.height < 6 {
         return;
     }
     let mut lines: Vec<Line> = Vec::new();
-    if area.height >= 12 {
-        for row in [
-            "█   █ █ ▄▀▀ █ ▄▀▄",
-            "█   █ █ █   █ █▄█",
-            "█▄▄ ▀▄▀ ▀▄▄ █ █ █",
-        ] {
-            lines.push(Line::from(Span::styled(
-                row,
-                Style::new().fg(COLOR_USER).bold(),
-            )));
+    // 点阵放大加阴影后宽 56 列、高 6 行，加速查共 15 行，需要足够空间才展示。
+    if area.height >= 15 && area.width >= 58 {
+        let filled = |row: usize, col: usize| {
+            HERO_LOGO
+                .get(row)
+                .and_then(|line| line.as_bytes().get(col))
+                .copied()
+                == Some(b'#')
+        };
+        let rows = HERO_LOGO.len();
+        let cols = HERO_LOGO[0].len();
+        let last_row = rows.saturating_sub(1).max(1);
+        // 多渲染一行一列，容纳最下与最右侧实心像素的投影。
+        for row in 0..=rows {
+            let color = lerp_color(
+                HERO_LOGO_TOP,
+                HERO_LOGO_BOTTOM,
+                row.min(last_row) as f32 / last_row as f32,
+            );
+            let mut spans: Vec<Span> = Vec::with_capacity(cols + 1);
+            for col in 0..=cols {
+                if filled(row, col) {
+                    spans.push(Span::styled("██", Style::new().fg(color)));
+                } else if row > 0 && col > 0 && filled(row - 1, col - 1) {
+                    spans.push(Span::styled("░░", Style::new().fg(HERO_LOGO_SHADOW)));
+                } else {
+                    spans.push(Span::raw("  "));
+                }
+            }
+            lines.push(Line::from(spans));
         }
         lines.push(Line::default());
     }
@@ -284,11 +501,13 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
     // 键位列右对齐、说明列按显示宽度补齐，保证整行居中后两列仍纵向对齐。
     for (key, action) in [
         ("Enter", "发送消息"),
-        ("Esc", "中断运行 / 退出"),
+        ("Ctrl+J", "插入换行"),
+        ("Esc", "中断 / 清空 / 退出"),
         ("PgUp/PgDn", "滚动历史"),
+        ("Ctrl+P", "历史输入回溯"),
         ("Ctrl+Y", "复制最近回复"),
     ] {
-        let pad = 15usize.saturating_sub(unicode_width::UnicodeWidthStr::width(action));
+        let pad = 18usize.saturating_sub(unicode_width::UnicodeWidthStr::width(action));
         lines.push(Line::from(vec![
             Span::styled(format!("{key:>9}"), Style::new().fg(COLOR_TEXT)),
             Span::styled(

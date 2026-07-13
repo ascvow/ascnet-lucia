@@ -10,6 +10,8 @@ pub(crate) mod plugin_render;
 #[cfg(feature = "plugins")]
 pub(crate) mod view;
 
+#[cfg(test)]
+pub(crate) use chat::context_status;
 pub(crate) use chat::render_main;
 #[cfg(feature = "plugins")]
 pub(crate) use plugin_bridge::{

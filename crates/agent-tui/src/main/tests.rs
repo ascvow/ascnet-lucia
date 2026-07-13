@@ -173,6 +173,36 @@ fn input_editor_starts_immediately_after_rule() {
     assert!(!rows[rule_row + 3].trim().is_empty());
 }
 
+/// 多行输入框最多展示六个逻辑行，并自动滚动到光标所在的末行。
+#[test]
+fn multiline_input_renders_six_visible_rows() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("创建多行输入测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = (1..=8)
+        .map(|index| format!("input-line-{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.cursor = app.input.len();
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染多行输入界面");
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(!text.contains("input-line-2"), "{text:?}");
+    for index in 3..=8 {
+        assert!(text.contains(&format!("input-line-{index}")), "{text:?}");
+    }
+}
+
 /// Startup activation events render in the footer once, then collapse into a plugin count.
 ///
 /// 启动激活事件应在底部信息栏右侧展示一次，随后收敛为插件数量。
@@ -181,20 +211,22 @@ fn input_editor_starts_immediately_after_rule() {
 fn plugin_status_shows_startup_details_then_compact_count() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    app.finish_plugin_loading(
-        vec!["mcp".into(), "skill".into()],
-        vec![
-            json!({
-                "source": {"id": "mcp"},
-                "data": {"text": "MCP 插件等待配置"}
-            }),
-            json!({
-                "source": {"id": "skill"},
-                "presentation": {"text": "已加载 1 个 Skill"}
-            }),
-        ],
-        Vec::new(),
+    app = app.with_loading_plugins(vec!["mcp".into(), "skill".into()]);
+    app.mark_plugin_ready(
+        "mcp".into(),
+        &[json!({
+            "source": {"id": "mcp"},
+            "data": {"text": "MCP 插件等待配置"}
+        })],
     );
+    app.mark_plugin_ready(
+        "skill".into(),
+        &[json!({
+            "source": {"id": "skill"},
+            "presentation": {"text": "已加载 1 个 Skill"}
+        })],
+    );
+    app.finish_progressive_plugin_loading();
     assert_eq!(
         app.plugin_status_content(),
         (
@@ -226,6 +258,22 @@ fn plugin_status_shows_startup_details_then_compact_count() {
     assert_eq!(app.plugin_status_content(), ("◈", "2 plugins".into()));
 }
 
+/// 渐进加载期间应同时展示剩余插件和已经可用的插件数量。
+#[cfg(feature = "plugins")]
+#[test]
+fn plugin_status_reports_progressive_ready_count() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app =
+        App::new(tx, "测试模型".into()).with_loading_plugins(vec!["command".into(), "mcp".into()]);
+
+    app.mark_plugin_ready("command".into(), &[]);
+
+    let (_, status) = app.plugin_status_content();
+    assert!(status.contains("mcp"), "{status}");
+    assert!(!status.contains("command"), "{status}");
+    assert!(status.contains("已就绪 1"), "{status}");
+}
+
 /// Partial plugin failures retain successes and remain visible in the compact footer count.
 ///
 /// 单插件失败应保留成功插件，并在紧凑底栏中持续显示失败数量。
@@ -234,15 +282,14 @@ fn plugin_status_shows_startup_details_then_compact_count() {
 fn plugin_status_keeps_partial_successes() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    app.finish_plugin_loading(
-        vec!["skill".into()],
-        Vec::new(),
-        vec![PluginLoadFailure {
-            plugin_id: "mcp".into(),
-            reason: "初始化超时".into(),
-            blocked_by: Vec::new(),
-        }],
-    );
+    app = app.with_loading_plugins(vec!["skill".into(), "mcp".into()]);
+    app.mark_plugin_ready("skill".into(), &[]);
+    app.mark_plugin_failed(PluginLoadFailure {
+        plugin_id: "mcp".into(),
+        reason: "初始化超时".into(),
+        blocked_by: Vec::new(),
+    });
+    app.finish_progressive_plugin_loading();
 
     let (icon, status) = app.plugin_status_content();
     assert_eq!(icon, "!");
@@ -256,12 +303,12 @@ fn plugin_status_keeps_partial_successes() {
     assert_eq!(app.plugin_status_content(), ("◈", "1 plugins · ✗ 1".into()));
 }
 
-/// Inputs entered before readiness stay FIFO-ordered and remain visible in the loading footer.
+/// Agent 引用确实不可用时，输入保持 FIFO 顺序并显示在加载底栏。
 ///
-/// Agent 就绪前输入应保持 FIFO 顺序，并在加载底栏显示排队数量。
+/// 该路径用于启动装配失败等兜底场景；渐进插件加载的正常路径始终提供 Agent。
 #[cfg(feature = "plugins")]
 #[test]
-fn plugin_loading_queues_inputs_until_agent_is_ready() {
+fn unavailable_agent_queues_inputs_in_fifo_order() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app =
         App::new(tx, "测试模型".into()).with_loading_plugins(vec!["mcp".into(), "skill".into()]);
@@ -301,6 +348,29 @@ fn plugin_loading_queues_inputs_until_agent_is_ready() {
             .count(),
         2
     );
+}
+
+/// 插件仍在渐进加载时，普通输入应立即启动已有工具快照，不进入等待队列。
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn plugin_loading_does_not_block_ready_agent_input() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app =
+        App::new(tx, "测试模型".into()).with_loading_plugins(vec!["mcp".into(), "skill".into()]);
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    app.input = "立即执行".into();
+    app.cursor = app.input.len();
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
+
+    assert!(app.running);
+    assert!(app.queued_inputs.is_empty());
+    assert!(app.input.is_empty());
+    assert!(app
+        .messages
+        .iter()
+        .any(|message| matches!(message.kind, MsgKind::User) && message.text == "立即执行"));
 }
 
 /// Queued startup inputs execute sequentially and persist into one continuing session.
@@ -396,7 +466,7 @@ fn tool_lines_show_args_and_truncated_result() {
         24,
     ));
 
-    let lines = msg.to_lines(false);
+    let lines = msg.to_lines(false, 80);
     let text: String = lines
         .iter()
         .map(|line| {
@@ -600,6 +670,24 @@ fn markdown_renders_emphasis_without_background() {
         .find(|span| span.content.contains("重点"))
         .expect("应包含加粗片段");
     assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
+}
+
+/// 验证围栏代码块隐藏围栏、保留语言标签，并且不干扰相邻表格。
+#[test]
+fn markdown_code_blocks_are_visually_separated() {
+    let lines = markdown_lines(
+        "```rust\nfn main() {}\n```\n| 列一 | 列二 |\n|---|---|\n| 值一 | 值二 |\n```txt\n未闭合",
+        false,
+    );
+    let text = lines
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+        .collect::<String>();
+
+    assert!(!text.contains("```"), "{text:?}");
+    assert!(text.contains("▎ fn main() {}  rust"), "{text:?}");
+    assert!(text.contains('┼'), "{text:?}");
+    assert!(text.contains("▎ 未闭合  txt"), "{text:?}");
 }
 
 /// 验证流式增量与运行结束不会打断用户的手动滚动位置。
@@ -1523,16 +1611,151 @@ fn pasted_file_path_parses_dropped_paths() {
     assert_eq!(pasted_file_path(&display), None);
 }
 
-/// 粘贴非路径文本时插入输入框，换行压平为空格。
+/// 粘贴非路径文本时保留逻辑换行并统一平台换行符。
 #[test]
-fn paste_inserts_flattened_text() {
+fn paste_preserves_multiline_text() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
 
-    app.handle_paste("第一行\n第二行");
+    app.handle_paste("第一行\r\n第二行\t内容");
 
-    assert_eq!(app.input, "第一行 第二行");
+    assert_eq!(app.input, "第一行\n第二行 内容");
     assert_eq!(app.cursor, app.input.len());
+}
+
+/// 输入历史由 Ctrl+P 进入回溯，回溯态中方向键可继续导航，编辑后退出回溯态。
+#[test]
+fn input_history_recalls_recent_submissions() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    for input in ["第一条", "第一条", "第二条"] {
+        app.input = input.into();
+        app.cursor = app.input.len();
+        assert!(app.take_input().is_some());
+    }
+
+    app.handle_key(KeyCode::Char('p'), KeyModifiers::CONTROL, None);
+    assert_eq!(app.input, "第二条");
+    app.handle_key(KeyCode::Up, KeyModifiers::NONE, None);
+    assert_eq!(app.input, "第一条");
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE, None);
+    assert_eq!(app.input, "第二条");
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE, None);
+    assert!(app.input.is_empty());
+
+    app.handle_key(KeyCode::Char('p'), KeyModifiers::CONTROL, None);
+    app.handle_key(KeyCode::Char('改'), KeyModifiers::NONE, None);
+    assert_eq!(app.input, "第二条改");
+    assert_eq!(app.input_history_cursor, None);
+}
+
+/// 空输入时方向键滚动消息区而不是进入历史回溯；滚轮在备用屏下映射为方向键。
+#[test]
+fn arrow_keys_keep_scrolling_message_history() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "已提交".into();
+    app.cursor = app.input.len();
+    assert!(app.take_input().is_some());
+    app.last_max_scroll = 10;
+
+    app.handle_key(KeyCode::Up, KeyModifiers::NONE, None);
+    assert_eq!(app.scroll, Some(9));
+    assert!(app.input.is_empty());
+    assert_eq!(app.input_history_cursor, None);
+
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE, None);
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE, None);
+    assert_eq!(app.scroll, None);
+}
+
+/// 换行手势（Shift+Enter / Alt+Enter / Ctrl+J）插入换行，Home/End 使用行内语义。
+#[test]
+fn multiline_newline_gestures_and_line_navigation() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE, None);
+    app.handle_key(KeyCode::Enter, KeyModifiers::SHIFT, None);
+    app.handle_key(KeyCode::Char('b'), KeyModifiers::NONE, None);
+    app.handle_key(KeyCode::Enter, KeyModifiers::ALT, None);
+    app.handle_key(KeyCode::Char('j'), KeyModifiers::CONTROL, None);
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE, None);
+    assert_eq!(app.input, "a\nb\n\nc");
+
+    // Home/End 停留在当前逻辑行内，而不是整段首尾。
+    app.handle_key(KeyCode::Home, KeyModifiers::NONE, None);
+    assert_eq!(app.cursor, 5);
+    app.handle_key(KeyCode::Up, KeyModifiers::NONE, None);
+    app.handle_key(KeyCode::Up, KeyModifiers::NONE, None);
+    app.handle_key(KeyCode::End, KeyModifiers::NONE, None);
+    assert_eq!(app.cursor, 3);
+}
+
+/// 编辑快捷键按词边界与 UTF-8 字符边界移动和删除。
+#[test]
+fn input_editor_supports_word_and_forward_deletion() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "hello, 世界".into();
+    app.cursor = app.input.len();
+
+    app.handle_key(KeyCode::Left, KeyModifiers::ALT, None);
+    assert_eq!(&app.input[app.cursor..], "世界");
+    app.handle_key(KeyCode::Char('w'), KeyModifiers::CONTROL, None);
+    assert_eq!(app.input, "世界");
+    app.cursor = 0;
+    app.handle_key(KeyCode::Delete, KeyModifiers::NONE, None);
+    assert_eq!(app.input, "界");
+}
+
+/// 多行输入支持插入换行和按显示列上下移动光标。
+#[test]
+fn multiline_input_moves_cursor_between_lines() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "甲乙\nabc\n终".into();
+    app.cursor = "甲乙\nab".len();
+
+    app.handle_key(KeyCode::Up, KeyModifiers::NONE, None);
+    assert_eq!(app.cursor, "甲".len());
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE, None);
+    assert_eq!(app.cursor, "甲乙\nab".len());
+    app.cursor = app.input.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::SHIFT, None);
+    assert!(app.input.ends_with('\n'));
+}
+
+/// PageUp 和 PageDown 使用最近视口高度减一作为整页步长，Ctrl+End 回到底部。
+#[test]
+fn page_scroll_uses_last_viewport() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.last_max_scroll = 80;
+    app.last_viewport = 20;
+
+    app.handle_key(KeyCode::PageUp, KeyModifiers::NONE, None);
+    assert_eq!(app.scroll, Some(61));
+    app.handle_key(KeyCode::PageDown, KeyModifiers::NONE, None);
+    assert_eq!(app.scroll, None);
+    app.handle_key(KeyCode::PageUp, KeyModifiers::NONE, None);
+    app.handle_key(KeyCode::End, KeyModifiers::CONTROL, None);
+    assert_eq!(app.scroll, None);
+}
+
+/// 上下文状态在配置窗口后展示占比，并按超过 80% 与 95% 的阈值着色。
+#[test]
+fn context_status_uses_configured_window_thresholds() {
+    assert_eq!(
+        tui::context_status(86_900, Some(200_000)),
+        ("43% · 86.9k".into(), COLOR_MUTED)
+    );
+    assert_eq!(tui::context_status(160_000, Some(200_000)).1, COLOR_MUTED);
+    assert_eq!(tui::context_status(160_001, Some(200_000)).1, COLOR_WARNING);
+    assert_eq!(tui::context_status(190_001, Some(200_000)).1, COLOR_DANGER);
+    assert_eq!(
+        tui::context_status(5_300, None),
+        ("5.3k".into(), COLOR_MUTED)
+    );
 }
 
 /// MIME 推断：图片按扩展名，未知扩展按内容区分文本与二进制。

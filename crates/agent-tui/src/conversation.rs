@@ -98,8 +98,10 @@ pub(crate) struct Msg {
     pub(crate) text: String,
     /// 工具调用参数的单行摘要（仅工具消息）。
     pub(crate) args: Option<String>,
-    /// 工具返回内容的单行摘要（仅工具消息）。
+    /// 工具返回内容的首行摘要（仅工具消息）。
     pub(crate) result: Option<String>,
+    /// 工具返回内容的后续预览行（仅工具消息），`+`/`-` 前缀行按 diff 着色。
+    pub(crate) detail: Vec<String>,
     /// 扩展事件使用的强调色。
     pub(crate) accent: Option<Color>,
     /// 是否以分隔线形式展示扩展事件。
@@ -114,6 +116,7 @@ impl Msg {
             text: text.into(),
             args: None,
             result: None,
+            detail: Vec::new(),
             accent: None,
             divider: false,
         }
@@ -126,15 +129,18 @@ impl Msg {
             text: text.into(),
             args: None,
             result: None,
+            detail: Vec::new(),
             accent: Some(color),
             divider,
         }
     }
 
     /// 将消息转换为行首标记加正文的紧凑样式，并标记正在流式生成的消息。
-    pub(crate) fn to_lines(&self, streaming: bool) -> Vec<Line<'_>> {
+    ///
+    /// `width` 为消息区可用显示宽度，用户消息按它预换行以保持竖条连续。
+    pub(crate) fn to_lines(&self, streaming: bool, width: u16) -> Vec<Line<'_>> {
         match self.kind {
-            MsgKind::User => user_lines(&self.text),
+            MsgKind::User => user_lines(&self.text, width),
             MsgKind::Assistant => markdown_lines(&self.text, streaming),
             MsgKind::ToolRunning => self.tool_lines("", COLOR_WARNING),
             MsgKind::ToolOk => self.tool_lines("", COLOR_SUCCESS),
@@ -169,7 +175,8 @@ impl Msg {
         }
     }
 
-    /// 构造工具调用块：`● 名称(参数)` 加 `⎿ 返回摘要` 行，圆点以状态色区分，块尾留空行。
+    /// 构造工具调用块：`● 名称(参数)` 加 `⎿ 返回摘要` 与缩进的多行预览，
+    /// 圆点以状态色区分，`+`/`-` 前缀的预览行按 diff 着色，块尾留空行。
     pub(crate) fn tool_lines(&self, note: &str, color: Color) -> Vec<Line<'_>> {
         let mut first = vec![
             Span::styled("● ", Style::new().fg(color)),
@@ -185,15 +192,30 @@ impl Msg {
             first.push(Span::styled(format!("  {note}"), Style::new().fg(color)));
         }
         let mut lines = vec![Line::from(first)];
+        let result_color = if matches!(self.kind, MsgKind::ToolError) {
+            COLOR_DANGER
+        } else {
+            COLOR_MUTED
+        };
         if let Some(result) = &self.result {
-            let result_color = if matches!(self.kind, MsgKind::ToolError) {
+            lines.push(Line::from(vec![
+                Span::styled("  ⎿ ", Style::new().fg(COLOR_MUTED)),
+                Span::styled(result.as_str(), Style::new().fg(result_color)),
+            ]));
+        }
+        for detail in &self.detail {
+            let detail_color = if matches!(self.kind, MsgKind::ToolError) {
+                COLOR_DANGER
+            } else if detail.starts_with('+') {
+                COLOR_SUCCESS
+            } else if detail.starts_with('-') {
                 COLOR_DANGER
             } else {
                 COLOR_MUTED
             };
             lines.push(Line::from(vec![
-                Span::styled("  ⎿ ", Style::new().fg(COLOR_MUTED)),
-                Span::styled(result.as_str(), Style::new().fg(result_color)),
+                Span::raw("    "),
+                Span::styled(detail.as_str(), Style::new().fg(detail_color)),
             ]));
         }
         lines.push(Line::default());
@@ -201,14 +223,18 @@ impl Msg {
     }
 }
 
-/// 构造用户消息块：每行左侧竖条并铺统一背景色，与助手正文形成视觉区分。
+/// 构造用户消息块：按显示宽度预换行，每个视觉行都带左侧竖条与统一背景色。
 ///
-/// 背景色只覆盖文本自身，换行由 Paragraph 完成时续行沿用同一样式。
-pub(crate) fn user_lines(text: &str) -> Vec<Line<'_>> {
+/// 预换行避免 Paragraph 自动换行时续行丢失竖条，保证消息块边缘连续。
+pub(crate) fn user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    // 竖条与右侧留白共占 3 列。
+    let max = usize::from(width).saturating_sub(3).max(1);
     let body = if text.is_empty() {
-        vec![""]
+        vec![String::new()]
     } else {
-        text.lines().collect::<Vec<_>>()
+        text.lines()
+            .flat_map(|line| wrap_display(line, max))
+            .collect::<Vec<_>>()
     };
     let mut lines: Vec<Line> = body
         .into_iter()
@@ -224,6 +250,26 @@ pub(crate) fn user_lines(text: &str) -> Vec<Line<'_>> {
         .collect();
     lines.push(Line::default());
     lines
+}
+
+/// 将单个逻辑行按显示宽度拆分为若干视觉行，按字符边界处理全角字符。
+fn wrap_display(line: &str, max: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut width = 0;
+    for ch in line.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            width = 0;
+        }
+        current.push(ch);
+        width += ch_width;
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// 构造角色消息：首行带标记，续行对齐缩进，流式时在末尾附加光标。
@@ -259,10 +305,16 @@ pub(crate) fn conversation_lines<'a>(
     lines
 }
 
-/// Markdown 文本段：普通段落交给 tui-markdown，表格块单独排版。
+/// Markdown 文本段：普通段落交给 tui-markdown，表格与围栏代码块单独排版。
 enum MdSegment<'a> {
     Prose(&'a str),
     Table(Vec<&'a str>),
+    Code {
+        /// 围栏首行声明的语言名。
+        language: &'a str,
+        /// 不含围栏行的代码内容。
+        lines: Vec<&'a str>,
+    },
 }
 
 /// 将助手回复按 Markdown 渲染：表格块自行对齐排版（tui-markdown 不支持表格），
@@ -287,6 +339,7 @@ pub(crate) fn markdown_lines(text: &str, streaming: bool) -> Vec<Line<'_>> {
                 }
             }
             MdSegment::Table(rows) => render_table(&rows, &mut raw),
+            MdSegment::Code { language, lines } => render_code(language, &lines, &mut raw),
         }
     }
 
@@ -323,7 +376,7 @@ pub(crate) fn markdown_lines(text: &str, streaming: bool) -> Vec<Line<'_>> {
     lines
 }
 
-/// 按行扫描文本，切分出表格块：首行以 `|` 开头且次行是 `|---|` 分隔行的连续竖线行。
+/// 按行扫描文本，切分围栏代码块和 Markdown 表格块。
 fn split_markdown_segments(text: &str) -> Vec<MdSegment<'_>> {
     let mut rows: Vec<(usize, &str)> = Vec::new();
     let mut offset = 0;
@@ -337,6 +390,28 @@ fn split_markdown_segments(text: &str) -> Vec<MdSegment<'_>> {
     let mut prose_start = 0;
     let mut index = 0;
     while index < rows.len() {
+        let trimmed = rows[index].1.trim_start();
+        if let Some(language) = trimmed.strip_prefix("```") {
+            if rows[index].0 > prose_start {
+                segments.push(MdSegment::Prose(&text[prose_start..rows[index].0]));
+            }
+            let language = language.trim();
+            index += 1;
+            let mut code = Vec::new();
+            while index < rows.len() && !rows[index].1.trim_start().starts_with("```") {
+                code.push(rows[index].1);
+                index += 1;
+            }
+            if index < rows.len() {
+                index += 1;
+            }
+            segments.push(MdSegment::Code {
+                language,
+                lines: code,
+            });
+            prose_start = rows.get(index).map_or(text.len(), |(start, _)| *start);
+            continue;
+        }
         let is_table_start = is_table_row(rows[index].1)
             && rows
                 .get(index + 1)
@@ -360,6 +435,29 @@ fn split_markdown_segments(text: &str) -> Vec<MdSegment<'_>> {
         segments.push(MdSegment::Prose(&text[prose_start..]));
     }
     segments
+}
+
+/// 渲染围栏代码块：隐藏围栏行，以左侧竖线区分正文，并在首行标注语言。
+fn render_code<'a>(language: &'a str, rows: &[&'a str], out: &mut Vec<Line<'a>>) {
+    let rows = if rows.is_empty() {
+        vec![""]
+    } else {
+        rows.to_vec()
+    };
+    for (index, row) in rows.into_iter().enumerate() {
+        let mut spans = vec![
+            Span::styled("▎ ", Style::new().fg(COLOR_BORDER_FOCUS)),
+            Span::styled(row, Style::new().fg(COLOR_MUTED)),
+        ];
+        if index == 0 && !language.is_empty() {
+            spans.push(Span::styled(
+                format!("  {language}"),
+                Style::new().fg(COLOR_BORDER_FOCUS),
+            ));
+        }
+        out.push(Line::from(spans));
+    }
+    out.push(Line::default());
 }
 
 /// 判断是否为表格行（修剪后以竖线开头）。
@@ -432,17 +530,57 @@ pub(crate) fn render_table<'a>(rows: &[&'a str], out: &mut Vec<Line<'a>>) {
     out.push(Line::default());
 }
 
-/// 清除 tui-markdown 主题自带的背景色：带背景的样式（标题、行内代码）改为前景强调色加粗。
+/// 将 tui-markdown 主题的样式统一映射到 Lucia 色板，避免与主题脱节的杂色。
+///
+/// 带背景的样式（一级标题、行内代码）改为前景强调色加粗；仅带前景色的装饰
+/// （次级标题、列表标记、强调、链接）按加粗与否映射为正文色或次要色。
 pub(crate) fn restyle_markdown(style: Style, accent: Color) -> Style {
-    if style.bg.is_none() {
-        return style;
+    if style.bg.is_some() {
+        let mut modifiers = style.add_modifier;
+        // 下划线在终端里过于花哨，标题保留加粗与颜色即可。
+        modifiers.remove(Modifier::UNDERLINED);
+        return Style::new()
+            .fg(accent)
+            .add_modifier(modifiers | Modifier::BOLD);
     }
-    let mut modifiers = style.add_modifier;
-    // 下划线在终端里过于花哨，标题保留加粗与颜色即可。
-    modifiers.remove(Modifier::UNDERLINED);
-    Style::new()
-        .fg(accent)
-        .add_modifier(modifiers | Modifier::BOLD)
+    if style.fg.is_some() {
+        let modifiers = style.add_modifier;
+        let fg = if modifiers.contains(Modifier::BOLD) {
+            COLOR_TEXT
+        } else {
+            COLOR_MUTED
+        };
+        return Style::new().fg(fg).add_modifier(modifiers);
+    }
+    style
+}
+
+/// 工具结果预览保留的最大行数。
+pub(crate) const TOOL_RESULT_PREVIEW_LINES: usize = 6;
+
+/// 从工具结果 JSON 中提取多行文本预览：首行作摘要，其余行缩进展示。
+///
+/// 文本型 `content` 按行拆分并按显示宽度截断；非文本结构退回单行 JSON 摘要；
+/// 超出预览行数时以省略行标注总行数。
+pub(crate) fn tool_result_lines(value: &Value, max_lines: usize, max_width: usize) -> Vec<String> {
+    let text = match value {
+        Value::Object(map) => match map.get("content") {
+            Some(Value::String(text)) => text.as_str(),
+            _ => return vec![summarize_json(value, max_width)],
+        },
+        Value::String(text) => text.as_str(),
+        other => return vec![summarize_json(other, max_width)],
+    };
+    let total = text.lines().count();
+    let mut lines: Vec<String> = text
+        .lines()
+        .take(max_lines)
+        .map(|line| truncate_line(line.trim_end(), max_width))
+        .collect();
+    if total > max_lines {
+        lines.push(format!("… 共 {total} 行"));
+    }
+    lines
 }
 
 /// 将 JSON 值压缩为单行摘要：对象展开为 `键: 值` 列表，嵌套结构折叠为计数，
