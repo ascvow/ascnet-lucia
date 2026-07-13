@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "publisher": "ascvow",
+  "release": {
+    "owner": "ascvow",
+    "repository": "lucia-plugins",
+    "tag": "registry-v1-2026-07-13"
+  },
+  "plugins": [
+    {
+      "id": "context",
+      "crate": "context-plugin",
+      "directory": "examples/plugins/context-plugin",
+      "files": ["plugin.toml", "target/wasm32-wasip2/release/context_plugin.wasm"]
+    },
+    {
+      "id": "mcp",
+      "crate": "mcp-plugin",
+      "directory": "examples/plugins/mcp-plugin",
+      "files": [
+        "plugin.toml",
+        "target/wasm32-wasip2/release/mcp_plugin.wasm",
+        "config/mastergo.example.json"
+      ]
+    },
+    {
+      "id": "skill",
+      "crate": "skill-plugin",
+      "directory": "examples/plugins/skill-plugin",
+      "files": [
+        "plugin.toml",
+        "target/wasm32-wasip2/release/skill_plugin.wasm",
+        "skills/lucia-plugin-development/SKILL.md"
+      ]
+    },
+    {
+      "id": "command",
+      "crate": "command-plugin",
+      "directory": "examples/plugins/command-plugin",
+      "files": ["plugin.toml", "target/wasm32-wasip2/release/command_plugin.wasm"]
+    },
+    {
+      "id": "teammate",
+      "crate": "teammate-plugin",
+      "directory": "examples/plugins/teammate-plugin",
+      "files": ["plugin.toml", "target/wasm32-wasip2/release/teammate_plugin.wasm"]
+    },
+    {
+      "id": "plan",
+      "crate": "plan-plugin",
+      "directory": "examples/plugins/plan-plugin",
+      "files": ["plugin.toml", "target/wasm32-wasip2/release/plan_plugin.wasm"]
+    },
+    {
+      "id": "sandbox",
+      "crate": "sandbox-plugin",
+      "directory": "examples/plugins/sandbox-plugin",
+      "files": ["plugin.toml", "target/wasm32-wasip2/release/sandbox_plugin.wasm"]
+    }
+  ]
+}

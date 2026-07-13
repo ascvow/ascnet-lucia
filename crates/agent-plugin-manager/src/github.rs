@@ -80,6 +80,8 @@ pub struct GithubInstallOptions {
     pub tag: Option<String>,
     /// 指定 ZIP asset 名称；未指定时按稳定命名规则选择。
     pub asset: Option<String>,
+    /// Registry 声明的归档 SHA-256；设置后必须与下载内容一致。
+    pub expected_sha256: Option<String>,
     /// 允许下载的最大字节数。
     pub max_download_bytes: u64,
 }
@@ -90,6 +92,7 @@ impl Default for GithubInstallOptions {
             enabled: true,
             tag: None,
             asset: None,
+            expected_sha256: None,
             max_download_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
         }
     }
@@ -118,6 +121,25 @@ impl PluginManager {
         source: &GithubPluginSource,
         options: GithubInstallOptions,
     ) -> Result<GithubInstallResult> {
+        self.install_github_with_mode(source, options, false).await
+    }
+
+    /// 下载并原子替换同 ID 的已安装插件，供 Registry 更新流程调用。
+    pub(crate) async fn update_github(
+        &self,
+        source: &GithubPluginSource,
+        options: GithubInstallOptions,
+    ) -> Result<GithubInstallResult> {
+        self.install_github_with_mode(source, options, true).await
+    }
+
+    /// 共享 GitHub 获取和验证流程，并在最终事务阶段选择新增或替换。
+    async fn install_github_with_mode(
+        &self,
+        source: &GithubPluginSource,
+        options: GithubInstallOptions,
+        replace: bool,
+    ) -> Result<GithubInstallResult> {
         if options.max_download_bytes == 0 {
             bail!("GitHub bundle 下载大小上限必须大于零");
         }
@@ -138,7 +160,10 @@ impl PluginManager {
         }
         let archive = download_asset(&client, asset, options.max_download_bytes).await?;
         let checksum_asset = find_checksum_asset(&release.assets, &asset.name);
-        let checksum_verified = if let Some(checksum_asset) = checksum_asset {
+        let checksum_verified = if let Some(expected_sha256) = options.expected_sha256.as_deref() {
+            verify_expected_checksum(&archive, expected_sha256)?;
+            true
+        } else if let Some(checksum_asset) = checksum_asset {
             let checksum = download_asset(&client, checksum_asset, 64 * 1024).await?;
             verify_checksum(&archive, &checksum, &asset.name)?;
             true
@@ -156,13 +181,14 @@ impl PluginManager {
                 release.tag_name,
                 asset.name
             );
-            let plugin = self.install_with_source(
-                bundle,
-                InstallOptions {
-                    enabled: options.enabled,
-                },
-                Some(source_description),
-            )?;
+            let install_options = InstallOptions {
+                enabled: options.enabled,
+            };
+            let plugin = if replace {
+                self.replace_with_source(bundle, install_options, Some(source_description))?
+            } else {
+                self.install_with_source(bundle, install_options, Some(source_description))?
+            };
             Ok(GithubInstallResult {
                 plugin,
                 release_tag: release.tag_name,
@@ -173,6 +199,31 @@ impl PluginManager {
         let _ = fs::remove_dir_all(&temporary);
         result
     }
+}
+
+/// 从指定 GitHub Release 下载具名资产，供 Registry 索引读取复用。
+///
+/// 返回实际解析到的标签与资产内容；网络、鉴权、资产缺失或大小超限时返回错误。
+pub(crate) async fn download_named_release_asset(
+    source: &GithubPluginSource,
+    tag: Option<&str>,
+    asset_name: &str,
+    max_download_bytes: u64,
+) -> Result<(String, Vec<u8>)> {
+    let client = github_client()?;
+    let release = fetch_release(&client, source, tag).await?;
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == asset_name)
+        .ok_or_else(|| {
+            anyhow!(
+                "GitHub Release `{}` 缺少资产 `{asset_name}`",
+                release.tag_name
+            )
+        })?;
+    let bytes = download_asset(&client, asset, max_download_bytes).await?;
+    Ok((release.tag_name, bytes))
 }
 
 /// 显式联网检查 GitHub API 是否可访问；不下载插件或修改任何本地状态。
@@ -339,6 +390,19 @@ fn verify_checksum(archive: &[u8], checksum: &[u8], asset_name: &str) -> Result<
     let actual = format!("{:x}", Sha256::digest(archive));
     if !actual.eq_ignore_ascii_case(expected) {
         bail!("GitHub asset `{asset_name}` 的 SHA-256 校验失败");
+    }
+    Ok(())
+}
+
+/// 校验 Registry 内联声明的 SHA-256，避免索引与资产被拆分替换。
+fn verify_expected_checksum(archive: &[u8], expected: &str) -> Result<()> {
+    let expected = expected.trim();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Registry 中的 SHA-256 格式无效");
+    }
+    let actual = format!("{:x}", Sha256::digest(archive));
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!("插件资产 SHA-256 校验失败");
     }
     Ok(())
 }

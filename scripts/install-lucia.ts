@@ -1,14 +1,7 @@
 import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-
-/** Files copied from an official Lucia plugin bundle. Lucia 官方插件 bundle 的同步描述。 */
-interface OfficialPluginBundle {
-  /** Stable plugin ID and installation directory name. 插件稳定 ID，也是安装目录名。 */
-  id: string
-  /** Runtime files relative to the plugin source directory. 相对于插件源码目录的运行时文件。 */
-  files: string[]
-}
+import { loadOfficialPluginCatalog, type OfficialPluginBundle } from './official-plugins'
 
 /** Repository root used as the source of official bundles. 官方插件 bundle 的仓库源目录。 */
 const repositoryRoot = join(import.meta.dir, '..')
@@ -21,52 +14,11 @@ const zshrcPath = join(homedir(), '.zshrc')
 /** Idempotent PATH entry for Cargo-installed binaries. Cargo 安装目录的幂等 PATH 配置。 */
 const cargoPathLine = 'export PATH="$HOME/.cargo/bin:$PATH"'
 
-/** Official bundles included in the default Lucia installation. Lucia 默认安装包含的官方 bundle。 */
-const bundles: OfficialPluginBundle[] = [
-  {
-    id: 'context',
-    files: ['plugin.toml', 'target/wasm32-wasip2/release/context_plugin.wasm'],
-  },
-  {
-    id: 'mcp',
-    files: [
-      'plugin.toml',
-      'target/wasm32-wasip2/release/mcp_plugin.wasm',
-      'config/mastergo.example.json',
-    ],
-  },
-  {
-    id: 'skill',
-    files: [
-      'plugin.toml',
-      'target/wasm32-wasip2/release/skill_plugin.wasm',
-      'skills/lucia-plugin-development/SKILL.md',
-    ],
-  },
-  {
-    id: 'command',
-    files: ['plugin.toml', 'target/wasm32-wasip2/release/command_plugin.wasm'],
-  },
-  {
-    id: 'teammate',
-    files: ['plugin.toml', 'target/wasm32-wasip2/release/teammate_plugin.wasm'],
-  },
-  {
-    id: 'plan',
-    files: ['plugin.toml', 'target/wasm32-wasip2/release/plan_plugin.wasm'],
-  },
-  {
-    id: 'sandbox',
-    files: ['plugin.toml', 'target/wasm32-wasip2/release/sandbox_plugin.wasm'],
-  },
-]
-
 /**
- * Copies one official plugin's runtime files while retaining user-managed files.
  * 同步一个官方插件的运行时文件，同时保留安装目录中的用户文件。
  */
 async function syncBundle(bundle: OfficialPluginBundle): Promise<void> {
-  const sourceRoot = join(repositoryRoot, 'examples', 'plugins', `${bundle.id}-plugin`)
+  const sourceRoot = join(repositoryRoot, bundle.directory)
   const destinationRoot = join(officialRoot, bundle.id)
   await Promise.all(
     bundle.files.map(async (relativePath) => {
@@ -116,8 +68,9 @@ async function registerZshPath(): Promise<boolean> {
 
 /** Runs official bundle synchronization and zsh registration. 执行官方插件同步和 zsh 注册。 */
 async function main(): Promise<void> {
+  const catalog = await loadOfficialPluginCatalog()
   await mkdir(officialRoot, { recursive: true })
-  for (const bundle of bundles) {
+  for (const bundle of catalog.plugins) {
     await syncBundle(bundle)
   }
   const pathAdded = await registerZshPath()

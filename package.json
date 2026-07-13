@@ -18,7 +18,8 @@
     "build:plugin:skill": "bun run scripts/build-plugin.ts skill-plugin",
     "build:plugin:command": "bun run scripts/build-plugin.ts command-plugin",
     "build:plugin:teammate": "bun run scripts/build-plugin.ts teammate-plugin",
-    "build:plugin:official": "bun run scripts/build-plugin.ts context-plugin mcp-plugin skill-plugin command-plugin teammate-plugin plan-plugin sandbox-plugin",
+    "build:plugin:official": "bun run scripts/build-official-plugins.ts",
+    "package:plugin:official": "bun run build:plugin:official && bun run scripts/package-official-plugins.ts",
     "build:plugin:agent-runtime": "bun run scripts/build-plugin.ts agent-runtime-plugin",
     "build:plugin:ui-showcase": "bun run scripts/build-plugin.ts ui-showcase-plugin",
     "build:plugin:workflow": "bun run scripts/build-plugin.ts workflow-plugin",
@@ -55,6 +56,7 @@
     "docs:rust:private": "cargo doc -p agent-core -p agent-tool -p agent-session -p agent-runtime -p agent-plugin-host -p agent-plugin -p agent-plugin-manager --lib --no-deps --document-private-items"
   },
   "devDependencies": {
+    "fflate": "^0.8.3",
     "vitepress": "^1.6.4"
   }
 }

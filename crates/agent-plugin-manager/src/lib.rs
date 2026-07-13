@@ -5,10 +5,15 @@
 #![deny(missing_docs)]
 
 mod github;
+mod registry;
 
 pub use github::{
     check_github_connectivity, GithubInstallOptions, GithubInstallResult, GithubPluginSource,
     DEFAULT_GITHUB_PUBLISHER,
+};
+pub use registry::{
+    RegistryInstallResult, RegistryOutdatedPlugin, RegistryRequest, RegistrySearchResult,
+    RegistryUpdateResult,
 };
 
 use agent_plugin_host::manifest::{
@@ -177,6 +182,27 @@ impl PluginManager {
         options: InstallOptions,
         source_description: Option<String>,
     ) -> Result<InstalledPlugin> {
+        self.install_or_replace_with_source(bundle, options, source_description, false)
+    }
+
+    /// 从已验证目录替换同 ID 插件；新版本完成校验并写入锁文件后才清理旧目录。
+    pub(crate) fn replace_with_source(
+        &self,
+        bundle: impl AsRef<Path>,
+        options: InstallOptions,
+        source_description: Option<String>,
+    ) -> Result<InstalledPlugin> {
+        self.install_or_replace_with_source(bundle, options, source_description, true)
+    }
+
+    /// 执行新增或原子替换，共享 bundle 校验、暂存目录和锁文件事务。
+    fn install_or_replace_with_source(
+        &self,
+        bundle: impl AsRef<Path>,
+        options: InstallOptions,
+        source_description: Option<String>,
+        replace: bool,
+    ) -> Result<InstalledPlugin> {
         self.ensure_layout()?;
         let source = bundle.as_ref();
         let source_metadata = fs::symlink_metadata(source)
@@ -204,13 +230,17 @@ impl PluginManager {
         validate_storage_component(&manifest.plugin.version, "plugin.version")?;
 
         let mut lock = self.load_lock()?;
-        if lock
+        let existing_index = lock
             .plugins
             .iter()
-            .any(|plugin| plugin.id == manifest.plugin.id)
-        {
+            .position(|plugin| plugin.id == manifest.plugin.id);
+        if existing_index.is_some() && !replace {
             bail!("插件 `{}` 已安装", manifest.plugin.id);
         }
+        if existing_index.is_none() && replace {
+            bail!("插件 `{}` 尚未安装，不能执行更新", manifest.plugin.id);
+        }
+        let previous = existing_index.map(|index| lock.plugins[index].clone());
 
         let plugin_parent = self.plugins_dir().join(&manifest.plugin.id);
         ensure_real_directory(&plugin_parent, true)?;
@@ -248,7 +278,11 @@ impl PluginManager {
                 source: source_description
                     .unwrap_or_else(|| canonical_source.to_string_lossy().into_owned()),
             };
-            lock.plugins.push(installed.clone());
+            if let Some(index) = existing_index {
+                lock.plugins[index] = installed.clone();
+            } else {
+                lock.plugins.push(installed.clone());
+            }
             sort_lock_plugins(&mut lock.plugins);
             if let Err(error) = self.validate_enabled_plugins(&lock) {
                 let _ = fs::remove_dir_all(&destination);
@@ -257,6 +291,17 @@ impl PluginManager {
             if let Err(error) = self.save_lock(&lock) {
                 let _ = fs::remove_dir_all(&destination);
                 return Err(error);
+            }
+            if let Some(previous) = previous.as_ref() {
+                let previous_manifest = self.resolve_locked_manifest(previous)?;
+                if let Some(previous_bundle) = previous_manifest.parent() {
+                    if previous_bundle != destination {
+                        let _ = fs::remove_dir_all(previous_bundle);
+                        if let Some(parent) = previous_bundle.parent() {
+                            let _ = remove_directory_if_empty(parent);
+                        }
+                    }
+                }
             }
             Ok(installed)
         })();
@@ -969,6 +1014,49 @@ mod tests {
         assert_eq!(runtime.manifest_paths.len(), 1);
         assert!(runtime.manifest_paths[0].ends_with("plugins/echo/1.2.3/plugin.toml"));
         assert!(runtime.capability_selection.is_empty());
+    }
+
+    #[test]
+    fn replace_keeps_previous_plugin_when_new_version_is_invalid() {
+        let directory = TestDirectory::new("replace-rollback");
+        let first = create_bundle(&directory.path, "echo", "1.0.0", &[], None);
+        let second = create_bundle(&directory.path, "echo", "2.0.0", &[("missing", "^1")], None);
+        let manager = PluginManager::new(directory.path.join("managed"));
+        manager.install(&first).expect("旧版本应安装成功");
+
+        let error = manager
+            .replace_with_source(&second, InstallOptions::default(), Some("registry".into()))
+            .expect_err("依赖不满足的新版本应拒绝替换");
+
+        assert!(error.to_string().contains("依赖关系无效"));
+        let installed = manager.list().expect("锁文件应保持可读");
+        assert_eq!(installed[0].version, "1.0.0");
+        assert!(directory
+            .path
+            .join("managed/plugins/echo/1.0.0/plugin.toml")
+            .is_file());
+        assert!(!directory.path.join("managed/plugins/echo/2.0.0").exists());
+    }
+
+    #[test]
+    fn replace_switches_lock_before_removing_previous_bundle() {
+        let directory = TestDirectory::new("replace-success");
+        let first = create_bundle(&directory.path, "echo", "1.0.0", &[], None);
+        let second = create_bundle(&directory.path, "echo", "2.0.0", &[], None);
+        let manager = PluginManager::new(directory.path.join("managed"));
+        manager.install(&first).expect("旧版本应安装成功");
+
+        let updated = manager
+            .replace_with_source(&second, InstallOptions::default(), Some("registry".into()))
+            .expect("新版本应原子替换成功");
+
+        assert_eq!(updated.version, "2.0.0");
+        assert_eq!(manager.list().expect("锁文件应可读")[0].version, "2.0.0");
+        assert!(!directory.path.join("managed/plugins/echo/1.0.0").exists());
+        assert!(directory
+            .path
+            .join("managed/plugins/echo/2.0.0/plugin.toml")
+            .is_file());
     }
 
     #[test]
