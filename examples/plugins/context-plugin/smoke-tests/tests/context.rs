@@ -99,6 +99,45 @@ async fn component_replaces_agent_context_and_emits_event() {
     }));
 }
 
+/// 短会话低于压缩水位时插件返回透传，Agent 必须继续使用原始上下文而不是报错。
+#[tokio::test]
+async fn component_passes_through_short_context_without_error() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
+    let plugin_host = Arc::new(
+        load_wasm_plugins(&[manifest])
+            .await
+            .expect("上下文透传 component 应加载成功"),
+    );
+    let model = Arc::new(CapturingModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("capturing", model.clone())
+        .expect("捕获模型应注册成功");
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("capturing", "test-model"),
+    )
+    .with_extension(plugin_host.clone())
+    .with_context_loader(plugin_host.clone());
+
+    let session = Session::from_parts(
+        Some("保持准确".into()),
+        vec![ModelMessage::text(MessageRole::User, "你好")],
+    );
+    agent
+        .run_session(session)
+        .await
+        .expect("短会话应透传原始上下文完成运行");
+
+    let requests = model.requests.lock().expect("模型请求锁不应中毒");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].system.as_deref(), Some("保持准确"));
+    assert_eq!(requests[0].messages.len(), 1);
+    assert_eq!(requests[0].messages[0].text_content(), "你好");
+}
+
 /// 验证微压缩后的工具结果仍可通过真实 WASM 宿主进入模型请求。
 #[tokio::test]
 async fn component_micro_compacts_tool_results_without_breaking_model_request() {
@@ -126,11 +165,13 @@ async fn component_micro_compacts_tool_results_without_breaking_model_request() 
 
     let mut messages = vec![ModelMessage::text(MessageRole::User, "分析工具执行结果")];
     for index in 0..4 {
-        messages.push(ModelMessage::assistant_tool_calls(vec![agent_tool::ToolCall::new(
-            format!("call-{index}"),
-            "read_file",
-            serde_json::json!({ "path": format!("file-{index}.txt") }),
-        )]));
+        messages.push(ModelMessage::assistant_tool_calls(vec![
+            agent_tool::ToolCall::new(
+                format!("call-{index}"),
+                "read_file",
+                serde_json::json!({ "path": format!("file-{index}.txt") }),
+            ),
+        ]));
         messages.push(ModelMessage::tool_result(ToolResult::success(
             format!("call-{index}"),
             "read_file",
@@ -171,11 +212,13 @@ async fn component_reuses_micro_compacted_context_within_fuel_budget() {
         .expect("上下文缓存 component 应加载成功");
     let mut messages = vec![ModelMessage::text(MessageRole::User, "分析工具执行结果")];
     for index in 0..4 {
-        messages.push(ModelMessage::assistant_tool_calls(vec![agent_tool::ToolCall::new(
-            format!("cache-call-{index}"),
-            "read_file",
-            serde_json::json!({ "path": format!("cache-{index}.txt") }),
-        )]));
+        messages.push(ModelMessage::assistant_tool_calls(vec![
+            agent_tool::ToolCall::new(
+                format!("cache-call-{index}"),
+                "read_file",
+                serde_json::json!({ "path": format!("cache-{index}.txt") }),
+            ),
+        ]));
         messages.push(ModelMessage::tool_result(ToolResult::success(
             format!("cache-call-{index}"),
             "read_file",

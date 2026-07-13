@@ -309,7 +309,9 @@ impl UiShowcasePlugin {
                 request.width, request.height
             ))]),
             line(vec![plain("")]),
-            line(vec![plain("这里可以由插件渲染 sub-agent、workflow 或任意业务实例。")]),
+            line(vec![plain(
+                "这里可以由插件渲染 sub-agent、workflow 或任意业务实例。",
+            )]),
             line(vec![styled("Esc 返回上一层", UiColor::Yellow, true)]),
         ]
     }

@@ -20,7 +20,10 @@ async fn wasm_host_routes_sandbox_approval() {
     let host = load_wasm_plugins(&[manifest])
         .await
         .expect("加载 Sandbox WASM 插件");
-    assert_eq!(host.capability_owner(TOOL_POLICY_CAPABILITY), Some("sandbox"));
+    assert_eq!(
+        host.capability_owner(TOOL_POLICY_CAPABILITY),
+        Some("sandbox")
+    );
     let declarations = host.ui_declarations().await.expect("建立 Sandbox UI 路由");
     assert_eq!(declarations[0].placement, UiPlacement::Input);
 
