@@ -86,6 +86,7 @@ dependencies = [
  "agent-tool",
  "anyhow",
  "async-trait",
+ "futures-util",
  "semver",
  "serde",
  "serde_json",
