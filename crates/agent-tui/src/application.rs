@@ -383,6 +383,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     plugin_id,
                     startup_events,
                     ui_declarations,
+                    load_duration_ms: _,
                 } => {
                     app.mark_plugin_ready(plugin_id.clone(), &startup_events);
                     app.add_plugin_views(ui_declarations);
