@@ -21,10 +21,11 @@ provider = "open-ai"
 base_url = "https://api.openai.com/v1"
 model = "gpt-5"
 api_key = "sk-..."
+context_window = 200000
 openai_protocol = "responses"
 ```
 
-`base_url` 是模型服务 URL，`model` 是请求使用的模型名称。密钥默认使用 `api_key = "..."` 直接配置，也可以删除该字段并改用 `api_key_env = "OPENAI_API_KEY"` 指定环境变量名；两者同时存在时 `api_key` 优先。修改配置后重新运行 `lucia` 即可生效。
+`base_url` 是模型服务 URL，`model` 是请求使用的模型名称。可选的 `context_window` 只用于 TUI 状态栏显示当前上下文占比，不会改变模型请求。密钥默认使用 `api_key = "..."` 直接配置，也可以删除该字段并改用 `api_key_env = "OPENAI_API_KEY"` 指定环境变量名；两者同时存在时 `api_key` 优先。修改配置后重新运行 `lucia` 即可生效。
 
 也可以显式初始化指定文件后退出：
 

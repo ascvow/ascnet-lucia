@@ -64,7 +64,7 @@ version = "1.0.0"
 mode = "exclusive"
 ```
 
-Plugin Host 会把选中的 owner 适配成同一个 `ContextLoader` 接口。插件收到 provider-neutral 消息 JSON，返回的 `LoadedContext` 完整替换模型输入；返回错误会终止当前 run，不会回退到完整历史。多个独占 provider 的选择规则见 [Manifest 与权限](/host/manifest-capabilities)。
+Plugin Host 会把选中的 owner 适配成同一个 `ContextLoader` 接口。插件收到 provider-neutral 消息 JSON，返回的 `LoadedContext` 完整替换模型输入；返回 `None` 表示本轮显式透传，宿主继续使用原始完整历史，避免把未修改的上下文跨 WASM 边界回传；返回错误会终止当前 run。多个独占 provider 的选择规则见 [Manifest 与权限](/host/manifest-capabilities)。
 
 官方实现位于 `examples/plugins/context-plugin`。它按 token 水位执行工具结果微压缩或结构化历史压缩，并保留近期完整 API 轮次。
 
