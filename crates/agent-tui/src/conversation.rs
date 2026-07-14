@@ -175,7 +175,7 @@ impl Msg {
         }
     }
 
-    /// 构造工具调用块：`● 名称(参数)` 加 `⎿ 返回摘要` 与缩进的多行预览，
+    /// 构造工具调用块：`● 名称(参数)` 加 `└ 返回摘要` 与缩进的多行预览，
     /// 圆点以状态色区分，`+`/`-` 前缀的预览行按 diff 着色，块尾留空行。
     ///
     /// 摘要与预览行按 `width` 显示宽度截断，避免窄终端下自动换行
@@ -204,7 +204,7 @@ impl Msg {
         };
         if let Some(result) = &self.result {
             lines.push(Line::from(vec![
-                Span::styled("  ⎿ ", Style::new().fg(COLOR_MUTED)),
+                Span::styled("  └ ", Style::new().fg(COLOR_MUTED)),
                 Span::styled(
                     truncate_line(result, preview_width),
                     Style::new().fg(result_color),

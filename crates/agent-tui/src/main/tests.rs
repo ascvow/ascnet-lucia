@@ -503,7 +503,7 @@ fn tool_lines_show_args_and_truncated_result() {
         .join("\n");
 
     assert!(text.contains("● read_file(path: src/main.rs)"), "{text:?}");
-    assert!(text.contains("⎿ content: 很长的文件内容"), "{text:?}");
+    assert!(text.contains("└ content: 很长的文件内容"), "{text:?}");
     assert!(text.contains('…'), "{text:?}");
 }
 
