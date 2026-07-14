@@ -16,11 +16,12 @@
 | `system_prompt` | `String` | 新 Session 缺少 system 时写入的默认提示 |
 | `tool_choice` | `ToolChoice` | 模型是否以及如何选择工具 |
 | `max_tokens` | `Option<u32>` | 单次响应上限；`None` 表示不发送该字段 |
+| `stream` | `bool` | 是否使用模型流式接口；默认 `true`，设为 `false` 时等待完整响应 |
 | `temperature` | `Option<f32>` | 采样温度；范围由 adapter 或服务商校验 |
 | `reasoning` | `ReasoningLevel` | 推理等级；不支持的 adapter 可忽略或报错 |
 | `provider_options` | `Value` | 浅合并到服务商请求的专属 JSON 对象 |
 
-`with_provider(provider)`、`with_model(model)` 和 `with_model_route(provider, model)` 消费并返回 `AgentOptions`。这些函数只写字段，不验证 provider 是否已经注册。
+`with_provider(provider)`、`with_model(model)`、`with_model_route(provider, model)` 和 `with_stream(stream)` 消费并返回 `AgentOptions`。这些函数只写字段，不验证 provider 是否已经注册。
 
 ### `AgentModelConfig::new`
 

@@ -71,6 +71,9 @@ pub struct AgentOptions {
     /// 最大输出 token 数。
     pub max_tokens: Option<u32>,
 
+    /// 是否使用模型流式接口；关闭后等待完整响应再继续处理。
+    pub stream: bool,
+
     /// Sampling temperature.
     /// 采样温度。
     pub temperature: Option<f32>,
@@ -92,6 +95,7 @@ impl Default for AgentOptions {
             system_prompt: DEFAULT_REACT_SYSTEM_PROMPT.to_string(),
             tool_choice: ToolChoice::Auto,
             max_tokens: None,
+            stream: true,
             temperature: None,
             reasoning: ReasoningLevel::Off,
             provider_options: Value::Object(Default::default()),
@@ -125,6 +129,12 @@ impl AgentOptions {
         self.model = model.into();
         self
     }
+
+    /// 以 builder 风格设置是否使用模型流式接口。
+    pub fn with_stream(mut self, stream: bool) -> Self {
+        self.stream = stream;
+        self
+    }
 }
 
 /// Complete runtime model configuration owned by the caller.
@@ -153,6 +163,10 @@ pub struct AgentModelConfig {
     /// 最大输出 token；None 表示 adapter 不发送该字段。
     pub max_tokens: Option<u32>,
 
+    /// 是否使用模型流式接口；缺省为 `true`。
+    #[serde(default = "default_stream")]
+    pub stream: bool,
+
     /// Sampling temperature; None means the adapter omits the field.
     /// 采样温度；None 表示 adapter 不发送该字段。
     pub temperature: Option<f32>,
@@ -176,6 +190,7 @@ impl AgentModelConfig {
             model: model.into(),
             tool_choice: ToolChoice::Auto,
             max_tokens: None,
+            stream: true,
             temperature: None,
             reasoning: ReasoningLevel::Off,
             provider_options: empty_provider_options(),
@@ -185,6 +200,11 @@ impl AgentModelConfig {
 
 fn empty_provider_options() -> Value {
     Value::Object(Default::default())
+}
+
+/// 返回 Agent 模型调用的默认流式模式。
+fn default_stream() -> bool {
+    true
 }
 
 /// Result of one agent run.
@@ -381,6 +401,7 @@ impl Agent {
         let mut config = AgentModelConfig::new(provider_config, model);
         config.tool_choice = options.tool_choice.clone();
         config.max_tokens = options.max_tokens;
+        config.stream = options.stream;
         config.temperature = options.temperature;
         config.reasoning = options.reasoning;
         config.provider_options = options.provider_options.clone();
@@ -409,6 +430,7 @@ impl Agent {
         self.options.model = config.model;
         self.options.tool_choice = config.tool_choice;
         self.options.max_tokens = config.max_tokens;
+        self.options.stream = config.stream;
         self.options.temperature = config.temperature;
         self.options.reasoning = config.reasoning;
         self.options.provider_options = config.provider_options;

@@ -186,8 +186,16 @@ impl Agent {
             )
             .await?;
 
-            let mut model_stream = self.gateway.stream(&self.options.provider, req).await?;
-            self.update_state(|state| state.phase = AgentPhase::StreamingModel);
+            let mut model_stream = if self.options.stream {
+                let stream = self.gateway.stream(&self.options.provider, req).await?;
+                self.update_state(|state| state.phase = AgentPhase::StreamingModel);
+                stream
+            } else {
+                let response = self.gateway.complete(&self.options.provider, req).await?;
+                let (sender, stream) = crate::model::ModelEventStream::channel();
+                sender.done(response);
+                stream
+            };
             // 累积文本增量：取消发生在流中途时，把已生成的部分文本保留进会话。
             let mut streamed_text = String::new();
             while let Some(event) = model_stream.next().await {

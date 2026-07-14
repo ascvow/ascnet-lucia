@@ -63,6 +63,7 @@ pub(crate) struct ModelCompletionHostServices {
     pub(crate) provider: String,
     pub(crate) model: String,
     pub(crate) max_output_tokens: u32,
+    pub(crate) stream: bool,
 }
 
 impl PluginHostServices {
@@ -96,8 +97,9 @@ impl PluginHostServices {
 
     /// 注入插件可请求的固定模型路由和最大输出预算。
     ///
-    /// Guest 只能提交 system、messages 和更小的输出上限；provider、model、工具和
-    /// provider options 均由 Host 控制。插件 manifest 还必须声明 `model_completion`。
+    /// Guest 只能提交 system、messages 和更小的输出上限；provider、model、流式模式、
+    /// 工具和 provider options 均由 Host 控制。插件 manifest 还必须声明
+    /// `model_completion`。
     #[cfg(feature = "wasm")]
     pub fn with_model_completion(
         mut self,
@@ -105,6 +107,7 @@ impl PluginHostServices {
         provider: impl Into<String>,
         model: impl Into<String>,
         max_output_tokens: u32,
+        stream: bool,
     ) -> Result<Self> {
         let provider = provider.into();
         let model = model.into();
@@ -125,6 +128,7 @@ impl PluginHostServices {
             provider,
             model,
             max_output_tokens,
+            stream,
         });
         Ok(self)
     }

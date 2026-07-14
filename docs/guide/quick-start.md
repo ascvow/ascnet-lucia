@@ -59,6 +59,8 @@ openai_protocol = "responses"
 # 0 表示交互主会话不设置总 ReAct 步数上限。
 max_steps = 0
 max_tokens = 4096
+# 默认 true；设为 false 时等待完整模型响应。
+stream = true
 
 [tui]
 sessions_dir = "projects"

@@ -87,6 +87,8 @@ pub struct AgentOptionsPatch {
     pub tool_choice: Option<ToolChoice>,
     /// 覆盖最大输出 token 数。
     pub max_tokens: Option<u32>,
+    /// 覆盖是否使用模型流式接口。
+    pub stream: Option<bool>,
     /// 覆盖采样温度。
     pub temperature: Option<f32>,
     /// 覆盖推理级别。
@@ -116,6 +118,9 @@ impl AgentOptionsPatch {
         if let Some(value) = self.max_tokens {
             options.max_tokens = Some(value);
         }
+        if let Some(value) = self.stream {
+            options.stream = value;
+        }
         if let Some(value) = self.temperature {
             options.temperature = Some(value);
         }
@@ -125,6 +130,26 @@ impl AgentOptionsPatch {
         if let Some(value) = &self.provider_options {
             options.provider_options = value.clone();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 派生配置应能显式关闭基础 Agent 默认启用的流式模式。
+    #[test]
+    fn options_patch_overrides_streaming_mode() {
+        let mut options = AgentOptions::default();
+        assert!(options.stream);
+
+        AgentOptionsPatch {
+            stream: Some(false),
+            ..AgentOptionsPatch::default()
+        }
+        .apply_to(&mut options);
+
+        assert!(!options.stream);
     }
 }
 

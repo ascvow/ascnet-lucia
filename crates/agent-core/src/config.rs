@@ -51,6 +51,7 @@ impl AgentRootConfig {
         let mut config =
             AgentModelConfig::new(self.model.to_provider_config()?, self.model.model.clone());
         config.max_tokens = self.agent.max_tokens.or(config.max_tokens);
+        config.stream = self.agent.stream.unwrap_or(config.stream);
         config.temperature = self.agent.temperature.or(config.temperature);
         config.provider_options = self
             .agent
@@ -83,6 +84,7 @@ impl AgentRootConfig {
             options.system_prompt = system_prompt.clone();
         }
         options.max_tokens = self.agent.max_tokens.or(options.max_tokens);
+        options.stream = self.agent.stream.unwrap_or(options.stream);
         options.temperature = self.agent.temperature.or(options.temperature);
         options.provider_options = self
             .agent
@@ -174,6 +176,8 @@ pub struct AgentConfig {
     pub system_prompt: Option<String>,
     /// 单次模型响应允许生成的最大 token 数；具体支持程度由服务商决定。
     pub max_tokens: Option<u32>,
+    /// 是否使用模型流式接口；`None` 使用默认值 `true`。
+    pub stream: Option<bool>,
     /// 模型采样温度；Core 原样传递，合法范围由服务商适配器校验。
     pub temperature: Option<f32>,
 

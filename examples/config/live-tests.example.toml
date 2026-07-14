@@ -11,6 +11,8 @@ openai_protocol = "chat-completions"
 # 0 表示交互主会话不设置总 ReAct 步数上限。
 max_steps = 0
 max_tokens = 1024
+# 默认使用流式模型接口；兼容仅支持非流式的端点时可设为 false。
+stream = true
 
 # plugin 或 all 场景会加载这个真实 WASM component。
 [[plugins]]

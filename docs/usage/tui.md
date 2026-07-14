@@ -34,6 +34,7 @@ context_window = 200000
 [agent]
 max_steps = 0
 max_tokens = 4096
+stream = true
 
 [tui]
 sessions_dir = "projects"
@@ -58,6 +59,7 @@ lucia
 - `model.context_window`：只用于底栏上下文占比展示，不改变请求上限。
 - `agent.max_steps`：一条用户指令连续执行的 ReAct 步数；交互主会话中 `0` 表示不设置总步数上限。
 - `agent.max_tokens`：单次模型响应的最大输出 token 数，是否支持由服务商决定。
+- `agent.stream`：是否使用模型流式接口，默认 `true`；设为 `false` 时等待完整响应。
 - `tui.sessions_dir`：按项目隔离的会话根目录；相对路径以配置文件目录为基准。
 - `tui.events_jsonl`：可选事件日志；相对路径以配置文件目录为基准。
 

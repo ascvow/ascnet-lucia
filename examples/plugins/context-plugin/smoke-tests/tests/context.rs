@@ -1,9 +1,9 @@
 //! 官方上下文管理插件的真实 WASM 端到端测试。
 
 use agent_core::{
-    Agent, AgentEventKind, AgentOptions, ChatModel, ContentBlock, ContextLoadRequest,
-    ContextLoader, InMemoryEventSink, MessageRole, ModelGateway, ModelMessage, ModelRequest,
-    ModelResponse, ProviderAdapter, Session, TokenUsage, ToolChoice,
+    model::ModelEventStream, Agent, AgentEventKind, AgentOptions, ChatModel, ContentBlock,
+    ContextLoadRequest, ContextLoader, InMemoryEventSink, MessageRole, ModelGateway, ModelMessage,
+    ModelRequest, ModelResponse, ProviderAdapter, Session, TokenUsage, ToolChoice,
 };
 use agent_plugin_host::{
     wasm::{load_wasm_plugins, load_wasm_plugins_with_services},
@@ -12,28 +12,32 @@ use agent_plugin_host::{
 use agent_tool::ToolResult;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 /// 捕获 Agent 实际发送给模型的请求。
+#[derive(Default)]
 struct CapturingModel {
     requests: std::sync::Mutex<Vec<ModelRequest>>,
+    complete_calls: AtomicUsize,
+    stream_calls: AtomicUsize,
 }
 
 /// 在摘要请求中返回带根因错误的测试模型。
 struct FailingSummaryModel;
 
-#[async_trait]
-impl ChatModel for CapturingModel {
-    /// 保存请求并返回确定性文本，避免测试访问网络。
-    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+impl CapturingModel {
+    /// 根据请求类型构造摘要或主 Agent 的确定性响应。
+    fn response_for(request: &ModelRequest) -> ModelResponse {
         let is_summary = request
             .system
             .as_deref()
             .is_some_and(|system| system.contains("负责压缩长对话"));
-        self.requests
-            .lock()
-            .expect("模型请求锁不应中毒")
-            .push(request);
         let mut response = if is_summary {
             ModelResponse::text(
                 "<analysis>不应进入主上下文</analysis><summary>模型生成摘要：已分析旧上下文并保留关键状态。</summary>",
@@ -46,7 +50,36 @@ impl ChatModel for CapturingModel {
             output_tokens: Some(20),
             total_tokens: Some(120),
         });
+        response
+    }
+
+    /// 保存请求，供测试检查摘要与主 Agent 的调用顺序。
+    fn record(&self, request: ModelRequest) {
+        self.requests
+            .lock()
+            .expect("模型请求锁不应中毒")
+            .push(request);
+    }
+}
+
+#[async_trait]
+impl ChatModel for CapturingModel {
+    /// 保存请求并返回确定性文本，避免测试访问网络。
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+        self.complete_calls.fetch_add(1, Ordering::SeqCst);
+        let response = Self::response_for(&request);
+        self.record(request);
         Ok(response)
+    }
+
+    /// 保存流式请求，并返回只包含终态的测试事件流。
+    async fn stream(&self, request: ModelRequest) -> ModelEventStream {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        let response = Self::response_for(&request);
+        self.record(request);
+        let (sender, stream) = ModelEventStream::channel();
+        sender.done(response);
+        stream
     }
 }
 
@@ -78,9 +111,7 @@ impl ProviderAdapter for FailingSummaryModel {
 #[tokio::test]
 async fn component_replaces_agent_context_and_emits_event() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
-    let model = Arc::new(CapturingModel {
-        requests: std::sync::Mutex::new(Vec::new()),
-    });
+    let model = Arc::new(CapturingModel::default());
     let mut gateway = ModelGateway::new();
     gateway
         .register("capturing", model.clone())
@@ -91,6 +122,7 @@ async fn component_replaces_agent_context_and_emits_event() {
             "capturing",
             "trusted-summary-model",
             20_000,
+            false,
         )
         .expect("Host 应接受固定模型完成服务");
     let plugin_host = Arc::new(
@@ -128,6 +160,8 @@ async fn component_replaces_agent_context_and_emits_event() {
     {
         let requests = model.requests.lock().expect("模型请求锁不应中毒");
         assert_eq!(requests.len(), 2);
+        assert_eq!(model.complete_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.stream_calls.load(Ordering::SeqCst), 1);
         let summary_request = &requests[0];
         assert_eq!(summary_request.model, "trusted-summary-model");
         assert_eq!(summary_request.tool_choice, ToolChoice::None);
@@ -170,7 +204,7 @@ async fn component_preserves_summary_model_error_chain() {
         .register("failing", Arc::new(FailingSummaryModel))
         .expect("失败模型应注册成功");
     let services = PluginHostServices::new()
-        .with_model_completion(gateway, "failing", "failing-model", 4_096)
+        .with_model_completion(gateway, "failing", "failing-model", 20_000, false)
         .expect("Host 应接受失败模型服务");
     let plugin_host = load_wasm_plugins_with_services(&[manifest], services)
         .await
@@ -211,9 +245,7 @@ async fn component_passes_through_short_context_without_error() {
             .await
             .expect("上下文透传 component 应加载成功"),
     );
-    let model = Arc::new(CapturingModel {
-        requests: std::sync::Mutex::new(Vec::new()),
-    });
+    let model = Arc::new(CapturingModel::default());
     let mut gateway = ModelGateway::new();
     gateway
         .register("capturing", model.clone())
@@ -250,9 +282,7 @@ async fn component_micro_compacts_tool_results_without_breaking_model_request() 
             .await
             .expect("上下文微压缩 component 应加载成功"),
     );
-    let model = Arc::new(CapturingModel {
-        requests: std::sync::Mutex::new(Vec::new()),
-    });
+    let model = Arc::new(CapturingModel::default());
     let mut gateway = ModelGateway::new();
     gateway
         .register("capturing", model.clone())

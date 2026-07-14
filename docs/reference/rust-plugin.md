@@ -129,7 +129,7 @@ Guest 不能提交模型、provider options、工具权限或 owner。`profile` 
 
 | 方法 | 参数 | 返回/行为 |
 | --- | --- | --- |
-| `complete_model(request)` | system、provider-neutral messages、可选 max_tokens | 返回模型文本和可选用量；Host 固定 provider/model 并禁用工具与推理 |
+| `complete_model(request)` | system、provider-neutral messages、可选 max_tokens | 返回模型文本和可选用量；Host 固定 provider/model/stream 并禁用工具与推理 |
 
 该调用要求 manifest `model_completion = true` 和应用侧 `PluginHostServices::with_model_completion` 绑定。`ModelCompletionRequest` 拒绝未知字段，Guest 无法覆盖路由或 provider options。
 

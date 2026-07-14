@@ -312,14 +312,22 @@ impl CapabilityState {
                 .clamp(1, binding.max_output_tokens),
         );
         model_request.reasoning = ReasoningLevel::Off;
-        let response = binding
-            .gateway
-            .stream(&binding.provider, model_request)
-            .await
-            .context("启动插件模型完成流失败")?
-            .result()
-            .await
-            .context("插件模型完成调用失败")?;
+        let response = if binding.stream {
+            binding
+                .gateway
+                .stream(&binding.provider, model_request)
+                .await
+                .context("启动插件模型完成流失败")?
+                .result()
+                .await
+                .context("插件模型完成调用失败")?
+        } else {
+            binding
+                .gateway
+                .complete(&binding.provider, model_request)
+                .await
+                .context("插件模型非流式完成调用失败")?
+        };
         if !response.tool_calls.is_empty() {
             return Err(anyhow!("模型完成服务返回了未授权工具调用"));
         }
@@ -1006,15 +1014,19 @@ mod tests {
     /// 捕获 Host 最终模型请求的测试适配器。
     struct CapturingCompletionModel {
         requests: Arc<Mutex<Vec<ModelRequest>>>,
+        expect_stream: bool,
     }
 
     #[async_trait]
     impl ChatModel for CapturingCompletionModel {
-        async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
-            panic!("模型完成 Host 必须复用主 Agent 的流式调用路径")
+        async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+            assert!(!self.expect_stream, "Host 应使用配置的非流式调用路径");
+            self.requests.lock().expect("锁定模型请求").push(request);
+            Ok(ModelResponse::text("受控模型摘要"))
         }
 
         async fn stream(&self, request: ModelRequest) -> ModelEventStream {
+            assert!(self.expect_stream, "Host 应使用配置的流式调用路径");
             self.requests.lock().expect("锁定模型请求").push(request);
             let (sender, stream) = ModelEventStream::channel();
             sender.done(ModelResponse::text("受控模型摘要"));
@@ -1332,6 +1344,7 @@ mod tests {
                 "trusted-provider",
                 Arc::new(CapturingCompletionModel {
                     requests: requests.clone(),
+                    expect_stream: true,
                 }),
             )
             .expect("注册测试模型");
@@ -1340,6 +1353,7 @@ mod tests {
             provider: "trusted-provider".into(),
             model: "trusted-model".into(),
             max_output_tokens: 128,
+            stream: true,
         };
 
         let response = CapabilityState::complete_model_with(
@@ -1358,6 +1372,39 @@ mod tests {
         assert_eq!(captured[0].tool_choice, ToolChoice::None);
         assert!(captured[0].tools.is_empty());
         assert_eq!(captured[0].reasoning, ReasoningLevel::Off);
+    }
+
+    /// Host 关闭流式模式后必须改用模型的非流式完成接口。
+    #[tokio::test]
+    async fn model_completion_can_use_non_streaming_route() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut gateway = agent_core::ModelGateway::new();
+        gateway
+            .register(
+                "trusted-provider",
+                Arc::new(CapturingCompletionModel {
+                    requests: requests.clone(),
+                    expect_stream: false,
+                }),
+            )
+            .expect("注册非流式测试模型");
+        let binding = ModelCompletionHostServices {
+            gateway,
+            provider: "trusted-provider".into(),
+            model: "trusted-model".into(),
+            max_output_tokens: 20_000,
+            stream: false,
+        };
+
+        CapabilityState::complete_model_with(
+            true,
+            Some(binding),
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"旧上下文"}]}]}"#,
+        )
+        .await
+        .expect("非流式模型完成应成功");
+
+        assert_eq!(requests.lock().expect("锁定模型请求").len(), 1);
     }
 
     /// Dispatcher 只暴露短控制面操作，并返回可跨 ABI 使用的脱敏结构。

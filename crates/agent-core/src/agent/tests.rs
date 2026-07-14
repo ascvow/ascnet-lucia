@@ -604,6 +604,73 @@ async fn model_stream_deltas_are_forwarded_to_event_sink() {
     assert_eq!(run.final_text, "你好");
 }
 
+/// Agent 默认使用流式接口，显式关闭后只调用非流式完成且不发布文本增量。
+#[tokio::test]
+async fn model_streaming_defaults_on_and_can_be_disabled() {
+    assert!(AgentOptions::default().stream);
+
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("stream", Arc::new(StreamingModel))
+        .expect("注册双模式模型");
+    let sink = Arc::new(InMemoryEventSink::new());
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default()
+            .with_model_route("stream", "stream-model")
+            .with_stream(false),
+    )
+    .with_event_sink(sink.clone());
+
+    let run = agent.run("你好").await.expect("非流式 run 应成功");
+    let events = sink.events().await;
+    assert_eq!(run.final_text, "你好");
+    assert!(!events
+        .iter()
+        .any(|event| event.kind == AgentEventKind::ModelTextDelta));
+}
+
+/// TOML 未声明 stream 时保持默认流式，显式 false 时切换为非流式。
+#[test]
+fn agent_config_controls_streaming_mode() {
+    let default_config: crate::AgentRootConfig = toml::from_str(
+        r#"
+            [model]
+            provider = "open-ai"
+            model = "test-model"
+            api_key = "test-key"
+        "#,
+    )
+    .expect("解析默认流式配置");
+    assert!(default_config.agent_options().stream);
+    assert!(
+        default_config
+            .agent_model_config()
+            .expect("构造默认模型配置")
+            .stream
+    );
+
+    let non_streaming_config: crate::AgentRootConfig = toml::from_str(
+        r#"
+            [model]
+            provider = "open-ai"
+            model = "test-model"
+            api_key = "test-key"
+
+            [agent]
+            stream = false
+        "#,
+    )
+    .expect("解析非流式配置");
+    assert!(!non_streaming_config.agent_options().stream);
+    assert!(
+        !non_streaming_config
+            .agent_model_config()
+            .expect("构造非流式模型配置")
+            .stream
+    );
+}
+
 /// follow-up 消息在任务完成后注入并继续循环。
 #[tokio::test]
 async fn follow_up_continues_the_loop() {

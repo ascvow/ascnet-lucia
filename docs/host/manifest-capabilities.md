@@ -76,7 +76,7 @@ Host 会先串联普通插件的工具 Rewrite，再把最终调用交给选中�
 | `fs_read` | 可用 | 仅允许声明路径及其目录后代 |
 | `process_exec` | 可用 | 无 shell，stdin/stdout 由 Host 管理 |
 | `agent` | 可用 | 分操作授权、profile allowlist、可信身份与卸载撤销 |
-| `model_completion` | 可用 | 应用固定 provider/model，Host 禁用工具与推理并限制输出 |
+| `model_completion` | 可用 | 应用固定 provider/model/stream，Host 禁用工具与推理并限制输出 |
 | `fs_write` | 尚未开放 | manifest 申请会被拒绝 |
 | `http` | 尚未开放 | manifest 申请会被拒绝 |
 | `secrets` | 尚未开放 | manifest 申请会被拒绝 |
@@ -90,7 +90,7 @@ Host 不继承 WASI 环境变量、预打开目录或 stdio。需要 I/O 的插�
 model_completion = true
 ```
 
-Manifest 只允许插件请求一次受限模型完成；应用还必须通过 `PluginHostServices::with_model_completion` 注入已注册的模型网关、可信 provider/model 和最大输出 token。Guest 请求只包含 system、provider-neutral messages 和更小的输出上限，未知字段会被拒绝。Host 强制工具列表为空、`tool_choice = none`、推理关闭，模型返回工具调用或空文本时调用失败。
+Manifest 只允许插件请求一次受限模型完成；应用还必须通过 `PluginHostServices::with_model_completion` 注入已注册的模型网关、可信 provider/model、流式模式和最大输出 token。Guest 请求只包含 system、provider-neutral messages 和更小的输出上限，未知字段会被拒绝。Host 强制工具列表为空、`tool_choice = none`、推理关闭，模型返回工具调用或空文本时调用失败。
 
 ## Agent Runtime 权限
 

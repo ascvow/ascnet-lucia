@@ -103,7 +103,7 @@ let response = host.complete_model(&ModelCompletionRequest {
 })?;
 ```
 
-该能力要求 manifest 声明 `model_completion = true`，且应用通过 `PluginHostServices::with_model_completion` 注入模型网关、provider、model 和最大输出预算。Guest 不能提交模型路由、工具、推理级别或 provider options；Host 固定路由、禁用工具和推理，并收窄输出预算。调用失败或返回空文本时直接返回错误，不会静默退回本地裁剪。
+该能力要求 manifest 声明 `model_completion = true`，且应用通过 `PluginHostServices::with_model_completion` 注入模型网关、provider、model、流式模式和最大输出预算。Guest 不能提交模型路由、流式模式、工具、推理级别或 provider options；Host 固定这些设置并收窄输出预算。调用失败或返回空文本时直接返回错误，不会静默退回本地裁剪。
 
 ## 错误信封
 

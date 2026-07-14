@@ -29,6 +29,7 @@ openai_protocol = "chat-completions"
 [agent]
 max_steps = 12
 max_tokens = 4096
+stream = true
 ```
 
 也可以使用 `open-ai` 的 Responses 协议或 `anthropic` provider；字段与普通 Lucia 配置一致。真实测试需要模型支持结构化工具调用，`minimal` 通过不代表后续场景一定兼容。
