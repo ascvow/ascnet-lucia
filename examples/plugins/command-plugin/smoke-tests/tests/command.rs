@@ -91,7 +91,7 @@ async fn component_routes_builtin_commands_and_dialog() {
     assert_eq!(
         compact,
         PrepareExecuteResponse::SurfaceAction {
-            action: SurfaceAction::CompactSession,
+            action: SurfaceAction::ReloadSessionContext,
         }
     );
 

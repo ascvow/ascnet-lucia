@@ -221,6 +221,7 @@ async fn component_preserves_summary_model_error_chain() {
     );
     let request = ContextLoadRequest {
         run_id: "failing-summary-run".into(),
+        user_initiated: false,
         step: 0,
         provider: "failing".into(),
         model: "failing-model".into(),
@@ -363,6 +364,7 @@ async fn component_reuses_micro_compacted_context_within_fuel_budget() {
     let first = ContextLoadRequest {
         run_id: "cached-micro-run".into(),
         step: 0,
+        user_initiated: false,
         provider: "capturing".into(),
         model: "test-model".into(),
         system: None,
@@ -376,6 +378,7 @@ async fn component_reuses_micro_compacted_context_within_fuel_budget() {
     let second = ContextLoadRequest {
         run_id: "cached-micro-run".into(),
         step: 1,
+        user_initiated: false,
         provider: "capturing".into(),
         model: "test-model".into(),
         system: None,

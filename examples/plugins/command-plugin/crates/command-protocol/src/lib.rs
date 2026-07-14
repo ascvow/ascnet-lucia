@@ -447,8 +447,9 @@ pub enum SurfaceAction {
     NewSession,
     /// 清空当前会话上下文并进入新的空白草稿。
     ClearSession,
-    /// 请求 TUI 立即压缩并持久化当前会话上下文。
-    CompactSession,
+    /// 请求 TUI 通过已注册的上下文加载器立即重载并持久化当前会话上下文。
+    #[serde(alias = "compact_session")]
+    ReloadSessionContext,
     /// 请求 TUI 正常退出应用。
     ExitApplication,
 }

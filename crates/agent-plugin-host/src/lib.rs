@@ -1016,6 +1016,7 @@ mod tests {
         let request = ContextLoadRequest {
             run_id: "run-1".into(),
             step: 0,
+            user_initiated: false,
             provider: "test".into(),
             model: "test-model".into(),
             system: Some("系统提示".into()),
@@ -1045,6 +1046,7 @@ mod tests {
         let request = ContextLoadRequest {
             run_id: "run-1".into(),
             step: 0,
+            user_initiated: false,
             provider: "test".into(),
             model: "test-model".into(),
             system: Some("系统提示".into()),
@@ -1070,6 +1072,7 @@ mod tests {
         let request = ContextLoadRequest {
             run_id: "run-loading".into(),
             step: 0,
+            user_initiated: false,
             provider: "test".into(),
             model: "test-model".into(),
             system: Some("系统提示".into()),

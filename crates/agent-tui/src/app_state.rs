@@ -54,6 +54,9 @@ pub(crate) struct App {
     /// 当前回溯到的历史下标；`None` 表示正在编辑新输入。
     pub(crate) input_history_cursor: Option<usize>,
     pub(crate) running: bool,
+    /// 正在后台执行的斜杠命令原文；期间禁止提交消息或执行新命令。
+    #[cfg(feature = "plugins")]
+    pub(crate) pending_command: Option<String>,
     /// 当前运行的起始时间，用于渲染运行耗时。
     pub(crate) run_started_at: Option<std::time::Instant>,
     pub(crate) should_quit: bool,
@@ -190,6 +193,8 @@ impl App {
             input_history: Vec::new(),
             input_history_cursor: None,
             running: false,
+            #[cfg(feature = "plugins")]
+            pending_command: None,
             run_started_at: None,
             should_quit: false,
             session_record,
@@ -304,6 +309,35 @@ impl App {
         let draft = self.workspace.draft_record()?;
         self.replace_session(draft, Some(notice));
         Ok(())
+    }
+
+    /// 处理后台会话上下文重载结果：替换会话时保留正在编辑的输入。
+    ///
+    /// 处理说明由加载器插件发布的展示事件提供，这里只负责会话状态切换。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn handle_session_context_reloaded(&mut self, result: Result<SessionReloadOutcome>) {
+        self.pending_command = None;
+        match result {
+            Ok(SessionReloadOutcome::Replaced(saved)) => {
+                // 重载在后台完成，用户可能仍在编辑输入，替换会话后原样恢复。
+                let input = std::mem::take(&mut self.input);
+                let cursor = self.cursor;
+                let attachments = std::mem::take(&mut self.attachments);
+                self.replace_session(saved, None);
+                self.input = input;
+                self.cursor = cursor;
+                self.attachments = attachments;
+            }
+            Ok(SessionReloadOutcome::Unchanged) => {}
+            Ok(SessionReloadOutcome::NoLoader) => self.messages.push(Msg::new(
+                MsgKind::Info,
+                "当前没有就绪的上下文加载器，无法重载会话上下文",
+            )),
+            Err(error) => self.messages.push(Msg::new(
+                MsgKind::Error,
+                format!("重载会话上下文失败：{error}"),
+            )),
+        }
     }
 
     /// 追加一个刚 Ready 插件的视图声明，不重置其他插件的帧、焦点或导航栈。
@@ -826,6 +860,13 @@ impl App {
                 self.clear_command_completion();
             }
             KeyCode::Enter => {
+                // 后台命令可能随时替换会话记录，期间禁止并发提交新消息。
+                #[cfg(feature = "plugins")]
+                if self.pending_command.is_some() {
+                    self.messages
+                        .push(Msg::new(MsgKind::Info, "命令仍在执行中，请稍候再发送消息"));
+                    return;
+                }
                 if let Some(agent) = agent {
                     if self.running {
                         // steering 只支持纯文本，附件必须等当前回合结束后随消息发送。

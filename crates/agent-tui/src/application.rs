@@ -316,7 +316,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                 if let Some(input) = app.take_input() {
                                     if let Some(host) = plugin_host.as_ref() {
                                         if let Err(error) =
-                                            execute_command(&mut app, host.as_ref(), input).await
+                                            execute_command(&mut app, host, input).await
                                         {
                                             app.messages.push(Msg::new(
                                                 MsgKind::Error,
@@ -604,6 +604,19 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Some(UiEvent::ContextUsage(tokens)) => {
                 app.context_tokens = Some(tokens);
             }
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::SessionContextReloaded(result)) => {
+                app.handle_session_context_reloaded(*result);
+                // 重载期间加载器插件发布的展示事件补进主事件列表。
+                if let Some(host) = plugin_host.as_ref() {
+                    if let Err(error) = drain_plugin_ui_events(&mut app, host.as_ref()).await {
+                        app.messages.push(Msg::new(
+                            MsgKind::Error,
+                            format!("插件事件处理失败：{error}"),
+                        ));
+                    }
+                }
+            }
             Some(UiEvent::AgentDone(result)) => {
                 record_run_failure_event(events_jsonl.as_deref(), result.as_ref()).await;
                 let queue_may_advance = app.handle_agent_done(*result);
@@ -620,7 +633,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Some(UiEvent::Tick) => {
                 tick_pending.store(false, Ordering::Relaxed);
                 #[cfg(feature = "plugins")]
-                let animate_spinner = app.running || app.plugins_loading;
+                let animate_spinner =
+                    app.running || app.plugins_loading || app.pending_command.is_some();
                 #[cfg(not(feature = "plugins"))]
                 let animate_spinner = app.running;
                 if animate_spinner {

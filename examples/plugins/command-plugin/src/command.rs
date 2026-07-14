@@ -286,7 +286,7 @@ impl CommandPlugin {
                 action: SurfaceAction::ClearSession,
             },
             BuiltinCommand::Compact => PrepareExecuteResponse::SurfaceAction {
-                action: SurfaceAction::CompactSession,
+                action: SurfaceAction::ReloadSessionContext,
             },
             BuiltinCommand::Exit => PrepareExecuteResponse::SurfaceAction {
                 action: SurfaceAction::ExitApplication,

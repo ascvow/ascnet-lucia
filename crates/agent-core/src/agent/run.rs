@@ -156,6 +156,7 @@ impl Agent {
                     model: self.options.model.clone(),
                     system: session.system().cloned(),
                     messages: source_messages,
+                    user_initiated: false,
                 })
                 .await
                 .context("上下文加载失败")?;

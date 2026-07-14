@@ -48,6 +48,7 @@ impl LatencySummary {
 fn context_request() -> ContextLoadRequest {
     ContextLoadRequest {
         run_id: "performance-run".into(),
+        user_initiated: false,
         step: 0,
         provider: "benchmark".into(),
         model: "benchmark-model".into(),

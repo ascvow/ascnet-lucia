@@ -186,7 +186,7 @@ pub(crate) async fn session_completion_items(
 #[cfg(feature = "plugins")]
 pub(crate) async fn execute_command(
     app: &mut App,
-    plugin_host: &dyn PluginHost,
+    plugin_host: &Arc<LivePluginHost>,
     input: String,
 ) -> Result<()> {
     if app.running
@@ -198,9 +198,17 @@ pub(crate) async fn execute_command(
             .push(Msg::new(MsgKind::Error, "该命令只能在 Agent 空闲时执行"));
         return Ok(());
     }
+    // 后台命令可能替换会话记录，结束前不接受新的命令。
+    if app.pending_command.is_some() {
+        app.messages
+            .push(Msg::new(MsgKind::Info, "上一条命令仍在执行中，请稍候"));
+        return Ok(());
+    }
 
+    // 保留命令原文，供转入后台执行时作为进行中指示的标签。
+    let command_label = input.trim().to_string();
     let response: PrepareExecuteResponse = call_typed_plugin_service(
-        plugin_host,
+        plugin_host.as_ref(),
         TUI_COMMAND_CALLER,
         PROVIDER_PLUGIN_ID,
         PREPARE_EXECUTE_SERVICE,
@@ -219,7 +227,7 @@ pub(crate) async fn execute_command(
             request,
         } => {
             let response: CommandCallbackResponse = call_typed_plugin_service(
-                plugin_host,
+                plugin_host.as_ref(),
                 PROVIDER_PLUGIN_ID,
                 &owner_plugin_id,
                 &service,
@@ -246,15 +254,23 @@ pub(crate) async fn execute_command(
         PrepareExecuteResponse::SurfaceAction { action } => match action {
             SurfaceAction::NewSession => app.start_new_draft("已新建空白会话")?,
             SurfaceAction::ClearSession => app.start_new_draft("会话上下文已清空")?,
-            SurfaceAction::CompactSession => compact_current_session(app, plugin_host).await?,
+            SurfaceAction::ReloadSessionContext => {
+                start_session_context_reload(app, Arc::clone(plugin_host), command_label);
+            }
             SurfaceAction::ExitApplication => app.should_quit = true,
         },
         PrepareExecuteResponse::SurfaceOpened { view_id } => {
             if view_id != SESSION_DIALOG_VIEW {
                 return Err(anyhow!("Command 插件返回了未知界面：{view_id}"));
             }
-            process_command_surface_effects(app, plugin_host).await?;
-            refresh_plugin_view(app, plugin_host, PROVIDER_PLUGIN_ID, SESSION_DIALOG_VIEW).await;
+            process_command_surface_effects(app, plugin_host.as_ref()).await?;
+            refresh_plugin_view(
+                app,
+                plugin_host.as_ref(),
+                PROVIDER_PLUGIN_ID,
+                SESSION_DIALOG_VIEW,
+            )
+            .await;
         }
         PrepareExecuteResponse::Output { content } => {
             app.messages.push(Msg::new(MsgKind::Info, content));
@@ -268,60 +284,67 @@ pub(crate) async fn execute_command(
         }
     }
 
-    if let Some(snapshot) = load_command_snapshot(plugin_host).await? {
+    if let Some(snapshot) = load_command_snapshot(plugin_host.as_ref()).await? {
         app.set_command_snapshot(Some(snapshot));
     }
     Ok(())
 }
 
-/// 立即调用 Context 插件压缩当前 Session，成功持久化后再替换内存与界面状态。
+/// 在后台通过已注册的上下文加载器重载当前会话并持久化变化。
+///
+/// 立即返回以保持事件循环渲染；结果经 `SessionContextReloaded` 事件回投主循环，
+/// 处理过程的用户可见说明由加载器插件发布的展示事件提供。
 #[cfg(feature = "plugins")]
-pub(crate) async fn compact_current_session(
+pub(crate) fn start_session_context_reload(
     app: &mut App,
+    plugin_host: Arc<LivePluginHost>,
+    command: String,
+) {
+    app.pending_command = Some(command);
+    let record = app.session_record.clone();
+    let model_name = app.model_name.clone();
+    let session_store = Arc::clone(&app.session_store);
+    let tx = app.tx.clone();
+    tokio::spawn(async move {
+        let result = reload_session_context(
+            plugin_host.as_ref(),
+            session_store.as_ref(),
+            record,
+            model_name,
+        )
+        .await;
+        let _ = tx.send(UiEvent::SessionContextReloaded(Box::new(result)));
+    });
+}
+
+/// 请求上下文加载器重载给定会话记录；仅在内容变化时保存并返回新记录。
+#[cfg(feature = "plugins")]
+async fn reload_session_context(
     plugin_host: &dyn PluginHost,
-) -> Result<()> {
-    let before_session = app.session_record.session.clone();
+    session_store: &dyn SessionStore,
+    record: SessionRecord,
+    model_name: String,
+) -> Result<SessionReloadOutcome> {
     let request = ContextLoadRequest {
-        run_id: format!(
-            "compact:{}:{}",
-            app.session_record.id, app.session_record.revision
-        ),
+        run_id: format!("reload:{}:{}", record.id, record.revision),
         step: 0,
         provider: "manual".into(),
-        model: app.model_name.clone(),
-        system: before_session.system().cloned(),
-        messages: before_session.model_messages(),
+        model: model_name,
+        system: record.session.system().cloned(),
+        messages: record.session.model_messages(),
+        user_initiated: true,
     };
-    let before_messages = request.messages.len();
-    let loaded: LoadedContext = call_typed_plugin_service(
-        plugin_host,
-        TUI_COMMAND_CALLER,
-        CONTEXT_PLUGIN_ID,
-        CONTEXT_COMPACT_SERVICE,
-        &request,
-    )
-    .await?
-    .ok_or_else(|| anyhow!("Context 插件不可用，无法压缩当前会话"))?;
-
+    let Some(loaded) = plugin_host.load_context(&request).await? else {
+        return Ok(SessionReloadOutcome::NoLoader);
+    };
     if loaded.system == request.system && loaded.messages == request.messages {
-        app.messages
-            .push(Msg::new(MsgKind::Info, "当前会话没有可压缩的历史上下文"));
-        return Ok(());
+        return Ok(SessionReloadOutcome::Unchanged);
     }
-
-    let after_messages = loaded.messages.len();
-    let mut compacted_record = app.session_record.clone();
-    compacted_record.session = Session::from_parts(loaded.system, loaded.messages);
-    let expected_revision = (compacted_record.revision > 0).then_some(compacted_record.revision);
-    let saved = save_session_record_reconciled(
-        app.session_store.as_ref(),
-        compacted_record,
-        expected_revision,
-    )
-    .await?;
-    let notice = format!("上下文已立即压缩：{before_messages} 条消息变为 {after_messages} 条");
-    app.replace_session(saved, Some(&notice));
-    Ok(())
+    let mut reloaded = record;
+    reloaded.session = Session::from_parts(loaded.system, loaded.messages);
+    let expected_revision = (reloaded.revision > 0).then_some(reloaded.revision);
+    let saved = save_session_record_reconciled(session_store, reloaded, expected_revision).await?;
+    Ok(SessionReloadOutcome::Replaced(saved))
 }
 
 /// 处理 Command 会话界面产生的查询、恢复和关闭动作。

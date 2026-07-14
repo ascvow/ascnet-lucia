@@ -24,6 +24,10 @@ pub struct ContextLoadRequest {
     pub system: Option<String>,
     /// 扩展提示与完整会话消息组成的原始上下文。
     pub messages: Vec<ModelMessage>,
+    /// 是否由用户显式发起（而非模型请求前的自动加载）。
+    /// 加载器可据此跳过内部水位判断，无条件执行完整处理。
+    #[serde(default)]
+    pub user_initiated: bool,
 }
 
 /// 上下文加载器为一次模型请求返回的完整上下文。

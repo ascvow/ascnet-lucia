@@ -1,9 +1,9 @@
 //! 基于 Claude Code 分层策略的 Lucia 上下文压缩插件。
 
 use agent_plugin::{
-    export_plugin, ActivationContext, AgentPlugin, ContextLoadRequest, EventPresentation,
-    EventPresentationTone, ExtensionEvent, LoadedContext, ModelCompletionRequest,
-    ModelCompletionResponse, PluginHostApi, Result, ServiceCall, ServiceSpec,
+    export_plugin, AgentPlugin, ContextLoadRequest, EventPresentation, EventPresentationTone,
+    ExtensionEvent, LoadedContext, ModelCompletionRequest, ModelCompletionResponse, PluginHostApi,
+    Result,
 };
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
@@ -24,12 +24,6 @@ const RECENT_TOOL_RESULTS_TO_KEEP: usize = 3;
 const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 20_000;
 /// 被微压缩的工具结果占位文本。
 const CLEARED_TOOL_RESULT: &str = "[旧工具结果内容已清理]";
-/// 原生 TUI 调用主动压缩服务时使用的稳定身份。
-const TUI_PLUGIN_ID: &str = "lucia-tui";
-/// Context 插件接收主动压缩请求的服务名。
-const CONTEXT_COMPACT_SERVICE: &str = "context.compact";
-/// 主动压缩服务当前版本。
-const CONTEXT_SERVICE_VERSION: &str = "1.0.0";
 /// 独立摘要调用使用的固定 system 提示，不携带主 Agent 的工具和行为人格。
 const SUMMARY_SYSTEM_PROMPT: &str =
     "你是一名负责压缩长对话的助手。请准确、完整地总结已有上下文，禁止调用工具。";
@@ -119,46 +113,30 @@ impl ContextPlugin {
 }
 
 impl AgentPlugin for ContextPlugin {
-    /// 注册主动压缩服务；命令定义由官方 Command 插件维护。
-    fn activate(&mut self, host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
-        host.upsert_service(&ServiceSpec {
-            name: CONTEXT_COMPACT_SERVICE.into(),
-            version: CONTEXT_SERVICE_VERSION.into(),
-            description: Some("立即压缩原生 TUI 提供的完整 Session 上下文".into()),
-        })?;
-        Ok(())
-    }
-
-    /// 注销主动压缩服务，并释放仅服务于运行期请求的压缩缓存。
-    fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
-        host.remove_service(CONTEXT_COMPACT_SERVICE)?;
+    /// 释放仅服务于运行期请求的压缩缓存。
+    fn deactivate(&mut self, _host: &dyn PluginHostApi) -> Result<()> {
         self.cache = None;
         Ok(())
-    }
-
-    /// 接收原生 TUI 的完整 Session，并同步返回压缩后的替换上下文。
-    fn handle_service(&mut self, host: &dyn PluginHostApi, call: ServiceCall) -> Result<Value> {
-        if call.name != CONTEXT_COMPACT_SERVICE {
-            return Err(anyhow!("Context 插件未实现服务 `{}`", call.name));
-        }
-        if call.caller_id != TUI_PLUGIN_ID {
-            return Err(anyhow!("调用方 `{}` 无权请求上下文压缩", call.caller_id));
-        }
-        self.cache = None;
-        let summarize = |messages: &[Value]| summarize_with_model(host, messages);
-        let outcome = compact_service_request(call.payload, &summarize)?;
-        if let Some(event) = outcome.event {
-            host.emit_event(&event)?;
-        }
-        serde_json::to_value(outcome.context).context("序列化主动压缩结果失败")
     }
 
     /// 根据估算 token 水位透传、微压缩或完整压缩上下文，并发布对应事件。
+    ///
+    /// 用户显式发起的加载（`user_initiated`）跳过增量缓存与水位判断，
+    /// 无条件执行完整压缩策略并始终返回替换上下文。
     fn load_context(
         &mut self,
         host: &dyn PluginHostApi,
         request: ContextLoadRequest,
     ) -> Result<Option<LoadedContext>> {
+        if request.user_initiated {
+            self.cache = None;
+            let summarize = |messages: &[Value]| summarize_with_model(host, messages);
+            let outcome = compress_context(request, true, &summarize)?;
+            if let Some(event) = outcome.event {
+                host.emit_event(&event)?;
+            }
+            return Ok(Some(outcome.context));
+        }
         let cache_hit = self.cache.as_ref().is_some_and(|cache| {
             cache.run_id == request.run_id
                 && cache.provider == request.provider
@@ -295,15 +273,6 @@ fn compress_context(
         },
         event: None,
     })
-}
-
-/// 解析原生 TUI 提供的完整请求，并立即执行不受自动水位限制的压缩。
-fn compact_service_request(
-    payload: Value,
-    summarize: &dyn Fn(&[Value]) -> Result<ModelCompletionResponse>,
-) -> Result<CompressionOutcome> {
-    let request = serde_json::from_value(payload).context("解析主动压缩请求失败")?;
-    compress_context(request, true, summarize)
 }
 
 /// 根据 Claude Code 的 `[1m]` 模型标记返回微压缩和完整压缩水位。
@@ -598,6 +567,7 @@ mod tests {
         let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-small".into(),
+                user_initiated: false,
                 step: 0,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -620,6 +590,7 @@ mod tests {
         let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-micro".into(),
+                user_initiated: false,
                 step: 1,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -663,6 +634,7 @@ mod tests {
         let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-micro-error".into(),
+                user_initiated: false,
                 step: 1,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -702,6 +674,7 @@ mod tests {
         let outcome = compress_context(
             ContextLoadRequest {
                 run_id: "run-full".into(),
+                user_initiated: false,
                 step: 2,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -745,6 +718,7 @@ mod tests {
         let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-two-rounds".into(),
+                user_initiated: false,
                 step: 1,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -775,6 +749,7 @@ mod tests {
         let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-manual".into(),
+                user_initiated: true,
                 step: 0,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -814,6 +789,7 @@ mod tests {
                 ContextLoadRequest {
                     run_id: "incremental-run".into(),
                     step: 0,
+                    user_initiated: false,
                     provider: "test".into(),
                     model: "test-model".into(),
                     system: None,
@@ -831,6 +807,7 @@ mod tests {
                 ContextLoadRequest {
                     run_id: "incremental-run".into(),
                     step: 1,
+                    user_initiated: false,
                     provider: "test".into(),
                     model: "test-model".into(),
                     system: None,
@@ -851,9 +828,9 @@ mod tests {
         );
     }
 
-    /// 主动压缩服务立即返回替换上下文，不保留下一轮待处理状态。
+    /// 用户显式发起的压缩不受水位限制，立即返回替换上下文。
     #[test]
-    fn compact_service_returns_replacement_immediately() {
+    fn user_initiated_compaction_returns_replacement_immediately() {
         let request = ContextLoadRequest {
             run_id: "compact-now".into(),
             step: 0,
@@ -867,12 +844,10 @@ mod tests {
                 text_message("assistant", "中间回复"),
                 text_message("user", "当前请求"),
             ],
+            user_initiated: true,
         };
-        let outcome = compact_service_request(
-            serde_json::to_value(request).expect("主动压缩请求应能序列化"),
-            &test_summary,
-        )
-        .expect("主动压缩服务应立即返回结果");
+        let outcome =
+            compress_context(request, true, &test_summary).expect("主动压缩应立即返回结果");
 
         assert_eq!(outcome.context.messages.len(), 3);
         assert!(outcome.context.messages[0]["content"][0]["text"]

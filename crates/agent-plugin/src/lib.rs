@@ -442,6 +442,10 @@ pub struct ContextLoadRequest {
     pub system: Option<String>,
     /// 扩展提示与会话消息组成的 provider-neutral JSON 消息。
     pub messages: Vec<serde_json::Value>,
+    /// 是否由用户显式发起（而非模型请求前的自动加载）。
+    /// 上下文插件可据此跳过水位判断，无条件执行完整处理。
+    #[serde(default)]
+    pub user_initiated: bool,
 }
 
 /// 上下文插件返回的完整模型输入替换结果。

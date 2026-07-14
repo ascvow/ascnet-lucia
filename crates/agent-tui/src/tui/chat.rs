@@ -91,6 +91,15 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             }
             lines.push(Line::from(spans));
         }
+        // 后台执行的斜杠命令以命令原文作为进行中指示。
+        #[cfg(feature = "plugins")]
+        if let Some(command) = app.pending_command.as_deref() {
+            let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
+            lines.push(Line::from(vec![
+                Span::styled(format!("{spinner} "), Style::new().fg(COLOR_WARNING)),
+                Span::styled(command.to_string(), Style::new().fg(COLOR_MUTED)),
+            ]));
+        }
 
         // 按 Paragraph 的词边界规则计算高度，保证滚动范围与实际渲染一致。
         let wrapped_height = lines.iter().fold(0u16, |height, line| {

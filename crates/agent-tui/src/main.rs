@@ -21,6 +21,8 @@ use conversation::*;
 use plugin_startup::*;
 use session_coordination::*;
 
+#[cfg(feature = "plugins")]
+use agent_core::ContextLoadRequest;
 use agent_core::{
     config::AgentRootConfig,
     event::{AgentEvent, AgentEventKind, CompositeEventSink, EventSink, JsonlEventSink},
@@ -30,8 +32,6 @@ use agent_core::{
     },
     Agent, AgentOptions, AgentRun, Session,
 };
-#[cfg(feature = "plugins")]
-use agent_core::{ContextLoadRequest, LoadedContext};
 #[cfg(feature = "plugins")]
 use agent_plugin_host::{
     manifest::{load_plugin_runtime_config, PluginManifest},
@@ -290,6 +290,9 @@ enum UiEvent {
     ContextUsage(u64),
     /// Agent 运行结束，携带至少一次持久化后的会话状态。
     AgentDone(Box<AgentCompletion>),
+    /// 后台会话上下文重载完成。
+    #[cfg(feature = "plugins")]
+    SessionContextReloaded(Box<Result<SessionReloadOutcome>>),
     /// 后台会话摘要查询完成，等待注入 Command 插件界面。
     #[cfg(feature = "plugins")]
     CommandSurfaceUpdate {
@@ -332,6 +335,17 @@ struct AgentCompletion {
     input: UserSubmission,
 }
 
+/// 一次后台会话上下文重载的会话级结果。
+#[cfg(feature = "plugins")]
+enum SessionReloadOutcome {
+    /// 加载器返回了新上下文，已持久化为该会话记录。
+    Replaced(SessionRecord),
+    /// 加载器返回的上下文与当前会话一致，无需替换。
+    Unchanged,
+    /// 当前没有就绪的上下文加载器。
+    NoLoader,
+}
+
 /// 一次与输入快照绑定的参数候选结果。
 #[cfg(feature = "plugins")]
 struct ResolvedCommandCompletion {
@@ -349,12 +363,6 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 /// 原生 TUI 调用 Command Provider 时使用的稳定身份。
 #[cfg(feature = "plugins")]
 const TUI_COMMAND_CALLER: &str = "lucia-tui";
-/// 官方 Context 插件的稳定 ID。
-#[cfg(feature = "plugins")]
-const CONTEXT_PLUGIN_ID: &str = "context";
-/// 官方 Context 插件立即压缩当前 Session 的服务名。
-#[cfg(feature = "plugins")]
-const CONTEXT_COMPACT_SERVICE: &str = "context.compact";
 
 /// 输入区域的聚焦边框颜色。
 const COLOR_BORDER_FOCUS: Color = Color::Rgb(112, 110, 104);

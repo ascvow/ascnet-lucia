@@ -502,6 +502,7 @@ where
 fn context_request() -> ContextLoadRequest {
     ContextLoadRequest {
         run_id: "benchmark-run".to_string(),
+        user_initiated: false,
         step: 3,
         provider: "benchmark-provider".to_string(),
         model: "benchmark-model".to_string(),

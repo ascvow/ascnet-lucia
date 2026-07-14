@@ -109,7 +109,7 @@ fn prepares_compact_surface_action() {
     assert_eq!(
         response,
         PrepareExecuteResponse::SurfaceAction {
-            action: SurfaceAction::CompactSession
+            action: SurfaceAction::ReloadSessionContext
         }
     );
 }
