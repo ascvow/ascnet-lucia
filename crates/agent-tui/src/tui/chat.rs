@@ -430,9 +430,9 @@ pub(crate) fn context_status(tokens: u64, context_window: Option<u64>) -> (Strin
 ///
 /// 点阵只保留双马尾发束、刘海、红眼、面部与领口，确保常见 TUI 尺寸下仍可辨认。
 const HERO_PORTRAIT: [&str; 14] = [
-    ".......kkk........kkk.......",
-    "......khhk........khhk......",
-    ".....khhhhhhhhhhhhhhhhk.....",
+    "..........kkkkkkkk..........",
+    ".......kkhhhhhhhhhhkk.......",
+    ".....kkhhhhhhhhhhhhhhkk.....",
     "....khhhhhhhhhhhhhhhhhhk....",
     "..rrkhhhhhhhhhhhhhhhhhhkrr..",
     "...khhhhhhhhhhhhhhhhhhhhk...",
