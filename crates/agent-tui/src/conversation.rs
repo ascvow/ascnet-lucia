@@ -142,10 +142,10 @@ impl Msg {
         match self.kind {
             MsgKind::User => user_lines(&self.text, width),
             MsgKind::Assistant => markdown_lines(&self.text, streaming),
-            MsgKind::ToolRunning => self.tool_lines("", COLOR_WARNING),
-            MsgKind::ToolOk => self.tool_lines("", COLOR_SUCCESS),
-            MsgKind::ToolError => self.tool_lines("failed", COLOR_DANGER),
-            MsgKind::ToolSkipped => self.tool_lines("skipped", COLOR_MUTED),
+            MsgKind::ToolRunning => self.tool_lines("", COLOR_WARNING, width),
+            MsgKind::ToolOk => self.tool_lines("", COLOR_SUCCESS, width),
+            MsgKind::ToolError => self.tool_lines("failed", COLOR_DANGER, width),
+            MsgKind::ToolSkipped => self.tool_lines("skipped", COLOR_MUTED, width),
             MsgKind::Error => {
                 conversation_lines("✗", &self.text, COLOR_DANGER, COLOR_DANGER, false)
             }
@@ -177,7 +177,12 @@ impl Msg {
 
     /// 构造工具调用块：`● 名称(参数)` 加 `⎿ 返回摘要` 与缩进的多行预览，
     /// 圆点以状态色区分，`+`/`-` 前缀的预览行按 diff 着色，块尾留空行。
-    pub(crate) fn tool_lines(&self, note: &str, color: Color) -> Vec<Line<'_>> {
+    ///
+    /// 摘要与预览行按 `width` 显示宽度截断，避免窄终端下自动换行
+    /// 把续行顶到行首、破坏缩进对齐。
+    pub(crate) fn tool_lines(&self, note: &str, color: Color, width: u16) -> Vec<Line<'_>> {
+        // 前缀占 4 列，再留 1 列吸收截断省略号，保证整行不超宽。
+        let preview_width = usize::from(width).saturating_sub(5).max(1);
         let mut first = vec![
             Span::styled("● ", Style::new().fg(color)),
             Span::styled(self.text.as_str(), Style::new().fg(COLOR_TEXT).bold()),
@@ -200,7 +205,10 @@ impl Msg {
         if let Some(result) = &self.result {
             lines.push(Line::from(vec![
                 Span::styled("  ⎿ ", Style::new().fg(COLOR_MUTED)),
-                Span::styled(result.as_str(), Style::new().fg(result_color)),
+                Span::styled(
+                    truncate_line(result, preview_width),
+                    Style::new().fg(result_color),
+                ),
             ]));
         }
         for detail in &self.detail {
@@ -215,7 +223,10 @@ impl Msg {
             };
             lines.push(Line::from(vec![
                 Span::raw("    "),
-                Span::styled(detail.as_str(), Style::new().fg(detail_color)),
+                Span::styled(
+                    truncate_line(detail, preview_width),
+                    Style::new().fg(detail_color),
+                ),
             ]));
         }
         lines.push(Line::default());

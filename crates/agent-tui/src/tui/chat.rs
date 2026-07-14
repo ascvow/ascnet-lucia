@@ -123,10 +123,11 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                     width,
                     height: 1,
                 };
+                // 角标覆盖在消息文字上，补暗色背景保证可读。
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled(
                         hint,
-                        Style::new().fg(COLOR_WARNING),
+                        Style::new().fg(COLOR_WARNING).bg(COLOR_USER_BG),
                     ))),
                     hint_area,
                 );
