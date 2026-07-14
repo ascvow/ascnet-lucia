@@ -225,7 +225,8 @@ impl Msg {
 
 /// 构造用户消息块：按显示宽度预换行，每个视觉行都带左侧竖条与统一背景色。
 ///
-/// 预换行避免 Paragraph 自动换行时续行丢失竖条，保证消息块边缘连续。
+/// 预换行避免 Paragraph 自动换行时续行丢失竖条，保证消息块边缘连续；
+/// 每行按显示宽度补齐尾部空格，使背景色铺满整个消息区宽度。
 pub(crate) fn user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     // 竖条与右侧留白共占 3 列。
     let max = usize::from(width).saturating_sub(3).max(1);
@@ -239,10 +240,12 @@ pub(crate) fn user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = body
         .into_iter()
         .map(|line| {
+            // 补齐到 max 列后再加 1 列右侧留白，整行恰好占满 width。
+            let pad = max.saturating_sub(unicode_width::UnicodeWidthStr::width(line.as_str()));
             Line::from(vec![
                 Span::styled("▌ ", Style::new().fg(COLOR_USER).bg(COLOR_USER_BG)),
                 Span::styled(
-                    format!("{line} "),
+                    format!("{line}{}", " ".repeat(pad + 1)),
                     Style::new().fg(COLOR_TEXT).bg(COLOR_USER_BG),
                 ),
             ])
