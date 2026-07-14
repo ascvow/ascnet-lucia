@@ -439,9 +439,9 @@ const HERO_PORTRAIT: [&str; 18] = [
     "....khhhhhhhhhhhhhhhhhhhhhhhhhhk....",
     ".khhhhkhhhhhhhhhhhhhhhhhhhhhkhhhhhk.",
     "krrrkhhkkhhhhshhhhshhhhshhhkkhhkrrrk",
-    ".khhhhkkkqqqsssqqqssssqqqqqkkkhhhhk.",
-    ".khhhhkkksqeEwesqsssseEweqskkkhhhhk.",
-    ".khhhhhqqssEEkEssssssEEkEssqqhhhhhk.",
+    ".khhhhkrRqqqsssqqqssssqqqqqRrkhhhhk.",
+    ".khhhhkrRsqeEwesqsssseEweqsRrkhhhhk.",
+    ".khhhhhrRssEEpEssssssEEpEssRrhhhhhk.",
     ".khhhhhqqssssssssssssssssssqqhhhhhk.",
     ".khhhhhqqqqssssssssssssssqqqqhhhhhk.",
     "..krrrrhhhhhhkdddRRdddkhhhhhhrrrrk..",
@@ -453,18 +453,19 @@ const HERO_PORTRAIT: [&str; 18] = [
 /// 将头像点阵字符映射为终端 RGB 颜色；透明像素返回 `None`。
 fn hero_pixel_color(pixel: u8) -> Option<Color> {
     match pixel {
-        b'k' => Some(Color::Rgb(28, 24, 30)),
-        b'q' => Some(Color::Rgb(50, 42, 51)),
-        b'h' => Some(Color::Rgb(67, 57, 67)),
-        b'l' => Some(Color::Rgb(91, 76, 87)),
-        b'r' => Some(Color::Rgb(132, 23, 40)),
+        b'k' => Some(Color::Rgb(58, 48, 60)),
+        b'q' => Some(Color::Rgb(73, 60, 72)),
+        b'h' => Some(Color::Rgb(90, 72, 87)),
+        b'l' => Some(Color::Rgb(118, 91, 108)),
+        b'r' => Some(Color::Rgb(158, 30, 48)),
         b'R' => Some(Color::Rgb(230, 55, 72)),
         b's' => Some(Color::Rgb(255, 210, 202)),
         b'S' => Some(Color::Rgb(220, 159, 158)),
         b'e' => Some(Color::Rgb(201, 45, 58)),
         b'E' => Some(Color::Rgb(239, 71, 82)),
+        b'p' => Some(Color::Rgb(111, 25, 38)),
         b'w' => Some(Color::Rgb(255, 242, 238)),
-        b'd' => Some(Color::Rgb(43, 39, 48)),
+        b'd' => Some(Color::Rgb(64, 53, 67)),
         _ => None,
     }
 }
@@ -698,6 +699,21 @@ mod hero_portrait_tests {
         let width = HERO_PORTRAIT[0].len();
         for (index, row) in HERO_PORTRAIT.iter().enumerate() {
             assert_eq!(row.len(), width, "头像第 {index} 行宽度不一致");
+        }
+    }
+
+    /// 除透明标记外的每个像素字符都必须拥有颜色，避免静默显示为背景空洞。
+    #[test]
+    fn portrait_palette_covers_every_opaque_pixel() {
+        for (row_index, row) in HERO_PORTRAIT.iter().enumerate() {
+            for (column_index, pixel) in row.bytes().enumerate() {
+                if pixel != b'.' {
+                    assert!(
+                        hero_pixel_color(pixel).is_some(),
+                        "头像第 {row_index} 行第 {column_index} 列缺少颜色"
+                    );
+                }
+            }
         }
     }
 }
