@@ -429,21 +429,23 @@ pub(crate) fn context_status(tokens: u64, context_window: Option<u64>) -> (Strin
 /// Lucia 大头像素点阵；每个字符代表一个像素，`.` 表示透明背景。
 ///
 /// 点阵只保留双马尾发束、刘海、红眼、面部与领口，确保常见 TUI 尺寸下仍可辨认。
-const HERO_PORTRAIT: [&str; 14] = [
-    ".......kkk........kkk.......",
-    "......khhk........khhk......",
-    ".....khhhhhhhhhhhhhhhhk.....",
-    "....khhhhhhhhhhhhhhhhhhk....",
-    "..rrkhhhhhhhhhhhhhhhhhhkrr..",
-    "...khhhhhhhhhhhhhhhhhhhhk...",
-    "..khhhhhhhhhhkkhhhhhhhhhhk..",
-    ".rkhhhRRhhhhkkkkhhhhRRhhhkr.",
-    ".khhhkkkssssssssssskkkhhhhk.",
-    ".khhkkssseesssseesssskkhhhk.",
-    ".rkhhkssssssssssssssskhhhkr.",
-    "..khhhkkkssssssssskkkhhhhk..",
-    "...khhhhkdddRRdddddkhhhhh...",
-    "....rrkkddddddddddddkkrr....",
+const HERO_PORTRAIT: [&str; 16] = [
+    "........kkkk........kkkk........",
+    ".......khhhk........khhhk.......",
+    ".......khhhhhhhhhhhhhhhhk.......",
+    ".....khhhhhhhhhhhhhhhhhhhhk.....",
+    "....khhhhhhhhhhhhhhhhhhhhhhk....",
+    "..khhhkhhhhhhhhhhhhhhhhhhkhhhk..",
+    ".khhhhkhhhhhhhhhhhhhhhhhhkhhhhk.",
+    ".khhhhhkhhhssshhhhssshhhkhhhhhk.",
+    ".khhhhhkksewesssssseweskkhhhhhk.",
+    ".khhhhhkssekessssssekesskhhhhhk.",
+    "..khhhhhksssssssssssssskhhhhhk..",
+    "..khhhhhhksssssssssssskhhhhhhk..",
+    "...khhhhhhkssssRRsssskhhhhhhk...",
+    "...khhhhhhkkdddRRdddkkhhhhhhk...",
+    "....krrrrrkkkddRRddkkkrrrrrk....",
+    ".....rrrrrrrddddddddrrrrrrr.....",
 ];
 
 /// 将头像点阵字符映射为终端 RGB 颜色；透明像素返回 `None`。
@@ -455,6 +457,7 @@ fn hero_pixel_color(pixel: u8) -> Option<Color> {
         b'R' => Some(Color::Rgb(230, 55, 72)),
         b's' => Some(Color::Rgb(255, 210, 202)),
         b'e' => Some(Color::Rgb(201, 45, 58)),
+        b'w' => Some(Color::Rgb(255, 242, 238)),
         b'd' => Some(Color::Rgb(43, 39, 48)),
         _ => None,
     }
@@ -498,8 +501,8 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
         return;
     }
     let mut lines: Vec<Line> = Vec::new();
-    // 头像宽 28 列、高 7 行；与版本和速查合计 15 行。
-    if area.height >= 15 && area.width >= 30 {
+    // 头像宽 32 列、高 8 行；与版本和速查合计 16 行。
+    if area.height >= 16 && area.width >= 34 {
         lines.extend(hero_portrait_lines());
     }
     lines.push(Line::from(Span::styled(
