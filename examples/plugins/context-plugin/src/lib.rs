@@ -185,7 +185,7 @@ fn compress_context(request: ContextLoadRequest, manual: bool) -> CompressionOut
                         "estimated_tokens_before": before_tokens,
                         "estimated_tokens_after": after_tokens,
                         "trigger": if manual { "manual" } else { "auto" },
-                        "strategy": "structured_summary_with_recent_tail"
+                        "strategy": "structured_continuation_summary_with_recent_tail"
                     }),
                     presentation: Some(EventPresentation::divider(
                         "上下文压缩",
@@ -216,12 +216,9 @@ fn compress_context(request: ContextLoadRequest, manual: bool) -> CompressionOut
                         "estimated_tokens_before": before_tokens,
                         "estimated_tokens_after": after_tokens,
                         "trigger": if manual { "manual" } else { "auto" },
-                        "strategy": "clear_old_tool_results"
+                        "strategy": "clear_old_successful_tool_results"
                     }),
-                    presentation: Some(EventPresentation::divider(
-                        "上下文微压缩",
-                        EventPresentationTone::Muted,
-                    )),
+                    presentation: None,
                 }),
             };
         }
@@ -295,9 +292,12 @@ fn estimate_text_tokens(text: &str) -> usize {
     text.len().div_ceil(3)
 }
 
-/// 清理较旧工具结果正文，同时保留调用关联、工具名、错误状态和最近结果。
+/// 清理较旧的成功工具结果正文，同时保留调用关联、错误结果和最近成功结果。
 fn micro_compact_tool_results(messages: &[Value]) -> (Vec<Value>, usize) {
-    let total_results = messages.iter().map(tool_result_count).sum::<usize>();
+    let total_results = messages
+        .iter()
+        .map(compactable_tool_result_count)
+        .sum::<usize>();
     let mut remaining_to_clear = total_results.saturating_sub(RECENT_TOOL_RESULTS_TO_KEEP);
     if remaining_to_clear == 0 {
         return (messages.to_vec(), 0);
@@ -320,6 +320,13 @@ fn micro_compact_tool_results(messages: &[Value]) -> (Vec<Value>, usize) {
                 let Some(result) = block.get_mut("result") else {
                     continue;
                 };
+                if result
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let Some(content) = result.get_mut("content") else {
                     continue;
                 };
@@ -337,15 +344,21 @@ fn micro_compact_tool_results(messages: &[Value]) -> (Vec<Value>, usize) {
     (compacted, cleared)
 }
 
-/// 统计一条消息中的工具结果块数量。
-fn tool_result_count(message: &Value) -> usize {
+/// 统计一条消息中允许微压缩的成功工具结果块数量。
+fn compactable_tool_result_count(message: &Value) -> usize {
     message
         .get("content")
         .and_then(Value::as_array)
         .map(|blocks| {
             blocks
                 .iter()
-                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+                .filter(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("tool_result")
+                        && !block
+                            .pointer("/result/is_error")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                })
                 .count()
         })
         .unwrap_or(0)
@@ -415,12 +428,13 @@ fn recent_tail_start(messages: &[Value], group_starts: &[usize], manual: bool) -
     start
 }
 
-/// 从被替换的历史中提取用户意图、技术进展、工具状态和继续工作线索。
+/// 按继续工作所需的九类信息重建被替换历史，并为每一类单独限制预算。
 fn build_structured_summary(messages: &[Value]) -> String {
     let mut user_requests = Vec::new();
     let mut assistant_progress = Vec::new();
     let mut developer_context = Vec::new();
     let mut tool_activity = Vec::new();
+    let mut errors = Vec::new();
 
     for message in messages {
         match message.get("role").and_then(Value::as_str) {
@@ -432,44 +446,51 @@ fn build_structured_summary(messages: &[Value]) -> String {
             Some("developer") | Some("system") => {
                 collect_text_blocks(message, &mut developer_context, 1_500, 12);
             }
-            Some("tool") => collect_tool_results(message, &mut tool_activity, 40),
+            Some("tool") => collect_tool_results(message, &mut tool_activity, &mut errors, 40),
             _ => {}
         }
     }
 
+    let recent_context = render_recent_context(messages);
+    let latest_user_request = messages
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .map(message_text)
+        .filter(|text| !text.is_empty())
+        .map(|text| truncated(&text, 1_200))
+        .unwrap_or_else(|| "无可提取内容".into());
     let mut summary = format!(
-        "压缩范围：{} 条较旧消息。\n\n## 用户请求与意图\n{}\n\n## 开发者约束与已有上下文\n{}\n\n## 已完成工作与技术进展\n{}\n\n## 工具调用、文件和错误状态\n{}\n\n## 继续工作上下文\n{}",
+        "压缩范围：{} 条较旧消息。以下内容用于继续当前工作，不是对旧消息的简单删除。\n\n## 1. 用户主要请求与意图\n{}\n\n## 2. 关键约束与技术上下文\n{}\n\n## 3. 文件、代码与工具状态\n{}\n\n## 4. 错误与修复线索\n{}\n\n## 5. 问题处理过程\n{}\n\n## 6. 用户消息记录\n{}\n\n## 7. 待办任务线索\n{}\n\n## 8. 当前工作状态\n{}\n\n## 9. 下一步依据\n- 最近用户请求：{}",
         messages.len(),
-        render_items(&user_requests),
-        render_items(&developer_context),
-        render_items(&assistant_progress),
-        render_items(&tool_activity),
-        render_recent_context(messages),
+        render_items_with_limit(latest_items(&user_requests, 6), 2_500),
+        render_items_with_limit(latest_items(&developer_context, 6), 1_800),
+        render_items_with_limit(latest_items(&tool_activity, 16), 3_500),
+        render_items_with_limit(latest_items(&errors, 8), 2_500),
+        render_items_with_limit(latest_items(&assistant_progress, 10), 2_500),
+        render_items_with_limit(latest_items(&user_requests, 14), 3_500),
+        truncated(&recent_context, 2_000),
+        truncated(&recent_context, 2_500),
+        latest_user_request,
     );
     truncate_chars(&mut summary, SUMMARY_CHARACTER_LIMIT);
     summary
 }
 
-/// 收集消息文本块，限制单项和总项数以稳定摘要规模。
+/// 收集消息文本块，达到总项数后淘汰最旧内容以优先保留最近状态。
 fn collect_text_blocks(
     message: &Value,
     output: &mut Vec<String>,
     item_limit: usize,
     max_items: usize,
 ) {
-    if output.len() >= max_items {
-        return;
-    }
     let Some(blocks) = message.get("content").and_then(Value::as_array) else {
         return;
     };
     for block in blocks {
-        if output.len() >= max_items {
-            break;
-        }
         if block.get("type").and_then(Value::as_str) == Some("text") {
             if let Some(text) = block.get("text").and_then(Value::as_str) {
-                output.push(truncated(text, item_limit));
+                push_recent(output, truncated(text, item_limit), max_items);
             }
         }
     }
@@ -481,9 +502,7 @@ fn collect_tool_calls(message: &Value, output: &mut Vec<String>, max_items: usiz
         return;
     };
     for block in blocks {
-        if output.len() >= max_items
-            || block.get("type").and_then(Value::as_str) != Some("tool_call")
-        {
+        if block.get("type").and_then(Value::as_str) != Some("tool_call") {
             continue;
         }
         let Some(call) = block.get("call") else {
@@ -494,19 +513,26 @@ fn collect_tool_calls(message: &Value, output: &mut Vec<String>, max_items: usiz
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let args = call.get("args").cloned().unwrap_or(Value::Null).to_string();
-        output.push(format!("调用 `{name}`，参数：{}", truncated(&args, 600)));
+        push_recent(
+            output,
+            format!("调用 `{name}`，参数：{}", truncated(&args, 600)),
+            max_items,
+        );
     }
 }
 
-/// 收集工具结果状态；成功结果只保留短摘录，错误结果保留更长诊断信息。
-fn collect_tool_results(message: &Value, output: &mut Vec<String>, max_items: usize) {
+/// 分别收集最近的成功工具状态和错误诊断，避免错误被普通结果挤出摘要。
+fn collect_tool_results(
+    message: &Value,
+    output: &mut Vec<String>,
+    errors: &mut Vec<String>,
+    max_items: usize,
+) {
     let Some(blocks) = message.get("content").and_then(Value::as_array) else {
         return;
     };
     for block in blocks {
-        if output.len() >= max_items
-            || block.get("type").and_then(Value::as_str) != Some("tool_result")
-        {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
             continue;
         }
         let Some(result) = block.get("result") else {
@@ -527,11 +553,29 @@ fn collect_tool_results(message: &Value, output: &mut Vec<String>, max_items: us
             .to_string();
         let status = if is_error { "失败" } else { "成功" };
         let limit = if is_error { 1_000 } else { 400 };
-        output.push(format!(
-            "`{name}` {status}，结果：{}",
-            truncated(&content, limit)
-        ));
+        let item = format!("`{name}` {status}，结果：{}", truncated(&content, limit));
+        if is_error {
+            push_recent(errors, item, max_items);
+        } else {
+            push_recent(output, item, max_items);
+        }
     }
+}
+
+/// 在固定容量内追加条目；容量耗尽时移除最旧条目。
+fn push_recent(output: &mut Vec<String>, item: String, max_items: usize) {
+    if max_items == 0 {
+        return;
+    }
+    if output.len() == max_items {
+        output.remove(0);
+    }
+    output.push(item);
+}
+
+/// 返回列表中最多 `max_items` 个最近条目。
+fn latest_items(items: &[String], max_items: usize) -> &[String] {
+    &items[items.len().saturating_sub(max_items)..]
 }
 
 /// 渲染摘要列表；没有内容时给出明确占位，避免模型自行补全事实。
@@ -544,6 +588,13 @@ fn render_items(items: &[String]) -> String {
         .map(|item| format!("- {}", item.trim()))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 渲染摘要分段并独立限制字符预算，避免靠总截断丢失尾部继续工作信息。
+fn render_items_with_limit(items: &[String], limit: usize) -> String {
+    let mut rendered = render_items(items);
+    truncate_chars(&mut rendered, limit);
+    rendered
 }
 
 /// 保留被压缩范围末尾的原文线索，降低任务交接时的意图漂移。
@@ -631,6 +682,22 @@ mod tests {
         })
     }
 
+    /// 构造必须跨微压缩保留的失败工具结果。
+    fn failed_tool_result_message(index: usize, content: impl Into<String>) -> Value {
+        json!({
+            "role": "tool",
+            "content": [{
+                "type": "tool_result",
+                "result": {
+                    "call_id": format!("failed-call-{index}"),
+                    "name": "Read",
+                    "content": content.into(),
+                    "is_error": true
+                }
+            }]
+        })
+    }
+
     /// 低于水位时必须完整透传，避免短会话发生无意义改写。
     #[test]
     fn keeps_small_context_unchanged() {
@@ -673,6 +740,13 @@ mod tests {
             outcome.event.as_ref().map(|event| event.name.as_str()),
             Some("context.micro_compaction.completed")
         );
+        assert!(
+            outcome
+                .event
+                .as_ref()
+                .is_some_and(|event| event.presentation.is_none()),
+            "微压缩事件不应请求 UI 展示"
+        );
         for message in &outcome.context.messages[..3] {
             assert_eq!(
                 message["content"][0]["result"]["content"],
@@ -687,6 +761,31 @@ mod tests {
         }
     }
 
+    /// 微压缩不能清理失败结果，否则后续模型会失去仍待处理的错误状态。
+    #[test]
+    fn micro_compaction_preserves_failed_tool_results() {
+        let failure = failed_tool_result_message(0, "文件不存在：src/missing.rs");
+        let mut messages = vec![failure.clone()];
+        messages.extend((0..4).map(|index| tool_result_message(index, 100_000)));
+        let outcome = compress_context(
+            ContextLoadRequest {
+                run_id: "run-micro-error".into(),
+                step: 1,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages,
+            },
+            false,
+        );
+
+        assert_eq!(outcome.context.messages[0], failure);
+        assert_eq!(
+            outcome.context.messages[1]["content"][0]["result"]["content"],
+            CLEARED_TOOL_RESULT
+        );
+    }
+
     /// 完整压缩应生成结构化摘要，并逐字保留最近 API 轮次。
     #[test]
     fn full_compaction_summarizes_prefix_and_keeps_recent_rounds() {
@@ -694,6 +793,7 @@ mod tests {
         let messages = vec![
             text_message("user", "分析上下文压缩"),
             text_message("assistant", "已定位压缩入口"),
+            failed_tool_result_message(0, "读取配置失败：权限不足"),
             tool_result_message(0, 520_000),
             text_message("assistant", "已完成旧历史分析"),
             text_message("user", recent_request),
@@ -716,10 +816,13 @@ mod tests {
             Some("context.compaction.completed")
         );
         assert_eq!(outcome.context.messages[0]["role"], "developer");
-        assert!(outcome.context.messages[0]["content"][0]["text"]
+        let summary = outcome.context.messages[0]["content"][0]["text"]
             .as_str()
-            .expect("摘要应为文本")
-            .contains("用户请求与意图"));
+            .expect("摘要应为文本");
+        assert!(summary.contains("用户主要请求与意图"));
+        assert!(summary.contains("不是对旧消息的简单删除"));
+        assert!(summary.contains("读取配置失败：权限不足"));
+        assert!(summary.contains("下一步依据"));
         assert!(outcome
             .context
             .messages

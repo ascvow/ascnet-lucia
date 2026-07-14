@@ -79,17 +79,18 @@ async fn component_replaces_agent_context_and_emits_event() {
         .await
         .expect("Agent 应使用插件上下文完成运行");
 
-    let requests = model.requests.lock().expect("模型请求锁不应中毒");
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].messages.len() < 6);
-    assert!(requests[0].messages[0]
-        .text_content()
-        .contains("用户请求与意图"));
-    assert!(requests[0]
-        .messages
-        .iter()
-        .any(|message| message.text_content() == recent_request));
-    drop(requests);
+    {
+        let requests = model.requests.lock().expect("模型请求锁不应中毒");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].messages.len() < 6);
+        assert!(requests[0].messages[0]
+            .text_content()
+            .contains("用户主要请求与意图"));
+        assert!(requests[0]
+            .messages
+            .iter()
+            .any(|message| message.text_content() == recent_request));
+    }
 
     let recorded = events.events().await;
     assert!(recorded.iter().any(|event| {
@@ -185,21 +186,22 @@ async fn component_micro_compacts_tool_results_without_breaking_model_request() 
         .await
         .expect("微压缩后的上下文应能完成模型请求");
 
-    let requests = model.requests.lock().expect("模型请求锁不应中毒");
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].messages.iter().any(|message| {
-        message.content.iter().any(|block| {
-            matches!(block, ContentBlock::ToolResult { result }
-                if result.content.as_str() == Some("[旧工具结果内容已清理]"))
-        })
-    }));
-    drop(requests);
+    {
+        let requests = model.requests.lock().expect("模型请求锁不应中毒");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult { result }
+                    if result.content.as_str() == Some("[旧工具结果内容已清理]"))
+            })
+        }));
+    }
 
     let recorded = events.events().await;
     assert!(recorded.iter().any(|event| {
         event.kind == AgentEventKind::Extension
             && event.payload["name"] == "context.micro_compaction.completed"
-            && event.payload["presentation"]["text"] == "上下文微压缩"
+            && event.payload["presentation"].is_null()
     }));
 }
 
