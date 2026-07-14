@@ -137,6 +137,28 @@ fn render_shows_visual_hierarchy() {
     assert!(!text.contains("ReAct"), "{text:?}");
 }
 
+/// 空会话首屏应在常见终端尺寸内绘制压缩后的彩色像素头像。
+#[test]
+fn empty_session_renders_pixel_portrait() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("创建像素头像测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染像素头像测试界面");
+    let portrait_cells = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .filter(|cell| matches!(cell.symbol(), "▀" | "▄" | "█"))
+        .count();
+
+    assert!(portrait_cells >= 80, "像素头像应包含足够的可见终端像素");
+}
+
 /// 输入提示应紧跟输入盒上边框，下边框之后立即进入状态栏。
 #[test]
 fn input_editor_starts_immediately_after_rule() {

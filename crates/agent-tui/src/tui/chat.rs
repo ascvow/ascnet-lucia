@@ -426,72 +426,81 @@ pub(crate) fn context_status(tokens: u64, context_window: Option<u64>) -> (Strin
     )
 }
 
-/// LUCIA 字标点阵：`#` 为实心像素，渲染时每个像素横向放大为两个全块字符，
-/// 并向右下偏移一个像素投射纹理阴影。
-const HERO_LOGO: [&str; 5] = [
-    "#.... #...# .#### ### .###.",
-    "#.... #...# #.... .#. #...#",
-    "#.... #...# #.... .#. #####",
-    "#.... #...# #.... .#. #...#",
-    "##### .###. .#### ### #...#",
+/// Lucia 大头像素点阵；每个字符代表一个像素，`.` 表示透明背景。
+///
+/// 点阵只保留双马尾发束、刘海、红眼、面部与领口，确保常见 TUI 尺寸下仍可辨认。
+const HERO_PORTRAIT: [&str; 14] = [
+    ".......kkk........kkk.......",
+    "......khhk........khhk......",
+    ".....khhhhhhhhhhhhhhhhk.....",
+    "....khhhhhhhhhhhhhhhhhhk....",
+    "..rrkhhhhhhhhhhhhhhhhhhkrr..",
+    "...khhhhhhhhhhhhhhhhhhhhk...",
+    "..khhhhhhhhhhkkhhhhhhhhhhk..",
+    ".rkhhhRRhhhhkkkkhhhhRRhhhkr.",
+    ".khhhkkkssssssssssskkkhhhhk.",
+    ".khhkkssseesssseesssskkhhhk.",
+    ".rkhhkssssssssssssssskhhhkr.",
+    "..khhhkkkssssssssskkkhhhhk..",
+    "...khhhhkdddRRdddddkhhhhh...",
+    "....rrkkddddddddddddkkrr....",
 ];
-/// 字标纵向渐变的起始色（浅绯红）。
-const HERO_LOGO_TOP: (u8, u8, u8) = (255, 128, 138);
-/// 字标纵向渐变的结束色（深绯红）。
-const HERO_LOGO_BOTTOM: (u8, u8, u8) = (168, 32, 58);
-/// 字标阴影颜色（暗绯红）。
-const HERO_LOGO_SHADOW: Color = Color::Rgb(96, 26, 38);
 
-/// 在两个 RGB 颜色间按比例线性插值。
-fn lerp_color(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> Color {
-    let channel = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
-    Color::Rgb(
-        channel(from.0, to.0),
-        channel(from.1, to.1),
-        channel(from.2, to.2),
-    )
+/// 将头像点阵字符映射为终端 RGB 颜色；透明像素返回 `None`。
+fn hero_pixel_color(pixel: u8) -> Option<Color> {
+    match pixel {
+        b'k' => Some(Color::Rgb(28, 24, 30)),
+        b'h' => Some(Color::Rgb(67, 57, 67)),
+        b'r' => Some(Color::Rgb(132, 23, 40)),
+        b'R' => Some(Color::Rgb(230, 55, 72)),
+        b's' => Some(Color::Rgb(255, 210, 202)),
+        b'e' => Some(Color::Rgb(201, 45, 58)),
+        b'd' => Some(Color::Rgb(43, 39, 48)),
+        _ => None,
+    }
 }
 
-/// 空会话首屏：垂直居中展示字标、版本、工作目录与快捷键速查。
+/// 使用上下半块字符把两行头像像素压缩为一个终端行。
+fn hero_portrait_lines() -> Vec<Line<'static>> {
+    let width = HERO_PORTRAIT[0].len();
+    HERO_PORTRAIT
+        .chunks_exact(2)
+        .map(|rows| {
+            let top = rows[0].as_bytes();
+            let bottom = rows[1].as_bytes();
+            let spans = (0..width)
+                .map(|column| {
+                    let top = hero_pixel_color(top[column]);
+                    let bottom = hero_pixel_color(bottom[column]);
+                    match (top, bottom) {
+                        (None, None) => Span::raw(" "),
+                        (Some(color), None) => Span::styled("▀", Style::new().fg(color)),
+                        (None, Some(color)) => Span::styled("▄", Style::new().fg(color)),
+                        (Some(top), Some(bottom)) if top == bottom => {
+                            Span::styled("█", Style::new().fg(top))
+                        }
+                        (Some(top), Some(bottom)) => {
+                            Span::styled("▀", Style::new().fg(top).bg(bottom))
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// 空会话首屏：垂直居中展示像素头像、版本、工作目录与快捷键速查。
 ///
-/// 尺寸不足以容纳字标时退化为纯文字信息，区域过小则完全不绘制。
+/// 尺寸不足以容纳头像时退化为纯文字信息，区域过小则完全不绘制。
 fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
     if area.width < 30 || area.height < 6 {
         return;
     }
     let mut lines: Vec<Line> = Vec::new();
-    // 点阵放大加阴影后宽 56 列、高 6 行，加速查共 15 行，需要足够空间才展示。
-    if area.height >= 15 && area.width >= 58 {
-        let filled = |row: usize, col: usize| {
-            HERO_LOGO
-                .get(row)
-                .and_then(|line| line.as_bytes().get(col))
-                .copied()
-                == Some(b'#')
-        };
-        let rows = HERO_LOGO.len();
-        let cols = HERO_LOGO[0].len();
-        let last_row = rows.saturating_sub(1).max(1);
-        // 多渲染一行一列，容纳最下与最右侧实心像素的投影。
-        for row in 0..=rows {
-            let color = lerp_color(
-                HERO_LOGO_TOP,
-                HERO_LOGO_BOTTOM,
-                row.min(last_row) as f32 / last_row as f32,
-            );
-            let mut spans: Vec<Span> = Vec::with_capacity(cols + 1);
-            for col in 0..=cols {
-                if filled(row, col) {
-                    spans.push(Span::styled("██", Style::new().fg(color)));
-                } else if row > 0 && col > 0 && filled(row - 1, col - 1) {
-                    spans.push(Span::styled("░░", Style::new().fg(HERO_LOGO_SHADOW)));
-                } else {
-                    spans.push(Span::raw("  "));
-                }
-            }
-            lines.push(Line::from(spans));
-        }
-        lines.push(Line::default());
+    // 头像宽 28 列、高 7 行；与版本和速查合计 15 行。
+    if area.height >= 15 && area.width >= 30 {
+        lines.extend(hero_portrait_lines());
     }
     lines.push(Line::from(Span::styled(
         format!("lucia v{} · {cwd}", env!("CARGO_PKG_VERSION")),
