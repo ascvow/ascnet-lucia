@@ -1,58 +1,60 @@
 # Lucia
 
-Lucia 是一个完全开源、可以自己组装能力的终端 Agent。
+English | [简体中文](README.zh-CN.md)
 
-它不是又一个把模型包进命令行的外壳。Lucia 更关心的是：当 Agent 可以读取代码、调用工具、启动进程，甚至替你连续完成一组任务时，你能否看见它如何工作、限制它能做什么，并替换其中任何一个不符合需要的部分。
+Lucia is a fully open-source terminal agent designed to be inspectable, configurable, and extensible.
 
-## 为什么做 Lucia
+It is not another command-line wrapper around a model. Lucia is built around a more practical question: when an agent can read your code, invoke tools, start processes, and carry out a chain of tasks, can you see how it works, limit what it may do, and replace any part that does not fit your needs?
 
-近期，一些 AI 编程工具的数据采集方式和本地代码处理边界引发了争议。无论具体事件最终如何定性，有一个问题已经无法回避：一个深入终端、代码仓库和开发环境的工具，不应该只要求用户无条件信任。
+## Why Lucia Exists
 
-Lucia 因此诞生。
+Recent controversy around how some AI coding tools collect data and handle local source code has made one issue hard to ignore. Whatever the final judgment on any individual case, a tool with deep access to terminals, repositories, and development environments should not have to be trusted as a black box.
 
-我们希望 Agent 的运行方式可以检查，能力可以选择，权限可以收紧。你不需要接受一整套不可拆分的功能，也不必等待某家公司决定下一步开放什么。需要 MCP，就安装 MCP 插件；需要 Skill、工作流、多 Agent 协作或新的交互界面，也可以通过插件实现。用不到的能力，不必交给它权限。
+That is why Lucia exists.
 
-整个项目采用 MIT 许可证公开源代码。从模型请求、Agent 循环到工具路由、会话存储、插件加载和权限检查，都可以被阅读、修改和重新构建。
+An agent should be inspectable. Its capabilities should be optional, and its permissions should be narrow by default. You should not have to accept an inseparable bundle of features or wait for a vendor to decide what can be extended. If you need MCP, install the MCP plugin. Skills, workflows, multi-agent collaboration, and custom interfaces belong in plugins as well. Capabilities you do not use do not need permissions.
 
-## Lucia 能做什么
+The entire project is available under the MIT License. The model request path, agent loop, tool routing, session storage, plugin loading, and permission checks can all be read, changed, and rebuilt.
 
-- 在终端中与真实模型交互，并按项目保存和恢复会话。
-- 接入 OpenAI、Anthropic 和 OpenAI-compatible 模型服务。
-- 通过 WASM 插件增加 MCP、Skill、命令、上下文压缩、计划、审批和多 Agent 协作等能力。
-- 只使用轻量的 Agent Core，或按需组合会话、Runtime、Plugin Host 和 TUI。
-- 把 Lucia 作为 Rust 库嵌入自己的应用，而不是只能使用现成终端界面。
+## What Lucia Can Do
 
-Lucia 当前提供 Context、MCP、Skill、Command、Teammate、Plan 和 Sandbox 等官方插件。插件不是附属脚本，而是项目的主要扩展方式：Core 负责通用 Agent 机制，具体功能留在各自插件中。
+- Work with real models from a terminal while saving and resuming sessions per project.
+- Connect to OpenAI, Anthropic, and OpenAI-compatible model services.
+- Add MCP, Skills, commands, context compression, planning, approvals, and multi-agent collaboration through WASM plugins.
+- Run as a lightweight Agent Core or compose session storage, Runtime, Plugin Host, and the TUI as needed.
+- Embed Lucia as a Rust library instead of using the bundled terminal interface.
 
-## 先运行一次
+Lucia currently ships official Context, MCP, Skill, Command, Teammate, Plan, and Sandbox plugins. Plugins are not an afterthought; they are the primary extension model. Core owns the general agent mechanics, while each concrete capability stays in its own plugin.
 
-只想确认项目能够工作，安装 Rust 后在仓库根目录执行：
+## Try It Once
+
+To verify the project with only Rust installed, run this from the repository root:
 
 ```bash
-cargo run -p agent-basic-cli -- --demo "你好"
+cargo run -p agent-basic-cli -- --demo "hello"
 ```
 
-这个示例使用确定性的内置模型，不需要 API key，也不会连接外部模型服务。它会走完一次模型请求、原生工具调用和结果回传流程。
+This example uses a deterministic built-in model. It needs no API key and does not contact an external model service. It exercises one complete model request, native tool call, and result round trip.
 
-## 环境要求
+## Requirements
 
-- Rust stable，具体工具链以仓库中的 `rust-toolchain.toml` 为准。
-- `wasm32-wasip2`，仅在编译 WASM 插件时需要。
-- Bun 是可选项，用于批量构建和同步官方插件，不是编译 Lucia Core 的必要条件。
+- Rust stable. The exact toolchain is defined in `rust-toolchain.toml`.
+- `wasm32-wasip2`, only when building WASM plugins.
+- Bun is optional. It automates bulk builds and installation of the official plugins, but it is not required to build Lucia Core.
 
-缺少 WASM target 时可以手动安装：
+Install the WASM target manually if it is missing:
 
 ```bash
 rustup target add wasm32-wasip2
 ```
 
-## 编译与安装
+## Build and Install
 
-Lucia 有纯 Core 和插件版两种构建形态。两者生成的命令都叫 `lucia`，区别在于是否包含 Plugin Host、Wasmtime、插件管理和插件 UI。
+Lucia has two build variants: Core-only and plugin-enabled. Both produce a binary named `lucia`; the difference is whether Plugin Host, Wasmtime, plugin management, and plugin UI support are included.
 
-### 方式一：只使用 Cargo 编译纯 Core
+### Option 1: Build Core with Cargo Only
 
-纯 Core 版本不包含 WASM 插件系统，适合只需要模型、原生工具、会话和事件能力的用户。
+The Core-only build excludes the WASM plugin system. It is suitable when you only need models, native tools, sessions, and events.
 
 ```bash
 cargo build \
@@ -64,7 +66,7 @@ cargo build \
 ./target/core-tui/release/lucia --demo
 ```
 
-安装到 Cargo bin 目录：
+Install it into Cargo's binary directory:
 
 ```bash
 cargo install \
@@ -76,11 +78,11 @@ cargo install \
 lucia --demo
 ```
 
-如果 shell 找不到 `lucia`，确认 `$HOME/.cargo/bin` 已加入 `PATH`。
+If your shell cannot find `lucia`, make sure `$HOME/.cargo/bin` is in `PATH`.
 
-### 方式二：只使用 Cargo 编译插件版
+### Option 2: Build the Plugin-Enabled Version with Cargo
 
-插件版包含 Plugin Host 和插件管理能力，但单独编译主程序不会自动构建或安装官方插件。
+This build includes Plugin Host and plugin management. Building the main binary alone does not build or install the official plugins.
 
 ```bash
 cargo build \
@@ -92,7 +94,7 @@ cargo build \
 ./target/plugin-tui/release/lucia --demo
 ```
 
-安装插件版命令：
+Install the plugin-enabled binary:
 
 ```bash
 cargo install \
@@ -102,7 +104,7 @@ cargo install \
   --features plugins
 ```
 
-不使用 Bun 也可以手动编译并加载单个插件。下面以 Echo 插件为例：
+You can also build and load a single plugin without Bun. This example uses the Echo plugin:
 
 ```bash
 cargo build \
@@ -116,23 +118,23 @@ cargo build \
   --plugin-manifest examples/plugins/echo-plugin/plugin.toml
 ```
 
-### 方式三：一键安装插件版和官方插件
+### Option 3: Install Lucia with the Official Plugins
 
-希望直接使用完整体验时，可以安装 Bun 后运行：
+For the complete bundled experience, install Bun and run:
 
 ```bash
 bun run install:tui
 lucia --demo
 ```
 
-这条命令会依次完成：
+This command:
 
-1. 编译官方 WASM 插件。
-2. 通过 Cargo 编译并安装插件版 `lucia`。
-3. 将官方插件同步到 `$LUCIA_HOME/official-plugins`，未设置 `LUCIA_HOME` 时使用 `$HOME/.lucia`。
-4. 按需把 `$HOME/.cargo/bin` 写入 zsh 的 `PATH`。
+1. Builds the official WASM plugins.
+2. Builds and installs the plugin-enabled `lucia` binary through Cargo.
+3. Synchronizes official plugins into `$LUCIA_HOME/official-plugins`, or `$HOME/.lucia/official-plugins` when `LUCIA_HOME` is not set.
+4. Adds `$HOME/.cargo/bin` to the zsh `PATH` when needed.
 
-只想构建而不安装时，可以分别运行：
+To build without installing:
 
 ```bash
 bun run build:tui:core
@@ -140,24 +142,24 @@ bun run build:tui:plugins
 bun run build:plugin:official
 ```
 
-对应产物位于 `target/core-tui/release/lucia`、`target/plugin-tui/release/lucia` 和各插件目录的 `target/wasm32-wasip2/release`。
+The outputs are written to `target/core-tui/release/lucia`, `target/plugin-tui/release/lucia`, and each plugin's `target/wasm32-wasip2/release` directory.
 
-## 配置模型
+## Configure a Model
 
-首次启动会创建 `$HOME/.lucia/config.toml`。也可以先初始化配置后退出：
+On first launch, Lucia creates `$HOME/.lucia/config.toml`. You can also initialize the configuration and exit:
 
 ```bash
 lucia --init
 ```
 
-下面是一份最小配置：
+A minimal configuration looks like this:
 
 ```toml
 [model]
 name = "default"
 provider = "open-ai"
 base_url = "https://api.openai.com/v1"
-model = "替换为账号可用的模型 ID"
+model = "replace-with-an-available-model-id"
 api_key_env = "OPENAI_API_KEY"
 openai_protocol = "responses"
 
@@ -169,41 +171,41 @@ max_tokens = 4096
 sessions_dir = "projects"
 ```
 
-`api_key_env` 保存的是环境变量名，不是密钥本身。设置环境变量后启动：
+`api_key_env` stores the name of an environment variable, not the key itself. Set the variable before starting Lucia:
 
 ```bash
-export OPENAI_API_KEY="你的密钥"
+export OPENAI_API_KEY="your-api-key"
 lucia
 ```
 
-`provider` 还支持 `open-ai-compatible` 和 `anthropic`。本地模型服务、其他接口地址及完整配置项见 [TUI 配置与会话](docs/guide/tui-configuration.md)。
+The `provider` field also supports `open-ai-compatible` and `anthropic`. See [TUI configuration and sessions](docs/guide/tui-configuration.md) for local model services, custom endpoints, and the full configuration reference.
 
-## 我们如何看待安全
+## Security Model
 
-开源不等于自动安全，WASM 也不是一句“沙箱”就能解决所有问题。Lucia 选择把边界写清楚，而不是给出无法兑现的承诺。
+Open source does not make software automatically secure, and calling something a WASM sandbox does not settle every trust question. Lucia documents its boundaries instead of making promises it cannot enforce.
 
-- 插件必须在 manifest 中声明文件读取、原生进程或 Agent Runtime 等能力，未声明的能力不会被授权。
-- Host 掌握插件身份、owner 和资源上限，不信任模型或插件自行声明的真实值。
-- `process_exec` 等于授予插件当前系统用户的原生进程权限。启用这类插件前，仍应检查来源和代码。
-- 连接在线模型时，请求会发送到你配置的模型服务；获权插件也可能访问本地资源。请根据自己的数据要求选择服务商、插件和权限。
+- Plugins must declare capabilities such as file access, native process execution, or Agent Runtime access in their manifest. Undeclared capabilities are not granted.
+- Host controls plugin identity, ownership, and resource limits. It does not trust a model or guest plugin to declare authoritative values.
+- `process_exec` grants a plugin native process access as the current operating-system user. Review the source and provenance before enabling a plugin with this capability.
+- Requests to online models are sent to the model service you configure. Authorized plugins may also access local resources. Choose providers, plugins, and permissions according to your data requirements.
 
-Lucia 想提供的不是“请相信我们”，而是让信任有可以检查的依据。
+Lucia is not asking you to replace one opaque promise with another. It is trying to make trust inspectable.
 
-## 面向开发者
+## For Developers
 
-如果只是增加一种具体能力，优先通过插件实现。Core 仅承载通用 Agent 机制；MCP、Skill、命令、上下文压缩、工作流、多 Agent 编排和特定 UI 等具体功能均由插件负责。
+When adding a concrete capability, prefer implementing it as a plugin. Core only owns general agent mechanics; MCP, Skills, commands, context compression, workflows, multi-agent orchestration, and specialized UI behavior belong to plugins.
 
-仓库的主要模块保持明确的职责边界：
+The main crates keep explicit ownership boundaries:
 
-- `agent-core`：模型网关、ReAct、上下文、事件和扩展契约。
-- `agent-tool`：通用工具类型与原生工具注册表。
-- `agent-session`：版本化会话记录、CAS 和存储。
-- `agent-runtime`：Agent 身份、派生、生命周期、权限和资源限额。
-- `agent-plugin-host`：WASM ABI、鉴权、贡献注册和 owner 路由。
-- `agent-plugin`：Guest SDK、共享协议类型、WIT 绑定和导出宏。
-- `agent-tui`：应用组装、配置、输入和终端渲染。
+- `agent-core`: model gateways, ReAct, context, events, and extension contracts.
+- `agent-tool`: common tool types and the native tool registry.
+- `agent-session`: versioned session records, CAS, and storage.
+- `agent-runtime`: agent identity, spawning, lifecycle, permissions, and resource limits.
+- `agent-plugin-host`: WASM ABI, authorization, contribution registration, and owner routing.
+- `agent-plugin`: Guest SDK, shared protocol types, WIT bindings, and export macros.
+- `agent-tui`: application assembly, configuration, input, and terminal rendering.
 
-常用验证命令：
+Common verification commands:
 
 ```bash
 cargo test -p agent-core
@@ -211,26 +213,28 @@ cargo test -p lucia --no-default-features
 cargo test -p lucia --features plugins
 ```
 
-修改插件时还应编译 `wasm32-wasip2` 组件，并运行该插件的真实 Host 冒烟测试。各官方插件已经在 `package.json` 中提供对应的 `bun run test:plugin:*` 命令。
+Plugin changes should also compile the `wasm32-wasip2` component and pass that plugin's real Host smoke tests. The official plugins expose corresponding `bun run test:plugin:*` commands in `package.json`.
 
-## 文档入口
+## Documentation
 
-- [快速开始](docs/guide/quick-start.md)
-- [TUI 使用](docs/usage/tui.md)
-- [CLI 使用](docs/usage/cli.md)
-- [插件管理](docs/usage/plugin-management.md)
-- [创建 WASM 插件](docs/plugin/quick-start.md)
-- [插件开发手册](docs/development/plugin.md)
-- [Manifest 与权限](docs/host/manifest-capabilities.md)
-- [Rust API 手册](docs/reference/rust-api.md)
-- [架构边界](docs/guide/architecture.md)
+The detailed documentation is currently maintained in Simplified Chinese:
 
-## 项目状态
+- [Quick start](docs/guide/quick-start.md)
+- [TUI usage](docs/usage/tui.md)
+- [CLI usage](docs/usage/cli.md)
+- [Plugin management](docs/usage/plugin-management.md)
+- [Create a WASM plugin](docs/plugin/quick-start.md)
+- [Plugin development](docs/development/plugin.md)
+- [Manifest and capabilities](docs/host/manifest-capabilities.md)
+- [Rust API reference](docs/reference/rust-api.md)
+- [Architecture boundaries](docs/guide/architecture.md)
 
-Lucia 仍处于早期阶段，接口和插件协议还会继续演进。当前仓库已经包含离线示例、两种 TUI 构建形态、官方插件、插件端到端冒烟测试和分层开发文档，但仍需要更多真实环境验证、安全审查和不同使用方式的反馈。
+## Project Status
 
-欢迎阅读代码、提出问题、编写插件或提交改进。比起把 Lucia 变成另一个封闭的全能工具，我们更希望它成为一套任何人都能理解、修改并掌握边界的 Agent 基础设施。
+Lucia is still at an early stage, and its APIs and plugin protocol will continue to evolve. The repository already includes an offline example, two TUI build variants, official plugins, end-to-end plugin smoke tests, and layered development documentation. It still needs more real-world validation, security review, and feedback from different workflows.
 
-## 许可证
+You are welcome to read the code, report issues, build plugins, or contribute improvements. Rather than turning Lucia into another closed all-purpose tool, the goal is to build agent infrastructure that people can understand, modify, and control.
+
+## License
 
 [MIT](LICENSE)
