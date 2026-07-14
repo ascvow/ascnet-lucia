@@ -19,6 +19,9 @@ struct CapturingModel {
     requests: std::sync::Mutex<Vec<ModelRequest>>,
 }
 
+/// 在摘要请求中返回带根因错误的测试模型。
+struct FailingSummaryModel;
+
 #[async_trait]
 impl ChatModel for CapturingModel {
     /// 保存请求并返回确定性文本，避免测试访问网络。
@@ -52,6 +55,22 @@ impl ProviderAdapter for CapturingModel {
     /// 返回测试路由使用的稳定适配器名称。
     fn name(&self) -> &'static str {
         "capturing"
+    }
+}
+
+#[async_trait]
+impl ChatModel for FailingSummaryModel {
+    /// 模拟第三方模型网关拒绝摘要请求。
+    async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        Err(anyhow::anyhow!("上游模型拒绝摘要请求"))
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for FailingSummaryModel {
+    /// 返回失败模型使用的稳定适配器名称。
+    fn name(&self) -> &'static str {
+        "failing-summary"
     }
 }
 
@@ -140,6 +159,47 @@ async fn component_replaces_agent_context_and_emits_event() {
             && event.payload["name"] == "context.compaction.completed"
             && event.payload["presentation"]["text"] == "上下文压缩"
     }));
+}
+
+/// 摘要模型失败时，WASM 双边信封必须把底层 provider 原因传回 Core。
+#[tokio::test]
+async fn component_preserves_summary_model_error_chain() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("failing", Arc::new(FailingSummaryModel))
+        .expect("失败模型应注册成功");
+    let services = PluginHostServices::new()
+        .with_model_completion(gateway, "failing", "failing-model", 4_096)
+        .expect("Host 应接受失败模型服务");
+    let plugin_host = load_wasm_plugins_with_services(&[manifest], services)
+        .await
+        .expect("上下文 component 应加载成功");
+    let session = Session::from_parts(
+        None,
+        vec![
+            ModelMessage::text(MessageRole::User, "分析旧上下文"),
+            ModelMessage::text(MessageRole::Assistant, "开始分析"),
+            ModelMessage::text(MessageRole::Tool, "x".repeat(520_000)),
+            ModelMessage::text(MessageRole::Assistant, "继续处理"),
+            ModelMessage::text(MessageRole::User, "保留当前请求"),
+        ],
+    );
+    let request = ContextLoadRequest {
+        run_id: "failing-summary-run".into(),
+        step: 0,
+        provider: "failing".into(),
+        model: "failing-model".into(),
+        system: None,
+        messages: session.model_messages(),
+    };
+
+    let error = ContextLoader::load(&plugin_host, request)
+        .await
+        .expect_err("摘要模型失败必须终止上下文加载");
+    let error = format!("{error:#}");
+    assert!(error.contains("调用模型生成上下文摘要失败"));
+    assert!(error.contains("上游模型拒绝摘要请求"));
 }
 
 /// 短会话低于压缩水位时插件返回透传，Agent 必须继续使用原始上下文而不是报错。

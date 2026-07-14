@@ -1494,7 +1494,7 @@ world plugin {
                         .to_string(),
                         Err(error) => $crate::__serde_json::json!({
                             "ok": false,
-                            "error": error.to_string(),
+                            "error": format!("{error:#}"),
                         })
                         .to_string(),
                     }
@@ -1578,7 +1578,7 @@ world plugin {
                         },
                         Err(error) => $crate::ContextLoadResponse {
                             context: None,
-                            error: Some(error.to_string()),
+                            error: Some(format!("{error:#}")),
                         },
                     };
                     $crate::to_json_string(&response)

@@ -20,7 +20,7 @@
 
 Command 插件生成受控的 `CompactSession` 动作，原生 TUI 随即把当前完整 Session 交给 `context.compact`。Context 插件忽略自动水位并同步返回压缩后的替换上下文；TUI 成功持久化后立即刷新当前 Session，不需要再发送一条消息。当前会话没有可安全切分的历史轮次时，主事件列表会提示“没有可压缩的历史上下文”。
 
-完整压缩通过 `PluginHostApi::complete_model` 发送旧历史，摘要模型使用与当前 Agent 相同的 Host 可信 provider/model。Guest 不能指定路由、工具、推理级别或 provider options；Host 强制禁用工具与推理，并把输出限制在应用配置上限内。TUI 会自动注入该服务，其他应用加载此插件时也必须通过 `PluginHostServices::with_model_completion` 注入模型网关。
+完整压缩通过 `PluginHostApi::complete_model` 发送旧历史，摘要模型使用与当前 Agent 相同的 Host 可信 provider/model 和流式调用路径。Guest 不能指定路由、工具、推理级别或 provider options；Host 强制禁用工具与推理，并把输出限制在当前 Agent 与应用配置的较小上限内。TUI 会自动注入该服务，其他应用加载此插件时也必须通过 `PluginHostServices::with_model_completion` 注入模型网关。
 
 与 Claude Code 相比，当前实现包含预算预留、微压缩、轮次安全切分、模型摘要和近期状态保留，但尚未实现文件内容重新注入或持久化 compact boundary。
 

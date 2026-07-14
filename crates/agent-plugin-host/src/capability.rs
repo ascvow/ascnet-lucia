@@ -314,7 +314,10 @@ impl CapabilityState {
         model_request.reasoning = ReasoningLevel::Off;
         let response = binding
             .gateway
-            .complete(&binding.provider, model_request)
+            .stream(&binding.provider, model_request)
+            .await
+            .context("启动插件模型完成流失败")?
+            .result()
             .await
             .context("插件模型完成调用失败")?;
         if !response.tool_calls.is_empty() {
@@ -889,7 +892,7 @@ pub(crate) fn encode_host_response(result: Result<Value>) -> String {
         Err(error) => json!({
             "schema_version": HOST_RESPONSE_SCHEMA_VERSION,
             "ok": false,
-            "error": error.to_string(),
+            "error": format!("{error:#}"),
         })
         .to_string(),
     }
@@ -991,7 +994,7 @@ fn validate_state_key(key: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::service::ServiceHandler;
-    use agent_core::{ChatModel, ModelResponse, ProviderAdapter};
+    use agent_core::{model::ModelEventStream, ChatModel, ModelResponse, ProviderAdapter};
     use agent_runtime::{
         AgentDeriveConfig, AgentHandle, AgentLineage, AgentOutcome, AgentPermissions,
         AgentProfileId, AgentRuntimeError, AgentRuntimeProvisioner, AgentSnapshot, AgentStatus,
@@ -1007,9 +1010,15 @@ mod tests {
 
     #[async_trait]
     impl ChatModel for CapturingCompletionModel {
-        async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+        async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+            panic!("模型完成 Host 必须复用主 Agent 的流式调用路径")
+        }
+
+        async fn stream(&self, request: ModelRequest) -> ModelEventStream {
             self.requests.lock().expect("锁定模型请求").push(request);
-            Ok(ModelResponse::text("受控模型摘要"))
+            let (sender, stream) = ModelEventStream::channel();
+            sender.done(ModelResponse::text("受控模型摘要"));
+            stream
         }
     }
 
@@ -1248,13 +1257,14 @@ mod tests {
     fn host_response_includes_schema_version() {
         let success: Value =
             serde_json::from_str(&encode_host_response(Ok(json!(7)))).expect("解析成功响应");
-        let failure: Value = serde_json::from_str(&encode_host_response(Err(anyhow!("失败"))))
-            .expect("解析失败响应");
+        let failure = anyhow!("底层失败").context("外层失败");
+        let failure: Value =
+            serde_json::from_str(&encode_host_response(Err(failure))).expect("解析失败响应");
 
         assert_eq!(success["schema_version"], HOST_RESPONSE_SCHEMA_VERSION);
         assert_eq!(success["value"], 7);
         assert_eq!(failure["schema_version"], HOST_RESPONSE_SCHEMA_VERSION);
-        assert_eq!(failure["error"], "失败");
+        assert_eq!(failure["error"], "外层失败: 底层失败");
     }
 
     /// 进程能力必须在调用操作系统前拒绝无界或无效字段。
