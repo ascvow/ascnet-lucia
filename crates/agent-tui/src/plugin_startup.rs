@@ -93,6 +93,9 @@ pub(crate) async fn load_plugins_for_tui(
     let model_gateway = agent_template.gateway().clone();
     let model_provider = agent_template.options().provider.clone();
     let model_name = agent_template.options().model.clone();
+    // 插件模型调用与主 Agent 使用相同的流式开关：部分代理会强制断开
+    // 长时间无数据的非流式连接，摘要这类长请求必须跟随配置的传输方式。
+    let model_stream = agent_template.options().stream;
     let runtime =
         AgentRuntime::new(RuntimeLimits::default()).context("创建 TUI Agent Runtime 失败")?;
     let controller_profile =
@@ -106,7 +109,13 @@ pub(crate) async fn load_plugins_for_tui(
         .await
         .context("注册 TUI controller profile 失败")?;
     let host_services = PluginHostServices::new()
-        .with_model_completion(model_gateway, model_provider, model_name, 20_000, false)?
+        .with_model_completion(
+            model_gateway,
+            model_provider,
+            model_name,
+            20_000,
+            model_stream,
+        )?
         .with_agent_runtime(
             Arc::new(runtime),
             controller_profile,

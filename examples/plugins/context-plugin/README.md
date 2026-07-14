@@ -20,7 +20,7 @@
 
 Command 插件生成受控的 `ReloadSessionContext` 动作，原生 TUI 随即在后台把当前完整 Session 以 `user_initiated` 标记交给已注册的上下文加载器。Context 插件对用户显式发起的加载忽略自动水位，无条件执行完整压缩并返回替换上下文；TUI 成功持久化后立即刷新当前 Session，等待期间界面保持可交互并显示命令执行指示。压缩结果的用户可见说明完全由本插件发布的展示事件提供：完成时为“上下文压缩”分隔线，没有可安全切分的历史轮次时提示“没有可压缩的历史上下文”。
 
-完整压缩通过 `PluginHostApi::complete_model` 发送旧历史，摘要模型使用与当前 Agent 相同的 Host 可信 provider/model，但固定使用非流式调用，输出上限固定为 20k token。Guest 不能指定路由、流式模式、工具、推理级别或 provider options；Host 强制禁用工具与推理。TUI 会自动注入该服务，其他应用加载此插件时也必须通过 `PluginHostServices::with_model_completion` 注入模型网关。
+完整压缩通过 `PluginHostApi::complete_model` 发送旧历史，摘要模型使用与当前 Agent 相同的 Host 可信 provider/model 和流式开关（Host 侧聚合流式增量后整体返回），输出上限固定为 20k token。Guest 不能指定路由、流式模式、工具、推理级别或 provider options；Host 强制禁用工具与推理。TUI 会自动注入该服务，其他应用加载此插件时也必须通过 `PluginHostServices::with_model_completion` 注入模型网关。
 
 与 Claude Code 相比，当前实现包含预算预留、微压缩、轮次安全切分、模型摘要和近期状态保留，但尚未实现文件内容重新注入或持久化 compact boundary。
 
