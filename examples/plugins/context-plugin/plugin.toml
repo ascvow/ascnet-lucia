@@ -12,4 +12,5 @@ version = "1.0.0"
 mode = "exclusive"
 
 [capabilities]
-# 插件只进行内存计算和事件发布，不申请外部资源权限。
+# 完整压缩使用应用固定的 provider/model 执行无工具摘要调用。
+model_completion = true

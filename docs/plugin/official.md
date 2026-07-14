@@ -12,7 +12,7 @@ bun run install:tui
 
 ## Context
 
-`context` 提供官方上下文管理与压缩能力。它在约 120k token 时清理旧工具结果，在约 167k token 时把较旧 API 轮次替换为结构化摘要，并保留近期完整轮次；`[1m]` 模型使用对应的百万上下文水位。Command 插件内置的 `/compact` 会立即调用 `context.compact`，成功持久化压缩结果后当场替换当前 Session，不需要再发送一条消息。
+`context` 提供官方上下文管理与压缩能力。它在约 120k token 时静默清理旧工具结果，在约 167k token 时额外调用一次 Host 固定路由的模型，把较旧 API 轮次替换为结构化摘要并保留近期完整轮次；`[1m]` 模型使用对应的百万上下文水位。Command 插件内置的 `/compact` 会立即调用同一模型摘要流程，成功持久化压缩结果后当场替换当前 Session，不需要再发送一条消息。
 
 ```bash
 bun run build:plugin:context

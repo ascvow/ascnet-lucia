@@ -16,7 +16,7 @@ world plugin {
 }
 ```
 
-完整 world 有 19 个 Host imports 和 12 个 Guest exports。当前 Host 要求所有 exports 存在；插件没有某项能力时由 SDK 默认实现返回空值，而不是删除 export。
+完整 world 有 20 个 Host imports 和 12 个 Guest exports。当前 Host 要求所有 exports 存在；插件没有某项能力时由 SDK 默认实现返回空值，而不是删除 export。
 
 ## Host 响应信封
 
@@ -353,6 +353,49 @@ Rust SDK：`read_process_line(handle, timeout_ms) -> Result<Option<String>>`。
 终止并释放句柄，成功 `value` 为 `null`。未知句柄或终止失败时返回错误。Guest 应在 `deactivate` 主动清理；Host 丢弃 store 时也会 kill-on-drop。
 
 Rust SDK：`kill_process(handle) -> Result<()>`。
+
+## 模型完成 import
+
+### `host-model-complete`
+
+该 import 提供受 manifest 与应用配置共同约束的独立模型调用。请求拒绝未知字段：
+
+```json
+{
+  "system": "生成结构化摘要",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "待摘要的旧上下文" }
+      ]
+    }
+  ],
+  "max_tokens": 20000
+}
+```
+
+成功 `value`：
+
+```json
+{
+  "text": "模型生成的摘要",
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 300,
+    "total_tokens": 1500
+  }
+}
+```
+
+共同约束：
+
+- manifest 必须声明 `model_completion = true`，应用必须注入已注册的模型网关和固定 provider/model。
+- Guest 只能提交 system、provider-neutral messages 和期望输出上限，不能提交路由、工具、推理级别或 provider options。
+- Host 强制空工具列表、`tool_choice = none` 和关闭推理，并把 `max_tokens` 收窄到应用上限。
+- 空消息、超大请求、模型工具调用、空文本或底层模型错误都会返回失败信封。
+
+Rust SDK：`complete_model(request) -> Result<ModelCompletionResponse>`。
 
 ## Agent Runtime import
 

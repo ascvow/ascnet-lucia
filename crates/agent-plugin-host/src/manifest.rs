@@ -675,6 +675,10 @@ pub struct CapabilitySection {
     #[serde(default)]
     pub agent: AgentCapabilitySection,
 
+    /// 插件是否可以使用应用固定路由执行无工具模型完成。
+    #[serde(default)]
+    pub model_completion: bool,
+
     /// 插件是否希望通过宿主 API 执行进程。
     #[serde(default)]
     pub process_exec: bool,

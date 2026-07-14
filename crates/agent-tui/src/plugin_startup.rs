@@ -90,6 +90,9 @@ pub(crate) async fn load_plugins_for_tui(
     live_host: Arc<LivePluginHost>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
+    let model_gateway = agent_template.gateway().clone();
+    let model_provider = agent_template.options().provider.clone();
+    let model_name = agent_template.options().model.clone();
     let runtime =
         AgentRuntime::new(RuntimeLimits::default()).context("创建 TUI Agent Runtime 失败")?;
     let controller_profile =
@@ -102,11 +105,13 @@ pub(crate) async fn load_plugins_for_tui(
         )
         .await
         .context("注册 TUI controller profile 失败")?;
-    let host_services = PluginHostServices::new().with_agent_runtime(
-        Arc::new(runtime),
-        controller_profile,
-        HashMap::from([("worker".to_string(), AgentDeriveConfig::default())]),
-    )?;
+    let host_services = PluginHostServices::new()
+        .with_model_completion(model_gateway, model_provider, model_name, 20_000)?
+        .with_agent_runtime(
+            Arc::new(runtime),
+            controller_profile,
+            HashMap::from([("worker".to_string(), AgentDeriveConfig::default())]),
+        )?;
     let _failures = load_wasm_plugins_progressively_with_selection_and_services(
         &manifests,
         &capability_selection,

@@ -125,6 +125,14 @@
 
 Guest 不能提交模型、provider options、工具权限或 owner。`profile` 必须同时存在于 manifest 允许列表和应用注册表。
 
+#### 受控模型完成
+
+| 方法 | 参数 | 返回/行为 |
+| --- | --- | --- |
+| `complete_model(request)` | system、provider-neutral messages、可选 max_tokens | 返回模型文本和可选用量；Host 固定 provider/model 并禁用工具与推理 |
+
+该调用要求 manifest `model_completion = true` 和应用侧 `PluginHostServices::with_model_completion` 绑定。`ModelCompletionRequest` 拒绝未知字段，Guest 无法覆盖路由或 provider options。
+
 ### `export_plugin!`
 
 宏必须在插件 crate 根调用一次。它负责：
@@ -178,6 +186,7 @@ Guest 不能提交模型、provider options、工具权限或 owner。`profile` 
 | 字段 | 当前支持 |
 | --- | --- |
 | `agent` | 支持 spawn/observe/cancel 与 profile allowlist |
+| `model_completion` | 支持，应用固定路由、工具策略和输出上限 |
 | `process_exec` | 支持，属于完整原生进程信任 |
 | `fs_read` | 支持，逐路径 canonicalize 后鉴权 |
 | `http`、`secrets`、`fs_write` | 当前拒绝，不会静默忽略 |

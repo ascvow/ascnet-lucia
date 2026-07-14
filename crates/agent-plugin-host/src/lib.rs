@@ -17,7 +17,8 @@ mod capability;
 pub mod wasm;
 
 use agent_core::{
-    model::ModelMessage, AgentExtension, ContextLoadRequest, ContextLoader, LoadedContext,
+    model::{ModelGateway, ModelMessage},
+    AgentExtension, ContextLoadRequest, ContextLoader, LoadedContext,
 };
 #[cfg(feature = "wasm")]
 use agent_runtime::{AgentDeriveConfig, AgentProfileId, AgentRuntimeProvisioner};
@@ -41,6 +42,8 @@ pub use ui::{UiDeclaration, UiFrame, UiInput, UiRenderRequest};
 pub struct PluginHostServices {
     #[cfg(feature = "wasm")]
     agent_runtime: Option<AgentRuntimeHostServices>,
+    #[cfg(feature = "wasm")]
+    model_completion: Option<ModelCompletionHostServices>,
 }
 
 /// Agent Runtime provisioner 与 Host 管理的派生策略注册表。
@@ -50,6 +53,16 @@ pub(crate) struct AgentRuntimeHostServices {
     pub(crate) provisioner: Arc<dyn AgentRuntimeProvisioner>,
     pub(crate) controller_profile: AgentProfileId,
     spawn_profiles: Arc<HashMap<String, AgentDeriveConfig>>,
+}
+
+/// 应用固定路由的受限模型完成服务。
+#[cfg(feature = "wasm")]
+#[derive(Clone)]
+pub(crate) struct ModelCompletionHostServices {
+    pub(crate) gateway: ModelGateway,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) max_output_tokens: u32,
 }
 
 impl PluginHostServices {
@@ -81,10 +94,51 @@ impl PluginHostServices {
         Ok(self)
     }
 
+    /// 注入插件可请求的固定模型路由和最大输出预算。
+    ///
+    /// Guest 只能提交 system、messages 和更小的输出上限；provider、model、工具和
+    /// provider options 均由 Host 控制。插件 manifest 还必须声明 `model_completion`。
+    #[cfg(feature = "wasm")]
+    pub fn with_model_completion(
+        mut self,
+        gateway: ModelGateway,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        max_output_tokens: u32,
+    ) -> Result<Self> {
+        let provider = provider.into();
+        let model = model.into();
+        if provider.trim().is_empty() {
+            return Err(anyhow!("模型完成 provider 不能为空"));
+        }
+        if model.trim().is_empty() {
+            return Err(anyhow!("模型完成 model 不能为空"));
+        }
+        if !gateway.contains(&provider) {
+            return Err(anyhow!("模型完成 provider `{provider}` 未注册"));
+        }
+        if max_output_tokens == 0 {
+            return Err(anyhow!("模型完成最大输出 token 必须大于零"));
+        }
+        self.model_completion = Some(ModelCompletionHostServices {
+            gateway,
+            provider,
+            model,
+            max_output_tokens,
+        });
+        Ok(self)
+    }
+
     /// 返回 Host 内部使用的 Agent Runtime 服务快照。
     #[cfg(feature = "wasm")]
     pub(crate) fn agent_runtime(&self) -> Option<AgentRuntimeHostServices> {
         self.agent_runtime.clone()
+    }
+
+    /// 返回 Host 内部使用的固定模型完成服务快照。
+    #[cfg(feature = "wasm")]
+    pub(crate) fn model_completion(&self) -> Option<ModelCompletionHostServices> {
+        self.model_completion.clone()
     }
 }
 

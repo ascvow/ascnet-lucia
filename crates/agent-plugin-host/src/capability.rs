@@ -4,9 +4,9 @@ use crate::{
     contribution::{ContributionRegistry, PromptContribution, ToolRegistrationRequest},
     manifest::{AgentCapabilitySection, CapabilitySection},
     service::{PluginService, PluginServiceCall, ServiceRegistry},
-    AgentRuntimeHostServices,
+    AgentRuntimeHostServices, ModelCompletionHostServices,
 };
-use agent_core::AgentEvent;
+use agent_core::{AgentEvent, ModelMessage, ModelRequest, ReasoningLevel, ToolChoice};
 use agent_runtime::{
     AgentEventStream, AgentId, AgentRuntimeApi, AgentSpawnRequest, RuntimePrincipal,
 };
@@ -40,6 +40,7 @@ const MAX_HOST_CAPABILITY_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const MAX_READ_TIMEOUT_MS: u64 = 120_000;
 const MAX_AGENT_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_MODEL_COMPLETION_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const HOST_RESPONSE_SCHEMA_VERSION: u32 = 1;
 
 /// 单个插件实例可访问的受控宿主能力状态。
@@ -50,6 +51,7 @@ pub(crate) struct CapabilityState {
     contributions: Arc<ContributionRegistry>,
     services: Arc<ServiceRegistry>,
     agent_runtime: Option<AgentRuntimeBinding>,
+    model_completion: Option<ModelCompletionHostServices>,
     processes: HashMap<u64, ManagedProcess>,
     next_process_handle: u64,
     state: HashMap<String, Value>,
@@ -155,6 +157,15 @@ struct ExtensionEventRequest {
     presentation: Option<Value>,
 }
 
+/// Guest 可提交的受限模型完成请求；真实路由与工具策略由 Host 注入。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestModelCompletionRequest {
+    system: Option<String>,
+    messages: Vec<ModelMessage>,
+    max_tokens: Option<u32>,
+}
+
 #[derive(Deserialize)]
 struct PathRequest {
     path: String,
@@ -239,6 +250,7 @@ impl CapabilityState {
         contributions: Arc<ContributionRegistry>,
         services: Arc<ServiceRegistry>,
         agent_runtime: Option<AgentRuntimeBinding>,
+        model_completion: Option<ModelCompletionHostServices>,
     ) -> Self {
         Self {
             plugin_id,
@@ -247,6 +259,7 @@ impl CapabilityState {
             contributions,
             services,
             agent_runtime,
+            model_completion,
             processes: HashMap::new(),
             next_process_handle: 1,
             state: HashMap::new(),
@@ -258,6 +271,63 @@ impl CapabilityState {
         &self,
     ) -> (AgentCapabilitySection, Option<AgentRuntimeBinding>) {
         (self.permissions.agent.clone(), self.agent_runtime.clone())
+    }
+
+    /// 克隆模型完成所需的 manifest 授权和应用绑定，避免跨 `await` 借用 store。
+    pub(crate) fn model_completion_context(&self) -> (bool, Option<ModelCompletionHostServices>) {
+        (
+            self.permissions.model_completion,
+            self.model_completion.clone(),
+        )
+    }
+
+    /// 校验并执行一次固定路由、禁用工具的模型完成调用。
+    pub(crate) async fn complete_model_with(
+        allowed: bool,
+        binding: Option<ModelCompletionHostServices>,
+        request_json: &str,
+    ) -> Result<Value> {
+        if !allowed {
+            return Err(anyhow!("插件 manifest 未授权 model_completion"));
+        }
+        if request_json.len() > MAX_MODEL_COMPLETION_REQUEST_BYTES {
+            return Err(anyhow!(
+                "模型完成请求超过 {} 字节限制",
+                MAX_MODEL_COMPLETION_REQUEST_BYTES
+            ));
+        }
+        let request: GuestModelCompletionRequest = parse_request(request_json)?;
+        if request.messages.is_empty() {
+            return Err(anyhow!("模型完成消息不能为空"));
+        }
+        let binding = binding.ok_or_else(|| anyhow!("应用未注入模型完成服务"))?;
+
+        let mut model_request = ModelRequest::new(binding.model, request.messages);
+        model_request.system = request.system;
+        model_request.tool_choice = ToolChoice::None;
+        model_request.max_tokens = Some(
+            request
+                .max_tokens
+                .unwrap_or(binding.max_output_tokens)
+                .clamp(1, binding.max_output_tokens),
+        );
+        model_request.reasoning = ReasoningLevel::Off;
+        let response = binding
+            .gateway
+            .complete(&binding.provider, model_request)
+            .await
+            .context("插件模型完成调用失败")?;
+        if !response.tool_calls.is_empty() {
+            return Err(anyhow!("模型完成服务返回了未授权工具调用"));
+        }
+        let text = response.text_content();
+        if text.trim().is_empty() {
+            return Err(anyhow!("模型完成服务返回了空文本"));
+        }
+        Ok(json!({
+            "text": text,
+            "usage": response.usage,
+        }))
     }
 
     /// 解析、鉴权并委托一次 Agent Runtime 短控制面调用。
@@ -921,12 +991,33 @@ fn validate_state_key(key: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::service::ServiceHandler;
+    use agent_core::{ChatModel, ModelResponse, ProviderAdapter};
     use agent_runtime::{
         AgentDeriveConfig, AgentHandle, AgentLineage, AgentOutcome, AgentPermissions,
         AgentProfileId, AgentRuntimeError, AgentRuntimeProvisioner, AgentSnapshot, AgentStatus,
         ProvisionedAgentRuntime, RuntimeResult,
     };
     use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    /// 捕获 Host 最终模型请求的测试适配器。
+    struct CapturingCompletionModel {
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for CapturingCompletionModel {
+        async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+            self.requests.lock().expect("锁定模型请求").push(request);
+            Ok(ModelResponse::text("受控模型摘要"))
+        }
+    }
+
+    impl ProviderAdapter for CapturingCompletionModel {
+        fn name(&self) -> &'static str {
+            "capturing-completion"
+        }
+    }
 
     /// 回显 Host 最终注入调用方的测试服务。
     struct CallerEchoService;
@@ -1100,6 +1191,7 @@ mod tests {
             Arc::new(ContributionRegistry::default()),
             Arc::new(ServiceRegistry::default()),
             None,
+            None,
         )
     }
 
@@ -1140,6 +1232,7 @@ mod tests {
             CapabilitySection::default(),
             contributions.clone(),
             Arc::new(ServiceRegistry::default()),
+            None,
             None,
         );
         state
@@ -1191,6 +1284,70 @@ mod tests {
         let error = parse_request::<Value>(&oversized).expect_err("超大请求必须被拒绝");
 
         assert!(error.to_string().contains("请求超过"));
+    }
+
+    /// 模型完成能力必须同时具备 manifest 授权和应用侧服务绑定。
+    #[tokio::test]
+    async fn model_completion_requires_manifest_permission_and_binding() {
+        let request = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"摘要"}]}]}"#;
+        let unauthorized = CapabilityState::complete_model_with(false, None, request)
+            .await
+            .expect_err("未授权请求必须失败");
+        assert!(unauthorized.to_string().contains("manifest 未授权"));
+
+        let missing_binding = CapabilityState::complete_model_with(true, None, request)
+            .await
+            .expect_err("未绑定模型服务必须失败");
+        assert!(missing_binding.to_string().contains("未注入模型完成服务"));
+    }
+
+    /// Guest 不得通过请求字段覆盖 Host 注入的模型路由。
+    #[tokio::test]
+    async fn model_completion_rejects_forged_route_fields() {
+        let error =
+            CapabilityState::complete_model_with(true, None, r#"{"model":"forged","messages":[]}"#)
+                .await
+                .expect_err("伪造 model 字段必须失败");
+
+        assert!(error.to_string().contains("解析插件宿主能力请求失败"));
+    }
+
+    /// Host 必须固定 provider、model、工具策略和最大输出预算。
+    #[tokio::test]
+    async fn model_completion_uses_trusted_route_and_limits() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut gateway = agent_core::ModelGateway::new();
+        gateway
+            .register(
+                "trusted-provider",
+                Arc::new(CapturingCompletionModel {
+                    requests: requests.clone(),
+                }),
+            )
+            .expect("注册测试模型");
+        let binding = ModelCompletionHostServices {
+            gateway,
+            provider: "trusted-provider".into(),
+            model: "trusted-model".into(),
+            max_output_tokens: 128,
+        };
+
+        let response = CapabilityState::complete_model_with(
+            true,
+            Some(binding),
+            r#"{"system":"只生成摘要","messages":[{"role":"user","content":[{"type":"text","text":"旧上下文"}]}],"max_tokens":999}"#,
+        )
+        .await
+        .expect("受控模型请求应成功");
+
+        assert_eq!(response["text"], "受控模型摘要");
+        let captured = requests.lock().expect("锁定模型请求");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].model, "trusted-model");
+        assert_eq!(captured[0].max_tokens, Some(128));
+        assert_eq!(captured[0].tool_choice, ToolChoice::None);
+        assert!(captured[0].tools.is_empty());
+        assert_eq!(captured[0].reasoning, ReasoningLevel::Off);
     }
 
     /// Dispatcher 只暴露短控制面操作，并返回可跨 ABI 使用的脱敏结构。

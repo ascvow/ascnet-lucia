@@ -93,6 +93,18 @@ Guest 的 `AgentSpawnRequest` 只包含 profile 名称和任务输入；`AgentCo
 
 WASM Host API 不开放阻塞式 `wait`。插件应保存 `AgentHandle`，在后续工具调用或 UI 帧中查询状态和结果，避免同步 component 调用长期占用 store。teammate 邮箱由插件通过自身状态、持久 KV 或版本化 service 实现，不属于 Agent Runtime API。完整模型见 [Agent Runtime](/agent/agent-runtime)，可运行插件见 `examples/plugins/agent-runtime-plugin`。
 
+## 受控模型完成
+
+```rust
+let response = host.complete_model(&ModelCompletionRequest {
+    system: Some("生成结构化摘要".into()),
+    messages,
+    max_tokens: Some(20_000),
+})?;
+```
+
+该能力要求 manifest 声明 `model_completion = true`，且应用通过 `PluginHostServices::with_model_completion` 注入模型网关、provider、model 和最大输出预算。Guest 不能提交模型路由、工具、推理级别或 provider options；Host 固定路由、禁用工具和推理，并收窄输出预算。调用失败或返回空文本时直接返回错误，不会静默退回本地裁剪。
+
 ## 错误信封
 
 WIT import 返回 JSON 字符串：

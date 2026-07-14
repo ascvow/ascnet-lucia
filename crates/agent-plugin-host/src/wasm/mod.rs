@@ -361,6 +361,7 @@ impl WasmPluginHost {
                         contributions.clone(),
                         services.clone(),
                         agent_runtime.clone(),
+                        host_services.model_completion(),
                     ),
                     store_limits,
                 ),
@@ -983,6 +984,18 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
     )
     .into_anyhow()
     .context("注册 host-process-kill 失败")?;
+    root.func_wrap_async(
+        "host-model-complete",
+        |caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+            let (allowed, binding) = caller.data().capabilities.model_completion_context();
+            Box::new(async move {
+                let result = CapabilityState::complete_model_with(allowed, binding, &request).await;
+                Ok((encode_host_response(result),))
+            })
+        },
+    )
+    .into_anyhow()
+    .context("注册 host-model-complete 失败")?;
     root.func_wrap_async(
         "host-agent-runtime-call",
         |caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {

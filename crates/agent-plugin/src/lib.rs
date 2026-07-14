@@ -38,6 +38,7 @@ world plugin {
   import host-process-write: func(request-json: string) -> string;
   import host-process-read-line: func(request-json: string) -> string;
   import host-process-kill: func(request-json: string) -> string;
+  import host-model-complete: func(request-json: string) -> string;
   import host-agent-runtime-call: func(request-json: string) -> string;
   export activate: func(context-json: string) -> string;
   export deactivate: func() -> string;
@@ -615,6 +616,29 @@ pub struct ProcessSpec {
     pub inherit_stderr: bool,
 }
 
+/// 插件发起的一次受限模型完成请求。
+///
+/// Provider 和模型由应用注入的 Host 服务固定，插件只能提供上下文与输出上限；Host
+/// 不向该请求暴露工具，避免模型摘要等内部调用产生外部副作用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelCompletionRequest {
+    /// 本轮独立模型调用使用的 system 提示。
+    pub system: Option<String>,
+    /// 发送给模型的 provider-neutral JSON 消息。
+    pub messages: Vec<serde_json::Value>,
+    /// 请求的最大输出 token 数；Host 会收窄到应用配置上限。
+    pub max_tokens: Option<u32>,
+}
+
+/// 宿主模型完成调用返回的文本与用量。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelCompletionResponse {
+    /// 模型返回的全部文本内容。
+    pub text: String,
+    /// Provider 返回的可选 token 用量；字段结构与 Core `TokenUsage` 一致。
+    pub usage: Option<serde_json::Value>,
+}
+
 /// 宿主目录扫描返回的一项。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileEntry {
@@ -876,6 +900,11 @@ pub trait PluginHostApi {
     /// 终止并释放子进程句柄。
     fn kill_process(&self, handle: u64) -> Result<()>;
 
+    /// 使用应用固定的 provider 和模型执行一次无工具模型完成。
+    fn complete_model(&self, _request: &ModelCompletionRequest) -> Result<ModelCompletionResponse> {
+        Err(anyhow!("宿主未提供模型完成 API"))
+    }
+
     /// 返回分配给当前插件激活实例的 controller Agent 身份。
     fn agent_identity(&self) -> Result<AgentId> {
         Err(anyhow!("宿主未提供 Agent Runtime API"))
@@ -1116,6 +1145,7 @@ world plugin {
   import host-process-write: func(request-json: string) -> string;
   import host-process-read-line: func(request-json: string) -> string;
   import host-process-kill: func(request-json: string) -> string;
+  import host-model-complete: func(request-json: string) -> string;
   import host-agent-runtime-call: func(request-json: string) -> string;
   export activate: func(context-json: string) -> string;
   export deactivate: func() -> string;
@@ -1299,6 +1329,15 @@ world plugin {
                     let request = $crate::__serde_json::json!({"handle": handle});
                     $crate::decode_host_response(&host_process_kill(
                         &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn complete_model(
+                    &self,
+                    request: &$crate::ModelCompletionRequest,
+                ) -> $crate::Result<$crate::ModelCompletionResponse> {
+                    $crate::decode_host_response(&host_model_complete(
+                        &$crate::to_json_string(request),
                     ))
                 }
 

@@ -3,9 +3,12 @@
 use agent_core::{
     Agent, AgentEventKind, AgentOptions, ChatModel, ContentBlock, ContextLoadRequest,
     ContextLoader, InMemoryEventSink, MessageRole, ModelGateway, ModelMessage, ModelRequest,
-    ModelResponse, ProviderAdapter, Session,
+    ModelResponse, ProviderAdapter, Session, TokenUsage, ToolChoice,
 };
-use agent_plugin_host::wasm::load_wasm_plugins;
+use agent_plugin_host::{
+    wasm::{load_wasm_plugins, load_wasm_plugins_with_services},
+    PluginHostServices,
+};
 use agent_tool::ToolResult;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,11 +23,27 @@ struct CapturingModel {
 impl ChatModel for CapturingModel {
     /// 保存请求并返回确定性文本，避免测试访问网络。
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let is_summary = request
+            .system
+            .as_deref()
+            .is_some_and(|system| system.contains("负责压缩长对话"));
         self.requests
             .lock()
             .expect("模型请求锁不应中毒")
             .push(request);
-        Ok(ModelResponse::text("上下文插件测试完成"))
+        let mut response = if is_summary {
+            ModelResponse::text(
+                "<analysis>不应进入主上下文</analysis><summary>模型生成摘要：已分析旧上下文并保留关键状态。</summary>",
+            )
+        } else {
+            ModelResponse::text("上下文插件测试完成")
+        };
+        response.usage = Some(TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            total_tokens: Some(120),
+        });
+        Ok(response)
     }
 }
 
@@ -40,11 +59,6 @@ impl ProviderAdapter for CapturingModel {
 #[tokio::test]
 async fn component_replaces_agent_context_and_emits_event() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
-    let plugin_host = Arc::new(
-        load_wasm_plugins(&[manifest])
-            .await
-            .expect("上下文替换 component 应加载成功"),
-    );
     let model = Arc::new(CapturingModel {
         requests: std::sync::Mutex::new(Vec::new()),
     });
@@ -52,6 +66,19 @@ async fn component_replaces_agent_context_and_emits_event() {
     gateway
         .register("capturing", model.clone())
         .expect("捕获模型应注册成功");
+    let services = PluginHostServices::new()
+        .with_model_completion(
+            gateway.clone(),
+            "capturing",
+            "trusted-summary-model",
+            20_000,
+        )
+        .expect("Host 应接受固定模型完成服务");
+    let plugin_host = Arc::new(
+        load_wasm_plugins_with_services(&[manifest], services)
+            .await
+            .expect("上下文替换 component 应加载成功"),
+    );
     let events = Arc::new(InMemoryEventSink::new());
     let agent = Agent::new(
         gateway,
@@ -81,12 +108,27 @@ async fn component_replaces_agent_context_and_emits_event() {
 
     {
         let requests = model.requests.lock().expect("模型请求锁不应中毒");
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].messages.len() < 6);
-        assert!(requests[0].messages[0]
+        assert_eq!(requests.len(), 2);
+        let summary_request = &requests[0];
+        assert_eq!(summary_request.model, "trusted-summary-model");
+        assert_eq!(summary_request.tool_choice, ToolChoice::None);
+        assert!(summary_request.tools.is_empty());
+        assert_eq!(summary_request.max_tokens, Some(20_000));
+        assert!(summary_request
+            .messages
+            .last()
+            .is_some_and(|message| message.text_content().contains("尚未完成的任务")));
+
+        let main_request = &requests[1];
+        assert_eq!(main_request.model, "test-model");
+        assert!(main_request.messages.len() < 6);
+        assert!(main_request.messages[0]
             .text_content()
-            .contains("用户主要请求与意图"));
-        assert!(requests[0]
+            .contains("模型生成摘要"));
+        assert!(!main_request.messages[0]
+            .text_content()
+            .contains("不应进入主上下文"));
+        assert!(main_request
             .messages
             .iter()
             .any(|message| message.text_content() == recent_request));

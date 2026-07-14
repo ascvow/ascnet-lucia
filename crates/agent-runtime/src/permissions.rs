@@ -171,6 +171,11 @@ impl AgentTemplate {
         &self.options
     }
 
+    /// 返回模板复用的模型网关，供应用注册受控的模型宿主能力。
+    pub fn gateway(&self) -> &ModelGateway {
+        &self.gateway
+    }
+
     /// 根据父权限和派生配置创建独立 Core Agent。
     ///
     /// 返回值同时包含已经与父权限取交集的有效权限。工具 allowlist 会同时过滤模型

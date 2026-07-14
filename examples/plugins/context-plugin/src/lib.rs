@@ -2,8 +2,8 @@
 
 use agent_plugin::{
     export_plugin, ActivationContext, AgentPlugin, ContextLoadRequest, EventPresentation,
-    EventPresentationTone, ExtensionEvent, LoadedContext, PluginHostApi, Result, ServiceCall,
-    ServiceSpec,
+    EventPresentationTone, ExtensionEvent, LoadedContext, ModelCompletionRequest,
+    ModelCompletionResponse, PluginHostApi, Result, ServiceCall, ServiceSpec,
 };
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
@@ -20,8 +20,8 @@ const LARGE_MICRO_COMPACT_THRESHOLD_TOKENS: usize = 900_000;
 const RECENT_CONTEXT_TARGET_TOKENS: usize = 40_000;
 /// 微压缩始终原样保留的最近工具结果数量。
 const RECENT_TOOL_RESULTS_TO_KEEP: usize = 3;
-/// 结构化摘要的字符上限，避免摘要本身再次挤占上下文。
-const SUMMARY_CHARACTER_LIMIT: usize = 24_000;
+/// Claude Code 为完整摘要预留的最大输出 token 数。
+const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 20_000;
 /// 被微压缩的工具结果占位文本。
 const CLEARED_TOOL_RESULT: &str = "[旧工具结果内容已清理]";
 /// 原生 TUI 调用主动压缩服务时使用的稳定身份。
@@ -30,6 +30,24 @@ const TUI_PLUGIN_ID: &str = "lucia-tui";
 const CONTEXT_COMPACT_SERVICE: &str = "context.compact";
 /// 主动压缩服务当前版本。
 const CONTEXT_SERVICE_VERSION: &str = "1.0.0";
+/// 独立摘要调用使用的固定 system 提示，不携带主 Agent 的工具和行为人格。
+const SUMMARY_SYSTEM_PROMPT: &str =
+    "你是一名负责压缩长对话的助手。请准确、完整地总结已有上下文，禁止调用工具。";
+/// 参考 Claude Code 的完整压缩提示，要求模型保留继续开发所需的全部关键状态。
+const SUMMARY_REQUEST_PROMPT: &str = r#"请为此前对话生成一份详细的继续工作摘要，重点保留用户明确要求、已经执行的操作、技术决策和当前状态。
+
+摘要必须包含以下部分：
+1. 用户主要请求与意图
+2. 关键技术概念与约束
+3. 涉及的文件、代码位置和重要代码变化
+4. 遇到的错误、原因与修复
+5. 已完成的问题处理过程
+6. 所有非工具结果的用户消息
+7. 尚未完成的任务
+8. 压缩前正在进行的工作
+9. 与最近工作直接相关的下一步
+
+不要调用工具，不要虚构信息，不要把摘要写成泛泛建议。直接输出 <summary>...</summary>，确保仅凭摘要和后续保留的近期消息即可继续工作。"#;
 
 /// 提供分层上下文压缩能力的插件。
 #[derive(Default)]
@@ -52,7 +70,11 @@ struct CompressionCache {
 
 impl ContextPlugin {
     /// 复用已压缩历史，只把当前请求新增的消息追加到有效上下文后再判断水位。
-    fn compress_incrementally(&mut self, request: ContextLoadRequest) -> CompressionOutcome {
+    fn compress_incrementally(
+        &mut self,
+        request: ContextLoadRequest,
+        summarize: &dyn Fn(&[Value]) -> Result<ModelCompletionResponse>,
+    ) -> Result<CompressionOutcome> {
         let cache_hit = self.cache.as_ref().is_some_and(|cache| {
             // Agent 在单次 run 中只会向 Session 追加消息；避免比较超大 JSON 前缀，
             // 否则微压缩后的下一轮会在 Guest 内耗尽 fuel。
@@ -78,7 +100,7 @@ impl ContextPlugin {
         } else {
             request
         };
-        let outcome = compress_context(effective_request, false);
+        let outcome = compress_context(effective_request, false, summarize)?;
 
         if cache_hit || outcome.event.is_some() {
             self.cache = Some(CompressionCache {
@@ -92,7 +114,7 @@ impl ContextPlugin {
         } else {
             self.cache = None;
         }
-        outcome
+        Ok(outcome)
     }
 }
 
@@ -123,7 +145,8 @@ impl AgentPlugin for ContextPlugin {
             return Err(anyhow!("调用方 `{}` 无权请求上下文压缩", call.caller_id));
         }
         self.cache = None;
-        let outcome = compact_service_request(call.payload)?;
+        let summarize = |messages: &[Value]| summarize_with_model(host, messages);
+        let outcome = compact_service_request(call.payload, &summarize)?;
         if let Some(event) = outcome.event {
             host.emit_event(&event)?;
         }
@@ -143,7 +166,8 @@ impl AgentPlugin for ContextPlugin {
                 && cache.system == request.system
                 && request.messages.len() >= cache.source_message_count
         });
-        let outcome = self.compress_incrementally(request);
+        let summarize = |messages: &[Value]| summarize_with_model(host, messages);
+        let outcome = self.compress_incrementally(request, &summarize)?;
         if let Some(event) = outcome.event {
             host.emit_event(&event)?;
             return Ok(Some(outcome.context));
@@ -160,16 +184,32 @@ struct CompressionOutcome {
     event: Option<ExtensionEvent>,
 }
 
+/// 完整压缩生成的替换消息、摘要范围和模型用量。
+struct CompactedMessages {
+    messages: Vec<Value>,
+    summarized_messages: usize,
+    summary_usage: Option<Value>,
+}
+
 /// 按模型窗口、当前输入规模和手动请求选择分层压缩策略。
-fn compress_context(request: ContextLoadRequest, manual: bool) -> CompressionOutcome {
+fn compress_context(
+    request: ContextLoadRequest,
+    manual: bool,
+    summarize: &dyn Fn(&[Value]) -> Result<ModelCompletionResponse>,
+) -> Result<CompressionOutcome> {
     let before_messages = request.messages.len();
     let before_tokens = estimate_context_tokens(request.system.as_deref(), &request.messages);
     let (micro_threshold, compact_threshold) = thresholds_for_model(&request.model);
 
     if manual || before_tokens >= compact_threshold {
-        if let Some((messages, summarized_messages)) = compact_messages(&request.messages, manual) {
+        if let Some(compacted) = compact_messages(&request.messages, manual, summarize)? {
+            let CompactedMessages {
+                messages,
+                summarized_messages,
+                summary_usage,
+            } = compacted;
             let after_tokens = estimate_context_tokens(request.system.as_deref(), &messages);
-            return CompressionOutcome {
+            return Ok(CompressionOutcome {
                 context: LoadedContext {
                     system: request.system,
                     messages,
@@ -184,15 +224,16 @@ fn compress_context(request: ContextLoadRequest, manual: bool) -> CompressionOut
                         "summarized_messages": summarized_messages,
                         "estimated_tokens_before": before_tokens,
                         "estimated_tokens_after": after_tokens,
+                        "summary_usage": summary_usage,
                         "trigger": if manual { "manual" } else { "auto" },
-                        "strategy": "structured_continuation_summary_with_recent_tail"
+                        "strategy": "model_summary_with_recent_tail"
                     }),
                     presentation: Some(EventPresentation::divider(
                         "上下文压缩",
                         EventPresentationTone::Info,
                     )),
                 }),
-            };
+            });
         }
     }
 
@@ -200,7 +241,7 @@ fn compress_context(request: ContextLoadRequest, manual: bool) -> CompressionOut
         let (messages, cleared_results) = micro_compact_tool_results(&request.messages);
         if cleared_results > 0 {
             let after_tokens = estimate_context_tokens(request.system.as_deref(), &messages);
-            return CompressionOutcome {
+            return Ok(CompressionOutcome {
                 context: LoadedContext {
                     system: request.system,
                     messages,
@@ -220,12 +261,12 @@ fn compress_context(request: ContextLoadRequest, manual: bool) -> CompressionOut
                     }),
                     presentation: None,
                 }),
-            };
+            });
         }
     }
 
     if manual {
-        return CompressionOutcome {
+        return Ok(CompressionOutcome {
             context: LoadedContext {
                 system: request.system,
                 messages: request.messages,
@@ -244,22 +285,25 @@ fn compress_context(request: ContextLoadRequest, manual: bool) -> CompressionOut
                     EventPresentationTone::Muted,
                 )),
             }),
-        };
+        });
     }
 
-    CompressionOutcome {
+    Ok(CompressionOutcome {
         context: LoadedContext {
             system: request.system,
             messages: request.messages,
         },
         event: None,
-    }
+    })
 }
 
 /// 解析原生 TUI 提供的完整请求，并立即执行不受自动水位限制的压缩。
-fn compact_service_request(payload: Value) -> Result<CompressionOutcome> {
+fn compact_service_request(
+    payload: Value,
+    summarize: &dyn Fn(&[Value]) -> Result<ModelCompletionResponse>,
+) -> Result<CompressionOutcome> {
     let request = serde_json::from_value(payload).context("解析主动压缩请求失败")?;
-    Ok(compress_context(request, true))
+    compress_context(request, true, summarize)
 }
 
 /// 根据 Claude Code 的 `[1m]` 模型标记返回微压缩和完整压缩水位。
@@ -364,19 +408,24 @@ fn compactable_tool_result_count(message: &Value) -> usize {
         .unwrap_or(0)
 }
 
-/// 把较旧 API 轮次替换为结构化摘要；手动模式只保留最新完整轮次。
-fn compact_messages(messages: &[Value], manual: bool) -> Option<(Vec<Value>, usize)> {
+/// 用独立模型摘要替换较旧 API 轮次；手动模式只保留最新完整轮次。
+fn compact_messages(
+    messages: &[Value],
+    manual: bool,
+    summarize: &dyn Fn(&[Value]) -> Result<ModelCompletionResponse>,
+) -> Result<Option<CompactedMessages>> {
     let group_starts = api_round_group_starts(messages);
     if group_starts.len() < 2 {
-        return None;
+        return Ok(None);
     }
 
     let split_index = recent_tail_start(messages, &group_starts, manual);
     if split_index == 0 || split_index >= messages.len() {
-        return None;
+        return Ok(None);
     }
 
-    let summary = build_structured_summary(&messages[..split_index]);
+    let response = summarize(&messages[..split_index])?;
+    let summary = normalize_model_summary(&response.text)?;
     let mut compacted = Vec::with_capacity(messages.len() - split_index + 1);
     compacted.push(json!({
         "role": "developer",
@@ -388,7 +437,11 @@ fn compact_messages(messages: &[Value], manual: bool) -> Option<(Vec<Value>, usi
         }]
     }));
     compacted.extend_from_slice(&messages[split_index..]);
-    Some((compacted, split_index))
+    Ok(Some(CompactedMessages {
+        messages: compacted,
+        summarized_messages: split_index,
+        summary_usage: response.usage,
+    }))
 }
 
 /// 以 assistant 响应开头划分 API 轮次，避免拆散工具调用与对应结果。
@@ -428,228 +481,51 @@ fn recent_tail_start(messages: &[Value], group_starts: &[usize], manual: bool) -
     start
 }
 
-/// 按继续工作所需的九类信息重建被替换历史，并为每一类单独限制预算。
-fn build_structured_summary(messages: &[Value]) -> String {
-    let mut user_requests = Vec::new();
-    let mut assistant_progress = Vec::new();
-    let mut developer_context = Vec::new();
-    let mut tool_activity = Vec::new();
-    let mut errors = Vec::new();
+/// 通过 Host 固定路由调用模型生成摘要；Guest 无法指定 provider、model 或工具。
+fn summarize_with_model(
+    host: &dyn PluginHostApi,
+    messages: &[Value],
+) -> Result<ModelCompletionResponse> {
+    let mut summary_messages = messages.to_vec();
+    summary_messages.push(json!({
+        "role": "user",
+        "content": [{"type": "text", "text": SUMMARY_REQUEST_PROMPT}]
+    }));
+    host.complete_model(&ModelCompletionRequest {
+        system: Some(SUMMARY_SYSTEM_PROMPT.into()),
+        messages: summary_messages,
+        max_tokens: Some(SUMMARY_MAX_OUTPUT_TOKENS),
+    })
+    .context("调用模型生成上下文摘要失败")
+}
 
-    for message in messages {
-        match message.get("role").and_then(Value::as_str) {
-            Some("user") => collect_text_blocks(message, &mut user_requests, 2_000, 20),
-            Some("assistant") => {
-                collect_text_blocks(message, &mut assistant_progress, 1_500, 20);
-                collect_tool_calls(message, &mut tool_activity, 40);
-            }
-            Some("developer") | Some("system") => {
-                collect_text_blocks(message, &mut developer_context, 1_500, 12);
-            }
-            Some("tool") => collect_tool_results(message, &mut tool_activity, &mut errors, 40),
-            _ => {}
+/// 清理模型可能返回的分析草稿和 summary 标签，并拒绝空摘要。
+fn normalize_model_summary(text: &str) -> Result<String> {
+    let without_analysis = remove_tagged_section(text, "<analysis>", "</analysis>");
+    let trimmed = without_analysis.trim();
+    let summary = match (trimmed.find("<summary>"), trimmed.rfind("</summary>")) {
+        (Some(start), Some(end)) if start + "<summary>".len() <= end => {
+            &trimmed[start + "<summary>".len()..end]
         }
+        _ => trimmed,
     }
-
-    let recent_context = render_recent_context(messages);
-    let latest_user_request = messages
-        .iter()
-        .rev()
-        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-        .map(message_text)
-        .filter(|text| !text.is_empty())
-        .map(|text| truncated(&text, 1_200))
-        .unwrap_or_else(|| "无可提取内容".into());
-    let mut summary = format!(
-        "压缩范围：{} 条较旧消息。以下内容用于继续当前工作，不是对旧消息的简单删除。\n\n## 1. 用户主要请求与意图\n{}\n\n## 2. 关键约束与技术上下文\n{}\n\n## 3. 文件、代码与工具状态\n{}\n\n## 4. 错误与修复线索\n{}\n\n## 5. 问题处理过程\n{}\n\n## 6. 用户消息记录\n{}\n\n## 7. 待办任务线索\n{}\n\n## 8. 当前工作状态\n{}\n\n## 9. 下一步依据\n- 最近用户请求：{}",
-        messages.len(),
-        render_items_with_limit(latest_items(&user_requests, 6), 2_500),
-        render_items_with_limit(latest_items(&developer_context, 6), 1_800),
-        render_items_with_limit(latest_items(&tool_activity, 16), 3_500),
-        render_items_with_limit(latest_items(&errors, 8), 2_500),
-        render_items_with_limit(latest_items(&assistant_progress, 10), 2_500),
-        render_items_with_limit(latest_items(&user_requests, 14), 3_500),
-        truncated(&recent_context, 2_000),
-        truncated(&recent_context, 2_500),
-        latest_user_request,
-    );
-    truncate_chars(&mut summary, SUMMARY_CHARACTER_LIMIT);
-    summary
-}
-
-/// 收集消息文本块，达到总项数后淘汰最旧内容以优先保留最近状态。
-fn collect_text_blocks(
-    message: &Value,
-    output: &mut Vec<String>,
-    item_limit: usize,
-    max_items: usize,
-) {
-    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-        return;
-    };
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) == Some("text") {
-            if let Some(text) = block.get("text").and_then(Value::as_str) {
-                push_recent(output, truncated(text, item_limit), max_items);
-            }
-        }
+    .trim();
+    if summary.is_empty() {
+        return Err(anyhow!("模型返回了空上下文摘要"));
     }
+    Ok(summary.to_string())
 }
 
-/// 收集工具名和参数摘要，使文件路径及关键操作在压缩后仍可恢复。
-fn collect_tool_calls(message: &Value, output: &mut Vec<String>, max_items: usize) {
-    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-        return;
-    };
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) != Some("tool_call") {
-            continue;
-        }
-        let Some(call) = block.get("call") else {
-            continue;
-        };
-        let name = call
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let args = call.get("args").cloned().unwrap_or(Value::Null).to_string();
-        push_recent(
-            output,
-            format!("调用 `{name}`，参数：{}", truncated(&args, 600)),
-            max_items,
-        );
-    }
-}
-
-/// 分别收集最近的成功工具状态和错误诊断，避免错误被普通结果挤出摘要。
-fn collect_tool_results(
-    message: &Value,
-    output: &mut Vec<String>,
-    errors: &mut Vec<String>,
-    max_items: usize,
-) {
-    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-        return;
-    };
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-            continue;
-        }
-        let Some(result) = block.get("result") else {
-            continue;
-        };
-        let name = result
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let is_error = result
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let content = result
-            .get("content")
-            .cloned()
-            .unwrap_or(Value::Null)
-            .to_string();
-        let status = if is_error { "失败" } else { "成功" };
-        let limit = if is_error { 1_000 } else { 400 };
-        let item = format!("`{name}` {status}，结果：{}", truncated(&content, limit));
-        if is_error {
-            push_recent(errors, item, max_items);
-        } else {
-            push_recent(output, item, max_items);
-        }
-    }
-}
-
-/// 在固定容量内追加条目；容量耗尽时移除最旧条目。
-fn push_recent(output: &mut Vec<String>, item: String, max_items: usize) {
-    if max_items == 0 {
-        return;
-    }
-    if output.len() == max_items {
-        output.remove(0);
-    }
-    output.push(item);
-}
-
-/// 返回列表中最多 `max_items` 个最近条目。
-fn latest_items(items: &[String], max_items: usize) -> &[String] {
-    &items[items.len().saturating_sub(max_items)..]
-}
-
-/// 渲染摘要列表；没有内容时给出明确占位，避免模型自行补全事实。
-fn render_items(items: &[String]) -> String {
-    if items.is_empty() {
-        return "- 无可提取内容".into();
-    }
-    items
-        .iter()
-        .map(|item| format!("- {}", item.trim()))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// 渲染摘要分段并独立限制字符预算，避免靠总截断丢失尾部继续工作信息。
-fn render_items_with_limit(items: &[String], limit: usize) -> String {
-    let mut rendered = render_items(items);
-    truncate_chars(&mut rendered, limit);
-    rendered
-}
-
-/// 保留被压缩范围末尾的原文线索，降低任务交接时的意图漂移。
-fn render_recent_context(messages: &[Value]) -> String {
-    let mut recent = Vec::new();
-    for message in messages.iter().rev().take(4).rev() {
-        let role = message
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let text = message_text(message);
-        if !text.is_empty() {
-            recent.push(format!("- {role}: {}", truncated(&text, 1_200)));
-        }
-    }
-    render_items_without_prefix_duplication(&recent)
-}
-
-/// 渲染已经带列表前缀的近期上下文。
-fn render_items_without_prefix_duplication(items: &[String]) -> String {
-    if items.is_empty() {
-        "- 无可提取内容".into()
-    } else {
-        items.join("\n")
-    }
-}
-
-/// 拼接一条消息中的全部文本内容。
-fn message_text(message: &Value) -> String {
-    message
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// 返回按字符边界截断的文本副本。
-fn truncated(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
+/// 删除第一段完整的 XML 风格区块；标签缺失时保持原文。
+fn remove_tagged_section(text: &str, open: &str, close: &str) -> String {
+    let Some(start) = text.find(open) else {
         return text.to_string();
-    }
-    let mut result = text.chars().take(limit).collect::<String>();
-    result.push_str("...[已截断]");
-    result
-}
-
-/// 原地限制摘要字符数。
-fn truncate_chars(text: &mut String, limit: usize) {
-    if text.chars().count() > limit {
-        *text = truncated(text, limit);
-    }
+    };
+    let Some(relative_end) = text[start + open.len()..].find(close) else {
+        return text.to_string();
+    };
+    let end = start + open.len() + relative_end + close.len();
+    format!("{}{}", &text[..start], &text[end..])
 }
 
 export_plugin!(ContextPlugin);
@@ -698,11 +574,28 @@ mod tests {
         })
     }
 
+    /// 返回测试使用的确定性模型摘要，并模拟 Provider 用量。
+    fn test_summary(_messages: &[Value]) -> Result<ModelCompletionResponse> {
+        Ok(ModelCompletionResponse {
+            text: "<analysis>测试草稿</analysis><summary>模型生成的上下文摘要：保留用户请求、错误状态与下一步。</summary>".into(),
+            usage: Some(json!({
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120
+            })),
+        })
+    }
+
+    /// 使用确定性摘要器执行一次测试压缩。
+    fn compress_for_test(request: ContextLoadRequest, manual: bool) -> CompressionOutcome {
+        compress_context(request, manual, &test_summary).expect("测试压缩应成功")
+    }
+
     /// 低于水位时必须完整透传，避免短会话发生无意义改写。
     #[test]
     fn keeps_small_context_unchanged() {
         let messages = vec![text_message("user", "检查当前实现")];
-        let outcome = compress_context(
+        let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-small".into(),
                 step: 0,
@@ -724,7 +617,7 @@ mod tests {
         let messages = (0..6)
             .map(|index| tool_result_message(index, 70_000))
             .collect::<Vec<_>>();
-        let outcome = compress_context(
+        let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-micro".into(),
                 step: 1,
@@ -767,7 +660,7 @@ mod tests {
         let failure = failed_tool_result_message(0, "文件不存在：src/missing.rs");
         let mut messages = vec![failure.clone()];
         messages.extend((0..4).map(|index| tool_result_message(index, 100_000)));
-        let outcome = compress_context(
+        let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-micro-error".into(),
                 step: 1,
@@ -789,6 +682,8 @@ mod tests {
     /// 完整压缩应生成结构化摘要，并逐字保留最近 API 轮次。
     #[test]
     fn full_compaction_summarizes_prefix_and_keeps_recent_rounds() {
+        use std::cell::RefCell;
+
         let recent_request = "继续修复最新失败用例";
         let messages = vec![
             text_message("user", "分析上下文压缩"),
@@ -799,6 +694,11 @@ mod tests {
             text_message("user", recent_request),
             text_message("assistant", "正在处理最新用例"),
         ];
+        let summarized_messages = RefCell::new(Vec::new());
+        let summarize = |messages: &[Value]| {
+            summarized_messages.replace(messages.to_vec());
+            test_summary(messages)
+        };
         let outcome = compress_context(
             ContextLoadRequest {
                 run_id: "run-full".into(),
@@ -809,7 +709,9 @@ mod tests {
                 messages,
             },
             false,
-        );
+            &summarize,
+        )
+        .expect("完整压缩应调用模型摘要");
 
         assert_eq!(
             outcome.event.as_ref().map(|event| event.name.as_str()),
@@ -819,10 +721,16 @@ mod tests {
         let summary = outcome.context.messages[0]["content"][0]["text"]
             .as_str()
             .expect("摘要应为文本");
-        assert!(summary.contains("用户主要请求与意图"));
-        assert!(summary.contains("不是对旧消息的简单删除"));
-        assert!(summary.contains("读取配置失败：权限不足"));
-        assert!(summary.contains("下一步依据"));
+        assert!(summary.contains("模型生成的上下文摘要"));
+        assert!(!summary.contains("测试草稿"));
+        assert!(summarized_messages
+            .borrow()
+            .iter()
+            .any(|message| message.to_string().contains("读取配置失败：权限不足")));
+        assert_eq!(
+            outcome.event.as_ref().expect("应发布压缩事件").data["summary_usage"]["output_tokens"],
+            20
+        );
         assert!(outcome
             .context
             .messages
@@ -834,7 +742,7 @@ mod tests {
     #[test]
     fn full_compaction_handles_two_api_rounds() {
         let recent_request = "保留当前请求";
-        let outcome = compress_context(
+        let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-two-rounds".into(),
                 step: 1,
@@ -864,7 +772,7 @@ mod tests {
     /// 手动压缩不受自动水位限制，并在存在历史轮次时生成完整摘要。
     #[test]
     fn manual_compaction_bypasses_automatic_threshold() {
-        let outcome = compress_context(
+        let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-manual".into(),
                 step: 0,
@@ -901,26 +809,36 @@ mod tests {
             text_message("assistant", "正在处理"),
         ];
         let mut plugin = ContextPlugin::default();
-        let first = plugin.compress_incrementally(ContextLoadRequest {
-            run_id: "incremental-run".into(),
-            step: 0,
-            provider: "test".into(),
-            model: "test-model".into(),
-            system: None,
-            messages: original_messages.clone(),
-        });
+        let first = plugin
+            .compress_incrementally(
+                ContextLoadRequest {
+                    run_id: "incremental-run".into(),
+                    step: 0,
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    system: None,
+                    messages: original_messages.clone(),
+                },
+                &test_summary,
+            )
+            .expect("首次增量压缩应成功");
         assert!(first.event.is_some(), "首轮超过水位时应执行自动压缩");
 
         let mut extended_messages = original_messages;
         extended_messages.push(text_message("user", "检查刚才的修改"));
-        let second = plugin.compress_incrementally(ContextLoadRequest {
-            run_id: "incremental-run".into(),
-            step: 1,
-            provider: "test".into(),
-            model: "test-model".into(),
-            system: None,
-            messages: extended_messages,
-        });
+        let second = plugin
+            .compress_incrementally(
+                ContextLoadRequest {
+                    run_id: "incremental-run".into(),
+                    step: 1,
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    system: None,
+                    messages: extended_messages,
+                },
+                &test_summary,
+            )
+            .expect("后续增量压缩应成功");
 
         assert!(second.event.is_none(), "复用压缩前缀时不应重复发布压缩事件");
         assert_eq!(
@@ -950,9 +868,11 @@ mod tests {
                 text_message("user", "当前请求"),
             ],
         };
-        let outcome =
-            compact_service_request(serde_json::to_value(request).expect("主动压缩请求应能序列化"))
-                .expect("主动压缩服务应立即返回结果");
+        let outcome = compact_service_request(
+            serde_json::to_value(request).expect("主动压缩请求应能序列化"),
+            &test_summary,
+        )
+        .expect("主动压缩服务应立即返回结果");
 
         assert_eq!(outcome.context.messages.len(), 3);
         assert!(outcome.context.messages[0]["content"][0]["text"]

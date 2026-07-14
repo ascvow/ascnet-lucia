@@ -58,6 +58,9 @@ world plugin {
   /// 终止并释放子进程。
   import host-process-kill: func(request-json: string) -> string;
 
+  /// 使用宿主固定的模型路由执行一次无工具模型完成。
+  import host-model-complete: func(request-json: string) -> string;
+
   /// 调用受权限约束的 Agent Runtime 短控制面操作。
   import host-agent-runtime-call: func(request-json: string) -> string;
 
