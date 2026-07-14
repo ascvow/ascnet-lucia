@@ -429,32 +429,41 @@ pub(crate) fn context_status(tokens: u64, context_window: Option<u64>) -> (Strin
 /// Lucia 大头像素点阵；每个字符代表一个像素，`.` 表示透明背景。
 ///
 /// 点阵只保留双马尾发束、刘海、红眼、面部与领口，确保常见 TUI 尺寸下仍可辨认。
-const HERO_PORTRAIT: [&str; 14] = [
-    "..........kkkkkkkk..........",
-    ".......kkhhhhhhhhhhkk.......",
-    ".....kkhhhhhhhhhhhhhhkk.....",
-    "....khhhhhhhhhhhhhhhhhhk....",
-    "..rrkhhhhhhhhhhhhhhhhhhkrr..",
-    "...khhhhhhhhhhhhhhhhhhhhk...",
-    "..khhhhhhhhhhkkhhhhhhhhhhk..",
-    ".rkhhhRRhhhhkkkkhhhhRRhhhkr.",
-    ".khhhkkkssssssssssskkkhhhhk.",
-    ".khhkkssseesssseesssskkhhhk.",
-    ".rkhhkssssssssssssssskhhhkr.",
-    "..khhhkkkssssssssskkkhhhhk..",
-    "...khhhhkdddRRdddddkhhhhh...",
-    "....rrkkddddddddddddkkrr....",
+const HERO_PORTRAIT: [&str; 18] = [
+    ".........kkkkk........kkkkk.........",
+    "........klllllk......klllllk........",
+    "........kqqqkkkkkkkkkkkkqqqk........",
+    "........khhhhqqqqqqqqqqhhhhk........",
+    "......khhhllllhhhhhhhhllllhhhk......",
+    ".....khhhhRRhhqqqqqqqqhhRRhhhhk.....",
+    "....khhhhhhhhhhhhhhhhhhhhhhhhhhk....",
+    ".khhhhkhhhhhhhhhhhhhhhhhhhhhkhhhhhk.",
+    "krrrkhhkkhhhhshhhhshhhhshhhkkhhkrrrk",
+    ".khhhhkkkqqqsssqqqssssqqqqqkkkhhhhk.",
+    ".khhhhkkksqeEwesqsssseEweqskkkhhhhk.",
+    ".khhhhhqqssEEkEssssssEEkEssqqhhhhhk.",
+    ".khhhhhqqssssssssssssssssssqqhhhhhk.",
+    ".khhhhhqqqqssssssssssssssqqqqhhhhhk.",
+    "..krrrrhhhhhhkdddRRdddkhhhhhhrrrrk..",
+    "...krrrqqqqqkddddRRddddkqqqqqrrrk...",
+    "....kRRRrrkdddddRRRRdddddkrrRRRk....",
+    ".....krrrddddddrrrrrrddddddrrrk.....",
 ];
 
 /// 将头像点阵字符映射为终端 RGB 颜色；透明像素返回 `None`。
 fn hero_pixel_color(pixel: u8) -> Option<Color> {
     match pixel {
         b'k' => Some(Color::Rgb(28, 24, 30)),
+        b'q' => Some(Color::Rgb(50, 42, 51)),
         b'h' => Some(Color::Rgb(67, 57, 67)),
+        b'l' => Some(Color::Rgb(91, 76, 87)),
         b'r' => Some(Color::Rgb(132, 23, 40)),
         b'R' => Some(Color::Rgb(230, 55, 72)),
         b's' => Some(Color::Rgb(255, 210, 202)),
+        b'S' => Some(Color::Rgb(220, 159, 158)),
         b'e' => Some(Color::Rgb(201, 45, 58)),
+        b'E' => Some(Color::Rgb(239, 71, 82)),
+        b'w' => Some(Color::Rgb(255, 242, 238)),
         b'd' => Some(Color::Rgb(43, 39, 48)),
         _ => None,
     }
@@ -498,8 +507,8 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
         return;
     }
     let mut lines: Vec<Line> = Vec::new();
-    // 头像宽 28 列、高 7 行；与版本和速查合计 15 行。
-    if area.height >= 15 && area.width >= 30 {
+    // 头像宽 36 列、高 9 行；与版本和速查合计 17 行。
+    if area.height >= 17 && area.width >= 38 {
         lines.extend(hero_portrait_lines());
     }
     lines.push(Line::from(Span::styled(
@@ -677,4 +686,18 @@ pub(crate) fn render_command_preview(
         ),
         area,
     );
+}
+
+#[cfg(test)]
+mod hero_portrait_tests {
+    use super::*;
+
+    /// 像素头像的每一行必须等宽，避免半块压缩时发生列索引越界。
+    #[test]
+    fn portrait_rows_have_equal_width() {
+        let width = HERO_PORTRAIT[0].len();
+        for (index, row) in HERO_PORTRAIT.iter().enumerate() {
+            assert_eq!(row.len(), width, "头像第 {index} 行宽度不一致");
+        }
+    }
 }
