@@ -11,6 +11,8 @@ Lucia is a fully open-source agent runtime and terminal interface for working wi
 > [!NOTE]
 > Lucia is in early development. APIs and the plugin protocol may change before a stable release.
 
+![Lucia terminal interface showing the startup screen and loaded plugins](docs/public/images/lucia-tui-overview.png)
+
 ## Why Lucia
 
 - **Inspectable by design.** The model request path, Agent loop, tool routing, session storage, plugin loading, and permission checks are available under the MIT License.

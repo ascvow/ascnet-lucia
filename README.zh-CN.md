@@ -11,6 +11,8 @@ Lucia 是一套完全开源的 Agent 运行时与终端界面，用于连接语�
 > [!NOTE]
 > Lucia 仍处于早期开发阶段，接口和插件协议在稳定版本发布前可能继续调整。
 
+![Lucia 终端界面的启动页与已加载插件](docs/public/images/lucia-tui-overview.png)
+
 ## 为什么选择 Lucia
 
 - **运行过程可以检查。** 模型请求、Agent 循环、工具路由、会话存储、插件加载和权限检查均采用 MIT 许可证开放源代码。
