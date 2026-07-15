@@ -785,11 +785,31 @@ impl TeammatePlugin {
             )]));
         }
         lines.push(ui_line(Vec::new()));
-        lines.push(ui_line(vec![ui_span(
-            "打开团队工作台",
-            Some(UiColor::Green),
-            true,
-        )]));
+        lines.push(ui_line(vec![
+            ui_span(
+                if request.focused { "› " } else { "  " },
+                Some(if request.focused {
+                    UiColor::Cyan
+                } else {
+                    UiColor::Gray
+                }),
+                request.focused,
+            ),
+            ui_action_span("团队工作台", request.focused),
+            ui_span(
+                if request.focused {
+                    "  Enter"
+                } else {
+                    "  Tab → Enter"
+                },
+                Some(if request.focused {
+                    UiColor::Cyan
+                } else {
+                    UiColor::Gray
+                }),
+                request.focused,
+            ),
+        ]));
         lines
     }
 
@@ -1272,6 +1292,23 @@ fn ui_span(text: impl Into<String>, foreground: Option<UiColor>, bold: bool) -> 
     }
 }
 
+/// 构造团队入口操作文本；聚焦时切换为高亮选中态，未聚焦时保留可点击链接语义。
+fn ui_action_span(text: impl Into<String>, focused: bool) -> UiSpan {
+    UiSpan {
+        text: text.into(),
+        style: UiStyle {
+            foreground: Some(if focused {
+                UiColor::Cyan
+            } else {
+                UiColor::Green
+            }),
+            bold: true,
+            underlined: true,
+            ..UiStyle::default()
+        },
+    }
+}
+
 /// 返回成员状态的单字符视觉标记。
 fn status_marker(status: AgentStatus) -> &'static str {
     match status {
@@ -1598,6 +1635,23 @@ mod tests {
         assert!(text.contains('◌'), "{text}");
         assert!(text.contains("队长  等待"), "{text}");
         assert!(text.contains("排队"), "{text}");
+        assert!(text.contains("团队工作台  Tab → Enter"), "{text}");
+
+        let focused = plugin
+            .render_ui(UiRenderRequest {
+                plugin_id: "teammate".into(),
+                view_id: TEAM_DOCK_VIEW.into(),
+                instance_id: None,
+                width: 30,
+                height: 16,
+                focused: true,
+                frame: 2,
+            })
+            .expect("聚焦团队摘要应返回可见帧");
+        let action = focused.lines.last().expect("团队摘要应包含入口行");
+        assert_eq!(action.spans[0].text, "› ");
+        assert_eq!(action.spans[2].text, "  Enter");
+        assert!(action.spans[1].style.underlined);
 
         let workspace = plugin
             .render_ui(UiRenderRequest {
@@ -1607,7 +1661,7 @@ mod tests {
                 width: 80,
                 height: 24,
                 focused: true,
-                frame: 2,
+                frame: 3,
             })
             .expect("团队工作台应返回可见帧");
         let workspace_text = workspace
