@@ -3,8 +3,8 @@
 use agent_plugin::{
     export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentPlugin, PluginHostApi,
     PromptContribution, Result, ToolCall, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame,
-    UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement,
-    UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
+    UiInput, UiInputEvent, UiLanguage, UiLine, UiNavigationAction, UiNavigationRequest,
+    UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -156,11 +156,14 @@ struct PlanPlugin {
     state: PlanState,
     /// 生成插件实例内唯一的导航请求 ID。
     navigation_sequence: u64,
+    /// Host 在激活阶段注入的界面语言。
+    language: UiLanguage,
 }
 
 impl AgentPlugin for PlanPlugin {
     /// 恢复 Host 中同一插件实例的状态、注册计划提示，并拒绝不兼容或损坏的数据。
-    fn activate(&mut self, host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
+    fn activate(&mut self, host: &dyn PluginHostApi, context: ActivationContext) -> Result<()> {
+        self.language = context.ui_language();
         if let Some(value) = host.get_state(PLAN_STATE_KEY)? {
             let state: PlanState = serde_json::from_value(value).context("解析计划状态失败")?;
             state.validate()?;
@@ -230,7 +233,7 @@ impl AgentPlugin for PlanPlugin {
             UiDeclaration {
                 plugin_id: String::new(),
                 view_id: PLAN_SHELF_VIEW.into(),
-                title: "计划".into(),
+                title: self.language.select("Plan", "计划").into(),
                 placement: UiPlacement::ComposerShelf,
                 size: UiSize {
                     width: None,
@@ -242,7 +245,7 @@ impl AgentPlugin for PlanPlugin {
             UiDeclaration {
                 plugin_id: String::new(),
                 view_id: PLAN_DETAIL_VIEW.into(),
-                title: "计划详情".into(),
+                title: self.language.select("Plan details", "计划详情").into(),
                 placement: UiPlacement::Subview,
                 size: UiSize::default(),
                 focusable: true,
@@ -296,7 +299,7 @@ impl AgentPlugin for PlanPlugin {
                 view: UiViewInstance {
                     view_id: PLAN_DETAIL_VIEW.into(),
                     instance_id: "current".into(),
-                    title: Some("计划详情".into()),
+                    title: Some(self.language.select("Plan details", "计划详情").into()),
                 },
             },
         });
@@ -308,7 +311,14 @@ impl PlanPlugin {
     fn render_shelf(&self, completed: usize, width: usize) -> Vec<UiLine> {
         let mut lines = vec![styled_line(
             truncate_to_width(
-                &format!("计划  {completed}/{} 已完成", self.state.plan.len()),
+                &match self.language {
+                    UiLanguage::English => {
+                        format!("Plan  {completed}/{} completed", self.state.plan.len())
+                    }
+                    UiLanguage::SimplifiedChinese => {
+                        format!("计划  {completed}/{} 已完成", self.state.plan.len())
+                    }
+                },
                 width,
             ),
             Some(UiColor::Cyan),
@@ -330,7 +340,13 @@ impl PlanPlugin {
         let hidden = ordered.len().saturating_sub(visible_tasks);
         if hidden > 0 {
             lines.push(styled_line(
-                truncate_to_width(&format!("+{hidden} Task"), width),
+                truncate_to_width(
+                    &match self.language {
+                        UiLanguage::English => format!("+{hidden} Task"),
+                        UiLanguage::SimplifiedChinese => format!("+{hidden} 项任务"),
+                    },
+                    width,
+                ),
                 Some(UiColor::Gray),
                 false,
             ));
@@ -342,7 +358,14 @@ impl PlanPlugin {
     fn render_detail(&self, completed: usize, width: usize) -> Vec<UiLine> {
         let mut lines = vec![styled_line(
             truncate_to_width(
-                &format!("进度  {completed} / {}", self.state.plan.len()),
+                &match self.language {
+                    UiLanguage::English => {
+                        format!("Progress  {completed} / {}", self.state.plan.len())
+                    }
+                    UiLanguage::SimplifiedChinese => {
+                        format!("进度  {completed} / {}", self.state.plan.len())
+                    }
+                },
                 width,
             ),
             Some(UiColor::Cyan),
@@ -350,7 +373,10 @@ impl PlanPlugin {
         )];
         if let Some(explanation) = &self.state.explanation {
             lines.push(styled_line(
-                truncate_to_width(&format!("说明：{explanation}"), width),
+                truncate_to_width(
+                    &format!("{}: {explanation}", self.language.select("Note", "说明")),
+                    width,
+                ),
                 Some(UiColor::Gray),
                 false,
             ));
@@ -646,7 +672,10 @@ mod tests {
     /// 紧凑计划架最多展示五行，超出项汇总显示，已完成任务稳定沉到末尾。
     #[test]
     fn shelf_limits_rows_and_sinks_completed_items() {
-        let mut plugin = PlanPlugin::default();
+        let mut plugin = PlanPlugin {
+            language: UiLanguage::SimplifiedChinese,
+            ..PlanPlugin::default()
+        };
         plugin.state.plan = vec![
             item("已完成一", PlanStatus::Completed),
             item("待处理", PlanStatus::Pending),
@@ -671,6 +700,7 @@ mod tests {
             ]
         );
 
+        plugin.language = UiLanguage::English;
         plugin.state.plan = (1..=7)
             .map(|index| item(&format!("任务 {index}"), PlanStatus::Pending))
             .collect();

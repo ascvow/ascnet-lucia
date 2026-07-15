@@ -140,6 +140,46 @@ pub struct ActivationContext {
     pub metadata: HashMap<String, String>,
 }
 
+/// 官方插件界面支持的语言集合；未知 locale 按英文处理。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UiLanguage {
+    /// 英文界面，也是缺失或未知 locale 的稳定回退。
+    #[default]
+    English,
+    /// 简体中文界面，兼容 `zh`、`zh-CN` 与 `zh-Hans` 标签。
+    SimplifiedChinese,
+}
+
+impl UiLanguage {
+    /// 从 BCP 47 或 POSIX locale 标签解析支持的界面语言。
+    pub fn from_locale(locale: &str) -> Self {
+        let normalized = locale.trim().replace('_', "-").to_ascii_lowercase();
+        if normalized == "zh" || normalized.starts_with("zh-") {
+            Self::SimplifiedChinese
+        } else {
+            Self::English
+        }
+    }
+
+    /// 在英文与简体中文文案之间选择当前语言对应的值。
+    pub fn select<'a>(self, english: &'a str, simplified_chinese: &'a str) -> &'a str {
+        match self {
+            Self::English => english,
+            Self::SimplifiedChinese => simplified_chinese,
+        }
+    }
+}
+
+impl ActivationContext {
+    /// 读取 Host 注入的界面语言；旧 Host 未提供时稳定回退到英文。
+    pub fn ui_language(&self) -> UiLanguage {
+        self.metadata
+            .get(HOST_LOCALE_METADATA_KEY)
+            .map(|locale| UiLanguage::from_locale(locale))
+            .unwrap_or_default()
+    }
+}
+
 /// 单次模型请求交给上下文插件的 provider-neutral 数据。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContextLoadRequest {
@@ -1408,5 +1448,27 @@ mod tests {
         assert_eq!(event.data["action"]["action"], "push");
         assert_eq!(event.data["action"]["view"]["instance_id"], "agent-1");
         assert_eq!(event.presentation, None);
+    }
+
+    /// 激活上下文应识别常见中文标签，缺失或不支持的语言稳定回退到英文。
+    #[test]
+    fn activation_context_selects_supported_ui_language() {
+        let mut context = ActivationContext {
+            plugin_id: "ui-plugin".into(),
+            metadata: HashMap::new(),
+        };
+        assert_eq!(context.ui_language(), UiLanguage::English);
+
+        for locale in ["zh", "zh_CN.UTF-8", "zh-Hans-CN", "zh-TW"] {
+            context
+                .metadata
+                .insert(HOST_LOCALE_METADATA_KEY.into(), locale.into());
+            assert_eq!(context.ui_language(), UiLanguage::SimplifiedChinese);
+        }
+
+        context
+            .metadata
+            .insert(HOST_LOCALE_METADATA_KEY.into(), "ja-JP".into());
+        assert_eq!(context.ui_language(), UiLanguage::English);
     }
 }

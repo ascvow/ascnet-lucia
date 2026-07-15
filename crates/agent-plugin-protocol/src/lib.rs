@@ -7,6 +7,9 @@
 use agent_tool::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 
+/// Host 在插件激活 metadata 中注入规范化界面语言所使用的保留键。
+pub const HOST_LOCALE_METADATA_KEY: &str = "host.locale";
+
 /// 插件界面可以挂载的位置。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

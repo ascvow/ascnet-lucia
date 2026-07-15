@@ -196,7 +196,7 @@ impl SessionSurface {
     }
 
     /// 根据宿主分配尺寸渲染稳定高度的 Dialog 内容。
-    pub(super) fn render(&mut self, width: u16, height: u16) -> Vec<UiLine> {
+    pub(super) fn render(&mut self, width: u16, height: u16, language: UiLanguage) -> Vec<UiLine> {
         if !self.visible {
             self.rendered_start = 0;
             self.rendered_len = 0;
@@ -204,15 +204,20 @@ impl SessionSurface {
         }
         let content_width = usize::from(width.saturating_sub(2)).max(1);
         let title = match self.mode {
-            SessionSurfaceMode::Resume => "恢复会话",
-            SessionSurfaceMode::Browse => "项目会话",
+            SessionSurfaceMode::Resume => language.select("Resume session", "恢复会话"),
+            SessionSurfaceMode::Browse => language.select("Project sessions", "项目会话"),
         };
         let mut lines = vec![
             line(vec![styled(title, UiColor::Cyan, true, false)]),
             line(vec![
-                styled("搜索  ", UiColor::Gray, false, false),
+                styled(
+                    language.select("Search  ", "搜索  "),
+                    UiColor::Gray,
+                    false,
+                    false,
+                ),
                 plain(if self.query.is_empty() {
-                    "输入关键词过滤"
+                    language.select("Type to filter", "输入关键词过滤")
                 } else {
                     &self.query
                 }),
@@ -230,7 +235,7 @@ impl SessionSurface {
         match &self.status {
             SessionListStatus::Loading => {
                 lines.push(line(vec![styled(
-                    "正在加载会话...",
+                    language.select("Loading sessions...", "正在加载会话..."),
                     UiColor::Yellow,
                     false,
                     false,
@@ -238,7 +243,10 @@ impl SessionSurface {
             }
             SessionListStatus::Empty => {
                 lines.push(line(vec![styled(
-                    "当前工作目录没有匹配会话",
+                    language.select(
+                        "No matching sessions in the current directory",
+                        "当前工作目录没有匹配会话",
+                    ),
                     UiColor::Gray,
                     false,
                     false,
@@ -264,11 +272,12 @@ impl SessionSurface {
                         item,
                         index == self.selected,
                         content_width,
+                        language,
                     ));
                 }
                 if next_cursor.is_some() && items.len() < list_height {
                     lines.push(line(vec![styled(
-                        "还有更多会话",
+                        language.select("More sessions available", "还有更多会话"),
                         UiColor::Gray,
                         false,
                         false,
@@ -316,23 +325,29 @@ pub(super) fn render_session_line(
     item: &SessionSummary,
     selected: bool,
     content_width: usize,
+    language: UiLanguage,
 ) -> UiLine {
     let title = if item.title.trim().is_empty() {
         item.id.as_str()
     } else {
         item.title.as_str()
     };
-    let active = if item.active { " · 使用中" } else { "" };
+    let active = if item.active {
+        language.select(" · Active", " · 使用中")
+    } else {
+        ""
+    };
     let updated = if item.updated_label.trim().is_empty() {
         item.updated_at_ms.to_string()
     } else {
         item.updated_label.clone()
     };
     let text = format!(
-        "{}{} · {} 条消息 · {}{}",
+        "{}{} · {} {} · {}{}",
         if selected { "> " } else { "  " },
         title,
         item.message_count,
+        language.select("messages", "条消息"),
         updated,
         active
     );

@@ -46,17 +46,20 @@ pub(super) struct CommandRegistry {
     pub(super) commands: BTreeMap<String, RegisteredCommand>,
     pub(super) aliases: BTreeMap<String, String>,
     pub(super) generation: u64,
+    /// 内置命令帮助与用户错误使用的界面语言。
+    pub(super) language: UiLanguage,
 }
 
 impl CommandRegistry {
     /// 创建只包含官方默认命令的第一代注册表。
-    pub(super) fn with_builtins() -> Self {
+    pub(super) fn with_builtins(language: UiLanguage) -> Self {
         let mut registry = Self {
             commands: BTreeMap::new(),
             aliases: BTreeMap::new(),
             generation: 1,
+            language,
         };
-        for (spec, command) in builtin_specs() {
+        for (spec, command) in builtin_specs(language) {
             registry.insert_unchecked(RegisteredCommand {
                 owner_plugin_id: BUILTIN_OWNER.into(),
                 spec,
@@ -308,20 +311,42 @@ impl CommandRegistry {
         };
         let Some(name) = canonical_command_name(&parsed.name) else {
             return Prepared::Error {
-                message: format!("无效命令名：{}", parsed.name),
+                message: format!(
+                    "{}: {}",
+                    self.language.select("Invalid command name", "无效命令名"),
+                    parsed.name
+                ),
                 usage: None,
             };
         };
         let Some(canonical) = self.resolve_name(&name) else {
             return Prepared::Error {
-                message: format!("未知命令：/{}", parsed.name),
-                usage: Some("输入 /help 查看可用命令".into()),
+                message: format!(
+                    "{}: /{}",
+                    self.language.select("Unknown command", "未知命令"),
+                    parsed.name
+                ),
+                usage: Some(
+                    self.language
+                        .select(
+                            "Type /help to view available commands",
+                            "输入 /help 查看可用命令",
+                        )
+                        .into(),
+                ),
             };
         };
         let entry = &self.commands[canonical];
         if entry.spec.availability == CommandAvailability::IdleOnly && !agent_idle {
             return Prepared::Error {
-                message: format!("命令 `/{canonical}` 只能在 Agent 空闲时执行"),
+                message: match self.language {
+                    UiLanguage::English => {
+                        format!("Command `/{canonical}` is only available while the Agent is idle")
+                    }
+                    UiLanguage::SimplifiedChinese => {
+                        format!("命令 `/{canonical}` 只能在 Agent 空闲时执行")
+                    }
+                },
                 usage: Some(entry.spec.display_usage()),
             };
         }
@@ -342,7 +367,14 @@ impl CommandRegistry {
         }
         let Some(handler) = entry.spec.handler.clone() else {
             return Prepared::Error {
-                message: format!("命令 `/{canonical}` 没有可用处理器"),
+                message: match self.language {
+                    UiLanguage::English => {
+                        format!("Command `/{canonical}` has no available handler")
+                    }
+                    UiLanguage::SimplifiedChinese => {
+                        format!("命令 `/{canonical}` 没有可用处理器")
+                    }
+                },
                 usage: Some(entry.spec.display_usage()),
             };
         };
@@ -358,10 +390,16 @@ impl CommandRegistry {
         if let Some(target) = target {
             let target = target.trim_start_matches('/');
             let Some(name) = canonical_command_name(target) else {
-                return format!("无效命令名：{target}");
+                return format!(
+                    "{}: {target}",
+                    self.language.select("Invalid command name", "无效命令名")
+                );
             };
             let Some(canonical) = self.resolve_name(&name) else {
-                return format!("未知命令：/{target}");
+                return format!(
+                    "{}: /{target}",
+                    self.language.select("Unknown command", "未知命令")
+                );
             };
             let spec = &self.commands[canonical].spec;
             let mut output = format!(
@@ -371,10 +409,14 @@ impl CommandRegistry {
                 spec.description
             );
             if !spec.aliases.is_empty() {
-                output.push_str(&format!("\n\n别名：/{}", spec.aliases.join("、/")));
+                output.push_str(&format!(
+                    "\n\n{}: /{}",
+                    self.language.select("Aliases", "别名"),
+                    spec.aliases.join(self.language.select(", /", "、/"))
+                ));
             }
             if !spec.arguments.is_empty() {
-                output.push_str("\n\n参数：");
+                output.push_str(self.language.select("\n\nArguments:", "\n\n参数："));
                 for argument in &spec.arguments {
                     output.push_str(&format!("\n  {}  {}", argument.name, argument.description));
                 }
@@ -382,7 +424,7 @@ impl CommandRegistry {
             return output;
         }
 
-        let mut output = String::from("可用命令：");
+        let mut output = String::from(self.language.select("Available commands:", "可用命令："));
         for entry in self.commands.values() {
             output.push_str(&format!(
                 "\n  {:<24} {}",
@@ -734,60 +776,92 @@ pub(super) fn validate_argument_value(
 }
 
 /// 构造官方内置命令及其处理器路由。
-pub(super) fn builtin_specs() -> Vec<(CommandSpec, BuiltinCommand)> {
+pub(super) fn builtin_specs(language: UiLanguage) -> Vec<(CommandSpec, BuiltinCommand)> {
     vec![
         (
-            CommandSpec::new("help", "查看命令帮助", "显示全部命令或指定命令的详细用法。")
-                .with_argument(ArgumentSpec::optional(
-                    "command",
+            CommandSpec::new(
+                "help",
+                language.select("View command help", "查看命令帮助"),
+                language.select(
+                    "Show detailed usage for all commands or one command.",
+                    "显示全部命令或指定命令的详细用法。",
+                ),
+            )
+            .with_argument(ArgumentSpec::optional(
+                "command",
+                language.select(
+                    "Command name without the leading slash",
                     "不含前导斜杠的命令名",
-                    ArgumentKind::String,
-                )),
+                ),
+                ArgumentKind::String,
+            )),
             BuiltinCommand::Help,
         ),
         (
             idle_command(
                 "resume",
-                "恢复历史会话",
-                "打开当前工作目录的会话列表，选择后恢复会话。",
+                language.select("Resume a previous session", "恢复历史会话"),
+                language.select(
+                    "Open sessions for the current directory and resume the selected session.",
+                    "打开当前工作目录的会话列表，选择后恢复会话。",
+                ),
             ),
             BuiltinCommand::Resume,
         ),
         (
             idle_command(
                 "new",
-                "新建空白会话",
-                "结束当前会话并进入不会立即落盘的空白草稿。",
+                language.select("Start a new session", "新建空白会话"),
+                language.select(
+                    "End the current session and open a new unsaved draft.",
+                    "结束当前会话并进入不会立即落盘的空白草稿。",
+                ),
             ),
             BuiltinCommand::New,
         ),
         (
             idle_command(
                 "sessions",
-                "浏览项目会话",
-                "打开当前工作目录的只读会话列表。",
+                language.select("Browse project sessions", "浏览项目会话"),
+                language.select(
+                    "Open the read-only session list for the current directory.",
+                    "打开当前工作目录的只读会话列表。",
+                ),
             ),
             BuiltinCommand::Sessions,
         ),
         (
             idle_command(
                 "clear",
-                "清空当前上下文",
-                "清空当前会话上下文并进入新的空白草稿。",
+                language.select("Clear current context", "清空当前上下文"),
+                language.select(
+                    "Clear the current session context and open a new draft.",
+                    "清空当前会话上下文并进入新的空白草稿。",
+                ),
             ),
             BuiltinCommand::Clear,
         ),
         (
             idle_command(
                 "compact",
-                "主动压缩当前上下文",
-                "立即压缩当前会话的较旧历史，并持久化压缩后的上下文。",
+                language.select("Compact current context", "主动压缩当前上下文"),
+                language.select(
+                    "Compact older session history now and persist the resulting context.",
+                    "立即压缩当前会话的较旧历史，并持久化压缩后的上下文。",
+                ),
             ),
             BuiltinCommand::Compact,
         ),
         (
-            idle_command("exit", "退出 Lucia", "请求 TUI 保存状态并正常退出 Lucia。")
-                .with_alias("quit"),
+            idle_command(
+                "exit",
+                language.select("Exit Lucia", "退出 Lucia"),
+                language.select(
+                    "Ask the TUI to save state and exit Lucia normally.",
+                    "请求 TUI 保存状态并正常退出 Lucia。",
+                ),
+            )
+            .with_alias("quit"),
             BuiltinCommand::Exit,
         ),
     ]

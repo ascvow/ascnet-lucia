@@ -43,6 +43,8 @@ pub use ui::{
 /// 提供 Agent Runtime，因此现有 loader 和不申请相关权限的插件保持原行为。
 #[derive(Clone, Default)]
 pub struct PluginHostServices {
+    /// 应用解析并规范化的界面 locale，仅由 Host 注入插件激活上下文。
+    locale: Option<String>,
     #[cfg(feature = "wasm")]
     agent_runtime: Option<AgentRuntimeHostServices>,
     #[cfg(feature = "wasm")]
@@ -73,6 +75,21 @@ impl PluginHostServices {
     /// 创建不提供额外宿主服务的默认集合。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 注入应用选择的界面 locale，供插件在首次声明 UI 前确定语言。
+    pub fn with_locale(mut self, locale: impl Into<String>) -> Result<Self> {
+        let locale = locale.into();
+        if locale.trim().is_empty() {
+            return Err(anyhow!("插件界面 locale 不能为空"));
+        }
+        self.locale = Some(locale);
+        Ok(self)
+    }
+
+    /// 返回应用注入的界面 locale；未注入时由 Guest 回退到英文。
+    pub(crate) fn locale(&self) -> Option<&str> {
+        self.locale.as_deref()
     }
 
     /// 注入 Agent Runtime provisioner、controller 基础 profile 和 Guest 可请求的派生策略。

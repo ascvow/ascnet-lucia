@@ -234,7 +234,7 @@ fn multiline_input_renders_six_visible_rows() {
 #[test]
 fn plugin_status_shows_startup_details_then_compact_count() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into());
+    let mut app = App::new(tx, "测试模型".into()).with_locale(Locale::SimplifiedChinese);
     app = app.with_loading_plugins(vec!["mcp".into(), "skill".into()]);
     app.mark_plugin_ready(
         "mcp".into(),
@@ -289,8 +289,9 @@ fn plugin_status_shows_startup_details_then_compact_count() {
 #[test]
 fn plugin_status_reports_progressive_ready_count() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app =
-        App::new(tx, "测试模型".into()).with_loading_plugins(vec!["command".into(), "mcp".into()]);
+    let mut app = App::new(tx, "测试模型".into())
+        .with_locale(Locale::SimplifiedChinese)
+        .with_loading_plugins(vec!["command".into(), "mcp".into()]);
 
     app.mark_plugin_ready("command".into(), &[], 0);
 
@@ -307,7 +308,7 @@ fn plugin_status_reports_progressive_ready_count() {
 #[test]
 fn plugin_status_keeps_partial_successes() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into());
+    let mut app = App::new(tx, "测试模型".into()).with_locale(Locale::SimplifiedChinese);
     app = app.with_loading_plugins(vec!["skill".into(), "mcp".into()]);
     app.mark_plugin_ready("skill".into(), &[], 0);
     app.mark_plugin_failed(PluginLoadFailure {

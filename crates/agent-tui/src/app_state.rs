@@ -39,6 +39,8 @@ pub(crate) fn input_ref_spans<'a>(
 pub(crate) struct App {
     /// 本次进程固定使用的项目工作目录。
     pub(crate) workspace: WorkspaceContext,
+    /// 本次进程固定使用的界面语言，由启动阶段按系统 locale 选择。
+    pub(crate) locale: Locale,
     pub(crate) messages: Vec<Msg>,
     pub(crate) input: String,
     /// 等待随下一条消息发送的附件；引用标签内嵌在 `input` 文本中。
@@ -163,6 +165,7 @@ impl App {
             .expect("创建进程内默认会话记录");
         Self {
             workspace: WorkspaceContext::capture().expect("当前工作目录应可用"),
+            locale: Locale::English,
             messages: Vec::new(),
             input: String::new(),
             attachments: Vec::new(),
@@ -223,6 +226,12 @@ impl App {
             #[cfg(feature = "plugins")]
             applied_host_actions: VecDeque::new(),
         }
+    }
+
+    /// 设置本次进程固定使用的界面语言。
+    pub(crate) fn with_locale(mut self, locale: Locale) -> Self {
+        self.locale = locale;
+        self
     }
 
     /// 注入主函数启动时捕获的项目上下文。
@@ -294,11 +303,18 @@ impl App {
             Ok(SessionReloadOutcome::Unchanged) => {}
             Ok(SessionReloadOutcome::NoLoader) => self.messages.push(Msg::new(
                 MsgKind::Info,
-                "当前没有就绪的上下文加载器，无法重载会话上下文",
+                self.locale.select(
+                    "No context loader is ready; the session context cannot be reloaded",
+                    "当前没有就绪的上下文加载器，无法重载会话上下文",
+                ),
             )),
             Err(error) => self.messages.push(Msg::new(
                 MsgKind::Error,
-                format!("重载会话上下文失败：{error}"),
+                format!(
+                    "{}: {error}",
+                    self.locale
+                        .select("Failed to reload session context", "重载会话上下文失败")
+                ),
             )),
         }
     }
@@ -427,8 +443,14 @@ impl App {
             Ok(None) => message.tool_frame = None,
             Err(error) => {
                 message.tool_frame = None;
-                self.plugin_failures
-                    .push(format!("工具消息 `{call_id}` 渲染失败：{error}"));
+                self.plugin_failures.push(match self.locale {
+                    Locale::English => {
+                        format!("Failed to render tool message `{call_id}`: {error}")
+                    }
+                    Locale::SimplifiedChinese => {
+                        format!("工具消息 `{call_id}` 渲染失败：{error}")
+                    }
+                });
             }
         }
     }
@@ -494,12 +516,23 @@ impl App {
         let blocked = if failure.blocked_by.is_empty() {
             String::new()
         } else {
-            format!("，依赖 {}", failure.blocked_by.join("、"))
+            match self.locale {
+                Locale::English => format!("; depends on {}", failure.blocked_by.join(", ")),
+                Locale::SimplifiedChinese => {
+                    format!("，依赖 {}", failure.blocked_by.join("、"))
+                }
+            }
         };
-        let detail = format!(
-            "{}: 加载失败{blocked} · {}",
-            failure.plugin_id, failure.reason
-        );
+        let detail = match self.locale {
+            Locale::English => format!(
+                "{}: load failed{blocked} · {}",
+                failure.plugin_id, failure.reason
+            ),
+            Locale::SimplifiedChinese => format!(
+                "{}: 加载失败{blocked} · {}",
+                failure.plugin_id, failure.reason
+            ),
+        };
         self.plugin_failures.push(detail.clone());
         self.plugin_startup_details.push(detail);
     }
@@ -560,7 +593,10 @@ impl App {
             let ready = if self.plugin_ids.is_empty() {
                 String::new()
             } else {
-                format!(" · 已就绪 {}", self.plugin_ids.len())
+                match self.locale {
+                    Locale::English => format!(" · {} ready", self.plugin_ids.len()),
+                    Locale::SimplifiedChinese => format!(" · 已就绪 {}", self.plugin_ids.len()),
+                }
             };
             let queue = if self.queued_inputs.is_empty() {
                 String::new()
@@ -568,14 +604,26 @@ impl App {
                 format!(" · queued {}", self.queued_inputs.len())
             };
             let text = if plugins.is_empty() {
-                format!("正在加载插件{ready}{queue}")
+                format!(
+                    "{}{ready}{queue}",
+                    self.locale.select("Loading plugins", "正在加载插件")
+                )
             } else {
-                format!("正在加载插件 · {plugins}{ready}{queue}")
+                format!(
+                    "{} · {plugins}{ready}{queue}",
+                    self.locale.select("Loading plugins", "正在加载插件")
+                )
             };
             return (SPINNER[self.spinner_frame % SPINNER.len()], text);
         }
         if let Some(error) = &self.plugin_load_error {
-            return ("✗", format!("插件加载失败 · {error}"));
+            return (
+                "✗",
+                format!(
+                    "{} · {error}",
+                    self.locale.select("Plugin loading failed", "插件加载失败")
+                ),
+            );
         }
         if self.plugin_status_ticks > 0 {
             let details = if self.plugin_startup_details.is_empty() {
@@ -584,11 +632,20 @@ impl App {
                 self.plugin_startup_details.join(" · ")
             };
             let text = if details.is_empty() {
-                "未加载插件".to_string()
+                self.locale
+                    .select("No plugins loaded", "未加载插件")
+                    .to_string()
             } else if self.plugin_failures.is_empty() {
-                format!("插件加载完成 · {details}")
+                format!(
+                    "{} · {details}",
+                    self.locale.select("Plugins loaded", "插件加载完成")
+                )
             } else {
-                format!("插件部分加载 · {details}")
+                format!(
+                    "{} · {details}",
+                    self.locale
+                        .select("Plugins partially loaded", "插件部分加载")
+                )
             };
             (
                 if self.plugin_failures.is_empty() {
@@ -869,8 +926,13 @@ impl App {
                 // 后台命令可能随时替换会话记录，期间禁止并发提交新消息。
                 #[cfg(feature = "plugins")]
                 if self.pending_reload.is_some() {
-                    self.messages
-                        .push(Msg::new(MsgKind::Info, "命令仍在执行中，请稍候再发送消息"));
+                    self.messages.push(Msg::new(
+                        MsgKind::Info,
+                        self.locale.select(
+                            "The command is still running. Try again shortly.",
+                            "命令仍在执行中，请稍候再发送消息",
+                        ),
+                    ));
                     return;
                 }
                 if let Some(agent) = agent {
@@ -881,7 +943,10 @@ impl App {
                         } else {
                             self.messages.push(Msg::new(
                                 MsgKind::Info,
-                                "运行中无法发送附件，请等待本轮完成后再提交",
+                                self.locale.select(
+                                    "Attachments cannot be sent during a run. Wait for it to finish.",
+                                    "运行中无法发送附件，请等待本轮完成后再提交",
+                                ),
                             ));
                         }
                     } else {
@@ -897,8 +962,11 @@ impl App {
                 if self.running {
                     if let Some(agent) = agent {
                         agent.cancel();
-                        self.messages
-                            .push(Msg::new(MsgKind::Info, "正在取消当前运行..."));
+                        self.messages.push(Msg::new(
+                            MsgKind::Info,
+                            self.locale
+                                .select("Cancelling the current run...", "正在取消当前运行..."),
+                        ));
                     }
                 } else if !self.input.is_empty() {
                     self.input.clear();
@@ -1295,7 +1363,10 @@ impl App {
                 visible: true,
                 lines: vec![UiLine {
                     spans: vec![UiSpan {
-                        text: format!("插件界面错误：{error:#}"),
+                        text: format!(
+                            "{}: {error:#}",
+                            self.locale.select("Plugin UI error", "插件界面错误")
+                        ),
                         style: UiStyle {
                             foreground: Some(UiColor::Red),
                             ..UiStyle::default()
@@ -1409,7 +1480,12 @@ impl App {
             Err(error) => {
                 self.messages.push(Msg::new(
                     MsgKind::Error,
-                    format!("读取附件失败（{}）：{error}", path.display()),
+                    format!(
+                        "{} ({}): {error}",
+                        self.locale
+                            .select("Failed to read attachment", "读取附件失败"),
+                        path.display()
+                    ),
                 ));
                 return;
             }
@@ -1417,11 +1493,18 @@ impl App {
         if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
             self.messages.push(Msg::new(
                 MsgKind::Error,
-                format!(
-                    "附件超过 {} MiB 上限：{}",
-                    MAX_ATTACHMENT_BYTES / 1024 / 1024,
-                    path.display()
-                ),
+                match self.locale {
+                    Locale::English => format!(
+                        "Attachment exceeds the {} MiB limit: {}",
+                        MAX_ATTACHMENT_BYTES / 1024 / 1024,
+                        path.display()
+                    ),
+                    Locale::SimplifiedChinese => format!(
+                        "附件超过 {} MiB 上限：{}",
+                        MAX_ATTACHMENT_BYTES / 1024 / 1024,
+                        path.display()
+                    ),
+                },
             ));
             return;
         }
@@ -1506,17 +1589,25 @@ impl App {
             .find(|m| matches!(m.kind, MsgKind::Assistant) && !m.text.is_empty())
             .map(|m| m.text.clone())
         else {
-            self.messages
-                .push(Msg::new(MsgKind::Info, "没有可复制的助手回复"));
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                self.locale
+                    .select("No assistant reply to copy", "没有可复制的助手回复"),
+            ));
             return;
         };
         match copy_to_clipboard(&text) {
-            Ok(()) => self
-                .messages
-                .push(Msg::new(MsgKind::Info, "已复制最近一条回复到剪贴板")),
-            Err(error) => self
-                .messages
-                .push(Msg::new(MsgKind::Error, format!("复制失败：{error}"))),
+            Ok(()) => self.messages.push(Msg::new(
+                MsgKind::Info,
+                self.locale.select(
+                    "Copied the latest reply to the clipboard",
+                    "已复制最近一条回复到剪贴板",
+                ),
+            )),
+            Err(error) => self.messages.push(Msg::new(
+                MsgKind::Error,
+                format!("{}: {error}", self.locale.select("Copy failed", "复制失败")),
+            )),
         }
     }
 
@@ -1532,9 +1623,15 @@ impl App {
         }
         self.mouse_capture = !self.mouse_capture;
         let notice = if self.mouse_capture {
-            "已恢复鼠标捕获与滚轮滚动"
+            self.locale.select(
+                "Mouse capture and wheel scrolling restored",
+                "已恢复鼠标捕获与滚轮滚动",
+            )
         } else {
-            "已暂停鼠标捕获：现在可用鼠标选择并复制文本，Ctrl+T 恢复"
+            self.locale.select(
+                "Mouse capture paused: select text normally; press Ctrl+T to restore",
+                "已暂停鼠标捕获：现在可用鼠标选择并复制文本，Ctrl+T 恢复",
+            )
         };
         self.messages.push(Msg::new(MsgKind::Info, notice));
     }
@@ -1590,7 +1687,10 @@ impl App {
         self.messages.push(Msg::new(MsgKind::User, input));
         self.messages.push(Msg::new(
             MsgKind::Info,
-            "插话已排队，将在当前工具完成后生效",
+            self.locale.select(
+                "Steering queued; it will be applied after the current tool finishes",
+                "插话已排队，将在当前工具完成后生效",
+            ),
         ));
     }
 
@@ -1730,14 +1830,20 @@ impl App {
         self.streaming_message = None;
         if let Some(run) = run {
             if run.cancelled {
-                self.messages
-                    .push(Msg::new(MsgKind::Info, "本轮运行已取消，已生成内容保留"));
+                self.messages.push(Msg::new(
+                    MsgKind::Info,
+                    self.locale.select(
+                        "Run cancelled; generated content was preserved",
+                        "本轮运行已取消，已生成内容保留",
+                    ),
+                ));
             }
             if !run.usage.is_empty() {
+                let step_label = self.locale.select("steps", "步");
                 self.messages.push(Msg::new(
                     MsgKind::Info,
                     format!(
-                        "↑{} ↓{} Σ{} tokens · {} 步",
+                        "↑{} ↓{} Σ{} tokens · {} {step_label}",
                         run.usage.input_tokens.unwrap_or(0),
                         run.usage.output_tokens.unwrap_or(0),
                         run.usage.total_tokens.unwrap_or(0),

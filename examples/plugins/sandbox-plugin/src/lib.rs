@@ -1,8 +1,9 @@
 //! Agent 工具策略与交互审批插件。
 
 use agent_plugin::{
-    export_plugin, AgentPlugin, ToolCall, ToolDecision, ToolDecisionStatus, UiColor, UiDeclaration,
-    UiFrame, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    export_plugin, ActivationContext, AgentPlugin, PluginHostApi, Result, ToolCall, ToolDecision,
+    ToolDecisionStatus, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLanguage, UiLine,
+    UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,9 +36,17 @@ pub struct SandboxPlugin {
     allowed_similar: BTreeSet<String>,
     allow_all: bool,
     selected: usize,
+    /// Host 在激活阶段注入的界面语言。
+    language: UiLanguage,
 }
 
 impl AgentPlugin for SandboxPlugin {
+    /// 读取 Host 注入的界面语言；沙盒策略本身不依赖 locale。
+    fn activate(&mut self, _host: &dyn PluginHostApi, context: ActivationContext) -> Result<()> {
+        self.language = context.ui_language();
+        Ok(())
+    }
+
     fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus {
         if let Some(resolution) = self.resolutions.remove(&call.id) {
             return match resolution {
@@ -70,7 +79,7 @@ impl AgentPlugin for SandboxPlugin {
             self.pending.push(PendingApproval {
                 call_id: call.id.clone(),
                 tool_name: call.name.clone(),
-                summary: approval_summary(&call),
+                summary: approval_summary(&call, self.language),
                 rule_key,
             });
         }
@@ -83,7 +92,10 @@ impl AgentPlugin for SandboxPlugin {
         vec![UiDeclaration {
             plugin_id: String::new(),
             view_id: APPROVAL_VIEW.into(),
-            title: "Agent 工具审批".into(),
+            title: self
+                .language
+                .select("Agent tool approval", "Agent 工具审批")
+                .into(),
             placement: UiPlacement::Input,
             size: UiSize {
                 width: None,
@@ -110,11 +122,31 @@ impl AgentPlugin for SandboxPlugin {
             view_id: APPROVAL_VIEW.into(),
             visible: true,
             lines: vec![
-                approval_header(&pending.tool_name, &pending.summary),
-                option_line("Y", "允许一次", self.selected == 0, false),
-                option_line("S", "允许相似调用", self.selected == 1, false),
-                option_line("Cmd+A", "全部放行", self.selected == 2, false),
-                option_line("C", "取消并暂停", self.selected == 3, true),
+                approval_header(&pending.tool_name, &pending.summary, self.language),
+                option_line(
+                    "Y",
+                    self.language.select("Allow once", "允许一次"),
+                    self.selected == 0,
+                    false,
+                ),
+                option_line(
+                    "S",
+                    self.language.select("Allow similar", "允许相似调用"),
+                    self.selected == 1,
+                    false,
+                ),
+                option_line(
+                    "Cmd+A",
+                    self.language.select("Allow all", "全部放行"),
+                    self.selected == 2,
+                    false,
+                ),
+                option_line(
+                    "C",
+                    self.language.select("Cancel and pause", "取消并暂停"),
+                    self.selected == 3,
+                    true,
+                ),
             ],
         })
     }
@@ -238,21 +270,29 @@ fn shell_command_family(command: &str) -> String {
 }
 
 /// 生成不包含文件内容或密钥值的审批摘要。
-fn approval_summary(call: &ToolCall) -> String {
+fn approval_summary(call: &ToolCall, language: UiLanguage) -> String {
     match call.name.as_str() {
         "write_file" => call
             .args
             .get("path")
             .and_then(|value| value.as_str())
-            .map(|path| format!("写入 {path}"))
-            .unwrap_or_else(|| "写入文件".into()),
+            .map(|path| format!("{} {path}", language.select("Write", "写入")))
+            .unwrap_or_else(|| language.select("Write file", "写入文件").into()),
         "shell" => call
             .args
             .get("command")
             .and_then(|value| value.as_str())
-            .map(redact_command)
-            .unwrap_or_else(|| "执行 Shell 命令".into()),
-        _ => format!("调用插件工具 {}", call.name),
+            .map(|command| redact_command(command, language))
+            .unwrap_or_else(|| {
+                language
+                    .select("Run shell command", "执行 Shell 命令")
+                    .into()
+            }),
+        _ => format!(
+            "{} {}",
+            language.select("Call plugin tool", "调用插件工具"),
+            call.name
+        ),
     }
 }
 
@@ -287,7 +327,7 @@ fn contains_sensitive_segment(path: &str) -> bool {
 }
 
 /// 截断命令预览并隐藏明显的凭据赋值，避免审批 UI 二次暴露密钥。
-fn redact_command(command: &str) -> String {
+fn redact_command(command: &str, language: UiLanguage) -> String {
     let preview = if command.chars().count() > 120 {
         format!("{}...", command.chars().take(120).collect::<String>())
     } else {
@@ -297,18 +337,23 @@ fn redact_command(command: &str) -> String {
         || preview.to_ascii_lowercase().contains("api_key=")
         || preview.to_ascii_lowercase().contains("password=")
     {
-        "执行包含敏感参数的 Shell 命令".into()
+        language
+            .select(
+                "Run shell command with sensitive arguments",
+                "执行包含敏感参数的 Shell 命令",
+            )
+            .into()
     } else {
-        format!("执行：{preview}")
+        format!("{}: {preview}", language.select("Run", "执行"))
     }
 }
 
 /// 渲染紧凑的审批标题，将工具名与调用摘要分层展示。
-fn approval_header(tool_name: &str, summary: &str) -> UiLine {
+fn approval_header(tool_name: &str, summary: &str, language: UiLanguage) -> UiLine {
     UiLine {
         spans: vec![
             UiSpan {
-                text: "审批".into(),
+                text: language.select("Approval", "审批").into(),
                 style: UiStyle {
                     foreground: Some(UiColor::Yellow),
                     bold: true,
@@ -383,7 +428,10 @@ mod tests {
     /// 审批界面应保持五行紧凑布局，不使用整块反色或冗余的关闭状态文案。
     #[test]
     fn approval_ui_uses_compact_visual_hierarchy() {
-        let mut plugin = SandboxPlugin::default();
+        let mut plugin = SandboxPlugin {
+            language: UiLanguage::SimplifiedChinese,
+            ..SandboxPlugin::default()
+        };
         plugin.before_tool(ToolCall::new(
             "shell-ui",
             "shell",

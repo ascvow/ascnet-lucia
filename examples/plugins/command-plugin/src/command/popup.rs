@@ -140,6 +140,7 @@ impl CommandPopup {
         registry: &CommandRegistry,
         agent_idle: bool,
         width: u16,
+        language: UiLanguage,
     ) -> Vec<UiLine> {
         let content_width = usize::from(width.saturating_sub(2)).max(1);
         if self.hidden {
@@ -188,7 +189,7 @@ impl CommandPopup {
         }
         if self.pending.is_some() {
             return vec![line(vec![styled(
-                "候选加载中...",
+                language.select("Loading suggestions...", "候选加载中..."),
                 UiColor::Yellow,
                 false,
                 false,
@@ -213,7 +214,10 @@ impl CommandPopup {
         let selected = &matches[selected_index];
         let availability = if !agent_idle && selected.availability == CommandAvailability::IdleOnly
         {
-            "  Agent 运行结束后可用"
+            language.select(
+                "  Available when the Agent run finishes",
+                "  Agent 运行结束后可用",
+            )
         } else {
             ""
         };

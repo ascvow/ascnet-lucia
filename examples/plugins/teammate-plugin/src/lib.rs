@@ -7,8 +7,9 @@ use agent_plugin::{
     export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentHandle, AgentId,
     AgentOutcome, AgentPlugin, AgentSpawnRequest, AgentStatus, AgentViewSession, ExtensionEvent,
     PluginHostApi, PromptContribution, Result, ServiceCall, ServiceSpec, ToolCall, ToolResult,
-    ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
-    UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
+    ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLanguage, UiLine,
+    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -405,6 +406,7 @@ fn default_inbox_limit() -> usize {
 #[derive(Default)]
 struct TeammatePlugin {
     plugin_id: Option<String>,
+    language: UiLanguage,
     state: TeamState,
     selected_member: usize,
     navigation_sequence: u64,
@@ -425,12 +427,12 @@ enum ControllerActivity {
 }
 
 impl ControllerActivity {
-    /// 返回团队栏使用的简体中文活动标签。
-    fn label(&self) -> &'static str {
+    /// 返回团队栏使用的本地化活动标签。
+    fn label(&self, language: UiLanguage) -> &'static str {
         match self {
-            Self::Waiting => "等待",
-            Self::Analyzing => "分析中",
-            Self::Working => "执行工具",
+            Self::Waiting => language.select("Waiting", "等待"),
+            Self::Analyzing => language.select("Analyzing", "分析中"),
+            Self::Working => language.select("Running tool", "执行工具"),
         }
     }
 
@@ -738,9 +740,17 @@ impl TeammatePlugin {
         let content_height = usize::from(request.height).max(1);
         let mut lines = vec![
             ui_line(vec![
-                ui_span(format!("{} 成员", members.len()), None, true),
                 ui_span(
-                    format!("  {} 运行", active),
+                    format!(
+                        "{} {}",
+                        members.len(),
+                        self.language.select("members", "成员")
+                    ),
+                    None,
+                    true,
+                ),
+                ui_span(
+                    format!("  {} {}", active, self.language.select("running", "运行")),
                     Some(if active > 0 {
                         UiColor::Cyan
                     } else {
@@ -749,7 +759,7 @@ impl TeammatePlugin {
                     active > 0,
                 ),
                 ui_span(
-                    format!("  {} 消息", unread),
+                    format!("  {} {}", unread, self.language.select("messages", "消息")),
                     Some(if unread > 0 {
                         UiColor::Yellow
                     } else {
@@ -759,15 +769,23 @@ impl TeammatePlugin {
                 ),
             ]),
             ui_line(vec![
-                ui_span("● 队长  ", Some(self.controller_activity.color()), true),
                 ui_span(
-                    self.controller_activity.label(),
+                    self.language.select("● Captain  ", "● 队长  "),
+                    Some(self.controller_activity.color()),
+                    true,
+                ),
+                ui_span(
+                    self.controller_activity.label(self.language),
                     Some(self.controller_activity.color()),
                     false,
                 ),
             ]),
             ui_line(Vec::new()),
-            ui_line(vec![ui_span("成员", Some(UiColor::Gray), true)]),
+            ui_line(vec![ui_span(
+                self.language.select("Members", "成员"),
+                Some(UiColor::Gray),
+                true,
+            )]),
         ];
         let member_capacity = content_height.saturating_sub(5);
         let visible_members = if members.len() > member_capacity {
@@ -784,7 +802,7 @@ impl TeammatePlugin {
                 ),
                 ui_span(format!(" {}", clipped(&member.role, 14)), None, false),
                 ui_span(
-                    format!("  {}", status_label(member.status)),
+                    format!("  {}", status_label(member.status, self.language)),
                     Some(UiColor::Gray),
                     false,
                 ),
@@ -802,7 +820,10 @@ impl TeammatePlugin {
         let hidden_members = members.len().saturating_sub(visible_members);
         if hidden_members > 0 {
             lines.push(ui_line(vec![ui_span(
-                format!("+{hidden_members} 成员"),
+                format!(
+                    "+{hidden_members} {}",
+                    self.language.select("members", "成员")
+                ),
                 Some(UiColor::Gray),
                 false,
             )]));
@@ -820,7 +841,10 @@ impl TeammatePlugin {
                 }),
                 request.focused,
             ),
-            ui_action_span("团队工作台", request.focused),
+            ui_action_span(
+                self.language.select("Team workspace", "团队工作台"),
+                request.focused,
+            ),
             ui_span(
                 if request.focused {
                     "  Enter"
@@ -842,9 +866,17 @@ impl TeammatePlugin {
     fn render_team_workspace(&mut self, request: &UiRenderRequest) -> Vec<UiLine> {
         let members = self.ui_members();
         let mut lines = vec![
-            ui_line(vec![ui_span("团队工作台", Some(UiColor::Cyan), true)]),
             ui_line(vec![ui_span(
-                format!("成员 {}", members.len()),
+                self.language.select("Team workspace", "团队工作台"),
+                Some(UiColor::Cyan),
+                true,
+            )]),
+            ui_line(vec![ui_span(
+                format!(
+                    "{} {}",
+                    self.language.select("Members", "成员"),
+                    members.len()
+                ),
                 Some(UiColor::Gray),
                 false,
             )]),
@@ -866,13 +898,17 @@ impl TeammatePlugin {
                 ),
                 ui_span(clipped(&member.role, 28), None, selected),
                 ui_span(
-                    format!("  {}", status_label(member.status)),
+                    format!("  {}", status_label(member.status, self.language)),
                     Some(UiColor::Gray),
                     false,
                 ),
                 ui_span(
                     if member.unread_messages > 0 {
-                        format!("  {} 条消息", member.unread_messages)
+                        format!(
+                            "  {} {}",
+                            member.unread_messages,
+                            self.language.select("messages", "条消息")
+                        )
                     } else {
                         String::new()
                     },
@@ -883,7 +919,7 @@ impl TeammatePlugin {
         }
         if members.is_empty() {
             lines.push(ui_line(vec![ui_span(
-                "暂无成员",
+                self.language.select("No members", "暂无成员"),
                 Some(UiColor::Gray),
                 false,
             )]));
@@ -892,32 +928,44 @@ impl TeammatePlugin {
         if let Some(member) = members.get(self.selected_member) {
             lines.push(ui_line(Vec::new()));
             lines.push(ui_line(vec![ui_span(
-                "成员详情",
+                self.language.select("Member details", "成员详情"),
                 Some(UiColor::Blue),
                 true,
             )]));
             lines.push(ui_line(vec![ui_span(
-                format!("角色  {}", member.role),
+                format!("{}  {}", self.language.select("Role", "角色"), member.role),
                 None,
                 false,
             )]));
             lines.push(ui_line(vec![ui_span(
-                format!("状态  {}", status_label(member.status)),
+                format!(
+                    "{}  {}",
+                    self.language.select("Status", "状态"),
+                    status_label(member.status, self.language)
+                ),
                 Some(status_color(member.status)),
                 false,
             )]));
             lines.push(ui_line(vec![ui_span(
-                format!("地址  {}", member.id.as_str()),
+                format!(
+                    "{}  {}",
+                    self.language.select("Address", "地址"),
+                    member.id.as_str()
+                ),
                 Some(UiColor::Gray),
                 false,
             )]));
             lines.push(ui_line(vec![ui_span(
-                format!("当前  {}", member.current_agent_id.as_str()),
+                format!(
+                    "{}  {}",
+                    self.language.select("Current", "当前"),
+                    member.current_agent_id.as_str()
+                ),
                 Some(UiColor::Gray),
                 false,
             )]));
             lines.push(ui_line(vec![ui_span(
-                "查看成员会话",
+                self.language.select("Open member session", "查看成员会话"),
                 Some(UiColor::Green),
                 true,
             )]));
@@ -929,7 +977,10 @@ impl TeammatePlugin {
     fn render_member_session(&self, request: &UiRenderRequest) -> Vec<UiLine> {
         let Some(instance_id) = request.instance_id.as_deref() else {
             return vec![ui_line(vec![ui_span(
-                "成员会话缺少实例 ID",
+                self.language.select(
+                    "Member session is missing an instance ID",
+                    "成员会话缺少实例 ID",
+                ),
                 Some(UiColor::Red),
                 false,
             )])];
@@ -942,14 +993,15 @@ impl TeammatePlugin {
             .find(|member| member.id.as_str() == instance_id)
         else {
             return vec![ui_line(vec![ui_span(
-                "成员不存在",
+                self.language.select("Member not found", "成员不存在"),
                 Some(UiColor::Red),
                 false,
             )])];
         };
         let Some(session) = self.member_sessions.get(&member.id) else {
             return vec![ui_line(vec![ui_span(
-                "正在连接成员会话",
+                self.language
+                    .select("Connecting to member session", "正在连接成员会话"),
                 Some(UiColor::Gray),
                 false,
             )])];
@@ -958,7 +1010,7 @@ impl TeammatePlugin {
             ui_line(vec![
                 ui_span(member.role, Some(UiColor::Cyan), true),
                 ui_span(
-                    format!("  {}", status_label(member.status)),
+                    format!("  {}", status_label(member.status, self.language)),
                     Some(status_color(member.status)),
                     false,
                 ),
@@ -1025,7 +1077,7 @@ impl TeammatePlugin {
                 view: UiViewInstance {
                     view_id: TEAM_WORKSPACE_VIEW.into(),
                     instance_id: "team".into(),
-                    title: Some("团队".into()),
+                    title: Some(self.language.select("Team", "团队").into()),
                 },
             },
         });
@@ -1058,6 +1110,7 @@ impl TeammatePlugin {
 impl AgentPlugin for TeammatePlugin {
     /// 保存可信插件 ID、注册协作提示并提供版本化 mailbox service。
     fn activate(&mut self, host: &dyn PluginHostApi, context: ActivationContext) -> Result<()> {
+        self.language = context.ui_language();
         self.plugin_id = Some(context.plugin_id);
         host.upsert_service(&ServiceSpec {
             name: TEAMMATE_SERVICE.into(),
@@ -1169,7 +1222,7 @@ impl AgentPlugin for TeammatePlugin {
             UiDeclaration {
                 plugin_id: String::new(),
                 view_id: TEAM_DOCK_VIEW.into(),
-                title: "团队".into(),
+                title: self.language.select("Team", "团队").into(),
                 placement: UiPlacement::Right,
                 size: UiSize {
                     width: Some(30),
@@ -1181,7 +1234,7 @@ impl AgentPlugin for TeammatePlugin {
             UiDeclaration {
                 plugin_id: String::new(),
                 view_id: TEAM_WORKSPACE_VIEW.into(),
-                title: "团队工作台".into(),
+                title: self.language.select("Team workspace", "团队工作台").into(),
                 placement: UiPlacement::Subview,
                 size: UiSize::default(),
                 focusable: true,
@@ -1190,7 +1243,7 @@ impl AgentPlugin for TeammatePlugin {
             UiDeclaration {
                 plugin_id: String::new(),
                 view_id: TEAM_SESSION_VIEW.into(),
-                title: "成员会话".into(),
+                title: self.language.select("Member session", "成员会话").into(),
                 placement: UiPlacement::Subview,
                 size: UiSize::default(),
                 focusable: true,
@@ -1346,15 +1399,15 @@ fn status_marker(status: AgentStatus) -> &'static str {
     }
 }
 
-/// 返回成员状态的简体中文标签。
-fn status_label(status: AgentStatus) -> &'static str {
+/// 返回成员状态的本地化标签。
+fn status_label(status: AgentStatus, language: UiLanguage) -> &'static str {
     match status {
-        AgentStatus::Ready => "就绪",
-        AgentStatus::Queued => "排队",
-        AgentStatus::Running => "运行中",
-        AgentStatus::Succeeded => "已完成",
-        AgentStatus::Failed => "失败",
-        AgentStatus::Cancelled => "已取消",
+        AgentStatus::Ready => language.select("Ready", "就绪"),
+        AgentStatus::Queued => language.select("Queued", "排队"),
+        AgentStatus::Running => language.select("Running", "运行中"),
+        AgentStatus::Succeeded => language.select("Completed", "已完成"),
+        AgentStatus::Failed => language.select("Failed", "失败"),
+        AgentStatus::Cancelled => language.select("Cancelled", "已取消"),
     }
 }
 
@@ -1625,6 +1678,7 @@ mod tests {
     fn team_ui_declares_entry_and_renders_members() {
         let mut plugin = TeammatePlugin {
             plugin_id: Some("teammate".into()),
+            language: UiLanguage::SimplifiedChinese,
             ..TeammatePlugin::default()
         };
         plugin
