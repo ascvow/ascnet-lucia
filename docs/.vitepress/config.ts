@@ -1,7 +1,8 @@
 import { defineConfig } from "vitepress";
 
-/** Lucia 中文文档站配置，按使用与开发两个一级板块组织导航。 */
+/** Lucia 中文文档站配置，按使用与开发板块组织导航并发布到 GitHub Pages 子路径。 */
 export default defineConfig({
+  base: "/ascnet-lucia/",
   lang: "zh-CN",
   title: "Lucia",
   description: "Lucia TUI、CLI、插件管理与 Rust 开发文档",
