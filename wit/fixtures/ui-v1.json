@@ -51,6 +51,34 @@
     "focused": true,
     "frame": 9
   },
+  "tool_render_request": {
+    "plugin_id": "fixture-plugin",
+    "renderer_id": "task-message",
+    "call": {
+      "id": "call-1",
+      "name": "task",
+      "args": {
+        "title": "整理方案"
+      }
+    },
+    "state": {
+      "state": "finished",
+      "result": {
+        "call_id": "call-1",
+        "name": "task",
+        "content": {
+          "status": "done"
+        },
+        "is_error": false,
+        "details": {
+          "duration_ms": 12
+        }
+      }
+    },
+    "width": 72,
+    "max_height": 20,
+    "frame": 10
+  },
   "frame": {
     "view_id": "detail",
     "visible": true,

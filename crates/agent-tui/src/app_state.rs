@@ -75,6 +75,9 @@ pub(crate) struct App {
     pub(crate) last_max_scroll: u16,
     /// 最近一次渲染得到的消息区高度，用于整页滚动。
     pub(crate) last_viewport: u16,
+    /// 最近一次渲染得到的消息区宽度，用于工具消息 renderer 分配尺寸。
+    #[cfg(feature = "plugins")]
+    pub(crate) last_message_width: u16,
     /// 最近一次模型请求消耗的上下文 token 数。
     pub(crate) context_tokens: Option<u64>,
     /// 配置的模型上下文窗口，用于状态栏计算占比。
@@ -182,6 +185,8 @@ impl App {
             scroll: None,
             last_max_scroll: 0,
             last_viewport: 0,
+            #[cfg(feature = "plugins")]
+            last_message_width: 0,
             context_tokens: None,
             context_window: None,
             mouse_capture: false,
@@ -307,6 +312,125 @@ impl App {
                 frame: None,
                 area: Rect::default(),
             }));
+    }
+
+    /// 为指定工具消息请求一次通用 Host 渲染；没有贡献时保持默认样式。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn schedule_tool_render(&mut self, host: Arc<LivePluginHost>, call_id: &str) {
+        let width = self.last_message_width.max(1);
+        let max_height = self.last_viewport.max(1);
+        let Some(index) = self
+            .messages
+            .iter()
+            .position(|message| message.tool_call_id() == Some(call_id))
+        else {
+            return;
+        };
+        let message = &self.messages[index];
+        let Some(call) = message.tool_call.clone() else {
+            return;
+        };
+        let state = match message.kind {
+            MsgKind::ToolRunning => ToolRenderState::Running,
+            MsgKind::ToolOk | MsgKind::ToolError => {
+                let Some(result) = message.tool_result.clone() else {
+                    return;
+                };
+                ToolRenderState::Finished { result }
+            }
+            MsgKind::ToolSkipped => ToolRenderState::Skipped {
+                reason: message.skip_reason.clone().unwrap_or_default(),
+            },
+            _ => return,
+        };
+        self.plugin_frame = self.plugin_frame.wrapping_add(1);
+        let context = ToolRenderContext {
+            call,
+            state,
+            width,
+            max_height,
+            frame: self.plugin_frame,
+        };
+        let revision = self.messages[index].tool_render_revision.wrapping_add(1);
+        self.messages[index].tool_render_revision = revision;
+        self.messages[index].tool_render_pending_width = Some(width);
+        let tx = self.tx.clone();
+        let call_id = call_id.to_string();
+        tokio::spawn(async move {
+            let result = host.render_tool_message(&context).await;
+            let _ = tx.send(UiEvent::ToolFrameLoaded {
+                call_id,
+                revision,
+                width,
+                result,
+            });
+        });
+    }
+
+    /// 对没有当前宽度帧的工具消息发起渲染，用于插件就绪和终端尺寸变化。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn schedule_stale_tool_renders(&mut self, host: Arc<LivePluginHost>) {
+        let width = self.last_message_width.max(1);
+        let call_ids = self
+            .messages
+            .iter()
+            .filter(|message| {
+                message.tool_call.is_some()
+                    && message.tool_render_pending_width != Some(width)
+                    && message.tool_frame_width != Some(width)
+            })
+            .filter_map(|message| message.tool_call_id().map(str::to_string))
+            .collect::<Vec<_>>();
+        for call_id in call_ids {
+            self.schedule_tool_render(Arc::clone(&host), &call_id);
+        }
+    }
+
+    /// 清除 Host 路由变化前的工具帧，并使并发中的旧渲染结果失效。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn invalidate_tool_frames(&mut self) {
+        for message in self
+            .messages
+            .iter_mut()
+            .filter(|message| message.tool_call.is_some())
+        {
+            message.tool_frame = None;
+            message.tool_frame_width = None;
+            message.tool_render_pending_width = None;
+            message.tool_render_revision = message.tool_render_revision.wrapping_add(1);
+        }
+    }
+
+    /// 提交一次工具消息 renderer 结果；失败时保留默认工具展示。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn apply_tool_frame(
+        &mut self,
+        call_id: &str,
+        revision: u64,
+        width: u16,
+        result: Result<Option<PluginUiFrame>>,
+    ) {
+        let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.tool_call_id() == Some(call_id))
+        else {
+            return;
+        };
+        if message.tool_render_revision != revision {
+            return;
+        }
+        message.tool_render_pending_width = None;
+        message.tool_frame_width = Some(width);
+        match result {
+            Ok(Some(frame)) => message.tool_frame = Some(frame),
+            Ok(None) => message.tool_frame = None,
+            Err(error) => {
+                message.tool_frame = None;
+                self.plugin_failures
+                    .push(format!("工具消息 `{call_id}` 渲染失败：{error}"));
+            }
+        }
     }
 
     /// 在应用导航栈上执行一次经 Host 标记来源的插件视图请求。

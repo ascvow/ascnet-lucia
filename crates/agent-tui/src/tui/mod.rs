@@ -21,7 +21,7 @@ pub(crate) use plugin_bridge::{
 };
 #[cfg(feature = "plugins")]
 pub(crate) use plugin_render::{
-    render_docked_plugin_views, render_input_panel, render_plugin_dialog, render_plugin_input,
-    render_plugin_subview,
+    plugin_frame_lines, render_docked_plugin_views, render_input_panel, render_plugin_dialog,
+    render_plugin_input, render_plugin_subview,
 };
 pub(crate) use root::render_root;

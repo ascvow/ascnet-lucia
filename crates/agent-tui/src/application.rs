@@ -350,11 +350,15 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         }
                     }
                     if let Some(host) = plugin_host.as_ref() {
-                        if let Err(error) = host.ui_declarations().await {
-                            app.messages.push(Msg::new(
+                        match host.ui_declarations().await {
+                            Ok(_) => {
+                                app.invalidate_tool_frames();
+                                app.schedule_stale_tool_renders(Arc::clone(host));
+                            }
+                            Err(error) => app.messages.push(Msg::new(
                                 MsgKind::Error,
                                 format!("插件 UI 声明刷新失败：{error}"),
-                            ));
+                            )),
                         }
                         app.schedule_plugin_views_refresh(Arc::clone(host));
                     }
@@ -430,7 +434,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::ToolStarted(call)) => {
+                #[cfg(feature = "plugins")]
+                let call_id = call.id.clone();
                 app.messages.push(Msg::tool_started(call));
+                #[cfg(feature = "plugins")]
+                if let Some(host) = plugin_host.as_ref() {
+                    app.schedule_tool_render(Arc::clone(host), &call_id);
+                }
             }
             Some(UiEvent::ToolFinished(tool_result)) => {
                 // 只按稳定调用 ID 更新运行项，避免同名并发工具互相覆盖。
@@ -449,13 +459,30 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 } else {
                     app.messages.push(Msg::tool_finished(tool_result));
                 }
+                #[cfg(feature = "plugins")]
+                if let Some(host) = plugin_host.as_ref() {
+                    app.schedule_tool_render(Arc::clone(host), &call_id);
+                }
             }
             Some(UiEvent::ToolSkipped { call, reason }) => {
+                #[cfg(feature = "plugins")]
+                let call_id = call.id.clone();
                 let mut message = Msg::tool_started(call);
                 message.kind = MsgKind::ToolSkipped;
                 message.skip_reason = Some(reason);
                 app.messages.push(message);
+                #[cfg(feature = "plugins")]
+                if let Some(host) = plugin_host.as_ref() {
+                    app.schedule_tool_render(Arc::clone(host), &call_id);
+                }
             }
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::ToolFrameLoaded {
+                call_id,
+                revision,
+                width,
+                result,
+            }) => app.apply_tool_frame(&call_id, revision, width, result),
             Some(UiEvent::SteeringInjected) => {
                 app.messages.push(Msg::new(MsgKind::Info, "插话已生效"));
             }
@@ -526,6 +553,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         if let Some(host) = plugin_host.as_ref() {
                             app.schedule_plugin_views_refresh(Arc::clone(host));
                         }
+                    }
+                    if let Some(host) = plugin_host.as_ref() {
+                        app.schedule_stale_tool_renders(Arc::clone(host));
                     }
                 }
             }

@@ -12,8 +12,8 @@ use super::{
     },
     service::{PluginService, PluginServiceCall, ServiceHandler, ServiceRegistry},
     AgentEvent, AgentRuntimeHostServices, CompositePluginHost, LivePluginHost, PluginHost,
-    PluginHostServices, ToolDecision, ToolRendererContribution, UiDeclaration, UiFrame, UiInput,
-    UiRenderRequest,
+    PluginHostServices, ToolDecision, ToolRenderRequest, ToolRendererContribution, UiDeclaration,
+    UiFrame, UiInput, UiRenderRequest,
 };
 use crate::ui::{UiContribution, UiPlacement};
 use agent_core::{model::ModelMessage, AgentExtension, ContextLoadRequest, LoadedContext};
@@ -679,22 +679,14 @@ impl PluginHost for WasmPluginHost {
         if request.plugin_id != self.id() {
             return Ok(None);
         }
-        let declaration = self
+        let Some(declaration) = self
             .known_ui
             .iter()
-            .find(|declaration| declaration.view_id == request.view_id);
-        let is_tool_renderer = self
-            .known_tool_renderers
-            .iter()
-            .any(|renderer| renderer.renderer_id == request.view_id);
-        if declaration.is_none() && !is_tool_renderer {
+            .find(|declaration| declaration.view_id == request.view_id)
+        else {
             return Ok(None);
-        }
-        if let Some(declaration) = declaration {
-            validate_ui_instance(declaration, request.instance_id.as_deref())?;
-        } else {
-            validate_tool_renderer_instance(&request.view_id, request.instance_id.as_deref())?;
-        }
+        };
+        validate_ui_instance(declaration, request.instance_id.as_deref())?;
 
         let request_json = serde_json::to_string(request)?;
         let mut state = self.state.lock().await;
@@ -721,26 +713,63 @@ impl PluginHost for WasmPluginHost {
         Ok(Some(frame))
     }
 
+    async fn render_tool(&self, request: &ToolRenderRequest) -> Result<Option<UiFrame>> {
+        if request.plugin_id != self.id() {
+            return Ok(None);
+        }
+        let Some(renderer) = self.known_tool_renderers.iter().find(|renderer| {
+            renderer.renderer_id == request.renderer_id
+                && renderer.tool_name == request.context.call.name
+        }) else {
+            return Ok(None);
+        };
+
+        let request_json = serde_json::to_string(request)?;
+        let mut state = self.state.lock().await;
+        refill_fuel(&mut state)?;
+        let render_ui = state.render_ui;
+        let (frame_json,) = render_ui
+            .call_async(&mut state.store, (request_json,))
+            .await
+            .into_anyhow()
+            .with_context(|| format!("plugin `{}` tool renderer failed", self.id()))?;
+        if frame_json.is_empty() {
+            return Ok(None);
+        }
+        let frame = serde_json::from_str::<UiFrame>(&frame_json)
+            .with_context(|| format!("plugin `{}` returned invalid UiFrame JSON", self.id()))?;
+        if frame.view_id != renderer.renderer_id {
+            return Err(anyhow!(
+                "plugin `{}` rendered view `{}` for tool renderer `{}`",
+                self.id(),
+                frame.view_id,
+                renderer.renderer_id
+            ));
+        }
+        if frame.lines.len() > usize::from(request.context.max_height) {
+            return Err(anyhow!(
+                "plugin `{}` tool renderer `{}` returned {} lines above limit {}",
+                self.id(),
+                renderer.renderer_id,
+                frame.lines.len(),
+                request.context.max_height
+            ));
+        }
+        Ok(Some(frame))
+    }
+
     async fn on_ui_input(&self, input: &UiInput) -> Result<()> {
         if input.plugin_id != self.id() {
             return Ok(());
         }
-        let declaration = self
+        let Some(declaration) = self
             .known_ui
             .iter()
-            .find(|declaration| declaration.view_id == input.view_id);
-        let is_tool_renderer = self
-            .known_tool_renderers
-            .iter()
-            .any(|renderer| renderer.renderer_id == input.view_id);
-        if declaration.is_none() && !is_tool_renderer {
+            .find(|declaration| declaration.view_id == input.view_id)
+        else {
             return Ok(());
-        }
-        if let Some(declaration) = declaration {
-            validate_ui_instance(declaration, input.instance_id.as_deref())?;
-        } else {
-            validate_tool_renderer_instance(&input.view_id, input.instance_id.as_deref())?;
-        }
+        };
+        validate_ui_instance(declaration, input.instance_id.as_deref())?;
 
         let input_json = serde_json::to_string(input)?;
         let mut state = self.state.lock().await;
@@ -1128,22 +1157,6 @@ fn validate_ui_contributions(
         }
     }
     Ok((declarations, tool_renderers))
-}
-
-/// 工具 renderer 必须使用稳定调用 ID 作为实例路由键。
-fn validate_tool_renderer_instance(renderer_id: &str, instance_id: Option<&str>) -> Result<()> {
-    match instance_id {
-        Some(instance_id)
-            if !instance_id.is_empty()
-                && instance_id.len() <= 256
-                && !instance_id.chars().any(char::is_control) =>
-        {
-            Ok(())
-        }
-        _ => Err(anyhow!(
-            "工具 renderer `{renderer_id}` 需要有效的工具调用 instance_id"
-        )),
-    }
 }
 
 /// 校验静态视图与动态子视图的实例路由是否匹配。

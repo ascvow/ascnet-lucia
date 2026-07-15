@@ -202,7 +202,8 @@ pub(crate) fn render_plugin_subview(frame: &mut Frame, app: &mut App, outer: Rec
 }
 
 /// 将插件声明式文本帧转换成 Ratatui 行。
-fn plugin_frame_lines(plugin_frame: &PluginUiFrame) -> Vec<Line<'static>> {
+/// 将宿主无关插件帧转换为 Ratatui 行，供固定视图和消息 renderer 共用。
+pub(crate) fn plugin_frame_lines(plugin_frame: &PluginUiFrame) -> Vec<Line<'static>> {
     plugin_frame
         .lines
         .iter()

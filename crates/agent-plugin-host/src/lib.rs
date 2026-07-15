@@ -32,7 +32,10 @@ use std::{
 
 pub use agent_core::{AgentEvent, AgentEventKind, AgentExtension, ToolDecision};
 pub use service::{PluginService, PluginServiceCall};
-pub use ui::{ToolRendererContribution, UiDeclaration, UiFrame, UiInput, UiRenderRequest};
+pub use ui::{
+    ToolRenderContext, ToolRenderRequest, ToolRendererContribution, UiDeclaration, UiFrame,
+    UiInput, UiRenderRequest,
+};
 
 /// Plugin Host 可注入 WASM 实例的通用宿主服务集合。
 ///
@@ -185,6 +188,11 @@ pub trait PluginHost: AgentExtension {
         Ok(None)
     }
 
+    /// 请求插件渲染一次自有工具调用；目标不属于当前插件时返回 `None`。
+    async fn render_tool(&self, _request: &ToolRenderRequest) -> Result<Option<UiFrame>> {
+        Ok(None)
+    }
+
     /// 将焦点视图收到的输入路由给对应插件。
     async fn on_ui_input(&self, _input: &UiInput) -> Result<()> {
         Ok(())
@@ -321,6 +329,31 @@ impl CompositePluginHost {
             .map_err(|_| anyhow!("插件工具路由锁已中毒"))?
             .get(tool_name)
             .and_then(|host| host.id().map(str::to_string)))
+    }
+
+    /// 根据可信贡献快照为工具消息选择 owner 并请求渲染。
+    pub async fn render_tool_message(
+        &self,
+        context: &ToolRenderContext,
+    ) -> Result<Option<UiFrame>> {
+        let renderer = self
+            .tool_renderers
+            .read()
+            .map_err(|_| anyhow!("插件工具 renderer 路由锁已中毒"))?
+            .get(&context.call.name)
+            .cloned();
+        let Some(renderer) = renderer else {
+            return Ok(None);
+        };
+        let Some(host) = self.get(&renderer.plugin_id) else {
+            return Ok(None);
+        };
+        host.render_tool(&ToolRenderRequest {
+            plugin_id: renderer.plugin_id,
+            renderer_id: renderer.renderer_id,
+            context: context.clone(),
+        })
+        .await
     }
 
     /// 子宿主数量。
@@ -533,15 +566,6 @@ impl PluginHost for CompositePluginHost {
                         renderer.tool_name
                     ));
                 }
-                if plugin_routes
-                    .insert(renderer.renderer_id.clone(), host.clone())
-                    .is_some()
-                {
-                    return Err(anyhow!(
-                        "插件公开了重复 UI 路由：{plugin_id}/{}",
-                        renderer.renderer_id
-                    ));
-                }
                 if tool_renderers
                     .insert(renderer.tool_name.clone(), renderer)
                     .is_some()
@@ -585,6 +609,25 @@ impl PluginHost for CompositePluginHost {
             Some(host) => host.render_ui(request).await,
             None => Ok(None),
         }
+    }
+
+    async fn render_tool(&self, request: &ToolRenderRequest) -> Result<Option<UiFrame>> {
+        let renderer = self
+            .tool_renderers
+            .read()
+            .map_err(|_| anyhow!("插件工具 renderer 路由锁已中毒"))?
+            .get(&request.context.call.name)
+            .cloned();
+        let Some(renderer) = renderer else {
+            return Ok(None);
+        };
+        if renderer.plugin_id != request.plugin_id || renderer.renderer_id != request.renderer_id {
+            return Ok(None);
+        }
+        let Some(host) = self.get(&renderer.plugin_id) else {
+            return Ok(None);
+        };
+        host.render_tool(request).await
     }
 
     async fn on_ui_input(&self, input: &UiInput) -> Result<()> {
@@ -724,6 +767,14 @@ impl LivePluginHost {
         Ok(self.read_state()?.current.get(plugin_id).is_some())
     }
 
+    /// 使用最新 Ready 插件快照渲染工具消息，TUI 无需感知 owner 或 renderer ID。
+    pub async fn render_tool_message(
+        &self,
+        context: &ToolRenderContext,
+    ) -> Result<Option<UiFrame>> {
+        self.current_snapshot()?.render_tool_message(context).await
+    }
+
     fn read_state(&self) -> Result<std::sync::RwLockReadGuard<'_, LivePluginState>> {
         self.state
             .read()
@@ -855,6 +906,10 @@ impl PluginHost for LivePluginHost {
         PluginHost::render_ui(&self.current_snapshot()?, request).await
     }
 
+    async fn render_tool(&self, request: &ToolRenderRequest) -> Result<Option<UiFrame>> {
+        PluginHost::render_tool(&self.current_snapshot()?, request).await
+    }
+
     async fn on_ui_input(&self, input: &UiInput) -> Result<()> {
         PluginHost::on_ui_input(&self.current_snapshot()?, input).await
     }
@@ -895,7 +950,7 @@ impl ContextLoader for CompositePluginHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::{UiInputEvent, UiPlacement, UiSize};
+    use crate::ui::{ToolRenderState, UiInputEvent, UiPlacement, UiSize};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1016,10 +1071,10 @@ mod tests {
             }])
         }
 
-        async fn render_ui(&self, request: &UiRenderRequest) -> Result<Option<UiFrame>> {
+        async fn render_tool(&self, request: &ToolRenderRequest) -> Result<Option<UiFrame>> {
             self.render_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Some(UiFrame {
-                view_id: request.view_id.clone(),
+                view_id: request.renderer_id.clone(),
                 visible: true,
                 lines: Vec::new(),
             }))
@@ -1316,10 +1371,15 @@ mod tests {
         assert_eq!(renderers[0].plugin_id, "task-plugin");
         assert_eq!(renderers[0].tool_name, "task");
 
-        let mut request = ui_render_request("task-plugin", "tool-message");
-        request.instance_id = Some("call-1".into());
+        let context = ToolRenderContext {
+            call: ToolCall::new("call-1", "task", json!({})),
+            state: ToolRenderState::Running,
+            width: 80,
+            max_height: 20,
+            frame: 1,
+        };
         assert!(host
-            .render_ui(&request)
+            .render_tool_message(&context)
             .await
             .expect("路由工具 renderer")
             .is_some());

@@ -98,6 +98,18 @@ pub(crate) struct Msg {
     pub(crate) tool_result: Option<ToolResult>,
     /// 工具未执行时的原因；其他消息为 `None`。
     pub(crate) skip_reason: Option<String>,
+    /// 插件为当前工具消息返回的声明式帧。
+    #[cfg(feature = "plugins")]
+    pub(crate) tool_frame: Option<PluginUiFrame>,
+    /// 当前插件帧对应的消息区宽度。
+    #[cfg(feature = "plugins")]
+    pub(crate) tool_frame_width: Option<u16>,
+    /// 最新一次工具消息渲染请求的版本号。
+    #[cfg(feature = "plugins")]
+    pub(crate) tool_render_revision: u64,
+    /// 当前仍在运行的渲染请求所使用的消息区宽度。
+    #[cfg(feature = "plugins")]
+    pub(crate) tool_render_pending_width: Option<u16>,
     /// 扩展事件使用的强调色。
     pub(crate) accent: Option<Color>,
     /// 是否以分隔线形式展示扩展事件。
@@ -113,6 +125,14 @@ impl Msg {
             tool_call: None,
             tool_result: None,
             skip_reason: None,
+            #[cfg(feature = "plugins")]
+            tool_frame: None,
+            #[cfg(feature = "plugins")]
+            tool_frame_width: None,
+            #[cfg(feature = "plugins")]
+            tool_render_revision: 0,
+            #[cfg(feature = "plugins")]
+            tool_render_pending_width: None,
             accent: None,
             divider: false,
         }
@@ -157,6 +177,14 @@ impl Msg {
             tool_call: None,
             tool_result: None,
             skip_reason: None,
+            #[cfg(feature = "plugins")]
+            tool_frame: None,
+            #[cfg(feature = "plugins")]
+            tool_frame_width: None,
+            #[cfg(feature = "plugins")]
+            tool_render_revision: 0,
+            #[cfg(feature = "plugins")]
+            tool_render_pending_width: None,
             accent: Some(color),
             divider,
         }
@@ -208,6 +236,17 @@ impl Msg {
     /// 摘要与预览行按 `width` 显示宽度截断，避免窄终端下自动换行
     /// 把续行顶到行首、破坏缩进对齐。
     pub(crate) fn tool_lines(&self, note: &str, color: Color, width: u16) -> Vec<Line<'_>> {
+        #[cfg(feature = "plugins")]
+        if let Some(frame) = self
+            .tool_frame
+            .as_ref()
+            .filter(|frame| frame.visible && !frame.lines.is_empty())
+        {
+            let mut lines = tui::plugin_frame_lines(frame);
+            lines.push(Line::default());
+            return lines;
+        }
+
         // 前缀占 4 列，再留 1 列吸收截断省略号，保证整行不超宽。
         let preview_width = usize::from(width).saturating_sub(5).max(1);
         let mut first = vec![

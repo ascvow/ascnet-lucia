@@ -777,6 +777,20 @@ pub trait AgentPlugin: Default + Send + 'static {
         self.render_ui(request)
     }
 
+    /// 渲染插件自有工具在消息列表中的内容；默认交给宿主通用工具样式。
+    fn render_tool(&mut self, _request: ToolRenderRequest) -> Option<UiFrame> {
+        None
+    }
+
+    /// 使用宿主 API 渲染工具消息；默认转发给 [`AgentPlugin::render_tool`]。
+    fn render_tool_with_host(
+        &mut self,
+        _host: &dyn PluginHostApi,
+        request: ToolRenderRequest,
+    ) -> Option<UiFrame> {
+        self.render_tool(request)
+    }
+
     /// 处理宿主路由给焦点视图的输入事件。
     fn on_ui_input(&mut self, _input: UiInput) {}
 
@@ -1332,14 +1346,21 @@ world plugin {
                 }
 
                 fn render_ui(request_json: String) -> String {
-                    let request: $crate::UiRenderRequest =
+                    let request: $crate::UiRenderRequestEnvelope =
                         match $crate::from_json_string(&request_json) {
                             Ok(request) => request,
                             Err(_) => return String::new(),
                         };
                     with_plugin(|plugin| {
-                        plugin
-                            .render_ui_with_host(&ComponentHostApi, request)
+                        let frame = match request {
+                            $crate::UiRenderRequestEnvelope::View(request) => {
+                                plugin.render_ui_with_host(&ComponentHostApi, request)
+                            }
+                            $crate::UiRenderRequestEnvelope::Tool(request) => {
+                                plugin.render_tool_with_host(&ComponentHostApi, *request)
+                            }
+                        };
+                        frame
                             .map(|frame| $crate::to_json_string(&frame))
                             .unwrap_or_default()
                     })

@@ -94,7 +94,7 @@ world plugin {
   /// 声明插件 UI 贡献。输出为 UiContribution JSON 数组，空数组表示无 UI。
   export describe-ui: func() -> string;
 
-  /// 渲染插件 UI。输入为 UiRenderRequest JSON，输出为 UiFrame JSON，空字符串表示不更新。
+  /// 渲染插件 UI。输入为 UiRenderRequestEnvelope JSON，输出为 UiFrame JSON，空字符串表示不更新。
   export render-ui: func(request-json: string) -> string;
 
   /// 处理路由给焦点插件视图的输入。输入为 UiInput JSON。

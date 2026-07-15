@@ -4,6 +4,7 @@
 
 #![deny(missing_docs)]
 
+use agent_tool::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 
 /// 插件界面可以挂载的位置。
@@ -107,8 +108,63 @@ pub struct UiRenderRequest {
     pub height: u16,
     /// 视图当前是否拥有输入焦点。
     pub focused: bool,
+    /// 应用单调递增的渲染帧序号。
+    pub frame: u64,
+}
+
+/// 通过同一 `render-ui` ABI 传递的具体渲染请求。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum UiRenderRequestEnvelope {
+    /// 普通插件视图渲染请求。
+    View(UiRenderRequest),
+    /// 工具消息列表渲染请求。
+    Tool(Box<ToolRenderRequest>),
+}
+
+/// 宿主请求插件渲染一次工具调用在消息列表中的内容。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolRenderRequest {
+    /// 目标插件的可信 ID。
+    pub plugin_id: String,
+    /// 目标 renderer ID。
+    pub renderer_id: String,
+    /// TUI 提供且不包含 owner 信息的工具展示上下文。
+    #[serde(flatten)]
+    pub context: ToolRenderContext,
+}
+
+/// 应用请求 Host 渲染工具消息时提供的通用上下文。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolRenderContext {
+    /// 未经裁剪的完整工具调用。
+    pub call: ToolCall,
+    /// 工具当前状态及其完整结果或跳过原因。
+    pub state: ToolRenderState,
+    /// 当前消息列表可用宽度。
+    pub width: u16,
+    /// 宿主允许 renderer 使用的最大行数。
+    pub max_height: u16,
     /// 宿主单调递增的渲染帧序号。
     pub frame: u64,
+}
+
+/// 工具消息 renderer 可见的执行状态。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ToolRenderState {
+    /// 工具正在执行。
+    Running,
+    /// 工具已经完成。
+    Finished {
+        /// 未经裁剪的完整工具结果。
+        result: ToolResult,
+    },
+    /// 工具未执行。
+    Skipped {
+        /// 跳过该工具的原因。
+        reason: String,
+    },
 }
 
 /// A dynamic subview instance created by a plugin.
@@ -467,5 +523,41 @@ mod tests {
             serde_json::from_value(encoded).expect("反序列化 UI 贡献");
 
         assert_eq!(decoded, contributions);
+    }
+
+    /// 普通视图与工具消息请求必须通过字段集合在同一 ABI 入口中准确分派。
+    #[test]
+    fn render_request_envelope_routes_view_and_tool_shapes() {
+        let view = serde_json::to_value(UiRenderRequest {
+            plugin_id: "demo".into(),
+            view_id: "panel".into(),
+            instance_id: None,
+            width: 40,
+            height: 12,
+            focused: false,
+            frame: 1,
+        })
+        .expect("序列化普通视图请求");
+        let tool = serde_json::to_value(ToolRenderRequest {
+            plugin_id: "demo".into(),
+            renderer_id: "task-message".into(),
+            context: ToolRenderContext {
+                call: ToolCall::new("call-1", "task", json!({})),
+                state: ToolRenderState::Running,
+                width: 72,
+                max_height: 20,
+                frame: 2,
+            },
+        })
+        .expect("序列化工具消息请求");
+
+        assert!(matches!(
+            serde_json::from_value::<UiRenderRequestEnvelope>(view).expect("分派普通视图请求"),
+            UiRenderRequestEnvelope::View(_)
+        ));
+        assert!(matches!(
+            serde_json::from_value::<UiRenderRequestEnvelope>(tool).expect("分派工具消息请求"),
+            UiRenderRequestEnvelope::Tool(_)
+        ));
     }
 }

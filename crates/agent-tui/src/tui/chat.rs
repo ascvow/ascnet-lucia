@@ -42,6 +42,10 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         horizontal: 1,
         vertical: 1,
     });
+    #[cfg(feature = "plugins")]
+    {
+        app.last_message_width = chat_area.width.max(1);
+    }
     // 首屏与底栏共用的工作目录缩写。
     let cwd = app.workspace.cwd.display().to_string();
     let cwd_display = match std::env::var("HOME") {

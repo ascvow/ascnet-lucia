@@ -154,6 +154,7 @@ impl PluginHost for BenchmarkPlugin {
             placement: UiPlacement::Right,
             size: UiSize::default(),
             focusable: true,
+            input_triggers: Vec::new(),
         }])
     }
 

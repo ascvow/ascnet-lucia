@@ -2,7 +2,9 @@
 
 use super::*;
 #[cfg(feature = "plugins")]
-use agent_plugin_host::ui::{UiNavigationAction, UiViewInstance};
+use agent_plugin_protocol::{
+    ToolRenderRequest, ToolRendererContribution, UiNavigationAction, UiSize, UiViewInstance,
+};
 use ratatui::{backend::TestBackend, Terminal};
 #[cfg(feature = "plugins")]
 use std::{fs, time::SystemTime};
@@ -1269,6 +1271,130 @@ async fn plugin_view_refresh_coalesces_pending_requests() {
         .expect("后台刷新任务不应 panic");
 }
 
+/// 为测试工具返回自定义消息帧的模拟宿主。
+#[cfg(feature = "plugins")]
+struct ToolMessagePluginHost;
+
+#[cfg(feature = "plugins")]
+#[async_trait]
+impl agent_core::AgentExtension for ToolMessagePluginHost {
+    async fn list_tools(&self) -> Result<Vec<ToolSpec>> {
+        Ok(vec![ToolSpec::new(
+            "test_tool",
+            "测试工具",
+            ToolSpec::empty_object_schema(),
+        )])
+    }
+}
+
+#[cfg(feature = "plugins")]
+#[async_trait]
+impl PluginHost for ToolMessagePluginHost {
+    fn id(&self) -> Option<&str> {
+        Some("test-plugin")
+    }
+
+    async fn tool_renderers(&self) -> Result<Vec<ToolRendererContribution>> {
+        Ok(vec![ToolRendererContribution {
+            plugin_id: String::new(),
+            renderer_id: "test-message".into(),
+            tool_name: "test_tool".into(),
+        }])
+    }
+
+    async fn render_tool(&self, request: &ToolRenderRequest) -> Result<Option<PluginUiFrame>> {
+        let state = match &request.context.state {
+            ToolRenderState::Running => "运行中",
+            ToolRenderState::Finished { .. } => "已完成",
+            ToolRenderState::Skipped { .. } => "已跳过",
+        };
+        Ok(Some(PluginUiFrame {
+            view_id: request.renderer_id.clone(),
+            visible: true,
+            lines: vec![UiLine {
+                spans: vec![UiSpan {
+                    text: format!("自定义工具 · {state}"),
+                    style: UiStyle::default(),
+                }],
+            }],
+        }))
+    }
+}
+
+/// 工具 renderer 返回的帧必须替换默认工具行并保持消息调用身份。
+#[tokio::test]
+#[cfg(feature = "plugins")]
+async fn tool_renderer_frame_is_applied_to_timeline_message() {
+    let host = Arc::new(LivePluginHost::new());
+    host.publish(Arc::new(ToolMessagePluginHost))
+        .expect("发布测试插件");
+    host.ui_declarations().await.expect("建立 UI 路由");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.last_message_width = 72;
+    app.last_viewport = 20;
+    app.messages.push(Msg::tool_started(ToolCall::new(
+        "call-1",
+        "test_tool",
+        json!({"title": "整理方案"}),
+    )));
+
+    app.schedule_tool_render(Arc::clone(&host), "call-1");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("工具 renderer 应按时返回")
+        .expect("UI 通道不应关闭");
+    let UiEvent::ToolFrameLoaded {
+        call_id,
+        revision,
+        width,
+        result,
+    } = event
+    else {
+        panic!("应返回工具消息帧");
+    };
+    app.apply_tool_frame(&call_id, revision, width, result);
+
+    let text = app.messages[0]
+        .to_lines(false, 72)
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert_eq!(app.messages[0].tool_call_id(), Some("call-1"));
+    assert!(text.contains("自定义工具 · 运行中"), "{text:?}");
+    assert!(!text.contains("● test_tool"), "{text:?}");
+}
+
+/// 晚到的旧 revision 不得覆盖较新的工具消息帧。
+#[test]
+#[cfg(feature = "plugins")]
+fn stale_tool_renderer_frame_is_ignored() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut message = Msg::tool_started(ToolCall::new("call-1", "test_tool", json!({})));
+    message.tool_render_revision = 2;
+    app.messages.push(message);
+    let frame = |text: &str| PluginUiFrame {
+        view_id: "test-message".into(),
+        visible: true,
+        lines: vec![UiLine {
+            spans: vec![UiSpan {
+                text: text.into(),
+                style: UiStyle::default(),
+            }],
+        }],
+    };
+
+    app.apply_tool_frame("call-1", 1, 72, Ok(Some(frame("旧帧"))));
+    assert!(app.messages[0].tool_frame.is_none());
+    app.apply_tool_frame("call-1", 2, 72, Ok(Some(frame("最终帧"))));
+    assert_eq!(
+        app.messages[0].tool_frame.as_ref().unwrap().lines[0].spans[0].text,
+        "最终帧"
+    );
+}
+
 /// 创建测试插件视图，覆盖停靠、对话框和焦点路由测试。
 #[cfg(feature = "plugins")]
 fn test_plugin_view(placement: UiPlacement, title: &str) -> PluginViewState {
@@ -1278,7 +1404,7 @@ fn test_plugin_view(placement: UiPlacement, title: &str) -> PluginViewState {
             view_id: format!("{placement:?}").to_ascii_lowercase(),
             title: title.into(),
             placement,
-            size: agent_plugin_host::ui::UiSize {
+            size: UiSize {
                 width: Some(24),
                 height: Some(8),
             },

@@ -1,8 +1,8 @@
 //! Guest SDK 的 WIT 与 UI JSON 契约回归测试。
 
 use agent_plugin::{
-    ToolRendererContribution, UiDeclaration, UiFrame, UiHostActionRequest, UiInput,
-    UiNavigationRequest, UiRenderRequest, UiSessionsReply, PLUGIN_WIT,
+    ToolRenderRequest, ToolRendererContribution, UiDeclaration, UiFrame, UiHostActionRequest,
+    UiInput, UiNavigationRequest, UiRenderRequest, UiSessionsReply, PLUGIN_WIT,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -82,6 +82,7 @@ fn guest_ui_types_match_contract_fixture() {
     assert_round_trip::<UiDeclaration>(&fixture["trigger_declaration"]);
     assert_round_trip::<ToolRendererContribution>(&fixture["tool_renderer"]);
     assert_round_trip::<UiRenderRequest>(&fixture["render_request"]);
+    assert_round_trip::<ToolRenderRequest>(&fixture["tool_render_request"]);
     assert_round_trip::<UiFrame>(&fixture["frame"]);
     assert_round_trip::<UiInput>(&fixture["input"]);
     assert_round_trip::<UiInput>(&fixture["main_input"]);

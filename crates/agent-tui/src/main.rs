@@ -35,18 +35,19 @@ use agent_core::{
 #[cfg(feature = "plugins")]
 use agent_plugin_host::{
     manifest::{load_plugin_runtime_config, PluginManifest},
-    ui::{
-        UiColor, UiDeclaration, UiFrame as PluginUiFrame, UiHostAction, UiHostActionRequest,
-        UiInput, UiInputEvent, UiLine, UiNavigationRequest, UiPlacement, UiRenderRequest,
-        UiSessionListStatus, UiSessionSummary, UiSessionsReply, UiSpan, UiStyle,
-        UI_HOST_ACTION_EVENT, UI_NAVIGATION_EVENT,
-    },
     wasm::{
         configure_wasm_cache_directory,
         load_wasm_plugins_progressively_with_selection_and_services, PluginLoadFailure,
         ProgressivePluginLoadUpdate,
     },
     LivePluginHost, PluginHost, PluginHostServices, PluginServiceCall,
+};
+#[cfg(feature = "plugins")]
+use agent_plugin_protocol::{
+    ToolRenderContext, ToolRenderState, UiColor, UiDeclaration, UiFrame as PluginUiFrame,
+    UiHostAction, UiHostActionRequest, UiInput, UiInputEvent, UiLine, UiNavigationRequest,
+    UiPlacement, UiRenderRequest, UiSessionListStatus, UiSessionSummary, UiSessionsReply, UiSpan,
+    UiStyle, UI_HOST_ACTION_EVENT, UI_NAVIGATION_EVENT,
 };
 #[cfg(feature = "plugins")]
 use agent_runtime::{
@@ -256,6 +257,14 @@ enum UiEvent {
     ToolSkipped {
         call: ToolCall,
         reason: String,
+    },
+    /// 插件工具 renderer 完成一次消息帧渲染。
+    #[cfg(feature = "plugins")]
+    ToolFrameLoaded {
+        call_id: String,
+        revision: u64,
+        width: u16,
+        result: Result<Option<PluginUiFrame>>,
     },
     SteeringInjected,
     FollowUpInjected,
