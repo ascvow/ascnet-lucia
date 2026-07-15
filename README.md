@@ -2,21 +2,23 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Lucia is a fully open-source terminal agent designed to be inspectable, configurable, and extensible.
+**An inspectable, configurable, and extensible terminal agent.**
 
-It is not another command-line wrapper around a model. Lucia is built around a more practical question: when an agent can read your code, invoke tools, start processes, and carry out a chain of tasks, can you see how it works, limit what it may do, and replace any part that does not fit your needs?
+Lucia is a fully open-source agent runtime and terminal interface for working with language models, tools, sessions, and WASM plugins. It is designed for developers who want to inspect the complete request path, keep capabilities optional, and replace concrete features without changing the Agent Core.
 
-## Why Lucia Exists
+[Quick start](#quick-start) · [Build and install](#build-and-install) · [Configuration](#configure-a-model) · [Documentation](#documentation) · [Security](#security-model)
 
-Recent controversy around how some AI coding tools collect data and handle local source code has made one issue hard to ignore. Whatever the final judgment on any individual case, a tool with deep access to terminals, repositories, and development environments should not have to be trusted as a black box.
+> [!NOTE]
+> Lucia is in early development. APIs and the plugin protocol may change before a stable release.
 
-That is why Lucia exists.
+## Why Lucia
 
-An agent should be inspectable. Its capabilities should be optional, and its permissions should be narrow by default. You should not have to accept an inseparable bundle of features or wait for a vendor to decide what can be extended. If you need MCP, install the MCP plugin. Skills, workflows, multi-agent collaboration, and custom interfaces belong in plugins as well. Capabilities you do not use do not need permissions.
+- **Inspectable by design.** The model request path, Agent loop, tool routing, session storage, plugin loading, and permission checks are available under the MIT License.
+- **Capabilities stay optional.** MCP, Skills, commands, context compression, planning, approvals, and multi-agent collaboration are independent plugins rather than mandatory Core behavior.
+- **Permissions are explicit.** Plugins declare capabilities in their manifests, while the Host controls trusted identity, ownership, and resource limits.
+- **Composable beyond the TUI.** Lucia can run as a small Agent Core, a plugin-enabled terminal application, or a set of Rust libraries embedded in another program.
 
-The entire project is available under the MIT License. The model request path, agent loop, tool routing, session storage, plugin loading, and permission checks can all be read, changed, and rebuilt.
-
-## What Lucia Can Do
+## Capabilities
 
 - Work with real models from a terminal while saving and resuming sessions per project.
 - Connect to OpenAI, Anthropic, and OpenAI-compatible model services.
@@ -26,7 +28,7 @@ The entire project is available under the MIT License. The model request path, a
 
 Lucia currently ships official Context, MCP, Skill, Command, Teammate, Plan, and Sandbox plugins. Plugins are not an afterthought; they are the primary extension model. Core owns the general agent mechanics, while each concrete capability stays in its own plugin.
 
-## Try It Once
+## Quick Start
 
 To verify the project with only Rust installed, run this from the repository root:
 
@@ -228,9 +230,18 @@ The detailed documentation is currently maintained in Simplified Chinese:
 
 ## Project Status
 
-Lucia is still at an early stage, and its APIs and plugin protocol will continue to evolve. The repository already includes an offline example, two TUI build variants, official plugins, end-to-end plugin smoke tests, and layered development documentation. It still needs more real-world validation, security review, and feedback from different workflows.
+The repository includes an offline example, Core-only and plugin-enabled TUI builds, official plugins, end-to-end plugin smoke tests, and layered development documentation. Before a stable release, Lucia still needs broader real-world validation, security review, and feedback from different workflows.
 
-You are welcome to read the code, report issues, build plugins, or contribute improvements. Rather than turning Lucia into another closed all-purpose tool, the goal is to build agent infrastructure that people can understand, modify, and control.
+## Getting Help and Contributing
+
+Use GitHub Issues for reproducible bugs, focused feature proposals, and documentation problems. When contributing code:
+
+- Keep Core mechanisms separate from concrete plugin behavior.
+- Add focused tests at both sides of any changed protocol boundary.
+- Run `cargo fmt --all -- --check` and the affected crate or plugin tests before opening a pull request.
+- Never include API keys, tokens, private configuration, or unredacted live-test output in an issue or commit.
+
+The goal is to build agent infrastructure that people can understand, modify, and control. Focused fixes, documentation improvements, and independent plugins are welcome.
 
 ## License
 
