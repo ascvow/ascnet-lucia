@@ -758,6 +758,11 @@ pub trait AgentPlugin: Default + Send + 'static {
         Vec::new()
     }
 
+    /// 声明插件自有工具在消息列表中的渲染器；默认使用宿主通用工具样式。
+    fn describe_tool_renderers(&self) -> Vec<ToolRendererContribution> {
+        Vec::new()
+    }
+
     /// 根据宿主分配的尺寸渲染指定视图；返回 `None` 表示该帧不更新。
     fn render_ui(&mut self, _request: UiRenderRequest) -> Option<UiFrame> {
         None
@@ -1310,7 +1315,20 @@ world plugin {
                 }
 
                 fn describe_ui() -> String {
-                    with_plugin(|plugin| $crate::to_json_string(&plugin.describe_ui()))
+                    with_plugin(|plugin| {
+                        let mut contributions = plugin
+                            .describe_ui()
+                            .into_iter()
+                            .map($crate::UiContribution::View)
+                            .collect::<Vec<_>>();
+                        contributions.extend(
+                            plugin
+                                .describe_tool_renderers()
+                                .into_iter()
+                                .map($crate::UiContribution::ToolRenderer),
+                        );
+                        $crate::to_json_string(&contributions)
+                    })
                 }
 
                 fn render_ui(request_json: String) -> String {

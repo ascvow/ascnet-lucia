@@ -12,9 +12,10 @@ use super::{
     },
     service::{PluginService, PluginServiceCall, ServiceHandler, ServiceRegistry},
     AgentEvent, AgentRuntimeHostServices, CompositePluginHost, LivePluginHost, PluginHost,
-    PluginHostServices, ToolDecision, UiDeclaration, UiFrame, UiInput, UiRenderRequest,
+    PluginHostServices, ToolDecision, ToolRendererContribution, UiDeclaration, UiFrame, UiInput,
+    UiRenderRequest,
 };
-use crate::ui::UiPlacement;
+use crate::ui::{UiContribution, UiPlacement};
 use agent_core::{model::ModelMessage, AgentExtension, ContextLoadRequest, LoadedContext};
 use agent_runtime::RuntimePrincipal;
 use agent_tool::{ToolCall, ToolDecisionStatus, ToolResult, ToolSpec};
@@ -91,6 +92,7 @@ pub struct WasmPluginHost {
     contributions: Arc<ContributionRegistry>,
     services: Arc<ServiceRegistry>,
     known_ui: Vec<UiDeclaration>,
+    known_tool_renderers: Vec<ToolRendererContribution>,
     agent_runtime: Option<AgentRuntimeBinding>,
     state: Arc<Mutex<WasmPluginState>>,
 }
@@ -464,16 +466,18 @@ impl WasmPluginHost {
                     .await
                     .into_anyhow()
                     .context("plugin `describe-ui` failed")?;
-                let mut declarations: Vec<UiDeclaration> = serde_json::from_str(&declarations_json)
-                    .with_context(|| {
-                        format!("plugin `{plugin_id}` returned invalid UiDeclaration JSON")
+                let ui_contributions: Vec<UiContribution> =
+                    serde_json::from_str(&declarations_json).with_context(|| {
+                        format!("plugin `{plugin_id}` returned invalid UI contribution JSON")
                     })?;
-                validate_ui_declarations(&plugin_id, &mut declarations)?;
-                Ok(declarations)
+                let owned_tools = contributions.tools()?;
+                let (declarations, tool_renderers) =
+                    validate_ui_contributions(&plugin_id, ui_contributions, &owned_tools)?;
+                Ok((declarations, tool_renderers))
             }
             .await;
-            let known_ui = match initialization {
-                Ok(known_ui) => known_ui,
+            let (known_ui, known_tool_renderers) = match initialization {
+                Ok(contributions) => contributions,
                 Err(error) => {
                     services.unregister_plugin(&plugin_id)?;
                     return Err(error);
@@ -485,6 +489,7 @@ impl WasmPluginHost {
                 contributions,
                 services,
                 known_ui,
+                known_tool_renderers,
                 agent_runtime,
                 state,
             })
@@ -666,18 +671,30 @@ impl PluginHost for WasmPluginHost {
         Ok(self.known_ui.clone())
     }
 
+    async fn tool_renderers(&self) -> Result<Vec<ToolRendererContribution>> {
+        Ok(self.known_tool_renderers.clone())
+    }
+
     async fn render_ui(&self, request: &UiRenderRequest) -> Result<Option<UiFrame>> {
         if request.plugin_id != self.id() {
             return Ok(None);
         }
-        let Some(declaration) = self
+        let declaration = self
             .known_ui
             .iter()
-            .find(|declaration| declaration.view_id == request.view_id)
-        else {
+            .find(|declaration| declaration.view_id == request.view_id);
+        let is_tool_renderer = self
+            .known_tool_renderers
+            .iter()
+            .any(|renderer| renderer.renderer_id == request.view_id);
+        if declaration.is_none() && !is_tool_renderer {
             return Ok(None);
-        };
-        validate_ui_instance(declaration, request.instance_id.as_deref())?;
+        }
+        if let Some(declaration) = declaration {
+            validate_ui_instance(declaration, request.instance_id.as_deref())?;
+        } else {
+            validate_tool_renderer_instance(&request.view_id, request.instance_id.as_deref())?;
+        }
 
         let request_json = serde_json::to_string(request)?;
         let mut state = self.state.lock().await;
@@ -708,14 +725,22 @@ impl PluginHost for WasmPluginHost {
         if input.plugin_id != self.id() {
             return Ok(());
         }
-        let Some(declaration) = self
+        let declaration = self
             .known_ui
             .iter()
-            .find(|declaration| declaration.view_id == input.view_id)
-        else {
+            .find(|declaration| declaration.view_id == input.view_id);
+        let is_tool_renderer = self
+            .known_tool_renderers
+            .iter()
+            .any(|renderer| renderer.renderer_id == input.view_id);
+        if declaration.is_none() && !is_tool_renderer {
             return Ok(());
-        };
-        validate_ui_instance(declaration, input.instance_id.as_deref())?;
+        }
+        if let Some(declaration) = declaration {
+            validate_ui_instance(declaration, input.instance_id.as_deref())?;
+        } else {
+            validate_tool_renderer_instance(&input.view_id, input.instance_id.as_deref())?;
+        }
 
         let input_json = serde_json::to_string(input)?;
         let mut state = self.state.lock().await;
@@ -1052,21 +1077,73 @@ fn set_fuel(state: &mut WasmPluginState, fuel: u64) -> Result<()> {
 }
 
 /// 校验插件内部视图 ID，并注入可信的 manifest 插件 ID。
-fn validate_ui_declarations(plugin_id: &str, declarations: &mut [UiDeclaration]) -> Result<()> {
+fn validate_ui_contributions(
+    plugin_id: &str,
+    contributions: Vec<UiContribution>,
+    tools: &[ToolSpec],
+) -> Result<(Vec<UiDeclaration>, Vec<ToolRendererContribution>)> {
     let mut view_ids = HashSet::new();
-    for declaration in declarations {
-        if declaration.view_id.trim().is_empty() {
-            return Err(anyhow!("plugin `{plugin_id}` has an empty UI view id"));
+    let owned_tools = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut declarations = Vec::new();
+    let mut tool_renderers = Vec::new();
+    for contribution in contributions {
+        match contribution {
+            UiContribution::View(mut declaration) => {
+                if declaration.view_id.trim().is_empty() {
+                    return Err(anyhow!("plugin `{plugin_id}` has an empty UI view id"));
+                }
+                if !view_ids.insert(declaration.view_id.clone()) {
+                    return Err(anyhow!(
+                        "plugin `{plugin_id}` declares duplicate UI route `{}`",
+                        declaration.view_id
+                    ));
+                }
+                declaration.plugin_id = plugin_id.to_string();
+                declarations.push(declaration);
+            }
+            UiContribution::ToolRenderer(mut renderer) => {
+                if renderer.renderer_id.trim().is_empty() {
+                    return Err(anyhow!(
+                        "plugin `{plugin_id}` has an empty tool renderer id"
+                    ));
+                }
+                if !view_ids.insert(renderer.renderer_id.clone()) {
+                    return Err(anyhow!(
+                        "plugin `{plugin_id}` declares duplicate UI route `{}`",
+                        renderer.renderer_id
+                    ));
+                }
+                if !owned_tools.contains(renderer.tool_name.as_str()) {
+                    return Err(anyhow!(
+                        "plugin `{plugin_id}` cannot render unowned tool `{}`",
+                        renderer.tool_name
+                    ));
+                }
+                renderer.plugin_id = plugin_id.to_string();
+                tool_renderers.push(renderer);
+            }
         }
-        if !view_ids.insert(declaration.view_id.clone()) {
-            return Err(anyhow!(
-                "plugin `{plugin_id}` declares duplicate UI view `{}`",
-                declaration.view_id
-            ));
-        }
-        declaration.plugin_id = plugin_id.to_string();
     }
-    Ok(())
+    Ok((declarations, tool_renderers))
+}
+
+/// 工具 renderer 必须使用稳定调用 ID 作为实例路由键。
+fn validate_tool_renderer_instance(renderer_id: &str, instance_id: Option<&str>) -> Result<()> {
+    match instance_id {
+        Some(instance_id)
+            if !instance_id.is_empty()
+                && instance_id.len() <= 256
+                && !instance_id.chars().any(char::is_control) =>
+        {
+            Ok(())
+        }
+        _ => Err(anyhow!(
+            "工具 renderer `{renderer_id}` 需要有效的工具调用 instance_id"
+        )),
+    }
 }
 
 /// 校验静态视图与动态子视图的实例路由是否匹配。

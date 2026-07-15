@@ -37,6 +37,11 @@
       "/"
     ]
   },
+  "tool_renderer": {
+    "plugin_id": "fixture-plugin",
+    "renderer_id": "task-message",
+    "tool_name": "task"
+  },
   "render_request": {
     "plugin_id": "fixture-plugin",
     "view_id": "detail",

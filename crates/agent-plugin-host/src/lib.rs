@@ -32,7 +32,7 @@ use std::{
 
 pub use agent_core::{AgentEvent, AgentEventKind, AgentExtension, ToolDecision};
 pub use service::{PluginService, PluginServiceCall};
-pub use ui::{UiDeclaration, UiFrame, UiInput, UiRenderRequest};
+pub use ui::{ToolRendererContribution, UiDeclaration, UiFrame, UiInput, UiRenderRequest};
 
 /// Plugin Host 可注入 WASM 实例的通用宿主服务集合。
 ///
@@ -175,6 +175,11 @@ pub trait PluginHost: AgentExtension {
         Ok(Vec::new())
     }
 
+    /// 返回插件为自有工具提供的消息列表渲染器。
+    async fn tool_renderers(&self) -> Result<Vec<ToolRendererContribution>> {
+        Ok(Vec::new())
+    }
+
     /// 请求插件为指定尺寸渲染一帧；目标不属于当前插件时返回 `None`。
     async fn render_ui(&self, _request: &UiRenderRequest) -> Result<Option<UiFrame>> {
         Ok(None)
@@ -218,6 +223,8 @@ pub struct CompositePluginHost {
     tool_routes: Arc<RwLock<HashMap<String, Arc<dyn PluginHost>>>>,
     /// 按可信插件 ID 和视图 ID 索引 UI owner，避免渲染和输入阶段遍历插件。
     ui_routes: Arc<RwLock<UiRoutes>>,
+    /// 按公开工具名索引的可信 renderer 声明快照。
+    tool_renderers: Arc<RwLock<HashMap<String, ToolRendererContribution>>>,
     capability_owners: HashMap<String, String>,
 }
 
@@ -233,6 +240,7 @@ impl CompositePluginHost {
             hosts: self.hosts.clone(),
             tool_routes: Arc::new(RwLock::new(HashMap::new())),
             ui_routes: Arc::new(RwLock::new(UiRoutes::new())),
+            tool_renderers: Arc::new(RwLock::new(HashMap::new())),
             capability_owners: self.capability_owners.clone(),
         }
     }
@@ -337,6 +345,10 @@ impl CompositePluginHost {
         self.ui_routes
             .write()
             .expect("插件 UI 路由锁不应中毒")
+            .clear();
+        self.tool_renderers
+            .write()
+            .expect("插件工具 renderer 路由锁不应中毒")
             .clear();
     }
 }
@@ -470,12 +482,18 @@ impl PluginHost for CompositePluginHost {
             .write()
             .map_err(|_| anyhow!("插件 UI 路由锁已中毒"))?
             .clear();
+        self.tool_renderers
+            .write()
+            .map_err(|_| anyhow!("插件工具 renderer 路由锁已中毒"))?
+            .clear();
 
         let mut declarations = Vec::new();
         let mut routes = UiRoutes::new();
+        let mut tool_renderers = HashMap::new();
         for host in &self.hosts {
             let host_declarations = host.ui_declarations().await?;
-            if host_declarations.is_empty() {
+            let host_renderers = host.tool_renderers().await?;
+            if host_declarations.is_empty() && host_renderers.is_empty() {
                 continue;
             }
             let plugin_id = host
@@ -498,12 +516,61 @@ impl PluginHost for CompositePluginHost {
                 }
                 declarations.push(declaration);
             }
+            let owned_tools = host
+                .list_tools()
+                .await?
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<std::collections::HashSet<_>>();
+            for mut renderer in host_renderers {
+                renderer.plugin_id = plugin_id.to_string();
+                if renderer.renderer_id.trim().is_empty() {
+                    return Err(anyhow!("插件 `{plugin_id}` 公开了空工具 renderer ID"));
+                }
+                if !owned_tools.contains(&renderer.tool_name) {
+                    return Err(anyhow!(
+                        "插件 `{plugin_id}` 不能为非自有工具 `{}` 注册 renderer",
+                        renderer.tool_name
+                    ));
+                }
+                if plugin_routes
+                    .insert(renderer.renderer_id.clone(), host.clone())
+                    .is_some()
+                {
+                    return Err(anyhow!(
+                        "插件公开了重复 UI 路由：{plugin_id}/{}",
+                        renderer.renderer_id
+                    ));
+                }
+                if tool_renderers
+                    .insert(renderer.tool_name.clone(), renderer)
+                    .is_some()
+                {
+                    return Err(anyhow!("同一工具不能注册多个消息 renderer"));
+                }
+            }
         }
         *self
             .ui_routes
             .write()
             .map_err(|_| anyhow!("插件 UI 路由锁已中毒"))? = routes;
+        *self
+            .tool_renderers
+            .write()
+            .map_err(|_| anyhow!("插件工具 renderer 路由锁已中毒"))? = tool_renderers;
         Ok(declarations)
+    }
+
+    async fn tool_renderers(&self) -> Result<Vec<ToolRendererContribution>> {
+        let mut renderers = self
+            .tool_renderers
+            .read()
+            .map_err(|_| anyhow!("插件工具 renderer 路由锁已中毒"))?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        renderers.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+        Ok(renderers)
     }
 
     async fn render_ui(&self, request: &UiRenderRequest) -> Result<Option<UiFrame>> {
@@ -780,6 +847,10 @@ impl PluginHost for LivePluginHost {
         PluginHost::ui_declarations(&self.current_snapshot()?).await
     }
 
+    async fn tool_renderers(&self) -> Result<Vec<ToolRendererContribution>> {
+        PluginHost::tool_renderers(&self.current_snapshot()?).await
+    }
+
     async fn render_ui(&self, request: &UiRenderRequest) -> Result<Option<UiFrame>> {
         PluginHost::render_ui(&self.current_snapshot()?, request).await
     }
@@ -910,6 +981,49 @@ mod tests {
         view_id: &'static str,
         render_calls: Arc<AtomicUsize>,
         input_calls: Arc<AtomicUsize>,
+    }
+
+    /// 声明工具消息 renderer 的测试插件宿主。
+    struct ToolRendererPluginHost {
+        id: &'static str,
+        owned_tool: &'static str,
+        rendered_tool: &'static str,
+        render_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentExtension for ToolRendererPluginHost {
+        async fn list_tools(&self) -> Result<Vec<ToolSpec>> {
+            Ok(vec![ToolSpec::new(
+                self.owned_tool,
+                "测试工具",
+                ToolSpec::empty_object_schema(),
+            )])
+        }
+    }
+
+    #[async_trait]
+    impl PluginHost for ToolRendererPluginHost {
+        fn id(&self) -> Option<&str> {
+            Some(self.id)
+        }
+
+        async fn tool_renderers(&self) -> Result<Vec<ToolRendererContribution>> {
+            Ok(vec![ToolRendererContribution {
+                plugin_id: "伪造身份".into(),
+                renderer_id: "tool-message".into(),
+                tool_name: self.rendered_tool.into(),
+            }])
+        }
+
+        async fn render_ui(&self, request: &UiRenderRequest) -> Result<Option<UiFrame>> {
+            self.render_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(UiFrame {
+                view_id: request.view_id.clone(),
+                visible: true,
+                lines: Vec::new(),
+            }))
+        }
     }
 
     #[async_trait]
@@ -1178,6 +1292,57 @@ mod tests {
         assert_eq!(first_input_calls.load(Ordering::SeqCst), 0);
         assert_eq!(second_render_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_input_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 工具 renderer 必须绑定 owner 自有工具，并通过可信 owner 路由渲染请求。
+    #[tokio::test]
+    async fn tool_renderer_is_validated_and_routed_by_tool_owner() {
+        let render_calls = Arc::new(AtomicUsize::new(0));
+        let mut host = CompositePluginHost::new();
+        host.push(Arc::new(ToolRendererPluginHost {
+            id: "task-plugin",
+            owned_tool: "task",
+            rendered_tool: "task",
+            render_calls: render_calls.clone(),
+        }));
+
+        assert!(host
+            .ui_declarations()
+            .await
+            .expect("建立工具 renderer 路由")
+            .is_empty());
+        let renderers = host.tool_renderers().await.expect("读取 renderer 快照");
+        assert_eq!(renderers.len(), 1);
+        assert_eq!(renderers[0].plugin_id, "task-plugin");
+        assert_eq!(renderers[0].tool_name, "task");
+
+        let mut request = ui_render_request("task-plugin", "tool-message");
+        request.instance_id = Some("call-1".into());
+        assert!(host
+            .render_ui(&request)
+            .await
+            .expect("路由工具 renderer")
+            .is_some());
+        assert_eq!(render_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 插件不得为其他 owner 的工具注册消息 renderer。
+    #[tokio::test]
+    async fn tool_renderer_rejects_unowned_tool() {
+        let mut host = CompositePluginHost::new();
+        host.push(Arc::new(ToolRendererPluginHost {
+            id: "task-plugin",
+            owned_tool: "task",
+            rendered_tool: "shell",
+            render_calls: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        let error = host
+            .ui_declarations()
+            .await
+            .expect_err("非自有工具 renderer 必须失败");
+        assert!(error.to_string().contains("不能为非自有工具"));
+        assert!(host.tool_renderers().await.expect("读取空快照").is_empty());
     }
 
     /// 同一可信插件 ID 下的重复视图必须失败，且不得保留半成品路由。

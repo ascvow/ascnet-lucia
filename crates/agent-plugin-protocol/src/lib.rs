@@ -68,6 +68,28 @@ pub struct UiDeclaration {
     pub input_triggers: Vec<String>,
 }
 
+/// 插件通过 `describe-ui` 返回的一项界面贡献。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum UiContribution {
+    /// 持久或按需显示的普通视图。
+    View(UiDeclaration),
+    /// 绑定插件自有工具的消息列表渲染器。
+    ToolRenderer(ToolRendererContribution),
+}
+
+/// 插件为自己拥有的工具声明的消息列表渲染器。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolRendererContribution {
+    /// 宿主注入的插件 ID，插件返回声明时必须留空。
+    #[serde(default)]
+    pub plugin_id: String,
+    /// 插件内稳定且唯一的渲染器 ID，同时作为 `render-ui` 的 `view_id`。
+    pub renderer_id: String,
+    /// 该插件公开并拥有的工具名称。
+    pub tool_name: String,
+}
+
 /// 宿主请求插件渲染一帧时提供的上下文。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UiRenderRequest {
@@ -427,5 +449,23 @@ mod tests {
             serde_json::from_value(encoded).expect("反序列化导航请求");
 
         assert_eq!(decoded, request);
+    }
+
+    /// 普通视图与工具 renderer 必须共享同一贡献数组且保持可区分。
+    #[test]
+    fn ui_contributions_round_trip_without_duplicate_envelopes() {
+        let contributions = vec![UiContribution::ToolRenderer(ToolRendererContribution {
+            plugin_id: String::new(),
+            renderer_id: "task-message".into(),
+            tool_name: "task".into(),
+        })];
+
+        let encoded = serde_json::to_value(&contributions).expect("序列化 UI 贡献");
+        assert_eq!(encoded[0]["renderer_id"], "task-message");
+        assert!(encoded[0].get("type").is_none());
+        let decoded: Vec<UiContribution> =
+            serde_json::from_value(encoded).expect("反序列化 UI 贡献");
+
+        assert_eq!(decoded, contributions);
     }
 }

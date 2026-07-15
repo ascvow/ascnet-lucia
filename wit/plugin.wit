@@ -91,7 +91,7 @@ world plugin {
   /// 为一次模型请求返回完整替换上下文的响应信封。
   export load-context: func(request-json: string) -> string;
 
-  /// 声明插件 UI 视图。输出为 UiDeclaration JSON 数组，空数组表示无 UI。
+  /// 声明插件 UI 贡献。输出为 UiContribution JSON 数组，空数组表示无 UI。
   export describe-ui: func() -> string;
 
   /// 渲染插件 UI。输入为 UiRenderRequest JSON，输出为 UiFrame JSON，空字符串表示不更新。
