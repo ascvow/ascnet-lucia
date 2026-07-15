@@ -144,7 +144,6 @@ pub(crate) async fn load_plugins_for_tui(
     manifests: Vec<PathBuf>,
     capability_selection: HashMap<String, String>,
     agent_template: AgentTemplate,
-    locale: Locale,
     live_host: Arc<LivePluginHost>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
@@ -170,7 +169,6 @@ pub(crate) async fn load_plugins_for_tui(
         .await
         .context("注册 TUI controller profile 失败")?;
     let host_services = PluginHostServices::new()
-        .with_locale(locale.code())?
         .with_model_completion(
             model_gateway,
             model_provider,

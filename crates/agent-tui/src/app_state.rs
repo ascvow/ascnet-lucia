@@ -39,8 +39,6 @@ pub(crate) fn input_ref_spans<'a>(
 pub(crate) struct App {
     /// 本次进程固定使用的项目工作目录。
     pub(crate) workspace: WorkspaceContext,
-    /// 本次进程固定使用的界面语言，由启动阶段按系统 locale 选择。
-    pub(crate) locale: Locale,
     pub(crate) messages: Vec<Msg>,
     pub(crate) input: String,
     /// 等待随下一条消息发送的附件；引用标签内嵌在 `input` 文本中。
@@ -165,7 +163,6 @@ impl App {
             .expect("创建进程内默认会话记录");
         Self {
             workspace: WorkspaceContext::capture().expect("当前工作目录应可用"),
-            locale: Locale::English,
             messages: Vec::new(),
             input: String::new(),
             attachments: Vec::new(),
@@ -226,12 +223,6 @@ impl App {
             #[cfg(feature = "plugins")]
             applied_host_actions: VecDeque::new(),
         }
-    }
-
-    /// 设置本次进程固定使用的界面语言。
-    pub(crate) fn with_locale(mut self, locale: Locale) -> Self {
-        self.locale = locale;
-        self
     }
 
     /// 注入主函数启动时捕获的项目上下文。
@@ -301,12 +292,13 @@ impl App {
                 self.attachments = attachments;
             }
             Ok(SessionReloadOutcome::Unchanged) => {}
-            Ok(SessionReloadOutcome::NoLoader) => self
-                .messages
-                .push(Msg::new(MsgKind::Info, self.locale.t("context.no_loader"))),
+            Ok(SessionReloadOutcome::NoLoader) => self.messages.push(Msg::new(
+                MsgKind::Info,
+                "No context loader is ready; the session context cannot be reloaded",
+            )),
             Err(error) => self.messages.push(Msg::new(
                 MsgKind::Error,
-                format!("{}: {error}", self.locale.t("context.reload_failed")),
+                format!("Failed to reload session context: {error}"),
             )),
         }
     }
@@ -435,9 +427,8 @@ impl App {
             Ok(None) => message.tool_frame = None,
             Err(error) => {
                 message.tool_frame = None;
-                self.plugin_failures.push(self.locale.t_args(
-                    "chat.tool_render_failed",
-                    &[("call_id", call_id), ("error", &error.to_string())],
+                self.plugin_failures.push(format!(
+                    "Failed to render tool message `{call_id}`: {error}"
                 ));
             }
         }
@@ -504,19 +495,11 @@ impl App {
         let blocked = if failure.blocked_by.is_empty() {
             String::new()
         } else {
-            let list = failure
-                .blocked_by
-                .join(self.locale.t("common.list_separator"));
-            self.locale
-                .t_args("plugin.failure_deps", &[("list", &list)])
+            format!("; depends on {}", failure.blocked_by.join(", "))
         };
-        let detail = self.locale.t_args(
-            "plugin.failure_detail",
-            &[
-                ("plugin_id", failure.plugin_id.as_str()),
-                ("blocked", &blocked),
-                ("reason", &failure.reason),
-            ],
+        let detail = format!(
+            "{}: load failed{blocked} · {}",
+            failure.plugin_id, failure.reason
         );
         self.plugin_failures.push(detail.clone());
         self.plugin_startup_details.push(detail);
@@ -578,10 +561,7 @@ impl App {
             let ready = if self.plugin_ids.is_empty() {
                 String::new()
             } else {
-                self.locale.t_args(
-                    "plugin.status_ready_count",
-                    &[("count", &self.plugin_ids.len().to_string())],
-                )
+                format!(" · {} ready", self.plugin_ids.len())
             };
             let queue = if self.queued_inputs.is_empty() {
                 String::new()
@@ -589,20 +569,14 @@ impl App {
                 format!(" · queued {}", self.queued_inputs.len())
             };
             let text = if plugins.is_empty() {
-                format!("{}{ready}{queue}", self.locale.t("plugin.status_loading"))
+                format!("Loading plugins{ready}{queue}")
             } else {
-                format!(
-                    "{} · {plugins}{ready}{queue}",
-                    self.locale.t("plugin.status_loading")
-                )
+                format!("Loading plugins · {plugins}{ready}{queue}")
             };
             return (SPINNER[self.spinner_frame % SPINNER.len()], text);
         }
         if let Some(error) = &self.plugin_load_error {
-            return (
-                "✗",
-                format!("{} · {error}", self.locale.t("plugin.status_failed")),
-            );
+            return ("✗", format!("Plugin loading failed · {error}"));
         }
         if self.plugin_status_ticks > 0 {
             let details = if self.plugin_startup_details.is_empty() {
@@ -611,11 +585,11 @@ impl App {
                 self.plugin_startup_details.join(" · ")
             };
             let text = if details.is_empty() {
-                self.locale.t("plugin.status_none").to_string()
+                "No plugins loaded".to_string()
             } else if self.plugin_failures.is_empty() {
-                format!("{} · {details}", self.locale.t("plugin.status_loaded"))
+                format!("Plugins loaded · {details}")
             } else {
-                format!("{} · {details}", self.locale.t("plugin.status_partial"))
+                format!("Plugins partially loaded · {details}")
             };
             (
                 if self.plugin_failures.is_empty() {
@@ -898,7 +872,7 @@ impl App {
                 if self.pending_reload.is_some() {
                     self.messages.push(Msg::new(
                         MsgKind::Info,
-                        self.locale.t("input.command_running"),
+                        "The command is still running. Try again shortly.",
                     ));
                     return;
                 }
@@ -910,7 +884,7 @@ impl App {
                         } else {
                             self.messages.push(Msg::new(
                                 MsgKind::Info,
-                                self.locale.t("input.attachment_during_run"),
+                                "Attachments cannot be sent during a run. Wait for it to finish.",
                             ));
                         }
                     } else {
@@ -927,7 +901,7 @@ impl App {
                     if let Some(agent) = agent {
                         agent.cancel();
                         self.messages
-                            .push(Msg::new(MsgKind::Info, self.locale.t("run.cancelling")));
+                            .push(Msg::new(MsgKind::Info, "Cancelling the current run..."));
                     }
                 } else if !self.input.is_empty() {
                     self.input.clear();
@@ -1325,7 +1299,7 @@ impl App {
                 visible: true,
                 lines: vec![UiLine {
                     spans: vec![UiSpan {
-                        text: format!("{}: {error:#}", self.locale.t("plugin.ui_error")),
+                        text: format!("Plugin UI error: {error:#}"),
                         style: UiStyle {
                             foreground: Some(UiColor::Red),
                             ..UiStyle::default()
@@ -1439,11 +1413,7 @@ impl App {
             Err(error) => {
                 self.messages.push(Msg::new(
                     MsgKind::Error,
-                    format!(
-                        "{} ({}): {error}",
-                        self.locale.t("attachment.read_failed"),
-                        path.display()
-                    ),
+                    format!("Failed to read attachment ({}): {error}", path.display()),
                 ));
                 return;
             }
@@ -1451,12 +1421,10 @@ impl App {
         if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
             self.messages.push(Msg::new(
                 MsgKind::Error,
-                self.locale.t_args(
-                    "attachment.too_large",
-                    &[
-                        ("limit", &(MAX_ATTACHMENT_BYTES / 1024 / 1024).to_string()),
-                        ("path", &path.display().to_string()),
-                    ],
+                format!(
+                    "Attachment exceeds the {} MiB limit: {}",
+                    MAX_ATTACHMENT_BYTES / 1024 / 1024,
+                    path.display()
                 ),
             ));
             return;
@@ -1543,17 +1511,17 @@ impl App {
             .map(|m| m.text.clone())
         else {
             self.messages
-                .push(Msg::new(MsgKind::Info, self.locale.t("copy.empty")));
+                .push(Msg::new(MsgKind::Info, "No assistant reply to copy"));
             return;
         };
         match copy_to_clipboard(&text) {
-            Ok(()) => self
-                .messages
-                .push(Msg::new(MsgKind::Info, self.locale.t("copy.done"))),
-            Err(error) => self.messages.push(Msg::new(
-                MsgKind::Error,
-                format!("{}: {error}", self.locale.t("copy.failed")),
+            Ok(()) => self.messages.push(Msg::new(
+                MsgKind::Info,
+                "Copied the latest reply to the clipboard",
             )),
+            Err(error) => self
+                .messages
+                .push(Msg::new(MsgKind::Error, format!("Copy failed: {error}"))),
         }
     }
 
@@ -1569,9 +1537,9 @@ impl App {
         }
         self.mouse_capture = !self.mouse_capture;
         let notice = if self.mouse_capture {
-            self.locale.t("mouse.capture_on")
+            "Mouse capture and wheel scrolling restored"
         } else {
-            self.locale.t("mouse.capture_off")
+            "Mouse capture paused: select text normally; press Ctrl+T to restore"
         };
         self.messages.push(Msg::new(MsgKind::Info, notice));
     }
@@ -1627,7 +1595,7 @@ impl App {
         self.messages.push(Msg::new(MsgKind::User, input));
         self.messages.push(Msg::new(
             MsgKind::Info,
-            self.locale.t("run.steering_queued"),
+            "Steering queued; it will be applied after the current tool finishes",
         ));
     }
 
@@ -1769,15 +1737,14 @@ impl App {
             if run.cancelled {
                 self.messages.push(Msg::new(
                     MsgKind::Info,
-                    self.locale.t("run.cancelled_preserved"),
+                    "Run cancelled; generated content was preserved",
                 ));
             }
             if !run.usage.is_empty() {
-                let step_label = self.locale.t("run.steps_label");
                 self.messages.push(Msg::new(
                     MsgKind::Info,
                     format!(
-                        "↑{} ↓{} Σ{} tokens · {} {step_label}",
+                        "↑{} ↓{} Σ{} tokens · {} steps",
                         run.usage.input_tokens.unwrap_or(0),
                         run.usage.output_tokens.unwrap_or(0),
                         run.usage.total_tokens.unwrap_or(0),

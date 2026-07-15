@@ -9,7 +9,7 @@ use agent_plugin::{
     export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentPlugin, EventPresentation,
     EventPresentationTarget, EventPresentationTone, EventPresentationVariant, ExtensionEvent,
     PluginHostApi, ServiceCall, ServiceSpec, UiColor, UiDeclaration, UiFrame, UiHostAction,
-    UiHostActionRequest, UiInput, UiInputEvent, UiLanguage, UiLine, UiPlacement, UiRenderRequest,
+    UiHostActionRequest, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest,
     UiSessionListStatus, UiSessionSummary, UiSessionsReply, UiSize, UiSpan, UiStyle,
 };
 use anyhow::{anyhow, Context, Result};
@@ -60,7 +60,6 @@ const BUILTIN_OWNER: &str = "command";
 /// 保存命令注册表、补全弹层与会话对话框状态的官方插件。
 struct CommandPlugin {
     registry: CommandRegistry,
-    language: UiLanguage,
     popup: CommandPopup,
     surface: SessionSurface,
     surface_authority: String,
@@ -75,8 +74,7 @@ struct CommandPlugin {
 impl Default for CommandPlugin {
     fn default() -> Self {
         Self {
-            registry: CommandRegistry::with_builtins(UiLanguage::English),
-            language: UiLanguage::default(),
+            registry: CommandRegistry::with_builtins(),
             popup: CommandPopup::default(),
             surface: SessionSurface::default(),
             surface_authority: DEFAULT_SURFACE_AUTHORITY.into(),
@@ -90,8 +88,6 @@ impl Default for CommandPlugin {
 impl AgentPlugin for CommandPlugin {
     /// 注册版本化 Command 服务并读取 TUI 调用方限制。
     fn activate(&mut self, host: &dyn PluginHostApi, context: ActivationContext) -> Result<()> {
-        self.language = context.ui_language();
-        self.registry = CommandRegistry::with_builtins(self.language);
         self.surface_authority = configured_surface_authority(&context);
         for (name, description) in service_descriptions() {
             host.upsert_service(&ServiceSpec {
@@ -138,7 +134,7 @@ impl AgentPlugin for CommandPlugin {
             UiDeclaration {
                 plugin_id: String::new(),
                 view_id: POPUP_VIEW.into(),
-                title: self.language.select("Commands", "命令").into(),
+                title: "Commands".into(),
                 placement: UiPlacement::InputPanel,
                 size: UiSize {
                     width: None,
@@ -150,7 +146,7 @@ impl AgentPlugin for CommandPlugin {
             UiDeclaration {
                 plugin_id: String::new(),
                 view_id: SESSION_DIALOG_VIEW.into(),
-                title: self.language.select("Sessions", "会话").into(),
+                title: "Sessions".into(),
                 placement: UiPlacement::Dialog,
                 size: UiSize {
                     width: Some(76),
@@ -168,19 +164,14 @@ impl AgentPlugin for CommandPlugin {
             POPUP_VIEW => Some(UiFrame {
                 view_id: request.view_id,
                 visible: self.popup.visible(&self.registry),
-                lines: self.popup.render(
-                    &self.registry,
-                    self.agent_idle,
-                    request.width,
-                    self.language,
-                ),
+                lines: self
+                    .popup
+                    .render(&self.registry, self.agent_idle, request.width),
             }),
             SESSION_DIALOG_VIEW => Some(UiFrame {
                 view_id: request.view_id,
                 visible: self.surface.visible,
-                lines: self
-                    .surface
-                    .render(request.width, request.height, self.language),
+                lines: self.surface.render(request.width, request.height),
             }),
             _ => None,
         }

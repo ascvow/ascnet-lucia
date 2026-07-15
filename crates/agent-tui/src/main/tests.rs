@@ -234,7 +234,7 @@ fn multiline_input_renders_six_visible_rows() {
 #[test]
 fn plugin_status_shows_startup_details_then_compact_count() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into()).with_locale(Locale::SimplifiedChinese);
+    let mut app = App::new(tx, "测试模型".into());
     app = app.with_loading_plugins(vec!["mcp".into(), "skill".into()]);
     app.mark_plugin_ready(
         "mcp".into(),
@@ -257,7 +257,7 @@ fn plugin_status_shows_startup_details_then_compact_count() {
         app.plugin_status_content(),
         (
             "✓",
-            "插件加载完成 · mcp: MCP 插件等待配置 · skill: 已加载 1 个 Skill".into()
+            "Plugins loaded · mcp: MCP 插件等待配置 · skill: 已加载 1 个 Skill".into()
         )
     );
 
@@ -276,7 +276,7 @@ fn plugin_status_shows_startup_details_then_compact_count() {
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect::<String>();
-    assert!(rendered.contains("插件加载完成"), "{rendered:?}");
+    assert!(rendered.contains("Pluginsloaded"), "{rendered:?}");
 
     for _ in 0..PLUGIN_STATUS_DETAIL_TICKS {
         app.tick_plugin_status();
@@ -289,16 +289,15 @@ fn plugin_status_shows_startup_details_then_compact_count() {
 #[test]
 fn plugin_status_reports_progressive_ready_count() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into())
-        .with_locale(Locale::SimplifiedChinese)
-        .with_loading_plugins(vec!["command".into(), "mcp".into()]);
+    let mut app =
+        App::new(tx, "测试模型".into()).with_loading_plugins(vec!["command".into(), "mcp".into()]);
 
     app.mark_plugin_ready("command".into(), &[], 0);
 
     let (_, status) = app.plugin_status_content();
     assert!(status.contains("mcp"), "{status}");
     assert!(!status.contains("command"), "{status}");
-    assert!(status.contains("已就绪 1"), "{status}");
+    assert!(status.contains("1 ready"), "{status}");
 }
 
 /// Partial plugin failures retain successes and remain visible in the compact footer count.
@@ -308,7 +307,7 @@ fn plugin_status_reports_progressive_ready_count() {
 #[test]
 fn plugin_status_keeps_partial_successes() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into()).with_locale(Locale::SimplifiedChinese);
+    let mut app = App::new(tx, "测试模型".into());
     app = app.with_loading_plugins(vec!["skill".into(), "mcp".into()]);
     app.mark_plugin_ready("skill".into(), &[], 0);
     app.mark_plugin_failed(PluginLoadFailure {
@@ -320,8 +319,8 @@ fn plugin_status_keeps_partial_successes() {
 
     let (icon, status) = app.plugin_status_content();
     assert_eq!(icon, "!");
-    assert!(status.contains("插件部分加载"), "{status}");
-    assert!(status.contains("mcp: 加载失败"), "{status}");
+    assert!(status.contains("Plugins partially loaded"), "{status}");
+    assert!(status.contains("mcp: load failed"), "{status}");
     assert_eq!(app.plugin_status_color(), COLOR_WARNING);
 
     for _ in 0..PLUGIN_STATUS_DETAIL_TICKS {

@@ -445,10 +445,9 @@ impl WasmPluginHost {
             let initialization = async {
                 let mut state = state.lock().await;
                 refill_fuel(&mut state)?;
-                let activation_metadata = activation_metadata(&manifest.metadata, &host_services);
                 let context_json = serde_json::to_string(&serde_json::json!({
                     "plugin_id": &plugin_id,
-                    "metadata": activation_metadata,
+                    "metadata": &manifest.metadata,
                 }))?;
                 let (activation_error,) = activate
                     .call_async(&mut state.store, (context_json,))
@@ -1086,21 +1085,6 @@ fn refill_fuel(state: &mut WasmPluginState) -> Result<()> {
     set_fuel(state, state.limits.fuel)
 }
 
-/// 合并 manifest metadata 与 Host 保留字段；Host 值必须覆盖插件自行声明的同名键。
-fn activation_metadata(
-    manifest_metadata: &HashMap<String, String>,
-    host_services: &PluginHostServices,
-) -> HashMap<String, String> {
-    let mut metadata = manifest_metadata.clone();
-    if let Some(locale) = host_services.locale() {
-        metadata.insert(
-            agent_plugin_protocol::HOST_LOCALE_METADATA_KEY.into(),
-            locale.into(),
-        );
-    }
-    metadata
-}
-
 /// 按单次上下文输入大小分配 fuel，并保留显式的最大计算预算。
 fn context_fuel_budget(limits: &WasmPluginLimits, input_bytes: usize) -> u64 {
     let extra = u64::try_from(input_bytes)
@@ -1239,24 +1223,6 @@ mod tests {
             limits.fuel + 300_000 * CONTEXT_FUEL_PER_INPUT_BYTE
         );
         assert_eq!(context_fuel_budget(&limits, usize::MAX), MAX_CONTEXT_FUEL);
-    }
-
-    /// Host locale 应作为保留 metadata 覆盖 manifest 中不可信的同名声明。
-    #[test]
-    fn activation_metadata_injects_trusted_host_locale() -> Result<()> {
-        let metadata = HashMap::from([(
-            agent_plugin_protocol::HOST_LOCALE_METADATA_KEY.into(),
-            "forged".into(),
-        )]);
-        let services = PluginHostServices::new().with_locale("zh-CN")?;
-
-        let activation = activation_metadata(&metadata, &services);
-
-        assert_eq!(
-            activation[agent_plugin_protocol::HOST_LOCALE_METADATA_KEY],
-            "zh-CN"
-        );
-        Ok(())
     }
 
     /// 多次请求运行时 Engine 时必须复用同一个底层实例。

@@ -7,7 +7,6 @@ mod conversation;
 mod doctor;
 #[cfg(feature = "plugins")]
 mod host_actions;
-mod locale;
 #[cfg(feature = "plugins")]
 mod plugin_cli;
 #[cfg(feature = "plugins")]
@@ -18,7 +17,6 @@ mod tui;
 use conversation::*;
 #[cfg(feature = "plugins")]
 use host_actions::*;
-use locale::*;
 #[cfg(feature = "plugins")]
 use plugin_startup::*;
 use session_coordination::*;

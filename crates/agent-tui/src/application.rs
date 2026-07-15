@@ -29,21 +29,19 @@ impl Drop for TerminalGuard {
 }
 
 pub(crate) async fn run(args: Args) -> Result<()> {
-    let locale = Locale::detect();
     let workspace = WorkspaceContext::capture()?;
     let config_path = resolve_config_path(args.config.as_deref())?;
     if args.init {
         initialize_config(&config_path)?;
-        println!("{}: {}", locale.t("config.created"), config_path.display());
-        println!("{}", locale.t("config.init_hint"));
+        println!("Created Lucia configuration: {}", config_path.display());
+        println!("Set model.api_key (or model.api_key_env), confirm model.model, then run lucia");
         return Ok(());
     }
 
     let mut config_exists = config_path.is_file();
     if args.config.is_some() && !config_exists {
         return Err(anyhow!(
-            "{}: {}",
-            locale.t("config.not_found"),
+            "Configuration file not found: {}",
             config_path.display()
         ));
     }
@@ -133,7 +131,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             gateway,
             options,
             true,
-            vec![locale.t("demo.local_notice").to_string()],
+            vec![
+                "Using the local demo model; no external model service will be contacted"
+                    .to_string(),
+            ],
         )
     } else if config_exists {
         let config = AgentRootConfig::load(&config_path)?;
@@ -149,14 +150,18 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 .model
                 .api_key_env
                 .as_deref()
-                .map(|name| format!("{} {name}", locale.t("demo.key_hint_env")))
-                .unwrap_or_else(|| locale.t("demo.key_hint_config").to_string());
+                .map(|name| format!("set environment variable {name}"))
+                .unwrap_or_else(|| {
+                    "set model.api_key or model.api_key_env in the configuration".to_string()
+                });
             let (gateway, options) = build_demo_gateway();
             (
                 gateway,
                 options,
                 true,
-                vec![locale.t_args("demo.no_key_notice", &[("key_hint", &key_hint)])],
+                vec![format!(
+                    "No model key detected; using the local demo model. {key_hint}, then restart lucia"
+                )],
             )
         }
     } else {
@@ -166,11 +171,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     if auto_initialized {
         startup_notices.insert(
             0,
-            format!(
-                "{}: {}",
-                locale.t("config.default_created"),
-                config_path.display()
-            ),
+            format!("Created default configuration: {}", config_path.display()),
         );
     }
 
@@ -271,7 +272,6 @@ pub(crate) async fn run(args: Args) -> Result<()> {
 
     let mut app = App::new(tx.clone(), model_name)
         .with_workspace(workspace)
-        .with_locale(locale)
         .with_context_window(tui_settings.context_window)
         .with_persistent_session(session_store, session_record);
     app.messages.extend(
@@ -289,7 +289,6 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 plugin_manifests,
                 capability_selection,
                 plugin_agent_template,
-                locale,
                 load_host,
                 load_tx.clone(),
             )
@@ -335,7 +334,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                             MsgKind::Error,
                                             format!(
                                                 "{}: {error}",
-                                                locale.t("plugin.ui_event_failed")
+                                                "Failed to process plugin UI event"
                                             ),
                                         ));
                                     }
@@ -368,7 +367,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         if let Err(error) = apply_plugin_navigation_event(&mut app, event) {
                             app.messages.push(Msg::new(
                                 MsgKind::Error,
-                                format!("{}: {error}", locale.t("plugin.view_nav_failed")),
+                                format!("Plugin view navigation failed: {error}"),
                             ));
                         }
                     }
@@ -380,7 +379,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                             }
                             Err(error) => app.messages.push(Msg::new(
                                 MsgKind::Error,
-                                format!("{}: {error}", locale.t("plugin.ui_decl_refresh_failed")),
+                                format!("Failed to refresh plugin UI declarations: {error}"),
                             )),
                         }
                         app.schedule_plugin_views_refresh(Arc::clone(host));
@@ -410,7 +409,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     app.set_progressive_plugin_load_error(&error);
                     app.messages.push(Msg::new(
                         MsgKind::Error,
-                        format!("{}: {error}", locale.t("plugin.load_plan_failed")),
+                        format!(
+                            "Plugin load planning failed; currently ready plugins were retained: {error}"
+                        ),
                     ));
                 }
             },
@@ -435,14 +436,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         }
                         Ok(None) => app.messages.push(Msg::new(
                             MsgKind::Error,
-                            locale.t_args(
-                                "plugin.session_query_unavailable",
-                                &[("plugin_id", &plugin_id)],
+                            format!(
+                                "Plugin `{plugin_id}` became unavailable before the session query completed"
                             ),
                         )),
                         Err(error) => app.messages.push(Msg::new(
                             MsgKind::Error,
-                            format!("{}: {error}", locale.t("plugin.session_query_send_failed")),
+                            format!("Failed to return session query results: {error}"),
                         )),
                     }
                 }
@@ -511,11 +511,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             }) => app.apply_tool_frame(&call_id, revision, width, result),
             Some(UiEvent::SteeringInjected) => {
                 app.messages
-                    .push(Msg::new(MsgKind::Info, locale.t("run.steering_applied")));
+                    .push(Msg::new(MsgKind::Info, "Steering applied"));
             }
             Some(UiEvent::FollowUpInjected) => {
                 app.messages
-                    .push(Msg::new(MsgKind::Info, locale.t("run.follow_up_started")));
+                    .push(Msg::new(MsgKind::Info, "Follow-up started"));
             }
             Some(UiEvent::Extension {
                 text,
@@ -529,7 +529,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 if let Err(error) = app.apply_view_navigation(&plugin_id, request) {
                     app.messages.push(Msg::new(
                         MsgKind::Error,
-                        format!("{}: {error}", locale.t("plugin.view_nav_failed")),
+                        format!("Plugin view navigation failed: {error}"),
                     ));
                 }
             }
@@ -544,7 +544,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     if let Err(error) = drain_plugin_ui_events(&mut app, host).await {
                         app.messages.push(Msg::new(
                             MsgKind::Error,
-                            format!("{}: {error}", locale.t("plugin.event_failed")),
+                            format!("Failed to process plugin event: {error}"),
                         ));
                     }
                 }
@@ -604,7 +604,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                 if let Err(error) = drain_plugin_ui_events(&mut app, host).await {
                                     app.messages.push(Msg::new(
                                         MsgKind::Error,
-                                        format!("{}: {error}", locale.t("plugin.ui_event_failed")),
+                                        format!("Failed to process plugin UI event: {error}"),
                                     ));
                                 }
                                 refresh_plugin_views_for(&mut app, host.as_ref(), &input.plugin_id)
@@ -665,7 +665,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         match tokio::time::timeout(std::time::Duration::from_secs(5), host.shutdown()).await {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(error),
-            Err(_) => Some(anyhow!(locale.t("plugin.host_shutdown_timeout"))),
+            Err(_) => Some(anyhow!("Plugin Host shutdown timed out")),
         }
     } else {
         None
@@ -696,7 +696,7 @@ async fn forward_main_input_snapshot(app: &mut App, plugin_host: &Arc<LivePlugin
     if let Err(error) = drain_plugin_ui_events(app, plugin_host).await {
         app.messages.push(Msg::new(
             MsgKind::Error,
-            format!("{}: {error}", app.locale.t("plugin.ui_event_failed")),
+            format!("Failed to process plugin UI event: {error}"),
         ));
     }
     refresh_plugin_view(app, plugin_host.as_ref(), &input.plugin_id, &input.view_id).await;

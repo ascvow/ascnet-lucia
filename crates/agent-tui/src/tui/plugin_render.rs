@@ -177,10 +177,7 @@ pub(crate) fn render_plugin_subview(frame: &mut Frame, app: &mut App, outer: Rec
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(breadcrumbs, Style::new().fg(COLOR_TEXT).bold()),
-            Span::styled(
-                app.locale.t("plugin.esc_back"),
-                Style::new().fg(COLOR_MUTED),
-            ),
+            Span::styled("  Esc Back", Style::new().fg(COLOR_MUTED)),
         ])),
         sections[0],
     );
@@ -199,7 +196,7 @@ pub(crate) fn render_plugin_subview(frame: &mut Frame, app: &mut App, outer: Rec
         .map(plugin_frame_lines)
         .unwrap_or_else(|| {
             vec![Line::from(Span::styled(
-                app.locale.t("plugin.view_loading"),
+                "Loading view...",
                 Style::new().fg(COLOR_MUTED),
             ))]
         });

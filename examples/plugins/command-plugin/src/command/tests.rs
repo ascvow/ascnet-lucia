@@ -184,7 +184,7 @@ fn press_popup(plugin: &mut CommandPlugin, host: &RecordingHost, code: &str) {
 /// 验证默认快照包含全部官方命令和 `/quit` 别名。
 #[test]
 fn exposes_builtin_commands() {
-    let registry = CommandRegistry::with_builtins(UiLanguage::SimplifiedChinese);
+    let registry = CommandRegistry::with_builtins();
     let snapshot = registry.snapshot();
     assert_eq!(snapshot.generation, 1);
     assert_eq!(
@@ -201,7 +201,7 @@ fn exposes_builtin_commands() {
 /// 验证命令名称不能被其他 owner 覆盖或注销。
 #[test]
 fn enforces_command_ownership() {
-    let mut registry = CommandRegistry::with_builtins(UiLanguage::SimplifiedChinese);
+    let mut registry = CommandRegistry::with_builtins();
     registry
         .register("owner-a".into(), third_party_spec("deploy"))
         .expect("首次注册应成功");
@@ -221,7 +221,7 @@ fn enforces_command_ownership() {
 /// 验证 Host 服务目录消失后会清理对应 owner 的幽灵命令。
 #[test]
 fn prunes_commands_whose_callback_service_disappeared() {
-    let mut registry = CommandRegistry::with_builtins(UiLanguage::SimplifiedChinese);
+    let mut registry = CommandRegistry::with_builtins();
     registry
         .register("inspect-plugin".into(), third_party_spec("inspect"))
         .expect("第三方命令应注册成功");
@@ -241,7 +241,7 @@ fn prunes_commands_whose_callback_service_disappeared() {
 /// 验证第三方命令生成回调计划并绑定类型化参数。
 #[test]
 fn prepares_callback_plan_with_typed_arguments() {
-    let mut registry = CommandRegistry::with_builtins(UiLanguage::SimplifiedChinese);
+    let mut registry = CommandRegistry::with_builtins();
     registry
         .register("deploy-plugin".into(), third_party_spec("deploy"))
         .expect("应注册命令");
@@ -510,9 +510,7 @@ fn popup_renders_descriptive_matches() {
     let mut plugin = CommandPlugin::default();
     sync_popup(&mut plugin, &host, "/res");
     assert!(plugin.popup.visible(&plugin.registry));
-    let lines = plugin
-        .popup
-        .render(&plugin.registry, true, 80, UiLanguage::English);
+    let lines = plugin.popup.render(&plugin.registry, true, 80);
     let text = lines
         .iter()
         .flat_map(|line| line.spans.iter())
@@ -520,30 +518,6 @@ fn popup_renders_descriptive_matches() {
         .collect::<String>();
     assert!(text.contains("/resume"), "{text}");
     assert!(text.contains("Resume a previous session"), "{text}");
-}
-
-/// Host 注入中文 locale 后，Command 标题和内置命令说明必须切换为简体中文。
-#[test]
-fn activation_selects_simplified_chinese_ui() {
-    let host = RecordingHost::default();
-    let mut plugin = CommandPlugin::default();
-    let mut context = ActivationContext {
-        plugin_id: "command".into(),
-        metadata: Default::default(),
-    };
-    context
-        .metadata
-        .insert("host.locale".into(), "zh-CN".into());
-
-    plugin
-        .activate(&host, context)
-        .expect("Command 插件应成功激活");
-
-    assert_eq!(plugin.describe_ui()[0].title, "命令");
-    assert_eq!(
-        plugin.registry.commands["resume"].spec.summary,
-        "恢复历史会话"
-    );
 }
 
 /// 验证 Esc 隐藏弹层且输入变化后恢复展示。
@@ -633,7 +607,7 @@ fn session_surface_scrolls_and_maps_mouse_to_visible_window() {
         },
     }));
     surface.selected = 8;
-    let lines = surface.render(60, 10, UiLanguage::SimplifiedChinese);
+    let lines = surface.render(60, 10);
     assert_eq!(surface.rendered_start, 5);
     assert_eq!(surface.rendered_len, 4);
     assert!(lines.iter().any(|line| {
