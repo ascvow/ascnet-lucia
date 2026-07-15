@@ -18,6 +18,10 @@ const PLAN_STATE_KEY: &str = "current_plan";
 const PLAN_SHELF_VIEW: &str = "plan-shelf";
 const PLAN_DETAIL_VIEW: &str = "plan-detail";
 const PLAN_SCHEMA_VERSION: u32 = 1;
+/// 紧凑计划架最多展示的内容行数，不包含宿主绘制的顶部分隔线。
+const PLAN_SHELF_CONTENT_LINES: usize = 5;
+/// 紧凑计划架的总布局高度，包含一行宿主顶部分隔线。
+const PLAN_SHELF_HEIGHT: u16 = 6;
 /// 引导主 Agent 使用结构化计划的 developer 提示 ID。
 const PLAN_MANAGEMENT_PROMPT_ID: &str = "plan-management";
 /// 引导主 Agent 在复杂任务中维护结构化计划的规则。
@@ -230,7 +234,7 @@ impl AgentPlugin for PlanPlugin {
                 placement: UiPlacement::ComposerShelf,
                 size: UiSize {
                     width: None,
-                    height: Some(3),
+                    height: Some(PLAN_SHELF_HEIGHT),
                 },
                 focusable: true,
                 input_triggers: Vec::new(),
@@ -300,7 +304,7 @@ impl AgentPlugin for PlanPlugin {
 }
 
 impl PlanPlugin {
-    /// 构造输入区上方的当前进度摘要，只保留当前步骤和紧邻的下一步。
+    /// 构造输入区上方的紧凑进度架，最多展示五行并用汇总行收起其余任务。
     fn render_shelf(&self, completed: usize, width: usize) -> Vec<UiLine> {
         let mut lines = vec![styled_line(
             truncate_to_width(
@@ -310,26 +314,23 @@ impl PlanPlugin {
             Some(UiColor::Cyan),
             true,
         )];
-        if let Some(current) = self
-            .state
-            .plan
-            .iter()
-            .find(|item| item.status == PlanStatus::InProgress)
-        {
+        let ordered = self.ordered_plan_items().collect::<Vec<_>>();
+        let task_capacity = PLAN_SHELF_CONTENT_LINES.saturating_sub(1);
+        let visible_tasks = if ordered.len() > task_capacity {
+            task_capacity.saturating_sub(1)
+        } else {
+            ordered.len()
+        };
+        lines.extend(
+            ordered
+                .iter()
+                .take(visible_tasks)
+                .map(|item| render_plan_item(item, width)),
+        );
+        let hidden = ordered.len().saturating_sub(visible_tasks);
+        if hidden > 0 {
             lines.push(styled_line(
-                truncate_to_width(&format!("[>] {}", current.step), width),
-                Some(UiColor::Yellow),
-                true,
-            ));
-        }
-        if let Some(next) = self
-            .state
-            .plan
-            .iter()
-            .find(|item| item.status == PlanStatus::Pending)
-        {
-            lines.push(styled_line(
-                truncate_to_width(&format!("[ ] 接下来：{}", next.step), width),
+                truncate_to_width(&format!("+{hidden} Task"), width),
                 Some(UiColor::Gray),
                 false,
             ));
@@ -355,19 +356,25 @@ impl PlanPlugin {
             ));
             lines.push(styled_line(String::new(), None, false));
         }
-        for item in &self.state.plan {
-            let (marker, color) = match item.status {
-                PlanStatus::Pending => ("[ ]", UiColor::Gray),
-                PlanStatus::InProgress => ("[>]", UiColor::Yellow),
-                PlanStatus::Completed => ("[x]", UiColor::Green),
-            };
-            lines.push(styled_line(
-                truncate_to_width(&format!("{marker} {}", item.step), width),
-                Some(color),
-                item.status == PlanStatus::InProgress,
-            ));
-        }
+        lines.extend(
+            self.ordered_plan_items()
+                .map(|item| render_plan_item(item, width)),
+        );
         lines
+    }
+
+    /// 按显示顺序遍历计划项：未完成项保持原顺序，已完成项稳定移动到末尾。
+    fn ordered_plan_items(&self) -> impl Iterator<Item = &PlanItem> {
+        self.state
+            .plan
+            .iter()
+            .filter(|item| item.status != PlanStatus::Completed)
+            .chain(
+                self.state
+                    .plan
+                    .iter()
+                    .filter(|item| item.status == PlanStatus::Completed),
+            )
     }
 
     /// 解析、校验并保存一次完整计划更新；Host 写入失败时保留旧状态。
@@ -474,6 +481,20 @@ fn styled_line(text: String, foreground: Option<UiColor>, bold: bool) -> UiLine 
             },
         }],
     }
+}
+
+/// 按计划状态渲染单个任务行，并限制其终端显示宽度。
+fn render_plan_item(item: &PlanItem, width: usize) -> UiLine {
+    let (marker, color) = match item.status {
+        PlanStatus::Pending => ("[ ]", UiColor::Gray),
+        PlanStatus::InProgress => ("[>]", UiColor::Yellow),
+        PlanStatus::Completed => ("[x]", UiColor::Green),
+    };
+    styled_line(
+        truncate_to_width(&format!("{marker} {}", item.step), width),
+        Some(color),
+        item.status == PlanStatus::InProgress,
+    )
 }
 
 /// 按终端显示宽度截断文本，确保中英文内容不会越过面板边界。
@@ -620,6 +641,43 @@ mod tests {
                 .expect("完成计划应返回帧")
                 .visible
         );
+    }
+
+    /// 紧凑计划架最多展示五行，超出项汇总显示，已完成任务稳定沉到末尾。
+    #[test]
+    fn shelf_limits_rows_and_sinks_completed_items() {
+        let mut plugin = PlanPlugin::default();
+        plugin.state.plan = vec![
+            item("已完成一", PlanStatus::Completed),
+            item("待处理", PlanStatus::Pending),
+            item("已完成二", PlanStatus::Completed),
+            item("处理中", PlanStatus::InProgress),
+        ];
+
+        let lines = plugin.render_shelf(2, 80);
+        let text = lines
+            .iter()
+            .map(|line| line.spans[0].text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), PLAN_SHELF_CONTENT_LINES);
+        assert_eq!(
+            text,
+            vec![
+                "计划  2/4 已完成",
+                "[ ] 待处理",
+                "[>] 处理中",
+                "[x] 已完成一",
+                "[x] 已完成二",
+            ]
+        );
+
+        plugin.state.plan = (1..=7)
+            .map(|index| item(&format!("任务 {index}"), PlanStatus::Pending))
+            .collect();
+        let overflow = plugin.render_shelf(0, 80);
+        assert_eq!(overflow.len(), PLAN_SHELF_CONTENT_LINES);
+        assert_eq!(overflow[4].spans[0].text, "+4 Task");
+        assert_eq!(plugin.describe_ui()[0].size.height, Some(PLAN_SHELF_HEIGHT));
     }
 
     /// 正常完成应收敛执行中步骤，取消运行必须保留原状态。
