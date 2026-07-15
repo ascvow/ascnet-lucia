@@ -88,13 +88,11 @@ lucia plugin unselect agent.context-loader
 $LUCIA_HOME/plugins/<id>/<version>/
 ```
 
-锁文件是 `$LUCIA_HOME/plugins.lock.toml`，记录来源、启用状态、manifest 路径和 bundle SHA-256。普通启动按以下优先级合并插件：
+锁文件是 `$LUCIA_HOME/plugins.lock.toml`，记录来源、启用状态、manifest 路径和 bundle SHA-256。普通启动只合并用户明确选择的以下来源：
 
 1. `--plugin-manifest` 和配置文件 `[[plugins]]`。
 2. `lucia plugin install` 管理的已启用插件。
-3. `$LUCIA_HOME/official-plugins` 中的官方插件。
-
-同 ID 的高优先级来源覆盖低优先级来源。配置文件中的 `disabled_plugins` 最后生效，按插件 ID 从最终组合中剔除任意来源的插件（含官方自动发现）：
+同 ID 的高优先级来源覆盖低优先级来源。配置文件中的 `disabled_plugins` 最后生效，按插件 ID 从最终组合中剔除任意来源的插件：
 
 ```toml
 disabled_plugins = ["teammate", "plan"]

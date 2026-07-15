@@ -60,8 +60,6 @@ use agent_tool::{JsonTool, ToolCall, ToolRegistry, ToolSpec};
 #[cfg(feature = "plugins")]
 use anyhow::Context;
 use anyhow::{anyhow, Result};
-#[cfg(feature = "plugins")]
-use app_config::discover_official_plugin_manifests;
 use app_config::{
     initialize_config, load_tui_settings, lucia_home_dir, resolve_config_path,
     resolve_config_relative_path, TuiSettings,

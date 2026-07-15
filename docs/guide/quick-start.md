@@ -25,10 +25,11 @@ cargo run -p agent-basic-cli -- --demo "你好"
 
 ## 2. 安装并启动 TUI
 
-构建插件版 TUI、安装 `lucia` 命令并同步官方插件：
+构建插件版 TUI、安装 `lucia` 命令，并显式选择需要的插件：
 
 ```bash
 bun run install:tui
+lucia plugin install context
 lucia --demo
 ```
 

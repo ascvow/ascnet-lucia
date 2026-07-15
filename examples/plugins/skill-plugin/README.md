@@ -32,10 +32,11 @@ bun run build:plugin:skill
 bun run test:plugin:skill
 ```
 
-默认安装后，官方 Skill bundle 会同步到 `$LUCIA_HOME/official-plugins/skill`，并在启动时自动加载：
+安装插件版 TUI 后，由用户显式安装 Skill 插件：
 
 ```bash
 bun run install:tui
+lucia plugin install skill
 lucia
 ```
 

@@ -52,7 +52,7 @@ bun run build:tui:plugins
 target/plugin-tui/release/lucia
 ```
 
-该版本会自动加载 `$LUCIA_HOME/official-plugins/*/plugin.toml`。配置中的 `[[plugins]]` 和 `--plugin-manifest` 用于补充其他插件；同 ID 的显式插件优先。
+该版本只提供 Plugin Host，不附带或自动发现功能插件。运行时加载 `lucia plugin install` 管理的已启用插件，以及配置 `[[plugins]]` 和 `--plugin-manifest` 明确指定的插件；同 ID 的显式 manifest 优先。
 
 该版本包含 Plugin Host、WASM component 加载、依赖解析、插件服务和插件 TUI。
 
@@ -72,13 +72,13 @@ crate，负责下载、安装和完整性规则，但不再分发单独的 `agen
 
 ## 本地安装
 
-构建全部官方与示例插件、安装插件版 TUI 并同步官方 bundle：
+构建全部官方与示例插件，并安装插件版 TUI；构建产物不会自动安装或启用：
 
 ```bash
 bun run install:all
 ```
 
-只构建并安装插件版 TUI 与默认官方 bundle，同时确保新 zsh 会话可以找到 Cargo bin：
+只构建并安装插件版 TUI：
 
 ```bash
 bun run install:tui
@@ -90,7 +90,7 @@ bun run install:tui
 bun run install:tui:core
 ```
 
-默认安装会把官方 Context、MCP、Skill、Command、Teammate、Plan 与 Sandbox bundle 同步到 `$LUCIA_HOME/official-plugins`，不会删除其中的用户配置或 Skill 文件。运行时文件先写入同目录临时文件并原子替换，`plugin.toml` 最后发布，避免并发启动读取到半写 WASM。安装后直接运行 `lucia`，无需额外插件参数。两个版本的命令名均为 `lucia`，因此同一 Cargo bin 目录内后安装的版本会覆盖前一个。分发两个压缩包时应使用独立 `--target-dir` 构建，并在归档名称中区分 `lucia-core` 与 `lucia-plugins`。
+安装后可用 `lucia plugin search` 查看 Registry，并用 `lucia plugin install <id>` 逐个选择能力。两个 TUI 版本的命令名均为 `lucia`，因此同一 Cargo bin 目录内后安装的版本会覆盖前一个。分发两个压缩包时应使用独立 `--target-dir` 构建，并在归档名称中区分 `lucia-core` 与 `lucia-plugins`。
 
 ## 验证边界
 

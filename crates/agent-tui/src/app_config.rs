@@ -153,38 +153,6 @@ pub(crate) fn resolve_config_relative_path(config_path: &Path, path: &Path) -> P
     }
 }
 
-/// Discovers installer-managed official plugin manifests under Lucia Home.
-///
-/// 发现 Lucia Home 中由安装器维护的官方插件 manifest。
-///
-/// Official plugins use the `$LUCIA_HOME/official-plugins/<plugin-id>/plugin.toml` layout.
-/// A missing root returns an empty list, while I/O failures are reported to avoid silently
-/// ignoring a corrupted installation.
-///
-/// 官方插件使用 `$LUCIA_HOME/official-plugins/<plugin-id>/plugin.toml` 布局。根目录尚未
-/// 安装时返回空列表；读取失败时返回错误，避免静默忽略损坏的安装。
-#[cfg(feature = "plugins")]
-pub(crate) fn discover_official_plugin_manifests(lucia_home: &Path) -> Result<Vec<PathBuf>> {
-    let root = lucia_home.join("official-plugins");
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut manifests = fs::read_dir(&root)
-        .with_context(|| format!("读取官方插件目录失败：{}", root.display()))?
-        .map(|entry| {
-            let entry = entry.context("读取官方插件目录项失败")?;
-            let path = entry.path();
-            let manifest = path.join("plugin.toml");
-            Ok((path.is_dir() && manifest.is_file()).then_some(manifest))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    manifests.sort();
-    Ok(manifests)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,30 +235,5 @@ mod tests {
             resolve_config_relative_path(config, Path::new("/var/lib/lucia")),
             PathBuf::from("/var/lib/lucia")
         );
-    }
-
-    /// Official plugin discovery uses a stable order and ignores incomplete entries.
-    ///
-    /// 官方插件发现应使用稳定顺序，并忽略不完整目录和普通文件。
-    #[cfg(feature = "plugins")]
-    #[test]
-    fn discovers_installed_official_plugins() {
-        let root = temp_dir();
-        let official = root.join("official-plugins");
-        fs::create_dir_all(official.join("skill")).expect("创建 Skill 目录");
-        fs::create_dir_all(official.join("mcp")).expect("创建 MCP 目录");
-        fs::create_dir_all(official.join("incomplete")).expect("创建不完整目录");
-        fs::write(official.join("skill/plugin.toml"), "skill").expect("写入 Skill manifest");
-        fs::write(official.join("mcp/plugin.toml"), "mcp").expect("写入 MCP manifest");
-        fs::write(official.join("README.md"), "说明").expect("写入普通文件");
-
-        assert_eq!(
-            discover_official_plugin_manifests(&root).expect("发现官方插件"),
-            vec![
-                official.join("mcp/plugin.toml"),
-                official.join("skill/plugin.toml")
-            ]
-        );
-        fs::remove_dir_all(root).expect("清理测试目录");
     }
 }

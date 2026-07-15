@@ -1,15 +1,16 @@
 # TUI 使用
 
-本章面向直接在终端中使用 Lucia 的用户。安装插件版 TUI 后，官方插件会随程序同步并自动加载，不需要手动传入 manifest。
+本章面向直接在终端中使用 Lucia 的用户。插件版 TUI 只提供 Plugin Host；功能插件由用户显式安装、启用或通过 manifest 指定。
 
 ## 安装与启动
 
 ```bash
 bun run install:tui
+lucia plugin install context
 lucia
 ```
 
-`install:tui` 会构建插件版 `lucia`，安装到 Cargo bin 目录，并把官方插件同步到 `$LUCIA_HOME/official-plugins`。未设置 `LUCIA_HOME` 时，应用目录是 `$HOME/.lucia`。
+`install:tui` 会构建插件版 `lucia` 并安装到 Cargo bin 目录，不会安装任何功能插件。`lucia plugin install` 管理的已启用插件会在启动时加载；未设置 `LUCIA_HOME` 时，应用目录是 `$HOME/.lucia`。
 
 第一次启动会创建 `$LUCIA_HOME/config.toml`。配置不存在或模型密钥不可用时，TUI 使用本地演示模型；也可以显式运行：
 

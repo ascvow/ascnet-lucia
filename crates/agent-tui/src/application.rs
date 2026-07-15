@@ -109,17 +109,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         let managed_runtime = agent_plugin_manager::PluginManager::new(&lucia_home)
             .runtime_config()
             .context("读取受管理插件配置失败；请运行 `lucia doctor`")?;
-        merge_official_plugin_manifests(&mut plugin_manifests, managed_runtime.manifest_paths);
+        merge_plugin_manifests(&mut plugin_manifests, managed_runtime.manifest_paths);
         for (capability, owner) in managed_runtime.capability_selection {
             capability_selection.entry(capability).or_insert(owner);
         }
     }
-    #[cfg(feature = "plugins")]
-    merge_official_plugin_manifests(
-        &mut plugin_manifests,
-        discover_official_plugin_manifests(&lucia_home)?,
-    );
-    // 用户禁用列表最后生效：官方自动发现和显式声明都会被剔除。
+    // 用户禁用列表最后生效：受管理插件和显式声明都会被剔除。
     #[cfg(feature = "plugins")]
     remove_disabled_plugin_manifests(&mut plugin_manifests, &disabled_plugins);
 

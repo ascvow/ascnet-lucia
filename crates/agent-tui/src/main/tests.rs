@@ -1111,41 +1111,40 @@ fn failed_completion_preserves_visible_history_without_persisting_diagnostic() {
         .all(|message| !message.text_content().contains(diagnostic)));
 }
 
-/// Explicit manifests override same-ID official plugins while retaining other defaults.
-///
-/// 显式插件应覆盖同 ID 官方插件，同时保留其他官方插件。
+/// 先声明的显式 manifest 应覆盖同 ID 受管理插件，同时保留其他插件。
 #[cfg(feature = "plugins")]
 #[test]
-fn explicit_plugin_manifest_overrides_official_manifest() {
+fn explicit_plugin_manifest_overrides_managed_manifest() {
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("生成测试时间戳")
         .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "lucia-official-plugin-merge-{}-{nonce}",
+        "lucia-plugin-manifest-merge-{}-{nonce}",
         std::process::id()
     ));
     let explicit = root.join("explicit.toml");
-    let official_same = root.join("official-same.toml");
-    let official_other = root.join("official-other.toml");
+    let managed_same = root.join("managed-same.toml");
+    let managed_other = root.join("managed-other.toml");
     fs::create_dir_all(&root).expect("创建插件合并测试目录");
     let manifest = |id: &str, name: &str| {
         format!(
-            "[plugin]\nid = \"{id}\"\nname = \"{name}\"\nversion = \"1.0.0\"\napi_version = \"0.6.0\"\nwasm = \"plugin.wasm\"\n"
+            "[plugin]\nid = \"{id}\"\nname = \"{name}\"\nversion = \"1.0.0\"\napi_version = \"0.7.0\"\nwasm = \"plugin.wasm\"\n"
         )
     };
     fs::write(&explicit, manifest("mcp", "显式 MCP")).expect("写入显式插件 manifest");
-    fs::write(&official_same, manifest("mcp", "官方 MCP")).expect("写入同 ID 官方插件 manifest");
-    fs::write(&official_other, manifest("skill", "官方 Skill")).expect("写入其他官方插件 manifest");
+    fs::write(&managed_same, manifest("mcp", "受管理 MCP")).expect("写入同 ID 受管理插件 manifest");
+    fs::write(&managed_other, manifest("skill", "受管理 Skill"))
+        .expect("写入其他受管理插件 manifest");
 
     let mut manifests = vec![explicit.clone()];
-    merge_official_plugin_manifests(&mut manifests, vec![official_same, official_other.clone()]);
+    merge_plugin_manifests(&mut manifests, vec![managed_same, managed_other.clone()]);
 
-    assert_eq!(manifests, vec![explicit, official_other]);
+    assert_eq!(manifests, vec![explicit, managed_other]);
     fs::remove_dir_all(root).expect("清理插件合并测试目录");
 }
 
-/// 用户禁用列表按插件 ID 剔除官方与显式 manifest，无法解析的保留给容错加载器。
+/// 用户禁用列表按插件 ID 剔除受管理与显式 manifest，无法解析的保留给容错加载器。
 #[cfg(feature = "plugins")]
 #[test]
 fn disabled_plugins_are_removed_from_runtime_composition() {
@@ -1160,7 +1159,7 @@ fn disabled_plugins_are_removed_from_runtime_composition() {
     fs::create_dir_all(&root).expect("创建插件禁用测试目录");
     let manifest = |id: &str| {
         format!(
-            "[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1.0.0\"\napi_version = \"0.6.0\"\nwasm = \"plugin.wasm\"\n"
+            "[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1.0.0\"\napi_version = \"0.7.0\"\nwasm = \"plugin.wasm\"\n"
         )
     };
     let teammate = root.join("teammate.toml");

@@ -20,7 +20,7 @@ export interface OfficialPluginRelease {
   tag: string
 }
 
-/** 构建、安装器同步和 Release 打包共享的唯一官方插件清单。 */
+/** 构建和 Release 打包共享的唯一官方插件清单。 */
 export interface OfficialPluginCatalog {
   /** 清单格式版本。 */
   schema_version: number

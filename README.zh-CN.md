@@ -40,7 +40,7 @@ cargo run -p agent-basic-cli -- --demo "你好"
 
 - Rust stable，具体工具链以仓库中的 `rust-toolchain.toml` 为准。
 - `wasm32-wasip2`，仅在编译 WASM 插件时需要。
-- Bun 是可选项，用于批量构建和同步官方插件，不是编译 Lucia Core 的必要条件。
+- Bun 是可选项，用于批量构建和打包官方插件，不是编译 Lucia Core 的必要条件。
 
 缺少 WASM target 时可以手动安装：
 
@@ -118,21 +118,17 @@ cargo build \
   --plugin-manifest examples/plugins/echo-plugin/plugin.toml
 ```
 
-### 方式三：一键安装插件版和官方插件
+### 方式三：安装插件版 TUI
 
-希望直接使用完整体验时，可以安装 Bun 后运行：
+需要插件加载能力时，可以安装 Bun 后运行：
 
 ```bash
 bun run install:tui
+lucia plugin install context
 lucia --demo
 ```
 
-这条命令会依次完成：
-
-1. 编译官方 WASM 插件。
-2. 通过 Cargo 编译并安装插件版 `lucia`。
-3. 将官方插件同步到 `$LUCIA_HOME/official-plugins`，未设置 `LUCIA_HOME` 时使用 `$HOME/.lucia`。
-4. 按需把 `$HOME/.cargo/bin` 写入 zsh 的 `PATH`。
+`install:tui` 只通过 Cargo 编译并安装具备 Plugin Host 的 `lucia`，不会安装或启用任何功能插件。用户通过 `lucia plugin search` 和 `lucia plugin install <id>` 自行选择能力；官方插件与第三方插件遵循同一套安装、权限和生命周期协议。
 
 只想构建而不安装时，可以分别运行：
 

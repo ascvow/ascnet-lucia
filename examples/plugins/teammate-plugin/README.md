@@ -32,10 +32,11 @@
 
 成员会话底部输入行支持正常文本编辑和 `Enter` 发送。成员正在排队或运行时，消息通过 Runtime steering 注入当前私有会话；成员成功结束后，消息通过 `continue_agent` 创建后续运行并继续显示在同一成员会话视图。失败或取消的运行没有可复用成功会话，因此会明确拒绝继续发送。
 
-使用默认插件版：
+安装插件版 TUI 后，显式安装 Teammate 插件：
 
 ```bash
 bun run install:tui:plugins
+lucia plugin install teammate
 lucia
 ```
 

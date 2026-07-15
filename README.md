@@ -40,7 +40,7 @@ This example uses a deterministic built-in model. It needs no API key and does n
 
 - Rust stable. The exact toolchain is defined in `rust-toolchain.toml`.
 - `wasm32-wasip2`, only when building WASM plugins.
-- Bun is optional. It automates bulk builds and installation of the official plugins, but it is not required to build Lucia Core.
+- Bun is optional. It automates bulk builds and packaging for the official plugins, but it is not required to build Lucia Core.
 
 Install the WASM target manually if it is missing:
 
@@ -118,21 +118,17 @@ cargo build \
   --plugin-manifest examples/plugins/echo-plugin/plugin.toml
 ```
 
-### Option 3: Install Lucia with the Official Plugins
+### Option 3: Install the Plugin-enabled TUI
 
-For the complete bundled experience, install Bun and run:
+To use the plugin loader, install Bun and run:
 
 ```bash
 bun run install:tui
+lucia plugin install context
 lucia --demo
 ```
 
-This command:
-
-1. Builds the official WASM plugins.
-2. Builds and installs the plugin-enabled `lucia` binary through Cargo.
-3. Synchronizes official plugins into `$LUCIA_HOME/official-plugins`, or `$HOME/.lucia/official-plugins` when `LUCIA_HOME` is not set.
-4. Adds `$HOME/.cargo/bin` to the zsh `PATH` when needed.
+`install:tui` only builds and installs the `lucia` binary with Plugin Host support. It does not install or enable feature plugins. Users choose capabilities with `lucia plugin search` and `lucia plugin install <id>`; official and third-party plugins use the same installation, permission, and lifecycle contracts.
 
 To build without installing:
 

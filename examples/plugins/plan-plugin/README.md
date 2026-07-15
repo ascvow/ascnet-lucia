@@ -1,6 +1,6 @@
 # Plan 插件
 
-Plan 是 Lucia 官方独立插件，随 `install:tui` 同步到 `$LUCIA_HOME/official-plugins/plan`，启动插件版 TUI 时自动加载。开发目录中也可以通过 `--plugin-manifest examples/plugins/plan-plugin/plugin.toml` 显式加载。
+Plan 是 Lucia 官方独立插件，可通过 `lucia plugin install plan` 由用户显式安装。开发目录中也可以通过 `--plugin-manifest examples/plugins/plan-plugin/plugin.toml` 临时加载。
 
 Plan 插件向 Agent 提供两个工具：
 

@@ -1,4 +1,4 @@
-//! 官方插件发现、manifest 合并与容错启动。
+//! 插件 manifest 合并与容错启动。
 
 use super::*;
 
@@ -32,21 +32,18 @@ pub(crate) fn plugin_startup_details(plugin_ids: &[String], events: &[Value]) ->
         .collect()
 }
 
-/// Appends default official plugins while preserving explicit manifests with the same ID.
+/// 合并另一组插件 manifest，并保留先出现的同 ID 声明。
 ///
-/// 将默认官方插件补充到显式插件列表，并让同 ID 的显式声明优先。
+/// 调用方按优先级传入来源；无法解析的 manifest 保留给后台容错加载器报告。
 #[cfg(feature = "plugins")]
-pub(crate) fn merge_official_plugin_manifests(
-    manifests: &mut Vec<PathBuf>,
-    official_manifests: Vec<PathBuf>,
-) {
+pub(crate) fn merge_plugin_manifests(manifests: &mut Vec<PathBuf>, incoming: Vec<PathBuf>) {
     let mut plugin_ids = manifests
         .iter()
         .map(PluginManifest::load)
         .filter_map(Result::ok)
         .map(|manifest| manifest.plugin.id)
         .collect::<HashSet<_>>();
-    for path in official_manifests {
+    for path in incoming {
         let should_append = PluginManifest::load(&path)
             .map(|manifest| plugin_ids.insert(manifest.plugin.id))
             // Keep invalid manifests for the background resilient loader to report after first paint.
@@ -60,7 +57,7 @@ pub(crate) fn merge_official_plugin_manifests(
 
 /// Removes manifests whose plugin ID appears in the user's disabled list.
 ///
-/// 按用户配置的禁用插件 ID 剔除 manifest；对官方自动发现和显式声明同样生效。
+/// 按用户配置的禁用插件 ID 剔除 manifest；对受管理插件和显式声明同样生效。
 /// 无法解析的 manifest 保留给后台容错加载器报告，不在这里静默丢弃。
 #[cfg(feature = "plugins")]
 pub(crate) fn remove_disabled_plugin_manifests(manifests: &mut Vec<PathBuf>, disabled: &[String]) {
@@ -106,6 +103,9 @@ pub(crate) async fn load_plugins_for_tui(
     live_host: Arc<LivePluginHost>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
+    if manifests.is_empty() {
+        return Ok(());
+    }
     let model_gateway = agent_template.gateway().clone();
     let model_provider = agent_template.options().provider.clone();
     let model_name = agent_template.options().model.clone();

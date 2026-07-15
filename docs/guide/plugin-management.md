@@ -63,7 +63,7 @@ Registry、本地与 GitHub 安装进入同一个 `$LUCIA_HOME/plugins/<id>/<ver
 ## 维护官方插件
 
 官方插件继续使用独立 crate、独立插件版本和独立 `api_version`。版本、ABI、说明和依赖只维护在
-各插件的 `plugin.toml`；构建、安装器同步和发布打包共享
+各插件的 `plugin.toml`；构建和发布打包共享
 `registry/official-plugins.json`，不会把 Lucia 程序版本与插件版本联动。
 
 发布步骤：
@@ -91,14 +91,12 @@ lucia plugin unselect agent.context-loader
 
 ## 运行时加载
 
-普通 `lucia` 启动按以下优先级合并插件：
+普通 `lucia` 启动只按以下优先级合并用户明确选择的插件：
 
 1. `--plugin-manifest` 和配置文件 `[[plugins]]`。
 2. `lucia plugin install` 管理的已启用插件。
-3. 安装器同步到 `$LUCIA_HOME/official-plugins` 的官方插件。
-
 同 ID 的高优先级声明覆盖低优先级来源。配置文件中的 `disabled_plugins` 最后生效，按插件
-ID 从最终组合中剔除任意来源的插件（含官方自动发现）：
+ID 从最终组合中剔除任意来源的插件：
 
 ```toml
 disabled_plugins = ["teammate", "plan"]

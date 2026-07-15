@@ -505,21 +505,11 @@ async fn inspect_plugins(
         }
     }
     if let Ok(runtime) = manager.runtime_config() {
-        merge_official_plugin_manifests(&mut manifests, runtime.manifest_paths);
+        merge_plugin_manifests(&mut manifests, runtime.manifest_paths);
         for (capability, owner) in runtime.capability_selection {
             selections.entry(capability).or_insert(owner);
         }
     }
-    match discover_official_plugin_manifests(lucia_home) {
-        Ok(official) => merge_official_plugin_manifests(&mut manifests, official),
-        Err(error) => report.push(
-            "plugins",
-            "official",
-            CheckStatus::Error,
-            format!("官方插件目录检查失败：{error:#}"),
-        ),
-    }
-
     let loaded = manifests
         .iter()
         .map(PluginManifest::load)
