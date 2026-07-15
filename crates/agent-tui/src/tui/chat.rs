@@ -72,10 +72,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
             let mut spans = vec![
                 Span::styled(format!("{spinner} "), Style::new().fg(COLOR_WARNING)),
-                Span::styled(
-                    app.locale.select("Working...", "处理中..."),
-                    Style::new().fg(COLOR_MUTED),
-                ),
+                Span::styled(app.locale.t("run.working"), Style::new().fg(COLOR_MUTED)),
             ];
             // 运行耗时随 UI tick 刷新，长任务时可感知进展。
             if let Some(started) = app.run_started_at {
@@ -118,10 +115,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         if let Some(position) = app.scroll {
             let below = max_scroll.saturating_sub(position);
             if below > 0 && chat_area.height > 0 {
-                let hint = match app.locale {
-                    Locale::English => format!(" ↓ {below} lines "),
-                    Locale::SimplifiedChinese => format!(" ↓ {below} 行 "),
-                };
+                let hint = app
+                    .locale
+                    .t_args("chat.scroll_below", &[("count", &below.to_string())]);
                 let hint_width = unicode_width::UnicodeWidthStr::width(hint.as_str()) as u16;
                 let width = hint_width.min(chat_area.width);
                 let hint_area = Rect {
@@ -171,9 +167,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         .padding(Padding::new(1, 1, 0, 0));
     // 插件渐进加载不会阻塞输入，只有 Agent 运行状态占用输入盒标题。
     let state_title = if app.running {
-        app.locale
-            .select(" Running · Esc to stop ", " 运行中 · Esc 中断 ")
-            .to_string()
+        app.locale.t("input.title_running").to_string()
     } else {
         String::new()
     };
@@ -184,10 +178,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
 
     if app.input.is_empty() {
         let placeholder = if app.running {
-            app.locale
-                .select("Steer the current run...", "向当前运行补充指令...")
+            app.locale.t("input.placeholder_steering")
         } else {
-            app.locale.select("Message Lucia...", "给 Lucia 发消息...")
+            app.locale.t("input.placeholder_idle")
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -529,24 +522,14 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str, locale: Locale) {
     )));
     lines.push(Line::default());
     // 键位列右对齐、说明列按显示宽度补齐，保证整行居中后两列仍纵向对齐。
-    let shortcuts = match locale {
-        Locale::English => [
-            ("Enter", "Send message"),
-            ("Ctrl+J", "Insert newline"),
-            ("Esc", "Stop / clear / exit"),
-            ("PgUp/PgDn", "Scroll history"),
-            ("Ctrl+P", "Recall input"),
-            ("Ctrl+Y", "Copy last reply"),
-        ],
-        Locale::SimplifiedChinese => [
-            ("Enter", "发送消息"),
-            ("Ctrl+J", "插入换行"),
-            ("Esc", "中断 / 清空 / 退出"),
-            ("PgUp/PgDn", "滚动历史"),
-            ("Ctrl+P", "历史输入回溯"),
-            ("Ctrl+Y", "复制最近回复"),
-        ],
-    };
+    let shortcuts = [
+        ("Enter", locale.t("hero.send")),
+        ("Ctrl+J", locale.t("hero.newline")),
+        ("Esc", locale.t("hero.stop")),
+        ("PgUp/PgDn", locale.t("hero.scroll")),
+        ("Ctrl+P", locale.t("hero.recall")),
+        ("Ctrl+Y", locale.t("hero.copy")),
+    ];
     for (key, action) in shortcuts {
         let pad = 18usize.saturating_sub(unicode_width::UnicodeWidthStr::width(action));
         lines.push(Line::from(vec![

@@ -2,6 +2,8 @@
 
 Lucia 提供三个打包形态：Core 库、纯 Core TUI 与插件版 TUI。常规 TUI 构建默认启用插件系统；纯 Core 形态通过 `--no-default-features` 排除 Plugin Host 和 Wasmtime。
 
+界面文案采用键值语言包（`crates/agent-tui/locales/*.toml`）：英文包始终嵌入，简体中文包由默认开启的 `lang-zh-cn` feature 控制。任何形态缺失语言包时按「当前语言 → 英文 → key」回退，界面始终正常显示；纯 Core 形态可通过 `--no-default-features --features lang-zh-cn` 单独加回中文。
+
 ## Core 库
 
 ```bash

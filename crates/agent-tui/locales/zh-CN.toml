@@ -1,0 +1,71 @@
+# Lucia TUI 简体中文语言包：仅在启用 `lang-zh-cn` feature 时嵌入。
+# key 必须与 en.toml 一一对应；缺失的 key 在运行时自动回退英文。
+
+"config.created" = "已创建 Lucia 配置"
+"config.init_hint" = "填写 model.api_key（或配置 model.api_key_env）并确认 model.model 后即可运行 lucia"
+"config.not_found" = "配置文件不存在"
+"config.default_created" = "已创建默认配置"
+
+"demo.local_notice" = "当前使用本地演示模型，不会连接外部模型服务"
+"demo.key_hint_env" = "设置环境变量"
+"demo.key_hint_config" = "在配置中设置 model.api_key 或 model.api_key_env"
+"demo.no_key_notice" = "未检测到模型密钥，当前使用本地演示模型；{key_hint} 后重新运行 lucia"
+
+"run.working" = "处理中..."
+"run.steering_applied" = "插话已生效"
+"run.steering_queued" = "插话已排队，将在当前工具完成后生效"
+"run.follow_up_started" = "追加任务开始"
+"run.cancelling" = "正在取消当前运行..."
+"run.cancelled_preserved" = "本轮运行已取消，已生成内容保留"
+"run.steps_label" = "步"
+
+"input.title_running" = " 运行中 · Esc 中断 "
+"input.placeholder_steering" = "向当前运行补充指令..."
+"input.placeholder_idle" = "给 Lucia 发消息..."
+"input.command_running" = "命令仍在执行中，请稍候再发送消息"
+"input.attachment_during_run" = "运行中无法发送附件，请等待本轮完成后再提交"
+
+"chat.scroll_below" = " ↓ {count} 行 "
+"chat.tool_render_failed" = "工具消息 `{call_id}` 渲染失败：{error}"
+
+"hero.send" = "发送消息"
+"hero.newline" = "插入换行"
+"hero.stop" = "中断 / 清空 / 退出"
+"hero.scroll" = "滚动历史"
+"hero.recall" = "历史输入回溯"
+"hero.copy" = "复制最近回复"
+
+"attachment.read_failed" = "读取附件失败"
+"attachment.too_large" = "附件超过 {limit} MiB 上限：{path}"
+
+"copy.empty" = "没有可复制的助手回复"
+"copy.done" = "已复制最近一条回复到剪贴板"
+"copy.failed" = "复制失败"
+
+"mouse.capture_on" = "已恢复鼠标捕获与滚轮滚动"
+"mouse.capture_off" = "已暂停鼠标捕获：现在可用鼠标选择并复制文本，Ctrl+T 恢复"
+
+"context.no_loader" = "当前没有就绪的上下文加载器，无法重载会话上下文"
+"context.reload_failed" = "重载会话上下文失败"
+
+"plugin.status_loading" = "正在加载插件"
+"plugin.status_loaded" = "插件加载完成"
+"plugin.status_partial" = "插件部分加载"
+"plugin.status_none" = "未加载插件"
+"plugin.status_failed" = "插件加载失败"
+"plugin.status_ready_count" = " · 已就绪 {count}"
+"plugin.failure_detail" = "{plugin_id}: 加载失败{blocked} · {reason}"
+"plugin.failure_deps" = "，依赖 {list}"
+"plugin.load_plan_failed" = "插件加载规划失败，已保留当前 Ready 插件"
+"plugin.event_failed" = "插件事件处理失败"
+"plugin.ui_event_failed" = "插件 UI 事件处理失败"
+"plugin.ui_error" = "插件界面错误"
+"plugin.ui_decl_refresh_failed" = "插件 UI 声明刷新失败"
+"plugin.view_nav_failed" = "插件视图导航失败"
+"plugin.view_loading" = "正在加载视图..."
+"plugin.esc_back" = "  Esc 返回"
+"plugin.session_query_unavailable" = "插件 `{plugin_id}` 在会话查询完成前已不可用"
+"plugin.session_query_send_failed" = "回送会话查询结果失败"
+"plugin.host_shutdown_timeout" = "插件宿主卸载超时"
+
+"common.list_separator" = "、"

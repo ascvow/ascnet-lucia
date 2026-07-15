@@ -9,7 +9,10 @@ description = "Lucia ReAct 智能体的交互式终端界面。"
 [features]
 # Regular builds include plugins; use `--no-default-features` for the isolated Core binary.
 # 常规构建默认提供插件能力；纯 Core 产物使用 `--no-default-features` 保持依赖边界。
-default = ["plugins"]
+default = ["plugins", "lang-zh-cn"]
+# 简体中文语言包；未打包时界面自动回退英文，功能不受影响。
+# 纯 Core 产物可用 `--no-default-features --features lang-zh-cn` 单独加回中文。
+lang-zh-cn = []
 plugins = [
     "dep:agent-plugin-protocol",
     "dep:agent-plugin-host",

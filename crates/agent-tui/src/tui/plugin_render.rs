@@ -178,7 +178,7 @@ pub(crate) fn render_plugin_subview(frame: &mut Frame, app: &mut App, outer: Rec
         Paragraph::new(Line::from(vec![
             Span::styled(breadcrumbs, Style::new().fg(COLOR_TEXT).bold()),
             Span::styled(
-                app.locale.select("  Esc Back", "  Esc 返回"),
+                app.locale.t("plugin.esc_back"),
                 Style::new().fg(COLOR_MUTED),
             ),
         ])),
@@ -199,7 +199,7 @@ pub(crate) fn render_plugin_subview(frame: &mut Frame, app: &mut App, outer: Rec
         .map(plugin_frame_lines)
         .unwrap_or_else(|| {
             vec![Line::from(Span::styled(
-                app.locale.select("Loading view...", "正在加载视图..."),
+                app.locale.t("plugin.view_loading"),
                 Style::new().fg(COLOR_MUTED),
             ))]
         });

@@ -1,0 +1,72 @@
+# Lucia TUI 英文语言包：作为回退基线始终嵌入二进制。
+# key 使用点分层级并加引号保持扁平结构；占位符使用 {name} 形式。
+# 新增文案必须先在本文件登记，其他语言缺失该 key 时回退到这里。
+
+"config.created" = "Created Lucia configuration"
+"config.init_hint" = "Set model.api_key (or model.api_key_env), confirm model.model, then run lucia"
+"config.not_found" = "Configuration file not found"
+"config.default_created" = "Created default configuration"
+
+"demo.local_notice" = "Using the local demo model; no external model service will be contacted"
+"demo.key_hint_env" = "set environment variable"
+"demo.key_hint_config" = "set model.api_key or model.api_key_env in the configuration"
+"demo.no_key_notice" = "No model key detected; using the local demo model. {key_hint}, then restart lucia"
+
+"run.working" = "Working..."
+"run.steering_applied" = "Steering applied"
+"run.steering_queued" = "Steering queued; it will be applied after the current tool finishes"
+"run.follow_up_started" = "Follow-up started"
+"run.cancelling" = "Cancelling the current run..."
+"run.cancelled_preserved" = "Run cancelled; generated content was preserved"
+"run.steps_label" = "steps"
+
+"input.title_running" = " Running · Esc to stop "
+"input.placeholder_steering" = "Steer the current run..."
+"input.placeholder_idle" = "Message Lucia..."
+"input.command_running" = "The command is still running. Try again shortly."
+"input.attachment_during_run" = "Attachments cannot be sent during a run. Wait for it to finish."
+
+"chat.scroll_below" = " ↓ {count} lines "
+"chat.tool_render_failed" = "Failed to render tool message `{call_id}`: {error}"
+
+"hero.send" = "Send message"
+"hero.newline" = "Insert newline"
+"hero.stop" = "Stop / clear / exit"
+"hero.scroll" = "Scroll history"
+"hero.recall" = "Recall input"
+"hero.copy" = "Copy last reply"
+
+"attachment.read_failed" = "Failed to read attachment"
+"attachment.too_large" = "Attachment exceeds the {limit} MiB limit: {path}"
+
+"copy.empty" = "No assistant reply to copy"
+"copy.done" = "Copied the latest reply to the clipboard"
+"copy.failed" = "Copy failed"
+
+"mouse.capture_on" = "Mouse capture and wheel scrolling restored"
+"mouse.capture_off" = "Mouse capture paused: select text normally; press Ctrl+T to restore"
+
+"context.no_loader" = "No context loader is ready; the session context cannot be reloaded"
+"context.reload_failed" = "Failed to reload session context"
+
+"plugin.status_loading" = "Loading plugins"
+"plugin.status_loaded" = "Plugins loaded"
+"plugin.status_partial" = "Plugins partially loaded"
+"plugin.status_none" = "No plugins loaded"
+"plugin.status_failed" = "Plugin loading failed"
+"plugin.status_ready_count" = " · {count} ready"
+"plugin.failure_detail" = "{plugin_id}: load failed{blocked} · {reason}"
+"plugin.failure_deps" = "; depends on {list}"
+"plugin.load_plan_failed" = "Plugin load planning failed; currently ready plugins were retained"
+"plugin.event_failed" = "Failed to process plugin event"
+"plugin.ui_event_failed" = "Failed to process plugin UI event"
+"plugin.ui_error" = "Plugin UI error"
+"plugin.ui_decl_refresh_failed" = "Failed to refresh plugin UI declarations"
+"plugin.view_nav_failed" = "Plugin view navigation failed"
+"plugin.view_loading" = "Loading view..."
+"plugin.esc_back" = "  Esc Back"
+"plugin.session_query_unavailable" = "Plugin `{plugin_id}` became unavailable before the session query completed"
+"plugin.session_query_send_failed" = "Failed to return session query results"
+"plugin.host_shutdown_timeout" = "Plugin Host shutdown timed out"
+
+"common.list_separator" = ", "

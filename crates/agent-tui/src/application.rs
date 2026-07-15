@@ -34,18 +34,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let config_path = resolve_config_path(args.config.as_deref())?;
     if args.init {
         initialize_config(&config_path)?;
-        println!(
-            "{}: {}",
-            locale.select("Created Lucia configuration", "已创建 Lucia 配置"),
-            config_path.display()
-        );
-        println!(
-            "{}",
-            locale.select(
-                "Set model.api_key (or model.api_key_env), confirm model.model, then run lucia",
-                "填写 model.api_key（或配置 model.api_key_env）并确认 model.model 后即可运行 lucia",
-            )
-        );
+        println!("{}: {}", locale.t("config.created"), config_path.display());
+        println!("{}", locale.t("config.init_hint"));
         return Ok(());
     }
 
@@ -53,7 +43,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     if args.config.is_some() && !config_exists {
         return Err(anyhow!(
             "{}: {}",
-            locale.select("Configuration file not found", "配置文件不存在"),
+            locale.t("config.not_found"),
             config_path.display()
         ));
     }
@@ -143,12 +133,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             gateway,
             options,
             true,
-            vec![locale
-                .select(
-                    "Using the local demo model; no external model service will be contacted",
-                    "当前使用本地演示模型，不会连接外部模型服务",
-                )
-                .to_string()],
+            vec![locale.t("demo.local_notice").to_string()],
         )
     } else if config_exists {
         let config = AgentRootConfig::load(&config_path)?;
@@ -164,33 +149,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 .model
                 .api_key_env
                 .as_deref()
-                .map(|name| {
-                    format!(
-                        "{} {name}",
-                        locale.select("set environment variable", "设置环境变量")
-                    )
-                })
-                .unwrap_or_else(|| {
-                    locale
-                        .select(
-                            "set model.api_key or model.api_key_env in the configuration",
-                            "在配置中设置 model.api_key 或 model.api_key_env",
-                        )
-                        .to_string()
-                });
+                .map(|name| format!("{} {name}", locale.t("demo.key_hint_env")))
+                .unwrap_or_else(|| locale.t("demo.key_hint_config").to_string());
             let (gateway, options) = build_demo_gateway();
             (
                 gateway,
                 options,
                 true,
-                vec![match locale {
-                    Locale::English => format!(
-                        "No model key detected; using the local demo model. {key_hint}, then restart lucia"
-                    ),
-                    Locale::SimplifiedChinese => format!(
-                        "未检测到模型密钥，当前使用本地演示模型；{key_hint} 后重新运行 lucia"
-                    ),
-                }],
+                vec![locale.t_args("demo.no_key_notice", &[("key_hint", &key_hint)])],
             )
         }
     } else {
@@ -202,7 +168,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             0,
             format!(
                 "{}: {}",
-                locale.select("Created default configuration", "已创建默认配置"),
+                locale.t("config.default_created"),
                 config_path.display()
             ),
         );
@@ -369,10 +335,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                             MsgKind::Error,
                                             format!(
                                                 "{}: {error}",
-                                                locale.select(
-                                                    "Failed to process plugin UI event",
-                                                    "插件 UI 事件处理失败"
-                                                )
+                                                locale.t("plugin.ui_event_failed")
                                             ),
                                         ));
                                     }
@@ -405,13 +368,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         if let Err(error) = apply_plugin_navigation_event(&mut app, event) {
                             app.messages.push(Msg::new(
                                 MsgKind::Error,
-                                format!(
-                                    "{}: {error}",
-                                    locale.select(
-                                        "Plugin view navigation failed",
-                                        "插件视图导航失败"
-                                    )
-                                ),
+                                format!("{}: {error}", locale.t("plugin.view_nav_failed")),
                             ));
                         }
                     }
@@ -423,13 +380,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                             }
                             Err(error) => app.messages.push(Msg::new(
                                 MsgKind::Error,
-                                format!(
-                                    "{}: {error}",
-                                    locale.select(
-                                        "Failed to refresh plugin UI declarations",
-                                        "插件 UI 声明刷新失败"
-                                    )
-                                ),
+                                format!("{}: {error}", locale.t("plugin.ui_decl_refresh_failed")),
                             )),
                         }
                         app.schedule_plugin_views_refresh(Arc::clone(host));
@@ -459,13 +410,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     app.set_progressive_plugin_load_error(&error);
                     app.messages.push(Msg::new(
                         MsgKind::Error,
-                        format!(
-                            "{}: {error}",
-                            locale.select(
-                                "Plugin load planning failed; currently ready plugins were retained",
-                                "插件加载规划失败，已保留当前 Ready 插件"
-                            )
-                        ),
+                        format!("{}: {error}", locale.t("plugin.load_plan_failed")),
                     ));
                 }
             },
@@ -490,24 +435,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         }
                         Ok(None) => app.messages.push(Msg::new(
                             MsgKind::Error,
-                            match locale {
-                                Locale::English => format!(
-                                    "Plugin `{plugin_id}` became unavailable before the session query completed"
-                                ),
-                                Locale::SimplifiedChinese => {
-                                    format!("插件 `{plugin_id}` 在会话查询完成前已不可用")
-                                }
-                            },
+                            locale.t_args(
+                                "plugin.session_query_unavailable",
+                                &[("plugin_id", &plugin_id)],
+                            ),
                         )),
                         Err(error) => app.messages.push(Msg::new(
                             MsgKind::Error,
-                            format!(
-                                "{}: {error}",
-                                locale.select(
-                                    "Failed to return session query results",
-                                    "回送会话查询结果失败"
-                                )
-                            ),
+                            format!("{}: {error}", locale.t("plugin.session_query_send_failed")),
                         )),
                     }
                 }
@@ -575,16 +510,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 result,
             }) => app.apply_tool_frame(&call_id, revision, width, result),
             Some(UiEvent::SteeringInjected) => {
-                app.messages.push(Msg::new(
-                    MsgKind::Info,
-                    locale.select("Steering applied", "插话已生效"),
-                ));
+                app.messages
+                    .push(Msg::new(MsgKind::Info, locale.t("run.steering_applied")));
             }
             Some(UiEvent::FollowUpInjected) => {
-                app.messages.push(Msg::new(
-                    MsgKind::Info,
-                    locale.select("Follow-up started", "追加任务开始"),
-                ));
+                app.messages
+                    .push(Msg::new(MsgKind::Info, locale.t("run.follow_up_started")));
             }
             Some(UiEvent::Extension {
                 text,
@@ -598,10 +529,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 if let Err(error) = app.apply_view_navigation(&plugin_id, request) {
                     app.messages.push(Msg::new(
                         MsgKind::Error,
-                        format!(
-                            "{}: {error}",
-                            locale.select("Plugin view navigation failed", "插件视图导航失败")
-                        ),
+                        format!("{}: {error}", locale.t("plugin.view_nav_failed")),
                     ));
                 }
             }
@@ -616,10 +544,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     if let Err(error) = drain_plugin_ui_events(&mut app, host).await {
                         app.messages.push(Msg::new(
                             MsgKind::Error,
-                            format!(
-                                "{}: {error}",
-                                locale.select("Failed to process plugin event", "插件事件处理失败")
-                            ),
+                            format!("{}: {error}", locale.t("plugin.event_failed")),
                         ));
                     }
                 }
@@ -679,13 +604,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                 if let Err(error) = drain_plugin_ui_events(&mut app, host).await {
                                     app.messages.push(Msg::new(
                                         MsgKind::Error,
-                                        format!(
-                                            "{}: {error}",
-                                            locale.select(
-                                                "Failed to process plugin UI event",
-                                                "插件 UI 事件处理失败"
-                                            )
-                                        ),
+                                        format!("{}: {error}", locale.t("plugin.ui_event_failed")),
                                     ));
                                 }
                                 refresh_plugin_views_for(&mut app, host.as_ref(), &input.plugin_id)
@@ -746,9 +665,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         match tokio::time::timeout(std::time::Duration::from_secs(5), host.shutdown()).await {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(error),
-            Err(_) => Some(anyhow!(
-                locale.select("Plugin Host shutdown timed out", "插件宿主卸载超时")
-            )),
+            Err(_) => Some(anyhow!(locale.t("plugin.host_shutdown_timeout"))),
         }
     } else {
         None
@@ -779,11 +696,7 @@ async fn forward_main_input_snapshot(app: &mut App, plugin_host: &Arc<LivePlugin
     if let Err(error) = drain_plugin_ui_events(app, plugin_host).await {
         app.messages.push(Msg::new(
             MsgKind::Error,
-            format!(
-                "{}: {error}",
-                app.locale
-                    .select("Failed to process plugin UI event", "插件 UI 事件处理失败")
-            ),
+            format!("{}: {error}", app.locale.t("plugin.ui_event_failed")),
         ));
     }
     refresh_plugin_view(app, plugin_host.as_ref(), &input.plugin_id, &input.view_id).await;
