@@ -92,6 +92,7 @@ impl AgentPlugin for SandboxPlugin {
                 height: Some(6),
             },
             focusable: true,
+            input_triggers: Vec::new(),
         }]
     }
 

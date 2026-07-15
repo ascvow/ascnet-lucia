@@ -679,6 +679,10 @@ pub struct CapabilitySection {
     #[serde(default)]
     pub model_completion: bool,
 
+    /// 插件是否可以发布 `ui.host.action` 事件驱动宿主应用级动作。
+    #[serde(default)]
+    pub surface_actions: bool,
+
     /// 插件是否希望通过宿主 API 执行进程。
     #[serde(default)]
     pub process_exec: bool,

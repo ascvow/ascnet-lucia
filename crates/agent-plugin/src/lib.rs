@@ -75,6 +75,11 @@ pub enum UiPlacement {
     /// A full-screen subview type whose instances are created by navigation requests.
     /// 替换主视图的全屏子视图类型，由导航请求创建实例。
     Subview,
+    /// 渲染在主输入区上方的触发面板。
+    ///
+    /// 仅当视图声明的某个输入触发前缀处于激活状态且帧可见时显示，
+    /// 供插件在用户键入期间展示候选或预览内容。
+    InputPanel,
 }
 
 /// 插件界面期望尺寸，宿主可按终端空间缩小该尺寸。
@@ -104,6 +109,13 @@ pub struct UiDeclaration {
     /// 视图是否可以通过 Tab 或模态焦点接收输入。
     #[serde(default)]
     pub focusable: bool,
+    /// 主输入触发前缀。
+    ///
+    /// 主输入去除前导空白后以任一前缀开头时该前缀激活：宿主把主输入快照
+    /// 与无修饰的 Tab、Enter、方向键、Esc 手势转发给该视图，并按
+    /// [`UiPlacement::InputPanel`] 规则渲染。空列表表示视图不参与主输入。
+    #[serde(default)]
+    pub input_triggers: Vec<String>,
 }
 
 /// 宿主请求插件渲染一帧时提供的上下文。
@@ -180,6 +192,124 @@ pub struct UiNavigationRequest {
 /// Stable extension event name used for plugin view navigation.
 /// 插件视图导航使用的稳定扩展事件名。
 pub const UI_NAVIGATION_EVENT: &str = "ui.view.navigation";
+
+/// Stable extension event name used for host-level surface actions.
+/// 插件请求宿主应用级动作使用的稳定扩展事件名。
+///
+/// 只有 manifest 声明 `surface_actions` 能力的插件可以发布该事件。
+pub const UI_HOST_ACTION_EVENT: &str = "ui.host.action";
+
+/// An idempotent host action request sent by a plugin.
+/// 插件发送给宿主应用的幂等动作请求。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiHostActionRequest {
+    /// 插件内单调或随机的请求 ID，用于忽略重复交付。
+    pub request_id: String,
+    /// 宿主需执行的应用级动作。
+    pub action: UiHostAction,
+}
+
+/// 宿主向插件公开的受控应用级动作词汇表。
+///
+/// 动作全部对应宿主自身的基础能力，不携带任何插件业务语义。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum UiHostAction {
+    /// 替换主输入框内容与光标。
+    SetInput {
+        /// 新的完整输入文本。
+        text: String,
+        /// UTF-8 字节光标；缺失时置于文本末尾。
+        #[serde(default)]
+        cursor: Option<u32>,
+    },
+    /// 结束当前会话并进入新的空白草稿。
+    NewSession,
+    /// 清空当前会话上下文并进入新的空白草稿。
+    ClearSession,
+    /// 通过已注册的上下文加载器立即重载并持久化当前会话上下文。
+    ReloadContext {
+        /// 后台进行期间展示的可选进度标签。
+        #[serde(default)]
+        label: Option<String>,
+    },
+    /// 正常退出宿主应用。
+    Exit,
+    /// 恢复当前项目内用户确认选中的会话。
+    ResumeSession {
+        /// 待恢复会话 ID。
+        session_id: String,
+        /// 选择时看到的修订号，供宿主进行并发校验。
+        revision: u64,
+    },
+    /// 异步查询当前项目的一页会话摘要。
+    ///
+    /// 宿主完成查询后调用发起插件的 `reply_service` 服务，
+    /// 载荷为 [`UiSessionsReply`]。
+    QuerySessions {
+        /// 用于丢弃过期应答的插件内单调查询 ID。
+        query_id: u64,
+        /// 不区分大小写的用户过滤文本。
+        query: String,
+        /// 可选分页游标。
+        #[serde(default)]
+        cursor: Option<String>,
+        /// 本次查询最多返回的摘要数量。
+        limit: u16,
+        /// 接收应答的发起插件服务名。
+        reply_service: String,
+    },
+}
+
+/// 宿主完成一次会话查询后回送插件的应答。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiSessionsReply {
+    /// 对应 [`UiHostAction::QuerySessions`] 的查询 ID。
+    pub query_id: u64,
+    /// 查询结果状态。
+    pub status: UiSessionListStatus,
+}
+
+/// 会话查询的结果状态。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UiSessionListStatus {
+    /// 已取得一页会话摘要。
+    Ready {
+        /// 当前页会话摘要。
+        items: Vec<UiSessionSummary>,
+        /// 下一页游标；为空表示没有更多结果。
+        next_cursor: Option<String>,
+    },
+    /// 当前查询没有匹配会话。
+    Empty,
+    /// 查询失败但插件界面可保持交互。
+    Error {
+        /// 面向用户的错误说明。
+        message: String,
+    },
+}
+
+/// 会话查询返回的一条轻量摘要。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiSessionSummary {
+    /// 当前项目内稳定且唯一的会话 ID。
+    pub id: String,
+    /// 用于列表展示的会话标题。
+    pub title: String,
+    /// 会话当前保存的消息数量。
+    pub message_count: u64,
+    /// 最近更新时间的 Unix 毫秒时间戳。
+    pub updated_at_ms: u64,
+    /// 由宿主根据当前时间生成的短标签，例如“10 分钟前”。
+    #[serde(default)]
+    pub updated_label: String,
+    /// 用于恢复前并发校验的会话修订号。
+    pub revision: u64,
+    /// 是否为当前活动会话，活动会话不能重复恢复。
+    #[serde(default)]
+    pub active: bool,
+}
 
 /// 插件返回的一帧声明式终端内容。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -296,6 +426,13 @@ pub enum UiInputEvent {
         x: u16,
         /// 内容区纵坐标。
         y: u16,
+    },
+    /// 输入触发前缀激活期间宿主主输入框的内容快照。
+    MainInput {
+        /// 主输入框的完整文本。
+        text: String,
+        /// UTF-8 字节光标位置。
+        cursor: u32,
     },
 }
 
@@ -497,6 +634,15 @@ impl ExtensionEvent {
     pub fn view_navigation(request: UiNavigationRequest) -> Result<Self> {
         Ok(Self {
             name: UI_NAVIGATION_EVENT.to_string(),
+            data: serde_json::to_value(request)?,
+            presentation: None,
+        })
+    }
+
+    /// 创建一条宿主应用级动作事件；需要 manifest 声明 `surface_actions` 能力。
+    pub fn host_action(request: UiHostActionRequest) -> Result<Self> {
+        Ok(Self {
+            name: UI_HOST_ACTION_EVENT.to_string(),
             data: serde_json::to_value(request)?,
             presentation: None,
         })

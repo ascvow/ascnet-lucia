@@ -14,7 +14,6 @@ plugins = [
     "dep:agent-plugin-host",
     "dep:agent-plugin-manager",
     "dep:agent-runtime",
-    "dep:command-protocol",
 ]
 
 [dependencies]
@@ -28,7 +27,6 @@ agent-tool = { path = "../agent-tool" }
 async-trait.workspace = true
 base64.workspace = true
 clap.workspace = true
-command-protocol = { path = "../../examples/plugins/command-plugin/crates/command-protocol", optional = true }
 # bracketed-paste：接收终端粘贴事件，用于把拖入的文件路径转换为附件
 crossterm = { version = "0.28", features = ["bracketed-paste"] }
 futures-util.workspace = true

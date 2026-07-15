@@ -32,7 +32,10 @@ pub(crate) fn render_docked_plugin_views(frame: &mut Frame, app: &mut App, outer
                     .size
                     .width
                     .unwrap_or_else(|| default_plugin_width(placement)),
-                UiPlacement::Dialog | UiPlacement::Input | UiPlacement::Subview => 0,
+                UiPlacement::Dialog
+                | UiPlacement::Input
+                | UiPlacement::Subview
+                | UiPlacement::InputPanel => 0,
             };
             let (plugin_area, next_remaining) = split_plugin_area(remaining, placement, requested);
             remaining = next_remaining;
@@ -97,7 +100,10 @@ fn split_plugin_area(area: Rect, placement: UiPlacement, requested: u16) -> (Rec
                 Rect::new(area.x, area.y, area.width.saturating_sub(size), area.height),
             )
         }
-        UiPlacement::Dialog | UiPlacement::Input | UiPlacement::Subview => (Rect::default(), area),
+        UiPlacement::Dialog
+        | UiPlacement::Input
+        | UiPlacement::Subview
+        | UiPlacement::InputPanel => (Rect::default(), area),
     }
 }
 
@@ -209,6 +215,27 @@ fn plugin_frame_lines(plugin_frame: &PluginUiFrame) -> Vec<Line<'static>> {
             )
         })
         .collect()
+}
+
+/// 在输入区上方渲染触发激活的输入面板。
+pub(crate) fn render_input_panel(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(index) = app.visible_input_panel() else {
+        return;
+    };
+    if area.is_empty() {
+        return;
+    }
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
+        .padding(Padding::horizontal(1));
+    app.plugin_views[index].area = block.inner(area);
+    let lines = app.plugin_views[index]
+        .frame
+        .as_ref()
+        .map(plugin_frame_lines)
+        .unwrap_or_default();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// 用可见的 Input 插件视图替换主文本输入区。

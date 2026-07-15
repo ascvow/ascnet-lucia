@@ -16,10 +16,12 @@ pub(crate) use chat::render_main;
 #[cfg(feature = "plugins")]
 pub(crate) use plugin_bridge::{
     apply_plugin_frames, apply_plugin_navigation_event, dispatch_plugin_input,
-    drain_plugin_ui_events, refresh_plugin_view, render_plugin_views, PluginRenderResult,
+    drain_plugin_ui_events, refresh_plugin_view, refresh_plugin_views_for, render_plugin_views,
+    PluginRenderResult,
 };
 #[cfg(feature = "plugins")]
 pub(crate) use plugin_render::{
-    render_docked_plugin_views, render_plugin_dialog, render_plugin_input, render_plugin_subview,
+    render_docked_plugin_views, render_input_panel, render_plugin_dialog, render_plugin_input,
+    render_plugin_subview,
 };
 pub(crate) use root::render_root;

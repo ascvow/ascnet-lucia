@@ -12,6 +12,7 @@
 - `Left`
 - `Dialog`
 - `Subview`
+- `InputPanel`
 
 ```rust
 fn describe_ui(&self) -> Vec<UiDeclaration> {
@@ -22,6 +23,7 @@ fn describe_ui(&self) -> Vec<UiDeclaration> {
         placement: UiPlacement::Right,
         size: UiSize { width: Some(32), height: None },
         focusable: true,
+        input_triggers: Vec::new(),
     }]
 }
 ```
@@ -82,15 +84,21 @@ host.navigate_view(UiNavigationRequest {
 
 同一个插件重复提交相同 `request_id` 时不会重复导航。插件只能 `Replace` 或 `Pop` 自己当前激活的子视图；用户按 Esc 可以执行宿主级返回。重新 `Push` 已存在的同一实例会返回该实例并截断其后的导航层级。
 
-## Command 预览与会话 Dialog
+## 输入触发与输入面板
 
-官方 Command 插件把命令定义、参数说明和候选来源放在版本化快照中。TUI 在 Command 插件单独 Ready 后立即读取快照，不等待 MCP 等其他插件，并以低频后台请求同步运行期注册变化；用户输入 `/` 时直接在内存中筛选并展示命令摘要、详细说明和用法，不会逐键跨越 WASM 边界。命令名由本地快照补全；只有用户在参数位置显式按 Tab 时，TUI 才调用 `command.prepare-completion`，再按受控计划取得静态候选、`command-sdk` 动态回调候选或 Session 数据源候选。
+`UiDeclaration.input_triggers` 声明主输入触发前缀。主输入去除前导空白后以任一前缀开头时该前缀激活：宿主把主输入快照（`UiInputEvent::MainInput`，包含完整文本与 UTF-8 字节光标）与无修饰的 Tab、Enter、方向键、Esc 手势转发给该视图，并把 `InputPanel` 视图渲染在输入区上方。触发退出激活后面板整体消失，不依赖插件端状态；无任何插件声明触发前缀时，这些字符没有特殊语义，宿主行为与无插件形态一致。
 
-`/resume` 和 `/sessions` 会打开 Command 插件声明的 `command-session-dialog`。插件负责查询、加载、空结果、错误、选择和关闭状态；TUI 只向插件提供当前项目的分页 `SessionSummary`，并在收到 `resume_session` 副作用后校验 revision、加载完整记录。这样插件无法直接读取会话正文，也不会把 Session 存储契约耦合进 Plugin Host。
+官方 Command 插件用这一机制实现斜杠命令：它声明触发前缀 `/` 的补全弹层，自己维护命令快照、逐键筛选、参数候选与选中状态；第三方命令的动态候选与执行回调由插件直接经 `host-service-call` 调用 owner 服务完成，不经过宿主中转。
+
+## 宿主动作事件
+
+声明 `capabilities.surface_actions` 的插件可以发布 `ui.host.action` 扩展事件，请求宿主执行基础动作：替换主输入（`set_input`）、新建或清空会话、重载上下文（`reload_context`）、退出应用（`exit`）、恢复会话（`resume_session`）与异步会话查询（`query_sessions`）。请求携带插件内幂等 `request_id`，宿主忽略重复交付；`query_sessions` 完成后宿主调用发起插件的 `reply_service` 服务回送 `UiSessionsReply`。
+
+`/resume` 和 `/sessions` 会打开 Command 插件声明的 `command-session-dialog`。插件负责查询、加载、空结果、错误、选择和关闭状态；宿主只应答当前项目的分页会话摘要，并在收到 `resume_session` 动作后校验 revision、加载完整记录。这样插件无法直接读取会话正文，也不会把 Session 存储契约耦合进 Plugin Host。
 
 ## 启动插件状态
 
-插件版 TUI 会先显示首帧并立即开放 Agent，再在后台按依赖顺序渐进加载插件。Host 优先完成工具策略 owner，随后有限并发加载其余插件。加载期间提交普通消息会使用该轮开始时已经 Ready 的工具、提示和路由；本轮执行期间新 Ready 的插件不会改变模型能力，从下一条用户消息起自动可见。Command 尚未 Ready 时，斜杠命令保留在输入框，不会误发给模型。
+插件版 TUI 会先显示首帧并立即开放 Agent，再在后台按依赖顺序渐进加载插件。Host 优先完成工具策略 owner，随后有限并发加载其余插件。加载期间提交普通消息会使用该轮开始时已经 Ready 的工具、提示和路由；本轮执行期间新 Ready 的插件不会改变模型能力，从下一条用户消息起自动可见。触发前缀由插件声明，插件 Ready 前这些字符按普通文本处理。
 
 单个插件的 manifest、依赖或激活失败不会关闭整个插件系统。Host 仅剔除该插件以及必选依赖它的下游插件；可选依赖方和无关插件继续加载。底栏会实时显示待加载、已就绪和失败数量。只有重复稳定 ID、无法确定独占能力 owner 等全局配置错误才会终止后续规划，并保留此前已经 Ready 的插件。独占工具策略 owner 未 Ready 时，Host 会阻止工具调用，禁止利用异步加载窗口绕过策略。
 

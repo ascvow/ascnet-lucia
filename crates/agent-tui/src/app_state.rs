@@ -54,9 +54,9 @@ pub(crate) struct App {
     /// 当前回溯到的历史下标；`None` 表示正在编辑新输入。
     pub(crate) input_history_cursor: Option<usize>,
     pub(crate) running: bool,
-    /// 正在后台执行的斜杠命令原文；期间禁止提交消息或执行新命令。
+    /// 正在后台重载会话上下文时展示的进度标签；期间禁止提交新消息。
     #[cfg(feature = "plugins")]
-    pub(crate) pending_command: Option<String>,
+    pub(crate) pending_reload: Option<String>,
     /// 当前运行的起始时间，用于渲染运行耗时。
     pub(crate) run_started_at: Option<std::time::Instant>,
     pub(crate) should_quit: bool,
@@ -123,36 +123,12 @@ pub(crate) struct App {
     /// 主视图之上的插件子视图导航栈。
     #[cfg(feature = "plugins")]
     pub(crate) view_stack: ViewStack,
-    /// Command Provider 发布的只读命令快照。
+    /// 最近一次会话摘要查询任务；新查询会中止尚未完成的旧查询。
     #[cfg(feature = "plugins")]
-    pub(crate) command_snapshot: Option<CommandSnapshot>,
-    /// 当前命令预览中的选中项。
+    pub(crate) sessions_query_task: Option<tokio::task::JoinHandle<()>>,
+    /// 最近处理过的宿主动作请求，用于忽略插件的重复交付。
     #[cfg(feature = "plugins")]
-    pub(crate) command_selection: usize,
-    /// 用户按 Esc 后临时隐藏当前输入对应的命令预览。
-    #[cfg(feature = "plugins")]
-    pub(crate) command_preview_hidden: bool,
-    /// 最近一次会话摘要查询任务；新输入会中止尚未完成的旧查询。
-    #[cfg(feature = "plugins")]
-    pub(crate) command_query_task: Option<tokio::task::JoinHandle<()>>,
-    /// 控制运行期命令快照低频刷新。
-    #[cfg(feature = "plugins")]
-    pub(crate) command_snapshot_tick: u8,
-    /// 防止同一时间存在多个命令快照请求。
-    #[cfg(feature = "plugins")]
-    pub(crate) command_snapshot_refreshing: bool,
-    /// 当前输入可展示并选择的参数候选。
-    #[cfg(feature = "plugins")]
-    pub(crate) command_completion: Option<ResolvedCommandCompletion>,
-    /// 正在运行的显式参数候选请求；输入变化时会中止。
-    #[cfg(feature = "plugins")]
-    pub(crate) command_completion_task: Option<tokio::task::JoinHandle<()>>,
-    /// 参数候选请求是否尚未返回。
-    #[cfg(feature = "plugins")]
-    pub(crate) command_completion_loading: bool,
-    /// 用于丢弃取消后仍到达的过期参数候选。
-    #[cfg(feature = "plugins")]
-    pub(crate) command_completion_generation: u64,
+    pub(crate) applied_host_actions: VecDeque<(String, String)>,
 }
 
 /// 主 TUI 为单个插件视图维护的运行时状态。
@@ -194,7 +170,7 @@ impl App {
             input_history_cursor: None,
             running: false,
             #[cfg(feature = "plugins")]
-            pending_command: None,
+            pending_reload: None,
             run_started_at: None,
             should_quit: false,
             session_record,
@@ -238,25 +214,9 @@ impl App {
             #[cfg(feature = "plugins")]
             view_stack: ViewStack::default(),
             #[cfg(feature = "plugins")]
-            command_snapshot: None,
+            sessions_query_task: None,
             #[cfg(feature = "plugins")]
-            command_selection: 0,
-            #[cfg(feature = "plugins")]
-            command_preview_hidden: false,
-            #[cfg(feature = "plugins")]
-            command_query_task: None,
-            #[cfg(feature = "plugins")]
-            command_snapshot_tick: 0,
-            #[cfg(feature = "plugins")]
-            command_snapshot_refreshing: false,
-            #[cfg(feature = "plugins")]
-            command_completion: None,
-            #[cfg(feature = "plugins")]
-            command_completion_task: None,
-            #[cfg(feature = "plugins")]
-            command_completion_loading: false,
-            #[cfg(feature = "plugins")]
-            command_completion_generation: 0,
+            applied_host_actions: VecDeque::new(),
         }
     }
 
@@ -296,8 +256,6 @@ impl App {
         self.streaming_message = None;
         self.scroll = None;
         self.context_tokens = None;
-        #[cfg(feature = "plugins")]
-        self.clear_command_completion();
         if let Some(notice) = notice {
             self.messages.push(Msg::new(MsgKind::Info, notice));
         }
@@ -316,7 +274,7 @@ impl App {
     /// 处理说明由加载器插件发布的展示事件提供，这里只负责会话状态切换。
     #[cfg(feature = "plugins")]
     pub(crate) fn handle_session_context_reloaded(&mut self, result: Result<SessionReloadOutcome>) {
-        self.pending_command = None;
+        self.pending_reload = None;
         match result {
             Ok(SessionReloadOutcome::Replaced(saved)) => {
                 // 重载在后台完成，用户可能仍在编辑输入，替换会话后原样恢复。
@@ -544,82 +502,125 @@ impl App {
         }
     }
 
-    /// 替换 Command Provider 快照，并重置本地预览状态。
+    /// 返回主输入当前激活的触发视图索引。
+    ///
+    /// 主输入去除前导空白后以某个视图声明的触发前缀开头即视为激活；
+    /// 多个视图声明重叠前缀时按声明顺序取第一个。
     #[cfg(feature = "plugins")]
-    pub(crate) fn set_command_snapshot(&mut self, snapshot: Option<CommandSnapshot>) {
-        self.clear_command_completion();
-        self.command_snapshot = snapshot;
-        self.command_selection = 0;
-        self.command_preview_hidden = false;
-    }
-
-    /// 返回与当前斜杠输入匹配的命令定义。
-    #[cfg(feature = "plugins")]
-    pub(crate) fn command_matches(&self) -> Vec<CommandSpec> {
-        if self.command_preview_hidden {
-            return Vec::new();
+    pub(crate) fn active_trigger_view(&self) -> Option<usize> {
+        let input = self.input.trim_start();
+        if input.is_empty() {
+            return None;
         }
-        let Some(body) = self.input.strip_prefix('/') else {
-            return Vec::new();
-        };
-        let prefix = body.split_whitespace().next().unwrap_or_default();
-        let Some(snapshot) = &self.command_snapshot else {
-            return Vec::new();
-        };
-        snapshot
-            .commands
-            .iter()
-            .filter(|command| {
-                command.name.starts_with(prefix)
-                    || command
-                        .aliases
-                        .iter()
-                        .any(|alias| alias.starts_with(prefix))
-            })
-            .take(6)
-            .cloned()
-            .collect()
+        self.plugin_views.iter().position(|view| {
+            view.declaration
+                .input_triggers
+                .iter()
+                .any(|trigger| !trigger.is_empty() && input.starts_with(trigger.as_str()))
+        })
     }
 
-    /// 根据用户输入解析当前命令定义，仅用于宿主状态校验和展示。
+    /// 返回当前应显示在输入区上方的输入面板视图索引。
     #[cfg(feature = "plugins")]
-    pub(crate) fn command_spec_for_input(&self, input: &str) -> Option<&CommandSpec> {
-        let name = input
-            .trim()
-            .strip_prefix('/')?
-            .split_whitespace()
-            .next()?
-            .to_ascii_lowercase();
-        self.command_snapshot
-            .as_ref()?
-            .commands
-            .iter()
-            .find(|command| {
-                command.name == name || command.aliases.iter().any(|alias| alias == &name)
-            })
+    pub(crate) fn visible_input_panel(&self) -> Option<usize> {
+        let index = self.active_trigger_view()?;
+        let view = &self.plugin_views[index];
+        (view.declaration.placement == UiPlacement::InputPanel && plugin_view_visible(view))
+            .then_some(index)
     }
 
-    /// 启动可取消的后台会话摘要查询，并通过 UI 事件返回类型化结果。
+    /// 输入面板的布局高度：内容行数加顶部边框，受声明高度约束。
     #[cfg(feature = "plugins")]
-    pub(crate) fn start_command_query(
+    pub(crate) fn input_panel_height(&self) -> u16 {
+        let Some(index) = self.visible_input_panel() else {
+            return 0;
+        };
+        let view = &self.plugin_views[index];
+        let lines = view
+            .frame
+            .as_ref()
+            .map(|frame| frame.lines.len())
+            .unwrap_or(0);
+        if lines == 0 {
+            return 0;
+        }
+        let max = view.declaration.size.height.unwrap_or(8);
+        u16::try_from(lines)
+            .unwrap_or(max)
+            .saturating_add(1)
+            .min(max)
+    }
+
+    /// 构造发送给触发视图的主输入快照事件。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn main_input_snapshot(&self, index: usize) -> UiInput {
+        let declaration = &self.plugin_views[index].declaration;
+        UiInput {
+            plugin_id: declaration.plugin_id.clone(),
+            view_id: declaration.view_id.clone(),
+            instance_id: None,
+            event: UiInputEvent::MainInput {
+                text: self.input.clone(),
+                cursor: u32::try_from(self.cursor).unwrap_or(u32::MAX),
+            },
+        }
+    }
+
+    /// 记录一条宿主动作请求；返回 `false` 表示重复交付应被忽略。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn mark_host_action(&mut self, plugin_id: &str, request_id: &str) -> bool {
+        let key = (plugin_id.to_string(), request_id.to_string());
+        if self.applied_host_actions.contains(&key) {
+            return false;
+        }
+        if self.applied_host_actions.len() >= 64 {
+            self.applied_host_actions.pop_front();
+        }
+        self.applied_host_actions.push_back(key);
+        true
+    }
+
+    /// 按插件请求替换主输入内容与光标，并保持附件引用一致。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn set_main_input(&mut self, text: String, cursor: Option<u32>) {
+        self.input = text;
+        let cursor = cursor
+            .and_then(|cursor| usize::try_from(cursor).ok())
+            .unwrap_or(self.input.len())
+            .min(self.input.len());
+        // 光标落在字符中间时回退到最近的合法边界。
+        self.cursor = (0..=cursor)
+            .rev()
+            .find(|offset| self.input.is_char_boundary(*offset))
+            .unwrap_or(0);
+        self.input_history_cursor = None;
+        self.prune_attachments();
+    }
+
+    /// 启动可取消的后台会话摘要查询，结果经 UI 事件回送发起插件。
+    #[cfg(feature = "plugins")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_sessions_query(
         &mut self,
-        request_id: u64,
+        plugin_id: String,
+        reply_service: String,
+        query_id: u64,
         query: String,
         cursor: Option<String>,
         limit: u16,
     ) {
-        if let Some(task) = self.command_query_task.take() {
+        if let Some(task) = self.sessions_query_task.take() {
             task.abort();
         }
         let session_store = Arc::clone(&self.session_store);
         let active_session_id = self.session_record.id.clone();
         let tx = self.tx.clone();
-        self.command_query_task = Some(tokio::spawn(async move {
+        self.sessions_query_task = Some(tokio::spawn(async move {
             // 搜索输入短暂防抖，连续键入只扫描一次项目会话目录。
             if cursor.is_none() && !query.is_empty() {
                 tokio::time::sleep(std::time::Duration::from_millis(75)).await;
             }
-            let status = command_session_page(
+            let status = sessions_page(
                 session_store.as_ref(),
                 &active_session_id,
                 &query,
@@ -627,166 +628,12 @@ impl App {
                 limit,
             )
             .await;
-            let _ = tx.send(UiEvent::CommandSurfaceUpdate { request_id, status });
-        }));
-    }
-
-    /// 在后台低频刷新命令注册表，不让运行期注册或注销阻塞输入线程。
-    #[cfg(feature = "plugins")]
-    pub(crate) fn schedule_command_snapshot_refresh(&mut self, plugin_host: Arc<LivePluginHost>) {
-        if self.command_snapshot_refreshing
-            || !self
-                .plugin_ids
-                .iter()
-                .any(|plugin_id| plugin_id == PROVIDER_PLUGIN_ID)
-        {
-            return;
-        }
-        self.command_snapshot_refreshing = true;
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let result = load_command_snapshot(plugin_host.as_ref()).await;
-            let _ = tx.send(UiEvent::CommandSnapshotLoaded(Box::new(result)));
-        });
-    }
-
-    /// 清理参数候选并使尚未返回的旧请求失效。
-    #[cfg(feature = "plugins")]
-    pub(crate) fn clear_command_completion(&mut self) {
-        if let Some(task) = self.command_completion_task.take() {
-            task.abort();
-        }
-        self.command_completion = None;
-        self.command_completion_loading = false;
-        self.command_completion_generation = self.command_completion_generation.wrapping_add(1);
-    }
-
-    /// 在后台执行一次显式参数补全请求。
-    #[cfg(feature = "plugins")]
-    pub(crate) fn schedule_command_completion(&mut self, plugin_host: Arc<LivePluginHost>) {
-        self.clear_command_completion();
-        self.command_completion_loading = true;
-        let generation = self.command_completion_generation;
-        let source_input = self.input.clone();
-        let source_cursor = self.cursor;
-        let session_store = Arc::clone(&self.session_store);
-        let tx = self.tx.clone();
-        self.command_completion_task = Some(tokio::spawn(async move {
-            let result = resolve_command_completion(
-                plugin_host.as_ref(),
-                session_store.as_ref(),
-                source_input,
-                source_cursor,
-            )
-            .await;
-            let _ = tx.send(UiEvent::CommandCompletionLoaded {
-                generation,
-                result: Box::new(result),
+            let _ = tx.send(UiEvent::SessionsQueryDone {
+                plugin_id,
+                reply_service,
+                reply: Box::new(UiSessionsReply { query_id, status }),
             });
         }));
-    }
-
-    /// 将当前选中的参数候选写入 Provider 指定的 UTF-8 替换区间。
-    #[cfg(feature = "plugins")]
-    pub(crate) fn apply_selected_command_completion(&mut self) -> bool {
-        let Some(completion) = self.command_completion.as_ref() else {
-            return false;
-        };
-        if completion.source_input != self.input || completion.source_cursor != self.cursor {
-            self.clear_command_completion();
-            return false;
-        }
-        let start = usize::try_from(completion.context.replacement_start).ok();
-        let end = usize::try_from(completion.context.replacement_end).ok();
-        let selected = self
-            .command_selection
-            .min(completion.items.len().saturating_sub(1));
-        let Some((start, end, item)) = start.zip(end).and_then(|(start, end)| {
-            completion
-                .items
-                .get(selected)
-                .map(|item| (start, end, item))
-        }) else {
-            self.clear_command_completion();
-            return false;
-        };
-        if start > end
-            || end > self.input.len()
-            || !self.input.is_char_boundary(start)
-            || !self.input.is_char_boundary(end)
-        {
-            self.clear_command_completion();
-            return false;
-        }
-        let insert_text = item.insert_text.clone();
-        self.input.replace_range(start..end, &insert_text);
-        self.cursor = start + insert_text.len();
-        self.clear_command_completion();
-        self.command_selection = 0;
-        self.command_preview_hidden = false;
-        true
-    }
-
-    /// 在命令预览打开时处理选择、补全与关闭操作。
-    #[cfg(feature = "plugins")]
-    pub(crate) fn handle_command_preview_key(&mut self, code: KeyCode) -> bool {
-        let completion_len = self
-            .command_completion
-            .as_ref()
-            .map(|completion| completion.items.len())
-            .unwrap_or(0);
-        if completion_len > 0 {
-            return match code {
-                KeyCode::Up => {
-                    self.command_selection = self.command_selection.saturating_sub(1);
-                    true
-                }
-                KeyCode::Down => {
-                    self.command_selection =
-                        (self.command_selection + 1).min(completion_len.saturating_sub(1));
-                    true
-                }
-                KeyCode::Tab => self.apply_selected_command_completion(),
-                KeyCode::Esc => {
-                    self.clear_command_completion();
-                    self.command_preview_hidden = true;
-                    true
-                }
-                _ => false,
-            };
-        }
-
-        let matches = self.command_matches();
-        if matches.is_empty() {
-            return false;
-        }
-        match code {
-            KeyCode::Up => {
-                self.command_selection = self.command_selection.saturating_sub(1);
-                true
-            }
-            KeyCode::Down => {
-                self.command_selection =
-                    (self.command_selection + 1).min(matches.len().saturating_sub(1));
-                true
-            }
-            KeyCode::Tab => {
-                let body = self.input.strip_prefix('/').unwrap_or_default();
-                if body.chars().any(char::is_whitespace) {
-                    return false;
-                }
-                let selected = self.command_selection.min(matches.len().saturating_sub(1));
-                self.input = format!("/{} ", matches[selected].name);
-                self.cursor = self.input.len();
-                self.command_selection = 0;
-                true
-            }
-            KeyCode::Esc => {
-                self.command_preview_hidden = true;
-                true
-            }
-            _ => false,
-        }
     }
 
     pub(crate) fn handle_key(
@@ -832,11 +679,6 @@ impl App {
             return;
         }
 
-        #[cfg(feature = "plugins")]
-        if self.handle_command_preview_key(code) {
-            return;
-        }
-
         match code {
             KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
                 let start = previous_word_boundary(&self.input, self.cursor);
@@ -851,18 +693,14 @@ impl App {
             }
             KeyCode::Left if modifiers.contains(KeyModifiers::ALT) => {
                 self.cursor = previous_word_boundary(&self.input, self.cursor);
-                #[cfg(feature = "plugins")]
-                self.clear_command_completion();
             }
             KeyCode::Right if modifiers.contains(KeyModifiers::ALT) => {
                 self.cursor = next_word_boundary(&self.input, self.cursor);
-                #[cfg(feature = "plugins")]
-                self.clear_command_completion();
             }
             KeyCode::Enter => {
                 // 后台命令可能随时替换会话记录，期间禁止并发提交新消息。
                 #[cfg(feature = "plugins")]
-                if self.pending_command.is_some() {
+                if self.pending_reload.is_some() {
                     self.messages
                         .push(Msg::new(MsgKind::Info, "命令仍在执行中，请稍候再发送消息"));
                     return;
@@ -899,12 +737,6 @@ impl App {
                     self.cursor = 0;
                     self.input_history_cursor = None;
                     self.prune_attachments();
-                    #[cfg(feature = "plugins")]
-                    {
-                        self.clear_command_completion();
-                        self.command_selection = 0;
-                        self.command_preview_hidden = false;
-                    }
                 } else {
                     self.should_quit = true;
                 }
@@ -914,24 +746,18 @@ impl App {
             KeyCode::Up => {
                 if self.input_history_cursor.is_some() {
                     self.recall_older_input();
-                } else if self.input.contains('\n')
-                    && move_cursor_vertically(&self.input, &mut self.cursor, true)
+                } else if !(self.input.contains('\n')
+                    && move_cursor_vertically(&self.input, &mut self.cursor, true))
                 {
-                    #[cfg(feature = "plugins")]
-                    self.clear_command_completion();
-                } else {
                     self.scroll_up(1);
                 }
             }
             KeyCode::Down => {
                 if self.input_history_cursor.is_some() {
                     self.recall_newer_input();
-                } else if self.input.contains('\n')
-                    && move_cursor_vertically(&self.input, &mut self.cursor, false)
+                } else if !(self.input.contains('\n')
+                    && move_cursor_vertically(&self.input, &mut self.cursor, false))
                 {
-                    #[cfg(feature = "plugins")]
-                    self.clear_command_completion();
-                } else {
                     self.scroll_down(1);
                 }
             }
@@ -949,12 +775,6 @@ impl App {
                     self.prune_attachments();
                 }
                 self.finish_input_edit();
-                #[cfg(feature = "plugins")]
-                {
-                    self.clear_command_completion();
-                    self.command_selection = 0;
-                    self.command_preview_hidden = false;
-                }
             }
             KeyCode::Delete => {
                 if let Some(next) = self.input[self.cursor..].chars().next() {
@@ -967,31 +787,23 @@ impl App {
                 if let Some(prev) = self.input[..self.cursor].chars().last() {
                     self.cursor -= prev.len_utf8();
                 }
-                #[cfg(feature = "plugins")]
-                self.clear_command_completion();
             }
             KeyCode::Right => {
                 if let Some(next) = self.input[self.cursor..].chars().next() {
                     self.cursor += next.len_utf8();
                 }
-                #[cfg(feature = "plugins")]
-                self.clear_command_completion();
             }
             KeyCode::Home => {
                 // 多行输入时回到当前逻辑行行首；单行输入等价于整段开头。
                 self.cursor = self.input[..self.cursor]
                     .rfind('\n')
                     .map_or(0, |index| index + 1);
-                #[cfg(feature = "plugins")]
-                self.clear_command_completion();
             }
             KeyCode::End => {
                 // 多行输入时到当前逻辑行行尾；单行输入等价于整段末尾。
                 self.cursor = self.input[self.cursor..]
                     .find('\n')
                     .map_or(self.input.len(), |index| self.cursor + index);
-                #[cfg(feature = "plugins")]
-                self.clear_command_completion();
             }
             _ => {}
         }
@@ -1029,8 +841,20 @@ impl App {
             return PluginKeyRoute::Input(self.plugin_key_input(index, code, modifiers));
         }
 
-        if matches!(code, KeyCode::Tab) && self.input.trim_start().starts_with('/') {
-            return PluginKeyRoute::Main;
+        // 触发前缀激活时，无修饰的补全与提交手势交给触发视图处理；
+        // 方向键和 Esc 仅在输入面板可见时转发，避免面板隐藏后劫持滚动。
+        if let Some(index) = self.active_trigger_view() {
+            if modifiers.is_empty() {
+                let panel_visible = self.visible_input_panel() == Some(index);
+                let forward = match code {
+                    KeyCode::Tab | KeyCode::Enter => true,
+                    KeyCode::Up | KeyCode::Down | KeyCode::Esc => panel_visible,
+                    _ => false,
+                };
+                if forward {
+                    return PluginKeyRoute::Input(self.plugin_key_input(index, code, modifiers));
+                }
+            }
         }
 
         if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
@@ -1225,20 +1049,32 @@ impl App {
         requests
     }
 
-    /// 构造周期刷新请求，并跳过由用户操作定向刷新的隐藏 Command Dialog。
+    /// 构造周期刷新请求，并跳过触发前缀未激活的输入面板。
+    ///
+    /// 输入面板只随主输入快照与手势的定向刷新更新，周期渲染它没有意义。
     #[cfg(feature = "plugins")]
     pub(crate) fn periodic_plugin_render_requests(&mut self) -> Vec<UiRenderRequest> {
-        let command_dialog_hidden = self.plugin_views.iter().any(|view| {
-            view.declaration.plugin_id == PROVIDER_PLUGIN_ID
-                && view.declaration.view_id == SESSION_DIALOG_VIEW
-                && view.frame.as_ref().is_some_and(|frame| !frame.visible)
-        });
+        let inactive_panels = self
+            .plugin_views
+            .iter()
+            .enumerate()
+            .filter(|(index, view)| {
+                view.declaration.placement == UiPlacement::InputPanel
+                    && self.active_trigger_view() != Some(*index)
+            })
+            .map(|(_, view)| {
+                (
+                    view.declaration.plugin_id.clone(),
+                    view.declaration.view_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut requests = self.plugin_render_requests();
-        if command_dialog_hidden {
-            requests.retain(|request| {
-                request.plugin_id != PROVIDER_PLUGIN_ID || request.view_id != SESSION_DIALOG_VIEW
-            });
-        }
+        requests.retain(|request| {
+            !inactive_panels.iter().any(|(plugin_id, view_id)| {
+                &request.plugin_id == plugin_id && &request.view_id == view_id
+            })
+        });
         requests
     }
 
@@ -1320,7 +1156,7 @@ impl App {
         }
     }
 
-    /// 在当前光标处插入文本，并退出历史回溯态、同步附件与命令补全状态。
+    /// 在当前光标处插入文本，并退出历史回溯态、同步附件状态。
     fn insert_input_text(&mut self, text: &str) {
         self.input.insert_str(self.cursor, text);
         self.cursor += text.len();
@@ -1331,12 +1167,6 @@ impl App {
     fn finish_input_edit(&mut self) {
         self.input_history_cursor = None;
         self.prune_attachments();
-        #[cfg(feature = "plugins")]
-        {
-            self.clear_command_completion();
-            self.command_selection = 0;
-            self.command_preview_hidden = false;
-        }
     }
 
     /// 召回更早的一条输入；空历史保持当前编辑器不变。
@@ -1541,17 +1371,15 @@ impl App {
         self.messages.push(Msg::new(MsgKind::Info, notice));
     }
 
-    /// Takes and clears the current editor value, returning `None` for blank input.
+    /// 取出并清空当前编辑器内容；空白输入返回 `None`。
     ///
-    /// 取出并清空当前编辑器内容；空白输入返回 `None`。斜杠命令等纯文本路径
-    /// 不携带附件，残留附件一并清除，避免引用标签消失后附件悬挂。
+    /// steering 等纯文本路径不携带附件，残留附件一并清除，
+    /// 避免引用标签消失后附件悬挂。
     pub(crate) fn take_input(&mut self) -> Option<String> {
         let input = self.input.trim().to_string();
         self.input.clear();
         self.attachments.clear();
         self.cursor = 0;
-        #[cfg(feature = "plugins")]
-        self.clear_command_completion();
         if input.is_empty() {
             return None;
         }
@@ -1565,8 +1393,6 @@ impl App {
         let attachments = std::mem::take(&mut self.attachments);
         self.input.clear();
         self.cursor = 0;
-        #[cfg(feature = "plugins")]
-        self.clear_command_completion();
         if text.is_empty() && attachments.is_empty() {
             return None;
         }
@@ -1578,10 +1404,6 @@ impl App {
     ///
     /// 插件加载导致 Agent 尚不可用时，将一条完整输入加入 FIFO 队列。
     pub(crate) fn queue_input_until_ready(&mut self) {
-        // 斜杠命令必须等待官方插件完成加载，不能误入 Agent 消息队列。
-        if self.input.trim_start().starts_with('/') {
-            return;
-        }
         let Some(submission) = self.take_submission() else {
             return;
         };
@@ -1842,7 +1664,7 @@ pub(crate) fn default_plugin_width(placement: UiPlacement) -> u16 {
     match placement {
         UiPlacement::Left | UiPlacement::Right => 28,
         UiPlacement::Dialog | UiPlacement::Subview => 60,
-        UiPlacement::Input => 40,
+        UiPlacement::Input | UiPlacement::InputPanel => 40,
         UiPlacement::Top | UiPlacement::Bottom => 40,
     }
 }
@@ -1854,6 +1676,7 @@ pub(crate) fn default_plugin_height(placement: UiPlacement) -> u16 {
         UiPlacement::Top | UiPlacement::Bottom => 6,
         UiPlacement::Dialog | UiPlacement::Subview => 20,
         UiPlacement::Input => 3,
+        UiPlacement::InputPanel => 8,
         UiPlacement::Left | UiPlacement::Right => 10,
     }
 }

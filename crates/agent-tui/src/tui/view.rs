@@ -174,6 +174,7 @@ mod tests {
             placement: UiPlacement::Subview,
             size: UiSize::default(),
             focusable: true,
+            input_triggers: Vec::new(),
         }
     }
 

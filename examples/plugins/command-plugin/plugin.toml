@@ -7,7 +7,8 @@ wasm = "target/wasm32-wasip2/release/command_plugin.wasm"
 description = "提供斜杠命令注册、预览、执行和会话选择界面。"
 
 [capabilities]
-# 命令插件仅使用宿主服务与声明式 UI，不申请文件、网络、进程或密钥能力。
+# 命令插件通过通用宿主动作驱动会话切换、上下文重载与退出等应用级操作。
+surface_actions = true
 
 [metadata]
 surface_authority = "lucia-tui"

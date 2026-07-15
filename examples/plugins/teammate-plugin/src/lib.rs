@@ -1252,6 +1252,7 @@ impl AgentPlugin for TeammatePlugin {
                     height: None,
                 },
                 focusable: true,
+                input_triggers: Vec::new(),
             },
             UiDeclaration {
                 plugin_id: String::new(),
@@ -1260,6 +1261,7 @@ impl AgentPlugin for TeammatePlugin {
                 placement: UiPlacement::Subview,
                 size: UiSize::default(),
                 focusable: true,
+                input_triggers: Vec::new(),
             },
             UiDeclaration {
                 plugin_id: String::new(),
@@ -1268,6 +1270,7 @@ impl AgentPlugin for TeammatePlugin {
                 placement: UiPlacement::Subview,
                 size: UiSize::default(),
                 focusable: true,
+                input_triggers: Vec::new(),
             },
         ]
     }

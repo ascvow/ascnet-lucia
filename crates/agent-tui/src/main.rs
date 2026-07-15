@@ -3,10 +3,10 @@
 mod app_config;
 mod app_state;
 mod application;
-#[cfg(feature = "plugins")]
-mod command_surface;
 mod conversation;
 mod doctor;
+#[cfg(feature = "plugins")]
+mod host_actions;
 #[cfg(feature = "plugins")]
 mod plugin_cli;
 #[cfg(feature = "plugins")]
@@ -14,9 +14,9 @@ mod plugin_startup;
 mod session_coordination;
 mod tui;
 
-#[cfg(feature = "plugins")]
-use command_surface::*;
 use conversation::*;
+#[cfg(feature = "plugins")]
+use host_actions::*;
 #[cfg(feature = "plugins")]
 use plugin_startup::*;
 use session_coordination::*;
@@ -36,8 +36,10 @@ use agent_core::{
 use agent_plugin_host::{
     manifest::{load_plugin_runtime_config, PluginManifest},
     ui::{
-        UiColor, UiDeclaration, UiFrame as PluginUiFrame, UiInput, UiInputEvent, UiLine,
-        UiNavigationRequest, UiPlacement, UiRenderRequest, UiSpan, UiStyle, UI_NAVIGATION_EVENT,
+        UiColor, UiDeclaration, UiFrame as PluginUiFrame, UiHostAction, UiHostActionRequest,
+        UiInput, UiInputEvent, UiLine, UiNavigationRequest, UiPlacement, UiRenderRequest,
+        UiSessionListStatus, UiSessionSummary, UiSessionsReply, UiSpan, UiStyle,
+        UI_HOST_ACTION_EVENT, UI_NAVIGATION_EVENT,
     },
     wasm::{
         configure_wasm_cache_directory,
@@ -68,16 +70,6 @@ use app_state::*;
 use async_trait::async_trait;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 #[cfg(feature = "plugins")]
-use command_protocol::{
-    CommandAvailability, CommandCallbackResponse, CommandSnapshot, CommandSpec, CompletionContext,
-    CompletionItem, PrepareCompletionRequest, PrepareCompletionResponse, PrepareExecuteRequest,
-    PrepareExecuteResponse, SessionListStatus, SessionSummary as CommandSessionSummary,
-    SnapshotRequest, SurfaceAction, SurfaceEffect, SurfaceEffectsResponse, SurfaceUpdateRequest,
-    PREPARE_COMPLETION_SERVICE, PREPARE_EXECUTE_SERVICE, PROVIDER_PLUGIN_ID,
-    SESSION_COMPLETION_SOURCE, SESSION_DIALOG_VIEW, SNAPSHOT_SERVICE, SURFACE_POLL_EFFECTS_SERVICE,
-    SURFACE_UPDATE_SERVICE,
-};
-#[cfg(feature = "plugins")]
 use crossterm::event::MouseEvent;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{prelude::*, widgets::*};
@@ -101,8 +93,8 @@ use tui::render_root;
 #[cfg(feature = "plugins")]
 use tui::{
     apply_plugin_frames, apply_plugin_navigation_event, dispatch_plugin_input,
-    drain_plugin_ui_events, refresh_plugin_view, render_plugin_views, view::ViewStack,
-    PluginRenderResult,
+    drain_plugin_ui_events, refresh_plugin_view, refresh_plugin_views_for, render_input_panel,
+    render_plugin_views, view::ViewStack, PluginRenderResult,
 };
 
 // ─── CLI 参数 ───
@@ -293,20 +285,15 @@ enum UiEvent {
     /// 后台会话上下文重载完成。
     #[cfg(feature = "plugins")]
     SessionContextReloaded(Box<Result<SessionReloadOutcome>>),
-    /// 后台会话摘要查询完成，等待注入 Command 插件界面。
+    /// 后台会话摘要查询完成，等待回送发起插件。
     #[cfg(feature = "plugins")]
-    CommandSurfaceUpdate {
-        request_id: u64,
-        status: SessionListStatus,
-    },
-    /// 后台取得新的命令注册表快照。
-    #[cfg(feature = "plugins")]
-    CommandSnapshotLoaded(Box<Result<Option<CommandSnapshot>>>),
-    /// 显式参数补全请求完成。
-    #[cfg(feature = "plugins")]
-    CommandCompletionLoaded {
-        generation: u64,
-        result: Box<Result<Option<ResolvedCommandCompletion>>>,
+    SessionsQueryDone {
+        /// 发起查询的可信插件 ID。
+        plugin_id: String,
+        /// 接收应答的插件服务名。
+        reply_service: String,
+        /// 回送插件的查询应答。
+        reply: Box<UiSessionsReply>,
     },
     /// 单个插件的渐进加载状态已经提交到动态宿主。
     #[cfg(feature = "plugins")]
@@ -346,23 +333,7 @@ enum SessionReloadOutcome {
     NoLoader,
 }
 
-/// 一次与输入快照绑定的参数候选结果。
-#[cfg(feature = "plugins")]
-struct ResolvedCommandCompletion {
-    /// 发起请求时的完整编辑器内容。
-    source_input: String,
-    /// 发起请求时的 UTF-8 字节光标。
-    source_cursor: usize,
-    /// Provider 校验后的参数位置与替换区间。
-    context: CompletionContext,
-    /// 已经过 Provider、SDK 或宿主数据源限制的候选。
-    items: Vec<CompletionItem>,
-}
-
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// 原生 TUI 调用 Command Provider 时使用的稳定身份。
-#[cfg(feature = "plugins")]
-const TUI_COMMAND_CALLER: &str = "lucia-tui";
 
 /// 输入区域的聚焦边框颜色。
 const COLOR_BORDER_FOCUS: Color = Color::Rgb(112, 110, 104);

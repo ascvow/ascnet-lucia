@@ -33,14 +33,16 @@ impl Default for SessionSurface {
 
 impl SessionSurface {
     /// 打开并重置界面，然后请求当前 `cwd` 的第一页会话摘要。
-    pub(super) fn open(&mut self, mode: SessionSurfaceMode) {
+    ///
+    /// `seq` 是插件级共享的查询 ID 计数器，避免与弹层候选查询串线。
+    pub(super) fn open(&mut self, seq: &mut u64, mode: SessionSurfaceMode) {
         self.visible = true;
         self.mode = mode;
         self.query.clear();
         self.selected = 0;
         self.rendered_start = 0;
         self.rendered_len = 0;
-        self.queue_query(None);
+        self.queue_query(seq, None);
     }
 
     /// 仅接受最近一次查询的响应，防止快速输入时旧结果覆盖新结果。
@@ -59,15 +61,16 @@ impl SessionSurface {
     }
 
     /// 处理 Dialog 的稳定输入事件。
-    pub(super) fn handle_input(&mut self, event: UiInputEvent) {
+    pub(super) fn handle_input(&mut self, seq: &mut u64, event: UiInputEvent) {
         match event {
-            UiInputEvent::Key { code, modifiers } => self.handle_key(&code, &modifiers),
-            UiInputEvent::Mouse { kind, y, .. } => self.handle_mouse(&kind, y),
+            UiInputEvent::Key { code, modifiers } => self.handle_key(seq, &code, &modifiers),
+            UiInputEvent::Mouse { kind, y, .. } => self.handle_mouse(seq, &kind, y),
+            UiInputEvent::MainInput { .. } => {}
         }
     }
 
     /// 处理导航、过滤、确认和关闭按键。
-    pub(super) fn handle_key(&mut self, code: &str, modifiers: &[String]) {
+    pub(super) fn handle_key(&mut self, seq: &mut u64, code: &str, modifiers: &[String]) {
         match code {
             "escape" => self.close(),
             "up" => self.selected = self.selected.saturating_sub(1),
@@ -75,7 +78,7 @@ impl SessionSurface {
                 if self.selected + 1 >= self.items().len() {
                     if let Some(cursor) = self.next_cursor() {
                         self.selected = 0;
-                        self.queue_query(Some(cursor));
+                        self.queue_query(seq, Some(cursor));
                         return;
                     }
                 }
@@ -86,7 +89,7 @@ impl SessionSurface {
                 if self.selected + 10 >= self.items().len() {
                     if let Some(cursor) = self.next_cursor() {
                         self.selected = 0;
-                        self.queue_query(Some(cursor));
+                        self.queue_query(seq, Some(cursor));
                         return;
                     }
                 }
@@ -97,28 +100,28 @@ impl SessionSurface {
             "backspace" => {
                 if self.query.pop().is_some() {
                     self.selected = 0;
-                    self.queue_query(None);
+                    self.queue_query(seq, None);
                 }
             }
             "enter" => self.confirm_selection(),
             _ if is_printable_key(code, modifiers) => {
                 self.query.push_str(code);
                 self.selected = 0;
-                self.queue_query(None);
+                self.queue_query(seq, None);
             }
             _ => {}
         }
     }
 
     /// 将鼠标滚轮和列表行点击映射为选择状态。
-    pub(super) fn handle_mouse(&mut self, kind: &str, y: u16) {
+    pub(super) fn handle_mouse(&mut self, seq: &mut u64, kind: &str, y: u16) {
         match kind {
             "scroll_up" => self.selected = self.selected.saturating_sub(1),
             "scroll_down" => {
                 if self.selected + 1 >= self.items().len() {
                     if let Some(cursor) = self.next_cursor() {
                         self.selected = 0;
-                        self.queue_query(Some(cursor));
+                        self.queue_query(seq, Some(cursor));
                         return;
                     }
                 }
@@ -160,8 +163,9 @@ impl SessionSurface {
     }
 
     /// 合并连续查询，只保留最新的轻量会话摘要请求。
-    pub(super) fn queue_query(&mut self, cursor: Option<String>) {
-        self.request_id = self.request_id.saturating_add(1).max(1);
+    pub(super) fn queue_query(&mut self, seq: &mut u64, cursor: Option<String>) {
+        *seq = seq.saturating_add(1).max(1);
+        self.request_id = *seq;
         self.status = SessionListStatus::Loading;
         self.rendered_start = 0;
         self.rendered_len = 0;

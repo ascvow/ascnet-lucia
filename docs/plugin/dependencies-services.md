@@ -30,7 +30,7 @@ Host 保持原配置中无关插件的相对顺序，并保证 provider 先于 d
 
 ## Command Provider 服务
 
-官方 Command 插件在激活时注册 `command.register`、`command.unregister`、`command.snapshot`、`command.prepare-completion`、`command.prepare-execute`、`command.surface.update` 和 `command.surface.poll-effects` 七个 `1.0.0` 服务。Host 只保存服务描述、注入可信 `caller_id` 并路由 JSON；命令所有权、名称冲突、参数解析、补全和 `/` 输入规则都由 Command 插件处理。
+官方 Command 插件在激活时注册 `command.register`、`command.unregister`、`command.snapshot`、`command.prepare-completion` 和 `command.surface.update` 五个 `1.0.0` 服务。Host 只保存服务描述、注入可信 `caller_id` 并路由 JSON；命令所有权、名称冲突、参数解析、补全、执行编排和 `/` 输入规则都由 Command 插件处理。前四个服务面向第三方插件与 SDK；`command.surface.update` 是宿主会话查询的应答入口，仅接受 manifest 配置的宿主调用方。
 
 公开类型位于 `command-protocol`：
 

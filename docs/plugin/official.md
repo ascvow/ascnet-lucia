@@ -45,7 +45,7 @@ Manifest：`examples/plugins/skill-plugin/plugin.toml`。
 
 ## Command
 
-`command` 提供斜杠命令注册表、输入预览、参数校验、候选补全和执行路由。内置命令包括 `/help`、`/resume`、`/new`、`/sessions`、`/clear`、`/compact` 与 `/exit`；`/quit` 是 `/exit` 的别名。`/resume` 和 `/sessions` 使用插件 Dialog 展示当前项目的轻量会话摘要，完整 Session 只由 TUI 在用户确认后加载。
+`command` 提供斜杠命令注册表、补全弹层、参数校验、候选补全和执行编排。插件声明触发前缀 `/` 的输入面板并自己渲染候选与预览；应用级动作（新建会话、重载上下文、退出等）通过通用 `ui.host.action` 事件请求宿主执行。内置命令包括 `/help`、`/resume`、`/new`、`/sessions`、`/clear`、`/compact` 与 `/exit`；`/quit` 是 `/exit` 的别名。`/resume` 和 `/sessions` 使用插件 Dialog 展示当前项目的轻量会话摘要，完整 Session 只由 TUI 在用户确认后加载。
 
 ```bash
 bun run build:plugin:command

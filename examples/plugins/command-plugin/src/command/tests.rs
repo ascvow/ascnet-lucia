@@ -1,8 +1,141 @@
 use super::*;
-use command_protocol::{
-    CommandHandlerRef, PrepareExecuteResponse, RegisterCommandRequest, SessionListStatus,
-    SurfaceEffect, CALLBACK_SERVICE,
+use agent_plugin::{
+    ModelCompletionRequest, ModelCompletionResponse, ProcessSpec, PromptContribution,
+    ServiceDescriptor, ToolSpec, UI_HOST_ACTION_EVENT,
 };
+use command_protocol::{CommandHandlerRef, SessionListStatus, SurfaceEffect, CALLBACK_SERVICE};
+use std::cell::RefCell;
+
+/// 记录事件与服务调用的测试宿主。
+#[derive(Default)]
+struct RecordingHost {
+    events: RefCell<Vec<ExtensionEvent>>,
+    /// 服务目录：owner 插件 ID 到服务名列表。
+    services: Vec<(String, String)>,
+    /// 固定的服务调用响应。
+    service_response: Option<Value>,
+    /// 已发出的服务调用记录。
+    calls: RefCell<Vec<(String, String, Value)>>,
+}
+
+impl RecordingHost {
+    /// 取出已记录的宿主动作请求。
+    fn host_actions(&self) -> Vec<UiHostAction> {
+        self.events
+            .borrow()
+            .iter()
+            .filter(|event| event.name == UI_HOST_ACTION_EVENT)
+            .map(|event| {
+                serde_json::from_value::<UiHostActionRequest>(event.data.clone())
+                    .expect("宿主动作事件应可解析")
+                    .action
+            })
+            .collect()
+    }
+
+    /// 取出主事件列表说明文本。
+    fn notices(&self) -> Vec<String> {
+        self.events
+            .borrow()
+            .iter()
+            .filter_map(|event| event.presentation.as_ref().map(|item| item.text.clone()))
+            .collect()
+    }
+}
+
+impl PluginHostApi for RecordingHost {
+    fn upsert_tool(&self, _local_name: &str, spec: &ToolSpec) -> Result<String> {
+        Ok(spec.name.clone())
+    }
+
+    fn remove_tool(&self, _public_name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn upsert_prompt(&self, prompt: &PromptContribution) -> Result<String> {
+        Ok(prompt.id.clone())
+    }
+
+    fn remove_prompt(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn emit_event(&self, event: &ExtensionEvent) -> Result<()> {
+        self.events.borrow_mut().push(event.clone());
+        Ok(())
+    }
+
+    fn get_state(&self, _key: &str) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
+    fn set_state(&self, _key: &str, _value: &Value) -> Result<()> {
+        Ok(())
+    }
+
+    fn remove_state(&self, _key: &str) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
+    fn upsert_service(&self, _service: &ServiceSpec) -> Result<()> {
+        Ok(())
+    }
+
+    fn remove_service(&self, _name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn list_services(&self, plugin_id: Option<&str>) -> Result<Vec<ServiceDescriptor>> {
+        Ok(self
+            .services
+            .iter()
+            .filter(|(owner, _)| plugin_id.is_none_or(|target| owner == target))
+            .map(|(owner, name)| ServiceDescriptor {
+                plugin_id: owner.clone(),
+                name: name.clone(),
+                version: "1.0.0".into(),
+                description: None,
+            })
+            .collect())
+    }
+
+    fn call_service(&self, plugin_id: &str, name: &str, payload: &Value) -> Result<Value> {
+        self.calls
+            .borrow_mut()
+            .push((plugin_id.into(), name.into(), payload.clone()));
+        self.service_response
+            .clone()
+            .ok_or_else(|| anyhow!("测试宿主未配置服务响应"))
+    }
+
+    fn read_file(&self, _path: &str) -> Result<String> {
+        Err(anyhow!("测试宿主不提供文件读取"))
+    }
+
+    fn list_dir(&self, _path: &str) -> Result<Vec<agent_plugin::FileEntry>> {
+        Err(anyhow!("测试宿主不提供目录扫描"))
+    }
+
+    fn spawn_process(&self, _spec: &ProcessSpec) -> Result<u64> {
+        Err(anyhow!("测试宿主不提供子进程"))
+    }
+
+    fn write_process(&self, _handle: u64, _data: &str) -> Result<()> {
+        Err(anyhow!("测试宿主不提供子进程"))
+    }
+
+    fn read_process_line(&self, _handle: u64, _timeout_ms: u64) -> Result<Option<String>> {
+        Err(anyhow!("测试宿主不提供子进程"))
+    }
+
+    fn kill_process(&self, _handle: u64) -> Result<()> {
+        Err(anyhow!("测试宿主不提供子进程"))
+    }
+
+    fn complete_model(&self, _request: &ModelCompletionRequest) -> Result<ModelCompletionResponse> {
+        Err(anyhow!("测试宿主不提供模型完成"))
+    }
+}
 
 /// 构造一个可执行的第三方命令。
 fn third_party_spec(name: &str) -> CommandSpec {
@@ -14,6 +147,38 @@ fn third_party_spec(name: &str) -> CommandSpec {
         handler_id: format!("{name}-handler"),
     });
     spec
+}
+
+/// 把主输入快照送入弹层。
+fn sync_popup(plugin: &mut CommandPlugin, host: &RecordingHost, text: &str) {
+    plugin.on_ui_input_with_host(
+        host,
+        UiInput {
+            plugin_id: "command".into(),
+            view_id: POPUP_VIEW.into(),
+            instance_id: None,
+            event: UiInputEvent::MainInput {
+                text: text.into(),
+                cursor: u32::try_from(text.len()).expect("测试输入应可转换"),
+            },
+        },
+    );
+}
+
+/// 向弹层发送一个无修饰手势键。
+fn press_popup(plugin: &mut CommandPlugin, host: &RecordingHost, code: &str) {
+    plugin.on_ui_input_with_host(
+        host,
+        UiInput {
+            plugin_id: "command".into(),
+            view_id: POPUP_VIEW.into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: code.into(),
+                modifiers: Vec::new(),
+            },
+        },
+    );
 }
 
 /// 验证默认快照包含全部官方命令和 `/quit` 别名。
@@ -73,7 +238,7 @@ fn prunes_commands_whose_callback_service_disappeared() {
     assert_eq!(registry.resolve_name("inspect"), None);
 }
 
-/// 验证第三方命令只生成回调计划，不在 Provider 内同步调用 owner。
+/// 验证第三方命令生成回调计划并绑定类型化参数。
 #[test]
 fn prepares_callback_plan_with_typed_arguments() {
     let mut registry = CommandRegistry::with_builtins();
@@ -93,177 +258,158 @@ fn prepares_callback_plan_with_typed_arguments() {
     assert_eq!(invocation.arguments["count"], ["3"]);
 }
 
-/// 验证 `/compact` 生成由原生 TUI 立即执行的受控会话动作。
+/// 验证 `/compact` 通过通用宿主动作请求上下文重载并清空输入。
 #[test]
-fn prepares_compact_surface_action() {
-    let registry = CommandRegistry::with_builtins();
-    let Prepared::Builtin {
-        command,
-        invocation,
-    } = registry.prepare("/compact", true)
-    else {
-        panic!("应生成内置命令计划");
-    };
+fn compact_emits_reload_context_action() {
+    let host = RecordingHost::default();
     let mut plugin = CommandPlugin::default();
-    let response = plugin.execute_builtin(command, invocation);
-    assert_eq!(
-        response,
-        PrepareExecuteResponse::SurfaceAction {
-            action: SurfaceAction::ReloadSessionContext
-        }
-    );
+    sync_popup(&mut plugin, &host, "/compact");
+    press_popup(&mut plugin, &host, "enter");
+
+    let actions = host.host_actions();
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, UiHostAction::SetInput { text, .. } if text.is_empty())));
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        UiHostAction::ReloadContext { label: Some(label) } if label == "/compact"
+    )));
 }
 
-/// 验证 Provider 识别当前参数，并在本地过滤 Choice 与 Static 候选。
+/// 验证 `/exit` 与 `/new` 映射到对应的通用宿主动作。
 #[test]
-fn prepares_local_argument_candidates() {
-    let mut spec = CommandSpec::new("deploy", "部署", "部署到指定环境和区域")
-        .with_argument(ArgumentSpec::required(
-            "environment",
-            "目标环境",
-            ArgumentKind::Choice {
-                values: vec!["production".into(), "preview".into(), "staging".into()],
+fn builtin_commands_map_to_host_actions() {
+    let host = RecordingHost::default();
+    let mut plugin = CommandPlugin::default();
+    sync_popup(&mut plugin, &host, "/new");
+    press_popup(&mut plugin, &host, "enter");
+    sync_popup(&mut plugin, &host, "/exit");
+    press_popup(&mut plugin, &host, "enter");
+
+    let actions = host.host_actions();
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, UiHostAction::NewSession)));
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, UiHostAction::Exit)));
+}
+
+/// 验证 Tab 在命令名阶段按选中项补全输入。
+#[test]
+fn tab_completes_command_name() {
+    let host = RecordingHost::default();
+    let mut plugin = CommandPlugin::default();
+    sync_popup(&mut plugin, &host, "/res");
+    press_popup(&mut plugin, &host, "tab");
+
+    let actions = host.host_actions();
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        UiHostAction::SetInput { text, .. } if text == "/resume "
+    )));
+    // 弹层内部快照跟随补全结果，无需等待宿主回发。
+    assert_eq!(plugin.popup.input, "/resume ");
+}
+
+/// 验证运行期间 IdleOnly 命令保留输入并提示等待。
+#[test]
+fn idle_only_command_is_deferred_while_running() {
+    let host = RecordingHost::default();
+    let mut plugin = CommandPlugin::default();
+    plugin.on_event(AgentEvent {
+        id: "event-1".into(),
+        run_id: "run-1".into(),
+        timestamp_ms: 0,
+        kind: AgentEventKind::RunStarted,
+        step: 0,
+        payload: Value::Null,
+    });
+    sync_popup(&mut plugin, &host, "/resume");
+    press_popup(&mut plugin, &host, "enter");
+
+    assert!(host.host_actions().is_empty(), "忙时不应产生宿主动作");
+    assert!(host.notices().iter().any(|notice| notice.contains("空闲")));
+    assert_eq!(plugin.popup.input, "/resume");
+}
+
+/// 验证 `/resume` 打开对话框并经宿主动作查询会话摘要。
+#[test]
+fn resume_opens_surface_and_queries_sessions() {
+    let host = RecordingHost::default();
+    let mut plugin = CommandPlugin::default();
+    sync_popup(&mut plugin, &host, "/resume");
+    press_popup(&mut plugin, &host, "enter");
+
+    assert!(plugin.surface.visible);
+    let actions = host.host_actions();
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        UiHostAction::QuerySessions {
+            query_id: 1,
+            limit,
+            reply_service,
+            ..
+        } if *limit == SESSION_PAGE_LIMIT && reply_service == SURFACE_UPDATE_SERVICE
+    )));
+}
+
+/// 验证会话查询应答按查询 ID 路由：对话框接受、过期应答被拒绝。
+#[test]
+fn sessions_reply_routes_to_dialog_by_query_id() {
+    let host = RecordingHost::default();
+    let mut plugin = CommandPlugin::default();
+    sync_popup(&mut plugin, &host, "/resume");
+    press_popup(&mut plugin, &host, "enter");
+
+    let stale = plugin
+        .handle_service(
+            &host,
+            ServiceCall {
+                caller_id: DEFAULT_SURFACE_AUTHORITY.into(),
+                name: SURFACE_UPDATE_SERVICE.into(),
+                payload: serde_json::to_value(UiSessionsReply {
+                    query_id: 99,
+                    status: UiSessionListStatus::Empty,
+                })
+                .expect("应答应可序列化"),
             },
-        ))
-        .with_argument(
-            ArgumentSpec::required("region", "目标区域", ArgumentKind::String).with_completion(
-                CompletionSource::Static {
-                    items: vec![
-                        CompletionItem {
-                            label: "eu-west".into(),
-                            insert_text: "eu-west".into(),
-                            description: Some("欧洲".into()),
-                        },
-                        CompletionItem {
-                            label: "us-east".into(),
-                            insert_text: "us-east".into(),
-                            description: Some("美国".into()),
-                        },
-                    ],
-                },
-            ),
-        );
-    spec.handler = Some(CommandHandlerRef {
-        service: CALLBACK_SERVICE.into(),
-        handler_id: "deploy-handler".into(),
-    });
-    let mut registry = CommandRegistry::with_builtins();
-    registry
-        .register("deploy-plugin".into(), spec)
-        .expect("命令应注册成功");
+        )
+        .expect("过期应答不应报错");
+    assert_eq!(stale["accepted"], false);
 
-    let choice = registry.prepare_completion(PrepareCompletionRequest::new("/deploy pr"));
-    let PrepareCompletionResponse::Candidates { context, items } = choice else {
-        panic!("Choice 参数应在 Provider 本地返回候选");
-    };
-    assert_eq!(context.argument, "environment");
-    assert_eq!(context.prefix, "pr");
-    assert_eq!(context.replacement_start, 8);
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].insert_text, "production");
-
-    let static_items =
-        registry.prepare_completion(PrepareCompletionRequest::new("/deploy production eu"));
-    let PrepareCompletionResponse::Candidates { context, items } = static_items else {
-        panic!("Static 参数应在 Provider 本地返回候选");
-    };
-    assert_eq!(context.argument, "region");
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].insert_text, "eu-west");
-}
-
-/// 验证带引号的当前 token 会被整体替换，特殊候选仍只解析成一个参数。
-#[test]
-fn encodes_completion_and_replaces_quoted_token() {
-    let value = r#"space "quoted" \ path's"#;
-    let mut spec = CommandSpec::new("open", "打开", "打开指定目标").with_argument(
-        ArgumentSpec::required("target", "目标", ArgumentKind::String).with_completion(
-            CompletionSource::Static {
-                items: vec![CompletionItem {
-                    label: "space target".into(),
-                    insert_text: value.into(),
-                    description: None,
-                }],
+    let reply = plugin
+        .handle_service(
+            &host,
+            ServiceCall {
+                caller_id: DEFAULT_SURFACE_AUTHORITY.into(),
+                name: SURFACE_UPDATE_SERVICE.into(),
+                payload: serde_json::to_value(UiSessionsReply {
+                    query_id: 1,
+                    status: UiSessionListStatus::Ready {
+                        items: vec![UiSessionSummary {
+                            id: "session-1".into(),
+                            title: "设计讨论".into(),
+                            message_count: 8,
+                            updated_at_ms: 42,
+                            updated_label: "刚刚".into(),
+                            revision: 7,
+                            active: false,
+                        }],
+                        next_cursor: None,
+                    },
+                })
+                .expect("应答应可序列化"),
             },
-        ),
-    );
-    spec.handler = Some(CommandHandlerRef {
-        service: CALLBACK_SERVICE.into(),
-        handler_id: "open-handler".into(),
-    });
-    let mut registry = CommandRegistry::with_builtins();
-    registry
-        .register("open-plugin".into(), spec)
-        .expect("命令应注册成功");
-
-    let input = r#"/open "space""#;
-    let response = registry.prepare_completion(PrepareCompletionRequest::new(input));
-    let PrepareCompletionResponse::Candidates { context, items } = response else {
-        panic!("静态参数应返回本地候选");
-    };
-    assert_eq!(context.replacement_start, 6);
-    assert_eq!(context.replacement_end, input.len() as u32);
-    assert_eq!(items.len(), 1);
-
-    let mut completed = input.to_owned();
-    completed.replace_range(
-        context.replacement_start as usize..context.replacement_end as usize,
-        &items[0].insert_text,
-    );
-    let parsed = ParsedCommandLine::parse(&completed).expect("补全结果应可执行");
-    assert_eq!(parsed.arguments, [value]);
+        )
+        .expect("匹配应答应被接受");
+    assert_eq!(reply["accepted"], true);
+    assert_eq!(plugin.surface.items().len(), 1);
 }
 
-/// 验证动态补全计划只使用注册时由 Host 注入的 owner 和回调服务。
+/// 验证会话参数补全经宿主数据源应答后立即应用唯一候选。
 #[test]
-fn prepares_trusted_dynamic_completion_callback() {
-    let mut spec = CommandSpec::new("deploy", "部署", "部署指定目标").with_argument(
-        ArgumentSpec::required("target", "部署目标", ArgumentKind::String)
-            .with_completion(CompletionSource::Callback),
-    );
-    spec.handler = Some(CommandHandlerRef {
-        service: "deploy.complete".into(),
-        handler_id: "trusted-handler".into(),
-    });
-    let mut registry = CommandRegistry::with_builtins();
-    registry
-        .register("trusted-owner".into(), spec)
-        .expect("命令应注册成功");
-    let input = "/deploy production";
-    let response = registry.prepare_completion(PrepareCompletionRequest {
-        input: input.into(),
-        cursor: Some(11),
-        limit: 7,
-    });
-    let PrepareCompletionResponse::Callback {
-        context,
-        owner_plugin_id,
-        service,
-        request,
-    } = response
-    else {
-        panic!("Callback 参数应返回可信回调计划");
-    };
-    assert_eq!(owner_plugin_id, "trusted-owner");
-    assert_eq!(service, "deploy.complete");
-    assert_eq!(context.prefix, "pro");
-    assert_eq!(context.replacement_start, 8);
-    assert_eq!(context.replacement_end, input.len() as u32);
-    let CommandCallbackRequest::Complete {
-        handler_id,
-        request,
-    } = request
-    else {
-        panic!("计划必须使用 Complete 回调");
-    };
-    assert_eq!(handler_id, "trusted-handler");
-    assert_eq!(request.argument, "target");
-    assert_eq!(request.limit, 7);
-}
-
-/// 验证 Session 参数转换为宿主会话数据源请求，不暴露插件 owner。
-#[test]
-fn prepares_session_surface_completion_request() {
+fn session_argument_completion_applies_reply() {
     let mut spec = CommandSpec::new("open", "打开", "打开指定会话").with_argument(
         ArgumentSpec::required("session", "会话标识", ArgumentKind::Session),
     );
@@ -271,69 +417,128 @@ fn prepares_session_surface_completion_request() {
         service: CALLBACK_SERVICE.into(),
         handler_id: "open-handler".into(),
     });
-    let mut registry = CommandRegistry::with_builtins();
-    registry
+    let host = RecordingHost {
+        services: vec![("session-plugin".into(), CALLBACK_SERVICE.into())],
+        ..RecordingHost::default()
+    };
+    let mut plugin = CommandPlugin::default();
+    plugin
+        .registry
         .register("session-plugin".into(), spec)
         .expect("命令应注册成功");
-    let response = registry.prepare_completion(PrepareCompletionRequest::new("/open abc"));
-    let PrepareCompletionResponse::Surface { context, request } = response else {
-        panic!("Session 参数应返回宿主数据源计划");
-    };
-    assert_eq!(context.argument, "session");
-    assert_eq!(request.source, SESSION_COMPLETION_SOURCE);
-    assert_eq!(request.request.prefix, "abc");
-}
 
-/// 验证仅空闲命令在准备阶段执行第二次状态校验。
-#[test]
-fn rejects_idle_only_command_while_agent_runs() {
-    let registry = CommandRegistry::with_builtins();
-    let Prepared::Error { message, .. } = registry.prepare("/resume", false) else {
-        panic!("运行期间应拒绝恢复会话");
-    };
-    assert!(message.contains("Agent 空闲"));
-    let Prepared::Error { message, .. } = registry.prepare("/exit", false) else {
-        panic!("运行期间应拒绝退出，避免中止持久化任务");
-    };
-    assert!(message.contains("Agent 空闲"));
-}
-
-/// 验证 `/resume` 打开插件 Dialog 并只查询轻量会话摘要。
-#[test]
-fn resume_opens_surface_and_queries_sessions() {
-    let mut plugin = CommandPlugin::default();
-    let response = plugin.execute_builtin(
-        BuiltinCommand::Resume,
-        CommandInvocation {
-            command: "resume".into(),
-            input: "/resume".into(),
-            arguments: BTreeMap::new(),
-        },
-    );
-    assert_eq!(
-        response,
-        PrepareExecuteResponse::SurfaceOpened {
-            view_id: SESSION_DIALOG_VIEW.into()
-        }
-    );
-    assert!(plugin.surface.visible);
-    assert_eq!(
-        plugin.surface.effects.front(),
-        Some(&SurfaceEffect::QuerySessions {
-            request_id: 1,
-            query: String::new(),
-            cursor: None,
-            limit: SESSION_PAGE_LIMIT,
+    sync_popup(&mut plugin, &host, "/open se");
+    press_popup(&mut plugin, &host, "tab");
+    let query_id = host
+        .host_actions()
+        .iter()
+        .find_map(|action| match action {
+            UiHostAction::QuerySessions { query_id, .. } => Some(*query_id),
+            _ => None,
         })
-    );
+        .expect("Session 参数应发起会话查询");
+
+    plugin
+        .handle_service(
+            &host,
+            ServiceCall {
+                caller_id: DEFAULT_SURFACE_AUTHORITY.into(),
+                name: SURFACE_UPDATE_SERVICE.into(),
+                payload: serde_json::to_value(UiSessionsReply {
+                    query_id,
+                    status: UiSessionListStatus::Ready {
+                        items: vec![UiSessionSummary {
+                            id: "session-9".into(),
+                            title: "发布计划".into(),
+                            message_count: 3,
+                            updated_at_ms: 1,
+                            updated_label: "刚刚".into(),
+                            revision: 2,
+                            active: false,
+                        }],
+                        next_cursor: None,
+                    },
+                })
+                .expect("应答应可序列化"),
+            },
+        )
+        .expect("候选应答应被接受");
+
+    assert!(host.host_actions().iter().any(|action| matches!(
+        action,
+        UiHostAction::SetInput { text, .. } if text == "/open session-9"
+    )));
+}
+
+/// 验证第三方命令执行直接调用 owner 回调并展示结果。
+#[test]
+fn executes_third_party_callback_directly() {
+    let host = RecordingHost {
+        services: vec![("deploy-plugin".into(), "command.callback".into())],
+        service_response: Some(
+            serde_json::to_value(CommandCallbackResponse::Executed {
+                result: Value::String("部署完成".into()),
+            })
+            .expect("响应应可序列化"),
+        ),
+        ..RecordingHost::default()
+    };
+    let mut plugin = CommandPlugin::default();
+    plugin
+        .registry
+        .register("deploy-plugin".into(), third_party_spec("deploy"))
+        .expect("应注册命令");
+
+    sync_popup(&mut plugin, &host, "/deploy 3");
+    press_popup(&mut plugin, &host, "enter");
+
+    let calls = host.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "deploy-plugin");
+    assert_eq!(calls[0].1, "command.callback");
+    drop(calls);
+    assert!(host
+        .notices()
+        .iter()
+        .any(|notice| notice.contains("部署完成")));
+}
+
+/// 验证弹层渲染包含命令用法、摘要与说明。
+#[test]
+fn popup_renders_descriptive_matches() {
+    let host = RecordingHost::default();
+    let mut plugin = CommandPlugin::default();
+    sync_popup(&mut plugin, &host, "/res");
+    assert!(plugin.popup.visible(&plugin.registry));
+    let lines = plugin.popup.render(&plugin.registry, true, 80);
+    let text = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    assert!(text.contains("/resume"), "{text}");
+    assert!(text.contains("恢复历史会话"), "{text}");
+}
+
+/// 验证 Esc 隐藏弹层且输入变化后恢复展示。
+#[test]
+fn escape_dismisses_popup_until_input_changes() {
+    let host = RecordingHost::default();
+    let mut plugin = CommandPlugin::default();
+    sync_popup(&mut plugin, &host, "/res");
+    press_popup(&mut plugin, &host, "escape");
+    assert!(!plugin.popup.visible(&plugin.registry));
+    sync_popup(&mut plugin, &host, "/resu");
+    assert!(plugin.popup.visible(&plugin.registry));
 }
 
 /// 验证过期查询响应不会覆盖搜索后发起的新请求。
 #[test]
 fn ignores_stale_surface_update() {
+    let mut seq = 0;
     let mut surface = SessionSurface::default();
-    surface.open(SessionSurfaceMode::Resume);
-    surface.handle_key("a", &[]);
+    surface.open(&mut seq, SessionSurfaceMode::Resume);
+    surface.handle_key(&mut seq, "a", &[]);
     assert_eq!(surface.request_id, 2);
     assert!(!surface.update(SurfaceUpdateRequest {
         request_id: 1,
@@ -345,8 +550,9 @@ fn ignores_stale_surface_update() {
 /// 验证选择会话只生成带修订号的恢复 effect，并立即关闭界面。
 #[test]
 fn selecting_session_emits_resume_effect() {
+    let mut seq = 0;
     let mut surface = SessionSurface::default();
-    surface.open(SessionSurfaceMode::Resume);
+    surface.open(&mut seq, SessionSurfaceMode::Resume);
     assert!(surface.update(SurfaceUpdateRequest {
         request_id: 1,
         status: SessionListStatus::Ready {
@@ -364,7 +570,7 @@ fn selecting_session_emits_resume_effect() {
         },
     }));
     surface.effects.clear();
-    surface.handle_key("enter", &[]);
+    surface.handle_key(&mut seq, "enter", &[]);
     assert!(!surface.visible);
     assert_eq!(
         surface.effects.pop_front(),
@@ -378,8 +584,9 @@ fn selecting_session_emits_resume_effect() {
 /// 验证选中项越过可见高度后滚动窗口，鼠标点击使用窗口绝对起点。
 #[test]
 fn session_surface_scrolls_and_maps_mouse_to_visible_window() {
+    let mut seq = 0;
     let mut surface = SessionSurface::default();
-    surface.open(SessionSurfaceMode::Resume);
+    surface.open(&mut seq, SessionSurfaceMode::Resume);
     let items = (0..12)
         .map(|index| SessionSummary {
             id: format!("session-{index}"),
@@ -409,7 +616,7 @@ fn session_surface_scrolls_and_maps_mouse_to_visible_window() {
             .any(|span| span.text.starts_with("> 会话 8"))
     }));
 
-    surface.handle_mouse("down_left", 3);
+    surface.handle_mouse(&mut seq, "down_left", 3);
     assert_eq!(surface.selected, 5);
 }
 

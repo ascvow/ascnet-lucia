@@ -8,7 +8,8 @@
       "width": 72,
       "height": 24
     },
-    "focusable": true
+    "focusable": true,
+    "input_triggers": []
   },
   "input_declaration": {
     "plugin_id": "fixture-plugin",
@@ -19,7 +20,22 @@
       "width": null,
       "height": 3
     },
-    "focusable": true
+    "focusable": true,
+    "input_triggers": []
+  },
+  "trigger_declaration": {
+    "plugin_id": "fixture-plugin",
+    "view_id": "assist",
+    "title": "助手",
+    "placement": "input_panel",
+    "size": {
+      "width": null,
+      "height": 8
+    },
+    "focusable": false,
+    "input_triggers": [
+      "/"
+    ]
   },
   "render_request": {
     "plugin_id": "fixture-plugin",
@@ -63,6 +79,15 @@
       ]
     }
   },
+  "main_input": {
+    "plugin_id": "fixture-plugin",
+    "view_id": "assist",
+    "event": {
+      "type": "main_input",
+      "text": "/resume se",
+      "cursor": 10
+    }
+  },
   "navigation": {
     "request_id": "open-1",
     "action": {
@@ -72,6 +97,58 @@
         "instance_id": "task-1",
         "title": "任务 1"
       }
+    }
+  },
+  "host_action_set_input": {
+    "request_id": "action-1",
+    "action": {
+      "action": "set_input",
+      "text": "/resume session-1",
+      "cursor": 17
+    }
+  },
+  "host_action_reload_context": {
+    "request_id": "action-2",
+    "action": {
+      "action": "reload_context",
+      "label": "/compact"
+    }
+  },
+  "host_action_resume_session": {
+    "request_id": "action-3",
+    "action": {
+      "action": "resume_session",
+      "session_id": "session-1",
+      "revision": 7
+    }
+  },
+  "host_action_query_sessions": {
+    "request_id": "action-4",
+    "action": {
+      "action": "query_sessions",
+      "query_id": 3,
+      "query": "设计",
+      "cursor": null,
+      "limit": 50,
+      "reply_service": "command.surface.update"
+    }
+  },
+  "sessions_reply": {
+    "query_id": 3,
+    "status": {
+      "type": "ready",
+      "items": [
+        {
+          "id": "session-1",
+          "title": "设计讨论",
+          "message_count": 8,
+          "updated_at_ms": 42,
+          "updated_label": "刚刚",
+          "revision": 7,
+          "active": false
+        }
+      ],
+      "next_cursor": "1"
     }
   }
 }

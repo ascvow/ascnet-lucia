@@ -1141,6 +1141,7 @@ mod tests {
             placement,
             size: UiSize::default(),
             focusable: true,
+            input_triggers: Vec::new(),
         };
 
         assert!(validate_ui_instance(&declaration(UiPlacement::Subview), Some("task-1")).is_ok());

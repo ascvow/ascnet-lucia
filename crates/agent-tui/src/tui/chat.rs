@@ -1,4 +1,4 @@
-//! 主对话区、输入编辑器、Command 预览与状态栏渲染。
+//! 主对话区、输入编辑器、输入面板与状态栏渲染。
 
 use crate::*;
 
@@ -11,28 +11,15 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let input_rows = desired_input_rows.min(workspace.height.saturating_sub(5).clamp(1, 6));
     let input_height = input_rows + 2;
     #[cfg(feature = "plugins")]
-    let command_matches = if workspace.height >= 10 {
-        app.command_matches()
+    let panel_height = if workspace.height >= 10 {
+        app.input_panel_height()
     } else {
-        Vec::new()
-    };
-    #[cfg(feature = "plugins")]
-    let command_preview_items = app
-        .command_completion
-        .as_ref()
-        .map(|completion| completion.items.len())
-        .unwrap_or(command_matches.len())
-        .min(6);
-    #[cfg(feature = "plugins")]
-    let command_preview_height = if app.command_preview_hidden || command_preview_items == 0 {
         0
-    } else {
-        u16::try_from(command_preview_items + 2).unwrap_or(8)
     };
     #[cfg(feature = "plugins")]
     let sections = Layout::vertical([
         Constraint::Min(4),
-        Constraint::Length(command_preview_height),
+        Constraint::Length(panel_height),
         Constraint::Length(input_height),
         Constraint::Length(1),
     ])
@@ -45,7 +32,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     ])
     .split(workspace);
     #[cfg(feature = "plugins")]
-    let (chat_section, command_section, input_section, footer_section) =
+    let (chat_section, panel_section, input_section, footer_section) =
         (sections[0], sections[1], sections[2], sections[3]);
     #[cfg(not(feature = "plugins"))]
     let (chat_section, input_section, footer_section) = (sections[0], sections[1], sections[2]);
@@ -91,13 +78,13 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             }
             lines.push(Line::from(spans));
         }
-        // 后台执行的斜杠命令以命令原文作为进行中指示。
+        // 后台上下文重载以插件提供的标签作为进行中指示。
         #[cfg(feature = "plugins")]
-        if let Some(command) = app.pending_command.as_deref() {
+        if let Some(label) = app.pending_reload.as_deref() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
             lines.push(Line::from(vec![
                 Span::styled(format!("{spinner} "), Style::new().fg(COLOR_WARNING)),
-                Span::styled(command.to_string(), Style::new().fg(COLOR_MUTED)),
+                Span::styled(label.to_string(), Style::new().fg(COLOR_MUTED)),
             ]));
         }
 
@@ -145,8 +132,8 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     }
 
     #[cfg(feature = "plugins")]
-    if command_preview_height > 0 {
-        render_command_preview(frame, app, command_section, &command_matches);
+    if panel_height > 0 {
+        render_input_panel(frame, app, panel_section);
     }
 
     // 输入区是四边圆角边框的多行输入盒，内容超过六行后内部垂直滚动。
@@ -557,145 +544,6 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
     frame.render_widget(
         Paragraph::new(lines).alignment(Alignment::Center),
         hero_area,
-    );
-}
-
-/// 渲染内存命令快照中的匹配项和当前选中命令说明。
-#[cfg(feature = "plugins")]
-pub(crate) fn render_command_preview(
-    frame: &mut Frame,
-    app: &App,
-    area: Rect,
-    matches: &[CommandSpec],
-) {
-    if area.is_empty() {
-        return;
-    }
-    if let Some(completion) = app.command_completion.as_ref() {
-        let visible = completion.items.iter().take(6).collect::<Vec<_>>();
-        if visible.is_empty() {
-            return;
-        }
-        let selected = app.command_selection.min(visible.len().saturating_sub(1));
-        let mut lines = visible
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let selected = index == selected;
-                let marker = if selected { "› " } else { "  " };
-                Line::from(vec![
-                    Span::styled(
-                        marker,
-                        Style::new().fg(if selected { COLOR_USER } else { COLOR_MUTED }),
-                    ),
-                    Span::styled(
-                        item.label.as_str(),
-                        Style::new()
-                            .fg(if selected { COLOR_TEXT } else { COLOR_MUTED })
-                            .bold(),
-                    ),
-                    Span::styled("  ", Style::new()),
-                    Span::styled(
-                        item.description.as_deref().unwrap_or_default(),
-                        Style::new().fg(COLOR_MUTED),
-                    ),
-                ])
-            })
-            .collect::<Vec<_>>();
-        let detail = app
-            .command_snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                snapshot
-                    .commands
-                    .iter()
-                    .find(|command| command.name == completion.context.command)
-            })
-            .and_then(|command| {
-                command
-                    .arguments
-                    .get(usize::from(completion.context.argument_index))
-            })
-            .map(|argument| argument.description.as_str())
-            .unwrap_or_default();
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(
-                    "/{} · {}",
-                    completion.context.command, completion.context.argument
-                ),
-                Style::new().fg(COLOR_BORDER_FOCUS),
-            ),
-            Span::styled("  ", Style::new()),
-            Span::styled(
-                truncate_line(detail, usize::from(area.width.saturating_sub(24).max(1))),
-                Style::new().fg(COLOR_MUTED),
-            ),
-        ]));
-        frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::new()
-                    .borders(Borders::TOP)
-                    .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
-                    .padding(Padding::horizontal(1)),
-            ),
-            area,
-        );
-        return;
-    }
-    if matches.is_empty() {
-        return;
-    }
-    let visible = matches.iter().take(6).collect::<Vec<_>>();
-    let selected = app.command_selection.min(visible.len().saturating_sub(1));
-    let mut lines = visible
-        .iter()
-        .enumerate()
-        .map(|(index, command)| {
-            let selected = index == selected;
-            let marker = if selected { "› " } else { "  " };
-            Line::from(vec![
-                Span::styled(
-                    marker,
-                    Style::new().fg(if selected { COLOR_USER } else { COLOR_MUTED }),
-                ),
-                Span::styled(
-                    command.display_usage(),
-                    Style::new()
-                        .fg(if selected { COLOR_TEXT } else { COLOR_MUTED })
-                        .bold(),
-                ),
-                Span::styled("  ", Style::new()),
-                Span::styled(command.summary.as_str(), Style::new().fg(COLOR_MUTED)),
-            ])
-        })
-        .collect::<Vec<_>>();
-    let selected_command = visible[selected];
-    let availability = if app.command_completion_loading {
-        "  候选加载中..."
-    } else if app.running && selected_command.availability == CommandAvailability::IdleOnly {
-        "  Agent 运行结束后可用"
-    } else {
-        ""
-    };
-    lines.push(Line::from(vec![
-        Span::styled(
-            truncate_line(
-                &selected_command.description,
-                usize::from(area.width.saturating_sub(24).max(1)),
-            ),
-            Style::new().fg(COLOR_MUTED),
-        ),
-        Span::styled(availability, Style::new().fg(COLOR_BORDER_FOCUS)),
-    ]));
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::new()
-                .borders(Borders::TOP)
-                .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
-                .padding(Padding::horizontal(1)),
-        ),
-        area,
     );
 }
 

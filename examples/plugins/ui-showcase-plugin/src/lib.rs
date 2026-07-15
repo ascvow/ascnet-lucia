@@ -177,6 +177,8 @@ impl AgentPlugin for UiShowcasePlugin {
                 }
             }
             UiInputEvent::Mouse { .. } => {}
+            // 展示插件不声明输入触发前缀，不会收到主输入快照。
+            UiInputEvent::MainInput { .. } => {}
         }
     }
 
@@ -368,6 +370,7 @@ fn declaration(
         placement,
         size: UiSize { width, height },
         focusable: true,
+        input_triggers: Vec::new(),
     }
 }
 

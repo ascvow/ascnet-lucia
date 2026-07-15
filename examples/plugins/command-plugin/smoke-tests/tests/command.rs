@@ -1,18 +1,22 @@
 //! 官方 Command 插件的真实 WASM 端到端测试。
 
 use agent_plugin_host::{
-    ui::{UiInput, UiInputEvent, UiPlacement, UiRenderRequest},
+    ui::{
+        UiHostAction, UiHostActionRequest, UiInput, UiInputEvent, UiPlacement, UiRenderRequest,
+        UiSessionListStatus, UiSessionsReply, UI_HOST_ACTION_EVENT,
+    },
     wasm::{load_wasm_plugins, WasmPluginHost},
-    PluginHost, PluginServiceCall,
+    AgentExtension, PluginHost, PluginServiceCall,
 };
 use command_protocol::{
-    CommandSnapshot, PrepareExecuteRequest, PrepareExecuteResponse, SessionListStatus,
-    SnapshotRequest, SurfaceAction, SurfaceEffect, SurfaceEffectsResponse, SurfaceUpdateRequest,
-    PREPARE_EXECUTE_SERVICE, PROTOCOL_VERSION, SESSION_DIALOG_VIEW, SNAPSHOT_SERVICE,
-    SURFACE_POLL_EFFECTS_SERVICE, SURFACE_UPDATE_SERVICE,
+    CommandSnapshot, SnapshotRequest, PROTOCOL_VERSION, SESSION_DIALOG_VIEW, SNAPSHOT_SERVICE,
+    SURFACE_UPDATE_SERVICE,
 };
 use serde_json::Value;
 use std::path::Path;
+
+/// 补全弹层的视图 ID，与插件声明保持一致。
+const POPUP_VIEW: &str = "command-popup";
 
 /// 通过真实 Host 服务路由调用 Command component。
 async fn call_service(host: &WasmPluginHost, name: &str, payload: Value) -> Value {
@@ -27,21 +31,56 @@ async fn call_service(host: &WasmPluginHost, name: &str, payload: Value) -> Valu
     .expect("Command component 应拥有目标服务")
 }
 
-/// 加载真实 component，验证服务注册、内置命令计划和声明式 Dialog 渲染。
+/// 向指定视图发送一次输入事件。
+async fn send_input(host: &WasmPluginHost, view_id: &str, event: UiInputEvent) {
+    host.on_ui_input(&UiInput {
+        plugin_id: "command".into(),
+        view_id: view_id.into(),
+        instance_id: None,
+        event,
+    })
+    .await
+    .expect("真实 WIT 输入路由不应失败");
+}
+
+/// 取出组件排队的全部宿主动作请求。
+async fn drain_host_actions(host: &WasmPluginHost) -> Vec<UiHostAction> {
+    AgentExtension::drain_events(host)
+        .await
+        .expect("读取插件事件不应失败")
+        .into_iter()
+        .filter(|event| event.get("name").and_then(Value::as_str) == Some(UI_HOST_ACTION_EVENT))
+        .map(|event| {
+            serde_json::from_value::<UiHostActionRequest>(
+                event.get("data").cloned().unwrap_or(Value::Null),
+            )
+            .expect("宿主动作事件应可解析")
+            .action
+        })
+        .collect()
+}
+
+/// 加载真实 component，验证服务注册、触发弹层与会话对话框的完整交互。
 #[tokio::test]
-async fn component_routes_builtin_commands_and_dialog() {
+async fn component_drives_commands_through_host_actions() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
     let host = WasmPluginHost::load_from_manifest(manifest)
         .await
         .expect("Command component 应加载成功");
 
     let services = host.services().await.expect("读取 Command 服务目录");
-    assert_eq!(services.len(), 7);
+    assert_eq!(services.len(), 5);
     assert!(services
         .iter()
         .all(|service| service.version == PROTOCOL_VERSION));
 
     let declarations = host.ui_declarations().await.expect("读取 Command UI 声明");
+    let popup = declarations
+        .iter()
+        .find(|declaration| declaration.view_id == POPUP_VIEW)
+        .expect("Command 必须声明补全弹层");
+    assert_eq!(popup.placement, UiPlacement::InputPanel);
+    assert_eq!(popup.input_triggers, vec!["/".to_string()]);
     let dialog = declarations
         .iter()
         .find(|declaration| declaration.view_id == SESSION_DIALOG_VIEW)
@@ -59,60 +98,100 @@ async fn component_routes_builtin_commands_and_dialog() {
         assert!(snapshot.commands.iter().any(|command| command.name == name));
     }
 
-    let help_value = call_service(
+    // 键入 `/res` 后弹层应可见并展示命令用法。
+    send_input(
         &host,
-        PREPARE_EXECUTE_SERVICE,
-        serde_json::to_value(PrepareExecuteRequest {
-            input: "/help".into(),
-            agent_idle: true,
-        })
-        .expect("序列化帮助命令请求"),
+        POPUP_VIEW,
+        UiInputEvent::MainInput {
+            text: "/res".into(),
+            cursor: 4,
+        },
     )
     .await;
-    let help: PrepareExecuteResponse =
-        serde_json::from_value(help_value).expect("解析帮助命令响应");
-    assert!(matches!(
-        help,
-        PrepareExecuteResponse::Output { content } if content.contains("/help")
-    ));
+    let frame = host
+        .render_ui(&UiRenderRequest {
+            plugin_id: "command".into(),
+            view_id: POPUP_VIEW.into(),
+            instance_id: None,
+            width: 80,
+            height: 8,
+            focused: false,
+            frame: 1,
+        })
+        .await
+        .expect("弹层渲染不应失败")
+        .expect("触发激活后弹层必须返回帧");
+    assert!(frame.visible);
+    let text = frame
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    assert!(text.contains("/resume"), "{text}");
 
-    let compact_value = call_service(
+    // `/compact` 提交后应产生清空输入与重载上下文两个宿主动作。
+    send_input(
         &host,
-        PREPARE_EXECUTE_SERVICE,
-        serde_json::to_value(PrepareExecuteRequest {
-            input: "/compact".into(),
-            agent_idle: true,
-        })
-        .expect("序列化压缩命令请求"),
+        POPUP_VIEW,
+        UiInputEvent::MainInput {
+            text: "/compact".into(),
+            cursor: 8,
+        },
     )
     .await;
-    let compact: PrepareExecuteResponse =
-        serde_json::from_value(compact_value).expect("解析压缩命令响应");
-    assert_eq!(
-        compact,
-        PrepareExecuteResponse::SurfaceAction {
-            action: SurfaceAction::ReloadSessionContext,
-        }
-    );
+    send_input(
+        &host,
+        POPUP_VIEW,
+        UiInputEvent::Key {
+            code: "enter".into(),
+            modifiers: Vec::new(),
+        },
+    )
+    .await;
+    let actions = drain_host_actions(&host).await;
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, UiHostAction::SetInput { text, .. } if text.is_empty())));
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        UiHostAction::ReloadContext { label: Some(label) } if label == "/compact"
+    )));
 
-    let resume_value = call_service(
+    // `/resume` 打开对话框并请求会话摘要。
+    send_input(
         &host,
-        PREPARE_EXECUTE_SERVICE,
-        serde_json::to_value(PrepareExecuteRequest {
-            input: "/resume".into(),
-            agent_idle: true,
-        })
-        .expect("序列化恢复命令请求"),
+        POPUP_VIEW,
+        UiInputEvent::MainInput {
+            text: "/resume".into(),
+            cursor: 7,
+        },
     )
     .await;
-    let resume: PrepareExecuteResponse =
-        serde_json::from_value(resume_value).expect("解析恢复命令响应");
-    assert_eq!(
-        resume,
-        PrepareExecuteResponse::SurfaceOpened {
-            view_id: SESSION_DIALOG_VIEW.into(),
-        }
-    );
+    send_input(
+        &host,
+        POPUP_VIEW,
+        UiInputEvent::Key {
+            code: "enter".into(),
+            modifiers: Vec::new(),
+        },
+    )
+    .await;
+    let actions = drain_host_actions(&host).await;
+    let query_id = actions
+        .iter()
+        .find_map(|action| match action {
+            UiHostAction::QuerySessions {
+                query_id,
+                reply_service,
+                ..
+            } => {
+                assert_eq!(reply_service, SURFACE_UPDATE_SERVICE);
+                Some(*query_id)
+            }
+            _ => None,
+        })
+        .expect("/resume 必须请求会话摘要");
 
     let frame = host
         .render_ui(&UiRenderRequest {
@@ -122,7 +201,7 @@ async fn component_routes_builtin_commands_and_dialog() {
             width: 80,
             height: 24,
             focused: true,
-            frame: 1,
+            frame: 2,
         })
         .await
         .expect("Command Dialog 渲染不应失败")
@@ -130,56 +209,51 @@ async fn component_routes_builtin_commands_and_dialog() {
     assert!(frame.visible);
     assert_eq!(frame.view_id, SESSION_DIALOG_VIEW);
 
-    let effects_value =
-        call_service(&host, SURFACE_POLL_EFFECTS_SERVICE, serde_json::json!({})).await;
-    let effects: SurfaceEffectsResponse =
-        serde_json::from_value(effects_value).expect("解析 surface effect");
-    let request_id = effects
-        .effects
-        .iter()
-        .find_map(|effect| match effect {
-            SurfaceEffect::QuerySessions { request_id, .. } => Some(*request_id),
-            _ => None,
-        })
-        .expect("/resume 必须请求会话摘要");
-
     let update = call_service(
         &host,
         SURFACE_UPDATE_SERVICE,
-        serde_json::to_value(SurfaceUpdateRequest {
-            request_id,
-            status: SessionListStatus::Empty,
+        serde_json::to_value(UiSessionsReply {
+            query_id,
+            status: UiSessionListStatus::Empty,
         })
-        .expect("序列化 surface 更新"),
+        .expect("序列化会话应答"),
     )
     .await;
     assert_eq!(update["accepted"], true);
 
-    host.on_ui_input(&UiInput {
-        plugin_id: "command".into(),
-        view_id: SESSION_DIALOG_VIEW.into(),
-        instance_id: None,
-        event: UiInputEvent::Key {
+    // Esc 关闭对话框，关闭状态由帧可见性表达。
+    send_input(
+        &host,
+        SESSION_DIALOG_VIEW,
+        UiInputEvent::Key {
             code: "escape".into(),
             modifiers: Vec::new(),
         },
-    })
-    .await
-    .expect("真实 WIT 输入路由不应失败");
-    let effects_value =
-        call_service(&host, SURFACE_POLL_EFFECTS_SERVICE, serde_json::json!({})).await;
-    let effects: SurfaceEffectsResponse =
-        serde_json::from_value(effects_value).expect("解析关闭 effect");
-    assert_eq!(effects.effects, vec![SurfaceEffect::CloseSurface]);
+    )
+    .await;
+    let frame = host
+        .render_ui(&UiRenderRequest {
+            plugin_id: "command".into(),
+            view_id: SESSION_DIALOG_VIEW.into(),
+            instance_id: None,
+            width: 80,
+            height: 24,
+            focused: false,
+            frame: 3,
+        })
+        .await
+        .expect("关闭后的渲染不应失败")
+        .expect("关闭后的 Dialog 仍返回帧");
+    assert!(!frame.visible);
 
     let error = host
         .call_service(&PluginServiceCall {
             caller_id: "untrusted-plugin".into(),
             plugin_id: "command".into(),
             name: SURFACE_UPDATE_SERVICE.into(),
-            payload: serde_json::to_value(SurfaceUpdateRequest {
-                request_id,
-                status: SessionListStatus::Empty,
+            payload: serde_json::to_value(UiSessionsReply {
+                query_id,
+                status: UiSessionListStatus::Empty,
             })
             .expect("序列化未授权更新"),
         })
@@ -195,8 +269,8 @@ async fn component_unload_clears_all_host_routes() {
     let mut host = load_wasm_plugins(&[manifest])
         .await
         .expect("Command component 应加载成功");
-    assert_eq!(host.ui_declarations().await.expect("读取 UI 声明").len(), 1);
-    assert_eq!(host.services().await.expect("读取服务目录").len(), 7);
+    assert_eq!(host.ui_declarations().await.expect("读取 UI 声明").len(), 2);
+    assert_eq!(host.services().await.expect("读取服务目录").len(), 5);
 
     let removed = host.clear();
     assert!(host

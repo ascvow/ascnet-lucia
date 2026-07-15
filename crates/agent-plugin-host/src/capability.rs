@@ -505,6 +505,9 @@ impl CapabilityState {
         if request.name.trim().is_empty() {
             return Err(anyhow!("扩展事件名称不能为空"));
         }
+        if request.name == crate::ui::UI_HOST_ACTION_EVENT && !self.permissions.surface_actions {
+            return Err(anyhow!("插件 manifest 未声明 surface_actions 能力"));
+        }
         self.contributions.emit_event(json!({
             "source": {
                 "type": "plugin",

@@ -1704,7 +1704,6 @@ dependencies = [
  "async-trait",
  "base64",
  "clap",
- "command-protocol",
  "crossterm",
  "futures-util",
  "ratatui",

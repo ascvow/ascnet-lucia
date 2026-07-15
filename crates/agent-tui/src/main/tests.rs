@@ -360,18 +360,12 @@ fn unavailable_agent_queues_inputs_in_fifo_order() {
     let (_, status) = app.plugin_status_content();
     assert!(status.contains("queued 2"), "{status}");
 
+    // 触发前缀尚未由插件声明时，斜杠文本没有特殊语义，按普通输入排队。
     app.input = "/clear".into();
     app.cursor = app.input.len();
     app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
-    assert_eq!(app.input, "/clear");
-    assert_eq!(app.queued_inputs.len(), 2);
-    assert_eq!(
-        app.messages
-            .iter()
-            .filter(|message| matches!(message.kind, MsgKind::User))
-            .count(),
-        2
-    );
+    assert!(app.input.is_empty());
+    assert_eq!(app.queued_inputs.len(), 3);
 }
 
 /// 插件仍在渐进加载时，普通输入应立即启动已有工具快照，不进入等待队列。
@@ -1206,6 +1200,7 @@ fn test_plugin_view(placement: UiPlacement, title: &str) -> PluginViewState {
                 height: Some(8),
             },
             focusable: true,
+            input_triggers: Vec::new(),
         },
         frame: Some(PluginUiFrame {
             view_id: format!("{placement:?}").to_ascii_lowercase(),
@@ -1221,20 +1216,22 @@ fn test_plugin_view(placement: UiPlacement, title: &str) -> PluginViewState {
     }
 }
 
-/// 隐藏的 Command Dialog 只接受定向刷新，不参与周期性跨 WASM 轮询。
+/// 触发未激活的输入面板只接受定向刷新，不参与周期性跨 WASM 轮询。
 #[test]
 #[cfg(feature = "plugins")]
-fn hidden_command_dialog_is_excluded_from_periodic_refresh() {
+fn inactive_input_panel_is_excluded_from_periodic_refresh() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    let mut view = test_plugin_view(UiPlacement::Dialog, "会话");
-    view.declaration.plugin_id = PROVIDER_PLUGIN_ID.into();
-    view.declaration.view_id = SESSION_DIALOG_VIEW.into();
-    view.frame.as_mut().expect("测试视图应包含帧").visible = false;
+    let mut view = test_plugin_view(UiPlacement::InputPanel, "命令");
+    view.declaration.input_triggers = vec!["/".into()];
     app.plugin_views.push(view);
 
     assert!(app.periodic_plugin_render_requests().is_empty());
     assert_eq!(app.plugin_render_requests().len(), 1);
+
+    app.input = "/res".into();
+    app.cursor = app.input.len();
+    assert_eq!(app.periodic_plugin_render_requests().len(), 1);
 }
 
 /// 验证右侧插槽与主界面可以同时渲染，且插件获得实际内容尺寸。
@@ -1382,68 +1379,53 @@ fn tab_cycles_plugin_focus() {
     assert_eq!(app.plugin_focus, None);
 }
 
-/// 验证参数候选使用 Provider 给出的 UTF-8 字节区间替换中文输入。
+/// 验证插件替换主输入时光标被限制在合法的 UTF-8 边界内。
 #[test]
 #[cfg(feature = "plugins")]
-fn command_completion_replaces_utf8_argument_range() {
+fn set_main_input_clamps_cursor_to_char_boundary() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    app.input = "/deploy 北京".into();
-    app.cursor = app.input.len();
-    app.command_selection = 1;
-    app.command_completion = Some(ResolvedCommandCompletion {
-        source_input: app.input.clone(),
-        source_cursor: app.cursor,
-        context: CompletionContext {
-            command: "deploy".into(),
-            argument: "region".into(),
-            argument_index: 0,
-            replacement_start: 8,
-            replacement_end: u32::try_from(app.input.len()).expect("输入长度应可转换"),
-            prefix: "北京".into(),
-        },
-        items: vec![
-            CompletionItem {
-                label: "北京".into(),
-                insert_text: "北京".into(),
-                description: None,
-            },
-            CompletionItem {
-                label: "上海".into(),
-                insert_text: "上海".into(),
-                description: Some("华东".into()),
-            },
-        ],
-    });
 
-    assert!(app.apply_selected_command_completion());
+    app.set_main_input("/deploy 上海".into(), None);
     assert_eq!(app.input, "/deploy 上海");
     assert_eq!(app.cursor, app.input.len());
-    assert!(app.command_completion.is_none());
+
+    // 光标落在多字节字符中间时回退到最近的合法边界。
+    app.set_main_input("/deploy 上海".into(), Some(9));
+    assert_eq!(app.cursor, 8);
+
+    // 越界光标收敛到文本末尾。
+    app.set_main_input("/x".into(), Some(99));
+    assert_eq!(app.cursor, 2);
 }
 
-/// 验证输入斜杠时展示命令用法、摘要和详细说明。
+/// 验证触发激活时输入面板渲染插件提供的帧内容。
 #[test]
 #[cfg(feature = "plugins")]
-fn command_preview_renders_descriptive_snapshot() {
+fn input_panel_renders_plugin_frame_when_trigger_active() {
     let backend = TestBackend::new(100, 20);
-    let mut terminal = Terminal::new(backend).expect("创建命令预览测试终端");
+    let mut terminal = Terminal::new(backend).expect("创建输入面板测试终端");
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
+    let mut view = test_plugin_view(UiPlacement::InputPanel, "命令");
+    view.declaration.input_triggers = vec!["/".into()];
+    view.frame = Some(PluginUiFrame {
+        view_id: view.declaration.view_id.clone(),
+        visible: true,
+        lines: vec![UiLine {
+            spans: vec![UiSpan {
+                text: "/resume  恢复历史会话".into(),
+                style: UiStyle::default(),
+            }],
+        }],
+    });
+    app.plugin_views.push(view);
     app.input = "/res".into();
     app.cursor = app.input.len();
-    app.set_command_snapshot(Some(CommandSnapshot {
-        generation: 1,
-        commands: vec![CommandSpec::new(
-            "resume",
-            "恢复历史会话",
-            "打开当前项目的会话列表并选择恢复。",
-        )],
-    }));
 
     terminal
         .draw(|frame| render_root(frame, &mut app))
-        .expect("渲染命令预览");
+        .expect("渲染输入面板");
     let text = terminal
         .backend()
         .buffer()
@@ -1456,16 +1438,73 @@ fn command_preview_renders_descriptive_snapshot() {
         .collect::<String>();
     assert!(text.contains("/resume"), "{text}");
     assert!(text.contains("恢复历史会话"), "{text}");
-    assert!(
-        text.contains("打开当前项目的会话列表并选择恢复。"),
-        "{text}"
-    );
+
+    // 触发退出激活后面板整体消失，不依赖插件端状态。
+    app.input.clear();
+    app.cursor = 0;
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染无触发界面");
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!text.contains("恢复历史会话"), "{text}");
 }
 
-/// 验证 Session 参数候选只读取轻量摘要并按标题过滤。
+/// 验证触发手势键按面板可见性路由给触发视图。
+#[test]
+#[cfg(feature = "plugins")]
+fn trigger_gestures_route_to_trigger_view() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut view = test_plugin_view(UiPlacement::InputPanel, "命令");
+    view.declaration.input_triggers = vec!["/".into()];
+    app.plugin_views.push(view);
+    app.input = "/res".into();
+    app.cursor = app.input.len();
+
+    // Tab 与 Enter 在触发激活时始终交给触发视图。
+    for code in [KeyCode::Tab, KeyCode::Enter] {
+        let PluginKeyRoute::Input(input) = app.route_plugin_key(code, KeyModifiers::NONE) else {
+            panic!("触发手势应路由给触发视图");
+        };
+        assert_eq!(input.view_id, "inputpanel");
+    }
+    // 面板可见时方向键交给触发视图；隐藏时保留给主界面。
+    assert!(matches!(
+        app.route_plugin_key(KeyCode::Up, KeyModifiers::NONE),
+        PluginKeyRoute::Input(_)
+    ));
+    app.plugin_views[0]
+        .frame
+        .as_mut()
+        .expect("测试视图应包含帧")
+        .visible = false;
+    assert!(matches!(
+        app.route_plugin_key(KeyCode::Up, KeyModifiers::NONE),
+        PluginKeyRoute::Main
+    ));
+    // 带修饰键的 Enter 是换行手势，必须留给输入编辑器。
+    assert!(matches!(
+        app.route_plugin_key(KeyCode::Enter, KeyModifiers::ALT),
+        PluginKeyRoute::Main
+    ));
+    // 无触发前缀时手势键全部回归主界面语义。
+    app.input.clear();
+    assert!(matches!(
+        app.route_plugin_key(KeyCode::Enter, KeyModifiers::NONE),
+        PluginKeyRoute::Main
+    ));
+}
+
+/// 验证会话摘要查询按标题过滤并返回 UI 契约状态。
 #[tokio::test]
 #[cfg(feature = "plugins")]
-async fn session_completion_uses_summary_titles() {
+async fn sessions_page_filters_by_title() {
     let store = MemorySessionStore::new();
     for (id, title) in [("alpha", "架构讨论"), ("beta", "发布计划")] {
         let mut record = SessionRecord::new(
@@ -1476,13 +1515,19 @@ async fn session_completion_uses_summary_titles() {
         record.title = Some(title.into());
         store.save(record, None).await.expect("保存候选会话");
     }
+    let active = SessionId::new("alpha").expect("创建当前会话标识");
 
-    let items = session_completion_items(&store, "架构", 6)
-        .await
-        .expect("读取 Session 候选");
+    let status = sessions_page(&store, &active, "架构", None, 6).await;
+    let UiSessionListStatus::Ready { items, next_cursor } = status else {
+        panic!("匹配查询应返回就绪状态");
+    };
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].label, "架构讨论");
-    assert_eq!(items[0].insert_text, "alpha");
+    assert_eq!(items[0].title, "架构讨论");
+    assert!(items[0].active);
+    assert_eq!(next_cursor, None);
+
+    let status = sessions_page(&store, &active, "不存在", None, 6).await;
+    assert!(matches!(status, UiSessionListStatus::Empty));
 }
 
 /// 验证恢复会话前必须重新读取并严格匹配用户选择时看到的 revision。

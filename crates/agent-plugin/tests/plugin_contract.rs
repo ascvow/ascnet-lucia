@@ -1,7 +1,8 @@
 //! Guest SDK 的 WIT 与 UI JSON 契约回归测试。
 
 use agent_plugin::{
-    UiDeclaration, UiFrame, UiInput, UiNavigationRequest, UiRenderRequest, PLUGIN_WIT,
+    UiDeclaration, UiFrame, UiHostActionRequest, UiInput, UiNavigationRequest, UiRenderRequest,
+    UiSessionsReply, PLUGIN_WIT,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -78,10 +79,17 @@ fn guest_ui_types_match_contract_fixture() {
 
     assert_round_trip::<UiDeclaration>(&fixture["declaration"]);
     assert_round_trip::<UiDeclaration>(&fixture["input_declaration"]);
+    assert_round_trip::<UiDeclaration>(&fixture["trigger_declaration"]);
     assert_round_trip::<UiRenderRequest>(&fixture["render_request"]);
     assert_round_trip::<UiFrame>(&fixture["frame"]);
     assert_round_trip::<UiInput>(&fixture["input"]);
+    assert_round_trip::<UiInput>(&fixture["main_input"]);
     assert_round_trip::<UiNavigationRequest>(&fixture["navigation"]);
+    assert_round_trip::<UiHostActionRequest>(&fixture["host_action_set_input"]);
+    assert_round_trip::<UiHostActionRequest>(&fixture["host_action_reload_context"]);
+    assert_round_trip::<UiHostActionRequest>(&fixture["host_action_resume_session"]);
+    assert_round_trip::<UiHostActionRequest>(&fixture["host_action_query_sessions"]);
+    assert_round_trip::<UiSessionsReply>(&fixture["sessions_reply"]);
 }
 
 /// 规范 WIT、Guest 常量和导出宏副本必须保持同一函数表面。

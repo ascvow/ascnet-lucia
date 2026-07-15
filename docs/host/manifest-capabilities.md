@@ -77,6 +77,7 @@ Host 会先串联普通插件的工具 Rewrite，再把最终调用交给选中�
 | `process_exec` | 可用 | 无 shell，stdin/stdout 由 Host 管理 |
 | `agent` | 可用 | 分操作授权、profile allowlist、可信身份与卸载撤销 |
 | `model_completion` | 可用 | 应用固定 provider/model/stream，Host 禁用工具与推理并限制输出 |
+| `surface_actions` | 可用 | 允许发布 `ui.host.action` 事件驱动宿主应用级动作 |
 | `fs_write` | 尚未开放 | manifest 申请会被拒绝 |
 | `http` | 尚未开放 | manifest 申请会被拒绝 |
 | `secrets` | 尚未开放 | manifest 申请会被拒绝 |
@@ -91,6 +92,15 @@ model_completion = true
 ```
 
 Manifest 只允许插件请求一次受限模型完成；应用还必须通过 `PluginHostServices::with_model_completion` 注入已注册的模型网关、可信 provider/model、流式模式和最大输出 token。Guest 请求只包含 system、provider-neutral messages 和更小的输出上限，未知字段会被拒绝。Host 强制工具列表为空、`tool_choice = none`、推理关闭，模型返回工具调用或空文本时调用失败。
+
+## 宿主动作权限
+
+```toml
+[capabilities]
+surface_actions = true
+```
+
+声明后插件可以发布 `ui.host.action` 扩展事件，请求宿主执行替换主输入、新建或清空会话、重载上下文、退出应用、恢复会话与会话查询等基础动作。未声明的插件发布该事件会在发布时被 Host 拒绝。动作词汇表与应答类型定义在 `agent_plugin_host::ui`（Guest 侧为 `agent_plugin` 同名类型），线格式由 `wit/fixtures/ui-v1.json` 的双侧契约测试保证。
 
 ## Agent Runtime 权限
 

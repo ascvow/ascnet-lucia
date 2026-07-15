@@ -18,7 +18,7 @@ pub mod wasm;
 
 use agent_core::{
     model::{ModelGateway, ModelMessage},
-    AgentExtension, ContextLoadRequest, ContextLoader, LoadedContext,
+    ContextLoadRequest, ContextLoader, LoadedContext,
 };
 #[cfg(feature = "wasm")]
 use agent_runtime::{AgentDeriveConfig, AgentProfileId, AgentRuntimeProvisioner};
@@ -30,7 +30,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-pub use agent_core::{AgentEvent, AgentEventKind, ToolDecision};
+pub use agent_core::{AgentEvent, AgentEventKind, AgentExtension, ToolDecision};
 pub use service::{PluginService, PluginServiceCall};
 pub use ui::{UiDeclaration, UiFrame, UiInput, UiRenderRequest};
 
@@ -933,6 +933,7 @@ mod tests {
                 placement: UiPlacement::Right,
                 size: UiSize::default(),
                 focusable: true,
+                input_triggers: Vec::new(),
             }])
         }
 

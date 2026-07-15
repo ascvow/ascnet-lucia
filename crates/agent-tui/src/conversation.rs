@@ -71,10 +71,6 @@ impl From<String> for UserSubmission {
     }
 }
 
-/// Command 注册表兜底刷新间隔，约为十五秒。
-#[cfg(feature = "plugins")]
-pub(crate) const COMMAND_SNAPSHOT_REFRESH_TICKS: u8 = 188;
-
 // ─── 聊天消息 ───
 
 pub(crate) enum MsgKind {

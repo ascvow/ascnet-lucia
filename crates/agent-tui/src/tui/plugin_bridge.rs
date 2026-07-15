@@ -54,8 +54,28 @@ pub(crate) async fn refresh_plugin_view(
     let Some(request) = request else {
         return;
     };
-    let (plugin_id, view_id, instance_id, result) =
-        render_plugin_request(plugin_host, request).await;
+    apply_rendered_request(app, render_plugin_request(plugin_host, request).await);
+}
+
+/// 刷新单个插件的全部视图；插件可在输入处理中开关自己的对话框或面板。
+pub(crate) async fn refresh_plugin_views_for(
+    app: &mut App,
+    plugin_host: &dyn PluginHost,
+    plugin_id: &str,
+) {
+    let requests = app
+        .plugin_render_requests()
+        .into_iter()
+        .filter(|request| request.plugin_id == plugin_id)
+        .collect::<Vec<_>>();
+    for request in requests {
+        apply_rendered_request(app, render_plugin_request(plugin_host, request).await);
+    }
+}
+
+/// 把一次定向渲染结果提交到视图缓存，并同步 Input 视图焦点。
+fn apply_rendered_request(app: &mut App, rendered: PluginRenderResult) {
+    let (plugin_id, view_id, instance_id, result) = rendered;
     match result {
         Ok(Some(frame)) => {
             app.update_plugin_frame(&plugin_id, instance_id.as_deref(), frame);
@@ -145,10 +165,13 @@ fn plugin_event_message(event: &Value) -> Option<Msg> {
 /// 消费插件 UI 输入产生的事件，同时保留普通主事件列表输出。
 pub(crate) async fn drain_plugin_ui_events(
     app: &mut App,
-    plugin_host: &dyn PluginHost,
+    plugin_host: &Arc<LivePluginHost>,
 ) -> Result<()> {
-    for event in plugin_host.drain_events().await? {
+    for event in agent_core::AgentExtension::drain_events(plugin_host.as_ref()).await? {
         if apply_plugin_navigation_event(app, &event)? {
+            continue;
+        }
+        if apply_plugin_host_action_event(app, plugin_host, &event).await? {
             continue;
         }
         if let Some(message) = plugin_event_message(&event) {

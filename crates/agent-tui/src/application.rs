@@ -286,57 +286,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     #[cfg(feature = "plugins")]
                     match app.route_plugin_key(key.code, key.modifiers) {
                         PluginKeyRoute::Main => {
-                            let argument_completion = matches!(key.code, KeyCode::Tab)
-                                && app
-                                    .input
-                                    .trim_start()
-                                    .strip_prefix('/')
-                                    .is_some_and(|body| body.chars().any(char::is_whitespace));
-                            // 带修饰键的 Enter 是换行手势，必须留给输入编辑器。
-                            let command_submission = matches!(key.code, KeyCode::Enter)
-                                && key.modifiers.is_empty()
-                                && app.input.trim_start().starts_with('/');
-                            let command_ready = plugin_host.as_ref().is_some_and(|host| {
-                                host.is_ready(PROVIDER_PLUGIN_ID).unwrap_or(false)
-                            });
-                            if argument_completion && command_ready {
-                                if !app.apply_selected_command_completion()
-                                    && !app.command_completion_loading
-                                {
-                                    if let Some(host) = plugin_host.as_ref() {
-                                        app.schedule_command_completion(Arc::clone(host));
-                                    } else {
-                                        app.messages.push(Msg::new(
-                                            MsgKind::Error,
-                                            "Command 插件不可用，无法补全参数",
-                                        ));
-                                    }
+                            let before = (app.input.clone(), app.cursor);
+                            app.handle_key(key.code, key.modifiers, agent.as_ref());
+                            // 编辑结果变化且触发前缀激活时同步主输入快照。
+                            if app.input != before.0 || app.cursor != before.1 {
+                                if let Some(host) = plugin_host.as_ref() {
+                                    forward_main_input_snapshot(&mut app, host).await;
                                 }
-                            } else if command_submission && command_ready {
-                                if let Some(input) = app.take_input() {
-                                    if let Some(host) = plugin_host.as_ref() {
-                                        if let Err(error) =
-                                            execute_command(&mut app, host, input).await
-                                        {
-                                            app.messages.push(Msg::new(
-                                                MsgKind::Error,
-                                                format!("命令执行失败：{error}"),
-                                            ));
-                                        }
-                                    } else {
-                                        app.messages.push(Msg::new(
-                                            MsgKind::Error,
-                                            "Command 插件不可用，无法执行斜杠命令",
-                                        ));
-                                    }
-                                }
-                            } else if command_submission {
-                                app.messages.push(Msg::new(
-                                    MsgKind::Info,
-                                    "Command 插件仍在加载，命令已保留在输入框",
-                                ));
-                            } else {
-                                app.handle_key(key.code, key.modifiers, agent.as_ref());
                             }
                         }
                         PluginKeyRoute::Consumed => {}
@@ -352,32 +308,18 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                         &error,
                                     );
                                 } else {
-                                    if let Err(error) =
-                                        drain_plugin_ui_events(&mut app, host.as_ref()).await
+                                    if let Err(error) = drain_plugin_ui_events(&mut app, host).await
                                     {
                                         app.messages.push(Msg::new(
                                             MsgKind::Error,
                                             format!("插件 UI 事件处理失败：{error}"),
                                         ));
                                     }
-                                    if input.plugin_id == PROVIDER_PLUGIN_ID
-                                        && input.view_id == SESSION_DIALOG_VIEW
-                                    {
-                                        if let Err(error) =
-                                            process_command_surface_effects(&mut app, host.as_ref())
-                                                .await
-                                        {
-                                            app.messages.push(Msg::new(
-                                                MsgKind::Error,
-                                                format!("会话界面操作失败：{error}"),
-                                            ));
-                                        }
-                                    }
-                                    refresh_plugin_view(
+                                    // 刷新该插件的全部视图，插件可借输入处理开关对话框。
+                                    refresh_plugin_views_for(
                                         &mut app,
                                         host.as_ref(),
                                         &input.plugin_id,
-                                        &input.view_id,
                                     )
                                     .await;
                                 }
@@ -404,19 +346,6 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                 MsgKind::Error,
                                 format!("插件视图导航失败：{error}"),
                             ));
-                        }
-                    }
-                    if plugin_id == PROVIDER_PLUGIN_ID {
-                        match load_command_snapshot(
-                            plugin_host.as_ref().expect("动态插件宿主必须存在").as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(snapshot) => app.set_command_snapshot(snapshot),
-                            Err(error) => app.messages.push(Msg::new(
-                                MsgKind::Error,
-                                format!("Command 命令快照加载失败：{error}"),
-                            )),
                         }
                     }
                     if let Some(host) = plugin_host.as_ref() {
@@ -458,74 +387,31 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             },
             #[cfg(feature = "plugins")]
-            Some(UiEvent::CommandSurfaceUpdate { request_id, status }) => {
+            Some(UiEvent::SessionsQueryDone {
+                plugin_id,
+                reply_service,
+                reply,
+            }) => {
                 if let Some(host) = plugin_host.as_ref() {
-                    let update = SurfaceUpdateRequest { request_id, status };
                     match call_typed_plugin_service::<_, Value>(
                         host.as_ref(),
-                        TUI_COMMAND_CALLER,
-                        PROVIDER_PLUGIN_ID,
-                        SURFACE_UPDATE_SERVICE,
-                        &update,
+                        HOST_SERVICE_CALLER,
+                        &plugin_id,
+                        &reply_service,
+                        reply.as_ref(),
                     )
                     .await
                     {
                         Ok(Some(_)) => {
-                            refresh_plugin_view(
-                                &mut app,
-                                host.as_ref(),
-                                PROVIDER_PLUGIN_ID,
-                                SESSION_DIALOG_VIEW,
-                            )
-                            .await
+                            refresh_plugin_views_for(&mut app, host.as_ref(), &plugin_id).await
                         }
                         Ok(None) => app.messages.push(Msg::new(
                             MsgKind::Error,
-                            "Command 插件在会话查询完成前已不可用",
+                            format!("插件 `{plugin_id}` 在会话查询完成前已不可用"),
                         )),
                         Err(error) => app.messages.push(Msg::new(
                             MsgKind::Error,
-                            format!("更新会话界面失败：{error}"),
-                        )),
-                    }
-                }
-            }
-            #[cfg(feature = "plugins")]
-            Some(UiEvent::CommandSnapshotLoaded(result)) => {
-                app.command_snapshot_refreshing = false;
-                if let Ok(snapshot) = *result {
-                    let changed = snapshot.as_ref().map(|snapshot| snapshot.generation)
-                        != app
-                            .command_snapshot
-                            .as_ref()
-                            .map(|snapshot| snapshot.generation);
-                    if changed {
-                        app.set_command_snapshot(snapshot);
-                    }
-                }
-            }
-            #[cfg(feature = "plugins")]
-            Some(UiEvent::CommandCompletionLoaded { generation, result }) => {
-                if generation == app.command_completion_generation {
-                    app.command_completion_loading = false;
-                    app.command_completion_task = None;
-                    match *result {
-                        Ok(Some(completion))
-                            if completion.source_input == app.input
-                                && completion.source_cursor == app.cursor =>
-                        {
-                            let apply_immediately = completion.items.len() == 1;
-                            app.command_completion = Some(completion);
-                            app.command_selection = 0;
-                            app.command_preview_hidden = false;
-                            if apply_immediately {
-                                app.apply_selected_command_completion();
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(error) => app.messages.push(Msg::new(
-                            MsgKind::Error,
-                            format!("命令参数补全失败：{error}"),
+                            format!("回送会话查询结果失败：{error}"),
                         )),
                     }
                 }
@@ -609,7 +495,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 app.handle_session_context_reloaded(*result);
                 // 重载期间加载器插件发布的展示事件补进主事件列表。
                 if let Some(host) = plugin_host.as_ref() {
-                    if let Err(error) = drain_plugin_ui_events(&mut app, host.as_ref()).await {
+                    if let Err(error) = drain_plugin_ui_events(&mut app, host).await {
                         app.messages.push(Msg::new(
                             MsgKind::Error,
                             format!("插件事件处理失败：{error}"),
@@ -634,7 +520,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 tick_pending.store(false, Ordering::Relaxed);
                 #[cfg(feature = "plugins")]
                 let animate_spinner =
-                    app.running || app.plugins_loading || app.pending_command.is_some();
+                    app.running || app.plugins_loading || app.pending_reload.is_some();
                 #[cfg(not(feature = "plugins"))]
                 let animate_spinner = app.running;
                 if animate_spinner {
@@ -648,13 +534,6 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         app.plugin_tick = 0;
                         if let Some(host) = plugin_host.as_ref() {
                             app.schedule_plugin_views_refresh(Arc::clone(host));
-                        }
-                    }
-                    app.command_snapshot_tick = app.command_snapshot_tick.wrapping_add(1);
-                    if app.command_snapshot_tick >= COMMAND_SNAPSHOT_REFRESH_TICKS {
-                        app.command_snapshot_tick = 0;
-                        if let Some(host) = plugin_host.as_ref() {
-                            app.schedule_command_snapshot_refresh(Arc::clone(host));
                         }
                     }
                 }
@@ -673,34 +552,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                     &error,
                                 );
                             } else {
-                                if let Err(error) =
-                                    drain_plugin_ui_events(&mut app, host.as_ref()).await
-                                {
+                                if let Err(error) = drain_plugin_ui_events(&mut app, host).await {
                                     app.messages.push(Msg::new(
                                         MsgKind::Error,
                                         format!("插件 UI 事件处理失败：{error}"),
                                     ));
                                 }
-                                if input.plugin_id == PROVIDER_PLUGIN_ID
-                                    && input.view_id == SESSION_DIALOG_VIEW
-                                {
-                                    if let Err(error) =
-                                        process_command_surface_effects(&mut app, host.as_ref())
-                                            .await
-                                    {
-                                        app.messages.push(Msg::new(
-                                            MsgKind::Error,
-                                            format!("会话界面操作失败：{error}"),
-                                        ));
-                                    }
-                                }
-                                refresh_plugin_view(
-                                    &mut app,
-                                    host.as_ref(),
-                                    &input.plugin_id,
-                                    &input.view_id,
-                                )
-                                .await;
+                                refresh_plugin_views_for(&mut app, host.as_ref(), &input.plugin_id)
+                                    .await;
                             }
                         }
                     } else if !dialog_active {
@@ -728,6 +587,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 let main_input_focused = true;
                 if main_input_focused {
                     app.handle_paste(&pasted);
+                    // 粘贴同样可能激活触发前缀，同步一次主输入快照。
+                    #[cfg(feature = "plugins")]
+                    if let Some(host) = plugin_host.as_ref() {
+                        forward_main_input_snapshot(&mut app, host).await;
+                    }
                 }
             }
             Some(UiEvent::Input(_)) => {}
@@ -765,6 +629,28 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// 触发前缀激活时，把主输入快照转发给触发视图并刷新其面板。
+///
+/// 触发未激活时不产生任何插件调用；面板的隐藏由渲染层按触发状态兜底。
+#[cfg(feature = "plugins")]
+async fn forward_main_input_snapshot(app: &mut App, plugin_host: &Arc<LivePluginHost>) {
+    let Some(index) = app.active_trigger_view() else {
+        return;
+    };
+    let input = app.main_input_snapshot(index);
+    if let Err(error) = dispatch_plugin_input(plugin_host.as_ref(), &input).await {
+        app.set_plugin_ui_error(&input.plugin_id, &input.view_id, None, &error);
+        return;
+    }
+    if let Err(error) = drain_plugin_ui_events(app, plugin_host).await {
+        app.messages.push(Msg::new(
+            MsgKind::Error,
+            format!("插件 UI 事件处理失败：{error}"),
+        ));
+    }
+    refresh_plugin_view(app, plugin_host.as_ref(), &input.plugin_id, &input.view_id).await;
 }
 
 /// 将 Agent 运行失败补写到可选 JSONL 事件文件，不影响主界面的错误呈现。

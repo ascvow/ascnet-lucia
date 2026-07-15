@@ -97,6 +97,7 @@ impl AgentPlugin for EchoPlugin {
                 height: None,
             },
             focusable: true,
+            input_triggers: Vec::new(),
         }]
     }
 

@@ -228,6 +228,7 @@ impl AgentPlugin for PlanPlugin {
                 height: None,
             },
             focusable: false,
+            input_triggers: Vec::new(),
         }]
     }
 
