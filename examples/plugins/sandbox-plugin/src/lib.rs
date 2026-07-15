@@ -106,6 +106,7 @@ impl AgentPlugin for SandboxPlugin {
                 view_id: APPROVAL_VIEW.into(),
                 visible: false,
                 lines: Vec::new(),
+                cursor: None,
             });
         };
 
@@ -119,6 +120,7 @@ impl AgentPlugin for SandboxPlugin {
                 option_line("Cmd+A", "Allow all", self.selected == 2, false),
                 option_line("C", "Cancel and pause", self.selected == 3, true),
             ],
+            cursor: None,
         })
     }
 

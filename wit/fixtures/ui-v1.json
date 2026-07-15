@@ -110,7 +110,11 @@
           }
         ]
       }
-    ]
+    ],
+    "cursor": {
+      "x": 4,
+      "y": 1
+    }
   },
   "input": {
     "plugin_id": "fixture-plugin",

@@ -167,11 +167,13 @@ impl AgentPlugin for CommandPlugin {
                 lines: self
                     .popup
                     .render(&self.registry, self.agent_idle, request.width),
+                cursor: None,
             }),
             SESSION_DIALOG_VIEW => Some(UiFrame {
                 view_id: request.view_id,
                 visible: self.surface.visible,
                 lines: self.surface.render(request.width, request.height),
+                cursor: None,
             }),
             _ => None,
         }

@@ -7,8 +7,9 @@ use agent_plugin::{
     export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentHandle, AgentId,
     AgentOutcome, AgentPlugin, AgentSpawnRequest, AgentStatus, AgentViewSession, ExtensionEvent,
     PluginHostApi, PromptContribution, Result, ServiceCall, ServiceSpec, ToolCall, ToolResult,
-    ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
-    UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
+    ToolSpec, UiColor, UiCursor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
+    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -974,6 +975,22 @@ impl TeammatePlugin {
         lines
     }
 
+    /// 把共享 Agent 输入光标转换为成员子视图帧内的相对坐标。
+    fn member_session_cursor(&self, request: &UiRenderRequest) -> Option<UiCursor> {
+        let instance_id = request.instance_id.as_deref()?;
+        let owner = self.plugin_id.as_deref().unwrap_or_default();
+        let member = self
+            .state
+            .list_members(owner)
+            .into_iter()
+            .find(|member| member.id.as_str() == instance_id)?;
+        let session = self.member_sessions.get(&member.id)?;
+        let mut cursor =
+            session.cursor_position(request.width, request.height.saturating_sub(3))?;
+        cursor.y = cursor.y.saturating_add(3);
+        Some(cursor)
+    }
+
     /// 刷新当前工具 owner 名下全部成员的 Runtime 状态缓存。
     fn refresh_ui_statuses(&mut self, host: &dyn PluginHostApi) {
         let owner = self.plugin_id.clone().unwrap_or_default();
@@ -1204,6 +1221,9 @@ impl AgentPlugin for TeammatePlugin {
     /// 团队摘要在当前 owner 没有成员时返回隐藏帧，子视图不受该条件影响。
     fn render_ui(&mut self, request: UiRenderRequest) -> Option<UiFrame> {
         let visible = request.view_id != TEAM_DOCK_VIEW || !self.ui_members().is_empty();
+        let cursor = (request.view_id == TEAM_SESSION_VIEW)
+            .then(|| self.member_session_cursor(&request))
+            .flatten();
         let lines = match request.view_id.as_str() {
             TEAM_DOCK_VIEW => self.render_team_dock(&request),
             TEAM_WORKSPACE_VIEW => self.render_team_workspace(&request),
@@ -1214,6 +1234,7 @@ impl AgentPlugin for TeammatePlugin {
             view_id: request.view_id,
             visible,
             lines,
+            cursor,
         })
     }
 
@@ -1735,6 +1756,7 @@ mod tests {
             session_text.contains("Waiting for Agent events"),
             "{session_text}"
         );
+        assert_eq!(session.cursor, Some(UiCursor { x: 2, y: 22 }));
     }
 
     /// 当前 owner 没有成员时，团队摘要不应占用右侧面板。

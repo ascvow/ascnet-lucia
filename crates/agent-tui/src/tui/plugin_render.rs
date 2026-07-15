@@ -132,8 +132,8 @@ fn render_plugin_view(frame: &mut Frame, view: &mut PluginViewState, area: Rect,
         .map(plugin_frame_lines)
         .unwrap_or_default();
     frame.render_widget(Paragraph::new(lines).block(block), area);
-    if focused && !content_area.is_empty() {
-        frame.set_cursor_position((content_area.x, content_area.y));
+    if focused {
+        set_plugin_cursor(frame, view.frame.as_ref(), content_area);
     }
 }
 
@@ -206,6 +206,23 @@ pub(crate) fn render_plugin_subview(frame: &mut Frame, app: &mut App, outer: Rec
             .wrap(Wrap { trim: false }),
         sections[1],
     );
+    set_plugin_cursor(frame, active.frame.as_ref(), active.area);
+}
+
+/// 将插件声明的相对坐标限制在内容区内，并恢复真实终端光标供输入法组合文本使用。
+fn set_plugin_cursor(frame: &mut Frame, plugin_frame: Option<&PluginUiFrame>, area: Rect) {
+    let Some(cursor) = plugin_frame.and_then(|plugin_frame| plugin_frame.cursor) else {
+        return;
+    };
+    if area.is_empty() {
+        return;
+    }
+    frame.set_cursor_position((
+        area.x
+            .saturating_add(cursor.x.min(area.width.saturating_sub(1))),
+        area.y
+            .saturating_add(cursor.y.min(area.height.saturating_sub(1))),
+    ));
 }
 
 /// 将插件声明式文本帧转换成 Ratatui 行。

@@ -164,6 +164,7 @@ impl PluginHost for BenchmarkPlugin {
             view_id: self.view_id.clone(),
             visible: true,
             lines: Vec::new(),
+            cursor: None,
         }))
     }
 

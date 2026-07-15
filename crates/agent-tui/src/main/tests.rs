@@ -1379,6 +1379,7 @@ impl PluginHost for ToolMessagePluginHost {
                     style: UiStyle::default(),
                 }],
             }],
+            cursor: None,
         }))
     }
 }
@@ -1446,6 +1447,7 @@ fn stale_tool_renderer_frame_is_ignored() {
                 style: UiStyle::default(),
             }],
         }],
+        cursor: None,
     };
 
     app.apply_tool_frame("call-1", 1, 72, Ok(Some(frame("旧帧"))));
@@ -1482,6 +1484,7 @@ fn test_plugin_view(placement: UiPlacement, title: &str) -> PluginViewState {
                     style: UiStyle::default(),
                 }],
             }],
+            cursor: None,
         }),
         area: Rect::default(),
     }
@@ -1598,6 +1601,7 @@ fn plugin_subview_replaces_main_view_and_routes_instance_input() {
                     style: UiStyle::default(),
                 }],
             }],
+            cursor: Some(agent_plugin_protocol::UiCursor { x: 5, y: 2 }),
         },
     );
 
@@ -1614,6 +1618,14 @@ fn plugin_subview_replaces_main_view_and_routes_instance_input() {
     assert!(rendered.contains("Reviewer Agent"), "{rendered:?}");
     assert!(rendered.contains("subview-content"), "{rendered:?}");
     assert!(!rendered.contains("main-view-content"), "{rendered:?}");
+    let active_area = app.view_stack.active().expect("子视图保持激活").area;
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("再次渲染子视图");
+    assert_eq!(
+        terminal.get_cursor_position().expect("读取终端光标"),
+        ratatui::layout::Position::new(active_area.x + 5, active_area.y + 2)
+    );
 
     let PluginKeyRoute::Input(input) = app.route_plugin_key(KeyCode::Enter, KeyModifiers::NONE)
     else {
@@ -1689,6 +1701,7 @@ fn input_panel_renders_plugin_frame_when_trigger_active() {
                 style: UiStyle::default(),
             }],
         }],
+        cursor: None,
     });
     app.plugin_views.push(view);
     app.input = "/res".into();

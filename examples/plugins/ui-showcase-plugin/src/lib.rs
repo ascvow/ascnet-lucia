@@ -163,6 +163,7 @@ impl AgentPlugin for UiShowcasePlugin {
             view_id: request.view_id.clone(),
             visible: request.view_id != DIALOG_VIEW || self.dialog_visible,
             lines,
+            cursor: None,
         })
     }
 

@@ -2,7 +2,7 @@
 
 use crate::{
     AgentContinueRequest, AgentEvent, AgentEventKind, AgentHandle, AgentId, AgentStatus,
-    PluginHostApi, UiColor, UiInputEvent, UiLine, UiSpan, UiStyle,
+    PluginHostApi, UiColor, UiCursor, UiInputEvent, UiLine, UiSpan, UiStyle,
 };
 use std::collections::VecDeque;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -152,6 +152,21 @@ impl AgentViewSession {
         lines
     }
 
+    /// 返回输入末尾相对 Agent 视图左上角的真实终端光标位置。
+    ///
+    /// 高度不足以完整显示三行输入框时不声明光标，避免宿主把光标放到边框外。
+    pub fn cursor_position(&self, width: u16, height: u16) -> Option<UiCursor> {
+        if width < 4 || height < 3 {
+            return None;
+        }
+        let text_width = usize::from(width).saturating_sub(4);
+        let displayed = clip_to_width(&self.input, text_width);
+        Some(UiCursor {
+            x: u16::try_from(2usize.saturating_add(displayed.width())).unwrap_or(u16::MAX),
+            y: height.saturating_sub(2),
+        })
+    }
+
     /// 提交当前输入并根据 Agent 状态选择 steering 或成功会话续跑。
     fn submit(&mut self, host: &dyn PluginHostApi) -> Option<AgentHandle> {
         let input = self.input.trim().to_string();
@@ -286,7 +301,7 @@ fn agent_event_lines(timeline: &VecDeque<AgentViewItem>, width: usize) -> Vec<Ui
 /// 绘制固定高度的输入框，使成员事件增长时仍保留稳定的交互位置。
 fn input_box_lines(input: &str, width: usize) -> Vec<UiLine> {
     let border_width = width.saturating_sub(2);
-    let text_width = width.saturating_sub(5);
+    let text_width = width.saturating_sub(4);
     let displayed = if input.is_empty() {
         "Message Agent..."
     } else {
@@ -301,7 +316,6 @@ fn input_box_lines(input: &str, width: usize) -> Vec<UiLine> {
         UiLine {
             spans: vec![
                 span("│ ", Some(UiColor::Gray), false),
-                span("▏", Some(UiColor::Cyan), true),
                 span(
                     &displayed,
                     Some(if input.is_empty() {
@@ -450,6 +464,9 @@ mod tests {
             .spans
             .iter()
             .any(|span| span.text.contains("review this")));
-        assert!(lines[6].spans.iter().any(|span| span.text == "▏"));
+        assert_eq!(
+            session.cursor_position(24, 8),
+            Some(UiCursor { x: 13, y: 6 })
+        );
     }
 }

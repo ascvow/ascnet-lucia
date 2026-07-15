@@ -237,6 +237,18 @@ pub struct UiFrame {
     /// 按终端行排列的内容。
     #[serde(default)]
     pub lines: Vec<UiLine>,
+    /// 聚焦时宿主应显示的终端光标位置，相对当前视图内容区左上角。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<UiCursor>,
+}
+
+/// 插件帧中的相对终端光标位置。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiCursor {
+    /// 相对内容区左侧的终端列。
+    pub x: u16,
+    /// 相对内容区顶部的终端行。
+    pub y: u16,
 }
 
 fn default_visible() -> bool {
@@ -489,6 +501,19 @@ mod tests {
         .expect("解析静态视图渲染请求");
 
         assert_eq!(request.instance_id, None);
+    }
+
+    /// 旧插件省略新增光标字段时必须继续解析，并保持宿主原有光标行为。
+    #[test]
+    fn ui_frames_default_to_no_cursor() {
+        let frame: UiFrame = serde_json::from_value(json!({
+            "view_id": "panel",
+            "visible": true,
+            "lines": []
+        }))
+        .expect("解析旧版插件帧");
+
+        assert_eq!(frame.cursor, None);
     }
 
     /// 子视图导航请求必须保留动作和动态实例身份。

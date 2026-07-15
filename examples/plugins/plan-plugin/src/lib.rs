@@ -276,6 +276,7 @@ impl AgentPlugin for PlanPlugin {
                 .iter()
                 .any(|item| item.status != PlanStatus::Completed),
             lines,
+            cursor: None,
         })
     }
 

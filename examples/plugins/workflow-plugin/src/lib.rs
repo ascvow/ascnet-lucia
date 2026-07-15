@@ -273,6 +273,7 @@ impl AgentPlugin for WorkflowPlugin {
             view_id: request.view_id,
             visible,
             lines,
+            cursor: None,
         })
     }
 

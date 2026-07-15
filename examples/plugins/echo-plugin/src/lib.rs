@@ -121,6 +121,7 @@ impl AgentPlugin for EchoPlugin {
             view_id: request.view_id,
             visible: true,
             lines,
+            cursor: None,
         })
     }
 

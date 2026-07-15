@@ -1077,6 +1077,7 @@ mod tests {
                 view_id: request.renderer_id.clone(),
                 visible: true,
                 lines: Vec::new(),
+                cursor: None,
             }))
         }
     }
@@ -1111,6 +1112,7 @@ mod tests {
                 view_id: self.view_id.to_string(),
                 visible: true,
                 lines: Vec::new(),
+                cursor: None,
             }))
         }
 

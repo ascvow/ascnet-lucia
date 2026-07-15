@@ -1306,6 +1306,7 @@ impl App {
                         },
                     }],
                 }],
+                cursor: None,
             },
         );
     }
