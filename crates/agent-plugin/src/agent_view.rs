@@ -2,9 +2,10 @@
 
 use crate::{
     AgentContinueRequest, AgentEvent, AgentEventKind, AgentHandle, AgentId, AgentStatus,
-    PluginHostApi, UiColor, UiInputEvent, UiLine, UiSpan, UiStyle,
+    PluginHostApi, UiColor, UiInputEvent, UiLanguage, UiLine, UiSpan, UiStyle,
 };
 use std::collections::VecDeque;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// 单个 Agent 主界面最多保留的 Runtime 事件和本地用户消息数量。
 const EVENT_LIMIT: usize = 512;
@@ -15,6 +16,7 @@ const EVENT_LIMIT: usize = 512;
 /// 节点映射、导航标题和权限策略仍由调用插件负责。
 pub struct AgentViewSession {
     target: AgentId,
+    language: UiLanguage,
     timeline: VecDeque<AgentViewItem>,
     input: String,
     feedback: Option<std::result::Result<String, String>>,
@@ -34,11 +36,18 @@ impl AgentViewSession {
     pub fn new(target: AgentId) -> Self {
         Self {
             target,
+            language: UiLanguage::English,
             timeline: VecDeque::new(),
             input: String::new(),
             feedback: None,
             status: None,
         }
+    }
+
+    /// 设置当前 Agent 子视图使用的界面语言。
+    pub fn with_language(mut self, language: UiLanguage) -> Self {
+        self.language = language;
+        self
     }
 
     /// 返回当前查询和交互使用的 Agent 身份。
@@ -64,7 +73,11 @@ impl AgentViewSession {
         match host.agent_status(&self.target) {
             Ok(snapshot) => self.status = Some(snapshot.status),
             Err(error) => {
-                self.feedback = Some(Err(format!("读取 Agent 状态失败：{error}")));
+                self.feedback = Some(Err(format!(
+                    "{}: {error}",
+                    self.language
+                        .select("Failed to read Agent status", "读取 Agent 状态失败")
+                )));
                 return;
             }
         }
@@ -76,7 +89,11 @@ impl AgentViewSession {
                 }
             }
             Err(error) => {
-                self.feedback = Some(Err(format!("读取 Agent 事件失败：{error}")));
+                self.feedback = Some(Err(format!(
+                    "{}: {error}",
+                    self.language
+                        .select("Failed to read Agent events", "读取 Agent 事件失败")
+                )));
             }
         }
     }
@@ -112,29 +129,39 @@ impl AgentViewSession {
         None
     }
 
-    /// 按给定尺寸渲染事件时间线、交互反馈和当前输入行。
+    /// 按给定尺寸渲染事件时间线、交互反馈和固定在底部的输入框。
     pub fn render(&self, width: u16, height: u16) -> Vec<UiLine> {
-        let reserved = if self.feedback.is_some() { 3 } else { 2 };
-        let available = usize::from(height).saturating_sub(reserved);
-        let event_lines = agent_event_lines(&self.timeline, usize::from(width));
+        const INPUT_BOX_HEIGHT: usize = 3;
+        let height = usize::from(height);
+        let feedback_height = usize::from(self.feedback.is_some());
+        let available = height.saturating_sub(INPUT_BOX_HEIGHT + feedback_height);
+        let event_lines = agent_event_lines(&self.timeline, usize::from(width), self.language);
         let mut lines = event_lines
             .into_iter()
             .rev()
             .take(available)
             .rev()
             .collect::<Vec<_>>();
-        if lines.is_empty() {
+        if lines.is_empty() && available > 0 {
             lines.push(line(
                 match self.status {
-                    Some(AgentStatus::Queued) => "等待运行资源",
-                    Some(AgentStatus::Ready) => "等待任务",
-                    _ => "等待 Agent 事件",
+                    Some(AgentStatus::Queued) => {
+                        self.language.select("Waiting for capacity", "等待运行资源")
+                    }
+                    Some(AgentStatus::Ready) => {
+                        self.language.select("Waiting for a task", "等待任务")
+                    }
+                    _ => self
+                        .language
+                        .select("Waiting for Agent events", "等待 Agent 事件"),
                 },
                 Some(UiColor::Gray),
                 false,
             ));
         }
-        lines.push(UiLine { spans: Vec::new() });
+        while lines.len() < available {
+            lines.push(UiLine { spans: Vec::new() });
+        }
         if let Some(feedback) = &self.feedback {
             let (text, color) = match feedback {
                 Ok(text) => (text.as_str(), UiColor::Green),
@@ -142,13 +169,12 @@ impl AgentViewSession {
             };
             lines.push(line(text, Some(color), false));
         }
-        lines.push(UiLine {
-            spans: vec![
-                span("> ", Some(UiColor::Green), true),
-                span(&self.input, None, false),
-            ],
-        });
-        lines.truncate(usize::from(height));
+        lines.extend(input_box_lines(
+            &self.input,
+            usize::from(width),
+            self.language,
+        ));
+        lines.truncate(height);
         lines
     }
 
@@ -161,25 +187,42 @@ impl AgentViewSession {
         let snapshot = match host.agent_status(&self.target) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.feedback = Some(Err(format!("读取 Agent 状态失败：{error}")));
+                self.feedback = Some(Err(format!(
+                    "{}: {error}",
+                    self.language
+                        .select("Failed to read Agent status", "读取 Agent 状态失败")
+                )));
                 return None;
             }
         };
         let result = match snapshot.status {
-            AgentStatus::Queued | AgentStatus::Running => host
-                .steer_agent(&self.target, &input)
-                .map(|_| (None, "消息已发送给 Agent".to_string())),
+            AgentStatus::Queued | AgentStatus::Running => {
+                host.steer_agent(&self.target, &input).map(|_| {
+                    (
+                        None,
+                        self.language
+                            .select("Message sent to Agent", "消息已发送给 Agent")
+                            .to_string(),
+                    )
+                })
+            }
             AgentStatus::Succeeded => host
                 .continue_agent(&AgentContinueRequest::new(
                     self.target.clone(),
                     input.clone(),
                 ))
                 .map(|handle| {
-                    let message = "已开始 Agent 后续会话".to_string();
+                    let message = self
+                        .language
+                        .select("Started an Agent follow-up", "已开始 Agent 后续会话")
+                        .to_string();
                     (Some(handle), message)
                 }),
             AgentStatus::Ready | AgentStatus::Failed | AgentStatus::Cancelled => {
-                Err(anyhow::anyhow!("Agent 当前状态不能接收消息"))
+                Err(anyhow::anyhow!(self.language.select(
+                    "The Agent cannot receive messages in its current state",
+                    "Agent 当前状态不能接收消息"
+                )))
             }
         };
         match result {
@@ -213,37 +256,65 @@ impl AgentViewSession {
 }
 
 /// 将 Agent 事件转换为主界面可见行，并合并连续模型文本增量。
-fn agent_event_lines(timeline: &VecDeque<AgentViewItem>, width: usize) -> Vec<UiLine> {
+fn agent_event_lines(
+    timeline: &VecDeque<AgentViewItem>,
+    width: usize,
+    language: UiLanguage,
+) -> Vec<UiLine> {
     let text_width = width.saturating_sub(4).max(12);
     let mut rows: Vec<(String, UiColor)> = Vec::new();
     for item in timeline {
         let event = match item {
             AgentViewItem::Event(event) => event,
             AgentViewItem::User(message) => {
-                rows.push((format!("你  {message}"), UiColor::Green));
+                rows.push((
+                    format!("{}  {message}", language.select("You", "你")),
+                    UiColor::Green,
+                ));
                 continue;
             }
         };
         match event.kind {
-            AgentEventKind::RunStarted => rows.push(("开始运行".into(), UiColor::Cyan)),
+            AgentEventKind::RunStarted => rows.push((
+                language.select("Run started", "开始运行").into(),
+                UiColor::Cyan,
+            )),
             AgentEventKind::TurnStarted => {
-                rows.push((format!("分析中 · 第 {} 步", event.step + 1), UiColor::Blue));
+                rows.push((
+                    match language {
+                        UiLanguage::English => format!("Analyzing · Step {}", event.step + 1),
+                        UiLanguage::SimplifiedChinese => {
+                            format!("分析中 · 第 {} 步", event.step + 1)
+                        }
+                    },
+                    UiColor::Blue,
+                ));
             }
             AgentEventKind::ModelTextDelta => {
                 let delta = event.payload["delta"].as_str().unwrap_or_default();
                 if let Some((text, _)) = rows
                     .last_mut()
-                    .filter(|(text, _)| text.starts_with("回复  "))
+                    .filter(|(text, _)| text.starts_with(language.select("Reply  ", "回复  ")))
                 {
                     text.push_str(delta);
                 } else if !delta.is_empty() {
-                    rows.push((format!("回复  {delta}"), UiColor::White));
+                    rows.push((
+                        format!("{}  {delta}", language.select("Reply", "回复")),
+                        UiColor::White,
+                    ));
                 }
             }
             AgentEventKind::ToolStarted => {
                 let name = event.payload["name"].as_str().unwrap_or("tool");
                 let args = compact_json(&event.payload["args"], 120);
-                rows.push((format!("调用  {name}{}", suffix(&args)), UiColor::Yellow));
+                rows.push((
+                    format!(
+                        "{}  {name}{}",
+                        language.select("Call", "调用"),
+                        suffix(&args)
+                    ),
+                    UiColor::Yellow,
+                ));
             }
             AgentEventKind::ToolFinished => {
                 let name = event.payload["name"].as_str().unwrap_or("tool");
@@ -252,7 +323,11 @@ fn agent_event_lines(timeline: &VecDeque<AgentViewItem>, width: usize) -> Vec<Ui
                 rows.push((
                     format!(
                         "{}  {name}{}",
-                        if failed { "失败" } else { "完成" },
+                        if failed {
+                            language.select("Failed", "失败")
+                        } else {
+                            language.select("Completed", "完成")
+                        },
                         suffix(&result)
                     ),
                     if failed { UiColor::Red } else { UiColor::Green },
@@ -260,14 +335,30 @@ fn agent_event_lines(timeline: &VecDeque<AgentViewItem>, width: usize) -> Vec<Ui
             }
             AgentEventKind::ToolSkipped => {
                 let name = event.payload["call"]["name"].as_str().unwrap_or("tool");
-                rows.push((format!("跳过  {name}"), UiColor::Gray));
+                rows.push((
+                    format!("{}  {name}", language.select("Skipped", "跳过")),
+                    UiColor::Gray,
+                ));
             }
             AgentEventKind::SteeringInjected => {
-                rows.push(("已接收新的互动消息".into(), UiColor::Cyan));
+                rows.push((
+                    language
+                        .select("Received a new interactive message", "已接收新的互动消息")
+                        .into(),
+                    UiColor::Cyan,
+                ));
             }
-            AgentEventKind::RunFinished => rows.push(("运行完成".into(), UiColor::Green)),
+            AgentEventKind::RunFinished => rows.push((
+                language.select("Run completed", "运行完成").into(),
+                UiColor::Green,
+            )),
             AgentEventKind::StepLimitReached => {
-                rows.push(("达到运行步数上限".into(), UiColor::Red));
+                rows.push((
+                    language
+                        .select("Run step limit reached", "达到运行步数上限")
+                        .into(),
+                    UiColor::Red,
+                ));
             }
             AgentEventKind::Extension
             | AgentEventKind::ModelRequest
@@ -281,6 +372,57 @@ fn agent_event_lines(timeline: &VecDeque<AgentViewItem>, width: usize) -> Vec<Ui
     rows.into_iter()
         .map(|(text, color)| line(&clip(&text, text_width), Some(color), false))
         .collect()
+}
+
+/// 绘制固定高度的输入框，使成员事件增长时仍保留稳定的交互位置。
+fn input_box_lines(input: &str, width: usize, language: UiLanguage) -> Vec<UiLine> {
+    let border_width = width.saturating_sub(2);
+    let text_width = width.saturating_sub(5);
+    let displayed = if input.is_empty() {
+        language.select("Message Agent...", "给 Agent 发消息...")
+    } else {
+        input
+    };
+    let displayed = clip_to_width(displayed, text_width);
+    let padding = " ".repeat(text_width.saturating_sub(displayed.width()));
+    let border = format!("┌{}┐", "─".repeat(border_width));
+    let bottom = format!("└{}┘", "─".repeat(border_width));
+    vec![
+        line(&border, Some(UiColor::Gray), false),
+        UiLine {
+            spans: vec![
+                span("│ ", Some(UiColor::Gray), false),
+                span("▏", Some(UiColor::Cyan), true),
+                span(
+                    &displayed,
+                    Some(if input.is_empty() {
+                        UiColor::Gray
+                    } else {
+                        UiColor::White
+                    }),
+                    false,
+                ),
+                span(&padding, None, false),
+                span(" │", Some(UiColor::Gray), false),
+            ],
+        },
+        line(&bottom, Some(UiColor::Gray), false),
+    ]
+}
+
+/// 按终端显示宽度裁剪输入内容，避免中文或宽字符挤出右侧边框。
+fn clip_to_width(value: &str, max_width: usize) -> String {
+    let mut output = String::new();
+    let mut width = 0usize;
+    for character in value.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if width.saturating_add(character_width) > max_width {
+            break;
+        }
+        output.push(character);
+        width = width.saturating_add(character_width);
+    }
+    output
 }
 
 /// 为非空工具参数或结果增加紧凑分隔。
@@ -339,7 +481,8 @@ mod tests {
     #[test]
     fn event_lines_merge_model_text_and_render_tool_payloads() {
         let target = AgentId::parse("agent-1").expect("创建测试 Agent ID");
-        let mut session = AgentViewSession::new(target);
+        let mut session =
+            AgentViewSession::new(target).with_language(UiLanguage::SimplifiedChinese);
         for (kind, payload) in [
             (AgentEventKind::ModelTextDelta, json!({"delta": "你好"})),
             (AgentEventKind::ModelTextDelta, json!({"delta": "，世界"})),
@@ -371,5 +514,34 @@ mod tests {
         assert!(text.contains("回复  你好，世界"), "{text}");
         assert!(text.contains("调用  read_file"), "{text}");
         assert!(text.contains("完成  read_file"), "{text}");
+    }
+
+    /// 事件数量超过视口后，输入框仍应固定在底部并保持完整边框宽度。
+    #[test]
+    fn input_box_stays_at_bottom_of_agent_view() {
+        let target = AgentId::parse("agent-input").expect("创建测试 Agent ID");
+        let mut session = AgentViewSession::new(target);
+        session.input = "review this".into();
+        for step in 0..12 {
+            session.push_item(AgentViewItem::Event(AgentEvent {
+                id: format!("event-{step}"),
+                run_id: "run-input".into(),
+                timestamp_ms: 0,
+                kind: AgentEventKind::TurnStarted,
+                step,
+                payload: serde_json::Value::Null,
+            }));
+        }
+
+        let lines = session.render(24, 8);
+
+        assert_eq!(lines.len(), 8);
+        assert_eq!(lines[5].spans[0].text.width(), 24);
+        assert_eq!(lines[7].spans[0].text.width(), 24);
+        assert!(lines[6]
+            .spans
+            .iter()
+            .any(|span| span.text.contains("review this")));
+        assert!(lines[6].spans.iter().any(|span| span.text == "▏"));
     }
 }

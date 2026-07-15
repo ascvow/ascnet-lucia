@@ -72,11 +72,13 @@ crate，负责下载、安装和完整性规则，但不再分发单独的 `agen
 
 ## 本地安装
 
-构建全部官方与示例插件，并安装插件版 TUI；构建产物不会自动安装或启用：
+构建全部官方与示例插件，把官方插件更新到 `$LUCIA_HOME/official-plugins`，并安装插件版 TUI：
 
 ```bash
 bun run install:all
 ```
+
+插件版 TUI 启动时自动扫描 `$LUCIA_HOME/plugins` 和 `$LUCIA_HOME/official-plugins` 的直接子目录。示例或第三方插件可作为独立 bundle 放入 `plugins/<id>/`；官方目录由安装脚本维护。
 
 只构建并安装插件版 TUI：
 

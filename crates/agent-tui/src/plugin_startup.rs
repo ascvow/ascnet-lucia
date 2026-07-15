@@ -1,6 +1,8 @@
 //! 插件 manifest 合并与容错启动。
 
 use super::*;
+#[cfg(feature = "plugins")]
+use std::fs;
 
 /// Builds load-order-preserving summaries from plugin activation events.
 ///
@@ -53,6 +55,48 @@ pub(crate) fn merge_plugin_manifests(manifests: &mut Vec<PathBuf>, incoming: Vec
             manifests.push(path);
         }
     }
+}
+
+/// 扫描插件根目录下一层的独立 bundle，并按目录名稳定返回 manifest。
+///
+/// 每个直接子目录必须包含普通文件 `plugin.toml`；符号链接、普通散落文件和更深层目录
+/// 不会被自动加载。根目录不存在时返回空列表，其他读取错误会返回给调用方。
+#[cfg(feature = "plugins")]
+pub(crate) fn discover_plugin_manifests(root: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取插件目录失败：{}", root.display()));
+        }
+    };
+    let mut bundles = entries
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("遍历插件目录失败：{}", root.display()))?;
+    bundles.sort_by_key(|entry| entry.file_name());
+
+    let mut manifests = Vec::new();
+    for bundle in bundles {
+        let file_type = bundle
+            .file_type()
+            .with_context(|| format!("读取插件目录项失败：{}", bundle.path().display()))?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let manifest = bundle.path().join("plugin.toml");
+        let metadata = match fs::symlink_metadata(&manifest) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("读取插件 manifest 失败：{}", manifest.display()));
+            }
+        };
+        if metadata.is_file() && !metadata.file_type().is_symlink() {
+            manifests.push(manifest);
+        }
+    }
+    Ok(manifests)
 }
 
 /// Removes manifests whose plugin ID appears in the user's disabled list.

@@ -12,4 +12,5 @@ agent-plugin-protocol = { path = "../agent-plugin-protocol" }
 agent-tool = { path = "../agent-tool", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+unicode-width.workspace = true
 wit-bindgen.workspace = true

@@ -12,7 +12,7 @@ lucia plugin install context
 lucia
 ```
 
-`install:tui` 会构建插件版 `lucia` 并安装到 Cargo bin 目录，不会安装任何功能插件。`lucia plugin install` 管理的已启用插件会在启动时加载；未设置 `LUCIA_HOME` 时，应用目录是 `$HOME/.lucia`。
+`install:tui` 会构建插件版 `lucia` 并安装到 Cargo bin 目录，不会安装任何功能插件。启动时会加载 `lucia plugin install` 管理的已启用插件，并自动扫描 `$LUCIA_HOME/plugins` 与 `$LUCIA_HOME/official-plugins` 的直接子目录；未设置 `LUCIA_HOME` 时，应用目录是 `$HOME/.lucia`。
 
 第一次启动会创建 `$LUCIA_HOME/config.toml`。配置不存在或模型密钥不可用时，TUI 使用本地演示模型；也可以显式运行：
 
@@ -76,6 +76,7 @@ lucia
 | 滚动历史 | `PgUp` / `PgDn` | 手动滚动消息区 |
 | 输入历史 | `Ctrl+P` | 进入或退出历史输入回溯 |
 | 复制回复 | `Ctrl+Y` | 复制最近一条助手回复 |
+| 切换鼠标捕获 | `Ctrl+T` | 默认支持点击聚焦和滚轮；暂停后可用终端原生选择文本 |
 | 切换插件焦点 | `Tab` | 在主输入区与可聚焦插件视图间循环 |
 
 终端支持键盘增强协议时，带修饰键的 `Enter` 会作为换行手势保留给编辑器。粘贴或拖入本地图片、文件路径时，TUI 会创建附件引用；单个附件上限为 10 MiB。

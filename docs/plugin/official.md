@@ -12,6 +12,8 @@ lucia plugin install context
 
 `install:tui` 只安装 Loader，不附带默认功能。官方插件与第三方插件使用相同的 Registry、本地目录或 GitHub Release 安装流程，只有用户显式安装且启用的插件才进入运行时；开发目录也可以通过 `--plugin-manifest` 临时加载。
 
+仓库开发环境执行 `bun run install:all` 时，会把官方清单中的 bundle 更新到 `$LUCIA_HOME/official-plugins`。Loader 也会自动扫描该目录和 `$LUCIA_HOME/plugins`，配置中的 `disabled_plugins` 仍可按 ID 排除自动发现的插件。
+
 ## Context
 
 `context` 提供官方上下文管理与压缩能力。它在约 120k token 时静默清理旧工具结果，在约 167k token 时额外调用一次 Host 固定路由的模型，把较旧 API 轮次替换为结构化摘要并保留近期完整轮次；`[1m]` 模型使用对应的百万上下文水位。Command 插件内置的 `/compact` 会立即调用同一模型摘要流程，成功持久化压缩结果后当场替换当前 Session，不需要再发送一条消息。

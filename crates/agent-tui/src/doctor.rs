@@ -490,11 +490,13 @@ async fn inspect_plugins(
 
     let mut manifests = args.plugin_manifests.clone();
     let mut selections = HashMap::new();
+    let mut disabled_plugins = Vec::new();
     if config_path.is_file() {
         match load_plugin_runtime_config(config_path) {
             Ok(config) => {
                 manifests.extend(config.manifest_paths);
                 selections.extend(config.capability_selection);
+                disabled_plugins.extend(config.disabled_plugins);
             }
             Err(error) => report.push(
                 "plugins",
@@ -504,12 +506,31 @@ async fn inspect_plugins(
             ),
         }
     }
+    match discover_plugin_manifests(&lucia_home.join("plugins")) {
+        Ok(discovered) => merge_plugin_manifests(&mut manifests, discovered),
+        Err(error) => report.push(
+            "plugins",
+            "user_discovery",
+            CheckStatus::Error,
+            format!("用户插件扫描失败：{error:#}"),
+        ),
+    }
     if let Ok(runtime) = manager.runtime_config() {
         merge_plugin_manifests(&mut manifests, runtime.manifest_paths);
         for (capability, owner) in runtime.capability_selection {
             selections.entry(capability).or_insert(owner);
         }
     }
+    match discover_plugin_manifests(&lucia_home.join("official-plugins")) {
+        Ok(discovered) => merge_plugin_manifests(&mut manifests, discovered),
+        Err(error) => report.push(
+            "plugins",
+            "official_discovery",
+            CheckStatus::Error,
+            format!("官方插件扫描失败：{error:#}"),
+        ),
+    }
+    remove_disabled_plugin_manifests(&mut manifests, &disabled_plugins);
     let loaded = manifests
         .iter()
         .map(PluginManifest::load)

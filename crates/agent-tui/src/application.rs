@@ -119,6 +119,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     }
     #[cfg(feature = "plugins")]
     {
+        let user_manifests = discover_plugin_manifests(&lucia_home.join("plugins"))
+            .context("扫描用户插件目录失败")?;
+        merge_plugin_manifests(&mut plugin_manifests, user_manifests);
         let managed_runtime = agent_plugin_manager::PluginManager::new(&lucia_home)
             .runtime_config()
             .context("读取受管理插件配置失败；请运行 `lucia doctor`")?;
@@ -126,6 +129,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         for (capability, owner) in managed_runtime.capability_selection {
             capability_selection.entry(capability).or_insert(owner);
         }
+        let official_manifests = discover_plugin_manifests(&lucia_home.join("official-plugins"))
+            .context("扫描官方插件目录失败")?;
+        merge_plugin_manifests(&mut plugin_manifests, official_manifests);
     }
     // 用户禁用列表最后生效：受管理插件和显式声明都会被剔除。
     #[cfg(feature = "plugins")]
@@ -262,9 +268,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     }
     // 守卫覆盖所有退出路径，包括 draw 失败的 `?` 提前返回。
     let terminal_guard = TerminalGuard { keyboard_enhanced };
-    // 默认保留终端原生鼠标选择，用户可通过 Ctrl+T 启用滚轮滚动。
-    // 启用 bracketed paste，将拖入的文件路径识别为附件
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    // 默认启用鼠标交互以支持点击插件聚焦；Ctrl+T 可暂停捕获并恢复终端原生选择。
+    // 启用 bracketed paste，将拖入的文件路径识别为附件。
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
+    );
 
     let input_tx = tx.clone();
     std::thread::spawn(move || {

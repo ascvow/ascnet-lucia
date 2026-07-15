@@ -1214,6 +1214,53 @@ fn explicit_plugin_manifest_overrides_managed_manifest() {
     fs::remove_dir_all(root).expect("清理插件合并测试目录");
 }
 
+/// 自动发现只接受插件根目录的直接 bundle，避免把受管理版本目录或散落文件重复加载。
+#[cfg(feature = "plugins")]
+#[test]
+fn plugin_discovery_scans_direct_bundles_only() {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("生成测试时间戳")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "lucia-plugin-discovery-{}-{nonce}",
+        std::process::id()
+    ));
+    let alpha = root.join("alpha");
+    let beta = root.join("beta");
+    let managed = root.join("managed/1.0.0");
+    fs::create_dir_all(&alpha).expect("创建 alpha bundle");
+    fs::create_dir_all(&beta).expect("创建 beta bundle");
+    fs::create_dir_all(&managed).expect("创建嵌套受管理 bundle");
+    fs::write(alpha.join("plugin.toml"), "alpha").expect("写入 alpha manifest");
+    fs::write(beta.join("plugin.toml"), "beta").expect("写入 beta manifest");
+    fs::write(managed.join("plugin.toml"), "managed").expect("写入嵌套 manifest");
+    fs::write(root.join("plugin.toml"), "loose").expect("写入散落 manifest");
+
+    let discovered = discover_plugin_manifests(&root).expect("插件目录应可扫描");
+
+    assert_eq!(
+        discovered,
+        vec![alpha.join("plugin.toml"), beta.join("plugin.toml")]
+    );
+    fs::remove_dir_all(root).expect("清理插件发现测试目录");
+}
+
+/// 不存在的自动发现目录应视为空目录，使首次启动无需预创建插件文件夹。
+#[cfg(feature = "plugins")]
+#[test]
+fn missing_plugin_discovery_root_is_empty() {
+    let root = std::env::temp_dir().join(format!(
+        "lucia-missing-plugin-discovery-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&root).ok();
+
+    assert!(discover_plugin_manifests(&root)
+        .expect("缺失目录不应报错")
+        .is_empty());
+}
+
 /// 用户禁用列表按插件 ID 剔除受管理与显式 manifest，无法解析的保留给容错加载器。
 #[cfg(feature = "plugins")]
 #[test]
@@ -1843,6 +1890,27 @@ fn clicking_main_view_restores_input_focus() {
         app.route_plugin_key(KeyCode::Char('a'), KeyModifiers::NONE),
         PluginKeyRoute::Main
     ));
+}
+
+/// 点击侧栏边框或内边距也应聚焦该视图，避免只有文字区域可点击。
+#[test]
+#[cfg(feature = "plugins")]
+fn clicking_side_dock_chrome_focuses_plugin() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut view = test_plugin_view(UiPlacement::Right, "右侧插件");
+    view.area = Rect::new(12, 4, 20, 10);
+    app.plugin_views.push(view);
+
+    let routed = app.route_plugin_mouse(&MouseEvent {
+        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 10,
+        row: 3,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert!(routed.is_some());
+    assert_eq!(app.plugin_focus, Some(0));
 }
 
 /// 写入一个测试附件文件，返回路径；测试结束由调用方删除。
