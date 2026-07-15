@@ -260,6 +260,14 @@ fn describe_ui(&self) -> Vec<UiDeclaration>
 
 声明静态视图类型。每项包含 `view_id`、标题、插槽、建议尺寸和是否可聚焦。`plugin_id` 应留空，由 Host 注入。该函数只声明能力，不绘制内容。
 
+### `describe_tool_renderers`
+
+```rust
+fn describe_tool_renderers(&self) -> Vec<ToolRendererContribution>
+```
+
+声明当前插件自有工具在消息列表中的 renderer。`tool_name` 必须是该插件拥有的公开工具名，`renderer_id` 是插件内稳定标识，`plugin_id` 应留空。Host 负责校验 owner 和维护路由，TUI 不读取这些声明。
+
 ### `render_ui_with_host`
 
 ```rust
@@ -279,6 +287,20 @@ fn render_ui_with_host(
 - 返回 `Some(UiFrame)`：替换该视图最近一帧；返回 `None`：本次不更新。
 
 `UiFrame` 只能包含可移植文本和样式，不得放 ANSI 序列或终端句柄。
+
+### `render_tool_with_host`
+
+```rust
+fn render_tool_with_host(
+    &mut self,
+    host: &dyn PluginHostApi,
+    request: ToolRenderRequest,
+) -> Option<UiFrame>
+```
+
+渲染工具调用在主消息列表中的内容。请求包含完整 `ToolCall`、执行状态、完整结果或跳过原因，以及消息区可用尺寸。`plugin_id` 和 `renderer_id` 由 Host 根据可信贡献快照注入；插件返回的 `UiFrame.view_id` 必须等于 `renderer_id`。
+
+返回 `Some(UiFrame)` 会替换该条消息的原生工具行；返回 `None` 保留原生展示。该 hook 只负责展示，工具执行、审批和状态机仍由各自的 Core 或插件协议负责。
 
 ### `on_ui_input_with_host`
 

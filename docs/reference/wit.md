@@ -686,7 +686,7 @@ export after-tool: func(result-json: string);
 
 ### `describe-ui`
 
-输出 UiDeclaration 数组，无 UI 时为 `[]`。每项包含 plugin/view ID、title、placement、size 和 focusable；Guest 的 `plugin_id` 应留空，Host 会注入可信值。
+输出 UI 贡献数组，无 UI 时为 `[]`。静态视图贡献包含 plugin/view ID、title、placement、size 和 focusable；Guest 的 `plugin_id` 应留空，Host 会注入可信值。
 
 ```json
 [
@@ -701,11 +701,25 @@ export after-tool: func(result-json: string);
 ]
 ```
 
-映射：`AgentPlugin::describe_ui()`。
+工具消息 renderer 使用同一数组声明，并且只能绑定当前插件拥有的工具：
+
+```json
+[
+  {
+    "plugin_id": "",
+    "renderer_id": "task-message",
+    "tool_name": "task"
+  }
+]
+```
+
+Host 会验证工具 owner、覆盖 `plugin_id`，并维护 `tool_name -> renderer` 路由。TUI 不接收贡献表。
+
+映射：`AgentPlugin::describe_ui()` 与 `AgentPlugin::describe_tool_renderers()`。
 
 ### `render-ui`
 
-输入：
+普通视图输入：
 
 ```json
 {
@@ -718,6 +732,34 @@ export after-tool: func(result-json: string);
   "frame": 42
 }
 ```
+
+工具消息输入由 Host 在完成 owner 路由后构造：
+
+```json
+{
+  "plugin_id": "task-plugin",
+  "renderer_id": "task-message",
+  "call": {
+    "id": "call-1",
+    "name": "task",
+    "args": { "title": "整理方案" }
+  },
+  "state": {
+    "state": "finished",
+    "result": {
+      "call_id": "call-1",
+      "name": "task",
+      "content": { "status": "done" },
+      "is_error": false
+    }
+  },
+  "width": 72,
+  "max_height": 20,
+  "frame": 42
+}
+```
+
+`state` 可以是 `running`、带完整 `ToolResult` 的 `finished`，或带 `reason` 的 `skipped`。工具请求中的 `plugin_id` 和 `renderer_id` 均由 Host 从可信贡献快照注入。
 
 返回 UiFrame JSON 表示更新；返回空字符串表示本帧不更新。无效输入也返回空字符串。
 
@@ -738,7 +780,7 @@ export after-tool: func(result-json: string);
 }
 ```
 
-映射：`AgentPlugin::render_ui_with_host(host, request)`。
+映射：普通视图调用 `AgentPlugin::render_ui_with_host(host, request)`；工具消息调用 `AgentPlugin::render_tool_with_host(host, request)`。
 
 ### `on-ui-input`
 
