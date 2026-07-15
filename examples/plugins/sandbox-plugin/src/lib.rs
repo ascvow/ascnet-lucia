@@ -110,24 +110,11 @@ impl AgentPlugin for SandboxPlugin {
             view_id: APPROVAL_VIEW.into(),
             visible: true,
             lines: vec![
-                styled_line(
-                    format!("审批 {} · {}", pending.tool_name, pending.summary),
-                    UiColor::Yellow,
-                    true,
-                ),
-                option_line("Y", "允许一次", self.selected == 0, UiColor::Green),
-                option_line("S", "允许相似调用", self.selected == 1, UiColor::Green),
-                option_line(
-                    "Cmd+A",
-                    if self.allow_all {
-                        "全部放行：已开启"
-                    } else {
-                        "全部放行：未开启"
-                    },
-                    self.selected == 2,
-                    UiColor::Yellow,
-                ),
-                option_line("C", "取消并暂停 Agent", self.selected == 3, UiColor::Red),
+                approval_header(&pending.tool_name, &pending.summary),
+                option_line("Y", "允许一次", self.selected == 0, false),
+                option_line("S", "允许相似调用", self.selected == 1, false),
+                option_line("Cmd+A", "全部放行", self.selected == 2, false),
+                option_line("C", "取消并暂停", self.selected == 3, true),
             ],
         })
     }
@@ -316,45 +303,73 @@ fn redact_command(command: &str) -> String {
     }
 }
 
-fn styled_line(text: impl Into<String>, color: UiColor, bold: bool) -> UiLine {
+/// 渲染紧凑的审批标题，将工具名与调用摘要分层展示。
+fn approval_header(tool_name: &str, summary: &str) -> UiLine {
     UiLine {
-        spans: vec![UiSpan {
-            text: text.into(),
-            style: UiStyle {
-                foreground: Some(color),
-                bold,
-                ..UiStyle::default()
+        spans: vec![
+            UiSpan {
+                text: "审批".into(),
+                style: UiStyle {
+                    foreground: Some(UiColor::Yellow),
+                    bold: true,
+                    ..UiStyle::default()
+                },
             },
-        }],
+            UiSpan {
+                text: format!("  {tool_name}"),
+                style: UiStyle {
+                    foreground: Some(UiColor::White),
+                    bold: true,
+                    ..UiStyle::default()
+                },
+            },
+            UiSpan {
+                text: format!("  {summary}"),
+                style: UiStyle {
+                    foreground: Some(UiColor::Gray),
+                    ..UiStyle::default()
+                },
+            },
+        ],
     }
 }
 
-/// 渲染一个纵向审批选项。
-fn option_line(shortcut: &str, label: &str, selected: bool, color: UiColor) -> UiLine {
+/// 渲染一个纵向审批选项；仅选中项强调快捷键，危险操作保留红色语义。
+fn option_line(shortcut: &str, label: &str, selected: bool, dangerous: bool) -> UiLine {
+    let text_color = if dangerous {
+        UiColor::Red
+    } else if selected {
+        UiColor::White
+    } else {
+        UiColor::Gray
+    };
     UiLine {
         spans: vec![
             UiSpan {
                 text: if selected { "› " } else { "  " }.into(),
                 style: UiStyle {
-                    foreground: Some(color),
+                    foreground: Some(UiColor::Cyan),
                     bold: selected,
                     ..UiStyle::default()
                 },
             },
-            option_span(&format!(" {shortcut} {label} "), selected, color),
+            UiSpan {
+                text: format!("{shortcut:<7}"),
+                style: UiStyle {
+                    foreground: Some(if selected { UiColor::Cyan } else { text_color }),
+                    bold: selected,
+                    ..UiStyle::default()
+                },
+            },
+            UiSpan {
+                text: label.into(),
+                style: UiStyle {
+                    foreground: Some(text_color),
+                    bold: selected,
+                    ..UiStyle::default()
+                },
+            },
         ],
-    }
-}
-
-fn option_span(text: &str, selected: bool, color: UiColor) -> UiSpan {
-    UiSpan {
-        text: text.into(),
-        style: UiStyle {
-            foreground: Some(color),
-            bold: selected,
-            reversed: selected,
-            ..UiStyle::default()
-        },
     }
 }
 
@@ -364,6 +379,46 @@ export_plugin!(SandboxPlugin);
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 审批界面应保持五行紧凑布局，不使用整块反色或冗余的关闭状态文案。
+    #[test]
+    fn approval_ui_uses_compact_visual_hierarchy() {
+        let mut plugin = SandboxPlugin::default();
+        plugin.before_tool(ToolCall::new(
+            "shell-ui",
+            "shell",
+            json!({"command": "cargo test"}),
+        ));
+
+        let frame = plugin
+            .render_ui(UiRenderRequest {
+                plugin_id: "sandbox".into(),
+                view_id: APPROVAL_VIEW.into(),
+                instance_id: None,
+                width: 68,
+                height: 6,
+                focused: true,
+                frame: 1,
+            })
+            .expect("审批界面应返回可见帧");
+        let text = frame
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(frame.visible);
+        assert_eq!(frame.lines.len(), 5);
+        assert!(text.contains("审批  shell"), "{text}");
+        assert!(text.contains("Cmd+A  全部放行"), "{text}");
+        assert!(!text.contains("未开启"), "{text}");
+        assert!(frame
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .all(|span| !span.style.reversed));
+    }
 
     /// 敏感文件读取必须直接拒绝，不能通过审批临时放行。
     #[test]

@@ -273,7 +273,7 @@ impl Msg {
         } else {
             COLOR_MUTED
         };
-        let mut result_lines = self
+        let result_lines = self
             .tool_result
             .as_ref()
             .map(|result| tool_result_lines(&result.content, TOOL_RESULT_PREVIEW_LINES, 96))
@@ -287,7 +287,7 @@ impl Msg {
                 ),
             ]));
         }
-        for detail in result_lines.drain(1..) {
+        for detail in result_lines.iter().skip(1) {
             let detail_color = if matches!(self.kind, MsgKind::ToolError) {
                 COLOR_DANGER
             } else if detail.starts_with('+') {

@@ -508,6 +508,21 @@ fn tool_lines_show_args_and_truncated_result() {
     assert!(text.contains('…'), "{text:?}");
 }
 
+/// 空工具结果只显示完成状态，不应因缺少预览行而越界崩溃。
+#[test]
+fn tool_lines_accept_empty_result() {
+    let msg = Msg::tool_finished(ToolResult::success("call-empty", "shell", json!(null)));
+
+    let lines = msg.to_lines(false, 80);
+    let text = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+    assert!(text.contains("● shell"), "{text:?}");
+}
+
 /// 验证嵌套 JSON 摘要折叠为计数而不是原始序列化。
 #[test]
 fn summarize_json_folds_nested_structures() {
