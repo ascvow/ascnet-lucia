@@ -92,12 +92,12 @@ pub(crate) enum MsgKind {
 pub(crate) struct Msg {
     pub(crate) kind: MsgKind,
     pub(crate) text: String,
-    /// 工具调用参数的单行摘要（仅工具消息）。
-    pub(crate) args: Option<String>,
-    /// 工具返回内容的首行摘要（仅工具消息）。
-    pub(crate) result: Option<String>,
-    /// 工具返回内容的后续预览行（仅工具消息），`+`/`-` 前缀行按 diff 着色。
-    pub(crate) detail: Vec<String>,
+    /// 工具消息关联的完整调用；普通消息为 `None`。
+    pub(crate) tool_call: Option<ToolCall>,
+    /// 工具消息关联的完整结果；运行中或普通消息为 `None`。
+    pub(crate) tool_result: Option<ToolResult>,
+    /// 工具未执行时的原因；其他消息为 `None`。
+    pub(crate) skip_reason: Option<String>,
     /// 扩展事件使用的强调色。
     pub(crate) accent: Option<Color>,
     /// 是否以分隔线形式展示扩展事件。
@@ -110,12 +110,43 @@ impl Msg {
         Self {
             kind,
             text: text.into(),
-            args: None,
-            result: None,
-            detail: Vec::new(),
+            tool_call: None,
+            tool_result: None,
+            skip_reason: None,
             accent: None,
             divider: false,
         }
+    }
+
+    /// 创建运行中的工具消息，并以调用 ID 作为后续状态更新依据。
+    pub(crate) fn tool_started(call: ToolCall) -> Self {
+        let mut message = Self::new(MsgKind::ToolRunning, call.name.clone());
+        message.tool_call = Some(call);
+        message
+    }
+
+    /// 创建只有最终结果的工具消息，用于事件缺失时的安全恢复。
+    pub(crate) fn tool_finished(result: ToolResult) -> Self {
+        let kind = if result.is_error {
+            MsgKind::ToolError
+        } else {
+            MsgKind::ToolOk
+        };
+        let mut message = Self::new(kind, result.name.clone());
+        message.tool_result = Some(result);
+        message
+    }
+
+    /// 返回工具消息的稳定调用 ID。
+    pub(crate) fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call
+            .as_ref()
+            .map(|call| call.id.as_str())
+            .or_else(|| {
+                self.tool_result
+                    .as_ref()
+                    .map(|result| result.call_id.as_str())
+            })
     }
 
     /// 创建由扩展事件驱动的主事件列表消息。
@@ -123,9 +154,9 @@ impl Msg {
         Self {
             kind: MsgKind::Extension,
             text: text.into(),
-            args: None,
-            result: None,
-            detail: Vec::new(),
+            tool_call: None,
+            tool_result: None,
+            skip_reason: None,
             accent: Some(color),
             divider,
         }
@@ -183,7 +214,12 @@ impl Msg {
             Span::styled("● ", Style::new().fg(color)),
             Span::styled(self.text.as_str(), Style::new().fg(COLOR_TEXT).bold()),
         ];
-        if let Some(args) = &self.args {
+        if let Some(args) = self
+            .tool_call
+            .as_ref()
+            .map(|call| summarize_json(&call.args, 64))
+            .filter(|args| !args.is_empty())
+        {
             first.push(Span::styled(
                 format!("({args})"),
                 Style::new().fg(COLOR_MUTED),
@@ -198,7 +234,12 @@ impl Msg {
         } else {
             COLOR_MUTED
         };
-        if let Some(result) = &self.result {
+        let mut result_lines = self
+            .tool_result
+            .as_ref()
+            .map(|result| tool_result_lines(&result.content, TOOL_RESULT_PREVIEW_LINES, 96))
+            .unwrap_or_default();
+        if let Some(result) = result_lines.first() {
             lines.push(Line::from(vec![
                 Span::styled("  └ ", Style::new().fg(COLOR_MUTED)),
                 Span::styled(
@@ -207,7 +248,7 @@ impl Msg {
                 ),
             ]));
         }
-        for detail in &self.detail {
+        for detail in result_lines.drain(1..) {
             let detail_color = if matches!(self.kind, MsgKind::ToolError) {
                 COLOR_DANGER
             } else if detail.starts_with('+') {
@@ -220,7 +261,7 @@ impl Msg {
             lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled(
-                    truncate_line(detail, preview_width),
+                    truncate_line(&detail, preview_width),
                     Style::new().fg(detail_color),
                 ),
             ]));

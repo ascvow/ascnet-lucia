@@ -477,11 +477,16 @@ fn render_adapts_to_running_state_and_narrow_width() {
 /// 验证工具行展示参数与返回内容摘要，且过长内容按显示宽度截断。
 #[test]
 fn tool_lines_show_args_and_truncated_result() {
-    let mut msg = Msg::new(MsgKind::ToolOk, "read_file");
-    msg.args = Some(summarize_json(&json!({ "path": "src/main.rs" }), 64));
-    msg.result = Some(summarize_json(
-        &json!({ "content": "很长的文件内容".repeat(30) }),
-        24,
+    let mut msg = Msg::tool_started(ToolCall::new(
+        "call-1",
+        "read_file",
+        json!({ "path": "src/main.rs" }),
+    ));
+    msg.kind = MsgKind::ToolOk;
+    msg.tool_result = Some(ToolResult::success(
+        "call-1",
+        "read_file",
+        json!({ "content": "很长的文件内容".repeat(30) }),
     ));
 
     let lines = msg.to_lines(false, 80);
@@ -497,7 +502,7 @@ fn tool_lines_show_args_and_truncated_result() {
         .join("\n");
 
     assert!(text.contains("● read_file(path: src/main.rs)"), "{text:?}");
-    assert!(text.contains("└ content: 很长的文件内容"), "{text:?}");
+    assert!(text.contains("└ 很长的文件内容"), "{text:?}");
     assert!(text.contains('…'), "{text:?}");
 }
 
@@ -538,13 +543,60 @@ fn persisted_session_hydrates_main_event_list() {
     assert_eq!(messages[0].text, "读取项目配置");
     assert!(matches!(messages[1].kind, MsgKind::ToolOk));
     assert_eq!(messages[1].text, "read_file");
-    assert_eq!(messages[1].args.as_deref(), Some("path: config.toml"));
+    assert_eq!(messages[1].tool_call_id(), Some("call-1"));
+    assert_eq!(
+        messages[1].tool_call.as_ref().map(|call| &call.args),
+        Some(&json!({"path": "config.toml"}))
+    );
     assert!(messages[1]
-        .result
-        .as_deref()
-        .is_some_and(|result| result.contains("配置内容")));
+        .tool_result
+        .as_ref()
+        .is_some_and(|result| result.content_text().contains("配置内容")));
     assert!(matches!(messages[2].kind, MsgKind::Assistant));
     assert_eq!(messages[2].text, "配置已经读取");
+}
+
+/// 同名工具乱序返回时必须按调用 ID 恢复各自结果。
+#[test]
+fn persisted_session_matches_same_name_tools_by_call_id() {
+    let mut session = Session::new();
+    session.push_assistant_blocks(vec![
+        ContentBlock::ToolCall {
+            call: ToolCall::new("call-1", "read_file", json!({"path": "one"})),
+        },
+        ContentBlock::ToolCall {
+            call: ToolCall::new("call-2", "read_file", json!({"path": "two"})),
+        },
+    ]);
+    session.push_tool_result(ToolResult::success(
+        "call-2",
+        "read_file",
+        json!({"content": "second"}),
+    ));
+    session.push_tool_result(ToolResult::success(
+        "call-1",
+        "read_file",
+        json!({"content": "first"}),
+    ));
+
+    let messages = restore_session_messages(&session);
+
+    let first = messages
+        .iter()
+        .find(|message| message.tool_call_id() == Some("call-1"))
+        .expect("应恢复第一个工具调用");
+    let second = messages
+        .iter()
+        .find(|message| message.tool_call_id() == Some("call-2"))
+        .expect("应恢复第二个工具调用");
+    assert_eq!(
+        first.tool_result.as_ref().map(ToolResult::content_text),
+        Some(r#"{"content":"first"}"#.to_string())
+    );
+    assert_eq!(
+        second.tool_result.as_ref().map(ToolResult::content_text),
+        Some(r#"{"content":"second"}"#.to_string())
+    );
 }
 
 /// 非 UTF-8 路径即使有损文本相同，也必须映射到不同项目空间。

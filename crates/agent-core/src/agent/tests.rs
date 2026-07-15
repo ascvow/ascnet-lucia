@@ -7,7 +7,7 @@ use crate::{
         ChatModel, ModelEventStream, ModelMessage, ModelResponse, ModelStreamEvent, ProviderAdapter,
     },
 };
-use agent_tool::{JsonTool, ToolSpec};
+use agent_tool::{JsonTool, Tool, ToolResult, ToolSpec};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -400,6 +400,27 @@ fn echo_tool() -> JsonTool {
     )
 }
 
+/// 返回结构化 UI 细节的测试工具。
+struct DetailedTool;
+
+#[async_trait]
+impl Tool for DetailedTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "detailed",
+            "返回完整工具结果",
+            ToolSpec::empty_object_schema(),
+        )
+    }
+
+    async fn call(&self, call: ToolCall) -> Result<ToolResult> {
+        Ok(
+            ToolResult::success(call.id, call.name, json!({"text": "完成"}))
+                .with_details(json!({"duration_ms": 12})),
+        )
+    }
+}
+
 /// 状态快照应覆盖模型流式阶段，并在成功后保留完整会话和运行摘要。
 #[tokio::test]
 async fn state_tracks_streaming_and_success_terminal_snapshot() {
@@ -458,6 +479,42 @@ async fn state_tracks_tool_call_lifecycle() {
         AgentToolCallStatus::Succeeded
     );
     assert!(finished.tool_calls[0].result.is_some());
+}
+
+/// 工具事件必须直接承载共享工具类型，不能丢失调用 ID 或 UI 细节。
+#[tokio::test]
+async fn tool_events_preserve_complete_call_and_result() {
+    let call = ToolCall::new("detailed-call", "detailed", json!({"value": "测试"}));
+    let mut agent = agent_with_script(vec![
+        ModelResponse::tool_calls(vec![call.clone()]),
+        ModelResponse::text("完成"),
+    ]);
+    agent
+        .tools_mut()
+        .register(DetailedTool)
+        .expect("注册详细结果工具");
+    let sink = Arc::new(InMemoryEventSink::new());
+    agent.set_event_sink(sink.clone());
+
+    agent.run("执行工具").await.expect("工具运行应成功");
+
+    let events = sink.events().await;
+    let started = events
+        .iter()
+        .find(|event| event.kind == AgentEventKind::ToolStarted)
+        .expect("应发出工具开始事件");
+    let started_call =
+        serde_json::from_value::<ToolCall>(started.payload.clone()).expect("应解码完整工具调用");
+    assert_eq!(started_call, call);
+
+    let finished = events
+        .iter()
+        .find(|event| event.kind == AgentEventKind::ToolFinished)
+        .expect("应发出工具完成事件");
+    let result =
+        serde_json::from_value::<ToolResult>(finished.payload.clone()).expect("应解码完整工具结果");
+    assert_eq!(result.call_id, "detailed-call");
+    assert_eq!(result.details, Some(json!({"duration_ms": 12})));
 }
 
 /// ReAct 错误应形成可查询的失败终态，并保留最后已确认的会话。

@@ -56,7 +56,7 @@ use agent_session::{
     FileSessionStore, MemorySessionStore, SessionId, SessionRecord, SessionStore,
     SessionStoreError, SessionSummary,
 };
-use agent_tool::{JsonTool, ToolCall, ToolRegistry, ToolSpec};
+use agent_tool::{JsonTool, ToolCall, ToolRegistry, ToolResult, ToolSpec};
 #[cfg(feature = "plugins")]
 use anyhow::Context;
 use anyhow::{anyhow, Result};
@@ -248,20 +248,15 @@ enum UiEvent {
     ModelStarted,
     /// 共享文本缓冲区已有尚未渲染的模型增量。
     ModelTextReady,
-    ToolStarted {
-        name: String,
-        /// 调用参数的单行摘要。
-        args: String,
+    /// 工具开始执行，携带未经裁剪的调用数据。
+    ToolStarted(ToolCall),
+    /// 工具完成执行，携带未经裁剪的结果与 UI 细节。
+    ToolFinished(ToolResult),
+    /// 工具未执行，保留原始调用和跳过原因。
+    ToolSkipped {
+        call: ToolCall,
+        reason: String,
     },
-    ToolFinished {
-        name: String,
-        is_error: bool,
-        /// 返回内容的首行摘要。
-        result: String,
-        /// 返回内容的后续预览行。
-        detail: Vec<String>,
-    },
-    ToolSkipped(String),
     SteeringInjected,
     FollowUpInjected,
     /// 扩展发布到主事件列表的结构化展示事件。

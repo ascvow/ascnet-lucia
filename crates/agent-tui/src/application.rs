@@ -429,42 +429,32 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     app.append_model_delta(&delta);
                 }
             }
-            Some(UiEvent::ToolStarted { name, args }) => {
-                let mut msg = Msg::new(MsgKind::ToolRunning, name);
-                msg.args = (!args.is_empty()).then_some(args);
-                app.messages.push(msg);
+            Some(UiEvent::ToolStarted(call)) => {
+                app.messages.push(Msg::tool_started(call));
             }
-            Some(UiEvent::ToolFinished {
-                name,
-                is_error,
-                result,
-                detail,
-            }) => {
-                // 把对应的"运行中"条目更新为最终状态，并挂上返回内容预览
-                let kind = if is_error {
+            Some(UiEvent::ToolFinished(tool_result)) => {
+                // 只按稳定调用 ID 更新运行项，避免同名并发工具互相覆盖。
+                let kind = if tool_result.is_error {
                     MsgKind::ToolError
                 } else {
                     MsgKind::ToolOk
                 };
-                let result = (!result.is_empty()).then_some(result);
-                if let Some(msg) = app
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|m| matches!(m.kind, MsgKind::ToolRunning) && m.text == name)
-                {
+                let call_id = tool_result.call_id.clone();
+                if let Some(msg) = app.messages.iter_mut().rev().find(|message| {
+                    matches!(message.kind, MsgKind::ToolRunning)
+                        && message.tool_call_id() == Some(call_id.as_str())
+                }) {
                     msg.kind = kind;
-                    msg.result = result;
-                    msg.detail = detail;
+                    msg.tool_result = Some(tool_result);
                 } else {
-                    let mut msg = Msg::new(kind, name);
-                    msg.result = result;
-                    msg.detail = detail;
-                    app.messages.push(msg);
+                    app.messages.push(Msg::tool_finished(tool_result));
                 }
             }
-            Some(UiEvent::ToolSkipped(name)) => {
-                app.messages.push(Msg::new(MsgKind::ToolSkipped, name));
+            Some(UiEvent::ToolSkipped { call, reason }) => {
+                let mut message = Msg::tool_started(call);
+                message.kind = MsgKind::ToolSkipped;
+                message.skip_reason = Some(reason);
+                app.messages.push(message);
             }
             Some(UiEvent::SteeringInjected) => {
                 app.messages.push(Msg::new(MsgKind::Info, "插话已生效"));

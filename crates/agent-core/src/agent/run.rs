@@ -360,7 +360,10 @@ impl Agent {
                             &run_id,
                             AgentEventKind::ToolSkipped,
                             step,
-                            json!({ "id": &skipped.id, "name": &skipped.name }),
+                            json!({
+                                "call": skipped,
+                                "reason": "Skipped due to cancelled run",
+                            }),
                         )
                         .await?;
                         results.push(ToolResult::error(
@@ -386,7 +389,10 @@ impl Agent {
                             &run_id,
                             AgentEventKind::ToolSkipped,
                             step,
-                            json!({ "id": &skipped.id, "name": &skipped.name }),
+                            json!({
+                                "call": skipped,
+                                "reason": "Skipped due to cancelled run",
+                            }),
                         )
                         .await?;
                         results.push(ToolResult::error(
@@ -407,7 +413,10 @@ impl Agent {
                             &run_id,
                             AgentEventKind::ToolSkipped,
                             step,
-                            json!({ "id": &skipped.id, "name": &skipped.name }),
+                            json!({
+                                "call": skipped,
+                                "reason": "Skipped due to queued user message",
+                            }),
                         )
                         .await?;
                         results.push(ToolResult::error(
@@ -545,8 +554,8 @@ impl Agent {
             run_id,
             AgentEventKind::ToolStarted,
             step,
-            // 事件带完整调用参数，供应用层展示或落盘诊断。
-            json!({ "id": &call.id, "name": &call.name, "args": &call.args }),
+            // 内建工具事件直接使用共享工具类型，避免跨层转换丢失调用身份或参数。
+            serde_json::to_value(&call)?,
         )
         .await?;
 
@@ -568,13 +577,8 @@ impl Agent {
             run_id,
             AgentEventKind::ToolFinished,
             step,
-            // 事件带完整返回内容，截断等展示策略由应用层决定。
-            json!({
-                "call_id": &result.call_id,
-                "name": &result.name,
-                "is_error": result.is_error,
-                "result": &result.content,
-            }),
+            // 完整 ToolResult 包含 UI 专用 details，截断和展示策略由应用层决定。
+            serde_json::to_value(&result)?,
         )
         .await?;
         Ok(result)

@@ -224,10 +224,7 @@ pub(crate) fn restore_session_messages(session: &Session) -> Vec<Msg> {
                 }
                 for block in &message.content {
                     if let ContentBlock::ToolCall { call } = block {
-                        let mut restored = Msg::new(MsgKind::ToolRunning, call.name.clone());
-                        let args = summarize_json(&call.args, 64);
-                        restored.args = (!args.is_empty()).then_some(args);
-                        messages.push(restored);
+                        messages.push(Msg::tool_started(call.clone()));
                     }
                 }
             }
@@ -236,31 +233,18 @@ pub(crate) fn restore_session_messages(session: &Session) -> Vec<Msg> {
                     let ContentBlock::ToolResult { result } = block else {
                         continue;
                     };
-                    let kind = if result.is_error {
-                        MsgKind::ToolError
-                    } else {
-                        MsgKind::ToolOk
-                    };
-                    // 与实时路径一致：首行作摘要，其余行作缩进预览。
-                    let mut lines =
-                        tool_result_lines(&result.content, TOOL_RESULT_PREVIEW_LINES, 96);
-                    let summary = if lines.is_empty() {
-                        String::new()
-                    } else {
-                        lines.remove(0)
-                    };
                     if let Some(restored) = messages.iter_mut().rev().find(|candidate| {
                         matches!(candidate.kind, MsgKind::ToolRunning)
-                            && candidate.text == result.name
+                            && candidate.tool_call_id() == Some(result.call_id.as_str())
                     }) {
-                        restored.kind = kind;
-                        restored.result = (!summary.is_empty()).then_some(summary);
-                        restored.detail = lines;
+                        restored.kind = if result.is_error {
+                            MsgKind::ToolError
+                        } else {
+                            MsgKind::ToolOk
+                        };
+                        restored.tool_result = Some(result.clone());
                     } else {
-                        let mut restored = Msg::new(kind, result.name.clone());
-                        restored.result = (!summary.is_empty()).then_some(summary);
-                        restored.detail = lines;
-                        messages.push(restored);
+                        messages.push(Msg::tool_finished(result.clone()));
                     }
                 }
             }

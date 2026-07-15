@@ -1818,14 +1818,6 @@ fn move_cursor_vertically(input: &str, cursor: &mut usize, upward: bool) -> bool
 #[async_trait]
 impl EventSink for ChannelEventSink {
     async fn record(&self, event: &AgentEvent) -> Result<()> {
-        let name = || {
-            event
-                .payload
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?")
-                .to_string()
-        };
         match event.kind {
             AgentEventKind::ModelRequest => {
                 let _ = self.tx.send(UiEvent::ModelStarted);
@@ -1853,40 +1845,24 @@ impl EventSink for ChannelEventSink {
                 }
             }
             AgentEventKind::ToolStarted => {
-                // 参数压缩为单行摘要，展示宽度由 UI 侧统一控制。
-                let args = event
-                    .payload
-                    .get("args")
-                    .map(|value| summarize_json(value, 64))
-                    .unwrap_or_default();
-                let _ = self.tx.send(UiEvent::ToolStarted { name: name(), args });
+                let call = serde_json::from_value::<ToolCall>(event.payload.clone())?;
+                let _ = self.tx.send(UiEvent::ToolStarted(call));
             }
             AgentEventKind::ToolFinished => {
-                let is_error = event
-                    .payload
-                    .get("is_error")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                // 文本结果保留多行预览，首行作为摘要行展示。
-                let mut lines = event
-                    .payload
-                    .get("result")
-                    .map(|value| tool_result_lines(value, TOOL_RESULT_PREVIEW_LINES, 96))
-                    .unwrap_or_default();
-                let result = if lines.is_empty() {
-                    String::new()
-                } else {
-                    lines.remove(0)
-                };
-                let _ = self.tx.send(UiEvent::ToolFinished {
-                    name: name(),
-                    is_error,
-                    result,
-                    detail: lines,
-                });
+                let result = serde_json::from_value::<ToolResult>(event.payload.clone())?;
+                let _ = self.tx.send(UiEvent::ToolFinished(result));
             }
             AgentEventKind::ToolSkipped => {
-                let _ = self.tx.send(UiEvent::ToolSkipped(name()));
+                let call = serde_json::from_value::<ToolCall>(
+                    event.payload.get("call").cloned().unwrap_or(Value::Null),
+                )?;
+                let reason = event
+                    .payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("工具跳过事件缺少原因"))?
+                    .to_string();
+                let _ = self.tx.send(UiEvent::ToolSkipped { call, reason });
             }
             AgentEventKind::SteeringInjected => {
                 let _ = self.tx.send(UiEvent::SteeringInjected);
