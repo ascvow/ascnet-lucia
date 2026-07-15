@@ -735,13 +735,29 @@ impl TeammatePlugin {
             .iter()
             .filter(|member| matches!(member.status, AgentStatus::Queued | AgentStatus::Running))
             .count();
+        let content_height = usize::from(request.height).max(1);
         let mut lines = vec![
-            ui_line(vec![ui_span("团队", Some(UiColor::Cyan), true)]),
-            ui_line(vec![ui_span(
-                format!("{} 成员  {} 运行  {} 消息", members.len(), active, unread),
-                None,
-                false,
-            )]),
+            ui_line(vec![
+                ui_span(format!("{} 成员", members.len()), None, true),
+                ui_span(
+                    format!("  {} 运行", active),
+                    Some(if active > 0 {
+                        UiColor::Cyan
+                    } else {
+                        UiColor::Gray
+                    }),
+                    active > 0,
+                ),
+                ui_span(
+                    format!("  {} 消息", unread),
+                    Some(if unread > 0 {
+                        UiColor::Yellow
+                    } else {
+                        UiColor::Gray
+                    }),
+                    unread > 0,
+                ),
+            ]),
             ui_line(vec![
                 ui_span("● 队长  ", Some(self.controller_activity.color()), true),
                 ui_span(
@@ -751,16 +767,22 @@ impl TeammatePlugin {
                 ),
             ]),
             ui_line(Vec::new()),
+            ui_line(vec![ui_span("成员", Some(UiColor::Gray), true)]),
         ];
-        let available = usize::from(request.height).saturating_sub(6);
-        for member in members.iter().take(available) {
+        let member_capacity = content_height.saturating_sub(5);
+        let visible_members = if members.len() > member_capacity {
+            member_capacity.saturating_sub(1)
+        } else {
+            members.len()
+        };
+        for member in members.iter().take(visible_members) {
             lines.push(ui_line(vec![
                 ui_span(
                     status_marker(member.status),
                     Some(status_color(member.status)),
                     true,
                 ),
-                ui_span(format!(" {}", clipped(&member.role, 18)), None, false),
+                ui_span(format!(" {}", clipped(&member.role, 14)), None, false),
                 ui_span(
                     format!("  {}", status_label(member.status)),
                     Some(UiColor::Gray),
@@ -777,14 +799,17 @@ impl TeammatePlugin {
                 ),
             ]));
         }
-        if members.is_empty() {
+        let hidden_members = members.len().saturating_sub(visible_members);
+        if hidden_members > 0 {
             lines.push(ui_line(vec![ui_span(
-                "暂无成员",
+                format!("+{hidden_members} 成员"),
                 Some(UiColor::Gray),
                 false,
             )]));
         }
-        lines.push(ui_line(Vec::new()));
+        while lines.len().saturating_add(1) < content_height {
+            lines.push(ui_line(Vec::new()));
+        }
         lines.push(ui_line(vec![
             ui_span(
                 if request.focused { "› " } else { "  " },
@@ -1636,6 +1661,13 @@ mod tests {
         assert!(text.contains("队长  等待"), "{text}");
         assert!(text.contains("排队"), "{text}");
         assert!(text.contains("团队工作台  Tab → Enter"), "{text}");
+        assert!(!text.contains("团队团队"), "{text}");
+        assert_eq!(frame.lines.len(), 16);
+        assert!(frame.lines[3].spans.iter().any(|span| span.text == "成员"));
+        assert!(frame.lines[4]
+            .spans
+            .iter()
+            .any(|span| span.text.contains("reviewer")));
 
         let focused = plugin
             .render_ui(UiRenderRequest {

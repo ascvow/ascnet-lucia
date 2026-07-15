@@ -80,7 +80,7 @@ fn split_plugin_area(area: Rect, placement: UiPlacement, requested: u16) -> (Rec
         UiPlacement::Left => {
             let size = requested.min(area.width.saturating_sub(24));
             (
-                Rect::new(area.x, area.y, size, area.height),
+                Rect::new(area.x, area.y, size, area.height.saturating_sub(1)),
                 Rect::new(
                     area.x.saturating_add(size),
                     area.y,
@@ -96,7 +96,7 @@ fn split_plugin_area(area: Rect, placement: UiPlacement, requested: u16) -> (Rec
                     area.x.saturating_add(area.width.saturating_sub(size)),
                     area.y,
                     size,
-                    area.height,
+                    area.height.saturating_sub(1),
                 ),
                 Rect::new(area.x, area.y, area.width.saturating_sub(size), area.height),
             )
@@ -116,9 +116,14 @@ fn render_plugin_view(frame: &mut Frame, view: &mut PluginViewState, area: Rect,
     } else {
         COLOR_MUTED
     };
+    let padding = match view.declaration.placement {
+        UiPlacement::Left | UiPlacement::Right => Padding::new(1, 1, 1, 1),
+        _ => Padding::horizontal(1),
+    };
     let block = Block::bordered()
         .title(format!(" {} ", view.declaration.title))
-        .border_style(Style::new().fg(border_color));
+        .border_style(Style::new().fg(border_color))
+        .padding(padding);
     let content_area = block.inner(area);
     view.area = content_area;
     let lines = view
@@ -330,5 +335,24 @@ fn plugin_color(color: UiColor) -> Color {
         UiColor::Cyan => Color::Cyan,
         UiColor::White => Color::White,
         UiColor::Gray => Color::DarkGray,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 左右停靠视图应为全局底栏保留一行，使边框底部与主输入框对齐。
+    #[test]
+    fn side_docks_leave_one_footer_row() {
+        let area = Rect::new(2, 3, 80, 24);
+
+        let (left, left_remaining) = split_plugin_area(area, UiPlacement::Left, 30);
+        assert_eq!(left, Rect::new(2, 3, 30, 23));
+        assert_eq!(left_remaining, Rect::new(32, 3, 50, 24));
+
+        let (right, right_remaining) = split_plugin_area(area, UiPlacement::Right, 30);
+        assert_eq!(right, Rect::new(52, 3, 30, 23));
+        assert_eq!(right_remaining, Rect::new(2, 3, 50, 24));
     }
 }
