@@ -2,7 +2,7 @@
 id = "skill"
 name = "Lucia 官方 Skill 插件"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/skill_plugin.wasm"
 description = "扫描本地 SKILL.md，向模型注入描述并按需加载完整指令。"
 

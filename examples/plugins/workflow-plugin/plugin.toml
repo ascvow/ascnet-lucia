@@ -2,7 +2,7 @@
 id = "workflow"
 name = "动态工作流插件"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/workflow_plugin.wasm"
 description = "通过受限 Agent Runtime 执行可动态扩展的 DAG 工作流。"
 

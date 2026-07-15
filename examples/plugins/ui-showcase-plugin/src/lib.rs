@@ -2,9 +2,9 @@
 
 use agent_plugin::{
     export_plugin, AgentEvent, AgentPlugin, PluginHostApi, Result, ToolCall, ToolDecision,
-    ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
-    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
-    UiViewInstance,
+    ToolDecisionStatus, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput,
+    UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest,
+    UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use serde_json::json;
 
@@ -65,7 +65,7 @@ impl AgentPlugin for UiShowcasePlugin {
         )]
     }
 
-    fn before_tool(&mut self, call: ToolCall) -> ToolDecision {
+    fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus {
         if call.name == "ui_showcase_control"
             && call.args.get("action").and_then(|value| value.as_str()) == Some("set_message")
             && call
@@ -76,9 +76,10 @@ impl AgentPlugin for UiShowcasePlugin {
         {
             return ToolDecision::Block {
                 reason: "set_message 必须提供非空 message".into(),
-            };
+            }
+            .into();
         }
-        ToolDecision::Allow
+        ToolDecision::Allow.into()
     }
 
     fn call_tool(&mut self, call: ToolCall) -> Result<ToolResult> {

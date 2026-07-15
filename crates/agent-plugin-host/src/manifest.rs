@@ -10,7 +10,7 @@ use std::{
 };
 
 /// 当前支持的插件 ABI 版本。
-pub const SUPPORTED_PLUGIN_API_VERSION: &str = "0.6.0";
+pub const SUPPORTED_PLUGIN_API_VERSION: &str = "0.7.0";
 
 /// 上下文加载器使用的标准能力 ID。
 pub const CONTEXT_LOADER_CAPABILITY: &str = "agent.context-loader";
@@ -29,7 +29,7 @@ struct PluginListConfig {
     #[serde(default)]
     capability_selection: HashMap<String, String>,
 
-    /// 按插件 ID 禁用的插件；对官方自动发现和显式声明同样生效。
+    /// 按插件 ID 禁用的插件；对受管理插件和显式声明同样生效。
     #[serde(default)]
     disabled_plugins: Vec<String>,
 }
@@ -297,7 +297,7 @@ manifest = "/opt/lucia/plugin.toml"
                 id = "workflow"
                 name = "Workflow"
                 version = "1.0.0"
-                api_version = "0.6.0"
+                api_version = "0.7.0"
                 wasm = "workflow.wasm"
 
                 [capabilities.agent]
@@ -324,7 +324,7 @@ manifest = "/opt/lucia/plugin.toml"
         let error = manifest
             .validate()
             .expect_err("旧 ABI manifest 必须在 component 加载前失败");
-        assert!(error.to_string().contains("仅支持当前版本 `0.6.0`"));
+        assert!(error.to_string().contains("仅支持当前版本 `0.7.0`"));
     }
 
     /// Spawn 权限必须同时声明至少一个可请求的 profile。

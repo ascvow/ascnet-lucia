@@ -5,7 +5,9 @@
 
 #![deny(missing_docs)]
 
-pub use agent_tool::{JsonSchema, ToolCall, ToolResult, ToolSpec};
+pub use agent_tool::{
+    JsonSchema, ToolCall, ToolDecision, ToolDecisionStatus, ToolResult, ToolSpec,
+};
 pub use anyhow::{anyhow, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
@@ -17,7 +19,7 @@ pub use serde_json as __serde_json;
 /// WIT contract used by both host and guest.
 /// 宿主和 guest 共用的 WIT 契约。
 pub const PLUGIN_WIT: &str = r#"
-package ascnet:lucia-plugin@0.6.0;
+package ascnet:lucia-plugin@0.7.0;
 
 world plugin {
   import host-agent-upsert-tool: func(request-json: string) -> string;
@@ -500,58 +502,6 @@ pub enum AgentEventKind {
     RunFinished,
     /// Agent 达到最大步数。
     StepLimitReached,
-}
-
-/// Decision returned by before-tool hooks.
-/// before-tool hook 返回的决策。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolDecision {
-    /// Allow the call as-is.
-    /// 原样允许工具调用。
-    #[default]
-    Allow,
-
-    /// Block the call and report the reason to the model.
-    /// 阻止工具调用，并把原因回传给模型。
-    Block {
-        /// 返回给模型的阻止原因，不应包含宿主敏感信息。
-        reason: String,
-    },
-
-    /// Cancel the current Agent run while preserving its session.
-    /// 取消当前 Agent 运行，并保留会话供后续继续。
-    CancelRun {
-        /// User-facing cancellation reason without sensitive host data.
-        /// 不包含敏感宿主信息的取消原因。
-        reason: String,
-    },
-
-    /// Rewrite the call before execution.
-    /// 在执行前重写工具调用。
-    Rewrite {
-        /// Guest 希望宿主改为执行的完整工具调用。
-        call: ToolCall,
-    },
-
-    /// Pause execution until the plugin UI resolves this approval request.
-    /// 暂停执行，直到插件 UI 处理该审批请求。
-    RequireApproval {
-        /// Stable request ID used by UI and audit records.
-        /// UI 与审计记录使用的稳定请求 ID。
-        request_id: String,
-        /// User-facing explanation without sensitive argument values.
-        /// 不包含敏感参数值的用户审批说明。
-        reason: String,
-        /// Delay before Core asks the policy again.
-        /// Core 再次询问策略前的等待毫秒数。
-        #[serde(default = "default_approval_poll_interval_ms")]
-        poll_interval_ms: u64,
-    },
-}
-
-fn default_approval_poll_interval_ms() -> u64 {
-    100
 }
 
 /// 插件启动时由宿主提供的只读上下文。
@@ -1155,8 +1105,10 @@ pub trait AgentPlugin: Default + Send + 'static {
 
     /// Hook before any tool is executed.
     /// 任意工具执行前 hook。
-    fn before_tool(&mut self, _call: ToolCall) -> ToolDecision {
-        ToolDecision::Allow
+    ///
+    /// 返回 `Pending` 时 Host 会稍后重新调用；等待原因、交互和持久化协议由插件自行维护。
+    fn before_tool(&mut self, _call: ToolCall) -> ToolDecisionStatus {
+        ToolDecision::Allow.into()
     }
 
     /// Hook after any tool is executed.
@@ -1274,7 +1226,7 @@ macro_rules! export_plugin {
             wit_bindgen::generate!({
                 path: [],
                 inline: r#"
-package ascnet:lucia-plugin@0.6.0;
+package ascnet:lucia-plugin@0.7.0;
 
 world plugin {
   import host-agent-upsert-tool: func(request-json: string) -> string;
@@ -1685,9 +1637,10 @@ world plugin {
                     let call: $crate::ToolCall = match $crate::from_json_string(&call_json) {
                         Ok(call) => call,
                         Err(err) => {
-                            let decision = $crate::ToolDecision::Block {
+                            let decision: $crate::ToolDecisionStatus = $crate::ToolDecision::Block {
                                 reason: err.to_string(),
-                            };
+                            }
+                            .into();
                             return $crate::to_json_string(&decision);
                         }
                     };

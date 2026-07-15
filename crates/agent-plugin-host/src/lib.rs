@@ -402,7 +402,6 @@ impl AgentExtension for CompositePluginHost {
                     return Ok(ToolDecision::CancelRun { reason });
                 }
                 ToolDecision::Rewrite { call } => current = call,
-                decision @ ToolDecision::RequireApproval { .. } => return Ok(decision),
             }
         }
 
@@ -419,7 +418,6 @@ impl AgentExtension for CompositePluginHost {
                     return Ok(ToolDecision::CancelRun { reason });
                 }
                 ToolDecision::Rewrite { call } => current = call,
-                decision @ ToolDecision::RequireApproval { .. } => return Ok(decision),
             }
         }
 

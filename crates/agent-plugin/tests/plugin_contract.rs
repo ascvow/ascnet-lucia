@@ -11,7 +11,7 @@ const CANONICAL_WIT: &str = include_str!("../../../wit/plugin.wit");
 const UI_FIXTURE: &str = include_str!("../../../wit/fixtures/ui-v1.json");
 const GUEST_SOURCE: &str = include_str!("../src/lib.rs");
 const HOST_WASM_SOURCE: &str = include_str!("../../agent-plugin-host/src/wasm/mod.rs");
-const WIT_PACKAGE: &str = "package ascnet:lucia-plugin@0.6.0;";
+const WIT_PACKAGE: &str = "package ascnet:lucia-plugin@0.7.0;";
 
 /// 读取单一 UI 契约样本。
 fn ui_fixture() -> Value {

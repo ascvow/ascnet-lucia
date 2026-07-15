@@ -17,7 +17,7 @@ Lucia 的插件组合分为两层：manifest 依赖保证插件存在、版本�
 id = "hello-command"
 name = "Hello Command"
 version = "1.0.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/hello_command.wasm"
 
 [[dependencies]]

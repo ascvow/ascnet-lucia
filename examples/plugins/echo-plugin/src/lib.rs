@@ -2,9 +2,9 @@
 //! ascnet-lucia 示例 WASM 插件。
 
 use agent_plugin::{
-    export_plugin, AgentEvent, AgentPlugin, Result, ToolCall, ToolDecision, ToolResult, ToolSpec,
-    UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest,
-    UiSize, UiSpan, UiStyle,
+    export_plugin, AgentEvent, AgentPlugin, Result, ToolCall, ToolDecision, ToolDecisionStatus,
+    ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
+    UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
 use serde_json::json;
 
@@ -36,7 +36,7 @@ impl AgentPlugin for EchoPlugin {
         )]
     }
 
-    fn before_tool(&mut self, call: ToolCall) -> ToolDecision {
+    fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus {
         // Demonstrate a real policy hook: block empty echo calls.
         // 演示真实策略 hook：阻止空 echo 调用。
         if call.name == "echo" {
@@ -50,10 +50,11 @@ impl AgentPlugin for EchoPlugin {
             if is_empty {
                 return ToolDecision::Block {
                     reason: "echo.text cannot be empty / echo.text 不能为空".to_string(),
-                };
+                }
+                .into();
             }
         }
-        ToolDecision::Allow
+        ToolDecision::Allow.into()
     }
 
     fn call_tool(&mut self, call: ToolCall) -> Result<ToolResult> {

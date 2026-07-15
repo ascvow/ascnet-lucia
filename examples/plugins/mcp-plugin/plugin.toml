@@ -2,7 +2,7 @@
 id = "mcp"
 name = "Lucia 官方 MCP 插件"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/mcp_plugin.wasm"
 description = "启动时扫描 stdio MCP 配置，并把任意服务端工具动态注册给 Lucia Agent。"
 

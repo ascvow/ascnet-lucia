@@ -2,7 +2,7 @@
 id = "plan"
 name = "Plan Plugin"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/plan_plugin.wasm"
 description = "提供计划更新、查询、校验和右侧状态面板。"
 

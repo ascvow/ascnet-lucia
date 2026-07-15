@@ -2,7 +2,7 @@
 id = "teammate"
 name = "Teammate 协作插件"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/teammate_plugin.wasm"
 description = "使用 Agent Runtime 句柄管理成员，并提供有界、可确认的短期邮箱。"
 

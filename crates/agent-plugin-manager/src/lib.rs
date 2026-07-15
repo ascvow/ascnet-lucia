@@ -983,7 +983,7 @@ mod tests {
         fs::write(bundle.join("assets/config.txt"), "测试配置").expect("应能写入测试资源");
 
         let mut manifest = format!(
-            "[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\napi_version = \"0.6.0\"\nwasm = \"plugin.wasm\"\n"
+            "[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\napi_version = \"0.7.0\"\nwasm = \"plugin.wasm\"\n"
         );
         for (dependency_id, requirement) in dependencies {
             manifest.push_str(&format!(
@@ -1232,7 +1232,7 @@ mod tests {
         let bundle = create_bundle(&directory.path, "escape", "1.0.0", &[], None);
         fs::write(
             bundle.join("plugin.toml"),
-            "[plugin]\nid = \"escape\"\nname = \"escape\"\nversion = \"1.0.0\"\napi_version = \"0.6.0\"\nwasm = \"../outside.wasm\"\n",
+            "[plugin]\nid = \"escape\"\nname = \"escape\"\nversion = \"1.0.0\"\napi_version = \"0.7.0\"\nwasm = \"../outside.wasm\"\n",
         )
         .expect("应能改写测试 manifest");
         let manager = PluginManager::new(directory.path.join("managed"));
@@ -1247,7 +1247,7 @@ mod tests {
         let bundle = create_bundle(&directory.path, "safe", "1.0.0", &[], None);
         fs::write(
             bundle.join("plugin.toml"),
-            "[plugin]\nid = \"../escape\"\nname = \"escape\"\nversion = \"1.0.0\"\napi_version = \"0.6.0\"\nwasm = \"plugin.wasm\"\n",
+            "[plugin]\nid = \"../escape\"\nname = \"escape\"\nversion = \"1.0.0\"\napi_version = \"0.7.0\"\nwasm = \"plugin.wasm\"\n",
         )
         .expect("应能改写测试 manifest");
         let manager = PluginManager::new(directory.path.join("managed"));

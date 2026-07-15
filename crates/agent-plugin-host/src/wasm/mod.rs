@@ -17,7 +17,7 @@ use super::{
 use crate::ui::UiPlacement;
 use agent_core::{model::ModelMessage, AgentExtension, ContextLoadRequest, LoadedContext};
 use agent_runtime::RuntimePrincipal;
-use agent_tool::{ToolCall, ToolResult, ToolSpec};
+use agent_tool::{ToolCall, ToolDecisionStatus, ToolResult, ToolSpec};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use semver::{Version, VersionReq};
@@ -574,18 +574,33 @@ impl AgentExtension for WasmPluginHost {
 
     async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
         let call_json = serde_json::to_string(call)?;
-        let mut state = self.state.lock().await;
-        refill_fuel(&mut state)?;
-        let before_tool = state.before_tool;
-        let (decision_json,) = before_tool
-            .call_async(&mut state.store, (call_json,))
-            .await
-            .into_anyhow()
-            .with_context(|| format!("plugin `{}` before-tool failed", self.id()))?;
-        let decision = serde_json::from_str::<ToolDecision>(&decision_json).with_context(|| {
-            format!("plugin `{}` returned invalid ToolDecision JSON", self.id())
-        })?;
-        Ok(decision)
+        loop {
+            let decision = {
+                let mut state = self.state.lock().await;
+                refill_fuel(&mut state)?;
+                let before_tool = state.before_tool;
+                let (decision_json,) = before_tool
+                    .call_async(&mut state.store, (call_json.clone(),))
+                    .await
+                    .into_anyhow()
+                    .with_context(|| format!("plugin `{}` before-tool failed", self.id()))?;
+                serde_json::from_str::<ToolDecisionStatus>(&decision_json).with_context(|| {
+                    format!(
+                        "plugin `{}` returned invalid ToolDecisionStatus JSON",
+                        self.id()
+                    )
+                })?
+            };
+            match decision {
+                ToolDecisionStatus::Pending { retry_after_ms } => {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        retry_after_ms.clamp(50, 1_000),
+                    ))
+                    .await;
+                }
+                ToolDecisionStatus::Ready { decision } => return Ok(decision),
+            }
+        }
     }
 
     async fn after_tool(&self, result: &ToolResult) -> Result<()> {

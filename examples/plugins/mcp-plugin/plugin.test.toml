@@ -2,7 +2,7 @@
 id = "mcp-test"
 name = "MCP 路由测试插件"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/mcp_plugin.wasm"
 description = "连接仓库内的假 MCP 服务，验证动态注册和工具回程路由。"
 

@@ -42,7 +42,7 @@ Command 等关键官方插件必须在构建 component 后运行独立 smoke tes
 
 | 错误 | 检查 |
 | --- | --- |
-| ABI 版本不支持 | manifest `api_version` 是否为 `0.6.0` |
+| ABI 版本不支持 | manifest `api_version` 是否为 `0.7.0` |
 | 缺少导出 | 插件是否调用 `export_plugin!` |
 | 文件无权限 | `fs_read` 是否包含真实路径 |
 | 进程启动失败 | `process_exec`、PATH、command 与 cwd |

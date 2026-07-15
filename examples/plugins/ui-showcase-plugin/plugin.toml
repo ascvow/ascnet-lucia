@@ -2,7 +2,7 @@
 id = "ui-showcase"
 name = "UI Showcase Plugin"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/ui_showcase_plugin.wasm"
 description = "展示四向插槽、对话框、样式、工具状态和输入路由。"
 

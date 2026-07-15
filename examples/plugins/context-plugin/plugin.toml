@@ -2,7 +2,7 @@
 id = "context"
 name = "上下文压缩插件"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/context_plugin.wasm"
 description = "支持自动水位与 /compact 主动触发的上下文压缩。"
 

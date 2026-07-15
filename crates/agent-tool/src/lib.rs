@@ -81,6 +81,57 @@ pub struct ToolCall {
     pub args: Value,
 }
 
+/// 工具执行前的通用最终决策，由 Core、Host 与 Guest SDK 共同复用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolDecision {
+    /// 原样允许工具调用。
+    #[default]
+    Allow,
+    /// 阻止工具调用，并将原因作为工具错误返回给模型。
+    Block {
+        /// 返回给模型和事件消费者的阻止原因，不应包含敏感宿主信息。
+        reason: String,
+    },
+    /// 取消当前 Agent 运行，并保留会话供后续继续。
+    CancelRun {
+        /// 返回给事件消费者的取消原因，不应包含敏感宿主信息。
+        reason: String,
+    },
+    /// 在执行前重写工具调用。
+    Rewrite {
+        /// 替换原调用的完整工具调用；调用 ID 应保持可关联性。
+        call: ToolCall,
+    },
+}
+
+/// Guest 前置检查的通用异步状态；业务插件自行维护等待原因和交互协议。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ToolDecisionStatus {
+    /// Guest 已形成可交给 Core 的最终决策。
+    Ready {
+        /// Core、Host 与 Guest 共享的最终工具决策。
+        decision: ToolDecision,
+    },
+    /// Guest 尚未形成最终决策，Host 应在短暂等待后重新调用。
+    Pending {
+        /// Host 再次调用 Guest 前的等待毫秒数。
+        #[serde(default = "default_tool_decision_retry_after_ms")]
+        retry_after_ms: u64,
+    },
+}
+
+impl From<ToolDecision> for ToolDecisionStatus {
+    fn from(decision: ToolDecision) -> Self {
+        Self::Ready { decision }
+    }
+}
+
+fn default_tool_decision_retry_after_ms() -> u64 {
+    100
+}
+
 impl ToolCall {
     /// Construct a tool call.
     /// 构造一次工具调用。
@@ -410,5 +461,40 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["alpha", "middle", "zeta"]);
+    }
+
+    /// 最终决策的 JSON 结构必须由 Core、Host 与 Guest 共享，避免边界两侧复制协议。
+    #[test]
+    fn tool_decision_status_serializes_shared_ready_decision() {
+        let status = ToolDecisionStatus::Ready {
+            decision: ToolDecision::Block {
+                reason: "测试阻止".to_string(),
+            },
+        };
+
+        assert_eq!(
+            serde_json::to_value(status).expect("序列化最终工具决策"),
+            json!({
+                "status": "ready",
+                "decision": {
+                    "type": "block",
+                    "reason": "测试阻止"
+                }
+            })
+        );
+    }
+
+    /// 旧 Guest 省略轮询间隔时必须使用稳定默认值，保证加法字段兼容。
+    #[test]
+    fn pending_tool_decision_uses_default_retry_interval() {
+        let status: ToolDecisionStatus =
+            serde_json::from_value(json!({ "status": "pending" })).expect("解析等待状态");
+
+        assert_eq!(
+            status,
+            ToolDecisionStatus::Pending {
+                retry_after_ms: 100
+            }
+        );
     }
 }

@@ -15,7 +15,7 @@
 | `list_tools()` | 无 | `Vec<ToolSpec>` | 只返回静态工具，不应做 I/O |
 | `call_tool(call)` | `ToolCall` | `Result<ToolResult>` | 只适合不需要 Host 能力的工具 |
 | `call_tool_with_host(host, call)` | Host API 与 ToolCall | `Result<ToolResult>` | 默认转发到 `call_tool`；文件、进程、服务或 Runtime 工具覆盖此方法 |
-| `before_tool(call)` | 任意候选工具调用 | `ToolDecision` | 可允许、阻止、取消、重写或请求审批 |
+| `before_tool(call)` | 任意候选工具调用 | `ToolDecisionStatus` | 返回最终决策，或请求 Host 稍后重新调用 |
 | `after_tool(result)` | 最终工具结果 | `()` | 只观察，不能修改已返回结果 |
 | `on_event(event)` | Core 生命周期事件 | `()` | 适合指标或状态，不应假设 payload 固定 |
 | `load_context(host, request)` | 本轮完整源上下文 | `Result<Option<LoadedContext>>` | `None` 透传；`Some` 完整替换；错误阻止模型请求 |
@@ -30,7 +30,7 @@
 
 `ToolCall` 的 `id` 必须原样带回 `ToolResult.call_id`；`name` 是 Host 路由后的公开名；`args` 是未强类型校验的 JSON。使用 `call.args_as::<Args>()` 解析，不要用字符串切割参数。
 
-`ToolDecision`：
+`ToolDecisionStatus::Ready` 中的 `ToolDecision`：
 
 | 变体 | 字段 | Core 行为 |
 | --- | --- | --- |
@@ -38,9 +38,8 @@
 | `Block` | `reason` | 生成模型可见拒绝结果，不执行工具 |
 | `CancelRun` | `reason` | 优雅取消当前运行并保留 Session |
 | `Rewrite` | 完整 `call` | 对最终调用重新执行策略检查后路由 |
-| `RequireApproval` | `request_id`、`reason`、`poll_interval_ms` | 暂停并周期性重新询问策略 |
 
-审批 `request_id` 必须稳定，`reason` 不应包含敏感参数。重写必须返回完整 ToolCall，不能只返回差量 args。
+`ToolDecisionStatus::Pending { retry_after_ms }` 只表示 Guest 尚未形成最终决策。Host 只负责等待并重新调用，不理解审批 ID、选项、UI 或持久化规则；这些协议由 Sandbox 等具体插件自行定义。重写必须返回完整 ToolCall，不能只返回差量 args。
 
 ### 上下文类型
 

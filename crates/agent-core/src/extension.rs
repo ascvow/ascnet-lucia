@@ -3,50 +3,11 @@
 //! core 只定义运行循环需要的最小接口，不感知具体扩展格式、加载方式或用户界面。
 
 use crate::{event::AgentEvent, model::ModelMessage};
-use agent_tool::{ToolCall, ToolResult, ToolSpec};
+use agent_tool::{ToolCall, ToolDecision, ToolResult, ToolSpec};
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-
-/// 工具执行前由扩展返回的通用决策。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolDecision {
-    /// 原样允许工具调用。
-    #[default]
-    Allow,
-    /// 阻止工具调用，并将原因作为工具错误返回给模型。
-    Block {
-        /// 返回给模型和事件消费者的阻止原因，不应包含敏感宿主信息。
-        reason: String,
-    },
-    /// 取消当前 Agent 运行，并保留会话供后续继续。
-    CancelRun {
-        /// 返回给事件消费者的取消原因，不应包含敏感宿主信息。
-        reason: String,
-    },
-    /// 在执行前重写工具调用。
-    Rewrite {
-        /// 替换原调用的完整工具调用；调用 ID 应保持可关联性。
-        call: ToolCall,
-    },
-    /// 暂停工具执行，等待扩展侧完成用户审批后重新检查同一调用。
-    RequireApproval {
-        /// 扩展生成的稳定审批请求 ID，用于 UI 与审计关联。
-        request_id: String,
-        /// 面向用户的审批说明，不应包含未脱敏的密钥或工具参数。
-        reason: String,
-        /// Core 再次询问策略前的等待毫秒数；会被限制在安全范围内。
-        #[serde(default = "default_approval_poll_interval_ms")]
-        poll_interval_ms: u64,
-    },
-}
-
-fn default_approval_poll_interval_ms() -> u64 {
-    100
-}
 
 /// Agent 运行循环支持的最小宿主扩展接口。
 ///
@@ -105,7 +66,7 @@ impl AgentExtension for NoopAgentExtension {}
 /// 将多个扩展组合为一个扩展，按注册顺序转发每个钩子。
 ///
 /// 与 [`crate::event::CompositeEventSink`] 对称：应用层可以在插件宿主之外
-/// 叠加自己的扩展（如工具审批、审计），而不必替换已挂载的扩展。
+/// 叠加自己的扩展（如工具策略、审计），而不必替换已挂载的扩展。
 ///
 /// 组合语义：
 /// - `prompt_messages` / `list_tools` / `drain_events`：按顺序拼接所有结果；
@@ -173,7 +134,6 @@ impl AgentExtension for CompositeAgentExtension {
                     return Ok(ToolDecision::CancelRun { reason });
                 }
                 ToolDecision::Rewrite { call } => current = Some(call),
-                decision @ ToolDecision::RequireApproval { .. } => return Ok(decision),
             }
         }
         Ok(match current {

@@ -1,4 +1,4 @@
-package ascnet:lucia-plugin@0.6.0;
+package ascnet:lucia-plugin@0.7.0;
 
 /// ascnet-lucia 的 WASM 插件 world。
 ///

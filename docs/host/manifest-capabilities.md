@@ -7,7 +7,7 @@
 id = "example"
 name = "Example Plugin"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/example_plugin.wasm"
 description = "示例插件"
 
@@ -131,4 +131,4 @@ profiles = ["worker", "reviewer"]
 
 ## ABI 兼容
 
-当前 manifest 版本是 `0.6.0`，Host 只接受该版本并要求 WIT 导出完整存在。WIT 函数表面发生破坏性变化时必须升级 ABI；当前 Host 不保留旧 component 的探测加载分支。
+当前 manifest 版本是 `0.7.0`，Host 只接受该版本并要求 WIT 导出完整存在。WIT 函数表面发生破坏性变化时必须升级 ABI；当前 Host 不保留旧 component 的探测加载分支。

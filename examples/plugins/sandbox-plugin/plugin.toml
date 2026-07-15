@@ -2,7 +2,7 @@
 id = "sandbox"
 name = "Sandbox Plugin"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/sandbox_plugin.wasm"
 description = "保护敏感文件，并在 Agent 执行有副作用的工具前请求用户审批。"
 

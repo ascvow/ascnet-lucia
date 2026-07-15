@@ -65,7 +65,7 @@ export_plugin!(HelloPlugin);
 id = "hello"
 name = "Hello Plugin"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/hello_plugin.wasm"
 
 [capabilities]

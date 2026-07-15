@@ -1,8 +1,8 @@
 //! Agent 工具策略与交互审批插件。
 
 use agent_plugin::{
-    export_plugin, AgentPlugin, ToolCall, ToolDecision, UiColor, UiDeclaration, UiFrame, UiInput,
-    UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    export_plugin, AgentPlugin, ToolCall, ToolDecision, ToolDecisionStatus, UiColor, UiDeclaration,
+    UiFrame, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -38,30 +38,30 @@ pub struct SandboxPlugin {
 }
 
 impl AgentPlugin for SandboxPlugin {
-    fn before_tool(&mut self, call: ToolCall) -> ToolDecision {
+    fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus {
         if let Some(resolution) = self.resolutions.remove(&call.id) {
             return match resolution {
-                ApprovalResolution::Allow => ToolDecision::Allow,
+                ApprovalResolution::Allow => ToolDecision::Allow.into(),
                 ApprovalResolution::Cancel => ToolDecision::CancelRun {
                     reason: format!("用户取消工具 `{}` 并暂停当前 Agent 运行", call.name),
-                },
+                }
+                .into(),
             };
         }
 
         if let Some(reason) = blocked_reason(&call) {
-            return ToolDecision::Block { reason };
+            return ToolDecision::Block { reason }.into();
         }
 
         if !requires_approval(&call) {
-            return ToolDecision::Allow;
+            return ToolDecision::Allow.into();
         }
 
         let rule_key = approval_rule_key(&call);
         if self.allow_all || self.allowed_similar.contains(&rule_key) {
-            return ToolDecision::Allow;
+            return ToolDecision::Allow.into();
         }
 
-        let request_id = format!("sandbox-{}", call.id);
         if !self
             .pending
             .iter()
@@ -74,10 +74,8 @@ impl AgentPlugin for SandboxPlugin {
                 rule_key,
             });
         }
-        ToolDecision::RequireApproval {
-            request_id,
-            reason: format!("工具 `{}` 需要用户审批", call.name),
-            poll_interval_ms: 100,
+        ToolDecisionStatus::Pending {
+            retry_after_ms: 100,
         }
     }
 
@@ -376,7 +374,12 @@ mod tests {
             "read_file",
             json!({"path": ".env"}),
         ));
-        assert!(matches!(decision, ToolDecision::Block { .. }));
+        assert!(matches!(
+            decision,
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Block { .. }
+            }
+        ));
     }
 
     /// 写入请求应等待 UI 决策，批准后同一调用只放行一次。
@@ -386,7 +389,7 @@ mod tests {
         let mut plugin = SandboxPlugin::default();
         assert!(matches!(
             plugin.before_tool(call.clone()),
-            ToolDecision::RequireApproval { .. }
+            ToolDecisionStatus::Pending { .. }
         ));
         plugin.on_ui_input(UiInput {
             plugin_id: "sandbox".into(),
@@ -397,7 +400,12 @@ mod tests {
                 modifiers: Vec::new(),
             },
         });
-        assert_eq!(plugin.before_tool(call), ToolDecision::Allow);
+        assert_eq!(
+            plugin.before_tool(call),
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Allow
+            }
+        );
     }
 
     /// 工作区外路径必须在工具执行前被拒绝。
@@ -409,7 +417,12 @@ mod tests {
             "write_file",
             json!({"path": "../important.txt"}),
         ));
-        assert!(matches!(decision, ToolDecision::Block { .. }));
+        assert!(matches!(
+            decision,
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Block { .. }
+            }
+        ));
     }
 
     /// 方向键切换到取消后，Enter 应暂停当前 Agent 运行。
@@ -419,7 +432,7 @@ mod tests {
         let mut plugin = SandboxPlugin::default();
         assert!(matches!(
             plugin.before_tool(call.clone()),
-            ToolDecision::RequireApproval { .. }
+            ToolDecisionStatus::Pending { .. }
         ));
         for code in ["right", "right", "right", "enter"] {
             plugin.on_ui_input(UiInput {
@@ -434,7 +447,9 @@ mod tests {
         }
         assert!(matches!(
             plugin.before_tool(call),
-            ToolDecision::CancelRun { .. }
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::CancelRun { .. }
+            }
         ));
     }
 
@@ -453,7 +468,12 @@ mod tests {
                 modifiers: Vec::new(),
             },
         });
-        assert_eq!(plugin.before_tool(call), ToolDecision::Allow);
+        assert_eq!(
+            plugin.before_tool(call),
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Allow
+            }
+        );
     }
 
     /// 允许相似 Shell 调用只应放行同一命令族。
@@ -474,11 +494,21 @@ mod tests {
             },
         });
 
-        assert_eq!(plugin.before_tool(first), ToolDecision::Allow);
-        assert_eq!(plugin.before_tool(similar), ToolDecision::Allow);
+        assert_eq!(
+            plugin.before_tool(first),
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Allow
+            }
+        );
+        assert_eq!(
+            plugin.before_tool(similar),
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Allow
+            }
+        );
         assert!(matches!(
             plugin.before_tool(different),
-            ToolDecision::RequireApproval { .. }
+            ToolDecisionStatus::Pending { .. }
         ));
     }
 
@@ -504,11 +534,23 @@ mod tests {
             },
         });
 
-        assert_eq!(plugin.before_tool(shell), ToolDecision::Allow);
-        assert_eq!(plugin.before_tool(write), ToolDecision::Allow);
+        assert_eq!(
+            plugin.before_tool(shell),
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Allow
+            }
+        );
+        assert_eq!(
+            plugin.before_tool(write),
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Allow
+            }
+        );
         assert!(matches!(
             plugin.before_tool(secret),
-            ToolDecision::Block { .. }
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Block { .. }
+            }
         ));
     }
 }

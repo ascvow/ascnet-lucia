@@ -21,6 +21,7 @@ pub mod session;
 pub mod state;
 
 pub use agent::{Agent, AgentControl, AgentModelConfig, AgentOptions, AgentRun};
+pub use agent_tool::ToolDecision;
 pub use config::{AgentConfig, AgentRootConfig, ModelConfig};
 pub use context::{
     ContextLoadRequest, ContextLoader, ContextTransform, LoadedContext, PassthroughContextLoader,
@@ -30,7 +31,7 @@ pub use event::{
     AgentEvent, AgentEventKind, BillingUsage, CompositeEventSink, EventSink, InMemoryEventSink,
     JsonlEventSink, NoopEventSink,
 };
-pub use extension::{AgentExtension, CompositeAgentExtension, NoopAgentExtension, ToolDecision};
+pub use extension::{AgentExtension, CompositeAgentExtension, NoopAgentExtension};
 pub use model::{
     ChatModel, ContentBlock, FinishReason, MessageRole, ModelGateway, ModelMessage,
     ModelProviderConfig, ModelRequest, ModelResponse, OpenAiProtocol, ProviderAdapter,

@@ -9,7 +9,7 @@ use agent_plugin_host::{
 };
 use agent_tool::ToolCall;
 use serde_json::json;
-use std::path::Path;
+use std::{path::Path, sync::Arc, time::Duration};
 
 const APPROVAL_VIEW: &str = "sandbox-approval";
 
@@ -17,9 +17,11 @@ const APPROVAL_VIEW: &str = "sandbox-approval";
 #[tokio::test]
 async fn wasm_host_routes_sandbox_approval() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
-    let host = load_wasm_plugins(&[manifest])
-        .await
-        .expect("加载 Sandbox WASM 插件");
+    let host = Arc::new(
+        load_wasm_plugins(&[manifest])
+            .await
+            .expect("加载 Sandbox WASM 插件"),
+    );
     assert_eq!(
         host.capability_owner(TOOL_POLICY_CAPABILITY),
         Some("sandbox")
@@ -29,7 +31,7 @@ async fn wasm_host_routes_sandbox_approval() {
 
     let secret = ToolCall::new("secret", "read_file", json!({"path": ".env"}));
     assert!(matches!(
-        AgentExtension::before_tool(&host, &secret)
+        AgentExtension::before_tool(host.as_ref(), &secret)
             .await
             .expect("检查敏感读取"),
         ToolDecision::Block { .. }
@@ -40,26 +42,35 @@ async fn wasm_host_routes_sandbox_approval() {
         "write_file",
         json!({"path": "src/safe.rs", "content": ""}),
     );
-    assert!(matches!(
-        AgentExtension::before_tool(&host, &write)
-            .await
-            .expect("创建审批"),
-        ToolDecision::RequireApproval { .. }
-    ));
+    let pending_host = Arc::clone(&host);
+    let pending_write = write.clone();
+    let pending_decision = tokio::spawn(async move {
+        AgentExtension::before_tool(pending_host.as_ref(), &pending_write).await
+    });
 
-    let frame = host
-        .render_ui(&UiRenderRequest {
-            plugin_id: "sandbox".into(),
-            view_id: APPROVAL_VIEW.into(),
-            instance_id: None,
-            width: 68,
-            height: 6,
-            focused: true,
-            frame: 1,
-        })
-        .await
-        .expect("渲染审批 UI")
-        .expect("Sandbox 应返回审批帧");
+    let frame = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(frame) = host
+                .render_ui(&UiRenderRequest {
+                    plugin_id: "sandbox".into(),
+                    view_id: APPROVAL_VIEW.into(),
+                    instance_id: None,
+                    width: 68,
+                    height: 6,
+                    focused: true,
+                    frame: 1,
+                })
+                .await
+                .expect("渲染审批 UI")
+                .filter(|frame| frame.visible)
+            {
+                break frame;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Sandbox 应在超时前展示审批界面");
     assert!(frame.visible);
 
     host.on_ui_input(&UiInput {
@@ -75,8 +86,9 @@ async fn wasm_host_routes_sandbox_approval() {
     .expect("批准工具调用");
 
     assert_eq!(
-        AgentExtension::before_tool(&host, &write)
+        pending_decision
             .await
+            .expect("审批任务不应 panic")
             .expect("读取审批结果"),
         ToolDecision::Allow
     );

@@ -179,7 +179,7 @@ pub trait ContextLoader: Send + Sync {
 | `prompt_messages()` | 无 | 本轮 developer/system 贡献消息 |
 | `list_tools()` | 无 | 扩展工具快照 |
 | `call_tool(call)` | `ToolCall` | 扩展拥有工具的结果 |
-| `before_tool(call)` | 候选调用 | `Allow`、`Block`、`Rewrite`、`CancelRun` 或 `RequireApproval` |
+| `before_tool(call)` | 候选调用 | `Allow`、`Block`、`Rewrite` 或 `CancelRun` 最终决策 |
 | `after_tool(result)` | 最终工具结果 | 只观察，不修改结果 |
 | `on_event(event)` | Core 生命周期事件 | 观察或积累扩展状态 |
 | `drain_events()` | 无 | 返回扩展待发布事件，Core 包装为 Extension 事件 |

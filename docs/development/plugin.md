@@ -42,7 +42,7 @@ wit-bindgen = "0.59"
 id = "my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/my_plugin.wasm"
 description = "提供示例工具的 Lucia 插件。"
 
@@ -150,7 +150,7 @@ fn list_tools(&self) -> Vec<ToolSpec>
 ### `before_tool`
 
 ```rust
-fn before_tool(&mut self, call: ToolCall) -> ToolDecision
+fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus
 ```
 
 在任意工具实际执行前参与策略判断，不只观察本插件拥有的工具。
@@ -158,7 +158,7 @@ fn before_tool(&mut self, call: ToolCall) -> ToolDecision
 - `call.id`：模型生成的调用 ID，重写时必须保持结果可关联。
 - `call.name`：公开工具名。
 - `call.args`：已经解析的 JSON 参数，但尚未按某个 Rust 结构验证。
-- 返回值：`Allow` 原样执行；`Block { reason }` 把拒绝原因作为工具结果交给模型；`CancelRun { reason }` 取消当前 Agent 循环；`Rewrite { call }` 执行替换后的完整调用；`RequireApproval` 暂停并按 `request_id` 等待 UI 审批。
+- 返回值：`Ready { decision }` 提交 `Allow`、`Block`、`CancelRun` 或 `Rewrite` 最终决策；`Pending { retry_after_ms }` 请求 Host 稍后重新调用。`Pending` 不携带审批 ID、原因或 UI 结构，审批协议及其状态必须由提供该能力的插件自行维护。
 - 安全要求：`reason` 面向用户和模型，不应包含 secret、完整环境变量或未脱敏命令参数。
 
 ### `call_tool`

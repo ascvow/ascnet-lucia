@@ -2,7 +2,7 @@
 id = "echo"
 name = "Echo Plugin"
 version = "0.1.0"
-api_version = "0.6.0"
+api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/echo_plugin.wasm"
 description = "Example ascnet-lucia WASM plugin that provides an echo tool."
 

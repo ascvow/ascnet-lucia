@@ -379,7 +379,7 @@ impl Agent {
                     .await?;
                 results.push(result);
 
-                // 工具策略可以在审批点取消当前运行；立即跳过同一批剩余工具。
+                // 工具前置策略可以取消当前运行；立即跳过同一批剩余工具。
                 if self.take_cancelled() {
                     for skipped in &tool_calls[index + 1..] {
                         self.emit(
@@ -502,20 +502,14 @@ impl Agent {
     ) -> Result<ToolResult> {
         let original_call = call.clone();
         let decision = loop {
-            let decision = self.extension.before_tool(&call).await?;
-            match decision {
-                ToolDecision::RequireApproval {
-                    poll_interval_ms, ..
-                } => {
-                    if self.control().cancel_requested() {
-                        break ToolDecision::Block {
-                            reason: "工具审批等待已取消".to_string(),
-                        };
-                    }
-                    tokio::time::sleep(Duration::from_millis(poll_interval_ms.clamp(50, 1_000)))
-                        .await;
-                }
-                decision => break decision,
+            if self.control().cancel_requested() {
+                break ToolDecision::CancelRun {
+                    reason: "工具执行前检查已取消".to_string(),
+                };
+            }
+            tokio::select! {
+                decision = self.extension.before_tool(&call) => break decision?,
+                _ = self.cancel_notify.notified() => {}
             }
         };
         let call = match decision {
@@ -534,7 +528,6 @@ impl Agent {
                 self.finish_tool_state(&result);
                 return Ok(result);
             }
-            ToolDecision::RequireApproval { .. } => unreachable!("审批决策已在执行前处理"),
         };
 
         self.update_state(|state| {

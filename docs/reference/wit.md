@@ -1,9 +1,9 @@
-# WIT API 0.6
+# WIT API 0.7
 
-Lucia 插件 ABI 的 world 是 `ascnet:lucia-plugin@0.6.0`。WIT 只固定函数名和 `string` 边界，业务结构通过 JSON 传递；这样可选字段可以按 serde 默认值演进，而不必为每个字段变化重写 Component 类型。
+Lucia 插件 ABI 的 world 是 `ascnet:lucia-plugin@0.7.0`。WIT 只固定函数名和 `string` 边界，业务结构通过 JSON 传递；这样可选字段可以按 serde 默认值演进，而不必为每个字段变化重写 Component 类型。
 
 ```wit
-package ascnet:lucia-plugin@0.6.0;
+package ascnet:lucia-plugin@0.7.0;
 
 world plugin {
   // Host imports
@@ -42,7 +42,7 @@ world plugin {
 }
 ```
 
-- `schema_version`：Host 能力响应信封版本，当前为 `1`，与插件 ABI `0.6.0` 独立。
+- `schema_version`：Host 能力响应信封版本，当前为 `1`，与插件 ABI `0.7.0` 独立。
 - `ok = true`：读取 `value`；无返回值的操作使用 JSON `null`。
 - `ok = false`：读取 `error`，不得同时把缺失 `value` 当作成功空值。
 - Guest SDK 的 `decode_host_response<T>` 会把失败信封转为 Rust `Err`，并把 `value` 反序列化为目标类型。
@@ -776,7 +776,7 @@ export after-tool: func(result-json: string);
 
 ## 兼容规则
 
-1. Host 当前只加载 manifest `api_version = "0.6.0"`，且要求 world 的全部 exports 存在。
+1. Host 当前只加载 manifest `api_version = "0.7.0"`，且要求 world 的全部 exports 存在。
 2. 修改 WIT import/export、删除或改名函数、改变字符串返回含义时必须升级插件 ABI。
 3. JSON 新字段必须可选并提供 serde 默认值；读取方必须忽略未知加法字段。
 4. 删除、改名、收紧枚举或改变既有字段含义属于破坏性变化，需要升级对应协议。
