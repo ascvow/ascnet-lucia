@@ -7,10 +7,25 @@
 target/
 dist/plugin-release/
 
-# 本地环境配置与测试覆盖率产物。
+# 本地环境、注册表凭据与私钥文件。
 .env
 .env.*
 !.env.example
+.envrc
+.direnv/
+.npmrc
+.pypirc
+.netrc
+.cargo/credentials
+.cargo/credentials.toml
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# 测试覆盖率产物。
 coverage/
 *.profraw
 *.profdata
