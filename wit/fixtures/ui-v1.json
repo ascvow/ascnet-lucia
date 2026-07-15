@@ -37,6 +37,18 @@
       "/"
     ]
   },
+  "shelf_declaration": {
+    "plugin_id": "fixture-plugin",
+    "view_id": "plan",
+    "title": "计划",
+    "placement": "composer_shelf",
+    "size": {
+      "width": null,
+      "height": 4
+    },
+    "focusable": true,
+    "input_triggers": []
+  },
   "tool_renderer": {
     "plugin_id": "fixture-plugin",
     "renderer_id": "task-message",

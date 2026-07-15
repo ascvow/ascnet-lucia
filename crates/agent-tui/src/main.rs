@@ -92,7 +92,7 @@ use tui::render_root;
 #[cfg(feature = "plugins")]
 use tui::{
     apply_plugin_frames, apply_plugin_navigation_event, dispatch_plugin_input,
-    drain_plugin_ui_events, refresh_plugin_view, refresh_plugin_views_for, render_input_panel,
+    drain_plugin_ui_events, refresh_plugin_view, refresh_plugin_views_for, render_composer_panels,
     render_plugin_views, view::ViewStack, PluginRenderResult,
 };
 

@@ -1664,6 +1664,31 @@ fn input_panel_renders_plugin_frame_when_trigger_active() {
     assert!(!text.contains("恢复历史会话"), "{text}");
 }
 
+/// 常驻上下文架必须显示在输入框上方，并依次让位给触发面板和独占输入视图。
+#[test]
+#[cfg(feature = "plugins")]
+fn composer_shelf_obeys_input_priority() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut shelf = test_plugin_view(UiPlacement::ComposerShelf, "计划");
+    shelf.frame.as_mut().unwrap().lines[0].spans[0].text = "当前计划步骤".into();
+    app.plugin_views.push(shelf);
+
+    assert_eq!(app.visible_composer_panels(), vec![0]);
+    assert!(app.composer_panel_height() > 0);
+
+    let mut command = test_plugin_view(UiPlacement::InputPanel, "命令");
+    command.declaration.input_triggers = vec!["/".into()];
+    app.plugin_views.push(command);
+    app.input = "/res".into();
+    app.cursor = app.input.len();
+    assert_eq!(app.visible_composer_panels(), vec![1]);
+
+    app.plugin_views
+        .push(test_plugin_view(UiPlacement::Input, "审批"));
+    assert!(app.visible_composer_panels().is_empty());
+}
+
 /// 验证触发手势键按面板可见性路由给触发视图。
 #[test]
 #[cfg(feature = "plugins")]

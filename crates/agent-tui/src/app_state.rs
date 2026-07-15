@@ -653,12 +653,52 @@ impl App {
             .then_some(index)
     }
 
-    /// 输入面板的布局高度：内容行数加顶部边框，受声明高度约束。
+    /// 返回当前独占主输入区的最后一个可见插件视图。
     #[cfg(feature = "plugins")]
-    pub(crate) fn input_panel_height(&self) -> u16 {
-        let Some(index) = self.visible_input_panel() else {
-            return 0;
-        };
+    pub(crate) fn visible_plugin_input(&self) -> Option<usize> {
+        self.plugin_views
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, view)| {
+                view.declaration.placement == UiPlacement::Input && plugin_view_visible(view)
+            })
+            .map(|(index, _)| index)
+    }
+
+    /// 返回输入框上方当前参与布局的视图，并落实独占输入、触发面板和常驻架优先级。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn visible_composer_panels(&self) -> Vec<usize> {
+        if self.visible_plugin_input().is_some() {
+            return Vec::new();
+        }
+        if let Some(index) = self.visible_input_panel() {
+            return vec![index];
+        }
+        self.plugin_views
+            .iter()
+            .enumerate()
+            .filter(|(_, view)| {
+                view.declaration.placement == UiPlacement::ComposerShelf
+                    && plugin_view_visible(view)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// 计算当前输入上方视图所需总高度；每个视图包含一行宿主分隔线。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn composer_panel_height(&self) -> u16 {
+        self.visible_composer_panels()
+            .into_iter()
+            .fold(0u16, |height, index| {
+                height.saturating_add(self.composer_panel_height_at(index))
+            })
+    }
+
+    /// 返回单个输入上方视图受声明上限约束后的布局高度。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn composer_panel_height_at(&self, index: usize) -> u16 {
         let view = &self.plugin_views[index];
         let lines = view
             .frame
@@ -668,7 +708,11 @@ impl App {
         if lines == 0 {
             return 0;
         }
-        let max = view.declaration.size.height.unwrap_or(8);
+        let max = view
+            .declaration
+            .size
+            .height
+            .unwrap_or_else(|| default_plugin_height(view.declaration.placement));
         u16::try_from(lines)
             .unwrap_or(max)
             .saturating_add(1)
@@ -1788,7 +1832,7 @@ pub(crate) fn default_plugin_width(placement: UiPlacement) -> u16 {
     match placement {
         UiPlacement::Left | UiPlacement::Right => 28,
         UiPlacement::Dialog | UiPlacement::Subview => 60,
-        UiPlacement::Input | UiPlacement::InputPanel => 40,
+        UiPlacement::Input | UiPlacement::InputPanel | UiPlacement::ComposerShelf => 40,
         UiPlacement::Top | UiPlacement::Bottom => 40,
     }
 }
@@ -1801,6 +1845,7 @@ pub(crate) fn default_plugin_height(placement: UiPlacement) -> u16 {
         UiPlacement::Dialog | UiPlacement::Subview => 20,
         UiPlacement::Input => 3,
         UiPlacement::InputPanel => 8,
+        UiPlacement::ComposerShelf => 4,
         UiPlacement::Left | UiPlacement::Right => 10,
     }
 }

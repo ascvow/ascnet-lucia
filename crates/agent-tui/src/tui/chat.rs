@@ -12,7 +12,8 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let input_height = input_rows + 2;
     #[cfg(feature = "plugins")]
     let panel_height = if workspace.height >= 10 {
-        app.input_panel_height()
+        app.composer_panel_height()
+            .min(workspace.height.saturating_sub(input_height + 5))
     } else {
         0
     };
@@ -137,7 +138,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
 
     #[cfg(feature = "plugins")]
     if panel_height > 0 {
-        render_input_panel(frame, app, panel_section);
+        render_composer_panels(frame, app, panel_section);
     }
 
     // 输入区是四边圆角边框的多行输入盒，内容超过六行后内部垂直滚动。

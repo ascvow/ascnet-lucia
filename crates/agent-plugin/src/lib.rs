@@ -13,6 +13,10 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 
+mod agent_view;
+
+pub use agent_view::AgentViewSession;
+
 #[doc(hidden)]
 pub use serde_json as __serde_json;
 

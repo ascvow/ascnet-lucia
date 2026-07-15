@@ -36,6 +36,7 @@ fn host_ui_types_match_contract_fixture() {
     assert_round_trip::<UiDeclaration>(&fixture["declaration"]);
     assert_round_trip::<UiDeclaration>(&fixture["input_declaration"]);
     assert_round_trip::<UiDeclaration>(&fixture["trigger_declaration"]);
+    assert_round_trip::<UiDeclaration>(&fixture["shelf_declaration"]);
     assert_round_trip::<ToolRendererContribution>(&fixture["tool_renderer"]);
     assert_round_trip::<UiRenderRequest>(&fixture["render_request"]);
     assert_round_trip::<ToolRenderRequest>(&fixture["tool_render_request"]);

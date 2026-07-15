@@ -35,7 +35,8 @@ pub(crate) fn render_docked_plugin_views(frame: &mut Frame, app: &mut App, outer
                 UiPlacement::Dialog
                 | UiPlacement::Input
                 | UiPlacement::Subview
-                | UiPlacement::InputPanel => 0,
+                | UiPlacement::InputPanel
+                | UiPlacement::ComposerShelf => 0,
             };
             let (plugin_area, next_remaining) = split_plugin_area(remaining, placement, requested);
             remaining = next_remaining;
@@ -103,7 +104,8 @@ fn split_plugin_area(area: Rect, placement: UiPlacement, requested: u16) -> (Rec
         UiPlacement::Dialog
         | UiPlacement::Input
         | UiPlacement::Subview
-        | UiPlacement::InputPanel => (Rect::default(), area),
+        | UiPlacement::InputPanel
+        | UiPlacement::ComposerShelf => (Rect::default(), area),
     }
 }
 
@@ -218,39 +220,46 @@ pub(crate) fn plugin_frame_lines(plugin_frame: &PluginUiFrame) -> Vec<Line<'stat
         .collect()
 }
 
-/// 在输入区上方渲染触发激活的输入面板。
-pub(crate) fn render_input_panel(frame: &mut Frame, app: &mut App, area: Rect) {
-    let Some(index) = app.visible_input_panel() else {
+/// 在输入区上方依次渲染当前参与布局的触发面板或常驻上下文架。
+pub(crate) fn render_composer_panels(frame: &mut Frame, app: &mut App, area: Rect) {
+    let indices = app.visible_composer_panels();
+    if indices.is_empty() {
         return;
-    };
+    }
     if area.is_empty() {
         return;
     }
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
-        .padding(Padding::horizontal(1));
-    app.plugin_views[index].area = block.inner(area);
-    let lines = app.plugin_views[index]
-        .frame
-        .as_ref()
-        .map(plugin_frame_lines)
-        .unwrap_or_default();
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let constraints = indices
+        .iter()
+        .map(|index| Constraint::Length(app.composer_panel_height_at(*index)))
+        .collect::<Vec<_>>();
+    let sections = Layout::vertical(constraints).split(area);
+    for (index, panel_area) in indices.into_iter().zip(sections.iter().copied()) {
+        if panel_area.is_empty() {
+            continue;
+        }
+        let focused = app.plugin_focus == Some(index);
+        let block = Block::new()
+            .borders(Borders::TOP)
+            .border_style(Style::new().fg(if focused {
+                COLOR_BORDER_FOCUS
+            } else {
+                COLOR_MUTED
+            }))
+            .padding(Padding::horizontal(1));
+        app.plugin_views[index].area = block.inner(panel_area);
+        let lines = app.plugin_views[index]
+            .frame
+            .as_ref()
+            .map(plugin_frame_lines)
+            .unwrap_or_default();
+        frame.render_widget(Paragraph::new(lines).block(block), panel_area);
+    }
 }
 
 /// 用可见的 Input 插件视图替换主文本输入区。
 pub(crate) fn render_plugin_input(frame: &mut Frame, app: &mut App, workspace: Rect) {
-    let Some(index) = app
-        .plugin_views
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, view)| {
-            view.declaration.placement == UiPlacement::Input && plugin_view_visible(view)
-        })
-        .map(|(index, _)| index)
-    else {
+    let Some(index) = app.visible_plugin_input() else {
         return;
     };
     let requested_height = app.plugin_views[index]
