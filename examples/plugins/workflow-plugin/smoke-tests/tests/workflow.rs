@@ -4,7 +4,11 @@ use agent_core::{
     Agent, AgentExtension, AgentOptions, ChatModel, ModelGateway, ModelRequest, ModelResponse,
     ProviderAdapter,
 };
-use agent_plugin_host::{wasm::WasmPluginHost, PluginHostServices};
+use agent_plugin_host::{
+    ui::{UiInput, UiInputEvent, UiPlacement, UiRenderRequest, UI_NAVIGATION_EVENT},
+    wasm::WasmPluginHost,
+    PluginHost, PluginHostServices,
+};
 use agent_runtime::{
     AgentDeriveConfig, AgentPermissions, AgentProfileId, AgentRuntime, AgentTemplate, RuntimeLimits,
 };
@@ -145,6 +149,13 @@ async fn component_runs_dynamic_workflow() {
         .await
         .expect("插件工具应可读取");
     assert_eq!(tools.len(), 6);
+    let declarations = PluginHost::ui_declarations(&host)
+        .await
+        .expect("工作流 UI 声明应可读取");
+    assert_eq!(declarations.len(), 3);
+    assert_eq!(declarations[0].placement, UiPlacement::ComposerShelf);
+    assert_eq!(declarations[1].placement, UiPlacement::Subview);
+    assert_eq!(declarations[2].placement, UiPlacement::Subview);
 
     let created = call_tool(
         &host,
@@ -157,6 +168,69 @@ async fn component_runs_dynamic_workflow() {
     )
     .await;
     let workflow_id = created["id"].as_str().expect("创建工作流应返回 ID");
+    let shelf = PluginHost::render_ui(
+        &host,
+        &UiRenderRequest {
+            plugin_id: "workflow".into(),
+            view_id: "workflow-shelf".into(),
+            instance_id: None,
+            width: 80,
+            height: 3,
+            focused: true,
+            frame: 1,
+        },
+    )
+    .await
+    .expect("工作流摘要渲染不应失败")
+    .expect("工作流摘要应返回帧");
+    assert!(shelf.visible);
+    assert!(shelf
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .any(|span| span.text.contains("动态审查")));
+    PluginHost::on_ui_input(
+        &host,
+        &UiInput {
+            plugin_id: "workflow".into(),
+            view_id: "workflow-shelf".into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: "enter".into(),
+                modifiers: Vec::new(),
+            },
+        },
+    )
+    .await
+    .expect("工作流入口按键路由不应失败");
+    let navigation = AgentExtension::drain_events(&host)
+        .await
+        .expect("工作流导航事件应可读取");
+    assert!(navigation.iter().any(|event| {
+        event["name"] == UI_NAVIGATION_EVENT
+            && event["data"]["action"]["view"]["view_id"] == "workflow-workspace"
+            && event["data"]["action"]["view"]["instance_id"] == workflow_id
+    }));
+    let workspace = PluginHost::render_ui(
+        &host,
+        &UiRenderRequest {
+            plugin_id: "workflow".into(),
+            view_id: "workflow-workspace".into(),
+            instance_id: Some(workflow_id.into()),
+            width: 80,
+            height: 24,
+            focused: true,
+            frame: 2,
+        },
+    )
+    .await
+    .expect("工作流工作台渲染不应失败")
+    .expect("工作流工作台应返回帧");
+    assert!(workspace
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .any(|span| span.text.contains("prepare")));
 
     let prepared = tick_until_node_succeeds(&host, workflow_id, "prepare").await;
     assert_eq!(prepared["sealed"], false);

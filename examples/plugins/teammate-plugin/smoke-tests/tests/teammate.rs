@@ -123,30 +123,8 @@ async fn component_runs_mailbox_dispatch_flow() {
     )
     .await
     .expect("团队摘要渲染不应失败")
-    .expect("团队摘要应返回可见帧");
-    assert!(dock.visible);
-    PluginHost::on_ui_input(
-        &host,
-        &UiInput {
-            plugin_id: "teammate".into(),
-            view_id: "teammate-team-dock".into(),
-            instance_id: None,
-            event: UiInputEvent::Key {
-                code: "enter".into(),
-                modifiers: Vec::new(),
-            },
-        },
-    )
-    .await
-    .expect("团队入口按键路由不应失败");
-    let navigation_events = AgentExtension::drain_events(&host)
-        .await
-        .expect("团队导航事件应可读取");
-    assert!(navigation_events.iter().any(|event| {
-        event["name"] == UI_NAVIGATION_EVENT
-            && event["data"]["action"]["action"] == "push"
-            && event["data"]["action"]["view"]["view_id"] == "teammate-team-workspace"
-    }));
+    .expect("团队摘要应返回帧");
+    assert!(!dock.visible);
     let services = PluginHost::services(&host)
         .await
         .expect("插件服务目录应可读取");
@@ -182,6 +160,45 @@ async fn component_runs_mailbox_dispatch_flow() {
         .as_str()
         .expect("spawn 应返回稳定成员地址");
     wait_result(&host, member_id).await;
+
+    let dock = PluginHost::render_ui(
+        &host,
+        &UiRenderRequest {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-team-dock".into(),
+            instance_id: None,
+            width: 30,
+            height: 16,
+            focused: true,
+            frame: 2,
+        },
+    )
+    .await
+    .expect("成员创建后团队摘要渲染不应失败")
+    .expect("成员创建后团队摘要应返回帧");
+    assert!(dock.visible);
+    PluginHost::on_ui_input(
+        &host,
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-team-dock".into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: "enter".into(),
+                modifiers: Vec::new(),
+            },
+        },
+    )
+    .await
+    .expect("团队入口按键路由不应失败");
+    let navigation_events = AgentExtension::drain_events(&host)
+        .await
+        .expect("团队导航事件应可读取");
+    assert!(navigation_events.iter().any(|event| {
+        event["name"] == UI_NAVIGATION_EVENT
+            && event["data"]["action"]["action"] == "push"
+            && event["data"]["action"]["view"]["view_id"] == "teammate-team-workspace"
+    }));
 
     PluginHost::on_ui_input(
         &host,

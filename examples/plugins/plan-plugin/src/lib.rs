@@ -3,7 +3,8 @@
 use agent_plugin::{
     export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentPlugin, PluginHostApi,
     PromptContribution, Result, ToolCall, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame,
-    UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement,
+    UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const UPDATE_PLAN_TOOL: &str = "update_plan";
 const GET_PLAN_TOOL: &str = "get_plan";
 const PLAN_STATE_KEY: &str = "current_plan";
-const PLAN_VIEW: &str = "plan-status";
+const PLAN_SHELF_VIEW: &str = "plan-shelf";
+const PLAN_DETAIL_VIEW: &str = "plan-detail";
 const PLAN_SCHEMA_VERSION: u32 = 1;
 /// 引导主 Agent 使用结构化计划的 developer 提示 ID。
 const PLAN_MANAGEMENT_PROMPT_ID: &str = "plan-management";
@@ -143,11 +145,13 @@ fn default_schema_version() -> u32 {
     PLAN_SCHEMA_VERSION
 }
 
-/// 管理当前 Agent 计划并向 TUI 提供只读状态面板。
+/// 管理当前 Agent 计划，并提供紧凑进度架与完整计划视图。
 #[derive(Default)]
 struct PlanPlugin {
     /// 当前插件实例持有的计划快照。
     state: PlanState,
+    /// 生成插件实例内唯一的导航请求 ID。
+    navigation_sequence: u64,
 }
 
 impl AgentPlugin for PlanPlugin {
@@ -216,69 +220,48 @@ impl AgentPlugin for PlanPlugin {
         }
     }
 
-    /// 声明只读的右侧计划状态面板。
+    /// 声明输入区上方的紧凑计划架和按需打开的完整计划子视图。
     fn describe_ui(&self) -> Vec<UiDeclaration> {
-        vec![UiDeclaration {
-            plugin_id: String::new(),
-            view_id: PLAN_VIEW.into(),
-            title: "计划".into(),
-            placement: UiPlacement::Right,
-            size: UiSize {
-                width: Some(38),
-                height: None,
+        vec![
+            UiDeclaration {
+                plugin_id: String::new(),
+                view_id: PLAN_SHELF_VIEW.into(),
+                title: "计划".into(),
+                placement: UiPlacement::ComposerShelf,
+                size: UiSize {
+                    width: None,
+                    height: Some(3),
+                },
+                focusable: true,
+                input_triggers: Vec::new(),
             },
-            focusable: false,
-            input_triggers: Vec::new(),
-        }]
+            UiDeclaration {
+                plugin_id: String::new(),
+                view_id: PLAN_DETAIL_VIEW.into(),
+                title: "计划详情".into(),
+                placement: UiPlacement::Subview,
+                size: UiSize::default(),
+                focusable: true,
+                input_triggers: Vec::new(),
+            },
+        ]
     }
 
-    /// 按宿主分配的宽高渲染完成进度、更新说明和步骤状态。
+    /// 按宿主分配的宽高渲染紧凑进度或完整步骤列表。
     ///
-    /// 没有计划或全部步骤完成时返回隐藏帧，使宿主自动收回右侧面板空间。
+    /// 没有计划或全部步骤完成时返回隐藏帧，使宿主自动收回布局空间。
     fn render_ui(&mut self, request: UiRenderRequest) -> Option<UiFrame> {
-        if request.view_id != PLAN_VIEW {
-            return None;
-        }
-
         let completed = self
             .state
             .plan
             .iter()
             .filter(|item| item.status == PlanStatus::Completed)
             .count();
-        let mut lines = vec![styled_line(
-            truncate_to_width(
-                &format!("{completed} / {} 已完成", self.state.plan.len()),
-                request.width as usize,
-            ),
-            Some(UiColor::Cyan),
-            true,
-        )];
-
-        if let Some(explanation) = &self.state.explanation {
-            lines.push(styled_line(
-                truncate_to_width(&format!("说明：{explanation}"), request.width as usize),
-                Some(UiColor::Gray),
-                false,
-            ));
-        }
-
-        if self.state.plan.is_empty() {
-            lines.push(styled_line("暂无计划".into(), Some(UiColor::Gray), false));
-        } else {
-            for item in &self.state.plan {
-                let (marker, color) = match item.status {
-                    PlanStatus::Pending => ("[ ]", UiColor::Gray),
-                    PlanStatus::InProgress => ("[>]", UiColor::Yellow),
-                    PlanStatus::Completed => ("[x]", UiColor::Green),
-                };
-                lines.push(styled_line(
-                    truncate_to_width(&format!("{marker} {}", item.step), request.width as usize),
-                    Some(color),
-                    item.status == PlanStatus::InProgress,
-                ));
-            }
-        }
+        let mut lines = match request.view_id.as_str() {
+            PLAN_SHELF_VIEW => self.render_shelf(completed, request.width as usize),
+            PLAN_DETAIL_VIEW => self.render_detail(completed, request.width as usize),
+            _ => return None,
+        };
         lines.truncate(request.height as usize);
 
         Some(UiFrame {
@@ -291,9 +274,102 @@ impl AgentPlugin for PlanPlugin {
             lines,
         })
     }
+
+    /// 在紧凑计划架上响应 Enter 或鼠标按下，打开完整计划子视图。
+    fn on_ui_input_with_host(&mut self, host: &dyn PluginHostApi, input: UiInput) {
+        if input.view_id != PLAN_SHELF_VIEW {
+            return;
+        }
+        let open = matches!(input.event, UiInputEvent::Key { ref code, .. } if code == "enter")
+            || matches!(input.event, UiInputEvent::Mouse { ref kind, .. } if kind.starts_with("down_"));
+        if !open {
+            return;
+        }
+        self.navigation_sequence = self.navigation_sequence.saturating_add(1);
+        let _ = host.navigate_view(UiNavigationRequest {
+            request_id: format!("plan-open-{}", self.navigation_sequence),
+            action: UiNavigationAction::Push {
+                view: UiViewInstance {
+                    view_id: PLAN_DETAIL_VIEW.into(),
+                    instance_id: "current".into(),
+                    title: Some("计划详情".into()),
+                },
+            },
+        });
+    }
 }
 
 impl PlanPlugin {
+    /// 构造输入区上方的当前进度摘要，只保留当前步骤和紧邻的下一步。
+    fn render_shelf(&self, completed: usize, width: usize) -> Vec<UiLine> {
+        let mut lines = vec![styled_line(
+            truncate_to_width(
+                &format!("计划  {completed}/{} 已完成", self.state.plan.len()),
+                width,
+            ),
+            Some(UiColor::Cyan),
+            true,
+        )];
+        if let Some(current) = self
+            .state
+            .plan
+            .iter()
+            .find(|item| item.status == PlanStatus::InProgress)
+        {
+            lines.push(styled_line(
+                truncate_to_width(&format!("[>] {}", current.step), width),
+                Some(UiColor::Yellow),
+                true,
+            ));
+        }
+        if let Some(next) = self
+            .state
+            .plan
+            .iter()
+            .find(|item| item.status == PlanStatus::Pending)
+        {
+            lines.push(styled_line(
+                truncate_to_width(&format!("[ ] 接下来：{}", next.step), width),
+                Some(UiColor::Gray),
+                false,
+            ));
+        }
+        lines
+    }
+
+    /// 构造完整计划子视图，展示说明和全部步骤状态。
+    fn render_detail(&self, completed: usize, width: usize) -> Vec<UiLine> {
+        let mut lines = vec![styled_line(
+            truncate_to_width(
+                &format!("进度  {completed} / {}", self.state.plan.len()),
+                width,
+            ),
+            Some(UiColor::Cyan),
+            true,
+        )];
+        if let Some(explanation) = &self.state.explanation {
+            lines.push(styled_line(
+                truncate_to_width(&format!("说明：{explanation}"), width),
+                Some(UiColor::Gray),
+                false,
+            ));
+            lines.push(styled_line(String::new(), None, false));
+        }
+        for item in &self.state.plan {
+            let (marker, color) = match item.status {
+                PlanStatus::Pending => ("[ ]", UiColor::Gray),
+                PlanStatus::InProgress => ("[>]", UiColor::Yellow),
+                PlanStatus::Completed => ("[x]", UiColor::Green),
+            };
+            lines.push(styled_line(
+                truncate_to_width(&format!("{marker} {}", item.step), width),
+                Some(color),
+                item.status == PlanStatus::InProgress,
+            ));
+        }
+        lines
+    }
+
     /// 解析、校验并保存一次完整计划更新；Host 写入失败时保留旧状态。
     fn update_plan(&mut self, host: &dyn PluginHostApi, call: ToolCall) -> Result<ToolResult> {
         let args: UpdatePlanArgs = match call.args_as() {
@@ -515,12 +591,12 @@ mod tests {
         assert!(state.plan.is_empty());
     }
 
-    /// 空计划和已完成计划不应占用右侧面板，未完成计划仍应显示。
+    /// 空计划和已完成计划不应占用进度架，未完成计划仍应显示。
     #[test]
     fn panel_is_visible_only_while_plan_is_incomplete() {
         let request = || UiRenderRequest {
             plugin_id: "plan".into(),
-            view_id: PLAN_VIEW.into(),
+            view_id: PLAN_SHELF_VIEW.into(),
             instance_id: None,
             width: 24,
             height: 8,
@@ -579,11 +655,12 @@ mod tests {
                 )],
                 ..PlanState::default()
             },
+            ..PlanPlugin::default()
         };
         let frame = plugin
             .render_ui(UiRenderRequest {
                 plugin_id: "plan".into(),
-                view_id: PLAN_VIEW.into(),
+                view_id: PLAN_DETAIL_VIEW.into(),
                 instance_id: None,
                 width: 16,
                 height: 2,

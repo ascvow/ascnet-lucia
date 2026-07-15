@@ -4,7 +4,7 @@ name = "Plan Plugin"
 version = "0.1.0"
 api_version = "0.7.0"
 wasm = "target/wasm32-wasip2/release/plan_plugin.wasm"
-description = "提供计划更新、查询、校验和右侧状态面板。"
+description = "提供计划更新、查询、校验、紧凑进度架和完整计划视图。"
 
 [capabilities]
 # 计划插件只使用实例内状态和声明式 UI，不申请文件、网络、进程或密钥能力。
