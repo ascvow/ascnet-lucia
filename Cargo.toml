@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/agent-tool",
+    "crates/agent-plugin-protocol",
     "crates/agent-plugin",
     "crates/agent-plugin-host",
     "crates/agent-plugin-manager",
@@ -34,6 +35,7 @@ members = [
 ]
 default-members = [
     "crates/agent-tool",
+    "crates/agent-plugin-protocol",
     "crates/agent-plugin",
     "crates/agent-plugin-host",
     "crates/agent-plugin-manager",

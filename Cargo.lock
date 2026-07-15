@@ -70,6 +70,7 @@ dependencies = [
 name = "agent-plugin"
 version = "0.1.0"
 dependencies = [
+ "agent-plugin-protocol",
  "agent-tool",
  "anyhow",
  "serde",
@@ -82,6 +83,7 @@ name = "agent-plugin-host"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-plugin-protocol",
  "agent-runtime",
  "agent-tool",
  "anyhow",
@@ -112,6 +114,14 @@ dependencies = [
  "sha2",
  "toml",
  "zip",
+]
+
+[[package]]
+name = "agent-plugin-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
