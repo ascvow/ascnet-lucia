@@ -849,7 +849,7 @@ impl TeammatePlugin {
                 if request.focused {
                     "  Enter"
                 } else {
-                    "  Tab → Enter"
+                    self.language.select("  Click → Enter", "  点击 → Enter")
                 },
                 Some(if request.focused {
                     UiColor::Cyan
@@ -1060,10 +1060,13 @@ impl TeammatePlugin {
                 stored.status = snapshot.status;
             }
         }
+        let language = self.language;
         let session = self
             .member_sessions
             .entry(member.id.clone())
-            .or_insert_with(|| AgentViewSession::new(member.current_agent_id.clone()));
+            .or_insert_with(|| {
+                AgentViewSession::new(member.current_agent_id.clone()).with_language(language)
+            });
         session.replace_target(member.current_agent_id);
         session.refresh(host);
     }
@@ -1090,9 +1093,12 @@ impl TeammatePlugin {
         let Some(member) = members.get(self.selected_member) else {
             return;
         };
+        let language = self.language;
         self.member_sessions
             .entry(member.id.clone())
-            .or_insert_with(|| AgentViewSession::new(member.current_agent_id.clone()));
+            .or_insert_with(|| {
+                AgentViewSession::new(member.current_agent_id.clone()).with_language(language)
+            });
         self.navigation_sequence = self.navigation_sequence.saturating_add(1);
         let _ = host.navigate_view(UiNavigationRequest {
             request_id: format!("teammate-member-{}", self.navigation_sequence),
@@ -1225,7 +1231,7 @@ impl AgentPlugin for TeammatePlugin {
                 title: self.language.select("Team", "团队").into(),
                 placement: UiPlacement::Right,
                 size: UiSize {
-                    width: Some(30),
+                    width: Some(36),
                     height: None,
                 },
                 focusable: true,
@@ -1293,12 +1299,6 @@ impl AgentPlugin for TeammatePlugin {
         match input.event {
             UiInputEvent::Key { code, .. }
                 if input.view_id == TEAM_DOCK_VIEW && code == "enter" =>
-            {
-                self.refresh_ui_statuses(host);
-                self.open_team_workspace(host);
-            }
-            UiInputEvent::Mouse { kind, .. }
-                if input.view_id == TEAM_DOCK_VIEW && kind.starts_with("down_") =>
             {
                 self.refresh_ui_statuses(host);
                 self.open_team_workspace(host);
@@ -1689,6 +1689,7 @@ mod tests {
         let declarations = plugin.describe_ui();
         assert_eq!(declarations.len(), 3);
         assert_eq!(declarations[0].placement, UiPlacement::Right);
+        assert_eq!(declarations[0].size.width, Some(36));
         assert!(declarations[0].focusable);
         assert_eq!(declarations[1].placement, UiPlacement::Subview);
 
@@ -1714,7 +1715,7 @@ mod tests {
         assert!(text.contains('◌'), "{text}");
         assert!(text.contains("队长  等待"), "{text}");
         assert!(text.contains("排队"), "{text}");
-        assert!(text.contains("团队工作台  Tab → Enter"), "{text}");
+        assert!(text.contains("团队工作台  点击 → Enter"), "{text}");
         assert!(!text.contains("团队团队"), "{text}");
         assert_eq!(frame.lines.len(), 16);
         assert!(frame.lines[3].spans.iter().any(|span| span.text == "成员"));
@@ -1762,7 +1763,8 @@ mod tests {
         let member = plugin.state.list_members("teammate").remove(0);
         plugin.member_sessions.insert(
             member.id.clone(),
-            AgentViewSession::new(member.current_agent_id.clone()),
+            AgentViewSession::new(member.current_agent_id.clone())
+                .with_language(UiLanguage::SimplifiedChinese),
         );
         let session = plugin
             .render_ui(UiRenderRequest {

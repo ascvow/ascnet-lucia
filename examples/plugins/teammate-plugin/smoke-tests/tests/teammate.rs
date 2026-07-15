@@ -243,7 +243,8 @@ async fn component_runs_mailbox_dispatch_flow() {
         .flat_map(|line| line.spans.iter())
         .map(|span| span.text.as_str())
         .collect::<String>();
-    assert!(session_text.contains("运行完成"), "{session_text}");
+    assert!(session_text.contains("Run completed"), "{session_text}");
+    assert!(session_text.contains("Message Agent..."), "{session_text}");
 
     for code in ["r", "e", "v", "i", "e", "w"] {
         PluginHost::on_ui_input(
