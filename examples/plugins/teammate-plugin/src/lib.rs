@@ -926,7 +926,7 @@ impl TeammatePlugin {
         lines
     }
 
-    /// 渲染成员实时事件和可编辑消息输入行。
+    /// 渲染与主 Agent 一致的成员会话时间线和可编辑输入框。
     fn render_member_session(&self, request: &UiRenderRequest) -> Vec<UiLine> {
         let Some(instance_id) = request.instance_id.as_deref() else {
             return vec![ui_line(vec![ui_span(
@@ -955,24 +955,7 @@ impl TeammatePlugin {
                 false,
             )])];
         };
-        let mut lines = vec![
-            ui_line(vec![
-                ui_span(member.role, Some(UiColor::Cyan), true),
-                ui_span(
-                    format!("  {}", status_label(member.status)),
-                    Some(status_color(member.status)),
-                    false,
-                ),
-            ]),
-            ui_line(vec![ui_span(
-                format!("Agent  {}", session.target().as_str()),
-                Some(UiColor::Gray),
-                false,
-            )]),
-            ui_line(Vec::new()),
-        ];
-        lines.extend(session.render(request.width, request.height.saturating_sub(3)));
-        lines
+        session.render(request.width, request.height)
     }
 
     /// 把共享 Agent 输入光标转换为成员子视图帧内的相对坐标。
@@ -985,10 +968,7 @@ impl TeammatePlugin {
             .into_iter()
             .find(|member| member.id.as_str() == instance_id)?;
         let session = self.member_sessions.get(&member.id)?;
-        let mut cursor =
-            session.cursor_position(request.width, request.height.saturating_sub(3))?;
-        cursor.y = cursor.y.saturating_add(3);
-        Some(cursor)
+        session.cursor_position(request.width, request.height)
     }
 
     /// 刷新当前工具 owner 名下全部成员的 Runtime 状态缓存。
@@ -1748,10 +1728,6 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.text.as_str())
             .collect::<String>();
-        assert!(
-            session_text.contains(member.current_agent_id.as_str()),
-            "{session_text}"
-        );
         assert!(
             session_text.contains("Waiting for Agent events"),
             "{session_text}"
