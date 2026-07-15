@@ -1145,6 +1145,38 @@ fn explicit_plugin_manifest_overrides_official_manifest() {
     fs::remove_dir_all(root).expect("清理插件合并测试目录");
 }
 
+/// 用户禁用列表按插件 ID 剔除官方与显式 manifest，无法解析的保留给容错加载器。
+#[cfg(feature = "plugins")]
+#[test]
+fn disabled_plugins_are_removed_from_runtime_composition() {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("生成测试时间戳")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "lucia-disabled-plugin-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).expect("创建插件禁用测试目录");
+    let manifest = |id: &str| {
+        format!(
+            "[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1.0.0\"\napi_version = \"0.6.0\"\nwasm = \"plugin.wasm\"\n"
+        )
+    };
+    let teammate = root.join("teammate.toml");
+    let context = root.join("context.toml");
+    let invalid = root.join("invalid.toml");
+    fs::write(&teammate, manifest("teammate")).expect("写入待禁用插件 manifest");
+    fs::write(&context, manifest("context")).expect("写入保留插件 manifest");
+    fs::write(&invalid, "not-a-manifest").expect("写入无效 manifest");
+
+    let mut manifests = vec![teammate, context.clone(), invalid.clone()];
+    remove_disabled_plugin_manifests(&mut manifests, &["teammate".to_string()]);
+
+    assert_eq!(manifests, vec![context, invalid]);
+    fs::remove_dir_all(root).expect("清理插件禁用测试目录");
+}
+
 /// Invalid manifests remain visible to background loading instead of blocking first paint.
 ///
 /// 无效 manifest 应交给后台加载器报告，不应阻断 TUI 首帧。

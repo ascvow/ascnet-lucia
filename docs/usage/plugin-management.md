@@ -94,7 +94,12 @@ $LUCIA_HOME/plugins/<id>/<version>/
 2. `lucia plugin install` 管理的已启用插件。
 3. `$LUCIA_HOME/official-plugins` 中的官方插件。
 
-同 ID 的高优先级来源覆盖低优先级来源。诊断最终组合使用：
+同 ID 的高优先级来源覆盖低优先级来源。配置文件中的 `disabled_plugins` 最后生效，按插件 ID 从最终组合中剔除任意来源的插件（含官方自动发现）：
+
+```toml
+disabled_plugins = ["teammate", "plan"]
+```
+诊断最终组合使用：
 
 ```bash
 lucia doctor

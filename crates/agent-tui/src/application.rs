@@ -96,10 +96,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     #[cfg(feature = "plugins")]
     let mut capability_selection = HashMap::new();
     #[cfg(feature = "plugins")]
+    let mut disabled_plugins = Vec::new();
+    #[cfg(feature = "plugins")]
     if config_exists {
         let plugin_runtime = load_plugin_runtime_config(&config_path)?;
         plugin_manifests.extend(plugin_runtime.manifest_paths);
         capability_selection.extend(plugin_runtime.capability_selection);
+        disabled_plugins.extend(plugin_runtime.disabled_plugins);
     }
     #[cfg(feature = "plugins")]
     {
@@ -116,6 +119,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         &mut plugin_manifests,
         discover_official_plugin_manifests(&lucia_home)?,
     );
+    // 用户禁用列表最后生效：官方自动发现和显式声明都会被剔除。
+    #[cfg(feature = "plugins")]
+    remove_disabled_plugin_manifests(&mut plugin_manifests, &disabled_plugins);
 
     let (gateway, options, demo_mode, mut startup_notices) = if args.demo {
         let (gateway, options) = build_demo_gateway();

@@ -97,5 +97,12 @@ lucia plugin unselect agent.context-loader
 2. `lucia plugin install` 管理的已启用插件。
 3. 安装器同步到 `$LUCIA_HOME/official-plugins` 的官方插件。
 
-同 ID 的高优先级声明覆盖低优先级来源。受管理插件在进入 Host 前必须通过锁文件、完整性、
+同 ID 的高优先级声明覆盖低优先级来源。配置文件中的 `disabled_plugins` 最后生效，按插件
+ID 从最终组合中剔除任意来源的插件（含官方自动发现）：
+
+```toml
+disabled_plugins = ["teammate", "plan"]
+```
+
+受管理插件在进入 Host 前必须通过锁文件、完整性、
 依赖和能力检查；诊断所有来源的实际启动组合使用 [`lucia doctor`](/guide/doctor)。

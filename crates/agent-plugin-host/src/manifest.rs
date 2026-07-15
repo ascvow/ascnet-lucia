@@ -28,6 +28,10 @@ struct PluginListConfig {
     /// 独占能力 ID 到插件 ID 的显式选择。
     #[serde(default)]
     capability_selection: HashMap<String, String>,
+
+    /// 按插件 ID 禁用的插件；对官方自动发现和显式声明同样生效。
+    #[serde(default)]
+    disabled_plugins: Vec<String>,
 }
 
 /// 应用配置文件中的单个插件 manifest 条目。
@@ -51,6 +55,8 @@ pub struct PluginRuntimeConfig {
     pub manifest_paths: Vec<PathBuf>,
     /// 独占能力 ID 到插件 ID 的显式选择。
     pub capability_selection: HashMap<String, String>,
+    /// 用户按插件 ID 禁用的插件；应用应在装配运行时组合前剔除。
+    pub disabled_plugins: Vec<String>,
 }
 
 /// 从应用 TOML 配置中读取插件路径和独占能力选择。
@@ -81,6 +87,7 @@ fn parse_plugin_runtime_config(text: &str, config_path: &Path) -> Result<PluginR
     Ok(PluginRuntimeConfig {
         manifest_paths,
         capability_selection: config.capability_selection,
+        disabled_plugins: config.disabled_plugins,
     })
 }
 
@@ -255,6 +262,8 @@ manifest = "/opt/lucia/plugin.toml"
     fn plugin_runtime_config_includes_capability_selection() {
         let config = parse_plugin_runtime_config(
             r#"
+                disabled_plugins = ["teammate"]
+
                 [[plugins]]
                 manifest = "plugins/context/plugin.toml"
 
@@ -276,6 +285,7 @@ manifest = "/opt/lucia/plugin.toml"
                 .map(String::as_str),
             Some("context-summary")
         );
+        assert_eq!(config.disabled_plugins, vec!["teammate".to_string()]);
     }
 
     /// Agent Runtime 权限应从嵌套 capability 解析，并保留明确的 profile allowlist。

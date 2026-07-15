@@ -58,6 +58,22 @@ pub(crate) fn merge_official_plugin_manifests(
     }
 }
 
+/// Removes manifests whose plugin ID appears in the user's disabled list.
+///
+/// 按用户配置的禁用插件 ID 剔除 manifest；对官方自动发现和显式声明同样生效。
+/// 无法解析的 manifest 保留给后台容错加载器报告，不在这里静默丢弃。
+#[cfg(feature = "plugins")]
+pub(crate) fn remove_disabled_plugin_manifests(manifests: &mut Vec<PathBuf>, disabled: &[String]) {
+    if disabled.is_empty() {
+        return;
+    }
+    manifests.retain(|path| {
+        PluginManifest::load(path)
+            .map(|manifest| !disabled.contains(&manifest.plugin.id))
+            .unwrap_or(true)
+    });
+}
+
 /// Reads stable plugin IDs for the loading footer before components are activated.
 ///
 /// 在 component 激活前读取稳定插件 ID，供加载中的底栏展示。

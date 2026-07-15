@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "build:all": "bun run build:tui:plugins && bun run build:plugin:all",
+    "build:core": "cargo build -p agent-tool -p agent-core -p agent-session --release --target-dir target/core",
     "build:tui": "bun run build:tui:core && bun run build:tui:plugins",
     "build:tui:core": "cargo build -p lucia --release --no-default-features --target-dir target/core-tui",
     "build:tui:plugins": "cargo build -p lucia --release --features plugins --target-dir target/plugin-tui",

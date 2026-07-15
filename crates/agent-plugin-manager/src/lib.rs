@@ -473,6 +473,8 @@ impl PluginManager {
         Ok(PluginRuntimeConfig {
             manifest_paths,
             capability_selection: lock.capability_selection,
+            // 受管理插件的启停由锁文件 `enabled` 字段表达，不使用该列表。
+            disabled_plugins: Vec::new(),
         })
     }
 

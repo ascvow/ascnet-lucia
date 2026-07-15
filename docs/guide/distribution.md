@@ -1,6 +1,22 @@
 # 构建与打包
 
-Lucia TUI 提供两个编译形态。常规构建默认启用插件系统；纯 Core 形态通过 `--no-default-features` 排除 Plugin Host 和 Wasmtime。
+Lucia 提供三个打包形态：Core 库、纯 Core TUI 与插件版 TUI。常规 TUI 构建默认启用插件系统；纯 Core 形态通过 `--no-default-features` 排除 Plugin Host 和 Wasmtime。
+
+## Core 库
+
+```bash
+bun run build:core
+```
+
+产物：
+
+```text
+target/core/release/libagent_tool.rlib
+target/core/release/libagent_core.rlib
+target/core/release/libagent_session.rlib
+```
+
+`agent-tool`、`agent-core` 与 `agent-session` 组成可独立复用的最小 Agent 核心：ReAct 循环、模型网关、工具注册表与会话存储，不含任何 TUI、Plugin Host 或 Wasmtime 依赖。外部项目通过 path 或 git 依赖直接嵌入（三个 crate 均已声明内部依赖版本号，可按 `agent-tool → agent-core → agent-session` 顺序发布到注册表）。嵌入示例见 `examples/basic-cli` 与 `docs/agent/`。
 
 ## 纯 Core TUI
 
