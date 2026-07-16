@@ -1,0 +1,146 @@
+name: 构建 Lucia 分发产物
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "examples/plugins/**"
+      - "registry/**"
+      - "scripts/**"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/build-lucia.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "examples/plugins/**"
+      - "registry/**"
+      - "scripts/**"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/build-lucia.yml"
+  workflow_dispatch:
+
+# 构建流程只读取仓库内容并上传当前运行的短期产物。
+permissions:
+  contents: read
+
+concurrency:
+  group: build-lucia-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: 构建 ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-latest
+            platform: linux
+            arch: x64
+          - name: macOS Apple Silicon
+            runner: macos-latest
+            platform: macos
+            arch: arm64
+          - name: macOS Intel
+            runner: macos-15-intel
+            platform: macos
+            arch: x64
+          - name: Windows x64
+            runner: windows-latest
+            platform: windows
+            arch: x64
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v5
+
+      - name: 安装 Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: 初始化 Rust 工具链
+        run: rustup show active-toolchain
+
+      - name: 构建 Core 库
+        run: bun run build:core
+
+      - name: 构建纯 Core TUI
+        run: bun run build:tui:core
+
+      - name: 构建插件版 TUI
+        run: bun run build:tui:plugins
+
+      - name: 上传 Core 库
+        uses: actions/upload-artifact@v4
+        with:
+          name: lucia-core-${{ matrix.platform }}-${{ matrix.arch }}
+          path: target/core/release/*.rlib
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传纯 Core TUI
+        uses: actions/upload-artifact@v4
+        with:
+          name: lucia-tui-core-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            target/core-tui/release/lucia
+            target/core-tui/release/lucia.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传插件版 TUI
+        uses: actions/upload-artifact@v4
+        with:
+          name: lucia-tui-plugins-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            target/plugin-tui/release/lucia
+            target/plugin-tui/release/lucia.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  plugins:
+    name: 构建官方 WASM 插件
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v5
+
+      - name: 安装 Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: 安装文档与打包依赖
+        run: bun install --frozen-lockfile
+
+      - name: 初始化 Rust 工具链
+        run: rustup show active-toolchain
+
+      - name: 安装 WASM 构建目标
+        run: rustup target add wasm32-wasip2
+
+      - name: 获取 WASM 构建依赖
+        run: cargo fetch --locked --target wasm32-wasip2
+
+      - name: 构建并打包官方插件
+        run: bun run package:plugin:official
+
+      - name: 上传官方插件包
+        uses: actions/upload-artifact@v4
+        with:
+          name: lucia-official-plugins-wasm
+          path: dist/plugin-release/
+          if-no-files-found: error
+          retention-days: 30
