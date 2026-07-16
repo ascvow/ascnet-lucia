@@ -9,7 +9,7 @@ use std::{
     path::Component,
 };
 
-const APPROVAL_VIEW: &str = "sandbox-approval";
+const APPROVAL_VIEW: &str = "permission-approval";
 
 /// 单次工具审批的最终选择。
 #[derive(Debug, Clone)]
@@ -27,9 +27,9 @@ struct PendingApproval {
     rule_key: String,
 }
 
-/// 沙盒插件状态；策略只检查调用参数，不持有宿主文件、进程或网络能力。
+/// 权限插件状态；策略只检查调用参数，不持有宿主文件、进程或网络能力。
 #[derive(Default)]
-pub struct SandboxPlugin {
+pub struct PermissionPlugin {
     pending: Vec<PendingApproval>,
     resolutions: BTreeMap<String, ApprovalResolution>,
     allowed_similar: BTreeSet<String>,
@@ -37,7 +37,7 @@ pub struct SandboxPlugin {
     selected: usize,
 }
 
-impl AgentPlugin for SandboxPlugin {
+impl AgentPlugin for PermissionPlugin {
     fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus {
         if let Some(resolution) = self.resolutions.remove(&call.id) {
             return match resolution {
@@ -153,7 +153,7 @@ impl AgentPlugin for SandboxPlugin {
     }
 }
 
-impl SandboxPlugin {
+impl PermissionPlugin {
     /// 处理当前审批并重置下一条请求的默认选项。
     fn resolve_current(&mut self, action: usize) {
         if self.pending.is_empty() {
@@ -185,11 +185,13 @@ fn blocked_reason(call: &ToolCall) -> Option<String> {
     let path = call.args.get("path").and_then(|value| value.as_str())?;
     if !is_safe_relative_path(path) {
         return Some(format!(
-            "Sandbox denied a path outside the workspace: {path}"
+            "Permission policy denied a path outside the workspace: {path}"
         ));
     }
     if contains_sensitive_segment(path) {
-        return Some("Sandbox denied access to a sensitive file or credential directory".into());
+        return Some(
+            "Permission policy denied access to a sensitive file or credential directory".into(),
+        );
     }
     None
 }
@@ -380,7 +382,7 @@ fn option_line(shortcut: &str, label: &str, selected: bool, dangerous: bool) -> 
     }
 }
 
-export_plugin!(SandboxPlugin);
+export_plugin!(PermissionPlugin);
 
 #[cfg(test)]
 mod tests {
@@ -390,7 +392,7 @@ mod tests {
     /// 审批界面应保持五行紧凑布局，不使用整块反色或冗余的关闭状态文案。
     #[test]
     fn approval_ui_uses_compact_visual_hierarchy() {
-        let mut plugin = SandboxPlugin::default();
+        let mut plugin = PermissionPlugin::default();
         plugin.before_tool(ToolCall::new(
             "shell-ui",
             "shell",
@@ -399,7 +401,7 @@ mod tests {
 
         let frame = plugin
             .render_ui(UiRenderRequest {
-                plugin_id: "sandbox".into(),
+                plugin_id: "permission".into(),
                 view_id: APPROVAL_VIEW.into(),
                 instance_id: None,
                 width: 68,
@@ -429,7 +431,7 @@ mod tests {
     /// 敏感文件读取必须直接拒绝，不能通过审批临时放行。
     #[test]
     fn blocks_sensitive_file_reads() {
-        let mut plugin = SandboxPlugin::default();
+        let mut plugin = PermissionPlugin::default();
         let decision = plugin.before_tool(ToolCall::new(
             "read-secret",
             "read_file",
@@ -447,13 +449,13 @@ mod tests {
     #[test]
     fn approves_write_once_from_ui() {
         let call = ToolCall::new("write-1", "write_file", json!({"path": "src/lib.rs"}));
-        let mut plugin = SandboxPlugin::default();
+        let mut plugin = PermissionPlugin::default();
         assert!(matches!(
             plugin.before_tool(call.clone()),
             ToolDecisionStatus::Pending { .. }
         ));
         plugin.on_ui_input(UiInput {
-            plugin_id: "sandbox".into(),
+            plugin_id: "permission".into(),
             view_id: APPROVAL_VIEW.into(),
             instance_id: None,
             event: UiInputEvent::Key {
@@ -472,7 +474,7 @@ mod tests {
     /// 工作区外路径必须在工具执行前被拒绝。
     #[test]
     fn blocks_parent_path_escape() {
-        let mut plugin = SandboxPlugin::default();
+        let mut plugin = PermissionPlugin::default();
         let decision = plugin.before_tool(ToolCall::new(
             "escape",
             "write_file",
@@ -490,14 +492,14 @@ mod tests {
     #[test]
     fn arrow_selection_cancels_run() {
         let call = ToolCall::new("shell-1", "shell", json!({"command": "cargo test"}));
-        let mut plugin = SandboxPlugin::default();
+        let mut plugin = PermissionPlugin::default();
         assert!(matches!(
             plugin.before_tool(call.clone()),
             ToolDecisionStatus::Pending { .. }
         ));
         for code in ["right", "right", "right", "enter"] {
             plugin.on_ui_input(UiInput {
-                plugin_id: "sandbox".into(),
+                plugin_id: "permission".into(),
                 view_id: APPROVAL_VIEW.into(),
                 instance_id: None,
                 event: UiInputEvent::Key {
@@ -518,10 +520,10 @@ mod tests {
     #[test]
     fn y_shortcut_approves_once() {
         let call = ToolCall::new("shell-y", "shell", json!({"command": "cargo check"}));
-        let mut plugin = SandboxPlugin::default();
+        let mut plugin = PermissionPlugin::default();
         plugin.before_tool(call.clone());
         plugin.on_ui_input(UiInput {
-            plugin_id: "sandbox".into(),
+            plugin_id: "permission".into(),
             view_id: APPROVAL_VIEW.into(),
             instance_id: None,
             event: UiInputEvent::Key {
@@ -543,10 +545,10 @@ mod tests {
         let first = ToolCall::new("first", "shell", json!({"command": "cargo test -p one"}));
         let similar = ToolCall::new("second", "shell", json!({"command": "cargo test -p two"}));
         let different = ToolCall::new("third", "shell", json!({"command": "cargo check"}));
-        let mut plugin = SandboxPlugin::default();
+        let mut plugin = PermissionPlugin::default();
         plugin.before_tool(first.clone());
         plugin.on_ui_input(UiInput {
-            plugin_id: "sandbox".into(),
+            plugin_id: "permission".into(),
             view_id: APPROVAL_VIEW.into(),
             instance_id: None,
             event: UiInputEvent::Key {
@@ -583,10 +585,10 @@ mod tests {
             json!({"path": "src/lib.rs", "content": ""}),
         );
         let secret = ToolCall::new("secret-all", "read_file", json!({"path": ".env"}));
-        let mut plugin = SandboxPlugin::default();
+        let mut plugin = PermissionPlugin::default();
         plugin.before_tool(shell.clone());
         plugin.on_ui_input(UiInput {
-            plugin_id: "sandbox".into(),
+            plugin_id: "permission".into(),
             view_id: APPROVAL_VIEW.into(),
             instance_id: None,
             event: UiInputEvent::Key {

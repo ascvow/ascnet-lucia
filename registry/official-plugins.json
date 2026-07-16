@@ -52,10 +52,10 @@
       "files": ["plugin.toml", "target/wasm32-wasip2/release/plan_plugin.wasm"]
     },
     {
-      "id": "sandbox",
-      "crate": "sandbox-plugin",
-      "directory": "examples/plugins/sandbox-plugin",
-      "files": ["plugin.toml", "target/wasm32-wasip2/release/sandbox_plugin.wasm"]
+      "id": "permission",
+      "crate": "permission-plugin",
+      "directory": "examples/plugins/permission-plugin",
+      "files": ["plugin.toml", "target/wasm32-wasip2/release/permission_plugin.wasm"]
     }
   ]
 }

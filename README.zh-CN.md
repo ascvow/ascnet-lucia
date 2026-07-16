@@ -28,7 +28,7 @@ Lucia 是一套完全开源的 Agent 运行时与终端界面，用于连接语�
 - 只使用轻量的 Agent Core，或按需组合会话、Runtime、Plugin Host 和 TUI。
 - 把 Lucia 作为 Rust 库嵌入自己的应用，而不是只能使用现成终端界面。
 
-Lucia 当前提供 Context、MCP、Skill、Command、Teammate、Plan 和 Sandbox 等官方插件。插件不是附属脚本，而是项目的主要扩展方式：Core 负责通用 Agent 机制，具体功能留在各自插件中。
+Lucia 当前提供 Context、MCP、Skill、Command、Teammate、Plan 和 Permission 等官方插件。插件不是附属脚本，而是项目的主要扩展方式：Core 负责通用 Agent 机制，具体功能留在各自插件中。
 
 ## 快速开始
 

@@ -28,7 +28,7 @@ Lucia is a fully open-source agent runtime and terminal interface for working wi
 - Run as a lightweight Agent Core or compose session storage, Runtime, Plugin Host, and the TUI as needed.
 - Embed Lucia as a Rust library instead of using the bundled terminal interface.
 
-Lucia currently ships official Context, MCP, Skill, Command, Teammate, Plan, and Sandbox plugins. Plugins are not an afterthought; they are the primary extension model. Core owns the general agent mechanics, while each concrete capability stays in its own plugin.
+Lucia currently ships official Context, MCP, Skill, Command, Teammate, Plan, and Permission plugins. Plugins are not an afterthought; they are the primary extension model. Core owns the general agent mechanics, while each concrete capability stays in its own plugin.
 
 ## Quick Start
 

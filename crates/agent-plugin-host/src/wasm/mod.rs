@@ -1414,17 +1414,17 @@ mod tests {
         let manifests = vec![
             manifest("command", None),
             manifest("policy-support", None),
-            manifest("sandbox", Some("policy-support")),
+            manifest("permission", Some("policy-support")),
             manifest("mcp", None),
         ];
 
         let order =
-            prioritize_progressive_order(&manifests, &[0, 1, 2, 3], &["sandbox".to_string()]);
+            prioritize_progressive_order(&manifests, &[0, 1, 2, 3], &["permission".to_string()]);
         let ids = order
             .iter()
             .map(|index| manifests[*index].plugin.id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, vec!["policy-support", "sandbox", "command", "mcp"]);
+        assert_eq!(ids, vec!["policy-support", "permission", "command", "mcp"]);
     }
 }

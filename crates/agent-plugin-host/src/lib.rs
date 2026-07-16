@@ -1652,7 +1652,7 @@ mod tests {
     #[tokio::test]
     async fn live_host_blocks_tools_until_selected_policy_is_ready() {
         let live = LivePluginHost::new();
-        live.set_capability_owner(manifest::TOOL_POLICY_CAPABILITY, "sandbox")
+        live.set_capability_owner(manifest::TOOL_POLICY_CAPABILITY, "permission")
             .expect("设置策略 owner");
         live.finish_capability_planning().expect("完成能力规划");
         live.on_event(&AgentEvent::new(

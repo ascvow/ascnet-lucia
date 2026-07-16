@@ -39,7 +39,7 @@
 | `CancelRun` | `reason` | 优雅取消当前运行并保留 Session |
 | `Rewrite` | 完整 `call` | 对最终调用重新执行策略检查后路由 |
 
-`ToolDecisionStatus::Pending { retry_after_ms }` 只表示 Guest 尚未形成最终决策。Host 只负责等待并重新调用，不理解审批 ID、选项、UI 或持久化规则；这些协议由 Sandbox 等具体插件自行定义。重写必须返回完整 ToolCall，不能只返回差量 args。
+`ToolDecisionStatus::Pending { retry_after_ms }` 只表示 Guest 尚未形成最终决策。Host 只负责等待并重新调用，不理解审批 ID、选项、UI 或持久化规则；这些协议由权限插件等具体插件自行定义。重写必须返回完整 ToolCall，不能只返回差量 args。
 
 ### 上下文类型
 

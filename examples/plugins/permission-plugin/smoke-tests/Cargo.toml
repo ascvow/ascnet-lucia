@@ -1,5 +1,5 @@
 [package]
-name = "sandbox-plugin-smoke-tests"
+name = "permission-plugin-smoke-tests"
 version = "0.1.0"
 edition = "2021"
 publish = false

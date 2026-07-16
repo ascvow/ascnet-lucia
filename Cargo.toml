@@ -29,8 +29,8 @@ members = [
     "examples/plugins/workflow-plugin",
     "examples/plugins/workflow-plugin/smoke-tests",
     "examples/plugins/plan-plugin",
-    "examples/plugins/sandbox-plugin",
-    "examples/plugins/sandbox-plugin/smoke-tests",
+    "examples/plugins/permission-plugin",
+    "examples/plugins/permission-plugin/smoke-tests",
     "tools/lucia-live-tests",
 ]
 default-members = [
