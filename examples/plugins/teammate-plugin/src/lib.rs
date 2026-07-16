@@ -4,12 +4,11 @@
 //! 身份、受限 Agent 派生及生命周期操作。
 
 use agent_plugin::{
-    export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentHandle, AgentId,
-    AgentOutcome, AgentPlugin, AgentSpawnRequest, AgentStatus, AgentViewSession, ExtensionEvent,
-    PluginHostApi, PromptContribution, Result, ServiceCall, ServiceSpec, ToolCall, ToolResult,
-    ToolSpec, UiColor, UiCursor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
-    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
-    UiViewInstance,
+    export_plugin, ActivationContext, AgentHandle, AgentId, AgentOutcome, AgentPlugin,
+    AgentSpawnRequest, AgentStatus, AgentViewSession, ExtensionEvent, PluginHostApi,
+    PromptContribution, Result, ServiceCall, ServiceSpec, ToolCall, ToolResult, ToolSpec, UiColor,
+    UiCursor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
+    UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -25,7 +24,7 @@ const TEAMMATE_SERVICE_VERSION: &str = "1.0.0";
 /// 引导主 Agent 合理拆分协作任务的 developer 提示 ID。
 const TEAMMATE_ORCHESTRATION_PROMPT_ID: &str = "teammate-orchestration";
 /// 引导主 Agent 选择 teammate 工具的协作规则。
-const TEAMMATE_ORCHESTRATION_PROMPT: &str = "当任务可拆分为两个或更多相互独立的子任务、需要并行调研，或需要独立审查时，优先使用 teammate_spawn 创建角色明确的 teammate。向成员提供完整且可执行的任务输入；完成后使用 teammate_result 获取结果并整合。简单、顺序依赖强或拆分成本高的任务不要创建 teammate。";
+const TEAMMATE_ORCHESTRATION_PROMPT: &str = "当任务可拆分为两个或更多相互独立的子任务、需要并行调研，或需要独立审查时，优先使用 teammate_spawn 创建角色明确的 teammate。需要队长时，必须创建独立成员并设置 captain=true；主 Agent 只负责控制团队，不能作为队长。每个团队最多一个队长。向成员提供完整且可执行的任务输入；完成后使用 teammate_result 获取结果并整合。简单、顺序依赖强或拆分成本高的任务不要创建 teammate。";
 /// 单个 owner 可创建的最大成员数。
 const MAX_MEMBERS_PER_OWNER: usize = 16;
 /// 单个成员邮箱可保留的最大未确认消息数。
@@ -87,6 +86,8 @@ struct MemberSnapshot {
     current_agent_id: AgentId,
     /// owner 定义的成员角色。
     role: String,
+    /// 是否为 owner 指定的独立队长 Agent。
+    captain: bool,
     /// 插件最近一次观察到的当前执行状态。
     status: AgentStatus,
     /// 当前成员尚未确认的消息数量。
@@ -98,6 +99,8 @@ struct MemberSnapshot {
 struct Member {
     owner: String,
     role: String,
+    /// 是否为 owner 指定的独立队长 Agent。
+    captain: bool,
     current: AgentHandle,
     status: AgentStatus,
 }
@@ -109,6 +112,7 @@ impl Member {
             id: address.clone(),
             current_agent_id: self.current.id.clone(),
             role: self.role.clone(),
+            captain: self.captain,
             status: self.status,
             unread_messages,
         }
@@ -129,6 +133,7 @@ impl TeamState {
         &mut self,
         owner: &str,
         role: String,
+        captain: bool,
         handle: AgentHandle,
     ) -> Result<MemberSnapshot> {
         if self
@@ -142,10 +147,19 @@ impl TeamState {
                 "owner `{owner}` 的成员数已达到上限 {MAX_MEMBERS_PER_OWNER}"
             ));
         }
+        if captain
+            && self
+                .members
+                .values()
+                .any(|member| member.owner == owner && member.captain)
+        {
+            return Err(anyhow!("owner `{owner}` 已存在队长 Agent"));
+        }
         let address = handle.id.clone();
         let member = Member {
             owner: owner.to_string(),
             role,
+            captain,
             current: handle,
             status: AgentStatus::Queued,
         };
@@ -330,6 +344,9 @@ impl TeamState {
 struct SpawnRequest {
     role: String,
     input: String,
+    /// 显式指定该派生成员为独立队长；缺省时保持普通成员语义。
+    #[serde(default)]
+    captain: bool,
 }
 
 /// 指向一个稳定成员地址的公共请求。
@@ -367,7 +384,13 @@ struct MessageRequest {
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum ServiceRequest {
     /// 创建一个 teammate 成员。
-    Spawn { role: String, input: String },
+    Spawn {
+        role: String,
+        input: String,
+        /// 显式指定该派生成员为独立队长；旧请求缺省为普通成员。
+        #[serde(default)]
+        captain: bool,
+    },
     /// 列出当前 service caller 拥有的成员。
     List,
     /// 查询成员当前执行状态。
@@ -410,39 +433,6 @@ struct TeammatePlugin {
     selected_member: usize,
     navigation_sequence: u64,
     member_sessions: BTreeMap<AgentId, AgentViewSession>,
-    controller_activity: ControllerActivity,
-}
-
-/// 主 Agent 在团队栏中展示的紧凑活动状态。
-#[derive(Default)]
-enum ControllerActivity {
-    /// 当前没有运行任务。
-    #[default]
-    Waiting,
-    /// 模型正在分析或生成响应。
-    Analyzing,
-    /// 当前轮次正在执行工具。
-    Working,
-}
-
-impl ControllerActivity {
-    /// 返回团队栏使用的活动标签。
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Waiting => "Waiting",
-            Self::Analyzing => "Analyzing",
-            Self::Working => "Running tool",
-        }
-    }
-
-    /// 返回与活动语义一致的终端颜色。
-    fn color(&self) -> UiColor {
-        match self {
-            Self::Waiting => UiColor::Gray,
-            Self::Analyzing => UiColor::Cyan,
-            Self::Working => UiColor::Yellow,
-        }
-    }
 }
 
 impl TeammatePlugin {
@@ -462,15 +452,25 @@ impl TeammatePlugin {
     ) -> Result<Value> {
         let role = validated_text(request.role, "role", 128)?;
         let input = validated_text(request.input, "input", 32 * 1024)?;
-        if self.state.list_members(owner).len() >= MAX_MEMBERS_PER_OWNER {
+        let members = self.state.list_members(owner);
+        if members.len() >= MAX_MEMBERS_PER_OWNER {
             return Err(anyhow!(
                 "owner `{owner}` 的成员数已达到上限 {MAX_MEMBERS_PER_OWNER}"
             ));
         }
-        let agent_input =
-            format!("你是 teammate 成员，角色为 `{role}`。请完成以下任务。\n\n{input}");
+        if request.captain && members.iter().any(|member| member.captain) {
+            return Err(anyhow!("owner `{owner}` 已存在队长 Agent"));
+        }
+        let identity = if request.captain {
+            "teammate 队长 Agent"
+        } else {
+            "teammate 成员"
+        };
+        let agent_input = format!("你是{identity}，角色为 `{role}`。请完成以下任务。\n\n{input}");
         let handle = host.spawn_agent(&AgentSpawnRequest::new(WORKER_PROFILE, agent_input))?;
-        let member = self.state.add_member(owner, role, handle)?;
+        let member = self
+            .state
+            .add_member(owner, role, request.captain, handle)?;
         emit(
             host,
             "teammate.member.spawned",
@@ -659,9 +659,19 @@ impl TeammatePlugin {
         request: ServiceRequest,
     ) -> Result<Value> {
         match request {
-            ServiceRequest::Spawn { role, input } => {
-                self.spawn(host, owner, SpawnRequest { role, input })
-            }
+            ServiceRequest::Spawn {
+                role,
+                input,
+                captain,
+            } => self.spawn(
+                host,
+                owner,
+                SpawnRequest {
+                    role,
+                    input,
+                    captain,
+                },
+            ),
             ServiceRequest::List => Ok(self.list(owner)),
             ServiceRequest::Status { member_id } => {
                 self.status(host, owner, MemberRequest { member_id })
@@ -759,14 +769,7 @@ impl TeammatePlugin {
                     unread > 0,
                 ),
             ]),
-            ui_line(vec![
-                ui_span("● Captain  ", Some(self.controller_activity.color()), true),
-                ui_span(
-                    self.controller_activity.label(),
-                    Some(self.controller_activity.color()),
-                    false,
-                ),
-            ]),
+            render_captain_summary(members.iter().find(|member| member.captain)),
             ui_line(Vec::new()),
             ui_line(vec![ui_span("Members", Some(UiColor::Gray), true)]),
         ];
@@ -776,11 +779,15 @@ impl TeammatePlugin {
         } else {
             members.len()
         };
-        for member in members.iter().take(visible_members) {
+        for member in members
+            .iter()
+            .filter(|member| !member.captain)
+            .take(visible_members)
+        {
             lines.push(ui_line(vec![
                 ui_span(
                     status_marker(member.status),
-                    Some(status_color(member.status)),
+                    Some(member_color(member)),
                     true,
                 ),
                 ui_span(format!(" {}", clipped(&member.role, 14)), None, false),
@@ -862,10 +869,18 @@ impl TeammatePlugin {
                 ),
                 ui_span(
                     format!(" {} ", status_marker(member.status)),
-                    Some(status_color(member.status)),
+                    Some(member_color(member)),
                     true,
                 ),
-                ui_span(clipped(&member.role, 28), None, selected),
+                ui_span(
+                    if member.captain {
+                        format!("Captain  {}", clipped(&member.role, 19))
+                    } else {
+                        clipped(&member.role, 28)
+                    },
+                    Some(member_color(member)),
+                    selected || member.captain,
+                ),
                 ui_span(
                     format!("  {}", status_label(member.status)),
                     Some(UiColor::Gray),
@@ -899,8 +914,20 @@ impl TeammatePlugin {
             )]));
             lines.push(ui_line(vec![ui_span(
                 format!("Role  {}", member.role),
-                None,
-                false,
+                Some(member_color(member)),
+                member.captain,
+            )]));
+            lines.push(ui_line(vec![ui_span(
+                format!(
+                    "Type  {}",
+                    if member.captain { "Captain" } else { "Member" }
+                ),
+                Some(if member.captain {
+                    UiColor::Magenta
+                } else {
+                    UiColor::Gray
+                }),
+                member.captain,
             )]));
             lines.push(ui_line(vec![ui_span(
                 format!("{}  {}", "Status", status_label(member.status)),
@@ -1076,36 +1103,12 @@ impl AgentPlugin for TeammatePlugin {
         self.plugin_id = None;
         self.state = TeamState::default();
         self.member_sessions.clear();
-        self.controller_activity = ControllerActivity::default();
         Ok(())
     }
 
     /// 返回模型可调用的 teammate 控制面工具。
     fn list_tools(&self) -> Vec<ToolSpec> {
         teammate_tools()
-    }
-
-    /// 根据主 Agent 生命周期事件更新团队栏中的队长活动状态。
-    fn on_event(&mut self, event: AgentEvent) {
-        self.controller_activity = match event.kind {
-            AgentEventKind::RunFinished | AgentEventKind::StepLimitReached => {
-                ControllerActivity::Waiting
-            }
-            AgentEventKind::ToolStarted => ControllerActivity::Working,
-            AgentEventKind::RunStarted
-            | AgentEventKind::TurnStarted
-            | AgentEventKind::ModelRequest
-            | AgentEventKind::ModelTextDelta
-            | AgentEventKind::ToolFinished
-            | AgentEventKind::ToolSkipped
-            | AgentEventKind::SteeringInjected
-            | AgentEventKind::FollowUpInjected => ControllerActivity::Analyzing,
-            AgentEventKind::Extension
-            | AgentEventKind::ModelThinkingDelta
-            | AgentEventKind::ModelResponse
-            | AgentEventKind::BillingUsage
-            | AgentEventKind::TurnFinished => return,
-        };
     }
 
     /// 执行 teammate 工具，并使用 Host 注入的 controller 身份作为发送者。
@@ -1365,6 +1368,31 @@ fn status_color(status: AgentStatus) -> UiColor {
     }
 }
 
+/// 返回成员在团队视图中的强调色；队长固定使用洋红色以区别普通成员。
+fn member_color(member: &MemberSnapshot) -> UiColor {
+    if member.captain {
+        UiColor::Magenta
+    } else {
+        status_color(member.status)
+    }
+}
+
+/// 渲染独立队长成员摘要；未创建队长时不再把主 Agent 伪装为队长。
+fn render_captain_summary(captain: Option<&MemberSnapshot>) -> UiLine {
+    let Some(captain) = captain else {
+        return ui_line(vec![ui_span("◇ No captain", Some(UiColor::Gray), false)]);
+    };
+    ui_line(vec![
+        ui_span("● Captain  ", Some(UiColor::Magenta), true),
+        ui_span(clipped(&captain.role, 10), Some(UiColor::Magenta), true),
+        ui_span(
+            format!("  {}", status_label(captain.status)),
+            Some(UiColor::Gray),
+            false,
+        ),
+    ])
+}
+
 /// 按字符数量截断紧凑列表文本，避免窄终端换行破坏对齐。
 fn clipped(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -1442,12 +1470,17 @@ fn teammate_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
             "teammate_spawn",
-            "使用受限 worker profile 创建带角色的 teammate；立即返回成员地址，不等待任务完成。",
+            "使用受限 worker profile 创建带角色的 teammate；可将独立成员指定为唯一队长，主 Agent 不能作为队长；立即返回成员地址，不等待任务完成。",
             json!({
                 "type": "object",
                 "properties": {
                     "role": {"type": "string", "minLength": 1, "maxLength": 128},
-                    "input": {"type": "string", "minLength": 1}
+                    "input": {"type": "string", "minLength": 1},
+                    "captain": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "是否将该独立成员设为队长；每个团队最多一个"
+                    }
                 },
                 "required": ["role", "input"],
                 "additionalProperties": false
@@ -1539,7 +1572,7 @@ mod tests {
     fn mailbox_preserves_sender_and_requires_ack() {
         let mut state = TeamState::default();
         let member = state
-            .add_member("owner-a", "reviewer".into(), handle("member-a"))
+            .add_member("owner-a", "reviewer".into(), false, handle("member-a"))
             .expect("成员应登记成功");
         let message = state
             .send(
@@ -1575,7 +1608,7 @@ mod tests {
     fn owner_isolation_rejects_cross_namespace_access() {
         let mut state = TeamState::default();
         let member = state
-            .add_member("owner-a", "worker".into(), handle("member-a"))
+            .add_member("owner-a", "worker".into(), false, handle("member-a"))
             .expect("成员应登记成功");
 
         let error = state
@@ -1590,7 +1623,7 @@ mod tests {
     fn dispatch_attempts_are_bounded() {
         let mut state = TeamState::default();
         let member = state
-            .add_member("owner", "worker".into(), handle("member"))
+            .add_member("owner", "worker".into(), false, handle("member"))
             .expect("成员应登记成功");
         let message = state
             .send(
@@ -1615,6 +1648,23 @@ mod tests {
         assert!(error.to_string().contains("重试上限"));
     }
 
+    /// 每个 owner 只能登记一个独立队长，且队长身份必须出现在成员快照中。
+    #[test]
+    fn captain_is_unique_teammate_member() {
+        let mut state = TeamState::default();
+        let captain = state
+            .add_member("owner", "lead".into(), true, handle("captain"))
+            .expect("首个队长应登记成功");
+        assert!(captain.captain);
+        let error = state
+            .add_member("owner", "backup".into(), true, handle("backup"))
+            .expect_err("同一 owner 不应登记第二个队长");
+        assert!(error.to_string().contains("已存在队长 Agent"));
+        state
+            .add_member("other", "lead".into(), true, handle("other-captain"))
+            .expect("不同 owner 可拥有各自队长");
+    }
+
     /// 插件必须声明可聚焦团队入口和全屏工作台，并在摘要中渲染成员状态。
     #[test]
     fn team_ui_declares_entry_and_renders_members() {
@@ -1624,7 +1674,11 @@ mod tests {
         };
         plugin
             .state
-            .add_member("teammate", "reviewer".into(), handle("member-ui"))
+            .add_member("teammate", "lead".into(), true, handle("captain-ui"))
+            .expect("UI 测试队长应登记成功");
+        plugin
+            .state
+            .add_member("teammate", "reviewer".into(), false, handle("member-ui"))
             .expect("UI 测试成员应登记成功");
 
         let declarations = plugin.describe_ui();
@@ -1654,7 +1708,7 @@ mod tests {
         assert!(text.contains("members"), "{text}");
         assert!(text.contains("reviewer"), "{text}");
         assert!(text.contains('◌'), "{text}");
-        assert!(text.contains("Captain  Waiting"), "{text}");
+        assert!(text.contains("Captain  lead  Queued"), "{text}");
         assert!(text.contains("Queued"), "{text}");
         assert!(text.contains("Team workspace  Click → Enter"), "{text}");
         assert_eq!(frame.lines.len(), 16);
@@ -1666,6 +1720,9 @@ mod tests {
             .spans
             .iter()
             .any(|span| span.text.contains("reviewer")));
+        assert!(frame.lines[1].spans.iter().any(|span| {
+            span.text.contains("Captain") && span.style.foreground == Some(UiColor::Magenta)
+        }));
 
         let focused = plugin
             .render_ui(UiRenderRequest {

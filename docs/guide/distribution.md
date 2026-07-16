@@ -66,6 +66,19 @@ bun run build:tui
 
 该命令依次构建纯 Core TUI 与插件版 TUI，并分别写入上述目录。
 
+## GitHub Actions 跨平台产物
+
+`构建 Lucia 分发产物` 工作流在 `master`、Pull Request 和手动触发时运行。桌面构建覆盖 Linux x64、macOS Apple Silicon、macOS Intel 和 Windows x64；官方插件统一编译为平台无关的 `wasm32-wasip2` 组件，不为每个桌面系统重复构建。
+
+| Actions 产物 | 内容 |
+| --- | --- |
+| `lucia-core-<platform>-<arch>` | `agent-tool`、`agent-core` 与 `agent-session` 的 release `rlib` |
+| `lucia-tui-core-<platform>-<arch>` | 不包含 Plugin Host 的纯 Core `lucia` 可执行文件 |
+| `lucia-tui-plugins-<platform>-<arch>` | 包含 Plugin Host 和插件管理能力的 `lucia` 可执行文件 |
+| `lucia-official-plugins-wasm` | 官方插件 ZIP、SHA-256 与 Registry 索引 |
+
+这些产物保留 30 天，可从对应 GitHub Actions 运行页面下载。平台与架构名称直接写入产物名，macOS 同时提供 `arm64` 和 `x64`，Windows 当前提供 `x64`。
+
 ## 管理命令
 
 插件版 `lucia` 同时包含 `lucia plugin` 和全局 `lucia doctor`。插件管理器仍是独立 library

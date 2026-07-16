@@ -5,7 +5,7 @@ use agent_core::{
     ProviderAdapter,
 };
 use agent_plugin_host::{
-    ui::{UiInput, UiInputEvent, UiPlacement, UiRenderRequest, UI_NAVIGATION_EVENT},
+    ui::{UiColor, UiInput, UiInputEvent, UiPlacement, UiRenderRequest, UI_NAVIGATION_EVENT},
     wasm::WasmPluginHost,
     PluginHost, PluginHostServices, PluginServiceCall,
 };
@@ -153,9 +153,10 @@ async fn component_runs_mailbox_dispatch_flow() {
     let spawned = call_tool(
         &host,
         "teammate_spawn",
-        json!({"role": "reviewer", "input": "检查首轮实现"}),
+        json!({"role": "reviewer", "input": "检查首轮实现", "captain": true}),
     )
     .await;
+    assert_eq!(spawned["member"]["captain"], true);
     let member_id = spawned["member"]["id"]
         .as_str()
         .expect("spawn 应返回稳定成员地址");
@@ -177,6 +178,9 @@ async fn component_runs_mailbox_dispatch_flow() {
     .expect("成员创建后团队摘要渲染不应失败")
     .expect("成员创建后团队摘要应返回帧");
     assert!(dock.visible);
+    assert!(dock.lines[1].spans.iter().any(|span| {
+        span.text.contains("Captain") && span.style.foreground == Some(UiColor::Magenta)
+    }));
     PluginHost::on_ui_input(
         &host,
         &UiInput {
