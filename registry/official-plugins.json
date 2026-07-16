@@ -53,6 +53,7 @@
     },
     {
       "id": "permission",
+      "replaces": ["sandbox"],
       "crate": "permission-plugin",
       "directory": "examples/plugins/permission-plugin",
       "files": ["plugin.toml", "target/wasm32-wasip2/release/permission_plugin.wasm"]

@@ -2,6 +2,8 @@
 export interface OfficialPluginBundle {
   /** 插件稳定 ID，必须与 plugin.toml 一致。 */
   id: string
+  /** 当前插件替代的旧官方插件 ID；同步时会删除对应旧 bundle。 */
+  replaces?: string[]
   /** 独立插件 crate 名称。 */
   crate: string
   /** 相对于仓库根目录的插件目录。 */
@@ -56,10 +58,26 @@ export async function loadOfficialPluginCatalog(): Promise<OfficialPluginCatalog
       throw new Error(`官方插件清单重复声明 ID：${plugin.id}`)
     }
     ids.add(plugin.id)
-    for (const path of [plugin.directory, ...plugin.files]) {
+    for (const path of [plugin.directory, ...plugin.files, ...(plugin.replaces ?? [])]) {
       if (path.startsWith('/') || path.split('/').includes('..')) {
         throw new Error(`官方插件路径不安全：${path}`)
       }
+    }
+  }
+  const replacedIds = new Set<string>()
+  for (const plugin of catalog.plugins) {
+    for (const replacedId of plugin.replaces ?? []) {
+      if (
+        !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(replacedId) ||
+        replacedId === plugin.id ||
+        ids.has(replacedId)
+      ) {
+        throw new Error(`官方插件替代关系无效：${plugin.id} -> ${replacedId}`)
+      }
+      if (replacedIds.has(replacedId)) {
+        throw new Error(`旧官方插件 ID 被重复替代：${replacedId}`)
+      }
+      replacedIds.add(replacedId)
     }
   }
   return catalog

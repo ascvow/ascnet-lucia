@@ -1,4 +1,4 @@
-import { copyFile, mkdir } from 'node:fs/promises'
+import { copyFile, mkdir, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { loadOfficialPluginCatalog } from './official-plugins'
@@ -11,6 +11,10 @@ async function main(): Promise<void> {
   const catalog = await loadOfficialPluginCatalog()
 
   for (const plugin of catalog.plugins) {
+    for (const replacedId of plugin.replaces ?? []) {
+      await rm(join(destinationRoot, replacedId), { recursive: true, force: true })
+      console.log(`已移除被替代的官方插件：${replacedId}`)
+    }
     const destination = join(destinationRoot, plugin.id)
     for (const relativePath of plugin.files) {
       const source = join(root, plugin.directory, relativePath)
