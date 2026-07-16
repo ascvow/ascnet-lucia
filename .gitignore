@@ -6,6 +6,8 @@
 # Rust 工作区与示例项目的构建产物。
 target/
 dist/plugin-release/
+dist/actions/
+dist/release/
 
 # 本地环境、注册表凭据与私钥文件。
 .env

@@ -70,14 +70,23 @@ bun run build:tui
 
 `构建 Lucia 分发产物` 工作流在 `master`、Pull Request 和手动触发时运行。桌面构建覆盖 Linux x64、macOS Apple Silicon、macOS Intel 和 Windows x64；官方插件统一编译为平台无关的 `wasm32-wasip2` 组件，不为每个桌面系统重复构建。
 
-| Actions 产物 | 内容 |
-| --- | --- |
-| `lucia-core-<platform>-<arch>` | `agent-tool`、`agent-core` 与 `agent-session` 的 release `rlib` |
-| `lucia-tui-core-<platform>-<arch>` | 不包含 Plugin Host 的纯 Core `lucia` 可执行文件 |
-| `lucia-tui-plugins-<platform>-<arch>` | 包含 Plugin Host 和插件管理能力的 `lucia` 可执行文件 |
-| `lucia-official-plugins-wasm` | 官方插件 ZIP、SHA-256 与 Registry 索引 |
+| Actions 产物                          | 内容                                                            |
+| ------------------------------------- | --------------------------------------------------------------- |
+| `lucia-core-<platform>-<arch>`        | `agent-tool`、`agent-core` 与 `agent-session` 的 release `rlib` |
+| `lucia-tui-core-<platform>-<arch>`    | 不包含 Plugin Host 的纯 Core `lucia` 可执行文件                 |
+| `lucia-tui-plugins-<platform>-<arch>` | 包含 Plugin Host 和插件管理能力的 `lucia` 可执行文件            |
+| `lucia-official-plugins-wasm`         | 官方插件 ZIP、SHA-256 与 Registry 索引                          |
 
-这些产物保留 30 天，可从对应 GitHub Actions 运行页面下载。平台与架构名称直接写入产物名，macOS 同时提供 `arm64` 和 `x64`，Windows 当前提供 `x64`。
+分支、Pull Request 和手动运行产生的 Actions 产物保留 30 天，可从对应运行页面下载。平台与架构名称直接写入产物名，macOS 同时提供 `arm64` 和 `x64`，Windows 当前提供 `x64`。
+
+推送与 workspace 版本一致的 `v*` 标签时，同一工作流会把桌面产物转换为 Linux/macOS `tar.gz` 和 Windows ZIP，为每个归档生成 SHA-256，并创建永久 GitHub Release。官方插件仍保持每个插件一个 ZIP，同时上传各自校验和、`registry.json` 与 Registry 校验和；Release 内的 Registry 会引用当前仓库和当前不可变标签，不依赖本地凭据或长期 API Key。
+
+例如 workspace 版本为 `0.1.0` 时，发布标签必须为 `v0.1.0`：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## 管理命令
 

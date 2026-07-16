@@ -1,7 +1,11 @@
 import { mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { zipSync, type Zippable } from 'fflate'
-import { loadOfficialPluginCatalog, type OfficialPluginBundle } from './official-plugins'
+import {
+  loadOfficialPluginCatalog,
+  type OfficialPluginBundle,
+  type OfficialPluginRelease,
+} from './official-plugins'
 
 /** plugin.toml 中打包需要读取的稳定字段。 */
 interface PluginManifestDocument {
@@ -30,6 +34,26 @@ interface RegistryVersionDocument {
   sha256: string
   /** 从 plugin.toml 转换的依赖约束。 */
   dependencies: Array<{ name: string; requirement: string; optional: boolean }>
+}
+
+/**
+ * 解析插件资产的 Release 位置。
+ * CI 发布标签时必须同时提供 owner、repository 和 tag；普通本地打包继续使用官方清单默认值。
+ */
+function resolveReleaseTarget(fallback: OfficialPluginRelease): OfficialPluginRelease {
+  const override = {
+    owner: Bun.env.LUCIA_PLUGIN_RELEASE_OWNER?.trim() ?? '',
+    repository: Bun.env.LUCIA_PLUGIN_RELEASE_REPOSITORY?.trim() ?? '',
+    tag: Bun.env.LUCIA_PLUGIN_RELEASE_TAG?.trim() ?? '',
+  }
+  const values = Object.values(override)
+  if (values.every((value) => value.length === 0)) {
+    return fallback
+  }
+  if (values.some((value) => value.length === 0)) {
+    throw new Error('插件 Release 覆盖参数必须同时提供 owner、repository 和 tag')
+  }
+  return override
 }
 
 /** 读取插件 manifest，并保证清单 ID 与 manifest 身份一致。 */
@@ -70,6 +94,7 @@ async function main(): Promise<void> {
   const root = join(import.meta.dir, '..')
   const output = join(root, 'dist', 'plugin-release')
   const catalog = await loadOfficialPluginCatalog()
+  const release = resolveReleaseTarget(catalog.release)
   await rm(output, { recursive: true, force: true })
   await mkdir(output, { recursive: true })
 
@@ -94,7 +119,7 @@ async function main(): Promise<void> {
         {
           version: manifest.plugin.version,
           api_version: manifest.plugin.api_version,
-          github: { ...catalog.release, asset },
+          github: { ...release, asset },
           sha256,
           dependencies: (manifest.dependencies ?? []).map((dependency) => ({
             name: dependency.id,

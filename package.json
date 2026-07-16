@@ -21,6 +21,7 @@
     "build:plugin:teammate": "bun run scripts/build-plugin.ts teammate-plugin",
     "build:plugin:official": "bun run scripts/build-official-plugins.ts",
     "package:plugin:official": "bun run build:plugin:official && bun run scripts/package-official-plugins.ts",
+    "package:release:assets": "bun run scripts/package-lucia-release.ts",
     "build:plugin:agent-runtime": "bun run scripts/build-plugin.ts agent-runtime-plugin",
     "build:plugin:ui-showcase": "bun run scripts/build-plugin.ts ui-showcase-plugin",
     "build:plugin:workflow": "bun run scripts/build-plugin.ts workflow-plugin",
