@@ -485,11 +485,14 @@ fn styled_line(text: String, foreground: Option<UiColor>, bold: bool) -> UiLine 
 }
 
 /// 按计划状态渲染单个任务行，并限制其终端显示宽度。
+///
+/// 待处理项使用正常文本色，进行中项使用黄色强调，已完成项使用灰色弱化，
+/// 避免完成态比尚未处理的任务更抢眼。
 fn render_plan_item(item: &PlanItem, width: usize) -> UiLine {
     let (marker, color) = match item.status {
-        PlanStatus::Pending => ("[ ]", UiColor::Gray),
+        PlanStatus::Pending => ("[ ]", UiColor::White),
         PlanStatus::InProgress => ("[>]", UiColor::Yellow),
-        PlanStatus::Completed => ("[x]", UiColor::Green),
+        PlanStatus::Completed => ("[x]", UiColor::Gray),
     };
     styled_line(
         truncate_to_width(&format!("{marker} {}", item.step), width),
@@ -671,6 +674,10 @@ mod tests {
                 "[x] 已完成二",
             ]
         );
+        assert_eq!(lines[1].spans[0].style.foreground, Some(UiColor::White));
+        assert_eq!(lines[2].spans[0].style.foreground, Some(UiColor::Yellow));
+        assert_eq!(lines[3].spans[0].style.foreground, Some(UiColor::Gray));
+        assert_eq!(lines[4].spans[0].style.foreground, Some(UiColor::Gray));
 
         plugin.state.plan = (1..=7)
             .map(|index| item(&format!("任务 {index}"), PlanStatus::Pending))
