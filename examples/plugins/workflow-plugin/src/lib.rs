@@ -1,6 +1,8 @@
-//! 基于 Agent Runtime 的动态 DAG 工作流插件。
+//! 参考 Claude Code 动态任务列表的工作流插件。
 //!
-//! 插件拥有工作流定义、依赖调度和失败传播；Host 只提供受限 Agent 派生、观察与取消。
+//! 插件维护单一动态任务列表：任务可随时追加、修改、取消或删除；依赖齐备的任务
+//! 自动派生受限 worker Agent 执行并注入依赖输出，无需封存或手动推进。
+//! Host 只提供受限 Agent 派生、观察与取消。
 
 use agent_plugin::{
     export_plugin, ActivationContext, AgentId, AgentOutcome, AgentPlugin, AgentSpawnRequest,
@@ -9,193 +11,141 @@ use agent_plugin::{
     UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// manifest 允许工作流节点使用的唯一 Agent 派生策略。
+/// manifest 允许任务使用的唯一 Agent 派生策略。
 const WORKER_PROFILE: &str = "worker";
-/// 单个工作流允许的最大并行节点数，防止 Guest 绕过应用级资源规划。
-const MAX_PARALLELISM: usize = 32;
-/// 节点提示词的最大字节数，避免状态和跨 ABI 请求无限增长。
+/// 同时运行的任务 Agent 上限；超出预算的就绪任务排队等待自动调度。
+const MAX_PARALLELISM: usize = 4;
+/// 任务提示词的最大字节数，避免状态和跨 ABI 请求无限增长。
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
-/// 引导主 Agent 合理创建 DAG 工作流的 developer 提示 ID。
-const WORKFLOW_ORCHESTRATION_PROMPT_ID: &str = "workflow-orchestration";
-/// 引导主 Agent 选择工作流工具的编排规则。
-const WORKFLOW_ORCHESTRATION_PROMPT: &str = "当任务包含明确依赖关系、可并行的多个阶段，或需要可追踪的失败传播时，优先使用 workflow_create 建立 DAG 工作流。先定义节点与依赖，再在节点齐备后使用 workflow_seal，并通过 workflow_tick 推进和观察执行。简单的一次性任务、无法明确依赖关系的探索任务不要创建工作流。";
-/// 输入框上方展示活动工作流进度的紧凑视图。
-const WORKFLOW_SHELF_VIEW: &str = "workflow-shelf";
-/// 展示单个 DAG 及节点详情的工作台子视图。
-const WORKFLOW_WORKSPACE_VIEW: &str = "workflow-workspace";
-/// 展示并交互单个工作流节点 Agent 的子视图。
-const WORKFLOW_NODE_VIEW: &str = "workflow-node-agent";
+/// 引导主 Agent 合理使用动态任务列表的 developer 提示 ID。
+const TASK_ORCHESTRATION_PROMPT_ID: &str = "workflow-orchestration";
+/// 引导主 Agent 以动态任务列表编排多阶段工作的规则。
+const TASK_ORCHESTRATION_PROMPT: &str = "包含多个阶段或明确依赖关系的任务，用 task_create 维护动态任务列表：先登记当前已知的任务与依赖，执行中随时追加新任务、修改待处理任务或取消不再需要的任务。依赖齐备的任务会自动派生 worker Agent 并注入依赖任务结果，无需手动推进；用 task_list 观察进度，用 task_get 读取任务输出，失败任务用 task_update 重置为 pending 即可重跑。简单的一次性任务不要创建任务列表。";
+/// 输入框上方展示任务进度的紧凑视图。
+const TASK_SHELF_VIEW: &str = "workflow-shelf";
+/// 展示任务列表及选中任务详情的工作台子视图。
+const TASK_WORKSPACE_VIEW: &str = "workflow-workspace";
+/// 展示并交互单个任务 Agent 的子视图。
+const TASK_AGENT_VIEW: &str = "workflow-task-agent";
+/// 任务工作台的固定视图实例 ID；插件只维护一个任务列表。
+const TASK_WORKSPACE_INSTANCE: &str = "tasks";
 
-/// 保存当前组件实例内所有动态工作流。
+/// 维护单一动态任务列表和任务 Agent 会话。
 #[derive(Default)]
 struct WorkflowPlugin {
-    workflows: BTreeMap<String, Workflow>,
-    next_workflow_id: u64,
-    selected_workflow: Option<String>,
-    selected_node: usize,
+    tasks: BTreeMap<String, Task>,
+    /// 任务创建顺序，用于展示和公平调度。
+    order: Vec<String>,
+    selected_task: usize,
     navigation_sequence: u64,
-    node_sessions: BTreeMap<String, AgentViewSession>,
+    task_sessions: BTreeMap<String, AgentViewSession>,
 }
 
-/// 一个可在封存前持续追加节点的 DAG 工作流。
-#[derive(Debug, Serialize)]
-struct Workflow {
-    id: String,
-    name: String,
-    max_parallelism: usize,
-    failure_policy: FailurePolicy,
-    sealed: bool,
-    status: WorkflowStatus,
-    nodes: BTreeMap<String, WorkflowNode>,
-}
-
-/// 工作流整体状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum WorkflowStatus {
-    Active,
-    Succeeded,
-    Failed,
-    Cancelled,
-}
-
-/// 节点失败后的调度策略。
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum FailurePolicy {
-    /// 首次失败后停止整个工作流并取消仍在运行的节点。
-    #[default]
-    Stop,
-    /// 只跳过依赖失败节点的下游节点，继续独立分支。
-    Continue,
-}
-
-/// 工作流中的一个 Agent 任务节点。
-#[derive(Debug, Serialize)]
-struct WorkflowNode {
+/// 任务列表中的一个 Agent 任务。
+struct Task {
     id: String,
     prompt: String,
-    dependencies: Vec<String>,
-    status: NodeStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    depends_on: Vec<String>,
+    status: TaskStatus,
     agent_id: Option<AgentId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
-/// 节点从等待到终态的稳定状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum NodeStatus {
+/// 任务的调度状态；completed、failed、cancelled 为终态。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskStatus {
     Pending,
-    Running,
-    Succeeded,
+    InProgress,
+    Completed,
     Failed,
     Cancelled,
-    Skipped,
 }
 
-impl NodeStatus {
-    /// 判断节点是否已进入不可再次调度的终态。
-    fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Skipped
-        )
-    }
-}
-
-/// 创建工作流时接受的参数。
+/// task_create 接受的批量任务参数。
 #[derive(Deserialize)]
-struct CreateWorkflowArgs {
-    name: String,
-    #[serde(default = "default_max_parallelism")]
-    max_parallelism: usize,
-    #[serde(default)]
-    failure_policy: FailurePolicy,
-    #[serde(default)]
-    sealed: bool,
-    #[serde(default)]
-    nodes: Vec<NodeInput>,
+struct CreateTasksArgs {
+    tasks: Vec<TaskInput>,
 }
 
-/// 新节点的稳定输入结构。
-#[derive(Clone, Deserialize)]
-struct NodeInput {
+/// 新任务的稳定输入结构。
+#[derive(Deserialize)]
+struct TaskInput {
     id: String,
     prompt: String,
     #[serde(default)]
-    dependencies: Vec<String>,
+    depends_on: Vec<String>,
 }
 
-/// 向开放工作流追加节点时接受的参数。
+/// task_update 接受的参数；除 id 外至少需要一个更新字段。
 #[derive(Deserialize)]
-struct AddNodeArgs {
-    workflow_id: String,
-    node: NodeInput,
+struct UpdateTaskArgs {
+    id: String,
+    status: Option<UpdateStatus>,
+    prompt: Option<String>,
+    depends_on: Option<Vec<String>>,
+    #[serde(default)]
+    delete: bool,
+}
+
+/// task_update 允许写入的目标状态。
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UpdateStatus {
+    /// 把失败或已取消的任务重置为待处理，以便自动重跑。
+    Pending,
+    /// 取消待处理或运行中的任务。
+    Cancelled,
 }
 
 impl AgentPlugin for WorkflowPlugin {
-    /// 注册工作流编排提示，使主 Agent 能在适合的任务中主动选择 DAG 工具。
+    /// 注册任务编排提示，使主 Agent 能在多阶段任务中主动维护任务列表。
     fn activate(&mut self, host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
         host.upsert_prompt(&PromptContribution {
-            id: WORKFLOW_ORCHESTRATION_PROMPT_ID.into(),
-            content: WORKFLOW_ORCHESTRATION_PROMPT.into(),
+            id: TASK_ORCHESTRATION_PROMPT_ID.into(),
+            content: TASK_ORCHESTRATION_PROMPT.into(),
             priority: 110,
         })?;
         Ok(())
     }
 
-    /// 删除本插件注册的工作流编排提示，避免插件卸载后继续影响模型决策。
+    /// 删除本插件注册的任务编排提示，避免插件卸载后继续影响模型决策。
     fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
-        host.remove_prompt(WORKFLOW_ORCHESTRATION_PROMPT_ID)
+        host.remove_prompt(TASK_ORCHESTRATION_PROMPT_ID)
     }
 
-    /// 返回动态工作流控制面工具。
+    /// 返回动态任务列表控制面工具。
     fn list_tools(&self) -> Vec<ToolSpec> {
         vec![
             ToolSpec::new(
-                "workflow_create",
-                "创建一个动态 DAG 工作流。开放工作流可以继续追加节点；sealed=true 时创建后立即封存。",
-                create_workflow_schema(),
+                "task_create",
+                "创建一个或多个任务加入动态任务列表。依赖可以引用已有任务或同批任务；依赖齐备的任务会立即自动派生 worker Agent 执行，无需手动推进。",
+                create_tasks_schema(),
             ),
             ToolSpec::new(
-                "workflow_add_node",
-                "向未封存的工作流追加节点。依赖必须引用该工作流中已经存在的节点。",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "workflow_id": workflow_id_property(),
-                        "node": node_schema()
-                    },
-                    "required": ["workflow_id", "node"],
-                    "additionalProperties": false
-                }),
+                "task_update",
+                "更新任务：把失败或已取消的任务重置为 pending 重跑、取消任务、修改待处理任务的提示词或依赖，或删除无人依赖的任务。",
+                update_task_schema(),
             ),
-            workflow_id_tool(
-                "workflow_seal",
-                "封存工作流，禁止继续追加节点；全部节点进入终态后工作流才会完成。",
+            ToolSpec::new(
+                "task_list",
+                "同步运行结果后返回全部任务的状态与阻塞依赖；任务输出通过 task_get 读取。",
+                ToolSpec::empty_object_schema(),
             ),
-            workflow_id_tool(
-                "workflow_tick",
-                "推进工作流一次：同步运行结果、传播失败并启动并行度预算内的就绪节点。调用不会等待 Agent 完成。",
-            ),
-            workflow_id_tool("workflow_get", "读取工作流及全部节点的当前状态。"),
-            workflow_id_tool(
-                "workflow_cancel",
-                "取消工作流中的运行节点并跳过尚未启动的节点。",
+            ToolSpec::new(
+                "task_get",
+                "同步运行结果后读取单个任务的完整详情，包括执行输出与错误。",
+                task_get_schema(),
             ),
         ]
     }
 
-    /// 执行一次短工作流控制操作，不在 Guest 内阻塞等待 Agent。
+    /// 执行一次短任务控制操作；每次调用都会同步结果并自动调度，不在 Guest 内阻塞等待 Agent。
     fn call_tool_with_host(
         &mut self,
         host: &dyn PluginHostApi,
@@ -203,30 +153,31 @@ impl AgentPlugin for WorkflowPlugin {
     ) -> Result<ToolResult> {
         let operation = call.name.clone();
         let content = match operation.as_str() {
-            "workflow_create" => self.create_workflow(call.args.clone())?,
-            "workflow_add_node" => self.add_node(call.args.clone())?,
-            "workflow_seal" => self.seal_workflow(&required_workflow_id(&call.args)?)?,
-            "workflow_tick" => self.tick_workflow(host, &required_workflow_id(&call.args)?)?,
-            "workflow_get" => self.workflow_snapshot(&required_workflow_id(&call.args)?)?,
-            "workflow_cancel" => self.cancel_workflow(host, &required_workflow_id(&call.args)?)?,
+            "task_create" => self.create_tasks(host, call.args.clone())?,
+            "task_update" => self.update_task(host, call.args.clone())?,
+            "task_list" => {
+                self.sync_and_schedule(host)?;
+                self.list_snapshot()
+            }
+            "task_get" => self.get_task(host, &call.args)?,
             _ => {
                 return Ok(ToolResult::error(
                     call.id,
                     call.name,
-                    format!("未知工作流工具：{operation}"),
+                    format!("未知任务工具：{operation}"),
                 ));
             }
         };
         Ok(ToolResult::success(call.id, call.name, content))
     }
 
-    /// 声明活动工作流摘要、DAG 工作台和节点 Agent 主界面。
+    /// 声明任务进度摘要、任务列表工作台和任务 Agent 主界面。
     fn describe_ui(&self) -> Vec<UiDeclaration> {
         vec![
             UiDeclaration {
                 plugin_id: String::new(),
-                view_id: WORKFLOW_SHELF_VIEW.into(),
-                title: "工作流".into(),
+                view_id: TASK_SHELF_VIEW.into(),
+                title: "任务".into(),
                 placement: UiPlacement::ComposerShelf,
                 size: UiSize {
                     width: None,
@@ -237,8 +188,8 @@ impl AgentPlugin for WorkflowPlugin {
             },
             UiDeclaration {
                 plugin_id: String::new(),
-                view_id: WORKFLOW_WORKSPACE_VIEW.into(),
-                title: "工作流".into(),
+                view_id: TASK_WORKSPACE_VIEW.into(),
+                title: "任务列表".into(),
                 placement: UiPlacement::Subview,
                 size: UiSize::default(),
                 focusable: true,
@@ -246,8 +197,8 @@ impl AgentPlugin for WorkflowPlugin {
             },
             UiDeclaration {
                 plugin_id: String::new(),
-                view_id: WORKFLOW_NODE_VIEW.into(),
-                title: "节点 Agent".into(),
+                view_id: TASK_AGENT_VIEW.into(),
+                title: "任务 Agent".into(),
                 placement: UiPlacement::Subview,
                 size: UiSize::default(),
                 focusable: true,
@@ -256,19 +207,15 @@ impl AgentPlugin for WorkflowPlugin {
         ]
     }
 
-    /// 根据 Host 分配的尺寸渲染工作流摘要、DAG 或节点 Agent 主界面。
+    /// 根据 Host 分配的尺寸渲染任务摘要、任务列表或任务 Agent 主界面。
     fn render_ui(&mut self, request: UiRenderRequest) -> Option<UiFrame> {
         let lines = match request.view_id.as_str() {
-            WORKFLOW_SHELF_VIEW => self.render_workflow_shelf(&request),
-            WORKFLOW_WORKSPACE_VIEW => self.render_workflow_workspace(&request),
-            WORKFLOW_NODE_VIEW => self.render_node_agent(&request),
+            TASK_SHELF_VIEW => self.render_task_shelf(&request),
+            TASK_WORKSPACE_VIEW => self.render_task_workspace(&request),
+            TASK_AGENT_VIEW => self.render_task_agent(&request),
             _ => return None,
         };
-        let visible = request.view_id != WORKFLOW_SHELF_VIEW
-            || self
-                .active_workflow_id()
-                .and_then(|id| self.workflows.get(id))
-                .is_some();
+        let visible = request.view_id != TASK_SHELF_VIEW || self.needs_attention();
         Some(UiFrame {
             view_id: request.view_id,
             visible,
@@ -277,65 +224,64 @@ impl AgentPlugin for WorkflowPlugin {
         })
     }
 
-    /// 节点子视图渲染前刷新对应 Agent 的实时状态和增量事件。
+    /// 渲染前同步运行结果并自动派生就绪任务，使调度无需模型手动推进。
     fn render_ui_with_host(
         &mut self,
         host: &dyn PluginHostApi,
         request: UiRenderRequest,
     ) -> Option<UiFrame> {
-        if request.view_id == WORKFLOW_NODE_VIEW {
-            if let Some(instance_id) = request.instance_id.as_deref() {
-                self.refresh_node_session(host, instance_id);
+        match request.view_id.as_str() {
+            TASK_SHELF_VIEW | TASK_WORKSPACE_VIEW => {
+                let _ = self.sync_and_schedule(host);
             }
+            TASK_AGENT_VIEW => {
+                if let Some(instance_id) = request.instance_id.as_deref() {
+                    self.refresh_task_session(host, instance_id);
+                }
+            }
+            _ => {}
         }
         self.render_ui(request)
     }
 
-    /// 处理摘要入口、DAG 节点选择、显式刷新和节点 Agent 消息输入。
+    /// 处理摘要入口、任务选择、显式刷新和任务 Agent 消息输入。
     fn on_ui_input_with_host(&mut self, host: &dyn PluginHostApi, input: UiInput) {
         match input.event {
             UiInputEvent::Key { code, .. }
-                if input.view_id == WORKFLOW_SHELF_VIEW && code == "enter" =>
+                if input.view_id == TASK_SHELF_VIEW && code == "enter" =>
             {
-                self.open_active_workflow(host);
+                self.open_task_workspace(host);
             }
             UiInputEvent::Mouse { kind, .. }
-                if input.view_id == WORKFLOW_SHELF_VIEW && kind.starts_with("down_") =>
+                if input.view_id == TASK_SHELF_VIEW && kind.starts_with("down_") =>
             {
-                self.open_active_workflow(host);
+                self.open_task_workspace(host);
             }
-            UiInputEvent::Key { code, .. } if input.view_id == WORKFLOW_WORKSPACE_VIEW => {
-                let Some(workflow_id) = input.instance_id.as_deref() else {
-                    return;
-                };
-                let node_count = self
-                    .workflows
-                    .get(workflow_id)
-                    .map_or(0, |workflow| workflow.nodes.len());
+            UiInputEvent::Key { code, .. } if input.view_id == TASK_WORKSPACE_VIEW => {
                 match code.as_str() {
-                    "up" => self.selected_node = self.selected_node.saturating_sub(1),
+                    "up" => self.selected_task = self.selected_task.saturating_sub(1),
                     "down" => {
-                        self.selected_node =
-                            (self.selected_node + 1).min(node_count.saturating_sub(1));
+                        self.selected_task =
+                            (self.selected_task + 1).min(self.order.len().saturating_sub(1));
                     }
                     "r" => {
-                        let _ = self.tick_workflow(host, workflow_id);
+                        let _ = self.sync_and_schedule(host);
                     }
-                    "enter" => self.open_selected_node(host, workflow_id),
+                    "enter" => self.open_selected_task(host),
                     _ => {}
                 }
             }
-            UiInputEvent::Key { code, modifiers } if input.view_id == WORKFLOW_NODE_VIEW => {
-                let Some(instance_id) = input.instance_id.as_deref() else {
+            UiInputEvent::Key { code, modifiers } if input.view_id == TASK_AGENT_VIEW => {
+                let Some(task_id) = input.instance_id.as_deref() else {
                     return;
                 };
                 let event = UiInputEvent::Key { code, modifiers };
                 let continued = self
-                    .node_sessions
-                    .get_mut(instance_id)
+                    .task_sessions
+                    .get_mut(task_id)
                     .and_then(|session| session.handle_input(host, &event));
                 if let Some(handle) = continued {
-                    self.replace_node_agent(instance_id, handle.id);
+                    self.replace_task_agent(task_id, handle.id);
                 }
             }
             _ => {}
@@ -344,56 +290,40 @@ impl AgentPlugin for WorkflowPlugin {
 }
 
 impl WorkflowPlugin {
-    /// 返回优先选中的活动工作流；选中项已结束时回退到最近创建的活动项。
-    fn active_workflow_id(&self) -> Option<&str> {
-        self.selected_workflow
-            .as_deref()
-            .filter(|id| {
-                self.workflows
-                    .get(*id)
-                    .is_some_and(|workflow| workflow.status == WorkflowStatus::Active)
-            })
-            .or_else(|| {
-                self.workflows
-                    .iter()
-                    .rev()
-                    .find(|(_, workflow)| workflow.status == WorkflowStatus::Active)
-                    .map(|(id, _)| id.as_str())
-            })
+    /// 判断是否存在需要展示的待处理、运行中或失败任务。
+    fn needs_attention(&self) -> bool {
+        self.tasks.values().any(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::InProgress | TaskStatus::Failed
+            )
+        })
     }
 
-    /// 渲染输入框上方的工作流进度摘要。
-    fn render_workflow_shelf(&self, request: &UiRenderRequest) -> Vec<UiLine> {
-        let Some(workflow) = self
-            .active_workflow_id()
-            .and_then(|id| self.workflows.get(id))
-        else {
+    /// 统计指定状态的任务数量。
+    fn count(&self, status: TaskStatus) -> usize {
+        self.tasks
+            .values()
+            .filter(|task| task.status == status)
+            .count()
+    }
+
+    /// 渲染输入框上方的任务进度摘要。
+    fn render_task_shelf(&self, request: &UiRenderRequest) -> Vec<UiLine> {
+        if self.tasks.is_empty() {
             return Vec::new();
-        };
-        let completed = workflow
-            .nodes
-            .values()
-            .filter(|node| node.status == NodeStatus::Succeeded)
-            .count();
-        let running = workflow
-            .nodes
-            .values()
-            .filter(|node| node.status == NodeStatus::Running)
-            .count();
-        let failed = workflow
-            .nodes
-            .values()
-            .filter(|node| matches!(node.status, NodeStatus::Failed | NodeStatus::Cancelled))
-            .count();
+        }
+        let width = usize::from(request.width);
+        let failed = self.count(TaskStatus::Failed);
         vec![
             ui_text_line(
                 &clip(
                     &format!(
-                        "工作流  {}  {completed}/{}",
-                        workflow.name,
-                        workflow.nodes.len()
+                        "任务  {}/{}",
+                        self.count(TaskStatus::Completed),
+                        self.tasks.len()
                     ),
-                    usize::from(request.width),
+                    width,
                 ),
                 Some(UiColor::Cyan),
                 true,
@@ -401,14 +331,11 @@ impl WorkflowPlugin {
             ui_text_line(
                 &clip(
                     &format!(
-                        "运行 {running}  等待 {}  失败 {failed}",
-                        workflow
-                            .nodes
-                            .values()
-                            .filter(|node| node.status == NodeStatus::Pending)
-                            .count()
+                        "运行 {}  等待 {}  失败 {failed}",
+                        self.count(TaskStatus::InProgress),
+                        self.count(TaskStatus::Pending)
                     ),
-                    usize::from(request.width),
+                    width,
                 ),
                 Some(if failed > 0 {
                     UiColor::Red
@@ -417,102 +344,91 @@ impl WorkflowPlugin {
                 }),
                 false,
             ),
-            ui_text_line("Enter 查看 DAG", Some(UiColor::Gray), false),
+            ui_text_line("Enter 查看任务列表", Some(UiColor::Gray), false),
         ]
     }
 
-    /// 渲染单个工作流的 DAG 节点列表和当前选中节点详情。
-    fn render_workflow_workspace(&self, request: &UiRenderRequest) -> Vec<UiLine> {
-        let Some(workflow_id) = request.instance_id.as_deref() else {
-            return vec![ui_text_line(
-                "工作流视图缺少实例 ID",
-                Some(UiColor::Red),
-                false,
-            )];
-        };
-        let Some(workflow) = self.workflows.get(workflow_id) else {
-            return vec![ui_text_line("工作流不存在", Some(UiColor::Red), false)];
-        };
+    /// 渲染任务列表和当前选中任务的详情。
+    fn render_task_workspace(&self, request: &UiRenderRequest) -> Vec<UiLine> {
+        if self.tasks.is_empty() {
+            return vec![ui_text_line("任务列表为空", Some(UiColor::Gray), false)];
+        }
         let width = usize::from(request.width);
-        let completed = workflow
-            .nodes
-            .values()
-            .filter(|node| node.status == NodeStatus::Succeeded)
-            .count();
         let mut lines = vec![
             ui_text_line(
                 &clip(
                     &format!(
-                        "{}  {}  {completed}/{}",
-                        workflow.name,
-                        workflow_status_label(workflow.status),
-                        workflow.nodes.len()
+                        "任务列表  {}/{}",
+                        self.count(TaskStatus::Completed),
+                        self.tasks.len()
                     ),
                     width,
                 ),
-                Some(workflow_status_color(workflow.status)),
+                Some(UiColor::Cyan),
                 true,
             ),
             ui_text_line(
-                &clip(
-                    &format!(
-                        "并行度 {}  失败策略 {}  {}",
-                        workflow.max_parallelism,
-                        failure_policy_label(workflow.failure_policy),
-                        if workflow.sealed {
-                            "已封存"
-                        } else {
-                            "可编辑"
-                        }
-                    ),
-                    width,
-                ),
+                &clip(&format!("自动调度  并行上限 {MAX_PARALLELISM}"), width),
                 Some(UiColor::Gray),
                 false,
             ),
             UiLine { spans: Vec::new() },
         ];
-        let selected = self
-            .selected_node
-            .min(workflow.nodes.len().saturating_sub(1));
-        for (index, node) in workflow.nodes.values().enumerate() {
-            let dependencies = if node.dependencies.is_empty() {
-                "起点".to_string()
-            } else {
-                format!("依赖 {}", node.dependencies.join(", "))
-            };
+        let selected = self.selected_task.min(self.order.len().saturating_sub(1));
+        for (index, task) in self
+            .order
+            .iter()
+            .filter_map(|id| self.tasks.get(id))
+            .enumerate()
+        {
+            let mut row = format!(
+                "{} {} {}",
+                if index == selected { ">" } else { " " },
+                task_status_marker(task.status),
+                task.id
+            );
+            if !task.depends_on.is_empty() {
+                row.push_str(&format!("  依赖 {}", task.depends_on.join(", ")));
+            }
             lines.push(ui_text_line(
-                &clip(
-                    &format!(
-                        "{} {} {}  {}",
-                        if index == selected { ">" } else { " " },
-                        node_status_marker(node.status),
-                        node.id,
-                        dependencies
-                    ),
-                    width,
-                ),
-                Some(node_status_color(node.status)),
+                &clip(&row, width),
+                Some(task_status_color(task.status)),
                 index == selected,
             ));
         }
-        if let Some(node) = workflow.nodes.values().nth(selected) {
+        if let Some(task) = self.order.get(selected).and_then(|id| self.tasks.get(id)) {
             lines.push(UiLine { spans: Vec::new() });
             lines.push(ui_text_line(
-                &clip(&format!("节点  {}", node.id), width),
+                &clip(
+                    &format!("任务  {}  {}", task.id, task_status_label(task.status)),
+                    width,
+                ),
                 Some(UiColor::Cyan),
                 true,
             ));
             lines.push(ui_text_line(
-                &clip(&node.prompt.replace(['\n', '\r'], " "), width),
+                &clip(&task.prompt.replace(['\n', '\r'], " "), width),
                 None,
                 false,
             ));
+            if let Some(error) = &task.error {
+                lines.push(ui_text_line(
+                    &clip(&error.replace(['\n', '\r'], " "), width),
+                    Some(UiColor::Red),
+                    false,
+                ));
+            } else if let Some(output) = &task.output {
+                lines.push(ui_text_line(
+                    &clip(&output.replace(['\n', '\r'], " "), width),
+                    Some(UiColor::Gray),
+                    false,
+                ));
+            }
             lines.push(ui_text_line(
-                if node.agent_id.is_some() {
-                    "Enter 进入节点 Agent  ·  r 推进工作流"
+                if task.agent_id.is_some() {
+                    "Enter 打开任务 Agent  ·  r 刷新任务"
                 } else {
-                    "r 推进工作流"
+                    "r 刷新任务"
                 },
                 Some(UiColor::Gray),
                 false,
@@ -522,45 +438,30 @@ impl WorkflowPlugin {
         lines
     }
 
-    /// 渲染节点上下文，并把剩余区域交给共享 Agent 主界面。
-    fn render_node_agent(&self, request: &UiRenderRequest) -> Vec<UiLine> {
-        let Some(instance_id) = request.instance_id.as_deref() else {
+    /// 渲染任务上下文，并把剩余区域交给共享 Agent 主界面。
+    fn render_task_agent(&self, request: &UiRenderRequest) -> Vec<UiLine> {
+        let Some(task_id) = request.instance_id.as_deref() else {
             return vec![ui_text_line(
-                "节点视图缺少实例 ID",
+                "任务视图缺少实例 ID",
                 Some(UiColor::Red),
                 false,
             )];
         };
-        let Some((workflow_id, node_id)) = split_node_instance(instance_id) else {
-            return vec![ui_text_line(
-                "节点视图实例 ID 无效",
-                Some(UiColor::Red),
-                false,
-            )];
-        };
-        let Some(workflow) = self.workflows.get(workflow_id) else {
-            return vec![ui_text_line("工作流不存在", Some(UiColor::Red), false)];
-        };
-        let Some(node) = workflow.nodes.get(node_id) else {
-            return vec![ui_text_line("工作流节点不存在", Some(UiColor::Red), false)];
+        let Some(task) = self.tasks.get(task_id) else {
+            return vec![ui_text_line("任务不存在", Some(UiColor::Red), false)];
         };
         let mut lines = vec![
             ui_text_line(
                 &clip(
-                    &format!(
-                        "{} / {}  {}",
-                        workflow.name,
-                        node.id,
-                        node_status_label(node.status)
-                    ),
+                    &format!("{}  {}", task.id, task_status_label(task.status)),
                     usize::from(request.width),
                 ),
-                Some(node_status_color(node.status)),
+                Some(task_status_color(task.status)),
                 true,
             ),
             ui_text_line(
                 &clip(
-                    &node.prompt.replace(['\n', '\r'], " "),
+                    &task.prompt.replace(['\n', '\r'], " "),
                     usize::from(request.width),
                 ),
                 Some(UiColor::Gray),
@@ -568,14 +469,14 @@ impl WorkflowPlugin {
             ),
             UiLine { spans: Vec::new() },
         ];
-        if let Some(session) = self.node_sessions.get(instance_id) {
+        if let Some(session) = self.task_sessions.get(task_id) {
             lines.extend(session.render(request.width, request.height.saturating_sub(3)));
         } else {
             lines.push(ui_text_line(
-                if node.agent_id.is_some() {
-                    "正在连接节点 Agent"
+                if task.agent_id.is_some() {
+                    "正在连接任务 Agent"
                 } else {
-                    "节点尚未启动"
+                    "任务尚未启动"
                 },
                 Some(UiColor::Gray),
                 false,
@@ -585,240 +486,449 @@ impl WorkflowPlugin {
         lines
     }
 
-    /// 刷新节点对应的共享 Agent 主界面，不推进其他工作流节点。
-    fn refresh_node_session(&mut self, host: &dyn PluginHostApi, instance_id: &str) {
-        let Some((workflow_id, node_id)) = split_node_instance(instance_id) else {
-            return;
-        };
+    /// 刷新任务对应的共享 Agent 主界面，不推进其他任务调度。
+    fn refresh_task_session(&mut self, host: &dyn PluginHostApi, task_id: &str) {
         let Some(target) = self
-            .workflows
-            .get(workflow_id)
-            .and_then(|workflow| workflow.nodes.get(node_id))
-            .and_then(|node| node.agent_id.clone())
+            .tasks
+            .get(task_id)
+            .and_then(|task| task.agent_id.clone())
         else {
             return;
         };
         let session = self
-            .node_sessions
-            .entry(instance_id.to_string())
+            .task_sessions
+            .entry(task_id.to_string())
             .or_insert_with(|| AgentViewSession::new(target.clone()));
         session.replace_target(target);
         session.refresh(host);
     }
 
-    /// 打开当前活动工作流的 DAG 工作台。
-    fn open_active_workflow(&mut self, host: &dyn PluginHostApi) {
-        let Some(workflow_id) = self.active_workflow_id().map(str::to_string) else {
+    /// 打开任务列表工作台。
+    fn open_task_workspace(&mut self, host: &dyn PluginHostApi) {
+        if self.tasks.is_empty() {
             return;
-        };
-        let title = self
-            .workflows
-            .get(&workflow_id)
-            .map(|workflow| workflow.name.clone());
-        self.selected_workflow = Some(workflow_id.clone());
-        self.selected_node = 0;
+        }
+        self.selected_task = 0;
         self.navigation_sequence = self.navigation_sequence.saturating_add(1);
         let _ = host.navigate_view(UiNavigationRequest {
             request_id: format!("workflow-open-{}", self.navigation_sequence),
             action: UiNavigationAction::Push {
                 view: UiViewInstance {
-                    view_id: WORKFLOW_WORKSPACE_VIEW.into(),
-                    instance_id: workflow_id,
-                    title,
+                    view_id: TASK_WORKSPACE_VIEW.into(),
+                    instance_id: TASK_WORKSPACE_INSTANCE.into(),
+                    title: Some("任务列表".into()),
                 },
             },
         });
     }
 
-    /// 打开 DAG 工作台中当前选中且已启动的节点 Agent。
-    fn open_selected_node(&mut self, host: &dyn PluginHostApi, workflow_id: &str) {
-        let Some((node_id, target)) = self.workflows.get(workflow_id).and_then(|workflow| {
-            workflow
-                .nodes
-                .values()
-                .nth(
-                    self.selected_node
-                        .min(workflow.nodes.len().saturating_sub(1)),
-                )
-                .and_then(|node| {
-                    node.agent_id
-                        .clone()
-                        .map(|target| (node.id.clone(), target))
-                })
-        }) else {
+    /// 打开当前选中且已启动的任务 Agent。
+    fn open_selected_task(&mut self, host: &dyn PluginHostApi) {
+        let selected = self.selected_task.min(self.order.len().saturating_sub(1));
+        let Some((task_id, target)) = self
+            .order
+            .get(selected)
+            .and_then(|id| self.tasks.get(id))
+            .and_then(|task| {
+                task.agent_id
+                    .clone()
+                    .map(|target| (task.id.clone(), target))
+            })
+        else {
             return;
         };
-        let instance_id = node_instance_id(workflow_id, &node_id);
-        self.node_sessions
-            .entry(instance_id.clone())
+        self.task_sessions
+            .entry(task_id.clone())
             .or_insert_with(|| AgentViewSession::new(target));
         self.navigation_sequence = self.navigation_sequence.saturating_add(1);
         let _ = host.navigate_view(UiNavigationRequest {
-            request_id: format!("workflow-node-{}", self.navigation_sequence),
+            request_id: format!("workflow-task-{}", self.navigation_sequence),
             action: UiNavigationAction::Push {
                 view: UiViewInstance {
-                    view_id: WORKFLOW_NODE_VIEW.into(),
-                    instance_id,
-                    title: Some(node_id),
+                    view_id: TASK_AGENT_VIEW.into(),
+                    instance_id: task_id.clone(),
+                    title: Some(task_id),
                 },
             },
         });
     }
 
-    /// 用成功会话续跑产生的新句柄替换节点的当前 Agent 映射。
-    fn replace_node_agent(&mut self, instance_id: &str, agent_id: AgentId) {
-        let Some((workflow_id, node_id)) = split_node_instance(instance_id) else {
-            return;
-        };
-        if let Some(node) = self
-            .workflows
-            .get_mut(workflow_id)
-            .and_then(|workflow| workflow.nodes.get_mut(node_id))
-        {
-            node.agent_id = Some(agent_id);
-            node.status = NodeStatus::Running;
-            node.output = None;
-            node.error = None;
+    /// 用成功会话续跑产生的新句柄替换任务的当前 Agent 映射。
+    fn replace_task_agent(&mut self, task_id: &str, agent_id: AgentId) {
+        if let Some(task) = self.tasks.get_mut(task_id) {
+            task.agent_id = Some(agent_id);
+            task.status = TaskStatus::InProgress;
+            task.output = None;
+            task.error = None;
         }
     }
 
-    /// 校验定义并创建组件实例内唯一的工作流。
-    fn create_workflow(&mut self, args: Value) -> Result<Value> {
-        let args: CreateWorkflowArgs =
-            serde_json::from_value(args).context("工作流创建参数无效")?;
-        validate_name(&args.name)?;
-        validate_parallelism(args.max_parallelism)?;
-        validate_initial_nodes(&args.nodes)?;
-
-        self.next_workflow_id = self
-            .next_workflow_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("工作流 ID 已耗尽"))?;
-        let id = format!("workflow-{}", self.next_workflow_id);
-        let nodes = args
-            .nodes
-            .into_iter()
-            .map(|node| (node.id.clone(), WorkflowNode::from_input(node)))
-            .collect();
-        let workflow = Workflow {
-            id: id.clone(),
-            name: args.name,
-            max_parallelism: args.max_parallelism,
-            failure_policy: args.failure_policy,
-            sealed: args.sealed,
-            status: WorkflowStatus::Active,
-            nodes,
-        };
-        self.workflows.insert(id.clone(), workflow);
-        self.selected_workflow = Some(id.clone());
-        self.selected_node = 0;
-        self.workflow_snapshot(&id)
+    /// 校验并批量创建任务，随后立即同步与调度。
+    fn create_tasks(&mut self, host: &dyn PluginHostApi, args: Value) -> Result<Value> {
+        let args: CreateTasksArgs = serde_json::from_value(args).context("任务创建参数无效")?;
+        if args.tasks.is_empty() {
+            return Err(anyhow!("tasks 不能为空"));
+        }
+        self.insert_tasks(args.tasks)?;
+        self.sync_and_schedule(host)?;
+        Ok(self.list_snapshot())
     }
 
-    /// 向开放工作流追加一个只依赖既有节点的新节点。
-    fn add_node(&mut self, args: Value) -> Result<Value> {
-        let args: AddNodeArgs = serde_json::from_value(args).context("工作流节点参数无效")?;
-        validate_node(&args.node)?;
-        let workflow = self.workflow_mut(&args.workflow_id)?;
-        if workflow.status != WorkflowStatus::Active {
-            return Err(anyhow!("工作流 `{}` 已进入终态", workflow.id));
-        }
-        if workflow.sealed {
-            return Err(anyhow!("工作流 `{}` 已封存", workflow.id));
-        }
-        if workflow.nodes.contains_key(&args.node.id) {
-            return Err(anyhow!("节点 `{}` 已存在", args.node.id));
-        }
-        for dependency in &args.node.dependencies {
-            if !workflow.nodes.contains_key(dependency) {
-                return Err(anyhow!(
-                    "节点 `{}` 的依赖 `{dependency}` 不存在",
-                    args.node.id
-                ));
+    /// 校验批量任务的标识、依赖引用和无环性后插入列表。
+    fn insert_tasks(&mut self, inputs: Vec<TaskInput>) -> Result<()> {
+        let mut known: BTreeSet<&str> = self.tasks.keys().map(String::as_str).collect();
+        for input in &inputs {
+            validate_task_input(input)?;
+            if !known.insert(input.id.as_str()) {
+                return Err(anyhow!("任务 `{}` 已存在", input.id));
             }
         }
-        workflow
-            .nodes
-            .insert(args.node.id.clone(), WorkflowNode::from_input(args.node));
-        workflow_value(workflow)
-    }
-
-    /// 封存工作流，使其可以在节点收敛后进入整体终态。
-    fn seal_workflow(&mut self, workflow_id: &str) -> Result<Value> {
-        let workflow = self.workflow_mut(workflow_id)?;
-        if workflow.status != WorkflowStatus::Active {
-            return Err(anyhow!("工作流 `{workflow_id}` 已进入终态"));
-        }
-        workflow.sealed = true;
-        settle_workflow_status(workflow);
-        workflow_value(workflow)
-    }
-
-    /// 推进一步工作流，最多启动本轮并行度预算允许的就绪节点。
-    fn tick_workflow(&mut self, host: &dyn PluginHostApi, workflow_id: &str) -> Result<Value> {
-        let workflow = self.workflow_mut(workflow_id)?;
-        if workflow.status != WorkflowStatus::Active {
-            return workflow_value(workflow);
-        }
-
-        refresh_running_nodes(host, workflow)?;
-        apply_failure_policy(host, workflow)?;
-        skip_blocked_nodes(workflow);
-
-        if workflow.status == WorkflowStatus::Active {
-            spawn_ready_nodes(host, workflow);
-            settle_workflow_status(workflow);
-        }
-        workflow_value(workflow)
-    }
-
-    /// 取消运行节点并把尚未调度的节点标记为跳过。
-    fn cancel_workflow(&mut self, host: &dyn PluginHostApi, workflow_id: &str) -> Result<Value> {
-        let workflow = self.workflow_mut(workflow_id)?;
-        if workflow.status == WorkflowStatus::Active {
-            for node in workflow.nodes.values_mut() {
-                match node.status {
-                    NodeStatus::Running => {
-                        if let Some(agent_id) = &node.agent_id {
-                            host.cancel_agent(agent_id)?;
-                        }
-                        node.status = NodeStatus::Cancelled;
-                    }
-                    NodeStatus::Pending => node.status = NodeStatus::Skipped,
-                    _ => {}
+        for input in &inputs {
+            for dependency in &input.depends_on {
+                if !known.contains(dependency.as_str()) {
+                    return Err(anyhow!("任务 `{}` 的依赖 `{dependency}` 不存在", input.id));
                 }
             }
-            workflow.sealed = true;
-            workflow.status = WorkflowStatus::Cancelled;
         }
-        workflow_value(workflow)
+        self.ensure_acyclic_with(
+            &inputs
+                .iter()
+                .map(|input| (input.id.as_str(), input.depends_on.as_slice()))
+                .collect(),
+        )?;
+        for input in inputs {
+            self.order.push(input.id.clone());
+            self.tasks.insert(input.id.clone(), Task::from_input(input));
+        }
+        Ok(())
     }
 
-    /// 返回工作流的序列化快照。
-    fn workflow_snapshot(&self, workflow_id: &str) -> Result<Value> {
-        let workflow = self
-            .workflows
-            .get(workflow_id)
-            .ok_or_else(|| anyhow!("工作流 `{workflow_id}` 不存在"))?;
-        workflow_value(workflow)
+    /// 按参数更新单个任务，随后立即同步与调度。
+    fn update_task(&mut self, host: &dyn PluginHostApi, args: Value) -> Result<Value> {
+        let args: UpdateTaskArgs = serde_json::from_value(args).context("任务更新参数无效")?;
+        if args.delete {
+            if args.status.is_some() || args.prompt.is_some() || args.depends_on.is_some() {
+                return Err(anyhow!("delete 不能与其他更新字段同时使用"));
+            }
+            self.delete_task(&args.id)?;
+        } else {
+            if args.status.is_none() && args.prompt.is_none() && args.depends_on.is_none() {
+                return Err(anyhow!(
+                    "task_update 至少需要 status、prompt、depends_on 或 delete 之一"
+                ));
+            }
+            if let Some(status) = args.status {
+                self.transition_task(host, &args.id, status)?;
+            }
+            if let Some(prompt) = args.prompt {
+                self.edit_prompt(&args.id, prompt)?;
+            }
+            if let Some(depends_on) = args.depends_on {
+                self.edit_depends_on(&args.id, depends_on)?;
+            }
+        }
+        self.sync_and_schedule(host)?;
+        Ok(self.list_snapshot())
     }
 
-    /// 返回指定工作流的可变引用。
-    fn workflow_mut(&mut self, workflow_id: &str) -> Result<&mut Workflow> {
-        self.workflows
-            .get_mut(workflow_id)
-            .ok_or_else(|| anyhow!("工作流 `{workflow_id}` 不存在"))
+    /// 执行取消或重置状态转换；取消运行中任务时同步取消其 Agent。
+    fn transition_task(
+        &mut self,
+        host: &dyn PluginHostApi,
+        task_id: &str,
+        status: UpdateStatus,
+    ) -> Result<()> {
+        match status {
+            UpdateStatus::Pending => self.reset_task(task_id),
+            UpdateStatus::Cancelled => {
+                let task = self.task_mut(task_id)?;
+                match task.status {
+                    TaskStatus::Pending => {
+                        task.status = TaskStatus::Cancelled;
+                        Ok(())
+                    }
+                    TaskStatus::InProgress => {
+                        if let Some(agent_id) = &task.agent_id {
+                            host.cancel_agent(agent_id)?;
+                        }
+                        task.status = TaskStatus::Cancelled;
+                        Ok(())
+                    }
+                    _ => Err(anyhow!("任务 `{task_id}` 已进入终态，无法取消")),
+                }
+            }
+        }
+    }
+
+    /// 把失败或已取消的任务重置为待处理并清空执行痕迹，以便自动重跑。
+    fn reset_task(&mut self, task_id: &str) -> Result<()> {
+        let task = self.task_mut(task_id)?;
+        if !matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled) {
+            return Err(anyhow!(
+                "任务 `{task_id}` 不是失败或已取消状态，无法重置为 pending"
+            ));
+        }
+        task.status = TaskStatus::Pending;
+        task.agent_id = None;
+        task.output = None;
+        task.error = None;
+        Ok(())
+    }
+
+    /// 修改待处理任务的提示词。
+    fn edit_prompt(&mut self, task_id: &str, prompt: String) -> Result<()> {
+        validate_prompt(task_id, &prompt)?;
+        let task = self.task_mut(task_id)?;
+        if task.status != TaskStatus::Pending {
+            return Err(anyhow!("只有待处理任务可以修改提示词"));
+        }
+        task.prompt = prompt;
+        Ok(())
+    }
+
+    /// 整体替换待处理任务的依赖，并保证依赖图仍然无环。
+    fn edit_depends_on(&mut self, task_id: &str, depends_on: Vec<String>) -> Result<()> {
+        let task = self.task_mut(task_id)?;
+        if task.status != TaskStatus::Pending {
+            return Err(anyhow!("只有待处理任务可以修改依赖"));
+        }
+        let unique = depends_on.iter().collect::<BTreeSet<_>>();
+        if unique.len() != depends_on.len() {
+            return Err(anyhow!("任务 `{task_id}` 包含重复依赖"));
+        }
+        for dependency in &depends_on {
+            if dependency == task_id {
+                return Err(anyhow!("任务 `{task_id}` 不能依赖自身"));
+            }
+            if !self.tasks.contains_key(dependency) {
+                return Err(anyhow!("任务 `{task_id}` 的依赖 `{dependency}` 不存在"));
+            }
+        }
+        self.ensure_acyclic_with(&BTreeMap::from([(task_id, depends_on.as_slice())]))?;
+        self.task_mut(task_id)?.depends_on = depends_on;
+        Ok(())
+    }
+
+    /// 删除未运行且无人依赖的任务及其残留会话。
+    fn delete_task(&mut self, task_id: &str) -> Result<()> {
+        let task = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| anyhow!("任务 `{task_id}` 不存在"))?;
+        if task.status == TaskStatus::InProgress {
+            return Err(anyhow!("任务 `{task_id}` 正在运行，请先取消再删除"));
+        }
+        if let Some(dependent) = self
+            .tasks
+            .values()
+            .find(|other| other.depends_on.iter().any(|dep| dep == task_id))
+        {
+            return Err(anyhow!(
+                "任务 `{}` 依赖 `{task_id}`，无法删除",
+                dependent.id
+            ));
+        }
+        self.tasks.remove(task_id);
+        self.order.retain(|id| id != task_id);
+        self.task_sessions.remove(task_id);
+        Ok(())
+    }
+
+    /// 同步后读取单个任务的完整详情。
+    fn get_task(&mut self, host: &dyn PluginHostApi, args: &Value) -> Result<Value> {
+        self.sync_and_schedule(host)?;
+        let task_id = required_task_id(args)?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| anyhow!("任务 `{task_id}` 不存在"))?;
+        Ok(self.task_value(task, true))
+    }
+
+    /// 同步运行中任务的终态并自动派生并行度预算内的就绪任务。
+    fn sync_and_schedule(&mut self, host: &dyn PluginHostApi) -> Result<()> {
+        self.refresh_running_tasks(host)?;
+        self.spawn_ready_tasks(host);
+        Ok(())
+    }
+
+    /// 同步所有运行中任务的幂等终态结果。
+    fn refresh_running_tasks(&mut self, host: &dyn PluginHostApi) -> Result<()> {
+        let running = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| task.status == TaskStatus::InProgress)
+            .map(|(id, task)| (id.clone(), task.agent_id.clone()))
+            .collect::<Vec<_>>();
+
+        for (task_id, agent_id) in running {
+            let agent_id =
+                agent_id.ok_or_else(|| anyhow!("运行中任务 `{task_id}` 缺少 Agent ID"))?;
+            let Some(outcome) = host.agent_result(&agent_id)? else {
+                continue;
+            };
+            let task = self
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| anyhow!("任务 `{task_id}` 在结果同步时消失"))?;
+            match outcome {
+                AgentOutcome::Succeeded { result } => {
+                    task.status = TaskStatus::Completed;
+                    task.output = Some(result.final_text);
+                }
+                AgentOutcome::Failed { error } => {
+                    task.status = TaskStatus::Failed;
+                    task.error = Some(error);
+                }
+                AgentOutcome::Cancelled => task.status = TaskStatus::Cancelled,
+            }
+        }
+        Ok(())
+    }
+
+    /// 按创建顺序启动并行度预算内的就绪任务；单个派生失败只影响对应任务。
+    fn spawn_ready_tasks(&mut self, host: &dyn PluginHostApi) {
+        let capacity = MAX_PARALLELISM.saturating_sub(self.count(TaskStatus::InProgress));
+        let ready = self
+            .order
+            .iter()
+            .filter(|id| {
+                self.tasks
+                    .get(*id)
+                    .is_some_and(|task| task.status == TaskStatus::Pending)
+            })
+            .filter(|id| {
+                self.tasks.get(*id).is_some_and(|task| {
+                    task.depends_on.iter().all(|dependency| {
+                        self.tasks
+                            .get(dependency)
+                            .is_some_and(|dependency| dependency.status == TaskStatus::Completed)
+                    })
+                })
+            })
+            .take(capacity)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for task_id in ready {
+            let input = self.build_task_input(&task_id);
+            let Some(task) = self.tasks.get_mut(&task_id) else {
+                continue;
+            };
+            match host.spawn_agent(&AgentSpawnRequest::new(WORKER_PROFILE, input)) {
+                Ok(handle) => {
+                    task.status = TaskStatus::InProgress;
+                    task.agent_id = Some(handle.id);
+                }
+                Err(error) => {
+                    task.status = TaskStatus::Failed;
+                    task.error = Some(format!("启动 Agent 失败：{error}"));
+                }
+            }
+        }
+    }
+
+    /// 合并任务提示词与其直接依赖的可信终态输出。
+    fn build_task_input(&self, task_id: &str) -> String {
+        let task = self.tasks.get(task_id).expect("待启动任务必须存在");
+        if task.depends_on.is_empty() {
+            return task.prompt.clone();
+        }
+        let outputs = task
+            .depends_on
+            .iter()
+            .filter_map(|dependency| {
+                self.tasks
+                    .get(dependency)
+                    .and_then(|task| task.output.as_ref())
+                    .map(|output| (dependency, output))
+            })
+            .collect::<BTreeMap<_, _>>();
+        format!(
+            "{}\n\n依赖任务结果：\n{}",
+            task.prompt,
+            serde_json::to_string_pretty(&outputs).expect("依赖输出必须可序列化")
+        )
+    }
+
+    /// 校验现有任务与增量修改合并后的依赖图仍然无环。
+    fn ensure_acyclic_with(&self, overrides: &BTreeMap<&str, &[String]>) -> Result<()> {
+        let mut graph: BTreeMap<&str, &[String]> = self
+            .tasks
+            .iter()
+            .map(|(id, task)| (id.as_str(), task.depends_on.as_slice()))
+            .collect();
+        for (id, depends_on) in overrides {
+            graph.insert(id, depends_on);
+        }
+        let mut visiting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        for id in graph.keys() {
+            visit_task(id, &graph, &mut visiting, &mut visited)?;
+        }
+        Ok(())
+    }
+
+    /// 返回按创建顺序排列的全部任务快照；任务输出通过 task_get 读取。
+    fn list_snapshot(&self) -> Value {
+        let tasks = self
+            .order
+            .iter()
+            .filter_map(|id| self.tasks.get(id))
+            .map(|task| self.task_value(task, false))
+            .collect::<Vec<_>>();
+        json!({ "tasks": tasks })
+    }
+
+    /// 序列化单个任务；待处理任务附带尚未完成的阻塞依赖。
+    fn task_value(&self, task: &Task, include_output: bool) -> Value {
+        let mut value = json!({
+            "id": task.id,
+            "prompt": task.prompt,
+            "status": task_status_key(task.status),
+            "depends_on": task.depends_on,
+        });
+        if task.status == TaskStatus::Pending {
+            let blocked_by = task
+                .depends_on
+                .iter()
+                .filter(|dependency| {
+                    self.tasks
+                        .get(*dependency)
+                        .is_none_or(|dependency| dependency.status != TaskStatus::Completed)
+                })
+                .collect::<Vec<_>>();
+            if !blocked_by.is_empty() {
+                value["blocked_by"] = json!(blocked_by);
+            }
+        }
+        if let Some(error) = &task.error {
+            value["error"] = json!(error);
+        }
+        if include_output {
+            if let Some(output) = &task.output {
+                value["output"] = json!(output);
+            }
+        }
+        value
+    }
+
+    /// 返回指定任务的可变引用。
+    fn task_mut(&mut self, task_id: &str) -> Result<&mut Task> {
+        self.tasks
+            .get_mut(task_id)
+            .ok_or_else(|| anyhow!("任务 `{task_id}` 不存在"))
     }
 }
 
-impl WorkflowNode {
-    /// 从已校验输入构造等待调度的节点。
-    fn from_input(input: NodeInput) -> Self {
+impl Task {
+    /// 从已校验输入构造等待调度的任务。
+    fn from_input(input: TaskInput) -> Self {
         Self {
             id: input.id,
             prompt: input.prompt,
-            dependencies: input.dependencies,
-            status: NodeStatus::Pending,
+            depends_on: input.depends_on,
+            status: TaskStatus::Pending,
             agent_id: None,
             output: None,
             error: None,
@@ -826,242 +936,70 @@ impl WorkflowNode {
     }
 }
 
-/// 同步所有运行节点的幂等终态结果。
-fn refresh_running_nodes(host: &dyn PluginHostApi, workflow: &mut Workflow) -> Result<()> {
-    let running = workflow
-        .nodes
-        .iter()
-        .filter(|(_, node)| node.status == NodeStatus::Running)
-        .map(|(id, node)| (id.clone(), node.agent_id.clone()))
-        .collect::<Vec<_>>();
-
-    for (node_id, agent_id) in running {
-        let agent_id = agent_id.ok_or_else(|| anyhow!("运行节点 `{node_id}` 缺少 Agent ID"))?;
-        let Some(outcome) = host.agent_result(&agent_id)? else {
-            continue;
-        };
-        let node = workflow
-            .nodes
-            .get_mut(&node_id)
-            .ok_or_else(|| anyhow!("节点 `{node_id}` 在结果同步时消失"))?;
-        match outcome {
-            AgentOutcome::Succeeded { result } => {
-                node.status = NodeStatus::Succeeded;
-                node.output = Some(result.final_text);
-            }
-            AgentOutcome::Failed { error } => {
-                node.status = NodeStatus::Failed;
-                node.error = Some(error);
-            }
-            AgentOutcome::Cancelled => node.status = NodeStatus::Cancelled,
-        }
-    }
-    Ok(())
-}
-
-/// 应用首次失败后的全局停止策略。
-fn apply_failure_policy(host: &dyn PluginHostApi, workflow: &mut Workflow) -> Result<()> {
-    let has_failure = workflow
-        .nodes
-        .values()
-        .any(|node| matches!(node.status, NodeStatus::Failed | NodeStatus::Cancelled));
-    if !has_failure || !matches!(workflow.failure_policy, FailurePolicy::Stop) {
+/// 深度优先检查任务依赖图是否存在环。
+fn visit_task<'a>(
+    task_id: &'a str,
+    graph: &BTreeMap<&'a str, &'a [String]>,
+    visiting: &mut BTreeSet<&'a str>,
+    visited: &mut BTreeSet<&'a str>,
+) -> Result<()> {
+    if visited.contains(task_id) {
         return Ok(());
     }
-
-    for node in workflow.nodes.values_mut() {
-        match node.status {
-            NodeStatus::Running => {
-                if let Some(agent_id) = &node.agent_id {
-                    host.cancel_agent(agent_id)?;
-                }
-                node.status = NodeStatus::Cancelled;
-            }
-            NodeStatus::Pending => node.status = NodeStatus::Skipped,
-            _ => {}
-        }
+    if !visiting.insert(task_id) {
+        return Err(anyhow!("任务列表包含涉及任务 `{task_id}` 的依赖环"));
     }
-    workflow.sealed = true;
-    workflow.status = WorkflowStatus::Failed;
+    let depends_on = graph
+        .get(task_id)
+        .ok_or_else(|| anyhow!("任务 `{task_id}` 不存在"))?;
+    for dependency in depends_on.iter() {
+        visit_task(dependency, graph, visiting, visited)?;
+    }
+    visiting.remove(task_id);
+    visited.insert(task_id);
     Ok(())
 }
 
-/// 反复标记依赖非成功终态的节点，直到失败传播稳定。
-fn skip_blocked_nodes(workflow: &mut Workflow) {
-    loop {
-        let blocked = workflow
-            .nodes
-            .iter()
-            .filter(|(_, node)| node.status == NodeStatus::Pending)
-            .filter(|(_, node)| {
-                node.dependencies.iter().any(|dependency| {
-                    workflow.nodes.get(dependency).is_some_and(|dependency| {
-                        dependency.status.is_terminal()
-                            && dependency.status != NodeStatus::Succeeded
-                    })
-                })
-            })
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        if blocked.is_empty() {
-            break;
-        }
-        for id in blocked {
-            if let Some(node) = workflow.nodes.get_mut(&id) {
-                node.status = NodeStatus::Skipped;
-                node.error = Some("依赖节点未成功完成".into());
-            }
-        }
-    }
-}
-
-/// 启动当前并行度预算内全部就绪节点；单个派生失败只影响对应节点。
-fn spawn_ready_nodes(host: &dyn PluginHostApi, workflow: &mut Workflow) {
-    let running = workflow
-        .nodes
-        .values()
-        .filter(|node| node.status == NodeStatus::Running)
-        .count();
-    let capacity = workflow.max_parallelism.saturating_sub(running);
-    let ready = workflow
-        .nodes
-        .iter()
-        .filter(|(_, node)| node.status == NodeStatus::Pending)
-        .filter(|(_, node)| {
-            node.dependencies.iter().all(|dependency| {
-                workflow
-                    .nodes
-                    .get(dependency)
-                    .is_some_and(|dependency| dependency.status == NodeStatus::Succeeded)
-            })
-        })
-        .map(|(id, _)| id.clone())
-        .take(capacity)
-        .collect::<Vec<_>>();
-
-    for node_id in ready {
-        let input = build_node_input(workflow, &node_id);
-        let node = workflow
-            .nodes
-            .get_mut(&node_id)
-            .expect("就绪节点必须仍存在");
-        match host.spawn_agent(&AgentSpawnRequest::new(WORKER_PROFILE, input)) {
-            Ok(handle) => {
-                node.status = NodeStatus::Running;
-                node.agent_id = Some(handle.id);
-            }
-            Err(error) => {
-                node.status = NodeStatus::Failed;
-                node.error = Some(format!("启动 Agent 失败：{error}"));
-            }
-        }
-    }
-}
-
-/// 合并节点提示词与其直接依赖的可信终态输出。
-fn build_node_input(workflow: &Workflow, node_id: &str) -> String {
-    let node = workflow.nodes.get(node_id).expect("待启动节点必须存在");
-    if node.dependencies.is_empty() {
-        return node.prompt.clone();
-    }
-    let outputs = node
-        .dependencies
-        .iter()
-        .filter_map(|dependency| {
-            workflow
-                .nodes
-                .get(dependency)
-                .and_then(|node| node.output.as_ref())
-                .map(|output| (dependency, output))
-        })
-        .collect::<BTreeMap<_, _>>();
-    format!(
-        "{}\n\n依赖节点结果：\n{}",
-        node.prompt,
-        serde_json::to_string_pretty(&outputs).expect("依赖输出必须可序列化")
-    )
-}
-
-/// 在封存且所有节点终止时计算工作流最终状态。
-fn settle_workflow_status(workflow: &mut Workflow) {
-    if !workflow.sealed
-        || workflow
-            .nodes
-            .values()
-            .any(|node| !node.status.is_terminal())
-    {
-        return;
-    }
-    workflow.status = if workflow
-        .nodes
-        .values()
-        .all(|node| node.status == NodeStatus::Succeeded)
-    {
-        WorkflowStatus::Succeeded
-    } else {
-        WorkflowStatus::Failed
-    };
-}
-
-/// 返回工作流整体状态的紧凑中文标签。
-fn workflow_status_label(status: WorkflowStatus) -> &'static str {
+/// 返回任务状态的稳定 JSON 键。
+fn task_status_key(status: TaskStatus) -> &'static str {
     match status {
-        WorkflowStatus::Active => "执行中",
-        WorkflowStatus::Succeeded => "已完成",
-        WorkflowStatus::Failed => "失败",
-        WorkflowStatus::Cancelled => "已取消",
+        TaskStatus::Pending => "pending",
+        TaskStatus::InProgress => "in_progress",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
     }
 }
 
-/// 返回工作流整体状态的终端颜色。
-fn workflow_status_color(status: WorkflowStatus) -> UiColor {
+/// 返回任务状态的固定宽度标记。
+fn task_status_marker(status: TaskStatus) -> &'static str {
     match status {
-        WorkflowStatus::Active => UiColor::Cyan,
-        WorkflowStatus::Succeeded => UiColor::Green,
-        WorkflowStatus::Failed => UiColor::Red,
-        WorkflowStatus::Cancelled => UiColor::Gray,
+        TaskStatus::Pending => "[ ]",
+        TaskStatus::InProgress => "[>]",
+        TaskStatus::Completed => "[x]",
+        TaskStatus::Failed => "[!]",
+        TaskStatus::Cancelled => "[-]",
     }
 }
 
-/// 返回失败传播策略的中文标签。
-fn failure_policy_label(policy: FailurePolicy) -> &'static str {
-    match policy {
-        FailurePolicy::Stop => "失败即停止",
-        FailurePolicy::Continue => "独立分支继续",
-    }
-}
-
-/// 返回节点状态的固定宽度标记。
-fn node_status_marker(status: NodeStatus) -> &'static str {
+/// 返回任务状态的紧凑中文标签。
+fn task_status_label(status: TaskStatus) -> &'static str {
     match status {
-        NodeStatus::Pending => "[ ]",
-        NodeStatus::Running => "[>]",
-        NodeStatus::Succeeded => "[x]",
-        NodeStatus::Failed => "[!]",
-        NodeStatus::Cancelled => "[-]",
-        NodeStatus::Skipped => "[~]",
+        TaskStatus::Pending => "等待",
+        TaskStatus::InProgress => "运行中",
+        TaskStatus::Completed => "已完成",
+        TaskStatus::Failed => "失败",
+        TaskStatus::Cancelled => "已取消",
     }
 }
 
-/// 返回节点状态的紧凑中文标签。
-fn node_status_label(status: NodeStatus) -> &'static str {
+/// 返回任务状态的终端颜色。
+fn task_status_color(status: TaskStatus) -> UiColor {
     match status {
-        NodeStatus::Pending => "等待",
-        NodeStatus::Running => "运行中",
-        NodeStatus::Succeeded => "已完成",
-        NodeStatus::Failed => "失败",
-        NodeStatus::Cancelled => "已取消",
-        NodeStatus::Skipped => "已跳过",
-    }
-}
-
-/// 返回节点状态的终端颜色。
-fn node_status_color(status: NodeStatus) -> UiColor {
-    match status {
-        NodeStatus::Pending | NodeStatus::Skipped | NodeStatus::Cancelled => UiColor::Gray,
-        NodeStatus::Running => UiColor::Yellow,
-        NodeStatus::Succeeded => UiColor::Green,
-        NodeStatus::Failed => UiColor::Red,
+        TaskStatus::Pending | TaskStatus::Cancelled => UiColor::Gray,
+        TaskStatus::InProgress => UiColor::Yellow,
+        TaskStatus::Completed => UiColor::Green,
+        TaskStatus::Failed => UiColor::Red,
     }
 }
 
@@ -1102,163 +1040,65 @@ fn clip(text: &str, max_width: usize) -> String {
     result
 }
 
-/// 生成可逆的节点子视图实例 ID；节点 ID 不允许包含斜杠。
-fn node_instance_id(workflow_id: &str, node_id: &str) -> String {
-    format!("{workflow_id}/{node_id}")
-}
-
-/// 从节点子视图实例 ID 中恢复工作流和节点 ID。
-fn split_node_instance(instance_id: &str) -> Option<(&str, &str)> {
-    instance_id
-        .split_once('/')
-        .filter(|(workflow_id, node_id)| !workflow_id.is_empty() && !node_id.is_empty())
-}
-
-/// 校验工作流名称。
-fn validate_name(name: &str) -> Result<()> {
-    if name.trim().is_empty() || name.len() > 256 {
-        return Err(anyhow!("工作流名称必须为 1 到 256 字节的非空字符串"));
-    }
-    Ok(())
-}
-
-/// 校验并行度在插件声明的结构限制内。
-fn validate_parallelism(max_parallelism: usize) -> Result<()> {
-    if !(1..=MAX_PARALLELISM).contains(&max_parallelism) {
-        return Err(anyhow!(
-            "max_parallelism 必须位于 1 到 {MAX_PARALLELISM} 之间"
-        ));
-    }
-    Ok(())
-}
-
-/// 校验节点标识、提示词和依赖去重。
-fn validate_node(node: &NodeInput) -> Result<()> {
-    if node.id.trim().is_empty()
-        || node.id.len() > 128
-        || !node
+/// 校验任务标识、提示词和依赖去重。
+fn validate_task_input(input: &TaskInput) -> Result<()> {
+    if input.id.trim().is_empty()
+        || input.id.len() > 128
+        || !input
             .id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
-        return Err(anyhow!("节点 ID `{}` 格式无效", node.id));
+        return Err(anyhow!("任务 ID `{}` 格式无效", input.id));
     }
-    if node.prompt.trim().is_empty() || node.prompt.len() > MAX_PROMPT_BYTES {
+    validate_prompt(&input.id, &input.prompt)?;
+    let unique = input.depends_on.iter().collect::<BTreeSet<_>>();
+    if unique.len() != input.depends_on.len() {
+        return Err(anyhow!("任务 `{}` 包含重复依赖", input.id));
+    }
+    if input
+        .depends_on
+        .iter()
+        .any(|dependency| dependency == &input.id)
+    {
+        return Err(anyhow!("任务 `{}` 不能依赖自身", input.id));
+    }
+    Ok(())
+}
+
+/// 校验任务提示词的长度边界。
+fn validate_prompt(task_id: &str, prompt: &str) -> Result<()> {
+    if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT_BYTES {
         return Err(anyhow!(
-            "节点 `{}` 的提示词必须为 1 到 {MAX_PROMPT_BYTES} 字节",
-            node.id
+            "任务 `{task_id}` 的提示词必须为 1 到 {MAX_PROMPT_BYTES} 字节"
         ));
     }
-    let unique_dependencies = node.dependencies.iter().collect::<BTreeSet<_>>();
-    if unique_dependencies.len() != node.dependencies.len() {
-        return Err(anyhow!("节点 `{}` 包含重复依赖", node.id));
-    }
-    if node
-        .dependencies
-        .iter()
-        .any(|dependency| dependency == &node.id)
-    {
-        return Err(anyhow!("节点 `{}` 不能依赖自身", node.id));
-    }
     Ok(())
 }
 
-/// 校验初始节点集合的引用完整性和无环性。
-fn validate_initial_nodes(nodes: &[NodeInput]) -> Result<()> {
-    let mut by_id = BTreeMap::new();
-    for node in nodes {
-        validate_node(node)?;
-        if by_id.insert(node.id.as_str(), node).is_some() {
-            return Err(anyhow!("节点 `{}` 重复", node.id));
-        }
-    }
-    for node in nodes {
-        for dependency in &node.dependencies {
-            if !by_id.contains_key(dependency.as_str()) {
-                return Err(anyhow!("节点 `{}` 的依赖 `{dependency}` 不存在", node.id));
-            }
-        }
-    }
-
-    let mut visiting = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    for node in nodes {
-        visit_node(node.id.as_str(), &by_id, &mut visiting, &mut visited)?;
-    }
-    Ok(())
-}
-
-/// 深度优先检查初始 DAG 是否包含依赖环。
-fn visit_node<'a>(
-    node_id: &'a str,
-    nodes: &BTreeMap<&'a str, &'a NodeInput>,
-    visiting: &mut BTreeSet<&'a str>,
-    visited: &mut BTreeSet<&'a str>,
-) -> Result<()> {
-    if visited.contains(node_id) {
-        return Ok(());
-    }
-    if !visiting.insert(node_id) {
-        return Err(anyhow!("工作流包含涉及节点 `{node_id}` 的依赖环"));
-    }
-    let node = nodes
-        .get(node_id)
-        .ok_or_else(|| anyhow!("节点 `{node_id}` 不存在"))?;
-    for dependency in &node.dependencies {
-        visit_node(dependency, nodes, visiting, visited)?;
-    }
-    visiting.remove(node_id);
-    visited.insert(node_id);
-    Ok(())
-}
-
-/// 默认允许四个工作流节点并行运行。
-fn default_max_parallelism() -> usize {
-    4
-}
-
-/// 从工具参数中读取工作流标识。
-fn required_workflow_id(args: &Value) -> Result<String> {
-    let workflow_id = args
-        .get("workflow_id")
+/// 从工具参数中读取任务标识。
+fn required_task_id(args: &Value) -> Result<String> {
+    let task_id = args
+        .get("id")
         .and_then(Value::as_str)
-        .context("参数 `workflow_id` 必须是字符串")?;
-    if workflow_id.trim().is_empty() {
-        return Err(anyhow!("参数 `workflow_id` 不能为空"));
+        .context("参数 `id` 必须是字符串")?;
+    if task_id.trim().is_empty() {
+        return Err(anyhow!("参数 `id` 不能为空"));
     }
-    Ok(workflow_id.to_owned())
+    Ok(task_id.to_owned())
 }
 
-/// 把工作流转换为稳定 JSON 快照。
-fn workflow_value(workflow: &Workflow) -> Result<Value> {
-    serde_json::to_value(workflow).context("序列化工作流状态失败")
-}
-
-/// 创建只接受工作流标识的工具定义。
-fn workflow_id_tool(name: &str, description: &str) -> ToolSpec {
-    ToolSpec::new(
-        name,
-        description,
-        json!({
-            "type": "object",
-            "properties": {"workflow_id": workflow_id_property()},
-            "required": ["workflow_id"],
-            "additionalProperties": false
-        }),
-    )
-}
-
-/// 返回工作流标识的 JSON Schema 属性。
-fn workflow_id_property() -> Value {
+/// 返回任务标识的 JSON Schema 属性。
+fn task_id_property() -> Value {
     json!({
         "type": "string",
-        "description": "workflow_create 返回的不透明工作流 ID。",
+        "description": "task_create 中登记的任务 ID。",
         "minLength": 1
     })
 }
 
-/// 返回节点输入的 JSON Schema。
-fn node_schema() -> Value {
+/// 返回新任务输入的 JSON Schema。
+fn task_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -1267,11 +1107,12 @@ fn node_schema() -> Value {
                 "pattern": "^[A-Za-z0-9._-]{1,128}$"
             },
             "prompt": {"type": "string", "minLength": 1, "maxLength": MAX_PROMPT_BYTES},
-            "dependencies": {
+            "depends_on": {
                 "type": "array",
                 "items": {"type": "string"},
                 "uniqueItems": true,
-                "default": []
+                "default": [],
+                "description": "该任务依赖的已有任务或同批任务 ID。"
             }
         },
         "required": ["id", "prompt"],
@@ -1279,27 +1120,62 @@ fn node_schema() -> Value {
     })
 }
 
-/// 返回创建工作流工具的 JSON Schema。
-fn create_workflow_schema() -> Value {
+/// 返回批量创建任务工具的 JSON Schema。
+fn create_tasks_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "name": {"type": "string", "minLength": 1, "maxLength": 256},
-            "max_parallelism": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": MAX_PARALLELISM,
-                "default": default_max_parallelism()
-            },
-            "failure_policy": {
-                "type": "string",
-                "enum": ["stop", "continue"],
-                "default": "stop"
-            },
-            "sealed": {"type": "boolean", "default": false},
-            "nodes": {"type": "array", "items": node_schema(), "default": []}
+            "tasks": {
+                "type": "array",
+                "minItems": 1,
+                "items": task_schema()
+            }
         },
-        "required": ["name"],
+        "required": ["tasks"],
+        "additionalProperties": false
+    })
+}
+
+/// 返回更新任务工具的 JSON Schema。
+fn update_task_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": task_id_property(),
+            "status": {
+                "type": "string",
+                "enum": ["pending", "cancelled"],
+                "description": "cancelled 取消待处理或运行中的任务；pending 重置失败或已取消的任务以便自动重跑。"
+            },
+            "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_PROMPT_BYTES,
+                "description": "替换待处理任务的提示词。"
+            },
+            "depends_on": {
+                "type": "array",
+                "items": {"type": "string"},
+                "uniqueItems": true,
+                "description": "整体替换待处理任务的依赖。"
+            },
+            "delete": {
+                "type": "boolean",
+                "default": false,
+                "description": "删除任务；仅允许删除未运行且无人依赖的任务，不能与其他字段同用。"
+            }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    })
+}
+
+/// 返回读取单个任务详情工具的 JSON Schema。
+fn task_get_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"id": task_id_property()},
+        "required": ["id"],
         "additionalProperties": false
     })
 }
@@ -1334,9 +1210,18 @@ mod tests {
             .join("\n")
     }
 
-    /// 工作流插件必须把摘要放在输入区上方，并把 DAG 与 Agent 放进子视图。
+    /// 构造便于测试的任务输入。
+    fn task_input(id: &str, prompt: &str, depends_on: &[&str]) -> TaskInput {
+        TaskInput {
+            id: id.into(),
+            prompt: prompt.into(),
+            depends_on: depends_on.iter().map(|dep| dep.to_string()).collect(),
+        }
+    }
+
+    /// 工作流插件必须把摘要放在输入区上方，并把任务列表与 Agent 放进子视图。
     #[test]
-    fn declares_shelf_workspace_and_node_views() {
+    fn declares_shelf_workspace_and_task_views() {
         let declarations = WorkflowPlugin::default().describe_ui();
 
         assert_eq!(declarations.len(), 3);
@@ -1348,43 +1233,129 @@ mod tests {
         assert!(matches!(declarations[2].placement, UiPlacement::Subview));
     }
 
-    /// 创建 DAG 后摘要应显示进度，工作台应显示节点和依赖关系。
+    /// 创建任务后摘要应显示进度，工作台应显示任务、依赖和阻塞信息。
     #[test]
-    fn renders_workflow_summary_and_dag() {
+    fn renders_task_summary_and_list() {
         let mut plugin = WorkflowPlugin::default();
         plugin
-            .create_workflow(json!({
-                "name": "发布检查",
-                "max_parallelism": 2,
-                "nodes": [
-                    {"id": "build", "prompt": "构建产物"},
-                    {"id": "review", "prompt": "复核产物", "dependencies": ["build"]}
-                ]
-            }))
-            .expect("工作流应创建成功");
+            .insert_tasks(vec![
+                task_input("build", "构建产物", &[]),
+                task_input("review", "复核产物", &["build"]),
+            ])
+            .expect("任务应创建成功");
 
         let shelf = plugin
-            .render_ui(request(WORKFLOW_SHELF_VIEW, None))
+            .render_ui(request(TASK_SHELF_VIEW, None))
             .expect("摘要应返回帧");
         assert!(shelf.visible);
-        assert!(frame_text(&shelf).contains("发布检查"));
+        assert!(frame_text(&shelf).contains("0/2"));
 
         let workspace = plugin
-            .render_ui(request(WORKFLOW_WORKSPACE_VIEW, Some("workflow-1")))
+            .render_ui(request(TASK_WORKSPACE_VIEW, Some(TASK_WORKSPACE_INSTANCE)))
             .expect("工作台应返回帧");
         let text = frame_text(&workspace);
         assert!(text.contains("build"), "{text}");
         assert!(text.contains("依赖 build"), "{text}");
+
+        let snapshot = plugin.list_snapshot();
+        assert_eq!(snapshot["tasks"][0]["id"], "build");
+        assert_eq!(snapshot["tasks"][1]["blocked_by"][0], "build");
     }
 
-    /// 节点实例 ID 必须无损保留工作流和节点身份。
+    /// 批内依赖环必须在创建时被拒绝。
     #[test]
-    fn node_instance_id_round_trips() {
-        let instance_id = node_instance_id("workflow-3", "review.final");
+    fn rejects_dependency_cycle_on_create() {
+        let mut plugin = WorkflowPlugin::default();
 
-        assert_eq!(
-            split_node_instance(&instance_id),
-            Some(("workflow-3", "review.final"))
-        );
+        let error = plugin
+            .insert_tasks(vec![
+                task_input("a", "任务 A", &["b"]),
+                task_input("b", "任务 B", &["a"]),
+            ])
+            .expect_err("依赖环应被拒绝");
+
+        assert!(error.to_string().contains("依赖环"), "{error}");
+    }
+
+    /// 修改依赖引入环时必须被拒绝。
+    #[test]
+    fn rejects_dependency_cycle_on_update() {
+        let mut plugin = WorkflowPlugin::default();
+        plugin
+            .insert_tasks(vec![
+                task_input("a", "任务 A", &[]),
+                task_input("b", "任务 B", &["a"]),
+            ])
+            .expect("任务应创建成功");
+
+        let error = plugin
+            .edit_depends_on("a", vec!["b".into()])
+            .expect_err("依赖环应被拒绝");
+
+        assert!(error.to_string().contains("依赖环"), "{error}");
+    }
+
+    /// 失败任务重置后应清空执行痕迹并回到待处理；非终态任务不允许重置。
+    #[test]
+    fn resets_failed_task_to_pending() {
+        let mut plugin = WorkflowPlugin::default();
+        plugin
+            .insert_tasks(vec![task_input("deploy", "部署产物", &[])])
+            .expect("任务应创建成功");
+        {
+            let task = plugin.task_mut("deploy").expect("任务应存在");
+            task.status = TaskStatus::Failed;
+            task.error = Some("部署超时".into());
+        }
+
+        plugin.reset_task("deploy").expect("失败任务应可重置");
+        let task = plugin.tasks.get("deploy").expect("任务应存在");
+        assert!(task.status == TaskStatus::Pending);
+        assert!(task.error.is_none());
+
+        let error = plugin
+            .reset_task("deploy")
+            .expect_err("待处理任务不应可重置");
+        assert!(error.to_string().contains("无法重置"), "{error}");
+    }
+
+    /// 被其他任务依赖的任务不允许删除；解除依赖后可以删除。
+    #[test]
+    fn rejects_delete_with_dependents() {
+        let mut plugin = WorkflowPlugin::default();
+        plugin
+            .insert_tasks(vec![
+                task_input("build", "构建产物", &[]),
+                task_input("review", "复核产物", &["build"]),
+            ])
+            .expect("任务应创建成功");
+
+        let error = plugin
+            .delete_task("build")
+            .expect_err("被依赖的任务不应可删除");
+        assert!(error.to_string().contains("无法删除"), "{error}");
+
+        plugin
+            .delete_task("review")
+            .expect("无人依赖的任务应可删除");
+        plugin.delete_task("build").expect("解除依赖后应可删除");
+        assert!(plugin.tasks.is_empty());
+        assert!(plugin.order.is_empty());
+    }
+
+    /// 全部任务进入完成或取消终态后，摘要应自动隐藏。
+    #[test]
+    fn hides_shelf_when_all_tasks_settled() {
+        let mut plugin = WorkflowPlugin::default();
+        plugin
+            .insert_tasks(vec![task_input("build", "构建产物", &[])])
+            .expect("任务应创建成功");
+        plugin.task_mut("build").expect("任务应存在").status = TaskStatus::Completed;
+
+        let shelf = plugin
+            .render_ui(request(TASK_SHELF_VIEW, None))
+            .expect("摘要应返回帧");
+
+        assert!(!shelf.visible);
     }
 }

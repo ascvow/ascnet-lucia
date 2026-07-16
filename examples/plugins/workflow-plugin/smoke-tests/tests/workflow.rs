@@ -1,4 +1,4 @@
-//! 动态工作流插件的真实 WASM 端到端测试。
+//! 动态任务列表工作流插件的真实 WASM 端到端测试。
 
 use agent_core::{
     Agent, AgentExtension, AgentOptions, ChatModel, ModelGateway, ModelRequest, ModelResponse,
@@ -29,7 +29,7 @@ struct RecordingModel {
 
 #[async_trait]
 impl ChatModel for RecordingModel {
-    /// 根据输入是否包含依赖结果返回对应节点的固定结果。
+    /// 根据输入是否包含依赖结果返回对应任务的固定结果。
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
         let input = request
             .messages
@@ -69,37 +69,29 @@ async fn call_tool(host: &WasmPluginHost, name: &str, args: Value) -> Value {
     result.content
 }
 
-/// 重复推进工作流，直到指定节点进入成功终态。
-async fn tick_until_node_succeeds(
-    host: &WasmPluginHost,
-    workflow_id: &str,
-    node_id: &str,
-) -> Value {
-    for _ in 0..100 {
-        let content = call_tool(host, "workflow_tick", json!({"workflow_id": workflow_id})).await;
-        if content["nodes"][node_id]["status"] == "succeeded" {
+/// 从任务列表快照中取出指定任务。
+fn task_in<'a>(content: &'a Value, task_id: &str) -> &'a Value {
+    content["tasks"]
+        .as_array()
+        .and_then(|tasks| tasks.iter().find(|task| task["id"] == task_id))
+        .unwrap_or(&Value::Null)
+}
+
+/// 反复读取任务列表（每次读取都会自动同步与调度），直到任务进入期望状态。
+async fn list_until_status(host: &WasmPluginHost, task_id: &str, expected: &str) -> Value {
+    for _ in 0..200 {
+        let content = call_tool(host, "task_list", json!({})).await;
+        if task_in(&content, task_id)["status"] == expected {
             return content;
         }
         tokio::task::yield_now().await;
     }
-    panic!("节点 `{node_id}` 未在轮询预算内完成");
+    panic!("任务 `{task_id}` 未在轮询预算内进入 `{expected}`");
 }
 
-/// 重复推进已封存工作流，直到整体进入成功终态。
-async fn tick_until_workflow_succeeds(host: &WasmPluginHost, workflow_id: &str) -> Value {
-    for _ in 0..100 {
-        let content = call_tool(host, "workflow_tick", json!({"workflow_id": workflow_id})).await;
-        if content["status"] == "succeeded" {
-            return content;
-        }
-        tokio::task::yield_now().await;
-    }
-    panic!("工作流未在轮询预算内完成");
-}
-
-/// 验证运行中追加节点、依赖调度、结果注入与封存收敛链路。
+/// 验证自动派生、依赖链自动推进、结果注入、动态追加与取消删除链路。
 #[tokio::test]
-async fn component_runs_dynamic_workflow() {
+async fn component_runs_dynamic_task_list() {
     let inputs = Arc::new(Mutex::new(Vec::new()));
     let mut gateway = ModelGateway::new();
     gateway
@@ -140,34 +132,39 @@ async fn component_runs_dynamic_workflow() {
 
     let prompts = AgentExtension::prompt_messages(&host)
         .await
-        .expect("工作流编排提示应可读取");
+        .expect("任务编排提示应可读取");
     assert!(prompts
         .iter()
-        .any(|prompt| prompt.text_content().contains("workflow_create")));
+        .any(|prompt| prompt.text_content().contains("task_create")));
 
     let tools = AgentExtension::list_tools(&host)
         .await
         .expect("插件工具应可读取");
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 4);
     let declarations = PluginHost::ui_declarations(&host)
         .await
-        .expect("工作流 UI 声明应可读取");
+        .expect("任务 UI 声明应可读取");
     assert_eq!(declarations.len(), 3);
     assert_eq!(declarations[0].placement, UiPlacement::ComposerShelf);
     assert_eq!(declarations[1].placement, UiPlacement::Subview);
     assert_eq!(declarations[2].placement, UiPlacement::Subview);
 
+    // 批量创建后就绪任务应立即自动派生，被依赖阻塞的任务保持等待。
     let created = call_tool(
         &host,
-        "workflow_create",
+        "task_create",
         json!({
-            "name": "动态审查",
-            "max_parallelism": 2,
-            "nodes": [{"id": "prepare", "prompt": "准备材料"}]
+            "tasks": [
+                {"id": "prepare", "prompt": "准备材料"},
+                {"id": "review", "prompt": "复核材料", "depends_on": ["prepare"]}
+            ]
         }),
     )
     .await;
-    let workflow_id = created["id"].as_str().expect("创建工作流应返回 ID");
+    assert_ne!(task_in(&created, "prepare")["status"], "pending");
+    assert_eq!(task_in(&created, "review")["status"], "pending");
+    assert_eq!(task_in(&created, "review")["blocked_by"][0], "prepare");
+
     let shelf = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
@@ -181,14 +178,14 @@ async fn component_runs_dynamic_workflow() {
         },
     )
     .await
-    .expect("工作流摘要渲染不应失败")
-    .expect("工作流摘要应返回帧");
+    .expect("任务摘要渲染不应失败")
+    .expect("任务摘要应返回帧");
     assert!(shelf.visible);
     assert!(shelf
         .lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .any(|span| span.text.contains("动态审查")));
+        .any(|span| span.text.contains("任务")));
     PluginHost::on_ui_input(
         &host,
         &UiInput {
@@ -202,21 +199,21 @@ async fn component_runs_dynamic_workflow() {
         },
     )
     .await
-    .expect("工作流入口按键路由不应失败");
+    .expect("任务入口按键路由不应失败");
     let navigation = AgentExtension::drain_events(&host)
         .await
-        .expect("工作流导航事件应可读取");
+        .expect("任务导航事件应可读取");
     assert!(navigation.iter().any(|event| {
         event["name"] == UI_NAVIGATION_EVENT
             && event["data"]["action"]["view"]["view_id"] == "workflow-workspace"
-            && event["data"]["action"]["view"]["instance_id"] == workflow_id
+            && event["data"]["action"]["view"]["instance_id"] == "tasks"
     }));
     let workspace = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
             plugin_id: "workflow".into(),
             view_id: "workflow-workspace".into(),
-            instance_id: Some(workflow_id.into()),
+            instance_id: Some("tasks".into()),
             width: 80,
             height: 24,
             focused: true,
@@ -224,41 +221,73 @@ async fn component_runs_dynamic_workflow() {
         },
     )
     .await
-    .expect("工作流工作台渲染不应失败")
-    .expect("工作流工作台应返回帧");
+    .expect("任务工作台渲染不应失败")
+    .expect("任务工作台应返回帧");
     assert!(workspace
         .lines
         .iter()
         .flat_map(|line| line.spans.iter())
         .any(|span| span.text.contains("prepare")));
 
-    let prepared = tick_until_node_succeeds(&host, workflow_id, "prepare").await;
-    assert_eq!(prepared["sealed"], false);
-    assert_eq!(prepared["status"], "active");
-
-    let expanded = call_tool(
-        &host,
-        "workflow_add_node",
-        json!({
-            "workflow_id": workflow_id,
-            "node": {
-                "id": "review",
-                "prompt": "复核材料",
-                "dependencies": ["prepare"]
-            }
-        }),
-    )
-    .await;
-    assert_eq!(expanded["nodes"]["review"]["status"], "pending");
-
-    call_tool(&host, "workflow_seal", json!({"workflow_id": workflow_id})).await;
-    let completed = tick_until_workflow_succeeds(&host, workflow_id).await;
-    assert_eq!(completed["nodes"]["review"]["output"], "复核完成");
+    // 依赖链应在轮询同步中自动推进：prepare 完成后 review 自动派生并完成。
+    let completed = list_until_status(&host, "review", "completed").await;
+    assert_eq!(task_in(&completed, "prepare")["status"], "completed");
+    let review = call_tool(&host, "task_get", json!({"id": "review"})).await;
+    assert_eq!(review["output"], "复核完成");
     assert!(inputs
         .lock()
         .expect("输入记录锁不应中毒")
         .iter()
-        .any(|input| input.contains("依赖节点结果") && input.contains("准备完成")));
+        .any(|input| input.contains("依赖任务结果") && input.contains("准备完成")));
+
+    // 运行中随时追加新任务：依赖已完成时创建即自动派生。
+    let expanded = call_tool(
+        &host,
+        "task_create",
+        json!({
+            "tasks": [{"id": "summary", "prompt": "总结结论", "depends_on": ["review"]}]
+        }),
+    )
+    .await;
+    assert_ne!(task_in(&expanded, "summary")["status"], "pending");
+
+    // 取消并删除不再需要的任务。
+    call_tool(
+        &host,
+        "task_create",
+        json!({
+            "tasks": [{"id": "obsolete", "prompt": "多余的收尾", "depends_on": ["summary"]}]
+        }),
+    )
+    .await;
+    let cancelled = call_tool(
+        &host,
+        "task_update",
+        json!({"id": "obsolete", "status": "cancelled"}),
+    )
+    .await;
+    assert_eq!(task_in(&cancelled, "obsolete")["status"], "cancelled");
+    let deleted = call_tool(&host, "task_update", json!({"id": "obsolete", "delete": true})).await;
+    assert!(task_in(&deleted, "obsolete").is_null());
+
+    // 全部任务完成后，进度架应自动隐藏。
+    list_until_status(&host, "summary", "completed").await;
+    let settled_shelf = PluginHost::render_ui(
+        &host,
+        &UiRenderRequest {
+            plugin_id: "workflow".into(),
+            view_id: "workflow-shelf".into(),
+            instance_id: None,
+            width: 80,
+            height: 3,
+            focused: false,
+            frame: 3,
+        },
+    )
+    .await
+    .expect("任务摘要渲染不应失败")
+    .expect("任务摘要应返回帧");
+    assert!(!settled_shelf.visible);
 
     host.deactivate()
         .await
