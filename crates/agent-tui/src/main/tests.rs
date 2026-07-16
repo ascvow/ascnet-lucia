@@ -508,6 +508,30 @@ fn tool_lines_show_args_and_truncated_result() {
     assert!(text.contains('…'), "{text:?}");
 }
 
+/// 运行中的工具应立即展示增量输出，而不必等待 ToolFinished。
+#[test]
+fn running_tool_lines_show_latest_output() {
+    let mut msg = Msg::tool_started(ToolCall::new(
+        "call-live",
+        "shell",
+        json!({"command": "cargo test"}),
+    ));
+    for line in 1..=8 {
+        msg.append_tool_output(&format!("编译进度 {line}\n"));
+    }
+
+    let text = msg
+        .to_lines(false, 100)
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+    assert!(text.contains("… 共 8 行"), "{text:?}");
+    assert!(!text.contains("编译进度 1"), "{text:?}");
+    assert!(text.contains("编译进度 8"), "{text:?}");
+}
+
 /// 空工具结果只显示完成状态，不应因缺少预览行而越界崩溃。
 #[test]
 fn tool_lines_accept_empty_result() {
@@ -879,6 +903,32 @@ async fn channel_event_sink_coalesces_model_text_notifications() {
 
     sink.record(&first).await.expect("消费后应允许再次通知");
     assert!(matches!(rx.recv().await, Some(UiEvent::ModelTextReady)));
+}
+
+/// 工具输出事件应保留调用 ID、输出流和文本，供消息状态机增量更新。
+#[tokio::test]
+async fn channel_event_sink_forwards_tool_output_delta() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, _model_deltas) = ChannelEventSink::new(tx);
+    let output = ToolOutputDelta {
+        call_id: "call-live".into(),
+        stream: agent_tool::ToolOutputStream::Stderr,
+        delta: "Compiling agent-core\n".into(),
+    };
+
+    sink.record(&AgentEvent::new(
+        "run-test",
+        AgentEventKind::ToolOutputDelta,
+        0,
+        serde_json::to_value(&output).expect("应序列化工具输出"),
+    ))
+    .await
+    .expect("应记录工具输出");
+
+    let Some(UiEvent::ToolOutputDelta(received)) = rx.recv().await else {
+        panic!("应收到工具输出 UI 事件");
+    };
+    assert_eq!(received, output);
 }
 
 /// 验证成功轮次创建并更新同一稳定会话，且每次保存都会推进 revision。

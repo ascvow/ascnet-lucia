@@ -183,6 +183,43 @@ pub struct ToolResult {
     pub details: Option<Value>,
 }
 
+/// 工具运行期间产生的输出流类别。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputStream {
+    /// 标准输出。
+    Stdout,
+    /// 标准错误。
+    Stderr,
+}
+
+/// 工具运行期间产生的一段增量输出。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolOutputDelta {
+    /// 输出所属工具调用的稳定 ID。
+    pub call_id: String,
+    /// 输出来源，供界面区分 stdout 与 stderr。
+    pub stream: ToolOutputStream,
+    /// 本次新增的文本；调用方应按接收顺序拼接。
+    pub delta: String,
+}
+
+/// 接收工具运行期增量输出的同步接口。
+///
+/// 实现必须快速返回；需要异步持久化或渲染时应转发到内部队列。
+pub trait ToolOutputSink: Send + Sync {
+    /// 接收一段工具输出。接收失败不应中断工具本身。
+    fn emit(&self, output: ToolOutputDelta);
+}
+
+/// 丢弃全部工具运行期输出的默认接收器。
+#[derive(Debug, Clone, Default)]
+pub struct NoopToolOutputSink;
+
+impl ToolOutputSink for NoopToolOutputSink {
+    fn emit(&self, _output: ToolOutputDelta) {}
+}
+
 impl ToolResult {
     /// Construct a successful tool result.
     /// 构造成功的工具结果。
@@ -240,6 +277,18 @@ pub trait Tool: Send + Sync {
     /// Execute the tool call.
     /// 执行工具调用。
     async fn call(&self, call: ToolCall) -> Result<ToolResult>;
+
+    /// 执行工具调用，并把可用的运行期输出发送给接收器。
+    ///
+    /// 默认实现兼容不支持增量输出的工具，只调用 [`Tool::call`]。实现增量输出的工具
+    /// 应覆盖此方法，但最终 [`ToolResult`] 必须与普通调用保持一致。
+    async fn call_with_output(
+        &self,
+        call: ToolCall,
+        _output: Arc<dyn ToolOutputSink>,
+    ) -> Result<ToolResult> {
+        self.call(call).await
+    }
 }
 
 /// Async function type used by [`JsonTool`].
@@ -384,6 +433,22 @@ impl ToolRegistry {
             return Err(anyhow!("unknown tool: {}", call.name));
         };
         tool.call(call).await
+    }
+
+    /// 执行一次工具调用，并转发工具实现提供的运行期输出。
+    ///
+    /// # Errors
+    ///
+    /// 调用引用未知工具，或工具实现执行失败时返回错误。
+    pub async fn call_with_output(
+        &self,
+        call: ToolCall,
+        output: Arc<dyn ToolOutputSink>,
+    ) -> Result<ToolResult> {
+        let Some(tool) = self.tools.get(&call.name) else {
+            return Err(anyhow!("unknown tool: {}", call.name));
+        };
+        tool.call_with_output(call, output).await
     }
 
     /// Number of registered tools.

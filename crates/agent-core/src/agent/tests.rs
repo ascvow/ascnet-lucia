@@ -7,7 +7,9 @@ use crate::{
         ChatModel, ModelEventStream, ModelMessage, ModelResponse, ModelStreamEvent, ProviderAdapter,
     },
 };
-use agent_tool::{JsonTool, Tool, ToolResult, ToolSpec};
+use agent_tool::{
+    JsonTool, Tool, ToolOutputDelta, ToolOutputSink, ToolOutputStream, ToolResult, ToolSpec,
+};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -421,6 +423,46 @@ impl Tool for DetailedTool {
     }
 }
 
+/// 在返回最终结果前发布两段输出的测试工具。
+struct StreamingOutputTool;
+
+#[async_trait]
+impl Tool for StreamingOutputTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "streaming_output",
+            "发布运行期输出",
+            ToolSpec::empty_object_schema(),
+        )
+    }
+
+    async fn call(&self, call: ToolCall) -> Result<ToolResult> {
+        Ok(ToolResult::success(
+            call.id,
+            call.name,
+            json!({"done": true}),
+        ))
+    }
+
+    async fn call_with_output(
+        &self,
+        call: ToolCall,
+        output: Arc<dyn ToolOutputSink>,
+    ) -> Result<ToolResult> {
+        output.emit(ToolOutputDelta {
+            call_id: call.id.clone(),
+            stream: ToolOutputStream::Stdout,
+            delta: "第一段\n".into(),
+        });
+        output.emit(ToolOutputDelta {
+            call_id: call.id.clone(),
+            stream: ToolOutputStream::Stderr,
+            delta: "第二段\n".into(),
+        });
+        self.call(call).await
+    }
+}
+
 /// 状态快照应覆盖模型流式阶段，并在成功后保留完整会话和运行摘要。
 #[tokio::test]
 async fn state_tracks_streaming_and_success_terminal_snapshot() {
@@ -515,6 +557,50 @@ async fn tool_events_preserve_complete_call_and_result() {
         serde_json::from_value::<ToolResult>(finished.payload.clone()).expect("应解码完整工具结果");
     assert_eq!(result.call_id, "detailed-call");
     assert_eq!(result.details, Some(json!({"duration_ms": 12})));
+}
+
+/// Core 必须在 ToolFinished 前按生成顺序转发工具输出增量。
+#[tokio::test]
+async fn tool_output_deltas_are_forwarded_before_completion() {
+    let call = ToolCall::new("stream-call", "streaming_output", json!({}));
+    let mut agent = agent_with_script(vec![
+        ModelResponse::tool_calls(vec![call]),
+        ModelResponse::text("完成"),
+    ]);
+    agent
+        .tools_mut()
+        .register(StreamingOutputTool)
+        .expect("注册输出测试工具");
+    let sink = Arc::new(InMemoryEventSink::new());
+    agent.set_event_sink(sink.clone());
+
+    agent.run("执行工具").await.expect("工具运行应成功");
+
+    let events = sink.events().await;
+    let kinds = events.iter().map(|event| &event.kind).collect::<Vec<_>>();
+    let started = kinds
+        .iter()
+        .position(|kind| **kind == AgentEventKind::ToolStarted)
+        .expect("应包含工具开始事件");
+    let finished = kinds
+        .iter()
+        .position(|kind| **kind == AgentEventKind::ToolFinished)
+        .expect("应包含工具完成事件");
+    let outputs = events
+        .iter()
+        .filter(|event| event.kind == AgentEventKind::ToolOutputDelta)
+        .map(|event| {
+            serde_json::from_value::<ToolOutputDelta>(event.payload.clone()).map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>>>()
+        .expect("输出事件应可解析");
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].delta, "第一段\n");
+    assert_eq!(outputs[1].stream, ToolOutputStream::Stderr);
+    assert!(started < finished);
+    assert!(events[started + 1..finished]
+        .iter()
+        .all(|event| event.kind == AgentEventKind::ToolOutputDelta));
 }
 
 /// ReAct 错误应形成可查询的失败终态，并保留最后已确认的会话。

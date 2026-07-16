@@ -241,6 +241,8 @@ struct AgentViewTool {
     call_id: String,
     name: String,
     args: serde_json::Value,
+    /// 工具尚未结束时已经收到的输出文本。
+    output: String,
     result: Option<serde_json::Value>,
     state: AgentViewToolState,
 }
@@ -282,9 +284,17 @@ fn agent_event_lines(
                     call_id: event.payload["id"].as_str().unwrap_or_default().to_string(),
                     name: event.payload["name"].as_str().unwrap_or("tool").to_string(),
                     args: event.payload["args"].clone(),
+                    output: String::new(),
                     result: None,
                     state: AgentViewToolState::Running,
                 }));
+            }
+            AgentEventKind::ToolOutputDelta => {
+                let call_id = event.payload["call_id"].as_str().unwrap_or_default();
+                let delta = event.payload["delta"].as_str().unwrap_or_default();
+                if let Some(tool) = find_tool_mut(&mut messages, call_id) {
+                    tool.output.push_str(delta);
+                }
             }
             AgentEventKind::ToolFinished => {
                 let call_id = event.payload["call_id"].as_str().unwrap_or_default();
@@ -302,6 +312,7 @@ fn agent_event_lines(
                         call_id: call_id.to_string(),
                         name: event.payload["name"].as_str().unwrap_or("tool").to_string(),
                         args: serde_json::Value::Null,
+                        output: String::new(),
                         result: Some(event.payload["content"].clone()),
                         state,
                     }));
@@ -317,6 +328,7 @@ fn agent_event_lines(
                         call_id: call_id.to_string(),
                         name: call["name"].as_str().unwrap_or("tool").to_string(),
                         args: call["args"].clone(),
+                        output: String::new(),
                         result: None,
                         state: AgentViewToolState::Skipped,
                     }));
@@ -452,10 +464,12 @@ fn tool_message_lines(tool: &AgentViewTool, width: usize) -> Vec<UiLine> {
     }
     let mut lines = vec![UiLine { spans: first }];
     let preview_width = width.saturating_sub(5).max(1);
-    for (index, result) in tool_result_lines(tool.result.as_ref(), 6, 96)
-        .into_iter()
-        .enumerate()
-    {
+    let result_lines = if let Some(result) = tool.result.as_ref() {
+        tool_result_lines(Some(result), 6, 96)
+    } else {
+        tool_live_output_lines(&tool.output, 6, 96)
+    };
+    for (index, result) in result_lines.into_iter().enumerate() {
         let prefix = if index == 0 { "  └ " } else { "    " };
         let result_color = if matches!(tool.state, AgentViewToolState::Failed) {
             UiColor::Red
@@ -603,6 +617,20 @@ fn tool_result_lines(
     lines
 }
 
+/// 截取运行期输出的最新几行，使长任务的预览持续变化而不是停留在开头。
+fn tool_live_output_lines(text: &str, max_lines: usize, max_width: usize) -> Vec<String> {
+    let all = text.lines().collect::<Vec<_>>();
+    let start = all.len().saturating_sub(max_lines);
+    let mut lines = all[start..]
+        .iter()
+        .map(|line| truncate_line(line.trim_end(), max_width))
+        .collect::<Vec<_>>();
+    if start > 0 {
+        lines.insert(0, format!("… {} lines", all.len()));
+    }
+    lines
+}
+
 /// 将文本压平为一行并按显示宽度截断。
 fn truncate_line(value: &str, max_width: usize) -> String {
     let flattened = value.replace(['\n', '\r', '\t'], " ");
@@ -697,6 +725,28 @@ mod tests {
                 .and_then(|span| span.style.foreground),
             Some(UiColor::Green)
         );
+    }
+
+    /// 派生 Agent 视图也应在工具完成前展示已经收到的输出。
+    #[test]
+    fn running_tool_renders_incremental_output() {
+        let tool = AgentViewTool {
+            call_id: "call-live".into(),
+            name: "shell".into(),
+            args: json!({"command": "cargo test"}),
+            output: "Compiling agent-core\nRunning tests\n".into(),
+            result: None,
+            state: AgentViewToolState::Running,
+        };
+
+        let text = tool_message_lines(&tool, 80)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(text.contains("Compiling agent-core"), "{text:?}");
+        assert!(text.contains("Running tests"), "{text:?}");
     }
 
     /// 本地用户消息应使用主界面的强调块，而不是带角色标签的日志行。

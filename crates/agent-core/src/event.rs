@@ -103,6 +103,8 @@ pub enum AgentEventKind {
 
     /// 工具调用已通过前置检查并开始执行。
     ToolStarted,
+    /// 工具运行期间产生增量输出；载荷为共享的 `ToolOutputDelta`。
+    ToolOutputDelta,
     /// 工具执行结束，载荷包含成功结果或结构化错误。
     ToolFinished,
 

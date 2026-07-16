@@ -19,6 +19,11 @@ agent.set_tools(tools);
 
 `Agent::tool_specs()` 合并原生工具与 `AgentExtension::list_tools()`。公开名称重复会在模型请求前报错。
 
+需要展示长时间运行工具的实时进度时，工具可以覆盖 `Tool::call_with_output()`，通过
+`ToolOutputSink` 发布带调用 ID、stdout/stderr 来源和文本的 `ToolOutputDelta`。Core 会按
+接收顺序写入 `AgentEventKind::ToolOutputDelta`，最终 `ToolResult` 的模型语义保持不变。
+内置 `shell` 工具会持续读取两个输出流，每个流最多保留并展示 100 KiB。
+
 ## 扩展工具生命周期
 
 `AgentExtension` 提供以下通用钩子：

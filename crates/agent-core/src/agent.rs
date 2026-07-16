@@ -19,7 +19,7 @@ use crate::{
     state::{AgentPhase, AgentState, AgentToolCallState, AgentToolCallStatus},
     ToolDecision,
 };
-use agent_tool::{ToolCall, ToolRegistry, ToolResult, ToolSpec};
+use agent_tool::{ToolCall, ToolOutputDelta, ToolOutputSink, ToolRegistry, ToolResult, ToolSpec};
 use anyhow::{anyhow, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

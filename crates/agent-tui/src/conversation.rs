@@ -96,6 +96,8 @@ pub(crate) struct Msg {
     pub(crate) tool_call: Option<ToolCall>,
     /// 工具消息关联的完整结果；运行中或普通消息为 `None`。
     pub(crate) tool_result: Option<ToolResult>,
+    /// 工具运行期间已收到的增量输出；完成后由结构化结果接管展示。
+    pub(crate) tool_output: String,
     /// 工具未执行时的原因；其他消息为 `None`。
     pub(crate) skip_reason: Option<String>,
     /// 插件为当前工具消息返回的声明式帧。
@@ -124,6 +126,7 @@ impl Msg {
             text: text.into(),
             tool_call: None,
             tool_result: None,
+            tool_output: String::new(),
             skip_reason: None,
             #[cfg(feature = "plugins")]
             tool_frame: None,
@@ -169,6 +172,18 @@ impl Msg {
             })
     }
 
+    /// 向运行中的工具消息追加输出；调用 ID 的匹配由上层状态机负责。
+    pub(crate) fn append_tool_output(&mut self, delta: &str) {
+        self.tool_output.push_str(delta);
+        if self.tool_output.len() > TOOL_LIVE_OUTPUT_BYTES {
+            let mut start = self.tool_output.len() - TOOL_LIVE_OUTPUT_BYTES;
+            while !self.tool_output.is_char_boundary(start) {
+                start += 1;
+            }
+            self.tool_output = format!("… [较早输出已省略]\n{}", &self.tool_output[start..]);
+        }
+    }
+
     /// 创建由扩展事件驱动的主事件列表消息。
     pub(crate) fn extension(text: impl Into<String>, color: Color, divider: bool) -> Self {
         Self {
@@ -176,6 +191,7 @@ impl Msg {
             text: text.into(),
             tool_call: None,
             tool_result: None,
+            tool_output: String::new(),
             skip_reason: None,
             #[cfg(feature = "plugins")]
             tool_frame: None,
@@ -273,11 +289,13 @@ impl Msg {
         } else {
             COLOR_MUTED
         };
-        let result_lines = self
-            .tool_result
-            .as_ref()
-            .map(|result| tool_result_lines(&result.content, TOOL_RESULT_PREVIEW_LINES, 96))
-            .unwrap_or_default();
+        let result_lines = if let Some(result) = self.tool_result.as_ref() {
+            tool_result_lines(&result.content, TOOL_RESULT_PREVIEW_LINES, 96)
+        } else if self.tool_output.is_empty() {
+            Vec::new()
+        } else {
+            tool_output_preview_lines(&self.tool_output, TOOL_RESULT_PREVIEW_LINES, 96)
+        };
         if let Some(result) = result_lines.first() {
             lines.push(Line::from(vec![
                 Span::styled("  └ ", Style::new().fg(COLOR_MUTED)),
@@ -300,7 +318,7 @@ impl Msg {
             lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled(
-                    truncate_line(&detail, preview_width),
+                    truncate_line(detail, preview_width),
                     Style::new().fg(detail_color),
                 ),
             ]));
@@ -647,6 +665,8 @@ pub(crate) fn restyle_markdown(style: Style, accent: Color) -> Style {
 
 /// 工具结果预览保留的最大行数。
 pub(crate) const TOOL_RESULT_PREVIEW_LINES: usize = 6;
+/// 单个运行中工具在 TUI 内保留的最大文本量，防止第三方工具无限推送。
+const TOOL_LIVE_OUTPUT_BYTES: usize = 200 * 1024;
 
 /// 从工具结果 JSON 中提取多行文本预览：首行作摘要，其余行缩进展示。
 ///
@@ -669,6 +689,20 @@ pub(crate) fn tool_result_lines(value: &Value, max_lines: usize, max_width: usiz
         .collect();
     if total > max_lines {
         lines.push(format!("… 共 {total} 行"));
+    }
+    lines
+}
+
+/// 构造工具输出预览；运行期文本展示最新行，最终结构化结果保持原有摘要行为。
+fn tool_output_preview_lines(text: &str, max_lines: usize, max_width: usize) -> Vec<String> {
+    let all = text.lines().collect::<Vec<_>>();
+    let start = all.len().saturating_sub(max_lines);
+    let mut lines = all[start..]
+        .iter()
+        .map(|line| truncate_line(line.trim_end(), max_width))
+        .collect::<Vec<_>>();
+    if start > 0 {
+        lines.insert(0, format!("… 共 {} 行", all.len()));
     }
     lines
 }

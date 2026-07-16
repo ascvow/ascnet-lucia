@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// 把工具同步输出回调转发到当前异步运行循环。
+struct ToolOutputChannel(tokio::sync::mpsc::UnboundedSender<ToolOutputDelta>);
+
+impl ToolOutputSink for ToolOutputChannel {
+    fn emit(&self, output: ToolOutputDelta) {
+        let _ = self.0.send(output);
+    }
+}
+
 impl Agent {
     /// 消费一次取消请求；运行循环在检查点调用。
     fn take_cancelled(&self) -> bool {
@@ -560,7 +569,8 @@ impl Agent {
         .await?;
 
         let result = if self.tools.contains(&call.name) {
-            self.tools.call(call).await?
+            self.execute_native_tool_with_output(run_id, step, call)
+                .await?
         } else if let Some(result) = self.extension.call_tool(call.clone()).await? {
             result
         } else {
@@ -582,6 +592,47 @@ impl Agent {
         )
         .await?;
         Ok(result)
+    }
+
+    /// 执行原生工具，并在最终结果到达前按顺序发布运行期输出事件。
+    async fn execute_native_tool_with_output(
+        &self,
+        run_id: &str,
+        step: usize,
+        call: ToolCall,
+    ) -> Result<ToolResult> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let output: Arc<dyn ToolOutputSink> = Arc::new(ToolOutputChannel(tx));
+        let mut execution = Box::pin(self.tools.call_with_output(call, output));
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    while let Ok(output) = rx.try_recv() {
+                        self.record_tool_output(run_id, step, output).await?;
+                    }
+                    return result;
+                }
+                Some(output) = rx.recv() => {
+                    self.record_tool_output(run_id, step, output).await?;
+                }
+            }
+        }
+    }
+
+    /// 只向事件 sink 写入高频工具输出，不逐块调用扩展 hook 或排空插件事件。
+    async fn record_tool_output(
+        &self,
+        run_id: &str,
+        step: usize,
+        output: ToolOutputDelta,
+    ) -> Result<()> {
+        let event = AgentEvent::new(
+            run_id.to_string(),
+            AgentEventKind::ToolOutputDelta,
+            step,
+            serde_json::to_value(output)?,
+        );
+        self.events.record(&event).await
     }
 
     /// 取得唯一运行槽位并用输入会话初始化完整状态。

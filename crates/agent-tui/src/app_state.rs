@@ -2044,6 +2044,10 @@ impl EventSink for ChannelEventSink {
                 let call = serde_json::from_value::<ToolCall>(event.payload.clone())?;
                 let _ = self.tx.send(UiEvent::ToolStarted(call));
             }
+            AgentEventKind::ToolOutputDelta => {
+                let output = serde_json::from_value::<ToolOutputDelta>(event.payload.clone())?;
+                let _ = self.tx.send(UiEvent::ToolOutputDelta(output));
+            }
             AgentEventKind::ToolFinished => {
                 let result = serde_json::from_value::<ToolResult>(event.payload.clone())?;
                 let _ = self.tx.send(UiEvent::ToolFinished(result));

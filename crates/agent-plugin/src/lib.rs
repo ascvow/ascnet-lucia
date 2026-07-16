@@ -114,6 +114,8 @@ pub enum AgentEventKind {
     BillingUsage,
     /// 工具执行开始。
     ToolStarted,
+    /// 工具运行期间产生增量输出。
+    ToolOutputDelta,
     /// 工具执行完成。
     ToolFinished,
     /// 工具因插话而跳过。

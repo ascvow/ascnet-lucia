@@ -57,7 +57,7 @@ use agent_session::{
     FileSessionStore, MemorySessionStore, SessionId, SessionRecord, SessionStore,
     SessionStoreError, SessionSummary,
 };
-use agent_tool::{JsonTool, ToolCall, ToolRegistry, ToolResult, ToolSpec};
+use agent_tool::{JsonTool, ToolCall, ToolOutputDelta, ToolRegistry, ToolResult, ToolSpec};
 #[cfg(feature = "plugins")]
 use anyhow::Context;
 use anyhow::{anyhow, Result};
@@ -251,6 +251,8 @@ enum UiEvent {
     ModelTextReady,
     /// 工具开始执行，携带未经裁剪的调用数据。
     ToolStarted(ToolCall),
+    /// 工具运行期间产生一段可立即展示的输出。
+    ToolOutputDelta(ToolOutputDelta),
     /// 工具完成执行，携带未经裁剪的结果与 UI 细节。
     ToolFinished(ToolResult),
     /// 工具未执行，保留原始调用和跳过原因。

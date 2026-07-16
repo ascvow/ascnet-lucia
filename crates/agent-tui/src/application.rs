@@ -468,6 +468,16 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     app.schedule_tool_render(Arc::clone(host), &call_id);
                 }
             }
+            Some(UiEvent::ToolOutputDelta(output)) => {
+                if let Some(message) = app
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|message| message.tool_call_id() == Some(output.call_id.as_str()))
+                {
+                    message.append_tool_output(&output.delta);
+                }
+            }
             Some(UiEvent::ToolFinished(tool_result)) => {
                 // 只按稳定调用 ID 更新运行项，避免同名并发工具互相覆盖。
                 let kind = if tool_result.is_error {
