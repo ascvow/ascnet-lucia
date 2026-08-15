@@ -9,8 +9,15 @@
 #![deny(missing_docs)]
 
 pub mod data_class;
+pub mod genome;
 pub mod ids;
 pub mod redaction;
+
+pub use genome::{
+    AgentGenome, GenomeMetadata, GenomeRevision, InvalidGenome, ModelGenome, PluginGenome,
+    PolicyRef, PromptArtifactRef, PromptGenome, PromptLayer, RuntimeIdentity, SkillRef,
+    ToolProfileGenome, GENOME_SCHEMA_VERSION,
+};
 
 pub use data_class::{
     DataClass, EpisodeDataPolicy, EpisodeFieldClass, EvolutionEligibility, RawToolResultPolicy,
