@@ -16,3 +16,7 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", optional = true, features = ["fs", "process", "io-util", "time", "rt"] }
+
+# Shell 超时后按进程组回收整棵进程树，需要向负 PID 发送信号。
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

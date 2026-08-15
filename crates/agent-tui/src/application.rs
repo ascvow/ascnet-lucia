@@ -186,8 +186,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Ok(json!({ "echo": text, "source": "native" }))
         }))?;
     } else {
-        // 真实模式注入内置工具集：读写文件、列目录、shell、搜索
-        agent_tool::builtins::register_builtins(&mut native_tools)?;
+        // 真实模式注入内置工具集：读写文件、列目录、shell、搜索。
+        // 工作区固定为启动目录，原生工具无法读写其外部路径，也不跟随越界符号链接。
+        let guard = agent_tool::WorkspaceGuard::rooted(&workspace.cwd)?;
+        agent_tool::builtins::register_builtins(&mut native_tools, guard)?;
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();

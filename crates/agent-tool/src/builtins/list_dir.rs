@@ -1,7 +1,7 @@
 //! 列出目录内容工具。
 //! List directory entries tool.
 
-use crate::{Tool, ToolCall, ToolResult, ToolSpec};
+use crate::{FileCapability, Tool, ToolCall, ToolResult, ToolSpec, WorkspaceGuard};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -9,7 +9,19 @@ use serde_json::json;
 
 /// 列出目录下的文件和子目录。
 /// List files and subdirectories in a directory.
-pub struct ListDirectoryTool;
+///
+/// 目录路径先经 [`WorkspaceGuard`] 解析，工作区之外的目录一律拒绝。
+#[derive(Debug, Clone, Default)]
+pub struct ListDirectoryTool {
+    guard: WorkspaceGuard,
+}
+
+impl ListDirectoryTool {
+    /// 以指定工作区守卫创建工具。
+    pub fn new(guard: WorkspaceGuard) -> Self {
+        Self { guard }
+    }
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -39,7 +51,15 @@ impl Tool for ListDirectoryTool {
     async fn call(&self, call: ToolCall) -> Result<ToolResult> {
         let args: Args = call.args_as()?;
 
-        let mut dir = match tokio::fs::read_dir(&args.path).await {
+        let path = match self
+            .guard
+            .resolve_existing(&args.path, FileCapability::Read)
+        {
+            Ok(path) => path,
+            Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
+        };
+
+        let mut dir = match tokio::fs::read_dir(&path).await {
             Ok(d) => d,
             Err(e) => return Ok(ToolResult::error(call.id, call.name, e.to_string())),
         };

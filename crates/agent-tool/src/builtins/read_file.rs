@@ -1,7 +1,7 @@
 //! 读取文件内容工具。
 //! Read file content tool.
 
-use crate::{Tool, ToolCall, ToolResult, ToolSpec};
+use crate::{FileCapability, Tool, ToolCall, ToolResult, ToolSpec, WorkspaceGuard};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -9,7 +9,19 @@ use serde_json::json;
 
 /// 读取文件内容，返回带行号的文本。
 /// Read file content with line numbers.
-pub struct ReadFileTool;
+///
+/// 路径先经 [`WorkspaceGuard`] 解析，工作区之外的目标一律拒绝。
+#[derive(Debug, Clone, Default)]
+pub struct ReadFileTool {
+    guard: WorkspaceGuard,
+}
+
+impl ReadFileTool {
+    /// 以指定工作区守卫创建工具。
+    pub fn new(guard: WorkspaceGuard) -> Self {
+        Self { guard }
+    }
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -55,7 +67,15 @@ impl Tool for ReadFileTool {
         let offset = args.offset.unwrap_or(0);
         let limit = args.limit.unwrap_or(2000);
 
-        let content = match tokio::fs::read_to_string(&args.path).await {
+        let path = match self
+            .guard
+            .resolve_existing(&args.path, FileCapability::Read)
+        {
+            Ok(path) => path,
+            Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
+        };
+
+        let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => return Ok(ToolResult::error(call.id, call.name, e.to_string())),
         };

@@ -13,17 +13,23 @@ pub use search::SearchFilesTool;
 pub use shell::ShellTool;
 pub use write_file::WriteFileTool;
 
-use crate::ToolRegistry;
+use crate::{ToolRegistry, WorkspaceGuard};
 use anyhow::Result;
 
-/// 使用默认配置将所有内置工具注册到 ToolRegistry。
-/// Register all built-in tools with default settings.
-pub fn register_builtins(registry: &mut ToolRegistry) -> Result<()> {
-    registry.register(ReadFileTool)?;
-    registry.register(WriteFileTool)?;
-    registry.register(ListDirectoryTool)?;
-    registry.register(ShellTool::default())?;
-    registry.register(SearchFilesTool::default())?;
+/// 在指定工作区内注册全部内置工具。
+///
+/// `guard` 决定这些工具可以触碰的目录范围与文件能力，所有路径都会经它解析。
+/// 调用方必须显式给出工作区：这是 Host 级的越权防线，不依赖任何插件参与。
+///
+/// # Errors
+///
+/// 工具重名或名称非法时返回错误。
+pub fn register_builtins(registry: &mut ToolRegistry, guard: WorkspaceGuard) -> Result<()> {
+    registry.register(ReadFileTool::new(guard.clone()))?;
+    registry.register(WriteFileTool::new(guard.clone()))?;
+    registry.register(ListDirectoryTool::new(guard.clone()))?;
+    registry.register(ShellTool::new(guard.clone()))?;
+    registry.register(SearchFilesTool::new(guard))?;
     Ok(())
 }
 
@@ -36,9 +42,9 @@ mod tests {
     #[test]
     fn builtin_specs_explain_selection_and_limits() {
         let specs = [
-            ReadFileTool.spec(),
-            WriteFileTool.spec(),
-            ListDirectoryTool.spec(),
+            ReadFileTool::default().spec(),
+            WriteFileTool::default().spec(),
+            ListDirectoryTool::default().spec(),
             ShellTool::default().spec(),
             SearchFilesTool::default().spec(),
         ];
