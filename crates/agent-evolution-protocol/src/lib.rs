@@ -9,10 +9,16 @@
 #![deny(missing_docs)]
 
 pub mod data_class;
+pub mod ids;
 pub mod redaction;
 
 pub use data_class::{
     DataClass, EpisodeDataPolicy, EpisodeFieldClass, EvolutionEligibility, RawToolResultPolicy,
     RetentionPolicy,
+};
+pub use ids::{
+    id_json_schema, ArtifactDigest, AuditRecordId, DatasetVersionId, EpisodeId, EvaluationReportId,
+    EvaluationRunId, GenomeDigest, GenomeRevisionId, InvalidEvolutionId, MutationId, ReleaseId,
+    RunId,
 };
 pub use redaction::{RedactionOutcome, RedactionRule, Redactor, REDACTION_RULES_VERSION};

@@ -232,6 +232,21 @@ Mutator 只看得到"发生了什么形态的失败"，看不到具体内容：�
 判定过期后连同 CAS 制品一并移除。Archive 中的评测记录不受此影响——它们不含
 原始内容，只含引用与摘要。
 
+### 强类型标识
+
+全部标识都是 newtype 而非裸 `String`，把 `EpisodeId` 传给需要 `RunId` 的位置
+会在编译期失败。两个家族：
+
+- **带前缀标识**：`<prefix>_<8-64 位小写字母或数字>`，正文取自 UUID v4，
+  不含时间戳、路径或用户名，标识本身不泄漏内容。
+- **内容摘要**：`sha256:<64 位小写十六进制>`。
+
+反序列化同样执行校验，非法值不会静默进入系统。各类型的 `PATTERN` 常量是
+跨语言校验的唯一事实来源，`id_json_schema()` 据此生成
+`schemas/evolution-ids.schema.json`。该文件已固化在仓库中供 TypeScript 引用，
+并由测试比对防止漂移；变更后以 `UPDATE_SCHEMA=1 cargo test -p
+agent-evolution-protocol` 重新生成。
+
 ## Promote 的两种模式
 
 | | 本地 | 生产 |

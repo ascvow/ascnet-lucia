@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascnet.dev/lucia/schemas/evolution-ids.schema.json",
+  "title": "Lucia Evolution Identifiers",
+  "description": "Lucia 自进化链路的强类型标识格式；由 agent-evolution-protocol 生成，请勿手工编辑。",
+  "$defs": {
+    "RunId": {
+      "type": "string",
+      "pattern": "^run_[0-9a-z]{8,64}$",
+      "description": "一次 Agent 运行的标识"
+    },
+    "EpisodeId": {
+      "type": "string",
+      "pattern": "^ep_[0-9a-z]{8,64}$",
+      "description": "一条运行证据 Episode 的标识"
+    },
+    "GenomeRevisionId": {
+      "type": "string",
+      "pattern": "^grev_[0-9a-z]{8,64}$",
+      "description": "Genome 的一次具体修订"
+    },
+    "MutationId": {
+      "type": "string",
+      "pattern": "^mut_[0-9a-z]{8,64}$",
+      "description": "一次变异提案的标识"
+    },
+    "EvaluationRunId": {
+      "type": "string",
+      "pattern": "^evrun_[0-9a-z]{8,64}$",
+      "description": "一次评测运行的标识"
+    },
+    "EvaluationReportId": {
+      "type": "string",
+      "pattern": "^evrep_[0-9a-z]{8,64}$",
+      "description": "一份评测报告的标识"
+    },
+    "DatasetVersionId": {
+      "type": "string",
+      "pattern": "^dsv_[0-9a-z]{8,64}$",
+      "description": "数据集某个版本的标识"
+    },
+    "ReleaseId": {
+      "type": "string",
+      "pattern": "^rel_[0-9a-z]{8,64}$",
+      "description": "一次发布的标识"
+    },
+    "AuditRecordId": {
+      "type": "string",
+      "pattern": "^aud_[0-9a-z]{8,64}$",
+      "description": "一条审计记录的标识"
+    },
+    "GenomeDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Genome 行为字段的内容摘要"
+    },
+    "ArtifactDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "CAS 中单个制品的内容摘要"
+    }
+  }
+}

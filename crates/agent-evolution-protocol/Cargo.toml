@@ -10,3 +10,5 @@ description = "Lucia 自进化链路的数据分级、进化资格与脱敏协�
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
