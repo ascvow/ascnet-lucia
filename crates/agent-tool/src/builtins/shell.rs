@@ -2,14 +2,18 @@
 //! Shell command execution tool.
 
 use crate::{
-    NoopToolOutputSink, Tool, ToolCall, ToolOutputDelta, ToolOutputSink, ToolOutputStream,
-    ToolResult, ToolSpec,
+    FileCapability, NoopToolOutputSink, Tool, ToolCall, ToolOutputDelta, ToolOutputSink,
+    ToolOutputStream, ToolResult, ToolSpec, WorkspaceGuard,
 };
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -17,17 +21,32 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 /// 单个输出流（stdout / stderr）最大保留字节数。
 const MAX_OUTPUT_BYTES: usize = 100 * 1024;
 
+/// 默认注入子进程的环境变量白名单。
+///
+/// 只保留命令正常运行所需的最小集合。凡是可能携带凭据的变量（`*_API_KEY`、
+/// `*_TOKEN`、`AWS_*`、`GITHUB_TOKEN` 等）都不在其中，因此默认不会泄漏到子进程。
+const ENV_ALLOWLIST: &[&str] = &[
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SHELL", "USER", "LOGNAME",
+    "TZ",
+];
+
 /// 执行 shell 命令并返回 stdout、stderr 和退出码。
 /// Execute a shell command and return stdout, stderr, and exit code.
+///
+/// 安全约束：工作目录固定在工作区内，环境变量按白名单注入（默认不含任何 Secret），
+/// 输出按流截断，超时后终止整个进程树。
 pub struct ShellTool {
     /// 全局默认超时（毫秒），通过构造函数配置。
     default_timeout_ms: u64,
+    /// 工作区守卫，限定命令的工作目录范围。
+    guard: WorkspaceGuard,
 }
 
 impl Default for ShellTool {
     fn default() -> Self {
         Self {
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
+            guard: WorkspaceGuard::default(),
         }
     }
 }
@@ -38,6 +57,32 @@ impl ShellTool {
     pub fn with_timeout_ms(timeout_ms: u64) -> Self {
         Self {
             default_timeout_ms: timeout_ms.min(MAX_TIMEOUT_MS),
+            guard: WorkspaceGuard::default(),
+        }
+    }
+
+    /// 以指定工作区守卫创建 ShellTool。
+    pub fn new(guard: WorkspaceGuard) -> Self {
+        Self {
+            default_timeout_ms: DEFAULT_TIMEOUT_MS,
+            guard,
+        }
+    }
+
+    /// 解析命令的工作目录。
+    ///
+    /// 未指定时使用工作区根目录；显式指定时必须落在工作区内，否则拒绝执行。
+    /// 不限制目录的守卫返回 `Ok(None)`，表示沿用进程当前目录。
+    fn resolve_working_directory(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<Option<PathBuf>, crate::WorkspaceError> {
+        match requested {
+            Some(raw) => self
+                .guard
+                .resolve_existing(raw, FileCapability::Read)
+                .map(Some),
+            None => Ok(self.guard.root().map(Path::to_path_buf)),
         }
     }
 }
@@ -158,16 +203,33 @@ impl Tool for ShellTool {
             .unwrap_or(self.default_timeout_ms)
             .min(MAX_TIMEOUT_MS);
 
+        let working_directory =
+            match self.resolve_working_directory(args.working_directory.as_deref()) {
+                Ok(dir) => dir,
+                Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
+            };
+
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(&args.command);
 
-        if let Some(ref dir) = args.working_directory {
+        if let Some(ref dir) = working_directory {
             cmd.current_dir(dir);
+        }
+
+        // 清空继承环境后按白名单重新注入，确保 Secret 不会默认进入子进程。
+        cmd.env_clear();
+        for key in ENV_ALLOWLIST {
+            if let Ok(value) = std::env::var(key) {
+                cmd.env(key, value);
+            }
         }
 
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
+        // 让 sh 成为独立进程组 leader，超时后可以按组回收其全部后代。
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -230,6 +292,13 @@ impl Tool for ShellTool {
                 ))
             }
             Err(_) => {
+                // 只 kill 直接子进程会留下后代继续运行，因此先按进程组整体回收。
+                #[cfg(unix)]
+                if let Some(group) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+                    unsafe {
+                        libc::kill(-group, libc::SIGKILL);
+                    }
+                }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 let _ = stdout_task.await;

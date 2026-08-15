@@ -1,7 +1,7 @@
 //! 在文件中搜索文本工具。
 //! Search text in files tool.
 
-use crate::{Tool, ToolCall, ToolResult, ToolSpec};
+use crate::{FileCapability, Tool, ToolCall, ToolResult, ToolSpec, WorkspaceGuard};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -34,15 +34,20 @@ const SKIP_DIRS: &[&str] = &[
 
 /// 在目录树中递归搜索文本内容。
 /// Recursively search for text content in a directory tree.
+///
+/// 搜索根目录先经 [`WorkspaceGuard`] 解析，且递归过程不会跟随指向工作区外的符号链接。
 pub struct SearchFilesTool {
     /// 默认最大结果数。
     default_max_results: usize,
+    /// 工作区守卫，限定可搜索的目录范围。
+    guard: WorkspaceGuard,
 }
 
 impl Default for SearchFilesTool {
     fn default() -> Self {
         Self {
             default_max_results: DEFAULT_MAX_RESULTS,
+            guard: WorkspaceGuard::default(),
         }
     }
 }
@@ -52,6 +57,15 @@ impl SearchFilesTool {
     pub fn with_max_results(max_results: usize) -> Self {
         Self {
             default_max_results: max_results.min(MAX_RESULTS_LIMIT),
+            guard: WorkspaceGuard::default(),
+        }
+    }
+
+    /// 以指定工作区守卫创建工具。
+    pub fn new(guard: WorkspaceGuard) -> Self {
+        Self {
+            default_max_results: DEFAULT_MAX_RESULTS,
+            guard,
         }
     }
 }
@@ -90,6 +104,9 @@ fn is_likely_binary(buf: &[u8]) -> bool {
 }
 
 /// 同步递归搜索。
+///
+/// `boundary` 为工作区根目录。每个条目都以 canonicalize 结果与之比较，因此指向
+/// 工作区外的符号链接不会被跟随；`None` 表示不限制目录。
 fn search_recursive(
     dir: &Path,
     pattern: &str,
@@ -97,6 +114,7 @@ fn search_recursive(
     depth: usize,
     results: &mut Vec<Match>,
     max_results: usize,
+    boundary: Option<&Path>,
 ) {
     if depth > MAX_DEPTH || results.len() >= max_results {
         return;
@@ -112,6 +130,13 @@ fn search_recursive(
 
     for entry in entries.flatten() {
         let path = entry.path();
+        // 逐条目校验真实路径，避免经符号链接读取或遍历工作区之外的内容。
+        if let Some(root) = boundary {
+            match path.canonicalize() {
+                Ok(real) if real.starts_with(root) => {}
+                _ => continue,
+            }
+        }
         if path.is_dir() {
             dirs.push(path);
         } else {
@@ -184,7 +209,15 @@ fn search_recursive(
         if SKIP_DIRS.contains(&dir_name) {
             continue;
         }
-        search_recursive(&dir_path, pattern, include, depth + 1, results, max_results);
+        search_recursive(
+            &dir_path,
+            pattern,
+            include,
+            depth + 1,
+            results,
+            max_results,
+            boundary,
+        );
     }
 }
 
@@ -242,19 +275,29 @@ impl Tool for SearchFilesTool {
         let pattern = args.pattern.clone();
         let include = args.include.clone();
 
+        // 搜索起点必须落在工作区内；解析后的规范路径同时作为递归的包含性基准。
+        let root = match self
+            .guard
+            .resolve_existing(&base_path, FileCapability::Read)
+        {
+            Ok(path) => path,
+            Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
+        };
+        let boundary = self.guard.root().map(Path::to_path_buf);
+
         let results = tokio::task::spawn_blocking(move || {
-            let dir = Path::new(&base_path);
-            if !dir.is_dir() {
+            if !root.is_dir() {
                 return Vec::new();
             }
             let mut matches = Vec::new();
             search_recursive(
-                dir,
+                &root,
                 &pattern,
                 include.as_deref(),
                 0,
                 &mut matches,
                 max_results,
+                boundary.as_deref(),
             );
             matches
         })

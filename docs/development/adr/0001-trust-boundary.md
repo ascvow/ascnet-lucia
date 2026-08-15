@@ -80,7 +80,11 @@ Trusted Evaluation 平面  判定候选优劣；独占隐藏数据集、Verifier
 3. 若该 owner 已声明但尚未 Ready，则阻止本轮工具执行（fail-closed，符合预期）。
 4. 若**没有任何插件**声明该能力，`policy_owner` 为 `None`，流程直接落到 `Ok(ToolDecision::Allow)`。
 
-因此移除 permission 插件等于移除全部工具授权。原生文件工具（`read_file`、`write_file`）当前不接收 workspace root，不做 canonicalize，不拒绝 `..` 逃逸；`ShellTool` 以 `sh -c` 执行，`working_directory` 由模型参数直接决定，且完整继承宿主环境变量。
+因此移除 permission 插件等于移除全部**工具授权**（哪些工具可调用）。
+
+> 该小节描述的是 M0-03 与 M0-04 之前的状态。原生文件工具彼时不接收 workspace
+> root、不做 canonicalize、不拒绝 `..` 逃逸，`ShellTool` 完整继承宿主环境变量。
+> 这些缺口已由后文的 M0-03、M0-04 落点关闭；工具授权本身仍由插件裁决。
 
 唯一已经存在的可信强制点是 `agent-runtime` 的 `RestrictedExtension`（`crates/agent-runtime/src/permissions.rs:251`）。它对派生 Agent 同时过滤 `list_tools`、拦截 `call_tool`，并且**重新校验插件 `Rewrite` 后的工具名**，因此插件无法借 `Rewrite` 提权。但它只作用于派生 Agent 的 allowlist，不构成根 Agent 的文件系统或进程边界。
 
@@ -105,9 +109,33 @@ Trusted Evaluation 平面  判定候选优劣；独占隐藏数据集、Verifier
 任何类型，因此无法提升自身权限。`AgentOptions::with_execution_policy` 应用
 `restrict` 而非覆盖，重复调用只会越来越严格。
 
-尚未关闭的部分：`FilesystemScope::Root` 目前只是**声明**，真正的 canonicalize、
-`..` 逃逸拒绝与 symlink 检查属于 M0-04；`allow_network`、`allow_secrets` 与
-`wall_clock_ms` 同样只是策略字段，尚无强制点。
+### M0-04 落点
+
+`WorkspaceGuard`（`agent-tool`）把 `FilesystemScope` 从声明变成强制：
+
+- 所有原生文件工具的路径都先经 `resolve_existing` / `resolve_new` 解析，
+  再使用返回的规范路径，而不是模型给出的原始字符串。
+- 逃逸防护依赖 `canonicalize`，它同时展开 `..` 与 symlink，因此指向工作区外的
+  链接在包含性检查之前就已还原为真实路径。
+- 新建路径逐级上溯到最近的已存在祖先再拼回，其中出现 `..` 直接拒绝。
+- 相对路径针对工作区根解析，不随进程 cwd 漂移。
+- 读、写、创建、删除是四项独立能力；`search_files` 递归时逐条目校验真实路径。
+
+Shell 与进程：工作目录固定在工作区内，`env_clear` 后按白名单重新注入
+（Secret 默认不进入子进程），输出按流截断，超时后按进程组回收整棵进程树。
+
+TUI 的工作区固定为启动目录。这是相对既有行为的**收紧**：原生工具不再能读写
+启动目录之外的路径。
+
+**残留限制（重要）**：`shell` 一旦获准执行，其内部命令不受工作区约束——
+`sh -c "cat /etc/passwd"` 仍然可行。固定 cwd 只影响相对路径解析，不构成沙箱。
+真正的进程隔离需要 OS 级手段（容器、seccomp、sandbox-exec），不在当前范围。
+因此对不可信内容的防线是 **Evaluation 平面直接关闭进程类工具**，而不是约束
+shell 的行为。这一点决定了：在引入 OS 级隔离之前，任何 TaskCase 都不应为
+Candidate 开放 `shell`。
+
+仍未关闭：`allow_network`、`allow_secrets` 与 `wall_clock_ms` 只是策略字段，
+尚无强制点；网络与 Secret 的实际隔离依赖 M8-05 的 Secret Broker。
 
 ## Mutator、Evaluator 与 Commit Gate 的权限
 
