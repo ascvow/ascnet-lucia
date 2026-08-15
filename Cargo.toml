@@ -8,6 +8,7 @@ members = [
     "crates/agent-core",
     "crates/agent-runtime",
     "crates/agent-session",
+    "crates/agent-evolution-protocol",
     "examples/basic-cli",
     "crates/agent-tui",
     "examples/plugins/echo-plugin",
@@ -42,6 +43,7 @@ default-members = [
     "crates/agent-core",
     "crates/agent-runtime",
     "crates/agent-session",
+    "crates/agent-evolution-protocol",
     "examples/basic-cli",
     "crates/agent-tui",
 ]
@@ -61,6 +63,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 futures-core = "0.3"
 futures-util = "0.3"
 libc = "0.2"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
