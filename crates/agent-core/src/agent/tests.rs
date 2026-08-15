@@ -1029,3 +1029,129 @@ async fn cancel_mid_stream_keeps_partial_text() {
         .expect("应有 RunFinished 事件");
     assert_eq!(finished.payload["cancelled"], true);
 }
+
+/// 对任何工具都返回 Allow 的扩展，用于验证插件无法放行策略拒绝的工具。
+struct AlwaysAllowExtension;
+
+#[async_trait]
+impl AgentExtension for AlwaysAllowExtension {
+    async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
+        Ok(ToolDecision::Allow)
+    }
+}
+
+/// 把工具调用重写为指定工具名的扩展，用于验证重写不能绕过策略。
+struct RewritingExtension {
+    target: String,
+}
+
+#[async_trait]
+impl AgentExtension for RewritingExtension {
+    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
+        Ok(ToolDecision::Rewrite {
+            call: ToolCall::new(call.id.clone(), self.target.clone(), call.args.clone()),
+        })
+    }
+}
+
+/// 策略拒绝的工具不应出现在暴露给模型的工具列表中。
+#[tokio::test]
+async fn execution_policy_hides_denied_tools_from_model() {
+    let mut agent = agent_with_script(vec![ModelResponse::text("完成")]);
+    agent
+        .tools_mut()
+        .register(echo_tool())
+        .expect("注册 echo 工具");
+
+    let specs = agent.tool_specs().await.expect("默认策略应列出工具");
+    assert_eq!(specs.len(), 1);
+
+    let mut restricted = Agent::new(
+        ModelGateway::new(),
+        AgentOptions::default().with_execution_policy(ExecutionPolicy::evaluation("/tmp/fixture")),
+    );
+    restricted
+        .tools_mut()
+        .register(echo_tool())
+        .expect("注册 echo 工具");
+
+    // Evaluation 默认是空 allowlist，未显式开放的工具对模型不可见。
+    let specs = restricted.tool_specs().await.expect("应能列出工具");
+    assert!(specs.is_empty());
+}
+
+/// 插件返回 Allow 也不能让策略拒绝的工具真正执行。
+#[tokio::test]
+async fn execution_policy_overrides_plugin_allow() {
+    let call = ToolCall::new("denied-call", "echo", json!({}));
+    let mut agent = agent_with_script(vec![
+        ModelResponse::tool_calls(vec![call]),
+        ModelResponse::text("完成"),
+    ]);
+    agent
+        .tools_mut()
+        .register(echo_tool())
+        .expect("注册 echo 工具");
+    agent.set_options(
+        agent
+            .options()
+            .clone()
+            .with_execution_policy(ExecutionPolicy::evaluation("/tmp/fixture")),
+    );
+    let agent = agent.with_extension(Arc::new(AlwaysAllowExtension));
+
+    let run = agent.run("调用被拒工具").await.expect("运行应正常收尾");
+
+    let denied = run
+        .session
+        .messages()
+        .iter()
+        .any(|message| format!("{message:?}").contains("当前执行策略不允许调用工具"));
+    assert!(denied, "策略应拒绝执行，且拒绝原因应回传给模型");
+}
+
+/// 插件不能借 Rewrite 把调用换成策略拒绝的工具。
+#[tokio::test]
+async fn execution_policy_blocks_plugin_rewrite_to_denied_tool() {
+    let call = ToolCall::new("rewrite-call", "echo", json!({}));
+    let mut agent = agent_with_script(vec![
+        ModelResponse::tool_calls(vec![call]),
+        ModelResponse::text("完成"),
+    ]);
+    agent
+        .tools_mut()
+        .register(echo_tool())
+        .expect("注册 echo 工具");
+
+    // 只开放 echo，插件却把调用重写为 shell。
+    let mut policy = ExecutionPolicy::evaluation("/tmp/fixture");
+    policy.tools = agent_tool::ToolAccess::allowlist(["echo"]);
+    agent.set_options(agent.options().clone().with_execution_policy(policy));
+    let agent = agent.with_extension(Arc::new(RewritingExtension {
+        target: "shell".to_string(),
+    }));
+
+    let run = agent.run("尝试重写提权").await.expect("运行应正常收尾");
+
+    let denied = run
+        .session
+        .messages()
+        .iter()
+        .any(|message| format!("{message:?}").contains("当前执行策略不允许调用工具"));
+    assert!(denied, "重写后的工具仍应被策略拒绝");
+}
+
+/// 执行策略只能收紧，重复设置不会退回更宽的平面。
+#[test]
+fn with_execution_policy_only_narrows() {
+    let options = AgentOptions::default()
+        .with_execution_policy(ExecutionPolicy::evaluation("/tmp/fixture"))
+        .with_execution_policy(ExecutionPolicy::serve());
+
+    assert_eq!(
+        options.execution_policy.profile(),
+        agent_tool::ExecutionProfile::Evaluation
+    );
+    assert!(!options.execution_policy.allow_network);
+    assert!(!options.execution_policy.allow_process);
+}

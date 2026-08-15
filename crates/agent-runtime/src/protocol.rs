@@ -5,6 +5,7 @@ use crate::{
     RuntimePrincipal, RuntimeResult,
 };
 use agent_core::{AgentEvent, AgentRun, EventSink, TokenUsage};
+use agent_tool::ResourceLimits;
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,29 @@ impl Default for RuntimeLimits {
 }
 
 impl RuntimeLimits {
+    /// 按执行策略的资源上限收紧运行时限额。
+    ///
+    /// 逐维度取较小值，策略未设该维度上限时保持原值，因此结果不会放宽任何一项。
+    /// `max_children_per_agent` 与 `max_concurrent_agents` 至少保留 1，以维持
+    /// [`RuntimeLimits::validate`] 要求的正数不变量；真正阻断派生依靠 `max_depth`。
+    pub fn clamped_by(&self, limits: &ResourceLimits) -> Self {
+        Self {
+            max_depth: limits
+                .max_depth
+                .map_or(self.max_depth, |limit| self.max_depth.min(limit)),
+            max_children_per_agent: limits
+                .max_children_per_agent
+                .map_or(self.max_children_per_agent, |limit| {
+                    self.max_children_per_agent.min(limit).max(1)
+                }),
+            max_concurrent_agents: limits
+                .max_concurrent_agents
+                .map_or(self.max_concurrent_agents, |limit| {
+                    self.max_concurrent_agents.min(limit).max(1)
+                }),
+        }
+    }
+
     /// 校验不能为零的运行时限额。
     pub fn validate(&self) -> RuntimeResult<()> {
         if self.max_children_per_agent == 0 {
