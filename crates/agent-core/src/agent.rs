@@ -19,7 +19,9 @@ use crate::{
     state::{AgentPhase, AgentState, AgentToolCallState, AgentToolCallStatus},
     ToolDecision,
 };
-use agent_tool::{ToolCall, ToolOutputDelta, ToolOutputSink, ToolRegistry, ToolResult, ToolSpec};
+use agent_tool::{
+    ExecutionPolicy, ToolCall, ToolOutputDelta, ToolOutputSink, ToolRegistry, ToolResult, ToolSpec,
+};
 use anyhow::{anyhow, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -85,6 +87,12 @@ pub struct AgentOptions {
     /// Provider-specific request options.
     /// 服务商专属请求选项。
     pub provider_options: Value,
+
+    /// 当前运行所处信任平面的安全策略。
+    ///
+    /// 默认为 [`ExecutionPolicy::serve`]。只应通过
+    /// [`AgentOptions::with_execution_policy`] 设置，该方法保证策略只能收紧。
+    pub execution_policy: ExecutionPolicy,
 }
 
 impl Default for AgentOptions {
@@ -100,11 +108,22 @@ impl Default for AgentOptions {
             temperature: None,
             reasoning: ReasoningLevel::Off,
             provider_options: Value::Object(Default::default()),
+            execution_policy: ExecutionPolicy::serve(),
         }
     }
 }
 
 impl AgentOptions {
+    /// 以 builder 风格收紧执行策略。
+    ///
+    /// 该方法应用 [`ExecutionPolicy::restrict`] 而不是直接覆盖，因此重复调用只会
+    /// 让策略越来越严格。默认策略为最宽的 `serve`，首次传入 `evaluation` 或
+    /// `mutation` 即可得到对应平面的完整限制，之后无法再退回 `serve`。
+    pub fn with_execution_policy(mut self, policy: ExecutionPolicy) -> Self {
+        self.execution_policy = self.execution_policy.restrict(&policy);
+        self
+    }
+
     /// Set provider name in a builder style.
     /// 以 builder 风格设置服务商名称。
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {

@@ -467,6 +467,10 @@ impl ToolRegistry {
 #[cfg(feature = "builtins")]
 pub mod builtins;
 
+pub mod policy;
+
+pub use policy::{ExecutionPolicy, ExecutionProfile, FilesystemScope, ResourceLimits, ToolAccess};
+
 /// Validate a provider-portable tool name.
 /// 校验跨服务商可移植的工具名称。
 ///

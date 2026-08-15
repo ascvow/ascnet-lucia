@@ -134,7 +134,8 @@ impl Agent {
 
         let mut step = 0;
         let mut steps_since_user_input = 0;
-        while self.options.max_steps == 0 || steps_since_user_input < self.options.max_steps {
+        let max_steps = self.effective_max_steps();
+        while max_steps == 0 || steps_since_user_input < max_steps {
             self.update_state(|state| {
                 state.phase = AgentPhase::Preparing;
                 state.step = step;
@@ -175,7 +176,11 @@ impl Agent {
                 messages: crate::model::transform::transform_messages(&loaded_context.messages),
                 tools,
                 tool_choice: self.options.tool_choice.clone(),
-                max_tokens: self.options.max_tokens,
+                max_tokens: self
+                    .options
+                    .execution_policy
+                    .limits
+                    .clamp_tokens(self.options.max_tokens),
                 temperature: self.options.temperature,
                 reasoning: self.options.reasoning,
                 provider_options: self.options.provider_options.clone(),
@@ -512,6 +517,38 @@ impl Agent {
         })
     }
 
+    /// 当执行策略拒绝该工具时，生成阻止结果并走完常规收尾流程。
+    ///
+    /// 返回 `Ok(None)` 表示策略放行。阻止原因只包含工具名，不透露策略细节，
+    /// 避免模型据此推断可用的绕过路径。
+    async fn reject_if_policy_denies(&self, call: &ToolCall) -> Result<Option<ToolResult>> {
+        if self.options.execution_policy.permits_tool(&call.name) {
+            return Ok(None);
+        }
+
+        let result = ToolResult::error(
+            call.id.clone(),
+            call.name.clone(),
+            format!("当前执行策略不允许调用工具：{}", call.name),
+        );
+        self.extension.after_tool(&result).await?;
+        self.finish_tool_state(&result);
+        Ok(Some(result))
+    }
+
+    /// 返回同时满足调用方配置与执行策略的实际步数上限。
+    ///
+    /// `0` 表示不限制。当调用方未设上限而策略设了上限时，采用策略上限，
+    /// 避免"不配置即无限制"绕过 Profile。
+    fn effective_max_steps(&self) -> usize {
+        let configured = self.options.max_steps;
+        match self.options.execution_policy.limits.max_steps {
+            Some(limit) if configured == 0 => limit,
+            Some(limit) => configured.min(limit),
+            None => configured,
+        }
+    }
+
     async fn execute_tool_with_hooks(
         &self,
         run_id: &str,
@@ -519,6 +556,13 @@ impl Agent {
         step: usize,
     ) -> Result<ToolResult> {
         let original_call = call.clone();
+
+        // 第一道策略门禁：在任何插件钩子之前拒绝策略不允许的工具，
+        // 避免插件通过 `before_tool` 观察到本不该暴露的调用。
+        if let Some(result) = self.reject_if_policy_denies(&call).await? {
+            return Ok(result);
+        }
+
         let decision = loop {
             if self.control().cancel_requested() {
                 break ToolDecision::CancelRun {
@@ -547,6 +591,12 @@ impl Agent {
                 return Ok(result);
             }
         };
+
+        // 第二道策略门禁：插件可以重写工具调用，但不能借重写换成策略拒绝的工具。
+        // 与 `RestrictedExtension` 对 allowlist 的处理保持一致。
+        if let Some(result) = self.reject_if_policy_denies(&call).await? {
+            return Ok(result);
+        }
 
         self.update_state(|state| {
             if let Some(tool) = state
@@ -720,6 +770,11 @@ impl Agent {
     pub async fn tool_specs(&self) -> Result<Vec<ToolSpec>> {
         let mut specs = self.tools.specs();
         specs.extend(self.extension.list_tools().await?);
+
+        // 执行策略在此统一过滤原生工具与插件工具：模型看不到策略拒绝的工具。
+        // 这不是唯一防线，`execute_tool_with_hooks` 仍会在调用前重新校验。
+        let policy = &self.options.execution_policy;
+        specs.retain(|spec| policy.permits_tool(&spec.name));
 
         let mut names = HashSet::new();
         for spec in &specs {

@@ -91,6 +91,24 @@ Trusted Evaluation 平面  判定候选优劣；独占隐藏数据集、Verifier
 - Host 必须 fail-closed：策略组件缺失或不可用时拒绝执行，而非放行。
 - 上述缺口由 M0-03（Execution Profile）与 M0-04（原生文件与进程工具收紧）关闭。在两者完成前，不得开启任何自动 Promote。
 
+### M0-03 落点
+
+`ExecutionPolicy` 定义在 `agent-tool`（依赖叶子），因此 `agent-core`、`agent-runtime` 和
+`agent-plugin-host` 共用同一份定义，无需反向依赖。强制点在 `agent-core`：
+
+- `Agent::tool_specs` 过滤策略拒绝的工具，模型看不到它们。
+- `Agent::execute_tool_with_hooks` 在插件钩子**之前**和**重写之后**各校验一次，
+  因此插件既不能放行被拒工具，也不能借 `Rewrite` 换成被拒工具。
+- `RuntimeLimits::clamped_by` 按策略收紧派生深度、子 Agent 数与并发数。
+
+这三处都位于可信 Rust 代码内，WASM 插件经 JSON ABI 通信，不接触 `ExecutionPolicy`
+任何类型，因此无法提升自身权限。`AgentOptions::with_execution_policy` 应用
+`restrict` 而非覆盖，重复调用只会越来越严格。
+
+尚未关闭的部分：`FilesystemScope::Root` 目前只是**声明**，真正的 canonicalize、
+`..` 逃逸拒绝与 symlink 检查属于 M0-04；`allow_network`、`allow_secrets` 与
+`wall_clock_ms` 同样只是策略字段，尚无强制点。
+
 ## Mutator、Evaluator 与 Commit Gate 的权限
 
 | 能力 | Mutator | Evaluator | Commit Gate |

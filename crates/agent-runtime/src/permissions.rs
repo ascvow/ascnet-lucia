@@ -10,50 +10,13 @@ use anyhow::Result as AnyResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
 /// 工具访问范围。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", content = "tools", rename_all = "snake_case")]
-pub enum ToolAccess {
-    /// 继承父节点当前允许的全部工具，不代表绕过父节点限制。
-    #[default]
-    All,
-    /// 只允许集合中列出的工具。
-    Allowlist(BTreeSet<String>),
-}
-
-impl ToolAccess {
-    /// 创建一个工具 allowlist。
-    pub fn allowlist<I, S>(names: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self::Allowlist(names.into_iter().map(Into::into).collect())
-    }
-
-    /// 判断当前范围是否允许指定工具。
-    pub fn permits(&self, name: &str) -> bool {
-        match self {
-            Self::All => true,
-            Self::Allowlist(names) => names.contains(name),
-        }
-    }
-
-    /// 在当前范围内应用下一层限制。
-    ///
-    /// 返回值只可能保持或收缩当前权限，子节点请求 `All` 也不会恢复父节点已移除的工具。
-    pub fn restrict(&self, requested: &Self) -> Self {
-        match (self, requested) {
-            (Self::All, next) => next.clone(),
-            (current @ Self::Allowlist(_), Self::All) => current.clone(),
-            (Self::Allowlist(current), Self::Allowlist(requested)) => {
-                Self::Allowlist(current.intersection(requested).cloned().collect())
-            }
-        }
-    }
-}
+///
+/// 定义已上移到 `agent-tool`，使派生 Agent 的 allowlist 与 Execution Profile 的
+/// 工具门禁共用同一套收缩语义。此处重导出以保持既有调用路径不变。
+pub use agent_tool::ToolAccess;
 
 /// Agent 可继承和收缩的权限集合。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +99,40 @@ impl AgentOptionsPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RuntimeLimits;
+    use agent_tool::ExecutionPolicy;
+
+    /// 执行策略应收紧 Runtime 限额，且不会放宽默认值。
+    #[test]
+    fn runtime_limits_are_clamped_by_execution_policy() {
+        let defaults = RuntimeLimits::default();
+        let evaluation = ExecutionPolicy::evaluation("/tmp/fixture");
+        let clamped = defaults.clamped_by(&evaluation.limits);
+
+        assert_eq!(clamped.max_depth, 2);
+        assert_eq!(clamped.max_children_per_agent, 4);
+        assert_eq!(clamped.max_concurrent_agents, 2);
+        clamped.validate().expect("收紧后的限额仍应合法");
+    }
+
+    /// Mutation 策略应完全阻断派生，同时保持正数不变量。
+    #[test]
+    fn mutation_policy_blocks_derivation_but_stays_valid() {
+        let clamped = RuntimeLimits::default().clamped_by(&ExecutionPolicy::mutation().limits);
+
+        assert_eq!(clamped.max_depth, 0);
+        assert_eq!(clamped.max_children_per_agent, 1);
+        clamped.validate().expect("限额必须通过校验");
+    }
+
+    /// 策略未声明某维度上限时保持 Runtime 原值。
+    #[test]
+    fn serve_policy_leaves_runtime_limits_untouched() {
+        let defaults = RuntimeLimits::default();
+        let clamped = defaults.clamped_by(&ExecutionPolicy::serve().limits);
+
+        assert_eq!(clamped, defaults);
+    }
 
     /// 派生配置应能显式关闭基础 Agent 默认启用的流式模式。
     #[test]
