@@ -29,6 +29,7 @@ export default defineConfig({
           { text: "插件开发", link: "/development/plugin" },
           { text: "二次开发", link: "/development/custom" },
           { text: "离线检查", link: "/development/checks" },
+          { text: "ADR-0001 信任边界", link: "/development/adr/0001-trust-boundary" },
         ],
       },
       {
@@ -60,6 +61,7 @@ export default defineConfig({
             { text: "插件开发", link: "/development/plugin" },
             { text: "二次开发", link: "/development/custom" },
             { text: "离线检查", link: "/development/checks" },
+            { text: "ADR-0001 信任边界", link: "/development/adr/0001-trust-boundary" },
           ],
         },
       ],

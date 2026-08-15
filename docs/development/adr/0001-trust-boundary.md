@@ -1,0 +1,162 @@
+# ADR-0001 自进化信任边界
+
+- 状态：已接受
+- 日期：2026-08-15
+- 背景：受控 Prompt 自进化 MVP（M0-02）
+
+本 ADR 定义 Lucia 引入自进化能力后的信任边界：哪些组件不可被自动变异、哪些可以在门禁下变异、变异器与评测器各自能触碰什么。后续所有进化相关改动都以本文为准。
+
+## 决策摘要
+
+1. 系统划分为 Serve、Evolution、Trusted Evaluation 三个平面，Evolution 平面被视为**不可信输入源**。
+2. Mutator 一律不得修改安全策略、评测实现、数据集、发布控制器和目标函数。
+3. Candidate 一律不得读取 Hidden Dataset 与 Hidden Verifier。
+4. 当前正在运行的 Genome 不允许热变更；新 Genome 只在下一次运行生效。
+5. 自动 Promote 只在本地显式开启时允许，生产环境默认只能 Recommend。
+
+## 三个平面
+
+```text
+Serve 平面            正常为用户执行任务；唯一面向真实用户和真实副作用的平面
+Evolution 平面        生成候选；输入是脱敏证据，输出只有数据制品
+Trusted Evaluation 平面  判定候选优劣；独占隐藏数据集、Verifier 和 Commit Policy
+```
+
+三者的隔离规则：
+
+- Evolution 平面**不能**链接或读取 Trusted Evaluation 的内部实现，只能通过进程边界请求评测并接收报告。
+- Trusted Evaluation 平面**不能**被候选内容影响，候选产出的文本一律视为不可信数据，不得当作指令。
+- Serve 平面**不能**加载 Mutator。TUI 默认不包含变异能力。
+
+对应到计划中的产物：`lucia-evolve` 属于 Evolution 平面，`lucia-eval` 属于 Trusted Evaluation 平面，两者以进程接口通信。
+
+## 组件分类
+
+分类是本 ADR 的核心约束。任何新增组件都必须落入其中一类。
+
+### Trusted Immutable
+
+自动变异流程绝不能修改，只能由人类通过常规评审改动：
+
+- `agent-core`：ReAct 循环、工具调用、事件派发。
+- `agent-tool`：`ToolSpec`、`ToolCall`、`ToolDecision` 契约与原生工具实现。
+- `agent-runtime`：`ToolAccess` / `AgentPermissions` 的单向收缩语义。
+- `agent-plugin-host`：ABI、生命周期、能力 owner 路由、UI 契约校验。
+- Execution Profile 的定义与强制点。
+- Verifier 实现、Commit Policy、Release Controller、Audit 写入路径。
+- Hidden Dataset 及其加载器。
+- 目标函数与评分口径。
+
+### Mutable but Gated
+
+允许自动生成候选，但必须经过 Trusted Evaluation 与 Commit Gate 才能成为 stable：
+
+| 表面 | 引入里程碑 | 说明 |
+| --- | --- | --- |
+| Task Strategy Prompt | M5 | MVP 阶段**唯一**开放的表面 |
+| Context Policy 参数 | M6 | 只含数值与枚举，不含插件源码 |
+| Skill 内容与选择规则 | M7 | 新 Skill 默认进入 Quarantine |
+
+未列入本表的任何内容都不是合法变异表面。Candidate Builder 必须在构建期拒绝越界的 Patch，而不是等到评测阶段才发现。
+
+### Ordinary Mutable
+
+由人类正常开发流程修改，不参与自动进化：文档、TUI 布局、示例插件、构建脚本。
+
+### Runtime Data
+
+运行期产生、不属于代码的制品：Episode、Event Stream、CAS Artifact、Evaluation Report、Genome Revision、Release Record、Audit Chain。这些数据**只追加不覆盖**；Archive 中的历史记录不得被后续流程改写。
+
+## Permission 插件与 Host Enforcement
+
+### 现状（截至本 ADR）
+
+必须如实记录：**当前授权完全由插件承担，Host 没有独立兜底。**
+
+`CompositePluginHost::before_tool`（`crates/agent-plugin-host/src/lib.rs:431`）的实际行为是：
+
+1. 依次调用非 policy owner 插件的 `before_tool`，任一返回 `Block` / `CancelRun` 即短路。
+2. 最后调用 `TOOL_POLICY_CAPABILITY` 的 owner 插件做最终裁决。
+3. 若该 owner 已声明但尚未 Ready，则阻止本轮工具执行（fail-closed，符合预期）。
+4. 若**没有任何插件**声明该能力，`policy_owner` 为 `None`，流程直接落到 `Ok(ToolDecision::Allow)`。
+
+因此移除 permission 插件等于移除全部工具授权。原生文件工具（`read_file`、`write_file`）当前不接收 workspace root，不做 canonicalize，不拒绝 `..` 逃逸；`ShellTool` 以 `sh -c` 执行，`working_directory` 由模型参数直接决定，且完整继承宿主环境变量。
+
+唯一已经存在的可信强制点是 `agent-runtime` 的 `RestrictedExtension`（`crates/agent-runtime/src/permissions.rs:251`）。它对派生 Agent 同时过滤 `list_tools`、拦截 `call_tool`，并且**重新校验插件 `Rewrite` 后的工具名**，因此插件无法借 `Rewrite` 提权。但它只作用于派生 Agent 的 allowlist，不构成根 Agent 的文件系统或进程边界。
+
+### 决策
+
+- 授权判定**必须**下沉为 Host 责任。插件可以收紧结果、提供交互式审批 UI，但不能成为唯一的强制点。
+- 权限只能单向收缩。任何组件都不得把 `Evaluation` 提升为 `Serve`，也不得恢复上层已移除的工具。
+- Host 必须 fail-closed：策略组件缺失或不可用时拒绝执行，而非放行。
+- 上述缺口由 M0-03（Execution Profile）与 M0-04（原生文件与进程工具收紧）关闭。在两者完成前，不得开启任何自动 Promote。
+
+## Mutator、Evaluator 与 Commit Gate 的权限
+
+| 能力 | Mutator | Evaluator | Commit Gate |
+| --- | --- | --- | --- |
+| 读脱敏 Episode | 允许 | 允许 | 否 |
+| 读原始 Session / 用户工作区 | 否 | 否 | 否 |
+| 读 Hidden Dataset | 否 | 允许 | 否 |
+| 读 Hidden Verifier 实现 | 否 | 允许 | 否 |
+| 写 Candidate Artifact Store | 允许 | 否 | 否 |
+| 写 Dataset / Verifier | 否 | 否 | 否 |
+| 修改 Commit Policy | 否 | 否 | 否 |
+| 调用 Release Controller | 否 | 否 | 允许 |
+| 写 Audit | 否 | 追加 | 追加 |
+| 真实网络与生产 Secret | 否 | 否 | 否 |
+
+明确禁止 Mutator 修改：安全策略、评测实现、数据集、发布流程、目标函数。这五项构成"不可自我优化"的核心——允许其中任意一项被变异，等同于允许系统重写自己的成功标准。
+
+Commit Policy 本身是版本化只读制品。修改它属于人类评审动作，且 Policy Version 必须写入 Evaluation Report 与 Audit。
+
+## Candidate 可访问的数据与工具
+
+Candidate 在 Evaluation Profile 下运行，默认拒绝：真实网络、真实 Secret、Shell 与 `process_exec`、workspace 之外的文件、Dataset 目录。
+
+允许的只有：TaskCase 显式声明的输入、Fixture Workspace 内的文件、Evaluation Policy 显式开放的工具、Mock 模型。
+
+两条附加规则：
+
+- Candidate 的输出（包括 Prompt 文本、工具参数、最终回答）在 Verifier 眼中永远是**数据**。Verifier 不得执行、不得解释其中的指令。
+- Candidate 不得从评测错误信息中反推隐藏答案。Verifier 返回给 Candidate 侧的失败信息必须是不含期望值的粗粒度分类。
+
+## Hidden Dataset 规则
+
+- 存储在普通 Lucia TUI 二进制**不可达**的位置，不编译进 TUI，不随仓库分发。
+- 只由 `lucia-eval` 进程加载，且加载路径与普通 Agent 的文件工具完全隔离。
+- Held-out 集由维护者单独维护，或以独立评测包注入。
+- 命中 Hidden Dataset 的读取尝试记为 Safety Violation，直接 Reject，并写入 Audit。
+- Hidden 结果只以聚合指标形式出现在 Evaluation Report，不回传具体样例。
+
+## Promote 的两种模式
+
+| | 本地 | 生产 |
+| --- | --- | --- |
+| 默认模式 | `RecommendOnly` | `RecommendOnly` |
+| 可否自动 Promote | 显式开启 `AutoPromoteLocal` 后可以 | 否，必须人工批准 |
+| Dirty 构建 | 允许运行，不得自动 Promote | 禁止 |
+| 样本不足 | 返回 `Inconclusive` | 返回 `RequireApproval` |
+
+生产环境的 Canary 属于 M8 范围，在 Gate C 全部满足前不得启用。
+
+## 运行中的 Genome 不可热变更
+
+一次运行在启动时绑定 `GenomeRevisionId` 并在整个生命周期内固定。理由有三：
+
+1. 运行中替换 Prompt 或 Policy 会使 Episode 失去归因价值——无法判断某个失败该归给哪一版。
+2. 热变更是一条提权路径：允许运行中改 Genome，等于允许绕过 Commit Gate 生效。
+3. Replay 要求确定性。Genome 变动会让同一 Episode 无法复现。
+
+Promote 只切换 `stable` 别名，对已在运行的会话无效，新 Genome 从下一次运行开始生效。子 Agent 可以使用派生 Genome，但必须记录 Parent Genome，且派生只能收缩权限。
+
+## 后果
+
+- `agent-core` 不得依赖 `agent-evolution`，否则 Serve 平面会被迫链接变异逻辑。
+- `lucia-eval` 与 `lucia-evolve` 必须是两个二进制。合并它们会使隐藏数据集进入候选可达范围。
+- 在 M0-03 与 M0-04 完成前，Evaluation Profile 的隔离承诺尚无强制手段，此期间只允许人工审阅候选。
+
+## 参考
+
+- [架构边界](/guide/architecture)
+- [离线检查](/development/checks)
