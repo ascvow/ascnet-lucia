@@ -175,6 +175,63 @@ Candidate 在 Evaluation Profile 下运行，默认拒绝：真实网络、真�
 - 命中 Hidden Dataset 的读取尝试记为 Safety Violation，直接 Reject，并写入 Audit。
 - Hidden 结果只以聚合指标形式出现在 Evaluation Report，不回传具体样例。
 
+## Evolution 数据处理策略
+
+由 `agent-evolution-protocol` 承载。该 crate 不依赖 `agent-core`，`agent-core`
+也不依赖它，Serve 平面不会因为引入进化能力而链接变异逻辑。
+
+**默认不可用**是贯穿全部默认值的原则：`DataClass` 默认 `Secret`，
+`EvolutionEligibility` 默认 `NotEligible`，`RawToolResultPolicy` 默认 `Discard`。
+新增字段或新增来源时的安全默认值总是最严格的那个，因此生产 Session **不会**
+因为忘记标记就自动成为变异输入。
+
+### 哪些 Session 可以进入 Episode Store
+
+四档资格：
+
+| 资格 | 含义 |
+| --- | --- |
+| `NotEligible` | 只能本地调试，不进入任何进化流程 |
+| `EligibleAfterRedaction` | 脱敏完成前等同 `NotEligible` |
+| `EligibleForLocalEvolution` | 可用于本机进化，不得离开本机 |
+| `EligibleForSharedEvaluation` | 可用于共享评测，允许离开本机 |
+
+`Sensitive` 与 `Secret` 级数据即使脱敏也不得共享——脱敏可能失败，而凭据外泄不可逆。
+
+### 原始 ToolResult 与保留期
+
+`StoreRaw` 只对 `Public` 与 `Internal` 开放；`Sensitive` 与 `Secret` 至少经过脱敏。
+保留期随敏感度递减：`Public` 不限期，`Internal` 180 天，`Sensitive` 30 天，
+`Secret` 0 天（即不保留）。
+
+### Mutator 可读字段
+
+Mutator 只看得到"发生了什么形态的失败"，看不到具体内容：可读 `Outcome`、
+`FailureClass`、`ToolCallShape`、`PromptArtifactRef`、`RedactedToolResult`、
+`Timing`、`Usage`；不可读 `RawToolResult`、`RawModelResponse`、`UserContent`。
+这样它无法把用户数据或隐藏答案写进候选 Prompt。
+
+### 隐藏推理不持久化
+
+`HiddenReasoning` 既不可持久化也不可读。它不构成可验证证据，却显著扩大泄漏面。
+
+### 脱敏
+
+在**持久化之前**执行，因此原始凭据不会先落盘再被清理。规则按固定顺序应用，
+相同输入必然得到相同输出与相同命中集合，且对已脱敏文本幂等。覆盖 URL 凭据、
+`Authorization` 与 `Cookie` 头、键值对凭据、`Bearer` 令牌、服务商令牌字面量
+（`sk-`、`ghp_`、`AKIA`、`xoxb-`）、JWT 与私有路径。
+
+规则集带版本号，Episode 记录它所使用的版本。一处刻意的例外：`total_tokens`
+之类的键名同样含 "token"，但纯数字值会被保留，否则 Usage 证据会被误删。
+
+### 导出与删除
+
+导出走 `lucia episode export --redacted`（M2-08），只输出脱敏后内容且要求
+`permits_mutation_input()` 为真。删除按保留期执行：`RetentionPolicy::is_expired`
+判定过期后连同 CAS 制品一并移除。Archive 中的评测记录不受此影响——它们不含
+原始内容，只含引用与摘要。
+
 ## Promote 的两种模式
 
 | | 本地 | 生产 |
