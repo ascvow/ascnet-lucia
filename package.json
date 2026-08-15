@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "check": "bun run scripts/check-offline.ts",
     "build:all": "bun run build:tui:plugins && bun run build:plugin:all",
     "build:core": "cargo build -p agent-tool -p agent-core -p agent-session --release --target-dir target/core",
     "build:tui": "bun run build:tui:core && bun run build:tui:plugins",

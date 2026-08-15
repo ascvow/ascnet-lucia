@@ -267,7 +267,12 @@ async fn component_runs_dynamic_task_list() {
     )
     .await;
     assert_eq!(task_in(&cancelled, "obsolete")["status"], "cancelled");
-    let deleted = call_tool(&host, "task_update", json!({"id": "obsolete", "delete": true})).await;
+    let deleted = call_tool(
+        &host,
+        "task_update",
+        json!({"id": "obsolete", "delete": true}),
+    )
+    .await;
     assert!(task_in(&deleted, "obsolete").is_null());
 
     // 全部任务完成后，进度架应自动隐藏。

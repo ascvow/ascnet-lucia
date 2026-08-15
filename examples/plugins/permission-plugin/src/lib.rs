@@ -138,11 +138,9 @@ impl AgentPlugin for PermissionPlugin {
         match code.as_str() {
             "left" | "up" => {
                 self.selected = self.selected.checked_sub(1).unwrap_or(3);
-                return;
             }
             "right" | "down" | "tab" => {
                 self.selected = (self.selected + 1) % 4;
-                return;
             }
             "y" | "Y" => self.resolve_current(0),
             "s" | "S" => self.resolve_current(1),

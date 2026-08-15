@@ -28,6 +28,7 @@ export default defineConfig({
         items: [
           { text: "插件开发", link: "/development/plugin" },
           { text: "二次开发", link: "/development/custom" },
+          { text: "离线检查", link: "/development/checks" },
         ],
       },
       {
@@ -58,6 +59,7 @@ export default defineConfig({
           items: [
             { text: "插件开发", link: "/development/plugin" },
             { text: "二次开发", link: "/development/custom" },
+            { text: "离线检查", link: "/development/checks" },
           ],
         },
       ],
