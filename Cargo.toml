@@ -9,6 +9,7 @@ members = [
     "crates/agent-runtime",
     "crates/agent-session",
     "crates/agent-evolution-protocol",
+    "crates/agent-evolution",
     "examples/basic-cli",
     "crates/agent-tui",
     "examples/plugins/echo-plugin",
@@ -44,6 +45,7 @@ default-members = [
     "crates/agent-runtime",
     "crates/agent-session",
     "crates/agent-evolution-protocol",
+    "crates/agent-evolution",
     "examples/basic-cli",
     "crates/agent-tui",
 ]
@@ -67,6 +69,7 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
 semver = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
