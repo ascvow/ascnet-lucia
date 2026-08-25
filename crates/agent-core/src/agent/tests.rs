@@ -394,6 +394,26 @@ fn agent_with_script(responses: Vec<ModelResponse>) -> Agent {
     )
 }
 
+/// Evidence Plane 提供的 Run ID 必须贯穿结果和全部事件，不能在 Core 内被替换。
+#[tokio::test]
+async fn caller_supplied_run_id_binds_result_and_events() {
+    let sink = Arc::new(InMemoryEventSink::new());
+    let agent = agent_with_script(vec![ModelResponse::text("完成")]).with_event_sink(sink.clone());
+    let run_id = "run_0123456789abcdef0123456789abcdef";
+
+    let run = agent
+        .run_session_with_id(Session::new(), run_id)
+        .await
+        .expect("指定运行标识应成功");
+
+    assert_eq!(run.run_id, run_id);
+    assert!(sink
+        .events()
+        .await
+        .iter()
+        .all(|event| event.run_id == run_id));
+}
+
 /// echo 工具，用于触发工具执行路径。
 fn echo_tool() -> JsonTool {
     JsonTool::new(

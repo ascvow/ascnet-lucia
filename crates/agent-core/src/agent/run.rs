@@ -104,6 +104,26 @@ impl Agent {
     /// 返回错误。成功、取消和失败都会更新 [`Agent::state`] 返回的最近运行快照。
     pub async fn run_session(&self, session: Session) -> Result<AgentRun> {
         let run_id = uuid::Uuid::new_v4().to_string();
+        self.run_session_with_id(session, run_id).await
+    }
+
+    /// 使用调用方提供的稳定 ID 运行已有会话。
+    ///
+    /// Evidence Plane 可在运行开始前生成强类型 Run ID，并用同一 ID 绑定 Genome、
+    /// Episode 和全部事件。普通调用方应继续使用 [`Agent::run_session`]。
+    ///
+    /// # Errors
+    ///
+    /// `run_id` 为空，或发生与 [`Agent::run_session`] 相同的运行错误时返回错误。
+    pub async fn run_session_with_id(
+        &self,
+        session: Session,
+        run_id: impl Into<String>,
+    ) -> Result<AgentRun> {
+        let run_id = run_id.into();
+        if run_id.is_empty() {
+            return Err(anyhow!("run id must not be empty"));
+        }
         self.begin_run(&run_id, &session)?;
 
         let result = self.run_session_inner(run_id, session).await;

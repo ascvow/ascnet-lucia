@@ -1,0 +1,16 @@
+//! Lucia Evolution 证据平面的存储、记录与确定性协议回放。
+//!
+//! 本 crate 可以由应用层选择性装配。`agent-core` 不依赖本 crate，因此未启用
+//! Evolution 时原有 Serve 路径不会改变，也不会链接候选生成或评测逻辑。
+
+#![deny(missing_docs)]
+
+mod artifact_store;
+mod episode_store;
+mod recorder;
+mod replay;
+
+pub use artifact_store::{ArtifactStore, ArtifactStoreError, FileArtifactStore};
+pub use episode_store::{EpisodeQuery, EpisodeStore, EpisodeStoreError, FileEpisodeStore};
+pub use recorder::{EpisodeRecorder, EpisodeRecorderConfig, EpisodeRecorderError};
+pub use replay::{ProtocolReplay, ProtocolReplayError, ReplayEventSink, ReplayReport};

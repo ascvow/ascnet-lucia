@@ -1,0 +1,61 @@
+# Evolution 可证据化运行
+
+Goal A 的证据链由 `agent-evolution-protocol` 与 `agent-evolution` 共同提供：前者定义
+稳定 Schema，后者实现本地 Artifact CAS、只追加 Episode Store、脱敏 Recorder 和
+Protocol Replay。Serve Core 不依赖 Evolution crate，未装配 Recorder 时原有运行方式
+保持不变。
+
+## 运行绑定
+
+每次需要形成证据的运行必须先创建 `EpisodeRecorderConfig`。配置会生成唯一 `RunId`，
+并要求调用方同时固定 `SessionId` 和 `GenomeRevisionId`：
+
+```rust
+use agent_core::{Agent, CompositeEventSink, Session};
+use agent_evolution::{EpisodeRecorder, EpisodeRecorderConfig};
+use agent_evolution_protocol::GenomeRevisionId;
+use std::sync::Arc;
+
+let config = EpisodeRecorderConfig::online(
+    "session-1",
+    GenomeRevisionId::new("grev_0123456789abcdef0123456789abcdef")?,
+);
+let run_id = config.run_id.clone();
+let recorder = Arc::new(EpisodeRecorder::new(config, artifacts, episodes));
+let mut sinks = CompositeEventSink::new();
+sinks.push(recorder);
+let agent = agent.with_event_sink(Arc::new(sinks));
+
+let run = agent
+    .run_session_with_id(Session::new(), run_id.to_string())
+    .await?;
+# Ok::<(), anyhow::Error>(())
+```
+
+`EpisodeRecorder` 会拒绝与预绑定 `RunId` 不同的首事件，也会拒绝把多个运行写进同一
+Episode。`run_session_with_id` 只是一项 Core 通用机制，不解析 Genome 或 Episode。
+
+## 数据处理与终态
+
+Recorder 在 `RunFinished` 时自动收敛：事件流先写入 SHA-256 CAS，随后只追加 Episode
+Header。默认 `EpisodeDataPolicy` 为 `NotEligible` 且丢弃工具结果正文；模型隐藏思考
+增量永不持久化。其余 JSON 字符串经过确定性脱敏，Episode 记录实际规则版本。
+
+在线运行没有可信 Verifier 时，正常完成默认记为 `Unverifiable`，不能推断为任务成功。
+取消记为 `Cancelled`。模型服务、工具环境或存储导致运行未产生 `RunFinished` 时，应用层
+应调用 `recorder.finish(Outcome::InfrastructureFailure)`，避免把基础设施问题统计为候选
+能力失败。
+
+## 存储不变量
+
+- `FileArtifactStore` 按 SHA-256 内容寻址，读取时重新验证摘要，提交不覆盖已有内容。
+- `FileEpisodeStore` 使用 `create_new` 语义，只追加而不更新历史 Episode。
+- Episode 查询支持按 `Outcome` 和 `session_id` 过滤。
+- 原始工具正文只有在数据分级允许且策略显式设为 `StoreRaw` 时才会进入事件制品。
+
+## Protocol Replay
+
+`ProtocolReplay` 读取 Episode 引用的 NDJSON 制品，先验证摘要、长度、事件数、Run ID、
+事件 ID 唯一性、时间与 step 单调性，以及 `run_started` / `run_finished` 终态顺序，再将
+事件逐条交给 `ReplayEventSink`。该过程不调用真实模型或工具，因此可用于确定性状态机、
+插件 Hook 与持久化回归。
