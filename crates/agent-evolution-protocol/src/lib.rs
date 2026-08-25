@@ -9,6 +9,7 @@
 #![deny(missing_docs)]
 
 pub mod data_class;
+pub mod episode;
 pub mod genome;
 pub mod ids;
 pub mod redaction;
@@ -22,6 +23,10 @@ pub use genome::{
 pub use data_class::{
     DataClass, EpisodeDataPolicy, EpisodeFieldClass, EvolutionEligibility, RawToolResultPolicy,
     RetentionPolicy,
+};
+pub use episode::{
+    ArtifactRef, Episode, EpisodeEvent, FailureClassification, FailureKind, InvalidEpisode,
+    Outcome, ReplayabilityGrade, TaskDescriptor, UsageSummary, EPISODE_SCHEMA_VERSION,
 };
 pub use ids::{
     id_json_schema, ArtifactDigest, AuditRecordId, DatasetVersionId, EpisodeId, EvaluationReportId,
