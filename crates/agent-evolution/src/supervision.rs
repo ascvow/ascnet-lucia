@@ -151,6 +151,7 @@ impl RunSupervisor {
                 outcome: Outcome::Cancelled,
                 source: OutcomeSource::Runtime,
                 reason: "用户或控制器取消".into(),
+                feedback: None,
             });
         }
 
@@ -200,6 +201,7 @@ impl RunSupervisor {
             outcome,
             source: OutcomeSource::DeterministicRule,
             reason,
+            feedback: None,
         })
     }
 

@@ -292,6 +292,23 @@ pub enum OutcomeSource {
 }
 
 impl OutcomeSource {
+    /// 返回来源的显式可信优先级；数值越大，来源越可信。
+    ///
+    /// 不应直接依赖枚举声明顺序比较可信度，因为序列化协议的枚举顺序与门控语义是
+    /// 两个独立约束。
+    pub const fn trust_priority(self) -> u8 {
+        match self {
+            Self::TrustedVerifier => 7,
+            Self::DeterministicRule => 6,
+            Self::UserFeedback => 5,
+            Self::Runtime => 4,
+            Self::IndependentJudge => 3,
+            Self::ModelAssisted => 2,
+            Self::SelfAssessment => 1,
+            Self::Unknown => 0,
+        }
+    }
+
     /// 判断该来源是否满足 Promotion 所需的可信门槛。
     ///
     /// `ModelAssisted` 与 `SelfAssessment` 单独存在时永远不足以触发 Promotion。
@@ -321,6 +338,12 @@ pub struct OutcomeRevision {
     pub source: OutcomeSource,
     /// 修订理由，供人工与审计使用。
     pub reason: String,
+    /// 触发本次修订的延迟反馈；非反馈修订或旧记录为 `None`。
+    ///
+    /// 该字段以加法兼容方式保存反馈、运行绑定和脱敏证据引用，避免只在理由文本中留下
+    /// 无法机器校验的关联。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<FeedbackEvent>,
 }
 
 impl OutcomeRevision {
@@ -335,6 +358,30 @@ impl OutcomeRevision {
         ) && self.source == OutcomeSource::SelfAssessment
         {
             return Err(InvalidSupervision::SelfDeclaredSuccess);
+        }
+        if let Some(feedback) = &self.feedback {
+            feedback.validate()?;
+            if feedback.related_episode_id != self.episode_id {
+                return Err(InvalidSupervision::FeedbackEpisodeMismatch);
+            }
+            if feedback.source.outcome_source() != self.source {
+                return Err(InvalidSupervision::FeedbackSourceMismatch);
+            }
+            let outcome_matches = matches!(
+                (&feedback.signal, &self.outcome),
+                (
+                    FeedbackSignal::ConfirmedSuccess,
+                    crate::episode::Outcome::Success
+                ) | (
+                    FeedbackSignal::ConfirmedFailure
+                        | FeedbackSignal::PartialFailure
+                        | FeedbackSignal::ConstraintViolation,
+                    crate::episode::Outcome::TaskFailure
+                )
+            );
+            if !outcome_matches {
+                return Err(InvalidSupervision::FeedbackOutcomeMismatch);
+            }
         }
         Ok(())
     }
@@ -352,6 +399,21 @@ pub enum FeedbackSource {
     Canary,
     /// 其他来源。
     Other,
+}
+
+impl FeedbackSource {
+    /// 映射为 Outcome 修订使用的可信来源。
+    ///
+    /// `Canary` 只代表受控运行观察，因此仍按 Runtime 证据处理；未知来源不会被提升为
+    /// 用户反馈或确定性规则。
+    pub const fn outcome_source(self) -> OutcomeSource {
+        match self {
+            Self::User => OutcomeSource::UserFeedback,
+            Self::DeterministicCheck => OutcomeSource::DeterministicRule,
+            Self::Canary => OutcomeSource::Runtime,
+            Self::Other => OutcomeSource::Unknown,
+        }
+    }
 }
 
 /// 延迟反馈的内容。
@@ -390,6 +452,20 @@ pub struct FeedbackEvent {
     pub evidence: Option<crate::episode::ArtifactRef>,
 }
 
+impl FeedbackEvent {
+    /// 校验延迟反馈自身不依赖存储的结构不变量。
+    ///
+    /// # Errors
+    ///
+    /// `Note` 只包含空白字符时返回错误；Episode、Run 与证据制品是否存在由应用层校验。
+    pub fn validate(&self) -> Result<(), InvalidSupervision> {
+        if matches!(&self.signal, FeedbackSignal::Note(note) if note.trim().is_empty()) {
+            return Err(InvalidSupervision::EmptyFeedbackNote);
+        }
+        Ok(())
+    }
+}
+
 /// 监督记录的不变量校验错误。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidSupervision {
@@ -411,6 +487,18 @@ pub enum InvalidSupervision {
     /// Agent 自评不能独立判定任何成功终态。
     #[error("SelfAssessment 不能独立判定成功 Outcome")]
     SelfDeclaredSuccess,
+    /// 延迟反馈的 Note 不能为空。
+    #[error("FeedbackSignal::Note 不能为空")]
+    EmptyFeedbackNote,
+    /// Outcome 修订与反馈指向不同 Episode。
+    #[error("OutcomeRevision 与 FeedbackEvent 必须指向同一 Episode")]
+    FeedbackEpisodeMismatch,
+    /// Outcome 修订来源与延迟反馈来源不一致。
+    #[error("OutcomeRevision 的 source 与 FeedbackEvent 来源不一致")]
+    FeedbackSourceMismatch,
+    /// Outcome 修订终态与延迟反馈信号不一致。
+    #[error("OutcomeRevision 的 outcome 与 FeedbackEvent 信号不一致")]
+    FeedbackOutcomeMismatch,
 }
 
 /// 把 IncidentKind 映射到推荐的可信组件。
@@ -540,6 +628,7 @@ mod tests {
                 outcome,
                 source: OutcomeSource::SelfAssessment,
                 reason: "Agent 自报完成".into(),
+                feedback: None,
             };
             assert_eq!(
                 revision.validate().expect_err("自报成功应被拒绝"),
@@ -556,6 +645,51 @@ mod tests {
         assert!(!OutcomeSource::ModelAssisted.is_trusted_for_promotion());
         assert!(!OutcomeSource::SelfAssessment.is_trusted_for_promotion());
         assert!(!OutcomeSource::Runtime.is_trusted_for_promotion());
+    }
+
+    #[test]
+    fn feedback_validates_note_and_revision_binding() {
+        let episode_id = EpisodeId::generate();
+        let run_id = RunId::generate();
+        let mut feedback = FeedbackEvent {
+            feedback_id: FeedbackId::generate(),
+            source: FeedbackSource::User,
+            related_episode_id: episode_id.clone(),
+            related_run_id: run_id,
+            signal: FeedbackSignal::Note("约束没有满足".into()),
+            evidence: None,
+        };
+        feedback.validate().expect("非空 Note 应通过校验");
+
+        feedback.signal = FeedbackSignal::ConfirmedFailure;
+        let revision = OutcomeRevision {
+            revision_id: OutcomeRevisionId::generate(),
+            episode_id,
+            supersedes: None,
+            outcome: crate::episode::Outcome::TaskFailure,
+            source: OutcomeSource::UserFeedback,
+            reason: "用户延迟纠正确认任务失败".into(),
+            feedback: Some(feedback.clone()),
+        };
+        revision.validate().expect("反馈绑定应合法");
+
+        feedback.signal = FeedbackSignal::Note("  ".into());
+        assert_eq!(
+            feedback.validate().expect_err("空 Note 应被拒绝"),
+            InvalidSupervision::EmptyFeedbackNote
+        );
+    }
+
+    #[test]
+    fn outcome_revision_reads_legacy_record_without_feedback() {
+        let revision_id = OutcomeRevisionId::generate();
+        let episode_id = EpisodeId::generate();
+        let encoded = format!(
+            r#"{{"revision_id":"{revision_id}","episode_id":"{episode_id}","outcome":"unverifiable","source":"deterministic_rule","reason":"旧版记录"}}"#
+        );
+        let decoded: OutcomeRevision = serde_json::from_str(&encoded).expect("旧记录应可读取");
+        assert_eq!(decoded.feedback, None);
+        decoded.validate().expect("旧记录仍应合法");
     }
 
     #[test]

@@ -344,6 +344,7 @@ mod tests {
             outcome,
             source: OutcomeSource::DeterministicRule,
             reason: "测试修订".into(),
+            feedback: None,
         }
     }
 
@@ -387,6 +388,7 @@ mod tests {
             outcome: Outcome::Cancelled,
             source: OutcomeSource::DeterministicRule,
             reason: "重复标识测试".into(),
+            feedback: None,
         };
         assert!(matches!(
             store.append(&duplicate_id).await,

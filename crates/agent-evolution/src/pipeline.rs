@@ -104,6 +104,7 @@ where
                         .unwrap_or(agent_evolution_protocol::Outcome::Unverifiable),
                     source: agent_evolution_protocol::OutcomeSource::DeterministicRule,
                     reason: format!("聚合 {} 条失败归因后确认终态", records.len()),
+                    feedback: None,
                 };
                 self.revisions
                     .append(&new_revision)
@@ -216,6 +217,7 @@ mod tests {
             outcome: Outcome::Unverifiable,
             source: OutcomeSource::DeterministicRule,
             reason: "初始不可验证".into(),
+            feedback: None,
         };
         revisions
             .append(&first_revision)
@@ -242,6 +244,7 @@ mod tests {
             outcome: Outcome::TaskFailure,
             source: OutcomeSource::DeterministicRule,
             reason: "初始失败".into(),
+            feedback: None,
         };
         revisions
             .append(&second_revision)

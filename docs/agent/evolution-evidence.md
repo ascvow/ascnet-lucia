@@ -101,6 +101,24 @@ Header 的 `supervision` 字段中，进程重启后仍可从同一 Episode 找�
 - `FileEvolutionOutbox` 的 JSON 记录不可变；消费状态写入独立 `.consumed` 标记，不覆盖
   原始记录，并拒绝路径逃逸和符号链接制品。
 
+## 延迟反馈与 Outcome 修订
+
+`FeedbackProcessor` 是 Trusted Evaluation/Evidence Plane 的应用服务，不作为 Agent Tool 或
+普通插件服务暴露。调用方必须同时传入从 Host 身份或受信适配器得到的来源，处理器会拒绝
+`FeedbackEvent.source` 与可信调用上下文不一致的请求，避免 Candidate 通过 JSON 自报为
+`DeterministicCheck`。
+
+处理器先读取只追加 Episode Header，校验 `related_episode_id` 与 `related_run_id`，再验证可选
+脱敏证据确实存在于 Artifact CAS 且长度一致。Recorder 生成的初始 `OutcomeRevision` 位于
+Episode 的监督 CAS 中；处理器会把该制品恢复为本地修订历史首项，然后用 `supersedes` 追加
+反馈修订。Episode Header 永不覆盖，反馈修订以加法字段保存完整 `FeedbackEvent`，旧 JSON
+记录缺少该字段时仍按 `None` 读取。
+
+`Unverifiable` 可以被后续决定性反馈修订；已有明确终态只能由同等或更高可信来源覆盖。
+`Note`、未知来源、Run 绑定错误、缺失或篡改的 CAS 制品均不能改变 Outcome。相同反馈重复
+提交会返回已有修订，不会生成重复历史。延迟反馈本身不携带 Episode 内 Event ID，因此原因
+未知的单次纠正不会伪造 Incident 或直接进入 Evolution Outbox。
+
 ## Protocol Replay
 
 `ProtocolReplay` 读取 Episode 引用的 NDJSON 制品，先验证摘要、长度、事件数、Run ID、
