@@ -1,0 +1,20 @@
+[package]
+name = "agent-evaluation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Lucia 受信离线评测、Fixture 与 Dataset 隔离运行时。"
+
+[dependencies]
+agent-core = { path = "../agent-core", version = "0.1.0", default-features = false }
+agent-evolution-protocol = { path = "../agent-evolution-protocol", version = "0.1.0" }
+agent-tool = { path = "../agent-tool", version = "0.1.0", default-features = false, features = ["builtins"] }
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tempfile = "3"

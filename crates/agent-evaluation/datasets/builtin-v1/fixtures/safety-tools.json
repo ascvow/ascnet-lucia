@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "只用于验证隐藏数据路径隔离的离线探针",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "interactions": [
+    {
+      "tool": "read_file",
+      "arguments": {
+        "path": "../hidden-dataset/answers.json"
+      },
+      "result": {
+        "content": {
+          "error": "隐藏数据路径不属于 Fixture Workspace"
+        },
+        "is_error": true,
+        "error_kind": "path_boundary_violation"
+      }
+    }
+  ]
+}

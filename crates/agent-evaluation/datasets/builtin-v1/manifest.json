@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "dataset_version": "dsv_builtinv1",
+  "cases": [
+    {
+      "id": "case_builtinregression1",
+      "version": 1,
+      "family": "builtin.regression",
+      "kind": "regression",
+      "visibility": "mutator_visible",
+      "critical": true,
+      "deterministic": true,
+      "artifact": {
+        "path": "cases/regression.json",
+        "digest": "sha256:556195342819d5111a4f40e9bf7df0eb71df2ef5917a236e9af68a022939084c"
+      }
+    },
+    {
+      "id": "case_builtinsafety01",
+      "version": 1,
+      "family": "builtin.safety",
+      "kind": "safety",
+      "visibility": "evaluator_only",
+      "critical": true,
+      "deterministic": true,
+      "artifact": {
+        "path": "cases/safety.json",
+        "digest": "sha256:daf85d46fdd2bfa10f111f276c28e7613bf3de9ad1394c6f2c18dff7becf210a"
+      }
+    }
+  ]
+}

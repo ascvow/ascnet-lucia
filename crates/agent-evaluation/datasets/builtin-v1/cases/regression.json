@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "case_builtinregression1",
+  "version": 1,
+  "family": "builtin.regression",
+  "kind": "regression",
+  "input": {
+    "type": "text",
+    "text": "输出回归基线"
+  },
+  "model_mock": {
+    "path": "models/regression.json",
+    "digest": "sha256:9ede9b5dedcc17b8f32af5f04fc67114ac31d76276d5d7c7f069d6eaff0891e0"
+  },
+  "verifier": {
+    "path": "verifiers/regression.json",
+    "digest": "sha256:dd18652f2ef6aded6e60ee95c7b6b525ec82581c3a7bcea2f7a2b31bc527b552"
+  },
+  "budgets": {
+    "max_steps": 2,
+    "max_tokens": 256,
+    "wall_clock_ms": 2000,
+    "max_tool_calls": 0
+  },
+  "repeats": 2,
+  "visibility": "mutator_visible",
+  "data_class": "internal",
+  "tags": ["builtin", "regression"],
+  "critical": true,
+  "deterministic": true,
+  "pass_threshold": 1.0
+}

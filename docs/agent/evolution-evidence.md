@@ -1,9 +1,10 @@
 # Evolution 可证据化运行
 
-Goal A 的证据链由 `agent-evolution-protocol` 与 `agent-evolution` 共同提供：前者定义
-稳定 Schema 与 Genome 行为摘要，后者实现不可变 Genome Store、本地 Artifact CAS、只追加
-Episode Store、脱敏 Recorder、运行监督、失败归因和 Protocol Replay。Serve Core 不依赖
-Evolution crate，未装配 Recorder 时原有运行方式保持不变。
+Goal A 的证据链由 `agent-evolution-protocol`、`agent-evaluation` 与 `agent-evolution` 共同提供：
+协议 crate 定义稳定 Schema 与 Genome 行为摘要，受信评测 crate 独占 TaskCase 正文、Hidden
+Dataset、Fixture 和最终 Verifier，Evolution crate 实现不可变 Genome Store、本地 Artifact CAS、
+只追加 Episode Store、脱敏 Recorder、运行监督、失败归因和 Protocol Replay。Serve Core 不依赖
+这些实现 crate，未装配 Recorder 时原有运行方式保持不变。
 
 ## Genome 完整性
 
@@ -178,6 +179,29 @@ Episode 的监督 CAS 中；处理器会把该制品恢复为本地修订历史�
 监督引用时，还会逐条验证 Envelope 的 sequence、Episode、Run、Genome、Event ID 和
 脱敏载荷。全部通过后才把事件交给 `ReplayEventSink`。该过程不调用真实模型或工具，
 因此可用于确定性状态机、插件 Hook 与持久化回归。
+
+## 离线 Dataset 与 Fixture Replay
+
+`agent-evaluation` 是受信评测平面的独立 crate。完整 `TaskCase` 使用版本化 Dataset Manifest
+索引，TaskCase、初始环境、工具 Fixture、Model Mock 和最终 Verifier 均以相对路径和 SHA-256
+摘要绑定。加载器拒绝绝对路径、`..`、符号链接、摘要不一致、Manifest/TaskCase 元数据不一致、
+未知 schema、重复 ID、Secret 正文和非 `evaluator_only` 的 Hidden Case。提供给 Mutator 的视图
+只包含 Public/MutatorVisible 元数据及其任务输入，不包含 Hidden ID/输入、文件路径、Fixture 或
+Verifier。
+
+`ComparativeRunner` 为每个 Parent/Candidate × TaskCase × Repeat 创建独立临时 Workspace，并拒绝
+Workspace 根与 Dataset 根互为祖先或后代。Agent 使用 `ExecutionProfile::Evaluation`：无网络、
+无 Secret、无进程、零派生深度，仅开放 TaskCase 声明的 Fixture 工具。标准运行使用条件化
+`ModelMock`，不需要真实 API Key。墙钟、步骤、Token 和工具调用预算分别进入 Timeout、
+BudgetFailure 或可信使用量。
+
+Tool Fixture 按全局顺序精确匹配工具名与 JSON 参数，返回结果时重新绑定真实 call ID；Model
+Record/Replay 对完整 provider-neutral 请求执行相等校验。每次录制还保存受信工具调用和去波动
+Protocol Trace，Fixture Replay 会重新驱动真实 ReAct、工具 Fixture 与最终 Verifier，并比较
+模型请求、工具序列、协议状态机、终态和 Verifier 结果。可展示报告不包含这些完整录制或隐藏
+答案。仓库内置 `datasets/builtin-v1` Regression/Safety Set；Safety Case 只使用离线路径探针，
+真实原生 `read_file` 的 Exit Gate 另行证明 Candidate 即使知道 Hidden 路径也只能得到
+`path_boundary_violation`，Session 不会出现隐藏答案。
 
 ## Evolution Scorecard 与历史分析
 

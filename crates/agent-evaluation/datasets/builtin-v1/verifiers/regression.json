@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "verifier_version": "builtin-v1",
+  "checks": [
+    {
+      "type": "exact_text",
+      "expected": "regression-ready"
+    }
+  ]
+}

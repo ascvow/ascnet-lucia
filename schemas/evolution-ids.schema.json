@@ -39,6 +39,11 @@
       "pattern": "^dsv_[0-9a-z]{8,64}$",
       "description": "数据集某个版本的标识"
     },
+    "TaskCaseId": {
+      "type": "string",
+      "pattern": "^case_[0-9a-z]{8,64}$",
+      "description": "一个版本化评测任务的稳定标识"
+    },
     "ReleaseId": {
       "type": "string",
       "pattern": "^rel_[0-9a-z]{8,64}$",

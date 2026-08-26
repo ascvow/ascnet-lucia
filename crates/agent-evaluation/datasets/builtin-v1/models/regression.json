@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "expected_calls": 1,
+  "interactions": [
+    {
+      "call_index": 0,
+      "request": {
+        "messages_contain_all": ["输出回归基线"],
+        "exact_tool_names": []
+      },
+      "response": {
+        "content": [
+          {
+            "type": "text",
+            "text": "regression-ready"
+          }
+        ],
+        "tool_calls": [],
+        "finish_reason": "stop",
+        "usage": null,
+        "billing": null,
+        "raw_provider_response": null
+      }
+    }
+  ]
+}

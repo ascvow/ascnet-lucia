@@ -351,6 +351,7 @@ prefixed_id!(MutationId, "mut", "一次变异提案的标识。");
 prefixed_id!(EvaluationRunId, "evrun", "一次评测运行的标识。");
 prefixed_id!(EvaluationReportId, "evrep", "一份评测报告的标识。");
 prefixed_id!(DatasetVersionId, "dsv", "数据集某个版本的标识。");
+prefixed_id!(TaskCaseId, "case", "一个版本化评测任务的稳定标识。");
 prefixed_id!(ReleaseId, "rel", "一次发布的标识。");
 prefixed_id!(AuditRecordId, "aud", "一条审计记录的标识。");
 prefixed_id!(EventId, "evt", "Event Envelope 中一条可信事件的标识。");
@@ -411,6 +412,7 @@ pub fn id_json_schema() -> serde_json::Value {
             "EvaluationRunId": entry(EvaluationRunId::PATTERN, "一次评测运行的标识"),
             "EvaluationReportId": entry(EvaluationReportId::PATTERN, "一份评测报告的标识"),
             "DatasetVersionId": entry(DatasetVersionId::PATTERN, "数据集某个版本的标识"),
+            "TaskCaseId": entry(TaskCaseId::PATTERN, "一个版本化评测任务的稳定标识"),
             "ReleaseId": entry(ReleaseId::PATTERN, "一次发布的标识"),
             "AuditRecordId": entry(AuditRecordId::PATTERN, "一条审计记录的标识"),
             "EventId": entry(EventId::PATTERN, "Event Envelope 中一条可信事件的标识"),
@@ -474,6 +476,7 @@ mod tests {
         check_prefixed!(EvaluationRunId);
         check_prefixed!(EvaluationReportId);
         check_prefixed!(DatasetVersionId);
+        check_prefixed!(TaskCaseId);
         check_prefixed!(ReleaseId);
         check_prefixed!(AuditRecordId);
         check_prefixed!(EventId);
@@ -569,7 +572,7 @@ mod tests {
     fn schema_patterns_accept_real_values() {
         let schema = id_json_schema();
         let defs = schema["$defs"].as_object().expect("应有 $defs");
-        assert_eq!(defs.len(), 18, "18 个标识类型都应出现在 schema 中");
+        assert_eq!(defs.len(), 19, "19 个标识类型都应出现在 schema 中");
 
         let run_pattern = defs["RunId"]["pattern"].as_str().expect("应有 pattern");
         assert!(Regex::new(run_pattern)

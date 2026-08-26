@@ -46,7 +46,7 @@ pub use ids::{
     id_json_schema, ArtifactDigest, AuditRecordId, DatasetVersionId, EpisodeId, EvaluationReportId,
     EvaluationRunId, EventId, EvolutionIssueId, FailureRecordId, FeedbackId, GenomeDigest,
     GenomeRevisionId, IncidentId, InvalidEvolutionId, MutationId, OutcomeRevisionId, ReleaseId,
-    RunId, SpanId,
+    RunId, SpanId, TaskCaseId,
 };
 pub use redaction::{RedactionOutcome, RedactionRule, Redactor, REDACTION_RULES_VERSION};
 pub use supervision::{
