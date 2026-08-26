@@ -8,6 +8,7 @@ mod doctor;
 mod evidence;
 mod evolution_cli;
 mod evolution_dashboard;
+mod genome_binding;
 #[cfg(feature = "plugins")]
 mod host_actions;
 #[cfg(feature = "plugins")]

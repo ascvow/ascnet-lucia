@@ -19,6 +19,6 @@ pub(crate) use protocol::{
     prepare_saved_record, validate_record, validate_schema_version, verify_revision,
 };
 pub use protocol::{
-    InvalidSessionId, SessionId, SessionRecord, SessionStore, SessionStoreError, SessionSummary,
-    CURRENT_SESSION_SCHEMA_VERSION,
+    InvalidSessionBehaviorBinding, InvalidSessionId, SessionBehaviorBinding, SessionId,
+    SessionRecord, SessionStore, SessionStoreError, SessionSummary, CURRENT_SESSION_SCHEMA_VERSION,
 };

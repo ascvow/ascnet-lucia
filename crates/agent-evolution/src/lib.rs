@@ -13,6 +13,7 @@ mod certificate;
 mod episode_store;
 mod evaluation_store;
 mod feedback;
+mod genome_diff;
 mod genome_store;
 mod history;
 mod metrics;
@@ -38,7 +39,11 @@ pub use evaluation_store::{
     load_evaluation_report, EvaluationStoreError, FileEvaluationReportStore,
 };
 pub use feedback::{FeedbackError, FeedbackProcessor};
-pub use genome_store::{FileGenomeStore, GenomeStore, GenomeStoreError};
+pub use genome_diff::{diff_genomes, verify_allowed_genome_diff, GenomeDiffError};
+pub use genome_store::{
+    FileGenomeResolver, FileGenomeStore, GenomeResolver, GenomeResolverError, GenomeSelector,
+    GenomeStore, GenomeStoreError, StableGenomeRef, STABLE_GENOME_REF_SCHEMA_VERSION,
+};
 pub use history::{
     compute_history, CapabilityMapCell, CapabilityMapRow, EvolutionFunnel, EvolutionHistory,
     EvolutionVelocityPoint, FixSurvivalPoint, HiddenTrendPoint, HiddenTrendSegment, HistoryError,

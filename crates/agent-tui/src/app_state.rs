@@ -278,7 +278,10 @@ impl App {
     /// 进入当前项目下尚未持久化的全新空白草稿。
     #[cfg(feature = "plugins")]
     pub(crate) fn start_new_draft(&mut self, notice: &str) -> Result<()> {
-        let draft = self.workspace.draft_record()?;
+        let mut draft = self.workspace.draft_record()?;
+        if let Some(evidence) = self.evidence.as_ref() {
+            evidence.bind_or_validate_session(&mut draft)?;
+        }
         self.replace_session(draft, Some(notice));
         Ok(())
     }
@@ -636,6 +639,18 @@ impl App {
         }
     }
 
+    /// 判断 Evidence Genome 的固定插件组合是否已经完整 Ready。
+    ///
+    /// 普通模式保持渐进加载期间可提交输入的既有体验；Evidence 模式必须等待全部插件
+    /// 完成，且任一加载失败都会阻止 Run，避免 Episode 绑定的 Genome 与真实组合不同。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn evidence_genome_run_is_ready(&self) -> bool {
+        self.evidence.is_none()
+            || (!self.plugins_loading
+                && self.plugin_load_error.is_none()
+                && self.plugin_failures.is_empty())
+    }
+
     /// 返回主输入当前激活的触发视图索引。
     ///
     /// 主输入去除前导空白后以某个视图声明的触发前缀开头即视为激活；
@@ -882,6 +897,14 @@ impl App {
                     self.messages.push(Msg::new(
                         MsgKind::Info,
                         "The command is still running. Try again shortly.",
+                    ));
+                    return;
+                }
+                #[cfg(feature = "plugins")]
+                if !self.evidence_genome_run_is_ready() {
+                    self.messages.push(Msg::new(
+                        MsgKind::Info,
+                        "Evidence Genome 的插件组合尚未完整就绪，当前不能开始 Run。".to_string(),
                     ));
                     return;
                 }

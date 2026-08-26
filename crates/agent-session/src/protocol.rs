@@ -16,6 +16,8 @@ use uuid::Uuid;
 pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 1;
 
 const MAX_SESSION_ID_LENGTH: usize = 128;
+const MAX_BEHAVIOR_BINDING_KIND_LENGTH: usize = 64;
+const MAX_BEHAVIOR_BINDING_REVISION_LENGTH: usize = 256;
 
 /// 经过路径安全校验的会话标识。
 ///
@@ -136,6 +138,13 @@ pub struct SessionRecord {
     /// 与具体插件无关的扩展元数据。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, serde_json::Value>,
+    /// 会话首次持久化时固定的外部行为修订。
+    ///
+    /// Session Store 不解释 `kind` 或 `revision` 的业务含义；应用层可用它绑定
+    /// Agent Genome 等版本化外部制品。旧会话缺少该字段时保持 `None`，但记录一旦
+    /// 带有绑定，后续 CAS 保存不得移除或替换。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior_binding: Option<SessionBehaviorBinding>,
     /// 与模型服务商无关的 Agent 会话。
     pub session: Session,
 }
@@ -156,8 +165,55 @@ impl SessionRecord {
             updated_at_ms: now,
             title: None,
             metadata: BTreeMap::new(),
+            behavior_binding: None,
             session,
         })
+    }
+}
+
+/// Session 固定引用的外部行为修订。
+///
+/// `kind` 标识制品协议，例如 `agent_genome`；`revision` 是该协议已经独立校验的
+/// 不透明修订 ID。该类型只保存引用，不保存模型配置、Prompt、插件状态或 Secret。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionBehaviorBinding {
+    /// 行为制品协议名，只允许安全的 ASCII 标识字符。
+    pub kind: String,
+    /// 不透明修订 ID，只允许安全的 ASCII 标识字符。
+    pub revision: String,
+}
+
+impl SessionBehaviorBinding {
+    /// 创建经过长度与字符集校验的行为修订绑定。
+    ///
+    /// # Errors
+    ///
+    /// `kind` 或 `revision` 为空、过长或含路径分隔符等非法字符时返回
+    /// [`InvalidSessionBehaviorBinding`]。
+    pub fn new(
+        kind: impl Into<String>,
+        revision: impl Into<String>,
+    ) -> Result<Self, InvalidSessionBehaviorBinding> {
+        let binding = Self {
+            kind: kind.into(),
+            revision: revision.into(),
+        };
+        validate_behavior_binding(&binding)?;
+        Ok(binding)
+    }
+}
+
+/// Session 行为修订绑定不满足安全标识规则。
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("非法 Session 行为修订绑定：{reason}")]
+pub struct InvalidSessionBehaviorBinding {
+    reason: &'static str,
+}
+
+impl InvalidSessionBehaviorBinding {
+    /// 返回固定且不包含绑定正文的失败原因。
+    pub fn reason(&self) -> &'static str {
+        self.reason
     }
 }
 
@@ -268,6 +324,15 @@ pub enum SessionStoreError {
     /// 系统时间无法转换为 UNIX epoch 毫秒。
     #[error("无法读取系统时间：{0}")]
     Clock(#[from] std::time::SystemTimeError),
+    /// Session 行为修订绑定不合法。
+    #[error(transparent)]
+    InvalidBehaviorBinding(#[from] InvalidSessionBehaviorBinding),
+    /// 已持久化 Session 的行为修订绑定被移除或替换。
+    #[error("会话 {id} 的行为修订绑定不可修改")]
+    BehaviorBindingChanged {
+        /// 被拒绝更新的 Session。
+        id: SessionId,
+    },
     /// 会话记录或摘要索引序列化失败。
     #[error("无法序列化会话存储数据：{0}")]
     Serialize(#[from] serde_json::Error),
@@ -367,7 +432,11 @@ fn validate_session_id(value: &str) -> Result<(), InvalidSessionId> {
 }
 
 pub(crate) fn validate_record(record: &SessionRecord) -> Result<(), SessionStoreError> {
-    validate_schema_version(&record.id, record.schema_version)
+    validate_schema_version(&record.id, record.schema_version)?;
+    if let Some(binding) = &record.behavior_binding {
+        validate_behavior_binding(binding)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_schema_version(
@@ -399,6 +468,11 @@ pub(crate) fn prepare_saved_record(
         });
     }
     verify_revision(&record.id, current, expected_revision)?;
+    if current.is_some_and(|current| current.behavior_binding != record.behavior_binding) {
+        return Err(SessionStoreError::BehaviorBindingChanged {
+            id: record.id.clone(),
+        });
+    }
     record.revision =
         record_expected
             .checked_add(1)
@@ -428,4 +502,103 @@ pub(crate) fn verify_revision(
 fn unix_time_ms() -> Result<u64, SessionStoreError> {
     let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     Ok(u64::try_from(millis).unwrap_or(u64::MAX))
+}
+
+/// 校验中立的行为修订引用，不允许路径或控制字符进入持久化协议。
+fn validate_behavior_binding(
+    binding: &SessionBehaviorBinding,
+) -> Result<(), InvalidSessionBehaviorBinding> {
+    fn valid(value: &str, max_len: usize) -> bool {
+        !value.is_empty()
+            && value.len() <= max_len
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+            })
+    }
+
+    if !valid(&binding.kind, MAX_BEHAVIOR_BINDING_KIND_LENGTH) {
+        return Err(InvalidSessionBehaviorBinding {
+            reason: "kind 为空、过长或包含非法字符",
+        });
+    }
+    if !valid(&binding.revision, MAX_BEHAVIOR_BINDING_REVISION_LENGTH) {
+        return Err(InvalidSessionBehaviorBinding {
+            reason: "revision 为空、过长或包含非法字符",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 行为绑定经过 JSON 往返后保持不变，旧记录缺少字段时仍可读取。
+    #[test]
+    fn behavior_binding_round_trips_and_is_backward_compatible() {
+        let binding =
+            SessionBehaviorBinding::new("agent_genome", "grev_0123456789abcdef0123456789abcdef")
+                .expect("合法 Genome 修订应可绑定");
+        let mut record =
+            SessionRecord::new(SessionId::generate(), Session::new()).expect("应创建 Session");
+        record.behavior_binding = Some(binding.clone());
+
+        let encoded = serde_json::to_value(&record).expect("应序列化 Session");
+        let decoded: SessionRecord = serde_json::from_value(encoded.clone()).expect("应反序列化");
+        assert_eq!(decoded.behavior_binding, Some(binding));
+
+        let mut legacy = encoded;
+        legacy
+            .as_object_mut()
+            .expect("Session JSON 应为对象")
+            .remove("behavior_binding");
+        let decoded: SessionRecord = serde_json::from_value(legacy).expect("旧 Session 应可读取");
+        assert_eq!(decoded.behavior_binding, None);
+    }
+
+    /// 修订引用不能携带路径分隔符或控制字符。
+    #[test]
+    fn behavior_binding_rejects_unsafe_identifiers() {
+        assert!(SessionBehaviorBinding::new("agent/genome", "grev_safe").is_err());
+        assert!(SessionBehaviorBinding::new("agent_genome", "../grev_escape").is_err());
+        assert!(SessionBehaviorBinding::new("agent_genome", "grev\nsecret").is_err());
+    }
+
+    /// CAS 更新不能删除或替换已经持久化的行为修订绑定。
+    #[test]
+    fn saved_behavior_binding_is_immutable() {
+        let mut current =
+            SessionRecord::new(SessionId::generate(), Session::new()).expect("应创建 Session");
+        current.revision = 1;
+        current.behavior_binding = Some(
+            SessionBehaviorBinding::new("agent_genome", "grev_parent").expect("测试绑定应合法"),
+        );
+
+        let mut changed = current.clone();
+        changed.behavior_binding = Some(
+            SessionBehaviorBinding::new("agent_genome", "grev_candidate").expect("测试绑定应合法"),
+        );
+        assert!(matches!(
+            prepare_saved_record(changed, Some(&current), Some(1)),
+            Err(SessionStoreError::BehaviorBindingChanged { .. })
+        ));
+
+        let mut removed = current.clone();
+        removed.behavior_binding = None;
+        assert!(matches!(
+            prepare_saved_record(removed, Some(&current), Some(1)),
+            Err(SessionStoreError::BehaviorBindingChanged { .. })
+        ));
+
+        let mut legacy = current.clone();
+        legacy.behavior_binding = None;
+        let mut silently_bound = legacy.clone();
+        silently_bound.behavior_binding = Some(
+            SessionBehaviorBinding::new("agent_genome", "grev_candidate").expect("测试绑定应合法"),
+        );
+        assert!(matches!(
+            prepare_saved_record(silently_bound, Some(&legacy), Some(1)),
+            Err(SessionStoreError::BehaviorBindingChanged { .. })
+        ));
+    }
 }

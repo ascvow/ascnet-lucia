@@ -280,6 +280,7 @@ pub(crate) fn session_record_payload_matches(
         && stored.created_at_ms == attempted.created_at_ms
         && stored.title == attempted.title
         && stored.metadata == attempted.metadata
+        && stored.behavior_binding == attempted.behavior_binding
         && stored.session == attempted.session
 }
 
@@ -324,6 +325,18 @@ pub(crate) async fn run_and_persist_with_evidence(
     evidence: Option<&EvidenceRuntime>,
 ) -> AgentCompletion {
     let submission: UserSubmission = input.into();
+    if let Some(evidence) = evidence {
+        if let Err(error) = evidence.bind_or_validate_session(&mut session_record) {
+            return AgentCompletion {
+                run: None,
+                session_record,
+                error: Some(error),
+                input_committed: false,
+                queue_may_advance: false,
+                input: submission,
+            };
+        }
+    }
     let expected_revision = (session_record.revision > 0).then_some(session_record.revision);
     session_record.session =
         agent.prepare_session_blocks(session_record.session.clone(), submission.blocks());
@@ -431,6 +444,7 @@ pub(crate) async fn run_and_persist_with_evidence(
                     Ok(mut fork_record) => {
                         fork_record.title = completed_record.title.clone();
                         fork_record.metadata = completed_record.metadata.clone();
+                        fork_record.behavior_binding = completed_record.behavior_binding.clone();
                         save_session_record_reconciled(session_store, fork_record, None).await
                     }
                     Err(error) => Err(error),

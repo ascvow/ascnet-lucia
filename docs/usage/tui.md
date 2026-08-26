@@ -47,6 +47,7 @@ sessions_dir = "projects"
 enabled = false
 # root_dir = "evolution"
 # genome_revision_id = "grev_0123456789abcdef0123456789abcdef"
+# genome_stable = "stable/general"
 ```
 
 设置密钥后重新启动：
@@ -72,7 +73,14 @@ lucia
 - `tui.events_jsonl`：可选事件日志；相对路径以配置文件目录为基准。
 - `evidence.enabled`：为主 Agent 的每次真实 Run 生成 Episode；默认关闭。
 - `evidence.root_dir`：Genome、Artifact CAS 与 Episode 根目录；相对路径以配置文件目录为基准。
-- `evidence.genome_revision_id`：启用 Evidence 时必须存在且通过行为摘要校验的 Genome 修订。
+- `evidence.genome_revision_id`：启用 Evidence 时直接绑定的精确 Genome 修订。
+- `evidence.genome_stable`：为新 Session 解析精确修订的 Stable lineage；与 `genome_revision_id` 二选一。
+
+Evidence 启用后，模型密钥仍来自普通配置，但模型路由和参数、Prompt CAS、原生工具、插件
+bundle、能力 owner 与执行策略以 Genome 为准。Genome 必须引用至少一个包含完整系统提示的
+UTF-8 Prompt CAS 制品，空 Prompt 不会采用普通配置或 Core 默认提示。缺少模型密钥不会自动
+切换演示模型；固定插件全部 Ready 前不能发送 Run，任一插件加载失败后保持阻断。旧 Session
+只能使用首次保存时绑定的精确 Revision，Stable 更新不会静默改变已有会话。
 
 ## 输入与快捷键
 

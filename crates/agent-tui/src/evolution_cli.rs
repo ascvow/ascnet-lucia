@@ -2,12 +2,15 @@
 
 use crate::app_config::lucia_home_dir;
 use agent_evolution::{
-    compute_history, compute_scorecard, load_evaluation_report, CapabilityMapRow,
-    EvolutionCertificate, EvolutionFunnel, EvolutionHistory, EvolutionScorecard,
-    EvolutionVerdictPolicy, FileArtifactStore, FileEvaluationReportStore, FileEvolutionArchive,
-    InheritanceMetrics, LineageNode, Rate, ResourceDelta,
+    compute_history, compute_scorecard, diff_genomes, load_evaluation_report,
+    verify_allowed_genome_diff, CapabilityMapRow, EvolutionCertificate, EvolutionFunnel,
+    EvolutionHistory, EvolutionScorecard, EvolutionVerdictPolicy, FileArtifactStore,
+    FileEvaluationReportStore, FileEvolutionArchive, FileGenomeResolver, GenomeResolver,
+    GenomeSelector, InheritanceMetrics, LineageNode, Rate, ResourceDelta,
 };
-use agent_evolution_protocol::{EvaluationReport, GenomeRevisionId, ReleaseId};
+use agent_evolution_protocol::{
+    EvaluationReport, GenomeDiff, GenomeRevision, GenomeRevisionId, MutationSurface, ReleaseId,
+};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use std::{
@@ -30,6 +33,8 @@ pub(crate) struct EvolutionArgs {
 /// 当前支持的 Evolution 子命令。
 #[derive(Debug, Subcommand)]
 enum EvolutionCommand {
+    /// 检查不可变 Genome、Stable 引用和 Parent/Candidate 差异。
+    Genome(GenomeArgs),
     /// 比较 Parent 与 Candidate 的真实 EvaluationReport。
     Compare(CompareArgs),
     /// 显示最近一次已发布 Candidate 的 Scorecard。
@@ -44,6 +49,102 @@ enum EvolutionCommand {
     CapabilityMap(HistoryArgs),
     /// 显示 Evolution Engine 漏斗与 Candidate Yield。
     Funnel(HistoryArgs),
+}
+
+/// `lucia evolution genome` 参数。
+#[derive(Debug, ClapArgs)]
+struct GenomeArgs {
+    /// Genome 运维查询。
+    #[command(subcommand)]
+    command: GenomeCommand,
+}
+
+/// Genome 的只读运维命令。
+#[derive(Debug, Subcommand)]
+enum GenomeCommand {
+    /// 显示已验证 Revision 的行为配置与摘要。
+    Inspect(GenomeTargetArgs),
+    /// 重新计算摘要并验证 Revision 或 Stable 引用。
+    Verify(GenomeTargetArgs),
+    /// 生成 Parent/Candidate 的可信差异，并可校验允许表面。
+    Diff(GenomeDiffArgs),
+}
+
+/// 选择精确 Revision 或 Stable lineage。
+#[derive(Debug, ClapArgs)]
+struct GenomeTargetArgs {
+    /// 精确 Genome Revision ID。
+    #[arg(long, conflicts_with = "stable", required_unless_present = "stable")]
+    revision: Option<String>,
+    /// Stable lineage，例如 `stable/general`。
+    #[arg(
+        long,
+        conflicts_with = "revision",
+        required_unless_present = "revision"
+    )]
+    stable: Option<String>,
+    /// 输出格式。
+    #[arg(long, value_enum, default_value_t = ScorecardFormat::Table)]
+    format: ScorecardFormat,
+}
+
+/// Parent/Candidate Genome 差异参数。
+#[derive(Debug, ClapArgs)]
+struct GenomeDiffArgs {
+    /// Parent Genome Revision ID。
+    #[arg(long)]
+    parent: String,
+    /// Candidate Genome Revision ID。
+    #[arg(long)]
+    candidate: String,
+    /// 可信 Evolution Policy 允许的表面；指定任一项后同时执行越界校验。
+    #[arg(long = "allow", value_enum, value_delimiter = ',')]
+    allowed: Vec<GenomeSurfaceArg>,
+    /// 输出格式。
+    #[arg(long, value_enum, default_value_t = ScorecardFormat::Table)]
+    format: ScorecardFormat,
+}
+
+/// CLI 可选择的已知 Genome 变异表面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GenomeSurfaceArg {
+    /// Task Strategy Prompt。
+    TaskStrategyPrompt,
+    /// Context Policy。
+    ContextPolicy,
+    /// Planning Policy。
+    PlanningPolicy,
+    /// Skill。
+    Skill,
+    /// Plugin 或 Capability owner。
+    Plugin,
+    /// Model。
+    Model,
+    /// Tool Profile。
+    ToolProfile,
+    /// Execution Profile。
+    ExecutionProfile,
+    /// Runtime 或 Kernel。
+    Runtime,
+    /// 受保护 Prompt。
+    ProtectedPrompt,
+}
+
+impl From<GenomeSurfaceArg> for MutationSurface {
+    fn from(value: GenomeSurfaceArg) -> Self {
+        match value {
+            GenomeSurfaceArg::TaskStrategyPrompt => Self::TaskStrategyPrompt,
+            GenomeSurfaceArg::ContextPolicy => Self::ContextPolicy,
+            GenomeSurfaceArg::PlanningPolicy => Self::PlanningPolicy,
+            GenomeSurfaceArg::Skill => Self::Skill,
+            GenomeSurfaceArg::Plugin => Self::Plugin,
+            GenomeSurfaceArg::Model => Self::Model,
+            GenomeSurfaceArg::ToolProfile => Self::ToolProfile,
+            GenomeSurfaceArg::ExecutionProfile => Self::ExecutionProfile,
+            GenomeSurfaceArg::Runtime => Self::Runtime,
+            GenomeSurfaceArg::ProtectedPrompt => Self::ProtectedPrompt,
+        }
+    }
 }
 
 /// `lucia evolution compare` 参数。
@@ -144,6 +245,7 @@ enum ScorecardFormat {
 pub(crate) async fn run(args: EvolutionArgs) -> Result<()> {
     let root = args.root.unwrap_or(lucia_home_dir()?.join("evolution"));
     match args.command {
+        EvolutionCommand::Genome(options) => run_genome(&root, options).await,
         EvolutionCommand::Compare(options) => run_compare(&root, options).await,
         EvolutionCommand::Dashboard(options) => run_dashboard(&root, options).await,
         EvolutionCommand::Certificate(options) => run_certificate(&root, options).await,
@@ -155,6 +257,154 @@ pub(crate) async fn run(args: EvolutionArgs) -> Result<()> {
             run_history(&root, options, HistoryView::CapabilityMap).await
         }
         EvolutionCommand::Funnel(options) => run_history(&root, options, HistoryView::Funnel).await,
+    }
+}
+
+/// 执行只读 Genome 运维命令；该路径不会写 Stable 引用或修改 Revision。
+async fn run_genome(root: &std::path::Path, options: GenomeArgs) -> Result<()> {
+    let resolver = FileGenomeResolver::new(root);
+    match options.command {
+        GenomeCommand::Inspect(target) => {
+            let revision = resolve_genome_target(&resolver, &target).await?;
+            println!("{}", render_genome(&revision, target.format, false)?);
+        }
+        GenomeCommand::Verify(target) => {
+            let revision = resolve_genome_target(&resolver, &target).await?;
+            revision.validate().context("Genome Revision 验证失败")?;
+            println!("{}", render_genome(&revision, target.format, true)?);
+        }
+        GenomeCommand::Diff(options) => {
+            let parent_id = GenomeRevisionId::new(options.parent)
+                .context("--parent 不是合法 GenomeRevisionId")?;
+            let candidate_id = GenomeRevisionId::new(options.candidate)
+                .context("--candidate 不是合法 GenomeRevisionId")?;
+            let parent = resolver
+                .resolve(&GenomeSelector::Revision(parent_id))
+                .await
+                .context("解析 Parent Genome 失败")?;
+            let candidate = resolver
+                .resolve(&GenomeSelector::Revision(candidate_id))
+                .await
+                .context("解析 Candidate Genome 失败")?;
+            let diff = if options.allowed.is_empty() {
+                diff_genomes(&parent, &candidate).context("生成可信 Genome Diff 失败")?
+            } else {
+                let allowed = options
+                    .allowed
+                    .into_iter()
+                    .map(MutationSurface::from)
+                    .collect::<BTreeSet<_>>();
+                verify_allowed_genome_diff(&parent, &candidate, &allowed)
+                    .context("Candidate Genome 超出允许变异表面")?
+            };
+            println!(
+                "{}",
+                render_genome_diff(&parent, &candidate, &diff, options.format)?
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 解析 CLI 指定的精确 Revision 或 Stable lineage。
+async fn resolve_genome_target(
+    resolver: &FileGenomeResolver,
+    target: &GenomeTargetArgs,
+) -> Result<GenomeRevision> {
+    let selector = match (target.revision.as_deref(), target.stable.as_deref()) {
+        (Some(revision), None) => GenomeSelector::Revision(
+            GenomeRevisionId::new(revision).context("--revision 不是合法 GenomeRevisionId")?,
+        ),
+        (None, Some(lineage)) => GenomeSelector::Stable(lineage.to_string()),
+        _ => return Err(anyhow!("必须且只能指定 --revision 或 --stable")),
+    };
+    resolver
+        .resolve(&selector)
+        .await
+        .with_context(|| format!("解析 Genome 失败：{selector:?}"))
+}
+
+/// 生成稳定的 Genome inspect/verify 文本或 JSON。
+fn render_genome(
+    revision: &GenomeRevision,
+    format: ScorecardFormat,
+    verified: bool,
+) -> Result<String> {
+    match format {
+        ScorecardFormat::Json => serde_json::to_string_pretty(revision)
+            .context("序列化 Genome Revision JSON 失败"),
+        ScorecardFormat::Table => Ok(format!(
+            "Lucia Agent Genome\nRevision: {}\nDigest: {}\nProfile: {:?}\nModel: {}/{}\nPlugins: {}\nNative tools: {}\nVerification: {}",
+            revision.revision_id,
+            revision.digest,
+            revision.genome.execution.profile(),
+            revision.genome.model.provider,
+            revision.genome.model.model,
+            revision.genome.plugins.len(),
+            revision.genome.tools.native_tools.len(),
+            if verified { "PASS" } else { "VALIDATED_ON_READ" },
+        )),
+        ScorecardFormat::Markdown => Ok(format!(
+            "# Lucia Agent Genome\n\n- Revision: `{}`\n- Digest: `{}`\n- Profile: `{:?}`\n- Model: `{}/{}`\n- Plugins: `{}`\n- Native tools: `{}`\n- Verification: **{}**\n",
+            revision.revision_id,
+            revision.digest,
+            revision.genome.execution.profile(),
+            revision.genome.model.provider,
+            revision.genome.model.model,
+            revision.genome.plugins.len(),
+            revision.genome.tools.native_tools.len(),
+            if verified { "PASS" } else { "VALIDATED_ON_READ" },
+        )),
+    }
+}
+
+/// 生成不包含 Prompt、Skill 或插件配置正文的可信 Genome Diff。
+fn render_genome_diff(
+    parent: &GenomeRevision,
+    candidate: &GenomeRevision,
+    diff: &GenomeDiff,
+    format: ScorecardFormat,
+) -> Result<String> {
+    match format {
+        ScorecardFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "parent_revision": parent.revision_id,
+            "candidate_revision": candidate.revision_id,
+            "diff": diff,
+        }))
+        .context("序列化 Genome Diff JSON 失败"),
+        ScorecardFormat::Table => {
+            let changes = if diff.summary.is_empty() {
+                "无行为变化".to_string()
+            } else {
+                diff.summary.join("\n- ")
+            };
+            Ok(format!(
+                "Lucia Genome Diff\nParent: {}\nCandidate: {}\nChanged surfaces: {}\n- {}",
+                parent.revision_id,
+                candidate.revision_id,
+                diff.changed_surfaces.len(),
+                changes,
+            ))
+        }
+        ScorecardFormat::Markdown => {
+            let changes = if diff.summary.is_empty() {
+                "- 无行为变化".to_string()
+            } else {
+                diff.summary
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok(format!(
+                "# Lucia Genome Diff\n\n- Parent: `{}`\n- Candidate: `{}`\n- Changed surfaces: `{}`\n\n{}\n",
+                parent.revision_id,
+                candidate.revision_id,
+                diff.changed_surfaces.len(),
+                changes,
+            ))
+        }
     }
 }
 

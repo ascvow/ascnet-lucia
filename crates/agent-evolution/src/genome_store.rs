@@ -1,10 +1,225 @@
 //! Genome 修订的不可变文件存储。
 
-use agent_evolution_protocol::{GenomeRevision, GenomeRevisionId};
+use agent_evolution_protocol::{GenomeDigest, GenomeRevision, GenomeRevisionId};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
+
+/// 当前稳定 Genome 引用 JSON 的结构版本。
+pub const STABLE_GENOME_REF_SCHEMA_VERSION: u32 = 1;
+
+/// Stable 名称或精确修订构成的 Genome 解析选择器。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenomeSelector {
+    /// 解析不可变的精确修订。
+    Revision(GenomeRevisionId),
+    /// 解析可信控制面发布的 Stable lineage。
+    Stable(String),
+}
+
+/// 一个 lineage 当前指向的不可变 Genome 修订。
+///
+/// Stable 引用不包含行为正文；读取时 Resolver 会重新校验目标 Revision 及其摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StableGenomeRef {
+    /// JSON 结构版本。
+    pub schema_version: u32,
+    /// 稳定 lineage 名称，例如 `stable/general`。
+    pub lineage: String,
+    /// 当前发布的 Genome 修订。
+    pub revision_id: GenomeRevisionId,
+    /// 发布时绑定的行为摘要。
+    pub digest: GenomeDigest,
+    /// lineage 内单调递增的代数。
+    pub generation: u64,
+}
+
+impl StableGenomeRef {
+    /// 从已验证修订创建 Stable 引用数据；本函数不写文件，也不执行 Promotion。
+    ///
+    /// # Errors
+    ///
+    /// lineage 不安全或 Revision 摘要无效时返回错误。
+    pub fn new(
+        lineage: impl Into<String>,
+        revision: &GenomeRevision,
+        generation: u64,
+    ) -> Result<Self, GenomeResolverError> {
+        let lineage = lineage.into();
+        validate_lineage(&lineage)?;
+        revision
+            .validate()
+            .map_err(|error| GenomeResolverError::InvalidStableRef(error.to_string()))?;
+        Ok(Self {
+            schema_version: STABLE_GENOME_REF_SCHEMA_VERSION,
+            lineage,
+            revision_id: revision.revision_id.clone(),
+            digest: revision.digest.clone(),
+            generation,
+        })
+    }
+
+    /// 校验 Stable 引用自身的版本、lineage 与字段边界。
+    ///
+    /// # Errors
+    ///
+    /// 结构版本未知、lineage 不安全时返回错误。
+    pub fn validate(&self) -> Result<(), GenomeResolverError> {
+        if self.schema_version != STABLE_GENOME_REF_SCHEMA_VERSION {
+            return Err(GenomeResolverError::InvalidStableRef(format!(
+                "不支持的 schema_version {}",
+                self.schema_version
+            )));
+        }
+        validate_lineage(&self.lineage)
+    }
+}
+
+/// Genome Resolver 的只读契约。
+#[async_trait]
+pub trait GenomeResolver: Send + Sync {
+    /// 解析并验证选择器指向的不可变 Revision。
+    ///
+    /// # Errors
+    ///
+    /// 目标不存在、路径不安全、记录损坏或摘要不一致时返回错误。
+    async fn resolve(
+        &self,
+        selector: &GenomeSelector,
+    ) -> Result<GenomeRevision, GenomeResolverError>;
+}
+
+/// 文件系统上的只读 Genome Resolver。
+///
+/// 数据根下的 `genomes/` 保存不可变 Revision，`stable/` 保存由可信发布控制面写入的
+/// Stable 引用。Resolver 自身不公开写 Stable 的接口，避免普通运行路径冒充 Promotion。
+#[derive(Debug, Clone)]
+pub struct FileGenomeResolver {
+    store: FileGenomeStore,
+    stable_root: PathBuf,
+}
+
+impl FileGenomeResolver {
+    /// 按 Evolution 数据根创建 Resolver，且不触碰文件系统。
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        Self {
+            store: FileGenomeStore::new(root.join("genomes")),
+            stable_root: root.join("stable"),
+        }
+    }
+
+    /// 返回 Resolver 使用的不可变 Revision Store。
+    pub fn store(&self) -> &FileGenomeStore {
+        &self.store
+    }
+
+    /// 返回 lineage 对应的固定引用路径；文件名只来自 lineage 摘要，不包含原始路径片段。
+    fn stable_ref_path(&self, lineage: &str) -> PathBuf {
+        let name = format!("{:x}.json", Sha256::digest(lineage.as_bytes()));
+        self.stable_root.join(name)
+    }
+}
+
+#[async_trait]
+impl GenomeResolver for FileGenomeResolver {
+    async fn resolve(
+        &self,
+        selector: &GenomeSelector,
+    ) -> Result<GenomeRevision, GenomeResolverError> {
+        let (revision_id, stable) = match selector {
+            GenomeSelector::Revision(revision_id) => (revision_id.clone(), None),
+            GenomeSelector::Stable(lineage) => {
+                validate_lineage(lineage)?;
+                let reference =
+                    read_stable_ref(&self.stable_root, &self.stable_ref_path(lineage), lineage)
+                        .await?;
+                (reference.revision_id.clone(), Some(reference))
+            }
+        };
+        let revision = self
+            .store
+            .get(&revision_id)
+            .await?
+            .ok_or_else(|| GenomeResolverError::RevisionNotFound(revision_id.clone()))?;
+        if let Some(reference) = stable {
+            if revision.digest != reference.digest {
+                return Err(GenomeResolverError::StableDigestMismatch {
+                    lineage: reference.lineage,
+                    declared: reference.digest,
+                    actual: revision.digest,
+                });
+            }
+        }
+        Ok(revision)
+    }
+}
+
+/// Genome 解析错误。
+#[derive(Debug, thiserror::Error)]
+pub enum GenomeResolverError {
+    /// 不可变 Revision Store 失败。
+    #[error(transparent)]
+    Store(#[from] GenomeStoreError),
+    /// 精确修订或 Stable 目标不存在。
+    #[error("Genome 修订不存在：{0}")]
+    RevisionNotFound(GenomeRevisionId),
+    /// Stable 引用不存在。
+    #[error("Stable Genome 引用不存在：{0}")]
+    StableNotFound(String),
+    /// Stable 引用结构或 lineage 无效。
+    #[error("Stable Genome 引用无效：{0}")]
+    InvalidStableRef(String),
+    /// Stable 存储路径不安全。
+    #[error("Stable Genome 路径不安全：{path}: {reason}")]
+    UnsafeStablePath {
+        /// 不安全路径。
+        path: PathBuf,
+        /// 稳定错误原因。
+        reason: &'static str,
+    },
+    /// Stable 引用 JSON 损坏。
+    #[error("Stable Genome 引用损坏：{path}: {source}")]
+    InvalidStableRecord {
+        /// 损坏记录路径。
+        path: PathBuf,
+        /// JSON 解析错误。
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Stable 引用的 lineage 与请求不一致。
+    #[error("Stable Genome lineage 不匹配：期望 {expected}，实际 {actual}")]
+    StableLineageMismatch {
+        /// 请求 lineage。
+        expected: String,
+        /// 记录 lineage。
+        actual: String,
+    },
+    /// Stable 引用摘要与不可变 Revision 不一致。
+    #[error("Stable Genome 摘要不匹配：lineage {lineage}，声明 {declared}，实际 {actual}")]
+    StableDigestMismatch {
+        /// 引用 lineage。
+        lineage: String,
+        /// Stable 引用声明摘要。
+        declared: GenomeDigest,
+        /// Revision 实际摘要。
+        actual: GenomeDigest,
+    },
+    /// Stable 引用文件系统操作失败。
+    #[error("{operation}失败：{path}: {source}")]
+    StableIo {
+        /// 操作名称。
+        operation: &'static str,
+        /// 目标路径。
+        path: PathBuf,
+        /// 原始 I/O 错误。
+        #[source]
+        source: std::io::Error,
+    },
+}
 
 /// Genome 修订存储契约。
 ///
@@ -159,6 +374,96 @@ pub enum GenomeStoreError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// 校验 Stable lineage 是有限、可展示且不含路径逃逸语义的 ASCII 名称。
+fn validate_lineage(lineage: &str) -> Result<(), GenomeResolverError> {
+    if lineage.is_empty()
+        || lineage.len() > 128
+        || lineage.starts_with('/')
+        || lineage.ends_with('/')
+        || lineage
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        || !lineage
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+    {
+        return Err(GenomeResolverError::InvalidStableRef(format!(
+            "lineage `{lineage}` 不符合安全标识规则"
+        )));
+    }
+    Ok(())
+}
+
+/// 读取并校验 Stable 引用，拒绝根目录或记录文件的符号链接替换。
+async fn read_stable_ref(
+    root: &Path,
+    path: &Path,
+    expected_lineage: &str,
+) -> Result<StableGenomeRef, GenomeResolverError> {
+    let root_metadata = match fs::symlink_metadata(root).await {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(GenomeResolverError::StableNotFound(
+                expected_lineage.to_string(),
+            ));
+        }
+        Err(source) => {
+            return Err(stable_io_error("检查 Stable Genome 目录", root, source));
+        }
+        Ok(metadata) => metadata,
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(GenomeResolverError::UnsafeStablePath {
+            path: root.to_path_buf(),
+            reason: "Stable Genome 根路径必须是非符号链接目录",
+        });
+    }
+    let metadata = match fs::symlink_metadata(path).await {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(GenomeResolverError::StableNotFound(
+                expected_lineage.to_string(),
+            ));
+        }
+        Err(source) => return Err(stable_io_error("检查 Stable Genome 引用", path, source)),
+        Ok(metadata) => metadata,
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(GenomeResolverError::UnsafeStablePath {
+            path: path.to_path_buf(),
+            reason: "Stable Genome 引用必须是非符号链接普通文件",
+        });
+    }
+    let bytes = fs::read(path)
+        .await
+        .map_err(|source| stable_io_error("读取 Stable Genome 引用", path, source))?;
+    let reference: StableGenomeRef = serde_json::from_slice(&bytes).map_err(|source| {
+        GenomeResolverError::InvalidStableRecord {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    reference.validate()?;
+    if reference.lineage != expected_lineage {
+        return Err(GenomeResolverError::StableLineageMismatch {
+            expected: expected_lineage.to_string(),
+            actual: reference.lineage,
+        });
+    }
+    Ok(reference)
+}
+
+/// 构造带路径上下文的 Stable 引用 I/O 错误。
+fn stable_io_error(
+    operation: &'static str,
+    path: impl AsRef<Path>,
+    source: std::io::Error,
+) -> GenomeResolverError {
+    GenomeResolverError::StableIo {
+        operation,
+        path: path.as_ref().to_path_buf(),
+        source,
+    }
 }
 
 /// 创建并验证 Genome 根目录自身，拒绝符号链接替换。
@@ -323,6 +628,88 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(root).await;
+    }
+
+    /// Resolver 应同时支持精确 Revision 与经过摘要复核的 Stable lineage。
+    #[tokio::test]
+    async fn resolves_exact_and_stable_revision() {
+        let root = temp_root();
+        let resolver = FileGenomeResolver::new(&root);
+        let revision = revision();
+        resolver
+            .store()
+            .append(&revision)
+            .await
+            .expect("应登记 Revision");
+        let reference =
+            StableGenomeRef::new("stable/general", &revision, 3).expect("应构造 Stable 引用");
+        fs::create_dir_all(&resolver.stable_root)
+            .await
+            .expect("应创建 Stable 目录");
+        fs::write(
+            resolver.stable_ref_path("stable/general"),
+            serde_json::to_vec_pretty(&reference).expect("应序列化 Stable 引用"),
+        )
+        .await
+        .expect("应写入 Stable fixture");
+
+        assert_eq!(
+            resolver
+                .resolve(&GenomeSelector::Revision(revision.revision_id.clone()))
+                .await
+                .expect("应解析精确 Revision"),
+            revision
+        );
+        assert_eq!(
+            resolver
+                .resolve(&GenomeSelector::Stable("stable/general".into()))
+                .await
+                .expect("应解析 Stable lineage"),
+            revision
+        );
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    /// Stable 引用不能用旧摘要指向另一份行为内容。
+    #[tokio::test]
+    async fn stable_ref_rejects_digest_mismatch() {
+        let root = temp_root();
+        let resolver = FileGenomeResolver::new(&root);
+        let revision = revision();
+        resolver
+            .store()
+            .append(&revision)
+            .await
+            .expect("应登记 Revision");
+        let mut reference =
+            StableGenomeRef::new("stable/general", &revision, 1).expect("应构造引用");
+        reference.digest = GenomeDigest::from_sha256_hex("0".repeat(64)).expect("摘要应合法");
+        fs::create_dir_all(&resolver.stable_root)
+            .await
+            .expect("应创建 Stable 目录");
+        fs::write(
+            resolver.stable_ref_path("stable/general"),
+            serde_json::to_vec_pretty(&reference).expect("应序列化引用"),
+        )
+        .await
+        .expect("应写入篡改引用");
+
+        assert!(matches!(
+            resolver
+                .resolve(&GenomeSelector::Stable("stable/general".into()))
+                .await,
+            Err(GenomeResolverError::StableDigestMismatch { .. })
+        ));
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    /// lineage 不能携带父目录、绝对路径或空分段。
+    #[test]
+    fn rejects_unsafe_stable_lineage() {
+        let revision = revision();
+        for lineage in ["../stable", "/stable/general", "stable//general"] {
+            assert!(StableGenomeRef::new(lineage, &revision, 1).is_err());
+        }
     }
 
     /// 篡改行为内容但保留旧摘要时，后续读取必须失败。

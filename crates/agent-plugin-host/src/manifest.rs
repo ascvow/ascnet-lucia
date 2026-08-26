@@ -255,6 +255,10 @@ manifest = "/opt/lucia/plugin.toml"
             resolved.exclusive_owner(CONTEXT_LOADER_CAPABILITY),
             Some("second")
         );
+        assert_eq!(
+            resolved.exclusive_owners().collect::<Vec<_>>(),
+            vec![(CONTEXT_LOADER_CAPABILITY, "second")]
+        );
     }
 
     /// 应用配置应同时解析插件路径和独占能力选择。
@@ -473,6 +477,7 @@ impl ProvidedCapability {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedPluginCapabilities {
     owners: HashMap<String, Vec<String>>,
+    modes: HashMap<String, ProvidedCapabilityMode>,
 }
 
 impl ResolvedPluginCapabilities {
@@ -489,6 +494,20 @@ impl ResolvedPluginCapabilities {
             .get(capability_id)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    /// 按能力 ID 返回全部独占能力的最终 owner。
+    ///
+    /// 结果只包含已经完成冲突解析的独占能力；多提供者能力不会混入该快照。调用方可将
+    /// 其收集到有序映射中，用于可信运行配置的一致性校验。
+    pub fn exclusive_owners(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.modes.iter().filter_map(|(capability_id, mode)| {
+            if *mode != ProvidedCapabilityMode::Exclusive {
+                return None;
+            }
+            self.exclusive_owner(capability_id)
+                .map(|owner| (capability_id.as_str(), owner))
+        })
     }
 }
 
@@ -518,7 +537,9 @@ pub fn resolve_plugin_capabilities(
     }
 
     let mut owners = HashMap::new();
+    let mut modes = HashMap::new();
     for (capability_id, (mode, providers)) in declarations {
+        modes.insert(capability_id.clone(), mode);
         match mode {
             ProvidedCapabilityMode::Multi => {
                 if selections.contains_key(&capability_id) {
@@ -549,7 +570,7 @@ pub fn resolve_plugin_capabilities(
             }
         }
     }
-    Ok(ResolvedPluginCapabilities { owners })
+    Ok(ResolvedPluginCapabilities { owners, modes })
 }
 
 /// manifest 声明的插件依赖。

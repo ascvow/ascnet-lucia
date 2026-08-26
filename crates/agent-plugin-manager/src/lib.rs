@@ -259,7 +259,7 @@ impl PluginManager {
             {
                 bail!("复制后的插件身份与源 manifest 不一致");
             }
-            let sha256 = hash_bundle(&staging)?;
+            let sha256 = hash_plugin_bundle(&staging)?;
             fs::rename(&staging, &destination)
                 .with_context(|| format!("无法将插件移动到安装目录：{}", destination.display()))?;
 
@@ -509,7 +509,7 @@ impl PluginManager {
         {
             bail!("manifest 身份与锁文件记录不一致");
         }
-        let actual_sha256 = hash_bundle(bundle_path)?;
+        let actual_sha256 = hash_plugin_bundle(bundle_path)?;
         if actual_sha256 != plugin.sha256 {
             bail!(
                 "SHA-256 不匹配：锁定值 `{}`，实际值 `{actual_sha256}`",
@@ -789,7 +789,16 @@ fn copy_bundle(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn hash_bundle(root: &Path) -> Result<String> {
+/// 计算插件 bundle 的稳定 SHA-256 摘要。
+///
+/// 摘要覆盖 bundle 内所有目录、普通文件、相对路径和文件内容；符号链接、特殊文件与
+/// 非法路径会被拒绝。Plugin Manager 锁文件和 Genome 运行绑定必须复用该算法，避免
+/// 安装完整性与运行身份采用不同口径。
+///
+/// # Errors
+///
+/// 根目录不是普通目录、存在不安全条目、路径无法规范化或文件读取失败时返回错误。
+pub fn hash_plugin_bundle(root: &Path) -> Result<String> {
     let entries = scan_bundle(root)?;
     let mut digest = Sha256::new();
     digest.update(b"lucia-plugin-bundle-v1\0");

@@ -17,6 +17,11 @@ Prompt 层级与 capability owner。修订 ID、父版本、变异来源、创�
 把已经通过 `GenomeStore::get` 验证的 Revision ID 交给 Recorder，不能临时生成一个 ID
 冒充真实 Genome。
 
+`FileGenomeResolver` 同时支持精确 Revision 与只读 Stable lineage。Stable 引用位于
+`stable/<sha256(lineage)>.json`，解析时会拒绝符号链接、校验引用版本和 lineage，并再次复核
+目标 Revision 的 ID 与行为摘要。Resolver 不提供写 Stable 接口，Promotion 与 Rollback 的
+写边界仍由可信 Release Controller 持有。
+
 ## 运行绑定
 
 每次需要形成证据的运行必须先创建 `EpisodeRecorderConfig`。配置会预先生成唯一
@@ -50,10 +55,29 @@ Episode。Episode Header、Incident 和 Outcome Revision 共享预分配的 `Epi
 `run_session_with_id` 只是一项 Core 通用机制，不解析 Genome 或 Episode。
 
 TUI 的 Evidence 装配默认关闭。启用时，启动阶段先从
-`<evidence-root>/genomes/<revision-id>.json` 读取并验证不可变 Revision；任一真实主会话在
+`<evidence-root>/genomes/<revision-id>.json` 读取并验证不可变 Revision，或把 Stable lineage
+解析为精确 Revision。普通配置只继续提供模型凭据；provider 类型、端点、协议、模型参数、
+Prompt、原生工具、插件 bundle、独占能力 owner 和执行策略都由 Genome 装配。Genome 必须
+按顺序引用至少一个包含完整系统提示的 UTF-8 Prompt CAS 制品；空 Prompt 不会隐式采用普通
+配置或 Core 默认提示。Prompt 与 Provider Options 从 Artifact CAS 按摘要读取，插件 bundle
+使用 Plugin Manager 的同一摘要算法复核。额外发现的插件不会进入 Evidence 组合，任一固定
+插件未 Ready 或加载失败时禁止开始 Run。
+
+启动还会把 Revision 的包版本、Git 提交、dirty 状态、目标三元组和 TUI feature 与编译产物
+逐项核对。源码归档构建使用显式 `unknown` 提交标记；它只能匹配同样声明的 Genome，且无法
+证明干净时按 dirty 构建处理。
+
+当前 TUI 没有跨插件的 Context、Planning 与 Skill 独立快照服务，因此包含这些非空字段的
+Genome 会明确拒绝运行，不会只记录字段却继续采用另一份真实配置。插件内部配置和 Skill
+文件仍可随整个 bundle 被摘要固定；以后开放独立变异表面时，需要由对应插件提供版本化快照
+服务。任一真实主会话在
 用户输入成功写入 Session Store 后预登记 Recorder，再把同一个 Run ID 传入 Core。正常
 `RunFinished`、取消、步骤预算耗尽和基础设施错误都会显式收敛并释放路由。证据写入失败会
 报告为运行完成错误，不会被静默忽略。
+
+新 Session 在首次保存前写入 `agent_genome/<revision-id>` 行为绑定。已持久化 Session 只能在
+绑定完全相同时恢复；旧记录缺少绑定或绑定不同 Revision 时拒绝恢复，避免 Stable 更新后让
+长会话静默切换行为版本。
 
 插件 Runtime 的子 Agent 不继承 TUI 主会话 Recorder。TUI 在创建 Runtime 时注入可信
 `RuntimeRunObserver`；Runtime 在 Core 启动前向观察器提交 Host 维护的 `AgentId` 与
@@ -154,6 +178,11 @@ SHA-256 摘要；`--verify` 还会读取 CAS，逐项校验引用制品摘要与
 常用只读命令如下：
 
 ```bash
+lucia evolution genome inspect --revision <revision-id> [--format json]
+lucia evolution genome inspect --stable stable/general [--format json]
+lucia evolution genome verify --revision <revision-id>
+lucia evolution genome diff --parent <revision-id> --candidate <revision-id>
+lucia evolution genome diff --parent <revision-id> --candidate <revision-id> --allow task-strategy-prompt
 lucia evolution compare --report <evaluation-report.json> --format table
 lucia evolution compare --parent <parent-revision> --candidate <candidate-revision> --format json
 lucia evolution dashboard [--lineage stable/general]
@@ -164,6 +193,9 @@ lucia evolution capability-map [--lineage stable/general] [--format json]
 lucia evolution funnel [--lineage stable/general] [--format json]
 lucia evolution certificate <release-id> --verify [--format json]
 ```
+
+Genome 子命令全部只读。`diff --allow` 由可信实现逐字段计算差异，不接受 Candidate 自报的
+变更列表；任一变化落在允许表面之外时命令失败。
 
 四页 Ratatui Dashboard 通过 `Tab`、左右方向键或数字 `1` 至 `4` 切换 Overview、
 Capability Map、Lineage 与 Evidence，Evidence 页使用上下方向键下钻，`q` 或 `Esc` 退出。
