@@ -375,6 +375,9 @@ mod tests {
         EvaluationReport {
             schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
             report_id: EvaluationReportId::generate(),
+            lineage: Some("stable/general".into()),
+            parent_generation: Some(1),
+            candidate_generation: Some(2),
             parent: EvaluationRun {
                 run_id: EvaluationRunId::generate(),
                 genome_revision: GenomeRevisionId::generate(),

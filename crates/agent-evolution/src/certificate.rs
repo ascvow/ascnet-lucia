@@ -155,14 +155,7 @@ impl EvolutionCertificate {
     ///
     /// 结构无效、摘要不匹配、任一制品不存在、内容哈希或长度不匹配时返回错误。
     pub async fn verify(&self, artifacts: &dyn ArtifactStore) -> Result<(), CertificateError> {
-        self.validate_structure()?;
-        let actual = self.compute_digest()?;
-        if actual != self.certificate_digest {
-            return Err(CertificateError::DigestMismatch {
-                declared: self.certificate_digest.clone(),
-                actual,
-            });
-        }
+        self.verify_digest()?;
         for reference in self
             .candidate_artifacts
             .iter()
@@ -170,6 +163,23 @@ impl EvolutionCertificate {
             .chain(self.inheritance_verification.iter())
         {
             verify_artifact(reference, artifacts).await?;
+        }
+        Ok(())
+    }
+
+    /// 校验结构与 Certificate 自身摘要，不读取外部 CAS。
+    ///
+    /// # Errors
+    ///
+    /// Schema、Promotion 状态、关键列表或摘要不合法时返回错误。
+    pub fn verify_digest(&self) -> Result<(), CertificateError> {
+        self.validate_structure()?;
+        let actual = self.compute_digest()?;
+        if actual != self.certificate_digest {
+            return Err(CertificateError::DigestMismatch {
+                declared: self.certificate_digest.clone(),
+                actual,
+            });
         }
         Ok(())
     }
@@ -408,6 +418,8 @@ impl InheritanceMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FileArtifactStore, FileEvolutionArchive};
+    use uuid::Uuid;
 
     #[test]
     fn certificate_digest_changes_after_rollback() {
@@ -447,5 +459,65 @@ mod tests {
         let rolled_back = signed.rolled_back().expect("应创建回滚视图");
         assert_ne!(signed.certificate_digest, rolled_back.certificate_digest);
         assert_eq!(rolled_back.lifecycle, EvolutionLifecycle::RolledBack);
+    }
+
+    #[tokio::test]
+    async fn certificate_verify_checks_all_cas_references() {
+        let root =
+            std::env::temp_dir().join(format!("lucia-certificate-{}", Uuid::new_v4().simple()));
+        let artifacts = FileArtifactStore::new(root.join("artifacts"));
+        let candidate = artifacts
+            .put("application/json", br#"{"candidate":true}"#)
+            .await
+            .expect("应写入 Candidate 制品");
+        let scorecard = artifacts
+            .put("application/json", br#"{"schema_version":1}"#)
+            .await
+            .expect("应写入 Scorecard");
+        let inheritance = artifacts
+            .put("application/json", br#"{"verified":true}"#)
+            .await
+            .expect("应写入继承证据");
+        let mut certificate = EvolutionCertificate {
+            schema_version: EVOLUTION_CERTIFICATE_SCHEMA_VERSION,
+            parent_revision: GenomeRevisionId::generate(),
+            child_revision: GenomeRevisionId::generate(),
+            source_episode_ids: vec![EpisodeId::generate()],
+            evolution_issue_id: EvolutionIssueId::generate(),
+            mutation_id: MutationId::generate(),
+            allowed_diff: GenomeDiff::default(),
+            candidate_artifacts: vec![candidate],
+            repair_dataset: DatasetVersionId::generate(),
+            regression_dataset: DatasetVersionId::generate(),
+            hidden_dataset: DatasetVersionId::generate(),
+            safety_dataset: DatasetVersionId::generate(),
+            repaired_task_case_ids: vec!["repair-1".into()],
+            evaluation_report: EvaluationReportId::generate(),
+            scorecard,
+            gate_decision: GateDecision::Pass,
+            release_record: ReleaseId::generate(),
+            inheritance_verification: Some(inheritance),
+            post_promotion_run_ids: vec![RunId::generate()],
+            lifecycle: EvolutionLifecycle::InheritanceVerified,
+            certificate_digest: empty_digest(),
+        };
+        certificate.certificate_digest = certificate.compute_digest().expect("应计算摘要");
+        certificate
+            .verify(&artifacts)
+            .await
+            .expect("全部 CAS 引用应验证通过");
+
+        let archive = FileEvolutionArchive::new(&root);
+        archive
+            .append_certificate(&certificate)
+            .await
+            .expect("Certificate 应归档");
+        let loaded = archive
+            .certificate(&certificate.release_record)
+            .await
+            .expect("归档应可读取")
+            .expect("Certificate 应存在");
+        assert_eq!(loaded.certificate_digest, certificate.certificate_digest);
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

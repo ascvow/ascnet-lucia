@@ -1,14 +1,16 @@
 //! 固定 Evaluation Artifact 驱动的完整 Scorecard 验收场景。
 
 use agent_evolution::{
-    compute_scorecard, BehaviorAssessment, EvolutionVerdictPolicy, HeadlineVerdict,
+    compute_scorecard, ArtifactStore, BehaviorAssessment, EvolutionCertificate,
+    EvolutionCertificateInput, EvolutionVerdictPolicy, FileArtifactStore,
+    FileEvaluationReportStore, FileEvolutionArchive, HeadlineVerdict,
 };
 use agent_evolution_protocol::{
-    DatasetKind, DatasetVersionId, EvaluationEnvironment, EvaluationReport, EvaluationReportId,
-    EvaluationRun, EvaluationRunId, EvaluationUsage, EvolutionLifecycle, GateDecision, GenomeDiff,
-    GenomeRevisionId, InheritanceVerification, MutationSurface, ReleaseId, SafetyAttemptSummary,
-    TaskAttemptResult, TaskAttemptStatus, TaskCaseMetadata, TaskCaseResult,
-    EVALUATION_REPORT_SCHEMA_VERSION,
+    DatasetKind, DatasetVersionId, EpisodeId, EvaluationEnvironment, EvaluationReport,
+    EvaluationReportId, EvaluationRun, EvaluationRunId, EvaluationUsage, EvolutionIssueId,
+    EvolutionLifecycle, GateDecision, GenomeDiff, GenomeRevisionId, InheritanceVerification,
+    MutationId, MutationSurface, ReleaseId, RunId, SafetyAttemptSummary, TaskAttemptResult,
+    TaskAttemptStatus, TaskCaseMetadata, TaskCaseResult, EVALUATION_REPORT_SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
 
@@ -124,6 +126,9 @@ fn evolved_report() -> EvaluationReport {
     EvaluationReport {
         schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
         report_id: EvaluationReportId::generate(),
+        lineage: Some("stable/general".into()),
+        parent_generation: Some(6),
+        candidate_generation: Some(7),
         parent: EvaluationRun {
             run_id: EvaluationRunId::generate(),
             genome_revision: GenomeRevisionId::generate(),
@@ -166,9 +171,11 @@ fn evolved_report() -> EvaluationReport {
     }
 }
 
-#[test]
-fn full_evolved_fixture_matches_scorecard_contract() {
-    let scorecard = compute_scorecard(&evolved_report(), &EvolutionVerdictPolicy::default())
+/// 验证完整 Scorecard；设置 `LUCIA_EVOLUTION_E2E_ROOT` 时额外导出可供 CLI 验收的归档。
+#[tokio::test]
+async fn full_evolved_fixture_matches_scorecard_contract() {
+    let report = evolved_report();
+    let scorecard = compute_scorecard(&report, &EvolutionVerdictPolicy::default())
         .expect("完整 Fixture 应生成评分卡");
     assert_eq!(
         scorecard.behavior_assessment,
@@ -202,4 +209,73 @@ fn full_evolved_fixture_matches_scorecard_contract() {
         .expect("应有继承指标")
         .rate()
         .is_complete());
+
+    if let Some(root) = std::env::var_os("LUCIA_EVOLUTION_E2E_ROOT") {
+        let root = std::path::PathBuf::from(root);
+        FileEvaluationReportStore::new(&root)
+            .append(&report)
+            .await
+            .expect("应导出 EvaluationReport");
+        let artifacts = FileArtifactStore::new(root.join("artifacts"));
+        let candidate_artifact = artifacts
+            .put("application/json", br#"{"candidate":true}"#)
+            .await
+            .expect("应导出 Candidate Artifact");
+        let scorecard_artifact = artifacts
+            .put(
+                "application/json",
+                &serde_json::to_vec_pretty(&scorecard).expect("Scorecard 应可序列化"),
+            )
+            .await
+            .expect("应导出 Scorecard Artifact");
+        let inheritance_artifact = artifacts
+            .put(
+                "application/json",
+                &serde_json::to_vec_pretty(report.inheritance.as_ref().expect("应有继承证据"))
+                    .expect("继承证据应可序列化"),
+            )
+            .await
+            .expect("应导出继承证据 Artifact");
+        let certificate = EvolutionCertificate::create(
+            EvolutionCertificateInput {
+                parent_revision: report.parent.genome_revision.clone(),
+                child_revision: report.candidate.genome_revision.clone(),
+                source_episode_ids: vec![EpisodeId::generate()],
+                evolution_issue_id: EvolutionIssueId::generate(),
+                mutation_id: MutationId::generate(),
+                allowed_diff: report.genome_diff.clone(),
+                candidate_artifacts: vec![candidate_artifact],
+                repair_dataset: report.candidate.datasets[&DatasetKind::Repair].clone(),
+                regression_dataset: report.candidate.datasets[&DatasetKind::Regression].clone(),
+                hidden_dataset: report.candidate.datasets[&DatasetKind::Hidden].clone(),
+                safety_dataset: report.candidate.datasets[&DatasetKind::Safety].clone(),
+                repaired_task_case_ids: vec!["Repair-000".into()],
+                scorecard: scorecard_artifact,
+                release_record: report.release_record.clone().expect("应有 Release"),
+                inheritance_verification: inheritance_artifact,
+                post_promotion_run_ids: vec![RunId::generate()],
+            },
+            &scorecard,
+        )
+        .expect("应生成 Certificate");
+        certificate
+            .verify(&artifacts)
+            .await
+            .expect("Certificate 应通过 CAS 验证");
+        let archive = FileEvolutionArchive::new(&root);
+        archive
+            .append_scorecard(&scorecard)
+            .await
+            .expect("应归档 Scorecard");
+        archive
+            .append_certificate(&certificate)
+            .await
+            .expect("应归档 Certificate");
+        println!(
+            "fixture_root={} report={} release={}",
+            root.display(),
+            report.report_id,
+            certificate.release_record
+        );
+    }
 }

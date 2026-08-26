@@ -329,6 +329,15 @@ pub struct EvaluationReport {
     pub schema_version: u32,
     /// 报告标识。
     pub report_id: EvaluationReportId,
+    /// Evolution Lineage 稳定名称；旧报告未知时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<String>,
+    /// Parent 在该 Lineage 中的代数；旧报告未知时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_generation: Option<u64>,
+    /// Candidate 在该 Lineage 中的代数；未晋升 Candidate 也必须使用唯一代数候选值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_generation: Option<u64>,
     /// Parent 评测结果。
     pub parent: EvaluationRun,
     /// Candidate 评测结果。
@@ -367,8 +376,8 @@ impl EvaluationReport {
     ///
     /// # Errors
     ///
-    /// Schema 版本未知、Parent/Candidate 修订相同、TaskCase 与 Attempt 标识不一致，
-    /// 或 Repeat 序号重复时返回 [`InvalidEvaluationReport`]。
+    /// Schema 版本未知、Lineage 与代数不一致、Parent/Candidate 修订相同、TaskCase 与
+    /// Attempt 标识不一致或 Repeat 序号重复时返回 [`InvalidEvaluationReport`]。
     pub fn validate(&self) -> Result<(), InvalidEvaluationReport> {
         if self.schema_version != EVALUATION_REPORT_SCHEMA_VERSION {
             return Err(InvalidEvaluationReport::UnsupportedSchemaVersion {
@@ -379,6 +388,11 @@ impl EvaluationReport {
         if self.parent.genome_revision == self.candidate.genome_revision {
             return Err(InvalidEvaluationReport::SameRevision);
         }
+        validate_lineage(
+            self.lineage.as_deref(),
+            self.parent_generation,
+            self.candidate_generation,
+        )?;
         validate_run(&self.parent)?;
         validate_run(&self.candidate)?;
         Ok(())
@@ -399,6 +413,20 @@ pub enum InvalidEvaluationReport {
     /// Parent 与 Candidate 指向同一修订。
     #[error("Parent 与 Candidate 不能是同一 Genome 修订")]
     SameRevision,
+    /// Lineage 或代数字段只填写了一部分，无法可靠解释历史关系。
+    #[error("EvaluationReport 的 Lineage、Parent 代数和 Candidate 代数必须同时存在或同时缺失")]
+    IncompleteLineage,
+    /// Lineage 不是安全的稳定名称。
+    #[error("EvaluationReport Lineage 不符合安全标识规则：{0}")]
+    InvalidLineage(String),
+    /// Candidate 不是 Parent 的下一代。
+    #[error("Candidate 代数必须等于 Parent 代数加一：Parent={parent}，Candidate={candidate}")]
+    InvalidGeneration {
+        /// Parent 代数。
+        parent: u64,
+        /// Candidate 代数。
+        candidate: u64,
+    },
     /// 同一运行内 TaskCase 标识重复。
     #[error("EvaluationRun 中 TaskCase 标识重复：{0}")]
     DuplicateTaskCase(String),
@@ -418,6 +446,41 @@ pub enum InvalidEvaluationReport {
         /// 重复序号。
         repeat_index: u32,
     },
+}
+
+/// 校验可选历史字段的完整性、安全名称与相邻代关系。
+fn validate_lineage(
+    lineage: Option<&str>,
+    parent_generation: Option<u64>,
+    candidate_generation: Option<u64>,
+) -> Result<(), InvalidEvaluationReport> {
+    let (Some(lineage), Some(parent), Some(candidate)) =
+        (lineage, parent_generation, candidate_generation)
+    else {
+        return if lineage.is_none() && parent_generation.is_none() && candidate_generation.is_none()
+        {
+            Ok(())
+        } else {
+            Err(InvalidEvaluationReport::IncompleteLineage)
+        };
+    };
+    if lineage.is_empty()
+        || lineage.len() > 128
+        || lineage.starts_with('/')
+        || lineage.ends_with('/')
+        || lineage
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        || !lineage
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+    {
+        return Err(InvalidEvaluationReport::InvalidLineage(lineage.into()));
+    }
+    if parent.checked_add(1) != Some(candidate) {
+        return Err(InvalidEvaluationReport::InvalidGeneration { parent, candidate });
+    }
+    Ok(())
 }
 
 /// 校验单个 EvaluationRun 的 Case 与 Repeat 唯一性。
@@ -491,6 +554,9 @@ mod tests {
         EvaluationReport {
             schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
             report_id: EvaluationReportId::generate(),
+            lineage: Some("stable/general".into()),
+            parent_generation: Some(1),
+            candidate_generation: Some(2),
             parent: EvaluationRun {
                 run_id: EvaluationRunId::generate(),
                 genome_revision: GenomeRevisionId::generate(),
@@ -527,6 +593,43 @@ mod tests {
             value.validate(),
             Err(InvalidEvaluationReport::AttemptCaseMismatch { .. })
         ));
+    }
+
+    /// 旧报告可同时缺少全部历史字段，但部分缺失不能进入历史计算。
+    #[test]
+    fn validates_optional_lineage_as_one_complete_group() {
+        let mut legacy = report();
+        legacy.lineage = None;
+        legacy.parent_generation = None;
+        legacy.candidate_generation = None;
+        legacy.validate().expect("旧报告应保持兼容");
+
+        legacy.lineage = Some("stable/general".into());
+        assert_eq!(
+            legacy.validate(),
+            Err(InvalidEvaluationReport::IncompleteLineage)
+        );
+    }
+
+    /// Lineage 名称和相邻代关系在进入 Store 前必须通过校验。
+    #[test]
+    fn rejects_unsafe_lineage_and_non_adjacent_generation() {
+        let mut value = report();
+        value.lineage = Some("../stable".into());
+        assert!(matches!(
+            value.validate(),
+            Err(InvalidEvaluationReport::InvalidLineage(_))
+        ));
+
+        value.lineage = Some("stable/general".into());
+        value.candidate_generation = Some(3);
+        assert_eq!(
+            value.validate(),
+            Err(InvalidEvaluationReport::InvalidGeneration {
+                parent: 1,
+                candidate: 3,
+            })
+        );
     }
 
     #[test]

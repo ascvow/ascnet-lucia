@@ -2,13 +2,19 @@
 
 use crate::app_config::lucia_home_dir;
 use agent_evolution::{
-    compute_scorecard, load_evaluation_report, EvolutionScorecard, EvolutionVerdictPolicy,
-    FileEvaluationReportStore, HeadlineVerdict, InheritanceMetrics, Rate, ResourceDelta,
+    compute_history, compute_scorecard, load_evaluation_report, CapabilityMapRow,
+    EvolutionCertificate, EvolutionFunnel, EvolutionHistory, EvolutionScorecard,
+    EvolutionVerdictPolicy, FileArtifactStore, FileEvaluationReportStore, FileEvolutionArchive,
+    InheritanceMetrics, LineageNode, Rate, ResourceDelta,
 };
-use agent_evolution_protocol::{EvaluationReport, GenomeRevisionId};
+use agent_evolution_protocol::{EvaluationReport, GenomeRevisionId, ReleaseId};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
-use std::{io::IsTerminal, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::IsTerminal,
+    path::PathBuf,
+};
 
 /// `lucia evolution` 的公共参数。
 #[derive(Debug, ClapArgs)]
@@ -28,6 +34,16 @@ enum EvolutionCommand {
     Compare(CompareArgs),
     /// 显示最近一次已发布 Candidate 的 Scorecard。
     Dashboard(DashboardArgs),
+    /// 查看或验证一次 Promotion 的不可变证明包。
+    Certificate(CertificateArgs),
+    /// 显示多代进化指标与趋势。
+    History(HistoryArgs),
+    /// 显示指定 Lineage 的 Candidate、发布、拒绝与回滚节点。
+    Lineage(LineageArgs),
+    /// 显示 Task Family × Generation 能力图。
+    CapabilityMap(HistoryArgs),
+    /// 显示 Evolution Engine 漏斗与 Candidate Yield。
+    Funnel(HistoryArgs),
 }
 
 /// `lucia evolution compare` 参数。
@@ -56,6 +72,12 @@ struct CompareArgs {
 /// `lucia evolution dashboard` 参数。
 #[derive(Debug, ClapArgs)]
 struct DashboardArgs {
+    /// 只选择显式绑定该 Lineage 的最近发布。
+    #[arg(long)]
+    lineage: Option<String>,
+    /// 在当前 `lucia` 二进制内启动四页 Ratatui Dashboard。
+    #[arg(long)]
+    tui: bool,
     /// 输出格式。
     #[arg(long, value_enum, default_value_t = ScorecardFormat::Table)]
     format: ScorecardFormat,
@@ -65,6 +87,46 @@ struct DashboardArgs {
     /// 覆盖表格显示宽度。
     #[arg(long, hide = true)]
     width: Option<u16>,
+}
+
+/// 历史、能力图与漏斗的公共参数。
+#[derive(Debug, ClapArgs)]
+struct HistoryArgs {
+    /// 只分析显式绑定该 Lineage 的报告。
+    #[arg(long)]
+    lineage: Option<String>,
+    /// 输出格式。
+    #[arg(long, value_enum, default_value_t = ScorecardFormat::Table)]
+    format: ScorecardFormat,
+    /// 版本化 EvolutionVerdictPolicy JSON。
+    #[arg(long)]
+    policy: Option<PathBuf>,
+}
+
+/// `lucia evolution lineage [lineage]` 参数。
+#[derive(Debug, ClapArgs)]
+struct LineageArgs {
+    /// Lineage 稳定名称；省略时显示全部显式 Lineage。
+    lineage: Option<String>,
+    /// 输出格式。
+    #[arg(long, value_enum, default_value_t = ScorecardFormat::Table)]
+    format: ScorecardFormat,
+    /// 版本化 EvolutionVerdictPolicy JSON。
+    #[arg(long)]
+    policy: Option<PathBuf>,
+}
+
+/// `lucia evolution certificate` 参数。
+#[derive(Debug, ClapArgs)]
+struct CertificateArgs {
+    /// Promotion 的 Release ID。
+    release: String,
+    /// 读取 CAS 并验证 Certificate 自身与全部引用制品。
+    #[arg(long)]
+    verify: bool,
+    /// 输出格式。
+    #[arg(long, value_enum, default_value_t = ScorecardFormat::Table)]
+    format: ScorecardFormat,
 }
 
 /// Scorecard 输出格式。
@@ -84,7 +146,37 @@ pub(crate) async fn run(args: EvolutionArgs) -> Result<()> {
     match args.command {
         EvolutionCommand::Compare(options) => run_compare(&root, options).await,
         EvolutionCommand::Dashboard(options) => run_dashboard(&root, options).await,
+        EvolutionCommand::Certificate(options) => run_certificate(&root, options).await,
+        EvolutionCommand::History(options) => {
+            run_history(&root, options, HistoryView::Summary).await
+        }
+        EvolutionCommand::Lineage(options) => run_lineage(&root, options).await,
+        EvolutionCommand::CapabilityMap(options) => {
+            run_history(&root, options, HistoryView::CapabilityMap).await
+        }
+        EvolutionCommand::Funnel(options) => run_history(&root, options, HistoryView::Funnel).await,
     }
+}
+
+/// 读取 Certificate，并按需验证所有 CAS 引用。
+async fn run_certificate(root: &std::path::Path, options: CertificateArgs) -> Result<()> {
+    let release = ReleaseId::new(options.release).context("release 不是合法 ReleaseId")?;
+    let certificate = FileEvolutionArchive::new(root)
+        .certificate(&release)
+        .await
+        .context("读取 EvolutionCertificate 失败")?
+        .ok_or_else(|| anyhow!("没有找到 Release 对应的 EvolutionCertificate"))?;
+    if options.verify {
+        certificate
+            .verify(&FileArtifactStore::new(root.join("artifacts")))
+            .await
+            .context("EvolutionCertificate 验证失败")?;
+    }
+    println!(
+        "{}",
+        render_certificate(&certificate, options.format, options.verify)?
+    );
+    Ok(())
 }
 
 /// 加载指定报告或 Store 索引并输出 Scorecard。
@@ -118,22 +210,130 @@ async fn run_compare(root: &std::path::Path, options: CompareArgs) -> Result<()>
 
 /// 从 Store 中选择最近一次有 Release 的正式报告。
 async fn run_dashboard(root: &std::path::Path, options: DashboardArgs) -> Result<()> {
-    let reports = FileEvaluationReportStore::new(root)
-        .list()
-        .await
-        .context("读取 Evolution 历史失败")?;
-    let report = reports
-        .into_iter()
-        .rev()
-        .find(|report| report.release_record.is_some())
-        .ok_or_else(|| anyhow!("暂无已发布 Evolution 数据；请先生成可信 EvaluationReport"))?;
+    let reports = match FileEvaluationReportStore::new(root).list().await {
+        Ok(reports) => reports,
+        Err(error) if options.tui => {
+            return crate::evolution_dashboard::run(
+                crate::evolution_dashboard::EvolutionDashboardState::failed(format!(
+                    "读取 Evolution 历史失败：{error}"
+                )),
+            );
+        }
+        Err(error) => return Err(error).context("读取 Evolution 历史失败"),
+    };
     let policy = load_policy(options.policy.as_ref()).await?;
-    let scorecard = compute_scorecard(&report, &policy).context("计算 Evolution Scorecard 失败")?;
+    let report = reports.iter().rev().find(|report| {
+        report.release_record.is_some()
+            && options
+                .lineage
+                .as_deref()
+                .is_none_or(|lineage| report.lineage.as_deref() == Some(lineage))
+    });
+    let scorecard = report
+        .map(|report| compute_scorecard(report, &policy))
+        .transpose()
+        .context("计算 Evolution Scorecard 失败")?;
+    if options.tui {
+        let certificates = match FileEvolutionArchive::new(root).list_certificates().await {
+            Ok(certificates) => certificates,
+            Err(error) => {
+                return crate::evolution_dashboard::run(
+                    crate::evolution_dashboard::EvolutionDashboardState::failed(format!(
+                        "读取 EvolutionCertificate 历史失败：{error}"
+                    )),
+                );
+            }
+        };
+        let history =
+            match compute_history(&reports, &certificates, &policy, options.lineage.as_deref()) {
+                Ok(history) => history,
+                Err(error) => {
+                    return crate::evolution_dashboard::run(
+                        crate::evolution_dashboard::EvolutionDashboardState::failed(format!(
+                            "计算 Evolution 历史失败：{error}"
+                        )),
+                    );
+                }
+            };
+        let certificate = scorecard.as_ref().and_then(|scorecard| {
+            let release = scorecard.release_record.as_ref()?;
+            certificates
+                .iter()
+                .find(|certificate| {
+                    &certificate.release_record == release
+                        && certificate.evaluation_report == scorecard.evaluation_report
+                })
+                .cloned()
+        });
+        return crate::evolution_dashboard::run(
+            crate::evolution_dashboard::EvolutionDashboardState::loaded(
+                scorecard,
+                certificate,
+                history,
+            ),
+        );
+    }
+    let scorecard = scorecard
+        .ok_or_else(|| anyhow!("暂无已发布 Evolution 数据；请先生成可信 EvaluationReport"))?;
     println!(
         "{}",
         render_scorecard(&scorecard, options.format, resolve_width(options.width))?
     );
     Ok(())
+}
+
+/// 历史命令选择的表格视图。
+#[derive(Debug, Clone, Copy)]
+enum HistoryView {
+    /// 综合历史摘要。
+    Summary,
+    /// Task Family × Generation 能力图。
+    CapabilityMap,
+    /// Evolution Engine 漏斗。
+    Funnel,
+}
+
+/// 加载真实报告与 Certificate 并输出历史视图。
+async fn run_history(
+    root: &std::path::Path,
+    options: HistoryArgs,
+    view: HistoryView,
+) -> Result<()> {
+    let policy = load_policy(options.policy.as_ref()).await?;
+    let history = load_history(root, &policy, options.lineage.as_deref()).await?;
+    println!(
+        "{}",
+        render_history(&history, options.format, view).context("渲染 Evolution 历史失败")?
+    );
+    Ok(())
+}
+
+/// 适配 positional Lineage 参数到公共历史加载路径。
+async fn run_lineage(root: &std::path::Path, options: LineageArgs) -> Result<()> {
+    let policy = load_policy(options.policy.as_ref()).await?;
+    let history = load_history(root, &policy, options.lineage.as_deref()).await?;
+    println!(
+        "{}",
+        render_lineage(&history, options.format).context("渲染 Evolution Lineage 失败")?
+    );
+    Ok(())
+}
+
+/// 从不可变报告与 Certificate 归档计算当前 Policy 下的历史结果。
+async fn load_history(
+    root: &std::path::Path,
+    policy: &EvolutionVerdictPolicy,
+    lineage: Option<&str>,
+) -> Result<EvolutionHistory> {
+    let reports = FileEvaluationReportStore::new(root)
+        .list()
+        .await
+        .context("读取 EvaluationReport 历史失败")?;
+    let certificates = FileEvolutionArchive::new(root)
+        .list_certificates()
+        .await
+        .context("读取 EvolutionCertificate 历史失败")?;
+    compute_history(&reports, &certificates, policy, lineage).context("计算 Evolution 历史指标失败")
 }
 
 /// 解析必需的 Genome 修订参数。
@@ -205,6 +405,287 @@ fn render_scorecard(
             serde_json::to_string_pretty(scorecard).context("序列化 Scorecard JSON 失败")
         }
         ScorecardFormat::Markdown => Ok(render_markdown(scorecard)),
+    }
+}
+
+/// 生成 Certificate 的稳定文本或 JSON。
+fn render_certificate(
+    certificate: &EvolutionCertificate,
+    format: ScorecardFormat,
+    verified: bool,
+) -> Result<String> {
+    match format {
+        ScorecardFormat::Json => {
+            serde_json::to_string_pretty(certificate).context("序列化 Certificate JSON 失败")
+        }
+        ScorecardFormat::Table => Ok(format!(
+            "Lucia Evolution Certificate\nRelease: {}\nParent: {}\nChild: {}\nGate: {:?}\nLifecycle: {:?}\nEvaluationReport: {}\nSource Episodes: {}\nRepaired Cases: {}\nPost-promotion Runs: {}\nVerification: {}\nDigest: {}",
+            certificate.release_record,
+            certificate.parent_revision,
+            certificate.child_revision,
+            certificate.gate_decision,
+            certificate.lifecycle,
+            certificate.evaluation_report,
+            certificate.source_episode_ids.len(),
+            certificate.repaired_task_case_ids.len(),
+            certificate.post_promotion_run_ids.len(),
+            if verified { "PASS" } else { "NOT_REQUESTED" },
+            certificate.certificate_digest,
+        )),
+        ScorecardFormat::Markdown => Ok(format!(
+            "# Lucia Evolution Certificate\n\n- Release: `{}`\n- Parent: `{}`\n- Child: `{}`\n- Gate: `{:?}`\n- Lifecycle: `{:?}`\n- EvaluationReport: `{}`\n- Verification: **{}**\n- Digest: `{}`\n",
+            certificate.release_record,
+            certificate.parent_revision,
+            certificate.child_revision,
+            certificate.gate_decision,
+            certificate.lifecycle,
+            certificate.evaluation_report,
+            if verified { "PASS" } else { "NOT_REQUESTED" },
+            certificate.certificate_digest,
+        )),
+    }
+}
+
+/// 渲染综合历史、能力图或漏斗；JSON 始终携带 Schema 版本。
+fn render_history(
+    history: &EvolutionHistory,
+    format: ScorecardFormat,
+    view: HistoryView,
+) -> Result<String> {
+    match format {
+        ScorecardFormat::Json => match view {
+            HistoryView::Summary => {
+                serde_json::to_string_pretty(history).context("序列化 EvolutionHistory 失败")
+            }
+            HistoryView::CapabilityMap => serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": history.schema_version,
+                "lineage": history.lineage,
+                "capability_map": history.capability_map,
+            }))
+            .context("序列化 CapabilityMap 失败"),
+            HistoryView::Funnel => serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": history.schema_version,
+                "lineage": history.lineage,
+                "funnel": history.funnel,
+                "candidate_yield": history.candidate_yield,
+                "rollback_rate": history.rollback_rate,
+            }))
+            .context("序列化 EvolutionFunnel 失败"),
+        },
+        ScorecardFormat::Table => Ok(match view {
+            HistoryView::Summary => render_history_summary(history),
+            HistoryView::CapabilityMap => render_capability_map(&history.capability_map),
+            HistoryView::Funnel => render_funnel(&history.funnel, history),
+        }),
+        ScorecardFormat::Markdown => Ok(match view {
+            HistoryView::Summary => render_history_markdown(history),
+            HistoryView::CapabilityMap => {
+                format!(
+                    "# Lucia Capability Map\n\n```text\n{}\n```\n",
+                    render_capability_map(&history.capability_map)
+                )
+            }
+            HistoryView::Funnel => {
+                format!(
+                    "# Lucia Evolution Funnel\n\n```text\n{}\n```\n",
+                    render_funnel(&history.funnel, history)
+                )
+            }
+        }),
+    }
+}
+
+/// 渲染 Lineage 节点；JSON 与 Markdown 复用稳定节点结构。
+fn render_lineage(history: &EvolutionHistory, format: ScorecardFormat) -> Result<String> {
+    match format {
+        ScorecardFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": history.schema_version,
+            "lineage": history.lineage,
+            "nodes": history.lineage_nodes,
+        }))
+        .context("序列化 Lineage 失败"),
+        ScorecardFormat::Table => Ok(render_lineage_nodes(&history.lineage_nodes)),
+        ScorecardFormat::Markdown => Ok(format!(
+            "# Lucia Evolution Lineage\n\n```text\n{}\n```\n",
+            render_lineage_nodes(&history.lineage_nodes)
+        )),
+    }
+}
+
+/// 渲染历史摘要，保留 Dataset 版本分段与缺失值。
+fn render_history_summary(history: &EvolutionHistory) -> String {
+    let mut lines = vec![
+        "Lucia Evolution History".into(),
+        format!(
+            "Lineage: {}  Evaluated: {}  Promotions: {}  Rollbacks: {}",
+            history.lineage.as_deref().unwrap_or("ALL"),
+            history.funnel.evaluated_candidates,
+            history.funnel.promotions,
+            history.funnel.rollbacks
+        ),
+        format!(
+            "Candidate Yield: {}  Rollback Rate: {}",
+            rate(history.candidate_yield),
+            rate(history.rollback_rate)
+        ),
+    ];
+    for survival in &history.fix_survival {
+        lines.push(format!(
+            "Fix Survival @{}: {}",
+            survival.generations,
+            rate(survival.rate)
+        ));
+    }
+    lines.push("Hidden Dataset segments:".into());
+    if history.hidden_trends.is_empty() {
+        lines.push("  N/A".into());
+    } else {
+        for segment in &history.hidden_trends {
+            lines.push(format!(
+                "  {}  generations {}  cumulative {}",
+                segment.dataset_version,
+                segment.points.len(),
+                pp(segment.cumulative_gain_pp)
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push(render_lineage_nodes(&history.lineage_nodes));
+    lines.join("\n")
+}
+
+/// 渲染 Engine 漏斗；上游没有结构化记录的阶段显示 N/A。
+fn render_funnel(funnel: &EvolutionFunnel, history: &EvolutionHistory) -> String {
+    [
+        "Lucia Evolution Funnel".into(),
+        format!("Episodes              {}", optional_count(funnel.episodes)),
+        format!("Incidents             {}", optional_count(funnel.incidents)),
+        format!(
+            "Confirmed Failures    {}",
+            optional_count(funnel.confirmed_failures)
+        ),
+        format!(
+            "Clustered Issues      {}",
+            optional_count(funnel.clustered_issues)
+        ),
+        format!(
+            "Eligible Issues       {}",
+            optional_count(funnel.eligible_issues)
+        ),
+        format!(
+            "Generated Candidates  {}",
+            optional_count(funnel.generated_candidates)
+        ),
+        format!("Valid Candidates      {}", funnel.valid_candidates),
+        format!("Evaluated Candidates  {}", funnel.evaluated_candidates),
+        format!("Gate Passed           {}", funnel.gate_passed_candidates),
+        format!("Promotions            {}", funnel.promotions),
+        format!("Rollbacks             {}", funnel.rollbacks),
+        format!("Candidate Yield       {}", rate(history.candidate_yield)),
+        format!("Rollback Rate         {}", rate(history.rollback_rate)),
+    ]
+    .join("\n")
+}
+
+/// 渲染 Task Family × Generation 数值图，不以颜色作为唯一信息。
+fn render_capability_map(rows: &[CapabilityMapRow]) -> String {
+    if rows.is_empty() {
+        return "Lucia Capability Map\n暂无可验证的 Task Family 数据".into();
+    }
+    let generations: BTreeSet<_> = rows
+        .iter()
+        .flat_map(|row| row.cells.iter().map(|cell| cell.generation))
+        .collect();
+    let mut lines = vec![format!(
+        "Task Family                   {}",
+        generations
+            .iter()
+            .map(|generation| format!("G{generation:>4}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )];
+    for row in rows {
+        let cells: BTreeMap<_, _> = row
+            .cells
+            .iter()
+            .map(|cell| (cell.generation, cell))
+            .collect();
+        lines.push(format!(
+            "{:<28} {}",
+            truncate_chars(&row.task_family, 28),
+            generations
+                .iter()
+                .map(|generation| {
+                    cells
+                        .get(generation)
+                        .and_then(|cell| cell.score)
+                        .map(|score| format!("{:>5.1}%", score * 100.0))
+                        .unwrap_or_else(|| "  N/A".into())
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    lines.join("\n")
+}
+
+/// 渲染包含拒绝、隔离、发布与回滚节点的 Lineage。
+fn render_lineage_nodes(nodes: &[LineageNode]) -> String {
+    if nodes.is_empty() {
+        return "Lineage: 暂无可验证节点".into();
+    }
+    let mut lines = vec![
+        "Generation  Revision            Parent              Behavior                 Gate       Lifecycle              Capability  Hidden".into(),
+    ];
+    for node in nodes {
+        lines.push(format!(
+            "{:>10}  {:<18}  {:<18}  {:<23}  {:<9}  {:<21}  {:>10}  {:>7}",
+            node.generation
+                .map(|generation| format!("G{generation}"))
+                .unwrap_or_else(|| "N/A".into()),
+            truncate_chars(node.revision.as_str(), 18),
+            truncate_chars(node.parent.as_str(), 18),
+            format!("{:?}", node.behavior_assessment),
+            format!("{:?}", node.gate_decision),
+            format!("{:?}", node.lifecycle),
+            number(node.capability_score, ""),
+            percent(node.hidden_score),
+        ));
+    }
+    lines.join("\n")
+}
+
+/// 渲染简洁 Markdown 历史摘要。
+fn render_history_markdown(history: &EvolutionHistory) -> String {
+    format!(
+        "# Lucia Evolution History\n\n- Lineage: `{}`\n- Evaluated Candidates: {}\n- Promotions: {}\n- Rollbacks: {}\n- Candidate Yield: {}\n- Rollback Rate: {}\n\n```text\n{}\n```\n",
+        history.lineage.as_deref().unwrap_or("ALL"),
+        history.funnel.evaluated_candidates,
+        history.funnel.promotions,
+        history.funnel.rollbacks,
+        rate(history.candidate_yield),
+        rate(history.rollback_rate),
+        render_lineage_nodes(&history.lineage_nodes),
+    )
+}
+
+/// 区分未知计数与真实零。
+fn optional_count(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "N/A".into())
+}
+
+/// 按 Unicode 字符数截断表格文本。
+fn truncate_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        value.into()
+    } else {
+        value
+            .chars()
+            .take(max.saturating_sub(1))
+            .collect::<String>()
+            + "…"
     }
 }
 
@@ -536,9 +1017,9 @@ mod tests {
     use super::*;
     use agent_evolution::{
         BehaviorAssessment, CapabilityScoreSummary, ComparisonValidity, DatasetComparison,
-        DatasetMetricSummary, EvaluationConfidence, GateSummary, RegressionComparison,
-        RegressionRetention, ResourceComparison, ResourceDelta, SafetyComparison, SafetyMetrics,
-        StabilityMetrics,
+        DatasetMetricSummary, EvaluationConfidence, GateSummary, HeadlineVerdict,
+        RegressionComparison, RegressionRetention, ResourceComparison, ResourceDelta,
+        SafetyComparison, SafetyMetrics, StabilityMetrics,
     };
     use agent_evolution_protocol::{
         EvaluationReportId, EvolutionLifecycle, GateDecision, GenomeRevisionId,
@@ -566,6 +1047,9 @@ mod tests {
             schema_version: 1,
             parent_revision: GenomeRevisionId::generate(),
             candidate_revision: GenomeRevisionId::generate(),
+            lineage: Some("stable/general".into()),
+            parent_generation: Some(1),
+            candidate_generation: Some(2),
             comparison_validity: ComparisonValidity {
                 valid: true,
                 violations: Vec::new(),

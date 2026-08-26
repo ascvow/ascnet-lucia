@@ -126,3 +126,53 @@ Episode 的监督 CAS 中；处理器会把该制品恢复为本地修订历史�
 监督引用时，还会逐条验证 Envelope 的 sequence、Episode、Run、Genome、Event ID 和
 脱敏载荷。全部通过后才把事件交给 `ReplayEventSink`。该过程不调用真实模型或工具，
 因此可用于确定性状态机、插件 Hook 与持久化回归。
+
+## Evolution Scorecard 与历史分析
+
+可信评测平面使用 `EvaluationReport` schema v1 记录 Parent/Candidate 环境、Dataset 版本、
+TaskCase metadata、逐次 Attempt、Verifier、安全、资源、Gate、Release 与继承证据。
+历史分析新增的 `lineage`、`parent_generation` 和 `candidate_generation` 均为可选加法字段，
+因此旧报告仍可读取；缺少这些字段时只显示 `N/A`，不会猜测 Lineage 或代数。
+
+`agent-evolution` 从单份报告派生 `EvolutionScorecard` schema v1。TaskCase 内先按有效 Repeat
+计算分数，再对 TaskCase 等权聚合；基础设施故障单独统计，Candidate 导致的超预算或超时仍算
+行为失败。Capability Score 只用于展示，Promotion 仍由可信 Gate 决定。安全证据缺失、完整性
+未知或 Hidden 隔离未知会得到 `INCONCLUSIVE`，不会按零失败处理。只有泛化、Retention、
+安全、Gate、Release、重启、新 Session、旧 Session 保留、Stable 引用与摘要验证全部满足策略，
+首屏才显示 `EVOLVED`。
+
+`EvolutionCertificate` schema v1 绑定源 Episode、Issue、Mutation、允许差异、Candidate CAS
+制品、四类 Dataset、EvaluationReport、Scorecard、Release 和继承验证。Certificate 自身使用
+SHA-256 摘要；`--verify` 还会读取 CAS，逐项校验引用制品摘要与长度。Rollback 不删除证明包，
+只生成生命周期为 `RolledBack` 的新归档视图。
+
+默认数据根为 `$LUCIA_HOME/evolution`，也可用全局 `--root` 指定。不可变报告位于
+`reports/`，Parent/Candidate 最近报告索引位于 `comparisons/`，派生评分卡位于 `scorecards/`，
+证明包位于 `certificates/`，内容寻址制品位于 `artifacts/`。读取历史时任一 JSON、Schema 或
+摘要损坏都会返回错误，不会静默跳过后继续展示成功。
+
+常用只读命令如下：
+
+```bash
+lucia evolution compare --report <evaluation-report.json> --format table
+lucia evolution compare --parent <parent-revision> --candidate <candidate-revision> --format json
+lucia evolution dashboard [--lineage stable/general]
+lucia evolution dashboard --tui [--lineage stable/general]
+lucia evolution history [--lineage stable/general] [--format json]
+lucia evolution lineage [stable/general] [--format json]
+lucia evolution capability-map [--lineage stable/general] [--format json]
+lucia evolution funnel [--lineage stable/general] [--format json]
+lucia evolution certificate <release-id> --verify [--format json]
+```
+
+四页 Ratatui Dashboard 通过 `Tab`、左右方向键或数字 `1` 至 `4` 切换 Overview、
+Capability Map、Lineage 与 Evidence，Evidence 页使用上下方向键下钻，`q` 或 `Esc` 退出。
+小终端会降级为仍包含 Verdict 与 Safety 的紧凑视图；无数据与损坏数据分别显示明确空状态和
+错误状态。Evidence 只展示可信 ID、结构化计数和 CAS 引用，不读取或显示 Hidden TaskCase
+正文、Secret、未脱敏 ToolResult，也不接受 Candidate 提供的最终评分。
+
+历史 schema v1 按 Hidden Dataset 版本分段趋势，以后续 Regression TaskCase 的真实结果计算
+Fix Survival；Candidate Yield 排除不可比较运行，Rollback Rate 使用 Promotion 数作为分母。
+当前 EvaluationReport 没有 Episode 到 Candidate 生成阶段的完整漏斗计数，因此这些上游阶段
+保持 `N/A`，不伪造为零。Schema v1 均为初始版本，不需要数据迁移；未来删除、改名或收紧字段
+语义时必须升级对应版本。

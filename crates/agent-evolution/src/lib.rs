@@ -6,6 +6,7 @@
 #![deny(missing_docs)]
 
 mod aggregation;
+mod archive;
 mod artifact_store;
 mod attribution;
 mod certificate;
@@ -13,6 +14,7 @@ mod episode_store;
 mod evaluation_store;
 mod feedback;
 mod genome_store;
+mod history;
 mod metrics;
 mod outbox;
 mod outcome_revision;
@@ -24,6 +26,7 @@ mod scorecard;
 mod supervision;
 
 pub use aggregation::IssueAggregator;
+pub use archive::{ArchiveError, FileEvolutionArchive};
 pub use artifact_store::{ArtifactStore, ArtifactStoreError, FileArtifactStore};
 pub use attribution::attribute_failures;
 pub use certificate::{
@@ -36,6 +39,11 @@ pub use evaluation_store::{
 };
 pub use feedback::{FeedbackError, FeedbackProcessor};
 pub use genome_store::{FileGenomeStore, GenomeStore, GenomeStoreError};
+pub use history::{
+    compute_history, CapabilityMapCell, CapabilityMapRow, EvolutionFunnel, EvolutionHistory,
+    EvolutionVelocityPoint, FixSurvivalPoint, HiddenTrendPoint, HiddenTrendSegment, HistoryError,
+    LineageNode, EVOLUTION_HISTORY_SCHEMA_VERSION,
+};
 pub use metrics::{
     aggregate_case, aggregate_dataset, compare_dataset, compare_resources, regression_retention,
     resource_averages, resource_delta, safety_metrics, stability, CapabilityScorePolicy,
