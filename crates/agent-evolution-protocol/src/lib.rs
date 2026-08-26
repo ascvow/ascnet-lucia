@@ -10,9 +10,11 @@
 
 pub mod data_class;
 pub mod episode;
+pub mod failure;
 pub mod genome;
 pub mod ids;
 pub mod redaction;
+pub mod supervision;
 
 pub use genome::{
     AgentGenome, GenomeMetadata, GenomeRevision, InvalidGenome, ModelGenome, PluginGenome,
@@ -25,12 +27,24 @@ pub use data_class::{
     RetentionPolicy,
 };
 pub use episode::{
-    ArtifactRef, Episode, EpisodeEvent, FailureClassification, FailureKind, InvalidEpisode,
-    Outcome, ReplayabilityGrade, TaskDescriptor, UsageSummary, EPISODE_SCHEMA_VERSION,
+    ArtifactRef, Episode, EpisodeEvent, EpisodeSupervisionRefs, FailureClassification, FailureKind,
+    InvalidEpisode, Outcome, ReplayabilityGrade, TaskDescriptor, UsageSummary,
+    EPISODE_SCHEMA_VERSION,
+};
+pub use failure::{
+    default_disposition, AttributionMethod, DiagnosticStatus, EvolutionIssue, FailureAttribution,
+    FailureDisposition, FailureFingerprint, FailureRecord, InvalidFailure,
 };
 pub use ids::{
     id_json_schema, ArtifactDigest, AuditRecordId, DatasetVersionId, EpisodeId, EvaluationReportId,
-    EvaluationRunId, GenomeDigest, GenomeRevisionId, InvalidEvolutionId, MutationId, ReleaseId,
-    RunId,
+    EvaluationRunId, EventId, EvolutionIssueId, FailureRecordId, FeedbackId, GenomeDigest,
+    GenomeRevisionId, IncidentId, InvalidEvolutionId, MutationId, OutcomeRevisionId, ReleaseId,
+    RunId, SpanId,
 };
 pub use redaction::{RedactionOutcome, RedactionRule, Redactor, REDACTION_RULES_VERSION};
+pub use supervision::{
+    default_component, default_recoverability, sorted_unique_event_ids, ComponentRef, DetectorRef,
+    EventEnvelope, FeedbackEvent, FeedbackSignal, FeedbackSource, Incident, IncidentKind,
+    IncidentStatus, InvalidSupervision, OutcomeRevision, OutcomeSource, Recoverability, Severity,
+    SUPERVISION_SCHEMA_VERSION,
+};

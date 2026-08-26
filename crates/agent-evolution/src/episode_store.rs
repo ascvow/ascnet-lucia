@@ -303,6 +303,7 @@ mod tests {
                 media_type: "application/x-ndjson".into(),
                 size_bytes: 1,
             },
+            supervision: None,
             environment_ref: None,
             outcome: Some(outcome),
             failures: Vec::new(),

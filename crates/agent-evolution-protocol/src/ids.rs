@@ -353,6 +353,29 @@ prefixed_id!(EvaluationReportId, "evrep", "一份评测报告的标识。");
 prefixed_id!(DatasetVersionId, "dsv", "数据集某个版本的标识。");
 prefixed_id!(ReleaseId, "rel", "一次发布的标识。");
 prefixed_id!(AuditRecordId, "aud", "一条审计记录的标识。");
+prefixed_id!(EventId, "evt", "Event Envelope 中一条可信事件的标识。");
+prefixed_id!(
+    SpanId,
+    "span",
+    "事件所属调用的标识，用于表达模型调用、工具调用与子 Agent 的父子关系。"
+);
+prefixed_id!(
+    IncidentId,
+    "inc",
+    "RunSupervisor 观测到的一次异常现象的标识。"
+);
+prefixed_id!(
+    OutcomeRevisionId,
+    "orev",
+    "一条 Outcome 修订的标识；Outcome 只追加修订，从不覆盖。"
+);
+prefixed_id!(FeedbackId, "fb", "一条延迟反馈信号的标识。");
+prefixed_id!(FailureRecordId, "fr", "一条失败归因记录的标识。");
+prefixed_id!(
+    EvolutionIssueId,
+    "issue",
+    "聚类后形成的稳定进化问题的标识。"
+);
 
 digest_id!(
     GenomeDigest,
@@ -390,6 +413,13 @@ pub fn id_json_schema() -> serde_json::Value {
             "DatasetVersionId": entry(DatasetVersionId::PATTERN, "数据集某个版本的标识"),
             "ReleaseId": entry(ReleaseId::PATTERN, "一次发布的标识"),
             "AuditRecordId": entry(AuditRecordId::PATTERN, "一条审计记录的标识"),
+            "EventId": entry(EventId::PATTERN, "Event Envelope 中一条可信事件的标识"),
+            "SpanId": entry(SpanId::PATTERN, "事件所属调用的标识"),
+            "IncidentId": entry(IncidentId::PATTERN, "RunSupervisor 观测到的一次异常现象"),
+            "OutcomeRevisionId": entry(OutcomeRevisionId::PATTERN, "一条 Outcome 修订"),
+            "FeedbackId": entry(FeedbackId::PATTERN, "一条延迟反馈信号"),
+            "FailureRecordId": entry(FailureRecordId::PATTERN, "一条失败归因记录"),
+            "EvolutionIssueId": entry(EvolutionIssueId::PATTERN, "聚类后形成的稳定进化问题"),
             "GenomeDigest": entry(GenomeDigest::PATTERN, "Genome 行为字段的内容摘要"),
             "ArtifactDigest": entry(ArtifactDigest::PATTERN, "CAS 中单个制品的内容摘要"),
         }
@@ -446,6 +476,13 @@ mod tests {
         check_prefixed!(DatasetVersionId);
         check_prefixed!(ReleaseId);
         check_prefixed!(AuditRecordId);
+        check_prefixed!(EventId);
+        check_prefixed!(SpanId);
+        check_prefixed!(IncidentId);
+        check_prefixed!(OutcomeRevisionId);
+        check_prefixed!(FeedbackId);
+        check_prefixed!(FailureRecordId);
+        check_prefixed!(EvolutionIssueId);
     }
 
     #[test]
@@ -532,7 +569,7 @@ mod tests {
     fn schema_patterns_accept_real_values() {
         let schema = id_json_schema();
         let defs = schema["$defs"].as_object().expect("应有 $defs");
-        assert_eq!(defs.len(), 11, "11 个标识类型都应出现在 schema 中");
+        assert_eq!(defs.len(), 18, "18 个标识类型都应出现在 schema 中");
 
         let run_pattern = defs["RunId"]["pattern"].as_str().expect("应有 pattern");
         assert!(Regex::new(run_pattern)

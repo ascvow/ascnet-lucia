@@ -5,12 +5,24 @@
 
 #![deny(missing_docs)]
 
+mod aggregation;
 mod artifact_store;
+mod attribution;
 mod episode_store;
+mod outbox;
+mod outcome_revision;
+mod pipeline;
 mod recorder;
 mod replay;
+mod supervision;
 
+pub use aggregation::IssueAggregator;
 pub use artifact_store::{ArtifactStore, ArtifactStoreError, FileArtifactStore};
+pub use attribution::attribute_failures;
 pub use episode_store::{EpisodeQuery, EpisodeStore, EpisodeStoreError, FileEpisodeStore};
+pub use outbox::{EvolutionOutbox, EvolutionOutboxItem, FileEvolutionOutbox, OutboxError};
+pub use outcome_revision::{FileOutcomeRevisionStore, OutcomeRevisionError, OutcomeRevisionStore};
+pub use pipeline::{EvolutionPipeline, PipelineError};
 pub use recorder::{EpisodeRecorder, EpisodeRecorderConfig, EpisodeRecorderError};
 pub use replay::{ProtocolReplay, ProtocolReplayError, ReplayEventSink, ReplayReport};
+pub use supervision::{RunSupervisor, SupervisionError, SupervisionReport};

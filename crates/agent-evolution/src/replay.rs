@@ -1,7 +1,7 @@
 //! 已保存事件输出驱动的确定性 Protocol Replay。
 
 use crate::{ArtifactStore, ArtifactStoreError};
-use agent_evolution_protocol::{Episode, EpisodeEvent};
+use agent_evolution_protocol::{Episode, EpisodeEvent, EventEnvelope};
 use async_trait::async_trait;
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -25,6 +25,8 @@ pub struct ReplayReport {
     pub max_step: u64,
     /// 是否观察到正常 `run_finished` 终态。
     pub finished: bool,
+    /// 是否同时验证了可信 Event Envelope 流。
+    pub supervision_verified: bool,
 }
 
 /// 读取不可变 Event Stream 并重新驱动观察者的协议回放器。
@@ -89,6 +91,28 @@ impl ProtocolReplay {
             });
         }
         validate_sequence(episode, &events)?;
+        let supervision_verified = if let Some(supervision) = &episode.supervision {
+            let envelope_bytes = self
+                .artifacts
+                .get(&supervision.event_envelopes_ref.digest)
+                .await?
+                .ok_or_else(|| {
+                    ProtocolReplayError::MissingArtifact(
+                        supervision.event_envelopes_ref.digest.clone(),
+                    )
+                })?;
+            if envelope_bytes.len() as u64 != supervision.event_envelopes_ref.size_bytes {
+                return Err(ProtocolReplayError::ArtifactSizeMismatch {
+                    expected: supervision.event_envelopes_ref.size_bytes,
+                    actual: envelope_bytes.len() as u64,
+                });
+            }
+            let envelopes = parse_envelopes(&envelope_bytes)?;
+            validate_envelopes(episode, &events, &envelopes)?;
+            true
+        } else {
+            false
+        };
         for event in &events {
             sink.apply(event).await?;
         }
@@ -98,6 +122,7 @@ impl ProtocolReplay {
             finished: events
                 .last()
                 .is_some_and(|event| event.kind == "run_finished"),
+            supervision_verified,
         })
     }
 }
@@ -160,12 +185,93 @@ pub enum ProtocolReplayError {
     /// run_finished 不是最后一个事件或重复出现。
     #[error("Protocol Replay 中 run_finished 必须唯一且位于末尾")]
     InvalidRunFinish,
+    /// 监督信封数量与规范事件流不一致。
+    #[error("Event Envelope 数量不匹配：期望 {expected}，实际 {actual}")]
+    EnvelopeCountMismatch {
+        /// Episode 事件数量。
+        expected: u64,
+        /// Envelope 数量。
+        actual: u64,
+    },
+    /// 监督信封未绑定同一 Episode、Genome 或事件内容。
+    #[error("Event Envelope 与 Episode 事件不一致：sequence={sequence}: {reason}")]
+    EnvelopeMismatch {
+        /// 从 1 开始的信封序号。
+        sequence: u64,
+        /// 稳定原因。
+        reason: &'static str,
+    },
     /// Artifact CAS 操作失败。
     #[error(transparent)]
     Artifact(#[from] ArtifactStoreError),
     /// 下游状态机拒绝事件。
     #[error("回放 sink 拒绝事件：{0}")]
     Sink(String),
+}
+
+/// 从 NDJSON 解析可信 Event Envelope。
+fn parse_envelopes(bytes: &[u8]) -> Result<Vec<EventEnvelope>, ProtocolReplayError> {
+    let mut envelopes = Vec::new();
+    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let envelope = serde_json::from_slice::<EventEnvelope>(line).map_err(|source| {
+            ProtocolReplayError::InvalidEvent {
+                line: index + 1,
+                source,
+            }
+        })?;
+        envelope
+            .validate()
+            .map_err(|error| ProtocolReplayError::InvalidEpisode(error.to_string()))?;
+        envelopes.push(envelope);
+    }
+    Ok(envelopes)
+}
+
+/// 验证信封与公开事件流逐条一致，并固定 Episode 和 Genome 归属。
+fn validate_envelopes(
+    episode: &Episode,
+    events: &[EpisodeEvent],
+    envelopes: &[EventEnvelope],
+) -> Result<(), ProtocolReplayError> {
+    if envelopes.len() != events.len() {
+        return Err(ProtocolReplayError::EnvelopeCountMismatch {
+            expected: events.len() as u64,
+            actual: envelopes.len() as u64,
+        });
+    }
+    for (index, (event, envelope)) in events.iter().zip(envelopes).enumerate() {
+        let sequence = index as u64 + 1;
+        if envelope.sequence != sequence {
+            return Err(ProtocolReplayError::EnvelopeMismatch {
+                sequence,
+                reason: "sequence 不连续",
+            });
+        }
+        if envelope.episode_id != episode.episode_id
+            || envelope.run_id != episode.run_id
+            || envelope.genome_revision_id != episode.genome_revision_id
+        {
+            return Err(ProtocolReplayError::EnvelopeMismatch {
+                sequence,
+                reason: "Episode、Run 或 Genome 绑定不一致",
+            });
+        }
+        if envelope.event_id.to_string() != event.event_id
+            || envelope.timestamp_ms != event.timestamp_ms
+            || envelope.kind != event.kind
+            || envelope.step != event.step
+            || envelope.payload != event.payload
+        {
+            return Err(ProtocolReplayError::EnvelopeMismatch {
+                sequence,
+                reason: "事件内容不一致",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// 验证协议状态序列的稳定不变量。
@@ -225,7 +331,11 @@ fn validate_sequence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ArtifactStore, FileArtifactStore};
+    use crate::{
+        ArtifactStore, EpisodeRecorder, EpisodeRecorderConfig, EpisodeStore, FileArtifactStore,
+        FileEpisodeStore,
+    };
+    use agent_core::{AgentEvent, AgentEventKind, EventSink};
     use agent_evolution_protocol::{
         EpisodeDataPolicy, EpisodeId, GenomeRevisionId, Outcome, ReplayabilityGrade, RunId,
         TaskDescriptor, UsageSummary, EPISODE_SCHEMA_VERSION,
@@ -288,6 +398,7 @@ mod tests {
             genome_revision_id: GenomeRevisionId::generate(),
             task: TaskDescriptor::default(),
             event_stream_ref,
+            supervision: None,
             environment_ref: None,
             outcome: Some(Outcome::Unverifiable),
             failures: Vec::new(),
@@ -305,10 +416,56 @@ mod tests {
             .expect("应回放");
         assert_eq!(report.event_count, 2);
         assert!(report.finished);
+        assert!(!report.supervision_verified);
         assert_eq!(
             *collector.0.lock().expect("锁不应中毒"),
             vec!["run_started", "run_finished"]
         );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// 验证 Recorder 写入的真实监督引用可由 Protocol Replay 完整校验。
+    #[tokio::test]
+    async fn verifies_supervision_from_recorder_episode() {
+        let root = temp_root();
+        let artifacts = Arc::new(FileArtifactStore::new(root.join("artifacts")));
+        let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
+        let config = EpisodeRecorderConfig::online("session-1", GenomeRevisionId::generate());
+        let episode_id = config.episode_id.clone();
+        let run_id = config.run_id.to_string();
+        let recorder = EpisodeRecorder::new(config, artifacts.clone(), episodes.clone());
+        recorder
+            .record(&AgentEvent::new(
+                &run_id,
+                AgentEventKind::RunStarted,
+                0,
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("应记录运行开始");
+        recorder
+            .record(&AgentEvent::new(
+                &run_id,
+                AgentEventKind::RunFinished,
+                0,
+                serde_json::json!({"steps_used": 0}),
+            ))
+            .await
+            .expect("应记录运行结束");
+
+        let episode = episodes
+            .get(&episode_id)
+            .await
+            .expect("应读取 Episode")
+            .expect("Episode 应存在");
+        let collector = Collector::default();
+        let report = ProtocolReplay::new(artifacts)
+            .replay(&episode, &collector)
+            .await
+            .expect("应验证并回放 Recorder 产物");
+        assert!(report.supervision_verified);
+        assert_eq!(report.event_count, 2);
+        assert!(report.finished);
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

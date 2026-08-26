@@ -49,6 +49,41 @@
       "pattern": "^aud_[0-9a-z]{8,64}$",
       "description": "一条审计记录的标识"
     },
+    "EventId": {
+      "type": "string",
+      "pattern": "^evt_[0-9a-z]{8,64}$",
+      "description": "Event Envelope 中一条可信事件的标识"
+    },
+    "SpanId": {
+      "type": "string",
+      "pattern": "^span_[0-9a-z]{8,64}$",
+      "description": "事件所属调用的标识"
+    },
+    "IncidentId": {
+      "type": "string",
+      "pattern": "^inc_[0-9a-z]{8,64}$",
+      "description": "RunSupervisor 观测到的一次异常现象"
+    },
+    "OutcomeRevisionId": {
+      "type": "string",
+      "pattern": "^orev_[0-9a-z]{8,64}$",
+      "description": "一条 Outcome 修订"
+    },
+    "FeedbackId": {
+      "type": "string",
+      "pattern": "^fb_[0-9a-z]{8,64}$",
+      "description": "一条延迟反馈信号"
+    },
+    "FailureRecordId": {
+      "type": "string",
+      "pattern": "^fr_[0-9a-z]{8,64}$",
+      "description": "一条失败归因记录"
+    },
+    "EvolutionIssueId": {
+      "type": "string",
+      "pattern": "^issue_[0-9a-z]{8,64}$",
+      "description": "聚类后形成的稳定进化问题"
+    },
     "GenomeDigest": {
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$",

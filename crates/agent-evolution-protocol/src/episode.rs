@@ -23,7 +23,7 @@ pub struct ArtifactRef {
 }
 
 /// 对一次任务的最小、可脱敏描述。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskDescriptor {
     /// 稳定任务族；空字符串表示尚未分类。
     #[serde(default)]
@@ -34,16 +34,6 @@ pub struct TaskDescriptor {
     /// 用于查询和数据集构建的非敏感标签。
     #[serde(default)]
     pub tags: BTreeSet<String>,
-}
-
-impl Default for TaskDescriptor {
-    fn default() -> Self {
-        Self {
-            family: String::new(),
-            input_ref: None,
-            tags: BTreeSet::new(),
-        }
-    }
 }
 
 /// 一次运行的客观资源用量汇总。
@@ -67,6 +57,8 @@ pub struct UsageSummary {
 pub enum Outcome {
     /// 任务成功；是否成功应由调用方或可信 Verifier 判定。
     Success,
+    /// 任务成功，但过程中发生了被恢复的异常。
+    SuccessWithRecovery,
     /// Agent 完成运行，但没有完成任务。
     TaskFailure,
     /// 触发安全策略或执行了不安全行为。
@@ -82,7 +74,7 @@ pub enum Outcome {
 }
 
 /// 第一版稳定失败分类。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     /// 关键上下文在运行中丢失。
@@ -162,6 +154,22 @@ pub struct EpisodeEvent {
     pub payload: Value,
 }
 
+/// Episode 绑定的可信监督制品引用。
+///
+/// 这些引用与 Episode Header 一起持久化，确保进程重启后仍能从 Episode 找回事件
+/// 信封、Incident 和初始 Outcome 修订，而不是依赖 Recorder 的内存句柄。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpisodeSupervisionRefs {
+    /// 脱敏 Event Envelope 流。
+    pub event_envelopes_ref: ArtifactRef,
+    /// Incident 流；没有异常时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incidents_ref: Option<ArtifactRef>,
+    /// 初始 Outcome 修订；没有正常终态时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_revision_ref: Option<ArtifactRef>,
+}
+
 /// 一次执行的不可变证据头。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Episode {
@@ -179,6 +187,9 @@ pub struct Episode {
     pub task: TaskDescriptor,
     /// 完整事件流 CAS 引用。
     pub event_stream_ref: ArtifactRef,
+    /// 可信监督制品；旧版 Episode 没有该字段时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision: Option<EpisodeSupervisionRefs>,
     /// 可选环境快照引用。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_ref: Option<ArtifactRef>,
@@ -286,6 +297,7 @@ mod tests {
             genome_revision_id: GenomeRevisionId::generate(),
             task: TaskDescriptor::default(),
             event_stream_ref: artifact(),
+            supervision: None,
             environment_ref: None,
             outcome: Some(Outcome::Unverifiable),
             failures: Vec::new(),
