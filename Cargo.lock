@@ -58,6 +58,7 @@ version = "0.1.0"
 dependencies = [
  "agent-core",
  "agent-evolution-protocol",
+ "agent-tool",
  "anyhow",
  "async-trait",
  "serde",
@@ -76,6 +77,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "uuid",
 ]
