@@ -55,9 +55,23 @@ TUI 的 Evidence 装配默认关闭。启用时，启动阶段先从
 `RunFinished`、取消、步骤预算耗尽和基础设施错误都会显式收敛并释放路由。证据写入失败会
 报告为运行完成错误，不会被静默忽略。
 
-插件 Runtime 的子 Agent 使用独立执行会话，当前不会继承 TUI 主会话 Recorder。其
-Execution Lineage 到 Episode 的装配必须由 Runtime 生命周期入口独立登记，不能用主会话
-ID 代替；该边界仍属于 Goal A 后续工作。
+插件 Runtime 的子 Agent 不继承 TUI 主会话 Recorder。TUI 在创建 Runtime 时注入可信
+`RuntimeRunObserver`；Runtime 在 Core 启动前向观察器提交 Host 维护的 `AgentId` 与
+`AgentLineage`，取得固定 Run ID、独立事件 sink 和一次性 finalizer。每个子运行使用
+`runtime-agent:<AgentId>` 作为独立 Session ID，并绑定启动时已经验证的同一 Genome
+Revision。正常完成记为 `Unverifiable`，取消记为 `Cancelled`，失败则根据已记录事件推断
+`BudgetFailure` 或 `InfrastructureFailure`。
+
+Runtime 的取消和 principal 撤销不会直接 abort 持有 finalizer 的监督任务。取消请求会中断
+Core future，监督任务随后先关闭 Episode、释放 Hub 路由，再写入 Runtime 终态；principal
+撤销还会等待这些收敛完成后返回。Evidence 未启用时不注入观察器，原有 Runtime 行为和 API
+保持兼容。
+
+Execution Lineage 与 Genome Lineage 是两套独立语义：前者只描述当前进程中 Agent 的父子
+身份、根节点和派生深度，用于把 Runtime Run 关联到执行主体；后者通过
+`GenomeRevision.parent_revision_ids` 描述跨版本 Mutation、Evaluation、Promotion 和
+Rollback。Episode 同时引用执行会话与 Genome Revision，但不得用任一 lineage 字段替代
+另一套关系。
 
 ## 数据处理与终态
 

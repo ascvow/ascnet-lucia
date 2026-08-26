@@ -208,8 +208,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let base_agent = Agent::new(gateway, options)
         .with_tools(native_tools)
         .with_event_sink(Arc::new(sink));
-    // Runtime 子 Agent 使用独立的执行会话，不能继承只为 TUI 主会话登记的 Recorder Hub。
-    // 因此先捕获插件模板，再只给主 Agent 叠加 Evidence sink。
+    // Runtime 子 Agent 使用独立执行会话，不能继承只为 TUI 主会话预登记的 Evidence sink；
+    // 因此先捕获插件模板，子运行随后由 Runtime 的可信观察器分别登记。
     #[cfg(feature = "plugins")]
     let plugin_agent_template = AgentTemplate::from_agent(&base_agent);
     let base_agent = if let Some(evidence) = evidence_runtime.as_ref() {
@@ -288,7 +288,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .with_workspace(workspace)
         .with_context_window(tui_settings.context_window)
         .with_persistent_session(session_store, session_record)
-        .with_evidence(evidence_runtime);
+        .with_evidence(evidence_runtime.clone());
     app.messages.extend(
         startup_notices
             .into_iter()
@@ -299,11 +299,15 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         app = app.with_loading_plugins(loading_plugin_ids);
         let load_tx = tx.clone();
         let load_host = Arc::clone(&live_plugin_host);
+        let run_observer = evidence_runtime
+            .as_ref()
+            .map(EvidenceRuntime::runtime_run_observer);
         tokio::spawn(async move {
             let result = load_plugins_for_tui(
                 plugin_manifests,
                 capability_selection,
                 plugin_agent_template,
+                run_observer,
                 load_host,
                 load_tx.clone(),
             )

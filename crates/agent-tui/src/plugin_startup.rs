@@ -144,6 +144,7 @@ pub(crate) async fn load_plugins_for_tui(
     manifests: Vec<PathBuf>,
     capability_selection: HashMap<String, String>,
     agent_template: AgentTemplate,
+    run_observer: Option<Arc<dyn agent_runtime::RuntimeRunObserver>>,
     live_host: Arc<LivePluginHost>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
@@ -156,8 +157,11 @@ pub(crate) async fn load_plugins_for_tui(
     // 插件模型调用与主 Agent 使用相同的流式开关：部分代理会强制断开
     // 长时间无数据的非流式连接，摘要这类长请求必须跟随配置的传输方式。
     let model_stream = agent_template.options().stream;
-    let runtime =
-        AgentRuntime::new(RuntimeLimits::default()).context("创建 TUI Agent Runtime 失败")?;
+    let runtime = match run_observer {
+        Some(observer) => AgentRuntime::new_with_run_observer(RuntimeLimits::default(), observer),
+        None => AgentRuntime::new(RuntimeLimits::default()),
+    }
+    .context("创建 TUI Agent Runtime 失败")?;
     let controller_profile =
         AgentProfileId::new("tui-controller").context("创建 TUI controller profile 失败")?;
     runtime

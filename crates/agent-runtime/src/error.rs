@@ -86,6 +86,10 @@ pub enum AgentRuntimeError {
     #[error("Agent 构造失败：{0}")]
     AgentBuild(String),
 
+    /// Host 注入的运行观察器无法开始或收敛证据。
+    #[error("Agent 运行观察失败：{0}")]
+    RunObservation(String),
+
     /// 根节点没有后台执行任务，不能等待结果。
     #[error("Agent 没有可等待的执行任务：{0}")]
     NotRunnable(AgentId),

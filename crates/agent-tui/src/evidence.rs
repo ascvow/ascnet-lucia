@@ -6,6 +6,13 @@ use agent_evolution::{
     FileGenomeStore, GenomeStore, RegisteredEpisodeRun,
 };
 use agent_evolution_protocol::GenomeRevisionId;
+#[cfg(feature = "plugins")]
+use agent_evolution_protocol::Outcome;
+#[cfg(feature = "plugins")]
+use agent_runtime::{
+    AgentRuntimeError, RuntimeResult, RuntimeRunContext, RuntimeRunFinalizer,
+    RuntimeRunObservation, RuntimeRunObserver, RuntimeRunTermination,
+};
 
 /// TUI 进程固定使用的证据运行配置。
 ///
@@ -31,6 +38,14 @@ impl EvidenceRuntime {
         Arc::clone(&self.hub)
     }
 
+    /// 创建供 Agent Runtime 子运行使用的 Host 可信观察器。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn runtime_run_observer(&self) -> Arc<dyn RuntimeRunObserver> {
+        Arc::new(RuntimeEvidenceObserver {
+            evidence: self.clone(),
+        })
+    }
+
     /// 为一次已经提交用户输入的主会话预登记 Episode。
     ///
     /// # Errors
@@ -48,6 +63,58 @@ impl EvidenceRuntime {
             .register(config)
             .await
             .context("登记 Episode 运行失败")
+    }
+}
+
+/// 把 Runtime 维护的 Agent 身份映射为独立 Episode 会话并预登记 Run。
+#[cfg(feature = "plugins")]
+struct RuntimeEvidenceObserver {
+    evidence: EvidenceRuntime,
+}
+
+#[cfg(feature = "plugins")]
+#[async_trait]
+impl RuntimeRunObserver for RuntimeEvidenceObserver {
+    async fn begin(&self, context: RuntimeRunContext) -> RuntimeResult<RuntimeRunObservation> {
+        let run = self
+            .evidence
+            .register_run(format!("runtime-agent:{}", context.agent_id))
+            .await
+            .map_err(|error| AgentRuntimeError::RunObservation(error.to_string()))?;
+        let run_id = run.run_id().to_string();
+        RuntimeRunObservation::new(
+            run_id,
+            self.evidence.hub(),
+            Arc::new(RuntimeEpisodeFinalizer {
+                run: tokio::sync::Mutex::new(Some(run)),
+            }),
+        )
+    }
+}
+
+/// 使用 Runtime 可信终态收敛一次子 Agent Episode。
+#[cfg(feature = "plugins")]
+struct RuntimeEpisodeFinalizer {
+    run: tokio::sync::Mutex<Option<RegisteredEpisodeRun>>,
+}
+
+#[cfg(feature = "plugins")]
+#[async_trait]
+impl RuntimeRunFinalizer for RuntimeEpisodeFinalizer {
+    async fn finish(&self, termination: RuntimeRunTermination) -> RuntimeResult<()> {
+        let run =
+            self.run.lock().await.take().ok_or_else(|| {
+                AgentRuntimeError::RunObservation("Runtime Episode 已经收敛".into())
+            })?;
+        let outcome = match termination {
+            RuntimeRunTermination::Completed => Outcome::Unverifiable,
+            RuntimeRunTermination::Cancelled => Outcome::Cancelled,
+            RuntimeRunTermination::Failed => run.interrupted_outcome().await,
+        };
+        run.close(outcome)
+            .await
+            .map(|_| ())
+            .map_err(|error| AgentRuntimeError::RunObservation(error.to_string()))
     }
 }
 
@@ -96,12 +163,72 @@ pub(crate) async fn load_evidence_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "plugins")]
+    use agent_core::{
+        Agent, AgentOptions, ChatModel, ModelGateway, ModelRequest, ModelResponse, ProviderAdapter,
+    };
+    #[cfg(feature = "plugins")]
+    use agent_evolution::{EpisodeQuery, EpisodeStore};
     use agent_evolution_protocol::{
         AgentGenome, GenomeMetadata, GenomeRevision, ModelGenome, PromptGenome, RuntimeIdentity,
         ToolProfileGenome, GENOME_SCHEMA_VERSION,
     };
+    #[cfg(feature = "plugins")]
+    use agent_runtime::{
+        AgentOutcome, AgentPermissions, AgentRuntime, AgentSpawnRequest, AgentTemplate,
+        RuntimeLimits,
+    };
     use agent_tool::ExecutionPolicy;
     use std::collections::{BTreeMap, BTreeSet};
+    #[cfg(feature = "plugins")]
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(feature = "plugins")]
+    use tokio::sync::Notify;
+
+    /// 返回固定公开响应的 Runtime Evidence 端到端测试模型。
+    #[cfg(feature = "plugins")]
+    struct RuntimeEvidenceModel;
+
+    /// 暴露模型已进入信号并持续阻塞，用于验证取消时的真实 Episode 收敛。
+    #[cfg(feature = "plugins")]
+    struct BlockingRuntimeEvidenceModel {
+        entered: Arc<AtomicBool>,
+        release: Arc<Notify>,
+    }
+
+    #[cfg(feature = "plugins")]
+    #[async_trait]
+    impl ChatModel for RuntimeEvidenceModel {
+        async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+            Ok(ModelResponse::text("Runtime 子 Agent 已完成"))
+        }
+    }
+
+    #[cfg(feature = "plugins")]
+    #[async_trait]
+    impl ProviderAdapter for RuntimeEvidenceModel {
+        fn name(&self) -> &'static str {
+            "runtime-evidence-fixture"
+        }
+    }
+
+    #[cfg(feature = "plugins")]
+    #[async_trait]
+    impl ChatModel for BlockingRuntimeEvidenceModel {
+        async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+            self.entered.store(true, Ordering::Release);
+            self.release.notified().await;
+            Ok(ModelResponse::text("取消后不应完成"))
+        }
+    }
+
+    #[cfg(feature = "plugins")]
+    #[async_trait]
+    impl ProviderAdapter for BlockingRuntimeEvidenceModel {
+        fn name(&self) -> &'static str {
+            "blocking-runtime-evidence-fixture"
+        }
+    }
 
     /// 构造用于验证 TUI 启动绑定的最小 Genome 修订。
     fn revision() -> GenomeRevision {
@@ -201,6 +328,142 @@ mod tests {
             .expect("应加载 Evidence")
             .expect("Evidence 应启用");
         assert_eq!(runtime.hub().active_runs().await, 0);
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// TUI 注入的可信观察器必须为真实 Runtime 子 Agent 创建独立且完整的 Episode。
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn runtime_child_run_persists_independent_episode() {
+        let root = std::env::temp_dir().join(format!(
+            "lucia-runtime-evidence-{}",
+            agent_session::SessionId::generate()
+        ));
+        let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
+        let hub = Arc::new(EpisodeRecorderHub::new(
+            Arc::new(FileArtifactStore::new(root.join("artifacts"))),
+            episodes.clone(),
+        ));
+        let genome_revision_id = GenomeRevisionId::generate();
+        let evidence = EvidenceRuntime::new(Arc::clone(&hub), genome_revision_id.clone());
+        let runtime = AgentRuntime::new_with_run_observer(
+            RuntimeLimits::default(),
+            evidence.runtime_run_observer(),
+        )
+        .expect("创建带 TUI Evidence 观察器的 Runtime");
+        let mut gateway = ModelGateway::new();
+        gateway
+            .register("runtime-evidence-fixture", Arc::new(RuntimeEvidenceModel))
+            .expect("注册 Runtime Evidence 测试模型");
+        let agent = Agent::new(
+            gateway,
+            AgentOptions::default().with_model_route("runtime-evidence-fixture", "fixture-model"),
+        );
+        let root_agent = runtime
+            .attach_root(
+                AgentTemplate::from_agent(&agent),
+                AgentPermissions::default(),
+            )
+            .await
+            .expect("挂载 Runtime 根 Agent");
+        let api = runtime.api(&root_agent.id).await.expect("绑定 Runtime API");
+        let child = api
+            .spawn(AgentSpawnRequest::new("记录独立 Runtime Episode"))
+            .await
+            .expect("派生 Runtime 子 Agent");
+
+        assert!(matches!(
+            api.wait(&child.id).await.expect("等待 Runtime 子 Agent"),
+            AgentOutcome::Succeeded { .. }
+        ));
+        let stored = episodes
+            .query(&EpisodeQuery {
+                outcome: None,
+                session_id: Some(format!("runtime-agent:{}", child.id)),
+            })
+            .await
+            .expect("查询 Runtime 子 Agent Episode");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].session_id, format!("runtime-agent:{}", child.id));
+        assert_eq!(stored[0].genome_revision_id, genome_revision_id);
+        assert_eq!(stored[0].outcome, Some(Outcome::Unverifiable));
+        assert!(!stored[0].run_id.as_str().is_empty());
+        assert_eq!(hub.active_runs().await, 0);
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// 取消真实 Runtime 子 Agent 后必须持久化 Cancelled Episode，并释放 Hub 路由。
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn cancelled_runtime_child_closes_episode_before_terminal_state() {
+        let root = std::env::temp_dir().join(format!(
+            "lucia-cancelled-runtime-evidence-{}",
+            agent_session::SessionId::generate()
+        ));
+        let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
+        let hub = Arc::new(EpisodeRecorderHub::new(
+            Arc::new(FileArtifactStore::new(root.join("artifacts"))),
+            episodes.clone(),
+        ));
+        let genome_revision_id = GenomeRevisionId::generate();
+        let evidence = EvidenceRuntime::new(Arc::clone(&hub), genome_revision_id.clone());
+        let runtime = AgentRuntime::new_with_run_observer(
+            RuntimeLimits::default(),
+            evidence.runtime_run_observer(),
+        )
+        .expect("创建带取消证据观察器的 Runtime");
+        let entered = Arc::new(AtomicBool::new(false));
+        let mut gateway = ModelGateway::new();
+        gateway
+            .register(
+                "blocking-runtime-evidence-fixture",
+                Arc::new(BlockingRuntimeEvidenceModel {
+                    entered: Arc::clone(&entered),
+                    release: Arc::new(Notify::new()),
+                }),
+            )
+            .expect("注册阻塞 Runtime Evidence 测试模型");
+        let agent = Agent::new(
+            gateway,
+            AgentOptions::default()
+                .with_model_route("blocking-runtime-evidence-fixture", "fixture-model"),
+        );
+        let root_agent = runtime
+            .attach_root(
+                AgentTemplate::from_agent(&agent),
+                AgentPermissions::default(),
+            )
+            .await
+            .expect("挂载取消测试根 Agent");
+        let api = runtime.api(&root_agent.id).await.expect("绑定取消测试 API");
+        let child = api
+            .spawn(AgentSpawnRequest::new("取消并收敛 Runtime Episode"))
+            .await
+            .expect("派生待取消 Runtime 子 Agent");
+        for _ in 0..100 {
+            if entered.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(entered.load(Ordering::Acquire));
+
+        assert!(api.cancel(&child.id).await.expect("取消 Runtime 子 Agent"));
+        assert_eq!(
+            api.wait(&child.id).await.expect("等待取消终态"),
+            AgentOutcome::Cancelled
+        );
+        let stored = episodes
+            .query(&EpisodeQuery {
+                outcome: Some(Outcome::Cancelled),
+                session_id: Some(format!("runtime-agent:{}", child.id)),
+            })
+            .await
+            .expect("查询取消 Runtime Episode");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].genome_revision_id, genome_revision_id);
+        assert_eq!(stored[0].outcome, Some(Outcome::Cancelled));
+        assert_eq!(hub.active_runs().await, 0);
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }
