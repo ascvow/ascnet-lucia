@@ -265,11 +265,12 @@ async fn trusted_run_observer_binds_runtime_execution() {
         api.wait(&child.id).await.expect("等待子 Agent"),
         AgentOutcome::Succeeded { .. }
     ));
-    let contexts = contexts.lock().expect("观察上下文锁不应中毒");
-    assert_eq!(contexts.len(), 1);
-    assert_eq!(contexts[0].agent_id, child.id);
-    assert_eq!(contexts[0].lineage, child.lineage);
-    drop(contexts);
+    {
+        let contexts = contexts.lock().expect("观察上下文锁不应中毒");
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].agent_id, child.id);
+        assert_eq!(contexts[0].lineage, child.lineage);
+    }
     assert_eq!(
         *terminations.lock().expect("观察终态锁不应中毒"),
         vec![RuntimeRunTermination::Completed]
