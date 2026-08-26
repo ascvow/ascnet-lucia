@@ -10,6 +10,7 @@
 
 pub mod data_class;
 pub mod episode;
+pub mod evaluation;
 pub mod failure;
 pub mod genome;
 pub mod ids;
@@ -30,6 +31,12 @@ pub use episode::{
     ArtifactRef, Episode, EpisodeEvent, EpisodeSupervisionRefs, FailureClassification, FailureKind,
     InvalidEpisode, Outcome, ReplayabilityGrade, TaskDescriptor, UsageSummary,
     EPISODE_SCHEMA_VERSION,
+};
+pub use evaluation::{
+    DatasetKind, EvaluationEnvironment, EvaluationReport, EvaluationRun, EvaluationUsage,
+    EvolutionLifecycle, GateDecision, GenomeDiff, InheritanceVerification, InvalidEvaluationReport,
+    MutationSurface, SafetyAttemptSummary, TaskAttemptResult, TaskAttemptStatus, TaskCaseMetadata,
+    TaskCaseResult, EVALUATION_REPORT_SCHEMA_VERSION,
 };
 pub use failure::{
     default_disposition, AttributionMethod, DiagnosticStatus, EvolutionIssue, FailureAttribution,

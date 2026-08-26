@@ -8,27 +8,52 @@
 mod aggregation;
 mod artifact_store;
 mod attribution;
+mod certificate;
 mod episode_store;
+mod evaluation_store;
 mod feedback;
 mod genome_store;
+mod metrics;
 mod outbox;
 mod outcome_revision;
 mod pipeline;
 mod recorder;
 mod recorder_hub;
 mod replay;
+mod scorecard;
 mod supervision;
 
 pub use aggregation::IssueAggregator;
 pub use artifact_store::{ArtifactStore, ArtifactStoreError, FileArtifactStore};
 pub use attribution::attribute_failures;
+pub use certificate::{
+    CertificateError, EvolutionCertificate, EvolutionCertificateInput,
+    EVOLUTION_CERTIFICATE_SCHEMA_VERSION,
+};
 pub use episode_store::{EpisodeQuery, EpisodeStore, EpisodeStoreError, FileEpisodeStore};
+pub use evaluation_store::{
+    load_evaluation_report, EvaluationStoreError, FileEvaluationReportStore,
+};
 pub use feedback::{FeedbackError, FeedbackProcessor};
 pub use genome_store::{FileGenomeStore, GenomeStore, GenomeStoreError};
+pub use metrics::{
+    aggregate_case, aggregate_dataset, compare_dataset, compare_resources, regression_retention,
+    resource_averages, resource_delta, safety_metrics, stability, CapabilityScorePolicy,
+    CapabilityScoreSummary, CaseMetric, DatasetComparison, DatasetMetrics, PercentagePointDelta,
+    Rate, RegressionRetention, RelativeDelta, ResourceAverages, ResourceComparison, ResourceDelta,
+    SafetyComparison, SafetyMetrics, StabilityMetrics,
+};
 pub use outbox::{EvolutionOutbox, EvolutionOutboxItem, FileEvolutionOutbox, OutboxError};
 pub use outcome_revision::{FileOutcomeRevisionStore, OutcomeRevisionError, OutcomeRevisionStore};
 pub use pipeline::{EvolutionPipeline, PipelineError};
 pub use recorder::{EpisodeRecorder, EpisodeRecorderConfig, EpisodeRecorderError};
 pub use recorder_hub::{EpisodeRecorderHub, EpisodeRecorderHubError, RegisteredEpisodeRun};
 pub use replay::{ProtocolReplay, ProtocolReplayError, ReplayEventSink, ReplayReport};
+pub use scorecard::{
+    comparison_validity, compute_scorecard, headline_verdict, BehaviorAssessment,
+    ComparisonValidity, ComparisonViolation, ComparisonViolationKind, ConfidenceInterval,
+    DatasetMetricSummary, EvaluationConfidence, EvolutionScorecard, EvolutionVerdictPolicy,
+    GateSummary, HeadlineVerdict, InheritanceMetrics, RegressionComparison, ResourceGatePolicy,
+    ScorecardError, EVOLUTION_SCORECARD_SCHEMA_VERSION,
+};
 pub use supervision::{RunSupervisor, SupervisionError, SupervisionReport};
