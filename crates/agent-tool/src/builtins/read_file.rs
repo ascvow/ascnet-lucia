@@ -72,7 +72,14 @@ impl Tool for ReadFileTool {
             .resolve_existing(&args.path, FileCapability::Read)
         {
             Ok(path) => path,
-            Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
+            Err(error) => {
+                return Ok(ToolResult::error_with_kind(
+                    call.id,
+                    call.name,
+                    error.tool_error_kind(),
+                    error.to_string(),
+                ))
+            }
         };
 
         let content = match tokio::fs::read_to_string(&path).await {

@@ -1,12 +1,14 @@
 # CLI 使用
 
-`lucia` 的无子命令形式启动 TUI；`doctor` 和 `plugin` 是执行完即退出的管理命令。纯 Core 构建不包含 `plugin` 子命令和 `--plugin-manifest` 参数。
+`lucia` 的无子命令形式启动 TUI；`doctor`、`episode`、`evolution` 和 `plugin` 是执行完即退出的管理命令。纯 Core 构建不包含 `plugin` 子命令和 `--plugin-manifest` 参数。
 
 ## 命令结构
 
 ```text
 lucia [启动参数]
 lucia doctor [--json] [--network]
+lucia episode <list|inspect|export> [参数]
+lucia evolution <操作> [参数]
 lucia plugin <操作> [参数]
 ```
 
@@ -102,6 +104,20 @@ lucia doctor --network
 - `--network`：额外只读检查 GitHub API 连通性。默认诊断不联网，也不会下载或安装插件。
 
 诊断严格只读，不创建目录或配置，不修改插件锁，不打开会产生写入的 Session Store。
+
+## Episode 证据命令
+
+```bash
+lucia episode list [--session-id <session-id>] [--outcome <outcome>] [--json]
+lucia episode inspect <episode-id> [--json]
+lucia episode export <episode-id> --redacted
+```
+
+这些命令默认读取 `$LUCIA_HOME/evolution`，也可在 `episode` 层使用 `--root <path>` 指定证据
+根目录。`list` 只读取 Episode Header；`inspect` 从 Artifact CAS 重载并校验事件、Envelope、
+Incident 和初始 Outcome Revision；`export --redacted` 还要求 Episode 数据策略允许作为进化
+输入，并且只输出 Recorder 已持久化的脱敏内容。任一 CAS 摘要、长度或跨 Episode 引用不一致
+都会返回非零退出码。
 
 ## 路径与优先级
 

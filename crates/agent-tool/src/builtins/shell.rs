@@ -206,7 +206,14 @@ impl Tool for ShellTool {
         let working_directory =
             match self.resolve_working_directory(args.working_directory.as_deref()) {
                 Ok(dir) => dir,
-                Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
+                Err(error) => {
+                    return Ok(ToolResult::error_with_kind(
+                        call.id,
+                        call.name,
+                        error.tool_error_kind(),
+                        error.to_string(),
+                    ))
+                }
             };
 
         let mut cmd = tokio::process::Command::new("sh");
@@ -276,6 +283,7 @@ impl Tool for ShellTool {
                         name: call.name,
                         content: payload,
                         is_error: true,
+                        error_kind: Some(crate::ToolErrorKind::Execution),
                         details: None,
                     })
                 } else {

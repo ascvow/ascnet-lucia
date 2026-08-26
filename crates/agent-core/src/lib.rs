@@ -21,7 +21,7 @@ pub mod session;
 pub mod state;
 
 pub use agent::{Agent, AgentControl, AgentModelConfig, AgentOptions, AgentRun};
-pub use agent_tool::ToolDecision;
+pub use agent_tool::{ToolDecision, ToolErrorKind};
 pub use config::{AgentConfig, AgentRootConfig, ModelConfig};
 pub use context::{
     ContextLoadRequest, ContextLoader, ContextTransform, LoadedContext, PassthroughContextLoader,

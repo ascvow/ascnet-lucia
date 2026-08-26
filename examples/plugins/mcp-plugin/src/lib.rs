@@ -167,6 +167,7 @@ impl AgentPlugin for McpPlugin {
             name: call.name,
             content: result,
             is_error,
+            error_kind: None,
             details: None,
         })
     }

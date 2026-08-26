@@ -65,7 +65,14 @@ impl Tool for WriteFileTool {
         };
         let path = match self.guard.resolve_new(&args.path, capability) {
             Ok(path) => path,
-            Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
+            Err(error) => {
+                return Ok(ToolResult::error_with_kind(
+                    call.id,
+                    call.name,
+                    error.tool_error_kind(),
+                    error.to_string(),
+                ))
+            }
         };
 
         if let Some(parent) = path.parent() {

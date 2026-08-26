@@ -281,7 +281,14 @@ impl Tool for SearchFilesTool {
             .resolve_existing(&base_path, FileCapability::Read)
         {
             Ok(path) => path,
-            Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
+            Err(error) => {
+                return Ok(ToolResult::error_with_kind(
+                    call.id,
+                    call.name,
+                    error.tool_error_kind(),
+                    error.to_string(),
+                ))
+            }
         };
         let boundary = self.guard.root().map(Path::to_path_buf);
 

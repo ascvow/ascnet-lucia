@@ -177,10 +177,44 @@ pub struct ToolResult {
     /// 工具是否失败。即使失败，ReAct loop 也会把错误结果回传给模型。
     pub is_error: bool,
 
+    /// 由可信执行层给出的稳定错误类别；成功或旧版结果没有该字段时为 `None`。
+    ///
+    /// Guest 可以序列化该字段，但 Host 必须按实际来源决定是否信任，不能直接据此形成
+    /// 权限或安全结论。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<ToolErrorKind>,
+
     /// UI 专用的结构化细节（diff 预览、执行耗时等），不会发送给模型。
     /// content 与 details 分离：模型只看 content，UI 只看 details。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+}
+
+/// 工具失败的稳定机器可读类别。
+///
+/// 该枚举只描述执行层事实，不表示最终任务 Outcome；安全类别必须由 Host 或原生工具
+/// 注入，普通 Guest 自报不能获得可信性。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolErrorKind {
+    /// 工具名称未注册。
+    UnknownTool,
+    /// 工具参数无法解析或未通过契约校验。
+    InvalidArguments,
+    /// 工具已执行但返回普通失败。
+    Execution,
+    /// 执行策略未授予所需权限。
+    PermissionDenied,
+    /// 文件路径越过工作区边界。
+    PathBoundaryViolation,
+    /// 进程调用越过执行策略边界。
+    ProcessBoundaryViolation,
+    /// 操作尝试读取或传递 Secret。
+    SecretAccessAttempt,
+    /// Runtime 工具 allowlist 拒绝调用。
+    PolicyDenied,
+    /// 运行取消导致工具未执行。
+    Cancelled,
 }
 
 /// 工具运行期间产生的输出流类别。
@@ -229,6 +263,7 @@ impl ToolResult {
             name: name.into(),
             content,
             is_error: false,
+            error_kind: None,
             details: None,
         }
     }
@@ -245,6 +280,27 @@ impl ToolResult {
             name: name.into(),
             content: json!({ "error": message.into() }),
             is_error: true,
+            error_kind: Some(ToolErrorKind::Execution),
+            details: None,
+        }
+    }
+
+    /// 构造带稳定类别的失败结果。
+    ///
+    /// `kind` 只应由知道真实执行边界的 Core、Host 或原生工具提供；调用方仍需按结果
+    /// 来源决定是否把安全类别提升为可信 Incident。
+    pub fn error_with_kind(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        kind: ToolErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            name: name.into(),
+            content: json!({ "error": message.into() }),
+            is_error: true,
+            error_kind: Some(kind),
             details: None,
         }
     }
@@ -567,5 +623,20 @@ mod tests {
                 retry_after_ms: 100
             }
         );
+    }
+
+    /// 旧插件和历史会话缺少加法错误类别时仍应按普通结果读取。
+    #[test]
+    fn legacy_tool_result_defaults_missing_error_kind() {
+        let result: ToolResult = serde_json::from_value(json!({
+            "call_id": "legacy-call",
+            "name": "legacy-tool",
+            "content": {"error": "旧版错误"},
+            "is_error": true
+        }))
+        .expect("旧版 ToolResult 应保持兼容");
+
+        assert_eq!(result.error_kind, None);
+        assert!(result.is_error);
     }
 }
