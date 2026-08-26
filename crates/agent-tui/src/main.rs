@@ -6,6 +6,7 @@ mod application;
 mod conversation;
 mod doctor;
 mod evidence;
+mod evolution_cli;
 #[cfg(feature = "plugins")]
 mod host_actions;
 #[cfg(feature = "plugins")]
@@ -149,6 +150,8 @@ struct Args {
 enum Command {
     /// 对整个 Lucia 安装执行无侵入只读诊断。
     Doctor(DoctorArgs),
+    /// 查看可审计的 Evolution Scorecard 与历史分析。
+    Evolution(evolution_cli::EvolutionArgs),
     /// 安装和管理受控插件。
     #[cfg(feature = "plugins")]
     Plugin(PluginArgs),
@@ -372,6 +375,7 @@ async fn main() -> Result<()> {
     let mut args = Args::parse();
     match args.command.take() {
         Some(Command::Doctor(options)) => doctor::run(&args, options).await,
+        Some(Command::Evolution(options)) => evolution_cli::run(options).await,
         #[cfg(feature = "plugins")]
         Some(Command::Plugin(options)) => plugin_cli::run(options).await,
         None => application::run(args).await,
