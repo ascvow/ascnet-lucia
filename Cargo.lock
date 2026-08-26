@@ -1738,6 +1738,8 @@ name = "lucia"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-evolution",
+ "agent-evolution-protocol",
  "agent-plugin-host",
  "agent-plugin-manager",
  "agent-plugin-protocol",

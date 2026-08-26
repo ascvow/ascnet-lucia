@@ -14,6 +14,7 @@ mod outbox;
 mod outcome_revision;
 mod pipeline;
 mod recorder;
+mod recorder_hub;
 mod replay;
 mod supervision;
 
@@ -26,5 +27,6 @@ pub use outbox::{EvolutionOutbox, EvolutionOutboxItem, FileEvolutionOutbox, Outb
 pub use outcome_revision::{FileOutcomeRevisionStore, OutcomeRevisionError, OutcomeRevisionStore};
 pub use pipeline::{EvolutionPipeline, PipelineError};
 pub use recorder::{EpisodeRecorder, EpisodeRecorderConfig, EpisodeRecorderError};
+pub use recorder_hub::{EpisodeRecorderHub, EpisodeRecorderHubError, RegisteredEpisodeRun};
 pub use replay::{ProtocolReplay, ProtocolReplayError, ReplayEventSink, ReplayReport};
 pub use supervision::{RunSupervisor, SupervisionError, SupervisionReport};

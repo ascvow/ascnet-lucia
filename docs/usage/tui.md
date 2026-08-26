@@ -42,6 +42,11 @@ stream = true
 [tui]
 sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
+
+[evidence]
+enabled = false
+# root_dir = "evolution"
+# genome_revision_id = "grev_0123456789abcdef0123456789abcdef"
 ```
 
 设置密钥后重新启动：
@@ -65,6 +70,9 @@ lucia
 - `agent.stream`：是否使用模型流式接口，默认 `true`；设为 `false` 时等待完整响应。
 - `tui.sessions_dir`：按项目隔离的会话根目录；相对路径以配置文件目录为基准。
 - `tui.events_jsonl`：可选事件日志；相对路径以配置文件目录为基准。
+- `evidence.enabled`：为主 Agent 的每次真实 Run 生成 Episode；默认关闭。
+- `evidence.root_dir`：Genome、Artifact CAS 与 Episode 根目录；相对路径以配置文件目录为基准。
+- `evidence.genome_revision_id`：启用 Evidence 时必须存在且通过行为摘要校验的 Genome 修订。
 
 ## 输入与快捷键
 

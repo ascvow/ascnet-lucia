@@ -49,11 +49,22 @@ Episode。Episode Header、Incident 和 Outcome Revision 共享预分配的 `Epi
 `EpisodeEvent`、对应 Event Envelope 及 Incident 证据共享 Recorder 分配的 `EventId`。
 `run_session_with_id` 只是一项 Core 通用机制，不解析 Genome 或 Episode。
 
+TUI 的 Evidence 装配默认关闭。启用时，启动阶段先从
+`<evidence-root>/genomes/<revision-id>.json` 读取并验证不可变 Revision；任一真实主会话在
+用户输入成功写入 Session Store 后预登记 Recorder，再把同一个 Run ID 传入 Core。正常
+`RunFinished`、取消、步骤预算耗尽和基础设施错误都会显式收敛并释放路由。证据写入失败会
+报告为运行完成错误，不会被静默忽略。
+
+插件 Runtime 的子 Agent 使用独立执行会话，当前不会继承 TUI 主会话 Recorder。其
+Execution Lineage 到 Episode 的装配必须由 Runtime 生命周期入口独立登记，不能用主会话
+ID 代替；该边界仍属于 Goal A 后续工作。
+
 ## 数据处理与终态
 
-Recorder 在 `RunFinished` 时自动收敛：事件流先写入 SHA-256 CAS，随后只追加 Episode
-Header。默认 `EpisodeDataPolicy` 为 `NotEligible` 且丢弃工具结果正文；模型隐藏思考
-增量永不持久化。其余 JSON 字符串经过确定性脱敏，Episode 记录实际规则版本。
+Recorder 默认在 `RunFinished` 时自动收敛：事件流先写入 SHA-256 CAS，随后只追加 Episode
+Header。TUI 会关闭自动收敛并在 Core 返回后统一决定终态，避免后续 UI/JSONL sink 的错误
+被提前记成正常完成。默认 `EpisodeDataPolicy` 为 `NotEligible` 且丢弃工具结果正文；模型隐藏
+思考增量永不持久化。其余 JSON 字符串经过确定性脱敏，Episode 记录实际规则版本。
 
 Recorder 只把脱敏并按数据策略收窄后的公开载荷交给 `RunSupervisor`。Supervisor 生成的
 Event Envelope、Incident 和初始 Outcome Revision 分别进入 CAS，其引用保存在 Episode
@@ -67,6 +78,7 @@ Header 的 `supervision` 字段中，进程重启后仍可从同一 Episode 找�
 ## 存储不变量
 
 - `FileArtifactStore` 按 SHA-256 内容寻址，读取时重新验证摘要，提交不覆盖已有内容。
+- `FileGenomeStore` 只追加通过行为摘要校验的 Revision，读取时重新验证 ID 与摘要。
 - `FileEpisodeStore` 使用 `create_new` 语义，只追加而不更新历史 Episode。
 - Episode 查询支持按 `Outcome` 和 `session_id` 过滤。
 - 原始工具正文只有在数据分级允许且策略显式设为 `StoreRaw` 时才会进入事件制品。

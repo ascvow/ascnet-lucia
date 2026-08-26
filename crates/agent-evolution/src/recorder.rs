@@ -35,6 +35,12 @@ pub struct EpisodeRecorderConfig {
     pub completed_outcome: Outcome,
     /// 该事件流可支持的回放等级。
     pub replayability: ReplayabilityGrade,
+    /// 是否在收到 `RunFinished` 时立即持久化 Episode。
+    ///
+    /// 长期复用 Agent 的应用层可关闭该项，并在 Core 返回后通过
+    /// [`EpisodeRecorder::finish`] 决定最终 Outcome，避免其他事件 sink 的收尾错误被误记
+    /// 为正常完成。
+    pub finalize_on_run_finished: bool,
 }
 
 impl EpisodeRecorderConfig {
@@ -49,6 +55,7 @@ impl EpisodeRecorderConfig {
             data_policy: EpisodeDataPolicy::default(),
             completed_outcome: Outcome::Unverifiable,
             replayability: ReplayabilityGrade::Exact,
+            finalize_on_run_finished: true,
         }
     }
 }
@@ -129,6 +136,24 @@ impl EpisodeRecorder {
     /// 返回收敛时生成的监督证据；未收敛时为 `None`。
     pub async fn supervision_artifacts(&self) -> Option<EpisodeSupervisionRefs> {
         self.state.lock().await.supervision.clone()
+    }
+
+    /// 根据已记录的确定性事件推断异常退出终态。
+    ///
+    /// 出现 `StepLimitReached` 时返回 [`Outcome::BudgetFailure`]；其他没有正常
+    /// `RunFinished` 的错误保守归为 [`Outcome::InfrastructureFailure`]，避免把模型、插件、
+    /// 工具环境或存储故障误算成 Solver 能力失败。
+    pub async fn interrupted_outcome(&self) -> Outcome {
+        let state = self.state.lock().await;
+        if state
+            .events
+            .iter()
+            .any(|event| event.kind == "step_limit_reached")
+        {
+            Outcome::BudgetFailure
+        } else {
+            Outcome::InfrastructureFailure
+        }
     }
 
     /// 把一条 Core 事件转换成符合数据策略的 Episode 事件。
@@ -343,7 +368,7 @@ impl EventSink for EpisodeRecorder {
             }
             state.events.push(sanitized);
         }
-        if event.kind == AgentEventKind::RunFinished {
+        if event.kind == AgentEventKind::RunFinished && self.config.finalize_on_run_finished {
             let outcome = if event
                 .payload
                 .get("cancelled")

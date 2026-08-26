@@ -102,6 +102,9 @@ impl GenomeStore for FileGenomeStore {
     }
 
     async fn get(&self, id: &GenomeRevisionId) -> Result<Option<GenomeRevision>, GenomeStoreError> {
+        if !validate_existing_root(&self.root).await? {
+            return Ok(None);
+        }
         read_revision(&self.revision_path(id), Some(id)).await
     }
 }
@@ -173,6 +176,21 @@ async fn ensure_safe_root(root: &Path) -> Result<(), GenomeStoreError> {
         });
     }
     Ok(())
+}
+
+/// 验证只读路径的根目录；不存在时不创建并返回 `false`。
+async fn validate_existing_root(root: &Path) -> Result<bool, GenomeStoreError> {
+    match fs::symlink_metadata(root).await {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error("检查 Genome 目录", root, source)),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(GenomeStoreError::UnsafePath {
+                path: root.to_path_buf(),
+                reason: "Genome 根路径必须是非符号链接目录",
+            })
+        }
+        Ok(_) => Ok(true),
+    }
 }
 
 /// 在提交前拒绝任何已存在的目标，包括符号链接和目录。
@@ -358,5 +376,32 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(root).await;
         let _ = fs::remove_file(outside).await;
+    }
+
+    /// Store 根目录本身是符号链接时也必须拒绝，不能只检查最终记录文件。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_symlink_root_on_read() {
+        use std::os::unix::fs::symlink;
+
+        let link = temp_root();
+        let outside = link.with_extension("outside");
+        fs::create_dir_all(&outside).await.expect("应创建外部目录");
+        let revision = revision();
+        fs::write(
+            outside.join(format!("{}.json", revision.revision_id)),
+            serde_json::to_vec(&revision).expect("应序列化"),
+        )
+        .await
+        .expect("应写入外部记录");
+        symlink(&outside, &link).expect("应创建根目录符号链接");
+        let store = FileGenomeStore::new(&link);
+
+        assert!(matches!(
+            store.get(&revision.revision_id).await,
+            Err(GenomeStoreError::UnsafePath { .. })
+        ));
+        let _ = fs::remove_file(link).await;
+        let _ = fs::remove_dir_all(outside).await;
     }
 }

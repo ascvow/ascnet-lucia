@@ -54,9 +54,19 @@ lucia --config ./lucia.toml --init
 [tui]
 sessions_dir = "projects"
 events_jsonl = "events.jsonl"
+
+[evidence]
+enabled = false
+# root_dir = "evolution"
+# genome_revision_id = "grev_0123456789abcdef0123456789abcdef"
 ```
 
 `sessions_dir` 是项目会话根目录。相对配置值与 `events_jsonl` 都以配置文件所在目录为基准；CLI 的 `--sessions-dir` 与 `--events-jsonl` 仍以当前工作目录为基准，并覆盖配置值。旧配置中的 `default_session` 和 `resume_latest` 仍可解析，但普通启动不再用它们自动恢复会话。
+
+`evidence.enabled` 默认关闭。启用时必须指定已经写入不可变 Genome Store 的
+`genome_revision_id`；启动会重新校验 Revision 的行为摘要，不存在或被篡改时拒绝运行。
+`root_dir` 的配置值相对配置文件解析，未配置时使用 `$LUCIA_HOME/evolution`。Episode、CAS
+制品和 Genome 修订分别保存在该根目录的 `episodes`、`artifacts` 和 `genomes` 子目录。
 
 ## 会话恢复
 

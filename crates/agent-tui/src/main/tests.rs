@@ -963,6 +963,51 @@ async fn successful_runs_persist_with_cas_revision() {
     );
 }
 
+/// 启用 Evidence 时，真实主会话必须使用预分配 Run ID 生成绑定 Genome 的 Episode。
+#[tokio::test]
+async fn evidence_runtime_records_persisted_main_run() {
+    use agent_evolution::{
+        EpisodeQuery, EpisodeRecorderHub, EpisodeStore, FileArtifactStore, FileEpisodeStore,
+    };
+    use agent_evolution_protocol::{GenomeRevisionId, Outcome};
+
+    let root = std::env::temp_dir().join(format!("lucia-tui-evidence-{}", SessionId::generate()));
+    let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
+    let hub = Arc::new(EpisodeRecorderHub::new(
+        Arc::new(FileArtifactStore::new(root.join("artifacts"))),
+        episodes.clone(),
+    ));
+    let genome_revision_id = GenomeRevisionId::generate();
+    let evidence = EvidenceRuntime::new(Arc::clone(&hub), genome_revision_id.clone());
+    let (gateway, options) = build_demo_gateway();
+    let mut sinks = CompositeEventSink::new();
+    sinks.push(hub);
+    let agent = Agent::new(gateway, options).with_event_sink(Arc::new(sinks));
+    let store = MemorySessionStore::new();
+    let session_id = SessionId::new("evidence-session").expect("创建证据测试会话标识");
+    let record = SessionRecord::new(session_id.clone(), Session::new()).expect("创建证据测试会话");
+
+    let completion =
+        run_and_persist_with_evidence(&agent, &store, record, "记录本轮证据", Some(&evidence))
+            .await;
+
+    assert!(completion.error.is_none(), "{:?}", completion.error);
+    let run = completion.run.expect("Agent 应成功完成");
+    let stored = episodes
+        .query(&EpisodeQuery {
+            outcome: None,
+            session_id: Some(session_id.to_string()),
+        })
+        .await
+        .expect("应查询 Episode");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].run_id.as_str(), run.run_id);
+    assert_eq!(stored[0].genome_revision_id, genome_revision_id);
+    assert_eq!(stored[0].outcome, Some(Outcome::Unverifiable));
+    assert_eq!(stored[0].session_id, session_id.to_string());
+    let _ = tokio::fs::remove_dir_all(root).await;
+}
+
 /// 首次 save 已写入但返回错误时，应通过回读协调后继续模型运行。
 #[tokio::test]
 async fn reconciles_indeterminate_initial_save_before_running() {
