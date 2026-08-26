@@ -42,6 +42,7 @@ sessions_dir = "projects"
 enabled = false
 # root_dir = "evolution"
 # genome_revision_id = "grev_0123456789abcdef0123456789abcdef"
+# genome_stable = "stable/general"
 "#;
 
 /// 配置文件中由 TUI 消费的应用设置。
@@ -73,6 +74,8 @@ pub(crate) struct EvidenceSettings {
     pub(crate) root_dir: Option<PathBuf>,
     /// 启动时从不可变 Genome Store 验证并绑定的修订 ID。
     pub(crate) genome_revision_id: Option<String>,
+    /// 启动时由只读 Resolver 解析的 Stable lineage；与修订 ID 二选一。
+    pub(crate) genome_stable: Option<String>,
 }
 
 /// 只反序列化根配置中的 TUI 字段，模型和插件字段由各自 crate 处理。
@@ -268,6 +271,7 @@ mod tests {
             settings.evidence.genome_revision_id.as_deref(),
             Some("grev_0123456789abcdef0123456789abcdef")
         );
+        assert!(settings.evidence.genome_stable.is_none());
         fs::remove_dir_all(root).expect("清理配置测试目录");
     }
 

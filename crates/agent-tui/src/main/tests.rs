@@ -393,6 +393,48 @@ async fn plugin_loading_does_not_block_ready_agent_input() {
         .any(|message| matches!(message.kind, MsgKind::User) && message.text == "立即执行"));
 }
 
+/// Evidence Run 必须等待 Genome 固定的全部插件 Ready，普通渐进模式不受该门禁影响。
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn evidence_run_waits_for_complete_genome_plugins() {
+    use agent_evolution::{EpisodeRecorderHub, FileArtifactStore, FileEpisodeStore};
+
+    let root = std::env::temp_dir().join(format!(
+        "lucia-evidence-plugin-ready-{}",
+        SessionId::generate()
+    ));
+    let artifacts = FileArtifactStore::new(root.join("artifacts"));
+    let evidence = EvidenceRuntime::new(
+        Arc::new(EpisodeRecorderHub::new(
+            Arc::new(artifacts.clone()),
+            Arc::new(FileEpisodeStore::new(root.join("episodes"))),
+        )),
+        super::evidence::test_genome_revision(agent_tool::ExecutionPolicy::serve(), &artifacts)
+            .await,
+        artifacts,
+    )
+    .expect("应创建插件就绪测试 Evidence");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into())
+        .with_evidence(Some(evidence))
+        .with_loading_plugins(vec!["skill".into()]);
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    app.input = "不得提前执行".into();
+    app.cursor = app.input.len();
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
+
+    assert!(!app.running);
+    assert_eq!(app.input, "不得提前执行");
+    assert!(app.messages.iter().any(|message| {
+        matches!(message.kind, MsgKind::Info) && message.text.contains("尚未完整就绪")
+    }));
+    app.finish_progressive_plugin_loading();
+    assert!(app.evidence_genome_run_is_ready());
+    let _ = tokio::fs::remove_dir_all(root).await;
+}
+
 /// Queued startup inputs execute sequentially and persist into one continuing session.
 ///
 /// 启动队列中的输入应逐条执行，并持久化到同一个连续 Session。
@@ -969,16 +1011,21 @@ async fn evidence_runtime_records_persisted_main_run() {
     use agent_evolution::{
         EpisodeQuery, EpisodeRecorderHub, EpisodeStore, FileArtifactStore, FileEpisodeStore,
     };
-    use agent_evolution_protocol::{GenomeRevisionId, Outcome};
+    use agent_evolution_protocol::Outcome;
 
     let root = std::env::temp_dir().join(format!("lucia-tui-evidence-{}", SessionId::generate()));
     let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
+    let artifacts = FileArtifactStore::new(root.join("artifacts"));
     let hub = Arc::new(EpisodeRecorderHub::new(
-        Arc::new(FileArtifactStore::new(root.join("artifacts"))),
+        Arc::new(artifacts.clone()),
         episodes.clone(),
     ));
-    let genome_revision_id = GenomeRevisionId::generate();
-    let evidence = EvidenceRuntime::new(Arc::clone(&hub), genome_revision_id.clone());
+    let revision =
+        super::evidence::test_genome_revision(agent_tool::ExecutionPolicy::serve(), &artifacts)
+            .await;
+    let genome_revision_id = revision.revision_id.clone();
+    let evidence =
+        EvidenceRuntime::new(Arc::clone(&hub), revision, artifacts).expect("应创建主会话 Evidence");
     let (gateway, options) = build_demo_gateway();
     let mut sinks = CompositeEventSink::new();
     sinks.push(hub);
@@ -1005,6 +1052,51 @@ async fn evidence_runtime_records_persisted_main_run() {
     assert_eq!(stored[0].genome_revision_id, genome_revision_id);
     assert_eq!(stored[0].outcome, Some(Outcome::Unverifiable));
     assert_eq!(stored[0].session_id, session_id.to_string());
+    let saved_session = store
+        .load(&session_id)
+        .await
+        .expect("应读取绑定后的会话")
+        .expect("Evidence 会话应已保存");
+    assert_eq!(
+        saved_session.behavior_binding,
+        Some(
+            agent_session::SessionBehaviorBinding::new(
+                "agent_genome",
+                genome_revision_id.to_string()
+            )
+            .expect("应构造预期 Genome 绑定")
+        )
+    );
+
+    let legacy_id = SessionId::new("legacy-evidence-session").expect("应创建旧会话标识");
+    let legacy = store
+        .save(
+            SessionRecord::new(legacy_id.clone(), Session::new()).expect("应创建未绑定旧会话"),
+            None,
+        )
+        .await
+        .expect("应保存未绑定旧会话");
+    let completion = run_and_persist_with_evidence(
+        &agent,
+        &store,
+        legacy,
+        "旧会话不得静默认领 Genome",
+        Some(&evidence),
+    )
+    .await;
+    assert!(!completion.input_committed);
+    assert!(completion
+        .error
+        .expect("旧会话缺少绑定必须失败")
+        .to_string()
+        .contains("缺少行为修订绑定"));
+    assert!(store
+        .load(&legacy_id)
+        .await
+        .expect("应读取旧会话")
+        .expect("旧会话应仍存在")
+        .behavior_binding
+        .is_none());
     let _ = tokio::fs::remove_dir_all(root).await;
 }
 

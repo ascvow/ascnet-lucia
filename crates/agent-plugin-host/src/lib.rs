@@ -22,7 +22,7 @@ use agent_core::{
 };
 #[cfg(feature = "wasm")]
 use agent_runtime::{AgentDeriveConfig, AgentProfileId, AgentRuntimeProvisioner};
-use agent_tool::{ToolCall, ToolResult, ToolSpec};
+use agent_tool::{ExecutionPolicy, ToolCall, ToolResult, ToolSpec};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::{
@@ -47,6 +47,8 @@ pub struct PluginHostServices {
     agent_runtime: Option<AgentRuntimeHostServices>,
     #[cfg(feature = "wasm")]
     model_completion: Option<ModelCompletionHostServices>,
+    /// Host 持有且只能通过 `restrict` 收紧的运行平面策略。
+    execution_policy: ExecutionPolicy,
 }
 
 /// Agent Runtime provisioner 与 Host 管理的派生策略注册表。
@@ -73,6 +75,16 @@ impl PluginHostServices {
     /// 创建不提供额外宿主服务的默认集合。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 使用可信执行策略收紧插件宿主能力。
+    ///
+    /// 每次调用都与当前策略逐字段取更严格的一方，因此后续传入 Serve 策略也无法恢复
+    /// 已收紧的字段。当前 Plugin Host 在进程能力入口使用该策略；其他能力可在获得对应
+    /// 可信门禁后复用同一策略。
+    pub fn restrict_execution_policy(mut self, requested: &ExecutionPolicy) -> Self {
+        self.execution_policy = self.execution_policy.restrict(requested);
+        self
     }
 
     /// 注入 Agent Runtime provisioner、controller 基础 profile 和 Guest 可请求的派生策略。
@@ -146,6 +158,12 @@ impl PluginHostServices {
     #[cfg(feature = "wasm")]
     pub(crate) fn model_completion(&self) -> Option<ModelCompletionHostServices> {
         self.model_completion.clone()
+    }
+
+    /// 返回 Host 内部持有的可信执行策略快照。
+    #[cfg(feature = "wasm")]
+    pub(crate) fn execution_policy(&self) -> ExecutionPolicy {
+        self.execution_policy.clone()
     }
 }
 
@@ -953,6 +971,16 @@ mod tests {
     use crate::ui::{ToolRenderState, UiInputEvent, UiPlacement, UiSize};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 宿主执行策略一旦收紧，后续 Serve 请求不得恢复进程能力。
+    #[test]
+    fn plugin_host_execution_policy_cannot_be_widened() {
+        let services = PluginHostServices::new()
+            .restrict_execution_policy(&ExecutionPolicy::evaluation("."))
+            .restrict_execution_policy(&ExecutionPolicy::serve());
+
+        assert!(!services.execution_policy.allow_process);
+    }
 
     /// 记录调用次数的测试插件宿主。
     struct CountingPluginHost {

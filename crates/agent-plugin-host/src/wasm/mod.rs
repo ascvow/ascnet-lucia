@@ -4,7 +4,9 @@
 //! Rust 内部类型可以继续通过 serde 演进。
 
 use super::{
-    capability::{encode_host_response, AgentRuntimeBinding, CapabilityState},
+    capability::{
+        encode_host_response, AgentRuntimeBinding, CapabilityHostContext, CapabilityState,
+    },
     contribution::ContributionRegistry,
     manifest::{
         resolve_plugin_capabilities, resolve_plugin_load_order, PluginManifest,
@@ -362,8 +364,11 @@ impl WasmPluginHost {
                         manifest.capabilities.clone(),
                         contributions.clone(),
                         services.clone(),
-                        agent_runtime.clone(),
-                        host_services.model_completion(),
+                        CapabilityHostContext::new(
+                            agent_runtime.clone(),
+                            host_services.model_completion(),
+                            host_services.execution_policy(),
+                        ),
                     ),
                     store_limits,
                 ),

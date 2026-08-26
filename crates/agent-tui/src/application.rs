@@ -2,6 +2,42 @@
 
 use super::*;
 
+/// 使用可信 Evidence 策略收紧普通 TUI 配置生成的 Agent 选项。
+///
+/// Evidence 未启用时原样返回，保证现有 Serve 装配行为不变；启用时通过 Core 的
+/// 单调收缩入口组合策略，普通配置不能覆盖 Genome 的限制。
+fn restrict_agent_options_for_evidence(
+    options: AgentOptions,
+    evidence_policy: Option<&agent_tool::ExecutionPolicy>,
+) -> AgentOptions {
+    match evidence_policy {
+        Some(policy) => options.with_execution_policy(policy.clone()),
+        None => options,
+    }
+}
+
+/// 创建原生工具工作区守卫，并在 Evidence 启用时叠加 Genome 文件系统范围。
+///
+/// TUI 启动目录始终是权限上界；Genome 的 `Root` 或 `Denied` 只能进一步收缩该范围，
+/// `Serve` 的 `Unrestricted` 也不能把原有工作区边界扩大为全盘访问。
+///
+/// # Errors
+///
+/// 工作区或 Genome 声明的有效根目录不存在、无法规范化时返回错误。
+fn native_workspace_guard(
+    workspace_root: &Path,
+    evidence_policy: Option<&agent_tool::ExecutionPolicy>,
+) -> Result<agent_tool::WorkspaceGuard> {
+    let Some(evidence_policy) = evidence_policy else {
+        return Ok(agent_tool::WorkspaceGuard::rooted(workspace_root)?);
+    };
+
+    let mut workspace_policy = agent_tool::ExecutionPolicy::serve();
+    workspace_policy.filesystem = agent_tool::FilesystemScope::Root(workspace_root.to_path_buf());
+    let effective_policy = workspace_policy.restrict(evidence_policy);
+    Ok(agent_tool::WorkspaceGuard::from_policy(&effective_policy)?)
+}
+
 /// 终端状态守卫：正常退出、`?` 提前返回或 panic 展开时都恢复终端。
 ///
 /// raw mode 或 bracketed paste 残留会让外层 shell 换行不回车、粘贴出现
@@ -84,15 +120,18 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     if args.list_sessions {
         return print_persisted_sessions(session_store.as_ref()).await;
     }
-    let session_record = load_startup_session(
+    let evidence_runtime =
+        load_evidence_runtime(&tui_settings.evidence, &config_path, &lucia_home).await?;
+    let mut session_record = load_startup_session(
         session_store.as_ref(),
         args.session_id.as_deref(),
         &workspace,
         args.resume_latest,
     )
     .await?;
-    let evidence_runtime =
-        load_evidence_runtime(&tui_settings.evidence, &config_path, &lucia_home).await?;
+    if let Some(evidence) = evidence_runtime.as_ref() {
+        evidence.bind_or_validate_session(&mut session_record)?;
+    }
 
     #[cfg(feature = "plugins")]
     let mut plugin_manifests = args.plugin_manifests.clone();
@@ -126,9 +165,23 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     // 用户禁用列表最后生效：受管理插件和显式声明都会被剔除。
     #[cfg(feature = "plugins")]
     remove_disabled_plugin_manifests(&mut plugin_manifests, &disabled_plugins);
+    #[cfg(feature = "plugins")]
+    if let Some(evidence) = evidence_runtime.as_ref() {
+        let (bound_manifests, bound_owners) = evidence.bind_plugins(&plugin_manifests)?;
+        plugin_manifests = bound_manifests;
+        capability_selection = bound_owners;
+    }
+    #[cfg(not(feature = "plugins"))]
+    if let Some(evidence) = evidence_runtime.as_ref() {
+        evidence.verify_core_only_plugins()?;
+    }
 
     let (gateway, options, demo_mode, mut startup_notices) = if args.demo {
         let (gateway, options) = build_demo_gateway();
+        let options = match evidence_runtime.as_ref() {
+            Some(evidence) => evidence.bind_demo_options(options).await?,
+            None => options,
+        };
         (
             gateway,
             options,
@@ -140,13 +193,24 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         )
     } else if config_exists {
         let config = AgentRootConfig::load(&config_path)?;
+        let config = match evidence_runtime.as_ref() {
+            Some(evidence) => evidence.bind_model_config(config)?,
+            None => config,
+        };
         if configured_model_key_is_available(&config) {
             let mut options = config.agent_options();
             if config.agent.max_steps.is_none() {
                 // 交互主会话默认不设总步数上限；后台运行可显式传入正数限制。
                 options.max_steps = 0;
             }
+            if let Some(evidence) = evidence_runtime.as_ref() {
+                options = evidence.bind_agent_options(options).await?;
+            }
             (config.build_gateway()?, options, false, Vec::new())
+        } else if evidence_runtime.is_some() {
+            return Err(anyhow!(
+                "Evidence Genome 已固定真实模型路由，但当前配置未提供可用模型密钥"
+            ));
         } else {
             let key_hint = config
                 .model
@@ -168,8 +232,16 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         }
     } else {
         let (gateway, options) = build_demo_gateway();
+        let options = match evidence_runtime.as_ref() {
+            Some(evidence) => evidence.bind_demo_options(options).await?,
+            None => options,
+        };
         (gateway, options, true, Vec::new())
     };
+    let evidence_policy = evidence_runtime
+        .as_ref()
+        .map(EvidenceRuntime::execution_policy);
+    let options = restrict_agent_options_for_evidence(options, evidence_policy);
     if auto_initialized {
         startup_notices.insert(
             0,
@@ -189,9 +261,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         }))?;
     } else {
         // 真实模式注入内置工具集：读写文件、列目录、shell、搜索。
-        // 工作区固定为启动目录，原生工具无法读写其外部路径，也不跟随越界符号链接。
-        let guard = agent_tool::WorkspaceGuard::rooted(&workspace.cwd)?;
+        // 工作区固定为启动目录；Evidence 启用时，Genome 只能在此上界内继续收紧。
+        let guard = native_workspace_guard(&workspace.cwd, evidence_policy)?;
         agent_tool::builtins::register_builtins(&mut native_tools, guard)?;
+    }
+    if let Some(evidence) = evidence_runtime.as_ref() {
+        native_tools = evidence.bind_native_tools(&native_tools)?;
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -299,15 +374,23 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         app = app.with_loading_plugins(loading_plugin_ids);
         let load_tx = tx.clone();
         let load_host = Arc::clone(&live_plugin_host);
+        let plugin_execution_policy = evidence_policy
+            .cloned()
+            .unwrap_or_else(agent_tool::ExecutionPolicy::serve);
         let run_observer = evidence_runtime
             .as_ref()
             .map(EvidenceRuntime::runtime_run_observer);
+        let require_complete_genome = evidence_runtime.is_some();
         tokio::spawn(async move {
             let result = load_plugins_for_tui(
                 plugin_manifests,
                 capability_selection,
                 plugin_agent_template,
-                run_observer,
+                PluginExecutionContext {
+                    execution_policy: plugin_execution_policy,
+                    run_observer,
+                    require_complete_genome,
+                },
                 load_host,
                 load_tx.clone(),
             )
@@ -750,3 +833,66 @@ async fn record_run_failure_event(events_jsonl: Option<&Path>, completion: &Agen
 }
 
 // ─── Demo 模型 ───
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_tool::{ExecutionPolicy, ExecutionProfile};
+
+    /// Evidence 策略必须收紧普通配置，且较严格的普通配置不能被 Serve Genome 放宽。
+    #[test]
+    fn evidence_policy_only_tightens_agent_options() {
+        let evaluation = ExecutionPolicy::evaluation("/tmp/lucia-fixture");
+        let options =
+            restrict_agent_options_for_evidence(AgentOptions::default(), Some(&evaluation));
+        assert_eq!(
+            options.execution_policy.profile(),
+            ExecutionProfile::Evaluation
+        );
+        assert!(!options.execution_policy.allow_process);
+
+        let mutation_options =
+            AgentOptions::default().with_execution_policy(ExecutionPolicy::mutation());
+        let options =
+            restrict_agent_options_for_evidence(mutation_options, Some(&ExecutionPolicy::serve()));
+        assert_eq!(
+            options.execution_policy.profile(),
+            ExecutionProfile::Mutation
+        );
+    }
+
+    /// 原生工具守卫必须采用工作区与 Genome 文件范围的交集，并保持无 Evidence 的旧边界。
+    #[test]
+    fn evidence_policy_restricts_native_workspace_guard() {
+        let root = std::env::temp_dir().join(format!(
+            "lucia-evidence-guard-{}",
+            agent_session::SessionId::generate()
+        ));
+        let workspace = root.join("workspace");
+        let fixture = workspace.join("fixture");
+        std::fs::create_dir_all(&fixture).expect("应创建测试工作区");
+
+        let guard = native_workspace_guard(&workspace, None).expect("应保留默认工作区守卫");
+        assert_eq!(
+            guard.root(),
+            Some(workspace.canonicalize().expect("应规范化工作区").as_path())
+        );
+
+        let guard = native_workspace_guard(&workspace, Some(&ExecutionPolicy::serve()))
+            .expect("Serve Genome 不应扩大工作区");
+        assert_eq!(
+            guard.root(),
+            Some(workspace.canonicalize().expect("应规范化工作区").as_path())
+        );
+
+        let evaluation = ExecutionPolicy::evaluation(&fixture);
+        let guard = native_workspace_guard(&workspace, Some(&evaluation))
+            .expect("Evaluation Fixture 应进入守卫");
+        assert_eq!(
+            guard.root(),
+            Some(fixture.canonicalize().expect("应规范化 Fixture").as_path())
+        );
+
+        std::fs::remove_dir_all(root).expect("应清理测试工作区");
+    }
+}

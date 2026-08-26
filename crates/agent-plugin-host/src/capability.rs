@@ -10,6 +10,7 @@ use agent_core::{AgentEvent, ModelMessage, ModelRequest, ReasoningLevel, ToolCho
 use agent_runtime::{
     AgentEventStream, AgentId, AgentRuntimeApi, AgentSpawnRequest, RuntimePrincipal,
 };
+use agent_tool::{ExecutionPolicy, ExecutionProfile};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -48,6 +49,8 @@ pub(crate) struct CapabilityState {
     plugin_id: String,
     plugin_dir: PathBuf,
     permissions: CapabilitySection,
+    /// 来自 Host 运行平面的可信策略，不接受 manifest 或 Guest 输入。
+    execution_policy: ExecutionPolicy,
     contributions: Arc<ContributionRegistry>,
     services: Arc<ServiceRegistry>,
     agent_runtime: Option<AgentRuntimeBinding>,
@@ -55,6 +58,38 @@ pub(crate) struct CapabilityState {
     processes: HashMap<u64, ManagedProcess>,
     next_process_handle: u64,
     state: HashMap<String, Value>,
+}
+
+/// Host 注入单个插件实例的可信服务与运行平面策略。
+///
+/// 该上下文不包含 manifest 或 Guest 可控字段，避免服务绑定与可信策略在构造阶段被混入
+/// 插件声明。
+#[derive(Clone, Default)]
+pub(crate) struct CapabilityHostContext {
+    /// 已绑定可信 principal 的 Agent Runtime；缺失时关闭控制面能力。
+    agent_runtime: Option<AgentRuntimeBinding>,
+    /// Host 固定模型路由；缺失时关闭模型完成能力。
+    model_completion: Option<ModelCompletionHostServices>,
+    /// Host 运行平面的可信策略，默认 Serve 以保持既有加载行为。
+    execution_policy: ExecutionPolicy,
+}
+
+impl CapabilityHostContext {
+    /// 组合 Host 已完成身份绑定的服务与只能收紧的执行策略。
+    ///
+    /// `agent_runtime` 和 `model_completion` 缺失时，对应能力保持关闭；
+    /// `execution_policy` 决定原生进程等高权限能力能否进入操作系统。
+    pub(crate) fn new(
+        agent_runtime: Option<AgentRuntimeBinding>,
+        model_completion: Option<ModelCompletionHostServices>,
+        execution_policy: ExecutionPolicy,
+    ) -> Self {
+        Self {
+            agent_runtime,
+            model_completion,
+            execution_policy,
+        }
+    }
 }
 
 impl Drop for CapabilityState {
@@ -242,24 +277,27 @@ fn default_agent_event_limit() -> usize {
 }
 
 impl CapabilityState {
-    /// 创建绑定到插件目录和 manifest 权限的能力状态。
+    /// 创建绑定到插件目录、manifest 请求和 Host 可信执行策略的能力状态。
+    ///
+    /// `host_context` 必须由 Host 应用组装层提供；构造后所有原生进程入口同时要求其中
+    /// 的执行策略允许与 manifest 显式声明，拒绝 Guest 通过提示或工具名称扩大权限。
     pub(crate) fn new(
         plugin_id: String,
         plugin_dir: PathBuf,
         permissions: CapabilitySection,
         contributions: Arc<ContributionRegistry>,
         services: Arc<ServiceRegistry>,
-        agent_runtime: Option<AgentRuntimeBinding>,
-        model_completion: Option<ModelCompletionHostServices>,
+        host_context: CapabilityHostContext,
     ) -> Self {
         Self {
             plugin_id,
             plugin_dir,
             permissions,
+            execution_policy: host_context.execution_policy,
             contributions,
             services,
-            agent_runtime,
-            model_completion,
+            agent_runtime: host_context.agent_runtime,
+            model_completion: host_context.model_completion,
             processes: HashMap::new(),
             next_process_handle: 1,
             state: HashMap::new(),
@@ -755,11 +793,15 @@ impl CapabilityState {
     }
 
     fn require_process_exec(&self) -> Result<()> {
-        if self.permissions.process_exec {
-            Ok(())
-        } else {
-            Err(anyhow!("插件 manifest 未声明 process_exec 能力"))
+        if self.execution_policy.profile() != ExecutionProfile::Serve
+            || !self.execution_policy.allow_process
+        {
+            return Err(anyhow!("Host ExecutionPolicy 禁止插件进程执行"));
         }
+        if !self.permissions.process_exec {
+            return Err(anyhow!("插件 manifest 未声明 process_exec 能力"));
+        }
+        Ok(())
     }
 
     fn resolve_read_path(&self, requested: &str) -> Result<PathBuf> {
@@ -1011,6 +1053,7 @@ mod tests {
         AgentProfileId, AgentRuntimeError, AgentRuntimeProvisioner, AgentSnapshot, AgentStatus,
         ProvisionedAgentRuntime, RuntimeResult,
     };
+    use agent_tool::ToolAccess;
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -1214,8 +1257,22 @@ mod tests {
             CapabilitySection::default(),
             Arc::new(ContributionRegistry::default()),
             Arc::new(ServiceRegistry::default()),
-            None,
-            None,
+            CapabilityHostContext::default(),
+        )
+    }
+
+    /// 创建带指定 manifest 进程声明和可信执行策略的测试状态。
+    fn process_state(process_exec: bool, execution_policy: ExecutionPolicy) -> CapabilityState {
+        CapabilityState::new(
+            "process-test-plugin".into(),
+            PathBuf::from("."),
+            CapabilitySection {
+                process_exec,
+                ..CapabilitySection::default()
+            },
+            Arc::new(ContributionRegistry::default()),
+            Arc::new(ServiceRegistry::default()),
+            CapabilityHostContext::new(None, None, execution_policy),
         )
     }
 
@@ -1256,8 +1313,7 @@ mod tests {
             CapabilitySection::default(),
             contributions.clone(),
             Arc::new(ServiceRegistry::default()),
-            None,
-            None,
+            CapabilityHostContext::default(),
         );
         state
             .emit_event(r#"{"name":"demo.ready","data":{"ok":true}}"#)
@@ -1300,6 +1356,56 @@ mod tests {
         invalid.args.clear();
         invalid.env = HashMap::from([("BAD=KEY".into(), "value".into())]);
         assert!(validate_process_spawn_request(&invalid).is_err());
+    }
+
+    /// manifest 声明不得覆盖 Evaluation 或 Mutation 平面的可信进程禁令。
+    #[test]
+    fn process_manifest_cannot_override_restricted_plane_policy() {
+        for mut policy in [
+            ExecutionPolicy::evaluation("."),
+            ExecutionPolicy::mutation(),
+        ] {
+            // 即使调用方错误地改开布尔位，可信平面身份也必须保持最终否决权。
+            policy.allow_process = true;
+            let mut state = process_state(true, policy);
+            let error = state
+                .spawn_process(r#"{"command":"command-must-not-run"}"#)
+                .expect_err("受限平面必须在调用操作系统前拒绝进程");
+
+            assert!(error.to_string().contains("ExecutionPolicy 禁止"));
+            assert!(state.processes.is_empty());
+        }
+    }
+
+    /// Serve 平面允许进程时仍必须获得 manifest 的显式声明。
+    #[test]
+    fn serve_process_policy_still_requires_manifest_permission() {
+        let denied = process_state(false, ExecutionPolicy::serve());
+        let error = denied
+            .require_process_exec()
+            .expect_err("缺少 manifest 声明必须拒绝");
+        assert!(error.to_string().contains("manifest 未声明 process_exec"));
+
+        let allowed = process_state(true, ExecutionPolicy::serve());
+        allowed
+            .require_process_exec()
+            .expect("Serve 策略和 manifest 同时允许时门禁应通过");
+    }
+
+    /// 插件即使把工具伪装成普通名称，也不能绕过实际进程能力入口。
+    #[test]
+    fn plugin_tool_alias_cannot_bypass_process_policy() {
+        let mut policy = ExecutionPolicy::evaluation(".");
+        policy.tools = ToolAccess::allowlist(["innocent_plugin_tool"]);
+        assert!(policy.permits_tool("innocent_plugin_tool"));
+
+        let mut state = process_state(true, policy);
+        let error = state
+            .spawn_process(r#"{"command":"command-must-not-run"}"#)
+            .expect_err("Host 进程门禁不得信任插件工具名称");
+
+        assert!(error.to_string().contains("ExecutionPolicy 禁止"));
+        assert!(state.processes.is_empty());
     }
 
     /// 所有 JSON 宿主能力入口必须共享请求大小上限。
