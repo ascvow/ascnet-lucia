@@ -36,6 +36,12 @@ stream = true
 [tui]
 sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
+
+[evidence]
+# 默认关闭；启用前必须先把对应 Genome Revision 写入不可变 Genome Store。
+enabled = false
+# root_dir = "evolution"
+# genome_revision_id = "grev_0123456789abcdef0123456789abcdef"
 "#;
 
 /// 配置文件中由 TUI 消费的应用设置。
@@ -53,6 +59,20 @@ pub(crate) struct TuiSettings {
     pub(crate) resume_latest: bool,
     /// Agent 事件 JSONL 路径；相对路径以配置文件目录为基准。
     pub(crate) events_jsonl: Option<PathBuf>,
+    /// Evolution Evidence Plane 配置；默认关闭且不创建证据目录。
+    pub(crate) evidence: EvidenceSettings,
+}
+
+/// TUI 的可证据化运行配置。
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct EvidenceSettings {
+    /// 是否为真实主 Agent Run 生成 Episode。
+    pub(crate) enabled: bool,
+    /// Genome、Artifact 与 Episode 的共同根目录；相对路径以配置文件目录为基准。
+    pub(crate) root_dir: Option<PathBuf>,
+    /// 启动时从不可变 Genome Store 验证并绑定的修订 ID。
+    pub(crate) genome_revision_id: Option<String>,
 }
 
 /// 只反序列化根配置中的 TUI 字段，模型和插件字段由各自 crate 处理。
@@ -61,6 +81,7 @@ pub(crate) struct TuiSettings {
 struct TuiConfigEnvelope {
     model: TuiModelSettings,
     tui: TuiSettings,
+    evidence: EvidenceSettings,
 }
 
 /// TUI 从 `[model]` 读取的展示元数据，不参与 Core 模型网关配置。
@@ -138,6 +159,7 @@ pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
         toml::from_str(&text).with_context(|| format!("解析 TUI 配置失败：{}", path.display()))?;
     let mut settings = config.tui;
     settings.context_window = config.model.context_window.filter(|window| *window > 0);
+    settings.evidence = config.evidence;
     Ok(settings)
 }
 
@@ -196,6 +218,7 @@ mod tests {
         assert_eq!(settings.context_window, None);
         assert_eq!(settings.default_session, None);
         assert!(!settings.resume_latest);
+        assert_eq!(settings.evidence, EvidenceSettings::default());
 
         let error = initialize_config(&path).expect_err("重复初始化必须拒绝覆盖");
         assert!(error.to_string().contains("未覆盖"));
@@ -220,6 +243,31 @@ mod tests {
         fs::write(&path, "[model]\ncontext_window = 0\n").expect("写入零窗口配置");
         let settings = load_tui_settings(&path).expect("读取零窗口配置");
         assert_eq!(settings.context_window, None);
+        fs::remove_dir_all(root).expect("清理配置测试目录");
+    }
+
+    /// Evidence 配置必须独立于 TUI 字段解析，并保留显式 Genome 绑定。
+    #[test]
+    fn loads_evidence_settings() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("创建配置测试目录");
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "[evidence]\nenabled = true\nroot_dir = \"evolution-data\"\ngenome_revision_id = \"grev_0123456789abcdef0123456789abcdef\"\n",
+        )
+        .expect("写入 Evidence 配置");
+
+        let settings = load_tui_settings(&path).expect("读取 Evidence 配置");
+        assert!(settings.evidence.enabled);
+        assert_eq!(
+            settings.evidence.root_dir,
+            Some(PathBuf::from("evolution-data"))
+        );
+        assert_eq!(
+            settings.evidence.genome_revision_id.as_deref(),
+            Some("grev_0123456789abcdef0123456789abcdef")
+        );
         fs::remove_dir_all(root).expect("清理配置测试目录");
     }
 

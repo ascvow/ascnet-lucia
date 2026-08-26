@@ -91,6 +91,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         args.resume_latest,
     )
     .await?;
+    let evidence_runtime =
+        load_evidence_runtime(&tui_settings.evidence, &config_path, &lucia_home).await?;
 
     #[cfg(feature = "plugins")]
     let mut plugin_manifests = args.plugin_manifests.clone();
@@ -206,8 +208,18 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let base_agent = Agent::new(gateway, options)
         .with_tools(native_tools)
         .with_event_sink(Arc::new(sink));
+    // Runtime 子 Agent 使用独立的执行会话，不能继承只为 TUI 主会话登记的 Recorder Hub。
+    // 因此先捕获插件模板，再只给主 Agent 叠加 Evidence sink。
     #[cfg(feature = "plugins")]
     let plugin_agent_template = AgentTemplate::from_agent(&base_agent);
+    let base_agent = if let Some(evidence) = evidence_runtime.as_ref() {
+        let mut sinks = CompositeEventSink::new();
+        sinks.push(evidence.hub());
+        sinks.push(base_agent.event_sink());
+        base_agent.with_event_sink(Arc::new(sinks))
+    } else {
+        base_agent
+    };
     #[cfg(feature = "plugins")]
     let live_plugin_host = Arc::new(LivePluginHost::new());
     #[cfg(feature = "plugins")]
@@ -275,7 +287,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let mut app = App::new(tx.clone(), model_name)
         .with_workspace(workspace)
         .with_context_window(tui_settings.context_window)
-        .with_persistent_session(session_store, session_record);
+        .with_persistent_session(session_store, session_record)
+        .with_evidence(evidence_runtime);
     app.messages.extend(
         startup_notices
             .into_iter()

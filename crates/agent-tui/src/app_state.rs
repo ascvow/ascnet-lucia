@@ -64,6 +64,8 @@ pub(crate) struct App {
     pub(crate) session_record: SessionRecord,
     /// 执行 revision 比较并交换的会话存储。
     pub(crate) session_store: Arc<dyn SessionStore>,
+    /// 可选 Evidence Plane；启用后每次主会话运行必须形成 Episode。
+    pub(crate) evidence: Option<EvidenceRuntime>,
     pub(crate) tx: mpsc::UnboundedSender<UiEvent>,
     pub(crate) model_name: String,
     pub(crate) spinner_frame: usize,
@@ -178,6 +180,7 @@ impl App {
             should_quit: false,
             session_record,
             session_store: Arc::new(MemorySessionStore::new()),
+            evidence: None,
             tx,
             model_name,
             spinner_frame: 0,
@@ -246,6 +249,12 @@ impl App {
         self.messages = restore_session_messages(&session_record.session);
         self.session_store = session_store;
         self.session_record = session_record;
+        self
+    }
+
+    /// 注入启动时已经验证 Genome Revision 的 Evidence Plane。
+    pub(crate) fn with_evidence(mut self, evidence: Option<EvidenceRuntime>) -> Self {
+        self.evidence = evidence;
         self
     }
 
@@ -1633,15 +1642,30 @@ impl App {
         let tx = self.tx.clone();
         let session_store = Arc::clone(&self.session_store);
         let session_record = self.session_record.clone();
+        let evidence = self.evidence.clone();
 
         tokio::spawn(async move {
-            let result = run_and_persist(
-                agent.as_ref(),
-                session_store.as_ref(),
-                session_record,
-                submission,
-            )
-            .await;
+            let result = match evidence.as_ref() {
+                Some(evidence) => {
+                    run_and_persist_with_evidence(
+                        agent.as_ref(),
+                        session_store.as_ref(),
+                        session_record,
+                        submission,
+                        Some(evidence),
+                    )
+                    .await
+                }
+                None => {
+                    run_and_persist(
+                        agent.as_ref(),
+                        session_store.as_ref(),
+                        session_record,
+                        submission,
+                    )
+                    .await
+                }
+            };
             let _ = tx.send(UiEvent::AgentDone(Box::new(result)));
         });
     }

@@ -5,6 +5,7 @@ mod app_state;
 mod application;
 mod conversation;
 mod doctor;
+mod evidence;
 #[cfg(feature = "plugins")]
 mod host_actions;
 #[cfg(feature = "plugins")]
@@ -58,12 +59,11 @@ use agent_session::{
     SessionStoreError, SessionSummary,
 };
 use agent_tool::{JsonTool, ToolCall, ToolOutputDelta, ToolRegistry, ToolResult, ToolSpec};
-#[cfg(feature = "plugins")]
 use anyhow::Context;
 use anyhow::{anyhow, Result};
 use app_config::{
     initialize_config, load_tui_settings, lucia_home_dir, resolve_config_path,
-    resolve_config_relative_path, TuiSettings,
+    resolve_config_relative_path, EvidenceSettings, TuiSettings,
 };
 use app_state::*;
 use async_trait::async_trait;
@@ -71,6 +71,7 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 #[cfg(feature = "plugins")]
 use crossterm::event::MouseEvent;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use evidence::{load_evidence_runtime, EvidenceRuntime};
 use ratatui::{prelude::*, widgets::*};
 #[cfg(feature = "plugins")]
 use serde::{de::DeserializeOwned, Serialize};

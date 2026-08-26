@@ -20,6 +20,8 @@ plugins = [
 [dependencies]
 anyhow.workspace = true
 agent-core = { path = "../agent-core", default-features = false, features = ["openai", "anthropic"] }
+agent-evolution = { path = "../agent-evolution" }
+agent-evolution-protocol = { path = "../agent-evolution-protocol" }
 agent-plugin-protocol = { path = "../agent-plugin-protocol", optional = true }
 agent-plugin-host = { path = "../agent-plugin-host", optional = true }
 agent-plugin-manager = { path = "../agent-plugin-manager", optional = true }

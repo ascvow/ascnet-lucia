@@ -305,8 +305,23 @@ pub(crate) async fn save_session_record_reconciled(
 pub(crate) async fn run_and_persist(
     agent: &Agent,
     session_store: &dyn SessionStore,
+    session_record: SessionRecord,
+    input: impl Into<UserSubmission>,
+) -> AgentCompletion {
+    run_and_persist_with_evidence(agent, session_store, session_record, input, None).await
+}
+
+/// 先保存用户输入，再以可选 Evidence Plane 运行 Agent 并保存完整回复。
+///
+/// Evidence 启用时，输入提交成功后才预登记 Run；Core、Recorder 和 Episode Header 使用
+/// 同一个强类型 Run ID。证据持久化失败会作为显式完成错误返回，但不会丢弃已经生成并成功
+/// 保存的完整 Session。
+pub(crate) async fn run_and_persist_with_evidence(
+    agent: &Agent,
+    session_store: &dyn SessionStore,
     mut session_record: SessionRecord,
     input: impl Into<UserSubmission>,
+    evidence: Option<&EvidenceRuntime>,
 ) -> AgentCompletion {
     let submission: UserSubmission = input.into();
     let expected_revision = (session_record.revision > 0).then_some(session_record.revision);
@@ -337,13 +352,55 @@ pub(crate) async fn run_and_persist(
         }
     };
 
-    let run = match agent.run_session(committed_record.session.clone()).await {
+    let registered_run = match evidence {
+        Some(evidence) => match evidence.register_run(committed_record.id.to_string()).await {
+            Ok(run) => Some(run),
+            Err(error) => {
+                return AgentCompletion {
+                    run: None,
+                    session_record: committed_record,
+                    error: Some(error),
+                    input_committed: true,
+                    queue_may_advance: true,
+                    input: submission,
+                };
+            }
+        },
+        None => None,
+    };
+    let run_result = match registered_run.as_ref() {
+        Some(registered) => {
+            agent
+                .run_session_with_id(
+                    committed_record.session.clone(),
+                    registered.run_id().to_string(),
+                )
+                .await
+        }
+        None => agent.run_session(committed_record.session.clone()).await,
+    };
+    let evidence_error = match registered_run {
+        Some(registered) => {
+            let outcome = match &run_result {
+                Ok(run) if run.cancelled => agent_evolution_protocol::Outcome::Cancelled,
+                Ok(_) => agent_evolution_protocol::Outcome::Unverifiable,
+                Err(_) => registered.interrupted_outcome().await,
+            };
+            registered
+                .close(outcome)
+                .await
+                .err()
+                .map(|error| anyhow!(error).context("收敛 Episode 失败"))
+        }
+        None => None,
+    };
+    let run = match run_result {
         Ok(run) => run,
         Err(error) => {
             return AgentCompletion {
                 run: None,
                 session_record: committed_record,
-                error: Some(error),
+                error: Some(merge_completion_error(error, evidence_error)),
                 input_committed: true,
                 queue_may_advance: true,
                 input: submission,
@@ -363,7 +420,7 @@ pub(crate) async fn run_and_persist(
         Ok(saved_record) => AgentCompletion {
             run: Some(run),
             session_record: saved_record,
-            error: None,
+            error: evidence_error,
             input_committed: true,
             queue_may_advance: true,
             input: submission,
@@ -381,9 +438,12 @@ pub(crate) async fn run_and_persist(
             match fork_result {
                 Ok(fork_record) => AgentCompletion {
                     run: Some(run),
-                    error: Some(anyhow!(
-                        "原会话的模型回复保存失败（{save_error}），完整回复已分叉保存为会话 {}",
-                        fork_record.id
+                    error: Some(merge_completion_error(
+                        anyhow!(
+                            "原会话的模型回复保存失败（{save_error}），完整回复已分叉保存为会话 {}",
+                            fork_record.id
+                        ),
+                        evidence_error,
                     )),
                     session_record: fork_record,
                     input_committed: true,
@@ -393,8 +453,11 @@ pub(crate) async fn run_and_persist(
                 Err(fork_error) => AgentCompletion {
                     run: Some(run),
                     session_record: completed_record,
-                    error: Some(anyhow!(
-                        "模型回复未能保存：{save_error}；分叉保存也失败：{fork_error}。完整回复已保留在当前内存会话中"
+                    error: Some(merge_completion_error(
+                        anyhow!(
+                            "模型回复未能保存：{save_error}；分叉保存也失败：{fork_error}。完整回复已保留在当前内存会话中"
+                        ),
+                        evidence_error,
                     )),
                     input_committed: true,
                     queue_may_advance: false,
@@ -402,6 +465,17 @@ pub(crate) async fn run_and_persist(
                 },
             }
         }
+    }
+}
+
+/// 合并运行、会话或证据错误，保留主要失败作为顶层语义。
+fn merge_completion_error(
+    primary: anyhow::Error,
+    secondary: Option<anyhow::Error>,
+) -> anyhow::Error {
+    match secondary {
+        Some(secondary) => anyhow!("{primary:#}；同时发生证据错误：{secondary:#}"),
+        None => primary,
     }
 }
 
