@@ -108,10 +108,35 @@ Recorder 只把脱敏并按数据策略收窄后的公开载荷交给 `RunSuperv
 Event Envelope、Incident 和初始 Outcome Revision 分别进入 CAS，其引用保存在 Episode
 Header 的 `supervision` 字段中，进程重启后仍可从同一 Episode 找回完整监督证据。
 
+工具终态由 Core 重新绑定实际 `call_id` 和工具名，并注入 `runtime_origin`。原生工具、Runtime
+和 Runtime 策略拒绝产生的 `error_kind` 可以形成可信权限或边界 Incident；Guest 插件自报的
+同名字段只按普通工具失败处理。即使数据策略丢弃工具正文，Recorder 仍保留这两个不含正文的
+安全元数据，避免脱敏过程破坏监督结论。
+
 在线运行没有可信 Verifier 时，正常完成默认记为 `Unverifiable`，不能推断为任务成功。
 取消记为 `Cancelled`。模型服务、工具环境或存储导致运行未产生 `RunFinished` 时，应用层
 应调用 `recorder.finish(Outcome::InfrastructureFailure)`，避免把基础设施问题统计为候选
 能力失败。
+
+TUI 的主 Agent 和 Runtime 子 Agent 都关闭 Recorder 的自动收敛。Core 返回后，应用层通过
+`OutcomeResolution` 提交可信终态：普通 Runtime 只能提交取消、基础设施失败或
+`Unverifiable`，成功与确定性任务失败必须来自可信 Verifier 或规则。Supervisor 会把恢复后的
+工具 Incident 更新为 `Recovered`，并把可信成功提升为 `SuccessWithRecovery`；可信后置条件
+失败会生成 `VerificationFailed` Incident。Context 压缩事件本身不等于失败，只有可信
+Verifier 判定 `ContextLoss` 时，才把检测位置关联到后续工具终态，并把疑似根因关联到真实
+压缩事件。
+
+Episode 提交后，TUI 从 Episode Store 和 Artifact CAS 重新读取证据，校验 Header、事件数、
+Event ID、Envelope、Incident、Outcome Revision 及其 Episode、Run、Genome 绑定，再调用
+`EvolutionPipeline`。Pipeline 跳过 `Recovered` Incident，普通单次工具错误只观察，可信
+`VerificationFailure` 与 `ContextLoss` 可单次进入 `EvolutionCandidate`，安全边界 Incident
+进入 `SecurityIncident`；需要处置的记录写入只追加 Evolution Outbox。调用方不能直接向这条
+生产路径注入自造 Incident 或 Outcome Revision JSON。
+
+普通错误的聚合计数写入 `issue-observations/` 下的只追加观察日志。观察键由失败指纹与
+Episode ID 决定，同一 Episode 重试写入保持幂等；新进程会先校验并重放历史观察，再处理当前
+Episode，因此跨重启的第二次同类失败仍能达到 `EvolutionCandidate` 阈值。相同指纹绑定冲突
+Issue ID、符号链接记录或损坏 JSON 会阻止 Pipeline，不会退化为新的内存 Issue。
 
 ## 存储不变量
 
@@ -124,6 +149,8 @@ Header 的 `supervision` 字段中，进程重启后仍可从同一 Episode 找�
   指向最新修订，并发竞争同一后继时只允许一个写入者提交。
 - `FileEvolutionOutbox` 的 JSON 记录不可变；消费状态写入独立 `.consumed` 标记，不覆盖
   原始记录，并拒绝路径逃逸和符号链接制品。
+- `FileIssueObservationStore` 使用指纹与 Episode 的稳定幂等键只追加观察，供重启后重建
+  Issue 聚合状态；同一 Episode 的重复 Incident 不会增加发生次数。
 
 ## 延迟反馈与 Outcome 修订
 
@@ -146,7 +173,8 @@ Episode 的监督 CAS 中；处理器会把该制品恢复为本地修订历史�
 ## Protocol Replay
 
 `ProtocolReplay` 读取 Episode 引用的 NDJSON 制品，先验证摘要、长度、事件数、Run ID、
-事件 ID 唯一性、时间与 step 单调性，以及 `run_started` / `run_finished` 终态顺序；存在
+事件 ID 唯一性、时间与 step 单调性，以及 `run_started` / `run_finished` 终态顺序。Core 的
+`run_finished` 必须唯一，其后只允许 Host 追加可信 Outcome 收敛事件；存在
 监督引用时，还会逐条验证 Envelope 的 sequence、Episode、Run、Genome、Event ID 和
 脱敏载荷。全部通过后才把事件交给 `ReplayEventSink`。该过程不调用真实模型或工具，
 因此可用于确定性状态机、插件 Hook 与持久化回归。
@@ -178,6 +206,9 @@ SHA-256 摘要；`--verify` 还会读取 CAS，逐项校验引用制品摘要与
 常用只读命令如下：
 
 ```bash
+lucia episode list [--session-id <session-id>] [--outcome <outcome>] [--json]
+lucia episode inspect <episode-id> [--json]
+lucia episode export <episode-id> --redacted
 lucia evolution genome inspect --revision <revision-id> [--format json]
 lucia evolution genome inspect --stable stable/general [--format json]
 lucia evolution genome verify --revision <revision-id>
@@ -193,6 +224,10 @@ lucia evolution capability-map [--lineage stable/general] [--format json]
 lucia evolution funnel [--lineage stable/general] [--format json]
 lucia evolution certificate <release-id> --verify [--format json]
 ```
+
+`episode inspect` 和 `episode export` 都先执行完整 CAS 与交叉绑定校验。`export --redacted` 只
+输出 Recorder 已持久化的脱敏证据，并要求 Episode 数据策略明确允许作为 Mutation 输入；该
+命令不读取原始 Session、模型响应或工具正文旁路。
 
 Genome 子命令全部只读。`diff --allow` 由可信实现逐字段计算差异，不接受 Candidate 自报的
 变更列表；任一变化落在允许表面之外时命令失败。

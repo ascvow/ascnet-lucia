@@ -257,6 +257,9 @@ pub fn default_disposition(kind: FailureKind, occurrences: usize) -> FailureDisp
         FailureKind::EnvironmentFailure | FailureKind::RuntimeFailure => {
             FailureDisposition::InfrastructureOperations
         }
+        FailureKind::VerificationFailure | FailureKind::ContextLoss => {
+            FailureDisposition::EvolutionCandidate
+        }
         _ if occurrences >= 2 => FailureDisposition::EvolutionCandidate,
         _ => FailureDisposition::Observe,
     }

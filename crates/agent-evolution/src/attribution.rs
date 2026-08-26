@@ -20,6 +20,10 @@ pub fn attribute_failures(
     let mut records = Vec::new();
 
     for incident in incidents {
+        // Turn 内已经恢复的异常属于运行质量证据，不是失败归因或进化候选。
+        if incident.status == agent_evolution_protocol::IncidentStatus::Recovered {
+            continue;
+        }
         let record = attribute_incident(incident, episode_failures);
         records.push(record);
     }
@@ -71,12 +75,22 @@ fn attribute_incident(
         .and_then(|failure| failure.evidence_event_ids.first())
         .and_then(|id| agent_evolution_protocol::EventId::new(id.clone()).ok());
 
+    let suspected_origin = if incident.kind == IncidentKind::ContextConstraintLost {
+        incident
+            .evidence
+            .iter()
+            .find(|event_id| *event_id != &incident.observed_event_id)
+            .cloned()
+    } else {
+        Some(incident.observed_event_id.clone())
+    };
+
     FailureRecord {
         record_id: FailureRecordId::generate(),
         episode_id: incident.episode_id.clone(),
         attribution: FailureAttribution {
             detected_at: incident.observed_event_id.clone(),
-            suspected_origin: Some(incident.observed_event_id.clone()),
+            suspected_origin,
             propagation_path: incident.evidence.clone(),
             decisive_step,
             failure_class,

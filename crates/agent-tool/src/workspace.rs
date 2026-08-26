@@ -135,6 +135,20 @@ impl fmt::Display for WorkspaceError {
 
 impl std::error::Error for WorkspaceError {}
 
+impl WorkspaceError {
+    /// 返回可写入原生 [`crate::ToolResult`] 的稳定错误类别。
+    ///
+    /// 路径不存在等普通解析失败不属于安全事件；权限缺失和路径逃逸保留各自类别，供
+    /// Runtime 在确认结果来自原生工具后生成可信 Incident。
+    pub const fn tool_error_kind(&self) -> crate::ToolErrorKind {
+        match self {
+            Self::Denied(_) | Self::NoFilesystem => crate::ToolErrorKind::PermissionDenied,
+            Self::Escape => crate::ToolErrorKind::PathBoundaryViolation,
+            Self::Unresolvable(_) => crate::ToolErrorKind::Execution,
+        }
+    }
+}
+
 /// 原生文件工具共用的路径守卫。
 ///
 /// 每个工具在触碰文件系统之前都必须调用 [`WorkspaceGuard::resolve_existing`] 或

@@ -4,7 +4,7 @@ use crate::{
     ArtifactStore, EpisodeRecorder, EpisodeRecorderConfig, EpisodeRecorderError, EpisodeStore,
 };
 use agent_core::{AgentEvent, EventSink};
-use agent_evolution_protocol::{EpisodeId, Outcome, RunId};
+use agent_evolution_protocol::{EpisodeId, Outcome, OutcomeResolution, RunId};
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
 use std::{
@@ -119,6 +119,41 @@ impl RegisteredEpisodeRun {
     /// 根据本运行已记录的确定性事件推断异常退出终态。
     pub async fn interrupted_outcome(&self) -> Outcome {
         self.recorder.interrupted_outcome().await
+    }
+
+    /// 在收敛前提交 Host 可信的 Outcome Resolver 输入。
+    ///
+    /// # Errors
+    ///
+    /// 输入不合法、运行尚无事件、已收敛或 Recorder 拒绝事件时返回错误。
+    pub async fn record_outcome_resolution(
+        &self,
+        resolution: OutcomeResolution,
+    ) -> Result<(), EpisodeRecorderHubError> {
+        self.recorder
+            .record_outcome_resolution(resolution)
+            .await
+            .map_err(EpisodeRecorderHubError::Recorder)
+    }
+
+    /// 使用 Host 可信 Outcome 输入收敛并释放当前运行。
+    ///
+    /// 无论成功与否都会释放 Hub 路由；失败表示没有形成可依赖的完整证据。
+    ///
+    /// # Errors
+    ///
+    /// Outcome 输入、CAS、监督证据或 Episode Header 持久化失败时返回错误。
+    pub async fn close_with_resolution(
+        self,
+        resolution: OutcomeResolution,
+    ) -> Result<EpisodeId, EpisodeRecorderHubError> {
+        let result = self
+            .recorder
+            .finish_with_resolution(resolution)
+            .await
+            .map_err(EpisodeRecorderHubError::Recorder);
+        self.hub.unregister(&self.run_id).await;
+        result
     }
 
     /// 确认自动收敛结果，或使用调用方提供的异常终态显式收敛。

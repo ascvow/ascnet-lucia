@@ -5,14 +5,18 @@
 //! [`OutcomeRevision`]。它不修改 Agent 行为，只产生证据；真正的处置由聚合器与
 //! Outbox 在 Turn 结束后决定。
 
+use agent_core::ToolErrorKind;
 use agent_core::{AgentEvent, AgentEventKind};
 use agent_evolution_protocol::{
     default_component, default_recoverability, DetectorRef, EpisodeId, EventEnvelope, EventId,
-    GenomeRevisionId, Incident, IncidentId, IncidentKind, IncidentStatus, Outcome, OutcomeRevision,
-    OutcomeRevisionId, OutcomeSource, RunId, Severity,
+    FailureKind, GenomeRevisionId, Incident, IncidentId, IncidentKind, IncidentStatus, Outcome,
+    OutcomeResolution, OutcomeRevision, OutcomeRevisionId, OutcomeSource, RunId, Severity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
+
+/// Host 注入 Outcome Resolver 输入时使用的稳定扩展事件名。
+pub const OUTCOME_RESOLUTION_EVENT: &str = "evolution.outcome_resolution";
 
 /// 事件监督与收敛时产生的完整证据包。
 #[derive(Debug, Clone)]
@@ -38,6 +42,8 @@ pub struct RunSupervisor {
     incidents: Vec<Incident>,
     /// ToolStarted 中按 call_id 记录的脱敏动作指纹。
     tool_fingerprints: BTreeMap<String, String>,
+    /// 工具调用最近一次可信终态事件，供 Verifier 关联检测位置。
+    tool_event_ids: BTreeMap<String, EventId>,
     /// 曾失败的动作指纹。
     failed_tool_actions: BTreeSet<String>,
     /// 失败后又成功的动作指纹。
@@ -46,6 +52,12 @@ pub struct RunSupervisor {
     last_failed_action: Option<String>,
     /// 已发出 incident 的重复动作键，避免无限重复。
     flagged_loops: BTreeSet<String>,
+    /// 动作指纹对应的可恢复 Incident。
+    action_incidents: BTreeMap<String, Vec<IncidentId>>,
+    /// 最近一次真实 Context 压缩事件。
+    latest_context_compression: Option<EventId>,
+    /// Host 在 Turn 结束后提交的可信 Outcome Resolver 输入及其事件 ID。
+    resolution: Option<(OutcomeResolution, EventId)>,
 }
 
 impl RunSupervisor {
@@ -58,10 +70,14 @@ impl RunSupervisor {
             envelopes: Vec::new(),
             incidents: Vec::new(),
             tool_fingerprints: BTreeMap::new(),
+            tool_event_ids: BTreeMap::new(),
             failed_tool_actions: BTreeSet::new(),
             recovered_tool_actions: BTreeSet::new(),
             last_failed_action: None,
             flagged_loops: BTreeSet::new(),
+            action_incidents: BTreeMap::new(),
+            latest_context_compression: None,
+            resolution: None,
         }
     }
 
@@ -114,7 +130,7 @@ impl RunSupervisor {
             step: event.step as u64,
             payload: event.payload.clone(),
         };
-        let incidents = self.detect(&envelope, event);
+        let incidents = self.detect(&envelope, event)?;
         self.envelopes.push(envelope);
         self.incidents.extend(incidents.iter().cloned());
         Ok((self.envelopes.last().expect("刚写入").clone(), incidents))
@@ -172,24 +188,38 @@ impl RunSupervisor {
             .filter(|incident| incident.severity == Severity::Critical)
             .count();
 
-        let (outcome, reason) = if safety_failures > 0 {
+        let (outcome, source, reason) = if safety_failures > 0 {
             (
                 Outcome::SafetyFailure,
+                OutcomeSource::DeterministicRule,
                 "出现 Critical 级安全或边界 Incident".to_string(),
             )
+        } else if let Some((resolution, _)) = &self.resolution {
+            let outcome = if resolution.outcome == Outcome::Success
+                && tool_failures > 0
+                && recovered == self.failed_tool_actions.len()
+            {
+                Outcome::SuccessWithRecovery
+            } else {
+                resolution.outcome.clone()
+            };
+            (outcome, resolution.source, resolution.reason.clone())
         } else if tool_failures > 0 && recovered == self.failed_tool_actions.len() {
             (
                 Outcome::Unverifiable,
+                OutcomeSource::DeterministicRule,
                 "工具失败均在预算内被恢复，但缺少可信 Verifier".to_string(),
             )
         } else if tool_failures > 0 {
             (
                 Outcome::Unverifiable,
+                OutcomeSource::DeterministicRule,
                 "存在未完全恢复的工具失败，需延迟证据判定".to_string(),
             )
         } else {
             (
                 Outcome::Unverifiable,
+                OutcomeSource::DeterministicRule,
                 "缺少可信 Verifier，不能推断任务成功".to_string(),
             )
         };
@@ -199,7 +229,7 @@ impl RunSupervisor {
             episode_id: self.episode_id.clone(),
             supersedes: None,
             outcome,
-            source: OutcomeSource::DeterministicRule,
+            source,
             reason,
             feedback: None,
         })
@@ -211,9 +241,16 @@ impl RunSupervisor {
     }
 
     /// 基于确定性规则检测单条事件是否触发 Incident。
-    fn detect(&mut self, envelope: &EventEnvelope, event: &AgentEvent) -> Vec<Incident> {
+    fn detect(
+        &mut self,
+        envelope: &EventEnvelope,
+        event: &AgentEvent,
+    ) -> Result<Vec<Incident>, SupervisionError> {
         let mut incidents = Vec::new();
         match event.kind {
+            AgentEventKind::Extension => {
+                self.detect_extension(envelope, &mut incidents)?;
+            }
             AgentEventKind::ToolStarted => {
                 let call_id = envelope
                     .payload
@@ -260,12 +297,42 @@ impl RunSupervisor {
                     .tool_fingerprints
                     .remove(&call_id)
                     .unwrap_or_else(|| name.clone());
+                if !call_id.is_empty() {
+                    self.tool_event_ids
+                        .insert(call_id.clone(), envelope.event_id.clone());
+                }
                 if is_error {
                     self.failed_tool_actions.insert(action_fingerprint.clone());
                 } else if self.failed_tool_actions.contains(&action_fingerprint) {
                     self.recovered_tool_actions
                         .insert(action_fingerprint.clone());
+                    if let Some(incident_ids) = self.action_incidents.get(&action_fingerprint) {
+                        for incident in &mut self.incidents {
+                            if incident_ids.contains(&incident.incident_id) {
+                                incident.status = IncidentStatus::Recovered;
+                                if !incident.evidence.contains(&envelope.event_id) {
+                                    incident.evidence.push(envelope.event_id.clone());
+                                }
+                            }
+                        }
+                    }
                 }
+
+                let runtime_origin = envelope
+                    .payload
+                    .get("runtime_origin")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("legacy");
+                let error_kind = envelope
+                    .payload
+                    .get("error_kind")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<ToolErrorKind>(value).ok());
+                let trusted_error_kind =
+                    matches!(runtime_origin, "native" | "runtime" | "runtime_policy")
+                        .then_some(error_kind)
+                        .flatten();
+                let classified = trusted_error_kind.map(classify_tool_error);
 
                 if name == "unknown"
                     || envelope.payload.get("content").is_some_and(|content| {
@@ -281,12 +348,17 @@ impl RunSupervisor {
                         DetectorRef::ToolSchema,
                     ));
                 } else if is_error {
-                    incidents.push(self.new_incident(
-                        envelope,
+                    let (kind, severity, detector) = classified.unwrap_or((
                         IncidentKind::ToolExecutionFailed,
                         Severity::Warning,
                         DetectorRef::ToolExecution,
                     ));
+                    let incident = self.new_incident(envelope, kind, severity, detector);
+                    self.action_incidents
+                        .entry(action_fingerprint.clone())
+                        .or_default()
+                        .push(incident.incident_id.clone());
+                    incidents.push(incident);
                 }
 
                 // 重复动作检测：同一工具与脱敏参数连续失败两次以上。
@@ -317,7 +389,118 @@ impl RunSupervisor {
             }
             _ => {}
         }
-        incidents
+        Ok(incidents)
+    }
+
+    /// 解析 Host Outcome 输入和 Context 压缩事件。
+    ///
+    /// 普通插件事件的 `source.type` 为 `plugin`，因此不能伪造 Host Outcome。Context
+    /// 事件只作为疑似根因，真正的 `ContextLoss` 仍必须由可信 Verifier 判定。
+    fn detect_extension(
+        &mut self,
+        envelope: &EventEnvelope,
+        incidents: &mut Vec<Incident>,
+    ) -> Result<(), SupervisionError> {
+        let source_type = envelope
+            .payload
+            .pointer("/source/type")
+            .and_then(serde_json::Value::as_str);
+        let source_id = envelope
+            .payload
+            .pointer("/source/id")
+            .and_then(serde_json::Value::as_str);
+        let name = envelope
+            .payload
+            .get("name")
+            .and_then(serde_json::Value::as_str);
+
+        if source_type == Some("plugin")
+            && source_id == Some("context")
+            && matches!(
+                name,
+                Some("context.compaction.completed" | "context.micro_compaction.completed")
+            )
+        {
+            self.latest_context_compression = Some(envelope.event_id.clone());
+            return Ok(());
+        }
+
+        if source_type != Some("host") || name != Some(OUTCOME_RESOLUTION_EVENT) {
+            return Ok(());
+        }
+        let resolution: OutcomeResolution = serde_json::from_value(
+            envelope
+                .payload
+                .get("data")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .map_err(SupervisionError::InvalidResolutionPayload)?;
+        resolution
+            .validate()
+            .map_err(|error| SupervisionError::InvalidResolution(error.to_string()))?;
+        if self.resolution.is_some() {
+            return Err(SupervisionError::DuplicateResolution);
+        }
+
+        if resolution.outcome == Outcome::TaskFailure {
+            let failure_kind = resolution
+                .failure_kind
+                .expect("OutcomeResolution 校验保证 TaskFailure 有类别");
+            let related_tool_event = resolution
+                .related_tool_call_id
+                .as_ref()
+                .and_then(|call_id| self.tool_event_ids.get(call_id))
+                .cloned();
+            if resolution.related_tool_call_id.is_some() && related_tool_event.is_none() {
+                return Err(SupervisionError::UnknownRelatedToolCall(
+                    resolution.related_tool_call_id.clone().unwrap_or_default(),
+                ));
+            }
+            let (kind, observed_event_id, mut evidence) =
+                if failure_kind == FailureKind::ContextLoss {
+                    let detected = related_tool_event
+                        .ok_or(SupervisionError::ContextLossRequiresRelatedToolCall)?;
+                    let origin = self
+                        .latest_context_compression
+                        .clone()
+                        .ok_or(SupervisionError::ContextLossRequiresCompression)?;
+                    (
+                        IncidentKind::ContextConstraintLost,
+                        detected.clone(),
+                        vec![detected, origin, envelope.event_id.clone()],
+                    )
+                } else {
+                    (
+                        IncidentKind::VerificationFailed,
+                        envelope.event_id.clone(),
+                        related_tool_event
+                            .into_iter()
+                            .chain(std::iter::once(envelope.event_id.clone()))
+                            .collect(),
+                    )
+                };
+            let mut seen = BTreeSet::new();
+            evidence.retain(|event_id| seen.insert(event_id.clone()));
+            let incident = Incident {
+                incident_id: IncidentId::generate(),
+                episode_id: self.episode_id.clone(),
+                observed_event_id,
+                kind,
+                severity: Severity::Error,
+                recoverability: default_recoverability(kind),
+                component: default_component(kind),
+                detector: DetectorRef::Custom("trusted_outcome_resolver".into()),
+                evidence,
+                status: IncidentStatus::Unrecovered,
+            };
+            incident
+                .validate()
+                .map_err(|error| SupervisionError::InvalidResolution(error.to_string()))?;
+            incidents.push(incident);
+        }
+        self.resolution = Some((resolution, envelope.event_id.clone()));
+        Ok(())
     }
 
     /// 构造一条已校验的 Incident。
@@ -375,6 +558,65 @@ pub enum SupervisionError {
         /// 实际收到的 run ID。
         actual: String,
     },
+    /// Host Outcome 输入不是合法 JSON 协议。
+    #[error("解析 OutcomeResolution 失败：{0}")]
+    InvalidResolutionPayload(serde_json::Error),
+    /// Host Outcome 输入违反协议不变量。
+    #[error("OutcomeResolution 不合法：{0}")]
+    InvalidResolution(String),
+    /// 一次运行只能提交一个初始可信 Outcome 输入。
+    #[error("同一次运行不能重复提交 OutcomeResolution")]
+    DuplicateResolution,
+    /// Outcome 输入引用了不存在的工具调用。
+    #[error("OutcomeResolution 引用了未知工具调用：{0}")]
+    UnknownRelatedToolCall(String),
+    /// ContextLoss 必须指向检测到约束丢失的工具调用。
+    #[error("ContextLoss 必须关联一个已记录的工具调用")]
+    ContextLossRequiresRelatedToolCall,
+    /// ContextLoss 必须有更早的真实 Context 压缩事件。
+    #[error("ContextLoss 缺少可关联的 Context 压缩事件")]
+    ContextLossRequiresCompression,
+}
+
+/// 把可信 ToolResult 类别映射为监督 Incident。
+fn classify_tool_error(kind: ToolErrorKind) -> (IncidentKind, Severity, DetectorRef) {
+    match kind {
+        ToolErrorKind::UnknownTool => (
+            IncidentKind::ToolNotFound,
+            Severity::Warning,
+            DetectorRef::ToolSchema,
+        ),
+        ToolErrorKind::InvalidArguments => (
+            IncidentKind::ToolArgumentInvalid,
+            Severity::Warning,
+            DetectorRef::ToolSchema,
+        ),
+        ToolErrorKind::PermissionDenied | ToolErrorKind::PolicyDenied => (
+            IncidentKind::PermissionDenied,
+            Severity::Critical,
+            DetectorRef::PermissionDenied,
+        ),
+        ToolErrorKind::PathBoundaryViolation => (
+            IncidentKind::PathBoundaryViolation,
+            Severity::Critical,
+            DetectorRef::PermissionDenied,
+        ),
+        ToolErrorKind::ProcessBoundaryViolation => (
+            IncidentKind::ProcessBoundaryViolation,
+            Severity::Critical,
+            DetectorRef::PermissionDenied,
+        ),
+        ToolErrorKind::SecretAccessAttempt => (
+            IncidentKind::SecretAccessAttempt,
+            Severity::Critical,
+            DetectorRef::PermissionDenied,
+        ),
+        ToolErrorKind::Execution | ToolErrorKind::Cancelled => (
+            IncidentKind::ToolExecutionFailed,
+            Severity::Warning,
+            DetectorRef::ToolExecution,
+        ),
+    }
 }
 
 /// 返回 AgentEventKind 的稳定 serde 名称。

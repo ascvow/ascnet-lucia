@@ -291,6 +291,108 @@ pub enum OutcomeSource {
     Unknown,
 }
 
+/// Turn 结束后由可信控制面提交给 Outcome Resolver 的判定输入。
+///
+/// 普通 Agent、模型和 Guest 插件不持有提交该结构的接口。`related_tool_call_id` 只用于把
+/// 确定性失败关联回既有工具事件，不允许调用方直接提供可信 Event ID。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeResolution {
+    /// 可信控制面判定的终态。
+    pub outcome: crate::episode::Outcome,
+    /// 判定来源；成功只能来自可信 Verifier 或确定性规则。
+    pub source: OutcomeSource,
+    /// 不含 Secret 的稳定判定原因。
+    pub reason: String,
+    /// 任务失败时的确定性失败类别。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<crate::episode::FailureKind>,
+    /// 可选的原始工具调用 ID；Recorder 会解析为本 Episode 内的可信事件 ID。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_tool_call_id: Option<String>,
+}
+
+impl OutcomeResolution {
+    /// 构造没有 Verifier 的 Runtime 终态。
+    ///
+    /// 正常完成应传 `Unverifiable`；该构造器不能把 Runtime 自报提升为可信成功。
+    pub fn runtime(outcome: crate::episode::Outcome) -> Self {
+        Self {
+            outcome,
+            source: OutcomeSource::Runtime,
+            reason: "Runtime 收敛运行终态".into(),
+            failure_kind: None,
+            related_tool_call_id: None,
+        }
+    }
+
+    /// 构造可信 Verifier 的成功判定。
+    pub fn verified_success(reason: impl Into<String>) -> Self {
+        Self {
+            outcome: crate::episode::Outcome::Success,
+            source: OutcomeSource::TrustedVerifier,
+            reason: reason.into(),
+            failure_kind: None,
+            related_tool_call_id: None,
+        }
+    }
+
+    /// 构造可信 Verifier 的任务失败判定。
+    pub fn verified_failure(
+        failure_kind: crate::episode::FailureKind,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            outcome: crate::episode::Outcome::TaskFailure,
+            source: OutcomeSource::TrustedVerifier,
+            reason: reason.into(),
+            failure_kind: Some(failure_kind),
+            related_tool_call_id: None,
+        }
+    }
+
+    /// 关联一个已发生的工具调用，供 Supervisor 解析可信检测位置。
+    pub fn with_related_tool_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.related_tool_call_id = Some(call_id.into());
+        self
+    }
+
+    /// 校验可信判定输入的结构与来源约束。
+    ///
+    /// # Errors
+    ///
+    /// 原因或调用 ID 为空、Runtime 自报成功、失败缺少类别，或非失败携带失败类别时返回
+    /// [`InvalidSupervision`]。
+    pub fn validate(&self) -> Result<(), InvalidSupervision> {
+        if self.reason.trim().is_empty() {
+            return Err(InvalidSupervision::EmptyOutcomeReason);
+        }
+        if self
+            .related_tool_call_id
+            .as_ref()
+            .is_some_and(|call_id| call_id.trim().is_empty())
+        {
+            return Err(InvalidSupervision::EmptyRelatedToolCallId);
+        }
+        if matches!(
+            self.outcome,
+            crate::episode::Outcome::Success | crate::episode::Outcome::SuccessWithRecovery
+        ) && !matches!(
+            self.source,
+            OutcomeSource::TrustedVerifier | OutcomeSource::DeterministicRule
+        ) {
+            return Err(InvalidSupervision::UntrustedSuccessResolution);
+        }
+        match (&self.outcome, self.failure_kind) {
+            (crate::episode::Outcome::TaskFailure, None) => {
+                Err(InvalidSupervision::MissingFailureKind)
+            }
+            (crate::episode::Outcome::TaskFailure, Some(_)) => Ok(()),
+            (_, Some(_)) => Err(InvalidSupervision::UnexpectedFailureKind),
+            (_, None) => Ok(()),
+        }
+    }
+}
+
 impl OutcomeSource {
     /// 返回来源的显式可信优先级；数值越大，来源越可信。
     ///
@@ -499,6 +601,21 @@ pub enum InvalidSupervision {
     /// Outcome 修订终态与延迟反馈信号不一致。
     #[error("OutcomeRevision 的 outcome 与 FeedbackEvent 信号不一致")]
     FeedbackOutcomeMismatch,
+    /// Outcome Resolver 输入的 reason 为空。
+    #[error("OutcomeResolution 的 reason 不能为空")]
+    EmptyOutcomeReason,
+    /// Outcome Resolver 的工具调用 ID 为空。
+    #[error("OutcomeResolution 的 related_tool_call_id 不能为空")]
+    EmptyRelatedToolCallId,
+    /// 不可信来源试图声明成功。
+    #[error("只有可信 Verifier 或确定性规则可以判定成功")]
+    UntrustedSuccessResolution,
+    /// TaskFailure 缺少失败类别。
+    #[error("TaskFailure 必须携带 failure_kind")]
+    MissingFailureKind,
+    /// 非 TaskFailure 携带失败类别。
+    #[error("只有 TaskFailure 可以携带 failure_kind")]
+    UnexpectedFailureKind,
 }
 
 /// 把 IncidentKind 映射到推荐的可信组件。

@@ -52,6 +52,6 @@ pub use redaction::{RedactionOutcome, RedactionRule, Redactor, REDACTION_RULES_V
 pub use supervision::{
     default_component, default_recoverability, sorted_unique_event_ids, ComponentRef, DetectorRef,
     EventEnvelope, FeedbackEvent, FeedbackSignal, FeedbackSource, Incident, IncidentKind,
-    IncidentStatus, InvalidSupervision, OutcomeRevision, OutcomeSource, Recoverability, Severity,
-    SUPERVISION_SCHEMA_VERSION,
+    IncidentStatus, InvalidSupervision, OutcomeResolution, OutcomeRevision, OutcomeSource,
+    Recoverability, Severity, SUPERVISION_SCHEMA_VERSION,
 };

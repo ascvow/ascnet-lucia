@@ -6,15 +6,17 @@ use crate::genome_binding::GenomeRuntimeBinding;
 use crate::genome_binding::{
     current_git_commit, current_git_dirty, current_target_triple, current_tui_features,
 };
+use agent_evolution::{
+    load_episode_evidence, EpisodeRecorderConfig, EpisodeRecorderHub, EvolutionPipeline,
+    FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox, FileGenomeResolver,
+    FileIssueObservationStore, FileOutcomeRevisionStore, GenomeResolver, GenomeSelector,
+    RegisteredEpisodeRun,
+};
 #[cfg(test)]
 use agent_evolution::{ArtifactStore, FileGenomeStore, GenomeStore};
-use agent_evolution::{
-    EpisodeRecorderConfig, EpisodeRecorderHub, FileArtifactStore, FileEpisodeStore,
-    FileGenomeResolver, GenomeResolver, GenomeSelector, RegisteredEpisodeRun,
-};
 #[cfg(feature = "plugins")]
 use agent_evolution_protocol::Outcome;
-use agent_evolution_protocol::{GenomeRevision, GenomeRevisionId};
+use agent_evolution_protocol::{GenomeRevision, GenomeRevisionId, OutcomeResolution};
 #[cfg(feature = "plugins")]
 use agent_runtime::{
     AgentRuntimeError, RuntimeResult, RuntimeRunContext, RuntimeRunFinalizer,
@@ -33,6 +35,9 @@ const GENOME_SESSION_BEHAVIOR_KIND: &str = "agent_genome";
 pub(crate) struct EvidenceRuntime {
     hub: Arc<EpisodeRecorderHub>,
     binding: Arc<GenomeRuntimeBinding>,
+    artifacts: FileArtifactStore,
+    episodes: FileEpisodeStore,
+    pipeline: Arc<EvolutionPipeline<FileEvolutionOutbox, FileOutcomeRevisionStore>>,
 }
 
 impl EvidenceRuntime {
@@ -45,10 +50,25 @@ impl EvidenceRuntime {
         hub: Arc<EpisodeRecorderHub>,
         revision: GenomeRevision,
         artifacts: FileArtifactStore,
+        episodes: FileEpisodeStore,
+        root: &Path,
     ) -> Result<Self> {
         Ok(Self {
             hub,
-            binding: Arc::new(GenomeRuntimeBinding::new(revision, artifacts)?),
+            binding: Arc::new(GenomeRuntimeBinding::new(revision, artifacts.clone())?),
+            artifacts,
+            episodes,
+            pipeline: Arc::new(
+                EvolutionPipeline::new(
+                    Arc::new(FileEvolutionOutbox::new(root.join("outbox"))),
+                    Arc::new(FileOutcomeRevisionStore::new(
+                        root.join("outcome-revisions"),
+                    )),
+                )
+                .with_issue_observation_store(Arc::new(
+                    FileIssueObservationStore::new(root.join("issue-observations")),
+                )),
+            ),
         })
     }
 
@@ -184,6 +204,38 @@ impl EvidenceRuntime {
             .await
             .context("登记 Episode 运行失败")
     }
+
+    /// 用可信 Outcome 输入收敛 Episode，并立即运行失败归因、聚合与 Outbox 路由。
+    ///
+    /// Pipeline 只读取刚由 Recorder 提交且经 CAS 重新校验的证据，不接受调用方提供的
+    /// Incident、修订或 GenomeDigest。
+    ///
+    /// # Errors
+    ///
+    /// Recorder 收敛、CAS 恢复、Outcome 修订或 Outbox 写入失败时返回错误。
+    pub(crate) async fn close_run(
+        &self,
+        run: RegisteredEpisodeRun,
+        resolution: OutcomeResolution,
+    ) -> Result<agent_evolution_protocol::EpisodeId> {
+        let episode_id = run
+            .close_with_resolution(resolution)
+            .await
+            .context("收敛 Episode 失败")?;
+        let evidence = load_episode_evidence(&self.episodes, &self.artifacts, &episode_id)
+            .await
+            .context("恢复 Episode 监督证据失败")?;
+        self.pipeline
+            .process_episode(
+                &evidence.episode,
+                &evidence.incidents,
+                &self.revision().digest,
+                evidence.initial_outcome_revision.as_ref(),
+            )
+            .await
+            .context("处理 Episode Evolution Pipeline 失败")?;
+        Ok(episode_id)
+    }
 }
 
 /// 把 Runtime 维护的 Agent 身份映射为独立 Episode 会话并预登记 Run。
@@ -207,6 +259,7 @@ impl RuntimeRunObserver for RuntimeEvidenceObserver {
             self.evidence.hub(),
             Arc::new(RuntimeEpisodeFinalizer {
                 run: tokio::sync::Mutex::new(Some(run)),
+                evidence: self.evidence.clone(),
             }),
         )
     }
@@ -216,6 +269,7 @@ impl RuntimeRunObserver for RuntimeEvidenceObserver {
 #[cfg(feature = "plugins")]
 struct RuntimeEpisodeFinalizer {
     run: tokio::sync::Mutex<Option<RegisteredEpisodeRun>>,
+    evidence: EvidenceRuntime,
 }
 
 #[cfg(feature = "plugins")]
@@ -231,7 +285,8 @@ impl RuntimeRunFinalizer for RuntimeEpisodeFinalizer {
             RuntimeRunTermination::Cancelled => Outcome::Cancelled,
             RuntimeRunTermination::Failed => run.interrupted_outcome().await,
         };
-        run.close(outcome)
+        self.evidence
+            .close_run(run, OutcomeResolution::runtime(outcome))
             .await
             .map(|_| ())
             .map_err(|error| AgentRuntimeError::RunObservation(error.to_string()))
@@ -286,7 +341,8 @@ pub(crate) async fn load_evidence_runtime(
 
     let artifact_store = FileArtifactStore::new(root.join("artifacts"));
     let artifacts = Arc::new(artifact_store.clone());
-    let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
+    let episode_store = FileEpisodeStore::new(root.join("episodes"));
+    let episodes = Arc::new(episode_store.clone());
     let mut hub = EpisodeRecorderHub::new(artifacts, episodes);
     if let Some(home) = std::env::var_os("HOME").and_then(|value| value.into_string().ok()) {
         hub = hub.with_home(home);
@@ -295,6 +351,8 @@ pub(crate) async fn load_evidence_runtime(
         Arc::new(hub),
         revision,
         artifact_store,
+        episode_store,
+        &root,
     )?))
 }
 
@@ -554,6 +612,8 @@ mod tests {
             )),
             revision,
             artifacts,
+            FileEpisodeStore::new(root.join("episodes")),
+            &root,
         )
         .expect("应创建 Evidence");
         let mut draft =
@@ -610,8 +670,14 @@ mod tests {
         ));
         let revision = test_genome_revision(ExecutionPolicy::serve(), &artifacts).await;
         let genome_revision_id = revision.revision_id.clone();
-        let evidence = EvidenceRuntime::new(Arc::clone(&hub), revision, artifacts)
-            .expect("应创建 Runtime Evidence");
+        let evidence = EvidenceRuntime::new(
+            Arc::clone(&hub),
+            revision,
+            artifacts,
+            FileEpisodeStore::new(root.join("episodes")),
+            &root,
+        )
+        .expect("应创建 Runtime Evidence");
         let runtime = AgentRuntime::new_with_run_observer(
             RuntimeLimits::default(),
             evidence.runtime_run_observer(),
@@ -674,8 +740,14 @@ mod tests {
         ));
         let revision = test_genome_revision(ExecutionPolicy::serve(), &artifacts).await;
         let genome_revision_id = revision.revision_id.clone();
-        let evidence = EvidenceRuntime::new(Arc::clone(&hub), revision, artifacts)
-            .expect("应创建取消测试 Evidence");
+        let evidence = EvidenceRuntime::new(
+            Arc::clone(&hub),
+            revision,
+            artifacts,
+            FileEpisodeStore::new(root.join("episodes")),
+            &root,
+        )
+        .expect("应创建取消测试 Evidence");
         let runtime = AgentRuntime::new_with_run_observer(
             RuntimeLimits::default(),
             evidence.runtime_run_observer(),

@@ -541,18 +541,26 @@ impl Agent {
     ///
     /// 返回 `Ok(None)` 表示策略放行。阻止原因只包含工具名，不透露策略细节，
     /// 避免模型据此推断可用的绕过路径。
-    async fn reject_if_policy_denies(&self, call: &ToolCall) -> Result<Option<ToolResult>> {
+    async fn reject_if_policy_denies(
+        &self,
+        run_id: &str,
+        call: &ToolCall,
+        step: usize,
+    ) -> Result<Option<ToolResult>> {
         if self.options.execution_policy.permits_tool(&call.name) {
             return Ok(None);
         }
 
-        let result = ToolResult::error(
+        let result = ToolResult::error_with_kind(
             call.id.clone(),
             call.name.clone(),
+            agent_tool::ToolErrorKind::PolicyDenied,
             format!("当前执行策略不允许调用工具：{}", call.name),
         );
         self.extension.after_tool(&result).await?;
         self.finish_tool_state(&result);
+        self.emit_tool_finished(run_id, step, &result, "runtime_policy")
+            .await?;
         Ok(Some(result))
     }
 
@@ -579,7 +587,7 @@ impl Agent {
 
         // 第一道策略门禁：在任何插件钩子之前拒绝策略不允许的工具，
         // 避免插件通过 `before_tool` 观察到本不该暴露的调用。
-        if let Some(result) = self.reject_if_policy_denies(&call).await? {
+        if let Some(result) = self.reject_if_policy_denies(run_id, &call, step).await? {
             return Ok(result);
         }
 
@@ -601,20 +609,29 @@ impl Agent {
                 let result = ToolResult::error(original_call.id, original_call.name, reason);
                 self.extension.after_tool(&result).await?;
                 self.finish_tool_state(&result);
+                self.emit_tool_finished(run_id, step, &result, "plugin_policy")
+                    .await?;
                 return Ok(result);
             }
             ToolDecision::CancelRun { reason } => {
                 self.control().cancel();
-                let result = ToolResult::error(original_call.id, original_call.name, reason);
+                let result = ToolResult::error_with_kind(
+                    original_call.id,
+                    original_call.name,
+                    agent_tool::ToolErrorKind::Cancelled,
+                    reason,
+                );
                 self.extension.after_tool(&result).await?;
                 self.finish_tool_state(&result);
+                self.emit_tool_finished(run_id, step, &result, "runtime")
+                    .await?;
                 return Ok(result);
             }
         };
 
         // 第二道策略门禁：插件可以重写工具调用，但不能借重写换成策略拒绝的工具。
         // 与 `RestrictedExtension` 对 allowlist 的处理保持一致。
-        if let Some(result) = self.reject_if_policy_denies(&call).await? {
+        if let Some(result) = self.reject_if_policy_denies(run_id, &call, step).await? {
             return Ok(result);
         }
 
@@ -638,30 +655,55 @@ impl Agent {
         )
         .await?;
 
-        let result = if self.tools.contains(&call.name) {
-            self.execute_native_tool_with_output(run_id, step, call)
-                .await?
+        let (result, runtime_origin) = if self.tools.contains(&call.name) {
+            (
+                self.execute_native_tool_with_output(run_id, step, call)
+                    .await?,
+                "native",
+            )
         } else if let Some(result) = self.extension.call_tool(call.clone()).await? {
-            result
+            // Guest 返回值不能改写原调用身份；Core 在生成可信事件前重新绑定。
+            let mut result = result;
+            result.call_id = call.id.clone();
+            result.name = call.name.clone();
+            (result, "plugin")
         } else {
-            ToolResult::error(
-                call.id.clone(),
-                call.name.clone(),
-                format!("unknown tool: {}", call.name),
+            (
+                ToolResult::error_with_kind(
+                    call.id.clone(),
+                    call.name.clone(),
+                    agent_tool::ToolErrorKind::UnknownTool,
+                    format!("unknown tool: {}", call.name),
+                ),
+                "runtime",
             )
         };
 
         self.extension.after_tool(&result).await?;
         self.finish_tool_state(&result);
-        self.emit(
-            run_id,
-            AgentEventKind::ToolFinished,
-            step,
-            // 完整 ToolResult 包含 UI 专用 details，截断和展示策略由应用层决定。
-            serde_json::to_value(&result)?,
-        )
-        .await?;
+        self.emit_tool_finished(run_id, step, &result, runtime_origin)
+            .await?;
         Ok(result)
+    }
+
+    /// 发布由 Core 注入实际执行来源的工具终态事件。
+    ///
+    /// `runtime_origin` 不发送给模型，只供可信 Recorder 区分原生、Runtime 与 Guest
+    /// 结果；Guest 即使在自身 JSON 中伪造同名字段，也会被这里覆盖。
+    async fn emit_tool_finished(
+        &self,
+        run_id: &str,
+        step: usize,
+        result: &ToolResult,
+        runtime_origin: &'static str,
+    ) -> Result<()> {
+        let mut payload = serde_json::to_value(result)?;
+        payload
+            .as_object_mut()
+            .expect("ToolResult 必须序列化为对象")
+            .insert("runtime_origin".into(), json!(runtime_origin));
+        self.emit(run_id, AgentEventKind::ToolFinished, step, payload)
+            .await
     }
 
     /// 执行原生工具，并在最终结果到达前按顺序发布运行期输出事件。

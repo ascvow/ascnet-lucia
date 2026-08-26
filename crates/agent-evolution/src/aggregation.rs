@@ -8,7 +8,7 @@ use agent_evolution_protocol::{
     default_disposition, DiagnosticStatus, EpisodeId, EvolutionIssue, EvolutionIssueId,
     FailureDisposition, FailureFingerprint, FailureKind, FailureRecord,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 内存版 Issue 聚合器；进程重启后由持久化 Outbox 重建。
 ///
@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Default)]
 pub struct IssueAggregator {
     issues: BTreeMap<String, EvolutionIssue>,
-    /// 每个指纹已聚合的失败记录数。
-    counts: BTreeMap<String, usize>,
+    /// 每个指纹已出现的不同 Episode；同一 Episode 的重复 Incident 只计一次。
+    occurrences: BTreeMap<String, BTreeSet<EpisodeId>>,
 }
 
 impl IssueAggregator {
@@ -37,23 +37,25 @@ impl IssueAggregator {
         episode_id: &EpisodeId,
         genome_digest: &agent_evolution_protocol::GenomeDigest,
     ) -> (EvolutionIssue, FailureDisposition) {
-        let fingerprint = FailureFingerprint {
-            task_family: String::new(),
-            failure_class: record.attribution.failure_class,
-            component: format!("{:?}", record.attribution.method),
-            tool: None,
-            plugin: None,
-            error_code: None,
-            genome_digest: genome_digest.clone(),
-            normalized_pattern: normalized_pattern(record),
-        };
+        self.record_with_issue_id(record, episode_id, genome_digest, None)
+    }
+
+    /// 使用持久化 Issue ID 录入失败记录，供只追加观察日志在进程重启后重建聚合状态。
+    pub(crate) fn record_with_issue_id(
+        &mut self,
+        record: &FailureRecord,
+        episode_id: &EpisodeId,
+        genome_digest: &agent_evolution_protocol::GenomeDigest,
+        issue_id: Option<EvolutionIssueId>,
+    ) -> (EvolutionIssue, FailureDisposition) {
+        let fingerprint = fingerprint_for(record, genome_digest);
         let key = fingerprint.stable_key();
-        let count = self.counts.entry(key.clone()).or_insert(0);
-        *count += 1;
-        let occurrences = *count;
+        let occurrences = self.occurrences.entry(key.clone()).or_default();
+        occurrences.insert(episode_id.clone());
+        let occurrence_count = occurrences.len();
 
         let issue = self.issues.entry(key).or_insert_with(|| EvolutionIssue {
-            issue_id: EvolutionIssueId::generate(),
+            issue_id: issue_id.unwrap_or_else(EvolutionIssueId::generate),
             fingerprint,
             evidence_episode_ids: Vec::new(),
             evidence_events: Vec::new(),
@@ -73,17 +75,39 @@ impl IssueAggregator {
             }
         }
         issue.confidence = issue.confidence.max(record.attribution.confidence);
-        if occurrences >= 2 {
+        if matches!(
+            record.attribution.failure_class,
+            FailureKind::VerificationFailure | FailureKind::ContextLoss
+        ) {
+            issue.status = DiagnosticStatus::EligibleForEvolution;
+        } else if occurrence_count >= 2 {
             issue.status = DiagnosticStatus::Clustered;
         }
 
-        let disposition = route(record, occurrences);
+        let disposition = route(record, occurrence_count);
         (issue.clone(), disposition)
     }
 
     /// 返回当前全部 Issue 的稳定快照。
     pub fn issues(&self) -> Vec<&EvolutionIssue> {
         self.issues.values().collect()
+    }
+}
+
+/// 从失败记录和运行 Genome 生成稳定聚合指纹。
+pub(crate) fn fingerprint_for(
+    record: &FailureRecord,
+    genome_digest: &agent_evolution_protocol::GenomeDigest,
+) -> FailureFingerprint {
+    FailureFingerprint {
+        task_family: String::new(),
+        failure_class: record.attribution.failure_class,
+        component: format!("{:?}", record.attribution.method),
+        tool: None,
+        plugin: None,
+        error_code: None,
+        genome_digest: genome_digest.clone(),
+        normalized_pattern: normalized_pattern(record),
     }
 }
 

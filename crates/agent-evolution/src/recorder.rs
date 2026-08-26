@@ -1,12 +1,13 @@
 //! `AgentEvent` 到不可变 Episode 的脱敏记录器。
 
+use crate::supervision::OUTCOME_RESOLUTION_EVENT;
 use crate::{ArtifactStore, ArtifactStoreError, EpisodeStore, EpisodeStoreError, RunSupervisor};
 use agent_core::{AgentEvent, AgentEventKind, EventSink};
 use agent_evolution_protocol::{
     Episode, EpisodeDataPolicy, EpisodeEvent, EpisodeId, EpisodeSupervisionRefs, EventId,
-    FailureClassification, FailureKind, GenomeRevisionId, Outcome, RawToolResultPolicy,
-    RedactionRule, Redactor, ReplayabilityGrade, RunId, TaskDescriptor, UsageSummary,
-    EPISODE_SCHEMA_VERSION, REDACTION_RULES_VERSION,
+    FailureClassification, FailureKind, GenomeRevisionId, Outcome, OutcomeResolution,
+    RawToolResultPolicy, RedactionRule, Redactor, ReplayabilityGrade, RunId, TaskDescriptor,
+    UsageSummary, EPISODE_SCHEMA_VERSION, REDACTION_RULES_VERSION,
 };
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
@@ -87,6 +88,8 @@ struct RecorderState {
     supervisor: Option<RunSupervisor>,
     /// 收敛时由 Supervisor 生成的监督制品；保存到 CAS。
     supervision: Option<EpisodeSupervisionRefs>,
+    /// Supervisor 解析出的可信终态；没有可信判定时为 `None`。
+    supervision_outcome: Option<Outcome>,
 }
 
 impl EpisodeRecorder {
@@ -131,6 +134,66 @@ impl EpisodeRecorder {
     pub async fn finish(&self, outcome: Outcome) -> Result<EpisodeId, EpisodeRecorderError> {
         let mut state = self.state.lock().await;
         self.finalize_locked(&mut state, outcome).await
+    }
+
+    /// 记录由 Host Outcome Resolver 提交的可信终态输入。
+    ///
+    /// 该方法使用固定 `source.type=host` 包装输入；普通插件发布的 Extension 事件始终带
+    /// `source.type=plugin`，因此不能通过相同 JSON 声明成功或改写失败类别。
+    ///
+    /// # Errors
+    ///
+    /// 输入不合法、运行尚未开始、已经收敛或事件持久化失败时返回错误。
+    pub async fn record_outcome_resolution(
+        &self,
+        resolution: OutcomeResolution,
+    ) -> Result<(), EpisodeRecorderError> {
+        resolution
+            .validate()
+            .map_err(|error| EpisodeRecorderError::InvalidResolution(error.to_string()))?;
+        let (run_id, step) = {
+            let state = self.state.lock().await;
+            if state.finalized.is_some() {
+                return Err(EpisodeRecorderError::EventAfterFinalization);
+            }
+            (
+                state.run_id.clone().ok_or(EpisodeRecorderError::NoEvents)?,
+                state
+                    .events
+                    .last()
+                    .map(|event| event.step as usize)
+                    .unwrap_or(0),
+            )
+        };
+        let event = AgentEvent::new(
+            run_id.to_string(),
+            AgentEventKind::Extension,
+            step,
+            json!({
+                "source": { "type": "host" },
+                "name": OUTCOME_RESOLUTION_EVENT,
+                "data": resolution,
+            }),
+        );
+        self.record(&event)
+            .await
+            .map_err(|error| EpisodeRecorderError::ResolutionRecord(error.to_string()))
+    }
+
+    /// 提交可信 Outcome 输入并立即收敛 Episode。
+    ///
+    /// 调用方必须先关闭 `finalize_on_run_finished`，让 Verifier 在 Core 返回后决定终态。
+    ///
+    /// # Errors
+    ///
+    /// Outcome 输入记录或 Episode 收敛失败时返回错误。
+    pub async fn finish_with_resolution(
+        &self,
+        resolution: OutcomeResolution,
+    ) -> Result<EpisodeId, EpisodeRecorderError> {
+        let outcome = resolution.outcome.clone();
+        self.record_outcome_resolution(resolution).await?;
+        self.finish(outcome).await
     }
 
     /// 返回收敛时生成的监督证据；未收敛时为 `None`。
@@ -200,6 +263,8 @@ impl EpisodeRecorder {
                 "call_id": event.payload.get("call_id").and_then(Value::as_str),
                 "name": event.payload.get("name").and_then(Value::as_str),
                 "is_error": event.payload.get("is_error").and_then(Value::as_bool),
+                "error_kind": event.payload.get("error_kind"),
+                "runtime_origin": event.payload.get("runtime_origin").and_then(Value::as_str),
                 "content_discarded": true,
             }),
             RawToolResultPolicy::StoreRedacted => {
@@ -238,10 +303,12 @@ impl EpisodeRecorder {
         let supervision = if let Some(refs) = &state.supervision {
             Some(refs.clone())
         } else {
-            let refs = self.persist_supervision(state).await?;
+            let (refs, resolved_outcome) = self.persist_supervision(state).await?;
             state.supervision = refs.clone();
+            state.supervision_outcome = resolved_outcome;
             refs
         };
+        let outcome = state.supervision_outcome.clone().unwrap_or(outcome);
 
         let mut data_policy = self.config.data_policy.clone();
         data_policy.redaction_rules_version = Some(REDACTION_RULES_VERSION.to_string());
@@ -279,11 +346,15 @@ impl EpisodeRecorder {
     async fn persist_supervision(
         &self,
         state: &mut RecorderState,
-    ) -> Result<Option<EpisodeSupervisionRefs>, EpisodeRecorderError> {
+    ) -> Result<(Option<EpisodeSupervisionRefs>, Option<Outcome>), EpisodeRecorderError> {
         let Some(supervisor) = state.supervisor.as_ref() else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let report = supervisor.clone().finalize();
+        let resolved_outcome = report
+            .outcome_revision
+            .as_ref()
+            .map(|revision| revision.outcome.clone());
         let mut envelope_bytes = Vec::new();
         for envelope in &report.envelopes {
             serde_json::to_writer(&mut envelope_bytes, envelope)
@@ -310,11 +381,14 @@ impl EpisodeRecorder {
                 serde_json::to_vec(revision).map_err(EpisodeRecorderError::SerializeEvent)?;
             outcome_revision_ref = Some(self.artifacts.put("application/json", &bytes).await?);
         }
-        Ok(Some(EpisodeSupervisionRefs {
-            event_envelopes_ref,
-            incidents_ref,
-            outcome_revision_ref,
-        }))
+        Ok((
+            Some(EpisodeSupervisionRefs {
+                event_envelopes_ref,
+                incidents_ref,
+                outcome_revision_ref,
+            }),
+            resolved_outcome,
+        ))
     }
 }
 
@@ -413,6 +487,12 @@ pub enum EpisodeRecorderError {
     /// 收敛后又收到事件。
     #[error("Recorder 收敛后不能继续接收事件")]
     EventAfterFinalization,
+    /// Outcome Resolver 输入不合法。
+    #[error("Outcome Resolver 输入不合法：{0}")]
+    InvalidResolution(String),
+    /// Outcome Resolver 事件写入失败。
+    #[error("记录 Outcome Resolver 事件失败：{0}")]
+    ResolutionRecord(String),
     /// 事件序列化失败。
     #[error("序列化 Episode 事件失败：{0}")]
     SerializeEvent(serde_json::Error),
@@ -497,8 +577,51 @@ fn classify_failures(events: &[EpisodeEvent]) -> Vec<FailureClassification> {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
+            let trusted_error_kind = event
+                .payload
+                .get("runtime_origin")
+                .and_then(Value::as_str)
+                .is_some_and(|origin| matches!(origin, "native" | "runtime" | "runtime_policy"))
+                .then(|| event.payload.get("error_kind").and_then(Value::as_str))
+                .flatten();
+            let kind = match trusted_error_kind {
+                Some(
+                    "permission_denied"
+                    | "path_boundary_violation"
+                    | "process_boundary_violation"
+                    | "secret_access_attempt"
+                    | "policy_denied",
+                ) => FailureKind::PermissionFailure,
+                Some("invalid_arguments" | "unknown_tool") => FailureKind::ToolArgument,
+                _ => FailureKind::ToolExecution,
+            };
             failures.push(FailureClassification {
-                kind: FailureKind::ToolExecution,
+                kind,
+                evidence_event_ids: vec![event.event_id.clone()],
+                confidence: 1.0,
+                rule_derived: true,
+                model_assisted: false,
+            });
+        }
+    }
+    for event in events.iter().filter(|event| event.kind == "extension") {
+        if event
+            .payload
+            .pointer("/source/type")
+            .and_then(Value::as_str)
+            != Some("host")
+            || event.payload.get("name").and_then(Value::as_str) != Some(OUTCOME_RESOLUTION_EVENT)
+        {
+            continue;
+        }
+        let failure_kind = event
+            .payload
+            .pointer("/data/failure_kind")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<FailureKind>(value).ok());
+        if let Some(kind) = failure_kind {
+            failures.push(FailureClassification {
+                kind,
                 evidence_event_ids: vec![event.event_id.clone()],
                 confidence: 1.0,
                 rule_derived: true,

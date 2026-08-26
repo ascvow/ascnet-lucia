@@ -56,7 +56,14 @@ impl Tool for ListDirectoryTool {
             .resolve_existing(&args.path, FileCapability::Read)
         {
             Ok(path) => path,
-            Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
+            Err(error) => {
+                return Ok(ToolResult::error_with_kind(
+                    call.id,
+                    call.name,
+                    error.tool_error_kind(),
+                    error.to_string(),
+                ))
+            }
         };
 
         let mut dir = match tokio::fs::read_dir(&path).await {

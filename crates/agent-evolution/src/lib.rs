@@ -10,12 +10,14 @@ mod archive;
 mod artifact_store;
 mod attribution;
 mod certificate;
+mod episode_evidence;
 mod episode_store;
 mod evaluation_store;
 mod feedback;
 mod genome_diff;
 mod genome_store;
 mod history;
+mod issue_observation;
 mod metrics;
 mod outbox;
 mod outcome_revision;
@@ -34,6 +36,7 @@ pub use certificate::{
     CertificateError, EvolutionCertificate, EvolutionCertificateInput,
     EVOLUTION_CERTIFICATE_SCHEMA_VERSION,
 };
+pub use episode_evidence::{load_episode_evidence, EpisodeEvidence, EpisodeEvidenceError};
 pub use episode_store::{EpisodeQuery, EpisodeStore, EpisodeStoreError, FileEpisodeStore};
 pub use evaluation_store::{
     load_evaluation_report, EvaluationStoreError, FileEvaluationReportStore,
@@ -48,6 +51,10 @@ pub use history::{
     compute_history, CapabilityMapCell, CapabilityMapRow, EvolutionFunnel, EvolutionHistory,
     EvolutionVelocityPoint, FixSurvivalPoint, HiddenTrendPoint, HiddenTrendSegment, HistoryError,
     LineageNode, EVOLUTION_HISTORY_SCHEMA_VERSION,
+};
+pub use issue_observation::{
+    FileIssueObservationStore, IssueObservation, IssueObservationError, IssueObservationStore,
+    ISSUE_OBSERVATION_SCHEMA_VERSION,
 };
 pub use metrics::{
     aggregate_case, aggregate_dataset, compare_dataset, compare_resources, regression_retention,
@@ -69,4 +76,6 @@ pub use scorecard::{
     GateSummary, HeadlineVerdict, InheritanceMetrics, RegressionComparison, ResourceGatePolicy,
     ScorecardError, EVOLUTION_SCORECARD_SCHEMA_VERSION,
 };
-pub use supervision::{RunSupervisor, SupervisionError, SupervisionReport};
+pub use supervision::{
+    RunSupervisor, SupervisionError, SupervisionReport, OUTCOME_RESOLUTION_EVENT,
+};

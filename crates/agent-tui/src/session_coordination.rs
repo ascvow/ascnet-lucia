@@ -399,8 +399,12 @@ pub(crate) async fn run_and_persist_with_evidence(
                 Ok(_) => agent_evolution_protocol::Outcome::Unverifiable,
                 Err(_) => registered.interrupted_outcome().await,
             };
-            registered
-                .close(outcome)
+            evidence
+                .expect("存在已登记 Evidence Run 时必有 EvidenceRuntime")
+                .close_run(
+                    registered,
+                    agent_evolution_protocol::OutcomeResolution::runtime(outcome),
+                )
                 .await
                 .err()
                 .map(|error| anyhow!(error).context("收敛 Episode 失败"))

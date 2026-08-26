@@ -412,6 +412,8 @@ async fn evidence_run_waits_for_complete_genome_plugins() {
         super::evidence::test_genome_revision(agent_tool::ExecutionPolicy::serve(), &artifacts)
             .await,
         artifacts,
+        FileEpisodeStore::new(root.join("episodes")),
+        &root,
     )
     .expect("应创建插件就绪测试 Evidence");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -1024,8 +1026,14 @@ async fn evidence_runtime_records_persisted_main_run() {
         super::evidence::test_genome_revision(agent_tool::ExecutionPolicy::serve(), &artifacts)
             .await;
     let genome_revision_id = revision.revision_id.clone();
-    let evidence =
-        EvidenceRuntime::new(Arc::clone(&hub), revision, artifacts).expect("应创建主会话 Evidence");
+    let evidence = EvidenceRuntime::new(
+        Arc::clone(&hub),
+        revision,
+        artifacts,
+        FileEpisodeStore::new(root.join("episodes")),
+        &root,
+    )
+    .expect("应创建主会话 Evidence");
     let (gateway, options) = build_demo_gateway();
     let mut sinks = CompositeEventSink::new();
     sinks.push(hub);

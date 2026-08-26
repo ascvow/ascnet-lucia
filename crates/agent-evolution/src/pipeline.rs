@@ -5,11 +5,10 @@
 //! 收敛后显式调用。
 
 use crate::{
-    attribute_failures, EvolutionOutbox, EvolutionOutboxItem, IssueAggregator, OutcomeRevisionStore,
+    attribute_failures, EvolutionOutbox, EvolutionOutboxItem, IssueAggregator, IssueObservation,
+    IssueObservationStore, OutcomeRevisionStore,
 };
-use agent_evolution_protocol::{
-    FailureDisposition, GenomeDigest, OutcomeRevision, OutcomeRevisionId,
-};
+use agent_evolution_protocol::{FailureDisposition, GenomeDigest, OutcomeRevision};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -23,6 +22,7 @@ where
     outbox: Arc<O>,
     revisions: Arc<R>,
     aggregator: tokio::sync::Mutex<IssueAggregator>,
+    observations: Option<Arc<dyn IssueObservationStore>>,
 }
 
 impl<O, R> EvolutionPipeline<O, R>
@@ -36,7 +36,17 @@ where
             outbox,
             revisions,
             aggregator: tokio::sync::Mutex::new(IssueAggregator::new()),
+            observations: None,
         }
+    }
+
+    /// 启用只追加 Issue 观察日志，使同类失败可跨进程重启聚合。
+    pub fn with_issue_observation_store<S>(mut self, store: Arc<S>) -> Self
+    where
+        S: IssueObservationStore + 'static,
+    {
+        self.observations = Some(store);
+        self
     }
 
     /// 处理一条已收敛 Episode 的监督证据。
@@ -56,15 +66,88 @@ where
         genome_digest: &GenomeDigest,
         current_revision: Option<&OutcomeRevision>,
     ) -> Result<usize, PipelineError> {
+        for incident in incidents {
+            incident
+                .validate()
+                .map_err(|error| PipelineError::InvalidIncident(error.to_string()))?;
+            if incident.episode_id != episode.episode_id {
+                return Err(PipelineError::MixedEpisodeIncident {
+                    expected: episode.episode_id.clone(),
+                    actual: incident.episode_id.clone(),
+                });
+            }
+        }
+        if let Some(current) = current_revision {
+            current
+                .validate()
+                .map_err(|error| PipelineError::InvalidOutcomeRevision(error.to_string()))?;
+            if current.episode_id != episode.episode_id {
+                return Err(PipelineError::MixedEpisodeRevision);
+            }
+            match self
+                .revisions
+                .current(&episode.episode_id)
+                .await
+                .map_err(PipelineError::OutcomeRevision)?
+            {
+                None => self
+                    .revisions
+                    .append(current)
+                    .await
+                    .map_err(PipelineError::OutcomeRevision)?,
+                Some(existing) if existing.revision_id == current.revision_id => {}
+                Some(_) => return Err(PipelineError::StaleOutcomeRevision),
+            }
+        }
         let records = attribute_failures(&episode.episode_id, incidents, &episode.failures);
         let mut written = 0;
+        let decisions = if let Some(store) = &self.observations {
+            let mut aggregator = IssueAggregator::new();
+            for observation in store.all().await.map_err(PipelineError::IssueObservation)? {
+                aggregator.record_with_issue_id(
+                    &observation.record,
+                    &observation.episode_id,
+                    &observation.fingerprint.genome_digest,
+                    Some(observation.issue_id),
+                );
+            }
+            for record in &records {
+                let (issue, _) = aggregator.record(record, &episode.episode_id, genome_digest);
+                store
+                    .append(&IssueObservation::new(
+                        issue.issue_id,
+                        episode.episode_id.clone(),
+                        genome_digest,
+                        record.clone(),
+                    ))
+                    .await
+                    .map_err(PipelineError::IssueObservation)?;
+            }
 
-        for record in &records {
-            let (issue, disposition) = {
-                let mut aggregator = self.aggregator.lock().await;
-                aggregator.record(record, &episode.episode_id, genome_digest)
-            };
+            let mut rebuilt = IssueAggregator::new();
+            for observation in store.all().await.map_err(PipelineError::IssueObservation)? {
+                rebuilt.record_with_issue_id(
+                    &observation.record,
+                    &observation.episode_id,
+                    &observation.fingerprint.genome_digest,
+                    Some(observation.issue_id),
+                );
+            }
+            let decisions = records
+                .iter()
+                .map(|record| rebuilt.record(record, &episode.episode_id, genome_digest))
+                .collect::<Vec<_>>();
+            *self.aggregator.lock().await = rebuilt;
+            decisions
+        } else {
+            let mut aggregator = self.aggregator.lock().await;
+            records
+                .iter()
+                .map(|record| aggregator.record(record, &episode.episode_id, genome_digest))
+                .collect::<Vec<_>>()
+        };
 
+        for (issue, disposition) in decisions {
             if matches!(
                 disposition,
                 FailureDisposition::Observe | FailureDisposition::Ignore
@@ -92,27 +175,6 @@ where
             written += 1;
         }
 
-        if let Some(current) = current_revision {
-            if !records.is_empty() {
-                let new_revision = OutcomeRevision {
-                    revision_id: OutcomeRevisionId::generate(),
-                    episode_id: episode.episode_id.clone(),
-                    supersedes: Some(current.revision_id.clone()),
-                    outcome: episode
-                        .outcome
-                        .clone()
-                        .unwrap_or(agent_evolution_protocol::Outcome::Unverifiable),
-                    source: agent_evolution_protocol::OutcomeSource::DeterministicRule,
-                    reason: format!("聚合 {} 条失败归因后确认终态", records.len()),
-                    feedback: None,
-                };
-                self.revisions
-                    .append(&new_revision)
-                    .await
-                    .map_err(PipelineError::OutcomeRevision)?;
-            }
-        }
-
         Ok(written)
     }
 }
@@ -126,6 +188,29 @@ pub enum PipelineError {
     /// Outcome 修订写入失败。
     #[error(transparent)]
     OutcomeRevision(crate::OutcomeRevisionError),
+    /// Issue 观察日志读写或完整性校验失败。
+    #[error(transparent)]
+    IssueObservation(crate::IssueObservationError),
+    /// Incident 违反监督协议不变量。
+    #[error("Incident 不合法：{0}")]
+    InvalidIncident(String),
+    /// Incident 属于另一 Episode。
+    #[error("Incident Episode 不匹配：期望 {expected}，实际 {actual}")]
+    MixedEpisodeIncident {
+        /// 当前处理的 Episode。
+        expected: agent_evolution_protocol::EpisodeId,
+        /// Incident 声明的 Episode。
+        actual: agent_evolution_protocol::EpisodeId,
+    },
+    /// Outcome 修订违反协议不变量。
+    #[error("OutcomeRevision 不合法：{0}")]
+    InvalidOutcomeRevision(String),
+    /// Outcome 修订属于另一 Episode。
+    #[error("OutcomeRevision 与 Episode 不匹配")]
+    MixedEpisodeRevision,
+    /// 本地历史已有另一条最新修订，拒绝覆盖。
+    #[error("OutcomeRevision 不是当前 Episode 的最新可信修订")]
+    StaleOutcomeRevision,
 }
 
 #[cfg(test)]
@@ -133,13 +218,14 @@ mod tests {
     use super::*;
     use crate::{
         EpisodeStore, EvolutionOutbox, FileEpisodeStore, FileEvolutionOutbox,
-        FileOutcomeRevisionStore, OutcomeRevisionStore,
+        FileIssueObservationStore, FileOutcomeRevisionStore, OutcomeRevisionStore,
     };
     use agent_evolution_protocol::{
         ArtifactDigest, ArtifactRef, ComponentRef, DetectorRef, Episode, EpisodeDataPolicy,
         EpisodeId, EventId, FailureClassification, FailureKind, GenomeRevisionId, Incident,
-        IncidentId, IncidentKind, IncidentStatus, Outcome, OutcomeSource, Recoverability,
-        ReplayabilityGrade, RunId, Severity, TaskDescriptor, UsageSummary, EPISODE_SCHEMA_VERSION,
+        IncidentId, IncidentKind, IncidentStatus, Outcome, OutcomeRevisionId, OutcomeSource,
+        Recoverability, ReplayabilityGrade, RunId, Severity, TaskDescriptor, UsageSummary,
+        EPISODE_SCHEMA_VERSION,
     };
     use std::path::PathBuf;
 
@@ -205,7 +291,9 @@ mod tests {
         let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
         let outbox = Arc::new(FileEvolutionOutbox::new(root.join("outbox")));
         let revisions = Arc::new(FileOutcomeRevisionStore::new(root.join("revisions")));
-        let pipeline = EvolutionPipeline::new(outbox.clone(), revisions.clone());
+        let observations = Arc::new(FileIssueObservationStore::new(root.join("observations")));
+        let pipeline = EvolutionPipeline::new(outbox.clone(), revisions.clone())
+            .with_issue_observation_store(observations.clone());
 
         // 第一条失败：Observe，不进入 Outbox。
         let first = episode();
@@ -233,6 +321,11 @@ mod tests {
             .await
             .expect("应处理");
         assert_eq!(written, 0);
+
+        // 模拟应用进程重启；第二个 Pipeline 只能从只追加观察日志恢复第一次计数。
+        drop(pipeline);
+        let pipeline = EvolutionPipeline::new(outbox.clone(), revisions.clone())
+            .with_issue_observation_store(observations);
 
         // 第二条同类失败：聚合为 Clustered，进入 EvolutionCandidate。
         let second = episode();

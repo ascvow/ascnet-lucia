@@ -19,4 +19,4 @@ tokio = { workspace = true, features = ["fs"] }
 uuid.workspace = true
 
 [dev-dependencies]
-agent-tool = { path = "../agent-tool", version = "0.1.0", default-features = false }
+agent-tool = { path = "../agent-tool", version = "0.1.0", default-features = false, features = ["builtins"] }

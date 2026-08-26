@@ -119,9 +119,7 @@ impl ProtocolReplay {
         Ok(ReplayReport {
             event_count: events.len() as u64,
             max_step: events.iter().map(|event| event.step).max().unwrap_or(0),
-            finished: events
-                .last()
-                .is_some_and(|event| event.kind == "run_finished"),
+            finished: events.iter().any(|event| event.kind == "run_finished"),
             supervision_verified,
         })
     }
@@ -182,8 +180,8 @@ pub enum ProtocolReplayError {
     /// run_started 重复。
     #[error("Protocol Replay 中 run_started 只能出现一次")]
     DuplicateRunStart,
-    /// run_finished 不是最后一个事件或重复出现。
-    #[error("Protocol Replay 中 run_finished 必须唯一且位于末尾")]
+    /// run_finished 重复，或其后出现非可信收敛事件。
+    #[error("Protocol Replay 中 run_finished 必须唯一，且之后只能出现可信收敛事件")]
     InvalidRunFinish,
     /// 监督信封数量与规范事件流不一致。
     #[error("Event Envelope 数量不匹配：期望 {expected}，实际 {actual}")]
@@ -312,7 +310,10 @@ fn validate_sequence(
             "run_started" => starts += 1,
             "run_finished" => {
                 finishes += 1;
-                if index + 1 != events.len() {
+                if events[index + 1..]
+                    .iter()
+                    .any(|event| !is_post_run_supervision(event))
+                {
                     return Err(ProtocolReplayError::InvalidRunFinish);
                 }
             }
@@ -328,6 +329,21 @@ fn validate_sequence(
     Ok(())
 }
 
+/// 判断事件是否为 Core 结束后由可信 Host 追加的监督收敛输入。
+fn is_post_run_supervision(event: &EpisodeEvent) -> bool {
+    event.kind == "extension"
+        && event
+            .payload
+            .pointer("/source/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("host")
+        && event
+            .payload
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            == Some(crate::supervision::OUTCOME_RESOLUTION_EVENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,8 +353,8 @@ mod tests {
     };
     use agent_core::{AgentEvent, AgentEventKind, EventSink};
     use agent_evolution_protocol::{
-        EpisodeDataPolicy, EpisodeId, GenomeRevisionId, Outcome, ReplayabilityGrade, RunId,
-        TaskDescriptor, UsageSummary, EPISODE_SCHEMA_VERSION,
+        EpisodeDataPolicy, EpisodeId, GenomeRevisionId, Outcome, OutcomeResolution,
+        ReplayabilityGrade, RunId, TaskDescriptor, UsageSummary, EPISODE_SCHEMA_VERSION,
     };
     use std::{path::PathBuf, sync::Mutex};
     use uuid::Uuid;
@@ -430,7 +446,8 @@ mod tests {
         let root = temp_root();
         let artifacts = Arc::new(FileArtifactStore::new(root.join("artifacts")));
         let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
-        let config = EpisodeRecorderConfig::online("session-1", GenomeRevisionId::generate());
+        let mut config = EpisodeRecorderConfig::online("session-1", GenomeRevisionId::generate());
+        config.finalize_on_run_finished = false;
         let episode_id = config.episode_id.clone();
         let run_id = config.run_id.to_string();
         let recorder = EpisodeRecorder::new(config, artifacts.clone(), episodes.clone());
@@ -452,6 +469,10 @@ mod tests {
             ))
             .await
             .expect("应记录运行结束");
+        recorder
+            .finish_with_resolution(OutcomeResolution::verified_success("后置条件已验证"))
+            .await
+            .expect("应记录可信终态并收敛");
 
         let episode = episodes
             .get(&episode_id)
@@ -464,7 +485,7 @@ mod tests {
             .await
             .expect("应验证并回放 Recorder 产物");
         assert!(report.supervision_verified);
-        assert_eq!(report.event_count, 2);
+        assert_eq!(report.event_count, 3);
         assert!(report.finished);
         let _ = tokio::fs::remove_dir_all(root).await;
     }
