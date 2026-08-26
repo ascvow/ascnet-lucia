@@ -1,12 +1,61 @@
 use super::*;
-use crate::{AgentExecutionResult, ToolAccess};
+use crate::{AgentExecutionResult, RuntimeRunFinalizer, RuntimeRunObservation, ToolAccess};
 use agent_core::{
-    Agent, AgentOptions, ChatModel, ModelGateway, ModelRequest, ModelResponse, ProviderAdapter,
+    Agent, AgentOptions, ChatModel, InMemoryEventSink, ModelGateway, ModelRequest, ModelResponse,
+    ProviderAdapter,
 };
 use agent_tool::{JsonTool, ToolRegistry, ToolSpec};
 use anyhow::Result;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// 记录 Runtime 上下文、Core 事件和收敛终态的可信测试观察器。
+struct RecordingRunObserver {
+    contexts: Arc<Mutex<Vec<RuntimeRunContext>>>,
+    terminations: Arc<Mutex<Vec<RuntimeRunTermination>>>,
+    events: Arc<InMemoryEventSink>,
+    fail_finish: bool,
+}
+
+/// 把一次 Runtime 终态写入测试观察器。
+struct RecordingRunFinalizer {
+    terminations: Arc<Mutex<Vec<RuntimeRunTermination>>>,
+    fail_finish: bool,
+}
+
+#[async_trait]
+impl RuntimeRunFinalizer for RecordingRunFinalizer {
+    async fn finish(&self, termination: RuntimeRunTermination) -> RuntimeResult<()> {
+        self.terminations
+            .lock()
+            .expect("观察终态锁不应中毒")
+            .push(termination);
+        if self.fail_finish {
+            Err(AgentRuntimeError::RunObservation("模拟证据收敛失败".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl RuntimeRunObserver for RecordingRunObserver {
+    async fn begin(&self, context: RuntimeRunContext) -> RuntimeResult<RuntimeRunObservation> {
+        let run_id = format!("observed-{}", context.agent_id);
+        self.contexts
+            .lock()
+            .expect("观察上下文锁不应中毒")
+            .push(context);
+        RuntimeRunObservation::new(
+            run_id,
+            self.events.clone(),
+            Arc::new(RecordingRunFinalizer {
+                terminations: Arc::clone(&self.terminations),
+                fail_finish: self.fail_finish,
+            }),
+        )
+    }
+}
 
 /// 返回固定文本的测试模型。
 struct FixedModel;
@@ -181,6 +230,159 @@ async fn spawn_returns_handle_and_reaches_success_terminal_state() {
         } if final_text == "完成"
     ));
     assert!(!api.cancel(&child.id).await.expect("重复终态操作应成功"));
+}
+
+/// Host 观察器必须在 Core 启动前固定 Run ID，并接收可信身份、事件和完成终态。
+#[tokio::test]
+async fn trusted_run_observer_binds_runtime_execution() {
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let terminations = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(InMemoryEventSink::new());
+    let runtime = AgentRuntime::new_with_run_observer(
+        RuntimeLimits::default(),
+        Arc::new(RecordingRunObserver {
+            contexts: Arc::clone(&contexts),
+            terminations: Arc::clone(&terminations),
+            events: Arc::clone(&events),
+            fail_finish: false,
+        }),
+    )
+    .expect("创建带观察器的 Runtime");
+    let root = runtime
+        .attach_root(
+            template(Arc::new(FixedModel), "fixed", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let child = api
+        .spawn(AgentSpawnRequest::new("执行证据任务"))
+        .await
+        .expect("派生 Agent");
+
+    assert!(matches!(
+        api.wait(&child.id).await.expect("等待子 Agent"),
+        AgentOutcome::Succeeded { .. }
+    ));
+    let contexts = contexts.lock().expect("观察上下文锁不应中毒");
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(contexts[0].agent_id, child.id);
+    assert_eq!(contexts[0].lineage, child.lineage);
+    drop(contexts);
+    assert_eq!(
+        *terminations.lock().expect("观察终态锁不应中毒"),
+        vec![RuntimeRunTermination::Completed]
+    );
+    let recorded = events.events().await;
+    assert!(recorded
+        .iter()
+        .any(|event| event.kind == agent_core::AgentEventKind::RunStarted));
+    assert!(recorded
+        .iter()
+        .any(|event| event.kind == agent_core::AgentEventKind::RunFinished));
+    assert!(recorded
+        .iter()
+        .all(|event| event.run_id == format!("observed-{}", child.id)));
+}
+
+/// 证据收敛失败必须把 Runtime 运行降为失败，不能保留可续跑的成功 Session。
+#[tokio::test]
+async fn run_observation_failure_rejects_success_terminal_state() {
+    let runtime = AgentRuntime::new_with_run_observer(
+        RuntimeLimits::default(),
+        Arc::new(RecordingRunObserver {
+            contexts: Arc::new(Mutex::new(Vec::new())),
+            terminations: Arc::new(Mutex::new(Vec::new())),
+            events: Arc::new(InMemoryEventSink::new()),
+            fail_finish: true,
+        }),
+    )
+    .expect("创建带失败观察器的 Runtime");
+    let root = runtime
+        .attach_root(
+            template(Arc::new(FixedModel), "fixed", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let child = api
+        .spawn(AgentSpawnRequest::new("执行失败证据任务"))
+        .await
+        .expect("派生 Agent");
+
+    assert!(matches!(
+        api.wait(&child.id).await.expect("等待子 Agent"),
+        AgentOutcome::Failed { error } if error.contains("模拟证据收敛失败")
+    ));
+    assert!(matches!(
+        api.continue_agent(&child.id, "不得续跑".into()).await,
+        Err(AgentRuntimeError::SessionUnavailable(_))
+    ));
+}
+
+/// principal 撤销必须中断阻塞中的 Core，但要等待可信观察器完成取消证据收敛后再返回。
+#[tokio::test]
+async fn revoke_principal_waits_for_observed_run_finalization() {
+    let entered = Arc::new(AtomicBool::new(false));
+    let terminations = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(InMemoryEventSink::new());
+    let runtime = AgentRuntime::new_with_run_observer(
+        RuntimeLimits::default(),
+        Arc::new(RecordingRunObserver {
+            contexts: Arc::new(Mutex::new(Vec::new())),
+            terminations: Arc::clone(&terminations),
+            events: Arc::clone(&events),
+            fail_finish: false,
+        }),
+    )
+    .expect("创建带观察器的 Runtime");
+    let principal =
+        RuntimePrincipal::new("component:test:observed-revoke").expect("创建撤销测试 principal");
+    let root = runtime
+        .attach_root_for(
+            principal.clone(),
+            template(
+                Arc::new(BlockingModel {
+                    entered: Arc::clone(&entered),
+                    release: Arc::new(Notify::new()),
+                }),
+                "blocking",
+                &[],
+            ),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载撤销测试根 Agent");
+    let api = runtime
+        .api_for(principal.clone(), &root.id)
+        .await
+        .expect("绑定撤销测试 API");
+    let child = api
+        .spawn(AgentSpawnRequest::new("阻塞直到 principal 撤销"))
+        .await
+        .expect("派生阻塞 Agent");
+
+    for _ in 0..100 {
+        if entered.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(entered.load(Ordering::Acquire));
+    assert_eq!(runtime.revoke_principal(&principal).await, 2);
+    assert_eq!(
+        *terminations.lock().expect("观察终态锁不应中毒"),
+        vec![RuntimeRunTermination::Cancelled]
+    );
+    let recorded = events.events().await;
+    assert!(recorded
+        .iter()
+        .any(|event| event.kind == agent_core::AgentEventKind::RunStarted));
+    assert!(recorded
+        .iter()
+        .all(|event| event.run_id == format!("observed-{}", child.id)));
 }
 
 /// 成功终态应保留私有会话，并允许有权 controller 创建权限不扩大的后续运行。

@@ -239,6 +239,91 @@ pub(crate) struct SubscriberEventSink {
     pub(crate) history: Arc<Mutex<VecDeque<AgentEvent>>>,
 }
 
+/// Runtime 即将启动一次 Core Run 时提供给可信 Host 观察器的上下文。
+///
+/// Execution lineage 与 Genome lineage 语义独立；本结构只描述当前 Runtime 身份和派生关系，
+/// 不接受 Guest 提供的 owner、Genome 或 Run ID。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRunContext {
+    /// 即将运行的 Runtime Agent 身份。
+    pub agent_id: AgentId,
+    /// Runtime 内可信维护的父子派生关系。
+    pub lineage: AgentLineage,
+}
+
+/// Runtime 观察到的 Core Run 终止形态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeRunTermination {
+    /// Core 正常完成且没有取消。
+    Completed,
+    /// Runtime 外部取消了 Core future，或 Core 自身通过取消路径优雅收尾。
+    Cancelled,
+    /// Core、事件 sink、模型、工具或扩展返回错误。
+    Failed,
+}
+
+/// 一次 Runtime Run 结束后的可信收敛回调。
+#[async_trait]
+pub trait RuntimeRunFinalizer: Send + Sync {
+    /// 使用 Runtime 判定的终止形态收敛外部证据。
+    ///
+    /// # Errors
+    ///
+    /// 证据或审计制品无法完整写入时返回错误；Runtime 会把该运行判定为失败。
+    async fn finish(&self, termination: RuntimeRunTermination) -> RuntimeResult<()>;
+}
+
+/// Host 观察器为单次 Core Run 提供的固定 ID、事件 sink 和收敛器。
+pub struct RuntimeRunObservation {
+    run_id: String,
+    event_sink: Arc<dyn EventSink>,
+    finalizer: Arc<dyn RuntimeRunFinalizer>,
+}
+
+impl RuntimeRunObservation {
+    /// 创建一次可信运行观察绑定。
+    ///
+    /// # Errors
+    ///
+    /// `run_id` 为空时返回 [`AgentRuntimeError::RunObservation`]。
+    pub fn new(
+        run_id: impl Into<String>,
+        event_sink: Arc<dyn EventSink>,
+        finalizer: Arc<dyn RuntimeRunFinalizer>,
+    ) -> RuntimeResult<Self> {
+        let run_id = run_id.into();
+        if run_id.is_empty() {
+            return Err(AgentRuntimeError::RunObservation(
+                "运行观察器返回了空 Run ID".into(),
+            ));
+        }
+        Ok(Self {
+            run_id,
+            event_sink,
+            finalizer,
+        })
+    }
+
+    /// 分解为 Runtime 执行路径使用的固定绑定。
+    pub(crate) fn into_parts(self) -> (String, Arc<dyn EventSink>, Arc<dyn RuntimeRunFinalizer>) {
+        (self.run_id, self.event_sink, self.finalizer)
+    }
+}
+
+/// Host 可选注入的 Runtime Run 观察器。
+///
+/// 观察器运行在 Guest 和普通插件权限之外，可为 Evidence Plane 预登记 Run，但不能改变
+/// Agent 权限、输入、执行策略或 Runtime lineage。
+#[async_trait]
+pub trait RuntimeRunObserver: Send + Sync {
+    /// 在 Core Run 启动前创建固定观察绑定。
+    ///
+    /// # Errors
+    ///
+    /// 无法预登记证据或生成合法运行绑定时返回错误；Core 不会在失败后继续运行。
+    async fn begin(&self, context: RuntimeRunContext) -> RuntimeResult<RuntimeRunObservation>;
+}
+
 #[async_trait]
 impl EventSink for SubscriberEventSink {
     async fn record(&self, event: &AgentEvent) -> AnyResult<()> {

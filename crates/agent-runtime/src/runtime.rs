@@ -5,7 +5,8 @@ use crate::{
     AgentDeriveConfig, AgentEventStream, AgentHandle, AgentId, AgentLineage, AgentOptionsPatch,
     AgentOutcome, AgentPermissions, AgentProfileId, AgentRuntimeApi, AgentRuntimeError,
     AgentRuntimeProvisioner, AgentSnapshot, AgentSpawnRequest, AgentStatus, AgentTemplate,
-    ProvisionedAgentRuntime, RuntimeLimits, RuntimePrincipal, RuntimeResult,
+    ProvisionedAgentRuntime, RuntimeLimits, RuntimePrincipal, RuntimeResult, RuntimeRunContext,
+    RuntimeRunObserver, RuntimeRunTermination,
 };
 use agent_core::{AgentControl, AgentEvent, CompositeEventSink, Session};
 use async_trait::async_trait;
@@ -14,14 +15,11 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     panic::AssertUnwindSafe,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
 };
-use tokio::{
-    sync::{mpsc, Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock, Semaphore},
-    task::AbortHandle,
-};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock, Semaphore};
 
 /// Agent 尚未开始运行时允许暂存的交互消息数量。
 const PENDING_STEERING_LIMIT: usize = 32;
@@ -37,6 +35,29 @@ pub struct AgentRuntime {
 impl AgentRuntime {
     /// 使用指定限额创建空 Runtime。
     pub fn new(limits: RuntimeLimits) -> RuntimeResult<Self> {
+        Self::build(limits, None)
+    }
+
+    /// 使用指定限额和 Host 可信运行观察器创建 Runtime。
+    ///
+    /// 观察器只接收 Runtime 维护的身份与 lineage，可为每次 Core Run 提供固定 Run ID、
+    /// 事件 sink 和终态收敛器；它不改变 Agent 权限或调度语义。
+    ///
+    /// # Errors
+    ///
+    /// Runtime 限额无效时返回错误。
+    pub fn new_with_run_observer(
+        limits: RuntimeLimits,
+        observer: Arc<dyn RuntimeRunObserver>,
+    ) -> RuntimeResult<Self> {
+        Self::build(limits, Some(observer))
+    }
+
+    /// 创建共享内部状态，确保不同构造入口使用同一组限额校验与默认值。
+    fn build(
+        limits: RuntimeLimits,
+        run_observer: Option<Arc<dyn RuntimeRunObserver>>,
+    ) -> RuntimeResult<Self> {
         limits.validate()?;
         Ok(Self {
             inner: Arc::new(RuntimeInner {
@@ -47,6 +68,7 @@ impl AgentRuntime {
                 profiles: AsyncRwLock::new(HashMap::new()),
                 profile_grants: AsyncRwLock::new(HashMap::new()),
                 lifecycle: AsyncMutex::new(()),
+                run_observer,
             }),
         })
     }
@@ -140,14 +162,19 @@ impl AgentRuntime {
                 .filter_map(|id| agents.remove(&id))
                 .collect::<Vec<_>>()
         };
-        let mut cancelled = 0;
-        for entry in entries {
-            if entry.finish(AgentOutcome::Cancelled) {
-                entry.abort();
-                cancelled += 1;
+        let mut cancelled = Vec::new();
+        for entry in &entries {
+            if entry.request_cancel() {
+                cancelled.push(Arc::clone(entry));
             }
         }
-        cancelled
+        // principal 已进入不可逆撤销态且 Agent 已从注册表移除，此后无需继续持有生命周期锁。
+        // 等待后台监督任务完成，确保 Runtime Evidence finalizer 在组件卸载返回前已经收敛。
+        drop(_lifecycle);
+        for entry in &cancelled {
+            entry.wait_until_finished().await;
+        }
+        cancelled.len()
     }
 
     /// 返回当前运行时限额。
@@ -301,7 +328,7 @@ impl AgentRuntime {
 
         let inner = self.inner.clone();
         let task_entry = entry.clone();
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let future = run_agent_task(inner, task_entry.clone(), request.input, None);
             match AssertUnwindSafe(future).catch_unwind().await {
                 Ok(completion) => {
@@ -314,7 +341,6 @@ impl AgentRuntime {
                 }
             }
         });
-        entry.set_abort_handle(task.abort_handle());
 
         Ok(AgentHandle { id, lineage })
     }
@@ -366,7 +392,7 @@ impl AgentRuntime {
 
         let inner = self.inner.clone();
         let task_entry = entry.clone();
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let future = run_agent_task(inner, task_entry.clone(), input, Some(session));
             match AssertUnwindSafe(future).catch_unwind().await {
                 Ok(completion) => {
@@ -379,7 +405,6 @@ impl AgentRuntime {
                 }
             }
         });
-        entry.set_abort_handle(task.abort_handle());
 
         Ok(AgentHandle { id, lineage })
     }
@@ -469,8 +494,7 @@ impl AgentRuntime {
         let entries = self.inner.descendants_including(target).await?;
         let mut changed = false;
         for entry in entries {
-            if entry.finish(AgentOutcome::Cancelled) {
-                entry.abort();
+            if entry.request_cancel() {
                 changed = true;
             }
         }
@@ -584,6 +608,8 @@ struct RuntimeInner {
     profiles: AsyncRwLock<HashMap<AgentProfileId, AgentProfile>>,
     profile_grants: AsyncRwLock<HashMap<RuntimePrincipal, BTreeSet<AgentProfileId>>>,
     lifecycle: AsyncMutex<()>,
+    /// Host 可信运行观察器；Guest 无法读取、替换或绕过。
+    run_observer: Option<Arc<dyn RuntimeRunObserver>>,
 }
 
 /// Host 注册的模板和初始权限。
@@ -698,7 +724,9 @@ struct AgentEntry {
     outcome: RwLock<Option<AgentOutcome>>,
     session: RwLock<Option<Session>>,
     finished: Notify,
-    abort_handle: Mutex<Option<AbortHandle>>,
+    /// Runtime 监督任务消费的一次性取消请求；不能直接 abort 监督任务，否则会跳过证据收敛。
+    cancel_requested: AtomicBool,
+    cancel_requested_notify: Notify,
     control: Mutex<Option<AgentControl>>,
     pending_steering: Mutex<VecDeque<String>>,
     child_count: AtomicUsize,
@@ -730,7 +758,8 @@ impl AgentEntry {
             outcome: RwLock::new(None),
             session: RwLock::new(None),
             finished: Notify::new(),
-            abort_handle: Mutex::new(None),
+            cancel_requested: AtomicBool::new(false),
+            cancel_requested_notify: Notify::new(),
             control: Mutex::new(None),
             pending_steering: Mutex::new(VecDeque::new()),
             child_count: AtomicUsize::new(0),
@@ -867,18 +896,41 @@ impl AgentEntry {
         *slot = Some(control);
     }
 
-    fn set_abort_handle(&self, handle: AbortHandle) {
-        *self.abort_handle.lock().expect("Agent 取消句柄锁不应中毒") = Some(handle);
+    /// 请求取消一次排队或运行中的任务；Ready 根节点没有监督任务，因此直接进入终态。
+    fn request_cancel(&self) -> bool {
+        let status = self.status();
+        if status.is_terminal() {
+            return false;
+        }
+        if status == AgentStatus::Ready {
+            return self.finish(AgentOutcome::Cancelled);
+        }
+        if self.cancel_requested.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.cancel_requested_notify.notify_waiters();
+        true
     }
 
-    fn abort(&self) {
-        if let Some(handle) = self
-            .abort_handle
-            .lock()
-            .expect("Agent 取消句柄锁不应中毒")
-            .as_ref()
-        {
-            handle.abort();
+    /// 等待已登记的取消请求；先登记通知再复核标志，避免丢失并发通知。
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.cancel_requested_notify.notified();
+            if self.cancel_requested.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// 等待 Runtime 监督任务写入最终结果。
+    async fn wait_until_finished(&self) {
+        loop {
+            let notified = self.finished.notified();
+            if self.outcome().is_some() {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -896,20 +948,35 @@ async fn run_agent_task(
     input: String,
     session: Option<Session>,
 ) -> AgentTaskCompletion {
-    let permit = match inner.semaphore.clone().acquire_owned().await {
-        Ok(permit) => permit,
-        Err(error) => {
+    let permit = tokio::select! {
+        biased;
+        _ = entry.cancelled() => {
             return AgentTaskCompletion {
-                outcome: AgentOutcome::Failed {
-                    error: format!("运行时并发控制已关闭：{error}"),
-                },
+                outcome: AgentOutcome::Cancelled,
                 session: None,
             };
+        }
+        permit = inner.semaphore.clone().acquire_owned() => match permit {
+            Ok(permit) => permit,
+            Err(error) => {
+                return AgentTaskCompletion {
+                    outcome: AgentOutcome::Failed {
+                        error: format!("运行时并发控制已关闭：{error}"),
+                    },
+                    session: None,
+                };
+            }
         }
     };
     if !entry.mark_running() {
         return AgentTaskCompletion {
             outcome: entry.outcome().unwrap_or(AgentOutcome::Cancelled),
+            session: None,
+        };
+    }
+    if entry.cancel_requested.load(Ordering::Acquire) {
+        return AgentTaskCompletion {
+            outcome: AgentOutcome::Cancelled,
             session: None,
         };
     }
@@ -932,8 +999,33 @@ async fn run_agent_task(
         }
     };
 
-    // 在模板 sink 之外叠加订阅转发，让 subscribe 拿到本 Agent 的事件流。
+    let observation = match inner.run_observer.as_ref() {
+        Some(observer) => match observer
+            .begin(RuntimeRunContext {
+                agent_id: entry.id.clone(),
+                lineage: entry.lineage.clone(),
+            })
+            .await
+        {
+            Ok(observation) => Some(observation.into_parts()),
+            Err(error) => {
+                return AgentTaskCompletion {
+                    outcome: AgentOutcome::Failed {
+                        error: error.to_string(),
+                    },
+                    session: None,
+                };
+            }
+        },
+        None => None,
+    };
+
+    // 可信观察 sink 放在模板和订阅 sink 之前：即使展示或诊断 sink 失败，Evidence 仍能
+    // 看到导致 Core 退出的最后一条事件，并由 finalizer 收敛为显式失败终态。
     let mut sink = CompositeEventSink::new();
+    if let Some((_, observation_sink, _)) = &observation {
+        sink.push(Arc::clone(observation_sink));
+    }
     sink.push(agent.event_sink());
     sink.push(Arc::new(SubscriberEventSink {
         subscribers: entry.subscribers.clone(),
@@ -941,29 +1033,103 @@ async fn run_agent_task(
     }));
     agent.set_event_sink(Arc::new(sink));
     entry.set_control(agent.control());
+    let observed_run_id = observation.as_ref().map(|(run_id, _, _)| run_id.clone());
+    let observation_finalizer = observation
+        .as_ref()
+        .map(|(_, _, finalizer)| Arc::clone(finalizer));
+    drop(observation);
 
-    let result = match session {
-        Some(session) => agent.run_continue(session, input).await,
-        None => agent.run(input).await,
+    let core_future = AssertUnwindSafe(async {
+        match (observed_run_id, session) {
+            (Some(run_id), Some(session)) => {
+                let session = agent.prepare_session(session, input);
+                agent.run_session_with_id(session, run_id).await
+            }
+            (Some(run_id), None) => {
+                let session = agent.prepare_session(Session::new(), input);
+                agent.run_session_with_id(session, run_id).await
+            }
+            (None, Some(session)) => agent.run_continue(session, input).await,
+            (None, None) => agent.run(input).await,
+        }
+    })
+    .catch_unwind();
+    tokio::pin!(core_future);
+    let execution = tokio::select! {
+        biased;
+        _ = entry.cancelled() => RuntimeCoreCompletion::Cancelled,
+        core_result = &mut core_future => {
+            let result = match core_result {
+                Ok(result) => result,
+                Err(payload) => Err(anyhow::anyhow!(
+                    "Agent Core 运行 panic：{}",
+                    panic_message(payload)
+                )),
+            };
+            if entry.cancel_requested.load(Ordering::Acquire) {
+                RuntimeCoreCompletion::Cancelled
+            } else {
+                RuntimeCoreCompletion::Finished(result)
+            }
+        }
     };
     drop(permit);
-    match result {
-        // Core 层优雅取消映射为 Runtime 的取消终态，不保留续跑会话。
-        Ok(run) if run.cancelled => AgentTaskCompletion {
+    let termination = match &execution {
+        RuntimeCoreCompletion::Cancelled => RuntimeRunTermination::Cancelled,
+        RuntimeCoreCompletion::Finished(Ok(run)) if run.cancelled => {
+            RuntimeRunTermination::Cancelled
+        }
+        RuntimeCoreCompletion::Finished(Ok(_)) => RuntimeRunTermination::Completed,
+        RuntimeCoreCompletion::Finished(Err(_)) => RuntimeRunTermination::Failed,
+    };
+    let observation_error = match observation_finalizer {
+        Some(finalizer) => finalizer.finish(termination).await.err(),
+        None => None,
+    };
+    match (execution, observation_error) {
+        (RuntimeCoreCompletion::Cancelled, None) => AgentTaskCompletion {
             outcome: AgentOutcome::Cancelled,
             session: None,
         },
-        Ok(run) => AgentTaskCompletion {
-            session: Some(run.session.clone()),
-            outcome: AgentOutcome::Succeeded { result: run.into() },
-        },
-        Err(error) => AgentTaskCompletion {
+        (RuntimeCoreCompletion::Cancelled, Some(error)) => AgentTaskCompletion {
             outcome: AgentOutcome::Failed {
                 error: error.to_string(),
             },
             session: None,
         },
+        // Core 层优雅取消映射为 Runtime 的取消终态，不保留续跑会话。
+        (RuntimeCoreCompletion::Finished(Ok(run)), None) if run.cancelled => AgentTaskCompletion {
+            outcome: AgentOutcome::Cancelled,
+            session: None,
+        },
+        (RuntimeCoreCompletion::Finished(Ok(run)), None) => AgentTaskCompletion {
+            session: Some(run.session.clone()),
+            outcome: AgentOutcome::Succeeded { result: run.into() },
+        },
+        (RuntimeCoreCompletion::Finished(Ok(_)), Some(error)) => AgentTaskCompletion {
+            outcome: AgentOutcome::Failed {
+                error: error.to_string(),
+            },
+            session: None,
+        },
+        (RuntimeCoreCompletion::Finished(Err(error)), observation_error) => AgentTaskCompletion {
+            outcome: AgentOutcome::Failed {
+                error: match observation_error {
+                    Some(observation_error) => {
+                        format!("{error:#}；同时发生运行观察错误：{observation_error}")
+                    }
+                    None => error.to_string(),
+                },
+            },
+            session: None,
+        },
     }
+}
+
+/// Runtime 监督层区分 Core 返回与外部取消，以便无论哪条路径都先收敛可信观察器。
+enum RuntimeCoreCompletion {
+    Finished(anyhow::Result<agent_core::AgentRun>),
+    Cancelled,
 }
 
 /// 将 panic 载荷转换为可诊断文本。

@@ -20,6 +20,7 @@ pub use permissions::{
 pub use protocol::{
     AgentEventStream, AgentExecutionResult, AgentHandle, AgentOutcome, AgentRuntimeApi,
     AgentRuntimeProvisioner, AgentSnapshot, AgentSpawnRequest, AgentStatus,
-    ProvisionedAgentRuntime, RuntimeLimits,
+    ProvisionedAgentRuntime, RuntimeLimits, RuntimeRunContext, RuntimeRunFinalizer,
+    RuntimeRunObservation, RuntimeRunObserver, RuntimeRunTermination,
 };
 pub use runtime::AgentRuntime;
