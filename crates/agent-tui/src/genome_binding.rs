@@ -279,18 +279,27 @@ fn verify_runtime_identity(revision: &GenomeRevision) -> Result<()> {
     if runtime.features != features {
         return Err(anyhow!("Genome features 与当前 Lucia 构建不一致"));
     }
-    let git_commit = current_git_commit();
-    if runtime.git_commit != git_commit {
-        return Err(anyhow!(
-            "Genome git_commit `{}` 与当前 Lucia 构建 `{git_commit}` 不一致",
-            runtime.git_commit
-        ));
-    }
+    verify_git_commit(&runtime.git_commit, current_git_commit())?;
     let git_dirty = current_git_dirty();
     if runtime.git_dirty != git_dirty {
         return Err(anyhow!(
             "Genome git_dirty `{}` 与当前 Lucia 构建 `{git_dirty}` 不一致",
             runtime.git_dirty
+        ));
+    }
+    Ok(())
+}
+
+/// 复核 Genome 声明的提交号与编译产物一致，并拒绝无法唯一标识源码的归档构建。
+fn verify_git_commit(declared: &str, build: &str) -> Result<()> {
+    if build == "unknown" {
+        return Err(anyhow!(
+            "当前 Lucia 编译产物缺少可验证的 Git commit，不能启动 Evidence"
+        ));
+    }
+    if declared != build {
+        return Err(anyhow!(
+            "Genome git_commit `{declared}` 与当前 Lucia 构建 `{build}` 不一致"
         ));
     }
     Ok(())
@@ -607,6 +616,13 @@ mod tests {
         )
         .expect_err("不匹配提交号必须拒绝");
         assert!(error.to_string().contains("git_commit"));
+    }
+
+    /// 缺少可验证提交号的源码归档构建不能进入 Evidence 平面。
+    #[test]
+    fn unknown_build_commit_is_rejected() {
+        let error = verify_git_commit("unknown", "unknown").expect_err("未知构建必须拒绝");
+        assert!(error.to_string().contains("缺少可验证的 Git commit"));
     }
 
     /// Genome 的 dirty 声明必须与构建时工作树状态完全一致。

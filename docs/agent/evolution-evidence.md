@@ -64,8 +64,8 @@ Prompt、原生工具、插件 bundle、独占能力 owner 和执行策略都由
 插件未 Ready 或加载失败时禁止开始 Run。
 
 启动还会把 Revision 的包版本、Git 提交、dirty 状态、目标三元组和 TUI feature 与编译产物
-逐项核对。源码归档构建使用显式 `unknown` 提交标记；它只能匹配同样声明的 Genome，且无法
-证明干净时按 dirty 构建处理。
+逐项核对。源码归档构建使用显式 `unknown` 提交标记且按 dirty 构建处理；由于它无法唯一证明
+内核版本，普通 Serve 可以运行，但 Evidence 会拒绝启动。
 
 当前 TUI 没有跨插件的 Context、Planning 与 Skill 独立快照服务，因此包含这些非空字段的
 Genome 会明确拒绝运行，不会只记录字段却继续采用另一份真实配置。插件内部配置和 Skill
