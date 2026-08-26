@@ -78,6 +78,7 @@ Genome 必须按顺序引用至少一个包含完整系统提示的 UTF-8 Prompt
 缺失时不会自动退回演示模型；显式 `--demo` 只接受声明 `scripted-demo` 路由的 Genome。
 插件版在固定插件全部 Ready 前不开始 Evidence Run，任一加载失败后继续保持阻断。
 Genome 的包版本、Git 提交、dirty 状态、目标三元组和 TUI feature 必须与当前编译产物一致。
+缺少可验证 Git commit 的源码归档构建可以运行普通 Serve，但不能启动 Evidence。
 
 ## 会话恢复
 
