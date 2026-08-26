@@ -7,11 +7,13 @@
 //! 确定性：所有集合使用 `BTreeMap` / `BTreeSet`，列表在 [`AgentGenome::validate`]
 //! 中要求已排序，因此同一份配置总是产生同一份序列化结果。
 //!
-//! 摘要计算本身属于 M1-03，本模块只负责结构与不变量。
+//! 摘要通过校验后的稳定 JSON 字节计算；结构字段顺序、`BTreeMap` / `BTreeSet` 和
+//! 已校验列表共同保证同一行为配置跨进程得到相同结果。
 
 use crate::ids::{ArtifactDigest, GenomeDigest, GenomeRevisionId};
 use agent_tool::{ExecutionPolicy, ToolAccess};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -319,6 +321,44 @@ impl AgentGenome {
 
         Ok(())
     }
+
+    /// 返回参与行为摘要的稳定 JSON 字节。
+    ///
+    /// 字节只包含 `AgentGenome`，不会混入修订 ID、父版本、创建时间或说明文字。
+    ///
+    /// # Errors
+    ///
+    /// Genome 结构不合法，或路径等字段无法编码为 JSON 时返回错误。
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, GenomeDigestError> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(GenomeDigestError::Serialization)
+    }
+
+    /// 计算当前行为配置的 SHA-256 摘要。
+    ///
+    /// # Errors
+    ///
+    /// Genome 不满足结构不变量、规范字节无法序列化或摘要类型构造失败时返回错误。
+    pub fn digest(&self) -> Result<GenomeDigest, GenomeDigestError> {
+        let bytes = self.canonical_bytes()?;
+        let hex = format!("{:x}", Sha256::digest(bytes));
+        GenomeDigest::from_sha256_hex(hex)
+            .map_err(|error| GenomeDigestError::InvalidDigest(error.to_string()))
+    }
+}
+
+/// Genome 规范序列化与摘要计算错误。
+#[derive(Debug, thiserror::Error)]
+pub enum GenomeDigestError {
+    /// Genome 结构不满足摘要前置条件。
+    #[error(transparent)]
+    InvalidGenome(#[from] InvalidGenome),
+    /// Genome 无法编码为稳定 JSON。
+    #[error("序列化 Genome 规范字节失败：{0}")]
+    Serialization(serde_json::Error),
+    /// SHA-256 文本无法构造成强类型摘要。
+    #[error("构造 Genome 摘要失败：{0}")]
+    InvalidDigest(String),
 }
 
 /// 判断迭代器产出的键是否严格升序（即已排序且无重复）。
@@ -372,6 +412,60 @@ pub struct GenomeRevision {
     /// 非行为元数据。
     #[serde(default)]
     pub metadata: GenomeMetadata,
+}
+
+impl GenomeRevision {
+    /// 从行为配置创建一次新的不可变修订登记。
+    ///
+    /// 修订 ID 每次重新生成；相同行为配置仍共享同一个 `GenomeDigest`。
+    ///
+    /// # Errors
+    ///
+    /// Genome 无法通过校验或计算摘要时返回错误。
+    pub fn create(
+        genome: AgentGenome,
+        metadata: GenomeMetadata,
+    ) -> Result<Self, GenomeRevisionError> {
+        let digest = genome.digest()?;
+        Ok(Self {
+            revision_id: GenomeRevisionId::generate(),
+            digest,
+            genome,
+            metadata,
+        })
+    }
+
+    /// 校验修订中的行为配置与声明摘要一致。
+    ///
+    /// # Errors
+    ///
+    /// Genome 不合法、摘要计算失败，或声明摘要与实际行为不一致时返回错误。
+    pub fn validate(&self) -> Result<(), GenomeRevisionError> {
+        let actual = self.genome.digest()?;
+        if actual != self.digest {
+            return Err(GenomeRevisionError::DigestMismatch {
+                declared: self.digest.clone(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Genome 修订构造与完整性校验错误。
+#[derive(Debug, thiserror::Error)]
+pub enum GenomeRevisionError {
+    /// Genome 摘要计算失败。
+    #[error(transparent)]
+    Digest(#[from] GenomeDigestError),
+    /// 修订声明的摘要与行为配置不一致。
+    #[error("Genome 修订摘要不匹配：声明 {declared}，实际 {actual}")]
+    DigestMismatch {
+        /// 修订记录中声明的摘要。
+        declared: GenomeDigest,
+        /// 从行为字段重新计算的摘要。
+        actual: GenomeDigest,
+    },
 }
 
 #[cfg(test)]
@@ -460,6 +554,10 @@ mod tests {
         let second = serde_json::to_string(&sample()).expect("应可序列化");
 
         assert_eq!(first, second);
+        assert_eq!(
+            sample().digest().expect("应计算摘要"),
+            sample().digest().expect("应计算摘要")
+        );
     }
 
     /// 集合字段的插入顺序不同，也必须得到相同序列化结果。
@@ -483,7 +581,9 @@ mod tests {
     /// 行为字段变化必须体现在序列化结果中。
     #[test]
     fn behavioural_changes_alter_serialization() {
-        let baseline = serde_json::to_string(&sample()).expect("应可序列化");
+        let baseline_genome = sample();
+        let baseline = serde_json::to_string(&baseline_genome).expect("应可序列化");
+        let baseline_digest = baseline_genome.digest().expect("应计算摘要");
 
         let mut changed = sample();
         changed.model.model = "claude-sonnet-5".into();
@@ -491,6 +591,7 @@ mod tests {
             serde_json::to_string(&changed).expect("应可序列化"),
             baseline
         );
+        assert_ne!(changed.digest().expect("应计算摘要"), baseline_digest);
 
         let mut changed = sample();
         changed.prompt.messages[1].artifact =
@@ -531,17 +632,16 @@ mod tests {
         let genome = sample();
         let baseline = serde_json::to_string(&genome).expect("应可序列化");
 
-        let revision = GenomeRevision {
-            revision_id: GenomeRevisionId::generate(),
-            digest: GenomeDigest::from_sha256_hex("0".repeat(64)).expect("摘要应合法"),
-            genome: genome.clone(),
-            metadata: GenomeMetadata {
+        let revision = GenomeRevision::create(
+            genome.clone(),
+            GenomeMetadata {
                 created_at: Some("2026-08-15T00:00:00Z".into()),
                 description: Some("首个版本".into()),
                 parent: None,
                 mutation: None,
             },
-        };
+        )
+        .expect("应创建修订");
 
         let mut other = revision.clone();
         other.revision_id = GenomeRevisionId::generate();
@@ -555,6 +655,22 @@ mod tests {
             baseline
         );
         assert_eq!(other.genome, revision.genome);
+        assert_eq!(other.digest, revision.digest);
+        revision.validate().expect("原修订应通过完整性校验");
+        other.validate().expect("元数据变化后仍应通过完整性校验");
+    }
+
+    /// 修订声明摘要被替换后必须拒绝读取，不能把错误行为绑定给已有 ID。
+    #[test]
+    fn revision_rejects_mismatched_digest() {
+        let mut revision =
+            GenomeRevision::create(sample(), GenomeMetadata::default()).expect("应创建修订");
+        revision.digest = GenomeDigest::from_sha256_hex("0".repeat(64)).expect("测试摘要应合法");
+
+        assert!(matches!(
+            revision.validate(),
+            Err(GenomeRevisionError::DigestMismatch { .. })
+        ));
     }
 
     #[test]

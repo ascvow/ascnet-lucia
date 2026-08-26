@@ -17,9 +17,9 @@ pub mod redaction;
 pub mod supervision;
 
 pub use genome::{
-    AgentGenome, GenomeMetadata, GenomeRevision, InvalidGenome, ModelGenome, PluginGenome,
-    PolicyRef, PromptArtifactRef, PromptGenome, PromptLayer, RuntimeIdentity, SkillRef,
-    ToolProfileGenome, GENOME_SCHEMA_VERSION,
+    AgentGenome, GenomeDigestError, GenomeMetadata, GenomeRevision, GenomeRevisionError,
+    InvalidGenome, ModelGenome, PluginGenome, PolicyRef, PromptArtifactRef, PromptGenome,
+    PromptLayer, RuntimeIdentity, SkillRef, ToolProfileGenome, GENOME_SCHEMA_VERSION,
 };
 
 pub use data_class::{

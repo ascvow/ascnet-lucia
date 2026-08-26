@@ -1,9 +1,21 @@
 # Evolution 可证据化运行
 
 Goal A 的证据链由 `agent-evolution-protocol` 与 `agent-evolution` 共同提供：前者定义
-稳定 Schema，后者实现本地 Artifact CAS、只追加 Episode Store、脱敏 Recorder、运行
-监督、失败归因和 Protocol Replay。Serve Core 不依赖 Evolution crate，未装配 Recorder
-时原有运行方式保持不变。
+稳定 Schema 与 Genome 行为摘要，后者实现不可变 Genome Store、本地 Artifact CAS、只追加
+Episode Store、脱敏 Recorder、运行监督、失败归因和 Protocol Replay。Serve Core 不依赖
+Evolution crate，未装配 Recorder 时原有运行方式保持不变。
+
+## Genome 完整性
+
+`AgentGenome::digest` 只序列化行为字段，并在计算 SHA-256 前校验 schema、排序、重复项、
+Prompt 层级与 capability owner。修订 ID、父版本、变异来源、创建时间和描述位于
+`GenomeMetadata`，不参与行为摘要；同一行为可以由不同 lineage 生成多个 Revision，但共享
+同一个 `GenomeDigest`。
+
+`FileGenomeStore` 使用 create-new 语义只追加 `GenomeRevision`。读取时会重新计算行为摘要并
+与记录中的声明值比较，同时拒绝符号链接、ID 与文件名不一致或已存在修订覆盖。应用层只能
+把已经通过 `GenomeStore::get` 验证的 Revision ID 交给 Recorder，不能临时生成一个 ID
+冒充真实 Genome。
 
 ## 运行绑定
 
