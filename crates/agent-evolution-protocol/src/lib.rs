@@ -17,6 +17,7 @@ pub mod genome;
 pub mod ids;
 pub mod ipc;
 pub mod mutation;
+mod plugin_evolution;
 pub mod redaction;
 mod skill_evolution;
 pub mod supervision;
@@ -79,6 +80,24 @@ pub use mutation::{
     MutationPatch, MutationProposal, MutationRisk, EVOLUTION_CYCLE_SCHEMA_VERSION,
     MAX_CANDIDATES_PER_CYCLE, MIN_CANDIDATES_PER_CYCLE, MUTATION_CANDIDATE_SCHEMA_VERSION,
     MUTATION_PROPOSAL_SCHEMA_VERSION,
+};
+pub use plugin_evolution::{
+    CapabilityExpansionRequest, CapabilityProfile, ComponentInterfaceSnapshot,
+    InvalidPluginEvolution, PluginApprovalDecision, PluginApprovalRecord, PluginAuditCheck,
+    PluginBuildAttestation, PluginCanaryRecord, PluginCanaryState, PluginCapabilitySet,
+    PluginEvaluationEvidence, PluginEvaluationGateInput, PluginEvaluationKind,
+    PluginEvaluationReport, PluginFilePatch, PluginHostAuditEvidence, PluginMutationKind,
+    PluginMutationProposal, PluginReleaseEnvelope, PluginReleaseStage, PluginSourceArtifact,
+    PluginSourceFile, PluginSourceGateDecision, PluginSourceGateFailure, PreapprovedPluginProfile,
+    SignatureAlgorithm, SignatureEnvelope, SignaturePurpose,
+    CAPABILITY_EXPANSION_REQUEST_SCHEMA_VERSION, COMPONENT_INTERFACE_SNAPSHOT_SCHEMA_VERSION,
+    PLUGIN_APPROVAL_RECORD_SCHEMA_VERSION, PLUGIN_AUDIT_CHECK_SCHEMA_VERSION,
+    PLUGIN_BUILD_ATTESTATION_SCHEMA_VERSION, PLUGIN_CANARY_RECORD_SCHEMA_VERSION,
+    PLUGIN_CAPABILITY_PROFILE_SCHEMA_VERSION, PLUGIN_CAPABILITY_SET_SCHEMA_VERSION,
+    PLUGIN_EVALUATION_EVIDENCE_SCHEMA_VERSION, PLUGIN_EVALUATION_GATE_INPUT_SCHEMA_VERSION,
+    PLUGIN_EVALUATION_REPORT_SCHEMA_VERSION, PLUGIN_HOST_AUDIT_EVIDENCE_SCHEMA_VERSION,
+    PLUGIN_MUTATION_PROPOSAL_SCHEMA_VERSION, PLUGIN_RELEASE_ENVELOPE_SCHEMA_VERSION,
+    PLUGIN_SOURCE_ARTIFACT_SCHEMA_VERSION, SIGNATURE_ENVELOPE_SCHEMA_VERSION,
 };
 pub use redaction::{RedactionOutcome, RedactionRule, Redactor, REDACTION_RULES_VERSION};
 pub use skill_evolution::{

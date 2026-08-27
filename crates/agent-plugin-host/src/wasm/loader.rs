@@ -56,7 +56,7 @@ pub async fn load_wasm_plugins_with_selection_and_services<P: AsRef<Path>>(
         .collect::<Vec<_>>();
     let resolved_capabilities = resolve_plugin_capabilities(&manifests, capability_selection)?;
     let order = resolve_plugin_load_order(&manifests)?;
-    let services = Arc::new(ServiceRegistry::default());
+    let services = Arc::new(ServiceRegistry::new(host_services.service_call_observer()));
     let mut composite = CompositePluginHost::new();
     if let Some(owner) = resolved_capabilities.exclusive_owner(CONTEXT_LOADER_CAPABILITY) {
         composite.set_capability_owner(CONTEXT_LOADER_CAPABILITY, owner);
@@ -527,7 +527,7 @@ pub async fn load_wasm_plugins_resilient_with_selection_and_services<P: AsRef<Pa
     let selected_tool_policy_owner = resolved_capabilities
         .exclusive_owner(TOOL_POLICY_CAPABILITY)
         .map(str::to_string);
-    let services = Arc::new(ServiceRegistry::default());
+    let services = Arc::new(ServiceRegistry::new(host_services.service_call_observer()));
     let mut composite = CompositePluginHost::new();
     failures.extend(dependency_failures);
     let mut failed_ids = failures
@@ -743,7 +743,7 @@ where
         .map(|failure| failure.plugin_id.clone())
         .collect::<HashSet<_>>();
     let mut completed_ids = failed_ids.clone();
-    let services = Arc::new(ServiceRegistry::default());
+    let services = Arc::new(ServiceRegistry::new(host_services.service_call_observer()));
     let by_id = manifests
         .iter()
         .enumerate()

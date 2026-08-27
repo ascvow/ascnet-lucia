@@ -246,12 +246,13 @@ impl WasmPluginHost {
         resolve_plugin_load_order(std::slice::from_ref(&manifest))?;
         let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         let wasm_path = base_dir.join(&manifest.plugin.wasm);
+        let services = Arc::new(ServiceRegistry::new(host_services.service_call_observer()));
         Self::load_with_limits_in_dir(
             manifest,
             wasm_path,
             base_dir.to_path_buf(),
             limits,
-            Arc::new(ServiceRegistry::default()),
+            services,
             host_services,
         )
         .await
@@ -305,12 +306,13 @@ impl WasmPluginHost {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
+        let services = Arc::new(ServiceRegistry::new(host_services.service_call_observer()));
         Self::load_with_limits_in_dir(
             manifest,
             wasm_path,
             plugin_dir,
             limits,
-            Arc::new(ServiceRegistry::default()),
+            services,
             host_services,
         )
         .await

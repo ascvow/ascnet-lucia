@@ -425,7 +425,7 @@ impl PluginManifest {
 }
 
 /// 同一能力允许的提供者基数。
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvidedCapabilityMode {
     /// 多个插件可以同时提供该能力。
@@ -494,6 +494,22 @@ impl ResolvedPluginCapabilities {
             .get(capability_id)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    /// 按未指定顺序返回全部能力、提供者基数和有效 owner。
+    ///
+    /// 调用方生成稳定制品时必须自行排序；返回的 owner 均来自已经校验并完成冲突解析的
+    /// manifest 集合。
+    pub fn resolved_owners(
+        &self,
+    ) -> impl Iterator<Item = (&str, ProvidedCapabilityMode, &[String])> {
+        self.owners.iter().map(|(capability_id, owners)| {
+            (
+                capability_id.as_str(),
+                self.modes[capability_id],
+                owners.as_slice(),
+            )
+        })
     }
 
     /// 按能力 ID 返回全部独占能力的最终 owner。

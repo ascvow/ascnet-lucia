@@ -1,7 +1,16 @@
 //! Lucia 官方 Skill 插件的真实 WASM 端到端测试。
 
 use agent_core::AgentExtension;
+use agent_evaluation::{
+    bind_plugin_host_audit, protocol_component_interface, PluginHostAuditBinding,
+    TrustedHostCheckOutcome,
+};
+use agent_evolution_protocol::{
+    ArtifactDigest, CandidateId, CapabilityProfile, MutationId, PluginCapabilitySet,
+};
 use agent_plugin_host::{
+    audit::{audit_plugin_component, ComponentInterfaceItemKind},
+    manifest::{resolve_plugin_capabilities, PluginManifest},
     wasm::WasmPluginHost,
     PluginHostServices,
 };
@@ -9,6 +18,12 @@ use agent_tool::ToolCall;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, path::Path};
+
+/// 计算真实测试字节的协议 SHA-256 摘要。
+fn artifact_digest(bytes: &[u8]) -> ArtifactDigest {
+    ArtifactDigest::from_sha256_hex(format!("{:x}", Sha256::digest(bytes)))
+        .expect("SHA-256 摘要应合法")
+}
 
 /// 构造 Guest 可复核的版本化 Skill Set 注入值。
 fn skill_set_json(
@@ -57,6 +72,105 @@ async fn load_with_skill_set(plugin_id: &str, skill_set: String) -> anyhow::Resu
         HashMap::from([("skill_set_json".into(), skill_set)]),
     )?;
     WasmPluginHost::load_from_manifest_with_services(manifest, services).await
+}
+
+/// 真实 Skill component 的 manifest、imports、exports 与能力 owner 必须形成同一审计证据。
+#[tokio::test]
+async fn component_exposes_complete_host_audit_evidence() {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
+    let manifest = PluginManifest::load(&manifest_path).expect("加载 Skill manifest");
+    let resolved = resolve_plugin_capabilities(
+        std::slice::from_ref(&manifest),
+        &std::collections::HashMap::new(),
+    )
+    .expect("解析 Skill 能力 owner");
+    let component_path = manifest_path
+        .parent()
+        .expect("Skill manifest 应有父目录")
+        .join(&manifest.plugin.wasm);
+
+    let component_bytes = std::fs::read(&component_path).expect("读取真实 Skill component");
+    let manifest_bytes = std::fs::read(&manifest_path).expect("读取真实 Skill manifest");
+    let host = WasmPluginHost::load_from_manifest(&manifest_path)
+        .await
+        .expect("真实 Skill component 应通过 Host 装载 smoke");
+    let tools = host
+        .list_tools()
+        .await
+        .expect("真实 Skill 工具路由应可读取");
+    let evidence = audit_plugin_component(&manifest, &component_path, &resolved, Vec::new())
+        .expect("真实 Skill component 审计应成功");
+    assert_eq!(evidence.manifest.plugin_id, "skill");
+    assert_eq!(evidence.manifest.provided[0].capability_id, "agent.skills");
+    assert!(evidence
+        .capability_import_checks
+        .iter()
+        .any(|check| check.capability_id == "fs_read" && check.satisfied));
+    assert!(evidence
+        .component
+        .imports
+        .iter()
+        .any(|item| item.path == "host-fs-read"));
+    assert!(evidence.component.exports.iter().any(|item| {
+        item.path == "list-tools" && item.kind == ComponentInterfaceItemKind::ComponentFunction
+    }));
+    assert_eq!(
+        evidence.resolved_capability_owners[0].owner_plugin_ids,
+        ["skill"]
+    );
+    assert!(evidence.observed_host_service_calls.is_empty());
+
+    let component_digest = artifact_digest(&component_bytes);
+    let scanner_revision = artifact_digest(b"wasmtime-component-types-v1");
+    let expected_interface = protocol_component_interface(
+        "skill",
+        component_digest.clone(),
+        scanner_revision,
+        &evidence,
+    )
+    .expect("真实 Skill 接口快照应进入 M8 协议");
+    let expected_capabilities = CapabilityProfile::new(
+        PluginCapabilitySet::new(vec!["fs_read".into()]).expect("Skill 请求能力应合法"),
+        PluginCapabilitySet::new(vec!["agent.skills".into()]).expect("Skill 提供能力应合法"),
+    )
+    .expect("Skill 能力 Profile 应合法");
+    let evidence_bytes = serde_json::to_vec(&evidence).expect("序列化 Host 审计证据");
+    let host_audit = bind_plugin_host_audit(
+        &evidence,
+        PluginHostAuditBinding {
+            plugin_id: "skill".into(),
+            mutation_id: MutationId::generate(),
+            candidate_id: CandidateId::generate(),
+            component_digest,
+            manifest_digest: artifact_digest(&manifest_bytes),
+            bundle_digest: artifact_digest(&[manifest_bytes, component_bytes].concat()),
+            expected_interface,
+            expected_capabilities,
+            verifier_revision: artifact_digest(b"m8-host-audit-adapter-v1"),
+            host_smoke: TrustedHostCheckOutcome {
+                report_digest: artifact_digest(
+                    serde_json::to_string(&tools)
+                        .expect("序列化真实工具路由摘要")
+                        .as_bytes(),
+                ),
+                check_count: 2,
+                failure_count: 0,
+            },
+            runtime_audit: TrustedHostCheckOutcome {
+                report_digest: artifact_digest(&evidence_bytes),
+                check_count: 1,
+                failure_count: 0,
+            },
+            completed_at_ms: 1,
+        },
+    )
+    .expect("真实 Skill Host 证据应转换为完整 M8 Gate 证据");
+    assert!(host_audit.host_smoke.passed);
+    assert!(host_audit.manifest_audit.passed);
+    assert!(host_audit.import_audit.passed);
+    assert!(host_audit.interface_audit.passed);
+    assert!(host_audit.owner_audit.passed);
+    assert!(host_audit.runtime_audit.passed);
 }
 
 /// 未注入 Genome Skill Set 时继续扫描目录并按需读取 `SKILL.md`。

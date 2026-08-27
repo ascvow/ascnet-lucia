@@ -1,5 +1,6 @@
 //! 插件间通用服务注册与调用。
 
+use crate::audit::{HostServiceCallObservation, HostServiceCallObserver};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use semver::Version;
@@ -55,9 +56,20 @@ pub(crate) trait ServiceHandler: Send + Sync {
 pub(crate) struct ServiceRegistry {
     services: RwLock<HashMap<(String, String), PluginService>>,
     handlers: RwLock<HashMap<String, Arc<dyn ServiceHandler>>>,
+    observer: Option<Arc<dyn HostServiceCallObserver>>,
 }
 
 impl ServiceRegistry {
+    /// 创建带可选旁路观察器的服务注册表。
+    #[cfg(feature = "wasm")]
+    pub(crate) fn new(observer: Option<Arc<dyn HostServiceCallObserver>>) -> Self {
+        Self {
+            services: RwLock::new(HashMap::new()),
+            handlers: RwLock::new(HashMap::new()),
+            observer,
+        }
+    }
+
     /// 注册插件实例的调用处理器。
     pub(crate) fn register_handler(
         &self,
@@ -117,6 +129,20 @@ impl ServiceRegistry {
 
     /// 调用目标插件已经注册的服务。
     pub(crate) async fn call(&self, call: PluginServiceCall) -> Result<Value> {
+        let result = self.call_inner(call.clone()).await;
+        if let Some(observer) = &self.observer {
+            let observation = HostServiceCallObservation::from_result(&call, &result);
+            let observer = observer.clone();
+            // 审计是旁路证据，不允许第三方观察器 panic 改变真实服务调用结果。
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.observe(observation);
+            }));
+        }
+        result
+    }
+
+    /// 执行服务目录校验、循环检测和目标处理器调用。
+    async fn call_inner(&self, call: PluginServiceCall) -> Result<Value> {
         let key = (call.plugin_id.clone(), call.name.clone());
         if !self
             .services

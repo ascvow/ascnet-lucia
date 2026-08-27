@@ -12,6 +12,10 @@ pub mod fixture;
 pub mod gate;
 pub mod health;
 pub mod model;
+mod plugin_gate;
+mod plugin_host_audit;
+mod plugin_release;
+mod plugin_signature;
 pub mod protocol;
 pub mod release;
 pub mod report;
@@ -59,6 +63,22 @@ pub use health::{
 pub use model::{
     ModelExchange, ModelFixture, ModelFixtureInteraction, ModelMock, ModelRequestMatcher,
     RecordingModel, ReplayModel, MODEL_FIXTURE_SCHEMA_VERSION,
+};
+pub use plugin_gate::{evaluate_plugin_source, PluginGateError};
+pub use plugin_host_audit::{
+    bind_plugin_host_audit, protocol_component_interface, PluginHostAuditBinding,
+    PluginHostAuditBindingError, TrustedHostCheckOutcome,
+};
+pub use plugin_release::{
+    FilePluginReleaseArchive, PluginCanaryAdmissionV1, PluginEvaluationArchiveRecordV1,
+    PluginReleaseArchiveRecordV1, PluginReleaseController, PluginReleaseError,
+    PluginRollbackRequestV1, PLUGIN_BUNDLE_MEDIA_TYPE, PLUGIN_COMPONENT_MEDIA_TYPE,
+    PLUGIN_EVALUATION_ARCHIVE_SCHEMA_VERSION, PLUGIN_EVALUATION_REPORT_MEDIA_TYPE,
+    PLUGIN_GATE_INPUT_MEDIA_TYPE, PLUGIN_RELEASE_ARCHIVE_SCHEMA_VERSION,
+    PLUGIN_RELEASE_ENVELOPE_MEDIA_TYPE,
+};
+pub use plugin_signature::{
+    PluginSignatureError, TrustedPluginKeyring, TrustedPluginSigner, TrustedPluginVerifyingKey,
 };
 pub use protocol::{ProtocolDifference, ProtocolTrace, ProtocolTraceEntry, ProtocolTraceError};
 pub use release::{ReleaseController, ReleaseError, ReleaseReceipt};

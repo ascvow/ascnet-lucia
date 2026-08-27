@@ -1046,6 +1046,7 @@ fn validate_state_key(key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::{HostServiceCallResult, InMemoryHostServiceCallObserver, JsonValueKind};
     use crate::service::ServiceHandler;
     use agent_core::{model::ModelEventStream, ChatModel, ModelResponse, ProviderAdapter};
     use agent_runtime::{
@@ -1639,7 +1640,8 @@ mod tests {
     /// Guest 请求体中的 caller_id 不得覆盖 Host 从当前 Store 注入的可信插件 ID。
     #[tokio::test]
     async fn service_call_ignores_forged_caller_id() {
-        let services = Arc::new(ServiceRegistry::default());
+        let observer = Arc::new(InMemoryHostServiceCallObserver::new());
+        let services = Arc::new(ServiceRegistry::new(Some(observer.clone())));
         services
             .register_handler("provider", Arc::new(CallerEchoService))
             .expect("注册测试服务处理器");
@@ -1664,5 +1666,16 @@ mod tests {
         .expect("服务调用应成功");
 
         assert_eq!(response["caller_id"], "trusted-consumer");
+        let observations = observer.snapshot();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].caller_id, "trusted-consumer");
+        assert_eq!(observations[0].target_owner_id, "provider");
+        assert_eq!(observations[0].service, "identity.echo");
+        assert_eq!(
+            observations[0].result,
+            HostServiceCallResult::Succeeded {
+                value_kind: JsonValueKind::Object
+            }
+        );
     }
 }
