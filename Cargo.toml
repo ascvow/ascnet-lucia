@@ -35,6 +35,7 @@ members = [
     "examples/plugins/permission-plugin",
     "examples/plugins/permission-plugin/smoke-tests",
     "tools/lucia-live-tests",
+    "tools/lucia-eval",
 ]
 default-members = [
     "crates/agent-tool",
