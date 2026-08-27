@@ -1,22 +1,15 @@
 [package]
-name = "lucia-eval"
+name = "lucia-evolve"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Lucia 独立受信离线评测与报告提交控制面。"
+description = "Lucia 外部自进化控制面客户端。"
 
 [dependencies]
-agent-evaluation = { path = "../../crates/agent-evaluation", version = "0.1.0" }
 agent-evolution = { path = "../../crates/agent-evolution", version = "0.1.0" }
 agent-evolution-protocol = { path = "../../crates/agent-evolution-protocol", version = "0.1.0" }
-anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 tokio.workspace = true
-
-[dev-dependencies]
-agent-tool = { path = "../../crates/agent-tool", version = "0.1.0", default-features = false }
-tempfile = "3"

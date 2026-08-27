@@ -5,10 +5,11 @@ use crate::{
     FileGenomeStore, GenomeDiffError, GenomeStore, GenomeStoreError,
 };
 use agent_evolution_protocol::{
-    ArtifactDigest, EvolutionCycleId, GenomeDigest, GenomeMetadata, GenomeRevision,
+    ArtifactDigest, CandidateId, EvolutionCycleId, GenomeDigest, GenomeMetadata, GenomeRevision,
     GenomeRevisionError, GenomeRevisionId, InvalidMutation, MutationCandidate, MutationProposal,
     MutationSurface, PromptLayer,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     str::Utf8Error,
@@ -54,6 +55,27 @@ impl<'a> CandidateBuilder<'a> {
         &self,
         cycle_id: EvolutionCycleId,
         proposal: &MutationProposal,
+    ) -> Result<MutationCandidate, CandidateBuildError> {
+        let created_at_ms =
+            u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
+                .map_err(|_| CandidateBuildError::TimestampOverflow)?;
+        self.build_at(cycle_id, proposal, created_at_ms).await
+    }
+
+    /// 使用受信调用方给定的创建时间构建 Candidate，供 Cycle 崩溃恢复保持完全相同的 DTO。
+    ///
+    /// `created_at_ms` 必须来自 Cycle 的受信请求时间或控制面时钟，只影响审计元数据，不参与
+    /// Genome 行为摘要。其余校验、幂等身份与只追加副作用和 [`Self::build`] 完全一致。
+    ///
+    /// # Errors
+    ///
+    /// Proposal、Parent、Prompt CAS、真实 Genome Diff、稳定身份或 Store 不满足边界时返回
+    /// [`CandidateBuildError`]。
+    pub async fn build_at(
+        &self,
+        cycle_id: EvolutionCycleId,
+        proposal: &MutationProposal,
+        created_at_ms: u64,
     ) -> Result<MutationCandidate, CandidateBuildError> {
         proposal
             .validate()
@@ -113,7 +135,7 @@ impl<'a> CandidateBuilder<'a> {
 
         let mut candidate_genome = parent.genome.clone();
         candidate_genome.prompt.messages[task_strategy_index].artifact = prompt.digest.clone();
-        let candidate_revision = GenomeRevision::create(
+        let mut candidate_revision = GenomeRevision::create(
             candidate_genome,
             GenomeMetadata {
                 created_at: None,
@@ -121,6 +143,11 @@ impl<'a> CandidateBuilder<'a> {
                 parent: Some(parent.revision_id.clone()),
                 mutation: Some(proposal.mutation_id.clone()),
             },
+        )?;
+        candidate_revision.revision_id = deterministic_revision_id(
+            &cycle_id,
+            &proposal.mutation_id,
+            &candidate_revision.digest,
         )?;
 
         let expected_surfaces = BTreeSet::from([MutationSurface::TaskStrategyPrompt]);
@@ -131,10 +158,7 @@ impl<'a> CandidateBuilder<'a> {
             });
         }
 
-        let created_at_ms =
-            u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
-                .map_err(|_| CandidateBuildError::TimestampOverflow)?;
-        let candidate = MutationCandidate::create(
+        let mut candidate = MutationCandidate::create(
             cycle_id,
             proposal,
             candidate_revision.revision_id.clone(),
@@ -143,10 +167,81 @@ impl<'a> CandidateBuilder<'a> {
             created_at_ms,
         )
         .map_err(CandidateBuildError::InvalidCandidate)?;
+        candidate.candidate_id = deterministic_candidate_id(
+            &candidate.cycle_id,
+            &candidate.mutation_id,
+            &candidate.candidate_revision_id,
+        )?;
+        candidate
+            .validate()
+            .map_err(CandidateBuildError::InvalidCandidate)?;
 
-        self.genome_store.append(&candidate_revision).await?;
+        match self.genome_store.append(&candidate_revision).await {
+            Ok(()) => {}
+            Err(GenomeStoreError::AlreadyExists(existing_id))
+                if existing_id == candidate_revision.revision_id =>
+            {
+                let existing = self
+                    .genome_store
+                    .get(&candidate_revision.revision_id)
+                    .await?
+                    .ok_or_else(|| {
+                        CandidateBuildError::MissingIdempotentRevision(
+                            candidate_revision.revision_id.clone(),
+                        )
+                    })?;
+                if existing != candidate_revision {
+                    return Err(CandidateBuildError::IdempotentRevisionConflict(
+                        candidate_revision.revision_id.clone(),
+                    ));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
         Ok(candidate)
     }
+}
+
+/// 从 Cycle、Mutation 与真实 Genome 摘要派生稳定 Revision ID，支持构建提交点崩溃恢复。
+fn deterministic_revision_id(
+    cycle_id: &EvolutionCycleId,
+    mutation_id: &agent_evolution_protocol::MutationId,
+    digest: &GenomeDigest,
+) -> Result<GenomeRevisionId, CandidateBuildError> {
+    let body = deterministic_id_body(&[
+        b"genome-revision-v1",
+        cycle_id.as_str().as_bytes(),
+        mutation_id.as_str().as_bytes(),
+        digest.as_str().as_bytes(),
+    ]);
+    GenomeRevisionId::new(format!("{}_{}", GenomeRevisionId::PREFIX, body))
+        .map_err(|error| CandidateBuildError::DeterministicId(error.to_string()))
+}
+
+/// 从 Cycle、Mutation 与 Revision 派生稳定 Candidate ID，不包含 Prompt 或用户正文。
+fn deterministic_candidate_id(
+    cycle_id: &EvolutionCycleId,
+    mutation_id: &agent_evolution_protocol::MutationId,
+    revision_id: &GenomeRevisionId,
+) -> Result<CandidateId, CandidateBuildError> {
+    let body = deterministic_id_body(&[
+        b"mutation-candidate-v1",
+        cycle_id.as_str().as_bytes(),
+        mutation_id.as_str().as_bytes(),
+        revision_id.as_str().as_bytes(),
+    ]);
+    CandidateId::new(format!("{}_{}", CandidateId::PREFIX, body))
+        .map_err(|error| CandidateBuildError::DeterministicId(error.to_string()))
+}
+
+/// 对带长度分隔的多个稳定身份字段计算 SHA-256，避免简单拼接歧义。
+fn deterministic_id_body(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// 返回 Parent 中唯一 Task Strategy Prompt 的位置。
@@ -246,6 +341,15 @@ pub enum CandidateBuildError {
     /// Candidate DTO 未通过协议校验。
     #[error("MutationCandidate 无效：{0}")]
     InvalidCandidate(InvalidMutation),
+    /// 稳定身份派生结果违反强类型 ID 契约。
+    #[error("构造 Candidate 稳定身份失败：{0}")]
+    DeterministicId(String),
+    /// 幂等 Revision 已声明存在，但复读时缺失。
+    #[error("幂等 Candidate Genome 修订复读缺失：{0}")]
+    MissingIdempotentRevision(GenomeRevisionId),
+    /// 相同稳定 Revision ID 已被不同 Genome 内容占用。
+    #[error("幂等 Candidate Genome 修订内容冲突：{0}")]
+    IdempotentRevisionConflict(GenomeRevisionId),
     /// 系统时钟早于 Unix Epoch，无法生成 Candidate 时间戳。
     #[error("无法生成 Candidate 时间戳：{0}")]
     Clock(#[from] SystemTimeError),

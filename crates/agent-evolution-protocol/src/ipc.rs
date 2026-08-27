@@ -9,10 +9,12 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-/// 当前 Evaluator 请求协议版本；Evaluate、Promote 与 Rollback 共用该严格版本。
+/// 当前 Evaluator 请求协议版本；Evaluate、Promote、Health 与 Rollback 共用该严格版本。
 pub const EVALUATION_REQUEST_SCHEMA_VERSION: u32 = 1;
 /// 当前 Evaluation Receipt 协议版本。
 pub const EVALUATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
+/// 当前 Health Receipt 协议版本。
+pub const HEALTH_RECEIPT_SCHEMA_VERSION: u32 = 1;
 /// 当前 Release Receipt 协议版本。
 pub const RELEASE_RECEIPT_SCHEMA_VERSION: u32 = 1;
 
@@ -113,6 +115,72 @@ impl RollbackRequestV1 {
     }
 }
 
+/// 请求受信 Evaluator 验证 Promotion 后运行健康状态的最小输入。
+///
+/// 请求只声明 Release 绑定和预期 Stable 状态；真实运行观察由 `lucia-eval` 从受信健康
+/// Store 加载，Evolver 不能通过 IPC 自报成功。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthCheckRequestV1 {
+    /// 请求 schema 版本。
+    pub schema_version: u32,
+    /// 调用方生成的稳定幂等标识；不得包含路径或用户内容。
+    pub request_id: String,
+    /// 正在验证的 Promotion Release。
+    pub release_id: ReleaseId,
+    /// Stable lineage。
+    pub lineage: String,
+    /// Promotion 后应由新运行使用的 Candidate Revision。
+    pub expected_revision_id: GenomeRevisionId,
+    /// Promotion 后预期的 Stable 单调代数。
+    pub expected_generation: u64,
+}
+
+impl HealthCheckRequestV1 {
+    /// 校验 schema、请求 ID 与 lineage；真实 Release 和 Stable 绑定由受信 Evaluator 复核。
+    ///
+    /// # Errors
+    ///
+    /// Schema 未知、请求 ID 或 lineage 非法时返回 [`InvalidEvaluatorIpc`]。
+    pub fn validate(&self) -> Result<(), InvalidEvaluatorIpc> {
+        validate_request_schema(self.schema_version)?;
+        validate_request_id(&self.request_id)?;
+        validate_lineage(&self.lineage)
+    }
+}
+
+/// 受信 Runtime 写入健康 Store 的版本化脱敏观察。
+///
+/// 观察只携带 Release、实际 Genome 和聚合检查计数，不含用户正文、模型输出或 ToolResult。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeHealthObservationV1 {
+    /// 观察 schema 版本，与 Evaluator 请求协议同步演进。
+    pub schema_version: u32,
+    /// 观察所属的 Promotion Release。
+    pub release_id: ReleaseId,
+    /// 新运行实际使用的 Genome Revision。
+    pub observed_revision_id: GenomeRevisionId,
+    /// 通过的受信健康检查数。
+    pub checks_passed: u32,
+    /// 执行的受信健康检查总数；必须大于零。
+    pub checks_total: u32,
+    /// 观察生成的 Unix 毫秒时间。
+    pub observed_at_ms: u64,
+}
+
+impl RuntimeHealthObservationV1 {
+    /// 校验 schema 与聚合计数边界。
+    ///
+    /// # Errors
+    ///
+    /// Schema 未知、检查总数为零或通过数超过总数时返回 [`InvalidEvaluatorIpc`]。
+    pub fn validate(&self) -> Result<(), InvalidEvaluatorIpc> {
+        validate_request_schema(self.schema_version)?;
+        validate_health_counts(self.checks_passed, self.checks_total)
+    }
+}
+
 /// 独立 Evaluator 提交正式 Report Seal 后返回的脱敏回执。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -178,6 +246,69 @@ impl EvaluationReceiptV1 {
             &self.verifier_set_digest,
             MAX_DIGEST_TEXT_BYTES,
         )
+    }
+}
+
+/// Promotion 后健康验证的版本化脱敏回执。
+///
+/// 回执绑定受信 Runtime 观察摘要和 Evaluator 重新读取的 Stable 状态；`verified` 只有在
+/// Stable、Genome、代数与全部健康检查同时通过时才能为 `true`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthCheckReceiptV1 {
+    /// 回执 schema 版本。
+    pub schema_version: u32,
+    /// 对应请求的幂等 ID。
+    pub request_id: String,
+    /// 被验证的 Promotion Release。
+    pub release_id: ReleaseId,
+    /// Stable lineage。
+    pub lineage: String,
+    /// 请求期望的新 Genome Revision。
+    pub expected_revision_id: GenomeRevisionId,
+    /// Evaluator 从 Stable Store 观察到的 Revision。
+    pub observed_revision_id: GenomeRevisionId,
+    /// 请求期望的 Stable 代数。
+    pub expected_generation: u64,
+    /// Evaluator 从 Stable Store 观察到的代数。
+    pub observed_generation: u64,
+    /// 通过的受信健康检查数。
+    pub checks_passed: u32,
+    /// 执行的受信健康检查总数。
+    pub checks_total: u32,
+    /// Runtime 健康观察规范字节的摘要。
+    pub observation_digest: ArtifactDigest,
+    /// Stable 引用是否仍绑定当前 Release、预期 Revision 与代数。
+    pub stable_reference_verified: bool,
+    /// 可信健康验证的最终结论。
+    pub verified: bool,
+}
+
+impl HealthCheckReceiptV1 {
+    /// 校验回执结构和最终结论的一致性。
+    ///
+    /// # Errors
+    ///
+    /// Schema 未知、请求 ID 或 lineage 非法、健康计数越界，或 `verified` 与可复核字段不一致
+    /// 时返回 [`InvalidEvaluatorIpc`]。
+    pub fn validate(&self) -> Result<(), InvalidEvaluatorIpc> {
+        if self.schema_version != HEALTH_RECEIPT_SCHEMA_VERSION {
+            return Err(InvalidEvaluatorIpc::UnsupportedHealthReceiptSchema {
+                found: self.schema_version,
+                supported: HEALTH_RECEIPT_SCHEMA_VERSION,
+            });
+        }
+        validate_request_id(&self.request_id)?;
+        validate_lineage(&self.lineage)?;
+        validate_health_counts(self.checks_passed, self.checks_total)?;
+        let derived = self.stable_reference_verified
+            && self.observed_revision_id == self.expected_revision_id
+            && self.observed_generation == self.expected_generation
+            && self.checks_passed == self.checks_total;
+        if self.verified != derived {
+            return Err(InvalidEvaluatorIpc::InconsistentHealthVerdict);
+        }
+        Ok(())
     }
 }
 
@@ -250,6 +381,14 @@ pub enum InvalidEvaluatorIpc {
         /// 当前版本。
         supported: u32,
     },
+    /// Health Receipt 使用了当前实现无法解释的版本。
+    #[error("不支持的 Health Receipt schema 版本 {found}，当前支持 {supported}")]
+    UnsupportedHealthReceiptSchema {
+        /// 实际版本。
+        found: u32,
+        /// 当前版本。
+        supported: u32,
+    },
     /// Release Receipt schema 不受支持。
     #[error("不支持的 Release Receipt schema 版本 {found}，当前支持 {supported}")]
     UnsupportedReleaseReceiptSchema {
@@ -270,6 +409,17 @@ pub enum InvalidEvaluatorIpc {
     /// Rollback 与原 Promotion 使用同一 Release ID，或回执引用自身。
     #[error("Evaluator IPC 的 Promotion 与 Rollback Release ID 不能相同")]
     SameRelease,
+    /// 健康检查总数为零或通过数超过总数。
+    #[error("健康检查计数无效：passed={passed}，total={total}")]
+    InvalidHealthCounts {
+        /// 通过数。
+        passed: u32,
+        /// 总数。
+        total: u32,
+    },
+    /// Health Receipt 的最终结论与可复核字段不一致。
+    #[error("Health Receipt 的 verified 与 Stable 和检查结果不一致")]
+    InconsistentHealthVerdict,
     /// 稳定版本或摘要字段为空或超过字节上限。
     #[error("Evaluator IPC 字段 `{field}` 必须是非空且不超过 {max_bytes} 字节的文本")]
     InvalidText {
@@ -287,6 +437,14 @@ fn validate_request_schema(schema_version: u32) -> Result<(), InvalidEvaluatorIp
             found: schema_version,
             supported: EVALUATION_REQUEST_SCHEMA_VERSION,
         });
+    }
+    Ok(())
+}
+
+/// 校验健康检查至少执行一项，且通过数不超过总数。
+fn validate_health_counts(passed: u32, total: u32) -> Result<(), InvalidEvaluatorIpc> {
+    if total == 0 || passed > total {
+        return Err(InvalidEvaluatorIpc::InvalidHealthCounts { passed, total });
     }
     Ok(())
 }
@@ -412,6 +570,64 @@ mod tests {
             rollback_release_id: release,
         };
         assert_eq!(rollback.validate(), Err(InvalidEvaluatorIpc::SameRelease));
+    }
+
+    /// Health 请求、Runtime 观察和回执必须严格绑定且不能自报不一致的成功结论。
+    #[test]
+    fn health_ipc_is_strict_and_fail_closed() {
+        let release_id = ReleaseId::generate();
+        let revision_id = GenomeRevisionId::generate();
+        let request = HealthCheckRequestV1 {
+            schema_version: EVALUATION_REQUEST_SCHEMA_VERSION,
+            request_id: "cycle-001-health".to_string(),
+            release_id: release_id.clone(),
+            lineage: "stable/general".to_string(),
+            expected_revision_id: revision_id.clone(),
+            expected_generation: 2,
+        };
+        request.validate().expect("Health 请求应合法");
+        let mut unknown = serde_json::to_value(request).expect("请求应可序列化");
+        unknown["health_store"] = serde_json::json!("/secret");
+        assert!(serde_json::from_value::<HealthCheckRequestV1>(unknown).is_err());
+
+        let observation = RuntimeHealthObservationV1 {
+            schema_version: EVALUATION_REQUEST_SCHEMA_VERSION,
+            release_id: release_id.clone(),
+            observed_revision_id: revision_id.clone(),
+            checks_passed: 2,
+            checks_total: 2,
+            observed_at_ms: 10,
+        };
+        observation.validate().expect("Runtime 观察应合法");
+        let mut invalid_observation = observation;
+        invalid_observation.checks_total = 0;
+        assert!(matches!(
+            invalid_observation.validate(),
+            Err(InvalidEvaluatorIpc::InvalidHealthCounts { .. })
+        ));
+
+        let mut receipt = HealthCheckReceiptV1 {
+            schema_version: HEALTH_RECEIPT_SCHEMA_VERSION,
+            request_id: "cycle-001-health".to_string(),
+            release_id,
+            lineage: "stable/general".to_string(),
+            expected_revision_id: revision_id.clone(),
+            observed_revision_id: revision_id,
+            expected_generation: 2,
+            observed_generation: 2,
+            checks_passed: 2,
+            checks_total: 2,
+            observation_digest: ArtifactDigest::from_sha256_hex("a".repeat(64))
+                .expect("摘要应合法"),
+            stable_reference_verified: true,
+            verified: true,
+        };
+        receipt.validate().expect("Health 回执应合法");
+        receipt.checks_passed = 1;
+        assert_eq!(
+            receipt.validate(),
+            Err(InvalidEvaluatorIpc::InconsistentHealthVerdict)
+        );
     }
 
     /// Release Receipt 必须版本化、严格反序列化并证明 Revision 确实发生切换。

@@ -13,7 +13,8 @@ use agent_evolution::{
     FileEvaluationReportStore,
 };
 use agent_evolution_protocol::{
-    ArtifactDigest, AuditRecordId, EvaluationReport, EvaluationReportId,
+    ArtifactDigest, AuditRecordId, EvaluationReport, EvaluationReportId, EvaluationRequestV1,
+    InvalidEvaluatorIpc,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +23,163 @@ use tokio::{fs, io::AsyncWriteExt};
 
 /// 当前可信 Evaluation Seal schema 版本。
 pub const EVALUATION_SEAL_SCHEMA_VERSION: u32 = 1;
+/// 当前 Evaluation request_id 绑定记录 schema 版本。
+pub const EVALUATION_REQUEST_BINDING_SCHEMA_VERSION: u32 = 1;
+/// 当前 Prepared Evaluation Journal schema 版本。
+pub const PREPARED_EVALUATION_SCHEMA_VERSION: u32 = 1;
+/// 单个请求绑定记录允许的最大字节数，防止损坏文件造成无界内存占用。
+const MAX_REQUEST_BINDING_BYTES: u64 = 64 * 1024;
+/// 单个 Prepared Journal 允许的最大字节数，覆盖大规模评测报告并限制损坏文件读取。
+const MAX_PREPARED_EVALUATION_BYTES: u64 = 256 * 1024 * 1024;
+
+/// 一个 `request_id` 对应的不可变正式报告身份。
+///
+/// 请求正文与固定 `report_id/generated_at_ms` 一起使用 create-new 语义写入归档。相同请求
+/// 重试复用该身份，不同请求不得占用同一个 `request_id`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationRequestBinding {
+    /// 绑定记录 schema 版本。
+    pub schema_version: u32,
+    /// 完整、已校验的共享 Evaluator 请求。
+    pub request: EvaluationRequestV1,
+    /// 此请求唯一对应的正式报告标识。
+    pub report_id: EvaluationReportId,
+    /// 此请求唯一对应的报告生成时间，使用 Unix 毫秒。
+    pub generated_at_ms: u64,
+}
+
+impl EvaluationRequestBinding {
+    /// 校验版本、共享请求以及固定身份字段。
+    ///
+    /// # Errors
+    ///
+    /// schema 或共享请求无效时返回 [`EvaluationArchiveError`]。
+    pub fn validate(&self) -> Result<(), EvaluationArchiveError> {
+        if self.schema_version != EVALUATION_REQUEST_BINDING_SCHEMA_VERSION {
+            return Err(EvaluationArchiveError::UnsupportedRequestBindingSchema(
+                self.schema_version,
+            ));
+        }
+        self.request
+            .validate()
+            .map_err(EvaluationArchiveError::InvalidRequest)
+    }
+
+    /// 复核已 Seal 报告确实属于本请求。
+    fn validate_report(&self, report: &EvaluationReport) -> Result<(), EvaluationArchiveError> {
+        let expected_candidate_generation = self
+            .request
+            .expected_parent_generation
+            .checked_add(1)
+            .ok_or(EvaluationArchiveError::RequestGenerationOverflow)?;
+        if report.report_id != self.report_id
+            || report.generated_at_ms != self.generated_at_ms
+            || report.parent.genome_revision != self.request.parent_revision_id
+            || report.candidate.genome_revision != self.request.candidate_revision_id
+            || report.lineage.as_deref() != Some(self.request.lineage.as_str())
+            || report.parent_generation != Some(self.request.expected_parent_generation)
+            || report.candidate_generation != Some(expected_candidate_generation)
+        {
+            return Err(EvaluationArchiveError::RequestReportMismatch(
+                self.request.request_id.clone(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Runner 完成后、Report 提交前持久化的完整可恢复评测制品索引。
+///
+/// 公开报告与 Gate 直接进入 Journal；完整私有录制先写入不可变 CAS，再由摘要绑定。只要该
+/// 记录提交成功，Report、Audit 或 Seal 任一后续提交点中断都无需再次执行 Runner。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedEvaluationJournal {
+    /// Prepared Journal schema 版本。
+    schema_version: u32,
+    /// 绑定的共享 Evaluate 请求标识。
+    request_id: String,
+    /// 已裁剪 Hidden 逐 Case 内容的正式公开报告。
+    report: EvaluationReport,
+    /// 受信 Builder 计算的完整聚合 Gate。
+    gate: CommitGateOutcome,
+    /// 生成 Gate 时使用的 Commit Policy 版本。
+    commit_policy_version: String,
+    /// 已先行写入私有 CAS 的完整录制摘要。
+    private_artifact_digest: ArtifactDigest,
+    /// 覆盖前述全部字段的稳定摘要。
+    journal_digest: ArtifactDigest,
+}
+
+impl PreparedEvaluationJournal {
+    /// 从 Builder 结果创建绑定请求的 Prepared Journal。
+    fn create(
+        binding: &EvaluationRequestBinding,
+        trusted: &TrustedEvaluationReport,
+    ) -> Result<Self, EvaluationArchiveError> {
+        binding.validate_report(trusted.report())?;
+        let mut journal = Self {
+            schema_version: PREPARED_EVALUATION_SCHEMA_VERSION,
+            request_id: binding.request.request_id.clone(),
+            report: trusted.report().clone(),
+            gate: trusted.gate().clone(),
+            commit_policy_version: trusted.commit_policy_version().to_string(),
+            private_artifact_digest: trusted.private_artifact_digest().clone(),
+            journal_digest: digest_bytes(&[])?,
+        };
+        journal.journal_digest = journal.compute_digest()?;
+        Ok(journal)
+    }
+
+    /// 校验 schema、请求绑定、自身摘要以及报告的请求身份。
+    fn validate(&self, binding: &EvaluationRequestBinding) -> Result<(), EvaluationArchiveError> {
+        if self.schema_version != PREPARED_EVALUATION_SCHEMA_VERSION {
+            return Err(EvaluationArchiveError::UnsupportedPreparedEvaluationSchema(
+                self.schema_version,
+            ));
+        }
+        if self.request_id != binding.request.request_id {
+            return Err(EvaluationArchiveError::PreparedEvaluationRequestMismatch(
+                binding.request.request_id.clone(),
+            ));
+        }
+        binding.validate_report(&self.report)?;
+        let actual = self.compute_digest()?;
+        if actual != self.journal_digest {
+            return Err(EvaluationArchiveError::PreparedEvaluationDigestMismatch {
+                declared: self.journal_digest.clone(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    /// 计算不包含 `journal_digest` 字段的稳定摘要。
+    fn compute_digest(&self) -> Result<ArtifactDigest, EvaluationArchiveError> {
+        #[derive(Serialize)]
+        struct DigestInput<'a> {
+            schema_version: u32,
+            request_id: &'a str,
+            report: &'a EvaluationReport,
+            gate: &'a CommitGateOutcome,
+            commit_policy_version: &'a str,
+            private_artifact_digest: &'a ArtifactDigest,
+        }
+
+        digest_bytes(
+            &serde_json::to_vec(&DigestInput {
+                schema_version: self.schema_version,
+                request_id: &self.request_id,
+                report: &self.report,
+                gate: &self.gate,
+                commit_policy_version: &self.commit_policy_version,
+                private_artifact_digest: &self.private_artifact_digest,
+            })
+            .map_err(EvaluationArchiveError::Serialize)?,
+        )
+    }
+}
 
 /// 报告提交完成后生成的不可变 Seal。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,6 +318,235 @@ impl TrustedEvaluationArchive {
     /// 返回共用的只追加 Audit Log，供同一受信控制面的 Release 事件使用。
     pub fn audit_log(&self) -> &FileAuditLog {
         &self.audit
+    }
+
+    /// 以 create-new-or-same 语义固定一次 Evaluate 请求的报告身份。
+    ///
+    /// 首次调用生成并持久化 `report_id`；相同请求重试返回已有绑定，并忽略新的时间参数。
+    /// 不同请求复用同一 `request_id` 时失败关闭。该记录先于 Runner 执行创建，用于把随后
+    /// 持久化的完整 Prepared Evaluation 绑定到同一正式身份。
+    ///
+    /// # Errors
+    ///
+    /// 请求无效、现有绑定损坏或冲突、路径不安全、记录过大或 I/O 失败时返回
+    /// [`EvaluationArchiveError`]。
+    pub async fn bind_request(
+        &self,
+        request: &EvaluationRequestV1,
+        generated_at_ms: u64,
+    ) -> Result<EvaluationRequestBinding, EvaluationArchiveError> {
+        request
+            .validate()
+            .map_err(EvaluationArchiveError::InvalidRequest)?;
+        let bindings = self.root.join("requests");
+        ensure_safe_directory(&self.root).await?;
+        ensure_safe_directory(&bindings).await?;
+        let path = bindings.join(format!("{}.json", request.request_id));
+        let proposed = EvaluationRequestBinding {
+            schema_version: EVALUATION_REQUEST_BINDING_SCHEMA_VERSION,
+            request: request.clone(),
+            report_id: EvaluationReportId::generate(),
+            generated_at_ms,
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&proposed).map_err(EvaluationArchiveError::Serialize)?;
+        if bytes.len() as u64 > MAX_REQUEST_BINDING_BYTES {
+            return Err(EvaluationArchiveError::RequestBindingTooLarge {
+                actual: bytes.len() as u64,
+                maximum: MAX_REQUEST_BINDING_BYTES,
+            });
+        }
+        let temporary = bindings.join(format!(".{}.tmp", proposed.report_id));
+        let commit = async {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .await
+                .map_err(|source| {
+                    io_error("创建 Evaluation 请求绑定临时文件", &temporary, source)
+                })?;
+            file.write_all(&bytes).await.map_err(|source| {
+                io_error("写入 Evaluation 请求绑定临时文件", &temporary, source)
+            })?;
+            file.sync_all().await.map_err(|source| {
+                io_error("同步 Evaluation 请求绑定临时文件", &temporary, source)
+            })?;
+            drop(file);
+            fs::hard_link(&temporary, &path)
+                .await
+                .map_err(|source| io_error("提交 Evaluation 请求绑定", &path, source))
+        }
+        .await;
+        let _ = fs::remove_file(&temporary).await;
+        match commit {
+            Ok(()) => Ok(proposed),
+            Err(EvaluationArchiveError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                let existing = self.read_request_binding(&path).await?;
+                if existing.request == *request {
+                    Ok(existing)
+                } else {
+                    Err(EvaluationArchiveError::RequestBindingConflict(
+                        request.request_id.clone(),
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 读取并验证指定请求已经完成 Seal 的正式报告。
+    ///
+    /// # Errors
+    ///
+    /// Seal 尚未提交，或报告与请求身份、lineage 和代数不一致时返回错误。
+    pub async fn get_verified_for_request(
+        &self,
+        binding: &EvaluationRequestBinding,
+    ) -> Result<VerifiedEvaluation, EvaluationArchiveError> {
+        binding.validate()?;
+        let verified = self.get_verified(&binding.report_id).await?;
+        binding.validate_report(verified.report())?;
+        Ok(verified)
+    }
+
+    /// 在启动 Report/Audit/Seal 提交前持久化完整可恢复评测结果。
+    ///
+    /// 私有录制先写入不可变 CAS，随后以 create-new-or-same 语义提交 Prepared Journal。
+    /// 相同请求和相同内容可幂等重试；同一请求产生不同结果时失败关闭。
+    ///
+    /// # Errors
+    ///
+    /// 请求与报告不绑定、私有录制摘要不匹配、现有 Journal 冲突或损坏、路径不安全、
+    /// Journal 过大或 I/O 失败时返回 [`EvaluationArchiveError`]。
+    pub async fn prepare_for_request(
+        &self,
+        binding: &EvaluationRequestBinding,
+        trusted: &TrustedEvaluationReport,
+    ) -> Result<(), EvaluationArchiveError> {
+        binding.validate()?;
+        let private_artifact = self
+            .private_artifacts
+            .put(
+                "application/vnd.lucia.evaluation-recordings+json",
+                trusted.private_artifact_bytes(),
+            )
+            .await?;
+        if private_artifact.digest != *trusted.private_artifact_digest() {
+            return Err(EvaluationArchiveError::PrivateArtifactDigestMismatch);
+        }
+
+        let journal = PreparedEvaluationJournal::create(binding, trusted)?;
+        let bytes =
+            serde_json::to_vec_pretty(&journal).map_err(EvaluationArchiveError::Serialize)?;
+        if bytes.len() as u64 > MAX_PREPARED_EVALUATION_BYTES {
+            return Err(EvaluationArchiveError::PreparedEvaluationTooLarge {
+                actual: bytes.len() as u64,
+                maximum: MAX_PREPARED_EVALUATION_BYTES,
+            });
+        }
+        let journals = self.root.join("prepared");
+        ensure_safe_directory(&self.root).await?;
+        ensure_safe_directory(&journals).await?;
+        let path = journals.join(format!("{}.json", binding.request.request_id));
+        let temporary = journals.join(format!(
+            ".{}.{}.tmp",
+            binding.request.request_id,
+            EvaluationReportId::generate()
+        ));
+        let commit = async {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .await
+                .map_err(|source| {
+                    io_error("创建 Prepared Evaluation 临时文件", &temporary, source)
+                })?;
+            file.write_all(&bytes).await.map_err(|source| {
+                io_error("写入 Prepared Evaluation 临时文件", &temporary, source)
+            })?;
+            file.sync_all().await.map_err(|source| {
+                io_error("同步 Prepared Evaluation 临时文件", &temporary, source)
+            })?;
+            drop(file);
+            fs::hard_link(&temporary, &path)
+                .await
+                .map_err(|source| io_error("提交 Prepared Evaluation", &path, source))
+        }
+        .await;
+        let _ = fs::remove_file(&temporary).await;
+        match commit {
+            Ok(()) => Ok(()),
+            Err(EvaluationArchiveError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                let existing = self.read_prepared_journal(binding, &path).await?;
+                if existing == journal {
+                    Ok(())
+                } else {
+                    Err(EvaluationArchiveError::PreparedEvaluationConflict(
+                        binding.request.request_id.clone(),
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 读取并完整验证某请求已持久化的 Prepared Evaluation。
+    ///
+    /// 本方法会验证 Journal 摘要、请求与报告身份，并从私有 CAS 恢复完整录制；不会执行
+    /// Dataset 加载、模型 Fixture 或 Runner。
+    ///
+    /// # Errors
+    ///
+    /// Prepared Journal 尚不存在、记录损坏或冲突、私有制品缺失或摘要不一致时返回
+    /// [`EvaluationArchiveError`]。
+    pub async fn get_prepared_for_request(
+        &self,
+        binding: &EvaluationRequestBinding,
+    ) -> Result<TrustedEvaluationReport, EvaluationArchiveError> {
+        binding.validate()?;
+        let journals = self.root.join("prepared");
+        ensure_safe_directory(&self.root).await?;
+        ensure_safe_directory(&journals).await?;
+        let path = journals.join(format!("{}.json", binding.request.request_id));
+        let journal = self.read_prepared_journal(binding, &path).await?;
+        let private_artifact = self
+            .private_artifacts
+            .get(&journal.private_artifact_digest)
+            .await?
+            .ok_or_else(|| {
+                EvaluationArchiveError::PrivateArtifactNotFound(
+                    journal.private_artifact_digest.clone(),
+                )
+            })?;
+        let trusted = TrustedEvaluationReport::restore_prepared(
+            journal.report,
+            journal.gate,
+            journal.commit_policy_version,
+            journal.private_artifact_digest,
+            private_artifact,
+        )?;
+        binding.validate_report(trusted.report())?;
+        Ok(trusted)
+    }
+
+    /// 从 Prepared Journal 恢复结果并继续完成 Report、Audit 与 Seal 提交。
+    ///
+    /// # Errors
+    ///
+    /// Prepared 恢复或任一正式提交步骤失败时返回 [`EvaluationArchiveError`]。
+    pub async fn commit_prepared_for_request(
+        &self,
+        binding: &EvaluationRequestBinding,
+        occurred_at_ms: u64,
+    ) -> Result<VerifiedEvaluation, EvaluationArchiveError> {
+        let trusted = self.get_prepared_for_request(binding).await?;
+        self.commit(&trusted, occurred_at_ms).await
     }
 
     /// 提交正式 Report、Audit 记录与最终 Seal。
@@ -356,11 +743,133 @@ impl TrustedEvaluationArchive {
         serde_json::from_slice(&bytes)
             .map_err(|source| EvaluationArchiveError::InvalidJson { path, source })
     }
+
+    /// 读取一个有大小上限的非符号链接请求绑定文件。
+    async fn read_request_binding(
+        &self,
+        path: &Path,
+    ) -> Result<EvaluationRequestBinding, EvaluationArchiveError> {
+        let metadata = fs::symlink_metadata(path)
+            .await
+            .map_err(|source| io_error("检查 Evaluation 请求绑定", path, source))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(EvaluationArchiveError::UnsafePath(path.to_path_buf()));
+        }
+        if metadata.len() > MAX_REQUEST_BINDING_BYTES {
+            return Err(EvaluationArchiveError::RequestBindingTooLarge {
+                actual: metadata.len(),
+                maximum: MAX_REQUEST_BINDING_BYTES,
+            });
+        }
+        let bytes = fs::read(path)
+            .await
+            .map_err(|source| io_error("读取 Evaluation 请求绑定", path, source))?;
+        let binding: EvaluationRequestBinding =
+            serde_json::from_slice(&bytes).map_err(|source| {
+                EvaluationArchiveError::InvalidJson {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    /// 有界读取并验证请求对应的 Prepared Journal。
+    async fn read_prepared_journal(
+        &self,
+        binding: &EvaluationRequestBinding,
+        path: &Path,
+    ) -> Result<PreparedEvaluationJournal, EvaluationArchiveError> {
+        let metadata = match fs::symlink_metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(EvaluationArchiveError::PreparedEvaluationNotFound(
+                    binding.request.request_id.clone(),
+                ));
+            }
+            Err(source) => {
+                return Err(io_error("检查 Prepared Evaluation", path, source));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(EvaluationArchiveError::UnsafePath(path.to_path_buf()));
+        }
+        if metadata.len() > MAX_PREPARED_EVALUATION_BYTES {
+            return Err(EvaluationArchiveError::PreparedEvaluationTooLarge {
+                actual: metadata.len(),
+                maximum: MAX_PREPARED_EVALUATION_BYTES,
+            });
+        }
+        let bytes = fs::read(path)
+            .await
+            .map_err(|source| io_error("读取 Prepared Evaluation", path, source))?;
+        let journal: PreparedEvaluationJournal =
+            serde_json::from_slice(&bytes).map_err(|source| {
+                EvaluationArchiveError::InvalidJson {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+        journal.validate(binding)?;
+        Ok(journal)
+    }
 }
 
 /// Evaluation Archive 提交、Seal 与验证错误。
 #[derive(Debug, thiserror::Error)]
 pub enum EvaluationArchiveError {
+    /// request_id 绑定记录 schema 超出当前实现。
+    #[error("不支持的 Evaluation 请求绑定 schema：{0}")]
+    UnsupportedRequestBindingSchema(u32),
+    /// 共享 Evaluate 请求未通过协议校验。
+    #[error("Evaluation 请求无效：{0}")]
+    InvalidRequest(InvalidEvaluatorIpc),
+    /// 同一 request_id 已绑定另一份请求。
+    #[error("Evaluation request_id 已被不同请求占用：{0}")]
+    RequestBindingConflict(String),
+    /// 请求绑定与已 Seal 报告不一致。
+    #[error("Evaluation 请求绑定与正式报告不一致：{0}")]
+    RequestReportMismatch(String),
+    /// 请求的 Parent 代数无法生成 Candidate 代数。
+    #[error("Evaluation 请求代数溢出")]
+    RequestGenerationOverflow,
+    /// 请求绑定文件超过受信读取上限。
+    #[error("Evaluation 请求绑定过大：{actual} 字节，上限 {maximum} 字节")]
+    RequestBindingTooLarge {
+        /// 实际文件或序列化字节数。
+        actual: u64,
+        /// 固定读取上限。
+        maximum: u64,
+    },
+    /// Prepared Journal schema 超出当前实现。
+    #[error("不支持的 Prepared Evaluation schema：{0}")]
+    UnsupportedPreparedEvaluationSchema(u32),
+    /// 请求尚未持久化可恢复的 Prepared Evaluation。
+    #[error("Prepared Evaluation 不存在：{0}")]
+    PreparedEvaluationNotFound(String),
+    /// 同一请求已绑定另一份 Prepared Evaluation。
+    #[error("Prepared Evaluation 已被不同内容占用：{0}")]
+    PreparedEvaluationConflict(String),
+    /// Prepared Journal 的请求或报告身份与绑定不一致。
+    #[error("Prepared Evaluation 与请求绑定不一致：{0}")]
+    PreparedEvaluationRequestMismatch(String),
+    /// Prepared Journal 自身摘要不匹配。
+    #[error("Prepared Evaluation 摘要不匹配：声明 {declared}，实际 {actual}")]
+    PreparedEvaluationDigestMismatch {
+        /// Journal 声明摘要。
+        declared: ArtifactDigest,
+        /// 重新计算的实际摘要。
+        actual: ArtifactDigest,
+    },
+    /// Prepared Journal 超过受信读取上限。
+    #[error("Prepared Evaluation 过大：{actual} 字节，上限 {maximum} 字节")]
+    PreparedEvaluationTooLarge {
+        /// 实际文件或序列化字节数。
+        actual: u64,
+        /// 固定读取上限。
+        maximum: u64,
+    },
     /// Seal schema 超出当前实现。
     #[error("不支持的 Evaluation Seal schema：{0}")]
     UnsupportedSealSchema(u32),
@@ -407,8 +916,8 @@ pub enum EvaluationArchiveError {
     /// 路径是符号链接或不是预期类型。
     #[error("Evaluation Archive 路径不安全：{0}")]
     UnsafePath(PathBuf),
-    /// Seal JSON 损坏。
-    #[error("Evaluation Seal JSON 损坏 `{path}`：{source}")]
+    /// Archive JSON 制品损坏。
+    #[error("Evaluation Archive JSON 损坏 `{path}`：{source}")]
     InvalidJson {
         /// 损坏文件路径。
         path: PathBuf,

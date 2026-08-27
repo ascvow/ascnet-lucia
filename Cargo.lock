@@ -1788,11 +1788,25 @@ dependencies = [
  "agent-evaluation",
  "agent-evolution",
  "agent-evolution-protocol",
+ "agent-tool",
  "anyhow",
  "clap",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "lucia-evolve"
+version = "0.1.0"
+dependencies = [
+ "agent-evolution",
+ "agent-evolution-protocol",
+ "clap",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

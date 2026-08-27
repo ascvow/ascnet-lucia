@@ -265,6 +265,32 @@ async fn builds_and_persists_exact_task_strategy_candidate() {
     assert!(!genome_json.contains(prompt_text));
 }
 
+/// 相同 Cycle 与 Proposal 在提交点后重试必须返回同一 Candidate，且不能追加孤立 Revision。
+#[tokio::test]
+async fn retries_candidate_build_idempotently() {
+    let fixture = Fixture::new(1).await;
+    let prompt = fixture
+        .artifacts
+        .put("text/plain", CANDIDATE_PROMPT)
+        .await
+        .expect("Candidate Prompt 应写入 CAS");
+    let proposal = fixture.proposal(prompt);
+    let cycle_id = EvolutionCycleId::generate();
+    let builder = CandidateBuilder::new(&fixture.genomes, &fixture.artifacts);
+
+    let first = builder
+        .build_at(cycle_id.clone(), &proposal, 1_000)
+        .await
+        .expect("首次构建应成功");
+    let retried = builder
+        .build_at(cycle_id, &proposal, 1_000)
+        .await
+        .expect("相同构建重试应幂等成功");
+
+    assert_eq!(retried, first);
+    assert_eq!(revision_file_count(&fixture.genomes).await, 2);
+}
+
 /// Builder 必须拒绝不存在或摘要错绑的 Parent，且不得追加孤立修订。
 #[tokio::test]
 async fn rejects_missing_or_mismatched_parent_without_append() {

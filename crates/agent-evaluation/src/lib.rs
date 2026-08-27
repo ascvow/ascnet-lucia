@@ -9,6 +9,7 @@ pub mod audit;
 pub mod dataset;
 pub mod fixture;
 pub mod gate;
+pub mod health;
 pub mod model;
 pub mod protocol;
 pub mod release;
@@ -17,8 +18,9 @@ pub mod runner;
 pub mod verifier;
 
 pub use archive::{
-    EvaluationArchiveError, EvaluationSeal, TrustedEvaluationArchive, VerifiedEvaluation,
-    EVALUATION_SEAL_SCHEMA_VERSION,
+    EvaluationArchiveError, EvaluationRequestBinding, EvaluationSeal, TrustedEvaluationArchive,
+    VerifiedEvaluation, EVALUATION_REQUEST_BINDING_SCHEMA_VERSION, EVALUATION_SEAL_SCHEMA_VERSION,
+    PREPARED_EVALUATION_SCHEMA_VERSION,
 };
 pub use audit::{
     AuditEvent, AuditRecord, AuditStoreError, AuditVerification, FileAuditLog,
@@ -39,6 +41,11 @@ pub use gate::{
     DatasetComparisonMetrics, EvaluationIntegrity, SafetyGateMetrics, TrustedEvaluationMetrics,
     COMMIT_POLICY_VERSION,
 };
+pub use health::{
+    FileRuntimeHealthObservationStore, ReleaseHealthVerificationError, ReleaseHealthVerifier,
+    RuntimeHealthStoreError, VerifiedRuntimeHealthObservation,
+    MAX_RUNTIME_HEALTH_OBSERVATION_BYTES,
+};
 pub use model::{
     ModelExchange, ModelFixture, ModelFixtureInteraction, ModelMock, ModelRequestMatcher,
     RecordingModel, ReplayModel, MODEL_FIXTURE_SCHEMA_VERSION,
@@ -46,8 +53,8 @@ pub use model::{
 pub use protocol::{ProtocolDifference, ProtocolTrace, ProtocolTraceEntry, ProtocolTraceError};
 pub use release::{ReleaseController, ReleaseError, ReleaseReceipt};
 pub use report::{
-    evaluation_report_digest, EvaluationReportBuilder, EvaluationReportMetadata, ReportBuildError,
-    TrustedEvaluationReport,
+    evaluation_report_digest, EvaluationReportBuilder, EvaluationReportIdentity,
+    EvaluationReportMetadata, ReportBuildError, TrustedEvaluationReport,
 };
 pub use runner::{
     ComparativeEvaluation, ComparativeRunner, ComparativeRunnerConfig, EvaluationAssurances,

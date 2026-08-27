@@ -24,6 +24,19 @@ pub struct EvaluationReportMetadata {
     pub generated_at_ms: u64,
 }
 
+/// 由受信请求绑定层预先分配的正式报告身份。
+///
+/// `report_id` 与 `generated_at_ms` 必须在同一 `request_id` 的全部重试中保持不变，避免
+/// 部分提交恢复时生成另一个报告身份。普通调用方应继续使用
+/// [`EvaluationReportBuilder::build`]，只有持久化请求绑定的控制面才能构造本类型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationReportIdentity {
+    /// 固定的正式报告标识。
+    pub report_id: EvaluationReportId,
+    /// 固定的报告生成时间，使用 Unix 毫秒。
+    pub generated_at_ms: u64,
+}
+
 /// 正式报告及其不含 Hidden 正文的 Gate 诊断。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrustedEvaluationReport {
@@ -64,6 +77,41 @@ impl TrustedEvaluationReport {
     pub(crate) fn private_artifact_bytes(&self) -> &[u8] {
         &self.private_artifact
     }
+
+    /// 从 Prepared Journal 绑定的公开报告、Gate 与私有录制制品恢复可信报告。
+    ///
+    /// 本入口只供 Archive 在进程重启后恢复 Runner 已完成的结果；它会重新校验协议报告、
+    /// Gate 决策、Policy 版本与私有录制摘要，避免把损坏的 Prepared 制品继续提交为 Seal。
+    ///
+    /// # Errors
+    ///
+    /// 报告结构、Gate 绑定、Policy 版本或私有录制摘要不合法时返回
+    /// [`ReportBuildError`]。
+    pub(crate) fn restore_prepared(
+        report: EvaluationReport,
+        gate: CommitGateOutcome,
+        commit_policy_version: String,
+        private_artifact_digest: ArtifactDigest,
+        private_artifact: Vec<u8>,
+    ) -> Result<Self, ReportBuildError> {
+        report.validate()?;
+        if report.gate_decision != gate.decision || report.lifecycle != gate.lifecycle {
+            return Err(ReportBuildError::PreparedGateMismatch);
+        }
+        if commit_policy_version.is_empty() {
+            return Err(ReportBuildError::MissingPreparedCommitPolicyVersion);
+        }
+        if digest_bytes(&private_artifact)? != private_artifact_digest {
+            return Err(ReportBuildError::PreparedPrivateArtifactDigestMismatch);
+        }
+        Ok(Self {
+            report,
+            gate,
+            commit_policy_version,
+            private_artifact_digest,
+            private_artifact,
+        })
+    }
 }
 
 /// 固定使用只读 Commit Policy 的正式报告构建器。
@@ -102,6 +150,32 @@ impl EvaluationReportBuilder {
         candidate: &GenomeRevision,
         metadata: EvaluationReportMetadata,
     ) -> Result<TrustedEvaluationReport, ReportBuildError> {
+        let identity = EvaluationReportIdentity {
+            report_id: EvaluationReportId::generate(),
+            generated_at_ms: metadata.generated_at_ms,
+        };
+        self.build_with_fixed_identity(comparison, parent, candidate, metadata, identity)
+    }
+
+    /// 使用请求绑定层持久化的固定身份构造正式报告。
+    ///
+    /// 除报告 ID 与生成时间由 `identity` 提供外，校验、可信差异、Gate、Hidden 数据裁剪和
+    /// 私有录制绑定均与 [`Self::build`] 完全一致。本入口不会信任 Candidate 自报身份，调用方
+    /// 必须先通过只追加请求 Store 固定 `identity`。
+    ///
+    /// # Errors
+    ///
+    /// Genome、Runner 绑定、可信保证、差异、Gate 或最终报告不合法时返回
+    /// [`ReportBuildError`]。
+    pub fn build_with_fixed_identity(
+        &self,
+        comparison: &ComparativeEvaluation,
+        parent: &GenomeRevision,
+        candidate: &GenomeRevision,
+        mut metadata: EvaluationReportMetadata,
+        identity: EvaluationReportIdentity,
+    ) -> Result<TrustedEvaluationReport, ReportBuildError> {
+        metadata.generated_at_ms = identity.generated_at_ms;
         parent
             .validate()
             .map_err(|source| ReportBuildError::InvalidParent { source })?;
@@ -144,7 +218,7 @@ impl EvaluationReportBuilder {
             .retain(|case| case.metadata.dataset_kind != DatasetKind::Hidden);
         let report = EvaluationReport {
             schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
-            report_id: EvaluationReportId::generate(),
+            report_id: identity.report_id,
             lineage: metadata.lineage,
             parent_generation: metadata.parent_generation,
             candidate_generation: metadata.candidate_generation,
@@ -262,6 +336,15 @@ pub enum ReportBuildError {
     /// SHA-256 文本无法构造成协议摘要。
     #[error("构造正式 EvaluationReport 摘要失败：{0}")]
     InvalidDigest(String),
+    /// Prepared Gate 的决策或生命周期与正式报告不一致。
+    #[error("Prepared Evaluation Gate 与正式报告不一致")]
+    PreparedGateMismatch,
+    /// Prepared 制品缺少生成报告时使用的 Commit Policy 版本。
+    #[error("Prepared Evaluation 缺少 Commit Policy 版本")]
+    MissingPreparedCommitPolicyVersion,
+    /// Prepared 私有录制正文与声明的摘要不一致。
+    #[error("Prepared Evaluation 私有录制摘要不一致")]
+    PreparedPrivateArtifactDigestMismatch,
 }
 
 #[cfg(test)]
@@ -274,10 +357,11 @@ mod tests {
         FileGenomeResolver, FileStableGenomePublisher, GenomeResolver, GenomeSelector, GenomeStore,
     };
     use agent_evolution_protocol::{
-        AgentGenome, DatasetVersionId, EvaluationEnvironment, EvaluationRun, EvaluationRunId,
-        EvaluationUsage, GateDecision, GenomeMetadata, ModelGenome, PromptArtifactRef,
-        PromptGenome, PromptLayer, RunId, RuntimeIdentity, SafetyAttemptSummary, TaskAttemptResult,
-        TaskAttemptStatus, TaskCaseMetadata, TaskCaseResult, ToolProfileGenome,
+        AgentGenome, DatasetVersionId, EvaluationEnvironment, EvaluationRequestV1, EvaluationRun,
+        EvaluationRunId, EvaluationUsage, GateDecision, GenomeMetadata, GenomeRevisionId,
+        ModelGenome, PromptArtifactRef, PromptGenome, PromptLayer, RunId, RuntimeIdentity,
+        SafetyAttemptSummary, TaskAttemptResult, TaskAttemptStatus, TaskCaseMetadata,
+        TaskCaseResult, ToolProfileGenome, EVALUATION_REQUEST_SCHEMA_VERSION,
         GENOME_SCHEMA_VERSION,
     };
     use agent_tool::ExecutionPolicy;
@@ -498,6 +582,45 @@ mod tests {
         assert!(!json.contains("hidden-secret-case"));
     }
 
+    /// 请求恢复入口必须使用持久化身份覆盖调用方元数据中的瞬时时间。
+    #[test]
+    fn fixed_identity_is_preserved_across_rebuilds() {
+        let parent = revision("parent");
+        let candidate = revision("candidate");
+        let comparison = comparison(&parent, &candidate);
+        let identity = EvaluationReportIdentity {
+            report_id: EvaluationReportId::generate(),
+            generated_at_ms: 42,
+        };
+        let builder = EvaluationReportBuilder::default();
+        let first = builder
+            .build_with_fixed_identity(
+                &comparison,
+                &parent,
+                &candidate,
+                metadata(),
+                identity.clone(),
+            )
+            .expect("首次固定身份构建应成功");
+        let mut later_metadata = metadata();
+        later_metadata.generated_at_ms = 9_999;
+        let rebuilt = builder
+            .build_with_fixed_identity(
+                &comparison,
+                &parent,
+                &candidate,
+                later_metadata,
+                identity.clone(),
+            )
+            .expect("重建应复用固定身份");
+
+        assert_eq!(first.report().report_id, identity.report_id);
+        assert_eq!(rebuilt.report().report_id, identity.report_id);
+        assert_eq!(first.report().generated_at_ms, 42);
+        assert_eq!(rebuilt.report().generated_at_ms, 42);
+        assert_eq!(first.report(), rebuilt.report());
+    }
+
     /// Runner 实际 Prompt 摘要与 Genome 不一致时必须失败关闭。
     #[test]
     fn rejects_strategy_artifact_mismatch() {
@@ -616,6 +739,212 @@ mod tests {
             .get_verified(&trusted.report().report_id)
             .await
             .is_err());
+    }
+
+    /// request_id 重试必须优先复用固定身份和已完成 Seal，冲突请求不得覆盖绑定。
+    #[tokio::test]
+    async fn archive_binds_request_identity_and_returns_sealed_retry() {
+        let parent = revision("parent");
+        let candidate = revision("candidate");
+        let root = TempDir::new().expect("创建 Evaluation Archive");
+        let archive = TrustedEvaluationArchive::new(root.path());
+        let request = EvaluationRequestV1 {
+            schema_version: EVALUATION_REQUEST_SCHEMA_VERSION,
+            request_id: "evaluation-retry-001".to_string(),
+            parent_revision_id: parent.revision_id.clone(),
+            candidate_revision_id: candidate.revision_id.clone(),
+            lineage: "stable/test".to_string(),
+            expected_parent_generation: 1,
+            expected_dataset_version: DatasetVersionId::new("dsv_repair000")
+                .expect("测试 Dataset ID 合法"),
+        };
+        let binding = archive
+            .bind_request(&request, 42)
+            .await
+            .expect("首次请求应固定身份");
+        assert!(matches!(
+            archive.get_verified_for_request(&binding).await,
+            Err(crate::EvaluationArchiveError::SealNotFound(_))
+        ));
+        let trusted = EvaluationReportBuilder::default()
+            .build_with_fixed_identity(
+                &comparison(&parent, &candidate),
+                &parent,
+                &candidate,
+                metadata(),
+                EvaluationReportIdentity {
+                    report_id: binding.report_id.clone(),
+                    generated_at_ms: binding.generated_at_ms,
+                },
+            )
+            .expect("固定身份报告应构建成功");
+        archive
+            .commit(&trusted, binding.generated_at_ms)
+            .await
+            .expect("固定身份报告应完成 Seal");
+
+        let retry = archive
+            .bind_request(&request, 9_999)
+            .await
+            .expect("相同请求应复用身份");
+        assert_eq!(retry, binding);
+        let verified = archive
+            .get_verified_for_request(&retry)
+            .await
+            .expect("重试应直接读取已 Seal 报告");
+        assert_eq!(verified.report().report_id, binding.report_id);
+        assert_eq!(verified.report().generated_at_ms, 42);
+
+        let mut conflict = request;
+        conflict.candidate_revision_id = GenomeRevisionId::generate();
+        assert!(matches!(
+            archive.bind_request(&conflict, 100).await,
+            Err(crate::EvaluationArchiveError::RequestBindingConflict(_))
+        ));
+    }
+
+    /// Report 已写但 Seal 尚未提交时，Prepared Journal 必须无需重建报告即可补齐提交。
+    #[tokio::test]
+    async fn archive_recovers_partial_report_commit_with_fixed_identity() {
+        let parent = revision("parent");
+        let candidate = revision("candidate");
+        let root = TempDir::new().expect("创建 Evaluation Archive");
+        let archive = TrustedEvaluationArchive::new(root.path());
+        let request = EvaluationRequestV1 {
+            schema_version: EVALUATION_REQUEST_SCHEMA_VERSION,
+            request_id: "evaluation-partial-001".to_string(),
+            parent_revision_id: parent.revision_id.clone(),
+            candidate_revision_id: candidate.revision_id.clone(),
+            lineage: "stable/test".to_string(),
+            expected_parent_generation: 1,
+            expected_dataset_version: DatasetVersionId::new("dsv_repair000")
+                .expect("测试 Dataset ID 合法"),
+        };
+        let binding = archive
+            .bind_request(&request, 42)
+            .await
+            .expect("请求应固定身份");
+        let trusted = EvaluationReportBuilder::default()
+            .build_with_fixed_identity(
+                &comparison(&parent, &candidate),
+                &parent,
+                &candidate,
+                metadata(),
+                EvaluationReportIdentity {
+                    report_id: binding.report_id.clone(),
+                    generated_at_ms: binding.generated_at_ms,
+                },
+            )
+            .expect("固定身份报告应构建成功");
+        archive
+            .prepare_for_request(&binding, &trusted)
+            .await
+            .expect("应先提交 Prepared Journal");
+        let orphan_root = root.path().join("reports").join("reports");
+        fs::create_dir_all(&orphan_root)
+            .await
+            .expect("创建孤立 Report 目录");
+        fs::write(
+            orphan_root.join(format!("{}.json", binding.report_id)),
+            serde_json::to_vec_pretty(trusted.report()).expect("序列化孤立 Report"),
+        )
+        .await
+        .expect("模拟已写 Report");
+        drop(trusted);
+
+        let verified = archive
+            .commit_prepared_for_request(&binding, binding.generated_at_ms)
+            .await
+            .expect("Prepared 恢复应补齐 Audit 与 Seal");
+        assert_eq!(verified.report().report_id, binding.report_id);
+        archive
+            .get_verified_for_request(&binding)
+            .await
+            .expect("补齐后请求应可直接恢复");
+    }
+
+    /// Audit 已写或 Seal 已提交时，Prepared Journal 重试不得追加重复 Audit 或重跑 Builder。
+    #[tokio::test]
+    async fn archive_recovers_prepared_after_audit_and_seal_commit() {
+        let parent = revision("parent");
+        let candidate = revision("candidate");
+        let root = TempDir::new().expect("创建 Evaluation Archive");
+        let archive = TrustedEvaluationArchive::new(root.path());
+        let request = EvaluationRequestV1 {
+            schema_version: EVALUATION_REQUEST_SCHEMA_VERSION,
+            request_id: "evaluation-prepared-audit-001".to_string(),
+            parent_revision_id: parent.revision_id.clone(),
+            candidate_revision_id: candidate.revision_id.clone(),
+            lineage: "stable/test".to_string(),
+            expected_parent_generation: 1,
+            expected_dataset_version: DatasetVersionId::new("dsv_repair000")
+                .expect("测试 Dataset ID 合法"),
+        };
+        let binding = archive
+            .bind_request(&request, 42)
+            .await
+            .expect("请求应固定身份");
+        let trusted = EvaluationReportBuilder::default()
+            .build_with_fixed_identity(
+                &comparison(&parent, &candidate),
+                &parent,
+                &candidate,
+                metadata(),
+                EvaluationReportIdentity {
+                    report_id: binding.report_id.clone(),
+                    generated_at_ms: binding.generated_at_ms,
+                },
+            )
+            .expect("固定身份报告应构建成功");
+        archive
+            .prepare_for_request(&binding, &trusted)
+            .await
+            .expect("应提交 Prepared Journal 和私有录制");
+        let report = trusted.report().clone();
+        let report_digest = evaluation_report_digest(&report).expect("计算 Report 摘要");
+        let orphan_root = root.path().join("reports").join("reports");
+        fs::create_dir_all(&orphan_root)
+            .await
+            .expect("创建孤立 Report 目录");
+        fs::write(
+            orphan_root.join(format!("{}.json", binding.report_id)),
+            serde_json::to_vec_pretty(&report).expect("序列化孤立 Report"),
+        )
+        .await
+        .expect("模拟已写 Report");
+        archive
+            .audit_log()
+            .append(
+                binding.generated_at_ms,
+                crate::AuditEvent::EvaluationReportCommitted {
+                    report_id: report.report_id.clone(),
+                    parent: report.parent.genome_revision.clone(),
+                    candidate: report.candidate.genome_revision.clone(),
+                    decision: report.gate_decision,
+                    report_digest,
+                },
+            )
+            .await
+            .expect("模拟已写 Audit");
+        drop(trusted);
+
+        archive
+            .commit_prepared_for_request(&binding, binding.generated_at_ms)
+            .await
+            .expect("Audit 提交点后应从 Prepared 补齐 Seal");
+        archive
+            .commit_prepared_for_request(&binding, binding.generated_at_ms)
+            .await
+            .expect("Seal 提交点后应幂等恢复");
+        assert_eq!(
+            archive
+                .audit_log()
+                .verify()
+                .await
+                .expect("验证 Audit")
+                .record_count(),
+            1
+        );
     }
 
     /// Promotion 必须绑定可信 Report；Rollback 必须原子恢复 Parent 并保持代数单调。

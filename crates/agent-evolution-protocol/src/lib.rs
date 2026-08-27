@@ -51,9 +51,11 @@ pub use ids::{
     MutationId, OutcomeRevisionId, ReleaseId, RunId, SpanId, TaskCaseId,
 };
 pub use ipc::{
-    EvaluationReceiptV1, EvaluationRequestV1, InvalidEvaluatorIpc, PromotionRequestV1,
-    ReleaseReceiptV1, RollbackRequestV1, EVALUATION_RECEIPT_SCHEMA_VERSION,
-    EVALUATION_REQUEST_SCHEMA_VERSION, RELEASE_RECEIPT_SCHEMA_VERSION,
+    EvaluationReceiptV1, EvaluationRequestV1, HealthCheckReceiptV1, HealthCheckRequestV1,
+    InvalidEvaluatorIpc, PromotionRequestV1, ReleaseReceiptV1, RollbackRequestV1,
+    RuntimeHealthObservationV1, EVALUATION_RECEIPT_SCHEMA_VERSION,
+    EVALUATION_REQUEST_SCHEMA_VERSION, HEALTH_RECEIPT_SCHEMA_VERSION,
+    RELEASE_RECEIPT_SCHEMA_VERSION,
 };
 pub use mutation::{
     EvolutionCycleRequestInput, EvolutionCycleRequestV1, EvolutionCycleSnapshotV1,

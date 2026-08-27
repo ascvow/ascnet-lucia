@@ -4,17 +4,22 @@
 //! Workspace 和 Store 根均来自受信环境配置，禁止由 Candidate 或 Mutator 随请求指定。
 
 use agent_evaluation::{
-    ComparativeRunner, ComparativeRunnerConfig, EvaluationReportBuilder, EvaluationReportMetadata,
-    EvaluationSubject, ReleaseController, ReleaseReceipt, TrustedDatasetStore,
-    TrustedEvaluationArchive,
+    ComparativeRunner, ComparativeRunnerConfig, EvaluationArchiveError, EvaluationReportBuilder,
+    EvaluationReportIdentity, EvaluationReportMetadata, EvaluationSubject,
+    FileRuntimeHealthObservationStore, ReleaseController, ReleaseHealthVerifier, ReleaseReceipt,
+    TrustedDatasetStore, TrustedEvaluationArchive, VerifiedEvaluation,
 };
 use agent_evolution::{
     ArtifactStore, FileArtifactStore, FileGenomeResolver, GenomeResolver, GenomeSelector,
 };
 use agent_evolution_protocol::{
-    ArtifactDigest, DatasetVersionId, EvaluationEnvironment, EvaluationReportId,
-    EvolutionLifecycle, GateDecision, GenomeRevision, GenomeRevisionId,
+    ArtifactDigest, EvaluationEnvironment, EvaluationReceiptV1, EvaluationRequestV1,
+    GenomeRevision, GenomeRevisionId, HealthCheckReceiptV1, HealthCheckRequestV1,
+    PromotionRequestV1, ReleaseReceiptV1, RollbackRequestV1, EVALUATION_RECEIPT_SCHEMA_VERSION,
+    RELEASE_RECEIPT_SCHEMA_VERSION,
 };
+#[cfg(test)]
+use agent_evolution_protocol::{DatasetVersionId, EVALUATION_REQUEST_SCHEMA_VERSION};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -28,11 +33,6 @@ use std::{
 
 /// stdin 请求允许的最大字节数，防止无界 JSON 占用内存。
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
-/// 当前 `lucia-eval` 请求 schema。
-const EVALUATION_REQUEST_SCHEMA_VERSION: u32 = 1;
-/// 当前 `lucia-eval` 回执 schema。
-const EVALUATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
-
 /// 独立 Evaluator 不接受任何路径或 Policy 命令行参数。
 #[derive(Debug, Parser)]
 #[command(
@@ -55,86 +55,8 @@ enum Command {
     Promote,
     /// 把指定 Promotion 原子回滚到 Parent。
     Rollback,
-}
-
-/// Candidate 可提交的最小比较请求。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EvaluationRequestV1 {
-    /// 请求 schema 版本。
-    schema_version: u32,
-    /// 调用方生成的稳定幂等标识；不得包含路径或用户内容。
-    request_id: String,
-    /// 当前 Stable Parent 修订。
-    parent_revision_id: GenomeRevisionId,
-    /// 待评测 Candidate 修订。
-    candidate_revision_id: GenomeRevisionId,
-    /// 受信 Stable lineage。
-    lineage: String,
-    /// 调用方观察到的 Parent 代数，用作并发前置条件。
-    expected_parent_generation: u64,
-    /// 调用方期望使用的受信 Dataset 版本。
-    expected_dataset_version: DatasetVersionId,
-}
-
-/// Promotion 只接收正式 Report 与幂等 Release ID。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PromotionRequestV1 {
-    /// 请求 schema 版本。
-    schema_version: u32,
-    /// 已完成 Seal 的 EvaluationReport。
-    report_id: EvaluationReportId,
-    /// 本次 Promotion 的幂等标识。
-    release_id: agent_evolution_protocol::ReleaseId,
-}
-
-/// Rollback 只接收被撤销 Release 与本次回滚的幂等 ID。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RollbackRequestV1 {
-    /// 请求 schema 版本。
-    schema_version: u32,
-    /// 被撤销的 Promotion Release。
-    release_id: agent_evolution_protocol::ReleaseId,
-    /// 本次 Rollback 自身的幂等 Release ID。
-    rollback_release_id: agent_evolution_protocol::ReleaseId,
-}
-
-impl EvaluationRequestV1 {
-    /// 校验不需要访问受信 Store 的请求结构边界。
-    fn validate(&self) -> Result<()> {
-        if self.schema_version != EVALUATION_REQUEST_SCHEMA_VERSION {
-            return Err(anyhow!("unsupported_request_schema"));
-        }
-        if self.request_id.is_empty()
-            || self.request_id.len() > 128
-            || !self
-                .request_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        {
-            return Err(anyhow!("invalid_request_id"));
-        }
-        if self.lineage.is_empty()
-            || self.lineage.len() > 128
-            || self.lineage.starts_with('/')
-            || self.lineage.ends_with('/')
-            || self
-                .lineage
-                .split('/')
-                .any(|part| part.is_empty() || matches!(part, "." | ".."))
-            || !self.lineage.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/')
-            })
-        {
-            return Err(anyhow!("invalid_lineage"));
-        }
-        if self.parent_revision_id == self.candidate_revision_id {
-            return Err(anyhow!("same_revision"));
-        }
-        Ok(())
-    }
+    /// 复核 Promotion 后 Stable 与受信 Runtime 健康观察。
+    Health,
 }
 
 /// 只从受信进程环境读取的 Evaluator 配置。
@@ -153,6 +75,25 @@ struct TrustedConfig {
 struct TrustedReleaseConfig {
     evolution_root: PathBuf,
     archive_root: PathBuf,
+}
+
+/// Promotion 健康复核需要的受信 Store 根配置。
+#[derive(Debug, Clone)]
+struct TrustedHealthConfig {
+    evolution_root: PathBuf,
+    archive_root: PathBuf,
+    health_store_root: PathBuf,
+}
+
+impl TrustedHealthConfig {
+    /// 只从进程环境加载 Registry、Archive 与 Runtime 观察 Store 根。
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            evolution_root: required_path("LUCIA_EVAL_EVOLUTION_ROOT")?,
+            archive_root: required_path("LUCIA_EVAL_ARCHIVE_ROOT")?,
+            health_store_root: required_path("LUCIA_EVAL_HEALTH_STORE_ROOT")?,
+        })
+    }
 }
 
 impl TrustedReleaseConfig {
@@ -186,24 +127,6 @@ impl TrustedConfig {
     }
 }
 
-/// 成功提交正式报告后的脱敏回执。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct EvaluationReceiptV1 {
-    schema_version: u32,
-    request_id: String,
-    report_id: EvaluationReportId,
-    report_digest: ArtifactDigest,
-    audit_record_id: agent_evolution_protocol::AuditRecordId,
-    audit_head_digest: ArtifactDigest,
-    parent_revision_id: GenomeRevisionId,
-    candidate_revision_id: GenomeRevisionId,
-    evaluation_policy_version: String,
-    commit_policy_version: String,
-    verifier_set_digest: String,
-    gate_decision: GateDecision,
-    lifecycle: EvolutionLifecycle,
-}
-
 /// 启动独立 Evaluator；可信 Reject/Unknown 仍返回成功回执和退出码 0。
 #[tokio::main]
 async fn main() {
@@ -216,6 +139,9 @@ async fn main() {
             .await
             .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
         Command::Rollback => run_rollback()
+            .await
+            .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
+        Command::Health => run_health()
             .await
             .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
     };
@@ -233,6 +159,27 @@ async fn run_evaluate() -> Result<EvaluationReceiptV1> {
     let config = TrustedConfig::from_env().context("config_invalid")?;
     let request = read_request().context("request_invalid")?;
     request.validate().context("request_invalid")?;
+    let archive = TrustedEvaluationArchive::new(&config.archive_root);
+    let binding = archive
+        .bind_request(&request, now_ms()?)
+        .await
+        .context("archive_commit_failed")?;
+    match archive.get_verified_for_request(&binding).await {
+        Ok(verified) => return Ok(evaluation_receipt(&request.request_id, &verified)),
+        Err(EvaluationArchiveError::SealNotFound(_)) => {}
+        Err(error) => return Err(error).context("archive_commit_failed"),
+    }
+    match archive.get_prepared_for_request(&binding).await {
+        Ok(trusted) => {
+            let verified = archive
+                .commit(&trusted, binding.generated_at_ms)
+                .await
+                .context("archive_commit_failed")?;
+            return Ok(evaluation_receipt(&request.request_id, &verified));
+        }
+        Err(EvaluationArchiveError::PreparedEvaluationNotFound(_)) => {}
+        Err(error) => return Err(error).context("archive_commit_failed"),
+    }
 
     let resolver = FileGenomeResolver::new(&config.evolution_root);
     let stable = resolver
@@ -272,14 +219,13 @@ async fn run_evaluate() -> Result<EvaluationReceiptV1> {
         .run_pair(&parent_subject, &candidate_subject)
         .await
         .context("evaluation_failed")?;
-    let generated_at_ms = now_ms()?;
     let trusted = EvaluationReportBuilder::task_strategy_mvp()
-        .build(
+        .build_with_fixed_identity(
             &comparison,
             &parent,
             &candidate,
             EvaluationReportMetadata {
-                lineage: Some(request.lineage),
+                lineage: Some(request.lineage.clone()),
                 parent_generation: Some(request.expected_parent_generation),
                 candidate_generation: Some(
                     request
@@ -287,20 +233,32 @@ async fn run_evaluate() -> Result<EvaluationReceiptV1> {
                         .checked_add(1)
                         .ok_or_else(|| anyhow!("generation_overflow"))?,
                 ),
-                generated_at_ms,
+                generated_at_ms: binding.generated_at_ms,
+            },
+            EvaluationReportIdentity {
+                report_id: binding.report_id.clone(),
+                generated_at_ms: binding.generated_at_ms,
             },
         )
         .context("report_build_failed")?;
-    let archive = TrustedEvaluationArchive::new(config.archive_root);
-    let verified = archive
-        .commit(&trusted, generated_at_ms)
+    archive
+        .prepare_for_request(&binding, &trusted)
         .await
         .context("archive_commit_failed")?;
+    let verified = archive
+        .commit_prepared_for_request(&binding, binding.generated_at_ms)
+        .await
+        .context("archive_commit_failed")?;
+    Ok(evaluation_receipt(&request.request_id, &verified))
+}
+
+/// 从已完整复核的 Report Seal 构造共享 Evaluate 回执。
+fn evaluation_receipt(request_id: &str, verified: &VerifiedEvaluation) -> EvaluationReceiptV1 {
     let report = verified.report();
     let seal = verified.seal();
-    Ok(EvaluationReceiptV1 {
+    EvaluationReceiptV1 {
         schema_version: EVALUATION_RECEIPT_SCHEMA_VERSION,
-        request_id: request.request_id,
+        request_id: request_id.to_string(),
         report_id: report.report_id.clone(),
         report_digest: seal.report_digest.clone(),
         audit_record_id: seal.audit_record_id.clone(),
@@ -312,33 +270,59 @@ async fn run_evaluate() -> Result<EvaluationReceiptV1> {
         verifier_set_digest: seal.verifier_set_digest.clone(),
         gate_decision: report.gate_decision,
         lifecycle: report.lifecycle,
-    })
+    }
 }
 
 /// 执行一次绑定正式 EvaluationReport 的 Promotion。
-async fn run_promote() -> Result<ReleaseReceipt> {
+async fn run_promote() -> Result<ReleaseReceiptV1> {
     let config = TrustedReleaseConfig::from_env().context("config_invalid")?;
     let request: PromotionRequestV1 = read_json_request().context("request_invalid")?;
-    if request.schema_version != EVALUATION_REQUEST_SCHEMA_VERSION {
-        return Err(anyhow!("unsupported_request_schema")).context("request_invalid");
-    }
-    ReleaseController::new(config.evolution_root, config.archive_root)
+    request.validate().context("request_invalid")?;
+    let receipt = ReleaseController::new(config.evolution_root, config.archive_root)
         .promote(&request.report_id, request.release_id, now_ms()?)
         .await
-        .context("promotion_failed")
+        .context("promotion_failed")?;
+    Ok(release_receipt_v1(receipt))
 }
 
 /// 执行一次绑定原 Promotion Report 的原子 Rollback。
-async fn run_rollback() -> Result<ReleaseReceipt> {
+async fn run_rollback() -> Result<ReleaseReceiptV1> {
     let config = TrustedReleaseConfig::from_env().context("config_invalid")?;
     let request: RollbackRequestV1 = read_json_request().context("request_invalid")?;
-    if request.schema_version != EVALUATION_REQUEST_SCHEMA_VERSION {
-        return Err(anyhow!("unsupported_request_schema")).context("request_invalid");
-    }
-    ReleaseController::new(config.evolution_root, config.archive_root)
+    request.validate().context("request_invalid")?;
+    let receipt = ReleaseController::new(config.evolution_root, config.archive_root)
         .rollback(&request.release_id, request.rollback_release_id, now_ms()?)
         .await
-        .context("rollback_failed")
+        .context("rollback_failed")?;
+    Ok(release_receipt_v1(receipt))
+}
+
+/// 从受信观察 Store 复核 Promotion 后 Runtime 健康状态。
+async fn run_health() -> Result<HealthCheckReceiptV1> {
+    let config = TrustedHealthConfig::from_env().context("config_invalid")?;
+    let request: HealthCheckRequestV1 = read_json_request().context("request_invalid")?;
+    request.validate().context("request_invalid")?;
+    let observations = FileRuntimeHealthObservationStore::new(config.health_store_root)
+        .context("config_invalid")?;
+    ReleaseHealthVerifier::new(config.evolution_root, config.archive_root, observations)
+        .verify(&request)
+        .await
+        .context("health_check_failed")
+}
+
+/// 把 Evaluator 内部 Release 结果映射为共享版本化 IPC 回执。
+fn release_receipt_v1(receipt: ReleaseReceipt) -> ReleaseReceiptV1 {
+    ReleaseReceiptV1 {
+        schema_version: RELEASE_RECEIPT_SCHEMA_VERSION,
+        release_id: receipt.release_id,
+        report_id: receipt.report_id,
+        lineage: receipt.lineage,
+        from: receipt.from,
+        to: receipt.to,
+        generation: receipt.generation,
+        audit_record_id: receipt.audit_record_id,
+        rollback_of: receipt.rollback_of,
+    }
 }
 
 /// 从 stdin 读取单个带上限、拒绝未知字段的请求。
@@ -457,6 +441,7 @@ fn stable_error_code(error: &anyhow::Error) -> &'static str {
             "archive_commit_failed" => return "archive_commit_failed",
             "promotion_failed" => return "promotion_failed",
             "rollback_failed" => return "rollback_failed",
+            "health_check_failed" => return "health_check_failed",
             _ => {}
         }
     }
@@ -508,5 +493,28 @@ mod tests {
         let mut escaped = request;
         escaped.lineage = "../stable".to_string();
         assert!(escaped.validate().is_err());
+    }
+
+    /// `health` 必须是显式受限子命令，不能通过自由动作字符串进入控制面。
+    #[test]
+    fn parses_explicit_health_command() {
+        let args = Args::try_parse_from(["lucia-eval", "health"]).expect("health 子命令应存在");
+        assert!(matches!(args.command, Command::Health));
+        assert!(Args::try_parse_from(["lucia-eval", "health", "/tmp/forged"]).is_err());
+    }
+
+    /// Health stdin 只能声明 Release 绑定，不能携带观察 Store 或 Stable 路径。
+    #[test]
+    fn health_request_rejects_control_plane_paths() {
+        let request = serde_json::json!({
+            "schema_version": EVALUATION_REQUEST_SCHEMA_VERSION,
+            "request_id": "health-request-001",
+            "release_id": agent_evolution_protocol::ReleaseId::generate(),
+            "lineage": "stable/test",
+            "expected_revision_id": GenomeRevisionId::generate(),
+            "expected_generation": 2,
+            "health_store_root": "/tmp/forged"
+        });
+        assert!(serde_json::from_value::<HealthCheckRequestV1>(request).is_err());
     }
 }

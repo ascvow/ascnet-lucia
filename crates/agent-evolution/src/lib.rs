@@ -10,12 +10,15 @@ mod archive;
 mod artifact_store;
 mod attribution;
 mod candidate_builder;
+mod candidate_selection;
 mod certificate;
+mod cycle;
 mod episode_evidence;
 mod episode_selection;
 mod episode_store;
-mod evolution_policy;
 mod evaluation_store;
+mod evaluator_process;
+mod evolution_policy;
 mod feedback;
 mod genome_diff;
 mod genome_store;
@@ -25,12 +28,14 @@ mod metrics;
 mod outbox;
 mod outcome_revision;
 mod pipeline;
+mod prompt_cycle;
 mod prompt_mutation;
 mod recorder;
 mod recorder_hub;
 mod replay;
 mod scorecard;
 mod supervision;
+mod template_generator;
 
 pub use aggregation::IssueAggregator;
 pub use archive::{ArchiveError, FileEvolutionArchive};
@@ -39,9 +44,13 @@ pub use attribution::attribute_failures;
 pub use candidate_builder::{
     CandidateBuildError, CandidateBuilder, MAX_TASK_STRATEGY_PROMPT_BYTES,
 };
+pub use candidate_selection::{CandidateSelectionError, CandidateSelector, SelectedCandidate};
 pub use certificate::{
     CertificateError, EvolutionCertificate, EvolutionCertificateInput,
     EVOLUTION_CERTIFICATE_SCHEMA_VERSION,
+};
+pub use cycle::{
+    is_terminal_cycle_stage, CycleStoreError, EvolutionCycleStore, FileEvolutionCycleStore,
 };
 pub use episode_evidence::{load_episode_evidence, EpisodeEvidence, EpisodeEvidenceError};
 pub use episode_selection::{
@@ -49,11 +58,12 @@ pub use episode_selection::{
     MutationFailureEvidence,
 };
 pub use episode_store::{EpisodeQuery, EpisodeStore, EpisodeStoreError, FileEpisodeStore};
-pub use evolution_policy::{
-    EvolutionPolicy, EVOLUTION_POLICY_VERSION, TASK_STRATEGY_MVP_CANDIDATE_COUNT,
-};
 pub use evaluation_store::{
     load_evaluation_report, EvaluationStoreError, FileEvaluationReportStore,
+};
+pub use evaluator_process::{EvaluatorClient, EvaluatorProcessError, LuciaEvalProcessClient};
+pub use evolution_policy::{
+    EvolutionPolicy, EVOLUTION_POLICY_VERSION, TASK_STRATEGY_MVP_CANDIDATE_COUNT,
 };
 pub use feedback::{FeedbackError, FeedbackProcessor};
 pub use genome_diff::{diff_genomes, verify_allowed_genome_diff, GenomeDiffError};
@@ -81,6 +91,7 @@ pub use metrics::{
 pub use outbox::{EvolutionOutbox, EvolutionOutboxItem, FileEvolutionOutbox, OutboxError};
 pub use outcome_revision::{FileOutcomeRevisionStore, OutcomeRevisionError, OutcomeRevisionStore};
 pub use pipeline::{EvolutionPipeline, PipelineError};
+pub use prompt_cycle::{PromptCycleError, PromptEvolutionCycle};
 pub use prompt_mutation::{
     BoundedPromptMutator, MutationProposalContext, PromptMutationDraft, PromptMutationError,
     PromptMutationGenerationError, PromptMutationGenerator, PromptMutationRequest,
@@ -98,3 +109,4 @@ pub use scorecard::{
 pub use supervision::{
     RunSupervisor, SupervisionError, SupervisionReport, OUTCOME_RESOLUTION_EVENT,
 };
+pub use template_generator::DeterministicPromptMutationGenerator;

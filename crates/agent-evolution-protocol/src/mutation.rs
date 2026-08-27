@@ -5,7 +5,7 @@
 //! 最终评测仍属于独立受信 Evaluator。
 
 use crate::{
-    ipc::{EvaluationReceiptV1, ReleaseReceiptV1},
+    ipc::{EvaluationReceiptV1, HealthCheckReceiptV1, ReleaseReceiptV1},
     ArtifactDigest, ArtifactRef, CandidateId, EpisodeId, EvaluationReportId, EvolutionCycleId,
     EvolutionIssueId, GenomeDigest, GenomeRevisionId, MutationId, MutationSurface, ReleaseId,
 };
@@ -282,8 +282,18 @@ pub enum EvolutionCycleStage {
     SelectingWinner,
     /// 已请求受信 Release Controller 晋升胜者。
     Promoting,
-    /// Cycle 已完成。
+    /// Promotion 已提交，等待后续真实运行产生健康观察。
+    AwaitingHealth,
+    /// 正在请求受信 Evaluator 复核 Promotion 与运行健康观察。
+    VerifyingHealth,
+    /// 健康验证失败，正在请求受信 Release Controller 回滚 Parent。
+    RollingBack,
+    /// 旧版 M5 Cycle 已完成；新 Cycle 使用更精确的 HealthVerified 或 RolledBack 终态。
     Completed,
+    /// Promotion 通过 Stable、后续运行和健康检查验证，Cycle 成功完成。
+    HealthVerified,
+    /// Promotion 健康验证失败并已原子回滚 Parent，Cycle 安全完成。
+    RolledBack,
     /// 所有 Candidate 均被拒绝，Cycle 正常终止。
     Rejected,
     /// 选择、诊断、生成、构建、评测或发布基础设施失败，Cycle 以失败关闭。
@@ -433,9 +443,15 @@ pub struct EvolutionCycleSnapshotV1 {
     /// 可信选择器选出的 Candidate；尚未选择时为 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub winner: Option<CandidateId>,
-    /// Promotion 或 Rollback 的受信 Release 回执。
+    /// Promotion 的受信 Release 回执。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_receipt: Option<ReleaseReceiptV1>,
+    /// Promotion 后的受信健康验证回执。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_receipt: Option<HealthCheckReceiptV1>,
+    /// 健康失败后的受信 Rollback 回执。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_receipt: Option<ReleaseReceiptV1>,
     /// Fail-closed 终态使用的稳定错误码；不保存外部错误正文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_code: Option<String>,
@@ -485,6 +501,18 @@ impl EvolutionCycleSnapshotV1 {
                 return Err(InvalidEvolutionCycle::NestedIdentityMismatch);
             }
         }
+        for receipt in &self.evaluation_receipts {
+            receipt
+                .validate()
+                .map_err(|error| InvalidEvolutionCycle::InvalidControlReceipt(error.to_string()))?;
+            if receipt.parent_revision_id != self.parent_revision_id
+                || !self.candidates.iter().any(|candidate| {
+                    candidate.candidate_revision_id == receipt.candidate_revision_id
+                })
+            {
+                return Err(InvalidEvolutionCycle::NestedIdentityMismatch);
+            }
+        }
         if let Some(winner) = &self.winner {
             if !self
                 .candidates
@@ -494,8 +522,115 @@ impl EvolutionCycleSnapshotV1 {
                 return Err(InvalidEvolutionCycle::UnknownWinner(winner.clone()));
             }
         }
+        if let Some(release) = &self.release_receipt {
+            release
+                .validate()
+                .map_err(|error| InvalidEvolutionCycle::InvalidControlReceipt(error.to_string()))?;
+            if release.rollback_of.is_some()
+                || release.lineage != self.request.lineage
+                || release.from != self.parent_revision_id
+            {
+                return Err(InvalidEvolutionCycle::NestedIdentityMismatch);
+            }
+            let winner_revision = self.winner.as_ref().and_then(|winner| {
+                self.candidates
+                    .iter()
+                    .find(|candidate| &candidate.candidate_id == winner)
+                    .map(|candidate| &candidate.candidate_revision_id)
+            });
+            if winner_revision != Some(&release.to) {
+                return Err(InvalidEvolutionCycle::NestedIdentityMismatch);
+            }
+        }
+        if let Some(health) = &self.health_receipt {
+            health
+                .validate()
+                .map_err(|error| InvalidEvolutionCycle::InvalidControlReceipt(error.to_string()))?;
+            let Some(release) = &self.release_receipt else {
+                return Err(InvalidEvolutionCycle::NestedIdentityMismatch);
+            };
+            if health.release_id != release.release_id
+                || health.lineage != release.lineage
+                || health.expected_revision_id != release.to
+                || health.expected_generation != release.generation
+            {
+                return Err(InvalidEvolutionCycle::NestedIdentityMismatch);
+            }
+        }
+        if let Some(rollback) = &self.rollback_receipt {
+            rollback
+                .validate()
+                .map_err(|error| InvalidEvolutionCycle::InvalidControlReceipt(error.to_string()))?;
+            let Some(release) = &self.release_receipt else {
+                return Err(InvalidEvolutionCycle::NestedIdentityMismatch);
+            };
+            if rollback.rollback_of.as_ref() != Some(&release.release_id)
+                || rollback.report_id != release.report_id
+                || rollback.lineage != release.lineage
+                || rollback.from != release.to
+                || rollback.to != self.parent_revision_id
+            {
+                return Err(InvalidEvolutionCycle::NestedIdentityMismatch);
+            }
+        }
         if let Some(code) = &self.failure_code {
             validate_failure_code(code)?;
+        }
+        self.validate_stage_artifacts()?;
+        Ok(())
+    }
+
+    /// 校验阶段与已归档控制面制品的一致性。
+    fn validate_stage_artifacts(&self) -> Result<(), InvalidEvolutionCycle> {
+        let failed = self.stage == EvolutionCycleStage::Failed;
+        if failed != self.failure_code.is_some() {
+            return Err(InvalidEvolutionCycle::StageArtifactMismatch);
+        }
+        let requires_winner = matches!(
+            self.stage,
+            EvolutionCycleStage::Promoting
+                | EvolutionCycleStage::AwaitingHealth
+                | EvolutionCycleStage::VerifyingHealth
+                | EvolutionCycleStage::RollingBack
+                | EvolutionCycleStage::HealthVerified
+                | EvolutionCycleStage::RolledBack
+                | EvolutionCycleStage::Completed
+        );
+        if requires_winner && self.winner.is_none() {
+            return Err(InvalidEvolutionCycle::StageArtifactMismatch);
+        }
+        let requires_release = matches!(
+            self.stage,
+            EvolutionCycleStage::AwaitingHealth
+                | EvolutionCycleStage::VerifyingHealth
+                | EvolutionCycleStage::RollingBack
+                | EvolutionCycleStage::HealthVerified
+                | EvolutionCycleStage::RolledBack
+                | EvolutionCycleStage::Completed
+        );
+        if requires_release && self.release_receipt.is_none() {
+            return Err(InvalidEvolutionCycle::StageArtifactMismatch);
+        }
+        if matches!(
+            self.stage,
+            EvolutionCycleStage::RollingBack | EvolutionCycleStage::RolledBack
+        ) && self
+            .health_receipt
+            .as_ref()
+            .is_none_or(|receipt| receipt.verified)
+        {
+            return Err(InvalidEvolutionCycle::StageArtifactMismatch);
+        }
+        if self.stage == EvolutionCycleStage::HealthVerified
+            && self
+                .health_receipt
+                .as_ref()
+                .is_none_or(|receipt| !receipt.verified)
+        {
+            return Err(InvalidEvolutionCycle::StageArtifactMismatch);
+        }
+        if (self.stage == EvolutionCycleStage::RolledBack) != self.rollback_receipt.is_some() {
+            return Err(InvalidEvolutionCycle::StageArtifactMismatch);
         }
         Ok(())
     }
@@ -511,6 +646,13 @@ impl EvolutionCycleSnapshotV1 {
     /// 返回当前快照引用的 Release ID；尚未发布时为 `None`。
     pub fn release_id(&self) -> Option<&ReleaseId> {
         self.release_receipt
+            .as_ref()
+            .map(|receipt| &receipt.release_id)
+    }
+
+    /// 返回健康失败后 Rollback 的 Release ID；尚未回滚时为 `None`。
+    pub fn rollback_release_id(&self) -> Option<&ReleaseId> {
+        self.rollback_receipt
             .as_ref()
             .map(|receipt| &receipt.release_id)
     }
@@ -613,6 +755,9 @@ pub enum InvalidEvolutionCycle {
     /// 嵌套 Proposal 或 Candidate 不合法。
     #[error("Evolution Cycle 包含无效 Mutation：{0}")]
     InvalidMutation(String),
+    /// 嵌套 Evaluator 或 Release 控制面回执不合法。
+    #[error("Evolution Cycle 包含无效控制面回执：{0}")]
+    InvalidControlReceipt(String),
     /// 嵌套对象不属于当前 Cycle、Issue 或 Parent。
     #[error("Evolution Cycle 嵌套对象的 Cycle、Issue 或 Parent 身份不匹配")]
     NestedIdentityMismatch,
@@ -622,6 +767,9 @@ pub enum InvalidEvolutionCycle {
     /// Fail-closed 错误码不符合稳定边界。
     #[error("Evolution Cycle failure_code 不合法")]
     InvalidFailureCode,
+    /// Cycle 阶段与 Winner、Release、Health、Rollback 或 Failure 制品不一致。
+    #[error("Evolution Cycle 阶段与归档制品不一致")]
+    StageArtifactMismatch,
 }
 
 /// 校验有界非空文本。
@@ -925,6 +1073,8 @@ mod tests {
             evaluation_receipts: Vec::new(),
             winner: Some(candidate.candidate_id.clone()),
             release_receipt: None,
+            health_receipt: None,
+            rollback_receipt: None,
             failure_code: None,
             created_at_ms: 11,
         };
