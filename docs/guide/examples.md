@@ -125,7 +125,7 @@ cargo run -p lucia -- --demo \
 
 ```toml
 [dependencies]
-agent-core = { path = "../ascnet-lucia/crates/agent-core" }
+agent-core = { path = "../ascnet-lucia/crates/agent-core/kernel" }
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```

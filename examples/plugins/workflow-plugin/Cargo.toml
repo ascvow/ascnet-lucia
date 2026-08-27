@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1"
-agent-plugin = { path = "../../../crates/agent-plugin" }
+agent-plugin = { path = "../../../crates/agent-plugins/sdk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-width = "0.2"

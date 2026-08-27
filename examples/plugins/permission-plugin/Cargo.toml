@@ -10,6 +10,6 @@ description = "限制 Agent 工具调用并提供交互审批界面的 WASM 插�
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-agent-plugin = { path = "../../../crates/agent-plugin" }
+agent-plugin = { path = "../../../crates/agent-plugins/sdk" }
 serde_json = "1"
 wit-bindgen = "0.59"

@@ -73,7 +73,7 @@ Trusted Evaluation 平面  判定候选优劣；独占隐藏数据集、Verifier
 
 必须如实记录：**当前授权完全由插件承担，Host 没有独立兜底。**
 
-`CompositePluginHost::before_tool`（`crates/agent-plugin-host/src/lib.rs:431`）的实际行为是：
+`CompositePluginHost::before_tool`（`crates/agent-plugins/host/src/lib.rs:431`）的实际行为是：
 
 1. 依次调用非 policy owner 插件的 `before_tool`，任一返回 `Block` / `CancelRun` 即短路。
 2. 最后调用 `TOOL_POLICY_CAPABILITY` 的 owner 插件做最终裁决。
@@ -86,7 +86,7 @@ Trusted Evaluation 平面  判定候选优劣；独占隐藏数据集、Verifier
 > root、不做 canonicalize、不拒绝 `..` 逃逸，`ShellTool` 完整继承宿主环境变量。
 > 这些缺口已由后文的 M0-03、M0-04 落点关闭；工具授权本身仍由插件裁决。
 
-唯一已经存在的可信强制点是 `agent-runtime` 的 `RestrictedExtension`（`crates/agent-runtime/src/permissions.rs:251`）。它对派生 Agent 同时过滤 `list_tools`、拦截 `call_tool`，并且**重新校验插件 `Rewrite` 后的工具名**，因此插件无法借 `Rewrite` 提权。但它只作用于派生 Agent 的 allowlist，不构成根 Agent 的文件系统或进程边界。
+唯一已经存在的可信强制点是 `agent-runtime` 的 `RestrictedExtension`（`crates/agent-core/runtime/src/permissions.rs:251`）。它对派生 Agent 同时过滤 `list_tools`、拦截 `call_tool`，并且**重新校验插件 `Rewrite` 后的工具名**，因此插件无法借 `Rewrite` 提权。但它只作用于派生 Agent 的 allowlist，不构成根 Agent 的文件系统或进程边界。
 
 ### 决策
 

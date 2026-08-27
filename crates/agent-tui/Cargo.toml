@@ -19,17 +19,17 @@ plugins = [
 
 [dependencies]
 anyhow.workspace = true
-agent-core = { path = "../agent-core", default-features = false, features = ["openai", "anthropic"] }
-agent-context = { path = "../agent-context" }
-agent-evolution = { path = "../agent-evolution" }
-agent-evolution-protocol = { path = "../agent-evolution-protocol" }
-agent-plugin-protocol = { path = "../agent-plugin-protocol", optional = true }
-agent-plugin-host = { path = "../agent-plugin-host", optional = true }
-agent-plugin-manager = { path = "../agent-plugin-manager", optional = true }
-agent-runtime = { path = "../agent-runtime", optional = true }
-agent-session = { path = "../agent-session" }
-agent-skill = { path = "../agent-skill" }
-agent-tool = { path = "../agent-tool" }
+agent-core = { path = "../agent-core/kernel", default-features = false, features = ["openai", "anthropic"] }
+agent-context = { path = "../agent-core/context" }
+agent-evolution = { path = "../agent-evolution/engine" }
+agent-evolution-protocol = { path = "../agent-evolution/protocol" }
+agent-plugin-protocol = { path = "../agent-plugins/protocol", optional = true }
+agent-plugin-host = { path = "../agent-plugins/host", optional = true }
+agent-plugin-manager = { path = "../agent-plugins/manager", optional = true }
+agent-runtime = { path = "../agent-core/runtime", optional = true }
+agent-session = { path = "../agent-core/session" }
+agent-skill = { path = "../agent-core/skill" }
+agent-tool = { path = "../agent-core/tool" }
 async-trait.workspace = true
 base64.workspace = true
 clap.workspace = true

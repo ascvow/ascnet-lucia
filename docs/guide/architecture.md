@@ -13,8 +13,11 @@
 | `agent-plugin-protocol` | Host、Guest 与应用共享的宿主无关 UI 数据契约 | owner 路由、WASM 调用、终端渲染 |
 | `agent-plugin-host` | ABI、生命周期、权限、贡献注册、owner 路由、UI 契约校验 | 具体扩展协议、业务规则和终端布局 |
 | `agent-plugin` | Guest SDK、WIT 绑定、导出宏 | component 加载、终端渲染 |
+| `agent-plugin-manager` | 安装、完整性锁、依赖求解、启停和诊断 | WASM ABI、Guest SDK、插件业务规则 |
 | `agent-tui` | 应用组装、原生命令、输入路由、通用声明式 UI 渲染 | 贡献归属和具体插件业务规则 |
 | 独立插件 crate | MCP、工作流、多 Agent 编排和业务集成 | 修改 Core 或 Host 语义 |
+
+`crates/` 按运行域分组：`agent-core/` 包含 Kernel 与默认原生能力，`agent-plugins/` 包含协议、SDK、Host 和 Manager，`agent-evolution/` 包含稳定协议、Engine 与 Evaluation；`agent-tui` 作为应用入口单独保留。目录归组不合并包名或职责，继续满足 Core、Host、Guest SDK、Manager 与可信评测之间的单向依赖边界。
 
 ## 依赖方向
 
