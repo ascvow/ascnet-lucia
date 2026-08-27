@@ -87,7 +87,7 @@ UTF-8 Prompt CAS 制品，空 Prompt 不会采用普通配置或 Core 默认提�
 | --- | --- | --- |
 | 发送 | `Enter` | 提交当前输入；Agent 运行中提交的普通输入按 FIFO 排队 |
 | 换行 | `Ctrl+J` | 在输入框中插入换行 |
-| 中断或退出 | `Esc` | 运行中请求取消；有输入时清空；空闲且输入为空时退出 |
+| 中断、返回或清空 | `Esc` | 运行中请求取消；菜单或子页面返回上一级；主输入区连续双按清空草稿，不会退出 Lucia |
 | 滚动历史 | `PgUp` / `PgDn` | 手动滚动消息区 |
 | 输入历史 | `Ctrl+P` | 进入或退出历史输入回溯 |
 | 复制回复 | `Ctrl+Y` | 复制最近一条助手回复 |
@@ -133,7 +133,7 @@ lucia --session-id design-review
 
 ## 退出与故障恢复
 
-空闲时按 `Esc` 退出。Lucia 会在正常退出、错误和 panic 展开时恢复 raw mode、备用屏幕和 bracketed paste 状态。
+使用 `/exit`、`/quit` 或 `Ctrl+C` 显式退出。Lucia 会在正常退出、错误和 panic 展开时恢复 raw mode、备用屏幕和 bracketed paste 状态。
 
 模型或工具问题需要完整事件时使用：
 

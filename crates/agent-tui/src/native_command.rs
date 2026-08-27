@@ -162,7 +162,13 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> bool {
+        if !matches!(code, KeyCode::Esc) {
+            self.last_escape_at = None;
+        }
         if self.native_command.dialog.is_some() {
+            if matches!(code, KeyCode::Esc) {
+                self.last_escape_at = None;
+            }
             return self.handle_native_session_dialog_key(code, modifiers);
         }
         #[cfg(feature = "plugins")]
@@ -211,6 +217,7 @@ impl App {
                 true
             }
             KeyCode::Esc if !matches.is_empty() => {
+                self.last_escape_at = None;
                 self.native_command.dismissed_input = Some(self.input.clone());
                 true
             }
