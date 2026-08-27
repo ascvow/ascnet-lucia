@@ -1,22 +1,59 @@
 //! 官方 Command 插件的真实 WASM 端到端测试。
 
 use agent_plugin_host::{
+    audit::{HostServiceCallResult, InMemoryHostServiceCallObserver, JsonValueKind},
     ui::{
         UiHostAction, UiHostActionRequest, UiInput, UiInputEvent, UiPlacement, UiRenderRequest,
         UiSessionListStatus, UiSessionsReply, UI_HOST_ACTION_EVENT,
     },
     wasm::{load_wasm_plugins, WasmPluginHost},
-    AgentExtension, PluginHost, PluginServiceCall,
+    AgentExtension, PluginHost, PluginHostServices, PluginServiceCall,
 };
 use command_protocol::{
     CommandSnapshot, SnapshotRequest, PROTOCOL_VERSION, SESSION_DIALOG_VIEW, SNAPSHOT_SERVICE,
     SURFACE_UPDATE_SERVICE,
 };
 use serde_json::Value;
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 /// 补全弹层的视图 ID，与插件声明保持一致。
 const POPUP_VIEW: &str = "command-popup";
+
+/// 真实 Command component 服务调用必须经过共享 Host 路由并产生脱敏运行期审计记录。
+#[tokio::test]
+async fn component_service_call_is_observed_at_host_boundary() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
+    let observer = Arc::new(InMemoryHostServiceCallObserver::new());
+    let host = WasmPluginHost::load_from_manifest_with_services(
+        manifest,
+        PluginHostServices::new().with_service_call_observer(observer.clone()),
+    )
+    .await
+    .expect("Command component 应加载成功");
+
+    let value = call_service(
+        &host,
+        SNAPSHOT_SERVICE,
+        serde_json::to_value(SnapshotRequest {}).expect("序列化快照请求"),
+    )
+    .await;
+    assert!(value.is_object());
+
+    let observations = observer.snapshot();
+    let observation = observations
+        .iter()
+        .find(|observation| observation.service == SNAPSHOT_SERVICE)
+        .expect("真实服务调用必须产生 Host 审计记录");
+    assert_eq!(observation.caller_id, "lucia-tui");
+    assert_eq!(observation.target_owner_id, "command");
+    assert_eq!(observation.method, None);
+    assert_eq!(
+        observation.result,
+        HostServiceCallResult::Succeeded {
+            value_kind: JsonValueKind::Object
+        }
+    );
+}
 
 /// 通过真实 Host 服务路由调用 Command component。
 async fn call_service(host: &WasmPluginHost, name: &str, payload: Value) -> Value {

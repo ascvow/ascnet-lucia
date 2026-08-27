@@ -4,6 +4,7 @@
 
 #![deny(missing_docs)]
 
+pub mod audit;
 pub mod manifest;
 pub mod service;
 pub mod ui;
@@ -16,10 +17,9 @@ mod capability;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-use agent_core::{
-    model::{ModelGateway, ModelMessage},
-    ContextLoadRequest, ContextLoader, LoadedContext,
-};
+#[cfg(feature = "wasm")]
+use agent_core::model::ModelGateway;
+use agent_core::{model::ModelMessage, ContextLoadRequest, ContextLoader, LoadedContext};
 #[cfg(feature = "wasm")]
 use agent_runtime::{AgentDeriveConfig, AgentProfileId, AgentRuntimeProvisioner};
 use agent_tool::{ExecutionPolicy, ToolCall, ToolResult, ToolSpec};
@@ -49,6 +49,8 @@ pub struct PluginHostServices {
     model_completion: Option<ModelCompletionHostServices>,
     #[cfg(feature = "wasm")]
     activation_metadata: HashMap<String, HashMap<String, String>>,
+    #[cfg(feature = "wasm")]
+    service_call_observer: Option<Arc<dyn audit::HostServiceCallObserver>>,
     /// Host 持有且只能通过 `restrict` 收紧的运行平面策略。
     execution_policy: ExecutionPolicy,
 }
@@ -86,6 +88,19 @@ impl PluginHostServices {
     /// 可信门禁后复用同一策略。
     pub fn restrict_execution_policy(mut self, requested: &ExecutionPolicy) -> Self {
         self.execution_policy = self.execution_policy.restrict(requested);
+        self
+    }
+
+    /// 安装真实 Host 服务路由的旁路审计观察器。
+    ///
+    /// 观察器只接收脱敏结果，不得改变服务调用结果。该观察器会被同一次多插件加载共享，
+    /// 因而可以捕获 Guest 发起的跨插件调用以及应用通过同一服务注册表发起的调用。
+    #[cfg(feature = "wasm")]
+    pub fn with_service_call_observer(
+        mut self,
+        observer: Arc<dyn audit::HostServiceCallObserver>,
+    ) -> Self {
+        self.service_call_observer = Some(observer);
         self
     }
 
@@ -200,6 +215,12 @@ impl PluginHostServices {
     #[cfg(feature = "wasm")]
     pub(crate) fn execution_policy(&self) -> ExecutionPolicy {
         self.execution_policy.clone()
+    }
+
+    /// 返回 Host 服务注册表使用的旁路审计观察器。
+    #[cfg(feature = "wasm")]
+    pub(crate) fn service_call_observer(&self) -> Option<Arc<dyn audit::HostServiceCallObserver>> {
+        self.service_call_observer.clone()
     }
 }
 
