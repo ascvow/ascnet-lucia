@@ -58,7 +58,11 @@ fn parent_genome() -> GenomeRevision {
                 version: "0.1.0".into(),
                 api_version: "0.7.0".into(),
                 bundle: digest('a'),
+                manifest_digest: Some(digest('b')),
                 config_digest: None,
+                capability_profile_digest: Some(digest('c')),
+                load_order: Some(0),
+                hook_order: Vec::new(),
             }],
             capability_owners: BTreeMap::from([(
                 "episode.read_redacted".into(),

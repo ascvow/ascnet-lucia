@@ -10,6 +10,7 @@ use std::path::Path;
 /// 执行插件管理命令；安装和状态规则全部委托给 `agent-plugin-manager`。
 pub(crate) async fn run(args: PluginArgs) -> Result<()> {
     let manager = PluginManager::new(lucia_home_dir()?);
+    let mut plugin_environment_changed = false;
     match args.command {
         PluginCommand::Install {
             source,
@@ -36,6 +37,7 @@ pub(crate) async fn run(args: PluginArgs) -> Result<()> {
                     plugin.version,
                     state_label(plugin.enabled)
                 );
+                plugin_environment_changed = true;
             } else if github {
                 let github = GithubPluginSource::parse(&source)?;
                 let result = manager
@@ -65,6 +67,7 @@ pub(crate) async fn run(args: PluginArgs) -> Result<()> {
                         result.asset_name
                     );
                 }
+                plugin_environment_changed = true;
             } else {
                 if tag.is_some() || asset.is_some() {
                     bail!("Registry 安装不能使用 --tag 或 --asset；任意 Release 请增加 --github");
@@ -74,6 +77,7 @@ pub(crate) async fn run(args: PluginArgs) -> Result<()> {
                 if result.already_satisfied {
                     println!("{} 已安装且满足 {}", result.requested, request.requirement);
                 } else {
+                    plugin_environment_changed = true;
                     for plugin in result.installed {
                         println!(
                             "已安装 {} {}（{}）",
@@ -125,6 +129,7 @@ pub(crate) async fn run(args: PluginArgs) -> Result<()> {
             if result.updated.is_empty() {
                 println!("没有可更新的 Registry 插件");
             } else {
+                plugin_environment_changed = true;
                 for plugin in result.updated {
                     println!("已更新 {} 到 {}", plugin.id, plugin.version);
                 }
@@ -148,27 +153,39 @@ pub(crate) async fn run(args: PluginArgs) -> Result<()> {
         }
         PluginCommand::Enable { id } => {
             let plugin = manager.enable(&id)?;
+            plugin_environment_changed = true;
             println!("已启用 {} {}", plugin.id, plugin.version);
         }
         PluginCommand::Disable { id } => {
             let plugin = manager.disable(&id)?;
+            plugin_environment_changed = true;
             println!("已禁用 {} {}", plugin.id, plugin.version);
         }
         PluginCommand::Select { capability, plugin } => {
             let selected = manager.select(&capability, &plugin)?;
+            plugin_environment_changed = true;
             println!(
                 "能力 {} 已选择插件 {} {}",
                 capability, selected.id, selected.version
             );
         }
         PluginCommand::Unselect { capability } => match manager.clear_selection(&capability)? {
-            Some(plugin) => println!("已清除能力 {} 的插件选择 {}", capability, plugin),
+            Some(plugin) => {
+                plugin_environment_changed = true;
+                println!("已清除能力 {} 的插件选择 {}", capability, plugin);
+            }
             None => println!("能力 {} 没有显式插件选择", capability),
         },
         PluginCommand::Remove { id } => {
             let plugin = manager.remove(&id)?;
+            plugin_environment_changed = true;
             println!("已移除 {} {}", plugin.id, plugin.version);
         }
+    }
+    if plugin_environment_changed {
+        println!(
+            "插件环境已改变。新的 Agent Run 将使用新的人工插件管理基线；现有 Session 继续使用启动时快照，旧 Evolution Candidate 不得自动应用到新基线。"
+        );
     }
     Ok(())
 }

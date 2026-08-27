@@ -127,6 +127,7 @@ impl<'a> SkillCandidateBuilder<'a> {
         let mut candidate_revision = GenomeRevision::create(
             candidate_genome,
             GenomeMetadata {
+                origin: agent_evolution_protocol::RevisionOrigin::Evolution,
                 created_at: None,
                 description: None,
                 parent: Some(parent.revision_id.clone()),
@@ -847,7 +848,11 @@ mod tests {
                     version: "1.0.0".into(),
                     api_version: "1".into(),
                     bundle: digest('a'),
+                    manifest_digest: Some(digest('b')),
                     config_digest: None,
+                    capability_profile_digest: Some(digest('c')),
+                    load_order: Some(0),
+                    hook_order: Vec::new(),
                 }],
                 capability_owners: BTreeMap::from([(
                     "episode.read_redacted".into(),

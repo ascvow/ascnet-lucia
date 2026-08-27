@@ -64,6 +64,10 @@ Prompt、原生工具、插件 bundle、独占能力 owner 和执行策略都由
 使用 Plugin Manager 的同一摘要算法复核。额外发现的插件不会进入 Evidence 组合，任一固定
 插件未 Ready 或加载失败时禁止开始 Run。
 
+Evolution Cycle 会从 Genome 生成完整 PluginEnvironmentSnapshot，其中绑定插件集合、版本、Bundle 与 Manifest 摘要、插件配置摘要、Capability Profile、加载顺序、Hook 顺序和 Capability Owner，并计算单一环境摘要。Parent 与所有 Candidate 必须使用相同摘要；任何字段变化都会返回 FrozenPluginEnvironmentChanged，使 Candidate、比较和 Promotion 失效。MutationSurface::Plugin 仅用于读取旧归档，可信 Policy 即使声明它也不能重新启用执行。
+
+Skill、Prompt 和第一方稳定 Schema 的 Policy Artifact 可以独立变化。插件 Manifest、Bundle 或不透明配置不能伪装成 Skill 或 Context Policy 变异。插件运行失败仍形成 Incident；Agent 错选工具或参数可路由到 Agent 侧行为制品，插件实现、Trap 或契约错误进入人工插件维护。
+
 启动还会把 Revision 的包版本、Git 提交、dirty 状态、目标三元组和 TUI feature 与编译产物
 逐项核对。源码归档构建使用显式 `unknown` 提交标记且按 dirty 构建处理；由于它无法唯一证明
 内核版本，普通 Serve 可以运行，但 Evidence 会拒绝启动。

@@ -24,8 +24,9 @@ pub mod supervision;
 
 pub use genome::{
     AgentGenome, GenomeDigestError, GenomeMetadata, GenomeRevision, GenomeRevisionError,
-    InvalidGenome, ModelGenome, PluginGenome, PolicyRef, PromptArtifactRef, PromptGenome,
-    PromptLayer, RuntimeIdentity, SkillRef, ToolProfileGenome, GENOME_SCHEMA_VERSION,
+    InvalidGenome, ModelGenome, PluginEnvironmentDigestError, PluginEnvironmentSnapshot,
+    PluginGenome, PolicyRef, PromptArtifactRef, PromptGenome, PromptLayer, RevisionOrigin,
+    RuntimeIdentity, SkillRef, ToolProfileGenome, GENOME_SCHEMA_VERSION,
 };
 
 pub use context::{
@@ -65,7 +66,7 @@ pub use ids::{
     id_json_schema, ArtifactDigest, AuditRecordId, CandidateId, DatasetVersionId, EpisodeId,
     EvaluationReportId, EvaluationRunId, EventId, EvolutionCycleId, EvolutionIssueId,
     FailureRecordId, FeedbackId, GenomeDigest, GenomeRevisionId, IncidentId, InvalidEvolutionId,
-    MutationId, OutcomeRevisionId, ReleaseId, RunId, SpanId, TaskCaseId,
+    MutationId, OutcomeRevisionId, PluginEnvironmentDigest, ReleaseId, RunId, SpanId, TaskCaseId,
 };
 pub use ipc::{
     ContextEvaluationReceiptV1, ContextEvaluationRequestV1, EvaluationReceiptV1,

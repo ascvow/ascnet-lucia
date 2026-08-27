@@ -813,6 +813,11 @@ fn trusted_environment(
         execution_profile_digest: String::new(),
         plugin_set_digest: digest_json(&parent.genome.plugins)?,
         capability_owner_digest: digest_json(&parent.genome.capability_owners)?,
+        plugin_environment_digest: parent
+            .genome
+            .plugin_environment_snapshot()
+            .digest()?
+            .to_string(),
         resource_budget_digest: String::new(),
         verifier_version: String::new(),
         evaluation_policy_version: String::new(),

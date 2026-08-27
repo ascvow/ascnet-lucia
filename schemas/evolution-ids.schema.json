@@ -108,6 +108,11 @@
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$",
       "description": "CAS 中单个制品的内容摘要"
+    },
+    "PluginEnvironmentDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "一次进化周期冻结插件环境的内容摘要"
     }
   }
 }

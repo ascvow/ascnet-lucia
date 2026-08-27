@@ -40,6 +40,8 @@ pub enum ComparisonViolationKind {
     PluginSet,
     /// Capability Owner 不同。
     CapabilityOwner,
+    /// 完整冻结插件环境不同或旧报告缺少完整摘要。
+    PluginEnvironment,
     /// 资源预算不同。
     ResourceBudget,
     /// Dataset ID 或版本不同。
@@ -431,6 +433,9 @@ pub struct EvolutionScorecard {
     pub parent_generation: Option<u64>,
     /// Candidate 代数；旧报告缺失时为 `None`。
     pub candidate_generation: Option<u64>,
+    /// 本轮 Parent 与 Candidate 必须共同使用的冻结插件环境摘要。
+    #[serde(default)]
+    pub plugin_environment_digest: String,
     /// Parent/Candidate 是否可比较。
     pub comparison_validity: ComparisonValidity,
     /// 仅表达行为能力的判定。
@@ -523,22 +528,22 @@ pub fn comparison_validity(report: &EvaluationReport) -> ComparisonValidity {
         &mut violations,
     );
     compare_field(
-        parent.plugin_set_digest == candidate.plugin_set_digest
-            || (report
-                .allowed_mutation_surfaces
-                .contains(&agent_evolution_protocol::MutationSurface::Plugin)
-                && report
-                    .genome_diff
-                    .changed_surfaces
-                    .contains(&agent_evolution_protocol::MutationSurface::Plugin)),
+        parent.plugin_set_digest == candidate.plugin_set_digest,
         ComparisonViolationKind::PluginSet,
-        "Plugin Set 不同且本轮未显式授权 Plugin 变异",
+        "Plugin Set 不同",
         &mut violations,
     );
     compare_field(
         parent.capability_owner_digest == candidate.capability_owner_digest,
         ComparisonViolationKind::CapabilityOwner,
         "Capability Owner 不同",
+        &mut violations,
+    );
+    compare_field(
+        !parent.plugin_environment_digest.is_empty()
+            && parent.plugin_environment_digest == candidate.plugin_environment_digest,
+        ComparisonViolationKind::PluginEnvironment,
+        "冻结插件环境摘要不同或缺失",
         &mut violations,
     );
     compare_field(
@@ -595,6 +600,15 @@ pub fn comparison_validity(report: &EvaluationReport) -> ComparisonValidity {
             detail: format!("包含未授权变异表面：{unauthorized:?}"),
         });
     }
+    if report
+        .allowed_mutation_surfaces
+        .contains(&agent_evolution_protocol::MutationSurface::Plugin)
+    {
+        violations.push(ComparisonViolation {
+            kind: ComparisonViolationKind::UnauthorizedMutationSurface,
+            detail: "Plugin 是只读遗留表面，不能由 Evolution Policy 授权".into(),
+        });
+    }
     ComparisonValidity {
         valid: violations.is_empty(),
         violations,
@@ -616,10 +630,8 @@ fn compare_field(
     }
 }
 
-/// 提取影响比较语义、但不包含 TaskCase 正文的稳定契约。
-fn task_case_contracts(
-    run: &agent_evolution_protocol::EvaluationRun,
-) -> BTreeSet<(
+/// 影响比较语义、但不包含 TaskCase 正文的稳定契约。
+type TaskCaseComparisonContract = (
     String,
     String,
     DatasetKind,
@@ -627,7 +639,12 @@ fn task_case_contracts(
     bool,
     Option<String>,
     BTreeSet<u32>,
-)> {
+);
+
+/// 提取运行中全部 TaskCase 的稳定比较契约。
+fn task_case_contracts(
+    run: &agent_evolution_protocol::EvaluationRun,
+) -> BTreeSet<TaskCaseComparisonContract> {
     run.task_cases
         .iter()
         .map(|case| {
@@ -745,6 +762,7 @@ pub fn compute_scorecard(
         lineage: report.lineage.clone(),
         parent_generation: report.parent_generation,
         candidate_generation: report.candidate_generation,
+        plugin_environment_digest: report.parent.environment.plugin_environment_digest.clone(),
         comparison_validity: validity,
         behavior_assessment: behavior,
         lifecycle: report.lifecycle,
@@ -1390,6 +1408,7 @@ mod tests {
             execution_profile_digest: "execution".into(),
             plugin_set_digest: "plugins".into(),
             capability_owner_digest: "owners".into(),
+            plugin_environment_digest: "plugins-and-owners".into(),
             resource_budget_digest: "budget".into(),
             verifier_version: "verifier".into(),
             evaluation_policy_version: "policy".into(),
@@ -1527,14 +1546,14 @@ mod tests {
         assert!(comparison_validity(&report()).valid);
     }
 
-    /// Plugin 是本轮显式允许且实际发生的变异表面时，Plugin Set 摘要变化仍可比较。
+    /// Plugin 即使被旧 Policy 显式允许，插件环境变化仍使比较无效。
     #[test]
-    fn allowed_plugin_diff_is_comparable() {
+    fn legacy_allowed_plugin_diff_is_invalid() {
         let mut value = report();
         value.candidate.environment.plugin_set_digest = "plugins-v2".into();
         value.genome_diff.changed_surfaces = [MutationSurface::Plugin].into_iter().collect();
         value.allowed_mutation_surfaces = [MutationSurface::Plugin].into_iter().collect();
-        assert!(comparison_validity(&value).valid);
+        assert!(!comparison_validity(&value).valid);
     }
 
     /// 仅修改 Plugin Set 环境摘要但没有对应授权差异时仍属于混杂变量。
@@ -1543,6 +1562,20 @@ mod tests {
         let mut value = report();
         value.candidate.environment.plugin_set_digest = "plugins-v2".into();
         assert!(!comparison_validity(&value).valid);
+    }
+
+    /// 完整插件环境摘要不同，即使旧集合摘要相同也不能比较。
+    #[test]
+    fn different_plugin_snapshot_is_invalid_comparison() {
+        let mut value = report();
+        value.candidate.environment.plugin_environment_digest =
+            "different-plugin-environment".into();
+        let validity = comparison_validity(&value);
+        assert!(!validity.valid);
+        assert!(validity
+            .violations
+            .iter()
+            .any(|violation| violation.kind == ComparisonViolationKind::PluginEnvironment));
     }
 
     /// Parent/Candidate 的 Repeat Count 总数相同也不能掩盖单个 Case 配对序号不一致。

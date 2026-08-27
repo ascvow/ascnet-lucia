@@ -19,6 +19,8 @@ use agent_skill::{GenomeSkillBinding, SkillCatalog};
 use agent_tool::{ExecutionPolicy, ExecutionProfile, ToolRegistry};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
+#[cfg(feature = "plugins")]
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 #[cfg(feature = "plugins")]
 use std::{
@@ -275,7 +277,23 @@ impl GenomeRuntimeBinding {
             selected_manifests.push(manifest.clone());
         }
 
-        resolve_plugin_load_order(&selected_manifests).context("Genome 插件依赖关系无效")?;
+        let resolved_load_order =
+            resolve_plugin_load_order(&selected_manifests).context("Genome 插件依赖关系无效")?;
+        for (actual_order, manifest_index) in resolved_load_order.into_iter().enumerate() {
+            let expected = &self.revision.genome.plugins[manifest_index];
+            if expected.load_order != Some(actual_order as u32) {
+                return Err(anyhow!(
+                    "插件 `{}` 的加载顺序与 Genome 冻结快照不一致",
+                    expected.id
+                ));
+            }
+            if !expected.hook_order.is_empty() {
+                return Err(anyhow!(
+                    "插件 `{}` 声明了当前 Host 无法独立证明的 Hook 顺序",
+                    expected.id
+                ));
+            }
+        }
         let selections = self
             .revision
             .genome
@@ -565,6 +583,32 @@ fn verify_plugin_snapshot(
             "插件 `{}` 的 bundle 摘要与 Genome 不一致",
             expected.id
         ));
+    }
+    if let Some(expected_manifest) = &expected.manifest_digest {
+        let bytes = std::fs::read(manifest_path)
+            .with_context(|| format!("读取插件 `{}` manifest 摘要输入失败", expected.id))?;
+        let actual_manifest =
+            ArtifactDigest::from_sha256_hex(format!("{:x}", Sha256::digest(bytes)))
+                .context("构造插件 Manifest 摘要失败")?;
+        if &actual_manifest != expected_manifest {
+            return Err(anyhow!(
+                "插件 `{}` 的 manifest 摘要与 Genome 不一致",
+                expected.id
+            ));
+        }
+    }
+    if let Some(expected_profile) = &expected.capability_profile_digest {
+        let bytes = serde_json::to_vec(&manifest.capabilities)
+            .context("序列化插件 Capability Profile 失败")?;
+        let actual_profile =
+            ArtifactDigest::from_sha256_hex(format!("{:x}", Sha256::digest(bytes)))
+                .context("构造插件 Capability Profile 摘要失败")?;
+        if &actual_profile != expected_profile {
+            return Err(anyhow!(
+                "插件 `{}` 的 Capability Profile 摘要与 Genome 不一致",
+                expected.id
+            ));
+        }
     }
     Ok(())
 }
@@ -879,6 +923,24 @@ mod tests {
 
         let bundle =
             agent_plugin_manager::hash_plugin_bundle(&selected).expect("应计算目标 bundle 摘要");
+        let selected_manifest_path = selected.join("plugin.toml");
+        let selected_manifest_bytes =
+            std::fs::read(&selected_manifest_path).expect("应读取目标 manifest");
+        let selected_manifest =
+            PluginManifest::load(&selected_manifest_path).expect("应解析目标 manifest");
+        let manifest_digest = ArtifactDigest::from_sha256_hex(format!(
+            "{:x}",
+            Sha256::digest(selected_manifest_bytes)
+        ))
+        .expect("manifest 摘要应合法");
+        let capability_profile_digest = ArtifactDigest::from_sha256_hex(format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&selected_manifest.capabilities)
+                    .expect("Capability Profile 应可序列化")
+            )
+        ))
+        .expect("Capability Profile 摘要应合法");
         let artifacts = FileArtifactStore::new(root.join("artifacts"));
         let policy = agent_evolution_protocol::ContextPolicyV1::default();
         let policy_artifact = ContextPolicyRepository::new(&artifacts)
@@ -891,7 +953,11 @@ mod tests {
             version: "1.2.3".into(),
             api_version: "0.7.0".into(),
             bundle: ArtifactDigest::from_sha256_hex(bundle).expect("bundle 摘要应合法"),
+            manifest_digest: Some(manifest_digest),
             config_digest: None,
+            capability_profile_digest: Some(capability_profile_digest),
+            load_order: Some(0),
+            hook_order: Vec::new(),
         }];
         revision.genome.capability_owners =
             BTreeMap::from([("agent.test-exclusive".into(), "selected".into())]);

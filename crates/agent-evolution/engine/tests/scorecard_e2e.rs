@@ -100,6 +100,7 @@ fn evolved_report() -> EvaluationReport {
         execution_profile_digest: "evaluation-v1".into(),
         plugin_set_digest: "plugins-v1".into(),
         capability_owner_digest: "owners-v1".into(),
+        plugin_environment_digest: "plugins-and-owners-v1".into(),
         resource_budget_digest: "budget-v1".into(),
         verifier_version: "verifier-v1".into(),
         evaluation_policy_version: "evaluation-v1".into(),

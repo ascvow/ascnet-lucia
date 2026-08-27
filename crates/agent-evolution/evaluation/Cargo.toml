@@ -10,8 +10,6 @@ description = "Lucia 受信离线评测、Fixture 与 Dataset 隔离运行时。
 agent-core = { path = "../../agent-core/kernel", version = "0.1.0", default-features = false }
 agent-evolution = { path = "../engine", version = "0.1.0" }
 agent-evolution-protocol = { path = "../protocol", version = "0.1.0" }
-agent-plugin-host = { path = "../../agent-plugins/host", version = "0.1.0" }
-agent-plugin-manager = { path = "../../agent-plugins/manager", version = "0.1.0" }
 agent-tool = { path = "../../agent-core/tool", version = "0.1.0", default-features = false, features = ["builtins"] }
 anyhow.workspace = true
 async-trait.workspace = true

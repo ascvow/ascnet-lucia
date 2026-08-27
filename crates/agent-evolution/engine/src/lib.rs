@@ -32,9 +32,6 @@ mod metrics;
 mod outbox;
 mod outcome_revision;
 mod pipeline;
-mod plugin_builder_worker;
-mod plugin_dependency_policy;
-mod plugin_workspace;
 mod prompt_cycle;
 mod prompt_mutation;
 mod recorder;
@@ -122,25 +119,6 @@ pub use metrics::{
 pub use outbox::{EvolutionOutbox, EvolutionOutboxItem, FileEvolutionOutbox, OutboxError};
 pub use outcome_revision::{FileOutcomeRevisionStore, OutcomeRevisionError, OutcomeRevisionStore};
 pub use pipeline::{EvolutionPipeline, PipelineError};
-pub use plugin_builder_worker::{
-    BuildStepRecord, ComponentInspectionRequest, ComponentInspector, ComponentInspectorFailure,
-    PluginBuildRequest, PluginBuildResult, PluginBuildStep, PluginBuilderWorker,
-    PluginBuilderWorkerConfig, PluginBuilderWorkerError, ProcessOutput, ProcessRequest,
-    ProcessRunner, ProcessRunnerFailure, ProcessStreamSummary, RealProcessRunner,
-    TrustedComponentInspection, MAX_PLUGIN_BUILDER_ERROR_BYTES, MAX_PLUGIN_COMPONENT_BYTES,
-    PLUGIN_BUILD_ENVIRONMENT_SCHEMA_VERSION, PLUGIN_BUILD_LOG_SCHEMA_VERSION,
-};
-pub use plugin_dependency_policy::{
-    PluginDependencyPolicy, PluginDependencyPolicyError, ValidatedPluginDependencyPlan,
-    MAX_PLUGIN_CARGO_LOCK_BYTES, MAX_PLUGIN_CARGO_MANIFEST_BYTES,
-    PLUGIN_DEPENDENCY_PLAN_SCHEMA_VERSION,
-};
-pub use plugin_workspace::{
-    PluginWorkspaceEntry, PluginWorkspaceError, PluginWorkspaceManifest,
-    PluginWorkspaceMaterializer, PluginWorkspaceRequest, ValidatedPluginWorkspacePlan,
-    MAX_PLUGIN_WORKSPACE_FILES, MAX_PLUGIN_WORKSPACE_FILE_BYTES, MAX_PLUGIN_WORKSPACE_PATCHES,
-    MAX_PLUGIN_WORKSPACE_TOTAL_BYTES, PLUGIN_PATCH_PLAN_SCHEMA_VERSION,
-};
 pub use prompt_cycle::{PromptCycleError, PromptEvolutionCycle};
 pub use prompt_mutation::{
     BoundedPromptMutator, MutationProposalContext, PromptMutationDraft, PromptMutationError,

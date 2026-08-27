@@ -357,6 +357,7 @@ impl<'a> SkillExitGate<'a> {
         let mut active_revision = GenomeRevision::create(
             active_genome,
             GenomeMetadata {
+                origin: agent_evolution_protocol::RevisionOrigin::Evolution,
                 created_at: None,
                 description: None,
                 parent: Some(candidate_revision.revision_id.clone()),

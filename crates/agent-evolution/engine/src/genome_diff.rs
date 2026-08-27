@@ -5,7 +5,7 @@
 
 use agent_evolution_protocol::{
     AgentGenome, GenomeDiff, GenomeRevision, GenomeRevisionError, MutationSurface,
-    PromptArtifactRef, PromptLayer,
+    PluginEnvironmentDigest, PluginEnvironmentDigestError, PromptArtifactRef, PromptLayer,
 };
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -37,6 +37,20 @@ pub enum GenomeDiffError {
         /// 调用方提供的可信允许集合。
         allowed: BTreeSet<MutationSurface>,
     },
+    /// Parent 或 Candidate 的冻结插件环境无法计算摘要。
+    #[error("计算冻结插件环境摘要失败：{0}")]
+    InvalidPluginEnvironment(#[from] PluginEnvironmentDigestError),
+    /// Candidate 改变了 Parent 冻结的插件环境。
+    #[error("Candidate 改变了冻结插件环境：parent={parent}，candidate={candidate}")]
+    FrozenPluginEnvironmentChanged {
+        /// Parent 的插件环境摘要。
+        parent: PluginEnvironmentDigest,
+        /// Candidate 的插件环境摘要。
+        candidate: PluginEnvironmentDigest,
+    },
+    /// 可信允许集合包含只读兼容用途的遗留插件变异表面。
+    #[error("插件变异表面仅用于读取历史数据，不能用于新进化周期")]
+    UnsupportedLegacyPluginSurface,
 }
 
 /// 从两份真实 Genome 修订生成可信差异。
@@ -151,7 +165,18 @@ pub fn verify_allowed_genome_diff(
     candidate: &GenomeRevision,
     allowed_surfaces: &BTreeSet<MutationSurface>,
 ) -> Result<GenomeDiff, GenomeDiffError> {
+    if allowed_surfaces.contains(&MutationSurface::Plugin) {
+        return Err(GenomeDiffError::UnsupportedLegacyPluginSurface);
+    }
     let diff = diff_genomes(parent, candidate)?;
+    let parent_plugin_environment = parent.genome.plugin_environment_snapshot().digest()?;
+    let candidate_plugin_environment = candidate.genome.plugin_environment_snapshot().digest()?;
+    if parent_plugin_environment != candidate_plugin_environment {
+        return Err(GenomeDiffError::FrozenPluginEnvironmentChanged {
+            parent: parent_plugin_environment,
+            candidate: candidate_plugin_environment,
+        });
+    }
     let unauthorized = diff
         .changed_surfaces
         .difference(allowed_surfaces)
@@ -306,14 +331,22 @@ mod tests {
                     version: "0.1.0".into(),
                     api_version: "0.7.0".into(),
                     bundle: digest('d'),
+                    manifest_digest: Some(digest('f')),
                     config_digest: None,
+                    capability_profile_digest: Some(digest('1')),
+                    load_order: Some(0),
+                    hook_order: vec!["before-model".into()],
                 },
                 PluginGenome {
                     id: "permission".into(),
                     version: "0.1.0".into(),
                     api_version: "0.7.0".into(),
                     bundle: digest('e'),
+                    manifest_digest: Some(digest('2')),
                     config_digest: None,
+                    capability_profile_digest: Some(digest('3')),
+                    load_order: Some(1),
+                    hook_order: vec!["before-tool".into()],
                 },
             ],
             capability_owners: [("agent.tool-policy".to_string(), "permission".to_string())]
@@ -361,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_owner_change_is_rejected() {
+    fn capability_owner_change_is_rejected_as_frozen_environment() {
         let parent = revision(sample_genome());
         let mut candidate_genome = parent.genome.clone();
         candidate_genome
@@ -369,7 +402,10 @@ mod tests {
             .insert("agent.tool-policy".into(), "context".into());
         let candidate = revision(candidate_genome);
 
-        assert_unauthorized(&parent, &candidate, MutationSurface::Plugin);
+        assert!(matches!(
+            verify_allowed_genome_diff(&parent, &candidate, &BTreeSet::new()),
+            Err(GenomeDiffError::FrozenPluginEnvironmentChanged { .. })
+        ));
     }
 
     #[test]
@@ -486,6 +522,90 @@ mod tests {
             }
             other => panic!("应返回未授权表面错误，实际为 {other:?}"),
         }
+    }
+
+    /// 断言任意插件环境字段变化都返回冻结依赖错误。
+    fn assert_frozen_plugin_change(mut mutate: impl FnMut(&mut AgentGenome)) {
+        let parent = revision(sample_genome());
+        let mut candidate_genome = parent.genome.clone();
+        mutate(&mut candidate_genome);
+        let candidate = revision(candidate_genome);
+        let allowed = [MutationSurface::TaskStrategyPrompt].into_iter().collect();
+        assert!(matches!(
+            verify_allowed_genome_diff(&parent, &candidate, &allowed),
+            Err(GenomeDiffError::FrozenPluginEnvironmentChanged { .. })
+        ));
+    }
+
+    /// Bundle 变化不能成为 Candidate。
+    #[test]
+    fn plugin_bundle_change_rejects_candidate() {
+        assert_frozen_plugin_change(|genome| genome.plugins[0].bundle = digest('9'));
+    }
+
+    /// 版本变化不能成为 Candidate。
+    #[test]
+    fn plugin_version_change_rejects_candidate() {
+        assert_frozen_plugin_change(|genome| genome.plugins[0].version = "0.2.0".into());
+    }
+
+    /// 不透明配置变化不能成为 Candidate。
+    #[test]
+    fn plugin_config_change_rejects_candidate() {
+        assert_frozen_plugin_change(|genome| genome.plugins[0].config_digest = Some(digest('9')));
+    }
+
+    /// 插件集合变化不能成为 Candidate。
+    #[test]
+    fn plugin_set_change_rejects_candidate() {
+        assert_frozen_plugin_change(|genome| {
+            genome.plugins.remove(0);
+            genome
+                .capability_owners
+                .retain(|_, owner| owner != "context");
+        });
+    }
+
+    /// 加载顺序变化不能成为 Candidate。
+    #[test]
+    fn plugin_load_order_change_rejects_candidate() {
+        assert_frozen_plugin_change(|genome| genome.plugins[0].load_order = Some(2));
+    }
+
+    /// Hook 顺序变化不能成为 Candidate。
+    #[test]
+    fn plugin_hook_order_change_rejects_candidate() {
+        assert_frozen_plugin_change(|genome| {
+            genome.plugins[0].hook_order.push("after-model".into());
+        });
+    }
+
+    /// Capability Profile 即插件权限变化不能成为 Candidate。
+    #[test]
+    fn plugin_permission_change_rejects_candidate() {
+        assert_frozen_plugin_change(|genome| {
+            genome.plugins[0].capability_profile_digest = Some(digest('9'));
+        });
+    }
+
+    /// Manifest 变化不能成为 Candidate。
+    #[test]
+    fn plugin_manifest_change_rejects_candidate() {
+        assert_frozen_plugin_change(|genome| {
+            genome.plugins[0].manifest_digest = Some(digest('9'));
+        });
+    }
+
+    /// 旧 Policy 即使声明 Plugin 表面也不能重新开启插件进化。
+    #[test]
+    fn legacy_plugin_surface_cannot_be_enabled() {
+        let parent = revision(sample_genome());
+        let candidate = revision(parent.genome.clone());
+        let allowed = [MutationSurface::Plugin].into_iter().collect();
+        assert!(matches!(
+            verify_allowed_genome_diff(&parent, &candidate, &allowed),
+            Err(GenomeDiffError::UnsupportedLegacyPluginSurface)
+        ));
     }
 
     #[test]

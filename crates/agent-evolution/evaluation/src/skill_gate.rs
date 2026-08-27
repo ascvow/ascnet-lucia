@@ -357,7 +357,11 @@ mod tests {
                 version: "1.0.0".into(),
                 api_version: "1".into(),
                 bundle: digest('1'),
+                manifest_digest: Some(digest('2')),
                 config_digest: None,
+                capability_profile_digest: Some(digest('3')),
+                load_order: Some(0),
+                hook_order: Vec::new(),
             }],
             capability_owners: BTreeMap::from([(
                 "episode.read_redacted".into(),

@@ -138,6 +138,7 @@ impl<'a> CandidateBuilder<'a> {
         let mut candidate_revision = GenomeRevision::create(
             candidate_genome,
             GenomeMetadata {
+                origin: agent_evolution_protocol::RevisionOrigin::Evolution,
                 created_at: None,
                 description: None,
                 parent: Some(parent.revision_id.clone()),

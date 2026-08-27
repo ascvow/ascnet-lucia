@@ -222,6 +222,8 @@ pub enum FailureDisposition {
     EvolutionCandidate,
     /// 属于平台工程任务，不能由 Agent 自进化解决。
     PlatformEngineering,
+    /// 插件实现、Bundle 或契约需要由开发者人工维护。
+    PluginMaintenance,
     /// 安全事件，立即隔离并告警。
     SecurityIncident,
     /// 基础设施或运维问题。
@@ -257,6 +259,7 @@ pub fn default_disposition(kind: FailureKind, occurrences: usize) -> FailureDisp
         FailureKind::EnvironmentFailure | FailureKind::RuntimeFailure => {
             FailureDisposition::InfrastructureOperations
         }
+        FailureKind::PluginFailure => FailureDisposition::PluginMaintenance,
         FailureKind::VerificationFailure | FailureKind::ContextLoss => {
             FailureDisposition::EvolutionCandidate
         }
@@ -348,6 +351,10 @@ mod tests {
         assert_eq!(
             default_disposition(FailureKind::PermissionFailure, 1),
             FailureDisposition::SecurityIncident
+        );
+        assert_eq!(
+            default_disposition(FailureKind::PluginFailure, 3),
+            FailureDisposition::PluginMaintenance
         );
         let _ = ArtifactDigest::from_sha256_hex("b".repeat(64)).expect("摘要应合法");
     }

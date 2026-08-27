@@ -2,7 +2,8 @@
 //!
 //! 单次普通错误只产生 [`FailureDisposition::Observe`]；同一指纹的失败达到阈值后
 //! 才聚合为 [`EvolutionIssue`] 并进入 [`FailureDisposition::EvolutionCandidate`]。
-//! 安全相关失败单次即 [`FailureDisposition::SecurityIncident`]。
+//! 插件实现失败进入人工插件维护，安全相关失败单次即
+//! [`FailureDisposition::SecurityIncident`]。
 
 use agent_evolution_protocol::{
     default_disposition, DiagnosticStatus, EpisodeId, EvolutionIssue, EvolutionIssueId,

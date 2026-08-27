@@ -327,6 +327,7 @@ async fn expected_active_revision(
     let mut revision = GenomeRevision::create(
         genome,
         GenomeMetadata {
+            origin: agent_evolution_protocol::RevisionOrigin::Evolution,
             created_at: None,
             description: None,
             parent: Some(candidate_revision.revision_id),

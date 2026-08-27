@@ -34,6 +34,7 @@ fn environment() -> EvaluationEnvironment {
         execution_profile_digest: "sha256:evaluation-v1".to_string(),
         plugin_set_digest: "sha256:none".to_string(),
         capability_owner_digest: "sha256:native-fixture".to_string(),
+        plugin_environment_digest: "sha256:plugin-environment-fixture".to_string(),
         resource_budget_digest: "sha256:builtin-budget-v1".to_string(),
         verifier_version: "builtin-v1".to_string(),
         evaluation_policy_version: "evaluation-v1".to_string(),

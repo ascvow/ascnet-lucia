@@ -88,6 +88,9 @@ pub struct EvaluationEnvironment {
     pub plugin_set_digest: String,
     /// Capability Owner 映射的规范化内容摘要。
     pub capability_owner_digest: String,
+    /// 完整冻结插件环境摘要；旧报告缺失时只能只读，不能进入新比较或 Promotion。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plugin_environment_digest: String,
     /// 资源预算的规范化内容摘要。
     pub resource_budget_digest: String,
     /// Verifier 实现版本。
@@ -526,6 +529,7 @@ mod tests {
             execution_profile_digest: "evaluation".into(),
             plugin_set_digest: "plugins".into(),
             capability_owner_digest: "owners".into(),
+            plugin_environment_digest: "plugins-and-owners".into(),
             resource_budget_digest: "budget".into(),
             verifier_version: "verifier-1".into(),
             evaluation_policy_version: "policy-1".into(),

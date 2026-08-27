@@ -385,6 +385,10 @@ digest_id!(
     "Genome 行为字段的内容摘要；行为不变则摘要不变。"
 );
 digest_id!(ArtifactDigest, "CAS 中单个制品的内容摘要。");
+digest_id!(
+    PluginEnvironmentDigest,
+    "一次进化周期冻结插件环境的内容摘要。"
+);
 
 /// 返回覆盖全部标识类型的 JSON Schema。
 ///
@@ -428,6 +432,10 @@ pub fn id_json_schema() -> serde_json::Value {
             "EvolutionIssueId": entry(EvolutionIssueId::PATTERN, "聚类后形成的稳定进化问题"),
             "GenomeDigest": entry(GenomeDigest::PATTERN, "Genome 行为字段的内容摘要"),
             "ArtifactDigest": entry(ArtifactDigest::PATTERN, "CAS 中单个制品的内容摘要"),
+            "PluginEnvironmentDigest": entry(
+                PluginEnvironmentDigest::PATTERN,
+                "一次进化周期冻结插件环境的内容摘要"
+            ),
         }
     })
 }
@@ -553,7 +561,7 @@ mod tests {
     fn checked_in_schema_matches_rust_definition() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../schemas/evolution-ids.schema.json"
+            "/../../../schemas/evolution-ids.schema.json"
         );
         let generated = format!(
             "{}\n",
@@ -578,7 +586,7 @@ mod tests {
     fn schema_patterns_accept_real_values() {
         let schema = id_json_schema();
         let defs = schema["$defs"].as_object().expect("应有 $defs");
-        assert_eq!(defs.len(), 21, "21 个标识类型都应出现在 schema 中");
+        assert_eq!(defs.len(), 22, "22 个标识类型都应出现在 schema 中");
 
         let run_pattern = defs["RunId"]["pattern"].as_str().expect("应有 pattern");
         assert!(Regex::new(run_pattern)

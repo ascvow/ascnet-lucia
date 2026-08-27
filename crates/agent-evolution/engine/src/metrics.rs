@@ -772,6 +772,7 @@ mod tests {
                 execution_profile_digest: "execution".into(),
                 plugin_set_digest: "plugins".into(),
                 capability_owner_digest: "owners".into(),
+                plugin_environment_digest: "plugins-and-owners".into(),
                 resource_budget_digest: "budget".into(),
                 verifier_version: "verifier".into(),
                 evaluation_policy_version: "policy".into(),

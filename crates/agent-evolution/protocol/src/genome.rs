@@ -10,7 +10,9 @@
 //! 摘要通过校验后的稳定 JSON 字节计算；结构字段顺序、`BTreeMap` / `BTreeSet` 和
 //! 已校验列表共同保证同一行为配置跨进程得到相同结果。
 
-use crate::ids::{ArtifactDigest, GenomeDigest, GenomeRevisionId};
+use crate::ids::{
+    ArtifactDigest, GenomeDigest, GenomeRevisionId, InvalidEvolutionId, PluginEnvironmentDigest,
+};
 use agent_tool::{ExecutionPolicy, ToolAccess};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,7 +20,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 /// Genome 结构版本；字段语义变化时必须递增。
-pub const GENOME_SCHEMA_VERSION: u32 = 1;
+pub const GENOME_SCHEMA_VERSION: u32 = 2;
+
+/// 仍可只读加载的最早 Genome 结构版本。
+const MIN_READABLE_GENOME_SCHEMA_VERSION: u32 = 1;
 
 /// Genome 校验失败。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -49,6 +54,14 @@ pub enum InvalidGenome {
         found: u32,
         /// 支持的版本。
         supported: u32,
+    },
+    /// 新版 Genome 缺少完整冻结插件环境字段。
+    #[error("schema v2 插件 `{plugin}` 缺少冻结字段 `{field}`")]
+    MissingPluginEnvironmentField {
+        /// 插件 ID。
+        plugin: String,
+        /// 缺失字段。
+        field: &'static str,
     },
 }
 
@@ -168,9 +181,58 @@ pub struct PluginGenome {
     pub api_version: String,
     /// bundle 的内容摘要。
     pub bundle: ArtifactDigest,
+    /// Manifest 的内容摘要；旧归档缺失时为 `None`，只能作为冻结遗留环境使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_digest: Option<ArtifactDigest>,
     /// 插件配置的内容摘要；无配置时为 `None`。
     #[serde(default)]
     pub config_digest: Option<ArtifactDigest>,
+    /// Capability Profile 的内容摘要；旧归档缺失时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_profile_digest: Option<ArtifactDigest>,
+    /// 插件在宿主中的加载次序；数值越小越先加载。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_order: Option<u32>,
+    /// 插件 Hook 的稳定执行次序，元素为宿主定义的 Hook 标识。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hook_order: Vec<String>,
+}
+
+/// 一次进化周期使用的完整冻结插件环境快照。
+///
+/// 快照只包含影响插件行为的字段；插件源码路径、下载来源和显示名称不属于运行环境。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginEnvironmentSnapshot {
+    /// 已解析插件集合及其版本、Bundle、Manifest、配置、权限和执行顺序。
+    pub plugins: Vec<PluginGenome>,
+    /// 独占能力到固定插件 owner 的绑定。
+    pub capability_owners: BTreeMap<String, String>,
+}
+
+impl PluginEnvironmentSnapshot {
+    /// 计算冻结插件环境的稳定 SHA-256 摘要。
+    ///
+    /// # Errors
+    ///
+    /// 快照无法序列化，或摘要无法构造成强类型值时返回错误。
+    pub fn digest(&self) -> Result<PluginEnvironmentDigest, PluginEnvironmentDigestError> {
+        let bytes =
+            serde_json::to_vec(self).map_err(PluginEnvironmentDigestError::Serialization)?;
+        let hex = format!("{:x}", Sha256::digest(bytes));
+        PluginEnvironmentDigest::from_sha256_hex(hex)
+            .map_err(PluginEnvironmentDigestError::InvalidDigest)
+    }
+}
+
+/// 冻结插件环境摘要计算失败。
+#[derive(Debug, thiserror::Error)]
+pub enum PluginEnvironmentDigestError {
+    /// 快照无法编码为稳定 JSON。
+    #[error("序列化插件环境快照失败：{0}")]
+    Serialization(serde_json::Error),
+    /// SHA-256 文本无法构造成强类型摘要。
+    #[error("构造插件环境摘要失败：{0}")]
+    InvalidDigest(InvalidEvolutionId),
 }
 
 /// 暴露给模型的工具集合。
@@ -266,6 +328,14 @@ pub struct AgentGenome {
 }
 
 impl AgentGenome {
+    /// 返回当前 Genome 绑定的冻结插件环境快照。
+    pub fn plugin_environment_snapshot(&self) -> PluginEnvironmentSnapshot {
+        PluginEnvironmentSnapshot {
+            plugins: self.plugins.clone(),
+            capability_owners: self.capability_owners.clone(),
+        }
+    }
+
     /// 校验结构不变量。
     ///
     /// 只有通过校验的 Genome 才可以计算摘要：未排序的列表会让同一份配置产生
@@ -276,7 +346,9 @@ impl AgentGenome {
     /// schema 版本不符、列表未排序或存在重复、能力 owner 指向未知插件，
     /// 或 Prompt 中出现 Session 层时返回 [`InvalidGenome`]。
     pub fn validate(&self) -> Result<(), InvalidGenome> {
-        if self.schema_version != GENOME_SCHEMA_VERSION {
+        if !(MIN_READABLE_GENOME_SCHEMA_VERSION..=GENOME_SCHEMA_VERSION)
+            .contains(&self.schema_version)
+        {
             return Err(InvalidGenome::UnsupportedSchemaVersion {
                 found: self.schema_version,
                 supported: GENOME_SCHEMA_VERSION,
@@ -294,6 +366,25 @@ impl AgentGenome {
                 field: "skills",
                 key: "id",
             });
+        }
+        if self.schema_version >= 2 {
+            for plugin in &self.plugins {
+                for (field, missing) in [
+                    ("manifest_digest", plugin.manifest_digest.is_none()),
+                    (
+                        "capability_profile_digest",
+                        plugin.capability_profile_digest.is_none(),
+                    ),
+                    ("load_order", plugin.load_order.is_none()),
+                ] {
+                    if missing {
+                        return Err(InvalidGenome::MissingPluginEnvironmentField {
+                            plugin: plugin.id.clone(),
+                            field,
+                        });
+                    }
+                }
+            }
         }
 
         if self
@@ -382,6 +473,9 @@ where
 /// 这些字段**不参与**摘要计算，因此改动它们不会产生新的行为版本。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GenomeMetadata {
+    /// 修订来源；用于区分 Evolution 与人工插件管理基线。
+    #[serde(default)]
+    pub origin: RevisionOrigin,
     /// 登记时间，RFC 3339 文本。
     #[serde(default)]
     pub created_at: Option<String>,
@@ -394,6 +488,23 @@ pub struct GenomeMetadata {
     /// 产生该修订的变异提案；人工登记时为 `None`。
     #[serde(default)]
     pub mutation: Option<crate::ids::MutationId>,
+}
+
+/// Genome 修订的可信来源分类。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionOrigin {
+    /// 自动进化产生的行为制品修订。
+    Evolution,
+    /// 用户人工修改普通配置。
+    ManualConfiguration,
+    /// 用户人工安装、升级、启停或重新配置插件。
+    PluginManagement,
+    /// Lucia 平台升级产生的新基线。
+    PlatformUpgrade,
+    /// 从旧归档或外部系统导入。
+    #[default]
+    Import,
 }
 
 /// 一次 Genome 登记。
@@ -515,14 +626,22 @@ mod tests {
                     version: "0.1.0".into(),
                     api_version: "0.7.0".into(),
                     bundle: digest('c'),
+                    manifest_digest: Some(digest('e')),
                     config_digest: None,
+                    capability_profile_digest: Some(digest('f')),
+                    load_order: Some(0),
+                    hook_order: vec!["before-model".into()],
                 },
                 PluginGenome {
                     id: "permission".into(),
                     version: "0.1.0".into(),
                     api_version: "0.7.0".into(),
                     bundle: digest('d'),
+                    manifest_digest: Some(digest('1')),
                     config_digest: None,
+                    capability_profile_digest: Some(digest('2')),
+                    load_order: Some(1),
+                    hook_order: vec!["before-tool".into()],
                 },
             ],
             capability_owners: [("agent.tool-policy".to_string(), "permission".to_string())]
@@ -634,6 +753,7 @@ mod tests {
         let revision = GenomeRevision::create(
             genome.clone(),
             GenomeMetadata {
+                origin: RevisionOrigin::ManualConfiguration,
                 created_at: Some("2026-08-15T00:00:00Z".into()),
                 description: Some("首个版本".into()),
                 parent: None,

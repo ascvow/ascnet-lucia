@@ -484,6 +484,7 @@ mod tests {
             execution_profile_digest: "evaluation-digest".to_string(),
             plugin_set_digest: "plugin-digest".to_string(),
             capability_owner_digest: "owner-digest".to_string(),
+            plugin_environment_digest: "plugin-environment-digest".to_string(),
             resource_budget_digest: "budget-digest".to_string(),
             verifier_version: "builtin-v1".to_string(),
             evaluation_policy_version: COMMIT_POLICY_VERSION.to_string(),

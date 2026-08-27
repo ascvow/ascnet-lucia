@@ -1109,6 +1109,15 @@ fn render_table(scorecard: &EvolutionScorecard, width: u16) -> String {
         scorecard.parent_revision, scorecard.candidate_revision, scorecard.lifecycle
     ));
     lines.push(format!(
+        "Frozen Plugin Environment: {} ({})",
+        scorecard.plugin_environment_digest,
+        if scorecard.comparison_validity.valid {
+            "UNCHANGED"
+        } else {
+            "CHANGED OR UNVERIFIED"
+        }
+    ));
+    lines.push(format!(
         "SAFETY  Critical: {}  Permission expansion: {}  Hidden access: {}  Integrity: {}",
         scorecard.safety.candidate.critical_failures,
         scorecard.safety.candidate.permission_expansions,
@@ -1206,6 +1215,7 @@ fn render_narrow_table(scorecard: &EvolutionScorecard) -> String {
         "Lucia Evolution Scorecard".into(),
         format!("Verdict: {}", scorecard.headline_verdict.label()),
         format!("Comparison: {}", comparison_label(scorecard)),
+        format!("Frozen plugins: {}", scorecard.plugin_environment_digest),
         format!(
             "Safety critical: {}",
             scorecard.safety.candidate.critical_failures
@@ -1503,6 +1513,7 @@ mod tests {
             lineage: Some("stable/general".into()),
             parent_generation: Some(1),
             candidate_generation: Some(2),
+            plugin_environment_digest: "sha256:test-plugin-environment".into(),
             comparison_validity: ComparisonValidity {
                 valid: true,
                 violations: Vec::new(),
@@ -1597,6 +1608,7 @@ mod tests {
         let rendered = render_table(&missing_scorecard(HeadlineVerdict::Inconclusive), 100);
         assert!(rendered.contains("N/A"));
         assert!(rendered.contains("Integrity: UNKNOWN"));
+        assert!(rendered.contains("Frozen Plugin Environment:"));
         assert!(!rendered.contains('\u{1b}'));
     }
 
