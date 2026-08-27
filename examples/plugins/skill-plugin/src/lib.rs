@@ -9,12 +9,21 @@ use agent_plugin::{
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};
 
 /// 插件内部动态工具 ID。
 const READ_TOOL_LOCAL_NAME: &str = "read";
 /// 注入 Agent 的 Skill 索引提示 ID。
 const SKILL_PROMPT_ID: &str = "available-skills";
+/// Evidence 装配层注入的版本化 Skill Set 元数据键。
+const SKILL_SET_JSON_METADATA_KEY: &str = "skill_set_json";
+/// 当前支持的 Genome Skill Set 信封版本。
+const SKILL_SET_SCHEMA_VERSION: u32 = 1;
+/// 当前支持的 SkillArtifact 版本。
+const SKILL_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+/// 单次 Genome 最多装配的 Skill 数量。
+const MAX_GENOME_SKILLS: usize = 256;
 /// 单个 Skill 文件允许的最大字节数。
 const MAX_SKILL_BYTES: usize = 1024 * 1024;
 /// 一次激活允许扫描的最大目录项数。
@@ -25,12 +34,82 @@ const MAX_SCAN_DEPTH: usize = 8;
 /// 已解析并可按需读取的 Skill 描述。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SkillDescriptor {
+    /// Genome 模式下的强类型稳定 ID；本地目录模式没有该字段。
+    skill_id: Option<String>,
     /// Skill 的稳定名称。
     name: String,
     /// 注入 Agent 索引提示的简短说明。
     description: String,
-    /// 相对于插件目录的 `SKILL.md` 路径。
-    path: String,
+    /// 完整指令的可信来源。
+    source: SkillSource,
+}
+
+/// Skill 完整指令的来源，Genome 制品与兼容目录扫描互斥。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillSource {
+    /// 相对于插件目录的兼容 `SKILL.md` 路径。
+    LocalFile { path: String },
+    /// TUI 从真实 CAS 固定并由 Guest 复核摘要的制品正文。
+    GenomeArtifact {
+        /// 原 Candidate 的不可变 Genome Revision ID。
+        genome_revision_id: String,
+        /// 原 Candidate 的不可变 Genome 行为摘要。
+        genome_digest: String,
+        /// 规范 SkillArtifact JSON 的 SHA-256 摘要。
+        artifact_digest: String,
+        /// SkillArtifact 中的精确版本化指令。
+        instructions: String,
+    },
+}
+
+/// TUI 注入的版本化 Genome Skill Set 信封。
+#[derive(Debug, Deserialize)]
+struct GenomeSkillSetV1 {
+    /// 信封结构版本。
+    schema_version: u32,
+    /// 原 Candidate 的不可变 Genome Revision ID。
+    genome_revision_id: String,
+    /// 原 Candidate 的不可变 Genome 行为摘要。
+    genome_digest: String,
+    /// 可信装配层固定的执行平面。
+    execution_profile: String,
+    /// 按 Skill ID 排序的精确制品引用。
+    skills: Vec<InjectedSkillArtifactV1>,
+}
+
+/// 一项携带原始规范 JSON 的 Skill 制品。
+#[derive(Debug, Deserialize)]
+struct InjectedSkillArtifactV1 {
+    /// Genome 与制品共同固定的 Skill ID。
+    skill_id: String,
+    /// 原始规范 JSON 的 SHA-256 摘要。
+    artifact_digest: String,
+    /// 来自 Artifact CAS 的原始规范 JSON。
+    artifact_json: String,
+}
+
+/// Guest 执行所需的 SkillArtifact V1 兼容字段。
+#[derive(Debug, Deserialize)]
+struct SkillArtifactV1 {
+    /// SkillArtifact 结构版本。
+    schema_version: u32,
+    /// 制品自身声明的稳定 Skill ID。
+    skill_id: String,
+    /// 面向模型的短名称。
+    name: String,
+    /// 用途说明。
+    description: String,
+    /// 按需读取时返回的完整指令。
+    instructions: String,
+    /// 完整状态链；只有终态 Active 可进入新运行。
+    status_history: Vec<SkillStatusTransitionV1>,
+}
+
+/// Guest 只读取状态链终态所需的兼容记录。
+#[derive(Debug, Deserialize)]
+struct SkillStatusTransitionV1 {
+    /// 小写下划线形式的生命周期状态。
+    status: String,
 }
 
 /// `skill_read` 工具参数。
@@ -51,25 +130,19 @@ struct SkillPlugin {
 }
 
 impl AgentPlugin for SkillPlugin {
-    /// 扫描 manifest 配置的目录并注册 Skill 索引和读取工具。
+    /// 优先消费可信 Genome Skill Set；未注入时扫描 manifest 配置目录以保持兼容。
     fn activate(&mut self, host: &dyn PluginHostApi, context: ActivationContext) -> Result<()> {
-        let skills_dir = context
-            .metadata
-            .get("skills_dir")
-            .map(String::as_str)
-            .unwrap_or("skills");
-        let paths = discover_skill_paths(host, skills_dir)?;
-
-        self.skills.clear();
-        for path in paths {
-            let source = host
-                .read_file(&path)
-                .with_context(|| format!("读取 Skill 失败：{path}"))?;
-            let skill = parse_skill(&path, &source)?;
-            if self.skills.insert(skill.name.clone(), skill).is_some() {
-                return Err(anyhow!("Skill 名称重复：{path}"));
-            }
-        }
+        self.skills =
+            if let Some(skill_set_json) = context.metadata.get(SKILL_SET_JSON_METADATA_KEY) {
+                parse_genome_skill_set(skill_set_json)?
+            } else {
+                let skills_dir = context
+                    .metadata
+                    .get("skills_dir")
+                    .map(String::as_str)
+                    .unwrap_or("skills");
+                load_local_skills(host, skills_dir)?
+            };
 
         let public_tool_name = host.upsert_tool(READ_TOOL_LOCAL_NAME, &skill_read_tool())?;
         let prompt = build_skill_prompt(&self.skills, &public_tool_name);
@@ -114,7 +187,7 @@ impl AgentPlugin for SkillPlugin {
         Vec::new()
     }
 
-    /// 使用 Host 受控文件 API 返回模型选中的完整 Skill 指令。
+    /// 返回模型选中的完整 Skill 指令；Genome 模式不会再次读取插件目录。
     fn call_tool_with_host(
         &mut self,
         host: &dyn PluginHostApi,
@@ -144,32 +217,67 @@ impl AgentPlugin for SkillPlugin {
                 format!("未知 Skill：{}", args.name),
             ));
         };
-        let content = match host.read_file(&skill.path) {
-            Ok(content) => content,
-            Err(error) => {
-                return Ok(ToolResult::error(
-                    call.id,
-                    call.name,
-                    format!("读取 Skill `{}` 失败：{error}", skill.name),
-                ));
-            }
+        let (content, artifact_digest) = match &skill.source {
+            SkillSource::LocalFile { path } => match host.read_file(path) {
+                Ok(content) => (content, None),
+                Err(error) => {
+                    return Ok(ToolResult::error(
+                        call.id,
+                        call.name,
+                        format!("读取 Skill `{}` 失败：{error}", skill.name),
+                    ));
+                }
+            },
+            SkillSource::GenomeArtifact {
+                artifact_digest,
+                instructions,
+                ..
+            } => (instructions.clone(), Some(artifact_digest.as_str())),
         };
-        host.emit_event(&ExtensionEvent {
-            name: "skill.loaded".into(),
-            data: json!({
-                "name": skill.name,
-                "path": skill.path,
-                "text": format!("加载 Skill：{}", skill.name),
-            }),
-            presentation: Some(EventPresentation::divider(
-                format!("加载 Skill：{}", skill.name),
-                EventPresentationTone::Info,
-            )),
-        })?;
+        if let (Some(skill_id), Some(artifact_digest)) = (&skill.skill_id, artifact_digest) {
+            let SkillSource::GenomeArtifact {
+                genome_revision_id,
+                genome_digest,
+                ..
+            } = &skill.source
+            else {
+                unreachable!("Genome Skill 必须携带 Genome 绑定")
+            };
+            host.emit_event(&ExtensionEvent {
+                name: "skill.loaded.v1".into(),
+                data: json!({
+                    "schema_version": 1,
+                    "skill_id": skill_id,
+                    "artifact_digest": artifact_digest,
+                    "genome_revision_id": genome_revision_id,
+                    "genome_digest": genome_digest,
+                    "call_id": call.id,
+                    "text": format!("加载 Skill：{}", skill.name),
+                }),
+                presentation: Some(EventPresentation::divider(
+                    format!("加载 Skill：{}", skill.name),
+                    EventPresentationTone::Info,
+                )),
+            })?;
+        } else {
+            host.emit_event(&ExtensionEvent {
+                name: "skill.loaded".into(),
+                data: json!({
+                    "name": skill.name,
+                    "text": format!("加载 Skill：{}", skill.name),
+                }),
+                presentation: Some(EventPresentation::divider(
+                    format!("加载 Skill：{}", skill.name),
+                    EventPresentationTone::Info,
+                )),
+            })?;
+        }
         Ok(ToolResult::success(
             call.id,
             call.name,
             json!({
+                "skill_id": skill.skill_id,
+                "artifact_digest": artifact_digest,
                 "name": skill.name,
                 "description": skill.description,
                 "content": content,
@@ -219,6 +327,166 @@ fn build_skill_prompt(
     format!(
         "当前可用 Skill：\n{index}\n当任务与某项描述匹配时，先调用 `{public_tool_name}` 读取完整指令，再按指令执行。不要在不匹配时加载 Skill。"
     )
+}
+
+/// 从 Host 可信元数据解析 Genome Skill Set，并复核每项原始制品摘要与绑定关系。
+///
+/// # Errors
+///
+/// 信封版本或执行平面不受支持、Skill 未排序或重复、制品摘要不匹配、ID 错绑，或终态
+/// 不允许进入当前执行平面时返回错误并阻止插件激活。
+fn parse_genome_skill_set(source: &str) -> Result<BTreeMap<String, SkillDescriptor>> {
+    let skill_set: GenomeSkillSetV1 =
+        serde_json::from_str(source).context("解析 Genome Skill Set JSON 失败")?;
+    if skill_set.schema_version != SKILL_SET_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "Genome Skill Set 版本不受支持：{}",
+            skill_set.schema_version
+        ));
+    }
+    if skill_set.skills.len() > MAX_GENOME_SKILLS {
+        return Err(anyhow!("Genome Skill Set 超过数量上限 {MAX_GENOME_SKILLS}"));
+    }
+    if !matches!(
+        skill_set.execution_profile.as_str(),
+        "serve" | "evaluation" | "mutation"
+    ) {
+        return Err(anyhow!(
+            "Genome Skill Set 执行平面不受支持：{}",
+            skill_set.execution_profile
+        ));
+    }
+    if skill_set.genome_revision_id.trim().is_empty() {
+        return Err(anyhow!("Genome Skill Set 缺少 genome_revision_id"));
+    }
+    validate_artifact_digest(&skill_set.genome_digest)
+        .context("Genome Skill Set genome_digest 无效")?;
+
+    let mut skills = BTreeMap::new();
+    let mut previous_id: Option<&str> = None;
+    for injected in &skill_set.skills {
+        validate_skill_id(&injected.skill_id)?;
+        if previous_id.is_some_and(|previous| previous >= injected.skill_id.as_str()) {
+            return Err(anyhow!("Genome Skill Set 必须按 Skill ID 严格升序排列"));
+        }
+        validate_artifact_digest(&injected.artifact_digest)?;
+        let actual_digest = format!("{:x}", Sha256::digest(injected.artifact_json.as_bytes()));
+        if actual_digest != injected.artifact_digest {
+            return Err(anyhow!(
+                "Skill `{}` 制品摘要不匹配：期望 {}，实际 {actual_digest}",
+                injected.skill_id,
+                injected.artifact_digest
+            ));
+        }
+        let artifact: SkillArtifactV1 = serde_json::from_str(&injected.artifact_json)
+            .with_context(|| format!("解析 Skill `{}` 制品失败", injected.skill_id))?;
+        if artifact.schema_version != SKILL_ARTIFACT_SCHEMA_VERSION {
+            return Err(anyhow!(
+                "Skill `{}` 制品版本不受支持：{}",
+                injected.skill_id,
+                artifact.schema_version
+            ));
+        }
+        if artifact.skill_id != injected.skill_id {
+            return Err(anyhow!(
+                "Skill Set ID `{}` 与制品 ID `{}` 不一致",
+                injected.skill_id,
+                artifact.skill_id
+            ));
+        }
+        let final_status = artifact
+            .status_history
+            .last()
+            .map(|transition| transition.status.as_str());
+        if !skill_status_is_loadable(&skill_set.execution_profile, final_status) {
+            return Err(anyhow!(
+                "Skill `{}` 终态 {final_status:?} 不能进入 {} 运行",
+                injected.skill_id,
+                skill_set.execution_profile
+            ));
+        }
+        validate_skill_name(&artifact.name)
+            .with_context(|| format!("Skill `{}` 名称无效", injected.skill_id))?;
+        if artifact.description.trim().is_empty() || artifact.description.chars().count() > 4_096 {
+            return Err(anyhow!("Skill `{}` description 无效", injected.skill_id));
+        }
+        if artifact.instructions.trim().is_empty() || artifact.instructions.len() > 65_536 {
+            return Err(anyhow!("Skill `{}` instructions 无效", injected.skill_id));
+        }
+
+        let descriptor = SkillDescriptor {
+            skill_id: Some(injected.skill_id.clone()),
+            name: artifact.name,
+            description: artifact.description,
+            source: SkillSource::GenomeArtifact {
+                genome_revision_id: skill_set.genome_revision_id.clone(),
+                genome_digest: skill_set.genome_digest.clone(),
+                artifact_digest: injected.artifact_digest.clone(),
+                instructions: artifact.instructions,
+            },
+        };
+        let name = descriptor.name.clone();
+        if skills.insert(name.clone(), descriptor).is_some() {
+            return Err(anyhow!("Genome Skill 名称重复：{name}"));
+        }
+        previous_id = Some(injected.skill_id.as_str());
+    }
+    Ok(skills)
+}
+
+/// 在 Guest 侧执行与可信装配层相同的 Skill 状态和运行平面门禁。
+fn skill_status_is_loadable(profile: &str, status: Option<&str>) -> bool {
+    match profile {
+        "serve" => status == Some("active"),
+        "evaluation" => matches!(status, Some("quarantined" | "evaluated" | "active")),
+        "mutation" => false,
+        _ => false,
+    }
+}
+
+/// 在未注入 Genome Skill Set 时加载本地目录，保持既有安装模式兼容。
+fn load_local_skills(
+    host: &dyn PluginHostApi,
+    skills_dir: &str,
+) -> Result<BTreeMap<String, SkillDescriptor>> {
+    let mut skills = BTreeMap::new();
+    for path in discover_skill_paths(host, skills_dir)? {
+        let source = host
+            .read_file(&path)
+            .with_context(|| format!("读取 Skill 失败：{path}"))?;
+        let skill = parse_skill(&path, &source)?;
+        if skills.insert(skill.name.clone(), skill).is_some() {
+            return Err(anyhow!("Skill 名称重复：{path}"));
+        }
+    }
+    Ok(skills)
+}
+
+/// 校验 Skill ID 的跨语言稳定形式。
+fn validate_skill_id(skill_id: &str) -> Result<()> {
+    let Some(body) = skill_id.strip_prefix("skill_") else {
+        return Err(anyhow!("Skill ID 前缀无效：{skill_id}"));
+    };
+    if !(8..=64).contains(&body.len())
+        || !body
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return Err(anyhow!("Skill ID 格式无效：{skill_id}"));
+    }
+    Ok(())
+}
+
+/// 校验 ArtifactDigest 的小写 SHA-256 十六进制形式。
+fn validate_artifact_digest(digest: &str) -> Result<()> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(anyhow!("Skill 制品摘要格式无效：{digest}"));
+    }
+    Ok(())
 }
 
 /// 在受控目录内递归发现 `SKILL.md`，并限制扫描规模与深度。
@@ -291,9 +559,12 @@ fn parse_skill(path: &str, source: &str) -> Result<SkillDescriptor> {
         return Err(anyhow!("Skill description 超过 1024 个字符：{path}"));
     }
     Ok(SkillDescriptor {
+        skill_id: None,
         name,
         description,
-        path: path.to_string(),
+        source: SkillSource::LocalFile {
+            path: path.to_string(),
+        },
     })
 }
 
@@ -419,7 +690,12 @@ mod tests {
 
         assert_eq!(skill.name, "code-review");
         assert_eq!(skill.description, "审查代码风险。");
-        assert_eq!(skill.path, "skills/review/SKILL.md");
+        assert_eq!(
+            skill.source,
+            SkillSource::LocalFile {
+                path: "skills/review/SKILL.md".into()
+            }
+        );
     }
 
     /// 验证 folded 多行描述与引号字符串可以稳定解析。
@@ -448,5 +724,116 @@ mod tests {
             "---\nname: empty-body\ndescription: 描述\n---\n"
         )
         .is_err());
+    }
+
+    /// Genome Skill Set 必须复核摘要、ID 和 Active 终态后才能提供精确指令。
+    #[test]
+    fn parses_verified_active_genome_skill_set() {
+        let artifact_json = json!({
+            "schema_version": 1,
+            "skill_id": "skill_verified1",
+            "name": "verified-skill",
+            "description": "只使用固定制品。",
+            "instructions": "来自真实 CAS 的精确指令。",
+            "status_history": [{"status": "active"}]
+        })
+        .to_string();
+        let digest = format!("{:x}", Sha256::digest(artifact_json.as_bytes()));
+        let source = json!({
+            "schema_version": 1,
+            "genome_revision_id": "grev_verified1",
+            "genome_digest": "1".repeat(64),
+            "execution_profile": "serve",
+            "skills": [{
+                "skill_id": "skill_verified1",
+                "artifact_digest": digest,
+                "artifact_json": artifact_json
+            }]
+        })
+        .to_string();
+
+        let skills = parse_genome_skill_set(&source).expect("Active Skill Set 应通过校验");
+        let skill = skills.get("verified-skill").expect("应装配固定 Skill");
+        assert_eq!(skill.skill_id.as_deref(), Some("skill_verified1"));
+        assert!(matches!(
+            &skill.source,
+            SkillSource::GenomeArtifact { instructions, .. }
+                if instructions == "来自真实 CAS 的精确指令。"
+        ));
+    }
+
+    /// Genome Skill Set 摘要不符或终态非 Active 时必须失败关闭。
+    #[test]
+    fn rejects_tampered_or_inactive_genome_skill_set() {
+        let artifact_json = json!({
+            "schema_version": 1,
+            "skill_id": "skill_rejected1",
+            "name": "rejected-skill",
+            "description": "不应装配。",
+            "instructions": "不应返回。",
+            "status_history": [{"status": "quarantined"}]
+        })
+        .to_string();
+        let digest = format!("{:x}", Sha256::digest(artifact_json.as_bytes()));
+        let inactive = json!({
+            "schema_version": 1,
+            "genome_revision_id": "grev_rejected1",
+            "genome_digest": "2".repeat(64),
+            "execution_profile": "serve",
+            "skills": [{
+                "skill_id": "skill_rejected1",
+                "artifact_digest": digest,
+                "artifact_json": artifact_json
+            }]
+        })
+        .to_string();
+        assert!(parse_genome_skill_set(&inactive).is_err());
+
+        let tampered = json!({
+            "schema_version": 1,
+            "genome_revision_id": "grev_rejected1",
+            "genome_digest": "2".repeat(64),
+            "execution_profile": "serve",
+            "skills": [{
+                "skill_id": "skill_rejected1",
+                "artifact_digest": "0".repeat(64),
+                "artifact_json": artifact_json
+            }]
+        })
+        .to_string();
+        assert!(parse_genome_skill_set(&tampered).is_err());
+    }
+
+    /// Evaluation 平面可装载隔离或已评测候选，但 Mutation 平面不运行 Skill。
+    #[test]
+    fn evaluation_allows_candidate_statuses_but_mutation_rejects_them() {
+        for status in ["quarantined", "evaluated"] {
+            let artifact_json = json!({
+                "schema_version": 1,
+                "skill_id": "skill_candidate1",
+                "name": "candidate-skill",
+                "description": "只用于隔离评测。",
+                "instructions": "运行确定性评测指令。",
+                "status_history": [{"status": status}]
+            })
+            .to_string();
+            let digest = format!("{:x}", Sha256::digest(artifact_json.as_bytes()));
+            let source = json!({
+                "schema_version": 1,
+                "genome_revision_id": "grev_candidate1",
+                "genome_digest": "3".repeat(64),
+                "execution_profile": "evaluation",
+                "skills": [{
+                    "skill_id": "skill_candidate1",
+                    "artifact_digest": digest,
+                    "artifact_json": artifact_json
+                }]
+            });
+            assert!(parse_genome_skill_set(&source.to_string()).is_ok());
+
+            let mut mutation = source;
+            mutation["execution_profile"] = json!("mutation");
+            assert!(parse_genome_skill_set(&mutation.to_string()).is_err());
+        }
     }
 }
