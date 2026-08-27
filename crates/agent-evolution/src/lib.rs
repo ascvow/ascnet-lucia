@@ -9,6 +9,7 @@ mod aggregation;
 mod archive;
 mod artifact_store;
 mod attribution;
+mod candidate_builder;
 mod certificate;
 mod episode_evidence;
 mod episode_store;
@@ -32,6 +33,9 @@ pub use aggregation::IssueAggregator;
 pub use archive::{ArchiveError, FileEvolutionArchive};
 pub use artifact_store::{ArtifactStore, ArtifactStoreError, FileArtifactStore};
 pub use attribution::attribute_failures;
+pub use candidate_builder::{
+    CandidateBuildError, CandidateBuilder, MAX_TASK_STRATEGY_PROMPT_BYTES,
+};
 pub use certificate::{
     CertificateError, EvolutionCertificate, EvolutionCertificateInput,
     EVOLUTION_CERTIFICATE_SCHEMA_VERSION,
