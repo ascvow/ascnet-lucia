@@ -1,4 +1,4 @@
-//! Agent 队列调度、生命周期、续跑和 principal 资源管理。
+//! Agent 队列调度、生命周期、会话续跑和 principal 资源管理。
 
 use crate::protocol::SubscriberEventSink;
 use crate::{
