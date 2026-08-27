@@ -13,6 +13,7 @@ pub mod fixture;
 pub mod gate;
 pub mod health;
 pub mod model;
+mod plugin_deployment;
 mod plugin_gate;
 mod plugin_host_audit;
 mod plugin_release;
@@ -68,6 +69,10 @@ pub use health::{
 pub use model::{
     ModelExchange, ModelFixture, ModelFixtureInteraction, ModelMock, ModelRequestMatcher,
     RecordingModel, ReplayModel, MODEL_FIXTURE_SCHEMA_VERSION,
+};
+pub use plugin_deployment::{
+    PluginCanaryDeployment, PluginDeploymentController, PluginDeploymentError,
+    PluginPromotionReceipt, PluginRollbackReceipt,
 };
 pub use plugin_gate::{evaluate_plugin_source, PluginGateError};
 pub use plugin_host_audit::{

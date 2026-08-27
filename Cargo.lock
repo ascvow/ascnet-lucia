@@ -60,6 +60,7 @@ dependencies = [
  "agent-evolution",
  "agent-evolution-protocol",
  "agent-plugin-host",
+ "agent-plugin-manager",
  "agent-tool",
  "anyhow",
  "async-trait",

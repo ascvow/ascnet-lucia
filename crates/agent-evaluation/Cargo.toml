@@ -11,6 +11,7 @@ agent-core = { path = "../agent-core", version = "0.1.0", default-features = fal
 agent-evolution = { path = "../agent-evolution", version = "0.1.0" }
 agent-evolution-protocol = { path = "../agent-evolution-protocol", version = "0.1.0" }
 agent-plugin-host = { path = "../agent-plugin-host", version = "0.1.0" }
+agent-plugin-manager = { path = "../agent-plugin-manager", version = "0.1.0" }
 agent-tool = { path = "../agent-tool", version = "0.1.0", default-features = false, features = ["builtins"] }
 anyhow.workspace = true
 async-trait.workspace = true
