@@ -47,6 +47,8 @@ pub struct PluginHostServices {
     agent_runtime: Option<AgentRuntimeHostServices>,
     #[cfg(feature = "wasm")]
     model_completion: Option<ModelCompletionHostServices>,
+    #[cfg(feature = "wasm")]
+    activation_metadata: HashMap<String, HashMap<String, String>>,
     /// Host 持有且只能通过 `restrict` 收紧的运行平面策略。
     execution_policy: ExecutionPolicy,
 }
@@ -85,6 +87,31 @@ impl PluginHostServices {
     pub fn restrict_execution_policy(mut self, requested: &ExecutionPolicy) -> Self {
         self.execution_policy = self.execution_policy.restrict(requested);
         self
+    }
+
+    /// 为指定插件注入 Host 可信的激活元数据。
+    ///
+    /// 元数据只会传给 `plugin_id` 对应的实例，并覆盖 manifest 中的同名键。Host 不解释
+    /// 值的业务含义；空插件 ID 或空键会返回错误，避免产生无法稳定寻址的配置。
+    ///
+    /// # Errors
+    ///
+    /// `plugin_id` 为空，或 `metadata` 包含空键时返回错误。
+    #[cfg(feature = "wasm")]
+    pub fn with_activation_metadata(
+        mut self,
+        plugin_id: impl Into<String>,
+        metadata: HashMap<String, String>,
+    ) -> Result<Self> {
+        let plugin_id = plugin_id.into();
+        if plugin_id.trim().is_empty() {
+            return Err(anyhow!("激活元数据 plugin_id 不能为空"));
+        }
+        if metadata.keys().any(|key| key.trim().is_empty()) {
+            return Err(anyhow!("插件 `{plugin_id}` 的激活元数据键不能为空"));
+        }
+        self.activation_metadata.insert(plugin_id, metadata);
+        Ok(self)
     }
 
     /// 注入 Agent Runtime provisioner、controller 基础 profile 和 Guest 可请求的派生策略。
@@ -158,6 +185,15 @@ impl PluginHostServices {
     #[cfg(feature = "wasm")]
     pub(crate) fn model_completion(&self) -> Option<ModelCompletionHostServices> {
         self.model_completion.clone()
+    }
+
+    /// 返回指定插件的 Host 可信激活元数据；未注入时返回空映射。
+    #[cfg(feature = "wasm")]
+    pub(crate) fn activation_metadata(&self, plugin_id: &str) -> HashMap<String, String> {
+        self.activation_metadata
+            .get(plugin_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// 返回 Host 内部持有的可信执行策略快照。
@@ -980,6 +1016,39 @@ mod tests {
             .restrict_execution_policy(&ExecutionPolicy::serve());
 
         assert!(!services.execution_policy.allow_process);
+    }
+
+    /// 激活元数据必须按可信插件 ID 隔离，未指定的插件不能读取其他实例配置。
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn activation_metadata_is_scoped_to_plugin_id() {
+        let services = PluginHostServices::new()
+            .with_activation_metadata(
+                "context",
+                HashMap::from([("policy".into(), "fixed".into())]),
+            )
+            .expect("合法激活元数据应被接受");
+
+        assert_eq!(
+            services
+                .activation_metadata("context")
+                .get("policy")
+                .map(String::as_str),
+            Some("fixed")
+        );
+        assert!(services.activation_metadata("other").is_empty());
+    }
+
+    /// 空插件 ID 或空元数据键不能进入 Host 激活上下文。
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn activation_metadata_rejects_unaddressable_keys() {
+        assert!(PluginHostServices::new()
+            .with_activation_metadata(" ", HashMap::new())
+            .is_err());
+        assert!(PluginHostServices::new()
+            .with_activation_metadata("context", HashMap::from([(" ".into(), "value".into())]))
+            .is_err());
     }
 
     /// 记录调用次数的测试插件宿主。

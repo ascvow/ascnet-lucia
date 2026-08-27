@@ -7,7 +7,8 @@ use std::fs;
 /// 插件启动期间由可信装配层固定的执行约束。
 ///
 /// `execution_policy` 同时收紧插件 Host、派生 Agent 和模型输出预算；`run_observer` 把子 Agent
-/// Run 接入 Evidence；`require_complete_genome` 要求 Genome 固定的插件组合全部进入 Ready。
+/// Run 接入 Evidence；`require_complete_genome` 要求 Genome 固定的插件组合全部进入 Ready；
+/// `activation_metadata` 只向对应插件实例传递可信装配数据。
 #[cfg(feature = "plugins")]
 pub(crate) struct PluginExecutionContext {
     /// Host 与 Runtime 共同执行的可信策略上限。
@@ -16,6 +17,8 @@ pub(crate) struct PluginExecutionContext {
     pub(crate) run_observer: Option<Arc<dyn agent_runtime::RuntimeRunObserver>>,
     /// 是否拒绝任何不完整的 Genome 插件组合。
     pub(crate) require_complete_genome: bool,
+    /// 按插件 ID 隔离的 Host 可信激活元数据。
+    pub(crate) activation_metadata: HashMap<String, HashMap<String, String>>,
 }
 
 /// 把可信执行策略的派生拓扑限制映射到 Plugin Host 使用的 Agent Runtime。
@@ -204,8 +207,12 @@ pub(crate) async fn load_plugins_for_tui(
         .await
         .context("注册 TUI controller profile 失败")?;
     let model_output_limit = plugin_model_output_limit(&execution.execution_policy);
-    let host_services = PluginHostServices::new()
-        .restrict_execution_policy(&execution.execution_policy)
+    let mut host_services =
+        PluginHostServices::new().restrict_execution_policy(&execution.execution_policy);
+    for (plugin_id, metadata) in execution.activation_metadata {
+        host_services = host_services.with_activation_metadata(plugin_id, metadata)?;
+    }
+    let host_services = host_services
         .with_model_completion(
             model_gateway,
             model_provider,

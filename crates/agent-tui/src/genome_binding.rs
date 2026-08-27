@@ -4,6 +4,8 @@ use agent_core::{
     model::{OpenAiProtocol, ProviderKind},
     AgentOptions, AgentRootConfig,
 };
+#[cfg(feature = "plugins")]
+use agent_evolution::ContextPolicyRepository;
 use agent_evolution::{ArtifactStore, FileArtifactStore};
 #[cfg(feature = "plugins")]
 use agent_evolution_protocol::{ArtifactDigest, PluginGenome};
@@ -22,6 +24,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "plugins")]
+const CONTEXT_POLICY_JSON_METADATA_KEY: &str = "context_policy_json";
+#[cfg(feature = "plugins")]
+const CONTEXT_POLICY_DIGEST_METADATA_KEY: &str = "context_policy_digest";
+
 /// 启动后不可替换的 Genome 运行装配器。
 ///
 /// Revision 已由 Resolver 校验摘要；本类型继续把其中的行为字段变成真实模型、Prompt、
@@ -39,7 +46,7 @@ impl GenomeRuntimeBinding {
     /// # Errors
     ///
     /// 包版本、Git 身份、目标平台或 feature 集合与当前二进制不一致，或 Genome 声明了
-    /// 当前尚无可信装配协议的 Context、Planning、Skill 快照时返回错误。
+    /// 当前尚无可信装配协议的 Planning、Skill 快照时返回错误。
     pub(crate) fn new(revision: GenomeRevision, artifacts: FileArtifactStore) -> Result<Self> {
         verify_runtime_identity(&revision)?;
         verify_supported_policy_surfaces(&revision)?;
@@ -206,6 +213,68 @@ impl GenomeRuntimeBinding {
         Ok((selected_paths, selections))
     }
 
+    /// 从真实 CAS 读取 Context Policy，并只为 Context Loader owner 生成激活元数据。
+    ///
+    /// 未声明策略时返回空映射并保持普通运行行为。策略正文由版本化仓库校验、规范化后
+    /// 交给 Guest 解释，TUI 只验证引用、能力 owner 与插件组合绑定关系。
+    ///
+    /// # Errors
+    ///
+    /// Context Loader owner 缺失、策略 ID 错绑，或 CAS 制品缺失、篡改、过大、非规范 JSON
+    /// 时返回错误。
+    #[cfg(feature = "plugins")]
+    pub(crate) async fn plugin_activation_metadata(
+        &self,
+    ) -> Result<HashMap<String, HashMap<String, String>>> {
+        let Some(reference) = self.revision.genome.context_policy.as_ref() else {
+            return Ok(HashMap::new());
+        };
+        let owner = self
+            .revision
+            .genome
+            .capability_owners
+            .get(agent_plugin_host::manifest::CONTEXT_LOADER_CAPABILITY)
+            .ok_or_else(|| anyhow!("Context Policy 已声明，但 Genome 缺少 Context Loader owner"))?;
+        if reference.id != *owner {
+            return Err(anyhow!(
+                "Context Policy ID `{}` 与 Context Loader owner `{owner}` 不一致",
+                reference.id
+            ));
+        }
+        if !self
+            .revision
+            .genome
+            .plugins
+            .iter()
+            .any(|plugin| plugin.id == *owner)
+        {
+            return Err(anyhow!(
+                "Context Loader owner `{owner}` 不在 Genome 插件组合中"
+            ));
+        }
+
+        let policy = ContextPolicyRepository::new(&self.artifacts)
+            .get(&reference.config_digest)
+            .await
+            .context("读取并校验 Genome Context Policy 制品失败")?;
+        let policy_json = String::from_utf8(
+            policy
+                .canonical_bytes()
+                .context("重新编码 Context Policy 规范 JSON 失败")?,
+        )
+        .context("Context Policy 规范 JSON 不是 UTF-8")?;
+        Ok(HashMap::from([(
+            owner.clone(),
+            HashMap::from([
+                (CONTEXT_POLICY_JSON_METADATA_KEY.into(), policy_json),
+                (
+                    CONTEXT_POLICY_DIGEST_METADATA_KEY.into(),
+                    reference.config_digest.to_string(),
+                ),
+            ]),
+        )]))
+    }
+
     /// 纯 Core 构建必须拒绝声明了插件行为的 Genome。
     ///
     /// # Errors
@@ -215,8 +284,11 @@ impl GenomeRuntimeBinding {
     pub(crate) fn verify_core_only_plugins(&self) -> Result<()> {
         if !self.revision.genome.plugins.is_empty()
             || !self.revision.genome.capability_owners.is_empty()
+            || self.revision.genome.context_policy.is_some()
         {
-            return Err(anyhow!("纯 Core 构建不能运行声明插件行为的 Genome"));
+            return Err(anyhow!(
+                "纯 Core 构建不能运行声明插件或 Context Policy 行为的 Genome"
+            ));
         }
         Ok(())
     }
@@ -305,7 +377,7 @@ fn verify_git_commit(declared: &str, build: &str) -> Result<()> {
     Ok(())
 }
 
-/// 当前尚无跨插件可信快照服务的策略字段不得被伪装成已装配行为。
+/// 当前尚无跨插件可信快照服务的 Planning 与 Skill 字段不得被伪装成已装配行为。
 fn verify_supported_policy_surfaces(revision: &GenomeRevision) -> Result<()> {
     let genome = &revision.genome;
     if genome.prompt.messages.is_empty() {
@@ -313,12 +385,9 @@ fn verify_supported_policy_surfaces(revision: &GenomeRevision) -> Result<()> {
             "Evidence Genome 必须把完整系统 Prompt 固定为至少一个 CAS 制品"
         ));
     }
-    if genome.context_policy.is_some()
-        || genome.planning_policy.is_some()
-        || !genome.skills.is_empty()
-    {
+    if genome.planning_policy.is_some() || !genome.skills.is_empty() {
         return Err(anyhow!(
-            "当前 TUI 尚不能可信装配 Genome 的 Context、Planning 或 Skill 独立快照"
+            "当前 TUI 尚不能可信装配 Genome 的 Planning 或 Skill 独立快照"
         ));
     }
     Ok(())
@@ -642,8 +711,8 @@ mod tests {
 
     /// Evidence 只装配 Genome 中的插件，并复核 bundle 与独占能力 owner。
     #[cfg(feature = "plugins")]
-    #[test]
-    fn genome_selects_verified_plugins_and_capability_owners() {
+    #[tokio::test]
+    async fn genome_selects_verified_plugins_and_context_policy() {
         let root = std::env::temp_dir().join(format!(
             "lucia-genome-plugins-{}",
             agent_session::SessionId::generate()
@@ -686,6 +755,12 @@ mod tests {
 
         let bundle =
             agent_plugin_manager::hash_plugin_bundle(&selected).expect("应计算目标 bundle 摘要");
+        let artifacts = FileArtifactStore::new(root.join("artifacts"));
+        let policy = agent_evolution_protocol::ContextPolicyV1::default();
+        let policy_artifact = ContextPolicyRepository::new(&artifacts)
+            .put(&policy)
+            .await
+            .expect("应写入 Context Policy CAS");
         let mut revision = revision(model(), fixed_prompt(), ToolProfileGenome::default());
         revision.genome.plugins = vec![PluginGenome {
             id: "selected".into(),
@@ -696,10 +771,12 @@ mod tests {
         }];
         revision.genome.capability_owners =
             BTreeMap::from([("agent.context-loader".into(), "selected".into())]);
+        revision.genome.context_policy = Some(agent_evolution_protocol::PolicyRef {
+            id: "selected".into(),
+            config_digest: policy_artifact.digest.clone(),
+        });
         revision.digest = revision.genome.digest().expect("应重算 Genome 摘要");
-        let binding =
-            GenomeRuntimeBinding::new(revision, FileArtifactStore::new(root.join("artifacts")))
-                .expect("应创建插件绑定");
+        let binding = GenomeRuntimeBinding::new(revision, artifacts).expect("应创建插件绑定");
 
         let (paths, owners) = binding
             .bind_plugins(&[extra.join("plugin.toml"), selected.join("plugin.toml")])
@@ -709,6 +786,29 @@ mod tests {
         assert_eq!(
             owners.get("agent.context-loader").map(String::as_str),
             Some("selected")
+        );
+        let activation_metadata = binding
+            .plugin_activation_metadata()
+            .await
+            .expect("应从真实 CAS 生成 Context Policy 激活元数据");
+        let context_metadata = activation_metadata
+            .get("selected")
+            .expect("只应注入真实 owner");
+        let policy_digest = policy_artifact.digest.to_string();
+        assert_eq!(
+            context_metadata
+                .get(CONTEXT_POLICY_DIGEST_METADATA_KEY)
+                .map(String::as_str),
+            Some(policy_digest.as_str())
+        );
+        assert_eq!(
+            serde_json::from_str::<agent_evolution_protocol::ContextPolicyV1>(
+                context_metadata
+                    .get(CONTEXT_POLICY_JSON_METADATA_KEY)
+                    .expect("应注入策略 JSON")
+            )
+            .expect("注入策略应保持版本化 JSON"),
+            policy
         );
 
         std::fs::write(selected.join("selected.wasm"), b"tampered").expect("应篡改目标 WASM");

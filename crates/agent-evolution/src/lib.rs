@@ -12,6 +12,8 @@ mod attribution;
 mod candidate_builder;
 mod candidate_selection;
 mod certificate;
+mod context_candidate_builder;
+mod context_policy;
 mod cycle;
 mod episode_evidence;
 mod episode_selection;
@@ -48,6 +50,13 @@ pub use candidate_selection::{CandidateSelectionError, CandidateSelector, Select
 pub use certificate::{
     CertificateError, EvolutionCertificate, EvolutionCertificateInput,
     EVOLUTION_CERTIFICATE_SCHEMA_VERSION,
+};
+pub use context_candidate_builder::{
+    ContextCandidateBuildError, ContextCandidateBuilder, CONTEXT_LOADER_CAPABILITY_ID,
+};
+pub use context_policy::{
+    ContextPolicyRepository, ContextPolicyRepositoryError, CONTEXT_POLICY_MEDIA_TYPE,
+    MAX_CONTEXT_POLICY_BYTES,
 };
 pub use cycle::{
     is_terminal_cycle_stage, CycleStoreError, EvolutionCycleStore, FileEvolutionCycleStore,

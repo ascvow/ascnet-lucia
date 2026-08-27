@@ -621,7 +621,9 @@ version = "0.1.0"
 dependencies = [
  "agent-plugin",
  "anyhow",
+ "serde",
  "serde_json",
+ "sha2",
  "wit-bindgen",
 ]
 
@@ -630,11 +632,15 @@ name = "context-plugin-smoke-tests"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-evaluation",
+ "agent-evolution",
+ "agent-evolution-protocol",
  "agent-plugin-host",
  "agent-tool",
  "anyhow",
  "async-trait",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

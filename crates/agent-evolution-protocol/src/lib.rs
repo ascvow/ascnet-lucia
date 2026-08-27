@@ -8,6 +8,7 @@
 
 #![deny(missing_docs)]
 
+pub mod context;
 pub mod data_class;
 pub mod episode;
 pub mod evaluation;
@@ -23,6 +24,20 @@ pub use genome::{
     AgentGenome, GenomeDigestError, GenomeMetadata, GenomeRevision, GenomeRevisionError,
     InvalidGenome, ModelGenome, PluginGenome, PolicyRef, PromptArtifactRef, PromptGenome,
     PromptLayer, RuntimeIdentity, SkillRef, ToolProfileGenome, GENOME_SCHEMA_VERSION,
+};
+
+pub use context::{
+    ContextEvaluationMetricsV1, ContextEvaluationObservationV1, ContextGateFailureV1,
+    ContextPolicyCandidateV1, ContextPolicyEvaluationReportV1, ContextPolicyMutationProposalV1,
+    ContextPolicyV1, InvalidContextEvaluation, InvalidContextMutation, InvalidContextPolicy,
+    PlanSnapshotRetentionPolicyV1, PostSummaryValidationAlgorithmV1, RecallObservationV1,
+    ToolResultRetentionPolicyV1, UserConstraintRetentionPolicyV1,
+    CONTEXT_EVALUATION_OBSERVATION_SCHEMA_VERSION, CONTEXT_EVALUATION_REPORT_SCHEMA_VERSION,
+    CONTEXT_POLICY_CANDIDATE_SCHEMA_VERSION, CONTEXT_POLICY_PROPOSAL_SCHEMA_VERSION,
+    CONTEXT_POLICY_SCHEMA_VERSION, MAX_CONTEXT_HYPOTHESIS_BYTES, MAX_CONTEXT_THRESHOLD_TOKENS,
+    MAX_PINNED_ITEM_COUNT, MAX_RECENT_MESSAGE_COUNT, MAX_RECENT_TOOL_RESULT_COUNT,
+    MAX_SUMMARY_TOKEN_BUDGET, MIN_CONTEXT_THRESHOLD_TOKENS, MIN_SUMMARY_TOKEN_BUDGET,
+    MIN_SUMMARY_VALIDATION_COVERAGE_BPS,
 };
 
 pub use data_class::{

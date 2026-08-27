@@ -6,6 +6,7 @@
 
 pub mod archive;
 pub mod audit;
+pub mod context_evaluation;
 pub mod dataset;
 pub mod fixture;
 pub mod gate;
@@ -25,6 +26,13 @@ pub use archive::{
 pub use audit::{
     AuditEvent, AuditRecord, AuditStoreError, AuditVerification, FileAuditLog,
     AUDIT_RECORD_SCHEMA_VERSION,
+};
+pub use context_evaluation::{
+    calculate_context_metrics, evaluate_context_policy_candidate, ContextEvaluationError,
+    ContextGatePolicyV1, M6_CONTEXT_GATE_POLICY, M6_CONTEXT_GATE_VERSION, M6_MAX_COST_RATIO_BPS,
+    M6_MAX_LATENCY_MS, M6_MIN_CONSTRAINT_RECALL_BPS, M6_MIN_DOWNSTREAM_TASK_SUCCESS_BPS,
+    M6_MIN_FACT_RECALL_BPS, M6_MIN_PLAN_STATE_RECALL_BPS, M6_MIN_TOKEN_REDUCTION_BPS,
+    M6_MIN_TOOL_STATE_RECALL_BPS,
 };
 pub use dataset::{
     DatasetCaseRef, DatasetError, DatasetManifest, DatasetVisibility, MutatorDatasetView,
