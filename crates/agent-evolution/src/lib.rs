@@ -40,6 +40,7 @@ mod recorder_hub;
 mod replay;
 mod scorecard;
 mod skill_candidate_builder;
+mod skill_cycle;
 mod skill_mutation;
 mod skill_repository;
 mod skill_usage;
@@ -142,6 +143,13 @@ pub use scorecard::{
     ScorecardError, EVOLUTION_SCORECARD_SCHEMA_VERSION,
 };
 pub use skill_candidate_builder::{SkillCandidateBuildError, SkillCandidateBuilder};
+pub use skill_cycle::{
+    SkillEvolutionArchiveV1, SkillEvolutionCycle, SkillEvolutionCycleError,
+    SkillEvolutionCycleRequestV1, SkillEvolutionCycleResultV1, SkillEvolutionDispositionV1,
+    SkillEvolutionOrchestrator, SkillEvolutionOrchestratorError, SkillGateCycleOutcomeV1,
+    SkillGatePromotionV1, SkillHealthVerdictV1, SKILL_EVOLUTION_ARCHIVE_SCHEMA_VERSION,
+    SKILL_EVOLUTION_CANDIDATE_COUNT,
+};
 pub use skill_mutation::{
     BoundedSkillMutator, SkillContentDraftV1, SkillMutationDraftOperationV1, SkillMutationDraftV1,
     SkillMutationError, SkillMutationGenerationError, SkillMutationGenerator,
