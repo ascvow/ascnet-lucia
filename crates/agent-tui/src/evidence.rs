@@ -10,7 +10,7 @@ use agent_evolution::{
     load_episode_evidence, EpisodeRecorderConfig, EpisodeRecorderHub, EvolutionPipeline,
     FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox, FileGenomeResolver,
     FileIssueObservationStore, FileOutcomeRevisionStore, GenomeResolver, GenomeSelector,
-    RegisteredEpisodeRun,
+    RegisteredEpisodeRun, RuntimeHealthRecorder,
 };
 #[cfg(test)]
 use agent_evolution::{ArtifactStore, FileGenomeStore, GenomeStore};
@@ -38,6 +38,7 @@ pub(crate) struct EvidenceRuntime {
     artifacts: FileArtifactStore,
     episodes: FileEpisodeStore,
     pipeline: Arc<EvolutionPipeline<FileEvolutionOutbox, FileOutcomeRevisionStore>>,
+    health: Option<RuntimeHealthRecorder>,
 }
 
 impl EvidenceRuntime {
@@ -69,7 +70,14 @@ impl EvidenceRuntime {
                     FileIssueObservationStore::new(root.join("issue-observations")),
                 )),
             ),
+            health: None,
         })
+    }
+
+    /// 绑定从同一 Stable 可信解析的 Promotion 后健康记录器。
+    fn with_runtime_health(mut self, health: Option<RuntimeHealthRecorder>) -> Self {
+        self.health = health;
+        self
     }
 
     /// 返回应挂到主 Agent 的多运行事件 sink。
@@ -250,6 +258,12 @@ impl EvidenceRuntime {
             )
             .await
             .context("处理 Episode Evolution Pipeline 失败")?;
+        if let Some(health) = &self.health {
+            health
+                .record_first_episode(&evidence.episode)
+                .await
+                .context("记录 Promotion 后 Runtime 健康观察失败")?;
+        }
         Ok(episode_id)
     }
 }
@@ -354,6 +368,18 @@ pub(crate) async fn load_evidence_runtime(
         .resolve(&selector)
         .await
         .with_context(|| format!("解析 Evidence Genome 失败：{selector:?}"))?;
+    let health = match &selector {
+        GenomeSelector::Stable(lineage) => RuntimeHealthRecorder::from_stable(&root, lineage)
+            .await
+            .with_context(|| format!("装配 Stable Runtime 健康观察失败：{lineage}"))?,
+        GenomeSelector::Revision(_) => None,
+    };
+    if health
+        .as_ref()
+        .is_some_and(|recorder| recorder.revision_id() != &revision.revision_id)
+    {
+        return Err(anyhow!("Stable 在 Evidence Runtime 装配期间发生变化"));
+    }
 
     let artifact_store = FileArtifactStore::new(root.join("artifacts"));
     let artifacts = Arc::new(artifact_store.clone());
@@ -363,13 +389,16 @@ pub(crate) async fn load_evidence_runtime(
     if let Some(home) = std::env::var_os("HOME").and_then(|value| value.into_string().ok()) {
         hub = hub.with_home(home);
     }
-    Ok(Some(EvidenceRuntime::new(
-        Arc::new(hub),
-        revision,
-        artifact_store,
-        episode_store,
-        &root,
-    )?))
+    Ok(Some(
+        EvidenceRuntime::new(
+            Arc::new(hub),
+            revision,
+            artifact_store,
+            episode_store,
+            &root,
+        )?
+        .with_runtime_health(health),
+    ))
 }
 
 /// 构造仅供 TUI 测试使用、且完整 Prompt 已进入 CAS 的合法 Genome 修订。
@@ -441,8 +470,12 @@ mod tests {
     };
     #[cfg(feature = "plugins")]
     use agent_evolution::{EpisodeQuery, EpisodeStore};
+    use agent_evolution::{
+        FileRuntimeHealthObservationStore, FileStableGenomePublisher, RUNTIME_HEALTH_DIRECTORY,
+    };
     #[cfg(feature = "plugins")]
     use agent_evolution_protocol::Outcome;
+    use agent_evolution_protocol::{EvaluationReportId, ReleaseId};
     #[cfg(feature = "plugins")]
     use agent_runtime::{
         AgentOutcome, AgentPermissions, AgentRuntime, AgentSpawnRequest, AgentTemplate,
@@ -608,6 +641,91 @@ mod tests {
             .expect("应加载 Stable Evidence")
             .expect("Evidence 应启用");
         assert_eq!(runtime.revision().revision_id, revision.revision_id);
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// Promotion 后通过 Stable 启动的 TUI 必须从真实关闭 Episode 写入首份健康观察。
+    #[tokio::test]
+    async fn promoted_stable_records_health_from_closed_episode() {
+        let root = std::env::temp_dir().join(format!(
+            "lucia-promoted-health-evidence-{}",
+            agent_session::SessionId::generate()
+        ));
+        let evidence_root = root.join("evolution");
+        let genomes = FileGenomeStore::new(evidence_root.join("genomes"));
+        let artifacts = FileArtifactStore::new(evidence_root.join("artifacts"));
+        let parent = test_genome_revision(
+            ExecutionPolicy::evaluation(&root.join("fixtures")),
+            &artifacts,
+        )
+        .await;
+        let candidate = test_genome_revision(ExecutionPolicy::serve(), &artifacts).await;
+        genomes.append(&parent).await.expect("应登记 Parent Genome");
+        genomes
+            .append(&candidate)
+            .await
+            .expect("应登记 Candidate Genome");
+        let publisher = FileStableGenomePublisher::new(&evidence_root);
+        let stable = publisher
+            .publish("stable/general", &parent, 1)
+            .await
+            .expect("应初始化 Stable");
+        let release_id = ReleaseId::generate();
+        publisher
+            .publish_bound(
+                &stable,
+                &candidate,
+                2,
+                release_id.clone(),
+                EvaluationReportId::generate(),
+                None,
+            )
+            .await
+            .expect("应提交 Promotion Stable");
+        let settings = EvidenceSettings {
+            enabled: true,
+            root_dir: Some(evidence_root.clone()),
+            genome_revision_id: None,
+            genome_stable: Some("stable/general".into()),
+        };
+        let runtime = load_evidence_runtime(&settings, &root.join("config.toml"), &root)
+            .await
+            .expect("应加载 Promotion Stable")
+            .expect("Evidence 应启用");
+        let run = runtime
+            .register_run("promoted-health-session")
+            .await
+            .expect("应登记真实运行");
+        runtime
+            .hub()
+            .record(&AgentEvent::new(
+                run.run_id().to_string(),
+                AgentEventKind::RunStarted,
+                0,
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("应记录真实运行事件");
+        runtime
+            .close_run(
+                run,
+                OutcomeResolution::runtime(agent_evolution_protocol::Outcome::Unverifiable),
+            )
+            .await
+            .expect("应从真实 Episode 收敛健康观察");
+
+        let observation =
+            FileRuntimeHealthObservationStore::new(evidence_root.join(RUNTIME_HEALTH_DIRECTORY))
+                .expect("健康根应合法")
+                .load(&release_id)
+                .await
+                .expect("应读取发布后健康观察");
+        assert_eq!(
+            observation.observation().observed_revision_id,
+            candidate.revision_id
+        );
+        assert_eq!(observation.observation().checks_passed, 2);
+        assert_eq!(observation.observation().checks_total, 2);
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
