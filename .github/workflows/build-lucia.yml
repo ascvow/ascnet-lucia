@@ -9,6 +9,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'crates/**'
+      - 'tools/**'
       - 'examples/plugins/**'
       - 'registry/**'
       - 'scripts/**'
@@ -21,6 +22,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'crates/**'
+      - 'tools/**'
       - 'examples/plugins/**'
       - 'registry/**'
       - 'scripts/**'
@@ -38,6 +40,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check:
+    name: 运行离线标准检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v5
+
+      - name: 安装 Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: 安装脚本依赖
+        run: bun install --frozen-lockfile
+
+      - name: 初始化 Rust 工具链
+        run: rustup show active-toolchain
+
+      - name: 安装 WASM 构建目标
+        run: rustup target add wasm32-wasip2
+
+      - name: 获取原生锁定依赖
+        run: cargo fetch --locked
+
+      - name: 获取 WASM 锁定依赖
+        run: cargo fetch --locked --target wasm32-wasip2
+
+      - name: 运行标准离线检查
+        run: bun run check
+
   desktop:
     name: 构建 ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
@@ -83,6 +115,9 @@ jobs:
       - name: 构建插件版 TUI
         run: bun run build:tui:plugins
 
+      - name: 构建 Evolution 控制面
+        run: bun run build:evolution-tools
+
       - name: 上传 Core 库
         uses: actions/upload-artifact@v4
         with:
@@ -108,6 +143,18 @@ jobs:
           path: |
             target/plugin-tui/release/lucia
             target/plugin-tui/release/lucia.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传 Evolution 控制面
+        uses: actions/upload-artifact@v4
+        with:
+          name: lucia-evolution-tools-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            target/evolution-tools/release/lucia-eval
+            target/evolution-tools/release/lucia-eval.exe
+            target/evolution-tools/release/lucia-evolve
+            target/evolution-tools/release/lucia-evolve.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -153,7 +200,7 @@ jobs:
   release:
     name: 发布 GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [desktop, plugins]
+    needs: [check, desktop, plugins]
     runs-on: ubuntu-latest
     permissions:
       contents: write

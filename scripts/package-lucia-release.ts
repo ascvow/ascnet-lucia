@@ -7,7 +7,7 @@ const inputRoot = join(repositoryRoot, 'dist', 'actions')
 const outputRoot = join(repositoryRoot, 'dist', 'release')
 const pluginArtifactName = 'lucia-official-plugins-wasm'
 const desktopArtifactPattern =
-  /^lucia-(?:core|tui-core|tui-plugins)-(?:linux|macos|windows)-(?:x64|arm64)$/
+  /^lucia-(?:core|tui-core|tui-plugins|evolution-tools)-(?:linux|macos|windows)-(?:x64|arm64)$/
 
 /** 读取 Actions 下载目录中的直接文件，拒绝意外的嵌套目录。 */
 async function listArtifactFiles(root: string): Promise<string[]> {
@@ -42,12 +42,17 @@ async function createZip(source: string, output: string, files: string[]): Promi
   await Bun.write(output, zipSync(entries, { level: 9, mtime: timestamp }))
 }
 
-/** Linux 与 macOS 资产使用 tar.gz，并恢复 TUI 可执行位。 */
+/** Linux 与 macOS 资产使用 tar.gz，并恢复 TUI 与控制面二进制的可执行位。 */
 async function createTarGz(source: string, output: string, artifact: string): Promise<void> {
-  if (artifact.startsWith('lucia-tui-')) {
-    const executable = join(source, 'lucia')
+  const executables = artifact.startsWith('lucia-tui-')
+    ? ['lucia']
+    : artifact.startsWith('lucia-evolution-tools-')
+      ? ['lucia-eval', 'lucia-evolve']
+      : []
+  for (const name of executables) {
+    const executable = join(source, name)
     if (!(await Bun.file(executable).exists())) {
-      throw new Error(`TUI 产物缺少 lucia 可执行文件：${artifact}`)
+      throw new Error(`分发产物缺少 ${name} 可执行文件：${artifact}`)
     }
     await chmod(executable, 0o755)
   }
