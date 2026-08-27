@@ -523,6 +523,27 @@ impl Tool for StreamingOutputTool {
     }
 }
 
+/// 永久等待的原生工具，用于验证取消会直接丢弃执行 future。
+struct BlockingTool {
+    entered: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Tool for BlockingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "blocking_tool",
+            "等待取消的测试工具",
+            ToolSpec::empty_object_schema(),
+        )
+    }
+
+    async fn call(&self, _call: ToolCall) -> Result<ToolResult> {
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+}
+
 /// 状态快照应覆盖模型流式阶段，并在成功后保留完整会话和运行摘要。
 #[tokio::test]
 async fn state_tracks_streaming_and_success_terminal_snapshot() {
@@ -781,6 +802,79 @@ async fn control_cancel_interrupts_pending_before_tool_hook() {
         .expect("取消应优雅结束运行");
 
     assert!(run.cancelled);
+}
+
+/// 控制面取消必须中断尚未返回事件流的模型请求，不能等待网络超时。
+#[tokio::test]
+async fn control_cancel_interrupts_pending_model_request() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register(
+            "blocking",
+            Arc::new(BlockingModel {
+                started: started.clone(),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }),
+        )
+        .expect("注册阻塞模型");
+    let agent = Arc::new(Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("blocking", "blocking-model"),
+    ));
+    let running_agent = agent.clone();
+    let running = tokio::spawn(async move { running_agent.run("测试中断模型请求").await });
+    started.notified().await;
+
+    agent.cancel();
+    let run = tokio::time::timeout(std::time::Duration::from_secs(1), running)
+        .await
+        .expect("取消后模型请求应及时结束")
+        .expect("运行任务不应 panic")
+        .expect("取消应优雅结束运行");
+
+    assert!(run.cancelled);
+}
+
+/// 控制面取消必须中断运行中的原生工具，并以取消终态收敛剩余工具调用。
+#[tokio::test]
+async fn control_cancel_interrupts_running_native_tool() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let call = ToolCall::new("blocking", "blocking_tool", json!({}));
+    let mut tools = ToolRegistry::new();
+    tools
+        .register(BlockingTool {
+            entered: entered.clone(),
+        })
+        .expect("注册阻塞工具");
+    let agent =
+        Arc::new(agent_with_script(vec![ModelResponse::tool_calls(vec![call])]).with_tools(tools));
+    let running_agent = agent.clone();
+    let running = tokio::spawn(async move { running_agent.run("测试中断原生工具").await });
+    entered.notified().await;
+
+    agent.cancel();
+    let run = tokio::time::timeout(std::time::Duration::from_secs(1), running)
+        .await
+        .expect("取消后原生工具应及时结束")
+        .expect("运行任务不应 panic")
+        .expect("取消应优雅结束运行");
+
+    assert!(run.cancelled);
+    let result = run
+        .session
+        .messages()
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .find_map(|block| match block {
+            crate::model::ContentBlock::ToolResult { result } => Some(result),
+            _ => None,
+        })
+        .expect("阻塞工具应形成取消结果");
+    assert_eq!(
+        result.error_kind,
+        Some(agent_tool::ToolErrorKind::Cancelled)
+    );
 }
 
 /// Agent 会转发模型文本增量，同时保留完整最终响应。

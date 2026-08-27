@@ -37,7 +37,7 @@ pub(super) fn spawn_openai_stream(
     protocol: OpenAiStreamProtocol,
 ) -> ModelEventStream {
     let (sender, stream) = ModelEventStream::channel();
-    tokio::spawn(async move {
+    let request_task = tokio::spawn(async move {
         sender.send(ModelStreamEvent::Start);
         let result = async {
             let response = client
@@ -67,7 +67,7 @@ pub(super) fn spawn_openai_stream(
             Err(error) => sender.error(format!("{error:#}")),
         }
     });
-    stream
+    stream.with_request_task(request_task)
 }
 
 /// 检查流式请求状态码，并在失败时保留服务商返回的错误正文。

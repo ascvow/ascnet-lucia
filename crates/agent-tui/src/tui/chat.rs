@@ -529,7 +529,7 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
         ("Ctrl+J", "Insert newline"),
         ("Esc", "Stop / back / double-clear"),
         ("PgUp/PgDn", "Scroll history"),
-        ("Ctrl+P", "Recall input"),
+        ("Up/Down", "Recall input"),
         ("Ctrl+Y", "Copy last reply"),
     ];
     for (key, action) in shortcuts {

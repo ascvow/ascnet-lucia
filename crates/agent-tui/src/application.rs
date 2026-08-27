@@ -372,13 +372,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     }
     // 守卫覆盖所有退出路径，包括 draw 失败的 `?` 提前返回。
     let terminal_guard = TerminalGuard { keyboard_enhanced };
-    // 默认启用鼠标交互以支持点击插件聚焦；Ctrl+T 可暂停捕获并恢复终端原生选择。
+    // 默认保留终端原生文本选择；Ctrl+T 可按需开启插件鼠标交互。
     // 启用 bracketed paste，将拖入的文件路径识别为附件。
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture
-    );
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
 
     let input_tx = tx.clone();
     std::thread::spawn(move || {
