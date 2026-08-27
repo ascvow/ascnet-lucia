@@ -57,6 +57,18 @@ impl PluginCanaryDeployment {
     pub fn candidate_revision(&self) -> &GenomeRevision {
         &self.candidate_revision
     }
+
+    /// 返回通过发布控制面验证的 Canary Admission。
+    pub fn admission(&self) -> &PluginCanaryAdmissionV1 {
+        &self.admission
+    }
+
+    /// 返回部署前确定性归档的旧 Stable bundle 字节。
+    ///
+    /// 调用方只能将该快照写入不可变 Artifact CAS；不得把原始字节内嵌到部署状态记录。
+    pub fn previous_bundle(&self) -> &[u8] {
+        &self.previous_bundle
+    }
 }
 
 /// 一次成功 Stable Promotion 的生产部署回执。
