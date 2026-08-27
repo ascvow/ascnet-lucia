@@ -450,9 +450,11 @@ impl WasmPluginHost {
             let initialization = async {
                 let mut state = state.lock().await;
                 refill_fuel(&mut state)?;
+                let mut activation_metadata = manifest.metadata.clone();
+                activation_metadata.extend(host_services.activation_metadata(&plugin_id));
                 let context_json = serde_json::to_string(&serde_json::json!({
                     "plugin_id": &plugin_id,
-                    "metadata": &manifest.metadata,
+                    "metadata": activation_metadata,
                 }))?;
                 let (activation_error,) = activate
                     .call_async(&mut state.store, (context_json,))
