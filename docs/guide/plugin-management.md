@@ -5,6 +5,8 @@ Registry、GitHub 获取、安全解包、SemVer 依赖求解、完整性锁和�
 `agent-plugin-manager` 负责。
 Plugin Host 只消费验证后的运行时配置，不参与下载或安装。
 
+插件管理是人工控制面，不是 Agent Evolution。安装、更新、移除、启停、版本选择、配置和 Capability Owner 变更会形成新的 PluginManagement 人工基线；它们不会生成 Evolution Certificate，也不会显示为 EVOLVED。已有 Session 保持启动时绑定的旧 Bundle，新 Session 使用新基线，基于旧插件环境的未完成 Candidate 不得自动 Promotion 到新基线。
+
 ## 从 Registry 安装
 
 默认从 `ascvow/lucia-plugins` 最新 Release 的 `registry.json` 解析名称。支持 npm 风格的

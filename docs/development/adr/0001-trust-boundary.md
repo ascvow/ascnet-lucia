@@ -155,6 +155,9 @@ Mutation 无法通过篡改布尔位打开真实能力。当前 Host 尚未提�
 | 读 Hidden Dataset | 否 | 允许 | 否 |
 | 读 Hidden Verifier 实现 | 否 | 允许 | 否 |
 | 写 Candidate Artifact Store | 允许 | 否 | 否 |
+| 读取或写入插件源码 | 否 | 否 | 否 |
+| 构建、签名或发布插件 Bundle | 否 | 否 | 否 |
+| 调用 Plugin Manager 写操作 | 否 | 否 | 否 |
 | 写 Dataset / Verifier | 否 | 否 | 否 |
 | 修改 Commit Policy | 否 | 否 | 否 |
 | 调用 Release Controller | 否 | 否 | 允许 |
@@ -275,7 +278,7 @@ agent-evolution-protocol` 重新生成。
 2. 热变更是一条提权路径：允许运行中改 Genome，等于允许绕过 Commit Gate 生效。
 3. Replay 要求确定性。Genome 变动会让同一 Episode 无法复现。
 
-Promote 只切换 `stable` 别名，对已在运行的会话无效，新 Genome 从下一次运行开始生效。子 Agent 可以使用派生 Genome，但必须记录 Parent Genome，且派生只能收缩权限。
+Promote 只切换 `stable` 别名，对已在运行的会话无效，新 Genome 从下一次运行开始生效。子 Agent 可以使用派生 Genome，但必须记录 Parent Genome，且派生只能收缩权限。插件环境同样在 Session 启动时固定；人工插件更新只建立新的人工基线，不会热替换活跃 Session。
 
 ## 后果
 
