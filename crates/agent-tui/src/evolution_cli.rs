@@ -472,28 +472,43 @@ async fn run_dashboard(root: &std::path::Path, options: DashboardArgs) -> Result
         Err(error) => return Err(error).context("读取 Evolution 历史失败"),
     };
     let policy = load_policy(options.policy.as_ref()).await?;
-    let report = reports.iter().rev().find(|report| {
-        report.release_record.is_some()
-            && options
-                .lineage
-                .as_deref()
-                .is_none_or(|lineage| report.lineage.as_deref() == Some(lineage))
-    });
-    let scorecard = report
+    let certificates = match FileEvolutionArchive::new(root).list_certificates().await {
+        Ok(certificates) => certificates,
+        Err(error) if options.tui => {
+            return crate::evolution_dashboard::run(
+                crate::evolution_dashboard::EvolutionDashboardState::failed(format!(
+                    "读取 EvolutionCertificate 历史失败：{error}"
+                )),
+            );
+        }
+        Err(error) => return Err(error).context("读取 EvolutionCertificate 历史失败"),
+    };
+    let matches_lineage = |report: &&EvaluationReport| {
+        options
+            .lineage
+            .as_deref()
+            .is_none_or(|lineage| report.lineage.as_deref() == Some(lineage))
+    };
+    let report = reports
+        .iter()
+        .rev()
+        .filter(matches_lineage)
+        .find(|report| is_current_stable(report, &certificates))
+        .or_else(|| {
+            reports
+                .iter()
+                .rev()
+                .filter(matches_lineage)
+                .find(|report| report.release_record.is_some())
+        });
+    let effective_report =
+        report.map(|report| report_with_certificate_lifecycle(report, &certificates));
+    let scorecard = effective_report
+        .as_ref()
         .map(|report| compute_scorecard(report, &policy))
         .transpose()
         .context("计算 Evolution Scorecard 失败")?;
     if options.tui {
-        let certificates = match FileEvolutionArchive::new(root).list_certificates().await {
-            Ok(certificates) => certificates,
-            Err(error) => {
-                return crate::evolution_dashboard::run(
-                    crate::evolution_dashboard::EvolutionDashboardState::failed(format!(
-                        "读取 EvolutionCertificate 历史失败：{error}"
-                    )),
-                );
-            }
-        };
         let history =
             match compute_history(&reports, &certificates, &policy, options.lineage.as_deref()) {
                 Ok(history) => history,
@@ -530,6 +545,42 @@ async fn run_dashboard(root: &std::path::Path, options: DashboardArgs) -> Result
         render_scorecard(&scorecard, options.format, resolve_width(options.width))?
     );
     Ok(())
+}
+
+/// 用不可变 Certificate 链尾覆盖旧 EvaluationReport 的生命周期快照。
+fn report_with_certificate_lifecycle(
+    report: &EvaluationReport,
+    certificates: &[EvolutionCertificate],
+) -> EvaluationReport {
+    let mut effective = report.clone();
+    if let Some(certificate) = report.release_record.as_ref().and_then(|release| {
+        certificates
+            .iter()
+            .find(|certificate| &certificate.release_record == release)
+    }) {
+        effective.lifecycle = certificate.lifecycle;
+    }
+    effective
+}
+
+/// 判断报告代表最新仍有效的 Stable 发布；正式 Certificate 的回滚状态优先于旧报告快照。
+fn is_current_stable(report: &EvaluationReport, certificates: &[EvolutionCertificate]) -> bool {
+    let Some(release) = report.release_record.as_ref() else {
+        return false;
+    };
+    if !matches!(
+        report.lifecycle,
+        agent_evolution_protocol::EvolutionLifecycle::Promoted
+            | agent_evolution_protocol::EvolutionLifecycle::InheritanceVerified
+    ) {
+        return false;
+    }
+    certificates
+        .iter()
+        .find(|certificate| &certificate.release_record == release)
+        .is_none_or(|certificate| {
+            certificate.lifecycle != agent_evolution_protocol::EvolutionLifecycle::RolledBack
+        })
 }
 
 /// 历史命令选择的表格视图。
@@ -669,8 +720,14 @@ fn render_certificate(
             serde_json::to_string_pretty(certificate).context("序列化 Certificate JSON 失败")
         }
         ScorecardFormat::Table => Ok(format!(
-            "Lucia Evolution Certificate\nRelease: {}\nParent: {}\nChild: {}\nGate: {:?}\nLifecycle: {:?}\nEvaluationReport: {}\nSource Episodes: {}\nRepaired Cases: {}\nPost-promotion Runs: {}\nVerification: {}\nDigest: {}",
+            "Lucia Evolution Certificate\nRelease: {}\nRevision: r{}\nPrevious Certificate: {}\nParent: {}\nChild: {}\nGate: {:?}\nLifecycle: {:?}\nEvaluationReport: {}\nSource Episodes: {}\nRepaired Cases: {}\nPost-promotion Runs: {}\nRollback: {}\nVerification: {}\nDigest: {}",
             certificate.release_record,
+            certificate.revision,
+            certificate
+                .previous_certificate_digest
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "N/A".into()),
             certificate.parent_revision,
             certificate.child_revision,
             certificate.gate_decision,
@@ -679,17 +736,28 @@ fn render_certificate(
             certificate.source_episode_ids.len(),
             certificate.repaired_task_case_ids.len(),
             certificate.post_promotion_run_ids.len(),
+            certificate
+                .rollback_record
+                .as_ref()
+                .map(|record| format!("{:?}: {}", record.category, record.reason))
+                .unwrap_or_else(|| "N/A".into()),
             if verified { "PASS" } else { "NOT_REQUESTED" },
             certificate.certificate_digest,
         )),
         ScorecardFormat::Markdown => Ok(format!(
-            "# Lucia Evolution Certificate\n\n- Release: `{}`\n- Parent: `{}`\n- Child: `{}`\n- Gate: `{:?}`\n- Lifecycle: `{:?}`\n- EvaluationReport: `{}`\n- Verification: **{}**\n- Digest: `{}`\n",
+            "# Lucia Evolution Certificate\n\n- Release: `{}`\n- Revision: `r{}`\n- Parent: `{}`\n- Child: `{}`\n- Gate: `{:?}`\n- Lifecycle: `{:?}`\n- EvaluationReport: `{}`\n- Rollback: `{}`\n- Verification: **{}**\n- Digest: `{}`\n",
             certificate.release_record,
+            certificate.revision,
             certificate.parent_revision,
             certificate.child_revision,
             certificate.gate_decision,
             certificate.lifecycle,
             certificate.evaluation_report,
+            certificate
+                .rollback_record
+                .as_ref()
+                .map(|record| format!("{:?}: {}", record.category, record.reason))
+                .unwrap_or_else(|| "N/A".into()),
             if verified { "PASS" } else { "NOT_REQUESTED" },
             certificate.certificate_digest,
         )),
@@ -778,6 +846,13 @@ fn render_history_summary(history: &EvolutionHistory) -> String {
             rate(history.candidate_yield),
             rate(history.rollback_rate)
         ),
+        format!(
+            "Rollback Reasons: Safety {}  Performance {}  Infrastructure {}  Manual {}",
+            history.rollback_breakdown.safety,
+            history.rollback_breakdown.performance,
+            history.rollback_breakdown.infrastructure,
+            history.rollback_breakdown.manual,
+        ),
     ];
     for survival in &history.fix_survival {
         lines.push(format!(
@@ -833,6 +908,13 @@ fn render_funnel(funnel: &EvolutionFunnel, history: &EvolutionHistory) -> String
         format!("Rollbacks             {}", funnel.rollbacks),
         format!("Candidate Yield       {}", rate(history.candidate_yield)),
         format!("Rollback Rate         {}", rate(history.rollback_rate)),
+        format!(
+            "Rollback Reasons      safety={} performance={} infrastructure={} manual={}",
+            history.rollback_breakdown.safety,
+            history.rollback_breakdown.performance,
+            history.rollback_breakdown.infrastructure,
+            history.rollback_breakdown.manual,
+        ),
     ]
     .join("\n")
 }
@@ -876,6 +958,25 @@ fn render_capability_map(rows: &[CapabilityMapRow]) -> String {
                 .join(" ")
         ));
     }
+    lines.push(String::new());
+    lines.push("Dataset version boundaries:".into());
+    for generation in generations {
+        let versions: BTreeSet<_> = rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .filter(|cell| cell.generation == generation)
+            .flat_map(|cell| cell.dataset_versions.iter())
+            .map(ToString::to_string)
+            .collect();
+        lines.push(format!(
+            "  G{generation}: {}",
+            if versions.is_empty() {
+                "N/A".into()
+            } else {
+                versions.into_iter().collect::<Vec<_>>().join(", ")
+            }
+        ));
+    }
     lines.join("\n")
 }
 
@@ -884,25 +985,59 @@ fn render_lineage_nodes(nodes: &[LineageNode]) -> String {
     if nodes.is_empty() {
         return "Lineage: 暂无可验证节点".into();
     }
-    let mut lines = vec![
-        "Generation  Revision            Parent              Behavior                 Gate       Lifecycle              Capability  Hidden".into(),
-    ];
+    let mut lines = vec!["Lucia Evolution Lineage".into()];
     for node in nodes {
         lines.push(format!(
-            "{:>10}  {:<18}  {:<18}  {:<23}  {:<9}  {:<21}  {:>10}  {:>7}",
+            "{}  Revision {}  Parent {}",
             node.generation
                 .map(|generation| format!("G{generation}"))
                 .unwrap_or_else(|| "N/A".into()),
-            truncate_chars(node.revision.as_str(), 18),
-            truncate_chars(node.parent.as_str(), 18),
-            format!("{:?}", node.behavior_assessment),
-            format!("{:?}", node.gate_decision),
-            format!("{:?}", node.lifecycle),
+            node.revision,
+            node.parent,
+        ));
+        lines.push(format!(
+            "  Mutation: {}  Behavior: {:?}  Gate: {:?}  Lifecycle: {:?}",
+            mutation_surfaces(&node.mutation_surfaces),
+            node.behavior_assessment,
+            node.gate_decision,
+            node.lifecycle,
+        ));
+        lines.push(format!(
+            "  Capability {}  Hidden {}  Repair {}  Retention {}  Stability {}",
             number(node.capability_score, ""),
             percent(node.hidden_score),
+            percent(node.repair_score),
+            rate(node.regression_retention),
+            percent(node.stability),
+        ));
+        lines.push(format!(
+            "  Token {}  Latency {} ms  Safety failures {}  Release {}  Rollback {}",
+            number(node.average_tokens, ""),
+            number(node.average_latency_ms, ""),
+            node.safety_failures,
+            node.release
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "N/A".into()),
+            node.rollback_record
+                .as_ref()
+                .map(|record| format!("{:?}: {}", record.category, record.reason))
+                .unwrap_or_else(|| "N/A".into()),
         ));
     }
     lines.join("\n")
+}
+
+/// 以稳定文本显示节点的全部变异表面。
+fn mutation_surfaces(surfaces: &BTreeSet<MutationSurface>) -> String {
+    if surfaces.is_empty() {
+        return "none".into();
+    }
+    surfaces
+        .iter()
+        .map(|surface| format!("{surface:?}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// 渲染简洁 Markdown 历史摘要。
@@ -947,10 +1082,27 @@ fn render_table(scorecard: &EvolutionScorecard, width: u16) -> String {
     let mut lines = Vec::new();
     lines.push("Lucia Evolution Scorecard".into());
     lines.push(format!(
-        "Verdict: {:<20} Comparable: {:<3} Gate: {:?}",
+        "Verdict: {:<20} Comparison: {:<14} Gate: {:?}",
         scorecard.headline_verdict.label(),
-        yes_no(scorecard.comparison_validity.valid),
+        comparison_label(scorecard),
         scorecard.gate.decision
+    ));
+    lines.push(format!(
+        "Lineage: {}  Generation: {} -> {}  Release: {}",
+        scorecard.lineage.as_deref().unwrap_or("N/A"),
+        scorecard
+            .parent_generation
+            .map(|generation| format!("G{generation}"))
+            .unwrap_or_else(|| "N/A".into()),
+        scorecard
+            .candidate_generation
+            .map(|generation| format!("G{generation}"))
+            .unwrap_or_else(|| "N/A".into()),
+        scorecard
+            .release_record
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "N/A".into()),
     ));
     lines.push(format!(
         "Parent: {}  Candidate: {}  Lifecycle: {:?}",
@@ -967,6 +1119,12 @@ fn render_table(scorecard: &EvolutionScorecard, width: u16) -> String {
         lines.push(format!(
             "HARD FAILURES: {}",
             scorecard.gate.hard_failures.join(", ")
+        ));
+    }
+    for violation in &scorecard.comparison_validity.violations {
+        lines.push(format!(
+            "NOT COMPARABLE: {:?}: {}",
+            violation.kind, violation.detail
         ));
     }
     lines.push("-----------------------------------------------------------------------".into());
@@ -1047,12 +1205,7 @@ fn render_narrow_table(scorecard: &EvolutionScorecard) -> String {
     let mut lines = vec![
         "Lucia Evolution Scorecard".into(),
         format!("Verdict: {}", scorecard.headline_verdict.label()),
-        format!(
-            "Comparable: {}",
-            yes_no(scorecard.comparison_validity.valid)
-        ),
-        format!("Gate: {:?}", scorecard.gate.decision),
-        format!("Lifecycle: {:?}", scorecard.lifecycle),
+        format!("Comparison: {}", comparison_label(scorecard)),
         format!(
             "Safety critical: {}",
             scorecard.safety.candidate.critical_failures
@@ -1061,6 +1214,28 @@ fn render_narrow_table(scorecard: &EvolutionScorecard) -> String {
             "Permission expansion: {}",
             scorecard.safety.candidate.permission_expansions
         ),
+        format!("Lineage: {}", scorecard.lineage.as_deref().unwrap_or("N/A")),
+        format!(
+            "Generation: {} -> {}",
+            scorecard
+                .parent_generation
+                .map(|generation| format!("G{generation}"))
+                .unwrap_or_else(|| "N/A".into()),
+            scorecard
+                .candidate_generation
+                .map(|generation| format!("G{generation}"))
+                .unwrap_or_else(|| "N/A".into()),
+        ),
+        format!(
+            "Release: {}",
+            scorecard
+                .release_record
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "N/A".into())
+        ),
+        format!("Gate: {:?}", scorecard.gate.decision),
+        format!("Lifecycle: {:?}", scorecard.lifecycle),
         format!(
             "Capability: {} -> {} ({})",
             number(scorecard.capability.parent_score, ""),
@@ -1090,6 +1265,12 @@ fn render_narrow_table(scorecard: &EvolutionScorecard) -> String {
         lines.push(format!(
             "HARD FAILURES: {}",
             scorecard.gate.hard_failures.join(", ")
+        ));
+    }
+    for violation in &scorecard.comparison_validity.violations {
+        lines.push(format!(
+            "NOT COMPARABLE: {:?}: {}",
+            violation.kind, violation.detail
         ));
     }
     lines.join("\n")
@@ -1134,9 +1315,13 @@ fn render_markdown(scorecard: &EvolutionScorecard) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "# Lucia Evolution Scorecard\n\n- Verdict: **{}**\n- Comparable: {}\n- Gate: `{:?}`\n- Lifecycle: `{:?}`\n- Critical safety failures: {}\n- Permission expansions: {}\n\n| Metric | Parent | Candidate | Delta |\n|---|---:|---:|---:|\n{}\n",
+        "# Lucia Evolution Scorecard\n\n- Verdict: **{}**\n- Comparison: **{}**\n- Lineage: `{}`\n- Generation: `{} -> {}`\n- Release: `{}`\n- Gate: `{:?}`\n- Lifecycle: `{:?}`\n- Critical safety failures: {}\n- Permission expansions: {}\n\n| Metric | Parent | Candidate | Delta |\n|---|---:|---:|---:|\n{}\n",
         scorecard.headline_verdict.label(),
-        yes_no(scorecard.comparison_validity.valid),
+        comparison_label(scorecard),
+        scorecard.lineage.as_deref().unwrap_or("N/A"),
+        scorecard.parent_generation.map(|value| format!("G{value}")).unwrap_or_else(|| "N/A".into()),
+        scorecard.candidate_generation.map(|value| format!("G{value}")).unwrap_or_else(|| "N/A".into()),
+        scorecard.release_record.as_ref().map(ToString::to_string).unwrap_or_else(|| "N/A".into()),
         scorecard.gate.decision,
         scorecard.lifecycle,
         scorecard.safety.candidate.critical_failures,
@@ -1199,12 +1384,28 @@ fn confidence_label(scorecard: &EvolutionScorecard) -> String {
 fn safety_integrity_label(scorecard: &EvolutionScorecard) -> &'static str {
     if scorecard.safety.candidate.artifact_integrity_failures != 0
         || scorecard.safety.candidate.audit_integrity_failures != 0
+        || scorecard.gate.artifact_integrity_verified == Some(false)
+        || scorecard.gate.audit_integrity_verified == Some(false)
+        || scorecard.gate.hidden_dataset_isolated == Some(false)
     {
         "FAIL"
-    } else if scorecard.safety.candidate.missing_attempts != 0 {
+    } else if scorecard.safety.candidate.missing_attempts != 0
+        || scorecard.gate.artifact_integrity_verified != Some(true)
+        || scorecard.gate.audit_integrity_verified != Some(true)
+        || scorecard.gate.hidden_dataset_isolated != Some(true)
+    {
         "UNKNOWN"
     } else {
         "PASS"
+    }
+}
+
+/// 输出不能只依赖布尔值表达的可比性标签。
+fn comparison_label(scorecard: &EvolutionScorecard) -> &'static str {
+    if scorecard.comparison_validity.valid {
+        "COMPARABLE"
+    } else {
+        "NOT COMPARABLE"
     }
 }
 
@@ -1266,13 +1467,15 @@ const fn optional_bool(value: Option<bool>) -> &'static str {
 mod tests {
     use super::*;
     use agent_evolution::{
-        BehaviorAssessment, CapabilityScoreSummary, ComparisonValidity, DatasetComparison,
-        DatasetMetricSummary, EvaluationConfidence, GateSummary, HeadlineVerdict,
+        BehaviorAssessment, CapabilityMapCell, CapabilityMapRow, CapabilityScoreSummary,
+        ComparisonValidity, ComparisonViolation, ComparisonViolationKind, DatasetComparison,
+        DatasetMetricSummary, EvaluationConfidence, GateSummary, HeadlineVerdict, LineageNode,
         RegressionComparison, RegressionRetention, ResourceComparison, ResourceDelta,
         SafetyComparison, SafetyMetrics, StabilityMetrics,
     };
     use agent_evolution_protocol::{
-        EvaluationReportId, EvolutionLifecycle, GateDecision, GenomeRevisionId,
+        DatasetVersionId, EvaluationReportId, EvolutionLifecycle, GateDecision, GenomeRevisionId,
+        MutationSurface, ReleaseId,
     };
 
     /// 构造缺失指标的固定 Scorecard，验证展示不会伪造零。
@@ -1311,6 +1514,9 @@ mod tests {
                 decision: GateDecision::Unknown,
                 hard_failures: Vec::new(),
                 resource_gate_passed: None,
+                artifact_integrity_verified: None,
+                audit_integrity_verified: None,
+                hidden_dataset_isolated: None,
             },
             capability: CapabilityScoreSummary {
                 parent_score: None,
@@ -1416,5 +1622,94 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("应是 JSON");
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["headline_verdict"], "INCONCLUSIVE");
+    }
+
+    /// EVOLVED 必须在无颜色首屏中直接出现，并同时展示 Lineage、代数和 Release 边界。
+    #[test]
+    fn evolved_first_screen_includes_release_context() {
+        let mut scorecard = missing_scorecard(HeadlineVerdict::Evolved);
+        scorecard.lifecycle = EvolutionLifecycle::InheritanceVerified;
+        scorecard.release_record = Some(ReleaseId::generate());
+        let rendered = render_table(&scorecard, 100);
+        let first_screen = rendered.lines().take(8).collect::<Vec<_>>().join("\n");
+        assert!(first_screen.contains("EVOLVED"));
+        assert!(first_screen.contains("Lineage: stable/general"));
+        assert!(first_screen.contains("Generation: G1 -> G2"));
+        assert!(first_screen.contains("Release:"));
+    }
+
+    /// Invalid Comparison 必须显示 NOT COMPARABLE 和具体违规，不能只输出 NO。
+    #[test]
+    fn invalid_comparison_is_explicitly_labeled() {
+        let mut scorecard = missing_scorecard(HeadlineVerdict::InvalidComparison);
+        scorecard.comparison_validity = ComparisonValidity {
+            valid: false,
+            violations: vec![ComparisonViolation {
+                kind: ComparisonViolationKind::Kernel,
+                detail: "KernelRef 不同".into(),
+            }],
+        };
+        let rendered = render_table(&scorecard, 100);
+        assert!(rendered.contains("Comparison: NOT COMPARABLE"));
+        assert!(rendered.contains("NOT COMPARABLE: Kernel: KernelRef 不同"));
+    }
+
+    /// Capability Map 文本必须显式列出每代 Dataset 版本边界。
+    #[test]
+    fn capability_map_displays_dataset_version_boundaries() {
+        let version = DatasetVersionId::generate();
+        let rendered = render_capability_map(&[CapabilityMapRow {
+            task_family: "工具调用".into(),
+            cells: vec![CapabilityMapCell {
+                generation: 2,
+                score: Some(0.85),
+                scored_cases: 1,
+                total_cases: 1,
+                dataset_versions: [version.clone()].into_iter().collect(),
+            }],
+        }]);
+        assert!(rendered.contains("Dataset version boundaries:"));
+        assert!(rendered.contains(&format!("G2: {version}")));
+    }
+
+    /// Lineage 文本必须覆盖变异、完整能力趋势、资源、安全与 Release 字段。
+    #[test]
+    fn lineage_displays_complete_audit_fields() {
+        let release = ReleaseId::generate();
+        let rendered = render_lineage_nodes(&[LineageNode {
+            revision: GenomeRevisionId::generate(),
+            parent: GenomeRevisionId::generate(),
+            generation: Some(2),
+            mutation_surfaces: [MutationSurface::TaskStrategyPrompt].into_iter().collect(),
+            behavior_assessment: BehaviorAssessment::GeneralizedImprovement,
+            gate_decision: GateDecision::Pass,
+            lifecycle: EvolutionLifecycle::InheritanceVerified,
+            capability_score: Some(87.4),
+            hidden_score: Some(0.79),
+            repair_score: Some(0.92),
+            regression_retention: Rate::new(99, 100),
+            stability: Some(0.97),
+            average_tokens: Some(1_710.0),
+            average_latency_ms: Some(8_500.0),
+            safety_failures: 0,
+            release: Some(release.clone()),
+            rolled_back: false,
+            rollback_record: None,
+        }]);
+        for expected in [
+            "Mutation: TaskStrategyPrompt",
+            "Repair 92.0%",
+            "Retention 99.0% (99/100)",
+            "Stability 97.0%",
+            "Token 1710.0",
+            "Latency 8500.0 ms",
+            "Safety failures 0",
+            &format!("Release {release}"),
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "缺少字段：{expected}\n{rendered}"
+            );
+        }
     }
 }

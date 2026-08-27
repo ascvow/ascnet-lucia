@@ -28,7 +28,7 @@ use std::{collections::HashSet, sync::Arc};
 
 /// Default system prompt for the helpful Lucia agent.
 /// Lucia 实用型 Agent 的默认 system prompt。
-pub const DEFAULT_REACT_SYSTEM_PROMPT: &str = r#"You are lucia, a helpful AI agent.
+pub const DEFAULT_REACT_SYSTEM_PROMPT: &str = r#"You are Lucia, a helpful AI agent.
 
 When tools are available, choose and use the appropriate tools for the task. Use tools only through the provided tool-calling interface.
 When you receive tool results, continue reasoning and answer the user directly.

@@ -1,20 +1,15 @@
 //! M8 插件部署 Store 的跨进程恢复、状态机并发与路径安全回归测试。
 
-pub use agent_evaluation::{PluginCanaryAdmissionV1, PluginCanaryDeployment};
-
-#[path = "../src/plugin_deployment_store.rs"]
-mod plugin_deployment_store;
-
-use agent_evolution::FileArtifactStore;
-use agent_evolution_protocol::{
-    ArtifactDigest, CandidateId, GenomeDigest, GenomeRevisionId, MutationId, ReleaseId,
-};
-use agent_plugin_manager::InstalledPlugin;
-use plugin_deployment_store::{
+use agent_evaluation::{
     FilePluginDeploymentStore, PluginCanaryDeploymentBindingV1,
     PluginCanaryDeploymentPersistenceView, PluginDeploymentId, PluginDeploymentStateV1,
     PluginDeploymentStoreError,
 };
+use agent_evolution::{FileArtifactStore, StableGenomeRef, STABLE_GENOME_REF_SCHEMA_VERSION};
+use agent_evolution_protocol::{
+    ArtifactDigest, CandidateId, GenomeDigest, GenomeRevisionId, MutationId, ReleaseId,
+};
+use agent_plugin_manager::InstalledPlugin;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -37,6 +32,8 @@ impl DeploymentFixture {
         let artifact_root = temp.path().join("artifacts");
         let release_id = ReleaseId::generate();
         let candidate_digest = artifact_digest('b');
+        let parent_revision_id = GenomeRevisionId::generate();
+        let parent_revision_digest = genome_digest('a');
         Self {
             temp,
             store_root,
@@ -46,8 +43,19 @@ impl DeploymentFixture {
                 canary_release_id: release_id,
                 mutation_id: MutationId::generate(),
                 candidate_id: CandidateId::generate(),
-                parent_revision_id: GenomeRevisionId::generate(),
-                parent_revision_digest: genome_digest('a'),
+                parent_stable: StableGenomeRef {
+                    schema_version: STABLE_GENOME_REF_SCHEMA_VERSION,
+                    lineage: "stable/plugins".to_string(),
+                    revision_id: parent_revision_id.clone(),
+                    digest: parent_revision_digest.clone(),
+                    generation: 1,
+                    release_id: None,
+                    evaluation_report_id: None,
+                    previous_revision_id: None,
+                    rollback_of: None,
+                },
+                parent_revision_id,
+                parent_revision_digest,
                 candidate_revision_id: GenomeRevisionId::generate(),
                 candidate_revision_digest: genome_digest('b'),
                 admission_digest: artifact_digest('c'),
@@ -193,6 +201,13 @@ async fn previous_bundle_rechecks_content_length_and_digest() {
         .append_planned(&fixture.binding, &fixture.previous_bundle)
         .await
         .expect("应追加 Planned");
+    let serialized = serde_json::to_vec(&planned).expect("应序列化 Planned");
+    assert!(
+        !serialized
+            .windows(fixture.previous_bundle.len())
+            .any(|window| window == fixture.previous_bundle),
+        "状态 JSON 不得内嵌旧 bundle 原始字节"
+    );
     let path = artifact_path(&fixture.artifact_root, &planned.previous_bundle.digest);
 
     std::fs::write(&path, b"tampered").expect("应篡改测试 CAS 文件");

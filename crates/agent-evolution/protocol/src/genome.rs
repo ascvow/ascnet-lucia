@@ -318,7 +318,6 @@ impl AgentGenome {
                 });
             }
         }
-
         Ok(())
     }
 

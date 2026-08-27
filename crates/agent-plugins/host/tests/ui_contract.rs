@@ -10,8 +10,8 @@ use agent_plugin_host::{
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
-const CANONICAL_WIT: &str = include_str!("../../../wit/plugin.wit");
-const UI_FIXTURE: &str = include_str!("../../../wit/fixtures/ui-v1.json");
+const CANONICAL_WIT: &str = include_str!("../../../../wit/plugin.wit");
+const UI_FIXTURE: &str = include_str!("../../../../wit/fixtures/ui-v1.json");
 
 /// 读取单一 UI 契约样本。
 fn ui_fixture() -> Value {

@@ -236,7 +236,7 @@ async fn full_evolved_fixture_matches_scorecard_contract() {
             )
             .await
             .expect("应导出继承证据 Artifact");
-        let certificate = EvolutionCertificate::create(
+        let promotion_certificate = EvolutionCertificate::create(
             EvolutionCertificateInput {
                 parent_revision: report.parent.genome_revision.clone(),
                 child_revision: report.candidate.genome_revision.clone(),
@@ -252,12 +252,17 @@ async fn full_evolved_fixture_matches_scorecard_contract() {
                 repaired_task_case_ids: vec!["Repair-000".into()],
                 scorecard: scorecard_artifact,
                 release_record: report.release_record.clone().expect("应有 Release"),
-                inheritance_verification: inheritance_artifact,
-                post_promotion_run_ids: vec![RunId::generate()],
             },
             &scorecard,
         )
-        .expect("应生成 Certificate");
+        .expect("应生成 Promotion Certificate");
+        let certificate = promotion_certificate
+            .with_inheritance(
+                report.inheritance.as_ref().expect("应有继承证据"),
+                inheritance_artifact,
+                vec![RunId::generate()],
+            )
+            .expect("应生成继承状态修订");
         certificate
             .verify(&artifacts)
             .await
@@ -268,9 +273,13 @@ async fn full_evolved_fixture_matches_scorecard_contract() {
             .await
             .expect("应归档 Scorecard");
         archive
+            .append_certificate(&promotion_certificate)
+            .await
+            .expect("应归档 Promotion Certificate");
+        archive
             .append_certificate(&certificate)
             .await
-            .expect("应归档 Certificate");
+            .expect("应归档继承状态修订");
         println!(
             "fixture_root={} report={} release={}",
             root.display(),

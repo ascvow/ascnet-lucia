@@ -356,7 +356,9 @@ mod release_support {
     mod deployment_tests {
         use super::*;
         use agent_evaluation::{
-            PluginDeploymentController, PluginDeploymentError, PluginPromotionReceipt,
+            FilePluginDeploymentStore, PersistentPluginDeploymentController,
+            PluginDeploymentController, PluginDeploymentError, PluginDeploymentId,
+            PluginDeploymentStateV1, PluginPromotionReceipt,
         };
         use agent_evolution::{
             FileGenomeResolver, FileStableGenomePublisher, GenomeResolver, GenomeSelector,
@@ -636,6 +638,367 @@ mod release_support {
             assert_eq!(stable.revision_id, candidate_revision.revision_id);
             assert_eq!(stable.digest, candidate_revision.digest);
             assert_eq!(current_stable(&publisher).await, candidate_revision);
+        }
+
+        /// replace 已提交但 CanaryInstalled 未落盘时，新 Controller 必须从真实 Manager 恢复并
+        /// 完成 Stable Promotion；终态补记前 Stable 被其他发布改写时必须失败关闭。
+        #[tokio::test]
+        async fn rebuilds_manager_state_across_controller_restart_and_promotes() {
+            let temp = TempDir::new().expect("创建测试目录");
+            let (parent_root, parent_bundle) = plugin_bundle(temp.path(), "1.0.0", false);
+            let (_, candidate_bundle) = plugin_bundle(temp.path(), "2.0.0", false);
+            let parent_revision = genome("1.0.0", bytes_digest(&parent_bundle), None);
+            let mut candidate_revision = genome(
+                "2.0.0",
+                bytes_digest(&candidate_bundle),
+                Some(&parent_revision),
+            );
+            let (manager, publisher) =
+                initialize_parent(&temp, &parent_root, &parent_revision).await;
+            let artifacts = FileArtifactStore::new(temp.path().join("artifacts"));
+            let signing = SigningFixture::new();
+            let archive = FilePluginReleaseArchive::new(temp.path().join("releases"), &artifacts)
+                .expect("创建发布归档");
+            let release_controller = PluginReleaseController::new(
+                &archive,
+                &signing.build_keys,
+                &signing.approval_keys,
+                &signing.release_keys,
+            );
+            let parent_fixture = bind_bundle(release_fixture(40, 7_000, None), parent_bundle);
+            let parent_admission =
+                admit_canary(&release_controller, &signing, &parent_fixture, 7_050).await;
+            let _trusted_parent = authorize_stable(
+                &release_controller,
+                &signing,
+                &parent_fixture,
+                &parent_admission,
+                7_060,
+            )
+            .await;
+            let candidate_fixture = bind_bundle(
+                release_fixture(41, 8_000, Some(&parent_fixture)),
+                candidate_bundle,
+            );
+            candidate_revision.metadata.mutation =
+                Some(candidate_fixture.input.proposal.mutation_id.clone());
+            let admission =
+                admit_canary(&release_controller, &signing, &candidate_fixture, 8_050).await;
+            let deployment_root = temp.path().join("deployment-store");
+            let deployment_store = FilePluginDeploymentStore::new(&deployment_root, &artifacts)
+                .expect("创建部署 Store");
+            let first = PersistentPluginDeploymentController::new(
+                &manager,
+                &publisher,
+                &archive,
+                &deployment_store,
+                temp.path().join("staging-first"),
+            );
+            let installed_record = first
+                .deploy_canary(
+                    "stable/plugins",
+                    &admission.release.release.release_id,
+                    &candidate_revision,
+                )
+                .await
+                .expect("持久化安装 Canary");
+            assert_eq!(
+                installed_record.state,
+                PluginDeploymentStateV1::CanaryInstalled
+            );
+            drop(first);
+
+            let directory = deployment_root.join("deployments").join(format!(
+                "{:x}",
+                Sha256::digest(installed_record.deployment_id.as_str().as_bytes())
+            ));
+            // 模拟 Planned 已提交、进程在 replace 前退出；新 Controller 必须从归档重做安装。
+            std::fs::remove_file(directory.join("01-canary-installed.json"))
+                .expect("移除测试中的未提交状态快照");
+            manager
+                .replace(&parent_root)
+                .expect("测试应恢复 replace 前的 Parent 安装");
+            let second = PersistentPluginDeploymentController::new(
+                &manager,
+                &publisher,
+                &archive,
+                &deployment_store,
+                temp.path().join("staging-second"),
+            );
+            let recovered = second
+                .recover_canary_install(&installed_record.deployment_id)
+                .await
+                .expect("新 Controller 应从 Release Archive 重新安装 Candidate");
+            assert_eq!(recovered.state, PluginDeploymentStateV1::CanaryInstalled);
+            assert_eq!(manager.list().expect("读取插件锁")[0].version, "2.0.0");
+            drop(second);
+
+            // 模拟 replace 已提交、进程在 CanaryInstalled 原子文件提交前退出；再次重建只补记状态。
+            std::fs::remove_file(directory.join("01-canary-installed.json"))
+                .expect("再次移除测试中的未提交状态快照");
+            let third = PersistentPluginDeploymentController::new(
+                &manager,
+                &publisher,
+                &archive,
+                &deployment_store,
+                temp.path().join("staging-third"),
+            );
+            let recovered = third
+                .recover_canary_install(&installed_record.deployment_id)
+                .await
+                .expect("新 Controller 应从 Manager Candidate 补记状态");
+
+            let stable = authorize_stable(
+                &release_controller,
+                &signing,
+                &candidate_fixture,
+                &admission,
+                8_060,
+            )
+            .await;
+            let receipt = third
+                .promote_stable(&recovered.deployment_id, &stable.release.release_id)
+                .await
+                .expect("重建后的 Controller 应完成 Promotion");
+            assert_eq!(receipt.installed.version, "2.0.0");
+            assert_eq!(receipt.stable.revision_id, candidate_revision.revision_id);
+            drop(third);
+
+            // 模拟 Stable 已原子发布、进程在 Promoted 状态文件提交前退出。
+            std::fs::remove_file(directory.join("02-promoted.json"))
+                .expect("移除测试中的未提交 Promoted 快照");
+            let fourth = PersistentPluginDeploymentController::new(
+                &manager,
+                &publisher,
+                &archive,
+                &deployment_store,
+                temp.path().join("staging-fourth"),
+            );
+            let resumed = fourth
+                .promote_stable(&recovered.deployment_id, &stable.release.release_id)
+                .await
+                .expect("新 Controller 应识别已提交 Stable 并补记 Promoted");
+            assert_eq!(resumed.stable, receipt.stable);
+            assert_eq!(
+                deployment_store
+                    .load(&PluginDeploymentId::for_canary_release(
+                        admission.release.release.release_id.clone(),
+                    ))
+                    .await
+                    .expect("读取部署终态")
+                    .expect("部署应存在")
+                    .state,
+                PluginDeploymentStateV1::Promoted
+            );
+
+            // 再次模拟 Promoted 未落盘，并让另一发布推进 Stable；恢复不得误认其为本部署结果。
+            std::fs::remove_file(directory.join("02-promoted.json"))
+                .expect("再次移除测试中的未提交 Promoted 快照");
+            let conflicting_revision = genome(
+                "3.0.0",
+                bytes_digest(&candidate_fixture.bundle),
+                Some(&candidate_revision),
+            );
+            publisher
+                .resolver()
+                .store()
+                .append(&conflicting_revision)
+                .await
+                .expect("登记其他发布的 Genome");
+            publisher
+                .publish("stable/plugins", &conflicting_revision, 3)
+                .await
+                .expect("模拟其他生产发布改写 Stable");
+            let fifth = PersistentPluginDeploymentController::new(
+                &manager,
+                &publisher,
+                &archive,
+                &deployment_store,
+                temp.path().join("staging-fifth"),
+            );
+            let error = fifth
+                .promote_stable(&recovered.deployment_id, &stable.release.release_id)
+                .await
+                .expect_err("其他发布的 Stable 不得被误认成本部署结果");
+            match error {
+                PluginDeploymentError::Binding(message) => {
+                    assert_eq!(message, "Stable 已被其他生产部署改写");
+                }
+                other => panic!("Stable 并发改写应返回绑定错误，实际为：{other}"),
+            }
+            assert_eq!(current_stable(&publisher).await, conflicting_revision);
+            assert_eq!(manager.list().expect("读取插件锁")[0].version, "2.0.0");
+            assert_eq!(
+                deployment_store
+                    .load(&recovered.deployment_id)
+                    .await
+                    .expect("读取并发改写后的部署状态")
+                    .expect("部署应存在")
+                    .state,
+                PluginDeploymentStateV1::CanaryInstalled
+            );
+        }
+
+        /// CanaryInstalled 落盘后重启的新 Controller 必须仅依赖归档与 Store/CAS 恢复旧 bundle。
+        #[tokio::test]
+        async fn rebuilds_manager_state_across_controller_restart_and_rolls_back() {
+            let temp = TempDir::new().expect("创建测试目录");
+            let (parent_root, parent_bundle) = plugin_bundle(temp.path(), "1.0.0", false);
+            let (_, candidate_bundle) = plugin_bundle(temp.path(), "2.0.0", false);
+            let parent_revision = genome("1.0.0", bytes_digest(&parent_bundle), None);
+            let mut candidate_revision = genome(
+                "2.0.0",
+                bytes_digest(&candidate_bundle),
+                Some(&parent_revision),
+            );
+            let (manager, publisher) =
+                initialize_parent(&temp, &parent_root, &parent_revision).await;
+            let artifacts = FileArtifactStore::new(temp.path().join("artifacts"));
+            let signing = SigningFixture::new();
+            let archive = FilePluginReleaseArchive::new(temp.path().join("releases"), &artifacts)
+                .expect("创建发布归档");
+            let release_controller = PluginReleaseController::new(
+                &archive,
+                &signing.build_keys,
+                &signing.approval_keys,
+                &signing.release_keys,
+            );
+            let parent_fixture = bind_bundle(release_fixture(42, 9_000, None), parent_bundle);
+            let parent_admission =
+                admit_canary(&release_controller, &signing, &parent_fixture, 9_050).await;
+            let trusted_parent = authorize_stable(
+                &release_controller,
+                &signing,
+                &parent_fixture,
+                &parent_admission,
+                9_060,
+            )
+            .await;
+            let candidate_fixture = bind_bundle(
+                release_fixture(43, 10_000, Some(&parent_fixture)),
+                candidate_bundle,
+            );
+            candidate_revision.metadata.mutation =
+                Some(candidate_fixture.input.proposal.mutation_id.clone());
+            let admission =
+                admit_canary(&release_controller, &signing, &candidate_fixture, 10_050).await;
+            let deployment_store =
+                FilePluginDeploymentStore::new(temp.path().join("deployment-store"), &artifacts)
+                    .expect("创建部署 Store");
+            let first = PersistentPluginDeploymentController::new(
+                &manager,
+                &publisher,
+                &archive,
+                &deployment_store,
+                temp.path().join("staging-first"),
+            );
+            let installed = first
+                .deploy_canary(
+                    "stable/plugins",
+                    &admission.release.release.release_id,
+                    &candidate_revision,
+                )
+                .await
+                .expect("持久化安装 Canary");
+            drop(first);
+
+            let running = running_canary(&admission.canary, 10_060);
+            release_controller
+                .record_canary_observation(
+                    &candidate_fixture.input,
+                    &candidate_fixture.report,
+                    &running,
+                )
+                .await
+                .expect("归档 Running Canary");
+            let failed = terminal_canary(&running, false, 10_061);
+            release_controller
+                .record_canary_observation(
+                    &candidate_fixture.input,
+                    &candidate_fixture.report,
+                    &failed,
+                )
+                .await
+                .expect("归档 Failed Canary");
+            let rollback = signing.release(
+                &candidate_fixture,
+                PluginReleaseStage::Rollback,
+                Some(admission.canary.release_id.clone()),
+                Some(trusted_parent.release.attestation.component_digest.clone()),
+                10_062,
+            );
+            let rollback_record = release_controller
+                .rollback_failed_canary(PluginRollbackRequestV1 {
+                    input: &candidate_fixture.input,
+                    report: &candidate_fixture.report,
+                    failed: &failed,
+                    rollback: &rollback,
+                    rollback_target_release_id: &trusted_parent.release.release_id,
+                    candidate_component_bytes: &candidate_fixture.component,
+                    bundle_bytes: &candidate_fixture.bundle,
+                    rollback_target_bytes: &parent_fixture.component,
+                })
+                .await
+                .expect("授权健康失败回滚");
+            let second = PersistentPluginDeploymentController::new(
+                &manager,
+                &publisher,
+                &archive,
+                &deployment_store,
+                temp.path().join("staging-second"),
+            );
+            let receipt = second
+                .rollback_failed_canary(
+                    &installed.deployment_id,
+                    &rollback_record.release.release_id,
+                    &trusted_parent.release.release_id,
+                )
+                .await
+                .expect("重建后的 Controller 应恢复旧 Stable bundle");
+            assert_eq!(receipt.installed.version, "1.0.0");
+            assert_eq!(
+                receipt.stable,
+                installed.parent_stable.expect("应持久化 Parent Stable")
+            );
+            assert_eq!(current_stable(&publisher).await, parent_revision);
+            drop(second);
+
+            // 模拟旧 bundle 已恢复、进程在 RolledBack 状态文件提交前退出。
+            let directory = temp
+                .path()
+                .join("deployment-store")
+                .join("deployments")
+                .join(format!(
+                    "{:x}",
+                    Sha256::digest(installed.deployment_id.as_str().as_bytes())
+                ));
+            std::fs::remove_file(directory.join("02-rolled-back.json"))
+                .expect("移除测试中的未提交 RolledBack 快照");
+            let third = PersistentPluginDeploymentController::new(
+                &manager,
+                &publisher,
+                &archive,
+                &deployment_store,
+                temp.path().join("staging-third"),
+            );
+            let resumed = third
+                .rollback_failed_canary(
+                    &installed.deployment_id,
+                    &rollback_record.release.release_id,
+                    &trusted_parent.release.release_id,
+                )
+                .await
+                .expect("新 Controller 应识别已恢复 Manager 并补记 RolledBack");
+            assert_eq!(resumed.installed.version, "1.0.0");
+            assert_eq!(
+                deployment_store
+                    .load(&installed.deployment_id)
+                    .await
+                    .expect("读取部署终态")
+                    .expect("部署应存在")
+                    .state,
+                PluginDeploymentStateV1::RolledBack
+            );
         }
 
         /// Plugin Manager 拒绝安装时不得改写插件锁或 Stable Genome。

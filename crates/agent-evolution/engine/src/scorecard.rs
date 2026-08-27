@@ -405,6 +405,15 @@ pub struct GateSummary {
     pub hard_failures: Vec<String>,
     /// 资源门槛；资源缺失时为 `None`。
     pub resource_gate_passed: Option<bool>,
+    /// Evaluation 制品完整性是否由可信控制面验证。
+    #[serde(default)]
+    pub artifact_integrity_verified: Option<bool>,
+    /// 审计链完整性是否由可信控制面验证。
+    #[serde(default)]
+    pub audit_integrity_verified: Option<bool>,
+    /// Hidden Dataset 隔离是否由可信控制面验证。
+    #[serde(default)]
+    pub hidden_dataset_isolated: Option<bool>,
 }
 
 /// 可序列化、可审计的完整 Evolution Scorecard。
@@ -514,9 +523,16 @@ pub fn comparison_validity(report: &EvaluationReport) -> ComparisonValidity {
         &mut violations,
     );
     compare_field(
-        parent.plugin_set_digest == candidate.plugin_set_digest,
+        parent.plugin_set_digest == candidate.plugin_set_digest
+            || (report
+                .allowed_mutation_surfaces
+                .contains(&agent_evolution_protocol::MutationSurface::Plugin)
+                && report
+                    .genome_diff
+                    .changed_surfaces
+                    .contains(&agent_evolution_protocol::MutationSurface::Plugin)),
         ComparisonViolationKind::PluginSet,
-        "Plugin Set 不同",
+        "Plugin Set 不同且本轮未显式授权 Plugin 变异",
         &mut violations,
     );
     compare_field(
@@ -603,7 +619,15 @@ fn compare_field(
 /// 提取影响比较语义、但不包含 TaskCase 正文的稳定契约。
 fn task_case_contracts(
     run: &agent_evolution_protocol::EvaluationRun,
-) -> BTreeSet<(String, String, DatasetKind, bool, bool, Option<String>)> {
+) -> BTreeSet<(
+    String,
+    String,
+    DatasetKind,
+    bool,
+    bool,
+    Option<String>,
+    BTreeSet<u32>,
+)> {
     run.task_cases
         .iter()
         .map(|case| {
@@ -614,6 +638,10 @@ fn task_case_contracts(
                 case.metadata.critical,
                 case.metadata.deterministic,
                 case.metadata.pass_threshold.map(|value| value.to_string()),
+                case.attempts
+                    .iter()
+                    .map(|attempt| attempt.repeat_index)
+                    .collect(),
             )
         })
         .collect()
@@ -680,6 +708,9 @@ pub fn compute_scorecard(
         decision: report.gate_decision,
         hard_failures,
         resource_gate_passed: resource_gate,
+        artifact_integrity_verified: report.artifact_integrity_verified,
+        audit_integrity_verified: report.audit_integrity_verified,
+        hidden_dataset_isolated: report.hidden_dataset_isolated,
     };
     let inheritance = report.inheritance.as_ref().map(InheritanceMetrics::from);
     let behavior = assess_behavior(AssessmentInput {
@@ -1494,6 +1525,47 @@ mod tests {
     #[test]
     fn allowed_prompt_diff_is_comparable() {
         assert!(comparison_validity(&report()).valid);
+    }
+
+    /// Plugin 是本轮显式允许且实际发生的变异表面时，Plugin Set 摘要变化仍可比较。
+    #[test]
+    fn allowed_plugin_diff_is_comparable() {
+        let mut value = report();
+        value.candidate.environment.plugin_set_digest = "plugins-v2".into();
+        value.genome_diff.changed_surfaces = [MutationSurface::Plugin].into_iter().collect();
+        value.allowed_mutation_surfaces = [MutationSurface::Plugin].into_iter().collect();
+        assert!(comparison_validity(&value).valid);
+    }
+
+    /// 仅修改 Plugin Set 环境摘要但没有对应授权差异时仍属于混杂变量。
+    #[test]
+    fn unauthorized_plugin_set_change_is_invalid() {
+        let mut value = report();
+        value.candidate.environment.plugin_set_digest = "plugins-v2".into();
+        assert!(!comparison_validity(&value).valid);
+    }
+
+    /// Parent/Candidate 的 Repeat Count 总数相同也不能掩盖单个 Case 配对序号不一致。
+    #[test]
+    fn mismatched_repeat_indices_are_invalid() {
+        let mut value = report();
+        value.parent.environment.repeat_count = 2;
+        value.candidate.environment.repeat_count = 2;
+        let parent_attempt = value.parent.task_cases[0].attempts[0].clone();
+        let mut candidate_attempt = value.candidate.task_cases[0].attempts[0].clone();
+        let mut parent_repeat = parent_attempt;
+        parent_repeat.repeat_index = 1;
+        candidate_attempt.repeat_index = 2;
+        value.parent.task_cases[0].attempts.push(parent_repeat);
+        value.candidate.task_cases[0]
+            .attempts
+            .push(candidate_attempt);
+        let validity = comparison_validity(&value);
+        assert!(!validity.valid);
+        assert!(validity
+            .violations
+            .iter()
+            .any(|violation| violation.kind == ComparisonViolationKind::TaskCases));
     }
 
     #[test]

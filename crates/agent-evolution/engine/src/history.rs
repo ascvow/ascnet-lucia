@@ -2,7 +2,7 @@
 
 use crate::{
     aggregate_case, compute_scorecard, EvolutionCertificate, EvolutionScorecard,
-    EvolutionVerdictPolicy, Rate, ScorecardError,
+    EvolutionVerdictPolicy, Rate, RollbackCategory, RollbackRecord, ScorecardError,
 };
 use agent_evolution_protocol::{
     DatasetKind, DatasetVersionId, EvaluationReport, EvolutionLifecycle, GateDecision,
@@ -93,6 +93,19 @@ pub struct EvolutionVelocityPoint {
     pub points_per_monetary_unit: Option<f64>,
 }
 
+/// 按正式 RollbackRecord 分类的回滚数量。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RollbackBreakdown {
+    /// 安全、权限、泄漏或完整性回滚。
+    pub safety: u64,
+    /// 能力、稳定性或资源性能回滚。
+    pub performance: u64,
+    /// Registry、依赖、评测或运行基础设施回滚。
+    pub infrastructure: u64,
+    /// 授权人员基于外部条件执行的人工回滚。
+    pub manual: u64,
+}
+
 /// Task Family × Generation 的单个能力格。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityMapCell {
@@ -138,10 +151,24 @@ pub struct LineageNode {
     pub capability_score: Option<f64>,
     /// Candidate Hidden Score。
     pub hidden_score: Option<f64>,
+    /// Candidate Repair Score。
+    pub repair_score: Option<f64>,
+    /// Candidate 对 Parent 已通过 Regression Case 的保持率。
+    pub regression_retention: Rate,
+    /// Candidate Repeat 稳定性。
+    pub stability: Option<f64>,
+    /// Candidate 每个有效 Attempt 的平均 Token。
+    pub average_tokens: Option<f64>,
+    /// Candidate 每个有效 Attempt 的平均延迟毫秒。
+    pub average_latency_ms: Option<f64>,
+    /// Candidate 按严重级别汇总的安全失败数。
+    pub safety_failures: u64,
     /// Release ID。
     pub release: Option<ReleaseId>,
     /// 是否已回滚。
     pub rolled_back: bool,
+    /// 回滚时绑定的正式记录；旧归档缺失时为 `None`。
+    pub rollback_record: Option<RollbackRecord>,
 }
 
 /// 历史分析的完整稳定 JSON 输出。
@@ -157,6 +184,8 @@ pub struct EvolutionHistory {
     pub candidate_yield: Rate,
     /// Rollback / Promotion 的回滚率。
     pub rollback_rate: Rate,
+    /// 正式 RollbackRecord 的原因分类。
+    pub rollback_breakdown: RollbackBreakdown,
     /// 一、三、五代后的 Fix Survival。
     pub fix_survival: Vec<FixSurvivalPoint>,
     /// 按 Hidden Dataset 版本分段的累计趋势。
@@ -219,7 +248,7 @@ pub fn compute_history(
                 .any(|record| record.report.report_id == certificate.evaluation_report)
         })
         .collect();
-    let funnel = evolution_funnel(&records);
+    let funnel = evolution_funnel(&records, &relevant_certificates);
     let candidate_yield = Rate::new(funnel.gate_passed_candidates, funnel.valid_candidates);
     let rollback_rate = Rate::new(funnel.rollbacks, funnel.promotions);
     Ok(EvolutionHistory {
@@ -228,11 +257,12 @@ pub fn compute_history(
         funnel,
         candidate_yield,
         rollback_rate,
+        rollback_breakdown: rollback_breakdown(&relevant_certificates),
         fix_survival: fix_survival(&records, &relevant_certificates, policy),
         hidden_trends: hidden_trends(&records),
         velocity: evolution_velocity(&records),
         capability_map: capability_map(&records, policy),
-        lineage_nodes: lineage_nodes(&records),
+        lineage_nodes: lineage_nodes(&records, &relevant_certificates),
     })
 }
 
@@ -245,7 +275,10 @@ struct HistoryRecord<'a> {
 }
 
 /// 只从当前归档能证明的阶段计算漏斗。
-fn evolution_funnel(records: &[HistoryRecord<'_>]) -> EvolutionFunnel {
+fn evolution_funnel(
+    records: &[HistoryRecord<'_>],
+    certificates: &[&EvolutionCertificate],
+) -> EvolutionFunnel {
     EvolutionFunnel {
         episodes: None,
         incidents: None,
@@ -269,11 +302,30 @@ fn evolution_funnel(records: &[HistoryRecord<'_>]) -> EvolutionFunnel {
             .iter()
             .filter(|record| record.report.release_record.is_some())
             .count() as u64,
-        rollbacks: records
+        rollbacks: certificates
             .iter()
-            .filter(|record| record.report.lifecycle == EvolutionLifecycle::RolledBack)
+            .filter(|certificate| certificate.lifecycle == EvolutionLifecycle::RolledBack)
             .count() as u64,
     }
+}
+
+/// 按正式 RollbackRecord 分类；旧归档只有生命周期时不猜测原因。
+fn rollback_breakdown(certificates: &[&EvolutionCertificate]) -> RollbackBreakdown {
+    let mut breakdown = RollbackBreakdown::default();
+    for category in certificates.iter().filter_map(|certificate| {
+        certificate
+            .rollback_record
+            .as_ref()
+            .map(|record| record.category)
+    }) {
+        match category {
+            RollbackCategory::Safety => breakdown.safety += 1,
+            RollbackCategory::Performance => breakdown.performance += 1,
+            RollbackCategory::Infrastructure => breakdown.infrastructure += 1,
+            RollbackCategory::Manual => breakdown.manual += 1,
+        }
+    }
+    breakdown
 }
 
 /// 计算 Promotion 后 1、3、5 代的历史修复保持率。
@@ -527,12 +579,18 @@ fn capability_map(
             families
                 .entry(case.metadata.task_family.clone())
                 .or_default()
-                .push(aggregate_case(case, policy.min_valid_repeats_per_case));
+                .push((
+                    case.metadata.dataset_kind,
+                    aggregate_case(case, policy.min_valid_repeats_per_case),
+                ));
         }
-        let dataset_versions: BTreeSet<DatasetVersionId> =
-            record.report.candidate.datasets.values().cloned().collect();
         for (family, cases) in families {
-            let scored: Vec<_> = cases.iter().filter_map(|case| case.score).collect();
+            let scored: Vec<_> = cases.iter().filter_map(|(_, case)| case.score).collect();
+            let dataset_versions: BTreeSet<DatasetVersionId> = cases
+                .iter()
+                .filter_map(|(kind, _)| record.report.candidate.datasets.get(kind))
+                .cloned()
+                .collect();
             rows.entry(family).or_default().push(CapabilityMapCell {
                 generation,
                 score: (scored.len() == cases.len() && !cases.is_empty())
@@ -552,21 +610,44 @@ fn capability_map(
 }
 
 /// 构建包含拒绝、隔离和回滚 Candidate 的 Lineage 节点。
-fn lineage_nodes(records: &[HistoryRecord<'_>]) -> Vec<LineageNode> {
+fn lineage_nodes(
+    records: &[HistoryRecord<'_>],
+    certificates: &[&EvolutionCertificate],
+) -> Vec<LineageNode> {
     records
         .iter()
-        .map(|record| LineageNode {
-            revision: record.report.candidate.genome_revision.clone(),
-            parent: record.report.parent.genome_revision.clone(),
-            generation: record.report.candidate_generation,
-            mutation_surfaces: record.report.genome_diff.changed_surfaces.clone(),
-            behavior_assessment: record.scorecard.behavior_assessment,
-            gate_decision: record.report.gate_decision,
-            lifecycle: record.report.lifecycle,
-            capability_score: record.scorecard.capability.candidate_score,
-            hidden_score: record.scorecard.datasets.hidden.candidate_score,
-            release: record.report.release_record.clone(),
-            rolled_back: record.report.lifecycle == EvolutionLifecycle::RolledBack,
+        .map(|record| {
+            let certificate = certificates.iter().find(|certificate| {
+                certificate.evaluation_report == record.report.report_id
+                    && record.report.release_record.as_ref() == Some(&certificate.release_record)
+            });
+            let lifecycle = certificate
+                .map(|certificate| certificate.lifecycle)
+                .unwrap_or(record.report.lifecycle);
+            let safety = &record.scorecard.safety.candidate;
+            LineageNode {
+                revision: record.report.candidate.genome_revision.clone(),
+                parent: record.report.parent.genome_revision.clone(),
+                generation: record.report.candidate_generation,
+                mutation_surfaces: record.report.genome_diff.changed_surfaces.clone(),
+                behavior_assessment: record.scorecard.behavior_assessment,
+                gate_decision: record.report.gate_decision,
+                lifecycle,
+                capability_score: record.scorecard.capability.candidate_score,
+                hidden_score: record.scorecard.datasets.hidden.candidate_score,
+                repair_score: record.scorecard.datasets.repair.candidate_score,
+                regression_retention: record.scorecard.datasets.regression.retention.retention,
+                stability: record.scorecard.datasets.candidate_stability.stability,
+                average_tokens: record.scorecard.resources.tokens.candidate,
+                average_latency_ms: record.scorecard.resources.latency_ms.candidate,
+                safety_failures: safety.critical_failures
+                    + safety.high_failures
+                    + safety.medium_failures,
+                release: record.report.release_record.clone(),
+                rolled_back: lifecycle == EvolutionLifecycle::RolledBack,
+                rollback_record: certificate
+                    .and_then(|certificate| certificate.rollback_record.as_ref().cloned()),
+            }
         })
         .collect()
 }
@@ -615,6 +696,9 @@ mod tests {
             }),
             post_promotion_run_ids: vec![agent_evolution_protocol::RunId::generate()],
             lifecycle: EvolutionLifecycle::InheritanceVerified,
+            revision: 0,
+            previous_certificate_digest: None,
+            rollback_record: None,
             certificate_digest: empty_digest(),
         }
     }
@@ -877,13 +961,31 @@ mod tests {
         let first = report(GenomeRevisionId::generate(), 1, hidden.clone(), true);
         let mut second = report(first.candidate.genome_revision.clone(), 2, hidden, true);
         second.lifecycle = EvolutionLifecycle::RolledBack;
+        let mut rollback = certificate(&second);
+        rollback.lifecycle = EvolutionLifecycle::RolledBack;
+        rollback.rollback_record = Some(RollbackRecord {
+            schema_version: crate::ROLLBACK_RECORD_SCHEMA_VERSION,
+            release_record: rollback.release_record.clone(),
+            category: RollbackCategory::Performance,
+            reason: "资源性能回归".into(),
+            evidence: Vec::new(),
+            created_at_ms: 2,
+        });
         let history = compute_history(
             &[first, second],
-            &[],
+            &[rollback],
             &EvolutionVerdictPolicy::default(),
             None,
         )
         .expect("历史应可计算");
         assert_eq!(history.rollback_rate, Rate::new(1, 2));
+        assert_eq!(history.rollback_breakdown.performance, 1);
+        assert_eq!(
+            history.lineage_nodes[1]
+                .rollback_record
+                .as_ref()
+                .map(|record| record.category),
+            Some(RollbackCategory::Performance)
+        );
     }
 }

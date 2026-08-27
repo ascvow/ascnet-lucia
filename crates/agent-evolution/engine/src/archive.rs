@@ -2,7 +2,10 @@
 
 use crate::{EvolutionCertificate, EvolutionScorecard};
 use agent_evolution_protocol::{EvaluationReportId, ReleaseId};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 use tokio::{fs, io::AsyncWriteExt};
 
 /// 本地 Evolution Analytics 归档。
@@ -66,9 +69,9 @@ impl FileEvolutionArchive {
         Ok(values)
     }
 
-    /// 只追加一个 Promotion Certificate。
+    /// 只追加一个 Promotion Certificate 状态修订。
     ///
-    /// Certificate 会先校验自身结构与摘要；同一 Release ID 已存在时拒绝覆盖。
+    /// Certificate 会先校验自身结构、摘要和前序状态；同一 Release 的旧修订不会被覆盖。
     ///
     /// # Errors
     ///
@@ -78,10 +81,17 @@ impl FileEvolutionArchive {
         certificate: &EvolutionCertificate,
     ) -> Result<PathBuf, ArchiveError> {
         certificate.verify_digest()?;
+        let revisions = self
+            .certificate_revisions(&certificate.release_record)
+            .await?;
+        validate_appended_revision(&revisions, certificate)?;
         let directory = self.root.join("certificates");
         ensure_safe_directory(&self.root).await?;
         ensure_safe_directory(&directory).await?;
-        let path = directory.join(format!("{}.json", certificate.release_record));
+        let path = directory.join(format!(
+            "{}--r{}.json",
+            certificate.release_record, certificate.revision
+        ));
         let bytes = serde_json::to_vec_pretty(certificate).map_err(ArchiveError::Serialize)?;
         write_create_new(&path, &bytes).await?;
         Ok(path)
@@ -98,23 +108,24 @@ impl FileEvolutionArchive {
         &self,
         release: &ReleaseId,
     ) -> Result<Option<EvolutionCertificate>, ArchiveError> {
-        let path = self
-            .root
-            .join("certificates")
-            .join(format!("{release}.json"));
-        let Some(bytes) = read_safe_file(&path).await? else {
-            return Ok(None);
-        };
-        let certificate: EvolutionCertificate =
-            serde_json::from_slice(&bytes).map_err(|source| ArchiveError::InvalidJson {
-                path: path.clone(),
-                source,
-            })?;
-        if &certificate.release_record != release {
-            return Err(ArchiveError::ReleaseMismatch(path));
-        }
-        certificate.verify_digest()?;
-        Ok(Some(certificate))
+        let revisions = self.certificate_history(release).await?;
+        Ok(latest_certificate_revision(&revisions)?.cloned())
+    }
+
+    /// 返回同一 Release 的完整不可变 Certificate 状态修订链。
+    ///
+    /// 结果按修订号排序，并校验摘要、连续序号和前序摘要；不存在时返回空列表。
+    ///
+    /// # Errors
+    ///
+    /// 任一修订损坏、Schema 未知、链断裂、分叉或路径不安全时返回错误。
+    pub async fn certificate_history(
+        &self,
+        release: &ReleaseId,
+    ) -> Result<Vec<EvolutionCertificate>, ArchiveError> {
+        let revisions = self.certificate_revisions(release).await?;
+        latest_certificate_revision(&revisions)?;
+        Ok(revisions)
     }
 
     /// 读取全部 Certificate，供历史分析使用。
@@ -123,13 +134,25 @@ impl FileEvolutionArchive {
     ///
     /// 任一文件损坏、摘要无效或路径不安全时返回错误。
     pub async fn list_certificates(&self) -> Result<Vec<EvolutionCertificate>, ArchiveError> {
-        let mut values =
+        let values =
             read_json_directory::<EvolutionCertificate>(&self.root.join("certificates")).await?;
         for certificate in &values {
             certificate.verify_digest()?;
         }
-        values.sort_by(|left, right| left.release_record.cmp(&right.release_record));
-        Ok(values)
+        let mut grouped: BTreeMap<ReleaseId, Vec<EvolutionCertificate>> = BTreeMap::new();
+        for certificate in values {
+            grouped
+                .entry(certificate.release_record.clone())
+                .or_default()
+                .push(certificate);
+        }
+        let mut latest = Vec::with_capacity(grouped.len());
+        for revisions in grouped.values() {
+            if let Some(certificate) = latest_certificate_revision(revisions)? {
+                latest.push(certificate.clone());
+            }
+        }
+        Ok(latest)
     }
 
     /// 返回同一报告、Metrics Policy 与 Verdict Policy 的 Scorecard 文件名。
@@ -146,6 +169,153 @@ impl FileEvolutionArchive {
             safe_segment(verdict_policy)
         ))
     }
+
+    /// 读取同一 Release 的全部不可变 Certificate 状态修订。
+    async fn certificate_revisions(
+        &self,
+        release: &ReleaseId,
+    ) -> Result<Vec<EvolutionCertificate>, ArchiveError> {
+        let values =
+            read_json_directory::<EvolutionCertificate>(&self.root.join("certificates")).await?;
+        let mut revisions = Vec::new();
+        for certificate in values {
+            if &certificate.release_record == release {
+                certificate.verify_digest()?;
+                revisions.push(certificate);
+            }
+        }
+        revisions.sort_by_key(|certificate| certificate.revision);
+        Ok(revisions)
+    }
+}
+
+/// 校验新修订严格延续当前唯一链尾。
+fn validate_appended_revision(
+    revisions: &[EvolutionCertificate],
+    appended: &EvolutionCertificate,
+) -> Result<(), ArchiveError> {
+    let latest = latest_certificate_revision(revisions)?;
+    match latest {
+        None if appended.revision == 0 && appended.previous_certificate_digest.is_none() => Ok(()),
+        Some(previous)
+            if appended.revision == previous.revision.saturating_add(1)
+                && appended.previous_certificate_digest.as_ref()
+                    == Some(&previous.certificate_digest)
+                && same_promotion_identity(previous, appended)
+                && valid_lifecycle_transition(previous, appended) =>
+        {
+            Ok(())
+        }
+        _ => Err(ArchiveError::InvalidCertificateChain(format!(
+            "Release {} 的修订 r{} 没有延续当前链尾",
+            appended.release_record, appended.revision
+        ))),
+    }
+}
+
+/// 返回通过 `previous_certificate_digest` 串联的唯一链尾，并拒绝断链或分叉。
+fn latest_certificate_revision(
+    revisions: &[EvolutionCertificate],
+) -> Result<Option<&EvolutionCertificate>, ArchiveError> {
+    if revisions.is_empty() {
+        return Ok(None);
+    }
+    let digests: BTreeSet<_> = revisions
+        .iter()
+        .map(|certificate| certificate.certificate_digest.clone())
+        .collect();
+    if digests.len() != revisions.len() {
+        return Err(ArchiveError::InvalidCertificateChain(
+            "存在重复 Certificate 摘要".into(),
+        ));
+    }
+    let mut by_revision: BTreeMap<u32, &EvolutionCertificate> = BTreeMap::new();
+    for certificate in revisions {
+        if by_revision
+            .insert(certificate.revision, certificate)
+            .is_some()
+        {
+            return Err(ArchiveError::InvalidCertificateChain(format!(
+                "Release {} 的修订 r{} 发生分叉",
+                certificate.release_record, certificate.revision
+            )));
+        }
+    }
+    let root = by_revision
+        .get(&0)
+        .copied()
+        .ok_or_else(|| ArchiveError::InvalidCertificateChain("缺少 r0 初始修订".into()))?;
+    if root.previous_certificate_digest.is_some() {
+        return Err(ArchiveError::InvalidCertificateChain(
+            "r0 不能声明前序 Certificate".into(),
+        ));
+    }
+    let mut previous = root;
+    for revision in 1..by_revision.len() as u32 {
+        let current = by_revision.get(&revision).copied().ok_or_else(|| {
+            ArchiveError::InvalidCertificateChain(format!("缺少连续修订 r{revision}"))
+        })?;
+        if current.previous_certificate_digest.as_ref() != Some(&previous.certificate_digest) {
+            return Err(ArchiveError::InvalidCertificateChain(format!(
+                "修订 r{revision} 的前序摘要不匹配"
+            )));
+        }
+        if !same_promotion_identity(previous, current) {
+            return Err(ArchiveError::InvalidCertificateChain(format!(
+                "修订 r{revision} 修改了不可变 Promotion 字段"
+            )));
+        }
+        if !valid_lifecycle_transition(previous, current) {
+            return Err(ArchiveError::InvalidCertificateChain(format!(
+                "修订 r{revision} 的生命周期不能从 {:?} 转换为 {:?}",
+                previous.lifecycle, current.lifecycle
+            )));
+        }
+        previous = current;
+    }
+    Ok(Some(previous))
+}
+
+/// 判断两个状态修订绑定同一份不可变 Promotion 事实。
+fn same_promotion_identity(
+    previous: &EvolutionCertificate,
+    current: &EvolutionCertificate,
+) -> bool {
+    previous.schema_version == current.schema_version
+        && previous.parent_revision == current.parent_revision
+        && previous.child_revision == current.child_revision
+        && previous.source_episode_ids == current.source_episode_ids
+        && previous.evolution_issue_id == current.evolution_issue_id
+        && previous.mutation_id == current.mutation_id
+        && previous.allowed_diff == current.allowed_diff
+        && previous.candidate_artifacts == current.candidate_artifacts
+        && previous.repair_dataset == current.repair_dataset
+        && previous.regression_dataset == current.regression_dataset
+        && previous.hidden_dataset == current.hidden_dataset
+        && previous.safety_dataset == current.safety_dataset
+        && previous.repaired_task_case_ids == current.repaired_task_case_ids
+        && previous.evaluation_report == current.evaluation_report
+        && previous.scorecard == current.scorecard
+        && previous.gate_decision == current.gate_decision
+        && previous.release_record == current.release_record
+}
+
+/// 限制 Certificate 状态只能沿 Promotion → InheritanceVerified → RolledBack 前进。
+fn valid_lifecycle_transition(
+    previous: &EvolutionCertificate,
+    current: &EvolutionCertificate,
+) -> bool {
+    matches!(
+        (previous.lifecycle, current.lifecycle),
+        (
+            agent_evolution_protocol::EvolutionLifecycle::Promoted,
+            agent_evolution_protocol::EvolutionLifecycle::InheritanceVerified
+                | agent_evolution_protocol::EvolutionLifecycle::RolledBack
+        ) | (
+            agent_evolution_protocol::EvolutionLifecycle::InheritanceVerified,
+            agent_evolution_protocol::EvolutionLifecycle::RolledBack
+        )
+    )
 }
 
 /// Evolution Analytics 归档错误。
@@ -180,6 +350,9 @@ pub enum ArchiveError {
     /// Certificate 文件名与正文 Release ID 不一致。
     #[error("EvolutionCertificate 文件名与 Release ID 不一致：{0}")]
     ReleaseMismatch(PathBuf),
+    /// 同一 Release 的 Certificate 状态修订链断裂、分叉或倒退。
+    #[error("EvolutionCertificate 状态修订链无效：{0}")]
+    InvalidCertificateChain(String),
     /// Certificate 自身或其摘要无效。
     #[error("EvolutionCertificate 无效：{0}")]
     Certificate(#[from] crate::CertificateError),

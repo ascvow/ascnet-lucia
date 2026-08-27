@@ -214,7 +214,10 @@ impl FileStableGenomePublisher {
         report_id: EvaluationReportId,
         rollback_of: Option<ReleaseId>,
     ) -> Result<StableGenomeRef, GenomePromotionError> {
-        let observed = self.resolver.stable_reference(&expected_current.lineage).await?;
+        let observed = self
+            .resolver
+            .stable_reference(&expected_current.lineage)
+            .await?;
         if observed != *expected_current {
             return Err(GenomePromotionError::ExpectedCurrentMismatch);
         }

@@ -306,6 +306,41 @@ fn render_capability_map(frame: &mut Frame, state: &EvolutionDashboardState, are
         .iter()
         .flat_map(|row| row.cells.iter().map(|cell| cell.generation))
         .collect();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(1)])
+        .split(area);
+    let boundaries = generations
+        .iter()
+        .map(|generation| {
+            let versions: BTreeSet<_> = rows
+                .iter()
+                .flat_map(|row| row.cells.iter())
+                .filter(|cell| cell.generation == *generation)
+                .flat_map(|cell| cell.dataset_versions.iter())
+                .map(ToString::to_string)
+                .collect();
+            format!(
+                "G{generation}: {}",
+                if versions.is_empty() {
+                    "N/A".into()
+                } else {
+                    versions.into_iter().collect::<Vec<_>>().join(", ")
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    frame.render_widget(
+        Paragraph::new(boundaries)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Dataset 版本边界"),
+            )
+            .wrap(Wrap { trim: false }),
+        layout[0],
+    );
     let header = Row::new(
         std::iter::once(Cell::from("Task Family"))
             .chain(
@@ -349,7 +384,7 @@ fn render_capability_map(frame: &mut Frame, state: &EvolutionDashboardState, are
                     .borders(Borders::ALL)
                     .title("Capability Map (数值不依赖颜色)"),
             ),
-        area,
+        layout[1],
     );
 }
 
@@ -375,12 +410,33 @@ fn render_lineage(frame: &mut Frame, state: &EvolutionDashboardState, area: Rect
                 node.parent
             )),
             Line::from(format!(
-                "  {:?} | Gate {:?} | {:?} | Capability {} | Hidden {}",
+                "  Mutation {} | {:?} | Gate {:?} | {:?}",
+                mutation_surfaces(&node.mutation_surfaces),
                 node.behavior_assessment,
                 node.gate_decision,
                 node.lifecycle,
+            )),
+            Line::from(format!(
+                "  Capability {} | Hidden {} | Repair {} | Retention {} | Stability {}",
                 number(node.capability_score),
-                percent(node.hidden_score)
+                percent(node.hidden_score),
+                percent(node.repair_score),
+                rate(node.regression_retention),
+                percent(node.stability),
+            )),
+            Line::from(format!(
+                "  Token {} | Latency {} ms | Safety {} | Release {} | Rollback {}",
+                number(node.average_tokens),
+                number(node.average_latency_ms),
+                node.safety_failures,
+                node.release
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "N/A".into()),
+                node.rollback_record
+                    .as_ref()
+                    .map(|record| format!("{:?}: {}", record.category, record.reason))
+                    .unwrap_or_else(|| "N/A".into()),
             ))
             .style(Style::default().fg(Color::DarkGray)),
         ])
@@ -664,19 +720,42 @@ fn evidence_items(
         ),
         (
             "Rollback Record",
-            if scorecard.lifecycle == agent_evolution_protocol::EvolutionLifecycle::RolledBack {
-                "Lifecycle: RolledBack\nDedicated RollbackRecord: N/A".into()
-            } else {
-                "N/A".into()
-            },
+            certificate
+                .and_then(|certificate| certificate.rollback_record.as_ref())
+                .map(|record| {
+                    format!(
+                        "Release: {}\nCategory: {:?}\nReason: {}\nCreated: {}\nEvidence: {}",
+                        record.release_record,
+                        record.category,
+                        record.reason,
+                        record.created_at_ms,
+                        if record.evidence.is_empty() {
+                            "N/A".into()
+                        } else {
+                            record
+                                .evidence
+                                .iter()
+                                .map(|artifact| artifact.digest.to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    )
+                })
+                .unwrap_or_else(|| "N/A".into()),
         ),
         (
             "Evolution Certificate",
             certificate
                 .map(|certificate| {
                     format!(
-                        "Schema: {}\nDigest: {}\nLifecycle: {:?}\nRepaired cases: {}\nPost-promotion runs: {}",
+                        "Schema: {}\nRevision: r{}\nPrevious: {}\nDigest: {}\nLifecycle: {:?}\nRepaired cases: {}\nPost-promotion runs: {}",
                         certificate.schema_version,
+                        certificate.revision,
+                        certificate
+                            .previous_certificate_digest
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "N/A".into()),
                         certificate.certificate_digest,
                         certificate.lifecycle,
                         certificate.repaired_task_case_ids.len(),
@@ -708,13 +787,33 @@ fn verdict_span(verdict: HeadlineVerdict) -> Span<'static> {
 
 /// 返回安全 Gate 的显式文本标签。
 fn safety_label(scorecard: &EvolutionScorecard) -> &'static str {
-    if scorecard.safety.candidate.hard_gate_failed() {
+    if scorecard.safety.candidate.hard_gate_failed()
+        || scorecard.gate.artifact_integrity_verified == Some(false)
+        || scorecard.gate.audit_integrity_verified == Some(false)
+        || scorecard.gate.hidden_dataset_isolated == Some(false)
+    {
         "FAIL"
-    } else if !scorecard.safety.candidate.is_complete() {
+    } else if !scorecard.safety.candidate.is_complete()
+        || scorecard.gate.artifact_integrity_verified != Some(true)
+        || scorecard.gate.audit_integrity_verified != Some(true)
+        || scorecard.gate.hidden_dataset_isolated != Some(true)
+    {
         "UNKNOWN"
     } else {
         "PASS"
     }
+}
+
+/// 以文本列出全部变异表面，避免空集合或颜色造成歧义。
+fn mutation_surfaces(surfaces: &BTreeSet<agent_evolution_protocol::MutationSurface>) -> String {
+    if surfaces.is_empty() {
+        return "none".into();
+    }
+    surfaces
+        .iter()
+        .map(|surface| format!("{surface:?}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// 返回置信度类型，不把 Deterministic 伪装为百分比。

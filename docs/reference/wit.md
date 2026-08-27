@@ -2,7 +2,7 @@
 
 Lucia 插件 ABI 的 world 是 `ascnet:lucia-plugin@0.7.0`。WIT 只固定函数名和 `string` 边界，业务结构通过 JSON 传递；这样可选字段可以按 serde 默认值演进，而不必为每个字段变化重写 Component 类型。
 
-```wit
+```txt
 package ascnet:lucia-plugin@0.7.0;
 
 world plugin {
@@ -498,7 +498,7 @@ AgentHandle 示例：
 
 ### `activate`
 
-```wit
+```txt
 export activate: func(context-json: string) -> string;
 ```
 
@@ -517,7 +517,7 @@ export activate: func(context-json: string) -> string;
 
 ### `deactivate`
 
-```wit
+```txt
 export deactivate: func() -> string;
 ```
 
@@ -555,7 +555,7 @@ export deactivate: func() -> string;
 
 ### `list-tools`
 
-```wit
+```txt
 export list-tools: func() -> string;
 ```
 
@@ -627,7 +627,7 @@ export list-tools: func() -> string;
 
 ### `after-tool`
 
-```wit
+```txt
 export after-tool: func(result-json: string);
 ```
 

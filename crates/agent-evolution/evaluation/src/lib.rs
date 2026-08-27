@@ -14,6 +14,7 @@ pub mod gate;
 pub mod health;
 pub mod model;
 mod plugin_deployment;
+mod plugin_deployment_store;
 mod plugin_gate;
 mod plugin_host_audit;
 mod plugin_host_smoke;
@@ -74,13 +75,20 @@ pub use model::{
     RecordingModel, ReplayModel, MODEL_FIXTURE_SCHEMA_VERSION,
 };
 pub use plugin_deployment::{
-    PluginCanaryDeployment, PluginDeploymentController, PluginDeploymentError,
-    PluginPromotionReceipt, PluginRollbackReceipt,
+    PersistentPluginDeploymentController, PluginCanaryDeployment, PluginDeploymentController,
+    PluginDeploymentError, PluginPromotionReceipt, PluginRollbackReceipt,
+};
+pub use plugin_deployment_store::{
+    FilePluginDeploymentStore, PluginCanaryDeploymentBindingV1,
+    PluginCanaryDeploymentPersistenceView, PluginCanaryDeploymentRecordV1, PluginDeploymentId,
+    PluginDeploymentStateV1, PluginDeploymentStoreError,
+    PLUGIN_CANARY_DEPLOYMENT_RECORD_SCHEMA_VERSION, PREVIOUS_PLUGIN_BUNDLE_MEDIA_TYPE,
 };
 pub use plugin_gate::{evaluate_plugin_source, PluginGateError};
 pub use plugin_host_audit::{
-    bind_plugin_host_audit, protocol_component_interface, PluginHostAuditBinding,
-    PluginHostAuditBindingError, TrustedHostCheckOutcome,
+    bind_plugin_host_audit, protocol_capability_profile, protocol_component_interface,
+    ManifestComponentInspector, PluginHostAuditBinding, PluginHostAuditBindingError,
+    TrustedHostCheckOutcome,
 };
 pub use plugin_host_smoke::{
     run_plugin_host_smoke, PluginHostDeclarationSnapshot, PluginHostSmokeError,

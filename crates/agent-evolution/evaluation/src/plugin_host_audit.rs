@@ -3,6 +3,10 @@
 //! Host 只负责产生 manifest、真实 Component 类型图、owner 和服务调用观察；本模块由
 //! Evaluation 平面拥有，负责加入 Mutation/Candidate/制品身份并构造六项版本化 Gate 证据。
 
+use agent_evolution::{
+    ComponentInspectionRequest, ComponentInspector, ComponentInspectorFailure,
+    TrustedComponentInspection,
+};
 use agent_evolution_protocol::{
     ArtifactDigest, CandidateId, CapabilityProfile, ComponentInterfaceSnapshot,
     InvalidPluginEvolution, MutationId, PluginAuditCheck, PluginCapabilitySet,
@@ -10,11 +14,150 @@ use agent_evolution_protocol::{
     PLUGIN_AUDIT_CHECK_SCHEMA_VERSION, PLUGIN_HOST_AUDIT_EVIDENCE_SCHEMA_VERSION,
 };
 use agent_plugin_host::audit::{
-    HostServiceCallResult, PluginAuditEvidence as HostPluginAuditEvidence,
+    scan_component_interfaces, snapshot_manifest_capabilities,
+    ComponentInterfaceSnapshot as HostComponentInterfaceSnapshot, HostServiceCallResult,
+    PluginAuditEvidence as HostPluginAuditEvidence,
 };
+use agent_plugin_host::manifest::PluginManifest;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fs, path::PathBuf};
+
+/// 使用真实 manifest 与 Wasmtime Component 类型扫描实现构建 Worker 的生产 Inspector。
+#[derive(Debug, Clone)]
+pub struct ManifestComponentInspector {
+    manifest_path: PathBuf,
+    scanner_revision: ArtifactDigest,
+}
+
+impl ManifestComponentInspector {
+    /// 固定受信 manifest 路径和扫描器修订摘要。
+    ///
+    /// 路径会在每次扫描时重新规范化并拒绝符号链接，避免构造后被替换；扫描器修订必须由
+    /// 受信控制面绑定当前二进制与规则配置。
+    pub fn new(manifest_path: impl Into<PathBuf>, scanner_revision: ArtifactDigest) -> Self {
+        Self {
+            manifest_path: manifest_path.into(),
+            scanner_revision,
+        }
+    }
+}
+
+impl ComponentInspector for ManifestComponentInspector {
+    /// 复核 Component 字节身份，扫描真实类型图，并从已校验 manifest 重建能力 Profile。
+    ///
+    /// # Errors
+    ///
+    /// manifest/Component 路径不安全、身份或摘要不匹配、WASM 不是合法 Component，或扫描
+    /// 结果无法转换为 M8 协议时返回脱敏失败。
+    fn inspect(
+        &mut self,
+        request: &ComponentInspectionRequest,
+    ) -> Result<TrustedComponentInspection, ComponentInspectorFailure> {
+        inspect_manifest_component(self, request)
+            .map_err(|error| ComponentInspectorFailure::new(error.to_string()))
+    }
+}
+
+/// 执行真实生产 Inspector 的可保留错误链主路径。
+fn inspect_manifest_component(
+    inspector: &ManifestComponentInspector,
+    request: &ComponentInspectionRequest,
+) -> anyhow::Result<TrustedComponentInspection> {
+    let manifest_path = canonical_regular_file(&inspector.manifest_path, "插件 manifest")?;
+    let component_path = canonical_regular_file(&request.component_path, "插件 Component")?;
+    let component_bytes = fs::read(&component_path)?;
+    if component_bytes.len() as u64 != request.component_size_bytes
+        || digest_bytes(&component_bytes)? != request.component_digest
+    {
+        anyhow::bail!("插件 Component 字节身份与构建请求不一致");
+    }
+
+    let manifest = PluginManifest::load(&manifest_path)?;
+    if manifest.plugin.id != request.plugin_id {
+        anyhow::bail!("插件 manifest 身份与构建请求不一致");
+    }
+    let declared_component = safe_manifest_component_name(&manifest.plugin.wasm)?;
+    if component_path.file_name() != Some(declared_component.as_os_str()) {
+        anyhow::bail!("插件 manifest Component 文件名与真实构建产物不一致");
+    }
+
+    let host_interface = scan_component_interfaces(&component_path)?;
+    let interface = protocol_component_interface_from_snapshot(
+        request.plugin_id.clone(),
+        request.component_digest.clone(),
+        inspector.scanner_revision.clone(),
+        &host_interface,
+    )?;
+    let capabilities = protocol_capability_profile(&manifest)?;
+    Ok(TrustedComponentInspection {
+        interface,
+        capabilities,
+    })
+}
+
+/// 从已校验 manifest 重建 M8 能力 Profile，不接受 Candidate 单独提交的能力结论。
+///
+/// # Errors
+///
+/// manifest 声明或协议能力 ID 不合法时返回错误。
+pub fn protocol_capability_profile(
+    manifest: &PluginManifest,
+) -> Result<CapabilityProfile, PluginHostAuditBindingError> {
+    let snapshot = snapshot_manifest_capabilities(manifest)
+        .map_err(|_| PluginHostAuditBindingError::InvalidManifest)?;
+    let requested = PluginCapabilitySet::new(
+        snapshot
+            .requested
+            .into_iter()
+            .map(|capability| capability.capability_id)
+            .collect(),
+    )?;
+    let provided = PluginCapabilitySet::new(
+        snapshot
+            .provided
+            .into_iter()
+            .map(|capability| capability.capability_id)
+            .collect(),
+    )?;
+    Ok(CapabilityProfile::new(requested, provided)?)
+}
+
+/// 规范化一个必须已存在的普通文件，并拒绝最终路径符号链接。
+fn canonical_regular_file(path: &PathBuf, label: &str) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("{label} 必须是绝对路径");
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("{label} 必须是非符号链接普通文件");
+    }
+    Ok(fs::canonicalize(path)?)
+}
+
+/// 返回 manifest 声明的安全相对 Component 文件名。
+fn safe_manifest_component_name(value: &str) -> anyhow::Result<std::ffi::OsString> {
+    let path = std::path::Path::new(value);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        anyhow::bail!("插件 manifest Component 路径不安全");
+    }
+    path.file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .ok_or_else(|| anyhow::anyhow!("插件 manifest Component 路径缺少文件名"))
+}
+
+/// 计算真实 Component 字节的强类型 SHA-256 摘要。
+fn digest_bytes(bytes: &[u8]) -> anyhow::Result<ArtifactDigest> {
+    ArtifactDigest::from_sha256_hex(format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
 
 /// 真实 Host smoke 或运行时审计器产生的一项受信结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,14 +212,27 @@ pub fn protocol_component_interface(
     scanner_revision: ArtifactDigest,
     evidence: &HostPluginAuditEvidence,
 ) -> Result<ComponentInterfaceSnapshot, PluginHostAuditBindingError> {
-    let mut imports = evidence
-        .component
+    protocol_component_interface_from_snapshot(
+        plugin_id,
+        component_digest,
+        scanner_revision,
+        &evidence.component,
+    )
+}
+
+/// 从 Host Component 类型图生成协议接口快照。
+fn protocol_component_interface_from_snapshot(
+    plugin_id: impl Into<String>,
+    component_digest: ArtifactDigest,
+    scanner_revision: ArtifactDigest,
+    component: &HostComponentInterfaceSnapshot,
+) -> Result<ComponentInterfaceSnapshot, PluginHostAuditBindingError> {
+    let mut imports = component
         .imports
         .iter()
         .map(|item| item.path.clone())
         .collect::<Vec<_>>();
-    let mut exports = evidence
-        .component
+    let mut exports = component
         .exports
         .iter()
         .map(|item| item.path.clone())
@@ -89,7 +245,7 @@ pub fn protocol_component_interface(
         schema_version: COMPONENT_INTERFACE_SNAPSHOT_SCHEMA_VERSION,
         plugin_id: plugin_id.into(),
         component_digest,
-        world: evidence.component.world.clone(),
+        world: component.world.clone(),
         imports,
         exports,
         scanner_revision,
@@ -339,4 +495,7 @@ pub enum PluginHostAuditBindingError {
     /// SHA-256 摘要无法转换为协议强类型 ID。
     #[error("Host 审计摘要无效：{0}")]
     InvalidDigest(String),
+    /// manifest 无法通过 Host 正式校验或快照化。
+    #[error("插件 manifest 无法生成受信能力快照")]
+    InvalidManifest,
 }

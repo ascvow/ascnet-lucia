@@ -18,7 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 /// 第一版插件部署状态记录 schema。
 pub const PLUGIN_CANARY_DEPLOYMENT_RECORD_SCHEMA_VERSION: u32 = 1;
@@ -116,6 +116,8 @@ pub struct PluginCanaryDeploymentBindingV1 {
     pub mutation_id: MutationId,
     /// 当前 Candidate ID。
     pub candidate_id: CandidateId,
+    /// 部署开始时完整、可跨进程复核的 Parent Stable 引用。
+    pub parent_stable: StableGenomeRef,
     /// 部署前 Parent Genome Revision ID。
     pub parent_revision_id: GenomeRevisionId,
     /// 部署前 Parent Genome 行为摘要。
@@ -179,6 +181,16 @@ impl PluginCanaryDeploymentBindingV1 {
                 "Parent 与 Candidate Revision ID 不得相同",
             ));
         }
+        self.parent_stable
+            .validate()
+            .map_err(|error| PluginDeploymentStoreError::InvalidRecord(error.to_string()))?;
+        if self.parent_stable.revision_id != self.parent_revision_id
+            || self.parent_stable.digest != self.parent_revision_digest
+        {
+            return Err(PluginDeploymentStoreError::BindingMismatch(
+                "Parent Stable 与 Parent Revision 摘要不一致",
+            ));
+        }
         Ok(())
     }
 }
@@ -237,6 +249,11 @@ pub struct PluginCanaryDeploymentRecordV1 {
     pub mutation_id: MutationId,
     /// 当前 Candidate ID。
     pub candidate_id: CandidateId,
+    /// 部署开始时完整固定的 Parent Stable 引用。
+    ///
+    /// 该字段是 V1 的加法扩展；旧记录反序列化为空并在生产恢复校验时失败关闭。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_stable: Option<StableGenomeRef>,
     /// 部署前 Parent Genome Revision ID。
     pub parent_revision_id: GenomeRevisionId,
     /// 部署前 Parent Genome 行为摘要。
@@ -259,18 +276,25 @@ pub struct PluginCanaryDeploymentRecordV1 {
 
 impl PluginCanaryDeploymentRecordV1 {
     /// 返回不含状态和 CAS 物理位置的部署身份绑定。
-    pub fn binding(&self) -> PluginCanaryDeploymentBindingV1 {
-        PluginCanaryDeploymentBindingV1 {
+    ///
+    /// # Errors
+    ///
+    /// 旧 V1 记录缺少恢复所需的 Parent Stable 加法字段时失败关闭。
+    pub fn binding(&self) -> Result<PluginCanaryDeploymentBindingV1, PluginDeploymentStoreError> {
+        Ok(PluginCanaryDeploymentBindingV1 {
             deployment_id: self.deployment_id.clone(),
             canary_release_id: self.canary_release_id.clone(),
             mutation_id: self.mutation_id.clone(),
             candidate_id: self.candidate_id.clone(),
+            parent_stable: self.parent_stable.clone().ok_or(
+                PluginDeploymentStoreError::BindingMismatch("部署记录缺少 Parent Stable 加法字段"),
+            )?,
             parent_revision_id: self.parent_revision_id.clone(),
             parent_revision_digest: self.parent_revision_digest.clone(),
             candidate_revision_id: self.candidate_revision_id.clone(),
             candidate_revision_digest: self.candidate_revision_digest.clone(),
             admission_digest: self.admission_digest.clone(),
-        }
+        })
     }
 
     /// 校验 schema、强类型身份、Revision 绑定与旧 bundle CAS 元数据。
@@ -284,7 +308,7 @@ impl PluginCanaryDeploymentRecordV1 {
                 found: self.schema_version,
             });
         }
-        self.binding().validate()?;
+        self.binding()?.validate()?;
         if self.previous_bundle.media_type != PREVIOUS_PLUGIN_BUNDLE_MEDIA_TYPE
             || self.previous_bundle.size_bytes == 0
         {
@@ -313,6 +337,19 @@ pub struct FilePluginDeploymentStore<'a> {
     root: PathBuf,
     artifacts: &'a FileArtifactStore,
     write_guard: Arc<Mutex<()>>,
+}
+
+/// 跨越一次真实部署副作用窗口的 Store 事务租约。
+///
+/// 租约同时持有进程内门禁、Store 全局文件锁和单 Deployment 文件锁。只有生产部署控制器
+/// 可以取得该租约，避免 Manager replace、Stable publish 与状态追加被其他进程交叉执行。
+pub(crate) struct PluginDeploymentTransaction<'store, 'artifacts> {
+    store: &'store FilePluginDeploymentStore<'artifacts>,
+    deployment_id: PluginDeploymentId,
+    _store_guard: MutexGuard<'store, ()>,
+    _transaction_guard: MutexGuard<'static, ()>,
+    _global_file_lock: DeploymentFileLock,
+    _deployment_file_lock: DeploymentFileLock,
 }
 
 impl<'a> FilePluginDeploymentStore<'a> {
@@ -349,25 +386,8 @@ impl<'a> FilePluginDeploymentStore<'a> {
         binding: &PluginCanaryDeploymentBindingV1,
         previous_bundle: &[u8],
     ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentStoreError> {
-        binding.validate()?;
-        if previous_bundle.is_empty() {
-            return Err(PluginDeploymentStoreError::BindingMismatch(
-                "旧 Stable bundle 不能为空",
-            ));
-        }
-        let artifact = self
-            .artifacts
-            .put(PREVIOUS_PLUGIN_BUNDLE_MEDIA_TYPE, previous_bundle)
-            .await?;
-        let installed_digest = artifact.digest.clone();
-        let record = record(
-            binding,
-            artifact,
-            installed_digest,
-            PluginDeploymentStateV1::Planned,
-        );
-        self.append_record(&record, true).await?;
-        Ok(record)
+        let transaction = self.transaction(&binding.deployment_id).await?;
+        transaction.append_planned(binding, previous_bundle).await
     }
 
     /// 从真实安装完成的内存 Canary 对象安全追加 CanaryInstalled 状态。
@@ -383,26 +403,8 @@ impl<'a> FilePluginDeploymentStore<'a> {
         deployment: &V,
     ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentStoreError> {
         let binding = deployment.persistence_binding()?;
-        binding.validate()?;
-        let installed_digest = installed_bundle_digest(deployment.installed())?;
-        let previous_bundle = deployment.previous_bundle_bytes();
-        if previous_bundle.is_empty() {
-            return Err(PluginDeploymentStoreError::BindingMismatch(
-                "内存部署的旧 Stable bundle 不能为空",
-            ));
-        }
-        let artifact = self
-            .artifacts
-            .put(PREVIOUS_PLUGIN_BUNDLE_MEDIA_TYPE, previous_bundle)
-            .await?;
-        let record = record(
-            &binding,
-            artifact,
-            installed_digest,
-            PluginDeploymentStateV1::CanaryInstalled,
-        );
-        self.append_record(&record, false).await?;
-        Ok(record)
+        let transaction = self.transaction(&binding.deployment_id).await?;
+        transaction.append_canary_installed(deployment).await
     }
 
     /// 把已安装 Canary 追加为 Promoted 终态。
@@ -414,8 +416,8 @@ impl<'a> FilePluginDeploymentStore<'a> {
         &self,
         deployment_id: &PluginDeploymentId,
     ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentStoreError> {
-        self.append_terminal(deployment_id, PluginDeploymentStateV1::Promoted)
-            .await
+        let transaction = self.transaction(deployment_id).await?;
+        transaction.mark_promoted().await
     }
 
     /// 把已安装 Canary 追加为 RolledBack 终态。
@@ -427,8 +429,8 @@ impl<'a> FilePluginDeploymentStore<'a> {
         &self,
         deployment_id: &PluginDeploymentId,
     ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentStoreError> {
-        self.append_terminal(deployment_id, PluginDeploymentStateV1::RolledBack)
-            .await
+        let transaction = self.transaction(deployment_id).await?;
+        transaction.mark_rolled_back().await
     }
 
     /// 按 Deployment ID 重新加载、验证并返回最新状态。
@@ -453,10 +455,8 @@ impl<'a> FilePluginDeploymentStore<'a> {
         &self,
         deployment_id: &PluginDeploymentId,
     ) -> Result<Vec<PluginCanaryDeploymentRecordV1>, PluginDeploymentStoreError> {
-        let _guard = self.write_guard.lock().await;
-        let _transaction_guard = DEPLOYMENT_TRANSACTION_GUARD.lock().await;
-        let _file_lock = self.acquire_deployment_lock(deployment_id).await?;
-        self.history_unlocked(deployment_id).await
+        let transaction = self.transaction(deployment_id).await?;
+        transaction.history().await
     }
 
     /// 从 CAS 读取并重新验证记录引用的旧 Stable bundle。
@@ -472,74 +472,23 @@ impl<'a> FilePluginDeploymentStore<'a> {
         self.verify_previous_bundle(&record.previous_bundle).await
     }
 
-    /// 追加一个已完成结构校验的状态快照。
-    async fn append_record(
-        &self,
-        record: &PluginCanaryDeploymentRecordV1,
-        allow_same_planned: bool,
-    ) -> Result<(), PluginDeploymentStoreError> {
-        record.validate()?;
-        self.verify_previous_bundle(&record.previous_bundle).await?;
-        let _guard = self.write_guard.lock().await;
-        let _transaction_guard = DEPLOYMENT_TRANSACTION_GUARD.lock().await;
-        let _file_lock = self.acquire_deployment_lock(&record.deployment_id).await?;
-        let mut history = self.history_unlocked(&record.deployment_id).await?;
-        if allow_same_planned
-            && history.len() == 1
-            && history[0] == *record
-            && record.state == PluginDeploymentStateV1::Planned
-        {
-            return Ok(());
-        }
-        if history.iter().any(|existing| existing == record) {
-            return Err(PluginDeploymentStoreError::DuplicateState(record.state));
-        }
-        validate_next_state(history.last(), record)?;
-        if let Some(first) = history.first() {
-            ensure_same_binding(first, record)?;
-        }
-        history.push(record.clone());
-        validate_history(&history, &record.deployment_id)?;
-        let directory = self.deployment_directory(&record.deployment_id);
-        let path = directory.join(record.state.file_name());
-        let bytes = serde_json::to_vec(record)?;
-        write_create_new_or_same(&self.root, &path, &bytes).await
-    }
-
-    /// 从 CanaryInstalled 追加一个不可重复的部署终态。
-    async fn append_terminal(
+    /// 获取跨越真实部署副作用窗口的全局排他事务租约。
+    pub(crate) async fn transaction(
         &self,
         deployment_id: &PluginDeploymentId,
-        state: PluginDeploymentStateV1,
-    ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentStoreError> {
-        debug_assert!(state.is_terminal());
-        let _guard = self.write_guard.lock().await;
-        let _transaction_guard = DEPLOYMENT_TRANSACTION_GUARD.lock().await;
-        let _file_lock = self.acquire_deployment_lock(deployment_id).await?;
-        let mut history = self.history_unlocked(deployment_id).await?;
-        let previous = history
-            .last()
-            .ok_or_else(|| PluginDeploymentStoreError::NotFound(deployment_id.clone()))?;
-        if previous.state.is_terminal() {
-            return Err(PluginDeploymentStoreError::DuplicateTerminal {
-                current: previous.state,
-                requested: state,
-            });
-        }
-        let mut next = previous.clone();
-        next.state = state;
-        if state == PluginDeploymentStateV1::RolledBack {
-            next.installed_digest = next.previous_bundle.digest.clone();
-        }
-        validate_next_state(Some(previous), &next)?;
-        history.push(next.clone());
-        validate_history(&history, deployment_id)?;
-        let path = self
-            .deployment_directory(deployment_id)
-            .join(state.file_name());
-        let bytes = serde_json::to_vec(&next)?;
-        write_create_new_or_same(&self.root, &path, &bytes).await?;
-        Ok(next)
+    ) -> Result<PluginDeploymentTransaction<'_, 'a>, PluginDeploymentStoreError> {
+        let store_guard = self.write_guard.lock().await;
+        let transaction_guard = DEPLOYMENT_TRANSACTION_GUARD.lock().await;
+        let global_file_lock = self.acquire_global_lock().await?;
+        let deployment_file_lock = self.acquire_deployment_lock(deployment_id).await?;
+        Ok(PluginDeploymentTransaction {
+            store: self,
+            deployment_id: deployment_id.clone(),
+            _store_guard: store_guard,
+            _transaction_guard: transaction_guard,
+            _global_file_lock: global_file_lock,
+            _deployment_file_lock: deployment_file_lock,
+        })
     }
 
     /// 在持有进程锁和 Deployment 文件锁时读取历史。
@@ -603,6 +552,247 @@ impl<'a> FilePluginDeploymentStore<'a> {
         ensure_store_directory(&self.root, parent).await?;
         acquire_file_lock(path).await
     }
+
+    /// 获取覆盖全部生产部署副作用的跨进程全局排他锁。
+    async fn acquire_global_lock(&self) -> Result<DeploymentFileLock, PluginDeploymentStoreError> {
+        let path = self.root.join("locks").join("deployment-global.lock");
+        let parent = path
+            .parent()
+            .ok_or_else(|| PluginDeploymentStoreError::UnsafePath(path.clone()))?;
+        ensure_store_directory(&self.root, parent).await?;
+        acquire_file_lock(path).await
+    }
+}
+
+impl PluginDeploymentTransaction<'_, '_> {
+    /// 返回当前事务锁定的 Deployment ID。
+    pub(crate) fn deployment_id(&self) -> &PluginDeploymentId {
+        &self.deployment_id
+    }
+
+    /// 在当前排他事务内读取并复核完整部署历史。
+    pub(crate) async fn history(
+        &self,
+    ) -> Result<Vec<PluginCanaryDeploymentRecordV1>, PluginDeploymentStoreError> {
+        self.store.history_unlocked(self.deployment_id()).await
+    }
+
+    /// 在真实安装前原子追加 Planned 与旧 bundle CAS 引用。
+    pub(crate) async fn append_planned(
+        &self,
+        binding: &PluginCanaryDeploymentBindingV1,
+        previous_bundle: &[u8],
+    ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentStoreError> {
+        self.ensure_deployment_id(&binding.deployment_id)?;
+        binding.validate()?;
+        if previous_bundle.is_empty() {
+            return Err(PluginDeploymentStoreError::BindingMismatch(
+                "旧 Stable bundle 不能为空",
+            ));
+        }
+        let artifact = self
+            .store
+            .artifacts
+            .put(PREVIOUS_PLUGIN_BUNDLE_MEDIA_TYPE, previous_bundle)
+            .await?;
+        let installed_digest = artifact.digest.clone();
+        let record = record(
+            binding,
+            artifact,
+            installed_digest,
+            PluginDeploymentStateV1::Planned,
+        );
+        self.append_record(&record, true).await?;
+        Ok(record)
+    }
+
+    /// 从内存部署对象追加不可重复的 CanaryInstalled 快照。
+    async fn append_canary_installed<V: PluginCanaryDeploymentPersistenceView + ?Sized>(
+        &self,
+        deployment: &V,
+    ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentStoreError> {
+        let binding = deployment.persistence_binding()?;
+        self.ensure_deployment_id(&binding.deployment_id)?;
+        binding.validate()?;
+        let installed_digest = installed_bundle_digest(deployment.installed())?;
+        let previous_bundle = deployment.previous_bundle_bytes();
+        if previous_bundle.is_empty() {
+            return Err(PluginDeploymentStoreError::BindingMismatch(
+                "内存部署的旧 Stable bundle 不能为空",
+            ));
+        }
+        let artifact = self
+            .store
+            .artifacts
+            .put(PREVIOUS_PLUGIN_BUNDLE_MEDIA_TYPE, previous_bundle)
+            .await?;
+        let record = record(
+            &binding,
+            artifact,
+            installed_digest,
+            PluginDeploymentStateV1::CanaryInstalled,
+        );
+        self.append_record(&record, false).await?;
+        Ok(record)
+    }
+
+    /// 根据磁盘 Planned 与 Plugin Manager 当前安装幂等补记 CanaryInstalled。
+    ///
+    /// # Errors
+    ///
+    /// Planned 缺失、稳定身份/CAS 错绑、安装摘要无效或已进入终态时返回错误。
+    pub(crate) async fn reconcile_canary_installed(
+        &self,
+        binding: &PluginCanaryDeploymentBindingV1,
+        installed: &InstalledPlugin,
+    ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentStoreError> {
+        self.ensure_deployment_id(&binding.deployment_id)?;
+        binding.validate()?;
+        let installed_digest = installed_bundle_digest(installed)?;
+        let history = self.history().await?;
+        let planned = history
+            .first()
+            .ok_or_else(|| PluginDeploymentStoreError::NotFound(binding.deployment_id.clone()))?;
+        if planned.state != PluginDeploymentStateV1::Planned || planned.binding()? != *binding {
+            return Err(PluginDeploymentStoreError::BindingMismatch(
+                "Manager 安装结果未绑定磁盘 Planned",
+            ));
+        }
+        let record = record(
+            binding,
+            planned.previous_bundle.clone(),
+            installed_digest,
+            PluginDeploymentStateV1::CanaryInstalled,
+        );
+        match history.last().map(|entry| entry.state) {
+            Some(PluginDeploymentStateV1::Planned) => {
+                self.append_record(&record, false).await?;
+                Ok(record)
+            }
+            Some(PluginDeploymentStateV1::CanaryInstalled) if history.last() == Some(&record) => {
+                Ok(record)
+            }
+            Some(PluginDeploymentStateV1::Promoted | PluginDeploymentStateV1::RolledBack) => {
+                Err(PluginDeploymentStoreError::DuplicateTerminal {
+                    current: history.last().expect("历史非空").state,
+                    requested: PluginDeploymentStateV1::CanaryInstalled,
+                })
+            }
+            _ => Err(PluginDeploymentStoreError::BindingMismatch(
+                "CanaryInstalled 与既有安装摘要不一致",
+            )),
+        }
+    }
+
+    /// 在当前事务内读取并重新验证旧 Stable bundle。
+    pub(crate) async fn previous_bundle(
+        &self,
+        record: &PluginCanaryDeploymentRecordV1,
+    ) -> Result<Vec<u8>, PluginDeploymentStoreError> {
+        self.ensure_deployment_id(&record.deployment_id)?;
+        record.validate()?;
+        self.store
+            .verify_previous_bundle(&record.previous_bundle)
+            .await
+    }
+
+    /// 在当前事务内追加 Promoted 终态。
+    pub(crate) async fn mark_promoted(
+        &self,
+    ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentStoreError> {
+        self.append_terminal(PluginDeploymentStateV1::Promoted)
+            .await
+    }
+
+    /// 在当前事务内追加 RolledBack 终态。
+    pub(crate) async fn mark_rolled_back(
+        &self,
+    ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentStoreError> {
+        self.append_terminal(PluginDeploymentStateV1::RolledBack)
+            .await
+    }
+
+    /// 返回事务绑定的 Deployment ID，并拒绝锁文件名异常。
+    /// 确认调用目标与事务锁定的 Deployment 完全一致。
+    fn ensure_deployment_id(
+        &self,
+        deployment_id: &PluginDeploymentId,
+    ) -> Result<(), PluginDeploymentStoreError> {
+        if self.deployment_id().as_str() != deployment_id.as_str() {
+            return Err(PluginDeploymentStoreError::BindingMismatch(
+                "事务 Deployment ID 与请求不一致",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 追加一个已完成结构校验的状态快照。
+    async fn append_record(
+        &self,
+        record: &PluginCanaryDeploymentRecordV1,
+        allow_same_planned: bool,
+    ) -> Result<(), PluginDeploymentStoreError> {
+        self.ensure_deployment_id(&record.deployment_id)?;
+        record.validate()?;
+        self.store
+            .verify_previous_bundle(&record.previous_bundle)
+            .await?;
+        let mut history = self.store.history_unlocked(&record.deployment_id).await?;
+        if allow_same_planned
+            && history.len() == 1
+            && history[0] == *record
+            && record.state == PluginDeploymentStateV1::Planned
+        {
+            return Ok(());
+        }
+        if history.iter().any(|existing| existing == record) {
+            return Err(PluginDeploymentStoreError::DuplicateState(record.state));
+        }
+        validate_next_state(history.last(), record)?;
+        if let Some(first) = history.first() {
+            ensure_same_binding(first, record)?;
+        }
+        history.push(record.clone());
+        validate_history(&history, &record.deployment_id)?;
+        let directory = self.store.deployment_directory(&record.deployment_id);
+        let path = directory.join(record.state.file_name());
+        let bytes = serde_json::to_vec(record)?;
+        write_create_new_or_same(&self.store.root, &path, &bytes).await
+    }
+
+    /// 从 CanaryInstalled 追加一个不可重复的部署终态。
+    async fn append_terminal(
+        &self,
+        state: PluginDeploymentStateV1,
+    ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentStoreError> {
+        debug_assert!(state.is_terminal());
+        let deployment_id = self.deployment_id().clone();
+        let mut history = self.store.history_unlocked(&deployment_id).await?;
+        let previous = history
+            .last()
+            .ok_or_else(|| PluginDeploymentStoreError::NotFound(deployment_id.clone()))?;
+        if previous.state.is_terminal() {
+            return Err(PluginDeploymentStoreError::DuplicateTerminal {
+                current: previous.state,
+                requested: state,
+            });
+        }
+        let mut next = previous.clone();
+        next.state = state;
+        if state == PluginDeploymentStateV1::RolledBack {
+            next.installed_digest = next.previous_bundle.digest.clone();
+        }
+        validate_next_state(Some(previous), &next)?;
+        history.push(next.clone());
+        validate_history(&history, &deployment_id)?;
+        let path = self
+            .store
+            .deployment_directory(&deployment_id)
+            .join(state.file_name());
+        let bytes = serde_json::to_vec(&next)?;
+        write_create_new_or_same(&self.store.root, &path, &bytes).await?;
+        Ok(next)
+    }
 }
 
 /// 从已验证 Admission 与 Parent/Candidate Revision 重建稳定持久化绑定。
@@ -657,6 +847,7 @@ fn binding_from_parts(
         canary_release_id,
         mutation_id: release.mutation_id.clone(),
         candidate_id: release.candidate_id.clone(),
+        parent_stable: parent.clone(),
         parent_revision_id: parent.revision_id.clone(),
         parent_revision_digest: parent.digest.clone(),
         candidate_revision_id: candidate.revision_id.clone(),
@@ -726,6 +917,7 @@ fn record(
         canary_release_id: binding.canary_release_id.clone(),
         mutation_id: binding.mutation_id.clone(),
         candidate_id: binding.candidate_id.clone(),
+        parent_stable: Some(binding.parent_stable.clone()),
         parent_revision_id: binding.parent_revision_id.clone(),
         parent_revision_digest: binding.parent_revision_digest.clone(),
         candidate_revision_id: binding.candidate_revision_id.clone(),
@@ -823,7 +1015,8 @@ fn ensure_same_binding(
     expected: &PluginCanaryDeploymentRecordV1,
     actual: &PluginCanaryDeploymentRecordV1,
 ) -> Result<(), PluginDeploymentStoreError> {
-    if expected.binding() != actual.binding() || expected.previous_bundle != actual.previous_bundle
+    if expected.binding()? != actual.binding()?
+        || expected.previous_bundle != actual.previous_bundle
     {
         return Err(PluginDeploymentStoreError::BindingMismatch(
             "部署状态快照改写了稳定身份或旧 bundle 引用",

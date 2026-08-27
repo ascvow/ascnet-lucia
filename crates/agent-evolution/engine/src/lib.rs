@@ -26,6 +26,7 @@ mod feedback;
 mod genome_diff;
 mod genome_store;
 mod history;
+mod inheritance;
 mod issue_observation;
 mod metrics;
 mod outbox;
@@ -58,8 +59,8 @@ pub use candidate_builder::{
 };
 pub use candidate_selection::{CandidateSelectionError, CandidateSelector, SelectedCandidate};
 pub use certificate::{
-    CertificateError, EvolutionCertificate, EvolutionCertificateInput,
-    EVOLUTION_CERTIFICATE_SCHEMA_VERSION,
+    CertificateError, EvolutionCertificate, EvolutionCertificateInput, RollbackCategory,
+    RollbackRecord, EVOLUTION_CERTIFICATE_SCHEMA_VERSION, ROLLBACK_RECORD_SCHEMA_VERSION,
 };
 pub use context_candidate_builder::{ContextCandidateBuildError, ContextCandidateBuilder};
 pub use context_cycle::{
@@ -101,7 +102,11 @@ pub use genome_store::{
 pub use history::{
     compute_history, CapabilityMapCell, CapabilityMapRow, EvolutionFunnel, EvolutionHistory,
     EvolutionVelocityPoint, FixSurvivalPoint, HiddenTrendPoint, HiddenTrendSegment, HistoryError,
-    LineageNode, EVOLUTION_HISTORY_SCHEMA_VERSION,
+    LineageNode, RollbackBreakdown, EVOLUTION_HISTORY_SCHEMA_VERSION,
+};
+pub use inheritance::{
+    verify_inheritance, InheritanceObservation, InheritanceObservationKind,
+    InheritanceVerificationError, InheritanceVerificationInput,
 };
 pub use issue_observation::{
     FileIssueObservationStore, IssueObservation, IssueObservationError, IssueObservationStore,

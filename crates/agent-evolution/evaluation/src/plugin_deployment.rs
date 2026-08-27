@@ -3,6 +3,12 @@
 //! 发布签名、Gate、Canary 状态机与只追加归档仍由 `PluginReleaseController` 负责；本模块只
 //! 消费它已经返回的归档结果，把确定性 bundle、Plugin Manager 与 Genome Stable 指针绑定。
 
+use crate::plugin_deployment_store::{
+    FilePluginDeploymentStore, PluginCanaryDeploymentBindingV1, PluginCanaryDeploymentRecordV1,
+    PluginDeploymentId, PluginDeploymentStateV1, PluginDeploymentStoreError,
+    PluginDeploymentTransaction,
+};
+use crate::plugin_release::{FilePluginReleaseArchive, PluginReleaseError};
 use crate::{
     PluginCanaryAdmissionV1, PluginEvaluationArchiveRecordV1, PluginReleaseArchiveRecordV1,
 };
@@ -100,6 +106,32 @@ pub struct PluginDeploymentController<'a> {
     deployment_guard: Mutex<()>,
 }
 
+/// 强制通过受信 Release Archive 与部署 Store 执行生产副作用的可恢复控制器。
+///
+/// 该控制器不接受调用方提供的 bundle、Admission 或 Evaluation 副本；所有恢复输入均从
+/// Release Archive、Genome Store、Plugin Manager 和部署 Store/CAS 重新读取并复核。
+pub struct PersistentPluginDeploymentController<'a> {
+    controller: PluginDeploymentController<'a>,
+    release_archive: &'a FilePluginReleaseArchive<'a>,
+    deployment_store: &'a FilePluginDeploymentStore<'a>,
+}
+
+/// 已完成 Manager 副作用前全部只读校验的 Canary 部署准备结果。
+struct PreparedCanaryDeployment {
+    admission: PluginCanaryAdmissionV1,
+    candidate_revision: GenomeRevision,
+    parent_stable: StableGenomeRef,
+    parent_revision: GenomeRevision,
+    previous_bundle: Vec<u8>,
+    prepared_bundle: PreparedBundle,
+}
+
+/// 从四个受信存储面重建、尚未执行终态动作的部署输入。
+struct RecoveredCanaryDeployment {
+    deployment: PluginCanaryDeployment,
+    record: PluginCanaryDeploymentRecordV1,
+}
+
 impl<'a> PluginDeploymentController<'a> {
     /// 使用真实 Plugin Manager、Stable 发布器和受信暂存根创建控制器。
     ///
@@ -140,6 +172,20 @@ impl<'a> PluginDeploymentController<'a> {
         bundle_bytes: &[u8],
     ) -> Result<PluginCanaryDeployment, PluginDeploymentError> {
         let _guard = self.deployment_guard.lock().await;
+        let prepared = self
+            .prepare_canary_deployment(lineage, admission, candidate_revision, bundle_bytes)
+            .await?;
+        self.install_prepared_canary(prepared).await
+    }
+
+    /// 完成 Candidate 安装前的受信输入、Parent 和 bundle 校验。
+    async fn prepare_canary_deployment(
+        &self,
+        lineage: &str,
+        admission: PluginCanaryAdmissionV1,
+        candidate_revision: &GenomeRevision,
+        bundle_bytes: &[u8],
+    ) -> Result<PreparedCanaryDeployment, PluginDeploymentError> {
         let parent_stable = self
             .publisher
             .resolver()
@@ -166,9 +212,29 @@ impl<'a> PluginDeploymentController<'a> {
         let prepared = self.prepare_bundle("candidate", bundle_bytes)?;
         verify_prepared_bundle(&prepared, candidate_plugin)?;
 
+        Ok(PreparedCanaryDeployment {
+            admission,
+            candidate_revision: candidate_revision.clone(),
+            parent_stable,
+            parent_revision,
+            previous_bundle,
+            prepared_bundle: prepared,
+        })
+    }
+
+    /// 执行真实 Candidate replace，并复核 Manager 与 Parent Stable 未并发变化。
+    async fn install_prepared_canary(
+        &self,
+        prepared: PreparedCanaryDeployment,
+    ) -> Result<PluginCanaryDeployment, PluginDeploymentError> {
+        let candidate_plugin = plugin_genome(
+            &prepared.candidate_revision,
+            &prepared.admission.release.release.plugin_id,
+        )?;
+        let parent_plugin = plugin_genome(&prepared.parent_revision, &candidate_plugin.id)?;
         let installed = self
             .manager
-            .replace(prepared.root())
+            .replace(prepared.prepared_bundle.root())
             .map_err(|error| PluginDeploymentError::Install(error.to_string()))?;
         if let Err(error) = verify_installed(&installed, candidate_plugin)
             .and_then(|_| self.verify_current_install(candidate_plugin))
@@ -176,27 +242,27 @@ impl<'a> PluginDeploymentController<'a> {
             return Err(self.compensated_failure(
                 "Canary 安装后验证",
                 error,
-                &previous_bundle,
+                &prepared.previous_bundle,
                 parent_plugin,
             ));
         }
         let observed_parent = self
             .publisher
             .resolver()
-            .stable_reference(lineage)
+            .stable_reference(&prepared.parent_stable.lineage)
             .await
             .map_err(|error| {
                 PluginDeploymentError::Genome(format!("重新读取 Parent Stable 失败：{error}"))
             });
         match observed_parent {
-            Ok(observed) if observed == parent_stable => {}
+            Ok(observed) if observed == prepared.parent_stable => {}
             Ok(_) => {
                 return Err(self.compensated_failure(
                     "Canary 安装并发前置条件",
                     PluginDeploymentError::Binding(
                         "Canary 安装期间 Stable Genome 已变化".to_string(),
                     ),
-                    &previous_bundle,
+                    &prepared.previous_bundle,
                     parent_plugin,
                 ));
             }
@@ -204,18 +270,18 @@ impl<'a> PluginDeploymentController<'a> {
                 return Err(self.compensated_failure(
                     "Canary 安装后 Stable 复核",
                     error,
-                    &previous_bundle,
+                    &prepared.previous_bundle,
                     parent_plugin,
                 ));
             }
         }
 
         Ok(PluginCanaryDeployment {
-            admission,
-            candidate_revision: candidate_revision.clone(),
-            parent_stable,
-            parent_revision,
-            previous_bundle,
+            admission: prepared.admission,
+            candidate_revision: prepared.candidate_revision,
+            parent_stable: prepared.parent_stable,
+            parent_revision: prepared.parent_revision,
+            previous_bundle: prepared.previous_bundle,
             installed,
         })
     }
@@ -278,13 +344,30 @@ impl<'a> PluginDeploymentController<'a> {
         trusted_stable_release: &PluginReleaseArchiveRecordV1,
     ) -> Result<PluginRollbackReceipt, PluginDeploymentError> {
         let _guard = self.deployment_guard.lock().await;
-        validate_rollback_authorization(
+        self.rollback_failed_canary_inner(
             &deployment,
             evaluation,
             rollback_release,
             trusted_stable_release,
+        )
+        .await
+    }
+
+    /// 执行健康失败回滚主路径，调用方负责持有进程内或跨进程部署锁。
+    async fn rollback_failed_canary_inner(
+        &self,
+        deployment: &PluginCanaryDeployment,
+        evaluation: &PluginEvaluationArchiveRecordV1,
+        rollback_release: &PluginReleaseArchiveRecordV1,
+        trusted_stable_release: &PluginReleaseArchiveRecordV1,
+    ) -> Result<PluginRollbackReceipt, PluginDeploymentError> {
+        validate_rollback_authorization(
+            deployment,
+            evaluation,
+            rollback_release,
+            trusted_stable_release,
         )?;
-        self.require_parent_stable(&deployment).await?;
+        self.require_parent_stable(deployment).await?;
         let parent_plugin = plugin_genome(
             &deployment.parent_revision,
             &deployment.admission.release.release.plugin_id,
@@ -298,10 +381,10 @@ impl<'a> PluginDeploymentController<'a> {
             .map_err(|error| PluginDeploymentError::RollbackInstall(error.to_string()))?;
         verify_installed(&installed, parent_plugin)?;
         self.verify_current_install(parent_plugin)?;
-        self.require_parent_stable(&deployment).await?;
+        self.require_parent_stable(deployment).await?;
         Ok(PluginRollbackReceipt {
             installed,
-            stable: deployment.parent_stable,
+            stable: deployment.parent_stable.clone(),
         })
     }
 
@@ -533,6 +616,391 @@ impl<'a> PluginDeploymentController<'a> {
         verify_installed(&installed, expected)?;
         self.verify_current_install(expected)
     }
+}
+
+impl<'a> PersistentPluginDeploymentController<'a> {
+    /// 使用真实 Manager、Genome Publisher、Release Archive、Deployment Store 和暂存根创建
+    /// 可跨进程恢复的生产部署控制器。
+    pub fn new(
+        manager: &'a PluginManager,
+        publisher: &'a FileStableGenomePublisher,
+        release_archive: &'a FilePluginReleaseArchive<'a>,
+        deployment_store: &'a FilePluginDeploymentStore<'a>,
+        staging_root: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            controller: PluginDeploymentController::new(manager, publisher, staging_root),
+            release_archive,
+            deployment_store,
+        }
+    }
+
+    /// 从受信 Release Archive 安装 Canary，并在 replace 前后分别持久化 Planned 与
+    /// CanaryInstalled。
+    ///
+    /// Candidate Revision 会先以 create-new-or-same 语义进入不可变 Genome Store。部署已存在
+    /// 时调用会按 Manager 当前摘要恢复崩溃窗口，不信任调用方提供的 bundle 或 Admission。
+    ///
+    /// # Errors
+    ///
+    /// Release Archive、Parent/Candidate Genome、Manager、CAS 或状态历史错绑，或任一真实安装
+    /// 副作用失败时返回错误。
+    pub async fn deploy_canary(
+        &self,
+        lineage: &str,
+        canary_release_id: &ReleaseId,
+        candidate_revision: &GenomeRevision,
+    ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentError> {
+        let _guard = self.controller.deployment_guard.lock().await;
+        let deployment_id = PluginDeploymentId::for_canary_release(canary_release_id.clone());
+        let transaction = self.deployment_store.transaction(&deployment_id).await?;
+        if !transaction.history().await?.is_empty() {
+            let recovered = self.recover_canary_locked(&transaction, true).await?;
+            if recovered.deployment.candidate_revision != *candidate_revision {
+                return Err(PluginDeploymentError::Binding(
+                    "重试传入的 Candidate Revision 与持久化部署不一致".to_string(),
+                ));
+            }
+            return Ok(recovered.record);
+        }
+        let admission = self
+            .release_archive
+            .canary_admission(canary_release_id)
+            .await?;
+        let bundle = self
+            .release_archive
+            .release_bundle(&admission.release)
+            .await?;
+        let prepared = self
+            .controller
+            .prepare_canary_deployment(lineage, admission, candidate_revision, &bundle)
+            .await?;
+        self.controller
+            .append_revision_idempotently(candidate_revision)
+            .await?;
+        let binding = PluginCanaryDeploymentBindingV1::from_plan(
+            &prepared.admission,
+            &prepared.parent_stable,
+            &prepared.candidate_revision,
+        )?;
+        transaction
+            .append_planned(&binding, &prepared.previous_bundle)
+            .await?;
+        let deployment = self.controller.install_prepared_canary(prepared).await?;
+        transaction
+            .reconcile_canary_installed(&binding, deployment.installed())
+            .await
+            .map_err(Into::into)
+    }
+
+    /// 重启后从受信存储面恢复 Planned 或 replace 后未落盘的 Canary 安装。
+    ///
+    /// # Errors
+    ///
+    /// Deployment 不存在、Manager 当前安装既非 Parent 也非 Candidate，或任何受信输入错绑时
+    /// 返回错误。
+    pub async fn recover_canary_install(
+        &self,
+        deployment_id: &PluginDeploymentId,
+    ) -> Result<PluginCanaryDeploymentRecordV1, PluginDeploymentError> {
+        let _guard = self.controller.deployment_guard.lock().await;
+        let transaction = self.deployment_store.transaction(deployment_id).await?;
+        Ok(self.recover_canary_locked(&transaction, true).await?.record)
+    }
+
+    /// 从受信 Stable Release 恢复并完成 Promotion；Stable 已发布但终态未落盘时只补记终态。
+    ///
+    /// # Errors
+    ///
+    /// Stable Release 未承接当前 Canary、Manager/Stable 已被其他部署改写或持久化终态冲突时
+    /// 返回错误。
+    pub async fn promote_stable(
+        &self,
+        deployment_id: &PluginDeploymentId,
+        stable_release_id: &ReleaseId,
+    ) -> Result<PluginPromotionReceipt, PluginDeploymentError> {
+        let _guard = self.controller.deployment_guard.lock().await;
+        let transaction = self.deployment_store.transaction(deployment_id).await?;
+        let recovered = self.recover_canary_locked(&transaction, true).await?;
+        if recovered.record.state == PluginDeploymentStateV1::RolledBack {
+            return Err(PluginDeploymentError::Binding(
+                "已回滚 Deployment 不得改写为 Promoted".to_string(),
+            ));
+        }
+        let stable_release = self
+            .release_archive
+            .release(stable_release_id)
+            .await?
+            .ok_or_else(|| PluginReleaseError::ReleaseNotFound(stable_release_id.clone()))?;
+        let evaluation = self
+            .release_archive
+            .evaluation_for_release(&stable_release)
+            .await?;
+        validate_stable_authorization(&recovered.deployment, &evaluation, &stable_release)?;
+        let candidate_plugin = plugin_genome(
+            &recovered.deployment.candidate_revision,
+            &recovered.deployment.admission.release.release.plugin_id,
+        )?;
+        self.controller.verify_current_install(candidate_plugin)?;
+        let observed = self
+            .controller
+            .publisher
+            .resolver()
+            .stable_reference(&recovered.deployment.parent_stable.lineage)
+            .await
+            .map_err(|error| {
+                PluginDeploymentError::Genome(format!("读取 Promotion Stable 失败：{error}"))
+            })?;
+        let receipt = if observed == recovered.deployment.parent_stable {
+            let generation = recovered
+                .deployment
+                .parent_stable
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| {
+                    PluginDeploymentError::Binding("Stable generation 已溢出".to_string())
+                })?;
+            self.controller
+                .promote_stable_inner(
+                    &recovered.deployment,
+                    &evaluation,
+                    &stable_release,
+                    generation,
+                )
+                .await?
+        } else if stable_matches_promotion(
+            &observed,
+            &recovered.deployment,
+            &evaluation,
+            &stable_release,
+        ) {
+            PluginPromotionReceipt {
+                installed: recovered.deployment.installed.clone(),
+                stable: observed,
+            }
+        } else {
+            return Err(PluginDeploymentError::Binding(
+                "Stable 已被其他生产部署改写".to_string(),
+            ));
+        };
+        if recovered.record.state != PluginDeploymentStateV1::Promoted {
+            transaction.mark_promoted().await?;
+        }
+        Ok(receipt)
+    }
+
+    /// 从受信 Rollback 与先前 Stable Release 恢复健康失败回滚；Manager 已恢复但终态未落盘
+    /// 时只补记 RolledBack。
+    ///
+    /// # Errors
+    ///
+    /// Rollback 授权、旧 bundle、Parent Stable 或 Manager 当前安装错绑，或终态冲突时返回错误。
+    pub async fn rollback_failed_canary(
+        &self,
+        deployment_id: &PluginDeploymentId,
+        rollback_release_id: &ReleaseId,
+        trusted_stable_release_id: &ReleaseId,
+    ) -> Result<PluginRollbackReceipt, PluginDeploymentError> {
+        let _guard = self.controller.deployment_guard.lock().await;
+        let transaction = self.deployment_store.transaction(deployment_id).await?;
+        let recovered = self.recover_canary_locked(&transaction, false).await?;
+        if recovered.record.state == PluginDeploymentStateV1::Promoted {
+            return Err(PluginDeploymentError::Binding(
+                "已 Promotion 的 Deployment 不得改写为 RolledBack".to_string(),
+            ));
+        }
+        let rollback_release = self
+            .release_archive
+            .release(rollback_release_id)
+            .await?
+            .ok_or_else(|| PluginReleaseError::ReleaseNotFound(rollback_release_id.clone()))?;
+        let trusted_stable_release = self
+            .release_archive
+            .release(trusted_stable_release_id)
+            .await?
+            .ok_or_else(|| {
+                PluginReleaseError::ReleaseNotFound(trusted_stable_release_id.clone())
+            })?;
+        let evaluation = self
+            .release_archive
+            .evaluation_for_release(&rollback_release)
+            .await?;
+        validate_rollback_authorization(
+            &recovered.deployment,
+            &evaluation,
+            &rollback_release,
+            &trusted_stable_release,
+        )?;
+        let parent_plugin = plugin_genome(
+            &recovered.deployment.parent_revision,
+            &recovered.deployment.admission.release.release.plugin_id,
+        )?;
+        let current = self.controller.current_installed(&parent_plugin.id)?;
+        let receipt = if verify_installed(&current, parent_plugin).is_ok() {
+            self.controller
+                .require_parent_stable(&recovered.deployment)
+                .await?;
+            PluginRollbackReceipt {
+                installed: current,
+                stable: recovered.deployment.parent_stable.clone(),
+            }
+        } else {
+            self.controller
+                .rollback_failed_canary_inner(
+                    &recovered.deployment,
+                    &evaluation,
+                    &rollback_release,
+                    &trusted_stable_release,
+                )
+                .await?
+        };
+        if recovered.record.state != PluginDeploymentStateV1::RolledBack {
+            transaction.mark_rolled_back().await?;
+        }
+        Ok(receipt)
+    }
+
+    /// 在持有跨进程事务锁时从四个受信存储面重建部署，并按 Manager 摘要恢复安装窗口。
+    async fn recover_canary_locked(
+        &self,
+        transaction: &PluginDeploymentTransaction<'_, '_>,
+        install_if_planned: bool,
+    ) -> Result<RecoveredCanaryDeployment, PluginDeploymentError> {
+        let history = transaction.history().await?;
+        let planned = history
+            .first()
+            .filter(|record| record.state == PluginDeploymentStateV1::Planned)
+            .cloned()
+            .ok_or_else(|| {
+                PluginDeploymentError::Persistence(PluginDeploymentStoreError::NotFound(
+                    transaction.deployment_id().clone(),
+                ))
+            })?;
+        let admission = self
+            .release_archive
+            .canary_admission(&planned.canary_release_id)
+            .await?;
+        let parent_stable = planned.parent_stable.clone().ok_or_else(|| {
+            PluginDeploymentError::Binding("持久化 Planned 缺少 Parent Stable 加法字段".to_string())
+        })?;
+        let candidate_revision = self
+            .controller
+            .publisher
+            .resolver()
+            .store()
+            .get(&planned.candidate_revision_id)
+            .await
+            .map_err(|error| {
+                PluginDeploymentError::Genome(format!("读取 Candidate Revision 失败：{error}"))
+            })?
+            .ok_or_else(|| {
+                PluginDeploymentError::Binding("Candidate Revision 尚未登记".to_string())
+            })?;
+        let parent_revision = self
+            .controller
+            .publisher
+            .resolver()
+            .store()
+            .get(&planned.parent_revision_id)
+            .await
+            .map_err(|error| {
+                PluginDeploymentError::Genome(format!("读取 Parent Revision 失败：{error}"))
+            })?
+            .ok_or_else(|| PluginDeploymentError::Binding("Parent Revision 不存在".to_string()))?;
+        validate_parent_binding(&candidate_revision, &parent_stable, &parent_revision)?;
+        let binding = PluginCanaryDeploymentBindingV1::from_plan(
+            &admission,
+            &parent_stable,
+            &candidate_revision,
+        )?;
+        if binding != planned.binding()? {
+            return Err(PluginDeploymentError::Binding(
+                "持久化 Planned 与 Release/Genome 重建结果不一致".to_string(),
+            ));
+        }
+        let previous_bundle = transaction.previous_bundle(&planned).await?;
+        let candidate_bundle = self
+            .release_archive
+            .release_bundle(&admission.release)
+            .await?;
+        let candidate_plugin =
+            validate_canary_authorization(&admission, &candidate_revision, &candidate_bundle)?;
+        let parent_plugin = plugin_genome(&parent_revision, &candidate_plugin.id)?;
+        let prepared_parent = self
+            .controller
+            .prepare_bundle("persisted-parent", &previous_bundle)?;
+        verify_prepared_bundle(&prepared_parent, parent_plugin)?;
+        let current = self.controller.current_installed(&candidate_plugin.id)?;
+        let mut record = history.last().cloned().expect("Planned 历史非空");
+        let installed = if verify_installed(&current, candidate_plugin).is_ok() {
+            if record.state == PluginDeploymentStateV1::Planned {
+                record = transaction
+                    .reconcile_canary_installed(&binding, &current)
+                    .await?;
+            }
+            current
+        } else if verify_installed(&current, parent_plugin).is_ok()
+            && record.state == PluginDeploymentStateV1::Planned
+            && install_if_planned
+        {
+            let prepared_bundle = self
+                .controller
+                .prepare_bundle("candidate", &candidate_bundle)?;
+            verify_prepared_bundle(&prepared_bundle, candidate_plugin)?;
+            let prepared = PreparedCanaryDeployment {
+                admission: admission.clone(),
+                candidate_revision: candidate_revision.clone(),
+                parent_stable: parent_stable.clone(),
+                parent_revision: parent_revision.clone(),
+                previous_bundle: previous_bundle.clone(),
+                prepared_bundle,
+            };
+            let deployment = self.controller.install_prepared_canary(prepared).await?;
+            record = transaction
+                .reconcile_canary_installed(&binding, deployment.installed())
+                .await?;
+            deployment.installed
+        } else if verify_installed(&current, parent_plugin).is_ok()
+            && matches!(
+                record.state,
+                PluginDeploymentStateV1::CanaryInstalled | PluginDeploymentStateV1::RolledBack
+            )
+        {
+            current
+        } else {
+            return Err(PluginDeploymentError::Binding(
+                "Plugin Manager 当前安装既非持久化 Parent 也非 Candidate".to_string(),
+            ));
+        };
+        Ok(RecoveredCanaryDeployment {
+            deployment: PluginCanaryDeployment {
+                admission,
+                candidate_revision,
+                parent_stable,
+                parent_revision,
+                previous_bundle,
+                installed,
+            },
+            record,
+        })
+    }
+}
+
+/// 验证当前 Stable 是同一部署已提交但尚未补记终态的精确 Promotion 结果。
+fn stable_matches_promotion(
+    stable: &StableGenomeRef,
+    deployment: &PluginCanaryDeployment,
+    evaluation: &PluginEvaluationArchiveRecordV1,
+    release: &PluginReleaseArchiveRecordV1,
+) -> bool {
+    stable.lineage == deployment.parent_stable.lineage
+        && stable.revision_id == deployment.candidate_revision.revision_id
+        && stable.digest == deployment.candidate_revision.digest
+        && stable.generation == deployment.parent_stable.generation.saturating_add(1)
+        && stable.release_id.as_ref() == Some(&release.release.release_id)
+        && stable.evaluation_report_id.as_ref() == Some(&evaluation.report_id)
+        && stable.previous_revision_id.as_ref() == Some(&deployment.parent_stable.revision_id)
+        && stable.rollback_of.is_none()
 }
 
 /// 一个仍由临时目录拥有的已解包 bundle。
@@ -774,6 +1242,12 @@ fn digest_bytes(bytes: &[u8]) -> Result<ArtifactDigest, PluginDeploymentError> {
 /// M8 生产插件部署错误。
 #[derive(Debug, thiserror::Error)]
 pub enum PluginDeploymentError {
+    /// 跨进程部署状态、CAS 或事务锁失败。
+    #[error("插件部署状态持久化失败：{0}")]
+    Persistence(#[from] PluginDeploymentStoreError),
+    /// 受信 Release Archive 无法重建部署授权输入。
+    #[error("插件部署 Release Archive 读取失败：{0}")]
+    ReleaseArchive(#[from] PluginReleaseError),
     /// Release、Genome、安装记录或并发前置条件错绑。
     #[error("插件部署绑定无效：{0}")]
     Binding(String),

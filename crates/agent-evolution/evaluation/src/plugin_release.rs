@@ -230,6 +230,114 @@ impl<'a> FilePluginReleaseArchive<'a> {
         Ok(Some(record))
     }
 
+    /// 从受信归档重建指定 Canary Release 的初始 Admission。
+    ///
+    /// 该入口重新读取 Release、Evaluation 和完整 Canary 历史，不接受调用方提供的 Admission
+    /// 副本，供部署进程重启后恢复授权边界。
+    ///
+    /// # Errors
+    ///
+    /// Release 不存在、初始 Planned Canary 缺失，或任一归档/CAS/身份绑定无效时返回错误。
+    pub async fn canary_admission(
+        &self,
+        release_id: &ReleaseId,
+    ) -> Result<PluginCanaryAdmissionV1, PluginReleaseError> {
+        let release = self
+            .release(release_id)
+            .await?
+            .ok_or_else(|| PluginReleaseError::ReleaseNotFound(release_id.clone()))?;
+        let report_bytes = self
+            .read_artifact(
+                &release.evaluation_report_artifact,
+                PLUGIN_EVALUATION_REPORT_MEDIA_TYPE,
+            )
+            .await?;
+        let report: PluginEvaluationReport = serde_json::from_slice(&report_bytes)?;
+        let evaluation = self.evaluation_for_release(&release).await?;
+        let input_bytes = self
+            .read_artifact(
+                &evaluation.gate_input_artifact,
+                PLUGIN_GATE_INPUT_MEDIA_TYPE,
+            )
+            .await?;
+        let input: PluginEvaluationGateInput = serde_json::from_slice(&input_bytes)?;
+        let history = self
+            .canary_history(&canary_id_for_release(release_id))
+            .await?;
+        let canary = history
+            .first()
+            .filter(|record| record.state == PluginCanaryState::Planned)
+            .cloned()
+            .ok_or(PluginReleaseError::CanaryAdmissionNotFound(
+                release_id.clone(),
+            ))?;
+        canary.validate_against_release(&release.release, &report, &input)?;
+        Ok(PluginCanaryAdmissionV1 { release, canary })
+    }
+
+    /// 从受信 Release 归档读取并复核完整 bundle 字节。
+    ///
+    /// # Errors
+    ///
+    /// 传入记录不是归档中的精确记录，或 bundle CAS 缺失、篡改、长度不符时返回错误。
+    pub async fn release_bundle(
+        &self,
+        record: &PluginReleaseArchiveRecordV1,
+    ) -> Result<Vec<u8>, PluginReleaseError> {
+        let archived = self
+            .release(&record.release.release_id)
+            .await?
+            .ok_or_else(|| {
+                PluginReleaseError::ReleaseNotFound(record.release.release_id.clone())
+            })?;
+        if archived != *record {
+            return Err(PluginReleaseError::ArtifactBindingMismatch(
+                "release_archive_record",
+            ));
+        }
+        self.read_artifact(&record.bundle_artifact, PLUGIN_BUNDLE_MEDIA_TYPE)
+            .await
+    }
+
+    /// 从受信 Release 记录定位并复核对应 Evaluation 归档。
+    ///
+    /// # Errors
+    ///
+    /// Release 未归档、报告 CAS 无效或 Evaluation 索引缺失/错绑时返回错误。
+    pub async fn evaluation_for_release(
+        &self,
+        record: &PluginReleaseArchiveRecordV1,
+    ) -> Result<PluginEvaluationArchiveRecordV1, PluginReleaseError> {
+        let archived = self
+            .release(&record.release.release_id)
+            .await?
+            .ok_or_else(|| {
+                PluginReleaseError::ReleaseNotFound(record.release.release_id.clone())
+            })?;
+        if archived != *record {
+            return Err(PluginReleaseError::ArtifactBindingMismatch(
+                "release_archive_record",
+            ));
+        }
+        let report_bytes = self
+            .read_artifact(
+                &record.evaluation_report_artifact,
+                PLUGIN_EVALUATION_REPORT_MEDIA_TYPE,
+            )
+            .await?;
+        let report: PluginEvaluationReport = serde_json::from_slice(&report_bytes)?;
+        let evaluation = self
+            .evaluation(&report.report_id)
+            .await?
+            .ok_or_else(|| PluginReleaseError::EvaluationNotFound(report.report_id.clone()))?;
+        if evaluation.report_artifact != record.evaluation_report_artifact {
+            return Err(PluginReleaseError::ArtifactBindingMismatch(
+                "evaluation_report",
+            ));
+        }
+        Ok(evaluation)
+    }
+
     /// 追加一项 Canary 状态快照，并校验完整历史为单调状态链。
     ///
     /// 相同快照重试幂等；同一进度键出现不同内容会被视为分叉。
@@ -835,6 +943,9 @@ pub enum PluginReleaseError {
     /// 指定 Release 不存在。
     #[error("插件 Release 不存在：{0}")]
     ReleaseNotFound(ReleaseId),
+    /// 指定 Canary Release 缺少可信 Planned Admission。
+    #[error("插件 Canary Admission 不存在：{0}")]
+    CanaryAdmissionNotFound(ReleaseId),
     /// 指定评测报告尚未归档。
     #[error("插件评测报告不存在：{0}")]
     EvaluationNotFound(agent_evolution_protocol::EvaluationReportId),
@@ -861,10 +972,9 @@ fn planned_canary(
     release: &PluginReleaseEnvelope,
 ) -> Result<PluginCanaryRecord, PluginReleaseError> {
     let release_digest = release.signing_digest()?;
-    let digest = Sha256::digest(release.release_id.as_str().as_bytes());
     let record = PluginCanaryRecord {
         schema_version: PLUGIN_CANARY_RECORD_SCHEMA_VERSION,
-        canary_id: format!("canary-{digest:x}"),
+        canary_id: canary_id_for_release(&release.release_id),
         release_id: release.release_id.clone(),
         release_digest,
         plugin_id: release.plugin_id.clone(),
@@ -882,6 +992,12 @@ fn planned_canary(
     };
     record.validate()?;
     Ok(record)
+}
+
+/// 从 Release ID 构造 Canary 历史使用的稳定摘要 ID。
+fn canary_id_for_release(release_id: &ReleaseId) -> String {
+    let digest = Sha256::digest(release_id.as_str().as_bytes());
+    format!("canary-{digest:x}")
 }
 
 fn validate_release_record(
