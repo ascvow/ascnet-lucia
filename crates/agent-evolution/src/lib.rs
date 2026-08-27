@@ -86,6 +86,7 @@ pub use evaluation_store::{
 };
 pub use evaluator_process::{
     ContextEvaluatorClient, EvaluatorClient, EvaluatorProcessError, LuciaEvalProcessClient,
+    LuciaEvalSkillProcessClient,
 };
 pub use evolution_policy::{
     EvolutionPolicy, EVOLUTION_POLICY_VERSION, TASK_STRATEGY_MVP_CANDIDATE_COUNT,
@@ -164,11 +165,11 @@ pub use skill_cycle::{
     SKILL_EVOLUTION_CANDIDATE_COUNT,
 };
 pub use skill_mutation::{
-    BoundedSkillMutator, SkillContentDraftV1, SkillMutationDraftOperationV1, SkillMutationDraftV1,
-    SkillMutationError, SkillMutationGenerationError, SkillMutationGenerator,
-    SkillMutationParentView, SkillMutationRequestV1, M7_SKILL_CANDIDATE_COUNT,
-    M7_SKILL_MUTATION_POLICY_VERSION, MAX_SKILL_DRAFT_ARTIFACTS, MAX_SKILL_DRAFT_BYTES,
-    MAX_SKILL_DRAFT_HYPOTHESIS_BYTES,
+    BoundedSkillMutator, DeterministicSkillMutationGenerator, SkillContentDraftV1,
+    SkillMutationDraftOperationV1, SkillMutationDraftV1, SkillMutationError,
+    SkillMutationGenerationError, SkillMutationGenerator, SkillMutationParentView,
+    SkillMutationRequestV1, M7_SKILL_CANDIDATE_COUNT, M7_SKILL_MUTATION_POLICY_VERSION,
+    MAX_SKILL_DRAFT_ARTIFACTS, MAX_SKILL_DRAFT_BYTES, MAX_SKILL_DRAFT_HYPOTHESIS_BYTES,
 };
 pub use skill_repository::{
     FileSkillStatusStore, SkillArtifactRepository, SkillRepositoryError, SkillStatusIndexEntryV1,

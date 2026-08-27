@@ -3,10 +3,17 @@
 //! 客户端不链接 Evaluator 实现，也不传入 Dataset、Verifier、Commit Policy 或 Store 路径。
 //! 每次调用只向固定可执行文件发送一份版本化 JSON，并严格校验脱敏回执与请求身份。
 
+use crate::{
+    ArtifactStore, FileArtifactStore, SkillEvolutionOrchestrator, SkillEvolutionOrchestratorError,
+    SkillGateCycleOutcomeV1, SkillGatePromotionV1, SkillHealthVerdictV1, StableGenomeRef,
+};
 use agent_evolution_protocol::{
     ContextEvaluationReceiptV1, ContextEvaluationRequestV1, EvaluationReceiptV1,
     EvaluationRequestV1, HealthCheckReceiptV1, HealthCheckRequestV1, PromotionRequestV1,
-    ReleaseReceiptV1, RollbackRequestV1, M6_CONTEXT_GATE_VERSION,
+    ReleaseReceiptV1, RollbackRequestV1, SkillCandidateV1, SkillEvaluationOutcomeV1,
+    SkillEvaluationReceiptV1, SkillEvaluationRequestV1, SkillHealthReceiptV1, SkillHealthRequestV1,
+    SkillHealthStatusV1, M6_CONTEXT_GATE_VERSION, SKILL_CANDIDATE_SNAPSHOT_MEDIA_TYPE,
+    SKILL_EVALUATION_IPC_SCHEMA_VERSION, SKILL_HEALTH_IPC_SCHEMA_VERSION,
 };
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
@@ -188,6 +195,170 @@ impl LuciaEvalProcessClient {
             return Err(EvaluatorProcessError::UnexpectedStderr);
         }
         serde_json::from_slice(&output.stdout).map_err(EvaluatorProcessError::InvalidReceipt)
+    }
+}
+
+/// 专用于 M7 Skill Cycle 的独立 `lucia-eval` 进程客户端。
+///
+/// 完整 Candidate 会先以规范 JSON 写入固定 Evolution 根下的 Artifact CAS，
+/// stdin 只携带强类型身份、CAS 引用和时间前置条件。Registry、Episode、
+/// 观察、授权和 Gate Policy 由 Evaluator 环境固定，不能经请求覆盖。
+#[derive(Debug, Clone)]
+pub struct LuciaEvalSkillProcessClient {
+    process: LuciaEvalProcessClient,
+    artifacts: FileArtifactStore,
+}
+
+impl LuciaEvalSkillProcessClient {
+    /// 创建绑定固定 Evaluator、超时和 Evolution 根的 Skill 客户端。
+    pub fn new(
+        executable: impl Into<PathBuf>,
+        timeout: Duration,
+        evolution_root: impl AsRef<Path>,
+    ) -> Self {
+        Self {
+            process: LuciaEvalProcessClient::new(executable, timeout),
+            artifacts: FileArtifactStore::new(evolution_root.as_ref().join("artifacts")),
+        }
+    }
+
+    /// 返回固定 Evaluator 可执行文件路径。
+    pub fn executable(&self) -> &Path {
+        self.process.executable()
+    }
+
+    /// 将本地进程错误收窄为不含路径和子进程输出的稳定错误码。
+    fn orchestrator_error(_error: impl std::fmt::Display) -> SkillEvolutionOrchestratorError {
+        SkillEvolutionOrchestratorError::new("skill_evaluator_failed")
+    }
+}
+
+#[async_trait]
+impl SkillEvolutionOrchestrator for LuciaEvalSkillProcessClient {
+    async fn evaluate_and_promote(
+        &self,
+        candidate: &SkillCandidateV1,
+        evaluated_at_ms: u64,
+        activated_at_ms: u64,
+    ) -> Result<SkillGateCycleOutcomeV1, SkillEvolutionOrchestratorError> {
+        candidate.validate().map_err(Self::orchestrator_error)?;
+        let candidate_bytes = serde_json::to_vec(candidate).map_err(Self::orchestrator_error)?;
+        let candidate_artifact = self
+            .artifacts
+            .put(SKILL_CANDIDATE_SNAPSHOT_MEDIA_TYPE, &candidate_bytes)
+            .await
+            .map_err(Self::orchestrator_error)?;
+        let request = SkillEvaluationRequestV1 {
+            schema_version: SKILL_EVALUATION_IPC_SCHEMA_VERSION,
+            request_id: format!("skill-evaluate-{}", candidate.candidate_id),
+            candidate_id: candidate.candidate_id.clone(),
+            candidate_revision_id: candidate.candidate_revision_id.clone(),
+            candidate_genome_digest: candidate.candidate_genome_digest.clone(),
+            candidate_artifact,
+            evaluated_at_ms,
+            activated_at_ms,
+        };
+        request.validate().map_err(Self::orchestrator_error)?;
+        let receipt: SkillEvaluationReceiptV1 = self
+            .process
+            .invoke("skill-evaluate", &request)
+            .await
+            .map_err(Self::orchestrator_error)?;
+        receipt.validate().map_err(Self::orchestrator_error)?;
+        if receipt.request_id != request.request_id || receipt.candidate_id != request.candidate_id
+        {
+            return Err(SkillEvolutionOrchestratorError::new(
+                "skill_evaluation_receipt_mismatch",
+            ));
+        }
+        match receipt.result {
+            SkillEvaluationOutcomeV1::Rejected {
+                report_id,
+                report_artifact,
+            } => Ok(SkillGateCycleOutcomeV1::Rejected {
+                candidate_id: receipt.candidate_id,
+                report_id,
+                report_artifact,
+            }),
+            SkillEvaluationOutcomeV1::Promoted {
+                evaluated_candidate,
+                report_id,
+                report_artifact,
+                active_skill_artifacts,
+                active_genome,
+                authorization_evidence_id,
+                production_permitted,
+            } => {
+                if evaluated_candidate.candidate_revision_id != request.candidate_revision_id
+                    || evaluated_candidate.candidate_genome_digest
+                        != request.candidate_genome_digest
+                {
+                    return Err(SkillEvolutionOrchestratorError::new(
+                        "skill_evaluation_receipt_mismatch",
+                    ));
+                }
+                Ok(SkillGateCycleOutcomeV1::Promoted(Box::new(
+                    SkillGatePromotionV1 {
+                        evaluated_candidate: *evaluated_candidate,
+                        report_id,
+                        report_artifact,
+                        active_skill_artifacts,
+                        active_genome: *active_genome,
+                        authorization_evidence_id,
+                        production_permitted,
+                    },
+                )))
+            }
+        }
+    }
+
+    async fn verify_health(
+        &self,
+        promoted: &StableGenomeRef,
+    ) -> Result<SkillHealthVerdictV1, SkillEvolutionOrchestratorError> {
+        let release_id = promoted
+            .release_id
+            .clone()
+            .ok_or_else(|| SkillEvolutionOrchestratorError::new("skill_health_release_missing"))?;
+        let request = SkillHealthRequestV1 {
+            schema_version: SKILL_HEALTH_IPC_SCHEMA_VERSION,
+            request_id: format!("skill-health-{release_id}"),
+            release_id,
+            lineage: promoted.lineage.clone(),
+            expected_revision_id: promoted.revision_id.clone(),
+            expected_generation: promoted.generation,
+        };
+        request.validate().map_err(Self::orchestrator_error)?;
+        let receipt: SkillHealthReceiptV1 = self
+            .process
+            .invoke("skill-health", &request)
+            .await
+            .map_err(Self::orchestrator_error)?;
+        receipt.validate().map_err(Self::orchestrator_error)?;
+        if receipt.request_id != request.request_id
+            || receipt.release_id != request.release_id
+            || receipt.lineage != request.lineage
+            || receipt.expected_revision_id != request.expected_revision_id
+            || receipt.observed_revision_id != request.expected_revision_id
+            || receipt.expected_generation != request.expected_generation
+            || receipt.observed_generation != request.expected_generation
+        {
+            return Err(SkillEvolutionOrchestratorError::new(
+                "skill_health_receipt_mismatch",
+            ));
+        }
+        Ok(match receipt.result {
+            SkillHealthStatusV1::Healthy { evidence_id } => {
+                SkillHealthVerdictV1::Healthy { evidence_id }
+            }
+            SkillHealthStatusV1::Unhealthy {
+                evidence_id,
+                reason_code,
+            } => SkillHealthVerdictV1::Unhealthy {
+                evidence_id,
+                reason_code,
+            },
+        })
     }
 }
 

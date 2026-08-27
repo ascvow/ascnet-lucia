@@ -15,6 +15,7 @@ use agent_evolution_protocol::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// M7 固定 Skill Mutator 策略版本。
@@ -158,6 +159,92 @@ pub struct SkillMutationGenerationError {
     message: String,
 }
 
+/// 无外部模型依赖的 M7 确定性 Skill 候选生成器。
+///
+/// Parent 已有 Skill 时，它仅对按 ID 排序的首个 Skill 生成三份受限
+/// Update 草案；Parent 为空时则生成三份固定 ID 的 Create 草案。草案只使用
+/// Selector 提供的脱敏预期行为，所有身份、能力上限和证据绑定仍由
+/// [`BoundedSkillMutator`] 从真实 Store 重建。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeterministicSkillMutationGenerator;
+
+#[async_trait]
+impl SkillMutationGenerator for DeterministicSkillMutationGenerator {
+    async fn generate(
+        &self,
+        request: SkillMutationRequestV1<'_>,
+    ) -> Result<Vec<SkillMutationDraftV1>, SkillMutationGenerationError> {
+        if request.candidate_count != M7_SKILL_CANDIDATE_COUNT
+            || request.mutation_surface != MutationSurface::Skill
+        {
+            return Err(SkillMutationGenerationError::new(
+                "unsupported_skill_mutation_request",
+            ));
+        }
+        let expected_behavior = request.evidence.expected_behavior.trim();
+        if expected_behavior.is_empty() {
+            return Err(SkillMutationGenerationError::new(
+                "missing_expected_behavior",
+            ));
+        }
+        let strategies = [
+            ("补充执行前的可验证边界", "执行前先检查输入、权限和完成条件"),
+            (
+                "补充执行后的真实状态复核",
+                "执行后核对真实状态、错误分类和外部副作用",
+            ),
+            (
+                "补充结束前的独立验收",
+                "结束前按任务契约独立验收并保留失败证据",
+            ),
+        ];
+        let drafts = if let Some(parent) = request.parent_skills.first() {
+            strategies
+                .into_iter()
+                .map(|(hypothesis, instruction)| SkillMutationDraftV1 {
+                    hypothesis: hypothesis.to_string(),
+                    operation: SkillMutationDraftOperationV1::Update {
+                        skill: SkillContentDraftV1 {
+                            skill_id: parent.skill_id.clone(),
+                            name: parent.name.clone(),
+                            description: parent.description.clone(),
+                            instructions: format!(
+                                "{}\n\n进化策略：{}。目标行为：{}。",
+                                parent.instructions, instruction, expected_behavior
+                            ),
+                            trigger_policy: parent.trigger_policy.clone(),
+                            required_capabilities: parent.required_capabilities.clone(),
+                        },
+                    },
+                })
+                .collect()
+        } else {
+            let ids = ["skill_m7create01", "skill_m7create02", "skill_m7create03"];
+            strategies
+                .into_iter()
+                .zip(ids)
+                .map(|((hypothesis, instruction), id)| SkillMutationDraftV1 {
+                    hypothesis: hypothesis.to_string(),
+                    operation: SkillMutationDraftOperationV1::Create {
+                        skill: SkillContentDraftV1 {
+                            skill_id: SkillId::new(id).expect("固定 Skill ID 必须合法"),
+                            name: hypothesis.to_string(),
+                            description: format!("为受信进化证据补充策略：{expected_behavior}。"),
+                            instructions: format!(
+                                "{}。目标行为：{}。",
+                                instruction, expected_behavior
+                            ),
+                            trigger_policy: SkillTriggerPolicyV1::default(),
+                            required_capabilities: BTreeSet::new(),
+                        },
+                    },
+                })
+                .collect()
+        };
+        Ok(drafts)
+    }
+}
+
 impl SkillMutationGenerationError {
     /// 从不含 Secret、用户正文或原始模型响应的稳定原因创建错误。
     pub fn new(message: impl Into<String>) -> Self {
@@ -276,14 +363,20 @@ where
                     maximum: MAX_SKILL_DRAFT_BYTES,
                 });
             }
-            if let Some(first_candidate) = fingerprints.insert(fingerprint, candidate) {
+            if let Some(first_candidate) = fingerprints.insert(fingerprint.clone(), candidate) {
                 return Err(SkillMutationError::DuplicateCandidate {
                     first_candidate,
                     duplicate_candidate: candidate,
                 });
             }
 
-            let mutation_id = MutationId::generate();
+            let mutation_id = deterministic_mutation_id(
+                parent,
+                evidence,
+                generated_at_ms,
+                candidate,
+                &fingerprint,
+            )?;
             let proposed_artifacts = materialize_operation(
                 candidate,
                 draft.operation,
@@ -309,6 +402,36 @@ where
         }
         Ok(proposals)
     }
+}
+
+/// 从完整可信输入和规范草案派生幂等 Mutation ID。
+fn deterministic_mutation_id(
+    parent: &GenomeRevision,
+    evidence: &MutationEvidence,
+    generated_at_ms: u64,
+    candidate: usize,
+    draft_fingerprint: &[u8],
+) -> Result<MutationId, SkillMutationError> {
+    let mut hasher = Sha256::new();
+    for part in [
+        M7_SKILL_MUTATION_POLICY_VERSION.as_bytes(),
+        parent.revision_id.as_str().as_bytes(),
+        parent.digest.as_str().as_bytes(),
+        evidence.issue_id.as_str().as_bytes(),
+        &generated_at_ms.to_be_bytes(),
+        &(candidate as u64).to_be_bytes(),
+        draft_fingerprint,
+    ] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    for episode in &evidence.episodes {
+        let part = episode.episode_id.as_str().as_bytes();
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    MutationId::new(format!("{}_{:x}", MutationId::PREFIX, hasher.finalize()))
+        .map_err(|error| SkillMutationError::DeterministicMutationId(error.to_string()))
 }
 
 fn validate_evidence(
@@ -883,6 +1006,9 @@ pub enum SkillMutationError {
     /// 草案无法稳定序列化。
     #[error("序列化 Skill 候选草案失败：{0}")]
     SerializeDraft(serde_json::Error),
+    /// 无法从受信证据与规范草案派生稳定 Mutation ID。
+    #[error("构造确定性 Skill Mutation ID 失败：{0}")]
+    DeterministicMutationId(String),
     /// Skill CAS 读取或校验失败。
     #[error(transparent)]
     SkillRepository(#[from] SkillRepositoryError),
@@ -1095,12 +1221,18 @@ mod tests {
                 },
             },
         ];
-        let proposals = BoundedSkillMutator::m7(generator(drafts))
-            .propose(&parent, &evidence(&parent), 10, &artifacts)
+        let evidence = evidence(&parent);
+        let proposals = BoundedSkillMutator::m7(generator(drafts.clone()))
+            .propose(&parent, &evidence, 10, &artifacts)
             .await
             .expect("三类操作应可信物化");
+        let retried = BoundedSkillMutator::m7(generator(drafts))
+            .propose(&parent, &evidence, 10, &artifacts)
+            .await
+            .expect("相同可信输入应可幂等重算");
 
         assert_eq!(proposals.len(), M7_SKILL_CANDIDATE_COUNT);
+        assert_eq!(proposals, retried);
         assert_eq!(proposals[0].parent_revision_id, parent.revision_id);
         assert_eq!(proposals[0].parent_genome_digest, parent.digest);
         assert!(matches!(

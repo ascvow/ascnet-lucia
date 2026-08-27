@@ -19,7 +19,7 @@ use agent_evolution_protocol::{
     SkillMutationProposalV1, SkillStatusV1,
 };
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -34,7 +34,8 @@ pub const SKILL_EVOLUTION_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 pub const SKILL_EVOLUTION_CANDIDATE_COUNT: usize = 3;
 
 /// 一轮 Skill 生产 Cycle 的可信输入。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillEvolutionCycleRequestV1 {
     /// Cycle 稳定 ID。
     pub cycle_id: EvolutionCycleId,
@@ -81,8 +82,8 @@ impl SkillEvolutionCycleRequestV1 {
 }
 
 /// 独立 Skill Exit Gate 对单个 Candidate 的脱敏结果。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SkillGateCycleOutcomeV1 {
     /// Gate 拒绝 Candidate；正式报告仍必须位于 Artifact CAS。
     Rejected {
@@ -126,7 +127,8 @@ impl SkillGateCycleOutcomeV1 {
 }
 
 /// Exit Gate 通过后的 Q→E→A 可信回执。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillGatePromotionV1 {
     /// 已绑定正式报告但不改写原 Candidate Revision 的快照。
     pub evaluated_candidate: SkillCandidateV1,
@@ -156,8 +158,8 @@ impl SkillGatePromotionV1 {
 }
 
 /// Promotion 后的受信健康结论。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SkillHealthVerdictV1 {
     /// 新 Stable Genome 已通过生产健康检查。
     Healthy {
@@ -219,7 +221,7 @@ pub trait SkillEvolutionOrchestrator: Send + Sync {
 }
 
 /// Skill Cycle 最终状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillEvolutionDispositionV1 {
     /// 所有 Candidate 均被 Gate 拒绝或缺少生产授权。
@@ -231,7 +233,8 @@ pub enum SkillEvolutionDispositionV1 {
 }
 
 /// 一轮 Skill Cycle 的不可变全量归档。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillEvolutionArchiveV1 {
     /// 归档结构版本。
     pub schema_version: u32,
@@ -744,6 +747,47 @@ pub enum SkillEvolutionCycleError {
     /// Stable 发布失败。
     #[error(transparent)]
     GenomePromotion(#[from] GenomePromotionError),
+}
+
+impl SkillEvolutionCycleError {
+    /// 返回不包含路径、候选正文或底层错误细节的稳定 CLI 错误码。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "skill_cycle_request_invalid",
+            Self::StablePreconditionFailed => "skill_stable_precondition_failed",
+            Self::CandidateCountMismatch => "skill_candidate_count_mismatch",
+            Self::GateCandidateMismatch
+            | Self::GateReportNotFound
+            | Self::GateReportBindingMismatch
+            | Self::InvalidAuthorizationEvidence
+            | Self::InvalidActiveGenome(_)
+            | Self::ActiveGenomeNotFound(_)
+            | Self::ActiveGenomeStoreMismatch
+            | Self::ActiveGenomeExecutionMismatch
+            | Self::ActiveSkillSetMismatch
+            | Self::InvalidActiveGenomeDiff
+            | Self::ActiveSkillMissing(_)
+            | Self::ActiveSkillDigestMismatch(_)
+            | Self::ActiveSkillNotActive(_) => "skill_gate_receipt_invalid",
+            Self::InvalidHealthVerdict => "skill_health_receipt_invalid",
+            Self::GenerationOverflow | Self::DeterministicReleaseId(_) => {
+                "skill_release_identity_invalid"
+            }
+            Self::InvalidArchive
+            | Self::ArchiveSerialization(_)
+            | Self::ArchiveConflict(_)
+            | Self::UnsafeArchivePath(_)
+            | Self::ArchiveIo { .. } => "skill_archive_failed",
+            Self::Mutation(_) => "skill_mutation_failed",
+            Self::CandidateBuild(_) => "skill_candidate_build_failed",
+            Self::Orchestrator(_) => "skill_evaluator_failed",
+            Self::Artifact(_) | Self::SkillRepository(_) => "skill_artifact_store_failed",
+            Self::GenomeStore(_) | Self::GenomeResolver(_) | Self::GenomeDiff(_) => {
+                "skill_genome_store_failed"
+            }
+            Self::GenomePromotion(_) => "skill_stable_publish_failed",
+        }
+    }
 }
 
 /// 校验最终 Archive 保留三份提案、候选、Gate 结果及合法发布分支。

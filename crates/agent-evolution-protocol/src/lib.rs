@@ -71,9 +71,12 @@ pub use ipc::{
     ContextEvaluationReceiptV1, ContextEvaluationRequestV1, EvaluationReceiptV1,
     EvaluationRequestV1, HealthCheckReceiptV1, HealthCheckRequestV1, InvalidEvaluatorIpc,
     PromotionRequestV1, ReleaseReceiptV1, RollbackRequestV1, RuntimeHealthObservationV1,
+    SkillEvaluationOutcomeV1, SkillEvaluationReceiptV1, SkillEvaluationRequestV1,
+    SkillHealthReceiptV1, SkillHealthRequestV1, SkillHealthStatusV1,
     CONTEXT_EVALUATION_RECEIPT_SCHEMA_VERSION, EVALUATION_RECEIPT_SCHEMA_VERSION,
     EVALUATION_REQUEST_SCHEMA_VERSION, HEALTH_RECEIPT_SCHEMA_VERSION,
-    RELEASE_RECEIPT_SCHEMA_VERSION,
+    RELEASE_RECEIPT_SCHEMA_VERSION, SKILL_CANDIDATE_SNAPSHOT_MEDIA_TYPE,
+    SKILL_EVALUATION_IPC_SCHEMA_VERSION, SKILL_HEALTH_IPC_SCHEMA_VERSION,
 };
 pub use mutation::{
     EvolutionCycleRequestInput, EvolutionCycleRequestV1, EvolutionCycleSnapshotV1,

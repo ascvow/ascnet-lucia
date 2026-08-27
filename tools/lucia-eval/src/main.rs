@@ -8,19 +8,22 @@ use agent_evaluation::{
     ContextEvaluationReportBuilder, ContextEvaluationReportMetadata, EvaluationArchiveError,
     EvaluationReportBuilder, EvaluationReportIdentity, EvaluationReportMetadata, EvaluationSubject,
     FileRuntimeHealthObservationStore, ReleaseController, ReleaseHealthVerifier, ReleaseReceipt,
-    TrustedContextObservationFixture, TrustedDatasetStore, TrustedEvaluationArchive,
-    VerifiedEvaluation,
+    SkillExitGate, SkillExitGateOutcomeV1, TrustedContextObservationFixture, TrustedDatasetStore,
+    TrustedEvaluationArchive, TrustedSkillEvaluationRegistry, VerifiedEvaluation,
 };
 use agent_evolution::{
-    ArtifactStore, FileArtifactStore, FileGenomeResolver, GenomeResolver, GenomeSelector,
+    collect_trusted_skill_evaluation_bindings, ArtifactStore, FileArtifactStore, FileEpisodeStore,
+    FileGenomeResolver, FileGenomeStore, GenomeResolver, GenomeSelector, GenomeStore,
 };
 use agent_evolution_protocol::{
     ArtifactDigest, ContextEvaluationReceiptV1, ContextEvaluationRequestV1,
     ContextPolicyEvaluationReportV1, EvaluationEnvironment, EvaluationReceiptV1,
     EvaluationRequestV1, GenomeRevision, GenomeRevisionId, HealthCheckReceiptV1,
     HealthCheckRequestV1, PromotionRequestV1, ReleaseReceiptV1, RollbackRequestV1,
-    CONTEXT_EVALUATION_RECEIPT_SCHEMA_VERSION, EVALUATION_RECEIPT_SCHEMA_VERSION,
-    RELEASE_RECEIPT_SCHEMA_VERSION,
+    SkillCandidateV1, SkillEvaluationOutcomeV1, SkillEvaluationReceiptV1, SkillEvaluationRequestV1,
+    SkillHealthReceiptV1, SkillHealthRequestV1, CONTEXT_EVALUATION_RECEIPT_SCHEMA_VERSION,
+    EVALUATION_RECEIPT_SCHEMA_VERSION, RELEASE_RECEIPT_SCHEMA_VERSION,
+    SKILL_EVALUATION_IPC_SCHEMA_VERSION, SKILL_HEALTH_IPC_SCHEMA_VERSION,
 };
 #[cfg(test)]
 use agent_evolution_protocol::{DatasetVersionId, EVALUATION_REQUEST_SCHEMA_VERSION};
@@ -57,12 +60,16 @@ enum Command {
     Evaluate,
     /// 运行固定八指标 Context Gate 并提交正式 Report Seal。
     ContextEvaluate,
+    /// 从受信 Registry 和真实 Episode 运行 Skill Exit Gate。
+    SkillEvaluate,
     /// 使用正式 EvaluationReport 晋升 Candidate。
     Promote,
     /// 把指定 Promotion 原子回滚到 Parent。
     Rollback,
     /// 复核 Promotion 后 Stable 与受信 Runtime 健康观察。
     Health,
+    /// 复核 Skill Promotion 后 Stable 与受信 Skill 健康记录。
+    SkillHealth,
 }
 
 /// 只从受信进程环境读取的 Evaluator 配置。
@@ -90,6 +97,28 @@ struct TrustedContextConfig {
     archive_root: PathBuf,
     fixture_root: PathBuf,
     expected_fixture_digest: ArtifactDigest,
+}
+
+/// Skill Gate 与健康复核需要的固定受信 Registry 配置。
+#[derive(Debug, Clone)]
+struct TrustedSkillConfig {
+    evolution_root: PathBuf,
+    registry_root: PathBuf,
+    expected_registry_digest: ArtifactDigest,
+}
+
+impl TrustedSkillConfig {
+    /// 只从进程环境读取 Skill Registry 绝对路径与固定摘要。
+    fn from_env() -> Result<Self> {
+        let expected_registry_digest =
+            ArtifactDigest::new(required_env("LUCIA_EVAL_SKILL_REGISTRY_DIGEST")?)
+                .map_err(|_| anyhow!("invalid_skill_registry_digest"))?;
+        Ok(Self {
+            evolution_root: required_path("LUCIA_EVAL_EVOLUTION_ROOT")?,
+            registry_root: required_path("LUCIA_EVAL_SKILL_REGISTRY_ROOT")?,
+            expected_registry_digest,
+        })
+    }
 }
 
 impl TrustedContextConfig {
@@ -168,6 +197,9 @@ async fn main() {
         Command::ContextEvaluate => run_context_evaluate()
             .await
             .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
+        Command::SkillEvaluate => run_skill_evaluate()
+            .await
+            .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
         Command::Promote => run_promote()
             .await
             .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
@@ -175,6 +207,9 @@ async fn main() {
             .await
             .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
         Command::Health => run_health()
+            .await
+            .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
+        Command::SkillHealth => run_skill_health()
             .await
             .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
     };
@@ -185,6 +220,183 @@ async fn main() {
         },
         Err(error) => fail(stable_error_code(&error)),
     }
+}
+
+/// 从固定 CAS、Genome Store、Episode Store 和摘要锁定 Registry 运行 Skill Gate。
+async fn run_skill_evaluate() -> Result<SkillEvaluationReceiptV1> {
+    let config = TrustedSkillConfig::from_env().context("config_invalid")?;
+    let request: SkillEvaluationRequestV1 = read_json_request().context("skill_request_invalid")?;
+    request.validate().context("skill_request_invalid")?;
+    let registry = TrustedSkillEvaluationRegistry::open_pinned(
+        &config.evolution_root,
+        &config.registry_root,
+        config.expected_registry_digest,
+    )
+    .await
+    .context("skill_registry_invalid")?;
+    let entry = registry
+        .registry()
+        .evaluation(&request.candidate_id, &request.candidate_artifact)
+        .context("skill_registry_binding_mismatch")?;
+    if entry.candidate_revision_id != request.candidate_revision_id
+        || entry.evaluated_at_ms != request.evaluated_at_ms
+        || entry.activated_at_ms != request.activated_at_ms
+    {
+        return Err(anyhow!("skill_registry_binding_mismatch"));
+    }
+
+    let artifacts = FileArtifactStore::new(config.evolution_root.join("artifacts"));
+    let candidate_bytes = artifacts
+        .get(&request.candidate_artifact.digest)
+        .await
+        .context("skill_candidate_invalid")?
+        .context("skill_candidate_invalid")?;
+    if u64::try_from(candidate_bytes.len()).ok() != Some(request.candidate_artifact.size_bytes) {
+        return Err(anyhow!("skill_candidate_invalid"));
+    }
+    let candidate: SkillCandidateV1 =
+        serde_json::from_slice(&candidate_bytes).context("skill_candidate_invalid")?;
+    candidate.validate().context("skill_candidate_invalid")?;
+    let canonical_candidate = serde_json::to_vec(&candidate).context("skill_candidate_invalid")?;
+    if canonical_candidate != candidate_bytes
+        || candidate.candidate_id != request.candidate_id
+        || candidate.candidate_revision_id != request.candidate_revision_id
+        || candidate.candidate_genome_digest != request.candidate_genome_digest
+    {
+        return Err(anyhow!("skill_candidate_invalid"));
+    }
+
+    let genomes = FileGenomeStore::new(config.evolution_root.join("genomes"));
+    let candidate_genome = genomes
+        .get(&candidate.candidate_revision_id)
+        .await
+        .context("skill_candidate_invalid")?
+        .context("skill_candidate_invalid")?;
+    if candidate_genome.digest != candidate.candidate_genome_digest {
+        return Err(anyhow!("skill_candidate_invalid"));
+    }
+    let episodes = FileEpisodeStore::new(config.evolution_root.join("skill-evaluation-episodes"));
+    let mut actual_bindings = std::collections::BTreeMap::new();
+    let episode_ids = entry
+        .trusted_usage_bindings
+        .values()
+        .map(|binding| binding.episode_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for episode_id in episode_ids {
+        let bindings = collect_trusted_skill_evaluation_bindings(
+            &episodes,
+            &artifacts,
+            &episode_id,
+            &candidate_genome,
+        )
+        .await
+        .context("skill_episode_binding_invalid")?;
+        for (event_id, binding) in bindings {
+            if actual_bindings.insert(event_id, binding).is_some() {
+                return Err(anyhow!("skill_episode_binding_invalid"));
+            }
+        }
+    }
+    if actual_bindings != entry.trusted_usage_bindings {
+        return Err(anyhow!("skill_episode_binding_invalid"));
+    }
+
+    let authorization = entry
+        .authorization
+        .gate_authorization()
+        .context("skill_registry_invalid")?;
+    let authorization_evidence_id = entry.authorization.evidence_id();
+    let production_permitted = authorization.permits_production();
+    let gate = SkillExitGate::new(
+        &genomes,
+        &artifacts,
+        config.evolution_root.join("skill-status"),
+    );
+    let outcome = gate
+        .evaluate_and_promote(
+            &candidate,
+            authorization,
+            &entry.observations,
+            &actual_bindings,
+            entry.report_id.clone(),
+            request.evaluated_at_ms,
+            request.activated_at_ms,
+        )
+        .await
+        .context("skill_gate_failed")?;
+    let result = match outcome {
+        SkillExitGateOutcomeV1::Rejected {
+            gate,
+            report_artifact,
+        } => SkillEvaluationOutcomeV1::Rejected {
+            report_id: gate.report.report_id,
+            report_artifact,
+        },
+        SkillExitGateOutcomeV1::Promoted(receipt) => SkillEvaluationOutcomeV1::Promoted {
+            report_id: receipt.gate.report.report_id.clone(),
+            evaluated_candidate: Box::new(receipt.evaluated_candidate),
+            report_artifact: receipt.report_artifact,
+            active_skill_artifacts: receipt.active_skill_artifacts,
+            active_genome: Box::new(receipt.active_genome),
+            authorization_evidence_id,
+            production_permitted,
+        },
+    };
+    let receipt = SkillEvaluationReceiptV1 {
+        schema_version: SKILL_EVALUATION_IPC_SCHEMA_VERSION,
+        request_id: request.request_id,
+        candidate_id: request.candidate_id,
+        result,
+    };
+    receipt.validate().context("skill_receipt_invalid")?;
+    Ok(receipt)
+}
+
+/// 复读当前 Stable 并返回与 Release 全身份绑定的 Skill 健康回执。
+async fn run_skill_health() -> Result<SkillHealthReceiptV1> {
+    let config = TrustedSkillConfig::from_env().context("config_invalid")?;
+    let request: SkillHealthRequestV1 = read_json_request().context("skill_request_invalid")?;
+    request.validate().context("skill_request_invalid")?;
+    let registry = TrustedSkillEvaluationRegistry::open_pinned(
+        &config.evolution_root,
+        &config.registry_root,
+        config.expected_registry_digest,
+    )
+    .await
+    .context("skill_registry_invalid")?;
+    let resolver = FileGenomeResolver::new(&config.evolution_root);
+    let stable = resolver
+        .stable_reference(&request.lineage)
+        .await
+        .context("skill_health_binding_mismatch")?;
+    if stable.release_id.as_ref() != Some(&request.release_id)
+        || stable.revision_id != request.expected_revision_id
+        || stable.generation != request.expected_generation
+    {
+        return Err(anyhow!("skill_health_binding_mismatch"));
+    }
+    let entry = registry
+        .registry()
+        .health(
+            &request.release_id,
+            &request.lineage,
+            &request.expected_revision_id,
+            request.expected_generation,
+        )
+        .context("skill_health_binding_mismatch")?;
+    let receipt = SkillHealthReceiptV1 {
+        schema_version: SKILL_HEALTH_IPC_SCHEMA_VERSION,
+        request_id: request.request_id,
+        release_id: request.release_id,
+        lineage: request.lineage,
+        expected_revision_id: request.expected_revision_id.clone(),
+        observed_revision_id: stable.revision_id,
+        expected_generation: request.expected_generation,
+        observed_generation: stable.generation,
+        result: entry.result.clone(),
+    };
+    receipt.validate().context("skill_receipt_invalid")?;
+    Ok(receipt)
 }
 
 /// 执行受信 Context Fixture 加载、八指标 Gate、正式 Archive 与 Seal 提交。
@@ -658,6 +870,15 @@ fn stable_error_code(error: &anyhow::Error) -> &'static str {
             "promotion_failed" => return "promotion_failed",
             "rollback_failed" => return "rollback_failed",
             "health_check_failed" => return "health_check_failed",
+            "skill_request_invalid" => return "skill_request_invalid",
+            "skill_registry_invalid" | "skill_registry_binding_mismatch" => {
+                return "skill_registry_invalid"
+            }
+            "skill_candidate_invalid" => return "skill_candidate_invalid",
+            "skill_episode_binding_invalid" => return "skill_episode_binding_invalid",
+            "skill_gate_failed" => return "skill_gate_failed",
+            "skill_health_binding_mismatch" => return "skill_health_binding_mismatch",
+            "skill_receipt_invalid" => return "skill_receipt_invalid",
             _ => {}
         }
     }
@@ -752,6 +973,50 @@ mod tests {
             .expect("context-evaluate 子命令应存在");
         assert!(matches!(args.command, Command::ContextEvaluate));
         assert!(Args::try_parse_from(["lucia-eval", "context-evaluate", "/tmp/forged"]).is_err());
+    }
+
+    /// Skill Evaluate/Health 必须是无自由参数的显式受限子命令。
+    #[test]
+    fn parses_explicit_skill_commands() {
+        let evaluate = Args::try_parse_from(["lucia-eval", "skill-evaluate"])
+            .expect("skill-evaluate 子命令应存在");
+        assert!(matches!(evaluate.command, Command::SkillEvaluate));
+        let health = Args::try_parse_from(["lucia-eval", "skill-health"])
+            .expect("skill-health 子命令应存在");
+        assert!(matches!(health.command, Command::SkillHealth));
+        assert!(Args::try_parse_from(["lucia-eval", "skill-evaluate", "/tmp/forged"]).is_err());
+        assert!(Args::try_parse_from(["lucia-eval", "skill-health", "/tmp/forged"]).is_err());
+    }
+
+    /// Skill Evaluate stdin 不得携带观察、授权、Registry 或 Gate Policy。
+    #[test]
+    fn skill_request_rejects_control_plane_fields() {
+        let base = serde_json::json!({
+            "schema_version": SKILL_EVALUATION_IPC_SCHEMA_VERSION,
+            "request_id": "skill-evaluate-request-01",
+            "candidate_id": agent_evolution_protocol::CandidateId::generate(),
+            "candidate_revision_id": GenomeRevisionId::generate(),
+            "candidate_genome_digest": agent_evolution_protocol::GenomeDigest::from_sha256_hex("a".repeat(64))
+                .expect("摘要应合法"),
+            "candidate_artifact": {
+                "digest": ArtifactDigest::from_sha256_hex("b".repeat(64)).expect("摘要应合法"),
+                "media_type": agent_evolution_protocol::SKILL_CANDIDATE_SNAPSHOT_MEDIA_TYPE,
+                "size_bytes": 128,
+            },
+            "evaluated_at_ms": 10,
+            "activated_at_ms": 20,
+        });
+        for field in [
+            "observations",
+            "authorization",
+            "trusted_usage_bindings",
+            "registry_root",
+            "gate_policy",
+        ] {
+            let mut value = base.clone();
+            value[field] = serde_json::json!("forged");
+            assert!(serde_json::from_value::<SkillEvaluationRequestV1>(value).is_err());
+        }
     }
 
     /// Health stdin 只能声明 Release 绑定，不能携带观察 Store 或 Stable 路径。

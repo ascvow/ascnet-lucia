@@ -4,11 +4,13 @@
 //! Policy、Release Store 与权限上限均由受信 `lucia-eval` 进程配置，不能通过 IPC 覆盖。
 
 use crate::{
-    ArtifactDigest, AuditRecordId, ContextPolicyEvaluationReportV1, DatasetVersionId,
-    EvaluationReportId, EvolutionLifecycle, GateDecision, GenomeRevisionId, ReleaseId,
+    ArtifactDigest, ArtifactRef, AuditRecordId, CandidateId, ContextPolicyEvaluationReportV1,
+    DatasetVersionId, EvaluationReportId, EvolutionLifecycle, GateDecision, GenomeDigest,
+    GenomeRevision, GenomeRevisionId, ReleaseId, SkillCandidateV1, SkillId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use std::collections::BTreeMap;
 
 /// 当前 Evaluator 请求协议版本；Evaluate、Promote、Health 与 Rollback 共用该严格版本。
 pub const EVALUATION_REQUEST_SCHEMA_VERSION: u32 = 1;
@@ -16,6 +18,13 @@ pub const EVALUATION_REQUEST_SCHEMA_VERSION: u32 = 1;
 pub const EVALUATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
 /// 当前 Context Evaluation Receipt 协议版本。
 pub const CONTEXT_EVALUATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
+/// 当前 Skill Evaluation 请求与回执协议版本。
+pub const SKILL_EVALUATION_IPC_SCHEMA_VERSION: u32 = 1;
+/// 当前 Skill Health 请求与回执协议版本。
+pub const SKILL_HEALTH_IPC_SCHEMA_VERSION: u32 = 1;
+/// Skill Candidate 规范 JSON 快照的固定 Artifact CAS 媒体类型。
+pub const SKILL_CANDIDATE_SNAPSHOT_MEDIA_TYPE: &str =
+    "application/vnd.ascnet.lucia.skill-candidate.v1+json";
 /// 当前 Health Receipt 协议版本。
 pub const HEALTH_RECEIPT_SCHEMA_VERSION: u32 = 1;
 /// 当前 Release Receipt 协议版本。
@@ -118,6 +127,275 @@ impl ContextEvaluationRequestV1 {
             expected_parent_generation: self.expected_parent_generation,
             expected_dataset_version: self.expected_fixture_version.clone(),
         }
+    }
+}
+
+/// Evolver 提交给独立 Skill Evaluator 的最小请求。
+///
+/// Candidate 正文只通过不可变 Artifact CAS 引用传递。使用观察、Episode/Run/Skill 绑定、
+/// 激活授权、Gate Policy 和存储路径必须由 Evaluator 的受信 Registry 配置提供。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillEvaluationRequestV1 {
+    /// 请求 schema 版本。
+    pub schema_version: u32,
+    /// 调用方生成的稳定幂等标识。
+    pub request_id: String,
+    /// 待评测 Candidate 的强类型身份。
+    pub candidate_id: CandidateId,
+    /// Candidate Genome 修订，用于拒绝同一 Candidate ID 的修订错绑。
+    pub candidate_revision_id: GenomeRevisionId,
+    /// Candidate Genome 行为摘要，用于拒绝 Store 中的内容替换。
+    pub candidate_genome_digest: GenomeDigest,
+    /// Candidate 规范 JSON 在共享 Artifact CAS 中的不可变引用。
+    pub candidate_artifact: ArtifactRef,
+    /// Gate 写入 Evaluated 状态的可信时间。
+    pub evaluated_at_ms: u64,
+    /// Gate 写入 Active 状态的可信时间。
+    pub activated_at_ms: u64,
+}
+
+impl SkillEvaluationRequestV1 {
+    /// 校验版本、请求 ID、Candidate 媒体类型和 Q→E→A 时间顺序。
+    ///
+    /// # Errors
+    ///
+    /// 请求版本、短标识、Artifact 引用或时间顺序无效时返回 [`InvalidEvaluatorIpc`]。
+    pub fn validate(&self) -> Result<(), InvalidEvaluatorIpc> {
+        if self.schema_version != SKILL_EVALUATION_IPC_SCHEMA_VERSION {
+            return Err(InvalidEvaluatorIpc::UnsupportedSkillEvaluationSchema {
+                found: self.schema_version,
+                supported: SKILL_EVALUATION_IPC_SCHEMA_VERSION,
+            });
+        }
+        validate_request_id(&self.request_id)?;
+        validate_artifact_ref(&self.candidate_artifact)?;
+        if self.candidate_artifact.media_type != SKILL_CANDIDATE_SNAPSHOT_MEDIA_TYPE {
+            return Err(InvalidEvaluatorIpc::InvalidSkillCandidateArtifact);
+        }
+        if self.evaluated_at_ms == 0 || self.activated_at_ms <= self.evaluated_at_ms {
+            return Err(InvalidEvaluatorIpc::InvalidSkillEvaluationTime);
+        }
+        Ok(())
+    }
+}
+
+/// 独立 Skill Evaluator 的脱敏 Gate 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SkillEvaluationOutcomeV1 {
+    /// Gate 拒绝 Candidate，但正式报告仍保留在 Artifact CAS。
+    Rejected {
+        /// 正式评测报告。
+        report_id: EvaluationReportId,
+        /// 报告的不可变 CAS 引用。
+        report_artifact: ArtifactRef,
+    },
+    /// Gate 完成 Q→E→A，并返回后续 Active Genome。
+    Promoted {
+        /// 已绑定正式报告的 Candidate 快照。
+        evaluated_candidate: Box<SkillCandidateV1>,
+        /// 正式评测报告。
+        report_id: EvaluationReportId,
+        /// 报告的不可变 CAS 引用。
+        report_artifact: ArtifactRef,
+        /// 每个变更 Skill 的 Active 制品引用。
+        active_skill_artifacts: BTreeMap<SkillId, ArtifactRef>,
+        /// 只替换 Active Skill Set 的后续 Serve Genome。
+        active_genome: Box<GenomeRevision>,
+        /// 不含正文的授权证据 ID。
+        authorization_evidence_id: String,
+        /// 受信授权是否允许生产 Stable 发布。
+        production_permitted: bool,
+    },
+}
+
+/// 独立 Skill Evaluator 返回的严格绑定回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillEvaluationReceiptV1 {
+    /// 回执 schema 版本。
+    pub schema_version: u32,
+    /// 对应请求的幂等 ID。
+    pub request_id: String,
+    /// 对应 Candidate。
+    pub candidate_id: CandidateId,
+    /// 独立 Gate 结果。
+    pub result: SkillEvaluationOutcomeV1,
+}
+
+impl SkillEvaluationReceiptV1 {
+    /// 校验回执版本、请求 ID、报告制品和 Promotion 主体的局部结构。
+    ///
+    /// # Errors
+    ///
+    /// 版本、标识、Artifact、Candidate、Genome 或授权字段无效时返回
+    /// [`InvalidEvaluatorIpc`]。
+    pub fn validate(&self) -> Result<(), InvalidEvaluatorIpc> {
+        if self.schema_version != SKILL_EVALUATION_IPC_SCHEMA_VERSION {
+            return Err(InvalidEvaluatorIpc::UnsupportedSkillEvaluationSchema {
+                found: self.schema_version,
+                supported: SKILL_EVALUATION_IPC_SCHEMA_VERSION,
+            });
+        }
+        validate_request_id(&self.request_id)?;
+        match &self.result {
+            SkillEvaluationOutcomeV1::Rejected {
+                report_artifact, ..
+            } => validate_artifact_ref(report_artifact),
+            SkillEvaluationOutcomeV1::Promoted {
+                evaluated_candidate,
+                report_artifact,
+                active_skill_artifacts,
+                active_genome,
+                authorization_evidence_id,
+                ..
+            } => {
+                validate_artifact_ref(report_artifact)?;
+                evaluated_candidate
+                    .validate()
+                    .map_err(|error| InvalidEvaluatorIpc::InvalidSkillPayload(error.to_string()))?;
+                if evaluated_candidate.candidate_id != self.candidate_id {
+                    return Err(InvalidEvaluatorIpc::SkillReceiptCandidateMismatch);
+                }
+                active_genome
+                    .validate()
+                    .map_err(|error| InvalidEvaluatorIpc::InvalidSkillPayload(error.to_string()))?;
+                if active_skill_artifacts.is_empty()
+                    || active_skill_artifacts
+                        .values()
+                        .any(|artifact| validate_artifact_ref(artifact).is_err())
+                    || !valid_control_id(authorization_evidence_id)
+                {
+                    return Err(InvalidEvaluatorIpc::InvalidSkillPayload(
+                        "Skill Promotion 回执字段无效".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Evolver 请求独立控制面复核 Skill Promotion 健康状态的最小请求。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillHealthRequestV1 {
+    /// 请求 schema 版本。
+    pub schema_version: u32,
+    /// 调用方生成的稳定幂等标识。
+    pub request_id: String,
+    /// 被复核的 Promotion Release。
+    pub release_id: ReleaseId,
+    /// Stable lineage。
+    pub lineage: String,
+    /// 期望已发布的 Genome Revision。
+    pub expected_revision_id: GenomeRevisionId,
+    /// 期望的 Stable 代数。
+    pub expected_generation: u64,
+}
+
+impl SkillHealthRequestV1 {
+    /// 校验请求版本、短标识、lineage 和代数。
+    ///
+    /// # Errors
+    ///
+    /// 任一局部结构无效时返回 [`InvalidEvaluatorIpc`]。
+    pub fn validate(&self) -> Result<(), InvalidEvaluatorIpc> {
+        if self.schema_version != SKILL_HEALTH_IPC_SCHEMA_VERSION {
+            return Err(InvalidEvaluatorIpc::UnsupportedSkillHealthSchema {
+                found: self.schema_version,
+                supported: SKILL_HEALTH_IPC_SCHEMA_VERSION,
+            });
+        }
+        validate_request_id(&self.request_id)?;
+        validate_lineage(&self.lineage)?;
+        if self.expected_generation == 0 {
+            return Err(InvalidEvaluatorIpc::InvalidGeneration);
+        }
+        Ok(())
+    }
+}
+
+/// Skill 健康复核的受信结论。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SkillHealthStatusV1 {
+    /// Promotion 后运行健康。
+    Healthy {
+        /// 不含用户正文的健康证据 ID。
+        evidence_id: String,
+    },
+    /// Promotion 后运行不健康。
+    Unhealthy {
+        /// 不含用户正文的健康证据 ID。
+        evidence_id: String,
+        /// 稳定失败码。
+        reason_code: String,
+    },
+}
+
+impl SkillHealthStatusV1 {
+    /// 校验健康证据 ID 与可选失败码均为有限控制面标识。
+    ///
+    /// # Errors
+    ///
+    /// 任一字段为空、过长或包含路径字符时返回 [`InvalidEvaluatorIpc`]。
+    pub fn validate(&self) -> Result<(), InvalidEvaluatorIpc> {
+        match self {
+            Self::Healthy { evidence_id } if valid_control_id(evidence_id) => Ok(()),
+            Self::Unhealthy {
+                evidence_id,
+                reason_code,
+            } if valid_control_id(evidence_id) && valid_control_id(reason_code) => Ok(()),
+            _ => Err(InvalidEvaluatorIpc::InvalidSkillHealthVerdict),
+        }
+    }
+}
+
+/// 独立 Skill 健康控制面返回的严格绑定回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillHealthReceiptV1 {
+    /// 回执 schema 版本。
+    pub schema_version: u32,
+    /// 对应请求 ID。
+    pub request_id: String,
+    /// 被复核的 Promotion Release。
+    pub release_id: ReleaseId,
+    /// Stable lineage。
+    pub lineage: String,
+    /// 请求期望的 Revision。
+    pub expected_revision_id: GenomeRevisionId,
+    /// 控制面实际读取到的 Revision。
+    pub observed_revision_id: GenomeRevisionId,
+    /// 请求期望的代数。
+    pub expected_generation: u64,
+    /// 控制面实际读取到的代数。
+    pub observed_generation: u64,
+    /// 受信健康结论。
+    pub result: SkillHealthStatusV1,
+}
+
+impl SkillHealthReceiptV1 {
+    /// 校验回执版本、身份、代数与有限健康标识。
+    ///
+    /// # Errors
+    ///
+    /// 版本、请求绑定或健康标识无效时返回 [`InvalidEvaluatorIpc`]。
+    pub fn validate(&self) -> Result<(), InvalidEvaluatorIpc> {
+        if self.schema_version != SKILL_HEALTH_IPC_SCHEMA_VERSION {
+            return Err(InvalidEvaluatorIpc::UnsupportedSkillHealthSchema {
+                found: self.schema_version,
+                supported: SKILL_HEALTH_IPC_SCHEMA_VERSION,
+            });
+        }
+        validate_request_id(&self.request_id)?;
+        validate_lineage(&self.lineage)?;
+        if self.expected_generation == 0 || self.observed_generation == 0 {
+            return Err(InvalidEvaluatorIpc::InvalidGeneration);
+        }
+        self.result.validate()
     }
 }
 
@@ -517,6 +795,22 @@ pub enum InvalidEvaluatorIpc {
         /// 当前版本。
         supported: u32,
     },
+    /// Skill Evaluation 请求或回执 schema 不受支持。
+    #[error("不支持的 Skill Evaluation IPC schema 版本 {found}，当前支持 {supported}")]
+    UnsupportedSkillEvaluationSchema {
+        /// 实际版本。
+        found: u32,
+        /// 当前版本。
+        supported: u32,
+    },
+    /// Skill Health 请求或回执 schema 不受支持。
+    #[error("不支持的 Skill Health IPC schema 版本 {found}，当前支持 {supported}")]
+    UnsupportedSkillHealthSchema {
+        /// 实际版本。
+        found: u32,
+        /// 当前版本。
+        supported: u32,
+    },
     /// Health Receipt 使用了当前实现无法解释的版本。
     #[error("不支持的 Health Receipt schema 版本 {found}，当前支持 {supported}")]
     UnsupportedHealthReceiptSchema {
@@ -568,6 +862,24 @@ pub enum InvalidEvaluatorIpc {
     /// Context Gate 决策与正式报告生命周期不一致。
     #[error("Context Evaluation Receipt 的 Gate 决策与生命周期不一致")]
     InconsistentContextLifecycle,
+    /// Skill Candidate 快照不是固定媒体类型或引用为空。
+    #[error("Skill Candidate Artifact 引用无效")]
+    InvalidSkillCandidateArtifact,
+    /// Skill Evaluation 的 Evaluated/Active 时间顺序无效。
+    #[error("Skill Evaluation 的 Q→E→A 时间顺序无效")]
+    InvalidSkillEvaluationTime,
+    /// Skill IPC 携带的协议主体无效。
+    #[error("Skill IPC 主体无效：{0}")]
+    InvalidSkillPayload(String),
+    /// Skill Promotion 回执内部 Candidate 与外层身份不一致。
+    #[error("Skill Evaluation Receipt 的 Candidate 身份错绑")]
+    SkillReceiptCandidateMismatch,
+    /// Stable 代数不能为零。
+    #[error("Evaluator IPC 的 Stable 代数无效")]
+    InvalidGeneration,
+    /// Skill 健康结论缺少稳定证据 ID 或失败码。
+    #[error("Skill Health 回执结论无效")]
+    InvalidSkillHealthVerdict,
     /// 稳定版本或摘要字段为空或超过字节上限。
     #[error("Evaluator IPC 字段 `{field}` 必须是非空且不超过 {max_bytes} 字节的文本")]
     InvalidText {
@@ -626,6 +938,27 @@ fn validate_lineage(value: &str) -> Result<(), InvalidEvaluatorIpc> {
         return Err(InvalidEvaluatorIpc::InvalidLineage);
     }
     Ok(())
+}
+
+/// 校验 Artifact 引用具有有限媒体类型和非零长度。
+fn validate_artifact_ref(value: &ArtifactRef) -> Result<(), InvalidEvaluatorIpc> {
+    if value.size_bytes == 0
+        || value.media_type.trim().is_empty()
+        || value.media_type.len() > MAX_POLICY_VERSION_BYTES
+        || value.media_type.chars().any(char::is_control)
+    {
+        return Err(InvalidEvaluatorIpc::InvalidSkillCandidateArtifact);
+    }
+    Ok(())
+}
+
+/// 校验控制面证据短标识，禁止路径和用户正文。
+fn valid_control_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REQUEST_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// 校验不包含用户内容的有界稳定文本。
@@ -704,6 +1037,71 @@ mod tests {
             fixture_version: DatasetVersionId::generate(),
             context_report,
             lifecycle: EvolutionLifecycle::Eligible,
+        }
+    }
+
+    /// Skill 评测请求只允许强类型身份、Candidate CAS 和时间前置条件。
+    #[test]
+    fn skill_evaluation_request_is_strict_and_identity_bound() {
+        let request = SkillEvaluationRequestV1 {
+            schema_version: SKILL_EVALUATION_IPC_SCHEMA_VERSION,
+            request_id: "skill-evaluate-candidate-01".into(),
+            candidate_id: CandidateId::generate(),
+            candidate_revision_id: GenomeRevisionId::generate(),
+            candidate_genome_digest: GenomeDigest::from_sha256_hex("9".repeat(64))
+                .expect("测试 Genome 摘要应合法"),
+            candidate_artifact: ArtifactRef {
+                digest: digest('8'),
+                media_type: SKILL_CANDIDATE_SNAPSHOT_MEDIA_TYPE.into(),
+                size_bytes: 128,
+            },
+            evaluated_at_ms: 10,
+            activated_at_ms: 20,
+        };
+        request.validate().expect("Skill 评测请求应合法");
+        let encoded = serde_json::to_value(&request).expect("请求应可序列化");
+        assert_eq!(
+            serde_json::from_value::<SkillEvaluationRequestV1>(encoded.clone())
+                .expect("请求应可反序列化"),
+            request
+        );
+        for field in [
+            "observations",
+            "trusted_usage_bindings",
+            "authorization",
+            "registry_root",
+            "episode_store_root",
+            "gate_policy",
+        ] {
+            let mut unknown = encoded.clone();
+            unknown[field] = serde_json::json!("candidate-controlled");
+            assert!(serde_json::from_value::<SkillEvaluationRequestV1>(unknown).is_err());
+        }
+        let mut invalid = request;
+        invalid.candidate_artifact.media_type = "application/json".into();
+        assert_eq!(
+            invalid.validate(),
+            Err(InvalidEvaluatorIpc::InvalidSkillCandidateArtifact)
+        );
+    }
+
+    /// Skill 健康请求不得携带健康结论、Store 路径或回滚操作。
+    #[test]
+    fn skill_health_request_rejects_control_plane_fields() {
+        let request = SkillHealthRequestV1 {
+            schema_version: SKILL_HEALTH_IPC_SCHEMA_VERSION,
+            request_id: "skill-health-release-01".into(),
+            release_id: ReleaseId::generate(),
+            lineage: "production".into(),
+            expected_revision_id: GenomeRevisionId::generate(),
+            expected_generation: 2,
+        };
+        request.validate().expect("Skill 健康请求应合法");
+        let encoded = serde_json::to_value(request).expect("请求应可序列化");
+        for field in ["result", "health_store_root", "stable_path", "rollback"] {
+            let mut unknown = encoded.clone();
+            unknown[field] = serde_json::json!("candidate-controlled");
+            assert!(serde_json::from_value::<SkillHealthRequestV1>(unknown).is_err());
         }
     }
 

@@ -6,8 +6,11 @@
 
 use agent_evolution::{
     ContextEvolutionCycle, ContextEvolutionCycleRequestV1, ContextEvolutionCycleSnapshotV1,
-    DeterministicPromptMutationGenerator, EvolutionCycleStore, FileContextCycleArchive,
-    FileEvolutionCycleStore, LuciaEvalProcessClient, PromptEvolutionCycle,
+    DeterministicPromptMutationGenerator, DeterministicSkillMutationGenerator, EpisodeSelector,
+    EvolutionCycleStore, EvolutionOutbox, FileContextCycleArchive, FileEpisodeStore,
+    FileEvolutionCycleStore, FileEvolutionOutbox, FileIssueObservationStore,
+    LuciaEvalProcessClient, LuciaEvalSkillProcessClient, PromptEvolutionCycle,
+    SkillEvolutionArchiveV1, SkillEvolutionCycle, SkillEvolutionCycleRequestV1,
 };
 use agent_evolution_protocol::{
     DatasetVersionId, EvolutionCycleId, EvolutionCycleRequestV1, EvolutionCycleSnapshotV1,
@@ -18,7 +21,8 @@ use std::{
     env,
     ffi::OsString,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -63,6 +67,8 @@ enum Command {
     },
     /// 从 stdin 读取 ContextEvolutionCycleRequestV1 并执行完整 Context Cycle。
     ContextCycle,
+    /// 从 stdin 读取 SkillEvolutionCycleRequestV1 并执行完整 Skill Cycle。
+    SkillCycle,
     /// 读取并验证指定 Context Cycle 的完整只追加快照历史。
     ContextInspect {
         /// 需要检查的强类型 Context Cycle 标识。
@@ -156,6 +162,10 @@ async fn dispatch(command: Command) -> Result<(), FailureCode> {
             let snapshot = execute_context_cycle().await?;
             write_receipt(&snapshot)
         }
+        Command::SkillCycle => {
+            let archive = execute_skill_cycle().await?;
+            write_receipt(&archive)
+        }
         Command::ContextInspect { cycle_id } => {
             let history = execute_context_inspect(&cycle_id).await?;
             write_receipt(&history)
@@ -165,6 +175,51 @@ async fn dispatch(command: Command) -> Result<(), FailureCode> {
             write_receipt(&snapshot)
         }
     }
+}
+
+/// 从固定 Store 恢复唯一证据、执行 Skill Cycle，并在归档成功后消费对应 Outbox。
+async fn execute_skill_cycle() -> Result<SkillEvolutionArchiveV1, FailureCode> {
+    let request: SkillEvolutionCycleRequestV1 = read_json_request()?;
+    request
+        .validate()
+        .map_err(|_| FailureCode::RequestInvalid)?;
+    let evolution_root = evolution_root()?;
+    let evidence = EpisodeSelector::new(
+        Arc::new(FileEvolutionOutbox::new(evolution_root.join("outbox"))),
+        Arc::new(FileEpisodeStore::new(evolution_root.join("episodes"))),
+        Arc::new(FileIssueObservationStore::new(
+            evolution_root.join("issue-observations"),
+        )),
+    )
+    .select()
+    .await
+    .map_err(|_| FailureCode::Cycle("skill_evidence_selection_failed"))?
+    .into_iter()
+    .filter(|evidence| evidence.genome_digest == request.parent_genome_digest)
+    .collect::<Vec<_>>();
+    if evidence.len() != 1 {
+        return Err(FailureCode::Cycle("skill_evidence_not_unique"));
+    }
+    let evaluator = skill_evaluator_client(&evolution_root)?;
+    let result = SkillEvolutionCycle::new(
+        &evolution_root,
+        DeterministicSkillMutationGenerator,
+        evaluator,
+    )
+    .run(&request, &evidence[0])
+    .await
+    .map_err(|error| FailureCode::Cycle(error.code()))?;
+    let outbox = FileEvolutionOutbox::new(evolution_root.join("outbox"));
+    for episode in &evidence[0].episodes {
+        let consumed = outbox
+            .mark_consumed(&episode.outbox_id)
+            .await
+            .map_err(|_| FailureCode::Cycle("skill_outbox_consume_failed"))?;
+        if !consumed {
+            return Err(FailureCode::Cycle("skill_outbox_consume_failed"));
+        }
+    }
+    Ok(result.archive)
 }
 
 /// 校验 Context Cycle 请求，并通过固定 Mutator 和独立 Evaluator 执行生产闭环。
@@ -266,6 +321,19 @@ fn evaluator_client() -> Result<LuciaEvalProcessClient, FailureCode> {
     let value = env::var_os(EVALUATOR_BIN_ENV).ok_or(FailureCode::EvaluatorConfigInvalid)?;
     let executable = validate_evaluator_path(value)?;
     Ok(LuciaEvalProcessClient::new(executable, EVALUATOR_TIMEOUT))
+}
+
+/// 从固定环境变量装配共享 Artifact CAS 的 Skill Evaluator 客户端。
+fn skill_evaluator_client(
+    evolution_root: &Path,
+) -> Result<LuciaEvalSkillProcessClient, FailureCode> {
+    let value = env::var_os(EVALUATOR_BIN_ENV).ok_or(FailureCode::EvaluatorConfigInvalid)?;
+    let executable = validate_evaluator_path(value)?;
+    Ok(LuciaEvalSkillProcessClient::new(
+        executable,
+        EVALUATOR_TIMEOUT,
+        evolution_root,
+    ))
 }
 
 /// 从固定环境变量读取绝对 Evolution 数据根。
@@ -425,10 +493,53 @@ mod tests {
         }
     }
 
+    /// Skill Cycle stdin 只允许身份、Stable 前置条件和生命周期时间。
+    #[test]
+    fn skill_cycle_request_rejects_control_plane_fields() {
+        let base = serde_json::json!({
+            "cycle_id": EvolutionCycleId::generate(),
+            "parent_revision_id": GenomeRevisionId::generate(),
+            "parent_genome_digest": GenomeDigest::from_sha256_hex("a".repeat(64))
+                .expect("摘要应合法"),
+            "lineage": "production",
+            "expected_parent_generation": 1,
+            "mutation_generated_at_ms": 10,
+            "candidate_created_at_ms": 20,
+            "evaluated_at_ms": 30,
+            "activated_at_ms": 40,
+        });
+        for field in [
+            "observations",
+            "authorization",
+            "registry_root",
+            "episode_store_root",
+            "gate_policy",
+            "health_verdict",
+        ] {
+            let mut value = base.clone();
+            value[field] = serde_json::json!("forged");
+            assert_eq!(
+                read_json_request_from::<SkillEvolutionCycleRequestV1, _>(
+                    value.to_string().as_bytes()
+                ),
+                Err(FailureCode::RequestInvalid)
+            );
+        }
+        let parsed = Args::try_parse_from(["lucia-evolve", "skill-cycle"])
+            .expect("skill-cycle 子命令应存在");
+        assert!(matches!(parsed.command, Command::SkillCycle));
+    }
+
     /// 普通 Evolver 不得暴露绕过 Cycle 状态机的低层 Evaluator 子命令。
     #[test]
     fn cli_rejects_low_level_evaluator_commands() {
-        for command in ["evaluate", "promote", "rollback"] {
+        for command in [
+            "evaluate",
+            "promote",
+            "rollback",
+            "skill-evaluate",
+            "skill-health",
+        ] {
             assert!(Args::try_parse_from(["lucia-evolve", command]).is_err());
         }
     }
