@@ -8,9 +8,9 @@ description = "Lucia Agent 与插件的真实模型分级测试运行器。"
 
 [dependencies]
 anyhow = "1"
-agent-core = { path = "../../crates/agent-core" }
-agent-plugin-host = { path = "../../crates/agent-plugin-host" }
-agent-tool = { path = "../../crates/agent-tool", default-features = false }
+agent-core = { path = "../../crates/agent-core/kernel" }
+agent-plugin-host = { path = "../../crates/agent-plugins/host" }
+agent-tool = { path = "../../crates/agent-core/tool", default-features = false }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

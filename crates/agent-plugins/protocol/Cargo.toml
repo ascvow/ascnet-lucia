@@ -1,0 +1,12 @@
+[package]
+name = "agent-plugin-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Lucia 插件 Host、Guest SDK 与应用共享的宿主无关协议。"
+
+[dependencies]
+agent-tool = { path = "../../agent-core/tool", default-features = false }
+serde.workspace = true
+serde_json.workspace = true

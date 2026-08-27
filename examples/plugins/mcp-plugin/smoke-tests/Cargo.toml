@@ -7,8 +7,8 @@ license = "MIT"
 description = "通用 MCP 插件的独立端到端测试。"
 
 [dev-dependencies]
-agent-core = { path = "../../../../crates/agent-core", default-features = false }
-agent-plugin-host = { path = "../../../../crates/agent-plugin-host" }
-agent-tool = { path = "../../../../crates/agent-tool", default-features = false }
+agent-core = { path = "../../../../crates/agent-core/kernel", default-features = false }
+agent-plugin-host = { path = "../../../../crates/agent-plugins/host" }
+agent-tool = { path = "../../../../crates/agent-core/tool", default-features = false }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

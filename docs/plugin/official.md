@@ -18,7 +18,7 @@ lucia plugin install mcp
 
 Context 是 TUI 默认原生能力，不经过 Plugin Host，也不需要安装 bundle。它在约 120k token 时静默清理旧工具结果，在约 167k token 时额外调用一次应用固定路由的模型，把较旧 API 轮次替换为结构化摘要并保留近期完整轮次；`[1m]` 模型使用对应的百万上下文水位。原生 `/compact` 命令会立即调用同一模型摘要流程，成功持久化压缩结果后当场替换当前 Session，不需要再发送一条消息。
 
-Evidence 运行从 Genome 固定的 Artifact CAS 装配 Context Policy，策略 owner 固定为 `native-context`。实现位于 `crates/agent-context`，默认插件版与 `--no-default-features` 纯 Core 版行为一致。
+Evidence 运行从 Genome 固定的 Artifact CAS 装配 Context Policy，策略 owner 固定为 `native-context`。实现位于 `crates/agent-core/context`，默认插件版与 `--no-default-features` 纯 Core 版行为一致。
 
 ## MCP
 
@@ -37,7 +37,7 @@ Skill 是 TUI 默认原生能力，不经过 Plugin Host，也不需要安装 bu
 
 Evidence 运行不扫描可变目录，而是从 Genome 固定的 Artifact CAS 装配 Skill。Serve 只接受 Active 制品，Evaluation 可接受 Quarantined、Evaluated 或 Active 候选；可信使用证据来自 Core 注入的原生 `tool_finished` 事件。
 
-实现位于 `crates/agent-skill`，默认插件版与 `--no-default-features` 纯 Core 版行为一致。
+实现位于 `crates/agent-core/skill`，默认插件版与 `--no-default-features` 纯 Core 版行为一致。
 
 ## 原生 Command
 

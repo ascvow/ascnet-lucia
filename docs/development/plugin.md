@@ -28,7 +28,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-agent-plugin = { path = "../../../crates/agent-plugin" }
+agent-plugin = { path = "../../../crates/agent-plugins/sdk" }
 serde_json = "1"
 wit-bindgen = "0.59"
 ```

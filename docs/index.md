@@ -52,7 +52,7 @@ Lucia 同时提供可直接使用的终端 Agent 和可嵌入、可扩展的 Rus
 | 最小 ReAct 与原生工具 | `examples/basic-cli` |
 | 最小 WASM 工具插件 | `examples/plugins/echo-plugin` |
 | stdio MCP | `examples/plugins/mcp-plugin` |
-| Skill 按需加载 | `crates/agent-skill` |
+| Skill 按需加载 | `crates/agent-core/skill` |
 | 命令与 Dialog | `crates/agent-tui/src/native_command.rs` |
 | Agent 派生与续跑 | `examples/plugins/agent-runtime-plugin` |
 | 多 Agent 协作 | `examples/plugins/teammate-plugin` |
