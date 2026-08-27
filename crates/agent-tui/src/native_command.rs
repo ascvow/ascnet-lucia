@@ -37,8 +37,8 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
     NativeCommandSpec {
         name: "sessions",
         aliases: &[],
-        summary: "浏览项目会话",
-        description: "以只读方式打开当前项目的会话摘要列表。",
+        summary: "切换项目会话",
+        description: "打开当前项目的会话摘要列表，并切换至选中的完整会话。",
         idle_only: true,
     },
     NativeCommandSpec {
@@ -71,12 +71,12 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
     },
 ];
 
-/// 会话对话框的用途；浏览模式不允许恢复会话。
+/// 会话对话框的入口用途；两种模式都允许切换至选中的会话。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeSessionDialogMode {
     /// 选择后恢复完整会话。
     Resume,
-    /// 只读浏览摘要。
+    /// 从项目会话列表浏览并切换。
     Browse,
 }
 
@@ -202,6 +202,11 @@ impl App {
                 true
             }
             KeyCode::Enter => {
+                if !matches.is_empty() {
+                    let selected = self.native_command.selected.min(matches.len() - 1);
+                    self.input = format!("/{}", matches[selected].name);
+                    self.cursor = self.input.len();
+                }
                 self.execute_native_command();
                 true
             }
@@ -356,7 +361,7 @@ impl App {
             KeyCode::Down if item_count > 0 => {
                 dialog.selected = (dialog.selected + 1) % item_count;
             }
-            KeyCode::Enter if item_count > 0 && dialog.mode == NativeSessionDialogMode::Resume => {
+            KeyCode::Enter if item_count > 0 => {
                 let NativeSessionDialogStatus::Ready(items) = &dialog.status else {
                     unreachable!("会话数量只会来自 Ready 状态");
                 };
@@ -509,7 +514,7 @@ pub(crate) fn render_native_session_dialog(frame: &mut Frame, app: &App, outer: 
     };
     let footer = match dialog.mode {
         NativeSessionDialogMode::Resume => " ↑↓ 选择 · Enter 恢复 · Esc 关闭 ",
-        NativeSessionDialogMode::Browse => " ↑↓ 浏览 · Esc 关闭 ",
+        NativeSessionDialogMode::Browse => " ↑↓ 选择 · Enter 切换 · Esc 关闭 ",
     };
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -560,7 +565,7 @@ mod tests {
         );
     }
 
-    /// 命令补全必须由原生状态机完成，并替换为规范命令名。
+    /// Tab 必须只补全规范命令名，不能提前执行命令。
     #[test]
     fn native_completion_replaces_input_without_plugin_host() {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -572,6 +577,51 @@ mod tests {
         assert!(app.handle_native_command_key(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.input, "/resume ");
         assert_eq!(app.cursor, app.input.len());
+        assert!(app.native_command.dialog.is_none());
+    }
+
+    /// Enter 必须立即执行当前高亮候选，而不是把命令缩写当作未知命令。
+    #[test]
+    fn native_completion_executes_selected_command_on_enter() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.input = "/h".into();
+        app.cursor = app.input.len();
+
+        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.input.is_empty());
+        assert_eq!(app.messages.len(), 1);
+        assert!(app.messages[0].text.contains("/help"));
+    }
+
+    /// `/sessions` 的浏览入口必须允许切换至当前高亮的精确会话修订。
+    #[test]
+    fn native_sessions_browse_switches_selected_session_on_enter() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        let session_id = SessionId::new("selected-session").expect("创建测试会话标识");
+        app.native_command.dialog = Some(NativeSessionDialog {
+            mode: NativeSessionDialogMode::Browse,
+            selected: 0,
+            status: NativeSessionDialogStatus::Ready(vec![SessionSummary {
+                id: session_id.clone(),
+                revision: 7,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+                title: Some("待切换会话".into()),
+                message_count: 3,
+            }]),
+        });
+
+        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.native_command.dialog.is_none());
+        assert!(matches!(
+            rx.try_recv().expect("应发送原生会话切换请求"),
+            UiEvent::NativeResumeRequested {
+                session_id: requested_id,
+                revision: 7,
+            } if requested_id == session_id
+        ));
     }
 
     /// `/compact` 在任何 feature 组合下都必须进入原生重载路径。
