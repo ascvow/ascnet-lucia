@@ -171,7 +171,7 @@ pub(crate) async fn drain_plugin_ui_events(
         if apply_plugin_navigation_event(app, &event)? {
             continue;
         }
-        if apply_plugin_host_action_event(app, plugin_host, &event).await? {
+        if apply_plugin_host_action_event(app, &event).await? {
             continue;
         }
         if let Some(message) = plugin_event_message(&event) {

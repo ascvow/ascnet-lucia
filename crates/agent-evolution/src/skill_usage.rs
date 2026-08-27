@@ -1,7 +1,7 @@
-//! 从真实 Episode 插件事件构造 M7 Skill 使用绑定。
+//! 从真实 Episode 原生工具终态构造 M7 Skill 使用绑定。
 //!
-//! Guest 只能发布“某 Skill 已加载”的弱事件；本模块重新加载只追加 Episode、Host 注入的
-//! 插件来源与 Genome 固定的 Active Skill CAS，随后才生成 Evaluator 可消费的可信绑定。
+//! `skill_read` 结果正文不构成成功证据；本模块重新加载只追加 Episode、Core 注入的
+//! `runtime_origin=native` 与 Genome 固定的 Skill CAS，随后才生成 Evaluator 可消费的绑定。
 
 use crate::skill_repository::{SkillArtifactRepository, SkillRepositoryError};
 use crate::{
@@ -10,30 +10,30 @@ use crate::{
 };
 use agent_evolution_protocol::{
     ArtifactDigest, EpisodeId, EventId, GenomeRevision, SkillArtifactV1, SkillId, SkillStatusV1,
-    TrustedPluginEventRefV1, TrustedSkillUsageBindingV1,
+    TrustedSkillToolEventRefV1, TrustedSkillUsageBindingV1,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-/// Skill Guest 发布、由 Host 包装可信插件来源的版本化使用事件名。
-pub const SKILL_LOADED_EVENT_V1: &str = "skill.loaded.v1";
-/// `skill.loaded.v1` 事件数据的结构版本。
-pub const SKILL_LOADED_EVENT_SCHEMA_VERSION: u32 = 1;
+/// Core 记录的原生 Skill 读取工具名。
+pub const NATIVE_SKILL_READ_TOOL: &str = "skill_read";
+/// `details.skill_usage` 的结构版本。
+pub const NATIVE_SKILL_USAGE_SCHEMA_VERSION: u32 = 1;
 /// 保存脱敏 Skill 使用事件 payload 的 CAS 媒体类型。
 pub const SKILL_USAGE_EVENT_MEDIA_TYPE: &str =
-    "application/vnd.ascnet.lucia.skill-usage-event.v1+json";
+    "application/vnd.ascnet.lucia.skill-usage-event.v2+json";
 
-/// 从可信 Episode 中提取全部真实 Skill 加载事件。
+/// 从可信 Episode 中提取全部真实原生 Skill 读取终态。
 ///
-/// 调用方必须传入 Resolver 已校验的同一 Genome 修订以及已绑定的唯一 Skill 插件 ID。
+/// 调用方必须传入 Resolver 已校验的同一 Genome 修订。
 /// 方法从 Genome 引用的真实 CAS 重新加载每份 Skill 制品，只允许终态为 `Active` 的制品；
-/// 随后要求事件来源由 Host 固定为该插件、事件中的 Skill ID 和摘要精确命中 Genome，并把
-/// 已脱敏 payload 写入 CAS。普通文本、其他插件事件和非 Skill 事件会被忽略。
+/// 随后要求事件由 Core 固定为原生 `skill_read`、Skill ID 和摘要精确命中 Genome，并把
+/// 已脱敏 payload 写入 CAS。普通文本和其他工具事件会被忽略。
 ///
 /// # Errors
 ///
-/// Episode 或 Genome 绑定不一致、Genome Skill 引用无效或非 Active、事件字段缺失或错绑、
+/// Episode 或 Genome 绑定不一致、Genome Skill 引用无效或非 Active、工具字段缺失或错绑、
 /// 事件序号溢出、payload 无法规范编码，或 Artifact CAS 读写失败时返回
 /// [`SkillUsageBindingError`]。任一目标事件无效时整体失败，不返回部分绑定。
 pub async fn collect_trusted_skill_usage_bindings(
@@ -41,14 +41,12 @@ pub async fn collect_trusted_skill_usage_bindings(
     artifacts: &FileArtifactStore,
     episode_id: &EpisodeId,
     genome: &GenomeRevision,
-    skill_plugin_id: &str,
 ) -> Result<BTreeMap<EventId, TrustedSkillUsageBindingV1>, SkillUsageBindingError> {
     collect_trusted_skill_usage_bindings_for_stage(
         episodes,
         artifacts,
         episode_id,
         genome,
-        skill_plugin_id,
         SkillBindingStage::Serve,
     )
     .await
@@ -63,21 +61,19 @@ pub async fn collect_trusted_skill_usage_bindings(
 ///
 /// # Errors
 ///
-/// Episode、Genome、插件来源、Skill 状态或 CAS 绑定不可信时返回
+/// Episode、Genome、工具来源、Skill 状态或 CAS 绑定不可信时返回
 /// [`SkillUsageBindingError`]，不会返回部分绑定。
 pub async fn collect_trusted_skill_evaluation_bindings(
     episodes: &dyn EpisodeStore,
     artifacts: &FileArtifactStore,
     episode_id: &EpisodeId,
     candidate_genome: &GenomeRevision,
-    skill_plugin_id: &str,
 ) -> Result<BTreeMap<EventId, TrustedSkillUsageBindingV1>, SkillUsageBindingError> {
     collect_trusted_skill_usage_bindings_for_stage(
         episodes,
         artifacts,
         episode_id,
         candidate_genome,
-        skill_plugin_id,
         SkillBindingStage::Evaluation,
     )
     .await
@@ -97,12 +93,8 @@ async fn collect_trusted_skill_usage_bindings_for_stage(
     artifacts: &FileArtifactStore,
     episode_id: &EpisodeId,
     genome: &GenomeRevision,
-    skill_plugin_id: &str,
     stage: SkillBindingStage,
 ) -> Result<BTreeMap<EventId, TrustedSkillUsageBindingV1>, SkillUsageBindingError> {
-    if skill_plugin_id.trim().is_empty() {
-        return Err(SkillUsageBindingError::EmptyPluginId);
-    }
     genome
         .validate()
         .map_err(|error| SkillUsageBindingError::InvalidGenome(error.to_string()))?;
@@ -114,34 +106,39 @@ async fn collect_trusted_skill_usage_bindings_for_stage(
     let skill_set = load_skill_set(artifacts, genome, stage).await?;
     let mut bindings = BTreeMap::new();
     for (index, event) in evidence.events.iter().enumerate() {
-        if event.kind != "extension"
+        if event.kind != "tool_finished"
             || event
                 .payload
                 .get("name")
                 .and_then(serde_json::Value::as_str)
-                != Some(SKILL_LOADED_EVENT_V1)
+                != Some(NATIVE_SKILL_READ_TOOL)
         {
             continue;
         }
-        let source_type = event
+        if event
             .payload
-            .pointer("/source/type")
-            .and_then(serde_json::Value::as_str);
-        let source_id = event
+            .get("runtime_origin")
+            .and_then(serde_json::Value::as_str)
+            != Some("native")
+        {
+            return Err(SkillUsageBindingError::UntrustedRuntimeOrigin);
+        }
+        if event
             .payload
-            .pointer("/source/id")
-            .and_then(serde_json::Value::as_str);
-        if source_type != Some("plugin") || source_id != Some(skill_plugin_id) {
-            return Err(SkillUsageBindingError::UntrustedPluginSource);
+            .get("is_error")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
         }
         let data = event
             .payload
-            .get("data")
-            .ok_or(SkillUsageBindingError::MissingEventData)?;
+            .pointer("/details/skill_usage")
+            .ok_or(SkillUsageBindingError::MissingSkillUsageDetails)?;
         let schema_version = data
             .get("schema_version")
             .and_then(serde_json::Value::as_u64);
-        if schema_version != Some(u64::from(SKILL_LOADED_EVENT_SCHEMA_VERSION)) {
+        if schema_version != Some(u64::from(NATIVE_SKILL_USAGE_SCHEMA_VERSION)) {
             return Err(SkillUsageBindingError::UnsupportedEventSchema {
                 found: schema_version,
             });
@@ -150,9 +147,15 @@ async fn collect_trusted_skill_usage_bindings_for_stage(
             .map_err(|error| SkillUsageBindingError::InvalidSkillId(error.to_string()))?;
         let artifact_digest = ArtifactDigest::new(required_string(data, "artifact_digest")?)
             .map_err(|error| SkillUsageBindingError::InvalidArtifactDigest(error.to_string()))?;
-        let call_id = required_string(data, "call_id")?;
+        let call_id = required_string(&event.payload, "call_id")?;
         if call_id.trim().is_empty() {
             return Err(SkillUsageBindingError::EmptyCallId);
+        }
+        if required_string(data, "genome_revision_id")? != genome.revision_id.to_string().as_str() {
+            return Err(SkillUsageBindingError::UsageGenomeRevisionMismatch);
+        }
+        if required_string(data, "genome_digest")? != genome.digest.to_string().as_str() {
+            return Err(SkillUsageBindingError::UsageGenomeDigestMismatch);
         }
         if skill_set.get(&skill_id) != Some(&artifact_digest) {
             return Err(SkillUsageBindingError::SkillNotInGenome {
@@ -177,11 +180,11 @@ async fn collect_trusted_skill_usage_bindings_for_stage(
             genome_revision_id: evidence.episode.genome_revision_id.clone(),
             skill_id,
             skill_artifact_digest: artifact_digest,
-            plugin_event: TrustedPluginEventRefV1 {
+            tool_event: TrustedSkillToolEventRefV1 {
                 event_id: event_id.clone(),
                 sequence,
-                owner_plugin_id: skill_plugin_id.to_string(),
-                event_kind: SKILL_LOADED_EVENT_V1.to_string(),
+                runtime_origin: "native".to_string(),
+                tool_name: NATIVE_SKILL_READ_TOOL.to_string(),
                 payload_digest: payload.digest,
             },
         };
@@ -264,9 +267,6 @@ fn canonical_json_bytes(value: &impl Serialize) -> Result<Vec<u8>, SkillUsageBin
 /// 可信 Skill 使用绑定构造失败。
 #[derive(Debug, Error)]
 pub enum SkillUsageBindingError {
-    /// Skill 插件 ID 为空。
-    #[error("Skill 插件 ID 不能为空")]
-    EmptyPluginId,
     /// Genome 修订自身不合法。
     #[error("Genome 修订无效：{0}")]
     InvalidGenome(String),
@@ -295,12 +295,12 @@ pub enum SkillUsageBindingError {
         /// 可信控制面选择的阶段。
         stage: &'static str,
     },
-    /// 目标事件不是由 Host 包装的预期插件来源。
-    #[error("Skill 使用事件缺少 Host 固定的可信插件来源")]
-    UntrustedPluginSource,
-    /// 目标事件缺少 data 对象。
-    #[error("Skill 使用事件缺少 data")]
-    MissingEventData,
+    /// 目标工具终态不是由 Core 注入的原生执行来源。
+    #[error("Skill 使用事件缺少 Core 固定的原生工具来源")]
+    UntrustedRuntimeOrigin,
+    /// 目标工具终态缺少受控 Skill 使用细节。
+    #[error("Skill 工具终态缺少 details.skill_usage")]
+    MissingSkillUsageDetails,
     /// 目标事件结构版本不受支持。
     #[error("Skill 使用事件 schema_version 不受支持：{found:?}")]
     UnsupportedEventSchema {
@@ -316,6 +316,12 @@ pub enum SkillUsageBindingError {
     /// 工具调用 ID 为空。
     #[error("Skill 使用事件 call_id 不能为空")]
     EmptyCallId,
+    /// 工具细节中的 Genome Revision 与 Episode 固定修订不同。
+    #[error("Skill 工具终态声明的 Genome Revision 与 Episode 不一致")]
+    UsageGenomeRevisionMismatch,
+    /// 工具细节中的 Genome 摘要与真实修订不同。
+    #[error("Skill 工具终态声明的 Genome 摘要与真实修订不一致")]
+    UsageGenomeDigestMismatch,
     /// 事件引用的 Skill 不在该 Episode 的 Genome 中。
     #[error("Skill `{skill_id}` 的制品 `{artifact_digest}` 不在 Episode Genome 中")]
     SkillNotInGenome {

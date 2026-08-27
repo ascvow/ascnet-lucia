@@ -39,7 +39,6 @@ bun run check --from test         # 从指定步骤开始，执行其后全部�
 以下测试需要显式触发，不属于标准离线检查：
 
 - 真实模型测试：`bun run test:live`，需要有效的模型凭据。
-- WASM 性能门禁：`bun run perf:plugin:gate`。
 - 需要 `--ignored` 的插件冒烟测试，见 `package.json` 中对应的 `test:plugin:*` 脚本。
 
 真实模型测试不会进入普通离线 CI。

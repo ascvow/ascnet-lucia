@@ -12,11 +12,11 @@ Plugin Host 只消费验证后的运行时配置，不参与下载或安装。
 
 ```bash
 lucia plugin search
-lucia plugin search context
-lucia plugin install context
-lucia plugin install context@^0.1
+lucia plugin search mcp
+lucia plugin install mcp
+lucia plugin install mcp@^0.1
 lucia plugin outdated
-lucia plugin update context
+lucia plugin update mcp
 lucia plugin update
 ```
 
@@ -43,7 +43,7 @@ Release 可以同时提供 `<asset>.sha256` 或同名 `.sha256` 文件，存在�
 默认安装后立即启用。需要先处理依赖或独占能力冲突时使用：
 
 ```bash
-lucia plugin install context --disabled
+lucia plugin install mcp --disabled
 lucia plugin enable example-plugin
 lucia plugin disable example-plugin
 lucia plugin remove example-plugin
@@ -81,8 +81,8 @@ Registry、本地与 GitHub 安装进入同一个 `$LUCIA_HOME/plugins/<id>/<ver
 
 ```bash
 lucia plugin list
-lucia plugin select agent.context-loader context-plugin-b
-lucia plugin unselect agent.context-loader
+lucia plugin select agent.tool-policy permission
+lucia plugin unselect agent.tool-policy
 ```
 
 依赖由 manifest 的 `[[dependencies]]` 声明。启用插件前会验证必选依赖是否已经安装并启用、

@@ -26,7 +26,7 @@ use std::{
 
 /// M7 Skill EvaluationReport 在 Artifact CAS 中的媒体类型。
 pub const SKILL_EVALUATION_REPORT_MEDIA_TYPE: &str =
-    "application/vnd.ascnet.lucia.skill-evaluation-report.v1+json";
+    "application/vnd.ascnet.lucia.skill-evaluation-report.v2+json";
 
 /// 可信控制面授予的 Skill 激活授权。
 ///
@@ -289,7 +289,6 @@ impl<'a> SkillExitGate<'a> {
         receipt: &SkillPromotionReceiptV1,
         episodes: &dyn agent_evolution::EpisodeStore,
         episode_id: &EpisodeId,
-        skill_plugin_id: &str,
     ) -> Result<SkillPostPromotionProofV1, SkillExitGateError> {
         let active = self
             .genomes
@@ -301,14 +300,9 @@ impl<'a> SkillExitGate<'a> {
         if active != receipt.active_genome {
             return Err(SkillExitGateError::ActiveGenomeStoreMismatch);
         }
-        let bindings = collect_trusted_skill_usage_bindings(
-            episodes,
-            self.artifacts,
-            episode_id,
-            &active,
-            skill_plugin_id,
-        )
-        .await?;
+        let bindings =
+            collect_trusted_skill_usage_bindings(episodes, self.artifacts, episode_id, &active)
+                .await?;
         if bindings.is_empty() {
             return Err(SkillExitGateError::MissingPostPromotionUsage);
         }

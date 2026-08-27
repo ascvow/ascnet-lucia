@@ -189,7 +189,7 @@ pub struct ToolProfileGenome {
 /// 插件代码本身由 [`PluginGenome`] 的 bundle 摘要固定；此处只记录它使用的参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyRef {
-    /// 策略标识，通常为提供该策略的插件 ID。
+    /// 策略标识，由原生能力或插件行为所有者定义。
     pub id: String,
     /// 策略参数的内容摘要。
     pub config_digest: ArtifactDigest,

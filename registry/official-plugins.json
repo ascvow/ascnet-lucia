@@ -8,12 +8,6 @@
   },
   "plugins": [
     {
-      "id": "context",
-      "crate": "context-plugin",
-      "directory": "examples/plugins/context-plugin",
-      "files": ["plugin.toml", "target/wasm32-wasip2/release/context_plugin.wasm"]
-    },
-    {
       "id": "mcp",
       "crate": "mcp-plugin",
       "directory": "examples/plugins/mcp-plugin",
@@ -22,22 +16,6 @@
         "target/wasm32-wasip2/release/mcp_plugin.wasm",
         "config/mastergo.example.json"
       ]
-    },
-    {
-      "id": "skill",
-      "crate": "skill-plugin",
-      "directory": "examples/plugins/skill-plugin",
-      "files": [
-        "plugin.toml",
-        "target/wasm32-wasip2/release/skill_plugin.wasm",
-        "skills/lucia-plugin-development/SKILL.md"
-      ]
-    },
-    {
-      "id": "command",
-      "crate": "command-plugin",
-      "directory": "examples/plugins/command-plugin",
-      "files": ["plugin.toml", "target/wasm32-wasip2/release/command_plugin.wasm"]
     },
     {
       "id": "teammate",

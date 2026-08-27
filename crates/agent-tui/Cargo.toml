@@ -20,6 +20,7 @@ plugins = [
 [dependencies]
 anyhow.workspace = true
 agent-core = { path = "../agent-core", default-features = false, features = ["openai", "anthropic"] }
+agent-context = { path = "../agent-context" }
 agent-evolution = { path = "../agent-evolution" }
 agent-evolution-protocol = { path = "../agent-evolution-protocol" }
 agent-plugin-protocol = { path = "../agent-plugin-protocol", optional = true }
@@ -27,6 +28,7 @@ agent-plugin-host = { path = "../agent-plugin-host", optional = true }
 agent-plugin-manager = { path = "../agent-plugin-manager", optional = true }
 agent-runtime = { path = "../agent-runtime", optional = true }
 agent-session = { path = "../agent-session" }
+agent-skill = { path = "../agent-skill" }
 agent-tool = { path = "../agent-tool" }
 async-trait.workspace = true
 base64.workspace = true

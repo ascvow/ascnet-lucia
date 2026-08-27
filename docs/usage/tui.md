@@ -8,7 +8,6 @@ TUI 与官方插件界面统一使用英文，不读取或注入系统语言设�
 
 ```bash
 bun run install:tui
-lucia plugin install context
 lucia
 ```
 
@@ -99,13 +98,13 @@ UTF-8 Prompt CAS 制品，空 Prompt 不会采用普通配置或 Core 默认提�
 
 ## 斜杠命令
 
-输入 `/` 会显示官方 Command 插件提供的命令和用法。常用命令包括：
+输入 `/` 会显示 TUI 原生提供的命令和用法。常用命令包括：
 
 - `/resume`：打开当前项目的会话列表，选中后恢复完整会话。
 - `/sessions`：只读浏览当前项目的会话摘要。
-- `/compact`：请求 Context 插件立即压缩当前上下文。
+- `/compact`：请求原生 Context Loader 立即压缩当前上下文。
 
-命令名称从本地快照补全。光标位于命令参数时，显式按 `Tab` 才会请求动态候选。禁用 Command 插件后，斜杠命令和对应 Dialog 不可用，但已有会话文件不会被删除。
+命令名称在本地同步补全，不依赖插件加载状态；默认插件版与纯 Core 版都提供斜杠命令和会话 Dialog。
 
 ## 会话行为
 

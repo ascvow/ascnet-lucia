@@ -12,6 +12,7 @@ mod evolution_dashboard;
 mod genome_binding;
 #[cfg(feature = "plugins")]
 mod host_actions;
+mod native_command;
 #[cfg(feature = "plugins")]
 mod plugin_cli;
 #[cfg(feature = "plugins")]
@@ -22,12 +23,12 @@ mod tui;
 use conversation::*;
 #[cfg(feature = "plugins")]
 use host_actions::*;
+use native_command::*;
 #[cfg(feature = "plugins")]
 use plugin_startup::*;
 use session_coordination::*;
 
-#[cfg(feature = "plugins")]
-use agent_core::ContextLoadRequest;
+use agent_context::{NativeContextLoader, DEFAULT_MAX_SUMMARY_TOKENS};
 use agent_core::{
     config::AgentRootConfig,
     event::{AgentEvent, AgentEventKind, CompositeEventSink, EventSink, JsonlEventSink},
@@ -35,7 +36,7 @@ use agent_core::{
         ChatModel, ContentBlock, MessageRole, ModelGateway, ModelRequest, ModelResponse,
         ProviderAdapter,
     },
-    Agent, AgentOptions, AgentRun, Session,
+    Agent, AgentOptions, AgentRun, ContextLoadRequest, ContextLoader, Session,
 };
 #[cfg(feature = "plugins")]
 use agent_plugin_host::{
@@ -62,6 +63,7 @@ use agent_session::{
     FileSessionStore, MemorySessionStore, SessionId, SessionRecord, SessionStore,
     SessionStoreError, SessionSummary,
 };
+use agent_skill::SkillCatalog;
 use agent_tool::{JsonTool, ToolCall, ToolOutputDelta, ToolRegistry, ToolResult, ToolSpec};
 use anyhow::Context;
 use anyhow::{anyhow, Result};
@@ -295,8 +297,18 @@ enum UiEvent {
     ContextUsage(u64),
     /// Agent 运行结束，携带至少一次持久化后的会话状态。
     AgentDone(Box<AgentCompletion>),
+    /// 原生会话 Dialog 的摘要查询完成。
+    NativeSessionsLoaded(Result<Vec<SessionSummary>, SessionStoreError>),
+    /// 用户在原生会话 Dialog 中确认恢复一份精确修订。
+    NativeResumeRequested {
+        /// 待恢复的稳定会话 ID。
+        session_id: SessionId,
+        /// 列表加载时观察到的修订号，用于阻止竞态覆盖。
+        revision: u64,
+    },
+    /// 原生 `/compact` 请求通过当前 Context Loader 重载会话。
+    NativeCompactRequested,
     /// 后台会话上下文重载完成。
-    #[cfg(feature = "plugins")]
     SessionContextReloaded(Box<Result<SessionReloadOutcome>>),
     /// 后台会话摘要查询完成，等待回送发起插件。
     #[cfg(feature = "plugins")]
@@ -336,14 +348,11 @@ struct AgentCompletion {
 }
 
 /// 一次后台会话上下文重载的会话级结果。
-#[cfg(feature = "plugins")]
 enum SessionReloadOutcome {
     /// 加载器返回了新上下文，已持久化为该会话记录。
     Replaced(SessionRecord),
     /// 加载器返回的上下文与当前会话一致，无需替换。
     Unchanged,
-    /// 当前没有就绪的上下文加载器。
-    NoLoader,
 }
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

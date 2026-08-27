@@ -92,13 +92,13 @@ host.navigate_view(UiNavigationRequest {
 
 `UiDeclaration.input_triggers` 声明主输入触发前缀。主输入去除前导空白后以任一前缀开头时该前缀激活：宿主把主输入快照（`UiInputEvent::MainInput`，包含完整文本与 UTF-8 字节光标）与无修饰的 Tab、Enter、方向键、Esc 手势转发给该视图，并把 `InputPanel` 视图渲染在输入区上方。触发退出激活后面板整体消失，不依赖插件端状态；无任何插件声明触发前缀时，这些字符没有特殊语义，宿主行为与无插件形态一致。
 
-官方 Command 插件用这一机制实现斜杠命令：它声明触发前缀 `/` 的补全弹层，自己维护命令快照、逐键筛选、参数候选与选中状态；第三方命令的动态候选与执行回调由插件直接经 `host-service-call` 调用 owner 服务完成，不经过宿主中转。
+Lucia 的斜杠命令是 TUI 原生默认功能，不通过插件输入触发机制。输入以 `/` 开头时，原生命令补全面板和会话 Dialog 优先处理按键；其他触发前缀仍按声明式插件协议路由。
 
 ## 宿主动作事件
 
 声明 `capabilities.surface_actions` 的插件可以发布 `ui.host.action` 扩展事件，请求宿主执行基础动作：替换主输入（`set_input`）、新建或清空会话、重载上下文（`reload_context`）、退出应用（`exit`）、恢复会话（`resume_session`）与异步会话查询（`query_sessions`）。请求携带插件内幂等 `request_id`，宿主忽略重复交付；`query_sessions` 完成后宿主调用发起插件的 `reply_service` 服务回送 `UiSessionsReply`。
 
-`/resume` 和 `/sessions` 会打开 Command 插件声明的 `command-session-dialog`。插件负责查询、加载、空结果、错误、选择和关闭状态；宿主只应答当前项目的分页会话摘要，并在收到 `resume_session` 动作后校验 revision、加载完整记录。这样插件无法直接读取会话正文，也不会把 Session 存储契约耦合进 Plugin Host。
+`/resume` 和 `/sessions` 会打开 TUI 原生会话 Dialog。TUI 通过 `agent-session` 查询当前项目的分页会话摘要，并在恢复前校验 revision、加载完整记录；该流程不依赖 Plugin Host，也不向插件公开 Session 正文。
 
 ## 启动插件状态
 
@@ -108,7 +108,7 @@ host.navigate_view(UiNavigationRequest {
 
 TUI 会在每个插件 Ready 时立即消费其激活事件，并在底部信息栏右侧按稳定计划顺序累积状态和本次加载耗时，例如 `mcp: MCP 插件等待配置 · 420 ms`。全部加载结束数秒后该区域收敛为 `◈ N plugins`，持续显示当前已加载插件数量，不额外占用对话区高度。周期性插件视图渲染在单个后台任务中执行；刷新期间到达的新请求会合并为下一批，不阻塞键盘事件，也不会无限堆积任务。
 
-只有启动激活阶段的事件进入该状态行。工具调用、上下文压缩及其他运行期插件事件仍按 `presentation.target` 进入主事件列表，插件无需为此修改运行期事件协议。
+只有启动激活阶段的事件进入该状态行。原生上下文压缩事件和插件运行期事件仍按 `presentation.target` 进入主事件列表，插件无需为此修改运行期事件协议。
 
 ## 主事件列表
 

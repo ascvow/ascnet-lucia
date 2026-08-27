@@ -9,15 +9,13 @@ use agent_evolution_protocol::{
     CandidateId, ContextPolicyCandidateV1, ContextPolicyMutationProposalV1, EvolutionCycleId,
     GenomeDigest, GenomeMetadata, GenomeRevision, GenomeRevisionError, GenomeRevisionId,
     InvalidContextMutation, MutationId, MutationSurface, CONTEXT_POLICY_CANDIDATE_SCHEMA_VERSION,
+    NATIVE_CONTEXT_POLICY_ID,
 };
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
-
-/// Context Policy 必须由该独占能力的真实 owner 插件消费。
-pub const CONTEXT_LOADER_CAPABILITY_ID: &str = "agent.context-loader";
 
 /// 使用真实 Genome Store 与 Artifact CAS 构建 Context Policy Candidate 的可信边界。
 ///
@@ -99,15 +97,9 @@ impl<'a> ContextCandidateBuilder<'a> {
                 actual: parent_ref.config_digest.clone(),
             });
         }
-        let owner = parent
-            .genome
-            .capability_owners
-            .get(CONTEXT_LOADER_CAPABILITY_ID)
-            .ok_or(ContextCandidateBuildError::MissingContextOwner)?;
-        if owner != &parent_ref.id {
-            return Err(ContextCandidateBuildError::ContextOwnerMismatch {
-                policy_id: parent_ref.id.clone(),
-                actual_owner: owner.clone(),
+        if parent_ref.id != NATIVE_CONTEXT_POLICY_ID {
+            return Err(ContextCandidateBuildError::ContextPolicyOwnerMismatch {
+                actual: parent_ref.id.clone(),
             });
         }
 
@@ -279,16 +271,11 @@ pub enum ContextCandidateBuildError {
         /// Genome 中真实摘要。
         actual: agent_evolution_protocol::ArtifactDigest,
     },
-    /// Parent 没有声明 Context Loader 独占能力 owner。
-    #[error("Parent Genome 缺少 `{CONTEXT_LOADER_CAPABILITY_ID}` 能力 owner")]
-    MissingContextOwner,
-    /// Context Policy ID 不是 Context Loader 的真实 owner 插件 ID。
-    #[error("Context Policy ID `{policy_id}` 与真实能力 owner `{actual_owner}` 不一致")]
-    ContextOwnerMismatch {
-        /// PolicyRef 中的插件 ID。
-        policy_id: String,
-        /// Genome 能力映射中的真实 owner。
-        actual_owner: String,
+    /// Context Policy ID 不是 Kernel 原生上下文能力的稳定 ID。
+    #[error("Context Policy owner `{actual}` 不是原生 owner `{NATIVE_CONTEXT_POLICY_ID}`")]
+    ContextPolicyOwnerMismatch {
+        /// PolicyRef 中实际声明的 owner ID。
+        actual: String,
     },
     /// Parent 与 Candidate 策略结构值或摘要相同。
     #[error("Candidate Context Policy 未发生变化：{0}")]

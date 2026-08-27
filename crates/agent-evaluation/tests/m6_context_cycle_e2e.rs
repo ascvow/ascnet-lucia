@@ -16,18 +16,18 @@ use agent_evolution_protocol::{
     ContextEvaluationReceiptV1, ContextEvaluationRequestV1, ContextPolicyV1, DataClass,
     DatasetVersionId, Episode, EpisodeDataPolicy, EpisodeId, EvolutionEligibility,
     FailureClassification, FailureKind, GateDecision, GenomeMetadata, GenomeRevision,
-    GenomeRevisionId, HealthCheckReceiptV1, HealthCheckRequestV1, ModelGenome, Outcome,
-    PluginGenome, PolicyRef, PromotionRequestV1, RecallObservationV1, ReleaseReceiptV1,
-    ReplayabilityGrade, RollbackRequestV1, RunId, RuntimeHealthObservationV1, RuntimeIdentity,
-    TaskDescriptor, ToolProfileGenome, UsageSummary, CONTEXT_EVALUATION_OBSERVATION_SCHEMA_VERSION,
+    GenomeRevisionId, HealthCheckReceiptV1, HealthCheckRequestV1, ModelGenome, Outcome, PolicyRef,
+    PromotionRequestV1, RecallObservationV1, ReleaseReceiptV1, ReplayabilityGrade,
+    RollbackRequestV1, RunId, RuntimeHealthObservationV1, RuntimeIdentity, TaskDescriptor,
+    ToolProfileGenome, UsageSummary, CONTEXT_EVALUATION_OBSERVATION_SCHEMA_VERSION,
     CONTEXT_EVALUATION_RECEIPT_SCHEMA_VERSION, EPISODE_SCHEMA_VERSION, GENOME_SCHEMA_VERSION,
-    M6_CONTEXT_GATE_VERSION, RELEASE_RECEIPT_SCHEMA_VERSION,
+    M6_CONTEXT_GATE_VERSION, NATIVE_CONTEXT_POLICY_ID, RELEASE_RECEIPT_SCHEMA_VERSION,
 };
 use agent_tool::{ExecutionPolicy, ToolAccess};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -300,23 +300,14 @@ fn parent_revision(policy_digest: ArtifactDigest) -> GenomeRevision {
                 provider_options_digest: None,
             },
             prompt: Default::default(),
-            plugins: vec![PluginGenome {
-                id: "context".to_string(),
-                version: "0.1.0".to_string(),
-                api_version: "0.7.0".to_string(),
-                bundle: digest_bytes(b"context-plugin"),
-                config_digest: None,
-            }],
-            capability_owners: BTreeMap::from([(
-                "agent.context-loader".to_string(),
-                "context".to_string(),
-            )]),
+            plugins: Vec::new(),
+            capability_owners: Default::default(),
             tools: ToolProfileGenome {
                 native_tools: BTreeSet::new(),
                 access: ToolAccess::All,
             },
             context_policy: Some(PolicyRef {
-                id: "context".to_string(),
+                id: NATIVE_CONTEXT_POLICY_ID.to_string(),
                 config_digest: policy_digest,
             }),
             planning_policy: None,

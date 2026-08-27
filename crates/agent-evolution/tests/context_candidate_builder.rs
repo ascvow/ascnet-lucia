@@ -7,8 +7,8 @@ use agent_evolution::{
 use agent_evolution_protocol::{
     AgentGenome, ArtifactDigest, ContextPolicyMutationProposalV1, ContextPolicyV1, EpisodeId,
     EvolutionCycleId, GenomeMetadata, GenomeRevision, ModelGenome, MutationId, MutationSurface,
-    PluginGenome, PolicyRef, PromptGenome, RuntimeIdentity, ToolProfileGenome,
-    CONTEXT_POLICY_PROPOSAL_SCHEMA_VERSION, GENOME_SCHEMA_VERSION,
+    PolicyRef, PromptGenome, RuntimeIdentity, ToolProfileGenome,
+    CONTEXT_POLICY_PROPOSAL_SCHEMA_VERSION, GENOME_SCHEMA_VERSION, NATIVE_CONTEXT_POLICY_ID,
 };
 use agent_tool::{ExecutionPolicy, ToolAccess};
 use std::{collections::BTreeSet, path::PathBuf};
@@ -117,33 +117,20 @@ fn sample_genome(policy_digest: ArtifactDigest) -> AgentGenome {
             provider_options_digest: None,
         },
         prompt: PromptGenome::default(),
-        plugins: vec![PluginGenome {
-            id: "context".into(),
-            version: "0.1.0".into(),
-            api_version: "0.7.0".into(),
-            bundle: digest('a'),
-            config_digest: None,
-        }],
-        capability_owners: [("agent.context-loader".into(), "context".into())]
-            .into_iter()
-            .collect(),
+        plugins: Vec::new(),
+        capability_owners: Default::default(),
         tools: ToolProfileGenome {
             native_tools: BTreeSet::new(),
             access: ToolAccess::All,
         },
         context_policy: Some(PolicyRef {
-            id: "context".into(),
+            id: NATIVE_CONTEXT_POLICY_ID.into(),
             config_digest: policy_digest,
         }),
         planning_policy: None,
         skills: Vec::new(),
         execution: ExecutionPolicy::serve(),
     }
-}
-
-/// 构造确定性的 Artifact 摘要。
-fn digest(seed: char) -> ArtifactDigest {
-    ArtifactDigest::from_sha256_hex(seed.to_string().repeat(64)).expect("测试摘要应合法")
 }
 
 /// Builder 必须写真实策略 CAS、登记不可变 Revision，并保持唯一 Context Policy 差异。
@@ -186,7 +173,7 @@ async fn builds_context_only_candidate_with_real_stores() {
             .as_ref()
             .expect("Candidate 应保留 Context Policy owner")
             .id,
-        "context"
+        NATIVE_CONTEXT_POLICY_ID
     );
     assert_eq!(
         ContextPolicyRepository::new(&fixture.artifacts)
@@ -217,26 +204,17 @@ async fn build_is_idempotent_for_same_trusted_inputs() {
     assert_eq!(first, second);
 }
 
-/// PolicyRef 必须绑定 Genome 中 `agent.context-loader` 的真实 owner。
+/// PolicyRef 必须绑定 Kernel 原生上下文能力的稳定 owner。
 #[tokio::test]
 async fn rejects_policy_owner_mismatch() {
     let fixture = Fixture::new().await;
     let mut invalid_parent = fixture.parent.clone();
     invalid_parent
         .genome
-        .capability_owners
-        .insert("agent.context-loader".into(), "other".into());
-    invalid_parent.genome.plugins.push(PluginGenome {
-        id: "other".into(),
-        version: "0.1.0".into(),
-        api_version: "0.7.0".into(),
-        bundle: digest('b'),
-        config_digest: None,
-    });
-    invalid_parent
-        .genome
-        .plugins
-        .sort_by(|left, right| left.id.cmp(&right.id));
+        .context_policy
+        .as_mut()
+        .expect("测试 Parent 应声明 Context Policy")
+        .id = "legacy-context-owner".into();
     invalid_parent = GenomeRevision::create(invalid_parent.genome, GenomeMetadata::default())
         .expect("错绑 owner 仍是结构合法 Genome");
     fixture
@@ -255,7 +233,7 @@ async fn rejects_policy_owner_mismatch() {
 
     assert!(matches!(
         error,
-        ContextCandidateBuildError::ContextOwnerMismatch { .. }
+        ContextCandidateBuildError::ContextPolicyOwnerMismatch { .. }
     ));
 }
 

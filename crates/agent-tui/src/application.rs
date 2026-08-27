@@ -172,9 +172,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         let (bound_manifests, bound_owners) = evidence.bind_plugins(&plugin_manifests)?;
         plugin_manifests = bound_manifests;
         capability_selection = bound_owners;
-        plugin_activation_metadata = evidence
-            .plugin_activation_metadata(&plugin_manifests)
-            .await?;
+        plugin_activation_metadata = evidence.plugin_activation_metadata().await?;
     }
     #[cfg(not(feature = "plugins"))]
     if let Some(evidence) = evidence_runtime.as_ref() {
@@ -246,13 +244,33 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let evidence_policy = evidence_runtime
         .as_ref()
         .map(EvidenceRuntime::execution_policy);
-    let options = restrict_agent_options_for_evidence(options, evidence_policy);
+    let mut options = restrict_agent_options_for_evidence(options, evidence_policy);
     if auto_initialized {
         startup_notices.insert(
             0,
             format!("Created default configuration: {}", config_path.display()),
         );
     }
+
+    // Skill 是 Kernel 默认能力：普通运行扫描 Lucia Home 与项目目录，Evidence 运行只从
+    // Genome 固定的 CAS 制品装配，绝不回退到可变本地文件。
+    let skill_catalog = match evidence_runtime.as_ref() {
+        Some(evidence) => evidence.bind_skill_catalog().await?,
+        None => SkillCatalog::load_local([
+            lucia_home.join("skills"),
+            workspace.cwd.join("skills"),
+            workspace.cwd.join(".lucia/skills"),
+        ])
+        .context("扫描原生 Skill 目录失败")?,
+    };
+    if let Some(skill_prompt) = skill_catalog.prompt() {
+        options.system_prompt.push_str("\n\n");
+        options.system_prompt.push_str(&skill_prompt);
+    }
+    // 恢复历史会话时同步当前原生能力提示，避免旧 system 消息继续隐藏 Skill 索引。
+    session_record
+        .session
+        .set_system(options.system_prompt.clone());
 
     let mut native_tools = ToolRegistry::new();
     if demo_mode {
@@ -270,6 +288,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         let guard = native_workspace_guard(&workspace.cwd, evidence_policy)?;
         agent_tool::builtins::register_builtins(&mut native_tools, guard)?;
     }
+    skill_catalog.register_tool(&mut native_tools)?;
     if let Some(evidence) = evidence_runtime.as_ref() {
         native_tools = evidence.bind_native_tools(&native_tools)?;
     }
@@ -285,13 +304,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         sink.push(Arc::new(JsonlEventSink::new(path.clone())));
     }
 
+    let application_events: Arc<dyn EventSink> = Arc::new(sink);
     let base_agent = Agent::new(gateway, options)
         .with_tools(native_tools)
-        .with_event_sink(Arc::new(sink));
-    // Runtime 子 Agent 使用独立执行会话，不能继承只为 TUI 主会话预登记的 Evidence sink；
-    // 因此先捕获插件模板，子运行随后由 Runtime 的可信观察器分别登记。
-    #[cfg(feature = "plugins")]
-    let plugin_agent_template = AgentTemplate::from_agent(&base_agent);
+        .with_event_sink(Arc::clone(&application_events));
     let base_agent = if let Some(evidence) = evidence_runtime.as_ref() {
         let mut sinks = CompositeEventSink::new();
         sinks.push(evidence.hub());
@@ -300,13 +316,40 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     } else {
         base_agent
     };
+    let context_policy = match evidence_runtime.as_ref() {
+        Some(evidence) => evidence.bind_context_policy().await?,
+        None => None,
+    };
+    // 手动压缩发生在 Agent Run 之外，只写应用事件；自动压缩额外进入已登记的 Evidence Run。
+    // 两条路径使用相同模型路由和策略实现，且都不经过 Plugin Host。
+    let manual_context_loader: Arc<dyn ContextLoader> = Arc::new(NativeContextLoader::new(
+        base_agent.gateway().clone(),
+        base_agent.options().provider.clone(),
+        base_agent.options().model.clone(),
+        base_agent.options().stream,
+        DEFAULT_MAX_SUMMARY_TOKENS,
+        context_policy.clone(),
+        application_events,
+    )?);
+    let agent_context_loader: Arc<dyn ContextLoader> = Arc::new(NativeContextLoader::new(
+        base_agent.gateway().clone(),
+        base_agent.options().provider.clone(),
+        base_agent.options().model.clone(),
+        base_agent.options().stream,
+        DEFAULT_MAX_SUMMARY_TOKENS,
+        context_policy,
+        base_agent.event_sink(),
+    )?);
+    let base_agent = base_agent.with_context_loader(agent_context_loader);
+    // Runtime 子 Agent 使用独立执行会话，不能继承只为 TUI 主会话预登记的 Evidence sink；
+    // 因此先捕获插件模板，子运行随后由 Runtime 的可信观察器分别登记。
+    #[cfg(feature = "plugins")]
+    let plugin_agent_template = AgentTemplate::from_agent(&base_agent);
     #[cfg(feature = "plugins")]
     let live_plugin_host = Arc::new(LivePluginHost::new());
     #[cfg(feature = "plugins")]
     let agent = Some(Arc::new(
-        base_agent
-            .with_extension(live_plugin_host.clone())
-            .with_context_loader(live_plugin_host.clone()),
+        base_agent.with_extension(live_plugin_host.clone()),
     ));
     #[cfg(not(feature = "plugins"))]
     let agent = Some(Arc::new(base_agent));
@@ -368,6 +411,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .with_workspace(workspace)
         .with_context_window(tui_settings.context_window)
         .with_persistent_session(session_store, session_record)
+        .with_context_loader(manual_context_loader)
         .with_evidence(evidence_runtime.clone());
     app.messages.extend(
         startup_notices
@@ -411,11 +455,17 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         match rx.recv().await {
             Some(UiEvent::Input(Event::Key(key))) => {
                 if key.kind == KeyEventKind::Press {
+                    let before_input = app.input.clone();
+                    if app.handle_native_command_key(key.code, key.modifiers) {
+                        app.sync_native_command_input(&before_input);
+                        continue;
+                    }
                     #[cfg(feature = "plugins")]
                     match app.route_plugin_key(key.code, key.modifiers) {
                         PluginKeyRoute::Main => {
                             let before = (app.input.clone(), app.cursor);
                             app.handle_key(key.code, key.modifiers, agent.as_ref());
+                            app.sync_native_command_input(&before_input);
                             // 编辑结果变化且触发前缀激活时同步主输入快照。
                             if app.input != before.0 || app.cursor != before.1 {
                                 if let Some(host) = plugin_host.as_ref() {
@@ -458,7 +508,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         }
                     }
                     #[cfg(not(feature = "plugins"))]
-                    app.handle_key(key.code, key.modifiers, agent.as_ref());
+                    {
+                        app.handle_key(key.code, key.modifiers, agent.as_ref());
+                        app.sync_native_command_input(&before_input);
+                    }
                 }
             }
             #[cfg(feature = "plugins")]
@@ -654,18 +707,23 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Some(UiEvent::ContextUsage(tokens)) => {
                 app.context_tokens = Some(tokens);
             }
-            #[cfg(feature = "plugins")]
+            Some(UiEvent::NativeSessionsLoaded(result)) => {
+                app.handle_native_sessions_loaded(result);
+            }
+            Some(UiEvent::NativeResumeRequested {
+                session_id,
+                revision,
+            }) => {
+                if let Err(error) = resume_native_session(&mut app, session_id, revision).await {
+                    app.messages
+                        .push(Msg::new(MsgKind::Error, format!("恢复会话失败：{error}")));
+                }
+            }
+            Some(UiEvent::NativeCompactRequested) => {
+                start_session_context_reload(&mut app, "正在压缩当前上下文".into());
+            }
             Some(UiEvent::SessionContextReloaded(result)) => {
                 app.handle_session_context_reloaded(*result);
-                // 重载期间加载器插件发布的展示事件补进主事件列表。
-                if let Some(host) = plugin_host.as_ref() {
-                    if let Err(error) = drain_plugin_ui_events(&mut app, host).await {
-                        app.messages.push(Msg::new(
-                            MsgKind::Error,
-                            format!("Failed to process plugin event: {error}"),
-                        ));
-                    }
-                }
             }
             Some(UiEvent::AgentDone(result)) => {
                 record_run_failure_event(events_jsonl.as_deref(), result.as_ref()).await;
@@ -686,7 +744,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 let animate_spinner =
                     app.running || app.plugins_loading || app.pending_reload.is_some();
                 #[cfg(not(feature = "plugins"))]
-                let animate_spinner = app.running;
+                let animate_spinner = app.running || app.pending_reload.is_some();
                 if animate_spinner {
                     app.spinner_frame = app.spinner_frame.wrapping_add(1);
                 }
@@ -747,13 +805,16 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Some(UiEvent::Input(Event::Paste(pasted))) => {
                 // 粘贴只进入主输入框；插件视图聚焦或模态层激活时忽略。
                 #[cfg(feature = "plugins")]
-                let main_input_focused = app.plugin_focus.is_none()
+                let main_input_focused = app.native_command.dialog.is_none()
+                    && app.plugin_focus.is_none()
                     && app.active_dialog_index().is_none()
                     && app.view_stack.is_main();
                 #[cfg(not(feature = "plugins"))]
-                let main_input_focused = true;
+                let main_input_focused = app.native_command.dialog.is_none();
                 if main_input_focused {
+                    let before_input = app.input.clone();
                     app.handle_paste(&pasted);
+                    app.sync_native_command_input(&before_input);
                     // 粘贴同样可能激活触发前缀，同步一次主输入快照。
                     #[cfg(feature = "plugins")]
                     if let Some(host) = plugin_host.as_ref() {

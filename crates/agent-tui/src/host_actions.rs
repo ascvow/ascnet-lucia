@@ -1,7 +1,7 @@
 //! 插件宿主动作事件的执行与会话数据源服务。
 //!
 //! 本模块只实现与插件业务无关的宿主基础能力：替换主输入、会话新建与恢复、
-//! 后台上下文重载、退出应用，以及供插件界面消费的会话摘要查询。
+//! 请求原生上下文压缩、退出应用，以及供插件界面消费的会话摘要查询。
 
 use super::*;
 
@@ -44,11 +44,7 @@ where
 ///
 /// 单个动作的执行失败转换为主事件列表消息，不中断同批次的其余事件。
 #[cfg(feature = "plugins")]
-pub(crate) async fn apply_plugin_host_action_event(
-    app: &mut App,
-    plugin_host: &Arc<LivePluginHost>,
-    event: &Value,
-) -> Result<bool> {
+pub(crate) async fn apply_plugin_host_action_event(app: &mut App, event: &Value) -> Result<bool> {
     if event.get("name").and_then(Value::as_str) != Some(UI_HOST_ACTION_EVENT) {
         return Ok(false);
     }
@@ -63,7 +59,7 @@ pub(crate) async fn apply_plugin_host_action_event(
     if !app.mark_host_action(&plugin_id, &request.request_id) {
         return Ok(true);
     }
-    if let Err(error) = apply_host_action(app, plugin_host, plugin_id, request.action).await {
+    if let Err(error) = apply_host_action(app, plugin_id, request.action).await {
         app.messages.push(Msg::new(
             MsgKind::Error,
             format!("插件动作执行失败：{error}"),
@@ -74,30 +70,13 @@ pub(crate) async fn apply_plugin_host_action_event(
 
 /// 执行单个宿主动作。
 #[cfg(feature = "plugins")]
-async fn apply_host_action(
-    app: &mut App,
-    plugin_host: &Arc<LivePluginHost>,
-    plugin_id: String,
-    action: UiHostAction,
-) -> Result<()> {
+async fn apply_host_action(app: &mut App, plugin_id: String, action: UiHostAction) -> Result<()> {
     match action {
         UiHostAction::SetInput { text, cursor } => app.set_main_input(text, cursor),
         UiHostAction::NewSession => app.start_new_draft("已新建空白会话")?,
         UiHostAction::ClearSession => app.start_new_draft("会话上下文已清空")?,
         UiHostAction::ReloadContext { label } => {
-            // 后台重载可能替换会话记录，结束前不接受重复请求。
-            if app.pending_reload.is_some() {
-                app.messages.push(Msg::new(
-                    MsgKind::Info,
-                    "上一次上下文重载仍在进行中，请稍候",
-                ));
-            } else {
-                start_session_context_reload(
-                    app,
-                    Arc::clone(plugin_host),
-                    label.unwrap_or_default(),
-                );
-            }
+            start_session_context_reload(app, label.unwrap_or_default());
         }
         UiHostAction::Exit => app.should_quit = true,
         UiHostAction::ResumeSession {
@@ -116,63 +95,6 @@ async fn apply_host_action(
         } => app.start_sessions_query(plugin_id, reply_service, query_id, query, cursor, limit),
     }
     Ok(())
-}
-
-/// 在后台通过已注册的上下文加载器重载当前会话并持久化变化。
-///
-/// 立即返回以保持事件循环渲染；结果经 `SessionContextReloaded` 事件回投主循环，
-/// 处理过程的用户可见说明由加载器插件发布的展示事件提供。
-#[cfg(feature = "plugins")]
-pub(crate) fn start_session_context_reload(
-    app: &mut App,
-    plugin_host: Arc<LivePluginHost>,
-    label: String,
-) {
-    app.pending_reload = Some(label);
-    let record = app.session_record.clone();
-    let model_name = app.model_name.clone();
-    let session_store = Arc::clone(&app.session_store);
-    let tx = app.tx.clone();
-    tokio::spawn(async move {
-        let result = reload_session_context(
-            plugin_host.as_ref(),
-            session_store.as_ref(),
-            record,
-            model_name,
-        )
-        .await;
-        let _ = tx.send(UiEvent::SessionContextReloaded(Box::new(result)));
-    });
-}
-
-/// 请求上下文加载器重载给定会话记录；仅在内容变化时保存并返回新记录。
-#[cfg(feature = "plugins")]
-async fn reload_session_context(
-    plugin_host: &dyn PluginHost,
-    session_store: &dyn SessionStore,
-    record: SessionRecord,
-    model_name: String,
-) -> Result<SessionReloadOutcome> {
-    let request = ContextLoadRequest {
-        run_id: format!("reload:{}:{}", record.id, record.revision),
-        step: 0,
-        provider: "manual".into(),
-        model: model_name,
-        system: record.session.system().cloned(),
-        messages: record.session.model_messages(),
-        user_initiated: true,
-    };
-    let Some(loaded) = plugin_host.load_context(&request).await? else {
-        return Ok(SessionReloadOutcome::NoLoader);
-    };
-    if loaded.system == request.system && loaded.messages == request.messages {
-        return Ok(SessionReloadOutcome::Unchanged);
-    }
-    let mut reloaded = record;
-    reloaded.session = Session::from_parts(loaded.system, loaded.messages);
-    let expected_revision = (reloaded.revision > 0).then_some(reloaded.revision);
-    let saved = save_session_record_reconciled(session_store, reloaded, expected_revision).await?;
-    Ok(SessionReloadOutcome::Replaced(saved))
 }
 
 /// 读取、过滤并分页当前项目的轻量会话摘要。

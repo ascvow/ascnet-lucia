@@ -54,8 +54,9 @@ pub(crate) struct App {
     /// 当前回溯到的历史下标；`None` 表示正在编辑新输入。
     pub(crate) input_history_cursor: Option<usize>,
     pub(crate) running: bool,
+    /// 不依赖 Plugin Host 的默认斜杠命令与会话 Dialog 状态。
+    pub(crate) native_command: NativeCommandState,
     /// 正在后台重载会话上下文时展示的进度标签；期间禁止提交新消息。
-    #[cfg(feature = "plugins")]
     pub(crate) pending_reload: Option<String>,
     /// 当前运行的起始时间，用于渲染运行耗时。
     pub(crate) run_started_at: Option<std::time::Instant>,
@@ -64,6 +65,8 @@ pub(crate) struct App {
     pub(crate) session_record: SessionRecord,
     /// 执行 revision 比较并交换的会话存储。
     pub(crate) session_store: Arc<dyn SessionStore>,
+    /// `/compact` 与模型请求共同使用的原生上下文加载器。
+    pub(crate) context_loader: Arc<dyn ContextLoader>,
     /// 可选 Evidence Plane；启用后每次主会话运行必须形成 Episode。
     pub(crate) evidence: Option<EvidenceRuntime>,
     pub(crate) tx: mpsc::UnboundedSender<UiEvent>,
@@ -174,12 +177,13 @@ impl App {
             input_history: Vec::new(),
             input_history_cursor: None,
             running: false,
-            #[cfg(feature = "plugins")]
+            native_command: NativeCommandState::default(),
             pending_reload: None,
             run_started_at: None,
             should_quit: false,
             session_record,
             session_store: Arc::new(MemorySessionStore::new()),
+            context_loader: Arc::new(agent_core::PassthroughContextLoader),
             evidence: None,
             tx,
             model_name,
@@ -252,6 +256,12 @@ impl App {
         self
     }
 
+    /// 注入应用默认的原生上下文加载器。
+    pub(crate) fn with_context_loader(mut self, context_loader: Arc<dyn ContextLoader>) -> Self {
+        self.context_loader = context_loader;
+        self
+    }
+
     /// 注入启动时已经验证 Genome Revision 的 Evidence Plane。
     pub(crate) fn with_evidence(mut self, evidence: Option<EvidenceRuntime>) -> Self {
         self.evidence = evidence;
@@ -259,7 +269,6 @@ impl App {
     }
 
     /// 用完整记录替换当前会话，并清理只属于旧会话的瞬时界面状态。
-    #[cfg(feature = "plugins")]
     pub(crate) fn replace_session(&mut self, session_record: SessionRecord, notice: Option<&str>) {
         self.messages = restore_session_messages(&session_record.session);
         self.session_record = session_record;
@@ -270,13 +279,14 @@ impl App {
         self.streaming_message = None;
         self.scroll = None;
         self.context_tokens = None;
+        self.native_command.dialog = None;
+        self.native_command.dismissed_input = None;
         if let Some(notice) = notice {
             self.messages.push(Msg::new(MsgKind::Info, notice));
         }
     }
 
     /// 进入当前项目下尚未持久化的全新空白草稿。
-    #[cfg(feature = "plugins")]
     pub(crate) fn start_new_draft(&mut self, notice: &str) -> Result<()> {
         let mut draft = self.workspace.draft_record()?;
         if let Some(evidence) = self.evidence.as_ref() {
@@ -288,8 +298,7 @@ impl App {
 
     /// 处理后台会话上下文重载结果：替换会话时保留正在编辑的输入。
     ///
-    /// 处理说明由加载器插件发布的展示事件提供，这里只负责会话状态切换。
-    #[cfg(feature = "plugins")]
+    /// 处理说明由原生加载器发布的展示事件提供，这里只负责会话状态切换。
     pub(crate) fn handle_session_context_reloaded(&mut self, result: Result<SessionReloadOutcome>) {
         self.pending_reload = None;
         match result {
@@ -304,13 +313,9 @@ impl App {
                 self.attachments = attachments;
             }
             Ok(SessionReloadOutcome::Unchanged) => {}
-            Ok(SessionReloadOutcome::NoLoader) => self.messages.push(Msg::new(
-                MsgKind::Info,
-                "No context loader is ready; the session context cannot be reloaded",
-            )),
             Err(error) => self.messages.push(Msg::new(
                 MsgKind::Error,
-                format!("Failed to reload session context: {error}"),
+                format!("重新加载会话上下文失败：{error}"),
             )),
         }
     }
@@ -657,6 +662,10 @@ impl App {
     /// 多个视图声明重叠前缀时按声明顺序取第一个。
     #[cfg(feature = "plugins")]
     pub(crate) fn active_trigger_view(&self) -> Option<usize> {
+        // `/` 由默认原生命令独占，插件不能通过同名触发前缀覆盖命令状态机。
+        if self.input.starts_with('/') {
+            return None;
+        }
         let input = self.input.trim_start();
         if input.is_empty() {
             return None;
@@ -695,6 +704,9 @@ impl App {
     #[cfg(feature = "plugins")]
     pub(crate) fn visible_composer_panels(&self) -> Vec<usize> {
         if self.visible_plugin_input().is_some() {
+            return Vec::new();
+        }
+        if self.native_command_panel_height() > 0 {
             return Vec::new();
         }
         if let Some(index) = self.visible_input_panel() {
@@ -892,12 +904,9 @@ impl App {
             }
             KeyCode::Enter => {
                 // 后台命令可能随时替换会话记录，期间禁止并发提交新消息。
-                #[cfg(feature = "plugins")]
                 if self.pending_reload.is_some() {
-                    self.messages.push(Msg::new(
-                        MsgKind::Info,
-                        "The command is still running. Try again shortly.",
-                    ));
+                    self.messages
+                        .push(Msg::new(MsgKind::Info, "上下文压缩仍在进行中，请稍候"));
                     return;
                 }
                 #[cfg(feature = "plugins")]

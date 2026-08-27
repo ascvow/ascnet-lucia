@@ -6,6 +6,7 @@ use crate::genome_binding::GenomeRuntimeBinding;
 use crate::genome_binding::{
     current_git_commit, current_git_dirty, current_target_triple, current_tui_features,
 };
+use agent_context::NativeContextPolicy;
 use agent_evolution::{
     load_episode_evidence, EpisodeRecorderConfig, EpisodeRecorderHub, EvolutionPipeline,
     FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox, FileGenomeResolver,
@@ -23,6 +24,7 @@ use agent_runtime::{
     RuntimeRunObservation, RuntimeRunObserver, RuntimeRunTermination,
 };
 use agent_session::SessionBehaviorBinding;
+use agent_skill::SkillCatalog;
 
 /// Session Store 中用于标识 Agent Genome 修订绑定的协议名。
 const GENOME_SESSION_BEHAVIOR_KIND: &str = "agent_genome";
@@ -131,6 +133,24 @@ impl EvidenceRuntime {
         self.binding.bind_native_tools(tools)
     }
 
+    /// 从 Genome CAS 装配原生 Skill 目录。
+    ///
+    /// # Errors
+    ///
+    /// Skill 引用、状态、强类型 ID 或 CAS 完整性校验失败时返回错误。
+    pub(crate) async fn bind_skill_catalog(&self) -> Result<SkillCatalog> {
+        self.binding.bind_skill_catalog().await
+    }
+
+    /// 从 Genome CAS 装配原生上下文压缩策略。
+    ///
+    /// # Errors
+    ///
+    /// 策略 owner 不是原生稳定 ID，或 CAS 制品未通过完整性与协议校验时返回错误。
+    pub(crate) async fn bind_context_policy(&self) -> Result<Option<NativeContextPolicy>> {
+        self.binding.bind_context_policy().await
+    }
+
     /// 从发现结果中选择并验证 Genome 固定的插件与能力 owner。
     ///
     /// # Errors
@@ -144,20 +164,16 @@ impl EvidenceRuntime {
         self.binding.bind_plugins(manifests)
     }
 
-    /// 读取 Genome Context Policy 与 Skill Set，并生成按真实插件 ID 隔离的激活元数据。
+    /// 读取 Genome Context Policy，并生成按真实插件 ID 隔离的激活元数据。
     ///
     /// # Errors
     ///
-    /// 引用、能力 owner 或已绑定 manifest 错绑，或真实 CAS 制品无法通过完整性与协议
-    /// 校验时返回错误。
+    /// 引用或能力 owner 错绑，或真实 CAS 制品无法通过完整性与协议校验时返回错误。
     #[cfg(feature = "plugins")]
     pub(crate) async fn plugin_activation_metadata(
         &self,
-        bound_manifests: &[PathBuf],
     ) -> Result<HashMap<String, HashMap<String, String>>> {
-        self.binding
-            .plugin_activation_metadata(bound_manifests)
-            .await
+        self.binding.plugin_activation_metadata().await
     }
 
     /// 纯 Core 构建拒绝任何插件行为快照。

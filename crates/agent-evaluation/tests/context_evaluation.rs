@@ -6,8 +6,8 @@ use agent_evaluation::{
 use agent_evolution_protocol::{
     AgentGenome, ArtifactDigest, ContextEvaluationObservationV1, ContextGateFailureV1,
     ContextPolicyV1, GateDecision, GenomeMetadata, GenomeRevision, ModelGenome, MutationSurface,
-    PluginGenome, PolicyRef, PromptGenome, RecallObservationV1, RuntimeIdentity, ToolProfileGenome,
-    CONTEXT_EVALUATION_OBSERVATION_SCHEMA_VERSION, GENOME_SCHEMA_VERSION,
+    PolicyRef, PromptGenome, RecallObservationV1, RuntimeIdentity, ToolProfileGenome,
+    CONTEXT_EVALUATION_OBSERVATION_SCHEMA_VERSION, GENOME_SCHEMA_VERSION, NATIVE_CONTEXT_POLICY_ID,
 };
 use agent_tool::{ExecutionPolicy, ToolAccess};
 use std::collections::BTreeSet;
@@ -55,22 +55,14 @@ fn sample_genome(policy_digest: ArtifactDigest) -> AgentGenome {
             provider_options_digest: None,
         },
         prompt: PromptGenome::default(),
-        plugins: vec![PluginGenome {
-            id: "context".into(),
-            version: "0.1.0".into(),
-            api_version: "0.7.0".into(),
-            bundle: digest('c'),
-            config_digest: None,
-        }],
-        capability_owners: [("agent.context-loader".into(), "context".into())]
-            .into_iter()
-            .collect(),
+        plugins: Vec::new(),
+        capability_owners: Default::default(),
         tools: ToolProfileGenome {
             native_tools: BTreeSet::new(),
             access: ToolAccess::All,
         },
         context_policy: Some(PolicyRef {
-            id: "context".into(),
+            id: NATIVE_CONTEXT_POLICY_ID.into(),
             config_digest: policy_digest,
         }),
         planning_policy: None,

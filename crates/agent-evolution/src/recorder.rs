@@ -259,14 +259,28 @@ impl EpisodeRecorder {
         applied: &mut BTreeSet<RedactionRule>,
     ) -> Value {
         match self.config.data_policy.raw_tool_results {
-            RawToolResultPolicy::Discard => json!({
-                "call_id": event.payload.get("call_id").and_then(Value::as_str),
-                "name": event.payload.get("name").and_then(Value::as_str),
-                "is_error": event.payload.get("is_error").and_then(Value::as_bool),
-                "error_kind": event.payload.get("error_kind"),
-                "runtime_origin": event.payload.get("runtime_origin").and_then(Value::as_str),
-                "content_discarded": true,
-            }),
+            RawToolResultPolicy::Discard => {
+                let trusted_skill_usage = (event.payload.get("name").and_then(Value::as_str)
+                    == Some("skill_read")
+                    && event.payload.get("runtime_origin").and_then(Value::as_str)
+                        == Some("native")
+                    && !event
+                        .payload
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false))
+                .then(|| event.payload.pointer("/details/skill_usage").cloned())
+                .flatten();
+                json!({
+                    "call_id": event.payload.get("call_id").and_then(Value::as_str),
+                    "name": event.payload.get("name").and_then(Value::as_str),
+                    "is_error": event.payload.get("is_error").and_then(Value::as_bool),
+                    "error_kind": event.payload.get("error_kind"),
+                    "runtime_origin": event.payload.get("runtime_origin").and_then(Value::as_str),
+                    "details": trusted_skill_usage.map(|usage| json!({ "skill_usage": usage })),
+                    "content_discarded": true,
+                })
+            }
             RawToolResultPolicy::StoreRedacted => {
                 let (payload, rules) = self.redactor.redact_json(&event.payload);
                 applied.extend(rules);

@@ -6,7 +6,7 @@
 
 ```bash
 lucia plugin search
-lucia plugin search context
+lucia plugin search mcp
 ```
 
 `query` 是可选的位置参数，按插件名称和说明过滤 Registry。搜索只返回与当前插件 ABI 兼容的版本，不安装任何内容。
@@ -16,9 +16,9 @@ lucia plugin search context
 ### 从 Registry 安装
 
 ```bash
-lucia plugin install context
-lucia plugin install context@^0.1
-lucia plugin install context --disabled
+lucia plugin install mcp
+lucia plugin install mcp@^0.1
+lucia plugin install mcp --disabled
 ```
 
 `source` 使用 `name[@semver]`。未指定版本时选择当前 ABI 下最高兼容版本，并先求解必需依赖。`--disabled` 只完成安装和锁文件更新，不让插件进入运行时组合。
@@ -50,7 +50,7 @@ lucia plugin install ./dist/example-plugin --local
 ```bash
 lucia plugin list
 lucia plugin outdated
-lucia plugin update context
+lucia plugin update mcp
 lucia plugin update
 ```
 
@@ -74,8 +74,8 @@ lucia plugin remove example-plugin
 ## 选择独占能力
 
 ```bash
-lucia plugin select agent.context-loader context-plugin-b
-lucia plugin unselect agent.context-loader
+lucia plugin select agent.tool-policy permission
+lucia plugin unselect agent.tool-policy
 ```
 
 `capability` 是 manifest 声明的稳定能力 ID，`plugin` 是提供该能力的插件 ID。多个已启用插件声明同一 `exclusive` 能力时，必须用 `select` 指定 owner；选择操作同时确保目标插件已启用。`unselect` 清除选择，之后若仍有多个候选，运行时检查会要求重新选择。

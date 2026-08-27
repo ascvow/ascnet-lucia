@@ -10,14 +10,18 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         .clamp(1, 6);
     let input_rows = desired_input_rows.min(workspace.height.saturating_sub(5).clamp(1, 6));
     let input_height = input_rows + 2;
+    let native_panel_height = app.native_command_panel_height();
     #[cfg(feature = "plugins")]
+    let plugin_panel_height = app.composer_panel_height();
+    #[cfg(not(feature = "plugins"))]
+    let plugin_panel_height = 0;
     let panel_height = if workspace.height >= 10 {
-        app.composer_panel_height()
+        native_panel_height
+            .saturating_add(plugin_panel_height)
             .min(workspace.height.saturating_sub(input_height + 5))
     } else {
         0
     };
-    #[cfg(feature = "plugins")]
     let sections = Layout::vertical([
         Constraint::Min(4),
         Constraint::Length(panel_height),
@@ -25,18 +29,8 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         Constraint::Length(1),
     ])
     .split(workspace);
-    #[cfg(not(feature = "plugins"))]
-    let sections = Layout::vertical([
-        Constraint::Min(4),
-        Constraint::Length(input_height),
-        Constraint::Length(1),
-    ])
-    .split(workspace);
-    #[cfg(feature = "plugins")]
     let (chat_section, panel_section, input_section, footer_section) =
         (sections[0], sections[1], sections[2], sections[3]);
-    #[cfg(not(feature = "plugins"))]
-    let (chat_section, input_section, footer_section) = (sections[0], sections[1], sections[2]);
 
     // 消息流不使用容器边框，长文交给自动换行控制。
     let chat_area = chat_section.inner(Margin {
@@ -83,7 +77,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             }
             lines.push(Line::from(spans));
         }
-        // 后台上下文重载以插件提供的标签作为进行中指示。
+        // 后台原生上下文重载以调用方提供的标签作为进行中指示。
         #[cfg(feature = "plugins")]
         if let Some(label) = app.pending_reload.as_deref() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
@@ -136,9 +130,17 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         }
     }
 
-    #[cfg(feature = "plugins")]
     if panel_height > 0 {
-        render_composer_panels(frame, app, panel_section);
+        let native_height = native_panel_height.min(panel_height);
+        let panels = Layout::vertical([Constraint::Length(native_height), Constraint::Min(0)])
+            .split(panel_section);
+        if native_height > 0 {
+            render_native_command_panel(frame, app, panels[0]);
+        }
+        #[cfg(feature = "plugins")]
+        if panels[1].height > 0 {
+            render_composer_panels(frame, app, panels[1]);
+        }
     }
 
     // 输入区是四边圆角边框的多行输入盒，内容超过六行后内部垂直滚动。
@@ -149,9 +151,11 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         COLOR_USER
     };
     #[cfg(feature = "plugins")]
-    let main_input_focused = app.plugin_focus.is_none() && app.active_dialog_index().is_none();
+    let main_input_focused = app.native_command.dialog.is_none()
+        && app.plugin_focus.is_none()
+        && app.active_dialog_index().is_none();
     #[cfg(not(feature = "plugins"))]
-    let main_input_focused = true;
+    let main_input_focused = app.native_command.dialog.is_none();
     let mut input_block = Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)

@@ -61,9 +61,7 @@ pub use certificate::{
     CertificateError, EvolutionCertificate, EvolutionCertificateInput,
     EVOLUTION_CERTIFICATE_SCHEMA_VERSION,
 };
-pub use context_candidate_builder::{
-    ContextCandidateBuildError, ContextCandidateBuilder, CONTEXT_LOADER_CAPABILITY_ID,
-};
+pub use context_candidate_builder::{ContextCandidateBuildError, ContextCandidateBuilder};
 pub use context_cycle::{
     BoundedContextMutator, ContextCycleArchiveError, ContextCycleError, ContextCycleStage,
     ContextEvolutionCycle, ContextEvolutionCycleRequestV1, ContextEvolutionCycleSnapshotV1,
@@ -177,7 +175,7 @@ pub use skill_repository::{
 };
 pub use skill_usage::{
     collect_trusted_skill_evaluation_bindings, collect_trusted_skill_usage_bindings,
-    SkillUsageBindingError, SKILL_LOADED_EVENT_SCHEMA_VERSION, SKILL_LOADED_EVENT_V1,
+    SkillUsageBindingError, NATIVE_SKILL_READ_TOOL, NATIVE_SKILL_USAGE_SCHEMA_VERSION,
     SKILL_USAGE_EVENT_MEDIA_TYPE,
 };
 pub use supervision::{

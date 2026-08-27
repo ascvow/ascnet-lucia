@@ -188,9 +188,9 @@ Rust SDK：`remove_state(key) -> Result<Option<Value>>`。
 
 ```json
 {
-  "name": "command.snapshot",
+  "name": "audit.snapshot",
   "version": "1.0.0",
-  "description": "返回命令注册表快照。"
+  "description": "返回审计记录快照。"
 }
 ```
 
@@ -205,7 +205,7 @@ Rust SDK：`upsert_service(service) -> Result<()>`。
 ### `host-service-remove`
 
 ```json
-{ "name": "command.snapshot" }
+{ "name": "audit.snapshot" }
 ```
 
 幂等删除当前插件拥有的服务，成功 `value` 为 `null`。
@@ -223,7 +223,7 @@ Rust SDK：`remove_service(name) -> Result<()>`。
 查询一个插件：
 
 ```json
-{ "plugin_id": "command" }
+{ "plugin_id": "audit-provider" }
 ```
 
 成功 `value`：
@@ -231,10 +231,10 @@ Rust SDK：`remove_service(name) -> Result<()>`。
 ```json
 [
   {
-    "plugin_id": "command",
-    "name": "command.snapshot",
+    "plugin_id": "audit-provider",
+    "name": "audit.snapshot",
     "version": "1.0.0",
-    "description": "返回命令注册表快照。"
+    "description": "返回审计记录快照。"
   }
 ]
 ```
@@ -247,8 +247,8 @@ Rust SDK：`list_services(plugin_id) -> Result<Vec<ServiceDescriptor>>`。
 
 ```json
 {
-  "plugin_id": "command",
-  "name": "command.snapshot",
+  "plugin_id": "audit-provider",
+  "name": "audit.snapshot",
   "payload": { "include_hidden": false }
 }
 ```
@@ -532,7 +532,7 @@ export deactivate: func() -> string;
 ```json
 {
   "caller_id": "可信调用方插件 ID",
-  "name": "command.snapshot",
+  "name": "audit.snapshot",
   "payload": {}
 }
 ```
@@ -540,7 +540,7 @@ export deactivate: func() -> string;
 输出使用 Guest 服务信封，不带 Host `schema_version`：
 
 ```json
-{ "ok": true, "value": { "commands": [] } }
+{ "ok": true, "value": { "records": [] } }
 ```
 
 或：

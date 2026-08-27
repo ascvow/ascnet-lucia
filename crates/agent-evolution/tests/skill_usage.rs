@@ -1,14 +1,14 @@
-//! M7 Skill 使用事件到可信 Episode 绑定的端到端测试。
+//! M7 原生 Skill 工具终态到可信 Episode 绑定的端到端测试。
 
 use agent_core::{AgentEvent, AgentEventKind, EventSink};
 use agent_evolution::{
     collect_trusted_skill_evaluation_bindings, collect_trusted_skill_usage_bindings, ArtifactStore,
     EpisodeRecorder, EpisodeRecorderConfig, FileArtifactStore, FileEpisodeStore,
-    SkillArtifactRepository, SkillUsageBindingError, SKILL_LOADED_EVENT_V1,
+    SkillArtifactRepository, SkillUsageBindingError, NATIVE_SKILL_READ_TOOL,
 };
 use agent_evolution_protocol::{
     AgentGenome, ArtifactDigest, EpisodeId, EvaluationReportId, GenomeMetadata, GenomeRevision,
-    ModelGenome, MutationId, PluginGenome, PromptGenome, RuntimeIdentity, SkillArtifactV1, SkillId,
+    ModelGenome, MutationId, PromptGenome, RuntimeIdentity, SkillArtifactV1, SkillId,
     SkillOperationV1, SkillRef, SkillStatusTransitionV1, SkillStatusV1, SkillTriggerPolicyV1,
     ToolProfileGenome, GENOME_SCHEMA_VERSION, SKILL_ARTIFACT_SCHEMA_VERSION,
 };
@@ -67,7 +67,7 @@ fn genome(skill_id: &SkillId, skill_digest: ArtifactDigest) -> GenomeRevision {
                 git_commit: "m7-skill-usage".into(),
                 git_dirty: false,
                 target_triple: "aarch64-apple-darwin".into(),
-                features: BTreeSet::from(["plugins".into()]),
+                features: BTreeSet::new(),
             },
             model: ModelGenome {
                 provider: "fixture".into(),
@@ -81,13 +81,7 @@ fn genome(skill_id: &SkillId, skill_digest: ArtifactDigest) -> GenomeRevision {
                 provider_options_digest: None,
             },
             prompt: PromptGenome::default(),
-            plugins: vec![PluginGenome {
-                id: "skill".into(),
-                version: "0.1.0".into(),
-                api_version: "0.7.0".into(),
-                bundle: digest('b'),
-                config_digest: None,
-            }],
+            plugins: Vec::new(),
             capability_owners: Default::default(),
             tools: ToolProfileGenome::default(),
             context_policy: None,
@@ -103,12 +97,12 @@ fn genome(skill_id: &SkillId, skill_digest: ArtifactDigest) -> GenomeRevision {
     .expect("测试 Genome 应合法")
 }
 
-/// 用真实 Recorder 持久化一条由 Host 包装来源的 Skill 加载事件。
+/// 用真实 Recorder 持久化一条由 Core 注入来源的原生 Skill 工具终态。
 async fn record_skill_episode(
     artifacts: Arc<FileArtifactStore>,
     episodes: Arc<FileEpisodeStore>,
     genome: &GenomeRevision,
-    source_plugin_id: &str,
+    runtime_origin: &str,
     skill_id: &SkillId,
     skill_digest: &ArtifactDigest,
 ) -> EpisodeId {
@@ -127,21 +121,26 @@ async fn record_skill_episode(
     recorder
         .record(&AgentEvent::new(
             &run_id,
-            AgentEventKind::Extension,
+            AgentEventKind::ToolFinished,
             1,
             json!({
-                "source": { "type": "plugin", "id": source_plugin_id },
-                "name": SKILL_LOADED_EVENT_V1,
-                "data": {
-                    "schema_version": 1,
-                    "skill_id": skill_id,
-                    "artifact_digest": skill_digest,
-                    "call_id": "skill-call-1"
+                "call_id": "skill-call-1",
+                "name": NATIVE_SKILL_READ_TOOL,
+                "is_error": false,
+                "runtime_origin": runtime_origin,
+                "details": {
+                    "skill_usage": {
+                        "schema_version": 1,
+                        "skill_id": skill_id,
+                        "artifact_digest": skill_digest,
+                        "genome_revision_id": genome.revision_id,
+                        "genome_digest": genome.digest
+                    }
                 }
             }),
         ))
         .await
-        .expect("应记录 Skill 加载事件");
+        .expect("应记录原生 Skill 工具终态");
     recorder
         .record(&AgentEvent::new(
             &run_id,
@@ -156,7 +155,7 @@ async fn record_skill_episode(
 
 /// 真实 Recorder、CAS 与 Genome 应共同生成唯一可信绑定和 payload 制品。
 #[tokio::test]
-async fn binds_real_host_plugin_event_to_active_genome_skill() {
+async fn binds_real_native_tool_event_to_active_genome_skill() {
     let root = std::env::temp_dir().join(format!("lucia-m7-usage-{}", uuid::Uuid::new_v4()));
     let artifacts = Arc::new(FileArtifactStore::new(root.join("artifacts")));
     let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
@@ -171,7 +170,7 @@ async fn binds_real_host_plugin_event_to_active_genome_skill() {
         artifacts.clone(),
         episodes.clone(),
         &genome,
-        "skill",
+        "native",
         &skill_id,
         &reference.digest,
     )
@@ -182,7 +181,6 @@ async fn binds_real_host_plugin_event_to_active_genome_skill() {
         artifacts.as_ref(),
         &episode_id,
         &genome,
-        "skill",
     )
     .await
     .expect("真实 Skill 事件应产生可信绑定");
@@ -192,19 +190,19 @@ async fn binds_real_host_plugin_event_to_active_genome_skill() {
     assert_eq!(binding.skill_id, skill_id);
     assert_eq!(binding.skill_artifact_digest, reference.digest);
     let payload = artifacts
-        .get(&binding.plugin_event.payload_digest)
+        .get(&binding.tool_event.payload_digest)
         .await
         .expect("应读取 payload CAS")
         .expect("payload CAS 应存在");
     assert!(String::from_utf8(payload)
         .expect("payload 应是 UTF-8 JSON")
-        .contains("skill.loaded.v1"));
+        .contains("skill_read"));
     let _ = tokio::fs::remove_dir_all(root).await;
 }
 
-/// Guest 伪造其他插件来源时不得生成部分可信绑定。
+/// Guest 或插件伪造原生来源时不得生成部分可信绑定。
 #[tokio::test]
-async fn rejects_forged_plugin_owner() {
+async fn rejects_forged_runtime_origin() {
     let root = std::env::temp_dir().join(format!("lucia-m7-owner-{}", uuid::Uuid::new_v4()));
     let artifacts = Arc::new(FileArtifactStore::new(root.join("artifacts")));
     let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
@@ -218,7 +216,7 @@ async fn rejects_forged_plugin_owner() {
         artifacts.clone(),
         episodes.clone(),
         &genome,
-        "forged-plugin",
+        "plugin",
         &skill_id,
         &reference.digest,
     )
@@ -229,13 +227,12 @@ async fn rejects_forged_plugin_owner() {
         artifacts.as_ref(),
         &episode_id,
         &genome,
-        "skill",
     )
     .await
-    .expect_err("伪造 owner 必须失败关闭");
+    .expect_err("伪造原生来源必须失败关闭");
     assert!(matches!(
         error,
-        SkillUsageBindingError::UntrustedPluginSource
+        SkillUsageBindingError::UntrustedRuntimeOrigin
     ));
     let _ = tokio::fs::remove_dir_all(root).await;
 }
@@ -256,7 +253,7 @@ async fn rejects_quarantined_skill_from_serve_usage() {
         artifacts.clone(),
         episodes.clone(),
         &genome,
-        "skill",
+        "native",
         &skill_id,
         &reference.digest,
     )
@@ -267,7 +264,6 @@ async fn rejects_quarantined_skill_from_serve_usage() {
         artifacts.as_ref(),
         &episode_id,
         &genome,
-        "skill",
     )
     .await
     .expect_err("Quarantined Skill 不得被绑定为 Serve 使用");
@@ -295,7 +291,7 @@ async fn evaluation_binder_accepts_quarantined_candidate_on_original_revision() 
         artifacts.clone(),
         episodes.clone(),
         &candidate,
-        "skill",
+        "native",
         &skill_id,
         &reference.digest,
     )
@@ -306,7 +302,6 @@ async fn evaluation_binder_accepts_quarantined_candidate_on_original_revision() 
         artifacts.as_ref(),
         &episode_id,
         &candidate,
-        "skill",
     )
     .await
     .expect("Evaluation 应绑定原 Candidate Revision 的 Quarantined Skill");
@@ -319,7 +314,6 @@ async fn evaluation_binder_accepts_quarantined_candidate_on_original_revision() 
         artifacts.as_ref(),
         &episode_id,
         &candidate,
-        "skill",
     )
     .await
     .expect_err("相同事件不能通过普通 Serve Binder");

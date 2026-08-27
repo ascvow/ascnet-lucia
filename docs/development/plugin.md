@@ -4,7 +4,7 @@ Lucia 插件是独立的 `wasm32-wasip2` crate。插件通过 `agent-plugin` Gue
 
 ## 适合放进插件的功能
 
-MCP、Skill、Command、工作流、多 Agent 编排、上下文压缩和特定 UI 都属于插件规则。通用消息、ReAct、模型网关和事件契约属于 Core；ABI、权限和 owner 路由属于 Host。不要为了复用把具体插件协议移入 Core 或 Host。
+MCP、工作流、多 Agent 编排和特定 UI 属于插件规则。Command、Skill 与上下文压缩是 Kernel 默认原生能力；通用消息、ReAct、模型网关和事件契约属于 Core，具体原生实现分别由应用装配层和独立原生 crate 承担。ABI、权限和 owner 路由属于 Host，不得为复用具体协议扩大 Host 职责。
 
 ## 工程结构
 
@@ -207,28 +207,6 @@ fn on_event(&mut self, event: AgentEvent)
 ```
 
 接收 Core 生命周期事件。`event.run_id` 关联一次运行，`event.kind` 是稳定事件类型，`event.step` 是 ReAct 步数，`event.payload` 是对应类型的 JSON。该回调用于观察，不应假设所有事件都包含同一种 payload 结构。
-
-### `load_context`
-
-```rust
-fn load_context(
-    &mut self,
-    host: &dyn PluginHostApi,
-    request: ContextLoadRequest,
-) -> Result<Option<LoadedContext>>
-```
-
-在每次模型请求前提供完整替换上下文，只有被选为上下文 owner 的插件会处理。
-
-- `request.run_id`、`request.step`：标识当前运行和轮次。
-- `request.provider`、`request.model`：本轮实际选择的逻辑 provider 与模型 ID。
-- `request.system`：当前顶层 system 提示。
-- `request.messages`：扩展提示和 Session 消息组成的 provider-neutral JSON 列表。
-- 返回 `Ok(None)`：本轮原样透传，避免把未修改的历史跨 WASM 边界返回。
-- 返回 `Ok(Some(context))`：用 `context.system` 和 `context.messages` 完整替换模型输入；不是增量追加。
-- 返回 `Err`：上下文加载失败，当前模型请求不会发送。
-
-上下文插件必须保留合法的 tool call / tool result 配对，不能只按字符数任意截断。
 
 ## 服务函数
 

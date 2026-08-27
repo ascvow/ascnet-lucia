@@ -22,13 +22,13 @@ use uuid::Uuid;
 /// 当前支持的 Skill 制品结构版本。
 pub const SKILL_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 /// 当前支持的 Skill 使用观察结构版本。
-pub const SKILL_USAGE_OBSERVATION_SCHEMA_VERSION: u32 = 1;
+pub const SKILL_USAGE_OBSERVATION_SCHEMA_VERSION: u32 = 2;
 /// 当前支持的 Skill 变异提案结构版本。
 pub const SKILL_MUTATION_PROPOSAL_SCHEMA_VERSION: u32 = 1;
 /// 当前支持的 Skill Candidate 结构版本。
 pub const SKILL_CANDIDATE_SCHEMA_VERSION: u32 = 1;
 /// 当前支持的 Skill 评测报告结构版本。
-pub const SKILL_EVALUATION_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const SKILL_EVALUATION_REPORT_SCHEMA_VERSION: u32 = 2;
 
 const SKILL_ID_BODY_MIN_BYTES: usize = 8;
 const SKILL_ID_BODY_MAX_BYTES: usize = 64;
@@ -473,39 +473,39 @@ impl SkillArtifactV1 {
     }
 }
 
-/// Host 可信事件流中的真实插件事件引用。
+/// Core 可信事件流中的真实原生 Skill 工具终态引用。
 ///
 /// `payload_digest` 只固定脱敏事件 payload，不把用户正文或 ToolResult 放入协议。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct TrustedPluginEventRefV1 {
+pub struct TrustedSkillToolEventRefV1 {
     /// Event Envelope 中的真实事件 ID。
     pub event_id: EventId,
     /// Episode 内从 1 开始的单调事件序号。
     pub sequence: u64,
-    /// Host 在事件产生时注入的插件 owner ID。
-    pub owner_plugin_id: String,
-    /// Host 记录的版本化事件类型。
-    pub event_kind: String,
+    /// Core 在事件产生时注入的运行来源；原生 Skill 固定为 `native`。
+    pub runtime_origin: String,
+    /// Core 记录的真实工具名；原生 Skill 固定为 `skill_read`。
+    pub tool_name: String,
     /// 脱敏事件 payload 的 Artifact CAS 摘要。
     pub payload_digest: ArtifactDigest,
 }
 
-impl TrustedPluginEventRefV1 {
-    /// 校验事件序号以及 owner、事件类型的文本边界。
+impl TrustedSkillToolEventRefV1 {
+    /// 校验事件序号以及运行来源、工具名的文本边界。
     ///
     /// # Errors
     ///
     /// 序号为零，或文本字段为空、过长时返回 [`InvalidSkillEvolution`]。
     pub fn validate(&self) -> Result<(), InvalidSkillEvolution> {
         if self.sequence == 0 {
-            return Err(InvalidSkillEvolution::InvalidPluginEventSequence);
+            return Err(InvalidSkillEvolution::InvalidSkillToolEventSequence);
         }
-        validate_label("owner_plugin_id", &self.owner_plugin_id)?;
-        validate_text("event_kind", &self.event_kind, MAX_PLUGIN_EVENT_KIND_BYTES)
+        validate_label("runtime_origin", &self.runtime_origin)?;
+        validate_text("tool_name", &self.tool_name, MAX_PLUGIN_EVENT_KIND_BYTES)
     }
 }
 
-/// Recorder/Host 从可信 Episode 与插件事件解析出的使用绑定。
+/// Recorder/Core 从可信 Episode 与原生 Skill 工具事件解析出的使用绑定。
 ///
 /// 此结构是校验输入，不接受 Skill 或模型自行构造的值作为事实来源。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -520,18 +520,18 @@ pub struct TrustedSkillUsageBindingV1 {
     pub skill_id: SkillId,
     /// 实际装载的 Skill 制品摘要。
     pub skill_artifact_digest: ArtifactDigest,
-    /// 真实插件事件引用。
-    pub plugin_event: TrustedPluginEventRefV1,
+    /// 真实原生 Skill 工具终态引用。
+    pub tool_event: TrustedSkillToolEventRefV1,
 }
 
 impl TrustedSkillUsageBindingV1 {
-    /// 校验真实插件事件引用的局部结构。
+    /// 校验真实原生 Skill 工具事件引用的局部结构。
     ///
     /// # Errors
     ///
-    /// 插件事件序号或文本字段非法时返回 [`InvalidSkillEvolution`]。
+    /// 工具事件序号或文本字段非法时返回 [`InvalidSkillEvolution`]。
     pub fn validate(&self) -> Result<(), InvalidSkillEvolution> {
-        self.plugin_event.validate()
+        self.tool_event.validate()
     }
 }
 
@@ -539,7 +539,7 @@ impl TrustedSkillUsageBindingV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillUsageEvidenceSourceV1 {
-    /// Recorder 把真实插件事件绑定到可信 Episode 终态与 OutcomeRevision。
+    /// Recorder 把真实原生工具事件绑定到可信 Episode 终态与 OutcomeRevision。
     TrustedEpisodeOutcome,
     /// Skill 或插件自行上报；只能用于诊断，禁止进入评测成功计数。
     SkillSelfReported,
@@ -559,7 +559,7 @@ pub enum SkillUsageResultV1 {
     MissedTrigger,
 }
 
-/// 一次与可信 Episode、Run、Genome 和真实插件事件绑定的 Skill 使用观察。
+/// 一次与可信 Episode、Run、Genome 和真实原生工具事件绑定的 Skill 使用观察。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillUsageObservationV1 {
     /// 使用观察结构版本。
@@ -1020,7 +1020,7 @@ pub struct SkillEvaluationReportV1 {
     /// 本报告评测的全部 Skill ID。
     #[serde(default)]
     pub evaluated_skill_ids: BTreeSet<SkillId>,
-    /// 按真实插件 Event ID 严格升序的使用观察。
+    /// 按真实原生 Skill 工具 Event ID 严格升序的使用观察。
     #[serde(default)]
     pub observations: Vec<SkillUsageObservationV1>,
     /// Skill Commit Policy 的结论；V1 自动 Gate 只接受 Pass 或 Reject。
@@ -1077,7 +1077,7 @@ impl SkillEvaluationReportV1 {
         }
         let mut previous_event: Option<&EventId> = None;
         for observation in &self.observations {
-            let event_id = &observation.binding.plugin_event.event_id;
+            let event_id = &observation.binding.tool_event.event_id;
             if previous_event.is_some_and(|previous| previous >= event_id) {
                 return Err(InvalidSkillEvolution::UnorderedCollection {
                     field: "observations",
@@ -1086,7 +1086,7 @@ impl SkillEvaluationReportV1 {
             previous_event = Some(event_id);
             let trusted = trusted_usage_bindings
                 .get(event_id)
-                .ok_or(InvalidSkillEvolution::MissingTrustedPluginEvent)?;
+                .ok_or(InvalidSkillEvolution::MissingTrustedSkillToolEvent)?;
             observation.validate(trusted)?;
             if !self
                 .evaluated_skill_ids
@@ -1211,14 +1211,14 @@ pub enum InvalidSkillEvolution {
         /// 实际终态。
         actual: SkillStatusV1,
     },
-    /// 插件事件序号不能为零。
-    #[error("真实插件事件 sequence 必须从 1 开始")]
-    InvalidPluginEventSequence,
+    /// 原生 Skill 工具事件序号不能为零。
+    #[error("真实 Skill 工具事件 sequence 必须从 1 开始")]
+    InvalidSkillToolEventSequence,
     /// 使用观察与 Host/Recorder 可信绑定不一致。
-    #[error("Skill 使用观察与可信 Episode、Run、Genome、Skill 或插件事件绑定不一致")]
+    #[error("Skill 使用观察与可信 Episode、Run、Genome、Skill 或原生工具事件绑定不一致")]
     UsageBindingMismatch,
     /// Skill 自报不能作为评测成功证据。
-    #[error("Skill 或插件自报成功不可信，必须绑定可信 Episode 终态与真实插件事件")]
+    #[error("Skill 自报成功不可信，必须绑定可信 Episode 终态与真实原生工具事件")]
     UntrustedSkillSelfReport,
     /// 观察结果与 Verifier 值矛盾。
     #[error("Skill 使用结果与可信 Verifier 判定不一致")]
@@ -1289,9 +1289,9 @@ pub enum InvalidSkillEvolution {
         /// 冲突 Skill。
         skill_id: SkillId,
     },
-    /// 评测观察找不到 Host 的真实插件事件。
-    #[error("Skill 使用观察没有对应的 Host 可信插件事件")]
-    MissingTrustedPluginEvent,
+    /// 评测观察找不到 Core 的真实原生 Skill 工具事件。
+    #[error("Skill 使用观察没有对应的 Core 可信 Skill 工具事件")]
+    MissingTrustedSkillToolEvent,
     /// 观察中的 Skill 不属于报告评测集合。
     #[error("Skill 使用观察指向报告 evaluated_skill_ids 之外的 Skill")]
     EvaluationSkillMismatch,
@@ -1534,11 +1534,11 @@ mod tests {
             genome_revision_id: GenomeRevisionId::generate(),
             skill_id,
             skill_artifact_digest: digest('a'),
-            plugin_event: TrustedPluginEventRefV1 {
+            tool_event: TrustedSkillToolEventRefV1 {
                 event_id: EventId::generate(),
                 sequence: 4,
-                owner_plugin_id: "agent.skill-loader".into(),
-                event_kind: "skill_invoked.v1".into(),
+                runtime_origin: "native".into(),
+                tool_name: "skill_read".into(),
                 payload_digest: digest('b'),
             },
         }
@@ -1761,7 +1761,7 @@ mod tests {
         assert!(serde_json::from_value::<SkillOperationV1>(value).is_err());
     }
 
-    /// 使用观察必须逐字段匹配可信 Episode/Run/Genome/Skill/插件事件并拒绝自报成功。
+    /// 使用观察必须逐字段匹配可信 Episode/Run/Genome/Skill/原生工具事件并拒绝自报成功。
     #[test]
     fn usage_observation_rejects_misbinding_and_self_report() {
         let binding = plugin_binding(skill_id("observee"));
@@ -1860,7 +1860,7 @@ mod tests {
             .contains("[\"a.first\",\"z.last\"]"));
     }
 
-    /// 评测报告必须复核真实插件事件，且 Pass 只接受可信成功观察。
+    /// 评测报告必须复核真实原生工具事件，且 Pass 只接受可信成功观察。
     #[test]
     fn evaluation_report_binds_trusted_usage() {
         let skill_id = skill_id("evaluate");
@@ -1881,14 +1881,14 @@ mod tests {
             failures: BTreeSet::new(),
             generated_at_ms: 20,
         };
-        let trusted = BTreeMap::from([(binding.plugin_event.event_id.clone(), binding)]);
+        let trusted = BTreeMap::from([(binding.tool_event.event_id.clone(), binding)]);
         report
             .validate(&trusted)
-            .expect("真实插件事件绑定的可信成功报告应合法");
+            .expect("真实原生工具事件绑定的可信成功报告应合法");
 
         assert_eq!(
             report.validate(&BTreeMap::new()),
-            Err(InvalidSkillEvolution::MissingTrustedPluginEvent)
+            Err(InvalidSkillEvolution::MissingTrustedSkillToolEvent)
         );
     }
 }

@@ -1,15 +1,26 @@
-//! 基于 Claude Code 分层策略的 Lucia 上下文压缩插件。
+//! Lucia 默认原生上下文压缩、模型摘要和 Context Policy 执行能力。
 
-use agent_plugin::{
-    export_plugin, ActivationContext, AgentPlugin, ContextLoadRequest, EventPresentation,
-    EventPresentationTone, ExtensionEvent, LoadedContext, ModelCompletionRequest,
-    ModelCompletionResponse, PluginHostApi, Result,
+#![deny(missing_docs)]
+
+use agent_core::{
+    event::{AgentEvent, AgentEventKind, EventSink},
+    model::{ModelGateway, ModelRequest},
+    ContextLoadRequest as CoreContextLoadRequest, ContextLoader,
+    LoadedContext as CoreLoadedContext, ReasoningLevel, ToolChoice,
 };
-use anyhow::{anyhow, Context};
+use agent_evolution_protocol::{
+    ArtifactDigest, ContextPolicyV1, PlanSnapshotRetentionPolicyV1,
+    PostSummaryValidationAlgorithmV1, ToolResultRetentionPolicyV1, UserConstraintRetentionPolicyV1,
+    NATIVE_CONTEXT_POLICY_ID,
+};
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 
 /// 200k 上下文扣除 20k 摘要输出预算和 13k 下一轮缓冲后的自动压缩阈值。
 const DEFAULT_COMPACT_THRESHOLD_TOKENS: usize = 167_000;
@@ -24,23 +35,8 @@ const RECENT_CONTEXT_TARGET_TOKENS: usize = 40_000;
 /// 微压缩始终原样保留的最近工具结果数量。
 const RECENT_TOOL_RESULTS_TO_KEEP: usize = 3;
 /// Claude Code 为完整摘要预留的最大输出 token 数。
-const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 20_000;
-/// Genome Context Policy 激活元数据中的规范 JSON 键。
-const CONTEXT_POLICY_JSON_METADATA_KEY: &str = "context_policy_json";
-/// Genome Context Policy 激活元数据中的 CAS 摘要键。
-const CONTEXT_POLICY_DIGEST_METADATA_KEY: &str = "context_policy_digest";
-/// 当前插件消费的 Context Policy 结构版本。
-const CONTEXT_POLICY_SCHEMA_VERSION: u32 = 1;
-/// Context Policy 自动压缩水位允许的固定范围。
-const MIN_CONTEXT_THRESHOLD_TOKENS: u32 = 4_096;
-const MAX_CONTEXT_THRESHOLD_TOKENS: u32 = 2_000_000;
-/// Context Policy 各有界计数和摘要预算的固定上限。
-const MAX_RECENT_MESSAGE_COUNT: u16 = 256;
-const MAX_PINNED_ITEM_COUNT: u16 = 256;
-const MAX_RECENT_TOOL_RESULT_COUNT: u16 = 64;
-const MIN_SUMMARY_TOKEN_BUDGET: u32 = 256;
-const MAX_SUMMARY_TOKEN_BUDGET: u32 = 32_768;
-const MIN_SUMMARY_VALIDATION_COVERAGE_BPS: u16 = 9_500;
+/// 原生上下文摘要请求允许的默认最大输出 token 数。
+pub const DEFAULT_MAX_SUMMARY_TOKENS: u32 = 20_000;
 /// 上游显式结构化用户约束消息的稳定 JSON schema。
 const USER_CONSTRAINT_MARKER_SCHEMA: &str = "lucia.context/user-constraint/v1";
 /// 上游显式结构化事实消息的稳定 JSON schema；事实正文只进入摘要，不进入固定区。
@@ -69,182 +65,102 @@ const SUMMARY_REQUEST_PROMPT: &str = r#"请为此前对话生成一份详细的�
 
 不要调用工具，不要虚构信息，不要把摘要写成泛泛建议。直接输出 <summary>...</summary>，确保仅凭摘要和后续保留的近期消息即可继续工作。"#;
 
-/// 提供分层上下文压缩能力的插件。
+/// 压缩算法内部使用的 JSON 消息请求；只在 Core 类型边界做一次双向转换。
+#[derive(Clone)]
+struct ContextLoadRequest {
+    run_id: String,
+    step: usize,
+    provider: String,
+    model: String,
+    system: Option<String>,
+    messages: Vec<Value>,
+    user_initiated: bool,
+}
+
+/// 压缩算法内部使用的 JSON 消息结果。
+struct LoadedContext {
+    system: Option<String>,
+    messages: Vec<Value>,
+}
+
+fn encode_core_request(request: CoreContextLoadRequest) -> Result<ContextLoadRequest> {
+    Ok(ContextLoadRequest {
+        run_id: request.run_id,
+        step: request.step,
+        provider: request.provider,
+        model: request.model,
+        system: request.system,
+        messages: request
+            .messages
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<serde_json::Result<Vec<_>>>()
+            .context("编码 Core 上下文消息失败")?,
+        user_initiated: request.user_initiated,
+    })
+}
+
+fn decode_core_context(context: LoadedContext) -> Result<CoreLoadedContext> {
+    Ok(CoreLoadedContext {
+        system: context.system,
+        messages: context
+            .messages
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<serde_json::Result<Vec<_>>>()
+            .context("解码原生压缩上下文消息失败")?,
+    })
+}
+
+/// 一份已经由装配层从 Artifact CAS 校验并固定的 Context Policy。
+#[derive(Debug, Clone)]
+pub struct NativeContextPolicy {
+    policy: ContextPolicyV1,
+    artifact_digest: ArtifactDigest,
+}
+
+impl NativeContextPolicy {
+    /// 创建原生 Context Policy 绑定，并再次校验协议约束。
+    ///
+    /// # Errors
+    ///
+    /// 策略版本、阈值、保留数量或验证安全下限无效时返回错误。
+    pub fn new(policy: ContextPolicyV1, artifact_digest: ArtifactDigest) -> Result<Self> {
+        policy
+            .validate()
+            .map_err(|error| anyhow!("Context Policy 无效：{error}"))?;
+        Ok(Self {
+            policy,
+            artifact_digest,
+        })
+    }
+
+    /// 返回 Genome 中绑定原生 Context Policy 的稳定所有者 ID。
+    pub fn owner_id() -> &'static str {
+        NATIVE_CONTEXT_POLICY_ID
+    }
+}
+
+/// Lucia 默认原生上下文加载器。
+///
+/// 加载器在每次模型请求前按水位执行微压缩或模型摘要，并维护同一 Run 内的追加缓存。
+/// 它只使用应用固定的模型路由，摘要请求禁用工具与推理；可选 Context Policy 必须由
+/// [`NativeContextPolicy`] 绑定到已校验 CAS 摘要。
+pub struct NativeContextLoader {
+    gateway: ModelGateway,
+    provider: String,
+    model: String,
+    stream: bool,
+    max_summary_tokens: u32,
+    events: Arc<dyn EventSink>,
+    policy: Option<NativeContextPolicy>,
+    state: Mutex<CompressionState>,
+}
+
 #[derive(Default)]
-struct ContextPlugin {
+struct CompressionState {
     /// 最近一次自动压缩结果，用于增量追加后续消息，避免重复处理同一历史前缀。
     cache: Option<CompressionCache>,
-    /// `None` 表示未注入 Genome 策略，完整保持历史默认行为。
-    policy: Option<ContextPolicyV1>,
-    /// 已由插件按激活 JSON 重新计算并核对的 CAS 摘要。
-    policy_digest: Option<String>,
-}
-
-/// 旧 ToolResult 的版本化保留策略；JSON 形态与 M6 控制面协议一致。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ToolResultRetentionPolicyV1 {
-    /// 原样保留全部 ToolResult。
-    PreserveAll,
-    /// 原样保留错误和指定数量的近期成功结果。
-    PreserveErrorsAndRecent {
-        /// 从新到旧保留的成功结果数量。
-        recent_successful_results: u16,
-    },
-}
-
-impl Default for ToolResultRetentionPolicyV1 {
-    fn default() -> Self {
-        Self::PreserveErrorsAndRecent {
-            recent_successful_results: 3,
-        }
-    }
-}
-
-/// 显式结构化用户约束的固定区策略。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum UserConstraintRetentionPolicyV1 {
-    /// 固定区逐值保留，不要求摘要信封重复 ID。
-    PinnedStructured { max_items: u16 },
-    /// 固定区逐值保留，并要求摘要信封确认全部 ID。
-    PinnedStructuredAndSummary { max_items: u16 },
-}
-
-impl Default for UserConstraintRetentionPolicyV1 {
-    fn default() -> Self {
-        Self::PinnedStructuredAndSummary { max_items: 64 }
-    }
-}
-
-/// plan-plugin 结构化快照的固定区策略。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PlanSnapshotRetentionPolicyV1 {
-    /// 保留最新完整快照，不要求摘要信封重复修订号。
-    LatestSnapshot { max_items: u16 },
-    /// 保留最新完整快照，并要求摘要信封确认修订号。
-    LatestSnapshotAndSummary { max_items: u16 },
-}
-
-impl Default for PlanSnapshotRetentionPolicyV1 {
-    fn default() -> Self {
-        Self::LatestSnapshotAndSummary { max_items: 100 }
-    }
-}
-
-/// 摘要后允许的确定性验证算法。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PostSummaryValidationAlgorithmV1 {
-    /// 对稳定标记做逐字节集合覆盖验证。
-    StructuredMarkerCoverageV1 { min_coverage_bps: u16 },
-}
-
-impl Default for PostSummaryValidationAlgorithmV1 {
-    fn default() -> Self {
-        Self::StructuredMarkerCoverageV1 {
-            min_coverage_bps: 10_000,
-        }
-    }
-}
-
-/// 插件侧兼容读取的 M6 Context Policy V1。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-struct ContextPolicyV1 {
-    schema_version: u32,
-    micro_compact_threshold_tokens: u32,
-    full_compact_threshold_tokens: u32,
-    recent_message_count: u16,
-    tool_result_retention: ToolResultRetentionPolicyV1,
-    user_constraints: UserConstraintRetentionPolicyV1,
-    plan_snapshot: PlanSnapshotRetentionPolicyV1,
-    summary_token_budget: u32,
-    post_summary_validation: PostSummaryValidationAlgorithmV1,
-}
-
-impl Default for ContextPolicyV1 {
-    fn default() -> Self {
-        Self {
-            schema_version: CONTEXT_POLICY_SCHEMA_VERSION,
-            micro_compact_threshold_tokens: DEFAULT_MICRO_COMPACT_THRESHOLD_TOKENS as u32,
-            full_compact_threshold_tokens: DEFAULT_COMPACT_THRESHOLD_TOKENS as u32,
-            recent_message_count: 8,
-            tool_result_retention: ToolResultRetentionPolicyV1::default(),
-            user_constraints: UserConstraintRetentionPolicyV1::default(),
-            plan_snapshot: PlanSnapshotRetentionPolicyV1::default(),
-            summary_token_budget: SUMMARY_MAX_OUTPUT_TOKENS,
-            post_summary_validation: PostSummaryValidationAlgorithmV1::default(),
-        }
-    }
-}
-
-impl ContextPolicyV1 {
-    /// 复核 Guest 实际执行的版本、范围关系与不可关闭安全下限。
-    fn validate(&self) -> Result<()> {
-        if self.schema_version != CONTEXT_POLICY_SCHEMA_VERSION {
-            return Err(anyhow!(
-                "不支持的 Context Policy schema_version：{}",
-                self.schema_version
-            ));
-        }
-        for (name, value) in [
-            (
-                "micro_compact_threshold_tokens",
-                self.micro_compact_threshold_tokens,
-            ),
-            (
-                "full_compact_threshold_tokens",
-                self.full_compact_threshold_tokens,
-            ),
-        ] {
-            if !(MIN_CONTEXT_THRESHOLD_TOKENS..=MAX_CONTEXT_THRESHOLD_TOKENS).contains(&value) {
-                return Err(anyhow!("Context Policy `{name}` 超出允许范围"));
-            }
-        }
-        if self.micro_compact_threshold_tokens >= self.full_compact_threshold_tokens {
-            return Err(anyhow!("Context Policy 微压缩水位必须小于完整压缩水位"));
-        }
-        if self.recent_message_count == 0 || self.recent_message_count > MAX_RECENT_MESSAGE_COUNT {
-            return Err(anyhow!(
-                "Context Policy `recent_message_count` 超出允许范围"
-            ));
-        }
-        if let ToolResultRetentionPolicyV1::PreserveErrorsAndRecent {
-            recent_successful_results,
-        } = &self.tool_result_retention
-        {
-            if *recent_successful_results == 0
-                || *recent_successful_results > MAX_RECENT_TOOL_RESULT_COUNT
-            {
-                return Err(anyhow!("Context Policy 近期 ToolResult 数量超出允许范围"));
-            }
-        }
-        for (name, value) in [
-            (
-                "user_constraints.max_items",
-                constraint_limit(&self.user_constraints),
-            ),
-            ("plan_snapshot.max_items", plan_limit(&self.plan_snapshot)),
-        ] {
-            if value == 0 || value > MAX_PINNED_ITEM_COUNT {
-                return Err(anyhow!("Context Policy `{name}` 超出允许范围"));
-            }
-        }
-        if !((MIN_SUMMARY_TOKEN_BUDGET..=MAX_SUMMARY_TOKEN_BUDGET)
-            .contains(&self.summary_token_budget)
-            && self.summary_token_budget < self.full_compact_threshold_tokens)
-        {
-            return Err(anyhow!("Context Policy 摘要 token 预算无效"));
-        }
-        let PostSummaryValidationAlgorithmV1::StructuredMarkerCoverageV1 { min_coverage_bps } =
-            self.post_summary_validation;
-        if !(MIN_SUMMARY_VALIDATION_COVERAGE_BPS..=10_000).contains(&min_coverage_bps) {
-            return Err(anyhow!("Context Policy 摘要验证覆盖率无效"));
-        }
-        Ok(())
-    }
 }
 
 /// 返回结构化约束固定区上限。
@@ -264,6 +180,7 @@ fn plan_limit(policy: &PlanSnapshotRetentionPolicyV1) -> u16 {
 }
 
 /// 最近一次自动压缩的追加边界与有效模型上下文。
+#[derive(Clone)]
 struct CompressionCache {
     /// 同一 Agent 运行内的会话消息只会追加，跨运行必须使缓存失效。
     run_id: String,
@@ -275,155 +192,178 @@ struct CompressionCache {
     loaded_messages: Vec<Value>,
 }
 
-impl ContextPlugin {
-    /// 复用已压缩历史，只把当前请求新增的消息追加到有效上下文后再判断水位。
-    fn compress_incrementally(
-        &mut self,
+impl NativeContextLoader {
+    /// 创建默认原生上下文加载器。
+    ///
+    /// `max_summary_tokens` 是可信运行策略允许的摘要输出上限；Genome Policy 只能继续收紧。
+    /// `events` 接收微压缩、完整压缩和手动跳过事件，供 TUI 与 Evidence 共用同一事实源。
+    ///
+    /// # Errors
+    ///
+    /// 模型路由为空或摘要输出上限为零时返回错误。
+    pub fn new(
+        gateway: ModelGateway,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        stream: bool,
+        max_summary_tokens: u32,
+        policy: Option<NativeContextPolicy>,
+        events: Arc<dyn EventSink>,
+    ) -> Result<Self> {
+        let provider = provider.into();
+        let model = model.into();
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return Err(anyhow!("原生上下文压缩的模型路由不能为空"));
+        }
+        if max_summary_tokens == 0 {
+            return Err(anyhow!("原生上下文压缩的摘要 token 上限必须大于零"));
+        }
+        Ok(Self {
+            gateway,
+            provider,
+            model,
+            stream,
+            max_summary_tokens,
+            events,
+            policy,
+            state: Mutex::new(CompressionState::default()),
+        })
+    }
+
+    /// 在不持有锁的情况下构造本轮有效请求及缓存更新元数据。
+    fn prepare_request(
+        &self,
         request: ContextLoadRequest,
-        summarize: &SummaryFunction<'_>,
-    ) -> Result<CompressionOutcome> {
-        let cache_hit = self.cache.as_ref().is_some_and(|cache| {
-            // Agent 在单次 run 中只会向 Session 追加消息；避免比较超大 JSON 前缀，
-            // 否则微压缩后的下一轮会在 Guest 内耗尽 fuel。
+    ) -> Result<(ContextLoadRequest, CachePlan)> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?;
+        if request.user_initiated {
+            state.cache = None;
+            return Ok((request, CachePlan::Manual));
+        }
+        let cache = state.cache.clone();
+        let cache_hit = cache.as_ref().is_some_and(|cache| {
             cache.run_id == request.run_id
                 && cache.provider == request.provider
                 && cache.model == request.model
                 && cache.system == request.system
                 && request.messages.len() >= cache.source_message_count
         });
-        let source_message_count = request.messages.len();
-        let run_id = request.run_id.clone();
-        let provider = request.provider.clone();
-        let model = request.model.clone();
-        let system = request.system.clone();
-        let effective_request = if cache_hit {
-            let cache = self.cache.as_ref().expect("命中缓存时必须存在缓存内容");
-            let mut messages = cache.loaded_messages.clone();
-            messages.extend_from_slice(&request.messages[cache.source_message_count..]);
-            ContextLoadRequest {
-                messages,
-                ..request
-            }
-        } else {
-            request
+        let plan = CachePlan::Automatic {
+            run_id: request.run_id.clone(),
+            provider: request.provider.clone(),
+            model: request.model.clone(),
+            system: request.system.clone(),
+            source_message_count: request.messages.len(),
+            cache_hit,
         };
-        let outcome = compress_context(
-            effective_request,
-            false,
-            self.policy.as_ref(),
-            self.policy_digest.as_deref(),
-            summarize,
-        )?;
+        if let Some(cache) = cache.filter(|_| cache_hit) {
+            let mut messages = cache.loaded_messages;
+            messages.extend_from_slice(&request.messages[cache.source_message_count..]);
+            Ok((
+                ContextLoadRequest {
+                    messages,
+                    ..request
+                },
+                plan,
+            ))
+        } else {
+            Ok((request, plan))
+        }
+    }
 
-        if cache_hit || outcome.event.is_some() {
-            self.cache = Some(CompressionCache {
+    /// 提交本轮压缩结果；模型调用期间不持有缓存锁。
+    fn commit_cache(&self, plan: CachePlan, outcome: &CompressionOutcome) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?;
+        match plan {
+            CachePlan::Manual => state.cache = None,
+            CachePlan::Automatic {
                 run_id,
                 provider,
                 model,
                 system,
                 source_message_count,
-                loaded_messages: outcome.context.messages.clone(),
-            });
-        } else {
-            self.cache = None;
+                cache_hit,
+            } if cache_hit || outcome.event.is_some() => {
+                state.cache = Some(CompressionCache {
+                    run_id,
+                    provider,
+                    model,
+                    system,
+                    source_message_count,
+                    loaded_messages: outcome.context.messages.clone(),
+                });
+            }
+            CachePlan::Automatic { .. } => state.cache = None,
         }
-        Ok(outcome)
+        Ok(())
+    }
+
+    /// 把压缩事实写入 Agent 事件流；无事件的透传请求不产生记录。
+    async fn emit_event(&self, request: &ContextLoadRequest, event: Option<&Value>) -> Result<()> {
+        let Some(event) = event else {
+            return Ok(());
+        };
+        self.events
+            .record(&AgentEvent::new(
+                request.run_id.clone(),
+                AgentEventKind::Extension,
+                request.step,
+                event.clone(),
+            ))
+            .await
+            .context("记录原生上下文压缩事件失败")
     }
 }
 
-impl AgentPlugin for ContextPlugin {
-    /// 激活时消费 Host 按插件 ID 隔离注入的 Context Policy，并复核原始 JSON 摘要。
-    ///
-    /// 两个元数据键都不存在时保持历史默认算法；只出现一个键、JSON 无效或摘要不匹配时
-    /// 失败关闭，避免运行未被 Genome 固定的策略。
-    fn activate(&mut self, _host: &dyn PluginHostApi, context: ActivationContext) -> Result<()> {
-        let policy_json = context.metadata.get(CONTEXT_POLICY_JSON_METADATA_KEY);
-        let policy_digest = context.metadata.get(CONTEXT_POLICY_DIGEST_METADATA_KEY);
-        match (policy_json, policy_digest) {
-            (None, None) => {
-                self.policy = None;
-                self.policy_digest = None;
-            }
-            (Some(policy_json), Some(policy_digest)) => {
-                let actual_digest = format!("sha256:{:x}", Sha256::digest(policy_json.as_bytes()));
-                if actual_digest != *policy_digest {
-                    return Err(anyhow!(
-                        "Context Policy 摘要不匹配：声明 {policy_digest}，实际 {actual_digest}"
-                    ));
-                }
-                let policy: ContextPolicyV1 = serde_json::from_str(policy_json)
-                    .context("解析 Host 注入的 Context Policy JSON 失败")?;
-                policy.validate()?;
-                self.policy = Some(policy);
-                self.policy_digest = Some(policy_digest.clone());
-            }
-            _ => {
-                return Err(anyhow!(
-                    "Context Policy 激活元数据不完整，正文和摘要必须同时存在"
-                ));
-            }
-        }
-        self.cache = None;
-        Ok(())
-    }
+enum CachePlan {
+    Manual,
+    Automatic {
+        run_id: String,
+        provider: String,
+        model: String,
+        system: Option<String>,
+        source_message_count: usize,
+        cache_hit: bool,
+    },
+}
 
-    /// 释放仅服务于运行期请求的压缩缓存。
-    fn deactivate(&mut self, _host: &dyn PluginHostApi) -> Result<()> {
-        self.cache = None;
-        Ok(())
-    }
-
-    /// 根据估算 token 水位透传、微压缩或完整压缩上下文，并发布对应事件。
+#[async_trait]
+impl ContextLoader for NativeContextLoader {
+    /// 根据估算 token 水位透传、微压缩或完整压缩上下文。
     ///
-    /// 用户显式发起的加载（`user_initiated`）跳过增量缓存与水位判断，
-    /// 无条件执行完整压缩策略并始终返回替换上下文。
-    fn load_context(
-        &mut self,
-        host: &dyn PluginHostApi,
-        request: ContextLoadRequest,
-    ) -> Result<Option<LoadedContext>> {
-        if request.user_initiated {
-            self.cache = None;
-            let summarize = |messages: &[Value], requirements: &SummaryRequirements, max_tokens| {
-                summarize_with_model(host, messages, requirements, max_tokens)
-            };
-            let outcome = compress_context(
-                request,
-                true,
-                self.policy.as_ref(),
-                self.policy_digest.as_deref(),
-                &summarize,
-            )?;
-            if let Some(event) = outcome.event {
-                host.emit_event(&event)?;
-            }
-            return Ok(Some(outcome.context));
-        }
-        let cache_hit = self.cache.as_ref().is_some_and(|cache| {
-            cache.run_id == request.run_id
-                && cache.provider == request.provider
-                && cache.model == request.model
-                && cache.system == request.system
-                && request.messages.len() >= cache.source_message_count
-        });
-        let summarize = |messages: &[Value], requirements: &SummaryRequirements, max_tokens| {
-            summarize_with_model(host, messages, requirements, max_tokens)
-        };
-        let outcome = self.compress_incrementally(request, &summarize)?;
-        if let Some(event) = outcome.event {
-            host.emit_event(&event)?;
-            return Ok(Some(outcome.context));
-        }
-        // 未压缩的完整历史已由 Host 持有，无需跨 WASM 边界往返序列化。
-        // 命中缓存时仍须返回插件维护的已压缩上下文及本轮追加消息。
-        Ok(cache_hit.then_some(outcome.context))
+    /// 手动请求跳过自动水位并清空增量缓存；摘要失败、策略验证失败或事件持久化失败时
+    /// 关闭本轮模型请求，不会静默退回未固定行为。
+    async fn load(&self, request: CoreContextLoadRequest) -> Result<CoreLoadedContext> {
+        let (effective, plan) = self.prepare_request(encode_core_request(request)?)?;
+        let policy = self.policy.as_ref().map(|binding| &binding.policy);
+        let policy_digest = self
+            .policy
+            .as_ref()
+            .map(|binding| binding.artifact_digest.to_string());
+        let outcome = compress_context(
+            effective.clone(),
+            effective.user_initiated,
+            policy,
+            policy_digest.as_deref(),
+            self,
+        )
+        .await?;
+        self.commit_cache(plan, &outcome)?;
+        self.emit_event(&effective, outcome.event.as_ref()).await?;
+        decode_core_context(outcome.context)
     }
 }
 
 /// 一次压缩计算的上下文和可选展示事件。
 struct CompressionOutcome {
     context: LoadedContext,
-    event: Option<ExtensionEvent>,
+    event: Option<Value>,
 }
 
 /// 完整压缩生成的替换消息、摘要范围和模型用量。
@@ -470,17 +410,31 @@ struct PinnedMessages {
     plan_message_index: Option<usize>,
 }
 
-/// 摘要调用的内部函数签名，统一约束模型输入、标记要求和输出预算。
-type SummaryFunction<'a> =
-    dyn Fn(&[Value], &SummaryRequirements, u32) -> Result<ModelCompletionResponse> + 'a;
+/// 摘要模型调用的最小内部结果。
+struct SummaryResponse {
+    text: String,
+    usage: Option<Value>,
+}
+
+/// 上下文压缩只依赖该受限摘要接口，测试可注入不联网的确定性实现。
+#[async_trait]
+trait ContextSummarizer: Send + Sync {
+    /// 摘要指定旧历史，并逐字遵守结构化标记与输出预算。
+    async fn summarize(
+        &self,
+        messages: &[Value],
+        requirements: &SummaryRequirements,
+        max_tokens: u32,
+    ) -> Result<SummaryResponse>;
+}
 
 /// 按模型窗口、当前输入规模和手动请求选择分层压缩策略。
-fn compress_context(
+async fn compress_context(
     request: ContextLoadRequest,
     manual: bool,
     policy: Option<&ContextPolicyV1>,
     policy_digest: Option<&str>,
-    summarize: &SummaryFunction<'_>,
+    summarizer: &dyn ContextSummarizer,
 ) -> Result<CompressionOutcome> {
     let before_messages = request.messages.len();
     let before_tokens = estimate_context_tokens(request.system.as_deref(), &request.messages);
@@ -494,7 +448,9 @@ fn compress_context(
     let policy_summary = policy.map(policy_event_data);
 
     if manual || before_tokens >= compact_threshold {
-        if let Some(compacted) = compact_messages(&request.messages, manual, policy, summarize)? {
+        if let Some(compacted) =
+            compact_messages(&request.messages, manual, policy, summarizer).await?
+        {
             let CompactedMessages {
                 messages,
                 summarized_messages,
@@ -510,9 +466,9 @@ fn compress_context(
                     system: request.system,
                     messages,
                 },
-                event: Some(ExtensionEvent {
-                    name: "context.compaction.completed".into(),
-                    data: json!({
+                event: Some(json!({
+                    "name": "context.compaction.completed",
+                    "data": {
                         "run_id": request.run_id,
                         "step": request.step,
                         "before_messages": before_messages,
@@ -530,13 +486,15 @@ fn compress_context(
                         "preserved_user_constraints": preserved_user_constraints,
                         "preserved_plan_snapshots": preserved_plan_snapshots,
                         "summary_max_output_tokens": policy
-                            .map_or(SUMMARY_MAX_OUTPUT_TOKENS, |policy| policy.summary_token_budget)
-                    }),
-                    presentation: Some(EventPresentation::divider(
-                        "上下文压缩",
-                        EventPresentationTone::Info,
-                    )),
-                }),
+                            .map_or(DEFAULT_MAX_SUMMARY_TOKENS, |policy| policy.summary_token_budget)
+                    },
+                    "presentation": {
+                        "target": "main_event_list",
+                        "variant": "divider",
+                        "tone": "info",
+                        "text": "上下文压缩"
+                    }
+                })),
             });
         }
     }
@@ -553,9 +511,9 @@ fn compress_context(
                     system: request.system,
                     messages,
                 },
-                event: Some(ExtensionEvent {
-                    name: "context.micro_compaction.completed".into(),
-                    data: json!({
+                event: Some(json!({
+                    "name": "context.micro_compaction.completed",
+                    "data": {
                         "run_id": request.run_id,
                         "step": request.step,
                         "before_messages": before_messages,
@@ -568,9 +526,9 @@ fn compress_context(
                         "policy_digest": policy_digest,
                         "policy": policy_summary,
                         "policy_verified": policy.is_some()
-                    }),
-                    presentation: None,
-                }),
+                    },
+                    "presentation": { "target": "none" }
+                })),
             });
         }
     }
@@ -581,20 +539,22 @@ fn compress_context(
                 system: request.system,
                 messages: request.messages,
             },
-            event: Some(ExtensionEvent {
-                name: "context.compaction.skipped".into(),
-                data: json!({
+            event: Some(json!({
+                "name": "context.compaction.skipped",
+                "data": {
                     "run_id": request.run_id,
                     "step": request.step,
                     "estimated_tokens": before_tokens,
                     "reason": "no_compressible_history",
                     "trigger": "manual"
-                }),
-                presentation: Some(EventPresentation::divider(
-                    "没有可压缩的历史上下文",
-                    EventPresentationTone::Muted,
-                )),
-            }),
+                },
+                "presentation": {
+                    "target": "main_event_list",
+                    "variant": "divider",
+                    "tone": "muted",
+                    "text": "没有可压缩的历史上下文"
+                }
+            })),
         });
     }
 
@@ -735,11 +695,11 @@ fn compactable_tool_result_count(message: &Value) -> usize {
 }
 
 /// 用独立模型摘要替换较旧 API 轮次；手动模式只保留最新完整轮次。
-fn compact_messages(
+async fn compact_messages(
     messages: &[Value],
     manual: bool,
     policy: Option<&ContextPolicyV1>,
-    summarize: &SummaryFunction<'_>,
+    summarizer: &dyn ContextSummarizer,
 ) -> Result<Option<CompactedMessages>> {
     let group_starts = api_round_group_starts(messages);
     if group_starts.len() < 2 {
@@ -756,10 +716,12 @@ fn compact_messages(
         None => PinnedMessages::default(),
     };
     let requirements = summary_requirements(messages, split_index, policy, &pinned)?;
-    let max_tokens = policy.map_or(SUMMARY_MAX_OUTPUT_TOKENS, |policy| {
+    let max_tokens = policy.map_or(DEFAULT_MAX_SUMMARY_TOKENS, |policy| {
         policy.summary_token_budget
     });
-    let response = summarize(&messages[..split_index], &requirements, max_tokens)?;
+    let response = summarizer
+        .summarize(&messages[..split_index], &requirements, max_tokens)
+        .await?;
     let (summary, markers) = normalize_model_summary(&response.text, policy.is_some())?;
     if let Some(policy) = policy {
         verify_summary_markers(
@@ -1193,32 +1155,69 @@ fn recent_tail_start(
 }
 
 /// 通过 Host 固定路由调用模型生成摘要；Guest 无法指定 provider、model 或工具。
-fn summarize_with_model(
-    host: &dyn PluginHostApi,
-    messages: &[Value],
-    requirements: &SummaryRequirements,
-    max_tokens: u32,
-) -> Result<ModelCompletionResponse> {
-    let mut summary_messages = messages.to_vec();
-    let request_prompt = if requirements.schema_version == 0 {
-        SUMMARY_REQUEST_PROMPT.to_string()
-    } else {
-        let marker_contract =
-            serde_json::to_string(requirements).context("编码 Context Policy 摘要标记要求失败")?;
-        format!(
-            "{SUMMARY_REQUEST_PROMPT}\n\n在 summary 标签之后逐字输出以下标记信封；不得增删 ID 或修改 Plan 修订：\n{SUMMARY_MARKERS_OPEN}{marker_contract}{SUMMARY_MARKERS_CLOSE}"
-        )
-    };
-    summary_messages.push(json!({
-        "role": "user",
-        "content": [{"type": "text", "text": request_prompt}]
-    }));
-    host.complete_model(&ModelCompletionRequest {
-        system: Some(SUMMARY_SYSTEM_PROMPT.into()),
-        messages: summary_messages,
-        max_tokens: Some(max_tokens),
-    })
-    .context("调用模型生成上下文摘要失败")
+#[async_trait]
+impl ContextSummarizer for NativeContextLoader {
+    /// 使用应用固定的 provider/model 生成摘要；调用强制禁用工具、推理和 provider 逃生参数。
+    async fn summarize(
+        &self,
+        messages: &[Value],
+        requirements: &SummaryRequirements,
+        max_tokens: u32,
+    ) -> Result<SummaryResponse> {
+        let mut summary_messages = messages.to_vec();
+        let request_prompt = if requirements.schema_version == 0 {
+            SUMMARY_REQUEST_PROMPT.to_string()
+        } else {
+            let marker_contract = serde_json::to_string(requirements)
+                .context("编码 Context Policy 摘要标记要求失败")?;
+            format!(
+                "{SUMMARY_REQUEST_PROMPT}\n\n在 summary 标签之后逐字输出以下标记信封；不得增删 ID 或修改 Plan 修订：\n{SUMMARY_MARKERS_OPEN}{marker_contract}{SUMMARY_MARKERS_CLOSE}"
+            )
+        };
+        summary_messages.push(json!({
+            "role": "user",
+            "content": [{"type": "text", "text": request_prompt}]
+        }));
+        let messages = summary_messages
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<serde_json::Result<Vec<_>>>()
+            .context("解码上下文摘要模型消息失败")?;
+        let mut request = ModelRequest::new(self.model.clone(), messages);
+        request.system = Some(SUMMARY_SYSTEM_PROMPT.into());
+        request.tool_choice = ToolChoice::None;
+        request.reasoning = ReasoningLevel::Off;
+        request.max_tokens = Some(max_tokens.min(self.max_summary_tokens).max(1));
+        let response = if self.stream {
+            self.gateway
+                .stream(&self.provider, request)
+                .await
+                .context("启动原生上下文摘要流失败")?
+                .result()
+                .await
+                .context("原生上下文摘要流调用失败")?
+        } else {
+            self.gateway
+                .complete(&self.provider, request)
+                .await
+                .context("原生上下文摘要模型调用失败")?
+        };
+        if !response.tool_calls.is_empty() {
+            return Err(anyhow!("原生上下文摘要返回了未授权工具调用"));
+        }
+        let text = response.text_content();
+        if text.trim().is_empty() {
+            return Err(anyhow!("原生上下文摘要返回了空文本"));
+        }
+        Ok(SummaryResponse {
+            text,
+            usage: response
+                .usage
+                .map(serde_json::to_value)
+                .transpose()
+                .context("编码上下文摘要用量失败")?,
+        })
+    }
 }
 
 /// 清理模型可能返回的分析草稿和 summary 标签，并拒绝空摘要。
@@ -1286,8 +1285,6 @@ fn remove_tagged_section(text: &str, open: &str, close: &str) -> String {
     format!("{}{}", &text[..start], &text[end..])
 }
 
-export_plugin!(ContextPlugin);
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1333,29 +1330,37 @@ mod tests {
     }
 
     /// 返回测试使用的确定性模型摘要，并模拟 Provider 用量。
-    fn test_summary(
-        _messages: &[Value],
-        _requirements: &SummaryRequirements,
-        _max_tokens: u32,
-    ) -> Result<ModelCompletionResponse> {
-        Ok(ModelCompletionResponse {
-            text: "<analysis>测试草稿</analysis><summary>模型生成的上下文摘要：保留用户请求、错误状态与下一步。</summary>".into(),
-            usage: Some(json!({
-                "input_tokens": 100,
-                "output_tokens": 20,
-                "total_tokens": 120
-            })),
-        })
+    struct TestSummarizer;
+
+    #[async_trait]
+    impl ContextSummarizer for TestSummarizer {
+        async fn summarize(
+            &self,
+            _messages: &[Value],
+            _requirements: &SummaryRequirements,
+            _max_tokens: u32,
+        ) -> Result<SummaryResponse> {
+            Ok(SummaryResponse {
+                text: "<analysis>测试草稿</analysis><summary>模型生成的上下文摘要：保留用户请求、错误状态与下一步。</summary>".into(),
+                usage: Some(json!({
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "total_tokens": 120
+                })),
+            })
+        }
     }
 
     /// 使用确定性摘要器执行一次测试压缩。
-    fn compress_for_test(request: ContextLoadRequest, manual: bool) -> CompressionOutcome {
-        compress_context(request, manual, None, None, &test_summary).expect("测试压缩应成功")
+    async fn compress_for_test(request: ContextLoadRequest, manual: bool) -> CompressionOutcome {
+        compress_context(request, manual, None, None, &TestSummarizer)
+            .await
+            .expect("测试压缩应成功")
     }
 
     /// 低于水位时必须完整透传，避免短会话发生无意义改写。
-    #[test]
-    fn keeps_small_context_unchanged() {
+    #[tokio::test]
+    async fn keeps_small_context_unchanged() {
         let messages = vec![text_message("user", "检查当前实现")];
         let outcome = compress_for_test(
             ContextLoadRequest {
@@ -1368,15 +1373,16 @@ mod tests {
                 messages: messages.clone(),
             },
             false,
-        );
+        )
+        .await;
 
         assert_eq!(outcome.context.messages, messages);
         assert!(outcome.event.is_none());
     }
 
     /// 微压缩只清理旧结果，最近三条工具结果必须保持原文。
-    #[test]
-    fn micro_compaction_preserves_recent_tool_results() {
+    #[tokio::test]
+    async fn micro_compaction_preserves_recent_tool_results() {
         let messages = (0..6)
             .map(|index| tool_result_message(index, 70_000))
             .collect::<Vec<_>>();
@@ -1391,17 +1397,21 @@ mod tests {
                 messages,
             },
             false,
-        );
+        )
+        .await;
 
         assert_eq!(
-            outcome.event.as_ref().map(|event| event.name.as_str()),
-            Some("context.micro_compaction.completed")
-        );
-        assert!(
             outcome
                 .event
                 .as_ref()
-                .is_some_and(|event| event.presentation.is_none()),
+                .and_then(|event| event["name"].as_str()),
+            Some("context.micro_compaction.completed")
+        );
+        assert!(
+            outcome.event.as_ref().is_some_and(|event| event
+                .pointer("/presentation/target")
+                .and_then(Value::as_str)
+                == Some("none")),
             "微压缩事件不应请求 UI 展示"
         );
         for message in &outcome.context.messages[..3] {
@@ -1419,8 +1429,8 @@ mod tests {
     }
 
     /// 微压缩不能清理失败结果，否则后续模型会失去仍待处理的错误状态。
-    #[test]
-    fn micro_compaction_preserves_failed_tool_results() {
+    #[tokio::test]
+    async fn micro_compaction_preserves_failed_tool_results() {
         let failure = failed_tool_result_message(0, "文件不存在：src/missing.rs");
         let mut messages = vec![failure.clone()];
         messages.extend((0..4).map(|index| tool_result_message(index, 100_000)));
@@ -1435,7 +1445,8 @@ mod tests {
                 messages,
             },
             false,
-        );
+        )
+        .await;
 
         assert_eq!(outcome.context.messages[0], failure);
         assert_eq!(
@@ -1445,10 +1456,8 @@ mod tests {
     }
 
     /// 完整压缩应生成结构化摘要，并逐字保留最近 API 轮次。
-    #[test]
-    fn full_compaction_summarizes_prefix_and_keeps_recent_rounds() {
-        use std::cell::RefCell;
-
+    #[tokio::test]
+    async fn full_compaction_summarizes_prefix_and_keeps_recent_rounds() {
         let recent_request = "继续修复最新失败用例";
         let messages = vec![
             text_message("user", "分析上下文压缩"),
@@ -1459,11 +1468,24 @@ mod tests {
             text_message("user", recent_request),
             text_message("assistant", "正在处理最新用例"),
         ];
-        let summarized_messages = RefCell::new(Vec::new());
-        let summarize = |messages: &[Value], requirements: &SummaryRequirements, max_tokens| {
-            summarized_messages.replace(messages.to_vec());
-            test_summary(messages, requirements, max_tokens)
-        };
+        struct RecordingSummarizer(Mutex<Vec<Value>>);
+
+        #[async_trait]
+        impl ContextSummarizer for RecordingSummarizer {
+            async fn summarize(
+                &self,
+                messages: &[Value],
+                requirements: &SummaryRequirements,
+                max_tokens: u32,
+            ) -> Result<SummaryResponse> {
+                *self.0.lock().expect("记录锁不应损坏") = messages.to_vec();
+                TestSummarizer
+                    .summarize(messages, requirements, max_tokens)
+                    .await
+            }
+        }
+
+        let summarizer = RecordingSummarizer(Mutex::new(Vec::new()));
         let outcome = compress_context(
             ContextLoadRequest {
                 run_id: "run-full".into(),
@@ -1477,12 +1499,16 @@ mod tests {
             false,
             None,
             None,
-            &summarize,
+            &summarizer,
         )
+        .await
         .expect("完整压缩应调用模型摘要");
 
         assert_eq!(
-            outcome.event.as_ref().map(|event| event.name.as_str()),
+            outcome
+                .event
+                .as_ref()
+                .and_then(|event| event["name"].as_str()),
             Some("context.compaction.completed")
         );
         assert_eq!(outcome.context.messages[0]["role"], "developer");
@@ -1491,12 +1517,15 @@ mod tests {
             .expect("摘要应为文本");
         assert!(summary.contains("模型生成的上下文摘要"));
         assert!(!summary.contains("测试草稿"));
-        assert!(summarized_messages
-            .borrow()
+        assert!(summarizer
+            .0
+            .lock()
+            .expect("记录锁不应损坏")
             .iter()
             .any(|message| message.to_string().contains("读取配置失败：权限不足")));
         assert_eq!(
-            outcome.event.as_ref().expect("应发布压缩事件").data["summary_usage"]["output_tokens"],
+            outcome.event.as_ref().expect("应发布压缩事件")["data"]["summary_usage"]
+                ["output_tokens"],
             20
         );
         assert!(outcome
@@ -1507,8 +1536,8 @@ mod tests {
     }
 
     /// 只有两个 API 轮次时也必须能压缩超大前缀，不能因保留轮次数下限失效。
-    #[test]
-    fn full_compaction_handles_two_api_rounds() {
+    #[tokio::test]
+    async fn full_compaction_handles_two_api_rounds() {
         let recent_request = "保留当前请求";
         let outcome = compress_for_test(
             ContextLoadRequest {
@@ -1525,10 +1554,14 @@ mod tests {
                 ],
             },
             false,
-        );
+        )
+        .await;
 
         assert_eq!(
-            outcome.event.as_ref().map(|event| event.name.as_str()),
+            outcome
+                .event
+                .as_ref()
+                .and_then(|event| event["name"].as_str()),
             Some("context.compaction.completed")
         );
         assert!(outcome
@@ -1539,8 +1572,8 @@ mod tests {
     }
 
     /// 手动压缩不受自动水位限制，并在存在历史轮次时生成完整摘要。
-    #[test]
-    fn manual_compaction_bypasses_automatic_threshold() {
+    #[tokio::test]
+    async fn manual_compaction_bypasses_automatic_threshold() {
         let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-manual".into(),
@@ -1556,21 +1589,25 @@ mod tests {
                 ],
             },
             true,
-        );
+        )
+        .await;
 
         assert_eq!(
-            outcome.event.as_ref().map(|event| event.name.as_str()),
+            outcome
+                .event
+                .as_ref()
+                .and_then(|event| event["name"].as_str()),
             Some("context.compaction.completed")
         );
         assert_eq!(
-            outcome.event.expect("应发布压缩事件").data["trigger"],
+            outcome.event.expect("应发布压缩事件")["data"]["trigger"],
             "manual"
         );
     }
 
     /// 自动压缩后新增消息应复用已压缩前缀，且不重复发布压缩事件。
-    #[test]
-    fn incremental_compaction_reuses_compacted_prefix() {
+    #[tokio::test]
+    async fn incremental_compaction_reuses_compacted_prefix() {
         let large_history = "历史工具输出".repeat(90_000);
         let original_messages = vec![
             text_message("user", &large_history),
@@ -1578,39 +1615,54 @@ mod tests {
             text_message("user", "继续处理"),
             text_message("assistant", "正在处理"),
         ];
-        let mut plugin = ContextPlugin::default();
-        let first = plugin
-            .compress_incrementally(
-                ContextLoadRequest {
-                    run_id: "incremental-run".into(),
-                    step: 0,
-                    user_initiated: false,
-                    provider: "test".into(),
-                    model: "test-model".into(),
-                    system: None,
-                    messages: original_messages.clone(),
-                },
-                &test_summary,
-            )
+        let loader = NativeContextLoader::new(
+            ModelGateway::new(),
+            "test",
+            "test-model",
+            false,
+            DEFAULT_MAX_SUMMARY_TOKENS,
+            None,
+            Arc::new(agent_core::InMemoryEventSink::new()),
+        )
+        .expect("应创建原生上下文加载器");
+        let (request, plan) = loader
+            .prepare_request(ContextLoadRequest {
+                run_id: "incremental-run".into(),
+                step: 0,
+                user_initiated: false,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages: original_messages.clone(),
+            })
+            .expect("应准备首次压缩请求");
+        let first = compress_context(request, false, None, None, &TestSummarizer)
+            .await
             .expect("首次增量压缩应成功");
+        loader
+            .commit_cache(plan, &first)
+            .expect("应提交首次压缩缓存");
         assert!(first.event.is_some(), "首轮超过水位时应执行自动压缩");
 
         let mut extended_messages = original_messages;
         extended_messages.push(text_message("user", "检查刚才的修改"));
-        let second = plugin
-            .compress_incrementally(
-                ContextLoadRequest {
-                    run_id: "incremental-run".into(),
-                    step: 1,
-                    user_initiated: false,
-                    provider: "test".into(),
-                    model: "test-model".into(),
-                    system: None,
-                    messages: extended_messages,
-                },
-                &test_summary,
-            )
+        let (request, plan) = loader
+            .prepare_request(ContextLoadRequest {
+                run_id: "incremental-run".into(),
+                step: 1,
+                user_initiated: false,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages: extended_messages,
+            })
+            .expect("应准备追加压缩请求");
+        let second = compress_context(request, false, None, None, &TestSummarizer)
+            .await
             .expect("后续增量压缩应成功");
+        loader
+            .commit_cache(plan, &second)
+            .expect("应提交追加压缩缓存");
 
         assert!(second.event.is_none(), "复用压缩前缀时不应重复发布压缩事件");
         assert_eq!(
@@ -1624,8 +1676,8 @@ mod tests {
     }
 
     /// 用户显式发起的压缩不受水位限制，立即返回替换上下文。
-    #[test]
-    fn user_initiated_compaction_returns_replacement_immediately() {
+    #[tokio::test]
+    async fn user_initiated_compaction_returns_replacement_immediately() {
         let request = ContextLoadRequest {
             run_id: "compact-now".into(),
             step: 0,
@@ -1641,7 +1693,8 @@ mod tests {
             ],
             user_initiated: true,
         };
-        let outcome = compress_context(request, true, None, None, &test_summary)
+        let outcome = compress_context(request, true, None, None, &TestSummarizer)
+            .await
             .expect("主动压缩应立即返回结果");
 
         assert_eq!(outcome.context.messages.len(), 3);
@@ -1649,7 +1702,7 @@ mod tests {
             .as_str()
             .is_some_and(|text| text.contains("本会话早期上下文已压缩")));
         assert_eq!(
-            outcome.event.expect("应发布压缩事件").data["trigger"],
+            outcome.event.expect("应发布压缩事件")["data"]["trigger"],
             "manual"
         );
     }

@@ -29,7 +29,7 @@ fn digest(character: char) -> ArtifactDigest {
     ArtifactDigest::from_sha256_hex(character.to_string().repeat(64)).expect("测试摘要应合法")
 }
 
-/// 创建包含真实 Skill provider 与受限能力 owner 的 Parent Genome。
+/// 创建包含受限证据能力 owner 的 Parent Genome；Skill 本身由 Kernel 原生装配。
 fn parent_genome() -> GenomeRevision {
     GenomeRevision::create(
         AgentGenome {
@@ -54,13 +54,16 @@ fn parent_genome() -> GenomeRevision {
             },
             prompt: PromptGenome::default(),
             plugins: vec![PluginGenome {
-                id: "skill".into(),
+                id: "evidence".into(),
                 version: "0.1.0".into(),
                 api_version: "0.7.0".into(),
                 bundle: digest('a'),
                 config_digest: None,
             }],
-            capability_owners: BTreeMap::from([("episode.read_redacted".into(), "skill".into())]),
+            capability_owners: BTreeMap::from([(
+                "episode.read_redacted".into(),
+                "evidence".into(),
+            )]),
             tools: ToolProfileGenome::default(),
             context_policy: None,
             planning_policy: None,
@@ -104,7 +107,7 @@ fn proposal(parent: &GenomeRevision, skill_id: SkillId) -> SkillMutationProposal
     }
 }
 
-/// 使用真实 Recorder 写入由 Host 包装插件来源的 Skill 使用事件。
+/// 使用真实 Recorder 写入由 Core 注入来源的原生 Skill 工具终态。
 async fn record_skill_episode(
     artifacts: Arc<FileArtifactStore>,
     episodes: Arc<FileEpisodeStore>,
@@ -128,21 +131,26 @@ async fn record_skill_episode(
     recorder
         .record(&AgentEvent::new(
             &run_id,
-            AgentEventKind::Extension,
+            AgentEventKind::ToolFinished,
             1,
             json!({
-                "source": { "type": "plugin", "id": "skill" },
-                "name": "skill.loaded.v1",
-                "data": {
-                    "schema_version": 1,
-                    "skill_id": skill_id,
-                    "artifact_digest": skill_digest,
-                    "call_id": call_id
+                "call_id": call_id,
+                "name": "skill_read",
+                "is_error": false,
+                "runtime_origin": "native",
+                "details": {
+                    "skill_usage": {
+                        "schema_version": 1,
+                        "skill_id": skill_id,
+                        "artifact_digest": skill_digest,
+                        "genome_revision_id": genome.revision_id,
+                        "genome_digest": genome.digest
+                    }
                 }
             }),
         ))
         .await
-        .expect("应记录真实 Skill 事件");
+        .expect("应记录真实原生 Skill 工具终态");
     recorder
         .record(&AgentEvent::new(
             &run_id,
@@ -208,7 +216,6 @@ async fn promotes_quarantined_candidate_and_proves_new_serve_usage() {
         artifacts.as_ref(),
         &evaluation_episode,
         &candidate_revision,
-        "skill",
     )
     .await
     .expect("原 Quarantined Candidate Revision 应产生可信评测绑定");
@@ -353,7 +360,7 @@ async fn promotes_quarantined_candidate_and_proves_new_serve_usage() {
     )
     .await;
     let proof = gate
-        .verify_post_promotion_use(receipt, episodes.as_ref(), &serve_episode, "skill")
+        .verify_post_promotion_use(receipt, episodes.as_ref(), &serve_episode)
         .await
         .expect("新运行应证明 Active Skill 实际可用");
     assert_eq!(proof.active_revision_id, receipt.active_genome.revision_id);

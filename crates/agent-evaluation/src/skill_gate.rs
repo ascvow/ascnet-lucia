@@ -1,7 +1,7 @@
 //! M7 Skill 的独立 Commit Policy 与可信 Gate。
 //!
 //! Gate 只接受真实 Genome Revision、可信 Builder 产出的 [`SkillCandidateV1`]，以及由
-//! Recorder/Host 绑定到真实插件事件的使用观察。无论 Candidate、Skill 还是插件自行声明
+//! Recorder/Core 绑定到真实原生工具事件的使用观察。无论 Candidate 还是 Skill 自行声明
 //! 成功，都不能绕过真实 Diff、能力子集与可信事件复核。
 
 use agent_evolution::{diff_genomes, GenomeDiffError};
@@ -20,7 +20,7 @@ pub const M7_SKILL_COMMIT_POLICY_VERSION: &str = "skill-commit-m7-v1";
 pub struct SkillCommitPolicyV1 {
     /// 策略语义版本；任何阈值或分类变化都必须更换。
     pub version: &'static str,
-    /// Gate Pass 所需的最少可信真实插件事件观察数。
+    /// Gate Pass 所需的最少可信原生 Skill 工具事件观察数。
     pub min_trusted_observations: usize,
     /// 是否把任一可信任务失败设为硬失败。
     pub reject_verified_failure: bool,
@@ -170,7 +170,7 @@ pub fn evaluate_skill_candidate_with_policy(
         .collect::<BTreeMap<_, _>>();
     let mut trusted_observations = Vec::new();
     for observation in observations {
-        let event_id = &observation.binding.plugin_event.event_id;
+        let event_id = &observation.binding.tool_event.event_id;
         let valid_binding = trusted_usage_bindings
             .get(event_id)
             .is_some_and(|binding| observation.validate(binding).is_ok());
@@ -200,13 +200,13 @@ pub fn evaluate_skill_candidate_with_policy(
     }
     trusted_observations.sort_by(|left, right| {
         left.binding
-            .plugin_event
+            .tool_event
             .event_id
-            .cmp(&right.binding.plugin_event.event_id)
+            .cmp(&right.binding.tool_event.event_id)
     });
     let before_dedup = trusted_observations.len();
     trusted_observations.dedup_by(|left, right| {
-        left.binding.plugin_event.event_id == right.binding.plugin_event.event_id
+        left.binding.tool_event.event_id == right.binding.tool_event.event_id
     });
     if trusted_observations.len() != before_dedup {
         failures.insert(SkillGateFailureV1::Integrity);
@@ -320,7 +320,7 @@ mod tests {
     use agent_evolution_protocol::{
         AgentGenome, ArtifactDigest, CandidateId, EvolutionCycleId, ModelGenome, MutationId,
         OutcomeRevisionId, PluginGenome, PromptGenome, RuntimeIdentity, SkillId, SkillRef,
-        SkillUsageEvidenceSourceV1, ToolProfileGenome, TrustedPluginEventRefV1,
+        SkillUsageEvidenceSourceV1, ToolProfileGenome, TrustedSkillToolEventRefV1,
         GENOME_SCHEMA_VERSION, SKILL_CANDIDATE_SCHEMA_VERSION,
         SKILL_USAGE_OBSERVATION_SCHEMA_VERSION,
     };
@@ -422,11 +422,11 @@ mod tests {
             genome_revision_id: candidate.revision_id.clone(),
             skill_id,
             skill_artifact_digest: artifact_digest,
-            plugin_event: TrustedPluginEventRefV1 {
+            tool_event: TrustedSkillToolEventRefV1 {
                 event_id: EventId::generate(),
                 sequence: 3,
-                owner_plugin_id: "agent.skill-loader".into(),
-                event_kind: "skill_invoked.v1".into(),
+                runtime_origin: "native".into(),
+                tool_name: "skill_read".into(),
                 payload_digest: digest('3'),
             },
         };
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn passes_only_with_real_skill_diff_and_trusted_usage() {
         let (parent, candidate, trusted_candidate, binding, observation) = fixture();
-        let bindings = BTreeMap::from([(binding.plugin_event.event_id.clone(), binding)]);
+        let bindings = BTreeMap::from([(binding.tool_event.event_id.clone(), binding)]);
         let result = evaluate_skill_candidate(
             &parent,
             &candidate,
@@ -466,7 +466,7 @@ mod tests {
     fn rejects_skill_self_reported_success() {
         let (parent, candidate, trusted_candidate, binding, mut observation) = fixture();
         observation.evidence_source = SkillUsageEvidenceSourceV1::SkillSelfReported;
-        let bindings = BTreeMap::from([(binding.plugin_event.event_id.clone(), binding)]);
+        let bindings = BTreeMap::from([(binding.tool_event.event_id.clone(), binding)]);
         let result = evaluate_skill_candidate(
             &parent,
             &candidate,
@@ -502,7 +502,7 @@ mod tests {
         trusted_candidate
             .candidate_capabilities
             .insert("process_exec".into());
-        let bindings = BTreeMap::from([(binding.plugin_event.event_id.clone(), binding)]);
+        let bindings = BTreeMap::from([(binding.tool_event.event_id.clone(), binding)]);
         let result = evaluate_skill_candidate(
             &parent,
             &candidate,

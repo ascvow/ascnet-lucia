@@ -1,6 +1,6 @@
 //! M6 Context Policy 的版本化参数、候选与可信评测协议。
 //!
-//! 本模块只定义稳定数据契约，不实现上下文压缩、插件装配或 Commit Gate。策略正文以
+//! 本模块只定义稳定数据契约，不实现上下文压缩、原生运行装配或 Commit Gate。策略正文以
 //! 规范 JSON 写入 Artifact CAS，Genome 仅通过 `PolicyRef.config_digest` 引用它。
 
 use crate::{
@@ -10,6 +10,9 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
+
+/// Genome 中原生 Context Policy 使用的稳定行为所有者 ID。
+pub const NATIVE_CONTEXT_POLICY_ID: &str = "native-context";
 
 /// 当前支持的 Context Policy 结构版本。
 pub const CONTEXT_POLICY_SCHEMA_VERSION: u32 = 1;

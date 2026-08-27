@@ -68,10 +68,10 @@ Prompt、原生工具、插件 bundle、独占能力 owner 和执行策略都由
 逐项核对。源码归档构建使用显式 `unknown` 提交标记且按 dirty 构建处理；由于它无法唯一证明
 内核版本，普通 Serve 可以运行，但 Evidence 会拒绝启动。
 
-当前 TUI 没有跨插件的 Context、Planning 与 Skill 独立快照服务，因此包含这些非空字段的
-Genome 会明确拒绝运行，不会只记录字段却继续采用另一份真实配置。插件内部配置和 Skill
-文件仍可随整个 bundle 被摘要固定；以后开放独立变异表面时，需要由对应插件提供版本化快照
-服务。任一真实主会话在
+当前 TUI 没有跨插件的 Context 与 Planning 独立快照服务，因此包含这些非空字段的 Genome
+会明确拒绝运行，不会只记录字段却继续采用另一份真实配置。Skill 由 `agent-skill` 直接从 Genome
+固定的 Artifact CAS 装配，不扫描运行时可变目录；以后开放其他独立变异表面时，需要由对应
+行为所有者提供版本化快照服务。任一真实主会话在
 用户输入成功写入 Session Store 后预登记 Recorder，再把同一个 Run ID 传入 Core。正常
 `RunFinished`、取消、步骤预算耗尽和基础设施错误都会显式收敛并释放路由。证据写入失败会
 报告为运行完成错误，不会被静默忽略。

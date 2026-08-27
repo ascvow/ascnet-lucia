@@ -7,23 +7,18 @@
 ```bash
 bun run install:tui
 lucia plugin search
-lucia plugin install context
+lucia plugin install mcp
 ```
 
-`install:tui` 只安装 Loader，不附带默认功能。官方插件与第三方插件使用相同的 Registry、本地目录或 GitHub Release 安装流程，只有用户显式安装且启用的插件才进入运行时；开发目录也可以通过 `--plugin-manifest` 临时加载。
+`install:tui` 安装 TUI、原生 Command、原生 Skill 和原生 Context；其他官方插件与第三方插件使用相同的 Registry、本地目录或 GitHub Release 安装流程，只有用户显式安装且启用的插件才进入运行时。开发目录也可以通过 `--plugin-manifest` 临时加载。
 
 仓库开发环境执行 `bun run install:all` 时，会把官方清单中的 bundle 更新到 `$LUCIA_HOME/official-plugins`。清单通过 `replaces` 声明插件改名关系，同步时只删除被明确替代的旧官方 bundle，避免新旧插件同时提供同一独占能力。Loader 也会自动扫描该目录和 `$LUCIA_HOME/plugins`，配置中的 `disabled_plugins` 仍可按 ID 排除自动发现的插件。
 
-## Context
+## 原生 Context
 
-`context` 提供官方上下文管理与压缩能力。它在约 120k token 时静默清理旧工具结果，在约 167k token 时额外调用一次 Host 固定路由的模型，把较旧 API 轮次替换为结构化摘要并保留近期完整轮次；`[1m]` 模型使用对应的百万上下文水位。Command 插件内置的 `/compact` 会立即调用同一模型摘要流程，成功持久化压缩结果后当场替换当前 Session，不需要再发送一条消息。
+Context 是 TUI 默认原生能力，不经过 Plugin Host，也不需要安装 bundle。它在约 120k token 时静默清理旧工具结果，在约 167k token 时额外调用一次应用固定路由的模型，把较旧 API 轮次替换为结构化摘要并保留近期完整轮次；`[1m]` 模型使用对应的百万上下文水位。原生 `/compact` 命令会立即调用同一模型摘要流程，成功持久化压缩结果后当场替换当前 Session，不需要再发送一条消息。
 
-```bash
-bun run build:plugin:context
-bun run test:plugin:context
-```
-
-Manifest：`examples/plugins/context-plugin/plugin.toml`。
+Evidence 运行从 Genome 固定的 Artifact CAS 装配 Context Policy，策略 owner 固定为 `native-context`。实现位于 `crates/agent-context`，默认插件版与 `--no-default-features` 纯 Core 版行为一致。
 
 ## MCP
 
@@ -36,27 +31,19 @@ bun run test:plugin:mcp
 
 Manifest：`examples/plugins/mcp-plugin/plugin.toml`。
 
-## Skill
+## 原生 Skill
 
-`skill` 递归扫描 `skills_dir` 中的 `SKILL.md`，解析 YAML frontmatter 的 `name` 和 `description`，并注入一份轻量索引。模型只有在任务匹配时才通过 `skill_read` 读取完整正文。
+Skill 是 TUI 默认原生能力，不经过 Plugin Host，也不需要安装 bundle。普通运行递归扫描 `$LUCIA_HOME/skills`、项目 `skills` 和项目 `.lucia/skills` 中的 `SKILL.md`，解析 YAML frontmatter 的 `name` 与 `description` 并注入轻量索引；模型只有在任务匹配时才通过原生 `skill_read` 读取完整正文。
 
-```bash
-bun run build:plugin:skill
-bun run test:plugin:skill
-```
+Evidence 运行不扫描可变目录，而是从 Genome 固定的 Artifact CAS 装配 Skill。Serve 只接受 Active 制品，Evaluation 可接受 Quarantined、Evaluated 或 Active 候选；可信使用证据来自 Core 注入的原生 `tool_finished` 事件。
 
-Manifest：`examples/plugins/skill-plugin/plugin.toml`。
+实现位于 `crates/agent-skill`，默认插件版与 `--no-default-features` 纯 Core 版行为一致。
 
-## Command
+## 原生 Command
 
-`command` 提供斜杠命令注册表、补全弹层、参数校验、候选补全和执行编排。插件声明触发前缀 `/` 的输入面板并自己渲染候选与预览；应用级动作（新建会话、重载上下文、退出等）通过通用 `ui.host.action` 事件请求宿主执行。内置命令包括 `/help`、`/resume`、`/new`、`/sessions`、`/clear`、`/compact` 与 `/exit`；`/quit` 是 `/exit` 的别名。`/resume` 和 `/sessions` 使用插件 Dialog 展示当前项目的轻量会话摘要，完整 Session 只由 TUI 在用户确认后加载。
+Command 是 TUI 默认原生状态机，负责斜杠命令补全、参数校验、执行编排和会话 Dialog，不经过 Plugin Host。内置命令包括 `/help`、`/resume`、`/new`、`/sessions`、`/clear`、`/compact` 与 `/exit`；`/quit` 是 `/exit` 的别名。`/resume` 和 `/sessions` 只先加载当前项目的轻量摘要，完整 Session 仍只在用户确认后按 revision 校验并加载。
 
-```bash
-bun run build:plugin:command
-bun run test:plugin:command
-```
-
-Manifest：`examples/plugins/command-plugin/plugin.toml`。公开协议与开发 SDK 分别位于 `examples/plugins/command-plugin/crates/command-protocol` 和 `examples/plugins/command-plugin/crates/command-sdk`。
+实现位于 `crates/agent-tui/src/native_command.rs`，纯 Core 构建同样提供这些命令；`/compact` 在没有 Context Loader 时返回可见说明，不伪造压缩结果。
 
 ## Teammate 插件
 
