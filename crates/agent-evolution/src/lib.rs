@@ -38,6 +38,7 @@ mod prompt_mutation;
 mod recorder;
 mod recorder_hub;
 mod replay;
+mod runtime_health;
 mod scorecard;
 mod skill_candidate_builder;
 mod skill_cycle;
@@ -135,6 +136,11 @@ pub use prompt_mutation::{
 pub use recorder::{EpisodeRecorder, EpisodeRecorderConfig, EpisodeRecorderError};
 pub use recorder_hub::{EpisodeRecorderHub, EpisodeRecorderHubError, RegisteredEpisodeRun};
 pub use replay::{ProtocolReplay, ProtocolReplayError, ReplayEventSink, ReplayReport};
+pub use runtime_health::{
+    FileRuntimeHealthObservationStore, RuntimeHealthRecorder, RuntimeHealthRecorderError,
+    RuntimeHealthStoreError, VerifiedRuntimeHealthObservation,
+    MAX_RUNTIME_HEALTH_OBSERVATION_BYTES, RUNTIME_HEALTH_DIRECTORY,
+};
 pub use scorecard::{
     comparison_validity, compute_scorecard, headline_verdict, BehaviorAssessment,
     ComparisonValidity, ComparisonViolation, ComparisonViolationKind, ConfidenceInterval,
