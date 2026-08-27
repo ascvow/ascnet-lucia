@@ -348,6 +348,8 @@ prefixed_id!(
     "Genome 的一次具体修订；与内容摘要不同，同一摘要可能有多次登记。"
 );
 prefixed_id!(MutationId, "mut", "一次变异提案的标识。");
+prefixed_id!(CandidateId, "cand", "一次变异产生的 Candidate 标识。");
+prefixed_id!(EvolutionCycleId, "cycle", "一次 Turn 外自进化周期的标识。");
 prefixed_id!(EvaluationRunId, "evrun", "一次评测运行的标识。");
 prefixed_id!(EvaluationReportId, "evrep", "一份评测报告的标识。");
 prefixed_id!(DatasetVersionId, "dsv", "数据集某个版本的标识。");
@@ -409,6 +411,8 @@ pub fn id_json_schema() -> serde_json::Value {
             "EpisodeId": entry(EpisodeId::PATTERN, "一条运行证据 Episode 的标识"),
             "GenomeRevisionId": entry(GenomeRevisionId::PATTERN, "Genome 的一次具体修订"),
             "MutationId": entry(MutationId::PATTERN, "一次变异提案的标识"),
+            "CandidateId": entry(CandidateId::PATTERN, "一次变异产生的 Candidate 标识"),
+            "EvolutionCycleId": entry(EvolutionCycleId::PATTERN, "一次 Turn 外自进化周期的标识"),
             "EvaluationRunId": entry(EvaluationRunId::PATTERN, "一次评测运行的标识"),
             "EvaluationReportId": entry(EvaluationReportId::PATTERN, "一份评测报告的标识"),
             "DatasetVersionId": entry(DatasetVersionId::PATTERN, "数据集某个版本的标识"),
@@ -473,6 +477,8 @@ mod tests {
         check_prefixed!(EpisodeId);
         check_prefixed!(GenomeRevisionId);
         check_prefixed!(MutationId);
+        check_prefixed!(CandidateId);
+        check_prefixed!(EvolutionCycleId);
         check_prefixed!(EvaluationRunId);
         check_prefixed!(EvaluationReportId);
         check_prefixed!(DatasetVersionId);
@@ -572,7 +578,7 @@ mod tests {
     fn schema_patterns_accept_real_values() {
         let schema = id_json_schema();
         let defs = schema["$defs"].as_object().expect("应有 $defs");
-        assert_eq!(defs.len(), 19, "19 个标识类型都应出现在 schema 中");
+        assert_eq!(defs.len(), 21, "21 个标识类型都应出现在 schema 中");
 
         let run_pattern = defs["RunId"]["pattern"].as_str().expect("应有 pattern");
         assert!(Regex::new(run_pattern)

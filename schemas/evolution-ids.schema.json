@@ -24,6 +24,16 @@
       "pattern": "^mut_[0-9a-z]{8,64}$",
       "description": "一次变异提案的标识"
     },
+    "CandidateId": {
+      "type": "string",
+      "pattern": "^cand_[0-9a-z]{8,64}$",
+      "description": "一次变异产生的 Candidate 标识"
+    },
+    "EvolutionCycleId": {
+      "type": "string",
+      "pattern": "^cycle_[0-9a-z]{8,64}$",
+      "description": "一次 Turn 外自进化周期的标识"
+    },
     "EvaluationRunId": {
       "type": "string",
       "pattern": "^evrun_[0-9a-z]{8,64}$",

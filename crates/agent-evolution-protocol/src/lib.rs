@@ -14,6 +14,8 @@ pub mod evaluation;
 pub mod failure;
 pub mod genome;
 pub mod ids;
+pub mod ipc;
+pub mod mutation;
 pub mod redaction;
 pub mod supervision;
 
@@ -43,10 +45,22 @@ pub use failure::{
     FailureDisposition, FailureFingerprint, FailureRecord, InvalidFailure,
 };
 pub use ids::{
-    id_json_schema, ArtifactDigest, AuditRecordId, DatasetVersionId, EpisodeId, EvaluationReportId,
-    EvaluationRunId, EventId, EvolutionIssueId, FailureRecordId, FeedbackId, GenomeDigest,
-    GenomeRevisionId, IncidentId, InvalidEvolutionId, MutationId, OutcomeRevisionId, ReleaseId,
-    RunId, SpanId, TaskCaseId,
+    id_json_schema, ArtifactDigest, AuditRecordId, CandidateId, DatasetVersionId, EpisodeId,
+    EvaluationReportId, EvaluationRunId, EventId, EvolutionCycleId, EvolutionIssueId,
+    FailureRecordId, FeedbackId, GenomeDigest, GenomeRevisionId, IncidentId, InvalidEvolutionId,
+    MutationId, OutcomeRevisionId, ReleaseId, RunId, SpanId, TaskCaseId,
+};
+pub use ipc::{
+    EvaluationReceiptV1, EvaluationRequestV1, InvalidEvaluatorIpc, PromotionRequestV1,
+    ReleaseReceiptV1, RollbackRequestV1, EVALUATION_RECEIPT_SCHEMA_VERSION,
+    EVALUATION_REQUEST_SCHEMA_VERSION, RELEASE_RECEIPT_SCHEMA_VERSION,
+};
+pub use mutation::{
+    EvolutionCycleRequestInput, EvolutionCycleRequestV1, EvolutionCycleSnapshotV1,
+    EvolutionCycleStage, ExpectedEffect, InvalidEvolutionCycle, InvalidMutation, MutationCandidate,
+    MutationPatch, MutationProposal, MutationRisk, EVOLUTION_CYCLE_SCHEMA_VERSION,
+    MAX_CANDIDATES_PER_CYCLE, MIN_CANDIDATES_PER_CYCLE, MUTATION_CANDIDATE_SCHEMA_VERSION,
+    MUTATION_PROPOSAL_SCHEMA_VERSION,
 };
 pub use redaction::{RedactionOutcome, RedactionRule, Redactor, REDACTION_RULES_VERSION};
 pub use supervision::{
