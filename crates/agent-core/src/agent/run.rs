@@ -498,16 +498,13 @@ impl Agent {
             AgentEventKind::StepLimitReached,
             step,
             json!({
-                "max_steps": self.options.max_steps,
+                "max_steps": max_steps,
                 "steps_used": step,
                 "usage": &total_usage
             }),
         )
         .await?;
-        Err(anyhow!(
-            "max ReAct steps reached: {}",
-            self.options.max_steps
-        ))
+        Err(anyhow!("max ReAct steps reached: {max_steps}"))
     }
 
     /// 以取消终态收尾当前运行：发出带 `cancelled: true` 的 RunFinished 事件，

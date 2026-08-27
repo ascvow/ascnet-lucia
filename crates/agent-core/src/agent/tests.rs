@@ -150,6 +150,46 @@ async fn zero_max_steps_allows_unlimited_tool_rounds() {
     assert_eq!(run.steps_used, 10);
 }
 
+/// Evaluation Candidate 即使持续生成工具调用，也必须在可信策略的步数上限处终止。
+#[tokio::test]
+async fn evaluation_candidate_infinite_tool_loop_is_terminated() {
+    let responses = (0..64)
+        .map(|index| {
+            ModelResponse::tool_calls(vec![ToolCall::new(
+                format!("loop-call-{index}"),
+                "echo",
+                json!({"value": index}),
+            )])
+        })
+        .collect();
+    let mut policy = ExecutionPolicy::evaluation("/tmp/fixture");
+    policy.tools = agent_tool::ToolAccess::allowlist(["echo"]);
+    let mut agent = agent_with_script(responses).with_tools({
+        let mut tools = ToolRegistry::new();
+        tools.register(echo_tool()).expect("注册 echo 工具");
+        tools
+    });
+    agent.options_mut().max_steps = 0;
+    agent.set_options(agent.options().clone().with_execution_policy(policy));
+
+    let error = agent
+        .run("持续调用工具")
+        .await
+        .expect_err("可信 Evaluation 上限必须终止无限工具循环");
+    let tool_results = agent
+        .state()
+        .session
+        .messages()
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter(|block| matches!(block, crate::model::ContentBlock::ToolResult { .. }))
+        .count();
+
+    assert_eq!(error.to_string(), "max ReAct steps reached: 64");
+    assert_eq!(tool_results, 64);
+    assert_eq!(agent.state().phase, AgentPhase::Failed);
+}
+
 /// 扩展提示应进入模型请求，但不能污染调用方持有的会话历史。
 #[tokio::test]
 async fn extension_prompt_is_injected_without_persisting_to_session() {
