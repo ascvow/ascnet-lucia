@@ -33,4 +33,5 @@ pub(crate) fn render_root(frame: &mut Frame, app: &mut App) {
     render_plugin_input(frame, app, workspace);
     #[cfg(feature = "plugins")]
     render_plugin_dialog(frame, app, outer);
+    render_native_session_dialog(frame, app, outer);
 }

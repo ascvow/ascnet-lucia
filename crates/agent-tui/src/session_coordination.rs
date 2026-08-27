@@ -299,6 +299,63 @@ pub(crate) async fn save_session_record_reconciled(
     }
 }
 
+/// 在后台通过原生上下文加载器重载当前会话并持久化变化。
+///
+/// 函数立即返回以保持事件循环可交互；完成结果通过 `SessionContextReloaded` 回投主循环。
+/// 压缩完成或没有可压缩历史的说明由加载器写入统一 Agent 事件流。
+pub(crate) fn start_session_context_reload(app: &mut App, label: String) {
+    if app.pending_reload.is_some() {
+        app.messages.push(Msg::new(
+            MsgKind::Info,
+            "上一次上下文压缩仍在进行中，请稍候",
+        ));
+        return;
+    }
+    app.pending_reload = Some(label);
+    let context_loader = Arc::clone(&app.context_loader);
+    let record = app.session_record.clone();
+    let model_name = app.model_name.clone();
+    let session_store = Arc::clone(&app.session_store);
+    let tx = app.tx.clone();
+    tokio::spawn(async move {
+        let result = reload_session_context(
+            context_loader.as_ref(),
+            session_store.as_ref(),
+            record,
+            model_name,
+        )
+        .await;
+        let _ = tx.send(UiEvent::SessionContextReloaded(Box::new(result)));
+    });
+}
+
+/// 请求原生加载器重载给定会话记录；仅在内容变化时保存并返回新记录。
+async fn reload_session_context(
+    context_loader: &dyn ContextLoader,
+    session_store: &dyn SessionStore,
+    record: SessionRecord,
+    model_name: String,
+) -> Result<SessionReloadOutcome> {
+    let request = ContextLoadRequest {
+        run_id: format!("reload:{}:{}", record.id, record.revision),
+        step: 0,
+        provider: "native".into(),
+        model: model_name,
+        system: record.session.system().cloned(),
+        messages: record.session.model_messages(),
+        user_initiated: true,
+    };
+    let loaded = context_loader.load(request.clone()).await?;
+    if loaded.system == request.system && loaded.messages == request.messages {
+        return Ok(SessionReloadOutcome::Unchanged);
+    }
+    let mut reloaded = record;
+    reloaded.session = Session::from_parts(loaded.system, loaded.messages);
+    let expected_revision = (reloaded.revision > 0).then_some(reloaded.revision);
+    let saved = save_session_record_reconciled(session_store, reloaded, expected_revision).await?;
+    Ok(SessionReloadOutcome::Replaced(saved))
+}
+
 /// 先保存用户输入，再运行 Agent 并保存完整回复。
 ///
 /// save 返回错误时先回读并协调可能已经落盘的不确定提交。确认未落盘后，最终保存失败

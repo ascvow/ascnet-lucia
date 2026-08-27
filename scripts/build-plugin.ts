@@ -5,7 +5,7 @@ const repositoryRoot = resolve(import.meta.dir, '..')
 const pluginNames = process.argv.slice(2)
 
 if (pluginNames.length === 0) {
-  throw new Error('缺少插件目录名，例如 context-plugin')
+  throw new Error('缺少插件目录名，例如 mcp-plugin')
 }
 
 const sharedTarget = join(repositoryRoot, 'target')

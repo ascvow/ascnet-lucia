@@ -21,6 +21,7 @@
 | --- | --- | --- |
 | `agent-core` | 模型网关、ReAct、上下文、事件和扩展契约 | 插件加载、配置文件位置、会话持久化 |
 | `agent-tool` | 工具定义、调用结果和原生注册表 | Agent 循环、插件 owner 路由 |
+| `agent-context` | 默认上下文压缩、模型摘要与 Context Policy 绑定 | Agent 循环、插件加载 |
 | `agent-session` | 版本化记录、CAS、文件与内存存储 | 模型配置、Agent 调度、插件状态 |
 | `agent-runtime` | 身份、派生、权限收缩、生命周期和资源上限 | workflow、teammate 等业务协议 |
 | `agent-plugin` | Guest SDK、共享 JSON 类型、WIT 绑定和导出宏 | Host 实现、终端渲染 |
@@ -66,8 +67,8 @@ ModelProviderConfig
 PluginManifest::load + validate
   -> load_wasm_plugins_with_selection_and_services
   -> CompositePluginHost
-  -> Agent::with_extension + with_context_loader
-  -> 工具、上下文、事件、服务和 UI 按 owner 路由
+  -> Agent::with_extension
+  -> 工具、事件、服务和 UI 按 owner 路由
 ```
 
 ### 派生 Agent

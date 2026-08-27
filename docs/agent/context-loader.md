@@ -51,22 +51,19 @@ impl ContextLoader for SummaryLoader {
 }
 ```
 
-插件或应用负责如何生成摘要；Core 只保证加载结果真正成为模型上下文。
+应用负责如何生成摘要；Core 只保证加载结果真正成为模型上下文。
 
-## WASM 插件桥接
+## 默认原生实现
 
-插件在 manifest 中声明独占能力，并实现 SDK 的 `load_context`：
+TUI 默认装配 `agent-context` 的 `NativeContextLoader`，不经过 Plugin Host，也不需要安装 bundle。默认实现按模型上下文水位执行三种行为：
 
-```toml
-[[provides]]
-id = "agent.context-loader"
-version = "1.0.0"
-mode = "exclusive"
-```
+- 低于水位时透传完整上下文。
+- 达到微压缩水位时静默清理较旧的成功工具结果，同时保留失败结果和合法调用配对。
+- 达到完整压缩水位时禁用工具与推理，通过应用固定的模型路由生成结构化摘要，并保留近期完整 API 轮次。
 
-Plugin Host 会把选中的 owner 适配成同一个 `ContextLoader` 接口。插件收到 provider-neutral 消息 JSON，返回的 `LoadedContext` 完整替换模型输入；返回 `None` 表示本轮显式透传，宿主继续使用原始完整历史，避免把未修改的上下文跨 WASM 边界回传；返回错误会终止当前 run。多个独占 provider 的选择规则见 [Manifest 与权限](/host/manifest-capabilities)。
+原生 `/compact` 将当前 Session 以 `user_initiated` 请求交给同一加载器，无条件尝试完整压缩；内容变化时以 revision 比较并交换方式持久化并立即替换当前 Session。默认插件版与 `--no-default-features` 纯 Core 版使用相同行为。
 
-官方实现位于 `examples/plugins/context-plugin`。它按 token 水位静默执行工具结果微压缩；达到完整压缩水位后，通过 Host 受控模型完成能力生成结构化历史摘要，并保留近期完整 API 轮次。
+Evidence 运行从 Artifact CAS 装配 Genome 固定的 Context Policy，`PolicyRef.id` 必须为原生稳定 owner `native-context`。压缩事实直接写入 Agent EventSink，供 TUI 展示与 Evidence 记录使用。
 
 ## 挂载与恢复
 

@@ -84,7 +84,7 @@ Genome 的包版本、Git 提交、dirty 状态、目标三元组和 TUI feature
 
 Lucia 启动时规范化当前目录，并据此生成稳定 `project-id`。同一个工作目录可以保存多个会话，不同工作目录不会混用列表；实际文件位于 `<sessions_dir>/<project-id>/sessions`。
 
-普通启动总是创建只存在于内存中的空白 Draft，不加载上一次记录。用户发送第一条普通消息时，TUI 先用 revision/CAS 保存用户输入并生成短标题，再运行 Agent；没有发送消息就退出时不会创建会话文件。插件版可直接在 TUI 中恢复：
+普通启动总是创建只存在于内存中的空白 Draft，不加载上一次记录。用户发送第一条普通消息时，TUI 先用 revision/CAS 保存用户输入并生成短标题，再运行 Agent；没有发送消息就退出时不会创建会话文件。默认插件版与纯 Core 版都可直接在 TUI 中恢复：
 
 ```bash
 lucia
@@ -94,7 +94,7 @@ lucia
 /resume
 ```
 
-`/resume` 由官方 Command 插件打开当前项目的会话列表，用户选中后才加载完整 Session。`/sessions` 使用同一界面只读浏览；移除 Command 插件后，这两个界面和其他斜杠命令不可用，但会话文件不受影响。
+原生 `/resume` 打开当前项目的会话列表，用户选中后才按 revision 校验并加载完整 Session；`/sessions` 使用同一界面只读浏览。两者不依赖 Plugin Host。
 
 Evidence 模式会在首次保存前把 Session 绑定到精确 Genome Revision。已有记录缺少绑定或绑定
 不同 Revision 时拒绝恢复；Stable 引用更新只影响后续新 Session，不会让旧 Session 静默升级。

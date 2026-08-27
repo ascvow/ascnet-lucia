@@ -50,12 +50,4 @@ Command 等关键官方插件必须在构建 component 后运行独立 smoke tes
 | 工具重名 | 不同 owner 是否使用了相同公开名称 |
 | fuel 用尽 | 是否在 guest 内进行无界循环或重计算 |
 
-上下文替换插件提供可重复运行的真实 component 测试：
-
-```bash
-bun run test:plugin:context
-```
-
-该命令先离线构建 WASM component，再运行独立 smoke-test，验证完整压缩先使用 Host 固定路由生成模型摘要，随后 Agent 实际模型请求包含摘要与近期原文，并检查扩展事件已经进入事件流。微压缩测试同时验证它不会触发摘要模型调用或展示文本。
-
 子进程调试日志应写 stderr，并在 `ProcessSpec` 中启用 `inherit_stderr`，避免污染协议 stdout。

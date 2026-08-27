@@ -88,7 +88,6 @@ bun run test:live
 
 ```bash
 bun run perf:plugin:host
-bun run perf:plugin:wasm
 ```
 
-Host 微基准用于比较组合、路由和 UI 开销；WASM 性能示例覆盖真实 component 边界。需要把阈值作为失败门禁时运行 `bun run perf:plugin:gate`。
+Host 微基准用于比较组合、路由和 UI 开销。结果只用于同一机器上的趋势分析，不作为跨机器的绝对性能门禁。

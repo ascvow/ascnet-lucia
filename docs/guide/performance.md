@@ -1,6 +1,6 @@
 # 插件性能分析
 
-Lucia 把性能验证分成编译边界、Host 微基准和真实 WASM 探针。测试目标不是证明任意第三方插件都足够快，而是持续量化“启用插件系统后新增了多少开销”，并让超出预算的真实 component 阻止合入。
+Lucia 把插件性能验证分成编译边界和 Host 微基准。测试目标不是证明任意第三方插件都足够快，而是持续量化“启用插件系统后新增了多少开销”。
 
 ## 纯 Core 边界
 
@@ -36,36 +36,4 @@ Host 微基准标记为 `informational_only`，不会自行判定回归。共享
 渐进加载状态会记录每个插件从 component 编译到 Ready 的总毫秒数，用于定位需要继续
 拆分 `activate` 或外部服务初始化的长尾插件。
 
-## 真实 WASM 探针
-
-```bash
-bun run perf:plugin:wasm
-```
-
-该命令使用真实上下文替换 component，分别输出：
-
-- `wasm_component_load`：component 编译、实例化和激活耗时。
-- `core_context_passthrough`：Core 直通 ContextLoader 基线。
-- `wasm_context_compression`：经过 Host、WIT 和 guest 的上下文压缩耗时。
-
-每组调用结果使用纳秒输出，包含 `total_ns`、`p50_ns`、`p95_ns` 和 `max_ns`。`LUCIA_PERF_ITERATIONS` 可调整正式样本数，默认值是 200，且至少执行 10 次。
-
-## 性能门禁
-
-```bash
-bun run perf:plugin:gate
-```
-
-门禁同时检查两项预算：`wasm_context_compression` 的 p95 默认不超过 500 微秒，`wasm_component_load` 的冷启动默认不超过 250 毫秒。输出仍使用纳秒，环境变量分别使用微秒和毫秒，避免门禁配置出现过长数值。
-
-可以按稳定测试机的历史基线收紧两项预算：
-
-```bash
-LUCIA_PLUGIN_CONTEXT_P95_US=300 \
-LUCIA_PLUGIN_LOAD_MAX_MS=200 \
-bun run perf:plugin:gate
-```
-
-超过预算时命令返回非零退出码。门禁应运行在固定资源的 CI runner；本地开发机适合定位趋势，不适合作为跨机器的统一绝对基线。
-
-Host 默认通过 Wasmtime fuel 限制单次 guest 计算，并将单个线性内存限制为 `64 MiB`。性能结果只覆盖框架路由和测试插件；插件作者仍需为网络、进程、文件扫描、上下文压缩算法和 TUI 渲染分别设置预算，并避免在 Agent 同步调用路径中执行无界工作。
+Host 默认通过 Wasmtime fuel 限制单次 guest 计算，并将单个线性内存限制为 `64 MiB`。性能结果只覆盖框架路由；插件作者仍需为网络、进程、文件扫描和 TUI 渲染分别设置预算，并避免在 Agent 同步调用路径中执行无界工作。

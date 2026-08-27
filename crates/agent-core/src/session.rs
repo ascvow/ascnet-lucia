@@ -24,7 +24,7 @@ impl Session {
 
     /// 从系统提示词和完整消息列表恢复会话。
     ///
-    /// 该方法不校验消息顺序，持久化层和上下文插件可以据此恢复经过转换的会话。
+    /// 该方法不校验消息顺序，持久化层和原生上下文加载器可以据此恢复经过转换的会话。
     pub fn from_parts(system: Option<String>, messages: Vec<ModelMessage>) -> Self {
         Self { system, messages }
     }

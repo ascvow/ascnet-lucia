@@ -1314,13 +1314,13 @@ fn failed_completion_preserves_confirmed_session() {
     assert_eq!(app.session_record, original);
 }
 
-/// 上下文加载失败必须向界面保留插件或 WASM 层的完整错误链。
+/// 原生上下文加载失败必须向界面保留完整错误链。
 #[test]
 fn failed_completion_shows_context_loader_root_cause() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let original = app.session_record.clone();
-    let error = anyhow!("插件 `context` context load failed: guest trap").context("上下文加载失败");
+    let error = anyhow!("原生摘要模型请求失败").context("上下文加载失败");
 
     app.handle_agent_done(AgentCompletion {
         run: None,
@@ -1337,7 +1337,7 @@ fn failed_completion_shows_context_loader_root_cause() {
         .find(|message| matches!(message.kind, MsgKind::Error))
         .expect("上下文加载失败应显示在界面中");
     assert!(displayed.text.contains("上下文加载失败"));
-    assert!(displayed.text.contains("guest trap"));
+    assert!(displayed.text.contains("原生摘要模型请求失败"));
 }
 
 /// 已提交运行失败时应保留界面分析历史，诊断文本不得写入下一次模型使用的 Session。
@@ -1691,14 +1691,14 @@ fn test_plugin_view(placement: UiPlacement, title: &str) -> PluginViewState {
 fn inactive_input_panel_is_excluded_from_periodic_refresh() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    let mut view = test_plugin_view(UiPlacement::InputPanel, "命令");
-    view.declaration.input_triggers = vec!["/".into()];
+    let mut view = test_plugin_view(UiPlacement::InputPanel, "筛选");
+    view.declaration.input_triggers = vec![":".into()];
     app.plugin_views.push(view);
 
     assert!(app.periodic_plugin_render_requests().is_empty());
     assert_eq!(app.plugin_render_requests().len(), 1);
 
-    app.input = "/res".into();
+    app.input = ":res".into();
     app.cursor = app.input.len();
     assert_eq!(app.periodic_plugin_render_requests().len(), 1);
 }
@@ -1885,21 +1885,21 @@ fn input_panel_renders_plugin_frame_when_trigger_active() {
     let mut terminal = Terminal::new(backend).expect("创建输入面板测试终端");
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    let mut view = test_plugin_view(UiPlacement::InputPanel, "命令");
-    view.declaration.input_triggers = vec!["/".into()];
+    let mut view = test_plugin_view(UiPlacement::InputPanel, "筛选");
+    view.declaration.input_triggers = vec![":".into()];
     view.frame = Some(PluginUiFrame {
         view_id: view.declaration.view_id.clone(),
         visible: true,
         lines: vec![UiLine {
             spans: vec![UiSpan {
-                text: "/resume  恢复历史会话".into(),
+                text: ":review  筛选待审查项目".into(),
                 style: UiStyle::default(),
             }],
         }],
         cursor: None,
     });
     app.plugin_views.push(view);
-    app.input = "/res".into();
+    app.input = ":rev".into();
     app.cursor = app.input.len();
 
     terminal
@@ -1915,8 +1915,8 @@ fn input_panel_renders_plugin_frame_when_trigger_active() {
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect::<String>();
-    assert!(text.contains("/resume"), "{text}");
-    assert!(text.contains("恢复历史会话"), "{text}");
+    assert!(text.contains(":review"), "{text}");
+    assert!(text.contains("筛选待审查项目"), "{text}");
 
     // 触发退出激活后面板整体消失，不依赖插件端状态。
     app.input.clear();
@@ -1931,7 +1931,7 @@ fn input_panel_renders_plugin_frame_when_trigger_active() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(!text.contains("恢复历史会话"), "{text}");
+    assert!(!text.contains("筛选待审查项目"), "{text}");
 }
 
 /// 常驻上下文架必须显示在输入框上方，并依次让位给触发面板和独占输入视图。
@@ -1947,10 +1947,10 @@ fn composer_shelf_obeys_input_priority() {
     assert_eq!(app.visible_composer_panels(), vec![0]);
     assert!(app.composer_panel_height() > 0);
 
-    let mut command = test_plugin_view(UiPlacement::InputPanel, "命令");
-    command.declaration.input_triggers = vec!["/".into()];
-    app.plugin_views.push(command);
-    app.input = "/res".into();
+    let mut filter = test_plugin_view(UiPlacement::InputPanel, "筛选");
+    filter.declaration.input_triggers = vec![":".into()];
+    app.plugin_views.push(filter);
+    app.input = ":res".into();
     app.cursor = app.input.len();
     assert_eq!(app.visible_composer_panels(), vec![1]);
 
@@ -1965,10 +1965,10 @@ fn composer_shelf_obeys_input_priority() {
 fn trigger_gestures_route_to_trigger_view() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    let mut view = test_plugin_view(UiPlacement::InputPanel, "命令");
-    view.declaration.input_triggers = vec!["/".into()];
+    let mut view = test_plugin_view(UiPlacement::InputPanel, "筛选");
+    view.declaration.input_triggers = vec![":".into()];
     app.plugin_views.push(view);
-    app.input = "/res".into();
+    app.input = ":res".into();
     app.cursor = app.input.len();
 
     // Tab 与 Enter 在触发激活时始终交给触发视图。
