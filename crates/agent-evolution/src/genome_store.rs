@@ -1,6 +1,8 @@
 //! Genome 修订的不可变文件存储。
 
-use agent_evolution_protocol::{GenomeDigest, GenomeRevision, GenomeRevisionId};
+use agent_evolution_protocol::{
+    EvaluationReportId, GenomeDigest, GenomeRevision, GenomeRevisionId, ReleaseId,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,6 +37,18 @@ pub struct StableGenomeRef {
     pub digest: GenomeDigest,
     /// lineage 内单调递增的代数。
     pub generation: u64,
+    /// 产生该指针的可信 Release；人工初始化旧指针为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<ReleaseId>,
+    /// Promotion 或 Rollback 绑定的正式 EvaluationReport。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_report_id: Option<EvaluationReportId>,
+    /// 本次原子切换前的 Revision，用于验证相邻发布与回滚目标。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_revision_id: Option<GenomeRevisionId>,
+    /// Rollback 时指向被撤销的 Release；普通 Promotion 为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_of: Option<ReleaseId>,
 }
 
 impl StableGenomeRef {
@@ -59,7 +73,28 @@ impl StableGenomeRef {
             revision_id: revision.revision_id.clone(),
             digest: revision.digest.clone(),
             generation,
+            release_id: None,
+            evaluation_report_id: None,
+            previous_revision_id: None,
+            rollback_of: None,
         })
+    }
+
+    /// 为受信 Release Controller 绑定报告、前序 Revision 与可选回滚来源。
+    ///
+    /// 该方法只构造引用数据；真正提交仍必须通过 [`FileStableGenomePublisher`] 的原子替换。
+    pub fn bind_release(
+        mut self,
+        release_id: ReleaseId,
+        evaluation_report_id: EvaluationReportId,
+        previous_revision_id: GenomeRevisionId,
+        rollback_of: Option<ReleaseId>,
+    ) -> Self {
+        self.release_id = Some(release_id);
+        self.evaluation_report_id = Some(evaluation_report_id);
+        self.previous_revision_id = Some(previous_revision_id);
+        self.rollback_of = rollback_of;
+        self
     }
 
     /// 校验 Stable 引用自身的版本、lineage 与字段边界。
@@ -74,7 +109,26 @@ impl StableGenomeRef {
                 self.schema_version
             )));
         }
-        validate_lineage(&self.lineage)
+        validate_lineage(&self.lineage)?;
+        let binding_count = [
+            self.release_id.is_some(),
+            self.evaluation_report_id.is_some(),
+            self.previous_revision_id.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        if binding_count != 0 && binding_count != 3 {
+            return Err(GenomeResolverError::InvalidStableRef(
+                "Release、EvaluationReport 与前序 Revision 必须同时存在或同时缺失".to_string(),
+            ));
+        }
+        if self.rollback_of.is_some() && binding_count != 3 {
+            return Err(GenomeResolverError::InvalidStableRef(
+                "Rollback 引用必须绑定完整 Release 信息".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -102,6 +156,148 @@ pub struct FileGenomeResolver {
     stable_root: PathBuf,
 }
 
+/// 可信控制面用于原子更新 Stable Genome 引用的文件发布器。
+///
+/// 普通 Serve 路径只应持有 [`FileGenomeResolver`]；该类型必须由完成 Commit Gate 的发布控制面
+/// 显式装配，避免 Candidate 或普通运行路径自行声明 Promotion。
+#[derive(Debug, Clone)]
+pub struct FileStableGenomePublisher {
+    resolver: FileGenomeResolver,
+}
+
+impl FileStableGenomePublisher {
+    /// 按 Evolution 数据根创建发布器，不触碰文件系统。
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            resolver: FileGenomeResolver::new(root),
+        }
+    }
+
+    /// 返回与发布器共享 Registry 的只读 Resolver。
+    pub fn resolver(&self) -> &FileGenomeResolver {
+        &self.resolver
+    }
+
+    /// 原子发布一个已登记且摘要有效的 Revision 为指定 lineage 的 Stable Genome。
+    ///
+    /// 发布器只更新 Stable 引用，不修改不可变 Revision。`generation` 必须严格大于现有值；
+    /// 提交后会通过 Resolver 重新读取并核对最终可见 Revision。
+    ///
+    /// # Errors
+    ///
+    /// Revision 未登记、摘要无效、代数未递增、Stable 路径不安全或文件系统操作失败时返回错误。
+    pub async fn publish(
+        &self,
+        lineage: &str,
+        revision: &GenomeRevision,
+        generation: u64,
+    ) -> Result<StableGenomeRef, GenomePromotionError> {
+        let reference = StableGenomeRef::new(lineage, revision, generation)?;
+        self.publish_reference(reference, revision).await
+    }
+
+    /// 原子发布一条绑定正式 EvaluationReport 的 Stable 引用。
+    ///
+    /// `expected_current` 是 Release Controller 在持有排他锁后重新读取的当前指针。提交前会
+    /// 再次核对 Revision 和代数，避免把并发变化静默覆盖。`rollback_of` 仅在回滚时填写。
+    ///
+    /// # Errors
+    ///
+    /// 当前 Stable 与前置条件不一致、Revision 未登记、代数未递增或原子文件替换失败时
+    /// 返回错误。
+    pub async fn publish_bound(
+        &self,
+        expected_current: &StableGenomeRef,
+        revision: &GenomeRevision,
+        generation: u64,
+        release_id: ReleaseId,
+        report_id: EvaluationReportId,
+        rollback_of: Option<ReleaseId>,
+    ) -> Result<StableGenomeRef, GenomePromotionError> {
+        let observed = self.resolver.stable_reference(&expected_current.lineage).await?;
+        if observed != *expected_current {
+            return Err(GenomePromotionError::ExpectedCurrentMismatch);
+        }
+        let reference = StableGenomeRef::new(&expected_current.lineage, revision, generation)?
+            .bind_release(
+                release_id,
+                report_id,
+                expected_current.revision_id.clone(),
+                rollback_of,
+            );
+        self.publish_reference(reference, revision).await
+    }
+
+    /// 验证 Registry 与代数后原子替换 Stable 引用。
+    async fn publish_reference(
+        &self,
+        reference: StableGenomeRef,
+        revision: &GenomeRevision,
+    ) -> Result<StableGenomeRef, GenomePromotionError> {
+        revision
+            .validate()
+            .map_err(|error| GenomePromotionError::InvalidRevision(error.to_string()))?;
+        let registered = self
+            .resolver
+            .store
+            .get(&revision.revision_id)
+            .await?
+            .ok_or_else(|| GenomePromotionError::RevisionNotFound(revision.revision_id.clone()))?;
+        if registered != *revision {
+            return Err(GenomePromotionError::RegisteredRevisionMismatch);
+        }
+        let lineage = &reference.lineage;
+        let generation = reference.generation;
+        let target = self.resolver.stable_ref_path(lineage);
+        ensure_safe_stable_root(&self.resolver.stable_root).await?;
+        if let Some(current) =
+            read_optional_stable_ref(&self.resolver.stable_root, &target, lineage).await?
+        {
+            if generation <= current.generation {
+                return Err(GenomePromotionError::NonIncreasingGeneration {
+                    current: current.generation,
+                    proposed: generation,
+                });
+            }
+        }
+        let bytes =
+            serde_json::to_vec_pretty(&reference).map_err(GenomePromotionError::Serialization)?;
+        let temporary = self
+            .resolver
+            .stable_root
+            .join(format!(".{}.tmp", Uuid::new_v4().simple()));
+        let result = async {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .await
+                .map_err(|source| promotion_io_error("创建 Stable 临时文件", &temporary, source))?;
+            file.write_all(&bytes)
+                .await
+                .map_err(|source| promotion_io_error("写入 Stable 临时文件", &temporary, source))?;
+            file.sync_all()
+                .await
+                .map_err(|source| promotion_io_error("同步 Stable 临时文件", &temporary, source))?;
+            drop(file);
+            fs::rename(&temporary, &target)
+                .await
+                .map_err(|source| promotion_io_error("提交 Stable Genome 引用", &target, source))
+        }
+        .await;
+        let _ = fs::remove_file(&temporary).await;
+        result?;
+        let observed = self
+            .resolver
+            .resolve(&GenomeSelector::Stable(lineage.to_string()))
+            .await?;
+        if observed.revision_id != revision.revision_id || observed.digest != revision.digest {
+            return Err(GenomePromotionError::CommitVerificationFailed);
+        }
+        Ok(reference)
+    }
+}
+
 impl FileGenomeResolver {
     /// 按 Evolution 数据根创建 Resolver，且不触碰文件系统。
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -115,6 +311,22 @@ impl FileGenomeResolver {
     /// 返回 Resolver 使用的不可变 Revision Store。
     pub fn store(&self) -> &FileGenomeStore {
         &self.store
+    }
+
+    /// 读取并完整校验指定 lineage 的 Stable 引用。
+    ///
+    /// 该方法只返回版本指针，不解析 Genome 正文，供受信 Evaluator 和 Release Controller
+    /// 校验 Parent 代数及 expected-current 前置条件。
+    ///
+    /// # Errors
+    ///
+    /// lineage 不安全、Stable 引用不存在、为符号链接、JSON 损坏或字段不匹配时返回错误。
+    pub async fn stable_reference(
+        &self,
+        lineage: &str,
+    ) -> Result<StableGenomeRef, GenomeResolverError> {
+        validate_lineage(lineage)?;
+        read_stable_ref(&self.stable_root, &self.stable_ref_path(lineage), lineage).await
     }
 
     /// 返回 lineage 对应的固定引用路径；文件名只来自 lineage 摘要，不包含原始路径片段。
@@ -211,6 +423,54 @@ pub enum GenomeResolverError {
     /// Stable 引用文件系统操作失败。
     #[error("{operation}失败：{path}: {source}")]
     StableIo {
+        /// 操作名称。
+        operation: &'static str,
+        /// 目标路径。
+        path: PathBuf,
+        /// 原始 I/O 错误。
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Stable Genome 发布失败。
+#[derive(Debug, thiserror::Error)]
+pub enum GenomePromotionError {
+    /// 待发布 Revision 自身无效。
+    #[error("待发布 Genome 修订无效：{0}")]
+    InvalidRevision(String),
+    /// Revision 尚未登记到不可变 Registry。
+    #[error("待发布 Genome 修订尚未登记：{0}")]
+    RevisionNotFound(GenomeRevisionId),
+    /// 调用方提供的 Revision 与 Registry 中同 ID 内容不一致。
+    #[error("待发布 Genome 修订与 Registry 内容不一致")]
+    RegisteredRevisionMismatch,
+    /// Stable 指针已不同于 Release Controller 持锁后观察到的前置值。
+    #[error("Stable Genome 当前引用与 expected-current 不一致")]
+    ExpectedCurrentMismatch,
+    /// lineage 代数必须严格递增。
+    #[error("Stable Genome 代数必须递增：当前 {current}，请求 {proposed}")]
+    NonIncreasingGeneration {
+        /// 当前 Stable 代数。
+        current: u64,
+        /// 请求发布的代数。
+        proposed: u64,
+    },
+    /// Stable 引用 JSON 序列化失败。
+    #[error("序列化 Stable Genome 引用失败：{0}")]
+    Serialization(serde_json::Error),
+    /// 原子提交后重新读取的 Revision 与请求不一致。
+    #[error("Stable Genome 原子提交后的重新验证失败")]
+    CommitVerificationFailed,
+    /// 不可变 Registry 读取失败。
+    #[error(transparent)]
+    Store(#[from] GenomeStoreError),
+    /// Stable Resolver 校验失败。
+    #[error(transparent)]
+    Resolver(#[from] GenomeResolverError),
+    /// Stable 发布文件系统操作失败。
+    #[error("{operation}失败：{path}: {source}")]
+    Io {
         /// 操作名称。
         operation: &'static str,
         /// 目标路径。
@@ -451,6 +711,51 @@ async fn read_stable_ref(
         });
     }
     Ok(reference)
+}
+
+/// Stable 引用不存在时返回 `None`，其余情况沿用完整安全校验。
+async fn read_optional_stable_ref(
+    root: &Path,
+    path: &Path,
+    expected_lineage: &str,
+) -> Result<Option<StableGenomeRef>, GenomeResolverError> {
+    match read_stable_ref(root, path, expected_lineage).await {
+        Ok(reference) => Ok(Some(reference)),
+        Err(GenomeResolverError::StableNotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// 创建并校验 Stable 根目录，拒绝符号链接替换。
+async fn ensure_safe_stable_root(path: &Path) -> Result<(), GenomePromotionError> {
+    fs::create_dir_all(path)
+        .await
+        .map_err(|source| promotion_io_error("创建 Stable Genome 目录", path, source))?;
+    let metadata = fs::symlink_metadata(path)
+        .await
+        .map_err(|source| promotion_io_error("检查 Stable Genome 目录", path, source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(GenomePromotionError::Resolver(
+            GenomeResolverError::UnsafeStablePath {
+                path: path.to_path_buf(),
+                reason: "Stable Genome 根路径必须是非符号链接目录",
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// 构造带路径上下文的 Stable 发布 I/O 错误。
+fn promotion_io_error(
+    operation: &'static str,
+    path: impl AsRef<Path>,
+    source: std::io::Error,
+) -> GenomePromotionError {
+    GenomePromotionError::Io {
+        operation,
+        path: path.as_ref().to_path_buf(),
+        source,
+    }
 }
 
 /// 构造带路径上下文的 Stable 引用 I/O 错误。

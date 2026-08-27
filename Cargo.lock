@@ -57,10 +57,12 @@ name = "agent-evaluation"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-evolution",
  "agent-evolution-protocol",
  "agent-tool",
  "anyhow",
  "async-trait",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -1777,6 +1779,21 @@ dependencies = [
  "toml",
  "tui-markdown",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "lucia-eval"
+version = "0.1.0"
+dependencies = [
+ "agent-evaluation",
+ "agent-evolution",
+ "agent-evolution-protocol",
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

@@ -8,10 +8,12 @@ description = "Lucia 受信离线评测、Fixture 与 Dataset 隔离运行时。
 
 [dependencies]
 agent-core = { path = "../agent-core", version = "0.1.0", default-features = false }
+agent-evolution = { path = "../agent-evolution", version = "0.1.0" }
 agent-evolution-protocol = { path = "../agent-evolution-protocol", version = "0.1.0" }
 agent-tool = { path = "../agent-tool", version = "0.1.0", default-features = false, features = ["builtins"] }
 anyhow.workspace = true
 async-trait.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

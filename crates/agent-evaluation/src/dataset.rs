@@ -255,6 +255,7 @@ impl TrustedDataset {
 #[derive(Debug, Clone)]
 pub struct TrustedDatasetStore {
     root: PathBuf,
+    expected_manifest_digest: Option<ArtifactDigest>,
 }
 
 impl TrustedDatasetStore {
@@ -281,7 +282,28 @@ impl TrustedDatasetStore {
             path: root.to_path_buf(),
             source,
         })?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            expected_manifest_digest: None,
+        })
+    }
+
+    /// 打开并绑定受信配置声明的 Manifest SHA-256。
+    ///
+    /// 与 [`Self::open`] 相同地规范化根路径，同时要求后续加载的 `manifest.json` 原始字节
+    /// 必须匹配 `expected_manifest_digest`。生产 `lucia-eval` 必须使用该入口，防止整体替换
+    /// Dataset 并重算内部引用。
+    ///
+    /// # Errors
+    ///
+    /// 根目录不安全时返回 [`DatasetError`]。
+    pub fn open_pinned(
+        root: impl AsRef<Path>,
+        expected_manifest_digest: ArtifactDigest,
+    ) -> Result<Self, DatasetError> {
+        let mut store = Self::open(root)?;
+        store.expected_manifest_digest = Some(expected_manifest_digest);
+        Ok(store)
     }
 
     /// 加载并交叉校验 Manifest 与全部 TaskCase。
@@ -291,6 +313,21 @@ impl TrustedDatasetStore {
     /// Manifest/TaskCase schema、ID、元数据、路径、摘要或 JSON 任一不一致时返回错误，
     /// 不会返回部分 Dataset。
     pub fn load(&self) -> Result<TrustedDataset, DatasetError> {
+        let manifest_path = resolve_trusted_path(&self.root, MANIFEST_FILE_NAME)?;
+        if let Some(expected) = &self.expected_manifest_digest {
+            let bytes = fs::read(&manifest_path).map_err(|source| DatasetError::Io {
+                path: manifest_path.clone(),
+                source,
+            })?;
+            let actual = digest_bytes(&bytes);
+            if &actual != expected {
+                return Err(DatasetError::DigestMismatch {
+                    path: manifest_path,
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
         let manifest_path = resolve_trusted_path(&self.root, MANIFEST_FILE_NAME)?;
         let manifest = parse_json::<DatasetManifest>(&manifest_path)?;
         validate_manifest(&manifest)?;
@@ -760,6 +797,19 @@ mod tests {
         assert!(!encoded.contains("hidden"));
         assert!(!encoded.contains("cases/"));
         assert!(!encoded.contains("verifiers/"));
+    }
+
+    /// 生产加载必须把 Manifest 原始字节绑定到受信配置，拒绝整体替换 Dataset。
+    #[test]
+    fn pinned_store_rejects_replaced_manifest() {
+        let temp = TempDir::new().expect("创建临时目录");
+        write_dataset(temp.path());
+        let wrong = ArtifactDigest::from_sha256_hex("0".repeat(64)).expect("固定摘要合法");
+
+        let error = TrustedDatasetStore::open_pinned(temp.path(), wrong)
+            .and_then(|store| store.load())
+            .expect_err("Manifest 摘要不匹配必须拒绝");
+        assert!(matches!(error, DatasetError::DigestMismatch { .. }));
     }
 
     /// TaskCase 内容变化后必须因摘要不匹配被整体拒绝。

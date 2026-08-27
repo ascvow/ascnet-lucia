@@ -44,8 +44,9 @@ pub use evaluation_store::{
 pub use feedback::{FeedbackError, FeedbackProcessor};
 pub use genome_diff::{diff_genomes, verify_allowed_genome_diff, GenomeDiffError};
 pub use genome_store::{
-    FileGenomeResolver, FileGenomeStore, GenomeResolver, GenomeResolverError, GenomeSelector,
-    GenomeStore, GenomeStoreError, StableGenomeRef, STABLE_GENOME_REF_SCHEMA_VERSION,
+    FileGenomeResolver, FileGenomeStore, FileStableGenomePublisher, GenomePromotionError,
+    GenomeResolver, GenomeResolverError, GenomeSelector, GenomeStore, GenomeStoreError,
+    StableGenomeRef, STABLE_GENOME_REF_SCHEMA_VERSION,
 };
 pub use history::{
     compute_history, CapabilityMapCell, CapabilityMapRow, EvolutionFunnel, EvolutionHistory,

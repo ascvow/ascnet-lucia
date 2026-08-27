@@ -8,12 +8,160 @@ use agent_tool::{ToolErrorKind, ToolResult};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fmt::Debug, fs, path::Path, sync::Arc};
 
 /// 当前支持的 Verifier 规则 schema 版本。
 pub const VERIFIER_RULE_SCHEMA_VERSION: u32 = 1;
 /// 单个 TaskCase 允许的最大 Verifier 检查数。
 const MAX_VERIFIER_CHECKS: usize = 128;
+
+/// 受信 Verifier 实现的稳定注册契约。
+///
+/// 实现只接收 Evaluator 已经收集的运行结果和 Fixture Workspace。Candidate 输出始终作为
+/// 数据传入，Verifier 不得执行其中的命令或把失败详情返回给 Candidate。
+pub trait TrustedVerifier: Debug + Send + Sync {
+    /// 返回实现的稳定版本；该值必须与 [`VerifierRule::verifier_version`] 精确匹配。
+    fn version(&self) -> &'static str;
+
+    /// 校验一份规则是否属于当前实现支持的 schema 和检查集合。
+    ///
+    /// # Errors
+    ///
+    /// 规则版本、检查数量、拒绝类别或文件路径不合法时返回错误。
+    fn validate_rule(&self, rule: &VerifierRule) -> Result<()>;
+
+    /// 对一次真实运行执行最终验证。
+    ///
+    /// # Errors
+    ///
+    /// 规则无效，或读取受信 Workspace 时发生 I/O 错误时返回错误。答案不匹配必须返回
+    /// `passed = false`，不能伪装为基础设施故障。
+    fn verify(
+        &self,
+        rule: &VerifierRule,
+        final_text: &str,
+        workspace: &Path,
+        fixture_records: &[FixtureCallRecord],
+        tool_results: &[ToolResult],
+    ) -> Result<VerificationResult>;
+}
+
+/// 内置确定性 Verifier v1。
+#[derive(Debug, Default)]
+pub struct BuiltinVerifierV1;
+
+impl TrustedVerifier for BuiltinVerifierV1 {
+    fn version(&self) -> &'static str {
+        "builtin-v1"
+    }
+
+    fn validate_rule(&self, rule: &VerifierRule) -> Result<()> {
+        rule.validate()
+    }
+
+    fn verify(
+        &self,
+        rule: &VerifierRule,
+        final_text: &str,
+        workspace: &Path,
+        fixture_records: &[FixtureCallRecord],
+        tool_results: &[ToolResult],
+    ) -> Result<VerificationResult> {
+        rule.verify(final_text, workspace, fixture_records, tool_results)
+    }
+}
+
+/// 受信 Verifier Registry。
+///
+/// Registry 由 `lucia-eval` 进程构造，Dataset 只能引用已经注册的固定实现版本。未知版本
+/// 会在执行 Candidate 之前失败关闭，不能回退到 Candidate 提供的规则解释器。
+#[derive(Debug, Default)]
+pub struct VerifierRegistry {
+    implementations: BTreeMap<String, Arc<dyn TrustedVerifier>>,
+}
+
+impl VerifierRegistry {
+    /// 创建不含任何实现的 Registry。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 创建只包含 Lucia 内置确定性 Verifier 的生产 Registry。
+    pub fn with_builtin() -> Self {
+        let mut registry = Self::new();
+        registry
+            .register(BuiltinVerifierV1)
+            .expect("内置 Verifier 版本必须合法且唯一");
+        registry
+    }
+
+    /// 注册一个受信 Verifier 实现。
+    ///
+    /// # Errors
+    ///
+    /// 版本名不符合稳定标识规则，或相同版本已经注册时返回错误。注册不会替换已有实现。
+    pub fn register<V>(&mut self, implementation: V) -> Result<()>
+    where
+        V: TrustedVerifier + 'static,
+    {
+        let version = implementation.version();
+        validate_stable_version(version)?;
+        if self.implementations.contains_key(version) {
+            return Err(anyhow!("Verifier 版本已注册，禁止覆盖：{version}"));
+        }
+        self.implementations
+            .insert(version.to_string(), Arc::new(implementation));
+        Ok(())
+    }
+
+    /// 校验规则并确认其实现版本已由受信进程注册。
+    ///
+    /// # Errors
+    ///
+    /// 实现版本未知或规则不合法时返回错误。
+    pub fn validate_rule(&self, rule: &VerifierRule) -> Result<()> {
+        self.resolve(rule)?.validate_rule(rule)
+    }
+
+    /// 使用规则绑定的受信实现执行最终验证。
+    ///
+    /// # Errors
+    ///
+    /// 实现版本未知、规则无效或 Verifier 读取 Workspace 失败时返回错误。
+    pub fn verify(
+        &self,
+        rule: &VerifierRule,
+        final_text: &str,
+        workspace: &Path,
+        fixture_records: &[FixtureCallRecord],
+        tool_results: &[ToolResult],
+    ) -> Result<VerificationResult> {
+        let implementation = self.resolve(rule)?;
+        implementation.validate_rule(rule)?;
+        implementation.verify(rule, final_text, workspace, fixture_records, tool_results)
+    }
+
+    /// 解析规则绑定的实现；未知版本必须失败关闭。
+    fn resolve(&self, rule: &VerifierRule) -> Result<&dyn TrustedVerifier> {
+        self.implementations
+            .get(&rule.verifier_version)
+            .map(AsRef::as_ref)
+            .ok_or_else(|| anyhow!("Verifier 实现未注册：{}", rule.verifier_version))
+    }
+}
+
+/// 校验 Verifier 版本是可审计、可移植的稳定名称。
+fn validate_stable_version(version: &str) -> Result<()> {
+    if version.is_empty()
+        || version.len() > 128
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(anyhow!("Verifier 版本必须是 1-128 位稳定 ASCII 名称"));
+    }
+    Ok(())
+}
 
 /// 受信 Evaluator 支持的确定性检查。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -82,15 +230,7 @@ impl VerifierRule {
                 VERIFIER_RULE_SCHEMA_VERSION
             ));
         }
-        if self.verifier_version.is_empty()
-            || self.verifier_version.len() > 128
-            || !self
-                .verifier_version
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        {
-            return Err(anyhow!("Verifier 版本必须是 1-128 位稳定 ASCII 名称"));
-        }
+        validate_stable_version(&self.verifier_version)?;
         if self.checks.is_empty() || self.checks.len() > MAX_VERIFIER_CHECKS {
             return Err(anyhow!(
                 "Verifier 检查数必须在 1 到 {MAX_VERIFIER_CHECKS} 之间"
@@ -262,5 +402,34 @@ mod tests {
 
         assert!(!result.passed);
         assert_eq!(result.failed_checks, vec![0]);
+    }
+
+    /// Dataset 不能通过自报版本选择未注册的 Verifier 实现。
+    #[test]
+    fn registry_rejects_unknown_verifier_version() {
+        let rule = VerifierRule {
+            schema_version: VERIFIER_RULE_SCHEMA_VERSION,
+            verifier_version: "candidate-verifier-v1".to_string(),
+            checks: vec![VerifierCheck::ExactText {
+                expected: "不可达".to_string(),
+            }],
+        };
+        let workspace = TempDir::new().expect("创建临时 Workspace");
+        let error = VerifierRegistry::with_builtin()
+            .verify(&rule, "不可达", workspace.path(), &[], &[])
+            .expect_err("未知 Verifier 版本必须失败关闭");
+
+        assert!(error.to_string().contains("未注册"));
+    }
+
+    /// Registry 的固定版本注册必须是 create-new 语义，不能静默替换可信实现。
+    #[test]
+    fn registry_rejects_duplicate_version() {
+        let mut registry = VerifierRegistry::with_builtin();
+        let error = registry
+            .register(BuiltinVerifierV1)
+            .expect_err("重复版本不得覆盖已有实现");
+
+        assert!(error.to_string().contains("禁止覆盖"));
     }
 }

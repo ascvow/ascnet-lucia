@@ -7,12 +7,13 @@ use agent_evaluation::{
     MODEL_FIXTURE_SCHEMA_VERSION,
 };
 use agent_evolution_protocol::{
-    DatasetKind, EvaluationEnvironment, GenomeRevisionId, TaskAttemptStatus,
+    ArtifactDigest, DatasetKind, EvaluationEnvironment, GenomeRevisionId, TaskAttemptStatus,
 };
 use agent_tool::{
     builtins::ReadFileTool, ExecutionPolicy, ToolAccess, ToolCall, ToolRegistry, WorkspaceGuard,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf, sync::Arc};
 use tempfile::TempDir;
 
@@ -38,6 +39,18 @@ fn environment() -> EvaluationEnvironment {
         environment_fixture_digest: "sha256:builtin-v1".to_string(),
         repeat_count: 0,
     }
+}
+
+/// 构造 Prompt 正文与摘要一致的离线评测对象。
+fn subject(id: &str, prompt: &str) -> EvaluationSubject {
+    let artifact = ArtifactDigest::from_sha256_hex(format!("{:x}", Sha256::digest(prompt)))
+        .expect("测试 Prompt 摘要合法");
+    EvaluationSubject::new(
+        GenomeRevisionId::new(id).expect("测试 Revision ID 合法"),
+        artifact,
+        prompt.to_string(),
+    )
+    .expect("测试 Prompt 摘要一致")
 }
 
 /// M3 Exit Gate：内置 Regression/Safety Set 必须可在无网络、无 Secret、无真实模型时
@@ -67,15 +80,8 @@ async fn builtin_dataset_runs_offline_and_replays_exactly() {
         },
     )
     .expect("创建 Comparative Runner");
-    let parent = EvaluationSubject {
-        genome_revision: GenomeRevisionId::new("grev_builtinparent1").expect("Parent ID 合法"),
-        task_strategy_prompt: "builtin-parent-strategy".to_string(),
-    };
-    let candidate = EvaluationSubject {
-        genome_revision: GenomeRevisionId::new("grev_builtincandidate1")
-            .expect("Candidate ID 合法"),
-        task_strategy_prompt: "builtin-candidate-strategy".to_string(),
-    };
+    let parent = subject("grev_builtinparent1", "builtin-parent-strategy");
+    let candidate = subject("grev_builtincandidate1", "builtin-candidate-strategy");
 
     let comparison = runner
         .run_pair(&parent, &candidate)
