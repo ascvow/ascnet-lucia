@@ -175,6 +175,35 @@ impl PluginManager {
         self.install_with_source(bundle, options, None)
     }
 
+    /// 从本地已验证 bundle 原子替换同 ID 插件，并默认启用新版本。
+    ///
+    /// 新 bundle 会先完成路径、manifest、WASM、依赖、能力和锁文件校验；任一步失败时保留
+    /// 原版本及锁记录。成功提交新锁记录后才清理旧受管理目录。调用方负责在替换前保留可用于
+    /// 回滚的旧 bundle，不得把本方法当作版本归档。
+    ///
+    /// # Errors
+    ///
+    /// 插件尚未安装、bundle 非法、依赖或能力冲突、锁文件无法原子更新时返回错误。
+    pub fn replace(&self, bundle: impl AsRef<Path>) -> Result<InstalledPlugin> {
+        self.replace_with_options(bundle, InstallOptions::default())
+    }
+
+    /// 从本地已验证 bundle 原子替换同 ID 插件，并显式指定替换后的启用状态。
+    ///
+    /// 该入口供受信发布控制面使用；它不会下载、构建、执行或签名插件，也不会自行扩大
+    /// capability selection。失败时原版本和锁记录保持不变，成功后旧受管理目录才会删除。
+    ///
+    /// # Errors
+    ///
+    /// 插件尚未安装、bundle 非法、依赖或能力校验失败、文件系统提交失败时返回错误。
+    pub fn replace_with_options(
+        &self,
+        bundle: impl AsRef<Path>,
+        options: InstallOptions,
+    ) -> Result<InstalledPlugin> {
+        self.replace_with_source(bundle, options, None)
+    }
+
     /// 从目录安装 bundle，并允许可信获取层覆盖持久化来源描述。
     pub(crate) fn install_with_source(
         &self,
@@ -1049,19 +1078,26 @@ mod tests {
         assert!(!directory.path.join("managed/plugins/echo/2.0.0").exists());
     }
 
+    /// 公共本地替换入口必须先提交新锁记录，再删除旧受管理 bundle。
     #[test]
-    fn replace_switches_lock_before_removing_previous_bundle() {
+    fn public_replace_switches_lock_before_removing_previous_bundle() {
         let directory = TestDirectory::new("replace-success");
         let first = create_bundle(&directory.path, "echo", "1.0.0", &[], None);
         let second = create_bundle(&directory.path, "echo", "2.0.0", &[], None);
         let manager = PluginManager::new(directory.path.join("managed"));
         manager.install(&first).expect("旧版本应安装成功");
 
-        let updated = manager
-            .replace_with_source(&second, InstallOptions::default(), Some("registry".into()))
-            .expect("新版本应原子替换成功");
+        let updated = manager.replace(&second).expect("新版本应原子替换成功");
 
         assert_eq!(updated.version, "2.0.0");
+        assert_eq!(
+            updated.source,
+            second
+                .canonicalize()
+                .expect("应解析路径")
+                .display()
+                .to_string()
+        );
         assert_eq!(manager.list().expect("锁文件应可读")[0].version, "2.0.0");
         assert!(!directory.path.join("managed/plugins/echo/1.0.0").exists());
         assert!(directory
