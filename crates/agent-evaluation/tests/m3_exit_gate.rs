@@ -10,7 +10,8 @@ use agent_evolution_protocol::{
     ArtifactDigest, DatasetKind, EvaluationEnvironment, GenomeRevisionId, TaskAttemptStatus,
 };
 use agent_tool::{
-    builtins::ReadFileTool, ExecutionPolicy, ToolAccess, ToolCall, ToolRegistry, WorkspaceGuard,
+    builtins::{ReadFileTool, WriteFileTool},
+    ExecutionPolicy, ToolAccess, ToolCall, ToolRegistry, WorkspaceGuard,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -195,4 +196,82 @@ async fn candidate_cannot_read_hidden_dataset_with_native_file_tool() {
     let session = serde_json::to_string(&run.session).expect("序列化安全测试 Session");
     assert!(session.contains("path_boundary_violation"));
     assert!(!session.contains("不可泄漏的隐藏答案"));
+}
+
+/// Candidate 即使知道 Stable 引用的相对位置，也不能借原生写文件工具修改可信发布状态。
+#[tokio::test]
+async fn candidate_cannot_write_stable_reference_with_native_file_tool() {
+    let root = TempDir::new().expect("创建发布边界测试根");
+    let fixture_workspace = root.path().join("fixture-workspace");
+    let release_state = root.path().join("evolution-state");
+    fs::create_dir(&fixture_workspace).expect("创建 Fixture Workspace");
+    fs::create_dir(&release_state).expect("创建发布状态目录");
+    let stable = release_state.join("stable.json");
+    fs::write(&stable, r#"{"revision":"stable-v1"}"#).expect("写入初始 Stable 引用");
+
+    let model = Arc::new(
+        ModelMock::new(ModelFixture {
+            schema_version: MODEL_FIXTURE_SCHEMA_VERSION,
+            expected_calls: 2,
+            interactions: vec![
+                ModelFixtureInteraction {
+                    call_index: 0,
+                    request: ModelRequestMatcher {
+                        messages_contain_all: vec!["尝试改写 Stable".to_string()],
+                        exact_tool_names: Some(vec!["write_file".to_string()]),
+                        ..ModelRequestMatcher::default()
+                    },
+                    response: ModelResponse::tool_calls(vec![ToolCall::new(
+                        "stable-write-1",
+                        "write_file",
+                        json!({
+                            "path": "../evolution-state/stable.json",
+                            "content": "{\"revision\":\"candidate-v2\"}"
+                        }),
+                    )]),
+                },
+                ModelFixtureInteraction {
+                    call_index: 1,
+                    request: ModelRequestMatcher {
+                        messages_contain_all: vec!["path_boundary_violation".to_string()],
+                        ..ModelRequestMatcher::default()
+                    },
+                    response: ModelResponse::text("发布写入已拒绝"),
+                },
+            ],
+        })
+        .expect("创建发布攻击 Model Mock"),
+    );
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("evaluation-fixture", model)
+        .expect("注册发布攻击 Model Mock");
+    let mut tools = ToolRegistry::new();
+    tools
+        .register(WriteFileTool::new(
+            WorkspaceGuard::rooted(&fixture_workspace).expect("创建 WorkspaceGuard"),
+        ))
+        .expect("注册真实原生 write_file");
+    let mut policy = ExecutionPolicy::evaluation(&fixture_workspace);
+    policy.tools = ToolAccess::allowlist(["write_file"]);
+    let mut options = AgentOptions::default()
+        .with_model_route("evaluation-fixture", "fixture-model-v1")
+        .with_stream(false)
+        .with_execution_policy(policy);
+    options.system_prompt = "candidate-adversarial-strategy".to_string();
+    options.max_steps = 4;
+    let agent = Agent::new(gateway, options).with_tools(tools);
+
+    let run = agent
+        .run("尝试改写 Stable")
+        .await
+        .expect("路径拒绝后 Agent 应正常收敛");
+
+    assert_eq!(run.final_text, "发布写入已拒绝");
+    assert_eq!(
+        fs::read_to_string(stable).expect("读取可信 Stable 引用"),
+        r#"{"revision":"stable-v1"}"#
+    );
+    let session = serde_json::to_string(&run.session).expect("序列化发布攻击 Session");
+    assert!(session.contains("path_boundary_violation"));
 }
