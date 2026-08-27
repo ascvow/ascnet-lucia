@@ -19,7 +19,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MINIMAL_MARKER: &str = "LUCIA_LIVE_MINIMAL_OK";
@@ -50,6 +50,22 @@ struct Args {
     /// 可选的 JSON 报告输出路径；报告始终同时输出到标准输出。
     #[arg(long)]
     report: Option<PathBuf>,
+
+    /// 整个测试套件允许消耗的最大总 Token 数，必须显式指定。
+    #[arg(long)]
+    max_total_tokens: u64,
+
+    /// 单次模型响应允许生成的最大 Token 数，必须显式指定。
+    #[arg(long)]
+    max_output_tokens_per_call: u32,
+
+    /// 单个场景允许执行的最大 ReAct 步数，必须显式指定。
+    #[arg(long)]
+    max_steps_per_scenario: usize,
+
+    /// 整个测试套件的墙钟时间上限，单位毫秒，必须显式指定。
+    #[arg(long)]
+    max_duration_ms: u64,
 }
 
 /// 命令行支持的场景选择。
@@ -94,6 +110,12 @@ enum LiveScenario {
 #[derive(Debug, Serialize)]
 struct SuiteReport {
     schema_version: u32,
+    started_at_ms: u64,
+    provider: String,
+    provider_kind: String,
+    model: String,
+    model_parameters: ModelParametersReport,
+    budget: LiveTestBudget,
     passed: bool,
     duration_ms: u64,
     scenarios: Vec<ScenarioReport>,
@@ -103,13 +125,106 @@ struct SuiteReport {
 
 impl SuiteReport {
     /// 根据场景报告生成总结果，任一失败都会使总结果失败。
-    fn new(duration_ms: u64, scenarios: Vec<ScenarioReport>) -> Self {
+    fn new(metadata: SuiteMetadata, duration_ms: u64, scenarios: Vec<ScenarioReport>) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
+            started_at_ms: metadata.started_at_ms,
+            provider: metadata.provider,
+            provider_kind: metadata.provider_kind,
+            model: metadata.model,
+            model_parameters: metadata.model_parameters,
+            budget: metadata.budget,
             passed: scenarios.iter().all(|scenario| scenario.passed),
             duration_ms,
             scenarios,
             error: None,
+        }
+    }
+}
+
+/// 真实模型测试的显式资源预算；四个维度都由调用方在命令行确认。
+#[derive(Debug, Clone, Copy, Serialize)]
+struct LiveTestBudget {
+    max_total_tokens: u64,
+    max_output_tokens_per_call: u32,
+    max_steps_per_scenario: usize,
+    max_duration_ms: u64,
+}
+
+impl LiveTestBudget {
+    /// 从命令行复制预算，并拒绝把零值解释为无限制。
+    fn from_args(args: &Args) -> Option<Self> {
+        let budget = Self {
+            max_total_tokens: args.max_total_tokens,
+            max_output_tokens_per_call: args.max_output_tokens_per_call,
+            max_steps_per_scenario: args.max_steps_per_scenario,
+            max_duration_ms: args.max_duration_ms,
+        };
+        (budget.max_total_tokens > 0
+            && budget.max_output_tokens_per_call > 0
+            && budget.max_steps_per_scenario > 0
+            && budget.max_duration_ms > 0)
+            .then_some(budget)
+    }
+}
+
+/// 报告中允许公开的模型参数，不记录 API Key、Header 或 provider options 正文。
+#[derive(Debug, Clone, Serialize)]
+struct ModelParametersReport {
+    configured_max_steps: Option<usize>,
+    configured_max_tokens: Option<u32>,
+    stream: Option<bool>,
+    temperature: Option<f32>,
+    protocol: String,
+    provider_options_present: bool,
+}
+
+/// 构造报告所需的固定运行元数据。
+struct SuiteMetadata {
+    started_at_ms: u64,
+    provider: String,
+    provider_kind: String,
+    model: String,
+    model_parameters: ModelParametersReport,
+    budget: LiveTestBudget,
+}
+
+impl SuiteMetadata {
+    /// 从已解析配置提取脱敏元数据；配置内容不会写入报告。
+    fn from_config(started_at_ms: u64, config: &AgentRootConfig, budget: LiveTestBudget) -> Self {
+        Self {
+            started_at_ms,
+            provider: config.model.name.clone(),
+            provider_kind: format!("{:?}", config.model.provider),
+            model: config.model.model.clone(),
+            model_parameters: ModelParametersReport {
+                configured_max_steps: config.agent.max_steps,
+                configured_max_tokens: config.agent.max_tokens,
+                stream: config.agent.stream,
+                temperature: config.agent.temperature,
+                protocol: format!("{:?}", config.model.openai_protocol),
+                provider_options_present: config.agent.provider_options.is_some(),
+            },
+            budget,
+        }
+    }
+
+    /// 配置加载失败时仍生成结构完整且不伪造 Provider/Model 的报告。
+    fn unavailable(started_at_ms: u64, budget: LiveTestBudget) -> Self {
+        Self {
+            started_at_ms,
+            provider: "unavailable".to_string(),
+            provider_kind: "unavailable".to_string(),
+            model: "unavailable".to_string(),
+            model_parameters: ModelParametersReport {
+                configured_max_steps: None,
+                configured_max_tokens: None,
+                stream: None,
+                temperature: None,
+                protocol: "unavailable".to_string(),
+                provider_options_present: false,
+            },
+            budget,
         }
     }
 }
@@ -201,7 +316,7 @@ async fn main() {
     match serde_json::to_string_pretty(&report) {
         Ok(json) => println!("{json}"),
         Err(_) => {
-            println!("{{\"schema_version\":1,\"passed\":false,\"error\":\"无法序列化测试报告\"}}");
+            println!("{{\"schema_version\":2,\"passed\":false,\"error\":\"无法序列化测试报告\"}}");
             std::process::exit(2);
         }
     }
@@ -214,7 +329,33 @@ async fn main() {
 /// 顺序运行所选场景；单场景失败不会阻止后续场景。
 async fn run_suite(args: &Args) -> SuiteReport {
     let suite_started = Instant::now();
+    let started_at_ms = unix_timestamp_ms();
     let selected = args.scenario.scenarios();
+    let Some(budget) = LiveTestBudget::from_args(args) else {
+        let reports = selected
+            .into_iter()
+            .map(|scenario| {
+                ScenarioReport::setup_failed(
+                    scenario,
+                    Instant::now(),
+                    "真实模型测试的四项预算必须全部大于零",
+                )
+            })
+            .collect();
+        return SuiteReport::new(
+            SuiteMetadata::unavailable(
+                started_at_ms,
+                LiveTestBudget {
+                    max_total_tokens: args.max_total_tokens,
+                    max_output_tokens_per_call: args.max_output_tokens_per_call,
+                    max_steps_per_scenario: args.max_steps_per_scenario,
+                    max_duration_ms: args.max_duration_ms,
+                },
+            ),
+            elapsed_ms(suite_started),
+            reports,
+        );
+    };
     let config = match AgentRootConfig::load(&args.config) {
         Ok(config) => config,
         Err(_) => {
@@ -228,30 +369,81 @@ async fn run_suite(args: &Args) -> SuiteReport {
                     )
                 })
                 .collect();
-            return SuiteReport::new(elapsed_ms(suite_started), reports);
+            return SuiteReport::new(
+                SuiteMetadata::unavailable(started_at_ms, budget),
+                elapsed_ms(suite_started),
+                reports,
+            );
         }
     };
+    let metadata = SuiteMetadata::from_config(started_at_ms, &config, budget);
 
     let plugin_manifest = resolve_plugin_manifest(args);
     let mut reports = Vec::with_capacity(selected.len());
+    let mut total_tokens = 0_u64;
+    let mut budget_exhausted = false;
     for scenario in selected {
-        let report = match scenario {
-            LiveScenario::Minimal | LiveScenario::React | LiveScenario::Complex => {
-                run_core_scenario(&config, scenario).await
+        if budget_exhausted {
+            reports.push(ScenarioReport::setup_failed(
+                scenario,
+                Instant::now(),
+                "套件预算已经耗尽，当前场景未运行",
+            ));
+            continue;
+        }
+        let remaining_ms = budget
+            .max_duration_ms
+            .saturating_sub(elapsed_ms(suite_started));
+        if remaining_ms == 0 {
+            budget_exhausted = true;
+            reports.push(ScenarioReport::setup_failed(
+                scenario,
+                Instant::now(),
+                "套件墙钟预算已经耗尽，当前场景未运行",
+            ));
+            continue;
+        }
+        let execution = async {
+            match scenario {
+                LiveScenario::Minimal | LiveScenario::React | LiveScenario::Complex => {
+                    run_core_scenario(&config, scenario, budget).await
+                }
+                LiveScenario::Plugin => match &plugin_manifest {
+                    Some(path) => run_plugin_scenario(&config, path, budget).await,
+                    None => ScenarioReport::setup_failed(
+                        scenario,
+                        Instant::now(),
+                        "插件场景缺少 plugin.toml；请传入 --plugin-manifest 或在配置中声明插件",
+                    ),
+                },
             }
-            LiveScenario::Plugin => match &plugin_manifest {
-                Some(path) => run_plugin_scenario(&config, path).await,
-                None => ScenarioReport::setup_failed(
-                    scenario,
-                    Instant::now(),
-                    "插件场景缺少 plugin.toml；请传入 --plugin-manifest 或在配置中声明插件",
-                ),
-            },
         };
+        let mut report =
+            match tokio::time::timeout(Duration::from_millis(remaining_ms), execution).await {
+                Ok(report) => report,
+                Err(_) => {
+                    budget_exhausted = true;
+                    ScenarioReport::setup_failed(scenario, Instant::now(), "场景超过套件墙钟预算")
+                }
+            };
+        match observed_total_tokens(&report.usage) {
+            Some(tokens) => {
+                total_tokens = total_tokens.saturating_add(tokens);
+                if total_tokens > budget.max_total_tokens {
+                    report.append_error("套件实际 Token 用量超过显式预算");
+                    budget_exhausted = true;
+                }
+            }
+            None if report.error.is_none() => {
+                report.append_error("服务商未返回 Token 用量，无法验证显式预算");
+                budget_exhausted = true;
+            }
+            None => {}
+        }
         reports.push(report);
     }
 
-    SuiteReport::new(elapsed_ms(suite_started), reports)
+    SuiteReport::new(metadata, elapsed_ms(suite_started), reports)
 }
 
 /// 优先使用命令行 manifest，否则读取 Lucia 配置中的第一个插件。
@@ -264,7 +456,11 @@ fn resolve_plugin_manifest(args: &Args) -> Option<PathBuf> {
 }
 
 /// 运行不依赖插件的真实模型场景。
-async fn run_core_scenario(config: &AgentRootConfig, scenario: LiveScenario) -> ScenarioReport {
+async fn run_core_scenario(
+    config: &AgentRootConfig,
+    scenario: LiveScenario,
+    budget: LiveTestBudget,
+) -> ScenarioReport {
     let started = Instant::now();
     let sink = Arc::new(InMemoryEventSink::new());
     let (tools, prompt, minimum_steps) = match scenario {
@@ -284,7 +480,7 @@ async fn run_core_scenario(config: &AgentRootConfig, scenario: LiveScenario) -> 
         LiveScenario::Plugin => unreachable!("插件场景由专用入口运行"),
     };
 
-    let agent = match build_agent(config, tools, sink.clone(), minimum_steps) {
+    let agent = match build_agent(config, tools, sink.clone(), minimum_steps, budget) {
         Ok(agent) => agent,
         Err(_) => {
             return ScenarioReport::setup_failed(
@@ -301,7 +497,11 @@ async fn run_core_scenario(config: &AgentRootConfig, scenario: LiveScenario) -> 
 }
 
 /// 加载真实 WASM 插件并运行插件工具场景。
-async fn run_plugin_scenario(config: &AgentRootConfig, manifest: &Path) -> ScenarioReport {
+async fn run_plugin_scenario(
+    config: &AgentRootConfig,
+    manifest: &Path,
+    budget: LiveTestBudget,
+) -> ScenarioReport {
     let scenario = LiveScenario::Plugin;
     let started = Instant::now();
     let host = match load_wasm_plugins(&[manifest]).await {
@@ -332,7 +532,7 @@ async fn run_plugin_scenario(config: &AgentRootConfig, manifest: &Path) -> Scena
     }
 
     let sink = Arc::new(InMemoryEventSink::new());
-    let mut agent = match build_agent(config, ToolRegistry::new(), sink.clone(), 5) {
+    let mut agent = match build_agent(config, ToolRegistry::new(), sink.clone(), 5, budget) {
         Ok(agent) => agent,
         Err(_) => {
             let _ = PluginHost::shutdown(host.as_ref()).await;
@@ -362,9 +562,13 @@ fn build_agent(
     tools: ToolRegistry,
     sink: Arc<InMemoryEventSink>,
     minimum_steps: usize,
+    budget: LiveTestBudget,
 ) -> Result<Agent> {
     let mut agent = config.build_agent()?;
-    agent.options_mut().max_steps = agent.options().max_steps.max(minimum_steps);
+    let configured_steps = agent.options().max_steps.max(minimum_steps);
+    agent.options_mut().max_steps = configured_steps.min(budget.max_steps_per_scenario);
+    let configured_tokens = agent.options().max_tokens.unwrap_or(u32::MAX);
+    agent.options_mut().max_tokens = Some(configured_tokens.min(budget.max_output_tokens_per_call));
     agent.options_mut().system_prompt.push_str(
         "\n\nThis is an automated Lucia capability test. Follow the user's exact output and tool-use constraints. Do not fabricate tool results.",
     );
@@ -692,6 +896,25 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
+/// 返回当前 Unix 毫秒时间；系统时钟早于 Epoch 时使用零并由调用报告保留该事实。
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+/// 从服务商用量中读取可验证总量，兼容只返回输入和输出分项的实现。
+fn observed_total_tokens(usage: &TokenUsage) -> Option<u64> {
+    usage.total_tokens.or_else(|| {
+        usage
+            .input_tokens
+            .zip(usage.output_tokens)
+            .map(|(input, output)| input.saturating_add(output))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,10 +1045,18 @@ mod tests {
             },
             ScenarioReport::setup_failed(LiveScenario::Plugin, Instant::now(), "插件加载失败"),
         ];
-        let report = SuiteReport::new(4, reports);
+        let budget = LiveTestBudget {
+            max_total_tokens: 1_000,
+            max_output_tokens_per_call: 128,
+            max_steps_per_scenario: 8,
+            max_duration_ms: 30_000,
+        };
+        let report = SuiteReport::new(SuiteMetadata::unavailable(1, budget), 4, reports);
         let encoded = serde_json::to_string(&report).expect("报告应可序列化");
 
         assert!(!report.passed);
+        assert!(encoded.contains("max_total_tokens"));
+        assert!(encoded.contains("started_at_ms"));
         assert!(!encoded.contains("api_key"));
         assert!(!encoded.contains("raw_provider_response"));
         assert!(!encoded.contains("final_text"));
@@ -848,5 +1079,30 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(3));
         assert_eq!(usage.total_tokens, Some(13));
+    }
+
+    /// 真实模型入口必须要求调用方显式确认全部预算维度。
+    #[test]
+    fn live_cli_requires_explicit_budget() {
+        assert!(Args::try_parse_from(["agent-live-tests", "--config", "model.toml"]).is_err());
+
+        let args = Args::try_parse_from([
+            "agent-live-tests",
+            "--config",
+            "model.toml",
+            "--max-total-tokens",
+            "1000",
+            "--max-output-tokens-per-call",
+            "128",
+            "--max-steps-per-scenario",
+            "8",
+            "--max-duration-ms",
+            "30000",
+        ])
+        .expect("显式预算完整时应解析成功");
+        assert_eq!(args.max_total_tokens, 1_000);
+        assert_eq!(args.max_output_tokens_per_call, 128);
+        assert_eq!(args.max_steps_per_scenario, 8);
+        assert_eq!(args.max_duration_ms, 30_000);
     }
 }
