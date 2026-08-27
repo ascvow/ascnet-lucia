@@ -134,8 +134,17 @@ TUI 的工作区固定为启动目录。这是相对既有行为的**收紧**：
 shell 的行为。这一点决定了：在引入 OS 级隔离之前，任何 TaskCase 都不应为
 Candidate 开放 `shell`。
 
-仍未关闭：`allow_network`、`allow_secrets` 与 `wall_clock_ms` 只是策略字段，
-尚无强制点；网络与 Secret 的实际隔离依赖 M8-05 的 Secret Broker。
+`ExecutionPolicy::permits_network_access`、`permits_secret_access` 与
+`permits_process_execution` 同时校验私有 Profile 和公开请求字段，Evaluation 与
+Mutation 无法通过篡改布尔位打开真实能力。当前 Host 尚未提供 HTTP 与 Secret API，
+插件 manifest 一旦声明 `http` 或 `secrets`，会在 component 实例化前直接拒绝；
+原生 Shell 也在启动操作系统进程前复核同一进程门禁，并清空非白名单环境变量。
+每个 WASM 插件使用独立且有限的 Store fuel，真实无限循环 component 的调用会以
+`Trap::OutOfFuel` 终止，不会无限占用 Host 执行线程。
+
+仍未关闭：`wall_clock_ms` 尚无覆盖完整运行生命周期的强制点。M8-05 Secret Broker
+仍是未来向 Serve 平面提供受控 Secret 的必要组件；新增网络或凭据入口时必须复用上述
+最终门禁，不能只读取公开布尔字段。
 
 ## Mutator、Evaluator 与 Commit Gate 的权限
 

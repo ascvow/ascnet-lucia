@@ -7,7 +7,7 @@
 
 use agent_tool::{
     builtins::{ListDirectoryTool, ReadFileTool, SearchFilesTool, ShellTool, WriteFileTool},
-    ExecutionPolicy, Tool, ToolCall, ToolResult, WorkspaceGuard,
+    ExecutionPolicy, Tool, ToolAccess, ToolCall, ToolErrorKind, ToolResult, WorkspaceGuard,
 };
 use serde_json::json;
 use std::{fs, path::PathBuf, time::Duration};
@@ -211,7 +211,9 @@ fn shell_does_not_leak_unlisted_environment_variables() {
         ToolCall::new(
             "c",
             "shell",
-            json!({"command": "echo \"${LUCIA_TEST_FAKE_TOKEN:-absent}\"; echo \"path=${PATH:+set}\""}),
+            json!({
+                "command": "printf 'direct=%s\\n' \"${LUCIA_TEST_FAKE_TOKEN:-absent}\"; printf 'subshell=%s\\n' \"$(printenv LUCIA_TEST_FAKE_TOKEN 2>/dev/null || printf absent)\"; env; echo \"path=${PATH:+set}\""
+            }),
         ),
     );
 
@@ -319,4 +321,49 @@ fn evaluation_profile_disables_process_tools() {
 
     assert!(!policy.permits_tool("shell"));
     assert!(!policy.permits_tool("process_exec"));
+}
+
+/// 直接调用真实 Shell 入口也不能绕过 Evaluation 的进程、注入与环境隔离。
+#[test]
+fn evaluation_shell_boundary_blocks_injection_and_secret_extraction() {
+    let base = fixture("evaluation-shell-boundary");
+    let workspace = base.join("workspace");
+    let marker = workspace.join("injected.txt");
+    std::env::set_var("LUCIA_EVALUATION_FAKE_SECRET", "evaluation-secret-value");
+
+    let mut policy = ExecutionPolicy::evaluation(&workspace);
+    // 模拟错误配置同时放开工具名和公开能力字段，验证私有 Profile 仍拥有最终否决权。
+    policy.tools = ToolAccess::allowlist(["shell"]);
+    policy.allow_process = true;
+    policy.allow_secrets = true;
+    let guard = WorkspaceGuard::from_policy(&policy).expect("应按评测策略创建守卫");
+    let tool = ShellTool::with_execution_policy(guard, policy);
+
+    let result = run(
+        &tool,
+        ToolCall::new(
+            "evaluation-shell",
+            "shell",
+            json!({
+                "command": "printf '%s' \"$(printenv LUCIA_EVALUATION_FAKE_SECRET)\"; printf injected > injected.txt"
+            }),
+        ),
+    );
+
+    assert!(result.is_error, "Evaluation 的真实 Shell 入口必须拒绝调用");
+    assert_eq!(
+        result.error_kind,
+        Some(ToolErrorKind::ProcessBoundaryViolation)
+    );
+    assert!(
+        !result
+            .content
+            .to_string()
+            .contains("evaluation-secret-value"),
+        "拒绝结果不得包含宿主 Secret"
+    );
+    assert!(!marker.exists(), "注入载荷不得产生文件副作用");
+
+    std::env::remove_var("LUCIA_EVALUATION_FAKE_SECRET");
+    let _ = fs::remove_dir_all(&base);
 }
