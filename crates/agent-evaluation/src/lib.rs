@@ -16,6 +16,7 @@ pub mod model;
 mod plugin_deployment;
 mod plugin_gate;
 mod plugin_host_audit;
+mod plugin_host_smoke;
 mod plugin_release;
 mod plugin_signature;
 pub mod protocol;
@@ -24,6 +25,7 @@ pub mod report;
 pub mod runner;
 mod skill_exit_gate;
 mod skill_gate;
+mod skill_registry;
 pub mod verifier;
 
 pub use archive::{
@@ -79,6 +81,10 @@ pub use plugin_host_audit::{
     bind_plugin_host_audit, protocol_component_interface, PluginHostAuditBinding,
     PluginHostAuditBindingError, TrustedHostCheckOutcome,
 };
+pub use plugin_host_smoke::{
+    run_plugin_host_smoke, PluginHostDeclarationSnapshot, PluginHostSmokeError,
+    PluginHostSmokeInput, PluginHostSmokeOutput,
+};
 pub use plugin_release::{
     FilePluginReleaseArchive, PluginCanaryAdmissionV1, PluginEvaluationArchiveRecordV1,
     PluginReleaseArchiveRecordV1, PluginReleaseController, PluginReleaseError,
@@ -108,6 +114,12 @@ pub use skill_exit_gate::{
 pub use skill_gate::{
     evaluate_skill_candidate, evaluate_skill_candidate_with_policy, SkillCommitPolicyV1,
     SkillGateError, TrustedSkillGateResultV1, M7_SKILL_COMMIT_POLICY_VERSION,
+};
+pub use skill_registry::{
+    SkillEvaluationRegistryEntryV1, SkillEvaluationRegistryV1, SkillHealthRegistryEntryV1,
+    SkillRegistryAuthorizationV1, SkillRegistryError, TrustedSkillEvaluationRegistry,
+    MAX_SKILL_EVALUATION_REGISTRY_BYTES, SKILL_EVALUATION_REGISTRY_FILE,
+    SKILL_EVALUATION_REGISTRY_SCHEMA_VERSION,
 };
 pub use verifier::{
     BuiltinVerifierV1, TrustedVerifier, VerificationResult, VerifierCheck, VerifierRegistry,
