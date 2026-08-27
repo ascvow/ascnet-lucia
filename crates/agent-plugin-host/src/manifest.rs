@@ -342,6 +342,38 @@ manifest = "/opt/lucia/plugin.toml"
             .expect_err("缺少 profile allowlist 时必须失败");
         assert!(error.to_string().contains("至少一个 profiles"));
     }
+
+    /// Guest 声明不得在 Host 尚无真实实现时打开网络或 Secret 能力。
+    #[test]
+    fn unsupported_network_and_secret_capabilities_fail_before_instantiation() {
+        for (capability_name, capabilities) in [
+            (
+                "HTTP",
+                CapabilitySection {
+                    http: true,
+                    ..CapabilitySection::default()
+                },
+            ),
+            (
+                "Secret",
+                CapabilitySection {
+                    secrets: true,
+                    ..CapabilitySection::default()
+                },
+            ),
+        ] {
+            let mut manifest = test_manifest("untrusted", "1.0.0", Vec::new());
+            manifest.capabilities = capabilities;
+
+            let error = manifest
+                .validate()
+                .expect_err("未实现的真实能力必须在 component 实例化前拒绝");
+            assert!(
+                error.to_string().contains("尚未实现插件 HTTP、secret"),
+                "{capability_name} 声明应被 Host 拒绝，实际为：{error}"
+            );
+        }
+    }
 }
 
 /// plugin.toml 的结构。

@@ -2,8 +2,8 @@
 //! Shell command execution tool.
 
 use crate::{
-    FileCapability, NoopToolOutputSink, Tool, ToolCall, ToolOutputDelta, ToolOutputSink,
-    ToolOutputStream, ToolResult, ToolSpec, WorkspaceGuard,
+    ExecutionPolicy, FileCapability, NoopToolOutputSink, Tool, ToolCall, ToolErrorKind,
+    ToolOutputDelta, ToolOutputSink, ToolOutputStream, ToolResult, ToolSpec, WorkspaceGuard,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -40,6 +40,8 @@ pub struct ShellTool {
     default_timeout_ms: u64,
     /// 工作区守卫，限定命令的工作目录范围。
     guard: WorkspaceGuard,
+    /// 操作系统进程入口复核的可信执行策略。
+    execution_policy: ExecutionPolicy,
 }
 
 impl Default for ShellTool {
@@ -47,6 +49,7 @@ impl Default for ShellTool {
         Self {
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
             guard: WorkspaceGuard::default(),
+            execution_policy: ExecutionPolicy::serve(),
         }
     }
 }
@@ -58,6 +61,7 @@ impl ShellTool {
         Self {
             default_timeout_ms: timeout_ms.min(MAX_TIMEOUT_MS),
             guard: WorkspaceGuard::default(),
+            execution_policy: ExecutionPolicy::serve(),
         }
     }
 
@@ -66,6 +70,20 @@ impl ShellTool {
         Self {
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
             guard,
+            execution_policy: ExecutionPolicy::serve(),
+        }
+    }
+
+    /// 以指定工作区守卫和可信执行策略创建 ShellTool。
+    ///
+    /// `execution_policy` 会在每次调用操作系统前复核；Evaluation 与 Mutation 即使错误地
+    /// 开启 `allow_process` 也会返回结构化边界错误，不会启动 Shell。调用方应使用同一
+    /// 策略构造 `guard`，确保文件与进程边界一致。
+    pub fn with_execution_policy(guard: WorkspaceGuard, execution_policy: ExecutionPolicy) -> Self {
+        Self {
+            default_timeout_ms: DEFAULT_TIMEOUT_MS,
+            guard,
+            execution_policy,
         }
     }
 
@@ -197,6 +215,15 @@ impl Tool for ShellTool {
         call: ToolCall,
         output: Arc<dyn ToolOutputSink>,
     ) -> Result<ToolResult> {
+        if !self.execution_policy.permits_process_execution() {
+            return Ok(ToolResult::error_with_kind(
+                call.id,
+                call.name,
+                ToolErrorKind::ProcessBoundaryViolation,
+                "当前执行策略禁止 Shell 与子进程执行",
+            ));
+        }
+
         let args: Args = call.args_as()?;
         let timeout_ms = args
             .timeout_ms
@@ -283,7 +310,7 @@ impl Tool for ShellTool {
                         name: call.name,
                         content: payload,
                         is_error: true,
-                        error_kind: Some(crate::ToolErrorKind::Execution),
+                        error_kind: Some(ToolErrorKind::Execution),
                         details: None,
                     })
                 } else {

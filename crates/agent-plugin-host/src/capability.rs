@@ -10,7 +10,7 @@ use agent_core::{AgentEvent, ModelMessage, ModelRequest, ReasoningLevel, ToolCho
 use agent_runtime::{
     AgentEventStream, AgentId, AgentRuntimeApi, AgentSpawnRequest, RuntimePrincipal,
 };
-use agent_tool::{ExecutionPolicy, ExecutionProfile};
+use agent_tool::ExecutionPolicy;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -793,9 +793,7 @@ impl CapabilityState {
     }
 
     fn require_process_exec(&self) -> Result<()> {
-        if self.execution_policy.profile() != ExecutionProfile::Serve
-            || !self.execution_policy.allow_process
-        {
+        if !self.execution_policy.permits_process_execution() {
             return Err(anyhow!("Host ExecutionPolicy 禁止插件进程执行"));
         }
         if !self.permissions.process_exec {

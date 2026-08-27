@@ -125,6 +125,7 @@ impl WasiView for PluginWasiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasmtime::{component::Component, component::Linker, Store, Trap};
 
     /// 显式缓存目录必须被 Wasmtime 验证并创建。
     #[test]
@@ -137,6 +138,43 @@ mod tests {
 
         drop(engine);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    /// 恶意 component 的无限循环必须耗尽 Store fuel 并由 Wasmtime 终止。
+    #[test]
+    fn infinite_loop_component_is_terminated_by_fuel() {
+        let engine = create_wasm_engine(None).expect("应创建启用 fuel 的 Engine");
+        let component = Component::new(
+            &engine,
+            r#"
+                (component
+                    (core module $malicious
+                        (func (export "run")
+                            (loop $spin
+                                br $spin)))
+                    (core instance $malicious-instance (instantiate $malicious))
+                    (func (export "run")
+                        (canon lift (core func $malicious-instance "run"))))
+            "#,
+        )
+        .expect("恶意 component 应可编译");
+        let linker = Linker::<()>::new(&engine);
+        let mut store = Store::new(&engine, ());
+        store.set_fuel(10_000).expect("应设置有限 fuel");
+        let instance = linker
+            .instantiate(&mut store, &component)
+            .expect("恶意 component 应可实例化");
+        let run = instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .expect("应取得恶意导出函数");
+
+        let error = run
+            .call(&mut store, ())
+            .expect_err("无限循环必须在 fuel 耗尽后终止");
+        assert!(
+            matches!(error.downcast_ref::<Trap>(), Some(Trap::OutOfFuel)),
+            "终止原因必须是 fuel 耗尽，实际为：{error:?}"
+        );
     }
 }
 

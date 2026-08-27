@@ -226,13 +226,13 @@ pub struct ExecutionPolicy {
     /// 原生文件工具的目录范围。
     #[serde(default)]
     pub filesystem: FilesystemScope,
-    /// 是否允许访问真实网络。
+    /// 是否请求允许访问真实网络；真实入口必须调用 `permits_network_access` 复核。
     #[serde(default)]
     pub allow_network: bool,
-    /// 是否允许注入真实 Secret。
+    /// 是否请求允许注入真实 Secret；真实入口必须调用 `permits_secret_access` 复核。
     #[serde(default)]
     pub allow_secrets: bool,
-    /// 是否允许 Shell 与子进程执行。
+    /// 是否请求允许 Shell 与子进程执行；真实入口必须调用 `permits_process_execution` 复核。
     #[serde(default)]
     pub allow_process: bool,
     /// 资源上限。
@@ -317,14 +317,38 @@ impl ExecutionPolicy {
         self.profile
     }
 
+    /// 判断可信运行平面是否允许访问真实网络。
+    ///
+    /// 公开布尔字段只表达调用方请求；Evaluation 与 Mutation 的 Profile 身份拥有最终
+    /// 否决权，因此即使字段被错误地改为 `true` 也不会开放网络能力。
+    pub fn permits_network_access(&self) -> bool {
+        self.profile == ExecutionProfile::Serve && self.allow_network
+    }
+
+    /// 判断可信运行平面是否允许读取或注入真实 Secret。
+    ///
+    /// 该方法是未来 Secret Broker 与其他真实凭据入口必须复用的最终门禁；受限 Profile
+    /// 不会因公开请求字段被篡改而获得凭据。
+    pub fn permits_secret_access(&self) -> bool {
+        self.profile == ExecutionProfile::Serve && self.allow_secrets
+    }
+
+    /// 判断可信运行平面是否允许启动 Shell 或其他原生子进程。
+    ///
+    /// 调用操作系统的每个进程入口都必须复用该方法，不能只依赖工具名 allowlist 或公开
+    /// 布尔字段，否则 Guest 别名与错误配置可能绕过受限 Profile。
+    pub fn permits_process_execution(&self) -> bool {
+        self.profile == ExecutionProfile::Serve && self.allow_process
+    }
+
     /// 判断策略是否允许调用指定工具。
     ///
-    /// 除 allowlist 外，`allow_process` 为假时会额外拒绝声明需要进程能力的工具。
+    /// 除 allowlist 外，进程能力最终门禁会额外拒绝声明需要进程能力的工具。
     pub fn permits_tool(&self, name: &str) -> bool {
         if !self.tools.permits(name) {
             return false;
         }
-        if !self.allow_process && is_process_tool(name) {
+        if is_process_tool(name) && !self.permits_process_execution() {
             return false;
         }
         true
@@ -395,11 +419,29 @@ mod tests {
     #[test]
     fn evaluation_denies_process_tools_even_when_allowlisted() {
         let mut policy = ExecutionPolicy::evaluation("/tmp/fixture");
-        // 即使评测策略错误地把 shell 放进 allowlist，进程能力关闭仍应拒绝。
+        // 即使评测策略错误地把 shell 放进 allowlist 并改开布尔位，Profile 仍应拒绝。
         policy.tools = ToolAccess::allowlist(["read_file", "shell"]);
+        policy.allow_process = true;
 
         assert!(policy.permits_tool("read_file"));
         assert!(!policy.permits_tool("shell"));
+    }
+
+    #[test]
+    fn restricted_profiles_cannot_regain_real_capabilities() {
+        for mut policy in [
+            ExecutionPolicy::evaluation("/tmp/fixture"),
+            ExecutionPolicy::mutation(),
+        ] {
+            // 模拟调用方绕过构造流程直接改开公开请求字段。
+            policy.allow_network = true;
+            policy.allow_secrets = true;
+            policy.allow_process = true;
+
+            assert!(!policy.permits_network_access());
+            assert!(!policy.permits_secret_access());
+            assert!(!policy.permits_process_execution());
+        }
     }
 
     #[test]
@@ -407,6 +449,9 @@ mod tests {
         let policy = ExecutionPolicy::serve();
         assert!(policy.permits_tool("shell"));
         assert!(policy.permits_tool("read_file"));
+        assert!(policy.permits_network_access());
+        assert!(policy.permits_secret_access());
+        assert!(policy.permits_process_execution());
     }
 
     #[test]
