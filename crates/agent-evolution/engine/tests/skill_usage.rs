@@ -16,11 +16,6 @@ use agent_tool::ExecutionPolicy;
 use serde_json::json;
 use std::{collections::BTreeSet, sync::Arc};
 
-/// 创建测试使用的固定 Artifact 摘要。
-fn digest(seed: char) -> ArtifactDigest {
-    ArtifactDigest::from_sha256_hex(seed.to_string().repeat(64)).expect("测试摘要应合法")
-}
-
 /// 创建 Quarantined 或完整 Active 状态链的 Skill 制品。
 fn skill_artifact(skill_id: SkillId, active: bool) -> SkillArtifactV1 {
     let mut status_history = vec![SkillStatusTransitionV1 {
