@@ -13,6 +13,7 @@ mod candidate_builder;
 mod candidate_selection;
 mod certificate;
 mod context_candidate_builder;
+mod context_cycle;
 mod context_policy;
 mod cycle;
 mod episode_evidence;
@@ -38,7 +39,6 @@ mod prompt_mutation;
 mod recorder;
 mod recorder_hub;
 mod replay;
-mod runtime_health;
 mod scorecard;
 mod skill_candidate_builder;
 mod skill_cycle;
@@ -63,6 +63,12 @@ pub use certificate::{
 pub use context_candidate_builder::{
     ContextCandidateBuildError, ContextCandidateBuilder, CONTEXT_LOADER_CAPABILITY_ID,
 };
+pub use context_cycle::{
+    BoundedContextMutator, ContextCycleArchiveError, ContextCycleError, ContextCycleStage,
+    ContextEvolutionCycle, ContextEvolutionCycleRequestV1, ContextEvolutionCycleSnapshotV1,
+    FileContextCycleArchive, CONTEXT_EVOLUTION_CANDIDATE_COUNT,
+    CONTEXT_EVOLUTION_CYCLE_SCHEMA_VERSION, MAX_CONTEXT_CYCLE_SNAPSHOT_BYTES,
+};
 pub use context_policy::{
     ContextPolicyRepository, ContextPolicyRepositoryError, CONTEXT_POLICY_MEDIA_TYPE,
     MAX_CONTEXT_POLICY_BYTES,
@@ -79,7 +85,9 @@ pub use episode_store::{EpisodeQuery, EpisodeStore, EpisodeStoreError, FileEpiso
 pub use evaluation_store::{
     load_evaluation_report, EvaluationStoreError, FileEvaluationReportStore,
 };
-pub use evaluator_process::{EvaluatorClient, EvaluatorProcessError, LuciaEvalProcessClient};
+pub use evaluator_process::{
+    ContextEvaluatorClient, EvaluatorClient, EvaluatorProcessError, LuciaEvalProcessClient,
+};
 pub use evolution_policy::{
     EvolutionPolicy, EVOLUTION_POLICY_VERSION, TASK_STRATEGY_MVP_CANDIDATE_COUNT,
 };
@@ -136,11 +144,6 @@ pub use prompt_mutation::{
 pub use recorder::{EpisodeRecorder, EpisodeRecorderConfig, EpisodeRecorderError};
 pub use recorder_hub::{EpisodeRecorderHub, EpisodeRecorderHubError, RegisteredEpisodeRun};
 pub use replay::{ProtocolReplay, ProtocolReplayError, ReplayEventSink, ReplayReport};
-pub use runtime_health::{
-    FileRuntimeHealthObservationStore, RuntimeHealthRecorder, RuntimeHealthRecorderError,
-    RuntimeHealthStoreError, VerifiedRuntimeHealthObservation,
-    MAX_RUNTIME_HEALTH_OBSERVATION_BYTES, RUNTIME_HEALTH_DIRECTORY,
-};
 pub use scorecard::{
     comparison_validity, compute_scorecard, headline_verdict, BehaviorAssessment,
     ComparisonValidity, ComparisonViolation, ComparisonViolationKind, ConfidenceInterval,

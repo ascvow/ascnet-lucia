@@ -7,6 +7,7 @@
 pub mod archive;
 pub mod audit;
 pub mod context_evaluation;
+pub mod context_fixture;
 pub mod dataset;
 pub mod fixture;
 pub mod gate;
@@ -39,6 +40,10 @@ pub use context_evaluation::{
     M6_MAX_LATENCY_MS, M6_MIN_CONSTRAINT_RECALL_BPS, M6_MIN_DOWNSTREAM_TASK_SUCCESS_BPS,
     M6_MIN_FACT_RECALL_BPS, M6_MIN_PLAN_STATE_RECALL_BPS, M6_MIN_TOKEN_REDUCTION_BPS,
     M6_MIN_TOOL_STATE_RECALL_BPS,
+};
+pub use context_fixture::{
+    ContextFixtureError, ContextObservationFixtureV1, TrustedContextObservationFixture,
+    CONTEXT_OBSERVATION_FIXTURE_SCHEMA_VERSION, MAX_CONTEXT_OBSERVATION_FIXTURE_BYTES,
 };
 pub use dataset::{
     DatasetCaseRef, DatasetError, DatasetManifest, DatasetVisibility, MutatorDatasetView,
@@ -83,7 +88,8 @@ pub use plugin_signature::{
 pub use protocol::{ProtocolDifference, ProtocolTrace, ProtocolTraceEntry, ProtocolTraceError};
 pub use release::{ReleaseController, ReleaseError, ReleaseReceipt};
 pub use report::{
-    evaluation_report_digest, EvaluationReportBuilder, EvaluationReportIdentity,
+    evaluation_report_digest, ContextEvaluationReportBuilder, ContextEvaluationReportMetadata,
+    ContextReportBuildError, EvaluationReportBuilder, EvaluationReportIdentity,
     EvaluationReportMetadata, ReportBuildError, TrustedEvaluationReport,
 };
 pub use runner::{

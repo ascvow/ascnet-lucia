@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 /// 固定 M6 Context Policy Gate 的版本。
 ///
 /// 任一阈值或比较语义变化都必须更换该版本，不能继续接受旧报告。
-pub const M6_CONTEXT_GATE_VERSION: &str = "context-policy-m6-v1";
+pub const M6_CONTEXT_GATE_VERSION: &str = agent_evolution_protocol::M6_CONTEXT_GATE_VERSION;
 /// Candidate 事实召回率最低为 95%。
 pub const M6_MIN_FACT_RECALL_BPS: u16 = 9_500;
 /// Candidate 用户约束召回率必须为 100%。

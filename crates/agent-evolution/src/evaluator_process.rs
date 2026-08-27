@@ -4,8 +4,9 @@
 //! 每次调用只向固定可执行文件发送一份版本化 JSON，并严格校验脱敏回执与请求身份。
 
 use agent_evolution_protocol::{
-    EvaluationReceiptV1, EvaluationRequestV1, HealthCheckReceiptV1, HealthCheckRequestV1,
-    PromotionRequestV1, ReleaseReceiptV1, RollbackRequestV1,
+    ContextEvaluationReceiptV1, ContextEvaluationRequestV1, EvaluationReceiptV1,
+    EvaluationRequestV1, HealthCheckReceiptV1, HealthCheckRequestV1, PromotionRequestV1,
+    ReleaseReceiptV1, RollbackRequestV1, M6_CONTEXT_GATE_VERSION,
 };
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
@@ -60,6 +61,53 @@ pub trait EvaluatorClient: Send + Sync {
     ///
     /// 请求无效、Evaluator 进程失败或回执未绑定请求的 Release 时返回错误。
     async fn rollback(
+        &self,
+        request: &RollbackRequestV1,
+    ) -> Result<ReleaseReceiptV1, EvaluatorProcessError>;
+}
+
+/// Context Cycle 使用的独立 Evaluator 进程边界。
+///
+/// Context Gate 评测使用专用请求和回执；Promotion、Health 与 Rollback 复用相同的受信
+/// Release 控制面，不在 Evolver 内复制 Gate 或发布规则。
+#[async_trait]
+pub trait ContextEvaluatorClient: Send + Sync {
+    /// 提交 Context Candidate 并返回八指标 Gate 与正式 Report Seal 回执。
+    ///
+    /// # Errors
+    ///
+    /// 请求、Evaluator 进程、Context Report 或身份绑定无效时返回错误。
+    async fn evaluate_context(
+        &self,
+        request: &ContextEvaluationRequestV1,
+    ) -> Result<ContextEvaluationReceiptV1, EvaluatorProcessError>;
+
+    /// 请求受信 Release Controller 晋升已通过 Context Gate 的正式报告。
+    ///
+    /// # Errors
+    ///
+    /// 请求、Evaluator 进程或回执绑定无效时返回错误。
+    async fn promote_context(
+        &self,
+        request: &PromotionRequestV1,
+    ) -> Result<ReleaseReceiptV1, EvaluatorProcessError>;
+
+    /// 请求受信 Evaluator 复核 Context Promotion 后的 Runtime 健康观察。
+    ///
+    /// # Errors
+    ///
+    /// 请求、Evaluator 进程或回执绑定无效时返回错误。
+    async fn health_context(
+        &self,
+        request: &HealthCheckRequestV1,
+    ) -> Result<HealthCheckReceiptV1, EvaluatorProcessError>;
+
+    /// 请求受信 Release Controller 回滚不健康的 Context Promotion。
+    ///
+    /// # Errors
+    ///
+    /// 请求、Evaluator 进程或回执绑定无效时返回错误。
+    async fn rollback_context(
         &self,
         request: &RollbackRequestV1,
     ) -> Result<ReleaseReceiptV1, EvaluatorProcessError>;
@@ -234,6 +282,53 @@ impl EvaluatorClient for LuciaEvalProcessClient {
             ));
         }
         Ok(receipt)
+    }
+}
+
+#[async_trait]
+impl ContextEvaluatorClient for LuciaEvalProcessClient {
+    async fn evaluate_context(
+        &self,
+        request: &ContextEvaluationRequestV1,
+    ) -> Result<ContextEvaluationReceiptV1, EvaluatorProcessError> {
+        request
+            .validate()
+            .map_err(|error| EvaluatorProcessError::InvalidRequest(error.to_string()))?;
+        let receipt: ContextEvaluationReceiptV1 = self.invoke("context-evaluate", request).await?;
+        receipt
+            .validate(M6_CONTEXT_GATE_VERSION)
+            .map_err(|error| EvaluatorProcessError::InvalidReceiptBinding(error.to_string()))?;
+        if receipt.request_id != request.request_id
+            || receipt.context_report.parent_revision_id != request.parent_revision_id
+            || receipt.context_report.candidate_revision_id != request.candidate_revision_id
+            || receipt.fixture_version != request.expected_fixture_version
+        {
+            return Err(EvaluatorProcessError::InvalidReceiptBinding(
+                "Context Evaluation Receipt 与请求身份不匹配".to_string(),
+            ));
+        }
+        Ok(receipt)
+    }
+
+    async fn promote_context(
+        &self,
+        request: &PromotionRequestV1,
+    ) -> Result<ReleaseReceiptV1, EvaluatorProcessError> {
+        EvaluatorClient::promote(self, request).await
+    }
+
+    async fn health_context(
+        &self,
+        request: &HealthCheckRequestV1,
+    ) -> Result<HealthCheckReceiptV1, EvaluatorProcessError> {
+        EvaluatorClient::health(self, request).await
+    }
+
+    async fn rollback_context(
+        &self,
+        request: &RollbackRequestV1,
+    ) -> Result<ReleaseReceiptV1, EvaluatorProcessError> {
+        EvaluatorClient::rollback(self, request).await
     }
 }
 

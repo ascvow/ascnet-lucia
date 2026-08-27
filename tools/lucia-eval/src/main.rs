@@ -4,18 +4,22 @@
 //! Workspace 和 Store 根均来自受信环境配置，禁止由 Candidate 或 Mutator 随请求指定。
 
 use agent_evaluation::{
-    ComparativeRunner, ComparativeRunnerConfig, EvaluationArchiveError, EvaluationReportBuilder,
-    EvaluationReportIdentity, EvaluationReportMetadata, EvaluationSubject,
+    evaluate_context_policy_candidate, ComparativeRunner, ComparativeRunnerConfig,
+    ContextEvaluationReportBuilder, ContextEvaluationReportMetadata, EvaluationArchiveError,
+    EvaluationReportBuilder, EvaluationReportIdentity, EvaluationReportMetadata, EvaluationSubject,
     FileRuntimeHealthObservationStore, ReleaseController, ReleaseHealthVerifier, ReleaseReceipt,
-    TrustedDatasetStore, TrustedEvaluationArchive, VerifiedEvaluation,
+    TrustedContextObservationFixture, TrustedDatasetStore, TrustedEvaluationArchive,
+    VerifiedEvaluation,
 };
 use agent_evolution::{
     ArtifactStore, FileArtifactStore, FileGenomeResolver, GenomeResolver, GenomeSelector,
 };
 use agent_evolution_protocol::{
-    ArtifactDigest, EvaluationEnvironment, EvaluationReceiptV1, EvaluationRequestV1,
-    GenomeRevision, GenomeRevisionId, HealthCheckReceiptV1, HealthCheckRequestV1,
-    PromotionRequestV1, ReleaseReceiptV1, RollbackRequestV1, EVALUATION_RECEIPT_SCHEMA_VERSION,
+    ArtifactDigest, ContextEvaluationReceiptV1, ContextEvaluationRequestV1,
+    ContextPolicyEvaluationReportV1, EvaluationEnvironment, EvaluationReceiptV1,
+    EvaluationRequestV1, GenomeRevision, GenomeRevisionId, HealthCheckReceiptV1,
+    HealthCheckRequestV1, PromotionRequestV1, ReleaseReceiptV1, RollbackRequestV1,
+    CONTEXT_EVALUATION_RECEIPT_SCHEMA_VERSION, EVALUATION_RECEIPT_SCHEMA_VERSION,
     RELEASE_RECEIPT_SCHEMA_VERSION,
 };
 #[cfg(test)]
@@ -51,6 +55,8 @@ struct Args {
 enum Command {
     /// 运行 Parent/Candidate 离线比较并提交正式 Report Seal。
     Evaluate,
+    /// 运行固定八指标 Context Gate 并提交正式 Report Seal。
+    ContextEvaluate,
     /// 使用正式 EvaluationReport 晋升 Candidate。
     Promote,
     /// 把指定 Promotion 原子回滚到 Parent。
@@ -75,6 +81,30 @@ struct TrustedConfig {
 struct TrustedReleaseConfig {
     evolution_root: PathBuf,
     archive_root: PathBuf,
+}
+
+/// Context Gate 需要的受信 Registry、Fixture 与 Archive 配置。
+#[derive(Debug, Clone)]
+struct TrustedContextConfig {
+    evolution_root: PathBuf,
+    archive_root: PathBuf,
+    fixture_root: PathBuf,
+    expected_fixture_digest: ArtifactDigest,
+}
+
+impl TrustedContextConfig {
+    /// 只从进程环境加载 Context Gate 的固定输入位置和摘要。
+    fn from_env() -> Result<Self> {
+        let expected_fixture_digest =
+            ArtifactDigest::new(required_env("LUCIA_EVAL_CONTEXT_FIXTURE_DIGEST")?)
+                .map_err(|_| anyhow!("invalid_context_fixture_digest"))?;
+        Ok(Self {
+            evolution_root: required_path("LUCIA_EVAL_EVOLUTION_ROOT")?,
+            archive_root: required_path("LUCIA_EVAL_ARCHIVE_ROOT")?,
+            fixture_root: required_path("LUCIA_EVAL_CONTEXT_FIXTURE_ROOT")?,
+            expected_fixture_digest,
+        })
+    }
 }
 
 /// Promotion 健康复核需要的受信 Store 根配置。
@@ -135,6 +165,9 @@ async fn main() {
         Command::Evaluate => run_evaluate()
             .await
             .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
+        Command::ContextEvaluate => run_context_evaluate()
+            .await
+            .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
         Command::Promote => run_promote()
             .await
             .and_then(|value| serde_json::to_value(value).context("receipt_serialize_failed")),
@@ -152,6 +185,183 @@ async fn main() {
         },
         Err(error) => fail(stable_error_code(&error)),
     }
+}
+
+/// 执行受信 Context Fixture 加载、八指标 Gate、正式 Archive 与 Seal 提交。
+async fn run_context_evaluate() -> Result<ContextEvaluationReceiptV1> {
+    let config = TrustedContextConfig::from_env().context("config_invalid")?;
+    let request: ContextEvaluationRequestV1 = read_json_request().context("request_invalid")?;
+    request.validate().context("request_invalid")?;
+    let fixture = TrustedContextObservationFixture::open_pinned(
+        &config.fixture_root,
+        config.expected_fixture_digest,
+    )
+    .await
+    .context("context_fixture_invalid")?;
+    if fixture.version() != &request.expected_fixture_version {
+        return Err(anyhow!("context_fixture_version_mismatch"));
+    }
+
+    let resolver = FileGenomeResolver::new(&config.evolution_root);
+    let parent = resolve_revision(&resolver, &request.parent_revision_id).await?;
+    let candidate = resolve_revision(&resolver, &request.candidate_revision_id).await?;
+    let parent_observation = fixture
+        .observation(&request.parent_revision_id)
+        .context("context_fixture_invalid")?;
+    let candidate_observation = fixture
+        .observation(&request.candidate_revision_id)
+        .context("context_fixture_invalid")?;
+    let context_report = evaluate_context_policy_candidate(
+        &parent,
+        &candidate,
+        parent_observation,
+        candidate_observation,
+    )
+    .context("context_evaluation_failed")?;
+
+    let archive_request = request.archive_request();
+    let archive = TrustedEvaluationArchive::new(&config.archive_root);
+    let binding = archive
+        .bind_request(&archive_request, now_ms()?)
+        .await
+        .context("archive_commit_failed")?;
+    match archive.get_verified_for_request(&binding).await {
+        Ok(verified) => {
+            return context_evaluation_receipt(
+                &request,
+                &context_report,
+                fixture.digest(),
+                &verified,
+            )
+        }
+        Err(EvaluationArchiveError::SealNotFound(_)) => {}
+        Err(error) => return Err(error).context("archive_commit_failed"),
+    }
+    match archive.get_prepared_for_request(&binding).await {
+        Ok(trusted) => {
+            let verified = archive
+                .commit(&trusted, binding.generated_at_ms)
+                .await
+                .context("archive_commit_failed")?;
+            return context_evaluation_receipt(
+                &request,
+                &context_report,
+                fixture.digest(),
+                &verified,
+            );
+        }
+        Err(EvaluationArchiveError::PreparedEvaluationNotFound(_)) => {}
+        Err(error) => return Err(error).context("archive_commit_failed"),
+    }
+
+    let stable = resolver
+        .stable_reference(&request.lineage)
+        .await
+        .context("stable_precondition_failed")?;
+    if stable.revision_id != request.parent_revision_id
+        || stable.generation != request.expected_parent_generation
+    {
+        return Err(anyhow!("stable_precondition_failed"));
+    }
+    let trusted = ContextEvaluationReportBuilder
+        .build_with_fixed_identity(
+            &context_report,
+            parent_observation,
+            candidate_observation,
+            &parent,
+            &candidate,
+            ContextEvaluationReportMetadata {
+                lineage: request.lineage.clone(),
+                parent_generation: request.expected_parent_generation,
+                fixture_version: request.expected_fixture_version.clone(),
+                fixture_digest: fixture.digest().clone(),
+                generated_at_ms: binding.generated_at_ms,
+            },
+            EvaluationReportIdentity {
+                report_id: binding.report_id.clone(),
+                generated_at_ms: binding.generated_at_ms,
+            },
+        )
+        .context("report_build_failed")?;
+    archive
+        .prepare_for_request(&binding, &trusted)
+        .await
+        .context("archive_commit_failed")?;
+    let verified = archive
+        .commit_prepared_for_request(&binding, binding.generated_at_ms)
+        .await
+        .context("archive_commit_failed")?;
+    context_evaluation_receipt(&request, &context_report, fixture.digest(), &verified)
+}
+
+/// 从 Context Gate 报告和已复核 Seal 构造严格绑定的专用回执。
+fn context_evaluation_receipt(
+    request: &ContextEvaluationRequestV1,
+    context_report: &ContextPolicyEvaluationReportV1,
+    fixture_digest: &ArtifactDigest,
+    verified: &VerifiedEvaluation,
+) -> Result<ContextEvaluationReceiptV1> {
+    let report = verified.report();
+    let seal = verified.seal();
+    let expected_fixture_binding =
+        format!("{}:{}", request.expected_fixture_version, fixture_digest);
+    let context_surface_is_exact = report.genome_diff.changed_surfaces.len() == 1
+        && report
+            .genome_diff
+            .changed_surfaces
+            .contains(&agent_evolution_protocol::MutationSurface::ContextPolicy)
+        && report.allowed_mutation_surfaces.len() == 1
+        && report
+            .allowed_mutation_surfaces
+            .contains(&agent_evolution_protocol::MutationSurface::ContextPolicy);
+    if report.parent.genome_revision != context_report.parent_revision_id
+        || report.candidate.genome_revision != context_report.candidate_revision_id
+        || report.gate_decision != context_report.decision
+        || report.lineage.as_deref() != Some(request.lineage.as_str())
+        || report.parent_generation != Some(request.expected_parent_generation)
+        || report.candidate_generation != request.expected_parent_generation.checked_add(1)
+        || !context_surface_is_exact
+        || seal.commit_policy_version != agent_evaluation::M6_CONTEXT_GATE_VERSION
+        || seal.evaluation_policy_version != agent_evaluation::M6_CONTEXT_GATE_VERSION
+        || report.parent.environment.evaluation_policy_version
+            != agent_evaluation::M6_CONTEXT_GATE_VERSION
+        || report.candidate.environment.evaluation_policy_version
+            != agent_evaluation::M6_CONTEXT_GATE_VERSION
+        || report
+            .parent
+            .environment
+            .environment_fixture_digest
+            .as_str()
+            != expected_fixture_binding.as_str()
+        || report
+            .candidate
+            .environment
+            .environment_fixture_digest
+            .as_str()
+            != expected_fixture_binding.as_str()
+    {
+        return Err(anyhow!("context_archive_binding_mismatch"));
+    }
+    let context_bytes = serde_json::to_vec(context_report).context("receipt_serialize_failed")?;
+    let context_report_digest =
+        ArtifactDigest::from_sha256_hex(format!("{:x}", Sha256::digest(context_bytes)))
+            .map_err(|_| anyhow!("receipt_serialize_failed"))?;
+    let receipt = ContextEvaluationReceiptV1 {
+        schema_version: CONTEXT_EVALUATION_RECEIPT_SCHEMA_VERSION,
+        request_id: request.request_id.clone(),
+        report_id: report.report_id.clone(),
+        report_digest: seal.report_digest.clone(),
+        context_report_digest,
+        audit_record_id: seal.audit_record_id.clone(),
+        audit_head_digest: seal.audit_record_digest.clone(),
+        fixture_version: request.expected_fixture_version.clone(),
+        context_report: context_report.clone(),
+        lifecycle: report.lifecycle,
+    };
+    receipt
+        .validate(agent_evaluation::M6_CONTEXT_GATE_VERSION)
+        .context("context_archive_binding_mismatch")?;
+    Ok(receipt)
 }
 
 /// 执行一次完整的加载、比较、Gate、Report、Audit 与 Seal 提交。
@@ -436,6 +646,12 @@ fn stable_error_code(error: &anyhow::Error) -> &'static str {
             "request_invalid" => return "request_invalid",
             "stable_precondition_failed" => return "stable_precondition_failed",
             "dataset_invalid" | "dataset_version_mismatch" => return "dataset_invalid",
+            "context_fixture_invalid" | "context_fixture_version_mismatch" => {
+                return "context_fixture_invalid"
+            }
+            "context_evaluation_failed" | "context_archive_binding_mismatch" => {
+                return "context_evaluation_failed"
+            }
             "evaluation_failed" | "runner_invalid" => return "evaluation_failed",
             "report_build_failed" => return "report_build_failed",
             "archive_commit_failed" => return "archive_commit_failed",
@@ -477,6 +693,32 @@ mod tests {
         }
     }
 
+    /// Context 请求只能声明修订和 Fixture 版本，不能覆盖观察、Gate 或存储配置。
+    #[test]
+    fn context_request_rejects_control_plane_fields() {
+        let base = serde_json::json!({
+            "schema_version": EVALUATION_REQUEST_SCHEMA_VERSION,
+            "request_id": "context-request-0001",
+            "parent_revision_id": GenomeRevisionId::generate(),
+            "candidate_revision_id": GenomeRevisionId::generate(),
+            "lineage": "stable/test",
+            "expected_parent_generation": 1,
+            "expected_fixture_version": DatasetVersionId::generate(),
+        });
+        for field in [
+            "fixture_root",
+            "fixture_digest",
+            "observations",
+            "gate_policy",
+            "gate_decision",
+            "archive_root",
+        ] {
+            let mut value = base.clone();
+            value[field] = serde_json::json!("forged");
+            assert!(serde_json::from_value::<ContextEvaluationRequestV1>(value).is_err());
+        }
+    }
+
     /// 请求 ID 与 lineage 不能携带路径穿越或无界内容。
     #[test]
     fn request_validates_stable_names() {
@@ -501,6 +743,15 @@ mod tests {
         let args = Args::try_parse_from(["lucia-eval", "health"]).expect("health 子命令应存在");
         assert!(matches!(args.command, Command::Health));
         assert!(Args::try_parse_from(["lucia-eval", "health", "/tmp/forged"]).is_err());
+    }
+
+    /// `context-evaluate` 必须是无自由参数的显式受限子命令。
+    #[test]
+    fn parses_explicit_context_evaluate_command() {
+        let args = Args::try_parse_from(["lucia-eval", "context-evaluate"])
+            .expect("context-evaluate 子命令应存在");
+        assert!(matches!(args.command, Command::ContextEvaluate));
+        assert!(Args::try_parse_from(["lucia-eval", "context-evaluate", "/tmp/forged"]).is_err());
     }
 
     /// Health stdin 只能声明 Release 绑定，不能携带观察 Store 或 Stable 路径。

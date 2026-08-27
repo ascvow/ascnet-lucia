@@ -2,14 +2,18 @@
 
 use crate::{
     evaluate_commit_gate, CommitGateOutcome, CommitPolicy, ComparativeEvaluation,
-    EvaluationIntegrity,
+    EvaluationIntegrity, SafetyGateMetrics, TrustedEvaluationMetrics, M6_CONTEXT_GATE_VERSION,
 };
 use agent_evolution::{diff_genomes, GenomeDiffError};
 use agent_evolution_protocol::{
-    ArtifactDigest, DatasetKind, EvaluationReport, EvaluationReportId, GenomeRevision,
-    GenomeRevisionError, InvalidEvaluationReport, EVALUATION_REPORT_SCHEMA_VERSION,
+    ArtifactDigest, ContextEvaluationObservationV1, ContextGateFailureV1,
+    ContextPolicyEvaluationReportV1, DatasetKind, DatasetVersionId, EvaluationEnvironment,
+    EvaluationReport, EvaluationReportId, EvaluationRun, EvaluationRunId, EvolutionLifecycle,
+    GateDecision, GenomeRevision, GenomeRevisionError, InvalidContextEvaluation,
+    InvalidEvaluationReport, MutationSurface, EVALUATION_REPORT_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// EvaluationReport 的 Lineage 与时间元数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +248,256 @@ impl EvaluationReportBuilder {
             private_artifact,
         })
     }
+}
+
+/// Context Gate 正式报告的可信环境与 Lineage 元数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextEvaluationReportMetadata {
+    /// Evolution Lineage。
+    pub lineage: String,
+    /// Parent 在 Lineage 中的当前代数。
+    pub parent_generation: u64,
+    /// 受信 Context Fixture 版本。
+    pub fixture_version: DatasetVersionId,
+    /// 受信 Context Fixture 原始字节摘要。
+    pub fixture_digest: ArtifactDigest,
+    /// 报告生成时间，使用 Unix 毫秒。
+    pub generated_at_ms: u64,
+}
+
+/// 把固定八指标 Context Gate 结果封装进现有可信 Archive/Release 边界的构建器。
+///
+/// 本类型不接受可反序列化 Policy。它只承认编译期固定的 M6 Gate 版本，并重新计算完整 Genome
+/// Diff；Evolver 无法直接构造 `TrustedEvaluationReport` 或 Gate Pass。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContextEvaluationReportBuilder;
+
+impl ContextEvaluationReportBuilder {
+    /// 使用请求绑定的固定报告身份构造可归档的正式 EvaluationReport。
+    ///
+    /// 原始 Context 观察只进入 Evaluator 私有 CAS；公开报告仅保留修订、真实 Genome Diff、
+    /// Gate 决策和可信环境摘要。Context 八指标报告由独立回执和私有制品共同保留。
+    ///
+    /// # Errors
+    ///
+    /// Revision、Context Report、真实差异、身份绑定或序列化不合法时返回
+    /// [`ContextReportBuildError`]。
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_fixed_identity(
+        &self,
+        context_report: &ContextPolicyEvaluationReportV1,
+        parent_observation: &ContextEvaluationObservationV1,
+        candidate_observation: &ContextEvaluationObservationV1,
+        parent: &GenomeRevision,
+        candidate: &GenomeRevision,
+        metadata: ContextEvaluationReportMetadata,
+        identity: EvaluationReportIdentity,
+    ) -> Result<TrustedEvaluationReport, ContextReportBuildError> {
+        parent
+            .validate()
+            .map_err(|source| ContextReportBuildError::InvalidParent { source })?;
+        candidate
+            .validate()
+            .map_err(|source| ContextReportBuildError::InvalidCandidate { source })?;
+        parent_observation.validate()?;
+        candidate_observation.validate()?;
+        context_report.validate(M6_CONTEXT_GATE_VERSION)?;
+        if context_report.parent_revision_id != parent.revision_id
+            || context_report.candidate_revision_id != candidate.revision_id
+        {
+            return Err(ContextReportBuildError::SubjectMismatch);
+        }
+        if metadata.generated_at_ms != identity.generated_at_ms {
+            return Err(ContextReportBuildError::IdentityTimestampMismatch);
+        }
+        let genome_diff = diff_genomes(parent, candidate)?;
+        let lifecycle = match context_report.decision {
+            GateDecision::Pass => EvolutionLifecycle::Eligible,
+            GateDecision::Reject => EvolutionLifecycle::Rejected,
+            GateDecision::RequireApproval | GateDecision::Unknown => {
+                return Err(ContextReportBuildError::UnsupportedDecision(
+                    context_report.decision,
+                ));
+            }
+        };
+        let environment = context_environment(&metadata);
+        let report = EvaluationReport {
+            schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
+            report_id: identity.report_id,
+            lineage: Some(metadata.lineage),
+            parent_generation: Some(metadata.parent_generation),
+            candidate_generation: Some(
+                metadata
+                    .parent_generation
+                    .checked_add(1)
+                    .ok_or(ContextReportBuildError::GenerationOverflow)?,
+            ),
+            parent: EvaluationRun {
+                run_id: EvaluationRunId::generate(),
+                genome_revision: parent.revision_id.clone(),
+                environment: environment.clone(),
+                datasets: BTreeMap::new(),
+                task_cases: Vec::new(),
+            },
+            candidate: EvaluationRun {
+                run_id: EvaluationRunId::generate(),
+                genome_revision: candidate.revision_id.clone(),
+                environment,
+                datasets: BTreeMap::new(),
+                task_cases: Vec::new(),
+            },
+            genome_diff,
+            allowed_mutation_surfaces: BTreeSet::from([MutationSurface::ContextPolicy]),
+            gate_decision: context_report.decision,
+            lifecycle,
+            release_record: None,
+            inheritance: None,
+            artifact_integrity_verified: Some(true),
+            audit_integrity_verified: None,
+            hidden_dataset_isolated: Some(true),
+            generated_at_ms: metadata.generated_at_ms,
+        };
+        report.validate()?;
+        let private_artifact =
+            serialize_context_record(context_report, parent_observation, candidate_observation)?;
+        let private_artifact_digest =
+            digest_bytes(&private_artifact).map_err(ContextReportBuildError::ReportBuild)?;
+        let gate = context_commit_gate(context_report, lifecycle);
+        Ok(TrustedEvaluationReport {
+            report,
+            gate,
+            commit_policy_version: M6_CONTEXT_GATE_VERSION.to_string(),
+            private_artifact_digest,
+            private_artifact,
+        })
+    }
+}
+
+/// 构造不包含调用方可控路径或阈值的固定 Context Evaluation 环境摘要。
+fn context_environment(metadata: &ContextEvaluationReportMetadata) -> EvaluationEnvironment {
+    EvaluationEnvironment {
+        kernel_ref: "context-policy-runner-v1".to_string(),
+        model_provider: "trusted-context-fixture".to_string(),
+        model: "deterministic-context-replay".to_string(),
+        model_parameters_digest: metadata.fixture_digest.to_string(),
+        tool_profile_digest: metadata.fixture_digest.to_string(),
+        execution_profile_digest: "context-evaluation-isolated-v1".to_string(),
+        plugin_set_digest: "context-loader-owner-bound-v1".to_string(),
+        capability_owner_digest: "context-loader-owner-bound-v1".to_string(),
+        resource_budget_digest: "context-gate-budget-v1".to_string(),
+        verifier_version: "context-structured-recall-verifier-v1".to_string(),
+        evaluation_policy_version: M6_CONTEXT_GATE_VERSION.to_string(),
+        environment_fixture_digest: format!(
+            "{}:{}",
+            metadata.fixture_version, metadata.fixture_digest
+        ),
+        repeat_count: 1,
+    }
+}
+
+/// 把 Context Gate 的固定失败集合映射到现有 Seal 所需的权威 Gate 输出。
+fn context_commit_gate(
+    report: &ContextPolicyEvaluationReportV1,
+    lifecycle: EvolutionLifecycle,
+) -> CommitGateOutcome {
+    let behavior_failures = report
+        .failures
+        .iter()
+        .map(|failure| format!("context_gate:{}", context_failure_code(*failure)))
+        .collect();
+    CommitGateOutcome {
+        decision: report.decision,
+        lifecycle,
+        hard_failures: Vec::new(),
+        inconclusive_reasons: Vec::new(),
+        behavior_failures,
+        metrics: TrustedEvaluationMetrics {
+            datasets: BTreeMap::new(),
+            safety: SafetyGateMetrics::default(),
+        },
+    }
+}
+
+/// 返回 Context Gate 失败类别的稳定代码。
+fn context_failure_code(failure: ContextGateFailureV1) -> &'static str {
+    match failure {
+        ContextGateFailureV1::FactRecall => "fact_recall",
+        ContextGateFailureV1::ConstraintRecall => "constraint_recall",
+        ContextGateFailureV1::ToolStateRecall => "tool_state_recall",
+        ContextGateFailureV1::PlanStateRecall => "plan_state_recall",
+        ContextGateFailureV1::DownstreamTaskSuccess => "downstream_task_success",
+        ContextGateFailureV1::TokenReduction => "token_reduction",
+        ContextGateFailureV1::Cost => "cost",
+        ContextGateFailureV1::Latency => "latency",
+        ContextGateFailureV1::GenomeDiff => "genome_diff",
+    }
+}
+
+/// 序列化只允许进入 Evaluator 私有 CAS 的完整 Context 评测记录。
+fn serialize_context_record(
+    report: &ContextPolicyEvaluationReportV1,
+    parent: &ContextEvaluationObservationV1,
+    candidate: &ContextEvaluationObservationV1,
+) -> Result<Vec<u8>, ContextReportBuildError> {
+    #[derive(serde::Serialize)]
+    struct ContextPrivateRecord<'a> {
+        report: &'a ContextPolicyEvaluationReportV1,
+        parent_observation: &'a ContextEvaluationObservationV1,
+        candidate_observation: &'a ContextEvaluationObservationV1,
+    }
+
+    serde_json::to_vec(&ContextPrivateRecord {
+        report,
+        parent_observation: parent,
+        candidate_observation: candidate,
+    })
+    .map_err(ContextReportBuildError::Serialize)
+}
+
+/// Context Gate 到正式 Archive 适配失败。
+#[derive(Debug, thiserror::Error)]
+pub enum ContextReportBuildError {
+    /// Parent Revision 无效。
+    #[error("Parent Genome 无效：{source}")]
+    InvalidParent {
+        /// 原始 Genome 校验错误。
+        #[source]
+        source: GenomeRevisionError,
+    },
+    /// Candidate Revision 无效。
+    #[error("Candidate Genome 无效：{source}")]
+    InvalidCandidate {
+        /// 原始 Genome 校验错误。
+        #[source]
+        source: GenomeRevisionError,
+    },
+    /// Context 观察或 Gate Report 违反协议。
+    #[error(transparent)]
+    InvalidContext(#[from] InvalidContextEvaluation),
+    /// Context Report 绑定了另一组修订。
+    #[error("Context Gate Report 与 Parent/Candidate Revision 不匹配")]
+    SubjectMismatch,
+    /// 请求绑定时间与报告元数据不一致。
+    #[error("Context Evaluation 固定身份时间与报告元数据不一致")]
+    IdentityTimestampMismatch,
+    /// Context 自动 Gate 产生不支持的决策。
+    #[error("Context 自动 Gate 不支持决策：{0:?}")]
+    UnsupportedDecision(GateDecision),
+    /// Candidate 代数溢出。
+    #[error("Context Candidate 代数溢出")]
+    GenerationOverflow,
+    /// Genome Diff 计算失败。
+    #[error(transparent)]
+    GenomeDiff(#[from] GenomeDiffError),
+    /// 正式 EvaluationReport 结构无效。
+    #[error(transparent)]
+    InvalidReport(#[from] InvalidEvaluationReport),
+    /// 私有 Context 评测记录无法序列化。
+    #[error("序列化 Context 私有评测记录失败：{0}")]
+    Serialize(serde_json::Error),
+    /// 正式报告摘要构造失败。
+    #[error(transparent)]
+    ReportBuild(ReportBuildError),
 }
 
 /// 计算正式 EvaluationReport 存储 JSON 的稳定 SHA-256 摘要。

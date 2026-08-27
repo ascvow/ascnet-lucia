@@ -5,8 +5,9 @@
 //! Cycle 状态机驱动并归档，不能通过低层直通子命令绕过。
 
 use agent_evolution::{
-    DeterministicPromptMutationGenerator, EvolutionCycleStore, FileEvolutionCycleStore,
-    LuciaEvalProcessClient, PromptEvolutionCycle,
+    ContextEvolutionCycle, ContextEvolutionCycleRequestV1, ContextEvolutionCycleSnapshotV1,
+    DeterministicPromptMutationGenerator, EvolutionCycleStore, FileContextCycleArchive,
+    FileEvolutionCycleStore, LuciaEvalProcessClient, PromptEvolutionCycle,
 };
 use agent_evolution_protocol::{
     DatasetVersionId, EvolutionCycleId, EvolutionCycleRequestV1, EvolutionCycleSnapshotV1,
@@ -31,6 +32,8 @@ const EVALUATOR_BIN_ENV: &str = "LUCIA_EVOLVE_EVALUATOR_BIN";
 const EVOLUTION_ROOT_ENV: &str = "LUCIA_EVOLVE_EVOLUTION_ROOT";
 /// Cycle 使用的固定受信 Dataset 版本配置入口。
 const DATASET_VERSION_ENV: &str = "LUCIA_EVOLVE_DATASET_VERSION";
+/// Context Cycle 使用的固定受信 Fixture 版本配置入口。
+const CONTEXT_FIXTURE_VERSION_ENV: &str = "LUCIA_EVOLVE_CONTEXT_FIXTURE_VERSION";
 
 /// 外部自进化控制面命令；请求正文只能来自 stdin。
 #[derive(Debug, Parser)]
@@ -55,6 +58,20 @@ enum Command {
     /// 驱动指定 Cycle 完成受信健康验证；失败时在同一 Cycle 内自动回滚。
     Health {
         /// 已进入 AwaitingHealth 的强类型 Cycle 标识。
+        #[arg(long, value_name = "CYCLE_ID")]
+        cycle_id: EvolutionCycleId,
+    },
+    /// 从 stdin 读取 ContextEvolutionCycleRequestV1 并执行完整 Context Cycle。
+    ContextCycle,
+    /// 读取并验证指定 Context Cycle 的完整只追加快照历史。
+    ContextInspect {
+        /// 需要检查的强类型 Context Cycle 标识。
+        #[arg(long, value_name = "CYCLE_ID")]
+        cycle_id: EvolutionCycleId,
+    },
+    /// 驱动指定 Context Cycle 完成健康验证；失败时自动回滚。
+    ContextHealth {
+        /// 已进入 AwaitingHealth 的强类型 Context Cycle 标识。
         #[arg(long, value_name = "CYCLE_ID")]
         cycle_id: EvolutionCycleId,
     },
@@ -135,7 +152,63 @@ async fn dispatch(command: Command) -> Result<(), FailureCode> {
             let snapshot = execute_health(&cycle_id).await?;
             write_receipt(&snapshot)
         }
+        Command::ContextCycle => {
+            let snapshot = execute_context_cycle().await?;
+            write_receipt(&snapshot)
+        }
+        Command::ContextInspect { cycle_id } => {
+            let history = execute_context_inspect(&cycle_id).await?;
+            write_receipt(&history)
+        }
+        Command::ContextHealth { cycle_id } => {
+            let snapshot = execute_context_health(&cycle_id).await?;
+            write_receipt(&snapshot)
+        }
     }
+}
+
+/// 校验 Context Cycle 请求，并通过固定 Mutator 和独立 Evaluator 执行生产闭环。
+async fn execute_context_cycle() -> Result<ContextEvolutionCycleSnapshotV1, FailureCode> {
+    let request: ContextEvolutionCycleRequestV1 = read_json_request()?;
+    request
+        .validate()
+        .map_err(|_| FailureCode::RequestInvalid)?;
+    context_cycle_runner(evolution_root()?, context_fixture_version()?)?
+        .run(&request)
+        .await
+        .map_err(|error| FailureCode::Cycle(error.code()))
+}
+
+/// 从受信 Context Archive 读取并验证完整历史。
+async fn execute_context_inspect(
+    cycle_id: &EvolutionCycleId,
+) -> Result<Vec<ContextEvolutionCycleSnapshotV1>, FailureCode> {
+    FileContextCycleArchive::new(evolution_root()?.join("context-cycles"))
+        .history(cycle_id)
+        .await
+        .map_err(|_| FailureCode::CycleInspectFailed)
+}
+
+/// 驱动 Context Cycle 完成受信健康验证或自动回滚。
+async fn execute_context_health(
+    cycle_id: &EvolutionCycleId,
+) -> Result<ContextEvolutionCycleSnapshotV1, FailureCode> {
+    context_cycle_runner(evolution_root()?, context_fixture_version()?)?
+        .verify_health(cycle_id)
+        .await
+        .map_err(|error| FailureCode::Cycle(error.code()))
+}
+
+/// 组装 Context Cycle 的固定 Fixture 版本与独立 Evaluator 客户端。
+fn context_cycle_runner(
+    evolution_root: PathBuf,
+    fixture_version: DatasetVersionId,
+) -> Result<ContextEvolutionCycle<LuciaEvalProcessClient>, FailureCode> {
+    Ok(ContextEvolutionCycle::new(
+        evolution_root,
+        evaluator_client()?,
+        fixture_version,
+    ))
 }
 
 /// 校验 Cycle 请求，并通过固定生成器和独立 Evaluator 执行完整 Prompt 自进化周期。
@@ -204,6 +277,14 @@ fn evolution_root() -> Result<PathBuf, FailureCode> {
 /// 从固定环境变量读取并校验强类型 Dataset 版本。
 fn dataset_version() -> Result<DatasetVersionId, FailureCode> {
     env::var(DATASET_VERSION_ENV)
+        .ok()
+        .ok_or(FailureCode::EvolutionConfigInvalid)
+        .and_then(parse_dataset_version)
+}
+
+/// 从固定环境变量读取并校验 Context Fixture 版本。
+fn context_fixture_version() -> Result<DatasetVersionId, FailureCode> {
+    env::var(CONTEXT_FIXTURE_VERSION_ENV)
         .ok()
         .ok_or(FailureCode::EvolutionConfigInvalid)
         .and_then(parse_dataset_version)
@@ -311,6 +392,39 @@ mod tests {
         );
     }
 
+    /// Context Cycle stdin 只能携带版本化请求，不能覆盖 Fixture、Gate 或 Archive 控制面。
+    #[test]
+    fn context_cycle_request_rejects_control_plane_fields() {
+        let base = serde_json::json!({
+            "schema_version": agent_evolution::CONTEXT_EVOLUTION_CYCLE_SCHEMA_VERSION,
+            "cycle_id": EvolutionCycleId::generate(),
+            "parent_revision_id": GenomeRevisionId::generate(),
+            "parent_genome_digest": GenomeDigest::from_sha256_hex("a".repeat(64))
+                .expect("摘要应合法"),
+            "lineage": "stable/general",
+            "expected_parent_generation": 1,
+            "evidence_episode_ids": [EpisodeId::generate()],
+            "expected_fixture_version": DatasetVersionId::generate(),
+            "requested_at_ms": 1,
+        });
+        for field in [
+            "fixture_root",
+            "fixture_digest",
+            "gate_policy",
+            "archive_root",
+            "release_root",
+        ] {
+            let mut value = base.clone();
+            value[field] = serde_json::json!("forged");
+            assert_eq!(
+                read_json_request_from::<ContextEvolutionCycleRequestV1, _>(
+                    value.to_string().as_bytes(),
+                ),
+                Err(FailureCode::RequestInvalid)
+            );
+        }
+    }
+
     /// 普通 Evolver 不得暴露绕过 Cycle 状态机的低层 Evaluator 子命令。
     #[test]
     fn cli_rejects_low_level_evaluator_commands() {
@@ -319,16 +433,19 @@ mod tests {
         }
     }
 
-    /// Inspect 与 Health 只接受强类型 Cycle ID，不接受路径或自由文本。
+    /// Prompt 与 Context 的 Inspect、Health 只接受强类型 Cycle ID，不接受路径或自由文本。
     #[test]
     fn cycle_commands_require_typed_id() {
         let cycle_id = EvolutionCycleId::generate();
-        for command in ["inspect", "health"] {
+        for command in ["inspect", "health", "context-inspect", "context-health"] {
             let parsed =
                 Args::try_parse_from(["lucia-evolve", command, "--cycle-id", cycle_id.as_str()])
                     .expect("合法 Cycle ID 应通过");
             let observed = match parsed.command {
-                Command::Inspect { cycle_id } | Command::Health { cycle_id } => cycle_id,
+                Command::Inspect { cycle_id }
+                | Command::Health { cycle_id }
+                | Command::ContextInspect { cycle_id }
+                | Command::ContextHealth { cycle_id } => cycle_id,
                 _ => panic!("应解析为 Cycle 查询命令"),
             };
             assert_eq!(observed, cycle_id);

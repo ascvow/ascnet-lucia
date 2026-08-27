@@ -40,6 +40,8 @@ pub const MAX_SUMMARY_TOKEN_BUDGET: u32 = 32_768;
 pub const MIN_SUMMARY_VALIDATION_COVERAGE_BPS: u16 = 9_500;
 /// 提案假设文本允许的最大 UTF-8 字节数。
 pub const MAX_CONTEXT_HYPOTHESIS_BYTES: usize = 4 * 1_024;
+/// M6 固定 Context Gate 的跨进程协议版本。
+pub const M6_CONTEXT_GATE_VERSION: &str = "context-policy-m6-v1";
 
 /// 旧 ToolResult 的保留策略。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
