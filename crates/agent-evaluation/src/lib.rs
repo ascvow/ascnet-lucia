@@ -18,6 +18,7 @@ mod plugin_gate;
 mod plugin_host_audit;
 mod plugin_host_smoke;
 mod plugin_release;
+mod plugin_runtime_evaluation;
 mod plugin_signature;
 pub mod protocol;
 pub mod release;
@@ -92,6 +93,20 @@ pub use plugin_release::{
     PLUGIN_EVALUATION_ARCHIVE_SCHEMA_VERSION, PLUGIN_EVALUATION_REPORT_MEDIA_TYPE,
     PLUGIN_GATE_INPUT_MEDIA_TYPE, PLUGIN_RELEASE_ARCHIVE_SCHEMA_VERSION,
     PLUGIN_RELEASE_ENVELOPE_MEDIA_TYPE,
+};
+pub use plugin_runtime_evaluation::{
+    PinnedPluginEvaluationDataset, PluginEvaluationHostFactory, PluginEvaluationHostRequest,
+    PluginEvaluationSubject, PluginRuntimeActionKindV1, PluginRuntimeActionV1,
+    PluginRuntimeCaseReceiptV1, PluginRuntimeCaseRefV1, PluginRuntimeCaseV1,
+    PluginRuntimeDatasetManifestV1, PluginRuntimeEvaluationError, PluginRuntimeEvaluationOutput,
+    PluginRuntimeEvaluationReportV1, PluginRuntimeEvaluator, PluginRuntimeFixtureRefV1,
+    PluginRuntimeVerifierV1, WasmPluginEvaluationHostFactory, MAX_PLUGIN_EVALUATION_WASM_FUEL,
+    MAX_PLUGIN_EVALUATION_WASM_MEMORY_BYTES, MAX_PLUGIN_EVALUATION_WASM_YIELD_INTERVAL,
+    MAX_PLUGIN_RUNTIME_CASES, MAX_PLUGIN_RUNTIME_CASE_BYTES, MAX_PLUGIN_RUNTIME_CASE_TIMEOUT_MS,
+    MAX_PLUGIN_RUNTIME_DATASET_BYTES, MAX_PLUGIN_RUNTIME_FIXTURES,
+    MAX_PLUGIN_RUNTIME_MANIFEST_BYTES, PLUGIN_RUNTIME_CASE_SCHEMA_VERSION,
+    PLUGIN_RUNTIME_DATASET_SCHEMA_VERSION, PLUGIN_RUNTIME_MANIFEST_FILE_NAME,
+    PLUGIN_RUNTIME_REPORT_MEDIA_TYPE, PLUGIN_RUNTIME_REPORT_SCHEMA_VERSION,
 };
 pub use plugin_signature::{
     PluginSignatureError, TrustedPluginKeyring, TrustedPluginSigner, TrustedPluginVerifyingKey,
