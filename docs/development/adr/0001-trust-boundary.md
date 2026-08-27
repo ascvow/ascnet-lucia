@@ -142,9 +142,10 @@ Mutation 无法通过篡改布尔位打开真实能力。当前 Host 尚未提�
 每个 WASM 插件使用独立且有限的 Store fuel，真实无限循环 component 的调用会以
 `Trap::OutOfFuel` 终止，不会无限占用 Host 执行线程。
 
-仍未关闭：`wall_clock_ms` 尚无覆盖完整运行生命周期的强制点。M8-05 Secret Broker
-仍是未来向 Serve 平面提供受控 Secret 的必要组件；新增网络或凭据入口时必须复用上述
-最终门禁，不能只读取公开布尔字段。
+Evaluation Runner 已按每个 TaskCase 的 `wall_clock_ms` 包裹完整候选运行，并在超时后
+以受信运行结果失败关闭。Serve 平面仍未提供跨完整用户 Run 的统一墙钟上限；Host 也
+尚未提供 Secret API。以后由平台开发者新增网络或凭据入口时，必须复用上述最终门禁，
+不能只读取公开布尔字段，更不能把能力扩张交给 Evolution Plane。
 
 ## Mutator、Evaluator 与 Commit Gate 的权限
 
@@ -268,7 +269,9 @@ agent-evolution-protocol` 重新生成。
 | Dirty 构建 | 允许运行，不得自动 Promote | 禁止 |
 | 样本不足 | 返回 `Inconclusive` | 返回 `RequireApproval` |
 
-生产环境的 Canary 属于 M8 范围，在 Gate C 全部满足前不得启用。
+生产环境 Canary 尚未开放；如后续由平台开发者实现，仍必须在 Gate C 全部满足后走独立
+人工授权流程。插件不进入该流程：插件更新只属于人工 Plugin Management，不存在自动
+Plugin Candidate 或插件 Evolution Canary。
 
 ## 运行中的 Genome 不可热变更
 

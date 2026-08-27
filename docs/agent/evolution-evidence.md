@@ -72,10 +72,11 @@ Skill、Prompt 和第一方稳定 Schema 的 Policy Artifact 可以独立变化�
 逐项核对。源码归档构建使用显式 `unknown` 提交标记且按 dirty 构建处理；由于它无法唯一证明
 内核版本，普通 Serve 可以运行，但 Evidence 会拒绝启动。
 
-当前 TUI 没有跨插件的 Context 与 Planning 独立快照服务，因此包含这些非空字段的 Genome
-会明确拒绝运行，不会只记录字段却继续采用另一份真实配置。Skill 由 `agent-skill` 直接从 Genome
-固定的 Artifact CAS 装配，不扫描运行时可变目录；以后开放其他独立变异表面时，需要由对应
-行为所有者提供版本化快照服务。任一真实主会话在
+Context Policy 已外部化为第一方 `ContextPolicyV1`，TUI 会从 Genome 固定的 Artifact CAS
+校验并装配 `native-context` 策略；它不读取或改写通用 Plugin Config。Planning Policy 尚无
+对应第一方快照服务，因此非空引用会明确拒绝运行，不会只记录字段却继续采用另一份真实配置。
+Skill 由 `agent-skill` 直接从 Genome 固定的 Artifact CAS 装配，不扫描运行时可变目录；以后
+开放其他独立变异表面时，需要由对应行为所有者提供版本化快照服务。任一真实主会话在
 用户输入成功写入 Session Store 后预登记 Recorder，再把同一个 Run ID 传入 Core。正常
 `RunFinished`、取消、步骤预算耗尽和基础设施错误都会显式收敛并释放路由。证据写入失败会
 报告为运行完成错误，不会被静默忽略。
