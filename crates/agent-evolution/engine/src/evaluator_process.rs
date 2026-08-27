@@ -28,6 +28,23 @@ use tokio::{io::AsyncWriteExt, process::Command};
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 /// Evaluator 稳定错误码允许的最大字节数。
 const MAX_ERROR_CODE_BYTES: usize = 128;
+/// 独立 Evaluator 可以从 Evolver 继承的配置变量。
+///
+/// 列表只包含受信评测控制面的路径、摘要和版本绑定；模型密钥、代理、用户目录与生产
+/// 凭据都不会进入子进程环境。Candidate 仍只能通过严格 IPC 和 Fixture 接触评测资源。
+const EVALUATOR_ENV_ALLOWLIST: [&str; 11] = [
+    "LUCIA_EVAL_ARCHIVE_ROOT",
+    "LUCIA_EVAL_CONTEXT_FIXTURE_DIGEST",
+    "LUCIA_EVAL_CONTEXT_FIXTURE_ROOT",
+    "LUCIA_EVAL_DATASET_MANIFEST_DIGEST",
+    "LUCIA_EVAL_DATASET_ROOT",
+    "LUCIA_EVAL_EVOLUTION_ROOT",
+    "LUCIA_EVAL_HEALTH_STORE_ROOT",
+    "LUCIA_EVAL_KERNEL_REF",
+    "LUCIA_EVAL_SKILL_REGISTRY_DIGEST",
+    "LUCIA_EVAL_SKILL_REGISTRY_ROOT",
+    "LUCIA_EVAL_WORKSPACE_ROOT",
+];
 
 /// 独立 Evaluator 的进程边界抽象，便于 Cycle 使用真实进程或离线测试替身。
 #[async_trait]
@@ -153,7 +170,9 @@ impl LuciaEvalProcessClient {
     {
         validate_executable(&self.executable).await?;
         let bytes = serde_json::to_vec(request).map_err(EvaluatorProcessError::SerializeRequest)?;
-        let mut child = Command::new(&self.executable)
+        let mut command = Command::new(&self.executable);
+        configure_evaluator_environment(&mut command);
+        let mut child = command
             .arg(action)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -195,6 +214,19 @@ impl LuciaEvalProcessClient {
             return Err(EvaluatorProcessError::UnexpectedStderr);
         }
         serde_json::from_slice(&output.stdout).map_err(EvaluatorProcessError::InvalidReceipt)
+    }
+}
+
+/// 清空 Evolver 进程环境，并只复制独立 Evaluator 明确需要的受信配置。
+///
+/// 该函数会移除调用方先前设置的全部环境覆盖。调用方不得在此后追加模型密钥、代理、
+/// Secret 或生产工作区变量，否则会破坏 Evolver 与 Evaluator 之间的权限边界。
+fn configure_evaluator_environment(command: &mut Command) {
+    command.env_clear();
+    for name in EVALUATOR_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
     }
 }
 
@@ -612,5 +644,18 @@ mod tests {
             .await
             .expect_err("相对路径应拒绝");
         assert!(matches!(error, EvaluatorProcessError::UnsafeExecutable(_)));
+    }
+
+    /// 子进程环境必须在复制白名单前清空，不能继承调用方显式注入的生产凭据。
+    #[tokio::test]
+    async fn evaluator_environment_drops_non_allowlisted_secrets() {
+        let mut command = Command::new("/usr/bin/env");
+        command.env("OPENAI_API_KEY", "should-not-cross-boundary");
+        configure_evaluator_environment(&mut command);
+        let output = command.output().await.expect("应运行环境探针");
+        assert!(output.status.success());
+        let environment = String::from_utf8(output.stdout).expect("环境输出应为 UTF-8");
+        assert!(!environment.contains("OPENAI_API_KEY"));
+        assert!(!environment.contains("should-not-cross-boundary"));
     }
 }
