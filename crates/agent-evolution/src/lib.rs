@@ -12,7 +12,9 @@ mod attribution;
 mod candidate_builder;
 mod certificate;
 mod episode_evidence;
+mod episode_selection;
 mod episode_store;
+mod evolution_policy;
 mod evaluation_store;
 mod feedback;
 mod genome_diff;
@@ -23,6 +25,7 @@ mod metrics;
 mod outbox;
 mod outcome_revision;
 mod pipeline;
+mod prompt_mutation;
 mod recorder;
 mod recorder_hub;
 mod replay;
@@ -41,7 +44,14 @@ pub use certificate::{
     EVOLUTION_CERTIFICATE_SCHEMA_VERSION,
 };
 pub use episode_evidence::{load_episode_evidence, EpisodeEvidence, EpisodeEvidenceError};
+pub use episode_selection::{
+    EpisodeSelectionError, EpisodeSelector, MutationEpisodeEvidence, MutationEvidence,
+    MutationFailureEvidence,
+};
 pub use episode_store::{EpisodeQuery, EpisodeStore, EpisodeStoreError, FileEpisodeStore};
+pub use evolution_policy::{
+    EvolutionPolicy, EVOLUTION_POLICY_VERSION, TASK_STRATEGY_MVP_CANDIDATE_COUNT,
+};
 pub use evaluation_store::{
     load_evaluation_report, EvaluationStoreError, FileEvaluationReportStore,
 };
@@ -71,6 +81,10 @@ pub use metrics::{
 pub use outbox::{EvolutionOutbox, EvolutionOutboxItem, FileEvolutionOutbox, OutboxError};
 pub use outcome_revision::{FileOutcomeRevisionStore, OutcomeRevisionError, OutcomeRevisionStore};
 pub use pipeline::{EvolutionPipeline, PipelineError};
+pub use prompt_mutation::{
+    BoundedPromptMutator, MutationProposalContext, PromptMutationDraft, PromptMutationError,
+    PromptMutationGenerationError, PromptMutationGenerator, PromptMutationRequest,
+};
 pub use recorder::{EpisodeRecorder, EpisodeRecorderConfig, EpisodeRecorderError};
 pub use recorder_hub::{EpisodeRecorderHub, EpisodeRecorderHubError, RegisteredEpisodeRun};
 pub use replay::{ProtocolReplay, ProtocolReplayError, ReplayEventSink, ReplayReport};
