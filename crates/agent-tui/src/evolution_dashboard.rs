@@ -112,7 +112,11 @@ impl EvolutionDashboardState {
     /// 处理不修改任何 Evolution Artifact 的键盘导航。
     fn handle_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc if self.page != DashboardPage::Overview => {
+                self.page = DashboardPage::Overview;
+                self.evidence_index = 0;
+            }
             KeyCode::Tab | KeyCode::Right => self.page = self.page.next(),
             KeyCode::BackTab | KeyCode::Left => self.page = self.page.previous(),
             KeyCode::Char('1') => self.page = DashboardPage::Overview,
@@ -185,7 +189,7 @@ fn render(frame: &mut Frame, state: &mut EvolutionDashboardState) {
         }
     }
     frame.render_widget(
-        Paragraph::new("Tab/←/→ 切换页面  1-4 跳转  ↑/↓ 证据下钻  q/Esc 退出")
+        Paragraph::new("Tab/←/→ 切换页面  1-4 跳转  ↑/↓ 证据下钻  Esc 返回概览  q 退出")
             .style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
@@ -629,7 +633,8 @@ fn evidence_items(
             "Genome Diff / Comparison",
             if !scorecard.comparison_validity.valid {
                 format!(
-                    "Comparable: NO\n{}",
+                    "Comparable: NO\nFrozen Plugin Environment: {}\n{}",
+                    scorecard.plugin_environment_digest,
                     scorecard
                         .comparison_validity
                         .violations
@@ -640,7 +645,8 @@ fn evidence_items(
                 )
             } else if let Some(certificate) = certificate {
                 format!(
-                    "Comparable: YES\nChanged surfaces: {}\nDiff artifact: {}",
+                    "Comparable: YES\nFrozen Plugin Environment: {} (UNCHANGED)\nChanged surfaces: {}\nDiff artifact: {}",
+                    scorecard.plugin_environment_digest,
                     if certificate.allowed_diff.changed_surfaces.is_empty() {
                         "none".into()
                     } else {
@@ -945,5 +951,29 @@ mod tests {
         assert_eq!(state.page, DashboardPage::Evidence);
         state.handle_key(KeyCode::Char('1'));
         assert_eq!(state.page, DashboardPage::Overview);
+    }
+
+    /// Esc 只返回概览页，根页面保持运行；显式 q 才退出 Dashboard。
+    #[test]
+    fn escape_returns_to_overview_without_quitting_dashboard() {
+        let mut state = EvolutionDashboardState {
+            scorecard: None,
+            certificate: None,
+            history: None,
+            error: None,
+            page: DashboardPage::Evidence,
+            evidence_index: 3,
+            should_quit: false,
+        };
+
+        state.handle_key(KeyCode::Esc);
+        assert_eq!(state.page, DashboardPage::Overview);
+        assert_eq!(state.evidence_index, 0);
+        assert!(!state.should_quit);
+
+        state.handle_key(KeyCode::Esc);
+        assert!(!state.should_quit);
+        state.handle_key(KeyCode::Char('q'));
+        assert!(state.should_quit);
     }
 }

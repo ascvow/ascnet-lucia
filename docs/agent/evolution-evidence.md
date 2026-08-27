@@ -257,7 +257,7 @@ Genome 子命令全部只读。`diff --allow` 由可信实现逐字段计算差�
 变更列表；任一变化落在允许表面之外时命令失败。
 
 四页 Ratatui Dashboard 通过 `Tab`、左右方向键或数字 `1` 至 `4` 切换 Overview、
-Capability Map、Lineage 与 Evidence，Evidence 页使用上下方向键下钻，`q` 或 `Esc` 退出。
+Capability Map、Lineage 与 Evidence，Evidence 页使用上下方向键下钻；`Esc` 返回 Overview，`q` 退出。
 小终端会降级为仍包含 Verdict 与 Safety 的紧凑视图；无数据与损坏数据分别显示明确空状态和
 错误状态。Evidence 只展示可信 ID、结构化计数和 CAS 引用，不读取或显示 Hidden TaskCase
 正文、Secret、未脱敏 ToolResult，也不接受 Candidate 提供的最终评分。

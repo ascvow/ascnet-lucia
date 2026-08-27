@@ -2217,6 +2217,81 @@ fn broken_ref_label_prunes_attachment() {
     assert!(app.attachments.is_empty());
 }
 
+/// Esc 在主界面不得直接退出，且非空输入必须连续双按才会清空。
+#[test]
+fn escape_double_press_clears_input_without_quitting() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "保留中的草稿".into();
+    app.cursor = app.input.len();
+
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, None);
+    assert_eq!(app.input, "保留中的草稿");
+    assert!(!app.should_quit);
+
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, None);
+    assert!(app.input.is_empty());
+    assert_eq!(app.cursor, 0);
+    assert!(!app.should_quit);
+
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, None);
+    assert!(!app.should_quit);
+}
+
+/// 两次 Esc 之间出现其他按键时必须重新计数，避免误清空新编辑的内容。
+#[test]
+fn escape_double_press_is_reset_by_input_edit() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "草稿".into();
+    app.cursor = app.input.len();
+
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, None);
+    app.handle_key(KeyCode::Char('新'), KeyModifiers::NONE, None);
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, None);
+
+    assert_eq!(app.input, "草稿新");
+    assert!(!app.should_quit);
+}
+
+/// 超过连续双按时间窗的第二次 Esc 只能重新计数，不能清空草稿。
+#[test]
+fn escape_double_press_expires_before_clearing_input() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "超时后保留".into();
+    app.cursor = app.input.len();
+    app.last_escape_at = Some(
+        std::time::Instant::now()
+            .checked_sub(ESC_DOUBLE_PRESS_WINDOW + std::time::Duration::from_millis(1))
+            .expect("测试时间点应可回退"),
+    );
+
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, None);
+
+    assert_eq!(app.input, "超时后保留");
+    assert!(app.last_escape_at.is_some());
+    assert!(!app.should_quit);
+}
+
+/// Agent 运行中单按 Esc 必须优先请求取消，并保留尚未发送的输入。
+#[test]
+fn escape_interrupts_running_agent_without_clearing_input() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    app.running = true;
+    app.input = "尚未发送的引导".into();
+    app.cursor = app.input.len();
+
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, Some(&agent));
+
+    assert!(agent.state().cancel_requested);
+    assert_eq!(app.input, "尚未发送的引导");
+    assert!(!app.should_quit);
+}
+
 /// 粘贴的引号包裹或转义路径解析为文件；普通文本返回 None。
 #[test]
 fn pasted_file_path_parses_dropped_paths() {

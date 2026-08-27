@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// 主输入区识别连续两次 Esc 的最长间隔，避免单次误触清空草稿。
+pub(crate) const ESC_DOUBLE_PRESS_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
 /// 将输入文本切分为普通文本与附件引用标签片段，标签使用高亮样式。
 pub(crate) fn input_ref_spans<'a>(
     input: &'a str,
@@ -60,6 +64,8 @@ pub(crate) struct App {
     pub(crate) pending_reload: Option<String>,
     /// 当前运行的起始时间，用于渲染运行耗时。
     pub(crate) run_started_at: Option<std::time::Instant>,
+    /// 主输入区最近一次未被其他按键打断的 Esc 时间，用于识别连续双按。
+    pub(crate) last_escape_at: Option<std::time::Instant>,
     pub(crate) should_quit: bool,
     /// 下一轮使用的完整会话记录；最终保存失败时可暂存 dirty 完成态。
     pub(crate) session_record: SessionRecord,
@@ -180,6 +186,7 @@ impl App {
             native_command: NativeCommandState::default(),
             pending_reload: None,
             run_started_at: None,
+            last_escape_at: None,
             should_quit: false,
             session_record,
             session_store: Arc::new(MemorySessionStore::new()),
@@ -279,6 +286,7 @@ impl App {
         self.streaming_message = None;
         self.scroll = None;
         self.context_tokens = None;
+        self.last_escape_at = None;
         self.native_command.dialog = None;
         self.native_command.dismissed_input = None;
         if let Some(notice) = notice {
@@ -799,6 +807,7 @@ impl App {
             .find(|offset| self.input.is_char_boundary(*offset))
             .unwrap_or(0);
         self.input_history_cursor = None;
+        self.last_escape_at = None;
         self.prune_attachments();
     }
 
@@ -847,6 +856,9 @@ impl App {
         modifiers: KeyModifiers,
         agent: Option<&Arc<Agent>>,
     ) {
+        if !matches!(code, KeyCode::Esc) {
+            self.last_escape_at = None;
+        }
         if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
             self.should_quit = true;
             return;
@@ -936,21 +948,28 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                // Esc 三级行为：运行中请求取消，输入非空先清空，空闲才退出，
-                // 避免打字中途误触直接丢内容退程序。
+                // 运行中优先中断；空闲输入必须连续双按才清空，Esc 永不直接退出。
                 if self.running {
+                    self.last_escape_at = None;
                     if let Some(agent) = agent {
                         agent.cancel();
                         self.messages
                             .push(Msg::new(MsgKind::Info, "Cancelling the current run..."));
                     }
-                } else if !self.input.is_empty() {
-                    self.input.clear();
-                    self.cursor = 0;
-                    self.input_history_cursor = None;
-                    self.prune_attachments();
+                } else if self.input.is_empty() && self.attachments.is_empty() {
+                    self.last_escape_at = None;
                 } else {
-                    self.should_quit = true;
+                    let now = std::time::Instant::now();
+                    let double_pressed = self.last_escape_at.take().is_some_and(|previous| {
+                        now.saturating_duration_since(previous) <= ESC_DOUBLE_PRESS_WINDOW
+                    });
+                    if double_pressed {
+                        self.input.clear();
+                        self.cursor = 0;
+                        self.finish_input_edit();
+                    } else {
+                        self.last_escape_at = Some(now);
+                    }
                 }
             }
             KeyCode::PageUp => self.scroll_up(self.last_viewport.saturating_sub(1).max(1)),
@@ -1028,12 +1047,16 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> PluginKeyRoute {
+        if !matches!(code, KeyCode::Esc) {
+            self.last_escape_at = None;
+        }
         if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
             return PluginKeyRoute::Main;
         }
 
         if self.view_stack.active().is_some() {
             if matches!(code, KeyCode::Esc) {
+                self.last_escape_at = None;
                 self.view_stack.pop_for_user();
                 return PluginKeyRoute::Consumed;
             }
@@ -1050,6 +1073,9 @@ impl App {
         }
 
         if let Some(index) = self.active_dialog_index() {
+            if matches!(code, KeyCode::Esc) {
+                self.last_escape_at = None;
+            }
             return PluginKeyRoute::Input(self.plugin_key_input(index, code, modifiers));
         }
 
@@ -1064,6 +1090,9 @@ impl App {
                     _ => false,
                 };
                 if forward {
+                    if matches!(code, KeyCode::Esc) {
+                        self.last_escape_at = None;
+                    }
                     return PluginKeyRoute::Input(self.plugin_key_input(index, code, modifiers));
                 }
             }
@@ -1078,6 +1107,7 @@ impl App {
 
         if let Some(index) = self.plugin_focus {
             if matches!(code, KeyCode::Esc) {
+                self.last_escape_at = None;
                 self.plugin_focus = None;
                 return PluginKeyRoute::Consumed;
             }
@@ -1380,6 +1410,7 @@ impl App {
     /// 完成一次输入内容修改后的统一清理。
     fn finish_input_edit(&mut self) {
         self.input_history_cursor = None;
+        self.last_escape_at = None;
         self.prune_attachments();
     }
 
@@ -1595,6 +1626,7 @@ impl App {
         self.input.clear();
         self.attachments.clear();
         self.cursor = 0;
+        self.last_escape_at = None;
         if input.is_empty() {
             return None;
         }
@@ -1608,6 +1640,7 @@ impl App {
         let attachments = std::mem::take(&mut self.attachments);
         self.input.clear();
         self.cursor = 0;
+        self.last_escape_at = None;
         if text.is_empty() && attachments.is_empty() {
             return None;
         }

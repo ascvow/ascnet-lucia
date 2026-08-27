@@ -527,7 +527,7 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
     let shortcuts = [
         ("Enter", "Send message"),
         ("Ctrl+J", "Insert newline"),
-        ("Esc", "Stop / clear / exit"),
+        ("Esc", "Stop / back / double-clear"),
         ("PgUp/PgDn", "Scroll history"),
         ("Ctrl+P", "Recall input"),
         ("Ctrl+Y", "Copy last reply"),
