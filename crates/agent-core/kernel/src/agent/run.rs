@@ -221,20 +221,50 @@ impl Agent {
             )
             .await?;
 
-            let mut model_stream = if self.options.stream {
-                let stream = self.gateway.stream(&self.options.provider, req).await?;
-                self.update_state(|state| state.phase = AgentPhase::StreamingModel);
-                stream
-            } else {
-                let response = self.gateway.complete(&self.options.provider, req).await?;
-                let (sender, stream) = crate::model::ModelEventStream::channel();
-                sender.done(response);
-                stream
+            let mut model_stream = {
+                // 把通知 future 限定在建连阶段，成功后立即注销等待者，不能窃取后续取消通知。
+                loop {
+                    let cancel_notified = self.cancel_notify.notified();
+                    tokio::pin!(cancel_notified);
+                    if self.options.stream {
+                        tokio::select! {
+                            result = self.gateway.stream(&self.options.provider, req.clone()) => {
+                                let stream = result?;
+                                self.update_state(|state| state.phase = AgentPhase::StreamingModel);
+                                break stream;
+                            }
+                            _ = &mut cancel_notified => {
+                                if self.take_cancelled() {
+                                    return self.finish_cancelled(
+                                        &run_id, step, step + 1, total_usage, session,
+                                    ).await;
+                                }
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            result = self.gateway.complete(&self.options.provider, req.clone()) => {
+                                let (sender, stream) = crate::model::ModelEventStream::channel();
+                                sender.done(result?);
+                                break stream;
+                            }
+                            _ = &mut cancel_notified => {
+                                if self.take_cancelled() {
+                                    return self.finish_cancelled(
+                                        &run_id, step, step + 1, total_usage, session,
+                                    ).await;
+                                }
+                            }
+                        }
+                    }
+                }
             };
             // 累积文本增量：取消发生在流中途时，把已生成的部分文本保留进会话。
             let mut streamed_text = String::new();
-            while let Some(event) = model_stream.next().await {
-                // 检查点：流事件之间响应取消；丢弃流即中止本次模型请求。
+            loop {
+                // 先建立通知监听再读取原子标记，避免取消落在检查与等待之间。
+                let cancel_notified = self.cancel_notify.notified();
+                tokio::pin!(cancel_notified);
                 if self.take_cancelled() {
                     drop(model_stream);
                     if !streamed_text.is_empty() {
@@ -246,6 +276,13 @@ impl Agent {
                         .finish_cancelled(&run_id, step, step + 1, total_usage, session)
                         .await;
                 }
+                let event = tokio::select! {
+                    event = model_stream.next() => event,
+                    _ = &mut cancel_notified => continue,
+                };
+                let Some(event) = event else {
+                    break;
+                };
                 match event {
                     ModelStreamEvent::TextDelta { index, delta } => {
                         streamed_text.push_str(&delta);
@@ -658,7 +695,21 @@ impl Agent {
                     .await?,
                 "native",
             )
-        } else if let Some(result) = self.extension.call_tool(call.clone()).await? {
+        } else if let Some(result) = loop {
+            tokio::select! {
+                result = self.extension.call_tool(call.clone()) => break result?,
+                _ = self.cancel_notify.notified() => {
+                    if self.control().cancel_requested() {
+                        break Some(ToolResult::error_with_kind(
+                            call.id.clone(),
+                            call.name.clone(),
+                            agent_tool::ToolErrorKind::Cancelled,
+                            "插件工具执行已被用户中断",
+                        ));
+                    }
+                }
+            }
+        } {
             // Guest 返回值不能改写原调用身份；Core 在生成可信事件前重新绑定。
             let mut result = result;
             result.call_id = call.id.clone();
@@ -710,6 +761,8 @@ impl Agent {
         step: usize,
         call: ToolCall,
     ) -> Result<ToolResult> {
+        let call_id = call.id.clone();
+        let call_name = call.name.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let output: Arc<dyn ToolOutputSink> = Arc::new(ToolOutputChannel(tx));
         let mut execution = Box::pin(self.tools.call_with_output(call, output));
@@ -723,6 +776,14 @@ impl Agent {
                 }
                 Some(output) = rx.recv() => {
                     self.record_tool_output(run_id, step, output).await?;
+                }
+                _ = self.cancel_notify.notified() => {
+                    return Ok(ToolResult::error_with_kind(
+                        call_id,
+                        call_name,
+                        agent_tool::ToolErrorKind::Cancelled,
+                        "工具执行已被用户中断",
+                    ));
                 }
             }
         }

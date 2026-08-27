@@ -93,7 +93,7 @@ pub(crate) struct App {
     pub(crate) context_tokens: Option<u64>,
     /// 配置的模型上下文窗口，用于状态栏计算占比。
     pub(crate) context_window: Option<u64>,
-    /// 鼠标捕获是否开启；默认开启以支持点击聚焦，用户可用 Ctrl+T 临时关闭。
+    /// 鼠标捕获是否开启；默认关闭以允许终端原生选择复制，用户可用 Ctrl+T 临时开启。
     pub(crate) mouse_capture: bool,
     /// 插件声明的视图及宿主缓存的最近一帧。
     #[cfg(feature = "plugins")]
@@ -203,7 +203,7 @@ impl App {
             last_message_width: 0,
             context_tokens: None,
             context_window: None,
-            mouse_capture: true,
+            mouse_capture: false,
             #[cfg(feature = "plugins")]
             plugin_views: Vec::new(),
             #[cfg(feature = "plugins")]
@@ -871,8 +871,7 @@ impl App {
             self.toggle_mouse_capture();
             return;
         }
-        // 历史输入回溯入口用 Ctrl+P/Ctrl+N：↑/↓ 必须保留给消息滚动，
-        // 备用屏下鼠标滚轮会被终端映射为方向键，劫持它们等于禁用滚动。
+        // Ctrl+P/Ctrl+N 作为方向键历史回溯的兼容入口。
         if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('p')) {
             // 仅空输入或已处于回溯态时生效，避免覆盖未发送的内容。
             if self.input.is_empty() || self.input_history_cursor.is_some() {
@@ -980,7 +979,10 @@ impl App {
                 } else if !(self.input.contains('\n')
                     && move_cursor_vertically(&self.input, &mut self.cursor, true))
                 {
-                    self.scroll_up(1);
+                    // 空输入框直接回填最近一次提交；非空单行草稿不得被历史覆盖。
+                    if self.input.is_empty() {
+                        self.recall_older_input();
+                    }
                 }
             }
             KeyCode::Down => {
@@ -989,7 +991,7 @@ impl App {
                 } else if !(self.input.contains('\n')
                     && move_cursor_vertically(&self.input, &mut self.cursor, false))
                 {
-                    self.scroll_down(1);
+                    // 未处于历史回溯态时向下键不修改当前草稿。
                 }
             }
             KeyCode::Char(c) => {
@@ -1610,9 +1612,9 @@ impl App {
         }
         self.mouse_capture = !self.mouse_capture;
         let notice = if self.mouse_capture {
-            "Mouse capture and wheel scrolling restored"
+            "Mouse capture enabled; press Ctrl+T to restore text selection"
         } else {
-            "Mouse capture paused: select text normally; press Ctrl+T to restore"
+            "Text selection restored; press Ctrl+T to enable mouse interaction"
         };
         self.messages.push(Msg::new(MsgKind::Info, notice));
     }

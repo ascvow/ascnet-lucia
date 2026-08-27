@@ -2321,7 +2321,7 @@ fn paste_preserves_multiline_text() {
     assert_eq!(app.cursor, app.input.len());
 }
 
-/// 输入历史由 Ctrl+P 进入回溯，回溯态中方向键可继续导航，编辑后退出回溯态。
+/// 空输入框用上方向键回填历史，方向键可继续导航，编辑后退出回溯态。
 #[test]
 fn input_history_recalls_recent_submissions() {
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -2332,7 +2332,7 @@ fn input_history_recalls_recent_submissions() {
         assert!(app.take_input().is_some());
     }
 
-    app.handle_key(KeyCode::Char('p'), KeyModifiers::CONTROL, None);
+    app.handle_key(KeyCode::Up, KeyModifiers::NONE, None);
     assert_eq!(app.input, "第二条");
     app.handle_key(KeyCode::Up, KeyModifiers::NONE, None);
     assert_eq!(app.input, "第一条");
@@ -2347,24 +2347,30 @@ fn input_history_recalls_recent_submissions() {
     assert_eq!(app.input_history_cursor, None);
 }
 
-/// 空输入时方向键滚动消息区而不是进入历史回溯；滚轮在备用屏下映射为方向键。
+/// 空输入时上方向键回填最近提交，下方向键越过最新记录后恢复空输入。
 #[test]
-fn arrow_keys_keep_scrolling_message_history() {
+fn arrow_keys_recall_input_history() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.input = "已提交".into();
     app.cursor = app.input.len();
     assert!(app.take_input().is_some());
-    app.last_max_scroll = 10;
-
     app.handle_key(KeyCode::Up, KeyModifiers::NONE, None);
-    assert_eq!(app.scroll, Some(9));
+    assert_eq!(app.input, "已提交");
+    assert_eq!(app.input_history_cursor, Some(0));
+
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE, None);
     assert!(app.input.is_empty());
     assert_eq!(app.input_history_cursor, None);
+}
 
-    app.handle_key(KeyCode::Down, KeyModifiers::NONE, None);
-    app.handle_key(KeyCode::Down, KeyModifiers::NONE, None);
-    assert_eq!(app.scroll, None);
+/// TUI 默认不捕获鼠标，使消息、工具输出和错误文本可由终端直接选择复制。
+#[test]
+fn app_defaults_to_terminal_text_selection() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let app = App::new(tx, "测试模型".into());
+
+    assert!(!app.mouse_capture);
 }
 
 /// 换行手势（Shift+Enter / Alt+Enter / Ctrl+J）插入换行，Home/End 使用行内语义。

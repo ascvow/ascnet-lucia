@@ -125,6 +125,8 @@ pub struct ModelEventStream {
     rx: mpsc::UnboundedReceiver<ModelStreamEvent>,
     /// 缓存的终止事件产物；`next` 消费到 Done/Error 时填充。
     final_result: Option<Result<ModelResponse>>,
+    /// 可选的模型请求后台任务；消费者提前丢弃流时立即终止网络请求。
+    request_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ModelEventStream {
@@ -136,8 +138,18 @@ impl ModelEventStream {
             ModelEventStream {
                 rx,
                 final_result: None,
+                request_task: None,
             },
         )
+    }
+
+    /// 绑定实际执行模型请求的后台任务。
+    ///
+    /// 流被取消或提前丢弃时会中止该任务，避免 HTTP 请求继续占用连接与 token；正常消费到
+    /// 终态后，已完成任务的中止操作没有副作用。
+    pub(crate) fn with_request_task(mut self, task: tokio::task::JoinHandle<()>) -> Self {
+        self.request_task = Some(task);
+        self
     }
 
     /// 取下一个事件；流结束后返回 None。
@@ -171,7 +183,16 @@ impl ModelEventStream {
             }
         }
         self.final_result
+            .take()
             .unwrap_or_else(|| Err(anyhow!("model stream ended without a terminal event")))
+    }
+}
+
+impl Drop for ModelEventStream {
+    fn drop(&mut self) {
+        if let Some(task) = self.request_task.take() {
+            task.abort();
+        }
     }
 }
 
