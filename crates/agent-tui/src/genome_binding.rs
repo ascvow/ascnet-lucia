@@ -4,18 +4,20 @@ use agent_core::{
     model::{OpenAiProtocol, ProviderKind},
     AgentOptions, AgentRootConfig,
 };
-#[cfg(feature = "plugins")]
-use agent_evolution::ContextPolicyRepository;
 use agent_evolution::{ArtifactStore, FileArtifactStore};
 #[cfg(feature = "plugins")]
-use agent_evolution_protocol::{ArtifactDigest, PluginGenome};
+use agent_evolution::{ContextPolicyRepository, SkillArtifactRepository};
+#[cfg(feature = "plugins")]
+use agent_evolution_protocol::{ArtifactDigest, PluginGenome, SkillId, SkillStatusV1};
 use agent_evolution_protocol::{GenomeRevision, ModelGenome};
 #[cfg(feature = "plugins")]
 use agent_plugin_host::manifest::{
     resolve_plugin_capabilities, resolve_plugin_load_order, PluginManifest,
 };
-use agent_tool::{ExecutionPolicy, ToolRegistry};
+use agent_tool::{ExecutionPolicy, ExecutionProfile, ToolRegistry};
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "plugins")]
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 #[cfg(feature = "plugins")]
@@ -28,6 +30,40 @@ use std::{
 const CONTEXT_POLICY_JSON_METADATA_KEY: &str = "context_policy_json";
 #[cfg(feature = "plugins")]
 const CONTEXT_POLICY_DIGEST_METADATA_KEY: &str = "context_policy_digest";
+#[cfg(feature = "plugins")]
+const SKILL_SET_JSON_METADATA_KEY: &str = "skill_set_json";
+#[cfg(feature = "plugins")]
+const SKILL_SET_SCHEMA_VERSION: u32 = 1;
+#[cfg(feature = "plugins")]
+const SKILL_CAPABILITY_ID: &str = "agent.skills";
+
+/// 交给 Skill Guest 的版本化 Genome Skill Set 信封。
+#[cfg(feature = "plugins")]
+#[derive(Debug, Serialize)]
+struct GenomeSkillSetV1 {
+    /// 信封结构版本。
+    schema_version: u32,
+    /// 原 Candidate 的不可变 Genome Revision ID。
+    genome_revision_id: String,
+    /// 原 Candidate 的不可变 Genome 行为摘要。
+    genome_digest: String,
+    /// 本次 Genome 运行所在的可信执行平面。
+    execution_profile: ExecutionProfile,
+    /// 按强类型 Skill ID 排序的精确制品。
+    skills: Vec<InjectedSkillArtifactV1>,
+}
+
+/// 一项来自真实 Artifact CAS 的 Skill 制品原始规范 JSON。
+#[cfg(feature = "plugins")]
+#[derive(Debug, Serialize)]
+struct InjectedSkillArtifactV1 {
+    /// Genome 引用与制品共同声明的稳定 Skill ID。
+    skill_id: String,
+    /// 规范 SkillArtifact JSON 的 CAS 摘要。
+    artifact_digest: String,
+    /// 仓库复核后的原始规范 JSON；Guest 会再次计算摘要。
+    artifact_json: String,
+}
 
 /// 启动后不可替换的 Genome 运行装配器。
 ///
@@ -46,14 +82,56 @@ impl GenomeRuntimeBinding {
     /// # Errors
     ///
     /// 包版本、Git 身份、目标平台或 feature 集合与当前二进制不一致，或 Genome 声明了
-    /// 当前尚无可信装配协议的 Planning、Skill 快照时返回错误。
+    /// 当前尚无可信装配协议的 Planning 快照时返回错误。
     pub(crate) fn new(revision: GenomeRevision, artifacts: FileArtifactStore) -> Result<Self> {
+        Self::new_with_policy(revision, artifacts, None)
+    }
+
+    /// 为原 Candidate Revision 创建 Evaluation 运行绑定，不改写其 Genome 或摘要。
+    ///
+    /// `fixture_root` 只用于构造 Evaluation 平面的文件系统边界；有效策略通过 `restrict`
+    /// 单调收紧，原 `revision_id`、`digest` 与 Genome execution 全部原样保留。
+    ///
+    /// # Errors
+    ///
+    /// Revision 身份或策略表面无效，或原 Genome 已处于 Mutation 平面时返回错误。
+    #[cfg(feature = "plugins")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "供独立 Evaluation 运行装配入口调用")
+    )]
+    pub(crate) fn new_for_evaluation(
+        revision: GenomeRevision,
+        artifacts: FileArtifactStore,
+        fixture_root: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        Self::new_with_policy(
+            revision,
+            artifacts,
+            Some(ExecutionPolicy::evaluation(fixture_root)),
+        )
+    }
+
+    /// 复用同一身份校验建立普通或受信平面覆盖绑定。
+    fn new_with_policy(
+        revision: GenomeRevision,
+        artifacts: FileArtifactStore,
+        runtime_policy: Option<ExecutionPolicy>,
+    ) -> Result<Self> {
         verify_runtime_identity(&revision)?;
         verify_supported_policy_surfaces(&revision)?;
         let mut execution_policy = revision.genome.execution.clone();
         execution_policy.tools = execution_policy
             .tools
             .restrict(&revision.genome.tools.access);
+        if let Some(runtime_policy) = runtime_policy {
+            execution_policy = execution_policy.restrict(&runtime_policy);
+            if execution_policy.profile() != ExecutionProfile::Evaluation {
+                return Err(anyhow!(
+                    "只有 Serve Candidate 可以单调收紧为 Evaluation 运行"
+                ));
+            }
+        }
         Ok(Self {
             revision,
             artifacts,
@@ -213,66 +291,173 @@ impl GenomeRuntimeBinding {
         Ok((selected_paths, selections))
     }
 
-    /// 从真实 CAS 读取 Context Policy，并只为 Context Loader owner 生成激活元数据。
+    /// 从真实 CAS 读取 Context Policy 与 Skill Set，并只向各自真实能力 owner 注入。
     ///
-    /// 未声明策略时返回空映射并保持普通运行行为。策略正文由版本化仓库校验、规范化后
-    /// 交给 Guest 解释，TUI 只验证引用、能力 owner 与插件组合绑定关系。
+    /// 未声明快照时返回空映射并保持普通运行行为。Context Policy 正文和 SkillArtifact
+    /// 都由版本化仓库校验；`bound_manifests` 必须是 [`Self::bind_plugins`] 已选择的真实
+    /// manifest 集合，Skill Set 只允许存在一个 `agent.skills` provider。
     ///
     /// # Errors
     ///
-    /// Context Loader owner 缺失、策略 ID 错绑，或 CAS 制品缺失、篡改、过大、非规范 JSON
-    /// 时返回错误。
+    /// Context Loader owner 缺失、Skill provider 不唯一、引用与强类型 ID 错绑、Skill 终态
+    /// 不允许进入当前执行平面，或 CAS 制品缺失、篡改、过大、非规范 JSON 时返回错误。
     #[cfg(feature = "plugins")]
     pub(crate) async fn plugin_activation_metadata(
         &self,
+        bound_manifests: &[PathBuf],
     ) -> Result<HashMap<String, HashMap<String, String>>> {
-        let Some(reference) = self.revision.genome.context_policy.as_ref() else {
-            return Ok(HashMap::new());
-        };
-        let owner = self
-            .revision
-            .genome
-            .capability_owners
-            .get(agent_plugin_host::manifest::CONTEXT_LOADER_CAPABILITY)
-            .ok_or_else(|| anyhow!("Context Policy 已声明，但 Genome 缺少 Context Loader owner"))?;
-        if reference.id != *owner {
-            return Err(anyhow!(
-                "Context Policy ID `{}` 与 Context Loader owner `{owner}` 不一致",
-                reference.id
-            ));
-        }
-        if !self
-            .revision
-            .genome
-            .plugins
-            .iter()
-            .any(|plugin| plugin.id == *owner)
-        {
-            return Err(anyhow!(
-                "Context Loader owner `{owner}` 不在 Genome 插件组合中"
-            ));
-        }
+        let mut metadata = HashMap::<String, HashMap<String, String>>::new();
+        if let Some(reference) = self.revision.genome.context_policy.as_ref() {
+            let owner = self
+                .revision
+                .genome
+                .capability_owners
+                .get(agent_plugin_host::manifest::CONTEXT_LOADER_CAPABILITY)
+                .ok_or_else(|| {
+                    anyhow!("Context Policy 已声明，但 Genome 缺少 Context Loader owner")
+                })?;
+            if reference.id != *owner {
+                return Err(anyhow!(
+                    "Context Policy ID `{}` 与 Context Loader owner `{owner}` 不一致",
+                    reference.id
+                ));
+            }
+            if !self
+                .revision
+                .genome
+                .plugins
+                .iter()
+                .any(|plugin| plugin.id == *owner)
+            {
+                return Err(anyhow!(
+                    "Context Loader owner `{owner}` 不在 Genome 插件组合中"
+                ));
+            }
 
-        let policy = ContextPolicyRepository::new(&self.artifacts)
-            .get(&reference.config_digest)
-            .await
-            .context("读取并校验 Genome Context Policy 制品失败")?;
-        let policy_json = String::from_utf8(
-            policy
-                .canonical_bytes()
-                .context("重新编码 Context Policy 规范 JSON 失败")?,
-        )
-        .context("Context Policy 规范 JSON 不是 UTF-8")?;
-        Ok(HashMap::from([(
-            owner.clone(),
-            HashMap::from([
+            let policy = ContextPolicyRepository::new(&self.artifacts)
+                .get(&reference.config_digest)
+                .await
+                .context("读取并校验 Genome Context Policy 制品失败")?;
+            let policy_json = String::from_utf8(
+                policy
+                    .canonical_bytes()
+                    .context("重新编码 Context Policy 规范 JSON 失败")?,
+            )
+            .context("Context Policy 规范 JSON 不是 UTF-8")?;
+            metadata.entry(owner.clone()).or_default().extend([
                 (CONTEXT_POLICY_JSON_METADATA_KEY.into(), policy_json),
                 (
                     CONTEXT_POLICY_DIGEST_METADATA_KEY.into(),
                     reference.config_digest.to_string(),
                 ),
-            ]),
-        )]))
+            ]);
+        }
+
+        if !self.revision.genome.skills.is_empty() {
+            let manifests = self.verified_bound_manifests(bound_manifests)?;
+            let providers = manifests
+                .iter()
+                .filter(|manifest| {
+                    manifest
+                        .provides
+                        .iter()
+                        .any(|provided| provided.id == SKILL_CAPABILITY_ID)
+                })
+                .map(|manifest| manifest.plugin.id.as_str())
+                .collect::<Vec<_>>();
+            let [provider] = providers.as_slice() else {
+                return Err(anyhow!(
+                    "Genome Skill Set 要求唯一 `{SKILL_CAPABILITY_ID}` provider，实际为 {} 个",
+                    providers.len()
+                ));
+            };
+
+            let repository = SkillArtifactRepository::new(&self.artifacts);
+            let mut skills = Vec::with_capacity(self.revision.genome.skills.len());
+            for reference in &self.revision.genome.skills {
+                let skill_id = SkillId::new(reference.id.clone())
+                    .with_context(|| format!("Genome Skill ID 无效：{}", reference.id))?;
+                let artifact = repository
+                    .get(&reference.content)
+                    .await
+                    .with_context(|| format!("读取并校验 Genome Skill `{skill_id}` 制品失败"))?;
+                if artifact.skill_id != skill_id {
+                    return Err(anyhow!(
+                        "Genome Skill ID `{skill_id}` 与制品 ID `{}` 不一致",
+                        artifact.skill_id
+                    ));
+                }
+                let final_status = artifact
+                    .status_history
+                    .last()
+                    .map(|transition| transition.status);
+                if !skill_status_is_loadable(self.execution_policy.profile(), final_status) {
+                    return Err(anyhow!(
+                        "Genome Skill `{skill_id}` 终态 {final_status:?} 不能进入 {:?} 运行",
+                        self.execution_policy.profile()
+                    ));
+                }
+                let artifact_json = String::from_utf8(
+                    artifact
+                        .canonical_bytes()
+                        .context("重新编码 SkillArtifact 规范 JSON 失败")?,
+                )
+                .context("SkillArtifact 规范 JSON 不是 UTF-8")?;
+                skills.push(InjectedSkillArtifactV1 {
+                    skill_id: skill_id.to_string(),
+                    artifact_digest: reference.content.to_string(),
+                    artifact_json,
+                });
+            }
+            let skill_set_json = serde_json::to_string(&GenomeSkillSetV1 {
+                schema_version: SKILL_SET_SCHEMA_VERSION,
+                genome_revision_id: self.revision.revision_id.to_string(),
+                genome_digest: self.revision.digest.to_string(),
+                execution_profile: self.execution_policy.profile(),
+                skills,
+            })
+            .context("编码 Genome Skill Set JSON 失败")?;
+            metadata
+                .entry((*provider).to_string())
+                .or_default()
+                .insert(SKILL_SET_JSON_METADATA_KEY.into(), skill_set_json);
+        }
+
+        Ok(metadata)
+    }
+
+    /// 重新复核调用方传入的绑定 manifest，避免通过目录扫描伪造 Skill provider。
+    ///
+    /// # Errors
+    ///
+    /// manifest 数量、ID 或 bundle 与 Genome 固定快照不一致时返回错误。
+    #[cfg(feature = "plugins")]
+    fn verified_bound_manifests(&self, paths: &[PathBuf]) -> Result<Vec<PluginManifest>> {
+        if paths.len() != self.revision.genome.plugins.len() {
+            return Err(anyhow!("已绑定插件集合与 Genome 插件数量不一致"));
+        }
+        let expected = self
+            .revision
+            .genome
+            .plugins
+            .iter()
+            .map(|plugin| (plugin.id.as_str(), plugin))
+            .collect::<HashMap<_, _>>();
+        let mut seen = BTreeSet::new();
+        let mut manifests = Vec::with_capacity(paths.len());
+        for path in paths {
+            let manifest = PluginManifest::load(path)
+                .with_context(|| format!("重新读取绑定插件 manifest 失败：{}", path.display()))?;
+            let snapshot = expected.get(manifest.plugin.id.as_str()).ok_or_else(|| {
+                anyhow!("绑定插件 `{}` 不在 Genome 插件组合中", manifest.plugin.id)
+            })?;
+            if !seen.insert(manifest.plugin.id.clone()) {
+                return Err(anyhow!("绑定插件 ID 重复：{}", manifest.plugin.id));
+            }
+            verify_plugin_snapshot(snapshot, path, &manifest)?;
+            manifests.push(manifest);
+        }
+        Ok(manifests)
     }
 
     /// 纯 Core 构建必须拒绝声明了插件行为的 Genome。
@@ -285,9 +470,10 @@ impl GenomeRuntimeBinding {
         if !self.revision.genome.plugins.is_empty()
             || !self.revision.genome.capability_owners.is_empty()
             || self.revision.genome.context_policy.is_some()
+            || !self.revision.genome.skills.is_empty()
         {
             return Err(anyhow!(
-                "纯 Core 构建不能运行声明插件或 Context Policy 行为的 Genome"
+                "纯 Core 构建不能运行声明插件、Context Policy 或 Skill 行为的 Genome"
             ));
         }
         Ok(())
@@ -377,7 +563,23 @@ fn verify_git_commit(declared: &str, build: &str) -> Result<()> {
     Ok(())
 }
 
-/// 当前尚无跨插件可信快照服务的 Planning 与 Skill 字段不得被伪装成已装配行为。
+/// 判断 Skill 终态是否允许进入指定可信运行平面。
+///
+/// Serve 只能装载 Commit Gate 后的 Active；Evaluation 可运行隔离候选及已评测候选；
+/// Deprecated、Deleted 和所有 Mutation 运行都不装配 Skill。
+#[cfg(feature = "plugins")]
+fn skill_status_is_loadable(profile: ExecutionProfile, status: Option<SkillStatusV1>) -> bool {
+    match profile {
+        ExecutionProfile::Serve => status == Some(SkillStatusV1::Active),
+        ExecutionProfile::Evaluation => matches!(
+            status,
+            Some(SkillStatusV1::Quarantined | SkillStatusV1::Evaluated | SkillStatusV1::Active)
+        ),
+        ExecutionProfile::Mutation => false,
+    }
+}
+
+/// 当前尚无跨插件可信快照服务的 Planning 字段不得被伪装成已装配行为。
 fn verify_supported_policy_surfaces(revision: &GenomeRevision) -> Result<()> {
     let genome = &revision.genome;
     if genome.prompt.messages.is_empty() {
@@ -385,9 +587,9 @@ fn verify_supported_policy_surfaces(revision: &GenomeRevision) -> Result<()> {
             "Evidence Genome 必须把完整系统 Prompt 固定为至少一个 CAS 制品"
         ));
     }
-    if genome.planning_policy.is_some() || !genome.skills.is_empty() {
+    if genome.planning_policy.is_some() {
         return Err(anyhow!(
-            "当前 TUI 尚不能可信装配 Genome 的 Planning 或 Skill 独立快照"
+            "当前 TUI 尚不能可信装配 Genome 的 Planning Policy 独立快照"
         ));
     }
     Ok(())
@@ -502,6 +704,12 @@ mod tests {
         AgentGenome, ArtifactDigest, GenomeMetadata, ModelGenome, PromptArtifactRef, PromptGenome,
         PromptLayer, RuntimeIdentity, ToolProfileGenome, GENOME_SCHEMA_VERSION,
     };
+    #[cfg(feature = "plugins")]
+    use agent_evolution_protocol::{EpisodeId, EvaluationReportId, MutationId, SkillRef};
+    #[cfg(feature = "plugins")]
+    use agent_evolution_protocol::{
+        SkillArtifactV1, SkillOperationV1, SkillStatusTransitionV1, SkillTriggerPolicyV1,
+    };
     use agent_tool::{JsonTool, ToolSpec};
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -560,6 +768,48 @@ mod tests {
                 artifact: ArtifactDigest::from_sha256_hex("0".repeat(64))
                     .expect("固定 Prompt 摘要应合法"),
             }],
+        }
+    }
+
+    /// 构造 TUI 真实 CAS 装配测试使用的合法 SkillArtifact。
+    #[cfg(feature = "plugins")]
+    fn skill_artifact(skill_id: &str, final_status: SkillStatusV1) -> SkillArtifactV1 {
+        let report_id = EvaluationReportId::generate();
+        let mut status_history = vec![SkillStatusTransitionV1 {
+            status: SkillStatusV1::Quarantined,
+            recorded_at_ms: 1,
+            evaluation_report_id: None,
+        }];
+        if matches!(
+            final_status,
+            SkillStatusV1::Evaluated | SkillStatusV1::Active
+        ) {
+            status_history.push(SkillStatusTransitionV1 {
+                status: SkillStatusV1::Evaluated,
+                recorded_at_ms: 2,
+                evaluation_report_id: Some(report_id.clone()),
+            });
+        }
+        if final_status == SkillStatusV1::Active {
+            status_history.push(SkillStatusTransitionV1 {
+                status: SkillStatusV1::Active,
+                recorded_at_ms: 3,
+                evaluation_report_id: Some(report_id),
+            });
+        }
+        SkillArtifactV1 {
+            schema_version: agent_evolution_protocol::SKILL_ARTIFACT_SCHEMA_VERSION,
+            skill_id: SkillId::new(skill_id).expect("测试 Skill ID 应合法"),
+            revision: 1,
+            operation: SkillOperationV1::Create,
+            name: format!("skill-{skill_id}"),
+            description: "验证真实 CAS Skill 装配。".into(),
+            instructions: "只执行 CAS 固定的测试指令。".into(),
+            trigger_policy: SkillTriggerPolicyV1::default(),
+            required_capabilities: BTreeSet::new(),
+            source_episode_ids: BTreeSet::from([EpisodeId::generate()]),
+            mutation_id: MutationId::generate(),
+            status_history,
         }
     }
 
@@ -788,7 +1038,7 @@ mod tests {
             Some("selected")
         );
         let activation_metadata = binding
-            .plugin_activation_metadata()
+            .plugin_activation_metadata(&paths)
             .await
             .expect("应从真实 CAS 生成 Context Policy 激活元数据");
         let context_metadata = activation_metadata
@@ -817,5 +1067,223 @@ mod tests {
             .expect_err("bundle 篡改必须拒绝");
         assert!(error.to_string().contains("bundle 摘要"));
         std::fs::remove_dir_all(root).expect("应清理插件绑定目录");
+    }
+
+    /// Genome Skill Set 只注入唯一真实 provider，并按运行平面执行状态门禁。
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn genome_injects_verified_skill_set_for_unique_provider_and_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "lucia-genome-skills-{}",
+            agent_session::SessionId::generate()
+        ));
+        let provider = root.join("skill-provider");
+        std::fs::create_dir_all(&provider).expect("应创建 Skill provider 目录");
+        std::fs::write(provider.join("skill.wasm"), b"verified-skill-wasm")
+            .expect("应写入 Skill provider WASM");
+        std::fs::write(
+            provider.join("plugin.toml"),
+            r#"
+                [plugin]
+                id = "skill-provider"
+                name = "Skill Provider"
+                version = "1.0.0"
+                api_version = "0.7.0"
+                wasm = "skill.wasm"
+
+                [[provides]]
+                id = "agent.skills"
+                version = "1.0.0"
+                mode = "multi"
+            "#,
+        )
+        .expect("应写入 Skill provider manifest");
+
+        let artifacts = FileArtifactStore::new(root.join("artifacts"));
+        let active = skill_artifact("skill_runtime1", SkillStatusV1::Active);
+        let active_ref = SkillArtifactRepository::new(&artifacts)
+            .put(&active)
+            .await
+            .expect("应写入 Active SkillArtifact CAS");
+        let bundle = agent_plugin_manager::hash_plugin_bundle(&provider)
+            .expect("应计算 Skill provider bundle 摘要");
+        let mut revision = revision(model(), fixed_prompt(), ToolProfileGenome::default());
+        revision.genome.plugins = vec![PluginGenome {
+            id: "skill-provider".into(),
+            version: "1.0.0".into(),
+            api_version: "0.7.0".into(),
+            bundle: ArtifactDigest::from_sha256_hex(bundle).expect("bundle 摘要应合法"),
+            config_digest: None,
+        }];
+        revision.genome.skills = vec![SkillRef {
+            id: active.skill_id.to_string(),
+            content: active_ref.digest.clone(),
+        }];
+        revision.digest = revision.genome.digest().expect("应重算 Genome 摘要");
+        let binding =
+            GenomeRuntimeBinding::new(revision, artifacts.clone()).expect("应创建 Skill 绑定");
+        let (paths, _) = binding
+            .bind_plugins(&[provider.join("plugin.toml")])
+            .expect("应绑定真实 Skill provider");
+        let metadata = binding
+            .plugin_activation_metadata(&paths)
+            .await
+            .expect("Serve 应装配 Active Skill");
+        assert_eq!(metadata.len(), 1);
+        let skill_set: Value = serde_json::from_str(
+            metadata
+                .get("skill-provider")
+                .and_then(|values| values.get(SKILL_SET_JSON_METADATA_KEY))
+                .expect("只应向唯一真实 provider 注入 Skill Set"),
+        )
+        .expect("注入值应为版本化 JSON");
+        assert_eq!(skill_set["schema_version"], SKILL_SET_SCHEMA_VERSION);
+        assert_eq!(skill_set["execution_profile"], "serve");
+        assert_eq!(skill_set["skills"][0]["skill_id"], active.skill_id.as_str());
+        assert_eq!(
+            skill_set["skills"][0]["artifact_digest"],
+            active_ref.digest.to_string()
+        );
+
+        let quarantined = skill_artifact("skill_candidate1", SkillStatusV1::Quarantined);
+        let quarantined_ref = SkillArtifactRepository::new(&artifacts)
+            .put(&quarantined)
+            .await
+            .expect("应写入 Quarantined SkillArtifact CAS");
+        let mut candidate_genome = binding.revision().genome.clone();
+        candidate_genome.skills = vec![SkillRef {
+            id: quarantined.skill_id.to_string(),
+            content: quarantined_ref.digest,
+        }];
+        let candidate_revision =
+            GenomeRevision::create(candidate_genome, GenomeMetadata::default())
+                .expect("应创建保持 Serve execution 的 Candidate Revision");
+        let candidate_revision_id = candidate_revision.revision_id.to_string();
+        let candidate_digest = candidate_revision.digest.to_string();
+        let evaluation = GenomeRuntimeBinding::new_for_evaluation(
+            candidate_revision.clone(),
+            artifacts.clone(),
+            root.join("fixtures"),
+        )
+        .expect("应以原 Candidate 创建 Evaluation Skill 绑定");
+        assert_eq!(evaluation.revision(), &candidate_revision);
+        assert_eq!(
+            evaluation.revision().genome.execution.profile(),
+            ExecutionProfile::Serve
+        );
+        assert_eq!(
+            evaluation.execution_policy().profile(),
+            ExecutionProfile::Evaluation
+        );
+        let evaluation_metadata = evaluation
+            .plugin_activation_metadata(&paths)
+            .await
+            .expect("Evaluation 应允许装配 Quarantined Candidate");
+        let evaluation_set: Value = serde_json::from_str(
+            evaluation_metadata["skill-provider"][SKILL_SET_JSON_METADATA_KEY].as_str(),
+        )
+        .expect("Evaluation Skill Set 应可解析");
+        assert_eq!(evaluation_set["execution_profile"], "evaluation");
+        assert_eq!(evaluation_set["genome_revision_id"], candidate_revision_id);
+        assert_eq!(evaluation_set["genome_digest"], candidate_digest);
+
+        let serve = GenomeRuntimeBinding::new(candidate_revision, artifacts.clone())
+            .expect("应创建 Serve Skill 绑定");
+        let error = serve
+            .plugin_activation_metadata(&paths)
+            .await
+            .expect_err("Serve 必须拒绝 Quarantined Skill");
+        assert!(error.to_string().contains("不能进入 Serve 运行"));
+
+        let duplicate = root.join("skill-provider-2");
+        std::fs::create_dir_all(&duplicate).expect("应创建重复 provider 目录");
+        std::fs::write(duplicate.join("skill.wasm"), b"duplicate-skill-wasm")
+            .expect("应写入重复 provider WASM");
+        std::fs::write(
+            duplicate.join("plugin.toml"),
+            r#"
+                [plugin]
+                id = "skill-provider-2"
+                name = "Duplicate Skill Provider"
+                version = "1.0.0"
+                api_version = "0.7.0"
+                wasm = "skill.wasm"
+
+                [[provides]]
+                id = "agent.skills"
+                version = "1.0.0"
+                mode = "multi"
+            "#,
+        )
+        .expect("应写入重复 provider manifest");
+        let duplicate_bundle = agent_plugin_manager::hash_plugin_bundle(&duplicate)
+            .expect("应计算重复 provider bundle 摘要");
+        let mut duplicate_revision = binding.revision().clone();
+        duplicate_revision.genome.plugins.push(PluginGenome {
+            id: "skill-provider-2".into(),
+            version: "1.0.0".into(),
+            api_version: "0.7.0".into(),
+            bundle: ArtifactDigest::from_sha256_hex(duplicate_bundle)
+                .expect("重复 provider bundle 摘要应合法"),
+            config_digest: None,
+        });
+        duplicate_revision.digest = duplicate_revision
+            .genome
+            .digest()
+            .expect("应重算重复 provider Genome 摘要");
+        let duplicate_binding = GenomeRuntimeBinding::new(duplicate_revision, artifacts.clone())
+            .expect("应创建重复 provider 绑定");
+        let (duplicate_paths, _) = duplicate_binding
+            .bind_plugins(&[provider.join("plugin.toml"), duplicate.join("plugin.toml")])
+            .expect("multi provider 可完成通用能力解析");
+        let error = duplicate_binding
+            .plugin_activation_metadata(&duplicate_paths)
+            .await
+            .expect_err("Evidence Skill Set 必须拒绝多个真实 provider");
+        assert!(error.to_string().contains("实际为 2 个"));
+
+        let unrelated = root.join("unrelated-plugin");
+        std::fs::create_dir_all(&unrelated).expect("应创建无 Skill 能力插件目录");
+        std::fs::write(unrelated.join("plugin.wasm"), b"unrelated-wasm")
+            .expect("应写入无 Skill 能力插件 WASM");
+        std::fs::write(
+            unrelated.join("plugin.toml"),
+            r#"
+                [plugin]
+                id = "unrelated-plugin"
+                name = "Unrelated Plugin"
+                version = "1.0.0"
+                api_version = "0.7.0"
+                wasm = "plugin.wasm"
+            "#,
+        )
+        .expect("应写入无 Skill 能力插件 manifest");
+        let unrelated_bundle = agent_plugin_manager::hash_plugin_bundle(&unrelated)
+            .expect("应计算无 Skill 能力插件 bundle 摘要");
+        let mut missing_revision = binding.revision().clone();
+        missing_revision.genome.plugins = vec![PluginGenome {
+            id: "unrelated-plugin".into(),
+            version: "1.0.0".into(),
+            api_version: "0.7.0".into(),
+            bundle: ArtifactDigest::from_sha256_hex(unrelated_bundle)
+                .expect("无 Skill 能力插件 bundle 摘要应合法"),
+            config_digest: None,
+        }];
+        missing_revision.digest = missing_revision
+            .genome
+            .digest()
+            .expect("应重算缺少 provider 的 Genome 摘要");
+        let missing_binding = GenomeRuntimeBinding::new(missing_revision, artifacts)
+            .expect("应创建缺少 provider 的绑定");
+        let (missing_paths, _) = missing_binding
+            .bind_plugins(&[unrelated.join("plugin.toml")])
+            .expect("无关插件仍应通过通用绑定");
+        let error = missing_binding
+            .plugin_activation_metadata(&missing_paths)
+            .await
+            .expect_err("Evidence Skill Set 必须拒绝缺少真实 provider");
+        assert!(error.to_string().contains("实际为 0 个"));
+
+        std::fs::remove_dir_all(root).expect("应清理 Skill 装配目录");
     }
 }

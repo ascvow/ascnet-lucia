@@ -36,6 +36,10 @@ mod recorder;
 mod recorder_hub;
 mod replay;
 mod scorecard;
+mod skill_candidate_builder;
+mod skill_mutation;
+mod skill_repository;
+mod skill_usage;
 mod supervision;
 mod template_generator;
 
@@ -114,6 +118,22 @@ pub use scorecard::{
     DatasetMetricSummary, EvaluationConfidence, EvolutionScorecard, EvolutionVerdictPolicy,
     GateSummary, HeadlineVerdict, InheritanceMetrics, RegressionComparison, ResourceGatePolicy,
     ScorecardError, EVOLUTION_SCORECARD_SCHEMA_VERSION,
+};
+pub use skill_candidate_builder::{SkillCandidateBuildError, SkillCandidateBuilder};
+pub use skill_mutation::{
+    BoundedSkillMutator, SkillContentDraftV1, SkillMutationDraftOperationV1, SkillMutationDraftV1,
+    SkillMutationError, SkillMutationGenerationError, SkillMutationGenerator,
+    SkillMutationParentView, SkillMutationRequestV1, M7_SKILL_CANDIDATE_COUNT,
+    M7_SKILL_MUTATION_POLICY_VERSION, MAX_SKILL_DRAFT_ARTIFACTS, MAX_SKILL_DRAFT_BYTES,
+    MAX_SKILL_DRAFT_HYPOTHESIS_BYTES,
+};
+pub use skill_repository::{
+    FileSkillStatusStore, SkillArtifactRepository, SkillRepositoryError, SkillStatusIndexEntryV1,
+};
+pub use skill_usage::{
+    collect_trusted_skill_evaluation_bindings, collect_trusted_skill_usage_bindings,
+    SkillUsageBindingError, SKILL_LOADED_EVENT_SCHEMA_VERSION, SKILL_LOADED_EVENT_V1,
+    SKILL_USAGE_EVENT_MEDIA_TYPE,
 };
 pub use supervision::{
     RunSupervisor, SupervisionError, SupervisionReport, OUTCOME_RESOLUTION_EVENT,

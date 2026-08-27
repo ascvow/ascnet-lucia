@@ -172,7 +172,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         let (bound_manifests, bound_owners) = evidence.bind_plugins(&plugin_manifests)?;
         plugin_manifests = bound_manifests;
         capability_selection = bound_owners;
-        plugin_activation_metadata = evidence.plugin_activation_metadata().await?;
+        plugin_activation_metadata = evidence
+            .plugin_activation_metadata(&plugin_manifests)
+            .await?;
     }
     #[cfg(not(feature = "plugins"))]
     if let Some(evidence) = evidence_runtime.as_ref() {

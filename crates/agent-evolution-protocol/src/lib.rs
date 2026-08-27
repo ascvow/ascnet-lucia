@@ -18,6 +18,7 @@ pub mod ids;
 pub mod ipc;
 pub mod mutation;
 pub mod redaction;
+mod skill_evolution;
 pub mod supervision;
 
 pub use genome::{
@@ -80,6 +81,16 @@ pub use mutation::{
     MUTATION_PROPOSAL_SCHEMA_VERSION,
 };
 pub use redaction::{RedactionOutcome, RedactionRule, Redactor, REDACTION_RULES_VERSION};
+pub use skill_evolution::{
+    InvalidSkillEvolution, InvalidSkillId, SkillArtifactV1, SkillCandidateV1, SkillDeletionModeV1,
+    SkillEvaluationReportV1, SkillGateFailureV1, SkillGenomeRefV1, SkillId,
+    SkillMutationProposalV1, SkillOperationV1, SkillStatusTransitionV1, SkillStatusV1,
+    SkillTriggerModeV1, SkillTriggerPolicyV1, SkillUsageEvidenceSourceV1, SkillUsageObservationV1,
+    SkillUsageResultV1, TrustedPluginEventRefV1, TrustedSkillUsageBindingV1,
+    SKILL_ARTIFACT_SCHEMA_VERSION, SKILL_CANDIDATE_SCHEMA_VERSION,
+    SKILL_EVALUATION_REPORT_SCHEMA_VERSION, SKILL_MUTATION_PROPOSAL_SCHEMA_VERSION,
+    SKILL_USAGE_OBSERVATION_SCHEMA_VERSION,
+};
 pub use supervision::{
     default_component, default_recoverability, sorted_unique_event_ids, ComponentRef, DetectorRef,
     EventEnvelope, FeedbackEvent, FeedbackSignal, FeedbackSource, Incident, IncidentKind,

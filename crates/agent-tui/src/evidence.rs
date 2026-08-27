@@ -136,6 +136,22 @@ impl EvidenceRuntime {
         self.binding.bind_plugins(manifests)
     }
 
+    /// 读取 Genome Context Policy 与 Skill Set，并生成按真实插件 ID 隔离的激活元数据。
+    ///
+    /// # Errors
+    ///
+    /// 引用、能力 owner 或已绑定 manifest 错绑，或真实 CAS 制品无法通过完整性与协议
+    /// 校验时返回错误。
+    #[cfg(feature = "plugins")]
+    pub(crate) async fn plugin_activation_metadata(
+        &self,
+        bound_manifests: &[PathBuf],
+    ) -> Result<HashMap<String, HashMap<String, String>>> {
+        self.binding
+            .plugin_activation_metadata(bound_manifests)
+            .await
+    }
+
     /// 纯 Core 构建拒绝任何插件行为快照。
     ///
     /// # Errors

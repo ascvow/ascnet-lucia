@@ -16,6 +16,8 @@ pub mod protocol;
 pub mod release;
 pub mod report;
 pub mod runner;
+mod skill_exit_gate;
+mod skill_gate;
 pub mod verifier;
 
 pub use archive::{
@@ -67,6 +69,14 @@ pub use report::{
 pub use runner::{
     ComparativeEvaluation, ComparativeRunner, ComparativeRunnerConfig, EvaluationAssurances,
     EvaluationSubject, FixtureReplayReport, RecordedFixtureAttempt, RunnerError,
+};
+pub use skill_exit_gate::{
+    SkillActivationAuthorizationV1, SkillExitGate, SkillExitGateError, SkillExitGateOutcomeV1,
+    SkillPostPromotionProofV1, SkillPromotionReceiptV1, SKILL_EVALUATION_REPORT_MEDIA_TYPE,
+};
+pub use skill_gate::{
+    evaluate_skill_candidate, evaluate_skill_candidate_with_policy, SkillCommitPolicyV1,
+    SkillGateError, TrustedSkillGateResultV1, M7_SKILL_COMMIT_POLICY_VERSION,
 };
 pub use verifier::{
     BuiltinVerifierV1, TrustedVerifier, VerificationResult, VerifierCheck, VerifierRegistry,

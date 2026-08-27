@@ -41,7 +41,7 @@
     "test:plugin:manager": "cargo test -p agent-plugin-manager",
     "test:plugin:context": "cargo test --offline -p context-plugin && bun run build:plugin:context && cargo test --offline -p context-plugin-smoke-tests",
     "test:plugin:mcp": "cargo test --offline -p mcp-plugin && bun run build:plugin:mcp && cargo test --offline -p mcp-plugin-smoke-tests -- --ignored --nocapture",
-    "test:plugin:skill": "cargo test --offline -p skill-plugin && bun run build:plugin:skill && cargo test --offline -p skill-plugin-smoke-tests -- --ignored --nocapture",
+    "test:plugin:skill": "cargo test --offline -p skill-plugin && bun run build:plugin:skill && cargo test --offline -p skill-plugin-smoke-tests -- --nocapture",
     "test:plugin:command": "cargo test --offline -p command-plugin -p command-protocol -p command-sdk && bun run build:plugin:command && cargo test --offline -p command-plugin-smoke-tests",
     "test:plugin:teammate": "cargo test --offline -p teammate-plugin && bun run build:plugin:teammate && cargo test --offline -p teammate-plugin-smoke-tests",
     "test:plugin:plan": "cargo test --offline -p plan-plugin && bun run build:plugin:plan",

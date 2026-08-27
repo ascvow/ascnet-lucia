@@ -14,4 +14,5 @@ anyhow = "1"
 agent-plugin = { path = "../../../crates/agent-plugin" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 wit-bindgen = "0.59"
