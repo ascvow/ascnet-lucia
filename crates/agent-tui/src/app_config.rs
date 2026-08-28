@@ -323,6 +323,32 @@ mod tests {
         fs::remove_dir_all(root).expect("清理配置测试目录");
     }
 
+    /// OpenAI 协议代理使用唯一模型 ID 时应跨服务商命中 models.dev 能力。
+    #[test]
+    fn loads_unique_model_metadata_by_model_id() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("创建配置测试目录");
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "[model]\nprovider = \"open-ai\"\nmodel = \"gpt-5.6-luna\"\n",
+        )
+        .expect("写入模型配置");
+
+        let settings = load_tui_settings(&path).expect("读取模型配置");
+        let metadata = settings.model_metadata.expect("模型 ID 应唯一命中快照");
+        assert_eq!(metadata.context_window, Some(1_050_000));
+        assert_eq!(metadata.max_output_tokens, Some(128_000));
+        assert!(metadata.reasoning_levels.contains(&ReasoningLevel::Max));
+        assert!(metadata
+            .input_modalities
+            .contains(&crate::model_metadata::ModelModality::Image));
+        assert!(metadata
+            .input_modalities
+            .contains(&crate::model_metadata::ModelModality::Pdf));
+        fs::remove_dir_all(root).expect("清理配置测试目录");
+    }
+
     /// Evidence 配置必须独立于 TUI 字段解析，并保留显式 Genome 绑定。
     #[test]
     fn loads_evidence_settings() {

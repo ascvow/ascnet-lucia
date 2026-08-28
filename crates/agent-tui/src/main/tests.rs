@@ -2128,9 +2128,12 @@ fn plugin_slash_command_routes_after_native_commands() {
     let mut view = test_plugin_view(UiPlacement::InputPanel, "权限模式");
     view.declaration.input_triggers = vec!["/permission".into()];
     app.plugin_views.push(view);
-    app.input = "/permission".into();
+    app.input = "/per".into();
     app.cursor = app.input.len();
 
+    assert!(app.native_command_panel_height() > 0);
+    assert!(app.handle_native_command_key(KeyCode::Tab, KeyModifiers::NONE, None));
+    assert_eq!(app.input, "/permission ");
     assert!(!app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
     let PluginKeyRoute::Input(input) = app.route_plugin_key(KeyCode::Enter, KeyModifiers::NONE)
     else {

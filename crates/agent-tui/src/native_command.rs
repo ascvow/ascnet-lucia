@@ -3,7 +3,7 @@
 use super::*;
 
 /// 原生命令面板最多展示的候选数。
-const MAX_VISIBLE_COMMANDS: usize = 7;
+const MAX_VISIBLE_COMMANDS: usize = 12;
 
 /// 会话对话框一次展示的最大摘要数，避免大型历史目录占满终端。
 const MAX_VISIBLE_SESSIONS: usize = 100;
@@ -16,6 +16,17 @@ struct NativeCommandSpec {
     summary: &'static str,
     description: &'static str,
     idle_only: bool,
+}
+
+/// 统一斜杠补全候选；插件仅提供声明式触发前缀，不进入原生命令执行路由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlashCommandMatch {
+    /// 不含前导斜杠的规范命令名。
+    name: String,
+    /// 补全面板展示的简短用途。
+    summary: String,
+    /// 是否由 TUI 原生命令状态机执行。
+    native: bool,
 }
 
 /// Lucia 默认提供的全部斜杠命令。
@@ -72,7 +83,7 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
     },
     NativeCommandSpec {
         name: "reasoning",
-        aliases: &["think"],
+        aliases: &["think", "effort", "effo"],
         summary: "查看或切换思考等级",
         description: "用法：/reasoning [off|minimal|low|medium|high|xhigh|max|next]；不带参数时打开等级选择界面。",
         idle_only: false,
@@ -252,22 +263,48 @@ impl App {
             }
     }
 
-    /// 返回当前输入匹配的原生命令，排序与稳定注册顺序一致。
-    fn native_command_matches(&self) -> Vec<&'static NativeCommandSpec> {
+    /// 返回当前输入匹配的原生命令与插件斜杠触发器，原生命令始终排在前面。
+    fn slash_command_matches(&self) -> Vec<SlashCommandMatch> {
         let Some(rest) = self.input.strip_prefix('/') else {
             return Vec::new();
         };
         if rest.contains(char::is_whitespace) {
             return Vec::new();
         }
-        NATIVE_COMMANDS
+        let mut matches = NATIVE_COMMANDS
             .iter()
             .filter(|command| {
                 command.name.starts_with(rest)
                     || command.aliases.iter().any(|alias| alias.starts_with(rest))
             })
-            .take(MAX_VISIBLE_COMMANDS)
-            .collect()
+            .map(|command| SlashCommandMatch {
+                name: command.name.to_string(),
+                summary: command.summary.to_string(),
+                native: true,
+            })
+            .collect::<Vec<_>>();
+        #[cfg(feature = "plugins")]
+        for view in &self.plugin_views {
+            for trigger in &view.declaration.input_triggers {
+                let Some(name) = trigger.strip_prefix('/') else {
+                    continue;
+                };
+                if name.is_empty()
+                    || name.contains(char::is_whitespace)
+                    || !name.starts_with(rest)
+                    || matches.iter().any(|candidate| candidate.name == name)
+                {
+                    continue;
+                }
+                matches.push(SlashCommandMatch {
+                    name: name.to_string(),
+                    summary: view.declaration.title.clone(),
+                    native: false,
+                });
+            }
+        }
+        matches.truncate(MAX_VISIBLE_COMMANDS);
+        matches
     }
 
     /// 返回当前补全面板所需高度；输入不是命令或面板已被显式隐藏时返回零。
@@ -275,7 +312,7 @@ impl App {
         if self.native_command.dismissed_input.as_deref() == Some(self.input.as_str()) {
             return 0;
         }
-        let count = u16::try_from(self.native_command_matches().len())
+        let count = u16::try_from(self.slash_command_matches().len())
             .unwrap_or(u16::MAX)
             .min(MAX_VISIBLE_COMMANDS as u16);
         count.saturating_add(u16::from(count > 0))
@@ -337,7 +374,7 @@ impl App {
         if self.native_command.dismissed_input.as_deref() == Some(self.input.as_str()) {
             return false;
         }
-        let matches = self.native_command_matches();
+        let matches = self.slash_command_matches();
         match code {
             KeyCode::Up if !matches.is_empty() => {
                 self.native_command.selected = self
@@ -368,6 +405,9 @@ impl App {
                     let selected = self.native_command.selected.min(matches.len() - 1);
                     self.input = format!("/{}", matches[selected].name);
                     self.cursor = self.input.len();
+                    if !matches[selected].native {
+                        return false;
+                    }
                 }
                 self.execute_native_command(agent);
                 true
@@ -962,7 +1002,7 @@ pub(crate) fn render_native_command_panel(frame: &mut Frame, app: &App, area: Re
     if area.is_empty() {
         return;
     }
-    let matches = app.native_command_matches();
+    let matches = app.slash_command_matches();
     if matches.is_empty() {
         return;
     }
@@ -978,7 +1018,7 @@ pub(crate) fn render_native_command_panel(frame: &mut Frame, app: &App, area: Re
             };
             Line::from(vec![
                 Span::styled(format!("/{:<10}", command.name), style),
-                Span::styled(command.summary, style),
+                Span::styled(command.summary.clone(), style),
             ])
         })
         .collect::<Vec<_>>();
@@ -1344,6 +1384,18 @@ mod tests {
             NATIVE_COMMANDS.last().expect("应有退出命令").aliases,
             &["quit"]
         );
+    }
+
+    /// 空斜杠菜单必须展示完整原生命令，不能因固定高度截掉思考入口。
+    #[test]
+    fn slash_panel_includes_reasoning_command() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.input = "/".into();
+
+        let matches = app.slash_command_matches();
+        assert!(matches.iter().any(|command| command.name == "reasoning"));
+        assert!(app.native_command_panel_height() >= 9);
     }
 
     /// 插件构建只暴露人工管理入口，不得重新出现插件进化或生成命令。

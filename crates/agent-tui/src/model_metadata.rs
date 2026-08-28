@@ -106,10 +106,11 @@ struct ModelLimit {
     output: Option<u64>,
 }
 
-/// 从内置快照按 models.dev 服务商 ID 与模型 ID 精确读取能力。
+/// 从内置快照按模型 ID 读取能力，并优先使用指定的 models.dev 服务商消歧。
 ///
-/// 未找到服务商或模型时返回 `Ok(None)`；快照损坏时返回错误并阻止启动，避免打包数据
-/// 静默失效。输出上限超过 Core 的 `u32` 协议范围时忽略该字段。
+/// 指定服务商未命中时会按模型 ID 扫描全部服务商；仅有唯一结果时返回该配置，重复 ID
+/// 必须通过 `models_dev_provider` 显式消歧。快照损坏时返回错误并阻止启动，避免打包
+/// 数据静默失效。输出上限超过 Core 的 `u32` 协议范围时忽略该字段。
 pub(crate) fn find_model_metadata(
     provider_id: &str,
     model_id: &str,
@@ -125,11 +126,22 @@ fn find_model_metadata_in(
 ) -> Result<Option<ModelMetadata>> {
     let providers: HashMap<String, ProviderRecord> =
         serde_json::from_str(snapshot).context("解析内置 models.dev 模型快照失败")?;
-    let Some(model) = providers
+    let exact = providers
         .get(provider_id)
-        .and_then(|provider| provider.models.get(model_id))
-    else {
-        return Ok(None);
+        .and_then(|provider| provider.models.get(model_id));
+    let model = if let Some(model) = exact {
+        model
+    } else {
+        let mut matches = providers
+            .values()
+            .filter_map(|provider| provider.models.get(model_id));
+        let Some(unique) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        unique
     };
     Ok(Some(ModelMetadata {
         context_window: positive(model.limit.context),
@@ -288,5 +300,36 @@ mod tests {
             metadata.reasoning_levels,
             vec![ReasoningLevel::Off, ReasoningLevel::Medium]
         );
+    }
+
+    /// 服务商别名未命中时仍应按唯一模型 ID 读取能力，兼容 OpenAI 协议代理。
+    #[test]
+    fn falls_back_to_unique_model_id_across_providers() {
+        let metadata = find_model_metadata_in(
+            r#"{"ai-router":{"models":{"gpt-luna":{"reasoning":true,"limit":{"context":1050000}}}}}"#,
+            "openai",
+            "gpt-luna",
+        )
+        .expect("夹具应可解析")
+        .expect("唯一模型 ID 应命中");
+
+        assert_eq!(metadata.context_window, Some(1_050_000));
+        assert_eq!(
+            metadata.reasoning_levels,
+            vec![ReasoningLevel::Off, ReasoningLevel::Medium]
+        );
+    }
+
+    /// 多个服务商声明同一模型 ID 时不得任意选择，必须要求配置显式消歧。
+    #[test]
+    fn rejects_ambiguous_model_id_fallback() {
+        let metadata = find_model_metadata_in(
+            r#"{"first":{"models":{"shared":{"reasoning":true}}},"second":{"models":{"shared":{"reasoning":false}}}}"#,
+            "missing",
+            "shared",
+        )
+        .expect("夹具应可解析");
+
+        assert!(metadata.is_none());
     }
 }
