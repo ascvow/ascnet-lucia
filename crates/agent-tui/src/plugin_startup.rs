@@ -2,23 +2,77 @@
 
 use super::*;
 #[cfg(feature = "plugins")]
+use crate::genome_binding::GenomeRuntimeBinding;
+#[cfg(feature = "plugins")]
 use std::fs;
 
 /// 插件启动期间由可信装配层固定的执行约束。
 ///
 /// `execution_policy` 同时收紧插件 Host、派生 Agent 和模型输出预算；`run_observer` 把子 Agent
-/// Run 接入 Evidence；`require_complete_genome` 要求 Genome 固定的插件组合全部进入 Ready；
-/// `activation_metadata` 只向对应插件实例传递可信装配数据。
+/// Run 接入 Evidence。Genome 插件完整性和激活元数据由后台启动装配器直接绑定，调用方不能
+/// 通过本上下文绕过或替换。
 #[cfg(feature = "plugins")]
 pub(crate) struct PluginExecutionContext {
     /// Host 与 Runtime 共同执行的可信策略上限。
     pub(crate) execution_policy: agent_tool::ExecutionPolicy,
     /// 可选的可信 Runtime Run 观察器。
     pub(crate) run_observer: Option<Arc<dyn agent_runtime::RuntimeRunObserver>>,
-    /// 是否拒绝任何不完整的 Genome 插件组合。
-    pub(crate) require_complete_genome: bool,
+}
+
+/// TUI 首帧后的可信插件启动输入。
+///
+/// Genome 绑定存在时，Bundle、Manifest、Capability Profile、加载顺序和 Capability Owner
+/// 会在阻塞线程池中完整复核；只有复核通过的固定组合才能进入 Component 激活。没有 Genome
+/// 绑定的 Legacy 启动保持原有人工配置组合。
+#[cfg(feature = "plugins")]
+#[derive(Debug)]
+pub(crate) struct PreparedPluginStartup {
+    /// 允许进入 Host 激活的 manifest。
+    manifests: Vec<PathBuf>,
+    /// 可信解析后的 Capability Owner。
+    capability_selection: HashMap<String, String>,
     /// 按插件 ID 隔离的 Host 可信激活元数据。
-    pub(crate) activation_metadata: HashMap<String, HashMap<String, String>>,
+    activation_metadata: HashMap<String, HashMap<String, String>>,
+    /// 是否要求 Genome 固定组合全部进入 Ready。
+    require_complete_genome: bool,
+}
+
+/// 在 TUI 首帧后准备经过 Genome 复核的插件启动输入。
+///
+/// Bundle 摘要可能覆盖较大的只读插件目录，因此同步文件扫描通过 `spawn_blocking` 与 TUI
+/// 事件循环隔离。该调整只改变校验时机，不缓存或跳过任何摘要、权限和顺序检查。
+///
+/// # Errors
+///
+/// 后台任务异常终止，或 Genome 固定插件的身份、摘要、顺序、Owner 和激活元数据不一致时
+/// 返回错误，不产生可供 Host 激活的部分组合。
+#[cfg(feature = "plugins")]
+pub(crate) async fn prepare_plugin_startup(
+    manifests: Vec<PathBuf>,
+    capability_selection: HashMap<String, String>,
+    genome_binding: Option<Arc<GenomeRuntimeBinding>>,
+) -> Result<PreparedPluginStartup> {
+    let Some(binding) = genome_binding else {
+        return Ok(PreparedPluginStartup {
+            manifests,
+            capability_selection,
+            activation_metadata: HashMap::new(),
+            require_complete_genome: false,
+        });
+    };
+
+    let verifier = Arc::clone(&binding);
+    let (manifests, capability_selection) =
+        tokio::task::spawn_blocking(move || verifier.bind_plugins(&manifests))
+            .await
+            .context("Genome 插件完整性校验任务异常终止")??;
+    let activation_metadata = binding.plugin_activation_metadata().await?;
+    Ok(PreparedPluginStartup {
+        manifests,
+        capability_selection,
+        activation_metadata,
+        require_complete_genome: true,
+    })
 }
 
 /// 把可信执行策略的派生拓扑限制映射到 Plugin Host 使用的 Agent Runtime。
@@ -167,8 +221,9 @@ pub(crate) fn plugin_manifest_ids(manifests: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// 在 TUI 事件循环之外渐进加载插件，并把每个 Ready/Failed 状态立即发回主循环。
+/// 在 TUI 事件循环之外复核并渐进加载插件，把每个 Ready/Failed 状态立即发回主循环。
 ///
+/// Genome Bundle 的完整摘要复核先在阻塞线程池执行，且必须在任一 Component 激活前通过。
 /// 全局 manifest、依赖或能力规划错误会终止加载；单插件激活失败由 Host 转换为
 /// `PluginLoadUpdate`，不会撤销此前已经发布的无关插件。`require_complete_genome` 为真时，
 /// 任一单插件失败也会让整体结果失败，调用方必须阻止不完整组合开始 Evidence Run。
@@ -176,12 +231,14 @@ pub(crate) fn plugin_manifest_ids(manifests: &[PathBuf]) -> Vec<String> {
 pub(crate) async fn load_plugins_for_tui(
     manifests: Vec<PathBuf>,
     capability_selection: HashMap<String, String>,
+    genome_binding: Option<Arc<GenomeRuntimeBinding>>,
     agent_template: AgentTemplate,
     execution: PluginExecutionContext,
     live_host: Arc<LivePluginHost>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
-    if manifests.is_empty() {
+    let prepared = prepare_plugin_startup(manifests, capability_selection, genome_binding).await?;
+    if prepared.manifests.is_empty() {
         return Ok(());
     }
     let model_gateway = agent_template.gateway().clone();
@@ -209,7 +266,7 @@ pub(crate) async fn load_plugins_for_tui(
     let model_output_limit = plugin_model_output_limit(&execution.execution_policy);
     let mut host_services =
         PluginHostServices::new().restrict_execution_policy(&execution.execution_policy);
-    for (plugin_id, metadata) in execution.activation_metadata {
+    for (plugin_id, metadata) in prepared.activation_metadata {
         host_services = host_services.with_activation_metadata(plugin_id, metadata)?;
     }
     let host_services = host_services
@@ -226,8 +283,8 @@ pub(crate) async fn load_plugins_for_tui(
             HashMap::from([("worker".to_string(), AgentDeriveConfig::default())]),
         )?;
     let failures = load_wasm_plugins_progressively_with_selection_and_services(
-        &manifests,
-        &capability_selection,
+        &prepared.manifests,
+        &prepared.capability_selection,
         host_services,
         live_host.as_ref(),
         |update| {
@@ -235,7 +292,7 @@ pub(crate) async fn load_plugins_for_tui(
         },
     )
     .await?;
-    if execution.require_complete_genome && !failures.is_empty() {
+    if prepared.require_complete_genome && !failures.is_empty() {
         let details = failures
             .iter()
             .map(|failure| format!("{}: {}", failure.plugin_id, failure.reason))

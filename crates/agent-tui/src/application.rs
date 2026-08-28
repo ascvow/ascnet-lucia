@@ -156,8 +156,6 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     #[cfg(feature = "plugins")]
     let mut capability_selection = HashMap::new();
     #[cfg(feature = "plugins")]
-    let mut plugin_activation_metadata = HashMap::new();
-    #[cfg(feature = "plugins")]
     let mut disabled_plugins = Vec::new();
     #[cfg(feature = "plugins")]
     if config_exists {
@@ -401,13 +399,6 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             .set_system(options.system_prompt.clone());
     }
 
-    #[cfg(feature = "plugins")]
-    if let Some(binding) = genome_binding.as_deref() {
-        let (bound_manifests, bound_owners) = binding.bind_plugins(&plugin_manifests)?;
-        plugin_manifests = bound_manifests;
-        capability_selection = bound_owners;
-        plugin_activation_metadata = binding.plugin_activation_metadata().await?;
-    }
     #[cfg(not(feature = "plugins"))]
     if let Some(binding) = genome_binding.as_deref() {
         binding.verify_core_only_plugins()?;
@@ -581,17 +572,16 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         let run_observer = evidence_runtime
             .as_ref()
             .map(EvidenceRuntime::runtime_run_observer);
-        let require_complete_genome = genome_binding.is_some();
+        let plugin_genome_binding = genome_binding.clone();
         tokio::spawn(async move {
             let result = load_plugins_for_tui(
                 plugin_manifests,
                 capability_selection,
+                plugin_genome_binding,
                 plugin_agent_template,
                 PluginExecutionContext {
                     execution_policy: plugin_execution_policy,
                     run_observer,
-                    require_complete_genome,
-                    activation_metadata: plugin_activation_metadata,
                 },
                 load_host,
                 load_tx.clone(),
