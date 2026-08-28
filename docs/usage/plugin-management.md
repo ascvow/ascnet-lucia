@@ -30,10 +30,12 @@ WASM。源码、Cargo `target`、Smoke Test 及其他开发文件不会被复制
 新 Session 使用新基线；旧 Candidate 不能跨插件环境 Promotion。提交失败时 Plugin Manager
 恢复到操作前的锁文件和 Bundle 状态。
 
-安装新 Lucia 二进制后，未绑定的新 Session 会创建 `RevisionOrigin::PlatformUpgrade` 基线；
-它只更新 Kernel 运行身份并完整继承冻结插件环境，不会生成 EvolutionCertificate。已有 Session
-和显式 Revision 不会被自动迁移。
+安装新 Lucia 发行包后，未绑定的新 Session 会创建 `RevisionOrigin::PlatformUpgrade` 基线；
+它更新 Kernel 运行身份，并自动采用实际加载路径仍来自 `official-plugins` 的官方 Bundle 摘要变化，
+不会生成 EvolutionCertificate。用户插件、受管理插件、显式插件覆盖、Capability Owner 变化、
+已有 Session 和显式 Revision 不会被自动迁移；这些变化仍需通过人工插件管理提交。
 
-Lucia 不会自主修改、生成、组合、升级、启停或重新配置插件。插件源码开发、Component 构建、
-签名、发布和 smoke test 仍由用户、开发者与 CI 人工完成。完整的安全、优先级和事务说明见
+除发行包内官方 Bundle 的受限摘要迁移外，Lucia 不会自主修改、生成、组合、升级、启停或重新
+配置插件。插件源码开发、Component 构建、签名、发布和 smoke test 仍由用户、开发者与 CI
+人工完成。完整的安全、优先级和事务说明见
 [插件管理指南](/guide/plugin-management)。

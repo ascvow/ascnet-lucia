@@ -136,6 +136,15 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         args.resume_latest,
     )
     .await?;
+    #[cfg(feature = "plugins")]
+    let may_upgrade_default_official_plugins = session_record.revision == 0
+        && session_record.behavior_binding.is_none()
+        && tui_settings.genome.root_dir.is_none()
+        && tui_settings.genome.stable.is_none()
+        && tui_settings.genome.revision_id.is_none()
+        && tui_settings.evidence.root_dir.is_none()
+        && tui_settings.evidence.genome_revision_id.is_none()
+        && tui_settings.evidence.genome_stable.is_none();
     let mut genome_runtime = load_genome_session_runtime(
         &tui_settings.genome,
         &tui_settings.evidence,
@@ -182,11 +191,35 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         }
         let official_manifests = discover_plugin_manifests(&lucia_home.join("official-plugins"))
             .context("扫描官方插件目录失败")?;
+        let official_manifest_paths = official_manifests.iter().cloned().collect::<HashSet<_>>();
         merge_plugin_manifests(&mut plugin_manifests, official_manifests);
+        // 用户禁用列表最后生效；被禁用的官方插件不属于可自动采用的发行包运行环境。
+        remove_disabled_plugin_manifests(&mut plugin_manifests, &disabled_plugins);
+        // 只有最终实际选中的 manifest 仍来自官方目录时，才允许自动迁移对应 Bundle 摘要。
+        let official_plugin_ids = plugin_manifests
+            .iter()
+            .filter(|path| official_manifest_paths.contains(*path))
+            .map(PluginManifest::load)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|manifest| manifest.plugin.id)
+            .collect::<BTreeSet<_>>();
+        if may_upgrade_default_official_plugins && !genome_runtime.is_unconfigured() {
+            let current_environment = crate::genome_binding::snapshot_plugin_environment(
+                &plugin_manifests,
+                &capability_selection,
+            )?;
+            let (runtime, _) = upgrade_default_official_plugin_environment(
+                genome_runtime,
+                current_environment,
+                &official_plugin_ids,
+                &mut session_record,
+            )
+            .await?;
+            genome_runtime = runtime;
+            genome_binding = genome_runtime.binding_arc();
+        }
     }
-    // 用户禁用列表最后生效：受管理插件和显式声明都会被剔除。
-    #[cfg(feature = "plugins")]
-    remove_disabled_plugin_manifests(&mut plugin_manifests, &disabled_plugins);
     let (gateway, options, demo_mode, mut startup_notices) = if args.demo {
         let (gateway, options) = build_demo_gateway();
         let options = match genome_binding.as_deref() {

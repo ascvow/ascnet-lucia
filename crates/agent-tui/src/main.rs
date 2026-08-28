@@ -82,6 +82,8 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use crossterm::event::MouseEvent;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use evidence::{load_evidence_runtime, EvidenceRuntime};
+#[cfg(feature = "plugins")]
+use genome_session::upgrade_default_official_plugin_environment;
 use genome_session::{
     bootstrap_default_genome_runtime, load_genome_session_runtime, GenomeSessionRuntime,
     InitialGenomeInputs, DEFAULT_GENOME_LINEAGE, DEMO_GENOME_LINEAGE,
@@ -93,7 +95,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 #[cfg(feature = "plugins")]
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::{
     path::Path,
     path::PathBuf,
