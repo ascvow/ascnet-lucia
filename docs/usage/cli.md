@@ -1,6 +1,6 @@
 # CLI 使用
 
-`lucia` 的无子命令形式启动 TUI；`doctor`、`episode`、`evolution` 和 `plugin` 是执行完即退出的管理命令。纯 Core 构建不包含 `plugin` 子命令和 `--plugin-manifest` 参数。
+`lucia` 的无子命令形式启动 TUI；`doctor`、`episode` 和 `evolution` 是执行完即退出的诊断或证据命令。插件安装、更新、启停和移除只通过 TUI `/plugins` 页面完成。纯 Core 构建不包含 `--plugin-manifest` 参数和插件管理页。
 
 ## 命令结构
 
@@ -9,10 +9,7 @@ lucia [启动参数]
 lucia doctor [--json] [--network]
 lucia episode <list|inspect|export> [参数]
 lucia evolution <操作> [参数]
-lucia plugin <操作> [参数]
 ```
-
-插件子命令的完整用法见[插件管理](/usage/plugin-management)。
 
 ## 启动参数
 

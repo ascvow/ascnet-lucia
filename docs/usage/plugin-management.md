@@ -1,113 +1,30 @@
 # 插件管理
 
-插件版 `lucia` 使用 `agent-plugin-manager` 管理下载、完整性、SemVer 依赖、启用状态和独占能力。Plugin Host 只加载已经验证的运行时配置，不参与安装。
+插件管理只在 Lucia TUI 中提供。启动插件版 `lucia`，输入 `/plugins` 打开人工管理页。页面显示
+受管理插件的固定版本、启用状态、Bundle SHA-256，以及当前 Stable Revision 和
+`PluginEnvironmentDigest`。
 
-## 搜索
+常用按键：
 
-```bash
-lucia plugin search
-lucia plugin search mcp
-```
+- `g`：从 Registry 安装 `name[@semver]`；
+- `h`：从 GitHub Release 安装预构建 Bundle；
+- `i`：从本地 Bundle 目录安装；
+- `t` / `u`：从 Registry 或本地 Bundle 更新高亮插件；
+- `b`：输入插件 ID 和历史版本，从 Installed Version History 人工回滚；
+- `e`：启用或禁用；
+- `o` / `w`：选择或清除 Capability Owner；
+- `x`：二次确认后移除；
+- `r`：刷新锁文件和冻结环境。
 
-`query` 是可选的位置参数，按插件名称和说明过滤 Registry。搜索只返回与当前插件 ABI 兼容的版本，不安装任何内容。
+人工更新、移除和回滚会保留受 SHA-256 约束的旧 Bundle，并在页面显示为
+`Installed Version History`。它只用于 Replay 和人工回滚，不是 Evolution Lineage，Evolver
+不能选择这些版本。
 
-## 安装
+插件写操作要求 TUI 已通过 `[genome] stable` 绑定可发布的 Stable Genome。每次真实变化创建
+`RevisionOrigin::PluginManagement` 人工基线，不生成 EvolutionCertificate，不显示为
+`EVOLVED`。当前 Session 保持启动时的精确插件快照，新 Session 使用新基线；旧 Candidate
+不能跨插件环境 Promotion。提交失败时 Plugin Manager 恢复到操作前的锁文件和 Bundle 状态。
 
-### 从 Registry 安装
-
-```bash
-lucia plugin install mcp
-lucia plugin install mcp@^0.1
-lucia plugin install mcp --disabled
-```
-
-`source` 使用 `name[@semver]`。未指定版本时选择当前 ABI 下最高兼容版本，并先求解必需依赖。`--disabled` 只完成安装和锁文件更新，不让插件进入运行时组合。
-
-### 从 GitHub Release 安装
-
-```bash
-lucia plugin install owner/example-plugin --github
-lucia plugin install owner/example-plugin --github --tag v1.2.0
-lucia plugin install owner/example-plugin --github --asset lucia-plugin-example.zip
-```
-
-- `--github`：把 `source` 解释为 `owner/repository` 或完整 GitHub URL，绕过 Registry 依赖求解。
-- `--tag <tag>`：指定 Release tag；省略时使用 latest release。
-- `--asset <name>`：指定 Release 中的 ZIP asset；省略时按 bundle 规则选择。
-
-私有仓库可通过 `GITHUB_TOKEN` 授权。安装器不会克隆或构建源码，也不会执行插件代码；它只接受包含一个 `plugin.toml` 的预构建 ZIP，并拒绝符号链接、特殊文件和路径穿越。
-
-### 从本地 bundle 安装
-
-```bash
-lucia plugin install ./dist/example-plugin --local
-```
-
-`--local` 要求 `source` 是本地目录，目录根必须包含 `plugin.toml` 和 manifest 指向的 WASM 文件。安装器复制并校验 bundle，不引用原目录继续运行，因此原目录后续修改不会自动生效。
-
-## 查看与更新
-
-```bash
-lucia plugin list
-lucia plugin outdated
-lucia plugin update mcp
-lucia plugin update
-```
-
-- `list`：显示全部受管理插件的版本、来源和启用状态。
-- `outdated`：列出 Registry 中存在更高兼容版本的插件。
-- `update <id>`：更新一个插件。
-- `update`：更新全部存在兼容新版本的插件。
-
-更新会先完成 ZIP、SHA-256、manifest、依赖和能力校验，再原子切换锁记录；失败时旧版本保持可用。
-
-## 启用、禁用与删除
-
-```bash
-lucia plugin enable example-plugin
-lucia plugin disable example-plugin
-lucia plugin remove example-plugin
-```
-
-`id` 是 manifest 中的稳定插件 ID，不是 Registry 搜索名称。启用前会验证必需依赖已经安装并启用、版本满足约束且依赖图无循环。删除会检查依赖关系，不能静默破坏仍启用插件的必需依赖。
-
-## 选择独占能力
-
-```bash
-lucia plugin select agent.tool-policy permission
-lucia plugin unselect agent.tool-policy
-```
-
-`capability` 是 manifest 声明的稳定能力 ID，`plugin` 是提供该能力的插件 ID。多个已启用插件声明同一 `exclusive` 能力时，必须用 `select` 指定 owner；选择操作同时确保目标插件已启用。`unselect` 清除选择，之后若仍有多个候选，运行时检查会要求重新选择。
-
-## 安装位置与运行时优先级
-
-受管理插件安装到：
-
-```text
-$LUCIA_HOME/plugins/<id>/<version>/
-```
-
-锁文件是 `$LUCIA_HOME/plugins.lock.toml`，记录来源、启用状态、manifest 路径和 bundle SHA-256。普通启动按优先级合并以下来源：
-
-1. `--plugin-manifest` 和配置文件 `[[plugins]]`。
-2. `$LUCIA_HOME/plugins/<bundle>/plugin.toml` 自动发现的用户 bundle。
-3. `lucia plugin install` 管理的已启用插件。
-4. `$LUCIA_HOME/official-plugins/<bundle>/plugin.toml` 自动发现的官方 bundle。
-同 ID 的高优先级来源覆盖低优先级来源。配置文件中的 `disabled_plugins` 最后生效，按插件 ID 从最终组合中剔除任意来源的插件：
-
-```toml
-disabled_plugins = ["teammate", "plan"]
-```
-诊断最终组合使用：
-
-```bash
-lucia doctor
-lucia doctor --network
-```
-
-## 安全与版本边界
-
-插件服务版本、manifest `api_version`、插件 crate 版本和 `plugins.lock.toml` schema 是独立维度。升级其中一个不代表其他版本自动变化。
-
-manifest 权限决定 Host 能否为插件开放文件读取、进程或 Agent Runtime 能力。`process_exec` 是完整原生进程信任，不是 WASM 沙箱内的弱权限；安装第三方插件前应检查其 [Manifest 与权限](/host/manifest-capabilities)。
+Lucia 不会自主修改、生成、组合、升级、启停或重新配置插件。插件源码开发、Component 构建、
+签名、发布和 smoke test 仍由用户、开发者与 CI 人工完成。完整的安全、优先级和事务说明见
+[插件管理指南](/guide/plugin-management)。

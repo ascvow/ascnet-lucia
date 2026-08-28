@@ -54,7 +54,7 @@ bun run build:tui:plugins
 target/plugin-tui/release/lucia
 ```
 
-该版本只提供 Plugin Host，不附带或自动发现功能插件。运行时加载 `lucia plugin install` 管理的已启用插件，以及配置 `[[plugins]]` 和 `--plugin-manifest` 明确指定的插件；同 ID 的显式 manifest 优先。
+该版本只提供 Plugin Host，不附带功能插件。运行时加载 TUI `/plugins` 人工管理的已启用插件，以及配置 `[[plugins]]` 和 `--plugin-manifest` 明确指定的插件；同 ID 的显式 manifest 优先。
 
 该版本包含 Plugin Host、WASM component 加载、依赖解析、插件服务和插件 TUI。
 
@@ -90,9 +90,9 @@ git push origin v0.1.0
 
 ## 管理命令
 
-插件版 `lucia` 同时包含 `lucia plugin` 和全局 `lucia doctor`。插件管理器仍是独立 library
-crate，负责下载、安装和完整性规则，但不再分发单独的 `agent-plugin` 可执行程序。纯 Core
-版本保留 `lucia doctor`，并跳过插件运行时检查。
+插件版 `lucia` 在 TUI 内提供 `/plugins` 人工管理页，并保留全局只读诊断 `lucia doctor`。
+插件管理器仍是独立 library crate，负责下载、安装、完整性与补偿恢复规则，但不分发单独的
+插件管理可执行程序。纯 Core 版本保留 `lucia doctor`，并跳过插件运行时检查。
 
 ## 本地安装
 
@@ -116,7 +116,7 @@ bun run install:tui
 bun run install:tui:core
 ```
 
-安装后可用 `lucia plugin search` 查看 Registry，并用 `lucia plugin install <id>` 逐个选择能力。两个 TUI 版本的命令名均为 `lucia`，因此同一 Cargo bin 目录内后安装的版本会覆盖前一个。分发两个压缩包时应使用独立 `--target-dir` 构建，并在归档名称中区分 `lucia-core` 与 `lucia-plugins`。
+安装插件版后启动 `lucia`，输入 `/plugins` 从 Registry、GitHub Release 或本地 Bundle 人工选择能力。两个 TUI 版本的命令名均为 `lucia`，因此同一 Cargo bin 目录内后安装的版本会覆盖前一个。分发两个压缩包时应使用独立 `--target-dir` 构建，并在归档名称中区分 `lucia-core` 与 `lucia-plugins`。
 
 ## 验证边界
 

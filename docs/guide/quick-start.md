@@ -29,10 +29,10 @@ cargo run -p agent-basic-cli -- --demo "你好"
 
 ```bash
 bun run install:tui
-lucia plugin install context
 lucia --demo
 ```
 
+进入 TUI 后输入 `/plugins`，再从 Registry、GitHub Release 或本地 Bundle 人工安装插件。
 `--demo` 强制使用内置模型。退出后直接运行 `lucia` 即可按配置连接真实服务。
 
 首次运行时，Lucia 会创建 `$HOME/.lucia/config.toml`。也可以只初始化配置并退出：

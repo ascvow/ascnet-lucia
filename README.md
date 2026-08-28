@@ -130,11 +130,13 @@ To use the plugin loader, install Bun and run:
 
 ```bash
 bun run install:tui
-lucia plugin install context
 lucia --demo
 ```
 
-`install:tui` only builds and installs the `lucia` binary with Plugin Host support. It does not install or enable feature plugins. Users choose capabilities with `lucia plugin search` and `lucia plugin install <id>`; official and third-party plugins use the same installation, permission, and lifecycle contracts.
+`install:tui` 只构建并安装带 Plugin Host 的 `lucia`，不会自动安装或启用功能插件。启动 Lucia
+后输入 `/plugins`，通过 TUI 人工安装、更新、回滚和管理官方或第三方插件。每次真实变化都会创建
+`PluginManagement` 人工基线；当前 Session 保持启动时快照。旧 Bundle 保留在 Installed Version
+History 中，只用于人工回滚与 Replay，Evolver 不能从中选择版本。
 
 To build without installing:
 

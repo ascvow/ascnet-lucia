@@ -29,7 +29,7 @@ cargo run -p agent-basic-cli -- --demo \
 bun run build:tui:core
 ```
 
-产物位于 `target/core-tui/release/lucia`。该版本不编译 Plugin Host、Wasmtime 或插件 UI，也没有 `lucia plugin` 和 `--plugin-manifest`，但保留模型、原生工具、会话、ContextLoader 和事件日志。
+产物位于 `target/core-tui/release/lucia`。该版本不编译 Plugin Host、Wasmtime 或 `/plugins` 管理页，也没有 `--plugin-manifest`，但保留模型、原生工具、会话、ContextLoader 和事件日志。
 
 ### 插件版 TUI
 

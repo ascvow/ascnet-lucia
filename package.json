@@ -30,7 +30,6 @@
     "build:plugin:all": "bun run scripts/build-plugin.ts mcp-plugin teammate-plugin plan-plugin permission-plugin echo-plugin ui-showcase-plugin agent-runtime-plugin workflow-plugin",
     "init:tui": "cargo run -p lucia -- --init",
     "run:tui:demo": "cargo run -p lucia -- --demo",
-    "plugin": "cargo run -p lucia -- plugin",
     "test:session": "cargo test -p agent-session",
     "test:agent-runtime": "cargo test -p agent-runtime",
     "test:tui:core": "cargo test -p lucia --no-default-features",

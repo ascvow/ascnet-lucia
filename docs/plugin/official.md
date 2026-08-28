@@ -6,11 +6,10 @@
 
 ```bash
 bun run install:tui
-lucia plugin search
-lucia plugin install mcp
+lucia
 ```
 
-`install:tui` 安装 TUI、原生 Command、原生 Skill 和原生 Context；其他官方插件与第三方插件使用相同的 Registry、本地目录或 GitHub Release 安装流程，只有用户显式安装且启用的插件才进入运行时。开发目录也可以通过 `--plugin-manifest` 临时加载。
+`install:tui` 安装 TUI、原生 Command、原生 Skill 和原生 Context；启动后输入 `/plugins`，官方插件与第三方插件使用相同的 Registry、本地目录或 GitHub Release 人工安装流程，只有用户显式安装且启用的插件才进入新 Session。开发目录也可以通过 `--plugin-manifest` 临时加载。
 
 仓库开发环境执行 `bun run install:all` 时，会把官方清单中的 bundle 更新到 `$LUCIA_HOME/official-plugins`。清单通过 `replaces` 声明插件改名关系，同步时只删除被明确替代的旧官方 bundle，避免新旧插件同时提供同一独占能力。Loader 也会自动扫描该目录和 `$LUCIA_HOME/plugins`，配置中的 `disabled_plugins` 仍可按 ID 排除自动发现的插件。
 
@@ -41,9 +40,9 @@ Evidence 运行不扫描可变目录，而是从 Genome 固定的 Artifact CAS �
 
 ## 原生 Command
 
-Command 是 TUI 默认原生状态机，负责斜杠命令补全、参数校验、执行编排和会话 Dialog，不经过 Plugin Host。内置命令包括 `/help`、`/resume`、`/new`、`/sessions`、`/clear`、`/compact` 与 `/exit`；`/quit` 是 `/exit` 的别名。`/resume` 和 `/sessions` 只先加载当前项目的轻量摘要，完整 Session 仍只在用户确认后按 revision 校验并加载。
+Command 是 TUI 默认原生状态机，负责斜杠命令补全、参数校验、执行编排和会话 Dialog，不经过 Plugin Host。插件构建还提供人工管理命令 `/plugins`；它不进入 Plugin Host，也不属于 Evolution。其余内置命令包括 `/help`、`/resume`、`/new`、`/sessions`、`/clear`、`/compact` 与 `/exit`；`/quit` 是 `/exit` 的别名。`/resume` 和 `/sessions` 只先加载当前项目的轻量摘要，完整 Session 仍只在用户确认后按 revision 校验并加载。
 
-实现位于 `crates/agent-tui/src/native_command.rs`，纯 Core 构建同样提供这些命令；`/compact` 在没有 Context Loader 时返回可见说明，不伪造压缩结果。
+实现位于 `crates/agent-tui/src/native_command.rs`，纯 Core 构建提供除 `/plugins` 外的原生命令；`/compact` 在没有 Context Loader 时返回可见说明，不伪造压缩结果。
 
 ## Teammate 插件
 

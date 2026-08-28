@@ -11,7 +11,7 @@ bun run install:tui
 lucia
 ```
 
-`install:tui` 会构建插件版 `lucia` 并安装到 Cargo bin 目录，不会安装任何功能插件。启动时会加载 `lucia plugin install` 管理的已启用插件，并自动扫描 `$LUCIA_HOME/plugins` 与 `$LUCIA_HOME/official-plugins` 的直接子目录；未设置 `LUCIA_HOME` 时，应用目录是 `$HOME/.lucia`。
+`install:tui` 会构建插件版 `lucia` 并安装到 Cargo bin 目录，不会安装任何功能插件。启动时会加载 TUI `/plugins` 人工管理且已经启用的插件，并自动扫描 `$LUCIA_HOME/plugins` 与 `$LUCIA_HOME/official-plugins` 的直接子目录；未设置 `LUCIA_HOME` 时，应用目录是 `$HOME/.lucia`。
 
 第一次启动会创建 `$LUCIA_HOME/config.toml`。配置不存在或模型密钥不可用时，TUI 使用本地演示模型；也可以显式运行：
 
@@ -107,6 +107,7 @@ Revision，但不会取消上述行为绑定。
 
 - `/resume`：打开当前项目的会话列表，选中后恢复完整会话。
 - `/sessions`：只读浏览当前项目的会话摘要。
+- `/plugins`：打开人工插件管理页；变更创建新 Stable 基线，当前 Session 不热重载。
 - `/compact`：请求原生 Context Loader 立即压缩当前上下文。
 
 命令名称在本地同步补全，不依赖插件加载状态；默认插件版与纯 Core 版都提供斜杠命令和会话 Dialog。
