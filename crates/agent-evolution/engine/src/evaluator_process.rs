@@ -647,6 +647,7 @@ mod tests {
     }
 
     /// 子进程环境必须在复制白名单前清空，不能继承调用方显式注入的生产凭据。
+    #[cfg(unix)]
     #[tokio::test]
     async fn evaluator_environment_drops_non_allowlisted_secrets() {
         let mut command = Command::new("/usr/bin/env");
