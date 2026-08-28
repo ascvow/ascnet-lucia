@@ -27,6 +27,7 @@ mod genome_diff;
 mod genome_store;
 mod history;
 mod inheritance;
+mod intervention_queue;
 mod issue_observation;
 mod metrics;
 mod outbox;
@@ -105,6 +106,10 @@ pub use inheritance::{
     verify_inheritance, InheritanceObservation, InheritanceObservationKind,
     InheritanceVerificationError, InheritanceVerificationInput,
 };
+pub use intervention_queue::{
+    FileInterventionQueue, InterventionQueue, InterventionQueueError, InterventionQueueItemV1,
+    INTERVENTION_QUEUE_SCHEMA_VERSION, MAX_INTERVENTION_QUEUE_ITEM_BYTES,
+};
 pub use issue_observation::{
     FileIssueObservationStore, IssueObservation, IssueObservationError, IssueObservationStore,
     ISSUE_OBSERVATION_SCHEMA_VERSION,
@@ -116,9 +121,12 @@ pub use metrics::{
     Rate, RegressionRetention, RelativeDelta, ResourceAverages, ResourceComparison, ResourceDelta,
     SafetyComparison, SafetyMetrics, StabilityMetrics,
 };
-pub use outbox::{EvolutionOutbox, EvolutionOutboxItem, FileEvolutionOutbox, OutboxError};
+pub use outbox::{
+    EvolutionOutbox, EvolutionOutboxItem, FileEvolutionOutbox, LegacyOutboxMigrationError,
+    OutboxError,
+};
 pub use outcome_revision::{FileOutcomeRevisionStore, OutcomeRevisionError, OutcomeRevisionStore};
-pub use pipeline::{EvolutionPipeline, PipelineError};
+pub use pipeline::{EvolutionPipeline, PipelineError, PipelineWriteSummary};
 pub use prompt_cycle::{PromptCycleError, PromptEvolutionCycle};
 pub use prompt_mutation::{
     BoundedPromptMutator, MutationProposalContext, PromptMutationDraft, PromptMutationError,

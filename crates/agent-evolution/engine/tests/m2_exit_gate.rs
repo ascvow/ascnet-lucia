@@ -7,7 +7,8 @@ use agent_core::{
 use agent_evolution::{
     attribute_failures, load_episode_evidence, EpisodeEvidence, EpisodeRecorder,
     EpisodeRecorderConfig, EpisodeRecorderHub, EvolutionOutbox, EvolutionPipeline,
-    FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox, FileOutcomeRevisionStore,
+    FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox, FileInterventionQueue,
+    FileOutcomeRevisionStore, PipelineWriteSummary,
 };
 use agent_evolution_protocol::{
     FailureDisposition, FailureKind, GenomeDigest, GenomeRevisionId, IncidentKind, IncidentStatus,
@@ -60,7 +61,7 @@ async fn close_and_process(
     resolution: OutcomeResolution,
 ) -> (
     EpisodeEvidence,
-    usize,
+    PipelineWriteSummary,
     Vec<agent_evolution::EvolutionOutboxItem>,
 ) {
     let episode_id = recorder
@@ -71,8 +72,10 @@ async fn close_and_process(
         .await
         .expect("应从只追加 Store 与 CAS 恢复证据");
     let outbox = Arc::new(FileEvolutionOutbox::new(root.join("outbox")));
+    let interventions = Arc::new(FileInterventionQueue::new(root.join("interventions")));
     let revisions = Arc::new(FileOutcomeRevisionStore::new(root.join("revisions")));
-    let pipeline = EvolutionPipeline::new(Arc::clone(&outbox), revisions);
+    let pipeline = EvolutionPipeline::new(Arc::clone(&outbox), revisions)
+        .with_intervention_queue(interventions);
     let written = pipeline
         .process_episode(
             &evidence.episode,

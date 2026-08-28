@@ -1,14 +1,17 @@
 //! Turn 结束后的进化外循环编排。
 //!
-//! 该模块把监督证据转化为失败归因、聚合 Issue、更新 Outcome 修订并写入
-//! Evolution Outbox。它不运行在 ReACT 主循环内，由应用层在 `EpisodeRecorder`
-//! 收敛后显式调用。
+//! 该模块把监督证据转化为失败归因、聚合 Issue、更新 Outcome 修订，并把进化候选与
+//! 人工干预请求写入各自队列。它不运行在 ReACT 主循环内，由应用层在
+//! `EpisodeRecorder` 收敛后显式调用。
 
 use crate::{
-    attribute_failures, EvolutionOutbox, EvolutionOutboxItem, IssueAggregator, IssueObservation,
-    IssueObservationStore, OutcomeRevisionStore,
+    attribute_failures, EvolutionOutbox, EvolutionOutboxItem, InterventionQueue,
+    InterventionQueueItemV1, IssueAggregator, IssueObservation, IssueObservationStore,
+    OutcomeRevisionStore,
 };
-use agent_evolution_protocol::{FailureDisposition, GenomeDigest, OutcomeRevision};
+use agent_evolution_protocol::{
+    EvolutionIssueId, FailureDisposition, GenomeDigest, OutcomeRevision,
+};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -23,6 +26,7 @@ where
     revisions: Arc<R>,
     aggregator: tokio::sync::Mutex<IssueAggregator>,
     observations: Option<Arc<dyn IssueObservationStore>>,
+    interventions: Option<Arc<dyn InterventionQueue>>,
 }
 
 impl<O, R> EvolutionPipeline<O, R>
@@ -37,6 +41,7 @@ where
             revisions,
             aggregator: tokio::sync::Mutex::new(IssueAggregator::new()),
             observations: None,
+            interventions: None,
         }
     }
 
@@ -49,23 +54,35 @@ where
         self
     }
 
+    /// 配置独立人工干预队列。
+    ///
+    /// 未配置时遇到人工处置会失败关闭，绝不回落写入 Evolution Outbox。
+    pub fn with_intervention_queue<Q>(mut self, queue: Arc<Q>) -> Self
+    where
+        Q: InterventionQueue + 'static,
+    {
+        self.interventions = Some(queue);
+        self
+    }
+
     /// 处理一条已收敛 Episode 的监督证据。
     ///
-    /// 步骤：归因 → 逐条聚合 → 非 Observe/Ignore 处置写入 Outbox → 更新 Outcome 修订。
-    /// 返回写入 Outbox 的记录数。
+    /// 步骤：归因 → 逐条聚合 → 按处置分流到 Evolution Outbox 或人工干预队列。
+    /// 返回两个队列各自的成功写入数；`Observe` 与 `Ignore` 不创建任务。
     ///
     /// `genome_digest` 由调用方从已解析的 Genome 提供，聚合器不反向依赖 Genome Registry。
     ///
     /// # Errors
     ///
-    /// Outbox 或修订存储写入失败时返回错误，已写入的记录不会回滚。
+    /// 队列或修订存储写入失败、人工队列缺失，或 Episode 结束后仍出现
+    /// `RetryInTurn` 时返回错误；已写入的记录不会回滚。
     pub async fn process_episode(
         &self,
         episode: &agent_evolution_protocol::Episode,
         incidents: &[agent_evolution_protocol::Incident],
         genome_digest: &GenomeDigest,
         current_revision: Option<&OutcomeRevision>,
-    ) -> Result<usize, PipelineError> {
+    ) -> Result<PipelineWriteSummary, PipelineError> {
         for incident in incidents {
             incident
                 .validate()
@@ -100,7 +117,6 @@ where
             }
         }
         let records = attribute_failures(&episode.episode_id, incidents, &episode.failures);
-        let mut written = 0;
         let decisions = if let Some(store) = &self.observations {
             let mut aggregator = IssueAggregator::new();
             for observation in store.all().await.map_err(PipelineError::IssueObservation)? {
@@ -147,35 +163,114 @@ where
                 .collect::<Vec<_>>()
         };
 
-        for (issue, disposition) in decisions {
-            if matches!(
-                disposition,
-                FailureDisposition::Observe | FailureDisposition::Ignore
-            ) {
-                continue;
+        // 写入前先验证所有路由所需能力，避免同一 Episode 只提交一部分确定性任务。
+        for (issue, disposition) in &decisions {
+            match disposition {
+                FailureDisposition::RetryInTurn => {
+                    return Err(PipelineError::RetryInTurnAfterEpisode(
+                        issue.issue_id.clone(),
+                    ));
+                }
+                FailureDisposition::ManualReview
+                | FailureDisposition::PlatformEngineering
+                | FailureDisposition::PluginMaintenance
+                | FailureDisposition::SecurityIncident
+                | FailureDisposition::InfrastructureOperations
+                    if self.interventions.is_none() =>
+                {
+                    return Err(PipelineError::InterventionQueueUnavailable(*disposition));
+                }
+                FailureDisposition::Ignore
+                | FailureDisposition::Observe
+                | FailureDisposition::EvolutionCandidate
+                | FailureDisposition::ManualReview
+                | FailureDisposition::PlatformEngineering
+                | FailureDisposition::PluginMaintenance
+                | FailureDisposition::SecurityIncident
+                | FailureDisposition::InfrastructureOperations => {}
             }
-
-            let item = EvolutionOutboxItem {
-                outbox_id: format!("out_{}", Uuid::new_v4().simple()),
-                episode_id: episode.episode_id.clone(),
-                outcome: episode
-                    .outcome
-                    .clone()
-                    .unwrap_or(agent_evolution_protocol::Outcome::Unverifiable),
-                disposition,
-                issue_id: Some(issue.issue_id.clone()),
-                issue_status: issue.status,
-                created_at_ms: episode.finished_at_ms,
-                consumed: false,
-            };
-            self.outbox
-                .append(&item)
-                .await
-                .map_err(PipelineError::Outbox)?;
-            written += 1;
         }
 
-        Ok(written)
+        let mut summary = PipelineWriteSummary::default();
+        for (issue, disposition) in decisions {
+            let outcome = episode
+                .outcome
+                .clone()
+                .unwrap_or(agent_evolution_protocol::Outcome::Unverifiable);
+            match disposition {
+                FailureDisposition::EvolutionCandidate => {
+                    let item = EvolutionOutboxItem {
+                        outbox_id: format!("out_{}", Uuid::new_v4().simple()),
+                        episode_id: episode.episode_id.clone(),
+                        outcome,
+                        disposition,
+                        issue_id: Some(issue.issue_id.clone()),
+                        issue_status: issue.status,
+                        created_at_ms: episode.finished_at_ms,
+                        consumed: false,
+                    };
+                    self.outbox
+                        .append(&item)
+                        .await
+                        .map_err(PipelineError::Outbox)?;
+                    summary.evolution_candidates_written += 1;
+                }
+                FailureDisposition::ManualReview
+                | FailureDisposition::PlatformEngineering
+                | FailureDisposition::PluginMaintenance
+                | FailureDisposition::SecurityIncident
+                | FailureDisposition::InfrastructureOperations => {
+                    let queue = self
+                        .interventions
+                        .as_ref()
+                        .ok_or(PipelineError::InterventionQueueUnavailable(disposition))?;
+                    let request = InterventionQueueItemV1::create(
+                        episode.episode_id.clone(),
+                        outcome,
+                        disposition,
+                        Some(issue.issue_id),
+                        issue.status,
+                        Some(issue.fingerprint.failure_class),
+                        None,
+                        episode.finished_at_ms,
+                    )
+                    .map_err(PipelineError::InterventionQueue)?;
+                    queue
+                        .append(&request)
+                        .await
+                        .map_err(PipelineError::InterventionQueue)?;
+                    summary.interventions_written += 1;
+                }
+                FailureDisposition::Observe | FailureDisposition::Ignore => {}
+                FailureDisposition::RetryInTurn => {
+                    return Err(PipelineError::RetryInTurnAfterEpisode(issue.issue_id));
+                }
+            }
+        }
+
+        Ok(summary)
+    }
+}
+
+/// 一次 Episode 分流成功写入两个独立队列的数量。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PipelineWriteSummary {
+    /// 写入 Evolution Outbox 的进化候选数。
+    pub evolution_candidates_written: usize,
+    /// 写入人工干预队列的请求数。
+    pub interventions_written: usize,
+}
+
+impl PipelineWriteSummary {
+    /// 返回本次写入的任务总数，用于旧调用方逐步迁移。
+    pub fn total_written(self) -> usize {
+        self.evolution_candidates_written + self.interventions_written
+    }
+}
+
+impl PartialEq<usize> for PipelineWriteSummary {
+    fn eq(&self, other: &usize) -> bool {
+        self.total_written() == *other
     }
 }
 
@@ -185,6 +280,15 @@ pub enum PipelineError {
     /// Outbox 写入失败。
     #[error(transparent)]
     Outbox(crate::OutboxError),
+    /// 人工干预请求构造或写入失败。
+    #[error(transparent)]
+    InterventionQueue(crate::InterventionQueueError),
+    /// 处置要求人工介入，但应用层没有配置人工队列。
+    #[error("人工处置要求独立队列，但当前未配置：{0:?}")]
+    InterventionQueueUnavailable(FailureDisposition),
+    /// Turn 已结束后不允许再执行 Turn 内重试。
+    #[error("Issue {0} 在 Episode 收敛后仍请求 Turn 内重试")]
+    RetryInTurnAfterEpisode(EvolutionIssueId),
     /// Outcome 修订写入失败。
     #[error(transparent)]
     OutcomeRevision(crate::OutcomeRevisionError),
@@ -218,7 +322,8 @@ mod tests {
     use super::*;
     use crate::{
         EpisodeStore, EvolutionOutbox, FileEpisodeStore, FileEvolutionOutbox,
-        FileIssueObservationStore, FileOutcomeRevisionStore, OutcomeRevisionStore,
+        FileInterventionQueue, FileIssueObservationStore, FileOutcomeRevisionStore,
+        InterventionQueue, OutcomeRevisionStore,
     };
     use agent_evolution_protocol::{
         ArtifactDigest, ArtifactRef, ComponentRef, DetectorRef, Episode, EpisodeDataPolicy,
@@ -368,12 +473,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safety_failure_goes_to_outbox_immediately() {
+    async fn safety_failure_goes_only_to_intervention_queue() {
         let root = temp_root();
         let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
         let outbox = Arc::new(FileEvolutionOutbox::new(root.join("outbox")));
+        let interventions = Arc::new(FileInterventionQueue::new(root.join("interventions")));
         let revisions = Arc::new(FileOutcomeRevisionStore::new(root.join("revisions")));
-        let pipeline = EvolutionPipeline::new(outbox.clone(), revisions.clone());
+        let pipeline = EvolutionPipeline::new(outbox.clone(), revisions.clone())
+            .with_intervention_queue(interventions.clone());
 
         let mut episode = episode();
         episode.outcome = Some(Outcome::SafetyFailure);
@@ -388,9 +495,92 @@ mod tests {
             .await
             .expect("应处理");
         assert_eq!(written, 1);
+        assert_eq!(written.evolution_candidates_written, 0);
+        assert_eq!(written.interventions_written, 1);
 
         let pending = outbox.pending().await.expect("应读取 Outbox");
+        assert!(pending.is_empty());
+        let pending = interventions.pending().await.expect("应读取人工队列");
         assert_eq!(pending[0].disposition, FailureDisposition::SecurityIncident);
+        assert_eq!(
+            pending[0].failure_kind,
+            Some(FailureKind::PermissionFailure)
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// 插件故障与基础设施故障必须进入人工队列，不能污染进化候选。
+    #[tokio::test]
+    async fn plugin_and_infrastructure_failures_route_to_intervention_queue() {
+        let root = temp_root();
+        let outbox = Arc::new(FileEvolutionOutbox::new(root.join("outbox")));
+        let interventions = Arc::new(FileInterventionQueue::new(root.join("interventions")));
+        let revisions = Arc::new(FileOutcomeRevisionStore::new(root.join("revisions")));
+        let pipeline = EvolutionPipeline::new(outbox.clone(), revisions)
+            .with_intervention_queue(interventions.clone());
+
+        let plugin_episode = episode();
+        let mut plugin_incident = incident(&plugin_episode.episode_id);
+        plugin_incident.kind = IncidentKind::PluginTrap;
+        plugin_incident.component = ComponentRef::PluginHost;
+        let plugin_written = pipeline
+            .process_episode(&plugin_episode, &[plugin_incident], &digest(), None)
+            .await
+            .expect("插件故障应完成分流");
+        assert_eq!(plugin_written.evolution_candidates_written, 0);
+        assert_eq!(plugin_written.interventions_written, 1);
+
+        let infrastructure_episode = episode();
+        let mut infrastructure_incident = incident(&infrastructure_episode.episode_id);
+        infrastructure_incident.kind = IncidentKind::StorageFailure;
+        infrastructure_incident.component = ComponentRef::Storage;
+        let infrastructure_written = pipeline
+            .process_episode(
+                &infrastructure_episode,
+                &[infrastructure_incident],
+                &digest(),
+                None,
+            )
+            .await
+            .expect("基础设施故障应完成分流");
+        assert_eq!(infrastructure_written.evolution_candidates_written, 0);
+        assert_eq!(infrastructure_written.interventions_written, 1);
+
+        assert!(outbox.pending().await.expect("应读取 Outbox").is_empty());
+        let pending = interventions.pending().await.expect("应读取人工队列");
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().any(|item| {
+            item.disposition == FailureDisposition::PluginMaintenance
+                && item.failure_kind == Some(FailureKind::PluginFailure)
+        }));
+        assert!(pending.iter().any(|item| {
+            item.disposition == FailureDisposition::InfrastructureOperations
+                && item.failure_kind == Some(FailureKind::EnvironmentFailure)
+        }));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// 应用层遗漏人工队列时必须失败关闭，Evolution Outbox 保持为空。
+    #[tokio::test]
+    async fn missing_intervention_queue_fails_closed() {
+        let root = temp_root();
+        let outbox = Arc::new(FileEvolutionOutbox::new(root.join("outbox")));
+        let revisions = Arc::new(FileOutcomeRevisionStore::new(root.join("revisions")));
+        let pipeline = EvolutionPipeline::new(outbox.clone(), revisions);
+        let episode = episode();
+        let mut incident = incident(&episode.episode_id);
+        incident.kind = IncidentKind::PluginTrap;
+        incident.component = ComponentRef::PluginHost;
+
+        assert!(matches!(
+            pipeline
+                .process_episode(&episode, &[incident], &digest(), None)
+                .await,
+            Err(PipelineError::InterventionQueueUnavailable(
+                FailureDisposition::PluginMaintenance
+            ))
+        ));
+        assert!(outbox.pending().await.expect("应读取 Outbox").is_empty());
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }
