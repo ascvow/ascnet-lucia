@@ -16,7 +16,7 @@ mod genome_session;
 mod host_actions;
 mod native_command;
 #[cfg(feature = "plugins")]
-mod plugin_cli;
+mod plugin_management;
 #[cfg(feature = "plugins")]
 mod plugin_startup;
 mod session_coordination;
@@ -26,6 +26,8 @@ use conversation::*;
 #[cfg(feature = "plugins")]
 use host_actions::*;
 use native_command::*;
+#[cfg(feature = "plugins")]
+use plugin_management::*;
 #[cfg(feature = "plugins")]
 use plugin_startup::*;
 use session_coordination::*;
@@ -161,9 +163,6 @@ enum Command {
     Episode(episode_cli::EpisodeArgs),
     /// 查看可审计的 Evolution Scorecard 与历史分析。
     Evolution(evolution_cli::EvolutionArgs),
-    /// 安装和管理受控插件。
-    #[cfg(feature = "plugins")]
-    Plugin(PluginArgs),
 }
 
 /// 全局诊断参数。
@@ -175,83 +174,6 @@ struct DoctorArgs {
     /// 额外检查 GitHub API 连通性；默认诊断不联网。
     #[arg(long)]
     network: bool,
-}
-
-/// 插件管理命令参数。
-#[cfg(feature = "plugins")]
-#[derive(Debug, ClapArgs)]
-struct PluginArgs {
-    /// 要执行的插件管理操作。
-    #[command(subcommand)]
-    command: PluginCommand,
-}
-
-/// `lucia plugin` 支持的操作。
-#[cfg(feature = "plugins")]
-#[derive(Debug, Subcommand)]
-enum PluginCommand {
-    /// 从 Registry、GitHub Release 或本地 bundle 安装插件。
-    Install {
-        /// Registry 的 name[@semver]、GitHub 仓库或本地 bundle 路径。
-        source: String,
-        /// 从本地 bundle 目录安装，不访问 GitHub。
-        #[arg(long)]
-        local: bool,
-        /// 将来源按 GitHub owner/repository 或 URL 解析，绕过 Registry。
-        #[arg(long)]
-        github: bool,
-        /// 指定 GitHub Release tag；默认使用 latest release。
-        #[arg(long)]
-        tag: Option<String>,
-        /// 指定 GitHub Release 中的 ZIP asset 名称。
-        #[arg(long)]
-        asset: Option<String>,
-        /// 安装完成后保持禁用状态。
-        #[arg(long)]
-        disabled: bool,
-    },
-    /// 搜索官方 Registry 中当前 ABI 可安装的插件。
-    Search {
-        /// 按插件名称或说明过滤；省略时列出全部插件。
-        #[arg(default_value = "")]
-        query: String,
-    },
-    /// 列出 Registry 中存在更高兼容版本的已安装插件。
-    Outdated,
-    /// 将一个或全部已安装插件更新到 Registry 最新兼容版本。
-    Update {
-        /// 要更新的插件 ID；省略时更新全部可更新插件。
-        id: Option<String>,
-    },
-    /// 列出全部受管理插件。
-    List,
-    /// 启用指定插件。
-    Enable {
-        /// 插件稳定 ID。
-        id: String,
-    },
-    /// 禁用指定插件。
-    Disable {
-        /// 插件稳定 ID。
-        id: String,
-    },
-    /// 为独占能力选择 owner，并启用目标插件。
-    Select {
-        /// 稳定能力 ID。
-        capability: String,
-        /// 提供该能力的插件稳定 ID。
-        plugin: String,
-    },
-    /// 清除指定独占能力的 owner 选择。
-    Unselect {
-        /// 稳定能力 ID。
-        capability: String,
-    },
-    /// 移除指定插件。
-    Remove {
-        /// 插件稳定 ID。
-        id: String,
-    },
 }
 
 // ─── UI 事件 ───
@@ -310,6 +232,12 @@ enum UiEvent {
     },
     /// 原生 `/compact` 请求通过当前 Context Loader 重载会话。
     NativeCompactRequested,
+    /// 原生插件管理页完成 Manager 与 Stable 环境读取。
+    #[cfg(feature = "plugins")]
+    NativePluginsLoaded(Result<NativePluginDialogData, String>),
+    /// 原生插件管理页完成人工写操作和 Stable 基线提交。
+    #[cfg(feature = "plugins")]
+    NativePluginActionFinished(Result<PluginManagementOutcome, String>),
     /// 后台会话上下文重载完成。
     SessionContextReloaded(Box<Result<SessionReloadOutcome>>),
     /// 后台会话摘要查询完成，等待回送发起插件。
@@ -393,8 +321,6 @@ async fn main() -> Result<()> {
         Some(Command::Doctor(options)) => doctor::run(&args, options).await,
         Some(Command::Episode(options)) => episode_cli::run(options).await,
         Some(Command::Evolution(options)) => evolution_cli::run(options).await,
-        #[cfg(feature = "plugins")]
-        Some(Command::Plugin(options)) => plugin_cli::run(options).await,
         None => application::run(args).await,
     }
 }

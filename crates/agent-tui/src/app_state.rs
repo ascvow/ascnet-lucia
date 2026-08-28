@@ -75,6 +75,9 @@ pub(crate) struct App {
     pub(crate) context_loader: Arc<dyn ContextLoader>,
     /// 当前进程固定的 Session Genome 行为绑定；独立于 Evidence 隐私开关。
     pub(crate) genome_runtime: GenomeSessionRuntime,
+    /// TUI 人工插件控制面；只在配置了 Stable Genome 的插件构建中存在。
+    #[cfg(feature = "plugins")]
+    pub(crate) plugin_management: Option<Arc<PluginManagementService>>,
     /// 可选 Evidence Plane；启用后每次主会话运行必须形成 Episode。
     pub(crate) evidence: Option<EvidenceRuntime>,
     pub(crate) tx: mpsc::UnboundedSender<UiEvent>,
@@ -294,6 +297,8 @@ impl App {
             genome_runtime: GenomeSessionRuntime::default(),
             #[cfg(test)]
             genome_runtime: GenomeSessionRuntime::TestOnly,
+            #[cfg(feature = "plugins")]
+            plugin_management: None,
             evidence: None,
             tx,
             model_name,
@@ -379,6 +384,16 @@ impl App {
         self
     }
 
+    /// 注入只供 TUI 原生插件页使用的人工管理服务。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn with_plugin_management(
+        mut self,
+        plugin_management: Option<Arc<PluginManagementService>>,
+    ) -> Self {
+        self.plugin_management = plugin_management;
+        self
+    }
+
     /// 注入启动时已经验证 Genome Revision 的 Evidence Plane。
     pub(crate) fn with_evidence(mut self, evidence: Option<EvidenceRuntime>) -> Self {
         self.evidence = evidence;
@@ -398,6 +413,10 @@ impl App {
         self.context_tokens = None;
         self.last_escape_at = None;
         self.native_command.dialog = None;
+        #[cfg(feature = "plugins")]
+        {
+            self.native_command.plugin_dialog = None;
+        }
         self.native_command.dismissed_input = None;
         if let Some(notice) = notice {
             self.messages.push(Msg::new(MsgKind::Info, notice));

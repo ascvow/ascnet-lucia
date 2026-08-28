@@ -73,6 +73,11 @@ pub struct PluginLock {
     /// 当前受管理的插件记录。
     #[serde(default)]
     pub plugins: Vec<InstalledPlugin>,
+    /// 已归档但不参与运行时加载的人工安装版本历史。
+    ///
+    /// 该字段只支持人工回滚和 Replay，不表示 Evolution Lineage，也不能由 Evolver 选择。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub version_history: Vec<InstalledPlugin>,
     /// 独占能力 ID 到启用插件 ID 的选择。
     #[serde(default)]
     pub capability_selection: HashMap<String, String>,
@@ -85,7 +90,7 @@ pub struct PluginLock {
 #[derive(Debug, Clone)]
 pub struct PluginManagerStateSnapshot {
     lock: PluginLock,
-    bundles: BTreeMap<String, Vec<u8>>,
+    bundles: BTreeMap<(String, String), Vec<u8>>,
 }
 
 impl Default for PluginLock {
@@ -93,6 +98,7 @@ impl Default for PluginLock {
         Self {
             schema_version: LOCK_SCHEMA_VERSION,
             plugins: Vec::new(),
+            version_history: Vec::new(),
             capability_selection: HashMap::new(),
         }
     }
@@ -196,8 +202,8 @@ impl PluginManager {
     /// 从本地已验证 bundle 原子替换同 ID 插件，并默认启用新版本。
     ///
     /// 新 bundle 会先完成路径、manifest、WASM、依赖、能力和锁文件校验；任一步失败时保留
-    /// 原版本及锁记录。成功提交新锁记录后才清理旧受管理目录。调用方负责在替换前保留可用于
-    /// 回滚的旧 bundle，不得把本方法当作版本归档。
+    /// 原版本及锁记录。成功提交新锁记录时，旧版本会进入 Installed Version History，保留
+    /// 原 Bundle 用于人工回滚和 Replay；该历史不参与 Evolution。
     ///
     /// # Errors
     ///
@@ -209,7 +215,7 @@ impl PluginManager {
     /// 从本地已验证 bundle 原子替换同 ID 插件，并显式指定替换后的启用状态。
     ///
     /// 该入口供受信发布控制面使用；它不会下载、构建、执行或签名插件，也不会自行扩大
-    /// capability selection。失败时原版本和锁记录保持不变，成功后旧受管理目录才会删除。
+    /// capability selection。失败时原版本和锁记录保持不变，成功后旧版本进入人工版本历史。
     ///
     /// # Errors
     ///
@@ -232,7 +238,7 @@ impl PluginManager {
         self.install_or_replace_with_source(bundle, options, source_description, false)
     }
 
-    /// 从已验证目录替换同 ID 插件；新版本完成校验并写入锁文件后才清理旧目录。
+    /// 从已验证目录替换同 ID 插件；新版本完成校验后把旧版本归档到人工版本历史。
     pub(crate) fn replace_with_source(
         &self,
         bundle: impl AsRef<Path>,
@@ -330,7 +336,11 @@ impl PluginManager {
             } else {
                 lock.plugins.push(installed.clone());
             }
+            if let Some(previous) = previous.clone() {
+                upsert_version_history(&mut lock.version_history, previous);
+            }
             sort_lock_plugins(&mut lock.plugins);
+            sort_version_history(&mut lock.version_history);
             if let Err(error) = self.validate_enabled_plugins(&lock) {
                 let _ = fs::remove_dir_all(&destination);
                 return Err(error);
@@ -338,17 +348,6 @@ impl PluginManager {
             if let Err(error) = self.save_lock(&lock) {
                 let _ = fs::remove_dir_all(&destination);
                 return Err(error);
-            }
-            if let Some(previous) = previous.as_ref() {
-                let previous_manifest = self.resolve_locked_manifest(previous)?;
-                if let Some(previous_bundle) = previous_manifest.parent() {
-                    if previous_bundle != destination {
-                        let _ = fs::remove_dir_all(previous_bundle);
-                        if let Some(parent) = previous_bundle.parent() {
-                            let _ = remove_directory_if_empty(parent);
-                        }
-                    }
-                }
             }
             Ok(installed)
         })();
@@ -368,6 +367,20 @@ impl PluginManager {
         Ok(plugins)
     }
 
+    /// 返回不参与运行时加载的人工安装版本历史。
+    ///
+    /// 结果按插件 ID 和版本排序；每条记录仍绑定安装时的 Bundle SHA-256，调用方只能把它
+    /// 展示为 Package/Installed Version History，不能解释为 Evolution Lineage。
+    ///
+    /// # Errors
+    ///
+    /// 锁文件缺失时返回空列表，锁文件格式无效或读取失败时返回错误。
+    pub fn list_version_history(&self) -> Result<Vec<InstalledPlugin>> {
+        let mut history = self.load_lock()?.version_history;
+        sort_version_history(&mut history);
+        Ok(history)
+    }
+
     /// 捕获当前锁文件及全部受管理 Bundle，供人工管理事务失败时恢复。
     ///
     /// 快照不会读取未被锁文件管理的目录，也不会执行 WASM。每个 Bundle 都会重新计算摘要，
@@ -379,7 +392,7 @@ impl PluginManager {
     pub fn capture_state(&self) -> Result<PluginManagerStateSnapshot> {
         let lock = self.load_lock()?;
         let mut bundles = BTreeMap::new();
-        for plugin in &lock.plugins {
+        for plugin in lock.plugins.iter().chain(&lock.version_history) {
             let manifest = self.resolve_locked_manifest(plugin)?;
             let bundle = manifest
                 .parent()
@@ -390,7 +403,14 @@ impl PluginManager {
             if digest != plugin.sha256 {
                 bail!("插件 `{}` 的归档摘要与锁文件不一致", plugin.id);
             }
-            bundles.insert(plugin.id.clone(), archive);
+            let key = (plugin.id.clone(), plugin.version.clone());
+            if bundles.insert(key, archive).is_some() {
+                bail!(
+                    "插件 `{}` 版本 `{}` 在当前安装与版本历史中重复",
+                    plugin.id,
+                    plugin.version
+                );
+            }
         }
         Ok(PluginManagerStateSnapshot { lock, bundles })
     }
@@ -407,11 +427,22 @@ impl PluginManager {
     pub fn restore_state(&self, snapshot: &PluginManagerStateSnapshot) -> Result<()> {
         self.ensure_layout()?;
         let current = self.load_lock()?;
-        for plugin in &snapshot.lock.plugins {
+        for plugin in snapshot
+            .lock
+            .plugins
+            .iter()
+            .chain(&snapshot.lock.version_history)
+        {
             let archive = snapshot
                 .bundles
-                .get(&plugin.id)
-                .ok_or_else(|| anyhow!("插件 `{}` 的恢复快照缺少 Bundle", plugin.id))?;
+                .get(&(plugin.id.clone(), plugin.version.clone()))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "插件 `{}` 版本 `{}` 的恢复快照缺少 Bundle",
+                        plugin.id,
+                        plugin.version
+                    )
+                })?;
             let archive_digest = format!("{:x}", Sha256::digest(archive));
             if archive_digest != plugin.sha256 {
                 bail!("插件 `{}` 的恢复快照摘要无效", plugin.id);
@@ -446,12 +477,14 @@ impl PluginManager {
             }
         }
         self.validate_enabled_plugins(&snapshot.lock)?;
+        self.validate_version_history(&snapshot.lock)?;
         self.save_lock(&snapshot.lock)?;
-        for plugin in current.plugins {
+        for plugin in current.plugins.iter().chain(&current.version_history) {
             let retained = snapshot
                 .lock
                 .plugins
                 .iter()
+                .chain(&snapshot.lock.version_history)
                 .any(|item| item.id == plugin.id && item.version == plugin.version);
             if retained {
                 continue;
@@ -510,10 +543,10 @@ impl PluginManager {
         Ok(previous)
     }
 
-    /// 移除指定插件及其受管理目录。
+    /// 从当前运行集合移除指定插件，并把原 Bundle 保留到人工安装版本历史。
     ///
-    /// 仍被启用插件依赖时拒绝移除。锁文件会先原子更新，删除失败时会返回错误，
-    /// 遗留目录可由后续安装或人工诊断处理。
+    /// 仍被启用插件依赖时拒绝移除。成功后运行时不再加载该插件，但历史 Bundle 继续受摘要
+    /// 约束，可由用户人工回滚；该行为不会创建 Evolution Candidate。
     pub fn remove(&self, plugin_id: &str) -> Result<InstalledPlugin> {
         validate_storage_component(plugin_id, "插件 ID")?;
         let mut lock = self.load_lock()?;
@@ -523,22 +556,54 @@ impl PluginManager {
             .position(|plugin| plugin.id == plugin_id)
             .ok_or_else(|| anyhow!("插件 `{plugin_id}` 未安装"))?;
         let removed = lock.plugins.remove(index);
+        upsert_version_history(&mut lock.version_history, removed.clone());
+        sort_version_history(&mut lock.version_history);
         lock.capability_selection
             .retain(|_, owner| owner != plugin_id);
         self.validate_enabled_plugins(&lock)?;
         self.save_lock(&lock)?;
-
-        let manifest_path = self.resolve_locked_manifest(&removed)?;
-        let bundle_path = manifest_path
-            .parent()
-            .ok_or_else(|| anyhow!("插件 manifest 缺少父目录"))?;
-        if let Err(error) = fs::remove_dir_all(bundle_path) {
-            return Err(error).with_context(|| format!("无法删除插件 `{plugin_id}` 的安装目录"));
-        }
-        if let Some(parent) = bundle_path.parent() {
-            remove_directory_if_empty(parent)?;
-        }
         Ok(removed)
+    }
+
+    /// 从 Installed Version History 人工回滚到指定固定版本。
+    ///
+    /// 回滚只切换锁文件中的当前版本，不下载、不构建、不执行插件。被替换的当前版本会进入
+    /// 历史；已有插件保持当前启停状态，被移除插件恢复时采用其归档时状态。依赖、Capability
+    /// Owner 和 Bundle 摘要会在原子写锁前重新校验。
+    ///
+    /// # Errors
+    ///
+    /// 历史版本不存在、Bundle 被篡改、依赖或 Capability 冲突、锁文件提交失败时返回错误，
+    /// 当前安装状态保持不变。
+    pub fn rollback(&self, plugin_id: &str, version: &str) -> Result<InstalledPlugin> {
+        validate_storage_component(plugin_id, "插件 ID")?;
+        validate_storage_component(version, "插件版本")?;
+        let mut lock = self.load_lock()?;
+        let history_index = lock
+            .version_history
+            .iter()
+            .position(|plugin| plugin.id == plugin_id && plugin.version == version)
+            .ok_or_else(|| anyhow!("插件 `{plugin_id}` 没有历史版本 `{version}`"))?;
+        let mut target = lock.version_history.remove(history_index);
+        self.inspect_locked_plugin(&target)
+            .with_context(|| format!("历史插件 `{plugin_id}` 版本 `{version}` 校验失败"))?;
+
+        if let Some(active_index) = lock
+            .plugins
+            .iter()
+            .position(|plugin| plugin.id == plugin_id)
+        {
+            let current = lock.plugins.remove(active_index);
+            target.enabled = current.enabled;
+            upsert_version_history(&mut lock.version_history, current);
+        }
+        lock.plugins.push(target.clone());
+        sort_lock_plugins(&mut lock.plugins);
+        sort_version_history(&mut lock.version_history);
+        self.validate_enabled_plugins(&lock)?;
+        self.validate_version_history(&lock)?;
+        self.save_lock(&lock)?;
+        Ok(target)
     }
 
     /// 检查锁文件、路径、manifest、WASM、SHA-256、依赖和能力冲突。
@@ -573,6 +638,32 @@ impl PluginManager {
                     Some(&plugin.id),
                     format!("插件检查失败：{error:#}"),
                 ),
+            }
+        }
+
+        let mut versions = lock
+            .plugins
+            .iter()
+            .map(|plugin| (plugin.id.clone(), plugin.version.clone()))
+            .collect::<HashSet<_>>();
+        for plugin in &lock.version_history {
+            if !versions.insert((plugin.id.clone(), plugin.version.clone())) {
+                push_issue(
+                    &mut report,
+                    Some(&plugin.id),
+                    format!(
+                        "版本 `{}` 同时出现在当前安装或版本历史的重复记录中",
+                        plugin.version
+                    ),
+                );
+                continue;
+            }
+            if let Err(error) = self.inspect_locked_plugin(plugin) {
+                push_issue(
+                    &mut report,
+                    Some(&plugin.id),
+                    format!("历史版本 `{}` 检查失败：{error:#}", plugin.version),
+                );
             }
         }
 
@@ -680,6 +771,31 @@ impl PluginManager {
         Ok(())
     }
 
+    /// 校验人工版本历史的身份唯一性与 Bundle 完整性，不把历史版本加入运行时依赖解析。
+    fn validate_version_history(&self, lock: &PluginLock) -> Result<()> {
+        let mut versions = lock
+            .plugins
+            .iter()
+            .map(|plugin| (plugin.id.clone(), plugin.version.clone()))
+            .collect::<HashSet<_>>();
+        for plugin in &lock.version_history {
+            if !versions.insert((plugin.id.clone(), plugin.version.clone())) {
+                bail!(
+                    "插件 `{}` 版本 `{}` 同时出现在当前安装或版本历史中",
+                    plugin.id,
+                    plugin.version
+                );
+            }
+            self.inspect_locked_plugin(plugin).with_context(|| {
+                format!(
+                    "历史插件 `{}` 版本 `{}` 完整性校验失败",
+                    plugin.id, plugin.version
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn resolve_locked_manifest(&self, plugin: &InstalledPlugin) -> Result<PathBuf> {
         validate_storage_component(&plugin.id, "插件 ID")?;
         validate_storage_component(&plugin.version, "插件版本")?;
@@ -720,6 +836,7 @@ impl PluginManager {
         let managed = lock
             .plugins
             .iter()
+            .chain(&lock.version_history)
             .map(|plugin| (plugin.id.as_str(), plugin.version.as_str()))
             .collect::<HashSet<_>>();
         for plugin_entry in fs::read_dir(&plugins_dir).context("无法读取受管理插件根目录")?
@@ -786,6 +903,7 @@ impl PluginManager {
 
     fn save_lock(&self, lock: &PluginLock) -> Result<()> {
         self.ensure_layout()?;
+        self.validate_version_history(lock)?;
         let text = toml::to_string_pretty(lock).context("无法序列化插件锁文件")?;
         let path = self.lock_path();
         if let Ok(metadata) = fs::symlink_metadata(&path) {
@@ -1342,6 +1460,27 @@ fn sort_lock_plugins(plugins: &mut [InstalledPlugin]) {
     plugins.sort_by(|left, right| left.id.cmp(&right.id));
 }
 
+/// 按稳定 ID 和版本规范化人工版本历史顺序，保证锁文件可复现。
+fn sort_version_history(history: &mut [InstalledPlugin]) {
+    history.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.version.cmp(&right.version))
+    });
+}
+
+/// 以插件 ID 和版本为键更新人工版本历史，避免重复归档同一固定 Bundle。
+fn upsert_version_history(history: &mut Vec<InstalledPlugin>, plugin: InstalledPlugin) {
+    if let Some(index) = history
+        .iter()
+        .position(|item| item.id == plugin.id && item.version == plugin.version)
+    {
+        history[index] = plugin;
+    } else {
+        history.push(plugin);
+    }
+}
+
 fn push_issue(report: &mut DoctorReport, plugin_id: Option<&str>, message: String) {
     report.issues.push(DoctorIssue {
         severity: DoctorSeverity::Error,
@@ -1522,7 +1661,7 @@ mod tests {
         assert!(!directory.path.join("managed/plugins/echo/2.0.0").exists());
     }
 
-    /// 公共本地替换入口必须先提交新锁记录，再删除旧受管理 bundle。
+    /// 公共本地替换入口必须提交新锁记录，并把旧 Bundle 保留到人工版本历史。
     #[test]
     fn public_replace_switches_lock_before_removing_previous_bundle() {
         let directory = TestDirectory::new("replace-success");
@@ -1543,11 +1682,75 @@ mod tests {
                 .to_string()
         );
         assert_eq!(manager.list().expect("锁文件应可读")[0].version, "2.0.0");
-        assert!(!directory.path.join("managed/plugins/echo/1.0.0").exists());
+        assert!(directory
+            .path
+            .join("managed/plugins/echo/1.0.0/plugin.toml")
+            .is_file());
         assert!(directory
             .path
             .join("managed/plugins/echo/2.0.0/plugin.toml")
             .is_file());
+        let history = manager.list_version_history().expect("应读取人工版本历史");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, "1.0.0");
+    }
+
+    /// 人工回滚只切换固定版本，当前版本进入历史且两个 Bundle 都保持可复现。
+    #[test]
+    fn rollback_switches_installed_version_and_preserves_history() {
+        let directory = TestDirectory::new("manual-version-rollback");
+        let first = create_bundle(&directory.path, "echo", "1.0.0", &[], None);
+        let second = create_bundle(&directory.path, "echo", "2.0.0", &[], None);
+        let manager = PluginManager::new(directory.path.join("managed"));
+        manager.install(&first).expect("旧版本应安装成功");
+        manager.replace(&second).expect("新版本应替换成功");
+
+        let rolled_back = manager
+            .rollback("echo", "1.0.0")
+            .expect("历史版本应可人工回滚");
+
+        assert_eq!(rolled_back.version, "1.0.0");
+        assert_eq!(manager.list().expect("锁文件应可读")[0].version, "1.0.0");
+        let history = manager.list_version_history().expect("应读取人工版本历史");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, "2.0.0");
+        assert!(directory
+            .path
+            .join("managed/plugins/echo/1.0.0/plugin.toml")
+            .is_file());
+        assert!(directory
+            .path
+            .join("managed/plugins/echo/2.0.0/plugin.toml")
+            .is_file());
+        assert!(manager.doctor().expect("回滚后诊断应执行").is_healthy());
+    }
+
+    /// 历史 Bundle 被篡改后不得通过人工回滚切换为运行依赖。
+    #[test]
+    fn rollback_rejects_tampered_history_bundle() {
+        let directory = TestDirectory::new("manual-version-rollback-tampered");
+        let first = create_bundle(&directory.path, "echo", "1.0.0", &[], None);
+        let second = create_bundle(&directory.path, "echo", "2.0.0", &[], None);
+        let manager = PluginManager::new(directory.path.join("managed"));
+        manager.install(&first).expect("旧版本应安装成功");
+        manager.replace(&second).expect("新版本应替换成功");
+        fs::write(
+            directory
+                .path
+                .join("managed/plugins/echo/1.0.0/assets/config.txt"),
+            "历史版本已篡改",
+        )
+        .expect("应能篡改测试历史文件");
+
+        let error = manager
+            .rollback("echo", "1.0.0")
+            .expect_err("被篡改历史必须拒绝回滚");
+
+        assert!(error.to_string().contains("历史插件"));
+        assert_eq!(
+            manager.list().expect("锁文件应保持可读")[0].version,
+            "2.0.0"
+        );
     }
 
     /// 人工基线提交失败时必须能够恢复被替换的固定版本与原锁状态。
@@ -1736,7 +1939,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_updates_lock_and_deletes_bundle() {
+    fn remove_updates_lock_and_archives_bundle() {
         let directory = TestDirectory::new("remove");
         let bundle = create_bundle(&directory.path, "echo", "1.0.0", &[], None);
         let manager = PluginManager::new(directory.path.join("managed"));
@@ -1745,7 +1948,14 @@ mod tests {
         let removed = manager.remove("echo").expect("插件应移除成功");
         assert_eq!(removed.id, "echo");
         assert!(manager.list().expect("锁文件应可读").is_empty());
-        assert!(!directory.path.join("managed/plugins/echo").exists());
+        assert!(directory
+            .path
+            .join("managed/plugins/echo/1.0.0/plugin.toml")
+            .is_file());
+        assert_eq!(
+            manager.list_version_history().expect("应读取人工版本历史")[0].version,
+            "1.0.0"
+        );
     }
 
     #[test]

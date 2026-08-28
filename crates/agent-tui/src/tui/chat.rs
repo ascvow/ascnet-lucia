@@ -151,11 +151,11 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         COLOR_USER
     };
     #[cfg(feature = "plugins")]
-    let main_input_focused = app.native_command.dialog.is_none()
+    let main_input_focused = !app.native_dialog_active()
         && app.plugin_focus.is_none()
         && app.active_dialog_index().is_none();
     #[cfg(not(feature = "plugins"))]
-    let main_input_focused = app.native_command.dialog.is_none();
+    let main_input_focused = !app.native_dialog_active();
     let mut input_block = Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)

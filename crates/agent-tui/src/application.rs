@@ -154,6 +154,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         disabled_plugins.extend(plugin_runtime.disabled_plugins);
     }
     #[cfg(feature = "plugins")]
+    let plugin_management_base_manifests = plugin_manifests.clone();
+    #[cfg(feature = "plugins")]
+    let plugin_management_base_selection = capability_selection.clone();
+    #[cfg(feature = "plugins")]
     {
         let user_manifests = discover_plugin_manifests(&lucia_home.join("plugins"))
             .context("扫描用户插件目录失败")?;
@@ -183,6 +187,21 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     if let Some(binding) = genome_binding {
         binding.verify_core_only_plugins()?;
     }
+    #[cfg(feature = "plugins")]
+    let plugin_management = match (
+        genome_runtime.registry_root(),
+        genome_runtime.stable_lineage(),
+    ) {
+        (Some(registry_root), Some(lineage)) => Some(Arc::new(PluginManagementService::new(
+            lucia_home.clone(),
+            registry_root.to_path_buf(),
+            lineage.to_string(),
+            plugin_management_base_manifests,
+            plugin_management_base_selection,
+            disabled_plugins.clone(),
+        ))),
+        _ => None,
+    };
 
     let (gateway, options, demo_mode, mut startup_notices) = if args.demo {
         let (gateway, options) = build_demo_gateway();
@@ -415,6 +434,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .with_context_loader(manual_context_loader)
         .with_genome_runtime(genome_runtime.clone())
         .with_evidence(evidence_runtime.clone());
+    #[cfg(feature = "plugins")]
+    {
+        app = app.with_plugin_management(plugin_management);
+    }
     // 终端拒绝启用鼠标捕获时同步真实状态，使 Ctrl+T 下一次可重新尝试开启。
     app.mouse_capture = mouse_capture;
     app.messages.extend(
@@ -730,6 +753,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Some(UiEvent::NativeCompactRequested) => {
                 start_session_context_reload(&mut app, "正在压缩当前上下文".into());
             }
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::NativePluginsLoaded(result)) => {
+                app.handle_native_plugins_loaded(result);
+            }
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::NativePluginActionFinished(result)) => {
+                app.handle_native_plugin_action_finished(result);
+            }
             Some(UiEvent::SessionContextReloaded(result)) => {
                 app.handle_session_context_reloaded(*result);
             }
@@ -814,12 +845,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Some(UiEvent::Input(Event::Paste(pasted))) => {
                 // 粘贴只进入主输入框；插件视图聚焦或模态层激活时忽略。
                 #[cfg(feature = "plugins")]
-                let main_input_focused = app.native_command.dialog.is_none()
+                let main_input_focused = !app.native_dialog_active()
                     && app.plugin_focus.is_none()
                     && app.active_dialog_index().is_none()
                     && app.view_stack.is_main();
                 #[cfg(not(feature = "plugins"))]
-                let main_input_focused = app.native_command.dialog.is_none();
+                let main_input_focused = !app.native_dialog_active();
                 if main_input_focused {
                     let before_input = app.input.clone();
                     app.handle_paste(&pasted);

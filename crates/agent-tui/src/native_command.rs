@@ -41,6 +41,14 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
         description: "打开当前项目的会话摘要列表，并切换至选中的完整会话。",
         idle_only: true,
     },
+    #[cfg(feature = "plugins")]
+    NativeCommandSpec {
+        name: "plugins",
+        aliases: &[],
+        summary: "管理固定插件依赖",
+        description: "打开人工插件管理页；变更创建新基线，当前会话不热重载。",
+        idle_only: true,
+    },
     NativeCommandSpec {
         name: "new",
         aliases: &[],
@@ -102,6 +110,72 @@ pub(crate) struct NativeSessionDialog {
     pub(crate) status: NativeSessionDialogStatus,
 }
 
+/// 插件管理页加载完成后的只读数据。
+#[cfg(feature = "plugins")]
+#[derive(Debug, Clone)]
+pub(crate) struct NativePluginDialogData {
+    /// 全部受管理插件，包含禁用项。
+    pub(crate) plugins: Vec<agent_plugin_manager::InstalledPlugin>,
+    /// 不参与当前运行时加载的人工安装版本历史。
+    pub(crate) version_history: Vec<agent_plugin_manager::InstalledPlugin>,
+    /// 当前 Stable Genome 修订。
+    pub(crate) stable_revision: agent_evolution_protocol::GenomeRevisionId,
+    /// 当前冻结插件环境摘要。
+    pub(crate) environment_digest: agent_evolution_protocol::PluginEnvironmentDigest,
+    /// 当前 Stable 代数。
+    pub(crate) generation: u64,
+}
+
+/// 插件管理页的异步状态。
+#[cfg(feature = "plugins")]
+#[derive(Debug)]
+pub(crate) enum NativePluginDialogStatus {
+    /// 正在读取 Manager 与 Stable Genome。
+    Loading,
+    /// 列表和冻结环境已经校验。
+    Ready(NativePluginDialogData),
+    /// 正在提交 Manager 写入和人工基线。
+    Applying,
+    /// 读取或写入失败；用户可刷新重试。
+    Error(String),
+}
+
+/// 插件管理页当前接受的表单输入用途。
+#[cfg(feature = "plugins")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativePluginPathMode {
+    /// 输入 Registry `name[@semver]` 请求。
+    InstallRegistry,
+    /// 输入 GitHub owner/repository 或 URL。
+    InstallGithub,
+    /// 安装新本地 Bundle。
+    Install,
+    /// 使用本地 Bundle 替换已安装版本。
+    Replace,
+    /// 输入插件 ID 和历史版本执行人工回滚。
+    Rollback,
+    /// 输入 Capability ID 和插件 ID 选择 Owner。
+    SelectCapabilityOwner,
+    /// 输入 Capability ID 清除 Owner 选择。
+    ClearCapabilityOwner,
+}
+
+/// 插件管理页的完整交互状态。
+#[cfg(feature = "plugins")]
+#[derive(Debug)]
+pub(crate) struct NativePluginDialog {
+    /// 当前高亮插件下标。
+    pub(crate) selected: usize,
+    /// 异步数据状态。
+    pub(crate) status: NativePluginDialogStatus,
+    /// 本地 Bundle 路径输入模式；`None` 表示列表导航。
+    pub(crate) path_mode: Option<NativePluginPathMode>,
+    /// 正在编辑的本地 Bundle 路径。
+    pub(crate) path_input: String,
+    /// 第一次删除按键记录的插件 ID；再次确认才执行。
+    pub(crate) remove_confirmation: Option<String>,
+}
+
 /// TUI 原生命令状态；不依赖 Plugin Host，纯 Core 构建同样可用。
 #[derive(Debug, Default)]
 pub(crate) struct NativeCommandState {
@@ -111,9 +185,27 @@ pub(crate) struct NativeCommandState {
     pub(crate) dismissed_input: Option<String>,
     /// 当前会话对话框。
     pub(crate) dialog: Option<NativeSessionDialog>,
+    /// 当前人工插件管理页；纯 Core 构建不包含该状态。
+    #[cfg(feature = "plugins")]
+    pub(crate) plugin_dialog: Option<NativePluginDialog>,
 }
 
 impl App {
+    /// 返回任一原生全屏 Dialog 是否正在占用键盘焦点。
+    pub(crate) fn native_dialog_active(&self) -> bool {
+        self.native_command.dialog.is_some()
+            || cfg!(feature = "plugins") && {
+                #[cfg(feature = "plugins")]
+                {
+                    self.native_command.plugin_dialog.is_some()
+                }
+                #[cfg(not(feature = "plugins"))]
+                {
+                    false
+                }
+            }
+    }
+
     /// 返回当前输入匹配的原生命令，排序与稳定注册顺序一致。
     fn native_command_matches(&self) -> Vec<&'static NativeCommandSpec> {
         let Some(rest) = self.input.strip_prefix('/') else {
@@ -170,6 +262,13 @@ impl App {
                 self.last_escape_at = None;
             }
             return self.handle_native_session_dialog_key(code, modifiers);
+        }
+        #[cfg(feature = "plugins")]
+        if self.native_command.plugin_dialog.is_some() {
+            if matches!(code, KeyCode::Esc) {
+                self.last_escape_at = None;
+            }
+            return self.handle_native_plugin_dialog_key(code, modifiers);
         }
         #[cfg(feature = "plugins")]
         if !self.view_stack.is_main()
@@ -262,6 +361,8 @@ impl App {
             "help" => self.show_native_command_help(parts.next()),
             "resume" => self.open_native_sessions(NativeSessionDialogMode::Resume),
             "sessions" => self.open_native_sessions(NativeSessionDialogMode::Browse),
+            #[cfg(feature = "plugins")]
+            "plugins" => self.open_native_plugins(),
             "new" | "clear" => {
                 let notice = if command.name == "new" {
                     "已进入新的空白会话"
@@ -395,6 +496,310 @@ impl App {
         }
         let _ = self.tx.send(UiEvent::NativeCompactRequested);
     }
+
+    /// 打开人工插件管理页，并异步读取 Manager 与冻结 Stable 环境。
+    #[cfg(feature = "plugins")]
+    fn open_native_plugins(&mut self) {
+        self.native_command.plugin_dialog = Some(NativePluginDialog {
+            selected: 0,
+            status: NativePluginDialogStatus::Loading,
+            path_mode: None,
+            path_input: String::new(),
+            remove_confirmation: None,
+        });
+        self.reload_native_plugins();
+    }
+
+    /// 重新加载插件管理页；未配置 Stable Genome 时以只读错误说明阻止写操作。
+    #[cfg(feature = "plugins")]
+    fn reload_native_plugins(&mut self) {
+        let Some(dialog) = self.native_command.plugin_dialog.as_mut() else {
+            return;
+        };
+        dialog.status = NativePluginDialogStatus::Loading;
+        dialog.remove_confirmation = None;
+        let Some(service) = self.plugin_management.as_ref().map(Arc::clone) else {
+            dialog.status = NativePluginDialogStatus::Error(
+                "未配置可发布的 Stable Genome；插件写操作已禁用".into(),
+            );
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = load_native_plugin_dialog(service.as_ref())
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(UiEvent::NativePluginsLoaded(result));
+        });
+    }
+
+    /// 把插件页异步加载结果应用到仍然打开的 Dialog。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn handle_native_plugins_loaded(
+        &mut self,
+        result: Result<NativePluginDialogData, String>,
+    ) {
+        let Some(dialog) = self.native_command.plugin_dialog.as_mut() else {
+            return;
+        };
+        dialog.selected = 0;
+        dialog.status = match result {
+            Ok(data) => NativePluginDialogStatus::Ready(data),
+            Err(error) => NativePluginDialogStatus::Error(error),
+        };
+    }
+
+    /// 把人工管理事务结果显示到消息流，并刷新插件页的 Stable 摘要。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn handle_native_plugin_action_finished(
+        &mut self,
+        result: Result<PluginManagementOutcome, String>,
+    ) {
+        match result {
+            Ok(outcome) => {
+                let suffix = outcome.baseline.as_ref().map_or_else(
+                    || "插件环境没有行为变化，未创建新基线。".to_string(),
+                    |baseline| {
+                        format!(
+                            "插件环境已改变；新 Session 使用人工基线 {}（代数 {}，Genome 摘要 {}，插件摘要 {}）。当前 Session 继续使用启动时快照，旧 Evolution Candidate 不得自动应用。",
+                            baseline.revision_id,
+                            baseline.generation,
+                            baseline.genome_digest,
+                            baseline.plugin_environment_digest
+                        )
+                    },
+                );
+                self.messages.push(Msg::new(
+                    MsgKind::Info,
+                    format!("{}\n{}", outcome.message, suffix),
+                ));
+                self.reload_native_plugins();
+            }
+            Err(error) => {
+                if let Some(dialog) = self.native_command.plugin_dialog.as_mut() {
+                    dialog.status = NativePluginDialogStatus::Error(error.clone());
+                }
+                self.messages.push(Msg::new(
+                    MsgKind::Error,
+                    format!("人工插件管理失败：{error}"),
+                ));
+            }
+        }
+    }
+
+    /// 处理插件管理页的列表导航、路径输入、启停和二次确认移除。
+    #[cfg(feature = "plugins")]
+    fn handle_native_plugin_dialog_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
+            return false;
+        }
+        let Some(dialog) = self.native_command.plugin_dialog.as_mut() else {
+            return false;
+        };
+        if let Some(mode) = dialog.path_mode {
+            match code {
+                KeyCode::Esc => {
+                    dialog.path_mode = None;
+                    dialog.path_input.clear();
+                }
+                KeyCode::Backspace => {
+                    dialog.path_input.pop();
+                }
+                KeyCode::Char(character) if modifiers.is_empty() => {
+                    dialog.path_input.push(character);
+                }
+                KeyCode::Enter if !dialog.path_input.trim().is_empty() => {
+                    let action = match mode {
+                        NativePluginPathMode::InstallRegistry => {
+                            ManualPluginAction::InstallRegistry {
+                                request: dialog.path_input.trim().to_string(),
+                                enabled: true,
+                            }
+                        }
+                        NativePluginPathMode::InstallGithub => ManualPluginAction::InstallGithub {
+                            source: dialog.path_input.trim().to_string(),
+                            enabled: true,
+                        },
+                        NativePluginPathMode::Install => ManualPluginAction::InstallLocal {
+                            bundle: PathBuf::from(dialog.path_input.trim()),
+                            enabled: true,
+                        },
+                        NativePluginPathMode::Replace => ManualPluginAction::ReplaceLocal {
+                            bundle: PathBuf::from(dialog.path_input.trim()),
+                            enabled: true,
+                        },
+                        NativePluginPathMode::Rollback => {
+                            let mut parts = dialog.path_input.split_whitespace();
+                            let plugin_id = parts.next().unwrap_or_default();
+                            let version = parts.next().unwrap_or_default();
+                            if plugin_id.is_empty() || version.is_empty() || parts.next().is_some()
+                            {
+                                return true;
+                            }
+                            ManualPluginAction::Rollback {
+                                plugin_id: plugin_id.to_string(),
+                                version: version.to_string(),
+                            }
+                        }
+                        NativePluginPathMode::SelectCapabilityOwner => {
+                            let mut parts = dialog.path_input.split_whitespace();
+                            let capability_id = parts.next().unwrap_or_default();
+                            let plugin_id = parts.next().unwrap_or_default();
+                            if capability_id.is_empty()
+                                || plugin_id.is_empty()
+                                || parts.next().is_some()
+                            {
+                                return true;
+                            }
+                            ManualPluginAction::SelectCapabilityOwner {
+                                capability_id: capability_id.to_string(),
+                                plugin_id: plugin_id.to_string(),
+                            }
+                        }
+                        NativePluginPathMode::ClearCapabilityOwner => {
+                            ManualPluginAction::ClearCapabilityOwner {
+                                capability_id: dialog.path_input.trim().to_string(),
+                            }
+                        }
+                    };
+                    dialog.path_mode = None;
+                    dialog.path_input.clear();
+                    self.start_native_plugin_action(action);
+                }
+                _ => {}
+            }
+            return true;
+        }
+        let item_count = match &dialog.status {
+            NativePluginDialogStatus::Ready(data) => data.plugins.len(),
+            NativePluginDialogStatus::Loading
+            | NativePluginDialogStatus::Applying
+            | NativePluginDialogStatus::Error(_) => 0,
+        };
+        match code {
+            KeyCode::Esc => self.native_command.plugin_dialog = None,
+            KeyCode::Char('r') => self.reload_native_plugins(),
+            KeyCode::Char('i') if matches!(dialog.status, NativePluginDialogStatus::Ready(_)) => {
+                dialog.path_mode = Some(NativePluginPathMode::Install);
+                dialog.path_input.clear();
+            }
+            KeyCode::Char('g') if matches!(dialog.status, NativePluginDialogStatus::Ready(_)) => {
+                dialog.path_mode = Some(NativePluginPathMode::InstallRegistry);
+                dialog.path_input.clear();
+            }
+            KeyCode::Char('h') if matches!(dialog.status, NativePluginDialogStatus::Ready(_)) => {
+                dialog.path_mode = Some(NativePluginPathMode::InstallGithub);
+                dialog.path_input.clear();
+            }
+            KeyCode::Char('u') if item_count > 0 => {
+                dialog.path_mode = Some(NativePluginPathMode::Replace);
+                dialog.path_input.clear();
+            }
+            KeyCode::Char('b') if matches!(dialog.status, NativePluginDialogStatus::Ready(_)) => {
+                dialog.path_mode = Some(NativePluginPathMode::Rollback);
+                dialog.path_input.clear();
+            }
+            KeyCode::Char('o') if item_count > 0 => {
+                dialog.path_mode = Some(NativePluginPathMode::SelectCapabilityOwner);
+                dialog.path_input.clear();
+            }
+            KeyCode::Char('w') if matches!(dialog.status, NativePluginDialogStatus::Ready(_)) => {
+                dialog.path_mode = Some(NativePluginPathMode::ClearCapabilityOwner);
+                dialog.path_input.clear();
+            }
+            KeyCode::Char('t') if item_count > 0 => {
+                let NativePluginDialogStatus::Ready(data) = &dialog.status else {
+                    unreachable!("插件数量只会来自 Ready 状态");
+                };
+                let plugin_id = data.plugins[dialog.selected.min(data.plugins.len() - 1)]
+                    .id
+                    .clone();
+                self.start_native_plugin_action(ManualPluginAction::UpdateRegistry { plugin_id });
+            }
+            KeyCode::Up if item_count > 0 => {
+                dialog.selected = dialog.selected.checked_sub(1).unwrap_or(item_count - 1);
+                dialog.remove_confirmation = None;
+            }
+            KeyCode::Down if item_count > 0 => {
+                dialog.selected = (dialog.selected + 1) % item_count;
+                dialog.remove_confirmation = None;
+            }
+            KeyCode::Char('e') if item_count > 0 => {
+                let NativePluginDialogStatus::Ready(data) = &dialog.status else {
+                    unreachable!("插件数量只会来自 Ready 状态");
+                };
+                let plugin = &data.plugins[dialog.selected.min(data.plugins.len() - 1)];
+                let action = if plugin.enabled {
+                    ManualPluginAction::Disable {
+                        plugin_id: plugin.id.clone(),
+                    }
+                } else {
+                    ManualPluginAction::Enable {
+                        plugin_id: plugin.id.clone(),
+                    }
+                };
+                self.start_native_plugin_action(action);
+            }
+            KeyCode::Char('x') if item_count > 0 => {
+                let NativePluginDialogStatus::Ready(data) = &dialog.status else {
+                    unreachable!("插件数量只会来自 Ready 状态");
+                };
+                let plugin_id = data.plugins[dialog.selected.min(data.plugins.len() - 1)]
+                    .id
+                    .clone();
+                if dialog.remove_confirmation.as_deref() == Some(plugin_id.as_str()) {
+                    dialog.remove_confirmation = None;
+                    self.start_native_plugin_action(ManualPluginAction::Remove { plugin_id });
+                } else {
+                    dialog.remove_confirmation = Some(plugin_id);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// 在后台执行插件人工管理事务，期间 Dialog 保持不可编辑。
+    #[cfg(feature = "plugins")]
+    fn start_native_plugin_action(&mut self, action: ManualPluginAction) {
+        let Some(service) = self.plugin_management.as_ref().map(Arc::clone) else {
+            if let Some(dialog) = self.native_command.plugin_dialog.as_mut() {
+                dialog.status = NativePluginDialogStatus::Error(
+                    "未配置可发布的 Stable Genome；插件写操作已禁用".into(),
+                );
+            }
+            return;
+        };
+        if let Some(dialog) = self.native_command.plugin_dialog.as_mut() {
+            dialog.status = NativePluginDialogStatus::Applying;
+            dialog.remove_confirmation = None;
+        }
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = service
+                .apply(action)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(UiEvent::NativePluginActionFinished(result));
+        });
+    }
+}
+
+/// 读取人工插件页所需的 Manager 列表与冻结 Stable 摘要。
+#[cfg(feature = "plugins")]
+async fn load_native_plugin_dialog(
+    service: &PluginManagementService,
+) -> Result<NativePluginDialogData> {
+    let plugins = service.list()?;
+    let version_history = service.list_version_history()?;
+    let (stable, environment_digest) = service.frozen_environment().await?;
+    Ok(NativePluginDialogData {
+        plugins,
+        version_history,
+        stable_revision: stable.revision_id,
+        environment_digest,
+        generation: stable.generation,
+    })
 }
 
 /// 恢复用户在原生 Dialog 中选择的精确会话修订。
@@ -536,6 +941,154 @@ pub(crate) fn render_native_session_dialog(frame: &mut Frame, app: &App, outer: 
     );
 }
 
+/// 在主界面上方绘制人工插件管理页。
+#[cfg(feature = "plugins")]
+pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &App, outer: Rect) {
+    let Some(dialog) = app.native_command.plugin_dialog.as_ref() else {
+        return;
+    };
+    let width = outer.width.saturating_sub(2).clamp(30, 104);
+    let height = outer.height.saturating_sub(2).clamp(10, 30);
+    let area = Rect::new(
+        outer.x + outer.width.saturating_sub(width) / 2,
+        outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let inner_height = usize::from(height.saturating_sub(5));
+    let mut lines = match &dialog.status {
+        NativePluginDialogStatus::Loading => vec![Line::from(Span::styled(
+            "正在读取插件锁和冻结环境…",
+            Style::new().fg(COLOR_MUTED),
+        ))],
+        NativePluginDialogStatus::Applying => vec![Line::from(Span::styled(
+            "正在提交人工插件管理基线；当前 Session 不会热重载…",
+            Style::new().fg(COLOR_WARNING),
+        ))],
+        NativePluginDialogStatus::Error(error) => vec![
+            Line::from(Span::styled(
+                format!("读取或提交失败：{error}"),
+                Style::new().fg(COLOR_DANGER),
+            )),
+            Line::from(Span::styled(
+                "按 r 重试，按 Esc 关闭",
+                Style::new().fg(COLOR_MUTED),
+            )),
+        ],
+        NativePluginDialogStatus::Ready(data) => {
+            let mut content = vec![
+                Line::from(vec![
+                    Span::styled("Frozen Plugin Environment  ", Style::new().fg(COLOR_MUTED)),
+                    Span::styled(
+                        truncate_line(&data.environment_digest.to_string(), 24),
+                        Style::new().fg(COLOR_USER),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    format!(
+                        "Stable {} · generation {} · Plugins are fixed dependencies for this Session.",
+                        data.stable_revision, data.generation
+                    ),
+                    Style::new().fg(COLOR_MUTED),
+                )),
+                Line::from(Span::styled(
+                    if data.version_history.is_empty() {
+                        "Installed Version History: 无".to_string()
+                    } else {
+                        format!(
+                            "Installed Version History: {}",
+                            data.version_history
+                                .iter()
+                                .map(|plugin| format!("{}@{}", plugin.id, plugin.version))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                    Style::new().fg(COLOR_MUTED),
+                )),
+            ];
+            if data.plugins.is_empty() {
+                content.push(Line::from(Span::styled(
+                    "未安装受管理插件；按 i 从本地 Bundle 安装",
+                    Style::new().fg(COLOR_MUTED),
+                )));
+                content
+            } else {
+                let selected = dialog.selected.min(data.plugins.len() - 1);
+                let visible_height = inner_height.saturating_sub(content.len());
+                let start = selected
+                    .saturating_sub(visible_height.saturating_sub(1) / 2)
+                    .min(data.plugins.len().saturating_sub(visible_height));
+                content.extend(
+                    data.plugins
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .take(visible_height)
+                        .map(|(index, plugin)| {
+                            let state = if plugin.enabled {
+                                "已启用"
+                            } else {
+                                "已禁用"
+                            };
+                            let label = format!(
+                                "{:<18} {:<10} {:<6} sha256:{}",
+                                truncate_line(&plugin.id, 18),
+                                truncate_line(&plugin.version, 10),
+                                state,
+                                truncate_line(&plugin.sha256, 12)
+                            );
+                            let style = if index == selected {
+                                Style::new().fg(COLOR_TEXT).bg(COLOR_USER_BG).bold()
+                            } else {
+                                Style::new().fg(COLOR_MUTED)
+                            };
+                            Line::from(Span::styled(label, style))
+                        }),
+                );
+                content
+            }
+        }
+    };
+    if let Some(mode) = dialog.path_mode {
+        let label = match mode {
+            NativePluginPathMode::InstallRegistry => "Registry name[@semver]",
+            NativePluginPathMode::InstallGithub => "GitHub owner/repository 或 URL",
+            NativePluginPathMode::Install => "本地安装 Bundle 路径",
+            NativePluginPathMode::Replace => "本地更新 Bundle 路径",
+            NativePluginPathMode::Rollback => "插件 ID 与历史版本",
+            NativePluginPathMode::SelectCapabilityOwner => "Capability ID 与插件 ID",
+            NativePluginPathMode::ClearCapabilityOwner => "待清除的 Capability ID",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label}: "), Style::new().fg(COLOR_USER)),
+            Span::styled(&dialog.path_input, Style::new().fg(COLOR_TEXT)),
+        ]));
+    } else if let Some(plugin_id) = &dialog.remove_confirmation {
+        lines.push(Line::from(Span::styled(
+            format!("再次按 x 确认移除 `{plugin_id}`；该操作会创建人工基线"),
+            Style::new().fg(COLOR_WARNING),
+        )));
+    }
+    let footer = if dialog.path_mode.is_some() {
+        " 输入路径 · Enter 提交 · Esc 取消 "
+    } else {
+        " ↑↓ · e 启停 · g/h/i 安装 · t/u 更新 · b 人工回滚 · o/w Owner · x 移除 · r 刷新 · Esc "
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
+                .title("Plugins · 人工管理")
+                .title_bottom(Line::from(footer).alignment(Alignment::Center))
+                .padding(Padding::horizontal(1)),
+        ),
+        area,
+    );
+}
+
 /// 生成人类可读的会话更新时间标签。
 fn relative_native_time(updated_at_ms: u64) -> String {
     let now_ms = std::time::SystemTime::now()
@@ -554,6 +1107,8 @@ fn relative_native_time(updated_at_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "plugins")]
+    use ratatui::{backend::TestBackend, Terminal};
 
     /// 默认注册表必须包含用户依赖的全部内置命令和退出别名。
     #[test]
@@ -562,6 +1117,12 @@ mod tests {
             .iter()
             .map(|command| command.name)
             .collect::<Vec<_>>();
+        #[cfg(feature = "plugins")]
+        assert_eq!(
+            names,
+            vec!["help", "resume", "sessions", "plugins", "new", "clear", "compact", "exit"]
+        );
+        #[cfg(not(feature = "plugins"))]
         assert_eq!(
             names,
             vec!["help", "resume", "sessions", "new", "clear", "compact", "exit"]
@@ -569,6 +1130,130 @@ mod tests {
         assert_eq!(
             NATIVE_COMMANDS.last().expect("应有退出命令").aliases,
             &["quit"]
+        );
+    }
+
+    /// 插件构建只暴露人工管理入口，不得重新出现插件进化或生成命令。
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn plugin_page_has_no_evolution_actions() {
+        let names = NATIVE_COMMANDS
+            .iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"plugins"));
+        assert!(!names.iter().any(|name| {
+            name.contains("evolve") || name.contains("mutation") || name.contains("generate")
+        }));
+        let plugin_help = NATIVE_COMMANDS
+            .iter()
+            .find(|command| command.name == "plugins")
+            .expect("应保留人工插件管理入口");
+        assert!(plugin_help.description.contains("人工插件管理"));
+        assert!(plugin_help.description.contains("不热重载"));
+    }
+
+    /// 插件页必须展示冻结环境摘要和人工操作，且不能出现进化按钮文案。
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn plugin_page_shows_frozen_digest_and_manual_actions() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        let environment_digest =
+            agent_evolution_protocol::PluginEnvironmentDigest::from_sha256_hex("a".repeat(64))
+                .expect("插件环境摘要应合法");
+        app.native_command.plugin_dialog = Some(NativePluginDialog {
+            selected: 0,
+            status: NativePluginDialogStatus::Ready(NativePluginDialogData {
+                plugins: vec![agent_plugin_manager::InstalledPlugin {
+                    id: "echo".into(),
+                    name: "Echo".into(),
+                    version: "1.0.0".into(),
+                    api_version: "0.7.0".into(),
+                    enabled: true,
+                    manifest: "plugins/echo/1.0.0/plugin.toml".into(),
+                    sha256: "b".repeat(64),
+                    source: "fixture".into(),
+                }],
+                version_history: vec![agent_plugin_manager::InstalledPlugin {
+                    id: "echo".into(),
+                    name: "Echo".into(),
+                    version: "0.9.0".into(),
+                    api_version: "0.7.0".into(),
+                    enabled: true,
+                    manifest: "plugins/echo/0.9.0/plugin.toml".into(),
+                    sha256: "c".repeat(64),
+                    source: "fixture-history".into(),
+                }],
+                stable_revision: agent_evolution_protocol::GenomeRevisionId::generate(),
+                environment_digest,
+                generation: 3,
+            }),
+            path_mode: None,
+            path_input: String::new(),
+            remove_confirmation: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(112, 32)).expect("应创建测试终端");
+
+        terminal
+            .draw(|frame| render_native_plugin_dialog(frame, &app, frame.area()))
+            .expect("应渲染插件管理页");
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let compact = text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+
+        assert!(text.contains("Frozen Plugin Environment"), "{text}");
+        assert!(text.contains("sha256:aaaaaaaaaaaaaaaaa"), "{text}");
+        assert!(text.contains("Installed Version History"), "{text}");
+        assert!(text.contains("echo@0.9.0"), "{text}");
+        assert!(compact.contains("人工管理"), "{text}");
+        assert!(!text.contains("Evolve Plugin"), "{text}");
+        assert!(!text.contains("Generate Plugin"), "{text}");
+    }
+
+    /// 人工插件变更提示必须说明新基线、旧 Session 固定和旧 Candidate 不可应用。
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn plugin_change_warning_is_displayed() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.native_command.plugin_dialog = Some(NativePluginDialog {
+            selected: 0,
+            status: NativePluginDialogStatus::Applying,
+            path_mode: None,
+            path_input: String::new(),
+            remove_confirmation: None,
+        });
+        let digest = agent_evolution_protocol::GenomeDigest::from_sha256_hex("b".repeat(64))
+            .expect("Genome 摘要应合法");
+        let environment_digest =
+            agent_evolution_protocol::PluginEnvironmentDigest::from_sha256_hex("c".repeat(64))
+                .expect("插件环境摘要应合法");
+
+        app.handle_native_plugin_action_finished(Ok(PluginManagementOutcome {
+            message: "已启用 echo 1.0.0".into(),
+            baseline: Some(PluginManagementBaseline {
+                revision_id: agent_evolution_protocol::GenomeRevisionId::generate(),
+                genome_digest: digest,
+                plugin_environment_digest: environment_digest,
+                generation: 4,
+            }),
+        }));
+
+        let text = &app.messages.last().expect("应显示人工变更提示").text;
+        assert!(text.contains("新 Session"), "{text}");
+        assert!(text.contains("当前 Session 继续使用启动时快照"), "{text}");
+        assert!(
+            text.contains("旧 Evolution Candidate 不得自动应用"),
+            "{text}"
         );
     }
 
