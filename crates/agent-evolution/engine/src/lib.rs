@@ -141,11 +141,12 @@ pub use scorecard::{
 };
 pub use skill_candidate_builder::{SkillCandidateBuildError, SkillCandidateBuilder};
 pub use skill_cycle::{
-    SkillEvolutionArchiveV1, SkillEvolutionCycle, SkillEvolutionCycleError,
-    SkillEvolutionCycleRequestV1, SkillEvolutionCycleResultV1, SkillEvolutionDispositionV1,
+    FileSkillEvolutionCycleArchive, SkillEvolutionArchiveV1, SkillEvolutionCycle,
+    SkillEvolutionCycleError, SkillEvolutionCycleRequestV1, SkillEvolutionCycleResultV1,
+    SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleStage, SkillEvolutionDispositionV1,
     SkillEvolutionOrchestrator, SkillEvolutionOrchestratorError, SkillGateCycleOutcomeV1,
     SkillGatePromotionV1, SkillHealthVerdictV1, SKILL_EVOLUTION_ARCHIVE_SCHEMA_VERSION,
-    SKILL_EVOLUTION_CANDIDATE_COUNT,
+    SKILL_EVOLUTION_CANDIDATE_COUNT, SKILL_EVOLUTION_CYCLE_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use skill_mutation::{
     BoundedSkillMutator, DeterministicSkillMutationGenerator, SkillContentDraftV1,

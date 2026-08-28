@@ -10,11 +10,12 @@ use agent_evolution::{
     collect_trusted_skill_evaluation_bindings, ArtifactStore, BoundedSkillMutator,
     DeterministicSkillMutationGenerator, EpisodeRecorder, EpisodeRecorderConfig, EpisodeStore,
     EvolutionOutbox, EvolutionOutboxItem, FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox,
-    FileGenomeResolver, FileGenomeStore, FileIssueObservationStore, FileStableGenomePublisher,
-    GenomeResolver, GenomeSelector, GenomeStore, IssueObservation, IssueObservationStore,
-    SkillArtifactRepository, SkillCandidateBuilder, SkillEvolutionArchiveV1,
-    SkillEvolutionCycleRequestV1, SkillEvolutionDispositionV1, SkillGateCycleOutcomeV1,
-    NATIVE_SKILL_READ_TOOL, NATIVE_SKILL_USAGE_SCHEMA_VERSION,
+    FileGenomeResolver, FileGenomeStore, FileIssueObservationStore, FileSkillEvolutionCycleArchive,
+    FileStableGenomePublisher, GenomeResolver, GenomeSelector, GenomeStore, IssueObservation,
+    IssueObservationStore, SkillArtifactRepository, SkillCandidateBuilder, SkillEvolutionArchiveV1,
+    SkillEvolutionCycleRequestV1, SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleStage,
+    SkillEvolutionDispositionV1, SkillGateCycleOutcomeV1, NATIVE_SKILL_READ_TOOL,
+    NATIVE_SKILL_USAGE_SCHEMA_VERSION,
 };
 use agent_evolution_protocol::{
     AgentGenome, ArtifactDigest, ArtifactRef, AttributionMethod, DataClass, DiagnosticStatus,
@@ -28,6 +29,7 @@ use agent_evolution_protocol::{
     SKILL_CANDIDATE_SNAPSHOT_MEDIA_TYPE, SKILL_USAGE_OBSERVATION_SCHEMA_VERSION,
 };
 use agent_tool::ExecutionPolicy;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
@@ -384,18 +386,21 @@ fn evaluator_binary() -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .expect("测试二进制应位于 target profile/deps")
-        .join("lucia-eval")
+        .join(format!("lucia-eval{}", std::env::consts::EXE_SUFFIX))
 }
 
-/// 启动真实 `lucia-evolve skill-cycle` 并解析唯一归档回执。
-fn invoke_cycle(
+/// 启动真实 `lucia-evolve` 子命令，并解析唯一 JSON 回执。
+fn invoke_evolver<T: DeserializeOwned>(
     root: &Path,
     evaluator: &Path,
     registry_digest: &ArtifactDigest,
-    request: &SkillEvolutionCycleRequestV1,
-) -> SkillEvolutionArchiveV1 {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lucia-evolve"))
-        .arg("skill-cycle")
+    command: &str,
+    cycle_id: Option<&agent_evolution_protocol::EvolutionCycleId>,
+    request: Option<&SkillEvolutionCycleRequestV1>,
+) -> T {
+    let mut process = Command::new(env!("CARGO_BIN_EXE_lucia-evolve"));
+    process
+        .arg(command)
         .env("LUCIA_EVOLVE_EVALUATOR_BIN", evaluator)
         .env("LUCIA_EVOLVE_EVOLUTION_ROOT", root)
         .env("LUCIA_EVAL_EVOLUTION_ROOT", root)
@@ -403,25 +408,35 @@ fn invoke_cycle(
             "LUCIA_EVAL_SKILL_REGISTRY_ROOT",
             root.join("skill-registry"),
         )
-        .env("LUCIA_EVAL_SKILL_REGISTRY_DIGEST", registry_digest.as_str())
-        .stdin(Stdio::piped())
+        .env("LUCIA_EVAL_SKILL_REGISTRY_DIGEST", registry_digest.as_str());
+    if let Some(cycle_id) = cycle_id {
+        process.arg("--cycle-id").arg(cycle_id.as_str());
+    }
+    let mut child = process
+        .stdin(if request.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("应启动真实 lucia-evolve");
-    child
-        .stdin
-        .take()
-        .expect("skill-cycle 应打开 stdin")
-        .write_all(&serde_json::to_vec(request).expect("请求应可序列化"))
-        .expect("应写入 Skill Cycle 请求");
+    if let Some(request) = request {
+        child
+            .stdin
+            .take()
+            .expect("skill-cycle 应打开 stdin")
+            .write_all(&serde_json::to_vec(request).expect("请求应可序列化"))
+            .expect("应写入 Skill Cycle 请求");
+    }
     let output = child.wait_with_output().expect("应等待 lucia-evolve");
     assert!(
         output.status.success(),
         "lucia-evolve 失败：{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).expect("应返回 Skill Evolution Archive")
+    serde_json::from_slice(&output.stdout).expect("应返回合法 JSON 回执")
 }
 
 /// 真实双进程必须完成 Reject、本地评测、生产晋升与不健康回滚。
@@ -571,7 +586,64 @@ async fn skill_cycle_uses_independent_gate_and_rolls_back_unhealthy_promotion() 
     registry.validate().expect("Registry 应合法");
     let registry_digest = write_registry(&root, &registry);
 
-    let archive = invoke_cycle(&root, &evaluator, &registry_digest, &request);
+    let pending: SkillEvolutionCycleSnapshotV1 = invoke_evolver(
+        &root,
+        &evaluator,
+        &registry_digest,
+        "skill-cycle",
+        None,
+        Some(&request),
+    );
+    assert_eq!(pending.stage, SkillEvolutionCycleStage::AwaitingHealth);
+    assert!(root
+        .join("skill-cycle-archive")
+        .join(format!("{}.json", request.cycle_id))
+        .try_exists()
+        .is_ok_and(|exists| !exists));
+    assert_eq!(
+        FileEvolutionOutbox::new(root.join("outbox"))
+            .pending()
+            .await
+            .expect("等待健康时应可读取 Outbox")
+            .len(),
+        1
+    );
+
+    let history: Vec<SkillEvolutionCycleSnapshotV1> = invoke_evolver(
+        &root,
+        &evaluator,
+        &registry_digest,
+        "skill-inspect",
+        Some(&request.cycle_id),
+        None,
+    );
+    assert_eq!(history.last(), Some(&pending));
+    for pair in history.windows(2) {
+        assert_eq!(pair[1].sequence, pair[0].sequence + 1);
+        assert_eq!(
+            pair[1].previous_digest.as_ref(),
+            Some(
+                &FileSkillEvolutionCycleArchive::snapshot_digest(&pair[0])
+                    .expect("阶段摘要应可重算")
+            )
+        );
+    }
+
+    let terminal: SkillEvolutionCycleSnapshotV1 = invoke_evolver(
+        &root,
+        &evaluator,
+        &registry_digest,
+        "skill-health",
+        Some(&request.cycle_id),
+        None,
+    );
+    assert_eq!(terminal.stage, SkillEvolutionCycleStage::RolledBack);
+    let archive_path = root
+        .join("skill-cycle-archive")
+        .join(format!("{}.json", request.cycle_id));
+    let archive: SkillEvolutionArchiveV1 =
+        serde_json::from_slice(&fs::read(&archive_path).expect("健康终态应生成旧版兼容归档"))
+            .expect("旧版兼容归档应保持原 schema");
     assert_eq!(archive.disposition, SkillEvolutionDispositionV1::RolledBack);
     assert_eq!(archive.candidates, candidates);
     assert_eq!(archive.gate_outcomes.len(), 3);
@@ -619,10 +691,7 @@ async fn skill_cycle_uses_independent_gate_and_rolls_back_unhealthy_promotion() 
             .expect("应读取 Candidate Revision")
             .is_some());
     }
-    assert!(root
-        .join("skill-cycle-archive")
-        .join(format!("{}.json", request.cycle_id))
-        .is_file());
+    assert!(archive_path.is_file());
     assert!(root
         .join("skill-registry")
         .join(SKILL_EVALUATION_REGISTRY_FILE)

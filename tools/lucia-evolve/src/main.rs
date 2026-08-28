@@ -7,10 +7,10 @@
 use agent_evolution::{
     ContextEvolutionCycle, ContextEvolutionCycleRequestV1, ContextEvolutionCycleSnapshotV1,
     DeterministicPromptMutationGenerator, DeterministicSkillMutationGenerator, EpisodeSelector,
-    EvolutionCycleStore, EvolutionOutbox, FileContextCycleArchive, FileEpisodeStore,
-    FileEvolutionCycleStore, FileEvolutionOutbox, FileIssueObservationStore,
-    LuciaEvalProcessClient, LuciaEvalSkillProcessClient, PromptEvolutionCycle,
-    SkillEvolutionArchiveV1, SkillEvolutionCycle, SkillEvolutionCycleRequestV1,
+    EvolutionCycleStore, FileContextCycleArchive, FileEpisodeStore, FileEvolutionCycleStore,
+    FileEvolutionOutbox, FileIssueObservationStore, FileSkillEvolutionCycleArchive,
+    LuciaEvalProcessClient, LuciaEvalSkillProcessClient, PromptEvolutionCycle, SkillEvolutionCycle,
+    SkillEvolutionCycleRequestV1, SkillEvolutionCycleSnapshotV1,
 };
 use agent_evolution_protocol::{
     DatasetVersionId, EvolutionCycleId, EvolutionCycleRequestV1, EvolutionCycleSnapshotV1,
@@ -69,6 +69,18 @@ enum Command {
     ContextCycle,
     /// 从 stdin 读取 SkillEvolutionCycleRequestV1 并执行完整 Skill Cycle。
     SkillCycle,
+    /// 读取并验证指定 Skill Cycle 的完整只追加快照历史。
+    SkillInspect {
+        /// 需要检查的强类型 Skill Cycle 标识。
+        #[arg(long, value_name = "CYCLE_ID")]
+        cycle_id: EvolutionCycleId,
+    },
+    /// 驱动指定 Skill Cycle 完成健康验证；失败时自动回滚。
+    SkillHealth {
+        /// 已进入 AwaitingHealth 的强类型 Skill Cycle 标识。
+        #[arg(long, value_name = "CYCLE_ID")]
+        cycle_id: EvolutionCycleId,
+    },
     /// 读取并验证指定 Context Cycle 的完整只追加快照历史。
     ContextInspect {
         /// 需要检查的强类型 Context Cycle 标识。
@@ -163,8 +175,16 @@ async fn dispatch(command: Command) -> Result<(), FailureCode> {
             write_receipt(&snapshot)
         }
         Command::SkillCycle => {
-            let archive = execute_skill_cycle().await?;
-            write_receipt(&archive)
+            let snapshot = execute_skill_cycle().await?;
+            write_receipt(&snapshot)
+        }
+        Command::SkillInspect { cycle_id } => {
+            let history = execute_skill_inspect(&cycle_id).await?;
+            write_receipt(&history)
+        }
+        Command::SkillHealth { cycle_id } => {
+            let snapshot = execute_skill_health(&cycle_id).await?;
+            write_receipt(&snapshot)
         }
         Command::ContextInspect { cycle_id } => {
             let history = execute_context_inspect(&cycle_id).await?;
@@ -177,13 +197,27 @@ async fn dispatch(command: Command) -> Result<(), FailureCode> {
     }
 }
 
-/// 从固定 Store 恢复唯一证据、执行 Skill Cycle，并在归档成功后消费对应 Outbox。
-async fn execute_skill_cycle() -> Result<SkillEvolutionArchiveV1, FailureCode> {
+/// 从固定 Store 恢复唯一证据，并执行或恢复 Skill Cycle 至等待健康或可信终态。
+async fn execute_skill_cycle() -> Result<SkillEvolutionCycleSnapshotV1, FailureCode> {
     let request: SkillEvolutionCycleRequestV1 = read_json_request()?;
     request
         .validate()
         .map_err(|_| FailureCode::RequestInvalid)?;
     let evolution_root = evolution_root()?;
+    let runner = skill_cycle_runner(&evolution_root)?;
+    if let Some(existing) = runner
+        .cycle_archive()
+        .latest(&request.cycle_id)
+        .await
+        .map_err(|error| FailureCode::Cycle(error.code()))?
+    {
+        if !existing.stage.requires_mutation_evidence() {
+            return runner
+                .resume(&request)
+                .await
+                .map_err(|error| FailureCode::Cycle(error.code()));
+        }
+    }
     let evidence = EpisodeSelector::new(
         Arc::new(FileEvolutionOutbox::new(evolution_root.join("outbox"))),
         Arc::new(FileEpisodeStore::new(evolution_root.join("episodes"))),
@@ -200,26 +234,48 @@ async fn execute_skill_cycle() -> Result<SkillEvolutionArchiveV1, FailureCode> {
     if evidence.len() != 1 {
         return Err(FailureCode::Cycle("skill_evidence_not_unique"));
     }
-    let evaluator = skill_evaluator_client(&evolution_root)?;
-    let result = SkillEvolutionCycle::new(
-        &evolution_root,
-        DeterministicSkillMutationGenerator,
-        evaluator,
-    )
-    .run(&request, &evidence[0])
-    .await
-    .map_err(|error| FailureCode::Cycle(error.code()))?;
-    let outbox = FileEvolutionOutbox::new(evolution_root.join("outbox"));
-    for episode in &evidence[0].episodes {
-        let consumed = outbox
-            .mark_consumed(&episode.outbox_id)
-            .await
-            .map_err(|_| FailureCode::Cycle("skill_outbox_consume_failed"))?;
-        if !consumed {
-            return Err(FailureCode::Cycle("skill_outbox_consume_failed"));
-        }
+    runner
+        .run_until_health(&request, &evidence[0])
+        .await
+        .map_err(|error| FailureCode::Cycle(error.code()))
+}
+
+/// 从受信 Skill 阶段 Archive 读取并验证完整历史。
+async fn execute_skill_inspect(
+    cycle_id: &EvolutionCycleId,
+) -> Result<Vec<SkillEvolutionCycleSnapshotV1>, FailureCode> {
+    let history = FileSkillEvolutionCycleArchive::new(evolution_root()?.join("skill-cycles"))
+        .history(cycle_id)
+        .await
+        .map_err(|_| FailureCode::CycleInspectFailed)?;
+    if history.is_empty() {
+        return Err(FailureCode::Cycle("skill_cycle_not_found"));
     }
-    Ok(result.archive)
+    Ok(history)
+}
+
+/// 驱动 Skill Cycle 完成受信健康验证或自动回滚。
+async fn execute_skill_health(
+    cycle_id: &EvolutionCycleId,
+) -> Result<SkillEvolutionCycleSnapshotV1, FailureCode> {
+    skill_cycle_runner(&evolution_root()?)?
+        .verify_health(cycle_id)
+        .await
+        .map_err(|error| FailureCode::Cycle(error.code()))
+}
+
+/// 组装固定 Skill Mutator 与独立 Evaluator 进程客户端。
+fn skill_cycle_runner(
+    evolution_root: &Path,
+) -> Result<
+    SkillEvolutionCycle<DeterministicSkillMutationGenerator, LuciaEvalSkillProcessClient>,
+    FailureCode,
+> {
+    Ok(SkillEvolutionCycle::new(
+        evolution_root,
+        DeterministicSkillMutationGenerator,
+        skill_evaluator_client(evolution_root)?,
+    ))
 }
 
 /// 校验 Context Cycle 请求，并通过固定 Mutator 和独立 Evaluator 执行生产闭环。
@@ -544,11 +600,18 @@ mod tests {
         }
     }
 
-    /// Prompt 与 Context 的 Inspect、Health 只接受强类型 Cycle ID，不接受路径或自由文本。
+    /// Prompt、Context 与 Skill 的 Inspect、Health 只接受强类型 Cycle ID。
     #[test]
     fn cycle_commands_require_typed_id() {
         let cycle_id = EvolutionCycleId::generate();
-        for command in ["inspect", "health", "context-inspect", "context-health"] {
+        for command in [
+            "inspect",
+            "health",
+            "context-inspect",
+            "context-health",
+            "skill-inspect",
+            "skill-health",
+        ] {
             let parsed =
                 Args::try_parse_from(["lucia-evolve", command, "--cycle-id", cycle_id.as_str()])
                     .expect("合法 Cycle ID 应通过");
@@ -556,7 +619,9 @@ mod tests {
                 Command::Inspect { cycle_id }
                 | Command::Health { cycle_id }
                 | Command::ContextInspect { cycle_id }
-                | Command::ContextHealth { cycle_id } => cycle_id,
+                | Command::ContextHealth { cycle_id }
+                | Command::SkillInspect { cycle_id }
+                | Command::SkillHealth { cycle_id } => cycle_id,
                 _ => panic!("应解析为 Cycle 查询命令"),
             };
             assert_eq!(observed, cycle_id);
@@ -608,6 +673,30 @@ mod tests {
         let mut output = Vec::new();
         write_failure_code(&mut output, FailureCode::RequestInvalid).expect("错误码应可写入");
         assert_eq!(output, b"request_invalid\n");
+    }
+
+    /// Skill Inspect、Health 与禁止的直接 Rollback 必须暴露稳定控制面错误码。
+    #[test]
+    fn skill_control_commands_keep_stable_failure_codes() {
+        assert_eq!(
+            FailureCode::Cycle("skill_cycle_not_found").as_str(),
+            "skill_cycle_not_found"
+        );
+        assert_eq!(
+            FailureCode::Cycle("skill_health_not_ready").as_str(),
+            "skill_health_not_ready"
+        );
+        assert_eq!(
+            FailureCode::CycleInspectFailed.as_str(),
+            "cycle_inspect_failed"
+        );
+        assert!(Args::try_parse_from([
+            "lucia-evolve",
+            "skill-rollback",
+            "--cycle-id",
+            EvolutionCycleId::generate().as_str(),
+        ])
+        .is_err());
     }
 
     /// 工具的直接依赖必须保持在 Evolver 允许列表内，尤其不能链接 agent-evaluation。

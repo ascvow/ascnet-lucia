@@ -7,16 +7,16 @@
 
 use crate::{
     verify_allowed_genome_diff, ArtifactStore, ArtifactStoreError, BoundedSkillMutator,
-    FileArtifactStore, FileGenomeResolver, FileStableGenomePublisher, GenomeDiffError,
-    GenomePromotionError, GenomeResolver, GenomeResolverError, GenomeSelector, GenomeStore,
-    GenomeStoreError, MutationEvidence, SkillArtifactRepository, SkillCandidateBuildError,
-    SkillCandidateBuilder, SkillMutationError, SkillMutationGenerator, SkillRepositoryError,
-    StableGenomeRef,
+    EvolutionOutbox, FileArtifactStore, FileEvolutionOutbox, FileGenomeResolver,
+    FileStableGenomePublisher, GenomeDiffError, GenomePromotionError, GenomeResolver,
+    GenomeResolverError, GenomeSelector, GenomeStore, GenomeStoreError, MutationEvidence,
+    OutboxError, SkillArtifactRepository, SkillCandidateBuildError, SkillCandidateBuilder,
+    SkillMutationError, SkillMutationGenerator, SkillRepositoryError, StableGenomeRef,
 };
 use agent_evolution_protocol::{
-    ArtifactRef, CandidateId, EvaluationReportId, EvolutionCycleId, GenomeDigest, GenomeRevision,
-    GenomeRevisionId, MutationSurface, ReleaseId, SkillCandidateV1, SkillId,
-    SkillMutationProposalV1, SkillStatusV1,
+    ArtifactDigest, ArtifactRef, CandidateId, EvaluationReportId, EvolutionCycleId,
+    EvolutionIssueId, GenomeDigest, GenomeRevision, GenomeRevisionId, MutationSurface, ReleaseId,
+    SkillCandidateV1, SkillId, SkillMutationProposalV1, SkillStatusV1,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -24,14 +24,19 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
 /// Skill Cycle 归档结构版本。
 pub const SKILL_EVOLUTION_ARCHIVE_SCHEMA_VERSION: u32 = 1;
+/// Skill Cycle 阶段快照结构版本。
+pub const SKILL_EVOLUTION_CYCLE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Skill Cycle 固定保留的候选数量。
 pub const SKILL_EVOLUTION_CANDIDATE_COUNT: usize = 3;
+/// 单份 Skill Cycle 阶段快照的固定字节上限。
+const MAX_SKILL_CYCLE_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// 一轮 Skill 生产 Cycle 的可信输入。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +237,411 @@ pub enum SkillEvolutionDispositionV1 {
     RolledBack,
 }
 
+/// Skill Cycle 的可恢复阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillEvolutionCycleStage {
+    /// 已验证请求与 Stable Parent，并建立首份快照。
+    Requested,
+    /// 正在从脱敏失败证据生成固定三份提案。
+    Mutating,
+    /// 正在逐份构建并登记 Candidate。
+    BuildingCandidates,
+    /// 正在逐份调用独立 Skill Evaluator。
+    Evaluating,
+    /// 正在从完整 Gate 回执中选择生产 Candidate。
+    SelectingWinner,
+    /// 正在原子发布生产 Stable。
+    Promoting,
+    /// Promotion 已归档，等待显式健康验证。
+    AwaitingHealth,
+    /// 正在调用独立健康控制面。
+    VerifyingHealth,
+    /// Promotion 已通过健康验证。
+    HealthVerified,
+    /// 正在原子回滚 Parent。
+    RollingBack,
+    /// 不健康 Promotion 已回滚。
+    RolledBack,
+    /// 所有 Candidate 均不具备生产发布资格。
+    Rejected,
+    /// 确定性闭环错误已经归档。
+    Failed,
+}
+
+impl SkillEvolutionCycleStage {
+    /// 判断恢复当前阶段是否仍需要调用方提供原始脱敏 MutationEvidence。
+    pub fn requires_mutation_evidence(self) -> bool {
+        matches!(self, Self::Requested | Self::Mutating)
+    }
+}
+
+/// 一轮 Skill Cycle 的只追加阶段快照。
+///
+/// 快照保存所有已经可信提交的 Proposal、Candidate、Gate、Stable 与健康回执。后续修订只能
+/// 在这些向量和可选字段后追加，不能删除或改写先前证据。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillEvolutionCycleSnapshotV1 {
+    /// 阶段快照结构版本。
+    pub schema_version: u32,
+    /// 原始可信请求。
+    pub request: SkillEvolutionCycleRequestV1,
+    /// 启动时完整读取的 Stable Parent 引用。
+    pub parent_stable: StableGenomeRef,
+    /// 当前可恢复阶段。
+    pub stage: SkillEvolutionCycleStage,
+    /// Cycle 内从零开始的连续快照序号。
+    pub sequence: u64,
+    /// 前一份快照规范 JSON 的 SHA-256 摘要；首份为 `None`。
+    pub previous_digest: Option<ArtifactDigest>,
+    /// 进入 Mutator 的可信 Issue；Proposal 尚未生成时为 `None`。
+    pub source_issue_id: Option<EvolutionIssueId>,
+    /// 与本轮证据精确绑定的 Outbox ID。
+    #[serde(default)]
+    pub source_outbox_ids: BTreeSet<String>,
+    /// Mutator 已生成的全部 Proposal。
+    #[serde(default)]
+    pub proposals: Vec<SkillMutationProposalV1>,
+    /// Builder 已登记的 Candidate 前缀。
+    #[serde(default)]
+    pub candidates: Vec<SkillCandidateV1>,
+    /// 独立 Evaluator 已提交的 Gate 回执前缀。
+    #[serde(default)]
+    pub gate_outcomes: Vec<SkillGateCycleOutcomeV1>,
+    /// 获得生产授权的 Winner。
+    pub winner: Option<CandidateId>,
+    /// Promotion 后的 Stable 引用。
+    pub promotion: Option<StableGenomeRef>,
+    /// Promotion 后健康结论。
+    pub health: Option<SkillHealthVerdictV1>,
+    /// 不健康后的 Parent 回滚引用。
+    pub rollback: Option<StableGenomeRef>,
+    /// 仅在可信终态设置的旧 Archive 兼容终态。
+    pub disposition: Option<SkillEvolutionDispositionV1>,
+    /// 确定性失败终态的稳定错误码。
+    pub failure_code: Option<String>,
+    /// 受信控制面写入该快照的 Unix 毫秒。
+    pub created_at_ms: u64,
+}
+
+impl SkillEvolutionCycleSnapshotV1 {
+    /// 校验快照结构、请求、阶段制品前缀与终态字段组合。
+    ///
+    /// # Errors
+    ///
+    /// schema、Stable Parent、证据绑定、制品数量或阶段字段组合不一致时返回
+    /// [`SkillEvolutionCycleError::InvalidArchive`]。
+    pub fn validate(&self) -> Result<(), SkillEvolutionCycleError> {
+        self.request.validate()?;
+        self.parent_stable.validate()?;
+        if let Some(promotion) = &self.promotion {
+            promotion.validate()?;
+        }
+        if let Some(health) = &self.health {
+            health.validate()?;
+        }
+        if let Some(rollback) = &self.rollback {
+            rollback.validate()?;
+        }
+        if self.schema_version != SKILL_EVOLUTION_CYCLE_SNAPSHOT_SCHEMA_VERSION
+            || self.created_at_ms == 0
+            || self.parent_stable.lineage != self.request.lineage
+            || self.parent_stable.revision_id != self.request.parent_revision_id
+            || self.parent_stable.digest != self.request.parent_genome_digest
+            || self.parent_stable.generation != self.request.expected_parent_generation
+            || self.proposals.len() > SKILL_EVOLUTION_CANDIDATE_COUNT
+            || self.candidates.len() > self.proposals.len()
+            || self.gate_outcomes.len() > self.candidates.len()
+            || self
+                .candidates
+                .iter()
+                .zip(&self.proposals)
+                .any(|(candidate, proposal)| {
+                    candidate.cycle_id != self.request.cycle_id
+                        || candidate.mutation_id != proposal.mutation_id
+                })
+            || self
+                .gate_outcomes
+                .iter()
+                .zip(&self.candidates)
+                .any(|(outcome, candidate)| outcome.candidate_id() != &candidate.candidate_id)
+        {
+            return Err(SkillEvolutionCycleError::InvalidArchive);
+        }
+        let has_no_source = self.source_issue_id.is_none()
+            && self.source_outbox_ids.is_empty()
+            && self.proposals.is_empty();
+        let has_committed_source = self.source_issue_id.is_some()
+            && !self.source_outbox_ids.is_empty()
+            && self.source_outbox_ids.iter().all(|id| valid_control_id(id))
+            && self.proposals.len() == SKILL_EVOLUTION_CANDIDATE_COUNT;
+        if !has_no_source && !has_committed_source {
+            return Err(SkillEvolutionCycleError::InvalidArchive);
+        }
+        if let Some(winner) = &self.winner {
+            let eligible = self.gate_outcomes.iter().any(|outcome| {
+                matches!(outcome, SkillGateCycleOutcomeV1::Promoted(receipt)
+                    if receipt.permits_production()
+                        && receipt.evaluated_candidate.candidate_id == *winner)
+            });
+            if !eligible {
+                return Err(SkillEvolutionCycleError::InvalidArchive);
+            }
+        }
+        if self.stage == SkillEvolutionCycleStage::Failed {
+            if self.disposition.is_some()
+                || self
+                    .failure_code
+                    .as_deref()
+                    .is_none_or(|code| !valid_control_id(code))
+                || self.rollback.is_some() && self.health.is_none()
+                || self.health.is_some() && self.promotion.is_none()
+                || self.promotion.is_some() && self.winner.is_none()
+            {
+                return Err(SkillEvolutionCycleError::InvalidArchive);
+            }
+            return Ok(());
+        }
+        let before_mutation_commit = matches!(
+            self.stage,
+            SkillEvolutionCycleStage::Requested | SkillEvolutionCycleStage::Mutating
+        );
+        if before_mutation_commit != has_no_source
+            || (!before_mutation_commit && !has_committed_source)
+        {
+            return Err(SkillEvolutionCycleError::InvalidArchive);
+        }
+        if self.candidates.len() != SKILL_EVOLUTION_CANDIDATE_COUNT
+            && matches!(
+                self.stage,
+                SkillEvolutionCycleStage::Evaluating
+                    | SkillEvolutionCycleStage::SelectingWinner
+                    | SkillEvolutionCycleStage::Promoting
+                    | SkillEvolutionCycleStage::AwaitingHealth
+                    | SkillEvolutionCycleStage::VerifyingHealth
+                    | SkillEvolutionCycleStage::HealthVerified
+                    | SkillEvolutionCycleStage::RollingBack
+                    | SkillEvolutionCycleStage::RolledBack
+                    | SkillEvolutionCycleStage::Rejected
+            )
+        {
+            return Err(SkillEvolutionCycleError::InvalidArchive);
+        }
+        if self.gate_outcomes.len() != SKILL_EVOLUTION_CANDIDATE_COUNT
+            && matches!(
+                self.stage,
+                SkillEvolutionCycleStage::SelectingWinner
+                    | SkillEvolutionCycleStage::Promoting
+                    | SkillEvolutionCycleStage::AwaitingHealth
+                    | SkillEvolutionCycleStage::VerifyingHealth
+                    | SkillEvolutionCycleStage::HealthVerified
+                    | SkillEvolutionCycleStage::RollingBack
+                    | SkillEvolutionCycleStage::RolledBack
+                    | SkillEvolutionCycleStage::Rejected
+            )
+        {
+            return Err(SkillEvolutionCycleError::InvalidArchive);
+        }
+        let terminal = match self.stage {
+            SkillEvolutionCycleStage::Rejected => {
+                self.disposition == Some(SkillEvolutionDispositionV1::Rejected)
+                    && self.winner.is_none()
+                    && self.promotion.is_none()
+                    && self.health.is_none()
+                    && self.rollback.is_none()
+            }
+            SkillEvolutionCycleStage::HealthVerified => {
+                self.disposition == Some(SkillEvolutionDispositionV1::HealthVerified)
+                    && self.winner.is_some()
+                    && self.promotion.is_some()
+                    && matches!(self.health, Some(SkillHealthVerdictV1::Healthy { .. }))
+                    && self.rollback.is_none()
+            }
+            SkillEvolutionCycleStage::RolledBack => {
+                self.disposition == Some(SkillEvolutionDispositionV1::RolledBack)
+                    && self.winner.is_some()
+                    && self.promotion.is_some()
+                    && matches!(self.health, Some(SkillHealthVerdictV1::Unhealthy { .. }))
+                    && self.rollback.is_some()
+            }
+            SkillEvolutionCycleStage::Failed => unreachable!("失败阶段已提前校验"),
+            _ => self.disposition.is_none() && self.failure_code.is_none(),
+        };
+        if !terminal
+            || (self.winner.is_some()
+                != matches!(
+                    self.stage,
+                    SkillEvolutionCycleStage::Promoting
+                        | SkillEvolutionCycleStage::AwaitingHealth
+                        | SkillEvolutionCycleStage::VerifyingHealth
+                        | SkillEvolutionCycleStage::HealthVerified
+                        | SkillEvolutionCycleStage::RollingBack
+                        | SkillEvolutionCycleStage::RolledBack
+                ))
+            || (self.promotion.is_some()
+                != matches!(
+                    self.stage,
+                    SkillEvolutionCycleStage::AwaitingHealth
+                        | SkillEvolutionCycleStage::VerifyingHealth
+                        | SkillEvolutionCycleStage::HealthVerified
+                        | SkillEvolutionCycleStage::RollingBack
+                        | SkillEvolutionCycleStage::RolledBack
+                ))
+            || (self.health.is_some()
+                != matches!(
+                    self.stage,
+                    SkillEvolutionCycleStage::HealthVerified
+                        | SkillEvolutionCycleStage::RollingBack
+                        | SkillEvolutionCycleStage::RolledBack
+                ))
+            || (self.rollback.is_some() != (self.stage == SkillEvolutionCycleStage::RolledBack))
+        {
+            return Err(SkillEvolutionCycleError::InvalidArchive);
+        }
+        Ok(())
+    }
+}
+
+/// 文件系统上的只追加 Skill Cycle 阶段 Archive。
+#[derive(Debug, Clone)]
+pub struct FileSkillEvolutionCycleArchive {
+    root: PathBuf,
+}
+
+impl FileSkillEvolutionCycleArchive {
+    /// 创建延迟初始化的 Skill Cycle Archive。
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// 返回阶段 Archive 根目录。
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// 计算快照规范 JSON 的 SHA-256 摘要。
+    ///
+    /// # Errors
+    ///
+    /// 快照无法序列化或摘要无法构造成强类型值时返回错误。
+    pub fn snapshot_digest(
+        snapshot: &SkillEvolutionCycleSnapshotV1,
+    ) -> Result<ArtifactDigest, SkillEvolutionCycleError> {
+        let bytes =
+            serde_json::to_vec(snapshot).map_err(SkillEvolutionCycleError::ArchiveSerialization)?;
+        skill_digest_bytes(&bytes)
+    }
+
+    /// 追加一份不可变阶段快照并复读验证。
+    ///
+    /// # Errors
+    ///
+    /// 快照、摘要链、阶段迁移、历史前缀、路径或 I/O 无效时返回错误。
+    pub async fn append(
+        &self,
+        snapshot: &SkillEvolutionCycleSnapshotV1,
+    ) -> Result<(), SkillEvolutionCycleError> {
+        snapshot.validate()?;
+        ensure_safe_archive_directory(&self.root).await?;
+        let cycle_root = self.cycle_root(&snapshot.request.cycle_id);
+        ensure_safe_archive_directory(&cycle_root).await?;
+        let history = self.history(&snapshot.request.cycle_id).await?;
+        validate_next_skill_snapshot(history.last(), snapshot)?;
+        let path = cycle_root.join(format!("{:020}.json", snapshot.sequence));
+        let bytes = serde_json::to_vec_pretty(snapshot)
+            .map_err(SkillEvolutionCycleError::ArchiveSerialization)?;
+        enforce_skill_snapshot_size(bytes.len() as u64)?;
+        append_new_file(&path, &bytes).await?;
+        let observed = read_skill_snapshot(&path).await?;
+        if observed != *snapshot {
+            return Err(SkillEvolutionCycleError::ArchiveConflict(path));
+        }
+        Ok(())
+    }
+
+    /// 读取并验证指定 Cycle 的完整快照历史。
+    ///
+    /// # Errors
+    ///
+    /// 路径、JSON、摘要链、阶段迁移或历史前缀无效时返回错误。
+    pub async fn history(
+        &self,
+        cycle_id: &EvolutionCycleId,
+    ) -> Result<Vec<SkillEvolutionCycleSnapshotV1>, SkillEvolutionCycleError> {
+        let cycle_root = self.cycle_root(cycle_id);
+        let metadata = match fs::symlink_metadata(&cycle_root).await {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(archive_io_error(
+                    "检查 Skill Cycle 阶段目录",
+                    &cycle_root,
+                    source,
+                ))
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(SkillEvolutionCycleError::UnsafeArchivePath(cycle_root));
+        }
+        let mut directory = fs::read_dir(&cycle_root)
+            .await
+            .map_err(|source| archive_io_error("遍历 Skill Cycle 阶段目录", &cycle_root, source))?;
+        let mut paths = Vec::new();
+        while let Some(entry) = directory.next_entry().await.map_err(|source| {
+            archive_io_error("读取 Skill Cycle 阶段目录项", &cycle_root, source)
+        })? {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                return Err(SkillEvolutionCycleError::UnsafeArchivePath(path));
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            if name.len() != 25
+                || !name.ends_with(".json")
+                || !name[..20].bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(SkillEvolutionCycleError::UnsafeArchivePath(path));
+            }
+            paths.push(path);
+        }
+        paths.sort();
+        let mut history = Vec::with_capacity(paths.len());
+        for path in paths {
+            let snapshot = read_skill_snapshot(&path).await?;
+            if snapshot.request.cycle_id != *cycle_id
+                || path
+                    != self
+                        .cycle_root(cycle_id)
+                        .join(format!("{:020}.json", snapshot.sequence))
+            {
+                return Err(SkillEvolutionCycleError::ArchiveHistoryInvalid);
+            }
+            validate_next_skill_snapshot(history.last(), &snapshot)?;
+            history.push(snapshot);
+        }
+        Ok(history)
+    }
+
+    /// 返回指定 Cycle 的最新快照；不存在时返回 `None`。
+    ///
+    /// # Errors
+    ///
+    /// 完整历史无法验证时返回错误。
+    pub async fn latest(
+        &self,
+        cycle_id: &EvolutionCycleId,
+    ) -> Result<Option<SkillEvolutionCycleSnapshotV1>, SkillEvolutionCycleError> {
+        Ok(self.history(cycle_id).await?.pop())
+    }
+
+    /// 返回单个 Cycle 的固定阶段归档目录。
+    fn cycle_root(&self, cycle_id: &EvolutionCycleId) -> PathBuf {
+        self.root.join(cycle_id.as_str())
+    }
+}
+
 /// 一轮 Skill Cycle 的不可变全量归档。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -275,6 +685,7 @@ where
 {
     evolution_root: PathBuf,
     artifacts: FileArtifactStore,
+    archive: FileSkillEvolutionCycleArchive,
     mutator: BoundedSkillMutator<G>,
     orchestrator: O,
 }
@@ -292,6 +703,7 @@ where
         let evolution_root = evolution_root.into();
         Self {
             artifacts: FileArtifactStore::new(evolution_root.join("artifacts")),
+            archive: FileSkillEvolutionCycleArchive::new(evolution_root.join("skill-cycles")),
             evolution_root,
             mutator: BoundedSkillMutator::m7(generator),
             orchestrator,
@@ -301,6 +713,11 @@ where
     /// 返回 Runner 使用的 Artifact CAS，供独立 Gate 适配器共享同一 Store。
     pub fn artifacts(&self) -> &FileArtifactStore {
         &self.artifacts
+    }
+
+    /// 返回只追加 Skill Cycle 阶段 Archive。
+    pub fn cycle_archive(&self) -> &FileSkillEvolutionCycleArchive {
+        &self.archive
     }
 
     /// 执行一次完整 Skill 生产闭环并归档全部 Candidate。
@@ -321,12 +738,236 @@ where
         evidence: &MutationEvidence,
     ) -> Result<SkillEvolutionCycleResultV1, SkillEvolutionCycleError> {
         request.validate()?;
-        let publisher = FileStableGenomePublisher::new(&self.evolution_root);
-        let expected_stable = self.validate_stable(request, publisher.resolver()).await?;
-        let parent = publisher
-            .resolver()
+        if let Some(archive) =
+            read_existing_archive(&self.evolution_root, &request.cycle_id).await?
+        {
+            if archive.request != *request {
+                return Err(SkillEvolutionCycleError::CycleRequestConflict);
+            }
+            validate_archive(&archive)?;
+            if let Some(snapshot) = self.archive.latest(&request.cycle_id).await? {
+                if snapshot.request != *request || !is_consumable_skill_stage(snapshot.stage) {
+                    return Err(SkillEvolutionCycleError::StateArtifactMismatch);
+                }
+                if archive_from_snapshot(&snapshot)? != archive {
+                    return Err(SkillEvolutionCycleError::StateArtifactMismatch);
+                }
+                self.finalize_terminal(&snapshot).await?;
+            }
+            let archive_path = final_archive_path(&self.evolution_root, &request.cycle_id);
+            return Ok(SkillEvolutionCycleResultV1 {
+                archive,
+                archive_path,
+            });
+        }
+        let mut snapshot = self.run_until_health(request, evidence).await?;
+        if snapshot.stage == SkillEvolutionCycleStage::AwaitingHealth {
+            snapshot = self.verify_health(&request.cycle_id).await?;
+        }
+        let archive = archive_from_snapshot(&snapshot)?;
+        let archive_path = append_archive(&self.evolution_root, &archive).await?;
+        Ok(SkillEvolutionCycleResultV1 {
+            archive,
+            archive_path,
+        })
+    }
+
+    /// 执行或恢复 Skill Cycle，直到等待显式健康观察或进入可信终态。
+    ///
+    /// # Errors
+    ///
+    /// 请求、证据、Stable、Candidate、Evaluator、阶段 Archive 或终态归档失败时返回错误。
+    pub async fn run_until_health(
+        &self,
+        request: &SkillEvolutionCycleRequestV1,
+        evidence: &MutationEvidence,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+        request.validate()?;
+        if read_existing_archive(&self.evolution_root, &request.cycle_id)
+            .await?
+            .is_some()
+            && self.archive.latest(&request.cycle_id).await?.is_none()
+        {
+            return Err(SkillEvolutionCycleError::LegacyArchiveAlreadyComplete);
+        }
+        let initial = if let Some(existing) = self.archive.latest(&request.cycle_id).await? {
+            if existing.request != *request {
+                return Err(SkillEvolutionCycleError::CycleRequestConflict);
+            }
+            self.validate_recovery_evidence(&existing, evidence)?;
+            if is_terminal_skill_stage(existing.stage)
+                || existing.stage == SkillEvolutionCycleStage::AwaitingHealth
+            {
+                self.finalize_terminal(&existing).await?;
+                return Ok(existing);
+            }
+            existing
+        } else {
+            if evidence.genome_digest != request.parent_genome_digest
+                || evidence.episodes.is_empty()
+            {
+                return Err(SkillEvolutionCycleError::EvidenceBindingMismatch);
+            }
+            let publisher = FileStableGenomePublisher::new(&self.evolution_root);
+            let parent_stable = self.validate_stable(request, publisher.resolver()).await?;
+            let initial = SkillEvolutionCycleSnapshotV1 {
+                schema_version: SKILL_EVOLUTION_CYCLE_SNAPSHOT_SCHEMA_VERSION,
+                request: request.clone(),
+                parent_stable,
+                stage: SkillEvolutionCycleStage::Requested,
+                sequence: 0,
+                previous_digest: None,
+                source_issue_id: None,
+                source_outbox_ids: BTreeSet::new(),
+                proposals: Vec::new(),
+                candidates: Vec::new(),
+                gate_outcomes: Vec::new(),
+                winner: None,
+                promotion: None,
+                health: None,
+                rollback: None,
+                disposition: None,
+                failure_code: None,
+                created_at_ms: now_ms()?,
+            };
+            self.archive.append(&initial).await?;
+            initial
+        };
+        match self.run_active(initial, Some(evidence)).await {
+            Ok(snapshot) => {
+                self.finalize_terminal(&snapshot).await?;
+                Ok(snapshot)
+            }
+            Err(error) => {
+                if error.should_close_cycle() {
+                    let _ = self.append_failed(request, error.code()).await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// 不重新读取 MutationEvidence，从已提交 Proposal 之后的阶段继续 Cycle。
+    ///
+    /// # Errors
+    ///
+    /// Cycle 不存在、请求不一致、仍停留在 Mutation 前阶段，或后续控制面失败时返回错误。
+    pub async fn resume(
+        &self,
+        request: &SkillEvolutionCycleRequestV1,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+        request.validate()?;
+        let current = self
+            .archive
+            .latest(&request.cycle_id)
+            .await?
+            .ok_or_else(|| SkillEvolutionCycleError::CycleNotFound(request.cycle_id.clone()))?;
+        if current.request != *request {
+            return Err(SkillEvolutionCycleError::CycleRequestConflict);
+        }
+        if current.stage.requires_mutation_evidence() {
+            return Err(SkillEvolutionCycleError::EvidenceRequired);
+        }
+        if is_terminal_skill_stage(current.stage)
+            || current.stage == SkillEvolutionCycleStage::AwaitingHealth
+        {
+            self.finalize_terminal(&current).await?;
+            return Ok(current);
+        }
+        let snapshot = self.run_active(current, None).await?;
+        self.finalize_terminal(&snapshot).await?;
+        Ok(snapshot)
+    }
+
+    /// 从已归档 Promotion 继续健康验证，并在失败时自动回滚 Parent。
+    ///
+    /// # Errors
+    ///
+    /// Cycle 不存在、阶段不允许、独立健康控制面、回滚或归档失败时返回错误。
+    pub async fn verify_health(
+        &self,
+        cycle_id: &EvolutionCycleId,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+        let current = self
+            .archive
+            .latest(cycle_id)
+            .await?
+            .ok_or_else(|| SkillEvolutionCycleError::CycleNotFound(cycle_id.clone()))?;
+        if is_terminal_skill_stage(current.stage) {
+            self.finalize_terminal(&current).await?;
+            return Ok(current);
+        }
+        if !matches!(
+            current.stage,
+            SkillEvolutionCycleStage::AwaitingHealth
+                | SkillEvolutionCycleStage::VerifyingHealth
+                | SkillEvolutionCycleStage::RollingBack
+        ) {
+            return Err(SkillEvolutionCycleError::HealthNotReady(current.stage));
+        }
+        let current = if current.stage == SkillEvolutionCycleStage::AwaitingHealth {
+            self.advance(current, SkillEvolutionCycleStage::VerifyingHealth, |_| {})
+                .await?
+        } else {
+            current
+        };
+        let snapshot = self.run_active(current, None).await?;
+        self.finalize_terminal(&snapshot).await?;
+        Ok(snapshot)
+    }
+
+    /// 从最后一份完整快照继续固定 Skill 状态机。
+    async fn run_active(
+        &self,
+        mut current: SkillEvolutionCycleSnapshotV1,
+        evidence: Option<&MutationEvidence>,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+        loop {
+            current = match current.stage {
+                SkillEvolutionCycleStage::Requested => {
+                    self.advance(current, SkillEvolutionCycleStage::Mutating, |_| {})
+                        .await?
+                }
+                SkillEvolutionCycleStage::Mutating => {
+                    self.resume_mutation(
+                        current,
+                        evidence.ok_or(SkillEvolutionCycleError::EvidenceRequired)?,
+                    )
+                    .await?
+                }
+                SkillEvolutionCycleStage::BuildingCandidates => {
+                    self.resume_candidate_build(current).await?
+                }
+                SkillEvolutionCycleStage::Evaluating => self.resume_evaluation(current).await?,
+                SkillEvolutionCycleStage::SelectingWinner => self.resume_selection(current).await?,
+                SkillEvolutionCycleStage::Promoting => self.resume_promotion(current).await?,
+                SkillEvolutionCycleStage::AwaitingHealth => return Ok(current),
+                SkillEvolutionCycleStage::VerifyingHealth => {
+                    self.resume_health_verification(current).await?
+                }
+                SkillEvolutionCycleStage::RollingBack => self.resume_rollback(current).await?,
+                SkillEvolutionCycleStage::HealthVerified
+                | SkillEvolutionCycleStage::RolledBack
+                | SkillEvolutionCycleStage::Rejected
+                | SkillEvolutionCycleStage::Failed => return Ok(current),
+            };
+        }
+    }
+
+    /// 幂等重算三份 Skill Proposal，并归档证据与 Outbox 精确绑定。
+    async fn resume_mutation(
+        &self,
+        current: SkillEvolutionCycleSnapshotV1,
+        evidence: &MutationEvidence,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+        if evidence.genome_digest != current.request.parent_genome_digest
+            || evidence.episodes.is_empty()
+        {
+            return Err(SkillEvolutionCycleError::EvidenceBindingMismatch);
+        }
+        let parent = FileGenomeResolver::new(&self.evolution_root)
             .resolve(&GenomeSelector::Revision(
-                request.parent_revision_id.clone(),
+                current.request.parent_revision_id.clone(),
             ))
             .await?;
         let proposals = self
@@ -334,128 +975,376 @@ where
             .propose(
                 &parent,
                 evidence,
-                request.mutation_generated_at_ms,
+                current.request.mutation_generated_at_ms,
                 &self.artifacts,
             )
             .await?;
         if proposals.len() != SKILL_EVOLUTION_CANDIDATE_COUNT {
             return Err(SkillEvolutionCycleError::CandidateCountMismatch);
         }
+        let source_outbox_ids = evidence
+            .episodes
+            .iter()
+            .map(|episode| episode.outbox_id.clone())
+            .collect();
+        self.advance(
+            current,
+            SkillEvolutionCycleStage::BuildingCandidates,
+            |snapshot| {
+                snapshot.source_issue_id = Some(evidence.issue_id.clone());
+                snapshot.source_outbox_ids = source_outbox_ids;
+                snapshot.proposals = proposals;
+            },
+        )
+        .await
+    }
 
-        let builder = SkillCandidateBuilder::new(publisher.resolver().store(), &self.artifacts);
-        let mut candidates = Vec::with_capacity(proposals.len());
-        for proposal in &proposals {
-            candidates.push(
-                builder
-                    .build_at(
-                        request.cycle_id.clone(),
-                        proposal,
-                        request.candidate_created_at_ms,
-                    )
-                    .await?,
-            );
+    /// 逐个构建 Candidate；CAS 已提交但快照未落盘时由 Builder 幂等复读。
+    async fn resume_candidate_build(
+        &self,
+        current: SkillEvolutionCycleSnapshotV1,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+        if current.proposals.len() != SKILL_EVOLUTION_CANDIDATE_COUNT {
+            return Err(SkillEvolutionCycleError::StateArtifactMismatch);
         }
-
-        let mut gate_outcomes = Vec::with_capacity(candidates.len());
-        for candidate in &candidates {
-            let outcome = self
-                .orchestrator
-                .evaluate_and_promote(candidate, request.evaluated_at_ms, request.activated_at_ms)
-                .await?;
-            self.validate_gate_outcome(candidate, &outcome, publisher.resolver())
-                .await?;
-            gate_outcomes.push(outcome);
+        if current.candidates.len() == current.proposals.len() {
+            return self
+                .advance(current, SkillEvolutionCycleStage::Evaluating, |_| {})
+                .await;
         }
+        let index = current.candidates.len();
+        let resolver = FileGenomeResolver::new(&self.evolution_root);
+        let candidate = SkillCandidateBuilder::new(resolver.store(), &self.artifacts)
+            .build_at(
+                current.request.cycle_id.clone(),
+                &current.proposals[index],
+                current.request.candidate_created_at_ms,
+            )
+            .await?;
+        self.advance(
+            current,
+            SkillEvolutionCycleStage::BuildingCandidates,
+            |snapshot| snapshot.candidates.push(candidate),
+        )
+        .await
+    }
 
-        let winner = gate_outcomes.iter().find_map(|outcome| match outcome {
-            SkillGateCycleOutcomeV1::Promoted(receipt) if receipt.permits_production() => {
-                Some(receipt)
-            }
-            _ => None,
-        });
-        let (winner_id, promotion, health, rollback, disposition) = if let Some(winner) = winner {
-            let promotion_generation = request
-                .expected_parent_generation
-                .checked_add(1)
-                .ok_or(SkillEvolutionCycleError::GenerationOverflow)?;
-            let promotion_release =
-                deterministic_release_id("skillpromotion", &request.cycle_id, &winner.report_id)?;
-            let promoted = publisher
+    /// 逐个调用独立 Skill Evaluator，并在每份 Gate 回执后落盘。
+    async fn resume_evaluation(
+        &self,
+        current: SkillEvolutionCycleSnapshotV1,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+        if current.candidates.len() != SKILL_EVOLUTION_CANDIDATE_COUNT {
+            return Err(SkillEvolutionCycleError::StateArtifactMismatch);
+        }
+        if current.gate_outcomes.len() == current.candidates.len() {
+            return self
+                .advance(current, SkillEvolutionCycleStage::SelectingWinner, |_| {})
+                .await;
+        }
+        let candidate = &current.candidates[current.gate_outcomes.len()];
+        let outcome = self
+            .orchestrator
+            .evaluate_and_promote(
+                candidate,
+                current.request.evaluated_at_ms,
+                current.request.activated_at_ms,
+            )
+            .await?;
+        self.validate_gate_outcome(
+            candidate,
+            &outcome,
+            &FileGenomeResolver::new(&self.evolution_root),
+        )
+        .await?;
+        self.advance(current, SkillEvolutionCycleStage::Evaluating, |snapshot| {
+            snapshot.gate_outcomes.push(outcome);
+        })
+        .await
+    }
+
+    /// 从完整 Gate 回执中选择首个具有生产授权的 Candidate。
+    async fn resume_selection(
+        &self,
+        current: SkillEvolutionCycleSnapshotV1,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+        if current.gate_outcomes.len() != SKILL_EVOLUTION_CANDIDATE_COUNT {
+            return Err(SkillEvolutionCycleError::StateArtifactMismatch);
+        }
+        let winner = current
+            .gate_outcomes
+            .iter()
+            .find_map(|outcome| match outcome {
+                SkillGateCycleOutcomeV1::Promoted(receipt) if receipt.permits_production() => {
+                    Some(receipt.evaluated_candidate.candidate_id.clone())
+                }
+                _ => None,
+            });
+        let Some(winner) = winner else {
+            return self
+                .advance(current, SkillEvolutionCycleStage::Rejected, |snapshot| {
+                    snapshot.disposition = Some(SkillEvolutionDispositionV1::Rejected);
+                })
+                .await;
+        };
+        self.advance(current, SkillEvolutionCycleStage::Promoting, |snapshot| {
+            snapshot.winner = Some(winner);
+        })
+        .await
+    }
+
+    /// 使用确定性 Release ID 发布 Winner，并识别“已发布、快照未落盘”的恢复窗口。
+    async fn resume_promotion(
+        &self,
+        current: SkillEvolutionCycleSnapshotV1,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+        let winner = winner_receipt(&current)?.clone();
+        let candidate = current
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == winner.evaluated_candidate.candidate_id)
+            .ok_or(SkillEvolutionCycleError::StateArtifactMismatch)?;
+        self.validate_gate_outcome(
+            candidate,
+            &SkillGateCycleOutcomeV1::Promoted(Box::new(winner.clone())),
+            &FileGenomeResolver::new(&self.evolution_root),
+        )
+        .await?;
+        let generation = current
+            .request
+            .expected_parent_generation
+            .checked_add(1)
+            .ok_or(SkillEvolutionCycleError::GenerationOverflow)?;
+        let release_id = deterministic_release_id(
+            "skillpromotion",
+            &current.request.cycle_id,
+            &winner.report_id,
+        )?;
+        let expected =
+            StableGenomeRef::new(&current.request.lineage, &winner.active_genome, generation)?
+                .bind_release(
+                    release_id.clone(),
+                    winner.report_id.clone(),
+                    current.parent_stable.revision_id.clone(),
+                    None,
+                );
+        let publisher = FileStableGenomePublisher::new(&self.evolution_root);
+        let observed = publisher
+            .resolver()
+            .stable_reference(&current.request.lineage)
+            .await?;
+        let promoted = if observed == expected {
+            expected
+        } else if observed == current.parent_stable {
+            publisher
                 .publish_bound(
-                    &expected_stable,
+                    &current.parent_stable,
                     &winner.active_genome,
-                    promotion_generation,
-                    promotion_release.clone(),
+                    generation,
+                    release_id,
                     winner.report_id.clone(),
                     None,
                 )
-                .await?;
-            let health = self.orchestrator.verify_health(&promoted).await?;
-            health.validate()?;
-            match &health {
-                SkillHealthVerdictV1::Healthy { .. } => (
-                    Some(winner.evaluated_candidate.candidate_id.clone()),
-                    Some(promoted),
-                    Some(health),
-                    None,
-                    SkillEvolutionDispositionV1::HealthVerified,
-                ),
-                SkillHealthVerdictV1::Unhealthy { .. } => {
-                    let rollback_generation = promotion_generation
-                        .checked_add(1)
-                        .ok_or(SkillEvolutionCycleError::GenerationOverflow)?;
-                    let rollback_release = deterministic_release_id(
-                        "skillrollback",
-                        &request.cycle_id,
-                        &winner.report_id,
-                    )?;
-                    let rolled_back = publisher
-                        .publish_bound(
-                            &promoted,
-                            &parent,
-                            rollback_generation,
-                            rollback_release,
-                            winner.report_id.clone(),
-                            Some(promotion_release),
-                        )
-                        .await?;
-                    (
-                        Some(winner.evaluated_candidate.candidate_id.clone()),
-                        Some(promoted),
-                        Some(health),
-                        Some(rolled_back),
-                        SkillEvolutionDispositionV1::RolledBack,
-                    )
-                }
-            }
+                .await?
         } else {
-            (
-                None,
-                None,
-                None,
-                None,
-                SkillEvolutionDispositionV1::Rejected,
-            )
+            return Err(SkillEvolutionCycleError::StablePreconditionFailed);
         };
+        self.advance(
+            current,
+            SkillEvolutionCycleStage::AwaitingHealth,
+            |snapshot| snapshot.promotion = Some(promoted),
+        )
+        .await
+    }
 
-        let archive = SkillEvolutionArchiveV1 {
-            schema_version: SKILL_EVOLUTION_ARCHIVE_SCHEMA_VERSION,
-            request: request.clone(),
-            proposals,
-            candidates,
-            gate_outcomes,
-            winner: winner_id,
-            promotion,
-            health,
-            rollback,
-            disposition,
+    /// 调用独立健康控制面并归档健康终态或回滚前置阶段。
+    async fn resume_health_verification(
+        &self,
+        current: SkillEvolutionCycleSnapshotV1,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+        let promoted = current
+            .promotion
+            .as_ref()
+            .ok_or(SkillEvolutionCycleError::StateArtifactMismatch)?;
+        let health = self.orchestrator.verify_health(promoted).await?;
+        health.validate()?;
+        let stage = if matches!(health, SkillHealthVerdictV1::Healthy { .. }) {
+            SkillEvolutionCycleStage::HealthVerified
+        } else {
+            SkillEvolutionCycleStage::RollingBack
         };
-        validate_archive(&archive)?;
-        let archive_path = append_archive(&self.evolution_root, &archive).await?;
-        Ok(SkillEvolutionCycleResultV1 {
-            archive,
-            archive_path,
+        self.advance(current, stage, |snapshot| {
+            if stage == SkillEvolutionCycleStage::HealthVerified {
+                snapshot.disposition = Some(SkillEvolutionDispositionV1::HealthVerified);
+            }
+            snapshot.health = Some(health);
         })
+        .await
+    }
+
+    /// 原子回滚 Parent，并识别“已回滚、快照未落盘”的恢复窗口。
+    async fn resume_rollback(
+        &self,
+        current: SkillEvolutionCycleSnapshotV1,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+        if !matches!(current.health, Some(SkillHealthVerdictV1::Unhealthy { .. })) {
+            return Err(SkillEvolutionCycleError::StateArtifactMismatch);
+        }
+        let promoted = current
+            .promotion
+            .as_ref()
+            .ok_or(SkillEvolutionCycleError::StateArtifactMismatch)?;
+        let winner = winner_receipt(&current)?;
+        let parent = FileGenomeResolver::new(&self.evolution_root)
+            .resolve(&GenomeSelector::Revision(
+                current.request.parent_revision_id.clone(),
+            ))
+            .await?;
+        let generation = promoted
+            .generation
+            .checked_add(1)
+            .ok_or(SkillEvolutionCycleError::GenerationOverflow)?;
+        let rollback_release = deterministic_release_id(
+            "skillrollback",
+            &current.request.cycle_id,
+            &winner.report_id,
+        )?;
+        let promotion_release = promoted
+            .release_id
+            .clone()
+            .ok_or(SkillEvolutionCycleError::StateArtifactMismatch)?;
+        let expected = StableGenomeRef::new(&current.request.lineage, &parent, generation)?
+            .bind_release(
+                rollback_release.clone(),
+                winner.report_id.clone(),
+                promoted.revision_id.clone(),
+                Some(promotion_release.clone()),
+            );
+        let publisher = FileStableGenomePublisher::new(&self.evolution_root);
+        let observed = publisher
+            .resolver()
+            .stable_reference(&current.request.lineage)
+            .await?;
+        let rollback = if observed == expected {
+            expected
+        } else if observed == *promoted {
+            publisher
+                .publish_bound(
+                    promoted,
+                    &parent,
+                    generation,
+                    rollback_release,
+                    winner.report_id.clone(),
+                    Some(promotion_release),
+                )
+                .await?
+        } else {
+            return Err(SkillEvolutionCycleError::StablePreconditionFailed);
+        };
+        self.advance(current, SkillEvolutionCycleStage::RolledBack, |snapshot| {
+            snapshot.rollback = Some(rollback);
+            snapshot.disposition = Some(SkillEvolutionDispositionV1::RolledBack);
+        })
+        .await
+    }
+
+    /// 追加保留全部既有制品的下一阶段快照。
+    async fn advance<F>(
+        &self,
+        previous: SkillEvolutionCycleSnapshotV1,
+        stage: SkillEvolutionCycleStage,
+        mutate: F,
+    ) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError>
+    where
+        F: FnOnce(&mut SkillEvolutionCycleSnapshotV1),
+    {
+        let mut next = previous.clone();
+        next.sequence = previous
+            .sequence
+            .checked_add(1)
+            .ok_or(SkillEvolutionCycleError::SequenceOverflow)?;
+        next.previous_digest = Some(FileSkillEvolutionCycleArchive::snapshot_digest(&previous)?);
+        next.stage = stage;
+        next.created_at_ms = now_ms()?;
+        next.failure_code = None;
+        mutate(&mut next);
+        self.archive.append(&next).await?;
+        Ok(next)
+    }
+
+    /// 尽力追加一个保留此前全部证据的失败终态。
+    async fn append_failed(
+        &self,
+        request: &SkillEvolutionCycleRequestV1,
+        code: &'static str,
+    ) -> Result<(), SkillEvolutionCycleError> {
+        let Some(previous) = self.archive.latest(&request.cycle_id).await? else {
+            return Ok(());
+        };
+        if is_terminal_skill_stage(previous.stage) {
+            return Ok(());
+        }
+        self.advance(previous, SkillEvolutionCycleStage::Failed, |snapshot| {
+            snapshot.failure_code = Some(code.to_string());
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// 先提交兼容最终 Archive，再按受信 Issue、Episode 和 Outbox 三重绑定消费来源。
+    async fn finalize_terminal(
+        &self,
+        snapshot: &SkillEvolutionCycleSnapshotV1,
+    ) -> Result<(), SkillEvolutionCycleError> {
+        if !is_consumable_skill_stage(snapshot.stage) {
+            return Ok(());
+        }
+        let archive = archive_from_snapshot(snapshot)?;
+        append_archive(&self.evolution_root, &archive).await?;
+        let issue_id = snapshot
+            .source_issue_id
+            .as_ref()
+            .ok_or(SkillEvolutionCycleError::StateArtifactMismatch)?;
+        let episode_ids = snapshot
+            .proposals
+            .iter()
+            .flat_map(|proposal| proposal.evidence_episode_ids.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let outbox = FileEvolutionOutbox::new(self.evolution_root.join("outbox"));
+        for item in outbox.pending().await? {
+            if snapshot.source_outbox_ids.contains(&item.outbox_id)
+                && item.issue_id.as_ref() == Some(issue_id)
+                && episode_ids.contains(&item.episode_id)
+            {
+                outbox.mark_consumed(&item.outbox_id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 校验恢复调用携带的证据仍与已归档来源完全一致。
+    fn validate_recovery_evidence(
+        &self,
+        snapshot: &SkillEvolutionCycleSnapshotV1,
+        evidence: &MutationEvidence,
+    ) -> Result<(), SkillEvolutionCycleError> {
+        if evidence.genome_digest != snapshot.request.parent_genome_digest {
+            return Err(SkillEvolutionCycleError::EvidenceBindingMismatch);
+        }
+        if snapshot.source_issue_id.is_none() {
+            return Ok(());
+        }
+        let outbox_ids = evidence
+            .episodes
+            .iter()
+            .map(|episode| episode.outbox_id.clone())
+            .collect::<BTreeSet<_>>();
+        if snapshot.source_issue_id.as_ref() != Some(&evidence.issue_id)
+            || snapshot.source_outbox_ids != outbox_ids
+        {
+            return Err(SkillEvolutionCycleError::EvidenceBindingMismatch);
+        }
+        Ok(())
     }
 
     /// 复核请求 Parent 正是当前 Stable 的同一修订、摘要和代数。
@@ -643,6 +1532,30 @@ pub enum SkillEvolutionCycleError {
     /// 请求字段或时间顺序无效。
     #[error("Skill Evolution Cycle 请求无效")]
     InvalidRequest,
+    /// 相同 Cycle ID 已绑定另一请求。
+    #[error("Skill Evolution Cycle ID 已绑定另一请求")]
+    CycleRequestConflict,
+    /// 指定 Cycle 不存在。
+    #[error("Skill Evolution Cycle 不存在：{0}")]
+    CycleNotFound(EvolutionCycleId),
+    /// 当前阶段不能执行健康验证。
+    #[error("Skill Evolution Cycle 当前阶段不能验证健康：{0:?}")]
+    HealthNotReady(SkillEvolutionCycleStage),
+    /// 旧格式最终 Archive 已完成，不能伪造此前不存在的阶段历史。
+    #[error("Skill Evolution Cycle 已存在旧格式最终 Archive")]
+    LegacyArchiveAlreadyComplete,
+    /// 恢复阶段仍需要原始脱敏 MutationEvidence。
+    #[error("Skill Evolution Cycle 恢复缺少 MutationEvidence")]
+    EvidenceRequired,
+    /// MutationEvidence 与请求或已归档来源不一致。
+    #[error("Skill Evolution Cycle MutationEvidence 绑定不匹配")]
+    EvidenceBindingMismatch,
+    /// 已归档阶段制品的数量、顺序或身份不一致。
+    #[error("Skill Evolution Cycle 已归档制品与阶段不一致")]
+    StateArtifactMismatch,
+    /// 快照序号无法递增。
+    #[error("Skill Evolution Cycle 快照序号溢出")]
+    SequenceOverflow,
     /// 当前 Stable 与请求 Parent 的修订、摘要或代数不一致。
     #[error("Skill Evolution Cycle Stable 前置条件失败")]
     StablePreconditionFailed,
@@ -703,6 +1616,26 @@ pub enum SkillEvolutionCycleError {
     /// Archive JSON 编码失败。
     #[error("序列化 Skill Evolution Archive 失败：{0}")]
     ArchiveSerialization(serde_json::Error),
+    /// 阶段 Archive JSON 无法解析。
+    #[error("Skill Evolution Cycle 阶段快照损坏：{path}: {source}")]
+    ArchiveDeserialization {
+        /// 损坏记录路径。
+        path: PathBuf,
+        /// 原始 JSON 错误。
+        #[source]
+        source: serde_json::Error,
+    },
+    /// 阶段 Archive 超出固定字节上限。
+    #[error("Skill Evolution Cycle 阶段快照过大：{actual} 字节，上限 {maximum} 字节")]
+    ArchiveTooLarge {
+        /// 实际字节数。
+        actual: u64,
+        /// 固定上限。
+        maximum: u64,
+    },
+    /// 阶段 Archive 的摘要链、迁移或历史前缀无效。
+    #[error("Skill Evolution Cycle 阶段历史无效")]
+    ArchiveHistoryInvalid,
     /// 同一 Cycle 已存在不同归档正文。
     #[error("Skill Evolution Archive 已存在不同正文：{0}")]
     ArchiveConflict(PathBuf),
@@ -747,6 +1680,15 @@ pub enum SkillEvolutionCycleError {
     /// Stable 发布失败。
     #[error(transparent)]
     GenomePromotion(#[from] GenomePromotionError),
+    /// Evolution Outbox 失败。
+    #[error(transparent)]
+    Outbox(#[from] OutboxError),
+    /// 系统时钟不可用。
+    #[error("Skill Evolution Cycle 系统时间不可用：{0}")]
+    Clock(#[from] SystemTimeError),
+    /// Unix 毫秒超过 `u64`。
+    #[error("Skill Evolution Cycle 系统时间溢出")]
+    ClockOverflow,
 }
 
 impl SkillEvolutionCycleError {
@@ -754,6 +1696,15 @@ impl SkillEvolutionCycleError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidRequest => "skill_cycle_request_invalid",
+            Self::CycleRequestConflict => "skill_cycle_request_conflict",
+            Self::CycleNotFound(_) => "skill_cycle_not_found",
+            Self::HealthNotReady(_) => "skill_health_not_ready",
+            Self::LegacyArchiveAlreadyComplete => "skill_cycle_legacy_complete",
+            Self::EvidenceRequired | Self::EvidenceBindingMismatch => "skill_evidence_invalid",
+            Self::StateArtifactMismatch => "skill_cycle_state_invalid",
+            Self::SequenceOverflow | Self::Clock(_) | Self::ClockOverflow => {
+                "skill_cycle_time_invalid"
+            }
             Self::StablePreconditionFailed => "skill_stable_precondition_failed",
             Self::CandidateCountMismatch => "skill_candidate_count_mismatch",
             Self::GateCandidateMismatch
@@ -775,6 +1726,9 @@ impl SkillEvolutionCycleError {
             }
             Self::InvalidArchive
             | Self::ArchiveSerialization(_)
+            | Self::ArchiveDeserialization { .. }
+            | Self::ArchiveTooLarge { .. }
+            | Self::ArchiveHistoryInvalid
             | Self::ArchiveConflict(_)
             | Self::UnsafeArchivePath(_)
             | Self::ArchiveIo { .. } => "skill_archive_failed",
@@ -786,7 +1740,19 @@ impl SkillEvolutionCycleError {
                 "skill_genome_store_failed"
             }
             Self::GenomePromotion(_) => "skill_stable_publish_failed",
+            Self::Outbox(_) => "skill_outbox_consume_failed",
         }
+    }
+
+    /// 判断错误是否适合追加确定性失败终态。
+    fn should_close_cycle(&self) -> bool {
+        matches!(
+            self,
+            Self::StablePreconditionFailed
+                | Self::CandidateCountMismatch
+                | Self::EvidenceBindingMismatch
+                | Self::StateArtifactMismatch
+        )
     }
 }
 
@@ -828,6 +1794,279 @@ fn validate_archive(archive: &SkillEvolutionArchiveV1) -> Result<(), SkillEvolut
         return Err(SkillEvolutionCycleError::InvalidArchive);
     }
     Ok(())
+}
+
+/// 从可信终态快照构造字节兼容的旧版最终 Archive。
+fn archive_from_snapshot(
+    snapshot: &SkillEvolutionCycleSnapshotV1,
+) -> Result<SkillEvolutionArchiveV1, SkillEvolutionCycleError> {
+    snapshot.validate()?;
+    let disposition = snapshot
+        .disposition
+        .ok_or(SkillEvolutionCycleError::StateArtifactMismatch)?;
+    let archive = SkillEvolutionArchiveV1 {
+        schema_version: SKILL_EVOLUTION_ARCHIVE_SCHEMA_VERSION,
+        request: snapshot.request.clone(),
+        proposals: snapshot.proposals.clone(),
+        candidates: snapshot.candidates.clone(),
+        gate_outcomes: snapshot.gate_outcomes.clone(),
+        winner: snapshot.winner.clone(),
+        promotion: snapshot.promotion.clone(),
+        health: snapshot.health.clone(),
+        rollback: snapshot.rollback.clone(),
+        disposition,
+    };
+    validate_archive(&archive)?;
+    Ok(archive)
+}
+
+/// 返回当前快照中获得生产授权的 Winner Gate 回执。
+fn winner_receipt(
+    snapshot: &SkillEvolutionCycleSnapshotV1,
+) -> Result<&SkillGatePromotionV1, SkillEvolutionCycleError> {
+    let winner = snapshot
+        .winner
+        .as_ref()
+        .ok_or(SkillEvolutionCycleError::StateArtifactMismatch)?;
+    snapshot
+        .gate_outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            SkillGateCycleOutcomeV1::Promoted(receipt)
+                if receipt.permits_production()
+                    && receipt.evaluated_candidate.candidate_id == *winner =>
+            {
+                Some(receipt.as_ref())
+            }
+            _ => None,
+        })
+        .ok_or(SkillEvolutionCycleError::StateArtifactMismatch)
+}
+
+/// 校验并连接相邻 Skill Cycle 快照。
+fn validate_next_skill_snapshot(
+    previous: Option<&SkillEvolutionCycleSnapshotV1>,
+    next: &SkillEvolutionCycleSnapshotV1,
+) -> Result<(), SkillEvolutionCycleError> {
+    next.validate()?;
+    match previous {
+        None => {
+            if next.sequence != 0
+                || next.previous_digest.is_some()
+                || next.stage != SkillEvolutionCycleStage::Requested
+            {
+                return Err(SkillEvolutionCycleError::ArchiveHistoryInvalid);
+            }
+        }
+        Some(previous) => {
+            if previous.request != next.request
+                || previous.parent_stable != next.parent_stable
+                || previous.sequence.checked_add(1) != Some(next.sequence)
+                || next.previous_digest.as_ref()
+                    != Some(&FileSkillEvolutionCycleArchive::snapshot_digest(previous)?)
+                || !allowed_skill_transition(previous.stage, next.stage)
+                || !next.proposals.starts_with(&previous.proposals)
+                || !next.candidates.starts_with(&previous.candidates)
+                || !next.gate_outcomes.starts_with(&previous.gate_outcomes)
+                || (previous.source_issue_id.is_some()
+                    && previous.source_issue_id != next.source_issue_id)
+                || (!previous.source_outbox_ids.is_empty()
+                    && previous.source_outbox_ids != next.source_outbox_ids)
+                || (previous.winner.is_some() && previous.winner != next.winner)
+                || (previous.promotion.is_some() && previous.promotion != next.promotion)
+                || (previous.health.is_some() && previous.health != next.health)
+                || (previous.rollback.is_some() && previous.rollback != next.rollback)
+                || (previous.disposition.is_some() && previous.disposition != next.disposition)
+            {
+                return Err(SkillEvolutionCycleError::ArchiveHistoryInvalid);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 判断相邻阶段是否属于固定 Skill Cycle 状态机。
+fn allowed_skill_transition(from: SkillEvolutionCycleStage, to: SkillEvolutionCycleStage) -> bool {
+    if is_terminal_skill_stage(from) {
+        return false;
+    }
+    to == SkillEvolutionCycleStage::Failed
+        || matches!(
+            (from, to),
+            (
+                SkillEvolutionCycleStage::Requested,
+                SkillEvolutionCycleStage::Mutating
+            ) | (
+                SkillEvolutionCycleStage::Mutating,
+                SkillEvolutionCycleStage::BuildingCandidates
+            ) | (
+                SkillEvolutionCycleStage::BuildingCandidates,
+                SkillEvolutionCycleStage::BuildingCandidates
+            ) | (
+                SkillEvolutionCycleStage::BuildingCandidates,
+                SkillEvolutionCycleStage::Evaluating
+            ) | (
+                SkillEvolutionCycleStage::Evaluating,
+                SkillEvolutionCycleStage::Evaluating
+            ) | (
+                SkillEvolutionCycleStage::Evaluating,
+                SkillEvolutionCycleStage::SelectingWinner
+            ) | (
+                SkillEvolutionCycleStage::SelectingWinner,
+                SkillEvolutionCycleStage::Promoting
+            ) | (
+                SkillEvolutionCycleStage::SelectingWinner,
+                SkillEvolutionCycleStage::Rejected
+            ) | (
+                SkillEvolutionCycleStage::Promoting,
+                SkillEvolutionCycleStage::AwaitingHealth
+            ) | (
+                SkillEvolutionCycleStage::AwaitingHealth,
+                SkillEvolutionCycleStage::VerifyingHealth
+            ) | (
+                SkillEvolutionCycleStage::VerifyingHealth,
+                SkillEvolutionCycleStage::HealthVerified
+            ) | (
+                SkillEvolutionCycleStage::VerifyingHealth,
+                SkillEvolutionCycleStage::RollingBack
+            ) | (
+                SkillEvolutionCycleStage::RollingBack,
+                SkillEvolutionCycleStage::RolledBack
+            )
+        )
+}
+
+/// 判断阶段是否已经关闭，不得再追加后续状态。
+fn is_terminal_skill_stage(stage: SkillEvolutionCycleStage) -> bool {
+    matches!(
+        stage,
+        SkillEvolutionCycleStage::HealthVerified
+            | SkillEvolutionCycleStage::RolledBack
+            | SkillEvolutionCycleStage::Rejected
+            | SkillEvolutionCycleStage::Failed
+    )
+}
+
+/// 判断终态是否具备完整最终 Archive 并允许消费来源 Outbox。
+fn is_consumable_skill_stage(stage: SkillEvolutionCycleStage) -> bool {
+    matches!(
+        stage,
+        SkillEvolutionCycleStage::HealthVerified
+            | SkillEvolutionCycleStage::RolledBack
+            | SkillEvolutionCycleStage::Rejected
+    )
+}
+
+/// 读取既有字节兼容最终 Archive；不存在时返回 `None`。
+async fn read_existing_archive(
+    evolution_root: &Path,
+    cycle_id: &EvolutionCycleId,
+) -> Result<Option<SkillEvolutionArchiveV1>, SkillEvolutionCycleError> {
+    let path = final_archive_path(evolution_root, cycle_id);
+    let metadata = match fs::symlink_metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(archive_io_error("检查 Skill Cycle 最终归档", &path, source)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(SkillEvolutionCycleError::UnsafeArchivePath(path));
+    }
+    let bytes = fs::read(&path)
+        .await
+        .map_err(|source| archive_io_error("读取 Skill Cycle 最终归档", &path, source))?;
+    let archive = serde_json::from_slice(&bytes).map_err(|source| {
+        SkillEvolutionCycleError::ArchiveDeserialization {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    Ok(Some(archive))
+}
+
+/// 返回旧版最终 Archive 的稳定路径。
+fn final_archive_path(evolution_root: &Path, cycle_id: &EvolutionCycleId) -> PathBuf {
+    evolution_root
+        .join("skill-cycle-archive")
+        .join(format!("{cycle_id}.json"))
+}
+
+/// 读取并校验一份阶段快照普通文件。
+async fn read_skill_snapshot(
+    path: &Path,
+) -> Result<SkillEvolutionCycleSnapshotV1, SkillEvolutionCycleError> {
+    let metadata = fs::symlink_metadata(path)
+        .await
+        .map_err(|source| archive_io_error("检查 Skill Cycle 阶段快照", path, source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(SkillEvolutionCycleError::UnsafeArchivePath(
+            path.to_path_buf(),
+        ));
+    }
+    enforce_skill_snapshot_size(metadata.len())?;
+    let bytes = fs::read(path)
+        .await
+        .map_err(|source| archive_io_error("读取 Skill Cycle 阶段快照", path, source))?;
+    enforce_skill_snapshot_size(bytes.len() as u64)?;
+    let snapshot = serde_json::from_slice(&bytes).map_err(|source| {
+        SkillEvolutionCycleError::ArchiveDeserialization {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    SkillEvolutionCycleSnapshotV1::validate(&snapshot)?;
+    Ok(snapshot)
+}
+
+/// 以临时文件与硬链接提交一份不可变普通文件。
+async fn append_new_file(path: &Path, bytes: &[u8]) -> Result<(), SkillEvolutionCycleError> {
+    let root = path
+        .parent()
+        .ok_or_else(|| SkillEvolutionCycleError::UnsafeArchivePath(path.to_path_buf()))?;
+    let temporary = root.join(format!(".{}.tmp", Uuid::new_v4().simple()));
+    let result = async {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await
+            .map_err(|source| archive_io_error("创建 Skill Cycle 临时快照", &temporary, source))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|source| archive_io_error("写入 Skill Cycle 临时快照", &temporary, source))?;
+        file.sync_all()
+            .await
+            .map_err(|source| archive_io_error("同步 Skill Cycle 临时快照", &temporary, source))?;
+        drop(file);
+        fs::hard_link(&temporary, path)
+            .await
+            .map_err(|source| archive_io_error("提交 Skill Cycle 阶段快照", path, source))
+    }
+    .await;
+    let _ = fs::remove_file(&temporary).await;
+    result
+}
+
+/// 校验阶段快照字节数不超过固定上限。
+fn enforce_skill_snapshot_size(actual: u64) -> Result<(), SkillEvolutionCycleError> {
+    if actual > MAX_SKILL_CYCLE_SNAPSHOT_BYTES {
+        return Err(SkillEvolutionCycleError::ArchiveTooLarge {
+            actual,
+            maximum: MAX_SKILL_CYCLE_SNAPSHOT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// 计算任意 Skill Cycle 制品的强类型 SHA-256 摘要。
+fn skill_digest_bytes(bytes: &[u8]) -> Result<ArtifactDigest, SkillEvolutionCycleError> {
+    ArtifactDigest::from_sha256_hex(format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|_| SkillEvolutionCycleError::ArchiveHistoryInvalid)
+}
+
+/// 返回当前受信 Unix 毫秒。
+fn now_ms() -> Result<u64, SkillEvolutionCycleError> {
+    u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
+        .map_err(|_| SkillEvolutionCycleError::ClockOverflow)
 }
 
 /// 校验可写入归档的控制面证据 ID，避免正文或无界数据进入 Cycle。
