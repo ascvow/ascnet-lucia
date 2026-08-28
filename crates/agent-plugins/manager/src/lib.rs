@@ -78,6 +78,16 @@ pub struct PluginLock {
     pub capability_selection: HashMap<String, String>,
 }
 
+/// 一次人工插件管理操作前捕获的可恢复状态。
+///
+/// 快照包含锁文件和每个受管理 Bundle 的确定性归档，仅用于应用层在后续人工基线提交失败时
+/// 执行补偿恢复。它不会安装新版本、选择版本或参与 Evolution Candidate。
+#[derive(Debug, Clone)]
+pub struct PluginManagerStateSnapshot {
+    lock: PluginLock,
+    bundles: BTreeMap<String, Vec<u8>>,
+}
+
 impl Default for PluginLock {
     fn default() -> Self {
         Self {
@@ -356,6 +366,106 @@ impl PluginManager {
         let mut plugins = self.load_lock()?.plugins;
         sort_lock_plugins(&mut plugins);
         Ok(plugins)
+    }
+
+    /// 捕获当前锁文件及全部受管理 Bundle，供人工管理事务失败时恢复。
+    ///
+    /// 快照不会读取未被锁文件管理的目录，也不会执行 WASM。每个 Bundle 都会重新计算摘要，
+    /// 因而篡改或缺失会在任何管理写操作发生前阻止事务开始。
+    ///
+    /// # Errors
+    ///
+    /// 锁文件无效、受管理 Bundle 缺失或篡改、归档超过安全上限或文件系统读取失败时返回错误。
+    pub fn capture_state(&self) -> Result<PluginManagerStateSnapshot> {
+        let lock = self.load_lock()?;
+        let mut bundles = BTreeMap::new();
+        for plugin in &lock.plugins {
+            let manifest = self.resolve_locked_manifest(plugin)?;
+            let bundle = manifest
+                .parent()
+                .ok_or_else(|| anyhow!("锁定 manifest 缺少 Bundle 根目录"))?;
+            let archive = pack_plugin_bundle(bundle)
+                .with_context(|| format!("归档插件 `{}` 的当前 Bundle 失败", plugin.id))?;
+            let digest = format!("{:x}", Sha256::digest(&archive));
+            if digest != plugin.sha256 {
+                bail!("插件 `{}` 的归档摘要与锁文件不一致", plugin.id);
+            }
+            bundles.insert(plugin.id.clone(), archive);
+        }
+        Ok(PluginManagerStateSnapshot { lock, bundles })
+    }
+
+    /// 恢复此前捕获的人工插件管理状态。
+    ///
+    /// 恢复先补齐并验证旧 Bundle，再原子写回旧锁文件；因此失败不会让锁文件指向尚未恢复的
+    /// Bundle。操作后产生但不再受管理的版本目录会尽力清理，清理失败只保留为可诊断残留。
+    ///
+    /// # Errors
+    ///
+    /// 快照归档损坏、目标路径被不一致内容占用、旧依赖或能力关系无法恢复，或锁文件提交失败
+    /// 时返回错误。失败可能留下尚未被锁文件引用的新版本目录，但不会把它装载为运行依赖。
+    pub fn restore_state(&self, snapshot: &PluginManagerStateSnapshot) -> Result<()> {
+        self.ensure_layout()?;
+        let current = self.load_lock()?;
+        for plugin in &snapshot.lock.plugins {
+            let archive = snapshot
+                .bundles
+                .get(&plugin.id)
+                .ok_or_else(|| anyhow!("插件 `{}` 的恢复快照缺少 Bundle", plugin.id))?;
+            let archive_digest = format!("{:x}", Sha256::digest(archive));
+            if archive_digest != plugin.sha256 {
+                bail!("插件 `{}` 的恢复快照摘要无效", plugin.id);
+            }
+            let destination = self.plugins_dir().join(&plugin.id).join(&plugin.version);
+            match fs::symlink_metadata(&destination) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        bail!(
+                            "插件恢复目标必须是非符号链接目录：{}",
+                            destination.display()
+                        );
+                    }
+                    let observed = hash_plugin_bundle(&destination)?;
+                    if observed != plugin.sha256 {
+                        bail!("插件 `{}` 的恢复目标已被不一致内容占用", plugin.id);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let parent = destination
+                        .parent()
+                        .ok_or_else(|| anyhow!("插件恢复目标缺少父目录"))?;
+                    ensure_real_directory(parent, true)?;
+                    unpack_plugin_bundle(archive, &destination)
+                        .with_context(|| format!("恢复插件 `{}` Bundle 失败", plugin.id))?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("检查插件恢复目标失败：{}", destination.display())
+                    });
+                }
+            }
+        }
+        self.validate_enabled_plugins(&snapshot.lock)?;
+        self.save_lock(&snapshot.lock)?;
+        for plugin in current.plugins {
+            let retained = snapshot
+                .lock
+                .plugins
+                .iter()
+                .any(|item| item.id == plugin.id && item.version == plugin.version);
+            if retained {
+                continue;
+            }
+            if let Ok(manifest) = self.resolve_locked_manifest(&plugin) {
+                if let Some(bundle) = manifest.parent() {
+                    let _ = fs::remove_dir_all(bundle);
+                    if let Some(parent) = bundle.parent() {
+                        let _ = remove_directory_if_empty(parent);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 启用指定插件，并在写入锁文件前检查依赖和能力冲突。
@@ -1438,6 +1548,39 @@ mod tests {
             .path
             .join("managed/plugins/echo/2.0.0/plugin.toml")
             .is_file());
+    }
+
+    /// 人工基线提交失败时必须能够恢复被替换的固定版本与原锁状态。
+    #[test]
+    fn captured_state_restores_previous_bundle_and_lock() {
+        let directory = TestDirectory::new("management-state-restore");
+        let first = create_bundle(&directory.path, "echo", "1.0.0", &[], None);
+        let second = create_bundle(&directory.path, "echo", "2.0.0", &[], None);
+        let manager = PluginManager::new(directory.path.join("managed"));
+        manager.install(&first).expect("旧版本应安装成功");
+        let before = manager.list().expect("应读取旧锁状态");
+        let snapshot = manager.capture_state().expect("应捕获可恢复状态");
+
+        manager.replace(&second).expect("新版本应替换成功");
+        manager.disable("echo").expect("新版本应可禁用");
+        manager
+            .restore_state(&snapshot)
+            .expect("应恢复人工管理状态");
+
+        assert_eq!(manager.list().expect("恢复后锁文件应可读"), before);
+        assert!(directory
+            .path
+            .join("managed/plugins/echo/1.0.0/plugin.toml")
+            .is_file());
+        assert!(!directory.path.join("managed/plugins/echo/2.0.0").exists());
+        assert_eq!(
+            manager
+                .runtime_config()
+                .expect("恢复后运行时配置应健康")
+                .manifest_paths
+                .len(),
+            1
+        );
     }
 
     #[test]
