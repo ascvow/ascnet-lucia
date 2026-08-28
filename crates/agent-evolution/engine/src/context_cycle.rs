@@ -6,8 +6,8 @@
 use crate::{
     ArtifactStore, ArtifactStoreError, ContextCandidateBuildError, ContextCandidateBuilder,
     ContextEvaluatorClient, EpisodeStore, EpisodeStoreError, EvaluatorProcessError,
-    FileArtifactStore, FileEpisodeStore, FileGenomeResolver, GenomeResolver, GenomeResolverError,
-    GenomeSelector,
+    EvolutionOutbox, FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox, FileGenomeResolver,
+    GenomeResolver, GenomeResolverError, GenomeSelector, OutboxError,
 };
 use agent_evolution_protocol::{
     ArtifactDigest, CandidateId, ContextEvaluationReceiptV1, ContextEvaluationRequestV1,
@@ -803,8 +803,8 @@ where
     ///
     /// # Errors
     ///
-    /// 请求、Stable/Episode 绑定、策略 CAS、Candidate Builder、独立 Evaluator 或 Archive
-    /// 失败时返回 [`ContextCycleError`]。
+    /// 请求、Stable/Episode 绑定、策略 CAS、Candidate Builder、独立 Evaluator、Archive 或
+    /// 终态 Outbox 消费失败时返回 [`ContextCycleError`]。
     pub async fn run(
         &self,
         request: &ContextEvolutionCycleRequestV1,
@@ -817,7 +817,13 @@ where
             if existing.request != *request {
                 return Err(ContextCycleError::CycleRequestConflict);
             }
-            if is_terminal(existing.stage) || existing.stage == ContextCycleStage::AwaitingHealth {
+            if is_terminal(existing.stage) {
+                if should_consume_outbox(existing.stage) {
+                    self.consume_outbox(request).await?;
+                }
+                return Ok(existing);
+            }
+            if existing.stage == ContextCycleStage::AwaitingHealth {
                 return Ok(existing);
             }
             existing
@@ -843,7 +849,12 @@ where
             initial
         };
         match self.run_active(initial).await {
-            Ok(snapshot) => Ok(snapshot),
+            Ok(snapshot) => {
+                if should_consume_outbox(snapshot.stage) {
+                    self.consume_outbox(request).await?;
+                }
+                Ok(snapshot)
+            }
             Err(error) => {
                 if error.should_close_cycle() {
                     let _ = self.append_failed(request, error.code()).await;
@@ -857,8 +868,8 @@ where
     ///
     /// # Errors
     ///
-    /// Cycle 不存在、阶段不允许、健康观察/发布控制面或 Archive 失败时返回
-    /// [`ContextCycleError`]。
+    /// Cycle 不存在、阶段不允许、健康观察/发布控制面、Archive 或终态 Outbox 消费失败时
+    /// 返回 [`ContextCycleError`]。
     pub async fn verify_health(
         &self,
         cycle_id: &EvolutionCycleId,
@@ -869,6 +880,9 @@ where
             .await?
             .ok_or_else(|| ContextCycleError::CycleNotFound(cycle_id.clone()))?;
         if is_terminal(current.stage) {
+            if should_consume_outbox(current.stage) {
+                self.consume_outbox(&current.request).await?;
+            }
             return Ok(current);
         }
         if current.stage != ContextCycleStage::AwaitingHealth
@@ -883,7 +897,11 @@ where
         } else {
             current
         };
-        self.run_active(current).await
+        let snapshot = self.run_active(current).await?;
+        if should_consume_outbox(snapshot.stage) {
+            self.consume_outbox(&snapshot.request).await?;
+        }
+        Ok(snapshot)
     }
 
     /// 从最后一份完整快照继续固定状态机。
@@ -1244,6 +1262,23 @@ where
         .await?;
         Ok(())
     }
+
+    /// 仅在闭环终态消费与请求证据精确绑定的 Evolution Outbox 记录。
+    ///
+    /// 消费标记独立于原始只追加记录；重复恢复终态时会幂等跳过已消费项。等待健康观察期间
+    /// 不调用本方法，确保 Promotion 尚未验证或回滚时证据仍可恢复。
+    async fn consume_outbox(
+        &self,
+        request: &ContextEvolutionCycleRequestV1,
+    ) -> Result<(), ContextCycleError> {
+        let store = FileEvolutionOutbox::new(self.evolution_root.join("outbox"));
+        for item in store.pending().await? {
+            if request.evidence_episode_ids.contains(&item.episode_id) {
+                store.mark_consumed(&item.outbox_id).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Context Cycle 执行错误。
@@ -1315,6 +1350,9 @@ pub enum ContextCycleError {
     /// Context Cycle Archive 失败。
     #[error(transparent)]
     Archive(#[from] ContextCycleArchiveError),
+    /// Evolution Outbox 读取或消费失败。
+    #[error(transparent)]
+    Outbox(#[from] OutboxError),
     /// 确定性 ID 无效。
     #[error("Context Cycle 确定性 ID 无效：{0}")]
     DeterministicId(String),
@@ -1346,6 +1384,7 @@ impl ContextCycleError {
             | Self::Resolver(_)
             | Self::Candidate(_)
             | Self::Archive(_)
+            | Self::Outbox(_)
             | Self::DeterministicId(_) => "context_cycle_store_failed",
             Self::Evaluator(_) => "context_evaluator_failed",
         }
@@ -1552,6 +1591,16 @@ fn is_terminal(stage: ContextCycleStage) -> bool {
             | ContextCycleStage::RolledBack
             | ContextCycleStage::Rejected
             | ContextCycleStage::Failed
+    )
+}
+
+/// 只有已完成可信健康结论或无需发布的拒绝终态才消费 Evolution Outbox。
+fn should_consume_outbox(stage: ContextCycleStage) -> bool {
+    matches!(
+        stage,
+        ContextCycleStage::HealthVerified
+            | ContextCycleStage::RolledBack
+            | ContextCycleStage::Rejected
     )
 }
 
