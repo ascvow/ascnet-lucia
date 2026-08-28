@@ -19,6 +19,8 @@ pub(crate) struct PluginExecutionContext {
     pub(crate) run_observer: Option<Arc<dyn agent_runtime::RuntimeRunObserver>>,
     /// 插件无工具模型完成使用的固定模型 ID；缺省时沿用主模型。
     pub(crate) model: Option<String>,
+    /// Serve 平面使用的应用插件状态目录；受限平面必须保持为 `None`。
+    pub(crate) persistent_state_dir: Option<PathBuf>,
 }
 
 /// TUI 首帧后的可信插件启动输入。
@@ -271,6 +273,9 @@ pub(crate) async fn load_plugins_for_tui(
     let model_output_limit = plugin_model_output_limit(&execution.execution_policy);
     let mut host_services =
         PluginHostServices::new().restrict_execution_policy(&execution.execution_policy);
+    if let Some(state_dir) = execution.persistent_state_dir {
+        host_services = host_services.with_persistent_state_dir(state_dir)?;
+    }
     for (plugin_id, metadata) in prepared.activation_metadata {
         host_services = host_services.with_activation_metadata(plugin_id, metadata)?;
     }

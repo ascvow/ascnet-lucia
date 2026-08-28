@@ -9,7 +9,12 @@ use std::{
     env, fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
+use toml_edit::{value, DocumentMut};
+
+/// 配置原子写入使用的进程内序号，避免连续切换复用同一临时文件名。
+static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// 首次初始化写入的安全配置模板。
 ///
@@ -238,6 +243,71 @@ pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
     Ok(settings)
 }
 
+/// 原子更新 `[agent].reasoning`，同时保留配置中的注释、顺序和其他用户字段。
+///
+/// 该写入使用目标目录内的 0600 临时文件并在同步后替换原文件。读取、解析、创建、同步或
+/// 重命名失败时返回错误，原配置和调用方当前运行参数都应保持不变。
+pub(crate) fn persist_reasoning_level(path: &Path, level: ReasoningLevel) -> Result<()> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
+    let mut document = text
+        .parse::<DocumentMut>()
+        .with_context(|| format!("解析配置文件失败：{}", path.display()))?;
+    document["agent"]["reasoning"] = value(reasoning_level_value(level));
+    atomic_write_config(path, document.to_string().as_bytes())
+}
+
+/// 返回配置文件使用的稳定推理等级值。
+fn reasoning_level_value(level: ReasoningLevel) -> &'static str {
+    match level {
+        ReasoningLevel::Off => "off",
+        ReasoningLevel::Minimal => "minimal",
+        ReasoningLevel::Low => "low",
+        ReasoningLevel::Medium => "medium",
+        ReasoningLevel::High => "high",
+        ReasoningLevel::XHigh => "x_high",
+        ReasoningLevel::Max => "max",
+    }
+}
+
+/// 在配置文件所在目录完成一次可恢复的原子替换。
+fn atomic_write_config(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("配置文件名不是有效 UTF-8：{}", path.display()))?;
+    let sequence = CONFIG_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("创建配置临时文件失败：{}", temporary.display()))?;
+    let written = (|| -> Result<()> {
+        file.write_all(contents)
+            .with_context(|| format!("写入配置临时文件失败：{}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("同步配置临时文件失败：{}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("原子更新配置文件失败：{}", path.display()))?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("同步配置目录失败：{}", parent.display()))?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written
+}
+
 /// 以配置文件所在目录为基准解析应用路径。
 pub(crate) fn resolve_config_relative_path(config_path: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -320,6 +390,41 @@ mod tests {
         fs::write(&path, "[model]\ncontext_window = 0\n").expect("写入零窗口配置");
         let settings = load_tui_settings(&path).expect("读取零窗口配置");
         assert_eq!(settings.context_window, None);
+        fs::remove_dir_all(root).expect("清理配置测试目录");
+    }
+
+    /// 切换推理等级必须保留用户注释和其他字段，并能被 Core 在下一次启动时读取。
+    #[test]
+    fn persists_reasoning_level_without_reformatting_config() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("创建配置测试目录");
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "# 用户注释\n[model]\nprovider = \"open-ai\"\nmodel = \"gpt-test\"\n\n[agent]\nmax_steps = 7 # 保留行尾注释\n",
+        )
+        .expect("写入推理配置");
+
+        persist_reasoning_level(&path, ReasoningLevel::XHigh).expect("持久化推理等级");
+
+        let text = fs::read_to_string(&path).expect("读取更新后的配置");
+        assert!(text.contains("# 用户注释"));
+        assert!(text.contains("max_steps = 7 # 保留行尾注释"));
+        assert!(text.contains("reasoning = \"x_high\""));
+        let config = agent_core::config::AgentRootConfig::load(&path).expect("Core 应读取新等级");
+        assert_eq!(config.agent.reasoning, Some(ReasoningLevel::XHigh));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("读取更新配置权限")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         fs::remove_dir_all(root).expect("清理配置测试目录");
     }
 

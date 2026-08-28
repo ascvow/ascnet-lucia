@@ -24,6 +24,8 @@ let plugin = WasmPluginHost::load_from_manifest_with_limits(
 
 `WasmPluginHost` 公开可信 `id()`、`manifest()` 和 `deactivate()`。默认限制为每次调用 `50_000_000` fuel，并将单个线性内存限制为 `64 MiB`；应用可通过 `WasmPluginLimits` 调整。
 
+应用未注入状态目录时，Guest 的 `get_state`、`set_state` 和 `remove_state` 保持插件实例内存语义。应用可通过 `PluginHostServices::with_persistent_state_dir` 启用按插件 ID 隔离的版本化 JSON 状态；Host 使用私有目录与文件权限、大小和键数上限以及原子替换，并在写入成功后才提交内存状态。生产状态目录只应注入 `Serve` 平面，Evaluation 与 Mutation 平面不得复用。
+
 ## 组合宿主
 
 ```rust

@@ -38,6 +38,16 @@ fn native_workspace_guard(
     Ok(agent_tool::WorkspaceGuard::from_policy(&effective_policy)?)
 }
 
+/// 仅为生产 Serve 平面返回应用插件状态目录，避免评估和变异运行读取生产偏好。
+#[cfg(feature = "plugins")]
+fn persistent_plugin_state_dir(
+    lucia_home: &Path,
+    policy: &agent_tool::ExecutionPolicy,
+) -> Option<PathBuf> {
+    (policy.profile() == agent_tool::ExecutionProfile::Serve)
+        .then(|| lucia_home.join("plugin-state"))
+}
+
 /// 终端状态守卫：正常退出、`?` 提前返回或 panic 展开时都恢复终端。
 ///
 /// raw mode 或 bracketed paste 残留会让外层 shell 换行不回车、粘贴出现
@@ -465,7 +475,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
 
     // UI 通道 sink 之外，可选叠加 JSONL sink 用于排查请求与工具调用。
     let mut sink = CompositeEventSink::new();
-    let (ui_sink, model_deltas) = ChannelEventSink::new(tx.clone());
+    let (ui_sink, model_deltas, thinking_deltas) = ChannelEventSink::new(tx.clone());
     sink.push(Arc::new(ui_sink));
     if let Some(path) = events_jsonl.as_ref() {
         sink.push(Arc::new(JsonlEventSink::new(path.clone())));
@@ -574,6 +584,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
 
     let mut app = App::new(tx.clone(), model_name)
         .with_workspace(workspace)
+        .with_config_path(config_path.clone())
         .with_context_window(context_window)
         .with_reasoning_levels(reasoning_levels, reasoning_level)
         .with_persistent_session(session_store, session_record)
@@ -602,6 +613,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         let plugin_execution_policy = genome_policy
             .cloned()
             .unwrap_or_else(agent_tool::ExecutionPolicy::serve);
+        let persistent_state_dir =
+            persistent_plugin_state_dir(&lucia_home, &plugin_execution_policy);
         let run_observer = evidence_runtime
             .as_ref()
             .map(EvidenceRuntime::runtime_run_observer);
@@ -616,6 +629,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     execution_policy: plugin_execution_policy,
                     run_observer,
                     model: tui_settings.plugin_model.clone(),
+                    persistent_state_dir,
                 },
                 load_host,
                 load_tx.clone(),
@@ -804,6 +818,15 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     .take();
                 if !delta.is_empty() {
                     app.append_model_delta(&delta);
+                }
+            }
+            Some(UiEvent::ModelThinkingReady) => {
+                let delta = thinking_deltas
+                    .lock()
+                    .expect("推理摘要增量缓冲区锁不应中毒")
+                    .take();
+                if !delta.is_empty() {
+                    app.append_model_thinking(&delta);
                 }
             }
             Some(UiEvent::ToolStarted(call)) => {
@@ -1119,6 +1142,25 @@ mod tests {
         assert_eq!(
             options.execution_policy.profile(),
             ExecutionProfile::Mutation
+        );
+    }
+
+    /// 生产插件偏好只允许进入 Serve 平面，Evaluation 与 Mutation 必须使用隔离内存状态。
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn persistent_plugin_state_is_scoped_to_serve_plane() {
+        let home = Path::new("/tmp/lucia-home");
+        assert_eq!(
+            persistent_plugin_state_dir(home, &ExecutionPolicy::serve()),
+            Some(home.join("plugin-state"))
+        );
+        assert_eq!(
+            persistent_plugin_state_dir(home, &ExecutionPolicy::evaluation("/tmp/lucia-fixture")),
+            None
+        );
+        assert_eq!(
+            persistent_plugin_state_dir(home, &ExecutionPolicy::mutation()),
+            None
         );
     }
 

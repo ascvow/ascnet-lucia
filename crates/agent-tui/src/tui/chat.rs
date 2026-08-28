@@ -62,6 +62,18 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                 message.to_lines(app.streaming_message == Some(index), inner_width)
             })
             .collect();
+        // 推理摘要仅存在于当前运行态，帮助确认推理已启用，但不会进入消息或会话记录。
+        if app.running && !app.model_thinking.is_empty() {
+            for (index, text) in app.model_thinking.lines().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if index == 0 { "思考  " } else { "      " },
+                        Style::new().fg(COLOR_WARNING).bold(),
+                    ),
+                    Span::styled(text.to_string(), Style::new().fg(COLOR_MUTED).italic()),
+                ]));
+            }
+        }
         if app.running && app.streaming_message.is_none() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
             let mut spans = vec![

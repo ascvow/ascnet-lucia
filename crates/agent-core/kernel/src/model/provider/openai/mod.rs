@@ -291,27 +291,18 @@ fn build_responses_request(req: ModelRequest, allowed_params: &[&str]) -> Result
         body["temperature"] = json!(temperature);
     }
 
-    // 推理级别映射：Off 不添加字段，其余映射为 OpenAI reasoning.effort
-    match req.reasoning {
-        ReasoningLevel::Off => {}
-        ReasoningLevel::Minimal => {
-            body["reasoning"] = json!({ "effort": "minimal" });
-        }
-        ReasoningLevel::Low => {
-            body["reasoning"] = json!({ "effort": "low" });
-        }
-        ReasoningLevel::Medium => {
-            body["reasoning"] = json!({ "effort": "medium" });
-        }
-        ReasoningLevel::High => {
-            body["reasoning"] = json!({ "effort": "high" });
-        }
-        ReasoningLevel::XHigh => {
-            body["reasoning"] = json!({ "effort": "xhigh" });
-        }
-        ReasoningLevel::Max => {
-            body["reasoning"] = json!({ "effort": "max" });
-        }
+    // 非关闭等级同时请求自动推理摘要，使客户端能观察推理确实启用但不暴露隐藏思维链。
+    let reasoning_effort = match req.reasoning {
+        ReasoningLevel::Off => None,
+        ReasoningLevel::Minimal => Some("minimal"),
+        ReasoningLevel::Low => Some("low"),
+        ReasoningLevel::Medium => Some("medium"),
+        ReasoningLevel::High => Some("high"),
+        ReasoningLevel::XHigh => Some("xhigh"),
+        ReasoningLevel::Max => Some("max"),
+    };
+    if let Some(effort) = reasoning_effort {
+        body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
     }
 
     // 按白名单过滤不支持的参数

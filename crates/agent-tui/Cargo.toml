@@ -42,6 +42,7 @@ serde_json.workspace = true
 sha2 = "0.10"
 tokio.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 # Markdown 转 ratatui Text；关闭默认的 syntect 代码高亮以减小依赖
 tui-markdown = { version = "=0.3.3", default-features = false }
 unicode-width = "0.2"

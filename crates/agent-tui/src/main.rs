@@ -73,8 +73,8 @@ use agent_tool::{JsonTool, ToolCall, ToolOutputDelta, ToolRegistry, ToolResult, 
 use anyhow::Context;
 use anyhow::{anyhow, Result};
 use app_config::{
-    initialize_config, load_tui_settings, lucia_home_dir, resolve_config_path,
-    resolve_config_relative_path, EvidenceSettings, TuiSettings,
+    initialize_config, load_tui_settings, lucia_home_dir, persist_reasoning_level,
+    resolve_config_path, resolve_config_relative_path, EvidenceSettings, TuiSettings,
 };
 use app_state::*;
 use async_trait::async_trait;
@@ -190,6 +190,8 @@ enum UiEvent {
     ModelStarted,
     /// 共享文本缓冲区已有尚未渲染的模型增量。
     ModelTextReady,
+    /// 共享推理摘要缓冲区已有尚未渲染的模型增量。
+    ModelThinkingReady,
     /// 工具开始执行，携带未经裁剪的调用数据。
     ToolStarted(ToolCall),
     /// 工具运行期间产生一段可立即展示的输出。

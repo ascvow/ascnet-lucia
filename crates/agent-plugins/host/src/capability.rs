@@ -4,6 +4,7 @@ use crate::{
     contribution::{ContributionRegistry, PromptContribution, ToolRegistrationRequest},
     manifest::{AgentCapabilitySection, CapabilitySection},
     service::{PluginService, PluginServiceCall, ServiceRegistry},
+    state::PluginStateStore,
     AgentRuntimeHostServices, ModelCompletionHostServices,
 };
 use agent_core::{AgentEvent, ModelMessage, ModelRequest, ReasoningLevel, ToolChoice};
@@ -58,6 +59,8 @@ pub(crate) struct CapabilityState {
     processes: HashMap<u64, ManagedProcess>,
     next_process_handle: u64,
     state: HashMap<String, Value>,
+    /// 应用可选注入的持久存储；缺失时保留实例内存语义。
+    state_store: Option<PluginStateStore>,
 }
 
 /// Host 在真实 Manifest 或执行策略边界拒绝插件能力时使用的类型化错误。
@@ -96,6 +99,8 @@ pub(crate) struct CapabilityHostContext {
     model_completion: Option<ModelCompletionHostServices>,
     /// Host 运行平面的可信策略，默认 Serve 以保持既有加载行为。
     execution_policy: ExecutionPolicy,
+    /// 应用拥有的持久状态目录；Guest 与 manifest 均不能声明或覆盖。
+    persistent_state_dir: Option<PathBuf>,
 }
 
 impl CapabilityHostContext {
@@ -107,11 +112,13 @@ impl CapabilityHostContext {
         agent_runtime: Option<AgentRuntimeBinding>,
         model_completion: Option<ModelCompletionHostServices>,
         execution_policy: ExecutionPolicy,
+        persistent_state_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             agent_runtime,
             model_completion,
             execution_policy,
+            persistent_state_dir,
         }
     }
 }
@@ -312,8 +319,17 @@ impl CapabilityState {
         contributions: Arc<ContributionRegistry>,
         services: Arc<ServiceRegistry>,
         host_context: CapabilityHostContext,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let state_store = host_context
+            .persistent_state_dir
+            .map(|root| PluginStateStore::new(root, &plugin_id))
+            .transpose()?;
+        let state = state_store
+            .as_ref()
+            .map(PluginStateStore::load)
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
             plugin_id,
             plugin_dir,
             permissions,
@@ -324,8 +340,9 @@ impl CapabilityState {
             model_completion: host_context.model_completion,
             processes: HashMap::new(),
             next_process_handle: 1,
-            state: HashMap::new(),
-        }
+            state,
+            state_store,
+        })
     }
 
     /// 克隆 Agent Runtime 调度所需的权限和绑定，避免跨 `await` 借用 Wasmtime store。
@@ -584,26 +601,39 @@ impl CapabilityState {
         Ok(Value::Null)
     }
 
-    /// 读取当前插件实例的内存状态。
+    /// 读取当前插件实例状态；应用注入持久目录时该映射已在激活前恢复。
     pub(crate) fn get_state(&mut self, request_json: &str) -> Result<Value> {
         let request: KeyRequest = parse_request(request_json)?;
         validate_state_key(&request.key)?;
         Ok(serde_json::to_value(self.state.get(&request.key))?)
     }
 
-    /// 写入当前插件实例的内存状态。
+    /// 事务性写入当前插件状态；持久保存失败时保留原内存值。
     pub(crate) fn set_state(&mut self, request_json: &str) -> Result<Value> {
         let request: StateSetRequest = parse_request(request_json)?;
         validate_state_key(&request.key)?;
-        self.state.insert(request.key, request.value);
+        let mut state = self.state.clone();
+        state.insert(request.key, request.value);
+        if let Some(store) = self.state_store.as_ref() {
+            store.save(&state)?;
+        }
+        self.state = state;
         Ok(Value::Null)
     }
 
-    /// 删除当前插件实例的内存状态。
+    /// 事务性删除当前插件状态；持久保存失败时保留原内存值。
     pub(crate) fn remove_state(&mut self, request_json: &str) -> Result<Value> {
         let request: KeyRequest = parse_request(request_json)?;
         validate_state_key(&request.key)?;
-        Ok(self.state.remove(&request.key).unwrap_or(Value::Null))
+        let mut state = self.state.clone();
+        let Some(removed) = state.remove(&request.key) else {
+            return Ok(Value::Null);
+        };
+        if let Some(store) = self.state_store.as_ref() {
+            store.save(&state)?;
+        }
+        self.state = state;
+        Ok(removed)
     }
 
     /// 注册或替换当前插件拥有的服务。
@@ -1293,6 +1323,7 @@ mod tests {
             Arc::new(ServiceRegistry::default()),
             CapabilityHostContext::default(),
         )
+        .expect("创建测试能力状态")
     }
 
     /// 创建带指定 manifest 进程声明和可信执行策略的测试状态。
@@ -1306,8 +1337,9 @@ mod tests {
             },
             Arc::new(ContributionRegistry::default()),
             Arc::new(ServiceRegistry::default()),
-            CapabilityHostContext::new(None, None, execution_policy),
+            CapabilityHostContext::new(None, None, execution_policy, None),
         )
+        .expect("创建进程测试能力状态")
     }
 
     /// 插件实例状态应支持读取、替换和删除。
@@ -1335,6 +1367,55 @@ mod tests {
                 .expect("读取空状态应成功"),
             Value::Null
         );
+        state
+            .set_state(r#"{"key":"nullable","value":null}"#)
+            .expect("写入空值状态应成功");
+        assert_eq!(
+            state
+                .remove_state(r#"{"key":"nullable"}"#)
+                .expect("删除空值状态应成功"),
+            Value::Null
+        );
+        assert!(!state.state.contains_key("nullable"));
+    }
+
+    /// 应用注入持久目录后，新 CapabilityState 必须在插件激活前恢复同一插件的状态。
+    #[test]
+    fn persistent_instance_state_survives_recreation() {
+        let root = std::env::temp_dir().join(format!(
+            "lucia-capability-state-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let create_state = || {
+            CapabilityState::new(
+                "permission".into(),
+                PathBuf::from("."),
+                CapabilitySection::default(),
+                Arc::new(ContributionRegistry::default()),
+                Arc::new(ServiceRegistry::default()),
+                CapabilityHostContext::new(
+                    None,
+                    None,
+                    ExecutionPolicy::serve(),
+                    Some(root.clone()),
+                ),
+            )
+            .expect("创建持久能力状态")
+        };
+        let mut first = create_state();
+        first
+            .set_state(r#"{"key":"permission_mode","value":"allow_all"}"#)
+            .expect("保存权限模式");
+
+        let mut reopened = create_state();
+        assert_eq!(
+            reopened
+                .get_state(r#"{"key":"permission_mode"}"#)
+                .expect("恢复权限模式"),
+            json!("allow_all")
+        );
+        std::fs::remove_dir_all(root).expect("清理持久能力状态测试目录");
     }
 
     /// 发布事件时 Host 必须覆盖可信的插件来源。
@@ -1348,7 +1429,8 @@ mod tests {
             contributions.clone(),
             Arc::new(ServiceRegistry::default()),
             CapabilityHostContext::default(),
-        );
+        )
+        .expect("创建事件测试能力状态");
         state
             .emit_event(r#"{"name":"demo.ready","data":{"ok":true}}"#)
             .expect("发布事件应成功");

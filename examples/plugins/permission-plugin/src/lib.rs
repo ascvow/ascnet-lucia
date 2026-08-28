@@ -1,10 +1,10 @@
 //! Agent 工具策略与交互审批插件。
 
 use agent_plugin::{
-    export_plugin, AgentPlugin, ExtensionEvent, ModelCompletionRequest, ModelCompletionResponse,
-    PluginHostApi, ToolCall, ToolDecision, ToolDecisionStatus, UiColor, UiDeclaration, UiFrame,
-    UiHostAction, UiHostActionRequest, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest,
-    UiSize, UiSpan, UiStyle,
+    export_plugin, ActivationContext, AgentPlugin, ExtensionEvent, ModelCompletionRequest,
+    ModelCompletionResponse, PluginHostApi, ToolCall, ToolDecision, ToolDecisionStatus, UiColor,
+    UiDeclaration, UiFrame, UiHostAction, UiHostActionRequest, UiInput, UiInputEvent, UiLine,
+    UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,6 +14,7 @@ use std::{
 const APPROVAL_VIEW: &str = "permission-approval";
 const MODE_VIEW: &str = "permission-mode";
 const PERMISSION_COMMAND: &str = "/permission";
+const PERMISSION_MODE_STATE_KEY: &str = "permission_mode";
 
 /// 权限插件对有副作用工具调用采用的默认处理模式。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -34,6 +35,25 @@ impl PermissionMode {
             Self::Manual => "手动审批",
             Self::ModelReview => "模型代审",
             Self::AllowAll => "全部放行",
+        }
+    }
+
+    /// 返回跨插件重启使用的稳定存储值；该值独立于界面文案和命令别名。
+    fn storage_value(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::ModelReview => "model_review",
+            Self::AllowAll => "allow_all",
+        }
+    }
+
+    /// 从插件状态恢复模式；未知值返回 `None`，由调用方安全回到手动审批。
+    fn from_storage_value(value: &serde_json::Value) -> Option<Self> {
+        match value.as_str()? {
+            "manual" => Some(Self::Manual),
+            "model_review" => Some(Self::ModelReview),
+            "allow_all" => Some(Self::AllowAll),
+            _ => None,
         }
     }
 }
@@ -66,9 +86,25 @@ pub struct PermissionPlugin {
     command_input: String,
     next_action_id: u64,
     review_notice: Option<String>,
+    mode_notice: Option<String>,
 }
 
 impl AgentPlugin for PermissionPlugin {
+    /// 激活时恢复 Host 为当前插件隔离保存的权限模式；无状态时保持最安全的手动审批。
+    fn activate(
+        &mut self,
+        host: &dyn PluginHostApi,
+        _context: ActivationContext,
+    ) -> agent_plugin::Result<()> {
+        let Some(value) = host.get_state(PERMISSION_MODE_STATE_KEY)? else {
+            return Ok(());
+        };
+        let mode = PermissionMode::from_storage_value(&value).unwrap_or(PermissionMode::Manual);
+        self.set_mode(mode);
+        self.mode_selected = permission_mode_index(mode);
+        Ok(())
+    }
+
     fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus {
         if let Some(resolution) = self.resolutions.remove(&call.id) {
             return match resolution {
@@ -144,7 +180,11 @@ impl AgentPlugin for PermissionPlugin {
                     .command_input
                     .trim_start()
                     .starts_with(PERMISSION_COMMAND),
-                lines: permission_mode_lines(self.mode, self.mode_selected),
+                lines: permission_mode_lines(
+                    self.mode,
+                    self.mode_selected,
+                    self.mode_notice.as_deref(),
+                ),
                 cursor: None,
             });
         }
@@ -219,7 +259,7 @@ impl AgentPlugin for PermissionPlugin {
     /// 处理 `/permission` 命令面板，并通过通用宿主动作清空已经消费的主输入。
     fn on_ui_input_with_host(&mut self, host: &dyn PluginHostApi, input: UiInput) {
         if input.view_id != MODE_VIEW {
-            self.on_ui_input(input);
+            self.on_approval_input_with_host(host, input);
             return;
         }
         match &input.event {
@@ -253,10 +293,64 @@ impl AgentPlugin for PermissionPlugin {
 }
 
 impl PermissionPlugin {
+    /// 处理真实 WASM 宿主路由的审批按键；“全部放行”必须成功持久化后才提交审批。
+    fn on_approval_input_with_host(&mut self, host: &dyn PluginHostApi, input: UiInput) {
+        if input.view_id != APPROVAL_VIEW || self.pending.is_empty() {
+            return;
+        }
+        let UiInputEvent::Key { code, modifiers } = input.event else {
+            return;
+        };
+        if matches!(code.as_str(), "a" | "A") && modifiers.iter().any(|value| value == "meta") {
+            self.resolve_current_with_host(host, 2);
+            return;
+        }
+        match code.as_str() {
+            "left" | "up" => {
+                self.selected = self.selected.checked_sub(1).unwrap_or(3);
+            }
+            "right" | "down" | "tab" => {
+                self.selected = (self.selected + 1) % 4;
+            }
+            "y" | "Y" => self.resolve_current(0),
+            "s" | "S" => self.resolve_current(1),
+            "a" | "A" => self.resolve_current_with_host(host, 2),
+            "c" | "C" | "escape" => self.resolve_current(3),
+            "enter" if self.selected == 2 => self.resolve_current_with_host(host, 2),
+            "enter" => self.resolve_current(self.selected),
+            _ => {}
+        }
+    }
+
     /// 处理当前审批并重置下一条请求的默认选项。
     fn resolve_current(&mut self, action: usize) {
+        self.resolve_current_with(action, |_| Ok(()));
+    }
+
+    /// 使用 Host 持久化可能改变默认模式的审批；失败时不消费待审批请求。
+    fn resolve_current_with_host(&mut self, host: &dyn PluginHostApi, action: usize) {
+        self.resolve_current_with(action, |mode| {
+            host.set_state(
+                PERMISSION_MODE_STATE_KEY,
+                &serde_json::Value::String(mode.storage_value().into()),
+            )
+        });
+    }
+
+    /// 处理当前审批；涉及默认模式时由调用方提供事务写入，失败不改变运行态。
+    fn resolve_current_with(
+        &mut self,
+        action: usize,
+        persist: impl FnOnce(PermissionMode) -> agent_plugin::Result<()>,
+    ) {
         if self.pending.is_empty() {
             return;
+        }
+        if action == 2 {
+            if let Err(error) = persist(PermissionMode::AllowAll) {
+                self.review_notice = Some(format!("保存权限模式失败，当前设置未改变：{error}"));
+                return;
+            }
         }
         let pending = self.pending.remove(0);
         let resolution = match action {
@@ -284,17 +378,36 @@ impl PermissionPlugin {
         self.mode = mode;
         self.allowed_similar.clear();
         self.review_notice = None;
+        self.mode_notice = None;
     }
 
     /// 使用 Host 固定模型路由审核当前调用，仅接受精确的 `ALLOW` 或 `DENY` 结论。
     fn review_current(&mut self, host: &dyn PluginHostApi) {
-        self.review_current_with(|request| host.complete_model(request));
+        self.review_current_with_state(
+            |request| host.complete_model(request),
+            |mode| {
+                host.set_state(
+                    PERMISSION_MODE_STATE_KEY,
+                    &serde_json::Value::String(mode.storage_value().into()),
+                )
+            },
+        );
     }
 
     /// 执行一次可测试的受限审核；完成器错误或协议无效时安全退回人工审批。
+    #[cfg(test)]
     fn review_current_with(
         &mut self,
         complete: impl FnOnce(&ModelCompletionRequest) -> agent_plugin::Result<ModelCompletionResponse>,
+    ) {
+        self.review_current_with_state(complete, |_| Ok(()));
+    }
+
+    /// 执行模型审核并在安全回退时同步持久状态；保存失败不阻止当前运行退回手动审批。
+    fn review_current_with_state(
+        &mut self,
+        complete: impl FnOnce(&ModelCompletionRequest) -> agent_plugin::Result<ModelCompletionResponse>,
+        persist: impl FnOnce(PermissionMode) -> agent_plugin::Result<()>,
     ) {
         let Some(pending) = self.pending.first().cloned() else {
             return;
@@ -314,22 +427,52 @@ impl PermissionPlugin {
             })],
             max_tokens: Some(8),
         };
-        match complete(&request) {
+        let fallback_notice = match complete(&request) {
             Ok(response) => match parse_review_decision(&response.text) {
-                Some(true) => self.resolve_current(0),
+                Some(true) => {
+                    self.resolve_current(0);
+                    return;
+                }
                 Some(false) => {
                     self.deny_current("安全审核模型拒绝了该工具调用，Agent 运行已暂停".into());
+                    return;
                 }
-                None => {
-                    self.mode = PermissionMode::Manual;
-                    self.review_notice = Some("模型返回了无效结论，已退回手动审批".into());
-                }
+                None => "模型返回了无效结论，已退回手动审批".to_string(),
             },
-            Err(error) => {
-                self.mode = PermissionMode::Manual;
-                self.review_notice = Some(format!("模型审核失败，已退回手动审批：{error}"));
-            }
+            Err(error) => format!("模型审核失败，已退回手动审批：{error}"),
+        };
+        let persist_error = persist(PermissionMode::Manual).err();
+        self.set_mode(PermissionMode::Manual);
+        self.mode_selected = permission_mode_index(PermissionMode::Manual);
+        self.review_notice = Some(match persist_error {
+            Some(error) => format!("{fallback_notice}；保存回退模式失败：{error}"),
+            None => fallback_notice,
+        });
+    }
+
+    /// 将命令选择写入 Host 后再更新内存模式；失败时保留命令输入供用户重试。
+    fn persist_command_mode(&mut self, host: &dyn PluginHostApi, mode: PermissionMode) -> bool {
+        self.persist_command_mode_with(mode, |mode| {
+            host.set_state(
+                PERMISSION_MODE_STATE_KEY,
+                &serde_json::Value::String(mode.storage_value().into()),
+            )
+        })
+    }
+
+    /// 使用可测试的状态写入切换命令模式，保证持久提交早于内存状态变更。
+    fn persist_command_mode_with(
+        &mut self,
+        mode: PermissionMode,
+        persist: impl FnOnce(PermissionMode) -> agent_plugin::Result<()>,
+    ) -> bool {
+        if let Err(error) = persist(mode) {
+            self.mode_notice = Some(format!("保存权限模式失败，当前设置未改变：{error}"));
+            return false;
         }
+        self.set_mode(mode);
+        self.mode_selected = permission_mode_index(mode);
+        true
     }
 
     /// 使用明确原因拒绝当前请求，供模型审核与后续可信策略复用。
@@ -346,9 +489,9 @@ impl PermissionPlugin {
 
     /// 应用命令选择的权限模式，并请求宿主清空命令文本。
     fn finish_mode_command(&mut self, host: &dyn PluginHostApi, mode: PermissionMode) {
-        self.set_mode(mode);
-        self.mode_selected = permission_mode_index(mode);
-        self.clear_command_input(host);
+        if self.persist_command_mode(host, mode) {
+            self.clear_command_input(host);
+        }
     }
 
     /// 清空权限命令输入；宿主动作失败时保留原输入，便于用户重试或退出。
@@ -600,8 +743,12 @@ fn approval_lines(
 }
 
 /// 构造 `/permission` 二级模式选择面板。
-fn permission_mode_lines(mode: PermissionMode, selected: usize) -> Vec<UiLine> {
-    vec![
+fn permission_mode_lines(
+    mode: PermissionMode,
+    selected: usize,
+    notice: Option<&str>,
+) -> Vec<UiLine> {
+    let mut lines = vec![
         mode_line(
             "/permission manual",
             "手动审批",
@@ -623,7 +770,13 @@ fn permission_mode_lines(mode: PermissionMode, selected: usize) -> Vec<UiLine> {
             mode == PermissionMode::AllowAll,
             selected == 2,
         ),
-    ]
+    ];
+    if let Some(notice) = notice {
+        lines.push(UiLine {
+            spans: vec![styled_span(notice, UiColor::Red, false)],
+        });
+    }
+    lines
 }
 
 /// 渲染一个纵向审批选项；选中项突出快捷键，危险操作保留红色语义。
@@ -818,6 +971,86 @@ mod tests {
         assert_eq!(parse_permission_mode_argument("/permission unknown"), None);
     }
 
+    /// 权限模式磁盘值必须稳定且未知值安全回到调用方默认策略。
+    #[test]
+    fn permission_mode_storage_values_are_stable() {
+        for (mode, value) in [
+            (PermissionMode::Manual, "manual"),
+            (PermissionMode::ModelReview, "model_review"),
+            (PermissionMode::AllowAll, "allow_all"),
+        ] {
+            assert_eq!(mode.storage_value(), value);
+            assert_eq!(
+                PermissionMode::from_storage_value(&json!(value)),
+                Some(mode)
+            );
+        }
+        assert_eq!(PermissionMode::from_storage_value(&json!("unknown")), None);
+    }
+
+    /// “全部放行”保存失败时不得消费审批或改变模式，成功后才能提交当前调用。
+    #[test]
+    fn allow_all_change_commits_only_after_state_save() {
+        let call = ToolCall::new("persist-all", "shell", json!({"command": "cargo test"}));
+        let mut plugin = PermissionPlugin::default();
+        plugin.before_tool(call.clone());
+
+        plugin.resolve_current_with(2, |_| Err(agent_plugin::anyhow!("磁盘只读")));
+        assert_eq!(plugin.mode, PermissionMode::Manual);
+        assert_eq!(plugin.pending.len(), 1);
+        assert!(plugin
+            .review_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("当前设置未改变")));
+
+        let mut saved = None;
+        plugin.resolve_current_with(2, |mode| {
+            saved = Some(mode.storage_value().to_string());
+            Ok(())
+        });
+        assert_eq!(saved.as_deref(), Some("allow_all"));
+        assert_eq!(plugin.mode, PermissionMode::AllowAll);
+        assert!(plugin.pending.is_empty());
+        assert_eq!(
+            plugin.before_tool(call),
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Allow
+            }
+        );
+    }
+
+    /// 命令模式保存失败时必须保留原模式，并把错误加入模式面板。
+    #[test]
+    fn permission_command_keeps_mode_when_state_save_fails() {
+        let mut plugin = PermissionPlugin {
+            command_input: "/permission allow-all".into(),
+            ..PermissionPlugin::default()
+        };
+
+        assert!(
+            !plugin.persist_command_mode_with(PermissionMode::AllowAll, |_| {
+                Err(agent_plugin::anyhow!("状态目录只读"))
+            })
+        );
+        assert_eq!(plugin.mode, PermissionMode::Manual);
+        let frame = plugin
+            .render_ui(UiRenderRequest {
+                plugin_id: "permission".into(),
+                view_id: MODE_VIEW.into(),
+                instance_id: None,
+                width: 68,
+                height: 4,
+                focused: true,
+                frame: 1,
+            })
+            .expect("权限模式界面应返回错误帧");
+        assert_eq!(frame.lines.len(), 4);
+        assert!(frame.lines[3]
+            .spans
+            .iter()
+            .any(|span| span.text.contains("当前设置未改变")));
+    }
+
     /// 模型代审只接受精确二元结论，避免解释文本被误判为放行。
     #[test]
     fn model_review_requires_exact_decision() {
@@ -904,6 +1137,38 @@ mod tests {
             plugin.before_tool(call),
             ToolDecisionStatus::Pending { .. }
         ));
+    }
+
+    /// 模型审核回退必须尝试保存手动模式，保存失败也不能阻止当前运行收紧权限。
+    #[test]
+    fn model_review_fallback_is_safe_when_state_save_fails() {
+        let call = ToolCall::new(
+            "model-state-error",
+            "shell",
+            json!({"command": "cargo test"}),
+        );
+        let mut plugin = PermissionPlugin {
+            mode: PermissionMode::ModelReview,
+            ..PermissionPlugin::default()
+        };
+        plugin.before_tool(call);
+        let mut persisted = None;
+
+        plugin.review_current_with_state(
+            |_| Err(agent_plugin::anyhow!("测试模型不可用")),
+            |mode| {
+                persisted = Some(mode);
+                Err(agent_plugin::anyhow!("状态目录只读"))
+            },
+        );
+
+        assert_eq!(persisted, Some(PermissionMode::Manual));
+        assert_eq!(plugin.mode, PermissionMode::Manual);
+        assert_eq!(plugin.pending.len(), 1);
+        assert!(plugin
+            .review_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("保存回退模式失败")));
     }
 
     /// 敏感文件读取必须直接拒绝，不能通过审批临时放行。

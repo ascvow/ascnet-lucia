@@ -584,13 +584,13 @@ pub trait PluginHostApi {
         self.emit_event(&ExtensionEvent::view_navigation(request)?)
     }
 
-    /// 读取插件实例内存状态；实例卸载后状态不会保留。
+    /// 读取插件状态；应用未注入持久目录时状态仅在当前实例内保留。
     fn get_state(&self, key: &str) -> Result<Option<serde_json::Value>>;
 
-    /// 写入插件实例内存状态。
+    /// 写入插件状态；应用注入持久目录时 Host 会在成功返回前原子保存。
     fn set_state(&self, key: &str, value: &serde_json::Value) -> Result<()>;
 
-    /// 删除插件实例内存状态并返回旧值。
+    /// 删除插件状态并返回旧值；持久保存失败时 Host 保留原值并返回错误。
     fn remove_state(&self, key: &str) -> Result<Option<serde_json::Value>>;
 
     /// 注册或替换当前插件拥有的服务。

@@ -82,9 +82,13 @@ pub(crate) struct App {
     pub(crate) evidence: Option<EvidenceRuntime>,
     pub(crate) tx: mpsc::UnboundedSender<UiEvent>,
     pub(crate) model_name: String,
+    /// 当前进程实际加载的配置路径；思考等级切换会原子更新该文件。
+    pub(crate) config_path: Option<PathBuf>,
     pub(crate) spinner_frame: usize,
     /// 当前正在接收增量文本的助手消息索引。
     pub(crate) streaming_message: Option<usize>,
+    /// 当前模型轮次正在流式返回的可见推理摘要；运行结束后清除且不进入 Session。
+    pub(crate) model_thinking: String,
     /// 手动滚动偏移；None 表示跟随底部自动滚动。
     pub(crate) scroll: Option<u16>,
     /// 上一帧计算出的最大滚动偏移，供滚动操作作为起点。
@@ -308,8 +312,10 @@ impl App {
             evidence: None,
             tx,
             model_name,
+            config_path: None,
             spinner_frame: 0,
             streaming_message: None,
+            model_thinking: String::new(),
             scroll: None,
             last_max_scroll: 0,
             last_viewport: 0,
@@ -360,6 +366,12 @@ impl App {
     /// 注入主函数启动时捕获的项目上下文。
     pub(crate) fn with_workspace(mut self, workspace: WorkspaceContext) -> Self {
         self.workspace = workspace;
+        self
+    }
+
+    /// 注入本次启动实际读取的配置文件，供交互设置执行原子持久化。
+    pub(crate) fn with_config_path(mut self, config_path: PathBuf) -> Self {
+        self.config_path = Some(config_path);
         self
     }
 
@@ -438,6 +450,7 @@ impl App {
         self.cursor = 0;
         self.queued_inputs.clear();
         self.streaming_message = None;
+        self.model_thinking.clear();
         self.scroll = None;
         self.context_tokens = None;
         self.last_escape_at = None;
@@ -1216,15 +1229,8 @@ impl App {
             .iter()
             .position(|level| *level == self.reasoning_level)
             .unwrap_or(0);
-        self.reasoning_level = self.reasoning_levels[(current + 1) % self.reasoning_levels.len()];
-        agent.set_reasoning_level(self.reasoning_level);
-        self.messages.push(Msg::new(
-            MsgKind::Info,
-            format!(
-                "思考等级已切换为 {}",
-                reasoning_level_label(self.reasoning_level)
-            ),
-        ));
+        let level = self.reasoning_levels[(current + 1) % self.reasoning_levels.len()];
+        self.set_reasoning_level(level, Some(agent));
     }
 
     /// 设置 models.dev 声明支持的推理等级，并更新共享 Agent 的后续请求参数。
@@ -1244,6 +1250,15 @@ impl App {
                 format!("当前模型不支持思考等级 {}", reasoning_level_label(level)),
             ));
             return;
+        }
+        if let Some(path) = self.config_path.as_deref() {
+            if let Err(error) = persist_reasoning_level(path, level) {
+                self.messages.push(Msg::new(
+                    MsgKind::Error,
+                    format!("保存思考等级失败，当前设置未改变：{error:#}"),
+                ));
+                return;
+            }
         }
         self.reasoning_level = level;
         agent.set_reasoning_level(level);
@@ -2034,6 +2049,7 @@ impl App {
         self.running = true;
         self.run_started_at = Some(std::time::Instant::now());
         self.streaming_message = None;
+        self.model_thinking.clear();
         self.scroll = None;
 
         let agent = Arc::clone(agent);
@@ -2087,6 +2103,14 @@ impl App {
     /// 开始一个新的模型响应轮次，后续增量会写入新的助手消息。
     pub(crate) fn start_model_response(&mut self) {
         self.streaming_message = None;
+        self.model_thinking.clear();
+    }
+
+    /// 将模型公开的推理摘要增量追加到当前运行态展示，不写入消息或持久会话。
+    pub(crate) fn append_model_thinking(&mut self, delta: &str) {
+        if self.running {
+            self.model_thinking.push_str(delta);
+        }
     }
 
     /// 将文本增量追加到当前助手消息；不改动滚动位置，用户回看历史时不被拉回底部。
@@ -2159,6 +2183,7 @@ impl App {
         }
 
         self.streaming_message = None;
+        self.model_thinking.clear();
         if let Some(run) = run {
             if run.cancelled {
                 self.messages.push(Msg::new(
@@ -2347,20 +2372,28 @@ impl ModelDeltaBuffer {
 pub(crate) struct ChannelEventSink {
     tx: mpsc::UnboundedSender<UiEvent>,
     model_deltas: Arc<std::sync::Mutex<ModelDeltaBuffer>>,
+    thinking_deltas: Arc<std::sync::Mutex<ModelDeltaBuffer>>,
 }
 
 impl ChannelEventSink {
-    /// 创建事件 sink，并返回供 UI 消费模型文本的共享缓冲区。
+    /// 创建事件 sink，并返回供 UI 分别消费回答文本和推理摘要的共享缓冲区。
     pub(crate) fn new(
         tx: mpsc::UnboundedSender<UiEvent>,
-    ) -> (Self, Arc<std::sync::Mutex<ModelDeltaBuffer>>) {
+    ) -> (
+        Self,
+        Arc<std::sync::Mutex<ModelDeltaBuffer>>,
+        Arc<std::sync::Mutex<ModelDeltaBuffer>>,
+    ) {
         let model_deltas = Arc::new(std::sync::Mutex::new(ModelDeltaBuffer::default()));
+        let thinking_deltas = Arc::new(std::sync::Mutex::new(ModelDeltaBuffer::default()));
         (
             Self {
                 tx,
                 model_deltas: model_deltas.clone(),
+                thinking_deltas: thinking_deltas.clone(),
             },
             model_deltas,
+            thinking_deltas,
         )
     }
 }
@@ -2475,6 +2508,18 @@ impl EventSink for ChannelEventSink {
                         .push(delta);
                     if should_notify {
                         let _ = self.tx.send(UiEvent::ModelTextReady);
+                    }
+                }
+            }
+            AgentEventKind::ModelThinkingDelta => {
+                if let Some(delta) = event.payload.get("delta").and_then(Value::as_str) {
+                    let should_notify = self
+                        .thinking_deltas
+                        .lock()
+                        .expect("推理摘要增量缓冲区锁不应中毒")
+                        .push(delta);
+                    if should_notify {
+                        let _ = self.tx.send(UiEvent::ModelThinkingReady);
                     }
                 }
             }

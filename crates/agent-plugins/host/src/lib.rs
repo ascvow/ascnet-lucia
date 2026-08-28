@@ -12,6 +12,9 @@ pub mod ui;
 mod contribution;
 
 #[cfg(feature = "wasm")]
+mod state;
+
+#[cfg(feature = "wasm")]
 mod capability;
 
 #[cfg(feature = "wasm")]
@@ -25,6 +28,8 @@ use agent_runtime::{AgentDeriveConfig, AgentProfileId, AgentRuntimeProvisioner};
 use agent_tool::{ExecutionPolicy, ToolCall, ToolResult, ToolSpec};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+#[cfg(feature = "wasm")]
+use std::path::PathBuf;
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -51,6 +56,8 @@ pub struct PluginHostServices {
     activation_metadata: HashMap<String, HashMap<String, String>>,
     #[cfg(feature = "wasm")]
     service_call_observer: Option<Arc<dyn audit::HostServiceCallObserver>>,
+    #[cfg(feature = "wasm")]
+    persistent_state_dir: Option<PathBuf>,
     /// Host 持有且只能通过 `restrict` 收紧的运行平面策略。
     execution_policy: ExecutionPolicy,
 }
@@ -102,6 +109,24 @@ impl PluginHostServices {
     ) -> Self {
         self.service_call_observer = Some(observer);
         self
+    }
+
+    /// 注入应用拥有的插件持久状态目录。
+    ///
+    /// 状态仍通过现有 `get_state`、`set_state` 和 `remove_state` ABI 按插件 ID 隔离；未调用
+    /// 本方法时保持进程内状态。应用不应把生产目录注入 Evaluation 或 Mutation 平面。
+    ///
+    /// # Errors
+    ///
+    /// 路径为空时返回错误；该调用本身不创建目录。
+    #[cfg(feature = "wasm")]
+    pub fn with_persistent_state_dir(mut self, path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if path.as_os_str().is_empty() {
+            return Err(anyhow!("插件持久状态目录不能为空"));
+        }
+        self.persistent_state_dir = Some(path);
+        Ok(self)
     }
 
     /// 为指定插件注入 Host 可信的激活元数据。
@@ -209,6 +234,12 @@ impl PluginHostServices {
             .get(plugin_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// 返回应用注入的持久状态目录；未注入时保持实例内存状态。
+    #[cfg(feature = "wasm")]
+    pub(crate) fn persistent_state_dir(&self) -> Option<PathBuf> {
+        self.persistent_state_dir.clone()
     }
 
     /// 返回 Host 内部持有的可信执行策略快照。

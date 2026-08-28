@@ -402,8 +402,9 @@ impl WasmPluginHost {
                             agent_runtime.clone(),
                             host_services.model_completion(),
                             host_services.execution_policy(),
+                            host_services.persistent_state_dir(),
                         ),
-                    ),
+                    )?,
                     store_limits,
                 ),
             );

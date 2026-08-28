@@ -520,6 +520,42 @@ fn render_adapts_to_running_state_and_narrow_width() {
     assert!(!text.contains("ascnet-lucia"), "{text:?}");
 }
 
+/// 当前运行收到推理摘要后必须显示独立“思考”区域，不能伪装成助手回复。
+#[test]
+fn render_shows_ephemeral_reasoning_summary() {
+    let backend = TestBackend::new(80, 18);
+    let mut terminal = Terminal::new(backend).expect("创建推理摘要测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.messages.push(Msg::new(MsgKind::User, "检查任务"));
+    app.model_thinking = "正在核对权限边界".into();
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染推理摘要");
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+
+    assert!(text.contains("思考"), "{text:?}");
+    assert!(text.contains("正在核对权限边界"), "{text:?}");
+    assert_eq!(
+        app.messages
+            .iter()
+            .filter(|message| matches!(message.kind, MsgKind::Assistant))
+            .count(),
+        0
+    );
+}
+
 /// 验证工具行展示参数与返回内容摘要，且过长内容按显示宽度截断。
 #[test]
 fn tool_lines_show_args_and_truncated_result() {
@@ -914,11 +950,38 @@ fn streamed_deltas_update_one_assistant_message() {
     assert!(app.streaming_message.is_none());
 }
 
+/// 推理摘要只在当前运行态展示，并在新轮次及运行结束时清除而不写入消息。
+#[test]
+fn thinking_deltas_are_ephemeral_run_state() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.append_model_thinking("先检查");
+    app.append_model_thinking("权限边界");
+
+    assert_eq!(app.model_thinking, "先检查权限边界");
+    assert!(app.messages.is_empty());
+    app.start_model_response();
+    assert!(app.model_thinking.is_empty());
+
+    app.append_model_thinking("重新分析");
+    app.handle_agent_done(AgentCompletion {
+        run: None,
+        session_record: app.session_record.clone(),
+        error: None,
+        input_committed: false,
+        queue_may_advance: true,
+        input: String::new().into(),
+    });
+    assert!(app.model_thinking.is_empty());
+    assert!(app.messages.is_empty());
+}
+
 /// 高频模型增量只排队一个 UI 通知，消费后才能创建下一次通知。
 #[tokio::test]
 async fn channel_event_sink_coalesces_model_text_notifications() {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, model_deltas) = ChannelEventSink::new(tx);
+    let (sink, model_deltas, _thinking_deltas) = ChannelEventSink::new(tx);
     let first = AgentEvent::new(
         "run-test",
         AgentEventKind::ModelTextDelta,
@@ -949,11 +1012,43 @@ async fn channel_event_sink_coalesces_model_text_notifications() {
     assert!(matches!(rx.recv().await, Some(UiEvent::ModelTextReady)));
 }
 
+/// 高频推理摘要增量必须与回答文本分开合并，避免写入助手消息缓冲区。
+#[tokio::test]
+async fn channel_event_sink_coalesces_thinking_notifications_separately() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, model_deltas, thinking_deltas) = ChannelEventSink::new(tx);
+    for delta in ["检查", "边界"] {
+        sink.record(&AgentEvent::new(
+            "run-test",
+            AgentEventKind::ModelThinkingDelta,
+            0,
+            json!({ "delta": delta }),
+        ))
+        .await
+        .expect("记录推理摘要增量");
+    }
+
+    assert!(matches!(rx.recv().await, Some(UiEvent::ModelThinkingReady)));
+    assert!(rx.try_recv().is_err());
+    assert!(model_deltas
+        .lock()
+        .expect("回答增量缓冲区锁不应中毒")
+        .take()
+        .is_empty());
+    assert_eq!(
+        thinking_deltas
+            .lock()
+            .expect("推理摘要增量缓冲区锁不应中毒")
+            .take(),
+        "检查边界"
+    );
+}
+
 /// 工具输出事件应保留调用 ID、输出流和文本，供消息状态机增量更新。
 #[tokio::test]
 async fn channel_event_sink_forwards_tool_output_delta() {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, _model_deltas) = ChannelEventSink::new(tx);
+    let (sink, _model_deltas, _thinking_deltas) = ChannelEventSink::new(tx);
     let output = ToolOutputDelta {
         call_id: "call-live".into(),
         stream: agent_tool::ToolOutputStream::Stderr,
@@ -2655,6 +2750,32 @@ fn reasoning_shortcut_cycles_model_supported_levels() {
 
     assert_eq!(app.reasoning_level, ReasoningLevel::Low);
     assert_eq!(agent.reasoning_level(), ReasoningLevel::Low);
+}
+
+/// 配置持久化失败时，TUI 与共享 Agent 都必须保持原思考等级。
+#[test]
+fn reasoning_change_is_transactional_when_config_write_fails() {
+    let missing_config = std::env::temp_dir().join(format!(
+        "lucia-missing-config-{}.toml",
+        SessionId::generate()
+    ));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into())
+        .with_config_path(missing_config)
+        .with_reasoning_levels(
+            vec![ReasoningLevel::Off, ReasoningLevel::High],
+            ReasoningLevel::Off,
+        );
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+
+    app.set_reasoning_level(ReasoningLevel::High, Some(&agent));
+
+    assert_eq!(app.reasoning_level, ReasoningLevel::Off);
+    assert_eq!(agent.reasoning_level(), ReasoningLevel::Off);
+    assert!(app.messages.last().is_some_and(|message| {
+        matches!(message.kind, MsgKind::Error) && message.text.contains("当前设置未改变")
+    }));
 }
 
 /// 应用内拖选应保留换行和中文宽字符，同时移除每行末尾的布局空白。

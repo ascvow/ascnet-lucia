@@ -164,6 +164,32 @@ fn filter_params_keeps_all_with_full_list() {
     assert!(body.get("store").is_some());
 }
 
+/// Responses 推理请求必须携带自动摘要，供客户端观察等级确实生效。
+#[test]
+fn responses_reasoning_requests_visible_summary() {
+    let mut request = ModelRequest::new("gpt-test", Vec::new());
+    request.reasoning = ReasoningLevel::High;
+
+    let body =
+        build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE).expect("应构建推理请求");
+
+    assert_eq!(
+        body["reasoning"],
+        json!({"effort": "high", "summary": "auto"})
+    );
+}
+
+/// 关闭推理时不得请求摘要，避免把普通模型请求误标为推理模式。
+#[test]
+fn responses_reasoning_off_omits_reasoning_object() {
+    let request = ModelRequest::new("gpt-test", Vec::new());
+
+    let body =
+        build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE).expect("应构建普通请求");
+
+    assert!(body.get("reasoning").is_none());
+}
+
 /// Responses SSE 文本增量会实时发送并进入最终聚合文本。
 #[tokio::test]
 async fn responses_sse_emits_and_aggregates_text_delta() {
@@ -182,6 +208,29 @@ async fn responses_sse_emits_and_aggregates_text_delta() {
         ModelStreamEvent::TextDelta { index, delta } => {
             assert_eq!(index, 0);
             assert_eq!(delta, "你好");
+        }
+        event => panic!("收到非预期事件: {event:?}"),
+    }
+}
+
+/// Responses 推理摘要 SSE 必须进入独立思考事件，不能混入最终回答文本。
+#[tokio::test]
+async fn responses_sse_emits_reasoning_summary_delta() {
+    let (sender, mut stream) = ModelEventStream::channel();
+    let mut state = ResponsesStreamState::default();
+
+    handle_responses_sse_data(
+        r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"检查权限边界"}"#,
+        &sender,
+        &mut state,
+    )
+    .expect("应该解析推理摘要增量");
+
+    assert!(state.text.is_empty());
+    match stream.next().await.expect("应该收到思考事件") {
+        ModelStreamEvent::ThinkingDelta { index, delta } => {
+            assert_eq!(index, 0);
+            assert_eq!(delta, "检查权限边界");
         }
         event => panic!("收到非预期事件: {event:?}"),
     }
