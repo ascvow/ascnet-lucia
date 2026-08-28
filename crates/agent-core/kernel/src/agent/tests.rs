@@ -1234,6 +1234,38 @@ async fn execution_policy_hides_denied_tools_from_model() {
     assert!(specs.is_empty());
 }
 
+/// 未加载 Permission 插件时，可信执行策略仍必须拒绝未授权工具。
+#[tokio::test]
+async fn execution_policy_blocks_denied_tool_without_permission_plugin() {
+    let call = ToolCall::new("denied-without-plugin", "echo", json!({}));
+    let mut agent = agent_with_script(vec![
+        ModelResponse::tool_calls(vec![call]),
+        ModelResponse::text("完成"),
+    ]);
+    agent
+        .tools_mut()
+        .register(echo_tool())
+        .expect("注册 echo 工具");
+    agent.set_options(
+        agent
+            .options()
+            .clone()
+            .with_execution_policy(ExecutionPolicy::evaluation("/tmp/fixture")),
+    );
+
+    let run = agent
+        .run("未加载权限插件时调用被拒工具")
+        .await
+        .expect("运行应正常收尾");
+
+    let denied = run
+        .session
+        .messages()
+        .iter()
+        .any(|message| format!("{message:?}").contains("当前执行策略不允许调用工具"));
+    assert!(denied, "可信执行策略必须独立于 Permission 插件拒绝越权调用");
+}
+
 /// 插件返回 Allow 也不能让策略拒绝的工具真正执行。
 #[tokio::test]
 async fn execution_policy_overrides_plugin_allow() {
