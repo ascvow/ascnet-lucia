@@ -981,7 +981,7 @@ pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &App, outer: R
                 Line::from(vec![
                     Span::styled("Frozen Plugin Environment  ", Style::new().fg(COLOR_MUTED)),
                     Span::styled(
-                        truncate_line(&data.environment_digest.to_string(), 24),
+                        truncate_line(data.environment_digest.as_ref(), 24),
                         Style::new().fg(COLOR_USER),
                     ),
                 ]),
