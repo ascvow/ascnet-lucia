@@ -22,13 +22,15 @@ Bundle SHA-256、启用状态、当前 Stable Revision、代数和 `PluginEnviro
 | `b` | 输入插件 ID 和历史版本，从 Installed Version History 人工回滚 |
 | `e` | 启用或禁用高亮插件 |
 | `o` / `w` | 选择或清除 Capability Owner |
+| `a` | 二次确认后把当前磁盘插件环境采用为新的人工基线 |
 | `x` | 两次确认后移除高亮插件 |
 | `r` | 重新读取插件锁和冻结环境 |
 
-Registry、GitHub 和本地安装都只接受已经构建的 Bundle。安装器不会克隆源码、构建插件、修改
-Manifest 或扩大权限；它会检查路径、大小、ZIP、SHA-256、Manifest、WASM、SemVer 依赖和
-Capability 冲突。私有 GitHub 仓库可由运行 Lucia 的环境提供 `GITHUB_TOKEN`，TUI 不展示或
-持久化 token。
+Registry、GitHub 和本地安装都只接受已经构建的 Bundle。受管理目录只持久化 `plugin.toml`
+和 Manifest 指向的 WASM；即使用户选择插件开发 crate，源码、Cargo `target`、Smoke Test 与
+其他未声明文件也不会被复制或计入安装摘要。安装器不会克隆源码、构建插件、修改 Manifest 或
+扩大权限；它会检查路径、大小、ZIP、SHA-256、Manifest、WASM、SemVer 依赖和 Capability
+冲突。私有 GitHub 仓库可由运行 Lucia 的环境提供 `GITHUB_TOKEN`，TUI 不展示或持久化 token。
 
 人工更新或移除时，原 Bundle 及其安装摘要进入 `Installed Version History`，不会删除。
 人工回滚只切换锁文件绑定并重新校验 Bundle、依赖和 Capability Owner；被替换版本继续保留。
@@ -47,10 +49,17 @@ Capability 冲突。私有 GitHub 仓库可由运行 Lucia 的环境提供 `GITH
 人工基线不绑定 Release、EvaluationReport 或 EvolutionCertificate，也不会显示为 `EVOLVED`。
 Stable 已被其他控制面移动时，提交失败并恢复操作前的 Plugin Manager 状态。Manager 写入后的
 快照、Genome 登记或 Stable 提交失败也执行同一补偿恢复，避免锁文件与 Stable Genome 分叉。
+开发者直接整理人工开发 Bundle 后，可以在 `/plugins` 页面按两次 `a` 显式创建
+`PluginManagement` 基线；环境未变化时不会创建空修订。
 
 人工变更后，当前 Session 和已经实例化的 Host 继续使用启动时的精确 Revision；新 Session
 使用新 Stable。基于旧插件环境的 Candidate 因 expected-current 或插件环境摘要不一致而不能
 Promotion。Lucia 不在活动 Run 中热替换插件。
+
+安装新的 Lucia 二进制后，未绑定的新 Session 会在默认 Stable 上创建
+`RevisionOrigin::PlatformUpgrade` 修订，只更新可验证的 Kernel 运行身份。Prompt、Skill、Policy、
+权限与冻结插件环境保持不变；该修订不绑定 EvaluationReport、Release 或
+EvolutionCertificate。显式选择的 Revision 和已有 Session 不会被静默迁移。
 
 ## 安装位置与运行时优先级
 

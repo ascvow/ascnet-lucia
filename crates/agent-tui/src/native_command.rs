@@ -215,6 +215,8 @@ pub(crate) struct NativePluginDialog {
     pub(crate) path_input: String,
     /// 第一次删除按键记录的插件 ID；再次确认才执行。
     pub(crate) remove_confirmation: Option<String>,
+    /// 是否正在等待用户再次确认采用当前插件环境。
+    pub(crate) adopt_confirmation: bool,
 }
 
 /// TUI 原生命令状态；不依赖 Plugin Host，纯 Core 构建同样可用。
@@ -619,6 +621,7 @@ impl App {
             path_mode: None,
             path_input: String::new(),
             remove_confirmation: None,
+            adopt_confirmation: false,
         });
         self.reload_native_plugins();
     }
@@ -631,6 +634,7 @@ impl App {
         };
         dialog.status = NativePluginDialogStatus::Loading;
         dialog.remove_confirmation = None;
+        dialog.adopt_confirmation = false;
         let Some(service) = self.plugin_management.as_ref().map(Arc::clone) else {
             dialog.status = NativePluginDialogStatus::Error(
                 "未配置可发布的 Stable Genome；插件写操作已禁用".into(),
@@ -718,7 +722,9 @@ impl App {
                 KeyCode::Backspace => {
                     dialog.path_input.pop();
                 }
-                KeyCode::Char(character) if modifiers.is_empty() => {
+                KeyCode::Char(character)
+                    if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
+                {
                     dialog.path_input.push(character);
                 }
                 KeyCode::Enter if !dialog.path_input.trim().is_empty() => {
@@ -792,6 +798,15 @@ impl App {
         match code {
             KeyCode::Esc => self.native_command.plugin_dialog = None,
             KeyCode::Char('r') => self.reload_native_plugins(),
+            KeyCode::Char('a') if matches!(dialog.status, NativePluginDialogStatus::Ready(_)) => {
+                if dialog.adopt_confirmation {
+                    dialog.adopt_confirmation = false;
+                    self.start_native_plugin_action(ManualPluginAction::AdoptCurrentEnvironment);
+                } else {
+                    dialog.adopt_confirmation = true;
+                    dialog.remove_confirmation = None;
+                }
+            }
             KeyCode::Char('i') if matches!(dialog.status, NativePluginDialogStatus::Ready(_)) => {
                 dialog.path_mode = Some(NativePluginPathMode::Install);
                 dialog.path_input.clear();
@@ -832,10 +847,12 @@ impl App {
             KeyCode::Up if item_count > 0 => {
                 dialog.selected = dialog.selected.checked_sub(1).unwrap_or(item_count - 1);
                 dialog.remove_confirmation = None;
+                dialog.adopt_confirmation = false;
             }
             KeyCode::Down if item_count > 0 => {
                 dialog.selected = (dialog.selected + 1) % item_count;
                 dialog.remove_confirmation = None;
+                dialog.adopt_confirmation = false;
             }
             KeyCode::Char('e') if item_count > 0 => {
                 let NativePluginDialogStatus::Ready(data) = &dialog.status else {
@@ -886,6 +903,7 @@ impl App {
         if let Some(dialog) = self.native_command.plugin_dialog.as_mut() {
             dialog.status = NativePluginDialogStatus::Applying;
             dialog.remove_confirmation = None;
+            dialog.adopt_confirmation = false;
         }
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -1236,6 +1254,11 @@ pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &App, outer: R
             Span::styled(format!("{label}: "), Style::new().fg(COLOR_USER)),
             Span::styled(&dialog.path_input, Style::new().fg(COLOR_TEXT)),
         ]));
+    } else if dialog.adopt_confirmation {
+        lines.push(Line::from(Span::styled(
+            "再次按 a 确认采用当前插件环境；该操作只创建人工基线，不会热重载当前 Session",
+            Style::new().fg(COLOR_WARNING),
+        )));
     } else if let Some(plugin_id) = &dialog.remove_confirmation {
         lines.push(Line::from(Span::styled(
             format!("再次按 x 确认移除 `{plugin_id}`；该操作会创建人工基线"),
@@ -1245,7 +1268,7 @@ pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &App, outer: R
     let footer = if dialog.path_mode.is_some() {
         " 输入路径 · Enter 提交 · Esc 取消 "
     } else {
-        " ↑↓ · e 启停 · g/h/i 安装 · t/u 更新 · b 人工回滚 · o/w Owner · x 移除 · r 刷新 · Esc "
+        " ↑↓ · e 启停 · g/h/i 安装 · t/u 更新 · b 回滚 · a 采用当前环境 · o/w Owner · x 移除 · r 刷新 · Esc "
     };
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -1382,6 +1405,7 @@ mod tests {
             path_mode: None,
             path_input: String::new(),
             remove_confirmation: None,
+            adopt_confirmation: false,
         });
         let mut terminal = Terminal::new(TestBackend::new(112, 32)).expect("应创建测试终端");
 
@@ -1407,6 +1431,46 @@ mod tests {
         assert!(compact.contains("人工管理"), "{text}");
         assert!(!text.contains("Evolve Plugin"), "{text}");
         assert!(!text.contains("Generate Plugin"), "{text}");
+
+        assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('a'), KeyModifiers::NONE,));
+        assert!(app
+            .native_command
+            .plugin_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.adopt_confirmation));
+    }
+
+    /// 本地插件路径必须接受由 Shift 产生的大写字符，同时拒绝控制类组合键。
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn plugin_path_input_accepts_uppercase_characters() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.native_command.plugin_dialog = Some(NativePluginDialog {
+            selected: 0,
+            status: NativePluginDialogStatus::Loading,
+            path_mode: Some(NativePluginPathMode::Install),
+            path_input: String::new(),
+            remove_confirmation: None,
+            adopt_confirmation: false,
+        });
+
+        assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('U'), KeyModifiers::SHIFT,));
+        assert_eq!(
+            app.native_command
+                .plugin_dialog
+                .as_ref()
+                .map(|dialog| dialog.path_input.as_str()),
+            Some("U")
+        );
+        assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert_eq!(
+            app.native_command
+                .plugin_dialog
+                .as_ref()
+                .map(|dialog| dialog.path_input.as_str()),
+            Some("U")
+        );
     }
 
     /// 人工插件变更提示必须说明新基线、旧 Session 固定和旧 Candidate 不可应用。
@@ -1421,6 +1485,7 @@ mod tests {
             path_mode: None,
             path_input: String::new(),
             remove_confirmation: None,
+            adopt_confirmation: false,
         });
         let digest = agent_evolution_protocol::GenomeDigest::from_sha256_hex("b".repeat(64))
             .expect("Genome 摘要应合法");

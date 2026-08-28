@@ -91,6 +91,8 @@ pub(crate) enum ManualPluginAction {
         /// Capability 稳定 ID。
         capability_id: String,
     },
+    /// 把当前磁盘上的完整插件环境显式采用为新的人工基线。
+    AdoptCurrentEnvironment,
 }
 
 impl ManualPluginAction {
@@ -125,6 +127,7 @@ impl ManualPluginAction {
             Self::ClearCapabilityOwner { capability_id } => {
                 format!("人工清除 Capability Owner：{capability_id}")
             }
+            Self::AdoptCurrentEnvironment => "人工采用当前插件环境为新基线".into(),
         }
     }
 }
@@ -265,6 +268,7 @@ impl PluginManagementService {
         let before_plugins = self.manager.list()?;
         let before_runtime = self.manager.runtime_config()?;
         let snapshot = self.manager.capture_state()?;
+        let adopt_current = matches!(action, ManualPluginAction::AdoptCurrentEnvironment);
         let message = match self.perform_action(&action).await {
             Ok(message) => message,
             Err(error) => return self.fail_with_restore(&snapshot, error),
@@ -277,7 +281,7 @@ impl PluginManagementService {
             Ok(runtime) => runtime,
             Err(error) => return self.fail_with_restore(&snapshot, error),
         };
-        if before_plugins == after_plugins && before_runtime == after_runtime {
+        if !adopt_current && before_plugins == after_plugins && before_runtime == after_runtime {
             return Ok(PluginManagementOutcome {
                 message,
                 baseline: None,
@@ -291,6 +295,12 @@ impl PluginManagementService {
             Ok(digest) => digest,
             Err(error) => return self.fail_with_restore(&snapshot, error.into()),
         };
+        if adopt_current && environment == parent.genome.plugin_environment_snapshot() {
+            return Ok(PluginManagementOutcome {
+                message: "当前插件环境与 Stable 基线一致，无需创建新基线".into(),
+                baseline: None,
+            });
+        }
         let mut genome = parent.genome.clone();
         genome.plugins = environment.plugins;
         genome.capability_owners = environment.capability_owners;
@@ -432,6 +442,9 @@ impl PluginManagementService {
                     }
                     None => Ok(format!("能力 {capability_id} 没有显式插件选择")),
                 }
+            }
+            ManualPluginAction::AdoptCurrentEnvironment => {
+                Ok("已将当前插件环境提交为人工配置基线".into())
             }
         }
     }
@@ -618,6 +631,33 @@ wasm = "plugin.wasm"
         assert_eq!(revision.genome.plugins[0].id, "echo");
         let _ = tokio::fs::remove_dir_all(root).await;
         let _ = tokio::fs::remove_dir_all(fixture_root).await;
+    }
+
+    /// 人工修改开发 Bundle 后必须显式采用当前环境，并创建 PluginManagement 修订。
+    #[tokio::test]
+    async fn current_plugin_environment_can_be_adopted_as_manual_baseline() {
+        let root = temp_root("adopt-current-environment");
+        let (service, parent) = service_fixture(&root, Vec::new()).await;
+        create_bundle(&root.join("plugins"), "echo", "1.0.0");
+
+        let outcome = service
+            .apply(ManualPluginAction::AdoptCurrentEnvironment)
+            .await
+            .expect("人工采用当前环境应成功");
+        let baseline = outcome.baseline.expect("插件环境变化必须产生新基线");
+        let revision = service
+            .publisher
+            .resolver()
+            .resolve(&GenomeSelector::Revision(baseline.revision_id))
+            .await
+            .expect("应读取人工采用后的修订");
+
+        assert_eq!(revision.metadata.origin, RevisionOrigin::PluginManagement);
+        assert_eq!(revision.metadata.parent, Some(parent.revision_id));
+        assert!(revision.metadata.mutation.is_none());
+        assert_eq!(revision.genome.plugins.len(), 1);
+        assert_eq!(revision.genome.plugins[0].id, "echo");
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     /// TUI 人工回滚必须创建新的 PluginManagement 基线，并保留被替换版本供再次回滚。

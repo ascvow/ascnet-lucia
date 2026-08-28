@@ -181,7 +181,8 @@ impl PluginManager {
 
     /// 从本地 bundle 安装并立即启用插件。
     ///
-    /// bundle 根目录必须包含 `plugin.toml`，且不得包含符号链接或特殊文件。
+    /// bundle 根目录必须包含 `plugin.toml` 及其指向的普通 WASM 文件。安装只持久化这两个
+    /// 运行时文件，开发源码、构建缓存、测试和其他未声明文件不会进入受管理目录。
     /// 插件 ID 已存在、依赖不满足或能力冲突时不会修改现有安装状态。
     pub fn install(&self, bundle: impl AsRef<Path>) -> Result<InstalledPlugin> {
         self.install_with_options(bundle, InstallOptions::default())
@@ -189,7 +190,7 @@ impl PluginManager {
 
     /// 按指定选项从本地 bundle 安装插件。
     ///
-    /// `options.enabled` 为 `false` 时仍会校验 manifest、WASM 路径和 bundle 完整性，
+    /// `options.enabled` 为 `false` 时仍会校验 manifest、WASM 路径和运行时 bundle 完整性，
     /// 但依赖与能力冲突会延迟到启用阶段检查。
     pub fn install_with_options(
         &self,
@@ -263,7 +264,6 @@ impl PluginManager {
         if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
             bail!("插件 bundle 必须是非符号链接目录：{}", source.display());
         }
-        scan_bundle(source)?;
         let canonical_source = source
             .canonicalize()
             .with_context(|| format!("无法解析 bundle 路径：{}", source.display()))?;
@@ -304,7 +304,7 @@ impl PluginManager {
 
         let staging = self.create_staging_dir()?;
         let install_result = (|| -> Result<InstalledPlugin> {
-            copy_bundle(source, &staging)?;
+            copy_runtime_bundle(source, &staging, &manifest)?;
             let staging_manifest_path = staging.join("plugin.toml");
             let staged_manifest = load_and_validate_manifest(&staging, &staging_manifest_path)?;
             if staged_manifest.plugin.id != manifest.plugin.id
@@ -968,7 +968,6 @@ enum BundleEntryKind {
 #[derive(Debug, Clone)]
 struct BundleEntry {
     source: PathBuf,
-    relative: PathBuf,
     normalized: String,
     kind: BundleEntryKind,
 }
@@ -1014,7 +1013,6 @@ fn scan_bundle_directory(
         };
         entries.push(BundleEntry {
             source: source.clone(),
-            relative,
             normalized,
             kind,
         });
@@ -1025,41 +1023,64 @@ fn scan_bundle_directory(
     Ok(())
 }
 
-fn copy_bundle(source: &Path, destination: &Path) -> Result<()> {
-    for entry in scan_bundle(source)? {
-        let target = destination.join(&entry.relative);
-        match entry.kind {
-            BundleEntryKind::Directory => fs::create_dir_all(&target)
-                .with_context(|| format!("无法创建 bundle 目录：{}", target.display()))?,
-            BundleEntryKind::File => {
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("无法创建 bundle 文件父目录：{}", parent.display())
-                    })?;
-                }
-                let current = fs::symlink_metadata(&entry.source).with_context(|| {
-                    format!("无法重新检查 bundle 文件：{}", entry.source.display())
-                })?;
-                if current.file_type().is_symlink() || !current.is_file() {
-                    bail!(
-                        "复制期间 bundle 文件类型发生变化：{}",
-                        entry.source.display()
-                    );
-                }
-                fs::copy(&entry.source, &target)
-                    .with_context(|| format!("无法复制 bundle 文件：{}", entry.source.display()))?;
-            }
+/// 只把运行时必需的 manifest 与 WASM 复制到受管理目录。
+///
+/// 本地路径可以指向插件开发 crate，但源码、Cargo 缓存、测试和其他未声明文件都不能成为
+/// 已安装 Bundle 的一部分。每个源文件会在复制前重新检查路径组件，避免通过符号链接逃逸。
+fn copy_runtime_bundle(source: &Path, destination: &Path, manifest: &PluginManifest) -> Result<()> {
+    let wasm_relative = validate_relative_path(Path::new(&manifest.plugin.wasm), "plugin.wasm")?;
+    for (relative, label) in [
+        (PathBuf::from("plugin.toml"), "plugin.toml"),
+        (wasm_relative, "plugin.wasm"),
+    ] {
+        let source_file = validate_runtime_bundle_file(source, &relative, label)?;
+        let target = destination.join(&relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("无法创建运行时 Bundle 文件父目录：{}", parent.display())
+            })?;
         }
+        fs::copy(&source_file, &target)
+            .with_context(|| format!("无法复制运行时 Bundle 文件：{}", source_file.display()))?;
     }
     Ok(())
 }
 
+/// 校验运行时文件及其全部父目录均为真实目录或普通文件。
+///
+/// 返回经过相对路径约束的源文件路径；任一父目录是符号链接、目标缺失或文件类型不符时
+/// 返回错误，防止开发目录中的链接把安装读取范围扩展到 Bundle 根目录之外。
+fn validate_runtime_bundle_file(root: &Path, relative: &Path, label: &str) -> Result<PathBuf> {
+    let relative = validate_relative_path(relative, label)?;
+    let component_count = relative.components().count();
+    let mut current = root.to_path_buf();
+    for (index, component) in relative.components().enumerate() {
+        let Component::Normal(part) = component else {
+            unreachable!("运行时文件路径已经完成相对路径校验");
+        };
+        current.push(part);
+        let metadata = fs::symlink_metadata(&current)
+            .with_context(|| format!("插件运行时文件不存在：{}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("插件运行时文件路径不允许符号链接：{}", current.display());
+        }
+        let is_last = index + 1 == component_count;
+        if is_last && !metadata.is_file() {
+            bail!("插件运行时文件必须是普通文件：{}", current.display());
+        }
+        if !is_last && !metadata.is_dir() {
+            bail!("插件运行时文件父路径必须是目录：{}", current.display());
+        }
+    }
+    Ok(current)
+}
+
 /// 把插件目录编码为可进入 Artifact CAS 的确定性 bundle 字节。
 ///
-/// 编码覆盖排序后的目录、普通文件、规范相对路径、文件长度和文件正文；其 SHA-256 与
-/// [`hash_plugin_bundle`] 完全一致，因此同一摘要可以同时约束 Release Archive、Plugin
-/// Manager 锁文件和 Genome。输入包含符号链接、特殊文件、过多条目或编码超过 256 MiB
-/// 时会拒绝，不会执行 bundle 内代码。
+/// 编码覆盖排序后的目录、普通文件、规范相对路径、文件长度和文件正文；其 SHA-256 与源目录
+/// 的 [`hash_plugin_bundle`] 完全一致。安装时 Plugin Manager 会从还原目录提取 manifest 与
+/// WASM，因此包含其他文件的发布归档摘要不等于清理后的安装摘要。输入包含符号链接、特殊
+/// 文件、过多条目或编码超过 256 MiB 时会拒绝，不会执行 bundle 内代码。
 ///
 /// # Errors
 ///
@@ -1361,23 +1382,10 @@ pub fn hash_plugin_bundle(root: &Path) -> Result<String> {
 }
 
 fn load_and_validate_manifest(bundle: &Path, manifest_path: &Path) -> Result<PluginManifest> {
-    let entries = scan_bundle(bundle)?;
-    if !entries.iter().any(|entry| {
-        entry.kind == BundleEntryKind::File && entry.relative == Path::new("plugin.toml")
-    }) {
-        bail!("插件 bundle 根目录缺少 plugin.toml");
-    }
+    validate_runtime_bundle_file(bundle, Path::new("plugin.toml"), "plugin.toml")?;
     let manifest = PluginManifest::load(manifest_path).context("插件 manifest 无效")?;
     let wasm_relative = validate_relative_path(Path::new(&manifest.plugin.wasm), "plugin.wasm")?;
-    let wasm_path = bundle.join(wasm_relative);
-    let wasm_metadata = fs::symlink_metadata(&wasm_path)
-        .with_context(|| format!("插件 WASM 不存在：{}", wasm_path.display()))?;
-    if wasm_metadata.file_type().is_symlink() || !wasm_metadata.is_file() {
-        bail!(
-            "插件 WASM 必须是 bundle 内的普通文件：{}",
-            wasm_path.display()
-        );
-    }
+    validate_runtime_bundle_file(bundle, &wasm_relative, "plugin.wasm")?;
     Ok(manifest)
 }
 
@@ -1560,7 +1568,7 @@ mod tests {
         bundle
     }
 
-    /// 确定性归档必须与安装摘要一致，并可无损恢复为 Plugin Manager 可安装目录。
+    /// 确定性归档必须无损恢复源目录，安装后摘要只覆盖提取出的运行时 Bundle。
     #[test]
     fn packed_bundle_round_trips_with_manager_digest() {
         let directory = TestDirectory::new("bundle-archive-round-trip");
@@ -1579,7 +1587,13 @@ mod tests {
         );
         let manager = PluginManager::new(directory.path.join("managed"));
         let installed = manager.install(restored).expect("还原 bundle 应可安装");
-        assert_eq!(installed.sha256, expected);
+        let installed_bundle = directory.path.join("managed/plugins/echo/1.2.3");
+        assert_eq!(
+            installed.sha256,
+            hash_plugin_bundle(&installed_bundle).expect("应计算运行时安装摘要")
+        );
+        assert_ne!(installed.sha256, expected);
+        assert!(!installed_bundle.join("assets").exists());
     }
 
     /// 解包器必须在创建目标目录前拒绝归档中的父目录逃逸。
@@ -1632,6 +1646,10 @@ mod tests {
         assert_eq!(installed.sha256.len(), 64);
         assert!(manager.lock_path().is_file());
         assert_eq!(manager.list().expect("应能列出插件"), vec![installed]);
+        let installed_bundle = directory.path.join("managed/plugins/echo/1.2.3");
+        assert!(installed_bundle.join("plugin.toml").is_file());
+        assert!(installed_bundle.join("plugin.wasm").is_file());
+        assert!(!installed_bundle.join("assets").exists());
 
         let runtime = manager.runtime_config().expect("运行时配置应通过校验");
         assert_eq!(runtime.manifest_paths.len(), 1);
@@ -1737,7 +1755,7 @@ mod tests {
         fs::write(
             directory
                 .path
-                .join("managed/plugins/echo/1.0.0/assets/config.txt"),
+                .join("managed/plugins/echo/1.0.0/plugin.wasm"),
             "历史版本已篡改",
         )
         .expect("应能篡改测试历史文件");
@@ -1887,7 +1905,7 @@ mod tests {
         fs::write(
             directory
                 .path
-                .join("managed/plugins/echo/1.0.0/assets/config.txt"),
+                .join("managed/plugins/echo/1.0.0/plugin.wasm"),
             "已篡改",
         )
         .expect("应能篡改测试文件");
@@ -1926,7 +1944,7 @@ mod tests {
         fs::write(
             directory
                 .path
-                .join("managed/plugins/echo/1.0.0/assets/config.txt"),
+                .join("managed/plugins/echo/1.0.0/plugin.wasm"),
             "已篡改",
         )
         .expect("应能篡改测试文件");
@@ -1996,6 +2014,11 @@ mod tests {
         let directory = TestDirectory::new("symlink");
         let bundle = create_bundle(&directory.path, "linked", "1.0.0", &[], None);
         symlink("plugin.wasm", bundle.join("linked.wasm")).expect("应能创建测试符号链接");
+        fs::write(
+            bundle.join("plugin.toml"),
+            "[plugin]\nid = \"linked\"\nname = \"linked\"\nversion = \"1.0.0\"\napi_version = \"0.7.0\"\nwasm = \"linked.wasm\"\n",
+        )
+        .expect("应能把 manifest 指向符号链接");
         let manager = PluginManager::new(directory.path.join("managed"));
 
         let error = manager.install(bundle).expect_err("符号链接必须被拒绝");
