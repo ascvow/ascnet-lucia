@@ -56,7 +56,7 @@ lucia --config ./lucia.toml --init
 [tui]
 sessions_dir = "projects"
 events_jsonl = "events.jsonl"
-plugin_model = "gpt-5-mini"
+plugin_model = "gpt-5.6-luna"
 
 [genome]
 # 普通启动无需配置；以下字段只用于选择已有 Registry。

@@ -40,7 +40,7 @@ stream = true
 sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
 # 插件无工具模型调用使用的独立小模型；权限插件的“帮我审批”模式使用该路由。
-plugin_model = "gpt-5-mini"
+plugin_model = "gpt-5.6-luna"
 
 [genome]
 # 普通首次启动会在 $LUCIA_HOME/evolution 自动创建本地人工基线，无需填写本段。
@@ -291,7 +291,7 @@ mod tests {
         let settings = load_tui_settings(&path).expect("模板应可解析");
         assert_eq!(settings.sessions_dir, Some(PathBuf::from("projects")));
         assert_eq!(settings.context_window, None);
-        assert_eq!(settings.plugin_model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(settings.plugin_model.as_deref(), Some("gpt-5.6-luna"));
         assert_eq!(settings.default_session, None);
         assert!(!settings.resume_latest);
         assert_eq!(settings.evidence, EvidenceSettings::default());
