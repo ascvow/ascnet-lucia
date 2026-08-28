@@ -827,10 +827,6 @@ impl App {
     /// 多个视图声明重叠前缀时按声明顺序取第一个。
     #[cfg(feature = "plugins")]
     pub(crate) fn active_trigger_view(&self) -> Option<usize> {
-        // `/` 由默认原生命令独占，插件不能通过同名触发前缀覆盖命令状态机。
-        if self.input.starts_with('/') {
-            return None;
-        }
         let input = self.input.trim_start();
         if input.is_empty() {
             return None;

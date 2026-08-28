@@ -56,6 +56,7 @@ lucia --config ./lucia.toml --init
 [tui]
 sessions_dir = "projects"
 events_jsonl = "events.jsonl"
+plugin_model = "gpt-5-mini"
 
 [genome]
 # 普通启动无需配置；以下字段只用于选择已有 Registry。
@@ -67,7 +68,7 @@ events_jsonl = "events.jsonl"
 enabled = false
 ```
 
-`sessions_dir` 是项目会话根目录。相对配置值与 `events_jsonl` 都以配置文件所在目录为基准；CLI 的 `--sessions-dir` 与 `--events-jsonl` 仍以当前工作目录为基准，并覆盖配置值。旧配置中的 `default_session` 和 `resume_latest` 仍可解析，但普通启动不再用它们自动恢复会话。
+`sessions_dir` 是项目会话根目录。相对配置值与 `events_jsonl` 都以配置文件所在目录为基准；CLI 的 `--sessions-dir` 与 `--events-jsonl` 仍以当前工作目录为基准，并覆盖配置值。`plugin_model` 是 Host 固定提供给插件无工具模型完成调用的模型 ID，权限插件的“帮我审批”模式使用该路由；缺省时兼容沿用主模型，建议显式配置同服务商下可用的小模型。旧配置中的 `default_session` 和 `resume_latest` 仍可解析，但普通启动不再用它们自动恢复会话。
 
 未配置 `[genome]` 时，首次新 Session 会在 `$LUCIA_HOME/evolution` 创建
 `RevisionOrigin::ManualConfiguration` 本地基线：演示模型写入 `stable/demo`，真实模型写入

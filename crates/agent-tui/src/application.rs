@@ -582,6 +582,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 PluginExecutionContext {
                     execution_policy: plugin_execution_policy,
                     run_observer,
+                    model: tui_settings.plugin_model.clone(),
                 },
                 load_host,
                 load_tx.clone(),

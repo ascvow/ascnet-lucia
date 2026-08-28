@@ -12,4 +12,6 @@ version = "1.0.0"
 mode = "exclusive"
 
 [capabilities]
-# 权限插件启动和运行时均不申请文件、网络、进程或密钥能力。
+# 模型代审只使用 Host 固定的小模型路由；命令完成后通过通用动作清空主输入。
+model_completion = true
+surface_actions = true

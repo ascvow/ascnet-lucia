@@ -39,6 +39,8 @@ stream = true
 [tui]
 sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
+# 插件无工具模型调用使用的独立小模型；权限插件的“帮我审批”模式使用该路由。
+plugin_model = "gpt-5-mini"
 
 [genome]
 # 普通首次启动会在 $LUCIA_HOME/evolution 自动创建本地人工基线，无需填写本段。
@@ -75,6 +77,8 @@ pub(crate) struct TuiSettings {
     pub(crate) resume_latest: bool,
     /// Agent 事件 JSONL 路径；相对路径以配置文件目录为基准。
     pub(crate) events_jsonl: Option<PathBuf>,
+    /// 插件无工具模型完成使用的独立模型 ID；缺省时沿用主模型以兼容旧配置。
+    pub(crate) plugin_model: Option<String>,
     /// Evolution Evidence Plane 配置；默认关闭且不创建证据目录。
     pub(crate) evidence: EvidenceSettings,
     /// Session 行为绑定使用的只读 Genome Registry 配置。
@@ -208,6 +212,9 @@ pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
     let config: TuiConfigEnvelope =
         toml::from_str(&text).with_context(|| format!("解析 TUI 配置失败：{}", path.display()))?;
     let mut settings = config.tui;
+    settings.plugin_model = settings
+        .plugin_model
+        .filter(|model| !model.trim().is_empty());
     settings.context_window = config.model.context_window.filter(|window| *window > 0);
     let provider_id =
         config
@@ -284,6 +291,7 @@ mod tests {
         let settings = load_tui_settings(&path).expect("模板应可解析");
         assert_eq!(settings.sessions_dir, Some(PathBuf::from("projects")));
         assert_eq!(settings.context_window, None);
+        assert_eq!(settings.plugin_model.as_deref(), Some("gpt-5-mini"));
         assert_eq!(settings.default_session, None);
         assert!(!settings.resume_latest);
         assert_eq!(settings.evidence, EvidenceSettings::default());

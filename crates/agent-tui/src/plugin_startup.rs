@@ -17,6 +17,8 @@ pub(crate) struct PluginExecutionContext {
     pub(crate) execution_policy: agent_tool::ExecutionPolicy,
     /// 可选的可信 Runtime Run 观察器。
     pub(crate) run_observer: Option<Arc<dyn agent_runtime::RuntimeRunObserver>>,
+    /// 插件无工具模型完成使用的固定模型 ID；缺省时沿用主模型。
+    pub(crate) model: Option<String>,
 }
 
 /// TUI 首帧后的可信插件启动输入。
@@ -243,7 +245,10 @@ pub(crate) async fn load_plugins_for_tui(
     }
     let model_gateway = agent_template.gateway().clone();
     let model_provider = agent_template.options().provider.clone();
-    let model_name = agent_template.options().model.clone();
+    let model_name = execution
+        .model
+        .clone()
+        .unwrap_or_else(|| agent_template.options().model.clone());
     // 插件模型调用与主 Agent 使用相同的流式开关：部分代理会强制断开
     // 长时间无数据的非流式连接，摘要这类长请求必须跟随配置的传输方式。
     let model_stream = agent_template.options().stream;

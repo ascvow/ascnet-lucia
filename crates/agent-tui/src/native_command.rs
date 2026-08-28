@@ -358,6 +358,10 @@ impl App {
                 true
             }
             KeyCode::Enter => {
+                #[cfg(feature = "plugins")]
+                if matches.is_empty() && self.active_trigger_view().is_some() {
+                    return false;
+                }
                 if !matches.is_empty() {
                     let selected = self.native_command.selected.min(matches.len() - 1);
                     self.input = format!("/{}", matches[selected].name);

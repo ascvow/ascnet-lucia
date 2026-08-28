@@ -2119,6 +2119,31 @@ fn trigger_gestures_route_to_trigger_view() {
     ));
 }
 
+/// 原生命令未声明的斜杠前缀应交给插件触发视图，不能被当作未知命令提前消费。
+#[test]
+#[cfg(feature = "plugins")]
+fn plugin_slash_command_routes_after_native_commands() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut view = test_plugin_view(UiPlacement::InputPanel, "权限模式");
+    view.declaration.input_triggers = vec!["/permission".into()];
+    app.plugin_views.push(view);
+    app.input = "/permission".into();
+    app.cursor = app.input.len();
+
+    assert!(!app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    let PluginKeyRoute::Input(input) = app.route_plugin_key(KeyCode::Enter, KeyModifiers::NONE)
+    else {
+        panic!("插件斜杠命令应路由给触发视图");
+    };
+    assert_eq!(input.view_id, "inputpanel");
+
+    app.input = "/reasoning".into();
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    assert!(app.native_command.reasoning_dialog.is_some());
+}
+
 /// 验证会话摘要查询按标题过滤并返回 UI 契约状态。
 #[tokio::test]
 #[cfg(feature = "plugins")]

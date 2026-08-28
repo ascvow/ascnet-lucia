@@ -1,8 +1,10 @@
 //! Agent 工具策略与交互审批插件。
 
 use agent_plugin::{
-    export_plugin, AgentPlugin, ToolCall, ToolDecision, ToolDecisionStatus, UiColor, UiDeclaration,
-    UiFrame, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    export_plugin, AgentPlugin, ExtensionEvent, ModelCompletionRequest, ModelCompletionResponse,
+    PluginHostApi, ToolCall, ToolDecision, ToolDecisionStatus, UiColor, UiDeclaration, UiFrame,
+    UiHostAction, UiHostActionRequest, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest,
+    UiSize, UiSpan, UiStyle,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -10,12 +12,37 @@ use std::{
 };
 
 const APPROVAL_VIEW: &str = "permission-approval";
+const MODE_VIEW: &str = "permission-mode";
+const PERMISSION_COMMAND: &str = "/permission";
+
+/// 权限插件对有副作用工具调用采用的默认处理模式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PermissionMode {
+    /// 每次通过 TUI 由用户决定。
+    #[default]
+    Manual,
+    /// 使用 Host 固定路由的受限小模型进行二元安全审核。
+    ModelReview,
+    /// 自动允许普通副作用调用；硬安全边界仍会先行拒绝。
+    AllowAll,
+}
+
+impl PermissionMode {
+    /// 返回界面使用的短标签。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "手动审批",
+            Self::ModelReview => "模型代审",
+            Self::AllowAll => "全部放行",
+        }
+    }
+}
 
 /// 单次工具审批的最终选择。
 #[derive(Debug, Clone)]
 enum ApprovalResolution {
     Allow,
-    Cancel,
+    Cancel(String),
 }
 
 /// 等待用户处理的一次工具调用。
@@ -33,8 +60,12 @@ pub struct PermissionPlugin {
     pending: Vec<PendingApproval>,
     resolutions: BTreeMap<String, ApprovalResolution>,
     allowed_similar: BTreeSet<String>,
-    allow_all: bool,
+    mode: PermissionMode,
     selected: usize,
+    mode_selected: usize,
+    command_input: String,
+    next_action_id: u64,
+    review_notice: Option<String>,
 }
 
 impl AgentPlugin for PermissionPlugin {
@@ -42,13 +73,7 @@ impl AgentPlugin for PermissionPlugin {
         if let Some(resolution) = self.resolutions.remove(&call.id) {
             return match resolution {
                 ApprovalResolution::Allow => ToolDecision::Allow.into(),
-                ApprovalResolution::Cancel => ToolDecision::CancelRun {
-                    reason: format!(
-                        "User cancelled tool `{}` and paused the Agent run",
-                        call.name
-                    ),
-                }
-                .into(),
+                ApprovalResolution::Cancel(reason) => ToolDecision::CancelRun { reason }.into(),
             };
         }
 
@@ -61,7 +86,7 @@ impl AgentPlugin for PermissionPlugin {
         }
 
         let rule_key = approval_rule_key(&call);
-        if self.allow_all || self.allowed_similar.contains(&rule_key) {
+        if self.mode == PermissionMode::AllowAll || self.allowed_similar.contains(&rule_key) {
             return ToolDecision::Allow.into();
         }
 
@@ -83,21 +108,46 @@ impl AgentPlugin for PermissionPlugin {
     }
 
     fn describe_ui(&self) -> Vec<UiDeclaration> {
-        vec![UiDeclaration {
-            plugin_id: String::new(),
-            view_id: APPROVAL_VIEW.into(),
-            title: "Agent tool approval".into(),
-            placement: UiPlacement::Input,
-            size: UiSize {
-                width: None,
-                height: Some(6),
+        vec![
+            UiDeclaration {
+                plugin_id: String::new(),
+                view_id: APPROVAL_VIEW.into(),
+                title: "安全审批".into(),
+                placement: UiPlacement::Input,
+                size: UiSize {
+                    width: None,
+                    height: Some(9),
+                },
+                focusable: true,
+                input_triggers: Vec::new(),
             },
-            focusable: true,
-            input_triggers: Vec::new(),
-        }]
+            UiDeclaration {
+                plugin_id: String::new(),
+                view_id: MODE_VIEW.into(),
+                title: "权限模式".into(),
+                placement: UiPlacement::InputPanel,
+                size: UiSize {
+                    width: None,
+                    height: Some(8),
+                },
+                focusable: true,
+                input_triggers: vec![PERMISSION_COMMAND.into()],
+            },
+        ]
     }
 
     fn render_ui(&mut self, request: UiRenderRequest) -> Option<UiFrame> {
+        if request.view_id == MODE_VIEW {
+            return Some(UiFrame {
+                view_id: MODE_VIEW.into(),
+                visible: self
+                    .command_input
+                    .trim_start()
+                    .starts_with(PERMISSION_COMMAND),
+                lines: permission_mode_lines(self.mode, self.mode_selected),
+                cursor: None,
+            });
+        }
         if request.view_id != APPROVAL_VIEW {
             return None;
         }
@@ -113,15 +163,30 @@ impl AgentPlugin for PermissionPlugin {
         Some(UiFrame {
             view_id: APPROVAL_VIEW.into(),
             visible: true,
-            lines: vec![
-                approval_header(&pending.tool_name, &pending.summary),
-                option_line("Y", "Allow once", self.selected == 0, false),
-                option_line("S", "Allow similar", self.selected == 1, false),
-                option_line("Cmd+A", "Allow all", self.selected == 2, false),
-                option_line("C", "Cancel and pause", self.selected == 3, true),
-            ],
+            lines: approval_lines(
+                pending,
+                self.mode,
+                self.selected,
+                self.pending.len(),
+                self.review_notice.as_deref(),
+            ),
             cursor: None,
         })
+    }
+
+    /// 模型代审模式在渲染审批卡片前完成一次受限审核；失败时退回手动审批。
+    fn render_ui_with_host(
+        &mut self,
+        host: &dyn PluginHostApi,
+        request: UiRenderRequest,
+    ) -> Option<UiFrame> {
+        if request.view_id == APPROVAL_VIEW
+            && self.mode == PermissionMode::ModelReview
+            && !self.pending.is_empty()
+        {
+            self.review_current(host);
+        }
+        self.render_ui(request)
     }
 
     fn on_ui_input(&mut self, input: UiInput) {
@@ -144,9 +209,45 @@ impl AgentPlugin for PermissionPlugin {
             }
             "y" | "Y" => self.resolve_current(0),
             "s" | "S" => self.resolve_current(1),
+            "a" | "A" => self.resolve_current(2),
             "c" | "C" | "escape" => self.resolve_current(3),
             "enter" => self.resolve_current(self.selected),
             _ => {}
+        }
+    }
+
+    /// 处理 `/permission` 命令面板，并通过通用宿主动作清空已经消费的主输入。
+    fn on_ui_input_with_host(&mut self, host: &dyn PluginHostApi, input: UiInput) {
+        if input.view_id != MODE_VIEW {
+            self.on_ui_input(input);
+            return;
+        }
+        match &input.event {
+            UiInputEvent::MainInput { text, .. } if self.pending.is_empty() => {
+                self.command_input = text.clone();
+                if let Some(mode) = parse_permission_mode_argument(text) {
+                    self.mode_selected = permission_mode_index(mode);
+                }
+            }
+            UiInputEvent::Key { code, .. } if self.pending.is_empty() => match code.as_str() {
+                "up" | "left" => {
+                    self.mode_selected = self.mode_selected.checked_sub(1).unwrap_or(2);
+                }
+                "down" | "right" | "tab" => {
+                    self.mode_selected = (self.mode_selected + 1) % 3;
+                }
+                "1" => self.finish_mode_command(host, PermissionMode::Manual),
+                "2" => self.finish_mode_command(host, PermissionMode::ModelReview),
+                "3" => self.finish_mode_command(host, PermissionMode::AllowAll),
+                "enter" => {
+                    let mode = parse_permission_mode_argument(&self.command_input)
+                        .unwrap_or_else(|| permission_mode_at(self.mode_selected));
+                    self.finish_mode_command(host, mode);
+                }
+                "escape" => self.clear_command_input(host),
+                _ => {}
+            },
+            _ => self.on_ui_input(input),
         }
     }
 }
@@ -165,13 +266,149 @@ impl PermissionPlugin {
                 ApprovalResolution::Allow
             }
             2 => {
-                self.allow_all = true;
+                self.set_mode(PermissionMode::AllowAll);
                 ApprovalResolution::Allow
             }
-            _ => ApprovalResolution::Cancel,
+            _ => ApprovalResolution::Cancel(format!(
+                "用户拒绝工具 `{}`，Agent 运行已暂停",
+                pending.tool_name
+            )),
         };
         self.resolutions.insert(pending.call_id, resolution);
         self.selected = 0;
+        self.review_notice = None;
+    }
+
+    /// 切换默认权限模式；模式变化会清除旧的“允许相似”临时授权，避免手动模式被历史规则绕过。
+    fn set_mode(&mut self, mode: PermissionMode) {
+        self.mode = mode;
+        self.allowed_similar.clear();
+        self.review_notice = None;
+    }
+
+    /// 使用 Host 固定模型路由审核当前调用，仅接受精确的 `ALLOW` 或 `DENY` 结论。
+    fn review_current(&mut self, host: &dyn PluginHostApi) {
+        self.review_current_with(|request| host.complete_model(request));
+    }
+
+    /// 执行一次可测试的受限审核；完成器错误或协议无效时安全退回人工审批。
+    fn review_current_with(
+        &mut self,
+        complete: impl FnOnce(&ModelCompletionRequest) -> agent_plugin::Result<ModelCompletionResponse>,
+    ) {
+        let Some(pending) = self.pending.first().cloned() else {
+            return;
+        };
+        let request = ModelCompletionRequest {
+            system: Some(
+                "你是工具调用安全审核器。只根据工具名称和脱敏摘要判断是否可执行。\
+                 仅输出 ALLOW 或 DENY，不得输出解释。信息不足、命令可破坏数据、扩大权限或访问凭据时输出 DENY。"
+                    .into(),
+            ),
+            messages: vec![serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": format!("工具：{}\n脱敏摘要：{}", pending.tool_name, pending.summary)
+                }]
+            })],
+            max_tokens: Some(8),
+        };
+        match complete(&request) {
+            Ok(response) => match parse_review_decision(&response.text) {
+                Some(true) => self.resolve_current(0),
+                Some(false) => {
+                    self.deny_current("安全审核模型拒绝了该工具调用，Agent 运行已暂停".into());
+                }
+                None => {
+                    self.mode = PermissionMode::Manual;
+                    self.review_notice = Some("模型返回了无效结论，已退回手动审批".into());
+                }
+            },
+            Err(error) => {
+                self.mode = PermissionMode::Manual;
+                self.review_notice = Some(format!("模型审核失败，已退回手动审批：{error}"));
+            }
+        }
+    }
+
+    /// 使用明确原因拒绝当前请求，供模型审核与后续可信策略复用。
+    fn deny_current(&mut self, reason: String) {
+        let Some(pending) = self.pending.first().cloned() else {
+            return;
+        };
+        self.pending.remove(0);
+        self.resolutions
+            .insert(pending.call_id, ApprovalResolution::Cancel(reason));
+        self.selected = 0;
+        self.review_notice = None;
+    }
+
+    /// 应用命令选择的权限模式，并请求宿主清空命令文本。
+    fn finish_mode_command(&mut self, host: &dyn PluginHostApi, mode: PermissionMode) {
+        self.set_mode(mode);
+        self.mode_selected = permission_mode_index(mode);
+        self.clear_command_input(host);
+    }
+
+    /// 清空权限命令输入；宿主动作失败时保留原输入，便于用户重试或退出。
+    fn clear_command_input(&mut self, host: &dyn PluginHostApi) {
+        self.next_action_id = self.next_action_id.saturating_add(1);
+        let request = UiHostActionRequest {
+            request_id: format!("permission-command-{}", self.next_action_id),
+            action: UiHostAction::SetInput {
+                text: String::new(),
+                cursor: Some(0),
+            },
+        };
+        if host
+            .emit_event(&ExtensionEvent::host_action(request).expect("宿主动作必须可序列化"))
+            .is_ok()
+        {
+            self.command_input.clear();
+        }
+    }
+}
+
+/// 从 `/permission` 命令参数解析权限模式；无参数或未知参数返回 `None` 以保留菜单选择。
+fn parse_permission_mode_argument(input: &str) -> Option<PermissionMode> {
+    let mut parts = input.split_whitespace();
+    let command = parts.next()?;
+    if !matches!(command, "/permission" | "/permissions") {
+        return None;
+    }
+    match parts.next()?.to_ascii_lowercase().as_str() {
+        "manual" | "手动" | "手动审批" => Some(PermissionMode::Manual),
+        "assist" | "review" | "模型" | "帮我审批" => Some(PermissionMode::ModelReview),
+        "allow" | "allow-all" | "all" | "全部放行" => Some(PermissionMode::AllowAll),
+        _ => None,
+    }
+}
+
+/// 返回权限模式在二级菜单中的稳定下标。
+fn permission_mode_index(mode: PermissionMode) -> usize {
+    match mode {
+        PermissionMode::Manual => 0,
+        PermissionMode::ModelReview => 1,
+        PermissionMode::AllowAll => 2,
+    }
+}
+
+/// 按菜单下标返回权限模式；越界时回到最安全的手动审批。
+fn permission_mode_at(index: usize) -> PermissionMode {
+    match index {
+        1 => PermissionMode::ModelReview,
+        2 => PermissionMode::AllowAll,
+        _ => PermissionMode::Manual,
+    }
+}
+
+/// 解析小模型的最小二元协议；任何附加解释都视为无效并退回人工审批。
+fn parse_review_decision(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_uppercase().as_str() {
+        "ALLOW" => Some(true),
+        "DENY" => Some(false),
+        _ => None,
     }
 }
 
@@ -310,39 +547,108 @@ fn redact_command(command: &str) -> String {
     }
 }
 
-/// 渲染紧凑的审批标题，将工具名与调用摘要分层展示。
-fn approval_header(tool_name: &str, summary: &str) -> UiLine {
-    UiLine {
-        spans: vec![
-            UiSpan {
-                text: "Approval".into(),
-                style: UiStyle {
-                    foreground: Some(UiColor::Yellow),
-                    bold: true,
-                    ..UiStyle::default()
-                },
-            },
-            UiSpan {
-                text: format!("  {tool_name}"),
-                style: UiStyle {
-                    foreground: Some(UiColor::White),
-                    bold: true,
-                    ..UiStyle::default()
-                },
-            },
-            UiSpan {
-                text: format!("  {summary}"),
-                style: UiStyle {
-                    foreground: Some(UiColor::Gray),
-                    ..UiStyle::default()
-                },
-            },
-        ],
+/// 构造完整审批卡片，分离状态、工具摘要、操作和键盘提示。
+fn approval_lines(
+    pending: &PendingApproval,
+    mode: PermissionMode,
+    selected: usize,
+    pending_count: usize,
+    notice: Option<&str>,
+) -> Vec<UiLine> {
+    let mut lines = vec![
+        UiLine {
+            spans: vec![
+                styled_span("◆ 安全审批", UiColor::Yellow, true),
+                styled_span(format!("  {}", mode.label()), UiColor::Cyan, true),
+                styled_span(format!("  待处理 {pending_count}"), UiColor::Gray, false),
+            ],
+        },
+        UiLine {
+            spans: vec![
+                styled_span("工具  ", UiColor::Gray, false),
+                styled_span(&pending.tool_name, UiColor::White, true),
+            ],
+        },
+        UiLine {
+            spans: vec![
+                styled_span("请求  ", UiColor::Gray, false),
+                styled_span(&pending.summary, UiColor::White, false),
+            ],
+        },
+    ];
+    if let Some(notice) = notice {
+        lines.push(UiLine {
+            spans: vec![styled_span(notice, UiColor::Yellow, false)],
+        });
+    } else {
+        lines.push(UiLine { spans: Vec::new() });
     }
+    lines.extend([
+        option_line("Y", "允许一次", "仅当前调用", selected == 0, false),
+        option_line("S", "允许同类", "记住相似规则", selected == 1, false),
+        option_line("A", "全部放行", "硬安全边界仍生效", selected == 2, false),
+        option_line("C", "拒绝并暂停", "保留当前会话", selected == 3, true),
+        UiLine {
+            spans: vec![styled_span(
+                "↑↓ 选择 · Enter 确认 · /permission 切换默认模式",
+                UiColor::Gray,
+                false,
+            )],
+        },
+    ]);
+    lines
 }
 
-/// 渲染一个纵向审批选项；仅选中项强调快捷键，危险操作保留红色语义。
-fn option_line(shortcut: &str, label: &str, selected: bool, dangerous: bool) -> UiLine {
+/// 构造 `/permission` 二级模式选择面板。
+fn permission_mode_lines(mode: PermissionMode, selected: usize) -> Vec<UiLine> {
+    vec![
+        UiLine {
+            spans: vec![
+                styled_span("◆ 权限模式", UiColor::Cyan, true),
+                styled_span(format!("  当前：{}", mode.label()), UiColor::Gray, false),
+            ],
+        },
+        UiLine { spans: Vec::new() },
+        mode_line(
+            "1",
+            "手动审批",
+            "每次由你确认",
+            selected == 0,
+            UiColor::Green,
+        ),
+        mode_line(
+            "2",
+            "帮我审批",
+            "受限小模型审核",
+            selected == 1,
+            UiColor::Cyan,
+        ),
+        mode_line(
+            "3",
+            "全部放行",
+            "仅保留硬安全边界",
+            selected == 2,
+            UiColor::Yellow,
+        ),
+        UiLine { spans: Vec::new() },
+        UiLine {
+            spans: vec![styled_span(
+                "↑↓ 选择 · Enter 应用 · Esc 关闭",
+                UiColor::Gray,
+                false,
+            )],
+        },
+    ]
+}
+
+/// 渲染一个纵向审批选项；选中项突出快捷键，危险操作保留红色语义。
+fn option_line(
+    shortcut: &str,
+    label: &str,
+    detail: &str,
+    selected: bool,
+    dangerous: bool,
+) -> UiLine {
     let text_color = if dangerous {
         UiColor::Red
     } else if selected {
@@ -361,7 +667,7 @@ fn option_line(shortcut: &str, label: &str, selected: bool, dangerous: bool) -> 
                 },
             },
             UiSpan {
-                text: format!("{shortcut:<7}"),
+                text: format!("[{shortcut}] "),
                 style: UiStyle {
                     foreground: Some(if selected { UiColor::Cyan } else { text_color }),
                     bold: selected,
@@ -369,14 +675,39 @@ fn option_line(shortcut: &str, label: &str, selected: bool, dangerous: bool) -> 
                 },
             },
             UiSpan {
-                text: label.into(),
+                text: format!("{label:<10}"),
                 style: UiStyle {
                     foreground: Some(text_color),
                     bold: selected,
                     ..UiStyle::default()
                 },
             },
+            styled_span(detail, UiColor::Gray, false),
         ],
+    }
+}
+
+/// 渲染权限模式选项，颜色只表达模式语义，不改变安全判断。
+fn mode_line(shortcut: &str, label: &str, detail: &str, selected: bool, color: UiColor) -> UiLine {
+    UiLine {
+        spans: vec![
+            styled_span(if selected { "› " } else { "  " }, UiColor::Cyan, selected),
+            styled_span(format!("[{shortcut}] "), color, selected),
+            styled_span(format!("{label:<10}"), UiColor::White, selected),
+            styled_span(detail, UiColor::Gray, false),
+        ],
+    }
+}
+
+/// 构造一段统一风格的声明式 UI 文本。
+fn styled_span(text: impl Into<String>, color: UiColor, bold: bool) -> UiSpan {
+    UiSpan {
+        text: text.into(),
+        style: UiStyle {
+            foreground: Some(color),
+            bold,
+            ..UiStyle::default()
+        },
     }
 }
 
@@ -387,7 +718,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// 审批界面应保持五行紧凑布局，不使用整块反色或冗余的关闭状态文案。
+    /// 审批界面应分层展示策略、工具、摘要、动作和键盘提示。
     #[test]
     fn approval_ui_uses_compact_visual_hierarchy() {
         let mut plugin = PermissionPlugin::default();
@@ -416,14 +747,153 @@ mod tests {
             .collect::<String>();
 
         assert!(frame.visible);
-        assert_eq!(frame.lines.len(), 5);
-        assert!(text.contains("Approval  shell"), "{text}");
-        assert!(text.contains("Cmd+A  Allow all"), "{text}");
+        assert_eq!(frame.lines.len(), 9);
+        assert!(text.contains("安全审批"), "{text}");
+        assert!(text.contains("工具  shell"), "{text}");
+        assert!(text.contains("[A] 全部放行"), "{text}");
         assert!(frame
             .lines
             .iter()
             .flat_map(|line| line.spans.iter())
             .all(|span| !span.style.reversed));
+    }
+
+    /// 权限命令面板必须展示三种默认策略，并标记当前手动模式。
+    #[test]
+    fn permission_command_renders_three_modes() {
+        let mut plugin = PermissionPlugin {
+            command_input: "/permission".into(),
+            ..PermissionPlugin::default()
+        };
+
+        let frame = plugin
+            .render_ui(UiRenderRequest {
+                plugin_id: "permission".into(),
+                view_id: MODE_VIEW.into(),
+                instance_id: None,
+                width: 68,
+                height: 9,
+                focused: true,
+                frame: 1,
+            })
+            .expect("权限模式界面应返回可见帧");
+        let text = frame
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(frame.visible);
+        assert!(text.contains("当前：手动审批"), "{text}");
+        assert!(text.contains("帮我审批"), "{text}");
+        assert!(text.contains("全部放行"), "{text}");
+    }
+
+    /// 命令参数必须稳定映射三种权限模式，未知值不得改变选择。
+    #[test]
+    fn permission_command_parses_mode_arguments() {
+        assert_eq!(
+            parse_permission_mode_argument("/permission manual"),
+            Some(PermissionMode::Manual)
+        );
+        assert_eq!(
+            parse_permission_mode_argument("/permission assist"),
+            Some(PermissionMode::ModelReview)
+        );
+        assert_eq!(
+            parse_permission_mode_argument("/permissions allow-all"),
+            Some(PermissionMode::AllowAll)
+        );
+        assert_eq!(parse_permission_mode_argument("/permission unknown"), None);
+    }
+
+    /// 模型代审只接受精确二元结论，避免解释文本被误判为放行。
+    #[test]
+    fn model_review_requires_exact_decision() {
+        assert_eq!(parse_review_decision("ALLOW\n"), Some(true));
+        assert_eq!(parse_review_decision("deny"), Some(false));
+        assert_eq!(parse_review_decision("ALLOW because it is safe"), None);
+        assert_eq!(parse_review_decision(""), None);
+    }
+
+    /// 模型代审允许结论必须只放行当前请求，并使用严格受限的短输出请求。
+    #[test]
+    fn model_review_allows_exact_positive_decision() {
+        let call = ToolCall::new("model-allow", "shell", json!({"command": "cargo test"}));
+        let mut plugin = PermissionPlugin {
+            mode: PermissionMode::ModelReview,
+            ..PermissionPlugin::default()
+        };
+        plugin.before_tool(call.clone());
+
+        plugin.review_current_with(|request| {
+            assert_eq!(request.max_tokens, Some(8));
+            assert!(request
+                .system
+                .as_deref()
+                .is_some_and(|text| text.contains("ALLOW")));
+            Ok(ModelCompletionResponse {
+                text: "ALLOW".into(),
+                usage: None,
+            })
+        });
+
+        assert_eq!(
+            plugin.before_tool(call),
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Allow
+            }
+        );
+    }
+
+    /// 模型代审拒绝结论必须取消当前运行，不能仅从待审批队列移除请求。
+    #[test]
+    fn model_review_denial_cancels_run() {
+        let call = ToolCall::new("model-deny", "shell", json!({"command": "rm -rf build"}));
+        let mut plugin = PermissionPlugin {
+            mode: PermissionMode::ModelReview,
+            ..PermissionPlugin::default()
+        };
+        plugin.before_tool(call.clone());
+
+        plugin.review_current_with(|_| {
+            Ok(ModelCompletionResponse {
+                text: "DENY".into(),
+                usage: None,
+            })
+        });
+
+        assert!(matches!(
+            plugin.before_tool(call),
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::CancelRun { .. }
+            }
+        ));
+    }
+
+    /// 模型调用失败时必须保留待审批请求并自动退回手动模式。
+    #[test]
+    fn model_review_failure_falls_back_to_manual() {
+        let call = ToolCall::new("model-error", "shell", json!({"command": "cargo test"}));
+        let mut plugin = PermissionPlugin {
+            mode: PermissionMode::ModelReview,
+            ..PermissionPlugin::default()
+        };
+        plugin.before_tool(call.clone());
+
+        plugin.review_current_with(|_| Err(agent_plugin::anyhow!("测试模型不可用")));
+
+        assert_eq!(plugin.mode, PermissionMode::Manual);
+        assert_eq!(plugin.pending.len(), 1);
+        assert!(plugin
+            .review_notice
+            .as_deref()
+            .is_some_and(|text| text.contains("已退回手动审批")));
+        assert!(matches!(
+            plugin.before_tool(call),
+            ToolDecisionStatus::Pending { .. }
+        ));
     }
 
     /// 敏感文件读取必须直接拒绝，不能通过审批临时放行。
