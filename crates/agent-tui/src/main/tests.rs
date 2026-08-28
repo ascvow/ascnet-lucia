@@ -2677,8 +2677,87 @@ fn escape_interrupts_running_agent_without_clearing_input() {
     app.handle_key(KeyCode::Esc, KeyModifiers::NONE, Some(&agent));
 
     assert!(agent.state().cancel_requested);
+    assert!(app.run_stream_cancelled);
     assert_eq!(app.input, "尚未发送的引导");
     assert!(!app.should_quit);
+}
+
+/// Esc 请求取消后，已经排队但尚未消费的正文和思考增量不得继续改变界面。
+#[test]
+fn escape_immediately_stops_visible_stream_deltas() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    app.running = true;
+    app.append_model_delta("取消前");
+    app.append_model_thinking("思考前");
+
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, Some(&agent));
+    app.append_model_delta("取消后");
+    app.append_model_thinking("思考后");
+
+    assert_eq!(app.messages[0].text, "取消前");
+    assert_eq!(app.model_thinking, "思考前");
+}
+
+/// 独占审批视图可见时必须冻结流式增量，隐藏后由后续模型输出恢复刷新。
+#[cfg(feature = "plugins")]
+#[test]
+fn visible_permission_input_freezes_stream_deltas() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.append_model_delta("审批前");
+    app.append_model_thinking("思考前");
+    app.plugin_views
+        .push(test_plugin_view(UiPlacement::Input, "Permission"));
+
+    app.append_model_delta("审批中");
+    app.append_model_thinking("思考中");
+    assert_eq!(app.messages[0].text, "审批前");
+    assert_eq!(app.model_thinking, "思考前");
+
+    app.plugin_views[0]
+        .frame
+        .as_mut()
+        .expect("审批帧应存在")
+        .visible = false;
+    app.append_model_delta("审批后");
+    app.append_model_thinking("思考后");
+    assert_eq!(app.messages[0].text, "审批前审批后");
+    assert_eq!(app.model_thinking, "思考前思考后");
+}
+
+/// 审批视图隐藏后必须归还主输入焦点，避免下一次 Esc 被旧插件焦点吞掉。
+#[cfg(feature = "plugins")]
+#[test]
+fn hidden_permission_input_returns_escape_to_main() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.plugin_views
+        .push(test_plugin_view(UiPlacement::Input, "Permission"));
+    app.plugin_focus = Some(0);
+    apply_plugin_frames(
+        &mut app,
+        vec![(
+            "test-plugin".into(),
+            "input".into(),
+            None,
+            Ok(Some(PluginUiFrame {
+                view_id: "input".into(),
+                visible: false,
+                lines: Vec::new(),
+                cursor: None,
+            })),
+        )],
+    );
+
+    assert!(app.plugin_focus.is_none());
+    assert!(matches!(
+        app.route_plugin_key(KeyCode::Esc, KeyModifiers::NONE),
+        PluginKeyRoute::Main
+    ));
 }
 
 /// 粘贴的引号包裹或转义路径解析为文件；普通文本返回 None。

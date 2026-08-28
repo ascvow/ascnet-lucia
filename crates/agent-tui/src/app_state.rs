@@ -87,6 +87,8 @@ pub(crate) struct App {
     pub(crate) spinner_frame: usize,
     /// 当前正在接收增量文本的助手消息索引。
     pub(crate) streaming_message: Option<usize>,
+    /// 用户取消当前运行后立即关闭可见流，防止已排队的模型或工具增量继续刷新界面。
+    pub(crate) run_stream_cancelled: bool,
     /// 当前模型轮次正在流式返回的可见推理摘要；运行结束后清除且不进入 Session。
     pub(crate) model_thinking: String,
     /// 手动滚动偏移；None 表示跟随底部自动滚动。
@@ -315,6 +317,7 @@ impl App {
             config_path: None,
             spinner_frame: 0,
             streaming_message: None,
+            run_stream_cancelled: false,
             model_thinking: String::new(),
             scroll: None,
             last_max_scroll: 0,
@@ -450,6 +453,7 @@ impl App {
         self.cursor = 0;
         self.queued_inputs.clear();
         self.streaming_message = None;
+        self.run_stream_cancelled = false;
         self.model_thinking.clear();
         self.scroll = None;
         self.context_tokens = None;
@@ -1121,6 +1125,7 @@ impl App {
                 if self.running {
                     self.last_escape_at = None;
                     if let Some(agent) = agent {
+                        self.run_stream_cancelled = true;
                         agent.cancel();
                         self.messages
                             .push(Msg::new(MsgKind::Info, "Cancelling the current run..."));
@@ -2049,6 +2054,7 @@ impl App {
         self.running = true;
         self.run_started_at = Some(std::time::Instant::now());
         self.streaming_message = None;
+        self.run_stream_cancelled = false;
         self.model_thinking.clear();
         self.scroll = None;
 
@@ -2108,14 +2114,14 @@ impl App {
 
     /// 将模型公开的推理摘要增量追加到当前运行态展示，不写入消息或持久会话。
     pub(crate) fn append_model_thinking(&mut self, delta: &str) {
-        if self.running {
+        if self.accepts_run_stream_output() {
             self.model_thinking.push_str(delta);
         }
     }
 
     /// 将文本增量追加到当前助手消息；不改动滚动位置，用户回看历史时不被拉回底部。
     pub(crate) fn append_model_delta(&mut self, delta: &str) {
-        if delta.is_empty() {
+        if delta.is_empty() || !self.accepts_run_stream_output() {
             return;
         }
         let index = self.streaming_message.unwrap_or_else(|| {
@@ -2128,6 +2134,21 @@ impl App {
         if let Some(message) = self.messages.get_mut(index) {
             message.text.push_str(delta);
         }
+    }
+
+    /// 返回当前是否允许流式输出刷新主界面。
+    ///
+    /// 用户请求取消后立即拒绝迟到增量；独占输入插件可见时暂时冻结主事件区，避免审批内容
+    /// 与后台输出同时移动。该方法不影响 Core 持久化已经生成的部分结果。
+    pub(crate) fn accepts_run_stream_output(&self) -> bool {
+        if !self.running || self.run_stream_cancelled {
+            return false;
+        }
+        #[cfg(feature = "plugins")]
+        if self.visible_plugin_input().is_some() {
+            return false;
+        }
+        true
     }
 
     /// 完成 Agent 运行，以完整 Session 校准界面，并返回是否可自动推进 FIFO。
@@ -2183,6 +2204,7 @@ impl App {
         }
 
         self.streaming_message = None;
+        self.run_stream_cancelled = false;
         self.model_thinking.clear();
         if let Some(run) = run {
             if run.cancelled {

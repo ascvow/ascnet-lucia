@@ -30,7 +30,7 @@ pub(crate) fn apply_plugin_frames(app: &mut App, rendered: Vec<PluginRenderResul
         match result {
             Ok(Some(frame)) => {
                 app.update_plugin_frame(&plugin_id, instance_id.as_deref(), frame);
-                focus_visible_input_view(app);
+                sync_visible_input_focus(app);
             }
             Ok(None) => {}
             Err(error) => {
@@ -79,15 +79,15 @@ fn apply_rendered_request(app: &mut App, rendered: PluginRenderResult) {
     match result {
         Ok(Some(frame)) => {
             app.update_plugin_frame(&plugin_id, instance_id.as_deref(), frame);
-            focus_visible_input_view(app);
+            sync_visible_input_focus(app);
         }
         Ok(None) => {}
         Err(error) => app.set_plugin_ui_error(&plugin_id, &view_id, instance_id.as_deref(), &error),
     }
 }
 
-/// 可见 Input 视图自动占用主输入焦点，隐藏后由 App 恢复主输入。
-fn focus_visible_input_view(app: &mut App) {
+/// 同步独占 Input 视图焦点；显示时自动接管，隐藏后立即归还主输入。
+fn sync_visible_input_focus(app: &mut App) {
     if let Some(index) = app
         .plugin_views
         .iter()
@@ -99,6 +99,15 @@ fn focus_visible_input_view(app: &mut App) {
         })
     {
         app.plugin_focus = Some(index);
+        return;
+    }
+    let focused_input_hidden = app.plugin_focus.is_some_and(|index| {
+        app.plugin_views.get(index).is_some_and(|view| {
+            view.declaration.placement == UiPlacement::Input && !plugin_view_visible(view)
+        })
+    });
+    if focused_input_hidden {
+        app.plugin_focus = None;
     }
 }
 

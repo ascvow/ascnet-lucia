@@ -839,13 +839,15 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::ToolOutputDelta(output)) => {
-                if let Some(message) = app
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|message| message.tool_call_id() == Some(output.call_id.as_str()))
-                {
-                    message.append_tool_output(&output.delta);
+                if app.accepts_run_stream_output() {
+                    if let Some(message) = app
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|message| message.tool_call_id() == Some(output.call_id.as_str()))
+                    {
+                        message.append_tool_output(&output.delta);
+                    }
                 }
             }
             Some(UiEvent::ToolFinished(tool_result)) => {
