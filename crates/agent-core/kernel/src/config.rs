@@ -3,7 +3,7 @@
 
 use crate::{
     agent::{Agent, AgentModelConfig, AgentOptions},
-    model::{ModelGateway, ModelProviderConfig, OpenAiProtocol, ProviderKind},
+    model::{ModelGateway, ModelProviderConfig, OpenAiProtocol, ProviderKind, ReasoningLevel},
 };
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,7 @@ impl AgentRootConfig {
         config.max_tokens = self.agent.max_tokens.or(config.max_tokens);
         config.stream = self.agent.stream.unwrap_or(config.stream);
         config.temperature = self.agent.temperature.or(config.temperature);
+        config.reasoning = self.agent.reasoning.unwrap_or(config.reasoning);
         config.provider_options = self
             .agent
             .provider_options
@@ -86,6 +87,7 @@ impl AgentRootConfig {
         options.max_tokens = self.agent.max_tokens.or(options.max_tokens);
         options.stream = self.agent.stream.unwrap_or(options.stream);
         options.temperature = self.agent.temperature.or(options.temperature);
+        options.reasoning = self.agent.reasoning.unwrap_or(options.reasoning);
         options.provider_options = self
             .agent
             .provider_options
@@ -180,6 +182,8 @@ pub struct AgentConfig {
     pub stream: Option<bool>,
     /// 模型采样温度；Core 原样传递，合法范围由服务商适配器校验。
     pub temperature: Option<f32>,
+    /// 模型推理强度；`None` 保持默认关闭，由应用层能力元数据决定是否补全。
+    pub reasoning: Option<ReasoningLevel>,
 
     /// Provider-specific options shallow-merged into the request.
     /// 浅合并到请求中的服务商专属选项。

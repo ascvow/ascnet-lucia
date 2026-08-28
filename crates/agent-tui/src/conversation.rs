@@ -5,16 +5,18 @@ use super::*;
 /// 输入框中等待随下一条消息发送的附件。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PendingAttachment {
-    /// 输入框中展示的引用标签，如 `[Image#1]`、`[FILE#report.pdf]`。
+    /// 输入框中展示的引用标签，如 `[IMAGE#1]`、`[FILE#1]`、`[PDF#1]`。
     pub(crate) label: String,
     /// 文件名（不含路径）。
     pub(crate) name: String,
     /// MIME 类型。
     pub(crate) media_type: String,
-    /// base64 编码的文件内容。
+    /// base64 编码的文件内容；粘贴文本使用空字符串并由 `pasted_text` 保存原文。
     pub(crate) data: String,
     /// 是否图片附件。
     pub(crate) is_image: bool,
+    /// 从剪贴板折叠展示的原始文本；文件附件为 `None`。
+    pub(crate) pasted_text: Option<String>,
 }
 
 /// 一次用户提交：含附件引用标签的文本与对应附件。
@@ -30,12 +32,14 @@ impl UserSubmission {
     /// 转换为一次用户消息的内容块：文本在前，附件按加入顺序排在其后。
     pub(crate) fn blocks(&self) -> Vec<ContentBlock> {
         let mut blocks = Vec::with_capacity(self.attachments.len() + 1);
-        if !self.text.is_empty() {
-            blocks.push(ContentBlock::Text {
-                text: self.text.clone(),
-            });
+        let visible_text = submission_text(&self.text, &self.attachments);
+        if !visible_text.is_empty() {
+            blocks.push(ContentBlock::Text { text: visible_text });
         }
         for attachment in &self.attachments {
+            if attachment.pasted_text.is_some() {
+                continue;
+            }
             blocks.push(if attachment.is_image {
                 ContentBlock::Image {
                     media_type: attachment.media_type.clone(),
@@ -51,6 +55,16 @@ impl UserSubmission {
         }
         blocks
     }
+}
+
+/// 展开粘贴文本并移除文件类展示标签，返回真正发送给模型的正文。
+pub(crate) fn submission_text(text: &str, attachments: &[PendingAttachment]) -> String {
+    let mut body = text.to_string();
+    for attachment in attachments {
+        let replacement = attachment.pasted_text.as_deref().unwrap_or_default();
+        body = body.replace(&attachment.label, replacement);
+    }
+    body.trim().to_string()
 }
 
 impl From<&str> for UserSubmission {
@@ -820,6 +834,13 @@ pub(crate) fn attachment_media_type(path: &Path, bytes: &[u8]) -> (String, bool)
         "gif" => "image/gif",
         "webp" => "image/webp",
         "pdf" => "application/pdf",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "ogg" => "audio/ogg",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
         "json" => "application/json",
         _ => {
             if std::str::from_utf8(bytes).is_ok() {
@@ -830,6 +851,23 @@ pub(crate) fn attachment_media_type(path: &Path, bytes: &[u8]) -> (String, bool)
         }
     };
     (media_type.to_string(), media_type.starts_with("image/"))
+}
+
+/// 将附件 MIME 类型映射为 models.dev 输入模态；普通文件依赖文本降级能力。
+pub(crate) fn attachment_modality(media_type: &str) -> crate::model_metadata::ModelModality {
+    use crate::model_metadata::ModelModality;
+
+    if media_type.starts_with("image/") {
+        ModelModality::Image
+    } else if media_type == "application/pdf" {
+        ModelModality::Pdf
+    } else if media_type.starts_with("audio/") {
+        ModelModality::Audio
+    } else if media_type.starts_with("video/") {
+        ModelModality::Video
+    } else {
+        ModelModality::Text
+    }
 }
 
 /// 将文本复制到系统剪贴板。

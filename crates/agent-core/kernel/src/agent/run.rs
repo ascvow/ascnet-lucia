@@ -202,7 +202,7 @@ impl Agent {
                     .limits
                     .clamp_tokens(self.options.max_tokens),
                 temperature: self.options.temperature,
-                reasoning: self.options.reasoning,
+                reasoning: self.reasoning_level(),
                 provider_options: self.options.provider_options.clone(),
             };
 

@@ -349,6 +349,8 @@ pub struct Agent {
     extension: Arc<dyn AgentExtension>,
     events: Arc<dyn EventSink>,
     options: AgentOptions,
+    /// 应用在共享 Agent 上动态覆盖的推理强度；`u8::MAX` 表示沿用静态运行选项。
+    reasoning_override: std::sync::atomic::AtomicU8,
 
     /// steering 消息队列：工具执行间隙注入，跳过剩余工具。
     steering: Arc<std::sync::Mutex<Vec<String>>>,
@@ -378,6 +380,7 @@ impl Agent {
             extension: Arc::new(NoopAgentExtension),
             events: Arc::new(NoopEventSink),
             options,
+            reasoning_override: std::sync::atomic::AtomicU8::new(u8::MAX),
             steering: Arc::new(std::sync::Mutex::new(Vec::new())),
             follow_ups: Arc::new(std::sync::Mutex::new(Vec::new())),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -653,6 +656,42 @@ impl Agent {
     /// 可变借用运行选项。
     pub fn options_mut(&mut self) -> &mut AgentOptions {
         &mut self.options
+    }
+
+    /// 返回后续模型请求实际使用的推理强度。
+    ///
+    /// 应用未动态覆盖时返回构造阶段配置的强度；该读取不会阻塞正在运行的 Agent。
+    pub fn reasoning_level(&self) -> ReasoningLevel {
+        match self
+            .reasoning_override
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            0 => ReasoningLevel::Off,
+            1 => ReasoningLevel::Minimal,
+            2 => ReasoningLevel::Low,
+            3 => ReasoningLevel::Medium,
+            4 => ReasoningLevel::High,
+            5 => ReasoningLevel::XHigh,
+            6 => ReasoningLevel::Max,
+            _ => self.options.reasoning,
+        }
+    }
+
+    /// 动态设置后续模型请求使用的推理强度。
+    ///
+    /// 已经发出的请求不会被修改；正在运行的 ReAct 循环会从下一次模型请求开始生效。
+    pub fn set_reasoning_level(&self, level: ReasoningLevel) {
+        let value = match level {
+            ReasoningLevel::Off => 0,
+            ReasoningLevel::Minimal => 1,
+            ReasoningLevel::Low => 2,
+            ReasoningLevel::Medium => 3,
+            ReasoningLevel::High => 4,
+            ReasoningLevel::XHigh => 5,
+            ReasoningLevel::Max => 6,
+        };
+        self.reasoning_override
+            .store(value, std::sync::atomic::Ordering::Release);
     }
 
     /// Borrow the model gateway.

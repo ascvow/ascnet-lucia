@@ -434,6 +434,28 @@ fn agent_with_script(responses: Vec<ModelResponse>) -> Agent {
     )
 }
 
+/// 共享 Agent 的动态推理等级应从下一次模型请求开始生效。
+#[tokio::test]
+async fn dynamic_reasoning_level_updates_next_request() {
+    let model = Arc::new(CapturingModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("capturing", model.clone())
+        .expect("注册捕获模型应成功");
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("capturing", "test-model"),
+    );
+
+    agent.set_reasoning_level(ReasoningLevel::XHigh);
+    agent.run("验证动态推理").await.expect("运行应成功");
+
+    let requests = model.requests.lock().expect("模型请求锁不应中毒");
+    assert_eq!(requests[0].reasoning, ReasoningLevel::XHigh);
+}
+
 /// Evidence Plane 提供的 Run ID 必须贯穿结果和全部事件，不能在 Core 内被替换。
 #[tokio::test]
 async fn caller_supplied_run_id_binds_result_and_events() {

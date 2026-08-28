@@ -294,6 +294,9 @@ fn build_responses_request(req: ModelRequest, allowed_params: &[&str]) -> Result
     // 推理级别映射：Off 不添加字段，其余映射为 OpenAI reasoning.effort
     match req.reasoning {
         ReasoningLevel::Off => {}
+        ReasoningLevel::Minimal => {
+            body["reasoning"] = json!({ "effort": "minimal" });
+        }
         ReasoningLevel::Low => {
             body["reasoning"] = json!({ "effort": "low" });
         }
@@ -302,6 +305,12 @@ fn build_responses_request(req: ModelRequest, allowed_params: &[&str]) -> Result
         }
         ReasoningLevel::High => {
             body["reasoning"] = json!({ "effort": "high" });
+        }
+        ReasoningLevel::XHigh => {
+            body["reasoning"] = json!({ "effort": "xhigh" });
+        }
+        ReasoningLevel::Max => {
+            body["reasoning"] = json!({ "effort": "max" });
         }
     }
 

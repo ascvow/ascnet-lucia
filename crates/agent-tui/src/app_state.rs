@@ -98,6 +98,14 @@ pub(crate) struct App {
     pub(crate) context_tokens: Option<u64>,
     /// 配置的模型上下文窗口，用于状态栏计算占比。
     pub(crate) context_window: Option<u64>,
+    /// models.dev 为当前模型声明的可选推理等级。
+    pub(crate) reasoning_levels: Vec<ReasoningLevel>,
+    /// 当前 Agent 使用的推理等级。
+    pub(crate) reasoning_level: ReasoningLevel,
+    /// models.dev 为当前模型声明的输入模态；`None` 表示快照未匹配，不限制旧行为。
+    pub(crate) model_input_modalities: Option<Vec<crate::model_metadata::ModelModality>>,
+    /// models.dev 为当前模型声明的输出模态；用于展示能力并阻止误报未实现协议。
+    pub(crate) model_output_modalities: Option<Vec<crate::model_metadata::ModelModality>>,
     /// 鼠标捕获是否开启；默认开启，由应用同时处理滚轮、拖选复制和插件点击。
     pub(crate) mouse_capture: bool,
     /// 当前屏幕文本选择；鼠标释放时把可见缓冲区中的选中文本写入系统剪贴板。
@@ -311,6 +319,10 @@ impl App {
             last_message_width: 0,
             context_tokens: None,
             context_window: None,
+            reasoning_levels: vec![ReasoningLevel::Off],
+            reasoning_level: ReasoningLevel::Off,
+            model_input_modalities: None,
+            model_output_modalities: None,
             mouse_capture: true,
             text_selection: None,
             #[cfg(feature = "plugins")]
@@ -358,6 +370,42 @@ impl App {
     pub(crate) fn with_context_window(mut self, context_window: Option<u64>) -> Self {
         self.context_window = context_window;
         self
+    }
+
+    /// 注入当前模型可切换的推理等级及启动时实际等级。
+    pub(crate) fn with_reasoning_levels(
+        mut self,
+        reasoning_levels: Vec<ReasoningLevel>,
+        reasoning_level: ReasoningLevel,
+    ) -> Self {
+        self.reasoning_levels = reasoning_levels;
+        self.reasoning_level = reasoning_level;
+        self
+    }
+
+    /// 注入 models.dev 声明的输入与输出模态；匹配到模型后附件入口会严格校验输入能力。
+    pub(crate) fn with_model_modalities(
+        mut self,
+        input: Vec<crate::model_metadata::ModelModality>,
+        output: Vec<crate::model_metadata::ModelModality>,
+    ) -> Self {
+        self.model_input_modalities = Some(input);
+        self.model_output_modalities = Some(output);
+        self
+    }
+
+    /// 返回底栏使用的模型输入输出能力摘要；快照未匹配时不展示推测值。
+    pub(crate) fn model_modality_summary(&self) -> Option<String> {
+        let input = self.model_input_modalities.as_ref()?;
+        let output = self.model_output_modalities.as_ref()?;
+        let labels = |modalities: &[crate::model_metadata::ModelModality]| {
+            modalities
+                .iter()
+                .map(crate::model_metadata::ModelModality::label)
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        Some(format!("入 {} · 出 {}", labels(input), labels(output)))
     }
 
     /// 注入启动时加载的持久化记录及其存储实现。
@@ -998,6 +1046,10 @@ impl App {
             self.toggle_mouse_capture();
             return;
         }
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('r')) {
+            self.cycle_reasoning_level(agent);
+            return;
+        }
         // Ctrl+P/Ctrl+N 作为方向键历史回溯的兼容入口。
         if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('p')) {
             // 仅空输入或已处于回溯态时生效，避免覆盖未发送的内容。
@@ -1167,6 +1219,34 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// 循环切换 models.dev 声明的推理等级，并更新共享 Agent 的后续请求参数。
+    fn cycle_reasoning_level(&mut self, agent: Option<&Arc<Agent>>) {
+        let Some(agent) = agent else {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "模型尚未就绪，无法切换思考等级"));
+            return;
+        };
+        if self.reasoning_levels.len() <= 1 {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "当前模型没有可切换的思考等级"));
+            return;
+        }
+        let current = self
+            .reasoning_levels
+            .iter()
+            .position(|level| *level == self.reasoning_level)
+            .unwrap_or(0);
+        self.reasoning_level = self.reasoning_levels[(current + 1) % self.reasoning_levels.len()];
+        agent.set_reasoning_level(self.reasoning_level);
+        self.messages.push(Msg::new(
+            MsgKind::Info,
+            format!(
+                "思考等级已切换为 {}",
+                reasoning_level_label(self.reasoning_level)
+            ),
+        ));
     }
 
     /// 根据模态层和 Tab 焦点决定键盘事件的接收者。
@@ -1589,13 +1669,13 @@ impl App {
         self.input_history_cursor = None;
     }
 
-    /// 处理终端粘贴：单个存在的文件路径转为附件，其余内容保留换行插入光标处。
+    /// 处理终端粘贴：文件路径转为附件，其余文本折叠为引用标签并保留原文待发送。
     pub(crate) fn handle_paste(&mut self, pasted: &str) {
         if let Some(path) = pasted_file_path(pasted) {
             self.attach_file(&path);
             return;
         }
-        // 统一平台换行，制表符仍降级为空格以避免终端宽度不一致。
+        // 统一平台换行，制表符仍降级为空格以避免不同终端产生不可见差异。
         let text = pasted
             .replace("\r\n", "\n")
             .replace('\r', "\n")
@@ -1603,7 +1683,25 @@ impl App {
         if text.is_empty() {
             return;
         }
-        self.insert_input_text(&text);
+        if let Err(message) =
+            self.validate_attachment_modality(&crate::model_metadata::ModelModality::Text)
+        {
+            self.messages.push(Msg::new(MsgKind::Error, message));
+            return;
+        }
+        let label = self.next_pasted_text_label();
+        self.attachments.push(PendingAttachment {
+            label: label.clone(),
+            name: "粘贴的文本".to_string(),
+            media_type: "text/plain".to_string(),
+            data: String::new(),
+            is_image: false,
+            pasted_text: Some(text),
+        });
+        let clip = format!("{label} ");
+        self.input.insert_str(self.cursor, &clip);
+        self.cursor += clip.len();
+        self.finish_input_edit();
     }
 
     /// 读取文件并加入待发送附件，同时在光标处插入引用标签。
@@ -1638,13 +1736,19 @@ impl App {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "attachment".to_string());
         let (media_type, is_image) = attachment_media_type(path, &bytes);
-        let label = self.next_attachment_label(&name, is_image);
+        let modality = attachment_modality(&media_type);
+        if let Err(message) = self.validate_attachment_modality(&modality) {
+            self.messages.push(Msg::new(MsgKind::Error, message));
+            return;
+        }
+        let label = self.next_attachment_label(&modality);
         self.attachments.push(PendingAttachment {
             label: label.clone(),
             name,
             media_type,
             data: base64::engine::general_purpose::STANDARD.encode(&bytes),
             is_image,
+            pasted_text: None,
         });
         let clip = format!("{label} ");
         self.input.insert_str(self.cursor, &clip);
@@ -1652,27 +1756,70 @@ impl App {
         self.finish_input_edit();
     }
 
-    /// 生成不与现有附件冲突的引用标签：图片使用递增序号，文件使用文件名。
-    pub(crate) fn next_attachment_label(&self, name: &str, is_image: bool) -> String {
-        let taken = |label: &str| self.attachments.iter().any(|a| a.label == label);
-        if is_image {
-            let mut index = self.attachments.iter().filter(|a| a.is_image).count() + 1;
-            loop {
-                let label = format!("[Image#{index}]");
-                if !taken(&label) {
-                    return label;
-                }
-                index += 1;
+    /// 校验附件所需的模型输入模态，并隔离 Core 尚未实现的音视频协议。
+    fn validate_attachment_modality(
+        &self,
+        modality: &crate::model_metadata::ModelModality,
+    ) -> std::result::Result<(), String> {
+        use crate::model_metadata::ModelModality;
+
+        if let Some(supported) = self.model_input_modalities.as_ref() {
+            if !supported.contains(modality) {
+                return Err(format!(
+                    "当前模型不支持{}输入；能力来自内置 models.dev 快照",
+                    modality.label()
+                ));
             }
         }
-        let base = format!("[FILE#{name}]");
-        if !taken(&base) {
-            return base;
+        if matches!(modality, ModelModality::Audio | ModelModality::Video) {
+            return Err(format!(
+                "当前模型支持{}输入，但 Lucia 当前模型协议尚未实现该内容块",
+                modality.label()
+            ));
         }
-        let mut index = 2;
+        Ok(())
+    }
+
+    /// 按附件模态生成不冲突的递增编号标签。
+    pub(crate) fn next_attachment_label(
+        &self,
+        modality: &crate::model_metadata::ModelModality,
+    ) -> String {
+        use crate::model_metadata::ModelModality;
+
+        let prefix = match modality {
+            ModelModality::Image => "IMAGE",
+            ModelModality::Pdf => "PDF",
+            _ => "FILE",
+        };
+        let mut index = 1;
         loop {
-            let label = format!("[FILE#{name}#{index}]");
-            if !taken(&label) {
+            let label = format!("[{prefix}#{index}]");
+            if !self
+                .attachments
+                .iter()
+                .any(|attachment| attachment.label == label)
+            {
+                return label;
+            }
+            index += 1;
+        }
+    }
+
+    /// 生成粘贴文本标签；首项使用固定文案，后续项追加序号以保持可独立删除。
+    fn next_pasted_text_label(&self) -> String {
+        let mut index = 1;
+        loop {
+            let label = if index == 1 {
+                "[粘贴的文本]".to_string()
+            } else {
+                format!("[粘贴的文本#{index}]")
+            };
+            if !self
+                .attachments
+                .iter()
+                .any(|attachment| attachment.label == label)
+            {
                 return label;
             }
             index += 1;
@@ -1810,6 +1957,14 @@ impl App {
 
     /// 取出并清空当前输入与附件；文本和附件都为空时返回 `None`。
     pub(crate) fn take_submission(&mut self) -> Option<UserSubmission> {
+        if !submission_text(&self.input, &self.attachments).is_empty() {
+            if let Err(message) =
+                self.validate_attachment_modality(&crate::model_metadata::ModelModality::Text)
+            {
+                self.messages.push(Msg::new(MsgKind::Error, message));
+                return None;
+            }
+        }
         let text = self.input.trim().to_string();
         let attachments = std::mem::take(&mut self.attachments);
         self.input.clear();
@@ -2074,6 +2229,19 @@ pub(crate) fn plugin_mouse_kind(kind: MouseEventKind) -> String {
         MouseEventKind::ScrollUp => "scroll_up".into(),
         MouseEventKind::ScrollLeft => "scroll_left".into(),
         MouseEventKind::ScrollRight => "scroll_right".into(),
+    }
+}
+
+/// 返回推理等级的紧凑中文标签，供底栏和切换反馈复用。
+pub(crate) fn reasoning_level_label(level: ReasoningLevel) -> &'static str {
+    match level {
+        ReasoningLevel::Off => "关闭",
+        ReasoningLevel::Minimal => "最小",
+        ReasoningLevel::Low => "低",
+        ReasoningLevel::Medium => "中",
+        ReasoningLevel::High => "高",
+        ReasoningLevel::XHigh => "超高",
+        ReasoningLevel::Max => "最大",
     }
 }
 

@@ -14,6 +14,7 @@ mod genome_binding;
 mod genome_session;
 #[cfg(feature = "plugins")]
 mod host_actions;
+mod model_metadata;
 mod native_command;
 #[cfg(feature = "plugins")]
 mod plugin_management;
@@ -38,7 +39,7 @@ use agent_core::{
     event::{AgentEvent, AgentEventKind, CompositeEventSink, EventSink, JsonlEventSink},
     model::{
         ChatModel, ContentBlock, MessageRole, ModelGateway, ModelRequest, ModelResponse,
-        ProviderAdapter,
+        ProviderAdapter, ReasoningLevel,
     },
     Agent, AgentOptions, AgentRun, ContextLoadRequest, ContextLoader, Session,
 };

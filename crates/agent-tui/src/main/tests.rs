@@ -2248,7 +2248,7 @@ fn write_temp_attachment(name: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
-/// 拖入图片生成 [Image#N] 引用标签，提交时转换为文本加图片内容块。
+/// 拖入图片生成 [IMAGE#N] 引用标签，提交时转换为文本加图片内容块。
 #[test]
 fn attached_image_becomes_ref_clip_and_blocks() {
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -2260,7 +2260,7 @@ fn attached_image_becomes_ref_clip_and_blocks() {
     app.attach_file(&path);
     std::fs::remove_file(&path).ok();
 
-    assert_eq!(app.input, "看这张 [Image#1] ");
+    assert_eq!(app.input, "看这张 [IMAGE#1] ");
     assert_eq!(app.attachments.len(), 1);
     assert!(app.attachments[0].is_image);
     assert_eq!(app.attachments[0].media_type, "image/png");
@@ -2268,7 +2268,7 @@ fn attached_image_becomes_ref_clip_and_blocks() {
     let submission = app.take_submission().expect("应有提交内容");
     let blocks = submission.blocks();
     assert_eq!(blocks.len(), 2);
-    assert!(matches!(&blocks[0], ContentBlock::Text { text } if text.contains("[Image#1]")));
+    assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "看这张"));
     assert!(
         matches!(&blocks[1], ContentBlock::Image { media_type, .. } if media_type == "image/png")
     );
@@ -2276,7 +2276,7 @@ fn attached_image_becomes_ref_clip_and_blocks() {
     assert!(app.input.is_empty());
 }
 
-/// 非图片文件使用 [FILE#文件名] 标签，重名时追加序号后缀。
+/// 普通文件使用 [FILE#N] 标签，多个文件按加入顺序编号。
 #[test]
 fn attached_files_use_name_labels_with_dedup() {
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -2292,10 +2292,152 @@ fn attached_files_use_name_labels_with_dedup() {
         .iter()
         .map(|attachment| attachment.label.as_str())
         .collect();
-    assert!(labels[0].starts_with("[FILE#"));
-    assert_ne!(labels[0], labels[1]);
+    assert_eq!(labels, vec!["[FILE#1]", "[FILE#2]"]);
     assert!(app.input.contains(labels[0]));
     assert!(app.input.contains(labels[1]));
+}
+
+/// PDF 使用独立编号标签，避免与普通文件混淆。
+#[test]
+fn attached_pdf_uses_pdf_number_label() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("报告.pdf", b"%PDF-1.7");
+
+    app.attach_file(&path);
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(app.input, "[PDF#1] ");
+    assert_eq!(app.attachments[0].media_type, "application/pdf");
+}
+
+/// models.dev 未声明图片输入时，TUI 必须在读取后拒绝加入图片附件。
+#[test]
+fn image_attachment_is_rejected_when_model_lacks_image_input() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into()).with_model_modalities(
+        vec![crate::model_metadata::ModelModality::Text],
+        vec![crate::model_metadata::ModelModality::Text],
+    );
+    let path = write_temp_attachment("图.png", b"png");
+
+    app.attach_file(&path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(app.attachments.is_empty());
+    assert!(app.input.is_empty());
+    assert!(app
+        .messages
+        .last()
+        .is_some_and(|message| message.text.contains("不支持图片输入")));
+}
+
+/// models.dev 未声明 PDF 输入时，原生 PDF 内容块不得进入待提交队列。
+#[test]
+fn pdf_attachment_is_rejected_when_model_lacks_pdf_input() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into()).with_model_modalities(
+        vec![crate::model_metadata::ModelModality::Text],
+        vec![crate::model_metadata::ModelModality::Text],
+    );
+    let path = write_temp_attachment("报告.pdf", b"%PDF-1.7");
+
+    app.attach_file(&path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(app.attachments.is_empty());
+    assert!(app
+        .messages
+        .last()
+        .is_some_and(|message| message.text.contains("不支持PDF输入")));
+}
+
+/// models.dev 声明图片输入时，现有图片内容块路径保持可用。
+#[test]
+fn image_attachment_is_allowed_when_model_supports_image_input() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into()).with_model_modalities(
+        vec![
+            crate::model_metadata::ModelModality::Text,
+            crate::model_metadata::ModelModality::Image,
+        ],
+        vec![crate::model_metadata::ModelModality::Text],
+    );
+    let path = write_temp_attachment("图.png", b"png");
+
+    app.attach_file(&path);
+    std::fs::remove_file(&path).ok();
+
+    let blocks = app.take_submission().expect("应有图片提交").blocks();
+    assert!(matches!(blocks.as_slice(), [ContentBlock::Image { .. }]));
+}
+
+/// 音频即使由模型声明支持，也必须因 Lucia 内容块协议未实现而拒绝。
+#[test]
+fn audio_attachment_is_rejected_until_core_protocol_supports_it() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into()).with_model_modalities(
+        vec![crate::model_metadata::ModelModality::Audio],
+        vec![crate::model_metadata::ModelModality::Text],
+    );
+    let path = write_temp_attachment("录音.mp3", b"audio");
+
+    app.attach_file(&path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(app.attachments.is_empty());
+    assert!(app
+        .messages
+        .last()
+        .is_some_and(|message| message.text.contains("协议尚未实现")));
+}
+
+/// 输入输出模态摘要必须同时来自 models.dev 元数据。
+#[test]
+fn model_modality_summary_includes_input_and_output_types() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let app = App::new(tx, "测试模型".into()).with_model_modalities(
+        vec![
+            crate::model_metadata::ModelModality::Text,
+            crate::model_metadata::ModelModality::Image,
+        ],
+        vec![crate::model_metadata::ModelModality::Text],
+    );
+
+    assert_eq!(
+        app.model_modality_summary().as_deref(),
+        Some("入 文本/图片 · 出 文本")
+    );
+}
+
+/// 普通粘贴文本在输入框折叠显示，提交内容块仍包含原始文本而非占位标签。
+#[test]
+fn pasted_text_uses_clip_label_and_preserves_original_content() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.handle_paste("第一行\r\n第二行");
+
+    assert_eq!(app.input, "[粘贴的文本] ");
+    let submission = app.take_submission().expect("应有粘贴文本提交");
+    let blocks = submission.blocks();
+    assert_eq!(blocks.len(), 1);
+    assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "第一行\n第二行"));
+}
+
+/// 删除粘贴标签必须同步删除绑定原文，提交时不得残留隐藏正文。
+#[test]
+fn deleting_pasted_text_label_removes_bound_content() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.handle_paste("不应发送的正文");
+    app.handle_key(KeyCode::Backspace, KeyModifiers::NONE, None);
+
+    app.handle_key(KeyCode::Backspace, KeyModifiers::NONE, None);
+
+    assert!(app.input.is_empty());
+    assert!(app.attachments.is_empty());
+    assert!(app.take_submission().is_none());
 }
 
 /// Backspace 紧跟引用标签时整体删除标签与对应附件。
@@ -2486,6 +2628,27 @@ fn app_defaults_to_mouse_wheel_and_text_selection() {
     assert!(app.mouse_capture);
 }
 
+/// Ctrl+R 只能在 models.dev 声明的等级中循环，并同步更新共享 Agent。
+#[test]
+fn reasoning_shortcut_cycles_model_supported_levels() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into()).with_reasoning_levels(
+        vec![
+            ReasoningLevel::Off,
+            ReasoningLevel::Low,
+            ReasoningLevel::High,
+        ],
+        ReasoningLevel::Off,
+    );
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+
+    app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, Some(&agent));
+
+    assert_eq!(app.reasoning_level, ReasoningLevel::Low);
+    assert_eq!(agent.reasoning_level(), ReasoningLevel::Low);
+}
+
 /// 应用内拖选应保留换行和中文宽字符，同时移除每行末尾的布局空白。
 #[test]
 fn mouse_text_selection_extracts_visible_buffer() {
@@ -2625,15 +2788,16 @@ fn attachment_media_type_detects_kinds() {
 #[test]
 fn input_ref_spans_highlight_labels() {
     let attachments = vec![PendingAttachment {
-        label: "[Image#1]".to_string(),
+        label: "[IMAGE#1]".to_string(),
         name: "pic.png".to_string(),
         media_type: "image/png".to_string(),
         data: String::new(),
         is_image: true,
+        pasted_text: None,
     }];
 
-    let spans = input_ref_spans("看 [Image#1] 这个", &attachments);
+    let spans = input_ref_spans("看 [IMAGE#1] 这个", &attachments);
     let contents: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
 
-    assert_eq!(contents, vec!["看 ", "[Image#1]", " 这个"]);
+    assert_eq!(contents, vec!["看 ", "[IMAGE#1]", " 这个"]);
 }

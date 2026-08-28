@@ -242,7 +242,20 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         Span::styled("lucia", Style::new().fg(COLOR_USER).bold()),
         Span::raw("  "),
         Span::styled(app.model_name.as_str(), Style::new().fg(COLOR_TEXT)),
+        Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+        Span::styled(
+            format!("思考 {}", reasoning_level_label(app.reasoning_level)),
+            Style::new().fg(COLOR_MUTED),
+        ),
     ];
+    if workspace.width >= 120 {
+        if let Some(modalities) = app.model_modality_summary() {
+            footer.extend([
+                Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+                Span::styled(modalities, Style::new().fg(COLOR_MUTED)),
+            ]);
+        }
+    }
     if workspace.width >= 96 {
         footer.extend([
             Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
@@ -531,6 +544,7 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
         ("PgUp/PgDn", "Scroll history"),
         ("Up/Down", "Recall input"),
         ("Ctrl+Y", "Copy last reply"),
+        ("Ctrl+R", "Cycle reasoning"),
     ];
     for (key, action) in shortcuts {
         let pad = 18usize.saturating_sub(unicode_width::UnicodeWidthStr::width(action));

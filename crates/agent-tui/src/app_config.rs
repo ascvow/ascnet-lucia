@@ -1,5 +1,6 @@
 //! Lucia TUI 的应用级配置初始化与路径解析。
 
+use agent_core::ReasoningLevel;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 #[cfg(unix)]
@@ -29,7 +30,9 @@ openai_protocol = "responses"
 [agent]
 # 0 表示交互主会话不设置总 ReAct 步数上限。
 max_steps = 0
-max_tokens = 4096
+# max_tokens 和 reasoning 缺省时从打包内置的 models.dev 快照读取。
+# max_tokens = 4096
+# reasoning = "medium"
 # 默认使用流式模型接口；设为 false 时等待完整响应。
 stream = true
 
@@ -54,6 +57,15 @@ pub(crate) struct TuiSettings {
     /// 模型上下文窗口，仅供状态栏计算占比，不传入模型请求。
     #[serde(skip)]
     pub(crate) context_window: Option<u64>,
+    /// 内置 models.dev 快照中匹配到的模型能力。
+    #[serde(skip)]
+    pub(crate) model_metadata: Option<crate::model_metadata::ModelMetadata>,
+    /// 用户是否显式配置了模型输出上限。
+    #[serde(skip)]
+    pub(crate) max_tokens_explicit: bool,
+    /// 用户是否显式配置了推理等级。
+    #[serde(skip)]
+    pub(crate) reasoning_explicit: bool,
     /// 会话目录；相对路径以配置文件目录为基准。
     pub(crate) sessions_dir: Option<PathBuf>,
     /// 旧版默认会话 ID；仅为兼容已有配置保留，普通启动不再自动恢复。
@@ -99,6 +111,7 @@ pub(crate) struct EvidenceSettings {
 #[serde(default)]
 struct TuiConfigEnvelope {
     model: TuiModelSettings,
+    agent: TuiAgentSettings,
     tui: TuiSettings,
     evidence: EvidenceSettings,
     genome: GenomeSettings,
@@ -110,6 +123,22 @@ struct TuiConfigEnvelope {
 struct TuiModelSettings {
     /// 模型上下文窗口 token 上限；零值视为未配置。
     context_window: Option<u64>,
+    /// Core 服务商类型，用于推导 models.dev 官方服务商 ID。
+    provider: Option<String>,
+    /// 发送给服务商的模型 ID。
+    model: Option<String>,
+    /// 自定义兼容网关对应的 models.dev 服务商 ID。
+    models_dev_provider: Option<String>,
+}
+
+/// TUI 读取的 Agent 显式覆盖标记，实际请求配置仍由 Core 解析。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct TuiAgentSettings {
+    /// 用户配置的输出 token 上限。
+    max_tokens: Option<u32>,
+    /// 用户配置的推理强度。
+    reasoning: Option<ReasoningLevel>,
 }
 
 /// 返回 Lucia 应用数据目录。
@@ -179,6 +208,23 @@ pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
         toml::from_str(&text).with_context(|| format!("解析 TUI 配置失败：{}", path.display()))?;
     let mut settings = config.tui;
     settings.context_window = config.model.context_window.filter(|window| *window > 0);
+    let provider_id =
+        config
+            .model
+            .models_dev_provider
+            .or_else(|| match config.model.provider.as_deref() {
+                Some("open-ai") => Some("openai".to_string()),
+                Some("anthropic") => Some("anthropic".to_string()),
+                _ => None,
+            });
+    settings.model_metadata = match (provider_id.as_deref(), config.model.model.as_deref()) {
+        (Some(provider), Some(model)) => {
+            crate::model_metadata::find_model_metadata(provider, model)?
+        }
+        _ => None,
+    };
+    settings.max_tokens_explicit = config.agent.max_tokens.is_some();
+    settings.reasoning_explicit = config.agent.reasoning.is_some();
     settings.evidence = config.evidence;
     settings.genome = config.genome;
     Ok(settings)

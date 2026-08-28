@@ -206,12 +206,18 @@ pub enum ReasoningLevel {
     /// 不启用推理。
     #[default]
     Off,
+    /// 最小预算推理。
+    Minimal,
     /// 低预算推理。
     Low,
     /// 中等预算推理。
     Medium,
     /// 高预算推理。
     High,
+    /// 超高预算推理。
+    XHigh,
+    /// 服务商允许的最大预算推理。
+    Max,
 }
 
 /// How the model should use tools.

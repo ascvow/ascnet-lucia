@@ -267,6 +267,49 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     };
     let genome_policy = genome_binding.map(|binding| binding.execution_policy());
     let mut options = restrict_agent_options_for_genome(options, genome_policy);
+    let mut reasoning_levels = vec![options.reasoning];
+    if !demo_mode && genome_binding.is_none() {
+        if let Some(metadata) = tui_settings.model_metadata.as_ref() {
+            if let (Some(configured), Some(limit)) =
+                (options.max_tokens, metadata.max_output_tokens)
+            {
+                if tui_settings.max_tokens_explicit && configured > limit {
+                    return Err(anyhow!(
+                        "配置的 agent.max_tokens {configured} 超过 models.dev 声明的模型输出上限 {limit}"
+                    ));
+                }
+            }
+            reasoning_levels = metadata.reasoning_levels.clone();
+            if tui_settings.reasoning_explicit {
+                if !reasoning_levels.contains(&options.reasoning) {
+                    return Err(anyhow!(
+                        "配置的思考等级 {} 不在 models.dev 声明的模型能力中",
+                        reasoning_level_label(options.reasoning)
+                    ));
+                }
+            } else if !reasoning_levels.contains(&options.reasoning) {
+                options.reasoning = reasoning_levels[0];
+            }
+        } else {
+            startup_notices.push(
+                "内置 models.dev 快照中未找到当前模型，继续使用显式配置且不提供思考等级切换"
+                    .to_string(),
+            );
+        }
+    }
+    let context_window = tui_settings.context_window.or_else(|| {
+        tui_settings
+            .model_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.context_window)
+    });
+    let reasoning_level = options.reasoning;
+    let model_modalities = tui_settings.model_metadata.as_ref().map(|metadata| {
+        (
+            metadata.input_modalities.clone(),
+            metadata.output_modalities.clone(),
+        )
+    });
     if auto_initialized {
         startup_notices.insert(
             0,
@@ -429,11 +472,15 @@ pub(crate) async fn run(args: Args) -> Result<()> {
 
     let mut app = App::new(tx.clone(), model_name)
         .with_workspace(workspace)
-        .with_context_window(tui_settings.context_window)
+        .with_context_window(context_window)
+        .with_reasoning_levels(reasoning_levels, reasoning_level)
         .with_persistent_session(session_store, session_record)
         .with_context_loader(manual_context_loader)
         .with_genome_runtime(genome_runtime.clone())
         .with_evidence(evidence_runtime.clone());
+    if let Some((input, output)) = model_modalities {
+        app = app.with_model_modalities(input, output);
+    }
     #[cfg(feature = "plugins")]
     {
         app = app.with_plugin_management(plugin_management);

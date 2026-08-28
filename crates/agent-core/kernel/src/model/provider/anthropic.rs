@@ -98,6 +98,10 @@ fn build_messages_request(req: ModelRequest) -> Result<Value> {
     // 推理级别映射：Off 不添加 thinking 参数，其余按预算档位设置
     match req.reasoning {
         ReasoningLevel::Off => {}
+        ReasoningLevel::Minimal => {
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": 1024 });
+            max_tokens = max_tokens.max(2048);
+        }
         ReasoningLevel::Low => {
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": 2048 });
             max_tokens = max_tokens.max(4096);
@@ -109,6 +113,14 @@ fn build_messages_request(req: ModelRequest) -> Result<Value> {
         ReasoningLevel::High => {
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": 16384 });
             max_tokens = max_tokens.max(20480);
+        }
+        ReasoningLevel::XHigh => {
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": 32768 });
+            max_tokens = max_tokens.max(36864);
+        }
+        ReasoningLevel::Max => {
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": 65536 });
+            max_tokens = max_tokens.max(69632);
         }
     }
 
