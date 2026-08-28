@@ -35,6 +35,7 @@
     "test:agent-runtime": "cargo test -p agent-runtime",
     "test:tui:core": "cargo test -p lucia --no-default-features",
     "test:tui:plugins": "cargo test -p lucia --features plugins",
+    "test:evolution:e2e": "cargo build --offline -p lucia-eval && cargo test --offline -p lucia-evolve --test m5_final_e2e -- --ignored && cargo test --offline -p lucia-evolve --test m6_context_process_e2e -- --ignored && cargo test --offline -p lucia-evolve --test m7_skill_process_e2e -- --ignored",
     "test:plugin:agent-runtime": "bun run build:plugin:agent-runtime && cargo test --offline -p agent-runtime-plugin-smoke-tests",
     "test:plugin:manager": "cargo test -p agent-plugin-manager",
     "test:plugin:mcp": "cargo test --offline -p mcp-plugin && bun run build:plugin:mcp && cargo test --offline -p mcp-plugin-smoke-tests -- --ignored --nocapture",

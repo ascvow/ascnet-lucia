@@ -167,7 +167,7 @@ fn evaluator_binary() -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .expect("测试二进制应位于 target profile/deps")
-        .join("lucia-eval")
+        .join(format!("lucia-eval{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// 为 `lucia-evolve` 固定独立 Evaluator、Context Fixture、Archive 与健康 Store。

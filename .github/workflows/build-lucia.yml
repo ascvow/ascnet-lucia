@@ -70,6 +70,9 @@ jobs:
       - name: 运行标准离线检查
         run: bun run check
 
+      - name: 运行外部制品进化双进程验收
+        run: bun run test:evolution:e2e
+
   desktop:
     name: 构建 ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}

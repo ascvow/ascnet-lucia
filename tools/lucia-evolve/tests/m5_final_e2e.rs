@@ -404,7 +404,7 @@ fn evaluator_binary() -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .expect("测试二进制应位于 target profile/deps")
-        .join("lucia-eval")
+        .join(format!("lucia-eval{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// 为 lucia-evolve 配置唯一受信双进程路径和 Dataset 绑定。
