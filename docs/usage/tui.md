@@ -42,11 +42,13 @@ stream = true
 sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
 
+[genome]
+root_dir = "evolution"
+stable = "stable/general"
+# revision_id = "grev_0123456789abcdef0123456789abcdef"
+
 [evidence]
 enabled = false
-# root_dir = "evolution"
-# genome_revision_id = "grev_0123456789abcdef0123456789abcdef"
-# genome_stable = "stable/general"
 ```
 
 设置密钥后重新启动：
@@ -70,16 +72,18 @@ lucia
 - `agent.stream`：是否使用模型流式接口，默认 `true`；设为 `false` 时等待完整响应。
 - `tui.sessions_dir`：按项目隔离的会话根目录；相对路径以配置文件目录为基准。
 - `tui.events_jsonl`：可选事件日志；相对路径以配置文件目录为基准。
+- `genome.root_dir`：Genome Registry 与 Artifact CAS 根目录；相对路径以配置文件目录为基准。
+- `genome.stable`：新 Session 解析的 Stable lineage；解析结果会以精确 Revision 写入 Session。
+- `genome.revision_id`：固定修订部署使用的精确 Revision；与 `stable` 二选一。
 - `evidence.enabled`：为主 Agent 的每次真实 Run 生成 Episode；默认关闭。
-- `evidence.root_dir`：Genome、Artifact CAS 与 Episode 根目录；相对路径以配置文件目录为基准。
-- `evidence.genome_revision_id`：启用 Evidence 时直接绑定的精确 Genome 修订。
-- `evidence.genome_stable`：为新 Session 解析精确修订的 Stable lineage；与 `genome_revision_id` 二选一。
 
-Evidence 启用后，模型密钥仍来自普通配置，但模型路由和参数、Prompt CAS、原生工具、插件
-bundle、能力 owner 与执行策略以 Genome 为准。Genome 必须引用至少一个包含完整系统提示的
-UTF-8 Prompt CAS 制品，空 Prompt 不会采用普通配置或 Core 默认提示。缺少模型密钥不会自动
-切换演示模型；固定插件全部 Ready 前不能发送 Run，任一插件加载失败后保持阻断。旧 Session
-只能使用首次保存时绑定的精确 Revision，Stable 更新不会静默改变已有会话。
+Genome 行为绑定独立于 Evidence 开关。模型密钥仍来自普通配置，但模型路由和参数、Prompt
+CAS、原生工具、插件 bundle、能力 owner 与执行策略始终以 Session 固定的 Genome 为准。
+Genome 必须引用至少一个包含完整系统提示的 UTF-8 Prompt CAS 制品，空 Prompt 不会采用普通
+配置或 Core 默认提示。缺少模型密钥不会自动切换演示模型；固定插件全部 Ready 前不能发送
+Run，任一插件加载失败后保持阻断。旧 Session 只能使用首次保存时绑定的精确 Revision，Stable
+更新不会静默改变已有会话。`evidence.enabled = false` 不创建 Episode、Outbox 或 Outcome
+Revision，但不会取消上述行为绑定。
 
 ## 输入与快捷键
 
@@ -108,7 +112,10 @@ UTF-8 Prompt CAS 制品，空 Prompt 不会采用普通配置或 Core 默认提�
 
 ## 会话行为
 
-普通 `lucia` 启动会创建内存中的空白 Draft，不自动恢复上一次会话。发送第一条消息时，TUI 先保存用户输入，再调用模型；这样模型请求失败时仍能保留原始输入。
+普通 `lucia` 启动会创建内存中的空白 Draft，不自动恢复上一次会话。配置了 Registry 后，Draft
+在首次保存前绑定当前 Stable 的精确 Revision；未配置可解析 Stable 或 Revision 时仍可进入界面，
+但发送消息和 `/compact` 会在保存或模型调用前失败。已持久化且缺少绑定的历史 Session 可只读
+恢复并显式标为 `LegacyUnbound/NotEligible`，不能继续运行或进入 Evidence。
 
 会话按启动目录隔离。实际路径为：
 

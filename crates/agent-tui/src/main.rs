@@ -10,6 +10,7 @@ mod evidence;
 mod evolution_cli;
 mod evolution_dashboard;
 mod genome_binding;
+mod genome_session;
 #[cfg(feature = "plugins")]
 mod host_actions;
 mod native_command;
@@ -78,6 +79,7 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use crossterm::event::MouseEvent;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use evidence::{load_evidence_runtime, EvidenceRuntime};
+use genome_session::{load_genome_session_runtime, GenomeSessionRuntime};
 use ratatui::{prelude::*, widgets::*};
 #[cfg(feature = "plugins")]
 use serde::{de::DeserializeOwned, Serialize};

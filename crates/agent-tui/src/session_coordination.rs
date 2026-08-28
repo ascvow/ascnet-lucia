@@ -314,6 +314,7 @@ pub(crate) fn start_session_context_reload(app: &mut App, label: String) {
     app.pending_reload = Some(label);
     let context_loader = Arc::clone(&app.context_loader);
     let record = app.session_record.clone();
+    let genome_runtime = app.genome_runtime.clone();
     let model_name = app.model_name.clone();
     let session_store = Arc::clone(&app.session_store);
     let tx = app.tx.clone();
@@ -323,19 +324,24 @@ pub(crate) fn start_session_context_reload(app: &mut App, label: String) {
             session_store.as_ref(),
             record,
             model_name,
+            &genome_runtime,
         )
         .await;
         let _ = tx.send(UiEvent::SessionContextReloaded(Box::new(result)));
     });
 }
 
-/// 请求原生加载器重载给定会话记录；仅在内容变化时保存并返回新记录。
+/// 请求原生加载器重载给定会话记录；仅在 Genome 绑定有效且内容变化时保存新记录。
 async fn reload_session_context(
     context_loader: &dyn ContextLoader,
     session_store: &dyn SessionStore,
-    record: SessionRecord,
+    mut record: SessionRecord,
     model_name: String,
+    genome_runtime: &GenomeSessionRuntime,
 ) -> Result<SessionReloadOutcome> {
+    genome_runtime
+        .validate_run_session(&mut record)
+        .context("上下文重载要求 Session 绑定精确 Genome Revision")?;
     let request = ContextLoadRequest {
         run_id: format!("reload:{}:{}", record.id, record.revision),
         step: 0,
@@ -365,8 +371,17 @@ pub(crate) async fn run_and_persist(
     session_store: &dyn SessionStore,
     session_record: SessionRecord,
     input: impl Into<UserSubmission>,
+    genome_runtime: &GenomeSessionRuntime,
 ) -> AgentCompletion {
-    run_and_persist_with_evidence(agent, session_store, session_record, input, None).await
+    run_and_persist_with_evidence(
+        agent,
+        session_store,
+        session_record,
+        input,
+        genome_runtime,
+        None,
+    )
+    .await
 }
 
 /// 先保存用户输入，再以可选 Evidence Plane 运行 Agent 并保存完整回复。
@@ -379,20 +394,19 @@ pub(crate) async fn run_and_persist_with_evidence(
     session_store: &dyn SessionStore,
     mut session_record: SessionRecord,
     input: impl Into<UserSubmission>,
+    genome_runtime: &GenomeSessionRuntime,
     evidence: Option<&EvidenceRuntime>,
 ) -> AgentCompletion {
     let submission: UserSubmission = input.into();
-    if let Some(evidence) = evidence {
-        if let Err(error) = evidence.bind_or_validate_session(&mut session_record) {
-            return AgentCompletion {
-                run: None,
-                session_record,
-                error: Some(error),
-                input_committed: false,
-                queue_may_advance: false,
-                input: submission,
-            };
-        }
+    if let Err(error) = genome_runtime.validate_run_session(&mut session_record) {
+        return AgentCompletion {
+            run: None,
+            session_record,
+            error: Some(error),
+            input_committed: false,
+            queue_may_advance: false,
+            input: submission,
+        };
     }
     let expected_revision = (session_record.revision > 0).then_some(session_record.revision);
     session_record.session =

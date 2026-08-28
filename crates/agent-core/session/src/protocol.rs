@@ -19,6 +19,12 @@ const MAX_SESSION_ID_LENGTH: usize = 128;
 const MAX_BEHAVIOR_BINDING_KIND_LENGTH: usize = 64;
 const MAX_BEHAVIOR_BINDING_REVISION_LENGTH: usize = 256;
 
+/// 历史 Session 未绑定版本化行为制品时使用的中立协议标记。
+pub const LEGACY_UNBOUND_BEHAVIOR_KIND: &str = "legacy_unbound";
+
+/// 历史 Session 不具备可归因行为修订时使用的不适用标记。
+pub const LEGACY_UNBOUND_BEHAVIOR_REVISION: &str = "not_eligible";
+
 /// 经过路径安全校验的会话标识。
 ///
 /// 标识只允许 1 到 128 个 ASCII 字母、数字、连字符或下划线，因此可以安全地
@@ -200,6 +206,23 @@ impl SessionBehaviorBinding {
         };
         validate_behavior_binding(&binding)?;
         Ok(binding)
+    }
+
+    /// 创建历史未绑定 Session 的显式不可评估标记。
+    ///
+    /// 该标记只声明 Session 没有可归因的版本化行为制品，不会把旧会话静默绑定到
+    /// 当前行为，也不会使其具备 Evidence 资格。
+    pub fn legacy_unbound() -> Self {
+        Self {
+            kind: LEGACY_UNBOUND_BEHAVIOR_KIND.to_string(),
+            revision: LEGACY_UNBOUND_BEHAVIOR_REVISION.to_string(),
+        }
+    }
+
+    /// 判断绑定是否为历史未绑定且不可评估的精确协议标记。
+    pub fn is_legacy_unbound(&self) -> bool {
+        self.kind == LEGACY_UNBOUND_BEHAVIOR_KIND
+            && self.revision == LEGACY_UNBOUND_BEHAVIOR_REVISION
     }
 }
 
@@ -468,7 +491,18 @@ pub(crate) fn prepare_saved_record(
         });
     }
     verify_revision(&record.id, current, expected_revision)?;
-    if current.is_some_and(|current| current.behavior_binding != record.behavior_binding) {
+    let behavior_binding_changed = current.is_some_and(|current| {
+        if current.behavior_binding == record.behavior_binding {
+            return false;
+        }
+        // 旧格式 Session 只允许加法迁移为显式 Legacy 标记；仍禁止绑定任意真实
+        // 行为修订、替换或删除绑定，避免恢复时静默改变历史行为身份。
+        !matches!(
+            (&current.behavior_binding, &record.behavior_binding),
+            (None, Some(binding)) if binding.is_legacy_unbound()
+        )
+    });
+    if behavior_binding_changed {
         return Err(SessionStoreError::BehaviorBindingChanged {
             id: record.id.clone(),
         });
@@ -598,6 +632,25 @@ mod tests {
         );
         assert!(matches!(
             prepare_saved_record(silently_bound, Some(&legacy), Some(1)),
+            Err(SessionStoreError::BehaviorBindingChanged { .. })
+        ));
+
+        let mut explicitly_legacy = legacy.clone();
+        explicitly_legacy.behavior_binding = Some(SessionBehaviorBinding::legacy_unbound());
+        let migrated = prepare_saved_record(explicitly_legacy, Some(&legacy), Some(1))
+            .expect("旧 Session 应允许加法写入 Legacy 标记");
+        assert_eq!(migrated.revision, 2);
+        assert!(migrated
+            .behavior_binding
+            .as_ref()
+            .is_some_and(SessionBehaviorBinding::is_legacy_unbound));
+
+        let mut rebound = migrated.clone();
+        rebound.behavior_binding = Some(
+            SessionBehaviorBinding::new("agent_genome", "grev_candidate").expect("测试绑定应合法"),
+        );
+        assert!(matches!(
+            prepare_saved_record(rebound, Some(&migrated), Some(2)),
             Err(SessionStoreError::BehaviorBindingChanged { .. })
         ));
     }

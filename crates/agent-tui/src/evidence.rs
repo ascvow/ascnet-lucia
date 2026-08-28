@@ -6,28 +6,22 @@ use crate::genome_binding::GenomeRuntimeBinding;
 use crate::genome_binding::{
     current_git_commit, current_git_dirty, current_target_triple, current_tui_features,
 };
-use agent_context::NativeContextPolicy;
+use crate::genome_session::GenomeSessionRuntime;
 use agent_evolution::{
     load_episode_evidence, EpisodeRecorderConfig, EpisodeRecorderHub, EvolutionPipeline,
-    FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox, FileGenomeResolver,
-    FileIssueObservationStore, FileOutcomeRevisionStore, GenomeResolver, GenomeSelector,
-    RegisteredEpisodeRun, RuntimeHealthRecorder,
+    FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox, FileIssueObservationStore,
+    FileOutcomeRevisionStore, RegisteredEpisodeRun, RuntimeHealthRecorder,
 };
 #[cfg(test)]
 use agent_evolution::{ArtifactStore, FileGenomeStore, GenomeStore};
 #[cfg(feature = "plugins")]
 use agent_evolution_protocol::Outcome;
-use agent_evolution_protocol::{GenomeRevision, GenomeRevisionId, OutcomeResolution};
+use agent_evolution_protocol::{GenomeRevision, OutcomeResolution};
 #[cfg(feature = "plugins")]
 use agent_runtime::{
     AgentRuntimeError, RuntimeResult, RuntimeRunContext, RuntimeRunFinalizer,
     RuntimeRunObservation, RuntimeRunObserver, RuntimeRunTermination,
 };
-use agent_session::SessionBehaviorBinding;
-use agent_skill::SkillCatalog;
-
-/// Session Store 中用于标识 Agent Genome 修订绑定的协议名。
-const GENOME_SESSION_BEHAVIOR_KIND: &str = "agent_genome";
 
 /// TUI 进程固定使用的证据运行配置。
 ///
@@ -44,21 +38,21 @@ pub(crate) struct EvidenceRuntime {
 }
 
 impl EvidenceRuntime {
-    /// 使用已验证的 Genome 修订、Artifact CAS 和 Recorder Hub 创建运行配置。
+    /// 使用 Session 层已验证的 Genome 绑定、Artifact CAS 和 Recorder Hub 创建运行配置。
     ///
     /// # Errors
     ///
     /// Genome 与当前 Kernel 不兼容，或声明当前 TUI 尚不能可信装配的行为表面时返回错误。
     pub(crate) fn new(
         hub: Arc<EpisodeRecorderHub>,
-        revision: GenomeRevision,
+        binding: Arc<GenomeRuntimeBinding>,
         artifacts: FileArtifactStore,
         episodes: FileEpisodeStore,
         root: &Path,
     ) -> Result<Self> {
         Ok(Self {
             hub,
-            binding: Arc::new(GenomeRuntimeBinding::new(revision, artifacts.clone())?),
+            binding,
             artifacts,
             episodes,
             pipeline: Arc::new(
@@ -76,6 +70,23 @@ impl EvidenceRuntime {
         })
     }
 
+    /// 使用测试 Revision 构造 Evidence，生产装配必须复用 Session Genome Binding。
+    ///
+    /// # Errors
+    ///
+    /// Revision 与当前 Kernel 不兼容，或声明无法可信装配的行为表面时返回错误。
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        hub: Arc<EpisodeRecorderHub>,
+        revision: GenomeRevision,
+        artifacts: FileArtifactStore,
+        episodes: FileEpisodeStore,
+        root: &Path,
+    ) -> Result<Self> {
+        let binding = Arc::new(GenomeRuntimeBinding::new(revision, artifacts.clone())?);
+        Self::new(hub, binding, artifacts, episodes, root)
+    }
+
     /// 绑定从同一 Stable 可信解析的 Promotion 后健康记录器。
     fn with_runtime_health(mut self, health: Option<RuntimeHealthRecorder>) -> Self {
         self.health = health;
@@ -87,134 +98,9 @@ impl EvidenceRuntime {
         Arc::clone(&self.hub)
     }
 
-    /// 返回该可信 Genome 为本次 TUI 进程声明的执行策略。
-    pub(crate) fn execution_policy(&self) -> &agent_tool::ExecutionPolicy {
-        self.binding.execution_policy()
-    }
-
     /// 返回启动时已经固定的 Genome Revision。
     pub(crate) fn revision(&self) -> &GenomeRevision {
         self.binding.revision()
-    }
-
-    /// 用 Genome 的模型行为绑定普通配置，同时保留凭据来源。
-    ///
-    /// # Errors
-    ///
-    /// 模型适配器类型、协议或额外 Header 无法安全绑定时返回错误。
-    pub(crate) fn bind_model_config(&self, config: AgentRootConfig) -> Result<AgentRootConfig> {
-        self.binding.bind_model_config(config)
-    }
-
-    /// 用 Genome 固定显式 Demo 运行的模型、Prompt 与资源行为。
-    ///
-    /// # Errors
-    ///
-    /// Demo 路由与 Genome 不符或引用制品不可读取时返回错误。
-    pub(crate) async fn bind_demo_options(&self, options: AgentOptions) -> Result<AgentOptions> {
-        self.binding.bind_demo_options(options).await
-    }
-
-    /// 用 Genome 固定真实模型选项、Prompt 与资源行为。
-    ///
-    /// # Errors
-    ///
-    /// 引用制品缺失、格式非法或模型参数无法解析时返回错误。
-    pub(crate) async fn bind_agent_options(&self, options: AgentOptions) -> Result<AgentOptions> {
-        self.binding.bind_agent_options(options).await
-    }
-
-    /// 按 Genome 选择当前 Kernel 的原生工具子集。
-    ///
-    /// # Errors
-    ///
-    /// Genome 引用了未注册的原生工具时返回错误。
-    pub(crate) fn bind_native_tools(&self, tools: &ToolRegistry) -> Result<ToolRegistry> {
-        self.binding.bind_native_tools(tools)
-    }
-
-    /// 从 Genome CAS 装配原生 Skill 目录。
-    ///
-    /// # Errors
-    ///
-    /// Skill 引用、状态、强类型 ID 或 CAS 完整性校验失败时返回错误。
-    pub(crate) async fn bind_skill_catalog(&self) -> Result<SkillCatalog> {
-        self.binding.bind_skill_catalog().await
-    }
-
-    /// 从 Genome CAS 装配原生上下文压缩策略。
-    ///
-    /// # Errors
-    ///
-    /// 策略 owner 不是原生稳定 ID，或 CAS 制品未通过完整性与协议校验时返回错误。
-    pub(crate) async fn bind_context_policy(&self) -> Result<Option<NativeContextPolicy>> {
-        self.binding.bind_context_policy().await
-    }
-
-    /// 从发现结果中选择并验证 Genome 固定的插件与能力 owner。
-    ///
-    /// # Errors
-    ///
-    /// 插件缺失、bundle 被篡改或能力 owner 不一致时返回错误。
-    #[cfg(feature = "plugins")]
-    pub(crate) fn bind_plugins(
-        &self,
-        manifests: &[PathBuf],
-    ) -> Result<(Vec<PathBuf>, HashMap<String, String>)> {
-        self.binding.bind_plugins(manifests)
-    }
-
-    /// 读取 Genome Context Policy，并生成按真实插件 ID 隔离的激活元数据。
-    ///
-    /// # Errors
-    ///
-    /// 引用或能力 owner 错绑，或真实 CAS 制品无法通过完整性与协议校验时返回错误。
-    #[cfg(feature = "plugins")]
-    pub(crate) async fn plugin_activation_metadata(
-        &self,
-    ) -> Result<HashMap<String, HashMap<String, String>>> {
-        self.binding.plugin_activation_metadata().await
-    }
-
-    /// 纯 Core 构建拒绝任何插件行为快照。
-    ///
-    /// # Errors
-    ///
-    /// Genome 声明插件或能力 owner 时返回错误。
-    #[cfg(not(feature = "plugins"))]
-    pub(crate) fn verify_core_only_plugins(&self) -> Result<()> {
-        self.binding.verify_core_only_plugins()
-    }
-
-    /// 为新会话固定当前 Genome，或校验已有会话已经固定到同一修订。
-    ///
-    /// 修订号为零且尚未绑定的记录视为未持久化新会话，可以写入绑定；已经持久化但
-    /// 缺少绑定的旧会话会被拒绝，避免在 Evidence 模式下静默认领当前 Genome。
-    ///
-    /// # Errors
-    ///
-    /// 绑定字段无法构造、已有会话缺少绑定，或绑定的协议与修订不匹配时返回错误。
-    pub(crate) fn bind_or_validate_session(&self, record: &mut SessionRecord) -> Result<()> {
-        let expected = SessionBehaviorBinding::new(
-            GENOME_SESSION_BEHAVIOR_KIND,
-            self.revision().revision_id.to_string(),
-        )
-        .context("构造 Evidence Session 行为绑定失败")?;
-        match record.behavior_binding.as_ref() {
-            Some(binding) if binding == &expected => Ok(()),
-            Some(_) => Err(anyhow!(
-                "会话 `{}` 的行为修订与当前 Evidence Genome 不匹配",
-                record.id
-            )),
-            None if record.revision == 0 => {
-                record.behavior_binding = Some(expected);
-                Ok(())
-            }
-            None => Err(anyhow!(
-                "已有会话 `{}` 缺少行为修订绑定，不能在 Evidence 模式下恢复",
-                record.id
-            )),
-        }
     }
 
     /// 创建供 Agent Runtime 子运行使用的 Host 可信观察器。
@@ -339,60 +225,37 @@ impl RuntimeRunFinalizer for RuntimeEpisodeFinalizer {
     }
 }
 
-/// 从 TUI 配置加载并验证 Evidence Plane。
+/// 从已解析的 Session Genome Runtime 可选装配 Evidence Plane。
 ///
-/// 未启用时不创建目录；启用时要求指定精确 Revision ID 或可信 Stable lineage。
+/// 未启用时不创建目录；启用时复用行为装配阶段已校验的精确 Revision，不再次按 Stable
+/// 选择或改变 Session 行为。
 ///
 /// # Errors
 ///
-/// 选择器不合法、两种选择器同时存在、Genome 不存在或被篡改，以及证据根目录无法读取时
-/// 返回错误。
+/// 当前 Session 为 Legacy、Stable 在装配期间变化，或证据根目录无法读取时返回错误。
 pub(crate) async fn load_evidence_runtime(
     settings: &EvidenceSettings,
-    config_path: &Path,
-    lucia_home: &Path,
+    genome_runtime: &GenomeSessionRuntime,
 ) -> Result<Option<EvidenceRuntime>> {
     if !settings.enabled {
         return Ok(None);
     }
-    let root = settings
-        .root_dir
-        .as_deref()
-        .map(|path| resolve_config_relative_path(config_path, path))
-        .unwrap_or_else(|| lucia_home.join("evolution"));
-    let selector = match (
-        settings.genome_revision_id.as_deref(),
-        settings.genome_stable.as_deref(),
-    ) {
-        (Some(_), Some(_)) => {
-            return Err(anyhow!(
-                "evidence.genome_revision_id 与 evidence.genome_stable 只能配置一个"
-            ));
-        }
-        (Some(revision), None) => GenomeSelector::Revision(
-            GenomeRevisionId::new(revision)
-                .context("evidence.genome_revision_id 不是合法的 Genome Revision ID")?,
-        ),
-        (None, Some(lineage)) => GenomeSelector::Stable(lineage.to_string()),
-        (None, None) => {
-            return Err(anyhow!(
-                "启用 evidence 时必须配置 evidence.genome_revision_id 或 evidence.genome_stable"
-            ));
-        }
-    };
-    let revision = FileGenomeResolver::new(&root)
-        .resolve(&selector)
-        .await
-        .with_context(|| format!("解析 Evidence Genome 失败：{selector:?}"))?;
-    let health = match &selector {
-        GenomeSelector::Stable(lineage) => RuntimeHealthRecorder::from_stable(&root, lineage)
+    let binding = genome_runtime
+        .binding_arc()
+        .ok_or_else(|| anyhow!("Session 未绑定精确 Genome Revision，不具备 Evidence 资格"))?;
+    let root = genome_runtime
+        .registry_root()
+        .ok_or_else(|| anyhow!("Evidence Session 缺少 Genome Registry 根目录"))?
+        .to_path_buf();
+    let health = match genome_runtime.stable_lineage() {
+        Some(lineage) => RuntimeHealthRecorder::from_stable(&root, lineage)
             .await
             .with_context(|| format!("装配 Stable Runtime 健康观察失败：{lineage}"))?,
-        GenomeSelector::Revision(_) => None,
+        None => None,
     };
     if health
         .as_ref()
-        .is_some_and(|recorder| recorder.revision_id() != &revision.revision_id)
+        .is_some_and(|recorder| recorder.revision_id() != &binding.revision().revision_id)
     {
         return Err(anyhow!("Stable 在 Evidence Runtime 装配期间发生变化"));
     }
@@ -406,14 +269,8 @@ pub(crate) async fn load_evidence_runtime(
         hub = hub.with_home(home);
     }
     Ok(Some(
-        EvidenceRuntime::new(
-            Arc::new(hub),
-            revision,
-            artifact_store,
-            episode_store,
-            &root,
-        )?
-        .with_runtime_health(health),
+        EvidenceRuntime::new(Arc::new(hub), binding, artifact_store, episode_store, &root)?
+            .with_runtime_health(health),
     ))
 }
 
@@ -504,6 +361,22 @@ mod tests {
     #[cfg(feature = "plugins")]
     use tokio::sync::Notify;
 
+    /// 使用已登记 Revision 构造 Session Genome Runtime，隔离 Evidence 开关测试。
+    fn genome_runtime(
+        root: &Path,
+        revision: GenomeRevision,
+        stable_lineage: Option<&str>,
+    ) -> GenomeSessionRuntime {
+        let binding =
+            GenomeRuntimeBinding::new(revision, FileArtifactStore::new(root.join("artifacts")))
+                .expect("测试 Genome 应可装配");
+        GenomeSessionRuntime::Genome {
+            binding: Arc::new(binding),
+            registry_root: root.to_path_buf(),
+            stable_lineage: stable_lineage.map(str::to_string),
+        }
+    }
+
     /// 返回固定公开响应的 Runtime Evidence 端到端测试模型。
     #[cfg(feature = "plugins")]
     struct RuntimeEvidenceModel;
@@ -559,7 +432,7 @@ mod tests {
         let settings = EvidenceSettings::default();
 
         assert!(
-            load_evidence_runtime(&settings, &root.join("config.toml"), &root)
+            load_evidence_runtime(&settings, &GenomeSessionRuntime::Unconfigured)
                 .await
                 .expect("禁用时应直接返回")
                 .is_none()
@@ -576,17 +449,12 @@ mod tests {
             genome_revision_id: None,
             genome_stable: None,
         };
-        let result = load_evidence_runtime(
-            &settings,
-            Path::new("/tmp/lucia/config.toml"),
-            Path::new("/tmp/lucia"),
-        )
-        .await;
+        let result = load_evidence_runtime(&settings, &GenomeSessionRuntime::Unconfigured).await;
         let Err(error) = result else {
             panic!("缺少 Genome 必须失败");
         };
 
-        assert!(error.to_string().contains("genome_revision_id"));
+        assert!(error.to_string().contains("Evidence 资格"));
     }
 
     /// 启用时必须从不可变 Store 读取并验证 Revision，而不是只接受配置中的 ID 文本。
@@ -605,18 +473,25 @@ mod tests {
         genomes.append(&revision).await.expect("应登记 Genome");
         let settings = EvidenceSettings {
             enabled: true,
-            root_dir: Some(evidence_root),
+            root_dir: Some(evidence_root.clone()),
             genome_revision_id: Some(revision.revision_id.to_string()),
             genome_stable: None,
         };
 
-        let runtime = load_evidence_runtime(&settings, &root.join("config.toml"), &root)
+        let session_runtime = genome_runtime(&evidence_root, revision.clone(), None);
+        let runtime = load_evidence_runtime(&settings, &session_runtime)
             .await
             .expect("应加载 Evidence")
             .expect("Evidence 应启用");
         assert_eq!(runtime.hub().active_runs().await, 0);
         assert_eq!(runtime.revision(), &revision);
-        assert_eq!(runtime.execution_policy(), &revision.genome.execution);
+        assert_eq!(
+            session_runtime
+                .binding()
+                .expect("应有 Genome 绑定")
+                .execution_policy(),
+            &revision.genome.execution
+        );
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
@@ -647,12 +522,14 @@ mod tests {
         .expect("应写入 Stable 引用");
         let settings = EvidenceSettings {
             enabled: true,
-            root_dir: Some(evidence_root),
+            root_dir: Some(evidence_root.clone()),
             genome_revision_id: None,
             genome_stable: Some("stable/general".into()),
         };
 
-        let runtime = load_evidence_runtime(&settings, &root.join("config.toml"), &root)
+        let session_runtime =
+            genome_runtime(&evidence_root, revision.clone(), Some("stable/general"));
+        let runtime = load_evidence_runtime(&settings, &session_runtime)
             .await
             .expect("应加载 Stable Evidence")
             .expect("Evidence 应启用");
@@ -704,7 +581,9 @@ mod tests {
             genome_revision_id: None,
             genome_stable: Some("stable/general".into()),
         };
-        let runtime = load_evidence_runtime(&settings, &root.join("config.toml"), &root)
+        let session_runtime =
+            genome_runtime(&evidence_root, candidate.clone(), Some("stable/general"));
+        let runtime = load_evidence_runtime(&settings, &session_runtime)
             .await
             .expect("应加载 Promotion Stable")
             .expect("Evidence 应启用");
@@ -745,65 +624,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
-    /// 新会话应固定当前 Genome，已有会话则必须带有完全一致的绑定。
-    #[tokio::test]
-    async fn evidence_binds_new_session_and_rejects_unbound_or_mismatched_history() {
-        let root = std::env::temp_dir().join(format!(
-            "lucia-evidence-binding-{}",
-            agent_session::SessionId::generate()
-        ));
-        let artifacts = FileArtifactStore::new(root.join("artifacts"));
-        let revision = test_genome_revision(ExecutionPolicy::serve(), &artifacts).await;
-        let revision_id = revision.revision_id.to_string();
-        let evidence = EvidenceRuntime::new(
-            Arc::new(EpisodeRecorderHub::new(
-                Arc::new(artifacts.clone()),
-                Arc::new(FileEpisodeStore::new(root.join("episodes"))),
-            )),
-            revision,
-            artifacts,
-            FileEpisodeStore::new(root.join("episodes")),
-            &root,
-        )
-        .expect("应创建 Evidence");
-        let mut draft =
-            SessionRecord::new(SessionId::generate(), Session::new()).expect("应创建测试会话");
-
-        evidence
-            .bind_or_validate_session(&mut draft)
-            .expect("新会话应绑定 Genome");
-        assert_eq!(
-            draft.behavior_binding,
-            Some(
-                SessionBehaviorBinding::new(GENOME_SESSION_BEHAVIOR_KIND, revision_id)
-                    .expect("应构造预期绑定")
-            )
-        );
-
-        let mut legacy =
-            SessionRecord::new(SessionId::generate(), Session::new()).expect("应创建旧会话");
-        legacy.revision = 1;
-        assert!(evidence
-            .bind_or_validate_session(&mut legacy)
-            .expect_err("旧会话缺少绑定必须拒绝")
-            .to_string()
-            .contains("缺少行为修订绑定"));
-
-        let mut mismatched = draft;
-        mismatched.behavior_binding = Some(
-            SessionBehaviorBinding::new(
-                GENOME_SESSION_BEHAVIOR_KIND,
-                GenomeRevisionId::generate().to_string(),
-            )
-            .expect("应构造不匹配绑定"),
-        );
-        assert!(evidence
-            .bind_or_validate_session(&mut mismatched)
-            .expect_err("不同 Genome 绑定必须拒绝")
-            .to_string()
-            .contains("不匹配"));
-    }
-
     /// TUI 注入的可信观察器必须为真实 Runtime 子 Agent 创建独立且完整的 Episode。
     #[cfg(feature = "plugins")]
     #[tokio::test]
@@ -820,7 +640,7 @@ mod tests {
         ));
         let revision = test_genome_revision(ExecutionPolicy::serve(), &artifacts).await;
         let genome_revision_id = revision.revision_id.clone();
-        let evidence = EvidenceRuntime::new(
+        let evidence = EvidenceRuntime::new_for_test(
             Arc::clone(&hub),
             revision,
             artifacts,
@@ -890,7 +710,7 @@ mod tests {
         ));
         let revision = test_genome_revision(ExecutionPolicy::serve(), &artifacts).await;
         let genome_revision_id = revision.revision_id.clone();
-        let evidence = EvidenceRuntime::new(
+        let evidence = EvidenceRuntime::new_for_test(
             Arc::clone(&hub),
             revision,
             artifacts,

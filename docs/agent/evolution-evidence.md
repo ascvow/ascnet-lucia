@@ -55,14 +55,16 @@ Episode。Episode Header、Incident 和 Outcome Revision 共享预分配的 `Epi
 `EpisodeEvent`、对应 Event Envelope 及 Incident 证据共享 Recorder 分配的 `EventId`。
 `run_session_with_id` 只是一项 Core 通用机制，不解析 Genome 或 Episode。
 
-TUI 的 Evidence 装配默认关闭。启用时，启动阶段先从
-`<evidence-root>/genomes/<revision-id>.json` 读取并验证不可变 Revision，或把 Stable lineage
-解析为精确 Revision。普通配置只继续提供模型凭据；provider 类型、端点、协议、模型参数、
+TUI 的 Session Genome 装配与 Evidence 隐私开关相互独立。启动阶段先从
+`<genome-root>/genomes/<revision-id>.json` 读取并验证不可变 Revision，或为新 Session 把 Stable
+lineage 解析为精确 Revision。普通配置只继续提供模型凭据；provider 类型、端点、协议、模型参数、
 Prompt、原生工具、插件 bundle、独占能力 owner 和执行策略都由 Genome 装配。Genome 必须
 按顺序引用至少一个包含完整系统提示的 UTF-8 Prompt CAS 制品；空 Prompt 不会隐式采用普通
 配置或 Core 默认提示。Prompt 与 Provider Options 从 Artifact CAS 按摘要读取，插件 bundle
 使用 Plugin Manager 的同一摘要算法复核。额外发现的插件不会进入 Evidence 组合，任一固定
-插件未 Ready 或加载失败时禁止开始 Run。
+插件未 Ready 或加载失败时禁止开始 Run。Evidence 默认关闭，此时不创建 Recorder、Episode、
+Outbox、Issue Observation 或 Outcome Revision；开启后只复用 Session 层已解析的同一绑定，
+不再次选择 Stable 或改变行为。
 
 Evolution Cycle 会从 Genome 生成完整 PluginEnvironmentSnapshot，其中绑定插件集合、版本、Bundle 与 Manifest 摘要、插件配置摘要、Capability Profile、加载顺序、Hook 顺序和 Capability Owner，并计算单一环境摘要。Parent 与所有 Candidate 必须使用相同摘要；任何字段变化都会返回 FrozenPluginEnvironmentChanged，使 Candidate、比较和 Promotion 失效。MutationSurface::Plugin 仅用于读取旧归档，可信 Policy 即使声明它也不能重新启用执行。
 
@@ -70,7 +72,7 @@ Skill、Prompt 和第一方稳定 Schema 的 Policy Artifact 可以独立变化�
 
 启动还会把 Revision 的包版本、Git 提交、dirty 状态、目标三元组和 TUI feature 与编译产物
 逐项核对。源码归档构建使用显式 `unknown` 提交标记且按 dirty 构建处理；由于它无法唯一证明
-内核版本，普通 Serve 可以运行，但 Evidence 会拒绝启动。
+内核版本，不能建立具备运行资格的 Session Genome 绑定。
 
 Context Policy 已外部化为第一方 `ContextPolicyV1`，TUI 会从 Genome 固定的 Artifact CAS
 校验并装配 `native-context` 策略；它不读取或改写通用 Plugin Config。Planning Policy 尚无
@@ -81,9 +83,10 @@ Skill 由 `agent-skill` 直接从 Genome 固定的 Artifact CAS 装配，不扫�
 `RunFinished`、取消、步骤预算耗尽和基础设施错误都会显式收敛并释放路由。证据写入失败会
 报告为运行完成错误，不会被静默忽略。
 
-新 Session 在首次保存前写入 `agent_genome/<revision-id>` 行为绑定。已持久化 Session 只能在
-绑定完全相同时恢复；旧记录缺少绑定或绑定不同 Revision 时拒绝恢复，避免 Stable 更新后让
-长会话静默切换行为版本。
+新 Session 在首次保存前写入 `agent_genome/<revision-id>` 行为绑定；已持久化 Session 始终按
+该精确 Revision 解析，Stable 移动不会改变长会话。未配置可解析 Registry 时，新 Draft 只允许
+显示，所有 Agent Run 与上下文重载都在首次保存和模型调用前失败关闭。旧记录缺少绑定时只允许
+加法迁移为 `LegacyUnbound/NotEligible`，保持可读但不具备新 Run 或 Evidence 资格。
 
 插件 Runtime 的子 Agent 不继承 TUI 主会话 Recorder。TUI 在创建 Runtime 时注入可信
 `RuntimeRunObserver`；Runtime 在 Core 启动前向观察器提交 Host 维护的 `AgentId` 与

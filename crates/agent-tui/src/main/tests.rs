@@ -404,7 +404,7 @@ async fn evidence_run_waits_for_complete_genome_plugins() {
         SessionId::generate()
     ));
     let artifacts = FileArtifactStore::new(root.join("artifacts"));
-    let evidence = EvidenceRuntime::new(
+    let evidence = EvidenceRuntime::new_for_test(
         Arc::new(EpisodeRecorderHub::new(
             Arc::new(artifacts.clone()),
             Arc::new(FileEpisodeStore::new(root.join("episodes"))),
@@ -987,14 +987,28 @@ async fn successful_runs_persist_with_cas_revision() {
     )
     .expect("创建测试会话记录");
 
-    let first_completion = run_and_persist(&agent, &store, record, "第一轮").await;
+    let first_completion = run_and_persist(
+        &agent,
+        &store,
+        record,
+        "第一轮",
+        &GenomeSessionRuntime::TestOnly,
+    )
+    .await;
     assert!(first_completion.error.is_none());
     assert!(first_completion.run.is_some());
     let first = first_completion.session_record;
     assert_eq!(first.revision, 2);
     assert_eq!(first.title.as_deref(), Some("第一轮"));
 
-    let second_completion = run_and_persist(&agent, &store, first.clone(), "第二轮").await;
+    let second_completion = run_and_persist(
+        &agent,
+        &store,
+        first.clone(),
+        "第二轮",
+        &GenomeSessionRuntime::TestOnly,
+    )
+    .await;
     assert!(second_completion.error.is_none());
     assert!(second_completion.run.is_some());
     let second = second_completion.session_record;
@@ -1005,6 +1019,63 @@ async fn successful_runs_persist_with_cas_revision() {
         store.load(&second.id).await.expect("读取测试会话"),
         Some(second)
     );
+}
+
+/// 未配置 Genome 的新 Draft 必须在首次保存和模型调用前拒绝主输入。
+#[tokio::test]
+async fn unconfigured_genome_rejects_input_before_session_save() {
+    let (gateway, options) = build_demo_gateway();
+    let agent = Agent::new(gateway, options);
+    let store = MemorySessionStore::new();
+    let record = SessionRecord::new(
+        SessionId::new("unconfigured-genome").expect("应创建会话 ID"),
+        Session::new(),
+    )
+    .expect("应创建 Draft");
+
+    let completion = run_and_persist(
+        &agent,
+        &store,
+        record,
+        "不得保存或运行",
+        &GenomeSessionRuntime::Unconfigured,
+    )
+    .await;
+
+    assert!(!completion.input_committed);
+    assert!(completion.run.is_none());
+    assert!(completion
+        .error
+        .expect("未配置 Genome 必须返回错误")
+        .to_string()
+        .contains("genome.stable"));
+    assert!(store.list().await.expect("应读取内存存储").is_empty());
+}
+
+/// 未配置 Genome 时 `/compact` 的上下文重载也必须在加载器和保存前失败关闭。
+#[tokio::test]
+async fn unconfigured_genome_rejects_session_context_reload() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app =
+        App::new(tx, "测试模型".into()).with_genome_runtime(GenomeSessionRuntime::Unconfigured);
+
+    start_session_context_reload(&mut app, "正在压缩".into());
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(UiEvent::SessionContextReloaded(result)) = rx.recv().await {
+                break *result;
+            }
+        }
+    })
+    .await
+    .expect("应收到上下文重载结果");
+
+    let Err(error) = result else {
+        panic!("未配置 Genome 不得重载上下文");
+    };
+    assert!(error.to_string().contains("精确 Genome Revision"));
+    assert_eq!(app.session_record.revision, 0);
+    assert!(app.session_record.behavior_binding.is_none());
 }
 
 /// 启用 Evidence 时，真实主会话必须使用预分配 Run ID 生成绑定 Genome 的 Episode。
@@ -1026,7 +1097,15 @@ async fn evidence_runtime_records_persisted_main_run() {
         super::evidence::test_genome_revision(agent_tool::ExecutionPolicy::serve(), &artifacts)
             .await;
     let genome_revision_id = revision.revision_id.clone();
-    let evidence = EvidenceRuntime::new(
+    let genome_runtime = GenomeSessionRuntime::Genome {
+        binding: Arc::new(
+            super::genome_binding::GenomeRuntimeBinding::new(revision.clone(), artifacts.clone())
+                .expect("应创建主会话 Genome 绑定"),
+        ),
+        registry_root: root.clone(),
+        stable_lineage: None,
+    };
+    let evidence = EvidenceRuntime::new_for_test(
         Arc::clone(&hub),
         revision,
         artifacts,
@@ -1042,9 +1121,15 @@ async fn evidence_runtime_records_persisted_main_run() {
     let session_id = SessionId::new("evidence-session").expect("创建证据测试会话标识");
     let record = SessionRecord::new(session_id.clone(), Session::new()).expect("创建证据测试会话");
 
-    let completion =
-        run_and_persist_with_evidence(&agent, &store, record, "记录本轮证据", Some(&evidence))
-            .await;
+    let completion = run_and_persist_with_evidence(
+        &agent,
+        &store,
+        record,
+        "记录本轮证据",
+        &genome_runtime,
+        Some(&evidence),
+    )
+    .await;
 
     assert!(completion.error.is_none(), "{:?}", completion.error);
     let run = completion.run.expect("Agent 应成功完成");
@@ -1089,6 +1174,7 @@ async fn evidence_runtime_records_persisted_main_run() {
         &store,
         legacy,
         "旧会话不得静默认领 Genome",
+        &genome_runtime,
         Some(&evidence),
     )
     .await;
@@ -1097,7 +1183,7 @@ async fn evidence_runtime_records_persisted_main_run() {
         .error
         .expect("旧会话缺少绑定必须失败")
         .to_string()
-        .contains("缺少行为修订绑定"));
+        .contains("未绑定当前精确 Genome Revision"));
     assert!(store
         .load(&legacy_id)
         .await
@@ -1120,7 +1206,14 @@ async fn reconciles_indeterminate_initial_save_before_running() {
     )
     .expect("创建首次协调测试会话");
 
-    let completion = run_and_persist(&agent, &store, record, "首次提交需要协调").await;
+    let completion = run_and_persist(
+        &agent,
+        &store,
+        record,
+        "首次提交需要协调",
+        &GenomeSessionRuntime::TestOnly,
+    )
+    .await;
 
     assert!(completion.error.is_none());
     assert!(completion.run.is_some());
@@ -1149,7 +1242,14 @@ async fn reconciles_indeterminate_final_save_without_forking() {
     .expect("创建最终协调测试会话");
     let original_id = record.id.clone();
 
-    let completion = run_and_persist(&agent, &store, record, "最终提交需要协调").await;
+    let completion = run_and_persist(
+        &agent,
+        &store,
+        record,
+        "最终提交需要协调",
+        &GenomeSessionRuntime::TestOnly,
+    )
+    .await;
 
     assert!(completion.error.is_none());
     assert!(completion.run.is_some());
@@ -1177,7 +1277,14 @@ async fn final_save_conflict_forks_completed_session() {
         .insert("lucia.project_id".into(), Value::String("project-a".into()));
     let original_id = record.id.clone();
 
-    let completion = run_and_persist(&agent, &store, record, "需要完整回复").await;
+    let completion = run_and_persist(
+        &agent,
+        &store,
+        record,
+        "需要完整回复",
+        &GenomeSessionRuntime::TestOnly,
+    )
+    .await;
 
     assert!(completion.run.is_some());
     assert!(completion.input_committed);
@@ -1216,7 +1323,14 @@ async fn failed_final_and_fork_saves_keep_dirty_completed_session() {
     )
     .expect("创建 dirty 测试会话");
 
-    let completion = run_and_persist(&agent, &store, record, "保留这次回复").await;
+    let completion = run_and_persist(
+        &agent,
+        &store,
+        record,
+        "保留这次回复",
+        &GenomeSessionRuntime::TestOnly,
+    )
+    .await;
     let dirty_record = completion.session_record.clone();
     let expected_assistant = restore_session_messages(&dirty_record.session)
         .into_iter()
