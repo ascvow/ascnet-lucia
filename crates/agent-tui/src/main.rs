@@ -8,6 +8,7 @@ mod doctor;
 mod episode_cli;
 mod evidence;
 mod evolution_cli;
+mod evolution_control;
 mod evolution_dashboard;
 mod genome_binding;
 mod genome_session;
