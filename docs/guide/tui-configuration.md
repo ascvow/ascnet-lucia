@@ -55,30 +55,34 @@ lucia --config ./lucia.toml --init
 sessions_dir = "projects"
 events_jsonl = "events.jsonl"
 
+[genome]
+root_dir = "evolution"
+stable = "stable/general"
+# revision_id = "grev_0123456789abcdef0123456789abcdef"
+
 [evidence]
 enabled = false
-# root_dir = "evolution"
-# genome_revision_id = "grev_0123456789abcdef0123456789abcdef"
-# genome_stable = "stable/general"
 ```
 
 `sessions_dir` 是项目会话根目录。相对配置值与 `events_jsonl` 都以配置文件所在目录为基准；CLI 的 `--sessions-dir` 与 `--events-jsonl` 仍以当前工作目录为基准，并覆盖配置值。旧配置中的 `default_session` 和 `resume_latest` 仍可解析，但普通启动不再用它们自动恢复会话。
 
-`evidence.enabled` 默认关闭。启用时必须在 `genome_revision_id` 与 `genome_stable` 中二选一；
-前者固定精确修订，后者通过只读 Stable 引用为新 Session 解析精确修订。启动会重新校验
-Revision 的行为摘要，不存在、引用不一致或被篡改时拒绝运行。
-`root_dir` 的配置值相对配置文件解析，未配置时使用 `$LUCIA_HOME/evolution`。Episode、CAS
-制品和 Genome 修订分别保存在该根目录的 `episodes`、`artifacts` 和 `genomes` 子目录。
+`genome.root_dir` 相对配置文件解析，未配置时使用 `$LUCIA_HOME/evolution`。新 Session 在
+`genome.stable` 与 `genome.revision_id` 中选择一个；Stable 通过只读 Resolver 解析为精确
+Revision。启动会重新校验 Revision 的行为摘要，不存在、引用不一致或被篡改时拒绝运行。
+旧配置中的 `evidence.root_dir`、`evidence.genome_revision_id` 和 `evidence.genome_stable` 仍可
+读取，但独立 `[genome]` 配置优先。
 
-Evidence 启用后，`[model]` 中的 `api_key` 或 `api_key_env` 仍负责提供 Secret；其余模型行为、
-Prompt CAS、原生工具集合、插件 bundle、独占能力 owner 与执行策略由 Genome 固定。
+Session Genome 绑定不受 `evidence.enabled` 控制。`[model]` 中的 `api_key` 或 `api_key_env` 仍
+负责提供 Secret；其余模型行为、Prompt CAS、原生工具集合、插件 bundle、独占能力 owner 与
+执行策略始终由 Genome 固定。Evidence 默认关闭，此时不会创建 `episodes`、`outbox`、
+`outcome-revisions` 或 `issue-observations`；启用后才在同一根目录追加生产证据。
 Genome 必须按顺序引用至少一个包含完整系统提示的 UTF-8 Prompt CAS 制品；空 Prompt 不会
 采用 `[agent].system_prompt` 或 Core 默认提示。
 `model.extra_headers` 暂不支持，因为它可能同时携带 Secret 和未入 Genome 的行为。模型密钥
 缺失时不会自动退回演示模型；显式 `--demo` 只接受声明 `scripted-demo` 路由的 Genome。
-插件版在固定插件全部 Ready 前不开始 Evidence Run，任一加载失败后继续保持阻断。
+插件版在 Genome 固定插件全部 Ready 前不开始 Run，任一加载失败后继续保持阻断。
 Genome 的包版本、Git 提交、dirty 状态、目标三元组和 TUI feature 必须与当前编译产物一致。
-缺少可验证 Git commit 的源码归档构建可以运行普通 Serve，但不能启动 Evidence。
+缺少可验证 Git commit 的源码归档构建不能建立具备运行资格的 Session Genome 绑定。
 
 ## 会话恢复
 
@@ -96,8 +100,10 @@ lucia
 
 原生 `/resume` 打开当前项目的会话列表，用户选中后才按 revision 校验并加载完整 Session；`/sessions` 使用同一界面只读浏览。两者不依赖 Plugin Host。
 
-Evidence 模式会在首次保存前把 Session 绑定到精确 Genome Revision。已有记录缺少绑定或绑定
-不同 Revision 时拒绝恢复；Stable 引用更新只影响后续新 Session，不会让旧 Session 静默升级。
+新 Session 会在首次保存前绑定精确 Genome Revision。Stable 引用更新只影响后续新 Session，
+已有绑定始终按原 Revision 精确恢复。未配置可解析 Registry 时，新 Draft 可以显示，但消息提交、
+队列输入、Host Action 和 `/compact` 都会在保存或模型调用前失败关闭。已持久化且缺少绑定的旧
+记录只允许加法标记为 `LegacyUnbound/NotEligible` 并只读恢复，不能启动 Run 或进入 Evidence。
 
 CLI 仍提供显式恢复和只读列举：
 

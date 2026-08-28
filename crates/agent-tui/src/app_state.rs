@@ -73,6 +73,8 @@ pub(crate) struct App {
     pub(crate) session_store: Arc<dyn SessionStore>,
     /// `/compact` 与模型请求共同使用的原生上下文加载器。
     pub(crate) context_loader: Arc<dyn ContextLoader>,
+    /// 当前进程固定的 Session Genome 行为绑定；独立于 Evidence 隐私开关。
+    pub(crate) genome_runtime: GenomeSessionRuntime,
     /// 可选 Evidence Plane；启用后每次主会话运行必须形成 Episode。
     pub(crate) evidence: Option<EvidenceRuntime>,
     pub(crate) tx: mpsc::UnboundedSender<UiEvent>,
@@ -191,6 +193,10 @@ impl App {
             session_record,
             session_store: Arc::new(MemorySessionStore::new()),
             context_loader: Arc::new(agent_core::PassthroughContextLoader),
+            #[cfg(not(test))]
+            genome_runtime: GenomeSessionRuntime::default(),
+            #[cfg(test)]
+            genome_runtime: GenomeSessionRuntime::TestOnly,
             evidence: None,
             tx,
             model_name,
@@ -269,6 +275,12 @@ impl App {
         self
     }
 
+    /// 注入启动时按 Session 精确解析的 Genome 行为运行时。
+    pub(crate) fn with_genome_runtime(mut self, genome_runtime: GenomeSessionRuntime) -> Self {
+        self.genome_runtime = genome_runtime;
+        self
+    }
+
     /// 注入启动时已经验证 Genome Revision 的 Evidence Plane。
     pub(crate) fn with_evidence(mut self, evidence: Option<EvidenceRuntime>) -> Self {
         self.evidence = evidence;
@@ -297,9 +309,7 @@ impl App {
     /// 进入当前项目下尚未持久化的全新空白草稿。
     pub(crate) fn start_new_draft(&mut self, notice: &str) -> Result<()> {
         let mut draft = self.workspace.draft_record()?;
-        if let Some(evidence) = self.evidence.as_ref() {
-            evidence.bind_or_validate_session(&mut draft)?;
-        }
+        self.genome_runtime.bind_or_validate_session(&mut draft)?;
         self.replace_session(draft, Some(notice));
         Ok(())
     }
@@ -1709,6 +1719,7 @@ impl App {
         let tx = self.tx.clone();
         let session_store = Arc::clone(&self.session_store);
         let session_record = self.session_record.clone();
+        let genome_runtime = self.genome_runtime.clone();
         let evidence = self.evidence.clone();
 
         tokio::spawn(async move {
@@ -1719,6 +1730,7 @@ impl App {
                         session_store.as_ref(),
                         session_record,
                         submission,
+                        &genome_runtime,
                         Some(evidence),
                     )
                     .await
@@ -1729,6 +1741,7 @@ impl App {
                         session_store.as_ref(),
                         session_record,
                         submission,
+                        &genome_runtime,
                     )
                     .await
                 }

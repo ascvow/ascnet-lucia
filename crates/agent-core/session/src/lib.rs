@@ -21,4 +21,5 @@ pub(crate) use protocol::{
 pub use protocol::{
     InvalidSessionBehaviorBinding, InvalidSessionId, SessionBehaviorBinding, SessionId,
     SessionRecord, SessionStore, SessionStoreError, SessionSummary, CURRENT_SESSION_SCHEMA_VERSION,
+    LEGACY_UNBOUND_BEHAVIOR_KIND, LEGACY_UNBOUND_BEHAVIOR_REVISION,
 };
