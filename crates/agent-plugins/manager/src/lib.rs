@@ -489,7 +489,7 @@ impl PluginManager {
             if retained {
                 continue;
             }
-            if let Ok(manifest) = self.resolve_locked_manifest(&plugin) {
+            if let Ok(manifest) = self.resolve_locked_manifest(plugin) {
                 if let Some(bundle) = manifest.parent() {
                     let _ = fs::remove_dir_all(bundle);
                     if let Some(parent) = bundle.parent() {
