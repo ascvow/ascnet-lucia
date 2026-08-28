@@ -47,24 +47,47 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         Ok(home) if !home.is_empty() => cwd.replacen(&home, "~", 1),
         _ => cwd,
     };
-    if app.messages.is_empty() && !app.running {
+    #[cfg(feature = "plugins")]
+    let (timeline_messages, timeline_streaming_message, timeline_thinking) =
+        app.main_event_snapshot.as_ref().map_or_else(
+            || {
+                (
+                    app.messages.as_slice(),
+                    app.streaming_message,
+                    app.model_thinking.as_str(),
+                )
+            },
+            |snapshot| {
+                (
+                    snapshot.messages.as_slice(),
+                    snapshot.streaming_message,
+                    snapshot.model_thinking.as_str(),
+                )
+            },
+        );
+    #[cfg(not(feature = "plugins"))]
+    let (timeline_messages, timeline_streaming_message, timeline_thinking) = (
+        app.messages.as_slice(),
+        app.streaming_message,
+        app.model_thinking.as_str(),
+    );
+    if timeline_messages.is_empty() && !app.running {
         // 空会话时以首屏替代消息流，首条消息或运行开始后自动消失。
         app.last_max_scroll = 0;
         app.last_viewport = chat_area.height;
         render_hero(frame, chat_area, &cwd_display);
     } else {
         let inner_width = chat_area.width.max(1);
-        let mut lines: Vec<Line> = app
-            .messages
+        let mut lines: Vec<Line> = timeline_messages
             .iter()
             .enumerate()
             .flat_map(|(index, message)| {
-                message.to_lines(app.streaming_message == Some(index), inner_width)
+                message.to_lines(timeline_streaming_message == Some(index), inner_width)
             })
             .collect();
         // 推理摘要仅存在于当前运行态，帮助确认推理已启用，但不会进入消息或会话记录。
-        if app.running && !app.model_thinking.is_empty() {
-            for (index, text) in app.model_thinking.lines().enumerate() {
+        if app.running && !timeline_thinking.is_empty() {
+            for (index, text) in timeline_thinking.lines().enumerate() {
                 lines.push(Line::from(vec![
                     Span::styled(
                         if index == 0 { "思考  " } else { "      " },
@@ -74,7 +97,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                 ]));
             }
         }
-        if app.running && app.streaming_message.is_none() {
+        if app.running && timeline_streaming_message.is_none() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
             let mut spans = vec![
                 Span::styled(format!("{spinner} "), Style::new().fg(COLOR_WARNING)),

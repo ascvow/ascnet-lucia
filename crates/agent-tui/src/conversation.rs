@@ -87,6 +87,8 @@ impl From<String> for UserSubmission {
 
 // ─── 聊天消息 ───
 
+/// 主事件区消息的展示类别，决定普通文本与工具状态的渲染方式。
+#[derive(Clone)]
 pub(crate) enum MsgKind {
     User,
     Assistant,
@@ -103,6 +105,8 @@ pub(crate) enum MsgKind {
     Extension,
 }
 
+/// 主事件区的一条可渲染消息，保留工具调用身份、结果和插件帧。
+#[derive(Clone)]
 pub(crate) struct Msg {
     pub(crate) kind: MsgKind,
     pub(crate) text: String,

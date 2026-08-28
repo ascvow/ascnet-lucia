@@ -99,6 +99,7 @@ fn sync_visible_input_focus(app: &mut App) {
         })
     {
         app.plugin_focus = Some(index);
+        app.sync_main_event_snapshot();
         return;
     }
     let focused_input_hidden = app.plugin_focus.is_some_and(|index| {
@@ -109,6 +110,7 @@ fn sync_visible_input_focus(app: &mut App) {
     if focused_input_hidden {
         app.plugin_focus = None;
     }
+    app.sync_main_event_snapshot();
 }
 
 /// 渲染单个插件请求，并保留可信 owner 信息供界面更新。

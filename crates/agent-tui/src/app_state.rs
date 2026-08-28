@@ -40,6 +40,19 @@ pub(crate) fn input_ref_spans<'a>(
     spans
 }
 
+/// 独占审批显示期间固定使用的主事件区快照。
+///
+/// 后台模型与并行工具仍可更新真实状态；审批结束后丢弃快照即可一次性追上，避免丢失结果。
+#[cfg(feature = "plugins")]
+pub(crate) struct MainEventSnapshot {
+    /// 快照建立时已经存在的主事件消息。
+    pub(crate) messages: Vec<Msg>,
+    /// 快照建立时正在接收增量的助手消息索引。
+    pub(crate) streaming_message: Option<usize>,
+    /// 快照建立时已经公开显示的思考摘要。
+    pub(crate) model_thinking: String,
+}
+
 pub(crate) struct App {
     /// 本次进程固定使用的项目工作目录。
     pub(crate) workspace: WorkspaceContext,
@@ -91,6 +104,9 @@ pub(crate) struct App {
     pub(crate) run_stream_cancelled: bool,
     /// 当前模型轮次正在流式返回的可见推理摘要；运行结束后清除且不进入 Session。
     pub(crate) model_thinking: String,
+    /// 独占 Input 视图可见期间使用的主事件区快照；隐藏后恢复实时状态。
+    #[cfg(feature = "plugins")]
+    pub(crate) main_event_snapshot: Option<MainEventSnapshot>,
     /// 手动滚动偏移；None 表示跟随底部自动滚动。
     pub(crate) scroll: Option<u16>,
     /// 上一帧计算出的最大滚动偏移，供滚动操作作为起点。
@@ -319,6 +335,8 @@ impl App {
             streaming_message: None,
             run_stream_cancelled: false,
             model_thinking: String::new(),
+            #[cfg(feature = "plugins")]
+            main_event_snapshot: None,
             scroll: None,
             last_max_scroll: 0,
             last_viewport: 0,
@@ -455,6 +473,10 @@ impl App {
         self.streaming_message = None;
         self.run_stream_cancelled = false;
         self.model_thinking.clear();
+        #[cfg(feature = "plugins")]
+        {
+            self.main_event_snapshot = None;
+        }
         self.scroll = None;
         self.context_tokens = None;
         self.last_escape_at = None;
@@ -1586,6 +1608,25 @@ impl App {
         }
     }
 
+    /// 按独占 Input 视图可见性冻结或恢复主事件区。
+    ///
+    /// 首次显示时固定正文、思考与工具消息的完整渲染状态；周期刷新不会覆盖已有快照。
+    /// 视图隐藏后只清除快照，后台已经完成的事件会在下一帧一次性显示。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn sync_main_event_snapshot(&mut self) {
+        if self.visible_plugin_input().is_some() {
+            if self.main_event_snapshot.is_none() {
+                self.main_event_snapshot = Some(MainEventSnapshot {
+                    messages: self.messages.clone(),
+                    streaming_message: self.streaming_message,
+                    model_thinking: self.model_thinking.clone(),
+                });
+            }
+        } else {
+            self.main_event_snapshot = None;
+        }
+    }
+
     /// 将单个插件的运行时 UI 错误限制在对应视图内展示。
     #[cfg(feature = "plugins")]
     pub(crate) fn set_plugin_ui_error(
@@ -2136,19 +2177,12 @@ impl App {
         }
     }
 
-    /// 返回当前是否允许流式输出刷新主界面。
+    /// 返回当前是否允许本次运行继续接收流式增量。
     ///
-    /// 用户请求取消后立即拒绝迟到增量；独占输入插件可见时暂时冻结主事件区，避免审批内容
-    /// 与后台输出同时移动。该方法不影响 Core 持久化已经生成的部分结果。
+    /// 用户请求取消后立即拒绝迟到增量。审批期间仍接收后台事件，由主事件区快照负责冻结
+    /// 可见内容，审批结束后可以完整追上而不丢失并行工具结果。
     pub(crate) fn accepts_run_stream_output(&self) -> bool {
-        if !self.running || self.run_stream_cancelled {
-            return false;
-        }
-        #[cfg(feature = "plugins")]
-        if self.visible_plugin_input().is_some() {
-            return false;
-        }
-        true
+        self.running && !self.run_stream_cancelled
     }
 
     /// 完成 Agent 运行，以完整 Session 校准界面，并返回是否可自动推进 FIFO。

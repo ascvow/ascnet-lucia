@@ -2701,32 +2701,98 @@ fn escape_immediately_stops_visible_stream_deltas() {
     assert_eq!(app.model_thinking, "思考前");
 }
 
-/// 独占审批视图可见时必须冻结流式增量，隐藏后由后续模型输出恢复刷新。
+/// 独占审批视图可见时必须冻结整个主事件区，隐藏后一次性显示期间积累的事件。
 #[cfg(feature = "plugins")]
 #[test]
-fn visible_permission_input_freezes_stream_deltas() {
+fn visible_permission_input_freezes_main_event_timeline() {
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).expect("创建审批冻结测试终端");
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.running = true;
     app.append_model_delta("审批前");
     app.append_model_thinking("思考前");
-    app.plugin_views
-        .push(test_plugin_view(UiPlacement::Input, "Permission"));
+    let mut approval = test_plugin_view(UiPlacement::Input, "Permission");
+    approval.frame.as_mut().expect("审批帧应存在").visible = false;
+    app.plugin_views.push(approval);
+    apply_plugin_frames(
+        &mut app,
+        vec![(
+            "test-plugin".into(),
+            "input".into(),
+            None,
+            Ok(Some(PluginUiFrame {
+                view_id: "input".into(),
+                visible: true,
+                lines: vec![UiLine {
+                    spans: vec![UiSpan {
+                        text: "等待审批".into(),
+                        style: UiStyle::default(),
+                    }],
+                }],
+                cursor: None,
+            })),
+        )],
+    );
 
-    app.append_model_delta("审批中");
-    app.append_model_thinking("思考中");
-    assert_eq!(app.messages[0].text, "审批前");
-    assert_eq!(app.model_thinking, "思考前");
+    app.append_model_delta("审批中正文");
+    app.append_model_thinking("审批中思考");
+    app.messages.push(Msg::tool_started(ToolCall::new(
+        "call-during-approval",
+        "审批期间工具",
+        json!({}),
+    )));
+    app.sync_main_event_snapshot();
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染审批期间主事件区");
+    let frozen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '▌')
+        .collect::<String>();
+    assert!(frozen.contains("审批前"), "{frozen:?}");
+    assert!(!frozen.contains("审批中正文"), "{frozen:?}");
+    assert!(!frozen.contains("审批中思考"), "{frozen:?}");
+    assert!(!frozen.contains("审批期间工具"), "{frozen:?}");
+    assert_eq!(app.messages.len(), 2, "后台事件仍应更新真实状态");
 
-    app.plugin_views[0]
-        .frame
-        .as_mut()
-        .expect("审批帧应存在")
-        .visible = false;
-    app.append_model_delta("审批后");
-    app.append_model_thinking("思考后");
-    assert_eq!(app.messages[0].text, "审批前审批后");
-    assert_eq!(app.model_thinking, "思考前思考后");
+    apply_plugin_frames(
+        &mut app,
+        vec![(
+            "test-plugin".into(),
+            "input".into(),
+            None,
+            Ok(Some(PluginUiFrame {
+                view_id: "input".into(),
+                visible: false,
+                lines: Vec::new(),
+                cursor: None,
+            })),
+        )],
+    );
+    app.streaming_message = None;
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染审批结束后的主事件区");
+    let resumed = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '▌')
+        .collect::<String>();
+    assert!(resumed.contains("审批中正文"), "{resumed:?}");
+    assert!(resumed.contains("审批中思考"), "{resumed:?}");
+    assert!(resumed.contains("审批期间工具"), "{resumed:?}");
 }
 
 /// 审批视图隐藏后必须归还主输入焦点，避免下一次 Esc 被旧插件焦点吞掉。
