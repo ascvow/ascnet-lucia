@@ -43,8 +43,9 @@ sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
 
 [genome]
-root_dir = "evolution"
-stable = "stable/general"
+# 普通启动无需配置；以下字段只用于选择已有 Registry。
+# root_dir = "evolution"
+# stable = "stable/general"
 # revision_id = "grev_0123456789abcdef0123456789abcdef"
 
 [evidence]
@@ -76,6 +77,11 @@ lucia
 - `genome.stable`：新 Session 解析的 Stable lineage；解析结果会以精确 Revision 写入 Session。
 - `genome.revision_id`：固定修订部署使用的精确 Revision；与 `stable` 二选一。
 - `evidence.enabled`：为主 Agent 的每次真实 Run 生成 Episode；默认关闭。
+
+未配置 Genome 选择器时，Lucia 会在 `$LUCIA_HOME/evolution` 自动创建不带进化证书的人工
+基线。演示运行固定到 `stable/demo`，真实模型固定到 `stable/general`；后续新 Session 复用
+既有 Stable，已有 Session 始终保留启动时绑定的精确 Revision。显式配置仍只解析已有目标，
+不会在拼写错误或目标缺失时静默创建。
 
 Genome 行为绑定独立于 Evidence 开关。模型密钥仍来自普通配置，但模型路由和参数、Prompt
 CAS、原生工具、插件 bundle、能力 owner 与执行策略始终以 Session 固定的 Genome 为准。

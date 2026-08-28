@@ -91,6 +91,15 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     } else {
         TuiSettings::default()
     };
+    let configured_agent = if !args.demo && config_exists {
+        Some(AgentRootConfig::load(&config_path)?)
+    } else {
+        None
+    };
+    let default_demo_mode = args.demo
+        || configured_agent
+            .as_ref()
+            .is_none_or(|config| !configured_model_key_is_available(config));
     let lucia_home = lucia_home_dir()?;
     #[cfg(feature = "plugins")]
     {
@@ -127,16 +136,20 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         args.resume_latest,
     )
     .await?;
-    let genome_runtime = load_genome_session_runtime(
+    let mut genome_runtime = load_genome_session_runtime(
         &tui_settings.genome,
         &tui_settings.evidence,
         &config_path,
         &lucia_home,
+        if default_demo_mode {
+            DEMO_GENOME_LINEAGE
+        } else {
+            DEFAULT_GENOME_LINEAGE
+        },
         &mut session_record,
     )
     .await?;
-    let evidence_runtime = load_evidence_runtime(&tui_settings.evidence, &genome_runtime).await?;
-    let genome_binding = genome_runtime.binding();
+    let mut genome_binding = genome_runtime.binding_arc();
 
     #[cfg(feature = "plugins")]
     let mut plugin_manifests = args.plugin_manifests.clone();
@@ -176,36 +189,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     // 用户禁用列表最后生效：受管理插件和显式声明都会被剔除。
     #[cfg(feature = "plugins")]
     remove_disabled_plugin_manifests(&mut plugin_manifests, &disabled_plugins);
-    #[cfg(feature = "plugins")]
-    if let Some(binding) = genome_binding {
-        let (bound_manifests, bound_owners) = binding.bind_plugins(&plugin_manifests)?;
-        plugin_manifests = bound_manifests;
-        capability_selection = bound_owners;
-        plugin_activation_metadata = binding.plugin_activation_metadata().await?;
-    }
-    #[cfg(not(feature = "plugins"))]
-    if let Some(binding) = genome_binding {
-        binding.verify_core_only_plugins()?;
-    }
-    #[cfg(feature = "plugins")]
-    let plugin_management = match (
-        genome_runtime.registry_root(),
-        genome_runtime.stable_lineage(),
-    ) {
-        (Some(registry_root), Some(lineage)) => Some(Arc::new(PluginManagementService::new(
-            lucia_home.clone(),
-            registry_root.to_path_buf(),
-            lineage.to_string(),
-            plugin_management_base_manifests,
-            plugin_management_base_selection,
-            disabled_plugins.clone(),
-        ))),
-        _ => None,
-    };
-
     let (gateway, options, demo_mode, mut startup_notices) = if args.demo {
         let (gateway, options) = build_demo_gateway();
-        let options = match genome_binding {
+        let options = match genome_binding.as_deref() {
             Some(binding) => binding.bind_demo_options(options).await?,
             None => options,
         };
@@ -219,25 +205,24 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             ],
         )
     } else if config_exists {
-        let config = AgentRootConfig::load(&config_path)?;
-        let config = match genome_binding {
-            Some(binding) => binding.bind_model_config(config)?,
-            None => config,
-        };
+        let config = configured_agent
+            .as_ref()
+            .expect("config_exists 已保证真实配置存在")
+            .clone();
         if configured_model_key_is_available(&config) {
+            let config = match genome_binding.as_deref() {
+                Some(binding) => binding.bind_model_config(config)?,
+                None => config,
+            };
             let mut options = config.agent_options();
             if config.agent.max_steps.is_none() {
                 // 交互主会话默认不设总步数上限；后台运行可显式传入正数限制。
                 options.max_steps = 0;
             }
-            if let Some(binding) = genome_binding {
+            if let Some(binding) = genome_binding.as_deref() {
                 options = binding.bind_agent_options(options).await?;
             }
             (config.build_gateway()?, options, false, Vec::new())
-        } else if genome_binding.is_some() {
-            return Err(anyhow!(
-                "Session Genome 已固定真实模型路由，但当前配置未提供可用模型密钥"
-            ));
         } else {
             let key_hint = config
                 .model
@@ -248,6 +233,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     "set model.api_key or model.api_key_env in the configuration".to_string()
                 });
             let (gateway, options) = build_demo_gateway();
+            let options = match genome_binding.as_deref() {
+                Some(binding) => binding
+                    .bind_demo_options(options)
+                    .await
+                    .context("Session Genome 已固定真实模型路由，但当前配置未提供可用模型密钥")?,
+                None => options,
+            };
             (
                 gateway,
                 options,
@@ -259,14 +251,16 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         }
     } else {
         let (gateway, options) = build_demo_gateway();
-        let options = match genome_binding {
+        let options = match genome_binding.as_deref() {
             Some(binding) => binding.bind_demo_options(options).await?,
             None => options,
         };
         (gateway, options, true, Vec::new())
     };
-    let genome_policy = genome_binding.map(|binding| binding.execution_policy());
-    let mut options = restrict_agent_options_for_genome(options, genome_policy);
+    let initial_genome_policy = genome_binding
+        .as_deref()
+        .map(|binding| binding.execution_policy());
+    let mut options = restrict_agent_options_for_genome(options, initial_genome_policy);
     let mut reasoning_levels = vec![options.reasoning];
     if !demo_mode && genome_binding.is_none() {
         if let Some(metadata) = tui_settings.model_metadata.as_ref() {
@@ -317,10 +311,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         );
     }
 
-    // Skill 是 Kernel 默认能力：未绑定 Draft 只为界面预装本地目录，具备运行资格的
-    // Session 必须从 Genome 固定的 CAS 制品装配，绝不回退到可变本地文件。
-    let skill_catalog = match genome_binding {
+    // 具备 Genome 绑定的 Session 只从 CAS 装配 Skill。历史 Legacy Session 仍可只读加载
+    // 本地 Skill；首次 Draft 必须先建立人工基线，不能把可变文件伪装成固定 Skill 制品。
+    let skill_catalog = match genome_binding.as_deref() {
         Some(binding) => binding.bind_skill_catalog().await?,
+        None if genome_runtime.is_unconfigured() => SkillCatalog::new(),
         None => SkillCatalog::load_local([
             lucia_home.join("skills"),
             workspace.cwd.join("skills"),
@@ -350,11 +345,96 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     } else {
         // 真实模式注入内置工具集：读写文件、列目录、shell、搜索。
         // 工作区固定为启动目录；Session Genome 只能在此上界内继续收紧。
-        let guard = native_workspace_guard(&workspace.cwd, genome_policy)?;
+        let guard = native_workspace_guard(&workspace.cwd, initial_genome_policy)?;
         agent_tool::builtins::register_builtins(&mut native_tools, guard)?;
     }
     skill_catalog.register_tool(&mut native_tools)?;
-    if let Some(binding) = genome_binding {
+
+    if genome_runtime.is_unconfigured() {
+        #[cfg(feature = "plugins")]
+        let plugin_environment = crate::genome_binding::snapshot_plugin_environment(
+            &plugin_manifests,
+            &capability_selection,
+        )?;
+        #[cfg(not(feature = "plugins"))]
+        let plugin_environment = agent_evolution_protocol::PluginEnvironmentSnapshot {
+            plugins: Vec::new(),
+            capability_owners: Default::default(),
+        };
+        let model = crate::genome_binding::initial_model_genome(
+            configured_agent.as_ref(),
+            &options,
+            demo_mode,
+        )?;
+        let inputs = InitialGenomeInputs {
+            model,
+            system_prompt: options.system_prompt.clone(),
+            provider_options: options.provider_options.clone(),
+            plugin_environment,
+            native_tools: native_tools
+                .specs()
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect(),
+            execution: options.execution_policy.clone(),
+        };
+        let lineage = if demo_mode {
+            DEMO_GENOME_LINEAGE
+        } else {
+            DEFAULT_GENOME_LINEAGE
+        };
+        let (runtime, created) =
+            bootstrap_default_genome_runtime(inputs, &lucia_home, lineage, &mut session_record)
+                .await?;
+        genome_runtime = runtime;
+        genome_binding = genome_runtime.binding_arc();
+        if created {
+            startup_notices.push(format!(
+                "已创建本地人工 Genome 基线 {lineage}；当前及后续同类新会话将固定使用该修订"
+            ));
+        }
+        options = genome_binding
+            .as_deref()
+            .expect("首次人工基线必须产生精确 Genome 绑定")
+            .bind_agent_options(options)
+            .await?;
+        session_record
+            .session
+            .set_system(options.system_prompt.clone());
+    }
+
+    #[cfg(feature = "plugins")]
+    if let Some(binding) = genome_binding.as_deref() {
+        let (bound_manifests, bound_owners) = binding.bind_plugins(&plugin_manifests)?;
+        plugin_manifests = bound_manifests;
+        capability_selection = bound_owners;
+        plugin_activation_metadata = binding.plugin_activation_metadata().await?;
+    }
+    #[cfg(not(feature = "plugins"))]
+    if let Some(binding) = genome_binding.as_deref() {
+        binding.verify_core_only_plugins()?;
+    }
+    #[cfg(feature = "plugins")]
+    let plugin_management = match (
+        genome_runtime.registry_root(),
+        genome_runtime.stable_lineage(),
+    ) {
+        (Some(registry_root), Some(lineage)) => Some(Arc::new(PluginManagementService::new(
+            lucia_home.clone(),
+            registry_root.to_path_buf(),
+            lineage.to_string(),
+            plugin_management_base_manifests,
+            plugin_management_base_selection,
+            disabled_plugins.clone(),
+        ))),
+        _ => None,
+    };
+    let evidence_runtime = load_evidence_runtime(&tui_settings.evidence, &genome_runtime).await?;
+    #[cfg(feature = "plugins")]
+    let genome_policy = genome_binding
+        .as_deref()
+        .map(|binding| binding.execution_policy());
+    if let Some(binding) = genome_binding.as_deref() {
         native_tools = binding.bind_native_tools(&native_tools)?;
     }
 
@@ -381,7 +461,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     } else {
         base_agent
     };
-    let context_policy = match genome_binding {
+    let context_policy = match genome_binding.as_deref() {
         Some(binding) => binding.bind_context_policy().await?,
         None => None,
     };

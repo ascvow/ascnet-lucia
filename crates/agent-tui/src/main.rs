@@ -82,7 +82,10 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use crossterm::event::MouseEvent;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use evidence::{load_evidence_runtime, EvidenceRuntime};
-use genome_session::{load_genome_session_runtime, GenomeSessionRuntime};
+use genome_session::{
+    bootstrap_default_genome_runtime, load_genome_session_runtime, GenomeSessionRuntime,
+    InitialGenomeInputs, DEFAULT_GENOME_LINEAGE, DEMO_GENOME_LINEAGE,
+};
 use ratatui::{prelude::*, widgets::*};
 #[cfg(feature = "plugins")]
 use serde::{de::DeserializeOwned, Serialize};

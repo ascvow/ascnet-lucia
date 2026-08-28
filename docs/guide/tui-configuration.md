@@ -58,8 +58,9 @@ sessions_dir = "projects"
 events_jsonl = "events.jsonl"
 
 [genome]
-root_dir = "evolution"
-stable = "stable/general"
+# 普通启动无需配置；以下字段只用于选择已有 Registry。
+# root_dir = "evolution"
+# stable = "stable/general"
 # revision_id = "grev_0123456789abcdef0123456789abcdef"
 
 [evidence]
@@ -68,9 +69,15 @@ enabled = false
 
 `sessions_dir` 是项目会话根目录。相对配置值与 `events_jsonl` 都以配置文件所在目录为基准；CLI 的 `--sessions-dir` 与 `--events-jsonl` 仍以当前工作目录为基准，并覆盖配置值。旧配置中的 `default_session` 和 `resume_latest` 仍可解析，但普通启动不再用它们自动恢复会话。
 
-`genome.root_dir` 相对配置文件解析，未配置时使用 `$LUCIA_HOME/evolution`。新 Session 在
-`genome.stable` 与 `genome.revision_id` 中选择一个；Stable 通过只读 Resolver 解析为精确
-Revision。启动会重新校验 Revision 的行为摘要，不存在、引用不一致或被篡改时拒绝运行。
+未配置 `[genome]` 时，首次新 Session 会在 `$LUCIA_HOME/evolution` 创建
+`RevisionOrigin::ManualConfiguration` 本地基线：演示模型写入 `stable/demo`，真实模型写入
+`stable/general`。基线固定当前完整 Prompt、模型行为参数、原生工具和插件环境；它不包含
+Secret，也不生成 EvaluationReport、Release 或 EvolutionCertificate。后续启动复用既有 Stable，
+并发首次启动不能覆盖已经胜出的基线。
+
+`genome.root_dir`、`genome.stable` 和 `genome.revision_id` 用于固定部署到已有 Registry；路径相对
+配置文件解析，`stable` 与 `revision_id` 二选一，配置 `root_dir` 时必须同时提供一个选择器。显式
+选择不存在、引用不一致或被篡改时严格拒绝启动，不会自动创建或覆盖目标。
 旧配置中的 `evidence.root_dir`、`evidence.genome_revision_id` 和 `evidence.genome_stable` 仍可
 读取，但独立 `[genome]` 配置优先。
 
@@ -81,7 +88,8 @@ Session Genome 绑定不受 `evidence.enabled` 控制。`[model]` 中的 `api_ke
 Genome 必须按顺序引用至少一个包含完整系统提示的 UTF-8 Prompt CAS 制品；空 Prompt 不会
 采用 `[agent].system_prompt` 或 Core 默认提示。
 `model.extra_headers` 暂不支持，因为它可能同时携带 Secret 和未入 Genome 的行为。模型密钥
-缺失时不会自动退回演示模型；显式 `--demo` 只接受声明 `scripted-demo` 路由的 Genome。
+缺失时使用独立的 `stable/demo` 演示基线，不会覆盖真实模型的 `stable/general`；显式 `--demo`
+同样只使用演示 lineage。
 插件版在 Genome 固定插件全部 Ready 前不开始 Run，任一加载失败后继续保持阻断。
 Genome 的包版本、Git 提交、dirty 状态、目标三元组和 TUI feature 必须与当前编译产物一致。
 缺少可验证 Git commit 的源码归档构建不能建立具备运行资格的 Session Genome 绑定。
@@ -103,9 +111,9 @@ lucia
 原生 `/resume` 打开当前项目的会话列表，用户选中后才按 revision 校验并加载完整 Session；`/sessions` 使用同一界面只读浏览。两者不依赖 Plugin Host。
 
 新 Session 会在首次保存前绑定精确 Genome Revision。Stable 引用更新只影响后续新 Session，
-已有绑定始终按原 Revision 精确恢复。未配置可解析 Registry 时，新 Draft 可以显示，但消息提交、
-队列输入、Host Action 和 `/compact` 都会在保存或模型调用前失败关闭。已持久化且缺少绑定的旧
-记录只允许加法标记为 `LegacyUnbound/NotEligible` 并只读恢复，不能启动 Run 或进入 Evidence。
+已有绑定始终按原 Revision 精确恢复。默认 Registry 尚不存在时会先创建上述人工基线；只有显式
+选择的 Registry 无法解析时才拒绝启动。已持久化且缺少绑定的旧记录只允许加法标记为
+`LegacyUnbound/NotEligible` 并只读恢复，不能启动 Run 或进入 Evidence。
 
 CLI 仍提供显式恢复和只读列举：
 

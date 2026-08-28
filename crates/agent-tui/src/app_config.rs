@@ -41,7 +41,8 @@ sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
 
 [genome]
-# 配置 Registry 后，新 Session 从 Stable 解析并固定精确 Revision。
+# 普通首次启动会在 $LUCIA_HOME/evolution 自动创建本地人工基线，无需填写本段。
+# 以下字段只用于固定部署到已有 Registry；root_dir 不能单独配置。
 # root_dir = "evolution"
 # stable = "stable/general"
 

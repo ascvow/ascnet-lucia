@@ -35,6 +35,11 @@ lucia --demo
 进入 TUI 后输入 `/plugins`，再从 Registry、GitHub Release 或本地 Bundle 人工安装插件。
 `--demo` 强制使用内置模型。退出后直接运行 `lucia` 即可按配置连接真实服务。
 
+首次进入 TUI 时，Lucia 会把当前模型、完整 Prompt、原生工具和固定插件环境写入本地
+`ManualConfiguration` Genome 基线。演示模式使用 `stable/demo`，真实模型使用
+`stable/general`；两者位于 `$LUCIA_HOME/evolution`，不需要先手工填写
+`genome.stable` 或 `genome.revision_id`，也不会生成 Evolution Certificate。
+
 首次运行时，Lucia 会创建 `$HOME/.lucia/config.toml`。也可以只初始化配置并退出：
 
 ```bash

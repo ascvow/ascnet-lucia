@@ -1048,7 +1048,7 @@ async fn unconfigured_genome_rejects_input_before_session_save() {
         .error
         .expect("未配置 Genome 必须返回错误")
         .to_string()
-        .contains("genome.stable"));
+        .contains("尚未完成初始化"));
     assert!(store.list().await.expect("应读取内存存储").is_empty());
 }
 
