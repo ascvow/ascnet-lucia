@@ -119,7 +119,8 @@ fn classify_incident(
         IncidentKind::PluginTrap
         | IncidentKind::PluginFuelExhausted
         | IncidentKind::PluginMemoryLimit
-        | IncidentKind::PluginCapabilityDenied => FailureKind::PluginFailure,
+        | IncidentKind::PluginContractViolation => FailureKind::PluginFailure,
+        IncidentKind::PluginCapabilityDenied => FailureKind::PermissionFailure,
         IncidentKind::PermissionDenied
         | IncidentKind::PathBoundaryViolation
         | IncidentKind::ProcessBoundaryViolation
@@ -208,6 +209,36 @@ mod tests {
             FailureKind::PermissionFailure
         );
         assert_eq!(records[0].attribution.confidence, 0.9);
+    }
+
+    /// 插件契约违规属于插件维护，不能落入 Agent 行为变异。
+    #[test]
+    fn plugin_contract_violation_maps_to_plugin_failure() {
+        let incidents = vec![incident(
+            IncidentKind::PluginContractViolation,
+            ComponentRef::PluginHost,
+        )];
+        let records = attribute_failures(&incidents[0].episode_id.clone(), &incidents, &[]);
+
+        assert_eq!(
+            records[0].attribution.failure_class,
+            FailureKind::PluginFailure
+        );
+    }
+
+    /// 插件越权属于安全事件，不得作为普通插件维护或 Evolution Candidate。
+    #[test]
+    fn plugin_capability_denial_maps_to_permission_failure() {
+        let incidents = vec![incident(
+            IncidentKind::PluginCapabilityDenied,
+            ComponentRef::PluginHost,
+        )];
+        let records = attribute_failures(&incidents[0].episode_id.clone(), &incidents, &[]);
+
+        assert_eq!(
+            records[0].attribution.failure_class,
+            FailureKind::PermissionFailure
+        );
     }
 
     #[test]

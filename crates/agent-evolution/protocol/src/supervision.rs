@@ -13,8 +13,8 @@ use crate::ids::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-/// Supervision 协议版本；不兼容字段语义变化时必须递增。
-pub const SUPERVISION_SCHEMA_VERSION: u32 = 1;
+/// Supervision 协议版本；V2 增加插件契约违规的稳定 Incident 类别。
+pub const SUPERVISION_SCHEMA_VERSION: u32 = 2;
 
 /// 一次调用或子任务的标识域，用于表达事件归属。
 ///
@@ -104,6 +104,8 @@ pub enum IncidentKind {
     PluginMemoryLimit,
     /// 插件试图调用未授权能力。
     PluginCapabilityDenied,
+    /// 插件返回值违反正式工具契约或无法解码。
+    PluginContractViolation,
 
     /// Host 或 Runtime 拒绝了越权操作。
     PermissionDenied,
@@ -192,7 +194,7 @@ pub enum DetectorRef {
     ToolSchema,
     /// 工具执行结果分类。
     ToolExecution,
-    /// 插件崩溃与资源耗尽。
+    /// 插件崩溃、资源耗尽与契约违规。
     PluginTrap,
     /// 权限拒绝与路径逃逸。
     PermissionDenied,
@@ -634,7 +636,8 @@ pub fn default_component(kind: IncidentKind) -> ComponentRef {
         IncidentKind::PluginTrap
         | IncidentKind::PluginFuelExhausted
         | IncidentKind::PluginMemoryLimit
-        | IncidentKind::PluginCapabilityDenied => ComponentRef::PluginHost,
+        | IncidentKind::PluginCapabilityDenied
+        | IncidentKind::PluginContractViolation => ComponentRef::PluginHost,
         IncidentKind::PermissionDenied
         | IncidentKind::PathBoundaryViolation
         | IncidentKind::ProcessBoundaryViolation
@@ -669,7 +672,8 @@ pub fn default_recoverability(kind: IncidentKind) -> Recoverability {
         IncidentKind::PluginTrap
         | IncidentKind::PluginFuelExhausted
         | IncidentKind::PluginMemoryLimit
-        | IncidentKind::PluginCapabilityDenied => Recoverability::RequiresIntervention,
+        | IncidentKind::PluginCapabilityDenied
+        | IncidentKind::PluginContractViolation => Recoverability::RequiresIntervention,
         IncidentKind::PermissionDenied
         | IncidentKind::PathBoundaryViolation
         | IncidentKind::ProcessBoundaryViolation

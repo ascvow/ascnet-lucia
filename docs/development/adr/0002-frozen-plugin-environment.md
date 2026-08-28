@@ -19,3 +19,5 @@ Prompt、Skill 内容和第一方稳定 Schema 的 Context、Planning、Routing 
 ## 安全后果
 
 Mutation Profile 没有文件系统、进程、网络或 Secret 能力。Evaluation 只使用只读 Fixture 和固定 Bundle 摘要。插件自身实现失败路由到 PluginMaintenance，权限或沙箱异常仍路由到 SecurityIncident；Agent 对固定工具的选择或参数错误可以进入 Agent 侧行为策略进化。
+
+Plugin Host 从真实 WASM 执行边界识别 Trap、Fuel、内存限制、Capability Denied 与契约违规，并在 ToolResult 的 UI 细节中写入 Host 专用标记。Guest 返回前会被删除同名标记，Guest 自报的权限或边界错误也会降为普通执行失败。Evolution Outbox 只接受 Agent 行为 `EvolutionCandidate`；PluginMaintenance、SecurityIncident 等记录进入独立 Intervention Queue，Commit Gate 不得执行这些人工请求。

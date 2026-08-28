@@ -1,11 +1,14 @@
 //! `AgentEvent` 到不可变 Episode 的脱敏记录器。
 
-use crate::supervision::OUTCOME_RESOLUTION_EVENT;
+use crate::supervision::{
+    classify_plugin_host_failure, trusted_tool_error_kind, OUTCOME_RESOLUTION_EVENT,
+    PLUGIN_HOST_FAILURE_DETAIL_KEY,
+};
 use crate::{ArtifactStore, ArtifactStoreError, EpisodeStore, EpisodeStoreError, RunSupervisor};
-use agent_core::{AgentEvent, AgentEventKind, EventSink};
+use agent_core::{AgentEvent, AgentEventKind, EventSink, ToolErrorKind};
 use agent_evolution_protocol::{
     Episode, EpisodeDataPolicy, EpisodeEvent, EpisodeId, EpisodeSupervisionRefs, EventId,
-    FailureClassification, FailureKind, GenomeRevisionId, Outcome, OutcomeResolution,
+    FailureClassification, FailureKind, GenomeRevisionId, IncidentKind, Outcome, OutcomeResolution,
     RawToolResultPolicy, RedactionRule, Redactor, ReplayabilityGrade, RunId, TaskDescriptor,
     UsageSummary, EPISODE_SCHEMA_VERSION, REDACTION_RULES_VERSION,
 };
@@ -271,13 +274,16 @@ impl EpisodeRecorder {
                         .unwrap_or(false))
                 .then(|| event.payload.pointer("/details/skill_usage").cloned())
                 .flatten();
+                let trusted_details = trusted_skill_usage
+                    .map(|usage| json!({ "skill_usage": usage }))
+                    .or_else(|| trusted_plugin_failure_details(&event.payload));
                 json!({
                     "call_id": event.payload.get("call_id").and_then(Value::as_str),
                     "name": event.payload.get("name").and_then(Value::as_str),
                     "is_error": event.payload.get("is_error").and_then(Value::as_bool),
                     "error_kind": event.payload.get("error_kind"),
                     "runtime_origin": event.payload.get("runtime_origin").and_then(Value::as_str),
-                    "details": trusted_skill_usage.map(|usage| json!({ "skill_usage": usage })),
+                    "details": trusted_details,
                     "content_discarded": true,
                 })
             }
@@ -404,6 +410,37 @@ impl EpisodeRecorder {
             resolved_outcome,
         ))
     }
+}
+
+/// 在默认丢弃 ToolResult 正文时保留 Plugin Host 的最小可信故障事实。
+///
+/// 只复制稳定类别与插件 ID；其他 Guest 可控字段不会进入监督证据。
+fn trusted_plugin_failure_details(payload: &Value) -> Option<Value> {
+    if payload.get("runtime_origin").and_then(Value::as_str) != Some("plugin")
+        || !payload
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let failure = payload
+        .get("details")?
+        .get(PLUGIN_HOST_FAILURE_DETAIL_KEY)?;
+    let kind = failure.get("kind").and_then(Value::as_str)?;
+    classify_plugin_host_failure(kind)?;
+
+    let mut stable_failure = serde_json::Map::new();
+    stable_failure.insert("kind".into(), Value::String(kind.to_string()));
+    if let Some(plugin_id) = failure.get("plugin_id").and_then(Value::as_str) {
+        stable_failure.insert("plugin_id".into(), Value::String(plugin_id.to_string()));
+    }
+    let mut details = serde_json::Map::new();
+    details.insert(
+        PLUGIN_HOST_FAILURE_DETAIL_KEY.into(),
+        Value::Object(stable_failure),
+    );
+    Some(Value::Object(details))
 }
 
 #[async_trait]
@@ -591,23 +628,50 @@ fn classify_failures(events: &[EpisodeEvent]) -> Vec<FailureClassification> {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            let trusted_error_kind = event
+            let runtime_origin = event
                 .payload
                 .get("runtime_origin")
                 .and_then(Value::as_str)
-                .is_some_and(|origin| matches!(origin, "native" | "runtime" | "runtime_policy"))
-                .then(|| event.payload.get("error_kind").and_then(Value::as_str))
+                .unwrap_or("legacy");
+            let error_kind = event
+                .payload
+                .get("error_kind")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<ToolErrorKind>(value).ok());
+            let trusted_error_kind = trusted_tool_error_kind(runtime_origin, error_kind);
+            let trusted_plugin_incident = (runtime_origin == "plugin")
+                .then(|| {
+                    event
+                        .payload
+                        .get("details")?
+                        .get(PLUGIN_HOST_FAILURE_DETAIL_KEY)?
+                        .get("kind")?
+                        .as_str()
+                        .and_then(classify_plugin_host_failure)
+                        .map(|(kind, _, _)| kind)
+                })
                 .flatten();
-            let kind = match trusted_error_kind {
+            let kind = match trusted_plugin_incident {
+                Some(IncidentKind::PluginCapabilityDenied) => FailureKind::PermissionFailure,
                 Some(
-                    "permission_denied"
-                    | "path_boundary_violation"
-                    | "process_boundary_violation"
-                    | "secret_access_attempt"
-                    | "policy_denied",
-                ) => FailureKind::PermissionFailure,
-                Some("invalid_arguments" | "unknown_tool") => FailureKind::ToolArgument,
-                _ => FailureKind::ToolExecution,
+                    IncidentKind::PluginTrap
+                    | IncidentKind::PluginFuelExhausted
+                    | IncidentKind::PluginMemoryLimit
+                    | IncidentKind::PluginContractViolation,
+                ) => FailureKind::PluginFailure,
+                _ => match trusted_error_kind {
+                    Some(
+                        ToolErrorKind::PermissionDenied
+                        | ToolErrorKind::PathBoundaryViolation
+                        | ToolErrorKind::ProcessBoundaryViolation
+                        | ToolErrorKind::SecretAccessAttempt
+                        | ToolErrorKind::PolicyDenied,
+                    ) => FailureKind::PermissionFailure,
+                    Some(ToolErrorKind::InvalidArguments | ToolErrorKind::UnknownTool) => {
+                        FailureKind::ToolArgument
+                    }
+                    _ => FailureKind::ToolExecution,
+                },
             };
             failures.push(FailureClassification {
                 kind,
@@ -907,6 +971,99 @@ mod tests {
             revision.source,
             agent_evolution_protocol::OutcomeSource::DeterministicRule
         );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// 默认丢弃工具正文时仍应保留 Host 最小故障事实并形成插件维护归因。
+    #[tokio::test]
+    async fn preserves_plugin_host_failure_under_default_data_policy() {
+        let root = temp_root();
+        let artifacts = Arc::new(FileArtifactStore::new(root.join("artifacts")));
+        let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
+        let config = EpisodeRecorderConfig::online("session-plugin", GenomeRevisionId::generate());
+        let episode_id = config.episode_id.clone();
+        let run_id = config.run_id.to_string();
+        let recorder = EpisodeRecorder::new(config, artifacts.clone(), episodes.clone());
+
+        recorder
+            .record(&AgentEvent::new(
+                &run_id,
+                AgentEventKind::RunStarted,
+                0,
+                json!({}),
+            ))
+            .await
+            .expect("应记录开始");
+        recorder
+            .record(&AgentEvent::new(
+                &run_id,
+                AgentEventKind::ToolFinished,
+                0,
+                json!({
+                    "call_id": "plugin-call",
+                    "name": "plugin.tool",
+                    "is_error": true,
+                    "error_kind": "execution",
+                    "runtime_origin": "plugin",
+                    "content": "不得保留的原始正文",
+                    "details": {
+                        "lucia_plugin_host_failure": {
+                            "kind": "contract_violation",
+                            "plugin_id": "plugin",
+                            "guest_extra": "不得保留"
+                        }
+                    }
+                }),
+            ))
+            .await
+            .expect("应记录插件故障");
+        recorder
+            .record(&AgentEvent::new(
+                &run_id,
+                AgentEventKind::RunFinished,
+                0,
+                json!({"steps_used": 1}),
+            ))
+            .await
+            .expect("应收敛");
+
+        let episode = episodes
+            .get(&episode_id)
+            .await
+            .expect("应读取 Episode")
+            .expect("Episode 应存在");
+        assert_eq!(episode.failures[0].kind, FailureKind::PluginFailure);
+        let supervision = episode.supervision.expect("应持久化监督引用");
+        let incidents_bytes = artifacts
+            .get(&supervision.incidents_ref.expect("应有 Incident").digest)
+            .await
+            .expect("应读取 Incident")
+            .expect("Incident 应存在");
+        let incidents = parse_ndjson::<Incident>(&incidents_bytes);
+        assert_eq!(incidents[0].kind, IncidentKind::PluginContractViolation);
+
+        let event_bytes = artifacts
+            .get(&episode.event_stream_ref.digest)
+            .await
+            .expect("应读取事件流")
+            .expect("事件流应存在");
+        let events = parse_ndjson::<EpisodeEvent>(&event_bytes);
+        let plugin_event = events
+            .iter()
+            .find(|event| event.kind == "tool_finished")
+            .expect("应保留工具终态");
+        assert_eq!(
+            plugin_event
+                .payload
+                .pointer("/details/lucia_plugin_host_failure/kind")
+                .and_then(Value::as_str),
+            Some("contract_violation")
+        );
+        assert!(plugin_event.payload.get("content").is_none());
+        assert!(plugin_event
+            .payload
+            .pointer("/details/lucia_plugin_host_failure/guest_extra")
+            .is_none());
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

@@ -1,10 +1,9 @@
-//! 插件源码变异、可信构建、能力审批与 Canary 发布的稳定协议。
+//! 历史插件进化归档的只读兼容协议。
 //!
-//! 本模块只定义跨进程数据契约和可复核的不变量，不执行源码、构建 Component、扫描
-//! WIT、验证密码学签名或切换发布流量。尤其需要注意：Mutation Proposal 内的能力和
-//! Component 接口均是 Candidate 自报输入，不是可信事实。受信构建平面必须从源码 CAS
-//! 重建 Component，再由独立扫描器重建能力与接口快照；Release Controller 只能接受该
-//! 受信结果，不能复制 Candidate 的声明。
+//! 这些类型仅用于反序列化、校验并展示产品决策变更前的 Archive，保留原字段、Schema 与
+//! Hash 语义。Engine、Evaluator、TUI 和 Plugin Manager 均没有消费这些类型的新执行入口；
+//! 不能据此创建、构建、评测、审批、Canary 或发布新的插件 Candidate。新的 Evolution Cycle
+//! 只接受 Agent 行为制品，并把插件环境作为冻结依赖。
 
 use crate::{
     ArtifactDigest, CandidateId, EpisodeId, EvaluationReportId, EvolutionCycleId, GenomeDigest,

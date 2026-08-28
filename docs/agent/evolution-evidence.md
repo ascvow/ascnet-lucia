@@ -117,9 +117,11 @@ Recorder 只把脱敏并按数据策略收窄后的公开载荷交给 `RunSuperv
 Event Envelope、Incident 和初始 Outcome Revision 分别进入 CAS，其引用保存在 Episode
 Header 的 `supervision` 字段中，进程重启后仍可从同一 Episode 找回完整监督证据。
 
-工具终态由 Core 重新绑定实际 `call_id` 和工具名，并注入 `runtime_origin`。原生工具、Runtime
+插件工具终态由 Plugin Host 重新绑定实际 `call_id` 和公开工具名，Core 再注入 `runtime_origin`。原生工具、Runtime
 和 Runtime 策略拒绝产生的 `error_kind` 可以形成可信权限或边界 Incident；Guest 插件自报的
-同名字段只按普通工具失败处理。即使数据策略丢弃工具正文，Recorder 仍保留这两个不含正文的
+权限与边界类别只按普通工具失败处理，参数错误仍可进入 Agent 侧调用策略归因。Plugin Host 会
+为真实 Trap、Fuel、内存限制、Capability Denied 与契约违规写入专用故障细节，并在返回 Core 前
+删除 Guest 伪造的同名键。即使数据策略丢弃工具正文，Recorder 仍只保留这些不含正文的最小
 安全元数据，避免脱敏过程破坏监督结论。
 
 在线运行没有可信 Verifier 时，正常完成默认记为 `Unverifiable`，不能推断为任务成功。
@@ -138,8 +140,9 @@ Verifier 判定 `ContextLoss` 时，才把检测位置关联到后续工具终�
 Episode 提交后，TUI 从 Episode Store 和 Artifact CAS 重新读取证据，校验 Header、事件数、
 Event ID、Envelope、Incident、Outcome Revision 及其 Episode、Run、Genome 绑定，再调用
 `EvolutionPipeline`。Pipeline 跳过 `Recovered` Incident，普通单次工具错误只观察，可信
-`VerificationFailure` 与 `ContextLoss` 可单次进入 `EvolutionCandidate`，安全边界 Incident
-进入 `SecurityIncident`；需要处置的记录写入只追加 Evolution Outbox。调用方不能直接向这条
+`VerificationFailure` 与 `ContextLoss` 可单次进入 `EvolutionCandidate`，且只有这类行为修复
+候选能够写入 Evolution Outbox。插件实现、平台、基础设施、人工复核与安全事件写入独立的只追加
+Intervention Queue；它们不能被 Mutator、Commit Gate 或 Promotion 消费。调用方不能直接向这条
 生产路径注入自造 Incident 或 Outcome Revision JSON。
 
 普通错误的聚合计数写入 `issue-observations/` 下的只追加观察日志。观察键由失败指纹与
@@ -156,8 +159,10 @@ Issue ID、符号链接记录或损坏 JSON 会阻止 Pipeline，不会退化为
 - 原始工具正文只有在数据分级允许且策略显式设为 `StoreRaw` 时才会进入事件制品。
 - `FileOutcomeRevisionStore` 按 Episode 保存单调序号记录；新修订必须通过 `supersedes`
   指向最新修订，并发竞争同一后继时只允许一个写入者提交。
-- `FileEvolutionOutbox` 的 JSON 记录不可变；消费状态写入独立 `.consumed` 标记，不覆盖
-  原始记录，并拒绝路径逃逸和符号链接制品。
+- `FileEvolutionOutbox` 只接受 `EvolutionCandidate`，JSON 记录不可变；消费状态写入独立
+  `.consumed` 标记，不覆盖原始记录，并拒绝路径逃逸和符号链接制品。
+- `FileInterventionQueue` 只接受人工复核、平台工程、插件维护、基础设施与安全处置；记录只追加，
+  不向 Mutation、Evaluation 或 Commit Gate 暴露执行入口。
 - `FileIssueObservationStore` 使用指纹与 Episode 的稳定幂等键只追加观察，供重启后重建
   Issue 聚合状态；同一 Episode 的重复 Incident 不会增加发生次数。
 

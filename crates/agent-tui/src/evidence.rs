@@ -9,8 +9,9 @@ use crate::genome_binding::{
 use crate::genome_session::GenomeSessionRuntime;
 use agent_evolution::{
     load_episode_evidence, EpisodeRecorderConfig, EpisodeRecorderHub, EvolutionPipeline,
-    FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox, FileIssueObservationStore,
-    FileOutcomeRevisionStore, RegisteredEpisodeRun, RuntimeHealthRecorder,
+    FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox, FileInterventionQueue,
+    FileIssueObservationStore, FileOutcomeRevisionStore, RegisteredEpisodeRun,
+    RuntimeHealthRecorder,
 };
 #[cfg(test)]
 use agent_evolution::{ArtifactStore, FileGenomeStore, GenomeStore};
@@ -62,9 +63,12 @@ impl EvidenceRuntime {
                         root.join("outcome-revisions"),
                     )),
                 )
-                .with_issue_observation_store(Arc::new(
-                    FileIssueObservationStore::new(root.join("issue-observations")),
-                )),
+                .with_issue_observation_store(Arc::new(FileIssueObservationStore::new(
+                    root.join("issue-observations"),
+                )))
+                .with_intervention_queue(Arc::new(FileInterventionQueue::new(
+                    root.join("interventions"),
+                ))),
             ),
             health: None,
         })
@@ -344,7 +348,8 @@ mod tests {
     #[cfg(feature = "plugins")]
     use agent_evolution::{EpisodeQuery, EpisodeStore};
     use agent_evolution::{
-        FileRuntimeHealthObservationStore, FileStableGenomePublisher, RUNTIME_HEALTH_DIRECTORY,
+        EvolutionOutbox, FileRuntimeHealthObservationStore, FileStableGenomePublisher,
+        InterventionQueue, RUNTIME_HEALTH_DIRECTORY,
     };
     #[cfg(feature = "plugins")]
     use agent_evolution_protocol::Outcome;
@@ -548,7 +553,7 @@ mod tests {
         let genomes = FileGenomeStore::new(evidence_root.join("genomes"));
         let artifacts = FileArtifactStore::new(evidence_root.join("artifacts"));
         let parent = test_genome_revision(
-            ExecutionPolicy::evaluation(&root.join("fixtures")),
+            ExecutionPolicy::evaluation(root.join("fixtures")),
             &artifacts,
         )
         .await;
@@ -621,6 +626,83 @@ mod tests {
         );
         assert_eq!(observation.observation().checks_passed, 2);
         assert_eq!(observation.observation().checks_total, 2);
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// TUI 生产装配必须把插件实现故障写入人工队列，Evolution Outbox 保持为空。
+    #[tokio::test]
+    async fn plugin_failure_is_routed_to_intervention_queue() {
+        let root = std::env::temp_dir().join(format!(
+            "lucia-plugin-intervention-evidence-{}",
+            agent_session::SessionId::generate()
+        ));
+        let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
+        let artifacts = FileArtifactStore::new(root.join("artifacts"));
+        let hub = Arc::new(EpisodeRecorderHub::new(
+            Arc::new(artifacts.clone()),
+            episodes,
+        ));
+        let revision = test_genome_revision(ExecutionPolicy::serve(), &artifacts).await;
+        let evidence = EvidenceRuntime::new_for_test(
+            Arc::clone(&hub),
+            revision,
+            artifacts,
+            FileEpisodeStore::new(root.join("episodes")),
+            &root,
+        )
+        .expect("应创建插件人工处置测试 Evidence");
+        let run = evidence
+            .register_run("plugin-intervention-session")
+            .await
+            .expect("应登记插件失败运行");
+        evidence
+            .hub()
+            .record(&AgentEvent::new(
+                run.run_id().to_string(),
+                AgentEventKind::ToolFinished,
+                0,
+                serde_json::json!({
+                    "call_id": "plugin-call",
+                    "name": "plugin.tool",
+                    "is_error": true,
+                    "error_kind": "execution",
+                    "runtime_origin": "plugin",
+                    "details": {
+                        "lucia_plugin_host_failure": {
+                            "kind": "contract_violation",
+                            "plugin_id": "plugin"
+                        }
+                    }
+                }),
+            ))
+            .await
+            .expect("应记录 Host 插件故障");
+        evidence
+            .close_run(
+                run,
+                OutcomeResolution::verified_failure(
+                    agent_evolution_protocol::FailureKind::PluginFailure,
+                    "Plugin Host 确认插件契约违规",
+                )
+                .with_related_tool_call_id("plugin-call"),
+            )
+            .await
+            .expect("插件故障应完成可信分流");
+
+        let interventions = FileInterventionQueue::new(root.join("interventions"))
+            .pending()
+            .await
+            .expect("应读取人工处置队列");
+        assert_eq!(interventions.len(), 1);
+        assert_eq!(
+            interventions[0].disposition,
+            agent_evolution_protocol::FailureDisposition::PluginMaintenance
+        );
+        assert!(FileEvolutionOutbox::new(root.join("outbox"))
+            .pending()
+            .await
+            .expect("应读取 Evolution Outbox")
+            .is_empty());
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

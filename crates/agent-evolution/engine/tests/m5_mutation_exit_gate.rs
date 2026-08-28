@@ -263,12 +263,6 @@ async fn excludes_ineligible_or_untrusted_outbox_items() {
             eligible_policy(),
             FailureDisposition::EvolutionCandidate,
         ),
-        (
-            "observe",
-            Outcome::TaskFailure,
-            eligible_policy(),
-            FailureDisposition::Observe,
-        ),
     ];
 
     for (index, (id, outcome, policy, disposition)) in cases.into_iter().enumerate() {
@@ -281,6 +275,19 @@ async fn excludes_ineligible_or_untrusted_outbox_items() {
         item.created_at_ms += index as u64;
         outbox.append(&item).await.expect("应追加过滤用 Outbox");
     }
+
+    let observe_episode_id = EpisodeId::generate();
+    let observe = outbox_item(
+        "observe",
+        observe_episode_id,
+        issue_id,
+        Outcome::TaskFailure,
+        FailureDisposition::Observe,
+    );
+    outbox
+        .append(&observe)
+        .await
+        .expect_err("Observe 不得写入只接受 Candidate 的 Evolution Outbox");
 
     let selected = EpisodeSelector::new(outbox, episodes, observations)
         .select()

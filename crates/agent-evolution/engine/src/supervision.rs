@@ -17,6 +17,8 @@ use thiserror::Error;
 
 /// Host 注入 Outcome Resolver 输入时使用的稳定扩展事件名。
 pub const OUTCOME_RESOLUTION_EVENT: &str = "evolution.outcome_resolution";
+/// Plugin Host 写入 ToolResult 细节的可信故障键。
+pub(crate) const PLUGIN_HOST_FAILURE_DETAIL_KEY: &str = "lucia_plugin_host_failure";
 
 /// 事件监督与收敛时产生的完整证据包。
 #[derive(Debug, Clone)]
@@ -328,11 +330,18 @@ impl RunSupervisor {
                     .get("error_kind")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<ToolErrorKind>(value).ok());
-                let trusted_error_kind =
-                    matches!(runtime_origin, "native" | "runtime" | "runtime_policy")
-                        .then_some(error_kind)
-                        .flatten();
-                let classified = trusted_error_kind.map(classify_tool_error);
+                let trusted_error_kind = trusted_tool_error_kind(runtime_origin, error_kind);
+                let trusted_plugin_failure = (runtime_origin == "plugin")
+                    .then(|| {
+                        envelope
+                            .payload
+                            .pointer(&format!("/details/{PLUGIN_HOST_FAILURE_DETAIL_KEY}/kind"))
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(classify_plugin_host_failure)
+                    })
+                    .flatten();
+                let classified =
+                    trusted_plugin_failure.or_else(|| trusted_error_kind.map(classify_tool_error));
 
                 if name == "unknown"
                     || envelope.payload.get("content").is_some_and(|content| {
@@ -456,6 +465,12 @@ impl RunSupervisor {
                 return Err(SupervisionError::UnknownRelatedToolCall(
                     resolution.related_tool_call_id.clone().unwrap_or_default(),
                 ));
+            }
+            // 插件、权限、沙箱、Runtime 与环境故障必须依赖各自的可信 Incident 进入人工
+            // 队列，不能再合成 VerificationFailed 后绕行到 Evolution Outbox。
+            if !crate::episode_selection::is_behavior_evolution_failure(failure_kind) {
+                self.resolution = Some((resolution, envelope.event_id.clone()));
+                return Ok(());
             }
             let (kind, observed_event_id, mut evidence) =
                 if failure_kind == FailureKind::ContextLoss {
@@ -619,6 +634,64 @@ fn classify_tool_error(kind: ToolErrorKind) -> (IncidentKind, Severity, Detector
     }
 }
 
+/// 将 Plugin Host 注入的稳定故障名映射为可信 Incident；未知名称保持不受信任。
+pub(crate) fn classify_plugin_host_failure(
+    kind: &str,
+) -> Option<(IncidentKind, Severity, DetectorRef)> {
+    match kind {
+        "trap" => Some((
+            IncidentKind::PluginTrap,
+            Severity::Error,
+            DetectorRef::PluginTrap,
+        )),
+        "fuel_exhausted" => Some((
+            IncidentKind::PluginFuelExhausted,
+            Severity::Error,
+            DetectorRef::PluginTrap,
+        )),
+        "memory_limit" => Some((
+            IncidentKind::PluginMemoryLimit,
+            Severity::Error,
+            DetectorRef::PluginTrap,
+        )),
+        "capability_denied" => Some((
+            IncidentKind::PluginCapabilityDenied,
+            Severity::Critical,
+            DetectorRef::PermissionDenied,
+        )),
+        "contract_violation" => Some((
+            IncidentKind::PluginContractViolation,
+            Severity::Error,
+            DetectorRef::PluginTrap,
+        )),
+        _ => None,
+    }
+}
+
+/// 根据 Core 注入的运行来源收窄可用于行为归因的工具错误类别。
+///
+/// Plugin Host 会先清洗 Guest 结果；这里再次拒绝 Guest 自报的权限与边界类别，避免归档
+/// 导入或其他扩展绕过 Host。参数、普通执行与取消错误仍可用于 Prompt、Skill 或 Policy
+/// 改进。
+pub(crate) fn trusted_tool_error_kind(
+    runtime_origin: &str,
+    error_kind: Option<ToolErrorKind>,
+) -> Option<ToolErrorKind> {
+    match runtime_origin {
+        "native" | "runtime" | "runtime_policy" => error_kind,
+        "plugin" => error_kind.filter(|kind| {
+            matches!(
+                kind,
+                ToolErrorKind::UnknownTool
+                    | ToolErrorKind::InvalidArguments
+                    | ToolErrorKind::Execution
+                    | ToolErrorKind::Cancelled
+            )
+        }),
+        _ => None,
+    }
+}
+
 /// 返回 AgentEventKind 的稳定 serde 名称。
 pub(crate) fn event_kind_name(kind: &AgentEventKind) -> &'static str {
     match kind {
@@ -646,6 +719,7 @@ pub(crate) fn event_kind_name(kind: &AgentEventKind) -> &'static str {
 mod tests {
     use super::*;
     use agent_core::AgentEvent;
+    use agent_evolution_protocol::ComponentRef;
     use serde_json::json;
 
     fn run_id() -> RunId {
@@ -857,5 +931,109 @@ mod tests {
             .filter(|incident| incident.kind == IncidentKind::LoopDetected)
             .count();
         assert_eq!(loops, 1);
+    }
+
+    /// 只有 Core 标记为插件来源且携带 Host 专用细节的失败才能形成插件 Incident。
+    #[test]
+    fn trusted_plugin_host_failure_creates_plugin_incident() {
+        let run_id = run_id();
+        let mut supervisor = RunSupervisor::new(run_id.clone(), episode_id(), genome_revision_id());
+        let event = AgentEvent::new(
+            run_id.as_str(),
+            AgentEventKind::ToolFinished,
+            0,
+            json!({
+                "call_id": "plugin-call",
+                "name": "plugin.tool",
+                "is_error": true,
+                "error_kind": "execution",
+                "runtime_origin": "plugin",
+                "details": {
+                    "lucia_plugin_host_failure": {
+                        "kind": "fuel_exhausted",
+                        "plugin_id": "plugin"
+                    }
+                }
+            }),
+        );
+
+        let (_, incidents) = supervisor.observe(&event).expect("应接收 Host 插件故障");
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].kind, IncidentKind::PluginFuelExhausted);
+        assert_eq!(incidents[0].component, ComponentRef::PluginHost);
+    }
+
+    /// Guest 自报的安全错误类别没有 Host 专用标记时只能作为普通工具失败。
+    #[test]
+    fn guest_plugin_error_kind_is_not_trusted() {
+        let run_id = run_id();
+        let mut supervisor = RunSupervisor::new(run_id.clone(), episode_id(), genome_revision_id());
+        let event = AgentEvent::new(
+            run_id.as_str(),
+            AgentEventKind::ToolFinished,
+            0,
+            json!({
+                "call_id": "forged-call",
+                "name": "plugin.tool",
+                "is_error": true,
+                "error_kind": "permission_denied",
+                "runtime_origin": "plugin"
+            }),
+        );
+
+        let (_, incidents) = supervisor.observe(&event).expect("应接收 Guest 工具失败");
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].kind, IncidentKind::ToolExecutionFailed);
+    }
+
+    /// 插件参数错误描述的是 Agent 调用方式，可以进入 Agent 侧行为归因。
+    #[test]
+    fn plugin_argument_error_remains_agent_behavior_incident() {
+        let run_id = run_id();
+        let mut supervisor = RunSupervisor::new(run_id.clone(), episode_id(), genome_revision_id());
+        let event = AgentEvent::new(
+            run_id.as_str(),
+            AgentEventKind::ToolFinished,
+            0,
+            json!({
+                "call_id": "argument-call",
+                "name": "plugin.tool",
+                "is_error": true,
+                "error_kind": "invalid_arguments",
+                "runtime_origin": "plugin"
+            }),
+        );
+
+        let (_, incidents) = supervisor.observe(&event).expect("应接收插件参数失败");
+
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].kind, IncidentKind::ToolArgumentInvalid);
+    }
+
+    /// 可信终态确认插件失败时不能再合成可进化的 VerificationFailed Incident。
+    #[test]
+    fn plugin_failure_resolution_does_not_create_behavior_incident() {
+        let run_id = run_id();
+        let mut supervisor = RunSupervisor::new(run_id.clone(), episode_id(), genome_revision_id());
+        let resolution = OutcomeResolution::verified_failure(
+            FailureKind::PluginFailure,
+            "Plugin Host 确认插件实现失败",
+        );
+        let event = AgentEvent::new(
+            run_id.as_str(),
+            AgentEventKind::Extension,
+            1,
+            json!({
+                "source": { "type": "host" },
+                "name": OUTCOME_RESOLUTION_EVENT,
+                "data": resolution,
+            }),
+        );
+
+        let (_, incidents) = supervisor.observe(&event).expect("应接收插件失败终态");
+
+        assert!(incidents.is_empty());
     }
 }
