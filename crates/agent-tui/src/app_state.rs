@@ -95,7 +95,7 @@ pub(crate) struct App {
     pub(crate) context_tokens: Option<u64>,
     /// 配置的模型上下文窗口，用于状态栏计算占比。
     pub(crate) context_window: Option<u64>,
-    /// 鼠标捕获是否开启；默认关闭以允许终端原生选择复制，用户可用 Ctrl+T 临时开启。
+    /// 鼠标捕获是否开启；默认开启以支持滚轮，用户可用 Ctrl+T 临时恢复终端原生选择复制。
     pub(crate) mouse_capture: bool,
     /// 插件声明的视图及宿主缓存的最近一帧。
     #[cfg(feature = "plugins")]
@@ -209,7 +209,7 @@ impl App {
             last_message_width: 0,
             context_tokens: None,
             context_window: None,
-            mouse_capture: false,
+            mouse_capture: true,
             #[cfg(feature = "plugins")]
             plugin_views: Vec::new(),
             #[cfg(feature = "plugins")]

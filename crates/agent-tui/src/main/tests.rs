@@ -2478,13 +2478,13 @@ fn arrow_keys_recall_input_history() {
     assert_eq!(app.input_history_cursor, None);
 }
 
-/// TUI 默认不捕获鼠标，使消息、工具输出和错误文本可由终端直接选择复制。
+/// TUI 默认捕获鼠标，使滚轮产生独立事件而不会触发输入框的 Up/Down 行为。
 #[test]
-fn app_defaults_to_terminal_text_selection() {
+fn app_defaults_to_mouse_wheel_interaction() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let app = App::new(tx, "测试模型".into());
 
-    assert!(!app.mouse_capture);
+    assert!(app.mouse_capture);
 }
 
 /// 换行手势（Shift+Enter / Alt+Enter / Ctrl+J）插入换行，Home/End 使用行内语义。
