@@ -74,7 +74,7 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
         name: "reasoning",
         aliases: &["think"],
         summary: "查看或切换思考等级",
-        description: "用法：/reasoning [off|minimal|low|medium|high|xhigh|max|next]；不带参数时显示当前等级和可用等级。",
+        description: "用法：/reasoning [off|minimal|low|medium|high|xhigh|max|next]；不带参数时打开等级选择界面。",
         idle_only: false,
     },
     NativeCommandSpec {
@@ -142,6 +142,13 @@ pub(crate) struct NativeSessionDialog {
     pub(crate) selected: usize,
     /// 异步列表状态。
     pub(crate) status: NativeSessionDialogStatus,
+}
+
+/// 思考等级二级选择界面的交互状态。
+#[derive(Debug)]
+pub(crate) struct NativeReasoningDialog {
+    /// 当前高亮等级在 models.dev 可用等级列表中的下标。
+    pub(crate) selected: usize,
 }
 
 /// 插件管理页加载完成后的只读数据。
@@ -219,6 +226,8 @@ pub(crate) struct NativeCommandState {
     pub(crate) dismissed_input: Option<String>,
     /// 当前会话对话框。
     pub(crate) dialog: Option<NativeSessionDialog>,
+    /// 当前思考等级选择界面。
+    pub(crate) reasoning_dialog: Option<NativeReasoningDialog>,
     /// 当前人工插件管理页；纯 Core 构建不包含该状态。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_dialog: Option<NativePluginDialog>,
@@ -228,6 +237,7 @@ impl App {
     /// 返回任一原生全屏 Dialog 是否正在占用键盘焦点。
     pub(crate) fn native_dialog_active(&self) -> bool {
         self.native_command.dialog.is_some()
+            || self.native_command.reasoning_dialog.is_some()
             || cfg!(feature = "plugins") && {
                 #[cfg(feature = "plugins")]
                 {
@@ -297,6 +307,12 @@ impl App {
                 self.last_escape_at = None;
             }
             return self.handle_native_session_dialog_key(code, modifiers);
+        }
+        if self.native_command.reasoning_dialog.is_some() {
+            if matches!(code, KeyCode::Esc) {
+                self.last_escape_at = None;
+            }
+            return self.handle_native_reasoning_dialog_key(code, modifiers, agent);
         }
         #[cfg(feature = "plugins")]
         if self.native_command.plugin_dialog.is_some() {
@@ -416,22 +432,15 @@ impl App {
         }
     }
 
-    /// 执行 `/reasoning`：无参数查看能力，`next` 循环，其余参数精确设置等级。
+    /// 执行 `/reasoning`：无参数打开二级选择界面，`next` 循环，其余参数精确设置等级。
     fn execute_reasoning_command(&mut self, value: Option<&str>, agent: Option<&Arc<Agent>>) {
         let Some(value) = value else {
-            let available = self
+            let selected = self
                 .reasoning_levels
                 .iter()
-                .map(|level| reasoning_level_command_value(*level))
-                .collect::<Vec<_>>()
-                .join("、");
-            self.messages.push(Msg::new(
-                MsgKind::Info,
-                format!(
-                    "当前思考等级：{}；可用等级：{available}",
-                    reasoning_level_label(self.reasoning_level)
-                ),
-            ));
+                .position(|level| *level == self.reasoning_level)
+                .unwrap_or(0);
+            self.native_command.reasoning_dialog = Some(NativeReasoningDialog { selected });
             return;
         };
         if value.eq_ignore_ascii_case("next") || value == "下一个" {
@@ -446,6 +455,38 @@ impl App {
             return;
         };
         self.set_reasoning_level(level, agent);
+    }
+
+    /// 处理思考等级二级界面的键盘导航，并在确认后同步 TUI 与共享 Agent。
+    fn handle_native_reasoning_dialog_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        agent: Option<&Arc<Agent>>,
+    ) -> bool {
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
+            return false;
+        }
+        let item_count = self.reasoning_levels.len();
+        let Some(dialog) = self.native_command.reasoning_dialog.as_mut() else {
+            return false;
+        };
+        match code {
+            KeyCode::Esc => self.native_command.reasoning_dialog = None,
+            KeyCode::Up if item_count > 0 => {
+                dialog.selected = dialog.selected.checked_sub(1).unwrap_or(item_count - 1);
+            }
+            KeyCode::Down if item_count > 0 => {
+                dialog.selected = (dialog.selected + 1) % item_count;
+            }
+            KeyCode::Enter if item_count > 0 => {
+                let level = self.reasoning_levels[dialog.selected.min(item_count - 1)];
+                self.native_command.reasoning_dialog = None;
+                self.set_reasoning_level(level, agent);
+            }
+            _ => {}
+        }
+        true
     }
 
     /// 在消息流中显示全部命令或指定命令的说明。
@@ -1009,6 +1050,64 @@ pub(crate) fn render_native_session_dialog(frame: &mut Frame, app: &App, outer: 
     );
 }
 
+/// 在主界面上方绘制思考等级二级选择界面；选项只来自当前模型的 models.dev 元数据。
+pub(crate) fn render_native_reasoning_dialog(frame: &mut Frame, app: &App, outer: Rect) {
+    let Some(dialog) = app.native_command.reasoning_dialog.as_ref() else {
+        return;
+    };
+    let width = outer.width.saturating_sub(4).clamp(24, 48);
+    let desired_height = u16::try_from(app.reasoning_levels.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let height = desired_height.min(outer.height.saturating_sub(4)).max(4);
+    let area = Rect::new(
+        outer.x + outer.width.saturating_sub(width) / 2,
+        outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let selected = dialog
+        .selected
+        .min(app.reasoning_levels.len().saturating_sub(1));
+    let lines = app
+        .reasoning_levels
+        .iter()
+        .enumerate()
+        .map(|(index, level)| {
+            let current = if *level == app.reasoning_level {
+                "●"
+            } else {
+                " "
+            };
+            let label = format!(
+                "{current} {:<6} {}",
+                reasoning_level_command_value(*level),
+                reasoning_level_label(*level)
+            );
+            let style = if index == selected {
+                Style::new().fg(COLOR_TEXT).bg(COLOR_USER_BG).bold()
+            } else {
+                Style::new().fg(COLOR_MUTED)
+            };
+            Line::from(Span::styled(label, style))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
+                .title("选择思考等级")
+                .title_bottom(
+                    Line::from(" ↑↓ 选择 · Enter 应用 · Esc 关闭 ").alignment(Alignment::Center),
+                )
+                .padding(Padding::horizontal(1)),
+        ),
+        area,
+    );
+}
+
 /// 在主界面上方绘制人工插件管理页。
 #[cfg(feature = "plugins")]
 pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &App, outer: Rect) {
@@ -1454,9 +1553,9 @@ mod tests {
             .is_some_and(|message| message.text.contains("思考等级已切换为 高")));
     }
 
-    /// `/reasoning` 不带参数时只展示当前与可用等级，不修改 Agent。
+    /// `/reasoning` 不带参数时必须打开二级界面，并默认高亮当前等级。
     #[test]
-    fn native_reasoning_command_shows_available_levels() {
+    fn native_reasoning_command_opens_level_dialog() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx, "测试模型".into()).with_reasoning_levels(
             vec![ReasoningLevel::Off, ReasoningLevel::Medium],
@@ -1467,9 +1566,34 @@ mod tests {
 
         assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
 
-        assert!(app.messages.last().is_some_and(|message| {
-            message.text.contains("当前思考等级：中")
-                && message.text.contains("可用等级：off、medium")
-        }));
+        let dialog = app
+            .native_command
+            .reasoning_dialog
+            .as_ref()
+            .expect("应打开思考等级二级界面");
+        assert_eq!(dialog.selected, 1);
+        assert!(app.messages.is_empty());
+    }
+
+    /// 思考等级二级界面必须支持方向键选择，并在 Enter 后同步共享 Agent。
+    #[test]
+    fn native_reasoning_dialog_applies_selected_level() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into()).with_reasoning_levels(
+            vec![ReasoningLevel::Off, ReasoningLevel::Medium],
+            ReasoningLevel::Off,
+        );
+        let (gateway, options) = build_demo_gateway();
+        let agent = Arc::new(Agent::new(gateway, options));
+        app.input = "/reasoning".into();
+        app.cursor = app.input.len();
+
+        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
+        assert!(app.handle_native_command_key(KeyCode::Down, KeyModifiers::NONE, Some(&agent)));
+        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
+
+        assert!(app.native_command.reasoning_dialog.is_none());
+        assert_eq!(app.reasoning_level, ReasoningLevel::Medium);
+        assert_eq!(agent.reasoning_level(), ReasoningLevel::Medium);
     }
 }

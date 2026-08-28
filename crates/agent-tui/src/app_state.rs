@@ -442,6 +442,7 @@ impl App {
         self.context_tokens = None;
         self.last_escape_at = None;
         self.native_command.dialog = None;
+        self.native_command.reasoning_dialog = None;
         #[cfg(feature = "plugins")]
         {
             self.native_command.plugin_dialog = None;

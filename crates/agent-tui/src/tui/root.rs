@@ -34,6 +34,7 @@ pub(crate) fn render_root(frame: &mut Frame, app: &mut App) {
     #[cfg(feature = "plugins")]
     render_plugin_dialog(frame, app, outer);
     render_native_session_dialog(frame, app, outer);
+    render_native_reasoning_dialog(frame, app, outer);
     #[cfg(feature = "plugins")]
     render_native_plugin_dialog(frame, app, outer);
 }
