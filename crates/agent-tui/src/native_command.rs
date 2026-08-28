@@ -241,9 +241,10 @@ impl App {
         let mut parts = input.split_whitespace();
         let invoked = parts.next().unwrap_or_default();
         let name = invoked.trim_start_matches('/');
-        let Some(command) = NATIVE_COMMANDS.iter().find(|command| {
-            command.name == name || command.aliases.iter().any(|alias| *alias == name)
-        }) else {
+        let Some(command) = NATIVE_COMMANDS
+            .iter()
+            .find(|command| command.name == name || command.aliases.contains(&name))
+        else {
             self.messages.push(Msg::new(
                 MsgKind::Error,
                 format!("未知命令 `{invoked}`；输入 `/help` 查看可用命令。"),
@@ -281,9 +282,10 @@ impl App {
     /// 在消息流中显示全部命令或指定命令的说明。
     fn show_native_command_help(&mut self, target: Option<&str>) {
         let content = match target.map(|value| value.trim_start_matches('/')) {
-            Some(target) => match NATIVE_COMMANDS.iter().find(|command| {
-                command.name == target || command.aliases.iter().any(|alias| *alias == target)
-            }) {
+            Some(target) => match NATIVE_COMMANDS
+                .iter()
+                .find(|command| command.name == target || command.aliases.contains(&target))
+            {
                 Some(command) => format!(
                     "/{} — {}\n{}{}",
                     command.name,
@@ -460,8 +462,8 @@ pub(crate) fn render_native_session_dialog(frame: &mut Frame, app: &App, outer: 
     let Some(dialog) = app.native_command.dialog.as_ref() else {
         return;
     };
-    let width = outer.width.saturating_sub(4).min(88).max(20);
-    let height = outer.height.saturating_sub(4).min(24).max(6);
+    let width = outer.width.saturating_sub(4).clamp(20, 88);
+    let height = outer.height.saturating_sub(4).clamp(6, 24);
     let area = Rect::new(
         outer.x + outer.width.saturating_sub(width) / 2,
         outer.y + outer.height.saturating_sub(height) / 2,

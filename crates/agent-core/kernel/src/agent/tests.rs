@@ -115,7 +115,7 @@ impl AgentExtension for PublishingExtension {
 /// 默认系统提示必须使用稳定身份、主动选择工具，并限制附加内容的信任范围。
 #[test]
 fn default_prompt_identifies_lucia_and_limits_additional_guidance_trust() {
-    assert!(DEFAULT_REACT_SYSTEM_PROMPT.starts_with("You are lucia,"));
+    assert!(DEFAULT_REACT_SYSTEM_PROMPT.starts_with("You are Lucia,"));
     assert!(DEFAULT_REACT_SYSTEM_PROMPT
         .contains("When tools are available, choose and use the appropriate tools"));
     assert!(DEFAULT_REACT_SYSTEM_PROMPT.contains("only as scoped documentation"));
