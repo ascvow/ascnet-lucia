@@ -27,7 +27,7 @@ api_key = "sk-..."
 openai_protocol = "responses"
 ```
 
-`base_url` 是模型服务 URL，`model` 是请求使用的模型名称。Lucia 打包时下载并内置 `models.dev/api.json`，运行时按服务商和模型 ID 读取上下文窗口、输出 token 上限、思考等级及输入输出模态，不依赖网络。`context_window`、`agent.max_tokens` 和 `agent.reasoning` 可显式覆盖；其中输出上限和思考等级不得超出快照声明的能力。快照中的最大输出量只作为配置校验上界，不会默认要求模型生成到最大长度。图片、普通文件和 PDF 在输入框中分别显示为 `[IMAGE#N]`、`[FILE#N]`、`[PDF#N]`，并在加入时校验模型输入能力；普通粘贴文本折叠为 `[粘贴的文本]`，删除标签会同步删除绑定的原文。音频、视频能力会被识别，但 Lucia 当前模型协议尚未实现对应内容块，因此不会误发送。输出模态作为能力元数据读取并在宽终端底栏展示，不会把尚未实现的图片、音频或视频输出伪装成文本。OpenAI 与 Anthropic 自动映射官方服务商 ID；兼容网关可用 `models_dev_provider` 指定对应 ID。密钥默认使用 `api_key = "..."` 直接配置，也可以删除该字段并改用 `api_key_env = "OPENAI_API_KEY"` 指定环境变量名；两者同时存在时 `api_key` 优先。TUI 使用 `Ctrl+R` 在快照允许的思考等级间循环切换，修改仅影响后续模型请求。
+`base_url` 是模型服务 URL，`model` 是请求使用的模型名称。Lucia 打包时下载并内置 `models.dev/api.json`，运行时按服务商和模型 ID 读取上下文窗口、输出 token 上限、思考等级及输入输出模态，不依赖网络。`context_window`、`agent.max_tokens` 和 `agent.reasoning` 可显式覆盖；其中输出上限和思考等级不得超出快照声明的能力。快照中的最大输出量只作为配置校验上界，不会默认要求模型生成到最大长度。图片、普通文件和 PDF 在输入框中分别显示为 `[IMAGE#N]`、`[FILE#N]`、`[PDF#N]`，并在加入时校验模型输入能力；普通粘贴文本折叠为 `[粘贴的文本]`，删除标签会同步删除绑定的原文。音频、视频能力会被识别，但 Lucia 当前模型协议尚未实现对应内容块，因此不会误发送。输入输出模态只用于能力校验，不在底栏显示，也不会把尚未实现的图片、音频或视频输出伪装成文本。OpenAI 与 Anthropic 自动映射官方服务商 ID；兼容网关可用 `models_dev_provider` 指定对应 ID。密钥默认使用 `api_key = "..."` 直接配置，也可以删除该字段并改用 `api_key_env = "OPENAI_API_KEY"` 指定环境变量名；两者同时存在时 `api_key` 优先。TUI 可使用 `/reasoning` 查看当前与可用等级，使用 `/reasoning high` 等命令精确切换，或使用 `/reasoning next`、`Ctrl+R` 循环切换；修改仅影响后续模型请求。
 
 也可以显式初始化指定文件后退出：
 

@@ -2315,10 +2315,8 @@ fn attached_pdf_uses_pdf_number_label() {
 #[test]
 fn image_attachment_is_rejected_when_model_lacks_image_input() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into()).with_model_modalities(
-        vec![crate::model_metadata::ModelModality::Text],
-        vec![crate::model_metadata::ModelModality::Text],
-    );
+    let mut app = App::new(tx, "测试模型".into())
+        .with_model_modalities(vec![crate::model_metadata::ModelModality::Text]);
     let path = write_temp_attachment("图.png", b"png");
 
     app.attach_file(&path);
@@ -2336,10 +2334,8 @@ fn image_attachment_is_rejected_when_model_lacks_image_input() {
 #[test]
 fn pdf_attachment_is_rejected_when_model_lacks_pdf_input() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into()).with_model_modalities(
-        vec![crate::model_metadata::ModelModality::Text],
-        vec![crate::model_metadata::ModelModality::Text],
-    );
+    let mut app = App::new(tx, "测试模型".into())
+        .with_model_modalities(vec![crate::model_metadata::ModelModality::Text]);
     let path = write_temp_attachment("报告.pdf", b"%PDF-1.7");
 
     app.attach_file(&path);
@@ -2356,13 +2352,10 @@ fn pdf_attachment_is_rejected_when_model_lacks_pdf_input() {
 #[test]
 fn image_attachment_is_allowed_when_model_supports_image_input() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into()).with_model_modalities(
-        vec![
-            crate::model_metadata::ModelModality::Text,
-            crate::model_metadata::ModelModality::Image,
-        ],
-        vec![crate::model_metadata::ModelModality::Text],
-    );
+    let mut app = App::new(tx, "测试模型".into()).with_model_modalities(vec![
+        crate::model_metadata::ModelModality::Text,
+        crate::model_metadata::ModelModality::Image,
+    ]);
     let path = write_temp_attachment("图.png", b"png");
 
     app.attach_file(&path);
@@ -2376,10 +2369,8 @@ fn image_attachment_is_allowed_when_model_supports_image_input() {
 #[test]
 fn audio_attachment_is_rejected_until_core_protocol_supports_it() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into()).with_model_modalities(
-        vec![crate::model_metadata::ModelModality::Audio],
-        vec![crate::model_metadata::ModelModality::Text],
-    );
+    let mut app = App::new(tx, "测试模型".into())
+        .with_model_modalities(vec![crate::model_metadata::ModelModality::Audio]);
     let path = write_temp_attachment("录音.mp3", b"audio");
 
     app.attach_file(&path);
@@ -2390,24 +2381,6 @@ fn audio_attachment_is_rejected_until_core_protocol_supports_it() {
         .messages
         .last()
         .is_some_and(|message| message.text.contains("协议尚未实现")));
-}
-
-/// 输入输出模态摘要必须同时来自 models.dev 元数据。
-#[test]
-fn model_modality_summary_includes_input_and_output_types() {
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let app = App::new(tx, "测试模型".into()).with_model_modalities(
-        vec![
-            crate::model_metadata::ModelModality::Text,
-            crate::model_metadata::ModelModality::Image,
-        ],
-        vec![crate::model_metadata::ModelModality::Text],
-    );
-
-    assert_eq!(
-        app.model_modality_summary().as_deref(),
-        Some("入 文本/图片 · 出 文本")
-    );
 }
 
 /// 普通粘贴文本在输入框折叠显示，提交内容块仍包含原始文本而非占位标签。
@@ -2565,7 +2538,7 @@ fn pasted_file_path_parses_dropped_paths() {
     assert_eq!(pasted_file_path(&display), None);
 }
 
-/// 粘贴非路径文本时保留逻辑换行并统一平台换行符。
+/// 粘贴非路径文本时折叠为标签，提交时保留统一后的逻辑换行。
 #[test]
 fn paste_preserves_multiline_text() {
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -2573,8 +2546,13 @@ fn paste_preserves_multiline_text() {
 
     app.handle_paste("第一行\r\n第二行\t内容");
 
-    assert_eq!(app.input, "第一行\n第二行 内容");
+    assert_eq!(app.input, "[粘贴的文本] ");
     assert_eq!(app.cursor, app.input.len());
+    let blocks = app.take_submission().expect("应保留粘贴正文").blocks();
+    assert!(matches!(
+        blocks.as_slice(),
+        [ContentBlock::Text { text }] if text == "第一行\n第二行 内容"
+    ));
 }
 
 /// 空输入框用上方向键回填历史，方向键可继续导航，编辑后退出回溯态。

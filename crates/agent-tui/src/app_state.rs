@@ -104,8 +104,6 @@ pub(crate) struct App {
     pub(crate) reasoning_level: ReasoningLevel,
     /// models.dev 为当前模型声明的输入模态；`None` 表示快照未匹配，不限制旧行为。
     pub(crate) model_input_modalities: Option<Vec<crate::model_metadata::ModelModality>>,
-    /// models.dev 为当前模型声明的输出模态；用于展示能力并阻止误报未实现协议。
-    pub(crate) model_output_modalities: Option<Vec<crate::model_metadata::ModelModality>>,
     /// 鼠标捕获是否开启；默认开启，由应用同时处理滚轮、拖选复制和插件点击。
     pub(crate) mouse_capture: bool,
     /// 当前屏幕文本选择；鼠标释放时把可见缓冲区中的选中文本写入系统剪贴板。
@@ -322,7 +320,6 @@ impl App {
             reasoning_levels: vec![ReasoningLevel::Off],
             reasoning_level: ReasoningLevel::Off,
             model_input_modalities: None,
-            model_output_modalities: None,
             mouse_capture: true,
             text_selection: None,
             #[cfg(feature = "plugins")]
@@ -383,29 +380,13 @@ impl App {
         self
     }
 
-    /// 注入 models.dev 声明的输入与输出模态；匹配到模型后附件入口会严格校验输入能力。
+    /// 注入 models.dev 声明的输入模态；匹配到模型后附件入口会严格校验能力。
     pub(crate) fn with_model_modalities(
         mut self,
         input: Vec<crate::model_metadata::ModelModality>,
-        output: Vec<crate::model_metadata::ModelModality>,
     ) -> Self {
         self.model_input_modalities = Some(input);
-        self.model_output_modalities = Some(output);
         self
-    }
-
-    /// 返回底栏使用的模型输入输出能力摘要；快照未匹配时不展示推测值。
-    pub(crate) fn model_modality_summary(&self) -> Option<String> {
-        let input = self.model_input_modalities.as_ref()?;
-        let output = self.model_output_modalities.as_ref()?;
-        let labels = |modalities: &[crate::model_metadata::ModelModality]| {
-            modalities
-                .iter()
-                .map(crate::model_metadata::ModelModality::label)
-                .collect::<Vec<_>>()
-                .join("/")
-        };
-        Some(format!("入 {} · 出 {}", labels(input), labels(output)))
     }
 
     /// 注入启动时加载的持久化记录及其存储实现。
@@ -1222,7 +1203,7 @@ impl App {
     }
 
     /// 循环切换 models.dev 声明的推理等级，并更新共享 Agent 的后续请求参数。
-    fn cycle_reasoning_level(&mut self, agent: Option<&Arc<Agent>>) {
+    pub(crate) fn cycle_reasoning_level(&mut self, agent: Option<&Arc<Agent>>) {
         let Some(agent) = agent else {
             self.messages
                 .push(Msg::new(MsgKind::Info, "模型尚未就绪，无法切换思考等级"));
@@ -1246,6 +1227,32 @@ impl App {
                 "思考等级已切换为 {}",
                 reasoning_level_label(self.reasoning_level)
             ),
+        ));
+    }
+
+    /// 设置 models.dev 声明支持的推理等级，并更新共享 Agent 的后续请求参数。
+    pub(crate) fn set_reasoning_level(
+        &mut self,
+        level: ReasoningLevel,
+        agent: Option<&Arc<Agent>>,
+    ) {
+        let Some(agent) = agent else {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "模型尚未就绪，无法切换思考等级"));
+            return;
+        };
+        if !self.reasoning_levels.contains(&level) {
+            self.messages.push(Msg::new(
+                MsgKind::Error,
+                format!("当前模型不支持思考等级 {}", reasoning_level_label(level)),
+            ));
+            return;
+        }
+        self.reasoning_level = level;
+        agent.set_reasoning_level(level);
+        self.messages.push(Msg::new(
+            MsgKind::Info,
+            format!("思考等级已切换为 {}", reasoning_level_label(level)),
         ));
     }
 

@@ -71,6 +71,13 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
         idle_only: true,
     },
     NativeCommandSpec {
+        name: "reasoning",
+        aliases: &["think"],
+        summary: "查看或切换思考等级",
+        description: "用法：/reasoning [off|minimal|low|medium|high|xhigh|max|next]；不带参数时显示当前等级和可用等级。",
+        idle_only: false,
+    },
+    NativeCommandSpec {
         name: "exit",
         aliases: &["quit"],
         summary: "退出 Lucia",
@@ -78,6 +85,33 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
         idle_only: true,
     },
 ];
+
+/// 解析 `/reasoning` 参数，兼容稳定英文值与底栏使用的中文标签。
+fn parse_reasoning_level(value: &str) -> Option<ReasoningLevel> {
+    match value.to_ascii_lowercase().as_str() {
+        "off" | "none" | "关闭" => Some(ReasoningLevel::Off),
+        "minimal" | "最小" => Some(ReasoningLevel::Minimal),
+        "low" | "低" => Some(ReasoningLevel::Low),
+        "medium" | "中" => Some(ReasoningLevel::Medium),
+        "high" | "高" => Some(ReasoningLevel::High),
+        "xhigh" | "超高" => Some(ReasoningLevel::XHigh),
+        "max" | "最大" => Some(ReasoningLevel::Max),
+        _ => None,
+    }
+}
+
+/// 返回可复制到 `/reasoning` 命令中的稳定英文等级值。
+fn reasoning_level_command_value(level: ReasoningLevel) -> &'static str {
+    match level {
+        ReasoningLevel::Off => "off",
+        ReasoningLevel::Minimal => "minimal",
+        ReasoningLevel::Low => "low",
+        ReasoningLevel::Medium => "medium",
+        ReasoningLevel::High => "high",
+        ReasoningLevel::XHigh => "xhigh",
+        ReasoningLevel::Max => "max",
+    }
+}
 
 /// 会话对话框的入口用途；两种模式都允许切换至选中的会话。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +287,7 @@ impl App {
         &mut self,
         code: KeyCode,
         modifiers: KeyModifiers,
+        agent: Option<&Arc<Agent>>,
     ) -> bool {
         if !matches!(code, KeyCode::Esc) {
             self.last_escape_at = None;
@@ -312,7 +347,7 @@ impl App {
                     self.input = format!("/{}", matches[selected].name);
                     self.cursor = self.input.len();
                 }
-                self.execute_native_command();
+                self.execute_native_command(agent);
                 true
             }
             KeyCode::Esc if !matches.is_empty() => {
@@ -325,7 +360,7 @@ impl App {
     }
 
     /// 执行当前输入中的一个原生命令，并保证命令文本不会作为用户消息发送给模型。
-    fn execute_native_command(&mut self) {
+    fn execute_native_command(&mut self, agent: Option<&Arc<Agent>>) {
         if !self.attachments.is_empty() {
             self.messages.push(Msg::new(
                 MsgKind::Error,
@@ -375,9 +410,42 @@ impl App {
                 }
             }
             "compact" => self.execute_native_compact(),
+            "reasoning" => self.execute_reasoning_command(parts.next(), agent),
             "exit" => self.should_quit = true,
             _ => unreachable!("原生命令表与执行路由必须同步"),
         }
+    }
+
+    /// 执行 `/reasoning`：无参数查看能力，`next` 循环，其余参数精确设置等级。
+    fn execute_reasoning_command(&mut self, value: Option<&str>, agent: Option<&Arc<Agent>>) {
+        let Some(value) = value else {
+            let available = self
+                .reasoning_levels
+                .iter()
+                .map(|level| reasoning_level_command_value(*level))
+                .collect::<Vec<_>>()
+                .join("、");
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                format!(
+                    "当前思考等级：{}；可用等级：{available}",
+                    reasoning_level_label(self.reasoning_level)
+                ),
+            ));
+            return;
+        };
+        if value.eq_ignore_ascii_case("next") || value == "下一个" {
+            self.cycle_reasoning_level(agent);
+            return;
+        }
+        let Some(level) = parse_reasoning_level(value) else {
+            self.messages.push(Msg::new(
+                MsgKind::Error,
+                format!("未知思考等级 `{value}`；输入 `/help reasoning` 查看用法。"),
+            ));
+            return;
+        };
+        self.set_reasoning_level(level, agent);
     }
 
     /// 在消息流中显示全部命令或指定命令的说明。
@@ -1120,12 +1188,31 @@ mod tests {
         #[cfg(feature = "plugins")]
         assert_eq!(
             names,
-            vec!["help", "resume", "sessions", "plugins", "new", "clear", "compact", "exit"]
+            vec![
+                "help",
+                "resume",
+                "sessions",
+                "plugins",
+                "new",
+                "clear",
+                "compact",
+                "reasoning",
+                "exit"
+            ]
         );
         #[cfg(not(feature = "plugins"))]
         assert_eq!(
             names,
-            vec!["help", "resume", "sessions", "new", "clear", "compact", "exit"]
+            vec![
+                "help",
+                "resume",
+                "sessions",
+                "new",
+                "clear",
+                "compact",
+                "reasoning",
+                "exit"
+            ]
         );
         assert_eq!(
             NATIVE_COMMANDS.last().expect("应有退出命令").aliases,
@@ -1266,7 +1353,7 @@ mod tests {
         app.cursor = app.input.len();
 
         assert!(app.native_command_panel_height() > 0);
-        assert!(app.handle_native_command_key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.handle_native_command_key(KeyCode::Tab, KeyModifiers::NONE, None));
         assert_eq!(app.input, "/resume ");
         assert_eq!(app.cursor, app.input.len());
         assert!(app.native_command.dialog.is_none());
@@ -1280,7 +1367,7 @@ mod tests {
         app.input = "/h".into();
         app.cursor = app.input.len();
 
-        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
         assert!(app.input.is_empty());
         assert_eq!(app.messages.len(), 1);
         assert!(app.messages[0].text.contains("/help"));
@@ -1305,7 +1392,7 @@ mod tests {
             }]),
         });
 
-        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
         assert!(app.native_command.dialog.is_none());
         assert!(matches!(
             rx.try_recv().expect("应发送原生会话切换请求"),
@@ -1338,9 +1425,51 @@ mod tests {
         app.input = "/help resume".into();
         app.cursor = app.input.len();
 
-        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
         assert!(app.input.is_empty());
         assert_eq!(app.messages.len(), 1);
         assert!(app.messages[0].text.contains("恢复历史会话"));
+    }
+
+    /// `/reasoning` 必须按 models.dev 可用等级更新 TUI 与共享 Agent。
+    #[test]
+    fn native_reasoning_command_sets_supported_level() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into()).with_reasoning_levels(
+            vec![ReasoningLevel::Off, ReasoningLevel::High],
+            ReasoningLevel::Off,
+        );
+        let (gateway, options) = build_demo_gateway();
+        let agent = Arc::new(Agent::new(gateway, options));
+        app.input = "/reasoning high".into();
+        app.cursor = app.input.len();
+
+        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
+
+        assert_eq!(app.reasoning_level, ReasoningLevel::High);
+        assert_eq!(agent.reasoning_level(), ReasoningLevel::High);
+        assert!(app
+            .messages
+            .last()
+            .is_some_and(|message| message.text.contains("思考等级已切换为 高")));
+    }
+
+    /// `/reasoning` 不带参数时只展示当前与可用等级，不修改 Agent。
+    #[test]
+    fn native_reasoning_command_shows_available_levels() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into()).with_reasoning_levels(
+            vec![ReasoningLevel::Off, ReasoningLevel::Medium],
+            ReasoningLevel::Medium,
+        );
+        app.input = "/reasoning".into();
+        app.cursor = app.input.len();
+
+        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+
+        assert!(app.messages.last().is_some_and(|message| {
+            message.text.contains("当前思考等级：中")
+                && message.text.contains("可用等级：off、medium")
+        }));
     }
 }

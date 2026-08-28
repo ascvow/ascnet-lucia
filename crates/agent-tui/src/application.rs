@@ -298,12 +298,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             .and_then(|metadata| metadata.context_window)
     });
     let reasoning_level = options.reasoning;
-    let model_modalities = tui_settings.model_metadata.as_ref().map(|metadata| {
-        (
-            metadata.input_modalities.clone(),
-            metadata.output_modalities.clone(),
-        )
-    });
+    let model_input_modalities = tui_settings
+        .model_metadata
+        .as_ref()
+        .map(|metadata| metadata.input_modalities.clone());
     if auto_initialized {
         startup_notices.insert(
             0,
@@ -558,8 +556,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .with_context_loader(manual_context_loader)
         .with_genome_runtime(genome_runtime.clone())
         .with_evidence(evidence_runtime.clone());
-    if let Some((input, output)) = model_modalities {
-        app = app.with_model_modalities(input, output);
+    if let Some(input) = model_input_modalities {
+        app = app.with_model_modalities(input);
     }
     #[cfg(feature = "plugins")]
     {
@@ -614,7 +612,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Some(UiEvent::Input(Event::Key(key))) => {
                 if key.kind == KeyEventKind::Press {
                     let before_input = app.input.clone();
-                    if app.handle_native_command_key(key.code, key.modifiers) {
+                    if app.handle_native_command_key(key.code, key.modifiers, agent.as_ref()) {
                         app.sync_native_command_input(&before_input);
                         continue;
                     }

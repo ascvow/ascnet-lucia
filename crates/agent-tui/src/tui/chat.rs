@@ -248,14 +248,6 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             Style::new().fg(COLOR_MUTED),
         ),
     ];
-    if workspace.width >= 120 {
-        if let Some(modalities) = app.model_modality_summary() {
-            footer.extend([
-                Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
-                Span::styled(modalities, Style::new().fg(COLOR_MUTED)),
-            ]);
-        }
-    }
     if workspace.width >= 96 {
         footer.extend([
             Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
