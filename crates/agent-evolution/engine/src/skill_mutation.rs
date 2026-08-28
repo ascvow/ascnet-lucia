@@ -4,6 +4,7 @@
 //! Episode 绑定、Mutation ID 与生命周期状态均由本模块从可信 Store 和控制面输入重建。
 
 use crate::{
+    episode_selection::mutation_evidence_is_behavior_only,
     skill_repository::{SkillArtifactRepository, SkillRepositoryError},
     FileArtifactStore, MutationEvidence,
 };
@@ -438,6 +439,11 @@ fn validate_evidence(
     parent: &GenomeRevision,
     evidence: &MutationEvidence,
 ) -> Result<(), SkillMutationError> {
+    if !mutation_evidence_is_behavior_only(evidence) {
+        return Err(SkillMutationError::UnsupportedFailureKind(
+            evidence.failure_kind,
+        ));
+    }
     if evidence.genome_digest != parent.digest {
         return Err(SkillMutationError::ParentGenomeDigestMismatch);
     }
@@ -837,6 +843,9 @@ pub enum SkillMutationError {
     /// 脱敏证据与 Parent Genome 摘要不一致。
     #[error("MutationEvidence 与 Parent GenomeDigest 不一致")]
     ParentGenomeDigestMismatch,
+    /// 失败属于插件实现、安全、Runtime 或环境边界，不能生成 Skill Candidate。
+    #[error("失败类别 {0:?} 不允许进入 Skill 变异")]
+    UnsupportedFailureKind(agent_evolution_protocol::FailureKind),
     /// 脱敏证据没有任何获准 Episode。
     #[error("Skill MutationEvidence 必须至少包含一条获准 Episode")]
     MissingMutationEvidence,
@@ -1199,6 +1208,25 @@ mod tests {
         ScriptedGenerator {
             drafts: Arc::new(drafts),
         }
+    }
+
+    /// 插件实现失败不能通过直接构造 MutationEvidence 绕过 Selector 进入 Skill Mutator。
+    #[tokio::test]
+    async fn rejects_plugin_failure_before_skill_generation() {
+        let (root, artifacts, parent) = fixture().await;
+        let mut evidence = evidence(&parent);
+        evidence.failure_kind = FailureKind::PluginFailure;
+        evidence.episodes[0].failure.kind = FailureKind::PluginFailure;
+
+        let error = BoundedSkillMutator::m7(generator(Vec::new()))
+            .propose(&parent, &evidence, 1, &artifacts)
+            .await
+            .expect_err("插件实现失败不得生成 Skill Candidate");
+        assert!(matches!(
+            error,
+            SkillMutationError::UnsupportedFailureKind(FailureKind::PluginFailure)
+        ));
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     /// Create、Deprecate、Delete 的可信字段必须由 Mutator 重建。

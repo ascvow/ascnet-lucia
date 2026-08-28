@@ -6,10 +6,11 @@ use agent_evaluation::{
     ReleaseHealthVerifier, TrustedEvaluationArchive,
 };
 use agent_evolution::{
-    ArtifactStore, ContextCycleStage, ContextEvaluatorClient, ContextEvolutionCycle,
-    ContextPolicyRepository, EpisodeStore, EvaluatorProcessError, FileArtifactStore,
-    FileEpisodeStore, FileGenomeResolver, FileGenomeStore, FileStableGenomePublisher,
-    GenomeResolver, GenomeSelector, GenomeStore, CONTEXT_EVOLUTION_CYCLE_SCHEMA_VERSION,
+    ArtifactStore, ContextCycleError, ContextCycleStage, ContextEvaluatorClient,
+    ContextEvolutionCycle, ContextPolicyRepository, EpisodeStore, EvaluatorProcessError,
+    FileArtifactStore, FileEpisodeStore, FileGenomeResolver, FileGenomeStore,
+    FileStableGenomePublisher, GenomeResolver, GenomeSelector, GenomeStore,
+    CONTEXT_EVOLUTION_CYCLE_SCHEMA_VERSION,
 };
 use agent_evolution_protocol::{
     AgentGenome, ArtifactDigest, ArtifactRef, ContextEvaluationObservationV1,
@@ -576,4 +577,55 @@ async fn completes_context_cycle_and_rolls_back_unhealthy_policy() {
         runner.archive().append(&terminal_extension).await.is_err(),
         "Archive 不得在终态后追加 Failed 快照"
     );
+}
+
+/// 插件实现失败即使被直接绑定到请求，也不能借 Context Policy 生成 Candidate。
+#[tokio::test]
+async fn plugin_failure_cannot_enter_context_policy_cycle() {
+    let temp = TempDir::new().expect("应创建临时目录");
+    let evolution_root = temp.path().join("evolution");
+    let (parent, _) = initialize(temp.path()).await;
+    let artifacts = FileArtifactStore::new(evolution_root.join("artifacts"));
+    let event_stream = artifacts
+        .put("application/json", b"[]")
+        .await
+        .expect("Episode 事件制品应写入 CAS");
+    let mut plugin_episode = episode(&parent, event_stream);
+    plugin_episode.failures[0].kind = FailureKind::PluginFailure;
+    let episode_id = plugin_episode.episode_id.clone();
+    FileEpisodeStore::new(evolution_root.join("episodes"))
+        .append(&plugin_episode)
+        .await
+        .expect("插件失败 Episode 应保留用于人工诊断");
+
+    let fixture_version = DatasetVersionId::generate();
+    let runner = ContextEvolutionCycle::new(
+        &evolution_root,
+        TrustedContextEvaluator::new(
+            evolution_root.clone(),
+            temp.path().join("archive"),
+            temp.path().join("health"),
+            fixture_version.clone(),
+        ),
+        fixture_version.clone(),
+    );
+    let request = agent_evolution::ContextEvolutionCycleRequestV1 {
+        schema_version: CONTEXT_EVOLUTION_CYCLE_SCHEMA_VERSION,
+        cycle_id: agent_evolution_protocol::EvolutionCycleId::generate(),
+        parent_revision_id: parent.revision_id.clone(),
+        parent_genome_digest: parent.digest.clone(),
+        lineage: "stable/context".to_string(),
+        expected_parent_generation: 1,
+        evidence_episode_ids: BTreeSet::from([episode_id.clone()]),
+        expected_fixture_version: fixture_version,
+        requested_at_ms: 100,
+    };
+
+    assert!(matches!(
+        runner.run(&request).await,
+        Err(ContextCycleError::UnsupportedFailureKind {
+            episode_id: actual,
+            kind: FailureKind::PluginFailure,
+        }) if actual == episode_id
+    ));
 }

@@ -493,6 +493,37 @@ async fn generates_three_unique_bounded_mutation_proposals_offline() {
     let _ = tokio::fs::remove_dir_all(root).await;
 }
 
+/// 插件实现失败即使被直接伪造成 MutationEvidence，也不能进入 Prompt Mutator。
+#[tokio::test]
+async fn plugin_failure_cannot_bypass_selector_into_prompt_mutation() {
+    let mut evidence = mutation_evidence();
+    evidence.failure_kind = FailureKind::PluginFailure;
+    evidence.episodes[0].failure.kind = FailureKind::PluginFailure;
+    let error = BoundedPromptMutator::task_strategy_mvp(ScriptedGenerator {
+        drafts: vec![draft(1), draft(2), draft(3)],
+    })
+    .mutate("Parent Task Strategy", &evidence)
+    .await
+    .expect_err("插件实现失败不得生成 Prompt Candidate");
+    assert!(matches!(
+        error,
+        PromptMutationError::UnsupportedFailureKind(FailureKind::PluginFailure)
+    ));
+
+    let mut inconsistent = mutation_evidence();
+    inconsistent.episodes[0].failure.kind = FailureKind::PluginFailure;
+    let error = BoundedPromptMutator::task_strategy_mvp(ScriptedGenerator {
+        drafts: vec![draft(1), draft(2), draft(3)],
+    })
+    .mutate("Parent Task Strategy", &inconsistent)
+    .await
+    .expect_err("Episode 失败类别错绑不得绕过边界");
+    assert!(matches!(
+        error,
+        PromptMutationError::UnsupportedFailureKind(FailureKind::VerificationFailure)
+    ));
+}
+
 /// 返回指定脚本草案触发的 Mutator 错误。
 async fn mutation_error(drafts: Vec<PromptMutationDraft>) -> PromptMutationError {
     BoundedPromptMutator::task_strategy_mvp(ScriptedGenerator { drafts })

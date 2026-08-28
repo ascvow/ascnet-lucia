@@ -75,6 +75,34 @@ pub struct MutationEvidence {
     pub episodes: Vec<MutationEpisodeEvidence>,
 }
 
+/// 判断失败类别是否可以通过 Agent 侧行为制品变异处理。
+///
+/// 插件实现、权限、沙箱、Runtime 与环境故障必须进入人工或运维处置；工具选择、参数和
+/// 结果处理错误仍使用对应 Agent 侧类别，因此不会因为插件参与执行而被一并禁止。
+pub(crate) fn is_behavior_evolution_failure(kind: FailureKind) -> bool {
+    matches!(
+        kind,
+        FailureKind::ContextLoss
+            | FailureKind::PlanningFailure
+            | FailureKind::ToolSelection
+            | FailureKind::ToolArgument
+            | FailureKind::ToolExecution
+            | FailureKind::ModelFailure
+            | FailureKind::VerificationFailure
+            | FailureKind::TerminationFailure
+            | FailureKind::Unknown
+    )
+}
+
+/// 校验公开 Mutator 收到的结构证据仍位于 Agent 行为变异边界内。
+pub(crate) fn mutation_evidence_is_behavior_only(evidence: &MutationEvidence) -> bool {
+    is_behavior_evolution_failure(evidence.failure_kind)
+        && evidence
+            .episodes
+            .iter()
+            .all(|episode| episode.failure.kind == evidence.failure_kind)
+}
+
 /// 从 Outbox、Episode Store 与 Issue Observation Store 交叉选择变异证据。
 pub struct EpisodeSelector<O, E, I>
 where
@@ -271,6 +299,9 @@ pub enum EpisodeSelectionError {
         /// 由观察重建的状态。
         rebuilt: DiagnosticStatus,
     },
+    /// 失败属于插件实现、安全、Runtime 或环境边界，不能进入行为制品变异。
+    #[error("失败类别 {0:?} 不允许进入 Agent 行为变异")]
+    UnsupportedFailureKind(FailureKind),
     /// 同一 Issue/Episode 被多个待处理候选重复引用。
     #[error("Issue {issue_id} 重复引用 Episode {episode_id}")]
     DuplicateEligibleEpisode {
@@ -382,6 +413,11 @@ fn rebuild_issue<'a>(
         });
     }
     let issue = rebuilt[0].clone();
+    if !is_behavior_evolution_failure(issue.fingerprint.failure_class) {
+        return Err(EpisodeSelectionError::UnsupportedFailureKind(
+            issue.fingerprint.failure_class,
+        ));
+    }
     if default_disposition(
         issue.fingerprint.failure_class,
         issue.evidence_episode_ids.len(),

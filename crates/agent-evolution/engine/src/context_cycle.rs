@@ -4,19 +4,20 @@
 //! Runtime 健康判断和 Rollback 的权威实现均留在 `lucia-eval`。
 
 use crate::{
-    ArtifactStore, ArtifactStoreError, ContextCandidateBuildError, ContextCandidateBuilder,
-    ContextEvaluatorClient, EpisodeStore, EpisodeStoreError, EvaluatorProcessError,
-    EvolutionOutbox, FileArtifactStore, FileEpisodeStore, FileEvolutionOutbox, FileGenomeResolver,
-    GenomeResolver, GenomeResolverError, GenomeSelector, OutboxError,
+    episode_selection::is_behavior_evolution_failure, ArtifactStore, ArtifactStoreError,
+    ContextCandidateBuildError, ContextCandidateBuilder, ContextEvaluatorClient, EpisodeStore,
+    EpisodeStoreError, EvaluatorProcessError, EvolutionOutbox, FileArtifactStore, FileEpisodeStore,
+    FileEvolutionOutbox, FileGenomeResolver, GenomeResolver, GenomeResolverError, GenomeSelector,
+    OutboxError,
 };
 use agent_evolution_protocol::{
     ArtifactDigest, CandidateId, ContextEvaluationReceiptV1, ContextEvaluationRequestV1,
     ContextPolicyCandidateV1, ContextPolicyMutationProposalV1, ContextPolicyV1, DatasetVersionId,
-    EpisodeId, EvolutionCycleId, EvolutionLifecycle, GateDecision, GenomeDigest, GenomeRevision,
-    GenomeRevisionId, HealthCheckReceiptV1, HealthCheckRequestV1, MutationId, PromotionRequestV1,
-    ReleaseId, ReleaseReceiptV1, RollbackRequestV1, CONTEXT_POLICY_PROPOSAL_SCHEMA_VERSION,
-    EVALUATION_REQUEST_SCHEMA_VERSION, MAX_CONTEXT_THRESHOLD_TOKENS, MIN_CONTEXT_THRESHOLD_TOKENS,
-    MIN_SUMMARY_TOKEN_BUDGET,
+    EpisodeId, EvolutionCycleId, EvolutionLifecycle, FailureKind, GateDecision, GenomeDigest,
+    GenomeRevision, GenomeRevisionId, HealthCheckReceiptV1, HealthCheckRequestV1, MutationId,
+    PromotionRequestV1, ReleaseId, ReleaseReceiptV1, RollbackRequestV1,
+    CONTEXT_POLICY_PROPOSAL_SCHEMA_VERSION, EVALUATION_REQUEST_SCHEMA_VERSION,
+    MAX_CONTEXT_THRESHOLD_TOKENS, MIN_CONTEXT_THRESHOLD_TOKENS, MIN_SUMMARY_TOKEN_BUDGET,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1173,6 +1174,16 @@ where
                     episode_id.clone(),
                 ));
             }
+            if let Some(failure) = episode
+                .failures
+                .iter()
+                .find(|failure| !is_behavior_evolution_failure(failure.kind))
+            {
+                return Err(ContextCycleError::UnsupportedFailureKind {
+                    episode_id: episode_id.clone(),
+                    kind: failure.kind,
+                });
+            }
         }
         Ok(())
     }
@@ -1320,6 +1331,14 @@ pub enum ContextCycleError {
     /// Episode 不属于 Parent 或不允许进入变异。
     #[error("Context Cycle 证据 Episode 与 Parent/数据策略不匹配：{0}")]
     EvidenceBindingMismatch(EpisodeId),
+    /// 证据属于插件实现、安全、Runtime 或环境故障，不能改变 Context Policy。
+    #[error("Context Cycle 证据 Episode {episode_id} 的失败类别 {kind:?} 不允许行为变异")]
+    UnsupportedFailureKind {
+        /// 被拒绝的证据 Episode。
+        episode_id: EpisodeId,
+        /// 需要进入人工、运维或安全处置的失败类别。
+        kind: FailureKind,
+    },
     /// 恢复快照中的制品前缀或身份不一致。
     #[error("Context Cycle 归档制品状态不一致")]
     StateArtifactMismatch,
@@ -1372,9 +1391,9 @@ impl ContextCycleError {
             | Self::MissingPolicyArtifact(_)
             | Self::InvalidParentPolicy(_) => "context_parent_policy_invalid",
             Self::InvalidMutation(_) => "context_mutation_invalid",
-            Self::EvidenceNotFound(_) | Self::EvidenceBindingMismatch(_) => {
-                "context_evidence_invalid"
-            }
+            Self::EvidenceNotFound(_)
+            | Self::EvidenceBindingMismatch(_)
+            | Self::UnsupportedFailureKind { .. } => "context_evidence_invalid",
             Self::StateArtifactMismatch => "context_cycle_state_invalid",
             Self::SequenceOverflow | Self::TimestampOverflow | Self::Clock(_) => {
                 "context_cycle_time_invalid"
@@ -1402,6 +1421,7 @@ impl ContextCycleError {
                 | Self::InvalidMutation(_)
                 | Self::EvidenceNotFound(_)
                 | Self::EvidenceBindingMismatch(_)
+                | Self::UnsupportedFailureKind { .. }
                 | Self::StateArtifactMismatch
         )
     }

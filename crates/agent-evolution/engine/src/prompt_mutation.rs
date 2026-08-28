@@ -1,6 +1,9 @@
 //! Task Strategy Prompt 的生成接口与确定性边界校验。
 
-use crate::{ArtifactStore, ArtifactStoreError, EvolutionPolicy, MutationEvidence};
+use crate::{
+    episode_selection::mutation_evidence_is_behavior_only, ArtifactStore, ArtifactStoreError,
+    EvolutionPolicy, MutationEvidence,
+};
 use agent_evolution_protocol::{
     ArtifactRef, ExpectedEffect, GenomeDigest, GenomeRevisionId, InvalidMutation, MutationId,
     MutationPatch, MutationProposal, MutationRisk, MutationSurface,
@@ -126,6 +129,11 @@ where
         parent_prompt: &str,
         evidence: &MutationEvidence,
     ) -> Result<Vec<PromptMutationDraft>, PromptMutationError> {
+        if !mutation_evidence_is_behavior_only(evidence) {
+            return Err(PromptMutationError::UnsupportedFailureKind(
+                evidence.failure_kind,
+            ));
+        }
         let parent_prompt = parent_prompt.trim();
         if parent_prompt.is_empty() {
             return Err(PromptMutationError::EmptyParentPrompt);
@@ -326,6 +334,9 @@ pub enum PromptMutationError {
     /// 脱敏证据与受信 Parent Genome 摘要不一致。
     #[error("MutationEvidence 与 Parent GenomeDigest 不一致")]
     ParentGenomeDigestMismatch,
+    /// 失败属于插件实现、安全、Runtime 或环境边界，不能生成 Prompt Candidate。
+    #[error("失败类别 {0:?} 不允许进入 Prompt 变异")]
+    UnsupportedFailureKind(agent_evolution_protocol::FailureKind),
     /// 脱敏证据没有任何获准 Episode。
     #[error("MutationEvidence 必须至少包含一条获准 Episode")]
     MissingMutationEvidence,
