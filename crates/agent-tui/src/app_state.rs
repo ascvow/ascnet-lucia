@@ -95,8 +95,10 @@ pub(crate) struct App {
     pub(crate) context_tokens: Option<u64>,
     /// 配置的模型上下文窗口，用于状态栏计算占比。
     pub(crate) context_window: Option<u64>,
-    /// 鼠标捕获是否开启；默认关闭以同时支持终端原生选择和备用屏滚轮映射。
+    /// 鼠标捕获是否开启；默认开启，由应用同时处理滚轮、拖选复制和插件点击。
     pub(crate) mouse_capture: bool,
+    /// 当前屏幕文本选择；鼠标释放时把可见缓冲区中的选中文本写入系统剪贴板。
+    pub(crate) text_selection: Option<MouseTextSelection>,
     /// 插件声明的视图及宿主缓存的最近一帧。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_views: Vec<PluginViewState>,
@@ -158,6 +160,101 @@ pub(crate) struct PluginViewState {
     pub(crate) area: Rect,
 }
 
+/// 应用内鼠标文本选择的屏幕坐标范围。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MouseTextSelection {
+    /// 拖动起点，对应终端缓冲区坐标。
+    anchor: Position,
+    /// 最近一次拖动或释放位置。
+    current: Position,
+    /// 是否已经离开起点；普通点击不会触发复制或高亮。
+    dragged: bool,
+}
+
+impl MouseTextSelection {
+    /// 从鼠标按下位置创建尚未发生拖动的选择。
+    pub(crate) fn new(anchor: Position) -> Self {
+        Self {
+            anchor,
+            current: anchor,
+            dragged: false,
+        }
+    }
+
+    /// 更新选择终点，并记录是否形成了非空拖动范围。
+    pub(crate) fn update(&mut self, current: Position) {
+        self.current = current;
+        self.dragged |= current != self.anchor;
+    }
+
+    /// 按终端线性选择顺序遍历范围内坐标，越界端点会收窄到缓冲区。
+    fn for_each_position(self, area: Rect, mut visit: impl FnMut(Position)) {
+        if area.is_empty() {
+            return;
+        }
+        let clamp = |position: Position| {
+            Position::new(
+                position
+                    .x
+                    .clamp(area.left(), area.right().saturating_sub(1)),
+                position
+                    .y
+                    .clamp(area.top(), area.bottom().saturating_sub(1)),
+            )
+        };
+        let anchor = clamp(self.anchor);
+        let current = clamp(self.current);
+        let (start, end) = if (anchor.y, anchor.x) <= (current.y, current.x) {
+            (anchor, current)
+        } else {
+            (current, anchor)
+        };
+        for y in start.y..=end.y {
+            let first = if y == start.y { start.x } else { area.left() };
+            let last = if y == end.y {
+                end.x
+            } else {
+                area.right().saturating_sub(1)
+            };
+            for x in first..=last {
+                visit(Position::new(x, y));
+            }
+        }
+    }
+
+    /// 从已渲染缓冲区提取选择文本；返回值保留内部换行并移除行尾布局空白。
+    pub(crate) fn extract(self, buffer: &Buffer) -> String {
+        let mut rows = Vec::<String>::new();
+        let mut row = String::new();
+        let mut previous_y = None;
+        let mut trailing_columns = 0usize;
+        self.for_each_position(buffer.area, |position| {
+            if previous_y.is_some_and(|y| y != position.y) {
+                rows.push(row.trim_end().to_string());
+                row.clear();
+                trailing_columns = 0;
+            }
+            previous_y = Some(position.y);
+            if trailing_columns > 0 {
+                trailing_columns -= 1;
+                return;
+            }
+            if let Some(cell) = buffer.cell(position) {
+                let symbol = cell.symbol();
+                row.push_str(symbol);
+                trailing_columns = unicode_width::UnicodeWidthStr::width(symbol).saturating_sub(1);
+            }
+        });
+        if previous_y.is_some() {
+            rows.push(row.trim_end().to_string());
+        }
+        while rows.last().is_some_and(String::is_empty) {
+            rows.pop();
+        }
+        rows.join("\n")
+    }
+}
+
 /// 键盘事件在主界面与插件界面之间的路由结果。
 #[cfg(feature = "plugins")]
 pub(crate) enum PluginKeyRoute {
@@ -209,7 +306,8 @@ impl App {
             last_message_width: 0,
             context_tokens: None,
             context_window: None,
-            mouse_capture: false,
+            mouse_capture: true,
+            text_selection: None,
             #[cfg(feature = "plugins")]
             plugin_views: Vec::new(),
             #[cfg(feature = "plugins")]
@@ -989,8 +1087,10 @@ impl App {
                 } else if !(self.input.contains('\n')
                     && move_cursor_vertically(&self.input, &mut self.cursor, true))
                 {
-                    // 备用屏中的滚轮与物理方向键都会到达此分支；输入历史由 Ctrl+P 进入。
-                    self.scroll_up(1);
+                    // 空输入框直接回填最近一次提交；非空单行草稿不得被历史覆盖。
+                    if self.input.is_empty() {
+                        self.recall_older_input();
+                    }
                 }
             }
             KeyCode::Down => {
@@ -999,7 +1099,7 @@ impl App {
                 } else if !(self.input.contains('\n')
                     && move_cursor_vertically(&self.input, &mut self.cursor, false))
                 {
-                    self.scroll_down(1);
+                    // 未处于历史回溯态时向下键不修改当前草稿。
                 }
             }
             KeyCode::Char(c) => {
@@ -1394,12 +1494,14 @@ impl App {
 
     /// 向上滚动 n 行，进入手动滚动模式。
     pub(crate) fn scroll_up(&mut self, n: u16) {
+        self.text_selection = None;
         let current = self.scroll.unwrap_or(self.last_max_scroll);
         self.scroll = Some(current.saturating_sub(n));
     }
 
     /// 向下滚动 n 行；到达底部时恢复自动跟随。
     pub(crate) fn scroll_down(&mut self, n: u16) {
+        self.text_selection = None;
         if let Some(current) = self.scroll {
             let next = current.saturating_add(n);
             if next >= self.last_max_scroll {
@@ -1625,6 +1727,49 @@ impl App {
             "Text selection restored; press Ctrl+T to enable mouse interaction"
         };
         self.messages.push(Msg::new(MsgKind::Info, notice));
+    }
+
+    /// 更新应用内文本选择，并在左键释放后复制当前可见缓冲区中的文本。
+    ///
+    /// 单击只重置选择，不产生剪贴板副作用；发生拖动后，选择按终端的线性行顺序展开，
+    /// 每行末尾空白会被移除。剪贴板不可用时保留高亮选择，不影响其他鼠标路由。
+    pub(crate) fn handle_text_selection(&mut self, mouse: &MouseEvent, buffer: &Buffer) {
+        let position = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                self.text_selection = Some(MouseTextSelection::new(position));
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                if let Some(selection) = self.text_selection.as_mut() {
+                    selection.update(position);
+                }
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                let Some(selection) = self.text_selection.as_mut() else {
+                    return;
+                };
+                selection.update(position);
+                if selection.dragged {
+                    let text = selection.extract(buffer);
+                    if !text.is_empty() {
+                        let _ = copy_to_clipboard(&text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 在当前帧缓冲区中反色显示应用内鼠标选择，不改变字符内容。
+    pub(crate) fn render_text_selection(&self, buffer: &mut Buffer) {
+        let Some(selection) = self.text_selection.filter(|selection| selection.dragged) else {
+            return;
+        };
+        selection.for_each_position(buffer.area, |position| {
+            if let Some(cell) = buffer.cell_mut(position) {
+                cell.modifier.insert(Modifier::REVERSED);
+            }
+        });
     }
 
     /// 取出并清空当前编辑器内容；空白输入返回 `None`。

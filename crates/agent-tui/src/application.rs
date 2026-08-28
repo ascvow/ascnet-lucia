@@ -375,8 +375,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     }
     // 守卫覆盖所有退出路径，包括 draw 失败的 `?` 提前返回。
     let terminal_guard = TerminalGuard { keyboard_enhanced };
-    // 默认保留终端原生文本选择；备用屏中的滚轮由终端映射为 Up/Down 供消息区滚动。
-    // Ctrl+T 仍可按需开启插件鼠标交互。
+    // 默认捕获鼠标：滚轮与拖选由 TUI 分别处理，避免终端把滚轮转换为输入框 Up/Down。
+    let mouse_capture =
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).is_ok();
     // 启用 bracketed paste，将拖入的文件路径识别为附件。
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
 
@@ -414,6 +415,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .with_context_loader(manual_context_loader)
         .with_genome_runtime(genome_runtime.clone())
         .with_evidence(evidence_runtime.clone());
+    // 终端拒绝启用鼠标捕获时同步真实状态，使 Ctrl+T 下一次可重新尝试开启。
+    app.mouse_capture = mouse_capture;
     app.messages.extend(
         startup_notices
             .into_iter()
@@ -451,7 +454,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     };
 
     loop {
-        terminal.draw(|frame| render_root(frame, &mut app))?;
+        let rendered = terminal.draw(|frame| {
+            render_root(frame, &mut app);
+            app.render_text_selection(frame.buffer_mut());
+        })?;
+        let rendered_buffer = rendered.buffer;
 
         match rx.recv().await {
             Some(UiEvent::Input(Event::Key(key))) => {
@@ -765,6 +772,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::Input(Event::Mouse(mouse))) => {
+                app.handle_text_selection(&mouse, rendered_buffer);
                 #[cfg(feature = "plugins")]
                 {
                     let dialog_active = app.active_dialog_index().is_some();

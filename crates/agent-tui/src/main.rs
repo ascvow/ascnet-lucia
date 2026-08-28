@@ -75,7 +75,6 @@ use app_config::{
 use app_state::*;
 use async_trait::async_trait;
 use clap::{Args as ClapArgs, Parser, Subcommand};
-#[cfg(feature = "plugins")]
 use crossterm::event::MouseEvent;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use evidence::{load_evidence_runtime, EvidenceRuntime};
