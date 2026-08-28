@@ -95,7 +95,7 @@ pub(crate) struct App {
     pub(crate) context_tokens: Option<u64>,
     /// 配置的模型上下文窗口，用于状态栏计算占比。
     pub(crate) context_window: Option<u64>,
-    /// 鼠标捕获是否开启；默认开启以支持滚轮，用户可用 Ctrl+T 临时恢复终端原生选择复制。
+    /// 鼠标捕获是否开启；默认关闭以同时支持终端原生选择和备用屏滚轮映射。
     pub(crate) mouse_capture: bool,
     /// 插件声明的视图及宿主缓存的最近一帧。
     #[cfg(feature = "plugins")]
@@ -209,7 +209,7 @@ impl App {
             last_message_width: 0,
             context_tokens: None,
             context_window: None,
-            mouse_capture: true,
+            mouse_capture: false,
             #[cfg(feature = "plugins")]
             plugin_views: Vec::new(),
             #[cfg(feature = "plugins")]
@@ -989,10 +989,8 @@ impl App {
                 } else if !(self.input.contains('\n')
                     && move_cursor_vertically(&self.input, &mut self.cursor, true))
                 {
-                    // 空输入框直接回填最近一次提交；非空单行草稿不得被历史覆盖。
-                    if self.input.is_empty() {
-                        self.recall_older_input();
-                    }
+                    // 备用屏中的滚轮与物理方向键都会到达此分支；输入历史由 Ctrl+P 进入。
+                    self.scroll_up(1);
                 }
             }
             KeyCode::Down => {
@@ -1001,7 +999,7 @@ impl App {
                 } else if !(self.input.contains('\n')
                     && move_cursor_vertically(&self.input, &mut self.cursor, false))
                 {
-                    // 未处于历史回溯态时向下键不修改当前草稿。
+                    self.scroll_down(1);
                 }
             }
             KeyCode::Char(c) => {
