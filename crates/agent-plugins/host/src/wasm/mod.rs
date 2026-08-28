@@ -5,7 +5,8 @@
 
 use super::{
     capability::{
-        encode_host_response, AgentRuntimeBinding, CapabilityHostContext, CapabilityState,
+        encode_host_response, is_capability_denied, AgentRuntimeBinding, CapabilityHostContext,
+        CapabilityState,
     },
     contribution::ContributionRegistry,
     manifest::{
@@ -20,12 +21,12 @@ use super::{
 use crate::ui::{UiContribution, UiPlacement};
 use agent_core::{model::ModelMessage, AgentExtension, ContextLoadRequest, LoadedContext};
 use agent_runtime::RuntimePrincipal;
-use agent_tool::{ToolCall, ToolDecisionStatus, ToolResult, ToolSpec};
+use agent_tool::{ToolCall, ToolDecisionStatus, ToolErrorKind, ToolResult, ToolSpec};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -38,13 +39,43 @@ use wasmtime::component::{
 };
 #[cfg(test)]
 use wasmtime::Engine;
-use wasmtime::{Store, StoreContextMut, StoreLimitsBuilder};
+use wasmtime::{Store, StoreContextMut, StoreLimitsBuilder, Trap};
 use wasmtime_wasi::WasiCtxBuilder;
 
 /// 上下文加载每个序列化输入字节追加的 WASM fuel，覆盖 JSON 遍历与压缩成本。
 const CONTEXT_FUEL_PER_INPUT_BYTE: u64 = 512;
 /// 单次上下文加载允许使用的最高 fuel，避免超大请求解除计算资源上限。
 const MAX_CONTEXT_FUEL: u64 = 500_000_000;
+/// ToolResult.details 中只允许 Host 注入的插件故障键。
+const PLUGIN_HOST_FAILURE_DETAIL_KEY: &str = "lucia_plugin_host_failure";
+
+/// Host 从真实 WASM 执行边界观察到的插件故障类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PluginHostFailureKind {
+    /// WASM 陷阱或其他执行崩溃。
+    Trap,
+    /// 单次调用耗尽 Host 分配的 fuel。
+    FuelExhausted,
+    /// 插件触发 Host 配置的线性内存上限。
+    MemoryLimit,
+    /// 插件调用了 Manifest 或 ExecutionPolicy 未授权的宿主能力。
+    CapabilityDenied,
+    /// Guest 返回值无法满足正式 ToolResult 契约。
+    ContractViolation,
+}
+
+impl PluginHostFailureKind {
+    /// 返回写入可信 ToolResult 细节的稳定协议名。
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trap => "trap",
+            Self::FuelExhausted => "fuel_exhausted",
+            Self::MemoryLimit => "memory_limit",
+            Self::CapabilityDenied => "capability_denied",
+            Self::ContractViolation => "contract_violation",
+        }
+    }
+}
 
 mod engine;
 mod loader;
@@ -355,6 +386,7 @@ impl WasmPluginHost {
             let contributions = Arc::new(ContributionRegistry::default());
             let store_limits = StoreLimitsBuilder::new()
                 .memory_size(limits.max_memory_bytes)
+                .trap_on_grow_failure(true)
                 .build();
             let mut store = Store::new(
                 &engine,
@@ -574,15 +606,44 @@ impl AgentExtension for WasmPluginHost {
         let call_json = serde_json::to_string(&call)?;
         let mut state = self.state.lock().await;
         refill_fuel(&mut state)?;
+        // 前一个 Hook 的故障不能污染本次工具调用；每个导出调用只消费自己的 Host 观察。
+        state.store.data_mut().take_plugin_failure();
         let call_tool = state.call_tool;
-        let (result_json,) = call_tool
-            .call_async(&mut state.store, (call_json,))
-            .await
-            .into_anyhow()
-            .with_context(|| format!("plugin `{}` call-tool failed", self.id()))?;
-        let mut result = serde_json::from_str::<ToolResult>(&result_json)
-            .with_context(|| format!("plugin `{}` returned invalid ToolResult JSON", self.id()))?;
-        result.name = public_name;
+        let invocation = call_tool.call_async(&mut state.store, (call_json,)).await;
+        let capability_failure = state.store.data_mut().take_plugin_failure();
+        let (result_json,) = match invocation {
+            Ok(value) => value,
+            Err(error) => {
+                let failure =
+                    capability_failure.unwrap_or_else(|| classify_wasm_plugin_failure(&error));
+                return Ok(Some(plugin_host_failure_result(
+                    &call,
+                    &public_name,
+                    self.id(),
+                    failure,
+                )));
+            }
+        };
+        if let Some(failure) = capability_failure {
+            return Ok(Some(plugin_host_failure_result(
+                &call,
+                &public_name,
+                self.id(),
+                failure,
+            )));
+        }
+        let mut result = match serde_json::from_str::<ToolResult>(&result_json) {
+            Ok(result) => result,
+            Err(_) => {
+                return Ok(Some(plugin_host_failure_result(
+                    &call,
+                    &public_name,
+                    self.id(),
+                    PluginHostFailureKind::ContractViolation,
+                )));
+            }
+        };
+        bind_guest_tool_result(&mut result, &call, &public_name);
         Ok(Some(result))
     }
 
@@ -915,9 +976,8 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
     root.func_wrap(
         "host-agent-emit-event",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.emit_event(&request),
-            ),))
+            let result = caller.data_mut().capabilities.emit_event(&request);
+            Ok((encode_host_response_with_failure(caller.data_mut(), result),))
         },
     )
     .into_anyhow()
@@ -998,9 +1058,8 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
     root.func_wrap(
         "host-fs-read",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.read_file(&request),
-            ),))
+            let result = caller.data_mut().capabilities.read_file(&request);
+            Ok((encode_host_response_with_failure(caller.data_mut(), result),))
         },
     )
     .into_anyhow()
@@ -1008,9 +1067,8 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
     root.func_wrap(
         "host-fs-list",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.list_dir(&request),
-            ),))
+            let result = caller.data_mut().capabilities.list_dir(&request);
+            Ok((encode_host_response_with_failure(caller.data_mut(), result),))
         },
     )
     .into_anyhow()
@@ -1018,9 +1076,8 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
     root.func_wrap(
         "host-process-spawn",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.spawn_process(&request),
-            ),))
+            let result = caller.data_mut().capabilities.spawn_process(&request);
+            Ok((encode_host_response_with_failure(caller.data_mut(), result),))
         },
     )
     .into_anyhow()
@@ -1030,7 +1087,7 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             Box::new(async move {
                 let result = caller.data_mut().capabilities.write_process(&request).await;
-                Ok((encode_host_response(result),))
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
     )
@@ -1045,7 +1102,7 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
                     .capabilities
                     .read_process_line(&request)
                     .await;
-                Ok((encode_host_response(result),))
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
     )
@@ -1056,7 +1113,7 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             Box::new(async move {
                 let result = caller.data_mut().capabilities.kill_process(&request).await;
-                Ok((encode_host_response(result),))
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
     )
@@ -1064,11 +1121,11 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
     .context("注册 host-process-kill 失败")?;
     root.func_wrap_async(
         "host-model-complete",
-        |caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             let (allowed, binding) = caller.data().capabilities.model_completion_context();
             Box::new(async move {
                 let result = CapabilityState::complete_model_with(allowed, binding, &request).await;
-                Ok((encode_host_response(result),))
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
     )
@@ -1076,18 +1133,98 @@ fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
     .context("注册 host-model-complete 失败")?;
     root.func_wrap_async(
         "host-agent-runtime-call",
-        |caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             let (permissions, binding) = caller.data().capabilities.agent_runtime_context();
             Box::new(async move {
                 let result =
                     CapabilityState::call_agent_runtime_with(permissions, binding, &request).await;
-                Ok((encode_host_response(result),))
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
     )
     .into_anyhow()
     .context("注册 host-agent-runtime-call 失败")?;
     Ok(())
+}
+
+/// 编码宿主能力响应，并把真实权限拒绝锁存在当前 WASM Store 中供调用终态消费。
+fn encode_host_response_with_failure(state: &mut PluginWasiState, result: Result<Value>) -> String {
+    if result.as_ref().is_err_and(is_capability_denied) {
+        state.record_plugin_failure(PluginHostFailureKind::CapabilityDenied);
+    }
+    encode_host_response(result)
+}
+
+/// 将 Host 观察到的真实 WASM 调用错误归入稳定插件故障类别。
+fn classify_wasm_plugin_failure(error: &wasmtime::Error) -> PluginHostFailureKind {
+    if matches!(error.downcast_ref::<Trap>(), Some(Trap::OutOfFuel)) {
+        return PluginHostFailureKind::FuelExhausted;
+    }
+    let diagnostic = format!("{error:#?}").to_ascii_lowercase();
+    if diagnostic.contains("forcing trap when growing memory")
+        || diagnostic.contains("memory growth failure")
+        || diagnostic.contains("memory limits")
+    {
+        return PluginHostFailureKind::MemoryLimit;
+    }
+    PluginHostFailureKind::Trap
+}
+
+/// 构造由 Host 注入、且会由 Core 重绑调用身份的插件故障结果。
+fn plugin_host_failure_result(
+    call: &ToolCall,
+    public_name: &str,
+    plugin_id: &str,
+    failure: PluginHostFailureKind,
+) -> ToolResult {
+    ToolResult::error_with_kind(
+        call.id.clone(),
+        public_name,
+        ToolErrorKind::Execution,
+        format!("插件 `{plugin_id}` 运行失败：{}", failure.as_str()),
+    )
+    .with_details(json!({
+        PLUGIN_HOST_FAILURE_DETAIL_KEY: {
+            "kind": failure.as_str(),
+            "plugin_id": plugin_id,
+        }
+    }))
+}
+
+/// 删除 Guest 可能伪造的 Host 专用故障键，并降级其安全错误类别。
+///
+/// 参数错误、普通执行错误与取消仍用于 Agent 侧行为归因；只有必须由可信执行层观察的
+/// 权限与边界类别会降为普通执行错误。
+fn sanitize_guest_tool_result(result: &mut ToolResult) {
+    result.error_kind = if !result.is_error {
+        None
+    } else {
+        match result.error_kind {
+            Some(
+                ToolErrorKind::PermissionDenied
+                | ToolErrorKind::PathBoundaryViolation
+                | ToolErrorKind::ProcessBoundaryViolation
+                | ToolErrorKind::SecretAccessAttempt
+                | ToolErrorKind::PolicyDenied,
+            )
+            | None => Some(ToolErrorKind::Execution),
+            trusted_behavior_error => trusted_behavior_error,
+        }
+    };
+    let Some(details) = result.details.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    details.remove(PLUGIN_HOST_FAILURE_DETAIL_KEY);
+    if details.is_empty() {
+        result.details = None;
+    }
+}
+
+/// 使用 Host 已知的真实调用身份覆盖 Guest 返回值中的可伪造字段。
+fn bind_guest_tool_result(result: &mut ToolResult, call: &ToolCall, public_name: &str) {
+    sanitize_guest_tool_result(result);
+    result.call_id.clone_from(&call.id);
+    result.name = public_name.to_string();
 }
 
 fn refill_fuel(state: &mut WasmPluginState) -> Result<()> {
@@ -1435,5 +1572,72 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ids, vec!["policy-support", "permission", "command", "mcp"]);
+    }
+
+    /// Guest 不能通过 ToolResult 字段伪造 Host 插件故障或安全错误类别。
+    #[test]
+    fn guest_tool_result_cannot_forge_host_failure() {
+        let mut result = ToolResult::error_with_kind(
+            "forged-call",
+            "forged.tool",
+            ToolErrorKind::PermissionDenied,
+            "伪造拒绝",
+        )
+        .with_details(json!({
+            PLUGIN_HOST_FAILURE_DETAIL_KEY: {
+                "kind": "capability_denied",
+                "plugin_id": "forged"
+            },
+            "duration_ms": 1
+        }));
+
+        let call = ToolCall::new("trusted-call", "plugin.local", json!({}));
+        bind_guest_tool_result(&mut result, &call, "plugin.public");
+
+        assert_eq!(result.error_kind, Some(ToolErrorKind::Execution));
+        assert_eq!(result.call_id, "trusted-call");
+        assert_eq!(result.name, "plugin.public");
+        let details = result.details.expect("非 Host UI 细节应保留");
+        assert!(details.get(PLUGIN_HOST_FAILURE_DETAIL_KEY).is_none());
+        assert_eq!(details["duration_ms"], 1);
+    }
+
+    /// Guest 的参数错误仍可用于改进 Agent 调用策略，不属于插件安全事实。
+    #[test]
+    fn guest_invalid_arguments_remains_agent_behavior_error() {
+        let mut result = ToolResult::error_with_kind(
+            "call",
+            "plugin.tool",
+            ToolErrorKind::InvalidArguments,
+            "缺少必填参数",
+        );
+
+        sanitize_guest_tool_result(&mut result);
+
+        assert_eq!(result.error_kind, Some(ToolErrorKind::InvalidArguments));
+    }
+
+    /// Host 构造的插件故障必须带有不可发送给模型的结构化可信标记。
+    #[test]
+    fn host_plugin_failure_has_stable_detail() {
+        let call = ToolCall::new("call", "plugin.tool", json!({}));
+
+        let result = plugin_host_failure_result(
+            &call,
+            "plugin.tool",
+            "plugin",
+            PluginHostFailureKind::ContractViolation,
+        );
+
+        assert!(result.is_error);
+        assert_eq!(result.error_kind, Some(ToolErrorKind::Execution));
+        assert_eq!(
+            result
+                .details
+                .as_ref()
+                .and_then(|details| details.pointer("/lucia_plugin_host_failure/kind"))
+                .and_then(Value::as_str),
+            Some("contract_violation")
+        );
     }
 }

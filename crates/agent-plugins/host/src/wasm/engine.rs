@@ -1,5 +1,6 @@
 //! 进程共享 Engine、WASI Store 状态与单插件资源限额。
 
+use super::PluginHostFailureKind;
 use crate::capability::CapabilityState;
 use anyhow::{anyhow, Result};
 use std::{
@@ -95,6 +96,8 @@ pub(super) struct PluginWasiState {
     pub(super) capabilities: CapabilityState,
     /// Wasmtime 在实例化和内存增长时应用的资源上限。
     pub(super) store_limits: StoreLimits,
+    /// 当前 Host 导出调用期间由可信宿主观察到的插件故障。
+    plugin_failure: Option<PluginHostFailureKind>,
 }
 
 impl PluginWasiState {
@@ -109,7 +112,18 @@ impl PluginWasiState {
             table: ResourceTable::new(),
             capabilities,
             store_limits,
+            plugin_failure: None,
         }
+    }
+
+    /// 记录当前导出调用中的首个可信插件故障，避免 Guest 后续返回覆盖根因。
+    pub(super) fn record_plugin_failure(&mut self, failure: PluginHostFailureKind) {
+        self.plugin_failure.get_or_insert(failure);
+    }
+
+    /// 取出并清空当前导出调用的可信插件故障。
+    pub(super) fn take_plugin_failure(&mut self) -> Option<PluginHostFailureKind> {
+        self.plugin_failure.take()
     }
 }
 

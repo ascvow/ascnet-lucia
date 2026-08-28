@@ -60,6 +60,30 @@ pub(crate) struct CapabilityState {
     state: HashMap<String, Value>,
 }
 
+/// Host 在真实 Manifest 或执行策略边界拒绝插件能力时使用的类型化错误。
+#[derive(Debug)]
+struct PluginCapabilityDenied(String);
+
+impl std::fmt::Display for PluginCapabilityDenied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PluginCapabilityDenied {}
+
+/// 构造可由 WASM Host 可信识别的能力拒绝错误。
+fn capability_denied(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(PluginCapabilityDenied(message.into()))
+}
+
+/// 判断错误链是否包含 Host 真实执行的能力拒绝。
+pub(crate) fn is_capability_denied(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|source| source.is::<PluginCapabilityDenied>())
+}
+
 /// Host 注入单个插件实例的可信服务与运行平面策略。
 ///
 /// 该上下文不包含 manifest 或 Guest 可控字段，避免服务绑定与可信策略在构造阶段被混入
@@ -326,7 +350,7 @@ impl CapabilityState {
         request_json: &str,
     ) -> Result<Value> {
         if !allowed {
-            return Err(anyhow!("插件 manifest 未授权 model_completion"));
+            return Err(capability_denied("插件 manifest 未授权 model_completion"));
         }
         if request_json.len() > MAX_MODEL_COMPLETION_REQUEST_BYTES {
             return Err(anyhow!(
@@ -367,7 +391,7 @@ impl CapabilityState {
                 .context("插件模型非流式完成调用失败")?
         };
         if !response.tool_calls.is_empty() {
-            return Err(anyhow!("模型完成服务返回了未授权工具调用"));
+            return Err(capability_denied("模型完成服务返回了未授权工具调用"));
         }
         let text = response.text_content();
         if text.trim().is_empty() {
@@ -407,10 +431,10 @@ impl CapabilityState {
                     return Err(anyhow!("Agent spawn 输入不能为空"));
                 }
                 if !permissions.allows_profile(&request.profile) {
-                    return Err(anyhow!(
+                    return Err(capability_denied(format!(
                         "插件 manifest 未授权 Agent spawn profile `{}`",
                         request.profile
-                    ));
+                    )));
                 }
                 let derive = binding
                     .host_services
@@ -544,7 +568,9 @@ impl CapabilityState {
             return Err(anyhow!("扩展事件名称不能为空"));
         }
         if request.name == crate::ui::UI_HOST_ACTION_EVENT && !self.permissions.surface_actions {
-            return Err(anyhow!("插件 manifest 未声明 surface_actions 能力"));
+            return Err(capability_denied(
+                "插件 manifest 未声明 surface_actions 能力",
+            ));
         }
         self.contributions.emit_event(json!({
             "source": {
@@ -794,17 +820,17 @@ impl CapabilityState {
 
     fn require_process_exec(&self) -> Result<()> {
         if !self.execution_policy.permits_process_execution() {
-            return Err(anyhow!("Host ExecutionPolicy 禁止插件进程执行"));
+            return Err(capability_denied("Host ExecutionPolicy 禁止插件进程执行"));
         }
         if !self.permissions.process_exec {
-            return Err(anyhow!("插件 manifest 未声明 process_exec 能力"));
+            return Err(capability_denied("插件 manifest 未声明 process_exec 能力"));
         }
         Ok(())
     }
 
     fn resolve_read_path(&self, requested: &str) -> Result<PathBuf> {
         if self.permissions.fs_read.is_empty() {
-            return Err(anyhow!("插件 manifest 未声明 fs_read 能力"));
+            return Err(capability_denied("插件 manifest 未声明 fs_read 能力"));
         }
         let requested = resolve_from(&self.plugin_dir, requested)
             .canonicalize()
@@ -817,7 +843,10 @@ impl CapabilityState {
                 return Ok(requested);
             }
         }
-        Err(anyhow!("插件无权读取路径：{}", requested.display()))
+        Err(capability_denied(format!(
+            "插件无权读取路径：{}",
+            requested.display()
+        )))
     }
 
     fn resolve_process_cwd(&self, requested: Option<&str>) -> Result<PathBuf> {
@@ -888,7 +917,7 @@ impl AgentCapabilityChecks for AgentCapabilitySection {
         if self.spawn || self.observe || self.cancel {
             Ok(())
         } else {
-            Err(anyhow!("插件 manifest 未声明 Agent Runtime 能力"))
+            Err(capability_denied("插件 manifest 未声明 Agent Runtime 能力"))
         }
     }
 
@@ -896,7 +925,9 @@ impl AgentCapabilityChecks for AgentCapabilitySection {
         if self.spawn {
             Ok(())
         } else {
-            Err(anyhow!("插件 manifest 未声明 capabilities.agent.spawn"))
+            Err(capability_denied(
+                "插件 manifest 未声明 capabilities.agent.spawn",
+            ))
         }
     }
 
@@ -904,7 +935,9 @@ impl AgentCapabilityChecks for AgentCapabilitySection {
         if self.observe {
             Ok(())
         } else {
-            Err(anyhow!("插件 manifest 未声明 capabilities.agent.observe"))
+            Err(capability_denied(
+                "插件 manifest 未声明 capabilities.agent.observe",
+            ))
         }
     }
 
@@ -912,7 +945,9 @@ impl AgentCapabilityChecks for AgentCapabilitySection {
         if self.cancel {
             Ok(())
         } else {
-            Err(anyhow!("插件 manifest 未声明 capabilities.agent.cancel"))
+            Err(capability_denied(
+                "插件 manifest 未声明 capabilities.agent.cancel",
+            ))
         }
     }
 }
@@ -1618,6 +1653,7 @@ mod tests {
         .expect_err("未授权 profile 必须失败");
 
         assert!(error.to_string().contains("manifest 未授权"));
+        assert!(is_capability_denied(&error));
     }
 
     /// Runtime 调用信封不得接受 Guest 伪造的 principal 或 caller 字段。
