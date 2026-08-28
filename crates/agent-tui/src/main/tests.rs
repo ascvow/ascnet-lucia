@@ -1894,6 +1894,41 @@ fn test_plugin_view(placement: UiPlacement, title: &str) -> PluginViewState {
     }
 }
 
+/// 独占输入插件必须使用完整边框和声明标题，形成与主输入区分离的审批卡片。
+#[test]
+#[cfg(feature = "plugins")]
+fn input_plugin_renders_bordered_title_card() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("创建输入插件测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.plugin_views
+        .push(test_plugin_view(UiPlacement::Input, "Permission"));
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染输入插件卡片");
+    let rows = (0..24)
+        .map(|y| {
+            (0..80)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let title_row = rows
+        .iter()
+        .position(|row| row.contains(" Permission "))
+        .expect("应显示插件声明标题");
+
+    assert!(rows[title_row].contains('┌'));
+    assert!(rows[title_row].contains('┐'));
+    assert!(rows[title_row + 1].contains('│'));
+    assert!(rows[title_row + 1].contains('插'));
+    assert!(rows[title_row + 1].contains('件'));
+    assert!(rows[title_row + 7].contains('└'));
+    assert!(rows[title_row + 7].contains('┘'));
+}
+
 /// 触发未激活的输入面板只接受定向刷新，不参与周期性跨 WASM 轮询。
 #[test]
 #[cfg(feature = "plugins")]

@@ -29,15 +29,6 @@ enum PermissionMode {
 }
 
 impl PermissionMode {
-    /// 返回界面使用的短标签。
-    fn label(self) -> &'static str {
-        match self {
-            Self::Manual => "手动审批",
-            Self::ModelReview => "模型代审",
-            Self::AllowAll => "全部放行",
-        }
-    }
-
     /// 返回跨插件重启使用的稳定存储值；该值独立于界面文案和命令别名。
     fn storage_value(self) -> &'static str {
         match self {
@@ -71,6 +62,10 @@ struct PendingApproval {
     call_id: String,
     tool_name: String,
     summary: String,
+    /// 审批卡片展示的操作原因，不包含模型输入或敏感参数。
+    reason: &'static str,
+    /// 审批卡片展示的宿主资源范围。
+    scope: &'static str,
     rule_key: String,
 }
 
@@ -135,6 +130,8 @@ impl AgentPlugin for PermissionPlugin {
                 call_id: call.id.clone(),
                 tool_name: call.name.clone(),
                 summary: approval_summary(&call),
+                reason: approval_reason(&call),
+                scope: approval_scope(&call),
                 rule_key,
             });
         }
@@ -148,11 +145,11 @@ impl AgentPlugin for PermissionPlugin {
             UiDeclaration {
                 plugin_id: String::new(),
                 view_id: APPROVAL_VIEW.into(),
-                title: "安全审批".into(),
+                title: "Permission".into(),
                 placement: UiPlacement::Input,
                 size: UiSize {
                     width: None,
-                    height: Some(9),
+                    height: Some(14),
                 },
                 focusable: true,
                 input_triggers: Vec::new(),
@@ -203,13 +200,7 @@ impl AgentPlugin for PermissionPlugin {
         Some(UiFrame {
             view_id: APPROVAL_VIEW.into(),
             visible: true,
-            lines: approval_lines(
-                pending,
-                self.mode,
-                self.selected,
-                self.pending.len(),
-                self.review_notice.as_deref(),
-            ),
+            lines: approval_lines(pending, self.selected, self.review_notice.as_deref()),
             cursor: None,
         })
     }
@@ -236,21 +227,17 @@ impl AgentPlugin for PermissionPlugin {
         let UiInputEvent::Key { code, modifiers } = input.event else {
             return;
         };
-        if matches!(code.as_str(), "a" | "A") && modifiers.iter().any(|value| value == "meta") {
-            self.resolve_current(2);
-            return;
-        }
         match code.as_str() {
-            "left" | "up" => {
-                self.selected = self.selected.checked_sub(1).unwrap_or(3);
+            "up" => {
+                self.selected = self.selected.checked_sub(1).unwrap_or(2);
             }
-            "right" | "down" | "tab" => {
-                self.selected = (self.selected + 1) % 4;
+            "down" | "tab" => {
+                self.selected = (self.selected + 1) % 3;
             }
-            "y" | "Y" => self.resolve_current(0),
-            "s" | "S" => self.resolve_current(1),
-            "a" | "A" => self.resolve_current(2),
-            "c" | "C" | "escape" => self.resolve_current(3),
+            "a" | "A" | "y" | "Y" if modifiers.is_empty() => self.resolve_current(0),
+            "s" | "S" if modifiers.is_empty() => self.resolve_current(1),
+            "d" | "D" | "c" | "C" if modifiers.is_empty() => self.resolve_current(2),
+            "escape" => self.resolve_current(2),
             "enter" => self.resolve_current(self.selected),
             _ => {}
         }
@@ -293,74 +280,21 @@ impl AgentPlugin for PermissionPlugin {
 }
 
 impl PermissionPlugin {
-    /// 处理真实 WASM 宿主路由的审批按键；“全部放行”必须成功持久化后才提交审批。
-    fn on_approval_input_with_host(&mut self, host: &dyn PluginHostApi, input: UiInput) {
-        if input.view_id != APPROVAL_VIEW || self.pending.is_empty() {
-            return;
-        }
-        let UiInputEvent::Key { code, modifiers } = input.event else {
-            return;
-        };
-        if matches!(code.as_str(), "a" | "A") && modifiers.iter().any(|value| value == "meta") {
-            self.resolve_current_with_host(host, 2);
-            return;
-        }
-        match code.as_str() {
-            "left" | "up" => {
-                self.selected = self.selected.checked_sub(1).unwrap_or(3);
-            }
-            "right" | "down" | "tab" => {
-                self.selected = (self.selected + 1) % 4;
-            }
-            "y" | "Y" => self.resolve_current(0),
-            "s" | "S" => self.resolve_current(1),
-            "a" | "A" => self.resolve_current_with_host(host, 2),
-            "c" | "C" | "escape" => self.resolve_current(3),
-            "enter" if self.selected == 2 => self.resolve_current_with_host(host, 2),
-            "enter" => self.resolve_current(self.selected),
-            _ => {}
-        }
+    /// 处理真实 WASM 宿主路由的审批按键；审批卡片仅处理本次、会话同类或拒绝。
+    fn on_approval_input_with_host(&mut self, _host: &dyn PluginHostApi, input: UiInput) {
+        self.on_ui_input(input);
     }
 
-    /// 处理当前审批并重置下一条请求的默认选项。
+    /// 处理当前审批并重置下一条请求的默认选项；会话授权只记录保守的同类规则键。
     fn resolve_current(&mut self, action: usize) {
-        self.resolve_current_with(action, |_| Ok(()));
-    }
-
-    /// 使用 Host 持久化可能改变默认模式的审批；失败时不消费待审批请求。
-    fn resolve_current_with_host(&mut self, host: &dyn PluginHostApi, action: usize) {
-        self.resolve_current_with(action, |mode| {
-            host.set_state(
-                PERMISSION_MODE_STATE_KEY,
-                &serde_json::Value::String(mode.storage_value().into()),
-            )
-        });
-    }
-
-    /// 处理当前审批；涉及默认模式时由调用方提供事务写入，失败不改变运行态。
-    fn resolve_current_with(
-        &mut self,
-        action: usize,
-        persist: impl FnOnce(PermissionMode) -> agent_plugin::Result<()>,
-    ) {
         if self.pending.is_empty() {
             return;
-        }
-        if action == 2 {
-            if let Err(error) = persist(PermissionMode::AllowAll) {
-                self.review_notice = Some(format!("保存权限模式失败，当前设置未改变：{error}"));
-                return;
-            }
         }
         let pending = self.pending.remove(0);
         let resolution = match action {
             0 => ApprovalResolution::Allow,
             1 => {
                 self.allowed_similar.insert(pending.rule_key);
-                ApprovalResolution::Allow
-            }
-            2 => {
-                self.set_mode(PermissionMode::AllowAll);
                 ApprovalResolution::Allow
             }
             _ => ApprovalResolution::Cancel(format!(
@@ -631,15 +565,42 @@ fn approval_summary(call: &ToolCall) -> String {
             .args
             .get("path")
             .and_then(|value| value.as_str())
-            .map(|path| format!("Write {path}"))
-            .unwrap_or_else(|| "Write file".into()),
+            .map(str::to_string)
+            .unwrap_or_else(|| "file".into()),
         "shell" => call
             .args
             .get("command")
             .and_then(|value| value.as_str())
             .map(redact_command)
-            .unwrap_or_else(|| "Run shell command".into()),
-        _ => format!("Call plugin tool {}", call.name),
+            .unwrap_or_else(|| "shell command".into()),
+        _ => "plugin tool call".into(),
+    }
+}
+
+/// 返回审批卡片中的静态原因说明，避免把未经信任的参数重复展示为解释文本。
+fn approval_reason(call: &ToolCall) -> &'static str {
+    match call.name.as_str() {
+        "write_file" => "Agent 请求修改当前工作区中的文件。",
+        "shell" => "Agent 请求在当前工作区执行该命令。",
+        _ => "Agent 请求执行这个插件工具。",
+    }
+}
+
+/// 返回工具调用触达的宿主资源范围。
+fn approval_scope(call: &ToolCall) -> &'static str {
+    match call.name.as_str() {
+        "write_file" => "filesystem",
+        "shell" => "process",
+        _ => "plugin",
+    }
+}
+
+/// 返回审批卡片首行使用的紧凑操作动词。
+fn approval_action(tool_name: &str) -> &'static str {
+    match tool_name {
+        "write_file" => "WRITE",
+        "shell" => "RUN",
+        _ => "CALL",
     }
 }
 
@@ -684,38 +645,43 @@ fn redact_command(command: &str) -> String {
         || preview.to_ascii_lowercase().contains("api_key=")
         || preview.to_ascii_lowercase().contains("password=")
     {
-        "Run shell command with sensitive arguments".into()
+        "shell command with sensitive arguments".into()
     } else {
-        format!("Run: {preview}")
+        preview
     }
 }
 
-/// 构造完整审批卡片，分离状态、工具摘要、操作和键盘提示。
-fn approval_lines(
-    pending: &PendingApproval,
-    mode: PermissionMode,
-    selected: usize,
-    pending_count: usize,
-    notice: Option<&str>,
-) -> Vec<UiLine> {
+/// 构造纵向审批卡片，把脱敏操作详情固定放在动作列表上方。
+fn approval_lines(pending: &PendingApproval, selected: usize, notice: Option<&str>) -> Vec<UiLine> {
     let mut lines = vec![
         UiLine {
             spans: vec![
-                styled_span("◆ 安全审批", UiColor::Yellow, true),
-                styled_span(format!("  {}", mode.label()), UiColor::Cyan, true),
-                styled_span(format!("  待处理 {pending_count}"), UiColor::Gray, false),
-            ],
-        },
-        UiLine {
-            spans: vec![
-                styled_span("工具  ", UiColor::Gray, false),
-                styled_span(&pending.tool_name, UiColor::White, true),
-            ],
-        },
-        UiLine {
-            spans: vec![
-                styled_span("请求  ", UiColor::Gray, false),
+                styled_span(
+                    format!("{:<6}", approval_action(&pending.tool_name)),
+                    UiColor::Cyan,
+                    true,
+                ),
                 styled_span(&pending.summary, UiColor::White, false),
+            ],
+        },
+        UiLine { spans: Vec::new() },
+        UiLine {
+            spans: vec![styled_span("Reason", UiColor::Gray, true)],
+        },
+        UiLine {
+            spans: vec![styled_span(pending.reason, UiColor::White, false)],
+        },
+        UiLine { spans: Vec::new() },
+        UiLine {
+            spans: vec![
+                styled_span("Scope   ", UiColor::Gray, true),
+                styled_span(pending.scope, UiColor::White, false),
+            ],
+        },
+        UiLine {
+            spans: vec![
+                styled_span("Risk    ", UiColor::Gray, true),
+                styled_span("●●●○  elevated", UiColor::Yellow, false),
             ],
         },
     ];
@@ -727,13 +693,12 @@ fn approval_lines(
         lines.push(UiLine { spans: Vec::new() });
     }
     lines.extend([
-        option_line("Y", "允许一次", "仅当前调用", selected == 0, false),
-        option_line("S", "允许同类", "记住相似规则", selected == 1, false),
-        option_line("A", "全部放行", "硬安全边界仍生效", selected == 2, false),
-        option_line("C", "拒绝并暂停", "保留当前会话", selected == 3, true),
+        option_line("A", "允许一次", selected == 0, UiColor::Green),
+        option_line("S", "本会话允许", selected == 1, UiColor::Cyan),
+        option_line("D", "拒绝", selected == 2, UiColor::Red),
         UiLine {
             spans: vec![styled_span(
-                "↑↓ 选择 · Enter 确认 · /permission 切换默认模式",
+                "↑↓ 选择   Enter 确认   Esc 拒绝",
                 UiColor::Gray,
                 false,
             )],
@@ -779,27 +744,14 @@ fn permission_mode_lines(
     lines
 }
 
-/// 渲染一个纵向审批选项；选中项突出快捷键，危险操作保留红色语义。
-fn option_line(
-    shortcut: &str,
-    label: &str,
-    detail: &str,
-    selected: bool,
-    dangerous: bool,
-) -> UiLine {
-    let text_color = if dangerous {
-        UiColor::Red
-    } else if selected {
-        UiColor::White
-    } else {
-        UiColor::Gray
-    };
+/// 渲染一个纵向审批选项；每个动作使用稳定语义色，选中项增加箭头与加粗。
+fn option_line(shortcut: &str, label: &str, selected: bool, color: UiColor) -> UiLine {
     UiLine {
         spans: vec![
             UiSpan {
-                text: if selected { "› " } else { "  " }.into(),
+                text: if selected { "❯ " } else { "  " }.into(),
                 style: UiStyle {
-                    foreground: Some(UiColor::Cyan),
+                    foreground: Some(UiColor::White),
                     bold: selected,
                     ..UiStyle::default()
                 },
@@ -807,20 +759,19 @@ fn option_line(
             UiSpan {
                 text: format!("[{shortcut}] "),
                 style: UiStyle {
-                    foreground: Some(if selected { UiColor::Cyan } else { text_color }),
+                    foreground: Some(color),
                     bold: selected,
                     ..UiStyle::default()
                 },
             },
             UiSpan {
-                text: format!("{label:<10}"),
+                text: label.into(),
                 style: UiStyle {
-                    foreground: Some(text_color),
+                    foreground: Some(if selected { UiColor::White } else { color }),
                     bold: selected,
                     ..UiStyle::default()
                 },
             },
-            styled_span(detail, UiColor::Gray, false),
         ],
     }
 }
@@ -878,7 +829,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// 审批界面应分层展示策略、工具、摘要、动作和键盘提示。
+    /// 审批界面应在顶部展示脱敏详情，并只保留三项纵向动作。
     #[test]
     fn approval_ui_uses_compact_visual_hierarchy() {
         let mut plugin = PermissionPlugin::default();
@@ -894,7 +845,7 @@ mod tests {
                 view_id: APPROVAL_VIEW.into(),
                 instance_id: None,
                 width: 68,
-                height: 6,
+                height: 14,
                 focused: true,
                 frame: 1,
             })
@@ -907,10 +858,16 @@ mod tests {
             .collect::<String>();
 
         assert!(frame.visible);
-        assert_eq!(frame.lines.len(), 9);
-        assert!(text.contains("安全审批"), "{text}");
-        assert!(text.contains("工具  shell"), "{text}");
-        assert!(text.contains("[A] 全部放行"), "{text}");
+        assert_eq!(frame.lines.len(), 12);
+        assert!(text.starts_with("RUN   cargo test"), "{text}");
+        assert!(text.contains("Reason"), "{text}");
+        assert!(text.contains("Scope   process"), "{text}");
+        assert!(text.contains("Risk    ●●●○  elevated"), "{text}");
+        assert!(text.contains("❯ [A] 允许一次"), "{text}");
+        assert!(text.contains("[S] 本会话允许"), "{text}");
+        assert!(text.contains("[D] 拒绝"), "{text}");
+        assert!(!text.contains("全部放行"), "{text}");
+        assert!(!text.contains("详情"), "{text}");
         assert!(frame
             .lines
             .iter()
@@ -986,37 +943,6 @@ mod tests {
             );
         }
         assert_eq!(PermissionMode::from_storage_value(&json!("unknown")), None);
-    }
-
-    /// “全部放行”保存失败时不得消费审批或改变模式，成功后才能提交当前调用。
-    #[test]
-    fn allow_all_change_commits_only_after_state_save() {
-        let call = ToolCall::new("persist-all", "shell", json!({"command": "cargo test"}));
-        let mut plugin = PermissionPlugin::default();
-        plugin.before_tool(call.clone());
-
-        plugin.resolve_current_with(2, |_| Err(agent_plugin::anyhow!("磁盘只读")));
-        assert_eq!(plugin.mode, PermissionMode::Manual);
-        assert_eq!(plugin.pending.len(), 1);
-        assert!(plugin
-            .review_notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("当前设置未改变")));
-
-        let mut saved = None;
-        plugin.resolve_current_with(2, |mode| {
-            saved = Some(mode.storage_value().to_string());
-            Ok(())
-        });
-        assert_eq!(saved.as_deref(), Some("allow_all"));
-        assert_eq!(plugin.mode, PermissionMode::AllowAll);
-        assert!(plugin.pending.is_empty());
-        assert_eq!(
-            plugin.before_tool(call),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Allow
-            }
-        );
     }
 
     /// 命令模式保存失败时必须保留原模式，并把错误加入模式面板。
@@ -1240,7 +1166,7 @@ mod tests {
             plugin.before_tool(call.clone()),
             ToolDecisionStatus::Pending { .. }
         ));
-        for code in ["right", "right", "right", "enter"] {
+        for code in ["down", "down", "enter"] {
             plugin.on_ui_input(UiInput {
                 plugin_id: "permission".into(),
                 view_id: APPROVAL_VIEW.into(),
@@ -1259,10 +1185,10 @@ mod tests {
         ));
     }
 
-    /// Y 快捷键应无需移动选择直接允许一次。
+    /// A 快捷键应无需移动选择直接允许一次。
     #[test]
-    fn y_shortcut_approves_once() {
-        let call = ToolCall::new("shell-y", "shell", json!({"command": "cargo check"}));
+    fn a_shortcut_approves_once() {
+        let call = ToolCall::new("shell-a", "shell", json!({"command": "cargo check"}));
         let mut plugin = PermissionPlugin::default();
         plugin.before_tool(call.clone());
         plugin.on_ui_input(UiInput {
@@ -1270,7 +1196,7 @@ mod tests {
             view_id: APPROVAL_VIEW.into(),
             instance_id: None,
             event: UiInputEvent::Key {
-                code: "y".into(),
+                code: "a".into(),
                 modifiers: Vec::new(),
             },
         });
@@ -1280,6 +1206,52 @@ mod tests {
                 decision: ToolDecision::Allow
             }
         );
+    }
+
+    /// D 快捷键必须直接拒绝当前调用并暂停 Agent 运行。
+    #[test]
+    fn d_shortcut_cancels_run() {
+        let call = ToolCall::new("shell-d", "shell", json!({"command": "cargo check"}));
+        let mut plugin = PermissionPlugin::default();
+        plugin.before_tool(call.clone());
+        plugin.on_ui_input(UiInput {
+            plugin_id: "permission".into(),
+            view_id: APPROVAL_VIEW.into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: "d".into(),
+                modifiers: Vec::new(),
+            },
+        });
+
+        assert!(matches!(
+            plugin.before_tool(call),
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::CancelRun { .. }
+            }
+        ));
+    }
+
+    /// 带修饰键的 A 不得触发审批，避免终端选择快捷键意外放行工具。
+    #[test]
+    fn modified_a_does_not_approve() {
+        let call = ToolCall::new("shell-meta-a", "shell", json!({"command": "cargo check"}));
+        let mut plugin = PermissionPlugin::default();
+        plugin.before_tool(call.clone());
+        plugin.on_ui_input(UiInput {
+            plugin_id: "permission".into(),
+            view_id: APPROVAL_VIEW.into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: "a".into(),
+                modifiers: vec!["meta".into()],
+            },
+        });
+
+        assert!(matches!(
+            plugin.before_tool(call),
+            ToolDecisionStatus::Pending { .. }
+        ));
     }
 
     /// 允许相似 Shell 调用只应放行同一命令族。
@@ -1318,7 +1290,7 @@ mod tests {
         ));
     }
 
-    /// Cmd+A 应开启全部放行，且不得绕过敏感路径硬拒绝。
+    /// 通过权限模式开启全部放行后仍不得绕过敏感路径硬拒绝。
     #[test]
     fn allow_all_keeps_sensitive_path_blocked() {
         let shell = ToolCall::new("shell-all", "shell", json!({"command": "cargo test"}));
@@ -1329,16 +1301,7 @@ mod tests {
         );
         let secret = ToolCall::new("secret-all", "read_file", json!({"path": ".env"}));
         let mut plugin = PermissionPlugin::default();
-        plugin.before_tool(shell.clone());
-        plugin.on_ui_input(UiInput {
-            plugin_id: "permission".into(),
-            view_id: APPROVAL_VIEW.into(),
-            instance_id: None,
-            event: UiInputEvent::Key {
-                code: "a".into(),
-                modifiers: vec!["meta".into()],
-            },
-        });
+        plugin.set_mode(PermissionMode::AllowAll);
 
         assert_eq!(
             plugin.before_tool(shell),

@@ -279,7 +279,7 @@ pub(crate) fn render_composer_panels(frame: &mut Frame, app: &mut App, area: Rec
     }
 }
 
-/// 用可见的 Input 插件视图替换主文本输入区。
+/// 用带标题边框的可见 Input 插件视图替换主文本输入区。
 pub(crate) fn render_plugin_input(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let Some(index) = app.visible_plugin_input() else {
         return;
@@ -302,10 +302,15 @@ pub(crate) fn render_plugin_input(frame: &mut Frame, app: &mut App, workspace: R
     if area.is_empty() {
         return;
     }
-    let block = Block::new()
-        .borders(Borders::TOP)
+    let title = app.plugin_views[index].declaration.title.clone();
+    let block = Block::bordered()
+        .border_type(BorderType::Plain)
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::new().fg(COLOR_TEXT).bold(),
+        ))
         .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
-        .padding(Padding::new(1, 1, 0, 0));
+        .padding(Padding::horizontal(1));
     app.plugin_views[index].area = block.inner(area);
     let lines = app.plugin_views[index]
         .frame
