@@ -128,7 +128,7 @@ impl AgentPlugin for PermissionPlugin {
                 placement: UiPlacement::InputPanel,
                 size: UiSize {
                     width: None,
-                    height: Some(8),
+                    height: Some(4),
                 },
                 focusable: true,
                 input_triggers: vec![PERMISSION_COMMAND.into()],
@@ -602,42 +602,27 @@ fn approval_lines(
 /// 构造 `/permission` 二级模式选择面板。
 fn permission_mode_lines(mode: PermissionMode, selected: usize) -> Vec<UiLine> {
     vec![
-        UiLine {
-            spans: vec![
-                styled_span("◆ 权限模式", UiColor::Cyan, true),
-                styled_span(format!("  当前：{}", mode.label()), UiColor::Gray, false),
-            ],
-        },
-        UiLine { spans: Vec::new() },
         mode_line(
-            "1",
+            "/permission manual",
             "手动审批",
             "每次由你确认",
+            mode == PermissionMode::Manual,
             selected == 0,
-            UiColor::Green,
         ),
         mode_line(
-            "2",
+            "/permission assist",
             "帮我审批",
             "受限小模型审核",
+            mode == PermissionMode::ModelReview,
             selected == 1,
-            UiColor::Cyan,
         ),
         mode_line(
-            "3",
+            "/permission allow-all",
             "全部放行",
             "仅保留硬安全边界",
+            mode == PermissionMode::AllowAll,
             selected == 2,
-            UiColor::Yellow,
         ),
-        UiLine { spans: Vec::new() },
-        UiLine {
-            spans: vec![styled_span(
-                "↑↓ 选择 · Enter 应用 · Esc 关闭",
-                UiColor::Gray,
-                false,
-            )],
-        },
     ]
 }
 
@@ -687,14 +672,36 @@ fn option_line(
     }
 }
 
-/// 渲染权限模式选项，颜色只表达模式语义，不改变安全判断。
-fn mode_line(shortcut: &str, label: &str, detail: &str, selected: bool, color: UiColor) -> UiLine {
+/// 渲染命令补全面板风格的权限模式选项，并同时标记当前模式与键盘选择。
+fn mode_line(command: &str, label: &str, detail: &str, current: bool, selected: bool) -> UiLine {
+    let style = UiStyle {
+        foreground: Some(if selected {
+            UiColor::White
+        } else {
+            UiColor::Gray
+        }),
+        bold: selected,
+        reversed: selected,
+        ..UiStyle::default()
+    };
     UiLine {
         spans: vec![
-            styled_span(if selected { "› " } else { "  " }, UiColor::Cyan, selected),
-            styled_span(format!("[{shortcut}] "), color, selected),
-            styled_span(format!("{label:<10}"), UiColor::White, selected),
-            styled_span(detail, UiColor::Gray, false),
+            UiSpan {
+                text: format!("{command:<24}"),
+                style: style.clone(),
+            },
+            UiSpan {
+                text: format!("{label} · {detail}"),
+                style: style.clone(),
+            },
+            UiSpan {
+                text: if current {
+                    "  当前".into()
+                } else {
+                    String::new()
+                },
+                style,
+            },
         ],
     }
 }
@@ -785,9 +792,12 @@ mod tests {
             .collect::<String>();
 
         assert!(frame.visible);
-        assert!(text.contains("当前：手动审批"), "{text}");
+        assert_eq!(frame.lines.len(), 3);
+        assert!(text.contains("/permission manual"), "{text}");
+        assert!(text.contains("手动审批 · 每次由你确认  当前"), "{text}");
         assert!(text.contains("帮我审批"), "{text}");
         assert!(text.contains("全部放行"), "{text}");
+        assert!(frame.lines[0].spans.iter().all(|span| span.style.reversed));
     }
 
     /// 命令参数必须稳定映射三种权限模式，未知值不得改变选择。

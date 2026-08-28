@@ -155,9 +155,9 @@ pub(crate) struct NativeSessionDialog {
     pub(crate) status: NativeSessionDialogStatus,
 }
 
-/// 思考等级二级选择界面的交互状态。
+/// 思考等级内联选择面板的交互状态。
 #[derive(Debug)]
-pub(crate) struct NativeReasoningDialog {
+pub(crate) struct NativeReasoningPanel {
     /// 当前高亮等级在 models.dev 可用等级列表中的下标。
     pub(crate) selected: usize,
 }
@@ -239,18 +239,17 @@ pub(crate) struct NativeCommandState {
     pub(crate) dismissed_input: Option<String>,
     /// 当前会话对话框。
     pub(crate) dialog: Option<NativeSessionDialog>,
-    /// 当前思考等级选择界面。
-    pub(crate) reasoning_dialog: Option<NativeReasoningDialog>,
+    /// 当前显示在输入框上方的思考等级选择面板。
+    pub(crate) reasoning_panel: Option<NativeReasoningPanel>,
     /// 当前人工插件管理页；纯 Core 构建不包含该状态。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_dialog: Option<NativePluginDialog>,
 }
 
 impl App {
-    /// 返回任一原生全屏 Dialog 是否正在占用键盘焦点。
+    /// 返回任一原生全屏 Dialog 是否正在占用键盘焦点；内联面板不计入。
     pub(crate) fn native_dialog_active(&self) -> bool {
         self.native_command.dialog.is_some()
-            || self.native_command.reasoning_dialog.is_some()
             || cfg!(feature = "plugins") && {
                 #[cfg(feature = "plugins")]
                 {
@@ -309,6 +308,15 @@ impl App {
 
     /// 返回当前补全面板所需高度；输入不是命令或面板已被显式隐藏时返回零。
     pub(crate) fn native_command_panel_height(&self) -> u16 {
+        if self.native_command.reasoning_panel.is_some() {
+            return u16::try_from(self.reasoning_levels.len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(1);
+        }
+        #[cfg(feature = "plugins")]
+        if self.plugin_slash_trigger_is_exact() {
+            return 0;
+        }
         if self.native_command.dismissed_input.as_deref() == Some(self.input.as_str()) {
             return 0;
         }
@@ -316,6 +324,18 @@ impl App {
             .unwrap_or(u16::MAX)
             .min(MAX_VISIBLE_COMMANDS as u16);
         count.saturating_add(u16::from(count > 0))
+    }
+
+    /// 判断主输入是否精确命中插件斜杠触发器；命中后应让位给插件二级面板。
+    #[cfg(feature = "plugins")]
+    fn plugin_slash_trigger_is_exact(&self) -> bool {
+        let input = self.input.trim();
+        self.plugin_views.iter().any(|view| {
+            view.declaration
+                .input_triggers
+                .iter()
+                .any(|trigger| trigger.starts_with('/') && trigger == input)
+        })
     }
 
     /// 主输入变化后重置补全选择，并让此前按 Esc 隐藏的面板重新参与匹配。
@@ -347,11 +367,11 @@ impl App {
             }
             return self.handle_native_session_dialog_key(code, modifiers);
         }
-        if self.native_command.reasoning_dialog.is_some() {
+        if self.native_command.reasoning_panel.is_some() {
             if matches!(code, KeyCode::Esc) {
                 self.last_escape_at = None;
             }
-            return self.handle_native_reasoning_dialog_key(code, modifiers, agent);
+            return self.handle_native_reasoning_panel_key(code, modifiers, agent);
         }
         #[cfg(feature = "plugins")]
         if self.native_command.plugin_dialog.is_some() {
@@ -372,6 +392,10 @@ impl App {
             return false;
         }
         if self.native_command.dismissed_input.as_deref() == Some(self.input.as_str()) {
+            return false;
+        }
+        #[cfg(feature = "plugins")]
+        if self.plugin_slash_trigger_is_exact() {
             return false;
         }
         let matches = self.slash_command_matches();
@@ -406,7 +430,7 @@ impl App {
                     self.input = format!("/{}", matches[selected].name);
                     self.cursor = self.input.len();
                     if !matches[selected].native {
-                        return false;
+                        return true;
                     }
                 }
                 self.execute_native_command(agent);
@@ -486,7 +510,7 @@ impl App {
                 .iter()
                 .position(|level| *level == self.reasoning_level)
                 .unwrap_or(0);
-            self.native_command.reasoning_dialog = Some(NativeReasoningDialog { selected });
+            self.native_command.reasoning_panel = Some(NativeReasoningPanel { selected });
             return;
         };
         if value.eq_ignore_ascii_case("next") || value == "下一个" {
@@ -503,8 +527,8 @@ impl App {
         self.set_reasoning_level(level, agent);
     }
 
-    /// 处理思考等级二级界面的键盘导航，并在确认后同步 TUI 与共享 Agent。
-    fn handle_native_reasoning_dialog_key(
+    /// 处理思考等级内联面板的键盘导航，并在确认后同步 TUI 与共享 Agent。
+    fn handle_native_reasoning_panel_key(
         &mut self,
         code: KeyCode,
         modifiers: KeyModifiers,
@@ -514,20 +538,20 @@ impl App {
             return false;
         }
         let item_count = self.reasoning_levels.len();
-        let Some(dialog) = self.native_command.reasoning_dialog.as_mut() else {
+        let Some(panel) = self.native_command.reasoning_panel.as_mut() else {
             return false;
         };
         match code {
-            KeyCode::Esc => self.native_command.reasoning_dialog = None,
+            KeyCode::Esc => self.native_command.reasoning_panel = None,
             KeyCode::Up if item_count > 0 => {
-                dialog.selected = dialog.selected.checked_sub(1).unwrap_or(item_count - 1);
+                panel.selected = panel.selected.checked_sub(1).unwrap_or(item_count - 1);
             }
             KeyCode::Down if item_count > 0 => {
-                dialog.selected = (dialog.selected + 1) % item_count;
+                panel.selected = (panel.selected + 1) % item_count;
             }
             KeyCode::Enter if item_count > 0 => {
-                let level = self.reasoning_levels[dialog.selected.min(item_count - 1)];
-                self.native_command.reasoning_dialog = None;
+                let level = self.reasoning_levels[panel.selected.min(item_count - 1)];
+                self.native_command.reasoning_panel = None;
                 self.set_reasoning_level(level, agent);
             }
             _ => {}
@@ -1002,6 +1026,10 @@ pub(crate) fn render_native_command_panel(frame: &mut Frame, app: &App, area: Re
     if area.is_empty() {
         return;
     }
+    if app.native_command.reasoning_panel.is_some() {
+        render_native_reasoning_panel(frame, app, area);
+        return;
+    }
     let matches = app.slash_command_matches();
     if matches.is_empty() {
         return;
@@ -1112,24 +1140,12 @@ pub(crate) fn render_native_session_dialog(frame: &mut Frame, app: &App, outer: 
     );
 }
 
-/// 在主界面上方绘制思考等级二级选择界面；选项只来自当前模型的 models.dev 元数据。
-pub(crate) fn render_native_reasoning_dialog(frame: &mut Frame, app: &App, outer: Rect) {
-    let Some(dialog) = app.native_command.reasoning_dialog.as_ref() else {
+/// 在输入框上方绘制命令面板风格的思考等级选择；选项只来自 models.dev 元数据。
+fn render_native_reasoning_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(panel) = app.native_command.reasoning_panel.as_ref() else {
         return;
     };
-    let width = outer.width.saturating_sub(4).clamp(24, 48);
-    let desired_height = u16::try_from(app.reasoning_levels.len())
-        .unwrap_or(u16::MAX)
-        .saturating_add(2);
-    let height = desired_height.min(outer.height.saturating_sub(4)).max(4);
-    let area = Rect::new(
-        outer.x + outer.width.saturating_sub(width) / 2,
-        outer.y + outer.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
-    frame.render_widget(Clear, area);
-    let selected = dialog
+    let selected = panel
         .selected
         .min(app.reasoning_levels.len().saturating_sub(1));
     let lines = app
@@ -1157,13 +1173,9 @@ pub(crate) fn render_native_reasoning_dialog(frame: &mut Frame, app: &App, outer
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines).block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
+            Block::new()
+                .borders(Borders::TOP)
                 .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
-                .title("选择思考等级")
-                .title_bottom(
-                    Line::from(" ↑↓ 选择 · Enter 应用 · Esc 关闭 ").alignment(Alignment::Center),
-                )
                 .padding(Padding::horizontal(1)),
         ),
         area,
@@ -1676,7 +1688,7 @@ mod tests {
 
     /// `/reasoning` 不带参数时必须打开二级界面，并默认高亮当前等级。
     #[test]
-    fn native_reasoning_command_opens_level_dialog() {
+    fn native_reasoning_command_opens_inline_panel() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx, "测试模型".into()).with_reasoning_levels(
             vec![ReasoningLevel::Off, ReasoningLevel::Medium],
@@ -1687,18 +1699,20 @@ mod tests {
 
         assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
 
-        let dialog = app
+        let panel = app
             .native_command
-            .reasoning_dialog
+            .reasoning_panel
             .as_ref()
             .expect("应打开思考等级二级界面");
-        assert_eq!(dialog.selected, 1);
+        assert_eq!(panel.selected, 1);
+        assert_eq!(app.native_command_panel_height(), 3);
+        assert!(!app.native_dialog_active());
         assert!(app.messages.is_empty());
     }
 
     /// 思考等级二级界面必须支持方向键选择，并在 Enter 后同步共享 Agent。
     #[test]
-    fn native_reasoning_dialog_applies_selected_level() {
+    fn native_reasoning_panel_applies_selected_level() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx, "测试模型".into()).with_reasoning_levels(
             vec![ReasoningLevel::Off, ReasoningLevel::Medium],
@@ -1713,7 +1727,7 @@ mod tests {
         assert!(app.handle_native_command_key(KeyCode::Down, KeyModifiers::NONE, Some(&agent)));
         assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
 
-        assert!(app.native_command.reasoning_dialog.is_none());
+        assert!(app.native_command.reasoning_panel.is_none());
         assert_eq!(app.reasoning_level, ReasoningLevel::Medium);
         assert_eq!(agent.reasoning_level(), ReasoningLevel::Medium);
     }

@@ -260,7 +260,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .map(|binding| binding.execution_policy());
     let mut options = restrict_agent_options_for_genome(options, initial_genome_policy);
     let mut reasoning_levels = vec![options.reasoning];
-    if !demo_mode && genome_binding.is_none() {
+    if !demo_mode {
         if let Some(metadata) = tui_settings.model_metadata.as_ref() {
             if let (Some(configured), Some(limit)) =
                 (options.max_tokens, metadata.max_output_tokens)
@@ -605,6 +605,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     let before_input = app.input.clone();
                     if app.handle_native_command_key(key.code, key.modifiers, agent.as_ref()) {
                         app.sync_native_command_input(&before_input);
+                        #[cfg(feature = "plugins")]
+                        if app.input != before_input {
+                            if let Some(host) = plugin_host.as_ref() {
+                                forward_main_input_snapshot(&mut app, host).await;
+                            }
+                        }
                         continue;
                     }
                     #[cfg(feature = "plugins")]

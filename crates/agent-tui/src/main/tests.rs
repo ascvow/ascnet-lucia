@@ -2132,8 +2132,10 @@ fn plugin_slash_command_routes_after_native_commands() {
     app.cursor = app.input.len();
 
     assert!(app.native_command_panel_height() > 0);
-    assert!(app.handle_native_command_key(KeyCode::Tab, KeyModifiers::NONE, None));
-    assert_eq!(app.input, "/permission ");
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    assert_eq!(app.input, "/permission");
+    assert_eq!(app.native_command_panel_height(), 0);
+    assert_eq!(app.visible_input_panel(), Some(0));
     assert!(!app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
     let PluginKeyRoute::Input(input) = app.route_plugin_key(KeyCode::Enter, KeyModifiers::NONE)
     else {
@@ -2144,7 +2146,7 @@ fn plugin_slash_command_routes_after_native_commands() {
     app.input = "/reasoning".into();
     app.cursor = app.input.len();
     assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
-    assert!(app.native_command.reasoning_dialog.is_some());
+    assert!(app.native_command.reasoning_panel.is_some());
 }
 
 /// 验证会话摘要查询按标题过滤并返回 UI 契约状态。
