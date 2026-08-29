@@ -845,7 +845,7 @@ impl App {
 
     /// 按独占 Input 视图可见性冻结或恢复主事件区。
     ///
-    /// 首次显示时固定正文、思考与工具消息的完整渲染状态；周期刷新不会覆盖已有快照。
+    /// 首次显示时固定正文、思考阶段与工具消息的完整渲染状态；周期刷新不会覆盖已有快照。
     /// 视图隐藏后只清除快照，后台已经完成的事件会在下一帧一次性显示。
     #[cfg(feature = "plugins")]
     pub(crate) fn sync_main_event_snapshot(&mut self) {
@@ -854,8 +854,7 @@ impl App {
                 self.main_event_snapshot = Some(MainEventSnapshot {
                     messages: self.messages.clone(),
                     streaming_message: self.streaming_message,
-                    model_thinking: self.model_thinking.clone(),
-                    model_thinking_index: self.model_thinking_index,
+                    model_is_thinking: self.model_is_thinking,
                 });
             }
         } else {

@@ -146,7 +146,7 @@ impl App {
         self.run_started_at = Some(std::time::Instant::now());
         self.streaming_message = None;
         self.run_stream_cancelled = false;
-        self.model_thinking.clear();
+        self.model_is_thinking = false;
         self.scroll = None;
 
         let agent = Arc::clone(agent);
@@ -182,15 +182,19 @@ impl App {
     /// 开始一个新的模型响应轮次，后续增量会写入新的助手消息。
     pub(crate) fn start_model_response(&mut self) {
         self.streaming_message = None;
-        self.model_thinking.clear();
-        self.model_thinking_index = self.messages.len();
+        self.model_is_thinking = false;
     }
 
-    /// 将模型公开的推理摘要增量追加到当前运行态展示，不写入消息或持久会话。
-    pub(crate) fn append_model_thinking(&mut self, delta: &str) {
+    /// 标记模型进入思考阶段；推理摘要文本不会进入界面、消息或持久会话。
+    pub(crate) fn mark_model_thinking(&mut self) {
         if self.accepts_run_stream_output() {
-            self.model_thinking.push_str(delta);
+            self.model_is_thinking = true;
         }
+    }
+
+    /// 标记模型离开思考阶段，正文生成和工具执行都会调用该状态切换。
+    pub(crate) fn finish_model_thinking(&mut self) {
+        self.model_is_thinking = false;
     }
 
     /// 将文本增量追加到当前助手消息；不改动滚动位置，用户回看历史时不被拉回底部。
@@ -198,6 +202,7 @@ impl App {
         if delta.is_empty() || !self.accepts_run_stream_output() {
             return;
         }
+        self.finish_model_thinking();
         let index = self.streaming_message.unwrap_or_else(|| {
             self.messages
                 .push(Msg::new(MsgKind::Assistant, String::new()));
@@ -235,6 +240,7 @@ impl App {
         let preserve_visible_history = run.is_none() && error.is_some();
         self.running = false;
         self.run_started_at = None;
+        self.model_is_thinking = false;
         let queued_run = std::mem::take(&mut self.queued_run_active);
         if queued_run && input_committed {
             let committed_input = self

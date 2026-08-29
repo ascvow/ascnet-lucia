@@ -82,10 +82,8 @@ pub(crate) struct MainEventSnapshot {
     pub(crate) messages: Vec<Msg>,
     /// 快照建立时正在接收增量的助手消息索引。
     pub(crate) streaming_message: Option<usize>,
-    /// 快照建立时已经公开显示的思考摘要。
-    pub(crate) model_thinking: String,
-    /// 思考摘要在主事件列表中的插入位置。
-    pub(crate) model_thinking_index: usize,
+    /// 快照建立时模型是否处于思考阶段。
+    pub(crate) model_is_thinking: bool,
 }
 
 pub(crate) struct App {
@@ -133,10 +131,8 @@ pub(crate) struct App {
     pub(crate) streaming_message: Option<usize>,
     /// 用户取消当前运行后立即关闭可见流，防止已排队的模型或工具增量继续刷新界面。
     pub(crate) run_stream_cancelled: bool,
-    /// 最近模型轮次的可见推理摘要；下一轮开始或切换会话时清除，且永不进入 Session。
-    pub(crate) model_thinking: String,
-    /// 当前思考摘要在消息列表中的插入位置，用于保持模型轮次内的事件顺序。
-    pub(crate) model_thinking_index: usize,
+    /// 当前模型是否处于思考阶段；仅控制状态文案，不保存推理摘要文本。
+    pub(crate) model_is_thinking: bool,
     /// 独占 Input 视图可见期间使用的主事件区快照；隐藏后恢复实时状态。
     #[cfg(feature = "plugins")]
     pub(crate) main_event_snapshot: Option<MainEventSnapshot>,
@@ -362,8 +358,7 @@ impl App {
             spinner_frame: 0,
             streaming_message: None,
             run_stream_cancelled: false,
-            model_thinking: String::new(),
-            model_thinking_index: 0,
+            model_is_thinking: false,
             #[cfg(feature = "plugins")]
             main_event_snapshot: None,
             scroll: None,
@@ -489,7 +484,7 @@ impl App {
         self.queued_inputs.clear();
         self.streaming_message = None;
         self.run_stream_cancelled = false;
-        self.model_thinking.clear();
+        self.model_is_thinking = false;
         #[cfg(feature = "plugins")]
         {
             self.main_event_snapshot = None;

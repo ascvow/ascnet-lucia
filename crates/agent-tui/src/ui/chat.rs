@@ -22,31 +22,28 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let input_rows = desired_input_rows.min(workspace.height.saturating_sub(5).clamp(1, 6));
     let input_height = input_rows + 2;
     #[cfg(feature = "plugins")]
-    let (timeline_messages, timeline_streaming_message, timeline_thinking, timeline_thinking_index) =
+    let (timeline_messages, timeline_streaming_message, timeline_is_thinking) =
         app.main_event_snapshot.as_ref().map_or_else(
             || {
                 (
                     app.messages.as_slice(),
                     app.streaming_message,
-                    app.model_thinking.as_str(),
-                    app.model_thinking_index,
+                    app.model_is_thinking,
                 )
             },
             |snapshot| {
                 (
                     snapshot.messages.as_slice(),
                     snapshot.streaming_message,
-                    snapshot.model_thinking.as_str(),
-                    snapshot.model_thinking_index,
+                    snapshot.model_is_thinking,
                 )
             },
         );
     #[cfg(not(feature = "plugins"))]
-    let (timeline_messages, timeline_streaming_message, timeline_thinking, timeline_thinking_index) = (
+    let (timeline_messages, timeline_streaming_message, timeline_is_thinking) = (
         app.messages.as_slice(),
         app.streaming_message,
-        app.model_thinking.as_str(),
-        app.model_thinking_index,
+        app.model_is_thinking,
     );
     let native_panel_height = app.native_command_panel_height();
     #[cfg(feature = "plugins")]
@@ -93,23 +90,22 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         render_hero(frame, chat_area, &cwd_display);
     } else {
         let inner_width = chat_area.width.max(1);
-        let show_thinking = !timeline_thinking.is_empty();
-        let thinking_index = timeline_thinking_index.min(timeline_messages.len());
         let mut lines = Vec::new();
         for (index, message) in timeline_messages.iter().enumerate() {
-            if show_thinking && index == thinking_index {
-                lines.extend(thinking_message_lines(timeline_thinking));
-            }
             lines.extend(message.to_lines(timeline_streaming_message == Some(index), inner_width));
-        }
-        if show_thinking && thinking_index == timeline_messages.len() {
-            lines.extend(thinking_message_lines(timeline_thinking));
         }
         if app.running && timeline_streaming_message.is_none() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
             let mut spans = vec![
                 Span::styled(format!("{spinner} "), Style::new().fg(COLOR_WARNING)),
-                Span::styled("Working...", Style::new().fg(COLOR_MUTED)),
+                Span::styled(
+                    if timeline_is_thinking {
+                        "Thinking..."
+                    } else {
+                        "Working..."
+                    },
+                    Style::new().fg(COLOR_MUTED),
+                ),
             ];
             // 运行耗时随 UI tick 刷新，长任务时可感知进展。
             if let Some(started) = app.run_started_at {
@@ -363,32 +359,6 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             plugin_area,
         );
     }
-}
-
-/// 将运行期思考整理为主事件列表内的 `thinking(content)` 行。
-///
-/// 低对比度斜体用于区别最终回答；末尾空行保持与下一条正文或工具事件的视觉边界。
-fn thinking_message_lines(thinking: &str) -> Vec<Line<'_>> {
-    let line_count = thinking.lines().count();
-    let mut lines = thinking
-        .lines()
-        .enumerate()
-        .map(|(index, text)| {
-            let prefix = if index == 0 {
-                "  thinking("
-            } else {
-                "           "
-            };
-            let suffix = if index + 1 == line_count { ")" } else { "" };
-            Line::from(vec![
-                Span::styled(prefix, Style::new().fg(COLOR_MUTED).italic()),
-                Span::styled(text, Style::new().fg(COLOR_MUTED).italic()),
-                Span::styled(suffix, Style::new().fg(COLOR_MUTED).italic()),
-            ])
-        })
-        .collect::<Vec<_>>();
-    lines.push(Line::default());
-    lines
 }
 
 /// 按 Ratatui `Wrap { trim: false }` 的词边界行为计算单个逻辑行的视觉行数。

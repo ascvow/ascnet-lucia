@@ -319,14 +319,14 @@ fn escape_immediately_stops_visible_stream_deltas() {
     let agent = Arc::new(Agent::new(gateway, options));
     app.running = true;
     app.append_model_delta("取消前");
-    app.append_model_thinking("思考前");
+    app.mark_model_thinking();
 
     app.handle_key(KeyCode::Esc, KeyModifiers::NONE, Some(&agent));
     app.append_model_delta("取消后");
-    app.append_model_thinking("思考后");
+    app.mark_model_thinking();
 
     assert_eq!(app.messages[0].text, "取消前");
-    assert_eq!(app.model_thinking, "思考前");
+    assert!(app.model_is_thinking);
 }
 
 /// 独占审批视图可见时必须冻结整个主事件区，隐藏后一次性显示期间积累的事件。
@@ -339,7 +339,7 @@ fn visible_permission_input_freezes_main_event_timeline() {
     let mut app = App::new(tx, "测试模型".into());
     app.running = true;
     app.append_model_delta("审批前");
-    app.append_model_thinking("思考前");
+    app.mark_model_thinking();
     let mut approval = test_plugin_view(UiPlacement::Input, "Permission");
     approval.frame.as_mut().expect("审批帧应存在").visible = false;
     app.plugin_views.push(approval);
@@ -364,7 +364,8 @@ fn visible_permission_input_freezes_main_event_timeline() {
     );
 
     app.append_model_delta("审批中正文");
-    app.append_model_thinking("审批中思考");
+    app.mark_model_thinking();
+    app.finish_model_thinking();
     app.messages.push(Msg::tool_started(ToolCall::new(
         "call-during-approval",
         "审批期间工具",
@@ -388,6 +389,12 @@ fn visible_permission_input_freezes_main_event_timeline() {
     assert!(!frozen.contains("审批中正文"), "{frozen:?}");
     assert!(!frozen.contains("审批中思考"), "{frozen:?}");
     assert!(!frozen.contains("审批期间工具"), "{frozen:?}");
+    assert!(
+        app.main_event_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.model_is_thinking),
+        "审批期间必须保留冻结时的思考阶段"
+    );
     assert_eq!(app.messages.len(), 2, "后台事件仍应更新真实状态");
 
     apply_plugin_frames(
@@ -419,8 +426,10 @@ fn visible_permission_input_freezes_main_event_timeline() {
         .filter(|character| !character.is_whitespace() && *character != '▌')
         .collect::<String>();
     assert!(resumed.contains("审批中正文"), "{resumed:?}");
-    assert!(resumed.contains("审批中思考"), "{resumed:?}");
+    assert!(!resumed.contains("审批中思考"), "{resumed:?}");
     assert!(resumed.contains("审批期间工具"), "{resumed:?}");
+    assert!(resumed.contains("Working..."), "{resumed:?}");
+    assert!(!resumed.contains("Thinking..."), "{resumed:?}");
 }
 
 /// 审批视图隐藏后必须归还主输入焦点，避免下一次 Esc 被旧插件焦点吞掉。

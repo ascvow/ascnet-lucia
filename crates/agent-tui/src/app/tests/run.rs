@@ -233,21 +233,21 @@ fn streamed_deltas_update_one_assistant_message() {
     assert!(app.streaming_message.is_none());
 }
 
-/// 推理摘要在运行结束后保留展示，只在新轮次开始时清除，且始终不写入消息。
+/// 推理增量只切换运行阶段，不保存摘要文本，并在正文、下一轮或运行结束时复位。
 #[test]
-fn thinking_deltas_are_ephemeral_run_state() {
+fn thinking_deltas_only_toggle_run_phase() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.running = true;
-    app.append_model_thinking("先检查");
-    app.append_model_thinking("权限边界");
+    app.mark_model_thinking();
+    app.mark_model_thinking();
 
-    assert_eq!(app.model_thinking, "先检查权限边界");
+    assert!(app.model_is_thinking);
     assert!(app.messages.is_empty());
     app.start_model_response();
-    assert!(app.model_thinking.is_empty());
+    assert!(!app.model_is_thinking);
 
-    app.append_model_thinking("重新分析");
+    app.mark_model_thinking();
     app.handle_agent_done(AgentCompletion {
         run: None,
         session_record: app.session_record.clone(),
@@ -256,11 +256,11 @@ fn thinking_deltas_are_ephemeral_run_state() {
         queue_may_advance: true,
         input: String::new().into(),
     });
-    assert_eq!(app.model_thinking, "重新分析");
+    assert!(!app.model_is_thinking);
     assert!(app.messages.is_empty());
 
     app.start_model_response();
-    assert!(app.model_thinking.is_empty());
+    assert!(!app.model_is_thinking);
 }
 
 /// 高频模型增量只排队一个 UI 通知，消费后才能创建下一次通知。

@@ -669,10 +669,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     .expect("推理摘要增量缓冲区锁不应中毒")
                     .take();
                 if !delta.is_empty() {
-                    app.append_model_thinking(&delta);
+                    app.mark_model_thinking();
                 }
             }
             Some(UiEvent::ToolStarted(call)) => {
+                app.finish_model_thinking();
                 #[cfg(feature = "plugins")]
                 let call_id = call.id.clone();
                 app.messages.push(Msg::tool_started(call));
