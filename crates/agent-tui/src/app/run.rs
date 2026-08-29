@@ -183,6 +183,7 @@ impl App {
     pub(crate) fn start_model_response(&mut self) {
         self.streaming_message = None;
         self.model_thinking.clear();
+        self.model_thinking_index = self.messages.len();
     }
 
     /// 将模型公开的推理摘要增量追加到当前运行态展示，不写入消息或持久会话。

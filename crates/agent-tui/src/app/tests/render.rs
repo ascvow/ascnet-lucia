@@ -138,15 +138,16 @@ fn render_adapts_to_running_state_and_narrow_width() {
     assert!(!text.contains("ascnet-lucia"), "{text:?}");
 }
 
-/// 当前运行收到推理摘要后必须显示独立灰色“思考”区域，不能伪装成助手回复。
+/// 当前运行收到推理摘要后必须按 `thinking(content)` 插入正文时间线，并保持弱化样式。
 #[test]
-fn render_shows_ephemeral_reasoning_summary() {
+fn render_shows_reasoning_inside_message_timeline() {
     let backend = TestBackend::new(80, 18);
     let mut terminal = Terminal::new(backend).expect("创建推理摘要测试终端");
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.running = true;
     app.messages.push(Msg::new(MsgKind::User, "检查任务"));
+    app.start_model_response();
     app.model_thinking = "正在核对权限边界".into();
 
     terminal
@@ -171,18 +172,24 @@ fn render_shows_ephemeral_reasoning_summary() {
     let thinking_row = rows
         .iter()
         .position(|row| row.contains("正在核对权限边界"))
-        .expect("思考区应可见");
+        .expect("正文时间线内的思考应可见");
     let thinking_x = (0..buffer.area.width)
         .find(|x| buffer[(*x, thinking_row as u16)].symbol() == "正")
         .expect("思考内容应存在灰色单元格");
 
-    assert!(text.contains("思考"), "{text:?}");
-    assert!(text.contains("正在核对权限边界"), "{text:?}");
+    assert!(text.contains("thinking(正在核对权限边界)"), "{text:?}");
+    assert!(!text.contains("思考正在核对权限边界"), "{text:?}");
     assert!(message_row < thinking_row, "{rows:?}");
     assert_eq!(
         buffer[(thinking_x, thinking_row as u16)].fg,
         COLOR_MUTED,
         "思考内容必须使用低对比灰色"
+    );
+    assert!(
+        buffer[(thinking_x, thinking_row as u16)]
+            .modifier
+            .contains(Modifier::ITALIC),
+        "思考内容必须使用斜体区别于正文"
     );
     assert_eq!(
         app.messages
@@ -193,10 +200,10 @@ fn render_shows_ephemeral_reasoning_summary() {
     );
 }
 
-/// 思考必须独立于正文滚动，并固定显示在正文与任务面板之间。
+/// 思考必须进入正文滚动范围，向上翻阅历史时不能继续悬浮在任务面板上方。
 #[cfg(feature = "plugins")]
 #[test]
-fn reasoning_section_stays_between_scrolled_chat_and_task_panel() {
+fn reasoning_scrolls_with_message_timeline() {
     let backend = TestBackend::new(80, 28);
     let mut terminal = Terminal::new(backend).expect("创建思考布局测试终端");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -204,7 +211,8 @@ fn reasoning_section_stays_between_scrolled_chat_and_task_panel() {
     app.running = true;
     app.messages
         .extend((0..20).map(|index| Msg::new(MsgKind::User, format!("正文定位 {index}"))));
-    app.model_thinking = "独立思考定位".into();
+    app.start_model_response();
+    app.model_thinking = "随正文滚动的思考".into();
     app.scroll = Some(0);
     let mut tasks = test_plugin_view(UiPlacement::ComposerShelf, "任务");
     tasks.frame.as_mut().expect("任务帧应存在").lines[0].spans[0].text = "任务面板定位".into();
@@ -212,7 +220,7 @@ fn reasoning_section_stays_between_scrolled_chat_and_task_panel() {
 
     terminal
         .draw(|frame| render_root(frame, &mut app))
-        .expect("渲染思考与任务面板");
+        .expect("渲染正文内思考与任务面板");
     let buffer = terminal.backend().buffer();
     let rows = (0..buffer.area.height)
         .map(|y| {
@@ -228,29 +236,29 @@ fn reasoning_section_stays_between_scrolled_chat_and_task_panel() {
         .iter()
         .position(|row| row.contains("正文定位0"))
         .expect("上翻后的正文应可见");
-    let thinking_row = rows
-        .iter()
-        .position(|row| row.contains("独立思考定位"))
-        .expect("上翻正文时思考仍应可见");
     let task_row = rows
         .iter()
         .position(|row| row.contains("任务面板定位"))
         .expect("任务面板应可见");
 
-    assert!(body_row < thinking_row, "{rows:?}");
-    assert!(thinking_row < task_row, "{rows:?}");
+    assert!(body_row < task_row, "{rows:?}");
+    assert!(
+        !rows.iter().any(|row| row.contains("随正文滚动的思考")),
+        "上翻正文后，末尾思考不应悬浮显示：{rows:?}"
+    );
 }
 
-/// 长思考只展示末尾四行，不能持续挤压正文和输入区。
+/// 长思考必须作为完整正文内容参与滚动，不能只保留独立视口中的末尾四行。
 #[test]
-fn reasoning_section_caps_height_and_keeps_latest_lines() {
-    let backend = TestBackend::new(80, 24);
+fn long_reasoning_uses_message_timeline_scrolling() {
+    let backend = TestBackend::new(80, 18);
     let mut terminal = Terminal::new(backend).expect("创建长思考测试终端");
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.running = true;
     app.messages.push(Msg::new(MsgKind::User, "正文保留"));
-    app.model_thinking = (0..10)
+    app.start_model_response();
+    app.model_thinking = (0..20)
         .map(|index| format!("思考阶段{index}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -258,26 +266,45 @@ fn reasoning_section_caps_height_and_keeps_latest_lines() {
     terminal
         .draw(|frame| render_root(frame, &mut app))
         .expect("渲染长思考");
-    let buffer = terminal.backend().buffer();
-    let rows = (0..buffer.area.height)
+    let latest_rows = (0..terminal.backend().buffer().area.height)
         .map(|y| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
+            (0..terminal.backend().buffer().area.width)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
                 .collect::<String>()
                 .chars()
                 .filter(|character| !character.is_whitespace())
                 .collect::<String>()
         })
         .collect::<Vec<_>>();
-    let visible_thinking_rows = rows.iter().filter(|row| row.contains("思考阶段")).count();
-
-    assert!(rows.iter().any(|row| row.contains("正文保留")), "{rows:?}");
+    assert!(app.last_max_scroll > 0);
     assert!(
-        !rows.iter().any(|row| row.contains("思考阶段0")),
-        "{rows:?}"
+        latest_rows.iter().any(|row| row.contains("思考阶段19")),
+        "{latest_rows:?}"
     );
-    assert!(rows.iter().any(|row| row.contains("思考阶段9")), "{rows:?}");
-    assert_eq!(visible_thinking_rows, 4);
+
+    app.scroll = Some(0);
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("向上滚动长思考");
+    let earliest_rows = (0..terminal.backend().buffer().area.height)
+        .map(|y| {
+            (0..terminal.backend().buffer().area.width)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        earliest_rows.iter().any(|row| row.contains("正文保留")),
+        "{earliest_rows:?}"
+    );
+    assert!(
+        earliest_rows.iter().any(|row| row.contains("思考阶段0")),
+        "{earliest_rows:?}"
+    );
 }
 
 /// 验证工具行展示参数与返回内容摘要，且过长内容按显示宽度截断。

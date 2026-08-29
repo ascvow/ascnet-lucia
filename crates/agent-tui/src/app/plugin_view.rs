@@ -855,6 +855,7 @@ impl App {
                     messages: self.messages.clone(),
                     streaming_message: self.streaming_message,
                     model_thinking: self.model_thinking.clone(),
+                    model_thinking_index: self.model_thinking_index,
                 });
             }
         } else {

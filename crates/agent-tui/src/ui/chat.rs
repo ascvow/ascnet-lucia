@@ -13,9 +13,6 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::collections::VecDeque;
 
-/// 思考区最多占用的视觉行数，避免长推理挤压正文和输入区。
-const MAX_THINKING_HEIGHT: u16 = 4;
-
 /// 在插件占用后的中心区域渲染 Lucia 主界面。
 pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     // 输入区随逻辑行数在一至六行间增长，边框额外占两行。
@@ -25,13 +22,14 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let input_rows = desired_input_rows.min(workspace.height.saturating_sub(5).clamp(1, 6));
     let input_height = input_rows + 2;
     #[cfg(feature = "plugins")]
-    let (timeline_messages, timeline_streaming_message, timeline_thinking) =
+    let (timeline_messages, timeline_streaming_message, timeline_thinking, timeline_thinking_index) =
         app.main_event_snapshot.as_ref().map_or_else(
             || {
                 (
                     app.messages.as_slice(),
                     app.streaming_message,
                     app.model_thinking.as_str(),
+                    app.model_thinking_index,
                 )
             },
             |snapshot| {
@@ -39,27 +37,17 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                     snapshot.messages.as_slice(),
                     snapshot.streaming_message,
                     snapshot.model_thinking.as_str(),
+                    snapshot.model_thinking_index,
                 )
             },
         );
     #[cfg(not(feature = "plugins"))]
-    let (timeline_messages, timeline_streaming_message, timeline_thinking) = (
+    let (timeline_messages, timeline_streaming_message, timeline_thinking, timeline_thinking_index) = (
         app.messages.as_slice(),
         app.streaming_message,
         app.model_thinking.as_str(),
+        app.model_thinking_index,
     );
-    let thinking_lines = if app.running && !timeline_thinking.is_empty() {
-        thinking_section_lines(timeline_thinking)
-    } else {
-        Vec::new()
-    };
-    let thinking_width = workspace.width.saturating_sub(2).max(1);
-    let desired_thinking_height = thinking_lines
-        .iter()
-        .fold(0u16, |height, line| {
-            height.saturating_add(wrapped_line_count(line, thinking_width))
-        })
-        .min(MAX_THINKING_HEIGHT);
     let native_panel_height = app.native_command_panel_height();
     #[cfg(feature = "plugins")]
     let plugin_panel_height = app.composer_panel_height();
@@ -73,23 +61,15 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let panel_height = native_panel_height
         .saturating_add(plugin_panel_height)
         .min(supplemental_height);
-    let thinking_height =
-        desired_thinking_height.min(supplemental_height.saturating_sub(panel_height));
     let sections = Layout::vertical([
         Constraint::Min(4),
-        Constraint::Length(thinking_height),
         Constraint::Length(panel_height),
         Constraint::Length(input_height),
         Constraint::Length(1),
     ])
     .split(workspace);
-    let (chat_section, thinking_section, panel_section, input_section, footer_section) = (
-        sections[0],
-        sections[1],
-        sections[2],
-        sections[3],
-        sections[4],
-    );
+    let (chat_section, panel_section, input_section, footer_section) =
+        (sections[0], sections[1], sections[2], sections[3]);
 
     // 消息流不使用容器边框，长文交给自动换行控制。
     let chat_area = chat_section.inner(Margin {
@@ -113,13 +93,18 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         render_hero(frame, chat_area, &cwd_display);
     } else {
         let inner_width = chat_area.width.max(1);
-        let mut lines: Vec<Line> = timeline_messages
-            .iter()
-            .enumerate()
-            .flat_map(|(index, message)| {
-                message.to_lines(timeline_streaming_message == Some(index), inner_width)
-            })
-            .collect();
+        let show_thinking = app.running && !timeline_thinking.is_empty();
+        let thinking_index = timeline_thinking_index.min(timeline_messages.len());
+        let mut lines = Vec::new();
+        for (index, message) in timeline_messages.iter().enumerate() {
+            if show_thinking && index == thinking_index {
+                lines.extend(thinking_message_lines(timeline_thinking));
+            }
+            lines.extend(message.to_lines(timeline_streaming_message == Some(index), inner_width));
+        }
+        if show_thinking && thinking_index == timeline_messages.len() {
+            lines.extend(thinking_message_lines(timeline_thinking));
+        }
         if app.running && timeline_streaming_message.is_none() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
             let mut spans = vec![
@@ -186,23 +171,6 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                 );
             }
         }
-    }
-
-    if thinking_height > 0 {
-        // 思考使用独立视口并自动滚到末尾，长推理不会进入正文滚动范围。
-        let thinking_area = thinking_section.inner(Margin {
-            horizontal: 1,
-            vertical: 0,
-        });
-        let wrapped_height = thinking_lines.iter().fold(0u16, |height, line| {
-            height.saturating_add(wrapped_line_count(line, thinking_area.width.max(1)))
-        });
-        frame.render_widget(
-            Paragraph::new(thinking_lines)
-                .wrap(Wrap { trim: false })
-                .scroll((wrapped_height.saturating_sub(thinking_area.height), 0)),
-            thinking_area,
-        );
     }
 
     if panel_height > 0 {
@@ -397,21 +365,30 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     }
 }
 
-/// 将运行期思考整理为低对比度行；首行携带紧凑标签，内容不会写入会话消息。
-fn thinking_section_lines(thinking: &str) -> Vec<Line<'_>> {
-    thinking
+/// 将运行期思考整理为主事件列表内的 `thinking(content)` 行。
+///
+/// 低对比度斜体用于区别最终回答；末尾空行保持与下一条正文或工具事件的视觉边界。
+fn thinking_message_lines(thinking: &str) -> Vec<Line<'_>> {
+    let line_count = thinking.lines().count();
+    let mut lines = thinking
         .lines()
         .enumerate()
         .map(|(index, text)| {
+            let prefix = if index == 0 {
+                "  thinking("
+            } else {
+                "           "
+            };
+            let suffix = if index + 1 == line_count { ")" } else { "" };
             Line::from(vec![
-                Span::styled(
-                    if index == 0 { "思考  " } else { "      " },
-                    Style::new().fg(COLOR_MUTED).bold(),
-                ),
+                Span::styled(prefix, Style::new().fg(COLOR_MUTED).italic()),
                 Span::styled(text, Style::new().fg(COLOR_MUTED).italic()),
+                Span::styled(suffix, Style::new().fg(COLOR_MUTED).italic()),
             ])
         })
-        .collect()
+        .collect::<Vec<_>>();
+    lines.push(Line::default());
+    lines
 }
 
 /// 按 Ratatui `Wrap { trim: false }` 的词边界行为计算单个逻辑行的视觉行数。

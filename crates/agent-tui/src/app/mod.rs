@@ -84,6 +84,8 @@ pub(crate) struct MainEventSnapshot {
     pub(crate) streaming_message: Option<usize>,
     /// 快照建立时已经公开显示的思考摘要。
     pub(crate) model_thinking: String,
+    /// 思考摘要在主事件列表中的插入位置。
+    pub(crate) model_thinking_index: usize,
 }
 
 pub(crate) struct App {
@@ -133,6 +135,8 @@ pub(crate) struct App {
     pub(crate) run_stream_cancelled: bool,
     /// 当前模型轮次正在流式返回的可见推理摘要；运行结束后清除且不进入 Session。
     pub(crate) model_thinking: String,
+    /// 当前思考摘要在消息列表中的插入位置，用于保持模型轮次内的事件顺序。
+    pub(crate) model_thinking_index: usize,
     /// 独占 Input 视图可见期间使用的主事件区快照；隐藏后恢复实时状态。
     #[cfg(feature = "plugins")]
     pub(crate) main_event_snapshot: Option<MainEventSnapshot>,
@@ -359,6 +363,7 @@ impl App {
             streaming_message: None,
             run_stream_cancelled: false,
             model_thinking: String::new(),
+            model_thinking_index: 0,
             #[cfg(feature = "plugins")]
             main_event_snapshot: None,
             scroll: None,
