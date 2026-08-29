@@ -76,7 +76,23 @@ wasmtime = { version = "46", features = ["component-model", "async"] }
 wasmtime-wasi = "46"
 wit-bindgen = "0.59"
 
-# 发布产物优先控制分发体积；调试构建保留完整符号，不能用于打包。
+# 开发与测试构建只为工作区代码保留行号，第三方依赖不生成调试符号。
+# 关闭增量编译可避免频繁切换 feature 和测试目标后长期积累历史缓存。
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test]
+debug = 1
+incremental = false
+
+[profile.test.package."*"]
+debug = 0
+
+# 发布产物优先控制分发体积，不能使用调试 profile 打包。
 [profile.release]
 codegen-units = 1
 opt-level = "s"

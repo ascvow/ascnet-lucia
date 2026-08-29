@@ -37,3 +37,16 @@ Host 微基准标记为 `informational_only`，不会自行判定回归。共享
 拆分 `activate` 或外部服务初始化的长尾插件。
 
 Host 默认通过 Wasmtime fuel 限制单次 guest 计算，并将单个线性内存限制为 `64 MiB`。性能结果只覆盖框架路由；插件作者仍需为网络、进程、文件扫描和 TUI 渲染分别设置预算，并避免在 Agent 同步调用路径中执行无界工作。
+
+## 构建缓存
+
+仓库内插件与宿主共享根 `target` 目录；插件构建脚本只把最终 WASM 文件复制到对应插件目录，不会为每个插件重复保存依赖缓存。开发和测试 profile 关闭增量编译，只为工作区代码保留行号，并关闭第三方依赖调试符号，避免频繁切换 feature、测试目标和历史 crate 图后持续积累完整调试产物。
+
+长期开发后可以先查看 debug profile 将删除的内容，再清理可重新生成的缓存：
+
+```bash
+bun run cache:clean:debug:dry-run
+bun run cache:clean:debug
+```
+
+该命令只清理 debug profile，不删除 release TUI 或 `wasm32-wasip2` release 插件产物。清理后的第一次开发构建需要重新编译依赖。
