@@ -434,6 +434,43 @@ fn agent_with_script(responses: Vec<ModelResponse>) -> Agent {
     )
 }
 
+/// 只返回空正文且没有工具调用的模型响应必须自动纠偏一次，不能静默结束会话。
+#[tokio::test]
+async fn empty_model_response_retries_once() {
+    let agent = agent_with_script(vec![ModelResponse::text("  "), ModelResponse::text("完成")]);
+
+    let run = agent
+        .run("检查项目")
+        .await
+        .expect("第二次模型响应应完成运行");
+
+    assert_eq!(run.final_text, "完成");
+    assert_eq!(run.steps_used, 2);
+    assert_eq!(run.session.messages().len(), 2);
+    assert_eq!(
+        run.session.messages()[0].role,
+        crate::model::MessageRole::User
+    );
+    assert_eq!(
+        run.session.messages()[1].role,
+        crate::model::MessageRole::Assistant
+    );
+    assert_eq!(run.session.last_assistant_text(), "完成");
+}
+
+/// 连续空响应必须形成可见失败，避免无限重试或伪装成成功完成。
+#[tokio::test]
+async fn repeated_empty_model_response_fails_explicitly() {
+    let agent = agent_with_script(vec![ModelResponse::text(""), ModelResponse::text("\n")]);
+
+    let error = agent.run("检查项目").await.expect_err("连续空响应必须失败");
+
+    assert!(error
+        .to_string()
+        .contains("连续两次未返回可见正文或工具调用"));
+    assert_eq!(agent.state().phase, AgentPhase::Failed);
+}
+
 /// 共享 Agent 的动态推理等级应从下一次模型请求开始生效。
 #[tokio::test]
 async fn dynamic_reasoning_level_updates_next_request() {

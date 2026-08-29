@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// 模型只返回思考摘要时使用的一次性纠偏提示；该提示只参与下一次请求，不写入会话。
+const EMPTY_RESPONSE_RECOVERY_PROMPT: &str =
+    "上一轮模型响应没有返回可见正文或工具调用。请继续处理原始用户请求；需要工具时立即调用工具，否则直接给出完整答复。";
+
 /// 把工具同步输出回调转发到当前异步运行循环。
 struct ToolOutputChannel(tokio::sync::mpsc::UnboundedSender<ToolOutputDelta>);
 
@@ -154,6 +158,7 @@ impl Agent {
 
         let mut step = 0;
         let mut steps_since_user_input = 0;
+        let mut recovering_empty_response = false;
         let max_steps = self.effective_max_steps();
         while max_steps == 0 || steps_since_user_input < max_steps {
             self.update_state(|state| {
@@ -176,6 +181,12 @@ impl Agent {
             let tools = self.tool_specs().await?;
             // 扩展提示不会写入会话，但必须参与每次请求的上下文加载和清洗。
             let mut source_messages = self.extension.prompt_messages().await?;
+            if recovering_empty_response {
+                source_messages.push(crate::model::ModelMessage::text(
+                    crate::model::MessageRole::Developer,
+                    EMPTY_RESPONSE_RECOVERY_PROMPT,
+                ));
+            }
             source_messages.extend(session.model_messages());
             let loaded_context = self
                 .context_loader
@@ -312,9 +323,13 @@ impl Agent {
             let response = model_stream.result().await?;
             let response_text = response.text_content();
             let tool_calls = response.tool_calls.clone();
+            let finish_reason = response.finish_reason.clone();
+            let empty_response = response_text.trim().is_empty() && tool_calls.is_empty();
             let usage = response.usage.clone();
             let provider_billing = response.billing.clone();
-            session.push_assistant_blocks(response.content.clone());
+            if !empty_response {
+                session.push_assistant_blocks(response.content.clone());
+            }
             self.update_state(|state| {
                 state.session = session.clone();
                 state.streamed_text.clear();
@@ -359,6 +374,21 @@ impl Agent {
                 )
                 .await?;
             }
+
+            if empty_response {
+                self.emit(&run_id, AgentEventKind::TurnFinished, step, json!({}))
+                    .await?;
+                if recovering_empty_response {
+                    return Err(anyhow!(
+                        "模型连续两次未返回可见正文或工具调用，最后停止原因：{finish_reason:?}"
+                    ));
+                }
+                // 空响应不计入 ReAct 工具步数，但模型调用序号继续递增；单次重试上限避免死循环。
+                recovering_empty_response = true;
+                step += 1;
+                continue;
+            }
+            recovering_empty_response = false;
 
             if tool_calls.is_empty() {
                 let final_text = if response_text.is_empty() {
