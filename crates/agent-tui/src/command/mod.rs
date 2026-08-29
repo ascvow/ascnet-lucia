@@ -53,11 +53,11 @@ struct SlashCommandMatch {
 /// Lucia 默认提供的全部斜杠命令。
 const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
     NativeCommandSpec {
-        name: "help",
+        name: "new",
         aliases: &[],
-        summary: "查看命令帮助",
-        description: "显示全部原生命令，或显示指定命令的详细用法。",
-        idle_only: false,
+        summary: "新建会话",
+        description: "结束当前会话并进入尚未持久化的空白草稿。",
+        idle_only: true,
     },
     NativeCommandSpec {
         name: "resume",
@@ -73,19 +73,11 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
         description: "打开当前项目的会话摘要列表，并切换至选中的完整会话。",
         idle_only: true,
     },
-    #[cfg(feature = "plugins")]
     NativeCommandSpec {
-        name: "plugins",
+        name: "compact",
         aliases: &[],
-        summary: "管理固定插件依赖",
-        description: "打开人工插件管理页；变更创建新基线，当前会话不热重载。",
-        idle_only: true,
-    },
-    NativeCommandSpec {
-        name: "new",
-        aliases: &[],
-        summary: "新建会话",
-        description: "结束当前会话并进入尚未持久化的空白草稿。",
+        summary: "立即压缩上下文",
+        description: "请求当前 Context Loader 压缩旧会话并持久化结果。",
         idle_only: true,
     },
     NativeCommandSpec {
@@ -96,17 +88,25 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
         idle_only: true,
     },
     NativeCommandSpec {
-        name: "compact",
-        aliases: &[],
-        summary: "立即压缩上下文",
-        description: "请求当前 Context Loader 压缩旧会话并持久化结果。",
-        idle_only: true,
-    },
-    NativeCommandSpec {
         name: "reasoning",
         aliases: &["think", "effort", "effo"],
         summary: "查看或切换思考等级",
         description: "用法：/reasoning [off|minimal|low|medium|high|xhigh|max|next]；不带参数时打开等级选择界面。",
+        idle_only: false,
+    },
+    #[cfg(feature = "plugins")]
+    NativeCommandSpec {
+        name: "plugins",
+        aliases: &[],
+        summary: "管理固定插件依赖",
+        description: "打开人工插件管理页；变更创建新基线，当前会话不热重载。",
+        idle_only: true,
+    },
+    NativeCommandSpec {
+        name: "help",
+        aliases: &[],
+        summary: "查看命令帮助",
+        description: "显示全部原生命令，或显示指定命令的详细用法。",
         idle_only: false,
     },
     NativeCommandSpec {
@@ -133,7 +133,7 @@ fn parse_reasoning_level(value: &str) -> Option<ReasoningLevel> {
 }
 
 /// 返回可复制到 `/reasoning` 命令中的稳定英文等级值。
-fn reasoning_level_command_value(level: ReasoningLevel) -> &'static str {
+pub(crate) fn reasoning_level_command_value(level: ReasoningLevel) -> &'static str {
     match level {
         ReasoningLevel::Off => "off",
         ReasoningLevel::Minimal => "minimal",
@@ -275,7 +275,7 @@ impl App {
             }
     }
 
-    /// 返回当前输入匹配的原生命令与插件斜杠触发器，原生命令始终排在前面。
+    /// 返回当前输入匹配的原生命令与插件斜杠触发器，并保持稳定的功能分组顺序。
     fn slash_command_matches(&self) -> Vec<SlashCommandMatch> {
         let Some(rest) = self.input.strip_prefix('/') else {
             return Vec::new();
@@ -296,6 +296,8 @@ impl App {
             })
             .collect::<Vec<_>>();
         #[cfg(feature = "plugins")]
+        let mut plugin_matches = Vec::new();
+        #[cfg(feature = "plugins")]
         for view in &self.plugin_views {
             for trigger in &view.declaration.input_triggers {
                 let Some(name) = trigger.strip_prefix('/') else {
@@ -305,15 +307,27 @@ impl App {
                     || name.contains(char::is_whitespace)
                     || !name.starts_with(rest)
                     || matches.iter().any(|candidate| candidate.name == name)
+                    || plugin_matches
+                        .iter()
+                        .any(|candidate: &SlashCommandMatch| candidate.name == name)
                 {
                     continue;
                 }
-                matches.push(SlashCommandMatch {
+                plugin_matches.push(SlashCommandMatch {
                     name: name.to_string(),
                     summary: view.declaration.title.clone(),
                     native: false,
                 });
             }
+        }
+        #[cfg(feature = "plugins")]
+        {
+            // 插件命令属于扩展操作，固定排在原生插件入口之后、帮助与退出之前。
+            let insertion = matches
+                .iter()
+                .position(|candidate| matches!(candidate.name.as_str(), "help" | "exit"))
+                .unwrap_or(matches.len());
+            matches.splice(insertion..insertion, plugin_matches);
         }
         matches.truncate(MAX_VISIBLE_COMMANDS);
         matches

@@ -4,7 +4,6 @@ use super::*;
 use crate::demo::build_demo_gateway;
 #[cfg(feature = "plugins")]
 use crate::plugin::management::PluginManagementOutcome;
-#[cfg(feature = "plugins")]
 use ratatui::{backend::TestBackend, Terminal};
 use tokio::sync::mpsc;
 
@@ -19,14 +18,14 @@ fn native_registry_contains_default_commands() {
     assert_eq!(
         names,
         vec![
-            "help",
+            "new",
             "resume",
             "sessions",
-            "plugins",
-            "new",
-            "clear",
             "compact",
+            "clear",
             "reasoning",
+            "plugins",
+            "help",
             "exit"
         ]
     );
@@ -34,13 +33,13 @@ fn native_registry_contains_default_commands() {
     assert_eq!(
         names,
         vec![
-            "help",
+            "new",
             "resume",
             "sessions",
-            "new",
-            "clear",
             "compact",
+            "clear",
             "reasoning",
+            "help",
             "exit"
         ]
     );
@@ -48,6 +47,30 @@ fn native_registry_contains_default_commands() {
         NATIVE_COMMANDS.last().expect("应有退出命令").aliases,
         &["quit"]
     );
+}
+
+/// 命令与说明使用固定紧凑间距，不因最长命令扩大整列留白。
+#[test]
+fn slash_panel_uses_compact_command_spacing() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "/".into();
+    let mut terminal = Terminal::new(TestBackend::new(80, 14)).expect("应创建命令面板终端");
+
+    terminal
+        .draw(|frame| render_native_command_panel(frame, &app, frame.area()))
+        .expect("应渲染命令面板");
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    // TestBackend 为全角字符保留空白单元格，因此只比较命令与首个说明字符的间距。
+    assert!(text.contains("/new  新"), "{text}");
+    assert!(!text.contains("/new      新"), "{text}");
 }
 
 /// 空斜杠菜单必须展示完整原生命令，不能因固定高度截掉思考入口。

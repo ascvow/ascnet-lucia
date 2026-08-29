@@ -15,6 +15,31 @@ fn render_shows_visual_hierarchy() {
     assert!(!text.contains("ReAct"), "{text:?}");
 }
 
+/// 底栏只显示稳定英文思考强度，不重复展示“思考”标签。
+#[test]
+fn footer_shows_compact_english_reasoning_level() {
+    let backend = TestBackend::new(100, 16);
+    let mut terminal = Terminal::new(backend).expect("创建底栏思考强度测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into())
+        .with_reasoning_levels(vec![ReasoningLevel::XHigh], ReasoningLevel::XHigh);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染英文思考强度");
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(text.contains("xhigh"), "{text:?}");
+    assert!(!text.contains("思考 xhigh"), "{text:?}");
+    assert!(!text.contains("思考 超高"), "{text:?}");
+}
+
 /// 空会话首屏应在常见终端尺寸内绘制压缩后的彩色像素头像。
 #[test]
 fn empty_session_renders_pixel_portrait() {

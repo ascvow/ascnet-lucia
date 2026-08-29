@@ -1,7 +1,7 @@
 //! 主对话区、输入编辑器、输入面板与状态栏渲染。
 
-use crate::app::{input_ref_spans, reasoning_level_label, App};
-use crate::command::render_native_command_panel;
+use crate::app::{input_ref_spans, App};
+use crate::command::{reasoning_level_command_value, render_native_command_panel};
 use crate::theme::{
     COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_TEXT, COLOR_USER, COLOR_USER_BG,
     COLOR_WARNING, SPINNER,
@@ -319,7 +319,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         Span::styled(app.model_name.as_str(), Style::new().fg(COLOR_TEXT)),
         Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
         Span::styled(
-            format!("思考 {}", reasoning_level_label(app.reasoning_level)),
+            reasoning_level_command_value(app.reasoning_level),
             Style::new().fg(COLOR_MUTED),
         ),
     ];

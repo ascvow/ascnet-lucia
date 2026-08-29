@@ -36,7 +36,7 @@ pub(crate) fn render_native_command_panel(frame: &mut Frame, app: &App, area: Re
                 Style::new().fg(COLOR_MUTED)
             };
             Line::from(vec![
-                Span::styled(format!("/{:<10}", command.name), style),
+                Span::styled(format!("/{}  ", command.name), style),
                 Span::styled(command.summary.clone(), style),
             ])
         })
