@@ -305,13 +305,18 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let mut reasoning_levels = vec![options.reasoning];
     if !demo_mode {
         if let Some(metadata) = tui_settings.model_metadata.as_ref() {
-            if let (Some(configured), Some(limit)) =
-                (options.max_tokens, metadata.max_output_tokens)
-            {
-                if tui_settings.max_tokens_explicit && configured > limit {
-                    return Err(anyhow!(
-                        "配置的 agent.max_tokens {configured} 超过 models.dev 声明的模型输出上限 {limit}"
-                    ));
+            if let Some(limit) = metadata.max_output_tokens {
+                if tui_settings.max_tokens_explicit {
+                    if let Some(configured) = options.max_tokens {
+                        if configured > limit {
+                            return Err(anyhow!(
+                                "配置的 agent.max_tokens {configured} 超过 models.dev 声明的模型输出上限 {limit}"
+                            ));
+                        }
+                    }
+                } else {
+                    // 未显式配置时直接采用 models.dev 声明的输出上限，避免落回服务商默认值。
+                    options.max_tokens = Some(limit);
                 }
             }
             reasoning_levels = metadata.reasoning_levels.clone();
