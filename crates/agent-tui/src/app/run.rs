@@ -272,7 +272,6 @@ impl App {
 
         self.streaming_message = None;
         self.run_stream_cancelled = false;
-        self.model_thinking.clear();
         if let Some(run) = run {
             if run.cancelled {
                 self.messages.push(Msg::new(

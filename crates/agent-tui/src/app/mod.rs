@@ -133,7 +133,7 @@ pub(crate) struct App {
     pub(crate) streaming_message: Option<usize>,
     /// 用户取消当前运行后立即关闭可见流，防止已排队的模型或工具增量继续刷新界面。
     pub(crate) run_stream_cancelled: bool,
-    /// 当前模型轮次正在流式返回的可见推理摘要；运行结束后清除且不进入 Session。
+    /// 最近模型轮次的可见推理摘要；下一轮开始或切换会话时清除，且永不进入 Session。
     pub(crate) model_thinking: String,
     /// 当前思考摘要在消息列表中的插入位置，用于保持模型轮次内的事件顺序。
     pub(crate) model_thinking_index: usize,

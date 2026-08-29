@@ -68,6 +68,7 @@ const RESPONSES_PARAMS_COMPATIBLE: &[&str] = &[
     "instructions",
     "tools",
     "tool_choice",
+    "max_output_tokens",
     "temperature",
     "top_p",
     "stream",

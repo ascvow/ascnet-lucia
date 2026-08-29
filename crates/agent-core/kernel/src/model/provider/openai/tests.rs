@@ -114,20 +114,20 @@ fn allowed_params_official_openai_is_full() {
     assert!(params.contains(&"store"));
 }
 
-/// 非官方 base URL 选择兼容参数白名单，不含 max_output_tokens。
+/// 非官方 Responses 网关也必须保留标准输出上限，避免推理耗尽网关默认额度。
 #[test]
 fn allowed_params_proxy_uses_compatible() {
     let params = responses_allowed_params(&ProviderKind::OpenAi, "https://api.phrolova.uno/v1");
-    assert!(!params.contains(&"max_output_tokens"));
+    assert!(params.contains(&"max_output_tokens"));
     assert!(!params.contains(&"store"));
 }
 
-/// OpenAiCompatible 类型始终使用兼容参数白名单。
+/// OpenAiCompatible 类型使用兼容参数白名单，但仍保留 Responses 标准输出上限。
 #[test]
 fn allowed_params_compatible_kind_uses_compatible() {
     let params =
         responses_allowed_params(&ProviderKind::OpenAiCompatible, "https://localhost:8080/v1");
-    assert!(!params.contains(&"max_output_tokens"));
+    assert!(params.contains(&"max_output_tokens"));
 }
 
 /// filter_params 移除不在白名单中的键。
@@ -145,7 +145,7 @@ fn filter_params_drops_unsupported_keys() {
     assert!(body.get("model").is_some());
     assert!(body.get("input").is_some());
     assert!(body.get("temperature").is_some());
-    assert!(body.get("max_output_tokens").is_none());
+    assert_eq!(body["max_output_tokens"], 32);
     assert!(body.get("store").is_none());
 }
 

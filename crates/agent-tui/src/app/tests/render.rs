@@ -138,7 +138,7 @@ fn render_adapts_to_running_state_and_narrow_width() {
     assert!(!text.contains("ascnet-lucia"), "{text:?}");
 }
 
-/// 当前运行收到推理摘要后必须按 `thinking(content)` 插入正文时间线，并保持弱化样式。
+/// 最近一次推理摘要在运行结束后仍按 `thinking(content)` 留在正文时间线，并保持弱化样式。
 #[test]
 fn render_shows_reasoning_inside_message_timeline() {
     let backend = TestBackend::new(80, 18);
@@ -149,6 +149,7 @@ fn render_shows_reasoning_inside_message_timeline() {
     app.messages.push(Msg::new(MsgKind::User, "检查任务"));
     app.start_model_response();
     app.model_thinking = "正在核对权限边界".into();
+    app.running = false;
 
     terminal
         .draw(|frame| render_root(frame, &mut app))

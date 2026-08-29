@@ -93,7 +93,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         render_hero(frame, chat_area, &cwd_display);
     } else {
         let inner_width = chat_area.width.max(1);
-        let show_thinking = app.running && !timeline_thinking.is_empty();
+        let show_thinking = !timeline_thinking.is_empty();
         let thinking_index = timeline_thinking_index.min(timeline_messages.len());
         let mut lines = Vec::new();
         for (index, message) in timeline_messages.iter().enumerate() {
