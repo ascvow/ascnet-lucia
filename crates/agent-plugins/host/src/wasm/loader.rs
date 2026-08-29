@@ -1,7 +1,30 @@
 //! 多插件依赖规划、能力选择与容错加载。
 
 use super::*;
+use crate::composite::CompositePluginHost;
+use crate::host::PluginHost;
+use crate::live::LivePluginHost;
+use crate::manifest::resolve_plugin_capabilities;
+use crate::manifest::resolve_plugin_load_order;
+use crate::manifest::PluginManifest;
+use crate::manifest::CONTEXT_LOADER_CAPABILITY;
+use crate::manifest::TOOL_POLICY_CAPABILITY;
+use crate::service::ServiceRegistry;
+use crate::services::PluginHostServices;
+use crate::ui::UiDeclaration;
+use agent_core::AgentExtension;
+use anyhow::anyhow;
+use anyhow::Result;
 use futures_util::{stream::FuturesUnordered, StreamExt};
+use semver::Version;
+use semver::VersionReq;
+use serde_json::Value;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// 后台实例化允许的最大并发数，限制冷编译的 CPU 和内存峰值。

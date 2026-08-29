@@ -1,0 +1,452 @@
+//! 插件文件、状态、服务与进程能力的宿主实现。
+
+use crate::capability::agent::AgentCapabilityChecks;
+use crate::capability::process::ManagedProcess;
+use crate::capability::requests::parse_request;
+use crate::capability::requests::resolve_from;
+use crate::capability::requests::validate_state_key;
+use crate::capability::requests::ExtensionEventRequest;
+use crate::capability::requests::FileEntry;
+use crate::capability::requests::IdRequest;
+use crate::capability::requests::KeyRequest;
+use crate::capability::requests::NameRequest;
+use crate::capability::requests::PathRequest;
+use crate::capability::requests::ServiceCallRequest;
+use crate::capability::requests::ServiceListRequest;
+use crate::capability::requests::ServiceSpecRequest;
+use crate::capability::requests::StateSetRequest;
+use crate::contribution::ContributionRegistry;
+use crate::contribution::PromptContribution;
+use crate::contribution::ToolRegistrationRequest;
+use crate::manifest::AgentCapabilitySection;
+use crate::manifest::CapabilitySection;
+use crate::service::PluginService;
+use crate::service::PluginServiceCall;
+use crate::service::ServiceRegistry;
+use crate::services::ModelCompletionHostServices;
+use crate::state::PluginStateStore;
+pub(crate) use agent::AgentRuntimeBinding;
+use agent_tool::ExecutionPolicy;
+use anyhow::anyhow;
+use anyhow::{Context, Result};
+use serde_json::json;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+mod agent;
+mod process;
+mod requests;
+#[cfg(test)]
+mod tests;
+
+const MAX_PLUGIN_PROCESSES: usize = 16;
+
+const MAX_PROCESS_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+const MAX_PROCESS_WRITE_BYTES: usize = 4 * 1024 * 1024;
+
+const MAX_PROCESS_COMMAND_BYTES: usize = 4 * 1024;
+
+const MAX_PROCESS_ARGUMENTS: usize = 256;
+
+const MAX_PROCESS_ARGUMENT_BYTES: usize = 64 * 1024;
+
+const MAX_PROCESS_ENV_ENTRIES: usize = 128;
+
+const MAX_PROCESS_ENV_BYTES: usize = 256 * 1024;
+
+const MAX_PROCESS_CWD_BYTES: usize = 4 * 1024;
+
+const MAX_HOST_CAPABILITY_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+
+const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
+
+const MAX_READ_TIMEOUT_MS: u64 = 120_000;
+
+const MAX_AGENT_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024;
+
+const MAX_MODEL_COMPLETION_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+
+const HOST_RESPONSE_SCHEMA_VERSION: u32 = 1;
+
+/// 单个插件实例可访问的受控宿主能力状态。
+pub(crate) struct CapabilityState {
+    plugin_id: String,
+    plugin_dir: PathBuf,
+    permissions: CapabilitySection,
+    /// 来自 Host 运行平面的可信策略，不接受 manifest 或 Guest 输入。
+    execution_policy: ExecutionPolicy,
+    contributions: Arc<ContributionRegistry>,
+    services: Arc<ServiceRegistry>,
+    agent_runtime: Option<AgentRuntimeBinding>,
+    model_completion: Option<ModelCompletionHostServices>,
+    processes: HashMap<u64, ManagedProcess>,
+    next_process_handle: u64,
+    state: HashMap<String, Value>,
+    /// 应用可选注入的持久存储；缺失时保留实例内存语义。
+    state_store: Option<PluginStateStore>,
+}
+
+/// Host 在真实 Manifest 或执行策略边界拒绝插件能力时使用的类型化错误。
+#[derive(Debug)]
+struct PluginCapabilityDenied(String);
+
+impl std::fmt::Display for PluginCapabilityDenied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PluginCapabilityDenied {}
+
+/// 构造可由 WASM Host 可信识别的能力拒绝错误。
+fn capability_denied(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(PluginCapabilityDenied(message.into()))
+}
+
+/// 判断错误链是否包含 Host 真实执行的能力拒绝。
+pub(crate) fn is_capability_denied(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|source| source.is::<PluginCapabilityDenied>())
+}
+
+/// Host 注入单个插件实例的可信服务与运行平面策略。
+///
+/// 该上下文不包含 manifest 或 Guest 可控字段，避免服务绑定与可信策略在构造阶段被混入
+/// 插件声明。
+#[derive(Clone, Default)]
+pub(crate) struct CapabilityHostContext {
+    /// 已绑定可信 principal 的 Agent Runtime；缺失时关闭控制面能力。
+    agent_runtime: Option<AgentRuntimeBinding>,
+    /// Host 固定模型路由；缺失时关闭模型完成能力。
+    model_completion: Option<ModelCompletionHostServices>,
+    /// Host 运行平面的可信策略，默认 Serve 以保持既有加载行为。
+    execution_policy: ExecutionPolicy,
+    /// 应用拥有的持久状态目录；Guest 与 manifest 均不能声明或覆盖。
+    persistent_state_dir: Option<PathBuf>,
+}
+
+impl CapabilityHostContext {
+    /// 组合 Host 已完成身份绑定的服务与只能收紧的执行策略。
+    ///
+    /// `agent_runtime` 和 `model_completion` 缺失时，对应能力保持关闭；
+    /// `execution_policy` 决定原生进程等高权限能力能否进入操作系统。
+    pub(crate) fn new(
+        agent_runtime: Option<AgentRuntimeBinding>,
+        model_completion: Option<ModelCompletionHostServices>,
+        execution_policy: ExecutionPolicy,
+        persistent_state_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            agent_runtime,
+            model_completion,
+            execution_policy,
+            persistent_state_dir,
+        }
+    }
+}
+
+impl Drop for CapabilityState {
+    fn drop(&mut self) {
+        // 加载 future 被取消时无法执行 Guest deactivate，必须由 Host 兜底终止子进程。
+        for process in self.processes.values_mut() {
+            process.start_kill_tree();
+        }
+    }
+}
+
+impl AgentCapabilityChecks for AgentCapabilitySection {
+    fn require_any(&self) -> Result<()> {
+        if self.spawn || self.observe || self.cancel {
+            Ok(())
+        } else {
+            Err(capability_denied("插件 manifest 未声明 Agent Runtime 能力"))
+        }
+    }
+
+    fn require_spawn(&self) -> Result<()> {
+        if self.spawn {
+            Ok(())
+        } else {
+            Err(capability_denied(
+                "插件 manifest 未声明 capabilities.agent.spawn",
+            ))
+        }
+    }
+
+    fn require_observe(&self) -> Result<()> {
+        if self.observe {
+            Ok(())
+        } else {
+            Err(capability_denied(
+                "插件 manifest 未声明 capabilities.agent.observe",
+            ))
+        }
+    }
+
+    fn require_cancel(&self) -> Result<()> {
+        if self.cancel {
+            Ok(())
+        } else {
+            Err(capability_denied(
+                "插件 manifest 未声明 capabilities.agent.cancel",
+            ))
+        }
+    }
+}
+
+/// 把宿主能力调用结果编码成稳定的 JSON 信封。
+pub(crate) fn encode_host_response(result: Result<Value>) -> String {
+    match result {
+        Ok(value) => json!({
+            "schema_version": HOST_RESPONSE_SCHEMA_VERSION,
+            "ok": true,
+            "value": value,
+        })
+        .to_string(),
+        Err(error) => json!({
+            "schema_version": HOST_RESPONSE_SCHEMA_VERSION,
+            "ok": false,
+            "error": format!("{error:#}"),
+        })
+        .to_string(),
+    }
+}
+
+impl CapabilityState {
+    /// 创建绑定到插件目录、manifest 请求和 Host 可信执行策略的能力状态。
+    ///
+    /// `host_context` 必须由 Host 应用组装层提供；构造后所有原生进程入口同时要求其中
+    /// 的执行策略允许与 manifest 显式声明，拒绝 Guest 通过提示或工具名称扩大权限。
+    pub(crate) fn new(
+        plugin_id: String,
+        plugin_dir: PathBuf,
+        permissions: CapabilitySection,
+        contributions: Arc<ContributionRegistry>,
+        services: Arc<ServiceRegistry>,
+        host_context: CapabilityHostContext,
+    ) -> Result<Self> {
+        let state_store = host_context
+            .persistent_state_dir
+            .map(|root| PluginStateStore::new(root, &plugin_id))
+            .transpose()?;
+        let state = state_store
+            .as_ref()
+            .map(PluginStateStore::load)
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
+            plugin_id,
+            plugin_dir,
+            permissions,
+            execution_policy: host_context.execution_policy,
+            contributions,
+            services,
+            agent_runtime: host_context.agent_runtime,
+            model_completion: host_context.model_completion,
+            processes: HashMap::new(),
+            next_process_handle: 1,
+            state,
+            state_store,
+        })
+    }
+
+    /// 处理动态工具注册请求。
+    pub(crate) fn upsert_tool(&mut self, request_json: &str) -> Result<Value> {
+        let request: ToolRegistrationRequest = parse_request(request_json)?;
+        Ok(json!(self.contributions.upsert_tool(request)?))
+    }
+
+    /// 处理动态工具删除请求。
+    pub(crate) fn remove_tool(&mut self, request_json: &str) -> Result<Value> {
+        let request: NameRequest = parse_request(request_json)?;
+        self.contributions.remove_tool(&request.name)?;
+        Ok(Value::Null)
+    }
+
+    /// 处理提示贡献注册请求。
+    pub(crate) fn upsert_prompt(&mut self, request_json: &str) -> Result<Value> {
+        let request: PromptContribution = parse_request(request_json)?;
+        Ok(json!(self.contributions.upsert_prompt(request)?))
+    }
+
+    /// 处理提示贡献删除请求。
+    pub(crate) fn remove_prompt(&mut self, request_json: &str) -> Result<Value> {
+        let request: IdRequest = parse_request(request_json)?;
+        self.contributions.remove_prompt(&request.id)?;
+        Ok(Value::Null)
+    }
+
+    /// 处理结构化扩展事件发布请求。
+    pub(crate) fn emit_event(&mut self, request_json: &str) -> Result<Value> {
+        let request: ExtensionEventRequest = parse_request(request_json)?;
+        if request.name.trim().is_empty() {
+            return Err(anyhow!("扩展事件名称不能为空"));
+        }
+        if request.name == crate::ui::UI_HOST_ACTION_EVENT && !self.permissions.surface_actions {
+            return Err(capability_denied(
+                "插件 manifest 未声明 surface_actions 能力",
+            ));
+        }
+        self.contributions.emit_event(json!({
+            "source": {
+                "type": "plugin",
+                "id": self.plugin_id,
+            },
+            "name": request.name,
+            "data": request.data,
+            "presentation": request.presentation,
+        }))?;
+        Ok(Value::Null)
+    }
+
+    /// 读取当前插件实例状态；应用注入持久目录时该映射已在激活前恢复。
+    pub(crate) fn get_state(&mut self, request_json: &str) -> Result<Value> {
+        let request: KeyRequest = parse_request(request_json)?;
+        validate_state_key(&request.key)?;
+        Ok(serde_json::to_value(self.state.get(&request.key))?)
+    }
+
+    /// 事务性写入当前插件状态；持久保存失败时保留原内存值。
+    pub(crate) fn set_state(&mut self, request_json: &str) -> Result<Value> {
+        let request: StateSetRequest = parse_request(request_json)?;
+        validate_state_key(&request.key)?;
+        let mut state = self.state.clone();
+        state.insert(request.key, request.value);
+        if let Some(store) = self.state_store.as_ref() {
+            store.save(&state)?;
+        }
+        self.state = state;
+        Ok(Value::Null)
+    }
+
+    /// 事务性删除当前插件状态；持久保存失败时保留原内存值。
+    pub(crate) fn remove_state(&mut self, request_json: &str) -> Result<Value> {
+        let request: KeyRequest = parse_request(request_json)?;
+        validate_state_key(&request.key)?;
+        let mut state = self.state.clone();
+        let Some(removed) = state.remove(&request.key) else {
+            return Ok(Value::Null);
+        };
+        if let Some(store) = self.state_store.as_ref() {
+            store.save(&state)?;
+        }
+        self.state = state;
+        Ok(removed)
+    }
+
+    /// 注册或替换当前插件拥有的服务。
+    pub(crate) fn upsert_service(&mut self, request_json: &str) -> Result<Value> {
+        let request: ServiceSpecRequest = parse_request(request_json)?;
+        self.services.upsert(
+            &self.plugin_id,
+            PluginService {
+                plugin_id: String::new(),
+                name: request.name,
+                version: request.version,
+                description: request.description,
+            },
+        )?;
+        Ok(Value::Null)
+    }
+
+    /// 删除当前插件拥有的服务。
+    pub(crate) fn remove_service(&mut self, request_json: &str) -> Result<Value> {
+        let request: NameRequest = parse_request(request_json)?;
+        self.services.remove(&self.plugin_id, &request.name)?;
+        Ok(Value::Null)
+    }
+
+    /// 查询当前服务目录。
+    pub(crate) fn list_services(&mut self, request_json: &str) -> Result<Value> {
+        let request: ServiceListRequest = parse_request(request_json)?;
+        Ok(serde_json::to_value(
+            self.services.list(request.plugin_id.as_deref())?,
+        )?)
+    }
+
+    /// 克隆服务调用所需的可信调用方和共享路由器。
+    pub(crate) fn service_context(&self) -> (String, Arc<ServiceRegistry>) {
+        (self.plugin_id.clone(), self.services.clone())
+    }
+
+    /// 解析并调用另一个插件公开的服务。
+    pub(crate) async fn call_service_with(
+        caller_id: String,
+        services: Arc<ServiceRegistry>,
+        request_json: &str,
+    ) -> Result<Value> {
+        let request: ServiceCallRequest = parse_request(request_json)?;
+        services
+            .call(PluginServiceCall {
+                caller_id,
+                plugin_id: request.plugin_id,
+                name: request.name,
+                payload: request.payload,
+            })
+            .await
+    }
+
+    /// 在 manifest 允许的目录中读取 UTF-8 文件。
+    pub(crate) fn read_file(&mut self, request_json: &str) -> Result<Value> {
+        let request: PathRequest = parse_request(request_json)?;
+        let path = self.resolve_read_path(&request.path)?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("读取插件文件失败：{}", path.display()))?;
+        Ok(json!(content))
+    }
+
+    /// 在 manifest 允许的目录中列出一层目录项。
+    pub(crate) fn list_dir(&mut self, request_json: &str) -> Result<Value> {
+        let request: PathRequest = parse_request(request_json)?;
+        let path = self.resolve_read_path(&request.path)?;
+        if !path.is_dir() {
+            return Err(anyhow!("插件请求的路径不是目录：{}", path.display()));
+        }
+
+        let mut entries = std::fs::read_dir(&path)
+            .with_context(|| format!("列出插件目录失败：{}", path.display()))?
+            .map(|entry| {
+                let entry = entry.context("读取插件目录项失败")?;
+                let entry_path = entry.path();
+                let relative = entry_path
+                    .strip_prefix(&self.plugin_dir)
+                    .unwrap_or(&entry_path)
+                    .to_string_lossy()
+                    .into_owned();
+                Ok(FileEntry {
+                    path: relative,
+                    is_dir: entry
+                        .file_type()
+                        .context("读取插件目录项类型失败")?
+                        .is_dir(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(serde_json::to_value(entries)?)
+    }
+
+    fn resolve_read_path(&self, requested: &str) -> Result<PathBuf> {
+        if self.permissions.fs_read.is_empty() {
+            return Err(capability_denied("插件 manifest 未声明 fs_read 能力"));
+        }
+        let requested = resolve_from(&self.plugin_dir, requested)
+            .canonicalize()
+            .with_context(|| format!("插件读取路径不存在：{requested}"))?;
+        for allowed in &self.permissions.fs_read {
+            let allowed = resolve_from(&self.plugin_dir, allowed)
+                .canonicalize()
+                .with_context(|| format!("manifest 中的 fs_read 路径不存在：{allowed}"))?;
+            if requested == allowed || (allowed.is_dir() && requested.starts_with(&allowed)) {
+                return Ok(requested);
+            }
+        }
+        Err(capability_denied(format!(
+            "插件无权读取路径：{}",
+            requested.display()
+        )))
+    }
+}

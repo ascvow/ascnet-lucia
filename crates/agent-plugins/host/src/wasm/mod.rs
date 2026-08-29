@@ -3,90 +3,77 @@
 //! WIT world 故意在 ABI 边界使用 JSON 字符串。这样第一版 ABI 更稳定，
 //! Rust 内部类型可以继续通过 serde 演进。
 
-use super::{
-    capability::{
-        encode_host_response, is_capability_denied, AgentRuntimeBinding, CapabilityHostContext,
-        CapabilityState,
-    },
-    contribution::ContributionRegistry,
-    manifest::{
-        resolve_plugin_capabilities, resolve_plugin_load_order, PluginManifest,
-        CONTEXT_LOADER_CAPABILITY, TOOL_POLICY_CAPABILITY,
-    },
-    service::{PluginService, PluginServiceCall, ServiceHandler, ServiceRegistry},
-    AgentEvent, AgentRuntimeHostServices, CompositePluginHost, LivePluginHost, PluginHost,
-    PluginHostServices, ToolDecision, ToolRenderRequest, ToolRendererContribution, UiDeclaration,
-    UiFrame, UiInput, UiRenderRequest,
-};
-use crate::ui::{UiContribution, UiPlacement};
-use agent_core::{model::ModelMessage, AgentExtension, ContextLoadRequest, LoadedContext};
+use crate::capability::AgentRuntimeBinding;
+use crate::capability::CapabilityHostContext;
+use crate::capability::CapabilityState;
+use crate::composite::CompositePluginHost;
+use crate::contribution::ContributionRegistry;
+use crate::host::PluginHost;
+use crate::manifest::resolve_plugin_load_order;
+use crate::manifest::PluginManifest;
+use crate::service::PluginService;
+use crate::service::PluginServiceCall;
+use crate::service::ServiceHandler;
+use crate::service::ServiceRegistry;
+use crate::services::AgentRuntimeHostServices;
+use crate::services::PluginHostServices;
+use crate::ui::ToolRenderRequest;
+use crate::ui::ToolRendererContribution;
+use crate::ui::UiContribution;
+use crate::ui::UiDeclaration;
+use crate::ui::UiFrame;
+use crate::ui::UiInput;
+use crate::ui::UiRenderRequest;
+use crate::wasm::engine::shared_wasm_engine;
+use crate::wasm::engine::IntoAnyhow;
+use crate::wasm::engine::PluginWasiState;
+use crate::wasm::fuel::context_fuel_budget;
+use crate::wasm::fuel::refill_fuel;
+use crate::wasm::fuel::set_fuel;
+use crate::wasm::guard::bind_guest_tool_result;
+use crate::wasm::guard::validate_ui_contributions;
+use crate::wasm::guard::validate_ui_instance;
+use crate::wasm::linker::classify_wasm_plugin_failure;
+use crate::wasm::linker::get_required_func;
+use agent_core::model::ModelMessage;
+use agent_core::AgentEvent;
+use agent_core::AgentExtension;
+use agent_core::ContextLoadRequest;
+use agent_core::LoadedContext;
+use agent_core::ToolDecision;
 use agent_runtime::RuntimePrincipal;
-use agent_tool::{ToolCall, ToolDecisionStatus, ToolErrorKind, ToolResult, ToolSpec};
-use anyhow::{anyhow, Context, Result};
+use agent_tool::ToolCall;
+use agent_tool::ToolDecisionStatus;
+use agent_tool::ToolResult;
+use agent_tool::ToolSpec;
+use anyhow::anyhow;
+use anyhow::Context;
+use anyhow::Result;
 use async_trait::async_trait;
-use semver::{Version, VersionReq};
 use serde::Deserialize;
-use serde_json::{json, Value};
-use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::{Arc, Weak},
-};
+use serde_json::Value;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Weak;
 use tokio::sync::Mutex;
 use uuid::Uuid;
-use wasmtime::component::{
-    Component, ComponentNamedList, Instance, Lift, Linker, Lower, TypedFunc,
-};
-#[cfg(test)]
-use wasmtime::Engine;
-use wasmtime::{Store, StoreContextMut, StoreLimitsBuilder, Trap};
+use wasmtime::component::Component;
+use wasmtime::component::Instance;
+use wasmtime::component::Linker;
+use wasmtime::component::TypedFunc;
+use wasmtime::Store;
+use wasmtime::StoreLimitsBuilder;
 use wasmtime_wasi::WasiCtxBuilder;
-
-/// 上下文加载每个序列化输入字节追加的 WASM fuel，覆盖 JSON 遍历与压缩成本。
-const CONTEXT_FUEL_PER_INPUT_BYTE: u64 = 512;
-/// 单次上下文加载允许使用的最高 fuel，避免超大请求解除计算资源上限。
-const MAX_CONTEXT_FUEL: u64 = 500_000_000;
-/// ToolResult.details 中只允许 Host 注入的插件故障键。
-const PLUGIN_HOST_FAILURE_DETAIL_KEY: &str = "lucia_plugin_host_failure";
-
-/// Host 从真实 WASM 执行边界观察到的插件故障类别。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PluginHostFailureKind {
-    /// WASM 陷阱或其他执行崩溃。
-    Trap,
-    /// 单次调用耗尽 Host 分配的 fuel。
-    FuelExhausted,
-    /// 插件触发 Host 配置的线性内存上限。
-    MemoryLimit,
-    /// 插件调用了 Manifest 或 ExecutionPolicy 未授权的宿主能力。
-    CapabilityDenied,
-    /// Guest 返回值无法满足正式 ToolResult 契约。
-    ContractViolation,
-}
-
-impl PluginHostFailureKind {
-    /// 返回写入可信 ToolResult 细节的稳定协议名。
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Trap => "trap",
-            Self::FuelExhausted => "fuel_exhausted",
-            Self::MemoryLimit => "memory_limit",
-            Self::CapabilityDenied => "capability_denied",
-            Self::ContractViolation => "contract_violation",
-        }
-    }
-}
-
 mod engine;
+mod fuel;
+mod guard;
+mod linker;
 mod loader;
 
-pub use engine::{configure_wasm_cache_directory, WasmPluginLimits};
-use engine::{shared_wasm_engine, IntoAnyhow, PluginWasiState};
+use linker::{add_plugin_host_imports, plugin_host_failure_result, PluginHostFailureKind};
 
-#[cfg(test)]
-use loader::{
-    failed_required_dependencies, prioritize_progressive_order, resilient_dependency_plan,
-};
+pub use engine::{configure_wasm_cache_directory, WasmPluginLimits};
 pub use loader::{
     load_wasm_plugins, load_wasm_plugins_progressively_with_selection_and_services,
     load_wasm_plugins_resilient, load_wasm_plugins_resilient_with_selection,
@@ -94,6 +81,67 @@ pub use loader::{
     load_wasm_plugins_with_selection_and_services, load_wasm_plugins_with_services,
     ProgressivePluginLoadUpdate,
 };
+
+/// 为一次插件激活创建独占 controller，并把 manifest profile 请求与应用注册表求交集。
+async fn provision_agent_runtime(
+    manifest: &PluginManifest,
+    host_services: Option<AgentRuntimeHostServices>,
+) -> Result<Option<AgentRuntimeBinding>> {
+    let permissions = &manifest.capabilities.agent;
+    if !permissions.is_requested() {
+        return Ok(None);
+    }
+    let host_services = host_services.ok_or_else(|| {
+        anyhow!(
+            "插件 `{}` 请求 Agent Runtime 能力，但应用未注入对应服务",
+            manifest.plugin.id
+        )
+    })?;
+    for profile in &permissions.profiles {
+        if host_services.spawn_profile(profile).is_none() {
+            return Err(anyhow!(
+                "插件 `{}` 请求的 Agent spawn profile `{profile}` 未在应用注册",
+                manifest.plugin.id
+            ));
+        }
+    }
+
+    let principal =
+        RuntimePrincipal::new(format!("plugin:{}:{}", manifest.plugin.id, Uuid::new_v4()))
+            .map_err(|error| anyhow!(error.to_string()))?;
+    if let Err(error) = host_services
+        .provisioner
+        .grant_profile(principal.clone(), &host_services.controller_profile)
+        .await
+    {
+        host_services.provisioner.revoke(&principal).await;
+        return Err(anyhow!(error.to_string()));
+    }
+    let provisioned = match host_services
+        .provisioner
+        .provision(principal.clone(), &host_services.controller_profile)
+        .await
+    {
+        Ok(provisioned) => provisioned,
+        Err(error) => {
+            host_services.provisioner.revoke(&principal).await;
+            return Err(anyhow!(error.to_string()));
+        }
+    };
+    if provisioned.api.principal() != principal
+        || provisioned.api.identity() != provisioned.controller.id
+    {
+        host_services.provisioner.revoke(&principal).await;
+        return Err(anyhow!(
+            "Agent Runtime provisioner 返回了与可信 principal 或 controller 不一致的 API"
+        ));
+    }
+    Ok(Some(AgentRuntimeBinding::new(
+        principal,
+        provisioned.api,
+        host_services,
+    )))
+}
 
 /// One plugin excluded from a resilient load attempt.
 ///
@@ -870,775 +918,5 @@ impl PluginHost for WasmPluginHost {
     }
 }
 
-/// 为一次插件激活创建独占 controller，并把 manifest profile 请求与应用注册表求交集。
-async fn provision_agent_runtime(
-    manifest: &PluginManifest,
-    host_services: Option<AgentRuntimeHostServices>,
-) -> Result<Option<AgentRuntimeBinding>> {
-    let permissions = &manifest.capabilities.agent;
-    if !permissions.is_requested() {
-        return Ok(None);
-    }
-    let host_services = host_services.ok_or_else(|| {
-        anyhow!(
-            "插件 `{}` 请求 Agent Runtime 能力，但应用未注入对应服务",
-            manifest.plugin.id
-        )
-    })?;
-    for profile in &permissions.profiles {
-        if host_services.spawn_profile(profile).is_none() {
-            return Err(anyhow!(
-                "插件 `{}` 请求的 Agent spawn profile `{profile}` 未在应用注册",
-                manifest.plugin.id
-            ));
-        }
-    }
-
-    let principal =
-        RuntimePrincipal::new(format!("plugin:{}:{}", manifest.plugin.id, Uuid::new_v4()))
-            .map_err(|error| anyhow!(error.to_string()))?;
-    if let Err(error) = host_services
-        .provisioner
-        .grant_profile(principal.clone(), &host_services.controller_profile)
-        .await
-    {
-        host_services.provisioner.revoke(&principal).await;
-        return Err(anyhow!(error.to_string()));
-    }
-    let provisioned = match host_services
-        .provisioner
-        .provision(principal.clone(), &host_services.controller_profile)
-        .await
-    {
-        Ok(provisioned) => provisioned,
-        Err(error) => {
-            host_services.provisioner.revoke(&principal).await;
-            return Err(anyhow!(error.to_string()));
-        }
-    };
-    if provisioned.api.principal() != principal
-        || provisioned.api.identity() != provisioned.controller.id
-    {
-        host_services.provisioner.revoke(&principal).await;
-        return Err(anyhow!(
-            "Agent Runtime provisioner 返回了与可信 principal 或 controller 不一致的 API"
-        ));
-    }
-    Ok(Some(AgentRuntimeBinding::new(
-        principal,
-        provisioned.api,
-        host_services,
-    )))
-}
-
-/// 把协议无关的 Agent、文件和进程能力注册到 component 根命名空间。
-fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> Result<()> {
-    let mut root = linker.root();
-    root.func_wrap(
-        "host-agent-upsert-tool",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.upsert_tool(&request),
-            ),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-agent-upsert-tool 失败")?;
-    root.func_wrap(
-        "host-agent-remove-tool",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.remove_tool(&request),
-            ),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-agent-remove-tool 失败")?;
-    root.func_wrap(
-        "host-agent-upsert-prompt",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.upsert_prompt(&request),
-            ),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-agent-upsert-prompt 失败")?;
-    root.func_wrap(
-        "host-agent-remove-prompt",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.remove_prompt(&request),
-            ),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-agent-remove-prompt 失败")?;
-    root.func_wrap(
-        "host-agent-emit-event",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            let result = caller.data_mut().capabilities.emit_event(&request);
-            Ok((encode_host_response_with_failure(caller.data_mut(), result),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-agent-emit-event 失败")?;
-    root.func_wrap(
-        "host-state-get",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.get_state(&request),
-            ),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-state-get 失败")?;
-    root.func_wrap(
-        "host-state-set",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.set_state(&request),
-            ),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-state-set 失败")?;
-    root.func_wrap(
-        "host-state-remove",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.remove_state(&request),
-            ),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-state-remove 失败")?;
-    root.func_wrap(
-        "host-service-upsert",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.upsert_service(&request),
-            ),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-service-upsert 失败")?;
-    root.func_wrap(
-        "host-service-remove",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.remove_service(&request),
-            ),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-service-remove 失败")?;
-    root.func_wrap(
-        "host-service-list",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.list_services(&request),
-            ),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-service-list 失败")?;
-    root.func_wrap_async(
-        "host-service-call",
-        |caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            let (caller_id, services) = caller.data().capabilities.service_context();
-            Box::new(async move {
-                let result =
-                    CapabilityState::call_service_with(caller_id, services, &request).await;
-                Ok((encode_host_response(result),))
-            })
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-service-call 失败")?;
-    root.func_wrap(
-        "host-fs-read",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            let result = caller.data_mut().capabilities.read_file(&request);
-            Ok((encode_host_response_with_failure(caller.data_mut(), result),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-fs-read 失败")?;
-    root.func_wrap(
-        "host-fs-list",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            let result = caller.data_mut().capabilities.list_dir(&request);
-            Ok((encode_host_response_with_failure(caller.data_mut(), result),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-fs-list 失败")?;
-    root.func_wrap(
-        "host-process-spawn",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            let result = caller.data_mut().capabilities.spawn_process(&request);
-            Ok((encode_host_response_with_failure(caller.data_mut(), result),))
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-process-spawn 失败")?;
-    root.func_wrap_async(
-        "host-process-write",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Box::new(async move {
-                let result = caller.data_mut().capabilities.write_process(&request).await;
-                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
-            })
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-process-write 失败")?;
-    root.func_wrap_async(
-        "host-process-read-line",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Box::new(async move {
-                let result = caller
-                    .data_mut()
-                    .capabilities
-                    .read_process_line(&request)
-                    .await;
-                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
-            })
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-process-read-line 失败")?;
-    root.func_wrap_async(
-        "host-process-kill",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Box::new(async move {
-                let result = caller.data_mut().capabilities.kill_process(&request).await;
-                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
-            })
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-process-kill 失败")?;
-    root.func_wrap_async(
-        "host-model-complete",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            let (allowed, binding) = caller.data().capabilities.model_completion_context();
-            Box::new(async move {
-                let result = CapabilityState::complete_model_with(allowed, binding, &request).await;
-                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
-            })
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-model-complete 失败")?;
-    root.func_wrap_async(
-        "host-agent-runtime-call",
-        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            let (permissions, binding) = caller.data().capabilities.agent_runtime_context();
-            Box::new(async move {
-                let result =
-                    CapabilityState::call_agent_runtime_with(permissions, binding, &request).await;
-                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
-            })
-        },
-    )
-    .into_anyhow()
-    .context("注册 host-agent-runtime-call 失败")?;
-    Ok(())
-}
-
-/// 编码宿主能力响应，并把真实权限拒绝锁存在当前 WASM Store 中供调用终态消费。
-fn encode_host_response_with_failure(state: &mut PluginWasiState, result: Result<Value>) -> String {
-    if result.as_ref().is_err_and(is_capability_denied) {
-        state.record_plugin_failure(PluginHostFailureKind::CapabilityDenied);
-    }
-    encode_host_response(result)
-}
-
-/// 将 Host 观察到的真实 WASM 调用错误归入稳定插件故障类别。
-fn classify_wasm_plugin_failure(error: &wasmtime::Error) -> PluginHostFailureKind {
-    if matches!(error.downcast_ref::<Trap>(), Some(Trap::OutOfFuel)) {
-        return PluginHostFailureKind::FuelExhausted;
-    }
-    let diagnostic = format!("{error:#?}").to_ascii_lowercase();
-    if diagnostic.contains("forcing trap when growing memory")
-        || diagnostic.contains("memory growth failure")
-        || diagnostic.contains("memory limits")
-    {
-        return PluginHostFailureKind::MemoryLimit;
-    }
-    PluginHostFailureKind::Trap
-}
-
-/// 构造由 Host 注入、且会由 Core 重绑调用身份的插件故障结果。
-fn plugin_host_failure_result(
-    call: &ToolCall,
-    public_name: &str,
-    plugin_id: &str,
-    failure: PluginHostFailureKind,
-) -> ToolResult {
-    ToolResult::error_with_kind(
-        call.id.clone(),
-        public_name,
-        ToolErrorKind::Execution,
-        format!("插件 `{plugin_id}` 运行失败：{}", failure.as_str()),
-    )
-    .with_details(json!({
-        PLUGIN_HOST_FAILURE_DETAIL_KEY: {
-            "kind": failure.as_str(),
-            "plugin_id": plugin_id,
-        }
-    }))
-}
-
-/// 删除 Guest 可能伪造的 Host 专用故障键，并降级其安全错误类别。
-///
-/// 参数错误、普通执行错误与取消仍用于 Agent 侧行为归因；只有必须由可信执行层观察的
-/// 权限与边界类别会降为普通执行错误。
-fn sanitize_guest_tool_result(result: &mut ToolResult) {
-    result.error_kind = if !result.is_error {
-        None
-    } else {
-        match result.error_kind {
-            Some(
-                ToolErrorKind::PermissionDenied
-                | ToolErrorKind::PathBoundaryViolation
-                | ToolErrorKind::ProcessBoundaryViolation
-                | ToolErrorKind::SecretAccessAttempt
-                | ToolErrorKind::PolicyDenied,
-            )
-            | None => Some(ToolErrorKind::Execution),
-            trusted_behavior_error => trusted_behavior_error,
-        }
-    };
-    let Some(details) = result.details.as_mut().and_then(Value::as_object_mut) else {
-        return;
-    };
-    details.remove(PLUGIN_HOST_FAILURE_DETAIL_KEY);
-    if details.is_empty() {
-        result.details = None;
-    }
-}
-
-/// 使用 Host 已知的真实调用身份覆盖 Guest 返回值中的可伪造字段。
-fn bind_guest_tool_result(result: &mut ToolResult, call: &ToolCall, public_name: &str) {
-    sanitize_guest_tool_result(result);
-    result.call_id.clone_from(&call.id);
-    result.name = public_name.to_string();
-}
-
-fn refill_fuel(state: &mut WasmPluginState) -> Result<()> {
-    set_fuel(state, state.limits.fuel)
-}
-
-/// 按单次上下文输入大小分配 fuel，并保留显式的最大计算预算。
-fn context_fuel_budget(limits: &WasmPluginLimits, input_bytes: usize) -> u64 {
-    let extra = u64::try_from(input_bytes)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(CONTEXT_FUEL_PER_INPUT_BYTE);
-    limits
-        .fuel
-        .saturating_add(extra)
-        .min(MAX_CONTEXT_FUEL.max(limits.fuel))
-}
-
-/// 将指定 fuel 重置到单插件 store。
-fn set_fuel(state: &mut WasmPluginState, fuel: u64) -> Result<()> {
-    state
-        .store
-        .set_fuel(fuel)
-        .into_anyhow()
-        .context("failed to refill plugin fuel")
-}
-
-/// 校验插件内部视图 ID，并注入可信的 manifest 插件 ID。
-fn validate_ui_contributions(
-    plugin_id: &str,
-    contributions: Vec<UiContribution>,
-    tools: &[ToolSpec],
-) -> Result<(Vec<UiDeclaration>, Vec<ToolRendererContribution>)> {
-    let mut view_ids = HashSet::new();
-    let owned_tools = tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<HashSet<_>>();
-    let mut declarations = Vec::new();
-    let mut tool_renderers = Vec::new();
-    for contribution in contributions {
-        match contribution {
-            UiContribution::View(mut declaration) => {
-                if declaration.view_id.trim().is_empty() {
-                    return Err(anyhow!("plugin `{plugin_id}` has an empty UI view id"));
-                }
-                if !view_ids.insert(declaration.view_id.clone()) {
-                    return Err(anyhow!(
-                        "plugin `{plugin_id}` declares duplicate UI route `{}`",
-                        declaration.view_id
-                    ));
-                }
-                declaration.plugin_id = plugin_id.to_string();
-                declarations.push(declaration);
-            }
-            UiContribution::ToolRenderer(mut renderer) => {
-                if renderer.renderer_id.trim().is_empty() {
-                    return Err(anyhow!(
-                        "plugin `{plugin_id}` has an empty tool renderer id"
-                    ));
-                }
-                if !view_ids.insert(renderer.renderer_id.clone()) {
-                    return Err(anyhow!(
-                        "plugin `{plugin_id}` declares duplicate UI route `{}`",
-                        renderer.renderer_id
-                    ));
-                }
-                if !owned_tools.contains(renderer.tool_name.as_str()) {
-                    return Err(anyhow!(
-                        "plugin `{plugin_id}` cannot render unowned tool `{}`",
-                        renderer.tool_name
-                    ));
-                }
-                renderer.plugin_id = plugin_id.to_string();
-                tool_renderers.push(renderer);
-            }
-        }
-    }
-    Ok((declarations, tool_renderers))
-}
-
-/// 校验静态视图与动态子视图的实例路由是否匹配。
-fn validate_ui_instance(declaration: &UiDeclaration, instance_id: Option<&str>) -> Result<()> {
-    match (declaration.placement, instance_id) {
-        (UiPlacement::Subview, Some(instance_id))
-            if !instance_id.is_empty()
-                && instance_id.len() <= 256
-                && !instance_id.chars().any(char::is_control) =>
-        {
-            Ok(())
-        }
-        (UiPlacement::Subview, _) => Err(anyhow!(
-            "subview `{}` 需要有效 instance_id",
-            declaration.view_id
-        )),
-        (_, None) => Ok(()),
-        (_, Some(_)) => Err(anyhow!(
-            "非 subview `{}` 不允许携带 instance_id",
-            declaration.view_id
-        )),
-    }
-}
-
-fn get_required_func<Params, Results>(
-    instance: &Instance,
-    store: &mut Store<PluginWasiState>,
-    name: &str,
-) -> Result<TypedFunc<Params, Results>>
-where
-    Params: ComponentNamedList + Lower + Send + Sync + 'static,
-    Results: ComponentNamedList + Lift + Send + Sync + 'static,
-{
-    instance
-        .get_typed_func::<Params, Results>(store, name)
-        .into_anyhow()
-        .with_context(|| {
-            format!("plugin missing export `{name}` or the export has incompatible type")
-        })
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::manifest::{PluginDependency, PluginSection, SUPPORTED_PLUGIN_API_VERSION};
-    use crate::ui::UiSize;
-
-    /// 默认运行时限制必须同时约束计算量和线性内存。
-    #[test]
-    fn default_limits_bound_fuel_and_memory() {
-        let limits = WasmPluginLimits::default();
-
-        assert!(limits.fuel > 0);
-        assert_eq!(limits.max_memory_bytes, 64 * 1024 * 1024);
-    }
-
-    /// 上下文输入应按大小获得额外 fuel，且不得突破全局硬上限。
-    #[test]
-    fn context_fuel_budget_scales_with_input_and_stays_bounded() {
-        let limits = WasmPluginLimits::default();
-        assert_eq!(context_fuel_budget(&limits, 0), limits.fuel);
-        assert_eq!(
-            context_fuel_budget(&limits, 300_000),
-            limits.fuel + 300_000 * CONTEXT_FUEL_PER_INPUT_BYTE
-        );
-        assert_eq!(context_fuel_budget(&limits, usize::MAX), MAX_CONTEXT_FUEL);
-    }
-
-    /// 多次请求运行时 Engine 时必须复用同一个底层实例。
-    #[test]
-    fn wasm_plugin_loads_share_process_engine() -> Result<()> {
-        let first = shared_wasm_engine()?;
-        let second = shared_wasm_engine()?;
-
-        assert!(Engine::same(&first, &second));
-        Ok(())
-    }
-
-    /// Subviews require a valid instance ID, while static views reject dynamic routing.
-    /// 子视图必须携带有效实例 ID，静态视图则拒绝动态实例路由。
-    #[test]
-    fn ui_instance_routing_matches_declared_placement() {
-        let declaration = |placement| UiDeclaration {
-            plugin_id: "demo".into(),
-            view_id: "detail".into(),
-            title: "详情".into(),
-            placement,
-            size: UiSize::default(),
-            focusable: true,
-            input_triggers: Vec::new(),
-        };
-
-        assert!(validate_ui_instance(&declaration(UiPlacement::Subview), Some("task-1")).is_ok());
-        assert!(validate_ui_instance(&declaration(UiPlacement::Subview), None).is_err());
-        assert!(validate_ui_instance(&declaration(UiPlacement::Right), None).is_ok());
-        assert!(validate_ui_instance(&declaration(UiPlacement::Right), Some("task-1")).is_err());
-    }
-
-    /// Required dependency failures propagate transitively while optional failures do not block.
-    ///
-    /// 必选依赖失败应向下游传播，可选依赖失败不应阻止加载。
-    #[test]
-    fn resilient_dependencies_skip_only_required_dependents() {
-        let manifest = |id: &str, dependency: PluginDependency| PluginManifest {
-            plugin: PluginSection {
-                id: id.into(),
-                name: id.into(),
-                version: "1.0.0".into(),
-                api_version: SUPPORTED_PLUGIN_API_VERSION.into(),
-                wasm: format!("{id}.wasm"),
-                description: None,
-            },
-            dependencies: vec![dependency],
-            provides: Vec::new(),
-            capabilities: Default::default(),
-            metadata: HashMap::new(),
-        };
-        let dependency = |id: &str, optional: bool| PluginDependency {
-            id: id.into(),
-            version: "*".into(),
-            optional,
-        };
-
-        let mut failed = HashSet::from(["provider".to_string()]);
-        let consumer = manifest("consumer", dependency("provider", false));
-        assert_eq!(
-            failed_required_dependencies(&consumer, &failed),
-            vec!["provider"]
-        );
-        failed.insert("consumer".into());
-        let downstream = manifest("downstream", dependency("consumer", false));
-        assert_eq!(
-            failed_required_dependencies(&downstream, &failed),
-            vec!["consumer"]
-        );
-        let optional = manifest("optional", dependency("provider", true));
-        assert!(failed_required_dependencies(&optional, &failed).is_empty());
-    }
-
-    /// Static dependency failures exclude only required dependents and leave unrelated plugins.
-    ///
-    /// 静态依赖失败应只剔除必选依赖闭包，无关插件仍进入加载计划。
-    #[test]
-    fn resilient_plan_isolates_required_dependency_closure() {
-        let manifest = |id: &str, dependencies: Vec<PluginDependency>| PluginManifest {
-            plugin: PluginSection {
-                id: id.into(),
-                name: id.into(),
-                version: "1.0.0".into(),
-                api_version: SUPPORTED_PLUGIN_API_VERSION.into(),
-                wasm: format!("{id}.wasm"),
-                description: None,
-            },
-            dependencies,
-            provides: Vec::new(),
-            capabilities: Default::default(),
-            metadata: HashMap::new(),
-        };
-        let dependency = |id: &str, optional: bool| PluginDependency {
-            id: id.into(),
-            version: "*".into(),
-            optional,
-        };
-        let manifests = vec![
-            manifest("healthy", Vec::new()),
-            manifest("consumer", vec![dependency("missing", false)]),
-            manifest("downstream", vec![dependency("consumer", false)]),
-            manifest("optional", vec![dependency("missing", true)]),
-        ];
-
-        let (order, failures) = resilient_dependency_plan(&manifests).expect("解析容错依赖计划");
-        let loaded = order
-            .iter()
-            .map(|index| manifests[*index].plugin.id.as_str())
-            .collect::<Vec<_>>();
-        let failed = failures
-            .iter()
-            .map(|failure| failure.plugin_id.as_str())
-            .collect::<HashSet<_>>();
-
-        assert_eq!(loaded, vec!["healthy", "optional"]);
-        assert_eq!(failed, HashSet::from(["consumer", "downstream"]));
-        let downstream = failures
-            .iter()
-            .find(|failure| failure.plugin_id == "downstream")
-            .expect("下游插件应被依赖失败剔除");
-        assert_eq!(downstream.blocked_by, vec!["consumer"]);
-    }
-
-    /// Required dependency cycles do not prevent independent plugins from loading.
-    ///
-    /// 必选依赖循环不应阻止独立插件加载。
-    #[test]
-    fn resilient_plan_isolates_required_dependency_cycles() {
-        let manifest = |id: &str, dependency_id: Option<&str>| PluginManifest {
-            plugin: PluginSection {
-                id: id.into(),
-                name: id.into(),
-                version: "1.0.0".into(),
-                api_version: SUPPORTED_PLUGIN_API_VERSION.into(),
-                wasm: format!("{id}.wasm"),
-                description: None,
-            },
-            dependencies: dependency_id
-                .map(|dependency_id| PluginDependency {
-                    id: dependency_id.into(),
-                    version: "*".into(),
-                    optional: false,
-                })
-                .into_iter()
-                .collect(),
-            provides: Vec::new(),
-            capabilities: Default::default(),
-            metadata: HashMap::new(),
-        };
-        let manifests = vec![
-            manifest("cycle-a", Some("cycle-b")),
-            manifest("cycle-b", Some("cycle-a")),
-            manifest("healthy", None),
-        ];
-
-        let (order, failures) = resilient_dependency_plan(&manifests).expect("隔离循环依赖");
-
-        assert_eq!(order, vec![2]);
-        assert_eq!(failures.len(), 2);
-        assert!(failures
-            .iter()
-            .all(|failure| failure.reason.contains("循环")));
-    }
-
-    /// 关键能力 owner 应提前加载，同时保持其必选依赖位于 owner 之前。
-    #[test]
-    fn progressive_order_prioritizes_critical_owner_with_dependencies() {
-        let manifest = |id: &str, dependency_id: Option<&str>| PluginManifest {
-            plugin: PluginSection {
-                id: id.into(),
-                name: id.into(),
-                version: "1.0.0".into(),
-                api_version: SUPPORTED_PLUGIN_API_VERSION.into(),
-                wasm: format!("{id}.wasm"),
-                description: None,
-            },
-            dependencies: dependency_id
-                .map(|dependency_id| PluginDependency {
-                    id: dependency_id.into(),
-                    version: "*".into(),
-                    optional: false,
-                })
-                .into_iter()
-                .collect(),
-            provides: Vec::new(),
-            capabilities: Default::default(),
-            metadata: HashMap::new(),
-        };
-        let manifests = vec![
-            manifest("command", None),
-            manifest("policy-support", None),
-            manifest("permission", Some("policy-support")),
-            manifest("mcp", None),
-        ];
-
-        let order =
-            prioritize_progressive_order(&manifests, &[0, 1, 2, 3], &["permission".to_string()]);
-        let ids = order
-            .iter()
-            .map(|index| manifests[*index].plugin.id.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(ids, vec!["policy-support", "permission", "command", "mcp"]);
-    }
-
-    /// Guest 不能通过 ToolResult 字段伪造 Host 插件故障或安全错误类别。
-    #[test]
-    fn guest_tool_result_cannot_forge_host_failure() {
-        let mut result = ToolResult::error_with_kind(
-            "forged-call",
-            "forged.tool",
-            ToolErrorKind::PermissionDenied,
-            "伪造拒绝",
-        )
-        .with_details(json!({
-            PLUGIN_HOST_FAILURE_DETAIL_KEY: {
-                "kind": "capability_denied",
-                "plugin_id": "forged"
-            },
-            "duration_ms": 1
-        }));
-
-        let call = ToolCall::new("trusted-call", "plugin.local", json!({}));
-        bind_guest_tool_result(&mut result, &call, "plugin.public");
-
-        assert_eq!(result.error_kind, Some(ToolErrorKind::Execution));
-        assert_eq!(result.call_id, "trusted-call");
-        assert_eq!(result.name, "plugin.public");
-        let details = result.details.expect("非 Host UI 细节应保留");
-        assert!(details.get(PLUGIN_HOST_FAILURE_DETAIL_KEY).is_none());
-        assert_eq!(details["duration_ms"], 1);
-    }
-
-    /// Guest 的参数错误仍可用于改进 Agent 调用策略，不属于插件安全事实。
-    #[test]
-    fn guest_invalid_arguments_remains_agent_behavior_error() {
-        let mut result = ToolResult::error_with_kind(
-            "call",
-            "plugin.tool",
-            ToolErrorKind::InvalidArguments,
-            "缺少必填参数",
-        );
-
-        sanitize_guest_tool_result(&mut result);
-
-        assert_eq!(result.error_kind, Some(ToolErrorKind::InvalidArguments));
-    }
-
-    /// Host 构造的插件故障必须带有不可发送给模型的结构化可信标记。
-    #[test]
-    fn host_plugin_failure_has_stable_detail() {
-        let call = ToolCall::new("call", "plugin.tool", json!({}));
-
-        let result = plugin_host_failure_result(
-            &call,
-            "plugin.tool",
-            "plugin",
-            PluginHostFailureKind::ContractViolation,
-        );
-
-        assert!(result.is_error);
-        assert_eq!(result.error_kind, Some(ToolErrorKind::Execution));
-        assert_eq!(
-            result
-                .details
-                .as_ref()
-                .and_then(|details| details.pointer("/lucia_plugin_host_failure/kind"))
-                .and_then(Value::as_str),
-            Some("contract_violation")
-        );
-    }
-}
+mod tests;
