@@ -213,6 +213,56 @@ async fn responses_sse_emits_and_aggregates_text_delta() {
     }
 }
 
+/// 兼容网关只发送正文完成事件时，也必须恢复完整正文并避免重复已有增量。
+#[tokio::test]
+async fn responses_sse_recovers_text_from_done_event() {
+    let (sender, mut stream) = ModelEventStream::channel();
+    let mut state = ResponsesStreamState::default();
+
+    handle_responses_sse_data(
+        r#"{"type":"response.output_text.delta","output_index":0,"delta":"你"}"#,
+        &sender,
+        &mut state,
+    )
+    .expect("应该解析正文增量");
+    handle_responses_sse_data(
+        r#"{"type":"response.output_text.done","output_index":0,"text":"你好"}"#,
+        &sender,
+        &mut state,
+    )
+    .expect("应该解析正文完成事件");
+
+    assert_eq!(state.text, "你好");
+    match stream.next().await.expect("应该收到首个正文增量") {
+        ModelStreamEvent::TextDelta { delta, .. } => assert_eq!(delta, "你"),
+        event => panic!("收到非预期事件: {event:?}"),
+    }
+    match stream.next().await.expect("应该收到完成事件补齐的正文") {
+        ModelStreamEvent::TextDelta { delta, .. } => assert_eq!(delta, "好"),
+        event => panic!("收到非预期事件: {event:?}"),
+    }
+}
+
+/// 兼容网关省略正文增量与正文完成事件时，消息完成事件仍必须恢复正文。
+#[tokio::test]
+async fn responses_sse_recovers_text_from_output_item_done() {
+    let (sender, mut stream) = ModelEventStream::channel();
+    let mut state = ResponsesStreamState::default();
+
+    handle_responses_sse_data(
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"检查完成"}]}}"#,
+        &sender,
+        &mut state,
+    )
+    .expect("应该从消息完成事件恢复正文");
+
+    assert_eq!(state.text, "检查完成");
+    match stream.next().await.expect("应该收到恢复的正文增量") {
+        ModelStreamEvent::TextDelta { delta, .. } => assert_eq!(delta, "检查完成"),
+        event => panic!("收到非预期事件: {event:?}"),
+    }
+}
+
 /// Responses 推理摘要 SSE 必须进入独立思考事件，不能混入最终回答文本。
 #[tokio::test]
 async fn responses_sse_emits_reasoning_summary_delta() {

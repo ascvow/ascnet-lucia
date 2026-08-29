@@ -196,16 +196,21 @@ pub(super) fn handle_responses_sse_data(
                 .get("delta")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if !delta.is_empty() {
-                state.text.push_str(delta);
-                sender.send(ModelStreamEvent::TextDelta {
-                    index: event
-                        .get("output_index")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as usize,
-                    delta: delta.to_string(),
-                });
-            }
+            append_responses_text(&event, delta, sender, state);
+        }
+        "response.output_text.done" => {
+            let text = event
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            append_completed_responses_text(&event, text, sender, state);
+        }
+        "response.content_part.done" => {
+            let text = event
+                .pointer("/part/text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            append_completed_responses_text(&event, text, sender, state);
         }
         "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
             let delta = event
@@ -249,6 +254,12 @@ pub(super) fn handle_responses_sse_data(
                     call,
                 });
                 state.function_items.push(item.clone());
+            } else if let Some(parts) = event.pointer("/item/content").and_then(Value::as_array) {
+                let text = parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<String>();
+                append_completed_responses_text(&event, &text, sender, state);
             }
         }
         "response.completed" => {
@@ -265,6 +276,37 @@ pub(super) fn handle_responses_sse_data(
         _ => {}
     }
     Ok(())
+}
+
+/// 追加 Responses 正文并发送对应增量；空文本不会产生事件。
+fn append_responses_text(
+    event: &Value,
+    text: &str,
+    sender: &ModelEventSender,
+    state: &mut ResponsesStreamState,
+) {
+    if text.is_empty() {
+        return;
+    }
+    state.text.push_str(text);
+    sender.send(ModelStreamEvent::TextDelta {
+        index: event
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        delta: text.to_string(),
+    });
+}
+
+/// 用完整正文事件补齐尚未通过增量收到的后缀，避免标准结束事件造成空响应或重复文本。
+fn append_completed_responses_text(
+    event: &Value,
+    text: &str,
+    sender: &ModelEventSender,
+    state: &mut ResponsesStreamState,
+) {
+    let missing = text.strip_prefix(&state.text).unwrap_or_default();
+    append_responses_text(event, missing, sender, state);
 }
 
 /// Chat Completions 工具调用的流式聚合状态。
