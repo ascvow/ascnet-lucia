@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 /// OpenAI 流式协议类型，用于选择对应的 SSE 聚合器。
@@ -143,7 +144,8 @@ where
 #[derive(Default)]
 pub(super) struct ResponsesStreamState {
     pub(super) text: String,
-    function_items: Vec<Value>,
+    function_items: BTreeMap<usize, Value>,
+    ended_function_items: BTreeSet<usize>,
     completed_response: Option<Value>,
 }
 
@@ -158,8 +160,16 @@ async fn consume_responses_stream(
     })
     .await?;
 
+    finalize_responses_stream_state(state)
+}
+
+/// 将已消费完的 Responses 流状态转换为统一模型响应。
+pub(super) fn finalize_responses_stream_state(
+    state: ResponsesStreamState,
+) -> Result<ModelResponse> {
     if let Some(mut response) = state.completed_response {
         ensure_output_text(&mut response, &state.text);
+        ensure_function_items(&mut response, &state.function_items);
         return parse_responses_response(response);
     }
 
@@ -171,7 +181,7 @@ async fn consume_responses_stream(
             "content": [{ "type": "output_text", "text": state.text }]
         }));
     }
-    output.extend(state.function_items);
+    output.extend(state.function_items.into_values());
     parse_responses_response(json!({ "status": "completed", "output": output }))
 }
 
@@ -232,28 +242,45 @@ pub(super) fn handle_responses_sse_data(
                 .get("delta")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let index = responses_output_index(&event);
+            if let Some(item) = state.function_items.get_mut(&index) {
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                item["arguments"] = Value::String(format!("{arguments}{delta}"));
+            }
             sender.send(ModelStreamEvent::ToolCallDelta {
-                index: event
-                    .get("output_index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize,
+                index,
                 delta: delta.to_string(),
             });
         }
-        "response.output_item.done" => {
+        "response.function_call_arguments.done" => {
+            let index = responses_output_index(&event);
+            if let Some(arguments) = event.get("arguments").and_then(Value::as_str) {
+                if let Some(item) = state.function_items.get_mut(&index) {
+                    item["arguments"] = Value::String(arguments.to_string());
+                }
+            }
+            finish_responses_function_item(index, sender, state)?;
+        }
+        "response.output_item.added" => {
+            let index = responses_output_index(&event);
             if let Some(item) = event
                 .get("item")
                 .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
             {
-                let call = parse_openai_function_call_item(item)?;
-                sender.send(ModelStreamEvent::ToolCallEnd {
-                    index: event
-                        .get("output_index")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as usize,
-                    call,
-                });
-                state.function_items.push(item.clone());
+                state.function_items.insert(index, item.clone());
+            }
+        }
+        "response.output_item.done" => {
+            let index = responses_output_index(&event);
+            if let Some(item) = event
+                .get("item")
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            {
+                state.function_items.insert(index, item.clone());
+                finish_responses_function_item(index, sender, state)?;
             } else if let Some(parts) = event.pointer("/item/content").and_then(Value::as_array) {
                 let text = parts
                     .iter()
@@ -307,6 +334,65 @@ fn append_completed_responses_text(
 ) {
     let missing = text.strip_prefix(&state.text).unwrap_or_default();
     append_responses_text(event, missing, sender, state);
+}
+
+/// 返回 Responses 事件对应的输出位置；兼容网关缺省时归入首个输出项。
+fn responses_output_index(event: &Value) -> usize {
+    event
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
+}
+
+/// 完成一个已聚合的函数调用并只发送一次结束事件。
+fn finish_responses_function_item(
+    index: usize,
+    sender: &ModelEventSender,
+    state: &mut ResponsesStreamState,
+) -> Result<()> {
+    if state.ended_function_items.contains(&index) {
+        return Ok(());
+    }
+    let Some(item) = state.function_items.get(&index) else {
+        return Ok(());
+    };
+    let call = parse_openai_function_call_item(item)?;
+    state.ended_function_items.insert(index);
+    sender.send(ModelStreamEvent::ToolCallEnd { index, call });
+    Ok(())
+}
+
+/// 将流中独立完成的函数调用补入最终响应，避免精简 `response.completed` 丢失工具调用。
+fn ensure_function_items(response: &mut Value, function_items: &BTreeMap<usize, Value>) {
+    if function_items.is_empty() {
+        return;
+    }
+    if !response.get("output").is_some_and(Value::is_array) {
+        response["output"] = Value::Array(Vec::new());
+    }
+    let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in function_items.values() {
+        let identity = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str);
+        let existing_index = identity.and_then(|identity| {
+            output.iter().position(|existing| {
+                existing
+                    .get("call_id")
+                    .or_else(|| existing.get("id"))
+                    .and_then(Value::as_str)
+                    == Some(identity)
+            })
+        });
+        if let Some(existing_index) = existing_index {
+            output[existing_index] = item.clone();
+        } else {
+            output.push(item.clone());
+        }
+    }
 }
 
 /// Chat Completions 工具调用的流式聚合状态。

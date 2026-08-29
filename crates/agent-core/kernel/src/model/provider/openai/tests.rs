@@ -1,8 +1,8 @@
 //! OpenAI 协议转换、参数过滤和流式聚合回归测试。
 
 use super::stream::{
-    handle_chat_completions_sse_data, handle_responses_sse_data, ChatCompletionsStreamState,
-    ResponsesStreamState,
+    finalize_responses_stream_state, handle_chat_completions_sse_data, handle_responses_sse_data,
+    ChatCompletionsStreamState, ResponsesStreamState,
 };
 use super::*;
 use crate::model::ModelStreamEvent;
@@ -261,6 +261,56 @@ async fn responses_sse_recovers_text_from_output_item_done() {
         ModelStreamEvent::TextDelta { delta, .. } => assert_eq!(delta, "检查完成"),
         event => panic!("收到非预期事件: {event:?}"),
     }
+}
+
+/// 兼容网关只在 added 与参数完成事件中提供函数调用时，最终精简响应不得丢失工具调用。
+#[tokio::test]
+async fn responses_sse_recovers_function_call_without_output_item_done() {
+    let (sender, mut stream) = ModelEventStream::channel();
+    let mut state = ResponsesStreamState::default();
+
+    handle_responses_sse_data(
+        r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"list_directory","arguments":""}}"#,
+        &sender,
+        &mut state,
+    )
+    .expect("应该记录函数调用起始项");
+    handle_responses_sse_data(
+        r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"path\":"}"#,
+        &sender,
+        &mut state,
+    )
+    .expect("应该聚合函数参数增量");
+    handle_responses_sse_data(
+        r#"{"type":"response.function_call_arguments.done","output_index":1,"arguments":"{\"path\":\".\"}"}"#,
+        &sender,
+        &mut state,
+    )
+    .expect("应该完成函数调用");
+    handle_responses_sse_data(
+        r#"{"type":"response.completed","response":{"status":"completed","output":[]}}"#,
+        &sender,
+        &mut state,
+    )
+    .expect("应该记录精简完成响应");
+
+    assert!(matches!(
+        stream.next().await.expect("应该收到参数增量"),
+        ModelStreamEvent::ToolCallDelta { index: 1, .. }
+    ));
+    match stream.next().await.expect("应该收到工具调用完成事件") {
+        ModelStreamEvent::ToolCallEnd { index, call } => {
+            assert_eq!(index, 1);
+            assert_eq!(call.name, "list_directory");
+            assert_eq!(call.args, serde_json::json!({"path": "."}));
+        }
+        event => panic!("收到非预期事件: {event:?}"),
+    }
+
+    let response = finalize_responses_stream_state(state).expect("应该生成最终模型响应");
+    assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].name, "list_directory");
 }
 
 /// Responses 推理摘要 SSE 必须进入独立思考事件，不能混入最终回答文本。
