@@ -109,8 +109,8 @@ impl Agent {
 
     /// 使用调用方提供的稳定 ID 运行已有会话。
     ///
-    /// Evidence Plane 可在运行开始前生成强类型 Run ID，并用同一 ID 绑定 Genome、
-    /// Episode 和全部事件。普通调用方应继续使用 [`Agent::run_session`]。
+    /// 调用方可在运行开始前生成强类型 Run ID，并用同一 ID 绑定结果与全部事件。
+    /// 普通调用方应继续使用 [`Agent::run_session`]。
     ///
     /// # Errors
     ///

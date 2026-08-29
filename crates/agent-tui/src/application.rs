@@ -2,50 +2,19 @@
 
 use super::*;
 
-/// 使用 Session Genome 策略收紧普通 TUI 配置生成的 Agent 选项。
-///
-/// Session 未绑定 Genome 时原样返回；存在绑定时通过 Core 的单调收缩入口组合策略，
-/// Evidence 隐私开关和普通配置都不能覆盖 Genome 的限制。
-fn restrict_agent_options_for_genome(
-    options: AgentOptions,
-    genome_policy: Option<&agent_tool::ExecutionPolicy>,
-) -> AgentOptions {
-    match genome_policy {
-        Some(policy) => options.with_execution_policy(policy.clone()),
-        None => options,
-    }
-}
-
-/// 创建原生工具工作区守卫，并在 Session 绑定 Genome 时叠加其文件系统范围。
-///
-/// TUI 启动目录始终是权限上界；Genome 的 `Root` 或 `Denied` 只能进一步收缩该范围，
-/// `Serve` 的 `Unrestricted` 也不能把原有工作区边界扩大为全盘访问。
+/// 创建以 TUI 启动目录为上界的原生工具工作区守卫。
 ///
 /// # Errors
 ///
-/// 工作区或 Genome 声明的有效根目录不存在、无法规范化时返回错误。
-fn native_workspace_guard(
-    workspace_root: &Path,
-    genome_policy: Option<&agent_tool::ExecutionPolicy>,
-) -> Result<agent_tool::WorkspaceGuard> {
-    let Some(genome_policy) = genome_policy else {
-        return Ok(agent_tool::WorkspaceGuard::rooted(workspace_root)?);
-    };
-
-    let mut workspace_policy = agent_tool::ExecutionPolicy::serve();
-    workspace_policy.filesystem = agent_tool::FilesystemScope::Root(workspace_root.to_path_buf());
-    let effective_policy = workspace_policy.restrict(genome_policy);
-    Ok(agent_tool::WorkspaceGuard::from_policy(&effective_policy)?)
+/// 工作区根目录不存在或无法规范化时返回错误。
+fn native_workspace_guard(workspace_root: &Path) -> Result<agent_tool::WorkspaceGuard> {
+    Ok(agent_tool::WorkspaceGuard::rooted(workspace_root)?)
 }
 
-/// 仅为生产 Serve 平面返回应用插件状态目录，避免评估和变异运行读取生产偏好。
+/// 返回应用插件持久状态目录。
 #[cfg(feature = "plugins")]
-fn persistent_plugin_state_dir(
-    lucia_home: &Path,
-    policy: &agent_tool::ExecutionPolicy,
-) -> Option<PathBuf> {
-    (policy.profile() == agent_tool::ExecutionProfile::Serve)
-        .then(|| lucia_home.join("plugin-state"))
+fn persistent_plugin_state_dir(lucia_home: &Path) -> PathBuf {
+    lucia_home.join("plugin-state")
 }
 
 /// 终端状态守卫：正常退出、`?` 提前返回或 panic 展开时都恢复终端。
@@ -106,10 +75,6 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     } else {
         None
     };
-    let default_demo_mode = args.demo
-        || configured_agent
-            .as_ref()
-            .is_none_or(|config| !configured_model_key_is_available(config));
     let lucia_home = lucia_home_dir()?;
     #[cfg(feature = "plugins")]
     {
@@ -147,30 +112,6 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     )
     .await?;
     #[cfg(feature = "plugins")]
-    let may_upgrade_default_official_plugins = session_record.revision == 0
-        && session_record.behavior_binding.is_none()
-        && tui_settings.genome.root_dir.is_none()
-        && tui_settings.genome.stable.is_none()
-        && tui_settings.genome.revision_id.is_none()
-        && tui_settings.evidence.root_dir.is_none()
-        && tui_settings.evidence.genome_revision_id.is_none()
-        && tui_settings.evidence.genome_stable.is_none();
-    let mut genome_runtime = load_genome_session_runtime(
-        &tui_settings.genome,
-        &tui_settings.evidence,
-        &config_path,
-        &lucia_home,
-        if default_demo_mode {
-            DEMO_GENOME_LINEAGE
-        } else {
-            DEFAULT_GENOME_LINEAGE
-        },
-        &mut session_record,
-    )
-    .await?;
-    let mut genome_binding = genome_runtime.binding_arc();
-
-    #[cfg(feature = "plugins")]
     let mut plugin_manifests = args.plugin_manifests.clone();
     #[cfg(feature = "plugins")]
     let mut capability_selection = HashMap::new();
@@ -183,10 +124,6 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         capability_selection.extend(plugin_runtime.capability_selection);
         disabled_plugins.extend(plugin_runtime.disabled_plugins);
     }
-    #[cfg(feature = "plugins")]
-    let plugin_management_base_manifests = plugin_manifests.clone();
-    #[cfg(feature = "plugins")]
-    let plugin_management_base_selection = capability_selection.clone();
     #[cfg(feature = "plugins")]
     {
         let user_manifests = discover_plugin_manifests(&lucia_home.join("plugins"))
@@ -201,41 +138,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         }
         let official_manifests = discover_plugin_manifests(&lucia_home.join("official-plugins"))
             .context("扫描官方插件目录失败")?;
-        let official_manifest_paths = official_manifests.iter().cloned().collect::<HashSet<_>>();
         merge_plugin_manifests(&mut plugin_manifests, official_manifests);
-        // 用户禁用列表最后生效；被禁用的官方插件不属于可自动采用的发行包运行环境。
+        // 用户禁用列表最后生效。
         remove_disabled_plugin_manifests(&mut plugin_manifests, &disabled_plugins);
-        // 只有最终实际选中的 manifest 仍来自官方目录时，才允许自动迁移对应 Bundle 摘要。
-        let official_plugin_ids = plugin_manifests
-            .iter()
-            .filter(|path| official_manifest_paths.contains(*path))
-            .map(PluginManifest::load)
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|manifest| manifest.plugin.id)
-            .collect::<BTreeSet<_>>();
-        if may_upgrade_default_official_plugins && !genome_runtime.is_unconfigured() {
-            let current_environment = crate::genome_binding::snapshot_plugin_environment(
-                &plugin_manifests,
-                &capability_selection,
-            )?;
-            let (runtime, _) = upgrade_default_official_plugin_environment(
-                genome_runtime,
-                current_environment,
-                &official_plugin_ids,
-                &mut session_record,
-            )
-            .await?;
-            genome_runtime = runtime;
-            genome_binding = genome_runtime.binding_arc();
-        }
     }
     let (gateway, options, demo_mode, mut startup_notices) = if args.demo {
         let (gateway, options) = build_demo_gateway();
-        let options = match genome_binding.as_deref() {
-            Some(binding) => binding.bind_demo_options(options).await?,
-            None => options,
-        };
         (
             gateway,
             options,
@@ -251,17 +159,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             .expect("config_exists 已保证真实配置存在")
             .clone();
         if configured_model_key_is_available(&config) {
-            let config = match genome_binding.as_deref() {
-                Some(binding) => binding.bind_model_config(config)?,
-                None => config,
-            };
             let mut options = config.agent_options();
             if config.agent.max_steps.is_none() {
                 // 交互主会话默认不设总步数上限；后台运行可显式传入正数限制。
                 options.max_steps = 0;
-            }
-            if let Some(binding) = genome_binding.as_deref() {
-                options = binding.bind_agent_options(options).await?;
             }
             (config.build_gateway()?, options, false, Vec::new())
         } else {
@@ -274,13 +175,6 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     "set model.api_key or model.api_key_env in the configuration".to_string()
                 });
             let (gateway, options) = build_demo_gateway();
-            let options = match genome_binding.as_deref() {
-                Some(binding) => binding
-                    .bind_demo_options(options)
-                    .await
-                    .context("Session Genome 已固定真实模型路由，但当前配置未提供可用模型密钥")?,
-                None => options,
-            };
             (
                 gateway,
                 options,
@@ -292,16 +186,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         }
     } else {
         let (gateway, options) = build_demo_gateway();
-        let options = match genome_binding.as_deref() {
-            Some(binding) => binding.bind_demo_options(options).await?,
-            None => options,
-        };
         (gateway, options, true, Vec::new())
     };
-    let initial_genome_policy = genome_binding
-        .as_deref()
-        .map(|binding| binding.execution_policy());
-    let mut options = restrict_agent_options_for_genome(options, initial_genome_policy);
+    let mut options = options;
     let mut reasoning_levels = vec![options.reasoning];
     if !demo_mode {
         if let Some(metadata) = tui_settings.model_metadata.as_ref() {
@@ -355,18 +242,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         );
     }
 
-    // 具备 Genome 绑定的 Session 只从 CAS 装配 Skill。历史 Legacy Session 仍可只读加载
-    // 本地 Skill；首次 Draft 必须先建立人工基线，不能把可变文件伪装成固定 Skill 制品。
-    let skill_catalog = match genome_binding.as_deref() {
-        Some(binding) => binding.bind_skill_catalog().await?,
-        None if genome_runtime.is_unconfigured() => SkillCatalog::new(),
-        None => SkillCatalog::load_local([
-            lucia_home.join("skills"),
-            workspace.cwd.join("skills"),
-            workspace.cwd.join(".lucia/skills"),
-        ])
-        .context("扫描原生 Skill 目录失败")?,
-    };
+    let skill_catalog = SkillCatalog::load_local([
+        lucia_home.join("skills"),
+        workspace.cwd.join("skills"),
+        workspace.cwd.join(".lucia/skills"),
+    ])
+    .context("扫描原生 Skill 目录失败")?;
     if let Some(skill_prompt) = skill_catalog.prompt() {
         options.system_prompt.push_str("\n\n");
         options.system_prompt.push_str(&skill_prompt);
@@ -387,93 +268,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Ok(json!({ "echo": text, "source": "native" }))
         }))?;
     } else {
-        // 真实模式注入内置工具集：读写文件、列目录、shell、搜索。
-        // 工作区固定为启动目录；Session Genome 只能在此上界内继续收紧。
-        let guard = native_workspace_guard(&workspace.cwd, initial_genome_policy)?;
+        // 真实模式注入内置工具集：读写文件、列目录、shell、搜索。工作区固定为启动目录。
+        let guard = native_workspace_guard(&workspace.cwd)?;
         agent_tool::builtins::register_builtins(&mut native_tools, guard)?;
     }
     skill_catalog.register_tool(&mut native_tools)?;
 
-    if genome_runtime.is_unconfigured() {
-        #[cfg(feature = "plugins")]
-        let plugin_environment = crate::genome_binding::snapshot_plugin_environment(
-            &plugin_manifests,
-            &capability_selection,
-        )?;
-        #[cfg(not(feature = "plugins"))]
-        let plugin_environment = agent_evolution_protocol::PluginEnvironmentSnapshot {
-            plugins: Vec::new(),
-            capability_owners: Default::default(),
-        };
-        let model = crate::genome_binding::initial_model_genome(
-            configured_agent.as_ref(),
-            &options,
-            demo_mode,
-        )?;
-        let inputs = InitialGenomeInputs {
-            model,
-            system_prompt: options.system_prompt.clone(),
-            provider_options: options.provider_options.clone(),
-            plugin_environment,
-            native_tools: native_tools
-                .specs()
-                .into_iter()
-                .map(|spec| spec.name)
-                .collect(),
-            execution: options.execution_policy.clone(),
-        };
-        let lineage = if demo_mode {
-            DEMO_GENOME_LINEAGE
-        } else {
-            DEFAULT_GENOME_LINEAGE
-        };
-        let (runtime, created) =
-            bootstrap_default_genome_runtime(inputs, &lucia_home, lineage, &mut session_record)
-                .await?;
-        genome_runtime = runtime;
-        genome_binding = genome_runtime.binding_arc();
-        if created {
-            startup_notices.push(format!(
-                "已创建本地人工 Genome 基线 {lineage}；当前及后续同类新会话将固定使用该修订"
-            ));
-        }
-        options = genome_binding
-            .as_deref()
-            .expect("首次人工基线必须产生精确 Genome 绑定")
-            .bind_agent_options(options)
-            .await?;
-        session_record
-            .session
-            .set_system(options.system_prompt.clone());
-    }
-
-    #[cfg(not(feature = "plugins"))]
-    if let Some(binding) = genome_binding.as_deref() {
-        binding.verify_core_only_plugins()?;
-    }
     #[cfg(feature = "plugins")]
-    let plugin_management = match (
-        genome_runtime.registry_root(),
-        genome_runtime.stable_lineage(),
-    ) {
-        (Some(registry_root), Some(lineage)) => Some(Arc::new(PluginManagementService::new(
-            lucia_home.clone(),
-            registry_root.to_path_buf(),
-            lineage.to_string(),
-            plugin_management_base_manifests,
-            plugin_management_base_selection,
-            disabled_plugins.clone(),
-        ))),
-        _ => None,
-    };
-    let evidence_runtime = load_evidence_runtime(&tui_settings.evidence, &genome_runtime).await?;
-    #[cfg(feature = "plugins")]
-    let genome_policy = genome_binding
-        .as_deref()
-        .map(|binding| binding.execution_policy());
-    if let Some(binding) = genome_binding.as_deref() {
-        native_tools = binding.bind_native_tools(&native_tools)?;
-    }
+    let plugin_management = Some(Arc::new(PluginManagementService::new(lucia_home.clone())));
 
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let model_name = options.model.clone();
@@ -490,27 +292,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let base_agent = Agent::new(gateway, options)
         .with_tools(native_tools)
         .with_event_sink(Arc::clone(&application_events));
-    let base_agent = if let Some(evidence) = evidence_runtime.as_ref() {
-        let mut sinks = CompositeEventSink::new();
-        sinks.push(evidence.hub());
-        sinks.push(base_agent.event_sink());
-        base_agent.with_event_sink(Arc::new(sinks))
-    } else {
-        base_agent
-    };
-    let context_policy = match genome_binding.as_deref() {
-        Some(binding) => binding.bind_context_policy().await?,
-        None => None,
-    };
-    // 手动压缩发生在 Agent Run 之外，只写应用事件；自动压缩额外进入已登记的 Evidence Run。
-    // 两条路径使用相同模型路由和策略实现，且都不经过 Plugin Host。
+    // 手动压缩发生在 Agent Run 之外，只写应用事件；两条路径使用相同模型路由和策略实现，
+    // 且都不经过 Plugin Host。
     let manual_context_loader: Arc<dyn ContextLoader> = Arc::new(NativeContextLoader::new(
         base_agent.gateway().clone(),
         base_agent.options().provider.clone(),
         base_agent.options().model.clone(),
         base_agent.options().stream,
         DEFAULT_MAX_SUMMARY_TOKENS,
-        context_policy.clone(),
         application_events,
     )?);
     let agent_context_loader: Arc<dyn ContextLoader> = Arc::new(NativeContextLoader::new(
@@ -519,12 +308,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         base_agent.options().model.clone(),
         base_agent.options().stream,
         DEFAULT_MAX_SUMMARY_TOKENS,
-        context_policy,
         base_agent.event_sink(),
     )?);
     let base_agent = base_agent.with_context_loader(agent_context_loader);
-    // Runtime 子 Agent 使用独立执行会话，不能继承只为 TUI 主会话预登记的 Evidence sink；
-    // 因此先捕获插件模板，子运行随后由 Runtime 的可信观察器分别登记。
+    // 先捕获插件模板，供派生子 Agent 使用独立执行会话。
     #[cfg(feature = "plugins")]
     let plugin_agent_template = AgentTemplate::from_agent(&base_agent);
     #[cfg(feature = "plugins")]
@@ -593,9 +380,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .with_context_window(context_window)
         .with_reasoning_levels(reasoning_levels, reasoning_level)
         .with_persistent_session(session_store, session_record)
-        .with_context_loader(manual_context_loader)
-        .with_genome_runtime(genome_runtime.clone())
-        .with_evidence(evidence_runtime.clone());
+        .with_context_loader(manual_context_loader);
     if let Some(input) = model_input_modalities {
         app = app.with_model_modalities(input);
     }
@@ -615,24 +400,16 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         app = app.with_loading_plugins(loading_plugin_ids);
         let load_tx = tx.clone();
         let load_host = Arc::clone(&live_plugin_host);
-        let plugin_execution_policy = genome_policy
-            .cloned()
-            .unwrap_or_else(agent_tool::ExecutionPolicy::serve);
-        let persistent_state_dir =
-            persistent_plugin_state_dir(&lucia_home, &plugin_execution_policy);
-        let run_observer = evidence_runtime
-            .as_ref()
-            .map(EvidenceRuntime::runtime_run_observer);
-        let plugin_genome_binding = genome_binding.clone();
+        let plugin_execution_policy = agent_tool::ExecutionPolicy::serve();
+        let persistent_state_dir = Some(persistent_plugin_state_dir(&lucia_home));
         tokio::spawn(async move {
             let result = load_plugins_for_tui(
                 plugin_manifests,
                 capability_selection,
-                plugin_genome_binding,
                 plugin_agent_template,
                 PluginExecutionContext {
                     execution_policy: plugin_execution_policy,
-                    run_observer,
+                    run_observer: None,
                     model: tui_settings.plugin_model.clone(),
                     persistent_state_dir,
                 },
@@ -1129,78 +906,29 @@ async fn record_run_failure_event(events_jsonl: Option<&Path>, completion: &Agen
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_tool::{ExecutionPolicy, ExecutionProfile};
 
-    /// Evidence 策略必须收紧普通配置，且较严格的普通配置不能被 Serve Genome 放宽。
-    #[test]
-    fn genome_policy_only_tightens_agent_options() {
-        let evaluation = ExecutionPolicy::evaluation("/tmp/lucia-fixture");
-        let options = restrict_agent_options_for_genome(AgentOptions::default(), Some(&evaluation));
-        assert_eq!(
-            options.execution_policy.profile(),
-            ExecutionProfile::Evaluation
-        );
-        assert!(!options.execution_policy.allow_process);
-
-        let mutation_options =
-            AgentOptions::default().with_execution_policy(ExecutionPolicy::mutation());
-        let options =
-            restrict_agent_options_for_genome(mutation_options, Some(&ExecutionPolicy::serve()));
-        assert_eq!(
-            options.execution_policy.profile(),
-            ExecutionProfile::Mutation
-        );
-    }
-
-    /// 生产插件偏好只允许进入 Serve 平面，Evaluation 与 Mutation 必须使用隔离内存状态。
+    /// 插件持久状态目录必须固定落在 Lucia Home 之下。
     #[cfg(feature = "plugins")]
     #[test]
-    fn persistent_plugin_state_is_scoped_to_serve_plane() {
+    fn persistent_plugin_state_lives_under_lucia_home() {
         let home = Path::new("/tmp/lucia-home");
-        assert_eq!(
-            persistent_plugin_state_dir(home, &ExecutionPolicy::serve()),
-            Some(home.join("plugin-state"))
-        );
-        assert_eq!(
-            persistent_plugin_state_dir(home, &ExecutionPolicy::evaluation("/tmp/lucia-fixture")),
-            None
-        );
-        assert_eq!(
-            persistent_plugin_state_dir(home, &ExecutionPolicy::mutation()),
-            None
-        );
+        assert_eq!(persistent_plugin_state_dir(home), home.join("plugin-state"));
     }
 
-    /// 原生工具守卫必须采用工作区与 Genome 文件范围的交集，并保持无 Evidence 的旧边界。
+    /// 原生工具守卫必须固定为 TUI 启动目录。
     #[test]
-    fn genome_policy_restricts_native_workspace_guard() {
+    fn native_workspace_guard_is_rooted_at_workspace() {
         let root = std::env::temp_dir().join(format!(
-            "lucia-evidence-guard-{}",
+            "lucia-workspace-guard-{}",
             agent_session::SessionId::generate()
         ));
         let workspace = root.join("workspace");
-        let fixture = workspace.join("fixture");
-        std::fs::create_dir_all(&fixture).expect("应创建测试工作区");
+        std::fs::create_dir_all(&workspace).expect("应创建测试工作区");
 
-        let guard = native_workspace_guard(&workspace, None).expect("应保留默认工作区守卫");
+        let guard = native_workspace_guard(&workspace).expect("应创建工作区守卫");
         assert_eq!(
             guard.root(),
             Some(workspace.canonicalize().expect("应规范化工作区").as_path())
-        );
-
-        let guard = native_workspace_guard(&workspace, Some(&ExecutionPolicy::serve()))
-            .expect("Serve Genome 不应扩大工作区");
-        assert_eq!(
-            guard.root(),
-            Some(workspace.canonicalize().expect("应规范化工作区").as_path())
-        );
-
-        let evaluation = ExecutionPolicy::evaluation(&fixture);
-        let guard = native_workspace_guard(&workspace, Some(&evaluation))
-            .expect("Evaluation Fixture 应进入守卫");
-        assert_eq!(
-            guard.root(),
-            Some(fixture.canonicalize().expect("应规范化 Fixture").as_path())
         );
 
         std::fs::remove_dir_all(root).expect("应清理测试工作区");

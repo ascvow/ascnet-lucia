@@ -1,12 +1,10 @@
 # 插件管理
 
 Lucia 只通过 TUI 暴露人工插件管理。启动插件版 `lucia` 后输入 `/plugins`，可以查看固定版本、
-Bundle SHA-256、启用状态、当前 Stable Revision、代数和 `PluginEnvironmentDigest`。应用服务把
-用户操作委托给 `agent-plugin-manager`；Plugin Host 只消费验证后的运行时配置，不参与安装。
+Bundle SHA-256 和启用状态。应用服务把用户操作委托给 `agent-plugin-manager`；Plugin Host
+只消费验证后的运行时配置，不参与安装。
 
-插件不是 Evolution Mutation Surface。Lucia 不会自主修改、生成、组合、升级、启停或重新配置
-插件。Prompt、Skill 内容和第一方 Policy Artifact 仍可进化，承载或读取它们的插件 Runtime
-保持固定。
+Lucia 不会自主修改、生成、组合、升级、启停或重新配置插件；全部插件变更都由用户显式发起。
 
 ## TUI 操作
 
@@ -22,9 +20,8 @@ Bundle SHA-256、启用状态、当前 Stable Revision、代数和 `PluginEnviro
 | `b` | 输入插件 ID 和历史版本，从 Installed Version History 人工回滚 |
 | `e` | 启用或禁用高亮插件 |
 | `o` / `w` | 选择或清除 Capability Owner |
-| `a` | 二次确认后把当前磁盘插件环境采用为新的人工基线 |
 | `x` | 两次确认后移除高亮插件 |
-| `r` | 重新读取插件锁和冻结环境 |
+| `r` | 重新读取插件锁 |
 
 Registry、GitHub 和本地安装都只接受已经构建的 Bundle。受管理目录只持久化 `plugin.toml`
 和 Manifest 指向的 WASM；即使用户选择插件开发 crate，源码、Cargo `target`、Smoke Test 与
@@ -34,32 +31,20 @@ Registry、GitHub 和本地安装都只接受已经构建的 Bundle。受管理�
 
 人工更新或移除时，原 Bundle 及其安装摘要进入 `Installed Version History`，不会删除。
 人工回滚只切换锁文件绑定并重新校验 Bundle、依赖和 Capability Owner；被替换版本继续保留。
-该历史用于 Replay 与人工恢复，不称为 Evolution Lineage，也不向 Evolver 暴露版本选择能力。
+该历史用于人工恢复。
 
-## 人工基线事务
+## 写操作事务
 
-插件写操作只在 TUI 绑定了可发布的 Stable Genome 时启用。每次真实变化执行同一个事务：
+每次插件写操作执行同一个事务：
 
 1. 捕获当前 `plugins.lock.toml` 和受管理 Bundle 的确定性恢复快照；
 2. 执行用户明确选择的 Plugin Manager 操作；
-3. 从真实 Manifest、Bundle、加载顺序和 Capability Owner 构造冻结插件环境；
-4. 创建 `RevisionOrigin::PluginManagement` Genome Revision；
-5. 通过 expected-current CAS 发布新 Stable 基线。
+3. 读取写入后的插件列表和运行时配置，判断插件环境是否真的发生变化。
 
-人工基线不绑定 Release、EvaluationReport 或 EvolutionCertificate，也不会显示为 `EVOLVED`。
-Stable 已被其他控制面移动时，提交失败并恢复操作前的 Plugin Manager 状态。Manager 写入后的
-快照、Genome 登记或 Stable 提交失败也执行同一补偿恢复，避免锁文件与 Stable Genome 分叉。
-开发者直接整理人工开发 Bundle 后，可以在 `/plugins` 页面按两次 `a` 显式创建
-`PluginManagement` 基线；环境未变化时不会创建空修订。
+任一步失败都会恢复操作前的 Plugin Manager 状态，避免留下半完成安装。
 
-人工变更后，当前 Session 和已经实例化的 Host 继续使用启动时的精确 Revision；新 Session
-使用新 Stable。基于旧插件环境的 Candidate 因 expected-current 或插件环境摘要不一致而不能
-Promotion。Lucia 不在活动 Run 中热替换插件。
-
-安装新的 Lucia 二进制后，未绑定的新 Session 会在默认 Stable 上创建
-`RevisionOrigin::PlatformUpgrade` 修订，只更新可验证的 Kernel 运行身份。Prompt、Skill、Policy、
-权限与冻结插件环境保持不变；该修订不绑定 EvaluationReport、Release 或
-EvolutionCertificate。显式选择的 Revision 和已有 Session 不会被静默迁移。
+人工变更后，当前 Session 和已经实例化的 Host 继续使用启动时的插件环境；新 Session 使用新
+环境。Lucia 不在活动 Run 中热替换插件。
 
 ## 安装位置与运行时优先级
 
@@ -72,14 +57,14 @@ EvolutionCertificate。显式选择的 Revision 和已有 Session 不会被静�
 4. `$LUCIA_HOME/official-plugins/<bundle>/plugin.toml`。
 
 同 ID 的高优先级声明覆盖低优先级来源，配置中的 `disabled_plugins` 最后生效。最终组合进入
-Host 前重新校验 Bundle、Manifest、依赖、权限、Capability Owner 和 Genome 冻结摘要。
+Host 前重新校验 Bundle、Manifest、依赖、权限和 Capability Owner。
 
 ## 开发与诊断
 
 官方和第三方插件继续使用独立 crate、独立插件版本和独立 `api_version`。开发者更新
 `plugin.toml` 后应运行对应 workspace 测试、Component 构建和真实 WASM Host smoke test，再
 把预构建 Bundle 交给 TUI 人工安装或更新。`bun run package:plugin:official` 继续生成 Registry、
-ZIP 和 `.sha256`；这些开发和 CI 流程不是插件进化。
+ZIP 和 `.sha256`。
 
 `lucia doctor` 保留只读诊断；`lucia doctor --network` 额外检查 GitHub 连通性。插件服务版本、
 Manifest `api_version`、插件 crate 版本和锁文件 Schema 是独立版本维度，不得相互替代。

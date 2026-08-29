@@ -63,7 +63,7 @@ TUI 默认装配 `agent-context` 的 `NativeContextLoader`，不经过 Plugin Ho
 
 原生 `/compact` 将当前 Session 以 `user_initiated` 请求交给同一加载器，无条件尝试完整压缩；内容变化时以 revision 比较并交换方式持久化并立即替换当前 Session。默认插件版与 `--no-default-features` 纯 Core 版使用相同行为。
 
-Evidence 运行从 Artifact CAS 装配 Genome 固定的 Context Policy，`PolicyRef.id` 必须为原生稳定 owner `native-context`。压缩事实直接写入 Agent EventSink，供 TUI 展示与 Evidence 记录使用。
+压缩事实直接写入 Agent EventSink，供 TUI 展示使用。
 
 ## 挂载与恢复
 

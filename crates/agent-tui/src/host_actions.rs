@@ -191,7 +191,7 @@ pub(crate) async fn resume_selected_session(
     revision: u64,
 ) -> Result<()> {
     let id = SessionId::new(session_id)?;
-    let mut record = app
+    let record = app
         .session_store
         .load(&id)
         .await?
@@ -199,7 +199,6 @@ pub(crate) async fn resume_selected_session(
     if record.revision != revision {
         return Err(anyhow!("会话 `{session_id}` 已更新，请刷新列表后重新选择"));
     }
-    app.genome_runtime.bind_or_validate_session(&mut record)?;
     let notice = format!("已恢复会话 {}", record.id);
     app.replace_session(record, Some(&notice));
     Ok(())

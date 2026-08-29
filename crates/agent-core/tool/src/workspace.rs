@@ -41,7 +41,7 @@ impl fmt::Display for FileCapability {
 ///
 /// 四项能力单独开关，便于 Evaluation 只开放读取。`Delete` 目前没有对应的内置工具，
 /// 唯一的删除路径是 `shell`；保留该能力是为了让策略能完整表达文件权限，
-/// 并在写入 Genome 时不丢失维度。
+/// 并在序列化时不丢失维度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FileCapabilities {
     /// 是否允许读取。

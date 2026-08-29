@@ -5,13 +5,6 @@ mod app_state;
 mod application;
 mod conversation;
 mod doctor;
-mod episode_cli;
-mod evidence;
-mod evolution_cli;
-mod evolution_control;
-mod evolution_dashboard;
-mod genome_binding;
-mod genome_session;
 #[cfg(feature = "plugins")]
 mod host_actions;
 mod model_metadata;
@@ -74,20 +67,13 @@ use anyhow::Context;
 use anyhow::{anyhow, Result};
 use app_config::{
     initialize_config, load_tui_settings, lucia_home_dir, persist_reasoning_level,
-    resolve_config_path, resolve_config_relative_path, EvidenceSettings, TuiSettings,
+    resolve_config_path, resolve_config_relative_path, TuiSettings,
 };
 use app_state::*;
 use async_trait::async_trait;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use crossterm::event::MouseEvent;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
-use evidence::{load_evidence_runtime, EvidenceRuntime};
-#[cfg(feature = "plugins")]
-use genome_session::upgrade_default_official_plugin_environment;
-use genome_session::{
-    bootstrap_default_genome_runtime, load_genome_session_runtime, GenomeSessionRuntime,
-    InitialGenomeInputs, DEFAULT_GENOME_LINEAGE, DEMO_GENOME_LINEAGE,
-};
 use ratatui::{prelude::*, widgets::*};
 #[cfg(feature = "plugins")]
 use serde::{de::DeserializeOwned, Serialize};
@@ -95,7 +81,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 #[cfg(feature = "plugins")]
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::{
     path::Path,
     path::PathBuf,
@@ -165,10 +151,6 @@ struct Args {
 enum Command {
     /// 对整个 Lucia 安装执行无侵入只读诊断。
     Doctor(DoctorArgs),
-    /// 查询和导出不可变 Episode 证据。
-    Episode(episode_cli::EpisodeArgs),
-    /// 查看可审计的 Evolution Scorecard 与历史分析。
-    Evolution(evolution_cli::EvolutionArgs),
 }
 
 /// 全局诊断参数。
@@ -327,8 +309,6 @@ async fn main() -> Result<()> {
     let mut args = Args::parse();
     match args.command.take() {
         Some(Command::Doctor(options)) => doctor::run(&args, options).await,
-        Some(Command::Episode(options)) => episode_cli::run(options).await,
-        Some(Command::Evolution(options)) => evolution_cli::run(options).await,
         None => application::run(args).await,
     }
 }

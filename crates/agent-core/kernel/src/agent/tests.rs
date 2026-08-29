@@ -456,7 +456,7 @@ async fn dynamic_reasoning_level_updates_next_request() {
     assert_eq!(requests[0].reasoning, ReasoningLevel::XHigh);
 }
 
-/// Evidence Plane 提供的 Run ID 必须贯穿结果和全部事件，不能在 Core 内被替换。
+/// 调用方提供的 Run ID 必须贯穿结果和全部事件，不能在 Core 内被替换。
 #[tokio::test]
 async fn caller_supplied_run_id_binds_result_and_events() {
     let sink = Arc::new(InMemoryEventSink::new());

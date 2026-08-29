@@ -75,7 +75,7 @@ pub struct PluginLock {
     pub plugins: Vec<InstalledPlugin>,
     /// 已归档但不参与运行时加载的人工安装版本历史。
     ///
-    /// 该字段只支持人工回滚和 Replay，不表示 Evolution Lineage，也不能由 Evolver 选择。
+    /// 该字段只支持人工回滚，不表示自动升级链路。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub version_history: Vec<InstalledPlugin>,
     /// 独占能力 ID 到启用插件 ID 的选择。
@@ -86,7 +86,7 @@ pub struct PluginLock {
 /// 一次人工插件管理操作前捕获的可恢复状态。
 ///
 /// 快照包含锁文件和每个受管理 Bundle 的确定性归档，仅用于应用层在后续人工基线提交失败时
-/// 执行补偿恢复。它不会安装新版本、选择版本或参与 Evolution Candidate。
+/// 执行补偿恢复。它不会自行安装或选择版本。
 #[derive(Debug, Clone)]
 pub struct PluginManagerStateSnapshot {
     lock: PluginLock,
@@ -204,7 +204,7 @@ impl PluginManager {
     ///
     /// 新 bundle 会先完成路径、manifest、WASM、依赖、能力和锁文件校验；任一步失败时保留
     /// 原版本及锁记录。成功提交新锁记录时，旧版本会进入 Installed Version History，保留
-    /// 原 Bundle 用于人工回滚和 Replay；该历史不参与 Evolution。
+    /// 原 Bundle 用于人工回滚。
     ///
     /// # Errors
     ///
@@ -370,7 +370,7 @@ impl PluginManager {
     /// 返回不参与运行时加载的人工安装版本历史。
     ///
     /// 结果按插件 ID 和版本排序；每条记录仍绑定安装时的 Bundle SHA-256，调用方只能把它
-    /// 展示为 Package/Installed Version History，不能解释为 Evolution Lineage。
+    /// 展示为 Package/Installed Version History。
     ///
     /// # Errors
     ///
@@ -546,7 +546,7 @@ impl PluginManager {
     /// 从当前运行集合移除指定插件，并把原 Bundle 保留到人工安装版本历史。
     ///
     /// 仍被启用插件依赖时拒绝移除。成功后运行时不再加载该插件，但历史 Bundle 继续受摘要
-    /// 约束，可由用户人工回滚；该行为不会创建 Evolution Candidate。
+    /// 约束，可由用户人工回滚。
     pub fn remove(&self, plugin_id: &str) -> Result<InstalledPlugin> {
         validate_storage_component(plugin_id, "插件 ID")?;
         let mut lock = self.load_lock()?;
@@ -1344,7 +1344,7 @@ fn read_archive_u64(archive: &[u8], cursor: &mut usize) -> Result<u64> {
 /// 计算插件 bundle 的稳定 SHA-256 摘要。
 ///
 /// 摘要覆盖 bundle 内所有目录、普通文件、相对路径和文件内容；符号链接、特殊文件与
-/// 非法路径会被拒绝。Plugin Manager 锁文件和 Genome 运行绑定必须复用该算法，避免
+/// 非法路径会被拒绝。Plugin Manager 锁文件必须复用该算法，避免
 /// 安装完整性与运行身份采用不同口径。
 ///
 /// # Errors

@@ -86,13 +86,9 @@ pub(crate) struct App {
     pub(crate) session_store: Arc<dyn SessionStore>,
     /// `/compact` 与模型请求共同使用的原生上下文加载器。
     pub(crate) context_loader: Arc<dyn ContextLoader>,
-    /// 当前进程固定的 Session Genome 行为绑定；独立于 Evidence 隐私开关。
-    pub(crate) genome_runtime: GenomeSessionRuntime,
-    /// TUI 人工插件控制面；只在配置了 Stable Genome 的插件构建中存在。
+    /// TUI 人工插件控制面；只在插件构建中存在。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_management: Option<Arc<PluginManagementService>>,
-    /// 可选 Evidence Plane；启用后每次主会话运行必须形成 Episode。
-    pub(crate) evidence: Option<EvidenceRuntime>,
     pub(crate) tx: mpsc::UnboundedSender<UiEvent>,
     pub(crate) model_name: String,
     /// 当前进程实际加载的配置路径；思考等级切换会原子更新该文件。
@@ -321,13 +317,8 @@ impl App {
             session_record,
             session_store: Arc::new(MemorySessionStore::new()),
             context_loader: Arc::new(agent_core::PassthroughContextLoader),
-            #[cfg(not(test))]
-            genome_runtime: GenomeSessionRuntime::default(),
-            #[cfg(test)]
-            genome_runtime: GenomeSessionRuntime::TestOnly,
             #[cfg(feature = "plugins")]
             plugin_management: None,
-            evidence: None,
             tx,
             model_name,
             config_path: None,
@@ -440,12 +431,6 @@ impl App {
         self
     }
 
-    /// 注入启动时按 Session 精确解析的 Genome 行为运行时。
-    pub(crate) fn with_genome_runtime(mut self, genome_runtime: GenomeSessionRuntime) -> Self {
-        self.genome_runtime = genome_runtime;
-        self
-    }
-
     /// 注入只供 TUI 原生插件页使用的人工管理服务。
     #[cfg(feature = "plugins")]
     pub(crate) fn with_plugin_management(
@@ -453,12 +438,6 @@ impl App {
         plugin_management: Option<Arc<PluginManagementService>>,
     ) -> Self {
         self.plugin_management = plugin_management;
-        self
-    }
-
-    /// 注入启动时已经验证 Genome Revision 的 Evidence Plane。
-    pub(crate) fn with_evidence(mut self, evidence: Option<EvidenceRuntime>) -> Self {
-        self.evidence = evidence;
         self
     }
 
@@ -494,8 +473,7 @@ impl App {
 
     /// 进入当前项目下尚未持久化的全新空白草稿。
     pub(crate) fn start_new_draft(&mut self, notice: &str) -> Result<()> {
-        let mut draft = self.workspace.draft_record()?;
-        self.genome_runtime.bind_or_validate_session(&mut draft)?;
+        let draft = self.workspace.draft_record()?;
         self.replace_session(draft, Some(notice));
         Ok(())
     }
@@ -848,18 +826,6 @@ impl App {
         }
     }
 
-    /// 判断 Evidence Genome 的固定插件组合是否已经完整 Ready。
-    ///
-    /// 普通模式保持渐进加载期间可提交输入的既有体验；Evidence 模式必须等待全部插件
-    /// 完成，且任一加载失败都会阻止 Run，避免 Episode 绑定的 Genome 与真实组合不同。
-    #[cfg(feature = "plugins")]
-    pub(crate) fn evidence_genome_run_is_ready(&self) -> bool {
-        self.evidence.is_none()
-            || (!self.plugins_loading
-                && self.plugin_load_error.is_none()
-                && self.plugin_failures.is_empty())
-    }
-
     /// 返回主输入当前激活的触发视图索引。
     ///
     /// 主输入去除前导空白后以某个视图声明的触发前缀开头即视为激活；
@@ -1114,14 +1080,6 @@ impl App {
                 if self.pending_reload.is_some() {
                     self.messages
                         .push(Msg::new(MsgKind::Info, "上下文压缩仍在进行中，请稍候"));
-                    return;
-                }
-                #[cfg(feature = "plugins")]
-                if !self.evidence_genome_run_is_ready() {
-                    self.messages.push(Msg::new(
-                        MsgKind::Info,
-                        "Evidence Genome 的插件组合尚未完整就绪，当前不能开始 Run。".to_string(),
-                    ));
                     return;
                 }
                 if let Some(agent) = agent {
@@ -2103,33 +2061,15 @@ impl App {
         let tx = self.tx.clone();
         let session_store = Arc::clone(&self.session_store);
         let session_record = self.session_record.clone();
-        let genome_runtime = self.genome_runtime.clone();
-        let evidence = self.evidence.clone();
 
         tokio::spawn(async move {
-            let result = match evidence.as_ref() {
-                Some(evidence) => {
-                    run_and_persist_with_evidence(
-                        agent.as_ref(),
-                        session_store.as_ref(),
-                        session_record,
-                        submission,
-                        &genome_runtime,
-                        Some(evidence),
-                    )
-                    .await
-                }
-                None => {
-                    run_and_persist(
-                        agent.as_ref(),
-                        session_store.as_ref(),
-                        session_record,
-                        submission,
-                        &genome_runtime,
-                    )
-                    .await
-                }
-            };
+            let result = run_and_persist(
+                agent.as_ref(),
+                session_store.as_ref(),
+                session_record,
+                submission,
+            )
+            .await;
             let _ = tx.send(UiEvent::AgentDone(Box::new(result)));
         });
     }

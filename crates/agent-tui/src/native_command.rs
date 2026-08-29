@@ -170,23 +170,17 @@ pub(crate) struct NativePluginDialogData {
     pub(crate) plugins: Vec<agent_plugin_manager::InstalledPlugin>,
     /// 不参与当前运行时加载的人工安装版本历史。
     pub(crate) version_history: Vec<agent_plugin_manager::InstalledPlugin>,
-    /// 当前 Stable Genome 修订。
-    pub(crate) stable_revision: agent_evolution_protocol::GenomeRevisionId,
-    /// 当前冻结插件环境摘要。
-    pub(crate) environment_digest: agent_evolution_protocol::PluginEnvironmentDigest,
-    /// 当前 Stable 代数。
-    pub(crate) generation: u64,
 }
 
 /// 插件管理页的异步状态。
 #[cfg(feature = "plugins")]
 #[derive(Debug)]
 pub(crate) enum NativePluginDialogStatus {
-    /// 正在读取 Manager 与 Stable Genome。
+    /// 正在读取 Plugin Manager 状态。
     Loading,
-    /// 列表和冻结环境已经校验。
+    /// 插件列表已经就绪。
     Ready(NativePluginDialogData),
-    /// 正在提交 Manager 写入和人工基线。
+    /// 正在执行 Manager 写入。
     Applying,
     /// 读取或写入失败；用户可刷新重试。
     Error(String),
@@ -226,8 +220,6 @@ pub(crate) struct NativePluginDialog {
     pub(crate) path_input: String,
     /// 第一次删除按键记录的插件 ID；再次确认才执行。
     pub(crate) remove_confirmation: Option<String>,
-    /// 是否正在等待用户再次确认采用当前插件环境。
-    pub(crate) adopt_confirmation: bool,
 }
 
 /// TUI 原生命令状态；不依赖 Plugin Host，纯 Core 构建同样可用。
@@ -685,12 +677,11 @@ impl App {
             path_mode: None,
             path_input: String::new(),
             remove_confirmation: None,
-            adopt_confirmation: false,
         });
         self.reload_native_plugins();
     }
 
-    /// 重新加载插件管理页；未配置 Stable Genome 时以只读错误说明阻止写操作。
+    /// 重新加载插件管理页；缺少插件管理服务时以只读错误说明阻止写操作。
     #[cfg(feature = "plugins")]
     fn reload_native_plugins(&mut self) {
         let Some(dialog) = self.native_command.plugin_dialog.as_mut() else {
@@ -698,11 +689,9 @@ impl App {
         };
         dialog.status = NativePluginDialogStatus::Loading;
         dialog.remove_confirmation = None;
-        dialog.adopt_confirmation = false;
         let Some(service) = self.plugin_management.as_ref().map(Arc::clone) else {
-            dialog.status = NativePluginDialogStatus::Error(
-                "未配置可发布的 Stable Genome；插件写操作已禁用".into(),
-            );
+            dialog.status =
+                NativePluginDialogStatus::Error("插件管理服务不可用；插件写操作已禁用".into());
             return;
         };
         let tx = self.tx.clone();
@@ -738,21 +727,14 @@ impl App {
     ) {
         match result {
             Ok(outcome) => {
-                let suffix = outcome.baseline.as_ref().map_or_else(
-                    || "插件环境没有行为变化，未创建新基线。".to_string(),
-                    |baseline| {
-                        format!(
-                            "插件环境已改变；新 Session 使用人工基线 {}（代数 {}，Genome 摘要 {}，插件摘要 {}）。当前 Session 继续使用启动时快照，旧 Evolution Candidate 不得自动应用。",
-                            baseline.revision_id,
-                            baseline.generation,
-                            baseline.genome_digest,
-                            baseline.plugin_environment_digest
-                        )
-                    },
-                );
+                let suffix = if outcome.changed {
+                    "插件环境已改变；新 Session 生效，当前 Session 继续使用启动时快照。"
+                } else {
+                    "插件环境没有变化。"
+                };
                 self.messages.push(Msg::new(
                     MsgKind::Info,
-                    format!("{}\n{}", outcome.message, suffix),
+                    format!("{}\n{suffix}", outcome.message),
                 ));
                 self.reload_native_plugins();
             }
@@ -862,15 +844,6 @@ impl App {
         match code {
             KeyCode::Esc => self.native_command.plugin_dialog = None,
             KeyCode::Char('r') => self.reload_native_plugins(),
-            KeyCode::Char('a') if matches!(dialog.status, NativePluginDialogStatus::Ready(_)) => {
-                if dialog.adopt_confirmation {
-                    dialog.adopt_confirmation = false;
-                    self.start_native_plugin_action(ManualPluginAction::AdoptCurrentEnvironment);
-                } else {
-                    dialog.adopt_confirmation = true;
-                    dialog.remove_confirmation = None;
-                }
-            }
             KeyCode::Char('i') if matches!(dialog.status, NativePluginDialogStatus::Ready(_)) => {
                 dialog.path_mode = Some(NativePluginPathMode::Install);
                 dialog.path_input.clear();
@@ -911,12 +884,10 @@ impl App {
             KeyCode::Up if item_count > 0 => {
                 dialog.selected = dialog.selected.checked_sub(1).unwrap_or(item_count - 1);
                 dialog.remove_confirmation = None;
-                dialog.adopt_confirmation = false;
             }
             KeyCode::Down if item_count > 0 => {
                 dialog.selected = (dialog.selected + 1) % item_count;
                 dialog.remove_confirmation = None;
-                dialog.adopt_confirmation = false;
             }
             KeyCode::Char('e') if item_count > 0 => {
                 let NativePluginDialogStatus::Ready(data) = &dialog.status else {
@@ -958,16 +929,14 @@ impl App {
     fn start_native_plugin_action(&mut self, action: ManualPluginAction) {
         let Some(service) = self.plugin_management.as_ref().map(Arc::clone) else {
             if let Some(dialog) = self.native_command.plugin_dialog.as_mut() {
-                dialog.status = NativePluginDialogStatus::Error(
-                    "未配置可发布的 Stable Genome；插件写操作已禁用".into(),
-                );
+                dialog.status =
+                    NativePluginDialogStatus::Error("插件管理服务不可用；插件写操作已禁用".into());
             }
             return;
         };
         if let Some(dialog) = self.native_command.plugin_dialog.as_mut() {
             dialog.status = NativePluginDialogStatus::Applying;
             dialog.remove_confirmation = None;
-            dialog.adopt_confirmation = false;
         }
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -985,15 +954,9 @@ impl App {
 async fn load_native_plugin_dialog(
     service: &PluginManagementService,
 ) -> Result<NativePluginDialogData> {
-    let plugins = service.list()?;
-    let version_history = service.list_version_history()?;
-    let (stable, environment_digest) = service.frozen_environment().await?;
     Ok(NativePluginDialogData {
-        plugins,
-        version_history,
-        stable_revision: stable.revision_id,
-        environment_digest,
-        generation: stable.generation,
+        plugins: service.list()?,
+        version_history: service.list_version_history()?,
     })
 }
 
@@ -1001,13 +964,13 @@ async fn load_native_plugin_dialog(
 ///
 /// # Errors
 ///
-/// 会话不存在、选择后已更新、存储读取失败或 Genome 行为绑定不一致时返回错误。
+/// 会话不存在、选择后已更新、存储读取失败时返回错误。
 pub(crate) async fn resume_native_session(
     app: &mut App,
     session_id: SessionId,
     revision: u64,
 ) -> Result<()> {
-    let mut record = app
+    let record = app
         .session_store
         .load(&session_id)
         .await?
@@ -1015,7 +978,6 @@ pub(crate) async fn resume_native_session(
     if record.revision != revision {
         return Err(anyhow!("会话 `{session_id}` 已更新，请刷新列表后重新选择"));
     }
-    app.genome_runtime.bind_or_validate_session(&mut record)?;
     let notice = format!("已恢复会话 {}", record.id);
     app.replace_session(record, Some(&notice));
     Ok(())
@@ -1200,11 +1162,11 @@ pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &App, outer: R
     let inner_height = usize::from(height.saturating_sub(5));
     let mut lines = match &dialog.status {
         NativePluginDialogStatus::Loading => vec![Line::from(Span::styled(
-            "正在读取插件锁和冻结环境…",
+            "正在读取插件锁…",
             Style::new().fg(COLOR_MUTED),
         ))],
         NativePluginDialogStatus::Applying => vec![Line::from(Span::styled(
-            "正在提交人工插件管理基线；当前 Session 不会热重载…",
+            "正在执行插件写操作；当前 Session 不会热重载…",
             Style::new().fg(COLOR_WARNING),
         ))],
         NativePluginDialogStatus::Error(error) => vec![
@@ -1219,18 +1181,8 @@ pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &App, outer: R
         ],
         NativePluginDialogStatus::Ready(data) => {
             let mut content = vec![
-                Line::from(vec![
-                    Span::styled("Frozen Plugin Environment  ", Style::new().fg(COLOR_MUTED)),
-                    Span::styled(
-                        truncate_line(data.environment_digest.as_ref(), 24),
-                        Style::new().fg(COLOR_USER),
-                    ),
-                ]),
                 Line::from(Span::styled(
-                    format!(
-                        "Stable {} · generation {} · Plugins are fixed dependencies for this Session.",
-                        data.stable_revision, data.generation
-                    ),
+                    "Plugins are fixed dependencies for this Session.",
                     Style::new().fg(COLOR_MUTED),
                 )),
                 Line::from(Span::styled(
@@ -1306,21 +1258,16 @@ pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &App, outer: R
             Span::styled(format!("{label}: "), Style::new().fg(COLOR_USER)),
             Span::styled(&dialog.path_input, Style::new().fg(COLOR_TEXT)),
         ]));
-    } else if dialog.adopt_confirmation {
-        lines.push(Line::from(Span::styled(
-            "再次按 a 确认采用当前插件环境；该操作只创建人工基线，不会热重载当前 Session",
-            Style::new().fg(COLOR_WARNING),
-        )));
     } else if let Some(plugin_id) = &dialog.remove_confirmation {
         lines.push(Line::from(Span::styled(
-            format!("再次按 x 确认移除 `{plugin_id}`；该操作会创建人工基线"),
+            format!("再次按 x 确认移除 `{plugin_id}`；该操作不会热重载当前 Session"),
             Style::new().fg(COLOR_WARNING),
         )));
     }
     let footer = if dialog.path_mode.is_some() {
         " 输入路径 · Enter 提交 · Esc 取消 "
     } else {
-        " ↑↓ · e 启停 · g/h/i 安装 · t/u 更新 · b 回滚 · a 采用当前环境 · o/w Owner · x 移除 · r 刷新 · Esc "
+        " ↑↓ · e 启停 · g/h/i 安装 · t/u 更新 · b 回滚 · o/w Owner · x 移除 · r 刷新 · Esc "
     };
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -1410,10 +1357,10 @@ mod tests {
         assert!(app.native_command_panel_height() >= 9);
     }
 
-    /// 插件构建只暴露人工管理入口，不得重新出现插件进化或生成命令。
+    /// 插件构建只暴露人工管理入口，不得出现自动变异或生成命令。
     #[cfg(feature = "plugins")]
     #[test]
-    fn plugin_page_has_no_evolution_actions() {
+    fn plugin_page_only_exposes_manual_actions() {
         let names = NATIVE_COMMANDS
             .iter()
             .map(|command| command.name)
@@ -1430,15 +1377,12 @@ mod tests {
         assert!(plugin_help.description.contains("不热重载"));
     }
 
-    /// 插件页必须展示冻结环境摘要和人工操作，且不能出现进化按钮文案。
+    /// 插件页必须展示已安装插件与版本历史，且不能出现自动变异按钮文案。
     #[cfg(feature = "plugins")]
     #[test]
-    fn plugin_page_shows_frozen_digest_and_manual_actions() {
+    fn plugin_page_shows_installed_plugins_and_manual_actions() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx, "测试模型".into());
-        let environment_digest =
-            agent_evolution_protocol::PluginEnvironmentDigest::from_sha256_hex("a".repeat(64))
-                .expect("插件环境摘要应合法");
         app.native_command.plugin_dialog = Some(NativePluginDialog {
             selected: 0,
             status: NativePluginDialogStatus::Ready(NativePluginDialogData {
@@ -1462,14 +1406,10 @@ mod tests {
                     sha256: "c".repeat(64),
                     source: "fixture-history".into(),
                 }],
-                stable_revision: agent_evolution_protocol::GenomeRevisionId::generate(),
-                environment_digest,
-                generation: 3,
             }),
             path_mode: None,
             path_input: String::new(),
             remove_confirmation: None,
-            adopt_confirmation: false,
         });
         let mut terminal = Terminal::new(TestBackend::new(112, 32)).expect("应创建测试终端");
 
@@ -1488,20 +1428,11 @@ mod tests {
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
 
-        assert!(text.contains("Frozen Plugin Environment"), "{text}");
-        assert!(text.contains("sha256:aaaaaaaaaaaaaaaaa"), "{text}");
         assert!(text.contains("Installed Version History"), "{text}");
         assert!(text.contains("echo@0.9.0"), "{text}");
         assert!(compact.contains("人工管理"), "{text}");
         assert!(!text.contains("Evolve Plugin"), "{text}");
         assert!(!text.contains("Generate Plugin"), "{text}");
-
-        assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('a'), KeyModifiers::NONE,));
-        assert!(app
-            .native_command
-            .plugin_dialog
-            .as_ref()
-            .is_some_and(|dialog| dialog.adopt_confirmation));
     }
 
     /// 本地插件路径必须接受由 Shift 产生的大写字符，同时拒绝控制类组合键。
@@ -1516,7 +1447,6 @@ mod tests {
             path_mode: Some(NativePluginPathMode::Install),
             path_input: String::new(),
             remove_confirmation: None,
-            adopt_confirmation: false,
         });
 
         assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('U'), KeyModifiers::SHIFT,));
@@ -1537,7 +1467,7 @@ mod tests {
         );
     }
 
-    /// 人工插件变更提示必须说明新基线、旧 Session 固定和旧 Candidate 不可应用。
+    /// 人工插件变更提示必须说明新 Session 生效且当前 Session 保持不变。
     #[cfg(feature = "plugins")]
     #[test]
     fn plugin_change_warning_is_displayed() {
@@ -1549,31 +1479,16 @@ mod tests {
             path_mode: None,
             path_input: String::new(),
             remove_confirmation: None,
-            adopt_confirmation: false,
         });
-        let digest = agent_evolution_protocol::GenomeDigest::from_sha256_hex("b".repeat(64))
-            .expect("Genome 摘要应合法");
-        let environment_digest =
-            agent_evolution_protocol::PluginEnvironmentDigest::from_sha256_hex("c".repeat(64))
-                .expect("插件环境摘要应合法");
 
         app.handle_native_plugin_action_finished(Ok(PluginManagementOutcome {
             message: "已启用 echo 1.0.0".into(),
-            baseline: Some(PluginManagementBaseline {
-                revision_id: agent_evolution_protocol::GenomeRevisionId::generate(),
-                genome_digest: digest,
-                plugin_environment_digest: environment_digest,
-                generation: 4,
-            }),
+            changed: true,
         }));
 
         let text = &app.messages.last().expect("应显示人工变更提示").text;
         assert!(text.contains("新 Session"), "{text}");
         assert!(text.contains("当前 Session 继续使用启动时快照"), "{text}");
-        assert!(
-            text.contains("旧 Evolution Candidate 不得自动应用"),
-            "{text}"
-        );
     }
 
     /// Tab 必须只补全规范命令名，不能提前执行命令。

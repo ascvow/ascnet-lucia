@@ -6,8 +6,8 @@
 | --- | --- | --- |
 | `agent-core` | Session、ContextLoader、ModelGateway、ReAct、工具调用、事件 | WASM、manifest、插件 UI、MCP、Skill |
 | `agent-tool` | ToolSpec、ToolCall、ToolResult、原生 ToolRegistry | Agent 循环、插件加载 |
-| `agent-context` | 原生上下文水位、微压缩、模型摘要和 Genome Context Policy 装配 | Agent 循环、插件加载、终端渲染 |
-| `agent-skill` | 原生 Skill 发现、索引提示、正文读取工具和 Genome CAS 装配 | Agent 循环、插件加载、终端渲染 |
+| `agent-context` | 原生上下文水位、微压缩和模型摘要 | Agent 循环、插件加载、终端渲染 |
+| `agent-skill` | 原生 Skill 发现、索引提示和正文读取工具 | Agent 循环、插件加载、终端渲染 |
 | `agent-session` | 版本化会话记录、CAS、内存与原子文件存储 | 模型配置、Agent 调度、插件状态 |
 | `agent-runtime` | Agent 派生、身份、生命周期、私有会话续跑、权限收缩与限额 | workflow、multi-agent、teammate 的编排、邮箱与消息协议 |
 | `agent-plugin-protocol` | Host、Guest 与应用共享的宿主无关 UI 数据契约 | owner 路由、WASM 调用、终端渲染 |
@@ -17,7 +17,7 @@
 | `agent-tui` | 应用组装、原生命令、输入路由、通用声明式 UI 渲染 | 贡献归属和具体插件业务规则 |
 | 独立插件 crate | MCP、工作流、多 Agent 编排和业务集成 | 修改 Core 或 Host 语义 |
 
-`crates/` 按运行域分组：`agent-core/` 包含 Kernel 与默认原生能力，`agent-plugins/` 包含协议、SDK、Host 和 Manager，`agent-evolution/` 包含稳定协议、Engine 与 Evaluation；`agent-tui` 作为应用入口单独保留。目录归组不合并包名或职责，继续满足 Core、Host、Guest SDK、Manager 与可信评测之间的单向依赖边界。
+`crates/` 按运行域分组：`agent-core/` 包含 Kernel 与默认原生能力，`agent-plugins/` 包含协议、SDK、Host 和 Manager；`agent-tui` 作为应用入口单独保留。目录归组不合并包名或职责，继续满足 Core、Host、Guest SDK 与 Manager 之间的单向依赖边界。
 
 ## 依赖方向
 

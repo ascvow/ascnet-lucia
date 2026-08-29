@@ -46,16 +46,6 @@ sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
 # 插件无工具模型调用使用的独立小模型；权限插件的“帮我审批”模式使用该路由。
 plugin_model = "gpt-5.6-luna"
-
-[genome]
-# 普通首次启动会在 $LUCIA_HOME/evolution 自动创建本地人工基线，无需填写本段。
-# 以下字段只用于固定部署到已有 Registry；root_dir 不能单独配置。
-# root_dir = "evolution"
-# stable = "stable/general"
-
-[evidence]
-# 默认关闭；只控制 Episode、Outbox 与 Outcome Revision 等生产证据持久化。
-enabled = false
 "#;
 
 /// 配置文件中由 TUI 消费的应用设置。
@@ -84,36 +74,6 @@ pub(crate) struct TuiSettings {
     pub(crate) events_jsonl: Option<PathBuf>,
     /// 插件无工具模型完成使用的独立模型 ID；缺省时沿用主模型以兼容旧配置。
     pub(crate) plugin_model: Option<String>,
-    /// Evolution Evidence Plane 配置；默认关闭且不创建证据目录。
-    pub(crate) evidence: EvidenceSettings,
-    /// Session 行为绑定使用的只读 Genome Registry 配置。
-    pub(crate) genome: GenomeSettings,
-}
-
-/// TUI 的只读 Genome Registry 配置。
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct GenomeSettings {
-    /// Genome 与 Artifact CAS 的共同根目录；相对路径以配置文件目录为基准。
-    pub(crate) root_dir: Option<PathBuf>,
-    /// 新 Session 解析的 Stable lineage；解析结果会以精确 Revision 写入 Session。
-    pub(crate) stable: Option<String>,
-    /// 新 Session 直接绑定的精确修订；仅用于兼容固定修订部署。
-    pub(crate) revision_id: Option<String>,
-}
-
-/// TUI 的可证据化运行配置。
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct EvidenceSettings {
-    /// 是否为真实主 Agent Run 生成 Episode。
-    pub(crate) enabled: bool,
-    /// 旧版 Genome 与 Evidence 共同根目录；仅在未配置 `[genome]` 时兼容读取。
-    pub(crate) root_dir: Option<PathBuf>,
-    /// 旧版精确 Genome 修订选择器；仅在未配置 `[genome]` 时兼容读取。
-    pub(crate) genome_revision_id: Option<String>,
-    /// 旧版 Stable lineage；仅在未配置 `[genome]` 时兼容读取。
-    pub(crate) genome_stable: Option<String>,
 }
 
 /// 只反序列化根配置中的 TUI 字段，模型和插件字段由各自 crate 处理。
@@ -123,8 +83,6 @@ struct TuiConfigEnvelope {
     model: TuiModelSettings,
     agent: TuiAgentSettings,
     tui: TuiSettings,
-    evidence: EvidenceSettings,
-    genome: GenomeSettings,
 }
 
 /// TUI 从 `[model]` 读取的展示元数据，不参与 Core 模型网关配置。
@@ -238,8 +196,6 @@ pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
     };
     settings.max_tokens_explicit = config.agent.max_tokens.is_some();
     settings.reasoning_explicit = config.agent.reasoning.is_some();
-    settings.evidence = config.evidence;
-    settings.genome = config.genome;
     Ok(settings)
 }
 
@@ -364,8 +320,6 @@ mod tests {
         assert_eq!(settings.plugin_model.as_deref(), Some("gpt-5.6-luna"));
         assert_eq!(settings.default_session, None);
         assert!(!settings.resume_latest);
-        assert_eq!(settings.evidence, EvidenceSettings::default());
-        assert_eq!(settings.genome, GenomeSettings::default());
 
         let error = initialize_config(&path).expect_err("重复初始化必须拒绝覆盖");
         assert!(error.to_string().contains("未覆盖"));
@@ -451,52 +405,6 @@ mod tests {
         assert!(metadata
             .input_modalities
             .contains(&crate::model_metadata::ModelModality::Pdf));
-        fs::remove_dir_all(root).expect("清理配置测试目录");
-    }
-
-    /// Evidence 配置必须独立于 TUI 字段解析，并保留显式 Genome 绑定。
-    #[test]
-    fn loads_evidence_settings() {
-        let root = temp_dir();
-        fs::create_dir_all(&root).expect("创建配置测试目录");
-        let path = root.join("config.toml");
-        fs::write(
-            &path,
-            "[evidence]\nenabled = true\nroot_dir = \"evolution-data\"\ngenome_revision_id = \"grev_0123456789abcdef0123456789abcdef\"\n",
-        )
-        .expect("写入 Evidence 配置");
-
-        let settings = load_tui_settings(&path).expect("读取 Evidence 配置");
-        assert!(settings.evidence.enabled);
-        assert_eq!(
-            settings.evidence.root_dir,
-            Some(PathBuf::from("evolution-data"))
-        );
-        assert_eq!(
-            settings.evidence.genome_revision_id.as_deref(),
-            Some("grev_0123456789abcdef0123456789abcdef")
-        );
-        assert!(settings.evidence.genome_stable.is_none());
-        fs::remove_dir_all(root).expect("清理配置测试目录");
-    }
-
-    /// Genome Registry 使用独立配置，Evidence 旧字段仍保持可读取以兼容已有部署。
-    #[test]
-    fn loads_genome_settings_independently_from_evidence_switch() {
-        let root = temp_dir();
-        fs::create_dir_all(&root).expect("创建配置测试目录");
-        let path = root.join("config.toml");
-        fs::write(
-            &path,
-            "[genome]\nroot_dir = \"registry\"\nstable = \"stable/general\"\n[evidence]\nenabled = false\n",
-        )
-        .expect("写入 Genome 配置");
-
-        let settings = load_tui_settings(&path).expect("读取 Genome 配置");
-        assert_eq!(settings.genome.root_dir, Some(PathBuf::from("registry")));
-        assert_eq!(settings.genome.stable.as_deref(), Some("stable/general"));
-        assert!(settings.genome.revision_id.is_none());
-        assert!(!settings.evidence.enabled);
         fs::remove_dir_all(root).expect("清理配置测试目录");
     }
 

@@ -1,4 +1,4 @@
-//! 为 Lucia TUI 注入可供 Genome 复核的编译时源码身份。
+//! 为 Lucia TUI 注入可供诊断复核的编译时源码身份。
 
 use std::process::Command;
 

@@ -169,7 +169,7 @@ impl AgentRuntime {
             }
         }
         // principal 已进入不可逆撤销态且 Agent 已从注册表移除，此后无需继续持有生命周期锁。
-        // 等待后台监督任务完成，确保 Runtime Evidence finalizer 在组件卸载返回前已经收敛。
+        // 等待后台监督任务完成，确保 Runtime 观察器在组件卸载返回前已经收敛。
         drop(_lifecycle);
         for entry in &cancelled {
             entry.wait_until_finished().await;
@@ -1020,7 +1020,7 @@ async fn run_agent_task(
         None => None,
     };
 
-    // 可信观察 sink 放在模板和订阅 sink 之前：即使展示或诊断 sink 失败，Evidence 仍能
+    // 可信观察 sink 放在模板和订阅 sink 之前：即使展示或诊断 sink 失败，可信观察仍能
     // 看到导致 Core 退出的最后一条事件，并由 finalizer 收敛为显式失败终态。
     let mut sink = CompositeEventSink::new();
     if let Some((_, observation_sink, _)) = &observation {

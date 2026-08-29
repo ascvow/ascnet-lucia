@@ -27,7 +27,7 @@ api_key = "sk-..."
 openai_protocol = "responses"
 ```
 
-`base_url` 是模型服务 URL，`model` 是请求使用的模型名称。Lucia 打包时下载并内置 `models.dev/api.json`，运行时优先按服务商和模型 ID 精确读取上下文窗口、输出 token 上限、思考等级及输入输出模态；服务商未命中但模型 ID 在快照中唯一时仍会使用该模型配置，不依赖网络。重复模型 ID 必须通过 `models_dev_provider` 指定服务商消歧。`context_window`、`agent.max_tokens` 和 `agent.reasoning` 可显式覆盖；其中输出上限和思考等级不得超出快照声明的能力。快照中的最大输出量只作为配置校验上界，不会默认要求模型生成到最大长度。图片、普通文件和 PDF 在输入框中分别显示为 `[IMAGE#N]`、`[FILE#N]`、`[PDF#N]`，并在加入时校验模型输入能力；普通粘贴文本折叠为 `[粘贴的文本]`，删除标签会同步删除绑定的原文。音频、视频能力会被识别，但 Lucia 当前模型协议尚未实现对应内容块，因此不会误发送。输入输出模态只用于能力校验，不在底栏显示，也不会把尚未实现的图片、音频或视频输出伪装成文本。OpenAI 与 Anthropic 自动映射官方服务商 ID；兼容网关可用 `models_dev_provider` 指定对应 ID。密钥默认使用 `api_key = "..."` 直接配置，也可以删除该字段并改用 `api_key_env = "OPENAI_API_KEY"` 指定环境变量名；两者同时存在时 `api_key` 优先。TUI 输入 `/reasoning` 后会在输入框上方打开命令面板风格的等级列表，可用方向键选择 models.dev 声明的等级并按 Enter 应用；`/effort` 与 `/effo` 是兼容别名。也可使用 `/reasoning high` 精确切换，或使用 `/reasoning next`、`Ctrl+R` 循环切换。切换成功后会原子写回本次启动实际使用的配置文件，只影响后续模型请求；写回失败时运行态保持原等级。OpenAI Responses 的非关闭等级会请求自动推理摘要，流式摘要仅在当前运行中显示，不进入消息、Session 或 Evidence。
+`base_url` 是模型服务 URL，`model` 是请求使用的模型名称。Lucia 打包时下载并内置 `models.dev/api.json`，运行时优先按服务商和模型 ID 精确读取上下文窗口、输出 token 上限、思考等级及输入输出模态；服务商未命中但模型 ID 在快照中唯一时仍会使用该模型配置，不依赖网络。重复模型 ID 必须通过 `models_dev_provider` 指定服务商消歧。`context_window`、`agent.max_tokens` 和 `agent.reasoning` 可显式覆盖；其中输出上限和思考等级不得超出快照声明的能力。快照中的最大输出量只作为配置校验上界，不会默认要求模型生成到最大长度。图片、普通文件和 PDF 在输入框中分别显示为 `[IMAGE#N]`、`[FILE#N]`、`[PDF#N]`，并在加入时校验模型输入能力；普通粘贴文本折叠为 `[粘贴的文本]`，删除标签会同步删除绑定的原文。音频、视频能力会被识别，但 Lucia 当前模型协议尚未实现对应内容块，因此不会误发送。输入输出模态只用于能力校验，不在底栏显示，也不会把尚未实现的图片、音频或视频输出伪装成文本。OpenAI 与 Anthropic 自动映射官方服务商 ID；兼容网关可用 `models_dev_provider` 指定对应 ID。密钥默认使用 `api_key = "..."` 直接配置，也可以删除该字段并改用 `api_key_env = "OPENAI_API_KEY"` 指定环境变量名；两者同时存在时 `api_key` 优先。TUI 输入 `/reasoning` 后会在输入框上方打开命令面板风格的等级列表，可用方向键选择 models.dev 声明的等级并按 Enter 应用；`/effort` 与 `/effo` 是兼容别名。也可使用 `/reasoning high` 精确切换，或使用 `/reasoning next`、`Ctrl+R` 循环切换。切换成功后会原子写回本次启动实际使用的配置文件，只影响后续模型请求；写回失败时运行态保持原等级。OpenAI Responses 的非关闭等级会请求自动推理摘要，流式摘要仅在当前运行中显示，不进入消息或 Session。
 
 也可以显式初始化指定文件后退出：
 
@@ -57,43 +57,12 @@ lucia --config ./lucia.toml --init
 sessions_dir = "projects"
 events_jsonl = "events.jsonl"
 plugin_model = "gpt-5.6-luna"
-
-[genome]
-# 普通启动无需配置；以下字段只用于选择已有 Registry。
-# root_dir = "evolution"
-# stable = "stable/general"
-# revision_id = "grev_0123456789abcdef0123456789abcdef"
-
-[evidence]
-enabled = false
 ```
 
 `sessions_dir` 是项目会话根目录。相对配置值与 `events_jsonl` 都以配置文件所在目录为基准；CLI 的 `--sessions-dir` 与 `--events-jsonl` 仍以当前工作目录为基准，并覆盖配置值。`plugin_model` 是 Host 固定提供给插件无工具模型完成调用的模型 ID，权限插件的“帮我审批”模式使用该路由；缺省时兼容沿用主模型，建议显式配置同服务商下可用的小模型。旧配置中的 `default_session` 和 `resume_latest` 仍可解析，但普通启动不再用它们自动恢复会话。
 
-未配置 `[genome]` 时，首次新 Session 会在 `$LUCIA_HOME/evolution` 创建
-`RevisionOrigin::ManualConfiguration` 本地基线：演示模型写入 `stable/demo`，真实模型写入
-`stable/general`。基线固定当前完整 Prompt、模型行为参数、原生工具和插件环境；它不包含
-Secret，也不生成 EvaluationReport、Release 或 EvolutionCertificate。后续启动复用既有 Stable，
-并发首次启动不能覆盖已经胜出的基线。
-
-`genome.root_dir`、`genome.stable` 和 `genome.revision_id` 用于固定部署到已有 Registry；路径相对
-配置文件解析，`stable` 与 `revision_id` 二选一，配置 `root_dir` 时必须同时提供一个选择器。显式
-选择不存在、引用不一致或被篡改时严格拒绝启动，不会自动创建或覆盖目标。
-旧配置中的 `evidence.root_dir`、`evidence.genome_revision_id` 和 `evidence.genome_stable` 仍可
-读取，但独立 `[genome]` 配置优先。
-
-Session Genome 绑定不受 `evidence.enabled` 控制。`[model]` 中的 `api_key` 或 `api_key_env` 仍
-负责提供 Secret；其余模型行为、Prompt CAS、原生工具集合、插件 bundle、独占能力 owner 与
-执行策略始终由 Genome 固定。Evidence 默认关闭，此时不会创建 `episodes`、`outbox`、
-`outcome-revisions` 或 `issue-observations`；启用后才在同一根目录追加生产证据。
-Genome 必须按顺序引用至少一个包含完整系统提示的 UTF-8 Prompt CAS 制品；空 Prompt 不会
-采用 `[agent].system_prompt` 或 Core 默认提示。
-`model.extra_headers` 暂不支持，因为它可能同时携带 Secret 和未入 Genome 的行为。模型密钥
-缺失时使用独立的 `stable/demo` 演示基线，不会覆盖真实模型的 `stable/general`；显式 `--demo`
-同样只使用演示 lineage。
-插件版在 Genome 固定插件全部 Ready 前不开始 Run，任一加载失败后继续保持阻断。
-Genome 的包版本、Git 提交、dirty 状态、目标三元组和 TUI feature 必须与当前编译产物一致。
-缺少可验证 Git commit 的源码归档构建不能建立具备运行资格的 Session Genome 绑定。
+`model.extra_headers` 暂不支持，因为它可能同时携带 Secret 和未经审阅的行为。模型密钥缺失
+时使用内置演示模型，并在界面中显示配置提示。
 
 ## 会话恢复
 
@@ -110,11 +79,6 @@ lucia
 ```
 
 原生 `/resume` 打开当前项目的会话列表，用户选中后才按 revision 校验并加载完整 Session；`/sessions` 使用同一界面只读浏览。两者不依赖 Plugin Host。
-
-新 Session 会在首次保存前绑定精确 Genome Revision。Stable 引用更新只影响后续新 Session，
-已有绑定始终按原 Revision 精确恢复。默认 Registry 尚不存在时会先创建上述人工基线；只有显式
-选择的 Registry 无法解析时才拒绝启动。已持久化且缺少绑定的旧记录只允许加法标记为
-`LegacyUnbound/NotEligible` 并只读恢复，不能启动 Run 或进入 Evidence。
 
 CLI 仍提供显式恢复和只读列举：
 

@@ -41,15 +41,6 @@ stream = true
 [tui]
 sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
-
-[genome]
-# 普通启动无需配置；以下字段只用于选择已有 Registry。
-# root_dir = "evolution"
-# stable = "stable/general"
-# revision_id = "grev_0123456789abcdef0123456789abcdef"
-
-[evidence]
-enabled = false
 ```
 
 设置密钥后重新启动：
@@ -73,23 +64,6 @@ lucia
 - `agent.stream`：是否使用模型流式接口，默认 `true`；设为 `false` 时等待完整响应。
 - `tui.sessions_dir`：按项目隔离的会话根目录；相对路径以配置文件目录为基准。
 - `tui.events_jsonl`：可选事件日志；相对路径以配置文件目录为基准。
-- `genome.root_dir`：Genome Registry 与 Artifact CAS 根目录；相对路径以配置文件目录为基准。
-- `genome.stable`：新 Session 解析的 Stable lineage；解析结果会以精确 Revision 写入 Session。
-- `genome.revision_id`：固定修订部署使用的精确 Revision；与 `stable` 二选一。
-- `evidence.enabled`：为主 Agent 的每次真实 Run 生成 Episode；默认关闭。
-
-未配置 Genome 选择器时，Lucia 会在 `$LUCIA_HOME/evolution` 自动创建不带进化证书的人工
-基线。演示运行固定到 `stable/demo`，真实模型固定到 `stable/general`；后续新 Session 复用
-既有 Stable，已有 Session 始终保留启动时绑定的精确 Revision。显式配置仍只解析已有目标，
-不会在拼写错误或目标缺失时静默创建。
-
-Genome 行为绑定独立于 Evidence 开关。模型密钥仍来自普通配置，但模型路由和参数、Prompt
-CAS、原生工具、插件 bundle、能力 owner 与执行策略始终以 Session 固定的 Genome 为准。
-Genome 必须引用至少一个包含完整系统提示的 UTF-8 Prompt CAS 制品，空 Prompt 不会采用普通
-配置或 Core 默认提示。缺少模型密钥不会自动切换演示模型；固定插件全部 Ready 前不能发送
-Run，任一插件加载失败后保持阻断。旧 Session 只能使用首次保存时绑定的精确 Revision，Stable
-更新不会静默改变已有会话。`evidence.enabled = false` 不创建 Episode、Outbox 或 Outcome
-Revision，但不会取消上述行为绑定。
 
 ## 输入与快捷键
 
@@ -113,17 +87,15 @@ Revision，但不会取消上述行为绑定。
 
 - `/resume`：打开当前项目的会话列表，选中后恢复完整会话。
 - `/sessions`：只读浏览当前项目的会话摘要。
-- `/plugins`：打开人工插件管理页；变更创建新 Stable 基线，当前 Session 不热重载。
+- `/plugins`：打开人工插件管理页；变更只影响新 Session，当前 Session 不热重载。
 - `/compact`：请求原生 Context Loader 立即压缩当前上下文。
 
 命令名称在本地同步补全，不依赖插件加载状态；默认插件版与纯 Core 版都提供斜杠命令和会话 Dialog。
 
 ## 会话行为
 
-普通 `lucia` 启动会创建内存中的空白 Draft，不自动恢复上一次会话。配置了 Registry 后，Draft
-在首次保存前绑定当前 Stable 的精确 Revision；未配置可解析 Stable 或 Revision 时仍可进入界面，
-但发送消息和 `/compact` 会在保存或模型调用前失败。已持久化且缺少绑定的历史 Session 可只读
-恢复并显式标为 `LegacyUnbound/NotEligible`，不能继续运行或进入 Evidence。
+普通 `lucia` 启动会创建内存中的空白 Draft，不自动恢复上一次会话。用户发送第一条消息时才
+按 revision/CAS 持久化该会话。
 
 会话按启动目录隔离。实际路径为：
 

@@ -70,9 +70,6 @@ jobs:
       - name: 运行标准离线检查
         run: bun run check
 
-      - name: 运行外部制品进化双进程验收
-        run: bun run test:evolution:e2e
-
   desktop:
     name: 构建 ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
@@ -118,9 +115,6 @@ jobs:
       - name: 构建插件版 TUI
         run: bun run build:tui:plugins
 
-      - name: 构建 Evolution 控制面
-        run: bun run build:evolution-tools
-
       - name: 上传 Core 库
         uses: actions/upload-artifact@v4
         with:
@@ -146,18 +140,6 @@ jobs:
           path: |
             target/plugin-tui/release/lucia
             target/plugin-tui/release/lucia.exe
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: 上传 Evolution 控制面
-        uses: actions/upload-artifact@v4
-        with:
-          name: lucia-evolution-tools-${{ matrix.platform }}-${{ matrix.arch }}
-          path: |
-            target/evolution-tools/release/lucia-eval
-            target/evolution-tools/release/lucia-eval.exe
-            target/evolution-tools/release/lucia-evolve
-            target/evolution-tools/release/lucia-evolve.exe
           if-no-files-found: error
           retention-days: 30
 

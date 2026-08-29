@@ -30,7 +30,7 @@ Lucia is a fully open-source agent runtime and terminal interface for working wi
 
 Lucia currently ships official Context, MCP, Skill, Command, Teammate, Plan, and Permission plugins. Plugins are not an afterthought; they are the primary extension model. Core owns the general agent mechanics, while each concrete capability stays in its own plugin.
 
-Lucia 的 Evolution 只改变 Prompt、Skill 和第一方 Policy 等 Agent 行为制品。它不会自主修改、生成、组合、升级、启停或重新配置插件；插件由用户或开发者人工管理，并在每个 Evolution Cycle 中作为固定版本、可验证的运行依赖。Skill 内容可以进化，承载或加载 Skill 的插件 Runtime 仍保持固定。
+Lucia 不会自主修改、生成、组合、升级、启停或重新配置插件；插件由用户���开发者人工管理，并在每个 Session 中作为固定版本、可验证的运行依赖。
 
 ## Quick Start
 
@@ -134,9 +134,8 @@ lucia --demo
 ```
 
 `install:tui` 只构建并安装带 Plugin Host 的 `lucia`，不会自动安装或启用功能插件。启动 Lucia
-后输入 `/plugins`，通过 TUI 人工安装、更新、回滚和管理官方或第三方插件。每次真实变化都会创建
-`PluginManagement` 人工基线；当前 Session 保持启动时快照。旧 Bundle 保留在 Installed Version
-History 中，只用于人工回滚与 Replay，Evolver 不能从中选择版本。
+后输入 `/plugins`，通过 TUI 人工安装、更新、回滚和管理官方或第三方插件。当前 Session 保持
+启动时的插件快照。旧 Bundle 保留在 Installed Version History 中，只用于人工回滚。
 
 To build without installing:
 

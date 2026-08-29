@@ -241,8 +241,7 @@ pub(crate) struct SubscriberEventSink {
 
 /// Runtime 即将启动一次 Core Run 时提供给可信 Host 观察器的上下文。
 ///
-/// Execution lineage 与 Genome lineage 语义独立；本结构只描述当前 Runtime 身份和派生关系，
-/// 不接受 Guest 提供的 owner、Genome 或 Run ID。
+/// 本结构只描述当前 Runtime 身份和派生关系，不接受 Guest 提供的 owner 或 Run ID。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeRunContext {
     /// 即将运行的 Runtime Agent 身份。
@@ -312,7 +311,7 @@ impl RuntimeRunObservation {
 
 /// Host 可选注入的 Runtime Run 观察器。
 ///
-/// 观察器运行在 Guest 和普通插件权限之外，可为 Evidence Plane 预登记 Run，但不能改变
+/// 观察器运行在 Guest 和普通插件权限之外，可预登记 Run，但不能改变
 /// Agent 权限、输入、执行策略或 Runtime lineage。
 #[async_trait]
 pub trait RuntimeRunObserver: Send + Sync {

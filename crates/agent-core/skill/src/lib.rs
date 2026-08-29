@@ -1,11 +1,10 @@
 //! Lucia 原生 Skill 发现、索引和按需读取能力。
 //!
-//! 本 crate 不依赖 Plugin Host。应用装配层负责提供可信本地目录或已经完成 CAS 校验的
-//! Genome Skill；本 crate 负责稳定解析、名称去重、模型提示和原生工具执行。
+//! 本 crate 不依赖 Plugin Host。应用装配层负责提供可信本地目录；本 crate 负责稳定解析、
+//! 名称去重、模型提示和原生工具执行。
 
 #![deny(missing_docs)]
 
-use agent_evolution_protocol::{ArtifactDigest, GenomeDigest, GenomeRevisionId, SkillArtifactV1};
 use agent_tool::{Tool, ToolCall, ToolRegistry, ToolResult, ToolSpec};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -23,19 +22,6 @@ pub const SKILL_READ_TOOL_NAME: &str = "skill_read";
 const MAX_SCAN_DEPTH: usize = 8;
 const MAX_SCAN_ENTRIES: usize = 4_096;
 const MAX_SKILL_BYTES: usize = 256 * 1024;
-
-/// 一份由可信装配层校验并固定到 Genome 的 Skill。
-#[derive(Debug, Clone)]
-pub struct GenomeSkillBinding {
-    /// Skill 的规范 CAS 摘要。
-    pub artifact_digest: ArtifactDigest,
-    /// 本次运行固定的 Genome 修订号。
-    pub genome_revision_id: GenomeRevisionId,
-    /// 本次运行固定的 Genome 内容摘要。
-    pub genome_digest: GenomeDigest,
-    /// 已从 CAS 读取并完成协议校验的 Skill 制品。
-    pub artifact: SkillArtifactV1,
-}
 
 /// 原生 Skill 目录；名称唯一且按字典序稳定排列。
 #[derive(Debug, Clone, Default)]
@@ -66,49 +52,6 @@ impl SkillCatalog {
                 let descriptor = parse_skill(&path, &source)?;
                 catalog.insert(descriptor)?;
             }
-        }
-        Ok(catalog)
-    }
-
-    /// 从已经由可信装配层绑定的 Genome Skill 构造目录。
-    ///
-    /// 本函数仍会复核制品自身协议、摘要和名称唯一性，防止调用方把错绑对象交给原生工具。
-    ///
-    /// # Errors
-    ///
-    /// 制品无效、摘要错绑或名称重复时返回错误。
-    pub fn from_genome(bindings: impl IntoIterator<Item = GenomeSkillBinding>) -> Result<Self> {
-        let mut catalog = Self::new();
-        for binding in bindings {
-            binding
-                .artifact
-                .validate()
-                .map_err(|error| anyhow!("Genome Skill 制品无效：{error}"))?;
-            let actual = binding
-                .artifact
-                .digest()
-                .map_err(|error| anyhow!("计算 Genome Skill 摘要失败：{error}"))?;
-            if actual != binding.artifact_digest {
-                return Err(anyhow!(
-                    "Genome Skill `{}` 摘要错绑：期望 {}，实际 {}",
-                    binding.artifact.skill_id,
-                    binding.artifact_digest,
-                    actual
-                ));
-            }
-            let descriptor = SkillDescriptor {
-                skill_id: Some(binding.artifact.skill_id.to_string()),
-                name: binding.artifact.name,
-                description: binding.artifact.description,
-                source: SkillSource::Genome {
-                    instructions: binding.artifact.instructions,
-                    artifact_digest: binding.artifact_digest,
-                    genome_revision_id: binding.genome_revision_id,
-                    genome_digest: binding.genome_digest,
-                },
-            };
-            validate_skill_name(&descriptor.name)?;
-            catalog.insert(descriptor)?;
         }
         Ok(catalog)
     }
@@ -165,21 +108,10 @@ impl SkillCatalog {
 
 #[derive(Debug, Clone)]
 struct SkillDescriptor {
-    skill_id: Option<String>,
     name: String,
     description: String,
-    source: SkillSource,
-}
-
-#[derive(Debug, Clone)]
-enum SkillSource {
-    LocalFile(PathBuf),
-    Genome {
-        instructions: String,
-        artifact_digest: ArtifactDigest,
-        genome_revision_id: GenomeRevisionId,
-        genome_digest: GenomeDigest,
-    },
+    /// Skill 正文所在的本地文件路径，读取时才加载完整内容。
+    path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,47 +162,25 @@ impl Tool for SkillReadTool {
                 format!("未知 Skill：{}", args.name),
             ));
         };
-        let (content, usage) = match &skill.source {
-            SkillSource::LocalFile(path) => match fs::read_to_string(path) {
-                Ok(content) => (content, None),
-                Err(error) => {
-                    return Ok(ToolResult::error(
-                        call.id,
-                        call.name,
-                        format!("读取 Skill `{}` 失败：{error}", skill.name),
-                    ));
-                }
-            },
-            SkillSource::Genome {
-                instructions,
-                artifact_digest,
-                genome_revision_id,
-                genome_digest,
-            } => (
-                instructions.clone(),
-                Some(json!({
-                    "schema_version": 1,
-                    "skill_id": skill.skill_id,
-                    "artifact_digest": artifact_digest,
-                    "genome_revision_id": genome_revision_id,
-                    "genome_digest": genome_digest,
-                })),
-            ),
+        let content = match fs::read_to_string(&skill.path) {
+            Ok(content) => content,
+            Err(error) => {
+                return Ok(ToolResult::error(
+                    call.id,
+                    call.name,
+                    format!("读取 Skill `{}` 失败：{error}", skill.name),
+                ));
+            }
         };
-        let mut result = ToolResult::success(
+        Ok(ToolResult::success(
             call.id,
             call.name,
             json!({
-                "skill_id": skill.skill_id,
                 "name": skill.name,
                 "description": skill.description,
                 "content": content,
             }),
-        );
-        if let Some(usage) = usage {
-            result = result.with_details(json!({ "skill_usage": usage }));
-        }
-        Ok(result)
+        ))
     }
 }
 
@@ -354,10 +264,9 @@ fn parse_skill(path: &Path, source: &str) -> Result<SkillDescriptor> {
         ));
     }
     Ok(SkillDescriptor {
-        skill_id: None,
         name,
         description,
-        source: SkillSource::LocalFile(path.to_path_buf()),
+        path: path.to_path_buf(),
     })
 }
 

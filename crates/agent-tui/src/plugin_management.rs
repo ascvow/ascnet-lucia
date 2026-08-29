@@ -1,27 +1,16 @@
-//! TUI 人工插件管理与 Genome 基线提交的应用服务。
+//! TUI 人工插件管理的应用服务。
 
-use crate::genome_binding::snapshot_plugin_environment;
-use crate::plugin_startup::{
-    discover_plugin_manifests, merge_plugin_manifests, remove_disabled_plugin_manifests,
-};
-use agent_evolution::{
-    FileStableGenomePublisher, GenomeResolver, GenomeSelector, GenomeStore, StableGenomeRef,
-};
-use agent_evolution_protocol::{
-    GenomeDigest, GenomeMetadata, GenomeRevision, GenomeRevisionId, PluginEnvironmentDigest,
-    RevisionOrigin,
-};
 use agent_plugin_manager::{
     GithubInstallOptions, GithubPluginSource, InstallOptions, InstalledPlugin, PluginManager,
     PluginManagerStateSnapshot, RegistryRequest,
 };
-use anyhow::{anyhow, Context, Result};
-use std::{collections::HashMap, path::PathBuf};
+use anyhow::{anyhow, Result};
+use std::path::PathBuf;
 
 /// 人工插件管理允许执行的本地写操作。
 ///
 /// Registry 和 GitHub 获取仍由 Plugin Manager 负责，但 TUI 的基础事务只接受用户明确选择的
-/// 本地 Bundle，不下载、不构建、不签名，也不允许 Evolution 调用。
+/// 本地 Bundle，不下载、不构建、不签名。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ManualPluginAction {
     /// 从官方 Registry 安装用户明确选择的兼容版本。
@@ -91,106 +80,30 @@ pub(crate) enum ManualPluginAction {
         /// Capability 稳定 ID。
         capability_id: String,
     },
-    /// 把当前磁盘上的完整插件环境显式采用为新的人工基线。
-    AdoptCurrentEnvironment,
 }
 
-impl ManualPluginAction {
-    /// 返回写入人工 Genome 修订的稳定中文审计描述。
-    fn description(&self) -> String {
-        match self {
-            Self::InstallRegistry { request, .. } => {
-                format!("人工从 Registry 安装插件：{request}")
-            }
-            Self::InstallGithub { source, .. } => {
-                format!("人工从 GitHub Release 安装插件：{source}")
-            }
-            Self::InstallLocal { bundle, .. } => {
-                format!("人工安装本地插件 Bundle：{}", bundle.display())
-            }
-            Self::ReplaceLocal { bundle, .. } => {
-                format!("人工替换本地插件 Bundle：{}", bundle.display())
-            }
-            Self::UpdateRegistry { plugin_id } => {
-                format!("人工更新 Registry 插件：{plugin_id}")
-            }
-            Self::Enable { plugin_id } => format!("人工启用插件：{plugin_id}"),
-            Self::Disable { plugin_id } => format!("人工禁用插件：{plugin_id}"),
-            Self::Remove { plugin_id } => format!("人工移除插件：{plugin_id}"),
-            Self::Rollback { plugin_id, version } => {
-                format!("人工回滚插件：{plugin_id} -> {version}")
-            }
-            Self::SelectCapabilityOwner {
-                capability_id,
-                plugin_id,
-            } => format!("人工选择 Capability Owner：{capability_id} -> {plugin_id}"),
-            Self::ClearCapabilityOwner { capability_id } => {
-                format!("人工清除 Capability Owner：{capability_id}")
-            }
-            Self::AdoptCurrentEnvironment => "人工采用当前插件环境为新基线".into(),
-        }
-    }
-}
-
-/// 一次已提交人工插件管理基线的结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PluginManagementBaseline {
-    /// 新 Stable 指向的不可变修订。
-    pub(crate) revision_id: GenomeRevisionId,
-    /// 新 Genome 行为摘要。
-    pub(crate) genome_digest: GenomeDigest,
-    /// 新冻结插件环境摘要。
-    pub(crate) plugin_environment_digest: PluginEnvironmentDigest,
-    /// 新 Stable 代数。
-    pub(crate) generation: u64,
-}
-
-/// 人工插件管理操作及其基线提交结果。
+/// 人工插件管理操作的结果。
 #[derive(Debug, Clone)]
 pub(crate) struct PluginManagementOutcome {
     /// Plugin Manager 返回的用户可读操作结果。
     pub(crate) message: String,
-    /// 状态没有变化时为 `None`，否则必须包含已提交的新人工基线。
-    pub(crate) baseline: Option<PluginManagementBaseline>,
+    /// 本次操作是否真正改变了插件状态。
+    pub(crate) changed: bool,
 }
 
 /// 仅供 TUI 人工控制面持有的可写 Plugin Manager 应用服务。
 ///
-/// Evolution 代码只读取 PluginEnvironmentSnapshot，不依赖也不持有本类型。服务在一个事务中
-/// 编排 Manager 写入、完整插件快照、不可变 Genome Revision 和 Stable CAS；任一后续步骤失败
-/// 都恢复操作前的 Manager 状态，活动 Session 与已经实例化的 Host 始终保持不变。
+/// 写操作失败时恢复操作前的 Manager 状态，活动 Session 与已经实例化的 Host 始终保持不变。
 #[derive(Debug, Clone)]
 pub(crate) struct PluginManagementService {
     manager: PluginManager,
-    publisher: FileStableGenomePublisher,
-    lineage: String,
-    lucia_home: PathBuf,
-    base_manifest_paths: Vec<PathBuf>,
-    base_capability_selection: HashMap<String, String>,
-    disabled_plugins: Vec<String>,
 }
 
 impl PluginManagementService {
     /// 创建 TUI 人工插件管理服务，不访问文件系统。
-    ///
-    /// `base_manifest_paths` 与 `base_capability_selection` 是启动参数和普通配置中的固定来源；
-    /// 用户目录、受管理目录与官方目录会在每次事务中重新扫描。
-    pub(crate) fn new(
-        lucia_home: PathBuf,
-        registry_root: PathBuf,
-        lineage: String,
-        base_manifest_paths: Vec<PathBuf>,
-        base_capability_selection: HashMap<String, String>,
-        disabled_plugins: Vec<String>,
-    ) -> Self {
+    pub(crate) fn new(lucia_home: PathBuf) -> Self {
         Self {
             manager: PluginManager::new(&lucia_home),
-            publisher: FileStableGenomePublisher::new(registry_root),
-            lineage,
-            lucia_home,
-            base_manifest_paths,
-            base_capability_selection,
-            disabled_plugins,
         }
     }
 
@@ -212,63 +125,21 @@ impl PluginManagementService {
         self.manager.list_version_history()
     }
 
-    /// 返回当前 Stable 插件环境及摘要，供 Evolution 页面或插件页只读展示。
+    /// 执行一次人工插件写操作。
+    ///
+    /// 当前 Session 和已实例化 Host 不会被重载；成功后只有新 Session 使用新的插件环境。
     ///
     /// # Errors
     ///
-    /// Stable、Revision 或插件环境摘要损坏时返回错误。
-    pub(crate) async fn frozen_environment(
-        &self,
-    ) -> Result<(StableGenomeRef, PluginEnvironmentDigest)> {
-        let stable = self
-            .publisher
-            .resolver()
-            .stable_reference(&self.lineage)
-            .await
-            .context("读取插件管理 Stable 基线失败")?;
-        let revision = self
-            .publisher
-            .resolver()
-            .resolve(&GenomeSelector::Revision(stable.revision_id.clone()))
-            .await
-            .context("读取插件管理 Stable Genome 失败")?;
-        let digest = revision
-            .genome
-            .plugin_environment_snapshot()
-            .digest()
-            .context("计算冻结插件环境摘要失败")?;
-        Ok((stable, digest))
-    }
-
-    /// 执行一次人工插件写操作并提交新的 PluginManagement Stable 基线。
-    ///
-    /// 当前 Session 和已实例化 Host 不会被重载。成功后只有新 Session 会从更新后的 Stable
-    /// 解析新插件环境；旧 Candidate 因 expected-current 已变化而不能自动 Promotion。
-    ///
-    /// # Errors
-    ///
-    /// Manager 写操作、完整快照、Genome 登记或 Stable CAS 任一步失败时返回错误，并先尝试
-    /// 恢复操作前 Manager 状态；补偿恢复也失败时错误文本会同时保留两个原因。
+    /// Manager 写操作或状态读取失败时返回错误，并先尝试恢复操作前 Manager 状态；补偿恢复
+    /// 也失败时错误文本会同时保留两个原因。
     pub(crate) async fn apply(
         &self,
         action: ManualPluginAction,
     ) -> Result<PluginManagementOutcome> {
-        let expected = self
-            .publisher
-            .resolver()
-            .stable_reference(&self.lineage)
-            .await
-            .context("读取人工插件变更前 Stable 基线失败")?;
-        let parent = self
-            .publisher
-            .resolver()
-            .resolve(&GenomeSelector::Revision(expected.revision_id.clone()))
-            .await
-            .context("读取人工插件变更前 Genome 失败")?;
         let before_plugins = self.manager.list()?;
         let before_runtime = self.manager.runtime_config()?;
         let snapshot = self.manager.capture_state()?;
-        let adopt_current = matches!(action, ManualPluginAction::AdoptCurrentEnvironment);
         let message = match self.perform_action(&action).await {
             Ok(message) => message,
             Err(error) => return self.fail_with_restore(&snapshot, error),
@@ -281,62 +152,8 @@ impl PluginManagementService {
             Ok(runtime) => runtime,
             Err(error) => return self.fail_with_restore(&snapshot, error),
         };
-        if !adopt_current && before_plugins == after_plugins && before_runtime == after_runtime {
-            return Ok(PluginManagementOutcome {
-                message,
-                baseline: None,
-            });
-        }
-        let environment = match self.current_plugin_environment() {
-            Ok(environment) => environment,
-            Err(error) => return self.fail_with_restore(&snapshot, error),
-        };
-        let environment_digest = match environment.digest() {
-            Ok(digest) => digest,
-            Err(error) => return self.fail_with_restore(&snapshot, error.into()),
-        };
-        if adopt_current && environment == parent.genome.plugin_environment_snapshot() {
-            return Ok(PluginManagementOutcome {
-                message: "当前插件环境与 Stable 基线一致，无需创建新基线".into(),
-                baseline: None,
-            });
-        }
-        let mut genome = parent.genome.clone();
-        genome.plugins = environment.plugins;
-        genome.capability_owners = environment.capability_owners;
-        let revision = match GenomeRevision::create(
-            genome,
-            GenomeMetadata {
-                origin: RevisionOrigin::PluginManagement,
-                description: Some(action.description()),
-                parent: Some(parent.revision_id.clone()),
-                mutation: None,
-                ..GenomeMetadata::default()
-            },
-        ) {
-            Ok(revision) => revision,
-            Err(error) => return self.fail_with_restore(&snapshot, error.into()),
-        };
-        if let Err(error) = self.publisher.resolver().store().append(&revision).await {
-            return self.fail_with_restore(&snapshot, error.into());
-        }
-        let published = match self
-            .publisher
-            .publish_manual_bound(&expected, &revision)
-            .await
-        {
-            Ok(reference) => reference,
-            Err(error) => return self.fail_with_restore(&snapshot, error.into()),
-        };
-        Ok(PluginManagementOutcome {
-            message,
-            baseline: Some(PluginManagementBaseline {
-                revision_id: revision.revision_id,
-                genome_digest: revision.digest,
-                plugin_environment_digest: environment_digest,
-                generation: published.generation,
-            }),
-        })
+        let changed = before_plugins != after_plugins || before_runtime != after_runtime;
+        Ok(PluginManagementOutcome { message, changed })
     }
 
     /// 执行不涉及网络或构建的单个 Manager 写操作。
@@ -443,31 +260,7 @@ impl PluginManagementService {
                     None => Ok(format!("能力 {capability_id} 没有显式插件选择")),
                 }
             }
-            ManualPluginAction::AdoptCurrentEnvironment => {
-                Ok("已将当前插件环境提交为人工配置基线".into())
-            }
         }
-    }
-
-    /// 按与启动装配一致的优先级重建完整运行插件环境。
-    fn current_plugin_environment(
-        &self,
-    ) -> Result<agent_evolution_protocol::PluginEnvironmentSnapshot> {
-        let mut manifests = self.base_manifest_paths.clone();
-        let user_manifests = discover_plugin_manifests(&self.lucia_home.join("plugins"))
-            .context("扫描用户插件目录失败")?;
-        merge_plugin_manifests(&mut manifests, user_manifests);
-        let managed = self.manager.runtime_config()?;
-        merge_plugin_manifests(&mut manifests, managed.manifest_paths);
-        let official = discover_plugin_manifests(&self.lucia_home.join("official-plugins"))
-            .context("扫描官方插件目录失败")?;
-        merge_plugin_manifests(&mut manifests, official);
-        remove_disabled_plugin_manifests(&mut manifests, &self.disabled_plugins);
-        let mut selections = self.base_capability_selection.clone();
-        for (capability, owner) in managed.capability_selection {
-            selections.entry(capability).or_insert(owner);
-        }
-        snapshot_plugin_environment(&manifests, &selections)
     }
 
     /// 把主错误与补偿恢复结果合并为单一失败返回。
@@ -488,13 +281,6 @@ impl PluginManagementService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_evolution::{FileGenomeStore, GenomeResolver, GenomeStore};
-    use agent_evolution_protocol::{
-        AgentGenome, ModelGenome, PromptGenome, RuntimeIdentity, ToolProfileGenome,
-        GENOME_SCHEMA_VERSION,
-    };
-    use agent_tool::ExecutionPolicy;
-    use std::collections::{BTreeMap, BTreeSet};
 
     /// 构造插件管理事务测试使用的独立目录。
     fn temp_root(label: &str) -> PathBuf {
@@ -526,78 +312,13 @@ wasm = "plugin.wasm"
         bundle
     }
 
-    /// 创建只含固定 Agent 行为、尚未装载插件的 Parent Genome。
-    fn parent_revision() -> GenomeRevision {
-        GenomeRevision::create(
-            AgentGenome {
-                schema_version: GENOME_SCHEMA_VERSION,
-                runtime: RuntimeIdentity {
-                    package_version: "0.1.0".into(),
-                    git_commit: "fixture".into(),
-                    git_dirty: true,
-                    target_triple: "fixture".into(),
-                    features: BTreeSet::from(["plugins".into()]),
-                },
-                model: ModelGenome {
-                    provider: "fixture".into(),
-                    provider_kind: "fixture".into(),
-                    model: "fixture".into(),
-                    base_url: None,
-                    protocol: None,
-                    max_tokens: None,
-                    temperature: None,
-                    stream: false,
-                    provider_options_digest: None,
-                },
-                prompt: PromptGenome::default(),
-                plugins: Vec::new(),
-                capability_owners: BTreeMap::new(),
-                tools: ToolProfileGenome::default(),
-                context_policy: None,
-                planning_policy: None,
-                skills: Vec::new(),
-                execution: ExecutionPolicy::serve(),
-            },
-            GenomeMetadata::default(),
-        )
-        .expect("Parent Genome 应合法")
-    }
-
-    /// 初始化插件管理服务所需的不可变 Registry 与 Stable Parent。
-    async fn service_fixture(
-        root: &std::path::Path,
-        base_manifests: Vec<PathBuf>,
-    ) -> (PluginManagementService, GenomeRevision) {
-        let registry = root.join("evolution");
-        let parent = parent_revision();
-        FileGenomeStore::new(registry.join("genomes"))
-            .append(&parent)
-            .await
-            .expect("应登记 Parent Genome");
-        FileStableGenomePublisher::new(&registry)
-            .publish("stable/general", &parent, 1)
-            .await
-            .expect("应发布 Parent Stable");
-        (
-            PluginManagementService::new(
-                root.to_path_buf(),
-                registry,
-                "stable/general".into(),
-                base_manifests,
-                HashMap::new(),
-                Vec::new(),
-            ),
-            parent,
-        )
-    }
-
-    /// TUI 本地安装必须创建 PluginManagement 修订，且不能绑定 Evolution Release。
+    /// 本地安装必须写入 Plugin Manager 并报告状态已改变。
     #[tokio::test]
-    async fn local_install_creates_plugin_management_baseline() {
-        let root = temp_root("install-baseline");
+    async fn local_install_updates_plugin_manager() {
+        let root = temp_root("install");
         let fixture_root = root.with_extension("fixtures");
         let bundle = create_bundle(&fixture_root, "echo", "1.0.0");
-        let (service, parent) = service_fixture(&root, Vec::new()).await;
+        let service = PluginManagementService::new(root.clone());
 
         let outcome = service
             .apply(ManualPluginAction::InstallLocal {
@@ -605,69 +326,24 @@ wasm = "plugin.wasm"
                 enabled: true,
             })
             .await
-            .expect("人工安装应提交新基线");
-        let baseline = outcome.baseline.expect("插件变化应产生基线");
-        let stable = service
-            .publisher
-            .resolver()
-            .stable_reference("stable/general")
-            .await
-            .expect("应读取新 Stable");
-        let revision = service
-            .publisher
-            .resolver()
-            .resolve(&GenomeSelector::Revision(stable.revision_id.clone()))
-            .await
-            .expect("应读取人工基线修订");
+            .expect("人工安装应成功");
 
-        assert_eq!(stable.generation, 2);
-        assert_eq!(stable.revision_id, baseline.revision_id);
-        assert!(stable.release_id.is_none());
-        assert!(stable.evaluation_report_id.is_none());
-        assert_eq!(revision.metadata.origin, RevisionOrigin::PluginManagement);
-        assert_eq!(revision.metadata.parent, Some(parent.revision_id));
-        assert!(revision.metadata.mutation.is_none());
-        assert_eq!(revision.genome.plugins.len(), 1);
-        assert_eq!(revision.genome.plugins[0].id, "echo");
+        assert!(outcome.changed);
+        let installed = service.list().expect("应读取已安装插件");
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].id, "echo");
         let _ = tokio::fs::remove_dir_all(root).await;
         let _ = tokio::fs::remove_dir_all(fixture_root).await;
     }
 
-    /// 人工修改开发 Bundle 后必须显式采用当前环境，并创建 PluginManagement 修订。
+    /// 人工回滚必须恢复固定版本，并保留被替换版本供再次回滚。
     #[tokio::test]
-    async fn current_plugin_environment_can_be_adopted_as_manual_baseline() {
-        let root = temp_root("adopt-current-environment");
-        let (service, parent) = service_fixture(&root, Vec::new()).await;
-        create_bundle(&root.join("plugins"), "echo", "1.0.0");
-
-        let outcome = service
-            .apply(ManualPluginAction::AdoptCurrentEnvironment)
-            .await
-            .expect("人工采用当前环境应成功");
-        let baseline = outcome.baseline.expect("插件环境变化必须产生新基线");
-        let revision = service
-            .publisher
-            .resolver()
-            .resolve(&GenomeSelector::Revision(baseline.revision_id))
-            .await
-            .expect("应读取人工采用后的修订");
-
-        assert_eq!(revision.metadata.origin, RevisionOrigin::PluginManagement);
-        assert_eq!(revision.metadata.parent, Some(parent.revision_id));
-        assert!(revision.metadata.mutation.is_none());
-        assert_eq!(revision.genome.plugins.len(), 1);
-        assert_eq!(revision.genome.plugins[0].id, "echo");
-        let _ = tokio::fs::remove_dir_all(root).await;
-    }
-
-    /// TUI 人工回滚必须创建新的 PluginManagement 基线，并保留被替换版本供再次回滚。
-    #[tokio::test]
-    async fn manual_rollback_creates_plugin_management_baseline() {
-        let root = temp_root("rollback-baseline");
+    async fn manual_rollback_restores_selected_version() {
+        let root = temp_root("rollback");
         let fixture_root = root.with_extension("fixtures");
         let first = create_bundle(&fixture_root, "echo", "1.0.0");
         let second = create_bundle(&fixture_root, "echo", "2.0.0");
-        let (service, _) = service_fixture(&root, Vec::new()).await;
+        let service = PluginManagementService::new(root.clone());
         service
             .apply(ManualPluginAction::InstallLocal {
                 bundle: first,
@@ -690,27 +366,9 @@ wasm = "plugin.wasm"
             })
             .await
             .expect("人工回滚应成功");
-        let baseline = outcome.baseline.expect("人工回滚必须产生新基线");
-        let stable = service
-            .publisher
-            .resolver()
-            .stable_reference("stable/general")
-            .await
-            .expect("应读取回滚后的 Stable");
-        let revision = service
-            .publisher
-            .resolver()
-            .resolve(&GenomeSelector::Revision(stable.revision_id.clone()))
-            .await
-            .expect("应读取人工回滚修订");
 
-        assert_eq!(stable.generation, 4);
-        assert_eq!(stable.revision_id, baseline.revision_id);
-        assert!(stable.release_id.is_none());
-        assert!(stable.evaluation_report_id.is_none());
-        assert_eq!(revision.metadata.origin, RevisionOrigin::PluginManagement);
-        assert!(revision.metadata.mutation.is_none());
-        assert_eq!(revision.genome.plugins[0].version, "1.0.0");
+        assert!(outcome.changed);
+        assert_eq!(service.list().expect("应读取插件")[0].version, "1.0.0");
         assert_eq!(
             service.list_version_history().expect("应读取人工版本历史")[0].version,
             "2.0.0"
@@ -719,37 +377,26 @@ wasm = "plugin.wasm"
         let _ = tokio::fs::remove_dir_all(fixture_root).await;
     }
 
-    /// Genome 快照提交失败时必须补偿恢复 Plugin Manager，不能留下半完成安装。
+    /// 写操作失败时必须补偿恢复 Plugin Manager，不能留下半完成安装。
     #[tokio::test]
-    async fn failed_baseline_restores_plugin_manager_state() {
+    async fn failed_action_restores_plugin_manager_state() {
         let root = temp_root("restore-on-failure");
-        let fixture_root = root.with_extension("fixtures");
-        let bundle = create_bundle(&fixture_root, "echo", "1.0.0");
-        let missing = root.join("missing/plugin.toml");
-        let (service, _) = service_fixture(&root, vec![missing]).await;
+        let service = PluginManagementService::new(root.clone());
 
         let error = service
             .apply(ManualPluginAction::InstallLocal {
-                bundle,
+                bundle: root.join("missing-bundle"),
                 enabled: true,
             })
             .await
-            .expect_err("无效固定 Manifest 应阻止基线提交");
+            .expect_err("无效 Bundle 应失败");
 
-        assert!(error.to_string().contains("读取插件 manifest"));
+        assert!(!error.to_string().is_empty());
         assert!(service
             .manager
             .list()
             .expect("恢复后锁文件应可读")
             .is_empty());
-        let stable = service
-            .publisher
-            .resolver()
-            .stable_reference("stable/general")
-            .await
-            .expect("Stable 应保持 Parent");
-        assert_eq!(stable.generation, 1);
         let _ = tokio::fs::remove_dir_all(root).await;
-        let _ = tokio::fs::remove_dir_all(fixture_root).await;
     }
 }

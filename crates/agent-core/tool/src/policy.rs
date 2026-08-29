@@ -288,7 +288,7 @@ impl ExecutionPolicy {
 
     /// Mutation 平面策略：不执行任务，只生成候选。
     ///
-    /// 不开放任何 Agent 工具，也不允许文件访问；Episode 读取与候选写入由变异侧
+    /// 不开放任何 Agent 工具，也不允许文件访问；相关读写由调用侧
     /// 组件自身的接口完成，不经过 Agent 工具通道。
     pub fn mutation() -> Self {
         Self {

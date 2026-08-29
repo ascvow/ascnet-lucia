@@ -147,7 +147,7 @@ pub struct SessionRecord {
     /// 会话首次持久化时固定的外部行为修订。
     ///
     /// Session Store 不解释 `kind` 或 `revision` 的业务含义；应用层可用它绑定
-    /// Agent Genome 等版本化外部制品。旧会话缺少该字段时保持 `None`，但记录一旦
+    /// 版本化外部行为制品。旧会话缺少该字段时保持 `None`，但记录一旦
     /// 带有绑定，后续 CAS 保存不得移除或替换。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_binding: Option<SessionBehaviorBinding>,
@@ -179,7 +179,7 @@ impl SessionRecord {
 
 /// Session 固定引用的外部行为修订。
 ///
-/// `kind` 标识制品协议，例如 `agent_genome`；`revision` 是该协议已经独立校验的
+/// `kind` 标识制品协议；`revision` 是该协议已经独立校验的
 /// 不透明修订 ID。该类型只保存引用，不保存模型配置、Prompt、插件状态或 Secret。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionBehaviorBinding {
@@ -211,7 +211,7 @@ impl SessionBehaviorBinding {
     /// 创建历史未绑定 Session 的显式不可评估标记。
     ///
     /// 该标记只声明 Session 没有可归因的版本化行为制品，不会把旧会话静默绑定到
-    /// 当前行为，也不会使其具备 Evidence 资格。
+    /// 当前行为。
     pub fn legacy_unbound() -> Self {
         Self {
             kind: LEGACY_UNBOUND_BEHAVIOR_KIND.to_string(),

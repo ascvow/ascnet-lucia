@@ -8,19 +8,10 @@ use agent_core::{
     ContextLoadRequest as CoreContextLoadRequest, ContextLoader,
     LoadedContext as CoreLoadedContext, ReasoningLevel, ToolChoice,
 };
-use agent_evolution_protocol::{
-    ArtifactDigest, ContextPolicyV1, PlanSnapshotRetentionPolicyV1,
-    PostSummaryValidationAlgorithmV1, ToolResultRetentionPolicyV1, UserConstraintRetentionPolicyV1,
-    NATIVE_CONTEXT_POLICY_ID,
-};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{
-    collections::BTreeSet,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 /// 200k 上下文扣除 20k 摘要输出预算和 13k 下一轮缓冲后的自动压缩阈值。
 const DEFAULT_COMPACT_THRESHOLD_TOKENS: usize = 167_000;
@@ -37,13 +28,6 @@ const RECENT_TOOL_RESULTS_TO_KEEP: usize = 3;
 /// Claude Code 为完整摘要预留的最大输出 token 数。
 /// 原生上下文摘要请求允许的默认最大输出 token 数。
 pub const DEFAULT_MAX_SUMMARY_TOKENS: u32 = 20_000;
-/// 上游显式结构化用户约束消息的稳定 JSON schema。
-const USER_CONSTRAINT_MARKER_SCHEMA: &str = "lucia.context/user-constraint/v1";
-/// 上游显式结构化事实消息的稳定 JSON schema；事实正文只进入摘要，不进入固定区。
-const FACT_MARKER_SCHEMA: &str = "lucia.context/fact/v1";
-/// 摘要模型返回确定性标记信封时使用的固定标签。
-const SUMMARY_MARKERS_OPEN: &str = "<context-policy-markers>";
-const SUMMARY_MARKERS_CLOSE: &str = "</context-policy-markers>";
 /// 被微压缩的工具结果占位文本。
 const CLEARED_TOOL_RESULT: &str = "[旧工具结果内容已清理]";
 /// 独立摘要调用使用的固定 system 提示，不携带主 Agent 的工具和行为人格。
@@ -112,40 +96,10 @@ fn decode_core_context(context: LoadedContext) -> Result<CoreLoadedContext> {
     })
 }
 
-/// 一份已经由装配层从 Artifact CAS 校验并固定的 Context Policy。
-#[derive(Debug, Clone)]
-pub struct NativeContextPolicy {
-    policy: ContextPolicyV1,
-    artifact_digest: ArtifactDigest,
-}
-
-impl NativeContextPolicy {
-    /// 创建原生 Context Policy 绑定，并再次校验协议约束。
-    ///
-    /// # Errors
-    ///
-    /// 策略版本、阈值、保留数量或验证安全下限无效时返回错误。
-    pub fn new(policy: ContextPolicyV1, artifact_digest: ArtifactDigest) -> Result<Self> {
-        policy
-            .validate()
-            .map_err(|error| anyhow!("Context Policy 无效：{error}"))?;
-        Ok(Self {
-            policy,
-            artifact_digest,
-        })
-    }
-
-    /// 返回 Genome 中绑定原生 Context Policy 的稳定所有者 ID。
-    pub fn owner_id() -> &'static str {
-        NATIVE_CONTEXT_POLICY_ID
-    }
-}
-
 /// Lucia 默认原生上下文加载器。
 ///
 /// 加载器在每次模型请求前按水位执行微压缩或模型摘要，并维护同一 Run 内的追加缓存。
-/// 它只使用应用固定的模型路由，摘要请求禁用工具与推理；可选 Context Policy 必须由
-/// [`NativeContextPolicy`] 绑定到已校验 CAS 摘要。
+/// 它只使用应用固定的模型路由，摘要请求禁用工具与推理。
 pub struct NativeContextLoader {
     gateway: ModelGateway,
     provider: String,
@@ -153,7 +107,6 @@ pub struct NativeContextLoader {
     stream: bool,
     max_summary_tokens: u32,
     events: Arc<dyn EventSink>,
-    policy: Option<NativeContextPolicy>,
     state: Mutex<CompressionState>,
 }
 
@@ -161,22 +114,6 @@ pub struct NativeContextLoader {
 struct CompressionState {
     /// 最近一次自动压缩结果，用于增量追加后续消息，避免重复处理同一历史前缀。
     cache: Option<CompressionCache>,
-}
-
-/// 返回结构化约束固定区上限。
-fn constraint_limit(policy: &UserConstraintRetentionPolicyV1) -> u16 {
-    match policy {
-        UserConstraintRetentionPolicyV1::PinnedStructured { max_items }
-        | UserConstraintRetentionPolicyV1::PinnedStructuredAndSummary { max_items } => *max_items,
-    }
-}
-
-/// 返回 Plan 快照步骤上限。
-fn plan_limit(policy: &PlanSnapshotRetentionPolicyV1) -> u16 {
-    match policy {
-        PlanSnapshotRetentionPolicyV1::LatestSnapshot { max_items }
-        | PlanSnapshotRetentionPolicyV1::LatestSnapshotAndSummary { max_items } => *max_items,
-    }
 }
 
 /// 最近一次自动压缩的追加边界与有效模型上下文。
@@ -195,8 +132,8 @@ struct CompressionCache {
 impl NativeContextLoader {
     /// 创建默认原生上下文加载器。
     ///
-    /// `max_summary_tokens` 是可信运行策略允许的摘要输出上限；Genome Policy 只能继续收紧。
-    /// `events` 接收微压缩、完整压缩和手动跳过事件，供 TUI 与 Evidence 共用同一事实源。
+    /// `max_summary_tokens` 是运行策略允许的摘要输出上限。
+    /// `events` 接收微压缩、完整压缩和手动跳过事件，供 TUI 使用同一事实源。
     ///
     /// # Errors
     ///
@@ -207,7 +144,6 @@ impl NativeContextLoader {
         model: impl Into<String>,
         stream: bool,
         max_summary_tokens: u32,
-        policy: Option<NativeContextPolicy>,
         events: Arc<dyn EventSink>,
     ) -> Result<Self> {
         let provider = provider.into();
@@ -225,7 +161,6 @@ impl NativeContextLoader {
             stream,
             max_summary_tokens,
             events,
-            policy,
             state: Mutex::new(CompressionState::default()),
         })
     }
@@ -337,23 +272,10 @@ enum CachePlan {
 impl ContextLoader for NativeContextLoader {
     /// 根据估算 token 水位透传、微压缩或完整压缩上下文。
     ///
-    /// 手动请求跳过自动水位并清空增量缓存；摘要失败、策略验证失败或事件持久化失败时
-    /// 关闭本轮模型请求，不会静默退回未固定行为。
+    /// 手动请求跳过自动水位并清空增量缓存；摘要失败或事件持久化失败时关闭本轮模型请求。
     async fn load(&self, request: CoreContextLoadRequest) -> Result<CoreLoadedContext> {
         let (effective, plan) = self.prepare_request(encode_core_request(request)?)?;
-        let policy = self.policy.as_ref().map(|binding| &binding.policy);
-        let policy_digest = self
-            .policy
-            .as_ref()
-            .map(|binding| binding.artifact_digest.to_string());
-        let outcome = compress_context(
-            effective.clone(),
-            effective.user_initiated,
-            policy,
-            policy_digest.as_deref(),
-            self,
-        )
-        .await?;
+        let outcome = compress_context(effective.clone(), effective.user_initiated, self).await?;
         self.commit_cache(plan, &outcome)?;
         self.emit_event(&effective, outcome.event.as_ref()).await?;
         decode_core_context(outcome.context)
@@ -371,43 +293,6 @@ struct CompactedMessages {
     messages: Vec<Value>,
     summarized_messages: usize,
     summary_usage: Option<Value>,
-    preserved_user_constraints: usize,
-    preserved_plan_snapshots: usize,
-    preservation_verified: bool,
-}
-
-/// 摘要模型必须回传的确定性稳定标记集合。
-#[derive(Debug, Default, Serialize)]
-struct SummaryRequirements {
-    schema_version: u32,
-    constraint_ids: BTreeSet<String>,
-    tool_result_call_ids: BTreeSet<String>,
-    fact_ids: BTreeSet<String>,
-    plan_revision: Option<u64>,
-}
-
-/// 摘要模型返回的结构化标记信封。
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct SummaryMarkers {
-    schema_version: u32,
-    #[serde(default)]
-    constraint_ids: BTreeSet<String>,
-    #[serde(default)]
-    tool_result_call_ids: BTreeSet<String>,
-    #[serde(default)]
-    fact_ids: BTreeSet<String>,
-    #[serde(default)]
-    plan_revision: Option<u64>,
-}
-
-/// 需要在摘要外固定区逐值保留的结构化消息。
-#[derive(Debug, Default)]
-struct PinnedMessages {
-    indices: BTreeSet<usize>,
-    user_constraint_ids: BTreeSet<String>,
-    plan_revision: Option<u64>,
-    plan_message_index: Option<usize>,
 }
 
 /// 摘要模型调用的最小内部结果。
@@ -419,45 +304,26 @@ struct SummaryResponse {
 /// 上下文压缩只依赖该受限摘要接口，测试可注入不联网的确定性实现。
 #[async_trait]
 trait ContextSummarizer: Send + Sync {
-    /// 摘要指定旧历史，并逐字遵守结构化标记与输出预算。
-    async fn summarize(
-        &self,
-        messages: &[Value],
-        requirements: &SummaryRequirements,
-        max_tokens: u32,
-    ) -> Result<SummaryResponse>;
+    /// 摘要指定旧历史，并遵守输出预算。
+    async fn summarize(&self, messages: &[Value], max_tokens: u32) -> Result<SummaryResponse>;
 }
 
 /// 按模型窗口、当前输入规模和手动请求选择分层压缩策略。
 async fn compress_context(
     request: ContextLoadRequest,
     manual: bool,
-    policy: Option<&ContextPolicyV1>,
-    policy_digest: Option<&str>,
     summarizer: &dyn ContextSummarizer,
 ) -> Result<CompressionOutcome> {
     let before_messages = request.messages.len();
     let before_tokens = estimate_context_tokens(request.system.as_deref(), &request.messages);
-    let (micro_threshold, compact_threshold) = match policy {
-        Some(policy) => (
-            policy.micro_compact_threshold_tokens as usize,
-            policy.full_compact_threshold_tokens as usize,
-        ),
-        None => thresholds_for_model(&request.model),
-    };
-    let policy_summary = policy.map(policy_event_data);
+    let (micro_threshold, compact_threshold) = thresholds_for_model(&request.model);
 
     if manual || before_tokens >= compact_threshold {
-        if let Some(compacted) =
-            compact_messages(&request.messages, manual, policy, summarizer).await?
-        {
+        if let Some(compacted) = compact_messages(&request.messages, manual, summarizer).await? {
             let CompactedMessages {
                 messages,
                 summarized_messages,
                 summary_usage,
-                preserved_user_constraints,
-                preserved_plan_snapshots,
-                preservation_verified,
             } = compacted;
             let after_tokens = estimate_context_tokens(request.system.as_deref(), &messages);
             let after_messages = messages.len();
@@ -479,14 +345,7 @@ async fn compress_context(
                         "summary_usage": summary_usage,
                         "trigger": if manual { "manual" } else { "auto" },
                         "strategy": "model_summary_with_recent_tail",
-                        "policy_digest": policy_digest,
-                        "policy": policy_summary,
-                        "policy_verified": policy.is_some(),
-                        "preservation_verified": preservation_verified,
-                        "preserved_user_constraints": preserved_user_constraints,
-                        "preserved_plan_snapshots": preserved_plan_snapshots,
-                        "summary_max_output_tokens": policy
-                            .map_or(DEFAULT_MAX_SUMMARY_TOKENS, |policy| policy.summary_token_budget)
+                        "summary_max_output_tokens": DEFAULT_MAX_SUMMARY_TOKENS
                     },
                     "presentation": {
                         "target": "main_event_list",
@@ -500,10 +359,7 @@ async fn compress_context(
     }
 
     if manual || before_tokens >= micro_threshold {
-        let (messages, cleared_results) = micro_compact_tool_results(
-            &request.messages,
-            policy.map(|policy| &policy.tool_result_retention),
-        );
+        let (messages, cleared_results) = micro_compact_tool_results(&request.messages);
         if cleared_results > 0 {
             let after_tokens = estimate_context_tokens(request.system.as_deref(), &messages);
             return Ok(CompressionOutcome {
@@ -522,10 +378,7 @@ async fn compress_context(
                         "estimated_tokens_before": before_tokens,
                         "estimated_tokens_after": after_tokens,
                         "trigger": if manual { "manual" } else { "auto" },
-                        "strategy": "clear_old_successful_tool_results",
-                        "policy_digest": policy_digest,
-                        "policy": policy_summary,
-                        "policy_verified": policy.is_some()
+                        "strategy": "clear_old_successful_tool_results"
                     },
                     "presentation": { "target": "none" }
                 })),
@@ -567,21 +420,6 @@ async fn compress_context(
     })
 }
 
-/// 把当前实际执行的策略参数写入结构化事件，便于 Evidence 对照 Genome 摘要。
-fn policy_event_data(policy: &ContextPolicyV1) -> Value {
-    json!({
-        "schema_version": policy.schema_version,
-        "micro_compact_threshold_tokens": policy.micro_compact_threshold_tokens,
-        "full_compact_threshold_tokens": policy.full_compact_threshold_tokens,
-        "recent_message_count": policy.recent_message_count,
-        "tool_result_retention": policy.tool_result_retention,
-        "user_constraints": policy.user_constraints,
-        "plan_snapshot": policy.plan_snapshot,
-        "summary_token_budget": policy.summary_token_budget,
-        "post_summary_validation": policy.post_summary_validation,
-    })
-}
-
 /// 根据 Claude Code 的 `[1m]` 模型标记返回微压缩和完整压缩水位。
 fn thresholds_for_model(model: &str) -> (usize, usize) {
     if model.to_ascii_lowercase().contains("[1m]") {
@@ -613,17 +451,8 @@ fn estimate_text_tokens(text: &str) -> usize {
 }
 
 /// 清理较旧的成功工具结果正文，同时保留调用关联、错误结果和最近成功结果。
-fn micro_compact_tool_results(
-    messages: &[Value],
-    retention: Option<&ToolResultRetentionPolicyV1>,
-) -> (Vec<Value>, usize) {
-    let keep = match retention {
-        Some(ToolResultRetentionPolicyV1::PreserveAll) => return (messages.to_vec(), 0),
-        Some(ToolResultRetentionPolicyV1::PreserveErrorsAndRecent {
-            recent_successful_results,
-        }) => *recent_successful_results as usize,
-        None => RECENT_TOOL_RESULTS_TO_KEEP,
-    };
+fn micro_compact_tool_results(messages: &[Value]) -> (Vec<Value>, usize) {
+    let keep = RECENT_TOOL_RESULTS_TO_KEEP;
     let total_results = messages
         .iter()
         .map(compactable_tool_result_count)
@@ -698,7 +527,6 @@ fn compactable_tool_result_count(message: &Value) -> usize {
 async fn compact_messages(
     messages: &[Value],
     manual: bool,
-    policy: Option<&ContextPolicyV1>,
     summarizer: &dyn ContextSummarizer,
 ) -> Result<Option<CompactedMessages>> {
     let group_starts = api_round_group_starts(messages);
@@ -706,33 +534,16 @@ async fn compact_messages(
         return Ok(None);
     }
 
-    let split_index = recent_tail_start(messages, &group_starts, manual, policy);
+    let split_index = recent_tail_start(messages, &group_starts, manual);
     if split_index == 0 || split_index >= messages.len() {
         return Ok(None);
     }
 
-    let pinned = match policy {
-        Some(policy) => collect_pinned_messages(messages, split_index, policy)?,
-        None => PinnedMessages::default(),
-    };
-    let requirements = summary_requirements(messages, split_index, policy, &pinned)?;
-    let max_tokens = policy.map_or(DEFAULT_MAX_SUMMARY_TOKENS, |policy| {
-        policy.summary_token_budget
-    });
     let response = summarizer
-        .summarize(&messages[..split_index], &requirements, max_tokens)
+        .summarize(&messages[..split_index], DEFAULT_MAX_SUMMARY_TOKENS)
         .await?;
-    let (summary, markers) = normalize_model_summary(&response.text, policy.is_some())?;
-    if let Some(policy) = policy {
-        verify_summary_markers(
-            markers
-                .as_ref()
-                .ok_or_else(|| anyhow!("模型摘要缺少结构化标记信封"))?,
-            &requirements,
-            policy,
-        )?;
-    }
-    let mut compacted = Vec::with_capacity(messages.len() - split_index + pinned.indices.len() + 1);
+    let summary = normalize_model_summary(&response.text)?;
+    let mut compacted = Vec::with_capacity(messages.len() - split_index + 1);
     compacted.push(json!({
         "role": "developer",
         "content": [{
@@ -742,360 +553,12 @@ async fn compact_messages(
             )
         }]
     }));
-    for index in &pinned.indices {
-        if *index < split_index {
-            compacted.push(messages[*index].clone());
-        }
-    }
     compacted.extend_from_slice(&messages[split_index..]);
-    let preservation_verified = verify_pinned_messages(&compacted, messages, &pinned)?;
     Ok(Some(CompactedMessages {
         messages: compacted,
         summarized_messages: split_index,
         summary_usage: response.usage,
-        preserved_user_constraints: pinned.user_constraint_ids.len(),
-        preserved_plan_snapshots: usize::from(pinned.plan_message_index.is_some()),
-        preservation_verified,
     }))
-}
-
-/// 收集上游显式标记的用户约束和最新成功 Plan 快照；不解析普通自然语言。
-fn collect_pinned_messages(
-    messages: &[Value],
-    split_index: usize,
-    policy: &ContextPolicyV1,
-) -> Result<PinnedMessages> {
-    let mut pinned = PinnedMessages::default();
-    for (index, message) in messages.iter().take(split_index).enumerate() {
-        if message.get("role").and_then(Value::as_str) == Some("user") {
-            for id in explicit_user_constraint_ids(message)? {
-                if !pinned.user_constraint_ids.insert(id.clone()) {
-                    return Err(anyhow!("结构化用户约束 ID 重复：{id}"));
-                }
-                pinned.indices.insert(index);
-            }
-        }
-        if let Some(revision) = plan_snapshot_revision(message, plan_limit(&policy.plan_snapshot))?
-        {
-            pinned.plan_revision = Some(revision);
-            pinned.plan_message_index = Some(index);
-        }
-    }
-    if pinned.user_constraint_ids.len() > constraint_limit(&policy.user_constraints) as usize {
-        return Err(anyhow!("结构化用户约束数量超过 Context Policy 固定区上限"));
-    }
-    if let Some(index) = pinned.plan_message_index {
-        pinned.indices.insert(index);
-    }
-    pin_tool_result_messages(
-        messages,
-        split_index,
-        &policy.tool_result_retention,
-        &mut pinned.indices,
-    );
-    Ok(pinned)
-}
-
-/// 按策略把摘要前缀中的错误与近期成功 ToolResult 固定为原始消息。
-fn pin_tool_result_messages(
-    messages: &[Value],
-    split_index: usize,
-    policy: &ToolResultRetentionPolicyV1,
-    indices: &mut BTreeSet<usize>,
-) {
-    let mut successful = Vec::new();
-    for (index, message) in messages.iter().take(split_index).enumerate() {
-        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        let mut has_result = false;
-        let mut has_error = false;
-        let mut has_success = false;
-        for block in blocks {
-            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                continue;
-            }
-            has_result = true;
-            if block
-                .pointer("/result/is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                has_error = true;
-            } else {
-                has_success = true;
-            }
-        }
-        match policy {
-            ToolResultRetentionPolicyV1::PreserveAll if has_result => {
-                indices.insert(index);
-            }
-            ToolResultRetentionPolicyV1::PreserveErrorsAndRecent { .. } => {
-                if has_error {
-                    indices.insert(index);
-                }
-                if has_success {
-                    successful.push(index);
-                }
-            }
-            _ => {}
-        }
-    }
-    if let ToolResultRetentionPolicyV1::PreserveErrorsAndRecent {
-        recent_successful_results,
-    } = policy
-    {
-        for index in successful
-            .into_iter()
-            .rev()
-            .take(*recent_successful_results as usize)
-        {
-            indices.insert(index);
-        }
-    }
-    let retained_call_ids = indices
-        .iter()
-        .flat_map(|index| tool_result_call_ids(&messages[*index]))
-        .collect::<BTreeSet<_>>();
-    for (index, message) in messages.iter().take(split_index).enumerate() {
-        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        if blocks.iter().any(|block| {
-            block.get("type").and_then(Value::as_str) == Some("tool_call")
-                && block
-                    .pointer("/call/id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| retained_call_ids.contains(id))
-        }) {
-            indices.insert(index);
-        }
-    }
-}
-
-/// 返回一条消息内全部非空 ToolResult 调用 ID。
-fn tool_result_call_ids(message: &Value) -> Vec<String> {
-    message
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-        .filter_map(|block| block.pointer("/result/call_id").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// 从完整 user 文本块读取专用 JSON 契约；非 JSON 或其他 schema 视为普通文本。
-fn explicit_user_constraint_ids(message: &Value) -> Result<Vec<String>> {
-    let mut ids = Vec::new();
-    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-        return Ok(ids);
-    };
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) != Some("text") {
-            continue;
-        }
-        let Some(text) = block.get("text").and_then(Value::as_str) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(text) else {
-            continue;
-        };
-        if value.get("schema").and_then(Value::as_str) != Some(USER_CONSTRAINT_MARKER_SCHEMA) {
-            continue;
-        }
-        let id = value
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| anyhow!("结构化用户约束缺少非空 `id`"))?;
-        if value.get("value").is_none_or(Value::is_null) {
-            return Err(anyhow!("结构化用户约束 `{id}` 缺少 `value`"));
-        }
-        ids.push(id.to_string());
-    }
-    Ok(ids)
-}
-
-/// 识别 plan-plugin 成功 ToolResult 中的最新完整只读快照。
-fn plan_snapshot_revision(message: &Value, max_items: u16) -> Result<Option<u64>> {
-    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-        return Ok(None);
-    };
-    let mut revision = None;
-    for block in blocks {
-        let Some(result) = block.get("result") else {
-            continue;
-        };
-        if result
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || !matches!(
-                result.get("name").and_then(Value::as_str),
-                Some("update_plan" | "get_plan")
-            )
-        {
-            continue;
-        }
-        let Some(content) = result.get("content") else {
-            continue;
-        };
-        if content.get("schema_version").and_then(Value::as_u64) != Some(1) {
-            return Err(anyhow!("Plan 快照 schema_version 不受支持"));
-        }
-        let current_revision = content
-            .get("revision")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("Plan 快照缺少 revision"))?;
-        let plan = content
-            .get("plan")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow!("Plan 快照缺少 plan 数组"))?;
-        if plan.len() > max_items as usize {
-            return Err(anyhow!("Plan 快照步骤数超过 Context Policy 固定区上限"));
-        }
-        revision = Some(current_revision);
-    }
-    Ok(revision)
-}
-
-/// 构造摘要模型必须逐字返回的稳定标记要求。
-fn summary_requirements(
-    messages: &[Value],
-    split_index: usize,
-    policy: Option<&ContextPolicyV1>,
-    pinned: &PinnedMessages,
-) -> Result<SummaryRequirements> {
-    let Some(policy) = policy else {
-        return Ok(SummaryRequirements::default());
-    };
-    let constraint_ids = match &policy.user_constraints {
-        UserConstraintRetentionPolicyV1::PinnedStructured { .. } => BTreeSet::new(),
-        UserConstraintRetentionPolicyV1::PinnedStructuredAndSummary { .. } => {
-            pinned.user_constraint_ids.clone()
-        }
-    };
-    let plan_revision = match &policy.plan_snapshot {
-        PlanSnapshotRetentionPolicyV1::LatestSnapshot { .. } => None,
-        PlanSnapshotRetentionPolicyV1::LatestSnapshotAndSummary { .. } => pinned.plan_revision,
-    };
-    let mut tool_result_call_ids = BTreeSet::new();
-    let mut fact_ids = BTreeSet::new();
-    for message in messages.iter().take(split_index) {
-        for id in explicit_fact_ids(message)? {
-            fact_ids.insert(id);
-        }
-        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        for block in blocks {
-            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                continue;
-            }
-            let call_id = block
-                .pointer("/result/call_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| anyhow!("摘要范围内的 ToolResult 缺少 call_id"))?;
-            tool_result_call_ids.insert(call_id.to_string());
-        }
-    }
-    Ok(SummaryRequirements {
-        schema_version: 1,
-        constraint_ids,
-        tool_result_call_ids,
-        fact_ids,
-        plan_revision,
-    })
-}
-
-/// 从任意角色的完整文本块读取专用事实 JSON 契约；普通文本永远不参与事实识别。
-fn explicit_fact_ids(message: &Value) -> Result<Vec<String>> {
-    let mut ids = Vec::new();
-    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-        return Ok(ids);
-    };
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) != Some("text") {
-            continue;
-        }
-        let Some(text) = block.get("text").and_then(Value::as_str) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(text) else {
-            continue;
-        };
-        if value.get("schema").and_then(Value::as_str) != Some(FACT_MARKER_SCHEMA) {
-            continue;
-        }
-        let id = value
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| anyhow!("结构化事实缺少非空 `id`"))?;
-        if value.get("value").is_none_or(Value::is_null) {
-            return Err(anyhow!("结构化事实 `{id}` 缺少 `value`"));
-        }
-        ids.push(id.to_string());
-    }
-    Ok(ids)
-}
-
-/// 按协议覆盖率逐字节验证模型回传标记，Plan 修订必须完全相等。
-fn verify_summary_markers(
-    markers: &SummaryMarkers,
-    required: &SummaryRequirements,
-    policy: &ContextPolicyV1,
-) -> Result<()> {
-    if markers.schema_version != 1 {
-        return Err(anyhow!("摘要标记信封 schema_version 不受支持"));
-    }
-    if markers.plan_revision != required.plan_revision {
-        return Err(anyhow!("摘要标记信封未确认最新 Plan 修订"));
-    }
-    let expected = required.constraint_ids.len()
-        + required.tool_result_call_ids.len()
-        + required.fact_ids.len();
-    let recalled = required
-        .constraint_ids
-        .intersection(&markers.constraint_ids)
-        .count()
-        + required
-            .tool_result_call_ids
-            .intersection(&markers.tool_result_call_ids)
-            .count()
-        + required.fact_ids.intersection(&markers.fact_ids).count();
-    let coverage_bps = (recalled * 10_000).checked_div(expected).unwrap_or(10_000) as u16;
-    let PostSummaryValidationAlgorithmV1::StructuredMarkerCoverageV1 { min_coverage_bps } =
-        policy.post_summary_validation;
-    if coverage_bps < min_coverage_bps {
-        return Err(anyhow!(
-            "摘要结构化标记覆盖率不足：{coverage_bps} bps，要求 {min_coverage_bps} bps"
-        ));
-    }
-    Ok(())
-}
-
-/// 对最终替换上下文逐值确认固定区消息未被摘要模型改写或遗漏。
-fn verify_pinned_messages(
-    compacted: &[Value],
-    source: &[Value],
-    pinned: &PinnedMessages,
-) -> Result<bool> {
-    for index in &pinned.indices {
-        let expected = &source[*index];
-        if !compacted.iter().any(|message| message == expected) {
-            return Err(anyhow!("摘要后固定区消息未逐值保留"));
-        }
-    }
-    Ok(true)
 }
 
 /// 以 assistant 响应开头划分 API 轮次，避免拆散工具调用与对应结果。
@@ -1110,26 +573,7 @@ fn api_round_group_starts(messages: &[Value]) -> Vec<usize> {
 }
 
 /// 自动模式保留约 40k 尾部；手动模式只保留最新完整轮次以确保实际发生压缩。
-fn recent_tail_start(
-    messages: &[Value],
-    group_starts: &[usize],
-    manual: bool,
-    policy: Option<&ContextPolicyV1>,
-) -> usize {
-    if let Some(policy) = policy {
-        let target = messages
-            .len()
-            .saturating_sub(policy.recent_message_count as usize);
-        if target == 0 {
-            return 0;
-        }
-        return group_starts
-            .iter()
-            .rev()
-            .copied()
-            .find(|start| *start <= target)
-            .unwrap_or(target);
-    }
+fn recent_tail_start(messages: &[Value], group_starts: &[usize], manual: bool) -> usize {
     if manual {
         return *group_starts.last().unwrap_or(&0);
     }
@@ -1158,25 +602,11 @@ fn recent_tail_start(
 #[async_trait]
 impl ContextSummarizer for NativeContextLoader {
     /// 使用应用固定的 provider/model 生成摘要；调用强制禁用工具、推理和 provider 逃生参数。
-    async fn summarize(
-        &self,
-        messages: &[Value],
-        requirements: &SummaryRequirements,
-        max_tokens: u32,
-    ) -> Result<SummaryResponse> {
+    async fn summarize(&self, messages: &[Value], max_tokens: u32) -> Result<SummaryResponse> {
         let mut summary_messages = messages.to_vec();
-        let request_prompt = if requirements.schema_version == 0 {
-            SUMMARY_REQUEST_PROMPT.to_string()
-        } else {
-            let marker_contract = serde_json::to_string(requirements)
-                .context("编码 Context Policy 摘要标记要求失败")?;
-            format!(
-                "{SUMMARY_REQUEST_PROMPT}\n\n在 summary 标签之后逐字输出以下标记信封；不得增删 ID 或修改 Plan 修订：\n{SUMMARY_MARKERS_OPEN}{marker_contract}{SUMMARY_MARKERS_CLOSE}"
-            )
-        };
         summary_messages.push(json!({
             "role": "user",
-            "content": [{"type": "text", "text": request_prompt}]
+            "content": [{"type": "text", "text": SUMMARY_REQUEST_PROMPT}]
         }));
         let messages = summary_messages
             .into_iter()
@@ -1221,16 +651,9 @@ impl ContextSummarizer for NativeContextLoader {
 }
 
 /// 清理模型可能返回的分析草稿和 summary 标签，并拒绝空摘要。
-fn normalize_model_summary(
-    text: &str,
-    require_markers: bool,
-) -> Result<(String, Option<SummaryMarkers>)> {
-    let without_analysis = remove_tagged_section(text, "<analysis>", "</analysis>");
-    let (without_markers, markers) = extract_summary_markers(&without_analysis)?;
-    if require_markers && markers.is_none() {
-        return Err(anyhow!("模型摘要缺少结构化标记信封"));
-    }
-    let trimmed = without_markers.trim();
+fn normalize_model_summary(text: &str) -> Result<String> {
+    let trimmed = remove_tagged_section(text, "<analysis>", "</analysis>");
+    let trimmed = trimmed.trim();
     let summary = match (trimmed.find("<summary>"), trimmed.rfind("</summary>")) {
         (Some(start), Some(end)) if start + "<summary>".len() <= end => {
             &trimmed[start + "<summary>".len()..end]
@@ -1241,36 +664,7 @@ fn normalize_model_summary(
     if summary.is_empty() {
         return Err(anyhow!("模型返回了空上下文摘要"));
     }
-    let summary = match markers.as_ref() {
-        Some(markers) => format!(
-            "{summary}\n\n{SUMMARY_MARKERS_OPEN}{}{SUMMARY_MARKERS_CLOSE}",
-            serde_json::to_string(markers).context("重新编码摘要结构化标记信封失败")?
-        ),
-        None => summary.to_string(),
-    };
-    Ok((summary, markers))
-}
-
-/// 从模型文本中提取唯一标记信封，并从摘要正文中移除该区块。
-fn extract_summary_markers(text: &str) -> Result<(String, Option<SummaryMarkers>)> {
-    let Some(start) = text.find(SUMMARY_MARKERS_OPEN) else {
-        return Ok((text.to_string(), None));
-    };
-    if text[start + SUMMARY_MARKERS_OPEN.len()..].contains(SUMMARY_MARKERS_OPEN) {
-        return Err(anyhow!("模型摘要包含重复的结构化标记信封"));
-    }
-    let content_start = start + SUMMARY_MARKERS_OPEN.len();
-    let relative_end = text[content_start..]
-        .find(SUMMARY_MARKERS_CLOSE)
-        .ok_or_else(|| anyhow!("模型摘要结构化标记信封未闭合"))?;
-    let end = content_start + relative_end;
-    let markers: SummaryMarkers = serde_json::from_str(&text[content_start..end])
-        .context("解析模型摘要结构化标记信封失败")?;
-    let block_end = end + SUMMARY_MARKERS_CLOSE.len();
-    Ok((
-        format!("{}{}", &text[..start], &text[block_end..]),
-        Some(markers),
-    ))
+    Ok(summary.to_string())
 }
 
 /// 删除第一段完整的 XML 风格区块；标签缺失时保持原文。
@@ -1337,7 +731,6 @@ mod tests {
         async fn summarize(
             &self,
             _messages: &[Value],
-            _requirements: &SummaryRequirements,
             _max_tokens: u32,
         ) -> Result<SummaryResponse> {
             Ok(SummaryResponse {
@@ -1353,7 +746,7 @@ mod tests {
 
     /// 使用确定性摘要器执行一次测试压缩。
     async fn compress_for_test(request: ContextLoadRequest, manual: bool) -> CompressionOutcome {
-        compress_context(request, manual, None, None, &TestSummarizer)
+        compress_context(request, manual, &TestSummarizer)
             .await
             .expect("测试压缩应成功")
     }
@@ -1475,13 +868,10 @@ mod tests {
             async fn summarize(
                 &self,
                 messages: &[Value],
-                requirements: &SummaryRequirements,
                 max_tokens: u32,
             ) -> Result<SummaryResponse> {
                 *self.0.lock().expect("记录锁不应损坏") = messages.to_vec();
-                TestSummarizer
-                    .summarize(messages, requirements, max_tokens)
-                    .await
+                TestSummarizer.summarize(messages, max_tokens).await
             }
         }
 
@@ -1497,8 +887,6 @@ mod tests {
                 messages,
             },
             false,
-            None,
-            None,
             &summarizer,
         )
         .await
@@ -1621,7 +1009,6 @@ mod tests {
             "test-model",
             false,
             DEFAULT_MAX_SUMMARY_TOKENS,
-            None,
             Arc::new(agent_core::InMemoryEventSink::new()),
         )
         .expect("应创建原生上下文加载器");
@@ -1636,7 +1023,7 @@ mod tests {
                 messages: original_messages.clone(),
             })
             .expect("应准备首次压缩请求");
-        let first = compress_context(request, false, None, None, &TestSummarizer)
+        let first = compress_context(request, false, &TestSummarizer)
             .await
             .expect("首次增量压缩应成功");
         loader
@@ -1657,7 +1044,7 @@ mod tests {
                 messages: extended_messages,
             })
             .expect("应准备追加压缩请求");
-        let second = compress_context(request, false, None, None, &TestSummarizer)
+        let second = compress_context(request, false, &TestSummarizer)
             .await
             .expect("后续增量压缩应成功");
         loader
@@ -1693,7 +1080,7 @@ mod tests {
             ],
             user_initiated: true,
         };
-        let outcome = compress_context(request, true, None, None, &TestSummarizer)
+        let outcome = compress_context(request, true, &TestSummarizer)
             .await
             .expect("主动压缩应立即返回结果");
 

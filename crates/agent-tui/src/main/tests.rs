@@ -393,50 +393,6 @@ async fn plugin_loading_does_not_block_ready_agent_input() {
         .any(|message| matches!(message.kind, MsgKind::User) && message.text == "立即执行"));
 }
 
-/// Evidence Run 必须等待 Genome 固定的全部插件 Ready，普通渐进模式不受该门禁影响。
-#[cfg(feature = "plugins")]
-#[tokio::test]
-async fn evidence_run_waits_for_complete_genome_plugins() {
-    use agent_evolution::{EpisodeRecorderHub, FileArtifactStore, FileEpisodeStore};
-
-    let root = std::env::temp_dir().join(format!(
-        "lucia-evidence-plugin-ready-{}",
-        SessionId::generate()
-    ));
-    let artifacts = FileArtifactStore::new(root.join("artifacts"));
-    let evidence = EvidenceRuntime::new_for_test(
-        Arc::new(EpisodeRecorderHub::new(
-            Arc::new(artifacts.clone()),
-            Arc::new(FileEpisodeStore::new(root.join("episodes"))),
-        )),
-        super::evidence::test_genome_revision(agent_tool::ExecutionPolicy::serve(), &artifacts)
-            .await,
-        artifacts,
-        FileEpisodeStore::new(root.join("episodes")),
-        &root,
-    )
-    .expect("应创建插件就绪测试 Evidence");
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into())
-        .with_evidence(Some(evidence))
-        .with_loading_plugins(vec!["skill".into()]);
-    let (gateway, options) = build_demo_gateway();
-    let agent = Arc::new(Agent::new(gateway, options));
-    app.input = "不得提前执行".into();
-    app.cursor = app.input.len();
-
-    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
-
-    assert!(!app.running);
-    assert_eq!(app.input, "不得提前执行");
-    assert!(app.messages.iter().any(|message| {
-        matches!(message.kind, MsgKind::Info) && message.text.contains("尚未完整就绪")
-    }));
-    app.finish_progressive_plugin_loading();
-    assert!(app.evidence_genome_run_is_ready());
-    let _ = tokio::fs::remove_dir_all(root).await;
-}
-
 /// Queued startup inputs execute sequentially and persist into one continuing session.
 ///
 /// 启动队列中的输入应逐条执行，并持久化到同一个连续 Session。
@@ -520,7 +476,7 @@ fn render_adapts_to_running_state_and_narrow_width() {
     assert!(!text.contains("ascnet-lucia"), "{text:?}");
 }
 
-/// 当前运行收到推理摘要后必须显示独立“思考”区域，不能伪装成助手回复。
+/// 当前运行收到推理摘要后必须显示独立灰色“思考”区域，不能伪装成助手回复。
 #[test]
 fn render_shows_ephemeral_reasoning_summary() {
     let backend = TestBackend::new(80, 18);
@@ -534,19 +490,38 @@ fn render_shows_ephemeral_reasoning_summary() {
     terminal
         .draw(|frame| render_root(frame, &mut app))
         .expect("渲染推理摘要");
-    let text = terminal
-        .backend()
-        .buffer()
-        .content()
+    let buffer = terminal.backend().buffer();
+    let rows = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let text = rows.join("");
+    let message_row = rows
         .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>()
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
+        .position(|row| row.contains("检查任务"))
+        .expect("正文应可见");
+    let thinking_row = rows
+        .iter()
+        .position(|row| row.contains("正在核对权限边界"))
+        .expect("思考区应可见");
+    let thinking_x = (0..buffer.area.width)
+        .find(|x| buffer[(*x, thinking_row as u16)].symbol() == "正")
+        .expect("思考内容应存在灰色单元格");
 
     assert!(text.contains("思考"), "{text:?}");
     assert!(text.contains("正在核对权限边界"), "{text:?}");
+    assert!(message_row < thinking_row, "{rows:?}");
+    assert_eq!(
+        buffer[(thinking_x, thinking_row as u16)].fg,
+        COLOR_MUTED,
+        "思考内容必须使用低对比灰色"
+    );
     assert_eq!(
         app.messages
             .iter()
@@ -554,6 +529,93 @@ fn render_shows_ephemeral_reasoning_summary() {
             .count(),
         0
     );
+}
+
+/// 思考必须独立于正文滚动，并固定显示在正文与任务面板之间。
+#[cfg(feature = "plugins")]
+#[test]
+fn reasoning_section_stays_between_scrolled_chat_and_task_panel() {
+    let backend = TestBackend::new(80, 28);
+    let mut terminal = Terminal::new(backend).expect("创建思考布局测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.messages
+        .extend((0..20).map(|index| Msg::new(MsgKind::User, format!("正文定位 {index}"))));
+    app.model_thinking = "独立思考定位".into();
+    app.scroll = Some(0);
+    let mut tasks = test_plugin_view(UiPlacement::ComposerShelf, "任务");
+    tasks.frame.as_mut().expect("任务帧应存在").lines[0].spans[0].text = "任务面板定位".into();
+    app.plugin_views.push(tasks);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染思考与任务面板");
+    let buffer = terminal.backend().buffer();
+    let rows = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let body_row = rows
+        .iter()
+        .position(|row| row.contains("正文定位0"))
+        .expect("上翻后的正文应可见");
+    let thinking_row = rows
+        .iter()
+        .position(|row| row.contains("独立思考定位"))
+        .expect("上翻正文时思考仍应可见");
+    let task_row = rows
+        .iter()
+        .position(|row| row.contains("任务面板定位"))
+        .expect("任务面板应可见");
+
+    assert!(body_row < thinking_row, "{rows:?}");
+    assert!(thinking_row < task_row, "{rows:?}");
+}
+
+/// 长思考只展示末尾四行，不能持续挤压正文和输入区。
+#[test]
+fn reasoning_section_caps_height_and_keeps_latest_lines() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("创建长思考测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.messages.push(Msg::new(MsgKind::User, "正文保留"));
+    app.model_thinking = (0..10)
+        .map(|index| format!("思考阶段{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染长思考");
+    let buffer = terminal.backend().buffer();
+    let rows = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let visible_thinking_rows = rows.iter().filter(|row| row.contains("思考阶段")).count();
+
+    assert!(rows.iter().any(|row| row.contains("正文保留")), "{rows:?}");
+    assert!(
+        !rows.iter().any(|row| row.contains("思考阶段0")),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|row| row.contains("思考阶段9")), "{rows:?}");
+    assert_eq!(visible_thinking_rows, 4);
 }
 
 /// 验证工具行展示参数与返回内容摘要，且过长内容按显示宽度截断。
@@ -1082,28 +1144,14 @@ async fn successful_runs_persist_with_cas_revision() {
     )
     .expect("创建测试会话记录");
 
-    let first_completion = run_and_persist(
-        &agent,
-        &store,
-        record,
-        "第一轮",
-        &GenomeSessionRuntime::TestOnly,
-    )
-    .await;
+    let first_completion = run_and_persist(&agent, &store, record, "第一轮").await;
     assert!(first_completion.error.is_none());
     assert!(first_completion.run.is_some());
     let first = first_completion.session_record;
     assert_eq!(first.revision, 2);
     assert_eq!(first.title.as_deref(), Some("第一轮"));
 
-    let second_completion = run_and_persist(
-        &agent,
-        &store,
-        first.clone(),
-        "第二轮",
-        &GenomeSessionRuntime::TestOnly,
-    )
-    .await;
+    let second_completion = run_and_persist(&agent, &store, first.clone(), "第二轮").await;
     assert!(second_completion.error.is_none());
     assert!(second_completion.run.is_some());
     let second = second_completion.session_record;
@@ -1114,179 +1162,6 @@ async fn successful_runs_persist_with_cas_revision() {
         store.load(&second.id).await.expect("读取测试会话"),
         Some(second)
     );
-}
-
-/// 未配置 Genome 的新 Draft 必须在首次保存和模型调用前拒绝主输入。
-#[tokio::test]
-async fn unconfigured_genome_rejects_input_before_session_save() {
-    let (gateway, options) = build_demo_gateway();
-    let agent = Agent::new(gateway, options);
-    let store = MemorySessionStore::new();
-    let record = SessionRecord::new(
-        SessionId::new("unconfigured-genome").expect("应创建会话 ID"),
-        Session::new(),
-    )
-    .expect("应创建 Draft");
-
-    let completion = run_and_persist(
-        &agent,
-        &store,
-        record,
-        "不得保存或运行",
-        &GenomeSessionRuntime::Unconfigured,
-    )
-    .await;
-
-    assert!(!completion.input_committed);
-    assert!(completion.run.is_none());
-    assert!(completion
-        .error
-        .expect("未配置 Genome 必须返回错误")
-        .to_string()
-        .contains("尚未完成初始化"));
-    assert!(store.list().await.expect("应读取内存存储").is_empty());
-}
-
-/// 未配置 Genome 时 `/compact` 的上下文重载也必须在加载器和保存前失败关闭。
-#[tokio::test]
-async fn unconfigured_genome_rejects_session_context_reload() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut app =
-        App::new(tx, "测试模型".into()).with_genome_runtime(GenomeSessionRuntime::Unconfigured);
-
-    start_session_context_reload(&mut app, "正在压缩".into());
-    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(UiEvent::SessionContextReloaded(result)) = rx.recv().await {
-                break *result;
-            }
-        }
-    })
-    .await
-    .expect("应收到上下文重载结果");
-
-    let Err(error) = result else {
-        panic!("未配置 Genome 不得重载上下文");
-    };
-    assert!(error.to_string().contains("精确 Genome Revision"));
-    assert_eq!(app.session_record.revision, 0);
-    assert!(app.session_record.behavior_binding.is_none());
-}
-
-/// 启用 Evidence 时，真实主会话必须使用预分配 Run ID 生成绑定 Genome 的 Episode。
-#[tokio::test]
-async fn evidence_runtime_records_persisted_main_run() {
-    use agent_evolution::{
-        EpisodeQuery, EpisodeRecorderHub, EpisodeStore, FileArtifactStore, FileEpisodeStore,
-    };
-    use agent_evolution_protocol::Outcome;
-
-    let root = std::env::temp_dir().join(format!("lucia-tui-evidence-{}", SessionId::generate()));
-    let episodes = Arc::new(FileEpisodeStore::new(root.join("episodes")));
-    let artifacts = FileArtifactStore::new(root.join("artifacts"));
-    let hub = Arc::new(EpisodeRecorderHub::new(
-        Arc::new(artifacts.clone()),
-        episodes.clone(),
-    ));
-    let revision =
-        super::evidence::test_genome_revision(agent_tool::ExecutionPolicy::serve(), &artifacts)
-            .await;
-    let genome_revision_id = revision.revision_id.clone();
-    let genome_runtime = GenomeSessionRuntime::Genome {
-        binding: Arc::new(
-            super::genome_binding::GenomeRuntimeBinding::new(revision.clone(), artifacts.clone())
-                .expect("应创建主会话 Genome 绑定"),
-        ),
-        registry_root: root.clone(),
-        stable_lineage: None,
-    };
-    let evidence = EvidenceRuntime::new_for_test(
-        Arc::clone(&hub),
-        revision,
-        artifacts,
-        FileEpisodeStore::new(root.join("episodes")),
-        &root,
-    )
-    .expect("应创建主会话 Evidence");
-    let (gateway, options) = build_demo_gateway();
-    let mut sinks = CompositeEventSink::new();
-    sinks.push(hub);
-    let agent = Agent::new(gateway, options).with_event_sink(Arc::new(sinks));
-    let store = MemorySessionStore::new();
-    let session_id = SessionId::new("evidence-session").expect("创建证据测试会话标识");
-    let record = SessionRecord::new(session_id.clone(), Session::new()).expect("创建证据测试会话");
-
-    let completion = run_and_persist_with_evidence(
-        &agent,
-        &store,
-        record,
-        "记录本轮证据",
-        &genome_runtime,
-        Some(&evidence),
-    )
-    .await;
-
-    assert!(completion.error.is_none(), "{:?}", completion.error);
-    let run = completion.run.expect("Agent 应成功完成");
-    let stored = episodes
-        .query(&EpisodeQuery {
-            outcome: None,
-            session_id: Some(session_id.to_string()),
-        })
-        .await
-        .expect("应查询 Episode");
-    assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].run_id.as_str(), run.run_id);
-    assert_eq!(stored[0].genome_revision_id, genome_revision_id);
-    assert_eq!(stored[0].outcome, Some(Outcome::Unverifiable));
-    assert_eq!(stored[0].session_id, session_id.to_string());
-    let saved_session = store
-        .load(&session_id)
-        .await
-        .expect("应读取绑定后的会话")
-        .expect("Evidence 会话应已保存");
-    assert_eq!(
-        saved_session.behavior_binding,
-        Some(
-            agent_session::SessionBehaviorBinding::new(
-                "agent_genome",
-                genome_revision_id.to_string()
-            )
-            .expect("应构造预期 Genome 绑定")
-        )
-    );
-
-    let legacy_id = SessionId::new("legacy-evidence-session").expect("应创建旧会话标识");
-    let legacy = store
-        .save(
-            SessionRecord::new(legacy_id.clone(), Session::new()).expect("应创建未绑定旧会话"),
-            None,
-        )
-        .await
-        .expect("应保存未绑定旧会话");
-    let completion = run_and_persist_with_evidence(
-        &agent,
-        &store,
-        legacy,
-        "旧会话不得静默认领 Genome",
-        &genome_runtime,
-        Some(&evidence),
-    )
-    .await;
-    assert!(!completion.input_committed);
-    assert!(completion
-        .error
-        .expect("旧会话缺少绑定必须失败")
-        .to_string()
-        .contains("未绑定当前精确 Genome Revision"));
-    assert!(store
-        .load(&legacy_id)
-        .await
-        .expect("应读取旧会话")
-        .expect("旧会话应仍存在")
-        .behavior_binding
-        .is_none());
-    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 /// 首次 save 已写入但返回错误时，应通过回读协调后继续模型运行。
@@ -1301,14 +1176,7 @@ async fn reconciles_indeterminate_initial_save_before_running() {
     )
     .expect("创建首次协调测试会话");
 
-    let completion = run_and_persist(
-        &agent,
-        &store,
-        record,
-        "首次提交需要协调",
-        &GenomeSessionRuntime::TestOnly,
-    )
-    .await;
+    let completion = run_and_persist(&agent, &store, record, "首次提交需要协调").await;
 
     assert!(completion.error.is_none());
     assert!(completion.run.is_some());
@@ -1337,14 +1205,7 @@ async fn reconciles_indeterminate_final_save_without_forking() {
     .expect("创建最终协调测试会话");
     let original_id = record.id.clone();
 
-    let completion = run_and_persist(
-        &agent,
-        &store,
-        record,
-        "最终提交需要协调",
-        &GenomeSessionRuntime::TestOnly,
-    )
-    .await;
+    let completion = run_and_persist(&agent, &store, record, "最终提交需要协调").await;
 
     assert!(completion.error.is_none());
     assert!(completion.run.is_some());
@@ -1372,14 +1233,7 @@ async fn final_save_conflict_forks_completed_session() {
         .insert("lucia.project_id".into(), Value::String("project-a".into()));
     let original_id = record.id.clone();
 
-    let completion = run_and_persist(
-        &agent,
-        &store,
-        record,
-        "需要完整回复",
-        &GenomeSessionRuntime::TestOnly,
-    )
-    .await;
+    let completion = run_and_persist(&agent, &store, record, "需要完整回复").await;
 
     assert!(completion.run.is_some());
     assert!(completion.input_committed);
@@ -1418,14 +1272,7 @@ async fn failed_final_and_fork_saves_keep_dirty_completed_session() {
     )
     .expect("创建 dirty 测试会话");
 
-    let completion = run_and_persist(
-        &agent,
-        &store,
-        record,
-        "保留这次回复",
-        &GenomeSessionRuntime::TestOnly,
-    )
-    .await;
+    let completion = run_and_persist(&agent, &store, record, "保留这次回复").await;
     let dirty_record = completion.session_record.clone();
     let expected_assistant = restore_session_messages(&dirty_record.session)
         .into_iter()
