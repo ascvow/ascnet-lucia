@@ -3,7 +3,18 @@
 //! 本模块只实现与插件业务无关的宿主基础能力：替换主输入、会话新建与恢复、
 //! 请求原生上下文压缩、退出应用，以及供插件界面消费的会话摘要查询。
 
-use super::*;
+use crate::app::App;
+use crate::session::conversation::{Msg, MsgKind};
+use crate::session::start_session_context_reload;
+use agent_plugin_host::{PluginHost, PluginServiceCall};
+use agent_plugin_protocol::{
+    UiHostAction, UiHostActionRequest, UiSessionListStatus, UiSessionSummary, UI_HOST_ACTION_EVENT,
+};
+use agent_session::{SessionId, SessionStore, SessionSummary};
+use anyhow::{anyhow, Context, Result};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::Value;
 
 /// 宿主应用调用插件服务时使用的稳定身份。
 #[cfg(feature = "plugins")]

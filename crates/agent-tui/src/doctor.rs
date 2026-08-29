@@ -1,9 +1,21 @@
 //! Lucia 全局无侵入诊断编排。
 
-use super::*;
+use crate::cli::{Args, DoctorArgs};
+use crate::config::{
+    configured_model_key_is_available, load_tui_settings, lucia_home_dir, resolve_config_path,
+    resolve_config_relative_path, TuiSettings,
+};
+#[cfg(feature = "plugins")]
+use crate::plugin::startup::{
+    discover_plugin_manifests, merge_plugin_manifests, remove_disabled_plugin_manifests,
+};
+use crate::session::resolve_tui_path;
+use agent_core::config::AgentRootConfig;
 use agent_session::diagnose_file_session_store;
 use anyhow::{bail, Result};
 use serde::Serialize;
+#[cfg(feature = "plugins")]
+use std::collections::HashMap;
 use std::{fs, path::Path};
 
 /// 全局诊断检查状态。

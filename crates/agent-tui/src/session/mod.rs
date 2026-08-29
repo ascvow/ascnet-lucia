@@ -1,6 +1,36 @@
 //! 工作区身份、会话存储、启动恢复与 CAS 持久化协调。
 
-use super::*;
+use agent_core::ContextLoadRequest;
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use sha2::Digest;
+pub(crate) mod attachment;
+pub(crate) mod conversation;
+
+use crate::app::App;
+use crate::config::resolve_config_relative_path;
+use crate::event::AgentCompletion;
+use crate::event::SessionReloadOutcome;
+use crate::event::UiEvent;
+use crate::session::conversation::Msg;
+use crate::session::conversation::MsgKind;
+use crate::session::conversation::UserSubmission;
+use agent_core::model::ContentBlock;
+use agent_core::model::MessageRole;
+use agent_core::Agent;
+use agent_core::ContextLoader;
+use agent_core::Session;
+use agent_session::FileSessionStore;
+use agent_session::SessionId;
+use agent_session::SessionRecord;
+use agent_session::SessionStore;
+use agent_session::SessionStoreError;
+use agent_session::SessionSummary;
+use serde_json::Value;
+use sha2::Sha256;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// 启动目录派生出的稳定项目上下文。
 #[derive(Debug, Clone)]

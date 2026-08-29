@@ -6,7 +6,11 @@ use super::render_main;
 use super::{
     render_docked_plugin_views, render_plugin_dialog, render_plugin_input, render_plugin_subview,
 };
-use crate::*;
+use crate::app::App;
+#[cfg(feature = "plugins")]
+use crate::command::render_native_plugin_dialog;
+use crate::command::render_native_session_dialog;
+use ratatui::prelude::*;
 
 /// Selects and renders the main view, plugin slots, dialogs, or the active subview.
 /// 选择并渲染主视图、插件插槽、对话框或当前激活的子视图。

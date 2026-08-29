@@ -6,7 +6,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 /// 编译时嵌入的模型能力快照，运行时不访问网络。
-const MODELS_DEV_SNAPSHOT: &str = include_str!("../assets/models-dev.json");
+const MODELS_DEV_SNAPSHOT: &str = include_str!("../../assets/models-dev.json");
 
 /// TUI 使用的模型能力，只保留请求与展示需要的稳定字段。
 #[derive(Clone, Debug, PartialEq, Eq)]

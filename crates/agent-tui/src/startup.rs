@@ -1,6 +1,67 @@
 //! TUI 启动组装、运行队列驱动与终端事件循环。
 
-use super::*;
+#[cfg(feature = "plugins")]
+use crate::app::PluginKeyRoute;
+use crate::app::{reasoning_level_label, App, ChannelEventSink};
+use crate::cli::Args;
+use crate::command::resume_native_session;
+use crate::config::{
+    configured_model_key_is_available, initialize_config, load_tui_settings, lucia_home_dir,
+    resolve_config_path, resolve_config_relative_path, TuiSettings,
+};
+use crate::demo::{build_demo_gateway, echo_spec};
+use crate::event::{AgentCompletion, UiEvent};
+#[cfg(feature = "plugins")]
+use crate::plugin::host_actions::{call_typed_plugin_service, HOST_SERVICE_CALLER};
+#[cfg(feature = "plugins")]
+use crate::plugin::management::PluginManagementService;
+#[cfg(feature = "plugins")]
+use crate::plugin::startup::{
+    discover_plugin_manifests, load_plugins_for_tui, merge_plugin_manifests, plugin_manifest_ids,
+    remove_disabled_plugin_manifests, PluginExecutionContext,
+};
+use crate::session::conversation::{Msg, MsgKind};
+use crate::session::{
+    load_startup_session, print_persisted_sessions, resolve_tui_path, start_session_context_reload,
+    LazyFileSessionStore, WorkspaceContext,
+};
+#[cfg(feature = "plugins")]
+use crate::theme::PLUGIN_REFRESH_TICKS;
+use crate::theme::UI_TICK_INTERVAL_MS;
+#[cfg(feature = "plugins")]
+use crate::ui::plugin_bridge::{
+    apply_plugin_frames, apply_plugin_navigation_event, dispatch_plugin_input,
+    drain_plugin_ui_events, refresh_plugin_view, refresh_plugin_views_for,
+};
+use crate::ui::root::render_root;
+use agent_context::{NativeContextLoader, DEFAULT_MAX_SUMMARY_TOKENS};
+use agent_core::config::AgentRootConfig;
+use agent_core::event::{
+    AgentEvent, AgentEventKind, CompositeEventSink, EventSink, JsonlEventSink,
+};
+use agent_core::{Agent, ContextLoader};
+#[cfg(feature = "plugins")]
+use agent_plugin_host::manifest::load_plugin_runtime_config;
+#[cfg(feature = "plugins")]
+use agent_plugin_host::wasm::{configure_wasm_cache_directory, ProgressivePluginLoadUpdate};
+#[cfg(feature = "plugins")]
+use agent_plugin_host::{LivePluginHost, PluginHost};
+#[cfg(feature = "plugins")]
+use agent_runtime::AgentTemplate;
+use agent_session::SessionStore;
+use agent_skill::SkillCatalog;
+use agent_tool::{JsonTool, ToolRegistry};
+use anyhow::{anyhow, Context, Result};
+use crossterm::event::{Event, KeyEventKind, MouseEventKind};
+use serde_json::{json, Value};
+#[cfg(feature = "plugins")]
+use std::collections::HashMap;
+use std::path::Path;
+#[cfg(feature = "plugins")]
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// 创建以 TUI 启动目录为上界的原生工具工作区守卫。
 ///

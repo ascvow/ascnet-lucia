@@ -1,7 +1,18 @@
 //! 插件视图的异步渲染、输入和导航事件桥接。
 
-use crate::*;
+use crate::app::{plugin_view_visible, App};
+use crate::plugin::host_actions::apply_plugin_host_action_event;
+use crate::session::conversation::Msg;
+use crate::theme::{COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_USER, COLOR_WARNING};
+use agent_plugin_host::{LivePluginHost, PluginHost};
+use agent_plugin_protocol::UiFrame as PluginUiFrame;
+use agent_plugin_protocol::{
+    UiInput, UiNavigationRequest, UiPlacement, UiRenderRequest, UI_NAVIGATION_EVENT,
+};
+use anyhow::{anyhow, Result};
 use futures_util::future::join_all;
+use serde_json::Value;
+use std::sync::Arc;
 
 /// 单个插件视图后台渲染结果，保留可信 owner 和实例定位信息。
 pub(crate) type PluginRenderResult = (

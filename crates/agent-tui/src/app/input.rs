@@ -1,0 +1,677 @@
+//! 主输入区的按键编辑、附件引用、滚动与文本选择。
+
+use super::App;
+use crate::app::{MouseTextSelection, ESC_DOUBLE_PRESS_WINDOW};
+use crate::session::attachment::{
+    attachment_media_type, attachment_modality, copy_to_clipboard, pasted_file_path,
+};
+use crate::session::conversation::{
+    submission_text, Msg, MsgKind, PendingAttachment, UserSubmission,
+};
+use crate::theme::MAX_ATTACHMENT_BYTES;
+use agent_core::Agent;
+use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::prelude::*;
+use std::path::Path;
+use std::sync::Arc;
+
+impl App {
+    pub(crate) fn handle_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        agent: Option<&Arc<Agent>>,
+    ) {
+        if !matches!(code, KeyCode::Esc) {
+            self.last_escape_at = None;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
+            self.should_quit = true;
+            return;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('y')) {
+            self.copy_last_assistant_message();
+            return;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('t')) {
+            self.toggle_mouse_capture();
+            return;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('r')) {
+            self.cycle_reasoning_level(agent);
+            return;
+        }
+        // Ctrl+P/Ctrl+N 作为方向键历史回溯的兼容入口。
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('p')) {
+            // 仅空输入或已处于回溯态时生效，避免覆盖未发送的内容。
+            if self.input.is_empty() || self.input_history_cursor.is_some() {
+                self.recall_older_input();
+            }
+            return;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('n')) {
+            if self.input_history_cursor.is_some() {
+                self.recall_newer_input();
+            }
+            return;
+        }
+        // 多行编辑键优先于命令预览，避免补全弹层吞掉换行手势。
+        // Shift+Enter 依赖键盘增强协议；Alt+Enter 与 Ctrl+J 在传统终端也可用。
+        if (matches!(code, KeyCode::Enter)
+            && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
+            || (modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('j')))
+        {
+            self.insert_input_text("\n");
+            return;
+        }
+
+        match code {
+            KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+                let start = previous_word_boundary(&self.input, self.cursor);
+                if start < self.cursor {
+                    self.input.replace_range(start..self.cursor, "");
+                    self.cursor = start;
+                    self.finish_input_edit();
+                }
+            }
+            KeyCode::End if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll = None;
+            }
+            KeyCode::Left if modifiers.contains(KeyModifiers::ALT) => {
+                self.cursor = previous_word_boundary(&self.input, self.cursor);
+            }
+            KeyCode::Right if modifiers.contains(KeyModifiers::ALT) => {
+                self.cursor = next_word_boundary(&self.input, self.cursor);
+            }
+            KeyCode::Enter => {
+                // 后台命令可能随时替换会话记录，期间禁止并发提交新消息。
+                if self.pending_reload.is_some() {
+                    self.messages
+                        .push(Msg::new(MsgKind::Info, "上下文压缩仍在进行中，请稍候"));
+                    return;
+                }
+                if let Some(agent) = agent {
+                    if self.running {
+                        // steering 只支持纯文本，附件必须等当前回合结束后随消息发送。
+                        if self.attachments.is_empty() {
+                            self.submit_steering(agent);
+                        } else {
+                            self.messages.push(Msg::new(
+                                MsgKind::Info,
+                                "Attachments cannot be sent during a run. Wait for it to finish.",
+                            ));
+                        }
+                    } else {
+                        self.submit(agent);
+                    }
+                } else {
+                    self.queue_input_until_ready();
+                }
+            }
+            KeyCode::Esc => {
+                // 运行中优先中断；空闲输入必须连续双按才清空，Esc 永不直接退出。
+                if self.running {
+                    self.last_escape_at = None;
+                    if let Some(agent) = agent {
+                        self.run_stream_cancelled = true;
+                        agent.cancel();
+                        self.messages
+                            .push(Msg::new(MsgKind::Info, "Cancelling the current run..."));
+                    }
+                } else if self.input.is_empty() && self.attachments.is_empty() {
+                    self.last_escape_at = None;
+                } else {
+                    let now = std::time::Instant::now();
+                    let double_pressed = self.last_escape_at.take().is_some_and(|previous| {
+                        now.saturating_duration_since(previous) <= ESC_DOUBLE_PRESS_WINDOW
+                    });
+                    if double_pressed {
+                        self.input.clear();
+                        self.cursor = 0;
+                        self.finish_input_edit();
+                    } else {
+                        self.last_escape_at = Some(now);
+                    }
+                }
+            }
+            KeyCode::PageUp => self.scroll_up(self.last_viewport.saturating_sub(1).max(1)),
+            KeyCode::PageDown => self.scroll_down(self.last_viewport.saturating_sub(1).max(1)),
+            KeyCode::Up => {
+                if self.input_history_cursor.is_some() {
+                    self.recall_older_input();
+                } else if !(self.input.contains('\n')
+                    && move_cursor_vertically(&self.input, &mut self.cursor, true))
+                {
+                    // 空输入框直接回填最近一次提交；非空单行草稿不得被历史覆盖。
+                    if self.input.is_empty() {
+                        self.recall_older_input();
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if self.input_history_cursor.is_some() {
+                    self.recall_newer_input();
+                } else if !(self.input.contains('\n')
+                    && move_cursor_vertically(&self.input, &mut self.cursor, false))
+                {
+                    // 未处于历史回溯态时向下键不修改当前草稿。
+                }
+            }
+            KeyCode::Char(c) => {
+                let mut encoded = [0; 4];
+                self.insert_input_text(c.encode_utf8(&mut encoded));
+            }
+            KeyCode::Backspace => {
+                // 光标紧跟附件引用标签时整体删除标签与附件。
+                if !self.remove_attachment_before_cursor() {
+                    if let Some(prev) = self.input[..self.cursor].chars().last() {
+                        self.cursor -= prev.len_utf8();
+                        self.input.remove(self.cursor);
+                    }
+                    self.prune_attachments();
+                }
+                self.finish_input_edit();
+            }
+            KeyCode::Delete => {
+                if let Some(next) = self.input[self.cursor..].chars().next() {
+                    let end = self.cursor + next.len_utf8();
+                    self.input.replace_range(self.cursor..end, "");
+                    self.finish_input_edit();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(prev) = self.input[..self.cursor].chars().last() {
+                    self.cursor -= prev.len_utf8();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(next) = self.input[self.cursor..].chars().next() {
+                    self.cursor += next.len_utf8();
+                }
+            }
+            KeyCode::Home => {
+                // 多行输入时回到当前逻辑行行首；单行输入等价于整段开头。
+                self.cursor = self.input[..self.cursor]
+                    .rfind('\n')
+                    .map_or(0, |index| index + 1);
+            }
+            KeyCode::End => {
+                // 多行输入时到当前逻辑行行尾；单行输入等价于整段末尾。
+                self.cursor = self.input[self.cursor..]
+                    .find('\n')
+                    .map_or(self.input.len(), |index| self.cursor + index);
+            }
+            _ => {}
+        }
+    }
+
+    /// 向上滚动 n 行，进入手动滚动模式。
+    pub(crate) fn scroll_up(&mut self, n: u16) {
+        self.text_selection = None;
+        let current = self.scroll.unwrap_or(self.last_max_scroll);
+        self.scroll = Some(current.saturating_sub(n));
+    }
+
+    /// 向下滚动 n 行；到达底部时恢复自动跟随。
+    pub(crate) fn scroll_down(&mut self, n: u16) {
+        self.text_selection = None;
+        if let Some(current) = self.scroll {
+            let next = current.saturating_add(n);
+            if next >= self.last_max_scroll {
+                self.scroll = None;
+            } else {
+                self.scroll = Some(next);
+            }
+        }
+    }
+
+    /// 在当前光标处插入文本，并退出历史回溯态、同步附件状态。
+    fn insert_input_text(&mut self, text: &str) {
+        self.input.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        self.finish_input_edit();
+    }
+
+    /// 完成一次输入内容修改后的统一清理。
+    fn finish_input_edit(&mut self) {
+        self.input_history_cursor = None;
+        self.last_escape_at = None;
+        self.prune_attachments();
+    }
+
+    /// 召回更早的一条输入；空历史保持当前编辑器不变。
+    fn recall_older_input(&mut self) {
+        let Some(index) = self.input_history_cursor.map_or_else(
+            || self.input_history.len().checked_sub(1),
+            |current| current.checked_sub(1),
+        ) else {
+            return;
+        };
+        self.input_history_cursor = Some(index);
+        self.input.clone_from(&self.input_history[index]);
+        self.cursor = self.input.len();
+        self.prune_attachments();
+    }
+
+    /// 向较新的输入回溯；越过最新记录时恢复空编辑器。
+    fn recall_newer_input(&mut self) {
+        let Some(current) = self.input_history_cursor else {
+            return;
+        };
+        if current + 1 < self.input_history.len() {
+            let index = current + 1;
+            self.input_history_cursor = Some(index);
+            self.input.clone_from(&self.input_history[index]);
+        } else {
+            self.input_history_cursor = None;
+            self.input.clear();
+        }
+        self.cursor = self.input.len();
+        self.prune_attachments();
+    }
+
+    /// 记录成功提交的非空输入，忽略连续重复并只保留最近五十条。
+    fn remember_input(&mut self, input: &str) {
+        if input.is_empty() || self.input_history.last().is_some_and(|last| last == input) {
+            self.input_history_cursor = None;
+            return;
+        }
+        if self.input_history.len() == 50 {
+            self.input_history.remove(0);
+        }
+        self.input_history.push(input.to_string());
+        self.input_history_cursor = None;
+    }
+
+    /// 处理终端粘贴：文件路径转为附件，其余文本折叠为引用标签并保留原文待发送。
+    pub(crate) fn handle_paste(&mut self, pasted: &str) {
+        if let Some(path) = pasted_file_path(pasted) {
+            self.attach_file(&path);
+            return;
+        }
+        // 统一平台换行，制表符仍降级为空格以避免不同终端产生不可见差异。
+        let text = pasted
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', " ");
+        if text.is_empty() {
+            return;
+        }
+        if let Err(message) =
+            self.validate_attachment_modality(&crate::config::model_metadata::ModelModality::Text)
+        {
+            self.messages.push(Msg::new(MsgKind::Error, message));
+            return;
+        }
+        let label = self.next_pasted_text_label();
+        self.attachments.push(PendingAttachment {
+            label: label.clone(),
+            name: "粘贴的文本".to_string(),
+            media_type: "text/plain".to_string(),
+            data: String::new(),
+            is_image: false,
+            pasted_text: Some(text),
+        });
+        let clip = format!("{label} ");
+        self.input.insert_str(self.cursor, &clip);
+        self.cursor += clip.len();
+        self.finish_input_edit();
+    }
+
+    /// 读取文件并加入待发送附件，同时在光标处插入引用标签。
+    ///
+    /// 读取失败或超过 [`MAX_ATTACHMENT_BYTES`] 时追加错误消息，不修改输入。
+    pub(crate) fn attach_file(&mut self, path: &Path) {
+        use base64::Engine;
+
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.messages.push(Msg::new(
+                    MsgKind::Error,
+                    format!("Failed to read attachment ({}): {error}", path.display()),
+                ));
+                return;
+            }
+        };
+        if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
+            self.messages.push(Msg::new(
+                MsgKind::Error,
+                format!(
+                    "Attachment exceeds the {} MiB limit: {}",
+                    MAX_ATTACHMENT_BYTES / 1024 / 1024,
+                    path.display()
+                ),
+            ));
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "attachment".to_string());
+        let (media_type, is_image) = attachment_media_type(path, &bytes);
+        let modality = attachment_modality(&media_type);
+        if let Err(message) = self.validate_attachment_modality(&modality) {
+            self.messages.push(Msg::new(MsgKind::Error, message));
+            return;
+        }
+        let label = self.next_attachment_label(&modality);
+        self.attachments.push(PendingAttachment {
+            label: label.clone(),
+            name,
+            media_type,
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            is_image,
+            pasted_text: None,
+        });
+        let clip = format!("{label} ");
+        self.input.insert_str(self.cursor, &clip);
+        self.cursor += clip.len();
+        self.finish_input_edit();
+    }
+
+    /// 校验附件所需的模型输入模态，并隔离 Core 尚未实现的音视频协议。
+    fn validate_attachment_modality(
+        &self,
+        modality: &crate::config::model_metadata::ModelModality,
+    ) -> std::result::Result<(), String> {
+        use crate::config::model_metadata::ModelModality;
+
+        if let Some(supported) = self.model_input_modalities.as_ref() {
+            if !supported.contains(modality) {
+                return Err(format!(
+                    "当前模型不支持{}输入；能力来自内置 models.dev 快照",
+                    modality.label()
+                ));
+            }
+        }
+        if matches!(modality, ModelModality::Audio | ModelModality::Video) {
+            return Err(format!(
+                "当前模型支持{}输入，但 Lucia 当前模型协议尚未实现该内容块",
+                modality.label()
+            ));
+        }
+        Ok(())
+    }
+
+    /// 按附件模态生成不冲突的递增编号标签。
+    pub(crate) fn next_attachment_label(
+        &self,
+        modality: &crate::config::model_metadata::ModelModality,
+    ) -> String {
+        use crate::config::model_metadata::ModelModality;
+
+        let prefix = match modality {
+            ModelModality::Image => "IMAGE",
+            ModelModality::Pdf => "PDF",
+            _ => "FILE",
+        };
+        let mut index = 1;
+        loop {
+            let label = format!("[{prefix}#{index}]");
+            if !self
+                .attachments
+                .iter()
+                .any(|attachment| attachment.label == label)
+            {
+                return label;
+            }
+            index += 1;
+        }
+    }
+
+    /// 生成粘贴文本标签；首项使用固定文案，后续项追加序号以保持可独立删除。
+    fn next_pasted_text_label(&self) -> String {
+        let mut index = 1;
+        loop {
+            let label = if index == 1 {
+                "[粘贴的文本]".to_string()
+            } else {
+                format!("[粘贴的文本#{index}]")
+            };
+            if !self
+                .attachments
+                .iter()
+                .any(|attachment| attachment.label == label)
+            {
+                return label;
+            }
+            index += 1;
+        }
+    }
+
+    /// 丢弃引用标签已不在输入文本中的附件，保持标签与附件一一对应。
+    pub(crate) fn prune_attachments(&mut self) {
+        if self.attachments.is_empty() {
+            return;
+        }
+        let input = &self.input;
+        self.attachments.retain(|a| input.contains(&a.label));
+    }
+
+    /// 光标紧跟附件引用标签时整体删除标签及对应附件，返回是否命中。
+    pub(crate) fn remove_attachment_before_cursor(&mut self) -> bool {
+        let prefix = &self.input[..self.cursor];
+        let Some(index) = self
+            .attachments
+            .iter()
+            .position(|a| prefix.ends_with(&a.label))
+        else {
+            return false;
+        };
+        let start = self.cursor - self.attachments[index].label.len();
+        self.input.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.attachments.remove(index);
+        true
+    }
+
+    /// 复制最近一条助手回复原文（Markdown）到系统剪贴板。
+    pub(crate) fn copy_last_assistant_message(&mut self) {
+        let Some(text) = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.kind, MsgKind::Assistant) && !m.text.is_empty())
+            .map(|m| m.text.clone())
+        else {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "No assistant reply to copy"));
+            return;
+        };
+        match copy_to_clipboard(&text) {
+            Ok(()) => self.messages.push(Msg::new(
+                MsgKind::Info,
+                "Copied the latest reply to the clipboard",
+            )),
+            Err(error) => self
+                .messages
+                .push(Msg::new(MsgKind::Error, format!("Copy failed: {error}"))),
+        }
+    }
+
+    /// 切换鼠标捕获：暂停后终端可用原生选择复制任意消息文本，恢复后支持滚轮滚动。
+    pub(crate) fn toggle_mouse_capture(&mut self) {
+        let result = if self.mouse_capture {
+            crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)
+        } else {
+            crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)
+        };
+        if result.is_err() {
+            return;
+        }
+        self.mouse_capture = !self.mouse_capture;
+        let notice = if self.mouse_capture {
+            "Mouse capture enabled; press Ctrl+T to restore text selection"
+        } else {
+            "Text selection restored; press Ctrl+T to enable mouse interaction"
+        };
+        self.messages.push(Msg::new(MsgKind::Info, notice));
+    }
+
+    /// 更新应用内文本选择，并在左键释放后复制当前可见缓冲区中的文本。
+    ///
+    /// 单击只重置选择，不产生剪贴板副作用；发生拖动后，选择按终端的线性行顺序展开，
+    /// 每行末尾空白会被移除。剪贴板不可用时保留高亮选择，不影响其他鼠标路由。
+    pub(crate) fn handle_text_selection(&mut self, mouse: &MouseEvent, buffer: &Buffer) {
+        let position = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                self.text_selection = Some(MouseTextSelection::new(position));
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                if let Some(selection) = self.text_selection.as_mut() {
+                    selection.update(position);
+                }
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                let Some(selection) = self.text_selection.as_mut() else {
+                    return;
+                };
+                selection.update(position);
+                if selection.dragged {
+                    let text = selection.extract(buffer);
+                    if !text.is_empty() {
+                        let _ = copy_to_clipboard(&text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 在当前帧缓冲区中反色显示应用内鼠标选择，不改变字符内容。
+    pub(crate) fn render_text_selection(&self, buffer: &mut Buffer) {
+        let Some(selection) = self.text_selection.filter(|selection| selection.dragged) else {
+            return;
+        };
+        selection.for_each_position(buffer.area, |position| {
+            if let Some(cell) = buffer.cell_mut(position) {
+                cell.modifier.insert(Modifier::REVERSED);
+            }
+        });
+    }
+
+    /// 取出并清空当前编辑器内容；空白输入返回 `None`。
+    ///
+    /// steering 等纯文本路径不携带附件，残留附件一并清除，
+    /// 避免引用标签消失后附件悬挂。
+    pub(crate) fn take_input(&mut self) -> Option<String> {
+        let input = self.input.trim().to_string();
+        self.input.clear();
+        self.attachments.clear();
+        self.cursor = 0;
+        self.last_escape_at = None;
+        if input.is_empty() {
+            return None;
+        }
+        self.remember_input(&input);
+        Some(input)
+    }
+
+    /// 取出并清空当前输入与附件；文本和附件都为空时返回 `None`。
+    pub(crate) fn take_submission(&mut self) -> Option<UserSubmission> {
+        if !submission_text(&self.input, &self.attachments).is_empty() {
+            if let Err(message) = self
+                .validate_attachment_modality(&crate::config::model_metadata::ModelModality::Text)
+            {
+                self.messages.push(Msg::new(MsgKind::Error, message));
+                return None;
+            }
+        }
+        let text = self.input.trim().to_string();
+        let attachments = std::mem::take(&mut self.attachments);
+        self.input.clear();
+        self.cursor = 0;
+        self.last_escape_at = None;
+        if text.is_empty() && attachments.is_empty() {
+            return None;
+        }
+        self.remember_input(&text);
+        Some(UserSubmission { text, attachments })
+    }
+}
+
+/// 判断字符是否为按词移动与删除使用的分隔符。
+fn is_word_separator(ch: char) -> bool {
+    ch.is_whitespace() || ch.is_ascii_punctuation()
+}
+
+/// 返回光标左侧一个词的起始字节位置。
+fn previous_word_boundary(input: &str, cursor: usize) -> usize {
+    let mut position = cursor;
+    while let Some(ch) = input[..position].chars().next_back() {
+        if !is_word_separator(ch) {
+            break;
+        }
+        position -= ch.len_utf8();
+    }
+    while let Some(ch) = input[..position].chars().next_back() {
+        if is_word_separator(ch) {
+            break;
+        }
+        position -= ch.len_utf8();
+    }
+    position
+}
+
+/// 返回光标右侧下一个词的起始字节位置。
+fn next_word_boundary(input: &str, cursor: usize) -> usize {
+    let mut position = cursor;
+    while let Some(ch) = input[position..].chars().next() {
+        if is_word_separator(ch) {
+            break;
+        }
+        position += ch.len_utf8();
+    }
+    while let Some(ch) = input[position..].chars().next() {
+        if !is_word_separator(ch) {
+            break;
+        }
+        position += ch.len_utf8();
+    }
+    position
+}
+
+/// 在目标逻辑行中找到不超过指定显示列的字节位置。
+fn byte_at_display_column(line: &str, target: usize) -> usize {
+    let mut width = 0;
+    let mut offset = 0;
+    for ch in line.chars() {
+        let next = width + unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if next > target {
+            break;
+        }
+        width = next;
+        offset += ch.len_utf8();
+    }
+    offset
+}
+
+/// 按显示列在相邻逻辑行间移动光标；到达首行或末行时返回 `false`。
+fn move_cursor_vertically(input: &str, cursor: &mut usize, upward: bool) -> bool {
+    let line_start = input[..*cursor].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = input[*cursor..]
+        .find('\n')
+        .map_or(input.len(), |index| *cursor + index);
+    let column = unicode_width::UnicodeWidthStr::width(&input[line_start..*cursor]);
+    let (target_start, target_end) = if upward {
+        if line_start == 0 {
+            return false;
+        }
+        let end = line_start - 1;
+        let start = input[..end].rfind('\n').map_or(0, |index| index + 1);
+        (start, end)
+    } else {
+        if line_end == input.len() {
+            return false;
+        }
+        let start = line_end + 1;
+        let end = input[start..]
+            .find('\n')
+            .map_or(input.len(), |index| start + index);
+        (start, end)
+    };
+    *cursor = target_start + byte_at_display_column(&input[target_start..target_end], column);
+    true
+}

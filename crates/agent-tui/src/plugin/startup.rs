@@ -1,8 +1,20 @@
 //! 插件 manifest 合并与容错启动。
 
-use super::*;
+use crate::event::UiEvent;
+use agent_plugin_host::manifest::PluginManifest;
+use agent_plugin_host::wasm::load_wasm_plugins_progressively_with_selection_and_services;
+use agent_plugin_host::{LivePluginHost, PluginHostServices};
+use agent_runtime::{
+    AgentDeriveConfig, AgentPermissions, AgentProfileId, AgentRuntime, AgentTemplate, RuntimeLimits,
+};
+use anyhow::{Context, Result};
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "plugins")]
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// 插件启动期间由可信装配层固定的执行约束。
 ///

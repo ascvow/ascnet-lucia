@@ -1,5 +1,8 @@
 //! Lucia TUI 的应用级配置初始化与路径解析。
 
+pub(crate) mod model_metadata;
+
+use agent_core::config::AgentRootConfig;
 use agent_core::ReasoningLevel;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -57,7 +60,7 @@ pub(crate) struct TuiSettings {
     pub(crate) context_window: Option<u64>,
     /// 内置 models.dev 快照中匹配到的模型能力。
     #[serde(skip)]
-    pub(crate) model_metadata: Option<crate::model_metadata::ModelMetadata>,
+    pub(crate) model_metadata: Option<crate::config::model_metadata::ModelMetadata>,
     /// 用户是否显式配置了模型输出上限。
     #[serde(skip)]
     pub(crate) max_tokens_explicit: bool,
@@ -190,7 +193,7 @@ pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
             });
     settings.model_metadata = match (provider_id.as_deref(), config.model.model.as_deref()) {
         (Some(provider), Some(model)) => {
-            crate::model_metadata::find_model_metadata(provider, model)?
+            crate::config::model_metadata::find_model_metadata(provider, model)?
         }
         _ => None,
     };
@@ -274,6 +277,23 @@ pub(crate) fn resolve_config_relative_path(config_path: &Path, path: &Path) -> P
             .unwrap_or_else(|| Path::new("."))
             .join(path)
     }
+}
+
+/// 判断配置中的模型密钥是否可以用于本次启动。
+///
+/// 明文密钥和环境变量任一包含非空值即视为可用；该检查不会读取或记录密钥内容。
+pub(crate) fn configured_model_key_is_available(config: &AgentRootConfig) -> bool {
+    config
+        .model
+        .api_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || config
+            .model
+            .api_key_env
+            .as_deref()
+            .and_then(std::env::var_os)
+            .is_some_and(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -401,10 +421,10 @@ mod tests {
         assert!(metadata.reasoning_levels.contains(&ReasoningLevel::Max));
         assert!(metadata
             .input_modalities
-            .contains(&crate::model_metadata::ModelModality::Image));
+            .contains(&crate::config::model_metadata::ModelModality::Image));
         assert!(metadata
             .input_modalities
-            .contains(&crate::model_metadata::ModelModality::Pdf));
+            .contains(&crate::config::model_metadata::ModelModality::Pdf));
         fs::remove_dir_all(root).expect("清理配置测试目录");
     }
 

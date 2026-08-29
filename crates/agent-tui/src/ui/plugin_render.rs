@@ -1,6 +1,13 @@
 //! 插件停靠视图、Dialog 和全屏子视图的 Ratatui 渲染组件。
 
-use crate::*;
+use crate::app::{
+    default_plugin_height, default_plugin_width, plugin_view_visible, App, PluginViewState,
+};
+use crate::theme::{COLOR_BORDER_FOCUS, COLOR_MUTED, COLOR_TEXT};
+use agent_plugin_protocol::UiFrame as PluginUiFrame;
+use agent_plugin_protocol::{UiColor, UiPlacement, UiStyle};
+use ratatui::prelude::*;
+use ratatui::widgets::*;
 
 /// 按加载顺序分配四向停靠插槽，并返回剩余的主界面区域。
 pub(crate) fn render_docked_plugin_views(frame: &mut Frame, app: &mut App, outer: Rect) -> Rect {
