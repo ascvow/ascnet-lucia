@@ -6,6 +6,7 @@ use agent_plugin_host::wasm::load_wasm_plugins_progressively_with_selection_and_
 use agent_plugin_host::{LivePluginHost, PluginHostServices};
 use agent_runtime::{
     AgentDeriveConfig, AgentPermissions, AgentProfileId, AgentRuntime, AgentTemplate, RuntimeLimits,
+    ToolAccess,
 };
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -15,6 +16,24 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// 插件可请求的默认 worker 只读工具集合；新增原生工具不会自动进入派生 Agent。
+const WORKER_READ_ONLY_TOOLS: [&str; 4] = [
+    "list_directory",
+    "search_files",
+    "read_file",
+    agent_skill::SKILL_READ_TOOL_NAME,
+];
+
+/// 构造 TUI 授予插件 worker profile 的显式只读派生策略。
+fn worker_agent_derive_config() -> AgentDeriveConfig {
+    AgentDeriveConfig {
+        permissions: AgentPermissions {
+            tools: ToolAccess::allowlist(WORKER_READ_ONLY_TOOLS),
+        },
+        ..AgentDeriveConfig::default()
+    }
+}
 
 /// 插件启动期间由可信装配层固定的执行约束。
 ///
@@ -274,7 +293,7 @@ pub(crate) async fn load_plugins_for_tui(
         .with_agent_runtime(
             Arc::new(runtime),
             controller_profile,
-            HashMap::from([("worker".to_string(), AgentDeriveConfig::default())]),
+            HashMap::from([("worker".to_string(), worker_agent_derive_config())]),
         )?;
     load_wasm_plugins_progressively_with_selection_and_services(
         &prepared_manifests,
@@ -316,5 +335,21 @@ mod tests {
             plugin_model_output_limit(&agent_tool::ExecutionPolicy::serve()),
             20_000
         );
+    }
+
+    /// worker profile 必须保持显式只读，不能因默认 `All` 或未来新增工具获得副作用能力。
+    #[test]
+    fn worker_profile_exposes_only_explicit_read_tools() {
+        let config = worker_agent_derive_config();
+
+        for allowed in WORKER_READ_ONLY_TOOLS {
+            assert!(config.permissions.tools.permits(allowed), "应允许 {allowed}");
+        }
+        for denied in ["write_file", "shell", "process_exec", "future_dangerous_tool"] {
+            assert!(
+                !config.permissions.tools.permits(denied),
+                "worker 不得获得 {denied}"
+            );
+        }
     }
 }
