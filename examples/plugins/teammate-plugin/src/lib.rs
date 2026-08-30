@@ -6,9 +6,10 @@
 use agent_plugin::{
     export_plugin, ActivationContext, AgentHandle, AgentId, AgentOutcome, AgentPlugin,
     AgentSpawnRequest, AgentStatus, AgentViewSession, ExtensionEvent, PluginHostApi,
-    PromptContribution, Result, ServiceCall, ServiceSpec, ToolCall, ToolResult, ToolSpec, UiColor,
-    UiCursor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
-    UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
+    PromptContribution, Result, ServiceCall, ServiceSpec, ToolCall, ToolPermissionScope,
+    ToolResult, ToolSpec, UiColor, UiCursor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
+    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -1446,7 +1447,7 @@ fn emit(host: &dyn PluginHostApi, name: &str, data: Value) {
     });
 }
 
-/// 返回所有 teammate 工具的 JSON Schema。
+/// 返回所有 teammate 控制面工具及其可信权限 scope。
 fn teammate_tools() -> Vec<ToolSpec> {
     let member_schema = || {
         json!({
@@ -1545,6 +1546,9 @@ fn teammate_tools() -> Vec<ToolSpec> {
             message_schema(),
         ),
     ]
+    .into_iter()
+    .map(|tool| tool.with_permission_scope(ToolPermissionScope::Control))
+    .collect()
 }
 
 export_plugin!(TeammatePlugin);
@@ -1553,6 +1557,16 @@ export_plugin!(TeammatePlugin);
 mod tests {
     use super::*;
     use agent_plugin::AgentLineage;
+
+    /// Teammate 工具只操作 Host 约束的成员控制面，不能因工具名称被误判为文件删除。
+    #[test]
+    fn teammate_tools_declare_control_scope() {
+        let tools = teammate_tools();
+        assert!(!tools.is_empty());
+        assert!(tools
+            .iter()
+            .all(|tool| tool.permission_scope == ToolPermissionScope::Control));
+    }
 
     /// 构造纯状态测试使用的 Agent 句柄。
     fn handle(id: &str) -> AgentHandle {

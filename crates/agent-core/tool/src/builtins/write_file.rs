@@ -1,7 +1,9 @@
 //! 写入文件内容工具。
 //! Write file content tool.
 
-use crate::{FileCapability, Tool, ToolCall, ToolResult, ToolSpec, WorkspaceGuard};
+use crate::{
+    FileCapability, Tool, ToolCall, ToolPermissionScope, ToolResult, ToolSpec, WorkspaceGuard,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -52,6 +54,7 @@ impl Tool for WriteFileTool {
                 "additionalProperties": false
             }),
         )
+        .with_permission_scope(ToolPermissionScope::Write)
     }
 
     async fn call(&self, call: ToolCall) -> Result<ToolResult> {

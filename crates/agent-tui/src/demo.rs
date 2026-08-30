@@ -7,7 +7,7 @@ use agent_core::{
     },
     AgentOptions,
 };
-use agent_tool::{ToolCall, ToolSpec};
+use agent_tool::{ToolCall, ToolPermissionScope, ToolSpec};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
@@ -41,6 +41,7 @@ pub(crate) fn echo_spec() -> ToolSpec {
             "additionalProperties": false
         }),
     )
+    .with_permission_scope(ToolPermissionScope::Control)
 }
 
 /// 确定性脚本模型，不联网即可演示 ReAct loop。

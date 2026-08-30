@@ -2,9 +2,9 @@
 
 use agent_plugin::{
     export_plugin, AgentEvent, AgentPlugin, PluginHostApi, Result, ToolCall, ToolDecision,
-    ToolDecisionStatus, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput,
-    UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest,
-    UiSize, UiSpan, UiStyle, UiViewInstance,
+    ToolDecisionStatus, ToolPermissionScope, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame,
+    UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement,
+    UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use serde_json::json;
 
@@ -62,7 +62,8 @@ impl AgentPlugin for UiShowcasePlugin {
                 "required": ["action"],
                 "additionalProperties": false
             }),
-        )]
+        )
+        .with_permission_scope(ToolPermissionScope::Control)]
     }
 
     fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus {
@@ -440,3 +441,15 @@ fn focus_line(focused: bool) -> UiLine {
 }
 
 export_plugin!(UiShowcasePlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// UI Showcase 工具只修改展示状态，不应触发宿主资源审批。
+    #[test]
+    fn ui_showcase_tool_declares_control_scope() {
+        let tools = UiShowcasePlugin::default().list_tools();
+        assert_eq!(tools[0].permission_scope, ToolPermissionScope::Control);
+    }
+}

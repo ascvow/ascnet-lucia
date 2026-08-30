@@ -1,7 +1,9 @@
 //! 列出目录内容工具。
 //! List directory entries tool.
 
-use crate::{FileCapability, Tool, ToolCall, ToolResult, ToolSpec, WorkspaceGuard};
+use crate::{
+    FileCapability, Tool, ToolCall, ToolPermissionScope, ToolResult, ToolSpec, WorkspaceGuard,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -46,6 +48,7 @@ impl Tool for ListDirectoryTool {
                 "additionalProperties": false
             }),
         )
+        .with_permission_scope(ToolPermissionScope::Read)
     }
 
     async fn call(&self, call: ToolCall) -> Result<ToolResult> {

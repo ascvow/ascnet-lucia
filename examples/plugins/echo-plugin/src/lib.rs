@@ -3,8 +3,8 @@
 
 use agent_plugin::{
     export_plugin, AgentEvent, AgentPlugin, Result, ToolCall, ToolDecision, ToolDecisionStatus,
-    ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
-    UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    ToolPermissionScope, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput,
+    UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
 use serde_json::json;
 
@@ -33,7 +33,8 @@ impl AgentPlugin for EchoPlugin {
                 "required": ["text"],
                 "additionalProperties": false
             }),
-        )]
+        )
+        .with_permission_scope(ToolPermissionScope::Control)]
     }
 
     fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus {
@@ -149,3 +150,15 @@ fn ui_line(text: &str, foreground: Option<UiColor>, bold: bool) -> UiLine {
 }
 
 export_plugin!(EchoPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Echo 仅修改插件内状态，不应触发资源权限审批。
+    #[test]
+    fn echo_tool_declares_control_scope() {
+        let tools = EchoPlugin::default().list_tools();
+        assert_eq!(tools[0].permission_scope, ToolPermissionScope::Control);
+    }
+}

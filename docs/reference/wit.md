@@ -566,12 +566,13 @@ export list-tools: func() -> string;
   {
     "name": "echo",
     "description": "返回输入文本。",
-    "input_schema": { "type": "object" }
+    "input_schema": { "type": "object" },
+    "permission_scope": "control"
   }
 ]
 ```
 
-映射：`AgentPlugin::list_tools()`。
+映射：`AgentPlugin::list_tools()`。`permission_scope` 是可选加法字段，取值为 `control`、`read`、`write`、`shell`、`network` 或 `unknown`；旧插件缺失时按 `unknown` 处理。
 
 ### `call-tool`
 
@@ -581,9 +582,12 @@ export list-tools: func() -> string;
 {
   "id": "call-1",
   "name": "echo",
-  "args": { "text": "hello" }
+  "args": { "text": "hello" },
+  "permission_scope": "control"
 }
 ```
+
+`permission_scope` 由 Core/Host 从可信工具快照注入。旧 Host 缺失该字段时 Guest 按 `unknown` 处理；Guest 和模型自行提交的值不能覆盖最终绑定。
 
 输出 ToolResult：
 

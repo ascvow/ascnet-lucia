@@ -5,7 +5,7 @@
 
 use agent_plugin::{
     export_plugin, AgentContinueRequest, AgentId, AgentPlugin, AgentSpawnRequest, PluginHostApi,
-    Result, ToolCall, ToolResult, ToolSpec,
+    Result, ToolCall, ToolPermissionScope, ToolResult, ToolSpec,
 };
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
@@ -40,7 +40,8 @@ impl AgentPlugin for AgentRuntimePlugin {
                     "required": ["input"],
                     "additionalProperties": false
                 }),
-            ),
+            )
+            .with_permission_scope(ToolPermissionScope::Control),
             ToolSpec::new(
                 "agent_runtime_continue",
                 "从成功终态 Agent 的私有会话异步创建后续运行；调用立即返回新句柄。",
@@ -61,7 +62,8 @@ impl AgentPlugin for AgentRuntimePlugin {
                     "required": ["target", "input"],
                     "additionalProperties": false
                 }),
-            ),
+            )
+            .with_permission_scope(ToolPermissionScope::Control),
             target_tool(
                 "agent_runtime_status",
                 "查询 controller 或其后代 Agent 的当前状态、谱系与有效权限。",
@@ -158,6 +160,7 @@ fn empty_tool(name: &str, description: &str) -> ToolSpec {
             "additionalProperties": false
         }),
     )
+    .with_permission_scope(ToolPermissionScope::Control)
 }
 
 /// 创建一个只接收不透明 Agent ID 的工具定义。
@@ -178,6 +181,7 @@ fn target_tool(name: &str, description: &str) -> ToolSpec {
             "additionalProperties": false
         }),
     )
+    .with_permission_scope(ToolPermissionScope::Control)
 }
 
 /// 读取并校验工具参数中的必填非空字符串。
@@ -205,3 +209,18 @@ fn success(call: ToolCall, content: Value) -> Result<ToolResult> {
 }
 
 export_plugin!(AgentRuntimePlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runtime 工具只调用 Host 受限控制面，必须统一声明 control scope。
+    #[test]
+    fn runtime_tools_declare_control_scope() {
+        let tools = AgentRuntimePlugin.list_tools();
+        assert!(!tools.is_empty());
+        assert!(tools
+            .iter()
+            .all(|tool| tool.permission_scope == ToolPermissionScope::Control));
+    }
+}

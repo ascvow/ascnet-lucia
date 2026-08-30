@@ -1,7 +1,9 @@
 //! 在文件中搜索文本工具。
 //! Search text in files tool.
 
-use crate::{FileCapability, Tool, ToolCall, ToolResult, ToolSpec, WorkspaceGuard};
+use crate::{
+    FileCapability, Tool, ToolCall, ToolPermissionScope, ToolResult, ToolSpec, WorkspaceGuard,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -263,6 +265,7 @@ impl Tool for SearchFilesTool {
                 "additionalProperties": false
             }),
         )
+        .with_permission_scope(ToolPermissionScope::Read)
     }
 
     async fn call(&self, call: ToolCall) -> Result<ToolResult> {

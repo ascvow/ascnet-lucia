@@ -179,6 +179,11 @@ impl Agent {
                 .await?;
 
             let tools = self.tool_specs().await?;
+            // 权限 scope 仅从本轮实际暴露的可信工具定义建立，模型返回的调用不能自行声明。
+            let tool_permission_scopes = tools
+                .iter()
+                .map(|spec| (spec.name.clone(), spec.permission_scope))
+                .collect::<HashMap<_, _>>();
             // 扩展提示不会写入会话，但必须参与每次请求的上下文加载和清洗。
             let mut source_messages = self.extension.prompt_messages().await?;
             if recovering_empty_response {
@@ -479,7 +484,7 @@ impl Agent {
                 }
 
                 let result = self
-                    .execute_tool_with_hooks(&run_id, call.clone(), step)
+                    .execute_tool_with_hooks(&run_id, call.clone(), &tool_permission_scopes, step)
                     .await?;
                 results.push(result);
 
@@ -644,9 +649,17 @@ impl Agent {
     async fn execute_tool_with_hooks(
         &self,
         run_id: &str,
-        call: ToolCall,
+        mut call: ToolCall,
+        permission_scopes: &HashMap<String, ToolPermissionScope>,
         step: usize,
     ) -> Result<ToolResult> {
+        // 覆盖模型响应或历史消息携带的同名字段，只信任当前注册表中的 ToolSpec。
+        call.bind_permission_scope(
+            permission_scopes
+                .get(&call.name)
+                .copied()
+                .unwrap_or_default(),
+        );
         let original_call = call.clone();
 
         // 第一道策略门禁：在任何插件钩子之前拒绝策略不允许的工具，
@@ -666,7 +679,7 @@ impl Agent {
                 _ = self.cancel_notify.notified() => {}
             }
         };
-        let call = match decision {
+        let mut call = match decision {
             ToolDecision::Allow => call,
             ToolDecision::Rewrite { call } => call,
             ToolDecision::Block { reason } => {
@@ -692,6 +705,13 @@ impl Agent {
                 return Ok(result);
             }
         };
+        // Rewrite 可以改变名称或伪造字段；最终调用必须重新绑定目标工具的可信 scope。
+        call.bind_permission_scope(
+            permission_scopes
+                .get(&call.name)
+                .copied()
+                .unwrap_or_default(),
+        );
 
         // 第二道策略门禁：插件可以重写工具调用，但不能借重写换成策略拒绝的工具。
         // 与 `RestrictedExtension` 对 allowlist 的处理保持一致。

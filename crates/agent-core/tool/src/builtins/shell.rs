@@ -3,7 +3,8 @@
 
 use crate::{
     ExecutionPolicy, FileCapability, NoopToolOutputSink, Tool, ToolCall, ToolErrorKind,
-    ToolOutputDelta, ToolOutputSink, ToolOutputStream, ToolResult, ToolSpec, WorkspaceGuard,
+    ToolOutputDelta, ToolOutputSink, ToolOutputStream, ToolPermissionScope, ToolResult, ToolSpec,
+    WorkspaceGuard,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -202,6 +203,7 @@ impl Tool for ShellTool {
                 "additionalProperties": false
             }),
         )
+        .with_permission_scope(ToolPermissionScope::Shell)
     }
 
     async fn call(&self, call: ToolCall) -> Result<ToolResult> {

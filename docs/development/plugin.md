@@ -145,6 +145,8 @@ fn list_tools(&self) -> Vec<ToolSpec>
 
 返回插件静态工具快照。`ToolSpec::new(name, description, input_schema)` 的参数分别是公开名称、给模型看的选择说明和 JSON Schema 输入约束。名称应使用跨服务商可接受的 ASCII 字母、数字、下划线或连字符，最长 64 字符。
 
+每个工具必须再用 `with_permission_scope` 声明真实资源边界：只操作 Lucia 内部状态或已编入可信目录且不扩大访问面的元数据使用 `Control`，读取调用方可选择的受保护数据使用 `Read`，创建、修改或删除持久数据使用 `Write`，原生进程使用 `Shell`，远端访问使用 `Network`。缺失声明会保守解析为 `Unknown` 并进入权限审批；不得通过工具名称让策略插件猜测权限。一个工具实际触达多类资源时应声明风险更高、覆盖面更大的 scope，并继续由 manifest 限制 Guest 自身能力。
+
 该函数没有 `host` 参数，不适合做文件扫描或服务调用。需要在启动后动态发现工具时，在 `activate` 中调用 `host.upsert_tool`。
 
 ### `before_tool`
@@ -158,6 +160,7 @@ fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus
 - `call.id`：模型生成的调用 ID，重写时必须保持结果可关联。
 - `call.name`：公开工具名。
 - `call.args`：已经解析的 JSON 参数，但尚未按某个 Rust 结构验证。
+- `call.permission_scope`：Core/Host 从可信 ToolSpec 绑定的权限范围；Guest Rewrite 不能自行扩大或伪造。
 - 返回值：`Ready { decision }` 提交 `Allow`、`Block`、`CancelRun` 或 `Rewrite` 最终决策；`Pending { retry_after_ms }` 请求 Host 稍后重新调用。`Pending` 不携带审批 ID、原因或 UI 结构，审批协议及其状态必须由提供该能力的插件自行维护。
 - 安全要求：`reason` 面向用户和模型，不应包含 secret、完整环境变量或未脱敏命令参数。
 

@@ -5,7 +5,7 @@
 
 #![deny(missing_docs)]
 
-use agent_tool::{Tool, ToolCall, ToolRegistry, ToolResult, ToolSpec};
+use agent_tool::{Tool, ToolCall, ToolPermissionScope, ToolRegistry, ToolResult, ToolSpec};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -142,6 +142,7 @@ impl Tool for SkillReadTool {
                 "additionalProperties": false
             }),
         )
+        .with_permission_scope(ToolPermissionScope::Control)
     }
 
     async fn call(&self, call: ToolCall) -> Result<ToolResult> {

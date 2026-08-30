@@ -6,7 +6,8 @@
 #![deny(missing_docs)]
 
 pub use agent_tool::{
-    JsonSchema, ToolCall, ToolDecision, ToolDecisionStatus, ToolResult, ToolSpec,
+    JsonSchema, ToolCall, ToolDecision, ToolDecisionStatus, ToolPermissionScope, ToolResult,
+    ToolSpec,
 };
 pub use anyhow::{anyhow, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};

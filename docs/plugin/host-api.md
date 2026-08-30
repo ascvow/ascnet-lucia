@@ -15,7 +15,8 @@
 ```rust
 host.upsert_tool(
     "remote/get_item",
-    &ToolSpec::new("remote_get_item", "读取项目", schema),
+    &ToolSpec::new("remote_get_item", "读取项目", schema)
+        .with_permission_scope(ToolPermissionScope::Network),
 )?;
 
 host.emit_event(&ExtensionEvent {
@@ -28,7 +29,7 @@ host.emit_event(&ExtensionEvent {
 })?;
 ```
 
-Host 会覆盖事件的 `source`，插件不能伪造其他 owner。
+Host 会覆盖事件的 `source`，插件不能伪造其他 owner。静态 `list_tools` 与动态 `upsert_tool` 都必须声明真实 `ToolPermissionScope`；缺失时使用 `Unknown`，不会按公开工具名自动放行。
 
 ## 实例状态
 

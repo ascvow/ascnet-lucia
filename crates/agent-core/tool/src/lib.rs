@@ -15,6 +15,35 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 /// 工具输入参数的 JSON Schema。
 pub type JsonSchema = Value;
 
+/// 工具调用触达的宿主权限范围，由注册工具的可信定义声明并由 Core 绑定到实际调用。
+///
+/// `write` 同时覆盖创建、修改与删除；旧插件未声明该字段时使用 `unknown`，权限策略应
+/// 保守审批。该元数据只用于宿主策略，不会发送给模型服务商。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPermissionScope {
+    /// 插件未声明或 Host 无法解析权限范围，必须按未知副作用处理。
+    #[default]
+    Unknown,
+    /// 只操作 Lucia 内部状态或已编入可信目录的元数据，不扩大调用方的宿主资源访问。
+    Control,
+    /// 读取宿主文件、目录或其他受保护数据。
+    Read,
+    /// 创建、修改或删除宿主文件与其他持久数据。
+    Write,
+    /// 执行 Shell 或其他宿主原生进程。
+    Shell,
+    /// 访问外部网络或远端服务。
+    Network,
+}
+
+impl ToolPermissionScope {
+    /// 返回当前 scope 是否缺少可信声明，供 serde 保持旧 JSON 形状。
+    fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
 /// A tool definition visible to the model.
 /// 暴露给模型看的工具定义。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -30,6 +59,10 @@ pub struct ToolSpec {
     /// JSON Schema object that describes the expected input arguments.
     /// 描述工具输入参数的 JSON Schema 对象。
     pub input_schema: JsonSchema,
+
+    /// 工具触达的权限范围；旧定义缺失时按未知副作用处理。
+    #[serde(default, skip_serializing_if = "ToolPermissionScope::is_unknown")]
+    pub permission_scope: ToolPermissionScope,
 }
 
 impl ToolSpec {
@@ -44,7 +77,14 @@ impl ToolSpec {
             name: name.into(),
             description: description.into(),
             input_schema,
+            permission_scope: ToolPermissionScope::Unknown,
         }
+    }
+
+    /// 为工具声明权限范围；该声明由 Core/Host 绑定到实际调用，模型参数不能覆盖。
+    pub fn with_permission_scope(mut self, permission_scope: ToolPermissionScope) -> Self {
+        self.permission_scope = permission_scope;
+        self
     }
 
     /// A schema for tools that do not require arguments.
@@ -79,6 +119,10 @@ pub struct ToolCall {
     /// Parsed JSON arguments.
     /// 已解析的 JSON 参数。
     pub args: Value,
+
+    /// Core/Host 从已注册工具定义绑定的可信权限范围；模型响应中的同名字段不得直接使用。
+    #[serde(default, skip_serializing_if = "ToolPermissionScope::is_unknown")]
+    pub permission_scope: ToolPermissionScope,
 }
 
 /// 工具执行前的通用最终决策，由 Core、Host 与 Guest SDK 共同复用。
@@ -140,7 +184,13 @@ impl ToolCall {
             id: id.into(),
             name: name.into(),
             args,
+            permission_scope: ToolPermissionScope::Unknown,
         }
+    }
+
+    /// 覆盖为宿主已验证的工具权限范围；仅注册表或 Host 路由层应调用。
+    pub fn bind_permission_scope(&mut self, permission_scope: ToolPermissionScope) {
+        self.permission_scope = permission_scope;
     }
 
     /// Deserialize arguments into a typed Rust value.
@@ -588,6 +638,41 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["alpha", "middle", "zeta"]);
+    }
+
+    /// 旧 ToolSpec JSON 缺少权限字段时必须解析为 unknown，新字段保持加法兼容。
+    #[test]
+    fn legacy_tool_spec_defaults_to_unknown_permission_scope() {
+        let spec: ToolSpec = serde_json::from_value(json!({
+            "name": "legacy",
+            "description": "旧工具",
+            "input_schema": {"type": "object"}
+        }))
+        .expect("旧 ToolSpec JSON 应继续解析");
+
+        assert_eq!(spec.permission_scope, ToolPermissionScope::Unknown);
+        assert!(serde_json::to_value(spec)
+            .expect("序列化旧工具定义")
+            .get("permission_scope")
+            .is_none());
+    }
+
+    /// 旧 ToolCall JSON 缺少权限字段时必须保守解析，新 scope 才会写入 Guest hook JSON。
+    #[test]
+    fn tool_call_permission_scope_is_additive_and_host_bound() {
+        let mut call: ToolCall = serde_json::from_value(json!({
+            "id": "legacy-call",
+            "name": "legacy",
+            "args": {}
+        }))
+        .expect("旧 ToolCall JSON 应继续解析");
+        assert_eq!(call.permission_scope, ToolPermissionScope::Unknown);
+
+        call.bind_permission_scope(ToolPermissionScope::Read);
+        assert_eq!(
+            serde_json::to_value(call).expect("序列化已绑定调用")["permission_scope"],
+            "read"
+        );
     }
 
     /// 最终决策的 JSON 结构必须由 Core、Host 与 Guest 共享，避免边界两侧复制协议。

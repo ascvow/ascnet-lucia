@@ -190,9 +190,11 @@ pub trait ContextLoader: Send + Sync {
 
 | 类型 | 关键字段 | 约束 |
 | --- | --- | --- |
-| `ToolSpec` | `name`、`description`、`input_schema` | 名称最长 64 字符，只允许 ASCII 字母、数字、`_`、`-` |
-| `ToolCall` | `id`、`name`、`args` | `id` 必须原样带回 ToolResult |
+| `ToolSpec` | `name`、`description`、`input_schema`、`permission_scope` | 名称最长 64 字符，只允许 ASCII 字母、数字、`_`、`-`；未声明 scope 时为 `Unknown` |
+| `ToolCall` | `id`、`name`、`args`、`permission_scope` | `id` 必须原样带回 ToolResult；scope 由 Core/Host 从可信 ToolSpec 绑定 |
 | `ToolResult` | `call_id`、`name`、`content`、`is_error`、`details` | `details` 只给 UI，不发送给模型 |
+
+`ToolPermissionScope` 包含 `Control`、`Read`、`Write`、`Shell`、`Network` 和保守默认值 `Unknown`。`Control` 只用于不扩大宿主资源访问的 Lucia 内部状态、编排操作或已编入可信目录的元数据；`Write` 同时覆盖创建、修改和删除。工具通过 `ToolSpec::with_permission_scope(...)` 声明，Core 会在策略 hook 前覆盖模型或历史调用中的同名字段，Rewrite 后也按目标工具重新绑定。
 
 `ToolCall::args_as<T>()` 把 JSON 参数反序列化为强类型，字段不匹配时返回包含工具名的错误。`args_json_string()` 用于协议适配；序列化异常时回退为 `{}`。
 

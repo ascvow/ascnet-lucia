@@ -15,9 +15,9 @@ use agent_core::ContextLoadRequest;
 use agent_core::ContextLoader;
 use agent_core::LoadedContext;
 use agent_core::ToolDecision;
-use agent_tool::ToolCall;
 use agent_tool::ToolResult;
 use agent_tool::ToolSpec;
+use agent_tool::{ToolCall, ToolPermissionScope};
 use anyhow::anyhow;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -29,6 +29,8 @@ use std::sync::RwLock;
 pub struct CompositePluginHost {
     hosts: Vec<Arc<dyn PluginHost>>,
     tool_routes: Arc<RwLock<HashMap<String, Arc<dyn PluginHost>>>>,
+    /// 按公开工具名索引的可信权限 scope，与工具 owner 路由在同一次快照中更新。
+    tool_permission_scopes: Arc<RwLock<HashMap<String, ToolPermissionScope>>>,
     /// 按可信插件 ID 和视图 ID 索引 UI owner，避免渲染和输入阶段遍历插件。
     ui_routes: Arc<RwLock<UiRoutes>>,
     /// 按公开工具名索引的可信 renderer 声明快照。
@@ -47,6 +49,7 @@ impl CompositePluginHost {
         Self {
             hosts: self.hosts.clone(),
             tool_routes: Arc::new(RwLock::new(HashMap::new())),
+            tool_permission_scopes: Arc::new(RwLock::new(HashMap::new())),
             ui_routes: Arc::new(RwLock::new(UiRoutes::new())),
             tool_renderers: Arc::new(RwLock::new(HashMap::new())),
             capability_owners: self.capability_owners.clone(),
@@ -171,6 +174,32 @@ impl CompositePluginHost {
             .write()
             .expect("插件工具路由锁不应中毒")
             .clear();
+        self.tool_permission_scopes
+            .write()
+            .expect("插件工具权限 scope 锁不应中毒")
+            .clear();
+    }
+
+    /// 以最近一次可信 ToolSpec 快照覆盖调用 scope；改名到未知或原生工具时保守使用 unknown。
+    fn bind_tool_permission_scope(
+        &self,
+        previous: Option<&ToolCall>,
+        mut call: ToolCall,
+    ) -> Result<ToolCall> {
+        let registered = self
+            .tool_permission_scopes
+            .read()
+            .map_err(|_| anyhow!("插件工具权限 scope 锁已中毒"))?
+            .get(&call.name)
+            .copied();
+        let permission_scope = registered.unwrap_or_else(|| match previous {
+            Some(previous) if previous.name == call.name => previous.permission_scope,
+            Some(_) => ToolPermissionScope::Unknown,
+            // 原生工具不在插件路由中，初始 scope 必须由 Core 注册表提前绑定。
+            None => call.permission_scope,
+        });
+        call.bind_permission_scope(permission_scope);
+        Ok(call)
     }
 
     /// 清空 UI owner 快照，确保宿主集合变化后不会调用旧 owner。
@@ -199,12 +228,14 @@ impl AgentExtension for CompositePluginHost {
     async fn list_tools(&self) -> Result<Vec<ToolSpec>> {
         let mut tools = Vec::new();
         let mut routes = HashMap::new();
+        let mut permission_scopes = HashMap::new();
         for host in &self.hosts {
             for tool in host.list_tools().await? {
                 tool.validate_name()?;
                 if routes.insert(tool.name.clone(), host.clone()).is_some() {
                     return Err(anyhow!("插件公开了重复工具：{}", tool.name));
                 }
+                permission_scopes.insert(tool.name.clone(), tool.permission_scope);
                 tools.push(tool);
             }
         }
@@ -212,6 +243,10 @@ impl AgentExtension for CompositePluginHost {
             .tool_routes
             .write()
             .map_err(|_| anyhow!("插件工具路由锁已中毒"))? = routes;
+        *self
+            .tool_permission_scopes
+            .write()
+            .map_err(|_| anyhow!("插件工具权限 scope 锁已中毒"))? = permission_scopes;
         Ok(tools)
     }
 
@@ -229,7 +264,7 @@ impl AgentExtension for CompositePluginHost {
     }
 
     async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        let mut current = call.clone();
+        let mut current = self.bind_tool_permission_scope(None, call.clone())?;
         let policy_owner = self
             .capability_owner(manifest::TOOL_POLICY_CAPABILITY)
             .map(str::to_string);
@@ -246,7 +281,9 @@ impl AgentExtension for CompositePluginHost {
                 ToolDecision::CancelRun { reason } => {
                     return Ok(ToolDecision::CancelRun { reason });
                 }
-                ToolDecision::Rewrite { call } => current = call,
+                ToolDecision::Rewrite { call } => {
+                    current = self.bind_tool_permission_scope(Some(&current), call)?;
+                }
             }
         }
 

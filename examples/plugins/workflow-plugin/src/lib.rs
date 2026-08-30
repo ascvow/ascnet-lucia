@@ -6,9 +6,10 @@
 
 use agent_plugin::{
     export_plugin, ActivationContext, AgentId, AgentOutcome, AgentPlugin, AgentSpawnRequest,
-    AgentViewSession, PluginHostApi, PromptContribution, Result, ToolCall, ToolResult, ToolSpec,
-    UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
-    UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
+    AgentViewSession, PluginHostApi, PromptContribution, Result, ToolCall, ToolPermissionScope,
+    ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
+    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
@@ -143,6 +144,9 @@ impl AgentPlugin for WorkflowPlugin {
                 task_get_schema(),
             ),
         ]
+        .into_iter()
+        .map(|tool| tool.with_permission_scope(ToolPermissionScope::Control))
+        .collect()
     }
 
     /// 执行一次短任务控制操作；每次调用都会同步结果并自动调度，不在 Guest 内阻塞等待 Agent。
@@ -1185,6 +1189,16 @@ export_plugin!(WorkflowPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Workflow 工具只编排 Host 受限运行，必须统一声明控制面 scope。
+    #[test]
+    fn workflow_tools_declare_control_scope() {
+        let tools = WorkflowPlugin::default().list_tools();
+        assert_eq!(tools.len(), 4);
+        assert!(tools
+            .iter()
+            .all(|tool| tool.permission_scope == ToolPermissionScope::Control));
+    }
 
     /// 构造固定尺寸的插件 UI 渲染请求。
     fn request(view_id: &str, instance_id: Option<&str>) -> UiRenderRequest {

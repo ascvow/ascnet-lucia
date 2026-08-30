@@ -4,7 +4,7 @@ use super::*;
 use crate::ui::{ToolRenderState, UiInputEvent, UiPlacement, UiSize};
 use agent_core::model::ModelMessage;
 use agent_core::{ContextLoadRequest, ContextLoader, LoadedContext};
-use agent_tool::{ExecutionPolicy, ToolCall, ToolResult, ToolSpec};
+use agent_tool::{ExecutionPolicy, ToolCall, ToolPermissionScope, ToolResult, ToolSpec};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
@@ -87,6 +87,29 @@ impl PluginHost for RewritePluginHost {
 
 /// 只允许看到最终工具名的测试策略宿主。
 struct FinalPolicyPluginHost;
+
+/// 记录最终策略收到的工具名与权限 scope，验证组合宿主的可信绑定顺序。
+struct CapturingScopePolicyPluginHost {
+    observed: Arc<std::sync::Mutex<Vec<(String, ToolPermissionScope)>>>,
+}
+
+#[async_trait]
+impl AgentExtension for CapturingScopePolicyPluginHost {
+    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
+        self.observed
+            .lock()
+            .expect("权限 scope 观察锁不应中毒")
+            .push((call.name.clone(), call.permission_scope));
+        Ok(ToolDecision::Allow)
+    }
+}
+
+#[async_trait]
+impl PluginHost for CapturingScopePolicyPluginHost {
+    fn id(&self) -> Option<&str> {
+        Some("scope-policy")
+    }
+}
 
 #[async_trait]
 impl AgentExtension for FinalPolicyPluginHost {
@@ -405,6 +428,91 @@ async fn selected_tool_policy_checks_final_rewritten_call() {
         .expect("最终策略检查不应失败");
 
     assert!(matches!(decision, ToolDecision::Block { .. }));
+}
+
+/// 插件工具调用携带的伪造 scope 必须被最近一次可信 ToolSpec 快照覆盖。
+#[tokio::test]
+async fn composite_host_binds_registered_tool_permission_scope() {
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut host = CompositePluginHost::new();
+    host.push(Arc::new(CapturingScopePolicyPluginHost {
+        observed: observed.clone(),
+    }));
+    host.push(Arc::new(CountingPluginHost {
+        id: "tool-owner",
+        tool: ToolSpec::new(
+            "scoped_tool",
+            "声明读取权限的工具",
+            ToolSpec::empty_object_schema(),
+        )
+        .with_permission_scope(ToolPermissionScope::Read),
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    host.set_capability_owner(manifest::TOOL_POLICY_CAPABILITY, "scope-policy");
+    host.list_tools().await.expect("建立可信工具 scope 快照");
+    let mut call = ToolCall::new("scoped-call", "scoped_tool", json!({}));
+    call.bind_permission_scope(ToolPermissionScope::Shell);
+
+    let decision = host.before_tool(&call).await.expect("执行最终 scope 策略");
+
+    assert!(matches!(
+        decision,
+        ToolDecision::Rewrite { call }
+            if call.name == "scoped_tool"
+                && call.permission_scope == ToolPermissionScope::Read
+    ));
+    assert_eq!(
+        observed
+            .lock()
+            .expect("权限 scope 观察锁不应中毒")
+            .as_slice(),
+        &[("scoped_tool".into(), ToolPermissionScope::Read)]
+    );
+}
+
+/// Rewrite 改名到未注册目标时必须降级 unknown，不能沿用来源工具的已授权 scope。
+#[tokio::test]
+async fn composite_host_downgrades_unknown_rewrite_permission_scope() {
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut host = CompositePluginHost::new();
+    host.push(Arc::new(CapturingScopePolicyPluginHost {
+        observed: observed.clone(),
+    }));
+    host.push(Arc::new(CountingPluginHost {
+        id: "tool-owner",
+        tool: ToolSpec::new(
+            "rewrite_source",
+            "重写来源工具",
+            ToolSpec::empty_object_schema(),
+        )
+        .with_permission_scope(ToolPermissionScope::Read),
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    host.push(Arc::new(RewritePluginHost {
+        id: "rewriter",
+        target: "unregistered_target",
+    }));
+    host.set_capability_owner(manifest::TOOL_POLICY_CAPABILITY, "scope-policy");
+    host.list_tools().await.expect("建立 Rewrite scope 快照");
+
+    let decision = host
+        .before_tool(&ToolCall::new("rewrite-call", "rewrite_source", json!({})))
+        .await
+        .expect("执行 Rewrite scope 策略");
+
+    assert!(matches!(
+        decision,
+        ToolDecision::Rewrite { call }
+            if call.name == "unregistered_target"
+                && call.permission_scope == ToolPermissionScope::Unknown
+    ));
+    assert_eq!(
+        observed
+            .lock()
+            .expect("权限 scope 观察锁不应中毒")
+            .as_slice(),
+        &[("unregistered_target".into(), ToolPermissionScope::Unknown)]
+    );
 }
 
 /// UI 声明必须使用可信宿主 ID，渲染和输入只能调用对应 owner。

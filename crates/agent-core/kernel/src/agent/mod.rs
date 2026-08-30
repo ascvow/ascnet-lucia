@@ -19,12 +19,13 @@ use crate::{
     ToolDecision,
 };
 use agent_tool::{
-    ExecutionPolicy, ToolCall, ToolOutputDelta, ToolOutputSink, ToolRegistry, ToolResult, ToolSpec,
+    ExecutionPolicy, ToolCall, ToolOutputDelta, ToolOutputSink, ToolPermissionScope, ToolRegistry,
+    ToolResult, ToolSpec,
 };
 use anyhow::{anyhow, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 /// Default system prompt for the helpful Lucia agent.
 /// Lucia 实用型 Agent 的默认 system prompt。

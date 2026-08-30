@@ -28,7 +28,7 @@
 
 ### 工具参数类型
 
-`ToolCall` 的 `id` 必须原样带回 `ToolResult.call_id`；`name` 是 Host 路由后的公开名；`args` 是未强类型校验的 JSON。使用 `call.args_as::<Args>()` 解析，不要用字符串切割参数。
+`ToolCall` 的 `id` 必须原样带回 `ToolResult.call_id`；`name` 是 Host 路由后的公开名；`args` 是未强类型校验的 JSON。`permission_scope` 由 Core 和组合 Host 从最近一次可信 `ToolSpec` 快照绑定，策略插件不得按工具名复制权限白名单。使用 `call.args_as::<Args>()` 解析，不要用字符串切割参数。
 
 `ToolDecisionStatus::Ready` 中的 `ToolDecision`：
 
@@ -39,7 +39,7 @@
 | `CancelRun` | `reason` | 优雅取消当前运行并保留 Session |
 | `Rewrite` | 完整 `call` | 对最终调用重新执行策略检查后路由 |
 
-`ToolDecisionStatus::Pending { retry_after_ms }` 只表示 Guest 尚未形成最终决策。Host 只负责等待并重新调用，不理解审批 ID、选项、UI 或持久化规则；这些协议由权限插件等具体插件自行定义。重写必须返回完整 ToolCall，不能只返回差量 args。
+`ToolDecisionStatus::Pending { retry_after_ms }` 只表示 Guest 尚未形成最终决策。Host 只负责等待并重新调用，不理解审批 ID、选项、UI 或持久化规则；这些协议由权限插件等具体插件自行定义。重写必须返回完整 ToolCall，不能只返回差量 args；组合 Host 会对同名重写恢复已注册 scope，改名到未知目标时降级为 `Unknown`，Core 随后按最终目标再次绑定。
 
 ### 上下文类型
 

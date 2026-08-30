@@ -2,9 +2,9 @@
 
 use agent_plugin::{
     export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentPlugin, PluginHostApi,
-    PromptContribution, Result, ToolCall, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame,
-    UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement,
-    UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
+    PromptContribution, Result, ToolCall, ToolPermissionScope, ToolResult, ToolSpec, UiColor,
+    UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest,
+    UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -459,6 +459,7 @@ fn update_plan_tool() -> ToolSpec {
             "additionalProperties": false
         }),
     )
+    .with_permission_scope(ToolPermissionScope::Control)
 }
 
 /// 构建读取当前计划快照的无参数工具定义。
@@ -468,6 +469,7 @@ fn get_plan_tool() -> ToolSpec {
         "读取当前任务计划、步骤状态和修订号。仅在需要确认现有计划且上下文中没有最新快照时调用。",
         ToolSpec::empty_object_schema(),
     )
+    .with_permission_scope(ToolPermissionScope::Control)
 }
 
 /// 创建带统一终端样式的单行文本。
@@ -530,6 +532,16 @@ export_plugin!(PlanPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 工具只修改插件内计划状态，必须声明为无需资源审批的控制面 scope。
+    #[test]
+    fn plan_tools_declare_control_scope() {
+        let tools = PlanPlugin::default().list_tools();
+        assert_eq!(tools.len(), 2);
+        assert!(tools
+            .iter()
+            .all(|tool| tool.permission_scope == ToolPermissionScope::Control));
+    }
 
     /// 创建测试计划项，减少状态校验用例中的重复结构。
     fn item(step: &str, status: PlanStatus) -> PlanItem {

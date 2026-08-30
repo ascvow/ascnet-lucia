@@ -3,9 +3,9 @@
 use agent_plugin::{
     export_plugin, ActivationContext, AgentPlugin, EventPresentation, EventPresentationTone,
     ExtensionEvent, ModelCompletionRequest, ModelCompletionResponse, PluginHostApi, ToolCall,
-    ToolDecision, ToolDecisionStatus, UiColor, UiDeclaration, UiFrame, UiHostAction,
-    UiHostActionRequest, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize,
-    UiSpan, UiStyle,
+    ToolDecision, ToolDecisionStatus, ToolPermissionScope, UiColor, UiDeclaration, UiFrame,
+    UiHostAction, UiHostActionRequest, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest,
+    UiSize, UiSpan, UiStyle,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -80,14 +80,18 @@ struct PendingApproval {
     call_id: String,
     tool_name: String,
     summary: String,
+    /// 审批卡片首行展示的 scope 操作类型。
+    action: &'static str,
     /// 审批卡片展示的操作原因，不包含模型输入或敏感参数。
     reason: &'static str,
     /// 审批卡片展示的宿主资源范围。
     scope: &'static str,
+    /// 审批卡片展示的静态风险等级，由可信 scope 决定。
+    risk: &'static str,
     rule_key: String,
 }
 
-/// 权限插件状态；策略只检查调用参数，不持有宿主文件、进程或网络能力。
+/// 权限插件状态；策略只消费 Host 绑定的 scope 与脱敏参数，不持有宿主资源能力。
 pub struct PermissionPlugin {
     pending: Vec<PendingApproval>,
     resolutions: BTreeMap<String, ApprovalResolution>,
@@ -172,8 +176,10 @@ impl AgentPlugin for PermissionPlugin {
                 call_id: call.id.clone(),
                 tool_name: call.name.clone(),
                 summary: approval_summary(&call),
+                action: approval_action(call.permission_scope),
                 reason: approval_reason(&call),
                 scope: approval_scope(&call),
+                risk: approval_risk(call.permission_scope),
                 rule_key,
             });
         }
@@ -400,7 +406,7 @@ impl PermissionPlugin {
         };
         let request = ModelCompletionRequest {
             system: Some(
-                "你是工具调用安全审核器。只根据工具名称和脱敏摘要判断是否可执行。\
+                "你是工具调用安全审核器。只根据可信权限 scope、工具名称和脱敏摘要判断是否可执行。\
                  仅输出 ALLOW 或 DENY，不得输出解释。信息不足、命令可破坏数据、扩大权限或访问凭据时输出 DENY。"
                     .into(),
             ),
@@ -408,7 +414,10 @@ impl PermissionPlugin {
                 "role": "user",
                 "content": [{
                     "type": "text",
-                    "text": format!("工具：{}\n脱敏摘要：{}", pending.tool_name, pending.summary)
+                    "text": format!(
+                        "工具：{}\n权限 scope：{}\n脱敏摘要：{}",
+                        pending.tool_name, pending.scope, pending.summary
+                    )
                 }]
             })],
             max_tokens: Some(8),
@@ -556,9 +565,12 @@ fn parse_review_decision(text: &str) -> Option<bool> {
     }
 }
 
-/// 对已知只读工具执行路径检查；敏感路径永不进入审批流程。
+/// 对已声明读写 scope 且携带文件路径的工具执行词法边界检查。
 fn blocked_reason(call: &ToolCall) -> Option<String> {
-    if call.name == "shell" {
+    if !matches!(
+        call.permission_scope,
+        ToolPermissionScope::Read | ToolPermissionScope::Write
+    ) {
         return None;
     }
     let path = call.args.get("path").and_then(|value| value.as_str())?;
@@ -575,26 +587,23 @@ fn blocked_reason(call: &ToolCall) -> Option<String> {
     None
 }
 
-/// 判断工具是否需要用户逐次确认；未知插件工具按有副作用处理。
+/// 判断工具是否需要审批；只依据 Host 绑定的可信 scope，不维护工具名白名单。
 fn requires_approval(call: &ToolCall) -> bool {
-    !matches!(
-        call.name.as_str(),
-        "read_file" | "list_directory" | "search_files"
-    )
+    call.permission_scope != ToolPermissionScope::Control
 }
 
 /// 构造“允许相似调用”使用的保守规则键。
 fn approval_rule_key(call: &ToolCall) -> String {
-    match call.name.as_str() {
-        "shell" => {
+    match call.permission_scope {
+        ToolPermissionScope::Shell => {
             let command = call
                 .args
                 .get("command")
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
-            format!("shell:{}", shell_command_family(command))
+            format!("shell:{}:{}", call.name, shell_command_family(command))
         }
-        "write_file" => {
+        ToolPermissionScope::Read | ToolPermissionScope::Write => {
             let parent = call
                 .args
                 .get("path")
@@ -603,9 +612,27 @@ fn approval_rule_key(call: &ToolCall) -> String {
                 .and_then(|path| path.to_str())
                 .filter(|path| !path.is_empty())
                 .unwrap_or(".");
-            format!("write_file:{parent}")
+            format!(
+                "{}:{}:{parent}",
+                permission_scope_key(call.permission_scope),
+                call.name
+            )
         }
-        name => format!("tool:{name}"),
+        ToolPermissionScope::Network => format!("network:{}", call.name),
+        ToolPermissionScope::Unknown => format!("unknown:{}", call.name),
+        ToolPermissionScope::Control => format!("control:{}", call.name),
+    }
+}
+
+/// 返回会话授权规则使用的稳定 scope 键，不依赖工具公开名称。
+fn permission_scope_key(scope: ToolPermissionScope) -> &'static str {
+    match scope {
+        ToolPermissionScope::Unknown => "unknown",
+        ToolPermissionScope::Control => "control",
+        ToolPermissionScope::Read => "read",
+        ToolPermissionScope::Write => "write",
+        ToolPermissionScope::Shell => "shell",
+        ToolPermissionScope::Network => "network",
     }
 }
 
@@ -627,47 +654,70 @@ fn shell_command_family(command: &str) -> String {
 
 /// 生成不包含文件内容或密钥值的审批摘要。
 fn approval_summary(call: &ToolCall) -> String {
-    match call.name.as_str() {
-        "write_file" => call
+    match call.permission_scope {
+        ToolPermissionScope::Read | ToolPermissionScope::Write => call
             .args
             .get("path")
             .and_then(|value| value.as_str())
             .map(str::to_string)
-            .unwrap_or_else(|| "file".into()),
-        "shell" => call
+            .unwrap_or_else(|| call.name.clone()),
+        ToolPermissionScope::Shell => call
             .args
             .get("command")
             .and_then(|value| value.as_str())
             .map(redact_command)
             .unwrap_or_else(|| "shell command".into()),
-        _ => "plugin tool call".into(),
+        ToolPermissionScope::Network => ["url", "endpoint", "host"]
+            .into_iter()
+            .find_map(|key| call.args.get(key).and_then(|value| value.as_str()))
+            .map(str::to_string)
+            .unwrap_or_else(|| call.name.clone()),
+        ToolPermissionScope::Unknown | ToolPermissionScope::Control => call.name.clone(),
     }
 }
 
 /// 返回审批卡片中的静态原因说明，避免把未经信任的参数重复展示为解释文本。
 fn approval_reason(call: &ToolCall) -> &'static str {
-    match call.name.as_str() {
-        "write_file" => "Agent 请求修改当前工作区中的文件。",
-        "shell" => "Agent 请求在当前工作区执行该命令。",
-        _ => "Agent 请求执行这个插件工具。",
+    match call.permission_scope {
+        ToolPermissionScope::Control => "Agent 请求修改 Lucia 内部控制面状态。",
+        ToolPermissionScope::Read => "Agent 请求读取宿主中的受保护数据。",
+        ToolPermissionScope::Write => "Agent 请求创建、修改或删除持久数据。",
+        ToolPermissionScope::Shell => "Agent 请求执行宿主原生进程。",
+        ToolPermissionScope::Network => "Agent 请求访问外部网络或远端服务。",
+        ToolPermissionScope::Unknown => "工具未声明可信权限 scope，副作用无法预先确定。",
     }
 }
 
 /// 返回工具调用触达的宿主资源范围。
 fn approval_scope(call: &ToolCall) -> &'static str {
-    match call.name.as_str() {
-        "write_file" => "filesystem",
-        "shell" => "process",
-        _ => "plugin",
+    match call.permission_scope {
+        ToolPermissionScope::Control => "control",
+        ToolPermissionScope::Read => "data:read",
+        ToolPermissionScope::Write => "data:write",
+        ToolPermissionScope::Shell => "process",
+        ToolPermissionScope::Network => "network",
+        ToolPermissionScope::Unknown => "undeclared",
     }
 }
 
 /// 返回审批卡片首行使用的紧凑操作动词。
-fn approval_action(tool_name: &str) -> &'static str {
-    match tool_name {
-        "write_file" => "WRITE",
-        "shell" => "RUN",
-        _ => "CALL",
+fn approval_action(scope: ToolPermissionScope) -> &'static str {
+    match scope {
+        ToolPermissionScope::Control | ToolPermissionScope::Unknown => "CALL",
+        ToolPermissionScope::Read => "READ",
+        ToolPermissionScope::Write => "WRITE",
+        ToolPermissionScope::Shell => "RUN",
+        ToolPermissionScope::Network => "CONNECT",
+    }
+}
+
+/// 返回审批卡片展示的静态风险等级，避免根据未经信任的工具名称推断风险。
+fn approval_risk(scope: ToolPermissionScope) -> &'static str {
+    match scope {
+        ToolPermissionScope::Control => "●○○○  low",
+        ToolPermissionScope::Read => "●●○○  moderate",
+        ToolPermissionScope::Write | ToolPermissionScope::Network => "●●●○  elevated",
+        ToolPermissionScope::Shell | ToolPermissionScope::Unknown => "●●●●  high",
     }
 }
 
@@ -723,11 +773,7 @@ fn approval_lines(pending: &PendingApproval, selected: usize, notice: Option<&st
     let mut lines = vec![
         UiLine {
             spans: vec![
-                styled_span(
-                    format!("{:<6}", approval_action(&pending.tool_name)),
-                    UiColor::Cyan,
-                    true,
-                ),
+                styled_span(format!("{:<8}", pending.action), UiColor::Cyan, true),
                 styled_span(&pending.summary, UiColor::White, false),
             ],
         },
@@ -748,7 +794,7 @@ fn approval_lines(pending: &PendingApproval, selected: usize, notice: Option<&st
         UiLine {
             spans: vec![
                 styled_span("Risk    ", UiColor::Gray, true),
-                styled_span("●●●○  elevated", UiColor::Yellow, false),
+                styled_span(pending.risk, UiColor::Yellow, false),
             ],
         },
     ];
@@ -896,14 +942,27 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 构造已经过 Core/Host 可信绑定的测试工具调用。
+    fn scoped_call(
+        id: &str,
+        name: &str,
+        args: serde_json::Value,
+        scope: ToolPermissionScope,
+    ) -> ToolCall {
+        let mut call = ToolCall::new(id, name, args);
+        call.bind_permission_scope(scope);
+        call
+    }
+
     /// 审批界面应在顶部展示脱敏详情，并只保留三项纵向动作。
     #[test]
     fn approval_ui_uses_compact_visual_hierarchy() {
         let mut plugin = PermissionPlugin::default();
-        plugin.before_tool(ToolCall::new(
+        plugin.before_tool(scoped_call(
             "shell-ui",
             "shell",
             json!({"command": "cargo test"}),
+            ToolPermissionScope::Shell,
         ));
 
         let frame = plugin
@@ -926,10 +985,10 @@ mod tests {
 
         assert!(frame.visible);
         assert_eq!(frame.lines.len(), 12);
-        assert!(text.starts_with("RUN   cargo test"), "{text}");
+        assert!(text.starts_with("RUN     cargo test"), "{text}");
         assert!(text.contains("Reason"), "{text}");
         assert!(text.contains("Scope   process"), "{text}");
-        assert!(text.contains("Risk    ●●●○  elevated"), "{text}");
+        assert!(text.contains("Risk    ●●●●  high"), "{text}");
         assert!(text.contains("❯ [A] 允许一次"), "{text}");
         assert!(text.contains("[S] 本会话允许"), "{text}");
         assert!(text.contains("[D] 拒绝"), "{text}");
@@ -1056,7 +1115,12 @@ mod tests {
     /// 模型代审允许结论必须只放行当前请求，并使用严格受限的短输出请求。
     #[test]
     fn model_review_allows_exact_positive_decision() {
-        let call = ToolCall::new("model-allow", "shell", json!({"command": "cargo test"}));
+        let call = scoped_call(
+            "model-allow",
+            "shell",
+            json!({"command": "cargo test"}),
+            ToolPermissionScope::Shell,
+        );
         let mut plugin = PermissionPlugin {
             mode: PermissionMode::ModelReview,
             ..PermissionPlugin::default()
@@ -1069,6 +1133,9 @@ mod tests {
                 .system
                 .as_deref()
                 .is_some_and(|text| text.contains("ALLOW")));
+            assert!(request.messages[0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("权限 scope：process")));
             Ok(ModelCompletionResponse {
                 text: "ALLOW".into(),
                 usage: None,
@@ -1086,7 +1153,12 @@ mod tests {
     /// 模型代审拒绝结论必须取消当前运行，不能仅从待审批队列移除请求。
     #[test]
     fn model_review_denial_cancels_run() {
-        let call = ToolCall::new("model-deny", "shell", json!({"command": "rm -rf build"}));
+        let call = scoped_call(
+            "model-deny",
+            "shell",
+            json!({"command": "rm -rf build"}),
+            ToolPermissionScope::Shell,
+        );
         let mut plugin = PermissionPlugin {
             mode: PermissionMode::ModelReview,
             ..PermissionPlugin::default()
@@ -1111,7 +1183,12 @@ mod tests {
     /// 模型调用失败时必须保留待审批请求并自动退回手动模式。
     #[test]
     fn model_review_failure_falls_back_to_manual() {
-        let call = ToolCall::new("model-error", "shell", json!({"command": "cargo test"}));
+        let call = scoped_call(
+            "model-error",
+            "shell",
+            json!({"command": "cargo test"}),
+            ToolPermissionScope::Shell,
+        );
         let mut plugin = PermissionPlugin {
             mode: PermissionMode::ModelReview,
             ..PermissionPlugin::default()
@@ -1135,10 +1212,11 @@ mod tests {
     /// 模型审核回退必须尝试保存手动模式，保存失败也不能阻止当前运行收紧权限。
     #[test]
     fn model_review_fallback_is_safe_when_state_save_fails() {
-        let call = ToolCall::new(
+        let call = scoped_call(
             "model-state-error",
             "shell",
             json!({"command": "cargo test"}),
+            ToolPermissionScope::Shell,
         );
         let mut plugin = PermissionPlugin {
             mode: PermissionMode::ModelReview,
@@ -1164,14 +1242,62 @@ mod tests {
             .is_some_and(|notice| notice.contains("保存回退模式失败")));
     }
 
+    /// 任意名称的 control 工具都应直接放行，证明策略不依赖官方工具白名单。
+    #[test]
+    fn control_scope_allows_third_party_tool_without_review() {
+        let mut plugin = PermissionPlugin::default();
+        let decision = plugin.before_tool(scoped_call(
+            "control-call",
+            "third_party_state_transition",
+            json!({"state": "ready"}),
+            ToolPermissionScope::Control,
+        ));
+
+        assert_eq!(
+            decision,
+            ToolDecisionStatus::Ready {
+                decision: ToolDecision::Allow
+            }
+        );
+        assert!(plugin.pending.is_empty());
+    }
+
+    /// 读、写、进程、网络和未声明 scope 均必须进入当前审批模式。
+    #[test]
+    fn non_control_scopes_require_approval() {
+        for (index, scope) in [
+            ToolPermissionScope::Read,
+            ToolPermissionScope::Write,
+            ToolPermissionScope::Shell,
+            ToolPermissionScope::Network,
+            ToolPermissionScope::Unknown,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut plugin = PermissionPlugin::default();
+            let decision = plugin.before_tool(scoped_call(
+                &format!("risky-{index}"),
+                "third_party_operation",
+                json!({"path": "src/lib.rs", "command": "cargo check"}),
+                scope,
+            ));
+            assert!(
+                matches!(decision, ToolDecisionStatus::Pending { .. }),
+                "scope {scope:?} 不得直接放行"
+            );
+        }
+    }
+
     /// 敏感文件读取必须直接拒绝，不能通过审批临时放行。
     #[test]
     fn blocks_sensitive_file_reads() {
         let mut plugin = PermissionPlugin::default();
-        let decision = plugin.before_tool(ToolCall::new(
+        let decision = plugin.before_tool(scoped_call(
             "read-secret",
             "read_file",
             json!({"path": ".env"}),
+            ToolPermissionScope::Read,
         ));
         assert!(matches!(
             decision,
@@ -1184,7 +1310,12 @@ mod tests {
     /// 写入请求应等待 UI 决策，批准后同一调用只放行一次。
     #[test]
     fn approves_write_once_from_ui() {
-        let call = ToolCall::new("write-1", "write_file", json!({"path": "src/lib.rs"}));
+        let call = scoped_call(
+            "write-1",
+            "write_file",
+            json!({"path": "src/lib.rs"}),
+            ToolPermissionScope::Write,
+        );
         let mut plugin = PermissionPlugin::default();
         assert!(matches!(
             plugin.before_tool(call.clone()),
@@ -1211,10 +1342,11 @@ mod tests {
     #[test]
     fn blocks_parent_path_escape() {
         let mut plugin = PermissionPlugin::default();
-        let decision = plugin.before_tool(ToolCall::new(
+        let decision = plugin.before_tool(scoped_call(
             "escape",
             "write_file",
             json!({"path": "../important.txt"}),
+            ToolPermissionScope::Write,
         ));
         assert!(matches!(
             decision,
@@ -1227,7 +1359,12 @@ mod tests {
     /// 方向键切换到取消后，Enter 应暂停当前 Agent 运行。
     #[test]
     fn arrow_selection_cancels_run() {
-        let call = ToolCall::new("shell-1", "shell", json!({"command": "cargo test"}));
+        let call = scoped_call(
+            "shell-1",
+            "shell",
+            json!({"command": "cargo test"}),
+            ToolPermissionScope::Shell,
+        );
         let mut plugin = PermissionPlugin::default();
         assert!(matches!(
             plugin.before_tool(call.clone()),
@@ -1255,7 +1392,12 @@ mod tests {
     /// A 快捷键应无需移动选择直接允许一次。
     #[test]
     fn a_shortcut_approves_once() {
-        let call = ToolCall::new("shell-a", "shell", json!({"command": "cargo check"}));
+        let call = scoped_call(
+            "shell-a",
+            "shell",
+            json!({"command": "cargo check"}),
+            ToolPermissionScope::Shell,
+        );
         let mut plugin = PermissionPlugin::default();
         plugin.before_tool(call.clone());
         plugin.on_ui_input(UiInput {
@@ -1278,7 +1420,12 @@ mod tests {
     /// D 快捷键必须直接拒绝当前调用并暂停 Agent 运行。
     #[test]
     fn d_shortcut_cancels_run() {
-        let call = ToolCall::new("shell-d", "shell", json!({"command": "cargo check"}));
+        let call = scoped_call(
+            "shell-d",
+            "shell",
+            json!({"command": "cargo check"}),
+            ToolPermissionScope::Shell,
+        );
         let mut plugin = PermissionPlugin::default();
         plugin.before_tool(call.clone());
         plugin.on_ui_input(UiInput {
@@ -1302,7 +1449,12 @@ mod tests {
     /// 带修饰键的 A 不得触发审批，避免终端选择快捷键意外放行工具。
     #[test]
     fn modified_a_does_not_approve() {
-        let call = ToolCall::new("shell-meta-a", "shell", json!({"command": "cargo check"}));
+        let call = scoped_call(
+            "shell-meta-a",
+            "shell",
+            json!({"command": "cargo check"}),
+            ToolPermissionScope::Shell,
+        );
         let mut plugin = PermissionPlugin::default();
         plugin.before_tool(call.clone());
         plugin.on_ui_input(UiInput {
@@ -1324,9 +1476,24 @@ mod tests {
     /// 允许相似 Shell 调用只应放行同一命令族。
     #[test]
     fn similar_mode_matches_shell_command_family() {
-        let first = ToolCall::new("first", "shell", json!({"command": "cargo test -p one"}));
-        let similar = ToolCall::new("second", "shell", json!({"command": "cargo test -p two"}));
-        let different = ToolCall::new("third", "shell", json!({"command": "cargo check"}));
+        let first = scoped_call(
+            "first",
+            "shell",
+            json!({"command": "cargo test -p one"}),
+            ToolPermissionScope::Shell,
+        );
+        let similar = scoped_call(
+            "second",
+            "shell",
+            json!({"command": "cargo test -p two"}),
+            ToolPermissionScope::Shell,
+        );
+        let different = scoped_call(
+            "third",
+            "shell",
+            json!({"command": "cargo check"}),
+            ToolPermissionScope::Shell,
+        );
         let mut plugin = PermissionPlugin::default();
         plugin.before_tool(first.clone());
         plugin.on_ui_input(UiInput {
@@ -1360,13 +1527,24 @@ mod tests {
     /// 通过权限模式开启全部放行后仍不得绕过敏感路径硬拒绝。
     #[test]
     fn allow_all_keeps_sensitive_path_blocked() {
-        let shell = ToolCall::new("shell-all", "shell", json!({"command": "cargo test"}));
-        let write = ToolCall::new(
+        let shell = scoped_call(
+            "shell-all",
+            "shell",
+            json!({"command": "cargo test"}),
+            ToolPermissionScope::Shell,
+        );
+        let write = scoped_call(
             "write-all",
             "write_file",
             json!({"path": "src/lib.rs", "content": ""}),
+            ToolPermissionScope::Write,
         );
-        let secret = ToolCall::new("secret-all", "read_file", json!({"path": ".env"}));
+        let secret = scoped_call(
+            "secret-all",
+            "read_file",
+            json!({"path": ".env"}),
+            ToolPermissionScope::Read,
+        );
         let mut plugin = PermissionPlugin::default();
         plugin.set_mode(PermissionMode::AllowAll);
 

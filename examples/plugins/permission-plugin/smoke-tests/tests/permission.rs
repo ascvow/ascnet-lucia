@@ -7,12 +7,19 @@ use agent_plugin_host::{
     wasm::{load_wasm_plugins, load_wasm_plugins_with_services},
     PluginHost, PluginHostServices,
 };
-use agent_tool::ToolCall;
-use serde_json::json;
+use agent_tool::{ToolCall, ToolPermissionScope};
+use serde_json::{json, Value};
 use std::{path::Path, sync::Arc, time::Duration};
 
 const APPROVAL_VIEW: &str = "permission-approval";
 const MODE_VIEW: &str = "permission-mode";
+
+/// 构造模拟 Core/Host 已完成可信 scope 绑定的真实 ABI 调用。
+fn scoped_call(id: &str, name: &str, args: Value, scope: ToolPermissionScope) -> ToolCall {
+    let mut call = ToolCall::new(id, name, args);
+    call.bind_permission_scope(scope);
+    call
+}
 
 /// 真实 component 必须阻止敏感读取，并在用户确认后放行一次写入。
 #[tokio::test]
@@ -30,7 +37,25 @@ async fn wasm_host_routes_permission_approval() {
     let declarations = host.ui_declarations().await.expect("建立权限插件 UI 路由");
     assert_eq!(declarations[0].placement, UiPlacement::Input);
 
-    let secret = ToolCall::new("secret", "read_file", json!({"path": ".env"}));
+    let update_plan = scoped_call(
+        "update-plan",
+        "update_plan",
+        json!({"plan": []}),
+        ToolPermissionScope::Control,
+    );
+    assert_eq!(
+        AgentExtension::before_tool(host.as_ref(), &update_plan)
+            .await
+            .expect("检查 control scope 工具"),
+        ToolDecision::Allow
+    );
+
+    let secret = scoped_call(
+        "secret",
+        "read_file",
+        json!({"path": ".env"}),
+        ToolPermissionScope::Read,
+    );
     assert!(matches!(
         AgentExtension::before_tool(host.as_ref(), &secret)
             .await
@@ -38,10 +63,11 @@ async fn wasm_host_routes_permission_approval() {
         ToolDecision::Block { .. }
     ));
 
-    let write = ToolCall::new(
+    let write = scoped_call(
         "write",
         "write_file",
         json!({"path": "src/safe.rs", "content": ""}),
+        ToolPermissionScope::Write,
     );
     let pending_host = Arc::clone(&host);
     let pending_write = write.clone();
@@ -198,10 +224,11 @@ async fn wasm_host_restores_persisted_permission_mode() {
     let reopened = load_wasm_plugins_with_services(&[&manifest], services)
         .await
         .expect("重新加载权限插件 WASM");
-    let write = ToolCall::new(
+    let write = scoped_call(
         "restored-write",
         "write_file",
         json!({"path": "src/restored.rs", "content": ""}),
+        ToolPermissionScope::Write,
     );
     let decision = tokio::time::timeout(
         Duration::from_secs(1),

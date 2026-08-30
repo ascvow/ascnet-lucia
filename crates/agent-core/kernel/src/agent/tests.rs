@@ -8,7 +8,8 @@ use crate::{
     },
 };
 use agent_tool::{
-    JsonTool, Tool, ToolOutputDelta, ToolOutputSink, ToolOutputStream, ToolResult, ToolSpec,
+    JsonTool, Tool, ToolOutputDelta, ToolOutputSink, ToolOutputStream, ToolPermissionScope,
+    ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -70,6 +71,22 @@ struct PublishingExtension {
 
 /// 在工具执行前取消当前运行的测试扩展。
 struct CancelRunExtension;
+
+/// 捕获权限 scope 的测试扩展，用于验证模型字段在进入策略前已被可信定义覆盖。
+struct CapturingPermissionScopeExtension {
+    observed: std::sync::Mutex<Vec<ToolPermissionScope>>,
+}
+
+#[async_trait]
+impl AgentExtension for CapturingPermissionScopeExtension {
+    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
+        self.observed
+            .lock()
+            .expect("权限 scope 观察锁不应中毒")
+            .push(call.permission_scope);
+        Ok(ToolDecision::Allow)
+    }
+}
 
 #[async_trait]
 impl AgentExtension for CancelRunExtension {
@@ -519,6 +536,45 @@ fn echo_tool() -> JsonTool {
         ToolSpec::new("echo", "回显输入", ToolSpec::empty_object_schema()),
         |args| async move { Ok(args) },
     )
+}
+
+/// 模型响应即使伪造权限字段，扩展也只能看到本轮 ToolSpec 绑定的可信 scope。
+#[tokio::test]
+async fn model_cannot_forge_tool_permission_scope() {
+    let mut call = ToolCall::new("scope-call", "scoped_echo", json!({}));
+    call.bind_permission_scope(ToolPermissionScope::Shell);
+    let extension = Arc::new(CapturingPermissionScopeExtension {
+        observed: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut tools = ToolRegistry::new();
+    tools
+        .register(JsonTool::new(
+            ToolSpec::new(
+                "scoped_echo",
+                "验证可信权限 scope",
+                ToolSpec::empty_object_schema(),
+            )
+            .with_permission_scope(ToolPermissionScope::Read),
+            |args| async move { Ok(args) },
+        ))
+        .expect("注册 scope 测试工具");
+    let agent = agent_with_script(vec![
+        ModelResponse::tool_calls(vec![call]),
+        ModelResponse::text("完成"),
+    ])
+    .with_tools(tools)
+    .with_extension(extension.clone());
+
+    agent.run("验证 scope 绑定").await.expect("运行应成功");
+
+    assert_eq!(
+        extension
+            .observed
+            .lock()
+            .expect("权限 scope 观察锁不应中毒")
+            .as_slice(),
+        &[ToolPermissionScope::Read]
+    );
 }
 
 /// 返回结构化 UI 细节的测试工具。
@@ -1265,6 +1321,54 @@ impl AgentExtension for RewritingExtension {
             call: ToolCall::new(call.id.clone(), self.target.clone(), call.args.clone()),
         })
     }
+}
+
+/// 插件 Rewrite 返回的 scope 不能直接进入执行事件，Core 必须按目标 ToolSpec 重新绑定。
+#[tokio::test]
+async fn rewritten_call_rebinds_target_tool_permission_scope() {
+    let mut tools = ToolRegistry::new();
+    for spec in [
+        ToolSpec::new(
+            "rewrite_source",
+            "重写来源工具",
+            ToolSpec::empty_object_schema(),
+        )
+        .with_permission_scope(ToolPermissionScope::Read),
+        ToolSpec::new(
+            "rewrite_target",
+            "重写目标工具",
+            ToolSpec::empty_object_schema(),
+        )
+        .with_permission_scope(ToolPermissionScope::Control),
+    ] {
+        tools
+            .register(JsonTool::new(spec, |args| async move { Ok(args) }))
+            .expect("注册 Rewrite scope 测试工具");
+    }
+    let sink = Arc::new(InMemoryEventSink::new());
+    let agent = agent_with_script(vec![
+        ModelResponse::tool_calls(vec![ToolCall::new(
+            "rewrite-scope-call",
+            "rewrite_source",
+            json!({}),
+        )]),
+        ModelResponse::text("完成"),
+    ])
+    .with_tools(tools)
+    .with_extension(Arc::new(RewritingExtension {
+        target: "rewrite_target".into(),
+    }))
+    .with_event_sink(sink.clone());
+
+    agent.run("验证 Rewrite scope").await.expect("运行应成功");
+
+    let events = sink.events().await;
+    let started = events
+        .iter()
+        .find(|event| event.kind == AgentEventKind::ToolStarted)
+        .expect("Rewrite 后应发布工具开始事件");
+    assert_eq!(started.payload["name"], "rewrite_target");
+    assert_eq!(started.payload["permission_scope"], "control");
 }
 
 /// 策略拒绝的工具不应出现在暴露给模型的工具列表中。
