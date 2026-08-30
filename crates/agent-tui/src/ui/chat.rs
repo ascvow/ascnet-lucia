@@ -3,8 +3,8 @@
 use crate::app::{input_ref_spans, App};
 use crate::command::{reasoning_level_command_value, render_native_command_panel};
 use crate::theme::{
-    COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_TEXT, COLOR_USER, COLOR_USER_BG,
-    COLOR_WARNING, SPINNER,
+    COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_TEXT, COLOR_USER,
+    COLOR_USER_BG, COLOR_WARNING, SPINNER,
 };
 use crate::ui::markdown::truncate_line;
 #[cfg(feature = "plugins")]
@@ -292,6 +292,12 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         footer.extend([
             Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
             Span::styled(truncate_line(text, 28), Style::new().fg(*color)),
+        ]);
+    }
+    if app.has_copyable_text_selection() {
+        footer.extend([
+            Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+            Span::styled("Selection · Ctrl+C copy", Style::new().fg(COLOR_SUCCESS)),
         ]);
     }
     if workspace.width >= 96 {

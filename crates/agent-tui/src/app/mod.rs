@@ -161,6 +161,8 @@ pub(crate) struct App {
     pub(crate) mouse_capture: bool,
     /// 当前屏幕文本选择；鼠标释放只保留高亮，不主动写入系统剪贴板。
     pub(crate) text_selection: Option<MouseTextSelection>,
+    /// 左键释放时从渲染缓冲区冻结的选区文本，供后续显式复制使用。
+    pub(crate) text_selection_content: Option<String>,
     /// 插件声明的视图及宿主缓存的最近一帧。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_views: Vec<PluginViewState>,
@@ -380,6 +382,7 @@ impl App {
             model_input_modalities: None,
             mouse_capture: true,
             text_selection: None,
+            text_selection_content: None,
             #[cfg(feature = "plugins")]
             plugin_views: Vec::new(),
             #[cfg(feature = "plugins")]

@@ -602,23 +602,28 @@ fn reasoning_change_is_transactional_when_config_write_fails() {
 fn mouse_release_preserves_selection_without_buffer_side_effects() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
+    let buffer = Buffer::with_lines(["01234567", "abcdefgh", "ABCDEFGH"]);
     for (kind, column) in [
         (MouseEventKind::Down(crossterm::event::MouseButton::Left), 1),
         (MouseEventKind::Drag(crossterm::event::MouseButton::Left), 4),
         (MouseEventKind::Up(crossterm::event::MouseButton::Left), 4),
     ] {
-        app.handle_text_selection(&MouseEvent {
-            kind,
-            column,
-            row: 2,
-            modifiers: KeyModifiers::NONE,
-        });
+        app.handle_text_selection(
+            &MouseEvent {
+                kind,
+                column,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &buffer,
+        );
     }
 
     let selection = app.text_selection.expect("释放后应保留拖选高亮");
     assert!(selection.dragged);
     assert_eq!(selection.anchor, Position::new(1, 2));
     assert_eq!(selection.current, Position::new(4, 2));
+    assert_eq!(app.text_selection_content.as_deref(), Some("BCDE"));
 }
 
 /// 显式复制使用的选区文本必须保留换行和中文宽字符，并移除行尾布局空白。

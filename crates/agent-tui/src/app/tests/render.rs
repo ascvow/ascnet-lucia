@@ -40,6 +40,29 @@ fn footer_shows_compact_english_reasoning_level() {
     assert!(!text.contains("思考 超高"), "{text:?}");
 }
 
+/// 左键释放形成可复制选区后，底栏必须展示一次性操作提示。
+#[test]
+fn footer_shows_copy_shortcut_for_released_selection() {
+    let backend = TestBackend::new(100, 16);
+    let mut terminal = Terminal::new(backend).expect("创建选区操作提示测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.text_selection_content = Some("待复制文本".into());
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染选区操作提示");
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(text.contains("Selection · Ctrl+C copy"), "{text:?}");
+}
+
 /// 空会话首屏应在常见终端尺寸内绘制压缩后的彩色像素头像。
 #[test]
 fn empty_session_renders_pixel_portrait() {

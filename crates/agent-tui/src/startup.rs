@@ -498,10 +498,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         .modifiers
                         .contains(crossterm::event::KeyModifiers::CONTROL)
                         && matches!(key.code, crossterm::event::KeyCode::Char('c'))
-                        && app.copy_text_selection(rendered_buffer)
+                        && app.copy_text_selection()
                     {
                         continue;
                     }
+                    app.dismiss_text_selection();
                     let before_input = app.input.clone();
                     if app.handle_native_command_key(key.code, key.modifiers, agent.as_ref()) {
                         app.sync_native_command_input(&before_input);
@@ -891,7 +892,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::Input(Event::Mouse(mouse))) => {
-                app.handle_text_selection(&mouse);
+                app.handle_text_selection(&mouse, rendered_buffer);
                 #[cfg(feature = "plugins")]
                 {
                     let dialog_active = app.active_dialog_index().is_some();
@@ -931,6 +932,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::Input(Event::Paste(pasted))) => {
+                app.dismiss_text_selection();
                 // 粘贴只进入主输入框；插件视图聚焦或模态层激活时忽略。
                 #[cfg(feature = "plugins")]
                 let main_input_focused = !app.native_dialog_active()

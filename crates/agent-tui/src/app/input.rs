@@ -217,14 +217,14 @@ impl App {
 
     /// 向上滚动 n 行，进入手动滚动模式。
     pub(crate) fn scroll_up(&mut self, n: u16) {
-        self.text_selection = None;
+        self.dismiss_text_selection();
         let current = self.scroll.unwrap_or(self.last_max_scroll);
         self.scroll = Some(current.saturating_sub(n));
     }
 
     /// 向下滚动 n 行；到达底部时恢复自动跟随。
     pub(crate) fn scroll_down(&mut self, n: u16) {
-        self.text_selection = None;
+        self.dismiss_text_selection();
         if let Some(current) = self.scroll {
             let next = current.saturating_add(n);
             if next >= self.last_max_scroll {
@@ -511,6 +511,7 @@ impl App {
             return;
         }
         self.mouse_capture = !self.mouse_capture;
+        self.dismiss_text_selection();
         let notice = if self.mouse_capture {
             "Mouse capture enabled; press Ctrl+T to restore text selection"
         } else {
@@ -523,13 +524,15 @@ impl App {
     ///
     /// 单击只重置选择；发生拖动后，选择按终端的线性行顺序展开。选区必须再由
     /// `Ctrl+C` 显式复制，避免鼠标释放意外覆盖用户已有剪贴板内容。
-    pub(crate) fn handle_text_selection(&mut self, mouse: &MouseEvent) {
+    pub(crate) fn handle_text_selection(&mut self, mouse: &MouseEvent, buffer: &Buffer) {
         let position = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                self.dismiss_text_selection();
                 self.text_selection = Some(MouseTextSelection::new(position));
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                self.text_selection_content = None;
                 if let Some(selection) = self.text_selection.as_mut() {
                     selection.update(position);
                 }
@@ -539,28 +542,43 @@ impl App {
                     return;
                 };
                 selection.update(position);
+                let text = if selection.dragged {
+                    selection.extract(buffer)
+                } else {
+                    String::new()
+                };
+                self.text_selection_content = (!text.is_empty()).then_some(text);
             }
             _ => {}
         }
     }
 
-    /// 将当前非空拖选范围复制到系统剪贴板，并报告按键是否应被选区消费。
+    /// 将左键释放时冻结的非空选区复制到系统剪贴板，并报告按键是否应被选区消费。
     ///
     /// 没有有效拖选时返回 `false`，调用方可继续执行 `Ctrl+C` 的退出行为；存在选区时
-    /// 即使剪贴板写入失败也返回 `true`，并把错误展示在消息区，避免一次复制失败意外退出。
-    pub(crate) fn copy_text_selection(&mut self, buffer: &Buffer) -> bool {
-        let Some(selection) = self.text_selection.filter(|selection| selection.dragged) else {
+    /// 即使剪贴板写入失败也返回 `true`，并保留选区供重试，避免一次失败意外退出。
+    pub(crate) fn copy_text_selection(&mut self) -> bool {
+        let Some(text) = self.text_selection_content.clone() else {
             return false;
         };
-        let text = selection.extract(buffer);
-        if text.is_empty() {
-            return false;
-        }
         if let Err(error) = copy_to_clipboard(&text) {
             self.messages
                 .push(Msg::new(MsgKind::Error, format!("Copy failed: {error}")));
+        } else {
+            self.dismiss_text_selection();
         }
         true
+    }
+
+    /// 返回当前是否存在已释放、可由 `Ctrl+C` 复制的文本选区。
+    pub(crate) fn has_copyable_text_selection(&self) -> bool {
+        self.text_selection_content.is_some()
+    }
+
+    /// 清除应用内拖选坐标与冻结文本；滚动、继续操作或复制成功后调用。
+    pub(crate) fn dismiss_text_selection(&mut self) {
+        self.text_selection = None;
+        self.text_selection_content = None;
     }
 
     /// 在当前帧缓冲区中反色显示应用内鼠标选择，不改变字符内容。
