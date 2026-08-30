@@ -2,7 +2,7 @@
 
 #[cfg(feature = "plugins")]
 use crate::app::PluginKeyRoute;
-use crate::app::{reasoning_level_label, App, ChannelEventSink};
+use crate::app::{is_copy_shortcut, reasoning_level_label, App, ChannelEventSink};
 use crate::cli::Args;
 use crate::command::resume_native_session;
 use crate::config::{
@@ -494,12 +494,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         match rx.recv().await {
             Some(UiEvent::Input(Event::Key(key))) => {
                 if key.kind == KeyEventKind::Press {
-                    if key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL)
-                        && matches!(key.code, crossterm::event::KeyCode::Char('c'))
-                        && app.copy_text_selection()
-                    {
+                    if is_copy_shortcut(key.code, key.modifiers) && app.copy_text_selection() {
                         continue;
                     }
                     app.dismiss_text_selection();

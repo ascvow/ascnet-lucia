@@ -131,7 +131,7 @@ pub(crate) fn copy_via_command(text: &str) -> bool {
     use std::process::{Command, Stdio};
 
     #[cfg(target_os = "macos")]
-    let candidates: &[&[&str]] = &[&["pbcopy"]];
+    let candidates: &[&[&str]] = &[&["/usr/bin/pbcopy"]];
     #[cfg(target_os = "windows")]
     let candidates: &[&[&str]] = &[&["clip"]];
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -160,4 +160,63 @@ pub(crate) fn copy_via_command(text: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试结束或断言失败时恢复原始 macOS 剪贴板内容，避免诊断污染用户数据。
+    #[cfg(target_os = "macos")]
+    struct MacosClipboardRestore(Vec<u8>);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for MacosClipboardRestore {
+        fn drop(&mut self) {
+            use std::io::Write;
+            use std::process::{Command, Stdio};
+
+            let Ok(mut child) = Command::new("/usr/bin/pbcopy")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                return;
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(&self.0);
+            }
+            let _ = child.wait();
+        }
+    }
+
+    /// 真实 macOS 剪贴板测试必须写入唯一文本、读回比较，并在结束时恢复原内容。
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "会短暂修改当前用户的系统剪贴板，仅在本机验收时运行"]
+    fn macos_clipboard_command_round_trip() {
+        use std::process::Command;
+
+        let original = Command::new("/usr/bin/pbpaste")
+            .output()
+            .expect("应读取当前 macOS 剪贴板");
+        assert!(original.status.success(), "读取 macOS 剪贴板失败");
+        let _restore = MacosClipboardRestore(original.stdout);
+        let expected = format!(
+            "lucia-copy-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("系统时间应晚于 Unix epoch")
+                .as_nanos()
+        );
+
+        assert!(copy_via_command(&expected), "pbcopy 应成功写入测试文本");
+        let actual = Command::new("/usr/bin/pbpaste")
+            .output()
+            .expect("应读回 macOS 剪贴板");
+        assert!(actual.status.success(), "读回 macOS 剪贴板失败");
+        assert_eq!(actual.stdout, expected.as_bytes());
+    }
 }

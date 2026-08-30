@@ -540,7 +540,7 @@ impl App {
         if !matches!(code, KeyCode::Esc) {
             self.last_escape_at = None;
         }
-        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
+        if super::is_copy_shortcut(code, modifiers) {
             return PluginKeyRoute::Main;
         }
 

@@ -29,6 +29,7 @@ use agent_plugin_protocol::UiFrame as PluginUiFrame;
 use agent_plugin_protocol::{UiDeclaration, UiInput};
 use agent_session::{MemorySessionStore, SessionId, SessionRecord, SessionStore};
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
 #[cfg(feature = "plugins")]
 use std::collections::BTreeMap;
@@ -36,6 +37,11 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// 判断终端按键是否表示复制快捷键；兼容增强键盘协议返回的大写字符和附加 Shift。
+pub(crate) fn is_copy_shortcut(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'C'))
+}
 
 /// 主输入区识别连续两次 Esc 的最长间隔，避免单次误触清空草稿。
 pub(crate) const ESC_DOUBLE_PRESS_WINDOW: std::time::Duration =

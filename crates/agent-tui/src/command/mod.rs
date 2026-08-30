@@ -561,7 +561,7 @@ impl App {
         modifiers: KeyModifiers,
         agent: Option<&Arc<Agent>>,
     ) -> bool {
-        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
+        if crate::app::is_copy_shortcut(code, modifiers) {
             return false;
         }
         let item_count = self.reasoning_levels.len();

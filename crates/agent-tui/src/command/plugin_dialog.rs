@@ -102,7 +102,7 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> bool {
-        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
+        if crate::app::is_copy_shortcut(code, modifiers) {
             return false;
         }
         let Some(dialog) = self.native_command.plugin_dialog.as_mut() else {

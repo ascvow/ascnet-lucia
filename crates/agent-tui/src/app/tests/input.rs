@@ -638,6 +638,17 @@ fn mouse_text_selection_extracts_visible_buffer_for_explicit_copy() {
     assert_eq!(selection.extract(&buffer), "甲乙\ntext");
 }
 
+/// 复制快捷键必须兼容终端增强协议携带的 Shift 与大写字符，其他组合不得误触发。
+#[test]
+fn copy_shortcut_accepts_terminal_key_variants() {
+    assert!(is_copy_shortcut(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(is_copy_shortcut(
+        KeyCode::Char('C'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT
+    ));
+    assert!(!is_copy_shortcut(KeyCode::Char('c'), KeyModifiers::SUPER));
+}
+
 /// 换行手势（Shift+Enter / Alt+Enter / Ctrl+J）插入换行，Home/End 使用行内语义。
 #[test]
 fn multiline_newline_gestures_and_line_navigation() {
