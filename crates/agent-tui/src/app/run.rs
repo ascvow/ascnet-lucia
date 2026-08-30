@@ -235,9 +235,10 @@ impl App {
             queue_may_advance,
             input,
         } = completion;
-        // 仅模型运行失败且没有完成态 Session 时保留当前界面；保存失败时 run 已携带
-        // 完整会话，必须以它重建界面，避免保留过期的流式内容。
-        let preserve_visible_history = run.is_none() && error.is_some();
+        let user_cancelled = self.run_stream_cancelled;
+        // 用户取消后保留 Esc 时冻结的界面；Session 仍更新到持久完成态，但不能让迟到内容
+        // 在 AgentDone 阶段重新跳回消息列表。其他失败仅在没有完成态 Session 时保留界面。
+        let preserve_visible_history = user_cancelled || (run.is_none() && error.is_some());
         self.running = false;
         self.run_started_at = None;
         self.model_is_thinking = false;
@@ -280,12 +281,21 @@ impl App {
         self.run_stream_cancelled = false;
         if let Some(run) = run {
             if run.cancelled {
-                self.messages.push(Msg::new(
-                    MsgKind::Info,
-                    "Run cancelled; generated content was preserved",
-                ));
+                if user_cancelled {
+                    if let Some(message) = self.messages.iter_mut().rev().find(|message| {
+                        matches!(message.kind, MsgKind::Info)
+                            && message.text == "Cancelling the current run..."
+                    }) {
+                        message.text = "Run cancelled; visible output was frozen".into();
+                    }
+                } else {
+                    self.messages.push(Msg::new(
+                        MsgKind::Info,
+                        "Run cancelled; generated content was preserved",
+                    ));
+                }
             }
-            if !run.usage.is_empty() {
+            if !user_cancelled && !run.usage.is_empty() {
                 self.messages.push(Msg::new(
                     MsgKind::Info,
                     format!(
@@ -302,6 +312,6 @@ impl App {
             self.messages
                 .push(Msg::new(MsgKind::Error, format!("{error:#}")));
         }
-        queue_may_advance
+        queue_may_advance && !user_cancelled
     }
 }

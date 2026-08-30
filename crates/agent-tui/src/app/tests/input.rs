@@ -326,7 +326,9 @@ fn escape_immediately_stops_visible_stream_deltas() {
     app.mark_model_thinking();
 
     assert_eq!(app.messages[0].text, "取消前");
-    assert!(app.model_is_thinking);
+    assert!(!app.model_is_thinking);
+    assert_eq!(app.messages.len(), 2);
+    assert_eq!(app.messages[1].text, "Cancelling the current run...");
 }
 
 /// 独占审批视图可见时必须冻结整个主事件区，隐藏后一次性显示期间积累的事件。
@@ -595,9 +597,33 @@ fn reasoning_change_is_transactional_when_config_write_fails() {
     }));
 }
 
-/// 应用内拖选应保留换行和中文宽字符，同时移除每行末尾的布局空白。
+/// 鼠标释放只结束拖选并保留高亮范围，不依赖渲染缓冲区触发隐式复制。
 #[test]
-fn mouse_text_selection_extracts_visible_buffer() {
+fn mouse_release_preserves_selection_without_buffer_side_effects() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    for (kind, column) in [
+        (MouseEventKind::Down(crossterm::event::MouseButton::Left), 1),
+        (MouseEventKind::Drag(crossterm::event::MouseButton::Left), 4),
+        (MouseEventKind::Up(crossterm::event::MouseButton::Left), 4),
+    ] {
+        app.handle_text_selection(&MouseEvent {
+            kind,
+            column,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    let selection = app.text_selection.expect("释放后应保留拖选高亮");
+    assert!(selection.dragged);
+    assert_eq!(selection.anchor, Position::new(1, 2));
+    assert_eq!(selection.current, Position::new(4, 2));
+}
+
+/// 显式复制使用的选区文本必须保留换行和中文宽字符，并移除行尾布局空白。
+#[test]
+fn mouse_text_selection_extracts_visible_buffer_for_explicit_copy() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
     buffer.set_string(0, 0, "甲乙", Style::default());
     buffer.set_string(0, 1, "text", Style::default());

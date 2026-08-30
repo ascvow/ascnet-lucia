@@ -38,7 +38,7 @@ Host 会覆盖事件的 `source`，插件不能伪造其他 owner。
 | `set_state(key, value)` | 写入或替换 JSON 值 |
 | `remove_state(key)` | 删除并返回旧值 |
 
-状态隔离在当前 component 实例内，不持久化。需要跨重启状态时，由插件使用被授权的外部存储能力。
+状态按当前插件隔离。应用未注入持久目录时只保留到 component 卸载；注入后由 Host 事务性保存并在同一插件重新加载前恢复，Guest 不接触实际状态路径。
 
 ## 插件服务
 

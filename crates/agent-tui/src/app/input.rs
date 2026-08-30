@@ -112,9 +112,19 @@ impl App {
                 // 运行中优先中断；空闲输入必须连续双按才清空，Esc 永不直接退出。
                 if self.running {
                     self.last_escape_at = None;
-                    if let Some(agent) = agent {
+                    if !self.run_stream_cancelled {
                         self.run_stream_cancelled = true;
-                        agent.cancel();
+                        self.model_is_thinking = false;
+                        self.streaming_message = None;
+                        for message in &mut self.messages {
+                            if matches!(message.kind, MsgKind::ToolRunning) {
+                                message.kind = MsgKind::ToolSkipped;
+                                message.skip_reason = Some("Cancelled by user".into());
+                            }
+                        }
+                        if let Some(agent) = agent {
+                            agent.cancel();
+                        }
                         self.messages
                             .push(Msg::new(MsgKind::Info, "Cancelling the current run..."));
                     }
@@ -509,11 +519,11 @@ impl App {
         self.messages.push(Msg::new(MsgKind::Info, notice));
     }
 
-    /// 更新应用内文本选择，并在左键释放后复制当前可见缓冲区中的文本。
+    /// 更新应用内文本选择，左键释放后只保留高亮范围，不主动修改系统剪贴板。
     ///
-    /// 单击只重置选择，不产生剪贴板副作用；发生拖动后，选择按终端的线性行顺序展开，
-    /// 每行末尾空白会被移除。剪贴板不可用时保留高亮选择，不影响其他鼠标路由。
-    pub(crate) fn handle_text_selection(&mut self, mouse: &MouseEvent, buffer: &Buffer) {
+    /// 单击只重置选择；发生拖动后，选择按终端的线性行顺序展开。选区必须再由
+    /// `Ctrl+C` 显式复制，避免鼠标释放意外覆盖用户已有剪贴板内容。
+    pub(crate) fn handle_text_selection(&mut self, mouse: &MouseEvent) {
         let position = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
@@ -529,15 +539,28 @@ impl App {
                     return;
                 };
                 selection.update(position);
-                if selection.dragged {
-                    let text = selection.extract(buffer);
-                    if !text.is_empty() {
-                        let _ = copy_to_clipboard(&text);
-                    }
-                }
             }
             _ => {}
         }
+    }
+
+    /// 将当前非空拖选范围复制到系统剪贴板，并报告按键是否应被选区消费。
+    ///
+    /// 没有有效拖选时返回 `false`，调用方可继续执行 `Ctrl+C` 的退出行为；存在选区时
+    /// 即使剪贴板写入失败也返回 `true`，并把错误展示在消息区，避免一次复制失败意外退出。
+    pub(crate) fn copy_text_selection(&mut self, buffer: &Buffer) -> bool {
+        let Some(selection) = self.text_selection.filter(|selection| selection.dragged) else {
+            return false;
+        };
+        let text = selection.extract(buffer);
+        if text.is_empty() {
+            return false;
+        }
+        if let Err(error) = copy_to_clipboard(&text) {
+            self.messages
+                .push(Msg::new(MsgKind::Error, format!("Copy failed: {error}")));
+        }
+        true
     }
 
     /// 在当前帧缓冲区中反色显示应用内鼠标选择，不改变字符内容。

@@ -2,6 +2,8 @@
 
 use crate::event::UiEvent;
 use crate::theme::{COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_USER, COLOR_WARNING};
+#[cfg(feature = "plugins")]
+use crate::ui::plugin_bridge::plugin_footer_event;
 use agent_core::event::{AgentEvent, AgentEventKind, EventSink};
 #[cfg(feature = "plugins")]
 use agent_plugin_protocol::{UiNavigationRequest, UI_NAVIGATION_EVENT};
@@ -139,6 +141,15 @@ impl EventSink for ChannelEventSink {
                 let _ = self.tx.send(UiEvent::FollowUpInjected);
             }
             AgentEventKind::Extension => {
+                #[cfg(feature = "plugins")]
+                if let Some((plugin_id, text, color)) = plugin_footer_event(&event.payload)? {
+                    let _ = self.tx.send(UiEvent::PluginFooterStatus {
+                        plugin_id,
+                        text,
+                        color,
+                    });
+                    return Ok(());
+                }
                 #[cfg(feature = "plugins")]
                 if event.payload.get("name").and_then(Value::as_str) == Some(UI_NAVIGATION_EVENT) {
                     let plugin_id = event

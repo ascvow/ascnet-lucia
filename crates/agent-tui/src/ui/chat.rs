@@ -287,6 +287,13 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             Style::new().fg(COLOR_MUTED),
         ),
     ];
+    #[cfg(feature = "plugins")]
+    for (text, color) in app.plugin_footer_statuses.values() {
+        footer.extend([
+            Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+            Span::styled(truncate_line(text, 28), Style::new().fg(*color)),
+        ]);
+    }
     if workspace.width >= 96 {
         footer.extend([
             Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),

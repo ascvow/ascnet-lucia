@@ -41,7 +41,7 @@ use crate::theme::{COLOR_DANGER, COLOR_MUTED, COLOR_WARNING};
 use crate::ui::markdown::{markdown_lines, summarize_json};
 
 #[cfg(feature = "plugins")]
-use crate::ui::plugin_bridge::apply_plugin_frames;
+use crate::ui::plugin_bridge::{apply_plugin_footer_event, apply_plugin_frames};
 
 use crate::ui::root::render_root;
 
@@ -105,10 +105,8 @@ use crossterm::event::KeyCode;
 
 use crossterm::event::KeyModifiers;
 
-#[cfg(feature = "plugins")]
 use crossterm::event::MouseEvent;
 
-#[cfg(feature = "plugins")]
 use crossterm::event::MouseEventKind;
 
 use ratatui::prelude::*;

@@ -110,7 +110,7 @@ Lucia 的内置斜杠命令由 TUI 原生执行，不通过插件输入触发机
 
 TUI 会在每个插件 Ready 时立即消费其激活事件，并在底部信息栏右侧按稳定计划顺序累积状态和本次加载耗时，例如 `mcp: MCP 插件等待配置 · 420 ms`。全部加载结束数秒后该区域收敛为 `◈ N plugins`，持续显示当前已加载插件数量，不额外占用对话区高度。周期性插件视图渲染在单个后台任务中执行；刷新期间到达的新请求会合并为下一批，不阻塞键盘事件，也不会无限堆积任务。
 
-只有启动激活阶段的事件进入该状态行。原生上下文压缩事件和插件运行期事件仍按 `presentation.target` 进入主事件列表，插件无需为此修改运行期事件协议。
+普通启动激活事件进入一次性状态行。`presentation.target = "footer"` 的事件按 Host 注入的可信插件来源保存为常驻底栏状态，同一插件的新值覆盖旧值；其余插件运行期事件按目标进入主事件列表。
 
 ## 主事件列表
 
@@ -130,6 +130,8 @@ TUI 会在每个插件 Ready 时立即消费其激活事件，并在底部信息
 ```
 
 Lucia TUI 支持 `text` 与 `divider`，tone 支持 `info`、`success`、`warning`、`error`、`muted`。无界面消费者可以忽略 `presentation`，仍保留 name 和 data。
+
+需要常驻展示插件当前模式时使用 `target = "footer"` 与 `text` 形态。底栏状态不进入对话消息或 Session；Rust 插件可用 `EventPresentation::footer(...)` 构造。
 
 Rust 插件应使用 `EventPresentation`、`EventPresentationTarget`、`EventPresentationVariant` 和 `EventPresentationTone` 构造展示提示，避免手写容易漂移的 JSON 字段。
 

@@ -73,6 +73,28 @@ impl AgentRuntime {
         })
     }
 
+    /// 取消当前 Runtime 中全部排队或运行中的 Agent，并保留 Ready controller 供后续派生。
+    ///
+    /// 应用层在用户中断一次顶层交互时调用该方法，可跨插件 principal 收敛本 Runtime
+    /// 已派生的后台工作。返回本次首次收到取消请求的 Agent 数量；已终止任务和未运行的
+    /// controller 不计入结果，也不会被撤销。
+    pub async fn cancel_active_runs(&self) -> usize {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        let entries = self
+            .inner
+            .agents
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        entries
+            .into_iter()
+            .filter(|entry| matches!(entry.status(), AgentStatus::Queued | AgentStatus::Running))
+            .filter(|entry| entry.request_cancel())
+            .count()
+    }
+
     /// 挂载一个 Host 已持有的根 Agent 身份。
     ///
     /// 根节点只作为模板、权限和通信主体，不会自动运行。返回后可通过 [`api`](Self::api)

@@ -51,6 +51,13 @@ pub(crate) enum UiEvent {
         color: Color,
         divider: bool,
     },
+    /// 插件发布的常驻底栏状态；插件 ID 来自 Host 注入的可信事件来源。
+    #[cfg(feature = "plugins")]
+    PluginFooterStatus {
+        plugin_id: String,
+        text: String,
+        color: Color,
+    },
     /// 插件请求主应用更新子视图导航栈。
     #[cfg(feature = "plugins")]
     ViewNavigation {

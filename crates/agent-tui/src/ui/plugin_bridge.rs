@@ -11,8 +11,57 @@ use agent_plugin_protocol::{
 };
 use anyhow::{anyhow, Result};
 use futures_util::future::join_all;
+use ratatui::style::Color;
 use serde_json::Value;
 use std::sync::Arc;
+
+/// 从通用扩展事件解析一条可信插件底栏状态。
+///
+/// 返回 `None` 表示事件目标不是底栏；底栏事件缺少 Host 注入的来源或展示文本时返回错误。
+pub(crate) fn plugin_footer_event(event: &Value) -> Result<Option<(String, String, Color)>> {
+    let Some(presentation) = event.get("presentation") else {
+        return Ok(None);
+    };
+    if presentation.get("target").and_then(Value::as_str) != Some("footer") {
+        return Ok(None);
+    }
+    let plugin_id = event
+        .pointer("/source/id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("底栏状态事件缺少可信插件来源"))?;
+    let text = presentation
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| event.pointer("/data/text").and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("底栏状态事件缺少展示文本"))?;
+    Ok(Some((
+        plugin_id.to_string(),
+        text.to_string(),
+        presentation_color(presentation),
+    )))
+}
+
+/// 把一条通用插件底栏事件提交到应用状态，同一可信来源覆盖旧值。
+pub(crate) fn apply_plugin_footer_event(app: &mut App, event: &Value) -> Result<bool> {
+    let Some((plugin_id, text, color)) = plugin_footer_event(event)? else {
+        return Ok(false);
+    };
+    app.plugin_footer_statuses.insert(plugin_id, (text, color));
+    Ok(true)
+}
+
+/// 将扩展展示色调映射为 TUI 颜色；未知色调按普通信息处理。
+fn presentation_color(presentation: &Value) -> Color {
+    match presentation.get("tone").and_then(Value::as_str) {
+        Some("success") => COLOR_SUCCESS,
+        Some("warning") => COLOR_WARNING,
+        Some("error") => COLOR_DANGER,
+        Some("muted") => COLOR_MUTED,
+        _ => COLOR_USER,
+    }
+}
 
 /// 单个插件视图后台渲染结果，保留可信 owner 和实例定位信息。
 pub(crate) type PluginRenderResult = (
@@ -174,13 +223,7 @@ fn plugin_event_message(event: &Value) -> Option<Msg> {
         .or_else(|| event.get("name").and_then(Value::as_str))?
         .to_string();
     let divider = presentation.get("variant").and_then(Value::as_str) == Some("divider");
-    let color = match presentation.get("tone").and_then(Value::as_str) {
-        Some("success") => COLOR_SUCCESS,
-        Some("warning") => COLOR_WARNING,
-        Some("error") => COLOR_DANGER,
-        Some("muted") => COLOR_MUTED,
-        _ => COLOR_USER,
-    };
+    let color = presentation_color(presentation);
     Some(Msg::extension(text, color, divider))
 }
 
@@ -190,6 +233,9 @@ pub(crate) async fn drain_plugin_ui_events(
     plugin_host: &Arc<LivePluginHost>,
 ) -> Result<()> {
     for event in agent_core::AgentExtension::drain_events(plugin_host.as_ref()).await? {
+        if apply_plugin_footer_event(app, &event)? {
+            continue;
+        }
         if apply_plugin_navigation_event(app, &event)? {
             continue;
         }

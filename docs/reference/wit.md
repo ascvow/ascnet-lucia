@@ -139,7 +139,7 @@ Rust SDK：`remove_prompt(id) -> Result<()>`。
 
 - `name`：非空的插件协议事件名。
 - `data`：任意 JSON，缺省为 `null`。
-- `presentation`：可选展示提示；没有 UI 的消费者可忽略。
+- `presentation`：可选展示提示；`target` 支持主事件列表 `main_event_list` 与按可信插件来源覆盖的常驻状态 `footer`，没有 UI 的消费者可忽略。
 - Host 会覆盖来源，注入 `source = { "type": "plugin", "id": <可信插件 ID> }`。Guest payload 中伪造的 source 不参与身份判断。
 - 成功 `value`：`null`。
 
@@ -147,7 +147,7 @@ Rust SDK：`emit_event(event) -> Result<()>`；子视图导航使用 `navigate_v
 
 ## 实例状态 imports
 
-状态只属于当前激活实例，卸载后消失，不是持久化 API。
+状态按插件实例隔离。Host 可以由应用注入持久目录，使这些键在同一插件重新加载后恢复；未注入时只保留到当前实例卸载。
 
 ### `host-state-get`
 

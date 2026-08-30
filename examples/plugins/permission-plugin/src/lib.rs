@@ -1,10 +1,11 @@
 //! Agent 工具策略与交互审批插件。
 
 use agent_plugin::{
-    export_plugin, ActivationContext, AgentPlugin, ExtensionEvent, ModelCompletionRequest,
-    ModelCompletionResponse, PluginHostApi, ToolCall, ToolDecision, ToolDecisionStatus, UiColor,
-    UiDeclaration, UiFrame, UiHostAction, UiHostActionRequest, UiInput, UiInputEvent, UiLine,
-    UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    export_plugin, ActivationContext, AgentPlugin, EventPresentation, EventPresentationTone,
+    ExtensionEvent, ModelCompletionRequest, ModelCompletionResponse, PluginHostApi, ToolCall,
+    ToolDecision, ToolDecisionStatus, UiColor, UiDeclaration, UiFrame, UiHostAction,
+    UiHostActionRequest, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize,
+    UiSpan, UiStyle,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -20,9 +21,9 @@ const PERMISSION_MODE_STATE_KEY: &str = "permission_mode";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum PermissionMode {
     /// 每次通过 TUI 由用户决定。
-    #[default]
     Manual,
     /// 使用 Host 固定路由的受限小模型进行二元安全审核。
+    #[default]
     ModelReview,
     /// 自动允许普通副作用调用；硬安全边界仍会先行拒绝。
     AllowAll,
@@ -38,13 +39,30 @@ impl PermissionMode {
         }
     }
 
-    /// 从插件状态恢复模式；未知值返回 `None`，由调用方安全回到手动审批。
+    /// 从插件状态恢复模式；未知值返回 `None`，由调用方写入当前默认模式。
     fn from_storage_value(value: &serde_json::Value) -> Option<Self> {
         match value.as_str()? {
             "manual" => Some(Self::Manual),
             "model_review" => Some(Self::ModelReview),
             "allow_all" => Some(Self::AllowAll),
             _ => None,
+        }
+    }
+
+    /// 返回底栏使用的紧凑英文模式名称，避免把命令面板的长说明常驻到主界面。
+    fn footer_label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::ModelReview => "review",
+            Self::AllowAll => "allow all",
+        }
+    }
+
+    /// 返回底栏状态的风险色调；全部放行必须持续保持警示色。
+    fn footer_tone(self) -> EventPresentationTone {
+        match self {
+            Self::AllowAll => EventPresentationTone::Warning,
+            Self::Manual | Self::ModelReview => EventPresentationTone::Muted,
         }
     }
 }
@@ -70,7 +88,6 @@ struct PendingApproval {
 }
 
 /// 权限插件状态；策略只检查调用参数，不持有宿主文件、进程或网络能力。
-#[derive(Default)]
 pub struct PermissionPlugin {
     pending: Vec<PendingApproval>,
     resolutions: BTreeMap<String, ApprovalResolution>,
@@ -84,19 +101,44 @@ pub struct PermissionPlugin {
     mode_notice: Option<String>,
 }
 
+impl Default for PermissionPlugin {
+    /// 创建默认使用受限模型代审的权限状态，并让命令面板同步选中当前模式。
+    fn default() -> Self {
+        let mode = PermissionMode::default();
+        Self {
+            pending: Vec::new(),
+            resolutions: BTreeMap::new(),
+            allowed_similar: BTreeSet::new(),
+            mode,
+            selected: 0,
+            mode_selected: permission_mode_index(mode),
+            command_input: String::new(),
+            next_action_id: 0,
+            review_notice: None,
+            mode_notice: None,
+        }
+    }
+}
+
 impl AgentPlugin for PermissionPlugin {
-    /// 激活时恢复 Host 为当前插件隔离保存的权限模式；无状态时保持最安全的手动审批。
+    /// 激活时恢复 Host 为当前插件隔离保存的权限模式；首次运行写入模型代审默认值。
     fn activate(
         &mut self,
         host: &dyn PluginHostApi,
         _context: ActivationContext,
     ) -> agent_plugin::Result<()> {
-        let Some(value) = host.get_state(PERMISSION_MODE_STATE_KEY)? else {
-            return Ok(());
-        };
-        let mode = PermissionMode::from_storage_value(&value).unwrap_or(PermissionMode::Manual);
+        let stored = host.get_state(PERMISSION_MODE_STATE_KEY)?;
+        let restored = stored.as_ref().and_then(PermissionMode::from_storage_value);
+        let mode = restored.unwrap_or_default();
+        if restored.is_none() {
+            host.set_state(
+                PERMISSION_MODE_STATE_KEY,
+                &serde_json::Value::String(mode.storage_value().into()),
+            )?;
+        }
         self.set_mode(mode);
         self.mode_selected = permission_mode_index(mode);
+        self.emit_mode_status(host)?;
         Ok(())
     }
 
@@ -317,6 +359,7 @@ impl PermissionPlugin {
 
     /// 使用 Host 固定模型路由审核当前调用，仅接受精确的 `ALLOW` 或 `DENY` 结论。
     fn review_current(&mut self, host: &dyn PluginHostApi) {
+        let previous_mode = self.mode;
         self.review_current_with_state(
             |request| host.complete_model(request),
             |mode| {
@@ -326,6 +369,15 @@ impl PermissionPlugin {
                 )
             },
         );
+        if self.mode != previous_mode {
+            if let Err(error) = self.emit_mode_status(host) {
+                let notice = format!("底栏权限模式更新失败：{error}");
+                self.review_notice = Some(match self.review_notice.take() {
+                    Some(current) => format!("{current}；{notice}"),
+                    None => notice,
+                });
+            }
+        }
     }
 
     /// 执行一次可测试的受限审核；完成器错误或协议无效时安全退回人工审批。
@@ -424,8 +476,23 @@ impl PermissionPlugin {
     /// 应用命令选择的权限模式，并请求宿主清空命令文本。
     fn finish_mode_command(&mut self, host: &dyn PluginHostApi, mode: PermissionMode) {
         if self.persist_command_mode(host, mode) {
+            if let Err(error) = self.emit_mode_status(host) {
+                self.mode_notice = Some(format!("权限模式已保存，但底栏更新失败：{error}"));
+            }
             self.clear_command_input(host);
         }
+    }
+
+    /// 发布当前权限模式的通用底栏状态；可信来源由 Host 覆盖注入。
+    fn emit_mode_status(&self, host: &dyn PluginHostApi) -> agent_plugin::Result<()> {
+        host.emit_event(&ExtensionEvent {
+            name: "permission.mode.status".into(),
+            data: serde_json::json!({ "mode": self.mode.storage_value() }),
+            presentation: Some(EventPresentation::footer(
+                format!("Permission: {}", self.mode.footer_label()),
+                self.mode.footer_tone(),
+            )),
+        })
     }
 
     /// 清空权限命令输入；宿主动作失败时保留原输入，便于用户重试或退出。
@@ -875,7 +942,7 @@ mod tests {
             .all(|span| !span.style.reversed));
     }
 
-    /// 权限命令面板必须展示三种默认策略，并标记当前手动模式。
+    /// 权限命令面板必须展示三种默认策略，并标记当前模型代审模式。
     #[test]
     fn permission_command_renders_three_modes() {
         let mut plugin = PermissionPlugin {
@@ -904,10 +971,10 @@ mod tests {
         assert!(frame.visible);
         assert_eq!(frame.lines.len(), 3);
         assert!(text.contains("/permission manual"), "{text}");
-        assert!(text.contains("手动审批 · 每次由你确认  当前"), "{text}");
-        assert!(text.contains("帮我审批"), "{text}");
+        assert!(text.contains("手动审批"), "{text}");
+        assert!(text.contains("帮我审批 · 受限小模型审核  当前"), "{text}");
         assert!(text.contains("全部放行"), "{text}");
-        assert!(frame.lines[0].spans.iter().all(|span| span.style.reversed));
+        assert!(frame.lines[1].spans.iter().all(|span| span.style.reversed));
     }
 
     /// 命令参数必须稳定映射三种权限模式，未知值不得改变选择。
@@ -958,7 +1025,7 @@ mod tests {
                 Err(agent_plugin::anyhow!("状态目录只读"))
             })
         );
-        assert_eq!(plugin.mode, PermissionMode::Manual);
+        assert_eq!(plugin.mode, PermissionMode::ModelReview);
         let frame = plugin
             .render_ui(UiRenderRequest {
                 plugin_id: "permission".into(),

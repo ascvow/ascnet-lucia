@@ -5,7 +5,7 @@
 - `read_file`、`list_directory`、`search_files` 仅允许工作区内的普通相对路径。
 - `.env`、私钥、凭据目录和 `.git` 内容始终拒绝读取或写入。
 - `write_file`、`shell` 和未知插件工具默认逐次审批。
-- `/permission` 打开权限模式选择，可切换“手动审批、帮我审批、全部放行”；也支持 `/permission manual`、`/permission assist`、`/permission allow-all`。模式在 Host 启用持久状态时跨重启保存，写入失败不会改变当前模式。
+- 默认使用“帮我审批”。`/permission` 打开权限模式选择，可切换“手动审批、帮我审批、全部放行”；也支持 `/permission manual`、`/permission assist`、`/permission allow-all`。模式在 Host 启用持久状态时跨重启保存，写入失败不会改变当前模式，当前值常驻显示在 TUI 底栏。
 - “帮我审批”通过 Host 固定的无工具小模型路由审核脱敏摘要，只接受 `ALLOW` 或 `DENY`；调用失败或响应无效时退回手动审批。
 - 插件不申请文件、进程、HTTP、secret 或 Agent Runtime 能力；模型代审仅申请受控 `model_completion`，命令面板仅用 `surface_actions` 清空已消费输入。
 

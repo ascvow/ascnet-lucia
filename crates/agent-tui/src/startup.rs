@@ -30,8 +30,8 @@ use crate::theme::PLUGIN_REFRESH_TICKS;
 use crate::theme::UI_TICK_INTERVAL_MS;
 #[cfg(feature = "plugins")]
 use crate::ui::plugin_bridge::{
-    apply_plugin_frames, apply_plugin_navigation_event, dispatch_plugin_input,
-    drain_plugin_ui_events, refresh_plugin_view, refresh_plugin_views_for,
+    apply_plugin_footer_event, apply_plugin_frames, apply_plugin_navigation_event,
+    dispatch_plugin_input, drain_plugin_ui_events, refresh_plugin_view, refresh_plugin_views_for,
 };
 use crate::ui::root::render_root;
 use agent_context::{NativeContextLoader, DEFAULT_MAX_SUMMARY_TOKENS};
@@ -457,23 +457,25 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             .map(|notice| Msg::new(MsgKind::Info, notice)),
     );
     #[cfg(feature = "plugins")]
+    let plugin_execution = PluginExecutionContext::new(
+        agent_tool::ExecutionPolicy::serve(),
+        None,
+        tui_settings.review_model.clone(),
+        Some(persistent_plugin_state_dir(&lucia_home)),
+    )?;
+    #[cfg(feature = "plugins")]
+    let plugin_agent_runtime = plugin_execution.runtime().clone();
+    #[cfg(feature = "plugins")]
     let plugin_load_task = {
         app = app.with_loading_plugins(loading_plugin_ids);
         let load_tx = tx.clone();
         let load_host = Arc::clone(&live_plugin_host);
-        let plugin_execution_policy = agent_tool::ExecutionPolicy::serve();
-        let persistent_state_dir = Some(persistent_plugin_state_dir(&lucia_home));
         tokio::spawn(async move {
             let result = load_plugins_for_tui(
                 plugin_manifests,
                 capability_selection,
                 plugin_agent_template,
-                PluginExecutionContext {
-                    execution_policy: plugin_execution_policy,
-                    run_observer: None,
-                    model: tui_settings.plugin_model.clone(),
-                    persistent_state_dir,
-                },
+                plugin_execution,
                 load_host,
                 load_tx.clone(),
             )
@@ -492,6 +494,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         match rx.recv().await {
             Some(UiEvent::Input(Event::Key(key))) => {
                 if key.kind == KeyEventKind::Press {
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                        && matches!(key.code, crossterm::event::KeyCode::Char('c'))
+                        && app.copy_text_selection(rendered_buffer)
+                    {
+                        continue;
+                    }
                     let before_input = app.input.clone();
                     if app.handle_native_command_key(key.code, key.modifiers, agent.as_ref()) {
                         app.sync_native_command_input(&before_input);
@@ -507,7 +517,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     match app.route_plugin_key(key.code, key.modifiers) {
                         PluginKeyRoute::Main => {
                             let before = (app.input.clone(), app.cursor);
+                            let cancel_was_requested = app.run_stream_cancelled;
                             app.handle_key(key.code, key.modifiers, agent.as_ref());
+                            if !cancel_was_requested && app.run_stream_cancelled {
+                                plugin_agent_runtime.cancel_active_runs().await;
+                            }
                             app.sync_native_command_input(&before_input);
                             // 编辑结果变化且触发前缀激活时同步主输入快照。
                             if app.input != before.0 || app.cursor != before.1 {
@@ -568,6 +582,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     app.mark_plugin_ready(plugin_id.clone(), &startup_events, load_duration_ms);
                     app.add_plugin_views(ui_declarations);
                     for event in &startup_events {
+                        if let Err(error) = apply_plugin_footer_event(&mut app, event) {
+                            app.messages.push(Msg::new(
+                                MsgKind::Error,
+                                format!("Plugin footer status failed: {error}"),
+                            ));
+                            continue;
+                        }
                         if let Err(error) = apply_plugin_navigation_event(&mut app, event) {
                             app.messages.push(Msg::new(
                                 MsgKind::Error,
@@ -597,6 +618,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Some(UiEvent::PluginFramesLoaded(rendered)) => {
                 app.plugin_refresh_task = None;
                 apply_plugin_frames(&mut app, rendered);
+                if let Some(host) = plugin_host.as_ref() {
+                    if let Err(error) = drain_plugin_ui_events(&mut app, host).await {
+                        app.messages.push(Msg::new(
+                            MsgKind::Error,
+                            format!("Failed to process plugin UI event: {error}"),
+                        ));
+                    }
+                }
                 if app.plugin_refresh_pending {
                     app.plugin_refresh_pending = false;
                     if let Some(host) = plugin_host.as_ref() {
@@ -652,7 +681,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::ModelStarted) => {
-                app.start_model_response();
+                if app.accepts_run_stream_output() {
+                    app.start_model_response();
+                }
             }
             Some(UiEvent::ModelTextReady) => {
                 let delta = model_deltas
@@ -673,6 +704,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::ToolStarted(call)) => {
+                if !app.accepts_run_stream_output() {
+                    continue;
+                }
                 app.finish_model_thinking();
                 #[cfg(feature = "plugins")]
                 let call_id = call.id.clone();
@@ -695,6 +729,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::ToolFinished(tool_result)) => {
+                if !app.accepts_run_stream_output() {
+                    continue;
+                }
                 // 只按稳定调用 ID 更新运行项，避免同名并发工具互相覆盖。
                 let kind = if tool_result.is_error {
                     MsgKind::ToolError
@@ -717,6 +754,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::ToolSkipped { call, reason }) => {
+                if !app.accepts_run_stream_output() {
+                    continue;
+                }
                 #[cfg(feature = "plugins")]
                 let call_id = call.id.clone();
                 let mut message = Msg::tool_started(call);
@@ -734,12 +774,22 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 revision,
                 width,
                 result,
-            }) => app.apply_tool_frame(&call_id, revision, width, result),
+            }) => {
+                if app.accepts_run_stream_output() {
+                    app.apply_tool_frame(&call_id, revision, width, result);
+                }
+            }
             Some(UiEvent::SteeringInjected) => {
+                if !app.accepts_run_stream_output() {
+                    continue;
+                }
                 app.messages
                     .push(Msg::new(MsgKind::Info, "Steering applied"));
             }
             Some(UiEvent::FollowUpInjected) => {
+                if !app.accepts_run_stream_output() {
+                    continue;
+                }
                 app.messages
                     .push(Msg::new(MsgKind::Info, "Follow-up started"));
             }
@@ -748,10 +798,24 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 color,
                 divider,
             }) => {
+                if !app.accepts_run_stream_output() {
+                    continue;
+                }
                 app.messages.push(Msg::extension(text, color, divider));
             }
             #[cfg(feature = "plugins")]
+            Some(UiEvent::PluginFooterStatus {
+                plugin_id,
+                text,
+                color,
+            }) => {
+                app.plugin_footer_statuses.insert(plugin_id, (text, color));
+            }
+            #[cfg(feature = "plugins")]
             Some(UiEvent::ViewNavigation { plugin_id, request }) => {
+                if !app.accepts_run_stream_output() {
+                    continue;
+                }
                 if let Err(error) = app.apply_view_navigation(&plugin_id, request) {
                     app.messages.push(Msg::new(
                         MsgKind::Error,
@@ -827,7 +891,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::Input(Event::Mouse(mouse))) => {
-                app.handle_text_selection(&mouse, rendered_buffer);
+                app.handle_text_selection(&mouse);
                 #[cfg(feature = "plugins")]
                 {
                     let dialog_active = app.active_dialog_index().is_some();

@@ -30,6 +30,8 @@ use agent_plugin_protocol::{UiDeclaration, UiInput};
 use agent_session::{MemorySessionStore, SessionId, SessionRecord, SessionStore};
 use anyhow::Result;
 use ratatui::prelude::*;
+#[cfg(feature = "plugins")]
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -155,9 +157,9 @@ pub(crate) struct App {
     pub(crate) reasoning_level: ReasoningLevel,
     /// models.dev 为当前模型声明的输入模态；`None` 表示快照未匹配，不限制旧行为。
     pub(crate) model_input_modalities: Option<Vec<crate::config::model_metadata::ModelModality>>,
-    /// 鼠标捕获是否开启；默认开启，由应用同时处理滚轮、拖选复制和插件点击。
+    /// 鼠标捕获是否开启；默认开启，由应用同时处理滚轮、文本拖选和插件点击。
     pub(crate) mouse_capture: bool,
-    /// 当前屏幕文本选择；鼠标释放时把可见缓冲区中的选中文本写入系统剪贴板。
+    /// 当前屏幕文本选择；鼠标释放只保留高亮，不主动写入系统剪贴板。
     pub(crate) text_selection: Option<MouseTextSelection>,
     /// 插件声明的视图及宿主缓存的最近一帧。
     #[cfg(feature = "plugins")]
@@ -198,6 +200,9 @@ pub(crate) struct App {
     /// Per-plugin failures retained alongside successful plugins. 与成功插件并存的单插件失败摘要。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_failures: Vec<String>,
+    /// 插件通过可信来源发布的常驻底栏状态；同一来源的新状态覆盖旧状态。
+    #[cfg(feature = "plugins")]
+    pub(crate) plugin_footer_statuses: BTreeMap<String, (String, Color)>,
     /// 主视图之上的插件子视图导航栈。
     #[cfg(feature = "plugins")]
     pub(crate) view_stack: ViewStack,
@@ -282,7 +287,9 @@ impl MouseTextSelection {
         }
     }
 
-    /// 从已渲染缓冲区提取选择文本；返回值保留内部换行并移除行尾布局空白。
+    /// 从已渲染缓冲区提取选择文本；保留内部换行，并移除每行末尾的布局空白。
+    ///
+    /// 中文等宽字符的后续占位单元格不会重复写入返回值；越界端点按缓冲区范围收窄。
     pub(crate) fn extract(self, buffer: &Buffer) -> String {
         let mut rows = Vec::<String>::new();
         let mut row = String::new();
@@ -399,6 +406,8 @@ impl App {
             plugin_load_error: None,
             #[cfg(feature = "plugins")]
             plugin_failures: Vec::new(),
+            #[cfg(feature = "plugins")]
+            plugin_footer_statuses: BTreeMap::new(),
             #[cfg(feature = "plugins")]
             view_stack: ViewStack::default(),
             #[cfg(feature = "plugins")]

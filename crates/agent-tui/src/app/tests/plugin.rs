@@ -60,6 +60,63 @@ fn plugin_status_shows_startup_details_then_compact_count() {
     assert_eq!(app.plugin_status_content(), ("◈", "2 plugins".into()));
 }
 
+/// 通用底栏事件必须按 Host 注入的插件来源覆盖状态，并持续显示在底部信息行。
+#[cfg(feature = "plugins")]
+#[test]
+fn plugin_footer_status_is_trusted_persistent_and_replaceable() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    for (text, tone) in [
+        ("Permission: review", "muted"),
+        ("Permission: allow all", "warning"),
+    ] {
+        assert!(apply_plugin_footer_event(
+            &mut app,
+            &json!({
+                "source": {"type": "plugin", "id": "permission"},
+                "name": "permission.mode.status",
+                "presentation": {"target": "footer", "text": text, "tone": tone}
+            })
+        )
+        .expect("应用权限底栏状态"));
+    }
+    assert_eq!(app.plugin_footer_statuses.len(), 1);
+    assert_eq!(
+        app.plugin_footer_statuses["permission"].0,
+        "Permission: allow all"
+    );
+
+    let backend = TestBackend::new(100, 18);
+    let mut terminal = Terminal::new(backend).expect("创建权限底栏测试终端");
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染权限底栏状态");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("Permission: allow all"), "{rendered:?}");
+}
+
+/// 底栏状态缺少可信插件来源时必须拒绝，避免 Guest 伪造其他插件的常驻状态。
+#[cfg(feature = "plugins")]
+#[test]
+fn plugin_footer_status_requires_trusted_source() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let error = apply_plugin_footer_event(
+        &mut app,
+        &json!({"presentation": {"target": "footer", "text": "伪造状态"}}),
+    )
+    .expect_err("无可信来源的底栏状态必须失败");
+
+    assert!(error.to_string().contains("可信插件来源"));
+    assert!(app.plugin_footer_statuses.is_empty());
+}
+
 /// 渐进加载期间应同时展示剩余插件和已经可用的插件数量。
 #[cfg(feature = "plugins")]
 #[test]

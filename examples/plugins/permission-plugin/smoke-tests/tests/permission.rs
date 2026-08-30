@@ -113,7 +113,50 @@ async fn wasm_host_restores_persisted_permission_mode() {
     let first = load_wasm_plugins_with_services(&[&manifest], services)
         .await
         .expect("首次加载权限插件 WASM");
+    let activation_events = AgentExtension::drain_events(&first)
+        .await
+        .expect("读取默认权限模式底栏事件");
+    assert!(activation_events.iter().any(|event| {
+        event["source"]["id"] == "permission"
+            && event["presentation"]["target"] == "footer"
+            && event["presentation"]["text"] == "Permission: review"
+    }));
     first.ui_declarations().await.expect("建立权限插件 UI 路由");
+    first
+        .on_ui_input(&UiInput {
+            plugin_id: "permission".into(),
+            view_id: MODE_VIEW.into(),
+            instance_id: None,
+            event: UiInputEvent::MainInput {
+                text: "/permission".into(),
+                cursor: 11,
+            },
+        })
+        .await
+        .expect("打开默认权限模式面板");
+    let default_frame = first
+        .render_ui(&UiRenderRequest {
+            plugin_id: "permission".into(),
+            view_id: MODE_VIEW.into(),
+            instance_id: None,
+            width: 68,
+            height: 4,
+            focused: true,
+            frame: 1,
+        })
+        .await
+        .expect("渲染默认权限模式")
+        .expect("默认权限模式应返回界面");
+    let default_text = default_frame
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    assert!(
+        default_text.contains("帮我审批 · 受限小模型审核  当前"),
+        "{default_text}"
+    );
     first
         .on_ui_input(&UiInput {
             plugin_id: "permission".into(),
@@ -138,6 +181,14 @@ async fn wasm_host_restores_persisted_permission_mode() {
         })
         .await
         .expect("提交权限模式命令");
+    let switched_events = AgentExtension::drain_events(&first)
+        .await
+        .expect("读取切换后的权限模式事件");
+    assert!(switched_events.iter().any(|event| {
+        event["source"]["id"] == "permission"
+            && event["presentation"]["target"] == "footer"
+            && event["presentation"]["text"] == "Permission: allow all"
+    }));
     first.shutdown().await.expect("卸载首次权限插件");
     drop(first);
 

@@ -24,12 +24,44 @@ use tokio::sync::mpsc;
 pub(crate) struct PluginExecutionContext {
     /// Host 与 Runtime 共同执行的可信策略上限。
     pub(crate) execution_policy: agent_tool::ExecutionPolicy,
-    /// 可选的可信 Runtime Run 观察器。
-    pub(crate) run_observer: Option<Arc<dyn agent_runtime::RuntimeRunObserver>>,
+    /// 应用持有控制句柄的 Agent Runtime；Esc 可通过共享实例取消插件派生任务。
+    pub(crate) runtime: AgentRuntime,
     /// 插件无工具模型完成使用的固定模型 ID；缺省时沿用主模型。
     pub(crate) model: Option<String>,
     /// Serve 平面使用的应用插件状态目录；受限平面必须保持为 `None`。
     pub(crate) persistent_state_dir: Option<PathBuf>,
+}
+
+#[cfg(feature = "plugins")]
+impl PluginExecutionContext {
+    /// 按可信执行策略创建插件 Runtime 与 Host 装配上下文。
+    ///
+    /// `run_observer` 只供应用可信观察派生 Run；模型路由与状态目录均由应用注入。
+    /// Runtime 限额无效或初始化失败时返回错误，不启动任何插件。
+    pub(crate) fn new(
+        execution_policy: agent_tool::ExecutionPolicy,
+        run_observer: Option<Arc<dyn agent_runtime::RuntimeRunObserver>>,
+        model: Option<String>,
+        persistent_state_dir: Option<PathBuf>,
+    ) -> Result<Self> {
+        let runtime_limits = plugin_runtime_limits(&execution_policy);
+        let runtime = match run_observer {
+            Some(observer) => AgentRuntime::new_with_run_observer(runtime_limits, observer),
+            None => AgentRuntime::new(runtime_limits),
+        }
+        .context("创建 TUI Agent Runtime 失败")?;
+        Ok(Self {
+            execution_policy,
+            runtime,
+            model,
+            persistent_state_dir,
+        })
+    }
+
+    /// 返回应用控制插件派生任务使用的共享 Runtime 句柄。
+    pub(crate) fn runtime(&self) -> &AgentRuntime {
+        &self.runtime
+    }
 }
 
 /// 把可信执行策略的派生拓扑限制映射到 Plugin Host 使用的 Agent Runtime。
@@ -54,6 +86,13 @@ fn plugin_model_output_limit(policy: &agent_tool::ExecutionPolicy) -> u32 {
 pub(crate) fn plugin_startup_details(plugin_ids: &[String], events: &[Value]) -> Vec<String> {
     let mut status_by_id = HashMap::new();
     for event in events {
+        if event
+            .pointer("/presentation/target")
+            .and_then(Value::as_str)
+            == Some("footer")
+        {
+            continue;
+        }
         let Some(plugin_id) = event.pointer("/source/id").and_then(Value::as_str) else {
             continue;
         };
@@ -195,21 +234,20 @@ pub(crate) async fn load_plugins_for_tui(
         return Ok(());
     }
     let prepared_manifests = manifests;
+    let PluginExecutionContext {
+        execution_policy,
+        runtime,
+        model,
+        persistent_state_dir,
+    } = execution;
     let model_gateway = agent_template.gateway().clone();
     let model_provider = agent_template.options().provider.clone();
-    let model_name = execution
-        .model
+    let model_name = model
         .clone()
         .unwrap_or_else(|| agent_template.options().model.clone());
     // 插件模型调用与主 Agent 使用相同的流式开关：部分代理会强制断开
     // 长时间无数据的非流式连接，摘要这类长请求必须跟随配置的传输方式。
     let model_stream = agent_template.options().stream;
-    let runtime_limits = plugin_runtime_limits(&execution.execution_policy);
-    let runtime = match execution.run_observer {
-        Some(observer) => AgentRuntime::new_with_run_observer(runtime_limits, observer),
-        None => AgentRuntime::new(runtime_limits),
-    }
-    .context("创建 TUI Agent Runtime 失败")?;
     let controller_profile =
         AgentProfileId::new("tui-controller").context("创建 TUI controller profile 失败")?;
     runtime
@@ -220,10 +258,9 @@ pub(crate) async fn load_plugins_for_tui(
         )
         .await
         .context("注册 TUI controller profile 失败")?;
-    let model_output_limit = plugin_model_output_limit(&execution.execution_policy);
-    let mut host_services =
-        PluginHostServices::new().restrict_execution_policy(&execution.execution_policy);
-    if let Some(state_dir) = execution.persistent_state_dir {
+    let model_output_limit = plugin_model_output_limit(&execution_policy);
+    let mut host_services = PluginHostServices::new().restrict_execution_policy(&execution_policy);
+    if let Some(state_dir) = persistent_state_dir {
         host_services = host_services.with_persistent_state_dir(state_dir)?;
     }
     let host_services = host_services

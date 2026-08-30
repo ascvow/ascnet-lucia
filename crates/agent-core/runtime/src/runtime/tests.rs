@@ -631,6 +631,61 @@ async fn cancellation_is_idempotent_and_terminal() {
     );
 }
 
+/// 应用级取消必须终止全部活动任务，但保留 controller 以便后续再次派生。
+#[tokio::test]
+async fn cancel_active_runs_preserves_ready_controllers() {
+    let entered = Arc::new(AtomicBool::new(false));
+    let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(
+                Arc::new(BlockingModel {
+                    entered: entered.clone(),
+                    release: Arc::new(Notify::new()),
+                }),
+                "blocking",
+                &[],
+            ),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let first = api
+        .spawn(AgentSpawnRequest::new("首次后台任务"))
+        .await
+        .expect("派生首次后台任务");
+
+    for _ in 0..100 {
+        if entered.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runtime.cancel_active_runs().await, 1);
+    assert_eq!(
+        api.wait(&first.id).await.expect("等待首次取消终态"),
+        AgentOutcome::Cancelled
+    );
+    assert_eq!(
+        api.status(&root.id)
+            .await
+            .expect("读取 controller 状态")
+            .status,
+        AgentStatus::Ready
+    );
+
+    let second = api
+        .spawn(AgentSpawnRequest::new("再次后台任务"))
+        .await
+        .expect("保留的 controller 应可再次派生");
+    assert_eq!(runtime.cancel_active_runs().await, 1);
+    assert_eq!(
+        api.wait(&second.id).await.expect("等待再次取消终态"),
+        AgentOutcome::Cancelled
+    );
+}
+
 /// controller 可以向运行中的后代注入消息，且消息进入同一私有会话的下一轮。
 #[tokio::test]
 async fn steer_injects_message_into_running_descendant() {

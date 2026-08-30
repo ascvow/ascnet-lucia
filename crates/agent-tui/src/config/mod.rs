@@ -47,8 +47,8 @@ stream = true
 [tui]
 sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
-# 插件无工具模型调用使用的独立小模型；权限插件的“帮我审批”模式使用该路由。
-plugin_model = "gpt-5.6-luna"
+# 权限插件“帮我审批”模式使用的独立审核模型。
+review_model = "gpt-5.6-luna"
 "#;
 
 /// 配置文件中由 TUI 消费的应用设置。
@@ -75,8 +75,9 @@ pub(crate) struct TuiSettings {
     pub(crate) resume_latest: bool,
     /// Agent 事件 JSONL 路径；相对路径以配置文件目录为基准。
     pub(crate) events_jsonl: Option<PathBuf>,
-    /// 插件无工具模型完成使用的独立模型 ID；缺省时沿用主模型以兼容旧配置。
-    pub(crate) plugin_model: Option<String>,
+    /// 权限插件代审使用的独立模型 ID；旧 `plugin_model` 字段仍可读取以兼容已有配置。
+    #[serde(alias = "plugin_model")]
+    pub(crate) review_model: Option<String>,
 }
 
 /// 只反序列化根配置中的 TUI 字段，模型和插件字段由各自 crate 处理。
@@ -178,8 +179,8 @@ pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
     let config: TuiConfigEnvelope =
         toml::from_str(&text).with_context(|| format!("解析 TUI 配置失败：{}", path.display()))?;
     let mut settings = config.tui;
-    settings.plugin_model = settings
-        .plugin_model
+    settings.review_model = settings
+        .review_model
         .filter(|model| !model.trim().is_empty());
     settings.context_window = config.model.context_window.filter(|window| *window > 0);
     let provider_id =
@@ -337,13 +338,31 @@ mod tests {
         let settings = load_tui_settings(&path).expect("模板应可解析");
         assert_eq!(settings.sessions_dir, Some(PathBuf::from("projects")));
         assert_eq!(settings.context_window, None);
-        assert_eq!(settings.plugin_model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(settings.review_model.as_deref(), Some("gpt-5.6-luna"));
         assert_eq!(settings.default_session, None);
         assert!(!settings.resume_latest);
 
         let error = initialize_config(&path).expect_err("重复初始化必须拒绝覆盖");
         assert!(error.to_string().contains("未覆盖"));
         fs::remove_dir_all(root).expect("清理测试目录");
+    }
+
+    /// 旧 `plugin_model` 配置必须继续映射到审核模型，避免升级后静默改用主模型。
+    #[test]
+    fn loads_legacy_plugin_model_as_review_model() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("创建兼容配置测试目录");
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "[model]\nmodel = \"gpt-test\"\n[tui]\nplugin_model = \"legacy-review\"\n",
+        )
+        .expect("写入旧审核模型配置");
+
+        let settings = load_tui_settings(&path).expect("读取旧审核模型配置");
+
+        assert_eq!(settings.review_model.as_deref(), Some("legacy-review"));
+        fs::remove_dir_all(root).expect("清理兼容配置测试目录");
     }
 
     /// 模型上下文窗口由 TUI 作为展示元数据读取，零值按未配置处理。

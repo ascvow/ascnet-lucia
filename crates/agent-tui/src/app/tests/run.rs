@@ -689,3 +689,47 @@ fn escape_interrupts_running_agent_without_clearing_input() {
     assert_eq!(app.input, "尚未发送的引导");
     assert!(!app.should_quit);
 }
+
+/// 用户取消完成时必须保留 Esc 瞬间的可见文本，不得用含迟到内容的 Session 重建消息区。
+#[test]
+fn cancelled_completion_keeps_frozen_visible_history() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.append_model_delta("取消前可见");
+    app.run_stream_cancelled = true;
+    app.messages
+        .push(Msg::new(MsgKind::Info, "Cancelling the current run..."));
+    let mut completed = app.session_record.clone();
+    completed.session.push_assistant_text("取消后的迟到正文");
+
+    let queue_may_advance = app.handle_agent_done(AgentCompletion {
+        run: Some(AgentRun {
+            run_id: "cancelled-run".into(),
+            final_text: "取消后的迟到正文".into(),
+            steps_used: 1,
+            usage: Default::default(),
+            session: completed.session.clone(),
+            cancelled: true,
+        }),
+        session_record: completed,
+        error: None,
+        input_committed: true,
+        queue_may_advance: true,
+        input: "测试取消".into(),
+    });
+
+    assert!(!queue_may_advance);
+    assert!(app
+        .messages
+        .iter()
+        .any(|message| message.text == "取消前可见"));
+    assert!(app
+        .messages
+        .iter()
+        .all(|message| message.text != "取消后的迟到正文"));
+    assert!(app
+        .messages
+        .iter()
+        .any(|message| message.text == "Run cancelled; visible output was frozen"));
+}

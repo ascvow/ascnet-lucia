@@ -233,6 +233,8 @@ impl ExtensionEvent {
 pub enum EventPresentationTarget {
     /// Lucia 主事件列表。
     MainEventList,
+    /// 应用底部状态栏；同一可信插件来源的新状态会覆盖旧状态。
+    Footer,
 }
 
 /// 扩展事件的展示形态。
@@ -284,6 +286,18 @@ impl EventPresentation {
         Self {
             target: EventPresentationTarget::MainEventList,
             variant: EventPresentationVariant::Divider,
+            tone,
+            text: text.into(),
+        }
+    }
+
+    /// 创建应用底部状态栏中的持久状态展示。
+    ///
+    /// 宿主按可信插件来源保存最近一条状态；不支持底栏的消费者可以安全忽略该提示。
+    pub fn footer(text: impl Into<String>, tone: EventPresentationTone) -> Self {
+        Self {
+            target: EventPresentationTarget::Footer,
+            variant: EventPresentationVariant::Text,
             tone,
             text: text.into(),
         }
@@ -1410,5 +1424,18 @@ mod tests {
         assert_eq!(event.data["action"]["action"], "push");
         assert_eq!(event.data["action"]["view"]["instance_id"], "agent-1");
         assert_eq!(event.presentation, None);
+    }
+
+    /// 底栏展示构造器必须序列化为加法目标，不改变扩展事件的稳定 JSON 外壳。
+    #[test]
+    fn footer_presentation_uses_stable_target() {
+        let presentation =
+            EventPresentation::footer("Permission: review", EventPresentationTone::Muted);
+        let encoded = serde_json::to_value(presentation).expect("序列化底栏展示");
+
+        assert_eq!(encoded["target"], "footer");
+        assert_eq!(encoded["variant"], "text");
+        assert_eq!(encoded["tone"], "muted");
+        assert_eq!(encoded["text"], "Permission: review");
     }
 }
