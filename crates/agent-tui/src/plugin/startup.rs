@@ -5,8 +5,8 @@ use agent_plugin_host::manifest::PluginManifest;
 use agent_plugin_host::wasm::load_wasm_plugins_progressively_with_selection_and_services;
 use agent_plugin_host::{LivePluginHost, PluginHostServices};
 use agent_runtime::{
-    AgentDeriveConfig, AgentPermissions, AgentProfileId, AgentRuntime, AgentTemplate, RuntimeLimits,
-    ToolAccess,
+    AgentDeriveConfig, AgentPermissions, AgentProfileId, AgentRuntime, AgentTemplate,
+    RuntimeLimits, ToolAccess,
 };
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -246,6 +246,7 @@ pub(crate) async fn load_plugins_for_tui(
     capability_selection: HashMap<String, String>,
     agent_template: AgentTemplate,
     execution: PluginExecutionContext,
+    workspace_scope: String,
     live_host: Arc<LivePluginHost>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
@@ -279,6 +280,10 @@ pub(crate) async fn load_plugins_for_tui(
         .context("注册 TUI controller profile 失败")?;
     let model_output_limit = plugin_model_output_limit(&execution_policy);
     let mut host_services = PluginHostServices::new().restrict_execution_policy(&execution_policy);
+    host_services = host_services.with_activation_metadata(
+        "permission",
+        HashMap::from([("workspace_scope".to_string(), workspace_scope)]),
+    )?;
     if let Some(state_dir) = persistent_state_dir {
         host_services = host_services.with_persistent_state_dir(state_dir)?;
     }
@@ -343,9 +348,17 @@ mod tests {
         let config = worker_agent_derive_config();
 
         for allowed in WORKER_READ_ONLY_TOOLS {
-            assert!(config.permissions.tools.permits(allowed), "应允许 {allowed}");
+            assert!(
+                config.permissions.tools.permits(allowed),
+                "应允许 {allowed}"
+            );
         }
-        for denied in ["write_file", "shell", "process_exec", "future_dangerous_tool"] {
+        for denied in [
+            "write_file",
+            "shell",
+            "process_exec",
+            "future_dangerous_tool",
+        ] {
             assert!(
                 !config.permissions.tools.permits(denied),
                 "worker 不得获得 {denied}"

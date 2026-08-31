@@ -190,6 +190,36 @@ fn responses_reasoning_off_omits_reasoning_object() {
     assert!(body.get("reasoning").is_none());
 }
 
+/// Responses 与 Chat 适配器都不得让 provider_options 覆盖可信输出上限。
+#[test]
+fn provider_options_cannot_override_trusted_output_limits() {
+    let mut responses_request = ModelRequest::new("gpt-test", Vec::new());
+    responses_request.max_tokens = Some(128);
+    responses_request.provider_options = json!({
+        "max_output_tokens": 99_999,
+        "max_tokens": 88_888,
+        "n": 4
+    });
+    let responses_body = build_responses_request(responses_request, RESPONSES_PARAMS_COMPATIBLE)
+        .expect("Responses 请求应成功构建");
+
+    let mut chat_request = ModelRequest::new("gpt-test", Vec::new());
+    chat_request.max_tokens = Some(256);
+    chat_request.provider_options = json!({
+        "max_tokens": 99_999,
+        "max_completion_tokens": 88_888,
+        "best_of": 3
+    });
+    let chat_body = build_chat_completions_request(chat_request).expect("Chat 请求应成功构建");
+
+    assert_eq!(responses_body["max_output_tokens"], 128);
+    assert_eq!(responses_body["max_tokens"], 128);
+    assert_eq!(responses_body["n"], 1);
+    assert_eq!(chat_body["max_tokens"], 256);
+    assert_eq!(chat_body["max_completion_tokens"], 256);
+    assert_eq!(chat_body["best_of"], 1);
+}
+
 /// Responses SSE 文本增量会实时发送并进入最终聚合文本。
 #[tokio::test]
 async fn responses_sse_emits_and_aggregates_text_delta() {

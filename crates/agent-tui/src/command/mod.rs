@@ -21,6 +21,8 @@ use agent_core::Agent;
 use agent_session::{SessionId, SessionSummary};
 use anyhow::{anyhow, Result};
 use crossterm::event::{KeyCode, KeyModifiers};
+#[cfg(feature = "plugins")]
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 原生命令面板最多展示的候选数。
@@ -191,6 +193,9 @@ pub(crate) struct NativePluginDialogData {
     pub(crate) plugins: Vec<agent_plugin_manager::InstalledPlugin>,
     /// 不参与当前运行时加载的人工安装版本历史。
     pub(crate) version_history: Vec<agent_plugin_manager::InstalledPlugin>,
+    /// 按插件 ID 索引的 Host 校验授权 profile，包含 manifest 与 ABI 固有权限。
+    pub(crate) authorizations:
+        HashMap<String, agent_plugin_host::audit::PluginAuthorizationProfile>,
 }
 
 /// 插件管理页的异步状态。
@@ -227,6 +232,28 @@ pub(crate) enum NativePluginPathMode {
     ClearCapabilityOwner,
 }
 
+/// 第一次 `e` 绑定的插件启用确认，第二次确认只能提交同一 Bundle 身份。
+#[cfg(feature = "plugins")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingPluginEnable {
+    /// 插件稳定 ID。
+    pub(crate) plugin_id: String,
+    /// 用户查看来源与能力时对应的不可变 Bundle 身份。
+    pub(crate) bundle_identity: agent_plugin_manager::PluginBundleIdentity,
+}
+
+/// 禁用插件被选择为 Capability Owner 后，等待独立启用确认的用户意图。
+#[cfg(feature = "plugins")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingCapabilityOwnerSelection {
+    /// Capability 稳定 ID。
+    pub(crate) capability_id: String,
+    /// 等待来源与能力确认的插件稳定 ID。
+    pub(crate) plugin_id: String,
+    /// Owner 意图创建时用户看到的不可变 Bundle 身份。
+    pub(crate) bundle_identity: agent_plugin_manager::PluginBundleIdentity,
+}
+
 /// 插件管理页的完整交互状态。
 #[cfg(feature = "plugins")]
 #[derive(Debug)]
@@ -241,6 +268,12 @@ pub(crate) struct NativePluginDialog {
     pub(crate) path_input: String,
     /// 第一次删除按键记录的插件 ID；再次确认才执行。
     pub(crate) remove_confirmation: Option<String>,
+    /// 第一次启用按键记录的 Bundle 身份；再次确认只能启用该精确身份。
+    pub(crate) enable_confirmation: Option<PendingPluginEnable>,
+    /// 禁用插件的待确认 Capability Owner 选择；任一无关操作都会使其失效。
+    pub(crate) pending_owner_selection: Option<PendingCapabilityOwnerSelection>,
+    /// 启用审查页的垂直滚动行；只影响展示，不参与授权身份比较。
+    pub(crate) review_scroll: u16,
 }
 
 /// TUI 原生命令状态；不依赖 Plugin Host，纯 Core 构建同样可用。
@@ -632,9 +665,19 @@ impl App {
 async fn load_native_plugin_dialog(
     service: &PluginManagementService,
 ) -> Result<NativePluginDialogData> {
+    let plugins = service.list()?;
+    let authorizations = plugins
+        .iter()
+        .map(|plugin| {
+            service
+                .authorization_profile(plugin)
+                .map(|profile| (plugin.id.clone(), profile))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
     Ok(NativePluginDialogData {
-        plugins: service.list()?,
+        plugins,
         version_history: service.list_version_history()?,
+        authorizations,
     })
 }
 

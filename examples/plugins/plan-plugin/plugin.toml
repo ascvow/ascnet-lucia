@@ -8,3 +8,7 @@ description = "提供计划更新、查询、校验、紧凑进度架和完整�
 
 [capabilities]
 # 计划插件只使用实例内状态和声明式 UI，不申请文件、网络、进程或密钥能力。
+
+[capabilities.tool_scopes]
+update_plan = "control"
+get_plan = "control"

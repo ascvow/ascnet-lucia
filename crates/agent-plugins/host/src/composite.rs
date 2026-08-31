@@ -5,8 +5,8 @@ use crate::manifest;
 use crate::service::{PluginService, PluginServiceCall};
 use crate::services::UiRoutes;
 use crate::ui::{
-    ToolRenderContext, ToolRenderRequest, ToolRendererContribution, UiDeclaration, UiFrame,
-    UiInput, UiRenderRequest,
+    ToolRenderContext, ToolRenderRequest, ToolRenderState, ToolRendererContribution, UiDeclaration,
+    UiFrame, UiInput, UiRenderRequest,
 };
 use agent_core::model::ModelMessage;
 use agent_core::AgentEvent;
@@ -15,9 +15,9 @@ use agent_core::ContextLoadRequest;
 use agent_core::ContextLoader;
 use agent_core::LoadedContext;
 use agent_core::ToolDecision;
-use agent_tool::ToolResult;
 use agent_tool::ToolSpec;
 use agent_tool::{ToolCall, ToolPermissionScope};
+use agent_tool::{ToolErrorKind, ToolResult};
 use anyhow::anyhow;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -151,10 +151,11 @@ impl CompositePluginHost {
         let Some(host) = self.get(&renderer.plugin_id) else {
             return Ok(None);
         };
+        let context = redact_permission_denial_for_guest(context);
         host.render_tool(&ToolRenderRequest {
             plugin_id: renderer.plugin_id,
             renderer_id: renderer.renderer_id,
-            context: context.clone(),
+            context,
         })
         .await
     }
@@ -199,6 +200,13 @@ impl CompositePluginHost {
             None => call.permission_scope,
         });
         call.bind_permission_scope(permission_scope);
+        if let Some(previous) = previous {
+            // Guest 只能改写目标和参数；调用关联键与运行身份始终继承可信输入。
+            call.id.clone_from(&previous.id);
+            if let Some(run_id) = previous.run_id.as_deref() {
+                call.bind_run_id(run_id);
+            }
+        }
         Ok(call)
     }
 
@@ -215,6 +223,29 @@ impl CompositePluginHost {
     }
 }
 
+/// 为 Guest 工具 renderer 隐去可信执行层保存的审批详情。
+///
+/// TUI 仍持有原始上下文用于默认展示；这里只构造跨越 Host/Guest 边界的副本，避免工具
+/// owner 通过自定义 renderer 读取审批模型理由或其他仅面向用户的权限诊断。
+fn redact_permission_denial_for_guest(context: &ToolRenderContext) -> ToolRenderContext {
+    let mut redacted = context.clone();
+    let ToolRenderState::Finished { result } = &context.state else {
+        return redacted;
+    };
+    if result.error_kind != Some(ToolErrorKind::PermissionDenied) {
+        return redacted;
+    }
+    redacted.state = ToolRenderState::Finished {
+        result: ToolResult::error_with_kind(
+            result.call_id.clone(),
+            result.name.clone(),
+            ToolErrorKind::PermissionDenied,
+            "工具调用未获批准",
+        ),
+    };
+    redacted
+}
+
 #[async_trait]
 impl AgentExtension for CompositePluginHost {
     async fn prompt_messages(&self) -> Result<Vec<ModelMessage>> {
@@ -225,12 +256,45 @@ impl AgentExtension for CompositePluginHost {
         Ok(messages)
     }
 
+    async fn prompt_messages_for_run(&self, run_id: &str) -> Result<Vec<ModelMessage>> {
+        let mut messages = Vec::new();
+        for host in &self.hosts {
+            messages.extend(host.prompt_messages_for_run(run_id).await?);
+        }
+        Ok(messages)
+    }
+
     async fn list_tools(&self) -> Result<Vec<ToolSpec>> {
         let mut tools = Vec::new();
         let mut routes = HashMap::new();
         let mut permission_scopes = HashMap::new();
         for host in &self.hosts {
             for tool in host.list_tools().await? {
+                tool.validate_name()?;
+                if routes.insert(tool.name.clone(), host.clone()).is_some() {
+                    return Err(anyhow!("插件公开了重复工具：{}", tool.name));
+                }
+                permission_scopes.insert(tool.name.clone(), tool.permission_scope);
+                tools.push(tool);
+            }
+        }
+        *self
+            .tool_routes
+            .write()
+            .map_err(|_| anyhow!("插件工具路由锁已中毒"))? = routes;
+        *self
+            .tool_permission_scopes
+            .write()
+            .map_err(|_| anyhow!("插件工具权限 scope 锁已中毒"))? = permission_scopes;
+        Ok(tools)
+    }
+
+    async fn list_tools_for_run(&self, run_id: &str) -> Result<Vec<ToolSpec>> {
+        let mut tools = Vec::new();
+        let mut routes = HashMap::new();
+        let mut permission_scopes = HashMap::new();
+        for host in &self.hosts {
+            for tool in host.list_tools_for_run(run_id).await? {
                 tool.validate_name()?;
                 if routes.insert(tool.name.clone(), host.clone()).is_some() {
                     return Err(anyhow!("插件公开了重复工具：{}", tool.name));
@@ -263,6 +327,19 @@ impl AgentExtension for CompositePluginHost {
         }
     }
 
+    async fn call_tool_for_run(&self, run_id: &str, call: ToolCall) -> Result<Option<ToolResult>> {
+        let host = self
+            .tool_routes
+            .read()
+            .map_err(|_| anyhow!("插件工具路由锁已中毒"))?
+            .get(&call.name)
+            .cloned();
+        match host {
+            Some(host) => host.call_tool_for_run(run_id, call).await,
+            None => Ok(None),
+        }
+    }
+
     async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
         let mut current = self.bind_tool_permission_scope(None, call.clone())?;
         let policy_owner = self
@@ -277,7 +354,15 @@ impl AgentExtension for CompositePluginHost {
             }
             match host.before_tool(&current).await? {
                 ToolDecision::Allow => {}
-                ToolDecision::Block { reason } => return Ok(ToolDecision::Block { reason }),
+                ToolDecision::Block {
+                    reason,
+                    agent_guidance,
+                } => {
+                    return Ok(ToolDecision::Block {
+                        reason,
+                        agent_guidance,
+                    })
+                }
                 ToolDecision::CancelRun { reason } => {
                     return Ok(ToolDecision::CancelRun { reason });
                 }
@@ -289,17 +374,94 @@ impl AgentExtension for CompositePluginHost {
 
         if let Some(owner) = policy_owner {
             let Some(policy) = self.get(&owner) else {
-                return Ok(ToolDecision::Block {
-                    reason: format!("工具策略插件 `{owner}` 仍在加载，本轮暂不执行工具"),
-                });
+                return Ok(ToolDecision::block_with_guidance(
+                    format!("工具策略插件 `{owner}` 仍在加载，本轮暂不执行工具"),
+                    "工具策略插件尚未就绪，当前调用未执行；请先继续处理无需该工具的部分，必要时稍后再尝试。",
+                ));
             };
             match policy.before_tool(&current).await? {
                 ToolDecision::Allow => {}
-                ToolDecision::Block { reason } => return Ok(ToolDecision::Block { reason }),
+                ToolDecision::Block {
+                    reason,
+                    agent_guidance,
+                } => {
+                    return Ok(ToolDecision::Block {
+                        reason,
+                        agent_guidance,
+                    })
+                }
                 ToolDecision::CancelRun { reason } => {
                     return Ok(ToolDecision::CancelRun { reason });
                 }
-                ToolDecision::Rewrite { call } => current = call,
+                ToolDecision::Rewrite { call } => {
+                    current = self.bind_tool_permission_scope(Some(&current), call)?;
+                }
+            }
+        }
+
+        if &current == call {
+            Ok(ToolDecision::Allow)
+        } else {
+            Ok(ToolDecision::Rewrite { call: current })
+        }
+    }
+
+    async fn before_tool_for_run(&self, run_id: &str, call: &ToolCall) -> Result<ToolDecision> {
+        let mut current = self.bind_tool_permission_scope(None, call.clone())?;
+        let policy_owner = self
+            .capability_owner(manifest::TOOL_POLICY_CAPABILITY)
+            .map(str::to_string);
+        for host in &self.hosts {
+            if host
+                .id()
+                .is_some_and(|id| Some(id) == policy_owner.as_deref())
+            {
+                continue;
+            }
+            match host.before_tool_for_run(run_id, &current).await? {
+                ToolDecision::Allow => {}
+                ToolDecision::Block {
+                    reason,
+                    agent_guidance,
+                } => {
+                    return Ok(ToolDecision::Block {
+                        reason,
+                        agent_guidance,
+                    })
+                }
+                ToolDecision::CancelRun { reason } => {
+                    return Ok(ToolDecision::CancelRun { reason });
+                }
+                ToolDecision::Rewrite { call } => {
+                    current = self.bind_tool_permission_scope(Some(&current), call)?;
+                }
+            }
+        }
+
+        if let Some(owner) = policy_owner {
+            let Some(policy) = self.get(&owner) else {
+                return Ok(ToolDecision::block_with_guidance(
+                    format!("工具策略插件 `{owner}` 仍在加载，本轮暂不执行工具"),
+                    "工具策略插件尚未就绪，当前调用未执行；请先继续处理无需该工具的部分，必要时稍后再尝试。",
+                ));
+            };
+            match policy.before_tool_for_run(run_id, &current).await? {
+                ToolDecision::Allow => {}
+                ToolDecision::Block {
+                    reason,
+                    agent_guidance,
+                } => {
+                    return Ok(ToolDecision::Block {
+                        reason,
+                        agent_guidance,
+                    })
+                }
+                ToolDecision::CancelRun { reason } => {
+                    return Ok(ToolDecision::CancelRun { reason });
+                }
+                ToolDecision::Rewrite { call } => {
+                    current = self.bind_tool_permission_scope(Some(&current), call)?;
+                }
             }
         }
 
@@ -317,9 +479,23 @@ impl AgentExtension for CompositePluginHost {
         Ok(())
     }
 
+    async fn after_tool_for_run(&self, run_id: &str, result: &ToolResult) -> Result<()> {
+        for host in &self.hosts {
+            host.after_tool_for_run(run_id, result).await?;
+        }
+        Ok(())
+    }
+
     async fn on_event(&self, event: &AgentEvent) -> Result<()> {
         for host in &self.hosts {
             host.on_event(event).await?;
+        }
+        Ok(())
+    }
+
+    async fn on_event_for_run(&self, run_id: &str, event: &AgentEvent) -> Result<()> {
+        for host in &self.hosts {
+            host.on_event_for_run(run_id, event).await?;
         }
         Ok(())
     }
@@ -330,6 +506,28 @@ impl AgentExtension for CompositePluginHost {
             events.extend(host.drain_events().await?);
         }
         Ok(events)
+    }
+
+    async fn drain_events_for_run(&self, run_id: &str) -> Result<Vec<serde_json::Value>> {
+        let mut events = Vec::new();
+        for host in &self.hosts {
+            events.extend(host.drain_events_for_run(run_id).await?);
+        }
+        Ok(events)
+    }
+
+    async fn finish_run(&self, run_id: &str) -> Result<()> {
+        let mut errors = Vec::new();
+        for host in &self.hosts {
+            if let Err(error) = host.finish_run(run_id).await {
+                let id = host.id().unwrap_or("<anonymous>");
+                errors.push(format!("插件 `{id}`：{error:#}"));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(anyhow!("插件运行清理失败：{}", errors.join("；")));
+        }
+        Ok(())
     }
 }
 

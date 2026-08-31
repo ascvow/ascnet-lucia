@@ -118,6 +118,8 @@ pub enum WorkspaceError {
     NoFilesystem,
     /// 路径不存在或无法解析。
     Unresolvable(String),
+    /// 目标命中凭据、私钥或版本库内部路径。
+    Sensitive,
 }
 
 impl fmt::Display for WorkspaceError {
@@ -129,6 +131,7 @@ impl fmt::Display for WorkspaceError {
             Self::Escape => f.write_str("路径超出允许的工作区范围"),
             Self::NoFilesystem => f.write_str("当前执行策略禁止访问文件系统"),
             Self::Unresolvable(reason) => write!(f, "无法解析路径：{reason}"),
+            Self::Sensitive => f.write_str("路径指向受保护的凭据或版本库内部文件"),
         }
     }
 }
@@ -142,7 +145,9 @@ impl WorkspaceError {
     /// Runtime 在确认结果来自原生工具后生成可信 Incident。
     pub const fn tool_error_kind(&self) -> crate::ToolErrorKind {
         match self {
-            Self::Denied(_) | Self::NoFilesystem => crate::ToolErrorKind::PermissionDenied,
+            Self::Denied(_) | Self::NoFilesystem | Self::Sensitive => {
+                crate::ToolErrorKind::PermissionDenied
+            }
             Self::Escape => crate::ToolErrorKind::PathBoundaryViolation,
             Self::Unresolvable(_) => crate::ToolErrorKind::Execution,
         }
@@ -262,6 +267,20 @@ impl WorkspaceGuard {
         }
     }
 
+    /// 按规范路径检查敏感文件；有根守卫只检查根内相对部分，避免父目录名称误伤。
+    fn ensure_not_sensitive(&self, resolved: &Path) -> Result<(), WorkspaceError> {
+        let relative = self
+            .root
+            .as_ref()
+            .and_then(|root| resolved.strip_prefix(root).ok())
+            .unwrap_or(resolved);
+        if is_sensitive_path(relative) {
+            Err(WorkspaceError::Sensitive)
+        } else {
+            Ok(())
+        }
+    }
+
     /// 检查能力并在缺失时返回拒绝。
     fn ensure_capability(&self, capability: FileCapability) -> Result<(), WorkspaceError> {
         if self.denied {
@@ -293,6 +312,7 @@ impl WorkspaceGuard {
             .canonicalize()
             .map_err(|error| WorkspaceError::Unresolvable(error.to_string()))?;
         self.ensure_contained(&resolved)?;
+        self.ensure_not_sensitive(&resolved)?;
         Ok(resolved)
     }
 
@@ -318,6 +338,7 @@ impl WorkspaceGuard {
                 .canonicalize()
                 .map_err(|error| WorkspaceError::Unresolvable(error.to_string()))?;
             self.ensure_contained(&resolved)?;
+            self.ensure_not_sensitive(&resolved)?;
             return Ok(resolved);
         }
 
@@ -351,8 +372,31 @@ impl WorkspaceGuard {
         }
 
         self.ensure_contained(&resolved)?;
+        self.ensure_not_sensitive(&resolved)?;
         Ok(resolved)
     }
+}
+
+/// 判断路径是否包含常见密钥、身份、凭据或版本库内部文件名。
+pub fn is_sensitive_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let Component::Normal(segment) = component else {
+            return false;
+        };
+        let name = segment.to_string_lossy().to_ascii_lowercase();
+        name == ".git"
+            || name == ".ssh"
+            || name == ".gnupg"
+            || name == ".aws"
+            || name == ".config"
+            || name == "credentials"
+            || name == "id_rsa"
+            || name == "id_ed25519"
+            || name.starts_with(".env")
+            || name.ends_with(".pem")
+            || name.ends_with(".key")
+            || name.ends_with(".p12")
+    })
 }
 
 impl Default for WorkspaceGuard {
@@ -420,6 +464,25 @@ mod tests {
             .expect_err("指向工作区外的符号链接必须被拒绝");
         assert_eq!(error, WorkspaceError::Escape);
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// 指向工作区内敏感文件的无害别名仍必须按规范目标拒绝。
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_alias_to_sensitive_file() {
+        let base = temp_workspace("sensitive-symlink");
+        let sensitive = base.join("inside/.env.local");
+        fs::write(&sensitive, "TOKEN=secret").expect("应创建敏感测试文件");
+        let alias = base.join("inside/settings.txt");
+        std::os::unix::fs::symlink(&sensitive, &alias).expect("应创建敏感文件别名");
+        let guard = WorkspaceGuard::rooted(base.join("inside")).expect("应创建守卫");
+
+        let error = guard
+            .resolve_existing("settings.txt", FileCapability::Read)
+            .expect_err("敏感文件别名必须拒绝");
+
+        assert_eq!(error, WorkspaceError::Sensitive);
         let _ = fs::remove_dir_all(&base);
     }
 

@@ -15,11 +15,11 @@
 | `max_steps` | `usize` | 单条用户指令连续执行的 ReAct 步数；`0` 表示不设总上限 |
 | `system_prompt` | `String` | 新 Session 缺少 system 时写入的默认提示 |
 | `tool_choice` | `ToolChoice` | 模型是否以及如何选择工具 |
-| `max_tokens` | `Option<u32>` | 单次响应上限；`None` 表示不发送该字段 |
+| `max_tokens` | `Option<u32>` | 单次响应的可信输出上限；`None` 表示不发送该字段 |
 | `stream` | `bool` | 是否使用模型流式接口；默认 `true`，设为 `false` 时等待完整响应 |
 | `temperature` | `Option<f32>` | 采样温度；范围由 adapter 或服务商校验 |
 | `reasoning` | `ReasoningLevel` | 推理等级；不支持的 adapter 可忽略或报错 |
-| `provider_options` | `Value` | 浅合并到服务商请求的专属 JSON 对象 |
+| `provider_options` | `Value` | 浅合并到服务商请求的专属 JSON 对象；内置 adapter 会在合并后恢复输出预算字段 |
 
 `with_provider(provider)`、`with_model(model)`、`with_model_route(provider, model)` 和 `with_stream(stream)` 消费并返回 `AgentOptions`。这些函数只写字段，不验证 provider 是否已经注册。
 
@@ -60,6 +60,8 @@ pub fn new(
 | `set_provider_options(value)` | 整体替换服务商专属 JSON | 不做深合并 |
 
 `set_model_route` 是 `set_model_selection` 的同义入口。`gateway()` 只读访问注册表，`gateway_mut()` 允许高级调用方直接增删 adapter。
+
+内置 OpenAI 与 Anthropic adapter 不允许 `provider_options` 放宽 `max_tokens`：合并后会重新收紧主 token 字段和已出现的常见顶层 token 别名，并把多候选字段固定为一。Anthropic extended thinking 的思考预算包含在同一总上限内。未知或嵌套的私有字段仍由第三方兼容网关解释，因此接入自定义 adapter 时，调用方必须自行保证最终 wire 请求不会突破 `ModelRequest.max_tokens`。
 
 ### Agent 组件函数
 
@@ -191,10 +193,10 @@ pub trait ContextLoader: Send + Sync {
 | 类型 | 关键字段 | 约束 |
 | --- | --- | --- |
 | `ToolSpec` | `name`、`description`、`input_schema`、`permission_scope` | 名称最长 64 字符，只允许 ASCII 字母、数字、`_`、`-`；未声明 scope 时为 `Unknown` |
-| `ToolCall` | `id`、`name`、`args`、`permission_scope` | `id` 必须原样带回 ToolResult；scope 由 Core/Host 从可信 ToolSpec 绑定 |
+| `ToolCall` | `id`、`name`、`args`、`permission_scope`、`run_id` | `id` 必须原样带回 ToolResult；scope 与运行 ID 由 Core/Host 可信绑定 |
 | `ToolResult` | `call_id`、`name`、`content`、`is_error`、`details` | `details` 只给 UI，不发送给模型 |
 
-`ToolPermissionScope` 包含 `Control`、`Read`、`Write`、`Shell`、`Network` 和保守默认值 `Unknown`。`Control` 只用于不扩大宿主资源访问的 Lucia 内部状态、编排操作或已编入可信目录的元数据；`Write` 同时覆盖创建、修改和删除。工具通过 `ToolSpec::with_permission_scope(...)` 声明，Core 会在策略 hook 前覆盖模型或历史调用中的同名字段，Rewrite 后也按目标工具重新绑定。
+`ToolPermissionScope` 包含 `Control`、`Read`、`Write`、`Shell`、`Network` 和保守默认值 `Unknown`。`Control` 只用于不扩大宿主资源访问的 Lucia 内部状态、编排操作或已编入可信目录的元数据；`Write` 同时覆盖创建、修改和删除。工具通过 `ToolSpec::with_permission_scope(...)` 声明，Core 会先清除模型或历史调用自报的 Host 字段，再在策略 hook 前绑定可信 scope 与 `run_id`；Rewrite 后也按当前运行和目标工具重新绑定。
 
 `ToolCall::args_as<T>()` 把 JSON 参数反序列化为强类型，字段不匹配时返回包含工具名的错误。`args_json_string()` 用于协议适配；序列化异常时回退为 `{}`。
 

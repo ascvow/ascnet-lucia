@@ -85,30 +85,40 @@ fn scan_bundle_directory(
     Ok(())
 }
 
-/// 只把运行时必需的 manifest 与 WASM 复制到受管理目录。
+/// 先复制 manifest 到 staging，再仅按 staged manifest 复制运行时 WASM。
 ///
 /// 本地路径可以指向插件开发 crate，但源码、Cargo 缓存、测试和其他未声明文件都不能成为
-/// 已安装 Bundle 的一部分。每个源文件会在复制前重新检查路径组件，避免通过符号链接逃逸。
-pub(crate) fn copy_runtime_bundle(
+/// 已安装 Bundle 的一部分。来源 manifest 只作为待复制文件，身份、能力、依赖和
+/// WASM 路径均从 staging 副本解析；每个源文件会在复制前重新检查路径组件。
+///
+/// 返回已在 staging 中复核 manifest 与 WASM 路径后的不可变授权输入。
+pub(crate) fn copy_runtime_bundle(source: &Path, destination: &Path) -> Result<PluginManifest> {
+    let manifest_relative = PathBuf::from("plugin.toml");
+    copy_runtime_bundle_file(source, destination, &manifest_relative, "plugin.toml")?;
+    let staged_manifest_path = destination.join(&manifest_relative);
+    let staged_manifest =
+        PluginManifest::load(&staged_manifest_path).context("staging 中的插件 manifest 无效")?;
+    let wasm_relative =
+        validate_relative_path(Path::new(&staged_manifest.plugin.wasm), "plugin.wasm")?;
+    copy_runtime_bundle_file(source, destination, &wasm_relative, "plugin.wasm")?;
+    load_and_validate_manifest(destination, &staged_manifest_path)
+}
+
+/// 把单个已约束的运行时文件复制到 staging。
+fn copy_runtime_bundle_file(
     source: &Path,
     destination: &Path,
-    manifest: &PluginManifest,
+    relative: &Path,
+    label: &str,
 ) -> Result<()> {
-    let wasm_relative = validate_relative_path(Path::new(&manifest.plugin.wasm), "plugin.wasm")?;
-    for (relative, label) in [
-        (PathBuf::from("plugin.toml"), "plugin.toml"),
-        (wasm_relative, "plugin.wasm"),
-    ] {
-        let source_file = validate_runtime_bundle_file(source, &relative, label)?;
-        let target = destination.join(&relative);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("无法创建运行时 Bundle 文件父目录：{}", parent.display())
-            })?;
-        }
-        fs::copy(&source_file, &target)
-            .with_context(|| format!("无法复制运行时 Bundle 文件：{}", source_file.display()))?;
+    let source_file = validate_runtime_bundle_file(source, &relative, label)?;
+    let target = destination.join(&relative);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建运行时 Bundle 文件父目录：{}", parent.display()))?;
     }
+    fs::copy(&source_file, &target)
+        .with_context(|| format!("无法复制运行时 Bundle 文件：{}", source_file.display()))?;
     Ok(())
 }
 

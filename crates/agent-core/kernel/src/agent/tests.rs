@@ -19,6 +19,18 @@ struct CapturingModel {
     requests: std::sync::Mutex<Vec<ModelRequest>>,
 }
 
+/// 记录调用次数并拒绝请求的测试门禁。
+struct RejectingModelRequestGate {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ModelRequestGate for RejectingModelRequestGate {
+    fn before_request(&self, _request: &ModelRequest) -> Result<()> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Err(anyhow!("模拟模型资源门禁拒绝"))
+    }
+}
+
 #[async_trait]
 impl ChatModel for CapturingModel {
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse> {
@@ -31,6 +43,31 @@ impl ChatModel for CapturingModel {
 impl ProviderAdapter for CapturingModel {
     fn name(&self) -> &'static str {
         "capturing"
+    }
+}
+
+/// 记录请求并按顺序返回脚本响应，用于验证跨轮次的一次性提示。
+struct CapturingScriptedModel {
+    requests: std::sync::Mutex<Vec<ModelRequest>>,
+    responses: std::sync::Mutex<std::collections::VecDeque<ModelResponse>>,
+}
+
+#[async_trait]
+impl ChatModel for CapturingScriptedModel {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse> {
+        self.requests.lock().expect("模型请求锁不应中毒").push(req);
+        self.responses
+            .lock()
+            .expect("脚本响应锁不应中毒")
+            .pop_front()
+            .ok_or_else(|| anyhow!("脚本响应已耗尽"))
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for CapturingScriptedModel {
+    fn name(&self) -> &'static str {
+        "capturing-scripted"
     }
 }
 
@@ -64,17 +101,187 @@ impl ContextLoader for SummaryContextLoader {
     }
 }
 
+/// 首轮保留用户请求、后续只返回摘要，用于验证审批指导能在工具历史被删除后补成合法工具对。
+struct DroppingToolHistoryContextLoader {
+    visible_requests: Arc<std::sync::Mutex<Vec<Vec<ModelMessage>>>>,
+}
+
+#[async_trait]
+impl ContextLoader for DroppingToolHistoryContextLoader {
+    async fn load(&self, request: ContextLoadRequest) -> Result<crate::LoadedContext> {
+        self.visible_requests
+            .lock()
+            .expect("上下文可见消息记录锁不应中毒")
+            .push(request.messages.clone());
+        if request.step == 0 {
+            return Ok(crate::LoadedContext::passthrough(request));
+        }
+        Ok(crate::LoadedContext::new(
+            request.system,
+            vec![ModelMessage::text(
+                crate::model::MessageRole::Developer,
+                "压缩后已删除工具调用与结果",
+            )],
+        ))
+    }
+}
+
+/// 记录上下文加载边界可见的消息并原样返回，用于验证一次性审批说明不会泄漏给插件。
+struct RecordingContextLoader {
+    messages: Arc<std::sync::Mutex<Vec<Vec<ModelMessage>>>>,
+}
+
+#[async_trait]
+impl ContextLoader for RecordingContextLoader {
+    async fn load(&self, request: ContextLoadRequest) -> Result<crate::LoadedContext> {
+        self.messages
+            .lock()
+            .expect("上下文加载记录锁不应中毒")
+            .push(request.messages.clone());
+        Ok(crate::LoadedContext::passthrough(request))
+    }
+}
+
 /// 发布一次扩展事件的测试扩展。
 struct PublishingExtension {
     events: std::sync::Mutex<Vec<Value>>,
 }
 
+/// 记录扩展实际收到的事件类型，用于验证敏感推理事件不会越过扩展边界。
+struct ObservingEventKindsExtension {
+    kinds: Arc<std::sync::Mutex<Vec<AgentEventKind>>>,
+}
+
+#[async_trait]
+impl AgentExtension for ObservingEventKindsExtension {
+    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
+        self.kinds
+            .lock()
+            .expect("扩展事件记录锁不应中毒")
+            .push(event.kind.clone());
+        Ok(())
+    }
+}
+
 /// 在工具执行前取消当前运行的测试扩展。
 struct CancelRunExtension;
+
+/// 阻止当前工具并向下一次模型请求提供一次性安全指导。
+struct BlockWithGuidanceExtension;
+
+/// 按调用 ID 返回不同审批详情与指导，用于验证同轮多工具不会串线。
+struct PerCallBlockWithGuidanceExtension;
+
+/// 只拒绝指定调用，其余调用放行，用于验证拒绝不会取消同批工具或后续轮次。
+struct BlockSelectedCallExtension {
+    blocked_call_id: String,
+}
+
+/// 拒绝工具并记录扩展实际可见的工具结果与事件视图。
+#[derive(Default)]
+struct ObservingBlockWithGuidanceExtension {
+    after_results: std::sync::Mutex<Vec<ToolResult>>,
+    finished_events: std::sync::Mutex<Vec<AgentEvent>>,
+}
+
+/// 拒绝工具但不提供一次性指导，用于验证失败详情仍不会泄漏给 Session 或第三方扩展。
+#[derive(Default)]
+struct ObservingBlockWithoutGuidanceExtension {
+    after_results: std::sync::Mutex<Vec<ToolResult>>,
+    finished_events: std::sync::Mutex<Vec<AgentEvent>>,
+}
+
+#[async_trait]
+impl AgentExtension for BlockWithGuidanceExtension {
+    async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
+        Ok(ToolDecision::block_with_guidance(
+            "审批模型拒绝：目标路径不在允许范围内",
+            "目标路径不在允许范围内，请改用工作区内的只读方案继续。",
+        ))
+    }
+}
+
+#[async_trait]
+impl AgentExtension for PerCallBlockWithGuidanceExtension {
+    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
+        Ok(ToolDecision::block_with_guidance(
+            format!("审批详情仅属于 {}", call.id),
+            format!("请仅为调用 {} 选择替代方案", call.id),
+        ))
+    }
+}
+
+#[async_trait]
+impl AgentExtension for BlockSelectedCallExtension {
+    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
+        if call.id == self.blocked_call_id {
+            Ok(ToolDecision::block_with_guidance(
+                "审批拒绝了当前调用",
+                "当前调用未获批准，请改用无需该权限的方案继续。",
+            ))
+        } else {
+            Ok(ToolDecision::Allow)
+        }
+    }
+}
+
+#[async_trait]
+impl AgentExtension for ObservingBlockWithGuidanceExtension {
+    async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
+        Ok(ToolDecision::block_with_guidance(
+            "审批模型拒绝：目标路径不在允许范围内",
+            "目标路径不在允许范围内，请改用工作区内的只读方案继续。",
+        ))
+    }
+
+    async fn after_tool(&self, result: &ToolResult) -> Result<()> {
+        self.after_results
+            .lock()
+            .expect("工具结果观察锁不应中毒")
+            .push(result.clone());
+        Ok(())
+    }
+
+    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
+        if event.kind == AgentEventKind::ToolFinished {
+            self.finished_events
+                .lock()
+                .expect("工具事件观察锁不应中毒")
+                .push(event.clone());
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AgentExtension for ObservingBlockWithoutGuidanceExtension {
+    async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
+        Ok(ToolDecision::block("仅可信界面可见的审批失败详情"))
+    }
+
+    async fn after_tool(&self, result: &ToolResult) -> Result<()> {
+        self.after_results
+            .lock()
+            .expect("工具结果观察锁不应中毒")
+            .push(result.clone());
+        Ok(())
+    }
+
+    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
+        if event.kind == AgentEventKind::ToolFinished {
+            self.finished_events
+                .lock()
+                .expect("工具事件观察锁不应中毒")
+                .push(event.clone());
+        }
+        Ok(())
+    }
+}
 
 /// 捕获权限 scope 的测试扩展，用于验证模型字段在进入策略前已被可信定义覆盖。
 struct CapturingPermissionScopeExtension {
     observed: std::sync::Mutex<Vec<ToolPermissionScope>>,
+    observed_run_ids: std::sync::Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait]
@@ -84,6 +291,10 @@ impl AgentExtension for CapturingPermissionScopeExtension {
             .lock()
             .expect("权限 scope 观察锁不应中毒")
             .push(call.permission_scope);
+        self.observed_run_ids
+            .lock()
+            .expect("运行 ID 观察锁不应中毒")
+            .push(call.run_id.clone());
         Ok(ToolDecision::Allow)
     }
 }
@@ -152,8 +363,15 @@ fn default_max_steps_supports_multi_round_tasks() {
 /// `max_steps = 0` 应取消总步数上限，供交互主会话持续完成多轮任务。
 #[tokio::test]
 async fn zero_max_steps_allows_unlimited_tool_rounds() {
-    let call = ToolCall::new("unlimited-call", "echo", json!({"value": "测试"}));
-    let mut responses = vec![ModelResponse::tool_calls(vec![call]); 9];
+    let mut responses = (0..9)
+        .map(|index| {
+            ModelResponse::tool_calls(vec![ToolCall::new(
+                format!("unlimited-call-{index}"),
+                "echo",
+                json!({"value": "测试"}),
+            )])
+        })
+        .collect::<Vec<_>>();
     responses.push(ModelResponse::text("已完成全部工具轮次"));
     let mut agent = agent_with_script(responses).with_tools({
         let mut tools = ToolRegistry::new();
@@ -165,6 +383,35 @@ async fn zero_max_steps_allows_unlimited_tool_rounds() {
     let run = agent.run("执行多轮任务").await.expect("不应触发步数上限");
     assert_eq!(run.final_text, "已完成全部工具轮次");
     assert_eq!(run.steps_used, 10);
+}
+
+/// 可信策略显式设置零步上限时不得沿用调用方 `0` 表示无限的旧语义。
+#[tokio::test]
+async fn policy_zero_max_steps_blocks_before_model_request() {
+    let mut policy = ExecutionPolicy::serve();
+    policy.limits.max_steps = Some(0);
+    let model = Arc::new(ScriptedModel::new(vec![ModelResponse::text(
+        "不应到达模型",
+    )]));
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("zero-step", model.clone())
+        .expect("注册零步测试模型");
+    let mut agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("zero-step", "test-model"),
+    );
+    agent.options_mut().max_steps = 0;
+    agent.set_options(agent.options().clone().with_execution_policy(policy));
+
+    let error = agent
+        .run("不得发起模型请求")
+        .await
+        .expect_err("零步策略必须在模型请求前终止");
+
+    assert_eq!(error.to_string(), "max ReAct steps reached: 0");
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(agent.state().phase, AgentPhase::Failed);
 }
 
 /// Evaluation Candidate 即使持续生成工具调用，也必须在可信策略的步数上限处终止。
@@ -238,6 +485,608 @@ async fn extension_prompt_is_injected_without_persisting_to_session() {
         .all(|message| !matches!(message.role, crate::model::MessageRole::Developer)));
 }
 
+/// 审批拒绝详情只进入事件，一次性指导只作为下一次请求的工具结果，二者都不持久化。
+#[tokio::test]
+async fn blocked_tool_guidance_continues_run_without_persisting_review_reason() {
+    let call = ToolCall::new("blocked-call", "echo", json!({"value": "测试"}));
+    let model = Arc::new(CapturingScriptedModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+        responses: std::sync::Mutex::new(
+            [
+                ModelResponse::tool_calls(vec![call]),
+                ModelResponse::text("已改用安全方案继续"),
+            ]
+            .into(),
+        ),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("capturing-scripted", model.clone())
+        .expect("注册脚本模型应成功");
+    let sink = Arc::new(InMemoryEventSink::new());
+    let context_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut tools = ToolRegistry::new();
+    tools.register(echo_tool()).expect("注册 echo 工具");
+    let observer = Arc::new(ObservingBlockWithGuidanceExtension::default());
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("capturing-scripted", "test-model"),
+    )
+    .with_tools(tools)
+    .with_extension(observer.clone())
+    .with_context_loader(Arc::new(RecordingContextLoader {
+        messages: Arc::clone(&context_messages),
+    }))
+    .with_event_sink(sink.clone());
+
+    let run = agent
+        .run("继续完成任务")
+        .await
+        .expect("阻止单个工具后应继续运行");
+
+    assert!(!run.cancelled);
+    assert_eq!(run.final_text, "已改用安全方案继续");
+    let persisted = serde_json::to_string(run.session.messages()).expect("序列化会话");
+    assert!(!persisted.contains("目标路径不在允许范围内"));
+    assert!(persisted.contains("工具调用未获批准"));
+
+    let context_messages = context_messages.lock().expect("上下文加载记录锁不应中毒");
+    assert_eq!(context_messages.len(), 2);
+    let context_visible = serde_json::to_string(&context_messages[1]).expect("序列化加载器消息");
+    assert!(context_visible.contains("工具调用未获批准"));
+    assert!(!context_visible.contains("目标路径不在允许范围内"));
+    assert!(!context_visible.contains("approval-guidance"));
+
+    let requests = model.requests.lock().expect("模型请求锁不应中毒");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().any(|message| {
+        matches!(message.role, crate::model::MessageRole::Tool)
+            && message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    crate::model::ContentBlock::ToolResult { result }
+                        if result.content_text().contains("请改用工作区内的只读方案继续")
+                )
+            })
+    }));
+    assert!(requests[1].messages.iter().all(|message| {
+        !matches!(message.role, crate::model::MessageRole::Developer)
+            || !message
+                .text_content()
+                .contains("请改用工作区内的只读方案继续")
+    }));
+    let events = sink.events().await;
+    let displayed = events
+        .iter()
+        .find(|event| event.kind == AgentEventKind::ToolFinished)
+        .expect("应发布工具失败事件");
+    let displayed: ToolResult =
+        serde_json::from_value(displayed.payload.clone()).expect("解析展示结果");
+    assert!(displayed
+        .content_text()
+        .contains("审批模型拒绝：目标路径不在允许范围内"));
+
+    let extension_results = observer
+        .after_results
+        .lock()
+        .expect("工具结果观察锁不应中毒");
+    assert_eq!(extension_results.len(), 1);
+    assert!(extension_results[0]
+        .content_text()
+        .contains("工具调用未获批准"));
+    assert!(!extension_results[0]
+        .content_text()
+        .contains("目标路径不在允许范围内"));
+    let extension_events = observer
+        .finished_events
+        .lock()
+        .expect("工具事件观察锁不应中毒");
+    assert_eq!(extension_events.len(), 1);
+    let extension_result: ToolResult = serde_json::from_value(extension_events[0].payload.clone())
+        .expect("解析扩展可见的工具结果");
+    assert!(extension_result.content_text().contains("工具调用未获批准"));
+    assert!(!extension_result
+        .content_text()
+        .contains("目标路径不在允许范围内"));
+}
+
+/// 同批工具中一个审批拒绝时，其余已允许调用仍必须正常执行，不能被标记为取消跳过。
+#[tokio::test]
+async fn blocked_tool_does_not_skip_allowed_call_in_same_model_response() {
+    let model = Arc::new(CapturingScriptedModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+        responses: std::sync::Mutex::new(
+            [
+                ModelResponse::tool_calls(vec![
+                    ToolCall::new("blocked-same-batch", "echo", json!({"value": "拒绝"})),
+                    ToolCall::new("allowed-same-batch", "echo", json!({"value": "执行"})),
+                ]),
+                ModelResponse::text("已继续处理允许的调用"),
+            ]
+            .into(),
+        ),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("same-batch-block", model)
+        .expect("注册脚本模型应成功");
+    let mut tools = ToolRegistry::new();
+    tools.register(echo_tool()).expect("注册 echo 工具");
+    let sink = Arc::new(InMemoryEventSink::new());
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("same-batch-block", "test-model"),
+    )
+    .with_tools(tools)
+    .with_extension(Arc::new(BlockSelectedCallExtension {
+        blocked_call_id: "blocked-same-batch".into(),
+    }))
+    .with_event_sink(sink.clone());
+
+    let run = agent
+        .run("执行同批工具")
+        .await
+        .expect("拒绝当前调用后同批其他调用应继续");
+
+    assert!(!run.cancelled);
+    assert_eq!(run.final_text, "已继续处理允许的调用");
+    let events = sink.events().await;
+    let started_calls = events
+        .iter()
+        .filter(|event| event.kind == AgentEventKind::ToolStarted)
+        .map(|event| {
+            serde_json::from_value::<ToolCall>(event.payload.clone()).expect("解析工具开始事件")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(started_calls.len(), 1);
+    assert_eq!(started_calls[0].id, "allowed-same-batch");
+    assert!(events
+        .iter()
+        .all(|event| event.kind != AgentEventKind::ToolSkipped));
+    let persisted = serde_json::to_string(run.session.messages()).expect("序列化会话");
+    assert!(persisted.contains("工具调用未获批准"));
+    assert!(persisted.contains("执行"));
+}
+
+/// 审批指导只替换紧随拒绝之后的一次模型请求，后续轮次只能看到持久化的通用失败文案。
+#[tokio::test]
+async fn blocked_tool_guidance_is_consumed_before_third_model_request() {
+    let model = Arc::new(CapturingScriptedModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+        responses: std::sync::Mutex::new(
+            [
+                ModelResponse::tool_calls(vec![ToolCall::new(
+                    "blocked-once",
+                    "echo",
+                    json!({"value": "拒绝"}),
+                )]),
+                ModelResponse::tool_calls(vec![ToolCall::new(
+                    "allowed-next",
+                    "echo",
+                    json!({"value": "继续"}),
+                )]),
+                ModelResponse::text("完成"),
+            ]
+            .into(),
+        ),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("one-time-guidance", model.clone())
+        .expect("注册脚本模型应成功");
+    let mut tools = ToolRegistry::new();
+    tools.register(echo_tool()).expect("注册 echo 工具");
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("one-time-guidance", "test-model"),
+    )
+    .with_tools(tools)
+    .with_extension(Arc::new(BlockSelectedCallExtension {
+        blocked_call_id: "blocked-once".into(),
+    }));
+
+    agent
+        .run("验证一次性审批指导")
+        .await
+        .expect("拒绝后应完成后续轮次");
+
+    let requests = model.requests.lock().expect("模型请求锁不应中毒");
+    assert_eq!(requests.len(), 3);
+    let second = serde_json::to_string(&requests[1].messages).expect("序列化第二次请求");
+    let third = serde_json::to_string(&requests[2].messages).expect("序列化第三次请求");
+    assert!(second.contains("当前调用未获批准，请改用无需该权限的方案继续"));
+    assert!(!third.contains("当前调用未获批准，请改用无需该权限的方案继续"));
+    assert!(third.contains("工具调用未获批准"));
+}
+
+/// 上下文加载器删除原工具对后，Core 必须在最终请求中补回无参数工具对并注入一次性指导。
+#[tokio::test]
+async fn blocked_tool_guidance_survives_context_loader_dropping_tool_history() {
+    let call = ToolCall::new(
+        "dropped-blocked-call",
+        "echo",
+        json!({"value": "敏感原参数"}),
+    );
+    let model = Arc::new(CapturingScriptedModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+        responses: std::sync::Mutex::new(
+            [
+                ModelResponse::tool_calls(vec![call]),
+                ModelResponse::text("已根据一次性指导继续"),
+            ]
+            .into(),
+        ),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("capturing-scripted", model.clone())
+        .expect("注册脚本模型应成功");
+    let visible_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut tools = ToolRegistry::new();
+    tools.register(echo_tool()).expect("注册 echo 工具");
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("capturing-scripted", "test-model"),
+    )
+    .with_tools(tools)
+    .with_extension(Arc::new(BlockWithGuidanceExtension))
+    .with_context_loader(Arc::new(DroppingToolHistoryContextLoader {
+        visible_requests: Arc::clone(&visible_requests),
+    }));
+
+    let run = agent
+        .run("继续完成任务")
+        .await
+        .expect("阻止工具后应继续运行");
+
+    assert_eq!(run.final_text, "已根据一次性指导继续");
+    let loader_visible = serde_json::to_string(
+        &visible_requests
+            .lock()
+            .expect("上下文可见消息记录锁不应中毒")[1],
+    )
+    .expect("序列化加载器可见消息");
+    assert!(!loader_visible.contains("请改用工作区内的只读方案继续"));
+
+    let requests = model.requests.lock().expect("模型请求锁不应中毒");
+    let second_request = &requests[1].messages;
+    assert!(second_request.iter().any(|message| {
+        matches!(message.role, crate::model::MessageRole::Assistant)
+            && message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    crate::model::ContentBlock::ToolCall { call }
+                        if call.id == "dropped-blocked-call"
+                            && call.name == "echo"
+                            && call.args == json!({})
+                )
+            })
+    }));
+    assert!(second_request.iter().any(|message| {
+        matches!(message.role, crate::model::MessageRole::Tool)
+            && message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    crate::model::ContentBlock::ToolResult { result }
+                        if result.call_id == "dropped-blocked-call"
+                            && result
+                                .content_text()
+                                .contains("请改用工作区内的只读方案继续")
+                )
+            })
+    }));
+    let final_request = serde_json::to_string(second_request).expect("序列化最终模型请求");
+    assert!(!final_request.contains("敏感原参数"));
+}
+
+/// 即使审批扩展未提供一次性指导，完整拒绝原因也只能进入可信事件。
+#[tokio::test]
+async fn blocked_tool_without_guidance_never_persists_or_broadcasts_reason() {
+    let call = ToolCall::new("blocked-without-guidance", "echo", json!({"value": "测试"}));
+    let model = Arc::new(CapturingScriptedModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+        responses: std::sync::Mutex::new(
+            [
+                ModelResponse::tool_calls(vec![call]),
+                ModelResponse::text("已在拒绝后继续"),
+            ]
+            .into(),
+        ),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("block-without-guidance", model.clone())
+        .expect("注册脚本模型应成功");
+    let sink = Arc::new(InMemoryEventSink::new());
+    let mut tools = ToolRegistry::new();
+    tools.register(echo_tool()).expect("注册 echo 工具");
+    let observer = Arc::new(ObservingBlockWithoutGuidanceExtension::default());
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("block-without-guidance", "test-model"),
+    )
+    .with_tools(tools)
+    .with_extension(observer.clone())
+    .with_event_sink(sink.clone());
+
+    let run = agent
+        .run("拒绝后继续")
+        .await
+        .expect("无指导的拒绝也只应阻止当前工具");
+
+    assert_eq!(run.final_text, "已在拒绝后继续");
+    let persisted = serde_json::to_string(run.session.messages()).expect("序列化会话");
+    assert!(persisted.contains("工具调用未获批准"));
+    assert!(!persisted.contains("仅可信界面可见的审批失败详情"));
+
+    let requests = model.requests.lock().expect("模型请求锁不应中毒");
+    assert_eq!(requests.len(), 2);
+    let second_request = serde_json::to_string(&requests[1].messages).expect("序列化第二次请求");
+    assert!(second_request.contains("工具调用未获批准"));
+    assert!(!second_request.contains("仅可信界面可见的审批失败详情"));
+
+    let after_results = observer
+        .after_results
+        .lock()
+        .expect("工具结果观察锁不应中毒");
+    assert_eq!(after_results.len(), 1);
+    assert!(after_results[0].content_text().contains("工具调用未获批准"));
+    assert!(!after_results[0]
+        .content_text()
+        .contains("仅可信界面可见的审批失败详情"));
+    let extension_events = observer
+        .finished_events
+        .lock()
+        .expect("工具事件观察锁不应中毒");
+    assert_eq!(extension_events.len(), 1);
+    let extension_result: ToolResult =
+        serde_json::from_value(extension_events[0].payload.clone()).expect("解析扩展可见工具结果");
+    assert!(extension_result.content_text().contains("工具调用未获批准"));
+    assert!(!extension_result
+        .content_text()
+        .contains("仅可信界面可见的审批失败详情"));
+
+    let trusted_event = sink
+        .events()
+        .await
+        .into_iter()
+        .find(|event| event.kind == AgentEventKind::ToolFinished)
+        .expect("可信事件应包含工具终态");
+    let trusted_result: ToolResult =
+        serde_json::from_value(trusted_event.payload).expect("解析可信工具结果");
+    assert!(trusted_result
+        .content_text()
+        .contains("仅可信界面可见的审批失败详情"));
+}
+
+/// 非流式模型路径也必须在拒绝单个工具后继续，并保持审批详情不进入持久会话。
+#[tokio::test]
+async fn blocked_tool_guidance_continues_in_non_stream_mode() {
+    let call = ToolCall::new("blocked-non-stream", "echo", json!({"value": "测试"}));
+    let model = Arc::new(CapturingScriptedModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+        responses: std::sync::Mutex::new(
+            [
+                ModelResponse::tool_calls(vec![call]),
+                ModelResponse::text("非流式路径已继续"),
+            ]
+            .into(),
+        ),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("capturing-scripted", model.clone())
+        .expect("注册脚本模型应成功");
+    let mut tools = ToolRegistry::new();
+    tools.register(echo_tool()).expect("注册 echo 工具");
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default()
+            .with_model_route("capturing-scripted", "test-model")
+            .with_stream(false),
+    )
+    .with_tools(tools)
+    .with_extension(Arc::new(BlockWithGuidanceExtension));
+
+    let run = agent
+        .run("继续完成任务")
+        .await
+        .expect("非流式拒绝后应继续运行");
+
+    assert_eq!(run.final_text, "非流式路径已继续");
+    let persisted = serde_json::to_string(run.session.messages()).expect("序列化会话");
+    assert!(!persisted.contains("目标路径不在允许范围内"));
+    assert!(persisted.contains("工具调用未获批准"));
+    let requests = model.requests.lock().expect("模型请求锁不应中毒");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(
+                block,
+                crate::model::ContentBlock::ToolResult { result }
+                    if result.content_text().contains("请改用工作区内的只读方案继续")
+            )
+        })
+    }));
+}
+
+/// 同一模型轮次的多个拒绝必须按调用 ID 注入各自指导，且详细原因均不得持久化。
+#[tokio::test]
+async fn multiple_blocked_tools_keep_one_time_guidance_scoped_by_call_id() {
+    let calls = vec![
+        ToolCall::new("blocked-first", "echo", json!({"value": "一"})),
+        ToolCall::new("blocked-second", "echo", json!({"value": "二"})),
+    ];
+    let model = Arc::new(CapturingScriptedModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+        responses: std::sync::Mutex::new(
+            [
+                ModelResponse::tool_calls(calls),
+                ModelResponse::text("两个拒绝均已分别处理"),
+            ]
+            .into(),
+        ),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("capturing-scripted", model.clone())
+        .expect("注册脚本模型应成功");
+    let mut tools = ToolRegistry::new();
+    tools.register(echo_tool()).expect("注册 echo 工具");
+    let sink = Arc::new(InMemoryEventSink::new());
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("capturing-scripted", "test-model"),
+    )
+    .with_tools(tools)
+    .with_extension(Arc::new(PerCallBlockWithGuidanceExtension))
+    .with_event_sink(sink.clone());
+
+    let run = agent
+        .run("分别处理多个拒绝")
+        .await
+        .expect("同轮多个拒绝后应继续运行");
+
+    let persisted = serde_json::to_string(run.session.messages()).expect("序列化会话");
+    assert!(!persisted.contains("审批详情仅属于"));
+    assert_eq!(persisted.matches("工具调用未获批准").count(), 2);
+
+    let requests = model.requests.lock().expect("模型请求锁不应中毒");
+    assert_eq!(requests.len(), 2);
+    let mut request_results = std::collections::HashMap::new();
+    for message in &requests[1].messages {
+        for block in &message.content {
+            if let crate::model::ContentBlock::ToolResult { result } = block {
+                request_results.insert(result.call_id.as_str(), result.content_text());
+            }
+        }
+    }
+    let first = request_results
+        .get("blocked-first")
+        .expect("第一条调用应有一次性指导");
+    let second = request_results
+        .get("blocked-second")
+        .expect("第二条调用应有一次性指导");
+    assert!(first.contains("调用 blocked-first"));
+    assert!(!first.contains("调用 blocked-second"));
+    assert!(second.contains("调用 blocked-second"));
+    assert!(!second.contains("调用 blocked-first"));
+
+    let events = sink.events().await;
+    let displayed_reasons = events
+        .iter()
+        .filter(|event| event.kind == AgentEventKind::ToolFinished)
+        .filter_map(|event| serde_json::from_value::<ToolResult>(event.payload.clone()).ok())
+        .map(|result| result.content_text())
+        .collect::<Vec<_>>();
+    assert_eq!(displayed_reasons.len(), 2);
+    assert!(displayed_reasons
+        .iter()
+        .any(|reason| reason.contains("blocked-first")));
+    assert!(displayed_reasons
+        .iter()
+        .any(|reason| reason.contains("blocked-second")));
+}
+
+/// 同轮重复调用 ID 必须在任何工具或审批钩子执行前失败，避免结果与一次性指导串线。
+#[tokio::test]
+async fn duplicate_tool_call_ids_fail_before_tool_execution() {
+    let model = Arc::new(CapturingScriptedModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+        responses: std::sync::Mutex::new(
+            [ModelResponse::tool_calls(vec![
+                ToolCall::new("duplicate", "echo", json!({"value": "一"})),
+                ToolCall::new("duplicate", "echo", json!({"value": "二"})),
+            ])]
+            .into(),
+        ),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("capturing-scripted", model)
+        .expect("注册脚本模型应成功");
+    let mut tools = ToolRegistry::new();
+    tools.register(echo_tool()).expect("注册 echo 工具");
+    let sink = Arc::new(InMemoryEventSink::new());
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("capturing-scripted", "test-model"),
+    )
+    .with_tools(tools)
+    .with_event_sink(sink.clone());
+
+    let error = agent
+        .run("验证重复调用 ID")
+        .await
+        .expect_err("重复调用 ID 必须拒绝整个模型响应");
+
+    assert!(error.to_string().contains("重复的工具调用 ID：duplicate"));
+    assert!(sink.events().await.iter().all(|event| {
+        !matches!(
+            event.kind,
+            AgentEventKind::ToolStarted | AgentEventKind::ToolFinished
+        )
+    }));
+    assert!(agent.state().session.messages().iter().all(|message| {
+        message
+            .content
+            .iter()
+            .all(|block| !matches!(block, crate::model::ContentBlock::ToolCall { .. }))
+    }));
+}
+
+/// 跨轮复用调用 ID 必须在第二次工具执行前失败，避免 ContextLoader 把新指导关联到历史工具对。
+#[tokio::test]
+async fn reused_tool_call_id_across_model_responses_is_rejected() {
+    let model = Arc::new(CapturingScriptedModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+        responses: std::sync::Mutex::new(
+            [
+                ModelResponse::tool_calls(vec![ToolCall::new(
+                    "reused-across-turns",
+                    "echo",
+                    json!({"value": "第一次"}),
+                )]),
+                ModelResponse::tool_calls(vec![ToolCall::new(
+                    "reused-across-turns",
+                    "echo",
+                    json!({"value": "第二次"}),
+                )]),
+            ]
+            .into(),
+        ),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("cross-turn-duplicate", model)
+        .expect("注册脚本模型应成功");
+    let mut tools = ToolRegistry::new();
+    tools.register(echo_tool()).expect("注册 echo 工具");
+    let sink = Arc::new(InMemoryEventSink::new());
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("cross-turn-duplicate", "test-model"),
+    )
+    .with_tools(tools)
+    .with_event_sink(sink.clone());
+
+    let error = agent
+        .run("验证跨轮调用 ID")
+        .await
+        .expect_err("跨轮复用调用 ID 必须拒绝");
+
+    assert!(error
+        .to_string()
+        .contains("复用了当前 Session 已存在的工具调用 ID：reused-across-turns"));
+    let started_count = sink
+        .events()
+        .await
+        .iter()
+        .filter(|event| event.kind == AgentEventKind::ToolStarted)
+        .count();
+    assert_eq!(started_count, 1, "第二次同 ID 调用不得开始执行");
+}
+
 /// 异步上下文加载器的返回值必须完整替换原始会话消息。
 #[tokio::test]
 async fn context_loader_replaces_messages_sent_to_model() {
@@ -285,6 +1134,59 @@ fn agent_control_exposes_pending_and_clear_operations() {
     control.clear_follow_ups();
     assert_eq!(control.pending_steering(), 0);
     assert_eq!(control.pending_follow_ups(), 0);
+}
+
+/// steering 的并发限额检查与入队必须在同一临界区完成。
+#[test]
+fn agent_control_steering_limit_is_atomic() {
+    let agent = Agent::new(ModelGateway::new(), AgentOptions::default());
+    let control = agent.control();
+    let accepted = Arc::new(AtomicUsize::new(0));
+
+    std::thread::scope(|scope| {
+        for index in 0..64 {
+            let control = control.clone();
+            let accepted = Arc::clone(&accepted);
+            scope.spawn(move || {
+                if control.try_steer_with_limit(format!("消息 {index}"), 32) {
+                    accepted.fetch_add(1, Ordering::AcqRel);
+                }
+            });
+        }
+    });
+
+    assert_eq!(accepted.load(Ordering::Acquire), 32);
+    assert_eq!(control.pending_steering(), 32);
+}
+
+/// 模型资源门禁拒绝后，请求不得到达 provider，也不得产生模型调用副作用。
+#[tokio::test]
+async fn model_request_gate_runs_before_provider() {
+    let model = Arc::new(CapturingModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("gated", model.clone())
+        .expect("注册捕获模型应成功");
+    let gate_calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("gated", "test-model"),
+    );
+    agent.set_model_request_gate(Arc::new(RejectingModelRequestGate {
+        calls: Arc::clone(&gate_calls),
+    }));
+
+    let error = agent.run("测试").await.expect_err("门禁应拒绝模型请求");
+
+    assert!(error.to_string().contains("provider 调用前"));
+    assert_eq!(gate_calls.load(Ordering::Acquire), 1);
+    assert!(model
+        .requests
+        .lock()
+        .expect("模型请求锁不应中毒")
+        .is_empty());
 }
 
 /// 扩展发布的载荷应进入统一事件 sink，且标记为 Extension。
@@ -367,6 +1269,10 @@ impl ChatModel for StreamingModel {
             index: 0,
             delta: "好".into(),
         });
+        sender.send(ModelStreamEvent::ThinkingDelta {
+            index: 0,
+            delta: "私有推理".into(),
+        });
         sender.done(ModelResponse::text("你好"));
         stream
     }
@@ -399,6 +1305,37 @@ impl ProviderAdapter for BlockingModel {
     fn name(&self) -> &'static str {
         "blocking"
     }
+}
+
+/// ExecutionPolicy 的墙钟上限必须终止阻塞模型请求，不能只停留在序列化声明中。
+#[tokio::test]
+async fn execution_policy_enforces_wall_clock_limit() {
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register(
+            "blocking",
+            Arc::new(BlockingModel {
+                started: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }),
+        )
+        .expect("注册阻塞模型");
+    let mut policy = ExecutionPolicy::serve();
+    policy.limits.wall_clock_ms = Some(20);
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default()
+            .with_model_route("blocking", "test-model")
+            .with_execution_policy(policy),
+    );
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), agent.run("阻塞测试"))
+        .await
+        .expect("Core 墙钟门禁应先结束")
+        .expect_err("阻塞运行必须超时失败");
+
+    assert!(error.to_string().contains("墙钟时间上限：20ms"));
+    assert_eq!(agent.state().phase, AgentPhase::Failed);
 }
 
 /// 在事件回调时读取 Core 状态，验证事件与状态转换的先后顺序。
@@ -543,8 +1480,10 @@ fn echo_tool() -> JsonTool {
 async fn model_cannot_forge_tool_permission_scope() {
     let mut call = ToolCall::new("scope-call", "scoped_echo", json!({}));
     call.bind_permission_scope(ToolPermissionScope::Shell);
+    call.bind_run_id("forged-run");
     let extension = Arc::new(CapturingPermissionScopeExtension {
         observed: std::sync::Mutex::new(Vec::new()),
+        observed_run_ids: std::sync::Mutex::new(Vec::new()),
     });
     let mut tools = ToolRegistry::new();
     tools
@@ -575,6 +1514,16 @@ async fn model_cannot_forge_tool_permission_scope() {
             .as_slice(),
         &[ToolPermissionScope::Read]
     );
+    let observed_run_ids = extension
+        .observed_run_ids
+        .lock()
+        .expect("运行 ID 观察锁不应中毒");
+    assert_eq!(observed_run_ids.len(), 1);
+    assert!(observed_run_ids[0].is_some());
+    assert_ne!(observed_run_ids[0].as_deref(), Some("forged-run"));
+    assert!(!serde_json::to_string(&agent.state().session)
+        .expect("序列化运行会话")
+        .contains("forged-run"));
 }
 
 /// 返回结构化 UI 细节的测试工具。
@@ -704,11 +1653,13 @@ async fn state_tracks_tool_call_lifecycle() {
     let observer = Arc::new(StateObserver::new(agent.control()));
     agent.set_event_sink(observer.clone());
 
-    agent.run("执行工具").await.expect("工具运行应成功");
+    let run = agent.run("执行工具").await.expect("工具运行应成功");
 
     let started = observer.state_for(AgentEventKind::ToolStarted);
     assert_eq!(started.phase, AgentPhase::ExecutingTools);
-    assert_eq!(started.tool_calls[0].call, call);
+    let mut trusted_call = call;
+    trusted_call.bind_run_id(run.run_id.clone());
+    assert_eq!(started.tool_calls[0].call, trusted_call);
     assert_eq!(started.tool_calls[0].status, AgentToolCallStatus::Running);
 
     let finished = observer.state_for(AgentEventKind::ToolFinished);
@@ -734,7 +1685,7 @@ async fn tool_events_preserve_complete_call_and_result() {
     let sink = Arc::new(InMemoryEventSink::new());
     agent.set_event_sink(sink.clone());
 
-    agent.run("执行工具").await.expect("工具运行应成功");
+    let run = agent.run("执行工具").await.expect("工具运行应成功");
 
     let events = sink.events().await;
     let started = events
@@ -743,7 +1694,10 @@ async fn tool_events_preserve_complete_call_and_result() {
         .expect("应发出工具开始事件");
     let started_call =
         serde_json::from_value::<ToolCall>(started.payload.clone()).expect("应解码完整工具调用");
-    assert_eq!(started_call, call);
+    let mut trusted_call = call;
+    trusted_call.bind_run_id(run.run_id.clone());
+    assert_eq!(started_call, trusted_call);
+    assert_eq!(started.run_id, run.run_id);
 
     let finished = events
         .iter()
@@ -1000,11 +1954,15 @@ async fn model_stream_deltas_are_forwarded_to_event_sink() {
         .register("stream", Arc::new(StreamingModel))
         .expect("注册流式模型");
     let sink = Arc::new(InMemoryEventSink::new());
+    let extension_kinds = Arc::new(std::sync::Mutex::new(Vec::new()));
     let agent = Agent::new(
         gateway,
         AgentOptions::default().with_model_route("stream", "stream-model"),
     )
-    .with_event_sink(sink.clone());
+    .with_event_sink(sink.clone())
+    .with_extension(Arc::new(ObservingEventKindsExtension {
+        kinds: Arc::clone(&extension_kinds),
+    }));
 
     let run = agent.run("你好").await.expect("流式 run 应成功");
     let events = sink.events().await;
@@ -1015,6 +1973,13 @@ async fn model_stream_deltas_are_forwarded_to_event_sink() {
         .collect::<String>();
 
     assert_eq!(deltas, "你好");
+    assert!(events
+        .iter()
+        .any(|event| event.kind == AgentEventKind::ModelThinkingDelta));
+    assert!(!extension_kinds
+        .lock()
+        .expect("扩展事件记录锁不应中毒")
+        .contains(&AgentEventKind::ModelThinkingDelta));
     assert_eq!(run.final_text, "你好");
 }
 
@@ -1318,7 +2283,7 @@ struct RewritingExtension {
 impl AgentExtension for RewritingExtension {
     async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
         Ok(ToolDecision::Rewrite {
-            call: ToolCall::new(call.id.clone(), self.target.clone(), call.args.clone()),
+            call: ToolCall::new("伪造调用 ID", self.target.clone(), call.args.clone()),
         })
     }
 }
@@ -1368,6 +2333,7 @@ async fn rewritten_call_rebinds_target_tool_permission_scope() {
         .find(|event| event.kind == AgentEventKind::ToolStarted)
         .expect("Rewrite 后应发布工具开始事件");
     assert_eq!(started.payload["name"], "rewrite_target");
+    assert_eq!(started.payload["id"], "rewrite-scope-call");
     assert_eq!(started.payload["permission_scope"], "control");
 }
 

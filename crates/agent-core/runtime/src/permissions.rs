@@ -112,6 +112,16 @@ mod tests {
         assert_eq!(clamped.max_depth, 2);
         assert_eq!(clamped.max_children_per_agent, 4);
         assert_eq!(clamped.max_concurrent_agents, 2);
+        assert_eq!(clamped.max_agents_per_principal, 16);
+        assert_eq!(clamped.max_agent_model_requests_per_principal, 128);
+        assert_eq!(
+            clamped.max_agent_model_request_bytes_per_principal,
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            clamped.max_agent_model_output_tokens_per_principal,
+            128 * 4096
+        );
         clamped.validate().expect("收紧后的限额仍应合法");
     }
 
@@ -122,6 +132,7 @@ mod tests {
 
         assert_eq!(clamped.max_depth, 0);
         assert_eq!(clamped.max_children_per_agent, 1);
+        assert_eq!(clamped.max_agents_per_principal, 1);
         clamped.validate().expect("限额必须通过校验");
     }
 
@@ -132,6 +143,35 @@ mod tests {
         let clamped = defaults.clamped_by(&ExecutionPolicy::serve().limits);
 
         assert_eq!(clamped, defaults);
+    }
+
+    /// 旧版 JSON 缺少累计资源字段时必须补入有限默认值，不能退化为无限制。
+    #[test]
+    fn legacy_runtime_limits_json_uses_safe_resource_defaults() {
+        let decoded: RuntimeLimits = serde_json::from_value(serde_json::json!({
+            "max_depth": 3,
+            "max_children_per_agent": 4,
+            "max_concurrent_agents": 2
+        }))
+        .expect("旧版 RuntimeLimits JSON 应保持兼容");
+        let defaults = RuntimeLimits::default();
+
+        assert_eq!(
+            decoded.max_agents_per_principal,
+            defaults.max_agents_per_principal
+        );
+        assert_eq!(
+            decoded.max_agent_model_requests_per_principal,
+            defaults.max_agent_model_requests_per_principal
+        );
+        assert_eq!(
+            decoded.max_agent_model_request_bytes_per_principal,
+            defaults.max_agent_model_request_bytes_per_principal
+        );
+        assert_eq!(
+            decoded.max_agent_model_output_tokens_per_principal,
+            defaults.max_agent_model_output_tokens_per_principal
+        );
     }
 
     /// 派生配置应能显式关闭基础 Agent 默认启用的流式模式。
@@ -147,6 +187,34 @@ mod tests {
         .apply_to(&mut options);
 
         assert!(!options.stream);
+    }
+
+    /// Runtime allowlist 的拒绝必须携带一次性指导，详细工具名只留给事件消费者。
+    #[tokio::test]
+    async fn restricted_extension_denial_uses_one_time_guidance() {
+        let extension = RestrictedExtension {
+            inner: Arc::new(agent_core::NoopAgentExtension),
+            access: ToolAccess::allowlist(["read_file"]),
+        };
+
+        let decision = extension
+            .before_tool(&ToolCall::new(
+                "denied-shell",
+                "shell",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("allowlist 拒绝应形成决策");
+
+        assert!(matches!(
+            decision,
+            ToolDecision::Block {
+                reason,
+                agent_guidance: Some(guidance),
+            } if reason.contains("shell")
+                && !guidance.contains("shell")
+                && guidance.contains("权限范围内")
+        ));
     }
 }
 
@@ -256,10 +324,24 @@ impl AgentExtension for RestrictedExtension {
         self.inner.prompt_messages().await
     }
 
+    async fn prompt_messages_for_run(&self, run_id: &str) -> AnyResult<Vec<ModelMessage>> {
+        self.inner.prompt_messages_for_run(run_id).await
+    }
+
     async fn list_tools(&self) -> AnyResult<Vec<ToolSpec>> {
         Ok(self
             .inner
             .list_tools()
+            .await?
+            .into_iter()
+            .filter(|spec| self.access.permits(&spec.name))
+            .collect())
+    }
+
+    async fn list_tools_for_run(&self, run_id: &str) -> AnyResult<Vec<ToolSpec>> {
+        Ok(self
+            .inner
+            .list_tools_for_run(run_id)
             .await?
             .into_iter()
             .filter(|spec| self.access.permits(&spec.name))
@@ -274,18 +356,51 @@ impl AgentExtension for RestrictedExtension {
         }
     }
 
+    async fn call_tool_for_run(
+        &self,
+        run_id: &str,
+        call: ToolCall,
+    ) -> AnyResult<Option<ToolResult>> {
+        if self.access.permits(&call.name) {
+            self.inner.call_tool_for_run(run_id, call).await
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn before_tool(&self, call: &ToolCall) -> AnyResult<ToolDecision> {
         if !self.access.permits(&call.name) {
-            return Ok(ToolDecision::Block {
-                reason: format!("工具不在当前 Agent 的 allowlist 中：{}", call.name),
-            });
+            return Ok(ToolDecision::block_with_guidance(
+                format!("工具不在当前 Agent 的 allowlist 中：{}", call.name),
+                "当前 Agent 无权使用该工具，调用未执行；不要重复相同调用，请改用权限范围内的工具继续。",
+            ));
         }
 
         match self.inner.before_tool(call).await? {
             ToolDecision::Rewrite { call } if !self.access.permits(&call.name) => {
-                Ok(ToolDecision::Block {
-                    reason: format!("重写后的工具不在当前 Agent 的 allowlist 中：{}", call.name),
-                })
+                Ok(ToolDecision::block_with_guidance(
+                    format!("重写后的工具不在当前 Agent 的 allowlist 中：{}", call.name),
+                    "工具重写后的目标超出当前 Agent 权限，调用未执行；请改用权限范围内的工具继续。",
+                ))
+            }
+            decision => Ok(decision),
+        }
+    }
+
+    async fn before_tool_for_run(&self, run_id: &str, call: &ToolCall) -> AnyResult<ToolDecision> {
+        if !self.access.permits(&call.name) {
+            return Ok(ToolDecision::block_with_guidance(
+                format!("工具不在当前 Agent 的 allowlist 中：{}", call.name),
+                "当前 Agent 无权使用该工具，调用未执行；不要重复相同调用，请改用权限范围内的工具继续。",
+            ));
+        }
+
+        match self.inner.before_tool_for_run(run_id, call).await? {
+            ToolDecision::Rewrite { call } if !self.access.permits(&call.name) => {
+                Ok(ToolDecision::block_with_guidance(
+                    format!("重写后的工具不在当前 Agent 的 allowlist 中：{}", call.name),
+                    "工具重写后的目标超出当前 Agent 权限，调用未执行；请改用权限范围内的工具继续。",
+                ))
             }
             decision => Ok(decision),
         }
@@ -295,11 +410,27 @@ impl AgentExtension for RestrictedExtension {
         self.inner.after_tool(result).await
     }
 
+    async fn after_tool_for_run(&self, run_id: &str, result: &ToolResult) -> AnyResult<()> {
+        self.inner.after_tool_for_run(run_id, result).await
+    }
+
     async fn on_event(&self, event: &AgentEvent) -> AnyResult<()> {
         self.inner.on_event(event).await
     }
 
+    async fn on_event_for_run(&self, run_id: &str, event: &AgentEvent) -> AnyResult<()> {
+        self.inner.on_event_for_run(run_id, event).await
+    }
+
     async fn drain_events(&self) -> AnyResult<Vec<Value>> {
         self.inner.drain_events().await
+    }
+
+    async fn drain_events_for_run(&self, run_id: &str) -> AnyResult<Vec<Value>> {
+        self.inner.drain_events_for_run(run_id).await
+    }
+
+    async fn finish_run(&self, run_id: &str) -> AnyResult<()> {
+        self.inner.finish_run(run_id).await
     }
 }

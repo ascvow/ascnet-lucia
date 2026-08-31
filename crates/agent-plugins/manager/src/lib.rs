@@ -25,6 +25,6 @@ pub use registry::{
     RegistryUpdateResult,
 };
 pub use types::{
-    InstallOptions, InstalledPlugin, PluginLock, PluginManagerStateSnapshot, LOCK_FILE_NAME,
+    InstallOptions, InstalledPlugin, PluginBundleIdentity, PluginLock, LOCK_FILE_NAME,
     LOCK_SCHEMA_VERSION,
 };

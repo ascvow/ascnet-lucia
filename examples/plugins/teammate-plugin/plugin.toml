@@ -11,3 +11,15 @@ spawn = true
 observe = true
 cancel = true
 profiles = ["worker"]
+
+[capabilities.tool_scopes]
+teammate_spawn = "unknown"
+teammate_list = "control"
+teammate_status = "control"
+teammate_result = "control"
+teammate_cancel = "control"
+teammate_remove = "control"
+teammate_send = "control"
+teammate_inbox = "control"
+teammate_ack = "control"
+teammate_dispatch = "unknown"

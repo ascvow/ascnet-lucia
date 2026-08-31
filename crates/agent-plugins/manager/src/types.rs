@@ -1,9 +1,11 @@
 //! 插件锁文件与安装记录的稳定数据结构。
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 /// 当前 `plugins.lock.toml` 的格式版本。
-pub const LOCK_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 持久化用户确认的完整授权 profile 摘要；v1 的启用位会在读取时安全降级为待重新审查。
+pub const LOCK_SCHEMA_VERSION: u32 = 2;
 
 /// 插件锁文件名。
 pub const LOCK_FILE_NAME: &str = "plugins.lock.toml";
@@ -29,6 +31,31 @@ pub struct InstalledPlugin {
     pub source: String,
 }
 
+impl InstalledPlugin {
+    /// 返回用户审批必须绑定的不可变 Bundle 身份。
+    ///
+    /// 启用操作在提交前应再次比较该身份，避免插件 ID 未变但来源、版本或内容已被替换。
+    #[must_use]
+    pub fn bundle_identity(&self) -> PluginBundleIdentity {
+        PluginBundleIdentity {
+            source: self.source.clone(),
+            version: self.version.clone(),
+            sha256: self.sha256.clone(),
+        }
+    }
+}
+
+/// 用户确认时看到的不可变插件 Bundle 身份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginBundleIdentity {
+    /// Bundle 的安装来源；本地路径与远端 Release 均按锁文件中的规范值精确比较。
+    pub source: String,
+    /// 用户确认时看到的插件版本。
+    pub version: String,
+    /// 用户确认时完整 Bundle 的 SHA-256 摘要。
+    pub sha256: String,
+}
+
 /// 插件锁文件的可序列化结构。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginLock {
@@ -42,21 +69,14 @@ pub struct PluginLock {
     /// 该字段只支持人工回滚，不表示自动升级链路。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub version_history: Vec<InstalledPlugin>,
+    /// 插件 ID 到用户最后确认的完整授权 profile SHA-256。
+    ///
+    /// 只有当前启用插件允许出现在该映射中；禁用、替换、移除和人工回滚都会撤销对应摘要。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub authorization_grants: HashMap<String, String>,
     /// 独占能力 ID 到启用插件 ID 的选择。
     #[serde(default)]
     pub capability_selection: HashMap<String, String>,
-}
-
-/// 一次人工插件管理操作前捕获的可恢复状态。
-///
-/// 快照包含锁文件和每个受管理 Bundle 的确定性归档，仅用于应用层在后续人工基线提交失败时
-/// 执行补偿恢复。它不会自行安装或选择版本。
-#[derive(Debug, Clone)]
-pub struct PluginManagerStateSnapshot {
-    /// 快照时刻的锁文件内容。
-    pub(crate) lock: PluginLock,
-    /// 快照时刻各插件 Bundle 的归档字节，按 (插件 ID, 版本) 索引。
-    pub(crate) bundles: BTreeMap<(String, String), Vec<u8>>,
 }
 
 impl Default for PluginLock {
@@ -65,6 +85,7 @@ impl Default for PluginLock {
             schema_version: LOCK_SCHEMA_VERSION,
             plugins: Vec::new(),
             version_history: Vec::new(),
+            authorization_grants: HashMap::new(),
             capability_selection: HashMap::new(),
         }
     }
@@ -73,12 +94,16 @@ impl Default for PluginLock {
 /// 安装行为选项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstallOptions {
-    /// 安装完成后是否立即启用插件。
+    /// 是否请求以启用状态提交 Bundle。
+    ///
+    /// 公开人工安装入口只接受 `false`；人工替换即使收到 `true` 也会保持禁用并要求重新审查。
+    /// 该标记仅供 Manager 内部可信迁移在重新核验来源、身份、能力和依赖后受限继承授权。
     pub enabled: bool,
 }
 
 impl Default for InstallOptions {
     fn default() -> Self {
-        Self { enabled: true }
+        // 安装只验证并落盘 Bundle；启用必须是展示 capability 后的独立用户动作。
+        Self { enabled: false }
     }
 }

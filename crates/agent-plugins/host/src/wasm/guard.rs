@@ -5,6 +5,7 @@ use crate::ui::UiContribution;
 use crate::ui::UiDeclaration;
 use crate::ui::UiPlacement;
 use crate::wasm::linker::PLUGIN_HOST_FAILURE_DETAIL_KEY;
+use agent_core::model::{ContentBlock, ModelMessage};
 use agent_tool::ToolCall;
 use agent_tool::ToolErrorKind;
 use agent_tool::ToolResult;
@@ -47,6 +48,18 @@ pub(crate) fn bind_guest_tool_result(result: &mut ToolResult, call: &ToolCall, p
     sanitize_guest_tool_result(result);
     result.call_id.clone_from(&call.id);
     result.name = public_name.to_string();
+}
+
+/// 从跨 WASM 边界的上下文中移除服务商私有推理，避免 Guest 读取或重新注入。
+///
+/// 原生 ContextLoader 不经过此函数，仍可在可信 Core 内保留同路由工具循环所需的签名。
+pub(crate) fn redact_guest_context_messages(messages: &mut Vec<ModelMessage>) {
+    for message in messages.iter_mut() {
+        message
+            .content
+            .retain(|block| !matches!(block, ContentBlock::Thinking { .. }));
+    }
+    messages.retain(|message| !message.content.is_empty());
 }
 
 /// 校验插件内部视图 ID，并注入可信的 manifest 插件 ID。
@@ -125,5 +138,40 @@ pub(crate) fn validate_ui_instance(
             "非 subview `{}` 不允许携带 instance_id",
             declaration.view_id
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Guest 上下文必须移除所有不透明推理块，并保留普通可见内容。
+    #[test]
+    fn guest_context_redacts_all_private_reasoning_blocks() {
+        let message: ModelMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "私有推理",
+                    "signature": "sig-private"
+                },
+                {
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": "opaque-private-envelope"
+                },
+                {"type": "text", "text": "可见内容"}
+            ]
+        }))
+        .expect("测试消息应符合 Core 协议");
+        let mut messages = vec![message];
+
+        redact_guest_context_messages(&mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text_content(), "可见内容");
+        assert_eq!(messages[0].content.len(), 1);
     }
 }

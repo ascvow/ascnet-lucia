@@ -20,7 +20,13 @@ pub(crate) struct ContributionRegistry {
 struct ContributionState {
     tools: HashMap<String, RegisteredTool>,
     prompts: HashMap<String, PromptContribution>,
-    events: VecDeque<Value>,
+    events: VecDeque<QueuedEvent>,
+}
+
+/// 插件事件及其可信运行归属；`None` 表示启动或 UI 控制面事件。
+struct QueuedEvent {
+    run_id: Option<String>,
+    payload: Value,
 }
 
 #[derive(Clone)]
@@ -138,14 +144,38 @@ impl ContributionRegistry {
     }
 
     /// 排队一条等待 Core 发布的结构化事件。
-    pub(crate) fn emit_event(&self, payload: Value) -> Result<()> {
-        self.write()?.events.push_back(payload);
+    pub(crate) fn emit_event(&self, run_id: Option<&str>, payload: Value) -> Result<()> {
+        self.write()?.events.push_back(QueuedEvent {
+            run_id: run_id.map(str::to_string),
+            payload,
+        });
         Ok(())
     }
 
-    /// 取出全部待发布事件，并从注册表中移除。
+    /// 取出未绑定 Agent run 的启动与 UI 事件，并从注册表中移除。
     pub(crate) fn drain_events(&self) -> Result<Vec<Value>> {
-        Ok(self.write()?.events.drain(..).collect())
+        self.drain_events_matching(None)
+    }
+
+    /// 取出指定 Agent run 的事件，其他并发运行和 UI 队列保持不变。
+    pub(crate) fn drain_events_for_run(&self, run_id: &str) -> Result<Vec<Value>> {
+        self.drain_events_matching(Some(run_id))
+    }
+
+    /// 按可信运行归属稳定地拆分事件队列。
+    fn drain_events_matching(&self, run_id: Option<&str>) -> Result<Vec<Value>> {
+        let mut state = self.write()?;
+        let mut matched = Vec::new();
+        let mut remaining = VecDeque::new();
+        while let Some(event) = state.events.pop_front() {
+            if event.run_id.as_deref() == run_id {
+                matched.push(event.payload);
+            } else {
+                remaining.push_back(event);
+            }
+        }
+        state.events = remaining;
+        Ok(matched)
     }
 
     fn read(&self) -> Result<RwLockReadGuard<'_, ContributionState>> {
@@ -187,6 +217,38 @@ mod tests {
                 .expect("查询不应失败")
                 .as_deref(),
             Some("remote/read_item")
+        );
+    }
+
+    /// 并发运行事件必须按可信 run_id 排空，启动与其他运行队列不得被提前消费。
+    #[test]
+    fn events_are_drained_by_trusted_run_id() {
+        let registry = ContributionRegistry::default();
+        registry
+            .emit_event(None, json!({"event": "ui"}))
+            .expect("写入 UI 事件");
+        registry
+            .emit_event(Some("run-a"), json!({"event": "a"}))
+            .expect("写入首个运行事件");
+        registry
+            .emit_event(Some("run-b"), json!({"event": "b"}))
+            .expect("写入第二个运行事件");
+
+        assert_eq!(
+            registry
+                .drain_events_for_run("run-a")
+                .expect("排空首个运行"),
+            [json!({"event": "a"})]
+        );
+        assert_eq!(
+            registry.drain_events().expect("排空 UI 事件"),
+            [json!({"event": "ui"})]
+        );
+        assert_eq!(
+            registry
+                .drain_events_for_run("run-b")
+                .expect("排空第二个运行"),
+            [json!({"event": "b"})]
         );
     }
 }

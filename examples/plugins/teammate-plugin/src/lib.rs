@@ -1547,7 +1547,14 @@ fn teammate_tools() -> Vec<ToolSpec> {
         ),
     ]
     .into_iter()
-    .map(|tool| tool.with_permission_scope(ToolPermissionScope::Control))
+    .map(|tool| {
+        if matches!(tool.name.as_str(), "teammate_spawn" | "teammate_dispatch") {
+            // 派生或续跑成员会消耗模型与 Runtime 资源，必须进入权限策略。
+            tool
+        } else {
+            tool.with_permission_scope(ToolPermissionScope::Control)
+        }
+    })
     .collect()
 }
 
@@ -1558,14 +1565,23 @@ mod tests {
     use super::*;
     use agent_plugin::AgentLineage;
 
-    /// Teammate 工具只操作 Host 约束的成员控制面，不能因工具名称被误判为文件删除。
+    /// 派生与续跑成员保持 unknown，其余短控制面操作才声明为 control。
     #[test]
-    fn teammate_tools_declare_control_scope() {
+    fn teammate_tools_separate_delegation_from_control_scope() {
         let tools = teammate_tools();
         assert!(!tools.is_empty());
-        assert!(tools
-            .iter()
-            .all(|tool| tool.permission_scope == ToolPermissionScope::Control));
+        for tool in tools {
+            let expected = if matches!(tool.name.as_str(), "teammate_spawn" | "teammate_dispatch") {
+                ToolPermissionScope::Unknown
+            } else {
+                ToolPermissionScope::Control
+            };
+            assert_eq!(
+                tool.permission_scope, expected,
+                "工具 {} scope 错误",
+                tool.name
+            );
+        }
     }
 
     /// 构造纯状态测试使用的 Agent 句柄。

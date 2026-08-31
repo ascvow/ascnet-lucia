@@ -7,6 +7,28 @@ use crate::plugin::management::PluginManagementOutcome;
 use ratatui::{backend::TestBackend, Terminal};
 use tokio::sync::mpsc;
 
+/// 为插件页测试补充 Host 当前 ABI 固有授权，避免测试复制另一份权限基线。
+#[cfg(feature = "plugins")]
+fn test_plugin_authorization(
+    manifest_snapshot: agent_plugin_host::audit::ManifestCapabilitySnapshot,
+) -> agent_plugin_host::audit::PluginAuthorizationProfile {
+    let manifest: agent_plugin_host::manifest::PluginManifest = toml::from_str(
+        r#"
+            [plugin]
+            id = "command-test"
+            name = "Command Test"
+            version = "1.0.0"
+            api_version = "0.7.0"
+            wasm = "command-test.wasm"
+        "#,
+    )
+    .expect("命令测试 manifest 应可解析");
+    let mut profile = agent_plugin_host::audit::snapshot_plugin_authorization_profile(&manifest)
+        .expect("生成命令测试授权 profile");
+    profile.manifest = manifest_snapshot;
+    profile
+}
+
 /// 默认注册表必须包含用户依赖的全部内置命令和退出别名。
 #[test]
 fn native_registry_contains_default_commands() {
@@ -119,7 +141,7 @@ fn plugin_page_shows_installed_plugins_and_manual_actions() {
                 name: "Echo".into(),
                 version: "1.0.0".into(),
                 api_version: "0.7.0".into(),
-                enabled: true,
+                enabled: false,
                 manifest: "plugins/echo/1.0.0/plugin.toml".into(),
                 sha256: "b".repeat(64),
                 source: "fixture".into(),
@@ -134,15 +156,29 @@ fn plugin_page_shows_installed_plugins_and_manual_actions() {
                 sha256: "c".repeat(64),
                 source: "fixture-history".into(),
             }],
+            authorizations: std::collections::HashMap::from([(
+                "echo".into(),
+                test_plugin_authorization(agent_plugin_host::audit::ManifestCapabilitySnapshot {
+                    plugin_id: "echo".into(),
+                    requested: vec![agent_plugin_host::audit::ManifestCapabilityRequest {
+                        capability_id: "process_exec".into(),
+                        scopes: Vec::new(),
+                    }],
+                    provided: Vec::new(),
+                }),
+            )]),
         }),
         path_mode: None,
         path_input: String::new(),
         remove_confirmation: None,
+        enable_confirmation: None,
+        pending_owner_selection: None,
+        review_scroll: 0,
     });
     let mut terminal = Terminal::new(TestBackend::new(112, 32)).expect("应创建测试终端");
 
     terminal
-        .draw(|frame| render_native_plugin_dialog(frame, &app, frame.area()))
+        .draw(|frame| render_native_plugin_dialog(frame, &mut app, frame.area()))
         .expect("应渲染插件管理页");
     let text = terminal
         .backend()
@@ -158,9 +194,281 @@ fn plugin_page_shows_installed_plugins_and_manual_actions() {
 
     assert!(text.contains("Installed Version History"), "{text}");
     assert!(text.contains("echo@0.9.0"), "{text}");
+    assert!(text.contains("process_exec"), "{text}");
     assert!(compact.contains("人工管理"), "{text}");
     assert!(!text.contains("Evolve Plugin"), "{text}");
     assert!(!text.contains("Generate Plugin"), "{text}");
+
+    assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('e'), KeyModifiers::NONE));
+    assert_eq!(
+        app.native_command
+            .plugin_dialog
+            .as_ref()
+            .and_then(|dialog| {
+                dialog
+                    .enable_confirmation
+                    .as_ref()
+                    .map(|confirmation| confirmation.plugin_id.as_str())
+            }),
+        Some("echo")
+    );
+    assert_eq!(
+        app.native_command
+            .plugin_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.enable_confirmation.as_ref())
+            .map(|confirmation| confirmation.bundle_identity.clone()),
+        Some(agent_plugin_manager::PluginBundleIdentity {
+            source: "fixture".into(),
+            version: "1.0.0".into(),
+            sha256: "b".repeat(64),
+        })
+    );
+
+    let mut review_terminal = Terminal::new(TestBackend::new(112, 32)).expect("应创建启用审查终端");
+    review_terminal
+        .draw(|frame| render_native_plugin_dialog(frame, &mut app, frame.area()))
+        .expect("应渲染完整启用审查页");
+    let review_text = review_terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    let compact_review = review_text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(compact_review.contains("启用授权确认"), "{review_text}");
+    assert!(review_text.contains(&"b".repeat(64)), "{review_text}");
+    assert!(review_text.contains("process_exec"), "{review_text}");
+
+    assert!(app.handle_native_plugin_dialog_key(KeyCode::Down, KeyModifiers::NONE));
+    let dialog = app
+        .native_command
+        .plugin_dialog
+        .as_ref()
+        .expect("滚动后应保留审查页");
+    assert_eq!(dialog.review_scroll, 1);
+    assert!(dialog.enable_confirmation.is_some());
+
+    app.native_command
+        .plugin_dialog
+        .as_mut()
+        .expect("审查页应保持打开")
+        .review_scroll = u16::MAX;
+    let mut narrow_terminal =
+        Terminal::new(TestBackend::new(36, 10)).expect("应创建窄终端审查视口");
+    narrow_terminal
+        .draw(|frame| render_native_plugin_dialog(frame, &mut app, frame.area()))
+        .expect("窄终端仍应安全渲染完整审查页");
+    let clamped_scroll = app
+        .native_command
+        .plugin_dialog
+        .as_ref()
+        .expect("审查页应保持打开")
+        .review_scroll;
+    assert!(clamped_scroll < u16::MAX);
+    let narrow_text = narrow_terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    let compact_narrow = narrow_text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(compact_narrow.contains("再次按e"), "{narrow_text}");
+    assert!(app.handle_native_plugin_dialog_key(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(
+        app.native_command
+            .plugin_dialog
+            .as_ref()
+            .expect("向上滚动后审查页应保持打开")
+            .review_scroll,
+        clamped_scroll.saturating_sub(1)
+    );
+}
+
+/// 缺少 Host 校验授权 profile 时必须阻止启用，不能让“未知授权”进入第二次确认。
+#[cfg(feature = "plugins")]
+#[test]
+fn plugin_enable_fails_closed_without_authorization_profile() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.native_command.plugin_dialog = Some(NativePluginDialog {
+        selected: 0,
+        status: NativePluginDialogStatus::Ready(NativePluginDialogData {
+            plugins: vec![agent_plugin_manager::InstalledPlugin {
+                id: "unknown-capabilities".into(),
+                name: "Unknown Capabilities".into(),
+                version: "1.0.0".into(),
+                api_version: "0.7.0".into(),
+                enabled: false,
+                manifest: "plugins/unknown-capabilities/1.0.0/plugin.toml".into(),
+                sha256: "e".repeat(64),
+                source: "fixture".into(),
+            }],
+            version_history: Vec::new(),
+            authorizations: std::collections::HashMap::new(),
+        }),
+        path_mode: None,
+        path_input: String::new(),
+        remove_confirmation: None,
+        enable_confirmation: None,
+        pending_owner_selection: None,
+        review_scroll: 0,
+    });
+
+    assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('e'), KeyModifiers::NONE));
+
+    let dialog = app
+        .native_command
+        .plugin_dialog
+        .as_ref()
+        .expect("失败后应保留插件页");
+    assert!(dialog.enable_confirmation.is_none());
+    assert!(matches!(
+        &dialog.status,
+        NativePluginDialogStatus::Error(error) if error.contains("授权 profile 不可用")
+    ));
+}
+
+/// 禁用插件被指定为 Capability Owner 时，必须先记录意图，再经过两次启用确认。
+#[cfg(feature = "plugins")]
+#[test]
+fn disabled_capability_owner_requires_two_enable_confirmations() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.native_command.plugin_dialog = Some(NativePluginDialog {
+        selected: 0,
+        status: NativePluginDialogStatus::Ready(NativePluginDialogData {
+            plugins: vec![agent_plugin_manager::InstalledPlugin {
+                id: "provider".into(),
+                name: "Provider".into(),
+                version: "1.0.0".into(),
+                api_version: "0.7.0".into(),
+                enabled: false,
+                manifest: "plugins/provider/1.0.0/plugin.toml".into(),
+                sha256: "d".repeat(64),
+                source: "github:https://github.com/example/provider@v1#provider.zip".into(),
+            }],
+            version_history: Vec::new(),
+            authorizations: std::collections::HashMap::from([(
+                "provider".into(),
+                test_plugin_authorization(agent_plugin_host::audit::ManifestCapabilitySnapshot {
+                    plugin_id: "provider".into(),
+                    requested: vec![agent_plugin_host::audit::ManifestCapabilityRequest {
+                        capability_id: "process_exec".into(),
+                        scopes: Vec::new(),
+                    }],
+                    provided: Vec::new(),
+                }),
+            )]),
+        }),
+        path_mode: None,
+        path_input: String::new(),
+        remove_confirmation: None,
+        enable_confirmation: None,
+        pending_owner_selection: None,
+        review_scroll: 0,
+    });
+
+    assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('o'), KeyModifiers::NONE));
+    for character in "agent.context-loader provider".chars() {
+        assert!(app.handle_native_plugin_dialog_key(KeyCode::Char(character), KeyModifiers::NONE,));
+    }
+    assert!(app.handle_native_plugin_dialog_key(KeyCode::Enter, KeyModifiers::NONE));
+    let dialog = app
+        .native_command
+        .plugin_dialog
+        .as_ref()
+        .expect("插件页应保持打开");
+    assert_eq!(
+        dialog.pending_owner_selection.clone(),
+        Some(PendingCapabilityOwnerSelection {
+            capability_id: "agent.context-loader".into(),
+            plugin_id: "provider".into(),
+            bundle_identity: agent_plugin_manager::PluginBundleIdentity {
+                source: "github:https://github.com/example/provider@v1#provider.zip".into(),
+                version: "1.0.0".into(),
+                sha256: "d".repeat(64),
+            },
+        })
+    );
+    assert!(dialog.enable_confirmation.is_none());
+    assert!(matches!(dialog.status, NativePluginDialogStatus::Ready(_)));
+
+    assert!(app.handle_native_plugin_dialog_key(KeyCode::Down, KeyModifiers::NONE));
+    assert!(app
+        .native_command
+        .plugin_dialog
+        .as_ref()
+        .is_some_and(|dialog| dialog.pending_owner_selection.is_none()));
+    assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('o'), KeyModifiers::NONE));
+    for character in "agent.context-loader provider".chars() {
+        assert!(app.handle_native_plugin_dialog_key(KeyCode::Char(character), KeyModifiers::NONE,));
+    }
+    assert!(app.handle_native_plugin_dialog_key(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('e'), KeyModifiers::NONE));
+    let dialog = app
+        .native_command
+        .plugin_dialog
+        .as_ref()
+        .expect("第一次确认后插件页应保持打开");
+    assert_eq!(
+        dialog
+            .enable_confirmation
+            .as_ref()
+            .map(|confirmation| confirmation.plugin_id.as_str()),
+        Some("provider")
+    );
+    assert_eq!(
+        dialog
+            .enable_confirmation
+            .as_ref()
+            .map(|confirmation| &confirmation.bundle_identity),
+        dialog
+            .pending_owner_selection
+            .as_ref()
+            .map(|pending| &pending.bundle_identity)
+    );
+    assert!(dialog.pending_owner_selection.is_some());
+    assert!(matches!(dialog.status, NativePluginDialogStatus::Ready(_)));
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 32)).expect("应创建测试终端");
+    terminal
+        .draw(|frame| render_native_plugin_dialog(frame, &mut app, frame.area()))
+        .expect("应渲染 Owner 启用确认");
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    let compact = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(compact.contains("再次按e"), "{text}");
+    assert!(text.contains("agent.context-loader"), "{text}");
+    assert!(text.contains("github.com/example/provider"), "{text}");
+    assert!(text.contains("process_exec"), "{text}");
+
+    assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('e'), KeyModifiers::NONE));
+    let dialog = app
+        .native_command
+        .plugin_dialog
+        .as_ref()
+        .expect("操作失败说明应保留插件页");
+    assert!(dialog.pending_owner_selection.is_none());
+    assert!(dialog.enable_confirmation.is_none());
+    assert!(matches!(dialog.status, NativePluginDialogStatus::Error(_)));
 }
 
 /// 本地插件路径必须接受由 Shift 产生的大写字符，同时拒绝控制类组合键。
@@ -175,6 +483,9 @@ fn plugin_path_input_accepts_uppercase_characters() {
         path_mode: Some(NativePluginPathMode::Install),
         path_input: String::new(),
         remove_confirmation: None,
+        enable_confirmation: None,
+        pending_owner_selection: None,
+        review_scroll: 0,
     });
 
     assert!(app.handle_native_plugin_dialog_key(KeyCode::Char('U'), KeyModifiers::SHIFT,));
@@ -207,6 +518,9 @@ fn plugin_change_warning_is_displayed() {
         path_mode: None,
         path_input: String::new(),
         remove_confirmation: None,
+        enable_confirmation: None,
+        pending_owner_selection: None,
+        review_scroll: 0,
     });
 
     app.handle_native_plugin_action_finished(Ok(PluginManagementOutcome {

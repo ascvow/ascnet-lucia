@@ -1,5 +1,7 @@
 //! 插件 manifest 支持。
 
+use crate::ui::UiHostActionKind;
+use agent_tool::{ToolPermissionScope, ToolSpec};
 use anyhow::{anyhow, Context, Result};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -317,6 +319,74 @@ manifest = "/opt/lucia/plugin.toml"
         assert!(manifest.capabilities.agent.spawn);
         assert!(manifest.capabilities.agent.allows_profile("reviewer"));
         assert!(!manifest.capabilities.agent.allows_profile("admin"));
+    }
+
+    /// Host 必须从 manifest 绑定工具 scope，未授权工具降级为 unknown，自报不一致直接拒绝。
+    #[test]
+    fn manifest_tool_scopes_are_authoritative() {
+        let mut manifest = test_manifest("scoped", "1.0.0", Vec::new());
+        manifest
+            .capabilities
+            .tool_scopes
+            .insert("safe_control".into(), ToolPermissionScope::Control);
+        manifest.validate().expect("工具 scope manifest 应合法");
+
+        let mut declared = ToolSpec::new(
+            "safe_control",
+            "安全控制工具",
+            ToolSpec::empty_object_schema(),
+        );
+        manifest
+            .capabilities
+            .bind_tool_scope(&mut declared)
+            .expect("Host 应补齐权威 scope");
+        assert_eq!(declared.permission_scope, ToolPermissionScope::Control);
+
+        let mut undeclared =
+            ToolSpec::new("undeclared", "未声明工具", ToolSpec::empty_object_schema())
+                .with_permission_scope(ToolPermissionScope::Control);
+        manifest
+            .capabilities
+            .bind_tool_scope(&mut undeclared)
+            .expect("未声明工具应安全降级");
+        assert_eq!(undeclared.permission_scope, ToolPermissionScope::Unknown);
+
+        let mut forged = ToolSpec::new("safe_control", "伪造工具", ToolSpec::empty_object_schema())
+            .with_permission_scope(ToolPermissionScope::Shell);
+        let error = manifest
+            .capabilities
+            .bind_tool_scope(&mut forged)
+            .expect_err("Guest 自报不一致必须失败");
+        assert!(error.to_string().contains("与 manifest 授权"));
+
+        manifest.capabilities.process_exec = true;
+        let mut process_control = ToolSpec::new(
+            "safe_control",
+            "可调用进程能力的控制工具",
+            ToolSpec::empty_object_schema(),
+        )
+        .with_permission_scope(ToolPermissionScope::Control);
+        manifest
+            .capabilities
+            .bind_tool_scope(&mut process_control)
+            .expect("Host 应按 component 能力抬高 scope");
+        assert_eq!(process_control.permission_scope, ToolPermissionScope::Shell);
+
+        manifest.capabilities.fs_read.push("config".into());
+        let mut compound_control = ToolSpec::new(
+            "safe_control",
+            "同时可调用进程和文件能力的控制工具",
+            ToolSpec::empty_object_schema(),
+        )
+        .with_permission_scope(ToolPermissionScope::Control);
+        manifest
+            .capabilities
+            .bind_tool_scope(&mut compound_control)
+            .expect("复合能力应保守绑定");
+        assert_eq!(
+            compound_control.permission_scope,
+            ToolPermissionScope::Unknown
+        );
     }
 
     /// Host 只接受当前 ABI，避免为缺失导出的旧 component 保留分支。
@@ -759,8 +829,14 @@ pub struct CapabilitySection {
     pub model_completion: bool,
 
     /// 插件是否可以发布 `ui.host.action` 事件驱动宿主应用级动作。
+    ///
+    /// 仅为旧 manifest 保留；`true` 代表全部动作，新插件应使用 `surface_action_allowlist`。
     #[serde(default)]
     pub surface_actions: bool,
+
+    /// 插件可请求的具体宿主界面动作；空集合不授予任何动作。
+    #[serde(default)]
+    pub surface_action_allowlist: Vec<UiHostActionKind>,
 
     /// 插件是否希望通过宿主 API 执行进程。
     #[serde(default)]
@@ -781,6 +857,10 @@ pub struct CapabilitySection {
     /// 插件请求写入的路径。
     #[serde(default)]
     pub fs_write: Vec<String>,
+
+    /// Host 按公开工具名绑定的权威权限 scope；未声明的插件工具统一降级为 `unknown`。
+    #[serde(default)]
+    pub tool_scopes: HashMap<String, ToolPermissionScope>,
 }
 
 /// 插件访问 Agent Runtime 的最小权限集合。
@@ -846,17 +926,119 @@ impl AgentCapabilitySection {
 }
 
 impl CapabilitySection {
+    /// 判断 manifest 是否允许具体宿主界面动作。
+    pub(crate) fn allows_surface_action(&self, action: UiHostActionKind) -> bool {
+        self.surface_actions || self.surface_action_allowlist.contains(&action)
+    }
+
+    /// 把 manifest 中用户可审计的 scope 绑定到 Guest 工具定义。
+    ///
+    /// Guest 未声明 scope 时由 Host 补齐；Guest 自报值与 manifest 不一致时拒绝加载，避免
+    /// 运行时代码把高风险工具伪装成 `control`。manifest 未列出的工具保守降级为 `unknown`。
+    /// Host 还会按整个 component 已授予的能力抬高 scope；WASM 无法证明某个工具不会在
+    /// 内部调用进程、文件或 Agent Host API，因此不允许高权限插件仅靠自报 `control`
+    /// 跳过逐调用审批。
+    pub(crate) fn bind_tool_scope(&self, spec: &mut ToolSpec) -> Result<()> {
+        let guest_scope = spec.permission_scope;
+        let Some(manifest_scope) = self.tool_scopes.get(&spec.name).copied() else {
+            spec.permission_scope = ToolPermissionScope::Unknown;
+            return Ok(());
+        };
+        if guest_scope != ToolPermissionScope::Unknown && guest_scope != manifest_scope {
+            return Err(anyhow!(
+                "插件工具 `{}` 自报 scope `{}` 与 manifest 授权 `{}` 不一致",
+                spec.name,
+                guest_scope.as_str(),
+                manifest_scope.as_str()
+            ));
+        }
+        spec.permission_scope =
+            merge_tool_permission_scopes(manifest_scope, self.component_capability_scope_floor());
+        Ok(())
+    }
+
+    /// 把 component 任意代码可调用的 Host 能力折算为所有公开工具的保守 scope 下限。
+    fn component_capability_scope_floor(&self) -> Option<ToolPermissionScope> {
+        let mut scope = None;
+        let mut include = |required| {
+            scope = Some(match scope {
+                None => required,
+                Some(current) => merge_tool_permission_scopes(current, Some(required)),
+            });
+        };
+        if self.process_exec {
+            include(ToolPermissionScope::Shell);
+        }
+        if !self.fs_read.is_empty() {
+            include(ToolPermissionScope::Read);
+        }
+        if !self.fs_write.is_empty() {
+            include(ToolPermissionScope::Write);
+        }
+        if self.http {
+            include(ToolPermissionScope::Network);
+        }
+        if self.secrets
+            || self.model_completion
+            || self.agent.is_requested()
+            || self.surface_actions
+            || !self.surface_action_allowlist.is_empty()
+        {
+            include(ToolPermissionScope::Unknown);
+        }
+        scope
+    }
+
     /// 校验当前宿主尚未实现的能力。
     ///
     /// 只读文件和子进程能力由宿主 API 在运行时逐次鉴权。尚未实现的 HTTP、secret
     /// 和文件写入能力在加载阶段直接拒绝，不会静默授予。
     pub fn validate_supported(&self) -> Result<()> {
         self.agent.validate()?;
+        if self.surface_actions && !self.surface_action_allowlist.is_empty() {
+            return Err(anyhow!(
+                "surface_actions = true 与 surface_action_allowlist 不能同时声明"
+            ));
+        }
+        let mut surface_actions = HashSet::new();
+        for action in &self.surface_action_allowlist {
+            if !surface_actions.insert(*action) {
+                return Err(anyhow!(
+                    "surface_action_allowlist 重复声明 `{}`",
+                    action.as_str()
+                ));
+            }
+        }
+        for name in self.tool_scopes.keys() {
+            ToolSpec::new(
+                name,
+                "manifest scope validation",
+                ToolSpec::empty_object_schema(),
+            )
+            .validate_name()
+            .map_err(|error| anyhow!("manifest 工具 scope 名称 `{name}` 无效：{error}"))?;
+        }
         if self.http || self.secrets || !self.fs_write.is_empty() {
             return Err(anyhow!(
                 "当前 Lucia 版本尚未实现插件 HTTP、secret 或文件写入能力"
             ));
         }
         Ok(())
+    }
+}
+
+/// 合并工具自身 scope 与 component 能力下限；不同资源类型必须降级为 `unknown`。
+fn merge_tool_permission_scopes(
+    declared: ToolPermissionScope,
+    required: Option<ToolPermissionScope>,
+) -> ToolPermissionScope {
+    let Some(required) = required else {
+        return declared;
+    };
+    match (declared, required) {
+        (ToolPermissionScope::Control, required) => required,
+        (declared, ToolPermissionScope::Control) => declared,
+        (declared, required) if declared == required => declared,
+        _ => ToolPermissionScope::Unknown,
     }
 }

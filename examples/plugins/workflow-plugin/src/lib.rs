@@ -145,7 +145,15 @@ impl AgentPlugin for WorkflowPlugin {
             ),
         ]
         .into_iter()
-        .map(|tool| tool.with_permission_scope(ToolPermissionScope::Control))
+        .enumerate()
+        .map(|(index, tool)| {
+            if index >= 2 {
+                tool.with_permission_scope(ToolPermissionScope::Control)
+            } else {
+                // 创建或重置任务会派生 worker，不能伪装成纯内部控制操作。
+                tool
+            }
+        })
         .collect()
     }
 
@@ -1190,12 +1198,14 @@ export_plugin!(WorkflowPlugin);
 mod tests {
     use super::*;
 
-    /// Workflow 工具只编排 Host 受限运行，必须统一声明控制面 scope。
+    /// 会派生 worker 的写操作保持 unknown，只读查询才属于 control scope。
     #[test]
-    fn workflow_tools_declare_control_scope() {
+    fn workflow_tools_separate_delegation_from_control_scope() {
         let tools = WorkflowPlugin::default().list_tools();
         assert_eq!(tools.len(), 4);
-        assert!(tools
+        assert_eq!(tools[0].permission_scope, ToolPermissionScope::Unknown);
+        assert_eq!(tools[1].permission_scope, ToolPermissionScope::Unknown);
+        assert!(tools[2..]
             .iter()
             .all(|tool| tool.permission_scope == ToolPermissionScope::Control));
     }

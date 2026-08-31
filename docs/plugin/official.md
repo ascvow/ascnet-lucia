@@ -47,7 +47,7 @@ Command 是 TUI 默认原生状态机，负责斜杠命令补全、参数校验�
 
 Teammate 插件负责成员角色、稳定成员地址、有界邮箱、确认、dispatch 重试与消息注入规则，并通过 `teammate.mailbox@1.0.0` 向其他插件提供 owner 隔离的版本化服务。插件同时声明右侧团队摘要和全屏团队工作台，TUI 只负责通用视图渲染、焦点和导航。
 
-Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置。
+Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置；worker 模板继承同一个动态 Plugin Host，因此只读工具仍会经过权限插件与 Host 启动期门禁。
 
 ## Plan 插件
 
@@ -55,7 +55,7 @@ Plan 插件提供结构化计划的整体更新、只读查询、状态校验、
 
 ## 权限插件
 
-权限插件提供 Agent 工具策略与输入区审批 UI。它只读取 Core/Host 从可信 `ToolSpec` 绑定的权限 scope：`Control` 直接放行，`Read`、`Write`、`Shell`、`Network` 与 `Unknown` 进入当前审批模式，不维护工具名白名单。可信读写 scope 携带路径时只允许工作区内词法相对路径，`.env`、私钥、凭据目录和 `.git` 内容始终拒绝访问。审批卡片按 scope 展示脱敏摘要、原因、作用范围和风险，支持方向键加 `Enter` 及 `A/S/D/Esc` 快捷键。`/permission` 可切换“手动审批、帮我审批、全部放行”；模型代审只向 Host 固定的无工具小模型发送 scope 与脱敏摘要，失败或返回非精确二元结论时退回人工。拒绝会结束当前 Agent 运行并保留会话，任何模式都不会绕过已声明读写 scope 的敏感路径和工作区边界。
+权限插件提供 Agent 工具策略与输入区审批 UI。它只读取 Host 绑定的最终权限 scope：纯内部 `Control` 直接放行，`Read`、`Write`、`Shell`、`Network` 与 `Unknown` 进入当前审批模式。Host 会按 component 已授的进程、文件、模型、Agent 和宿主动作能力抬高 manifest `tool_scopes` 下限，高权限插件不能用 `Control` 跳过审批。可信读写 scope 携带路径时只允许工作区内词法相对路径，`.env`、私钥、凭据目录和 `.git` 内容始终拒绝访问。审批卡片按 scope 展示脱敏摘要、原因、作用范围和风险，支持方向键加 `Enter` 及 `A/S/D/Esc` 快捷键；会话级放行只适用于携带可验证顶层路径的同目录只读调用。`/permission` 可切换“手动审批、帮我审批、全部放行”，模式按项目隔离。模型代审只接受无额外字段的最小 JSON：`allow` 不携带原因，`deny` 必须携带非空原因；待审批状态按 Core 绑定的 `(run_id, call_id)` 隔离并发 Agent。拒绝或异常只阻止当前调用，详细原因不写入 Session，一次性说明仅作为下一轮的工具结果让对应 Agent 调整方案继续，不会被提升为 Developer 指令。全部放行下 Shell 仍拥有当前系统用户的完整原生权限，界面会持续警示。
 
 插件声明独占 `agent.tool-policy@1.0.0` 能力，因此 Host 会在其他插件完成工具 Rewrite 后执行最终检查。权限插件不申请文件、进程、HTTP、secret 或 Agent Runtime 能力；模型代审只申请受控 `model_completion`，命令输入清理只申请通用 `surface_actions`。Shell 审批只表示用户或审核模型接受该次完整宿主命令风险，不提供操作系统级隔离。
 

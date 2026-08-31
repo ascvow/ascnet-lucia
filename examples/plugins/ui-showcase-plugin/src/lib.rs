@@ -75,10 +75,7 @@ impl AgentPlugin for UiShowcasePlugin {
                 .and_then(|value| value.as_str())
                 .is_none_or(|message| message.trim().is_empty())
         {
-            return ToolDecision::Block {
-                reason: "set_message 必须提供非空 message".into(),
-            }
-            .into();
+            return ToolDecision::block("set_message 必须提供非空 message").into();
         }
         ToolDecision::Allow.into()
     }

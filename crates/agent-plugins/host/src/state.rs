@@ -19,7 +19,7 @@ const MAX_PLUGIN_STATE_BYTES: usize = 1024 * 1024;
 /// 单个插件允许持有的最大状态键数量。
 const MAX_PLUGIN_STATE_ENTRIES: usize = 1024;
 /// 当前磁盘状态信封版本；该版本独立于插件 ABI 与 manifest 版本。
-const PLUGIN_STATE_SCHEMA_VERSION: u32 = 1;
+const PLUGIN_STATE_SCHEMA_VERSION: u32 = 2;
 /// 临时文件名使用的进程内序号，避免同一进程连续写入发生冲突。
 static STATE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -29,6 +29,7 @@ pub(crate) struct PluginStateStore {
     root: PathBuf,
     path: PathBuf,
     plugin_id: String,
+    state_identity: String,
 }
 
 /// 磁盘中的版本化插件状态信封。
@@ -37,24 +38,36 @@ pub(crate) struct PluginStateStore {
 struct StoredPluginState {
     schema_version: u32,
     plugin_id: String,
+    state_identity: String,
     values: HashMap<String, Value>,
 }
 
 impl PluginStateStore {
-    /// 按稳定插件 ID 创建隔离存储地址；文件名使用摘要编码，禁止路径分隔符进入目标路径。
-    pub(crate) fn new(root: PathBuf, plugin_id: &str) -> Result<Self> {
+    /// 按稳定插件 ID 和 Host 绑定的 Bundle 身份创建隔离存储地址。
+    ///
+    /// `state_identity` 必须由 Host 根据真实 Component 与 capability profile 生成，不能接受
+    /// manifest metadata 或 Guest 输入。文件名使用摘要编码，禁止路径分隔符进入目标路径。
+    pub(crate) fn new(root: PathBuf, plugin_id: &str, state_identity: &str) -> Result<Self> {
         if root.as_os_str().is_empty() {
             bail!("插件状态目录不能为空");
         }
         if plugin_id.trim().is_empty() {
             bail!("插件状态 plugin_id 不能为空");
         }
-        let encoded_id = format!("{:x}", Sha256::digest(plugin_id.as_bytes()));
+        if state_identity.trim().is_empty() || state_identity.len() > 256 {
+            bail!("插件状态可信身份无效");
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"lucia-plugin-state-v2\0");
+        update_identity_field(&mut digest, plugin_id.as_bytes());
+        update_identity_field(&mut digest, state_identity.as_bytes());
+        let encoded_id = format!("{:x}", digest.finalize());
         let path = root.join(format!("{encoded_id}.json"));
         Ok(Self {
             root,
             path,
             plugin_id: plugin_id.to_string(),
+            state_identity: state_identity.to_string(),
         })
     }
 
@@ -88,6 +101,9 @@ impl PluginStateStore {
         if stored.plugin_id != self.plugin_id {
             bail!("插件状态身份不匹配：期望 `{}`", self.plugin_id);
         }
+        if stored.state_identity != self.state_identity {
+            bail!("插件状态 Bundle 身份不匹配：期望 `{}`", self.plugin_id);
+        }
         validate_values(&stored.values)?;
         Ok(stored.values)
     }
@@ -110,6 +126,7 @@ impl PluginStateStore {
         let contents = serde_json::to_vec_pretty(&StoredPluginState {
             schema_version: PLUGIN_STATE_SCHEMA_VERSION,
             plugin_id: self.plugin_id.clone(),
+            state_identity: self.state_identity.clone(),
             values: values.clone(),
         })
         .context("序列化插件状态失败")?;
@@ -152,6 +169,12 @@ impl PluginStateStore {
         }
         written
     }
+}
+
+/// 使用长度前缀写入身份字段，避免相邻可变长字段产生拼接歧义。
+fn update_identity_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
 }
 
 /// 校验持久映射的数量和键边界，防止绕过 Guest 请求校验注入异常磁盘状态。
@@ -199,7 +222,8 @@ mod tests {
     #[test]
     fn plugin_state_round_trip_is_scoped_by_plugin_id() {
         let root = test_root("round-trip");
-        let first = PluginStateStore::new(root.clone(), "permission").expect("创建权限状态存储");
+        let first = PluginStateStore::new(root.clone(), "permission", "bundle-a")
+            .expect("创建权限状态存储");
         first
             .save(&HashMap::from([(
                 "mode".into(),
@@ -207,13 +231,17 @@ mod tests {
             )]))
             .expect("保存权限状态");
 
-        let reopened = PluginStateStore::new(root.clone(), "permission").expect("重新打开状态");
+        let reopened =
+            PluginStateStore::new(root.clone(), "permission", "bundle-a").expect("重新打开状态");
         assert_eq!(
             reopened.load().expect("恢复权限状态").get("mode"),
             Some(&Value::String("model_review".into()))
         );
-        let other = PluginStateStore::new(root.clone(), "other").expect("创建隔离状态");
+        let other = PluginStateStore::new(root.clone(), "other", "bundle-a").expect("创建隔离状态");
         assert!(other.load().expect("读取隔离状态").is_empty());
+        let replacement = PluginStateStore::new(root.clone(), "permission", "bundle-b")
+            .expect("创建不同 Bundle 状态");
+        assert!(replacement.load().expect("读取不同 Bundle 状态").is_empty());
         fs::remove_dir_all(root).expect("清理插件状态测试目录");
     }
 
@@ -222,7 +250,8 @@ mod tests {
     #[test]
     fn plugin_state_uses_private_unix_permissions() {
         let root = test_root("permissions");
-        let store = PluginStateStore::new(root.clone(), "permission").expect("创建权限状态存储");
+        let store = PluginStateStore::new(root.clone(), "permission", "bundle-a")
+            .expect("创建权限状态存储");
         store
             .save(&HashMap::from([(
                 "mode".into(),
@@ -253,7 +282,8 @@ mod tests {
     #[test]
     fn plugin_state_rejects_entry_limit_before_writing() {
         let root = test_root("entry-limit");
-        let store = PluginStateStore::new(root.clone(), "permission").expect("创建权限状态存储");
+        let store = PluginStateStore::new(root.clone(), "permission", "bundle-a")
+            .expect("创建权限状态存储");
         let values = (0..=MAX_PLUGIN_STATE_ENTRIES)
             .map(|index| (format!("key-{index}"), Value::Null))
             .collect::<HashMap<_, _>>();
@@ -273,7 +303,8 @@ mod tests {
         fs::create_dir_all(&root).expect("创建状态测试目录");
         let external = root.with_extension("external.json");
         fs::write(&external, "外部文件").expect("创建符号链接外部目标");
-        let store = PluginStateStore::new(root.clone(), "permission").expect("创建权限状态存储");
+        let store = PluginStateStore::new(root.clone(), "permission", "bundle-a")
+            .expect("创建权限状态存储");
         symlink(&external, &store.path).expect("创建状态符号链接");
 
         let error = store

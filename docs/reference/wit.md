@@ -581,13 +581,14 @@ export list-tools: func() -> string;
 ```json
 {
   "id": "call-1",
+  "run_id": "run-1",
   "name": "echo",
   "args": { "text": "hello" },
   "permission_scope": "control"
 }
 ```
 
-`permission_scope` 由 Core/Host 从可信工具快照注入。旧 Host 缺失该字段时 Guest 按 `unknown` 处理；Guest 和模型自行提交的值不能覆盖最终绑定。
+`permission_scope` 由 Core/Host 从可信工具快照注入，`run_id` 由 Core 按当前 Agent 运行注入。有状态策略使用 `(run_id, id)` 隔离并发调用。两个字段都是可选加法字段；旧 Host 缺失 scope 时 Guest 按 `unknown` 处理，缺失运行 ID 时只能保留旧版单调用 ID 兼容行为。Guest 和模型自行提交的值不能覆盖最终绑定。
 
 输出 ToolResult：
 

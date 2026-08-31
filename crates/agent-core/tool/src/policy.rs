@@ -159,12 +159,33 @@ pub struct ResourceLimits {
     /// 同时运行的最大 Agent 数。
     #[serde(default)]
     pub max_concurrent_agents: Option<usize>,
+    /// 单个可信 principal 在一次激活生命周期内允许登记的 Agent 累计总数。
+    #[serde(default)]
+    pub max_agents_per_principal: Option<usize>,
+    /// 单个可信 principal 的派生 Agent 允许发起的模型请求累计次数。
+    #[serde(default)]
+    pub max_agent_model_requests_per_principal: Option<usize>,
+    /// 单个可信 principal 的派生 Agent 允许提交的模型请求累计序列化字节数。
+    #[serde(default)]
+    pub max_agent_model_request_bytes_per_principal: Option<usize>,
+    /// 单个可信 principal 的派生 Agent 允许预留的模型输出 token 累计总数。
+    #[serde(default)]
+    pub max_agent_model_output_tokens_per_principal: Option<usize>,
     /// 单次运行的墙钟时间上限，单位毫秒。
     #[serde(default)]
     pub wall_clock_ms: Option<u64>,
-    /// 允许创建的最大子进程数。
+    /// 单个 Host 能力实例允许同时持有的受管直接进程组数量。
+    ///
+    /// `0` 关闭全部进程入口；正数限制 Shell 工具实例或插件实例的并发受管句柄，不统计
+    /// 命令在进程组内部自行派生的后代。后代隔离与总进程数硬限制仍需操作系统沙箱提供。
     #[serde(default)]
     pub max_processes: Option<usize>,
+    /// 单个插件激活生命周期内允许发起的模型完成调用总数。
+    #[serde(default)]
+    pub max_plugin_model_completions: Option<usize>,
+    /// 单个插件激活生命周期内允许提交的模型完成请求累计字节数。
+    #[serde(default)]
+    pub max_plugin_model_input_bytes: Option<usize>,
 }
 
 /// 取两个可选限额中更严格的一个，`None` 视为无上限。
@@ -191,8 +212,32 @@ impl ResourceLimits {
                 self.max_concurrent_agents,
                 requested.max_concurrent_agents,
             ),
+            max_agents_per_principal: tighter(
+                self.max_agents_per_principal,
+                requested.max_agents_per_principal,
+            ),
+            max_agent_model_requests_per_principal: tighter(
+                self.max_agent_model_requests_per_principal,
+                requested.max_agent_model_requests_per_principal,
+            ),
+            max_agent_model_request_bytes_per_principal: tighter(
+                self.max_agent_model_request_bytes_per_principal,
+                requested.max_agent_model_request_bytes_per_principal,
+            ),
+            max_agent_model_output_tokens_per_principal: tighter(
+                self.max_agent_model_output_tokens_per_principal,
+                requested.max_agent_model_output_tokens_per_principal,
+            ),
             wall_clock_ms: tighter(self.wall_clock_ms, requested.wall_clock_ms),
             max_processes: tighter(self.max_processes, requested.max_processes),
+            max_plugin_model_completions: tighter(
+                self.max_plugin_model_completions,
+                requested.max_plugin_model_completions,
+            ),
+            max_plugin_model_input_bytes: tighter(
+                self.max_plugin_model_input_bytes,
+                requested.max_plugin_model_input_bytes,
+            ),
         }
     }
 
@@ -258,7 +303,16 @@ impl ExecutionPolicy {
             allow_network: true,
             allow_secrets: true,
             allow_process: true,
-            limits: ResourceLimits::default(),
+            limits: ResourceLimits {
+                max_processes: Some(8),
+                max_agents_per_principal: Some(128),
+                max_agent_model_requests_per_principal: Some(512),
+                max_agent_model_request_bytes_per_principal: Some(64 * 1024 * 1024),
+                max_agent_model_output_tokens_per_principal: Some(512 * 20_000),
+                max_plugin_model_completions: Some(128),
+                max_plugin_model_input_bytes: Some(8 * 1024 * 1024),
+                ..ResourceLimits::default()
+            },
         }
     }
 
@@ -280,8 +334,14 @@ impl ExecutionPolicy {
                 max_depth: Some(2),
                 max_children_per_agent: Some(4),
                 max_concurrent_agents: Some(2),
+                max_agents_per_principal: Some(16),
+                max_agent_model_requests_per_principal: Some(128),
+                max_agent_model_request_bytes_per_principal: Some(16 * 1024 * 1024),
+                max_agent_model_output_tokens_per_principal: Some(128 * 4096),
                 wall_clock_ms: Some(120_000),
                 max_processes: Some(0),
+                max_plugin_model_completions: Some(32),
+                max_plugin_model_input_bytes: Some(1024 * 1024),
             },
         }
     }
@@ -306,8 +366,14 @@ impl ExecutionPolicy {
                 max_depth: Some(0),
                 max_children_per_agent: Some(1),
                 max_concurrent_agents: Some(1),
+                max_agents_per_principal: Some(1),
+                max_agent_model_requests_per_principal: Some(0),
+                max_agent_model_request_bytes_per_principal: Some(0),
+                max_agent_model_output_tokens_per_principal: Some(0),
                 wall_clock_ms: Some(120_000),
                 max_processes: Some(0),
+                max_plugin_model_completions: Some(0),
+                max_plugin_model_input_bytes: Some(0),
             },
         }
     }
@@ -336,9 +402,12 @@ impl ExecutionPolicy {
     /// 判断可信运行平面是否允许启动 Shell 或其他原生子进程。
     ///
     /// 调用操作系统的每个进程入口都必须复用该方法，不能只依赖工具名 allowlist 或公开
-    /// 布尔字段，否则 Guest 别名与错误配置可能绕过受限 Profile。
+    /// 布尔字段，否则 Guest 别名与错误配置可能绕过受限 Profile。显式的零进程上限同样
+    /// 具有最终否决权；正数并发上限由具体 Host 能力实例在创建句柄时强制。
     pub fn permits_process_execution(&self) -> bool {
-        self.profile == ExecutionProfile::Serve && self.allow_process
+        self.profile == ExecutionProfile::Serve
+            && self.allow_process
+            && self.limits.max_processes != Some(0)
     }
 
     /// 判断策略是否允许调用指定工具。
@@ -454,6 +523,18 @@ mod tests {
         assert!(policy.permits_process_execution());
     }
 
+    /// Serve 平面显式收紧为零进程时，工具暴露和真实进程入口都必须拒绝。
+    #[test]
+    fn zero_process_limit_denies_process_tools() {
+        let mut policy = ExecutionPolicy::serve();
+        policy.limits.max_processes = Some(0);
+
+        assert!(!policy.permits_process_execution());
+        assert!(!policy.permits_tool("shell"));
+        assert!(!policy.permits_tool("process_exec"));
+        assert!(policy.permits_tool("read_file"));
+    }
+
     #[test]
     fn filesystem_scope_cannot_escape_current_root() {
         let scope = FilesystemScope::Root(PathBuf::from("/tmp/fixture"));
@@ -478,11 +559,23 @@ mod tests {
         let current = ResourceLimits {
             max_steps: Some(10),
             max_tokens: None,
+            max_agents_per_principal: Some(4),
+            max_agent_model_requests_per_principal: Some(8),
+            max_agent_model_request_bytes_per_principal: Some(2048),
+            max_agent_model_output_tokens_per_principal: Some(1024),
+            max_plugin_model_completions: Some(2),
+            max_plugin_model_input_bytes: Some(512),
             ..ResourceLimits::default()
         };
         let requested = ResourceLimits {
             max_steps: Some(64),
             max_tokens: Some(512),
+            max_agents_per_principal: Some(6),
+            max_agent_model_requests_per_principal: Some(4),
+            max_agent_model_request_bytes_per_principal: Some(1024),
+            max_agent_model_output_tokens_per_principal: Some(2048),
+            max_plugin_model_completions: Some(4),
+            max_plugin_model_input_bytes: Some(256),
             ..ResourceLimits::default()
         };
         let merged = current.restrict(&requested);
@@ -490,6 +583,18 @@ mod tests {
         assert_eq!(merged.max_steps, Some(10));
         // 当前维度无上限时采纳请求方的上限。
         assert_eq!(merged.max_tokens, Some(512));
+        assert_eq!(merged.max_agents_per_principal, Some(4));
+        assert_eq!(merged.max_agent_model_requests_per_principal, Some(4));
+        assert_eq!(
+            merged.max_agent_model_request_bytes_per_principal,
+            Some(1024)
+        );
+        assert_eq!(
+            merged.max_agent_model_output_tokens_per_principal,
+            Some(1024)
+        );
+        assert_eq!(merged.max_plugin_model_completions, Some(2));
+        assert_eq!(merged.max_plugin_model_input_bytes, Some(256));
     }
 
     #[test]

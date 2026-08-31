@@ -1,13 +1,14 @@
 use super::*;
 use crate::{AgentExecutionResult, RuntimeRunFinalizer, RuntimeRunObservation, ToolAccess};
 use agent_core::{
-    Agent, AgentOptions, ChatModel, InMemoryEventSink, ModelGateway, ModelRequest, ModelResponse,
-    ProviderAdapter,
+    Agent, AgentExtension, AgentOptions, ChatModel, ContextLoadRequest, ContextLoader,
+    InMemoryEventSink, LoadedContext, ModelGateway, ModelRequest, ModelResponse, ProviderAdapter,
 };
 use agent_tool::{JsonTool, ToolRegistry, ToolSpec};
 use anyhow::Result;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::Barrier;
 
 /// 记录 Runtime 上下文、Core 事件和收敛终态的可信测试观察器。
 struct RecordingRunObserver {
@@ -74,10 +75,84 @@ impl ProviderAdapter for FixedModel {
     }
 }
 
+/// 记录 provider 调用次数与最终输出上限的测试模型。
+struct RecordingModel {
+    calls: Arc<AtomicUsize>,
+    max_tokens: Arc<Mutex<Vec<Option<u32>>>>,
+}
+
+#[async_trait]
+impl ChatModel for RecordingModel {
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        self.max_tokens
+            .lock()
+            .expect("模型请求记录锁不应中毒")
+            .push(request.max_tokens);
+        Ok(ModelResponse::text("完成"))
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for RecordingModel {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+}
+
+/// 每次都返回错误并记录调用次数的测试模型。
+struct FailingModel {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ChatModel for FailingModel {
+    async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Err(anyhow::anyhow!("模拟 provider 失败"))
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for FailingModel {
+    fn name(&self) -> &'static str {
+        "failing"
+    }
+}
+
+/// 让两个 Agent 在 provider 门禁前同时完成上下文加载，用于验证并发原子预留。
+struct BarrierContextLoader {
+    barrier: Arc<Barrier>,
+}
+
+#[async_trait]
+impl ContextLoader for BarrierContextLoader {
+    async fn load(&self, request: ContextLoadRequest) -> Result<LoadedContext> {
+        self.barrier.wait().await;
+        Ok(LoadedContext::new(request.system, request.messages))
+    }
+}
+
 /// 等待通知的测试模型，用于验证取消语义。
 struct BlockingModel {
     entered: Arc<AtomicBool>,
     release: Arc<Notify>,
+}
+
+/// 记录每个 run 扩展清理次数，用于验证 Runtime 外部取消不会丢弃生命周期收尾。
+struct FinishRecordingExtension {
+    finished_runs: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentExtension for FinishRecordingExtension {
+    async fn finish_run(&self, run_id: &str) -> Result<()> {
+        self.finished_runs
+            .lock()
+            .expect("扩展清理记录锁不应中毒")
+            .push(run_id.to_string());
+        Ok(())
+    }
 }
 
 /// 首轮等待交互、第二轮验证 steering 已进入模型上下文的测试模型。
@@ -631,6 +706,60 @@ async fn cancellation_is_idempotent_and_terminal() {
     );
 }
 
+/// Runtime 外部取消必须等待 Core 调用 finish_run，不能直接丢弃仍在阻塞的运行 future。
+#[tokio::test]
+async fn external_cancellation_finishes_run_extension_lifecycle() {
+    let entered = Arc::new(AtomicBool::new(false));
+    let finished_runs = Arc::new(Mutex::new(Vec::new()));
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register(
+            "blocking-cleanup",
+            Arc::new(BlockingModel {
+                entered: Arc::clone(&entered),
+                release: Arc::new(Notify::new()),
+            }),
+        )
+        .expect("注册阻塞测试模型");
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("blocking-cleanup", "test-model"),
+    )
+    .with_extension(Arc::new(FinishRecordingExtension {
+        finished_runs: Arc::clone(&finished_runs),
+    }));
+    let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            AgentTemplate::from_agent(&agent),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载清理测试根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定清理测试 API");
+    let child = api
+        .spawn(AgentSpawnRequest::new("等待取消并清理扩展"))
+        .await
+        .expect("派生清理测试 Agent");
+
+    for _ in 0..100 {
+        if entered.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(entered.load(Ordering::Acquire));
+    assert!(api.cancel(&child.id).await.expect("取消阻塞 Agent"));
+    assert_eq!(
+        api.wait(&child.id).await.expect("等待取消终态"),
+        AgentOutcome::Cancelled
+    );
+
+    let finished_runs = finished_runs.lock().expect("扩展清理记录锁不应中毒");
+    assert_eq!(finished_runs.len(), 1);
+    assert!(!finished_runs[0].is_empty());
+}
+
 /// 应用级取消必须终止全部活动任务，但保留 controller 以便后续再次派生。
 #[tokio::test]
 async fn cancel_active_runs_preserves_ready_controllers() {
@@ -869,4 +998,501 @@ async fn subscribe_is_descendant_scoped() {
         .await
         .expect_err("兄弟节点不能订阅事件");
     assert!(matches!(error, AgentRuntimeError::PermissionDenied { .. }));
+}
+
+/// controller、首次派生与会话续跑必须共同消耗 principal 的累计 Agent 名额。
+#[tokio::test]
+async fn principal_agent_limit_counts_controller_spawn_and_continue() {
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_agents_per_principal: 3,
+        ..RuntimeLimits::default()
+    })
+    .expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(Arc::new(FixedModel), "fixed", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let child = api
+        .spawn(AgentSpawnRequest::new("首次任务"))
+        .await
+        .expect("派生 Agent");
+    api.wait(&child.id).await.expect("等待首次任务");
+    let continued = api
+        .continue_agent(&child.id, "后续任务".to_string())
+        .await
+        .expect("创建后续运行");
+    api.wait(&continued.id).await.expect("等待后续运行");
+
+    let error = api
+        .spawn(AgentSpawnRequest::new("超过累计名额"))
+        .await
+        .expect_err("第四个 Agent 应被拒绝");
+    assert!(matches!(
+        error,
+        AgentRuntimeError::MaxAgentsPerPrincipalExceeded { limit: 3 }
+    ));
+}
+
+/// 不同 principal 必须拥有彼此隔离的累计 Agent 账本。
+#[tokio::test]
+async fn principal_agent_limits_are_isolated() {
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_agents_per_principal: 1,
+        ..RuntimeLimits::default()
+    })
+    .expect("创建 Runtime");
+    let first = RuntimePrincipal::new("plugin:first").expect("创建第一 principal");
+    let second = RuntimePrincipal::new("plugin:second").expect("创建第二 principal");
+
+    runtime
+        .attach_root_for(
+            first.clone(),
+            template(Arc::new(FixedModel), "fixed-first", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("第一 principal 应获得自己的名额");
+    let error = runtime
+        .attach_root_for(
+            first,
+            template(Arc::new(FixedModel), "fixed-first-extra", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect_err("同一 principal 的第二个 controller 应被拒绝");
+    assert!(matches!(
+        error,
+        AgentRuntimeError::MaxAgentsPerPrincipalExceeded { limit: 1 }
+    ));
+    runtime
+        .attach_root_for(
+            second,
+            template(Arc::new(FixedModel), "fixed-second", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("另一 principal 不应受前者用量影响");
+}
+
+/// 父节点子数门禁失败时必须回滚 principal 预留，后续合法派生仍可使用该名额。
+#[tokio::test]
+async fn child_limit_failure_rolls_back_principal_reservation() {
+    let release = Arc::new(Semaphore::new(0));
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_depth: 2,
+        max_children_per_agent: 1,
+        max_agents_per_principal: 3,
+        ..RuntimeLimits::default()
+    })
+    .expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(
+                Arc::new(ConcurrencyModel {
+                    current: Arc::new(AtomicUsize::new(0)),
+                    maximum: Arc::new(AtomicUsize::new(0)),
+                    release: Arc::clone(&release),
+                }),
+                "rollback",
+                &[],
+            ),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let root_api = runtime.api(&root.id).await.expect("绑定根 API");
+    let child = root_api
+        .spawn(AgentSpawnRequest::new("第一个子节点"))
+        .await
+        .expect("第一个子节点应成功");
+    let error = root_api
+        .spawn(AgentSpawnRequest::new("超过父节点上限"))
+        .await
+        .expect_err("第二个直属子节点应被拒绝");
+    assert!(matches!(
+        error,
+        AgentRuntimeError::MaxChildrenExceeded { limit: 1 }
+    ));
+
+    let child_api = runtime.api(&child.id).await.expect("绑定子节点 API");
+    let grandchild = child_api
+        .spawn(AgentSpawnRequest::new("合法孙节点"))
+        .await
+        .expect("回滚后应仍有一个 principal 名额");
+    release.add_permits(2);
+    child_api.wait(&grandchild.id).await.expect("等待孙节点");
+    root_api.wait(&child.id).await.expect("等待子节点");
+}
+
+/// 多个 Agent 必须共享 principal 的模型请求次数账本，超额请求不能到达 provider。
+#[tokio::test]
+async fn model_request_limit_is_shared_across_agents() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let model = Arc::new(RecordingModel {
+        calls: Arc::clone(&calls),
+        max_tokens: Arc::new(Mutex::new(Vec::new())),
+    });
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_agent_model_requests_per_principal: 1,
+        ..RuntimeLimits::default()
+    })
+    .expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(model, "request-limit", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let first = api
+        .spawn(AgentSpawnRequest::new("第一请求"))
+        .await
+        .expect("派生第一 Agent");
+    assert_eq!(
+        api.wait(&first.id).await.expect("等待第一 Agent").status(),
+        AgentStatus::Succeeded
+    );
+    let second = api
+        .spawn(AgentSpawnRequest::new("第二请求"))
+        .await
+        .expect("派生第二 Agent");
+    let outcome = api.wait(&second.id).await.expect("等待第二 Agent");
+
+    assert_eq!(outcome.status(), AgentStatus::Failed);
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+}
+
+/// provider 失败后已预留的请求额度不得返还，后续重试仍应在 provider 前被拒绝。
+#[tokio::test]
+async fn failed_provider_call_does_not_refund_model_request_budget() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_agent_model_requests_per_principal: 1,
+        ..RuntimeLimits::default()
+    })
+    .expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(
+                Arc::new(FailingModel {
+                    calls: Arc::clone(&calls),
+                }),
+                "failing",
+                &[],
+            ),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let first = api
+        .spawn(AgentSpawnRequest::new("第一次调用"))
+        .await
+        .expect("派生第一 Agent");
+    assert_eq!(
+        api.wait(&first.id).await.expect("等待第一 Agent").status(),
+        AgentStatus::Failed
+    );
+    let second = api
+        .spawn(AgentSpawnRequest::new("失败后重试"))
+        .await
+        .expect("派生第二 Agent");
+    assert_eq!(
+        api.wait(&second.id).await.expect("等待第二 Agent").status(),
+        AgentStatus::Failed
+    );
+
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+}
+
+/// 请求序列化字节预算不足时必须在 provider 调用前失败。
+#[tokio::test]
+async fn model_request_bytes_limit_rejects_before_provider() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_agent_model_request_bytes_per_principal: 1,
+        ..RuntimeLimits::default()
+    })
+    .expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(
+                Arc::new(RecordingModel {
+                    calls: Arc::clone(&calls),
+                    max_tokens: Arc::new(Mutex::new(Vec::new())),
+                }),
+                "byte-limit",
+                &[],
+            ),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let child = api
+        .spawn(AgentSpawnRequest::new("必然超过一个字节"))
+        .await
+        .expect("派生 Agent");
+    let outcome = api.wait(&child.id).await.expect("等待 Agent");
+
+    assert_eq!(outcome.status(), AgentStatus::Failed);
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+}
+
+/// 派生 Agent 未声明 max_tokens 时，Runtime 必须在最终请求中注入有限单次上限。
+#[tokio::test]
+async fn missing_max_tokens_gets_safe_runtime_limit() {
+    let max_tokens = Arc::new(Mutex::new(Vec::new()));
+    let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(
+                Arc::new(RecordingModel {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    max_tokens: Arc::clone(&max_tokens),
+                }),
+                "missing-max-tokens",
+                &[],
+            ),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let child = api
+        .spawn(AgentSpawnRequest::new("检查输出上限"))
+        .await
+        .expect("派生 Agent");
+    assert_eq!(
+        api.wait(&child.id).await.expect("等待 Agent").status(),
+        AgentStatus::Succeeded
+    );
+
+    assert_eq!(
+        max_tokens
+            .lock()
+            .expect("模型请求记录锁不应中毒")
+            .as_slice(),
+        &[Some(DEFAULT_DERIVED_AGENT_MAX_TOKENS)]
+    );
+}
+
+/// 显式零输出上限不能作为零成本预留绕过 provider 前门禁。
+#[tokio::test]
+async fn zero_max_tokens_is_rejected_before_provider() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(
+                Arc::new(RecordingModel {
+                    calls: Arc::clone(&calls),
+                    max_tokens: Arc::new(Mutex::new(Vec::new())),
+                }),
+                "zero-max-tokens",
+                &[],
+            ),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let mut request = AgentSpawnRequest::new("检查零输出上限");
+    request.derive.options.max_tokens = Some(0);
+    let child = api.spawn(request).await.expect("派生 Agent");
+    let outcome = api.wait(&child.id).await.expect("等待 Agent");
+
+    assert_eq!(outcome.status(), AgentStatus::Failed);
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+}
+
+/// 并发 Agent 的输出 token 预留必须原子执行，累计预算只能放行其中一次请求。
+#[tokio::test]
+async fn concurrent_model_output_token_reservation_is_atomic() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let max_tokens = Arc::new(Mutex::new(Vec::new()));
+    let model = Arc::new(RecordingModel {
+        calls: Arc::clone(&calls),
+        max_tokens: Arc::clone(&max_tokens),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("output-budget", model)
+        .expect("注册记录模型应成功");
+    let mut options = AgentOptions::default().with_model_route("output-budget", "test-model");
+    options.max_tokens = Some(64);
+    let agent = Agent::new(gateway, options).with_context_loader(Arc::new(BarrierContextLoader {
+        barrier: Arc::new(Barrier::new(2)),
+    }));
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_agent_model_requests_per_principal: 2,
+        max_agent_model_output_tokens_per_principal: 64,
+        ..RuntimeLimits::default()
+    })
+    .expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            AgentTemplate::from_agent(&agent),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let first = api
+        .spawn(AgentSpawnRequest::new("并发一"))
+        .await
+        .expect("派生第一 Agent");
+    let second = api
+        .spawn(AgentSpawnRequest::new("并发二"))
+        .await
+        .expect("派生第二 Agent");
+    let (first_outcome, second_outcome) = tokio::join!(api.wait(&first.id), api.wait(&second.id));
+    let outcomes = [
+        first_outcome.expect("等待第一 Agent"),
+        second_outcome.expect("等待第二 Agent"),
+    ];
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.status() == AgentStatus::Succeeded)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.status() == AgentStatus::Failed)
+            .count(),
+        1
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        max_tokens
+            .lock()
+            .expect("模型请求记录锁不应中毒")
+            .as_slice(),
+        &[Some(64)]
+    );
+}
+
+/// 运行阶段的 Core steering 队列同样最多保留 32 条消息。
+#[tokio::test]
+async fn running_steering_queue_rejects_the_thirty_third_message() {
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(Notify::new());
+    let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(
+                Arc::new(InteractiveModel {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    saw_message: Arc::new(AtomicBool::new(false)),
+                }),
+                "bounded-steering",
+                &[],
+            ),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let child = api
+        .spawn(AgentSpawnRequest::new("等待实时消息"))
+        .await
+        .expect("派生 Agent");
+    while !entered.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+
+    for index in 0..STEERING_QUEUE_LIMIT {
+        api.steer(&child.id, format!("实时补充 {index}"))
+            .await
+            .expect("前 32 条 steering 应成功入队");
+    }
+    let error = api
+        .steer(&child.id, "第 33 条".to_string())
+        .await
+        .expect_err("第 33 条 steering 应被拒绝");
+    assert!(matches!(
+        error,
+        AgentRuntimeError::PendingInteractionsExceeded {
+            limit: STEERING_QUEUE_LIMIT,
+            ..
+        }
+    ));
+
+    release.notify_waiters();
+    assert_eq!(
+        api.wait(&child.id).await.expect("等待 Agent").status(),
+        AgentStatus::Succeeded
+    );
+}
+
+/// 排队阶段的 Runtime steering 缓冲同样最多保留 32 条消息。
+#[tokio::test]
+async fn queued_steering_buffer_rejects_the_thirty_third_message() {
+    let current = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_concurrent_agents: 1,
+        ..RuntimeLimits::default()
+    })
+    .expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(
+                Arc::new(ConcurrencyModel {
+                    current: Arc::clone(&current),
+                    maximum: Arc::new(AtomicUsize::new(0)),
+                    release: Arc::clone(&release),
+                }),
+                "queued-steering",
+                &[],
+            ),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let running = api
+        .spawn(AgentSpawnRequest::new("占用并发许可"))
+        .await
+        .expect("派生运行 Agent");
+    while current.load(Ordering::Acquire) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let queued = api
+        .spawn(AgentSpawnRequest::new("保持排队"))
+        .await
+        .expect("派生排队 Agent");
+
+    for index in 0..STEERING_QUEUE_LIMIT {
+        api.steer(&queued.id, format!("排队消息 {index}"))
+            .await
+            .expect("前 32 条 steering 应成功暂存");
+    }
+    let error = api
+        .steer(&queued.id, "第 33 条".to_string())
+        .await
+        .expect_err("第 33 条 steering 应被拒绝");
+    assert!(matches!(
+        error,
+        AgentRuntimeError::PendingInteractionsExceeded {
+            limit: STEERING_QUEUE_LIMIT,
+            ..
+        }
+    ));
+
+    // 排队消息会逐条开启后续模型轮次，因此一次性放行全部测试调用。
+    release.add_permits(64);
+    api.wait(&running.id).await.expect("等待运行 Agent");
+    api.wait(&queued.id).await.expect("等待排队 Agent");
 }

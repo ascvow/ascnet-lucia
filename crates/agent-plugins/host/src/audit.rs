@@ -3,7 +3,10 @@
 //! 本模块只描述 Plugin Host 已经掌握的事实，不依赖演进、评测或具体插件协议。调用方可
 //! 将这些 DTO 交给独立策略层判定，但不能借此改变 Host 的 manifest 鉴权或 owner 路由。
 
-use crate::manifest::{PluginManifest, ProvidedCapabilityMode, ResolvedPluginCapabilities};
+use crate::manifest::{
+    PluginManifest, ProvidedCapabilityMode, ResolvedPluginCapabilities,
+    SUPPORTED_PLUGIN_API_VERSION,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,10 +61,88 @@ pub struct ManifestProvidedCapability {
 pub struct ManifestCapabilitySnapshot {
     /// manifest 中的可信插件 ID。
     pub plugin_id: String,
-    /// 按能力 ID 与 scope 字节序排列的能力请求。
+    /// 按能力 ID 与 scope 字节序排列的 Host 能力请求和跨插件服务依赖授权。
     pub requested: Vec<ManifestCapabilityRequest>,
     /// 按能力 ID、版本和模式字节序排列的提供声明。
     pub provided: Vec<ManifestProvidedCapability>,
+}
+
+/// 插件 ABI 无需 manifest 额外声明即可获得的一项固有权限。
+///
+/// 该枚举只描述 Host 已经开放的稳定行为边界，不表示 Guest 实际使用了对应导出或 import。
+/// 新增或扩大固有权限时必须新增枚举项，使授权 profile、官方升级比较和启用审查同步变化。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PluginAbiIntrinsicPermission {
+    /// 向模型上下文贡献 developer prompt。
+    DeveloperPromptContribution,
+    /// 注册模型可见工具并处理路由到本插件的工具调用。
+    ToolContribution,
+    /// 读取进入插件链的工具调用，并可阻止、重写或取消当前 Agent 运行。
+    ToolCallInterception,
+    /// 读取工具执行后返回给模型的结果。
+    ToolResultObservation,
+    /// 接收 Host 已脱敏的 Agent 生命周期事件。
+    RedactedEventObservation,
+    /// 向应用事件流发布扩展事件，并影响主事件列表、Footer 或插件视图导航。
+    ExtensionEventEmission,
+    /// 提供插件视图和自有工具的结果渲染器。
+    PluginUiContribution,
+    /// 读写按插件与 Bundle 身份隔离的状态。
+    IsolatedStateAccess,
+    /// 提供插件服务，并按 manifest 依赖 ACL 发现或调用其他插件服务。
+    AclPluginServices,
+}
+
+impl PluginAbiIntrinsicPermission {
+    /// 返回启用审查使用的简体中文权限说明。
+    ///
+    /// 文案与稳定枚举项定义在同一可信 Host profile 中；TUI 只负责逐项渲染，不能另行维护
+    /// 一份可能与官方升级比较漂移的固定列表。
+    pub const fn review_description_zh_cn(self) -> &'static str {
+        match self {
+            Self::DeveloperPromptContribution => "向模型上下文注入 developer prompt",
+            Self::ToolContribution => "注册模型可见工具并处理路由到本插件的调用",
+            Self::ToolCallInterception => {
+                "读取进入插件链的工具名与参数，并可阻止、重写或取消当前 Agent 运行"
+            }
+            Self::ToolResultObservation => "读取工具执行后返回给模型的结果",
+            Self::RedactedEventObservation => "接收 Host 已脱敏的 Agent 生命周期事件",
+            Self::ExtensionEventEmission => {
+                "向应用事件流发布扩展事件，可更新主事件列表、Footer 或插件视图导航"
+            }
+            Self::PluginUiContribution => "提供插件 UI 和自有工具结果渲染",
+            Self::IsolatedStateAccess => "读写按插件与 Bundle 身份隔离的状态",
+            Self::AclPluginServices => {
+                "提供插件服务，并按 manifest 依赖 ACL 发现或调用其他插件服务"
+            }
+        }
+    }
+}
+
+/// 当前插件 ABI 的固有授权快照。
+///
+/// `api_version` 与有序权限列表共同参与稳定比较；它们独立于 manifest capability 和真实
+/// Component import，可避免把 ABI 固有行为误报成某个 Guest 的静态 import 使用事实。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginAbiAuthorizationProfile {
+    /// Host 已校验的插件 ABI 版本。
+    pub api_version: String,
+    /// 按稳定语义顺序排列的 ABI 固有权限。
+    pub intrinsic_permissions: Vec<PluginAbiIntrinsicPermission>,
+}
+
+/// 启用授权与官方升级迁移共同使用的完整稳定 profile。
+///
+/// 现有 [`ManifestCapabilitySnapshot`] 保持原结构和 import 可达性语义；本包装类型把 manifest
+/// 显式授权与 ABI 固有权限并列保存，避免破坏依赖旧 struct literal 的外部 Rust 源码。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginAuthorizationProfile {
+    /// Host 校验后的 manifest 请求、依赖和提供声明。
+    pub manifest: ManifestCapabilitySnapshot,
+    /// 对应 manifest `api_version` 的 ABI 固有授权。
+    pub abi: PluginAbiAuthorizationProfile,
 }
 
 /// Component 类型图中的接口条目种类。
@@ -301,8 +382,21 @@ pub fn snapshot_manifest_capabilities(
     if capabilities.model_completion {
         requested.push(capability_request("model_completion"));
     }
-    if capabilities.surface_actions {
-        requested.push(capability_request("surface_actions"));
+    if capabilities.surface_actions || !capabilities.surface_action_allowlist.is_empty() {
+        requested.push(ManifestCapabilityRequest {
+            capability_id: "surface_actions".into(),
+            scopes: if capabilities.surface_actions {
+                vec!["*".into()]
+            } else {
+                sorted_unique(
+                    capabilities
+                        .surface_action_allowlist
+                        .iter()
+                        .map(|action| action.as_str().to_string())
+                        .collect(),
+                )
+            },
+        });
     }
     if capabilities.process_exec {
         requested.push(capability_request("process_exec"));
@@ -323,6 +417,35 @@ pub fn snapshot_manifest_capabilities(
         requested.push(ManifestCapabilityRequest {
             capability_id: "fs_write".into(),
             scopes: sorted_unique(capabilities.fs_write.clone()),
+        });
+    }
+    if !capabilities.tool_scopes.is_empty() {
+        requested.push(ManifestCapabilityRequest {
+            capability_id: "tool_scopes".into(),
+            scopes: sorted_unique(
+                capabilities
+                    .tool_scopes
+                    .iter()
+                    .map(|(name, scope)| format!("{name}={}", scope.as_str()))
+                    .collect(),
+            ),
+        });
+    }
+    if !manifest.dependencies.is_empty() {
+        requested.push(ManifestCapabilityRequest {
+            capability_id: "service_dependencies".into(),
+            scopes: sorted_unique(
+                manifest
+                    .dependencies
+                    .iter()
+                    .map(|dependency| {
+                        format!(
+                            "{}@{};optional={}",
+                            dependency.id, dependency.version, dependency.optional
+                        )
+                    })
+                    .collect(),
+            ),
         });
     }
     requested.sort_by(|left, right| byte_cmp(&left.capability_id, &right.capability_id));
@@ -346,6 +469,42 @@ pub fn snapshot_manifest_capabilities(
         plugin_id: manifest.plugin.id.clone(),
         requested,
         provided,
+    })
+}
+
+/// 从已校验 manifest 生成启用与官方升级迁移共用的完整授权 profile。
+///
+/// profile 同时包含 manifest 显式 Host 能力、服务依赖、提供声明，以及当前 ABI 无需额外
+/// capability 即可使用的固有行为。它不检查 Guest 是否实际导入或调用这些行为；实际使用事实
+/// 仍由 Component 审计和运行期观察单独记录。
+///
+/// # Errors
+///
+/// manifest 身份、ABI、依赖或能力声明无效时返回错误。
+pub fn snapshot_plugin_authorization_profile(
+    manifest: &PluginManifest,
+) -> Result<PluginAuthorizationProfile> {
+    let manifest_snapshot = snapshot_manifest_capabilities(manifest)?;
+    debug_assert_eq!(
+        manifest.plugin.api_version, SUPPORTED_PLUGIN_API_VERSION,
+        "manifest 快照校验后必须使用当前插件 ABI"
+    );
+    Ok(PluginAuthorizationProfile {
+        manifest: manifest_snapshot,
+        abi: PluginAbiAuthorizationProfile {
+            api_version: manifest.plugin.api_version.clone(),
+            intrinsic_permissions: vec![
+                PluginAbiIntrinsicPermission::DeveloperPromptContribution,
+                PluginAbiIntrinsicPermission::ToolContribution,
+                PluginAbiIntrinsicPermission::ToolCallInterception,
+                PluginAbiIntrinsicPermission::ToolResultObservation,
+                PluginAbiIntrinsicPermission::RedactedEventObservation,
+                PluginAbiIntrinsicPermission::ExtensionEventEmission,
+                PluginAbiIntrinsicPermission::PluginUiContribution,
+                PluginAbiIntrinsicPermission::IsolatedStateAccess,
+                PluginAbiIntrinsicPermission::AclPluginServices,
+            ],
+        },
     })
 }
 
@@ -408,7 +567,7 @@ pub fn check_manifest_import_reachability(
 /// 扫描真实 WASM Component 并聚合 Host 审计证据。
 ///
 /// `observed_host_service_calls` 必须来自 [`HostServiceCallObserver`]，调用方负责裁剪时间窗；
-/// 本函数不会把服务调用混入 WIT imports 或 manifest capability。
+/// 本函数不会把动态服务调用事实混入 WIT imports 或 manifest 中的依赖授权快照。
 ///
 /// # Errors
 ///
@@ -598,6 +757,7 @@ fn mapped_host_imports(capability_id: &str) -> &'static [&'static str] {
         "agent.spawn" | "agent.observe" | "agent.cancel" => &["host-agent-runtime-call"],
         "model_completion" => &["host-model-complete"],
         "surface_actions" => &["host-agent-emit-event"],
+        "service_dependencies" => &["host-service-call"],
         "process_exec" => &[
             "host-process-kill",
             "host-process-read-line",
@@ -694,6 +854,100 @@ mod tests {
         assert_eq!(snapshot.requested[1].scopes, ["a", "z"]);
     }
 
+    /// 跨插件服务依赖必须进入稳定授权快照，并保留版本范围与可选语义。
+    #[test]
+    fn manifest_snapshot_preserves_service_dependencies() {
+        let manifest = manifest_from_toml(
+            r#"
+                [plugin]
+                id = "consumer"
+                name = "Consumer"
+                version = "1.0.0"
+                api_version = "0.7.0"
+                wasm = "consumer.wasm"
+
+                [[dependencies]]
+                id = "provider-z"
+                version = "^2.0"
+                optional = true
+
+                [[dependencies]]
+                id = "provider-a"
+                version = "^1.0"
+                optional = false
+            "#,
+        );
+
+        let snapshot = snapshot_manifest_capabilities(&manifest).expect("生成依赖授权快照");
+
+        assert_eq!(snapshot.requested.len(), 1);
+        assert_eq!(snapshot.requested[0].capability_id, "service_dependencies");
+        assert_eq!(
+            snapshot.requested[0].scopes,
+            [
+                "provider-a@^1.0;optional=false",
+                "provider-z@^2.0;optional=true",
+            ]
+        );
+    }
+
+    /// 无显式 capability 的 v0.7 Guest 仍必须获得完整 ABI 固有授权快照。
+    #[test]
+    fn authorization_profile_discloses_v07_intrinsic_permissions() {
+        let manifest = manifest_from_toml(
+            r#"
+                [plugin]
+                id = "minimal"
+                name = "Minimal"
+                version = "1.0.0"
+                api_version = "0.7.0"
+                wasm = "minimal.wasm"
+            "#,
+        );
+
+        let profile =
+            snapshot_plugin_authorization_profile(&manifest).expect("生成完整插件授权 profile");
+
+        assert!(profile.manifest.requested.is_empty());
+        assert!(profile.manifest.provided.is_empty());
+        assert_eq!(profile.abi.api_version, SUPPORTED_PLUGIN_API_VERSION);
+        assert_eq!(
+            profile.abi.intrinsic_permissions,
+            [
+                PluginAbiIntrinsicPermission::DeveloperPromptContribution,
+                PluginAbiIntrinsicPermission::ToolContribution,
+                PluginAbiIntrinsicPermission::ToolCallInterception,
+                PluginAbiIntrinsicPermission::ToolResultObservation,
+                PluginAbiIntrinsicPermission::RedactedEventObservation,
+                PluginAbiIntrinsicPermission::ExtensionEventEmission,
+                PluginAbiIntrinsicPermission::PluginUiContribution,
+                PluginAbiIntrinsicPermission::IsolatedStateAccess,
+                PluginAbiIntrinsicPermission::AclPluginServices,
+            ]
+        );
+        let review = profile
+            .abi
+            .intrinsic_permissions
+            .iter()
+            .map(|permission| permission.review_description_zh_cn())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(review.contains("developer prompt"), "{review}");
+        assert!(
+            review.contains("阻止、重写或取消当前 Agent 运行"),
+            "{review}"
+        );
+        assert!(review.contains("工具执行后返回给模型的结果"), "{review}");
+        assert!(review.contains("Host 已脱敏"), "{review}");
+        assert!(
+            review.contains("主事件列表、Footer 或插件视图导航"),
+            "{review}"
+        );
+        assert!(review.contains("插件 UI"), "{review}");
+        assert!(review.contains("Bundle 身份隔离"), "{review}");
+        assert!(review.contains("依赖 ACL"), "{review}");
+    }
+
     /// owner 快照必须使用 `provides.id`，并保留 Host 已解析的全部 owner。
     #[test]
     fn owner_snapshot_uses_provided_capability_id() {
@@ -745,6 +999,7 @@ mod tests {
                 capability_request("fs_read"),
                 capability_request("process_exec"),
                 capability_request("http"),
+                capability_request("service_dependencies"),
             ],
             provided: Vec::new(),
         };
@@ -764,7 +1019,8 @@ mod tests {
         assert!(checks[0].satisfied);
         assert!(checks[1].satisfied);
         assert!(!checks[2].satisfied);
-        assert!(!checks.iter().any(|check| check.capability_id == "service"));
+        assert!(checks[3].satisfied);
+        assert_eq!(checks[3].mapped_host_imports, ["host-service-call"]);
     }
 
     /// 构造根 Component 函数条目。

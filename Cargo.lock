@@ -57,6 +57,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "toml",
@@ -1859,6 +1860,7 @@ name = "permission-plugin"
 version = "0.1.0"
 dependencies = [
  "agent-plugin",
+ "serde",
  "serde_json",
  "wit-bindgen",
 ]

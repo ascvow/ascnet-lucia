@@ -11,7 +11,7 @@ use crate::capability::{
 };
 use crate::manifest::AgentCapabilitySection;
 use crate::services::{AgentRuntimeHostServices, ModelCompletionHostServices};
-use agent_core::{AgentEvent, ModelRequest, ReasoningLevel, ToolChoice};
+use agent_core::{AgentEvent, AgentEventKind, ModelRequest, ReasoningLevel, ToolChoice};
 use agent_runtime::{
     AgentEventStream, AgentId, AgentRuntimeApi, AgentSpawnRequest, RuntimePrincipal,
 };
@@ -20,6 +20,36 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+
+/// 单次 Guest 轮询最多检查的 Runtime 事件数，避免大量敏感增量造成长时间同步扫描。
+const MAX_AGENT_EVENT_SCAN_PER_POLL: usize = 4_096;
+
+/// Session 与扩展共享的稳定审批拒绝结果；完整原因只允许可信应用事件消费者读取。
+const BLOCKED_TOOL_GUEST_MESSAGE: &str = "工具调用未获批准，未执行。";
+
+/// 清洗允许跨 Guest 边界的 Runtime 事件。
+///
+/// 服务商私有推理增量会被直接丢弃；插件策略拒绝的工具结果保留调用身份与错误类别，
+/// 但完整审批原因会替换为稳定文案，避免 `agent.observe` 绕过 Core 的扩展事件脱敏。
+pub(super) fn sanitize_guest_visible_agent_event(mut event: AgentEvent) -> Option<AgentEvent> {
+    if event.kind == AgentEventKind::ModelThinkingDelta {
+        return None;
+    }
+    if event.kind == AgentEventKind::ToolFinished
+        && event.payload["runtime_origin"] == "plugin_policy"
+        && event.payload["error_kind"] == "permission_denied"
+    {
+        if let Some(payload) = event.payload.as_object_mut() {
+            payload.insert(
+                "content".into(),
+                json!({ "error": BLOCKED_TOOL_GUEST_MESSAGE }),
+            );
+            payload.remove("details");
+        }
+    }
+    Some(event)
+}
+
 /// 单个插件激活实例可使用的身份绑定 Agent Runtime。
 #[derive(Clone)]
 pub(crate) struct AgentRuntimeBinding {
@@ -62,7 +92,23 @@ impl AgentRuntimeBinding {
         let stream = streams
             .get_mut(target)
             .expect("已创建的 Agent 事件订阅必须存在");
-        Ok((0..limit).filter_map(|_| stream.try_next()).collect())
+        let mut visible = Vec::with_capacity(limit);
+        let scan_limit = limit
+            .saturating_mul(16)
+            .min(MAX_AGENT_EVENT_SCAN_PER_POLL)
+            .max(limit);
+        for _ in 0..scan_limit {
+            if visible.len() >= limit {
+                break;
+            }
+            let Some(event) = stream.try_next() else {
+                break;
+            };
+            if let Some(event) = sanitize_guest_visible_agent_event(event) {
+                visible.push(event);
+            }
+        }
+        Ok(visible)
     }
 
     /// 撤销当前插件激活 principal，并取消、清理其 controller 与全部后代。
@@ -114,6 +160,9 @@ impl CapabilityState {
             return Err(anyhow!("模型完成消息不能为空"));
         }
         let binding = binding.ok_or_else(|| anyhow!("应用未注入模型完成服务"))?;
+        binding
+            .reserve(request_json.len())
+            .map_err(capability_denied)?;
 
         let mut model_request = ModelRequest::new(binding.model, request.messages);
         model_request.system = request.system;

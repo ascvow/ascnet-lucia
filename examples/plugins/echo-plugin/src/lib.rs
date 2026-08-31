@@ -49,10 +49,8 @@ impl AgentPlugin for EchoPlugin {
                 .unwrap_or_default()
                 .is_empty();
             if is_empty {
-                return ToolDecision::Block {
-                    reason: "echo.text cannot be empty / echo.text 不能为空".to_string(),
-                }
-                .into();
+                return ToolDecision::block("echo.text cannot be empty / echo.text 不能为空")
+                    .into();
             }
         }
         ToolDecision::Allow.into()

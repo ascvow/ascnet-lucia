@@ -25,6 +25,7 @@ use crate::service::PluginServiceCall;
 use crate::service::ServiceRegistry;
 use crate::services::ModelCompletionHostServices;
 use crate::state::PluginStateStore;
+use crate::ui::UiHostActionRequest;
 pub(crate) use agent::AgentRuntimeBinding;
 use agent_tool::ExecutionPolicy;
 use anyhow::anyhow;
@@ -33,7 +34,7 @@ use serde_json::json;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 mod agent;
 mod process;
 mod requests;
@@ -84,6 +85,8 @@ pub(crate) struct CapabilityState {
     processes: HashMap<u64, ManagedProcess>,
     next_process_handle: u64,
     state: HashMap<String, Value>,
+    /// 当前 Guest 回调所属的可信 Agent run；独立 RAII 绑定保证异步导出被取消时也会恢复。
+    active_run_id: ActiveRunBinding,
     /// 应用可选注入的持久存储；缺失时保留实例内存语义。
     state_store: Option<PluginStateStore>,
 }
@@ -91,6 +94,47 @@ pub(crate) struct CapabilityState {
 /// Host 在真实 Manifest 或执行策略边界拒绝插件能力时使用的类型化错误。
 #[derive(Debug)]
 struct PluginCapabilityDenied(String);
+
+/// 可跨 `await` 持有的 Guest 回调运行绑定；同步锁只保护一个短生命周期字符串替换。
+#[derive(Clone, Default)]
+struct ActiveRunBinding(Arc<Mutex<Option<String>>>);
+
+impl ActiveRunBinding {
+    /// 进入一个 Guest 导出作用域并保存旧值；返回守卫被丢弃时恢复，覆盖取消与提前返回。
+    fn enter(&self, run_id: Option<&str>) -> ActiveRunScope {
+        let mut active = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::mem::replace(&mut *active, run_id.map(str::to_string));
+        ActiveRunScope {
+            binding: self.clone(),
+            previous,
+        }
+    }
+
+    /// 克隆当前可信运行 ID，避免在贡献注册表调用期间持有同步锁。
+    fn current(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+/// Guest 导出调用的运行作用域；Drop 路径是异步 Future 被取消时的清理保证。
+pub(crate) struct ActiveRunScope {
+    binding: ActiveRunBinding,
+    previous: Option<String>,
+}
+
+impl Drop for ActiveRunScope {
+    fn drop(&mut self) {
+        let mut active = self
+            .binding
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *active = self.previous.take();
+    }
+}
 
 impl std::fmt::Display for PluginCapabilityDenied {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -218,10 +262,12 @@ pub(crate) fn encode_host_response(result: Result<Value>) -> String {
 impl CapabilityState {
     /// 创建绑定到插件目录、manifest 请求和 Host 可信执行策略的能力状态。
     ///
-    /// `host_context` 必须由 Host 应用组装层提供；构造后所有原生进程入口同时要求其中
-    /// 的执行策略允许与 manifest 显式声明，拒绝 Guest 通过提示或工具名称扩大权限。
+    /// `state_identity` 必须由 Host 根据真实 Bundle 和 capability profile 生成；
+    /// `host_context` 必须由 Host 应用组装层提供。构造后所有原生进程入口同时要求其中的
+    /// 执行策略允许与 manifest 显式声明，拒绝 Guest 通过提示或工具名称扩大权限。
     pub(crate) fn new(
         plugin_id: String,
+        state_identity: String,
         plugin_dir: PathBuf,
         permissions: CapabilitySection,
         contributions: Arc<ContributionRegistry>,
@@ -230,7 +276,7 @@ impl CapabilityState {
     ) -> Result<Self> {
         let state_store = host_context
             .persistent_state_dir
-            .map(|root| PluginStateStore::new(root, &plugin_id))
+            .map(|root| PluginStateStore::new(root, &plugin_id, &state_identity))
             .transpose()?;
         let state = state_store
             .as_ref()
@@ -249,13 +295,20 @@ impl CapabilityState {
             processes: HashMap::new(),
             next_process_handle: 1,
             state,
+            active_run_id: ActiveRunBinding::default(),
             state_store,
         })
     }
 
+    /// 绑定当前 Guest 导出调用所属的可信运行；`None` 用于启动、服务与 UI 控制面。
+    pub(crate) fn enter_active_run_scope(&self, run_id: Option<&str>) -> ActiveRunScope {
+        self.active_run_id.enter(run_id)
+    }
+
     /// 处理动态工具注册请求。
     pub(crate) fn upsert_tool(&mut self, request_json: &str) -> Result<Value> {
-        let request: ToolRegistrationRequest = parse_request(request_json)?;
+        let mut request: ToolRegistrationRequest = parse_request(request_json)?;
+        self.permissions.bind_tool_scope(&mut request.spec)?;
         Ok(json!(self.contributions.upsert_tool(request)?))
     }
 
@@ -285,20 +338,29 @@ impl CapabilityState {
         if request.name.trim().is_empty() {
             return Err(anyhow!("扩展事件名称不能为空"));
         }
-        if request.name == crate::ui::UI_HOST_ACTION_EVENT && !self.permissions.surface_actions {
-            return Err(capability_denied(
-                "插件 manifest 未声明 surface_actions 能力",
-            ));
+        if request.name == crate::ui::UI_HOST_ACTION_EVENT {
+            let action: UiHostActionRequest =
+                serde_json::from_value(request.data.clone()).context("解析插件宿主界面动作失败")?;
+            if !self.permissions.allows_surface_action(action.action.kind()) {
+                return Err(capability_denied(format!(
+                    "插件 manifest 未授权 surface action `{}`",
+                    action.action.kind().as_str()
+                )));
+            }
         }
-        self.contributions.emit_event(json!({
-            "source": {
-                "type": "plugin",
-                "id": self.plugin_id,
-            },
-            "name": request.name,
-            "data": request.data,
-            "presentation": request.presentation,
-        }))?;
+        let active_run_id = self.active_run_id.current();
+        self.contributions.emit_event(
+            active_run_id.as_deref(),
+            json!({
+                "source": {
+                    "type": "plugin",
+                    "id": self.plugin_id,
+                },
+                "name": request.name,
+                "data": request.data,
+                "presentation": request.presentation,
+            }),
+        )?;
         Ok(Value::Null)
     }
 
@@ -362,9 +424,10 @@ impl CapabilityState {
     /// 查询当前服务目录。
     pub(crate) fn list_services(&mut self, request_json: &str) -> Result<Value> {
         let request: ServiceListRequest = parse_request(request_json)?;
-        Ok(serde_json::to_value(
-            self.services.list(request.plugin_id.as_deref())?,
-        )?)
+        Ok(serde_json::to_value(self.services.list_for_plugin(
+            &self.plugin_id,
+            request.plugin_id.as_deref(),
+        )?)?)
     }
 
     /// 克隆服务调用所需的可信调用方和共享路由器。

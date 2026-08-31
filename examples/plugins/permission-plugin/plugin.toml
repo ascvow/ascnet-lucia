@@ -12,6 +12,6 @@ version = "1.0.0"
 mode = "exclusive"
 
 [capabilities]
-# 模型代审只使用 Host 固定的小模型路由；命令完成后通过通用动作清空主输入。
+# 模型代审只使用 Host 固定的小模型路由；命令完成后只允许清空主输入。
 model_completion = true
-surface_actions = true
+surface_action_allowlist = ["set_input"]

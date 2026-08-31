@@ -18,6 +18,38 @@ use tokio::sync::mpsc;
 /// 单个 Agent 为实时观察者保留的最近事件数量。
 const AGENT_EVENT_HISTORY_LIMIT: usize = 512;
 
+/// Serve 平面单 principal 默认允许登记的 Agent 累计总数。
+const DEFAULT_MAX_AGENTS_PER_PRINCIPAL: usize = 128;
+
+/// Serve 平面单 principal 默认允许发起的 Agent 模型请求累计次数。
+const DEFAULT_MAX_AGENT_MODEL_REQUESTS_PER_PRINCIPAL: usize = 512;
+
+/// Serve 平面单 principal 默认允许提交的 Agent 模型请求累计序列化字节数。
+const DEFAULT_MAX_AGENT_MODEL_REQUEST_BYTES_PER_PRINCIPAL: usize = 64 * 1024 * 1024;
+
+/// Serve 平面单 principal 默认允许预留的 Agent 模型输出 token 累计总数。
+const DEFAULT_MAX_AGENT_MODEL_OUTPUT_TOKENS_PER_PRINCIPAL: usize = 512 * 20_000;
+
+/// 为旧版 RuntimeLimits JSON 补充安全的单 principal Agent 总数默认值。
+const fn default_max_agents_per_principal() -> usize {
+    DEFAULT_MAX_AGENTS_PER_PRINCIPAL
+}
+
+/// 为旧版 RuntimeLimits JSON 补充安全的单 principal 模型请求次数默认值。
+const fn default_max_agent_model_requests_per_principal() -> usize {
+    DEFAULT_MAX_AGENT_MODEL_REQUESTS_PER_PRINCIPAL
+}
+
+/// 为旧版 RuntimeLimits JSON 补充安全的单 principal 模型请求字节默认值。
+const fn default_max_agent_model_request_bytes_per_principal() -> usize {
+    DEFAULT_MAX_AGENT_MODEL_REQUEST_BYTES_PER_PRINCIPAL
+}
+
+/// 为旧版 RuntimeLimits JSON 补充安全的单 principal 模型输出 token 默认值。
+const fn default_max_agent_model_output_tokens_per_principal() -> usize {
+    DEFAULT_MAX_AGENT_MODEL_OUTPUT_TOKENS_PER_PRINCIPAL
+}
+
 /// Agent Runtime 的资源与拓扑限额。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeLimits {
@@ -27,6 +59,18 @@ pub struct RuntimeLimits {
     pub max_children_per_agent: usize,
     /// 同时执行模型循环的最大 Agent 数量；额外任务保持排队状态。
     pub max_concurrent_agents: usize,
+    /// 单个可信 principal 在一次激活生命周期内允许登记的 Agent 累计总数。
+    #[serde(default = "default_max_agents_per_principal")]
+    pub max_agents_per_principal: usize,
+    /// 单个可信 principal 的派生 Agent 允许发起的模型请求累计次数。
+    #[serde(default = "default_max_agent_model_requests_per_principal")]
+    pub max_agent_model_requests_per_principal: usize,
+    /// 单个可信 principal 的派生 Agent 允许提交的模型请求累计序列化字节数。
+    #[serde(default = "default_max_agent_model_request_bytes_per_principal")]
+    pub max_agent_model_request_bytes_per_principal: usize,
+    /// 单个可信 principal 的派生 Agent 允许预留的模型输出 token 累计总数。
+    #[serde(default = "default_max_agent_model_output_tokens_per_principal")]
+    pub max_agent_model_output_tokens_per_principal: usize,
 }
 
 impl Default for RuntimeLimits {
@@ -35,6 +79,12 @@ impl Default for RuntimeLimits {
             max_depth: 8,
             max_children_per_agent: 16,
             max_concurrent_agents: 8,
+            max_agents_per_principal: DEFAULT_MAX_AGENTS_PER_PRINCIPAL,
+            max_agent_model_requests_per_principal: DEFAULT_MAX_AGENT_MODEL_REQUESTS_PER_PRINCIPAL,
+            max_agent_model_request_bytes_per_principal:
+                DEFAULT_MAX_AGENT_MODEL_REQUEST_BYTES_PER_PRINCIPAL,
+            max_agent_model_output_tokens_per_principal:
+                DEFAULT_MAX_AGENT_MODEL_OUTPUT_TOKENS_PER_PRINCIPAL,
         }
     }
 }
@@ -43,8 +93,9 @@ impl RuntimeLimits {
     /// 按执行策略的资源上限收紧运行时限额。
     ///
     /// 逐维度取较小值，策略未设该维度上限时保持原值，因此结果不会放宽任何一项。
-    /// `max_children_per_agent` 与 `max_concurrent_agents` 至少保留 1，以维持
-    /// [`RuntimeLimits::validate`] 要求的正数不变量；真正阻断派生依靠 `max_depth`。
+    /// `max_children_per_agent`、`max_concurrent_agents` 与 `max_agents_per_principal`
+    /// 至少保留 1，以维持 [`RuntimeLimits::validate`] 要求的正数不变量并容纳 controller；
+    /// 真正阻断派生依靠 `max_depth`。
     pub fn clamped_by(&self, limits: &ResourceLimits) -> Self {
         Self {
             max_depth: limits
@@ -60,6 +111,26 @@ impl RuntimeLimits {
                 .map_or(self.max_concurrent_agents, |limit| {
                     self.max_concurrent_agents.min(limit).max(1)
                 }),
+            max_agents_per_principal: limits
+                .max_agents_per_principal
+                .map_or(self.max_agents_per_principal, |limit| {
+                    self.max_agents_per_principal.min(limit).max(1)
+                }),
+            max_agent_model_requests_per_principal: limits
+                .max_agent_model_requests_per_principal
+                .map_or(self.max_agent_model_requests_per_principal, |limit| {
+                    self.max_agent_model_requests_per_principal.min(limit)
+                }),
+            max_agent_model_request_bytes_per_principal: limits
+                .max_agent_model_request_bytes_per_principal
+                .map_or(self.max_agent_model_request_bytes_per_principal, |limit| {
+                    self.max_agent_model_request_bytes_per_principal.min(limit)
+                }),
+            max_agent_model_output_tokens_per_principal: limits
+                .max_agent_model_output_tokens_per_principal
+                .map_or(self.max_agent_model_output_tokens_per_principal, |limit| {
+                    self.max_agent_model_output_tokens_per_principal.min(limit)
+                }),
         }
     }
 
@@ -73,6 +144,11 @@ impl RuntimeLimits {
         if self.max_concurrent_agents == 0 {
             return Err(AgentRuntimeError::InvalidLimits(
                 "max_concurrent_agents 必须大于零".to_string(),
+            ));
+        }
+        if self.max_agents_per_principal == 0 {
+            return Err(AgentRuntimeError::InvalidLimits(
+                "max_agents_per_principal 必须大于零".to_string(),
             ));
         }
         Ok(())

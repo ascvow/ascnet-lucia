@@ -8,6 +8,7 @@ use crate::capability::{
     capability_denied, CapabilityState, MAX_PLUGIN_PROCESSES, MAX_PROCESS_LINE_BYTES,
     MAX_PROCESS_WRITE_BYTES, MAX_READ_TIMEOUT_MS,
 };
+use agent_tool::ExecutionProfile;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -42,13 +43,27 @@ impl ManagedProcess {
     }
 }
 
+impl Drop for ManagedProcess {
+    /// 插件停用、Host 状态替换或 future 取消时同步回收整个独立进程组。
+    fn drop(&mut self) {
+        self.start_kill_tree();
+    }
+}
+
 impl CapabilityState {
     /// 启动一个带管道 stdin/stdout 的长驻子进程。
     pub(crate) fn spawn_process(&mut self, request_json: &str) -> Result<Value> {
         self.require_process_exec()?;
-        if self.processes.len() >= MAX_PLUGIN_PROCESSES {
+        // 这里只统计当前插件实例持有的受管直接进程组句柄；命令组内后代不计入该值。
+        let process_limit = self
+            .execution_policy
+            .limits
+            .max_processes
+            .unwrap_or(MAX_PLUGIN_PROCESSES)
+            .min(MAX_PLUGIN_PROCESSES);
+        if self.processes.len() >= process_limit {
             return Err(anyhow!(
-                "单个插件最多可同时运行 {MAX_PLUGIN_PROCESSES} 个进程"
+                "当前策略允许单个插件同时运行的进程数上限为 {process_limit}"
             ));
         }
 
@@ -164,9 +179,15 @@ impl CapabilityState {
     }
 
     pub(crate) fn require_process_exec(&self) -> Result<()> {
-        if !self.execution_policy.permits_process_execution() {
+        if self.execution_policy.profile() != ExecutionProfile::Serve
+            || !self.execution_policy.allow_process
+        {
             return Err(capability_denied("Host ExecutionPolicy 禁止插件进程执行"));
         }
+        if self.execution_policy.limits.max_processes == Some(0) {
+            return Err(capability_denied("Host ExecutionPolicy 的进程数上限为 0"));
+        }
+        debug_assert!(self.execution_policy.permits_process_execution());
         if !self.permissions.process_exec {
             return Err(capability_denied("插件 manifest 未声明 process_exec 能力"));
         }

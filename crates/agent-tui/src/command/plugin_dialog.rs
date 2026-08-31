@@ -3,7 +3,8 @@
 use crate::app::App;
 use crate::command::{
     load_native_plugin_dialog, NativePluginDialog, NativePluginDialogData,
-    NativePluginDialogStatus, NativePluginPathMode,
+    NativePluginDialogStatus, NativePluginPathMode, PendingCapabilityOwnerSelection,
+    PendingPluginEnable,
 };
 use crate::event::UiEvent;
 use crate::plugin::management::{ManualPluginAction, PluginManagementOutcome};
@@ -22,6 +23,9 @@ impl App {
             path_mode: None,
             path_input: String::new(),
             remove_confirmation: None,
+            enable_confirmation: None,
+            pending_owner_selection: None,
+            review_scroll: 0,
         });
         self.reload_native_plugins();
     }
@@ -34,6 +38,9 @@ impl App {
         };
         dialog.status = NativePluginDialogStatus::Loading;
         dialog.remove_confirmation = None;
+        dialog.enable_confirmation = None;
+        dialog.pending_owner_selection = None;
+        dialog.review_scroll = 0;
         let Some(service) = self.plugin_management.as_ref().map(Arc::clone) else {
             dialog.status =
                 NativePluginDialogStatus::Error("插件管理服务不可用；插件写操作已禁用".into());
@@ -95,7 +102,7 @@ impl App {
         }
     }
 
-    /// 处理插件管理页的列表导航、路径输入、启停和二次确认移除。
+    /// 处理插件管理页的列表导航、路径输入、启停及 Owner 授权确认。
     #[cfg(feature = "plugins")]
     pub(crate) fn handle_native_plugin_dialog_key(
         &mut self,
@@ -109,6 +116,9 @@ impl App {
             return false;
         };
         if let Some(mode) = dialog.path_mode {
+            dialog.remove_confirmation = None;
+            dialog.enable_confirmation = None;
+            dialog.pending_owner_selection = None;
             match code {
                 KeyCode::Esc => {
                     dialog.path_mode = None;
@@ -127,20 +137,20 @@ impl App {
                         NativePluginPathMode::InstallRegistry => {
                             ManualPluginAction::InstallRegistry {
                                 request: dialog.path_input.trim().to_string(),
-                                enabled: true,
+                                enabled: false,
                             }
                         }
                         NativePluginPathMode::InstallGithub => ManualPluginAction::InstallGithub {
                             source: dialog.path_input.trim().to_string(),
-                            enabled: true,
+                            enabled: false,
                         },
                         NativePluginPathMode::Install => ManualPluginAction::InstallLocal {
                             bundle: PathBuf::from(dialog.path_input.trim()),
-                            enabled: true,
+                            enabled: false,
                         },
                         NativePluginPathMode::Replace => ManualPluginAction::ReplaceLocal {
                             bundle: PathBuf::from(dialog.path_input.trim()),
-                            enabled: true,
+                            enabled: false,
                         },
                         NativePluginPathMode::Rollback => {
                             let mut parts = dialog.path_input.split_whitespace();
@@ -165,9 +175,32 @@ impl App {
                             {
                                 return true;
                             }
+                            let capability_id = capability_id.to_string();
+                            let plugin_id = plugin_id.to_string();
+                            let disabled_plugin = match &dialog.status {
+                                NativePluginDialogStatus::Ready(data) => data
+                                    .plugins
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, plugin)| plugin.id == plugin_id && !plugin.enabled)
+                                    .map(|(index, plugin)| (index, plugin.bundle_identity())),
+                                _ => None,
+                            };
+                            if let Some((index, bundle_identity)) = disabled_plugin {
+                                dialog.selected = index;
+                                dialog.path_mode = None;
+                                dialog.path_input.clear();
+                                dialog.pending_owner_selection =
+                                    Some(PendingCapabilityOwnerSelection {
+                                        capability_id,
+                                        plugin_id,
+                                        bundle_identity,
+                                    });
+                                return true;
+                            }
                             ManualPluginAction::SelectCapabilityOwner {
-                                capability_id: capability_id.to_string(),
-                                plugin_id: plugin_id.to_string(),
+                                capability_id,
+                                plugin_id,
                             }
                         }
                         NativePluginPathMode::ClearCapabilityOwner => {
@@ -190,6 +223,35 @@ impl App {
             | NativePluginDialogStatus::Applying
             | NativePluginDialogStatus::Error(_) => 0,
         };
+        if dialog.enable_confirmation.is_some() {
+            match code {
+                KeyCode::Up => {
+                    dialog.review_scroll = dialog.review_scroll.saturating_sub(1);
+                    return true;
+                }
+                KeyCode::Down => {
+                    dialog.review_scroll = dialog.review_scroll.saturating_add(1);
+                    return true;
+                }
+                KeyCode::PageUp => {
+                    dialog.review_scroll = dialog.review_scroll.saturating_sub(8);
+                    return true;
+                }
+                KeyCode::PageDown => {
+                    dialog.review_scroll = dialog.review_scroll.saturating_add(8);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if code != KeyCode::Char('e') {
+            dialog.enable_confirmation = None;
+            dialog.pending_owner_selection = None;
+            dialog.review_scroll = 0;
+        }
+        if code != KeyCode::Char('x') {
+            dialog.remove_confirmation = None;
+        }
         match code {
             KeyCode::Esc => self.native_command.plugin_dialog = None,
             KeyCode::Char('r') => self.reload_native_plugins(),
@@ -233,26 +295,67 @@ impl App {
             KeyCode::Up if item_count > 0 => {
                 dialog.selected = dialog.selected.checked_sub(1).unwrap_or(item_count - 1);
                 dialog.remove_confirmation = None;
+                dialog.enable_confirmation = None;
             }
             KeyCode::Down if item_count > 0 => {
                 dialog.selected = (dialog.selected + 1) % item_count;
                 dialog.remove_confirmation = None;
+                dialog.enable_confirmation = None;
             }
             KeyCode::Char('e') if item_count > 0 => {
                 let NativePluginDialogStatus::Ready(data) = &dialog.status else {
                     unreachable!("插件数量只会来自 Ready 状态");
                 };
                 let plugin = &data.plugins[dialog.selected.min(data.plugins.len() - 1)];
-                let action = if plugin.enabled {
-                    ManualPluginAction::Disable {
-                        plugin_id: plugin.id.clone(),
-                    }
+                let plugin_id = plugin.id.clone();
+                let enabled = plugin.enabled;
+                let bundle_identity = plugin.bundle_identity();
+                let authorization_profile_available = data.authorizations.contains_key(&plugin_id);
+                if enabled {
+                    self.start_native_plugin_action(ManualPluginAction::Disable { plugin_id });
+                } else if let Some(confirmation) = dialog
+                    .enable_confirmation
+                    .as_ref()
+                    .filter(|confirmation| confirmation.plugin_id == plugin_id)
+                    .cloned()
+                {
+                    let action = match dialog.pending_owner_selection.as_ref() {
+                        Some(pending)
+                            if pending.plugin_id == plugin_id
+                                && pending.bundle_identity == confirmation.bundle_identity =>
+                        {
+                            ManualPluginAction::EnableAndSelectCapabilityOwner {
+                                capability_id: pending.capability_id.clone(),
+                                plugin_id,
+                                expected_identity: confirmation.bundle_identity,
+                            }
+                        }
+                        Some(_) => {
+                            dialog.enable_confirmation = None;
+                            dialog.pending_owner_selection = None;
+                            return true;
+                        }
+                        None => ManualPluginAction::Enable {
+                            plugin_id,
+                            expected_identity: confirmation.bundle_identity,
+                        },
+                    };
+                    self.start_native_plugin_action(action);
+                } else if !authorization_profile_available {
+                    dialog.enable_confirmation = None;
+                    dialog.pending_owner_selection = None;
+                    dialog.review_scroll = 0;
+                    dialog.status = NativePluginDialogStatus::Error(format!(
+                        "插件 `{plugin_id}` 的授权 profile 不可用；已拒绝启用，请刷新后重试"
+                    ));
                 } else {
-                    ManualPluginAction::Enable {
-                        plugin_id: plugin.id.clone(),
-                    }
-                };
-                self.start_native_plugin_action(action);
+                    dialog.enable_confirmation = Some(PendingPluginEnable {
+                        plugin_id,
+                        bundle_identity,
+                    });
+                    dialog.review_scroll = 0;
+                    dialog.remove_confirmation = None;
+                }
             }
             KeyCode::Char('x') if item_count > 0 => {
                 let NativePluginDialogStatus::Ready(data) = &dialog.status else {
@@ -266,6 +369,7 @@ impl App {
                     self.start_native_plugin_action(ManualPluginAction::Remove { plugin_id });
                 } else {
                     dialog.remove_confirmation = Some(plugin_id);
+                    dialog.enable_confirmation = None;
                 }
             }
             _ => {}
@@ -280,12 +384,19 @@ impl App {
             if let Some(dialog) = self.native_command.plugin_dialog.as_mut() {
                 dialog.status =
                     NativePluginDialogStatus::Error("插件管理服务不可用；插件写操作已禁用".into());
+                dialog.remove_confirmation = None;
+                dialog.enable_confirmation = None;
+                dialog.pending_owner_selection = None;
+                dialog.review_scroll = 0;
             }
             return;
         };
         if let Some(dialog) = self.native_command.plugin_dialog.as_mut() {
             dialog.status = NativePluginDialogStatus::Applying;
             dialog.remove_confirmation = None;
+            dialog.enable_confirmation = None;
+            dialog.pending_owner_selection = None;
+            dialog.review_scroll = 0;
         }
         let tx = self.tx.clone();
         tokio::spawn(async move {

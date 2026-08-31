@@ -1,6 +1,9 @@
 //! GitHub Release 插件 bundle 获取与安全解包。
 
-use crate::{InstallOptions, InstalledPlugin, PluginManager};
+use crate::{
+    manager::{BundleReplacementPolicy, PluginManagerWriteGuard, StagedManifestValidator},
+    InstallOptions, InstalledPlugin, PluginManager,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use reqwest::{header, Client};
@@ -74,7 +77,10 @@ impl GithubPluginSource {
 /// GitHub Release 安装行为选项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubInstallOptions {
-    /// 安装完成后是否立即启用插件。
+    /// 是否请求以启用状态提交下载后的 Bundle。
+    ///
+    /// 公开 GitHub 安装入口只接受 `false`；`true` 仅供 Manager 内部可信 Registry 更新在
+    /// 重新核验 staged manifest、来源主体、能力和依赖后受限继承既有授权。
     pub enabled: bool,
     /// 指定 Release tag；未指定时使用 latest release。
     pub tag: Option<String>,
@@ -89,7 +95,8 @@ pub struct GithubInstallOptions {
 impl Default for GithubInstallOptions {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // 下载与校验不等于授权；默认安装后保持禁用。
+            enabled: false,
             tag: None,
             asset: None,
             expected_sha256: None,
@@ -121,16 +128,47 @@ impl PluginManager {
         source: &GithubPluginSource,
         options: GithubInstallOptions,
     ) -> Result<GithubInstallResult> {
-        self.install_github_with_mode(source, options, false).await
+        if options.enabled {
+            bail!("从 GitHub 安装不能直接启用插件；请先审查下载后 Bundle 的来源和能力");
+        }
+        self.install_github_with_mode(source, options, None, None, None)
+            .await
     }
 
-    /// 下载并原子替换同 ID 的已安装插件，供 Registry 更新流程调用。
+    /// 在已获取的 Manager 事务中安装 Registry Bundle，并校验 staged manifest。
+    pub(crate) async fn install_github_in_transaction(
+        &self,
+        source: &GithubPluginSource,
+        options: GithubInstallOptions,
+        transaction: &PluginManagerWriteGuard,
+        staged_manifest_validator: &StagedManifestValidator<'_>,
+    ) -> Result<GithubInstallResult> {
+        self.install_github_with_mode(
+            source,
+            options,
+            None,
+            Some(transaction),
+            Some(staged_manifest_validator),
+        )
+        .await
+    }
+
+    /// 下载并原子替换同 ID 的已安装插件，供固定 Registry 更新流程调用。
     pub(crate) async fn update_github(
         &self,
         source: &GithubPluginSource,
         options: GithubInstallOptions,
+        replacement_policy: BundleReplacementPolicy,
+        staged_manifest_validator: &StagedManifestValidator<'_>,
     ) -> Result<GithubInstallResult> {
-        self.install_github_with_mode(source, options, true).await
+        self.install_github_with_mode(
+            source,
+            options,
+            Some(replacement_policy),
+            None,
+            Some(staged_manifest_validator),
+        )
+        .await
     }
 
     /// 共享 GitHub 获取和验证流程，并在最终事务阶段选择新增或替换。
@@ -138,7 +176,9 @@ impl PluginManager {
         &self,
         source: &GithubPluginSource,
         options: GithubInstallOptions,
-        replace: bool,
+        replacement_policy: Option<BundleReplacementPolicy>,
+        transaction: Option<&PluginManagerWriteGuard>,
+        staged_manifest_validator: Option<&StagedManifestValidator<'_>>,
     ) -> Result<GithubInstallResult> {
         if options.max_download_bytes == 0 {
             bail!("GitHub bundle 下载大小上限必须大于零");
@@ -184,10 +224,42 @@ impl PluginManager {
             let install_options = InstallOptions {
                 enabled: options.enabled,
             };
-            let plugin = if replace {
-                self.replace_with_source(bundle, install_options, Some(source_description))?
-            } else {
-                self.install_with_source(bundle, install_options, Some(source_description))?
+            let plugin = match (replacement_policy, transaction, staged_manifest_validator) {
+                (Some(policy), Some(transaction), Some(validator)) => self
+                    .replace_with_source_policy_in_transaction(
+                        bundle,
+                        install_options,
+                        Some(source_description),
+                        policy,
+                        transaction,
+                        validator,
+                    )?,
+                (Some(policy), None, Some(validator)) => self
+                    .replace_with_source_policy_validated(
+                        bundle,
+                        install_options,
+                        Some(source_description),
+                        policy,
+                        validator,
+                    )?,
+                (Some(policy), None, None) => self.replace_with_source_policy(
+                    bundle,
+                    install_options,
+                    Some(source_description),
+                    policy,
+                )?,
+                (None, Some(transaction), Some(validator)) => self
+                    .install_with_source_in_transaction(
+                        bundle,
+                        install_options,
+                        Some(source_description),
+                        transaction,
+                        validator,
+                    )?,
+                (None, None, None) => {
+                    self.install_with_source(bundle, install_options, Some(source_description))?
+                }
+                _ => bail!("插件获取事务与 staged manifest 校验器必须成对传入"),
             };
             Ok(GithubInstallResult {
                 plugin,

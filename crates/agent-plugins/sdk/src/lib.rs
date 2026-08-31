@@ -6,8 +6,8 @@
 #![deny(missing_docs)]
 
 pub use agent_tool::{
-    JsonSchema, ToolCall, ToolDecision, ToolDecisionStatus, ToolPermissionScope, ToolResult,
-    ToolSpec,
+    is_sensitive_path, JsonSchema, ToolCall, ToolDecision, ToolDecisionStatus, ToolPermissionScope,
+    ToolResult, ToolSpec,
 };
 pub use anyhow::{anyhow, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -107,7 +107,7 @@ pub enum AgentEventKind {
     ModelRequest,
     /// 模型文本输出增量。
     ModelTextDelta,
-    /// 模型推理输出增量。
+    /// 模型推理输出增量；为协议兼容保留，Host 不向第三方 Guest 下发此敏感事件。
     ModelThinkingDelta,
     /// 模型响应完成。
     ModelResponse,
@@ -156,7 +156,7 @@ pub struct ContextLoadRequest {
     pub model: String,
     /// 会话顶层 system 提示。
     pub system: Option<String>,
-    /// 扩展提示与会话消息组成的 provider-neutral JSON 消息。
+    /// 扩展提示与会话消息组成的 provider-neutral JSON 消息；Host 已移除服务商私有推理块。
     pub messages: Vec<serde_json::Value>,
     /// 是否由用户显式发起（而非模型请求前的自动加载）。
     /// 上下文插件可据此跳过水位判断，无条件执行完整处理。
@@ -169,7 +169,7 @@ pub struct ContextLoadRequest {
 pub struct LoadedContext {
     /// 实际发送给模型的顶层 system 提示。
     pub system: Option<String>,
-    /// 实际发送给模型的全部 provider-neutral JSON 消息。
+    /// 实际发送给模型的全部 provider-neutral JSON 消息；Host 会再次移除私有推理块。
     pub messages: Vec<serde_json::Value>,
 }
 
@@ -218,7 +218,7 @@ impl ExtensionEvent {
         })
     }
 
-    /// 创建一条宿主应用级动作事件；需要 manifest 声明 `surface_actions` 能力。
+    /// 创建一条宿主应用级动作事件；需要 manifest 在 `surface_action_allowlist` 授权该动作。
     pub fn host_action(request: UiHostActionRequest) -> Result<Self> {
         Ok(Self {
             name: UI_HOST_ACTION_EVENT.to_string(),
@@ -683,6 +683,8 @@ pub trait PluginHostApi {
     }
 
     /// 非阻塞读取派生 Agent 的历史回放和后续实时事件。
+    ///
+    /// Host 不返回私有推理增量，并会把插件策略的完整审批拒绝原因替换为稳定文案。
     fn agent_events(&self, _target: &AgentId, _limit: usize) -> Result<Vec<AgentEvent>> {
         Err(anyhow!("宿主未提供 Agent Runtime API"))
     }
@@ -752,6 +754,18 @@ pub trait AgentPlugin: Default + Send + 'static {
     /// 返回 `Pending` 时 Host 会稍后重新调用；等待原因、交互和持久化协议由插件自行维护。
     fn before_tool(&mut self, _call: ToolCall) -> ToolDecisionStatus {
         ToolDecision::Allow.into()
+    }
+
+    /// 使用宿主能力执行工具前检查。
+    ///
+    /// 默认调用兼容旧插件的 [`AgentPlugin::before_tool`]；需要模型代审或其他宿主能力的
+    /// 策略插件覆盖此方法。返回 `Pending` 时 Host 会按状态中的间隔重新调用。
+    fn before_tool_with_host(
+        &mut self,
+        _host: &dyn PluginHostApi,
+        call: ToolCall,
+    ) -> ToolDecisionStatus {
+        self.before_tool(call)
     }
 
     /// Hook after any tool is executed.
@@ -1299,14 +1313,16 @@ world plugin {
                     let call: $crate::ToolCall = match $crate::from_json_string(&call_json) {
                         Ok(call) => call,
                         Err(err) => {
-                            let decision: $crate::ToolDecisionStatus = $crate::ToolDecision::Block {
-                                reason: err.to_string(),
-                            }
-                            .into();
+                            let decision: $crate::ToolDecisionStatus =
+                                $crate::ToolDecision::block(err.to_string()).into();
                             return $crate::to_json_string(&decision);
                         }
                     };
-                    with_plugin(|plugin| $crate::to_json_string(&plugin.before_tool(call)))
+                    with_plugin(|plugin| {
+                        $crate::to_json_string(
+                            &plugin.before_tool_with_host(&ComponentHostApi, call),
+                        )
+                    })
                 }
 
                 fn after_tool(result_json: String) {

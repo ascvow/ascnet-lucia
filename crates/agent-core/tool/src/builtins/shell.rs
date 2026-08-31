@@ -2,9 +2,9 @@
 //! Shell command execution tool.
 
 use crate::{
-    ExecutionPolicy, FileCapability, NoopToolOutputSink, Tool, ToolCall, ToolErrorKind,
-    ToolOutputDelta, ToolOutputSink, ToolOutputStream, ToolPermissionScope, ToolResult, ToolSpec,
-    WorkspaceGuard,
+    ExecutionPolicy, ExecutionProfile, FileCapability, NoopToolOutputSink, Tool, ToolCall,
+    ToolErrorKind, ToolOutputDelta, ToolOutputSink, ToolOutputStream, ToolPermissionScope,
+    ToolResult, ToolSpec, WorkspaceGuard,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -12,7 +12,10 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -43,36 +46,48 @@ pub struct ShellTool {
     guard: WorkspaceGuard,
     /// 操作系统进程入口复核的可信执行策略。
     execution_policy: ExecutionPolicy,
+    /// 当前工具实例正在持有的 Host 管理进程组名额。
+    active_processes: AtomicUsize,
 }
 
 impl Default for ShellTool {
     fn default() -> Self {
-        Self {
-            default_timeout_ms: DEFAULT_TIMEOUT_MS,
-            guard: WorkspaceGuard::default(),
-            execution_policy: ExecutionPolicy::serve(),
-        }
+        Self::from_parts(
+            DEFAULT_TIMEOUT_MS,
+            WorkspaceGuard::default(),
+            ExecutionPolicy::serve(),
+        )
     }
 }
 
 impl ShellTool {
+    /// 统一绑定工作区、可信策略和该实例的进程组并发门禁。
+    fn from_parts(
+        default_timeout_ms: u64,
+        guard: WorkspaceGuard,
+        execution_policy: ExecutionPolicy,
+    ) -> Self {
+        Self {
+            default_timeout_ms,
+            guard,
+            execution_policy,
+            active_processes: AtomicUsize::new(0),
+        }
+    }
+
     /// 使用自定义默认超时创建 ShellTool。
     /// Create a ShellTool with a custom default timeout.
     pub fn with_timeout_ms(timeout_ms: u64) -> Self {
-        Self {
-            default_timeout_ms: timeout_ms.min(MAX_TIMEOUT_MS),
-            guard: WorkspaceGuard::default(),
-            execution_policy: ExecutionPolicy::serve(),
-        }
+        Self::from_parts(
+            timeout_ms.min(MAX_TIMEOUT_MS),
+            WorkspaceGuard::default(),
+            ExecutionPolicy::serve(),
+        )
     }
 
     /// 以指定工作区守卫创建 ShellTool。
     pub fn new(guard: WorkspaceGuard) -> Self {
-        Self {
-            default_timeout_ms: DEFAULT_TIMEOUT_MS,
-            guard,
-            execution_policy: ExecutionPolicy::serve(),
-        }
+        Self::from_parts(DEFAULT_TIMEOUT_MS, guard, ExecutionPolicy::serve())
     }
 
     /// 以指定工作区守卫和可信执行策略创建 ShellTool。
@@ -81,11 +96,7 @@ impl ShellTool {
     /// 开启 `allow_process` 也会返回结构化边界错误，不会启动 Shell。调用方应使用同一
     /// 策略构造 `guard`，确保文件与进程边界一致。
     pub fn with_execution_policy(guard: WorkspaceGuard, execution_policy: ExecutionPolicy) -> Self {
-        Self {
-            default_timeout_ms: DEFAULT_TIMEOUT_MS,
-            guard,
-            execution_policy,
-        }
+        Self::from_parts(DEFAULT_TIMEOUT_MS, guard, execution_policy)
     }
 
     /// 解析命令的工作目录。
@@ -104,6 +115,24 @@ impl ShellTool {
             None => Ok(self.guard.root().map(Path::to_path_buf)),
         }
     }
+
+    /// 原子预留一个受管进程组名额；达到正数上限时返回该上限。
+    fn try_acquire_process_slot(&self) -> Result<Option<ProcessSlotGuard<'_>>, usize> {
+        let Some(limit) = self.execution_policy.limits.max_processes else {
+            return Ok(None);
+        };
+        let reserved =
+            self.active_processes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current < limit).then_some(current + 1)
+                });
+        match reserved {
+            Ok(_) => Ok(Some(ProcessSlotGuard {
+                active: &self.active_processes,
+            })),
+            Err(_) => Err(limit),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -113,6 +142,57 @@ struct Args {
     timeout_ms: Option<u64>,
     #[serde(default)]
     working_directory: Option<String>,
+}
+
+/// Shell 进程组的同步回收守卫。
+///
+/// Agent 超时、用户取消或上层 future 被丢弃时无法再等待异步清理，因此 Unix 平台在
+/// `Drop` 中向独立进程组发送 `SIGKILL`，防止后台后代脱离直接子进程后继续运行。
+/// 非 Unix 平台仍由 Tokio 的 `kill_on_drop` 回收直接子进程。
+struct ProcessGroupGuard {
+    #[cfg(unix)]
+    process_group: Option<i32>,
+}
+
+/// 一次 Shell 调用持有的实例级并发名额；任何返回、错误或取消都会自动释放。
+struct ProcessSlotGuard<'a> {
+    active: &'a AtomicUsize,
+}
+
+impl Drop for ProcessSlotGuard<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ProcessGroupGuard {
+    /// 使用已经配置为进程组 leader 的直接子进程 PID 创建守卫。
+    fn new(child_pid: Option<u32>) -> Self {
+        Self {
+            #[cfg(unix)]
+            process_group: child_pid
+                .and_then(|pid| i32::try_from(pid).ok())
+                .filter(|pid| *pid > 0),
+        }
+    }
+
+    /// 主动终止整个进程组，并解除后续重复回收。
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        if let Some(group) = self.process_group.take() {
+            // SAFETY: `group` 来自已成功启动且设置 `process_group(0)` 的直接子进程 PID；
+            // 传入负值只向该独立进程组发送信号，不会命中 Host 所在进程组。
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }
 
 /// 单个输出流的有限缓冲结果；读取仍会持续到 EOF，避免子进程管道阻塞。
@@ -217,7 +297,9 @@ impl Tool for ShellTool {
         call: ToolCall,
         output: Arc<dyn ToolOutputSink>,
     ) -> Result<ToolResult> {
-        if !self.execution_policy.permits_process_execution() {
+        if self.execution_policy.profile() != ExecutionProfile::Serve
+            || !self.execution_policy.allow_process
+        {
             return Ok(ToolResult::error_with_kind(
                 call.id,
                 call.name,
@@ -225,6 +307,26 @@ impl Tool for ShellTool {
                 "当前执行策略禁止 Shell 与子进程执行",
             ));
         }
+        if self.execution_policy.limits.max_processes == Some(0) {
+            return Ok(ToolResult::error_with_kind(
+                call.id,
+                call.name,
+                ToolErrorKind::ProcessBoundaryViolation,
+                "当前执行策略的进程数上限为 0",
+            ));
+        }
+        debug_assert!(self.execution_policy.permits_process_execution());
+        let _process_slot = match self.try_acquire_process_slot() {
+            Ok(slot) => slot,
+            Err(limit) => {
+                return Ok(ToolResult::error_with_kind(
+                    call.id,
+                    call.name,
+                    ToolErrorKind::ProcessBoundaryViolation,
+                    format!("当前执行策略允许同时运行的 Shell 进程组上限为 {limit}"),
+                ));
+            }
+        };
 
         let args: Args = call.args_as()?;
         let timeout_ms = args
@@ -277,6 +379,7 @@ impl Tool for ShellTool {
                 ));
             }
         };
+        let mut process_group_guard = ProcessGroupGuard::new(child.id());
         let stdout = child.stdout.take().expect("Shell stdout 已配置为管道");
         let stderr = child.stderr.take().expect("Shell stderr 已配置为管道");
         let stdout_task = tokio::spawn(capture_stream(
@@ -295,6 +398,8 @@ impl Tool for ShellTool {
 
         match status {
             Ok(Ok(status)) => {
+                // 直接 `sh` 可以在成功退出前留下后台后代；仍需按组回收，避免绕过并发名额。
+                process_group_guard.terminate();
                 let stdout = stdout_task.await??.into_text();
                 let stderr = stderr_task.await??.into_text();
                 let exit_code = status.code().unwrap_or(-1);
@@ -320,6 +425,9 @@ impl Tool for ShellTool {
                 }
             }
             Ok(Err(error)) => {
+                process_group_guard.terminate();
+                let _ = child.kill().await;
+                let _ = child.wait().await;
                 let _ = stdout_task.await;
                 let _ = stderr_task.await;
                 Ok(ToolResult::error(
@@ -330,12 +438,7 @@ impl Tool for ShellTool {
             }
             Err(_) => {
                 // 只 kill 直接子进程会留下后代继续运行，因此先按进程组整体回收。
-                #[cfg(unix)]
-                if let Some(group) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
-                    unsafe {
-                        libc::kill(-group, libc::SIGKILL);
-                    }
-                }
+                process_group_guard.terminate();
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 let _ = stdout_task.await;
@@ -409,6 +512,141 @@ mod tests {
                 let result = task.await.expect("Shell 任务不应崩溃").expect("调用应成功");
                 assert_eq!(result.content["stdout"], "firstsecond");
                 assert_eq!(result.content["exit_code"], 0);
+            });
+    }
+
+    /// 正数 `max_processes` 必须限制同一 Shell 工具实例的并发受管进程组，并在释放后恢复名额。
+    #[test]
+    fn shell_positive_process_limit_is_enforced() {
+        let mut policy = ExecutionPolicy::serve();
+        policy.limits.max_processes = Some(1);
+        let tool = ShellTool::with_execution_policy(WorkspaceGuard::default(), policy);
+
+        let first = tool
+            .try_acquire_process_slot()
+            .expect("首个进程组应获得名额")
+            .expect("有限策略应返回名额守卫");
+        assert!(matches!(tool.try_acquire_process_slot(), Err(1)));
+
+        drop(first);
+        assert!(tool
+            .try_acquire_process_slot()
+            .expect("释放后应可重新获得名额")
+            .is_some());
+    }
+
+    /// 直接 Shell 正常退出后仍必须回收同组后台后代，不能释放名额后留下游离进程。
+    #[cfg(unix)]
+    #[test]
+    fn shell_success_kills_background_descendants() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let result = ShellTool::default()
+                    .call(ToolCall::new(
+                        "shell-background",
+                        "shell",
+                        json!({
+                            "command": "sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\""
+                        }),
+                    ))
+                    .await
+                    .expect("Shell 调用应完成");
+                let descendant = result.content["stdout"]
+                    .as_str()
+                    .expect("stdout 应为文本")
+                    .trim()
+                    .parse::<i32>()
+                    .expect("后台后代 PID 应为整数");
+
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        // SAFETY: 测试只探测刚才由 Shell 命令报告的后台后代，不发送信号。
+                        let probe = unsafe { libc::kill(descendant, 0) };
+                        if probe == -1
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("Shell 正常返回后后台后代必须被回收");
+            });
+    }
+
+    /// 上层取消 Shell future 时必须回收独立进程组，不能只终止直接 `sh` 子进程。
+    #[cfg(unix)]
+    #[test]
+    fn shell_cancellation_kills_process_group() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let sink = Arc::new(CapturingOutputSink::default());
+                let task_sink: Arc<dyn ToolOutputSink> = sink.clone();
+                let task = tokio::spawn(async move {
+                    ShellTool::default()
+                        .call_with_output(
+                            ToolCall::new(
+                                "shell-cancel",
+                                "shell",
+                                json!({
+                                    "command": "printf '%s\\n' \"$$\"; sleep 30 & wait"
+                                }),
+                            ),
+                            task_sink,
+                        )
+                        .await
+                });
+
+                let process_group = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let stdout = sink
+                            .outputs
+                            .lock()
+                            .expect("输出锁不应中毒")
+                            .iter()
+                            .filter(|delta| delta.stream == ToolOutputStream::Stdout)
+                            .map(|delta| delta.delta.as_str())
+                            .collect::<String>();
+                        if let Some(pid) = stdout
+                            .lines()
+                            .next()
+                            .and_then(|line| line.trim().parse::<i32>().ok())
+                        {
+                            break pid;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("Shell 应及时报告自己的进程组 ID");
+
+                task.abort();
+                assert!(
+                    task.await.expect_err("Shell 任务应被取消").is_cancelled(),
+                    "任务必须以取消状态结束"
+                );
+
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        // SAFETY: 测试只探测刚才由 ShellTool 创建的独立进程组，不发送信号。
+                        let result = unsafe { libc::kill(-process_group, 0) };
+                        if result == -1
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("取消后整个 Shell 进程组都应被回收");
             });
     }
 }

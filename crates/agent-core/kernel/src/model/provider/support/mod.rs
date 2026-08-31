@@ -176,6 +176,41 @@ pub(super) fn merge_provider_options(body: &mut Value, provider_options: Value) 
     }
 }
 
+/// 恢复可信输出上限，并把已出现的常见 token 别名和多候选参数收窄到同一预算。
+///
+/// 仅处理请求体顶层字段；调用方应在合并 `provider_options` 后调用。不存在的兼容字段不会
+/// 被主动添加，避免改变原生 provider 协议；已出现的生成数量字段固定为一，防止一次请求
+/// 生成多份候选却只按单份 `max_tokens` 预留资源。
+pub(super) fn enforce_output_budget(body: &mut Value, primary_key: &str, max_tokens: u32) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    object.insert(primary_key.to_string(), Value::from(max_tokens));
+    for alias in [
+        "max_tokens",
+        "max_output_tokens",
+        "max_completion_tokens",
+        "max_new_tokens",
+        "max_length",
+    ] {
+        if object.contains_key(alias) {
+            object.insert(alias.to_string(), Value::from(max_tokens));
+        }
+    }
+    for multiplier in [
+        "n",
+        "best_of",
+        "num_return_sequences",
+        "candidate_count",
+        "num_generations",
+        "number_of_responses",
+    ] {
+        if object.contains_key(multiplier) {
+            object.insert(multiplier.to_string(), Value::from(1));
+        }
+    }
+}
+
 /// 将 `src` 的所有键值对浅拷贝到 `dst`，同名键覆盖。
 pub(super) fn merge_object(dst: &mut Map<String, Value>, src: Map<String, Value>) {
     for (key, value) in src {

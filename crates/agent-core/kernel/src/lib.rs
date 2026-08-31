@@ -20,7 +20,7 @@ pub mod model;
 pub mod session;
 pub mod state;
 
-pub use agent::{Agent, AgentControl, AgentModelConfig, AgentOptions, AgentRun};
+pub use agent::{Agent, AgentControl, AgentModelConfig, AgentOptions, AgentRun, ModelRequestGate};
 pub use agent_tool::{ToolDecision, ToolErrorKind};
 pub use config::{AgentConfig, AgentRootConfig, ModelConfig};
 pub use context::{

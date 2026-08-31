@@ -1,10 +1,10 @@
 //! Lucia 插件 Registry 索引、语义化版本求解和安装编排。
 
 use crate::{
-    github::download_named_release_asset, GithubInstallOptions, GithubPluginSource,
-    InstalledPlugin, PluginManager,
+    github::download_named_release_asset, manager::BundleReplacementPolicy, GithubInstallOptions,
+    GithubPluginSource, InstalledPlugin, PluginManager,
 };
-use agent_plugin_host::manifest::SUPPORTED_PLUGIN_API_VERSION;
+use agent_plugin_host::manifest::{PluginManifest, SUPPORTED_PLUGIN_API_VERSION};
 use anyhow::{anyhow, bail, Context, Result};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -205,6 +205,15 @@ impl PluginRegistry {
                         bail!("Registry 插件 `{name}@{}` 不能依赖自身", version.version);
                     }
                 }
+                let dependency_count = version
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.name.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .len();
+                if dependency_count != version.dependencies.len() {
+                    bail!("Registry 插件 `{name}@{}` 重复声明依赖", version.version);
+                }
             }
         }
         Ok(registry)
@@ -381,13 +390,21 @@ impl PluginManager {
     /// 从默认官方 Registry 求解依赖并安装插件。
     ///
     /// 已安装版本作为固定约束复用；冲突时不会自动替换。中途失败会按逆序移除本次新增项，
-    /// 不触碰安装前已有插件。根插件遵循 `enabled`，必需依赖始终启用。
+    /// 不触碰安装前已有插件。`enabled` 仅为保留调用兼容性，人工 Registry 安装只接受
+    /// `false`；根插件及本次新增依赖均保持禁用，必须逐一展示来源和能力后另行启用。
     pub async fn install_registry(
         &self,
         request: &RegistryRequest,
         enabled: bool,
     ) -> Result<RegistryInstallResult> {
+        if enabled {
+            bail!("Registry 安装不能直接启用插件；请安装后审查每个 Bundle 的来源和能力");
+        }
         let registry = PluginRegistry::fetch_default().await?;
+        // 从读取旧锁、执行依赖安装到失败回滚始终持有同一跨进程锁，
+        // 避免使用旧快照覆盖其他进程的禁用或撤权。
+        let transaction = self.acquire_write_lock()?;
+        let original_lock = self.lock_state_in_transaction(&transaction)?;
         let before = self.list()?;
         let plan = registry.resolve(request, &before)?;
         let already_satisfied = plan.is_empty()
@@ -402,23 +419,33 @@ impl PluginManager {
                 "{}/{}",
                 version.github.owner, version.github.repository
             ))?;
+            let validate_manifest =
+                |manifest: &PluginManifest| validate_registry_manifest(&name, &version, manifest);
             let result = self
-                .install_github(
+                .install_github_in_transaction(
                     &source,
                     GithubInstallOptions {
-                        enabled: name != request.name || enabled,
+                        enabled: false,
                         tag: Some(version.github.tag.clone()),
                         asset: Some(version.github.asset.clone()),
                         expected_sha256: Some(version.sha256.clone()),
                         ..GithubInstallOptions::default()
                     },
+                    &transaction,
+                    &validate_manifest,
                 )
                 .await;
             match result {
                 Ok(result) => installed.push(result.plugin),
                 Err(error) => {
-                    for plugin in installed.iter().rev() {
-                        let _ = self.remove(&plugin.id);
+                    if let Err(rollback) = self.rollback_new_installations_in_transaction(
+                        &original_lock,
+                        &installed,
+                        &transaction,
+                    ) {
+                        return Err(anyhow!(
+                            "安装 Registry 插件 `{name}` 失败：{error:#}；回滚本次 Registry 事务也失败：{rollback:#}"
+                        ));
                     }
                     return Err(error).with_context(|| format!("安装 Registry 插件 `{name}` 失败"));
                 }
@@ -512,10 +539,17 @@ impl PluginManager {
             let (current, version) = candidates
                 .get(&plugin_name)
                 .ok_or_else(|| anyhow!("更新计划缺少插件 `{plugin_name}`"))?;
+            let package = registry
+                .packages
+                .get(&plugin_name)
+                .ok_or_else(|| anyhow!("Registry 更新计划缺少包 `{plugin_name}`"))?;
             let source = GithubPluginSource::parse(&format!(
                 "{}/{}",
                 version.github.owner, version.github.repository
             ))?;
+            let validate_manifest = |manifest: &PluginManifest| {
+                validate_registry_manifest(&plugin_name, version, manifest)
+            };
             let result = self
                 .update_github(
                     &source,
@@ -526,12 +560,92 @@ impl PluginManager {
                         expected_sha256: Some(version.sha256.clone()),
                         ..GithubInstallOptions::default()
                     },
+                    registry_replacement_policy(package),
+                    &validate_manifest,
                 )
                 .await
                 .with_context(|| format!("更新 Registry 插件 `{plugin_name}` 失败"))?;
             updated.push(result.plugin);
         }
         Ok(RegistryUpdateResult { updated })
+    }
+}
+
+/// 校验已复制到 Manager staging 的 manifest 与 Registry 不可变索引完全一致。
+fn validate_registry_manifest(
+    package_name: &str,
+    indexed: &RegistryVersion,
+    manifest: &PluginManifest,
+) -> Result<()> {
+    if manifest.plugin.id != package_name {
+        bail!(
+            "Registry 包 `{package_name}` 的 Bundle 声明了不同插件 ID `{}`",
+            manifest.plugin.id
+        );
+    }
+    let manifest_version = Version::parse(&manifest.plugin.version)
+        .with_context(|| format!("Registry 包 `{package_name}` 的 manifest 版本无效"))?;
+    if manifest_version != indexed.version {
+        bail!(
+            "Registry 包 `{package_name}` 索引版本 `{}` 与 Bundle 版本 `{manifest_version}` 不一致",
+            indexed.version
+        );
+    }
+    if manifest.plugin.api_version != indexed.api_version {
+        bail!(
+            "Registry 包 `{package_name}@{}` 索引 api_version `{}` 与 Bundle `{}` 不一致",
+            indexed.version,
+            indexed.api_version,
+            manifest.plugin.api_version
+        );
+    }
+    let indexed_dependencies = indexed
+        .dependencies
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.name.clone(),
+                dependency.requirement.to_string(),
+                dependency.optional,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let manifest_dependencies = manifest
+        .dependencies
+        .iter()
+        .map(|dependency| {
+            Ok((
+                dependency.id.clone(),
+                VersionReq::parse(&dependency.version)
+                    .with_context(|| {
+                        format!(
+                            "Registry 包 `{package_name}@{}` 的 Bundle 依赖 `{}` 版本范围无效",
+                            indexed.version, dependency.id
+                        )
+                    })?
+                    .to_string(),
+                dependency.optional,
+            ))
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if manifest_dependencies != indexed_dependencies {
+        bail!(
+            "Registry 包 `{package_name}@{}` 的规范化依赖与索引不一致",
+            indexed.version
+        );
+    }
+    Ok(())
+}
+
+/// 将固定默认 Registry 的官方元数据收窄为 Manager 内部替换策略。
+///
+/// `official` 只在 [`PluginRegistry::fetch_default`] 返回的受信索引中参与生产调用；第三方包
+/// 即使来源主体和能力不变也必须重新审查精确 Bundle 身份。
+fn registry_replacement_policy(package: &RegistryPackage) -> BundleReplacementPolicy {
+    if package.official {
+        BundleReplacementPolicy::TrustedOfficialUpgrade
+    } else {
+        BundleReplacementPolicy::RequireBundleReview
     }
 }
 
@@ -668,6 +782,27 @@ mod tests {
         .expect("测试 Registry 应可解析")
     }
 
+    /// 构造与测试 Registry `root@1.0.0` 一致的 Host manifest。
+    fn indexed_root_manifest() -> PluginManifest {
+        let manifest: PluginManifest = toml::from_str(
+            r#"
+                [plugin]
+                id = "root"
+                name = "Root"
+                version = "1.0.0"
+                api_version = "0.7.0"
+                wasm = "root.wasm"
+
+                [[dependencies]]
+                id = "dep"
+                version = "^1.0"
+            "#,
+        )
+        .expect("测试 manifest 应可解析");
+        manifest.validate().expect("测试 manifest 应有效");
+        manifest
+    }
+
     #[test]
     fn request_supports_npm_style_version_range() {
         let request = RegistryRequest::parse("context@^0.1").expect("请求应可解析");
@@ -703,6 +838,63 @@ mod tests {
             .expect("已安装依赖应被复用");
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].0, "root");
+    }
+
+    /// 只有固定 Registry 标记的官方包可以请求受限授权迁移。
+    #[test]
+    fn registry_upgrade_policy_distinguishes_official_packages() {
+        let registry = registry();
+        assert_eq!(
+            registry_replacement_policy(registry.packages.get("root").expect("官方测试包应存在")),
+            BundleReplacementPolicy::TrustedOfficialUpgrade
+        );
+        assert_eq!(
+            registry_replacement_policy(registry.packages.get("dep").expect("第三方测试包应存在")),
+            BundleReplacementPolicy::RequireBundleReview
+        );
+    }
+
+    /// Registry 资产的包名、版本、ABI 和规范化依赖必须与索引完全一致。
+    #[test]
+    fn staged_registry_manifest_must_match_complete_index_identity() {
+        let registry = registry();
+        let indexed = &registry
+            .packages
+            .get("root")
+            .expect("应存在根插件")
+            .versions[0];
+        let manifest = indexed_root_manifest();
+        validate_registry_manifest("root", indexed, &manifest).expect("完整身份一致时应通过");
+
+        let mut wrong_id = manifest.clone();
+        wrong_id.plugin.id = "other".into();
+        assert!(validate_registry_manifest("root", indexed, &wrong_id)
+            .expect_err("包名与插件 ID 不一致必须拒绝")
+            .to_string()
+            .contains("不同插件 ID"));
+
+        let mut wrong_version = manifest.clone();
+        wrong_version.plugin.version = "1.0.1".into();
+        assert!(validate_registry_manifest("root", indexed, &wrong_version)
+            .expect_err("版本不一致必须拒绝")
+            .to_string()
+            .contains("索引版本"));
+
+        let mut wrong_api = manifest.clone();
+        wrong_api.plugin.api_version = "0.8.0".into();
+        assert!(validate_registry_manifest("root", indexed, &wrong_api)
+            .expect_err("api_version 不一致必须拒绝")
+            .to_string()
+            .contains("api_version"));
+
+        let mut wrong_dependencies = manifest;
+        wrong_dependencies.dependencies[0].optional = true;
+        assert!(
+            validate_registry_manifest("root", indexed, &wrong_dependencies)
+                .expect_err("依赖语义不一致必须拒绝")
+                .to_string()
+                .contains("规范化依赖")
+        );
     }
 
     #[test]

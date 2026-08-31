@@ -34,7 +34,7 @@ TUI 使用渐进生命周期：每个插件完成 `activate` 与 `describe-ui` �
 - `list_tools`：注册初始静态工具。仅使用动态注册的插件返回空数组。
 - `call_tool`：不需要 Host I/O 的旧式执行入口。
 - `call_tool_with_host`：需要文件、状态或子进程 API 时覆盖；默认调用 `call_tool`。
-- `before_tool`：观察所有工具调用，可允许、阻止或重写。
+- `before_tool`：观察所有工具调用，可允许、阻止或重写；需要模型等 Host 能力时覆盖 `before_tool_with_host`，默认仍转发到兼容方法。
 - `after_tool`：观察最终结果。
 
 Host 在调用 component 前把公开工具名替换为注册时的本地 ID。

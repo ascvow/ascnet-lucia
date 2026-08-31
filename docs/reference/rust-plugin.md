@@ -28,18 +28,18 @@
 
 ### 工具参数类型
 
-`ToolCall` 的 `id` 必须原样带回 `ToolResult.call_id`；`name` 是 Host 路由后的公开名；`args` 是未强类型校验的 JSON。`permission_scope` 由 Core 和组合 Host 从最近一次可信 `ToolSpec` 快照绑定，策略插件不得按工具名复制权限白名单。使用 `call.args_as::<Args>()` 解析，不要用字符串切割参数。
+`ToolCall` 的 `id` 必须原样带回 `ToolResult.call_id`；`run_id` 由 Core 按当前 Agent 运行绑定，有状态策略应使用 `(run_id, id)` 隔离并发审批；`name` 是 Host 路由后的公开名；`args` 是未强类型校验的 JSON。`permission_scope` 由 Core 和组合 Host 从最近一次可信 `ToolSpec` 快照绑定，策略插件不得按工具名复制权限白名单。使用 `call.args_as::<Args>()` 解析，不要用字符串切割参数。
 
 `ToolDecisionStatus::Ready` 中的 `ToolDecision`：
 
 | 变体 | 字段 | Core 行为 |
 | --- | --- | --- |
 | `Allow` | 无 | 原样执行 |
-| `Block` | `reason` | 生成模型可见拒绝结果，不执行工具 |
+| `Block` | `reason`、可选 `agent_guidance` | 详细原因只进入可信事件/UI；模型、Session 和扩展观察钩子只接收稳定拒绝文案，指导仅替换下一次请求且不写入 Session |
 | `CancelRun` | `reason` | 优雅取消当前运行并保留 Session |
 | `Rewrite` | 完整 `call` | 对最终调用重新执行策略检查后路由 |
 
-`ToolDecisionStatus::Pending { retry_after_ms }` 只表示 Guest 尚未形成最终决策。Host 只负责等待并重新调用，不理解审批 ID、选项、UI 或持久化规则；这些协议由权限插件等具体插件自行定义。重写必须返回完整 ToolCall，不能只返回差量 args；组合 Host 会对同名重写恢复已注册 scope，改名到未知目标时降级为 `Unknown`，Core 随后按最终目标再次绑定。
+`ToolDecisionStatus::Pending { retry_after_ms }` 只表示 Guest 尚未形成最终决策。Host 只负责等待并重新调用，不理解审批 ID、选项、UI 或持久化规则；这些协议由权限插件等具体插件自行定义。重写必须返回完整 ToolCall，不能只返回差量 args；组合 Host 会恢复可信 `run_id`，对同名重写恢复已注册 scope，改名到未知目标时降级为 `Unknown`，Core 随后按最终目标再次绑定。
 
 ### 上下文类型
 
@@ -86,8 +86,8 @@
 
 | 方法 | 参数 | 返回/错误 |
 | --- | --- | --- |
-| `get_state(key)` | 实例内 key | 不存在返回 `None` |
-| `set_state(key, value)` | key 与 JSON | 写入仅当前激活实例有效的内存 |
+| `get_state(key)` | 实例内 key | 不存在返回 `None`；应用注入持久目录时按可信 Bundle 身份恢复 |
+| `set_state(key, value)` | key 与 JSON | 事务性写入当前实例；持久状态按 ID、来源、Component、版本和能力身份隔离 |
 | `remove_state(key)` | key | 返回旧值，不存在返回 `None` |
 | `upsert_service(service)` | name、SemVer、description | 注册或替换当前插件服务 |
 | `remove_service(name)` | 当前插件内服务名 | 幂等删除 |
@@ -186,6 +186,8 @@ Guest 不能提交模型、provider options、工具权限或 owner。`profile` 
 | --- | --- |
 | `agent` | 支持 spawn/observe/cancel 与 profile allowlist |
 | `model_completion` | 支持，应用固定路由、工具策略和输出上限 |
+| `surface_action_allowlist` | 支持，逐项授权宿主界面动作 |
+| `tool_scopes` | 支持，Host 绑定工具 scope，并按 component 已授能力抬高风险下限 |
 | `process_exec` | 支持，属于完整原生进程信任 |
 | `fs_read` | 支持，逐路径 canonicalize 后鉴权 |
 | `http`、`secrets`、`fs_write` | 当前拒绝，不会静默忽略 |
@@ -222,9 +224,11 @@ Guest 不能提交模型、provider options、工具权限或 owner。`profile` 
 
 ### 安装记录
 
-`InstalledPlugin` 保存 ID、名称、插件版本、ABI 版本、启用状态、相对 manifest 路径、bundle SHA-256 和来源。`PluginLock` 保存 lock schema、插件列表和独占能力选择。它们描述已安装状态，不代表插件已经成功实例化。
+`InstalledPlugin` 保存 ID、名称、插件版本、ABI 版本、启用状态、相对 manifest 路径、bundle SHA-256 和来源。`PluginLock` schema v2 保存插件列表、独占能力选择，以及按插件 ID 索引的完整授权 profile 摘要。读取 v1、缺失摘要或摘要与当前 Host profile 不一致时，Manager 会在有效视图中禁用对应插件并清除其 Owner；下一次写事务持久化迁移后的安全状态。锁记录只描述已安装和已授权状态，不代表插件已经成功实例化。
 
-`InstallOptions.enabled` 决定安装后是否进入运行时组合，默认 `true`。
+`InstallOptions.enabled` 是保留给可信迁移的授权继承请求，默认 `false`。公开安装入口拒绝
+`true`，人工替换也固定保持禁用；启用必须在展示来源与能力后，通过绑定精确 Bundle 身份的
+`enable_if_matches` 完成。
 
 ### `PluginManager`
 
@@ -232,12 +236,15 @@ Guest 不能提交模型、provider options、工具权限或 owner。`profile` 
 | --- | --- | --- |
 | `new(root)` | 管理根目录 | 只构造对象，不创建目录 |
 | `root()` / `lock_path()` | 无 | 返回根目录或锁文件路径 |
-| `install(bundle)` | 本地 bundle 根 | 校验、复制、hash、原子写锁；默认启用 |
-| `install_with_options(bundle, options)` | bundle 与启用选项 | 失败时不修改现有锁和版本 |
+| `install(bundle)` | 本地 bundle 根 | 校验、复制、hash、原子写锁；默认禁用 |
+| `install_with_options(bundle, options)` | bundle 与兼容选项 | `enabled=true` 直接拒绝；失败时不修改现有锁和版本 |
 | `list()` | 无 | 按 ID 返回锁记录；不做完整性校验 |
-| `enable(id)` | 插件 ID | 校验依赖和能力后原子写锁 |
+| `inspect_if_matches(id, identity)` | 插件 ID 与列表中的 Bundle 身份 | 同一 Manager 写锁内核验身份、manifest 与摘要，避免审查展示跨 Bundle |
+| `enable(id)` | 插件 ID | 已弃用；固定拒绝未绑定 Bundle 身份的启用请求 |
+| `enable_if_matches(id, identity)` | 插件 ID 与确认时的 Bundle 身份 | 来源、版本或 SHA-256 变化时拒绝旧确认，失败不落盘 |
 | `disable(id)` | 插件 ID | 被启用插件依赖时拒绝 |
-| `select(capability, plugin)` | 独占能力和 owner | 启用目标并写 selection，失败不落盘 |
+| `select(capability, plugin)` | 独占能力和 owner | 仅接受已独立启用的目标并写 selection，失败不落盘 |
+| `enable_and_select(capability, plugin, identity)` | 已完成来源与能力确认的禁用 owner | 同一锁事务先比对确认身份，再启用并写 selection；完整校验成功后才落盘 |
 | `clear_selection(capability)` | 能力 ID | 返回原 owner；清除后产生冲突则拒绝 |
 | `remove(id)` | 插件 ID | 先原子更新锁，再删除 bundle；被依赖时拒绝 |
 | `doctor()` | 无 | 检查路径、manifest、WASM、hash、依赖和能力，返回报告 |
@@ -253,13 +260,16 @@ Guest 不能提交模型、provider options、工具权限或 owner。`profile` 
 
 | 字段 | 含义 |
 | --- | --- |
-| `enabled` | 安装后是否启用 |
+| `enabled` | 可信 Registry 更新的授权继承请求；公开 GitHub 安装只接受 `false` |
 | `tag` | 指定 Release；None 使用 latest |
 | `asset` | 指定 ZIP；None 按稳定规则选择 |
 | `expected_sha256` | Registry 提供的预期 hash，设置后必须匹配 |
 | `max_download_bytes` | 下载上限，0 非法 |
 
-`install_github(source, options)` 只下载预构建 Release bundle，不克隆、不编译、不执行插件。下载、checksum、解包、路径和大小全部校验后才进入原子安装；失败时锁文件不变。返回 `GithubInstallResult`，包含安装记录、实际 tag、asset 名和 checksum 是否验证。
+`install_github(source, options)` 只下载预构建 Release bundle，不克隆、不编译、不执行插件。
+公开入口拒绝 `enabled=true`。下载、checksum、解包、路径和大小全部校验后才进入原子安装；
+失败时锁文件不变。返回 `GithubInstallResult`，包含安装记录、实际 tag、asset 名和 checksum
+是否验证。
 
 ### Registry API
 
@@ -267,7 +277,7 @@ Guest 不能提交模型、provider options、工具权限或 owner。`profile` 
 
 | API | 参数 | 返回/行为 |
 | --- | --- | --- |
-| `install_registry(request, enabled)` | RegistryRequest 与启用状态 | 求解依赖，先安装依赖再安装目标 |
+| `install_registry(request, enabled)` | RegistryRequest 与兼容标记 | 只接受 `false`；求解依赖并将本次新增项全部保持禁用 |
 | `search_registry(query)` | 名称/说明过滤词 | 当前 ABI 下可安装结果 |
 | `outdated_registry()` | 无 | 已安装插件的兼容新版本 |
 | `update_registry(name)` | 可选插件名 | Some 更新一个，None 更新全部兼容项 |

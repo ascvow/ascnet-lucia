@@ -82,6 +82,38 @@ pub enum AgentRuntimeError {
         limit: usize,
     },
 
+    /// 单个 principal 在本次激活生命周期内登记的 Agent 累计总数超过上限。
+    #[error("principal 的 Agent 累计总数超过上限 {limit}")]
+    MaxAgentsPerPrincipalExceeded {
+        /// controller 与全部派生 Agent 合计允许登记的最大数量。
+        limit: usize,
+    },
+
+    /// 单个 principal 的派生 Agent 模型请求累计次数超过上限。
+    #[error("principal 的 Agent 模型请求累计次数超过上限 {limit}")]
+    MaxAgentModelRequestsPerPrincipalExceeded {
+        /// 当前激活生命周期允许发起的最大模型请求次数。
+        limit: usize,
+    },
+
+    /// 单个 principal 的派生 Agent 模型请求累计字节数超过上限。
+    #[error("principal 的 Agent 模型请求累计字节数超过上限 {limit}")]
+    MaxAgentModelRequestBytesPerPrincipalExceeded {
+        /// 当前激活生命周期允许提交的最大序列化请求字节数。
+        limit: usize,
+    },
+
+    /// 单个 principal 的派生 Agent 模型输出 token 累计预留量超过上限。
+    #[error("principal 的 Agent 模型输出 token 累计预留量超过上限 {limit}")]
+    MaxAgentModelOutputTokensPerPrincipalExceeded {
+        /// 当前激活生命周期允许预留的最大模型输出 token 数。
+        limit: usize,
+    },
+
+    /// 派生 Agent 的最终模型请求缺少可预留的输出 token 上限。
+    #[error("派生 Agent 的模型请求必须设置大于零的最大输出 token 数")]
+    AgentModelRequestMaxTokensRequired,
+
     /// 派生 Agent 的构造失败。
     #[error("Agent 构造失败：{0}")]
     AgentBuild(String),

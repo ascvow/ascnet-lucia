@@ -38,7 +38,7 @@ agent.set_tools(tools);
 | `on_event` | 观察 Core 生命周期事件 |
 | `drain_events` | 发布结构化扩展事件 |
 
-Core 不知道扩展由原生对象还是 WASM component 实现。
+Core 不知道扩展由原生对象还是 WASM component 实现。使用一次性审批指导时，可信应用 `EventSink` 接收完整展示原因，`after_tool` 与 `on_event` 只接收脱敏工具结果，防止无关扩展把原因重新注入后续模型上下文。
 
 ## EventSink
 

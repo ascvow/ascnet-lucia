@@ -53,7 +53,9 @@ description = "提供示例工具的 Lucia 插件。"
 - `version`：插件自身版本，与 Lucia 程序版本独立。
 - `api_version`：WIT ABI 版本，不是插件版本。
 - `wasm`：相对 manifest 的 component 路径。
-- `capabilities`：文件、进程、服务、Agent Runtime 等授权声明。未声明即不授权。
+- `capabilities`：文件、进程、模型完成、Agent Runtime 等额外 Host 资源授权；未声明即不授权。
+  Developer prompt、工具与 hook、脱敏事件、插件 UI、隔离状态和依赖 ACL 服务属于 v0.7 ABI
+  固有权限，由完整授权 profile 统一披露和比较，不通过该表重复声明。
 
 完整字段和安全约束见 [Manifest 与权限](/host/manifest-capabilities)。
 
@@ -145,7 +147,7 @@ fn list_tools(&self) -> Vec<ToolSpec>
 
 返回插件静态工具快照。`ToolSpec::new(name, description, input_schema)` 的参数分别是公开名称、给模型看的选择说明和 JSON Schema 输入约束。名称应使用跨服务商可接受的 ASCII 字母、数字、下划线或连字符，最长 64 字符。
 
-每个工具必须再用 `with_permission_scope` 声明真实资源边界：只操作 Lucia 内部状态或已编入可信目录且不扩大访问面的元数据使用 `Control`，读取调用方可选择的受保护数据使用 `Read`，创建、修改或删除持久数据使用 `Write`，原生进程使用 `Shell`，远端访问使用 `Network`。缺失声明会保守解析为 `Unknown` 并进入权限审批；不得通过工具名称让策略插件猜测权限。一个工具实际触达多类资源时应声明风险更高、覆盖面更大的 scope，并继续由 manifest 限制 Guest 自身能力。
+每个工具必须再用 `with_permission_scope` 声明真实资源边界：只操作 Lucia 内部状态或已编入可信目录且不扩大访问面的元数据使用 `Control`，读取调用方可选择的受保护数据使用 `Read`，创建、修改或删除持久数据使用 `Write`，原生进程使用 `Shell`，远端访问使用 `Network`。缺失声明会保守解析为 `Unknown` 并进入权限审批；不得通过工具名称让策略插件猜测权限。一个工具实际触达多类资源时应声明风险更高、覆盖面更大的 scope。Host 还会把 component 获授的 Host API 能力作为所有工具的风险下限，因为宿主无法证明插件代码不会从某个 `Control` 工具内调用高权限 API。
 
 该函数没有 `host` 参数，不适合做文件扫描或服务调用。需要在启动后动态发现工具时，在 `activate` 中调用 `host.upsert_tool`。
 
@@ -158,11 +160,12 @@ fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus
 在任意工具实际执行前参与策略判断，不只观察本插件拥有的工具。
 
 - `call.id`：模型生成的调用 ID，重写时必须保持结果可关联。
+- `call.run_id`：Core 为当前 Agent 运行绑定的可信 ID；有状态策略必须与 `call.id` 组合使用，隔离并发 Agent 的同名调用。Guest 不得自行生成或替换。
 - `call.name`：公开工具名。
 - `call.args`：已经解析的 JSON 参数，但尚未按某个 Rust 结构验证。
 - `call.permission_scope`：Core/Host 从可信 ToolSpec 绑定的权限范围；Guest Rewrite 不能自行扩大或伪造。
 - 返回值：`Ready { decision }` 提交 `Allow`、`Block`、`CancelRun` 或 `Rewrite` 最终决策；`Pending { retry_after_ms }` 请求 Host 稍后重新调用。`Pending` 不携带审批 ID、原因或 UI 结构，审批协议及其状态必须由提供该能力的插件自行维护。
-- 安全要求：`reason` 面向用户和模型，不应包含 secret、完整环境变量或未脱敏命令参数。
+- 安全要求：所有 `Block` 的完整 `reason` 都只进入可信应用事件/UI，Session、模型和所有扩展观察钩子仅接收稳定拒绝文案。可选的有界 `agent_guidance` 只替换下一次模型请求中的对应工具结果，不写入 Session；即使它来自审批组件，模型仍必须按不可信工具数据处理。`reason` 与指导都不得包含 secret、完整环境变量或未脱敏命令参数。
 
 ### `call_tool`
 
@@ -199,7 +202,7 @@ fn call_tool_with_host(
 fn after_tool(&mut self, result: ToolResult)
 ```
 
-观察最终工具结果，适合更新指标、审计摘要或插件内状态。`result.call_id` 和 `result.name` 标识调用，`result.content` 是模型可见载荷，`result.details` 只供 UI 使用。该函数没有返回值，不能修改已经产生的工具结果。
+观察最终工具结果，适合更新指标、审计摘要或插件内状态。`result.call_id` 和 `result.name` 标识调用，`result.content` 是模型可见载荷，`result.details` 只供 UI 使用。所有审批拒绝都会在这里脱敏，Guest 不会收到可信应用用于展示的详细原因或一次性 Agent 指导。该函数没有返回值，不能修改已经产生的工具结果。
 
 ## 事件与上下文函数
 
@@ -209,7 +212,11 @@ fn after_tool(&mut self, result: ToolResult)
 fn on_event(&mut self, event: AgentEvent)
 ```
 
-接收 Core 生命周期事件。`event.run_id` 关联一次运行，`event.kind` 是稳定事件类型，`event.step` 是 ReAct 步数，`event.payload` 是对应类型的 JSON。该回调用于观察，不应假设所有事件都包含同一种 payload 结构。
+接收 Core 生命周期事件。`event.run_id` 关联一次运行，`event.kind` 是稳定事件类型，`event.step` 是 ReAct 步数，`event.payload` 是对应类型的 JSON。审批拒绝的 `ToolFinished` 对扩展使用脱敏 payload，可信应用 EventSink 仍可获得完整展示原因。`ModelThinkingDelta` 为兼容枚举保留，但只发送给可信应用 EventSink，不会经 `on_event` 或 Agent Runtime 订阅下发给第三方 Guest。该回调用于观察，不应假设所有事件都包含同一种 payload 结构。
+
+### `load_context`
+
+上下文插件收到的是 Host 脱敏后的 provider-neutral 消息，Anthropic 等服务商的 thinking signature、加密推理块和来源路由不会跨 WASM 边界。插件返回完整替换上下文时，Host 会再次移除这类私有块；返回 `None` 则由 Core 继续使用未暴露给 Guest 的原始上下文。需要无损保留服务商私有工具循环的上下文压缩应由应用装配可信原生 `ContextLoader`。
 
 ## 服务函数
 

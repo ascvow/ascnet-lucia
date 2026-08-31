@@ -35,4 +35,30 @@ pub trait ProviderAdapter: ChatModel {
     /// Stable provider adapter name.
     /// 稳定的服务商适配器名称。
     fn name(&self) -> &'static str;
+
+    /// 使用 Gateway 已校验的逻辑 provider 完成一次模型调用。
+    ///
+    /// 默认实现忽略逻辑名称并调用 [`ChatModel::complete`]；需要把注册别名纳入私有
+    /// 协议路由的适配器应覆写本方法。模型请求失败时原样返回适配器错误。
+    async fn complete_for_provider(
+        &self,
+        logical_provider: &str,
+        req: ModelRequest,
+    ) -> Result<ModelResponse> {
+        let _ = logical_provider;
+        self.complete(req).await
+    }
+
+    /// 使用 Gateway 已校验的逻辑 provider 发起流式模型调用。
+    ///
+    /// 默认实现保留适配器自身的流式能力；需要把注册别名纳入私有协议路由的适配器
+    /// 应覆写本方法。协议错误通过返回的事件流传递。
+    async fn stream_for_provider(
+        &self,
+        logical_provider: &str,
+        req: ModelRequest,
+    ) -> ModelEventStream {
+        let _ = logical_provider;
+        self.stream(req).await
+    }
 }

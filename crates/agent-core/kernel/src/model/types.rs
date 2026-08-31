@@ -38,6 +38,104 @@ impl MessageRole {
     }
 }
 
+/// 服务商私有推理块的来源模型路由。
+///
+/// 私有签名只允许回传给生成该块的同一逻辑 provider、模型与规范化端点；该类型记录
+/// 不含凭据的端点指纹，不包含 API Key、原始 URL 或其他连接配置。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ModelRoute {
+    /// ModelGateway 中注册的逻辑 provider 名称。
+    provider: String,
+    /// 生成私有推理块时使用的模型 ID。
+    model: String,
+    /// 适配器提供的不透明端点指纹；旧会话缺失时不能匹配带指纹的新路由。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+}
+
+/// 封装在既有 `Thinking.signature` 字段中的服务商私有推理载荷。
+///
+/// 该内部信封避免给公开 [`ContentBlock`] 增加变体或字段，同时保留来源路由、原始签名
+/// 和加密推理块的有序会话语义。外部调用方应把 `signature` 始终视为不透明字符串。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PrivateReasoning {
+    /// 可带空展示文本、但必须原样回传服务商签名的推理块。
+    SignedThinking {
+        /// 服务商返回的原始签名。
+        signature: String,
+        /// 生成该签名的完整来源路由。
+        source_route: ModelRoute,
+    },
+    /// 服务商加密后不可展示、但工具循环要求原样回传的推理块。
+    RedactedThinking {
+        /// 服务商返回的不透明加密数据。
+        data: String,
+        /// 生成该加密块的完整来源路由。
+        source_route: ModelRoute,
+    },
+}
+
+impl PrivateReasoning {
+    /// 返回私有载荷绑定的完整来源路由。
+    pub(crate) fn source_route(&self) -> &ModelRoute {
+        match self {
+            Self::SignedThinking { source_route, .. }
+            | Self::RedactedThinking { source_route, .. } => source_route,
+        }
+    }
+}
+
+/// 内部私有推理信封的版本前缀；未知或旧版原始签名按未绑定来源处理。
+const PRIVATE_REASONING_PREFIX: &str = "lucia-private-reasoning-v1:";
+
+/// 把来源绑定的私有推理编码进公开协议既有的不透明签名字段。
+#[cfg(any(feature = "anthropic", test))]
+pub(crate) fn encode_private_reasoning(reasoning: &PrivateReasoning) -> String {
+    // 该枚举只包含字符串与结构体，序列化为 JSON Value 不存在失败分支。
+    let value = serde_json::to_value(reasoning).expect("私有推理信封必须可序列化");
+    format!("{PRIVATE_REASONING_PREFIX}{value}")
+}
+
+/// 从既有签名字段解析当前版本的内部私有推理信封。
+///
+/// 返回 `None` 表示普通签名、旧会话签名或无效信封；调用方必须按来源未知关闭复用。
+pub(crate) fn decode_private_reasoning(signature: &str) -> Option<PrivateReasoning> {
+    let encoded = signature.strip_prefix(PRIVATE_REASONING_PREFIX)?;
+    serde_json::from_str(encoded).ok()
+}
+
+impl ModelRoute {
+    /// 创建不包含连接凭据的模型路由标识。
+    #[cfg(test)]
+    pub(crate) fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            scope: None,
+        }
+    }
+
+    /// 创建带非秘密适配器端点指纹的精确模型路由。
+    #[cfg(feature = "anthropic")]
+    pub(crate) fn scoped(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        scope: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            scope: Some(scope.into()),
+        }
+    }
+
+    /// 判断目标逻辑 provider 与模型是否一致；端点 scope 必须在适配器边界另行比较。
+    pub(crate) fn matches_logical_route(&self, provider: &str, model: &str) -> bool {
+        self.provider == provider && self.model == model
+    }
+}
+
 /// Content block in a message.
 /// 消息中的内容块。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,12 +152,13 @@ pub enum ContentBlock {
     /// 模型输出的思维链/推理内容。
     ///
     /// `signature` 用于跨轮次复用思维上下文（Anthropic `thinkingSignature`、
-    /// OpenAI 加密推理签名等）。跨 provider 转换时应丢弃 signature 并将
-    /// thinking 降级为纯文本。
+    /// OpenAI 加密推理签名等）。该字段是不透明载荷，可能由 Core 封装来源绑定；调用方
+    /// 不应解析或修改。带签名的块只能回传给其来源路由，跨路由时整个块必须丢弃，
+    /// 不能把私有推理自动转换为可见文本。
     Thinking {
         /// 模型返回的完整推理文本；是否向最终用户展示由应用决定。
         thinking: String,
-        /// 服务商用于跨轮验证推理块的可选签名，只能回传给同一服务商。
+        /// 跨轮验证推理块的可选不透明签名，只能回传给同一路由。
         signature: Option<String>,
     },
 
@@ -103,6 +202,51 @@ pub enum ContentBlock {
 }
 
 impl ContentBlock {
+    /// 创建绑定完整来源路由的服务商签名推理块。
+    #[cfg(any(feature = "anthropic", test))]
+    pub(crate) fn private_signed_thinking(
+        thinking: impl Into<String>,
+        signature: impl Into<String>,
+        source_route: ModelRoute,
+    ) -> Self {
+        let private = PrivateReasoning::SignedThinking {
+            signature: signature.into(),
+            source_route,
+        };
+        Self::Thinking {
+            thinking: thinking.into(),
+            signature: Some(encode_private_reasoning(&private)),
+        }
+    }
+
+    /// 创建绑定完整来源路由的服务商加密推理块。
+    #[cfg(any(feature = "anthropic", test))]
+    pub(crate) fn private_redacted_thinking(
+        data: impl Into<String>,
+        source_route: ModelRoute,
+    ) -> Self {
+        let private = PrivateReasoning::RedactedThinking {
+            data: data.into(),
+            source_route,
+        };
+        Self::Thinking {
+            thinking: String::new(),
+            signature: Some(encode_private_reasoning(&private)),
+        }
+    }
+
+    /// 解析当前块中由 Core 封装的服务商私有推理载荷。
+    pub(crate) fn private_reasoning(&self) -> Option<PrivateReasoning> {
+        let Self::Thinking {
+            signature: Some(signature),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        decode_private_reasoning(signature)
+    }
+
     /// Extract text if this is a text block.
     /// 如果是文本块，则取出文本。
     pub fn text(&self) -> Option<&str> {

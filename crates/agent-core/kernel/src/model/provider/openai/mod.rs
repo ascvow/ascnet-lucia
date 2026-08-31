@@ -8,14 +8,15 @@
 //! 参数适配策略参考 LiteLLM：为每种 provider 维护一份"支持的参数白名单"，
 //! 构建请求时始终使用标准 Responses API 字段名，发送前按白名单过滤，
 //! 不在白名单中的参数静默丢弃。用户可通过 `provider_options` 手动注入
-//! provider 特有参数（在过滤之后合并，不受白名单约束）。
+//! provider 特有参数（在过滤之后合并，不受白名单约束），但不能覆盖
+//! `ModelRequest.max_tokens` 已绑定的输出上限。
 
 mod stream;
 
 use self::stream::{failed_model_stream, spawn_openai_stream, OpenAiStreamProtocol};
 use super::support::{
-    decode_json_response, endpoint_url, file_attachment_fallback_text, header_map,
-    merge_provider_options,
+    decode_json_response, endpoint_url, enforce_output_budget, file_attachment_fallback_text,
+    header_map, merge_provider_options,
 };
 use crate::model::{
     ChatModel, ContentBlock, FinishReason, MessageRole, ModelEventStream, ModelProviderConfig,
@@ -270,8 +271,10 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
 /// 始终使用标准 Responses API 字段名（如 `max_output_tokens`），
 /// 然后按 `allowed_params` 白名单过滤，最后合并 `provider_options`。
 /// 过滤在 `provider_options` 合并之前执行，因此用户可通过
-/// `provider_options` 注入任意 provider 特有参数，不受白名单约束。
+/// `provider_options` 注入 provider 特有参数；已设置的输出 token 上限会在合并后恢复，
+/// 防止绕过 Core 的执行策略与累计预算。
 fn build_responses_request(req: ModelRequest, allowed_params: &[&str]) -> Result<Value> {
+    let trusted_max_tokens = req.max_tokens;
     let mut body = json!({
         "model": &req.model,
         "input": messages_to_responses_input(&req.messages)?,
@@ -309,12 +312,16 @@ fn build_responses_request(req: ModelRequest, allowed_params: &[&str]) -> Result
     // 按白名单过滤不支持的参数
     filter_params(&mut body, allowed_params);
 
-    // provider_options 在过滤之后合并，不受白名单约束
+    // provider_options 在过滤之后合并；输出上限属于策略门禁字段，合并后必须恢复可信值。
     merge_provider_options(&mut body, req.provider_options);
+    if let Some(max_tokens) = trusted_max_tokens {
+        enforce_output_budget(&mut body, "max_output_tokens", max_tokens);
+    }
     Ok(body)
 }
 
 fn build_chat_completions_request(req: ModelRequest) -> Result<Value> {
+    let trusted_max_tokens = req.max_tokens;
     let mut messages = Vec::new();
 
     if let Some(system) = req.system {
@@ -342,6 +349,9 @@ fn build_chat_completions_request(req: ModelRequest) -> Result<Value> {
     }
 
     merge_provider_options(&mut body, req.provider_options);
+    if let Some(max_tokens) = trusted_max_tokens {
+        enforce_output_budget(&mut body, "max_tokens", max_tokens);
+    }
     Ok(body)
 }
 

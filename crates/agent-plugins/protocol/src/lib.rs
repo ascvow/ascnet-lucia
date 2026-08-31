@@ -366,7 +366,7 @@ pub enum UiInputEvent {
 /// Stable extension event name used for host-level surface actions.
 /// 插件请求宿主应用级动作使用的稳定扩展事件名。
 ///
-/// 只有 manifest 声明 `surface_actions` 能力的插件可以发布该事件。
+/// 只有 manifest 在 `surface_action_allowlist` 授权对应动作的插件可以发布该事件。
 pub const UI_HOST_ACTION_EVENT: &str = "ui.host.action";
 
 /// An idempotent host action request sent by a plugin.
@@ -430,6 +430,56 @@ pub enum UiHostAction {
         /// 接收应答的发起插件服务名。
         reply_service: String,
     },
+}
+
+/// Manifest 可单独授权的宿主界面动作种类。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum UiHostActionKind {
+    /// 替换主输入框文本。
+    SetInput,
+    /// 新建空白会话。
+    NewSession,
+    /// 清空当前会话。
+    ClearSession,
+    /// 重载当前上下文。
+    ReloadContext,
+    /// 退出宿主应用。
+    Exit,
+    /// 恢复指定会话。
+    ResumeSession,
+    /// 查询会话摘要。
+    QuerySessions,
+}
+
+impl UiHostActionKind {
+    /// 返回 manifest 与审计快照使用的稳定协议名称。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SetInput => "set_input",
+            Self::NewSession => "new_session",
+            Self::ClearSession => "clear_session",
+            Self::ReloadContext => "reload_context",
+            Self::Exit => "exit",
+            Self::ResumeSession => "resume_session",
+            Self::QuerySessions => "query_sessions",
+        }
+    }
+}
+
+impl UiHostAction {
+    /// 返回当前动作需要的最小 manifest 权限种类。
+    pub const fn kind(&self) -> UiHostActionKind {
+        match self {
+            Self::SetInput { .. } => UiHostActionKind::SetInput,
+            Self::NewSession => UiHostActionKind::NewSession,
+            Self::ClearSession => UiHostActionKind::ClearSession,
+            Self::ReloadContext { .. } => UiHostActionKind::ReloadContext,
+            Self::Exit => UiHostActionKind::Exit,
+            Self::ResumeSession { .. } => UiHostActionKind::ResumeSession,
+            Self::QuerySessions { .. } => UiHostActionKind::QuerySessions,
+        }
+    }
 }
 
 /// 宿主完成一次会话查询后回送插件的应答。

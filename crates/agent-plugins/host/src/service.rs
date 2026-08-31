@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -56,6 +56,7 @@ pub(crate) trait ServiceHandler: Send + Sync {
 pub(crate) struct ServiceRegistry {
     services: RwLock<HashMap<(String, String), PluginService>>,
     handlers: RwLock<HashMap<String, Arc<dyn ServiceHandler>>>,
+    declared_dependencies: RwLock<HashMap<String, HashSet<String>>>,
     observer: Option<Arc<dyn HostServiceCallObserver>>,
 }
 
@@ -66,14 +67,18 @@ impl ServiceRegistry {
         Self {
             services: RwLock::new(HashMap::new()),
             handlers: RwLock::new(HashMap::new()),
+            declared_dependencies: RwLock::new(HashMap::new()),
             observer,
         }
     }
 
-    /// 注册插件实例的调用处理器。
+    /// 注册插件实例的调用处理器及其 manifest 声明的服务依赖。
+    ///
+    /// 依赖集合由 Host 从可信 manifest 注入；Guest 请求不能在运行时扩张该集合。
     pub(crate) fn register_handler(
         &self,
         plugin_id: impl Into<String>,
+        declared_dependencies: HashSet<String>,
         handler: Arc<dyn ServiceHandler>,
     ) -> Result<()> {
         let plugin_id = plugin_id.into();
@@ -84,7 +89,12 @@ impl ServiceRegistry {
         if handlers.contains_key(&plugin_id) {
             return Err(anyhow!("插件 `{plugin_id}` 的服务处理器重复注册"));
         }
-        handlers.insert(plugin_id, handler);
+        let mut dependencies = self
+            .declared_dependencies
+            .write()
+            .map_err(|_| anyhow!("插件服务依赖锁已中毒"))?;
+        handlers.insert(plugin_id.clone(), handler);
+        dependencies.insert(plugin_id, declared_dependencies);
         Ok(())
     }
 
@@ -127,6 +137,39 @@ impl ServiceRegistry {
         Ok(services)
     }
 
+    /// 返回当前 Guest 按 manifest 依赖有权发现的服务。
+    pub(crate) fn list_for_plugin(
+        &self,
+        caller_id: &str,
+        plugin_id: Option<&str>,
+    ) -> Result<Vec<PluginService>> {
+        let dependencies = self
+            .declared_dependencies
+            .read()
+            .map_err(|_| anyhow!("插件服务依赖锁已中毒"))?;
+        let allowed = dependencies
+            .get(caller_id)
+            .ok_or_else(|| anyhow!("插件 `{caller_id}` 尚未注册服务调用身份"))?;
+        if let Some(target) = plugin_id {
+            ensure_declared_dependency(caller_id, target, allowed)?;
+        }
+        let mut services = self
+            .services
+            .read()
+            .map_err(|_| anyhow!("插件服务目录锁已中毒"))?
+            .values()
+            .filter(|service| {
+                plugin_id.is_none_or(|target| service.plugin_id == target)
+                    && (service.plugin_id == caller_id || allowed.contains(&service.plugin_id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        services.sort_by(|left, right| {
+            (&left.plugin_id, &left.name).cmp(&(&right.plugin_id, &right.name))
+        });
+        Ok(services)
+    }
+
     /// 调用目标插件已经注册的服务。
     pub(crate) async fn call(&self, call: PluginServiceCall) -> Result<Value> {
         let result = self.call_inner(call.clone()).await;
@@ -143,6 +186,21 @@ impl ServiceRegistry {
 
     /// 执行服务目录校验、循环检测和目标处理器调用。
     async fn call_inner(&self, call: PluginServiceCall) -> Result<Value> {
+        let caller_is_plugin = self
+            .handlers
+            .read()
+            .map_err(|_| anyhow!("插件服务处理器锁已中毒"))?
+            .contains_key(&call.caller_id);
+        if caller_is_plugin && call.caller_id != call.plugin_id {
+            let dependencies = self
+                .declared_dependencies
+                .read()
+                .map_err(|_| anyhow!("插件服务依赖锁已中毒"))?;
+            let allowed = dependencies
+                .get(&call.caller_id)
+                .ok_or_else(|| anyhow!("插件 `{}` 尚未注册服务调用身份", call.caller_id))?;
+            ensure_declared_dependency(&call.caller_id, &call.plugin_id, allowed)?;
+        }
         let key = (call.plugin_id.clone(), call.name.clone());
         if !self
             .services
@@ -163,11 +221,6 @@ impl ServiceRegistry {
             .get(&call.plugin_id)
             .cloned()
             .ok_or_else(|| anyhow!("插件 `{}` 当前不可调用", call.plugin_id))?;
-        let caller_is_plugin = self
-            .handlers
-            .read()
-            .map_err(|_| anyhow!("插件服务处理器锁已中毒"))?
-            .contains_key(&call.caller_id);
         if SERVICE_CALL_STACK.try_with(|_| ()).is_ok() {
             invoke_service(handler, call).await
         } else {
@@ -187,12 +240,30 @@ impl ServiceRegistry {
             .write()
             .map_err(|_| anyhow!("插件服务处理器锁已中毒"))?
             .remove(plugin_id);
+        self.declared_dependencies
+            .write()
+            .map_err(|_| anyhow!("插件服务依赖锁已中毒"))?
+            .remove(plugin_id);
         self.services
             .write()
             .map_err(|_| anyhow!("插件服务目录锁已中毒"))?
             .retain(|(owner, _), _| owner != plugin_id);
         Ok(())
     }
+}
+
+/// 校验目标服务 owner 已由调用方 manifest 显式声明。
+fn ensure_declared_dependency(
+    caller_id: &str,
+    target_id: &str,
+    allowed: &HashSet<String>,
+) -> Result<()> {
+    if caller_id == target_id || allowed.contains(target_id) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "插件 `{caller_id}` 的 manifest 未声明对插件 `{target_id}` 的依赖"
+    ))
 }
 
 /// 在任务级调用栈中执行服务，阻止任何插件 store 被同步重入。
@@ -253,7 +324,7 @@ mod tests {
     async fn service_registration_and_call_are_routed_by_owner() {
         let registry = ServiceRegistry::default();
         registry
-            .register_handler("command", Arc::new(EchoHandler))
+            .register_handler("command", HashSet::new(), Arc::new(EchoHandler))
             .expect("处理器注册应成功");
         registry
             .upsert(
@@ -282,12 +353,79 @@ mod tests {
         assert_eq!(response["payload"]["name"], "hello");
     }
 
+    /// Guest 只能调用并发现其 manifest 已声明依赖提供的服务。
+    #[tokio::test]
+    async fn plugin_service_access_requires_declared_dependency() {
+        let registry = ServiceRegistry::default();
+        registry
+            .register_handler("provider", HashSet::new(), Arc::new(EchoHandler))
+            .expect("提供方处理器注册应成功");
+        registry
+            .register_handler(
+                "consumer",
+                HashSet::from(["provider".to_string()]),
+                Arc::new(EchoHandler),
+            )
+            .expect("消费方处理器注册应成功");
+        registry
+            .register_handler("intruder", HashSet::new(), Arc::new(EchoHandler))
+            .expect("未授权调用方处理器注册应成功");
+        registry
+            .upsert(
+                "provider",
+                PluginService {
+                    plugin_id: String::new(),
+                    name: "identity.echo".into(),
+                    version: "1.0.0".into(),
+                    description: None,
+                },
+            )
+            .expect("服务注册应成功");
+
+        let response = registry
+            .call(PluginServiceCall {
+                caller_id: "consumer".into(),
+                plugin_id: "provider".into(),
+                name: "identity.echo".into(),
+                payload: Value::Null,
+            })
+            .await
+            .expect("已声明依赖应允许调用");
+        assert_eq!(response["caller"], "consumer");
+        assert_eq!(
+            registry
+                .list_for_plugin("consumer", Some("provider"))
+                .expect("已声明依赖应允许发现服务")
+                .len(),
+            1
+        );
+
+        let error = registry
+            .call(PluginServiceCall {
+                caller_id: "intruder".into(),
+                plugin_id: "provider".into(),
+                name: "identity.echo".into(),
+                payload: Value::Null,
+            })
+            .await
+            .expect_err("未声明依赖必须拒绝调用");
+        assert!(error.to_string().contains("manifest 未声明"));
+        assert!(registry
+            .list_for_plugin("intruder", None)
+            .expect("无目标查询应返回授权子集")
+            .is_empty());
+        let error = registry
+            .list_for_plugin("intruder", Some("provider"))
+            .expect_err("未声明依赖必须拒绝定向发现");
+        assert!(error.to_string().contains("manifest 未声明"));
+    }
+
     /// 未注册服务不能仅凭存在处理器被调用。
     #[tokio::test]
     async fn unregistered_service_is_rejected() {
         let registry = ServiceRegistry::default();
         registry
-            .register_handler("command", Arc::new(EchoHandler))
+            .register_handler("command", HashSet::new(), Arc::new(EchoHandler))
             .expect("处理器注册应成功");
 
         let error = registry
@@ -307,7 +445,7 @@ mod tests {
     async fn synchronous_self_call_is_rejected() {
         let registry = ServiceRegistry::default();
         registry
-            .register_handler("command", Arc::new(EchoHandler))
+            .register_handler("command", HashSet::new(), Arc::new(EchoHandler))
             .expect("处理器注册应成功");
         registry
             .upsert(

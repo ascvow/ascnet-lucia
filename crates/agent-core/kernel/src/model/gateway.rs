@@ -246,7 +246,8 @@ impl ModelGateway {
             .providers
             .get(provider)
             .ok_or_else(|| anyhow!("unknown model provider: {provider}"))?;
-        adapter.complete(req).await
+        // 逻辑路由只从 Gateway 的实际注册键传入，不能信任请求或插件自行声明。
+        adapter.complete_for_provider(provider, req).await
     }
 
     /// 流式调用一个已注册服务商。
@@ -261,7 +262,8 @@ impl ModelGateway {
             .providers
             .get(provider)
             .ok_or_else(|| anyhow!("unknown model provider: {provider}"))?;
-        Ok(adapter.stream(req).await)
+        // 与非流式路径保持相同的可信路由绑定。
+        Ok(adapter.stream_for_provider(provider, req).await)
     }
 
     /// Whether a provider exists.
@@ -288,5 +290,95 @@ fn validate_provider_name(provider_name: &str) -> Result<()> {
 impl ChatModel for ModelGateway {
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse> {
         self.complete("default", req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ModelEventStream;
+    use std::sync::Mutex;
+
+    /// 记录 Gateway 传入的可信注册别名，普通 ChatModel 路径不参与断言。
+    struct RoutedProvider {
+        observed: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for RoutedProvider {
+        async fn complete(&self, _req: ModelRequest) -> Result<ModelResponse> {
+            Ok(ModelResponse::text("未路由"))
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for RoutedProvider {
+        fn name(&self) -> &'static str {
+            "routed-test"
+        }
+
+        async fn complete_for_provider(
+            &self,
+            logical_provider: &str,
+            _req: ModelRequest,
+        ) -> Result<ModelResponse> {
+            self.observed
+                .lock()
+                .expect("路由记录锁不应中毒")
+                .push(logical_provider.to_string());
+            Ok(ModelResponse::text("完成"))
+        }
+
+        async fn stream_for_provider(
+            &self,
+            logical_provider: &str,
+            _req: ModelRequest,
+        ) -> ModelEventStream {
+            self.observed
+                .lock()
+                .expect("路由记录锁不应中毒")
+                .push(logical_provider.to_string());
+            let (sender, stream) = ModelEventStream::channel();
+            sender.done(ModelResponse::text("完成"));
+            stream
+        }
+    }
+
+    /// 自定义注册别名必须由 Gateway 同时绑定到非流式与流式适配器调用。
+    #[tokio::test]
+    async fn gateway_binds_registered_provider_alias() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut gateway = ModelGateway::new();
+        gateway
+            .register(
+                "custom-anthropic",
+                Arc::new(RoutedProvider {
+                    observed: Arc::clone(&observed),
+                }),
+            )
+            .expect("应注册自定义 provider 别名");
+
+        gateway
+            .complete(
+                "custom-anthropic",
+                ModelRequest::new("test-model", Vec::new()),
+            )
+            .await
+            .expect("非流式路由应成功");
+        gateway
+            .stream(
+                "custom-anthropic",
+                ModelRequest::new("test-model", Vec::new()),
+            )
+            .await
+            .expect("流式路由应成功")
+            .result()
+            .await
+            .expect("流式响应应成功");
+
+        assert_eq!(
+            *observed.lock().expect("路由记录锁不应中毒"),
+            vec!["custom-anthropic", "custom-anthropic"]
+        );
     }
 }

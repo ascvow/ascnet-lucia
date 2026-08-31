@@ -29,7 +29,7 @@ host.emit_event(&ExtensionEvent {
 })?;
 ```
 
-Host 会覆盖事件的 `source`，插件不能伪造其他 owner。静态 `list_tools` 与动态 `upsert_tool` 都必须声明真实 `ToolPermissionScope`；缺失时使用 `Unknown`，不会按公开工具名自动放行。
+Host 会覆盖事件的 `source`，插件不能伪造其他 owner。静态 `list_tools` 与动态 `upsert_tool` 先使用 manifest 的 `[capabilities.tool_scopes]`；Guest 自报值不一致会拒绝加载，manifest 缺失映射时降级为 `Unknown`。Host 随后根据整个 component 已授予的进程、文件、模型、Agent 和宿主动作能力抬高最终 scope；多类资源合并为 `Unknown`，防止高权限插件用 `Control` 跳过逐调用审批。
 
 ## 实例状态
 
@@ -39,7 +39,9 @@ Host 会覆盖事件的 `source`，插件不能伪造其他 owner。静态 `list
 | `set_state(key, value)` | 写入或替换 JSON 值 |
 | `remove_state(key)` | 删除并返回旧值 |
 
-状态按当前插件隔离。应用未注入持久目录时只保留到 component 卸载；注入后由 Host 事务性保存并在同一插件重新加载前恢复，Guest 不接触实际状态路径。
+状态按当前插件隔离。应用未注入持久目录时只保留到 component 卸载；注入后由 Host 按插件
+ID、真实加载来源、Component 字节、版本和 capability profile 生成可信身份，事务性保存并只在
+身份一致的插件重新加载前恢复，Guest 不接触也不能声明实际状态路径。
 
 ## 插件服务
 
@@ -47,10 +49,10 @@ Host 会覆盖事件的 `source`，插件不能伪造其他 owner。静态 `list
 | --- | --- |
 | `upsert_service(spec)` | 注册或替换当前插件拥有的版本化服务 |
 | `remove_service(name)` | 幂等删除当前插件服务 |
-| `list_services(plugin_id)` | 查询全部或指定插件的服务目录 |
-| `call_service(plugin_id, name, payload)` | 调用目标服务并取得 JSON 返回值 |
+| `list_services(plugin_id)` | 查询当前 manifest 已声明依赖及自身拥有的服务目录 |
+| `call_service(plugin_id, name, payload)` | 调用 manifest 已声明依赖的目标服务并取得 JSON 返回值 |
 
-服务 owner 和调用方 ID 均由 Host 注入。完整依赖模型和 command 复用示例见[依赖与服务](/plugin/dependencies-services)。
+服务 owner、调用方 ID 和可调用依赖集合均由 Host 注入。Guest 不能发现或调用 manifest 未声明的插件服务；提供方仍需按业务资源 owner 校验请求。完整依赖模型和 command 复用示例见[依赖与服务](/plugin/dependencies-services)。
 
 ## 文件读取
 
@@ -104,7 +106,7 @@ let response = host.complete_model(&ModelCompletionRequest {
 })?;
 ```
 
-该能力要求 manifest 声明 `model_completion = true`，且应用通过 `PluginHostServices::with_model_completion` 注入模型网关、provider、model、流式模式和最大输出预算。Guest 不能提交模型路由、流式模式、工具、推理级别或 provider options；Host 固定这些设置并收窄输出预算。调用失败或返回空文本时直接返回错误，不会静默退回本地裁剪。
+该能力要求 manifest 声明 `model_completion = true`，且应用通过 `PluginHostServices::with_model_completion` 注入模型网关、provider、model、流式模式和最大输出预算。Guest 不能提交模型路由、流式模式、工具、推理级别或 provider options；Host 固定这些设置并收窄输出预算。ExecutionPolicy 的累计调用次数和请求输入字节预算按单个插件激活隔离，同一激活内的并发 clone 共享原子账本，不会消耗其他插件实例的额度。调用失败或返回空文本时直接返回错误，不会静默退回本地裁剪。
 
 ## 错误信封
 

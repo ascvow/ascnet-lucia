@@ -59,6 +59,80 @@ fn wasm_plugin_loads_share_process_engine() -> Result<()> {
     Ok(())
 }
 
+/// 插件持久状态身份必须同时绑定真实来源、Component 字节、版本与 capability profile。
+#[test]
+fn plugin_state_identity_changes_with_trusted_bundle_identity() {
+    let manifest = PluginManifest {
+        plugin: PluginSection {
+            id: "permission".into(),
+            name: "Permission".into(),
+            version: "1.0.0".into(),
+            api_version: SUPPORTED_PLUGIN_API_VERSION.into(),
+            wasm: "permission.wasm".into(),
+            description: None,
+        },
+        dependencies: Vec::new(),
+        provides: Vec::new(),
+        capabilities: Default::default(),
+        metadata: HashMap::new(),
+    };
+    let original = derive_plugin_state_identity(
+        &manifest,
+        std::path::Path::new("/trusted/source-a/permission.wasm"),
+        b"component-a",
+    )
+    .expect("生成原 Bundle 状态身份");
+    assert_eq!(
+        original,
+        derive_plugin_state_identity(
+            &manifest,
+            std::path::Path::new("/trusted/source-a/permission.wasm"),
+            b"component-a",
+        )
+        .expect("相同 Bundle 身份应稳定")
+    );
+    assert_ne!(
+        original,
+        derive_plugin_state_identity(
+            &manifest,
+            std::path::Path::new("/trusted/source-b/permission.wasm"),
+            b"component-a",
+        )
+        .expect("不同来源应生成新身份")
+    );
+    assert_ne!(
+        original,
+        derive_plugin_state_identity(
+            &manifest,
+            std::path::Path::new("/trusted/source-a/permission.wasm"),
+            b"component-b",
+        )
+        .expect("不同 Component 应生成新身份")
+    );
+    let mut versioned = manifest.clone();
+    versioned.plugin.version = "2.0.0".into();
+    assert_ne!(
+        original,
+        derive_plugin_state_identity(
+            &versioned,
+            std::path::Path::new("/trusted/source-a/permission.wasm"),
+            b"component-a",
+        )
+        .expect("不同版本应生成新身份")
+    );
+    let mut expanded = manifest;
+    expanded.capabilities.process_exec = true;
+    assert_ne!(
+        original,
+        derive_plugin_state_identity(
+            &expanded,
+            std::path::Path::new("/trusted/source-a/permission.wasm"),
+            b"component-a",
+        )
+        .expect("不同 capability profile 应生成新身份")
+    );
+}
+
 /// Subviews require a valid instance ID, while static views reject dynamic routing.
 /// 子视图必须携带有效实例 ID，静态视图则拒绝动态实例路由。
 #[test]

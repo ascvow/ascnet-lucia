@@ -9,7 +9,7 @@ use crate::capability::requests::{
 use crate::contribution::ContributionRegistry;
 use crate::manifest::{AgentCapabilitySection, CapabilitySection};
 use crate::service::{PluginService, PluginServiceCall, ServiceHandler, ServiceRegistry};
-use crate::services::ModelCompletionHostServices;
+use crate::PluginHostServices;
 use agent_core::{model::ModelEventStream, ChatModel, ModelResponse, ProviderAdapter};
 use agent_core::{ModelRequest, ReasoningLevel, ToolChoice};
 use agent_runtime::{
@@ -27,6 +27,51 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
+
+/// Agent Runtime 的 Guest 订阅出口不得暴露服务商私有推理增量。
+#[test]
+fn agent_runtime_guest_events_hide_private_thinking() {
+    let event = agent_core::AgentEvent::new(
+        "run-private",
+        agent_core::AgentEventKind::ModelThinkingDelta,
+        0,
+        json!({"delta": "私有推理"}),
+    );
+
+    assert!(super::agent::sanitize_guest_visible_agent_event(event).is_none());
+}
+
+/// `agent.observe` 不得绕过 Core 的审批事件脱敏读取完整拒绝原因。
+#[test]
+fn agent_runtime_guest_events_hide_approval_reason() {
+    let event = agent_core::AgentEvent::new(
+        "run-denied",
+        agent_core::AgentEventKind::ToolFinished,
+        0,
+        json!({
+            "call_id": "blocked-call",
+            "name": "shell",
+            "content": {"error": "审批模型拒绝：命令包含敏感宿主路径"},
+            "is_error": true,
+            "error_kind": "permission_denied",
+            "details": {"private": "仅可信 UI 可见"},
+            "runtime_origin": "plugin_policy"
+        }),
+    );
+
+    let sanitized =
+        super::agent::sanitize_guest_visible_agent_event(event).expect("工具终态仍应向 Guest 可见");
+
+    assert_eq!(sanitized.payload["call_id"], "blocked-call");
+    assert_eq!(sanitized.payload["error_kind"], "permission_denied");
+    assert_eq!(
+        sanitized.payload["content"]["error"],
+        "工具调用未获批准，未执行。"
+    );
+    assert!(sanitized.payload.get("details").is_none());
+    assert!(!sanitized.payload.to_string().contains("敏感宿主路径"));
+}
 
 /// 捕获 Host 最终模型请求的测试适配器。
 struct CapturingCompletionModel {
@@ -217,6 +262,7 @@ fn agent_runtime_fixture() -> (
 fn test_state() -> CapabilityState {
     CapabilityState::new(
         "test-plugin".into(),
+        "test-bundle".into(),
         PathBuf::from("."),
         CapabilitySection::default(),
         Arc::new(ContributionRegistry::default()),
@@ -230,6 +276,7 @@ fn test_state() -> CapabilityState {
 fn process_state(process_exec: bool, execution_policy: ExecutionPolicy) -> CapabilityState {
     CapabilityState::new(
         "process-test-plugin".into(),
+        "process-test-bundle".into(),
         PathBuf::from("."),
         CapabilitySection {
             process_exec,
@@ -290,6 +337,7 @@ fn persistent_instance_state_survives_recreation() {
     let create_state = || {
         CapabilityState::new(
             "permission".into(),
+            "permission-bundle-a".into(),
             PathBuf::from("."),
             CapabilitySection::default(),
             Arc::new(ContributionRegistry::default()),
@@ -313,12 +361,55 @@ fn persistent_instance_state_survives_recreation() {
     std::fs::remove_dir_all(root).expect("清理持久能力状态测试目录");
 }
 
+/// 同 ID 的不同可信 Bundle 不得读取旧权限插件保存的 AllowAll。
+#[test]
+fn persistent_permission_state_is_isolated_by_bundle_identity() {
+    let root = std::env::temp_dir().join(format!(
+        "lucia-capability-state-identity-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let create_state = |state_identity: &str| {
+        CapabilityState::new(
+            "permission".into(),
+            state_identity.into(),
+            PathBuf::from("."),
+            CapabilitySection::default(),
+            Arc::new(ContributionRegistry::default()),
+            Arc::new(ServiceRegistry::default()),
+            CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), Some(root.clone())),
+        )
+        .expect("创建持久能力状态")
+    };
+    let mut original = create_state("permission-bundle-a");
+    original
+        .set_state(r#"{"key":"permission_mode:project-a","value":"allow_all"}"#)
+        .expect("保存旧 Bundle 权限模式");
+
+    let mut replacement = create_state("permission-bundle-b");
+    assert_eq!(
+        replacement
+            .get_state(r#"{"key":"permission_mode:project-a"}"#)
+            .expect("读取新 Bundle 权限模式"),
+        Value::Null
+    );
+    let mut reopened = create_state("permission-bundle-a");
+    assert_eq!(
+        reopened
+            .get_state(r#"{"key":"permission_mode:project-a"}"#)
+            .expect("恢复原 Bundle 权限模式"),
+        json!("allow_all")
+    );
+    std::fs::remove_dir_all(root).expect("清理身份隔离状态测试目录");
+}
+
 /// 发布事件时 Host 必须覆盖可信的插件来源。
 #[test]
 fn emitted_event_contains_trusted_source() {
     let contributions = Arc::new(ContributionRegistry::default());
     let mut state = CapabilityState::new(
         "trusted-id".into(),
+        "trusted-bundle".into(),
         PathBuf::from("."),
         CapabilitySection::default(),
         contributions.clone(),
@@ -332,6 +423,108 @@ fn emitted_event_contains_trusted_source() {
     let events = contributions.drain_events().expect("读取事件应成功");
     assert_eq!(events[0]["source"]["id"], "trusted-id");
     assert_eq!(events[0]["name"], "demo.ready");
+}
+
+/// Guest 导出 Future 被丢弃等价于作用域守卫 Drop，后续控制面事件不得继承旧 run。
+#[test]
+fn active_run_scope_restores_previous_binding_on_drop() {
+    let contributions = Arc::new(ContributionRegistry::default());
+    let mut state = CapabilityState::new(
+        "trusted-id".into(),
+        "trusted-bundle".into(),
+        PathBuf::from("."),
+        CapabilitySection::default(),
+        contributions.clone(),
+        Arc::new(ServiceRegistry::default()),
+        CapabilityHostContext::default(),
+    )
+    .expect("创建运行作用域测试能力状态");
+
+    {
+        let _scope = state.enter_active_run_scope(Some("run-a"));
+        state
+            .emit_event(r#"{"name":"run.event","data":{}}"#)
+            .expect("运行内事件应成功");
+    }
+    state
+        .emit_event(r#"{"name":"ui.event","data":{}}"#)
+        .expect("作用域结束后的控制面事件应成功");
+
+    let run_events = contributions
+        .drain_events_for_run("run-a")
+        .expect("读取运行事件应成功");
+    let control_events = contributions.drain_events().expect("读取控制面事件应成功");
+    assert_eq!(run_events[0]["name"], "run.event");
+    assert_eq!(control_events[0]["name"], "ui.event");
+}
+
+/// 异步 Guest 导出被取消时必须立即 Drop 守卫，并恢复进入导出前的运行绑定。
+#[tokio::test]
+async fn active_run_scope_restores_binding_when_future_is_cancelled() {
+    let binding = ActiveRunBinding::default();
+    let outer_scope = binding.enter(Some("run-outer"));
+    let worker_binding = binding.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _inner_scope = worker_binding.enter(Some("run-cancelled"));
+        entered_tx.send(()).expect("通知测试任务已进入运行作用域");
+        std::future::pending::<()>().await;
+    });
+
+    entered_rx.await.expect("测试任务应进入运行作用域");
+    assert_eq!(binding.current().as_deref(), Some("run-cancelled"));
+    task.abort();
+    let cancelled = task.await.expect_err("测试任务应被取消");
+    assert!(cancelled.is_cancelled());
+    assert_eq!(binding.current().as_deref(), Some("run-outer"));
+
+    drop(outer_scope);
+    assert_eq!(binding.current(), None);
+}
+
+/// 宿主界面动作必须逐项授权，permission 插件需要的 SetInput 不得隐式获得 Exit。
+#[test]
+fn surface_action_allowlist_is_enforced_per_action() {
+    let mut state = CapabilityState::new(
+        "permission".into(),
+        "permission-bundle".into(),
+        PathBuf::from("."),
+        CapabilitySection {
+            surface_action_allowlist: vec![crate::ui::UiHostActionKind::SetInput],
+            ..CapabilitySection::default()
+        },
+        Arc::new(ContributionRegistry::default()),
+        Arc::new(ServiceRegistry::default()),
+        CapabilityHostContext::default(),
+    )
+    .expect("创建细粒度界面动作状态");
+
+    state
+        .emit_event(
+            &json!({
+                "name": crate::ui::UI_HOST_ACTION_EVENT,
+                "data": {
+                    "request_id": "set-input-1",
+                    "action": {"action": "set_input", "text": "", "cursor": 0}
+                }
+            })
+            .to_string(),
+        )
+        .expect("已授权 SetInput 应成功");
+    let error = state
+        .emit_event(
+            &json!({
+                "name": crate::ui::UI_HOST_ACTION_EVENT,
+                "data": {
+                    "request_id": "exit-1",
+                    "action": {"action": "exit"}
+                }
+            })
+            .to_string(),
+        )
+        .expect_err("未授权 Exit 必须拒绝");
+    assert!(error.to_string().contains("未授权 surface action `exit`"));
+    assert!(is_capability_denied(&error));
 }
 
 /// 宿主响应必须携带稳定版本，且成功和失败信封保持同一结构入口。
@@ -403,6 +596,74 @@ fn serve_process_policy_still_requires_manifest_permission() {
         .expect("Serve 策略和 manifest 同时允许时门禁应通过");
 }
 
+/// Serve 平面仍必须执行 ResourceLimits 的进程数上限，`0` 在触碰操作系统前拒绝。
+#[test]
+fn plugin_process_count_follows_execution_policy_limit() {
+    let mut policy = ExecutionPolicy::serve();
+    policy.limits.max_processes = Some(0);
+    let mut state = process_state(true, policy);
+
+    let error = state
+        .spawn_process(r#"{"command":"command-must-not-run"}"#)
+        .expect_err("进程上限为 0 时必须拒绝");
+
+    assert!(error.to_string().contains("进程数上限为 0"));
+    assert!(state.processes.is_empty());
+}
+
+/// 插件状态被释放时必须回收受管进程组，不能让后台后代脱离 Host 生命周期。
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_plugin_state_kills_managed_process_group() {
+    let heartbeat = std::env::temp_dir().join(format!(
+        "lucia-plugin-process-heartbeat-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut state = process_state(true, ExecutionPolicy::serve());
+    let handle = state
+        .spawn_process(
+            &json!({
+                "command": "sh",
+                "args": ["-c", "printf 'ready\\n'; while :; do printf x >> \"$HEARTBEAT\"; sleep 0.02; done & wait"],
+                "env": {"HEARTBEAT": heartbeat.to_string_lossy()}
+            })
+            .to_string(),
+        )
+        .expect("应启动插件测试进程")
+        .as_u64()
+        .expect("进程句柄应为整数");
+    let ready = state
+        .read_process_line(&json!({"handle": handle, "timeout_ms": 2_000}).to_string())
+        .await
+        .expect("应读取插件进程就绪信号")
+        .as_str()
+        .expect("就绪信号应为文本")
+        .to_string();
+    assert_eq!(ready, "ready");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if std::fs::metadata(&heartbeat).is_ok_and(|metadata| metadata.len() > 0) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("后台后代应开始产生心跳");
+
+    drop(state);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let settled_size = std::fs::metadata(&heartbeat).expect("心跳文件应存在").len();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        std::fs::metadata(&heartbeat).expect("心跳文件应保留").len(),
+        settled_size,
+        "插件状态释放后后台后代必须停止运行"
+    );
+    std::fs::remove_file(heartbeat).expect("清理插件进程心跳文件");
+}
+
 /// 插件即使把工具伪装成普通名称，也不能绕过实际进程能力入口。
 #[test]
 fn plugin_tool_alias_cannot_bypass_process_policy() {
@@ -468,13 +729,11 @@ async fn model_completion_uses_trusted_route_and_limits() {
             }),
         )
         .expect("注册测试模型");
-    let binding = ModelCompletionHostServices {
-        gateway,
-        provider: "trusted-provider".into(),
-        model: "trusted-model".into(),
-        max_output_tokens: 128,
-        stream: true,
-    };
+    let binding = PluginHostServices::new()
+        .with_model_completion(gateway, "trusted-provider", "trusted-model", 128, true)
+        .expect("注入流式模型服务")
+        .model_completion()
+        .expect("模型服务绑定应存在");
 
     let response = CapabilityState::complete_model_with(
         true,
@@ -508,13 +767,11 @@ async fn model_completion_can_use_non_streaming_route() {
             }),
         )
         .expect("注册非流式测试模型");
-    let binding = ModelCompletionHostServices {
-        gateway,
-        provider: "trusted-provider".into(),
-        model: "trusted-model".into(),
-        max_output_tokens: 20_000,
-        stream: false,
-    };
+    let binding = PluginHostServices::new()
+        .with_model_completion(gateway, "trusted-provider", "trusted-model", 20_000, false)
+        .expect("注入非流式模型服务")
+        .model_completion()
+        .expect("模型服务绑定应存在");
 
     CapabilityState::complete_model_with(
         true,
@@ -525,6 +782,84 @@ async fn model_completion_can_use_non_streaming_route() {
     .expect("非流式模型完成应成功");
 
     assert_eq!(requests.lock().expect("锁定模型请求").len(), 1);
+}
+
+/// 插件模型完成必须执行累计调用预算，防止插件通过重复审核形成无界费用。
+#[tokio::test]
+async fn model_completion_enforces_execution_policy_budget() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut gateway = agent_core::ModelGateway::new();
+    gateway
+        .register(
+            "trusted-provider",
+            Arc::new(CapturingCompletionModel {
+                requests: requests.clone(),
+                expect_stream: false,
+            }),
+        )
+        .expect("注册预算测试模型");
+    let mut policy = ExecutionPolicy::serve();
+    policy.limits.max_plugin_model_completions = Some(1);
+    let binding = PluginHostServices::new()
+        .restrict_execution_policy(&policy)
+        .with_model_completion(gateway, "trusted-provider", "trusted-model", 128, false)
+        .expect("注入预算模型服务")
+        .model_completion()
+        .expect("模型服务绑定应存在");
+    let request = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"审核"}]}]}"#;
+
+    CapabilityState::complete_model_with(true, Some(binding.clone()), request)
+        .await
+        .expect("第一次调用应在预算内");
+    let error = CapabilityState::complete_model_with(true, Some(binding), request)
+        .await
+        .expect_err("第二次调用必须被预算拒绝");
+
+    assert!(error.to_string().contains("调用次数超过策略上限 1 次"));
+    assert!(is_capability_denied(&error));
+    assert_eq!(requests.lock().expect("锁定模型请求").len(), 1);
+}
+
+/// 不同插件激活必须拥有独立预算，而同一激活内的服务 clone 继续共享计数器。
+#[tokio::test]
+async fn model_completion_budget_is_isolated_per_plugin_activation() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut gateway = agent_core::ModelGateway::new();
+    gateway
+        .register(
+            "trusted-provider",
+            Arc::new(CapturingCompletionModel {
+                requests: requests.clone(),
+                expect_stream: false,
+            }),
+        )
+        .expect("注册预算隔离测试模型");
+    let mut policy = ExecutionPolicy::serve();
+    policy.limits.max_plugin_model_completions = Some(1);
+    let services = PluginHostServices::new()
+        .restrict_execution_policy(&policy)
+        .with_model_completion(gateway, "trusted-provider", "trusted-model", 128, false)
+        .expect("注入预算模型服务");
+    let first_activation = services
+        .model_completion()
+        .expect("第一插件激活应获得模型服务");
+    let second_activation = services
+        .model_completion()
+        .expect("第二插件激活应获得模型服务");
+    let request = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"审核"}]}]}"#;
+
+    CapabilityState::complete_model_with(true, Some(first_activation.clone()), request)
+        .await
+        .expect("第一插件首次调用应成功");
+    let error = CapabilityState::complete_model_with(true, Some(first_activation), request)
+        .await
+        .expect_err("同一插件通过 clone 发起第二次调用仍应被拒绝");
+    assert!(error.to_string().contains("调用次数超过策略上限 1 次"));
+    CapabilityState::complete_model_with(true, Some(second_activation), request)
+        .await
+        .expect("第二插件应拥有独立预算");
+
+    assert_eq!(requests.lock().expect("锁定模型请求").len(), 2);
 }
 
 /// Dispatcher 只暴露短控制面操作，并返回可跨 ABI 使用的脱敏结构。
@@ -654,8 +989,19 @@ async fn service_call_ignores_forged_caller_id() {
     let observer = Arc::new(InMemoryHostServiceCallObserver::new());
     let services = Arc::new(ServiceRegistry::new(Some(observer.clone())));
     services
-        .register_handler("provider", Arc::new(CallerEchoService))
+        .register_handler(
+            "provider",
+            std::collections::HashSet::new(),
+            Arc::new(CallerEchoService),
+        )
         .expect("注册测试服务处理器");
+    services
+        .register_handler(
+            "trusted-consumer",
+            std::collections::HashSet::from(["provider".to_string()]),
+            Arc::new(CallerEchoService),
+        )
+        .expect("注册测试调用方处理器");
     services
         .upsert(
             "provider",

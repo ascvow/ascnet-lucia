@@ -91,7 +91,7 @@ pub enum AgentEventKind {
     /// 模型输出的文本增量，可用于实时界面渲染。
     ModelTextDelta,
 
-    /// 模型输出的推理增量，可用于实时状态展示。
+    /// 模型输出的推理增量，仅发送给可信应用 EventSink 用于实时状态展示。
     ModelThinkingDelta,
 
     /// 模型已返回完整响应；流式增量事件会在它之前发布。

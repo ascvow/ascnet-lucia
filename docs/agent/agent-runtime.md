@@ -27,9 +27,9 @@
 Queued -> Running -> Succeeded | Failed | Cancelled
 ```
 
-终态不可覆盖。取消父节点会级联取消后代；重复取消保持幂等。`RuntimeLimits` 约束最大深度、每个父节点的累计子节点数和全局模型运行并发。
+终态不可覆盖。取消父节点会级联取消后代；重复取消保持幂等。`RuntimeLimits` 约束最大深度、每个父节点的累计子节点数、全局模型运行并发，以及单个 principal 的累计 Agent 与模型请求资源。
 
-`steer` 只接受排队或运行中的自身/后代 Agent。排队阶段最多暂存 32 条消息，Core Agent 启动后按顺序注入；目标进入终态后拒绝实时消息。`subscribe` 为晚加入观察者回放最近 512 条事件，再持续发送实时事件，终态且缓冲耗尽后自然结束。
+`steer` 只接受排队或运行中的自身/后代 Agent。排队阶段与 Core Agent 运行阶段的待注入队列都最多保留 32 条消息，启动后按顺序注入；目标进入终态后拒绝实时消息。`subscribe` 为晚加入观察者回放最近 512 条事件，再持续发送实时事件，终态且缓冲耗尽后自然结束。
 
 ## 原生调用
 
@@ -71,7 +71,15 @@ let follow_up = provisioned
 
 Host 为每次受限组件激活创建唯一 `RuntimePrincipal`。principal 拥有独立 controller 和派生树；插件请求不能填写 owner 或 parent。插件卸载时，Host 通过 provisioner 撤销 principal，取消并清理其全部 Runtime 资源。
 
+每个 controller、首次派生和 `continue_agent` 创建的后续 Agent 都计入该 principal 的累计 Agent 总数。Agent 进入终态不会返还名额，避免通过快速创建并结束任务绕过生命周期预算；只有撤销 principal 才会清理整份账本。父节点深度或子节点数检查失败时，尚未形成 Agent 的临时预留会回滚。
+
+派生 Agent 的每个最终 `ModelRequest` 在 provider 调用前原子预留三项累计资源：请求次数、provider-neutral 请求的 JSON 序列化字节数和 `max_tokens` 声明的输出 token。字节预算统计的是 adapter 转换前的可信请求，不等同于最终网络 body；计数使用有界 writer，超限时不会先复制完整请求。任一维度超限时 provider 不会收到请求；provider 随后失败也不返还预留，防止失败重试绕过预算。执行策略或 Agent 已设置的单次输出上限优先；两者都未设置时 Runtime 为派生 Agent 注入 20,000 token 的有限默认值。
+
+内置 OpenAI 与 Anthropic adapter 把这个 `max_tokens` 继续作为最终 wire 输出硬上限：合并 `provider_options` 后重新覆盖主 token 字段，把已出现的常见顶层 token 别名收窄到同一上限，并把多候选参数固定为一。Anthropic extended thinking 也必须在该总上限内分配思考与可见输出，预算不足时直接拒绝，不会隐式扩容。第三方 adapter 若要保留 Runtime 的累计输出保证，也必须把 `ModelRequest.max_tokens` 作为不可放宽的最终请求上限。
+
 Runtime 的 controller profile 由应用注册，决定基础模型、工具和权限。Plugin Host 还会把 Guest 可见的 spawn profile 映射为受控的 `AgentDeriveConfig`。Guest 只能提交 profile 名称和任务输入，不能直接传入 provider、API key、provider options 或工具权限。
+
+Lucia TUI 的 `worker` profile 使用显式只读 allowlist：`list_directory`、`search_files`、`read_file` 和 `skill_read`。它不继承 `shell`、`write_file` 或未来新增工具；需要副作用的工作必须回到经过主 Agent 权限策略的调用链。
 
 应用通过可选宿主服务把 Runtime 注入 WASM loader：
 

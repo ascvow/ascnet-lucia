@@ -126,6 +126,19 @@ impl Session {
 mod tests {
     use super::*;
 
+    /// 本次变更前公开给外部 crate 的推理内容块结构。
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum LegacyReasoningBlock {
+        /// 旧版只认识展示文本与不透明签名两个字段。
+        Thinking {
+            /// 旧版可见推理文本。
+            thinking: String,
+            /// 旧版不透明服务商签名。
+            signature: Option<String>,
+        },
+    }
+
     #[test]
     fn parts_round_trip_preserves_session() {
         let mut session = Session::new();
@@ -149,5 +162,69 @@ mod tests {
         let decoded: Session = serde_json::from_str(&encoded).expect("会话应该可以反序列化");
 
         assert_eq!(decoded, session);
+    }
+
+    /// 旧会话保存未绑定来源的原始签名时仍可读取，但该推理必须按不可回传处理。
+    #[test]
+    fn legacy_signed_thinking_without_source_route_is_fail_closed() {
+        let session: Session = serde_json::from_str(
+            r#"{
+                "messages": [{
+                    "role": "assistant",
+                    "content": [{
+                        "type": "thinking",
+                        "thinking": "旧私有推理",
+                        "signature": "sig-legacy"
+                    }]
+                }]
+            }"#,
+        )
+        .expect("旧会话应保持可读取");
+
+        let transformed = crate::model::transform::transform_messages_for_route(
+            session.messages(),
+            "anthropic-main",
+            "claude-test",
+        );
+
+        assert!(transformed.is_empty());
+    }
+
+    /// Anthropic 私有推理块及完整来源 scope 必须通过既有签名字段随会话 JSON 无损往返。
+    #[cfg(feature = "anthropic")]
+    #[test]
+    fn serde_round_trip_preserves_provider_private_reasoning_route() {
+        let route = crate::model::types::ModelRoute::scoped(
+            "anthropic-main",
+            "claude-test",
+            "endpoint-fingerprint",
+        );
+        let mut session = Session::new();
+        session.push_assistant_blocks(vec![
+            ContentBlock::private_signed_thinking("", "sig-private", route.clone()),
+            ContentBlock::private_redacted_thinking("encrypted-private", route),
+        ]);
+
+        let encoded = serde_json::to_string(&session).expect("私有推理会话应可序列化");
+        let decoded: Session = serde_json::from_str(&encoded).expect("私有推理会话应可反序列化");
+        let legacy_blocks: Vec<LegacyReasoningBlock> = serde_json::from_value(
+            serde_json::to_value(&session.messages()[0].content)
+                .expect("当前内容块应可编码为 JSON"),
+        )
+        .expect("旧版两字段 Thinking 协议应能读取全部私有推理块");
+
+        assert_eq!(decoded, session);
+        assert_eq!(legacy_blocks.len(), 2);
+        for block in legacy_blocks {
+            match block {
+                LegacyReasoningBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    assert!(thinking.is_empty());
+                    assert!(signature.is_some());
+                }
+            }
+        }
     }
 }

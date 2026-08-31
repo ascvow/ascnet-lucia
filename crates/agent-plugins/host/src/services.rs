@@ -13,6 +13,8 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 #[cfg(feature = "wasm")]
 use std::path::PathBuf;
+#[cfg(feature = "wasm")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 /// 应用固定路由的受限模型完成服务。
 #[cfg(feature = "wasm")]
@@ -23,6 +25,65 @@ pub(crate) struct ModelCompletionHostServices {
     pub(crate) model: String,
     pub(crate) max_output_tokens: u32,
     pub(crate) stream: bool,
+    execution_policy: ExecutionPolicy,
+    completed_calls: Arc<AtomicUsize>,
+    submitted_input_bytes: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "wasm")]
+impl ModelCompletionHostServices {
+    /// 为单个插件激活创建独立预算账本；返回值自身的后续 clone 继续共享该账本。
+    fn for_plugin_activation(&self) -> Self {
+        Self {
+            gateway: self.gateway.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            max_output_tokens: self.max_output_tokens,
+            stream: self.stream,
+            execution_policy: self.execution_policy.clone(),
+            completed_calls: Arc::new(AtomicUsize::new(0)),
+            submitted_input_bytes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// 预留一次插件模型调用预算；失败时不增加任何计数。
+    pub(crate) fn reserve(&self, input_bytes: usize) -> std::result::Result<(), String> {
+        let limits = &self.execution_policy.limits;
+        if !try_reserve(
+            &self.submitted_input_bytes,
+            input_bytes,
+            limits.max_plugin_model_input_bytes,
+        ) {
+            return Err(format!(
+                "插件模型请求累计输入超过策略上限 {} 字节",
+                limits.max_plugin_model_input_bytes.unwrap_or(0)
+            ));
+        }
+        if !try_reserve(
+            &self.completed_calls,
+            1,
+            limits.max_plugin_model_completions,
+        ) {
+            self.submitted_input_bytes
+                .fetch_sub(input_bytes, Ordering::AcqRel);
+            return Err(format!(
+                "插件模型完成调用次数超过策略上限 {} 次",
+                limits.max_plugin_model_completions.unwrap_or(0)
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 原子预留一个累计资源维度；`None` 表示不设上限但仍保留计数。
+#[cfg(feature = "wasm")]
+fn try_reserve(counter: &AtomicUsize, amount: usize, limit: Option<usize>) -> bool {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            let next = current.checked_add(amount)?;
+            limit.is_none_or(|limit| next <= limit).then_some(next)
+        })
+        .is_ok()
 }
 
 /// Plugin Host 可注入 WASM 实例的通用宿主服务集合。
@@ -67,6 +128,12 @@ impl PluginHostServices {
     /// 可信门禁后复用同一策略。
     pub fn restrict_execution_policy(mut self, requested: &ExecutionPolicy) -> Self {
         self.execution_policy = self.execution_policy.restrict(requested);
+        #[cfg(feature = "wasm")]
+        if let Some(model_completion) = self.model_completion.as_mut() {
+            model_completion.execution_policy = model_completion
+                .execution_policy
+                .restrict(&self.execution_policy);
+        }
         self
     }
 
@@ -85,8 +152,9 @@ impl PluginHostServices {
 
     /// 注入应用拥有的插件持久状态目录。
     ///
-    /// 状态仍通过现有 `get_state`、`set_state` 和 `remove_state` ABI 按插件 ID 隔离；未调用
-    /// 本方法时保持进程内状态。应用不应把生产目录注入 Evaluation 或 Mutation 平面。
+    /// 状态仍通过现有 `get_state`、`set_state` 和 `remove_state` ABI 访问，但 Host 会按插件
+    /// ID、真实加载来源、Component 字节、版本和 capability profile 共同隔离；未调用本方法
+    /// 时保持进程内状态。应用不应把生产目录注入 Evaluation 或 Mutation 平面。
     ///
     /// # Errors
     ///
@@ -183,6 +251,9 @@ impl PluginHostServices {
             model,
             max_output_tokens,
             stream,
+            execution_policy: self.execution_policy.clone(),
+            completed_calls: Arc::new(AtomicUsize::new(0)),
+            submitted_input_bytes: Arc::new(AtomicUsize::new(0)),
         });
         Ok(self)
     }
@@ -193,10 +264,15 @@ impl PluginHostServices {
         self.agent_runtime.clone()
     }
 
-    /// 返回 Host 内部使用的固定模型完成服务快照。
+    /// 返回单个插件激活使用的固定模型完成服务快照。
+    ///
+    /// 每次调用创建独立预算账本，避免一个插件耗尽其他插件的额度；同一返回值的 clone
+    /// 仍共享计数器，使该插件实例内的并发调用无法绕过累计上限。
     #[cfg(feature = "wasm")]
     pub(crate) fn model_completion(&self) -> Option<ModelCompletionHostServices> {
-        self.model_completion.clone()
+        self.model_completion
+            .as_ref()
+            .map(ModelCompletionHostServices::for_plugin_activation)
     }
 
     /// 返回指定插件的 Host 可信激活元数据；未注入时返回空映射。

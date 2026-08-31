@@ -78,6 +78,20 @@ fn persistent_plugin_state_dir(lucia_home: &Path) -> PathBuf {
     lucia_home.join("plugin-state")
 }
 
+/// 把动态插件宿主同时装配到主 Agent 和后续派生模板。
+///
+/// 模板必须在挂载 Host 后捕获；否则 workflow、teammate 等插件派生的 worker 会绕过
+/// permission 插件和 Host 启动期的 fail-closed 工具门禁。
+#[cfg(feature = "plugins")]
+fn assemble_plugin_agents(
+    base_agent: Agent,
+    live_plugin_host: Arc<LivePluginHost>,
+) -> (AgentTemplate, Arc<Agent>) {
+    let agent = base_agent.with_extension(live_plugin_host);
+    let template = AgentTemplate::from_agent(&agent);
+    (template, Arc::new(agent))
+}
+
 /// 终端状态守卫：正常退出、`?` 提前返回或 panic 展开时都恢复终端。
 ///
 /// raw mode 或 bracketed paste 残留会让外层 shell 换行不回车、粘贴出现
@@ -106,6 +120,8 @@ impl Drop for TerminalGuard {
 
 pub(crate) async fn run(args: Args) -> Result<()> {
     let workspace = WorkspaceContext::capture()?;
+    #[cfg(feature = "plugins")]
+    let plugin_workspace_scope = workspace.project_id.clone();
     let config_path = resolve_config_path(args.config.as_deref())?;
     if args.init {
         initialize_config(&config_path)?;
@@ -372,15 +388,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         base_agent.event_sink(),
     )?);
     let base_agent = base_agent.with_context_loader(agent_context_loader);
-    // 先捕获插件模板，供派生子 Agent 使用独立执行会话。
-    #[cfg(feature = "plugins")]
-    let plugin_agent_template = AgentTemplate::from_agent(&base_agent);
     #[cfg(feature = "plugins")]
     let live_plugin_host = Arc::new(LivePluginHost::new());
     #[cfg(feature = "plugins")]
-    let agent = Some(Arc::new(
-        base_agent.with_extension(live_plugin_host.clone()),
-    ));
+    let (plugin_agent_template, plugin_agent) =
+        assemble_plugin_agents(base_agent, live_plugin_host.clone());
+    #[cfg(feature = "plugins")]
+    let agent = Some(plugin_agent);
     #[cfg(not(feature = "plugins"))]
     let agent = Some(Arc::new(base_agent));
     #[cfg(feature = "plugins")]
@@ -476,6 +490,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 capability_selection,
                 plugin_agent_template,
                 plugin_execution,
+                plugin_workspace_scope,
                 load_host,
                 load_tx.clone(),
             )
@@ -1036,6 +1051,42 @@ mod tests {
     fn persistent_plugin_state_lives_under_lucia_home() {
         let home = Path::new("/tmp/lucia-home");
         assert_eq!(persistent_plugin_state_dir(home), home.join("plugin-state"));
+    }
+
+    /// 插件派生模板必须继承动态 Host，确保 worker 工具同样经过审批门禁。
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn plugin_worker_template_keeps_live_host_permission_gate() {
+        let live_host = Arc::new(LivePluginHost::new());
+        let base_agent = Agent::new(
+            agent_core::model::ModelGateway::new(),
+            agent_core::AgentOptions::default(),
+        );
+        let (template, _main_agent) = assemble_plugin_agents(base_agent, live_host);
+        let (worker, _) = template
+            .instantiate(
+                &agent_runtime::AgentPermissions::default(),
+                &agent_runtime::AgentDeriveConfig::default(),
+            )
+            .expect("派生 worker 应成功");
+
+        let decision = worker
+            .extension()
+            .before_tool(&agent_tool::ToolCall::new(
+                "worker-read",
+                "read_file",
+                json!({"path": "README.md"}),
+            ))
+            .await
+            .expect("Host 未就绪时应形成 fail-closed 决策");
+
+        assert!(matches!(
+            decision,
+            agent_core::ToolDecision::Block {
+                reason,
+                agent_guidance: Some(guidance),
+            } if reason.contains("能力归属仍在解析") && guidance.contains("当前调用未执行")
+        ));
     }
 
     /// 原生工具守卫必须固定为 TUI 启动目录。

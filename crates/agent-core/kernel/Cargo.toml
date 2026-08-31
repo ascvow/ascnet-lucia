@@ -9,7 +9,7 @@ description = "ascnet-lucia 的最小 ReAct Agent 核心和模型协议适配层
 [features]
 default = ["openai", "anthropic"]
 openai = ["dep:reqwest", "dep:base64"]
-anthropic = ["dep:reqwest", "dep:base64"]
+anthropic = ["dep:reqwest", "dep:base64", "dep:sha2"]
 
 [dependencies]
 anyhow.workspace = true
@@ -20,6 +20,7 @@ futures-util.workspace = true
 reqwest = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true

@@ -63,6 +63,30 @@ async fn wasm_host_routes_permission_approval() {
         ToolDecision::Block { .. }
     ));
 
+    // 本用例验证真实 UI 人工审批路由；模型代审的拒绝与异常语义由插件和 Core 分层测试覆盖。
+    host.on_ui_input(&UiInput {
+        plugin_id: "permission".into(),
+        view_id: MODE_VIEW.into(),
+        instance_id: None,
+        event: UiInputEvent::MainInput {
+            text: "/permission manual".into(),
+            cursor: 18,
+        },
+    })
+    .await
+    .expect("输入人工审批模式");
+    host.on_ui_input(&UiInput {
+        plugin_id: "permission".into(),
+        view_id: MODE_VIEW.into(),
+        instance_id: None,
+        event: UiInputEvent::Key {
+            code: "enter".into(),
+            modifiers: Vec::new(),
+        },
+    })
+    .await
+    .expect("切换人工审批模式");
+
     let write = scoped_call(
         "write",
         "write_file",

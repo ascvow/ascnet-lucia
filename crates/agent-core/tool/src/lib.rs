@@ -42,6 +42,18 @@ impl ToolPermissionScope {
     fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown)
     }
+
+    /// 返回 manifest、审计和授权界面共用的稳定协议名称。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Control => "control",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Shell => "shell",
+            Self::Network => "network",
+        }
+    }
 }
 
 /// A tool definition visible to the model.
@@ -123,6 +135,12 @@ pub struct ToolCall {
     /// Core/Host 从已注册工具定义绑定的可信权限范围；模型响应中的同名字段不得直接使用。
     #[serde(default, skip_serializing_if = "ToolPermissionScope::is_unknown")]
     pub permission_scope: ToolPermissionScope,
+
+    /// Core 为当前 Agent 运行绑定的可信 ID，供有状态策略隔离并发审批。
+    ///
+    /// Provider、历史消息或 Guest 自报值均不可信；Core 会在每次进入扩展链前覆盖该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// 工具执行前的通用最终决策，由 Core、Host 与 Guest SDK 共同复用。
@@ -132,10 +150,13 @@ pub enum ToolDecision {
     /// 原样允许工具调用。
     #[default]
     Allow,
-    /// 阻止工具调用，并将原因作为工具错误返回给模型。
+    /// 阻止当前工具调用，但不取消 Agent 运行。
     Block {
-        /// 返回给模型和事件消费者的阻止原因，不应包含敏感宿主信息。
+        /// 返回给事件消费者的详细原因，不会在存在一次性指导时写入会话历史。
         reason: String,
+        /// 仅注入下一次模型请求的脱敏指导；缺失时只保留稳定拒绝结果，不暴露 `reason`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_guidance: Option<String>,
     },
     /// 取消当前 Agent 运行，并保留会话供后续继续。
     CancelRun {
@@ -144,9 +165,34 @@ pub enum ToolDecision {
     },
     /// 在执行前重写工具调用。
     Rewrite {
-        /// 替换原调用的完整工具调用；调用 ID 应保持可关联性。
+        /// 替换原调用的工具名称和参数；Core/Host 会覆盖调用 ID、运行身份与权限 scope。
         call: ToolCall,
     },
+}
+
+impl ToolDecision {
+    /// 创建阻止决策。
+    ///
+    /// `reason` 只供可信事件和界面展示；模型、Session 与扩展观察钩子只接收稳定拒绝文案。
+    pub fn block(reason: impl Into<String>) -> Self {
+        Self::Block {
+            reason: reason.into(),
+            agent_guidance: None,
+        }
+    }
+
+    /// 创建带一次性 Agent 指导的阻止决策。
+    ///
+    /// `reason` 只供事件和界面展示；`agent_guidance` 仅参与下一次模型请求，不写入会话。
+    pub fn block_with_guidance(
+        reason: impl Into<String>,
+        agent_guidance: impl Into<String>,
+    ) -> Self {
+        Self::Block {
+            reason: reason.into(),
+            agent_guidance: Some(agent_guidance.into()),
+        }
+    }
 }
 
 /// Guest 前置检查的通用异步状态；业务插件自行维护等待原因和交互协议。
@@ -185,12 +231,18 @@ impl ToolCall {
             name: name.into(),
             args,
             permission_scope: ToolPermissionScope::Unknown,
+            run_id: None,
         }
     }
 
     /// 覆盖为宿主已验证的工具权限范围；仅注册表或 Host 路由层应调用。
     pub fn bind_permission_scope(&mut self, permission_scope: ToolPermissionScope) {
         self.permission_scope = permission_scope;
+    }
+
+    /// 覆盖为 Core 当前运行的可信 ID；仅 Agent 运行循环或 Host 重写路由应调用。
+    pub fn bind_run_id(&mut self, run_id: impl Into<String>) {
+        self.run_id = Some(run_id.into());
     }
 
     /// Deserialize arguments into a typed Rust value.
@@ -577,7 +629,9 @@ pub mod policy;
 pub mod workspace;
 
 pub use policy::{ExecutionPolicy, ExecutionProfile, FilesystemScope, ResourceLimits, ToolAccess};
-pub use workspace::{FileCapabilities, FileCapability, WorkspaceError, WorkspaceGuard};
+pub use workspace::{
+    is_sensitive_path, FileCapabilities, FileCapability, WorkspaceError, WorkspaceGuard,
+};
 
 /// Validate a provider-portable tool name.
 /// 校验跨服务商可移植的工具名称。
@@ -657,7 +711,7 @@ mod tests {
             .is_none());
     }
 
-    /// 旧 ToolCall JSON 缺少权限字段时必须保守解析，新 scope 才会写入 Guest hook JSON。
+    /// 旧 ToolCall JSON 缺少 Host 字段时必须兼容，新绑定值才会写入 Guest hook JSON。
     #[test]
     fn tool_call_permission_scope_is_additive_and_host_bound() {
         let mut call: ToolCall = serde_json::from_value(json!({
@@ -667,12 +721,13 @@ mod tests {
         }))
         .expect("旧 ToolCall JSON 应继续解析");
         assert_eq!(call.permission_scope, ToolPermissionScope::Unknown);
+        assert_eq!(call.run_id, None);
 
         call.bind_permission_scope(ToolPermissionScope::Read);
-        assert_eq!(
-            serde_json::to_value(call).expect("序列化已绑定调用")["permission_scope"],
-            "read"
-        );
+        call.bind_run_id("run-1");
+        let encoded = serde_json::to_value(call).expect("序列化已绑定调用");
+        assert_eq!(encoded["permission_scope"], "read");
+        assert_eq!(encoded["run_id"], "run-1");
     }
 
     /// 最终决策的 JSON 结构必须由 Core、Host 与 Guest 共享，避免边界两侧复制协议。
@@ -681,6 +736,7 @@ mod tests {
         let status = ToolDecisionStatus::Ready {
             decision: ToolDecision::Block {
                 reason: "测试阻止".to_string(),
+                agent_guidance: None,
             },
         };
 
@@ -694,6 +750,18 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// 旧版 Block JSON 缺少一次性指导时必须继续解析，并保持原有上下文行为。
+    #[test]
+    fn block_decision_accepts_legacy_json_without_agent_guidance() {
+        let decision: ToolDecision = serde_json::from_value(json!({
+            "type": "block",
+            "reason": "旧版阻止原因"
+        }))
+        .expect("旧版 Block 决策应继续解析");
+
+        assert_eq!(decision, ToolDecision::block("旧版阻止原因"));
     }
 
     /// 旧 Guest 省略轮询间隔时必须使用稳定默认值，保证加法字段兼容。
