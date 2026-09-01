@@ -20,6 +20,30 @@ pub(crate) const COLOR_WARNING: Color = Color::Rgb(197, 164, 103);
 pub(crate) const COLOR_DANGER: Color = Color::Rgb(205, 101, 101);
 /// 用户消息块背景色：与绯红强调同系的暗红灰，用于与助手正文区分。
 pub(crate) const COLOR_USER_BG: Color = Color::Rgb(58, 38, 43);
+
+/// 代码预览左侧行号列颜色；比正文更暗，避免与内容争夺注意力。
+pub(crate) const COLOR_LINE_NUMBER: Color = Color::Rgb(92, 90, 86);
+/// diff 新增行的整行背景色。
+pub(crate) const COLOR_DIFF_ADD_BG: Color = Color::Rgb(26, 56, 36);
+/// diff 删除行的整行背景色。
+pub(crate) const COLOR_DIFF_DEL_BG: Color = Color::Rgb(66, 30, 34);
+/// diff 新增行的行号与标记色。
+pub(crate) const COLOR_DIFF_ADD_FG: Color = Color::Rgb(126, 202, 146);
+/// diff 删除行的行号与标记色。
+pub(crate) const COLOR_DIFF_DEL_FG: Color = Color::Rgb(224, 122, 122);
+
+/// 代码高亮：关键字。
+pub(crate) const COLOR_SYNTAX_KEYWORD: Color = Color::Rgb(214, 122, 160);
+/// 代码高亮：字符串字面量。
+pub(crate) const COLOR_SYNTAX_STRING: Color = Color::Rgb(176, 196, 132);
+/// 代码高亮：注释。
+pub(crate) const COLOR_SYNTAX_COMMENT: Color = Color::Rgb(110, 118, 112);
+/// 代码高亮：数值字面量。
+pub(crate) const COLOR_SYNTAX_NUMBER: Color = Color::Rgb(214, 168, 118);
+/// 代码高亮：类型与首字母大写标识符。
+pub(crate) const COLOR_SYNTAX_TYPE: Color = Color::Rgb(210, 180, 120);
+/// 代码高亮：标点与运算符。
+pub(crate) const COLOR_SYNTAX_PUNCT: Color = Color::Rgb(150, 148, 142);
 /// Number of 80 ms UI ticks before startup plugin details collapse into the compact counter.
 /// 启动插件详情收敛为紧凑计数前保留的 80 毫秒 UI tick 数。
 #[cfg(feature = "plugins")]

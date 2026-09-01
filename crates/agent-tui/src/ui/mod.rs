@@ -1,8 +1,10 @@
 //! Lucia TUI 的组件、视图状态和插件 UI 桥接。
 
 pub(crate) mod chat;
+pub(crate) mod highlight;
 pub(crate) mod markdown;
 pub(crate) mod root;
+pub(crate) mod transcript;
 
 #[cfg(feature = "plugins")]
 pub(crate) mod plugin_bridge;

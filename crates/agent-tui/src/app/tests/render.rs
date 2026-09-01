@@ -189,7 +189,7 @@ fn render_hides_reasoning_text_and_shows_thinking_status() {
     assert!(!text.contains("Working..."), "{text:?}");
 }
 
-/// 验证工具行展示参数与返回内容摘要，且过长内容按显示宽度截断。
+/// 验证工具行展示目标路径与面向人的结果摘要，且过长内容按显示宽度截断。
 #[test]
 fn tool_lines_show_args_and_truncated_result() {
     let mut msg = Msg::tool_started(ToolCall::new(
@@ -216,8 +216,10 @@ fn tool_lines_show_args_and_truncated_result() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(text.contains("● read_file(path: src/main.rs)"), "{text:?}");
-    assert!(text.contains("└ 很长的文件内容"), "{text:?}");
+    assert!(text.contains("● Read(src/main.rs)"), "{text:?}");
+    assert!(text.contains("└ 读取 1 行，来自 src/main.rs"), "{text:?}");
+    // 正文进入带行号的预览块，超宽部分按显示宽度截断。
+    assert!(text.contains("1 很长的文件内容"), "{text:?}");
     assert!(text.contains('…'), "{text:?}");
 }
 
@@ -240,8 +242,9 @@ fn running_tool_lines_show_latest_output() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert!(text.contains("… 共 8 行"), "{text:?}");
-    assert!(!text.contains("编译进度 1"), "{text:?}");
+    // 预览只保留最新若干行，被折叠的行数以 `… +N 行` 标注。
+    assert!(text.contains("… +2 行"), "{text:?}");
+    assert!(!text.contains("编译进度 1\n"), "{text:?}");
     assert!(text.contains("编译进度 8"), "{text:?}");
 }
 
@@ -257,7 +260,9 @@ fn tool_lines_accept_empty_result() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert!(text.contains("● shell"), "{text:?}");
+    assert!(text.contains("● Shell"), "{text:?}");
+    // 空结果没有可展开的正文，不应凭空造出预览行。
+    assert!(!text.contains("null"), "{text:?}");
 }
 
 /// 验证嵌套 JSON 摘要折叠为计数而不是原始序列化。

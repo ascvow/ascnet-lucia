@@ -1,9 +1,11 @@
 //! 对话消息、Markdown 渲染、附件引用与剪贴板处理。
 
-use crate::theme::{COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_TEXT, COLOR_WARNING};
-use crate::ui::markdown::{
-    conversation_lines, markdown_lines, summarize_json, tool_output_preview_lines,
-    tool_result_lines, truncate_line, user_lines,
+use crate::theme::{COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_WARNING};
+use crate::ui::highlight::CodeLanguage;
+use crate::ui::markdown::{conversation_lines, markdown_lines, truncate_line, user_lines};
+use crate::ui::transcript::{
+    output_preview_lines, preview_language, preview_lines, render_preview, tool_summary,
+    tool_target, tool_title_spans,
 };
 use agent_core::model::ContentBlock;
 #[cfg(feature = "plugins")]
@@ -273,83 +275,86 @@ impl Msg {
         }
     }
 
-    /// 构造工具调用块：`● 名称(参数)` 加 `└ 返回摘要` 与缩进的多行预览，
-    /// 圆点以状态色区分，`+`/`-` 前缀的预览行按 diff 着色，块尾留空行。
+    /// 构造工具调用块：`● 名称(目标)` 加 `└ 结果摘要` 与带行号的预览，
+    /// 圆点以状态色区分，diff 行整行铺背景色，块尾留空行。
     ///
     /// 摘要与预览行按 `width` 显示宽度截断，避免窄终端下自动换行
     /// 把续行顶到行首、破坏缩进对齐。
-    pub(crate) fn tool_lines(&self, note: &str, color: Color, width: u16) -> Vec<Line<'_>> {
+    pub(crate) fn tool_lines(&self, note: &str, color: Color, width: u16) -> Vec<Line<'static>> {
         #[cfg(feature = "plugins")]
         if let Some(frame) = self
             .tool_frame
             .as_ref()
             .filter(|frame| frame.visible && !frame.lines.is_empty())
         {
-            let mut lines = crate::ui::plugin_frame_lines(frame);
+            let mut lines = crate::ui::plugin_frame_lines(frame)
+                .into_iter()
+                .map(|line| {
+                    // 插件帧借用自帧数据，这里克隆为独立行以统一返回生命周期。
+                    Line::from(
+                        line.spans
+                            .into_iter()
+                            .map(|span| Span::styled(span.content.into_owned(), span.style))
+                            .collect::<Vec<_>>(),
+                    )
+                    .style(line.style)
+                })
+                .collect::<Vec<_>>();
             lines.push(Line::default());
             return lines;
         }
 
-        // 前缀占 4 列，再留 1 列吸收截断省略号，保证整行不超宽。
-        let preview_width = usize::from(width).saturating_sub(5).max(1);
-        let mut first = vec![
-            Span::styled("● ", Style::new().fg(color)),
-            Span::styled(self.text.as_str(), Style::new().fg(COLOR_TEXT).bold()),
-        ];
-        if let Some(args) = self
-            .tool_call
-            .as_ref()
-            .map(|call| summarize_json(&call.args, 64))
-            .filter(|args| !args.is_empty())
-        {
-            first.push(Span::styled(
-                format!("({args})"),
-                Style::new().fg(COLOR_MUTED),
-            ));
-        }
+        // 标题前缀占 2 列，再留 1 列吸收截断省略号。
+        let summary_width = usize::from(width).saturating_sub(6).max(1);
+        let is_error = matches!(self.kind, MsgKind::ToolError);
+        let call = self.tool_call.as_ref();
+        let target = call.and_then(tool_target);
+
+        let mut first = vec![Span::styled("● ", Style::new().fg(color))];
+        first.extend(tool_title_spans(&self.text, target.as_deref()));
         if !note.is_empty() {
             first.push(Span::styled(format!("  {note}"), Style::new().fg(color)));
         }
         let mut lines = vec![Line::from(first)];
-        let result_color = if matches!(self.kind, MsgKind::ToolError) {
-            COLOR_DANGER
-        } else {
-            COLOR_MUTED
-        };
-        let result_lines = if let Some(result) = self.tool_result.as_ref() {
-            tool_result_lines(&result.content, TOOL_RESULT_PREVIEW_LINES, 96)
-        } else if self.tool_output.is_empty() {
-            Vec::new()
-        } else {
-            tool_output_preview_lines(&self.tool_output, TOOL_RESULT_PREVIEW_LINES, 96)
-        };
-        if let Some(result) = result_lines.first() {
+
+        // 跳过的工具没有结果可展开，直接说明原因。
+        if let Some(reason) = self.skip_reason.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled("  └ ", Style::new().fg(COLOR_MUTED)),
                 Span::styled(
-                    truncate_line(result, preview_width),
-                    Style::new().fg(result_color),
+                    truncate_line(reason, summary_width),
+                    Style::new().fg(COLOR_MUTED),
                 ),
             ]));
+            lines.push(Line::default());
+            return lines;
         }
-        for detail in result_lines.iter().skip(1) {
-            let detail_color = if matches!(self.kind, MsgKind::ToolError) {
-                COLOR_DANGER
-            } else if detail.starts_with('+') {
-                COLOR_SUCCESS
-            } else if detail.starts_with('-') {
-                COLOR_DANGER
-            } else {
-                COLOR_MUTED
-            };
+
+        let (summary, preview, language) = match self.tool_result.as_ref() {
+            Some(result) => (
+                tool_summary(call, result),
+                preview_lines(call, result, TOOL_RESULT_PREVIEW_LINES),
+                preview_language(call, result),
+            ),
+            None if self.tool_output.is_empty() => (None, Vec::new(), CodeLanguage::Plain),
+            None => (
+                None,
+                output_preview_lines(&self.tool_output, TOOL_RESULT_PREVIEW_LINES),
+                CodeLanguage::Plain,
+            ),
+        };
+
+        if let Some(summary) = summary {
+            let summary_color = if is_error { COLOR_DANGER } else { COLOR_MUTED };
             lines.push(Line::from(vec![
-                Span::raw("    "),
+                Span::styled("  └ ", Style::new().fg(COLOR_MUTED)),
                 Span::styled(
-                    truncate_line(detail, preview_width),
-                    Style::new().fg(detail_color),
+                    truncate_line(&summary, summary_width),
+                    Style::new().fg(summary_color),
                 ),
             ]));
         }
+        lines.extend(render_preview(&preview, width, language, is_error));
         lines.push(Line::default());
         lines
     }

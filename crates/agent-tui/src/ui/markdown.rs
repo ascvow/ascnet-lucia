@@ -340,49 +340,6 @@ pub(crate) fn restyle_markdown(style: Style, accent: Color) -> Style {
     style
 }
 
-/// 从工具结果 JSON 中提取多行文本预览：首行作摘要，其余行缩进展示。
-///
-/// 文本型 `content` 按行拆分并按显示宽度截断；非文本结构退回单行 JSON 摘要；
-/// 超出预览行数时以省略行标注总行数。
-pub(crate) fn tool_result_lines(value: &Value, max_lines: usize, max_width: usize) -> Vec<String> {
-    let text = match value {
-        Value::Object(map) => match map.get("content") {
-            Some(Value::String(text)) => text.as_str(),
-            _ => return vec![summarize_json(value, max_width)],
-        },
-        Value::String(text) => text.as_str(),
-        other => return vec![summarize_json(other, max_width)],
-    };
-    let total = text.lines().count();
-    let mut lines: Vec<String> = text
-        .lines()
-        .take(max_lines)
-        .map(|line| truncate_line(line.trim_end(), max_width))
-        .collect();
-    if total > max_lines {
-        lines.push(format!("… 共 {total} 行"));
-    }
-    lines
-}
-
-/// 构造工具输出预览；运行期文本展示最新行，最终结构化结果保持原有摘要行为。
-pub(crate) fn tool_output_preview_lines(
-    text: &str,
-    max_lines: usize,
-    max_width: usize,
-) -> Vec<String> {
-    let all = text.lines().collect::<Vec<_>>();
-    let start = all.len().saturating_sub(max_lines);
-    let mut lines = all[start..]
-        .iter()
-        .map(|line| truncate_line(line.trim_end(), max_width))
-        .collect::<Vec<_>>();
-    if start > 0 {
-        lines.insert(0, format!("… 共 {} 行", all.len()));
-    }
-    lines
-}
-
 /// 将 JSON 值压缩为单行摘要：对象展开为 `键: 值` 列表，嵌套结构折叠为计数，
 /// 超出宽度按显示宽度截断。
 pub(crate) fn summarize_json(value: &Value, max_width: usize) -> String {
