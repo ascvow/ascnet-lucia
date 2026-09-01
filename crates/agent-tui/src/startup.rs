@@ -937,6 +937,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     continue;
                 }
                 app.handle_text_selection(&mouse, rendered_buffer);
+                if app.handle_tool_message_click(&mouse) {
+                    continue;
+                }
                 #[cfg(feature = "plugins")]
                 {
                     let dialog_active = app.active_dialog_index().is_some();

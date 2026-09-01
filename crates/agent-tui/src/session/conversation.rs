@@ -129,6 +129,8 @@ pub(crate) struct Msg {
     pub(crate) tool_output: String,
     /// 工具未执行时的原因；其他消息为 `None`。
     pub(crate) skip_reason: Option<String>,
+    /// 工具详情是否展开；新消息默认收起，只保留标题与结果摘要。
+    pub(crate) tool_expanded: bool,
     /// 插件为当前工具消息返回的声明式帧。
     #[cfg(feature = "plugins")]
     pub(crate) tool_frame: Option<PluginUiFrame>,
@@ -157,6 +159,7 @@ impl Msg {
             tool_result: None,
             tool_output: String::new(),
             skip_reason: None,
+            tool_expanded: false,
             #[cfg(feature = "plugins")]
             tool_frame: None,
             #[cfg(feature = "plugins")]
@@ -201,6 +204,36 @@ impl Msg {
             })
     }
 
+    /// 返回当前消息是否属于工具生命周期，供消息分组和点击热区共用。
+    pub(crate) fn is_tool(&self) -> bool {
+        matches!(
+            self.kind,
+            MsgKind::ToolRunning | MsgKind::ToolOk | MsgKind::ToolError | MsgKind::ToolSkipped
+        )
+    }
+
+    /// 返回当前工具消息是否存在可展开详情。
+    ///
+    /// 插件 renderer 以第一行为紧凑态，其余行为详情；默认 renderer 只在结构化结果或
+    /// 运行输出能够形成至少一条预览行时允许展开。
+    pub(crate) fn has_tool_details(&self) -> bool {
+        if !self.is_tool() || self.skip_reason.is_some() {
+            return false;
+        }
+        #[cfg(feature = "plugins")]
+        if let Some(frame) = self
+            .tool_frame
+            .as_ref()
+            .filter(|frame| frame.visible && !frame.lines.is_empty())
+        {
+            return frame.lines.len() > 1;
+        }
+        if let Some(result) = self.tool_result.as_ref() {
+            return !preview_lines(self.tool_call.as_ref(), result, 1).is_empty();
+        }
+        !self.tool_output.is_empty() && !output_preview_lines(&self.tool_output, 1).is_empty()
+    }
+
     /// 向运行中的工具消息追加输出；调用 ID 的匹配由上层状态机负责。
     pub(crate) fn append_tool_output(&mut self, delta: &str) {
         self.tool_output.push_str(delta);
@@ -222,6 +255,7 @@ impl Msg {
             tool_result: None,
             tool_output: String::new(),
             skip_reason: None,
+            tool_expanded: false,
             #[cfg(feature = "plugins")]
             tool_frame: None,
             #[cfg(feature = "plugins")]
@@ -275,8 +309,8 @@ impl Msg {
         }
     }
 
-    /// 构造工具调用块：`● 名称(目标)` 加 `└ 结果摘要` 与带行号的预览，
-    /// 圆点以状态色区分，diff 行整行铺背景色，块尾留空行。
+    /// 构造工具调用块：紧凑态显示 `▸ ● 名称(目标)` 与结果摘要，展开态显示
+    /// `▾` 和有界详情；圆点以状态色区分，diff 行整行铺背景色。
     ///
     /// 摘要与预览行按 `width` 显示宽度截断，避免窄终端下自动换行
     /// 把续行顶到行首、破坏缩进对齐。
@@ -287,8 +321,17 @@ impl Msg {
             .as_ref()
             .filter(|frame| frame.visible && !frame.lines.is_empty())
         {
-            let mut lines = crate::ui::plugin_frame_lines(frame)
+            let frame_lines = crate::ui::plugin_frame_lines(frame);
+            let has_details = frame_lines.len() > 1;
+            let visible_lines = if self.tool_expanded {
+                TOOL_RESULT_DETAIL_LINES
+            } else {
+                1
+            };
+            let omitted = frame_lines.len().saturating_sub(visible_lines);
+            let mut lines = frame_lines
                 .into_iter()
+                .take(visible_lines)
                 .map(|line| {
                     // 插件帧借用自帧数据，这里克隆为独立行以统一返回生命周期。
                     Line::from(
@@ -300,17 +343,39 @@ impl Msg {
                     .style(line.style)
                 })
                 .collect::<Vec<_>>();
-            lines.push(Line::default());
+            if has_details {
+                lines[0].spans.insert(
+                    0,
+                    Span::styled(
+                        if self.tool_expanded { "▾ " } else { "▸ " },
+                        Style::new().fg(COLOR_MUTED),
+                    ),
+                );
+            }
+            if self.tool_expanded && omitted > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("  … +{omitted} 行"),
+                    Style::new().fg(COLOR_MUTED),
+                )));
+            }
             return lines;
         }
 
-        // 标题前缀占 2 列，再留 1 列吸收截断省略号。
+        // 摘要行预留缩进与截断省略号，窄终端下至少保留一个正文列。
         let summary_width = usize::from(width).saturating_sub(6).max(1);
         let is_error = matches!(self.kind, MsgKind::ToolError);
         let call = self.tool_call.as_ref();
         let target = call.and_then(tool_target);
+        let has_details = self.has_tool_details();
 
-        let mut first = vec![Span::styled("● ", Style::new().fg(color))];
+        let mut first = Vec::new();
+        if has_details {
+            first.push(Span::styled(
+                if self.tool_expanded { "▾ " } else { "▸ " },
+                Style::new().fg(COLOR_MUTED),
+            ));
+        }
+        first.push(Span::styled("● ", Style::new().fg(color)));
         first.extend(tool_title_spans(&self.text, target.as_deref()));
         if !note.is_empty() {
             first.push(Span::styled(format!("  {note}"), Style::new().fg(color)));
@@ -326,23 +391,13 @@ impl Msg {
                     Style::new().fg(COLOR_MUTED),
                 ),
             ]));
-            lines.push(Line::default());
             return lines;
         }
 
-        let (summary, preview, language) = match self.tool_result.as_ref() {
-            Some(result) => (
-                tool_summary(call, result),
-                preview_lines(call, result, TOOL_RESULT_PREVIEW_LINES),
-                preview_language(call, result),
-            ),
-            None if self.tool_output.is_empty() => (None, Vec::new(), CodeLanguage::Plain),
-            None => (
-                None,
-                output_preview_lines(&self.tool_output, TOOL_RESULT_PREVIEW_LINES),
-                CodeLanguage::Plain,
-            ),
-        };
+        let summary = self
+            .tool_result
+            .as_ref()
+            .and_then(|result| tool_summary(call, result));
 
         if let Some(summary) = summary {
             let summary_color = if is_error { COLOR_DANGER } else { COLOR_MUTED };
@@ -354,13 +409,24 @@ impl Msg {
                 ),
             ]));
         }
-        lines.extend(render_preview(&preview, width, language, is_error));
-        lines.push(Line::default());
+        if self.tool_expanded && has_details {
+            let (preview, language) = match self.tool_result.as_ref() {
+                Some(result) => (
+                    preview_lines(call, result, TOOL_RESULT_DETAIL_LINES),
+                    preview_language(call, result),
+                ),
+                None => (
+                    output_preview_lines(&self.tool_output, TOOL_RESULT_DETAIL_LINES),
+                    CodeLanguage::Plain,
+                ),
+            };
+            lines.extend(render_preview(&preview, width, language, is_error));
+        }
         lines
     }
 }
 
-/// 工具结果预览保留的最大行数。
-pub(crate) const TOOL_RESULT_PREVIEW_LINES: usize = 6;
+/// 单条工具消息展开后最多展示的详情行数，避免超大结果拖慢每帧布局。
+pub(crate) const TOOL_RESULT_DETAIL_LINES: usize = 40;
 /// 单个运行中工具在 TUI 内保留的最大文本量，防止第三方工具无限推送。
 const TOOL_LIVE_OUTPUT_BYTES: usize = 200 * 1024;

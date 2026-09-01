@@ -100,6 +100,15 @@ pub(crate) struct MainEventSnapshot {
     pub(crate) model_is_thinking: bool,
 }
 
+/// 最近一帧中可点击的工具消息区域，索引始终指向实时消息列表。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ToolMessageHitRegion {
+    /// 工具消息在 `App::messages` 中的索引。
+    pub(crate) message_index: usize,
+    /// 工具消息经过换行、滚动和裁剪后的可见终端区域。
+    pub(crate) area: Rect,
+}
+
 pub(crate) struct App {
     /// 本次进程固定使用的项目工作目录。
     pub(crate) workspace: WorkspaceContext,
@@ -164,6 +173,10 @@ pub(crate) struct App {
     ///
     /// 提示同时是可点击热区：手动翻阅后用鼠标即可回到底部，不必记快捷键。
     pub(crate) jump_hint_area: Option<Rect>,
+    /// 最近一帧可见且具有详情的工具消息点击区域。
+    pub(crate) tool_message_hit_regions: Vec<ToolMessageHitRegion>,
+    /// 左键按下时命中的工具消息；拖动或释放到其他区域时取消。
+    pub(crate) tool_click_candidate: Option<usize>,
     /// 最近一次渲染得到的消息区宽度，用于工具消息 renderer 分配尺寸。
     #[cfg(feature = "plugins")]
     pub(crate) last_message_width: u16,
@@ -395,6 +408,8 @@ impl App {
             last_max_scroll: 0,
             last_viewport: 0,
             jump_hint_area: None,
+            tool_message_hit_regions: Vec::new(),
+            tool_click_candidate: None,
             #[cfg(feature = "plugins")]
             last_message_width: 0,
             context_tokens: None,
@@ -524,6 +539,8 @@ impl App {
             self.main_event_snapshot = None;
         }
         self.scroll = None;
+        self.tool_message_hit_regions.clear();
+        self.tool_click_candidate = None;
         self.context_tokens = None;
         self.last_escape_at = None;
         self.native_command.dialog = None;

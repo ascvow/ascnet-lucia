@@ -325,6 +325,7 @@ impl App {
             return false;
         }
         self.dismiss_text_selection();
+        self.tool_click_candidate = None;
         self.scroll = None;
         true
     }
@@ -332,6 +333,7 @@ impl App {
     /// 向上滚动 n 行，进入手动滚动模式。
     pub(crate) fn scroll_up(&mut self, n: u16) {
         self.dismiss_text_selection();
+        self.tool_click_candidate = None;
         let current = self.scroll.unwrap_or(self.last_max_scroll);
         self.scroll = Some(current.saturating_sub(n));
     }
@@ -339,6 +341,7 @@ impl App {
     /// 向下滚动 n 行；到达底部时恢复自动跟随。
     pub(crate) fn scroll_down(&mut self, n: u16) {
         self.dismiss_text_selection();
+        self.tool_click_candidate = None;
         if let Some(current) = self.scroll {
             let next = current.saturating_add(n);
             if next >= self.last_max_scroll {
@@ -664,6 +667,61 @@ impl App {
                 self.text_selection_content = (!text.is_empty()).then_some(text);
             }
             _ => {}
+        }
+    }
+
+    /// 处理工具消息的左键点击，并在未发生文本拖选时切换详情展开状态。
+    ///
+    /// 按下与释放必须命中同一条实时消息；滚动、拖动、审批快照或消息失效都会取消候选，
+    /// 避免把复制手势和覆盖层点击误判为展开操作。返回 `true` 表示释放事件已被消费。
+    pub(crate) fn handle_tool_message_click(&mut self, mouse: &MouseEvent) -> bool {
+        #[cfg(feature = "plugins")]
+        if self.main_event_snapshot.is_some() {
+            self.tool_click_candidate = None;
+            return false;
+        }
+
+        let position = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                self.tool_click_candidate = self
+                    .tool_message_hit_regions
+                    .iter()
+                    .find(|region| region.area.contains(position))
+                    .map(|region| region.message_index);
+                false
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                self.tool_click_candidate = None;
+                false
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                let Some(message_index) = self.tool_click_candidate.take() else {
+                    return false;
+                };
+                if self
+                    .text_selection
+                    .is_some_and(|selection| selection.dragged)
+                {
+                    return false;
+                }
+                let still_inside = self.tool_message_hit_regions.iter().any(|region| {
+                    region.message_index == message_index && region.area.contains(position)
+                });
+                if !still_inside {
+                    return false;
+                }
+                let Some(message) = self.messages.get_mut(message_index) else {
+                    return false;
+                };
+                if !message.has_tool_details() {
+                    return false;
+                }
+                message.tool_expanded = !message.tool_expanded;
+                self.dismiss_text_selection();
+                true
+            }
+            _ => false,
         }
     }
 

@@ -383,6 +383,46 @@ async fn tool_renderer_frame_is_applied_to_timeline_message() {
     assert!(!text.contains("● test_tool"), "{text:?}");
 }
 
+/// 多行工具 renderer 默认只显示首行，展开后显示其余详情行。
+#[test]
+#[cfg(feature = "plugins")]
+fn multi_line_tool_renderer_supports_collapsed_details() {
+    let mut message = Msg::tool_started(ToolCall::new("call-1", "test_tool", json!({})));
+    message.tool_frame = Some(PluginUiFrame {
+        view_id: "test-message".into(),
+        visible: true,
+        lines: ["自定义摘要", "自定义详情"]
+            .into_iter()
+            .map(|text| UiLine {
+                spans: vec![UiSpan {
+                    text: text.into(),
+                    style: UiStyle::default(),
+                }],
+            })
+            .collect(),
+        cursor: None,
+    });
+
+    let collapsed = message
+        .to_lines(false, 72)
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(collapsed.contains("▸ 自定义摘要"), "{collapsed:?}");
+    assert!(!collapsed.contains("自定义详情"), "{collapsed:?}");
+
+    message.tool_expanded = true;
+    let expanded = message
+        .to_lines(false, 72)
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(expanded.contains("▾ 自定义摘要"), "{expanded:?}");
+    assert!(expanded.contains("自定义详情"), "{expanded:?}");
+}
+
 /// 晚到的旧 revision 不得覆盖较新的工具消息帧。
 #[test]
 #[cfg(feature = "plugins")]

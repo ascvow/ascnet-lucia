@@ -189,7 +189,7 @@ fn render_hides_reasoning_text_and_shows_thinking_status() {
     assert!(!text.contains("Working..."), "{text:?}");
 }
 
-/// 验证工具行展示目标路径与面向人的结果摘要，且过长内容按显示宽度截断。
+/// 验证工具结果默认收起，展开后展示目标内容且过长行按显示宽度截断。
 #[test]
 fn tool_lines_show_args_and_truncated_result() {
     let mut msg = Msg::tool_started(ToolCall::new(
@@ -204,8 +204,8 @@ fn tool_lines_show_args_and_truncated_result() {
         json!({ "content": "很长的文件内容".repeat(30) }),
     ));
 
-    let lines = msg.to_lines(false, 80);
-    let text: String = lines
+    let collapsed = msg
+        .to_lines(false, 80)
         .iter()
         .map(|line| {
             line.spans
@@ -216,11 +216,29 @@ fn tool_lines_show_args_and_truncated_result() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(text.contains("● Read(src/main.rs)"), "{text:?}");
-    assert!(text.contains("└ 读取 1 行，来自 src/main.rs"), "{text:?}");
+    assert!(collapsed.contains("▸ ● Read(src/main.rs)"), "{collapsed:?}");
+    assert!(
+        collapsed.contains("└ 读取 1 行，来自 src/main.rs"),
+        "{collapsed:?}"
+    );
+    assert!(!collapsed.contains("1 很长的文件内容"), "{collapsed:?}");
+
+    msg.tool_expanded = true;
+    let expanded = msg
+        .to_lines(false, 80)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(expanded.contains("▾ ● Read(src/main.rs)"), "{expanded:?}");
     // 正文进入带行号的预览块，超宽部分按显示宽度截断。
-    assert!(text.contains("1 很长的文件内容"), "{text:?}");
-    assert!(text.contains('…'), "{text:?}");
+    assert!(expanded.contains("1 很长的文件内容"), "{expanded:?}");
+    assert!(expanded.contains('…'), "{expanded:?}");
 }
 
 /// 运行中的工具应立即展示增量输出，而不必等待 ToolFinished。
@@ -231,10 +249,20 @@ fn running_tool_lines_show_latest_output() {
         "shell",
         json!({"command": "cargo test"}),
     ));
-    for line in 1..=8 {
+    for line in 1..=48 {
         msg.append_tool_output(&format!("编译进度 {line}\n"));
     }
 
+    let collapsed = msg
+        .to_lines(false, 100)
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(collapsed.contains("▸ ● Shell"), "{collapsed:?}");
+    assert!(!collapsed.contains("编译进度 48"), "{collapsed:?}");
+
+    msg.tool_expanded = true;
     let text = msg
         .to_lines(false, 100)
         .iter()
@@ -242,10 +270,10 @@ fn running_tool_lines_show_latest_output() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    // 预览只保留最新若干行，被折叠的行数以 `… +N 行` 标注。
-    assert!(text.contains("… +2 行"), "{text:?}");
+    // 展开详情只保留最新 40 行，被折叠的行数以 `… +N 行` 标注。
+    assert!(text.contains("… +8 行"), "{text:?}");
     assert!(!text.contains("编译进度 1\n"), "{text:?}");
-    assert!(text.contains("编译进度 8"), "{text:?}");
+    assert!(text.contains("编译进度 48"), "{text:?}");
 }
 
 /// 空工具结果只显示完成状态，不应因缺少预览行而越界崩溃。
@@ -263,6 +291,216 @@ fn tool_lines_accept_empty_result() {
     assert!(text.contains("● Shell"), "{text:?}");
     // 空结果没有可展开的正文，不应凭空造出预览行。
     assert!(!text.contains("null"), "{text:?}");
+}
+
+/// 连续工具消息必须逐行紧邻，工具组结束后仍与普通回复保留一行间隔。
+#[test]
+fn consecutive_tool_messages_use_compact_group_spacing() {
+    let backend = TestBackend::new(80, 18);
+    let mut terminal = Terminal::new(backend).expect("创建工具组间距测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages.extend([
+        Msg::tool_started(ToolCall::new("call-1", "first_tool", json!({}))),
+        Msg::tool_started(ToolCall::new("call-2", "second_tool", json!({}))),
+        Msg::new(MsgKind::Assistant, "follow-up reply"),
+    ]);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染紧凑工具组");
+    let rows = (0..18)
+        .map(|y| {
+            (0..80)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let tool_rows = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            (row.contains("first_tool") || row.contains("second_tool")).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let reply_row = rows
+        .iter()
+        .position(|row| row.contains("follow-up reply"))
+        .expect("应展示工具组后的回复");
+
+    assert_eq!(tool_rows.len(), 2, "{rows:?}");
+    assert_eq!(tool_rows[1], tool_rows[0] + 1, "{rows:?}");
+    assert_eq!(reply_row, tool_rows[1] + 2, "{rows:?}");
+}
+
+/// 左键按下与释放命中同一工具消息时切换详情，第二次点击可以收起。
+#[test]
+fn clicking_tool_message_toggles_expanded_details() {
+    let backend = TestBackend::new(80, 18);
+    let mut terminal = Terminal::new(backend).expect("创建工具点击测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut message = Msg::tool_started(ToolCall::new(
+        "call-click",
+        "read_file",
+        json!({"path": "src/main.rs"}),
+    ));
+    message.kind = MsgKind::ToolOk;
+    let detail_content = (1..=20)
+        .map(|index| {
+            if index == 20 {
+                "details-visible".to_string()
+            } else {
+                format!("detail-{index:02}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    message.tool_result = Some(ToolResult::success(
+        "call-click",
+        "read_file",
+        json!({"content": detail_content}),
+    ));
+    app.messages.push(message);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染收起工具消息");
+    let area = app.tool_message_hit_regions[0].area;
+    let click = |kind| MouseEvent {
+        kind,
+        column: area.x,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    let down = click(MouseEventKind::Down(crossterm::event::MouseButton::Left));
+    app.handle_text_selection(&down, terminal.backend().buffer());
+    assert!(!app.handle_tool_message_click(&down));
+    let up = click(MouseEventKind::Up(crossterm::event::MouseButton::Left));
+    app.handle_text_selection(&up, terminal.backend().buffer());
+    assert!(app.handle_tool_message_click(&up));
+    assert!(app.messages[0].tool_expanded);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染展开工具消息");
+    let expanded_text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(
+        expanded_text.contains("details-visible"),
+        "{expanded_text:?}"
+    );
+
+    let area = app.tool_message_hit_regions[0].area;
+    assert!(area.height < 20, "长详情热区应按当前视口裁剪：{area:?}");
+    for kind in [
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+    ] {
+        let event = MouseEvent {
+            kind,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_text_selection(&event, terminal.backend().buffer());
+        app.handle_tool_message_click(&event);
+    }
+    assert!(!app.messages[0].tool_expanded);
+}
+
+/// 工具消息上的左键拖选只能形成文本选区，不得同时展开详情。
+#[test]
+fn dragging_tool_message_does_not_toggle_details() {
+    let backend = TestBackend::new(80, 18);
+    let mut terminal = Terminal::new(backend).expect("创建工具拖选测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut message = Msg::tool_started(ToolCall::new(
+        "call-drag",
+        "shell",
+        json!({"command": "cargo test"}),
+    ));
+    message.append_tool_output("正在执行测试\n");
+    app.messages.push(message);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染工具拖选场景");
+    let area = app.tool_message_hit_regions[0].area;
+    for (kind, column) in [
+        (
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x,
+        ),
+        (
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            area.x + 2,
+        ),
+        (
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            area.x + 2,
+        ),
+    ] {
+        let event = MouseEvent {
+            kind,
+            column,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_text_selection(&event, terminal.backend().buffer());
+        assert!(!app.handle_tool_message_click(&event));
+    }
+
+    assert!(!app.messages[0].tool_expanded);
+    assert!(app.text_selection_content.is_some());
+}
+
+/// 独占审批快照可见时，即使上一帧残留工具热区也不得修改实时消息状态。
+#[cfg(feature = "plugins")]
+#[test]
+fn approval_snapshot_disables_tool_message_clicks() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut message = Msg::tool_started(ToolCall::new(
+        "call-approval",
+        "shell",
+        json!({"command": "cargo test"}),
+    ));
+    message.append_tool_output("等待审批\n");
+    app.messages.push(message);
+    app.tool_message_hit_regions
+        .push(crate::app::ToolMessageHitRegion {
+            message_index: 0,
+            area: Rect::new(1, 1, 20, 1),
+        });
+    app.main_event_snapshot = Some(crate::app::MainEventSnapshot {
+        messages: app.messages.clone(),
+        streaming_message: None,
+        model_is_thinking: false,
+    });
+
+    for kind in [
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+    ] {
+        let consumed = app.handle_tool_message_click(&MouseEvent {
+            kind,
+            column: 2,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!consumed);
+    }
+
+    assert!(!app.messages[0].tool_expanded);
+    assert!(app.tool_click_candidate.is_none());
 }
 
 /// 验证嵌套 JSON 摘要折叠为计数而不是原始序列化。

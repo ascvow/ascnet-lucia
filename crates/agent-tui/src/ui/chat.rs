@@ -1,6 +1,6 @@
 //! 主对话区、输入编辑器、输入面板与状态栏渲染。
 
-use crate::app::{input_ref_spans, App};
+use crate::app::{input_ref_spans, App, ToolMessageHitRegion};
 use crate::command::{reasoning_level_command_value, render_native_command_panel};
 use crate::theme::{
     COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_TEXT, COLOR_USER,
@@ -22,6 +22,8 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let input_rows = desired_input_rows.min(workspace.height.saturating_sub(5).clamp(1, 6));
     let input_height = input_rows + 2;
     #[cfg(feature = "plugins")]
+    let timeline_uses_snapshot = app.main_event_snapshot.is_some();
+    #[cfg(feature = "plugins")]
     let (timeline_messages, timeline_streaming_message, timeline_is_thinking) =
         app.main_event_snapshot.as_ref().map_or_else(
             || {
@@ -39,6 +41,8 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                 )
             },
         );
+    #[cfg(not(feature = "plugins"))]
+    let timeline_uses_snapshot = false;
     #[cfg(not(feature = "plugins"))]
     let (timeline_messages, timeline_streaming_message, timeline_is_thinking) = (
         app.messages.as_slice(),
@@ -87,12 +91,33 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         // 空会话时以首屏替代消息流，首条消息或运行开始后自动消失。
         app.last_max_scroll = 0;
         app.last_viewport = chat_area.height;
+        app.tool_message_hit_regions.clear();
         render_hero(frame, chat_area, &cwd_display);
     } else {
         let inner_width = chat_area.width.max(1);
         let mut lines = Vec::new();
+        let mut wrapped_height = 0u16;
+        let mut tool_message_rows = Vec::new();
         for (index, message) in timeline_messages.iter().enumerate() {
-            lines.extend(message.to_lines(timeline_streaming_message == Some(index), inner_width));
+            let message_lines =
+                message.to_lines(timeline_streaming_message == Some(index), inner_width);
+            let message_height = message_lines.iter().fold(0u16, |height, line| {
+                height.saturating_add(wrapped_line_count(line, inner_width))
+            });
+            if !timeline_uses_snapshot && message.has_tool_details() && message_height > 0 {
+                tool_message_rows.push((index, wrapped_height, message_height));
+            }
+            wrapped_height = wrapped_height.saturating_add(message_height);
+            lines.extend(message_lines);
+
+            // 工具组内部不留空行；工具组结束后仍与普通消息或状态行分隔。
+            let next_is_tool = timeline_messages
+                .get(index + 1)
+                .is_some_and(|next| next.is_tool());
+            if message.is_tool() && !next_is_tool {
+                lines.push(Line::default());
+                wrapped_height = wrapped_height.saturating_add(1);
+            }
         }
         if app.running && timeline_streaming_message.is_none() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
@@ -114,22 +139,22 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                     Style::new().fg(COLOR_MUTED),
                 ));
             }
-            lines.push(Line::from(spans));
+            let line = Line::from(spans);
+            wrapped_height = wrapped_height.saturating_add(wrapped_line_count(&line, inner_width));
+            lines.push(line);
         }
         // 后台原生上下文重载以调用方提供的标签作为进行中指示。
         #[cfg(feature = "plugins")]
         if let Some(label) = app.pending_reload.as_deref() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
-            lines.push(Line::from(vec![
+            let line = Line::from(vec![
                 Span::styled(format!("{spinner} "), Style::new().fg(COLOR_WARNING)),
                 Span::styled(label.to_string(), Style::new().fg(COLOR_MUTED)),
-            ]));
+            ]);
+            wrapped_height = wrapped_height.saturating_add(wrapped_line_count(&line, inner_width));
+            lines.push(line);
         }
 
-        // 按 Paragraph 的词边界规则计算高度，保证滚动范围与实际渲染一致。
-        let wrapped_height = lines.iter().fold(0u16, |height, line| {
-            height.saturating_add(wrapped_line_count(line, inner_width))
-        });
         let chat = Paragraph::new(lines).wrap(Wrap { trim: false });
         let viewport = chat_area.height;
         let max_scroll = wrapped_height.saturating_sub(viewport);
@@ -140,6 +165,28 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             app.scroll = None;
         }
         let scroll = app.scroll.unwrap_or(max_scroll);
+
+        // 将未滚动的逻辑行范围映射到当前终端视口，供左键释放时切换详情。
+        let viewport_end = scroll.saturating_add(viewport);
+        app.tool_message_hit_regions = tool_message_rows
+            .into_iter()
+            .filter_map(|(message_index, start, height)| {
+                let end = start.saturating_add(height);
+                let visible_start = start.max(scroll);
+                let visible_end = end.min(viewport_end);
+                (chat_area.width > 0 && visible_start < visible_end).then_some(
+                    ToolMessageHitRegion {
+                        message_index,
+                        area: Rect {
+                            x: chat_area.x,
+                            y: chat_area.y + visible_start.saturating_sub(scroll),
+                            width: chat_area.width,
+                            height: visible_end.saturating_sub(visible_start),
+                        },
+                    },
+                )
+            })
+            .collect();
 
         let chat = chat.scroll((scroll, 0));
         frame.render_widget(chat, chat_area);
