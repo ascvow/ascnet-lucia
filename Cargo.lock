@@ -1885,6 +1885,8 @@ dependencies = [
  "agent-core",
  "agent-plugin-host",
  "agent-tool",
+ "anyhow",
+ "async-trait",
  "serde_json",
  "tokio",
 ]

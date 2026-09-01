@@ -1,7 +1,8 @@
 //! 权限插件真实 WASM Host 路由测试。
 
 use agent_core::{
-    AgentEvent, AgentEventKind, AgentExtension, AgentRecordEvent, EventBus, ToolCallEvent,
+    AgentEvent, AgentEventKind, AgentExtension, AgentRecordEvent, ChatModel, EventBus,
+    ModelGateway, ModelRequest, ModelResponse, ProviderAdapter, ToolCallEvent,
 };
 use agent_plugin_host::{
     manifest::TOOL_POLICY_CAPABILITY,
@@ -10,11 +11,38 @@ use agent_plugin_host::{
     CompositePluginHost, LivePluginHost, PluginHost, PluginHostServices,
 };
 use agent_tool::{ToolCall, ToolPermissionScope};
+use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::{path::Path, sync::Arc, time::Duration};
+use tokio::sync::Notify;
 
 const APPROVAL_VIEW: &str = "permission-approval";
 const MODE_VIEW: &str = "permission-mode";
+
+/// 由通知器控制返回时机的审批模型，用于复现异步 Host 导入期间取消 Guest 调用。
+struct BlockingReviewModel {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl ChatModel for BlockingReviewModel {
+    /// 通知测试模型已经进入，并等待测试显式释放后返回允许结论。
+    async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(ModelResponse::text(r#"{"decision":"allow"}"#))
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for BlockingReviewModel {
+    /// 返回回归测试使用的稳定 provider 名称。
+    fn name(&self) -> &'static str {
+        "blocking-permission-review"
+    }
+}
 
 /// 构造模拟 Core/Host 已完成可信 scope 绑定的真实 ABI 调用。
 fn scoped_call(
@@ -180,6 +208,80 @@ async fn wasm_host_routes_permission_approval() {
             .is_cancelled(),
         "用户批准后工具应放行"
     );
+}
+
+/// 外层事件 future 被取消后，已进入 Component 的调用必须自行完成，后续 UI 输入仍可进入实例。
+#[tokio::test]
+async fn wasm_host_keeps_component_enterable_after_cancelled_model_import() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register(
+            "blocking-permission-review",
+            Arc::new(BlockingReviewModel {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+        )
+        .expect("注册阻塞审批模型");
+    let services = PluginHostServices::new()
+        .with_model_completion(
+            gateway,
+            "blocking-permission-review",
+            "review-model",
+            128,
+            false,
+        )
+        .expect("注入阻塞审批模型");
+    let host = Arc::new(
+        load_wasm_plugins_with_services(&[manifest], services)
+            .await
+            .expect("加载权限插件 WASM"),
+    );
+    host.ui_declarations().await.expect("建立权限插件 UI 路由");
+    let bus = live_bus_with_run(host.as_ref(), "cancelled-review-run").await;
+    let call = scoped_call(
+        "cancelled-review-call",
+        "write_file",
+        json!({"path": "src/cancelled-review.rs", "content": ""}),
+        ToolPermissionScope::Write,
+        "cancelled-review-run",
+    );
+    let dispatch = tokio::spawn(async move {
+        bus.dispatch(ToolCallEvent::new("cancelled-review-run", 0, call))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("审批模型应进入异步 Host 导入");
+    dispatch.abort();
+    assert!(
+        dispatch
+            .await
+            .expect_err("事件分发任务应被取消")
+            .is_cancelled(),
+        "事件分发任务必须以取消状态结束"
+    );
+    release.notify_waiters();
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        host.on_ui_input(&UiInput {
+            plugin_id: "permission".into(),
+            view_id: APPROVAL_VIEW.into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: "enter".into(),
+                modifiers: Vec::new(),
+            },
+        }),
+    )
+    .await
+    .expect("取消后的 UI 输入不应永久等待")
+    .expect("取消后的 UI 输入仍应进入同一 Component 实例");
 }
 
 /// 权限模式必须通过真实 Guest ABI 写入 Host，并在重新加载 component 后恢复。

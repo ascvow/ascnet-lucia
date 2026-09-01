@@ -9,12 +9,32 @@ use serde_json::Value;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    future::Future,
     sync::{Arc, RwLock},
 };
 
 tokio::task_local! {
     /// 当前异步任务已经锁定的插件服务调用链。
     static SERVICE_CALL_STACK: RefCell<Vec<String>>;
+}
+
+/// 让新任务继承当前插件服务调用链，避免任务切换绕过同步循环检测。
+///
+/// 当前任务不在服务调用作用域内时直接执行原 Future；存在调用链时为 Future 建立独立
+/// 副本，避免跨任务共享可变状态。
+pub(crate) fn inherit_service_call_stack<F>(future: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    let inherited = SERVICE_CALL_STACK
+        .try_with(|stack| stack.borrow().clone())
+        .ok();
+    async move {
+        match inherited {
+            Some(stack) => SERVICE_CALL_STACK.scope(RefCell::new(stack), future).await,
+            None => future.await,
+        }
+    }
 }
 
 /// 一个插件公开的协议无关服务。
@@ -305,6 +325,7 @@ fn validate_service_name(name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Weak;
 
     /// 返回调用来源和请求数据的测试服务。
     struct EchoHandler;
@@ -316,6 +337,35 @@ mod tests {
                 "caller": call.caller_id,
                 "payload": call.payload,
             }))
+        }
+    }
+
+    /// 在独立任务中继续调用另一个插件服务，用于覆盖任务切换后的调用链继承。
+    struct SpawnedForwardingHandler {
+        registry: Weak<ServiceRegistry>,
+        target_plugin_id: &'static str,
+        target_service_name: &'static str,
+    }
+
+    #[async_trait]
+    impl ServiceHandler for SpawnedForwardingHandler {
+        /// 把调用转发到目标插件，并保持当前服务调用链。
+        async fn handle(&self, call: PluginServiceCall) -> Result<Value> {
+            let registry = self
+                .registry
+                .upgrade()
+                .ok_or_else(|| anyhow!("测试服务注册表已释放"))?;
+            let nested_call = PluginServiceCall {
+                caller_id: call.plugin_id,
+                plugin_id: self.target_plugin_id.into(),
+                name: self.target_service_name.into(),
+                payload: call.payload,
+            };
+            tokio::spawn(inherit_service_call_stack(async move {
+                registry.call(nested_call).await
+            }))
+            .await
+            .map_err(|error| anyhow!("嵌套服务任务异常结束：{error}"))?
         }
     }
 
@@ -469,5 +519,60 @@ mod tests {
             .await
             .expect_err("同步自调用必须失败");
         assert!(error.to_string().contains("同步循环调用"));
+    }
+
+    /// 跨任务的 A -> B -> A 服务调用仍必须保留完整调用链并拒绝循环。
+    #[tokio::test]
+    async fn spawned_cross_plugin_service_cycle_is_rejected() {
+        let registry = Arc::new(ServiceRegistry::default());
+        registry
+            .register_handler(
+                "a",
+                HashSet::from(["b".to_string()]),
+                Arc::new(SpawnedForwardingHandler {
+                    registry: Arc::downgrade(&registry),
+                    target_plugin_id: "b",
+                    target_service_name: "b.forward",
+                }),
+            )
+            .expect("插件 a 处理器注册应成功");
+        registry
+            .register_handler(
+                "b",
+                HashSet::from(["a".to_string()]),
+                Arc::new(SpawnedForwardingHandler {
+                    registry: Arc::downgrade(&registry),
+                    target_plugin_id: "a",
+                    target_service_name: "a.forward",
+                }),
+            )
+            .expect("插件 b 处理器注册应成功");
+        for (plugin_id, name) in [("a", "a.forward"), ("b", "b.forward")] {
+            registry
+                .upsert(
+                    plugin_id,
+                    PluginService {
+                        plugin_id: String::new(),
+                        name: name.into(),
+                        version: "1.0.0".into(),
+                        description: None,
+                    },
+                )
+                .expect("转发服务注册应成功");
+        }
+
+        let error = registry
+            .call(PluginServiceCall {
+                caller_id: "external".into(),
+                plugin_id: "a".into(),
+                name: "a.forward".into(),
+                payload: Value::Null,
+            })
+            .await
+            .expect_err("跨任务循环调用必须失败");
+        assert!(
+            error.to_string().contains("a -> b -> a"),
+            "循环错误应包含完整调用链，实际为：{error}"
+        );
     }
 }

@@ -13,6 +13,7 @@ use crate::host::PluginHost;
 use crate::manifest::resolve_plugin_load_order;
 use crate::manifest::EventSubscription;
 use crate::manifest::PluginManifest;
+use crate::service::inherit_service_call_stack;
 use crate::service::PluginService;
 use crate::service::PluginServiceCall;
 use crate::service::ServiceHandler;
@@ -58,11 +59,12 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 use wasmtime::component::Component;
 use wasmtime::component::Instance;
@@ -268,6 +270,26 @@ struct WasmPluginState {
     limits: WasmPluginLimits,
 }
 
+/// 在取得实例独占锁后，把一次 Component 导出调用交给独立任务完整执行。
+///
+/// Wasmtime 不允许丢弃已经进入 Component 的异步调用；调用方取消等待时，独立任务仍会
+/// 运行到导出返回并释放实例锁，避免后续调用收到 `cannot enter component instance`。
+async fn complete_component_call<T, F, Fut>(
+    state: &Arc<Mutex<WasmPluginState>>,
+    operation: String,
+    call: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(OwnedMutexGuard<WasmPluginState>) -> Fut,
+    Fut: Future<Output = Result<T>> + Send + 'static,
+{
+    let state = Arc::clone(state).lock_owned().await;
+    let task = tokio::spawn(inherit_service_call_stack(call(state)));
+    task.await
+        .with_context(|| format!("{operation} 的 Component 调用任务异常结束"))?
+}
+
 /// 服务目录持有的弱引用端点，避免服务注册表与 WASM store 形成引用环。
 struct WasmServiceEndpoint {
     plugin_id: String,
@@ -295,31 +317,38 @@ impl ServiceHandler for WasmServiceEndpoint {
             .state
             .upgrade()
             .ok_or_else(|| anyhow!("插件 `{}` 已卸载", self.plugin_id))?;
-        let mut state = state.lock().await;
-        refill_fuel(&mut state)?;
-        let handle_service = state.handle_service;
         let request = serde_json::to_string(&serde_json::json!({
             "caller_id": call.caller_id,
             "name": call.name,
             "payload": call.payload,
         }))?;
-        let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
-        let (response_json,) = handle_service
-            .call_async(&mut state.store, (request,))
-            .await
-            .into_anyhow()
-            .with_context(|| format!("插件 `{}` 服务调用失败", self.plugin_id))?;
-        drop(run_scope);
-        let response: GuestServiceResponse = serde_json::from_str(&response_json)
-            .with_context(|| format!("插件 `{}` 返回了无效服务响应", self.plugin_id))?;
-        if response.ok {
-            Ok(response.value)
-        } else {
-            Err(anyhow!(
-                "{}",
-                response.error.unwrap_or_else(|| "插件服务调用失败".into())
-            ))
-        }
+        let plugin_id = self.plugin_id.clone();
+        complete_component_call(
+            &state,
+            format!("插件 `{plugin_id}` 服务"),
+            move |mut state| async move {
+                refill_fuel(&mut state)?;
+                let handle_service = state.handle_service;
+                let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
+                let (response_json,) = handle_service
+                    .call_async(&mut state.store, (request,))
+                    .await
+                    .into_anyhow()
+                    .with_context(|| format!("插件 `{plugin_id}` 服务调用失败"))?;
+                drop(run_scope);
+                let response: GuestServiceResponse = serde_json::from_str(&response_json)
+                    .with_context(|| format!("插件 `{plugin_id}` 返回了无效服务响应"))?;
+                if response.ok {
+                    Ok(response.value)
+                } else {
+                    Err(anyhow!(
+                        "{}",
+                        response.error.unwrap_or_else(|| "插件服务调用失败".into())
+                    ))
+                }
+            },
+        )
+        .await
     }
 }
 
@@ -661,28 +690,30 @@ impl WasmPluginHost {
 
     /// 调用 component 的卸载钩子并撤销其全部宿主资源。
     pub async fn deactivate(&self) -> Result<()> {
-        let mut state = self.state.lock().await;
-        let deactivation = async {
-            let deactivate = state.deactivate;
-            refill_fuel(&mut state)?;
-            let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
-            let (deactivation_error,) = deactivate
-                .call_async(&mut state.store, ())
-                .await
-                .into_anyhow()
-                .with_context(|| format!("plugin `{}` deactivate failed", self.id()))?;
-            drop(run_scope);
-            if deactivation_error.is_empty() {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "plugin `{}` deactivation failed: {deactivation_error}",
-                    self.id()
-                ))
-            }
-        }
+        let plugin_id = self.id().to_string();
+        let deactivation = complete_component_call(
+            &self.state,
+            format!("plugin `{plugin_id}` deactivate"),
+            move |mut state| async move {
+                let deactivate = state.deactivate;
+                refill_fuel(&mut state)?;
+                let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
+                let (deactivation_error,) = deactivate
+                    .call_async(&mut state.store, ())
+                    .await
+                    .into_anyhow()
+                    .with_context(|| format!("plugin `{plugin_id}` deactivate failed"))?;
+                drop(run_scope);
+                if deactivation_error.is_empty() {
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        "plugin `{plugin_id}` deactivation failed: {deactivation_error}"
+                    ))
+                }
+            },
+        )
         .await;
-        drop(state);
         let unregister = self.services.unregister_plugin(self.id());
         if let Some(binding) = &self.agent_runtime {
             binding.revoke().await;
@@ -703,39 +734,41 @@ impl WasmPluginHost {
         let envelope_json = serde_json::to_string(envelope)?;
         let mut waited_ms = 0u64;
         loop {
-            let response = {
-                let mut state = self.state.lock().await;
-                refill_fuel(&mut state)?;
-                let run_scope = state
-                    .store
-                    .data()
-                    .capabilities
-                    .enter_active_run_scope(run_id);
-                let on_event = state.on_event;
-                let invocation = on_event
-                    .call_async(&mut state.store, (envelope_json.clone(),))
-                    .await
-                    .into_anyhow();
-                drop(run_scope);
-                let (response_json,) = invocation.with_context(|| {
-                    format!(
-                        "plugin `{}` on-event failed for `{}`",
-                        self.id(),
-                        envelope.event
-                    )
-                })?;
+            let plugin_id = self.id().to_string();
+            let event_name = envelope.event.clone();
+            let event_json = envelope_json.clone();
+            let active_run_id = run_id.map(str::to_owned);
+            let response = complete_component_call(
+                &self.state,
+                format!("plugin `{plugin_id}` on-event `{event_name}`"),
+                move |mut state| async move {
+                    refill_fuel(&mut state)?;
+                    let run_scope = state
+                        .store
+                        .data()
+                        .capabilities
+                        .enter_active_run_scope(active_run_id.as_deref());
+                    let on_event = state.on_event;
+                    let invocation = on_event
+                        .call_async(&mut state.store, (event_json,))
+                        .await
+                        .into_anyhow();
+                    drop(run_scope);
+                    let (response_json,) = invocation.with_context(|| {
+                        format!("plugin `{plugin_id}` on-event failed for `{event_name}`")
+                    })?;
                 // 空字符串是"放行且不改写"的简写，允许纯观察型插件省略应答构造。
-                if response_json.trim().is_empty() {
-                    return Ok(PluginEventResponse::allow());
-                }
-                serde_json::from_str::<PluginEventResponse>(&response_json).with_context(|| {
-                    format!(
-                        "plugin `{}` returned invalid PluginEventResponse JSON for `{}`",
-                        self.id(),
-                        envelope.event
-                    )
-                })?
-            };
+                    if response_json.trim().is_empty() {
+                        return Ok(PluginEventResponse::allow());
+                    }
+                    serde_json::from_str::<PluginEventResponse>(&response_json).with_context(|| {
+                        format!(
+                            "plugin `{plugin_id}` returned invalid PluginEventResponse JSON for `{event_name}`"
+                        )
+                    })
+                },
+            )
+            .await?;
 
             match response {
                 PluginEventResponse::Pending { retry_after_ms } => {
@@ -776,53 +809,60 @@ impl AgentExtension for WasmPluginHost {
         call.name = local_name;
 
         let call_json = serde_json::to_string(&call)?;
-        let mut state = self.state.lock().await;
-        refill_fuel(&mut state)?;
-        // 前一个 Hook 的故障不能污染本次工具调用；每个导出调用只消费自己的 Host 观察。
-        state.store.data_mut().take_plugin_failure();
-        let run_scope = state
-            .store
-            .data()
-            .capabilities
-            .enter_active_run_scope(run_id.as_deref());
-        let call_tool = state.call_tool;
-        let invocation = call_tool.call_async(&mut state.store, (call_json,)).await;
-        drop(run_scope);
-        let capability_failure = state.store.data_mut().take_plugin_failure();
-        let (result_json,) = match invocation {
-            Ok(value) => value,
-            Err(error) => {
-                let failure =
-                    capability_failure.unwrap_or_else(|| classify_wasm_plugin_failure(&error));
-                return Ok(Some(plugin_host_failure_result(
-                    &call,
-                    &public_name,
-                    self.id(),
-                    failure,
-                )));
-            }
-        };
-        if let Some(failure) = capability_failure {
-            return Ok(Some(plugin_host_failure_result(
-                &call,
-                &public_name,
-                self.id(),
-                failure,
-            )));
-        }
-        let mut result = match serde_json::from_str::<ToolResult>(&result_json) {
-            Ok(result) => result,
-            Err(_) => {
-                return Ok(Some(plugin_host_failure_result(
-                    &call,
-                    &public_name,
-                    self.id(),
-                    PluginHostFailureKind::ContractViolation,
-                )));
-            }
-        };
-        bind_guest_tool_result(&mut result, &call, &public_name);
-        Ok(Some(result))
+        let plugin_id = self.id().to_string();
+        complete_component_call(
+            &self.state,
+            format!("plugin `{plugin_id}` call-tool"),
+            move |mut state| async move {
+                refill_fuel(&mut state)?;
+                // 前一个 Hook 的故障不能污染本次工具调用；每个导出调用只消费自己的 Host 观察。
+                state.store.data_mut().take_plugin_failure();
+                let run_scope = state
+                    .store
+                    .data()
+                    .capabilities
+                    .enter_active_run_scope(run_id.as_deref());
+                let call_tool = state.call_tool;
+                let invocation = call_tool.call_async(&mut state.store, (call_json,)).await;
+                drop(run_scope);
+                let capability_failure = state.store.data_mut().take_plugin_failure();
+                let (result_json,) = match invocation {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let failure = capability_failure
+                            .unwrap_or_else(|| classify_wasm_plugin_failure(&error));
+                        return Ok(Some(plugin_host_failure_result(
+                            &call,
+                            &public_name,
+                            &plugin_id,
+                            failure,
+                        )));
+                    }
+                };
+                if let Some(failure) = capability_failure {
+                    return Ok(Some(plugin_host_failure_result(
+                        &call,
+                        &public_name,
+                        &plugin_id,
+                        failure,
+                    )));
+                }
+                let mut result = match serde_json::from_str::<ToolResult>(&result_json) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return Ok(Some(plugin_host_failure_result(
+                            &call,
+                            &public_name,
+                            &plugin_id,
+                            PluginHostFailureKind::ContractViolation,
+                        )));
+                    }
+                };
+                bind_guest_tool_result(&mut result, &call, &public_name);
+                Ok(Some(result))
+            },
+        )
+        .await
     }
 
     async fn drain_events(&self) -> Result<Vec<serde_json::Value>> {
@@ -913,35 +953,42 @@ impl PluginHost for WasmPluginHost {
         let mut guest_request = request.clone();
         redact_guest_context_messages(&mut guest_request.messages);
         let request_json = serde_json::to_string(&guest_request)?;
-        let mut state = self.state.lock().await;
-        let fuel = context_fuel_budget(&state.limits, request_json.len());
-        set_fuel(&mut state, fuel)?;
-        let run_scope = state
-            .store
-            .data()
-            .capabilities
-            .enter_active_run_scope(Some(&request.run_id));
-        let load_context = state.load_context;
-        let invocation = load_context
-            .call_async(&mut state.store, (request_json,))
-            .await
-            .into_anyhow();
-        drop(run_scope);
-        let (response_json,) =
-            invocation.with_context(|| format!("plugin `{}` load-context failed", self.id()))?;
-        let response: GuestContextLoadResponse = serde_json::from_str(&response_json)
-            .with_context(|| format!("plugin `{}` returned invalid context response", self.id()))?;
-        if let Some(error) = response.error {
-            return Err(anyhow!(
-                "plugin `{}` context load failed: {error}",
-                self.id()
-            ));
-        }
-        let mut context = response.context;
-        if let Some(context) = context.as_mut() {
-            redact_guest_context_messages(&mut context.messages);
-        }
-        Ok(context)
+        let run_id = request.run_id.clone();
+        let plugin_id = self.id().to_string();
+        complete_component_call(
+            &self.state,
+            format!("plugin `{plugin_id}` load-context"),
+            move |mut state| async move {
+                let fuel = context_fuel_budget(&state.limits, request_json.len());
+                set_fuel(&mut state, fuel)?;
+                let run_scope = state
+                    .store
+                    .data()
+                    .capabilities
+                    .enter_active_run_scope(Some(&run_id));
+                let load_context = state.load_context;
+                let invocation = load_context
+                    .call_async(&mut state.store, (request_json,))
+                    .await
+                    .into_anyhow();
+                drop(run_scope);
+                let (response_json,) = invocation
+                    .with_context(|| format!("plugin `{plugin_id}` load-context failed"))?;
+                let response: GuestContextLoadResponse = serde_json::from_str(&response_json)
+                    .with_context(|| {
+                        format!("plugin `{plugin_id}` returned invalid context response")
+                    })?;
+                if let Some(error) = response.error {
+                    return Err(anyhow!("plugin `{plugin_id}` context load failed: {error}"));
+                }
+                let mut context = response.context;
+                if let Some(context) = context.as_mut() {
+                    redact_guest_context_messages(&mut context.messages);
+                }
+                Ok(context)
+            },
+        )
+        .await
     }
 
     async fn ui_declarations(&self) -> Result<Vec<UiDeclaration>> {
@@ -966,30 +1013,37 @@ impl PluginHost for WasmPluginHost {
         validate_ui_instance(declaration, request.instance_id.as_deref())?;
 
         let request_json = serde_json::to_string(request)?;
-        let mut state = self.state.lock().await;
-        refill_fuel(&mut state)?;
-        let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
-        let render_ui = state.render_ui;
-        let (frame_json,) = render_ui
-            .call_async(&mut state.store, (request_json,))
-            .await
-            .into_anyhow()
-            .with_context(|| format!("plugin `{}` render-ui failed", self.id()))?;
-        drop(run_scope);
-        if frame_json.is_empty() {
-            return Ok(None);
-        }
-        let frame = serde_json::from_str::<UiFrame>(&frame_json)
-            .with_context(|| format!("plugin `{}` returned invalid UiFrame JSON", self.id()))?;
-        if frame.view_id != request.view_id {
-            return Err(anyhow!(
-                "plugin `{}` rendered view `{}` for request `{}`",
-                self.id(),
-                frame.view_id,
-                request.view_id
-            ));
-        }
-        Ok(Some(frame))
+        let view_id = request.view_id.clone();
+        let plugin_id = self.id().to_string();
+        complete_component_call(
+            &self.state,
+            format!("plugin `{plugin_id}` render-ui"),
+            move |mut state| async move {
+                refill_fuel(&mut state)?;
+                let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
+                let render_ui = state.render_ui;
+                let (frame_json,) = render_ui
+                    .call_async(&mut state.store, (request_json,))
+                    .await
+                    .into_anyhow()
+                    .with_context(|| format!("plugin `{plugin_id}` render-ui failed"))?;
+                drop(run_scope);
+                if frame_json.is_empty() {
+                    return Ok(None);
+                }
+                let frame = serde_json::from_str::<UiFrame>(&frame_json).with_context(|| {
+                    format!("plugin `{plugin_id}` returned invalid UiFrame JSON")
+                })?;
+                if frame.view_id != view_id {
+                    return Err(anyhow!(
+                        "plugin `{plugin_id}` rendered view `{}` for request `{view_id}`",
+                        frame.view_id
+                    ));
+                }
+                Ok(Some(frame))
+            },
+        )
+        .await
     }
 
     async fn render_tool(&self, request: &ToolRenderRequest) -> Result<Option<UiFrame>> {
@@ -1004,39 +1058,44 @@ impl PluginHost for WasmPluginHost {
         };
 
         let request_json = serde_json::to_string(request)?;
-        let mut state = self.state.lock().await;
-        refill_fuel(&mut state)?;
-        let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
-        let render_ui = state.render_ui;
-        let (frame_json,) = render_ui
-            .call_async(&mut state.store, (request_json,))
-            .await
-            .into_anyhow()
-            .with_context(|| format!("plugin `{}` tool renderer failed", self.id()))?;
-        drop(run_scope);
-        if frame_json.is_empty() {
-            return Ok(None);
-        }
-        let frame = serde_json::from_str::<UiFrame>(&frame_json)
-            .with_context(|| format!("plugin `{}` returned invalid UiFrame JSON", self.id()))?;
-        if frame.view_id != renderer.renderer_id {
-            return Err(anyhow!(
-                "plugin `{}` rendered view `{}` for tool renderer `{}`",
-                self.id(),
-                frame.view_id,
-                renderer.renderer_id
-            ));
-        }
-        if frame.lines.len() > usize::from(request.context.max_height) {
-            return Err(anyhow!(
-                "plugin `{}` tool renderer `{}` returned {} lines above limit {}",
-                self.id(),
-                renderer.renderer_id,
-                frame.lines.len(),
-                request.context.max_height
-            ));
-        }
-        Ok(Some(frame))
+        let renderer_id = renderer.renderer_id.clone();
+        let max_height = request.context.max_height;
+        let plugin_id = self.id().to_string();
+        complete_component_call(
+            &self.state,
+            format!("plugin `{plugin_id}` tool renderer"),
+            move |mut state| async move {
+                refill_fuel(&mut state)?;
+                let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
+                let render_ui = state.render_ui;
+                let (frame_json,) = render_ui
+                    .call_async(&mut state.store, (request_json,))
+                    .await
+                    .into_anyhow()
+                    .with_context(|| format!("plugin `{plugin_id}` tool renderer failed"))?;
+                drop(run_scope);
+                if frame_json.is_empty() {
+                    return Ok(None);
+                }
+                let frame = serde_json::from_str::<UiFrame>(&frame_json).with_context(|| {
+                    format!("plugin `{plugin_id}` returned invalid UiFrame JSON")
+                })?;
+                if frame.view_id != renderer_id {
+                    return Err(anyhow!(
+                        "plugin `{plugin_id}` rendered view `{}` for tool renderer `{renderer_id}`",
+                        frame.view_id
+                    ));
+                }
+                if frame.lines.len() > usize::from(max_height) {
+                    return Err(anyhow!(
+                        "plugin `{plugin_id}` tool renderer `{renderer_id}` returned {} lines above limit {max_height}",
+                        frame.lines.len()
+                    ));
+                }
+                Ok(Some(frame))
+            },
+        )
+        .await
     }
 
     async fn on_ui_input(&self, input: &UiInput) -> Result<()> {
@@ -1053,17 +1112,24 @@ impl PluginHost for WasmPluginHost {
         validate_ui_instance(declaration, input.instance_id.as_deref())?;
 
         let input_json = serde_json::to_string(input)?;
-        let mut state = self.state.lock().await;
-        refill_fuel(&mut state)?;
-        let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
-        let on_ui_input = state.on_ui_input;
-        let invocation = on_ui_input
-            .call_async(&mut state.store, (input_json,))
-            .await
-            .into_anyhow();
-        drop(run_scope);
-        invocation.with_context(|| format!("plugin `{}` on-ui-input failed", self.id()))?;
-        Ok(())
+        let plugin_id = self.id().to_string();
+        complete_component_call(
+            &self.state,
+            format!("plugin `{plugin_id}` on-ui-input"),
+            move |mut state| async move {
+                refill_fuel(&mut state)?;
+                let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
+                let on_ui_input = state.on_ui_input;
+                let invocation = on_ui_input
+                    .call_async(&mut state.store, (input_json,))
+                    .await
+                    .into_anyhow();
+                drop(run_scope);
+                invocation.with_context(|| format!("plugin `{plugin_id}` on-ui-input failed"))?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn services(&self) -> Result<Vec<PluginService>> {
