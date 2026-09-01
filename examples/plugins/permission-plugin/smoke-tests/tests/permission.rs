@@ -1,11 +1,13 @@
 //! 权限插件真实 WASM Host 路由测试。
 
-use agent_core::{AgentExtension, ToolDecision};
+use agent_core::{
+    AgentEvent, AgentEventKind, AgentExtension, AgentRecordEvent, EventBus, ToolCallEvent,
+};
 use agent_plugin_host::{
     manifest::TOOL_POLICY_CAPABILITY,
     ui::{UiInput, UiInputEvent, UiPlacement, UiRenderRequest},
     wasm::{load_wasm_plugins, load_wasm_plugins_with_services},
-    PluginHost, PluginHostServices,
+    CompositePluginHost, LivePluginHost, PluginHost, PluginHostServices,
 };
 use agent_tool::{ToolCall, ToolPermissionScope};
 use serde_json::{json, Value};
@@ -15,10 +17,40 @@ const APPROVAL_VIEW: &str = "permission-approval";
 const MODE_VIEW: &str = "permission-mode";
 
 /// 构造模拟 Core/Host 已完成可信 scope 绑定的真实 ABI 调用。
-fn scoped_call(id: &str, name: &str, args: Value, scope: ToolPermissionScope) -> ToolCall {
+fn scoped_call(
+    id: &str,
+    name: &str,
+    args: Value,
+    scope: ToolPermissionScope,
+    run_id: &str,
+) -> ToolCall {
     let mut call = ToolCall::new(id, name, args);
     call.bind_permission_scope(scope);
+    call.bind_run_id(run_id);
     call
+}
+
+/// 把真实加载的插件装配成挂载总线、已开启一次运行快照的动态宿主。
+///
+/// 工具准入现在走事件总线，因此冒烟测试必须复现 Core 的真实路径：先由记录事件开启
+/// 运行快照，再分发 `core.tool.call`。
+async fn live_bus_with_run(composite: &CompositePluginHost, run_id: &str) -> EventBus {
+    let live = LivePluginHost::new();
+    let bus = EventBus::new();
+    live.set_capability_owner(TOOL_POLICY_CAPABILITY, "permission")
+        .expect("记录工具策略 owner");
+    for host in composite.hosts() {
+        live.publish(Arc::clone(host)).expect("发布真实插件宿主");
+    }
+    live.finish_capability_planning().expect("标记能力规划完成");
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
+    bus.dispatch(AgentRecordEvent {
+        record: AgentEvent::new(run_id, AgentEventKind::RunStarted, 0, json!({})),
+    })
+    .await;
+    // Live Host 需要在进程内长期存活，测试结束前不释放。
+    std::mem::forget(live);
+    bus
 }
 
 /// 真实 component 必须阻止敏感读取，并在用户确认后放行一次写入。
@@ -37,17 +69,20 @@ async fn wasm_host_routes_permission_approval() {
     let declarations = host.ui_declarations().await.expect("建立权限插件 UI 路由");
     assert_eq!(declarations[0].placement, UiPlacement::Input);
 
+    let bus = live_bus_with_run(host.as_ref(), "smoke-run").await;
+
     let update_plan = scoped_call(
         "update-plan",
         "update_plan",
         json!({"plan": []}),
         ToolPermissionScope::Control,
+        "smoke-run",
     );
-    assert_eq!(
-        AgentExtension::before_tool(host.as_ref(), &update_plan)
+    assert!(
+        !bus.dispatch(ToolCallEvent::new("smoke-run", 0, update_plan))
             .await
-            .expect("检查 control scope 工具"),
-        ToolDecision::Allow
+            .is_cancelled(),
+        "control scope 工具应放行"
     );
 
     let secret = scoped_call(
@@ -55,13 +90,13 @@ async fn wasm_host_routes_permission_approval() {
         "read_file",
         json!({"path": ".env"}),
         ToolPermissionScope::Read,
+        "smoke-run",
     );
-    assert!(matches!(
-        AgentExtension::before_tool(host.as_ref(), &secret)
-            .await
-            .expect("检查敏感读取"),
-        ToolDecision::Block { .. }
-    ));
+    let denied = bus
+        .dispatch(ToolCallEvent::new("smoke-run", 0, secret))
+        .await;
+    assert!(denied.is_cancelled(), "敏感读取必须被拒绝");
+    assert_eq!(denied.canceller(), Some("lucia.plugin-host"));
 
     // 本用例验证真实 UI 人工审批路由；模型代审的拒绝与异常语义由插件和 Core 分层测试覆盖。
     host.on_ui_input(&UiInput {
@@ -92,11 +127,13 @@ async fn wasm_host_routes_permission_approval() {
         "write_file",
         json!({"path": "src/safe.rs", "content": ""}),
         ToolPermissionScope::Write,
+        "smoke-run",
     );
-    let pending_host = Arc::clone(&host);
-    let pending_write = write.clone();
+    let pending_bus = bus.clone();
     let pending_decision = tokio::spawn(async move {
-        AgentExtension::before_tool(pending_host.as_ref(), &pending_write).await
+        pending_bus
+            .dispatch(ToolCallEvent::new("smoke-run", 0, write))
+            .await
     });
 
     let frame = tokio::time::timeout(Duration::from_secs(1), async {
@@ -136,12 +173,12 @@ async fn wasm_host_routes_permission_approval() {
     .await
     .expect("批准工具调用");
 
-    assert_eq!(
-        pending_decision
+    assert!(
+        !pending_decision
             .await
             .expect("审批任务不应 panic")
-            .expect("读取审批结果"),
-        ToolDecision::Allow
+            .is_cancelled(),
+        "用户批准后工具应放行"
     );
 }
 
@@ -248,20 +285,21 @@ async fn wasm_host_restores_persisted_permission_mode() {
     let reopened = load_wasm_plugins_with_services(&[&manifest], services)
         .await
         .expect("重新加载权限插件 WASM");
+    let bus = live_bus_with_run(&reopened, "restored-run").await;
     let write = scoped_call(
         "restored-write",
         "write_file",
         json!({"path": "src/restored.rs", "content": ""}),
         ToolPermissionScope::Write,
+        "restored-run",
     );
-    let decision = tokio::time::timeout(
+    let dispatched = tokio::time::timeout(
         Duration::from_secs(1),
-        AgentExtension::before_tool(&reopened, &write),
+        bus.dispatch(ToolCallEvent::new("restored-run", 0, write)),
     )
     .await
-    .expect("恢复后的全部放行不应等待人工审批")
-    .expect("读取恢复后的权限决策");
-    assert_eq!(decision, ToolDecision::Allow);
+    .expect("恢复后的全部放行不应等待人工审批");
+    assert!(!dispatched.is_cancelled(), "恢复的全部放行模式应直接放行");
 
     reopened.shutdown().await.expect("卸载重载权限插件");
     std::fs::remove_dir_all(state_root).expect("清理权限状态测试目录");

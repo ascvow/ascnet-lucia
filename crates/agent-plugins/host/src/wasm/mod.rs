@@ -11,6 +11,7 @@ use crate::composite::CompositePluginHost;
 use crate::contribution::ContributionRegistry;
 use crate::host::PluginHost;
 use crate::manifest::resolve_plugin_load_order;
+use crate::manifest::EventSubscription;
 use crate::manifest::PluginManifest;
 use crate::service::PluginService;
 use crate::service::PluginServiceCall;
@@ -38,13 +39,15 @@ use crate::wasm::linker::classify_wasm_plugin_failure;
 use crate::wasm::linker::get_required_func;
 use agent_core::model::ModelMessage;
 use agent_core::AgentExtension;
+use agent_core::AgentRecordEvent;
 use agent_core::ContextLoadRequest;
+use agent_core::Event;
+use agent_core::EventContext;
 use agent_core::LoadedContext;
-use agent_core::ToolDecision;
 use agent_core::{AgentEvent, AgentEventKind};
+use agent_plugin_protocol::{PluginEventEnvelope, PluginEventResponse};
 use agent_runtime::RuntimePrincipal;
 use agent_tool::ToolCall;
-use agent_tool::ToolDecisionStatus;
 use agent_tool::ToolResult;
 use agent_tool::ToolSpec;
 use anyhow::anyhow;
@@ -210,6 +213,12 @@ pub struct WasmPluginHost {
     state: Arc<Mutex<WasmPluginState>>,
 }
 
+/// 单个插件在一次事件分发上允许累计等待的最长毫秒数。
+///
+/// 人工审批等交互式插件通过 `Pending` 分片等待，这里给出统一上限：超时后 Host 判定
+/// Guest 失约并报错，由订阅声明的故障模式决定放行还是拒绝，防止插件永久挂起 Agent。
+const MAX_EVENT_PENDING_TOTAL_MS: u64 = 600_000;
+
 /// 插件加载被取消时异步撤销尚未转交给宿主实例的 Agent Runtime principal。
 struct AgentRuntimeLoadGuard {
     binding: Option<AgentRuntimeBinding>,
@@ -250,9 +259,7 @@ struct WasmPluginState {
     #[allow(dead_code)]
     instance: Instance,
     call_tool: TypedFunc<(String,), (String,)>,
-    before_tool: TypedFunc<(String,), (String,)>,
-    after_tool: TypedFunc<(String,), ()>,
-    on_event: TypedFunc<(String,), ()>,
+    on_event: TypedFunc<(String,), (String,)>,
     load_context: TypedFunc<(String,), (String,)>,
     handle_service: TypedFunc<(String,), (String,)>,
     deactivate: TypedFunc<(), (String,)>,
@@ -518,11 +525,8 @@ impl WasmPluginHost {
                 get_required_func::<(), (String,)>(&instance, &mut store, "list-tools")?;
             let call_tool =
                 get_required_func::<(String,), (String,)>(&instance, &mut store, "call-tool")?;
-            let before_tool =
-                get_required_func::<(String,), (String,)>(&instance, &mut store, "before-tool")?;
-            let after_tool =
-                get_required_func::<(String,), ()>(&instance, &mut store, "after-tool")?;
-            let on_event = get_required_func::<(String,), ()>(&instance, &mut store, "on-event")?;
+            let on_event =
+                get_required_func::<(String,), (String,)>(&instance, &mut store, "on-event")?;
             let load_context =
                 get_required_func::<(String,), (String,)>(&instance, &mut store, "load-context")?;
             let activate =
@@ -555,8 +559,6 @@ impl WasmPluginHost {
                 store,
                 instance,
                 call_tool,
-                before_tool,
-                after_tool,
                 on_event,
                 load_context,
                 handle_service,
@@ -688,24 +690,70 @@ impl WasmPluginHost {
         deactivation.and(unregister)
     }
 
-    /// 调用 Guest 后置钩子，并在能力导入期间绑定可信 Agent run。
-    async fn after_tool_scoped(&self, run_id: Option<&str>, result: &ToolResult) -> Result<()> {
-        let result_json = serde_json::to_string(result)?;
-        let mut state = self.state.lock().await;
-        refill_fuel(&mut state)?;
-        let run_scope = state
-            .store
-            .data()
-            .capabilities
-            .enter_active_run_scope(run_id);
-        let after_tool = state.after_tool;
-        let invocation = after_tool
-            .call_async(&mut state.store, (result_json,))
-            .await
-            .into_anyhow();
-        drop(run_scope);
-        invocation.with_context(|| format!("plugin `{}` after-tool failed", self.id()))?;
-        Ok(())
+    /// 向 Guest 投递一次事件分发，并在能力导入期间绑定可信 Agent run。
+    ///
+    /// Guest 返回 `Pending` 时按其请求的间隔重试，供人工审批一类需要外部输入的插件
+    /// 使用；累计等待超过 [`MAX_EVENT_PENDING_TOTAL_MS`] 视为 Guest 失约并返回错误，
+    /// 避免一个卡住的插件永久挂起整个 Agent。
+    async fn deliver_event(
+        &self,
+        envelope: &PluginEventEnvelope,
+        run_id: Option<&str>,
+    ) -> Result<PluginEventResponse> {
+        let envelope_json = serde_json::to_string(envelope)?;
+        let mut waited_ms = 0u64;
+        loop {
+            let response = {
+                let mut state = self.state.lock().await;
+                refill_fuel(&mut state)?;
+                let run_scope = state
+                    .store
+                    .data()
+                    .capabilities
+                    .enter_active_run_scope(run_id);
+                let on_event = state.on_event;
+                let invocation = on_event
+                    .call_async(&mut state.store, (envelope_json.clone(),))
+                    .await
+                    .into_anyhow();
+                drop(run_scope);
+                let (response_json,) = invocation.with_context(|| {
+                    format!(
+                        "plugin `{}` on-event failed for `{}`",
+                        self.id(),
+                        envelope.event
+                    )
+                })?;
+                // 空字符串是"放行且不改写"的简写，允许纯观察型插件省略应答构造。
+                if response_json.trim().is_empty() {
+                    return Ok(PluginEventResponse::allow());
+                }
+                serde_json::from_str::<PluginEventResponse>(&response_json).with_context(|| {
+                    format!(
+                        "plugin `{}` returned invalid PluginEventResponse JSON for `{}`",
+                        self.id(),
+                        envelope.event
+                    )
+                })?
+            };
+
+            match response {
+                PluginEventResponse::Pending { retry_after_ms } => {
+                    let delay = retry_after_ms.clamp(50, 1_000);
+                    waited_ms = waited_ms.saturating_add(delay);
+                    if waited_ms > MAX_EVENT_PENDING_TOTAL_MS {
+                        return Err(anyhow::anyhow!(
+                            "插件 `{}` 在事件 `{}` 上等待超过 {}ms 仍未给出结论",
+                            self.id(),
+                            envelope.event,
+                            MAX_EVENT_PENDING_TOTAL_MS
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                ready => return Ok(ready),
+            }
+        }
     }
 }
 
@@ -777,75 +825,6 @@ impl AgentExtension for WasmPluginHost {
         Ok(Some(result))
     }
 
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        let call_json = serde_json::to_string(call)?;
-        loop {
-            let decision = {
-                let mut state = self.state.lock().await;
-                refill_fuel(&mut state)?;
-                let run_scope = state
-                    .store
-                    .data()
-                    .capabilities
-                    .enter_active_run_scope(call.run_id.as_deref());
-                let before_tool = state.before_tool;
-                let invocation = before_tool
-                    .call_async(&mut state.store, (call_json.clone(),))
-                    .await
-                    .into_anyhow();
-                drop(run_scope);
-                let (decision_json,) = invocation
-                    .with_context(|| format!("plugin `{}` before-tool failed", self.id()))?;
-                serde_json::from_str::<ToolDecisionStatus>(&decision_json).with_context(|| {
-                    format!(
-                        "plugin `{}` returned invalid ToolDecisionStatus JSON",
-                        self.id()
-                    )
-                })?
-            };
-            match decision {
-                ToolDecisionStatus::Pending { retry_after_ms } => {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        retry_after_ms.clamp(50, 1_000),
-                    ))
-                    .await;
-                }
-                ToolDecisionStatus::Ready { decision } => return Ok(decision),
-            }
-        }
-    }
-
-    async fn after_tool(&self, result: &ToolResult) -> Result<()> {
-        self.after_tool_scoped(None, result).await
-    }
-
-    async fn after_tool_for_run(&self, run_id: &str, result: &ToolResult) -> Result<()> {
-        self.after_tool_scoped(Some(run_id), result).await
-    }
-
-    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
-        // 私有推理增量只面向可信应用 Recorder；WASM 边界再次 fail-closed。
-        if event.kind == AgentEventKind::ModelThinkingDelta {
-            return Ok(());
-        }
-        let event_json = serde_json::to_string(event)?;
-        let mut state = self.state.lock().await;
-        refill_fuel(&mut state)?;
-        let run_scope = state
-            .store
-            .data()
-            .capabilities
-            .enter_active_run_scope(Some(&event.run_id));
-        let on_event = state.on_event;
-        let invocation = on_event
-            .call_async(&mut state.store, (event_json,))
-            .await
-            .into_anyhow();
-        drop(run_scope);
-        invocation.with_context(|| format!("plugin `{}` on-event failed", self.id()))?;
-        Ok(())
-    }
-
     async fn drain_events(&self) -> Result<Vec<serde_json::Value>> {
         self.contributions.drain_events()
     }
@@ -863,7 +842,22 @@ impl AgentExtension for WasmPluginHost {
             0,
             serde_json::json!({"aborted": true, "host_cleanup": true}),
         );
-        let callback = self.on_event(&cleanup).await;
+        let callback = match serde_json::to_value(AgentRecordEvent { record: cleanup }) {
+            Ok(data) => self
+                .deliver_event(
+                    &PluginEventEnvelope {
+                        event: AgentRecordEvent::NAME.to_string(),
+                        cancelled: false,
+                        canceller: None,
+                        subscriber: self.id().to_string(),
+                        data,
+                    },
+                    Some(run_id),
+                )
+                .await
+                .map(|_| ()),
+            Err(error) => Err(error.into()),
+        };
         let drained = self.contributions.drain_events_for_run(run_id);
         match (callback, drained) {
             (Err(error), Err(drain_error)) => {
@@ -880,6 +874,39 @@ impl AgentExtension for WasmPluginHost {
 impl PluginHost for WasmPluginHost {
     fn id(&self) -> Option<&str> {
         Some(WasmPluginHost::id(self))
+    }
+
+    fn event_subscriptions(&self) -> &[EventSubscription] {
+        &self.manifest.events
+    }
+
+    async fn dispatch_event(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        let data = ctx.snapshot()?;
+        let envelope = PluginEventEnvelope {
+            event: ctx.name().to_string(),
+            cancelled: ctx.is_cancelled(),
+            canceller: ctx.canceller().map(str::to_string),
+            // 订阅身份由 Host 注入的可信插件 ID 决定，Guest 无法自行声明。
+            subscriber: WasmPluginHost::id(self).to_string(),
+            data,
+        };
+        let run_id = snapshot_run_id(&envelope.data).map(str::to_string);
+
+        let response = self.deliver_event(&envelope, run_id.as_deref()).await?;
+        let PluginEventResponse::Ready { cancel, patch } = response else {
+            unreachable!("deliver_event 只返回 Ready 应答")
+        };
+        // Monitor 级订阅只观察最终结果，Guest 的改写与取消一律不生效。
+        if ctx.is_read_only() {
+            return Ok(());
+        }
+        if !patch.is_null() {
+            ctx.merge(&patch)?;
+        }
+        if cancel {
+            ctx.cancel();
+        }
+        Ok(())
     }
 
     async fn load_context(&self, request: &ContextLoadRequest) -> Result<Option<LoadedContext>> {
@@ -1057,3 +1084,14 @@ impl PluginHost for WasmPluginHost {
 
 #[cfg(test)]
 mod tests;
+
+/// 从事件快照中读取 Core 绑定的运行 ID。
+///
+/// 事件负载由 Core 构造，因此这里读到的 `run_id` 是可信的；Guest 无法通过改写补丁
+/// 影响它，能力导入的运行作用域也就不会被指向其他运行。
+fn snapshot_run_id(data: &Value) -> Option<&str> {
+    data.get("run_id")
+        .and_then(Value::as_str)
+        .or_else(|| data.pointer("/record/run_id").and_then(Value::as_str))
+        .filter(|run_id| !run_id.is_empty())
+}

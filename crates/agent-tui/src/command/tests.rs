@@ -18,7 +18,7 @@ fn test_plugin_authorization(
             id = "command-test"
             name = "Command Test"
             version = "1.0.0"
-            api_version = "0.7.0"
+            api_version = "0.8.0"
             wasm = "command-test.wasm"
         "#,
     )
@@ -140,7 +140,7 @@ fn plugin_page_shows_installed_plugins_and_manual_actions() {
                 id: "echo".into(),
                 name: "Echo".into(),
                 version: "1.0.0".into(),
-                api_version: "0.7.0".into(),
+                api_version: "0.8.0".into(),
                 enabled: false,
                 manifest: "plugins/echo/1.0.0/plugin.toml".into(),
                 sha256: "b".repeat(64),
@@ -150,7 +150,7 @@ fn plugin_page_shows_installed_plugins_and_manual_actions() {
                 id: "echo".into(),
                 name: "Echo".into(),
                 version: "0.9.0".into(),
-                api_version: "0.7.0".into(),
+                api_version: "0.8.0".into(),
                 enabled: true,
                 manifest: "plugins/echo/0.9.0/plugin.toml".into(),
                 sha256: "c".repeat(64),
@@ -306,7 +306,7 @@ fn plugin_enable_fails_closed_without_authorization_profile() {
                 id: "unknown-capabilities".into(),
                 name: "Unknown Capabilities".into(),
                 version: "1.0.0".into(),
-                api_version: "0.7.0".into(),
+                api_version: "0.8.0".into(),
                 enabled: false,
                 manifest: "plugins/unknown-capabilities/1.0.0/plugin.toml".into(),
                 sha256: "e".repeat(64),
@@ -350,7 +350,7 @@ fn disabled_capability_owner_requires_two_enable_confirmations() {
                 id: "provider".into(),
                 name: "Provider".into(),
                 version: "1.0.0".into(),
-                api_version: "0.7.0".into(),
+                api_version: "0.8.0".into(),
                 enabled: false,
                 manifest: "plugins/provider/1.0.0/plugin.toml".into(),
                 sha256: "d".repeat(64),

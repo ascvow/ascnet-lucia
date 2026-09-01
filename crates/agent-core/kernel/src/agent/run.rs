@@ -219,6 +219,22 @@ impl ToolOutputSink for ToolOutputChannel {
     }
 }
 
+/// 记录事件监听者报告的错误。
+///
+/// 监听者失败不会中断 ReAct 循环：总线已按订阅声明的故障模式处理后果（观察型忽略、
+/// 安全型转为取消），这里只负责让失败可见，避免插件故障静默消失。
+fn log_listener_errors(event: &str, errors: &[ListenerError]) {
+    for error in errors {
+        tracing::warn!(
+            target: "agent_core::bus",
+            event,
+            subscriber = %error.subscriber,
+            error = %error.error,
+            "事件监听者执行失败"
+        );
+    }
+}
+
 impl Agent {
     /// 消费一次取消请求；运行循环在检查点调用。
     fn take_cancelled(&self) -> bool {
@@ -377,6 +393,26 @@ impl Agent {
         )
         .await?;
 
+        // 运行准入：监听者可以在进入循环前否决整次运行。
+        let run_start = self
+            .dispatch_cancellable(RunStartEvent {
+                run_id: run_id.clone(),
+                provider: self.options.provider.clone(),
+                model: self.options.model.clone(),
+            })
+            .await;
+        if run_start.is_cancelled() {
+            tracing::info!(
+                target: "agent_core::bus",
+                run_id = %run_id,
+                canceller = run_start.canceller().unwrap_or_default(),
+                "Agent 运行被监听者取消"
+            );
+            return self
+                .finish_cancelled(&run_id, 0, 0, total_usage, session)
+                .await;
+        }
+
         let mut step = 0;
         let mut steps_since_user_input = 0;
         let mut recovering_empty_response = false;
@@ -400,6 +436,26 @@ impl Agent {
             }
             self.emit(&run_id, AgentEventKind::TurnStarted, step, json!({}))
                 .await?;
+
+            // 轮次准入：监听者可以在本轮请求模型前结束运行。
+            let turn_start = self
+                .dispatch_cancellable(TurnStartEvent {
+                    run_id: run_id.clone(),
+                    step,
+                })
+                .await;
+            if turn_start.is_cancelled() {
+                tracing::info!(
+                    target: "agent_core::bus",
+                    run_id = %run_id,
+                    step,
+                    canceller = turn_start.canceller().unwrap_or_default(),
+                    "ReAct 轮次被监听者取消"
+                );
+                return self
+                    .finish_cancelled(&run_id, step, step, total_usage, session)
+                    .await;
+            }
 
             let tools = self.tool_specs_for_run(&run_id).await?;
             // 权限 scope 仅从本轮实际暴露的可信工具定义建立，模型返回的调用不能自行声明。
@@ -474,6 +530,28 @@ impl Agent {
                 }),
             )
             .await?;
+
+            // 模型请求准入：监听者可以在请求发往 provider 前结束运行。
+            let model_request = self
+                .dispatch_cancellable(ModelRequestEvent::new(
+                    &run_id,
+                    step,
+                    &self.options.provider,
+                    &req,
+                ))
+                .await;
+            if model_request.is_cancelled() {
+                tracing::info!(
+                    target: "agent_core::bus",
+                    run_id = %run_id,
+                    step,
+                    canceller = model_request.canceller().unwrap_or_default(),
+                    "模型请求被监听者取消"
+                );
+                return self
+                    .finish_cancelled(&run_id, step, step, total_usage, session)
+                    .await;
+            }
 
             let mut model_stream = {
                 // 把通知 future 限定在建连阶段，成功后立即注销等待者，不能窃取后续取消通知。
@@ -599,6 +677,15 @@ impl Agent {
             )
             .await?;
 
+            self.notify(ModelResponseEvent {
+                run_id: run_id.clone(),
+                step,
+                finish_reason: finish_reason.clone(),
+                tool_call_count: tool_calls.len(),
+                text_len: response_text.len(),
+            })
+            .await;
+
             if let Some(usage) = &usage {
                 total_usage.add_assign(usage);
                 self.update_state(|state| state.usage = total_usage.clone());
@@ -644,32 +731,34 @@ impl Agent {
                 self.emit(&run_id, AgentEventKind::TurnFinished, step, json!({}))
                     .await?;
 
-                // 模型直接返回文本时也必须消费运行期间到达的 steering，避免新指令静默遗留。
-                if let Some(message) = self.pop_steering() {
-                    self.emit(
-                        &run_id,
-                        AgentEventKind::SteeringInjected,
-                        step,
-                        json!({ "text_len": message.len() }),
-                    )
-                    .await?;
-                    session.push_user(message);
-                    self.update_state(|state| state.session = session.clone());
-                    step += 1;
-                    steps_since_user_input = 0;
-                    continue;
+                // 模型直接返回文本时也必须消费运行期间到达的 steering，避免新指令静默遗留；
+                // 之后再检查 follow-up 队列。被监听者取消的消息直接丢弃并继续看下一条，
+                // 队列耗尽时按"没有待注入消息"处理，正常结束本次运行。
+                let mut injected = None;
+                while let Some(message) = self.pop_steering() {
+                    if let Some(message) = self
+                        .negotiate_injection(&run_id, step, InjectKind::Steering, message)
+                        .await
+                    {
+                        injected = Some((AgentEventKind::SteeringInjected, message));
+                        break;
+                    }
                 }
-
-                // 任务完成前检查 follow-up 队列；有消息则注入并继续循环。
-                if let Some(follow_up) = self.pop_follow_up() {
-                    self.emit(
-                        &run_id,
-                        AgentEventKind::FollowUpInjected,
-                        step,
-                        json!({ "text_len": follow_up.len() }),
-                    )
-                    .await?;
-                    session.push_user(follow_up);
+                if injected.is_none() {
+                    while let Some(follow_up) = self.pop_follow_up() {
+                        if let Some(follow_up) = self
+                            .negotiate_injection(&run_id, step, InjectKind::FollowUp, follow_up)
+                            .await
+                        {
+                            injected = Some((AgentEventKind::FollowUpInjected, follow_up));
+                            break;
+                        }
+                    }
+                }
+                if let Some((kind, message)) = injected {
+                    self.emit(&run_id, kind, step, json!({ "text_len": message.len() }))
+                        .await?;
+                    session.push_user(message);
                     self.update_state(|state| state.session = session.clone());
                     step += 1;
                     steps_since_user_input = 0;
@@ -683,6 +772,13 @@ impl Agent {
                     json!({ "steps_used": step + 1, "usage": &total_usage }),
                 )
                 .await?;
+                self.notify(RunFinishEvent {
+                    run_id: run_id.clone(),
+                    steps_used: step + 1,
+                    cancelled: false,
+                    usage: total_usage.clone(),
+                })
+                .await;
                 return Ok(AgentRun {
                     run_id,
                     final_text,
@@ -756,27 +852,34 @@ impl Agent {
                 }
 
                 if let Some(message) = self.pop_steering() {
-                    // 剩余工具标记为 Skipped，让模型知道它们没有执行。
-                    for skipped in &tool_calls[index + 1..] {
-                        self.emit(
-                            &run_id,
-                            AgentEventKind::ToolSkipped,
-                            step,
-                            json!({
-                                "call": skipped,
-                                "reason": "Skipped due to queued user message",
-                            }),
-                        )
-                        .await?;
-                        results.push(ToolResult::error(
-                            skipped.id.clone(),
-                            skipped.name.clone(),
-                            "Skipped due to queued user message",
-                        ));
-                        self.mark_tool_skipped(&skipped.id);
+                    // 先协商注入再决定是否中断本轮：注入被取消时剩余工具照常执行，
+                    // 不会因一条最终没有生效的消息而白白跳过工具。
+                    if let Some(message) = self
+                        .negotiate_injection(&run_id, step, InjectKind::Steering, message)
+                        .await
+                    {
+                        // 剩余工具标记为 Skipped，让模型知道它们没有执行。
+                        for skipped in &tool_calls[index + 1..] {
+                            self.emit(
+                                &run_id,
+                                AgentEventKind::ToolSkipped,
+                                step,
+                                json!({
+                                    "call": skipped,
+                                    "reason": "Skipped due to queued user message",
+                                }),
+                            )
+                            .await?;
+                            results.push(ToolResult::error(
+                                skipped.id.clone(),
+                                skipped.name.clone(),
+                                "Skipped due to queued user message",
+                            ));
+                            self.mark_tool_skipped(&skipped.id);
+                        }
+                        steering_message = Some(message);
+                        break;
                     }
-                    steering_message = Some(message);
-                    break;
                 }
             }
             session.push_tool_results(results);
@@ -805,6 +908,11 @@ impl Agent {
 
             self.emit(&run_id, AgentEventKind::TurnFinished, step, json!({}))
                 .await?;
+            self.notify(TurnFinishEvent {
+                run_id: run_id.clone(),
+                step,
+            })
+            .await;
             step += 1;
         }
 
@@ -840,6 +948,13 @@ impl Agent {
             json!({ "steps_used": steps_used, "usage": &total_usage, "cancelled": true }),
         )
         .await?;
+        self.notify(RunFinishEvent {
+            run_id: run_id.to_string(),
+            steps_used,
+            cancelled: true,
+            usage: total_usage.clone(),
+        })
+        .await;
         Ok(AgentRun {
             run_id: run_id.to_string(),
             final_text: session.last_assistant_text(),
@@ -870,7 +985,8 @@ impl Agent {
             agent_tool::ToolErrorKind::PolicyDenied,
             format!("当前执行策略不允许调用工具：{}", call.name),
         );
-        self.extension.after_tool_for_run(run_id, &result).await?;
+        self.broadcast_tool_result(run_id, step, &result, "runtime_policy")
+            .await;
         self.finish_tool_state(&result);
         self.emit_tool_finished(run_id, step, &result, "runtime_policy")
             .await?;
@@ -909,87 +1025,111 @@ impl Agent {
         let original_call = call.clone();
 
         // 第一道策略门禁：在任何插件钩子之前拒绝策略不允许的工具，
-        // 避免插件通过 `before_tool` 观察到本不该暴露的调用。
+        // 避免插件通过 `core.tool.call` 观察到本不该暴露的调用。
         if let Some(result) = self.reject_if_policy_denies(run_id, &call, step).await? {
             return Ok(ToolExecutionOutcome::plain(result));
         }
 
-        let decision = loop {
+        // 工具准入决策点：监听者可以改写调用、拒绝执行或连带取消整个运行。
+        let admission = loop {
             if self.control().cancel_requested() {
-                break ToolDecision::CancelRun {
-                    reason: "工具执行前检查已取消".to_string(),
-                };
+                break None;
             }
+            let dispatch =
+                self.dispatch_cancellable(ToolCallEvent::new(run_id, step, call.clone()));
             tokio::select! {
-                decision = self.extension.before_tool_for_run(run_id, &call) => break decision?,
+                dispatched = dispatch => break Some(dispatched),
                 _ = self.cancel_notify.notified() => {}
             }
         };
-        let mut call = match decision {
-            ToolDecision::Allow => call,
-            ToolDecision::Rewrite { mut call } => {
-                // 调用 ID 是 Provider 与 Session 工具结果配对使用的可信关联键；扩展只能
-                // 改写名称和参数，不能把结果关联到其他调用或制造孤立工具消息。
-                call.id.clone_from(&original_call.id);
-                call
-            }
-            ToolDecision::Block {
-                reason,
-                agent_guidance,
-            } => {
-                let display_result = ToolResult::error_with_kind(
+
+        let Some(admission) = admission else {
+            // 监听者尚未给出结论时用户已取消：等价于运行级取消，不执行该工具。
+            let result = ToolResult::error_with_kind(
+                original_call.id,
+                original_call.name,
+                agent_tool::ToolErrorKind::Cancelled,
+                "工具执行前检查已取消",
+            );
+            self.broadcast_tool_result(run_id, step, &result, "runtime")
+                .await;
+            self.finish_tool_state(&result);
+            self.emit_tool_finished(run_id, step, &result, "runtime")
+                .await?;
+            return Ok(ToolExecutionOutcome::plain(result));
+        };
+
+        let canceller = admission.canceller().unwrap_or("unknown").to_string();
+        let cancelled = admission.is_cancelled();
+        let ToolCallEvent {
+            mut call,
+            block_reason,
+            agent_guidance,
+            cancel_run,
+            ..
+        } = admission.event;
+        // 调用 ID 是 Provider 与 Session 工具结果配对使用的可信关联键；监听者只能改写
+        // 名称和参数，不能把结果关联到其他调用或制造孤立工具消息。
+        call.id.clone_from(&original_call.id);
+
+        if cancelled && cancel_run {
+            // 取消并要求结束运行：与被拒绝的单次调用区分，结果标记为运行级取消。
+            self.control().cancel();
+            let result = ToolResult::error_with_kind(
+                original_call.id,
+                original_call.name,
+                agent_tool::ToolErrorKind::Cancelled,
+                block_reason.unwrap_or_else(|| format!("运行被 {canceller} 取消")),
+            );
+            self.broadcast_tool_result(run_id, step, &result, "runtime")
+                .await;
+            self.finish_tool_state(&result);
+            self.emit_tool_finished(run_id, step, &result, "runtime")
+                .await?;
+            return Ok(ToolExecutionOutcome::plain(result));
+        }
+
+        if cancelled {
+            let display_result = ToolResult::error_with_kind(
+                original_call.id.clone(),
+                original_call.name.clone(),
+                agent_tool::ToolErrorKind::PermissionDenied,
+                block_reason.unwrap_or_else(|| format!("工具调用被 {canceller} 拒绝")),
+            );
+            let request_result = agent_guidance.map(|guidance| {
+                ToolResult::error_with_kind(
                     original_call.id.clone(),
                     original_call.name.clone(),
                     agent_tool::ToolErrorKind::PermissionDenied,
-                    reason,
-                );
-                let request_result = agent_guidance.map(|guidance| {
-                    ToolResult::error_with_kind(
-                        original_call.id.clone(),
-                        original_call.name.clone(),
-                        agent_tool::ToolErrorKind::PermissionDenied,
-                        bounded_one_time_guidance(&guidance),
-                    )
-                });
-                let result = ToolResult::error_with_kind(
-                    original_call.id,
-                    original_call.name,
-                    agent_tool::ToolErrorKind::PermissionDenied,
-                    BLOCKED_TOOL_SESSION_MESSAGE,
-                );
-                // 应用事件保留面向用户的审批详情；所有扩展只观察会话中的脱敏结果，
-                // 避免无关 Guest 插件缓存详情并在后续轮次重新注入模型。
-                self.extension.after_tool_for_run(run_id, &result).await?;
-                self.finish_tool_state(&display_result);
-                self.emit_tool_finished_with_extension_result(
-                    run_id,
-                    step,
-                    &display_result,
-                    &result,
-                    "plugin_policy",
+                    bounded_one_time_guidance(&guidance),
                 )
-                .await?;
-                return Ok(ToolExecutionOutcome {
-                    result,
-                    request_result,
-                });
-            }
-            ToolDecision::CancelRun { reason } => {
-                self.control().cancel();
-                let result = ToolResult::error_with_kind(
-                    original_call.id,
-                    original_call.name,
-                    agent_tool::ToolErrorKind::Cancelled,
-                    reason,
-                );
-                self.extension.after_tool_for_run(run_id, &result).await?;
-                self.finish_tool_state(&result);
-                self.emit_tool_finished(run_id, step, &result, "runtime")
-                    .await?;
-                return Ok(ToolExecutionOutcome::plain(result));
-            }
-        };
-        // Rewrite 可以改变名称或伪造字段；最终调用必须重新绑定目标工具的可信 scope。
+            });
+            let result = ToolResult::error_with_kind(
+                original_call.id,
+                original_call.name,
+                agent_tool::ToolErrorKind::PermissionDenied,
+                BLOCKED_TOOL_SESSION_MESSAGE,
+            );
+            // 应用事件保留面向用户的审批详情；所有监听者只观察会话中的脱敏结果，
+            // 避免无关 Guest 插件缓存详情并在后续轮次重新注入模型。
+            self.broadcast_tool_result(run_id, step, &result, "plugin_policy")
+                .await;
+            self.finish_tool_state(&display_result);
+            self.emit_tool_finished_with_extension_result(
+                run_id,
+                step,
+                &display_result,
+                &result,
+                "plugin_policy",
+            )
+            .await?;
+            return Ok(ToolExecutionOutcome {
+                result,
+                request_result,
+            });
+        }
+
+        // 改写可以改变名称或伪造字段；最终调用必须重新绑定目标工具的可信 scope。
         call.bind_permission_scope(
             permission_scopes
                 .get(&call.name)
@@ -1062,7 +1202,8 @@ impl Agent {
             )
         };
 
-        self.extension.after_tool_for_run(run_id, &result).await?;
+        self.broadcast_tool_result(run_id, step, &result, runtime_origin)
+            .await;
         self.finish_tool_state(&result);
         self.emit_tool_finished(run_id, step, &result, runtime_origin)
             .await?;
@@ -1084,16 +1225,16 @@ impl Agent {
             .await
     }
 
-    /// 向应用 Recorder 发布完整结果，同时向扩展发送可独立脱敏的事件视图。
+    /// 向应用 Recorder 发布完整结果，同时向总线广播可独立脱敏的事件视图。
     ///
-    /// `display_result` 由可信应用用于呈现失败详情；`extension_result` 会广播给所有
-    /// 扩展，包括第三方 Guest，因此不得包含仅面向用户的审批原因。
+    /// `display_result` 由可信应用用于呈现失败详情；`broadcast_result` 会送达所有
+    /// 监听者，包括第三方 Guest，因此不得包含仅面向用户的审批原因。
     async fn emit_tool_finished_with_extension_result(
         &self,
         run_id: &str,
         step: usize,
         display_result: &ToolResult,
-        extension_result: &ToolResult,
+        broadcast_result: &ToolResult,
         runtime_origin: &'static str,
     ) -> Result<()> {
         let event = AgentEvent::new(
@@ -1102,16 +1243,14 @@ impl Agent {
             step,
             tool_finished_payload(display_result, runtime_origin)?,
         );
-        let extension_event = AgentEvent::new(
+        let broadcast_event = AgentEvent::new(
             run_id.to_string(),
             AgentEventKind::ToolFinished,
             step,
-            tool_finished_payload(extension_result, runtime_origin)?,
+            tool_finished_payload(broadcast_result, runtime_origin)?,
         );
         self.events.record(&event).await?;
-        self.extension
-            .on_event_for_run(run_id, &extension_event)
-            .await?;
+        self.broadcast_record(broadcast_event).await;
         self.flush_extension_events(run_id, step).await
     }
 
@@ -1280,14 +1419,15 @@ impl Agent {
         Ok(specs)
     }
 
-    /// 将调用方构造的事件写入 sink，并通知扩展观察该事件。
+    /// 将调用方构造的事件写入 sink，并在总线上广播记录副本。
     ///
-    /// 随后会刷新扩展发布的结构化事件。扩展事件只写入 sink，不再次回调扩展。
+    /// 随后会刷新扩展发布的结构化事件。扩展事件只写入 sink，不再次广播。
+    /// 模型推理增量只写入可信 sink，不进入总线：它属于仅供应用实时展示的敏感中间态。
     ///
     /// # Errors
     ///
-    /// 事件 sink 写入、扩展事件回调或扩展事件排空失败时返回错误。已经完成的前序写入
-    /// 不会回滚。
+    /// 事件 sink 写入或扩展事件排空失败时返回错误；监听者失败只记录日志，不影响运行。
+    /// 已经完成的前序写入不会回滚。
     pub async fn dispatch_event(&self, event: AgentEvent) -> Result<()> {
         let run_id = event.run_id.clone();
         let step = event.step;
@@ -1295,8 +1435,86 @@ impl Agent {
         if event.kind == AgentEventKind::ModelThinkingDelta {
             return Ok(());
         }
-        self.extension.on_event_for_run(&run_id, &event).await?;
+        self.broadcast_record(event).await;
         self.flush_extension_events(&run_id, step).await
+    }
+
+    /// 在总线上广播一条已写入 sink 的事件记录。
+    ///
+    /// 记录已经发生，取消没有意义，因此这里忽略取消状态。无人订阅时不产生任何开销。
+    async fn broadcast_record(&self, record: AgentEvent) {
+        if !self.bus.has_listeners(AgentRecordEvent::NAME) {
+            return;
+        }
+        let dispatched = self.bus.dispatch(AgentRecordEvent { record }).await;
+        log_listener_errors(AgentRecordEvent::NAME, &dispatched.errors);
+    }
+
+    /// 广播一次工具终态。
+    ///
+    /// `result` 必须是脱敏结果：本事件面向包括第三方插件在内的全部监听者，不得携带
+    /// 仅供用户查看的审批原因。
+    async fn broadcast_tool_result(
+        &self,
+        run_id: &str,
+        step: usize,
+        result: &ToolResult,
+        origin: &str,
+    ) {
+        if !self.bus.has_listeners(ToolResultEvent::NAME) {
+            return;
+        }
+        let dispatched = self
+            .bus
+            .dispatch(ToolResultEvent {
+                run_id: run_id.to_string(),
+                step,
+                result: result.clone(),
+                origin: origin.to_string(),
+            })
+            .await;
+        log_listener_errors(ToolResultEvent::NAME, &dispatched.errors);
+    }
+
+    /// 分发一个可取消事件，并记录监听者错误。
+    async fn dispatch_cancellable<E: Event>(&self, event: E) -> Dispatched<E> {
+        let dispatched = self.bus.dispatch(event).await;
+        log_listener_errors(E::NAME, &dispatched.errors);
+        dispatched
+    }
+
+    /// 分发一个只作通告的事件；事实已经发生，取消状态被忽略。
+    async fn notify<E: Event>(&self, event: E) {
+        if !self.bus.has_listeners(E::NAME) {
+            return;
+        }
+        let dispatched = self.bus.dispatch(event).await;
+        log_listener_errors(E::NAME, &dispatched.errors);
+    }
+
+    /// 分发一次消息注入事件，返回最终应写入会话的正文。
+    ///
+    /// 被取消时返回 `None`，该条消息直接丢弃；监听者改写正文时返回改写结果。
+    async fn negotiate_injection(
+        &self,
+        run_id: &str,
+        step: usize,
+        kind: InjectKind,
+        text: String,
+    ) -> Option<String> {
+        let dispatched = self
+            .dispatch_cancellable(MessageInjectEvent::new(run_id, step, kind, text))
+            .await;
+        if dispatched.is_cancelled() {
+            tracing::info!(
+                target: "agent_core::bus",
+                run_id,
+                canceller = dispatched.canceller().unwrap_or_default(),
+                "消息注入被监听者取消"
+            );
+            return None;
+        }
+        Some(dispatched.event.text)
     }
 
     async fn flush_extension_events(&self, run_id: &str, step: usize) -> Result<()> {

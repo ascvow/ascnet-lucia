@@ -86,10 +86,13 @@ fn persistent_plugin_state_dir(lucia_home: &Path) -> PathBuf {
 fn assemble_plugin_agents(
     base_agent: Agent,
     live_plugin_host: Arc<LivePluginHost>,
-) -> (AgentTemplate, Arc<Agent>) {
+) -> Result<(AgentTemplate, Arc<Agent>)> {
+    // 插件在总线上参与决策，因此动态宿主必须挂到主 Agent 的总线上；派生 worker 从
+    // 该总线派生子总线，从而继承同一套插件监听并叠加自己的 allowlist 门禁。
+    live_plugin_host.attach_bus(base_agent.event_bus())?;
     let agent = base_agent.with_extension(live_plugin_host);
     let template = AgentTemplate::from_agent(&agent);
-    (template, Arc::new(agent))
+    Ok((template, Arc::new(agent)))
 }
 
 /// 终端状态守卫：正常退出、`?` 提前返回或 panic 展开时都恢复终端。
@@ -392,7 +395,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let live_plugin_host = Arc::new(LivePluginHost::new());
     #[cfg(feature = "plugins")]
     let (plugin_agent_template, plugin_agent) =
-        assemble_plugin_agents(base_agent, live_plugin_host.clone());
+        assemble_plugin_agents(base_agent, live_plugin_host.clone())?;
     #[cfg(feature = "plugins")]
     let agent = Some(plugin_agent);
     #[cfg(not(feature = "plugins"))]
@@ -509,6 +512,21 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         match rx.recv().await {
             Some(UiEvent::Input(Event::Key(key))) => {
                 if key.kind == KeyEventKind::Press {
+                    // 界面准入：监听者可以在按键进入任何路由之前吞掉它。
+                    if let Some(agent) = agent.as_ref() {
+                        let dispatched = agent
+                            .event_bus()
+                            .dispatch(crate::bus::KeyEvent {
+                                code: crate::bus::plugin_key_code(key.code),
+                                modifiers: crate::bus::plugin_key_modifiers(key.modifiers),
+                                input: app.input.clone(),
+                                running: app.running,
+                            })
+                            .await;
+                        if dispatched.is_cancelled() {
+                            continue;
+                        }
+                    }
                     if is_copy_shortcut(key.code, key.modifiers) && app.copy_text_selection() {
                         continue;
                     }
@@ -865,7 +883,19 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             }
             Some(UiEvent::AgentDone(result)) => {
                 record_run_failure_event(events_jsonl.as_deref(), result.as_ref()).await;
+                let succeeded = result.error.is_none();
+                let cancelled = result.run.as_ref().is_some_and(|run| run.cancelled);
                 let queue_may_advance = app.handle_agent_done(*result);
+                // 会话已持久化、界面状态已更新后再通告，插件据此可安全读取最终会话。
+                if let Some(agent) = agent.as_ref() {
+                    agent
+                        .event_bus()
+                        .dispatch(crate::bus::RunFinishEvent {
+                            succeeded,
+                            cancelled,
+                        })
+                        .await;
+                }
                 #[cfg(feature = "plugins")]
                 if let Some(host) = plugin_host.as_ref() {
                     app.schedule_plugin_views_refresh(Arc::clone(host));
@@ -951,6 +981,22 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     && app.view_stack.is_main();
                 #[cfg(not(feature = "plugins"))]
                 let main_input_focused = !app.native_dialog_active();
+                // 粘贴准入：监听者可以取消粘贴，或改写实际写入主输入区的文本。
+                let pasted = match agent.as_ref() {
+                    Some(agent) => {
+                        let dispatched = agent
+                            .event_bus()
+                            .dispatch(crate::bus::PasteEvent {
+                                text: pasted.clone(),
+                            })
+                            .await;
+                        match dispatched.into_event_unless_cancelled() {
+                            Some(event) => event.text,
+                            None => continue,
+                        }
+                    }
+                    None => pasted,
+                };
                 if main_input_focused {
                     let before_input = app.input.clone();
                     app.handle_paste(&pasted);
@@ -1062,7 +1108,8 @@ mod tests {
             agent_core::model::ModelGateway::new(),
             agent_core::AgentOptions::default(),
         );
-        let (template, _main_agent) = assemble_plugin_agents(base_agent, live_host);
+        let (template, _main_agent) =
+            assemble_plugin_agents(base_agent, live_host.clone()).expect("装配插件 Agent 应成功");
         let (worker, _) = template
             .instantiate(
                 &agent_runtime::AgentPermissions::default(),
@@ -1070,23 +1117,31 @@ mod tests {
             )
             .expect("派生 worker 应成功");
 
-        let decision = worker
-            .extension()
-            .before_tool(&agent_tool::ToolCall::new(
-                "worker-read",
-                "read_file",
-                json!({"path": "README.md"}),
-            ))
-            .await
-            .expect("Host 未就绪时应形成 fail-closed 决策");
+        // 运行快照由 RunStarted 记录事件开启，与真实 Core 的发布顺序一致。
+        worker
+            .event_bus()
+            .dispatch(agent_core::AgentRecordEvent {
+                record: agent_core::AgentEvent::new(
+                    "worker-run",
+                    agent_core::AgentEventKind::RunStarted,
+                    0,
+                    json!({}),
+                ),
+            })
+            .await;
+        let mut call =
+            agent_tool::ToolCall::new("worker-read", "read_file", json!({"path": "README.md"}));
+        call.bind_run_id("worker-run");
+        let dispatched = worker
+            .event_bus()
+            .dispatch(agent_core::ToolCallEvent::new("worker-run", 0, call))
+            .await;
 
-        assert!(matches!(
-            decision,
-            agent_core::ToolDecision::Block {
-                reason,
-                agent_guidance: Some(guidance),
-            } if reason.contains("能力归属仍在解析") && guidance.contains("当前调用未执行")
-        ));
+        assert!(dispatched.is_cancelled(), "Host 未就绪时必须 fail-closed");
+        let reason = dispatched.event.block_reason.expect("应给出可解释阻止原因");
+        let guidance = dispatched.event.agent_guidance.expect("应附带一次性指导");
+        assert!(reason.contains("能力归属仍在解析"));
+        assert!(guidance.contains("当前调用未执行"));
     }
 
     /// 原生工具守卫必须固定为 TUI 启动目录。

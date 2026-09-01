@@ -790,7 +790,7 @@ mod tests {
                 id = "root"
                 name = "Root"
                 version = "1.0.0"
-                api_version = "0.7.0"
+                api_version = "0.8.0"
                 wasm = "root.wasm"
 
                 [[dependencies]]
@@ -881,7 +881,7 @@ mod tests {
             .contains("索引版本"));
 
         let mut wrong_api = manifest.clone();
-        wrong_api.plugin.api_version = "0.8.0".into();
+        wrong_api.plugin.api_version = "0.9.0".into();
         assert!(validate_registry_manifest("root", indexed, &wrong_api)
             .expect_err("api_version 不一致必须拒绝")
             .to_string()

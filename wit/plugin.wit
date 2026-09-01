@@ -1,4 +1,4 @@
-package ascnet:lucia-plugin@0.7.0;
+package ascnet:lucia-plugin@0.8.0;
 
 /// ascnet-lucia 的 WASM 插件 world。
 ///
@@ -79,14 +79,12 @@ world plugin {
   /// 执行工具调用。输入为 ToolCall JSON，输出为 ToolResult JSON。
   export call-tool: func(call-json: string) -> string;
 
-  /// 策略 hook。输入为 ToolCall JSON，输出为 ToolDecision JSON。
-  export before-tool: func(call-json: string) -> string;
-
-  /// 工具完成后的观察 hook。
-  export after-tool: func(result-json: string);
-
-  /// core 生命周期事件 hook。
-  export on-event: func(event-json: string);
+  /// 事件总线分发入口。
+  ///
+  /// 输入为 PluginEventEnvelope JSON，输出为 PluginEventResponse JSON。
+  /// 插件只会收到 manifest `[[events]]` 中声明订阅的事件；空字符串等价于放行且不改写。
+  /// 该入口取代旧 ABI 的 before-tool、after-tool 与无返回值的 on-event 三个专用 hook。
+  export on-event: func(envelope-json: string) -> string;
 
   /// 为一次模型请求返回完整替换上下文的响应信封。
   export load-context: func(request-json: string) -> string;

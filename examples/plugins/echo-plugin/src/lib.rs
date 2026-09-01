@@ -2,9 +2,9 @@
 //! ascnet-lucia 示例 WASM 插件。
 
 use agent_plugin::{
-    export_plugin, AgentEvent, AgentPlugin, Result, ToolCall, ToolDecision, ToolDecisionStatus,
-    ToolPermissionScope, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput,
-    UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    core_events, export_plugin, AgentPlugin, EventOutcome, PluginEvent, PluginHostApi, Result,
+    ToolCall, ToolCallEventData, ToolPermissionScope, ToolResult, ToolSpec, UiColor, UiDeclaration,
+    UiFrame, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
 use serde_json::json;
 
@@ -37,25 +37,6 @@ impl AgentPlugin for EchoPlugin {
         .with_permission_scope(ToolPermissionScope::Control)]
     }
 
-    fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus {
-        // Demonstrate a real policy hook: block empty echo calls.
-        // 演示真实策略 hook：阻止空 echo 调用。
-        if call.name == "echo" {
-            let is_empty = call
-                .args
-                .get("text")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .unwrap_or_default()
-                .is_empty();
-            if is_empty {
-                return ToolDecision::block("echo.text cannot be empty / echo.text 不能为空")
-                    .into();
-            }
-        }
-        ToolDecision::Allow.into()
-    }
-
     fn call_tool(&mut self, call: ToolCall) -> Result<ToolResult> {
         self.calls_seen += 1;
         let text = call
@@ -77,13 +58,34 @@ impl AgentPlugin for EchoPlugin {
         ))
     }
 
-    fn after_tool(&mut self, _result: ToolResult) {
-        // A real hook can update plugin state, metrics, or audit logs.
-        // 真实 hook 可以更新插件状态、指标或审计日志。
-    }
-
-    fn on_event(&mut self, _event: AgentEvent) {
-        self.events_seen += 1;
+    /// 演示事件总线的两类用法：取消工具调用与观察运行记录。
+    ///
+    /// 订阅在 `plugin.toml` 的 `[[events]]` 中声明；未声明的事件不会投递到这里。
+    fn on_event(&mut self, _host: &dyn PluginHostApi, event: &mut PluginEvent) -> EventOutcome {
+        match event.name() {
+            core_events::TOOL_CALL => {
+                // 演示真实的准入策略：取消空 echo 调用。
+                let Ok(data) = event.parse::<ToolCallEventData>() else {
+                    return EventOutcome::ready();
+                };
+                let is_empty = data
+                    .call
+                    .args
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty();
+                if data.call.name == "echo" && is_empty {
+                    event.deny_tool("echo.text cannot be empty / echo.text 不能为空", None);
+                }
+            }
+            core_events::AGENT_RECORD => {
+                self.events_seen += 1;
+            }
+            _ => {}
+        }
+        EventOutcome::ready()
     }
 
     fn describe_ui(&self) -> Vec<UiDeclaration> {

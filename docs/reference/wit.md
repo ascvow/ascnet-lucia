@@ -1,9 +1,9 @@
-# WIT API 0.7
+# WIT API 0.8
 
-Lucia 插件 ABI 的 world 是 `ascnet:lucia-plugin@0.7.0`。WIT 只固定函数名和 `string` 边界，业务结构通过 JSON 传递；这样可选字段可以按 serde 默认值演进，而不必为每个字段变化重写 Component 类型。
+Lucia 插件 ABI 的 world 是 `ascnet:lucia-plugin@0.8.0`。WIT 只固定函数名和 `string` 边界，业务结构通过 JSON 传递；这样可选字段可以按 serde 默认值演进，而不必为每个字段变化重写 Component 类型。
 
 ```txt
-package ascnet:lucia-plugin@0.7.0;
+package ascnet:lucia-plugin@0.8.0;
 
 world plugin {
   // Host imports
@@ -42,7 +42,7 @@ world plugin {
 }
 ```
 
-- `schema_version`：Host 能力响应信封版本，当前为 `1`，与插件 ABI `0.7.0` 独立。
+- `schema_version`：Host 能力响应信封版本，当前为 `1`，与插件 ABI `0.8.0` 独立。
 - `ok = true`：读取 `value`；无返回值的操作使用 JSON `null`。
 - `ok = false`：读取 `error`，不得同时把缺失 `value` 当作成功空值。
 - Guest SDK 的 `decode_host_response<T>` 会把失败信封转为 Rust `Err`，并把 `value` 反序列化为目标类型。
@@ -605,57 +605,61 @@ export list-tools: func() -> string;
 
 映射：`AgentPlugin::call_tool_with_host(host, call)`。
 
-### `before-tool`
-
-输入 ToolCall，输出使用 `type` 判别的 ToolDecision：
-
-```json
-{ "type": "allow" }
-```
-
-```json
-{ "type": "block", "reason": "参数不允许" }
-```
-
-```json
-{
-  "type": "require_approval",
-  "request_id": "approval-1",
-  "reason": "需要执行命令",
-  "poll_interval_ms": 100
-}
-```
-
-其他变体是 `cancel_run` 和带完整 `call` 的 `rewrite`。输入解析失败时 SDK 返回 `block`，不会 panic 或执行未知调用。
-
-映射：`AgentPlugin::before_tool(call)`。
-
-### `after-tool`
-
-```txt
-export after-tool: func(result-json: string);
-```
-
-输入完整 ToolResult，无返回值。SDK 无法解析时忽略本次观察回调；它不会改变 Core 已持有的结果。
-
-映射：`AgentPlugin::after_tool(result)`。
-
 ### `on-event`
 
+```txt
+export on-event: func(envelope-json: string) -> string;
+```
+
+事件总线的唯一分发入口，取代 0.7 的 `before-tool`、`after-tool` 与无返回值的 `on-event`。
+插件只会收到 manifest `[[events]]` 中声明订阅的事件。
+
+输入 `PluginEventEnvelope`：
+
 ```json
 {
-  "id": "event UUID",
-  "run_id": "run UUID",
-  "timestamp_ms": 0,
-  "kind": "tool_finished",
-  "step": 2,
-  "payload": {}
+  "event": "core.tool.call",
+  "cancelled": false,
+  "subscriber": "permission",
+  "data": {
+    "run_id": "run UUID",
+    "step": 2,
+    "call": { "id": "call-1", "name": "shell", "args": {} }
+  }
 }
 ```
 
-`kind` 使用 snake_case，覆盖 run、turn、模型、用量、工具、steering、follow-up 与 step limit 事件。无返回值；SDK 无法解析时忽略该回调。
+- `cancelled` 为事件到达本插件时的取消状态；`canceller` 只在已取消时出现，记录首个取消者。
+- `subscriber` 由 Host 注入的可信插件 ID，也是本插件取消事件时被记录的取消者。
+- `data` 是事件负载的完整快照，形状见 `agent_plugin_protocol` 中对应的 `*EventData`。
 
-映射：`AgentPlugin::on_event(event)`。
+输出 `PluginEventResponse`：
+
+```json
+{ "status": "ready", "cancel": false }
+```
+
+```json
+{
+  "status": "ready",
+  "cancel": true,
+  "patch": { "block_reason": "路径不在允许范围内" }
+}
+```
+
+```json
+{ "status": "pending", "retry_after_ms": 100 }
+```
+
+`pending` 让 Host 稍后重新投递同一事件，供人工审批等需要外部输入的插件使用；Host 对单次
+分发的累计等待设有上限，超时按拒绝处理。空字符串等价于 `{"status":"ready","cancel":false}`。
+
+`patch` 只会被合并进目标事件显式开放的字段，其余键静默忽略——工具调用 ID、运行 ID 与
+权限 scope 不在任何事件的白名单里，因此插件无法把结果关联到其他调用或提升权限。
+
+输入无法解析时 SDK 返回 `cancel`，对安全事件 fail-closed，不会 panic 或放行未知调用。
+
+映射：`AgentPlugin::on_event(host, event)`。
 
 ### `load-context`
 
@@ -816,14 +820,14 @@ Host 会验证工具 owner、覆盖 `plugin_id`，并维护 `tool_name -> render
 | `activate` / `deactivate` | 非空错误字符串 | 非空错误字符串 |
 | `handle-service` | `ok=false` Guest 服务信封 | `ok=false` Guest 服务信封 |
 | `call-tool` | 错误 ToolResult，使用 invalid call/name | 错误 ToolResult，保留原 call ID/name |
-| `before-tool` | `block` 决策 | trait 本身不返回 Result |
+| `on-event` | `cancel` 应答 | 按订阅声明的故障模式处理 |
 | `load-context` | `error` 字段 | `error` 字段 |
 | `render-ui` | 空字符串 | 无帧时空字符串 |
-| `after-tool` / `on-event` / `on-ui-input` | 忽略回调 | 无返回通道 |
+| `on-ui-input` | 忽略回调 | 无返回通道 |
 
 ## 兼容规则
 
-1. Host 当前只加载 manifest `api_version = "0.7.0"`，且要求 world 的全部 exports 存在。
+1. Host 当前只加载 manifest `api_version = "0.8.0"`，且要求 world 的全部 exports 存在。0.7 插件因 `on-event` 签名变化无法加载，必须重新编译。
 2. 修改 WIT import/export、删除或改名函数、改变字符串返回含义时必须升级插件 ABI。
 3. JSON 新字段必须可选并提供 serde 默认值；读取方必须忽略未知加法字段。
 4. 删除、改名、收紧枚举或改变既有字段含义属于破坏性变化，需要升级对应协议。

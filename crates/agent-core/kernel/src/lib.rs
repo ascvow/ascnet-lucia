@@ -12,6 +12,7 @@
 #![deny(missing_docs)]
 
 pub mod agent;
+pub mod bus;
 pub mod config;
 pub mod context;
 pub mod event;
@@ -21,7 +22,16 @@ pub mod session;
 pub mod state;
 
 pub use agent::{Agent, AgentControl, AgentModelConfig, AgentOptions, AgentRun, ModelRequestGate};
-pub use agent_tool::{ToolDecision, ToolErrorKind};
+pub use agent_event::declare_event;
+pub use agent_event::{
+    Cancellation, DispatchOutcome, Dispatched, Event, EventBus, EventContext, EventData,
+    EventListener, ListenerError, ListenerFailure, ListenerPriority, Subscribe, SubscriptionId,
+};
+pub use agent_tool::ToolErrorKind;
+pub use bus::{
+    AgentRecordEvent, InjectKind, MessageInjectEvent, ModelRequestEvent, ModelResponseEvent,
+    RunFinishEvent, RunStartEvent, ToolCallEvent, ToolResultEvent, TurnFinishEvent, TurnStartEvent,
+};
 pub use config::{AgentConfig, AgentRootConfig, ModelConfig};
 pub use context::{
     ContextLoadRequest, ContextLoader, ContextTransform, LoadedContext, PassthroughContextLoader,

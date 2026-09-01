@@ -1,10 +1,11 @@
 //! 为 Agent 提供结构化计划管理和声明式 TUI 状态面板。
 
 use agent_plugin::{
-    export_plugin, ActivationContext, AgentEvent, AgentEventKind, AgentPlugin, PluginHostApi,
-    PromptContribution, Result, ToolCall, ToolPermissionScope, ToolResult, ToolSpec, UiColor,
-    UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest,
-    UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
+    core_events, export_plugin, ActivationContext, AgentPlugin, EventOutcome, PluginEvent,
+    PluginHostApi, PromptContribution, Result, RunFinishEventData, ToolCall, ToolPermissionScope,
+    ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
+    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -188,12 +189,17 @@ impl AgentPlugin for PlanPlugin {
 
     /// 正常运行结束时收敛当前执行项，避免最终回复与计划面板状态不一致。
     ///
-    /// 取消运行时保留原状态，防止把中断任务误标为完成。
-    fn on_event(&mut self, event: AgentEvent) {
-        if event.kind != AgentEventKind::RunFinished
-            || event.payload["cancelled"].as_bool().unwrap_or(false)
-        {
-            return;
+    /// 取消运行时保留原状态，防止把中断任务误标为完成。本插件只订阅
+    /// `core.run.finish`，不参与任何准入决策。
+    fn on_event(&mut self, _host: &dyn PluginHostApi, event: &mut PluginEvent) -> EventOutcome {
+        if event.name() != core_events::RUN_FINISH {
+            return EventOutcome::ready();
+        }
+        let Ok(data) = event.parse::<RunFinishEventData>() else {
+            return EventOutcome::ready();
+        };
+        if data.cancelled {
+            return EventOutcome::ready();
         }
         let mut changed = false;
         for item in &mut self.state.plan {
@@ -205,6 +211,7 @@ impl AgentPlugin for PlanPlugin {
         if changed {
             self.state.revision = self.state.revision.saturating_add(1);
         }
+        EventOutcome::ready()
     }
 
     /// 校验并原子替换计划，或返回当前只读快照。
@@ -532,6 +539,7 @@ export_plugin!(PlanPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_plugin::{NoopHostApi, PluginEventEnvelope};
 
     /// Plan 工具只修改插件内计划状态，必须声明为无需资源审批的控制面 scope。
     #[test]
@@ -703,20 +711,25 @@ mod tests {
     /// 正常完成应收敛执行中步骤，取消运行必须保留原状态。
     #[test]
     fn run_finished_completes_only_successful_active_step() {
-        let event = |cancelled| AgentEvent {
-            id: "event".into(),
-            run_id: "run".into(),
-            timestamp_ms: 1,
-            kind: AgentEventKind::RunFinished,
-            step: 1,
-            payload: json!({"cancelled": cancelled}),
+        let event = |cancelled| {
+            PluginEvent::new(PluginEventEnvelope {
+                event: core_events::RUN_FINISH.into(),
+                cancelled: false,
+                canceller: None,
+                subscriber: "plan".into(),
+                data: json!({
+                    "run_id": "run",
+                    "steps_used": 1,
+                    "cancelled": cancelled,
+                }),
+            })
         };
         let mut plugin = PlanPlugin::default();
         plugin.state.plan = vec![item("汇总评价", PlanStatus::InProgress)];
 
-        plugin.on_event(event(true));
+        plugin.on_event(&NoopHostApi, &mut event(true));
         assert_eq!(plugin.state.plan[0].status, PlanStatus::InProgress);
-        plugin.on_event(event(false));
+        plugin.on_event(&NoopHostApi, &mut event(false));
         assert_eq!(plugin.state.plan[0].status, PlanStatus::Completed);
         assert_eq!(plugin.state.revision, 1);
     }

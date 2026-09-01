@@ -5,6 +5,11 @@ mod run;
 /// 兼容旧模块路径的同步上下文变换类型。
 pub use crate::context::ContextTransform;
 use crate::{
+    bus::{
+        AgentRecordEvent, InjectKind, MessageInjectEvent, ModelRequestEvent, ModelResponseEvent,
+        RunFinishEvent, RunStartEvent, ToolCallEvent, ToolResultEvent, TurnFinishEvent,
+        TurnStartEvent,
+    },
     context::{
         ContextLoadRequest, ContextLoader, PassthroughContextLoader, TransformContextLoader,
     },
@@ -16,8 +21,8 @@ use crate::{
     },
     session::Session,
     state::{AgentPhase, AgentState, AgentToolCallState, AgentToolCallStatus},
-    ToolDecision,
 };
+use agent_event::{Dispatched, Event, EventBus, ListenerError};
 use agent_tool::{
     ExecutionPolicy, ToolCall, ToolOutputDelta, ToolOutputSink, ToolPermissionScope, ToolRegistry,
     ToolResult, ToolSpec,
@@ -374,6 +379,13 @@ pub struct Agent {
     tools: ToolRegistry,
     extension: Arc<dyn AgentExtension>,
     events: Arc<dyn EventSink>,
+
+    /// ReAct 循环各决策点使用的可取消事件总线。
+    ///
+    /// core 只发布 [`crate::bus`] 中定义的事件并遵守取消结果，不知道监听者是宿主策略、
+    /// Runtime 门禁还是 WASM 插件。
+    bus: EventBus,
+
     options: AgentOptions,
     /// 应用在共享 Agent 上动态覆盖的推理强度；`u8::MAX` 表示沿用静态运行选项。
     reasoning_override: std::sync::atomic::AtomicU8,
@@ -408,6 +420,7 @@ impl Agent {
             tools: ToolRegistry::new(),
             extension: Arc::new(NoopAgentExtension),
             events: Arc::new(NoopEventSink),
+            bus: EventBus::new(),
             options,
             reasoning_override: std::sync::atomic::AtomicU8::new(u8::MAX),
             steering: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -618,6 +631,28 @@ impl Agent {
     pub fn with_event_sink(mut self, events: Arc<dyn EventSink>) -> Self {
         self.events = events;
         self
+    }
+
+    /// 挂载调用方持有的事件总线。
+    ///
+    /// 宿主通常在装配阶段创建一条总线并同时交给 core、界面和插件宿主，使三者共享
+    /// 同一张订阅表。未挂载时 Agent 使用自有的空总线，行为等价于没有任何监听者。
+    pub fn with_event_bus(mut self, bus: EventBus) -> Self {
+        self.bus = bus;
+        self
+    }
+
+    /// 替换事件总线。
+    pub fn set_event_bus(&mut self, bus: EventBus) -> &mut Self {
+        self.bus = bus;
+        self
+    }
+
+    /// 返回当前事件总线的共享句柄。
+    ///
+    /// 句柄内部共享同一张订阅表，调用方可用它登记监听者或在插件卸载时注销。
+    pub fn event_bus(&self) -> EventBus {
+        self.bus.clone()
     }
 
     /// 挂载上下文变换钩子。

@@ -1,10 +1,10 @@
 //! ascnet-lucia 插件 TUI 能力展示组件。
 
 use agent_plugin::{
-    export_plugin, AgentEvent, AgentPlugin, PluginHostApi, Result, ToolCall, ToolDecision,
-    ToolDecisionStatus, ToolPermissionScope, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame,
-    UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement,
-    UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
+    core_events, export_plugin, AgentPlugin, AgentRecordEventData, EventOutcome, PluginEvent,
+    PluginHostApi, Result, ToolCall, ToolCallEventData, ToolPermissionScope, ToolResult, ToolSpec,
+    UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
+    UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use serde_json::json;
 
@@ -66,20 +66,6 @@ impl AgentPlugin for UiShowcasePlugin {
         .with_permission_scope(ToolPermissionScope::Control)]
     }
 
-    fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus {
-        if call.name == "ui_showcase_control"
-            && call.args.get("action").and_then(|value| value.as_str()) == Some("set_message")
-            && call
-                .args
-                .get("message")
-                .and_then(|value| value.as_str())
-                .is_none_or(|message| message.trim().is_empty())
-        {
-            return ToolDecision::block("set_message 必须提供非空 message").into();
-        }
-        ToolDecision::Allow.into()
-    }
-
     fn call_tool(&mut self, call: ToolCall) -> Result<ToolResult> {
         let action = call
             .args
@@ -121,13 +107,43 @@ impl AgentPlugin for UiShowcasePlugin {
         ))
     }
 
-    fn after_tool(&mut self, _result: ToolResult) {
-        self.tool_results_seen += 1;
-    }
-
-    fn on_event(&mut self, event: AgentEvent) {
-        self.events_seen += 1;
-        self.last_event = format!("{:?} · step {}", event.kind, event.step);
+    /// 演示同一个入口同时承担准入决策与运行观察。
+    fn on_event(&mut self, _host: &dyn PluginHostApi, event: &mut PluginEvent) -> EventOutcome {
+        match event.name() {
+            core_events::TOOL_CALL => {
+                let Ok(data) = event.parse::<ToolCallEventData>() else {
+                    return EventOutcome::ready();
+                };
+                let empty_message = data
+                    .call
+                    .args
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .is_none_or(|message| message.trim().is_empty());
+                if data.call.name == "ui_showcase_control"
+                    && data
+                        .call
+                        .args
+                        .get("action")
+                        .and_then(|value| value.as_str())
+                        == Some("set_message")
+                    && empty_message
+                {
+                    event.deny_tool("set_message 必须提供非空 message", None);
+                }
+            }
+            core_events::TOOL_RESULT => {
+                self.tool_results_seen += 1;
+            }
+            core_events::AGENT_RECORD => {
+                self.events_seen += 1;
+                if let Ok(data) = event.parse::<AgentRecordEventData>() {
+                    self.last_event = format!("{:?} · step {}", data.record.kind, data.record.step);
+                }
+            }
+            _ => {}
+        }
+        EventOutcome::ready()
     }
 
     fn describe_ui(&self) -> Vec<UiDeclaration> {

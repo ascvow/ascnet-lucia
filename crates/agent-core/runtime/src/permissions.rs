@@ -2,8 +2,9 @@
 
 use crate::{AgentRuntimeError, RuntimeResult};
 use agent_core::{
-    Agent, AgentEvent, AgentExtension, AgentOptions, ContextLoader, EventSink, ModelGateway,
-    ModelMessage, ReasoningLevel, ToolChoice, ToolDecision,
+    Agent, AgentExtension, AgentOptions, ContextLoader, EventBus, EventContext, EventListener,
+    EventSink, ListenerFailure, ListenerPriority, ModelGateway, ModelMessage, ReasoningLevel,
+    Subscribe, ToolCallEvent, ToolChoice,
 };
 use agent_tool::{ToolCall, ToolRegistry, ToolResult, ToolSpec};
 use anyhow::Result as AnyResult;
@@ -191,30 +192,58 @@ mod tests {
 
     /// Runtime allowlist 的拒绝必须携带一次性指导，详细工具名只留给事件消费者。
     #[tokio::test]
-    async fn restricted_extension_denial_uses_one_time_guidance() {
-        let extension = RestrictedExtension {
-            inner: Arc::new(agent_core::NoopAgentExtension),
-            access: ToolAccess::allowlist(["read_file"]),
-        };
+    async fn tool_access_listener_denial_uses_one_time_guidance() {
+        let bus = EventBus::new();
+        bus.subscribe(
+            Subscribe::typed::<ToolCallEvent>(TOOL_ACCESS_SUBSCRIBER)
+                .with_priority(ListenerPriority::Highest)
+                .on_failure(ListenerFailure::CancelEvent),
+            Arc::new(ToolAccessListener {
+                access: ToolAccess::allowlist(["read_file"]),
+            }),
+        );
 
-        let decision = extension
-            .before_tool(&ToolCall::new(
-                "denied-shell",
-                "shell",
-                serde_json::json!({}),
+        let dispatched = bus
+            .dispatch(ToolCallEvent::new(
+                "run-1",
+                0,
+                ToolCall::new("denied-shell", "shell", serde_json::json!({})),
             ))
-            .await
-            .expect("allowlist 拒绝应形成决策");
+            .await;
 
-        assert!(matches!(
-            decision,
-            ToolDecision::Block {
-                reason,
-                agent_guidance: Some(guidance),
-            } if reason.contains("shell")
-                && !guidance.contains("shell")
-                && guidance.contains("权限范围内")
-        ));
+        assert!(dispatched.is_cancelled());
+        assert_eq!(dispatched.canceller(), Some(TOOL_ACCESS_SUBSCRIBER));
+        let reason = dispatched.event.block_reason.expect("拒绝应给出详细原因");
+        let guidance = dispatched
+            .event
+            .agent_guidance
+            .expect("拒绝应附带一次性指导");
+        assert!(reason.contains("shell"));
+        assert!(!guidance.contains("shell"));
+        assert!(guidance.contains("权限范围内"));
+    }
+
+    /// allowlist 内的工具不得被门禁取消。
+    #[tokio::test]
+    async fn tool_access_listener_allows_permitted_tools() {
+        let bus = EventBus::new();
+        bus.subscribe(
+            Subscribe::typed::<ToolCallEvent>(TOOL_ACCESS_SUBSCRIBER)
+                .with_priority(ListenerPriority::Highest),
+            Arc::new(ToolAccessListener {
+                access: ToolAccess::allowlist(["read_file"]),
+            }),
+        );
+
+        let dispatched = bus
+            .dispatch(ToolCallEvent::new(
+                "run-1",
+                0,
+                ToolCall::new("allowed", "read_file", serde_json::json!({})),
+            ))
+            .await;
+
+        assert!(!dispatched.is_cancelled());
     }
 }
 
@@ -240,6 +269,8 @@ pub struct AgentTemplate {
     extension: Arc<dyn AgentExtension>,
     event_sink: Arc<dyn EventSink>,
     context_loader: Arc<dyn ContextLoader>,
+    /// 父 Agent 的事件总线；派生 Agent 在其子总线上运行。
+    bus: EventBus,
     options: AgentOptions,
 }
 
@@ -252,6 +283,7 @@ impl AgentTemplate {
             extension: agent.extension(),
             event_sink: agent.event_sink(),
             context_loader: agent.context_loader(),
+            bus: agent.event_bus(),
             options: agent.options().clone(),
         }
     }
@@ -303,12 +335,63 @@ impl AgentTemplate {
             }),
         };
 
+        // 派生 Agent 使用子总线：父 Agent 的宿主与插件监听照常参与子 Agent 的决策，
+        // 而这里叠加的 allowlist 门禁不会回流影响父 Agent。
+        let bus = self.bus.child();
+        if let ToolAccess::Allowlist(_) = &permissions.tools {
+            bus.subscribe(
+                Subscribe::typed::<ToolCallEvent>(TOOL_ACCESS_SUBSCRIBER)
+                    // Highest 保证门禁看到全部改写生效后的最终调用，无需自行复核重写结果。
+                    .with_priority(ListenerPriority::Highest)
+                    .on_failure(ListenerFailure::CancelEvent),
+                Arc::new(ToolAccessListener {
+                    access: permissions.tools.clone(),
+                }),
+            );
+        }
+
         let agent = Agent::new(self.gateway.clone(), options)
             .with_tools(tools)
             .with_extension(extension)
             .with_event_sink(self.event_sink.clone())
+            .with_event_bus(bus)
             .with_context_loader(self.context_loader.clone());
         Ok((agent, permissions))
+    }
+}
+
+/// 派生 Agent 工具 allowlist 门禁在总线上的订阅者身份。
+const TOOL_ACCESS_SUBSCRIBER: &str = "agent-runtime.tool-access";
+
+/// 派生 Agent 的工具 allowlist 门禁。
+///
+/// 以 `Highest` 优先级订阅 `core.tool.call`，因此观察到的是所有监听者改写生效后的
+/// 最终调用；插件既不能借重写换成 allowlist 之外的工具，也不能在门禁之后再改名。
+/// 订阅声明为 fail-closed，门禁自身故障等同拒绝。
+struct ToolAccessListener {
+    access: ToolAccess,
+}
+
+#[async_trait]
+impl EventListener for ToolAccessListener {
+    async fn handle(&self, ctx: &mut EventContext<'_>) -> AnyResult<()> {
+        let Some(event) = ctx.event_mut::<ToolCallEvent>() else {
+            return Ok(());
+        };
+        if self.access.permits(&event.call.name) {
+            return Ok(());
+        }
+        // 详细工具名只留给可信事件消费者；注入模型的一次性指导不暴露被拒工具。
+        event.block_reason = Some(format!(
+            "工具不在当前 Agent 的 allowlist 中：{}",
+            event.call.name
+        ));
+        event.agent_guidance = Some(
+            "当前 Agent 无权使用该工具，调用未执行；不要重复相同调用，请改用权限范围内的工具继续。"
+                .to_string(),
+        );
+        ctx.cancel();
+        Ok(())
     }
 }
 
@@ -366,60 +449,6 @@ impl AgentExtension for RestrictedExtension {
         } else {
             Ok(None)
         }
-    }
-
-    async fn before_tool(&self, call: &ToolCall) -> AnyResult<ToolDecision> {
-        if !self.access.permits(&call.name) {
-            return Ok(ToolDecision::block_with_guidance(
-                format!("工具不在当前 Agent 的 allowlist 中：{}", call.name),
-                "当前 Agent 无权使用该工具，调用未执行；不要重复相同调用，请改用权限范围内的工具继续。",
-            ));
-        }
-
-        match self.inner.before_tool(call).await? {
-            ToolDecision::Rewrite { call } if !self.access.permits(&call.name) => {
-                Ok(ToolDecision::block_with_guidance(
-                    format!("重写后的工具不在当前 Agent 的 allowlist 中：{}", call.name),
-                    "工具重写后的目标超出当前 Agent 权限，调用未执行；请改用权限范围内的工具继续。",
-                ))
-            }
-            decision => Ok(decision),
-        }
-    }
-
-    async fn before_tool_for_run(&self, run_id: &str, call: &ToolCall) -> AnyResult<ToolDecision> {
-        if !self.access.permits(&call.name) {
-            return Ok(ToolDecision::block_with_guidance(
-                format!("工具不在当前 Agent 的 allowlist 中：{}", call.name),
-                "当前 Agent 无权使用该工具，调用未执行；不要重复相同调用，请改用权限范围内的工具继续。",
-            ));
-        }
-
-        match self.inner.before_tool_for_run(run_id, call).await? {
-            ToolDecision::Rewrite { call } if !self.access.permits(&call.name) => {
-                Ok(ToolDecision::block_with_guidance(
-                    format!("重写后的工具不在当前 Agent 的 allowlist 中：{}", call.name),
-                    "工具重写后的目标超出当前 Agent 权限，调用未执行；请改用权限范围内的工具继续。",
-                ))
-            }
-            decision => Ok(decision),
-        }
-    }
-
-    async fn after_tool(&self, result: &ToolResult) -> AnyResult<()> {
-        self.inner.after_tool(result).await
-    }
-
-    async fn after_tool_for_run(&self, run_id: &str, result: &ToolResult) -> AnyResult<()> {
-        self.inner.after_tool_for_run(run_id, result).await
-    }
-
-    async fn on_event(&self, event: &AgentEvent) -> AnyResult<()> {
-        self.inner.on_event(event).await
-    }
-
-    async fn on_event_for_run(&self, run_id: &str, event: &AgentEvent) -> AnyResult<()> {
-        self.inner.on_event_for_run(run_id, event).await
     }
 
     async fn drain_events(&self) -> AnyResult<Vec<Value>> {

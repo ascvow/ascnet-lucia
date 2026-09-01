@@ -2,9 +2,17 @@
 id = "echo"
 name = "Echo Plugin"
 version = "0.1.0"
-api_version = "0.7.0"
+api_version = "0.8.0"
 wasm = "target/wasm32-wasip2/release/echo_plugin.wasm"
 description = "Example ascnet-lucia WASM plugin that provides an echo tool."
+
+# 订阅事件总线：拦截工具调用并观察运行记录。未在此声明的事件不会投递给插件。
+[[events]]
+name = "core.tool.call"
+
+[[events]]
+name = "core.agent.event"
+priority = "monitor"
 
 [capabilities]
 # 该插件为纯计算插件，不申请 HTTP、文件系统、进程或 secret 能力。

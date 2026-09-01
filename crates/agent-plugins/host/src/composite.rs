@@ -9,12 +9,10 @@ use crate::ui::{
     UiFrame, UiInput, UiRenderRequest,
 };
 use agent_core::model::ModelMessage;
-use agent_core::AgentEvent;
 use agent_core::AgentExtension;
 use agent_core::ContextLoadRequest;
 use agent_core::ContextLoader;
 use agent_core::LoadedContext;
-use agent_core::ToolDecision;
 use agent_tool::ToolSpec;
 use agent_tool::{ToolCall, ToolPermissionScope};
 use agent_tool::{ToolErrorKind, ToolResult};
@@ -182,7 +180,10 @@ impl CompositePluginHost {
     }
 
     /// 以最近一次可信 ToolSpec 快照覆盖调用 scope；改名到未知或原生工具时保守使用 unknown。
-    fn bind_tool_permission_scope(
+    ///
+    /// 每个插件改写工具调用后都必须重新绑定：后续插件与最终的可信门禁看到的
+    /// 必须是改写目标本身的 scope，而不是被改写前那个工具的 scope。
+    pub(crate) fn bind_tool_permission_scope(
         &self,
         previous: Option<&ToolCall>,
         mut call: ToolCall,
@@ -338,166 +339,6 @@ impl AgentExtension for CompositePluginHost {
             Some(host) => host.call_tool_for_run(run_id, call).await,
             None => Ok(None),
         }
-    }
-
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        let mut current = self.bind_tool_permission_scope(None, call.clone())?;
-        let policy_owner = self
-            .capability_owner(manifest::TOOL_POLICY_CAPABILITY)
-            .map(str::to_string);
-        for host in &self.hosts {
-            if host
-                .id()
-                .is_some_and(|id| Some(id) == policy_owner.as_deref())
-            {
-                continue;
-            }
-            match host.before_tool(&current).await? {
-                ToolDecision::Allow => {}
-                ToolDecision::Block {
-                    reason,
-                    agent_guidance,
-                } => {
-                    return Ok(ToolDecision::Block {
-                        reason,
-                        agent_guidance,
-                    })
-                }
-                ToolDecision::CancelRun { reason } => {
-                    return Ok(ToolDecision::CancelRun { reason });
-                }
-                ToolDecision::Rewrite { call } => {
-                    current = self.bind_tool_permission_scope(Some(&current), call)?;
-                }
-            }
-        }
-
-        if let Some(owner) = policy_owner {
-            let Some(policy) = self.get(&owner) else {
-                return Ok(ToolDecision::block_with_guidance(
-                    format!("工具策略插件 `{owner}` 仍在加载，本轮暂不执行工具"),
-                    "工具策略插件尚未就绪，当前调用未执行；请先继续处理无需该工具的部分，必要时稍后再尝试。",
-                ));
-            };
-            match policy.before_tool(&current).await? {
-                ToolDecision::Allow => {}
-                ToolDecision::Block {
-                    reason,
-                    agent_guidance,
-                } => {
-                    return Ok(ToolDecision::Block {
-                        reason,
-                        agent_guidance,
-                    })
-                }
-                ToolDecision::CancelRun { reason } => {
-                    return Ok(ToolDecision::CancelRun { reason });
-                }
-                ToolDecision::Rewrite { call } => {
-                    current = self.bind_tool_permission_scope(Some(&current), call)?;
-                }
-            }
-        }
-
-        if &current == call {
-            Ok(ToolDecision::Allow)
-        } else {
-            Ok(ToolDecision::Rewrite { call: current })
-        }
-    }
-
-    async fn before_tool_for_run(&self, run_id: &str, call: &ToolCall) -> Result<ToolDecision> {
-        let mut current = self.bind_tool_permission_scope(None, call.clone())?;
-        let policy_owner = self
-            .capability_owner(manifest::TOOL_POLICY_CAPABILITY)
-            .map(str::to_string);
-        for host in &self.hosts {
-            if host
-                .id()
-                .is_some_and(|id| Some(id) == policy_owner.as_deref())
-            {
-                continue;
-            }
-            match host.before_tool_for_run(run_id, &current).await? {
-                ToolDecision::Allow => {}
-                ToolDecision::Block {
-                    reason,
-                    agent_guidance,
-                } => {
-                    return Ok(ToolDecision::Block {
-                        reason,
-                        agent_guidance,
-                    })
-                }
-                ToolDecision::CancelRun { reason } => {
-                    return Ok(ToolDecision::CancelRun { reason });
-                }
-                ToolDecision::Rewrite { call } => {
-                    current = self.bind_tool_permission_scope(Some(&current), call)?;
-                }
-            }
-        }
-
-        if let Some(owner) = policy_owner {
-            let Some(policy) = self.get(&owner) else {
-                return Ok(ToolDecision::block_with_guidance(
-                    format!("工具策略插件 `{owner}` 仍在加载，本轮暂不执行工具"),
-                    "工具策略插件尚未就绪，当前调用未执行；请先继续处理无需该工具的部分，必要时稍后再尝试。",
-                ));
-            };
-            match policy.before_tool_for_run(run_id, &current).await? {
-                ToolDecision::Allow => {}
-                ToolDecision::Block {
-                    reason,
-                    agent_guidance,
-                } => {
-                    return Ok(ToolDecision::Block {
-                        reason,
-                        agent_guidance,
-                    })
-                }
-                ToolDecision::CancelRun { reason } => {
-                    return Ok(ToolDecision::CancelRun { reason });
-                }
-                ToolDecision::Rewrite { call } => {
-                    current = self.bind_tool_permission_scope(Some(&current), call)?;
-                }
-            }
-        }
-
-        if &current == call {
-            Ok(ToolDecision::Allow)
-        } else {
-            Ok(ToolDecision::Rewrite { call: current })
-        }
-    }
-
-    async fn after_tool(&self, result: &ToolResult) -> Result<()> {
-        for host in &self.hosts {
-            host.after_tool(result).await?;
-        }
-        Ok(())
-    }
-
-    async fn after_tool_for_run(&self, run_id: &str, result: &ToolResult) -> Result<()> {
-        for host in &self.hosts {
-            host.after_tool_for_run(run_id, result).await?;
-        }
-        Ok(())
-    }
-
-    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
-        for host in &self.hosts {
-            host.on_event(event).await?;
-        }
-        Ok(())
-    }
-
-    async fn on_event_for_run(&self, run_id: &str, event: &AgentEvent) -> Result<()> {
-        for host in &self.hosts {
-            host.on_event_for_run(run_id, event).await?;
-        }
-        Ok(())
     }
 
     async fn drain_events(&self) -> Result<Vec<serde_json::Value>> {

@@ -4,6 +4,7 @@
 //! `app`、`session`、`command`、`plugin` 与 `ui` 模块中。
 
 mod app;
+mod bus;
 mod cli;
 mod command;
 mod config;

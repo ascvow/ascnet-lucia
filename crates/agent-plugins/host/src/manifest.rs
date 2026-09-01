@@ -1,6 +1,7 @@
 //! 插件 manifest 支持。
 
 use crate::ui::UiHostActionKind;
+use agent_event::ListenerPriority;
 use agent_tool::{ToolPermissionScope, ToolSpec};
 use anyhow::{anyhow, Context, Result};
 use semver::{Version, VersionReq};
@@ -12,7 +13,7 @@ use std::{
 };
 
 /// 当前支持的插件 ABI 版本。
-pub const SUPPORTED_PLUGIN_API_VERSION: &str = "0.7.0";
+pub const SUPPORTED_PLUGIN_API_VERSION: &str = "0.8.0";
 
 /// 上下文加载器使用的标准能力 ID。
 pub const CONTEXT_LOADER_CAPABILITY: &str = "agent.context-loader";
@@ -142,6 +143,7 @@ manifest = "/opt/lucia/plugin.toml"
             },
             dependencies,
             provides: Vec::new(),
+            events: Vec::new(),
             capabilities: CapabilitySection::default(),
             metadata: HashMap::new(),
         }
@@ -303,7 +305,7 @@ manifest = "/opt/lucia/plugin.toml"
                 id = "workflow"
                 name = "Workflow"
                 version = "1.0.0"
-                api_version = "0.7.0"
+                api_version = "0.8.0"
                 wasm = "workflow.wasm"
 
                 [capabilities.agent]
@@ -398,7 +400,7 @@ manifest = "/opt/lucia/plugin.toml"
         let error = manifest
             .validate()
             .expect_err("旧 ABI manifest 必须在 component 加载前失败");
-        assert!(error.to_string().contains("仅支持当前版本 `0.7.0`"));
+        assert!(error.to_string().contains("仅支持当前版本 `0.8.0`"));
     }
 
     /// Spawn 权限必须同时声明至少一个可请求的 profile。
@@ -446,6 +448,44 @@ manifest = "/opt/lucia/plugin.toml"
     }
 }
 
+/// 插件对一个事件的订阅声明。
+///
+/// 订阅是**投递权限边界**：未声明的事件不会送达插件，因此插件既看不到无关事件，
+/// 也无法对其表态。宿主据此在装配阶段就能审计出每个插件能观察和否决哪些决策点。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventSubscription {
+    /// 订阅的事件名，例如 `core.tool.call`。
+    pub name: String,
+
+    /// 执行优先级；缺省为 `normal`。
+    ///
+    /// `monitor` 表示只观察最终结果，其改写与取消都不会生效。
+    #[serde(default)]
+    pub priority: ListenerPriority,
+
+    /// 事件已被更早的监听者取消时是否跳过本插件；缺省为 `false`。
+    #[serde(default)]
+    pub ignore_cancelled: bool,
+}
+
+impl EventSubscription {
+    /// 校验单条订阅声明。
+    ///
+    /// # Errors
+    ///
+    /// 事件名为空或含空白字符时返回错误。
+    pub fn validate(&self) -> Result<()> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("events.name 不能为空"));
+        }
+        if name != self.name || name.chars().any(char::is_whitespace) {
+            return Err(anyhow!("events.name 不能包含空白字符：`{}`", self.name));
+        }
+        Ok(())
+    }
+}
+
 /// plugin.toml 的结构。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -459,6 +499,10 @@ pub struct PluginManifest {
     /// 插件向宿主声明的通用能力。
     #[serde(default)]
     pub provides: Vec<ProvidedCapability>,
+
+    /// 插件订阅的事件总线事件；未声明的事件不会投递给该插件。
+    #[serde(default)]
+    pub events: Vec<EventSubscription>,
 
     /// 插件请求的能力开关。
     #[serde(default)]
@@ -519,6 +563,15 @@ impl PluginManifest {
             provided.validate()?;
             if !provided_ids.insert(&provided.id) {
                 return Err(anyhow!("插件能力声明重复：`{}`", provided.id));
+            }
+        }
+        let mut subscribed_events = HashSet::new();
+        for subscription in &self.events {
+            subscription.validate()?;
+            // 同一事件重复订阅会让 Guest 在一次分发里被调用多次却无法区分，
+            // 属于配置错误而不是可用语义，直接在加载前拒绝。
+            if !subscribed_events.insert(&subscription.name) {
+                return Err(anyhow!("插件事件订阅重复：`{}`", subscription.name));
             }
         }
         self.capabilities.validate_supported()?;

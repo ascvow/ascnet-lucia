@@ -828,7 +828,7 @@ mod tests {
                 id = "consumer"
                 name = "Consumer"
                 version = "1.0.0"
-                api_version = "0.7.0"
+                api_version = "0.8.0"
                 wasm = "consumer.wasm"
 
                 [capabilities]
@@ -863,7 +863,7 @@ mod tests {
                 id = "consumer"
                 name = "Consumer"
                 version = "1.0.0"
-                api_version = "0.7.0"
+                api_version = "0.8.0"
                 wasm = "consumer.wasm"
 
                 [[dependencies]]
@@ -900,7 +900,7 @@ mod tests {
                 id = "minimal"
                 name = "Minimal"
                 version = "1.0.0"
-                api_version = "0.7.0"
+                api_version = "0.8.0"
                 wasm = "minimal.wasm"
             "#,
         );
@@ -957,7 +957,7 @@ mod tests {
                 id = "provider-b"
                 name = "Provider B"
                 version = "1.0.0"
-                api_version = "0.7.0"
+                api_version = "0.8.0"
                 wasm = "provider-b.wasm"
 
                 [[provides]]
@@ -972,7 +972,7 @@ mod tests {
                 id = "provider-a"
                 name = "Provider A"
                 version = "1.0.0"
-                api_version = "0.7.0"
+                api_version = "0.8.0"
                 wasm = "provider-a.wasm"
 
                 [[provides]]

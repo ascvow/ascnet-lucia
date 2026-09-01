@@ -15,9 +15,7 @@
 | `list_tools()` | 无 | `Vec<ToolSpec>` | 只返回静态工具，不应做 I/O |
 | `call_tool(call)` | `ToolCall` | `Result<ToolResult>` | 只适合不需要 Host 能力的工具 |
 | `call_tool_with_host(host, call)` | Host API 与 ToolCall | `Result<ToolResult>` | 默认转发到 `call_tool`；文件、进程、服务或 Runtime 工具覆盖此方法 |
-| `before_tool(call)` | 任意候选工具调用 | `ToolDecisionStatus` | 返回最终决策，或请求 Host 稍后重新调用 |
-| `after_tool(result)` | 最终工具结果 | `()` | 只观察，不能修改已返回结果 |
-| `on_event(event)` | Core 生命周期事件 | `()` | 适合指标或状态，不应假设 payload 固定 |
+| `on_event(host, event)` | 已订阅事件的可取消上下文 | `EventOutcome` | 参与总线分发：取消、改写或请求稍后重投 |
 | `load_context(host, request)` | 本轮完整源上下文 | `Result<Option<LoadedContext>>` | `None` 透传；`Some` 完整替换；错误阻止模型请求 |
 | `handle_service(host, call)` | Host 注入 caller 的服务调用 | `Result<Value>` | 仅处理已注册服务；payload 由服务版本定义 |
 | `describe_ui()` | 无 | `Vec<UiDeclaration>` | 声明视图，不绘制内容 |
@@ -30,16 +28,32 @@
 
 `ToolCall` 的 `id` 必须原样带回 `ToolResult.call_id`；`run_id` 由 Core 按当前 Agent 运行绑定，有状态策略应使用 `(run_id, id)` 隔离并发审批；`name` 是 Host 路由后的公开名；`args` 是未强类型校验的 JSON。`permission_scope` 由 Core 和组合 Host 从最近一次可信 `ToolSpec` 快照绑定，策略插件不得按工具名复制权限白名单。使用 `call.args_as::<Args>()` 解析，不要用字符串切割参数。
 
-`ToolDecisionStatus::Ready` 中的 `ToolDecision`：
+### 事件总线类型
 
-| 变体 | 字段 | Core 行为 |
-| --- | --- | --- |
-| `Allow` | 无 | 原样执行 |
-| `Block` | `reason`、可选 `agent_guidance` | 详细原因只进入可信事件/UI；模型、Session 和扩展观察钩子只接收稳定拒绝文案，指导仅替换下一次请求且不写入 Session |
-| `CancelRun` | `reason` | 优雅取消当前运行并保留 Session |
-| `Rewrite` | 完整 `call` | 对最终调用重新执行策略检查后路由 |
+`PluginEvent` 是插件在一次分发中看到的可取消上下文：
 
-`ToolDecisionStatus::Pending { retry_after_ms }` 只表示 Guest 尚未形成最终决策。Host 只负责等待并重新调用，不理解审批 ID、选项、UI 或持久化规则；这些协议由权限插件等具体插件自行定义。重写必须返回完整 ToolCall，不能只返回差量 args；组合 Host 会恢复可信 `run_id`，对同名重写恢复已注册 scope，改名到未知目标时降级为 `Unknown`，Core 随后按最终目标再次绑定。
+| 方法 | 作用 |
+| --- | --- |
+| `name()` | 事件名，例如 `core.tool.call` |
+| `is_cancelled()` / `canceller()` | 到达本插件时的取消状态与首个取消者 |
+| `subscriber()` | 本插件的可信订阅身份，也是它取消事件时被记录的取消者 |
+| `parse::<T>()` | 按 `*EventData` 解析负载 |
+| `set(field, value)` | 提交一个字段改写；Host 只采纳白名单字段 |
+| `cancel()` | 取消事件 |
+| `deny_tool(reason, guidance)` | 拒绝工具调用的快捷写法 |
+| `rewrite_tool(name, args)` | 改写工具名与参数的快捷写法 |
+
+对 `core.tool.call`，取消即拒绝执行：`block_reason` 只进入可信事件与界面；模型、Session
+和其他监听者只接收稳定拒绝文案；`agent_guidance` 仅替换下一次模型请求且不写入 Session；
+另外置 `cancel_run` 可在拒绝的同时优雅取消整次运行并保留 Session。
+
+`EventOutcome::pending(ms)` 只表示 Guest 尚未形成结论。Host 只负责等待并重新投递，不理解
+审批 ID、选项、UI 或持久化规则；这些协议由权限插件等具体插件自行定义。Host 对单次分发的
+累计等待设有上限，超时按 Guest 失约处理。
+
+改写只能通过补丁提交：调用 ID、运行 ID 与权限 scope 不在任何事件的白名单里；改名后
+组合 Host 会按已注册 `ToolSpec` 重新绑定 scope，改名到未知目标时降级为 `Unknown`，
+Core 随后按最终目标再次绑定。
 
 ### 上下文类型
 

@@ -181,9 +181,12 @@ pub trait ContextLoader: Send + Sync {
 | `prompt_messages()` | 无 | 本轮 developer/system 贡献消息 |
 | `list_tools()` | 无 | 扩展工具快照 |
 | `call_tool(call)` | `ToolCall` | 扩展拥有工具的结果 |
-| `before_tool(call)` | 候选调用 | `Allow`、`Block`、`Rewrite` 或 `CancelRun` 最终决策 |
-| `after_tool(result)` | 最终工具结果 | 只观察，不修改结果 |
-| `on_event(event)` | Core 生命周期事件 | 观察或积累扩展状态 |
+| `core.tool.call` 事件 | 候选调用 | 不取消即放行；取消即拒绝，`canceller` 记录拒绝者 |
+| `core.tool.result` 事件 | 脱敏后的最终工具结果 | 只观察，不修改结果 |
+| `core.agent.event` 事件 | Core 记录流的广播副本 | 观察或积累监听者状态 |
+
+决策类能力由 [`agent_core::bus`] 上的可取消事件承担；`AgentExtension` 只保留贡献类能力
+（提示、工具定义、工具实现、结构化事件载荷）。
 | `drain_events()` | 无 | 返回扩展待发布事件，Core 包装为 Extension 事件 |
 
 ## agent-tool

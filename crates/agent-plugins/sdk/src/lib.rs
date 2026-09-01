@@ -6,8 +6,7 @@
 #![deny(missing_docs)]
 
 pub use agent_tool::{
-    is_sensitive_path, JsonSchema, ToolCall, ToolDecision, ToolDecisionStatus, ToolPermissionScope,
-    ToolResult, ToolSpec,
+    is_sensitive_path, JsonSchema, ToolCall, ToolPermissionScope, ToolResult, ToolSpec,
 };
 pub use anyhow::{anyhow, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -24,7 +23,7 @@ pub use serde_json as __serde_json;
 /// WIT contract used by both host and guest.
 /// 宿主和 guest 共用的 WIT 契约。
 pub const PLUGIN_WIT: &str = r#"
-package ascnet:lucia-plugin@0.7.0;
+package ascnet:lucia-plugin@0.8.0;
 
 world plugin {
   import host-agent-upsert-tool: func(request-json: string) -> string;
@@ -52,9 +51,7 @@ world plugin {
   export handle-service: func(call-json: string) -> string;
   export list-tools: func() -> string;
   export call-tool: func(call-json: string) -> string;
-  export before-tool: func(call-json: string) -> string;
-  export after-tool: func(result-json: string);
-  export on-event: func(event-json: string);
+  export on-event: func(envelope-json: string) -> string;
   export load-context: func(request-json: string) -> string;
   export describe-ui: func() -> string;
   export render-ui: func(request-json: string) -> string;
@@ -748,33 +745,17 @@ pub trait AgentPlugin: Default + Send + 'static {
         Err(anyhow!("未实现插件服务 `{}`", call.name))
     }
 
-    /// Hook before any tool is executed.
-    /// 任意工具执行前 hook。
+    /// 处理一次事件总线分发。
     ///
-    /// 返回 `Pending` 时 Host 会稍后重新调用；等待原因、交互和持久化协议由插件自行维护。
-    fn before_tool(&mut self, _call: ToolCall) -> ToolDecisionStatus {
-        ToolDecision::Allow.into()
-    }
-
-    /// 使用宿主能力执行工具前检查。
+    /// 插件只会收到 manifest `[[events]]` 中声明订阅的事件；未声明即收不到，也无法对其
+    /// 表态。通过 [`PluginEvent::cancel`] 取消事件，通过 [`PluginEvent::set`] 提交改写；
+    /// 宿主只采纳目标事件白名单内的字段，调用 ID、运行 ID 与权限 scope 无法被改写。
     ///
-    /// 默认调用兼容旧插件的 [`AgentPlugin::before_tool`]；需要模型代审或其他宿主能力的
-    /// 策略插件覆盖此方法。返回 `Pending` 时 Host 会按状态中的间隔重新调用。
-    fn before_tool_with_host(
-        &mut self,
-        _host: &dyn PluginHostApi,
-        call: ToolCall,
-    ) -> ToolDecisionStatus {
-        self.before_tool(call)
+    /// 返回 [`EventOutcome::pending`] 可以让宿主稍后重新投递同一事件，用于人工审批等
+    /// 需要等待外部输入的场景；宿主对累计等待时长设有上限，超时按拒绝处理。
+    fn on_event(&mut self, _host: &dyn PluginHostApi, _event: &mut PluginEvent) -> EventOutcome {
+        EventOutcome::ready()
     }
-
-    /// Hook after any tool is executed.
-    /// 任意工具执行后 hook。
-    fn after_tool(&mut self, _result: ToolResult) {}
-
-    /// Receive core lifecycle events.
-    /// 接收 core 生命周期事件。
-    fn on_event(&mut self, _event: AgentEvent) {}
 
     /// 为一次模型请求返回完整替换上下文；默认不参与上下文加载。
     ///
@@ -902,7 +883,7 @@ macro_rules! export_plugin {
             wit_bindgen::generate!({
                 path: [],
                 inline: r#"
-package ascnet:lucia-plugin@0.7.0;
+package ascnet:lucia-plugin@0.8.0;
 
 world plugin {
   import host-agent-upsert-tool: func(request-json: string) -> string;
@@ -930,9 +911,7 @@ world plugin {
   export handle-service: func(call-json: string) -> string;
   export list-tools: func() -> string;
   export call-tool: func(call-json: string) -> string;
-  export before-tool: func(call-json: string) -> string;
-  export after-tool: func(result-json: string);
-  export on-event: func(event-json: string);
+  export on-event: func(envelope-json: string) -> string;
   export load-context: func(request-json: string) -> string;
   export describe-ui: func() -> string;
   export render-ui: func(request-json: string) -> string;
@@ -1309,33 +1288,22 @@ world plugin {
                     }
                 }
 
-                fn before_tool(call_json: String) -> String {
-                    let call: $crate::ToolCall = match $crate::from_json_string(&call_json) {
-                        Ok(call) => call,
-                        Err(err) => {
-                            let decision: $crate::ToolDecisionStatus =
-                                $crate::ToolDecision::block(err.to_string()).into();
-                            return $crate::to_json_string(&decision);
-                        }
-                    };
-                    with_plugin(|plugin| {
-                        $crate::to_json_string(
-                            &plugin.before_tool_with_host(&ComponentHostApi, call),
-                        )
-                    })
-                }
-
-                fn after_tool(result_json: String) {
-                    if let Ok(result) = $crate::from_json_string::<$crate::ToolResult>(&result_json)
-                    {
-                        with_plugin(|plugin| plugin.after_tool(result));
-                    }
-                }
-
-                fn on_event(event_json: String) {
-                    if let Ok(event) = $crate::from_json_string::<$crate::AgentEvent>(&event_json) {
-                        with_plugin(|plugin| plugin.on_event(event));
-                    }
+                fn on_event(envelope_json: String) -> String {
+                    let envelope: $crate::PluginEventEnvelope =
+                        match $crate::from_json_string(&envelope_json) {
+                            Ok(envelope) => envelope,
+                            // 信封无法解析说明 Host/Guest 协议不一致；对安全事件
+                            // fail-closed 取消，对通告事件取消不产生副作用。
+                            Err(_) => {
+                                return $crate::to_json_string(
+                                    &$crate::PluginEventResponse::cancel(),
+                                )
+                            }
+                        };
+                    let mut event = $crate::PluginEvent::new(envelope);
+                    let outcome =
+                        with_plugin(|plugin| plugin.on_event(&ComponentHostApi, &mut event));
+                    $crate::to_json_string(&event.into_response(outcome))
                 }
 
                 fn load_context(request_json: String) -> String {
@@ -1454,5 +1422,249 @@ mod tests {
         assert_eq!(encoded["variant"], "text");
         assert_eq!(encoded["tone"], "muted");
         assert_eq!(encoded["text"], "Permission: review");
+    }
+}
+
+/// 插件在一次事件分发中看到的可取消上下文。
+///
+/// 插件拿到的是事件的 JSON 快照。取消与改写都先记录在本地，分发结束后一次性交给宿主，
+/// 由宿主按目标事件的白名单合并——因此 `set` 写入白名单之外的字段不会生效，也不会报错。
+pub struct PluginEvent {
+    envelope: PluginEventEnvelope,
+    patch: serde_json::Map<String, serde_json::Value>,
+    cancel: bool,
+}
+
+impl PluginEvent {
+    /// 由宿主信封构造事件上下文；由 `export_plugin!` 调用。
+    pub fn new(envelope: PluginEventEnvelope) -> Self {
+        Self {
+            envelope,
+            patch: serde_json::Map::new(),
+            cancel: false,
+        }
+    }
+
+    /// 事件名，例如 `core.tool.call`。
+    pub fn name(&self) -> &str {
+        &self.envelope.event
+    }
+
+    /// 事件在投递给本插件时是否已被更早的监听者取消。
+    pub fn is_cancelled(&self) -> bool {
+        self.envelope.cancelled || self.cancel
+    }
+
+    /// 首个取消者身份；未取消时为 `None`。
+    ///
+    /// 取消归属由首次取消决定，本插件之后再取消也不会改变它。
+    pub fn canceller(&self) -> Option<&str> {
+        self.envelope.canceller.as_deref()
+    }
+
+    /// 本插件在总线上的订阅身份，也是它取消事件时被记录的取消者。
+    pub fn subscriber(&self) -> &str {
+        &self.envelope.subscriber
+    }
+
+    /// 事件负载的原始 JSON 快照。
+    pub fn data(&self) -> &serde_json::Value {
+        &self.envelope.data
+    }
+
+    /// 按具体类型解析事件负载。
+    ///
+    /// # Errors
+    ///
+    /// 负载形状与目标类型不匹配时返回错误。
+    pub fn parse<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_value(self.envelope.data.clone())
+            .map_err(|error| anyhow!("解析事件 `{}` 负载失败：{error}", self.envelope.event))
+    }
+
+    /// 提交一个字段改写；宿主只采纳目标事件白名单内的字段。
+    pub fn set(&mut self, field: impl Into<String>, value: serde_json::Value) -> &mut Self {
+        self.patch.insert(field.into(), value);
+        self
+    }
+
+    /// 取消事件。
+    ///
+    /// 对 `core.tool.call` 表示拒绝执行该工具；对其他可取消事件的后果见宿主文档。
+    pub fn cancel(&mut self) -> &mut Self {
+        self.cancel = true;
+        self
+    }
+
+    /// 拒绝当前工具调用，并给出面向界面的原因与面向模型的一次性指导。
+    ///
+    /// `reason` 只进入可信事件流供界面展示；`agent_guidance` 只注入下一次模型请求，
+    /// 不写入会话历史。仅在处理 `core.tool.call` 时有意义。
+    pub fn deny_tool(
+        &mut self,
+        reason: impl Into<String>,
+        agent_guidance: Option<String>,
+    ) -> &mut Self {
+        self.set("block_reason", json!(reason.into()));
+        if let Some(guidance) = agent_guidance {
+            self.set("agent_guidance", json!(guidance));
+        }
+        self.cancel()
+    }
+
+    /// 改写当前工具调用的名称与参数。
+    ///
+    /// 调用 ID、运行 ID 与权限 scope 由宿主绑定，无法通过本方法改写；宿主会在改写后
+    /// 按目标工具重新绑定权限 scope。仅在处理 `core.tool.call` 时有意义。
+    pub fn rewrite_tool(
+        &mut self,
+        name: Option<&str>,
+        args: Option<serde_json::Value>,
+    ) -> &mut Self {
+        let mut call = serde_json::Map::new();
+        if let Some(name) = name {
+            call.insert("name".into(), json!(name));
+        }
+        if let Some(args) = args {
+            call.insert("args".into(), args);
+        }
+        self.set("call", serde_json::Value::Object(call))
+    }
+
+    /// 把本次分发收敛为交给宿主的应答；由 `export_plugin!` 调用。
+    pub fn into_response(self, outcome: EventOutcome) -> PluginEventResponse {
+        match outcome {
+            EventOutcome::Pending { retry_after_ms } => {
+                PluginEventResponse::pending(retry_after_ms)
+            }
+            EventOutcome::Ready => PluginEventResponse::Ready {
+                cancel: self.cancel,
+                patch: if self.patch.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::Object(self.patch)
+                },
+            },
+        }
+    }
+}
+
+/// `core.agent.event` 的事件负载。
+///
+/// 承载 Core 写入记录流的完整事件，供只需要观察模型增量、计费用量、工具输出等细粒度
+/// 记录的插件使用；该事件只作通告，取消不产生任何后果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRecordEventData {
+    /// 已写入记录流的事件。
+    pub record: AgentEvent,
+}
+
+/// 插件对一次事件分发的处理结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventOutcome {
+    /// 已给出结论，宿主按当前取消状态与补丁继续分发。
+    Ready,
+    /// 尚未形成结论，请宿主稍后重新投递同一事件。
+    Pending {
+        /// 宿主重新投递前的等待毫秒数。
+        retry_after_ms: u64,
+    },
+}
+
+impl EventOutcome {
+    /// 构造已完成的结论。
+    pub fn ready() -> Self {
+        Self::Ready
+    }
+
+    /// 构造等待结论，请求宿主在指定毫秒后重投。
+    pub fn pending(retry_after_ms: u64) -> Self {
+        Self::Pending { retry_after_ms }
+    }
+}
+
+/// 不连接宿主的 [`PluginHostApi`] 空实现，供插件单元测试使用。
+///
+/// 所有写入型能力都是无副作用的成功返回，所有读取型能力返回空结果。插件在测试中
+/// 验证事件处理逻辑时不需要真实宿主，也就不必为每个插件重复编写替身。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopHostApi;
+
+impl PluginHostApi for NoopHostApi {
+    fn upsert_tool(&self, local_name: &str, _spec: &ToolSpec) -> Result<String> {
+        Ok(local_name.to_string())
+    }
+
+    fn remove_tool(&self, _public_name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn upsert_prompt(&self, prompt: &PromptContribution) -> Result<String> {
+        Ok(prompt.id.clone())
+    }
+
+    fn remove_prompt(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn emit_event(&self, _event: &ExtensionEvent) -> Result<()> {
+        Ok(())
+    }
+
+    fn get_state(&self, _key: &str) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    fn set_state(&self, _key: &str, _value: &serde_json::Value) -> Result<()> {
+        Ok(())
+    }
+
+    fn remove_state(&self, _key: &str) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    fn upsert_service(&self, _service: &ServiceSpec) -> Result<()> {
+        Ok(())
+    }
+
+    fn remove_service(&self, _name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn list_services(&self, _plugin_id: Option<&str>) -> Result<Vec<ServiceDescriptor>> {
+        Ok(Vec::new())
+    }
+
+    fn call_service(
+        &self,
+        _plugin_id: &str,
+        _name: &str,
+        _payload: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        Err(anyhow!("测试替身不提供插件服务调用"))
+    }
+
+    fn read_file(&self, _path: &str) -> Result<String> {
+        Err(anyhow!("测试替身不提供文件读取"))
+    }
+
+    fn list_dir(&self, _path: &str) -> Result<Vec<FileEntry>> {
+        Ok(Vec::new())
+    }
+
+    fn spawn_process(&self, _spec: &ProcessSpec) -> Result<u64> {
+        Err(anyhow!("测试替身不提供子进程能力"))
+    }
+
+    fn write_process(&self, _handle: u64, _data: &str) -> Result<()> {
+        Err(anyhow!("测试替身不提供子进程能力"))
+    }
+
+    fn read_process_line(&self, _handle: u64, _timeout_ms: u64) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn kill_process(&self, _handle: u64) -> Result<()> {
+        Ok(())
     }
 }

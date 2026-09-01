@@ -7,6 +7,7 @@ use crate::{
         ChatModel, ModelEventStream, ModelMessage, ModelResponse, ModelStreamEvent, ProviderAdapter,
     },
 };
+use agent_event::{EventContext, EventListener, Subscribe};
 use agent_tool::{
     JsonTool, Tool, ToolOutputDelta, ToolOutputSink, ToolOutputStream, ToolPermissionScope,
     ToolResult, ToolSpec,
@@ -147,184 +148,222 @@ struct PublishingExtension {
     events: std::sync::Mutex<Vec<Value>>,
 }
 
-/// 记录扩展实际收到的事件类型，用于验证敏感推理事件不会越过扩展边界。
-struct ObservingEventKindsExtension {
+/// 把测试监听者挂到 Agent 自带的总线上，保持既有的链式构造风格。
+fn listening(agent: Agent, subscribe: Subscribe, listener: Arc<dyn EventListener>) -> Agent {
+    agent.event_bus().subscribe(subscribe, listener);
+    agent
+}
+
+/// 以默认优先级订阅工具准入事件。
+fn on_tool_call(subscriber: &str) -> Subscribe {
+    Subscribe::typed::<ToolCallEvent>(subscriber)
+}
+
+/// 记录监听者实际收到的事件类型，用于验证敏感推理事件不会越过信任边界。
+struct ObservingEventKindsListener {
     kinds: Arc<std::sync::Mutex<Vec<AgentEventKind>>>,
 }
 
 #[async_trait]
-impl AgentExtension for ObservingEventKindsExtension {
-    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
-        self.kinds
-            .lock()
-            .expect("扩展事件记录锁不应中毒")
-            .push(event.kind.clone());
+impl EventListener for ObservingEventKindsListener {
+    async fn handle(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        if let Some(event) = ctx.event::<AgentRecordEvent>() {
+            self.kinds
+                .lock()
+                .expect("事件记录锁不应中毒")
+                .push(event.record.kind.clone());
+        }
         Ok(())
     }
 }
 
-/// 在工具执行前取消当前运行的测试扩展。
-struct CancelRunExtension;
+/// 在工具执行前取消当前运行的测试监听者。
+struct CancelRunListener;
+
+#[async_trait]
+impl EventListener for CancelRunListener {
+    async fn handle(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        if let Some(event) = ctx.event_mut::<ToolCallEvent>() {
+            event.block_reason = Some("扩展请求取消".into());
+            event.cancel_run = true;
+        }
+        ctx.cancel();
+        Ok(())
+    }
+}
 
 /// 阻止当前工具并向下一次模型请求提供一次性安全指导。
-struct BlockWithGuidanceExtension;
+struct BlockWithGuidanceListener;
+
+#[async_trait]
+impl EventListener for BlockWithGuidanceListener {
+    async fn handle(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        if let Some(event) = ctx.event_mut::<ToolCallEvent>() {
+            event.block_reason = Some("审批模型拒绝：目标路径不在允许范围内".into());
+            event.agent_guidance =
+                Some("目标路径不在允许范围内，请改用工作区内的只读方案继续。".into());
+        }
+        ctx.cancel();
+        Ok(())
+    }
+}
 
 /// 按调用 ID 返回不同审批详情与指导，用于验证同轮多工具不会串线。
-struct PerCallBlockWithGuidanceExtension;
+struct PerCallBlockWithGuidanceListener;
+
+#[async_trait]
+impl EventListener for PerCallBlockWithGuidanceListener {
+    async fn handle(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        if let Some(event) = ctx.event_mut::<ToolCallEvent>() {
+            let call_id = event.call.id.clone();
+            event.block_reason = Some(format!("审批详情仅属于 {call_id}"));
+            event.agent_guidance = Some(format!("请仅为调用 {call_id} 选择替代方案"));
+        }
+        ctx.cancel();
+        Ok(())
+    }
+}
 
 /// 只拒绝指定调用，其余调用放行，用于验证拒绝不会取消同批工具或后续轮次。
-struct BlockSelectedCallExtension {
+struct BlockSelectedCallListener {
     blocked_call_id: String,
 }
 
-/// 拒绝工具并记录扩展实际可见的工具结果与事件视图。
+#[async_trait]
+impl EventListener for BlockSelectedCallListener {
+    async fn handle(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        let Some(event) = ctx.event_mut::<ToolCallEvent>() else {
+            return Ok(());
+        };
+        if event.call.id != self.blocked_call_id {
+            return Ok(());
+        }
+        event.block_reason = Some("审批拒绝了当前调用".into());
+        event.agent_guidance = Some("当前调用未获批准，请改用无需该权限的方案继续。".into());
+        ctx.cancel();
+        Ok(())
+    }
+}
+
+/// 拒绝工具并记录第三方监听者实际可见的工具结果与事件视图。
 #[derive(Default)]
-struct ObservingBlockWithGuidanceExtension {
-    after_results: std::sync::Mutex<Vec<ToolResult>>,
+struct ObservingBlockListener {
+    /// 拒绝时是否附带一次性指导。
+    guidance: Option<&'static str>,
+    /// 拒绝原因。
+    reason: &'static str,
+    broadcast_results: std::sync::Mutex<Vec<ToolResult>>,
     finished_events: std::sync::Mutex<Vec<AgentEvent>>,
 }
 
-/// 拒绝工具但不提供一次性指导，用于验证失败详情仍不会泄漏给 Session 或第三方扩展。
+impl ObservingBlockListener {
+    /// 构造带一次性指导的观察型拒绝监听者。
+    fn with_guidance() -> Self {
+        Self {
+            guidance: Some("目标路径不在允许范围内，请改用工作区内的只读方案继续。"),
+            reason: "审批模型拒绝：目标路径不在允许范围内",
+            ..Self::default()
+        }
+    }
+
+    /// 构造不提供一次性指导的观察型拒绝监听者。
+    fn without_guidance() -> Self {
+        Self {
+            guidance: None,
+            reason: "仅可信界面可见的审批失败详情",
+            ..Self::default()
+        }
+    }
+
+    /// 返回监听者观察到的脱敏工具结果。
+    fn broadcast_results(&self) -> Vec<ToolResult> {
+        self.broadcast_results
+            .lock()
+            .expect("工具结果观察锁不应中毒")
+            .clone()
+    }
+
+    /// 返回监听者观察到的工具终态事件。
+    fn finished_events(&self) -> Vec<AgentEvent> {
+        self.finished_events
+            .lock()
+            .expect("工具事件观察锁不应中毒")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl EventListener for ObservingBlockListener {
+    async fn handle(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        if let Some(event) = ctx.event::<ToolResultEvent>() {
+            self.broadcast_results
+                .lock()
+                .expect("工具结果观察锁不应中毒")
+                .push(event.result.clone());
+            return Ok(());
+        }
+        if let Some(event) = ctx.event::<AgentRecordEvent>() {
+            if event.record.kind == AgentEventKind::ToolFinished {
+                self.finished_events
+                    .lock()
+                    .expect("工具事件观察锁不应中毒")
+                    .push(event.record.clone());
+            }
+            return Ok(());
+        }
+        if let Some(event) = ctx.event_mut::<ToolCallEvent>() {
+            event.block_reason = Some(self.reason.to_string());
+            event.agent_guidance = self.guidance.map(str::to_string);
+            ctx.cancel();
+        }
+        Ok(())
+    }
+}
+
+/// 捕获权限 scope 的测试监听者，用于验证模型字段在进入策略前已被可信定义覆盖。
 #[derive(Default)]
-struct ObservingBlockWithoutGuidanceExtension {
-    after_results: std::sync::Mutex<Vec<ToolResult>>,
-    finished_events: std::sync::Mutex<Vec<AgentEvent>>,
-}
-
-#[async_trait]
-impl AgentExtension for BlockWithGuidanceExtension {
-    async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
-        Ok(ToolDecision::block_with_guidance(
-            "审批模型拒绝：目标路径不在允许范围内",
-            "目标路径不在允许范围内，请改用工作区内的只读方案继续。",
-        ))
-    }
-}
-
-#[async_trait]
-impl AgentExtension for PerCallBlockWithGuidanceExtension {
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        Ok(ToolDecision::block_with_guidance(
-            format!("审批详情仅属于 {}", call.id),
-            format!("请仅为调用 {} 选择替代方案", call.id),
-        ))
-    }
-}
-
-#[async_trait]
-impl AgentExtension for BlockSelectedCallExtension {
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        if call.id == self.blocked_call_id {
-            Ok(ToolDecision::block_with_guidance(
-                "审批拒绝了当前调用",
-                "当前调用未获批准，请改用无需该权限的方案继续。",
-            ))
-        } else {
-            Ok(ToolDecision::Allow)
-        }
-    }
-}
-
-#[async_trait]
-impl AgentExtension for ObservingBlockWithGuidanceExtension {
-    async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
-        Ok(ToolDecision::block_with_guidance(
-            "审批模型拒绝：目标路径不在允许范围内",
-            "目标路径不在允许范围内，请改用工作区内的只读方案继续。",
-        ))
-    }
-
-    async fn after_tool(&self, result: &ToolResult) -> Result<()> {
-        self.after_results
-            .lock()
-            .expect("工具结果观察锁不应中毒")
-            .push(result.clone());
-        Ok(())
-    }
-
-    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
-        if event.kind == AgentEventKind::ToolFinished {
-            self.finished_events
-                .lock()
-                .expect("工具事件观察锁不应中毒")
-                .push(event.clone());
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl AgentExtension for ObservingBlockWithoutGuidanceExtension {
-    async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
-        Ok(ToolDecision::block("仅可信界面可见的审批失败详情"))
-    }
-
-    async fn after_tool(&self, result: &ToolResult) -> Result<()> {
-        self.after_results
-            .lock()
-            .expect("工具结果观察锁不应中毒")
-            .push(result.clone());
-        Ok(())
-    }
-
-    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
-        if event.kind == AgentEventKind::ToolFinished {
-            self.finished_events
-                .lock()
-                .expect("工具事件观察锁不应中毒")
-                .push(event.clone());
-        }
-        Ok(())
-    }
-}
-
-/// 捕获权限 scope 的测试扩展，用于验证模型字段在进入策略前已被可信定义覆盖。
-struct CapturingPermissionScopeExtension {
+struct CapturingPermissionScopeListener {
     observed: std::sync::Mutex<Vec<ToolPermissionScope>>,
     observed_run_ids: std::sync::Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait]
-impl AgentExtension for CapturingPermissionScopeExtension {
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        self.observed
-            .lock()
-            .expect("权限 scope 观察锁不应中毒")
-            .push(call.permission_scope);
-        self.observed_run_ids
-            .lock()
-            .expect("运行 ID 观察锁不应中毒")
-            .push(call.run_id.clone());
-        Ok(ToolDecision::Allow)
+impl EventListener for CapturingPermissionScopeListener {
+    async fn handle(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        if let Some(event) = ctx.event::<ToolCallEvent>() {
+            self.observed
+                .lock()
+                .expect("权限 scope 观察锁不应中毒")
+                .push(event.call.permission_scope);
+            self.observed_run_ids
+                .lock()
+                .expect("运行 ID 观察锁不应中毒")
+                .push(event.call.run_id.clone());
+        }
+        Ok(())
     }
 }
 
-#[async_trait]
-impl AgentExtension for CancelRunExtension {
-    async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
-        Ok(ToolDecision::CancelRun {
-            reason: "扩展请求取消".into(),
-        })
-    }
-}
-
-/// 永久等待的通用前置钩子，用于验证 Core 取消不会依赖具体插件协议。
-struct BlockingBeforeToolExtension {
+/// 永久等待的准入监听者，用于验证 Core 取消不会依赖具体插件协议。
+struct BlockingToolCallListener {
     entered: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait]
-impl AgentExtension for BlockingBeforeToolExtension {
-    async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
+impl EventListener for BlockingToolCallListener {
+    async fn handle(&self, _ctx: &mut EventContext<'_>) -> Result<()> {
         self.entered.notify_one();
         std::future::pending().await
     }
 }
 
 #[async_trait]
-impl AgentExtension for PublishingExtension {
-    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
-        if event.kind == AgentEventKind::RunStarted {
+impl EventListener for PublishingExtension {
+    async fn handle(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        let is_run_started = ctx
+            .event::<AgentRecordEvent>()
+            .is_some_and(|event| event.record.kind == AgentEventKind::RunStarted);
+        if is_run_started {
             self.events
                 .lock()
                 .expect("扩展事件锁不应中毒")
@@ -332,7 +371,10 @@ impl AgentExtension for PublishingExtension {
         }
         Ok(())
     }
+}
 
+#[async_trait]
+impl AgentExtension for PublishingExtension {
     async fn drain_events(&self) -> Result<Vec<Value>> {
         Ok(std::mem::take(
             &mut *self.events.lock().expect("扩展事件锁不应中毒"),
@@ -507,17 +549,27 @@ async fn blocked_tool_guidance_continues_run_without_persisting_review_reason() 
     let context_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut tools = ToolRegistry::new();
     tools.register(echo_tool()).expect("注册 echo 工具");
-    let observer = Arc::new(ObservingBlockWithGuidanceExtension::default());
+    let observer = Arc::new(ObservingBlockListener::with_guidance());
     let agent = Agent::new(
         gateway,
         AgentOptions::default().with_model_route("capturing-scripted", "test-model"),
     )
     .with_tools(tools)
-    .with_extension(observer.clone())
     .with_context_loader(Arc::new(RecordingContextLoader {
         messages: Arc::clone(&context_messages),
     }))
     .with_event_sink(sink.clone());
+    let agent = listening(agent, on_tool_call("observer"), observer.clone());
+    let agent = listening(
+        agent,
+        Subscribe::typed::<ToolResultEvent>("observer"),
+        observer.clone(),
+    );
+    let agent = listening(
+        agent,
+        Subscribe::typed::<AgentRecordEvent>("observer"),
+        observer.clone(),
+    );
 
     let run = agent
         .run("继续完成任务")
@@ -566,26 +618,20 @@ async fn blocked_tool_guidance_continues_run_without_persisting_review_reason() 
         .content_text()
         .contains("审批模型拒绝：目标路径不在允许范围内"));
 
-    let extension_results = observer
-        .after_results
-        .lock()
-        .expect("工具结果观察锁不应中毒");
-    assert_eq!(extension_results.len(), 1);
-    assert!(extension_results[0]
+    let broadcast_results = observer.broadcast_results();
+    assert_eq!(broadcast_results.len(), 1);
+    assert!(broadcast_results[0]
         .content_text()
         .contains("工具调用未获批准"));
-    assert!(!extension_results[0]
+    assert!(!broadcast_results[0]
         .content_text()
         .contains("目标路径不在允许范围内"));
-    let extension_events = observer
-        .finished_events
-        .lock()
-        .expect("工具事件观察锁不应中毒");
-    assert_eq!(extension_events.len(), 1);
-    let extension_result: ToolResult = serde_json::from_value(extension_events[0].payload.clone())
-        .expect("解析扩展可见的工具结果");
-    assert!(extension_result.content_text().contains("工具调用未获批准"));
-    assert!(!extension_result
+    let broadcast_events = observer.finished_events();
+    assert_eq!(broadcast_events.len(), 1);
+    let broadcast_result: ToolResult = serde_json::from_value(broadcast_events[0].payload.clone())
+        .expect("解析监听者可见的工具结果");
+    assert!(broadcast_result.content_text().contains("工具调用未获批准"));
+    assert!(!broadcast_result
         .content_text()
         .contains("目标路径不在允许范围内"));
 }
@@ -618,10 +664,14 @@ async fn blocked_tool_does_not_skip_allowed_call_in_same_model_response() {
         AgentOptions::default().with_model_route("same-batch-block", "test-model"),
     )
     .with_tools(tools)
-    .with_extension(Arc::new(BlockSelectedCallExtension {
-        blocked_call_id: "blocked-same-batch".into(),
-    }))
     .with_event_sink(sink.clone());
+    let agent = listening(
+        agent,
+        on_tool_call("approval"),
+        Arc::new(BlockSelectedCallListener {
+            blocked_call_id: "blocked-same-batch".into(),
+        }),
+    );
 
     let run = agent
         .run("执行同批工具")
@@ -680,10 +730,14 @@ async fn blocked_tool_guidance_is_consumed_before_third_model_request() {
         gateway,
         AgentOptions::default().with_model_route("one-time-guidance", "test-model"),
     )
-    .with_tools(tools)
-    .with_extension(Arc::new(BlockSelectedCallExtension {
-        blocked_call_id: "blocked-once".into(),
-    }));
+    .with_tools(tools);
+    let agent = listening(
+        agent,
+        on_tool_call("approval"),
+        Arc::new(BlockSelectedCallListener {
+            blocked_call_id: "blocked-once".into(),
+        }),
+    );
 
     agent
         .run("验证一次性审批指导")
@@ -729,10 +783,14 @@ async fn blocked_tool_guidance_survives_context_loader_dropping_tool_history() {
         AgentOptions::default().with_model_route("capturing-scripted", "test-model"),
     )
     .with_tools(tools)
-    .with_extension(Arc::new(BlockWithGuidanceExtension))
     .with_context_loader(Arc::new(DroppingToolHistoryContextLoader {
         visible_requests: Arc::clone(&visible_requests),
     }));
+    let agent = listening(
+        agent,
+        on_tool_call("approval"),
+        Arc::new(BlockWithGuidanceListener),
+    );
 
     let run = agent
         .run("继续完成任务")
@@ -800,14 +858,24 @@ async fn blocked_tool_without_guidance_never_persists_or_broadcasts_reason() {
     let sink = Arc::new(InMemoryEventSink::new());
     let mut tools = ToolRegistry::new();
     tools.register(echo_tool()).expect("注册 echo 工具");
-    let observer = Arc::new(ObservingBlockWithoutGuidanceExtension::default());
+    let observer = Arc::new(ObservingBlockListener::without_guidance());
     let agent = Agent::new(
         gateway,
         AgentOptions::default().with_model_route("block-without-guidance", "test-model"),
     )
     .with_tools(tools)
-    .with_extension(observer.clone())
     .with_event_sink(sink.clone());
+    let agent = listening(agent, on_tool_call("observer"), observer.clone());
+    let agent = listening(
+        agent,
+        Subscribe::typed::<ToolResultEvent>("observer"),
+        observer.clone(),
+    );
+    let agent = listening(
+        agent,
+        Subscribe::typed::<AgentRecordEvent>("observer"),
+        observer.clone(),
+    );
 
     let run = agent
         .run("拒绝后继续")
@@ -825,24 +893,20 @@ async fn blocked_tool_without_guidance_never_persists_or_broadcasts_reason() {
     assert!(second_request.contains("工具调用未获批准"));
     assert!(!second_request.contains("仅可信界面可见的审批失败详情"));
 
-    let after_results = observer
-        .after_results
-        .lock()
-        .expect("工具结果观察锁不应中毒");
-    assert_eq!(after_results.len(), 1);
-    assert!(after_results[0].content_text().contains("工具调用未获批准"));
-    assert!(!after_results[0]
+    let broadcast_results = observer.broadcast_results();
+    assert_eq!(broadcast_results.len(), 1);
+    assert!(broadcast_results[0]
+        .content_text()
+        .contains("工具调用未获批准"));
+    assert!(!broadcast_results[0]
         .content_text()
         .contains("仅可信界面可见的审批失败详情"));
-    let extension_events = observer
-        .finished_events
-        .lock()
-        .expect("工具事件观察锁不应中毒");
-    assert_eq!(extension_events.len(), 1);
-    let extension_result: ToolResult =
-        serde_json::from_value(extension_events[0].payload.clone()).expect("解析扩展可见工具结果");
-    assert!(extension_result.content_text().contains("工具调用未获批准"));
-    assert!(!extension_result
+    let broadcast_events = observer.finished_events();
+    assert_eq!(broadcast_events.len(), 1);
+    let broadcast_result: ToolResult = serde_json::from_value(broadcast_events[0].payload.clone())
+        .expect("解析监听者可见工具结果");
+    assert!(broadcast_result.content_text().contains("工具调用未获批准"));
+    assert!(!broadcast_result
         .content_text()
         .contains("仅可信界面可见的审批失败详情"));
 
@@ -885,8 +949,12 @@ async fn blocked_tool_guidance_continues_in_non_stream_mode() {
             .with_model_route("capturing-scripted", "test-model")
             .with_stream(false),
     )
-    .with_tools(tools)
-    .with_extension(Arc::new(BlockWithGuidanceExtension));
+    .with_tools(tools);
+    let agent = listening(
+        agent,
+        on_tool_call("approval"),
+        Arc::new(BlockWithGuidanceListener),
+    );
 
     let run = agent
         .run("继续完成任务")
@@ -939,8 +1007,12 @@ async fn multiple_blocked_tools_keep_one_time_guidance_scoped_by_call_id() {
         AgentOptions::default().with_model_route("capturing-scripted", "test-model"),
     )
     .with_tools(tools)
-    .with_extension(Arc::new(PerCallBlockWithGuidanceExtension))
     .with_event_sink(sink.clone());
+    let agent = listening(
+        agent,
+        on_tool_call("approval"),
+        Arc::new(PerCallBlockWithGuidanceListener),
+    );
 
     let run = agent
         .run("分别处理多个拒绝")
@@ -1204,10 +1276,17 @@ async fn extension_events_are_recorded_by_agent_sink() {
         gateway,
         AgentOptions::default().with_model_route("scripted", "test-model"),
     )
-    .with_extension(Arc::new(PublishingExtension {
-        events: std::sync::Mutex::new(Vec::new()),
-    }))
     .with_event_sink(sink.clone());
+    // 同一个测试替身既作为贡献扩展提供 drain_events，又作为监听者观察运行记录。
+    let publisher = Arc::new(PublishingExtension {
+        events: std::sync::Mutex::new(Vec::new()),
+    });
+    let agent = agent.with_extension(publisher.clone());
+    let agent = listening(
+        agent,
+        Subscribe::typed::<AgentRecordEvent>("publisher"),
+        publisher,
+    );
 
     agent.run("测试").await.expect("运行应成功");
     let events = sink.events().await;
@@ -1481,10 +1560,7 @@ async fn model_cannot_forge_tool_permission_scope() {
     let mut call = ToolCall::new("scope-call", "scoped_echo", json!({}));
     call.bind_permission_scope(ToolPermissionScope::Shell);
     call.bind_run_id("forged-run");
-    let extension = Arc::new(CapturingPermissionScopeExtension {
-        observed: std::sync::Mutex::new(Vec::new()),
-        observed_run_ids: std::sync::Mutex::new(Vec::new()),
-    });
+    let listener = Arc::new(CapturingPermissionScopeListener::default());
     let mut tools = ToolRegistry::new();
     tools
         .register(JsonTool::new(
@@ -1501,20 +1577,20 @@ async fn model_cannot_forge_tool_permission_scope() {
         ModelResponse::tool_calls(vec![call]),
         ModelResponse::text("完成"),
     ])
-    .with_tools(tools)
-    .with_extension(extension.clone());
+    .with_tools(tools);
+    let agent = listening(agent, on_tool_call("scope-observer"), listener.clone());
 
     agent.run("验证 scope 绑定").await.expect("运行应成功");
 
     assert_eq!(
-        extension
+        listener
             .observed
             .lock()
             .expect("权限 scope 观察锁不应中毒")
             .as_slice(),
         &[ToolPermissionScope::Read]
     );
-    let observed_run_ids = extension
+    let observed_run_ids = listener
         .observed_run_ids
         .lock()
         .expect("运行 ID 观察锁不应中毒");
@@ -1823,8 +1899,11 @@ async fn tool_policy_can_cancel_current_run() {
         ToolCall::new("cancelled", "echo", json!({"value": "一"})),
         ToolCall::new("skipped", "echo", json!({"value": "二"})),
     ];
-    let agent = agent_with_script(vec![ModelResponse::tool_calls(calls)])
-        .with_extension(Arc::new(CancelRunExtension));
+    let agent = listening(
+        agent_with_script(vec![ModelResponse::tool_calls(calls)]),
+        on_tool_call("policy"),
+        Arc::new(CancelRunListener),
+    );
 
     let run = agent.run("测试取消").await.expect("取消应优雅结束运行");
 
@@ -1851,13 +1930,13 @@ async fn control_cancel_interrupts_pending_before_tool_hook() {
     let entered = Arc::new(tokio::sync::Notify::new());
     let mut tools = ToolRegistry::new();
     tools.register(echo_tool()).expect("注册 echo 工具");
-    let agent = Arc::new(
-        agent_with_script(vec![ModelResponse::tool_calls(vec![call])])
-            .with_tools(tools)
-            .with_extension(Arc::new(BlockingBeforeToolExtension {
-                entered: entered.clone(),
-            })),
-    );
+    let agent = Arc::new(listening(
+        agent_with_script(vec![ModelResponse::tool_calls(vec![call])]).with_tools(tools),
+        on_tool_call("blocking"),
+        Arc::new(BlockingToolCallListener {
+            entered: entered.clone(),
+        }),
+    ));
     let control = agent.control();
     let running_agent = agent.clone();
     let running = tokio::spawn(async move { running_agent.run("测试取消等待").await });
@@ -1959,10 +2038,14 @@ async fn model_stream_deltas_are_forwarded_to_event_sink() {
         gateway,
         AgentOptions::default().with_model_route("stream", "stream-model"),
     )
-    .with_event_sink(sink.clone())
-    .with_extension(Arc::new(ObservingEventKindsExtension {
-        kinds: Arc::clone(&extension_kinds),
-    }));
+    .with_event_sink(sink.clone());
+    let agent = listening(
+        agent,
+        Subscribe::typed::<AgentRecordEvent>("observer"),
+        Arc::new(ObservingEventKindsListener {
+            kinds: Arc::clone(&extension_kinds),
+        }),
+    );
 
     let run = agent.run("你好").await.expect("流式 run 应成功");
     let events = sink.events().await;
@@ -2264,27 +2347,31 @@ async fn cancel_mid_stream_keeps_partial_text() {
     assert_eq!(finished.payload["cancelled"], true);
 }
 
-/// 对任何工具都返回 Allow 的扩展，用于验证插件无法放行策略拒绝的工具。
-struct AlwaysAllowExtension;
+/// 对任何工具都不表态的监听者，用于验证插件无法放行策略拒绝的工具。
+struct AlwaysAllowListener;
 
 #[async_trait]
-impl AgentExtension for AlwaysAllowExtension {
-    async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
-        Ok(ToolDecision::Allow)
+impl EventListener for AlwaysAllowListener {
+    async fn handle(&self, _ctx: &mut EventContext<'_>) -> Result<()> {
+        Ok(())
     }
 }
 
-/// 把工具调用重写为指定工具名的扩展，用于验证重写不能绕过策略。
-struct RewritingExtension {
+/// 把工具调用重写为指定工具名的监听者，用于验证重写不能绕过策略。
+///
+/// 监听者同时尝试伪造调用 ID，验证 Core 只采纳工具名与参数的改写。
+struct RewritingListener {
     target: String,
 }
 
 #[async_trait]
-impl AgentExtension for RewritingExtension {
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        Ok(ToolDecision::Rewrite {
-            call: ToolCall::new("伪造调用 ID", self.target.clone(), call.args.clone()),
-        })
+impl EventListener for RewritingListener {
+    async fn handle(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        if let Some(event) = ctx.event_mut::<ToolCallEvent>() {
+            event.call.id = "伪造调用 ID".into();
+            event.call.name.clone_from(&self.target);
+        }
+        Ok(())
     }
 }
 
@@ -2320,10 +2407,14 @@ async fn rewritten_call_rebinds_target_tool_permission_scope() {
         ModelResponse::text("完成"),
     ])
     .with_tools(tools)
-    .with_extension(Arc::new(RewritingExtension {
-        target: "rewrite_target".into(),
-    }))
     .with_event_sink(sink.clone());
+    let agent = listening(
+        agent,
+        on_tool_call("rewriter"),
+        Arc::new(RewritingListener {
+            target: "rewrite_target".into(),
+        }),
+    );
 
     agent.run("验证 Rewrite scope").await.expect("运行应成功");
 
@@ -2413,7 +2504,11 @@ async fn execution_policy_overrides_plugin_allow() {
             .clone()
             .with_execution_policy(ExecutionPolicy::evaluation("/tmp/fixture")),
     );
-    let agent = agent.with_extension(Arc::new(AlwaysAllowExtension));
+    let agent = listening(
+        agent,
+        on_tool_call("always-allow"),
+        Arc::new(AlwaysAllowListener),
+    );
 
     let run = agent.run("调用被拒工具").await.expect("运行应正常收尾");
 
@@ -2442,9 +2537,13 @@ async fn execution_policy_blocks_plugin_rewrite_to_denied_tool() {
     let mut policy = ExecutionPolicy::evaluation("/tmp/fixture");
     policy.tools = agent_tool::ToolAccess::allowlist(["echo"]);
     agent.set_options(agent.options().clone().with_execution_policy(policy));
-    let agent = agent.with_extension(Arc::new(RewritingExtension {
-        target: "shell".to_string(),
-    }));
+    let agent = listening(
+        agent,
+        on_tool_call("rewriter"),
+        Arc::new(RewritingListener {
+            target: "shell".to_string(),
+        }),
+    );
 
     let run = agent.run("尝试重写提权").await.expect("运行应正常收尾");
 

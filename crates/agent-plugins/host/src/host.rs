@@ -1,11 +1,13 @@
 //! 插件宿主 trait 与空实现。
 
+use crate::manifest::EventSubscription;
 use crate::service::{PluginService, PluginServiceCall};
 use crate::ui::{
     ToolRenderRequest, ToolRendererContribution, UiDeclaration, UiFrame, UiInput, UiRenderRequest,
 };
 use agent_core::AgentExtension;
 use agent_core::ContextLoadRequest;
+use agent_core::EventContext;
 use agent_core::LoadedContext;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -55,6 +57,27 @@ pub trait PluginHost: AgentExtension {
     /// 调用当前宿主拥有的服务；目标不属于当前宿主时返回 `None`。
     async fn call_service(&self, _call: &PluginServiceCall) -> Result<Option<serde_json::Value>> {
         Ok(None)
+    }
+
+    /// 返回插件在 manifest 中声明的事件订阅。
+    ///
+    /// 订阅是投递权限边界：未声明的事件不会送达该插件，宿主也不会为它在总线上登记
+    /// 任何监听。组合宿主自身不订阅事件，只由具体插件宿主返回。
+    fn event_subscriptions(&self) -> &[EventSubscription] {
+        &[]
+    }
+
+    /// 向插件投递一次事件分发。
+    ///
+    /// 实现方把 `ctx` 的快照交给 Guest，并按 Guest 应答在同一个 `ctx` 上执行白名单
+    /// 合并与取消。Guest 只能改写目标事件显式开放的字段。
+    ///
+    /// # Errors
+    ///
+    /// Guest 调用失败、应答不符合协议或超出等待预算时返回错误；错误后果由订阅声明的
+    /// 故障模式决定，不会中断其余监听者。
+    async fn dispatch_event(&self, _ctx: &mut EventContext<'_>) -> Result<()> {
+        Ok(())
     }
 
     /// 请求宿主实例执行卸载清理。

@@ -1,11 +1,103 @@
-//! 插件终端界面的宿主无关协议。
+//! 插件事件总线与终端界面的宿主无关协议。
 //!
-//! 插件通过 JSON 描述停靠位置、带样式文本和输入事件，宿主负责实际布局与终端渲染。
+//! 插件通过 JSON 参与宿主事件总线的分发，并用 JSON 描述停靠位置、带样式文本和输入
+//! 事件；宿主负责实际的取消收敛、白名单合并与终端渲染。
 
 #![deny(missing_docs)]
 
 use agent_tool::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// 宿主投递给插件的一次事件分发信封。
+///
+/// 插件看到的是事件的**快照**，而不是事件本身。改写只能通过
+/// [`PluginEventResponse::Ready`] 的补丁提交，并由宿主按事件自身声明的白名单合并，
+/// 因此插件无法改写调用 ID、运行 ID 或权限 scope 等宿主绑定字段。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PluginEventEnvelope {
+    /// 事件名，例如 `core.tool.call`。
+    pub event: String,
+
+    /// 事件当前是否已被取消。
+    ///
+    /// 插件在 manifest 中声明 `ignore_cancelled = true` 时不会收到已取消的事件。
+    #[serde(default)]
+    pub cancelled: bool,
+
+    /// 首个取消者身份；未取消时为 `None`，取消后不再变化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canceller: Option<String>,
+
+    /// 当前插件在本次分发中的订阅身份，也是它取消事件时被记录的取消者。
+    ///
+    /// 该值由宿主注入，等于可信插件 ID；插件不能自行声明。
+    pub subscriber: String,
+
+    /// 事件负载的完整 JSON 快照。
+    pub data: Value,
+}
+
+/// 插件对一次事件分发的应答。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PluginEventResponse {
+    /// 插件已给出结论。
+    Ready {
+        /// 是否取消该事件。
+        #[serde(default)]
+        cancel: bool,
+
+        /// 提交给宿主白名单合并的补丁；缺省表示不改写。
+        ///
+        /// 宿主只采纳目标事件显式开放的字段，其余键静默忽略。
+        #[serde(default, skip_serializing_if = "Value::is_null")]
+        patch: Value,
+    },
+
+    /// 插件尚未形成结论，宿主应在等待后向同一插件重新投递同一事件。
+    ///
+    /// 用于人工审批等需要外部输入的场景：插件先返回 `Pending`，在后台等待用户操作，
+    /// 宿主按间隔重试直到得到 `Ready`。宿主会限制总等待时长，超时按 fail-closed 处理。
+    Pending {
+        /// 宿主重新投递前的等待毫秒数。
+        #[serde(default = "default_event_retry_after_ms")]
+        retry_after_ms: u64,
+    },
+}
+
+impl PluginEventResponse {
+    /// 构造放行且不改写的应答。
+    pub fn allow() -> Self {
+        Self::Ready {
+            cancel: false,
+            patch: Value::Null,
+        }
+    }
+
+    /// 构造取消事件的应答。
+    pub fn cancel() -> Self {
+        Self::Ready {
+            cancel: true,
+            patch: Value::Null,
+        }
+    }
+
+    /// 构造带补丁的应答。
+    pub fn patched(cancel: bool, patch: Value) -> Self {
+        Self::Ready { cancel, patch }
+    }
+
+    /// 构造等待应答。
+    pub fn pending(retry_after_ms: u64) -> Self {
+        Self::Pending { retry_after_ms }
+    }
+}
+
+/// 插件省略轮询间隔时宿主使用的默认等待毫秒数。
+fn default_event_retry_after_ms() -> u64 {
+    100
+}
 
 /// 插件界面可以挂载的位置。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -537,6 +629,59 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 事件信封的线上形状由 Host 与 Guest 共享，不得在边界两侧各写一份。
+    #[test]
+    fn event_envelope_round_trips_cancellation_state() {
+        let envelope = PluginEventEnvelope {
+            event: "core.tool.call".into(),
+            cancelled: true,
+            canceller: Some("permission".into()),
+            subscriber: "audit".into(),
+            data: json!({ "call": { "name": "shell" } }),
+        };
+
+        let encoded = serde_json::to_value(&envelope).expect("序列化事件信封");
+        assert_eq!(encoded["cancelled"], true);
+        assert_eq!(encoded["canceller"], "permission");
+        assert_eq!(
+            serde_json::from_value::<PluginEventEnvelope>(encoded).expect("还原事件信封"),
+            envelope
+        );
+    }
+
+    /// 未取消的信封省略取消者字段，插件不应看到无意义的空身份。
+    #[test]
+    fn pristine_envelope_omits_canceller() {
+        let encoded = serde_json::to_value(PluginEventEnvelope {
+            event: "core.run.start".into(),
+            cancelled: false,
+            canceller: None,
+            subscriber: "audit".into(),
+            data: Value::Null,
+        })
+        .expect("序列化事件信封");
+
+        assert!(encoded.get("canceller").is_none());
+    }
+
+    /// 放行应答不携带补丁，避免宿主对空对象做无谓的白名单合并。
+    #[test]
+    fn allow_response_carries_no_patch() {
+        assert_eq!(
+            serde_json::to_value(PluginEventResponse::allow()).expect("序列化放行应答"),
+            json!({ "status": "ready", "cancel": false })
+        );
+    }
+
+    /// 插件省略轮询间隔时必须使用稳定默认值，保证加法字段兼容。
+    #[test]
+    fn pending_response_uses_default_retry_interval() {
+        let response: PluginEventResponse =
+            serde_json::from_value(json!({ "status": "pending" })).expect("解析等待应答");
+
+        assert_eq!(response, PluginEventResponse::pending(100));
+    }
+
     /// 静态视图请求省略实例 ID 时必须解析为 `None`。
     #[test]
     fn static_ui_requests_default_to_no_instance() {
@@ -640,4 +785,102 @@ mod tests {
             UiRenderRequestEnvelope::Tool(_)
         ));
     }
+}
+
+/// Core 在 ReAct 循环各决策点发布的事件名。
+///
+/// 插件在 manifest 的 `[[events]]` 中按这些名字声明订阅。名字是 Host 与 Guest 之间的
+/// 稳定契约，负载形状见本模块中对应的 `*EventData`。
+pub mod core_events {
+    /// 一次 Agent 运行即将开始；取消则该运行直接以取消终态收尾。
+    pub const RUN_START: &str = "core.run.start";
+    /// 一次 Agent 运行已结束；只作通告。
+    pub const RUN_FINISH: &str = "core.run.finish";
+    /// 一轮 ReAct 即将开始；取消则运行以取消终态收尾。
+    pub const TURN_START: &str = "core.turn.start";
+    /// 一轮 ReAct 已结束；只作通告。
+    pub const TURN_FINISH: &str = "core.turn.finish";
+    /// 一次模型请求即将发往服务商；取消则运行以取消终态收尾。
+    pub const MODEL_REQUEST: &str = "core.model.request";
+    /// 模型已返回完整响应；只作通告。
+    pub const MODEL_RESPONSE: &str = "core.model.response";
+    /// 一次工具调用即将执行；取消即拒绝执行该工具。
+    pub const TOOL_CALL: &str = "core.tool.call";
+    /// 一次工具调用已产生脱敏终态结果；只作通告。
+    pub const TOOL_RESULT: &str = "core.tool.result";
+    /// 一条 steering 或 follow-up 消息即将注入会话；取消则该消息被丢弃。
+    pub const MESSAGE_INJECT: &str = "core.message.inject";
+    /// Core 写入事件记录流的广播副本；只作通告，覆盖模型增量等细粒度记录。
+    pub const AGENT_RECORD: &str = "core.agent.event";
+}
+
+/// `core.tool.call` 的事件负载。
+///
+/// 可改写字段：`call.name`、`call.args`、`block_reason`、`agent_guidance`、`cancel_run`。
+/// `call.id`、`call.run_id` 与 `call.permission_scope` 由宿主绑定，插件的改写会被忽略。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallEventData {
+    /// 本次运行的稳定 ID。
+    pub run_id: String,
+    /// ReAct 步数索引。
+    pub step: usize,
+    /// 即将执行的工具调用。
+    pub call: ToolCall,
+    /// 拒绝执行时面向可信界面的详细原因；不写入会话，也不广播给其他插件。
+    #[serde(default)]
+    pub block_reason: Option<String>,
+    /// 拒绝执行时只注入下一次模型请求的脱敏指导。
+    #[serde(default)]
+    pub agent_guidance: Option<String>,
+    /// 拒绝执行的同时是否结束整个运行。
+    #[serde(default)]
+    pub cancel_run: bool,
+}
+
+/// `core.tool.result` 的事件负载。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolResultEventData {
+    /// 本次运行的稳定 ID。
+    pub run_id: String,
+    /// ReAct 步数索引。
+    pub step: usize,
+    /// 脱敏后的工具结果。
+    pub result: ToolResult,
+    /// 由 Core 注入的实际执行来源。
+    pub origin: String,
+}
+
+/// `core.message.inject` 的事件负载；可改写 `text`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessageInjectEventData {
+    /// 本次运行的稳定 ID。
+    pub run_id: String,
+    /// ReAct 步数索引。
+    pub step: usize,
+    /// 注入类型：`steering` 或 `follow_up`。
+    pub kind: String,
+    /// 即将写入会话的消息正文。
+    pub text: String,
+}
+
+/// `core.run.finish` 的事件负载。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunFinishEventData {
+    /// 本次运行的稳定 ID。
+    pub run_id: String,
+    /// 实际使用的模型步数。
+    pub steps_used: usize,
+    /// 是否因取消请求提前收尾。
+    pub cancelled: bool,
+}
+
+/// `core.run.start` 的事件负载。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunStartEventData {
+    /// 本次运行的稳定 ID。
+    pub run_id: String,
+    /// 逻辑服务商名称。
+    pub provider: String,
+    /// 模型 ID。
+    pub model: String,
 }

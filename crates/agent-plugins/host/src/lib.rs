@@ -24,7 +24,7 @@ mod state;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-pub use agent_core::{AgentEvent, AgentEventKind, AgentExtension, ToolDecision};
+pub use agent_core::{AgentEvent, AgentEventKind, AgentExtension};
 pub use composite::CompositePluginHost;
 pub use host::{NoopPluginHost, PluginHost};
 pub use live::LivePluginHost;

@@ -2,7 +2,7 @@
 id = "permission"
 name = "Permission Plugin"
 version = "0.1.0"
-api_version = "0.7.0"
+api_version = "0.8.0"
 wasm = "target/wasm32-wasip2/release/permission_plugin.wasm"
 description = "保护敏感文件，并在 Agent 执行有副作用的工具前请求用户审批。"
 
@@ -15,3 +15,13 @@ mode = "exclusive"
 # 模型代审只使用 Host 固定的小模型路由；命令完成后只允许清空主输入。
 model_completion = true
 surface_action_allowlist = ["set_input"]
+
+# 工具准入必须最后裁决，因此以 highest 订阅；宿主还会因独占 tool-policy 能力
+# 把该订阅固定排到全部普通插件之后。
+[[events]]
+name = "core.tool.call"
+priority = "highest"
+
+# 运行结束时释放该 run 的待审批状态，避免取消或超时留下阻塞队首。
+[[events]]
+name = "core.run.finish"

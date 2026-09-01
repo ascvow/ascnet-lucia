@@ -49,6 +49,7 @@ dependencies = [
 name = "agent-core"
 version = "0.1.0"
 dependencies = [
+ "agent-event",
  "agent-tool",
  "anyhow",
  "async-trait",
@@ -63,6 +64,17 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "agent-event"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -97,6 +109,7 @@ name = "agent-plugin-host"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-event",
  "agent-plugin-protocol",
  "agent-runtime",
  "agent-tool",

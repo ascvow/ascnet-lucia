@@ -12,6 +12,7 @@ wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dependencies]
 anyhow.workspace = true
+agent-event = { path = "../../agent-core/event" }
 agent-runtime = { path = "../../agent-core/runtime" }
 agent-core = { path = "../../agent-core/kernel", default-features = false }
 agent-plugin-protocol = { path = "../protocol" }

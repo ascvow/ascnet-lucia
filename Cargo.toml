@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/agent-core/tool",
+    "crates/agent-core/event",
     "crates/agent-plugins/protocol",
     "crates/agent-plugins/sdk",
     "crates/agent-plugins/host",
@@ -29,6 +30,7 @@ members = [
 ]
 default-members = [
     "crates/agent-core/tool",
+    "crates/agent-core/event",
     "crates/agent-plugins/protocol",
     "crates/agent-plugins/sdk",
     "crates/agent-plugins/host",

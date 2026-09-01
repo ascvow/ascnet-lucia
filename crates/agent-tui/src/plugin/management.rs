@@ -345,7 +345,7 @@ mod tests {
 id = "{id}"
 name = "测试插件"
 version = "{version}"
-api_version = "0.7.0"
+api_version = "0.8.0"
 wasm = "plugin.wasm"
 "#
             ),

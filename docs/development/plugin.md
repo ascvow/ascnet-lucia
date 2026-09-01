@@ -42,7 +42,7 @@ wit-bindgen = "0.59"
 id = "my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = "0.7.0"
+api_version = "0.8.0"
 wasm = "target/wasm32-wasip2/release/my_plugin.wasm"
 description = "提供示例工具的 Lucia 插件。"
 
@@ -151,22 +151,6 @@ fn list_tools(&self) -> Vec<ToolSpec>
 
 该函数没有 `host` 参数，不适合做文件扫描或服务调用。需要在启动后动态发现工具时，在 `activate` 中调用 `host.upsert_tool`。
 
-### `before_tool`
-
-```rust
-fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus
-```
-
-在任意工具实际执行前参与策略判断，不只观察本插件拥有的工具。
-
-- `call.id`：模型生成的调用 ID，重写时必须保持结果可关联。
-- `call.run_id`：Core 为当前 Agent 运行绑定的可信 ID；有状态策略必须与 `call.id` 组合使用，隔离并发 Agent 的同名调用。Guest 不得自行生成或替换。
-- `call.name`：公开工具名。
-- `call.args`：已经解析的 JSON 参数，但尚未按某个 Rust 结构验证。
-- `call.permission_scope`：Core/Host 从可信 ToolSpec 绑定的权限范围；Guest Rewrite 不能自行扩大或伪造。
-- 返回值：`Ready { decision }` 提交 `Allow`、`Block`、`CancelRun` 或 `Rewrite` 最终决策；`Pending { retry_after_ms }` 请求 Host 稍后重新调用。`Pending` 不携带审批 ID、原因或 UI 结构，审批协议及其状态必须由提供该能力的插件自行维护。
-- 安全要求：所有 `Block` 的完整 `reason` 都只进入可信应用事件/UI，Session、模型和所有扩展观察钩子仅接收稳定拒绝文案。可选的有界 `agent_guidance` 只替换下一次模型请求中的对应工具结果，不写入 Session；即使它来自审批组件，模型仍必须按不可信工具数据处理。`reason` 与指导都不得包含 secret、完整环境变量或未脱敏命令参数。
-
 ### `call_tool`
 
 ```rust
@@ -196,23 +180,44 @@ fn call_tool_with_host(
 - `call`：含义与 `call_tool` 相同。
 - 返回值和错误：与 `call_tool` 相同；Host API 的权限、路径和句柄错误会沿 `Result` 返回。
 
-### `after_tool`
-
-```rust
-fn after_tool(&mut self, result: ToolResult)
-```
-
-观察最终工具结果，适合更新指标、审计摘要或插件内状态。`result.call_id` 和 `result.name` 标识调用，`result.content` 是模型可见载荷，`result.details` 只供 UI 使用。所有审批拒绝都会在这里脱敏，Guest 不会收到可信应用用于展示的详细原因或一次性 Agent 指导。该函数没有返回值，不能修改已经产生的工具结果。
-
 ## 事件与上下文函数
 
 ### `on_event`
 
 ```rust
-fn on_event(&mut self, event: AgentEvent)
+fn on_event(&mut self, host: &dyn PluginHostApi, event: &mut PluginEvent) -> EventOutcome
 ```
 
-接收 Core 生命周期事件。`event.run_id` 关联一次运行，`event.kind` 是稳定事件类型，`event.step` 是 ReAct 步数，`event.payload` 是对应类型的 JSON。审批拒绝的 `ToolFinished` 对扩展使用脱敏 payload，可信应用 EventSink 仍可获得完整展示原因。`ModelThinkingDelta` 为兼容枚举保留，但只发送给可信应用 EventSink，不会经 `on_event` 或 Agent Runtime 订阅下发给第三方 Guest。该回调用于观察，不应假设所有事件都包含同一种 payload 结构。
+插件参与宿主事件总线的唯一入口，同时承担准入决策与运行观察。只会收到 `plugin.toml`
+的 `[[events]]` 中声明订阅的事件——未声明即不投递，插件也就无法对其表态。
+
+```toml
+[[events]]
+name = "core.tool.call"
+priority = "highest"      # lowest | low | normal | high | highest | monitor
+ignore_cancelled = false
+```
+
+- `event.name()`：事件名，用它分派不同处理分支。
+- `event.parse::<T>()`：按 `agent_plugin_protocol` 中对应的 `*EventData` 解析负载。
+- `event.is_cancelled()` / `event.canceller()`：事件到达本插件时的取消状态与首个取消者。
+  取消是单调的，`canceller` 一旦写入不可改写，低优先级插件无法撤销高优先级插件的拦截。
+- `event.cancel()` / `event.deny_tool(reason, guidance)`：取消事件。对 `core.tool.call`
+  即拒绝执行该工具。
+- `event.set(field, value)` / `event.rewrite_tool(name, args)`：提交改写。Host 只采纳
+  目标事件白名单内的字段；`call.id`、`call.run_id` 与 `call.permission_scope` 由宿主绑定，
+  插件改不动，因此无法把结果关联到其他调用或声明未获授予的权限。
+- 返回 `EventOutcome::pending(ms)`：请求 Host 稍后重投同一事件，供人工审批等需要外部
+  输入的插件使用；Host 对累计等待设有上限，超时按 Guest 失约处理。
+
+安全要求：拒绝的完整 `block_reason` 只进入可信应用事件与 UI，Session、模型和其他监听者
+仅接收稳定拒绝文案。可选的有界 `agent_guidance` 只替换下一次模型请求中的对应工具结果，
+不写入 Session；即使它来自审批组件，模型仍必须按不可信工具数据处理。`block_reason` 与
+指导都不得包含 secret、完整环境变量或未脱敏命令参数。
+
+`core.tool.result` 与 `core.agent.event` 携带的都是脱敏结果，Guest 不会收到可信应用用于
+展示的详细原因。`ModelThinkingDelta` 只发送给可信应用 EventSink，不会经总线下发给第三方
+Guest。观察型分支不应假设所有事件都包含同一种负载结构。
 
 ### `load_context`
 

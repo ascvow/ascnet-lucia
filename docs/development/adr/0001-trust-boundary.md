@@ -19,8 +19,9 @@
 
 安全语义的强制点，只能由人类通过常规评审改动：
 
-- `agent-core`：ReAct 循环、工具调用、事件派发。
-- `agent-tool`：`ToolSpec`、`ToolCall`、`ToolDecision` 契约与原生工具实现。
+- `agent-core`：ReAct 循环、工具调用、事件派发与 `core.*` 事件的取消语义。
+- `agent-event`：取消状态的单调性、优先级排序与不可信监听者的白名单合并边界。
+- `agent-tool`：`ToolSpec`、`ToolCall` 契约与原生工具实现。
 - `agent-runtime`：`ToolAccess` / `AgentPermissions` 的单向收缩语义。
 - `agent-plugin-host`：ABI、生命周期、能力 owner 路由、UI 契约校验。
 - Execution Profile 的定义与强制点。
@@ -35,14 +36,21 @@
 
 本节记录该决策做出时的状态：**授权完全由插件承担，Host 没有独立兜底。**
 
-`CompositePluginHost::before_tool`（`crates/agent-plugins/host/src/lib.rs:431`）的实际行为是：
+工具准入现在是 `core.tool.call` 事件的一次总线分发（`crates/agent-plugins/host/src/live.rs`
+中的 `PluginFanout`），实际行为是：
 
-1. 依次调用非 policy owner 插件的 `before_tool`，任一返回 `Block` / `CancelRun` 即短路。
-2. 最后调用 `TOOL_POLICY_CAPABILITY` 的 owner 插件做最终裁决。
-3. 若该 owner 已声明但尚未 Ready，则阻止本轮工具执行（fail-closed，符合预期）。
-4. 若**没有任何插件**声明该能力，`policy_owner` 为 `None`，流程直接落到 `Ok(ToolDecision::Allow)`。
+1. 无条件登记的守卫分组最先执行：能力归属仍在解析，或已声明的 `TOOL_POLICY_CAPABILITY`
+   owner 尚未进入本次运行快照时，直接取消事件（fail-closed，符合预期）。
+2. 按订阅优先级依次把事件扇出给非 policy owner 插件；任一插件取消即记录 `canceller`，
+   取消不可被后续插件撤销。
+3. policy owner 插件的 `core.tool.call` 订阅被固定提升为 `highest`，因此它在全部普通插件
+   之后做最终裁决；其余插件在该事件上最高只能到 `high`。
+4. 若**没有任何插件**声明该能力，也没有插件取消事件，则调用放行。
 
 因此移除 permission 插件等于移除全部**工具授权**（哪些工具可调用）。
+
+事件总线本身不改变这一结论：它把"谁在什么顺序上拥有否决权"变成可审计的声明
+（manifest `[[events]]` 与优先级），但没有引入 Host 侧的独立授权兜底。
 
 > 该小节描述的是执行策略与工作区守卫落地之前的状态。原生文件工具彼时不接收 workspace
 > root、不做 canonicalize、不拒绝 `..` 逃逸，`ShellTool` 完整继承宿主环境变量。

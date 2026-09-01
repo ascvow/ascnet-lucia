@@ -1,18 +1,23 @@
-//! Agent 的宿主无关扩展点。
+//! Agent 的宿主无关贡献扩展点。
 //!
 //! core 只定义运行循环需要的最小接口，不感知具体扩展格式、加载方式或用户界面。
+//!
+//! 本接口只保留**贡献型**能力：向模型提供提示、工具定义、工具实现和结构化事件载荷。
+//! **决策型**能力（准入、改写、取消、观察）全部由 [`crate::bus`] 上的可取消事件承担，
+//! 因此权限插件、审计扩展与界面都以同一套 [`agent_event::EventListener`] 契约接入，
+//! 不再需要在这里增加专用钩子。
 
-use crate::{event::AgentEvent, model::ModelMessage};
-use agent_tool::{ToolCall, ToolDecision, ToolResult, ToolSpec};
+use crate::model::ModelMessage;
+use agent_tool::{ToolCall, ToolResult, ToolSpec};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Agent 运行循环支持的最小宿主扩展接口。
+/// Agent 运行循环支持的最小宿主贡献接口。
 ///
-/// 实现方可以补充工具、调整工具调用或观察生命周期事件。core 不关心实现方是
-/// 静态组件、动态模块还是应用层测试替身。
+/// 实现方可以补充提示、工具定义与工具实现。core 不关心实现方是静态组件、动态模块
+/// 还是应用层测试替身。
 #[async_trait]
 pub trait AgentExtension: Send + Sync {
     /// 返回本次模型请求前需要注入的提示消息。
@@ -53,38 +58,6 @@ pub trait AgentExtension: Send + Sync {
         self.call_tool(call).await
     }
 
-    /// 在工具执行前检查或重写调用。
-    async fn before_tool(&self, _call: &ToolCall) -> Result<ToolDecision> {
-        Ok(ToolDecision::Allow)
-    }
-
-    /// 在指定运行的工具执行前检查或重写调用。
-    async fn before_tool_for_run(&self, _run_id: &str, call: &ToolCall) -> Result<ToolDecision> {
-        self.before_tool(call).await
-    }
-
-    /// 在任意工具执行后接收结果。
-    async fn after_tool(&self, _result: &ToolResult) -> Result<()> {
-        Ok(())
-    }
-
-    /// 在指定运行的任意工具执行后接收结果。
-    async fn after_tool_for_run(&self, _run_id: &str, result: &ToolResult) -> Result<()> {
-        self.after_tool(result).await
-    }
-
-    /// 接收 Agent 生命周期事件。
-    async fn on_event(&self, _event: &AgentEvent) -> Result<()> {
-        Ok(())
-    }
-
-    /// 接收指定运行的 Agent 生命周期事件。
-    ///
-    /// 默认转发事件自带运行 ID 的旧版接口；组合扩展必须继续向子扩展传递可信参数。
-    async fn on_event_for_run(&self, _run_id: &str, event: &AgentEvent) -> Result<()> {
-        self.on_event(event).await
-    }
-
     /// 取出扩展等待发布的结构化事件载荷。
     ///
     /// Core 会将每个载荷包装为 [`crate::event::AgentEventKind::Extension`] 并写入
@@ -116,14 +89,11 @@ impl AgentExtension for NoopAgentExtension {}
 /// 将多个扩展组合为一个扩展，按注册顺序转发每个钩子。
 ///
 /// 与 [`crate::event::CompositeEventSink`] 对称：应用层可以在插件宿主之外
-/// 叠加自己的扩展（如工具策略、审计），而不必替换已挂载的扩展。
+/// 叠加自己的扩展（如内置工具集、审计），而不必替换已挂载的扩展。
 ///
 /// 组合语义：
 /// - `prompt_messages` / `list_tools` / `drain_events`：按顺序拼接所有结果；
 /// - `call_tool`：第一个返回 `Some` 的扩展生效，后续不再询问；
-/// - `before_tool`：按顺序串联决策——任何扩展返回 `Block` 立即短路，
-///   `Rewrite` 的结果作为后续扩展的输入继续检查；
-/// - `after_tool` / `on_event`：全部依次调用；
 /// - `finish_run`：即使前序扩展清理失败也继续通知其余扩展，最后合并错误。
 #[derive(Default)]
 pub struct CompositeAgentExtension {
@@ -195,113 +165,6 @@ impl AgentExtension for CompositeAgentExtension {
         Ok(None)
     }
 
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        // 串联决策：Rewrite 结果继续交给后续扩展检查，保证 allowlist
-        // 等安全扩展始终看到最终将要执行的调用。
-        let mut current: Option<ToolCall> = None;
-        for extension in &self.extensions {
-            let decision = extension
-                .before_tool(current.as_ref().unwrap_or(call))
-                .await?;
-            match decision {
-                ToolDecision::Allow => {}
-                ToolDecision::Block {
-                    reason,
-                    agent_guidance,
-                } => {
-                    return Ok(ToolDecision::Block {
-                        reason,
-                        agent_guidance,
-                    })
-                }
-                ToolDecision::CancelRun { reason } => {
-                    return Ok(ToolDecision::CancelRun { reason });
-                }
-                ToolDecision::Rewrite {
-                    call: mut rewritten,
-                } => {
-                    let previous = current.as_ref().unwrap_or(call);
-                    rewritten.id.clone_from(&previous.id);
-                    if let Some(run_id) = previous.run_id.as_deref() {
-                        rewritten.bind_run_id(run_id);
-                    }
-                    current = Some(rewritten);
-                }
-            }
-        }
-        Ok(match current {
-            Some(call) => ToolDecision::Rewrite { call },
-            None => ToolDecision::Allow,
-        })
-    }
-
-    async fn before_tool_for_run(&self, run_id: &str, call: &ToolCall) -> Result<ToolDecision> {
-        // run-aware 路径保持与旧版组合相同的 Rewrite 串联与短路语义。
-        let mut current: Option<ToolCall> = None;
-        for extension in &self.extensions {
-            let decision = extension
-                .before_tool_for_run(run_id, current.as_ref().unwrap_or(call))
-                .await?;
-            match decision {
-                ToolDecision::Allow => {}
-                ToolDecision::Block {
-                    reason,
-                    agent_guidance,
-                } => {
-                    return Ok(ToolDecision::Block {
-                        reason,
-                        agent_guidance,
-                    })
-                }
-                ToolDecision::CancelRun { reason } => {
-                    return Ok(ToolDecision::CancelRun { reason });
-                }
-                ToolDecision::Rewrite {
-                    call: mut rewritten,
-                } => {
-                    let previous = current.as_ref().unwrap_or(call);
-                    rewritten.id.clone_from(&previous.id);
-                    if let Some(bound_run_id) = previous.run_id.as_deref() {
-                        rewritten.bind_run_id(bound_run_id);
-                    }
-                    current = Some(rewritten);
-                }
-            }
-        }
-        Ok(match current {
-            Some(call) => ToolDecision::Rewrite { call },
-            None => ToolDecision::Allow,
-        })
-    }
-
-    async fn after_tool(&self, result: &ToolResult) -> Result<()> {
-        for extension in &self.extensions {
-            extension.after_tool(result).await?;
-        }
-        Ok(())
-    }
-
-    async fn after_tool_for_run(&self, run_id: &str, result: &ToolResult) -> Result<()> {
-        for extension in &self.extensions {
-            extension.after_tool_for_run(run_id, result).await?;
-        }
-        Ok(())
-    }
-
-    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
-        for extension in &self.extensions {
-            extension.on_event(event).await?;
-        }
-        Ok(())
-    }
-
-    async fn on_event_for_run(&self, run_id: &str, event: &AgentEvent) -> Result<()> {
-        for extension in &self.extensions {
-            extension.on_event_for_run(run_id, event).await?;
-        }
-        Ok(())
-    }
-
     async fn drain_events(&self) -> Result<Vec<Value>> {
         let mut payloads = Vec::new();
         for extension in &self.extensions {
@@ -337,40 +200,6 @@ mod tests {
     use super::*;
     use crate::model::MessageRole;
     use serde_json::json;
-
-    /// 将指定工具调用重写为固定名称的测试扩展。
-    struct RewriteExtension {
-        from: &'static str,
-        to: &'static str,
-    }
-
-    #[async_trait]
-    impl AgentExtension for RewriteExtension {
-        async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-            if call.name == self.from {
-                let mut call = call.clone();
-                call.id = "伪造调用 ID".into();
-                call.name = self.to.to_string();
-                return Ok(ToolDecision::Rewrite { call });
-            }
-            Ok(ToolDecision::Allow)
-        }
-    }
-
-    /// 阻止指定工具名称的测试扩展。
-    struct BlockExtension {
-        name: &'static str,
-    }
-
-    #[async_trait]
-    impl AgentExtension for BlockExtension {
-        async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-            if call.name == self.name {
-                return Ok(ToolDecision::block(format!("禁止调用 {}", self.name)));
-            }
-            Ok(ToolDecision::Allow)
-        }
-    }
 
     /// 提供固定提示与工具处理的测试扩展。
     struct FixedExtension {
@@ -415,49 +244,6 @@ mod tests {
                 Ok(())
             }
         }
-    }
-
-    /// 组合前置决策：重写结果继续交给后续扩展检查，Block 短路。
-    #[tokio::test]
-    async fn composite_before_tool_chains_rewrite_into_block() {
-        let mut composite = CompositeAgentExtension::new();
-        composite.push(Arc::new(RewriteExtension {
-            from: "raw",
-            to: "restricted",
-        }));
-        composite.push(Arc::new(BlockExtension { name: "restricted" }));
-
-        let decision = composite
-            .before_tool(&ToolCall::new("call_1", "raw", json!({})))
-            .await
-            .expect("决策应成功");
-
-        assert!(matches!(decision, ToolDecision::Block { .. }));
-    }
-
-    /// 只有重写时返回最终重写结果；无扩展介入时返回 Allow。
-    #[tokio::test]
-    async fn composite_before_tool_returns_final_rewrite_or_allow() {
-        let mut composite = CompositeAgentExtension::new();
-        composite.push(Arc::new(RewriteExtension {
-            from: "raw",
-            to: "safe",
-        }));
-
-        let rewritten = composite
-            .before_tool(&ToolCall::new("call_1", "raw", json!({})))
-            .await
-            .expect("决策应成功");
-        assert!(matches!(
-            rewritten,
-            ToolDecision::Rewrite { call } if call.name == "safe" && call.id == "call_1"
-        ));
-
-        let untouched = composite
-            .before_tool(&ToolCall::new("call_2", "other", json!({})))
-            .await
-            .expect("决策应成功");
-        assert_eq!(untouched, ToolDecision::Allow);
     }
 
     /// call_tool 由第一个能处理的扩展生效；提示按注册顺序拼接。

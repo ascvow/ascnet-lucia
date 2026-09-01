@@ -2,25 +2,35 @@
 
 use crate::composite::CompositePluginHost;
 use crate::host::PluginHost;
+use crate::manifest::TOOL_POLICY_CAPABILITY;
 use crate::service::{PluginService, PluginServiceCall};
 use crate::ui::{
     ToolRenderContext, ToolRenderRequest, ToolRendererContribution, UiDeclaration, UiFrame,
     UiInput, UiRenderRequest,
 };
 use agent_core::model::ModelMessage;
-use agent_core::AgentEvent;
 use agent_core::AgentEventKind;
 use agent_core::AgentExtension;
+use agent_core::AgentRecordEvent;
 use agent_core::ContextLoadRequest;
 use agent_core::ContextLoader;
+use agent_core::Event;
+use agent_core::EventBus;
+use agent_core::EventContext;
+use agent_core::EventListener;
+use agent_core::ListenerFailure;
+use agent_core::ListenerPriority;
 use agent_core::LoadedContext;
-use agent_core::ToolDecision;
+use agent_core::Subscribe;
+use agent_core::SubscriptionId;
+use agent_core::ToolCallEvent;
 use agent_tool::ToolCall;
 use agent_tool::ToolResult;
 use agent_tool::ToolSpec;
 use anyhow::anyhow;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -45,6 +55,10 @@ struct LivePluginState {
     active_runs: HashMap<String, ActivePluginRun>,
     capability_plan_ready: bool,
     plugin_order: HashMap<String, usize>,
+    /// 已挂载的宿主事件总线；未挂载时插件不参与任何事件分发。
+    bus: Option<EventBus>,
+    /// 当前已在总线上登记的 (事件名, 优先级) 分组及其句柄。
+    registrations: HashMap<(String, ListenerPriority), SubscriptionId>,
 }
 
 #[derive(Clone)]
@@ -54,6 +68,11 @@ struct ActivePluginRun {
     prompts: Vec<ModelMessage>,
     capability_plan_ready: bool,
     state: PluginRunState,
+    /// 本次运行的 `RunFinished` 是否有插件未成功接收。
+    ///
+    /// 只要有一个插件没收到结束通知，就不能走"已送达"的轻量排空路径，必须让
+    /// `finish_run` 调用底层异常清理，确保 Guest 有机会释放该运行的瞬时状态。
+    finish_delivery_failed: bool,
 }
 
 /// Live Host 中单次运行的终态推进阶段。
@@ -160,7 +179,9 @@ impl LivePluginHost {
             })
             .unwrap_or_else(|| state.current.len());
         state.current.insert(index, host);
-        Ok(())
+        drop(state);
+        // 新插件的订阅必须在它可能收到事件之前登记完成。
+        self.sync_subscriptions()
     }
 
     /// 在发布前记录插件的稳定计划顺序，避免并发完成顺序改变工具与提示顺序。
@@ -290,85 +311,334 @@ impl LivePluginHost {
         }
     }
 
-    /// 按能力规划状态执行一次工具前置检查。
-    async fn before_tool_with_route(
-        host: CompositePluginHost,
-        capability_plan_ready: bool,
-        call: &ToolCall,
-    ) -> Result<ToolDecision> {
-        if !capability_plan_ready {
-            return Ok(ToolDecision::block_with_guidance(
-                "插件能力归属仍在解析，本轮暂不执行工具",
-                "工具策略尚未就绪，当前调用未执行；请先继续处理无需该工具的部分，必要时稍后再尝试。",
-            ));
-        }
-        AgentExtension::before_tool(&host, call).await
+    /// 挂载宿主事件总线，并按当前插件集合完成一次订阅同步。
+    ///
+    /// 应用在装配阶段把同一条总线交给 Core、界面和本宿主；未挂载总线时插件不会收到
+    /// 任何事件，也无法参与取消决策。
+    pub fn attach_bus(&self, bus: EventBus) -> Result<()> {
+        self.write_state()?.bus = Some(bus);
+        self.sync_subscriptions()
     }
 
-    /// 按事件运行身份创建、路由或结束冻结快照。
-    async fn route_event(&self, event: &AgentEvent) -> Result<()> {
-        if event.run_id.is_empty() {
-            return Err(anyhow!("插件事件缺少 run_id"));
-        }
-        if event.kind == AgentEventKind::RunStarted {
-            {
-                let state = self.read_state()?;
-                if state.active_runs.contains_key(&event.run_id) {
-                    return Err(anyhow!("插件运行快照重复创建：`{}`", event.run_id));
-                }
-            }
-            let (snapshot, capability_plan_ready) = {
-                let state = self.read_state()?;
-                (
-                    state.current.detached_snapshot(),
-                    state.capability_plan_ready,
-                )
+    /// 按当前已发布插件的 manifest 订阅重建总线登记。
+    ///
+    /// 每个 (事件名, 优先级) 分组只登记一个监听者，由 [`PluginFanout`] 在分发时按运行
+    /// 快照扇出给该分组内的插件。这样跨插件与跨宿主的执行顺序由总线统一裁决，而每次
+    /// 运行看到的插件集合仍是 `RunStarted` 时冻结的那一份。
+    ///
+    /// 插件发布或卸载后必须调用；重复调用是幂等的。
+    pub fn sync_subscriptions(&self) -> Result<()> {
+        let (bus, desired) = {
+            let state = self.read_state()?;
+            let Some(bus) = state.bus.clone() else {
+                return Ok(());
             };
-            let tools = AgentExtension::list_tools(&snapshot).await?;
-            let prompts = AgentExtension::prompt_messages(&snapshot).await?;
-            {
-                let mut state = self.write_state()?;
-                if state.active_runs.contains_key(&event.run_id) {
-                    return Err(anyhow!("插件运行快照重复创建：`{}`", event.run_id));
+            let policy_owner = state
+                .current
+                .capability_owner(TOOL_POLICY_CAPABILITY)
+                .map(str::to_string);
+            let mut desired = BTreeSet::new();
+            for host in state.current.hosts() {
+                let is_policy_owner = host
+                    .id()
+                    .is_some_and(|id| Some(id) == policy_owner.as_deref());
+                for subscription in host.event_subscriptions() {
+                    desired.insert((
+                        subscription.name.clone(),
+                        effective_priority(
+                            &subscription.name,
+                            subscription.priority,
+                            is_policy_owner,
+                        ),
+                    ));
                 }
-                state.active_runs.insert(
-                    event.run_id.clone(),
-                    ActivePluginRun {
-                        host: snapshot.clone(),
-                        tools,
-                        prompts,
-                        capability_plan_ready,
-                        state: PluginRunState::Active,
-                    },
-                );
             }
-            let result = AgentExtension::on_event_for_run(&snapshot, &event.run_id, event).await;
-            if result.is_err() {
-                if let Some(run) = self.write_state()?.active_runs.get_mut(&event.run_id) {
-                    run.state = PluginRunState::CleanupPending;
-                }
-                return result;
-            }
-            return Ok(());
-        }
+            // 运行快照生命周期由 core.agent.event 驱动，必须始终订阅且最先执行。
+            desired.insert((AgentRecordEvent::NAME.to_string(), ListenerPriority::Lowest));
+            // 运行结束的状态推进必须排在全部插件分组之后，因此固定登记只读的收尾分组。
+            desired.insert((
+                AgentRecordEvent::NAME.to_string(),
+                ListenerPriority::Monitor,
+            ));
+            // 工具准入守卫无条件登记且最先执行：策略 owner 尚未 Ready 或能力归属仍在
+            // 解析时必须拒绝工具，不能因为"暂时没有插件订阅"而形成放行空窗。
+            desired.insert((ToolCallEvent::NAME.to_string(), ListenerPriority::Lowest));
+            (bus, desired)
+        };
 
-        let run = self.run_snapshot(&event.run_id)?;
-        let result = AgentExtension::on_event_for_run(&run.host, &event.run_id, event).await;
-        if event.kind == AgentEventKind::RunFinished && result.is_ok() {
-            let mut state = self.write_state()?;
-            let active = state
-                .active_runs
-                .get_mut(&event.run_id)
-                .ok_or_else(|| anyhow!("插件运行快照在结束回调期间消失：`{}`", event.run_id))?;
-            if active.state != PluginRunState::Active {
-                return Err(anyhow!(
-                    "插件运行快照在结束回调期间发生并发终态变更：`{}`",
-                    event.run_id
-                ));
+        let mut state = self.write_state()?;
+        state.registrations.retain(|key, id| {
+            let keep = desired.contains(key);
+            if !keep {
+                bus.unsubscribe(*id);
             }
+            keep
+        });
+        for (event, priority) in desired {
+            if state.registrations.contains_key(&(event.clone(), priority)) {
+                continue;
+            }
+            // 工具准入是安全决策点：扇出失败必须等同拒绝，其余事件只记录错误。
+            let failure = if event == ToolCallEvent::NAME {
+                ListenerFailure::CancelEvent
+            } else {
+                ListenerFailure::Ignore
+            };
+            let id = bus.subscribe(
+                Subscribe::new(event.clone(), PLUGIN_HOST_SUBSCRIBER)
+                    .with_priority(priority)
+                    .on_failure(failure),
+                Arc::new(PluginFanout {
+                    live: self.clone(),
+                    priority,
+                }),
+            );
+            state.registrations.insert((event, priority), id);
+        }
+        Ok(())
+    }
+
+    /// 创建一次运行的冻结插件快照。
+    ///
+    /// 快照包含该运行可用的插件集合、工具与提示；后续加载的插件不会进入已开始的运行。
+    async fn open_run_snapshot(&self, run_id: &str) -> Result<()> {
+        {
+            let state = self.read_state()?;
+            if state.active_runs.contains_key(run_id) {
+                return Err(anyhow!("插件运行快照重复创建：`{run_id}`"));
+            }
+        }
+        let (snapshot, capability_plan_ready) = {
+            let state = self.read_state()?;
+            (
+                state.current.detached_snapshot(),
+                state.capability_plan_ready,
+            )
+        };
+        let tools = AgentExtension::list_tools(&snapshot).await?;
+        let prompts = AgentExtension::prompt_messages(&snapshot).await?;
+
+        let mut state = self.write_state()?;
+        if state.active_runs.contains_key(run_id) {
+            return Err(anyhow!("插件运行快照重复创建：`{run_id}`"));
+        }
+        state.active_runs.insert(
+            run_id.to_string(),
+            ActivePluginRun {
+                host: snapshot,
+                tools,
+                prompts,
+                capability_plan_ready,
+                state: PluginRunState::Active,
+                finish_delivery_failed: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// 标记该运行的 `RunFinished` 已经送达全部插件，等待 Core 排空最后一批事件。
+    ///
+    /// 存在未送达的插件时保持 `Active`，由 `finish_run` 走异常清理路径补偿。
+    fn mark_finish_delivered(&self, run_id: &str) -> Result<()> {
+        let mut state = self.write_state()?;
+        let Some(active) = state.active_runs.get_mut(run_id) else {
+            return Ok(());
+        };
+        if active.state == PluginRunState::Active && !active.finish_delivery_failed {
             active.state = PluginRunState::FinishEventDelivered;
         }
-        result
+        Ok(())
+    }
+
+    /// 记录本次运行的结束通知存在未送达插件。
+    fn mark_finish_delivery_failed(&self, run_id: &str) -> Result<()> {
+        if let Some(active) = self.write_state()?.active_runs.get_mut(run_id) {
+            active.finish_delivery_failed = true;
+        }
+        Ok(())
+    }
+
+    /// 返回允许参与事件扇出的运行快照。
+    ///
+    /// 记录事件在 `RunFinished` 送达后仍需继续投递给尚未处理的分组，因此这里接受
+    /// `FinishEventDelivered`；工具准入等决策事件仍走严格的 [`Self::run_snapshot`]。
+    fn run_snapshot_for_fanout(&self, run_id: &str, is_record: bool) -> Result<ActivePluginRun> {
+        if !is_record {
+            return self.run_snapshot(run_id);
+        }
+        self.run_snapshot_for_drain(run_id)
+    }
+}
+
+/// Live Host 在总线上使用的固定订阅者身份。
+const PLUGIN_HOST_SUBSCRIBER: &str = "lucia.plugin-host";
+
+/// 计算插件订阅在总线上的实际优先级。
+///
+/// 独占的工具策略 owner 必须在全部普通插件之后做最终裁决，因此它对
+/// `core.tool.call` 的订阅固定提升为 `Highest`，其余插件在该事件上最高只能到 `High`。
+/// 这保留了旧组合宿主"策略插件最后执行"的不变量，同时把排序交还给总线。
+fn effective_priority(
+    event: &str,
+    declared: ListenerPriority,
+    is_policy_owner: bool,
+) -> ListenerPriority {
+    if event != ToolCallEvent::NAME {
+        return declared;
+    }
+    if is_policy_owner {
+        ListenerPriority::Highest
+    } else {
+        declared.min(ListenerPriority::High)
+    }
+}
+
+/// 判断当前运行是否处于必须拒绝全部工具的策略空窗，并返回可信侧的详细原因。
+///
+/// 两种空窗都会让"谁是最终裁决者"无法确定，此时放行等于绕过工具策略：
+/// 能力归属尚未解析完成，或已声明的独占策略 owner 还没有进入本次运行的冻结快照。
+fn tool_admission_block_reason(
+    run: &ActivePluginRun,
+    policy_owner: Option<&str>,
+) -> Option<String> {
+    if !run.capability_plan_ready {
+        return Some("插件能力归属仍在解析，本轮暂不执行工具".to_string());
+    }
+    let owner = policy_owner?;
+    if run.host.get(owner).is_some() {
+        return None;
+    }
+    Some(format!("工具策略插件 `{owner}` 仍在加载，本轮暂不执行工具"))
+}
+
+/// 把一次总线分发扇出给运行快照中订阅了同一优先级分组的插件。
+struct PluginFanout {
+    live: LivePluginHost,
+    priority: ListenerPriority,
+}
+
+impl PluginFanout {
+    /// 读取事件快照中 Core 绑定的运行 ID。
+    fn run_id(ctx: &EventContext<'_>) -> Result<String> {
+        let data = ctx.snapshot()?;
+        data.get("run_id")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                data.pointer("/record/run_id")
+                    .and_then(|value| value.as_str())
+            })
+            .filter(|run_id| !run_id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("插件事件 `{}` 缺少可信 run_id", ctx.name()))
+    }
+
+    /// 在插件改写工具调用后重新绑定可信 scope 与运行身份。
+    ///
+    /// 后续插件和 Core 的最终门禁必须看到改写目标本身的权限 scope；调用 ID 与运行 ID
+    /// 始终继承 Core 的可信输入，插件无法借改写把结果关联到其他调用。
+    fn rebind_tool_call(
+        host: &CompositePluginHost,
+        ctx: &mut EventContext<'_>,
+        trusted: &ToolCall,
+    ) -> Result<()> {
+        let Some(event) = ctx.event_mut::<ToolCallEvent>() else {
+            return Ok(());
+        };
+        event.call = host.bind_tool_permission_scope(Some(trusted), event.call.clone())?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EventListener for PluginFanout {
+    async fn handle(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        let run_id = Self::run_id(ctx)?;
+        let is_record = ctx.name() == AgentRecordEvent::NAME;
+        let record_kind = ctx
+            .event::<AgentRecordEvent>()
+            .map(|event| event.record.kind.clone());
+
+        // 运行快照生命周期只由记录事件驱动，且必须先于任何插件投递完成创建。
+        if is_record && record_kind == Some(AgentEventKind::RunStarted) {
+            self.live.open_run_snapshot(&run_id).await?;
+        }
+
+        let run = self.live.run_snapshot_for_fanout(&run_id, is_record)?;
+        let policy_owner = run
+            .host
+            .capability_owner(TOOL_POLICY_CAPABILITY)
+            .map(str::to_string);
+
+        // 准入守卫只在最先执行的分组里跑一次，保证任何插件看到调用之前就已否决。
+        if ctx.name() == ToolCallEvent::NAME && self.priority == ListenerPriority::Lowest {
+            if let Some(reason) = tool_admission_block_reason(&run, policy_owner.as_deref()) {
+                if let Some(event) = ctx.event_mut::<ToolCallEvent>() {
+                    event.block_reason = Some(reason);
+                    // 一次性指导不暴露具体策略插件 ID，避免模型据此推断绕过路径。
+                    event.agent_guidance = Some(
+                        "工具策略尚未就绪，当前调用未执行；请先继续处理无需该工具的部分，必要时稍后再尝试。"
+                            .into(),
+                    );
+                }
+                ctx.cancel();
+                return Ok(());
+            }
+            // 守卫通过后立刻用运行快照中的可信 ToolSpec 覆盖调用 scope，
+            // 保证第一个插件看到的就是宿主认定的权限范围。
+            if let Some(event) = ctx.event_mut::<ToolCallEvent>() {
+                let trusted = event.call.clone();
+                event.call = run
+                    .host
+                    .bind_tool_permission_scope(Some(&trusted), trusted.clone())?;
+            }
+        }
+        let mut errors = Vec::new();
+        for host in run.host.hosts() {
+            let is_policy_owner = host
+                .id()
+                .is_some_and(|id| Some(id) == policy_owner.as_deref());
+            let subscribed = host.event_subscriptions().iter().any(|subscription| {
+                subscription.name == ctx.name()
+                    && effective_priority(
+                        &subscription.name,
+                        subscription.priority,
+                        is_policy_owner,
+                    ) == self.priority
+                    && !(subscription.ignore_cancelled && ctx.is_cancelled())
+            });
+            if !subscribed {
+                continue;
+            }
+            let trusted_call = ctx.event::<ToolCallEvent>().map(|event| event.call.clone());
+            if let Err(error) = host.dispatch_event(ctx).await {
+                errors.push(format!(
+                    "插件 `{}` 处理事件 `{}` 失败：{error:#}",
+                    host.id().unwrap_or("<匿名>"),
+                    ctx.name()
+                ));
+                continue;
+            }
+            if let Some(trusted_call) = trusted_call {
+                Self::rebind_tool_call(&run.host, ctx, &trusted_call)?;
+            }
+        }
+
+        if is_record && record_kind == Some(AgentEventKind::RunFinished) {
+            if errors.is_empty() {
+                // 只读收尾分组在全部插件分组之后执行，此时才允许推进终态。
+                if self.priority == ListenerPriority::Monitor {
+                    self.live.mark_finish_delivered(&run_id)?;
+                }
+            } else {
+                self.live.mark_finish_delivery_failed(&run_id)?;
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(errors.join("；")))
+        }
     }
 }
 
@@ -407,46 +677,6 @@ impl AgentExtension for LivePluginHost {
         Self::validate_call_run_id(&call, run_id)?;
         let host = self.run_snapshot(run_id)?.host;
         AgentExtension::call_tool_for_run(&host, run_id, call).await
-    }
-
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        if let Some(run_id) = call.run_id.as_deref() {
-            return self.before_tool_for_run(run_id, call).await;
-        }
-        let (host, plan_ready) = self.legacy_route()?;
-        Self::before_tool_with_route(host, plan_ready, call).await
-    }
-
-    async fn before_tool_for_run(&self, run_id: &str, call: &ToolCall) -> Result<ToolDecision> {
-        Self::validate_call_run_id(call, run_id)?;
-        let run = self.run_snapshot(run_id)?;
-        if !run.capability_plan_ready {
-            return Self::before_tool_with_route(run.host, false, call).await;
-        }
-        AgentExtension::before_tool_for_run(&run.host, run_id, call).await
-    }
-
-    async fn after_tool(&self, result: &ToolResult) -> Result<()> {
-        AgentExtension::after_tool(&self.legacy_route()?.0, result).await
-    }
-
-    async fn after_tool_for_run(&self, run_id: &str, result: &ToolResult) -> Result<()> {
-        let host = self.run_snapshot(run_id)?.host;
-        AgentExtension::after_tool_for_run(&host, run_id, result).await
-    }
-
-    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
-        self.route_event(event).await
-    }
-
-    async fn on_event_for_run(&self, run_id: &str, event: &AgentEvent) -> Result<()> {
-        if event.run_id != run_id {
-            return Err(anyhow!(
-                "插件事件 run_id 与可信运行不一致：期望 `{run_id}`，实际 `{}`",
-                event.run_id
-            ));
-        }
-        self.route_event(event).await
     }
 
     async fn drain_events(&self) -> Result<Vec<serde_json::Value>> {

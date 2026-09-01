@@ -2,6 +2,7 @@
 
 use super::App;
 use crate::app::{MainEventSnapshot, PluginKeyRoute, PluginViewState};
+use crate::bus::{plugin_key_code, plugin_key_modifiers};
 use crate::event::UiEvent;
 use crate::plugin::host_actions::sessions_page;
 use crate::plugin::startup::plugin_startup_details;
@@ -939,48 +940,6 @@ pub(crate) fn plugin_mouse_kind(kind: MouseEventKind) -> String {
         MouseEventKind::ScrollLeft => "scroll_left".into(),
         MouseEventKind::ScrollRight => "scroll_right".into(),
     }
-}
-
-/// 将 Crossterm 按键转换为稳定、可跨语言处理的名称。
-#[cfg(feature = "plugins")]
-pub(crate) fn plugin_key_code(code: KeyCode) -> String {
-    match code {
-        KeyCode::Char(character) => character.to_string(),
-        KeyCode::F(number) => format!("f{number}"),
-        KeyCode::Backspace => "backspace".into(),
-        KeyCode::Enter => "enter".into(),
-        KeyCode::Left => "left".into(),
-        KeyCode::Right => "right".into(),
-        KeyCode::Up => "up".into(),
-        KeyCode::Down => "down".into(),
-        KeyCode::Home => "home".into(),
-        KeyCode::End => "end".into(),
-        KeyCode::PageUp => "pageup".into(),
-        KeyCode::PageDown => "pagedown".into(),
-        KeyCode::Tab => "tab".into(),
-        KeyCode::BackTab => "back_tab".into(),
-        KeyCode::Delete => "delete".into(),
-        KeyCode::Insert => "insert".into(),
-        KeyCode::Esc => "escape".into(),
-        other => format!("{other:?}").to_ascii_lowercase(),
-    }
-}
-
-/// 按固定顺序输出按键修饰符，避免插件依赖 Crossterm 位标记。
-#[cfg(feature = "plugins")]
-pub(crate) fn plugin_key_modifiers(modifiers: KeyModifiers) -> Vec<String> {
-    [
-        (KeyModifiers::CONTROL, "control"),
-        (KeyModifiers::ALT, "alt"),
-        (KeyModifiers::SHIFT, "shift"),
-        (KeyModifiers::SUPER, "super"),
-        (KeyModifiers::HYPER, "hyper"),
-        (KeyModifiers::META, "meta"),
-    ]
-    .into_iter()
-    .filter(|(modifier, _)| modifiers.contains(*modifier))
-    .map(|(_, name)| name.to_string())
-    .collect()
 }
 
 /// 返回未实际布局前使用的插件视图默认宽度。

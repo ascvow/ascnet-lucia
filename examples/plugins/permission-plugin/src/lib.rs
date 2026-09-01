@@ -1,16 +1,43 @@
 //! Agent 工具策略与交互审批插件。
 
 use agent_plugin::{
-    export_plugin, is_sensitive_path, ActivationContext, AgentEvent, AgentEventKind, AgentPlugin,
+    core_events, export_plugin, is_sensitive_path, ActivationContext, AgentPlugin, EventOutcome,
     EventPresentation, EventPresentationTone, ExtensionEvent, ModelCompletionRequest,
-    ModelCompletionResponse, PluginHostApi, ToolCall, ToolDecision, ToolDecisionStatus,
-    ToolPermissionScope, UiColor, UiDeclaration, UiFrame, UiHostAction, UiHostActionRequest,
-    UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    ModelCompletionResponse, PluginEvent, PluginHostApi, RunFinishEventData, ToolCall,
+    ToolCallEventData, ToolPermissionScope, UiColor, UiDeclaration, UiFrame, UiHostAction,
+    UiHostActionRequest, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize,
+    UiSpan, UiStyle,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Component,
 };
+
+/// 插件内部的工具准入结论。
+///
+/// 与总线语义一一对应：放行不做任何事，拒绝转为取消事件并附带说明，等待则请求宿主
+/// 稍后重投同一事件，从而在不阻塞 Agent 主循环的前提下等待用户操作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolAdmission {
+    /// 放行工具调用。
+    Allow,
+    /// 拒绝执行；`reason` 只供界面展示，`agent_guidance` 只注入下一次模型请求。
+    Deny {
+        /// 面向可信界面的详细原因。
+        reason: String,
+        /// 注入下一次模型请求的脱敏指导。
+        agent_guidance: String,
+    },
+    /// 尚未形成结论，请宿主在指定毫秒后重投。
+    Pending {
+        /// 宿主重投前的等待毫秒数。
+        retry_after_ms: u64,
+    },
+}
+
+/// 准入事件负载不可解析时注入模型的一次性指导。
+const TOOL_ADMISSION_PROTOCOL_GUIDANCE: &str =
+    "权限插件无法读取本次工具准入请求，调用未执行；请改用无需审批的方案继续。";
 
 const APPROVAL_VIEW: &str = "permission-approval";
 const MODE_VIEW: &str = "permission-mode";
@@ -250,74 +277,45 @@ impl AgentPlugin for PermissionPlugin {
         Ok(())
     }
 
-    fn before_tool(&mut self, call: ToolCall) -> ToolDecisionStatus {
-        let approval_key = ApprovalKey::from_call(&call);
-        if let Some(resolution) = self.resolutions.remove(&approval_key) {
-            return match resolution {
-                ApprovalResolution::Allow => ToolDecision::Allow.into(),
-                ApprovalResolution::Block {
-                    reason,
-                    agent_guidance,
-                } => ToolDecision::block_with_guidance(reason, agent_guidance).into(),
-            };
-        }
-
-        if let Some(reason) = blocked_reason(&call) {
-            return ToolDecision::block_with_guidance(reason, PATH_POLICY_AGENT_GUIDANCE).into();
-        }
-
-        if !requires_approval(&call) {
-            return ToolDecision::Allow.into();
-        }
-
-        let rule_key = approval_rule_key(&call);
-        let scoped_rule = rule_key
-            .as_ref()
-            .map(|rule_key| ScopedApprovalRule::new(approval_key.run_id.clone(), rule_key.clone()));
-        if self.mode == PermissionMode::AllowAll
-            || scoped_rule
-                .as_ref()
-                .is_some_and(|rule| self.allowed_similar.contains(rule))
-        {
-            return ToolDecision::Allow.into();
-        }
-
-        if !self
-            .pending
-            .iter()
-            .any(|pending| pending.key == approval_key)
-        {
-            self.pending.push(PendingApproval {
-                key: approval_key,
-                tool_name: call.name.clone(),
-                summary: approval_summary(&call),
-                review_context: approval_review_context(&call),
-                action: approval_action(call.permission_scope),
-                reason: approval_reason(&call),
-                scope: approval_scope(&call),
-                risk: approval_risk(call.permission_scope),
-                allow_similar: rule_key.is_some(),
-                rule_key,
-            });
-        }
-        ToolDecisionStatus::Pending {
-            retry_after_ms: 100,
-        }
-    }
-
-    /// 模型代审直接在工具前置链中完成，避免审批依赖 TUI 渲染或其他界面副作用。
-    fn before_tool_with_host(
-        &mut self,
-        host: &dyn PluginHostApi,
-        call: ToolCall,
-    ) -> ToolDecisionStatus {
-        self.before_tool_with_review(call, |request| host.complete_model(request))
-    }
-
-    /// 运行结束时删除该 run 的待审批与未消费结论，避免取消或超时留下阻塞队首。
-    fn on_event(&mut self, event: AgentEvent) {
-        if event.kind == AgentEventKind::RunFinished && !event.run_id.is_empty() {
-            self.clear_run_approvals(&event.run_id);
+    /// 在事件总线上承担工具准入与运行收尾两件事。
+    ///
+    /// 模型代审直接在准入路径中完成，不依赖 TUI 渲染或其他界面副作用；运行结束时
+    /// 删除该 run 的待审批与未消费结论，避免取消或超时留下阻塞队首。
+    fn on_event(&mut self, host: &dyn PluginHostApi, event: &mut PluginEvent) -> EventOutcome {
+        match event.name() {
+            core_events::TOOL_CALL => {
+                let Ok(data) = event.parse::<ToolCallEventData>() else {
+                    // 负载无法解析说明协议不一致；安全事件必须 fail-closed。
+                    event.deny_tool(
+                        "无法解析工具准入事件负载",
+                        Some(TOOL_ADMISSION_PROTOCOL_GUIDANCE.to_string()),
+                    );
+                    return EventOutcome::ready();
+                };
+                match self.admit_tool_with_review(data.call, |request| host.complete_model(request))
+                {
+                    ToolAdmission::Allow => EventOutcome::ready(),
+                    ToolAdmission::Deny {
+                        reason,
+                        agent_guidance,
+                    } => {
+                        event.deny_tool(reason, Some(agent_guidance));
+                        EventOutcome::ready()
+                    }
+                    ToolAdmission::Pending { retry_after_ms } => {
+                        EventOutcome::pending(retry_after_ms)
+                    }
+                }
+            }
+            core_events::RUN_FINISH => {
+                if let Ok(data) = event.parse::<RunFinishEventData>() {
+                    if !data.run_id.is_empty() {
+                        self.clear_run_approvals(&data.run_id);
+                    }
+                }
+                EventOutcome::ready()
+            }
+            _ => EventOutcome::ready(),
         }
     }
 
@@ -514,21 +512,83 @@ impl PermissionPlugin {
         self.mode_notice = None;
     }
 
-    /// 在工具前置链中按需执行一次模型审核；非代审模式不会调用完成函数。
-    fn before_tool_with_review(
+    /// 对一次工具调用形成准入结论。
+    fn admit_tool(&mut self, call: ToolCall) -> ToolAdmission {
+        let approval_key = ApprovalKey::from_call(&call);
+        if let Some(resolution) = self.resolutions.remove(&approval_key) {
+            return match resolution {
+                ApprovalResolution::Allow => ToolAdmission::Allow,
+                ApprovalResolution::Block {
+                    reason,
+                    agent_guidance,
+                } => ToolAdmission::Deny {
+                    reason,
+                    agent_guidance,
+                },
+            };
+        }
+
+        if let Some(reason) = blocked_reason(&call) {
+            return ToolAdmission::Deny {
+                reason,
+                agent_guidance: PATH_POLICY_AGENT_GUIDANCE.to_string(),
+            };
+        }
+
+        if !requires_approval(&call) {
+            return ToolAdmission::Allow;
+        }
+
+        let rule_key = approval_rule_key(&call);
+        let scoped_rule = rule_key
+            .as_ref()
+            .map(|rule_key| ScopedApprovalRule::new(approval_key.run_id.clone(), rule_key.clone()));
+        if self.mode == PermissionMode::AllowAll
+            || scoped_rule
+                .as_ref()
+                .is_some_and(|rule| self.allowed_similar.contains(rule))
+        {
+            return ToolAdmission::Allow;
+        }
+
+        if !self
+            .pending
+            .iter()
+            .any(|pending| pending.key == approval_key)
+        {
+            self.pending.push(PendingApproval {
+                key: approval_key,
+                tool_name: call.name.clone(),
+                summary: approval_summary(&call),
+                review_context: approval_review_context(&call),
+                action: approval_action(call.permission_scope),
+                reason: approval_reason(&call),
+                scope: approval_scope(&call),
+                risk: approval_risk(call.permission_scope),
+                allow_similar: rule_key.is_some(),
+                rule_key,
+            });
+        }
+        ToolAdmission::Pending {
+            retry_after_ms: 100,
+        }
+    }
+
+    /// 在准入路径中按需执行一次模型审核；非代审模式不会调用完成函数。
+    fn admit_tool_with_review(
         &mut self,
         call: ToolCall,
         complete: impl FnOnce(&ModelCompletionRequest) -> agent_plugin::Result<ModelCompletionResponse>,
-    ) -> ToolDecisionStatus {
+    ) -> ToolAdmission {
         let approval_key = ApprovalKey::from_call(&call);
-        let status = self.before_tool(call.clone());
+        let admission = self.admit_tool(call.clone());
         if self.mode == PermissionMode::ModelReview
-            && matches!(status, ToolDecisionStatus::Pending { .. })
+            && matches!(admission, ToolAdmission::Pending { .. })
         {
             self.review_with_key(&approval_key, complete);
-            return self.before_tool(call);
+            return self.admit_tool(call);
         }
-        status
+        admission
     }
 
     /// 对审批队首执行一次受限审核；仅供单队列测试使用。
@@ -1432,7 +1492,23 @@ export_plugin!(PermissionPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_plugin::{NoopHostApi, PluginEventEnvelope};
     use serde_json::json;
+
+    /// 构造一次运行结束的总线事件，驱动插件释放该运行的审批状态。
+    fn run_finish_event(run_id: &str) -> PluginEvent {
+        PluginEvent::new(PluginEventEnvelope {
+            event: core_events::RUN_FINISH.into(),
+            cancelled: false,
+            canceller: None,
+            subscriber: "permission".into(),
+            data: json!({
+                "run_id": run_id,
+                "steps_used": 1,
+                "cancelled": false,
+            }),
+        })
+    }
 
     /// 构造已经过 Core/Host 可信绑定的测试工具调用。
     fn scoped_call(
@@ -1479,28 +1555,26 @@ mod tests {
         let mut plugin = PermissionPlugin::default();
 
         assert!(matches!(
-            plugin.before_tool(first.clone()),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(first.clone()),
+            ToolAdmission::Pending { .. }
         ));
         assert!(matches!(
-            plugin.before_tool(second.clone()),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(second.clone()),
+            ToolAdmission::Pending { .. }
         ));
         assert_eq!(plugin.pending.len(), 2);
 
         plugin.resolve_current(0);
-        assert_eq!(plugin.before_tool(first), ToolDecision::Allow.into());
+        assert_eq!(plugin.admit_tool(first), ToolAdmission::Allow);
         assert!(matches!(
-            plugin.before_tool(second.clone()),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(second.clone()),
+            ToolAdmission::Pending { .. }
         ));
 
         plugin.resolve_current(2);
         assert!(matches!(
-            plugin.before_tool(second),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Block { .. }
-            }
+            plugin.admit_tool(second),
+            ToolAdmission::Deny { .. }
         ));
     }
 
@@ -1526,23 +1600,16 @@ mod tests {
             ..PermissionPlugin::default()
         };
         assert!(matches!(
-            plugin.before_tool(interrupted),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(interrupted),
+            ToolAdmission::Pending { .. }
         ));
 
-        plugin.on_event(AgentEvent {
-            id: "cleanup-event".into(),
-            run_id: "run-interrupted".into(),
-            timestamp_ms: 0,
-            kind: AgentEventKind::RunFinished,
-            step: 0,
-            payload: json!({"aborted": true, "host_cleanup": true}),
-        });
+        plugin.on_event(&NoopHostApi, &mut run_finish_event("run-interrupted"));
 
         assert!(plugin.pending.is_empty());
         assert!(matches!(
-            plugin.before_tool(next),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(next),
+            ToolAdmission::Pending { .. }
         ));
         assert_eq!(
             plugin
@@ -1557,7 +1624,7 @@ mod tests {
     #[test]
     fn approval_ui_uses_compact_visual_hierarchy() {
         let mut plugin = PermissionPlugin::default();
-        plugin.before_tool(scoped_call(
+        plugin.admit_tool(scoped_call(
             "shell-ui",
             "shell",
             json!({"command": "cargo test"}),
@@ -1792,7 +1859,7 @@ mod tests {
             mode: PermissionMode::ModelReview,
             ..PermissionPlugin::default()
         };
-        plugin.before_tool(call.clone());
+        plugin.admit_tool(call.clone());
 
         plugin.review_current_with(|request| {
             assert_eq!(request.max_tokens, Some(128));
@@ -1809,12 +1876,7 @@ mod tests {
             })
         });
 
-        assert_eq!(
-            plugin.before_tool(call),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Allow
-            }
-        );
+        assert_eq!(plugin.admit_tool(call), ToolAdmission::Allow);
     }
 
     /// 模型代审必须在工具前置链内完成，不依赖审批视图是否被 TUI 或其他嵌入方渲染。
@@ -1832,7 +1894,7 @@ mod tests {
         };
         let mut attempts = 0;
 
-        let decision = plugin.before_tool_with_review(call, |_| {
+        let decision = plugin.admit_tool_with_review(call, |_| {
             attempts += 1;
             Ok(ModelCompletionResponse {
                 text: "{\"decision\":\"deny\",\"reason\":\"命令可能破坏构建产物\"}".into(),
@@ -1844,11 +1906,9 @@ mod tests {
         assert!(plugin.pending.is_empty());
         assert!(matches!(
             decision,
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Block {
-                    reason,
-                    agent_guidance: Some(guidance),
-                }
+            ToolAdmission::Deny {
+                reason,
+                agent_guidance: guidance,
             } if reason.contains("可能破坏构建产物")
                 && !guidance.contains("可能破坏构建产物")
                 && guidance.contains("副作用更小")
@@ -2000,7 +2060,7 @@ mod tests {
             mode: PermissionMode::ModelReview,
             ..PermissionPlugin::default()
         };
-        plugin.before_tool(call.clone());
+        plugin.admit_tool(call.clone());
 
         plugin.review_current_with(|request| {
             assert!(request
@@ -2020,12 +2080,7 @@ mod tests {
             })
         });
 
-        assert_eq!(
-            plugin.before_tool(call),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Allow
-            }
-        );
+        assert_eq!(plugin.admit_tool(call), ToolAdmission::Allow);
     }
 
     /// 审批提示必须明确隔离参数中的伪造规则，避免脱敏后的文本被提升为审核指令。
@@ -2044,7 +2099,7 @@ mod tests {
             mode: PermissionMode::ModelReview,
             ..PermissionPlugin::default()
         };
-        plugin.before_tool(call.clone());
+        plugin.admit_tool(call.clone());
 
         plugin.review_current_with(|request| {
             let system = request.system.as_deref().expect("审核请求必须包含系统提示");
@@ -2061,10 +2116,8 @@ mod tests {
         });
 
         assert!(matches!(
-            plugin.before_tool(call),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Block { .. }
-            }
+            plugin.admit_tool(call),
+            ToolAdmission::Deny { .. }
         ));
     }
 
@@ -2081,7 +2134,7 @@ mod tests {
             mode: PermissionMode::ModelReview,
             ..PermissionPlugin::default()
         };
-        plugin.before_tool(call.clone());
+        plugin.admit_tool(call.clone());
 
         plugin.review_current_with(|_| {
             Ok(ModelCompletionResponse {
@@ -2093,12 +2146,10 @@ mod tests {
         assert_eq!(plugin.mode, PermissionMode::ModelReview);
         assert!(plugin.pending.is_empty());
         assert!(matches!(
-            plugin.before_tool(call),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Block {
-                    reason,
-                    agent_guidance: Some(guidance),
-                }
+            plugin.admit_tool(call),
+            ToolAdmission::Deny {
+                reason,
+                agent_guidance: guidance,
             } if reason.contains("递归删除构建目录")
                 && !guidance.contains("递归删除构建目录")
                 && guidance.contains("副作用更小")
@@ -2119,18 +2170,16 @@ mod tests {
             ..PermissionPlugin::default()
         };
         let decision =
-            plugin.before_tool_with_review(call, |_| Err(agent_plugin::anyhow!("测试模型不可用")));
+            plugin.admit_tool_with_review(call, |_| Err(agent_plugin::anyhow!("测试模型不可用")));
 
         assert_eq!(plugin.mode, PermissionMode::ModelReview);
         assert!(plugin.pending.is_empty());
         assert!(plugin.resolutions.is_empty());
         assert!(matches!(
             decision,
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Block {
-                    reason,
-                    agent_guidance: Some(guidance),
-                }
+            ToolAdmission::Deny {
+                reason,
+                agent_guidance: guidance,
             } if reason.contains("测试模型不可用")
                 && !guidance.contains("测试模型不可用")
                 && guidance.contains("审批服务暂不可用")
@@ -2159,7 +2208,7 @@ mod tests {
             ..PermissionPlugin::default()
         };
 
-        let invalid_decision = plugin.before_tool_with_review(invalid, |_| {
+        let invalid_decision = plugin.admit_tool_with_review(invalid, |_| {
             Ok(ModelCompletionResponse {
                 text: "not-json".into(),
                 usage: None,
@@ -2168,28 +2217,21 @@ mod tests {
 
         assert!(matches!(
             invalid_decision,
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Block {
-                    reason,
-                    agent_guidance: Some(guidance),
-                }
+            ToolAdmission::Deny {
+                reason,
+                agent_guidance: guidance,
             } if reason.contains("无效结论") && guidance.contains("审批结果无效")
         ));
         assert!(plugin.pending.is_empty());
         assert!(plugin.resolutions.is_empty());
 
-        let next_decision = plugin.before_tool_with_review(next, |_| {
+        let next_decision = plugin.admit_tool_with_review(next, |_| {
             Ok(ModelCompletionResponse {
                 text: "{\"decision\":\"allow\"}".into(),
                 usage: None,
             })
         });
-        assert_eq!(
-            next_decision,
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Allow
-            }
-        );
+        assert_eq!(next_decision, ToolAdmission::Allow);
         assert!(plugin.pending.is_empty());
         assert!(plugin.resolutions.is_empty());
     }
@@ -2210,7 +2252,7 @@ mod tests {
         };
 
         let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            plugin.before_tool_with_review(call.clone(), |_| {
+            plugin.admit_tool_with_review(call.clone(), |_| {
                 panic!("模拟宿主在审批模型返回前取消导入调用")
             })
         }));
@@ -2220,7 +2262,7 @@ mod tests {
         assert!(plugin.resolutions.is_empty());
 
         let mut retry_attempts = 0;
-        let decision = plugin.before_tool_with_review(call, |_| {
+        let decision = plugin.admit_tool_with_review(call, |_| {
             retry_attempts += 1;
             Ok(ModelCompletionResponse {
                 text: "{\"decision\":\"allow\"}".into(),
@@ -2229,12 +2271,7 @@ mod tests {
         });
 
         assert_eq!(retry_attempts, 1);
-        assert_eq!(
-            decision,
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Allow
-            }
-        );
+        assert_eq!(decision, ToolAdmission::Allow);
         assert!(plugin.pending.is_empty());
         assert!(plugin.resolutions.is_empty());
     }
@@ -2261,11 +2298,11 @@ mod tests {
             ..PermissionPlugin::default()
         };
         assert!(matches!(
-            plugin.before_tool(stale),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(stale),
+            ToolAdmission::Pending { .. }
         ));
 
-        let decision = plugin.before_tool_with_review(next, |request| {
+        let decision = plugin.admit_tool_with_review(next, |request| {
             let review_text = request.messages[0]["content"][0]["text"]
                 .as_str()
                 .expect("审核请求应包含文本");
@@ -2277,12 +2314,7 @@ mod tests {
             })
         });
 
-        assert_eq!(
-            decision,
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Allow
-            }
-        );
+        assert_eq!(decision, ToolAdmission::Allow);
         assert_eq!(plugin.pending.len(), 1);
         assert_eq!(plugin.pending[0].key.run_id.as_deref(), Some("run-stale"));
         assert!(plugin.resolutions.is_empty());
@@ -2301,7 +2333,7 @@ mod tests {
             mode: PermissionMode::ModelReview,
             ..PermissionPlugin::default()
         };
-        plugin.before_tool(call);
+        plugin.admit_tool(call);
         let mut attempts = 0;
 
         plugin.review_current_with(|_| {
@@ -2321,19 +2353,14 @@ mod tests {
     #[test]
     fn control_scope_allows_third_party_tool_without_review() {
         let mut plugin = PermissionPlugin::default();
-        let decision = plugin.before_tool(scoped_call(
+        let decision = plugin.admit_tool(scoped_call(
             "control-call",
             "third_party_state_transition",
             json!({"state": "ready"}),
             ToolPermissionScope::Control,
         ));
 
-        assert_eq!(
-            decision,
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Allow
-            }
-        );
+        assert_eq!(decision, ToolAdmission::Allow);
         assert!(plugin.pending.is_empty());
     }
 
@@ -2351,14 +2378,14 @@ mod tests {
         .enumerate()
         {
             let mut plugin = PermissionPlugin::default();
-            let decision = plugin.before_tool(scoped_call(
+            let decision = plugin.admit_tool(scoped_call(
                 &format!("risky-{index}"),
                 "third_party_operation",
                 json!({"path": "src/lib.rs", "command": "cargo check"}),
                 scope,
             ));
             assert!(
-                matches!(decision, ToolDecisionStatus::Pending { .. }),
+                matches!(decision, ToolAdmission::Pending { .. }),
                 "scope {scope:?} 不得直接放行"
             );
         }
@@ -2368,7 +2395,7 @@ mod tests {
     #[test]
     fn blocks_sensitive_file_reads() {
         let mut plugin = PermissionPlugin::default();
-        let decision = plugin.before_tool(scoped_call(
+        let decision = plugin.admit_tool(scoped_call(
             "read-secret",
             "read_file",
             json!({"path": ".env"}),
@@ -2376,11 +2403,9 @@ mod tests {
         ));
         assert!(matches!(
             decision,
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Block {
-                    reason,
-                    agent_guidance: Some(guidance),
-                }
+            ToolAdmission::Deny {
+                reason,
+                agent_guidance: guidance,
             } if reason.contains("sensitive file")
                 && guidance == PATH_POLICY_AGENT_GUIDANCE
         ));
@@ -2397,8 +2422,8 @@ mod tests {
         );
         let mut plugin = PermissionPlugin::default();
         assert!(matches!(
-            plugin.before_tool(call.clone()),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(call.clone()),
+            ToolAdmission::Pending { .. }
         ));
         plugin.on_ui_input(UiInput {
             plugin_id: "permission".into(),
@@ -2409,19 +2434,14 @@ mod tests {
                 modifiers: Vec::new(),
             },
         });
-        assert_eq!(
-            plugin.before_tool(call),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Allow
-            }
-        );
+        assert_eq!(plugin.admit_tool(call), ToolAdmission::Allow);
     }
 
     /// 工作区外路径必须在工具执行前被拒绝。
     #[test]
     fn blocks_parent_path_escape() {
         let mut plugin = PermissionPlugin::default();
-        let decision = plugin.before_tool(scoped_call(
+        let decision = plugin.admit_tool(scoped_call(
             "escape",
             "write_file",
             json!({"path": "../important.txt"}),
@@ -2429,11 +2449,9 @@ mod tests {
         ));
         assert!(matches!(
             decision,
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Block {
-                    reason,
-                    agent_guidance: Some(guidance),
-                }
+            ToolAdmission::Deny {
+                reason,
+                agent_guidance: guidance,
             } if reason.contains("../important.txt")
                 && guidance == PATH_POLICY_AGENT_GUIDANCE
         ));
@@ -2450,8 +2468,8 @@ mod tests {
         );
         let mut plugin = PermissionPlugin::default();
         assert!(matches!(
-            plugin.before_tool(call.clone()),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(call.clone()),
+            ToolAdmission::Pending { .. }
         ));
         for code in ["down", "down", "enter"] {
             plugin.on_ui_input(UiInput {
@@ -2465,13 +2483,8 @@ mod tests {
             });
         }
         assert!(matches!(
-            plugin.before_tool(call),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Block {
-                    agent_guidance: Some(_),
-                    ..
-                }
-            }
+            plugin.admit_tool(call),
+            ToolAdmission::Deny { .. }
         ));
     }
 
@@ -2485,7 +2498,7 @@ mod tests {
             ToolPermissionScope::Shell,
         );
         let mut plugin = PermissionPlugin::default();
-        plugin.before_tool(call.clone());
+        plugin.admit_tool(call.clone());
         plugin.on_ui_input(UiInput {
             plugin_id: "permission".into(),
             view_id: APPROVAL_VIEW.into(),
@@ -2495,12 +2508,7 @@ mod tests {
                 modifiers: Vec::new(),
             },
         });
-        assert_eq!(
-            plugin.before_tool(call),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Allow
-            }
-        );
+        assert_eq!(plugin.admit_tool(call), ToolAdmission::Allow);
     }
 
     /// D 快捷键必须直接拒绝当前调用，但不取消 Agent 运行。
@@ -2513,7 +2521,7 @@ mod tests {
             ToolPermissionScope::Shell,
         );
         let mut plugin = PermissionPlugin::default();
-        plugin.before_tool(call.clone());
+        plugin.admit_tool(call.clone());
         plugin.on_ui_input(UiInput {
             plugin_id: "permission".into(),
             view_id: APPROVAL_VIEW.into(),
@@ -2525,13 +2533,8 @@ mod tests {
         });
 
         assert!(matches!(
-            plugin.before_tool(call),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Block {
-                    agent_guidance: Some(_),
-                    ..
-                }
-            }
+            plugin.admit_tool(call),
+            ToolAdmission::Deny { .. }
         ));
     }
 
@@ -2545,7 +2548,7 @@ mod tests {
             ToolPermissionScope::Shell,
         );
         let mut plugin = PermissionPlugin::default();
-        plugin.before_tool(call.clone());
+        plugin.admit_tool(call.clone());
         plugin.on_ui_input(UiInput {
             plugin_id: "permission".into(),
             view_id: APPROVAL_VIEW.into(),
@@ -2557,8 +2560,8 @@ mod tests {
         });
 
         assert!(matches!(
-            plugin.before_tool(call),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(call),
+            ToolAdmission::Pending { .. }
         ));
     }
 
@@ -2572,7 +2575,7 @@ mod tests {
             ToolPermissionScope::Shell,
         );
         let mut plugin = PermissionPlugin::default();
-        plugin.before_tool(first.clone());
+        plugin.admit_tool(first.clone());
         plugin.on_ui_input(UiInput {
             plugin_id: "permission".into(),
             view_id: APPROVAL_VIEW.into(),
@@ -2584,8 +2587,8 @@ mod tests {
         });
 
         assert!(matches!(
-            plugin.before_tool(first),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(first),
+            ToolAdmission::Pending { .. }
         ));
     }
 
@@ -2611,7 +2614,7 @@ mod tests {
             ToolPermissionScope::Read,
         );
         let mut plugin = PermissionPlugin::default();
-        plugin.before_tool(first.clone());
+        plugin.admit_tool(first.clone());
         plugin.on_ui_input(UiInput {
             plugin_id: "permission".into(),
             view_id: APPROVAL_VIEW.into(),
@@ -2622,11 +2625,11 @@ mod tests {
             },
         });
 
-        assert_eq!(plugin.before_tool(first), ToolDecision::Allow.into());
-        assert_eq!(plugin.before_tool(similar), ToolDecision::Allow.into());
+        assert_eq!(plugin.admit_tool(first), ToolAdmission::Allow);
+        assert_eq!(plugin.admit_tool(similar), ToolAdmission::Allow);
         assert!(matches!(
-            plugin.before_tool(different),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(different),
+            ToolAdmission::Pending { .. }
         ));
     }
 
@@ -2656,16 +2659,16 @@ mod tests {
         );
         let mut plugin = PermissionPlugin::default();
         assert!(matches!(
-            plugin.before_tool(approved.clone()),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(approved.clone()),
+            ToolAdmission::Pending { .. }
         ));
         plugin.resolve_current(1);
 
-        assert_eq!(plugin.before_tool(approved), ToolDecision::Allow.into());
-        assert_eq!(plugin.before_tool(same_run), ToolDecision::Allow.into());
+        assert_eq!(plugin.admit_tool(approved), ToolAdmission::Allow);
+        assert_eq!(plugin.admit_tool(same_run), ToolAdmission::Allow);
         assert!(matches!(
-            plugin.before_tool(other_run),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(other_run),
+            ToolAdmission::Pending { .. }
         ));
     }
 
@@ -2687,22 +2690,15 @@ mod tests {
             ToolPermissionScope::Read,
         );
         let mut plugin = PermissionPlugin::default();
-        plugin.before_tool(first.clone());
+        plugin.admit_tool(first.clone());
         plugin.resolve_current(1);
-        assert_eq!(plugin.before_tool(first), ToolDecision::Allow.into());
+        assert_eq!(plugin.admit_tool(first), ToolAdmission::Allow);
 
-        plugin.on_event(AgentEvent {
-            id: "finish-rules".into(),
-            run_id: "run-finished".into(),
-            timestamp_ms: 0,
-            kind: AgentEventKind::RunFinished,
-            step: 0,
-            payload: json!({"aborted": true, "host_cleanup": true}),
-        });
+        plugin.on_event(&NoopHostApi, &mut run_finish_event("run-finished"));
 
         assert!(matches!(
-            plugin.before_tool(after_finish),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(after_finish),
+            ToolAdmission::Pending { .. }
         ));
     }
 
@@ -2716,7 +2712,7 @@ mod tests {
             ToolPermissionScope::Read,
         );
         let mut plugin = PermissionPlugin::default();
-        plugin.before_tool(call.clone());
+        plugin.admit_tool(call.clone());
         plugin.on_ui_input(UiInput {
             plugin_id: "permission".into(),
             view_id: APPROVAL_VIEW.into(),
@@ -2728,8 +2724,8 @@ mod tests {
         });
 
         assert!(matches!(
-            plugin.before_tool(call),
-            ToolDecisionStatus::Pending { .. }
+            plugin.admit_tool(call),
+            ToolAdmission::Pending { .. }
         ));
     }
 
@@ -2757,23 +2753,11 @@ mod tests {
         let mut plugin = PermissionPlugin::default();
         plugin.set_mode(PermissionMode::AllowAll);
 
-        assert_eq!(
-            plugin.before_tool(shell),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Allow
-            }
-        );
-        assert_eq!(
-            plugin.before_tool(write),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Allow
-            }
-        );
+        assert_eq!(plugin.admit_tool(shell), ToolAdmission::Allow);
+        assert_eq!(plugin.admit_tool(write), ToolAdmission::Allow);
         assert!(matches!(
-            plugin.before_tool(secret),
-            ToolDecisionStatus::Ready {
-                decision: ToolDecision::Block { .. }
-            }
+            plugin.admit_tool(secret),
+            ToolAdmission::Deny { .. }
         ));
     }
 }

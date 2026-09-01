@@ -1,9 +1,13 @@
 //! 插件宿主组合、动态加载与上下文加载的回归测试。
 
 use super::*;
+use crate::manifest::EventSubscription;
 use crate::ui::{ToolRenderState, UiInputEvent, UiPlacement, UiSize};
 use agent_core::model::ModelMessage;
-use agent_core::{ContextLoadRequest, ContextLoader, LoadedContext};
+use agent_core::{
+    AgentEvent, AgentEventKind, AgentRecordEvent, ContextLoadRequest, ContextLoader, Event,
+    EventBus, EventContext, ListenerPriority, LoadedContext, ToolCallEvent, ToolResultEvent,
+};
 use agent_tool::{ExecutionPolicy, ToolCall, ToolPermissionScope, ToolResult, ToolSpec};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -67,70 +71,146 @@ struct CountingPluginHost {
 struct RewritePluginHost {
     id: &'static str,
     target: &'static str,
+    subscriptions: Vec<EventSubscription>,
+}
+
+impl RewritePluginHost {
+    /// 创建订阅工具准入事件的重写宿主。
+    fn new(id: &'static str, target: &'static str) -> Self {
+        Self {
+            id,
+            target,
+            subscriptions: vec![tool_call_subscription()],
+        }
+    }
+}
+
+/// 构造一条默认优先级的工具准入订阅声明。
+fn tool_call_subscription() -> EventSubscription {
+    EventSubscription {
+        name: ToolCallEvent::NAME.to_string(),
+        priority: ListenerPriority::Normal,
+        ignore_cancelled: false,
+    }
+}
+
+/// 构造一条记录事件订阅声明。
+fn record_subscription() -> EventSubscription {
+    EventSubscription {
+        name: AgentRecordEvent::NAME.to_string(),
+        priority: ListenerPriority::Normal,
+        ignore_cancelled: false,
+    }
 }
 
 #[async_trait]
-impl AgentExtension for RewritePluginHost {
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        Ok(ToolDecision::Rewrite {
-            call: ToolCall::new("伪造调用 ID", self.target, call.args.clone()),
-        })
-    }
-}
+impl AgentExtension for RewritePluginHost {}
 
 #[async_trait]
 impl PluginHost for RewritePluginHost {
     fn id(&self) -> Option<&str> {
         Some(self.id)
     }
+
+    fn event_subscriptions(&self) -> &[EventSubscription] {
+        &self.subscriptions
+    }
+
+    async fn dispatch_event(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        if let Some(event) = ctx.event_mut::<ToolCallEvent>() {
+            // 同时尝试伪造调用 ID，验证 Host 只采纳工具名与参数的改写。
+            event.call.id = "伪造调用 ID".into();
+            event.call.name = self.target.to_string();
+        }
+        Ok(())
+    }
 }
 
 /// 只允许看到最终工具名的测试策略宿主。
-struct FinalPolicyPluginHost;
+struct FinalPolicyPluginHost {
+    subscriptions: Vec<EventSubscription>,
+}
+
+impl FinalPolicyPluginHost {
+    /// 创建只检查最终工具名的策略宿主。
+    fn new() -> Self {
+        Self {
+            subscriptions: vec![tool_call_subscription()],
+        }
+    }
+}
 
 /// 记录最终策略收到的工具名与权限 scope，验证组合宿主的可信绑定顺序。
 struct CapturingScopePolicyPluginHost {
     observed: Arc<std::sync::Mutex<Vec<(String, String, ToolPermissionScope, Option<String>)>>>,
+    subscriptions: Vec<EventSubscription>,
+}
+
+impl CapturingScopePolicyPluginHost {
+    /// 创建记录最终工具准入视图的策略宿主。
+    fn new(
+        observed: Arc<std::sync::Mutex<Vec<(String, String, ToolPermissionScope, Option<String>)>>>,
+    ) -> Self {
+        Self {
+            observed,
+            subscriptions: vec![tool_call_subscription()],
+        }
+    }
 }
 
 #[async_trait]
-impl AgentExtension for CapturingScopePolicyPluginHost {
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        self.observed
-            .lock()
-            .expect("权限 scope 观察锁不应中毒")
-            .push((
-                call.id.clone(),
-                call.name.clone(),
-                call.permission_scope,
-                call.run_id.clone(),
-            ));
-        Ok(ToolDecision::Allow)
-    }
-}
+impl AgentExtension for CapturingScopePolicyPluginHost {}
 
 #[async_trait]
 impl PluginHost for CapturingScopePolicyPluginHost {
     fn id(&self) -> Option<&str> {
         Some("scope-policy")
     }
+
+    fn event_subscriptions(&self) -> &[EventSubscription] {
+        &self.subscriptions
+    }
+
+    async fn dispatch_event(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        if let Some(event) = ctx.event::<ToolCallEvent>() {
+            self.observed
+                .lock()
+                .expect("权限 scope 观察锁不应中毒")
+                .push((
+                    event.call.id.clone(),
+                    event.call.name.clone(),
+                    event.call.permission_scope,
+                    event.call.run_id.clone(),
+                ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
-impl AgentExtension for FinalPolicyPluginHost {
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        if call.name == "rewritten" {
-            Ok(ToolDecision::block("最终策略已检查重写调用"))
-        } else {
-            Ok(ToolDecision::Allow)
-        }
-    }
-}
+impl AgentExtension for FinalPolicyPluginHost {}
 
 #[async_trait]
 impl PluginHost for FinalPolicyPluginHost {
     fn id(&self) -> Option<&str> {
         Some("policy")
+    }
+
+    fn event_subscriptions(&self) -> &[EventSubscription] {
+        &self.subscriptions
+    }
+
+    async fn dispatch_event(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        let rewritten = ctx
+            .event::<ToolCallEvent>()
+            .is_some_and(|event| event.call.name == "rewritten");
+        if rewritten {
+            if let Some(event) = ctx.event_mut::<ToolCallEvent>() {
+                event.block_reason = Some("最终策略已检查重写调用".into());
+            }
+            ctx.cancel();
+        }
+        Ok(())
     }
 }
 
@@ -189,6 +269,7 @@ impl PluginHost for CleanupPluginHost {
 /// 为 Live Host 注入最终事件排空和异常清理故障的测试插件。
 struct RetryableRunCleanupPluginHost {
     id: &'static str,
+    subscriptions: Vec<EventSubscription>,
     finish_events: Arc<AtomicUsize>,
     drain_calls: Arc<AtomicUsize>,
     cleanup_calls: Arc<AtomicUsize>,
@@ -204,13 +285,6 @@ impl AgentExtension for RetryableRunCleanupPluginHost {
             "运行清理探针",
             ToolSpec::empty_object_schema(),
         )])
-    }
-
-    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
-        if event.kind == AgentEventKind::RunFinished {
-            self.finish_events.fetch_add(1, Ordering::SeqCst);
-        }
-        Ok(())
     }
 
     async fn drain_events_for_run(&self, _run_id: &str) -> Result<Vec<serde_json::Value>> {
@@ -234,6 +308,20 @@ impl AgentExtension for RetryableRunCleanupPluginHost {
 impl PluginHost for RetryableRunCleanupPluginHost {
     fn id(&self) -> Option<&str> {
         Some(self.id)
+    }
+
+    fn event_subscriptions(&self) -> &[EventSubscription] {
+        &self.subscriptions
+    }
+
+    async fn dispatch_event(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        let finished = ctx
+            .event::<AgentRecordEvent>()
+            .is_some_and(|event| event.record.kind == AgentEventKind::RunFinished);
+        if finished {
+            self.finish_events.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
     }
 }
 
@@ -274,6 +362,7 @@ struct SnapshotPluginHost {
     events: Arc<Mutex<Vec<String>>>,
     pending_events: Arc<Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>>,
     finished_runs: Arc<Mutex<Vec<String>>>,
+    subscriptions: Vec<EventSubscription>,
 }
 
 #[async_trait]
@@ -305,41 +394,6 @@ impl AgentExtension for SnapshotPluginHost {
         )))
     }
 
-    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
-        self.before_calls
-            .lock()
-            .expect("前置调用观察锁不应中毒")
-            .push(call.run_id.clone().unwrap_or_default());
-        if self.deny_tool == Some(call.name.as_str()) {
-            return Ok(ToolDecision::block("快照策略拒绝测试工具"));
-        }
-        Ok(ToolDecision::Allow)
-    }
-
-    async fn after_tool(&self, result: &ToolResult) -> Result<()> {
-        self.after_calls
-            .lock()
-            .expect("后置调用观察锁不应中毒")
-            .push(result.call_id.clone());
-        Ok(())
-    }
-
-    async fn on_event(&self, event: &AgentEvent) -> Result<()> {
-        if event.kind == AgentEventKind::TurnStarted {
-            self.events
-                .lock()
-                .expect("生命周期事件观察锁不应中毒")
-                .push(event.run_id.clone());
-            self.pending_events
-                .lock()
-                .expect("扩展事件队列锁不应中毒")
-                .entry(event.run_id.clone())
-                .or_default()
-                .push(json!({"plugin": self.id, "run_id": event.run_id}));
-        }
-        Ok(())
-    }
-
     async fn drain_events(&self) -> Result<Vec<serde_json::Value>> {
         Ok(Vec::new())
     }
@@ -366,6 +420,55 @@ impl AgentExtension for SnapshotPluginHost {
 impl PluginHost for SnapshotPluginHost {
     fn id(&self) -> Option<&str> {
         Some(self.id)
+    }
+
+    fn event_subscriptions(&self) -> &[EventSubscription] {
+        &self.subscriptions
+    }
+
+    async fn dispatch_event(&self, ctx: &mut EventContext<'_>) -> Result<()> {
+        if let Some(event) = ctx.event::<AgentRecordEvent>() {
+            if event.record.kind == AgentEventKind::TurnStarted {
+                let run_id = event.record.run_id.clone();
+                self.events
+                    .lock()
+                    .expect("生命周期事件观察锁不应中毒")
+                    .push(run_id.clone());
+                self.pending_events
+                    .lock()
+                    .expect("扩展事件队列锁不应中毒")
+                    .entry(run_id.clone())
+                    .or_default()
+                    .push(json!({"plugin": self.id, "run_id": run_id}));
+            }
+            return Ok(());
+        }
+        if let Some(event) = ctx.event::<ToolResultEvent>() {
+            self.after_calls
+                .lock()
+                .expect("后置调用观察锁不应中毒")
+                .push(event.result.call_id.clone());
+            return Ok(());
+        }
+        let denied = ctx.event::<ToolCallEvent>().map(|event| {
+            (
+                event.call.run_id.clone().unwrap_or_default(),
+                self.deny_tool == Some(event.call.name.as_str()),
+            )
+        });
+        if let Some((run_id, denied)) = denied {
+            self.before_calls
+                .lock()
+                .expect("前置调用观察锁不应中毒")
+                .push(run_id);
+            if denied {
+                if let Some(event) = ctx.event_mut::<ToolCallEvent>() {
+                    event.block_reason = Some("快照策略拒绝测试工具".into());
+                }
+                ctx.cancel();
+            }
+        }
+        Ok(())
     }
 
     async fn load_context(&self, request: &ContextLoadRequest) -> Result<Option<LoadedContext>> {
@@ -642,153 +745,6 @@ async fn tool_call_routes_only_to_owner() {
     assert_eq!(result.content["owner"], "second_tool");
     assert_eq!(first_calls.load(Ordering::SeqCst), 0);
     assert_eq!(second_calls.load(Ordering::SeqCst), 1);
-}
-
-/// 独占工具策略 owner 必须在其他插件完成 Rewrite 后执行。
-#[tokio::test]
-async fn selected_tool_policy_checks_final_rewritten_call() {
-    let mut host = CompositePluginHost::new();
-    host.push(Arc::new(FinalPolicyPluginHost));
-    host.push(Arc::new(RewritePluginHost {
-        id: "rewriter",
-        target: "rewritten",
-    }));
-    host.set_capability_owner(manifest::TOOL_POLICY_CAPABILITY, "policy");
-
-    let decision = host
-        .before_tool(&ToolCall::new("call", "original", json!({})))
-        .await
-        .expect("最终策略检查不应失败");
-
-    assert!(matches!(decision, ToolDecision::Block { .. }));
-}
-
-/// 最终策略 owner 可以改写目标与参数，但不得伪造 Core 绑定的调用 ID 或运行身份。
-#[tokio::test]
-async fn selected_tool_policy_rewrite_preserves_trusted_call_identity() {
-    let mut host = CompositePluginHost::new();
-    host.push(Arc::new(RewritePluginHost {
-        id: "policy",
-        target: "rewritten",
-    }));
-    host.set_capability_owner(manifest::TOOL_POLICY_CAPABILITY, "policy");
-    let mut call = ToolCall::new("trusted-call", "original", json!({}));
-    call.bind_permission_scope(ToolPermissionScope::Read);
-    call.bind_run_id("trusted-run");
-
-    let decision = host
-        .before_tool(&call)
-        .await
-        .expect("最终策略重写应被可信 Host 重新绑定");
-
-    assert!(matches!(
-        decision,
-        ToolDecision::Rewrite { call }
-            if call.id == "trusted-call"
-                && call.name == "rewritten"
-                && call.permission_scope == ToolPermissionScope::Unknown
-                && call.run_id.as_deref() == Some("trusted-run")
-    ));
-}
-
-/// 插件工具调用携带的伪造 scope 必须被最近一次可信 ToolSpec 快照覆盖。
-#[tokio::test]
-async fn composite_host_binds_registered_tool_permission_scope() {
-    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut host = CompositePluginHost::new();
-    host.push(Arc::new(CapturingScopePolicyPluginHost {
-        observed: observed.clone(),
-    }));
-    host.push(Arc::new(CountingPluginHost {
-        id: "tool-owner",
-        tool: ToolSpec::new(
-            "scoped_tool",
-            "声明读取权限的工具",
-            ToolSpec::empty_object_schema(),
-        )
-        .with_permission_scope(ToolPermissionScope::Read),
-        calls: Arc::new(AtomicUsize::new(0)),
-    }));
-    host.set_capability_owner(manifest::TOOL_POLICY_CAPABILITY, "scope-policy");
-    host.list_tools().await.expect("建立可信工具 scope 快照");
-    let mut call = ToolCall::new("scoped-call", "scoped_tool", json!({}));
-    call.bind_permission_scope(ToolPermissionScope::Shell);
-    call.bind_run_id("scope-run");
-
-    let decision = host.before_tool(&call).await.expect("执行最终 scope 策略");
-
-    assert!(matches!(
-        decision,
-        ToolDecision::Rewrite { call }
-            if call.name == "scoped_tool"
-                && call.permission_scope == ToolPermissionScope::Read
-                && call.run_id.as_deref() == Some("scope-run")
-    ));
-    assert_eq!(
-        observed
-            .lock()
-            .expect("权限 scope 观察锁不应中毒")
-            .as_slice(),
-        &[(
-            "scoped-call".into(),
-            "scoped_tool".into(),
-            ToolPermissionScope::Read,
-            Some("scope-run".into()),
-        )]
-    );
-}
-
-/// Rewrite 改名到未注册目标时必须降级 unknown，不能沿用来源工具的已授权 scope。
-#[tokio::test]
-async fn composite_host_downgrades_unknown_rewrite_permission_scope() {
-    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut host = CompositePluginHost::new();
-    host.push(Arc::new(CapturingScopePolicyPluginHost {
-        observed: observed.clone(),
-    }));
-    host.push(Arc::new(CountingPluginHost {
-        id: "tool-owner",
-        tool: ToolSpec::new(
-            "rewrite_source",
-            "重写来源工具",
-            ToolSpec::empty_object_schema(),
-        )
-        .with_permission_scope(ToolPermissionScope::Read),
-        calls: Arc::new(AtomicUsize::new(0)),
-    }));
-    host.push(Arc::new(RewritePluginHost {
-        id: "rewriter",
-        target: "unregistered_target",
-    }));
-    host.set_capability_owner(manifest::TOOL_POLICY_CAPABILITY, "scope-policy");
-    host.list_tools().await.expect("建立 Rewrite scope 快照");
-
-    let mut call = ToolCall::new("rewrite-call", "rewrite_source", json!({}));
-    call.bind_run_id("rewrite-run");
-    let decision = host
-        .before_tool(&call)
-        .await
-        .expect("执行 Rewrite scope 策略");
-
-    assert!(matches!(
-        decision,
-        ToolDecision::Rewrite { call }
-            if call.name == "unregistered_target"
-                && call.permission_scope == ToolPermissionScope::Unknown
-                && call.run_id.as_deref() == Some("rewrite-run")
-    ));
-    assert_eq!(
-        observed
-            .lock()
-            .expect("权限 scope 观察锁不应中毒")
-            .as_slice(),
-        &[(
-            "rewrite-call".into(),
-            "unregistered_target".into(),
-            ToolPermissionScope::Unknown,
-            Some("rewrite-run".into()),
-        )]
-    );
 }
 
 /// UI 声明必须使用可信宿主 ID，渲染和输入只能调用对应 owner。
@@ -1139,6 +1095,8 @@ async fn composite_host_finish_run_attempts_all_plugins_after_failure() {
 #[tokio::test]
 async fn live_host_freezes_tools_until_next_run() {
     let live = LivePluginHost::new();
+    let bus = EventBus::new();
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
     let first_calls = Arc::new(AtomicUsize::new(0));
     live.publish(Arc::new(CountingPluginHost {
         id: "first",
@@ -1147,8 +1105,7 @@ async fn live_host_freezes_tools_until_next_run() {
     }))
     .expect("发布首个插件");
 
-    let started = AgentEvent::new("run-1", AgentEventKind::RunStarted, 0, json!({}));
-    live.on_event(&started).await.expect("冻结首轮插件快照");
+    dispatch_record(&bus, "run-1", AgentEventKind::RunStarted, 0).await;
     assert_eq!(
         live.list_tools()
             .await
@@ -1174,12 +1131,9 @@ async fn live_host_freezes_tools_until_next_run() {
         .expect("未进入快照的工具应安全返回");
     assert!(unavailable.is_none());
 
-    let finished = AgentEvent::new("run-1", AgentEventKind::RunFinished, 1, json!({}));
-    live.on_event(&finished).await.expect("结束首轮快照");
-    let next_started = AgentEvent::new("run-2", AgentEventKind::RunStarted, 0, json!({}));
-    live.on_event(&next_started)
-        .await
-        .expect("冻结下一轮插件快照");
+    dispatch_record(&bus, "run-1", AgentEventKind::RunFinished, 1).await;
+    live.finish_run("run-1").await.expect("释放首轮快照");
+    dispatch_record(&bus, "run-2", AgentEventKind::RunStarted, 0).await;
     assert_eq!(live.list_tools().await.expect("读取下一轮工具").len(), 2);
     live.call_tool(ToolCall::new("call-3", "second_tool", json!({})))
         .await
@@ -1193,12 +1147,15 @@ async fn live_host_freezes_tools_until_next_run() {
 #[tokio::test]
 async fn live_host_isolates_concurrent_run_snapshots() {
     let live = LivePluginHost::new();
+    let bus = EventBus::new();
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
     let first_calls = Arc::new(Mutex::new(Vec::new()));
     let first_before = Arc::new(Mutex::new(Vec::new()));
     let first_after = Arc::new(Mutex::new(Vec::new()));
     let first_events = Arc::new(Mutex::new(Vec::new()));
     let first_finished = Arc::new(Mutex::new(Vec::new()));
     live.publish(Arc::new(SnapshotPluginHost {
+        subscriptions: snapshot_subscriptions(),
         id: "first",
         tool_name: "first_tool",
         prompt: "第一快照提示",
@@ -1215,12 +1172,7 @@ async fn live_host_isolates_concurrent_run_snapshots() {
     live.set_capability_owner(manifest::CONTEXT_LOADER_CAPABILITY, "first")
         .expect("选择首个上下文 owner");
     live.finish_capability_planning().expect("完成能力规划");
-    live.on_event_for_run(
-        "run-a",
-        &AgentEvent::new("run-a", AgentEventKind::RunStarted, 0, json!({})),
-    )
-    .await
-    .expect("冻结首个运行快照");
+    dispatch_record(&bus, "run-a", AgentEventKind::RunStarted, 0).await;
 
     let second_calls = Arc::new(Mutex::new(Vec::new()));
     let second_before = Arc::new(Mutex::new(Vec::new()));
@@ -1228,6 +1180,7 @@ async fn live_host_isolates_concurrent_run_snapshots() {
     let second_events = Arc::new(Mutex::new(Vec::new()));
     let second_finished = Arc::new(Mutex::new(Vec::new()));
     live.publish(Arc::new(SnapshotPluginHost {
+        subscriptions: snapshot_subscriptions(),
         id: "second",
         tool_name: "second_tool",
         prompt: "第二快照提示",
@@ -1243,12 +1196,7 @@ async fn live_host_isolates_concurrent_run_snapshots() {
     .expect("发布第二个快照插件");
     live.set_capability_owner(manifest::CONTEXT_LOADER_CAPABILITY, "second")
         .expect("切换后续运行的上下文 owner");
-    live.on_event_for_run(
-        "run-b",
-        &AgentEvent::new("run-b", AgentEventKind::RunStarted, 0, json!({})),
-    )
-    .await
-    .expect("冻结第二个运行快照");
+    dispatch_record(&bus, "run-b", AgentEventKind::RunStarted, 0).await;
 
     let run_a_tools = live
         .list_tools_for_run("run-a")
@@ -1286,20 +1234,22 @@ async fn live_host_isolates_concurrent_run_snapshots() {
 
     let mut run_a_before = ToolCall::new("before-a", "native_blocked", json!({}));
     run_a_before.bind_run_id("run-a");
-    assert_eq!(
-        live.before_tool_for_run("run-a", &run_a_before)
-            .await
-            .expect("首个运行不应看到后发布策略"),
-        ToolDecision::Allow
+    let run_a_admission = bus
+        .dispatch(ToolCallEvent::new("run-a", 0, run_a_before))
+        .await;
+    assert!(
+        !run_a_admission.is_cancelled(),
+        "首个运行不应看到后发布的策略插件"
     );
     let mut run_b_before = ToolCall::new("before-b", "native_blocked", json!({}));
     run_b_before.bind_run_id("run-b");
-    assert!(matches!(
-        live.before_tool_for_run("run-b", &run_b_before)
-            .await
-            .expect("第二个运行应经过后发布策略"),
-        ToolDecision::Block { .. }
-    ));
+    let run_b_admission = bus
+        .dispatch(ToolCallEvent::new("run-b", 0, run_b_before))
+        .await;
+    assert!(
+        run_b_admission.is_cancelled(),
+        "第二个运行应经过后发布的策略插件"
+    );
 
     let mut unavailable = ToolCall::new("call-a", "second_tool", json!({}));
     unavailable.bind_run_id("run-a");
@@ -1323,18 +1273,20 @@ async fn live_host_isolates_concurrent_run_snapshots() {
         .to_string()
         .contains("run_id 与可信运行不一致"));
 
-    live.after_tool_for_run(
-        "run-a",
-        &ToolResult::success("after-a", "native", json!({})),
-    )
-    .await
-    .expect("首个运行后置钩子应成功");
-    live.after_tool_for_run(
-        "run-b",
-        &ToolResult::success("after-b", "native", json!({})),
-    )
-    .await
-    .expect("第二个运行后置钩子应成功");
+    bus.dispatch(ToolResultEvent {
+        run_id: "run-a".into(),
+        step: 0,
+        result: ToolResult::success("after-a", "native", json!({})),
+        origin: "native".into(),
+    })
+    .await;
+    bus.dispatch(ToolResultEvent {
+        run_id: "run-b".into(),
+        step: 0,
+        result: ToolResult::success("after-b", "native", json!({})),
+        origin: "native".into(),
+    })
+    .await;
 
     let context_request = |run_id: &str| ContextLoadRequest {
         run_id: run_id.into(),
@@ -1356,14 +1308,10 @@ async fn live_host_isolates_concurrent_run_snapshots() {
     assert_eq!(run_a_context.messages[0].text_content(), "第一快照上下文");
     assert_eq!(run_b_context.messages[0].text_content(), "第二快照上下文");
 
-    let run_a_event = AgentEvent::new("run-a", AgentEventKind::TurnStarted, 1, json!({}));
-    let run_b_event = AgentEvent::new("run-b", AgentEventKind::TurnStarted, 1, json!({}));
-    let (run_a_routed, run_b_routed) = tokio::join!(
-        live.on_event_for_run("run-a", &run_a_event),
-        live.on_event_for_run("run-b", &run_b_event),
+    tokio::join!(
+        dispatch_record(&bus, "run-a", AgentEventKind::TurnStarted, 1),
+        dispatch_record(&bus, "run-b", AgentEventKind::TurnStarted, 1),
     );
-    run_a_routed.expect("并发路由首个运行事件");
-    run_b_routed.expect("并发路由第二个运行事件");
     let run_a_events = live
         .drain_events_for_run("run-a")
         .await
@@ -1414,12 +1362,7 @@ async fn live_host_isolates_concurrent_run_snapshots() {
         ["run-b"]
     );
 
-    live.on_event_for_run(
-        "run-a",
-        &AgentEvent::new("run-a", AgentEventKind::RunFinished, 2, json!({})),
-    )
-    .await
-    .expect("结束首个运行");
+    dispatch_record(&bus, "run-a", AgentEventKind::RunFinished, 2).await;
     assert!(live.list_tools_for_run("run-a").await.is_err());
     live.drain_events_for_run("run-a")
         .await
@@ -1439,12 +1382,7 @@ async fn live_host_isolates_concurrent_run_snapshots() {
         2
     );
 
-    live.on_event_for_run(
-        "run-b",
-        &AgentEvent::new("run-b", AgentEventKind::RunFinished, 2, json!({})),
-    )
-    .await
-    .expect("结束第二个运行");
+    dispatch_record(&bus, "run-b", AgentEventKind::RunFinished, 2).await;
     live.drain_events_for_run("run-b")
         .await
         .expect("排空第二个运行结束事件");
@@ -1458,12 +1396,7 @@ async fn live_host_isolates_concurrent_run_snapshots() {
         .expect("读取第二个正常清理观察")
         .is_empty());
 
-    live.on_event_for_run(
-        "run-aborted",
-        &AgentEvent::new("run-aborted", AgentEventKind::RunStarted, 0, json!({})),
-    )
-    .await
-    .expect("冻结异常运行快照");
+    dispatch_record(&bus, "run-aborted", AgentEventKind::RunStarted, 0).await;
     live.finish_run("run-aborted")
         .await
         .expect("异常路径应通知底层插件清理");
@@ -1487,12 +1420,15 @@ async fn live_host_isolates_concurrent_run_snapshots() {
 #[tokio::test]
 async fn live_host_requires_finish_callback_and_final_drain_before_release() {
     let live = LivePluginHost::new();
+    let bus = EventBus::new();
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
     let finish_events = Arc::new(AtomicUsize::new(0));
     let drain_calls = Arc::new(AtomicUsize::new(0));
     let cleanup_calls = Arc::new(AtomicUsize::new(0));
     let fail_next_drain = Arc::new(AtomicBool::new(false));
     let fail_next_cleanup = Arc::new(AtomicBool::new(false));
     live.publish(Arc::new(RetryableRunCleanupPluginHost {
+        subscriptions: vec![record_subscription()],
         id: "cleanup",
         finish_events: Arc::clone(&finish_events),
         drain_calls: Arc::clone(&drain_calls),
@@ -1502,22 +1438,8 @@ async fn live_host_requires_finish_callback_and_final_drain_before_release() {
     }))
     .expect("发布清理测试插件");
 
-    live.on_event(&AgentEvent::new(
-        "run-normal",
-        AgentEventKind::RunStarted,
-        0,
-        json!({}),
-    ))
-    .await
-    .expect("开始正常运行");
-    live.on_event(&AgentEvent::new(
-        "run-normal",
-        AgentEventKind::RunFinished,
-        1,
-        json!({}),
-    ))
-    .await
-    .expect("通知正常运行结束");
+    dispatch_record(&bus, "run-normal", AgentEventKind::RunStarted, 0).await;
+    dispatch_record(&bus, "run-normal", AgentEventKind::RunFinished, 1).await;
     live.drain_events_for_run("run-normal")
         .await
         .expect("正常运行应完成最终事件排空");
@@ -1528,22 +1450,8 @@ async fn live_host_requires_finish_callback_and_final_drain_before_release() {
     assert_eq!(drain_calls.load(Ordering::SeqCst), 1);
     assert_eq!(cleanup_calls.load(Ordering::SeqCst), 0);
 
-    live.on_event(&AgentEvent::new(
-        "run-without-drain",
-        AgentEventKind::RunStarted,
-        0,
-        json!({}),
-    ))
-    .await
-    .expect("开始缺少最终排空的运行");
-    live.on_event(&AgentEvent::new(
-        "run-without-drain",
-        AgentEventKind::RunFinished,
-        1,
-        json!({}),
-    ))
-    .await
-    .expect("通知缺少最终排空的运行结束");
+    dispatch_record(&bus, "run-without-drain", AgentEventKind::RunStarted, 0).await;
+    dispatch_record(&bus, "run-without-drain", AgentEventKind::RunFinished, 1).await;
     live.finish_run("run-without-drain")
         .await
         .expect("缺少最终排空时应由 Live Host 补做排空");
@@ -1551,22 +1459,8 @@ async fn live_host_requires_finish_callback_and_final_drain_before_release() {
     assert_eq!(drain_calls.load(Ordering::SeqCst), 2);
     assert_eq!(cleanup_calls.load(Ordering::SeqCst), 0);
 
-    live.on_event(&AgentEvent::new(
-        "run-drain-failed",
-        AgentEventKind::RunStarted,
-        0,
-        json!({}),
-    ))
-    .await
-    .expect("开始最终排空失败的运行");
-    live.on_event(&AgentEvent::new(
-        "run-drain-failed",
-        AgentEventKind::RunFinished,
-        1,
-        json!({}),
-    ))
-    .await
-    .expect("通知最终排空失败的运行结束");
+    dispatch_record(&bus, "run-drain-failed", AgentEventKind::RunStarted, 0).await;
+    dispatch_record(&bus, "run-drain-failed", AgentEventKind::RunFinished, 1).await;
     fail_next_drain.store(true, Ordering::SeqCst);
     live.drain_events_for_run("run-drain-failed")
         .await
@@ -1583,9 +1477,12 @@ async fn live_host_requires_finish_callback_and_final_drain_before_release() {
 #[tokio::test]
 async fn live_host_retries_cleanup_within_single_finish_call() {
     let live = LivePluginHost::new();
+    let bus = EventBus::new();
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
     let cleanup_calls = Arc::new(AtomicUsize::new(0));
     let fail_next_cleanup = Arc::new(AtomicBool::new(true));
     live.publish(Arc::new(RetryableRunCleanupPluginHost {
+        subscriptions: vec![record_subscription()],
         id: "cleanup",
         finish_events: Arc::new(AtomicUsize::new(0)),
         drain_calls: Arc::new(AtomicUsize::new(0)),
@@ -1594,14 +1491,7 @@ async fn live_host_retries_cleanup_within_single_finish_call() {
         fail_next_cleanup: Arc::clone(&fail_next_cleanup),
     }))
     .expect("发布可重试清理测试插件");
-    live.on_event(&AgentEvent::new(
-        "run-retry",
-        AgentEventKind::RunStarted,
-        0,
-        json!({}),
-    ))
-    .await
-    .expect("开始异常运行");
+    dispatch_record(&bus, "run-retry", AgentEventKind::RunStarted, 0).await;
 
     live.finish_run("run-retry")
         .await
@@ -1619,20 +1509,15 @@ async fn live_host_retries_cleanup_within_single_finish_call() {
 #[tokio::test]
 async fn live_host_bounds_hanging_cleanup_and_retries_internally() {
     let live = LivePluginHost::new();
+    let bus = EventBus::new();
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
     let cleanup_calls = Arc::new(AtomicUsize::new(0));
     live.publish(Arc::new(CancellableRunCleanupPluginHost {
         cleanup_calls: Arc::clone(&cleanup_calls),
         entered: Arc::new(tokio::sync::Notify::new()),
     }))
     .expect("发布超时清理测试插件");
-    live.on_event(&AgentEvent::new(
-        "run-hanging-cleanup",
-        AgentEventKind::RunStarted,
-        0,
-        json!({}),
-    ))
-    .await
-    .expect("开始清理将超时的运行");
+    dispatch_record(&bus, "run-hanging-cleanup", AgentEventKind::RunStarted, 0).await;
 
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1648,6 +1533,8 @@ async fn live_host_bounds_hanging_cleanup_and_retries_internally() {
 #[tokio::test]
 async fn live_host_recovers_cleanup_state_when_future_is_cancelled() {
     let live = LivePluginHost::new();
+    let bus = EventBus::new();
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
     let cleanup_calls = Arc::new(AtomicUsize::new(0));
     let entered = Arc::new(tokio::sync::Notify::new());
     live.publish(Arc::new(CancellableRunCleanupPluginHost {
@@ -1655,14 +1542,7 @@ async fn live_host_recovers_cleanup_state_when_future_is_cancelled() {
         entered: Arc::clone(&entered),
     }))
     .expect("发布可取消清理测试插件");
-    live.on_event(&AgentEvent::new(
-        "run-cancelled-cleanup",
-        AgentEventKind::RunStarted,
-        0,
-        json!({}),
-    ))
-    .await
-    .expect("开始清理将被取消的运行");
+    dispatch_record(&bus, "run-cancelled-cleanup", AgentEventKind::RunStarted, 0).await;
 
     let cleanup_task = tokio::spawn({
         let live = live.clone();
@@ -1685,6 +1565,8 @@ async fn live_host_recovers_cleanup_state_when_future_is_cancelled() {
 #[tokio::test]
 async fn live_host_releases_snapshot_after_bounded_cleanup_failure() {
     let live = LivePluginHost::new();
+    let bus = EventBus::new();
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
     let calls = Arc::new(Mutex::new(Vec::new()));
     live.publish(Arc::new(CleanupPluginHost {
         id: "always-fails",
@@ -1692,14 +1574,7 @@ async fn live_host_releases_snapshot_after_bounded_cleanup_failure() {
         fail: true,
     }))
     .expect("发布持续失败的清理测试插件");
-    live.on_event(&AgentEvent::new(
-        "run-bounded-failure",
-        AgentEventKind::RunStarted,
-        0,
-        json!({}),
-    ))
-    .await
-    .expect("开始持续清理失败的运行");
+    dispatch_record(&bus, "run-bounded-failure", AgentEventKind::RunStarted, 0).await;
 
     let error = live
         .finish_run("run-bounded-failure")
@@ -1714,22 +1589,8 @@ async fn live_host_releases_snapshot_after_bounded_cleanup_failure() {
         ]
     );
 
-    live.on_event(&AgentEvent::new(
-        "run-bounded-failure",
-        AgentEventKind::RunStarted,
-        0,
-        json!({}),
-    ))
-    .await
-    .expect("最终失败后同一 run_id 应能重新建立快照");
-    live.on_event(&AgentEvent::new(
-        "run-bounded-failure",
-        AgentEventKind::RunFinished,
-        1,
-        json!({}),
-    ))
-    .await
-    .expect("重新建立的运行应正常结束");
+    dispatch_record(&bus, "run-bounded-failure", AgentEventKind::RunStarted, 0).await;
+    dispatch_record(&bus, "run-bounded-failure", AgentEventKind::RunFinished, 1).await;
     live.drain_events_for_run("run-bounded-failure")
         .await
         .expect("重新建立的运行应完成最终排空");
@@ -1742,6 +1603,8 @@ async fn live_host_releases_snapshot_after_bounded_cleanup_failure() {
 #[tokio::test]
 async fn live_host_publishes_plugins_in_planned_order() {
     let live = LivePluginHost::new();
+    let bus = EventBus::new();
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
     live.set_plugin_order(&["first".into(), "second".into()])
         .expect("设置稳定计划顺序");
     live.publish(Arc::new(CountingPluginHost {
@@ -1771,55 +1634,262 @@ async fn live_host_publishes_plugins_in_planned_order() {
 #[tokio::test]
 async fn live_host_blocks_tools_until_selected_policy_is_ready() {
     let live = LivePluginHost::new();
+    let bus = EventBus::new();
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
     live.set_capability_owner(manifest::TOOL_POLICY_CAPABILITY, "permission")
         .expect("设置策略 owner");
     live.finish_capability_planning().expect("完成能力规划");
-    live.on_event(&AgentEvent::new(
-        "run-policy",
-        AgentEventKind::RunStarted,
-        0,
-        json!({}),
-    ))
-    .await
-    .expect("冻结缺少策略插件的快照");
+    dispatch_record(&bus, "run-policy", AgentEventKind::RunStarted, 0).await;
 
-    let decision = live
-        .before_tool(&ToolCall::new("native-1", "shell", json!({})))
-        .await
-        .expect("缺少策略时返回可解释阻止结果");
-    assert!(matches!(
-        decision,
-        ToolDecision::Block {
-            reason,
-            agent_guidance: Some(guidance),
-        } if reason.contains("仍在加载")
-            && !guidance.contains("permission")
-            && guidance.contains("稍后再尝试")
-    ));
+    let mut call = ToolCall::new("native-1", "shell", json!({}));
+    call.bind_run_id("run-policy");
+    let dispatched = bus
+        .dispatch(ToolCallEvent::new("run-policy", 0, call))
+        .await;
+
+    assert!(dispatched.is_cancelled());
+    let reason = dispatched.event.block_reason.expect("应给出可解释阻止原因");
+    let guidance = dispatched.event.agent_guidance.expect("应附带一次性指导");
+    assert!(reason.contains("仍在加载"));
+    assert!(!guidance.contains("permission"));
+    assert!(guidance.contains("稍后再尝试"));
 }
 
 /// 独占能力归属尚未解析时必须默认阻止工具，避免启动竞态形成策略空窗。
 #[tokio::test]
 async fn live_host_blocks_tools_while_capability_planning_is_pending() {
     let live = LivePluginHost::new();
-    live.on_event(&AgentEvent::new(
-        "run-planning",
-        AgentEventKind::RunStarted,
-        0,
-        json!({}),
-    ))
-    .await
-    .expect("冻结能力规划中的插件快照");
+    let bus = EventBus::new();
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
+    dispatch_record(&bus, "run-planning", AgentEventKind::RunStarted, 0).await;
 
-    let decision = live
-        .before_tool(&ToolCall::new("native-1", "shell", json!({})))
-        .await
-        .expect("能力规划中返回可解释阻止结果");
-    assert!(matches!(
-        decision,
-        ToolDecision::Block {
-            reason,
-            agent_guidance: Some(guidance),
-        } if reason.contains("能力归属仍在解析") && guidance.contains("稍后再尝试")
-    ));
+    let mut call = ToolCall::new("native-1", "shell", json!({}));
+    call.bind_run_id("run-planning");
+    let dispatched = bus
+        .dispatch(ToolCallEvent::new("run-planning", 0, call))
+        .await;
+
+    assert!(dispatched.is_cancelled());
+    let reason = dispatched.event.block_reason.expect("应给出可解释阻止原因");
+    let guidance = dispatched.event.agent_guidance.expect("应附带一次性指导");
+    assert!(reason.contains("能力归属仍在解析"));
+    assert!(guidance.contains("稍后再尝试"));
+}
+
+/// 装配一台挂载总线、已完成能力规划并开启一次运行快照的动态宿主。
+///
+/// 工具准入路径现在由总线负责排序与取消收敛，因此这类测试必须经过真实的
+/// `LivePluginHost` 扇出，而不是直接调用组合宿主。
+async fn live_host_with_run(
+    hosts: Vec<Arc<dyn PluginHost>>,
+    policy_owner: Option<&str>,
+    run_id: &str,
+) -> (LivePluginHost, EventBus) {
+    let live = LivePluginHost::new();
+    let bus = EventBus::new();
+    let ids = hosts
+        .iter()
+        .filter_map(|host| host.id().map(str::to_string))
+        .collect::<Vec<_>>();
+    live.set_plugin_order(&ids).expect("记录稳定加载顺序");
+    if let Some(owner) = policy_owner {
+        live.set_capability_owner(manifest::TOOL_POLICY_CAPABILITY, owner)
+            .expect("记录工具策略 owner");
+    }
+    for host in hosts {
+        live.publish(host).expect("发布测试插件");
+    }
+    live.finish_capability_planning().expect("标记能力规划完成");
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
+
+    // 运行快照由 RunStarted 记录事件开启，与真实 Core 的发布顺序一致。
+    bus.dispatch(AgentRecordEvent {
+        record: AgentEvent::new(run_id, AgentEventKind::RunStarted, 0, json!({})),
+    })
+    .await;
+    (live, bus)
+}
+
+/// 独占工具策略 owner 必须在其他插件完成改写后执行。
+#[tokio::test]
+async fn selected_tool_policy_checks_final_rewritten_call() {
+    let (_live, bus) = live_host_with_run(
+        vec![
+            Arc::new(FinalPolicyPluginHost::new()),
+            Arc::new(RewritePluginHost::new("rewriter", "rewritten")),
+        ],
+        Some("policy"),
+        "policy-run",
+    )
+    .await;
+    let mut call = ToolCall::new("call", "original", json!({}));
+    call.bind_run_id("policy-run");
+
+    let dispatched = bus
+        .dispatch(ToolCallEvent::new("policy-run", 0, call))
+        .await;
+
+    assert!(dispatched.is_cancelled());
+    assert_eq!(dispatched.canceller(), Some("lucia.plugin-host"));
+    assert_eq!(
+        dispatched.event.block_reason.as_deref(),
+        Some("最终策略已检查重写调用")
+    );
+}
+
+/// 最终策略 owner 可以改写目标与参数，但不得伪造 Core 绑定的调用 ID 或运行身份。
+#[tokio::test]
+async fn selected_tool_policy_rewrite_preserves_trusted_call_identity() {
+    let (_live, bus) = live_host_with_run(
+        vec![Arc::new(RewritePluginHost::new("policy", "rewritten"))],
+        Some("policy"),
+        "trusted-run",
+    )
+    .await;
+    let mut call = ToolCall::new("trusted-call", "original", json!({}));
+    call.bind_permission_scope(ToolPermissionScope::Read);
+    call.bind_run_id("trusted-run");
+
+    let dispatched = bus
+        .dispatch(ToolCallEvent::new("trusted-run", 0, call))
+        .await;
+
+    assert!(!dispatched.is_cancelled());
+    let call = dispatched.event.call;
+    assert_eq!(call.id, "trusted-call");
+    assert_eq!(call.name, "rewritten");
+    assert_eq!(call.permission_scope, ToolPermissionScope::Unknown);
+    assert_eq!(call.run_id.as_deref(), Some("trusted-run"));
+}
+
+/// 插件工具调用携带的伪造 scope 必须被最近一次可信 ToolSpec 快照覆盖。
+#[tokio::test]
+async fn composite_host_binds_registered_tool_permission_scope() {
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (_live, bus) = live_host_with_run(
+        vec![
+            Arc::new(CapturingScopePolicyPluginHost::new(observed.clone())),
+            Arc::new(CountingPluginHost {
+                id: "tool-owner",
+                tool: ToolSpec::new(
+                    "scoped_tool",
+                    "声明读取权限的工具",
+                    ToolSpec::empty_object_schema(),
+                )
+                .with_permission_scope(ToolPermissionScope::Read),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        ],
+        Some("scope-policy"),
+        "scope-run",
+    )
+    .await;
+    let mut call = ToolCall::new("scoped-call", "scoped_tool", json!({}));
+    call.bind_permission_scope(ToolPermissionScope::Shell);
+    call.bind_run_id("scope-run");
+
+    let dispatched = bus.dispatch(ToolCallEvent::new("scope-run", 0, call)).await;
+
+    assert!(!dispatched.is_cancelled());
+    assert_eq!(
+        observed
+            .lock()
+            .expect("权限 scope 观察锁不应中毒")
+            .as_slice(),
+        &[(
+            "scoped-call".into(),
+            "scoped_tool".into(),
+            ToolPermissionScope::Read,
+            Some("scope-run".into()),
+        )]
+    );
+}
+
+/// 改名到未注册目标时必须降级 unknown，不能沿用来源工具的已授权 scope。
+#[tokio::test]
+async fn composite_host_downgrades_unknown_rewrite_permission_scope() {
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (_live, bus) = live_host_with_run(
+        vec![
+            Arc::new(CapturingScopePolicyPluginHost::new(observed.clone())),
+            Arc::new(CountingPluginHost {
+                id: "tool-owner",
+                tool: ToolSpec::new(
+                    "rewrite_source",
+                    "重写来源工具",
+                    ToolSpec::empty_object_schema(),
+                )
+                .with_permission_scope(ToolPermissionScope::Read),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(RewritePluginHost::new("rewriter", "unregistered_target")),
+        ],
+        Some("scope-policy"),
+        "rewrite-run",
+    )
+    .await;
+    let mut call = ToolCall::new("rewrite-call", "rewrite_source", json!({}));
+    call.bind_run_id("rewrite-run");
+
+    let dispatched = bus
+        .dispatch(ToolCallEvent::new("rewrite-run", 0, call))
+        .await;
+
+    let final_call = dispatched.event.call;
+    assert_eq!(final_call.name, "unregistered_target");
+    assert_eq!(final_call.permission_scope, ToolPermissionScope::Unknown);
+    assert_eq!(final_call.run_id.as_deref(), Some("rewrite-run"));
+    assert_eq!(
+        observed
+            .lock()
+            .expect("权限 scope 观察锁不应中毒")
+            .as_slice(),
+        &[(
+            "rewrite-call".into(),
+            "unregistered_target".into(),
+            ToolPermissionScope::Unknown,
+            Some("rewrite-run".into()),
+        )]
+    );
+}
+
+/// 未声明订阅的插件不会收到事件，也无法参与取消决策。
+#[tokio::test]
+async fn plugins_without_subscription_never_receive_events() {
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut unsubscribed = CapturingScopePolicyPluginHost::new(observed.clone());
+    unsubscribed.subscriptions.clear();
+    let (_live, bus) =
+        live_host_with_run(vec![Arc::new(unsubscribed)], None, "unsubscribed-run").await;
+    let mut call = ToolCall::new("call", "any_tool", json!({}));
+    call.bind_run_id("unsubscribed-run");
+
+    bus.dispatch(ToolCallEvent::new("unsubscribed-run", 0, call))
+        .await;
+
+    assert!(observed
+        .lock()
+        .expect("权限 scope 观察锁不应中毒")
+        .is_empty());
+}
+
+/// 快照测试宿主订阅工具准入、工具结果与运行记录三类事件。
+fn snapshot_subscriptions() -> Vec<EventSubscription> {
+    vec![
+        tool_call_subscription(),
+        EventSubscription {
+            name: ToolResultEvent::NAME.to_string(),
+            priority: ListenerPriority::Normal,
+            ignore_cancelled: false,
+        },
+        record_subscription(),
+    ]
+}
+
+/// 通过总线投递一条运行记录事件，驱动 Live 宿主的运行快照生命周期。
+async fn dispatch_record(bus: &EventBus, run_id: &str, kind: AgentEventKind, step: usize) {
+    bus.dispatch(AgentRecordEvent {
+        record: AgentEvent::new(run_id, kind, step, json!({})),
+    })
+    .await;
 }

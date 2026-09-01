@@ -73,6 +73,7 @@ fn plugin_state_identity_changes_with_trusted_bundle_identity() {
         },
         dependencies: Vec::new(),
         provides: Vec::new(),
+        events: Vec::new(),
         capabilities: Default::default(),
         metadata: HashMap::new(),
     };
@@ -169,6 +170,7 @@ fn resilient_dependencies_skip_only_required_dependents() {
         },
         dependencies: vec![dependency],
         provides: Vec::new(),
+        events: Vec::new(),
         capabilities: Default::default(),
         metadata: HashMap::new(),
     };
@@ -210,6 +212,7 @@ fn resilient_plan_isolates_required_dependency_closure() {
         },
         dependencies,
         provides: Vec::new(),
+        events: Vec::new(),
         capabilities: Default::default(),
         metadata: HashMap::new(),
     };
@@ -267,6 +270,7 @@ fn resilient_plan_isolates_required_dependency_cycles() {
             .into_iter()
             .collect(),
         provides: Vec::new(),
+        events: Vec::new(),
         capabilities: Default::default(),
         metadata: HashMap::new(),
     };
@@ -306,6 +310,7 @@ fn progressive_order_prioritizes_critical_owner_with_dependencies() {
             .into_iter()
             .collect(),
         provides: Vec::new(),
+        events: Vec::new(),
         capabilities: Default::default(),
         metadata: HashMap::new(),
     };

@@ -4,7 +4,8 @@
 
 | Crate | 负责 | 不负责 |
 | --- | --- | --- |
-| `agent-core` | Session、ContextLoader、ModelGateway、ReAct、工具调用、事件 | WASM、manifest、插件 UI、MCP、Skill |
+| `agent-core` | Session、ContextLoader、ModelGateway、ReAct、工具调用、`core.*` 事件 | WASM、manifest、插件 UI、MCP、Skill |
+| `agent-event` | 可取消事件总线原语：取消状态、优先级、白名单合并、订阅表 | 任何业务语义——它不认识 Agent、工具或界面 |
 | `agent-tool` | ToolSpec、ToolCall、ToolResult、原生 ToolRegistry | Agent 循环、插件加载 |
 | `agent-context` | 原生上下文水位、微压缩和模型摘要 | Agent 循环、插件加载、终端渲染 |
 | `agent-skill` | 原生 Skill 发现、索引提示和正文读取工具 | Agent 循环、插件加载、终端渲染 |
@@ -54,10 +55,21 @@ JSON ABI 不意味着忽略类型。Rust Guest SDK 对外仍提供 `ToolSpec`、
 
 ## Hook 边界
 
-三层 hook 可以同时存在，但每层只处理自己的维度：
+扩展点分成**决策**与**贡献**两类，走两条不同的通道：
 
-- Core hook 位于 ReAct 执行链，发布通用生命周期事件并调用扩展契约，不解释插件业务协议。
-- Plugin hook 位于扩展实例，处理激活、工具策略、事件观察、服务和 UI 贡献；审批、工作流等完整状态协议由对应插件拥有。
-- TUI hook 位于输入与渲染循环，只把宿主无关输入交给 Host，并渲染 Host 返回的通用帧，不读取插件贡献表或复制插件规则。
+- **决策**（准入、改写、取消、观察）统一走[事件总线](/agent/event-bus)。Core 在 ReAct
+  执行链的各决策点发布 `core.*` 事件，TUI 在输入循环发布 `tui.*` 事件；两者共用同一条
+  总线和同一套取消语义，但命名空间与负载完全独立。发布方只遵守取消结果，不知道监听者
+  是宿主策略、Runtime 门禁还是 WASM 插件。
+- **贡献**（提示、工具定义、工具实现、服务、UI）走 `AgentExtension` 与 `PluginHost`
+  的注册接口。它们提供数据而不是响应事件，因此不适合用事件表达。
+
+在此之上每层仍只处理自己的维度：
+
+- Core 发布通用生命周期事件并遵守取消结果，不解释插件业务协议。
+- 插件在订阅的事件上表态，并提供激活、服务和 UI 贡献；审批、工作流等完整状态协议由
+  对应插件拥有。
+- TUI 位于输入与渲染循环，只把宿主无关输入交给 Host，并渲染 Host 返回的通用帧，不读取
+  插件贡献表或复制插件规则。
 
 工具消息渲染遵循单一路径：TUI 提交完整工具调用、状态和可用尺寸；Host 根据可信贡献快照选择 owner 并注入插件与 renderer 身份；插件返回 `UiFrame`。TUI 不知道哪个插件拥有该工具，也不为具体工具写展示分支。

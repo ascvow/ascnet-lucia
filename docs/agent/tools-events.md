@@ -33,12 +33,14 @@ agent.set_tools(tools);
 | `prompt_messages` | 为本次模型请求贡献消息 |
 | `list_tools` | 返回扩展工具快照 |
 | `call_tool` | 执行扩展拥有的工具 |
-| `before_tool` | 允许、阻止或重写调用 |
-| `after_tool` | 观察最终工具结果 |
-| `on_event` | 观察 Core 生命周期事件 |
+| `core.tool.call` | 放行、改写或取消（即拒绝）一次工具调用 |
+| `core.tool.result` | 观察脱敏后的最终工具结果 |
+| `core.agent.event` | 观察 Core 写入记录流的全部事件 |
 | `drain_events` | 发布结构化扩展事件 |
 
-Core 不知道扩展由原生对象还是 WASM component 实现。使用一次性审批指导时，可信应用 `EventSink` 接收完整展示原因，`after_tool` 与 `on_event` 只接收脱敏工具结果，防止无关扩展把原因重新注入后续模型上下文。
+这些是 [`agent_core::bus`] 上的可取消事件，不再是扩展 trait 上的专用钩子：Core 只发布事件并遵守取消结果，不知道监听者是宿主策略、Runtime 门禁还是 WASM 插件。
+
+Core 不知道监听者由原生对象还是 WASM component 实现。使用一次性审批指导时，可信应用 `EventSink` 接收完整展示原因，`core.tool.result` 与 `core.agent.event` 只接收脱敏工具结果，防止无关监听者把原因重新注入后续模型上下文。
 
 ## EventSink
 
