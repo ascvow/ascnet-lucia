@@ -14,6 +14,9 @@ lucia doctor --json
 锁文件，不加载或执行 WASM，不调用模型，也不写事件日志。配置缺失、尚无会话等首次运行
 状态以警告或通过展示；损坏的记录、锁文件、manifest、依赖和能力冲突返回非零退出码。
 
+已禁用插件和 Installed Version History 不会进入运行时。它们与当前 Host ABI 不兼容时报告警告，
+但路径、锁定身份或 Bundle SHA-256 损坏仍报告错误。macOS Finder 的 `.DS_Store` 会被忽略。
+
 默认诊断不联网。需要验证 GitHub API 连通性时显式运行：
 
 ```bash

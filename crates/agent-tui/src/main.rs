@@ -27,6 +27,8 @@ async fn main() -> Result<()> {
     let mut args = Args::parse();
     match args.command.take() {
         Some(Command::Doctor(options)) => doctor::run(&args, options).await,
+        #[cfg(feature = "plugins")]
+        Some(Command::Plugins(options)) => plugin::recovery::run(options),
         None => startup::run(args).await,
     }
 }

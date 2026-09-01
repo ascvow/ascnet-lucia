@@ -90,9 +90,11 @@ git push origin v0.1.0
 
 ## 管理命令
 
-插件版 `lucia` 在 TUI 内提供 `/plugins` 人工管理页，并保留全局只读诊断 `lucia doctor`。
-插件管理器仍是独立 library crate，负责下载、安装、完整性与补偿恢复规则，但不分发单独的
-插件管理可执行程序。纯 Core 版本保留 `lucia doctor`，并跳过插件运行时检查。
+插件版 `lucia` 在 TUI 内提供 `/plugins` 人工管理页，并保留全局只读诊断 `lucia doctor`。当插件
+状态阻止 TUI 启动时，可使用同一可执行文件的 `lucia plugins list/disable` 最小恢复入口；该入口
+不加载 WASM，也不提供启用或授权操作。插件管理器仍是独立 library crate，负责下载、安装、
+完整性与补偿恢复规则，但不分发单独的插件管理可执行程序。纯 Core 版本保留 `lucia doctor`，并
+跳过插件运行时检查。
 
 ## 本地安装
 

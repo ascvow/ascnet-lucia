@@ -1,10 +1,15 @@
 # 插件管理
 
-Lucia 只通过 TUI 暴露人工插件管理。启动插件版 `lucia` 后输入 `/plugins`，可以查看固定版本、
-Bundle SHA-256 和启用状态。应用服务把用户操作委托给 `agent-plugin-manager`；Plugin Host
-只消费验证后的运行时配置，不参与安装。
+Lucia 通过 TUI 暴露完整人工插件管理。启动插件版 `lucia` 后输入 `/plugins`，可以查看固定版本、
+Bundle SHA-256 和启用状态。若旧 ABI 或无效受管理插件阻止 TUI 启动，可先使用
+`lucia plugins list` 和 `lucia plugins disable <plugin-id>` 执行最小恢复。应用服务把用户操作委托给
+`agent-plugin-manager`；Plugin Host 只消费验证后的运行时配置，不参与安装。
 
 Lucia 不会自主修改、生成、组合、升级、启停或重新配置插件；全部插件变更都由用户显式发起。
+
+已禁用插件和 Installed Version History 不参与运行时加载。它们仍校验路径、Manifest 身份和
+Bundle SHA-256；与当前 Host ABI 不兼容时报告警告，并在重新启用或回滚时严格拒绝。完整性损坏
+仍是诊断错误。macOS Finder 生成的 `.DS_Store` 不属于插件状态，目录诊断会忽略。
 
 ## TUI 操作
 

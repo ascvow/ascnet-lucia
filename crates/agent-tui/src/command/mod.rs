@@ -668,12 +668,13 @@ async fn load_native_plugin_dialog(
     let plugins = service.list()?;
     let authorizations = plugins
         .iter()
-        .map(|plugin| {
+        .filter_map(|plugin| {
             service
                 .authorization_profile(plugin)
+                .ok()
                 .map(|profile| (plugin.id.clone(), profile))
         })
-        .collect::<Result<HashMap<_, _>>>()?;
+        .collect::<HashMap<_, _>>();
     Ok(NativePluginDialogData {
         plugins,
         version_history: service.list_version_history()?,

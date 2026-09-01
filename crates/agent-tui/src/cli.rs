@@ -53,6 +53,9 @@ pub(crate) struct Args {
 pub(crate) enum Command {
     /// 对整个 Lucia 安装执行无侵入只读诊断。
     Doctor(DoctorArgs),
+    /// 在 TUI 无法启动时执行最小受管理插件恢复操作。
+    #[cfg(feature = "plugins")]
+    Plugins(PluginsArgs),
 }
 
 /// 全局诊断参数。
@@ -64,4 +67,45 @@ pub(crate) struct DoctorArgs {
     /// 额外检查 GitHub API 连通性；默认诊断不联网。
     #[arg(long)]
     pub(crate) network: bool,
+}
+
+/// 无需启动 TUI 的插件恢复参数。
+#[cfg(feature = "plugins")]
+#[derive(Debug, ClapArgs)]
+pub(crate) struct PluginsArgs {
+    /// 要执行的只读查询或安全收缩操作。
+    #[command(subcommand)]
+    pub(crate) command: PluginsCommand,
+}
+
+/// TUI 启动失败时仍可使用的最小插件管理命令。
+#[cfg(feature = "plugins")]
+#[derive(Debug, Subcommand)]
+pub(crate) enum PluginsCommand {
+    /// 列出锁文件中的当前受管理插件，不加载或执行 WASM。
+    List,
+    /// 禁用指定插件并撤销其授权与 Capability Owner。
+    Disable {
+        /// 要禁用的稳定插件 ID。
+        plugin_id: String,
+    },
+}
+
+#[cfg(all(test, feature = "plugins"))]
+mod tests {
+    use super::*;
+
+    /// 插件恢复命令必须按稳定层级解析，避免退化为 TUI 启动参数。
+    #[test]
+    fn parses_plugin_disable_recovery_command() {
+        let args = Args::try_parse_from(["lucia", "plugins", "disable", "workflow"])
+            .expect("插件恢复命令应可解析");
+
+        assert!(matches!(
+            args.command,
+            Some(Command::Plugins(PluginsArgs {
+                command: PluginsCommand::Disable { plugin_id }
+            })) if plugin_id == "workflow"
+        ));
+    }
 }

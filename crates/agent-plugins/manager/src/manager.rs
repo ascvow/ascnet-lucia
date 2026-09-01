@@ -1,11 +1,11 @@
 //! 受管理插件的安装、替换、启停、回滚与锁文件事务。
 
 use crate::bundle::{
-    copy_runtime_bundle, ensure_real_directory, hash_plugin_bundle, load_and_validate_manifest,
-    path_to_lock_string, remove_directory_if_empty, sort_lock_plugins, sort_version_history,
-    upsert_version_history, validate_relative_path, validate_storage_component,
+    copy_runtime_bundle, ensure_real_directory, hash_plugin_bundle, path_to_lock_string,
+    remove_directory_if_empty, sort_lock_plugins, sort_version_history, upsert_version_history,
+    validate_relative_path, validate_storage_component,
 };
-use crate::doctor::{push_issue, push_warning, DoctorReport};
+use crate::doctor::{push_issue, push_warning, DoctorReport, DoctorSeverity};
 use crate::types::{
     InstallOptions, InstalledPlugin, PluginBundleIdentity, PluginLock, LOCK_FILE_NAME,
     LOCK_SCHEMA_VERSION,
@@ -17,6 +17,7 @@ use agent_plugin_host::manifest::{
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -689,17 +690,35 @@ impl PluginManager {
                 );
                 continue;
             }
-            match self.inspect_locked_plugin(plugin) {
-                Ok(manifest) => {
-                    if plugin.enabled {
-                        enabled_manifests.push(manifest);
-                    }
+            let manifest = match self.inspect_locked_bundle(plugin) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    push_issue(
+                        &mut report,
+                        Some(&plugin.id),
+                        format!("插件完整性检查失败：{error:#}"),
+                    );
+                    continue;
                 }
-                Err(error) => push_issue(
-                    &mut report,
-                    Some(&plugin.id),
-                    format!("插件检查失败：{error:#}"),
-                ),
+            };
+            if let Err(error) = manifest.validate() {
+                if plugin.enabled {
+                    push_issue(
+                        &mut report,
+                        Some(&plugin.id),
+                        format!("插件检查失败：{error:#}"),
+                    );
+                } else {
+                    push_warning(
+                        &mut report,
+                        Some(&plugin.id),
+                        format!("已禁用插件与当前 Host 不兼容：{error:#}"),
+                    );
+                }
+                continue;
+            }
+            if plugin.enabled {
+                enabled_manifests.push(manifest);
             }
         }
 
@@ -720,11 +739,25 @@ impl PluginManager {
                 );
                 continue;
             }
-            if let Err(error) = self.inspect_locked_plugin(plugin) {
-                push_issue(
+            let manifest = match self.inspect_locked_bundle(plugin) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    push_issue(
+                        &mut report,
+                        Some(&plugin.id),
+                        format!("历史版本 `{}` 完整性检查失败：{error:#}", plugin.version),
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = manifest.validate() {
+                push_warning(
                     &mut report,
                     Some(&plugin.id),
-                    format!("历史版本 `{}` 检查失败：{error:#}", plugin.version),
+                    format!(
+                        "历史版本 `{}` 与当前 Host 不兼容：{error:#}",
+                        plugin.version
+                    ),
                 );
             }
         }
@@ -758,6 +791,7 @@ impl PluginManager {
             let messages = report
                 .issues
                 .iter()
+                .filter(|issue| issue.severity == DoctorSeverity::Error)
                 .map(|issue| issue.message.as_str())
                 .collect::<Vec<_>>()
                 .join("；");
@@ -812,11 +846,24 @@ impl PluginManager {
     }
 
     fn inspect_locked_plugin(&self, plugin: &InstalledPlugin) -> Result<PluginManifest> {
+        let manifest = self.inspect_locked_bundle(plugin)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// 校验锁定 Bundle 的路径、Manifest 身份和摘要，但不要求其 ABI 可由当前 Host 执行。
+    ///
+    /// 该入口用于保存旧 ABI 的版本历史和诊断已禁用插件；任何进入运行时或重新启用的 Bundle
+    /// 仍必须通过 [`Self::inspect_locked_plugin`] 的当前 Host 校验。
+    fn inspect_locked_bundle(&self, plugin: &InstalledPlugin) -> Result<PluginManifest> {
         let manifest_path = self.resolve_locked_manifest(plugin)?;
         let bundle_path = manifest_path
             .parent()
             .ok_or_else(|| anyhow!("锁定 manifest 缺少父目录"))?;
-        let manifest = load_and_validate_manifest(bundle_path, &manifest_path)?;
+        let text = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("无法读取插件 manifest：{}", manifest_path.display()))?;
+        let manifest: PluginManifest = toml::from_str(&text)
+            .with_context(|| format!("无法解析插件 manifest：{}", manifest_path.display()))?;
         if manifest.plugin.id != plugin.id
             || manifest.plugin.version != plugin.version
             || manifest.plugin.name != plugin.name
@@ -929,7 +976,7 @@ impl PluginManager {
                     plugin.version
                 );
             }
-            self.inspect_locked_plugin(plugin).with_context(|| {
+            self.inspect_locked_bundle(plugin).with_context(|| {
                 format!(
                     "历史插件 `{}` 版本 `{}` 完整性校验失败",
                     plugin.id, plugin.version
@@ -985,6 +1032,9 @@ impl PluginManager {
         for plugin_entry in fs::read_dir(&plugins_dir).context("无法读取受管理插件根目录")?
         {
             let plugin_entry = plugin_entry.context("无法读取插件目录项")?;
+            if is_ignored_plugin_metadata(&plugin_entry.file_name()) {
+                continue;
+            }
             let plugin_path = plugin_entry.path();
             let plugin_id = plugin_entry.file_name().to_string_lossy().into_owned();
             let file_type = plugin_entry
@@ -1005,6 +1055,9 @@ impl PluginManager {
                 .with_context(|| format!("无法读取插件版本目录：{}", plugin_path.display()))?
             {
                 let version_entry = version_entry.context("无法读取插件版本目录项")?;
+                if is_ignored_plugin_metadata(&version_entry.file_name()) {
+                    continue;
+                }
                 let version_path = version_entry.path();
                 let version = version_entry.file_name().to_string_lossy().into_owned();
                 if !managed.contains(&(plugin_id.as_str(), version.as_str())) {
@@ -1198,6 +1251,11 @@ impl PluginManager {
             .with_context(|| format!("无法创建插件安装临时目录：{}", staging.display()))?;
         Ok(staging)
     }
+}
+
+/// macOS Finder 元数据不属于插件状态，目录诊断应稳定忽略。
+fn is_ignored_plugin_metadata(name: &OsStr) -> bool {
+    name == OsStr::new(".DS_Store")
 }
 
 /// 确认已锁定句柄与当前路径仍指向同一个普通文件。

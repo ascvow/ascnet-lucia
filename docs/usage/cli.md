@@ -1,12 +1,14 @@
 # CLI 使用
 
-`lucia` 的无子命令形式启动 TUI；`doctor` 是执行完即退出的只读诊断命令。插件安装、更新、启停和移除只通过 TUI `/plugins` 页面完成。纯 Core 构建不包含 `--plugin-manifest` 参数和插件管理页。
+`lucia` 的无子命令形式启动 TUI；`doctor` 是执行完即退出的只读诊断命令。插件版还提供不启动 TUI 的 `plugins list/disable` 恢复入口，完整安装、更新、授权和移除仍通过 TUI `/plugins` 页面完成。纯 Core 构建不包含 `--plugin-manifest`、`plugins` 子命令和插件管理页。
 
 ## 命令结构
 
 ```text
 lucia [启动参数]
 lucia doctor [--json] [--network]
+lucia plugins list
+lucia plugins disable <plugin-id>
 ```
 
 ## 启动参数
@@ -99,6 +101,18 @@ lucia doctor --network
 - `--network`：额外只读检查 GitHub API 连通性。默认诊断不联网，也不会下载或安装插件。
 
 诊断严格只读，不创建目录或配置，不修改插件锁，不打开会产生写入的 Session Store。
+
+## 插件恢复命令
+
+```bash
+lucia plugins list
+lucia plugins disable workflow
+```
+
+- `list`：读取受管理插件锁，显示插件 ID、版本、有效启用状态和 `api_version`，不加载或执行 WASM。
+- `disable <plugin-id>`：通过 Plugin Manager 原子禁用指定插件，并撤销其授权摘要和 Capability Owner。该命令用于旧 ABI、损坏配置或依赖问题阻止 TUI 启动时恢复基本运行能力。
+
+恢复命令不会启用插件、修改 Manifest、删除 Bundle 或绕过授权审查。禁用后可重新启动 Lucia，在 `/plugins` 中安装或更新经过当前 Host 校验的 Bundle。
 
 ## 路径与优先级
 

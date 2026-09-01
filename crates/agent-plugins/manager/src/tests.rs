@@ -108,6 +108,28 @@ fn write_persisted_lock(manager: &PluginManager, lock: &PluginLock) {
     fs::write(manager.lock_path(), text).expect("应写入测试锁文件");
 }
 
+/// 把已安装测试 Bundle 改写为指定旧 ABI，并同步锁身份与摘要。
+fn rewrite_installed_api_version(manager: &PluginManager, plugin_id: &str, api_version: &str) {
+    let mut lock = read_persisted_lock(manager);
+    let plugin = lock
+        .plugins
+        .iter_mut()
+        .find(|plugin| plugin.id == plugin_id)
+        .expect("应找到待改写插件");
+    let manifest_path = manager.root().join(&plugin.manifest);
+    let manifest = fs::read_to_string(&manifest_path)
+        .expect("应读取已安装 manifest")
+        .replace(
+            &format!("api_version = \"{}\"", plugin.api_version),
+            &format!("api_version = \"{api_version}\""),
+        );
+    fs::write(&manifest_path, manifest).expect("应改写已安装 manifest ABI");
+    plugin.api_version = api_version.to_string();
+    plugin.sha256 = hash_plugin_bundle(manifest_path.parent().expect("manifest 应有父目录"))
+        .expect("应更新旧 ABI Bundle 摘要");
+    write_persisted_lock(manager, &lock);
+}
+
 /// 确定性归档必须无损恢复源目录，安装后摘要只覆盖提取出的运行时 Bundle。
 #[test]
 fn packed_bundle_round_trips_with_manager_digest() {
@@ -1153,6 +1175,72 @@ fn doctor_warns_about_unmanaged_plugin_directories() {
     assert_eq!(report.issues.len(), 1);
     assert_eq!(report.issues[0].severity, DoctorSeverity::Warning);
     assert!(report.issues[0].message.contains("未被锁文件管理"));
+}
+
+/// macOS Finder 元数据不应污染插件目录诊断。
+#[test]
+fn doctor_ignores_macos_finder_metadata() {
+    let directory = TestDirectory::new("finder-metadata");
+    let manager = PluginManager::new(directory.path.join("managed"));
+    fs::create_dir_all(directory.path.join("managed/plugins/workflow")).expect("创建插件目录");
+    fs::write(directory.path.join("managed/plugins/.DS_Store"), "finder")
+        .expect("写入根目录 Finder 元数据");
+    fs::write(
+        directory.path.join("managed/plugins/workflow/.DS_Store"),
+        "finder",
+    )
+    .expect("写入插件目录 Finder 元数据");
+
+    let report = manager.doctor().expect("诊断应忽略 Finder 元数据");
+
+    assert!(report.issues.is_empty(), "{:#?}", report.issues);
+}
+
+/// 已禁用旧 ABI Bundle 应保留诊断警告，但不能阻断不加载插件的运行时配置。
+#[test]
+fn disabled_legacy_api_warns_without_blocking_runtime() {
+    let directory = TestDirectory::new("disabled-legacy-api");
+    let bundle = create_bundle(&directory.path, "workflow", "1.0.0", &[], None);
+    let manager = PluginManager::new(directory.path.join("managed"));
+    manager.install(bundle).expect("当前 ABI Bundle 应可安装");
+    rewrite_installed_api_version(&manager, "workflow", "0.7.0");
+
+    let report = manager.doctor().expect("旧 ABI 禁用插件应可诊断");
+
+    assert!(report.is_healthy());
+    assert_eq!(report.issues.len(), 1);
+    assert_eq!(report.issues[0].severity, DoctorSeverity::Warning);
+    assert!(report.issues[0]
+        .message
+        .contains("已禁用插件与当前 Host 不兼容"));
+    assert!(manager
+        .runtime_config()
+        .expect("旧 ABI 禁用插件不应阻断启动")
+        .manifest_paths
+        .is_empty());
+}
+
+/// 更新到当前 ABI 时必须允许把完整但不可执行的旧 ABI Bundle 保留到版本历史。
+#[test]
+fn replacement_preserves_legacy_api_in_version_history() {
+    let directory = TestDirectory::new("replace-legacy-api");
+    let first = create_bundle(&directory.path, "workflow", "1.0.0", &[], None);
+    let second = create_bundle(&directory.path, "workflow", "2.0.0", &[], None);
+    let manager = PluginManager::new(directory.path.join("managed"));
+    manager.install(first).expect("当前 ABI Bundle 应可安装");
+    rewrite_installed_api_version(&manager, "workflow", "0.7.0");
+
+    let updated = manager
+        .replace(second)
+        .expect("当前 ABI Bundle 应可替换旧 ABI");
+    let history = manager.list_version_history().expect("应读取版本历史");
+
+    assert_eq!(updated.version, "2.0.0");
+    assert!(!updated.enabled);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].version, "1.0.0");
+    assert_eq!(history[0].api_version, "0.7.0");
+    assert!(manager.doctor().expect("历史旧 ABI 应可诊断").is_healthy());
 }
 
 /// 被篡改的禁用插件不能绕过完整性检查重新启用。

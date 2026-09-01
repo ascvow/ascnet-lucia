@@ -300,7 +300,7 @@ Guest 不能提交模型、provider options、工具权限或 owner。`profile` 
 
 ### 诊断结果
 
-`DoctorReport.checked_plugins` 是检查数量，`issues` 保存插件级或全局问题。`is_healthy()` 只在没有问题时返回 true。锁文件无法解析等全局错误直接作为 `Err` 返回，不进入 issues。
+`DoctorReport.checked_plugins` 是检查数量，`issues` 保存插件级或全局问题。`is_healthy()` 在没有 `Error` 时返回 true，允许非阻断 `Warning`。锁文件无法解析等全局错误直接作为 `Err` 返回，不进入 issues。已禁用插件和版本历史仍校验存储身份与摘要，但旧 ABI 兼容性只作为警告；重新启用或回滚时仍执行当前 Host 的完整校验。
 
 ## 相关页面
 
