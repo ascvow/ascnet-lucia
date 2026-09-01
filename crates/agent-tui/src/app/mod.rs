@@ -47,6 +47,12 @@ pub(crate) fn is_copy_shortcut(code: KeyCode, modifiers: KeyModifiers) -> bool {
 pub(crate) const ESC_DOUBLE_PRESS_WINDOW: std::time::Duration =
     std::time::Duration::from_millis(500);
 
+/// 识别连续两次 Ctrl+C 的最长间隔。
+///
+/// 比 Esc 的窗口宽松得多：清空草稿可以重打，退出会丢掉整个会话，用户需要时间
+/// 读到提示再决定。
+pub(crate) const EXIT_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// 将输入文本切分为普通文本与附件引用标签片段，标签使用高亮样式。
 pub(crate) fn input_ref_spans<'a>(
     input: &'a str,
@@ -120,6 +126,10 @@ pub(crate) struct App {
     pub(crate) run_started_at: Option<std::time::Instant>,
     /// 主输入区最近一次未被其他按键打断的 Esc 时间，用于识别连续双按。
     pub(crate) last_escape_at: Option<std::time::Instant>,
+    /// 最近一次在空输入上按下 Ctrl+C 的时间，用于要求二次确认后才退出。
+    ///
+    /// 单击即退出会让一次误触丢掉整个会话，因此退出必须显式确认。
+    pub(crate) last_exit_request_at: Option<std::time::Instant>,
     pub(crate) should_quit: bool,
     /// 下一轮使用的完整会话记录；最终保存失败时可暂存 dirty 完成态。
     pub(crate) session_record: SessionRecord,
@@ -150,6 +160,10 @@ pub(crate) struct App {
     pub(crate) last_max_scroll: u16,
     /// 最近一次渲染得到的消息区高度，用于整页滚动。
     pub(crate) last_viewport: u16,
+    /// 最近一帧"回到底部"提示所占的区域；未展示时为 `None`。
+    ///
+    /// 提示同时是可点击热区：手动翻阅后用鼠标即可回到底部，不必记快捷键。
+    pub(crate) jump_hint_area: Option<Rect>,
     /// 最近一次渲染得到的消息区宽度，用于工具消息 renderer 分配尺寸。
     #[cfg(feature = "plugins")]
     pub(crate) last_message_width: u16,
@@ -361,6 +375,7 @@ impl App {
             pending_reload: None,
             run_started_at: None,
             last_escape_at: None,
+            last_exit_request_at: None,
             should_quit: false,
             session_record,
             session_store: Arc::new(MemorySessionStore::new()),
@@ -379,6 +394,7 @@ impl App {
             scroll: None,
             last_max_scroll: 0,
             last_viewport: 0,
+            jump_hint_area: None,
             #[cfg(feature = "plugins")]
             last_message_width: 0,
             context_tokens: None,

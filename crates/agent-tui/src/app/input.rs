@@ -25,8 +25,21 @@ impl App {
         if !matches!(code, KeyCode::Esc) {
             self.last_escape_at = None;
         }
+        // 退出确认只对连续两次 Ctrl+C 有效，其余按键立即撤销待退出状态。
         if super::is_copy_shortcut(code, modifiers) {
-            self.should_quit = true;
+            self.handle_interrupt_or_exit(agent);
+            return;
+        }
+        self.last_exit_request_at = None;
+        // Ctrl+D 是终端约定的 EOF：空输入直接退出，有内容时按 readline 语义前向删除。
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('d')) {
+            if self.input.is_empty() && self.attachments.is_empty() {
+                self.should_quit = true;
+            } else if let Some(next) = self.input[self.cursor..].chars().next() {
+                let end = self.cursor + next.len_utf8();
+                self.input.replace_range(self.cursor..end, "");
+                self.finish_input_edit();
+            }
             return;
         }
         if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('y')) {
@@ -74,13 +87,39 @@ impl App {
                     self.finish_input_edit();
                 }
             }
+            // readline 行内编辑：终端用户的肌肉记忆，缺失时只能靠退格逐字删。
+            KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor = self.current_line_start();
+            }
+            KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor = self.current_line_end();
+            }
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                let start = self.current_line_start();
+                if start < self.cursor {
+                    self.input.replace_range(start..self.cursor, "");
+                    self.cursor = start;
+                    self.finish_input_edit();
+                }
+            }
+            KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
+                let end = self.current_line_end();
+                if end > self.cursor {
+                    self.input.replace_range(self.cursor..end, "");
+                    self.finish_input_edit();
+                }
+            }
+            KeyCode::Home if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_up(u16::MAX);
+            }
             KeyCode::End if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.scroll = None;
             }
-            KeyCode::Left if modifiers.contains(KeyModifiers::ALT) => {
+            // Alt 与 Ctrl 都映射为按词移动：不同终端对这两个修饰键的上报并不一致。
+            KeyCode::Left if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
                 self.cursor = previous_word_boundary(&self.input, self.cursor);
             }
-            KeyCode::Right if modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Right if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
                 self.cursor = next_word_boundary(&self.input, self.cursor);
             }
             KeyCode::Enter => {
@@ -92,14 +131,12 @@ impl App {
                 }
                 if let Some(agent) = agent {
                     if self.running {
-                        // steering 只支持纯文本，附件必须等当前回合结束后随消息发送。
+                        // steering 只支持纯文本；带附件的输入排队到本轮结束后整条发送，
+                        // 而不是拒绝用户已经打好的内容。
                         if self.attachments.is_empty() {
                             self.submit_steering(agent);
                         } else {
-                            self.messages.push(Msg::new(
-                                MsgKind::Info,
-                                "Attachments cannot be sent during a run. Wait for it to finish.",
-                            ));
+                            self.queue_input_until_ready();
                         }
                     } else {
                         self.submit(agent);
@@ -112,22 +149,7 @@ impl App {
                 // 运行中优先中断；空闲输入必须连续双按才清空，Esc 永不直接退出。
                 if self.running {
                     self.last_escape_at = None;
-                    if !self.run_stream_cancelled {
-                        self.run_stream_cancelled = true;
-                        self.model_is_thinking = false;
-                        self.streaming_message = None;
-                        for message in &mut self.messages {
-                            if matches!(message.kind, MsgKind::ToolRunning) {
-                                message.kind = MsgKind::ToolSkipped;
-                                message.skip_reason = Some("Cancelled by user".into());
-                            }
-                        }
-                        if let Some(agent) = agent {
-                            agent.cancel();
-                        }
-                        self.messages
-                            .push(Msg::new(MsgKind::Info, "Cancelling the current run..."));
-                    }
+                    self.interrupt_run(agent);
                 } else if self.input.is_empty() && self.attachments.is_empty() {
                     self.last_escape_at = None;
                 } else {
@@ -213,6 +235,98 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// 返回光标所在逻辑行的起始字节位置。
+    fn current_line_start(&self) -> usize {
+        self.input[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1)
+    }
+
+    /// 返回光标所在逻辑行的结束字节位置。
+    fn current_line_end(&self) -> usize {
+        self.input[self.cursor..]
+            .find('\n')
+            .map_or(self.input.len(), |index| self.cursor + index)
+    }
+
+    /// 中断当前运行：关闭可见流、标记未完成工具为跳过，并通知 Agent 取消。
+    ///
+    /// 重复调用是幂等的，不会重复推送提示；Esc 与 Ctrl+C 共用同一条路径。
+    fn interrupt_run(&mut self, agent: Option<&Arc<Agent>>) {
+        if self.run_stream_cancelled {
+            return;
+        }
+        self.run_stream_cancelled = true;
+        self.model_is_thinking = false;
+        self.streaming_message = None;
+        for message in &mut self.messages {
+            if matches!(message.kind, MsgKind::ToolRunning) {
+                message.kind = MsgKind::ToolSkipped;
+                message.skip_reason = Some("Cancelled by user".into());
+            }
+        }
+        if let Some(agent) = agent {
+            agent.cancel();
+        }
+        self.messages
+            .push(Msg::new(MsgKind::Info, "Cancelling the current run..."));
+    }
+
+    /// 处理 Ctrl+C：按当前状态依次表示"中断运行""清空输入""确认退出"。
+    ///
+    /// 退出必须二次确认——单击即退会让一次误触丢掉整个会话，而中断和清空都是可恢复的。
+    fn handle_interrupt_or_exit(&mut self, agent: Option<&Arc<Agent>>) {
+        if self.running {
+            self.last_exit_request_at = None;
+            self.interrupt_run(agent);
+            return;
+        }
+        if !self.input.is_empty() || !self.attachments.is_empty() {
+            self.last_exit_request_at = None;
+            self.input.clear();
+            self.attachments.clear();
+            self.cursor = 0;
+            self.finish_input_edit();
+            return;
+        }
+        let now = std::time::Instant::now();
+        let confirmed = self.last_exit_request_at.take().is_some_and(|previous| {
+            now.saturating_duration_since(previous) <= super::EXIT_CONFIRM_WINDOW
+        });
+        if confirmed {
+            self.should_quit = true;
+        } else {
+            self.last_exit_request_at = Some(now);
+        }
+    }
+
+    /// 返回是否正在等待第二次 Ctrl+C 确认退出。
+    pub(crate) fn exit_confirmation_pending(&self) -> bool {
+        self.last_exit_request_at
+            .is_some_and(|requested| requested.elapsed() <= super::EXIT_CONFIRM_WINDOW)
+    }
+
+    /// 处理"回到底部"提示上的左键点击，返回事件是否已被热区消费。
+    ///
+    /// 必须在文本拖选之前调用：否则点击会先被当作一次选择起点，热区永远收不到事件。
+    pub(crate) fn handle_jump_hint_click(&mut self, mouse: &MouseEvent) -> bool {
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        ) {
+            return false;
+        }
+        let Some(area) = self.jump_hint_area else {
+            return false;
+        };
+        if !area.contains(Position::new(mouse.column, mouse.row)) {
+            return false;
+        }
+        self.dismiss_text_selection();
+        self.scroll = None;
+        true
     }
 
     /// 向上滚动 n 行，进入手动滚动模式。

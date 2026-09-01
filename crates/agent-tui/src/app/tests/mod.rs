@@ -4,7 +4,7 @@
 
 use crate::app::{
     input_ref_spans, is_copy_shortcut, App, ChannelEventSink, MouseTextSelection,
-    ESC_DOUBLE_PRESS_WINDOW,
+    ESC_DOUBLE_PRESS_WINDOW, EXIT_CONFIRM_WINDOW,
 };
 
 #[cfg(feature = "plugins")]

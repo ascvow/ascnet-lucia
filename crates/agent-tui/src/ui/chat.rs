@@ -144,11 +144,19 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         let chat = chat.scroll((scroll, 0));
         frame.render_widget(chat, chat_area);
 
-        // 手动翻阅时在消息区右下角提示距底部的行数。
+        // 手动翻阅时在消息区右下角提示距底部的行数，并作为回到底部的点击热区。
+        app.jump_hint_area = None;
         if let Some(position) = app.scroll {
             let below = max_scroll.saturating_sub(position);
             if below > 0 && chat_area.height > 0 {
-                let hint = format!(" ↓ {below} lines ");
+                // 宽终端显式写出点击提示；窄终端退回只带行数的紧凑形式。
+                let verbose = format!(" ↓ {below} lines · click to jump ");
+                let compact = format!(" ↓ {below} lines ");
+                let fits = |text: &str| {
+                    u16::try_from(unicode_width::UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+                        <= chat_area.width
+                };
+                let hint = if fits(&verbose) { verbose } else { compact };
                 let hint_width = unicode_width::UnicodeWidthStr::width(hint.as_str()) as u16;
                 let width = hint_width.min(chat_area.width);
                 let hint_area = Rect {
@@ -165,6 +173,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                     ))),
                     hint_area,
                 );
+                app.jump_hint_area = Some(hint_area);
             }
         }
     }
@@ -198,7 +207,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let mut input_block = Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if app.running {
+        .border_style(Style::new().fg(if app.exit_confirmation_pending() {
+            COLOR_DANGER
+        } else if app.running {
             COLOR_WARNING
         } else if main_input_focused {
             COLOR_BORDER_FOCUS
@@ -206,14 +217,28 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             COLOR_MUTED
         }))
         .padding(Padding::new(1, 1, 0, 0));
-    // 插件渐进加载不会阻塞输入，只有 Agent 运行状态占用输入盒标题。
-    let state_title = if app.running {
-        " Running · Esc to stop ".to_string()
+    // 输入盒标题按优先级展示当前最需要用户注意的状态：待确认退出 > 运行中 > 排队。
+    let state_title = if app.exit_confirmation_pending() {
+        " 再按一次 Ctrl+C 退出 ".to_string()
+    } else if app.running {
+        let queued = app.queued_inputs.len();
+        if queued > 0 {
+            format!(" Running · Esc to stop · {queued} queued ")
+        } else {
+            " Running · Esc to stop ".to_string()
+        }
+    } else if !app.queued_inputs.is_empty() {
+        format!(" {} queued ", app.queued_inputs.len())
     } else {
         String::new()
     };
+    let state_color = if app.exit_confirmation_pending() {
+        COLOR_DANGER
+    } else {
+        COLOR_WARNING
+    };
     if !state_title.is_empty() {
-        input_block = input_block.title(Span::styled(state_title, Style::new().fg(COLOR_WARNING)));
+        input_block = input_block.title(Span::styled(state_title, Style::new().fg(state_color)));
     }
     let input_inner = input_block.inner(input_area);
 
@@ -498,8 +523,8 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
         return;
     }
     let mut lines: Vec<Line> = Vec::new();
-    // 头像宽 36 列、高 9 行；与版本和速查合计 17 行。
-    if area.height >= 17 && area.width >= 38 {
+    // 头像宽 36 列、高 9 行；与版本和速查合计 18 行。
+    if area.height >= 18 && area.width >= 38 {
         lines.extend(hero_portrait_lines());
     }
     lines.push(Line::from(Span::styled(
@@ -511,11 +536,11 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
     let shortcuts = [
         ("Enter", "Send message"),
         ("Ctrl+J", "Insert newline"),
-        ("Esc", "Stop / back / double-clear"),
-        ("PgUp/PgDn", "Scroll history"),
+        ("/", "Slash commands"),
+        ("Esc", "Stop · twice to clear"),
+        ("Ctrl+C", "Clear · twice to exit"),
         ("Up/Down", "Recall input"),
-        ("Ctrl+Y", "Copy last reply"),
-        ("Ctrl+R", "Cycle reasoning"),
+        ("PgUp/PgDn", "Scroll history"),
     ];
     for (key, action) in shortcuts {
         let pad = 18usize.saturating_sub(unicode_width::UnicodeWidthStr::width(action));

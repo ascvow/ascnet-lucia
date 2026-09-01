@@ -932,6 +932,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::Input(Event::Mouse(mouse))) => {
+                // 回到底部热区必须先于拖选判定，否则点击会被当成一次选择起点。
+                if app.handle_jump_hint_click(&mouse) {
+                    continue;
+                }
                 app.handle_text_selection(&mouse, rendered_buffer);
                 #[cfg(feature = "plugins")]
                 {

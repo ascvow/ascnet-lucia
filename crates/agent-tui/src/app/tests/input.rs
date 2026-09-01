@@ -755,3 +755,193 @@ fn input_ref_spans_highlight_labels() {
 
     assert_eq!(contents, vec!["看 ", "[IMAGE#1]", " 这个"]);
 }
+
+/// Ctrl+C 在空输入上必须二次确认才退出，单次误触只给提示。
+#[test]
+fn ctrl_c_requires_confirmation_before_quitting() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL, None);
+    assert!(!app.should_quit);
+    assert!(app.exit_confirmation_pending());
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL, None);
+    assert!(app.should_quit);
+}
+
+/// 两次 Ctrl+C 之间出现其他按键时必须重新计数，避免误退出。
+#[test]
+fn ctrl_c_confirmation_is_reset_by_other_keys() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL, None);
+    app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE, None);
+    assert!(!app.exit_confirmation_pending());
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL, None);
+    assert!(!app.should_quit, "重新计数后首次 Ctrl+C 不得退出");
+}
+
+/// 超过确认窗口的第二次 Ctrl+C 只能重新计数，不能退出。
+#[test]
+fn ctrl_c_confirmation_expires() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.last_exit_request_at = Some(
+        std::time::Instant::now()
+            .checked_sub(EXIT_CONFIRM_WINDOW + std::time::Duration::from_millis(1))
+            .expect("测试时间点应可回退"),
+    );
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL, None);
+
+    assert!(!app.should_quit);
+    assert!(app.exit_confirmation_pending());
+}
+
+/// 有草稿时 Ctrl+C 先清空输入与附件，不进入退出确认。
+#[test]
+fn ctrl_c_clears_draft_before_offering_exit() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "未发送的草稿".into();
+    app.cursor = app.input.len();
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL, None);
+
+    assert!(app.input.is_empty());
+    assert_eq!(app.cursor, 0);
+    assert!(!app.should_quit);
+    assert!(!app.exit_confirmation_pending());
+}
+
+/// 运行期间的 Ctrl+C 只中断本次运行，绝不退出程序。
+#[test]
+fn ctrl_c_interrupts_run_instead_of_quitting() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.messages
+        .push(Msg::tool_started(agent_tool::ToolCall::new(
+            "call-1",
+            "shell",
+            serde_json::json!({}),
+        )));
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL, None);
+
+    assert!(!app.should_quit);
+    assert!(app.run_stream_cancelled);
+    assert!(matches!(app.messages[0].kind, MsgKind::ToolSkipped));
+}
+
+/// Ctrl+D 在空输入上按终端 EOF 约定直接退出，有内容时执行前向删除。
+#[test]
+fn ctrl_d_exits_only_on_empty_input() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "abc".into();
+    app.cursor = 0;
+
+    app.handle_key(KeyCode::Char('d'), KeyModifiers::CONTROL, None);
+    assert_eq!(app.input, "bc");
+    assert!(!app.should_quit);
+
+    app.input.clear();
+    app.cursor = 0;
+    app.handle_key(KeyCode::Char('d'), KeyModifiers::CONTROL, None);
+    assert!(app.should_quit);
+}
+
+/// readline 行内编辑键覆盖行首行尾移动与前后半行删除。
+#[test]
+fn readline_line_editing_shortcuts() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "first\nsecond line".into();
+    app.cursor = app.input.len();
+
+    // Ctrl+A / Ctrl+E 在当前逻辑行内移动，不跨行。
+    app.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL, None);
+    assert_eq!(app.cursor, "first\n".len());
+    app.handle_key(KeyCode::Char('e'), KeyModifiers::CONTROL, None);
+    assert_eq!(app.cursor, app.input.len());
+
+    // Ctrl+U 删除光标之前的半行，保留上一行。
+    app.handle_key(KeyCode::Char('u'), KeyModifiers::CONTROL, None);
+    assert_eq!(app.input, "first\n");
+
+    // Ctrl+K 删除光标之后的半行。
+    app.input = "keep|drop".into();
+    app.cursor = "keep".len();
+    app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL, None);
+    assert_eq!(app.input, "keep");
+}
+
+/// Ctrl 与 Alt 都必须映射为按词移动：终端对这两个修饰键的上报并不一致。
+#[test]
+fn word_motion_accepts_ctrl_and_alt() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "alpha beta".into();
+    app.cursor = app.input.len();
+
+    app.handle_key(KeyCode::Left, KeyModifiers::CONTROL, None);
+    assert_eq!(app.cursor, "alpha ".len());
+    app.handle_key(KeyCode::Left, KeyModifiers::ALT, None);
+    assert_eq!(app.cursor, 0);
+    app.handle_key(KeyCode::Right, KeyModifiers::CONTROL, None);
+    assert_eq!(app.cursor, "alpha ".len());
+}
+
+/// 手动翻阅后点击右下角提示应回到底部，并优先于文本拖选消费该事件。
+#[test]
+fn clicking_jump_hint_returns_to_bottom() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.scroll = Some(3);
+    app.jump_hint_area = Some(Rect::new(60, 20, 20, 1));
+
+    let inside = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 65,
+        row: 20,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(app.handle_jump_hint_click(&inside));
+    assert_eq!(app.scroll, None, "点击热区应恢复自动跟随底部");
+
+    // 热区之外的点击必须原样交还给拖选逻辑。
+    app.scroll = Some(3);
+    let outside = MouseEvent {
+        column: 10,
+        ..inside
+    };
+    assert!(!app.handle_jump_hint_click(&outside));
+    assert_eq!(app.scroll, Some(3));
+}
+
+/// 未展示提示时热区不存在，任何点击都不得改变滚动位置。
+#[test]
+fn jump_hint_click_is_inert_without_hint() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.scroll = Some(5);
+    app.jump_hint_area = None;
+
+    let click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 65,
+        row: 20,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(!app.handle_jump_hint_click(&click));
+    assert_eq!(app.scroll, Some(5));
+}
