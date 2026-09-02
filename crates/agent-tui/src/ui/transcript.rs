@@ -129,6 +129,14 @@ pub(crate) fn tool_summary(call: Option<&ToolCall>, result: &ToolResult) -> Opti
                 format!("读取 {read} 行（共 {total} 行），来自 {path}")
             })
         }
+        "list_directory" => {
+            let path = text_field(content, "path").map(shorten_path).or_else(|| {
+                args.and_then(|args| text_field(args, "path"))
+                    .map(shorten_path)
+            })?;
+            let count = number_field(content, "count").unwrap_or_default();
+            Some(format!("{count} 个条目，来自 {path}"))
+        }
         "search_files" => {
             let count = number_field(content, "count").unwrap_or_default();
             let truncated = content
@@ -195,16 +203,104 @@ pub(crate) enum PreviewLine {
     },
 }
 
-/// 剥离 `read_file` 等工具在正文前附加的 `  12→` 行号前缀，返回行号与正文。
+/// 剥离工具在正文前附加的行号前缀，返回行号与正文。
+///
+/// 支持 `12\t正文` 与 `12→正文` 两种写法：前者是原生 `read_file` 的格式，后者是
+/// 常见的插件写法。不匹配时原样返回，避免把正文里恰好以数字开头的行当成行号。
 fn split_line_number(text: &str) -> (Option<usize>, &str) {
     let trimmed = text.trim_start();
-    let Some((head, tail)) = trimmed.split_once('→') else {
+    let Some((head, tail)) = trimmed.split_once('\t').or_else(|| trimmed.split_once('→')) else {
         return (None, text);
     };
     match head.trim().parse::<usize>() {
         Ok(number) => (Some(number), tail),
         Err(_) => (None, text),
     }
+}
+
+/// 判断整段正文是否都带行号前缀。
+///
+/// 只有全部非空行都匹配时才剥离，避免把正文中偶然以数字加制表符开头的行误判为行号。
+fn is_line_numbered(rows: &[&str]) -> bool {
+    let mut numbered = 0;
+    for row in rows {
+        if row.trim().is_empty() {
+            continue;
+        }
+        if split_line_number(row).0.is_none() {
+            return false;
+        }
+        numbered += 1;
+    }
+    numbered > 0
+}
+
+/// 把字节数格式化为紧凑可读的体积。
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// 把数组型结果展开为逐条预览行。
+///
+/// 目录列表与搜索结果的正文是数组而不是文本，压成单行 JSON 摘要会丢掉最有价值的
+/// 条目本身（`entries: [3 项]` 对用户毫无信息量）。这里按已知形状逐条展开；
+/// 形状不匹配时返回 `None`，由调用方退回通用路径。
+fn collection_preview(result: &ToolResult, max_lines: usize) -> Option<Vec<PreviewLine>> {
+    let rows: Vec<String> = match result.name.as_str() {
+        "list_directory" => result
+            .content
+            .get("entries")?
+            .as_array()?
+            .iter()
+            .map(|entry| {
+                let name = text_field(entry, "name").unwrap_or("?");
+                let kind = text_field(entry, "type").unwrap_or("file");
+                // 目录以 `/` 结尾，与 shell 的列目录习惯一致；文件补上体积。
+                match (kind, number_field(entry, "size")) {
+                    ("dir", _) => format!("{name}/"),
+                    (_, Some(size)) => format!("{name}  {}", format_bytes(size)),
+                    _ => name.to_string(),
+                }
+            })
+            .collect(),
+        "search_files" => result
+            .content
+            .get("matches")?
+            .as_array()?
+            .iter()
+            .map(|item| {
+                let file = text_field(item, "file").unwrap_or("?");
+                let line = number_field(item, "line").unwrap_or_default();
+                let content = text_field(item, "content").unwrap_or_default().trim_end();
+                format!("{file}:{line}  {content}")
+            })
+            .collect(),
+        _ => return None,
+    };
+
+    let total = rows.len();
+    let mut lines: Vec<PreviewLine> = rows
+        .into_iter()
+        .take(max_lines)
+        .map(|text| PreviewLine::Context { number: None, text })
+        .collect();
+    if total > max_lines {
+        lines.push(PreviewLine::Elided {
+            hidden: total - max_lines,
+        });
+    }
+    Some(lines)
 }
 
 /// 判断一段文本是否是统一 diff：存在 `+`/`-` 前缀行且不是普通正文。
@@ -280,6 +376,9 @@ pub(crate) fn preview_lines(
         .then(|| call.and_then(|call| text_field(&call.args, "content")))
         .flatten()
         .map(str::to_string);
+    if let Some(lines) = collection_preview(result, max_lines) {
+        return lines;
+    }
     let text = written.or_else(|| result_body(result)).unwrap_or_default();
     // 单行错误已经完整出现在摘要行，再编一次号只会重复同一句话。
     if result.is_error && text.lines().filter(|line| !line.trim().is_empty()).count() <= 1 {
@@ -304,6 +403,8 @@ pub(crate) fn preview_lines(
     let rows: Vec<&str> = text.lines().collect();
     let total = rows.len();
     let is_diff = looks_like_diff(&rows);
+    // 只有整段都带行号前缀时才剥离，避免正文里偶然以"数字+制表符"开头的行被误拆。
+    let numbered = !is_diff && is_line_numbered(&rows);
     let mut lines: Vec<PreviewLine> = Vec::with_capacity(max_lines);
     for (index, row) in rows.iter().take(max_lines).enumerate() {
         if is_diff {
@@ -328,7 +429,11 @@ pub(crate) fn preview_lines(
         } else {
             row
         };
-        let (number, body) = split_line_number(row);
+        let (number, body) = if numbered {
+            split_line_number(row)
+        } else {
+            (None, row as &str)
+        };
         lines.push(PreviewLine::Context {
             number: number.or(Some(index + 1)),
             text: body.trim_end().to_string(),
@@ -397,9 +502,17 @@ pub(crate) fn render_preview(
     error: bool,
 ) -> Vec<Line<'static>> {
     let total_width = usize::from(width).max(1);
+    // 目录、搜索一类的条目没有行号，整块都没有时收起号位，避免白占一列缩进。
+    let show_gutter = lines.iter().any(|line| match line {
+        PreviewLine::Context { number, .. }
+        | PreviewLine::Added { number, .. }
+        | PreviewLine::Removed { number, .. } => number.is_some(),
+        PreviewLine::Elided { .. } => false,
+    });
+    let gutter_width = if show_gutter { GUTTER_WIDTH } else { 0 };
     // 缩进、行号列与标记列之后剩余的正文宽度。
     let body_width = total_width
-        .saturating_sub(PREVIEW_INDENT.len() + GUTTER_WIDTH + 2)
+        .saturating_sub(PREVIEW_INDENT.len() + gutter_width + 2)
         .max(1);
 
     lines
@@ -410,11 +523,11 @@ pub(crate) fn render_preview(
                 Span::styled(format!("… +{hidden} 行"), Style::new().fg(COLOR_MUTED)),
             ]),
             PreviewLine::Context { number, text } => {
-                let mut spans = vec![
-                    Span::raw(PREVIEW_INDENT),
-                    gutter(*number, COLOR_LINE_NUMBER),
-                    Span::raw(" "),
-                ];
+                let mut spans = vec![Span::raw(PREVIEW_INDENT)];
+                if show_gutter {
+                    spans.push(gutter(*number, COLOR_LINE_NUMBER));
+                    spans.push(Span::raw(" "));
+                }
                 let body = truncate_line(text, body_width);
                 if error {
                     spans.push(Span::styled(body, Style::new().fg(COLOR_DANGER)));
@@ -431,11 +544,11 @@ pub(crate) fn render_preview(
                     (COLOR_DIFF_DEL_BG, COLOR_DIFF_DEL_FG, "-")
                 };
                 let row_style = Style::new().bg(background);
-                let mut spans = vec![
-                    Span::raw(PREVIEW_INDENT),
-                    gutter(*number, marker_color).patch_style(row_style),
-                    Span::styled(marker.to_string(), row_style.fg(marker_color)),
-                ];
+                let mut spans = vec![Span::raw(PREVIEW_INDENT)];
+                if show_gutter {
+                    spans.push(gutter(*number, marker_color).patch_style(row_style));
+                }
+                spans.push(Span::styled(marker.to_string(), row_style.fg(marker_color)));
                 let body = truncate_line(text, body_width);
                 // diff 正文保持语法着色，只叠加整行背景，便于同时读出改动与语义。
                 if error {
@@ -752,5 +865,160 @@ mod layout_tests {
                 text: "fn main() {}".into()
             }
         );
+    }
+}
+
+impl PreviewLine {
+    /// 判断该行是否为省略提示。
+    pub(crate) fn is_elided(&self) -> bool {
+        matches!(self, Self::Elided { .. })
+    }
+}
+
+#[cfg(test)]
+mod result_shape_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `read_file` 用 `N\t` 前缀编号，必须还原为行号列而不是留在正文里重复出现。
+    #[test]
+    fn tab_numbered_content_becomes_the_gutter() {
+        let result = ToolResult::success(
+            "c",
+            "read_file",
+            json!({ "content": "1\t{\n2\t  \"name\": \"demo\"" }),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        assert_eq!(
+            lines[0],
+            PreviewLine::Context {
+                number: Some(1),
+                text: "{".into()
+            }
+        );
+        assert_eq!(
+            lines[1],
+            PreviewLine::Context {
+                number: Some(2),
+                text: "  \"name\": \"demo\"".into()
+            }
+        );
+    }
+
+    /// 正文中偶发的"数字+制表符"不得被误判为行号，否则会吞掉真实内容。
+    #[test]
+    fn partially_numbered_text_keeps_original_lines() {
+        let result = ToolResult::success(
+            "c",
+            "shell",
+            json!({ "content": "普通输出\n42\t被误判的一行" }),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        assert_eq!(
+            lines[1],
+            PreviewLine::Context {
+                number: Some(2),
+                text: "42\t被误判的一行".into()
+            }
+        );
+    }
+
+    /// 目录结果必须逐条展开，而不是压成 `entries: [N 项]` 这种无信息量的摘要。
+    #[test]
+    fn directory_entries_are_listed_individually() {
+        let result = ToolResult::success(
+            "c",
+            "list_directory",
+            json!({
+                "path": "crates",
+                "count": 2,
+                "entries": [
+                    {"name": "agent-core", "type": "dir", "size": null},
+                    {"name": "README.md", "type": "file", "size": 2048}
+                ]
+            }),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        assert_eq!(
+            lines[0],
+            PreviewLine::Context {
+                number: None,
+                text: "agent-core/".into()
+            }
+        );
+        assert_eq!(
+            lines[1],
+            PreviewLine::Context {
+                number: None,
+                text: "README.md  2.0 KB".into()
+            }
+        );
+        assert_eq!(
+            tool_summary(None, &result).as_deref(),
+            Some("2 个条目，来自 crates")
+        );
+    }
+
+    /// 搜索命中必须展示文件、行号与命中正文。
+    #[test]
+    fn search_matches_show_file_line_and_content() {
+        let result = ToolResult::success(
+            "c",
+            "search_files",
+            json!({
+                "count": 1,
+                "truncated": false,
+                "matches": [{"file": "src/bus.rs", "line": 12, "content": "pub struct EventBus {"}]
+            }),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        assert_eq!(
+            lines[0],
+            PreviewLine::Context {
+                number: None,
+                text: "src/bus.rs:12  pub struct EventBus {".into()
+            }
+        );
+    }
+
+    /// 整块没有行号时收起号位，条目不应白占一列缩进。
+    #[test]
+    fn gutter_collapses_when_no_line_is_numbered() {
+        let numbered = render_preview(
+            &[PreviewLine::Context {
+                number: Some(7),
+                text: "code".into(),
+            }],
+            60,
+            CodeLanguage::Plain,
+            false,
+        );
+        let plain = render_preview(
+            &[PreviewLine::Context {
+                number: None,
+                text: "code".into(),
+            }],
+            60,
+            CodeLanguage::Plain,
+            false,
+        );
+
+        let text_of = |line: &Line<'_>| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+
+        assert_eq!(text_of(&numbered[0]), format!("{PREVIEW_INDENT}   7 code"));
+        assert_eq!(text_of(&plain[0]), format!("{PREVIEW_INDENT}code"));
     }
 }

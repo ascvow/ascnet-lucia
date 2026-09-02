@@ -383,7 +383,7 @@ async fn tool_renderer_frame_is_applied_to_timeline_message() {
     assert!(!text.contains("● test_tool"), "{text:?}");
 }
 
-/// 多行工具 renderer 默认只显示首行，展开后显示其余详情行。
+/// 多行工具 renderer 默认展示上限内的全部详情行。
 #[test]
 #[cfg(feature = "plugins")]
 fn multi_line_tool_renderer_supports_collapsed_details() {
@@ -409,8 +409,10 @@ fn multi_line_tool_renderer_supports_collapsed_details() {
         .flat_map(|line| line.spans.iter())
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert!(collapsed.contains("▸ 自定义摘要"), "{collapsed:?}");
-    assert!(!collapsed.contains("自定义详情"), "{collapsed:?}");
+    // 详情未超过预览上限时全部直接展示，也就不需要展开标记。
+    assert!(collapsed.contains("自定义摘要"), "{collapsed:?}");
+    assert!(collapsed.contains("自定义详情"), "{collapsed:?}");
+    assert!(!collapsed.contains("▸ "), "{collapsed:?}");
 
     message.tool_expanded = true;
     let expanded = message

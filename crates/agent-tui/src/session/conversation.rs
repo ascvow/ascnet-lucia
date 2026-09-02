@@ -326,7 +326,7 @@ impl Msg {
             let visible_lines = if self.tool_expanded {
                 TOOL_RESULT_DETAIL_LINES
             } else {
-                1
+                TOOL_RESULT_PREVIEW_LINES
             };
             let omitted = frame_lines.len().saturating_sub(visible_lines);
             let mut lines = frame_lines
@@ -343,7 +343,7 @@ impl Msg {
                     .style(line.style)
                 })
                 .collect::<Vec<_>>();
-            if has_details {
+            if has_details && (omitted > 0 || self.tool_expanded) {
                 lines[0].spans.insert(
                     0,
                     Span::styled(
@@ -352,7 +352,7 @@ impl Msg {
                     ),
                 );
             }
-            if self.tool_expanded && omitted > 0 {
+            if omitted > 0 {
                 lines.push(Line::from(Span::styled(
                     format!("  … +{omitted} 行"),
                     Style::new().fg(COLOR_MUTED),
@@ -366,10 +366,32 @@ impl Msg {
         let is_error = matches!(self.kind, MsgKind::ToolError);
         let call = self.tool_call.as_ref();
         let target = call.and_then(tool_target);
-        let has_details = self.has_tool_details();
+
+        // 有结果就直接展示：先按当前上限构造详情，再据此决定是否需要展开标记。
+        let limit = if self.tool_expanded {
+            TOOL_RESULT_DETAIL_LINES
+        } else {
+            TOOL_RESULT_PREVIEW_LINES
+        };
+        let (preview, language) = if self.skip_reason.is_some() {
+            (Vec::new(), CodeLanguage::Plain)
+        } else {
+            match self.tool_result.as_ref() {
+                Some(result) => (
+                    preview_lines(call, result, limit),
+                    preview_language(call, result),
+                ),
+                None => (
+                    output_preview_lines(&self.tool_output, limit),
+                    CodeLanguage::Plain,
+                ),
+            }
+        };
+        // 只有确实还有更多内容时才提示可展开，避免出现点了没变化的假交互。
+        let truncated = preview.iter().any(|line| line.is_elided());
 
         let mut first = Vec::new();
-        if has_details {
+        if truncated || self.tool_expanded {
             first.push(Span::styled(
                 if self.tool_expanded { "▾ " } else { "▸ " },
                 Style::new().fg(COLOR_MUTED),
@@ -409,22 +431,17 @@ impl Msg {
                 ),
             ]));
         }
-        if self.tool_expanded && has_details {
-            let (preview, language) = match self.tool_result.as_ref() {
-                Some(result) => (
-                    preview_lines(call, result, TOOL_RESULT_DETAIL_LINES),
-                    preview_language(call, result),
-                ),
-                None => (
-                    output_preview_lines(&self.tool_output, TOOL_RESULT_DETAIL_LINES),
-                    CodeLanguage::Plain,
-                ),
-            };
-            lines.extend(render_preview(&preview, width, language, is_error));
-        }
+        lines.extend(render_preview(&preview, width, language, is_error));
         lines
     }
 }
+
+/// 工具消息默认展示的详情行数。
+///
+/// 有结果就直接展示，不必先点开——但必须有上限，否则一次 `read_file` 会把整屏刷满、
+/// 把上下文冲掉。超出部分折叠为 `… +N 行`，点击标题展开到
+/// [`TOOL_RESULT_DETAIL_LINES`]。
+pub(crate) const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 
 /// 单条工具消息展开后最多展示的详情行数，避免超大结果拖慢每帧布局。
 pub(crate) const TOOL_RESULT_DETAIL_LINES: usize = 40;

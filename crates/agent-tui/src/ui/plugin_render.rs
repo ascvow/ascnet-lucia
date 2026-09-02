@@ -3,7 +3,10 @@
 use crate::app::{
     default_plugin_height, default_plugin_width, plugin_view_visible, App, PluginViewState,
 };
-use crate::theme::{COLOR_BORDER_FOCUS, COLOR_MUTED, COLOR_TEXT};
+use crate::theme::{
+    COLOR_ACCENT, COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_TEXT,
+    COLOR_USER, COLOR_WARNING,
+};
 use agent_plugin_protocol::UiFrame as PluginUiFrame;
 use agent_plugin_protocol::{UiColor, UiPlacement, UiStyle};
 use ratatui::prelude::*;
@@ -352,18 +355,23 @@ fn plugin_style(plugin_style: &UiStyle) -> Style {
     style
 }
 
-/// 将插件便携颜色映射到 Ratatui 颜色。
+/// 将插件便携颜色映射到 Lucia 色板。
+///
+/// 刻意不直接落到终端 16 色：`Color::DarkGray` 之类的原始 ANSI 值在深色主题下比
+/// 应用自身的次要色暗得多，插件面板会明显比原生面板"发灰"，同一个界面里出现两套
+/// 观感。这里把插件的语义色收敛到与原生组件相同的色板，插件只需表达"这是次要文字"
+/// 或"这是危险状态"，具体呈现由宿主主题统一决定。
 fn plugin_color(color: UiColor) -> Color {
     match color {
         UiColor::Black => Color::Black,
-        UiColor::Red => Color::Red,
-        UiColor::Green => Color::Green,
-        UiColor::Yellow => Color::Yellow,
-        UiColor::Blue => Color::Blue,
-        UiColor::Magenta => Color::Magenta,
-        UiColor::Cyan => Color::Cyan,
-        UiColor::White => Color::White,
-        UiColor::Gray => Color::DarkGray,
+        UiColor::Red => COLOR_DANGER,
+        UiColor::Green => COLOR_SUCCESS,
+        UiColor::Yellow => COLOR_WARNING,
+        UiColor::Blue => COLOR_BORDER_FOCUS,
+        UiColor::Magenta => COLOR_USER,
+        UiColor::Cyan => COLOR_ACCENT,
+        UiColor::White => COLOR_TEXT,
+        UiColor::Gray => COLOR_MUTED,
     }
 }
 

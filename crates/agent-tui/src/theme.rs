@@ -21,6 +21,17 @@ pub(crate) const COLOR_DANGER: Color = Color::Rgb(205, 101, 101);
 /// 用户消息块背景色：与绯红强调同系的暗红灰，用于与助手正文区分。
 pub(crate) const COLOR_USER_BG: Color = Color::Rgb(58, 38, 43);
 
+/// 信息强调色：用于插件语义色中的"提示、正在进行"一类状态。
+pub(crate) const COLOR_ACCENT: Color = Color::Rgb(122, 172, 196);
+
+/// 列表与菜单中选中项的背景色。
+///
+/// 中性抬升色而非强调色：选中态需要的是"这一行被拎出来了"，用强调色会和语义色
+/// （成功、危险）争夺含义，反色则在深色主题下过于刺眼。
+pub(crate) const COLOR_SELECTION_BG: Color = Color::Rgb(56, 54, 60);
+/// 选中项左侧的指示条颜色。
+pub(crate) const COLOR_SELECTION_MARK: Color = Color::Rgb(226, 61, 82);
+
 /// 代码预览左侧行号列颜色；比正文更暗，避免与内容争夺注意力。
 pub(crate) const COLOR_LINE_NUMBER: Color = Color::Rgb(92, 90, 86);
 /// diff 新增行的整行背景色。

@@ -6,7 +6,10 @@ use crate::command::{
 };
 #[cfg(feature = "plugins")]
 use crate::command::{NativePluginDialogStatus, NativePluginPathMode};
-use crate::theme::{COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_TEXT, COLOR_USER_BG};
+use crate::theme::{
+    COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SELECTION_BG, COLOR_SELECTION_MARK,
+    COLOR_TEXT,
+};
 #[cfg(feature = "plugins")]
 use crate::theme::{COLOR_USER, COLOR_WARNING};
 use crate::ui::markdown::truncate_line;
@@ -14,6 +17,34 @@ use crate::ui::markdown::truncate_line;
 use crate::ui::wrapped_line_count;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+/// 构造列表中一行的选中态片段。
+///
+/// 选中项用中性抬升背景铺满整行并加左侧指示条；未选中项保持正文色，不整行压暗——
+/// 整行同色会让列表退化成一团难以扫读的灰字。
+fn selected_row(label: &str, active: bool, row_width: usize) -> Vec<Span<'static>> {
+    let row = if active {
+        Style::new().bg(COLOR_SELECTION_BG)
+    } else {
+        Style::new()
+    };
+    let pad = row_width.saturating_sub(unicode_width::UnicodeWidthStr::width(label));
+    let body = format!("{label}{}", " ".repeat(pad));
+    vec![
+        Span::styled(
+            if active { "▌" } else { " " },
+            Style::new().fg(COLOR_SELECTION_MARK).patch(row),
+        ),
+        Span::styled(
+            body,
+            if active {
+                row.fg(COLOR_TEXT).bold()
+            } else {
+                row.fg(COLOR_MUTED)
+            },
+        ),
+    ]
+}
+
 /// 在输入区上方绘制原生命令补全面板。
 pub(crate) fn render_native_command_panel(frame: &mut Frame, app: &App, area: Rect) {
     if area.is_empty() {
@@ -28,19 +59,15 @@ pub(crate) fn render_native_command_panel(frame: &mut Frame, app: &App, area: Re
         return;
     }
     let selected = app.native_command.selected.min(matches.len() - 1);
+    // 去掉边框、内边距与选中指示条后剩余的整行宽度，用于让选中背景铺满。
+    let row_width = usize::from(area.width.saturating_sub(4));
     let lines = matches
         .iter()
         .enumerate()
         .map(|(index, command)| {
-            let style = if index == selected {
-                Style::new().fg(COLOR_TEXT).bg(COLOR_USER_BG).bold()
-            } else {
-                Style::new().fg(COLOR_MUTED)
-            };
-            Line::from(vec![
-                Span::styled(format!("/{}  ", command.name), style),
-                Span::styled(command.summary.clone(), style),
-            ])
+            // 命令与说明保持固定紧凑间距，不按最长命令补齐整列留白。
+            let label = format!("/{}  {}", command.name, command.summary);
+            Line::from(selected_row(&label, index == selected, row_width))
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -73,6 +100,7 @@ pub(crate) fn render_native_session_dialog(frame: &mut Frame, app: &App, outer: 
         NativeSessionDialogMode::Browse => "项目会话",
     };
     let inner_height = usize::from(height.saturating_sub(2));
+    let row_width = usize::from(width.saturating_sub(4));
     let lines = match &dialog.status {
         NativeSessionDialogStatus::Loading => vec![Line::from(Span::styled(
             "正在读取会话…",
@@ -106,12 +134,7 @@ pub(crate) fn render_native_session_dialog(frame: &mut Frame, app: &App, outer: 
                         summary.message_count,
                         relative_native_time(summary.updated_at_ms)
                     );
-                    let style = if index == selected {
-                        Style::new().fg(COLOR_TEXT).bg(COLOR_USER_BG).bold()
-                    } else {
-                        Style::new().fg(COLOR_MUTED)
-                    };
-                    Line::from(Span::styled(label, style))
+                    Line::from(selected_row(&label, index == selected, row_width))
                 })
                 .collect()
         }
@@ -141,6 +164,7 @@ fn render_native_reasoning_panel(frame: &mut Frame, app: &App, area: Rect) {
     let selected = panel
         .selected
         .min(app.reasoning_levels.len().saturating_sub(1));
+    let row_width = usize::from(area.width.saturating_sub(4));
     let lines = app
         .reasoning_levels
         .iter()
@@ -156,12 +180,7 @@ fn render_native_reasoning_panel(frame: &mut Frame, app: &App, area: Rect) {
                 reasoning_level_command_value(*level),
                 reasoning_level_label(*level)
             );
-            let style = if index == selected {
-                Style::new().fg(COLOR_TEXT).bg(COLOR_USER_BG).bold()
-            } else {
-                Style::new().fg(COLOR_MUTED)
-            };
-            Line::from(Span::styled(label, style))
+            Line::from(selected_row(&label, index == selected, row_width))
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -192,6 +211,7 @@ pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &mut App, oute
     if width == 0 || height == 0 {
         return;
     }
+    let row_width = usize::from(width.saturating_sub(4));
     let area = Rect::new(
         outer.x + outer.width.saturating_sub(width) / 2,
         outer.y + outer.height.saturating_sub(height) / 2,
@@ -302,12 +322,7 @@ pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &mut App, oute
                                     state,
                                     truncate_line(&plugin.sha256, 12)
                                 );
-                                let style = if index == selected {
-                                    Style::new().fg(COLOR_TEXT).bg(COLOR_USER_BG).bold()
-                                } else {
-                                    Style::new().fg(COLOR_MUTED)
-                                };
-                                Line::from(Span::styled(label, style))
+                                Line::from(selected_row(&label, index == selected, row_width))
                             }),
                     );
                     content

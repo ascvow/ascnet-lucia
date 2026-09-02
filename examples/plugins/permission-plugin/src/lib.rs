@@ -1442,26 +1442,42 @@ fn option_line(shortcut: &str, label: &str, selected: bool, color: UiColor) -> U
 }
 
 /// 渲染命令补全面板风格的权限模式选项，并同时标记当前模式与键盘选择。
+///
+/// 选中态用左侧指示条加正文色，而不是整行反色：反色在深色主题下会变成刺眼的
+/// 白底黑字，与宿主原生命令面板的观感也对不上。未选中项保持正文色，只让说明文字
+/// 转为次要色，避免整行压暗后难以扫读。
 fn mode_line(command: &str, label: &str, detail: &str, current: bool, selected: bool) -> UiLine {
-    let style = UiStyle {
-        foreground: Some(if selected {
-            UiColor::White
-        } else {
-            UiColor::Gray
-        }),
+    let primary = UiStyle {
+        foreground: Some(UiColor::White),
         bold: selected,
-        reversed: selected,
+        ..UiStyle::default()
+    };
+    let secondary = UiStyle {
+        foreground: Some(UiColor::Gray),
+        bold: false,
         ..UiStyle::default()
     };
     UiLine {
         spans: vec![
             UiSpan {
+                text: if selected {
+                    "▌ ".into()
+                } else {
+                    "  ".to_string()
+                },
+                style: UiStyle {
+                    foreground: Some(UiColor::Magenta),
+                    bold: selected,
+                    ..UiStyle::default()
+                },
+            },
+            UiSpan {
                 text: format!("{command:<24}"),
-                style: style.clone(),
+                style: primary,
             },
             UiSpan {
                 text: format!("{label} · {detail}"),
-                style: style.clone(),
+                style: secondary.clone(),
             },
             UiSpan {
                 text: if current {
@@ -1469,7 +1485,11 @@ fn mode_line(command: &str, label: &str, detail: &str, current: bool, selected: 
                 } else {
                     String::new()
                 },
-                style,
+                style: UiStyle {
+                    foreground: Some(UiColor::Green),
+                    bold: true,
+                    ..UiStyle::default()
+                },
             },
         ],
     }
@@ -1699,7 +1719,13 @@ mod tests {
         assert!(text.contains("手动审批"), "{text}");
         assert!(text.contains("帮我审批 · 受限小模型审核  当前"), "{text}");
         assert!(text.contains("全部放行"), "{text}");
-        assert!(frame.lines[1].spans.iter().all(|span| span.style.reversed));
+        // 选中态用左侧指示条标记，不再整行反色——反色在深色主题下会变成刺眼的白底黑字。
+        assert!(frame
+            .lines
+            .iter()
+            .all(|line| line.spans.iter().all(|span| !span.style.reversed)));
+        assert!(frame.lines[1].spans[0].text.starts_with('▌'));
+        assert!(frame.lines[0].spans[0].text.trim().is_empty());
     }
 
     /// 命令参数必须稳定映射三种权限模式，未知值不得改变选择。

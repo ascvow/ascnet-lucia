@@ -216,12 +216,14 @@ fn tool_lines_show_args_and_truncated_result() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(collapsed.contains("▸ ● Read(src/main.rs)"), "{collapsed:?}");
+    // 有结果就默认展示详情；内容未超过预览上限时不出现展开标记。
+    assert!(collapsed.contains("● Read(src/main.rs)"), "{collapsed:?}");
+    assert!(!collapsed.contains("▸ "), "{collapsed:?}");
     assert!(
         collapsed.contains("└ 读取 1 行，来自 src/main.rs"),
         "{collapsed:?}"
     );
-    assert!(!collapsed.contains("1 很长的文件内容"), "{collapsed:?}");
+    assert!(collapsed.contains("1 很长的文件内容"), "{collapsed:?}");
 
     msg.tool_expanded = true;
     let expanded = msg
@@ -259,8 +261,11 @@ fn running_tool_lines_show_latest_output() {
         .flat_map(|line| line.spans.iter())
         .map(|span| span.content.as_ref())
         .collect::<String>();
+    // 默认展示最新若干行；超出上限的部分折叠并提示可展开。
     assert!(collapsed.contains("▸ ● Shell"), "{collapsed:?}");
-    assert!(!collapsed.contains("编译进度 48"), "{collapsed:?}");
+    assert!(collapsed.contains("编译进度 48"), "{collapsed:?}");
+    assert!(collapsed.contains("… +40 行"), "{collapsed:?}");
+    assert!(!collapsed.contains("编译进度 20"), "{collapsed:?}");
 
     msg.tool_expanded = true;
     let text = msg
