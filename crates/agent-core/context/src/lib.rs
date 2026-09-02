@@ -42,6 +42,12 @@ const RECENT_CONTEXT_TARGET_RATIO: usize = 20;
 const MAX_RETAINED_TOOL_RESULT_CHARS: usize = 2_000;
 /// 微压缩始终原样保留的最近工具结果数量。
 const RECENT_TOOL_RESULTS_TO_KEEP: usize = 3;
+/// 微压缩推进清理边界所需的最小积压条数。
+///
+/// 清理边界一旦前移就改写了历史中间的消息，服务端提示缓存会从改写点断开。按"保留最近
+/// 三条"逐轮推进意味着每一轮都断一次；这里改为积压够一批才推进一次，让绝大多数轮次的
+/// 上下文前缀保持逐字节稳定，代价只是旧结果多留一小段时间。
+const MICRO_COMPACT_CLEAR_BATCH: usize = 8;
 /// Claude Code 为完整摘要预留的最大输出 token 数。
 /// 原生上下文摘要请求允许的默认最大输出 token 数。
 pub const DEFAULT_MAX_SUMMARY_TOKENS: u32 = 20_000;
@@ -160,6 +166,8 @@ struct CompressionCache {
     system: Option<String>,
     /// 生成压缩结果时原始上下文的消息数，用于识别后续追加内容。
     source_message_count: usize,
+    /// 上一轮生效的微压缩清理边界，即已被清空的成功工具结果条数。
+    micro_cleared: usize,
     loaded_messages: Vec<Value>,
 }
 
@@ -242,12 +250,18 @@ impl NativeContextLoader {
                 && cache.system == request.system
                 && request.messages.len() >= cache.source_message_count
         });
+        // 缓存未命中说明前缀不是上一轮的延续，清理边界必须从零重新推导。
+        let micro_floor = cache
+            .as_ref()
+            .filter(|_| cache_hit)
+            .map_or(0, |cache| cache.micro_cleared);
         let plan = CachePlan::Automatic {
             run_id: request.run_id.clone(),
             provider: request.provider.clone(),
             model: request.model.clone(),
             system: request.system.clone(),
             source_message_count: request.messages.len(),
+            micro_floor,
             cache_hit,
         };
         if let Some(cache) = cache.filter(|_| cache_hit) {
@@ -280,6 +294,7 @@ impl NativeContextLoader {
                 system,
                 source_message_count,
                 cache_hit,
+                ..
             } if cache_hit || outcome.event.is_some() => {
                 state.cache = Some(CompressionCache {
                     run_id,
@@ -287,6 +302,7 @@ impl NativeContextLoader {
                     model,
                     system,
                     source_message_count,
+                    micro_cleared: outcome.micro_cleared,
                     loaded_messages: outcome.context.messages.clone(),
                 });
             }
@@ -320,8 +336,20 @@ enum CachePlan {
         model: String,
         system: Option<String>,
         source_message_count: usize,
+        /// 本轮允许沿用的微压缩清理边界下限。
+        micro_floor: usize,
         cache_hit: bool,
     },
+}
+
+impl CachePlan {
+    /// 返回本轮微压缩可以沿用的清理边界；手动压缩不继承任何边界。
+    fn micro_floor(&self) -> usize {
+        match self {
+            Self::Manual => 0,
+            Self::Automatic { micro_floor, .. } => *micro_floor,
+        }
+    }
 }
 
 #[async_trait]
@@ -332,8 +360,14 @@ impl ContextLoader for NativeContextLoader {
     async fn load(&self, request: CoreContextLoadRequest) -> Result<CoreLoadedContext> {
         let (effective, plan) = self.prepare_request(encode_core_request(request)?)?;
         let budget = compaction_budget(self.context_window, self.max_summary_tokens as usize);
-        let outcome =
-            compress_context(effective.clone(), effective.user_initiated, budget, self).await?;
+        let outcome = compress_context(
+            effective.clone(),
+            effective.user_initiated,
+            budget,
+            self,
+            plan.micro_floor(),
+        )
+        .await?;
         self.commit_cache(plan, &outcome)?;
         self.emit_event(&effective, outcome.event.as_ref()).await?;
         decode_core_context(outcome.context)
@@ -344,6 +378,10 @@ impl ContextLoader for NativeContextLoader {
 struct CompressionOutcome {
     context: LoadedContext,
     event: Option<Value>,
+    /// 本轮生效的微压缩清理边界，作为下一轮的下限延续。
+    ///
+    /// 完整压缩会用摘要替换历史，工具结果计数随之重置，因此该值归零。
+    micro_cleared: usize,
 }
 
 /// 完整压缩生成的替换消息、摘要范围和模型用量。
@@ -388,11 +426,15 @@ trait ContextSummarizer: Send + Sync {
 }
 
 /// 按模型窗口、当前输入规模和手动请求选择分层压缩策略。
+///
+/// `micro_floor` 是上一轮已生效的微压缩清理边界；本轮只在积压足够时才向后推进，
+/// 使多数轮次的上下文前缀保持稳定。
 async fn compress_context(
     request: ContextLoadRequest,
     manual: bool,
     budget: CompactionBudget,
     summarizer: &dyn ContextSummarizer,
+    micro_floor: usize,
 ) -> Result<CompressionOutcome> {
     let before_messages = request.messages.len();
     let before_tokens = estimate_context_tokens(request.system.as_deref(), &request.messages);
@@ -449,12 +491,17 @@ async fn compress_context(
                         "text": "上下文压缩"
                     }
                 })),
+                // 历史已被摘要替换，工具结果重新计数。
+                micro_cleared: 0,
             });
         }
     }
 
     if manual || before_tokens >= micro_threshold {
-        let (messages, cleared_results) = micro_compact_tool_results(&request.messages);
+        // 手动压缩本就要立刻见效，不受批量迟滞约束。
+        let clear_target = micro_clear_target(&request.messages, micro_floor, manual);
+        let (messages, cleared_results) =
+            micro_compact_tool_results(&request.messages, clear_target);
         // 最近若干条结果不清空，但同样需要封顶：巨型输出常常就出现在最新几条里。
         let (messages, capped_results) =
             cap_retained_tool_results(&messages, MAX_RETAINED_TOOL_RESULT_CHARS);
@@ -481,6 +528,19 @@ async fn compress_context(
                     },
                     "presentation": { "target": "none" }
                 })),
+                micro_cleared: clear_target,
+            });
+        }
+        // 本轮没有推进边界：保持上下文原样，让前缀继续命中缓存。
+        // 手动压缩仍要落到下面的"无可压缩历史"说明，不在这里收尾。
+        if !manual {
+            return Ok(CompressionOutcome {
+                context: LoadedContext {
+                    system: request.system,
+                    messages,
+                },
+                event: None,
+                micro_cleared: clear_target,
             });
         }
     }
@@ -507,6 +567,7 @@ async fn compress_context(
                     "text": "没有可压缩的历史上下文"
                 }
             })),
+            micro_cleared: 0,
         });
     }
 
@@ -516,6 +577,7 @@ async fn compress_context(
             messages: request.messages,
         },
         event: None,
+        micro_cleared: micro_floor,
     })
 }
 
@@ -574,14 +636,33 @@ fn estimate_text_tokens(text: &str) -> usize {
     ascii_bytes.div_ceil(4) + non_ascii_bytes.div_ceil(3)
 }
 
-/// 清理较旧的成功工具结果正文，同时保留调用关联、错误结果和最近成功结果。
-fn micro_compact_tool_results(messages: &[Value]) -> (Vec<Value>, usize) {
-    let keep = RECENT_TOOL_RESULTS_TO_KEEP;
-    let total_results = messages
+/// 推导本轮生效的微压缩清理边界，即从头数应处于清空态的成功工具结果条数。
+///
+/// 首次清理（`floor` 为零）直接清到位：此时不清理就省不下 token，而前缀本来就要因这次
+/// 改写重建一次。之后边界只在积压满一批时才前移——每次前移都会改写历史中间的消息，让
+/// 服务端提示缓存从改写点断开，因此稳定不动的轮次越多越省。`manual` 请求要求立刻见效，
+/// 同样直接取满。`floor` 超过当前可清理量时说明历史已被完整压缩替换，按当前量收敛。
+fn micro_clear_target(messages: &[Value], floor: usize, manual: bool) -> usize {
+    let clearable = messages
         .iter()
         .map(compactable_tool_result_count)
-        .sum::<usize>();
-    let mut remaining_to_clear = total_results.saturating_sub(keep);
+        .sum::<usize>()
+        .saturating_sub(RECENT_TOOL_RESULTS_TO_KEEP);
+    let floor = floor.min(clearable);
+    if manual || floor == 0 || clearable >= floor.saturating_add(MICRO_COMPACT_CLEAR_BATCH) {
+        clearable
+    } else {
+        floor
+    }
+}
+
+/// 清理较旧的成功工具结果正文，同时保留调用关联、错误结果和最近成功结果。
+///
+/// `clear_target` 是从头计数、应处于清空态的成功工具结果条数，由
+/// [`micro_clear_target`] 推导；返回值中的计数只统计本轮新清空的条数，已是占位符的
+/// 结果不重复计入。
+fn micro_compact_tool_results(messages: &[Value], clear_target: usize) -> (Vec<Value>, usize) {
+    let mut remaining_to_clear = clear_target;
     if remaining_to_clear == 0 {
         return (messages.to_vec(), 0);
     }
@@ -1000,9 +1081,9 @@ mod tests {
         tokens * 4 / messages + 1_024
     }
 
-    /// 使用确定性摘要器执行一次测试压缩。
+    /// 使用确定性摘要器执行一次测试压缩；清理边界从零开始。
     async fn compress_for_test(request: ContextLoadRequest, manual: bool) -> CompressionOutcome {
-        compress_context(request, manual, test_budget(), &TestSummarizer)
+        compress_context(request, manual, test_budget(), &TestSummarizer, 0)
             .await
             .expect("测试压缩应成功")
     }
@@ -1080,6 +1161,71 @@ mod tests {
         }
     }
 
+    /// 首次清理后，边界必须停在原处直到积压满一批，否则每轮都会改写历史、打断提示缓存。
+    #[tokio::test]
+    async fn micro_compaction_holds_boundary_until_batch_is_reached() {
+        let size = chars_to_exceed(test_budget().micro, 6);
+        let messages = (0..6)
+            .map(|index| tool_result_message(index, size))
+            .collect::<Vec<_>>();
+        let loader = NativeContextLoader::new(
+            ModelGateway::new(),
+            "test",
+            "test-model",
+            false,
+            DEFAULT_MAX_SUMMARY_TOKENS,
+            Arc::new(agent_core::InMemoryEventSink::new()),
+        )
+        .expect("应创建原生上下文加载器");
+        let request = |messages: Vec<Value>| ContextLoadRequest {
+            run_id: "micro-hold".into(),
+            step: 0,
+            user_initiated: false,
+            tools: Vec::new(),
+            provider: "test".into(),
+            model: "test-model".into(),
+            system: None,
+            messages,
+        };
+
+        let (prepared, plan) = loader
+            .prepare_request(request(messages.clone()))
+            .expect("应准备首轮微压缩请求");
+        let first = compress_context(
+            prepared,
+            false,
+            test_budget(),
+            &TestSummarizer,
+            plan.micro_floor(),
+        )
+        .await
+        .expect("首轮微压缩应成功");
+        loader.commit_cache(plan, &first).expect("应提交首轮边界");
+        // 六条结果保留最近三条，首次直接清到位。
+        assert_eq!(first.micro_cleared, 3);
+
+        // 追加一条新结果：积压只有一条，远不到一批，边界必须原地不动。
+        let mut extended = first.context.messages.clone();
+        extended.push(tool_result_message(6, size));
+        let (prepared, plan) = loader
+            .prepare_request(request(extended.clone()))
+            .expect("应准备次轮微压缩请求");
+        let second = compress_context(
+            prepared,
+            false,
+            test_budget(),
+            &TestSummarizer,
+            plan.micro_floor(),
+        )
+        .await
+        .expect("次轮微压缩应成功");
+
+        assert_eq!(second.micro_cleared, 3);
+        assert!(second.event.is_none(), "边界未推进时不应发布微压缩事件");
+        // 前缀逐字节不变，新消息只在末尾追加，服务端缓存才能继续命中。
+        assert_eq!(second.context.messages, extended);
+    }
+
     /// 微压缩不能清理失败结果，否则后续模型会失去仍待处理的错误状态。
     #[tokio::test]
     async fn micro_compaction_preserves_failed_tool_results() {
@@ -1151,6 +1297,7 @@ mod tests {
             false,
             test_budget(),
             &summarizer,
+            0,
         )
         .await
         .expect("完整压缩应调用模型摘要");
@@ -1389,7 +1536,7 @@ mod tests {
                 messages: original_messages.clone(),
             })
             .expect("应准备首次压缩请求");
-        let first = compress_context(request, false, test_budget(), &TestSummarizer)
+        let first = compress_context(request, false, test_budget(), &TestSummarizer, 0)
             .await
             .expect("首次增量压缩应成功");
         loader
@@ -1411,9 +1558,15 @@ mod tests {
                 messages: extended_messages,
             })
             .expect("应准备追加压缩请求");
-        let second = compress_context(request, false, test_budget(), &TestSummarizer)
-            .await
-            .expect("后续增量压缩应成功");
+        let second = compress_context(
+            request,
+            false,
+            test_budget(),
+            &TestSummarizer,
+            plan.micro_floor(),
+        )
+        .await
+        .expect("后续增量压缩应成功");
         loader
             .commit_cache(plan, &second)
             .expect("应提交追加压缩缓存");
@@ -1448,7 +1601,7 @@ mod tests {
             tools: Vec::new(),
             user_initiated: true,
         };
-        let outcome = compress_context(request, true, test_budget(), &TestSummarizer)
+        let outcome = compress_context(request, true, test_budget(), &TestSummarizer, 0)
             .await
             .expect("主动压缩应立即返回结果");
 
