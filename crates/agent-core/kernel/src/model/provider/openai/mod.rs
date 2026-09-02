@@ -28,10 +28,11 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// OpenAI `prompt_cache_key` 允许的最大字符数。
+const OPENAI_PROMPT_CACHE_KEY_MAX_CHARS: usize = 64;
 /// Codex Desktop 请求使用的客户端标识，用于兼容依赖官方客户端身份的模型网关。
 const CODEX_DESKTOP_USER_AGENT: &str =
     "Codex Desktop/0.144.0-alpha.4 (Mac OS 26.5.2; arm64) unknown (Codex Desktop; 26.707.31428)";
@@ -281,7 +282,7 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
 fn build_responses_request(req: ModelRequest, allowed_params: &[&str]) -> Result<Value> {
     let trusted_max_tokens = req.max_tokens;
     let cache_retention = req.cache_retention;
-    let prompt_cache_key = openai_prompt_cache_key(&req)?;
+    let prompt_cache_key = openai_prompt_cache_key(&req);
     let mut body = json!({
         "model": &req.model,
         "input": messages_to_responses_input(&req.messages)?,
@@ -336,7 +337,7 @@ fn build_responses_request(req: ModelRequest, allowed_params: &[&str]) -> Result
 fn build_chat_completions_request(req: ModelRequest) -> Result<Value> {
     let trusted_max_tokens = req.max_tokens;
     let cache_retention = req.cache_retention;
-    let prompt_cache_key = openai_prompt_cache_key(&req)?;
+    let prompt_cache_key = openai_prompt_cache_key(&req);
     let mut messages = Vec::new();
 
     if let Some(system) = req.system {
@@ -376,24 +377,26 @@ fn build_chat_completions_request(req: ModelRequest) -> Result<Value> {
     Ok(body)
 }
 
-/// 根据稳定提示前缀生成 OpenAI 缓存亲和键，不要求调用方提供专用运行参数。
+/// 返回本次请求使用的 OpenAI 缓存亲和键。
 ///
-/// 键只覆盖真正决定缓存前缀的部分：模型、system 提示和工具定义。消息不参与哈希，
-/// 因此同一会话的主请求、上下文摘要请求和其他复用同一前缀的内部调用会落在同一个键上，
-/// 被路由到同一台机器并共享已写入的前缀缓存。把首条消息纳入键会让每次一次性调用都产生
-/// 新键，反而使共享前缀无法命中。
-fn openai_prompt_cache_key(req: &ModelRequest) -> Result<Option<String>> {
+/// 键直接取调用方给出的会话 ID，不按请求内容推导：会话 ID 在整个会话生命周期内恒定，
+/// 天然把不同会话区分开，而任何按内容推导的键都会随消息或工具变化而改变，把同一会话的
+/// 连续请求路由到不同机器，缓存全部落空。
+///
+/// 关闭缓存或调用方未提供会话 ID 时不发送该字段，由服务商按前缀隐式缓存。
+fn openai_prompt_cache_key(req: &ModelRequest) -> Option<String> {
     if req.cache_retention == crate::model::PromptCacheRetention::None {
-        return Ok(None);
+        return None;
     }
-    let stable_prefix = json!({
-        "model": &req.model,
-        "system": &req.system,
-        "tools": &req.tools,
-    });
-    let encoded =
-        serde_json::to_vec(&stable_prefix).context("failed to encode OpenAI cache key")?;
-    Ok(Some(format!("{:x}", Sha256::digest(encoded))))
+    req.session_id.as_deref().map(clamp_prompt_cache_key)
+}
+
+/// 把会话 ID 收敛到 OpenAI 允许的缓存键长度上限，按字符而不是字节截断。
+fn clamp_prompt_cache_key(session_id: &str) -> String {
+    session_id
+        .chars()
+        .take(OPENAI_PROMPT_CACHE_KEY_MAX_CHARS)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

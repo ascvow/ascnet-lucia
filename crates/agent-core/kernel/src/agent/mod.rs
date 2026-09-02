@@ -399,6 +399,12 @@ pub struct Agent {
     /// 应用在共享 Agent 上动态覆盖的推理强度；`u8::MAX` 表示沿用静态运行选项。
     reasoning_override: std::sync::atomic::AtomicU8,
 
+    /// 应用注入的会话路由标识，随模型请求下发给支持会话亲和的服务商。
+    ///
+    /// 用共享可变而不是运行选项：同一个 Agent 实例会在多个会话之间切换，键必须跟着
+    /// 当前会话走，否则新会话会复用旧会话的路由。
+    session_id: Arc<std::sync::Mutex<Option<String>>>,
+
     /// steering 消息队列：工具执行间隙注入，跳过剩余工具。
     steering: Arc<std::sync::Mutex<Vec<String>>>,
 
@@ -432,6 +438,7 @@ impl Agent {
             bus: EventBus::new(),
             options,
             reasoning_override: std::sync::atomic::AtomicU8::new(u8::MAX),
+            session_id: Arc::new(std::sync::Mutex::new(None)),
             steering: Arc::new(std::sync::Mutex::new(Vec::new())),
             follow_ups: Arc::new(std::sync::Mutex::new(Vec::new())),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -777,6 +784,25 @@ impl Agent {
         };
         self.reasoning_override
             .store(value, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 返回随模型请求下发的会话路由标识。
+    pub fn session_id(&self) -> Option<String> {
+        self.session_id
+            .lock()
+            .ok()
+            .and_then(|session_id| session_id.clone())
+    }
+
+    /// 设置后续模型请求使用的会话路由标识。
+    ///
+    /// 应用应在会话创建、恢复或切换时调用，传入稳定的会话 ID。服务商据此把同一会话的
+    /// 请求路由到持有其前缀缓存的机器；传 `None` 表示不参与会话亲和。已经发出的请求不受
+    /// 影响，正在运行的 ReAct 循环从下一次模型请求开始生效。
+    pub fn set_session_id(&self, session_id: Option<String>) {
+        if let Ok(mut slot) = self.session_id.lock() {
+            *slot = session_id;
+        }
     }
 
     /// Borrow the model gateway.

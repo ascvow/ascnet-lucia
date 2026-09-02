@@ -1,7 +1,6 @@
 //! Agent 模型请求的上下文加载接口。
 
 use crate::model::ModelMessage;
-use agent_tool::ToolSpec;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -25,13 +24,6 @@ pub struct ContextLoadRequest {
     pub system: Option<String>,
     /// 扩展提示与完整会话消息组成的原始上下文。
     pub messages: Vec<ModelMessage>,
-    /// 本轮模型请求实际暴露的工具定义。
-    ///
-    /// 只供同进程原生加载器复刻请求前缀（system + tools + 历史消息），使摘要类调用
-    /// 能命中主请求已经写入的服务端提示缓存。该字段不跨插件 ABI 序列化，因此第三方
-    /// 上下文加载器看不到工具定义。
-    #[serde(skip)]
-    pub tools: Vec<ToolSpec>,
     /// 是否由用户显式发起（而非模型请求前的自动加载）。
     /// 加载器可据此跳过内部水位判断，无条件执行完整处理。
     #[serde(default)]

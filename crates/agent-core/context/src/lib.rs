@@ -4,11 +4,10 @@
 
 use agent_core::{
     event::{AgentEvent, AgentEventKind, EventSink},
-    model::{transform::transform_messages_for_route, ModelGateway, ModelRequest},
+    model::{ModelGateway, ModelRequest},
     ContextLoadRequest as CoreContextLoadRequest, ContextLoader,
     LoadedContext as CoreLoadedContext, PromptCacheRetention, ReasoningLevel, ToolChoice,
 };
-use agent_tool::ToolSpec;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -53,10 +52,7 @@ const MICRO_COMPACT_CLEAR_BATCH: usize = 8;
 pub const DEFAULT_MAX_SUMMARY_TOKENS: u32 = 20_000;
 /// 被微压缩的工具结果占位文本。
 const CLEARED_TOOL_RESULT: &str = "[older tool result elided]";
-/// 会话没有 system 提示时摘要调用使用的兜底 system 提示。
-///
-/// 正常路径会复用会话原 system：摘要请求与主请求共享 system + tools + 历史消息前缀，
-/// 才能命中服务端已经为主请求写入的提示缓存，把整段历史的输入成本降到缓存读取价。
+/// 独立摘要调用使用的固定 system 提示，不携带主 Agent 的工具和行为人格。
 const SUMMARY_SYSTEM_PROMPT: &str =
     "You compress long agent conversations into faithful, self-contained handoff summaries. Never call tools.";
 /// 完整压缩指令，作为尾部 user 消息追加在待摘要历史之后。
@@ -64,9 +60,7 @@ const SUMMARY_SYSTEM_PROMPT: &str =
 /// 使用英文以贴合模型的指令跟随分布；摘要正文的语言由对话本身决定。要求先写
 /// `<analysis>` 再写 `<summary>`，前者会被 [`normalize_model_summary`] 剥离，只把
 /// 结构化摘要写回上下文。
-const SUMMARY_REQUEST_PROMPT: &str = r#"Stop working on the task. This turn is a context-compaction turn: ignore any behavioral instructions in the system prompt about executing work, and do not call any tool.
-
-Write a handoff summary of the entire conversation above. It will REPLACE that conversation: the only things carried forward are your summary plus the few most recent messages, so anything you leave out is permanently lost.
+const SUMMARY_REQUEST_PROMPT: &str = r#"Write a handoff summary of the entire conversation above. It will REPLACE that conversation: the only things carried forward are your summary plus the few most recent messages, so anything you leave out is permanently lost.
 
 First, inside <analysis> tags, walk through the conversation chronologically and note what must survive: each user request, the technical decisions taken, the files touched, and the work still open. Keep it brief; this section is discarded.
 
@@ -91,8 +85,6 @@ struct ContextLoadRequest {
     model: String,
     system: Option<String>,
     messages: Vec<Value>,
-    /// 本轮模型请求暴露的工具定义，摘要调用据此复刻请求前缀。
-    tools: Vec<ToolSpec>,
     user_initiated: bool,
 }
 
@@ -115,7 +107,6 @@ fn encode_core_request(request: CoreContextLoadRequest) -> Result<ContextLoadReq
             .map(serde_json::to_value)
             .collect::<serde_json::Result<Vec<_>>>()
             .context("编码 Core 上下文消息失败")?,
-        tools: request.tools,
         user_initiated: request.user_initiated,
     })
 }
@@ -144,8 +135,6 @@ pub struct NativeContextLoader {
     max_summary_tokens: u32,
     /// 目标模型的真实上下文窗口；`None` 时按假定窗口推导水位。
     context_window: Option<usize>,
-    /// 摘要请求使用的提示缓存保留策略；默认与主 Agent 的默认值一致。
-    cache_retention: PromptCacheRetention,
     events: Arc<dyn EventSink>,
     state: Mutex<CompressionState>,
 }
@@ -203,19 +192,9 @@ impl NativeContextLoader {
             stream,
             max_summary_tokens,
             context_window: None,
-            cache_retention: PromptCacheRetention::default(),
             events,
             state: Mutex::new(CompressionState::default()),
         })
-    }
-
-    /// 声明摘要请求使用的提示缓存保留策略。
-    ///
-    /// 未声明时使用服务商短期缓存。调用方应传入与主 Agent 相同的配置值，否则摘要请求
-    /// 会写入一份主请求读不到的缓存条目。
-    pub fn with_cache_retention(mut self, cache_retention: PromptCacheRetention) -> Self {
-        self.cache_retention = cache_retention;
-        self
     }
 
     /// 声明目标模型的真实上下文窗口。
@@ -399,28 +378,16 @@ struct SummaryResponse {
     usage: Option<Value>,
 }
 
-/// 一次摘要调用需要复刻的主请求前缀。
-///
-/// 摘要请求只在 `messages` 之后追加压缩指令，其余部分与主请求逐字节一致，因此服务端
-/// 能把整段历史识别为同一缓存前缀。
-struct SummaryPrefix<'a> {
-    /// 会话顶层 system 提示；`None` 时摘要调用使用兜底提示。
-    system: Option<&'a str>,
-    /// 主请求本轮暴露的工具定义。
-    tools: &'a [ToolSpec],
-    /// 待摘要的历史消息，即主请求消息列表的前缀。
-    messages: &'a [Value],
-}
-
 /// 上下文压缩只依赖该受限摘要接口，测试可注入不联网的确定性实现。
 #[async_trait]
 trait ContextSummarizer: Send + Sync {
     /// 摘要指定旧历史，并遵守输出预算。
     ///
-    /// `prefix` 描述主请求前缀，实现应原样复用它以命中服务端提示缓存。
+    /// `route` 是本次调用的会话路由标识，实现据此保持服务商侧的会话亲和。
     async fn summarize(
         &self,
-        prefix: SummaryPrefix<'_>,
+        route: &str,
+        messages: &[Value],
         max_tokens: u32,
     ) -> Result<SummaryResponse>;
 }
@@ -447,8 +414,7 @@ async fn compress_context(
     if manual || before_tokens >= compact_threshold {
         if let Some(compacted) = compact_messages(
             &request.messages,
-            request.system.as_deref(),
-            &request.tools,
+            &request.run_id,
             manual,
             recent_target,
             summarizer,
@@ -789,8 +755,7 @@ fn compactable_tool_result_count(message: &Value) -> usize {
 /// 用独立模型摘要替换较旧 API 轮次；手动模式只保留最新完整轮次。
 async fn compact_messages(
     messages: &[Value],
-    system: Option<&str>,
-    tools: &[ToolSpec],
+    route: &str,
     manual: bool,
     recent_target: usize,
     summarizer: &dyn ContextSummarizer,
@@ -806,14 +771,7 @@ async fn compact_messages(
     }
 
     let response = summarizer
-        .summarize(
-            SummaryPrefix {
-                system,
-                tools,
-                messages: &messages[..split_index],
-            },
-            DEFAULT_MAX_SUMMARY_TOKENS,
-        )
+        .summarize(route, &messages[..split_index], DEFAULT_MAX_SUMMARY_TOKENS)
         .await?;
     let summary = normalize_model_summary(&response.text)?;
     // 保留区仍是原文，单条超长结果会让尾部继续占据数万 token；这里只封顶不清空。
@@ -883,17 +841,17 @@ fn recent_tail_start(
 /// 通过 Host 固定路由调用模型生成摘要；Guest 无法指定 provider、model 或工具。
 #[async_trait]
 impl ContextSummarizer for NativeContextLoader {
-    /// 使用应用固定的 provider/model 生成摘要；调用强制禁用工具调用、推理和 provider 逃生参数。
+    /// 使用应用固定的 provider/model 生成摘要；调用强制禁用工具、推理和 provider 逃生参数。
     ///
-    /// 请求刻意复用主请求的 system、工具定义和历史消息前缀，只在末尾追加压缩指令，
-    /// 使服务端把这段历史判定为已缓存前缀；工具定义只作为前缀出现，`tool_choice` 为
-    /// `None` 保证模型不能真的调用它们。
+    /// 摘要是一次性请求：它的前缀在压缩完成后就不复存在，写进去的缓存条目永远读不到，
+    /// 因此显式关闭缓存保留，只保留会话路由标识让请求落在同一台机器上。
     async fn summarize(
         &self,
-        prefix: SummaryPrefix<'_>,
+        route: &str,
+        messages: &[Value],
         max_tokens: u32,
     ) -> Result<SummaryResponse> {
-        let mut summary_messages = prefix.messages.to_vec();
+        let mut summary_messages = messages.to_vec();
         summary_messages.push(json!({
             "role": "user",
             "content": [{"type": "text", "text": SUMMARY_REQUEST_PROMPT}]
@@ -903,18 +861,12 @@ impl ContextSummarizer for NativeContextLoader {
             .map(serde_json::from_value)
             .collect::<serde_json::Result<Vec<_>>>()
             .context("解码上下文摘要模型消息失败")?;
-        // 主请求同样按路由清洗消息；这里必须做同一变换，否则前缀在字节层面就不一致。
-        let messages = transform_messages_for_route(&messages, &self.provider, &self.model);
         let mut request = ModelRequest::new(self.model.clone(), messages);
-        request.system = Some(
-            prefix
-                .system
-                .map_or_else(|| SUMMARY_SYSTEM_PROMPT.to_string(), str::to_string),
-        );
-        request.tools = prefix.tools.to_vec();
+        request.system = Some(SUMMARY_SYSTEM_PROMPT.into());
         request.tool_choice = ToolChoice::None;
         request.reasoning = ReasoningLevel::Off;
-        request.cache_retention = self.cache_retention;
+        request.cache_retention = PromptCacheRetention::None;
+        request.session_id = Some(route.to_string());
         request.max_tokens = Some(max_tokens.min(self.max_summary_tokens).max(1));
         let response = if self.stream {
             self.gateway
@@ -1053,7 +1005,8 @@ mod tests {
     impl ContextSummarizer for TestSummarizer {
         async fn summarize(
             &self,
-            _prefix: SummaryPrefix<'_>,
+            _route: &str,
+            _messages: &[Value],
             _max_tokens: u32,
         ) -> Result<SummaryResponse> {
             Ok(SummaryResponse {
@@ -1096,7 +1049,6 @@ mod tests {
             ContextLoadRequest {
                 run_id: "run-small".into(),
                 user_initiated: false,
-                tools: Vec::new(),
                 step: 0,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -1122,7 +1074,6 @@ mod tests {
             ContextLoadRequest {
                 run_id: "run-micro".into(),
                 user_initiated: false,
-                tools: Vec::new(),
                 step: 1,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -1181,7 +1132,6 @@ mod tests {
             run_id: "micro-hold".into(),
             step: 0,
             user_initiated: false,
-            tools: Vec::new(),
             provider: "test".into(),
             model: "test-model".into(),
             system: None,
@@ -1237,7 +1187,6 @@ mod tests {
             ContextLoadRequest {
                 run_id: "run-micro-error".into(),
                 user_initiated: false,
-                tools: Vec::new(),
                 step: 1,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -1274,11 +1223,12 @@ mod tests {
         impl ContextSummarizer for RecordingSummarizer {
             async fn summarize(
                 &self,
-                prefix: SummaryPrefix<'_>,
+                route: &str,
+                messages: &[Value],
                 max_tokens: u32,
             ) -> Result<SummaryResponse> {
-                *self.0.lock().expect("记录锁不应损坏") = prefix.messages.to_vec();
-                TestSummarizer.summarize(prefix, max_tokens).await
+                *self.0.lock().expect("记录锁不应损坏") = messages.to_vec();
+                TestSummarizer.summarize(route, messages, max_tokens).await
             }
         }
 
@@ -1287,7 +1237,6 @@ mod tests {
             ContextLoadRequest {
                 run_id: "run-full".into(),
                 user_initiated: false,
-                tools: Vec::new(),
                 step: 2,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -1402,7 +1351,6 @@ mod tests {
             ContextLoadRequest {
                 run_id: "run-cap".into(),
                 user_initiated: false,
-                tools: Vec::new(),
                 step: 1,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -1438,7 +1386,6 @@ mod tests {
             ContextLoadRequest {
                 run_id: "run-two-rounds".into(),
                 user_initiated: false,
-                tools: Vec::new(),
                 step: 1,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -1477,7 +1424,6 @@ mod tests {
             ContextLoadRequest {
                 run_id: "run-manual".into(),
                 user_initiated: true,
-                tools: Vec::new(),
                 step: 0,
                 provider: "test".into(),
                 model: "test-model".into(),
@@ -1529,7 +1475,6 @@ mod tests {
                 run_id: "incremental-run".into(),
                 step: 0,
                 user_initiated: false,
-                tools: Vec::new(),
                 provider: "test".into(),
                 model: "test-model".into(),
                 system: None,
@@ -1551,7 +1496,6 @@ mod tests {
                 run_id: "incremental-run".into(),
                 step: 1,
                 user_initiated: false,
-                tools: Vec::new(),
                 provider: "test".into(),
                 model: "test-model".into(),
                 system: None,
@@ -1598,7 +1542,6 @@ mod tests {
                 text_message("assistant", "中间回复"),
                 text_message("user", "当前请求"),
             ],
-            tools: Vec::new(),
             user_initiated: true,
         };
         let outcome = compress_context(request, true, test_budget(), &TestSummarizer, 0)
@@ -1615,12 +1558,13 @@ mod tests {
         );
     }
 
-    /// 摘要请求必须逐字复刻主请求前缀，否则整段历史无法命中服务端提示缓存。
+    /// 摘要是一次性请求：必须关闭缓存保留，同时保留会话路由标识。
     ///
-    /// 断言覆盖三件事：system 与工具定义原样复用、待摘要历史保持原顺序且只在末尾追加
-    /// 压缩指令、缓存保留策略跟随配置；同时 `tool_choice` 必须禁用，工具只作为前缀存在。
+    /// 摘要的前缀在压缩完成后就不存在了，写进去的缓存条目永远读不到；继续按主会话策略
+    /// 写缓存只会占用并驱逐主会话自己的缓存分区。路由标识仍要发送，使同一次运行里的
+    /// 摘要请求落到同一台机器上。
     #[tokio::test]
-    async fn summary_request_replays_main_request_prefix() {
+    async fn summary_request_disables_cache_and_keeps_session_route() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let mut gateway = ModelGateway::new();
         gateway
@@ -1637,13 +1581,7 @@ mod tests {
             DEFAULT_MAX_SUMMARY_TOKENS,
             Arc::new(agent_core::InMemoryEventSink::new()),
         )
-        .expect("应创建原生上下文加载器")
-        .with_cache_retention(PromptCacheRetention::Long);
-        let tools = vec![ToolSpec::new(
-            "read_file",
-            "读取文件",
-            json!({"type": "object"}),
-        )];
+        .expect("应创建原生上下文加载器");
         let history = "历史工具输出".repeat(90_000);
         let messages = vec![
             agent_core::model::ModelMessage::text(agent_core::MessageRole::User, history),
@@ -1659,8 +1597,7 @@ mod tests {
                 provider: "test".into(),
                 model: "test-model".into(),
                 system: Some("主 Agent 系统提示".into()),
-                messages: messages.clone(),
-                tools: tools.clone(),
+                messages,
                 user_initiated: false,
             })
             .await
@@ -1668,15 +1605,11 @@ mod tests {
 
         let captured = requests.lock().expect("请求记录锁不应损坏");
         let request = captured.first().expect("应发出一次摘要请求");
-        assert_eq!(request.system.as_deref(), Some("主 Agent 系统提示"));
-        assert_eq!(request.tools, tools);
+        assert_eq!(request.cache_retention, PromptCacheRetention::None);
+        assert_eq!(request.session_id.as_deref(), Some("prefix-run"));
+        // 摘要不携带主 Agent 的人格与工具，避免模型把压缩当成继续执行任务。
+        assert_eq!(request.system.as_deref(), Some(SUMMARY_SYSTEM_PROMPT));
+        assert!(request.tools.is_empty());
         assert_eq!(request.tool_choice, ToolChoice::None);
-        assert_eq!(request.cache_retention, PromptCacheRetention::Long);
-        // 摘要请求 = 主请求的历史前缀 + 末尾压缩指令，中间不得插入或改写任何消息。
-        let prefix_len = request.messages.len() - 1;
-        assert_eq!(request.messages[..prefix_len], messages[..prefix_len]);
-        assert!(request.messages[prefix_len]
-            .text_content()
-            .contains("context-compaction turn"));
     }
 }

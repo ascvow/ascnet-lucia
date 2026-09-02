@@ -139,7 +139,7 @@ let response = host.complete_model(&ModelCompletionRequest {
 })?;
 ```
 
-该能力要求 manifest 声明 `model_completion = true`，且应用通过 `PluginHostServices::with_model_completion` 注入模型网关、provider、model、流式模式、最大输出预算和提示缓存保留策略；应用应传入与主 Agent 相同的缓存策略，使复用同一 system 前缀的插件调用能命中同一份服务端缓存。Guest 不能提交模型路由、流式模式、工具、推理级别或 provider options；Host 固定这些设置并收窄输出预算。ExecutionPolicy 的累计调用次数和请求输入字节预算按单个插件激活隔离，同一激活内的并发 clone 共享原子账本，不会消耗其他插件实例的额度。调用失败或返回空文本时直接返回错误，不会静默退回本地裁剪。
+该能力要求 manifest 声明 `model_completion = true`，且应用通过 `PluginHostServices::with_model_completion` 注入模型网关、provider、model、流式模式和最大输出预算。插件补全是一次性调用，Host 固定关闭提示缓存保留，避免写入永远读不到的缓存条目挤占主会话的缓存分区。Guest 不能提交模型路由、流式模式、工具、推理级别或 provider options；Host 固定这些设置并收窄输出预算。ExecutionPolicy 的累计调用次数和请求输入字节预算按单个插件激活隔离，同一激活内的并发 clone 共享原子账本，不会消耗其他插件实例的额度。调用失败或返回空文本时直接返回错误，不会静默退回本地裁剪。
 
 ## 错误信封
 

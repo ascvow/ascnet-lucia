@@ -220,9 +220,9 @@ fn provider_options_cannot_override_trusted_output_limits() {
     assert_eq!(chat_body["best_of"], 1);
 }
 
-/// OpenAI 默认短期缓存必须自动生成稳定亲和键，不要求调用方提供专用运行参数。
+/// 缓存亲和键直接取会话 ID，两种协议使用同一个值。
 #[test]
-fn default_short_cache_adds_automatic_openai_cache_key() {
+fn default_short_cache_sends_session_id_as_cache_key() {
     let mut request = ModelRequest::new(
         "gpt-test",
         vec![crate::model::ModelMessage::text(
@@ -231,51 +231,80 @@ fn default_short_cache_adds_automatic_openai_cache_key() {
         )],
     );
     request.system = Some("系统提示".into());
+    request.session_id = Some("session-abc".into());
 
     let responses = build_responses_request(request.clone(), RESPONSES_PARAMS_COMPATIBLE)
         .expect("Responses 请求应成功构建");
     let chat = build_chat_completions_request(request).expect("Chat 请求应成功构建");
 
-    let responses_key = responses["prompt_cache_key"]
-        .as_str()
-        .expect("Responses 应包含缓存亲和键");
-    let chat_key = chat["prompt_cache_key"]
-        .as_str()
-        .expect("Chat 应包含缓存亲和键");
-    assert_eq!(responses_key.len(), 64);
-    assert_eq!(responses_key, chat_key);
+    assert_eq!(responses["prompt_cache_key"], "session-abc");
+    assert_eq!(chat["prompt_cache_key"], "session-abc");
     assert!(responses.get("prompt_cache_retention").is_none());
     assert!(chat.get("prompt_cache_retention").is_none());
 }
 
-/// 复用同一前缀的内部调用必须与主请求落在同一缓存亲和键上。
+/// 键必须只随会话变化：同一会话追加消息不得改键，不同会话必须拿到不同键。
 ///
-/// 上下文摘要请求携带相同的 system 与工具定义、只在消息末尾追加压缩指令；键随消息变化
-/// 会让它被路由到别处，共享前缀就白写了。
+/// 键一旦随请求内容漂移，同一会话的连续请求就会被路由到不同机器，前缀缓存全部落空；
+/// 反过来所有会话共用一个键又会让它们挤在同一台机器上互相驱逐。
 #[test]
-fn openai_cache_key_ignores_messages_for_shared_prefix() {
-    let mut main_request = ModelRequest::new(
-        "gpt-test",
-        vec![crate::model::ModelMessage::text(
-            crate::model::MessageRole::User,
-            "第一轮请求",
-        )],
-    );
-    main_request.system = Some("系统提示".into());
-    let mut summary_request = main_request.clone();
-    summary_request
-        .messages
-        .push(crate::model::ModelMessage::text(
-            crate::model::MessageRole::User,
-            "压缩上文",
-        ));
+fn openai_cache_key_tracks_session_only() {
+    let request_for = |session: &str, first: &str| {
+        let mut request = ModelRequest::new(
+            "gpt-test",
+            vec![crate::model::ModelMessage::text(
+                crate::model::MessageRole::User,
+                first,
+            )],
+        );
+        request.system = Some("系统提示".into());
+        request.session_id = Some(session.into());
+        request
+    };
 
-    let main = build_responses_request(main_request, RESPONSES_PARAMS_COMPATIBLE)
-        .expect("主请求应成功构建");
-    let summary = build_responses_request(summary_request, RESPONSES_PARAMS_COMPATIBLE)
-        .expect("摘要请求应成功构建");
+    let first_turn = request_for("session-1", "第一轮请求");
+    // 同一会话的后续轮次：消息变了，键不能变。
+    let later_turn = request_for("session-1", "完全不同的一轮请求");
+    let other_session = request_for("session-2", "第一轮请求");
 
-    assert_eq!(main["prompt_cache_key"], summary["prompt_cache_key"]);
+    let key = |request: ModelRequest| {
+        build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE).expect("请求应成功构建")
+            ["prompt_cache_key"]
+            .as_str()
+            .expect("应包含缓存亲和键")
+            .to_string()
+    };
+
+    assert_eq!(key(first_turn.clone()), key(later_turn));
+    assert_ne!(key(first_turn), key(other_session));
+}
+
+/// 未提供会话 ID 时不发送缓存键，交给服务商按前缀隐式缓存。
+#[test]
+fn missing_session_id_omits_openai_cache_key() {
+    let request = ModelRequest::new("gpt-test", Vec::new());
+
+    let responses = build_responses_request(request.clone(), RESPONSES_PARAMS_COMPATIBLE)
+        .expect("Responses 请求应成功构建");
+    let chat = build_chat_completions_request(request).expect("Chat 请求应成功构建");
+
+    assert!(responses.get("prompt_cache_key").is_none());
+    assert!(chat.get("prompt_cache_key").is_none());
+}
+
+/// 超长会话 ID 必须按字符截断到 OpenAI 允许的键长上限。
+#[test]
+fn oversized_session_id_is_clamped_to_key_limit() {
+    let mut request = ModelRequest::new("gpt-test", Vec::new());
+    request.session_id = Some("会".repeat(100));
+
+    let responses = build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE)
+        .expect("Responses 请求应成功构建");
+
+    let key = responses["prompt_cache_key"]
+        .as_str()
+        .expect("应包含缓存亲和键");
+    assert_eq!(key.chars().count(), OPENAI_PROMPT_CACHE_KEY_MAX_CHARS);
 }
 
 /// 显式关闭缓存时不得生成 OpenAI 缓存字段。
@@ -283,6 +312,8 @@ fn openai_cache_key_ignores_messages_for_shared_prefix() {
 fn no_cache_retention_omits_openai_cache_fields() {
     let mut request = ModelRequest::new("gpt-test", Vec::new());
     request.cache_retention = PromptCacheRetention::None;
+    // 即使调用方给了会话 ID，关闭缓存时也不得发送缓存键。
+    request.session_id = Some("session-abc".into());
 
     let responses = build_responses_request(request.clone(), RESPONSES_PARAMS_COMPATIBLE)
         .expect("Responses 无缓存请求应成功构建");

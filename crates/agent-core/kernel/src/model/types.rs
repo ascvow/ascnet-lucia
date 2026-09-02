@@ -432,6 +432,15 @@ pub struct ModelRequest {
     #[serde(default)]
     pub cache_retention: PromptCacheRetention,
 
+    /// 会话级路由标识，供支持会话亲和的服务商做提示缓存分组。
+    ///
+    /// 同一会话的所有请求必须使用同一个值，不同会话必须不同：服务商据此把请求路由到
+    /// 持有该会话前缀缓存的机器。取值应当是稳定的会话 ID，不能按请求内容推导——内容
+    /// 一变键就变，路由随之改变，缓存反而全部落空。`None` 表示不发送该字段，由服务商
+    /// 自行按前缀隐式缓存。
+    #[serde(default)]
+    pub session_id: Option<String>,
+
     /// Provider-specific escape hatch. Adapters shallow-merge this object into the wire request.
     /// 服务商专属逃生口。适配器会把这个对象浅合并到实际网络请求里。
     #[serde(default)]
@@ -452,6 +461,7 @@ impl ModelRequest {
             temperature: None,
             reasoning: ReasoningLevel::Off,
             cache_retention: PromptCacheRetention::Short,
+            session_id: None,
             provider_options: Value::Object(Default::default()),
         }
     }

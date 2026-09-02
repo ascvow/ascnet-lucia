@@ -11,7 +11,9 @@ use crate::capability::{
 };
 use crate::manifest::AgentCapabilitySection;
 use crate::services::{AgentRuntimeHostServices, ModelCompletionHostServices};
-use agent_core::{AgentEvent, AgentEventKind, ModelRequest, ReasoningLevel, ToolChoice};
+use agent_core::{
+    AgentEvent, AgentEventKind, ModelRequest, PromptCacheRetention, ReasoningLevel, ToolChoice,
+};
 use agent_runtime::{
     AgentEventStream, AgentId, AgentRuntimeApi, AgentSpawnRequest, RuntimePrincipal,
 };
@@ -174,8 +176,9 @@ impl CapabilityState {
                 .clamp(1, binding.max_output_tokens),
         );
         model_request.reasoning = ReasoningLevel::Off;
-        // 与主 Agent 使用同一缓存策略：插件补全常复用同一 system 前缀，策略一致才能命中。
-        model_request.cache_retention = binding.cache_retention;
+        // 插件补全是一次性调用，写进去的缓存条目没有后续请求会读到；关闭缓存保留避免
+        // 污染主会话的缓存分区，也不发送会话路由标识。
+        model_request.cache_retention = PromptCacheRetention::None;
         let response = if binding.stream {
             binding
                 .gateway

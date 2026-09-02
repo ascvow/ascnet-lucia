@@ -153,6 +153,9 @@ impl App {
         let tx = self.tx.clone();
         let session_store = Arc::clone(&self.session_store);
         let session_record = self.session_record.clone();
+        // 会话 ID 作为服务商侧的提示缓存路由键；每次启动运行时同步，使 /resume、fork
+        // 等切换后的下一轮请求立刻改用新会话的键，而不是继续复用上一个会话的缓存分区。
+        agent.set_session_id(Some(session_record.id.to_string()));
 
         tokio::spawn(async move {
             let result = run_and_persist(

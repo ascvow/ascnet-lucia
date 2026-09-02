@@ -1547,6 +1547,36 @@ async fn regular_run_uses_default_short_prompt_cache() {
     assert_eq!(requests[0].cache_retention, PromptCacheRetention::Short);
 }
 
+/// 应用注入的会话标识必须随每次模型请求下发，切换会话后立即改用新值。
+///
+/// 服务商按该值做提示缓存路由：漏发会退回隐式缓存，切换后不更新则新会话会继续复用旧
+/// 会话的缓存分区。
+#[tokio::test]
+async fn model_requests_carry_the_injected_session_id() {
+    let model = Arc::new(CapturingModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("capturing", model.clone())
+        .expect("注册捕获模型应成功");
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("capturing", "test-model"),
+    );
+
+    agent.run("未注入会话标识").await.expect("运行应成功");
+    agent.set_session_id(Some("session-1".into()));
+    agent.run("第一个会话").await.expect("运行应成功");
+    agent.set_session_id(Some("session-2".into()));
+    agent.run("切换后的会话").await.expect("运行应成功");
+
+    let requests = model.requests.lock().expect("模型请求锁不应中毒");
+    assert_eq!(requests[0].session_id, None);
+    assert_eq!(requests[1].session_id.as_deref(), Some("session-1"));
+    assert_eq!(requests[2].session_id.as_deref(), Some("session-2"));
+}
+
 /// 缓存读写分项必须参与缺省总 token 推导，避免累计用量漏计。
 #[test]
 fn token_usage_total_includes_cache_components() {

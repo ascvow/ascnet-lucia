@@ -64,7 +64,7 @@ pub fn new(
 
 内置 OpenAI 与 Anthropic adapter 不允许 `provider_options` 放宽 `max_tokens`：合并后会重新收紧主 token 字段和已出现的常见顶层 token 别名，并把多候选字段固定为一。Anthropic extended thinking 的思考预算包含在同一总上限内。未知或嵌套的私有字段仍由第三方兼容网关解释，因此接入自定义 adapter 时，调用方必须自行保证最终 wire 请求不会突破 `ModelRequest.max_tokens`。
 
-提示缓存默认通过普通运行函数启用，不增加缓存专用 API。OpenAI 根据模型、system 和工具定义这一稳定前缀自动生成 `prompt_cache_key`；消息不参与该键，因此同一会话的主请求与上下文摘要请求会落在同一个键上，共享服务端已经写入的前缀缓存。`Long` 另发送 `prompt_cache_retention = "24h"`；Anthropic 的 `Short` 在 system、最后一个工具和最近用户内容上发送 `ephemeral` 缓存断点，`Long` 额外请求 `ttl = "1h"`。`TokenUsage` 把未缓存输入、缓存读取和缓存写入拆成独立字段，`total_tokens` 保留完整总量。
+提示缓存默认通过普通运行函数启用，不增加缓存专用 API。OpenAI 的 `prompt_cache_key` 直接取 `ModelRequest.session_id`（超过 64 字符按字符截断），由应用通过 `Agent::set_session_id` 注入稳定的会话 ID；键按会话隔离且在会话内恒定，不按请求内容推导。未注入会话 ID 或保留策略为 `None` 时不发送该字段。`Long` 另发送 `prompt_cache_retention = "24h"`；Anthropic 的 `Short` 在 system、最后一个工具和最近用户内容上发送 `ephemeral` 缓存断点，`Long` 额外请求 `ttl = "1h"`。`TokenUsage` 把未缓存输入、缓存读取和缓存写入拆成独立字段，`total_tokens` 保留完整总量。
 
 ### Agent 组件函数
 
@@ -160,7 +160,7 @@ pub trait ContextLoader: Send + Sync {
 }
 ```
 
-`ContextLoadRequest` 包含 `run_id`、step、provider、model、system、本轮源消息和本轮工具定义。`tools` 只供同进程原生加载器复刻请求前缀（摘要请求据此命中主请求的提示缓存），标记为 `#[serde(skip)]`，不跨插件 ABI 传递。返回的 `LoadedContext` 是完整替换结果，不是增量。`LoadedContext::passthrough(request)` 原样保留 system 与消息；`TransformContextLoader::new(transform)` 只变换消息列表。
+`ContextLoadRequest` 包含 `run_id`、step、provider、model、system 和本轮源消息。返回的 `LoadedContext` 是完整替换结果，不是增量。`LoadedContext::passthrough(request)` 原样保留 system 与消息；`TransformContextLoader::new(transform)` 只变换消息列表。
 
 加载器必须保持 assistant tool call 与 tool result 配对。返回错误会阻止本轮模型请求。
 

@@ -272,8 +272,6 @@ pub(crate) async fn load_plugins_for_tui(
     // 插件模型调用与主 Agent 使用相同的流式开关：部分代理会强制断开
     // 长时间无数据的非流式连接，摘要这类长请求必须跟随配置的传输方式。
     let model_stream = agent_template.options().stream;
-    // 缓存策略同样跟随主 Agent 配置，否则插件调用会写入主请求读不到的缓存条目。
-    let model_cache_retention = agent_template.options().cache_retention;
     let workspace_root = workspace_root.to_string_lossy().into_owned();
     let controller_profile =
         AgentProfileId::new("tui-controller").context("创建 TUI controller profile 失败")?;
@@ -313,7 +311,6 @@ pub(crate) async fn load_plugins_for_tui(
             model_name,
             model_output_limit,
             model_stream,
-            model_cache_retention,
         )?
         .with_agent_runtime(
             Arc::new(runtime),

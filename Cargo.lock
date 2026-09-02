@@ -38,7 +38,6 @@ name = "agent-context"
 version = "0.1.0"
 dependencies = [
  "agent-core",
- "agent-tool",
  "anyhow",
  "async-trait",
  "serde",

@@ -481,8 +481,6 @@ impl Agent {
                     model: self.options.model.clone(),
                     system: session.system().cloned(),
                     messages: source_messages,
-                    // 摘要类内部调用据此复刻本轮请求前缀，命中同一份服务端提示缓存。
-                    tools: tools.clone(),
                     user_initiated: false,
                 })
                 .await
@@ -511,6 +509,7 @@ impl Agent {
                 temperature: self.options.temperature,
                 reasoning: self.reasoning_level(),
                 cache_retention: self.options.cache_retention,
+                session_id: self.session_id(),
                 provider_options: self.options.provider_options.clone(),
             };
 

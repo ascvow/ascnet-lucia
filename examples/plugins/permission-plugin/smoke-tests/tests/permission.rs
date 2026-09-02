@@ -2,8 +2,7 @@
 
 use agent_core::{
     AgentEvent, AgentEventKind, AgentExtension, AgentRecordEvent, ChatModel, EventBus,
-    ModelGateway, ModelRequest, ModelResponse, PromptCacheRetention, ProviderAdapter,
-    ToolCallEvent,
+    ModelGateway, ModelRequest, ModelResponse, ProviderAdapter, ToolCallEvent,
 };
 use agent_plugin_host::{
     manifest::TOOL_POLICY_CAPABILITY,
@@ -234,7 +233,6 @@ async fn wasm_host_keeps_component_enterable_after_cancelled_model_import() {
             "review-model",
             128,
             false,
-            PromptCacheRetention::Short,
         )
         .expect("注入阻塞审批模型");
     let host = Arc::new(
