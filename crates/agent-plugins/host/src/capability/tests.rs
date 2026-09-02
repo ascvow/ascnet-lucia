@@ -11,7 +11,7 @@ use crate::manifest::{AgentCapabilitySection, CapabilitySection};
 use crate::service::{PluginService, PluginServiceCall, ServiceHandler, ServiceRegistry};
 use crate::PluginHostServices;
 use agent_core::{model::ModelEventStream, ChatModel, ModelResponse, ProviderAdapter};
-use agent_core::{ModelRequest, ReasoningLevel, ToolChoice};
+use agent_core::{ModelRequest, PromptCacheRetention, ReasoningLevel, ToolChoice};
 use agent_runtime::{
     AgentDeriveConfig, AgentHandle, AgentLineage, AgentOutcome, AgentPermissions, AgentProfileId,
     AgentRuntimeError, AgentRuntimeProvisioner, AgentSnapshot, AgentStatus,
@@ -693,12 +693,12 @@ fn host_capability_request_size_is_bounded() {
 #[tokio::test]
 async fn model_completion_requires_manifest_permission_and_binding() {
     let request = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"摘要"}]}]}"#;
-    let unauthorized = CapabilityState::complete_model_with(false, None, request)
+    let unauthorized = CapabilityState::complete_model_with(false, None, "test-plugin", request)
         .await
         .expect_err("未授权请求必须失败");
     assert!(unauthorized.to_string().contains("manifest 未授权"));
 
-    let missing_binding = CapabilityState::complete_model_with(true, None, request)
+    let missing_binding = CapabilityState::complete_model_with(true, None, "test-plugin", request)
         .await
         .expect_err("未绑定模型服务必须失败");
     assert!(missing_binding.to_string().contains("未注入模型完成服务"));
@@ -707,10 +707,14 @@ async fn model_completion_requires_manifest_permission_and_binding() {
 /// Guest 不得通过请求字段覆盖 Host 注入的模型路由。
 #[tokio::test]
 async fn model_completion_rejects_forged_route_fields() {
-    let error =
-        CapabilityState::complete_model_with(true, None, r#"{"model":"forged","messages":[]}"#)
-            .await
-            .expect_err("伪造 model 字段必须失败");
+    let error = CapabilityState::complete_model_with(
+        true,
+        None,
+        "test-plugin",
+        r#"{"model":"forged","messages":[]}"#,
+    )
+    .await
+    .expect_err("伪造 model 字段必须失败");
 
     assert!(error.to_string().contains("解析插件宿主能力请求失败"));
 }
@@ -730,7 +734,14 @@ async fn model_completion_uses_trusted_route_and_limits() {
         )
         .expect("注册测试模型");
     let binding = PluginHostServices::new()
-        .with_model_completion(gateway, "trusted-provider", "trusted-model", 128, true)
+        .with_model_completion(
+            gateway,
+            "trusted-provider",
+            "trusted-model",
+            128,
+            true,
+            PromptCacheRetention::Short,
+        )
         .expect("注入流式模型服务")
         .model_completion()
         .expect("模型服务绑定应存在");
@@ -738,6 +749,7 @@ async fn model_completion_uses_trusted_route_and_limits() {
     let response = CapabilityState::complete_model_with(
         true,
         Some(binding),
+        "test-plugin",
         r#"{"system":"只生成摘要","messages":[{"role":"user","content":[{"type":"text","text":"旧上下文"}]}],"max_tokens":999}"#,
     )
     .await
@@ -751,6 +763,13 @@ async fn model_completion_uses_trusted_route_and_limits() {
     assert_eq!(captured[0].tool_choice, ToolChoice::None);
     assert!(captured[0].tools.is_empty());
     assert_eq!(captured[0].reasoning, ReasoningLevel::Off);
+    // 缓存策略跟随应用配置，键按插件分组：同一插件反复使用的 system 前缀才能持续命中，
+    // 且与主会话的缓存分区分开。
+    assert_eq!(captured[0].cache_retention, PromptCacheRetention::Short);
+    assert_eq!(
+        captured[0].session_id.as_deref(),
+        Some("plugin:test-plugin")
+    );
 }
 
 /// Host 关闭流式模式后必须改用模型的非流式完成接口。
@@ -768,7 +787,14 @@ async fn model_completion_can_use_non_streaming_route() {
         )
         .expect("注册非流式测试模型");
     let binding = PluginHostServices::new()
-        .with_model_completion(gateway, "trusted-provider", "trusted-model", 20_000, false)
+        .with_model_completion(
+            gateway,
+            "trusted-provider",
+            "trusted-model",
+            20_000,
+            false,
+            PromptCacheRetention::Short,
+        )
         .expect("注入非流式模型服务")
         .model_completion()
         .expect("模型服务绑定应存在");
@@ -776,6 +802,7 @@ async fn model_completion_can_use_non_streaming_route() {
     CapabilityState::complete_model_with(
         true,
         Some(binding),
+        "test-plugin",
         r#"{"messages":[{"role":"user","content":[{"type":"text","text":"旧上下文"}]}]}"#,
     )
     .await
@@ -802,16 +829,23 @@ async fn model_completion_enforces_execution_policy_budget() {
     policy.limits.max_plugin_model_completions = Some(1);
     let binding = PluginHostServices::new()
         .restrict_execution_policy(&policy)
-        .with_model_completion(gateway, "trusted-provider", "trusted-model", 128, false)
+        .with_model_completion(
+            gateway,
+            "trusted-provider",
+            "trusted-model",
+            128,
+            false,
+            PromptCacheRetention::Short,
+        )
         .expect("注入预算模型服务")
         .model_completion()
         .expect("模型服务绑定应存在");
     let request = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"审核"}]}]}"#;
 
-    CapabilityState::complete_model_with(true, Some(binding.clone()), request)
+    CapabilityState::complete_model_with(true, Some(binding.clone()), "test-plugin", request)
         .await
         .expect("第一次调用应在预算内");
-    let error = CapabilityState::complete_model_with(true, Some(binding), request)
+    let error = CapabilityState::complete_model_with(true, Some(binding), "test-plugin", request)
         .await
         .expect_err("第二次调用必须被预算拒绝");
 
@@ -838,7 +872,14 @@ async fn model_completion_budget_is_isolated_per_plugin_activation() {
     policy.limits.max_plugin_model_completions = Some(1);
     let services = PluginHostServices::new()
         .restrict_execution_policy(&policy)
-        .with_model_completion(gateway, "trusted-provider", "trusted-model", 128, false)
+        .with_model_completion(
+            gateway,
+            "trusted-provider",
+            "trusted-model",
+            128,
+            false,
+            PromptCacheRetention::Short,
+        )
         .expect("注入预算模型服务");
     let first_activation = services
         .model_completion()
@@ -848,14 +889,20 @@ async fn model_completion_budget_is_isolated_per_plugin_activation() {
         .expect("第二插件激活应获得模型服务");
     let request = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"审核"}]}]}"#;
 
-    CapabilityState::complete_model_with(true, Some(first_activation.clone()), request)
-        .await
-        .expect("第一插件首次调用应成功");
-    let error = CapabilityState::complete_model_with(true, Some(first_activation), request)
-        .await
-        .expect_err("同一插件通过 clone 发起第二次调用仍应被拒绝");
+    CapabilityState::complete_model_with(
+        true,
+        Some(first_activation.clone()),
+        "test-plugin",
+        request,
+    )
+    .await
+    .expect("第一插件首次调用应成功");
+    let error =
+        CapabilityState::complete_model_with(true, Some(first_activation), "test-plugin", request)
+            .await
+            .expect_err("同一插件通过 clone 发起第二次调用仍应被拒绝");
     assert!(error.to_string().contains("调用次数超过策略上限 1 次"));
-    CapabilityState::complete_model_with(true, Some(second_activation), request)
+    CapabilityState::complete_model_with(true, Some(second_activation), "test-plugin", request)
         .await
         .expect("第二插件应拥有独立预算");
 

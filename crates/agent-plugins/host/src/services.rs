@@ -5,7 +5,7 @@ use crate::audit;
 use crate::host::PluginHost;
 use crate::session::PluginSessionSource;
 #[cfg(feature = "wasm")]
-use agent_core::model::ModelGateway;
+use agent_core::model::{ModelGateway, PromptCacheRetention};
 #[cfg(feature = "wasm")]
 use agent_runtime::{AgentDeriveConfig, AgentProfileId, AgentRuntimeProvisioner};
 use agent_tool::ExecutionPolicy;
@@ -26,6 +26,8 @@ pub(crate) struct ModelCompletionHostServices {
     pub(crate) model: String,
     pub(crate) max_output_tokens: u32,
     pub(crate) stream: bool,
+    /// 应用配置的提示缓存保留策略，与主 Agent 取同一配置值。
+    pub(crate) cache_retention: PromptCacheRetention,
     execution_policy: ExecutionPolicy,
     completed_calls: Arc<AtomicUsize>,
     submitted_input_bytes: Arc<AtomicUsize>,
@@ -41,6 +43,7 @@ impl ModelCompletionHostServices {
             model: self.model.clone(),
             max_output_tokens: self.max_output_tokens,
             stream: self.stream,
+            cache_retention: self.cache_retention,
             execution_policy: self.execution_policy.clone(),
             completed_calls: Arc::new(AtomicUsize::new(0)),
             submitted_input_bytes: Arc::new(AtomicUsize::new(0)),
@@ -244,8 +247,11 @@ impl PluginHostServices {
     /// 注入插件可请求的固定模型路由和最大输出预算。
     ///
     /// Guest 只能提交 system、messages 和更小的输出上限；provider、model、流式模式、
-    /// 工具和 provider options 均由 Host 控制。插件 manifest 还必须声明
+    /// 工具、缓存策略和 provider options 均由 Host 控制。插件 manifest 还必须声明
     /// `model_completion`。
+    ///
+    /// `cache_retention` 应传入与主 Agent 相同的配置值；缓存键由 Host 按插件 ID 生成，
+    /// 使同一插件反复使用的 system 前缀能持续命中，且与主会话的缓存分区互不干扰。
     #[cfg(feature = "wasm")]
     pub fn with_model_completion(
         mut self,
@@ -254,6 +260,7 @@ impl PluginHostServices {
         model: impl Into<String>,
         max_output_tokens: u32,
         stream: bool,
+        cache_retention: PromptCacheRetention,
     ) -> Result<Self> {
         let provider = provider.into();
         let model = model.into();
@@ -275,6 +282,7 @@ impl PluginHostServices {
             model,
             max_output_tokens,
             stream,
+            cache_retention,
             execution_policy: self.execution_policy.clone(),
             completed_calls: Arc::new(AtomicUsize::new(0)),
             submitted_input_bytes: Arc::new(AtomicUsize::new(0)),

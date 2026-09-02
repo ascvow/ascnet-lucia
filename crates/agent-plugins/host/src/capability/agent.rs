@@ -11,9 +11,7 @@ use crate::capability::{
 };
 use crate::manifest::AgentCapabilitySection;
 use crate::services::{AgentRuntimeHostServices, ModelCompletionHostServices};
-use agent_core::{
-    AgentEvent, AgentEventKind, ModelRequest, PromptCacheRetention, ReasoningLevel, ToolChoice,
-};
+use agent_core::{AgentEvent, AgentEventKind, ModelRequest, ReasoningLevel, ToolChoice};
 use agent_runtime::{
     AgentEventStream, AgentId, AgentRuntimeApi, AgentSpawnRequest, RuntimePrincipal,
 };
@@ -134,11 +132,16 @@ impl CapabilityState {
         (self.permissions.agent.clone(), self.agent_runtime.clone())
     }
 
-    /// 克隆模型完成所需的 manifest 授权和应用绑定，避免跨 `await` 借用 store。
-    pub(crate) fn model_completion_context(&self) -> (bool, Option<ModelCompletionHostServices>) {
+    /// 克隆模型完成所需的 manifest 授权、应用绑定和调用方插件 ID，避免跨 `await` 借用 store。
+    ///
+    /// 插件 ID 参与缓存路由：同一插件的补全共用固定 system 前缀，按插件分组才能持续命中。
+    pub(crate) fn model_completion_context(
+        &self,
+    ) -> (bool, Option<ModelCompletionHostServices>, String) {
         (
             self.permissions.model_completion,
             self.model_completion.clone(),
+            self.plugin_id.clone(),
         )
     }
 
@@ -146,6 +149,7 @@ impl CapabilityState {
     pub(crate) async fn complete_model_with(
         allowed: bool,
         binding: Option<ModelCompletionHostServices>,
+        plugin_id: &str,
         request_json: &str,
     ) -> Result<Value> {
         if !allowed {
@@ -176,9 +180,11 @@ impl CapabilityState {
                 .clamp(1, binding.max_output_tokens),
         );
         model_request.reasoning = ReasoningLevel::Off;
-        // 插件补全是一次性调用，写进去的缓存条目没有后续请求会读到；关闭缓存保留避免
-        // 污染主会话的缓存分区，也不发送会话路由标识。
-        model_request.cache_retention = PromptCacheRetention::None;
+        model_request.cache_retention = binding.cache_retention;
+        // 插件补全通常是"固定 system + 短小可变正文"的高频调用，前缀在多次调用之间完全
+        // 相同，值得缓存。键按插件而不是按会话分组：同一插件的补全共享同一份 system 前缀
+        // 缓存，同时与主会话的缓存分区分开，互不驱逐。
+        model_request.session_id = Some(format!("plugin:{plugin_id}"));
         let response = if binding.stream {
             binding
                 .gateway

@@ -160,7 +160,7 @@ sessions = true
 model_completion = true
 ```
 
-Manifest 只允许插件请求受限模型完成；应用还必须通过 `PluginHostServices::with_model_completion` 注入已注册的模型网关、可信 provider/model、流式模式和最大输出 token。Guest 请求只包含 system、provider-neutral messages 和更小的输出上限，未知字段会被拒绝。Host 强制工具列表为空、`tool_choice = none`、推理关闭、提示缓存保留关闭，并执行 ExecutionPolicy 中的累计调用次数和输入字节预算；预算按单个插件激活隔离，同一激活内的调用共享原子账本。模型返回工具调用或空文本时调用失败。
+Manifest 只允许插件请求受限模型完成；应用还必须通过 `PluginHostServices::with_model_completion` 注入已注册的模型网关、可信 provider/model、流式模式、最大输出 token 和提示缓存保留策略。Guest 请求只包含 system、provider-neutral messages 和更小的输出上限，未知字段会被拒绝。Host 强制工具列表为空、`tool_choice = none`、推理关闭，按调用方插件 ID 生成缓存键，并执行 ExecutionPolicy 中的累计调用次数和输入字节预算；预算按单个插件激活隔离，同一激活内的调用共享原子账本。模型返回工具调用或空文本时调用失败。
 
 ## 宿主动作权限
 

@@ -292,9 +292,12 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap_async(
         "host-model-complete",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            let (allowed, binding) = caller.data().capabilities.model_completion_context();
+            let (allowed, binding, plugin_id) =
+                caller.data().capabilities.model_completion_context();
             Box::new(async move {
-                let result = CapabilityState::complete_model_with(allowed, binding, &request).await;
+                let result =
+                    CapabilityState::complete_model_with(allowed, binding, &plugin_id, &request)
+                        .await;
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
