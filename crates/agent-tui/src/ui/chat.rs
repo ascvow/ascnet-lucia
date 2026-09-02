@@ -110,11 +110,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             wrapped_height = wrapped_height.saturating_add(message_height);
             lines.extend(message_lines);
 
-            // 工具组内部不留空行；工具组结束后仍与普通消息或状态行分隔。
-            let next_is_tool = timeline_messages
-                .get(index + 1)
-                .is_some_and(|next| next.is_tool());
-            if message.is_tool() && !next_is_tool {
+            // 每条工具消息后固定留一行空白：连续调用之间不再挤成一片，
+            // 工具组结束后也与普通消息或状态行保持分隔。
+            if message.is_tool() {
                 lines.push(Line::default());
                 wrapped_height = wrapped_height.saturating_add(1);
             }
