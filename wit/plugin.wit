@@ -1,4 +1,4 @@
-package ascnet:lucia-plugin@0.9.0;
+package ascnet:lucia-plugin@0.10.0;
 
 /// ascnet-lucia 的 WASM 插件 world。
 ///
@@ -41,6 +41,17 @@ world plugin {
 
   /// 列出插件私有持久存储中指定作用域下的全部键。
   import host-store-list: func(request-json: string) -> string;
+
+  /// 列出当前项目的历史会话摘要。
+  ///
+  /// 需要 manifest 声明 `sessions = true`。该能力会把插件全部公开工具的权限下限
+  /// 抬到 unknown，因为会话内容涵盖 Agent 历史上见过的一切。
+  import host-session-list: func(request-json: string) -> string;
+
+  /// 分页读取一个会话的消息投影。
+  ///
+  /// 返回内容不含模型私有推理与图片字节；超长正文按宿主上限截断。
+  import host-session-read: func(request-json: string) -> string;
 
   /// 注册或替换当前插件拥有的服务。
   import host-service-upsert: func(request-json: string) -> string;

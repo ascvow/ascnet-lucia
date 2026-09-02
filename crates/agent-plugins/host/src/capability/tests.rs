@@ -284,7 +284,7 @@ fn process_state(process_exec: bool, execution_policy: ExecutionPolicy) -> Capab
         },
         Arc::new(ContributionRegistry::default()),
         Arc::new(ServiceRegistry::default()),
-        CapabilityHostContext::new(None, None, execution_policy, None, None),
+        CapabilityHostContext::new(None, None, execution_policy, None, None, None),
     )
     .expect("创建进程测试能力状态")
 }
@@ -342,7 +342,7 @@ fn persistent_instance_state_survives_recreation() {
             CapabilitySection::default(),
             Arc::new(ContributionRegistry::default()),
             Arc::new(ServiceRegistry::default()),
-            CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), Some(root.clone()), Some("test-workspace".into())),
+            CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), Some(root.clone()), Some("test-workspace".into()), None),
         )
         .expect("创建持久能力状态")
     };
@@ -377,7 +377,7 @@ fn persistent_permission_state_is_isolated_by_bundle_identity() {
             CapabilitySection::default(),
             Arc::new(ContributionRegistry::default()),
             Arc::new(ServiceRegistry::default()),
-            CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), Some(root.clone()), Some("test-workspace".into())),
+            CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), Some(root.clone()), Some("test-workspace".into()), None),
         )
         .expect("创建持久能力状态")
     };
@@ -1059,6 +1059,7 @@ fn storage_state(
             ExecutionPolicy::serve(),
             Some(root.to_path_buf()),
             workspace.map(str::to_string),
+            None,
         ),
     )
     .expect("创建持久存储能力状态")
@@ -1156,6 +1157,7 @@ fn store_requires_declared_capability() {
             ExecutionPolicy::serve(),
             Some(root.clone()),
             Some("project-a".into()),
+            None,
         ),
     )
     .expect("创建未声明存储能力的状态");
@@ -1214,4 +1216,125 @@ fn store_list_is_stable_and_reflects_removals() {
     );
 
     std::fs::remove_dir_all(root).expect("清理持久存储测试目录");
+}
+
+/// 返回固定会话的测试用只读来源。
+struct StubSessionSource {
+    id: String,
+}
+
+#[async_trait::async_trait]
+impl crate::session::PluginSessionSource for StubSessionSource {
+    async fn list_sessions(&self) -> anyhow::Result<Vec<crate::session::PluginSessionDescriptor>> {
+        Ok(vec![crate::session::PluginSessionDescriptor {
+            id: self.id.clone(),
+            title: Some("历史会话".into()),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            revision: 3,
+            message_count: 1,
+        }])
+    }
+
+    async fn load_session(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<agent_core::session::Session>> {
+        if id != self.id {
+            return Ok(None);
+        }
+        Ok(Some(agent_core::session::Session::from_parts(
+            None,
+            vec![agent_core::model::ModelMessage::text(
+                agent_core::model::MessageRole::User,
+                "历史提问",
+            )],
+        )))
+    }
+}
+
+/// 构造声明了 sessions 能力的测试用能力状态。
+fn session_state(sessions: bool) -> CapabilityState {
+    CapabilityState::new(
+        "knowledge".into(),
+        "bundle-a".into(),
+        PathBuf::from("."),
+        CapabilitySection {
+            sessions,
+            ..CapabilitySection::default()
+        },
+        Arc::new(ContributionRegistry::default()),
+        Arc::new(ServiceRegistry::default()),
+        CapabilityHostContext::new(
+            None,
+            None,
+            ExecutionPolicy::serve(),
+            None,
+            None,
+            Some(Arc::new(StubSessionSource {
+                id: "session-a".into(),
+            })),
+        ),
+    )
+    .expect("创建会话能力状态")
+}
+
+/// 未声明 sessions 能力的插件不得读取任何历史会话。
+#[tokio::test]
+async fn session_access_requires_declared_capability() {
+    let state = session_state(false);
+    let (allowed, source) = state.session_context();
+
+    let listed = CapabilityState::list_sessions_with(allowed, source.clone(), "{}")
+        .await
+        .expect_err("未声明能力必须拒绝列举");
+    assert!(listed.to_string().contains("sessions"), "{listed}");
+
+    let read = CapabilityState::read_session_with(allowed, source, r#"{"id":"session-a"}"#)
+        .await
+        .expect_err("未声明能力必须拒绝读取");
+    assert!(read.to_string().contains("sessions"), "{read}");
+}
+
+/// 声明能力后可以列举摘要并按标识读取消息投影。
+#[tokio::test]
+async fn declared_capability_lists_and_reads_sessions() {
+    let state = session_state(true);
+    let (allowed, source) = state.session_context();
+
+    let listed = CapabilityState::list_sessions_with(allowed, source.clone(), "{}")
+        .await
+        .expect("列举会话");
+    assert_eq!(listed[0]["id"], "session-a");
+    assert_eq!(listed[0]["message_count"], 1);
+
+    let page = CapabilityState::read_session_with(allowed, source, r#"{"id":"session-a"}"#)
+        .await
+        .expect("读取会话");
+    assert_eq!(page["messages"][0]["text"], "历史提问");
+}
+
+/// 未知会话返回 null 而不是错误，便于插件把"已删除"当作正常控制流处理。
+#[tokio::test]
+async fn reading_unknown_session_returns_null() {
+    let state = session_state(true);
+    let (allowed, source) = state.session_context();
+
+    let page = CapabilityState::read_session_with(allowed, source, r#"{"id":"missing"}"#)
+        .await
+        .expect("未知会话不应报错");
+    assert!(page.is_null());
+}
+
+/// 应用未注入会话来源时，即便 manifest 声明了能力也必须失败而不是返回空列表。
+///
+/// 返回空列表会让插件把"宿主没接线"误读成"这个项目没有历史会话"，
+/// 从而静默建出一个空知识库。
+#[tokio::test]
+async fn missing_session_source_fails_instead_of_reporting_empty() {
+    let error = CapabilityState::list_sessions_with(true, None, "{}")
+        .await
+        .expect_err("未注入来源必须失败");
+
+    assert!(error.to_string().contains("未注入"), "{error}");
 }

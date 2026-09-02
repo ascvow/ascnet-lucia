@@ -288,3 +288,24 @@ pub(crate) struct StoreSetRequest {
     /// 待写入的值。
     pub(crate) value: Value,
 }
+
+/// 不携带任何字段的请求体。
+///
+/// 保留为对象而不是空字符串，使后续新增可选字段不必再改 ABI。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoreScopelessRequest {}
+
+/// 分页读取会话消息的请求。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionReadRequest {
+    /// 目标会话标识。
+    pub(crate) id: String,
+    /// 起始消息序号，从零开始。
+    #[serde(default)]
+    pub(crate) offset: usize,
+    /// 本次最多返回的消息数；缺省时使用宿主上限。
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+}

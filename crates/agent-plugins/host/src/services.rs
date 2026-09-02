@@ -3,6 +3,7 @@
 #[cfg(feature = "wasm")]
 use crate::audit;
 use crate::host::PluginHost;
+use crate::session::PluginSessionSource;
 #[cfg(feature = "wasm")]
 use agent_core::model::ModelGateway;
 #[cfg(feature = "wasm")]
@@ -96,6 +97,8 @@ pub struct PluginHostServices {
     pub(crate) agent_runtime: Option<AgentRuntimeHostServices>,
     #[cfg(feature = "wasm")]
     pub(crate) model_completion: Option<ModelCompletionHostServices>,
+    /// 应用注入的只读会话来源；缺失时插件的 `sessions` 能力保持关闭。
+    pub(crate) session_source: Option<Arc<dyn PluginSessionSource>>,
     #[cfg(feature = "wasm")]
     pub(crate) activation_metadata: HashMap<String, HashMap<String, String>>,
     #[cfg(feature = "wasm")]
@@ -277,6 +280,23 @@ impl PluginHostServices {
             submitted_input_bytes: Arc::new(AtomicUsize::new(0)),
         });
         Ok(self)
+    }
+
+    /// 注入插件可只读访问的历史会话来源。
+    ///
+    /// 传入的是只读端口而不是 `SessionStore`，因此插件路径不存在写入会话的可能。
+    /// 插件 manifest 还必须声明 `sessions`；该能力会把插件全部公开工具的权限下限
+    /// 抬到 `unknown`，因为会话内容涵盖 Agent 历史上见过的一切。
+    #[cfg(feature = "wasm")]
+    pub fn with_session_source(mut self, source: Arc<dyn PluginSessionSource>) -> Self {
+        self.session_source = Some(source);
+        self
+    }
+
+    /// 返回应用注入的只读会话来源快照。
+    #[cfg(feature = "wasm")]
+    pub(crate) fn session_source(&self) -> Option<Arc<dyn PluginSessionSource>> {
+        self.session_source.clone()
     }
 
     /// 返回 Host 内部使用的 Agent Runtime 服务快照。

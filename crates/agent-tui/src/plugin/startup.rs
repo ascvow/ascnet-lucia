@@ -3,7 +3,9 @@
 use crate::event::UiEvent;
 use agent_plugin_host::manifest::PluginManifest;
 use agent_plugin_host::wasm::load_wasm_plugins_progressively_with_selection_and_services;
+use crate::plugin::sessions::TuiPluginSessionSource;
 use agent_plugin_host::{LivePluginHost, PluginHostServices};
+use agent_session::SessionStore;
 use agent_runtime::{
     AgentDeriveConfig, AgentPermissions, AgentProfileId, AgentRuntime, AgentTemplate,
     RuntimeLimits, ToolAccess,
@@ -247,6 +249,7 @@ pub(crate) async fn load_plugins_for_tui(
     agent_template: AgentTemplate,
     execution: PluginExecutionContext,
     workspace_scope: String,
+    session_store: Arc<dyn SessionStore>,
     live_host: Arc<LivePluginHost>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
@@ -286,6 +289,9 @@ pub(crate) async fn load_plugins_for_tui(
     )?;
     // 插件持久存储按项目隔离，作用域由宿主注入，不经过 manifest 或 Guest。
     host_services = host_services.with_workspace_scope(workspace_scope)?;
+    // 只读会话来源同样由宿主注入；传入的端口不含写入方法。
+    host_services =
+        host_services.with_session_source(Arc::new(TuiPluginSessionSource::new(session_store)));
     if let Some(state_dir) = persistent_state_dir {
         host_services = host_services.with_persistent_state_dir(state_dir)?;
     }

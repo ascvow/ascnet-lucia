@@ -18,7 +18,7 @@ fn test_plugin_authorization(
             id = "command-test"
             name = "Command Test"
             version = "1.0.0"
-            api_version = "0.9.0"
+            api_version = "0.10.0"
             wasm = "command-test.wasm"
         "#,
     )
@@ -142,7 +142,7 @@ fn plugin_page_shows_installed_plugins_and_manual_actions() {
                 id: "echo".into(),
                 name: "Echo".into(),
                 version: "1.0.0".into(),
-                api_version: "0.9.0".into(),
+                api_version: "0.10.0".into(),
                 enabled: false,
                 manifest: "plugins/echo/1.0.0/plugin.toml".into(),
                 sha256: "b".repeat(64),
@@ -151,10 +151,10 @@ fn plugin_page_shows_installed_plugins_and_manual_actions() {
             version_history: vec![agent_plugin_manager::InstalledPlugin {
                 id: "echo".into(),
                 name: "Echo".into(),
-                version: "0.9.0".into(),
-                api_version: "0.9.0".into(),
+                version: "0.10.0".into(),
+                api_version: "0.10.0".into(),
                 enabled: true,
-                manifest: "plugins/echo/0.9.0/plugin.toml".into(),
+                manifest: "plugins/echo/0.10.0/plugin.toml".into(),
                 sha256: "c".repeat(64),
                 source: "fixture-history".into(),
             }],
@@ -195,7 +195,7 @@ fn plugin_page_shows_installed_plugins_and_manual_actions() {
         .collect::<String>();
 
     assert!(text.contains("Installed Version History"), "{text}");
-    assert!(text.contains("echo@0.9.0"), "{text}");
+    assert!(text.contains("echo@0.10.0"), "{text}");
     assert!(text.contains("process_exec"), "{text}");
     assert!(compact.contains("人工管理"), "{text}");
     assert!(!text.contains("Evolve Plugin"), "{text}");
@@ -308,7 +308,7 @@ fn plugin_enable_fails_closed_without_authorization_profile() {
                 id: "unknown-capabilities".into(),
                 name: "Unknown Capabilities".into(),
                 version: "1.0.0".into(),
-                api_version: "0.9.0".into(),
+                api_version: "0.10.0".into(),
                 enabled: false,
                 manifest: "plugins/unknown-capabilities/1.0.0/plugin.toml".into(),
                 sha256: "e".repeat(64),
@@ -352,7 +352,7 @@ fn disabled_capability_owner_requires_two_enable_confirmations() {
                 id: "provider".into(),
                 name: "Provider".into(),
                 version: "1.0.0".into(),
-                api_version: "0.9.0".into(),
+                api_version: "0.10.0".into(),
                 enabled: false,
                 manifest: "plugins/provider/1.0.0/plugin.toml".into(),
                 sha256: "d".repeat(64),

@@ -16,7 +16,9 @@ use crate::capability::requests::PathRequest;
 use crate::capability::requests::ServiceCallRequest;
 use crate::capability::requests::ServiceListRequest;
 use crate::capability::requests::ServiceSpecRequest;
+use crate::capability::requests::SessionReadRequest;
 use crate::capability::requests::StateSetRequest;
+use crate::capability::requests::StoreScopelessRequest;
 use crate::contribution::ContributionRegistry;
 use crate::contribution::PromptContribution;
 use crate::contribution::ToolRegistrationRequest;
@@ -26,7 +28,9 @@ use crate::service::PluginService;
 use crate::service::PluginServiceCall;
 use crate::service::ServiceRegistry;
 use crate::services::ModelCompletionHostServices;
+use crate::session::{project_session, PluginSessionSource, MAX_SESSION_PAGE_MESSAGES};
 use crate::state::PluginStateStore;
+use agent_plugin_protocol::PluginSessionSummary;
 use agent_plugin_protocol::PluginStoreScope;
 use crate::ui::UiHostActionRequest;
 pub(crate) use agent::AgentRuntimeBinding;
@@ -85,6 +89,7 @@ pub(crate) struct CapabilityState {
     services: Arc<ServiceRegistry>,
     agent_runtime: Option<AgentRuntimeBinding>,
     model_completion: Option<ModelCompletionHostServices>,
+    session_source: Option<Arc<dyn PluginSessionSource>>,
     processes: HashMap<u64, ManagedProcess>,
     next_process_handle: u64,
     state: HashMap<String, Value>,
@@ -171,6 +176,8 @@ pub(crate) struct CapabilityHostContext {
     agent_runtime: Option<AgentRuntimeBinding>,
     /// Host 固定模型路由；缺失时关闭模型完成能力。
     model_completion: Option<ModelCompletionHostServices>,
+    /// 应用注入的只读会话来源；缺失时关闭会话读取能力。
+    session_source: Option<Arc<dyn PluginSessionSource>>,
     /// Host 运行平面的可信策略，默认 Serve 以保持既有加载行为。
     execution_policy: ExecutionPolicy,
     /// 应用拥有的持久状态目录；Guest 与 manifest 均不能声明或覆盖。
@@ -192,6 +199,7 @@ impl CapabilityHostContext {
         execution_policy: ExecutionPolicy,
         persistent_state_dir: Option<PathBuf>,
         workspace_scope: Option<String>,
+        session_source: Option<Arc<dyn PluginSessionSource>>,
     ) -> Self {
         Self {
             agent_runtime,
@@ -199,6 +207,7 @@ impl CapabilityHostContext {
             execution_policy,
             persistent_state_dir,
             workspace_scope,
+            session_source,
         }
     }
 }
@@ -320,6 +329,7 @@ impl CapabilityState {
             services,
             agent_runtime: host_context.agent_runtime,
             model_completion: host_context.model_completion,
+            session_source: host_context.session_source,
             processes: HashMap::new(),
             next_process_handle: 1,
             state,
@@ -447,6 +457,64 @@ impl CapabilityState {
         let mut keys = slot.values.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         Ok(serde_json::to_value(keys)?)
+    }
+
+    /// 克隆会话读取所需的 manifest 授权与应用绑定，避免跨 `await` 借用 store。
+    pub(crate) fn session_context(&self) -> (bool, Option<Arc<dyn PluginSessionSource>>) {
+        (self.permissions.sessions, self.session_source.clone())
+    }
+
+    /// 列出当前项目的全部会话摘要。
+    pub(crate) async fn list_sessions_with(
+        allowed: bool,
+        source: Option<Arc<dyn PluginSessionSource>>,
+        request_json: &str,
+    ) -> Result<Value> {
+        let source = Self::session_source_for(allowed, source)?;
+        // 请求体保留为对象以便后续演进，当前不接受任何字段。
+        let _: StoreScopelessRequest = parse_request(request_json)?;
+        let descriptors = source.list_sessions().await.context("列出会话失败")?;
+        let summaries: Vec<PluginSessionSummary> =
+            descriptors.iter().map(PluginSessionSummary::from).collect();
+        Ok(serde_json::to_value(summaries)?)
+    }
+
+    /// 按标识分页读取会话消息；会话不存在时返回 `null`。
+    pub(crate) async fn read_session_with(
+        allowed: bool,
+        source: Option<Arc<dyn PluginSessionSource>>,
+        request_json: &str,
+    ) -> Result<Value> {
+        let source = Self::session_source_for(allowed, source)?;
+        let request: SessionReadRequest = parse_request(request_json)?;
+        if request.id.trim().is_empty() {
+            return Err(anyhow!("会话标识不能为空"));
+        }
+        let Some(session) = source
+            .load_session(&request.id)
+            .await
+            .with_context(|| format!("读取会话 `{}` 失败", request.id))?
+        else {
+            return Ok(Value::Null);
+        };
+        let page = project_session(
+            &request.id,
+            &session,
+            request.offset,
+            request.limit.unwrap_or(MAX_SESSION_PAGE_MESSAGES),
+        );
+        Ok(serde_json::to_value(page)?)
+    }
+
+    /// 校验会话读取授权并取出应用注入的来源。
+    fn session_source_for(
+        allowed: bool,
+        source: Option<Arc<dyn PluginSessionSource>>,
+    ) -> Result<Arc<dyn PluginSessionSource>> {
+        if !allowed {
+            return Err(capability_denied("插件 manifest 未授权 sessions"));
+        }
+        source.ok_or_else(|| anyhow!("应用未注入只读会话来源"))
     }
 
     /// 读取当前插件实例状态；应用注入持久目录时该映射已在激活前恢复。

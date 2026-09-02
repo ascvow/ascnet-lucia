@@ -3,6 +3,7 @@
 pub(crate) mod host_actions;
 pub(crate) mod management;
 pub(crate) mod recovery;
+pub(crate) mod sessions;
 pub(crate) mod startup;
 
 pub(crate) use management::*;

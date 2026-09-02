@@ -23,7 +23,7 @@ pub use serde_json as __serde_json;
 /// WIT contract used by both host and guest.
 /// 宿主和 guest 共用的 WIT 契约。
 pub const PLUGIN_WIT: &str = r#"
-package ascnet:lucia-plugin@0.9.0;
+package ascnet:lucia-plugin@0.10.0;
 
 world plugin {
   import host-agent-upsert-tool: func(request-json: string) -> string;
@@ -38,6 +38,8 @@ world plugin {
   import host-store-set: func(request-json: string) -> string;
   import host-store-remove: func(request-json: string) -> string;
   import host-store-list: func(request-json: string) -> string;
+  import host-session-list: func(request-json: string) -> string;
+  import host-session-read: func(request-json: string) -> string;
   import host-service-upsert: func(request-json: string) -> string;
   import host-service-remove: func(request-json: string) -> string;
   import host-service-list: func(request-json: string) -> string;
@@ -652,6 +654,30 @@ pub trait PluginHostApi {
         Err(anyhow!("当前宿主未提供插件持久存储能力"))
     }
 
+    /// 列出当前项目的历史会话摘要。
+    ///
+    /// 需要 manifest 声明 `sessions = true`。该能力会把插件全部公开工具的权限下限
+    /// 抬到 `unknown`：会话内容是 Agent 历史上见过的一切的并集，涵盖文件正文、
+    /// shell 输出与网络返回。
+    fn session_list(&self) -> Result<Vec<PluginSessionSummary>> {
+        Err(anyhow!("当前宿主未提供只读会话访问能力"))
+    }
+
+    /// 分页读取一个会话的消息投影；会话不存在时返回 `None`。
+    ///
+    /// 返回内容不含模型私有推理与图片字节，超长正文按宿主上限截断。`limit` 缺省时
+    /// 使用宿主上限；宿主也可能因单页字节预算提前收尾，调用方应按
+    /// [`PluginSessionPage::message_count`] 判断是否还有后续页。
+    fn session_read(
+        &self,
+        id: &str,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<Option<PluginSessionPage>> {
+        let _ = (id, offset, limit);
+        Err(anyhow!("当前宿主未提供只读会话访问能力"))
+    }
+
     /// 注册或替换当前插件拥有的服务。
     fn upsert_service(&self, service: &ServiceSpec) -> Result<()>;
 
@@ -930,7 +956,7 @@ macro_rules! export_plugin {
             wit_bindgen::generate!({
                 path: [],
                 inline: r#"
-package ascnet:lucia-plugin@0.9.0;
+package ascnet:lucia-plugin@0.10.0;
 
 world plugin {
   import host-agent-upsert-tool: func(request-json: string) -> string;
@@ -945,6 +971,8 @@ world plugin {
   import host-store-set: func(request-json: string) -> string;
   import host-store-remove: func(request-json: string) -> string;
   import host-store-list: func(request-json: string) -> string;
+  import host-session-list: func(request-json: string) -> string;
+  import host-session-read: func(request-json: string) -> string;
   import host-service-upsert: func(request-json: string) -> string;
   import host-service-remove: func(request-json: string) -> string;
   import host-service-list: func(request-json: string) -> string;
@@ -1098,6 +1126,30 @@ world plugin {
                 ) -> $crate::Result<Vec<String>> {
                     let request = $crate::__serde_json::json!({"scope": scope});
                     $crate::decode_host_response(&host_store_list(
+                        &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn session_list(
+                    &self,
+                ) -> $crate::Result<Vec<$crate::PluginSessionSummary>> {
+                    $crate::decode_host_response(&host_session_list(
+                        &$crate::to_json_string(&$crate::__serde_json::json!({})),
+                    ))
+                }
+
+                fn session_read(
+                    &self,
+                    id: &str,
+                    offset: usize,
+                    limit: Option<usize>,
+                ) -> $crate::Result<Option<$crate::PluginSessionPage>> {
+                    let request = $crate::__serde_json::json!({
+                        "id": id,
+                        "offset": offset,
+                        "limit": limit,
+                    });
+                    $crate::decode_host_response(&host_session_read(
                         &$crate::to_json_string(&request),
                     ))
                 }
@@ -1749,6 +1801,19 @@ impl PluginHostApi for NoopHostApi {
 
     fn store_list(&self, _scope: PluginStoreScope) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+
+    fn session_list(&self) -> Result<Vec<PluginSessionSummary>> {
+        Ok(Vec::new())
+    }
+
+    fn session_read(
+        &self,
+        _id: &str,
+        _offset: usize,
+        _limit: Option<usize>,
+    ) -> Result<Option<PluginSessionPage>> {
+        Ok(None)
     }
 
     fn upsert_service(&self, _service: &ServiceSpec) -> Result<()> {

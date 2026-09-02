@@ -7,7 +7,7 @@
 id = "example"
 name = "Example Plugin"
 version = "0.1.0"
-api_version = "0.9.0"
+api_version = "0.10.0"
 wasm = "target/wasm32-wasip2/release/example_plugin.wasm"
 description = "示例插件"
 
@@ -90,6 +90,7 @@ ABI 基线混入其中会把“启用即可使用”误报为“当前 Guest 实
 | `model_completion` | 可用 | 应用固定 provider/model/stream，Host 禁用工具与推理并限制输出 |
 | `surface_action_allowlist` | 可用 | 按动作授权 `set_input`、会话操作或退出，禁止一项权限覆盖全部动作 |
 | `storage` | 可用 | 仅本插件私有命名空间，按 `workspace`/`user` 作用域隔离；宿主未提供项目身份时 `workspace` 不可用 |
+| `sessions` | 可用 | 只读当前项目历史会话；无写入路径，投影剔除私有推理与图片字节，并把工具权限下限抬到 `unknown` |
 | `tool_scopes` | 可用 | Host 按公开工具名绑定 scope；未声明工具降级为 `unknown`，已授 component 能力会进一步抬高风险下限 |
 | `fs_write` | 尚未开放 | manifest 申请会被拒绝 |
 | `http` | 尚未开放 | manifest 申请会被拒绝 |
@@ -123,6 +124,34 @@ storage = true
 Plugin Manager 的完整性锁与授权摘要在安装层拦截，而不是靠存储层每次哈希字节。
 
 存储受条目数与总字节配额约束，超限写入失败而不是静默丢弃。
+
+## 只读会话权限
+
+```toml
+[capabilities]
+sessions = true
+```
+
+允许插件列举并读取当前项目的历史会话。应用必须通过
+`PluginHostServices::with_session_source` 注入只读来源；未注入时该能力失败，而不是
+返回空列表——空列表会让插件把「宿主没接线」误读成「这个项目没有历史会话」。
+
+注入的是只读端口而不是 `SessionStore`：后者带有 `save` 与 `delete`，把它交给插件宿主
+就等于宿主持有了改写历史会话的能力，哪怕当前没有代码去调用。用类型而不是纪律来保证
+插件路径不可能写会话。
+
+**该能力会把插件全部公开工具的权限下限抬到 `unknown`。** 原因是它的覆盖面远大于名字：
+会话内容是 Agent 历史上见过的一切的并集——文件正文、shell 输出、网络返回，横跨全部
+过去的运行。持有它的插件因此能读到用户很久以前、为了另一件事才批准过的数据。按 `read`
+处理会低估这个面，让插件凭一次授权拿到远超当次意图的东西。
+
+投影在 Host 内完成，不下放给应用，避免不同宿主各自实现出宽窄不一的脱敏口径：
+
+- 剔除模型私有推理块——推理可能携带只能回传给来源路由的签名，暴露给插件既无检索价值，
+  又会让私有推理越过它的路由边界
+- 图片只保留存在标记，不投影 base64 字节
+- 单条正文与工具结果按字符上限截断并标注截断量
+- 单页按消息数与字节数双重限制；达到字节预算提前收尾，但至少返回一条，保证调用方能推进
 
 ## 模型完成权限
 
@@ -171,4 +200,4 @@ profiles = ["worker", "reviewer"]
 
 ## ABI 兼容
 
-当前 manifest 版本是 `0.9.0`，Host 只接受该版本并要求 WIT 导出完整存在。WIT 函数表面发生破坏性变化时必须升级 ABI；当前 Host 不保留旧 component 的探测加载分支。
+当前 manifest 版本是 `0.10.0`，Host 只接受该版本并要求 WIT 导出完整存在。WIT 函数表面发生破坏性变化时必须升级 ABI；当前 Host 不保留旧 component 的探测加载分支。

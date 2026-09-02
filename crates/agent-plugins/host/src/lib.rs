@@ -7,6 +7,7 @@
 pub mod audit;
 pub mod manifest;
 pub mod service;
+pub mod session;
 pub mod ui;
 
 mod composite;

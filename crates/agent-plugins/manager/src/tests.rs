@@ -57,7 +57,7 @@ fn create_bundle(
     fs::write(bundle.join("assets/config.txt"), "测试配置").expect("应能写入测试资源");
 
     let mut manifest = format!(
-        "[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\napi_version = \"0.9.0\"\nwasm = \"plugin.wasm\"\n"
+        "[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\napi_version = \"0.10.0\"\nwasm = \"plugin.wasm\"\n"
     );
     for (dependency_id, requirement) in dependencies {
         manifest.push_str(&format!(
@@ -1294,7 +1294,7 @@ fn manifest_wasm_path_cannot_escape_bundle() {
     let bundle = create_bundle(&directory.path, "escape", "1.0.0", &[], None);
     fs::write(
         bundle.join("plugin.toml"),
-        "[plugin]\nid = \"escape\"\nname = \"escape\"\nversion = \"1.0.0\"\napi_version = \"0.9.0\"\nwasm = \"../outside.wasm\"\n",
+        "[plugin]\nid = \"escape\"\nname = \"escape\"\nversion = \"1.0.0\"\napi_version = \"0.10.0\"\nwasm = \"../outside.wasm\"\n",
     )
     .expect("应能改写测试 manifest");
     let manager = PluginManager::new(directory.path.join("managed"));
@@ -1309,7 +1309,7 @@ fn plugin_id_cannot_be_used_as_storage_path() {
     let bundle = create_bundle(&directory.path, "safe", "1.0.0", &[], None);
     fs::write(
         bundle.join("plugin.toml"),
-        "[plugin]\nid = \"../escape\"\nname = \"escape\"\nversion = \"1.0.0\"\napi_version = \"0.9.0\"\nwasm = \"plugin.wasm\"\n",
+        "[plugin]\nid = \"../escape\"\nname = \"escape\"\nversion = \"1.0.0\"\napi_version = \"0.10.0\"\nwasm = \"plugin.wasm\"\n",
     )
     .expect("应能改写测试 manifest");
     let manager = PluginManager::new(directory.path.join("managed"));
@@ -1328,7 +1328,7 @@ fn bundle_symlink_is_rejected() {
     symlink("plugin.wasm", bundle.join("linked.wasm")).expect("应能创建测试符号链接");
     fs::write(
         bundle.join("plugin.toml"),
-        "[plugin]\nid = \"linked\"\nname = \"linked\"\nversion = \"1.0.0\"\napi_version = \"0.9.0\"\nwasm = \"linked.wasm\"\n",
+        "[plugin]\nid = \"linked\"\nname = \"linked\"\nversion = \"1.0.0\"\napi_version = \"0.10.0\"\nwasm = \"linked.wasm\"\n",
     )
     .expect("应能把 manifest 指向符号链接");
     let manager = PluginManager::new(directory.path.join("managed"));

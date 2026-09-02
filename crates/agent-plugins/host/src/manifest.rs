@@ -13,7 +13,7 @@ use std::{
 };
 
 /// 当前支持的插件 ABI 版本。
-pub const SUPPORTED_PLUGIN_API_VERSION: &str = "0.9.0";
+pub const SUPPORTED_PLUGIN_API_VERSION: &str = "0.10.0";
 
 /// 上下文加载器使用的标准能力 ID。
 pub const CONTEXT_LOADER_CAPABILITY: &str = "agent.context-loader";
@@ -305,7 +305,7 @@ manifest = "/opt/lucia/plugin.toml"
                 id = "workflow"
                 name = "Workflow"
                 version = "1.0.0"
-                api_version = "0.9.0"
+                api_version = "0.10.0"
                 wasm = "workflow.wasm"
 
                 [capabilities.agent]
@@ -400,7 +400,7 @@ manifest = "/opt/lucia/plugin.toml"
         let error = manifest
             .validate()
             .expect_err("旧 ABI manifest 必须在 component 加载前失败");
-        assert!(error.to_string().contains("仅支持当前版本 `0.9.0`"));
+        assert!(error.to_string().contains("仅支持当前版本 `0.10.0`"));
     }
 
     /// Spawn 权限必须同时声明至少一个可请求的 profile。
@@ -442,6 +442,38 @@ manifest = "/opt/lucia/plugin.toml"
         };
 
         assert_eq!(capabilities.component_capability_scope_floor(), None);
+    }
+
+    /// 只读会话访问已实现，manifest 声明必须被接受。
+    #[test]
+    fn sessions_capability_is_supported() {
+        let mut manifest = test_manifest("knowledge", "1.0.0", Vec::new());
+        manifest.capabilities = CapabilitySection {
+            sessions: true,
+            ..CapabilitySection::default()
+        };
+
+        manifest
+            .capabilities
+            .validate_supported()
+            .expect("只读会话能力应被接受");
+    }
+
+    /// 会话内容是历史上全部工具输出的并集，必须把工具权限下限抬到 `unknown`。
+    ///
+    /// 会话里可能有文件正文、shell 输出和网络返回，来源无法预先归类；按 `read`
+    /// 处理会低估覆盖面，让插件凭一次授权读到用户为别的目的批准过的数据。
+    #[test]
+    fn sessions_capability_raises_tool_permission_floor_to_unknown() {
+        let capabilities = CapabilitySection {
+            sessions: true,
+            ..CapabilitySection::default()
+        };
+
+        assert_eq!(
+            capabilities.component_capability_scope_floor(),
+            Some(ToolPermissionScope::Unknown)
+        );
     }
 
     /// Guest 声明不得在 Host 尚无真实实现时打开网络或 Secret 能力。
@@ -940,6 +972,15 @@ pub struct CapabilitySection {
     #[serde(default)]
     pub storage: bool,
 
+    /// 插件是否申请只读访问当前项目的历史会话。
+    ///
+    /// 该能力的覆盖面远大于它的名字：会话内容是 Agent 历史上见过的一切的并集——
+    /// 文件正文、shell 输出、网络返回，横跨全部过去的运行。持有该能力的插件因此
+    /// 能读到用户很久以前、为了另一件事才批准过的数据，所以它会把插件全部公开工具
+    /// 的权限下限抬到 `unknown`，并且没有任何写入路径。
+    #[serde(default)]
+    pub sessions: bool,
+
     /// 插件请求读取的路径。
     #[serde(default)]
     pub fs_read: Vec<String>,
@@ -1068,7 +1109,8 @@ impl CapabilitySection {
         if self.http {
             include(ToolPermissionScope::Network);
         }
-        if self.secrets
+        if self.sessions
+            || self.secrets
             || self.model_completion
             || self.agent.is_requested()
             || self.surface_actions

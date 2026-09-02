@@ -1,9 +1,9 @@
-# WIT API 0.9
+# WIT API 0.10
 
-Lucia 插件 ABI 的 world 是 `ascnet:lucia-plugin@0.9.0`。WIT 只固定函数名和 `string` 边界，业务结构通过 JSON 传递；这样可选字段可以按 serde 默认值演进，而不必为每个字段变化重写 Component 类型。
+Lucia 插件 ABI 的 world 是 `ascnet:lucia-plugin@0.10.0`。WIT 只固定函数名和 `string` 边界，业务结构通过 JSON 传递；这样可选字段可以按 serde 默认值演进，而不必为每个字段变化重写 Component 类型。
 
 ```txt
-package ascnet:lucia-plugin@0.9.0;
+package ascnet:lucia-plugin@0.10.0;
 
 world plugin {
   // Host imports
@@ -42,7 +42,7 @@ world plugin {
 }
 ```
 
-- `schema_version`：Host 能力响应信封版本，当前为 `1`，与插件 ABI `0.9.0` 独立。
+- `schema_version`：Host 能力响应信封版本，当前为 `1`，与插件 ABI `0.10.0` 独立。
 - `ok = true`：读取 `value`；无返回值的操作使用 JSON `null`。
 - `ok = false`：读取 `error`，不得同时把缺失 `value` 当作成功空值。
 - Guest SDK 的 `decode_host_response<T>` 会把失败信封转为 Rust `Err`，并把 `value` 反序列化为目标类型。
@@ -232,6 +232,39 @@ Rust SDK：`store_remove(scope, key) -> Result<Option<Value>>`。
 成功 `value` 是该作用域下全部键的字典序数组。
 
 Rust SDK：`store_list(scope) -> Result<Vec<String>>`。
+
+## 只读会话 imports
+
+需要 manifest 声明 `sessions = true`。该能力会把插件全部公开工具的权限下限抬到 `unknown`。
+
+### `host-session-list`
+
+```json
+{}
+```
+
+请求体保留为对象以便后续演进，当前不接受任何字段。成功 `value` 是会话摘要数组，
+每项含 `id`、`title`、`created_at_ms`、`updated_at_ms`、`revision` 与 `message_count`，
+不含任何消息正文。
+
+Rust SDK：`session_list() -> Result<Vec<PluginSessionSummary>>`。
+
+### `host-session-read`
+
+```json
+{
+  "id": "01J...",
+  "offset": 0,
+  "limit": 50
+}
+```
+
+成功 `value` 是消息投影分页；会话不存在时为 `null`。`limit` 缺省时使用宿主上限。
+Host 可能因单页字节预算提前收尾，调用方应按响应里的 `message_count` 判断是否还有后续页。
+
+投影不含模型私有推理与图片字节，超长正文按宿主上限截断并标注截断量。
+
+Rust SDK：`session_read(id, offset, limit) -> Result<Option<PluginSessionPage>>`。
 
 ## 插件服务 imports
 
@@ -878,7 +911,7 @@ Host 会验证工具 owner、覆盖 `plugin_id`，并维护 `tool_name -> render
 
 ## 兼容规则
 
-1. Host 当前只加载 manifest `api_version = "0.9.0"`，且要求 world 的全部 exports 存在。0.7 插件因 `on-event` 签名变化无法加载，必须重新编译。
+1. Host 当前只加载 manifest `api_version = "0.10.0"`，且要求 world 的全部 exports 存在。0.7 插件因 `on-event` 签名变化无法加载，必须重新编译。
 2. 修改 WIT import/export、删除或改名函数、改变字符串返回含义时必须升级插件 ABI。
 3. JSON 新字段必须可选并提供 serde 默认值；读取方必须忽略未知加法字段。
 4. 删除、改名、收紧枚举或改变既有字段含义属于破坏性变化，需要升级对应协议。

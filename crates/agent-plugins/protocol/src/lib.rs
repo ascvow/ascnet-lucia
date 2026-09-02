@@ -803,6 +803,82 @@ pub enum PluginStoreScope {
     User,
 }
 
+/// 只读会话列表项。
+///
+/// 只投影选择会话所需的元数据，不包含任何消息正文；需要正文时另行读取。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginSessionSummary {
+    /// 会话稳定标识，可用于后续读取。
+    pub id: String,
+    /// 可供展示的标题；会话尚未生成标题时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 记录创建时间，单位为 UNIX epoch 毫秒。
+    pub created_at_ms: u64,
+    /// 最近一次保存时间，单位为 UNIX epoch 毫秒。
+    pub updated_at_ms: u64,
+    /// 最近一次保存后的修订号；插件可据此判断会话是否发生过变化。
+    pub revision: u64,
+    /// 会话内消息总数，含工具结果消息。
+    pub message_count: usize,
+}
+
+/// 会话中一次工具调用的只读投影。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginSessionToolCall {
+    /// 被调用的公开工具名。
+    pub name: String,
+    /// 调用参数的 JSON 文本。
+    pub arguments: String,
+}
+
+/// 会话中一条消息的只读投影。
+///
+/// 该结构**不包含**模型私有推理内容：推理块可能带有只能回传给来源路由的签名，
+/// 把它暴露给插件既无检索价值，又会让私有推理越过它的路由边界。图片附件只保留
+/// 存在标记，不投影 base64 字节。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginSessionMessage {
+    /// 消息在会话中的序号，从零开始；与 `PluginSessionReadRequest` 的偏移量一致。
+    pub index: usize,
+    /// 消息角色：`system`、`developer`、`user`、`assistant` 或 `tool`。
+    pub role: String,
+    /// 消息内全部文本块按顺序拼接后的正文。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// 该消息发起的工具调用。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<PluginSessionToolCall>,
+    /// 该消息携带的工具结果正文。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_results: Vec<PluginSessionToolResult>,
+    /// 该消息是否含有未投影的图片附件。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_attachments: bool,
+}
+
+/// 会话中一条工具结果的只读投影。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginSessionToolResult {
+    /// 产生该结果的公开工具名。
+    pub name: String,
+    /// 结果是否为失败。
+    pub is_error: bool,
+    /// 结果正文的 JSON 文本。
+    pub content: String,
+}
+
+/// 读取会话消息的分页响应。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginSessionPage {
+    /// 会话稳定标识。
+    pub id: String,
+    /// 会话内消息总数，用于判断是否还有后续页。
+    pub message_count: usize,
+    /// 本页消息，按会话顺序排列。
+    pub messages: Vec<PluginSessionMessage>,
+}
+
 /// Core 在 ReAct 循环各决策点发布的事件名。
 ///
 /// 插件在 manifest 的 `[[events]]` 中按这些名字声明订阅。名字是 Host 与 Guest 之间的

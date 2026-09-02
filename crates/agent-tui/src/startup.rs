@@ -464,7 +464,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .with_config_path(config_path.clone())
         .with_context_window(context_window)
         .with_reasoning_levels(reasoning_levels, reasoning_level)
-        .with_persistent_session(session_store, session_record)
+        .with_persistent_session(Arc::clone(&session_store), session_record)
         .with_context_loader(manual_context_loader);
     if let Some(input) = model_input_modalities {
         app = app.with_model_modalities(input);
@@ -494,6 +494,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         app = app.with_loading_plugins(loading_plugin_ids);
         let load_tx = tx.clone();
         let load_host = Arc::clone(&live_plugin_host);
+        let plugin_session_store = Arc::clone(&session_store);
+
         tokio::spawn(async move {
             let result = load_plugins_for_tui(
                 plugin_manifests,
@@ -501,6 +503,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 plugin_agent_template,
                 plugin_execution,
                 plugin_workspace_scope,
+                plugin_session_store,
                 load_host,
                 load_tx.clone(),
             )

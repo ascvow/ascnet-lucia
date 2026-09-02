@@ -2,7 +2,7 @@
 id = "memory"
 name = "Memory Plugin"
 version = "0.1.0"
-api_version = "0.9.0"
+api_version = "0.10.0"
 wasm = "target/wasm32-wasip2/release/memory_plugin.wasm"
 description = "跨会话保留用户偏好与项目约定，并在每次模型请求前注入。"
 

@@ -266,6 +266,30 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     .into_anyhow()
     .context("注册 host-process-kill 失败")?;
     root.func_wrap_async(
+        "host-session-list",
+        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+            let (allowed, source) = caller.data().capabilities.session_context();
+            Box::new(async move {
+                let result = CapabilityState::list_sessions_with(allowed, source, &request).await;
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
+            })
+        },
+    )
+    .into_anyhow()
+    .context("注册 host-session-list 失败")?;
+    root.func_wrap_async(
+        "host-session-read",
+        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+            let (allowed, source) = caller.data().capabilities.session_context();
+            Box::new(async move {
+                let result = CapabilityState::read_session_with(allowed, source, &request).await;
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
+            })
+        },
+    )
+    .into_anyhow()
+    .context("注册 host-session-read 失败")?;
+    root.func_wrap_async(
         "host-model-complete",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             let (allowed, binding) = caller.data().capabilities.model_completion_context();
