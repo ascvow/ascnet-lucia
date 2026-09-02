@@ -28,6 +28,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -59,6 +60,8 @@ const RESPONSES_PARAMS_FULL: &[&str] = &[
     "include",
     "parallel_tool_calls",
     "previous_response_id",
+    "prompt_cache_key",
+    "prompt_cache_retention",
 ];
 
 /// 兼容网关 Responses API 端点通常支持的核心参数子集。
@@ -78,6 +81,8 @@ const RESPONSES_PARAMS_COMPATIBLE: &[&str] = &[
     "user",
     "text",
     "parallel_tool_calls",
+    "prompt_cache_key",
+    "prompt_cache_retention",
 ];
 
 /// 按白名单过滤请求体，移除 provider 不支持的顶层参数。
@@ -275,6 +280,8 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
 /// 防止绕过 Core 的执行策略与累计预算。
 fn build_responses_request(req: ModelRequest, allowed_params: &[&str]) -> Result<Value> {
     let trusted_max_tokens = req.max_tokens;
+    let cache_retention = req.cache_retention;
+    let prompt_cache_key = openai_prompt_cache_key(&req)?;
     let mut body = json!({
         "model": &req.model,
         "input": messages_to_responses_input(&req.messages)?,
@@ -293,6 +300,12 @@ fn build_responses_request(req: ModelRequest, allowed_params: &[&str]) -> Result
     }
     if let Some(temperature) = req.temperature {
         body["temperature"] = json!(temperature);
+    }
+    if cache_retention == crate::model::PromptCacheRetention::Long {
+        body["prompt_cache_retention"] = json!("24h");
+    }
+    if let Some(prompt_cache_key) = prompt_cache_key {
+        body["prompt_cache_key"] = json!(prompt_cache_key);
     }
 
     // 非关闭等级同时请求自动推理摘要，使客户端能观察推理确实启用但不暴露隐藏思维链。
@@ -322,6 +335,8 @@ fn build_responses_request(req: ModelRequest, allowed_params: &[&str]) -> Result
 
 fn build_chat_completions_request(req: ModelRequest) -> Result<Value> {
     let trusted_max_tokens = req.max_tokens;
+    let cache_retention = req.cache_retention;
+    let prompt_cache_key = openai_prompt_cache_key(&req)?;
     let mut messages = Vec::new();
 
     if let Some(system) = req.system {
@@ -347,12 +362,34 @@ fn build_chat_completions_request(req: ModelRequest) -> Result<Value> {
     if let Some(temperature) = req.temperature {
         body["temperature"] = json!(temperature);
     }
+    if cache_retention == crate::model::PromptCacheRetention::Long {
+        body["prompt_cache_retention"] = json!("24h");
+    }
+    if let Some(prompt_cache_key) = prompt_cache_key {
+        body["prompt_cache_key"] = json!(prompt_cache_key);
+    }
 
     merge_provider_options(&mut body, req.provider_options);
     if let Some(max_tokens) = trusted_max_tokens {
         enforce_output_budget(&mut body, "max_tokens", max_tokens);
     }
     Ok(body)
+}
+
+/// 根据稳定提示前缀生成 OpenAI 缓存亲和键，不要求调用方提供专用运行参数。
+fn openai_prompt_cache_key(req: &ModelRequest) -> Result<Option<String>> {
+    if req.cache_retention == crate::model::PromptCacheRetention::None {
+        return Ok(None);
+    }
+    let stable_prefix = json!({
+        "model": &req.model,
+        "system": &req.system,
+        "tools": &req.tools,
+        "first_message": req.messages.first(),
+    });
+    let encoded =
+        serde_json::to_vec(&stable_prefix).context("failed to encode OpenAI cache key")?;
+    Ok(Some(format!("{:x}", Sha256::digest(encoded))))
 }
 
 // ---------------------------------------------------------------------------
@@ -787,7 +824,7 @@ fn parse_chat_completions_response(value: Value) -> Result<ModelResponse> {
 
 fn parse_openai_usage(usage: Option<&Value>) -> Option<TokenUsage> {
     let usage = usage?;
-    let input_tokens = usage
+    let raw_input_tokens = usage
         .get("input_tokens")
         .or_else(|| usage.get("prompt_tokens"))
         .and_then(Value::as_u64);
@@ -796,10 +833,30 @@ fn parse_openai_usage(usage: Option<&Value>) -> Option<TokenUsage> {
         .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_u64);
     let total_tokens = usage.get("total_tokens").and_then(Value::as_u64);
+    let input_details = usage
+        .get("input_tokens_details")
+        .or_else(|| usage.get("prompt_tokens_details"));
+    let cache_read_tokens = input_details
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+        .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64));
+    let cache_write_tokens = input_details
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("cache_write_tokens").and_then(Value::as_u64));
+    // OpenAI 会把缓存读写计入 input/prompt tokens；中立用量结构改为分项保存。
+    let input_tokens = raw_input_tokens.map(|tokens| {
+        tokens
+            .saturating_sub(cache_read_tokens.unwrap_or(0))
+            .saturating_sub(cache_write_tokens.unwrap_or(0))
+    });
     Some(TokenUsage {
         input_tokens,
         output_tokens,
         total_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
     })
 }
 

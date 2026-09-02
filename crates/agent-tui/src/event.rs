@@ -64,7 +64,7 @@ pub(crate) enum UiEvent {
         plugin_id: String,
         request: UiNavigationRequest,
     },
-    /// 最近一次模型请求消耗的上下文 token 数。
+    /// 最近一次模型请求的未缓存输入与缓存读写 token 总数。
     ContextUsage(u64),
     /// Agent 运行结束，携带至少一次持久化后的会话状态。
     AgentDone(Box<AgentCompletion>),

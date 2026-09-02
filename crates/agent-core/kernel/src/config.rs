@@ -3,7 +3,10 @@
 
 use crate::{
     agent::{Agent, AgentModelConfig, AgentOptions},
-    model::{ModelGateway, ModelProviderConfig, OpenAiProtocol, ProviderKind, ReasoningLevel},
+    model::{
+        ModelGateway, ModelProviderConfig, OpenAiProtocol, PromptCacheRetention, ProviderKind,
+        ReasoningLevel,
+    },
 };
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -54,6 +57,7 @@ impl AgentRootConfig {
         config.stream = self.agent.stream.unwrap_or(config.stream);
         config.temperature = self.agent.temperature.or(config.temperature);
         config.reasoning = self.agent.reasoning.unwrap_or(config.reasoning);
+        config.cache_retention = self.agent.cache_retention.unwrap_or(config.cache_retention);
         config.provider_options = self
             .agent
             .provider_options
@@ -88,6 +92,10 @@ impl AgentRootConfig {
         options.stream = self.agent.stream.unwrap_or(options.stream);
         options.temperature = self.agent.temperature.or(options.temperature);
         options.reasoning = self.agent.reasoning.unwrap_or(options.reasoning);
+        options.cache_retention = self
+            .agent
+            .cache_retention
+            .unwrap_or(options.cache_retention);
         options.provider_options = self
             .agent
             .provider_options
@@ -184,6 +192,9 @@ pub struct AgentConfig {
     pub temperature: Option<f32>,
     /// 模型推理强度；`None` 保持默认关闭，由应用层能力元数据决定是否补全。
     pub reasoning: Option<ReasoningLevel>,
+
+    /// 模型提示缓存保留策略；`None` 使用默认短期缓存。
+    pub cache_retention: Option<PromptCacheRetention>,
 
     /// Provider-specific options shallow-merged into the request.
     /// 浅合并到请求中的服务商专属选项。

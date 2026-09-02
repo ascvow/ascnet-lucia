@@ -41,6 +41,8 @@ max_steps = 0
 # max_tokens 和 reasoning 缺省时从打包内置的 models.dev 快照读取。
 # max_tokens = 4096
 # reasoning = "medium"
+# 提示缓存默认使用 short；none 不发送显式控制，long 请求服务商的长期缓存。
+# cache_retention = "short"
 # 默认使用流式模型接口；设为 false 时等待完整响应。
 stream = true
 

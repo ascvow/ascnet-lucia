@@ -5,7 +5,7 @@ use super::stream::{
     ChatCompletionsStreamState, ResponsesStreamState,
 };
 use super::*;
-use crate::model::ModelStreamEvent;
+use crate::model::{ModelStreamEvent, PromptCacheRetention};
 
 /// 构造带文本、图片和 PDF 的用户消息，覆盖附件转换路径。
 fn attachment_message() -> crate::model::ModelMessage {
@@ -220,6 +220,113 @@ fn provider_options_cannot_override_trusted_output_limits() {
     assert_eq!(chat_body["best_of"], 1);
 }
 
+/// OpenAI 默认短期缓存必须自动生成稳定亲和键，不要求调用方提供专用运行参数。
+#[test]
+fn default_short_cache_adds_automatic_openai_cache_key() {
+    let mut request = ModelRequest::new(
+        "gpt-test",
+        vec![crate::model::ModelMessage::text(
+            crate::model::MessageRole::User,
+            "检查缓存",
+        )],
+    );
+    request.system = Some("系统提示".into());
+
+    let responses = build_responses_request(request.clone(), RESPONSES_PARAMS_COMPATIBLE)
+        .expect("Responses 请求应成功构建");
+    let chat = build_chat_completions_request(request).expect("Chat 请求应成功构建");
+
+    let responses_key = responses["prompt_cache_key"]
+        .as_str()
+        .expect("Responses 应包含缓存亲和键");
+    let chat_key = chat["prompt_cache_key"]
+        .as_str()
+        .expect("Chat 应包含缓存亲和键");
+    assert_eq!(responses_key.len(), 64);
+    assert_eq!(responses_key, chat_key);
+    assert!(responses.get("prompt_cache_retention").is_none());
+    assert!(chat.get("prompt_cache_retention").is_none());
+}
+
+/// 显式关闭缓存时不得生成 OpenAI 缓存字段。
+#[test]
+fn no_cache_retention_omits_openai_cache_fields() {
+    let mut request = ModelRequest::new("gpt-test", Vec::new());
+    request.cache_retention = PromptCacheRetention::None;
+
+    let responses = build_responses_request(request.clone(), RESPONSES_PARAMS_COMPATIBLE)
+        .expect("Responses 无缓存请求应成功构建");
+    let chat = build_chat_completions_request(request).expect("Chat 无缓存请求应成功构建");
+
+    assert!(responses.get("prompt_cache_key").is_none());
+    assert!(responses.get("prompt_cache_retention").is_none());
+    assert!(chat.get("prompt_cache_key").is_none());
+    assert!(chat.get("prompt_cache_retention").is_none());
+}
+
+/// OpenAI 长期缓存映射为 24 小时保留期，并同时适用于两种协议。
+#[test]
+fn long_cache_retention_maps_to_openai_24h() {
+    let mut request = ModelRequest::new("gpt-test", Vec::new());
+    request.cache_retention = PromptCacheRetention::Long;
+
+    let responses = build_responses_request(request.clone(), RESPONSES_PARAMS_COMPATIBLE)
+        .expect("Responses 长缓存请求应成功构建");
+    let chat = build_chat_completions_request(request).expect("Chat 长缓存请求应成功构建");
+
+    assert_eq!(responses["prompt_cache_retention"], "24h");
+    assert_eq!(chat["prompt_cache_retention"], "24h");
+}
+
+/// 特殊兼容网关仍可通过 provider_options 显式提供缓存路由字段，无需扩张运行 API。
+#[test]
+fn provider_options_can_supply_openai_cache_affinity() {
+    let mut request = ModelRequest::new("gpt-test", Vec::new());
+    request.provider_options = json!({"prompt_cache_key": "stable-session"});
+
+    let body = build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE)
+        .expect("兼容网关缓存路由请求应成功构建");
+
+    assert_eq!(body["prompt_cache_key"], "stable-session");
+}
+
+/// OpenAI usage 中缓存读写已包含在 input tokens，解析后必须拆成互斥分项。
+#[test]
+fn openai_usage_separates_cached_input_tokens() {
+    let usage = parse_openai_usage(Some(&json!({
+        "input_tokens": 1_000,
+        "output_tokens": 100,
+        "total_tokens": 1_100,
+        "input_tokens_details": {
+            "cached_tokens": 600,
+            "cache_write_tokens": 100
+        }
+    })))
+    .expect("应解析 OpenAI 用量");
+
+    assert_eq!(usage.input_tokens, Some(300));
+    assert_eq!(usage.output_tokens, Some(100));
+    assert_eq!(usage.cache_read_tokens, Some(600));
+    assert_eq!(usage.cache_write_tokens, Some(100));
+    assert_eq!(usage.total_tokens, Some(1_100));
+}
+
+/// Chat Completions 的兼容字段也必须解析缓存命中并扣除重复输入量。
+#[test]
+fn chat_usage_parses_cached_prompt_tokens() {
+    let usage = parse_openai_usage(Some(&json!({
+        "prompt_tokens": 900,
+        "completion_tokens": 80,
+        "total_tokens": 980,
+        "prompt_tokens_details": {"cached_tokens": 500}
+    })))
+    .expect("应解析 Chat 用量");
+
+    assert_eq!(usage.input_tokens, Some(400));
+    assert_eq!(usage.cache_read_tokens, Some(500));
+    assert_eq!(usage.cache_write_tokens, None);
+}
+
 /// Responses SSE 文本增量会实时发送并进入最终聚合文本。
 #[tokio::test]
 async fn responses_sse_emits_and_aggregates_text_delta() {
@@ -341,6 +448,27 @@ async fn responses_sse_recovers_function_call_without_output_item_done() {
     assert_eq!(response.finish_reason, FinishReason::ToolCalls);
     assert_eq!(response.tool_calls.len(), 1);
     assert_eq!(response.tool_calls[0].name, "list_directory");
+}
+
+/// Responses 完成事件中的缓存用量必须进入最终流式响应。
+#[tokio::test]
+async fn responses_sse_preserves_cache_usage() {
+    let (sender, _stream) = ModelEventStream::channel();
+    let mut state = ResponsesStreamState::default();
+
+    handle_responses_sse_data(
+        r#"{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1200,"output_tokens":100,"total_tokens":1300,"input_tokens_details":{"cached_tokens":800,"cache_write_tokens":100}}}}"#,
+        &sender,
+        &mut state,
+    )
+    .expect("应该记录带缓存用量的完成响应");
+
+    let response = finalize_responses_stream_state(state).expect("应该生成最终模型响应");
+    let usage = response.usage.expect("最终响应应保留用量");
+    assert_eq!(usage.input_tokens, Some(300));
+    assert_eq!(usage.cache_read_tokens, Some(800));
+    assert_eq!(usage.cache_write_tokens, Some(100));
+    assert_eq!(usage.total_tokens, Some(1_300));
 }
 
 /// Responses 推理摘要 SSE 必须进入独立思考事件，不能混入最终回答文本。

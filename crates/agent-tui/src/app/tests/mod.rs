@@ -55,7 +55,7 @@ use agent_core::model::MessageRole;
 
 use agent_core::model::{ContentBlock, ReasoningLevel};
 
-use agent_core::{Agent, AgentRun, Session};
+use agent_core::{Agent, AgentRun, Session, TokenUsage};
 
 #[cfg(feature = "plugins")]
 use agent_plugin_host::wasm::PluginLoadFailure;

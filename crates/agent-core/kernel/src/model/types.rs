@@ -390,6 +390,21 @@ pub enum ToolChoice {
     },
 }
 
+/// 模型提示缓存的保留策略。
+///
+/// Provider 适配器负责把该中立策略映射为各自协议字段；不支持缓存的适配器可以忽略。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheRetention {
+    /// 不发送任何显式提示缓存控制字段。
+    None,
+    /// 使用服务商默认的短期缓存保留时间。
+    #[default]
+    Short,
+    /// 请求服务商支持的较长缓存保留时间。
+    Long,
+}
+
 /// Request sent from ReAct loop to a model adapter.
 /// ReAct loop 发送给模型适配器的请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +428,10 @@ pub struct ModelRequest {
     #[serde(default)]
     pub reasoning: ReasoningLevel,
 
+    /// 本轮提示缓存保留策略；默认使用服务商的短期缓存。
+    #[serde(default)]
+    pub cache_retention: PromptCacheRetention,
+
     /// Provider-specific escape hatch. Adapters shallow-merge this object into the wire request.
     /// 服务商专属逃生口。适配器会把这个对象浅合并到实际网络请求里。
     #[serde(default)]
@@ -432,6 +451,7 @@ impl ModelRequest {
             max_tokens: None,
             temperature: None,
             reasoning: ReasoningLevel::Off,
+            cache_retention: PromptCacheRetention::Short,
             provider_options: Value::Object(Default::default()),
         }
     }
@@ -460,12 +480,18 @@ pub enum FinishReason {
 /// Token 用量；如果服务商返回该信息则填充。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenUsage {
-    /// 服务商报告的输入 token 数；未提供时为 `None`。
+    /// 未从提示缓存读取或写入的输入 token 数；未提供时为 `None`。
     pub input_tokens: Option<u64>,
     /// 服务商报告的输出 token 数；未提供时为 `None`。
     pub output_tokens: Option<u64>,
     /// 服务商报告或由输入输出相加得到的总 token 数。
     pub total_tokens: Option<u64>,
+    /// 从服务商提示缓存读取的 token 数；未提供时为 `None`。
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    /// 本次写入服务商提示缓存的 token 数；未提供时为 `None`。
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
 }
 
 impl TokenUsage {
@@ -474,21 +500,32 @@ impl TokenUsage {
     pub fn add_assign(&mut self, other: &TokenUsage) {
         add_token_field(&mut self.input_tokens, other.input_tokens);
         add_token_field(&mut self.output_tokens, other.output_tokens);
+        add_token_field(&mut self.cache_read_tokens, other.cache_read_tokens);
+        add_token_field(&mut self.cache_write_tokens, other.cache_write_tokens);
 
         let other_total =
             other
                 .total_tokens
                 .or_else(|| match (other.input_tokens, other.output_tokens) {
-                    (Some(input), Some(output)) => Some(input + output),
+                    (Some(input), Some(output)) => Some(
+                        input
+                            .saturating_add(output)
+                            .saturating_add(other.cache_read_tokens.unwrap_or(0))
+                            .saturating_add(other.cache_write_tokens.unwrap_or(0)),
+                    ),
                     _ => None,
                 });
         add_token_field(&mut self.total_tokens, other_total);
 
-        // Some providers omit total_tokens. Derive it when input and output are both known.
-        // 某些服务商不会返回 total_tokens；如果 input/output 都已知，则自动推导。
+        // 某些服务商不会返回 total_tokens；输入输出已知时按全部分项自动推导。
         if self.total_tokens.is_none() {
             if let (Some(input), Some(output)) = (self.input_tokens, self.output_tokens) {
-                self.total_tokens = Some(input + output);
+                self.total_tokens = Some(
+                    input
+                        .saturating_add(output)
+                        .saturating_add(self.cache_read_tokens.unwrap_or(0))
+                        .saturating_add(self.cache_write_tokens.unwrap_or(0)),
+                );
             }
         }
     }
@@ -496,7 +533,11 @@ impl TokenUsage {
     /// Return true when no usage field is present.
     /// 当没有任何用量字段时返回 true。
     pub fn is_empty(&self) -> bool {
-        self.input_tokens.is_none() && self.output_tokens.is_none() && self.total_tokens.is_none()
+        self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.total_tokens.is_none()
+            && self.cache_read_tokens.is_none()
+            && self.cache_write_tokens.is_none()
     }
 }
 

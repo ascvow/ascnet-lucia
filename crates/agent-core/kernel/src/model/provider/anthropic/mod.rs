@@ -7,8 +7,8 @@ use super::support::{
 use crate::model::types::{ModelRoute, PrivateReasoning};
 use crate::model::{
     ChatModel, ContentBlock, FinishReason, MessageRole, ModelEventStream, ModelProviderConfig,
-    ModelRequest, ModelResponse, ModelStreamEvent, ProviderAdapter, ProviderBilling,
-    ReasoningLevel, TokenUsage, ToolChoice,
+    ModelRequest, ModelResponse, ModelStreamEvent, PromptCacheRetention, ProviderAdapter,
+    ProviderBilling, ReasoningLevel, TokenUsage, ToolChoice,
 };
 use agent_tool::{ToolCall, ToolSpec};
 use anyhow::{anyhow, Context, Result};
@@ -150,6 +150,7 @@ fn build_messages_request_for_route(
 ) -> Result<Value> {
     validate_private_reasoning_for_route(&req.messages, target_route)?;
     let trusted_max_tokens = req.max_tokens;
+    let cache_control = anthropic_cache_control(req.cache_retention);
     let mut max_tokens = req.max_tokens.unwrap_or(4096);
 
     let mut body = json!({
@@ -159,11 +160,26 @@ fn build_messages_request_for_route(
     });
 
     if let Some(system) = req.system {
-        body["system"] = json!(system);
+        body["system"] = match &cache_control {
+            Some(cache_control) => json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": cache_control,
+            }]),
+            None => json!(system),
+        };
     }
     if !req.tools.is_empty() {
         body["tools"] = Value::Array(req.tools.iter().map(tool_to_anthropic).collect());
         body["tool_choice"] = tool_choice_to_anthropic(&req.tool_choice);
+        if let Some(cache_control) = &cache_control {
+            if let Some(last_tool) = body["tools"]
+                .as_array_mut()
+                .and_then(|tools| tools.last_mut())
+            {
+                last_tool["cache_control"] = cache_control.clone();
+            }
+        }
     }
     if let Some(temperature) = req.temperature {
         body["temperature"] = json!(temperature);
@@ -177,6 +193,10 @@ fn build_messages_request_for_route(
     )?;
 
     body["max_tokens"] = json!(max_tokens);
+
+    if let Some(cache_control) = &cache_control {
+        mark_last_anthropic_user_content(&mut body["messages"], cache_control);
+    }
 
     merge_provider_options(&mut body, req.provider_options);
     if let Some(max_tokens) = trusted_max_tokens {
@@ -468,6 +488,39 @@ fn tool_choice_to_anthropic(choice: &ToolChoice) -> Value {
     }
 }
 
+/// 把中立缓存保留策略转换为 Anthropic 显式缓存断点。
+fn anthropic_cache_control(retention: PromptCacheRetention) -> Option<Value> {
+    match retention {
+        PromptCacheRetention::None => None,
+        PromptCacheRetention::Short => Some(json!({ "type": "ephemeral" })),
+        PromptCacheRetention::Long => Some(json!({ "type": "ephemeral", "ttl": "1h" })),
+    }
+}
+
+/// 在最近一条 user/tool-result 消息的最后一个内容块上标记会话历史缓存断点。
+fn mark_last_anthropic_user_content(messages: &mut Value, cache_control: &Value) {
+    let Some(messages) = messages.as_array_mut() else {
+        return;
+    };
+    let Some(message) = messages.iter_mut().rev().find(|message| {
+        message.get("role").and_then(Value::as_str) == Some("user")
+            && message
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|content| !content.is_empty())
+    }) else {
+        return;
+    };
+    let Some(last_content) = message
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|content| content.last_mut())
+    else {
+        return;
+    };
+    last_content["cache_control"] = cache_control.clone();
+}
+
 fn parse_messages_response(value: Value, source_route: &ModelRoute) -> Result<ModelResponse> {
     let mut content = Vec::new();
     let mut tool_calls = Vec::new();
@@ -540,10 +593,29 @@ fn parse_messages_response(value: Value, source_route: &ModelRoute) -> Result<Mo
         _ => FinishReason::Unknown,
     };
 
-    let usage = value.get("usage").map(|usage| TokenUsage {
-        input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
-        output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
-        total_tokens: None,
+    let usage = value.get("usage").map(|usage| {
+        let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+        let output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+        let cache_read_tokens = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+        let cache_write_tokens = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64);
+        let total_tokens = [
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(u64::saturating_add);
+        TokenUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        }
     });
     let billing = ProviderBilling::from_provider_response(&value);
 

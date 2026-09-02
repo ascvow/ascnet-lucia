@@ -54,7 +54,7 @@ pub fn agent_model_config(&self) -> Result<AgentModelConfig>
 把 TOML 配置转换为运行时模型配置。
 
 - 参数：只使用 `self.model` 和与模型请求有关的 `self.agent` 字段。
-- 返回值：包含 provider、model、tool choice、token、温度、推理等级和 provider options。
+- 返回值：包含 provider、model、tool choice、token、温度、推理等级、提示缓存策略和 provider options。
 - 错误：`api_key` 与 `api_key_env` 都没有值，或 `api_key_env` 对应环境变量不存在时返回错误。
 - 副作用：可能读取一个环境变量；不会修改原配置或持久化解析后的密钥。
 
@@ -136,7 +136,7 @@ pub fn set_model_config(
 
 - `config.provider`：注册或替换同名 adapter。
 - `config.model`：切换模型 ID。
-- 其余字段：覆盖 tool choice、token、温度、推理等级和 provider options。
+- 其余字段：覆盖 tool choice、token、温度、推理等级、提示缓存策略和 provider options。
 - 返回值：可继续链式配置的可变 Agent 引用。
 - 错误与原子性：adapter 构造失败时返回错误，当前模型选择不会切换。
 
@@ -156,6 +156,8 @@ pub fn new(gateway: ModelGateway, options: AgentOptions) -> Agent
 - 副作用：只分配内存状态，不验证选中 provider 是否存在，也不发送请求。
 
 `AgentOptions.max_steps = 0` 表示单条用户指令不设置总 ReAct 步数上限。服务端后台任务通常应使用正数上限；交互应用还应提供取消能力。
+
+`AgentOptions.cache_retention` 默认是 `PromptCacheRetention::Short`，普通 `run`、`run_continue` 和 `run_session` 都会自动应用。`None` 不发送显式缓存控制；`Long` 请求 OpenAI 24 小时或 Anthropic 1 小时缓存。OpenAI 缓存亲和键由稳定提示前缀自动生成；自定义兼容网关需要覆盖该字段时，通过 `provider_options` 配置。
 
 ## 注册原生工具
 

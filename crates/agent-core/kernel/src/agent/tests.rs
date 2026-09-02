@@ -1526,6 +1526,42 @@ async fn dynamic_reasoning_level_updates_next_request() {
     assert_eq!(requests[0].reasoning, ReasoningLevel::XHigh);
 }
 
+/// 普通运行入口必须默认启用短期提示缓存，不要求调用方选择专用 API。
+#[tokio::test]
+async fn regular_run_uses_default_short_prompt_cache() {
+    let model = Arc::new(CapturingModel {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register("capturing", model.clone())
+        .expect("注册捕获模型应成功");
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("capturing", "test-model"),
+    );
+
+    agent.run("验证默认缓存").await.expect("普通运行应成功");
+
+    let requests = model.requests.lock().expect("模型请求锁不应中毒");
+    assert_eq!(requests[0].cache_retention, PromptCacheRetention::Short);
+}
+
+/// 缓存读写分项必须参与缺省总 token 推导，避免累计用量漏计。
+#[test]
+fn token_usage_total_includes_cache_components() {
+    let mut total = TokenUsage::default();
+    total.add_assign(&TokenUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(20),
+        total_tokens: None,
+        cache_read_tokens: Some(700),
+        cache_write_tokens: Some(180),
+    });
+
+    assert_eq!(total.total_tokens, Some(1_000));
+}
+
 /// 调用方提供的 Run ID 必须贯穿结果和全部事件，不能在 Core 内被替换。
 #[tokio::test]
 async fn caller_supplied_run_id_binds_result_and_events() {
@@ -2130,6 +2166,41 @@ fn agent_config_controls_streaming_mode() {
             .agent_model_config()
             .expect("构造非流式模型配置")
             .stream
+    );
+}
+
+/// TOML 缺省使用短期缓存，并允许显式选择关闭或长期保留策略。
+#[test]
+fn agent_config_controls_prompt_cache_retention() {
+    let default_config: crate::AgentRootConfig = toml::from_str(
+        r#"
+            [model]
+            provider = "open-ai"
+            model = "test-model"
+            api_key = "test-key"
+        "#,
+    )
+    .expect("解析默认缓存配置");
+    assert_eq!(
+        default_config.agent_options().cache_retention,
+        PromptCacheRetention::Short
+    );
+
+    let configured: crate::AgentRootConfig = toml::from_str(
+        r#"
+            [model]
+            provider = "anthropic"
+            model = "claude-test"
+            api_key = "test-key"
+
+            [agent]
+            cache_retention = "long"
+        "#,
+    )
+    .expect("解析长期缓存配置");
+    assert_eq!(
+        configured.agent_options().cache_retention,
+        PromptCacheRetention::Long
     );
 }
 

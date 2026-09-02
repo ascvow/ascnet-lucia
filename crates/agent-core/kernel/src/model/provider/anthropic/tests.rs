@@ -34,6 +34,108 @@ fn zero_max_tokens_rejects_reasoning_expansion() {
     assert!(error.to_string().contains("至少需要 2048"));
 }
 
+/// 默认短期缓存必须标记 system、最后一个工具和最近用户内容三个稳定前缀断点。
+#[test]
+fn default_short_cache_marks_anthropic_breakpoints() {
+    let mut request = ModelRequest::new(
+        "claude-test",
+        vec![crate::model::ModelMessage::text(
+            MessageRole::User,
+            "检查缓存",
+        )],
+    );
+    request.system = Some("系统提示".to_string());
+    request.tools = vec![ToolSpec::new(
+        "read_file",
+        "读取文件",
+        ToolSpec::empty_object_schema(),
+    )];
+
+    let body = build_messages_request(request).expect("短期缓存请求应成功构建");
+    let expected = json!({"type": "ephemeral"});
+
+    assert_eq!(body["system"][0]["cache_control"], expected);
+    assert_eq!(body["tools"][0]["cache_control"], expected);
+    assert_eq!(body["messages"][0]["content"][0]["cache_control"], expected);
+}
+
+/// 关闭显式缓存时必须保持原协议形态，不注入 Anthropic 缓存断点。
+#[test]
+fn no_cache_retention_omits_anthropic_breakpoints() {
+    let mut request = ModelRequest::new(
+        "claude-test",
+        vec![crate::model::ModelMessage::text(
+            MessageRole::User,
+            "普通请求",
+        )],
+    );
+    request.system = Some("系统提示".to_string());
+    request.cache_retention = PromptCacheRetention::None;
+    request.tools = vec![ToolSpec::new(
+        "read_file",
+        "读取文件",
+        ToolSpec::empty_object_schema(),
+    )];
+
+    let body = build_messages_request(request).expect("无缓存请求应成功构建");
+
+    assert_eq!(body["system"], "系统提示");
+    assert!(body["tools"][0].get("cache_control").is_none());
+    assert!(body["messages"][0]["content"][0]
+        .get("cache_control")
+        .is_none());
+}
+
+/// Anthropic 长期缓存必须在全部缓存断点上请求一小时 TTL。
+#[test]
+fn long_cache_retention_maps_to_anthropic_1h() {
+    let mut request = ModelRequest::new(
+        "claude-test",
+        vec![crate::model::ModelMessage::text(
+            MessageRole::User,
+            "长期任务",
+        )],
+    );
+    request.system = Some("系统提示".to_string());
+    request.cache_retention = PromptCacheRetention::Long;
+
+    let body = build_messages_request(request).expect("长期缓存请求应成功构建");
+    assert_eq!(
+        body["system"][0]["cache_control"],
+        json!({"type": "ephemeral", "ttl": "1h"})
+    );
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"],
+        json!({"type": "ephemeral", "ttl": "1h"})
+    );
+}
+
+/// Anthropic 返回的缓存读写用量必须计入分项与总 token 数。
+#[test]
+fn anthropic_usage_includes_cache_tokens() {
+    let response = parse_messages_response(
+        json!({
+            "content": [{"type": "text", "text": "完成"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 50,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 700,
+                "cache_creation_input_tokens": 200
+            }
+        }),
+        &ModelRoute::new("anthropic-main", "claude-test"),
+    )
+    .expect("应解析 Anthropic 缓存用量");
+    let usage = response.usage.expect("响应应包含用量");
+
+    assert_eq!(usage.input_tokens, Some(50));
+    assert_eq!(usage.output_tokens, Some(20));
+    assert_eq!(usage.cache_read_tokens, Some(700));
+    assert_eq!(usage.cache_write_tokens, Some(200));
+    assert_eq!(usage.total_tokens, Some(970));
+}
+
 /// 图片附件映射为 Anthropic base64 image 块。
 #[test]
 fn image_block_maps_to_base64_image() {
@@ -261,7 +363,11 @@ fn user_message_cannot_inject_private_reasoning_blocks() {
 
     assert_eq!(
         body["messages"][0]["content"],
-        json!([{"type": "text", "text": "真实用户输入"}])
+        json!([{
+            "type": "text",
+            "text": "真实用户输入",
+            "cache_control": {"type": "ephemeral"}
+        }])
     );
 }
 

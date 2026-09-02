@@ -16,8 +16,8 @@ use crate::{
     event::{AgentEvent, AgentEventKind, BillingUsage, EventSink, NoopEventSink},
     extension::{AgentExtension, NoopAgentExtension},
     model::{
-        ModelGateway, ModelProviderConfig, ModelRequest, ModelStreamEvent, ReasoningLevel,
-        TokenUsage, ToolChoice,
+        ModelGateway, ModelProviderConfig, ModelRequest, ModelStreamEvent, PromptCacheRetention,
+        ReasoningLevel, TokenUsage, ToolChoice,
     },
     session::Session,
     state::{AgentPhase, AgentState, AgentToolCallState, AgentToolCallStatus},
@@ -101,6 +101,9 @@ pub struct AgentOptions {
     /// 推理/思维链级别。
     pub reasoning: ReasoningLevel,
 
+    /// 模型提示缓存保留策略；默认使用服务商的短期缓存。
+    pub cache_retention: PromptCacheRetention,
+
     /// Provider-specific request options.
     /// 服务商专属请求选项。
     pub provider_options: Value,
@@ -124,6 +127,7 @@ impl Default for AgentOptions {
             stream: true,
             temperature: None,
             reasoning: ReasoningLevel::Off,
+            cache_retention: PromptCacheRetention::Short,
             provider_options: Value::Object(Default::default()),
             execution_policy: ExecutionPolicy::serve(),
         }
@@ -212,6 +216,10 @@ pub struct AgentModelConfig {
     #[serde(default)]
     pub reasoning: ReasoningLevel,
 
+    /// 模型提示缓存保留策略；缺省使用短期缓存。
+    #[serde(default)]
+    pub cache_retention: PromptCacheRetention,
+
     /// Provider-specific request options shallow-merged into each wire request.
     /// 每次实际网络请求都会浅合并的 provider 专属选项。
     #[serde(default = "empty_provider_options")]
@@ -230,6 +238,7 @@ impl AgentModelConfig {
             stream: true,
             temperature: None,
             reasoning: ReasoningLevel::Off,
+            cache_retention: PromptCacheRetention::Short,
             provider_options: empty_provider_options(),
         }
     }
@@ -475,6 +484,7 @@ impl Agent {
         config.stream = options.stream;
         config.temperature = options.temperature;
         config.reasoning = options.reasoning;
+        config.cache_retention = options.cache_retention;
         config.provider_options = options.provider_options.clone();
 
         let mut agent = Self::from_model_config(config)?;
@@ -504,6 +514,7 @@ impl Agent {
         self.options.stream = config.stream;
         self.options.temperature = config.temperature;
         self.options.reasoning = config.reasoning;
+        self.options.cache_retention = config.cache_retention;
         self.options.provider_options = config.provider_options;
         Ok(self)
     }

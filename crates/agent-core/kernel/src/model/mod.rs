@@ -20,5 +20,5 @@ pub use stream::{ModelEventSender, ModelEventStream, ModelStreamEvent};
 pub use types as ir;
 pub use types::{
     ContentBlock, FinishReason, MessageRole, ModelMessage, ModelRequest, ModelResponse,
-    ProviderBilling, ReasoningLevel, TokenUsage, ToolChoice,
+    PromptCacheRetention, ProviderBilling, ReasoningLevel, TokenUsage, ToolChoice,
 };

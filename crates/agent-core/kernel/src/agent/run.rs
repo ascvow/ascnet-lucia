@@ -508,6 +508,7 @@ impl Agent {
                     .clamp_tokens(self.options.max_tokens),
                 temperature: self.options.temperature,
                 reasoning: self.reasoning_level(),
+                cache_retention: self.options.cache_retention,
                 provider_options: self.options.provider_options.clone(),
             };
 

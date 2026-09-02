@@ -77,12 +77,8 @@ impl EventSink for ChannelEventSink {
                 let _ = self.tx.send(UiEvent::ModelStarted);
             }
             AgentEventKind::ModelResponse => {
-                // 转发本轮请求的 input tokens，作为当前上下文大小显示在底栏。
-                if let Some(tokens) = event
-                    .payload
-                    .pointer("/usage/input_tokens")
-                    .and_then(Value::as_u64)
-                {
+                // 上下文包含未缓存输入与缓存读写分项，底栏必须显示本轮完整输入规模。
+                if let Some(tokens) = model_context_tokens(&event.payload) {
                     let _ = self.tx.send(UiEvent::ContextUsage(tokens));
                 }
             }
@@ -204,4 +200,18 @@ impl EventSink for ChannelEventSink {
         }
         Ok(())
     }
+}
+
+/// 汇总模型响应中的全部输入分项，供底栏展示本轮真实上下文规模。
+fn model_context_tokens(payload: &Value) -> Option<u64> {
+    let usage = payload.get("usage")?;
+    let parts = [
+        usage.get("input_tokens").and_then(Value::as_u64),
+        usage.get("cache_read_tokens").and_then(Value::as_u64),
+        usage.get("cache_write_tokens").and_then(Value::as_u64),
+    ];
+    parts
+        .iter()
+        .any(Option::is_some)
+        .then(|| parts.into_iter().flatten().fold(0, u64::saturating_add))
 }

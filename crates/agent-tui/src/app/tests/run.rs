@@ -233,6 +233,44 @@ fn streamed_deltas_update_one_assistant_message() {
     assert!(app.streaming_message.is_none());
 }
 
+/// 运行完成提示必须展示服务商返回的缓存读取与写入 token。
+#[test]
+fn completed_run_displays_prompt_cache_usage() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut completed_session = Session::new();
+    completed_session.push_assistant_text("完成");
+    let mut saved_record = app.session_record.clone();
+    saved_record.session = completed_session.clone();
+
+    app.handle_agent_done(AgentCompletion {
+        run: Some(AgentRun {
+            run_id: "cache-usage".into(),
+            final_text: "完成".into(),
+            steps_used: 2,
+            usage: TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                total_tokens: Some(1_000),
+                cache_read_tokens: Some(700),
+                cache_write_tokens: Some(180),
+            },
+            session: completed_session,
+            cancelled: false,
+        }),
+        session_record: saved_record,
+        error: None,
+        input_committed: true,
+        queue_may_advance: true,
+        input: "测试缓存".into(),
+    });
+
+    assert!(app.messages.iter().any(|message| {
+        matches!(message.kind, MsgKind::Info)
+            && message.text == "↑100 ↓20 cache read 700 write 180 Σ1000 tokens · 2 steps"
+    }));
+}
+
 /// 推理增量只切换运行阶段，不保存摘要文本，并在正文、下一轮或运行结束时复位。
 #[test]
 fn thinking_deltas_only_toggle_run_phase() {
@@ -296,6 +334,29 @@ async fn channel_event_sink_coalesces_model_text_notifications() {
 
     sink.record(&first).await.expect("消费后应允许再次通知");
     assert!(matches!(rx.recv().await, Some(UiEvent::ModelTextReady)));
+}
+
+/// 底栏上下文用量必须合并未缓存输入与缓存读写分项。
+#[tokio::test]
+async fn channel_event_sink_sums_prompt_cache_context_tokens() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, _model_deltas, _thinking_deltas) = ChannelEventSink::new(tx);
+    let event = AgentEvent::new(
+        "run-cache",
+        AgentEventKind::ModelResponse,
+        0,
+        json!({
+            "usage": {
+                "input_tokens": 100,
+                "cache_read_tokens": 700,
+                "cache_write_tokens": 180
+            }
+        }),
+    );
+
+    sink.record(&event).await.expect("应转发缓存上下文用量");
+
+    assert!(matches!(rx.recv().await, Some(UiEvent::ContextUsage(980))));
 }
 
 /// 高频推理摘要增量必须与回答文本分开合并，避免写入助手消息缓冲区。

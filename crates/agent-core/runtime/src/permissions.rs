@@ -3,8 +3,8 @@
 use crate::{AgentRuntimeError, RuntimeResult};
 use agent_core::{
     Agent, AgentExtension, AgentOptions, ContextLoader, EventBus, EventContext, EventListener,
-    EventSink, ListenerFailure, ListenerPriority, ModelGateway, ModelMessage, ReasoningLevel,
-    Subscribe, ToolCallEvent, ToolChoice,
+    EventSink, ListenerFailure, ListenerPriority, ModelGateway, ModelMessage, PromptCacheRetention,
+    ReasoningLevel, Subscribe, ToolCallEvent, ToolChoice,
 };
 use agent_tool::{ToolCall, ToolRegistry, ToolResult, ToolSpec};
 use anyhow::Result as AnyResult;
@@ -57,6 +57,8 @@ pub struct AgentOptionsPatch {
     pub temperature: Option<f32>,
     /// 覆盖推理级别。
     pub reasoning: Option<ReasoningLevel>,
+    /// 覆盖模型提示缓存保留策略。
+    pub cache_retention: Option<PromptCacheRetention>,
     /// 覆盖服务商专属请求选项。
     pub provider_options: Option<Value>,
 }
@@ -90,6 +92,9 @@ impl AgentOptionsPatch {
         }
         if let Some(value) = self.reasoning {
             options.reasoning = value;
+        }
+        if let Some(value) = self.cache_retention {
+            options.cache_retention = value;
         }
         if let Some(value) = &self.provider_options {
             options.provider_options = value.clone();

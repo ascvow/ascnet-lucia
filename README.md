@@ -169,6 +169,7 @@ openai_protocol = "responses"
 [agent]
 max_steps = 0
 max_tokens = 4096
+cache_retention = "short"
 stream = true
 
 [tui]

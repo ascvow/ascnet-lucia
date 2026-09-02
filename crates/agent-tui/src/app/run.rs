@@ -7,7 +7,7 @@ use crate::event::{AgentCompletion, SessionReloadOutcome, UiEvent};
 use crate::session::conversation::{Msg, MsgKind, UserSubmission};
 use crate::session::{restore_session_messages, run_and_persist};
 use agent_core::model::ReasoningLevel;
-use agent_core::Agent;
+use agent_core::{Agent, TokenUsage};
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -298,13 +298,7 @@ impl App {
             if !user_cancelled && !run.usage.is_empty() {
                 self.messages.push(Msg::new(
                     MsgKind::Info,
-                    format!(
-                        "↑{} ↓{} Σ{} tokens · {} steps",
-                        run.usage.input_tokens.unwrap_or(0),
-                        run.usage.output_tokens.unwrap_or(0),
-                        run.usage.total_tokens.unwrap_or(0),
-                        run.steps_used,
-                    ),
+                    format_run_usage(&run.usage, run.steps_used),
                 ));
             }
         }
@@ -314,4 +308,24 @@ impl App {
         }
         queue_may_advance && !user_cancelled
     }
+}
+
+/// 格式化运行用量，并在服务商提供时显示提示缓存读取与写入量。
+fn format_run_usage(usage: &TokenUsage, steps_used: usize) -> String {
+    let mut cache = String::new();
+    if usage.cache_read_tokens.is_some() || usage.cache_write_tokens.is_some() {
+        cache = format!(
+            " cache read {} write {}",
+            usage.cache_read_tokens.unwrap_or(0),
+            usage.cache_write_tokens.unwrap_or(0),
+        );
+    }
+    format!(
+        "↑{} ↓{}{} Σ{} tokens · {} steps",
+        usage.input_tokens.unwrap_or(0),
+        usage.output_tokens.unwrap_or(0),
+        cache,
+        usage.total_tokens.unwrap_or(0),
+        steps_used,
+    )
 }

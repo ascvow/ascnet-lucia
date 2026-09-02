@@ -44,8 +44,8 @@ pub use event::{
 pub use extension::{AgentExtension, CompositeAgentExtension, NoopAgentExtension};
 pub use model::{
     ChatModel, ContentBlock, FinishReason, MessageRole, ModelGateway, ModelMessage,
-    ModelProviderConfig, ModelRequest, ModelResponse, OpenAiProtocol, ProviderAdapter,
-    ProviderBilling, ProviderKind, ReasoningLevel, TokenUsage, ToolChoice,
+    ModelProviderConfig, ModelRequest, ModelResponse, OpenAiProtocol, PromptCacheRetention,
+    ProviderAdapter, ProviderBilling, ProviderKind, ReasoningLevel, TokenUsage, ToolChoice,
 };
 pub use session::Session;
 pub use state::{AgentPhase, AgentState, AgentToolCallState, AgentToolCallStatus};

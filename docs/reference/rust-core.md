@@ -19,6 +19,7 @@
 | `stream` | `bool` | 是否使用模型流式接口；默认 `true`，设为 `false` 时等待完整响应 |
 | `temperature` | `Option<f32>` | 采样温度；范围由 adapter 或服务商校验 |
 | `reasoning` | `ReasoningLevel` | 推理等级；不支持的 adapter 可忽略或报错 |
+| `cache_retention` | `PromptCacheRetention` | 提示缓存保留策略；默认 `Short`，可选 `None` 或 `Long` |
 | `provider_options` | `Value` | 浅合并到服务商请求的专属 JSON 对象；内置 adapter 会在合并后恢复输出预算字段 |
 
 `with_provider(provider)`、`with_model(model)`、`with_model_route(provider, model)` 和 `with_stream(stream)` 消费并返回 `AgentOptions`。这些函数只写字段，不验证 provider 是否已经注册。
@@ -62,6 +63,8 @@ pub fn new(
 `set_model_route` 是 `set_model_selection` 的同义入口。`gateway()` 只读访问注册表，`gateway_mut()` 允许高级调用方直接增删 adapter。
 
 内置 OpenAI 与 Anthropic adapter 不允许 `provider_options` 放宽 `max_tokens`：合并后会重新收紧主 token 字段和已出现的常见顶层 token 别名，并把多候选字段固定为一。Anthropic extended thinking 的思考预算包含在同一总上限内。未知或嵌套的私有字段仍由第三方兼容网关解释，因此接入自定义 adapter 时，调用方必须自行保证最终 wire 请求不会突破 `ModelRequest.max_tokens`。
+
+提示缓存默认通过普通运行函数启用，不增加缓存专用 API。OpenAI 根据模型、system、工具和首条消息的稳定前缀自动生成 `prompt_cache_key`，`Long` 另发送 `prompt_cache_retention = "24h"`；Anthropic 的 `Short` 在 system、最后一个工具和最近用户内容上发送 `ephemeral` 缓存断点，`Long` 额外请求 `ttl = "1h"`。`TokenUsage` 把未缓存输入、缓存读取和缓存写入拆成独立字段，`total_tokens` 保留完整总量。
 
 ### Agent 组件函数
 
