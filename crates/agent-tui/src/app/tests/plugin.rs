@@ -383,46 +383,79 @@ async fn tool_renderer_frame_is_applied_to_timeline_message() {
     assert!(!text.contains("● test_tool"), "{text:?}");
 }
 
-/// 多行工具 renderer 默认展示上限内的全部详情行。
-#[test]
+/// 构造带指定行数的工具消息 renderer 帧。
 #[cfg(feature = "plugins")]
-fn multi_line_tool_renderer_supports_collapsed_details() {
+fn tool_renderer_message(lines: usize) -> Msg {
     let mut message = Msg::tool_started(ToolCall::new("call-1", "test_tool", json!({})));
     message.tool_frame = Some(PluginUiFrame {
         view_id: "test-message".into(),
         visible: true,
-        lines: ["自定义摘要", "自定义详情"]
-            .into_iter()
-            .map(|text| UiLine {
+        lines: (1..=lines)
+            .map(|index| UiLine {
                 spans: vec![UiSpan {
-                    text: text.into(),
+                    text: if index == 1 {
+                        "自定义摘要".to_string()
+                    } else {
+                        format!("自定义详情 {index}")
+                    },
                     style: UiStyle::default(),
                 }],
             })
             .collect(),
         cursor: None,
     });
+    message
+}
 
-    let collapsed = message
+/// 拼接一条消息渲染后的全部文本。
+#[cfg(feature = "plugins")]
+fn rendered_text(message: &Msg) -> String {
+    message
         .to_lines(false, 72)
         .iter()
         .flat_map(|line| line.spans.iter())
         .map(|span| span.content.as_ref())
-        .collect::<String>();
-    // 详情未超过预览上限时全部直接展示，也就不需要展开标记。
-    assert!(collapsed.contains("自定义摘要"), "{collapsed:?}");
-    assert!(collapsed.contains("自定义详情"), "{collapsed:?}");
-    assert!(!collapsed.contains("▸ "), "{collapsed:?}");
+        .collect()
+}
+
+/// 详情未超过上限的 renderer 帧全部直接展示，且不可展开。
+///
+/// 这类消息不应出现三角标记，也不应注册点击热区——否则点一下只会把 `▸` 翻成 `▾`，
+/// 内容却毫无变化。
+#[test]
+#[cfg(feature = "plugins")]
+fn short_tool_renderer_is_not_expandable() {
+    let mut message = tool_renderer_message(2);
+
+    let text = rendered_text(&message);
+    assert!(text.contains("自定义摘要"), "{text:?}");
+    assert!(text.contains("自定义详情 2"), "{text:?}");
+    assert!(!text.contains('▸'), "{text:?}");
+    assert!(!message.is_tool_expandable());
+
+    // 即使外部错误地置位展开标志，也不得凭空出现展开标记。
+    message.tool_expanded = true;
+    let text = rendered_text(&message);
+    assert!(!text.contains('▾'), "{text:?}");
+}
+
+/// 超过上限的 renderer 帧默认折叠尾部，展开后展示更多详情行。
+#[test]
+#[cfg(feature = "plugins")]
+fn long_tool_renderer_supports_collapsed_details() {
+    let mut message = tool_renderer_message(12);
+    assert!(message.is_tool_expandable());
+
+    let collapsed = rendered_text(&message);
+    assert!(collapsed.contains("▸ 自定义摘要"), "{collapsed:?}");
+    assert!(collapsed.contains("自定义详情 8"), "{collapsed:?}");
+    assert!(!collapsed.contains("自定义详情 12"), "{collapsed:?}");
+    assert!(collapsed.contains("… +4 行"), "{collapsed:?}");
 
     message.tool_expanded = true;
-    let expanded = message
-        .to_lines(false, 72)
-        .iter()
-        .flat_map(|line| line.spans.iter())
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
+    let expanded = rendered_text(&message);
     assert!(expanded.contains("▾ 自定义摘要"), "{expanded:?}");
-    assert!(expanded.contains("自定义详情"), "{expanded:?}");
+    assert!(expanded.contains("自定义详情 12"), "{expanded:?}");
 }
 
 /// 晚到的旧 revision 不得覆盖较新的工具消息帧。

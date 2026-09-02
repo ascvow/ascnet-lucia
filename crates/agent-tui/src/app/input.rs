@@ -765,7 +765,8 @@ impl App {
                 let Some(message) = self.messages.get_mut(message_index) else {
                     return false;
                 };
-                if !message.has_tool_details() {
+                // 内容没有被藏起来时不做任何切换，点击继续交给文本选择处理。
+                if !message.is_tool_expandable() {
                     return false;
                 }
                 message.tool_expanded = !message.tool_expanded;

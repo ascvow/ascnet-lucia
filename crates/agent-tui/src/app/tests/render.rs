@@ -225,22 +225,8 @@ fn tool_lines_show_args_and_truncated_result() {
     );
     assert!(collapsed.contains("1 很长的文件内容"), "{collapsed:?}");
 
-    msg.tool_expanded = true;
-    let expanded = msg
-        .to_lines(false, 80)
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(expanded.contains("▾ ● Read(src/main.rs)"), "{expanded:?}");
-    // 正文进入带行号的预览块，超宽部分按显示宽度截断。
-    assert!(expanded.contains("1 很长的文件内容"), "{expanded:?}");
-    assert!(expanded.contains('…'), "{expanded:?}");
+    // 内容没有被藏起来，因此不可展开：既没有三角标记，点击也不该改变任何东西。
+    assert!(!msg.is_tool_expandable());
 }
 
 /// 运行中的工具应立即展示增量输出，而不必等待 ToolFinished。
@@ -432,7 +418,9 @@ fn dragging_tool_message_does_not_toggle_details() {
         "shell",
         json!({"command": "cargo test"}),
     ));
-    message.append_tool_output("正在执行测试\n");
+    for line in 1..=24 {
+        message.append_tool_output(&format!("正在执行测试 {line}\n"));
+    }
     app.messages.push(message);
 
     terminal
@@ -638,4 +626,60 @@ fn context_status_uses_configured_window_thresholds() {
         crate::ui::chat::context_status(5_300, None),
         ("5.3k".into(), COLOR_MUTED)
     );
+}
+
+/// 内容未被折叠的工具消息不注册点击热区，点击也不得切换展开状态。
+///
+/// 这类消息展开后看到的内容完全一样，允许点击只会制造"点了没反应"的困惑。
+#[test]
+fn short_tool_message_is_neither_marked_nor_clickable() {
+    let backend = TestBackend::new(80, 18);
+    let mut terminal = Terminal::new(backend).expect("创建短工具消息测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut message = Msg::tool_started(ToolCall::new(
+        "call-short",
+        "read_file",
+        json!({"path": "a.rs"}),
+    ));
+    message.kind = MsgKind::ToolOk;
+    message.tool_result = Some(ToolResult::success(
+        "call-short",
+        "read_file",
+        json!({"content": "fn main() {}", "lines_read": 1, "total_lines": 1}),
+    ));
+    app.messages.push(message);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染短工具消息");
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(!app.messages[0].is_tool_expandable());
+    assert!(!screen.contains('▸'), "{screen}");
+    assert!(
+        app.tool_message_hit_regions.is_empty(),
+        "短结果不应注册热区"
+    );
+
+    // 即便直接构造一次落在消息上的点击，也不得改变展开状态。
+    let click = |kind| MouseEvent {
+        kind,
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_tool_message_click(&click(MouseEventKind::Down(
+        crossterm::event::MouseButton::Left,
+    )));
+    assert!(!app.handle_tool_message_click(&click(MouseEventKind::Up(
+        crossterm::event::MouseButton::Left
+    ))));
+    assert!(!app.messages[0].tool_expanded);
 }

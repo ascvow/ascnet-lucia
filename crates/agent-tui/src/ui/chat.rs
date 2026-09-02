@@ -104,7 +104,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             let message_height = message_lines.iter().fold(0u16, |height, line| {
                 height.saturating_add(wrapped_line_count(line, inner_width))
             });
-            if !timeline_uses_snapshot && message.has_tool_details() && message_height > 0 {
+            if !timeline_uses_snapshot && message.is_tool_expandable() && message_height > 0 {
                 tool_message_rows.push((index, wrapped_height, message_height));
             }
             wrapped_height = wrapped_height.saturating_add(message_height);

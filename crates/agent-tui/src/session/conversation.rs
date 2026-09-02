@@ -5,7 +5,7 @@ use crate::ui::highlight::CodeLanguage;
 use crate::ui::markdown::{conversation_lines, markdown_lines, truncate_line, user_lines};
 use crate::ui::transcript::{
     output_preview_lines, preview_language, preview_lines, render_preview, tool_summary,
-    tool_target, tool_title_spans,
+    tool_target, tool_title_spans, PreviewLine,
 };
 use agent_core::model::ContentBlock;
 #[cfg(feature = "plugins")]
@@ -212,11 +212,12 @@ impl Msg {
         )
     }
 
-    /// 返回当前工具消息是否存在可展开详情。
+    /// 返回展开当前工具消息是否真的能多看到内容。
     ///
-    /// 插件 renderer 以第一行为紧凑态，其余行为详情；默认 renderer 只在结构化结果或
-    /// 运行输出能够形成至少一条预览行时允许展开。
-    pub(crate) fn has_tool_details(&self) -> bool {
+    /// 判定基准是**收起态**的行数上限：只有默认视图确实藏起了内容，展开才有意义。
+    /// 结果本来就短于上限时既不显示三角标记，也不注册点击热区——否则会出现一个
+    /// 点了什么都不变、却把标记从 `▸` 翻成 `▾` 的假交互。
+    pub(crate) fn is_tool_expandable(&self) -> bool {
         if !self.is_tool() || self.skip_reason.is_some() {
             return false;
         }
@@ -226,12 +227,16 @@ impl Msg {
             .as_ref()
             .filter(|frame| frame.visible && !frame.lines.is_empty())
         {
-            return frame.lines.len() > 1;
+            return frame.lines.len() > TOOL_RESULT_PREVIEW_LINES;
         }
-        if let Some(result) = self.tool_result.as_ref() {
-            return !preview_lines(self.tool_call.as_ref(), result, 1).is_empty();
-        }
-        !self.tool_output.is_empty() && !output_preview_lines(&self.tool_output, 1).is_empty()
+        let preview = match self.tool_result.as_ref() {
+            Some(result) => {
+                preview_lines(self.tool_call.as_ref(), result, TOOL_RESULT_PREVIEW_LINES)
+            }
+            None if self.tool_output.is_empty() => return false,
+            None => output_preview_lines(&self.tool_output, TOOL_RESULT_PREVIEW_LINES),
+        };
+        preview.iter().any(PreviewLine::is_elided)
     }
 
     /// 向运行中的工具消息追加输出；调用 ID 的匹配由上层状态机负责。
@@ -322,7 +327,7 @@ impl Msg {
             .filter(|frame| frame.visible && !frame.lines.is_empty())
         {
             let frame_lines = crate::ui::plugin_frame_lines(frame);
-            let has_details = frame_lines.len() > 1;
+            let expandable = self.is_tool_expandable();
             let visible_lines = if self.tool_expanded {
                 TOOL_RESULT_DETAIL_LINES
             } else {
@@ -343,7 +348,7 @@ impl Msg {
                     .style(line.style)
                 })
                 .collect::<Vec<_>>();
-            if has_details && (omitted > 0 || self.tool_expanded) {
+            if expandable {
                 lines[0].spans.insert(
                     0,
                     Span::styled(
@@ -387,11 +392,8 @@ impl Msg {
                 ),
             }
         };
-        // 只有确实还有更多内容时才提示可展开，避免出现点了没变化的假交互。
-        let truncated = preview.iter().any(|line| line.is_elided());
-
         let mut first = Vec::new();
-        if truncated || self.tool_expanded {
+        if self.is_tool_expandable() {
             first.push(Span::styled(
                 if self.tool_expanded { "▾ " } else { "▸ " },
                 Style::new().fg(COLOR_MUTED),
