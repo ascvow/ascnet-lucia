@@ -41,6 +41,12 @@
       "crate": "memory-plugin",
       "directory": "examples/plugins/memory-plugin",
       "files": ["plugin.toml", "target/wasm32-wasip2/release/memory_plugin.wasm"]
+    },
+    {
+      "id": "knowledge",
+      "crate": "knowledge-plugin",
+      "directory": "examples/plugins/knowledge-plugin",
+      "files": ["plugin.toml", "target/wasm32-wasip2/release/knowledge_plugin.wasm"]
     }
   ]
 }

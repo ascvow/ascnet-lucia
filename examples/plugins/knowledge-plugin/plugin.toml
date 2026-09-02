@@ -1,0 +1,26 @@
+[plugin]
+id = "knowledge"
+name = "Knowledge Plugin"
+version = "0.1.0"
+api_version = "0.10.0"
+wasm = "target/wasm32-wasip2/release/knowledge_plugin.wasm"
+description = "把历史对话蒸馏为可检索知识库，并按条目回溯对话原文。"
+
+[capabilities]
+# 只读历史会话作为语料。该能力会把本插件全部工具的权限下限抬到 unknown：
+# 会话内容是 Agent 历史上见过的一切的并集，按只读文件对待会低估覆盖面。
+sessions = true
+# 知识库条目跨插件版本保留，属于用户资产，必须用持久存储而不是实例状态。
+storage = true
+# 蒸馏对话需要受控模型完成；Host 固定路由并禁用工具。
+model_completion = true
+
+[capabilities.tool_scopes]
+kb_index = "control"
+kb_status = "control"
+kb_search = "control"
+kb_read = "control"
+
+# 运行结束是索引的主要推进点：触发方已经拿到返回值，蒸馏发生在关键路径之外。
+[[events]]
+name = "core.run.finish"
