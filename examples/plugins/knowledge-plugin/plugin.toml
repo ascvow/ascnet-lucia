@@ -21,6 +21,10 @@ kb_status = "control"
 kb_search = "control"
 kb_read = "control"
 
-# 运行结束是索引的主要推进点：触发方已经拿到返回值，蒸馏发生在关键路径之外。
+# Core 运行结束时推进已有待办；此时当前会话尚未保证落盘，不做自动范围判断。
 [[events]]
 name = "core.run.finish"
+
+# TUI 完成会话持久化后，模型评估新修订会话并选择需要蒸馏的范围。
+[[events]]
+name = "tui.run.finish"
