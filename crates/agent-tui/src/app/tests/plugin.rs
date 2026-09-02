@@ -455,7 +455,7 @@ fn stale_tool_renderer_frame_is_ignored() {
     );
 }
 
-/// 独占输入插件必须使用完整边框和声明标题，形成与主输入区分离的审批卡片。
+/// 独占输入插件必须使用完整圆角边框和声明标题，形成与主输入区分离的审批卡片。
 #[test]
 #[cfg(feature = "plugins")]
 fn input_plugin_renders_bordered_title_card() {
@@ -481,13 +481,14 @@ fn input_plugin_renders_bordered_title_card() {
         .position(|row| row.contains(" Permission "))
         .expect("应显示插件声明标题");
 
-    assert!(rows[title_row].contains('┌'));
-    assert!(rows[title_row].contains('┐'));
+    // 圆角与主输入框保持一致，同一位置不出现两种边框风格。
+    assert!(rows[title_row].contains('╭'));
+    assert!(rows[title_row].contains('╮'));
     assert!(rows[title_row + 1].contains('│'));
     assert!(rows[title_row + 1].contains('插'));
     assert!(rows[title_row + 1].contains('件'));
-    assert!(rows[title_row + 7].contains('└'));
-    assert!(rows[title_row + 7].contains('┘'));
+    assert!(rows[title_row + 7].contains('╰'));
+    assert!(rows[title_row + 7].contains('╯'));
 }
 
 /// 验证右侧插槽与主界面可以同时渲染，且插件获得实际内容尺寸。

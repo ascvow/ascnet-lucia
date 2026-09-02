@@ -21,6 +21,12 @@ pub(crate) const COLOR_DANGER: Color = Color::Rgb(205, 101, 101);
 /// 用户消息块背景色：与绯红强调同系的暗红灰，用于与助手正文区分。
 pub(crate) const COLOR_USER_BG: Color = Color::Rgb(58, 38, 43);
 
+/// 面板之间分隔线的颜色。
+///
+/// 比次要文字更暗：分隔线只需要"这里换区域了"这一点信息，与正文同亮度会把界面
+/// 切得很碎。
+pub(crate) const COLOR_SEPARATOR: Color = Color::Rgb(68, 66, 72);
+
 /// 信息强调色：用于插件语义色中的"提示、正在进行"一类状态。
 pub(crate) const COLOR_ACCENT: Color = Color::Rgb(122, 172, 196);
 

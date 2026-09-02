@@ -1409,14 +1409,16 @@ fn permission_mode_lines(
     lines
 }
 
-/// 渲染一个纵向审批选项；每个动作使用稳定语义色，选中项增加箭头与加粗。
+/// 渲染一个纵向审批选项；每个动作使用稳定语义色，选中项加指示条与加粗。
+///
+/// 指示条与权限模式面板、宿主原生列表共用同一个记号，避免同一界面出现多种选中样式。
 fn option_line(shortcut: &str, label: &str, selected: bool, color: UiColor) -> UiLine {
     UiLine {
         spans: vec![
             UiSpan {
-                text: if selected { "❯ " } else { "  " }.into(),
+                text: if selected { "▌ " } else { "  " }.into(),
                 style: UiStyle {
-                    foreground: Some(UiColor::White),
+                    foreground: Some(UiColor::Magenta),
                     bold: selected,
                     ..UiStyle::default()
                 },
@@ -1675,7 +1677,7 @@ mod tests {
         assert!(text.contains("Reason"), "{text}");
         assert!(text.contains("Scope   process"), "{text}");
         assert!(text.contains("Risk    ●●●●  high"), "{text}");
-        assert!(text.contains("❯ [A] 允许一次"), "{text}");
+        assert!(text.contains("▌ [A] 允许一次"), "{text}");
         assert!(text.contains("[S] 此风险不支持运行级放行"), "{text}");
         assert!(text.contains("[D] 拒绝"), "{text}");
         assert!(!text.contains("全部放行"), "{text}");

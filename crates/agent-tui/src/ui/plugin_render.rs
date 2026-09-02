@@ -4,8 +4,8 @@ use crate::app::{
     default_plugin_height, default_plugin_width, plugin_view_visible, App, PluginViewState,
 };
 use crate::theme::{
-    COLOR_ACCENT, COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_TEXT,
-    COLOR_USER, COLOR_WARNING,
+    COLOR_ACCENT, COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SEPARATOR, COLOR_SUCCESS,
+    COLOR_TEXT, COLOR_USER, COLOR_WARNING,
 };
 use agent_plugin_protocol::UiFrame as PluginUiFrame;
 use agent_plugin_protocol::{UiColor, UiPlacement, UiStyle};
@@ -119,21 +119,76 @@ fn split_plugin_area(area: Rect, placement: UiPlacement, requested: u16) -> (Rec
     }
 }
 
-/// 渲染一个静态插件视图并记录去除边框后的内容区。
-fn render_plugin_view(frame: &mut Frame, view: &mut PluginViewState, area: Rect, focused: bool) {
-    let border_color = if focused {
-        COLOR_BORDER_FOCUS
+/// 返回停靠视图与主界面之间那一条分隔线所在的边。
+///
+/// 只画朝向主内容的一条细线，而不是四面包围的盒子：盒子会在每个插件周围堆叠出
+/// 大量框线，与原生命令面板的单横线风格也不一致。
+fn panel_edge(placement: UiPlacement) -> Borders {
+    match placement {
+        UiPlacement::Top => Borders::BOTTOM,
+        UiPlacement::Bottom => Borders::TOP,
+        UiPlacement::Left => Borders::RIGHT,
+        UiPlacement::Right => Borders::LEFT,
+        _ => Borders::TOP,
+    }
+}
+
+/// 构造插件面板的标题行。
+///
+/// 标题作为内容首行而不是嵌在边框上：侧边停靠只有一条竖线，边框上放不下标题，
+/// 统一成内容行后四个方向的观感才一致。
+fn panel_title_line(title: &str, focused: bool) -> Line<'static> {
+    let style = if focused {
+        Style::new().fg(COLOR_TEXT).bold()
     } else {
-        COLOR_MUTED
+        Style::new().fg(COLOR_MUTED).bold()
     };
-    let padding = match view.declaration.placement {
-        UiPlacement::Left | UiPlacement::Right => Padding::new(1, 1, 1, 1),
-        _ => Padding::horizontal(1),
-    };
+    Line::from(Span::styled(title.to_string(), style))
+}
+
+/// 渲染一个静态插件视图并记录去除外框后的内容区。
+fn render_plugin_view(frame: &mut Frame, view: &mut PluginViewState, area: Rect, focused: bool) {
+    let block = Block::new()
+        .borders(panel_edge(view.declaration.placement))
+        .border_style(Style::new().fg(if focused {
+            COLOR_BORDER_FOCUS
+        } else {
+            COLOR_SEPARATOR
+        }))
+        .padding(Padding::horizontal(1));
+    let content_area = block.inner(area);
+    view.area = content_area;
+    let mut lines = vec![panel_title_line(&view.declaration.title, focused)];
+    lines.extend(
+        view.frame
+            .as_ref()
+            .map(plugin_frame_lines)
+            .unwrap_or_default(),
+    );
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+    if focused {
+        set_plugin_cursor(frame, view.frame.as_ref(), content_area);
+    }
+}
+
+/// 渲染浮在主界面之上的插件对话框。
+///
+/// 对话框是唯一保留完整边框的插件容器：它悬浮在内容之上，需要一圈边界把自己和
+/// 下方内容分开；停靠视图有布局位置做区分，不需要盒子。
+fn render_plugin_dialog_view(
+    frame: &mut Frame,
+    view: &mut PluginViewState,
+    area: Rect,
+    focused: bool,
+) {
     let block = Block::bordered()
-        .title(format!(" {} ", view.declaration.title))
-        .border_style(Style::new().fg(border_color))
-        .padding(padding);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(COLOR_SEPARATOR))
+        .title(Span::styled(
+            format!(" {} ", view.declaration.title),
+            Style::new().fg(COLOR_TEXT).bold(),
+        ))
+        .padding(Padding::horizontal(1));
     let content_area = block.inner(area);
     view.area = content_area;
     let lines = view
@@ -177,7 +232,7 @@ pub(crate) fn render_plugin_dialog(frame: &mut Frame, app: &mut App, outer: Rect
         return;
     }
     frame.render_widget(Clear, area);
-    render_plugin_view(frame, &mut app.plugin_views[index], area, true);
+    render_plugin_dialog_view(frame, &mut app.plugin_views[index], area, true);
 }
 
 /// 以全屏内容替换主视图，并保留宿主统一的面包屑与返回交互。
@@ -195,9 +250,11 @@ pub(crate) fn render_plugin_subview(frame: &mut Frame, app: &mut App, outer: Rec
     let Some(active) = app.view_stack.active_mut() else {
         return;
     };
-    let block = Block::bordered()
-        .title(active.title.clone())
-        .border_style(Style::new().fg(COLOR_BORDER_FOCUS));
+    // 全屏子视图不再包一圈盒子：整屏边框只是噪声，面包屑已经说明了当前位置。
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .border_style(Style::new().fg(COLOR_SEPARATOR))
+        .padding(Padding::horizontal(1));
     active.area = block.inner(sections[1]);
     let lines = active
         .frame
@@ -276,7 +333,7 @@ pub(crate) fn render_composer_panels(frame: &mut Frame, app: &mut App, area: Rec
             .border_style(Style::new().fg(if focused {
                 COLOR_BORDER_FOCUS
             } else {
-                COLOR_MUTED
+                COLOR_SEPARATOR
             }))
             .padding(Padding::horizontal(1));
         app.plugin_views[index].area = block.inner(panel_area);
@@ -313,8 +370,10 @@ pub(crate) fn render_plugin_input(frame: &mut Frame, app: &mut App, workspace: R
         return;
     }
     let title = app.plugin_views[index].declaration.title.clone();
+    // 独占输入是需要用户决策的审批卡片，保留完整边框把它与主输入区分开；
+    // 圆角与主输入框一致，避免同一位置出现两种边框风格。
     let block = Block::bordered()
-        .border_type(BorderType::Plain)
+        .border_type(BorderType::Rounded)
         .title(Span::styled(
             format!(" {title} "),
             Style::new().fg(COLOR_TEXT).bold(),
