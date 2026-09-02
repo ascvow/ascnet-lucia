@@ -527,6 +527,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                             continue;
                         }
                     }
+                    // 诊断模式必须抢在命令面板与插件路由之前，才能看到原始上报组合。
+                    if app.key_inspect {
+                        app.handle_key(key.code, key.modifiers, agent.as_ref());
+                        continue;
+                    }
                     if is_copy_shortcut(key.code, key.modifiers) && app.copy_text_selection() {
                         continue;
                     }

@@ -638,7 +638,7 @@ fn mouse_text_selection_extracts_visible_buffer_for_explicit_copy() {
     assert_eq!(selection.extract(&buffer), "甲乙\ntext");
 }
 
-/// 复制快捷键必须兼容终端增强协议携带的 Shift 与大写字符，其他组合不得误触发。
+/// 复制快捷键必须兼容增强协议携带的 Shift、大写字符与 Cmd，无修饰时不得误触发。
 #[test]
 fn copy_shortcut_accepts_terminal_key_variants() {
     assert!(is_copy_shortcut(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -646,7 +646,10 @@ fn copy_shortcut_accepts_terminal_key_variants() {
         KeyCode::Char('C'),
         KeyModifiers::CONTROL | KeyModifiers::SHIFT
     ));
-    assert!(!is_copy_shortcut(KeyCode::Char('c'), KeyModifiers::SUPER));
+    // macOS 把 Command 上报为 Super；重映射修饰键后它就是用户实际按下的复制键。
+    assert!(is_copy_shortcut(KeyCode::Char('c'), KeyModifiers::SUPER));
+    assert!(!is_copy_shortcut(KeyCode::Char('c'), KeyModifiers::NONE));
+    assert!(!is_copy_shortcut(KeyCode::Char('c'), KeyModifiers::ALT));
 }
 
 /// 换行手势（Shift+Enter / Alt+Enter / Ctrl+J）插入换行，Home/End 使用行内语义。
@@ -944,4 +947,73 @@ fn jump_hint_click_is_inert_without_hint() {
 
     assert!(!app.handle_jump_hint_click(&click));
     assert_eq!(app.scroll, Some(5));
+}
+
+/// 命令修饰键必须同时接受 Control 与 Super，覆盖 macOS 重映射后的上报差异。
+#[test]
+fn command_modifier_accepts_control_and_super() {
+    assert!(is_command_modifier(KeyModifiers::CONTROL));
+    assert!(is_command_modifier(KeyModifiers::SUPER));
+    assert!(is_command_modifier(
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    ));
+    assert!(!is_command_modifier(KeyModifiers::ALT));
+    assert!(!is_command_modifier(KeyModifiers::NONE));
+}
+
+/// Cmd（Super）必须与 Ctrl 等价地触发复制与退出确认。
+#[test]
+fn super_modifier_drives_the_same_shortcuts_as_control() {
+    assert!(is_copy_shortcut(KeyCode::Char('c'), KeyModifiers::SUPER));
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "草稿".into();
+    app.cursor = app.input.len();
+
+    // Cmd+C 与 Ctrl+C 一样先清空草稿。
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::SUPER, None);
+    assert!(app.input.is_empty());
+    assert!(!app.should_quit);
+
+    // Cmd+U / Cmd+A 等行内编辑同样可用。
+    app.input = "abc".into();
+    app.cursor = app.input.len();
+    app.handle_key(KeyCode::Char('u'), KeyModifiers::SUPER, None);
+    assert!(app.input.is_empty());
+}
+
+/// 诊断模式回显实际上报的组合，并说明是否被识别为命令修饰键。
+#[test]
+fn key_inspection_reports_reported_modifiers() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.start_key_inspection();
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::ALT, None);
+
+    let last = app.messages.last().expect("诊断应回显按键").text.clone();
+    assert!(last.contains("alt + c"), "{last:?}");
+    assert!(last.contains("不是命令修饰键"), "{last:?}");
+    // 诊断期间按键不得改变输入内容。
+    assert!(app.input.is_empty());
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::SUPER, None);
+    let last = app.messages.last().expect("诊断应回显按键").text.clone();
+    assert!(last.contains("super + c"), "{last:?}");
+    assert!(last.contains("识别为命令修饰键"), "{last:?}");
+}
+
+/// Esc 退出诊断模式后按键恢复正常处理。
+#[test]
+fn key_inspection_exits_on_escape() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.start_key_inspection();
+
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, None);
+    assert!(!app.key_inspect);
+
+    app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE, None);
+    assert_eq!(app.input, "x");
 }

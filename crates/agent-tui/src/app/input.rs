@@ -1,7 +1,7 @@
 //! 主输入区的按键编辑、附件引用、滚动与文本选择。
 
 use super::App;
-use crate::app::{MouseTextSelection, ESC_DOUBLE_PRESS_WINDOW};
+use crate::app::{is_command_modifier, MouseTextSelection, ESC_DOUBLE_PRESS_WINDOW};
 use crate::session::attachment::{
     attachment_media_type, attachment_modality, copy_to_clipboard, pasted_file_path,
 };
@@ -22,6 +22,11 @@ impl App {
         modifiers: KeyModifiers,
         agent: Option<&Arc<Agent>>,
     ) {
+        // 诊断模式只回显不执行，让用户看到终端实际上报的组合。
+        if self.key_inspect {
+            self.report_inspected_key(code, modifiers);
+            return;
+        }
         if !matches!(code, KeyCode::Esc) {
             self.last_escape_at = None;
         }
@@ -32,7 +37,7 @@ impl App {
         }
         self.last_exit_request_at = None;
         // Ctrl+D 是终端约定的 EOF：空输入直接退出，有内容时按 readline 语义前向删除。
-        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('d')) {
+        if is_command_modifier(modifiers) && matches!(code, KeyCode::Char('d')) {
             if self.input.is_empty() && self.attachments.is_empty() {
                 self.should_quit = true;
             } else if let Some(next) = self.input[self.cursor..].chars().next() {
@@ -42,27 +47,27 @@ impl App {
             }
             return;
         }
-        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('y')) {
+        if is_command_modifier(modifiers) && matches!(code, KeyCode::Char('y')) {
             self.copy_last_assistant_message();
             return;
         }
-        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('t')) {
+        if is_command_modifier(modifiers) && matches!(code, KeyCode::Char('t')) {
             self.toggle_mouse_capture();
             return;
         }
-        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('r')) {
+        if is_command_modifier(modifiers) && matches!(code, KeyCode::Char('r')) {
             self.cycle_reasoning_level(agent);
             return;
         }
         // Ctrl+P/Ctrl+N 作为方向键历史回溯的兼容入口。
-        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('p')) {
+        if is_command_modifier(modifiers) && matches!(code, KeyCode::Char('p')) {
             // 仅空输入或已处于回溯态时生效，避免覆盖未发送的内容。
             if self.input.is_empty() || self.input_history_cursor.is_some() {
                 self.recall_older_input();
             }
             return;
         }
-        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('n')) {
+        if is_command_modifier(modifiers) && matches!(code, KeyCode::Char('n')) {
             if self.input_history_cursor.is_some() {
                 self.recall_newer_input();
             }
@@ -72,14 +77,14 @@ impl App {
         // Shift+Enter 依赖键盘增强协议；Alt+Enter 与 Ctrl+J 在传统终端也可用。
         if (matches!(code, KeyCode::Enter)
             && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
-            || (modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('j')))
+            || (is_command_modifier(modifiers) && matches!(code, KeyCode::Char('j')))
         {
             self.insert_input_text("\n");
             return;
         }
 
         match code {
-            KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('w') if is_command_modifier(modifiers) => {
                 let start = previous_word_boundary(&self.input, self.cursor);
                 if start < self.cursor {
                     self.input.replace_range(start..self.cursor, "");
@@ -88,13 +93,13 @@ impl App {
                 }
             }
             // readline 行内编辑：终端用户的肌肉记忆，缺失时只能靠退格逐字删。
-            KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('a') if is_command_modifier(modifiers) => {
                 self.cursor = self.current_line_start();
             }
-            KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('e') if is_command_modifier(modifiers) => {
                 self.cursor = self.current_line_end();
             }
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('u') if is_command_modifier(modifiers) => {
                 let start = self.current_line_start();
                 if start < self.cursor {
                     self.input.replace_range(start..self.cursor, "");
@@ -102,24 +107,28 @@ impl App {
                     self.finish_input_edit();
                 }
             }
-            KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('k') if is_command_modifier(modifiers) => {
                 let end = self.current_line_end();
                 if end > self.cursor {
                     self.input.replace_range(self.cursor..end, "");
                     self.finish_input_edit();
                 }
             }
-            KeyCode::Home if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Home if is_command_modifier(modifiers) => {
                 self.scroll_up(u16::MAX);
             }
-            KeyCode::End if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::End if is_command_modifier(modifiers) => {
                 self.scroll = None;
             }
             // Alt 与 Ctrl 都映射为按词移动：不同终端对这两个修饰键的上报并不一致。
-            KeyCode::Left if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+            KeyCode::Left
+                if modifiers.contains(KeyModifiers::ALT) || is_command_modifier(modifiers) =>
+            {
                 self.cursor = previous_word_boundary(&self.input, self.cursor);
             }
-            KeyCode::Right if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+            KeyCode::Right
+                if modifiers.contains(KeyModifiers::ALT) || is_command_modifier(modifiers) =>
+            {
                 self.cursor = next_word_boundary(&self.input, self.cursor);
             }
             KeyCode::Enter => {
@@ -235,6 +244,48 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// 进入按键诊断模式。
+    ///
+    /// 修饰键被系统重映射（macOS 常见的 Control/Option/Command 互换）后，同一个物理
+    /// 键到达终端时可能变成另一个修饰键。诊断模式直接回显实际收到的组合，用来确认
+    /// 快捷键失效是重映射导致还是应用本身没有绑定。
+    pub(crate) fn start_key_inspection(&mut self) {
+        self.key_inspect = true;
+        self.messages.push(Msg::new(
+            MsgKind::Info,
+            "按键诊断已开启：逐个按下要检查的组合，界面会显示终端实际上报的键名与修饰键。按 Esc 退出。",
+        ));
+    }
+
+    /// 回显一次被诊断模式捕获的按键；`Esc` 退出诊断。
+    fn report_inspected_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        if matches!(code, KeyCode::Esc) && modifiers.is_empty() {
+            self.key_inspect = false;
+            self.messages
+                .push(Msg::new(MsgKind::Info, "按键诊断已关闭。"));
+            return;
+        }
+        let key = crate::bus::plugin_key_code(code);
+        let names = crate::bus::plugin_key_modifiers(modifiers);
+        let combination = if names.is_empty() {
+            key
+        } else {
+            format!("{} + {key}", names.join(" + "))
+        };
+        // 同时说明该组合是否会被识别为命令修饰键，直接回答"我的快捷键为什么不生效"。
+        let recognized = if super::is_command_modifier(modifiers) {
+            "识别为命令修饰键"
+        } else if modifiers.is_empty() {
+            "无修饰键"
+        } else {
+            "不是命令修饰键，快捷键不会触发"
+        };
+        self.messages.push(Msg::new(
+            MsgKind::Info,
+            format!("按键：{combination} · {recognized}"),
+        ));
     }
 
     /// 返回光标所在逻辑行的起始字节位置。

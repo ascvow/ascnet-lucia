@@ -38,9 +38,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// 判断修饰键组合是否构成 Lucia 的"命令修饰键"。
+///
+/// 同时接受 `Control` 与 `Super`（macOS 的 Command、部分 Linux 桌面的 Meta）。
+/// macOS 用户常把 Control、Option 与 Command 互换以贴近 Windows 手感，终端随之把
+/// 同一个物理键上报成不同修饰键；只认 `Control` 会让全部快捷键在这些配置下失效。
+/// 两者语义不冲突，因此一并接受而不是要求用户改回系统设置。
+pub(crate) fn is_command_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+}
+
 /// 判断终端按键是否表示复制快捷键；兼容增强键盘协议返回的大写字符和附加 Shift。
 pub(crate) fn is_copy_shortcut(code: KeyCode, modifiers: KeyModifiers) -> bool {
-    modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'C'))
+    is_command_modifier(modifiers) && matches!(code, KeyCode::Char('c' | 'C'))
 }
 
 /// 主输入区识别连续两次 Esc 的最长间隔，避免单次误触清空草稿。
@@ -169,6 +179,8 @@ pub(crate) struct App {
     pub(crate) last_max_scroll: u16,
     /// 最近一次渲染得到的消息区高度，用于整页滚动。
     pub(crate) last_viewport: u16,
+    /// 是否处于按键诊断模式；开启后按键只回显不执行，`Esc` 退出。
+    pub(crate) key_inspect: bool,
     /// 最近一帧"回到底部"提示所占的区域；未展示时为 `None`。
     ///
     /// 提示同时是可点击热区：手动翻阅后用鼠标即可回到底部，不必记快捷键。
@@ -407,6 +419,7 @@ impl App {
             scroll: None,
             last_max_scroll: 0,
             last_viewport: 0,
+            key_inspect: false,
             jump_hint_area: None,
             tool_message_hit_regions: Vec::new(),
             tool_click_candidate: None,

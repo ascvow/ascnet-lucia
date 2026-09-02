@@ -105,6 +105,13 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
         idle_only: true,
     },
     NativeCommandSpec {
+        name: "keys",
+        aliases: &["key"],
+        summary: "查看终端上报的按键",
+        description: "进入按键诊断：逐条显示终端实际上报的键名与修饰键，按 Esc 退出。修饰键被系统重映射时用它确认实际到达的组合。",
+        idle_only: false,
+    },
+    NativeCommandSpec {
         name: "help",
         aliases: &[],
         summary: "查看命令帮助",
@@ -557,6 +564,7 @@ impl App {
             }
             "compact" => self.execute_native_compact(),
             "reasoning" => self.execute_reasoning_command(parts.next(), agent),
+            "keys" => self.start_key_inspection(),
             "exit" => self.should_quit = true,
             _ => unreachable!("原生命令表与执行路由必须同步"),
         }

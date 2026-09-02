@@ -47,6 +47,7 @@ fn native_registry_contains_default_commands() {
             "clear",
             "reasoning",
             "plugins",
+            "keys",
             "help",
             "exit"
         ]
@@ -61,6 +62,7 @@ fn native_registry_contains_default_commands() {
             "compact",
             "clear",
             "reasoning",
+            "keys",
             "help",
             "exit"
         ]

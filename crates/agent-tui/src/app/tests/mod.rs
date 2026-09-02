@@ -3,8 +3,8 @@
 //! Lucia TUI 状态、输入、渲染和会话协调回归测试。
 
 use crate::app::{
-    input_ref_spans, is_copy_shortcut, App, ChannelEventSink, MouseTextSelection,
-    ESC_DOUBLE_PRESS_WINDOW, EXIT_CONFIRM_WINDOW,
+    input_ref_spans, is_command_modifier, is_copy_shortcut, App, ChannelEventSink,
+    MouseTextSelection, ESC_DOUBLE_PRESS_WINDOW, EXIT_CONFIRM_WINDOW,
 };
 
 #[cfg(feature = "plugins")]
