@@ -1,15 +1,15 @@
 //! 插件 manifest 合并与容错启动。
 
 use crate::event::UiEvent;
+use crate::plugin::sessions::TuiPluginSessionSource;
 use agent_plugin_host::manifest::PluginManifest;
 use agent_plugin_host::wasm::load_wasm_plugins_progressively_with_selection_and_services;
-use crate::plugin::sessions::TuiPluginSessionSource;
 use agent_plugin_host::{LivePluginHost, PluginHostServices};
-use agent_session::SessionStore;
 use agent_runtime::{
     AgentDeriveConfig, AgentPermissions, AgentProfileId, AgentRuntime, AgentTemplate,
     RuntimeLimits, ToolAccess,
 };
+use agent_session::SessionStore;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -249,6 +249,7 @@ pub(crate) async fn load_plugins_for_tui(
     agent_template: AgentTemplate,
     execution: PluginExecutionContext,
     workspace_scope: String,
+    workspace_root: PathBuf,
     session_store: Arc<dyn SessionStore>,
     live_host: Arc<LivePluginHost>,
     tx: mpsc::UnboundedSender<UiEvent>,
@@ -271,6 +272,7 @@ pub(crate) async fn load_plugins_for_tui(
     // 插件模型调用与主 Agent 使用相同的流式开关：部分代理会强制断开
     // 长时间无数据的非流式连接，摘要这类长请求必须跟随配置的传输方式。
     let model_stream = agent_template.options().stream;
+    let workspace_root = workspace_root.to_string_lossy().into_owned();
     let controller_profile =
         AgentProfileId::new("tui-controller").context("创建 TUI controller profile 失败")?;
     runtime
@@ -285,7 +287,14 @@ pub(crate) async fn load_plugins_for_tui(
     let mut host_services = PluginHostServices::new().restrict_execution_policy(&execution_policy);
     host_services = host_services.with_activation_metadata(
         "permission",
-        HashMap::from([("workspace_scope".to_string(), workspace_scope.clone())]),
+        HashMap::from([
+            ("workspace_scope".to_string(), workspace_scope.clone()),
+            ("workspace_root".to_string(), workspace_root.clone()),
+        ]),
+    )?;
+    host_services = host_services.with_activation_metadata(
+        "teammate",
+        HashMap::from([("workspace_root".to_string(), workspace_root)]),
     )?;
     // 插件持久存储按项目隔离，作用域由宿主注入，不经过 manifest 或 Guest。
     host_services = host_services.with_workspace_scope(workspace_scope)?;

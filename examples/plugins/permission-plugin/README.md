@@ -4,9 +4,9 @@
 
 - `Control` 只表示 Lucia 内部控制面操作，直接放行；权限插件不维护官方工具名白名单。
 - `Read`、`Write`、`Shell`、`Network` 和旧插件默认的 `Unknown` 进入当前审批模式。
-- `Read`、`Write` 调用携带 `path` 时只允许工作区内普通相对路径；`.env`、私钥、凭据目录和 `.git` 内容始终拒绝。
+- `Read`、`Write` 调用携带 `path` 时允许工作区内普通相对路径，以及 Host 注入根目录下的绝对路径；工作区外绝对路径、父目录穿越、`.env`、私钥、凭据目录和 `.git` 内容始终拒绝，最终规范化与符号链接边界仍由 Host `WorkspaceGuard` 检查。
 - 默认使用“帮我审批”。`/permission` 打开权限模式选择，可切换“手动审批、帮我审批、全部放行”；也支持 `/permission manual`、`/permission assist`、`/permission allow-all`。TUI 按项目摘要隔离并跨重启保存模式，写入失败不会改变当前模式，当前值常驻显示在底栏。
-- “帮我审批”直接在工具前置链中通过 Host 固定的无工具小模型路由审核有界脱敏参数，不依赖 TUI 渲染；写入与网络正文只保留规模，URL 去除 userinfo、查询参数和 fragment，带凭据 URL 的 Shell 命令整体隐藏。只接受 `{"decision":"allow"}` 或带非空字符串 `reason` 的 `{"decision":"deny",...}`；纯文本、重复字段、`null` 和额外字段都视为无效结论。允许时执行；拒绝、调用失败或响应无效时只阻止当前工具，不取消 Agent。
+- “帮我审批”直接在工具前置链中通过 Host 固定的无工具小模型路由审核当前工具的直接副作用，不依赖 TUI 渲染；写入与网络正文只保留规模，Unknown 工具的 `input`、`prompt`、`instruction`、`task`、`message` 等不透明任务正文同样只保留规模，避免把子 Agent 后续目标误判为当前调用已直接访问资源。URL 去除 userinfo、查询参数和 fragment，带凭据 URL 的 Shell 命令整体隐藏。只接受 `{"decision":"allow"}` 或带非空字符串 `reason` 的 `{"decision":"deny",...}`；纯文本、重复字段、`null` 和额外字段都视为无效结论。允许时执行；拒绝、调用失败或响应无效时只阻止当前工具，不取消 Agent。
 - 详细失败原因只进入工具事件和界面；下一次模型请求只接收按可信 scope 生成的行动建议，不包含审核模型的自由文本原因，也不写入 Session。
 - 插件不申请文件、进程、HTTP、secret 或 Agent Runtime 能力；模型代审仅申请受控 `model_completion`，命令面板只获准 `set_input`，不能清空会话或退出应用。
 

@@ -5,19 +5,23 @@
 
 use agent_plugin::{
     export_plugin, ActivationContext, AgentHandle, AgentId, AgentOutcome, AgentPlugin,
-    AgentSpawnRequest, AgentStatus, AgentViewSession, ExtensionEvent, PluginHostApi,
-    Result, ServiceCall, ServiceSpec, ToolCall, ToolPermissionScope,
-    ToolResult, ToolSpec, UiColor, UiCursor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
-    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
-    UiViewInstance,
+    AgentSpawnRequest, AgentStatus, AgentViewSession, ExtensionEvent, PluginHostApi, Result,
+    ServiceCall, ServiceSpec, ToolCall, ToolPermissionScope, ToolResult, ToolSpec, UiColor,
+    UiCursor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
+    UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::{Path, PathBuf},
+};
 
 /// Host 注册并由 manifest 授权的唯一派生策略。
 const WORKER_PROFILE: &str = "worker";
+/// Host 注入的规范化工作区根目录元数据键。
+const WORKSPACE_ROOT_METADATA: &str = "workspace_root";
 /// 对其他插件公开的版本化邮箱服务。
 const TEAMMATE_SERVICE: &str = "teammate.mailbox";
 /// 当前邮箱服务协议版本。
@@ -426,6 +430,8 @@ fn default_inbox_limit() -> usize {
 #[derive(Default)]
 struct TeammatePlugin {
     plugin_id: Option<String>,
+    /// Host 注入的规范化工作区根目录，仅用于把派生任务中的绝对路径改写为相对路径。
+    workspace_root: Option<PathBuf>,
     state: TeamState,
     selected_member: usize,
     navigation_sequence: u64,
@@ -463,7 +469,8 @@ impl TeammatePlugin {
         } else {
             "teammate 成员"
         };
-        let agent_input = format!("你是{identity}，角色为 `{role}`。请完成以下任务。\n\n{input}");
+        let agent_input =
+            worker_agent_input(identity, &role, &input, self.workspace_root.as_deref());
         let handle = host.spawn_agent(&AgentSpawnRequest::new(WORKER_PROFILE, agent_input))?;
         let member = self
             .state
@@ -1077,8 +1084,9 @@ impl TeammatePlugin {
 }
 
 impl AgentPlugin for TeammatePlugin {
-    /// 保存可信插件 ID、注册协作提示并提供版本化 mailbox service。
+    /// 保存可信插件 ID 与工作区根目录，并提供版本化 mailbox service。
     fn activate(&mut self, host: &dyn PluginHostApi, context: ActivationContext) -> Result<()> {
+        self.workspace_root = activation_workspace_root(&context);
         self.plugin_id = Some(context.plugin_id);
         host.upsert_service(&ServiceSpec {
             name: TEAMMATE_SERVICE.into(),
@@ -1092,6 +1100,7 @@ impl AgentPlugin for TeammatePlugin {
     fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
         host.remove_service(TEAMMATE_SERVICE)?;
         self.plugin_id = None;
+        self.workspace_root = None;
         self.state = TeamState::default();
         self.member_sessions.clear();
         Ok(())
@@ -1413,6 +1422,66 @@ fn validated_text(value: String, field: &str, max_bytes: usize) -> Result<String
     Ok(value)
 }
 
+/// 从 Host 激活元数据读取规范化工作区根；缺失或非绝对值保持兼容的无根目录模式。
+fn activation_workspace_root(context: &ActivationContext) -> Option<PathBuf> {
+    let root = PathBuf::from(context.metadata.get(WORKSPACE_ROOT_METADATA)?);
+    if !root.is_absolute()
+        || root
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    Some(root)
+}
+
+/// 构造派生成员的完整启动输入，并明确文件工具只能接收工作区相对路径。
+fn worker_agent_input(
+    identity: &str,
+    role: &str,
+    input: &str,
+    workspace_root: Option<&Path>,
+) -> String {
+    let input = workspace_relative_task_input(input, workspace_root);
+    format!(
+        "你是{identity}，角色为 `{role}`。请完成以下任务。使用文件类工具时必须传入工作区相对路径；任务文本中的工作区绝对路径应先转换为相对路径，不要直接传给工具。\n\n{input}"
+    )
+}
+
+/// 把任务正文中指向当前工作区的绝对路径前缀改写为 `.`，其他路径和文本保持原样。
+fn workspace_relative_task_input(input: &str, workspace_root: Option<&Path>) -> String {
+    let Some(root) = workspace_root.and_then(Path::to_str) else {
+        return input.to_string();
+    };
+    let root = root.trim_end_matches(std::path::MAIN_SEPARATOR);
+    if root.is_empty() {
+        return input.to_string();
+    }
+
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(offset) = input[cursor..].find(root) {
+        let start = cursor + offset;
+        let end = start + root.len();
+        let starts_path = start == 0
+            || input[..start].chars().next_back().is_some_and(|character| {
+                !character.is_ascii_alphanumeric()
+                    && !matches!(character, '/' | '\\' | '.' | '_' | '-')
+            });
+        let follows_path_boundary =
+            end == input.len() || input[end..].starts_with(std::path::MAIN_SEPARATOR);
+        output.push_str(&input[cursor..start]);
+        if starts_path && follows_path_boundary {
+            output.push('.');
+        } else {
+            output.push_str(root);
+        }
+        cursor = end;
+    }
+    output.push_str(&input[cursor..]);
+    output
+}
+
 /// 校验可路由且适合日志展示的消息主题。
 fn validate_topic(topic: &str) -> Result<()> {
     let valid = !topic.is_empty()
@@ -1461,7 +1530,7 @@ fn teammate_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
             "teammate_spawn",
-            "任务可拆分为两个或更多相互独立的子任务、需要并行调研或独立审查时，用受限 worker profile 创建带角色的 teammate，并提供完整可执行的任务输入。可将独立成员指定为唯一队长，主 Agent 不能作为队长；立即返回成员地址，不等待任务完成，完成后用 teammate_result 取回结果。顺序依赖强或拆分成本高的任务不要创建 teammate。",
+            "用于复杂项目中两个或更多相互独立、互不阻塞且适合并行推进的子任务，或确实需要与主任务解耦的独立审查。只有并行收益明显高于协调成本时，才用受限 worker profile 创建带角色的 teammate，并提供完整可执行的任务输入。普通单点需求、单一路径代码审查、强顺序依赖任务，以及当前 Agent 可连续完成的工作通常不需要 teammate。可将独立成员指定为唯一队长；调用立即返回成员地址，完成后用 teammate_result 取回结果。",
             json!({
                 "type": "object",
                 "properties": {
@@ -1572,6 +1641,40 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    /// 派生工具描述必须要求真实并行收益，普通单点任务不能仅因工具可用而派生成员。
+    #[test]
+    fn teammate_spawn_description_requires_parallel_value() {
+        let description = teammate_tools()
+            .into_iter()
+            .find(|tool| tool.name == "teammate_spawn")
+            .expect("应暴露 teammate_spawn")
+            .description;
+
+        assert!(description.contains("复杂项目"));
+        assert!(description.contains("互不阻塞"));
+        assert!(description.contains("并行收益明显高于协调成本"));
+        assert!(description.contains("普通单点需求"));
+        assert!(description.contains("当前 Agent 可连续完成"));
+    }
+
+    /// 派生成员输入必须把当前工作区绝对路径转换为相对路径，并保留外部路径原文。
+    #[test]
+    fn worker_input_uses_workspace_relative_paths() {
+        let root = Path::new("/workspace/project");
+        let input = worker_agent_input(
+            "teammate 成员",
+            "审查员",
+            "检查 /workspace/project/src/lib.rs，并对照 /workspace/project-other/README.md 与 /tmp/workspace/project/src/main.rs",
+            Some(root),
+        );
+
+        assert!(input.contains("文件类工具时必须传入工作区相对路径"));
+        assert!(input.contains("检查 ./src/lib.rs"));
+        assert!(input.contains("/workspace/project-other/README.md"));
+        assert!(input.contains("/tmp/workspace/project/src/main.rs"));
+        assert!(!input.contains("/workspace/project/src/lib.rs"));
     }
 
     /// 构造纯状态测试使用的 Agent 句柄。

@@ -2,10 +2,9 @@
 
 use agent_plugin::{
     core_events, export_plugin, ActivationContext, AgentPlugin, EventOutcome, PluginEvent,
-    PluginHostApi, Result, RunFinishEventData, ToolCall, ToolPermissionScope,
-    ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
-    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
-    UiViewInstance,
+    PluginHostApi, Result, RunFinishEventData, ToolCall, ToolPermissionScope, ToolResult, ToolSpec,
+    UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
+    UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -424,7 +423,7 @@ impl PlanPlugin {
 fn update_plan_tool() -> ToolSpec {
     ToolSpec::new(
         UPDATE_PLAN_TOOL,
-        "创建或更新当前任务计划。多步骤、耗时较长或需要向用户呈现进度的任务开始时设置步骤，执行中及时把完成的步骤标记为 completed；始终提交完整计划，且最多一个步骤为 in_progress。一步问答或无需追踪的任务不要创建计划。",
+        "创建或更新当前任务计划。用于复杂项目、跨模块改动、需要多个可独立验证阶段的任务，或用户明确要求持续展示进度的场景。直接问答、初步探索、窄范围修改，以及一次连续执行即可完成的任务通常不需要计划。使用后应及时更新 completed 状态；始终提交完整计划，且最多一个步骤为 in_progress。",
         json!({
             "type": "object",
             "properties": {
@@ -540,6 +539,19 @@ mod tests {
         assert!(tools
             .iter()
             .all(|tool| tool.permission_scope == ToolPermissionScope::Control));
+    }
+
+    /// 工具描述必须把计划限定为复杂或真正需要持续追踪的多阶段任务。
+    #[test]
+    fn update_plan_description_requires_real_task_complexity() {
+        let description = update_plan_tool().description;
+
+        assert!(description.contains("复杂项目"));
+        assert!(description.contains("跨模块改动"));
+        assert!(description.contains("多个可独立验证阶段"));
+        assert!(description.contains("用户明确要求持续展示进度"));
+        assert!(description.contains("直接问答"));
+        assert!(description.contains("一次连续执行即可完成"));
     }
 
     /// 创建测试计划项，减少状态校验用例中的重复结构。

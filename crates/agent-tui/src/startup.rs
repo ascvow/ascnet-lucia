@@ -125,6 +125,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let workspace = WorkspaceContext::capture()?;
     #[cfg(feature = "plugins")]
     let plugin_workspace_scope = workspace.project_id.clone();
+    #[cfg(feature = "plugins")]
+    let plugin_workspace_root = workspace.cwd.clone();
     let config_path = resolve_config_path(args.config.as_deref())?;
     if args.init {
         initialize_config(&config_path)?;
@@ -503,6 +505,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 plugin_agent_template,
                 plugin_execution,
                 plugin_workspace_scope,
+                plugin_workspace_root,
                 plugin_session_store,
                 load_host,
                 load_tx.clone(),

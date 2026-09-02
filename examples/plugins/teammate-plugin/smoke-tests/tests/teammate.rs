@@ -95,14 +95,17 @@ async fn component_runs_mailbox_dispatch_flow() {
     let prompts = AgentExtension::prompt_messages(&host)
         .await
         .expect("Teammate 协作提示应可读取");
-    assert!(prompts
-        .iter()
-        .any(|prompt| prompt.text_content().contains("teammate_spawn")));
+    assert!(prompts.is_empty(), "Teammate 不应注入常驻提示");
 
     let tools = AgentExtension::list_tools(&host)
         .await
         .expect("插件工具应可读取");
     assert_eq!(tools.len(), 10);
+    let spawn = tools
+        .iter()
+        .find(|tool| tool.name == "teammate_spawn")
+        .expect("应暴露 teammate_spawn");
+    assert!(spawn.description.contains("并行收益明显高于协调成本"));
     let declarations = PluginHost::ui_declarations(&host)
         .await
         .expect("团队 UI 声明应可读取");
