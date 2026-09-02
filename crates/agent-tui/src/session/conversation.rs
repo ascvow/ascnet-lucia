@@ -215,8 +215,8 @@ impl Msg {
     /// 返回展开当前工具消息是否真的能多看到内容。
     ///
     /// 判定基准是**收起态**的行数上限：只有默认视图确实藏起了内容，展开才有意义。
-    /// 结果本来就短于上限时既不显示三角标记，也不注册点击热区——否则会出现一个
-    /// 点了什么都不变、却把标记从 `▸` 翻成 `▾` 的假交互。
+    /// 结果本来就短于上限时既不显示操作提示，也不注册点击热区，避免出现点击后
+    /// 内容毫无变化的假交互。
     pub(crate) fn is_tool_expandable(&self) -> bool {
         if !self.is_tool() || self.skip_reason.is_some() {
             return false;
@@ -314,8 +314,8 @@ impl Msg {
         }
     }
 
-    /// 构造工具调用块：紧凑态显示 `▸ ● 名称(目标)` 与结果摘要，展开态显示
-    /// `▾` 和有界详情；圆点以状态色区分，diff 行整行铺背景色。
+    /// 构造工具调用块：标题显示 `● 名称(目标)` 与结果摘要，可展开结果在详情底部
+    /// 显示展开或收起提示；圆点以状态色区分，diff 行整行铺背景色。
     ///
     /// 摘要与预览行按 `width` 显示宽度截断，避免窄终端下自动换行
     /// 把续行顶到行首、破坏缩进对齐。
@@ -348,20 +348,14 @@ impl Msg {
                     .style(line.style)
                 })
                 .collect::<Vec<_>>();
-            if expandable {
-                lines[0].spans.insert(
-                    0,
-                    Span::styled(
-                        if self.tool_expanded { "▾ " } else { "▸ " },
-                        Style::new().fg(COLOR_MUTED),
-                    ),
-                );
-            }
             if omitted > 0 {
                 lines.push(Line::from(Span::styled(
                     format!("  … +{omitted} 行"),
                     Style::new().fg(COLOR_MUTED),
                 )));
+            }
+            if expandable {
+                lines.push(tool_toggle_hint(self.tool_expanded, width));
             }
             return lines;
         }
@@ -372,7 +366,7 @@ impl Msg {
         let call = self.tool_call.as_ref();
         let target = call.and_then(tool_target);
 
-        // 有结果就直接展示：先按当前上限构造详情，再据此决定是否需要展开标记。
+        // 有结果就直接展示：先按当前上限构造详情，再据此决定是否需要操作提示。
         let limit = if self.tool_expanded {
             TOOL_RESULT_DETAIL_LINES
         } else {
@@ -393,12 +387,6 @@ impl Msg {
             }
         };
         let mut first = Vec::new();
-        if self.is_tool_expandable() {
-            first.push(Span::styled(
-                if self.tool_expanded { "▾ " } else { "▸ " },
-                Style::new().fg(COLOR_MUTED),
-            ));
-        }
         first.push(Span::styled("● ", Style::new().fg(color)));
         first.extend(tool_title_spans(&self.text, target.as_deref()));
         if !note.is_empty() {
@@ -434,14 +422,34 @@ impl Msg {
             ]));
         }
         lines.extend(render_preview(&preview, width, language, is_error));
+        if self.is_tool_expandable() {
+            lines.push(tool_toggle_hint(self.tool_expanded, width));
+        }
         lines
     }
+}
+
+/// 构造可展开工具结果末尾的操作提示。
+///
+/// `expanded` 决定提示用户展开还是收起，`width` 用于限制窄终端中的文本宽度；
+/// 返回的独立行使用弱化颜色，不产生外部副作用。
+fn tool_toggle_hint(expanded: bool, width: u16) -> Line<'static> {
+    let text = if expanded {
+        "Click to collapse"
+    } else {
+        "Click to expand"
+    };
+    let available = usize::from(width).saturating_sub(4).max(1);
+    Line::from(vec![
+        Span::raw("    "),
+        Span::styled(truncate_line(text, available), Style::new().fg(COLOR_MUTED)),
+    ])
 }
 
 /// 工具消息默认展示的详情行数。
 ///
 /// 有结果就直接展示，不必先点开——但必须有上限，否则一次 `read_file` 会把整屏刷满、
-/// 把上下文冲掉。超出部分折叠为 `… +N 行`，点击标题展开到
+/// 把上下文冲掉。超出部分折叠为 `… +N 行`，点击工具消息展开到
 /// [`TOOL_RESULT_DETAIL_LINES`]。
 pub(crate) const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 

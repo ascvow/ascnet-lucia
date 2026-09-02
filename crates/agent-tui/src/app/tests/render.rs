@@ -216,16 +216,16 @@ fn tool_lines_show_args_and_truncated_result() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // 有结果就默认展示详情；内容未超过预览上限时不出现展开标记。
+    // 有结果就默认展示详情；内容未超过预览上限时不出现展开提示。
     assert!(collapsed.contains("● Read(src/main.rs)"), "{collapsed:?}");
-    assert!(!collapsed.contains("▸ "), "{collapsed:?}");
+    assert!(!collapsed.contains("Click to expand"), "{collapsed:?}");
     assert!(
         collapsed.contains("└ 读取 1 行，来自 src/main.rs"),
         "{collapsed:?}"
     );
     assert!(collapsed.contains("1 很长的文件内容"), "{collapsed:?}");
 
-    // 内容没有被藏起来，因此不可展开：既没有三角标记，点击也不该改变任何东西。
+    // 内容没有被藏起来，因此不可展开：既没有操作提示，点击也不该改变任何东西。
     assert!(!msg.is_tool_expandable());
 }
 
@@ -248,9 +248,11 @@ fn running_tool_lines_show_latest_output() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
     // 默认展示最新若干行；超出上限的部分折叠并提示可展开。
-    assert!(collapsed.contains("▸ ● Shell"), "{collapsed:?}");
+    assert!(collapsed.contains("● Shell"), "{collapsed:?}");
+    assert!(!collapsed.contains('▸'), "{collapsed:?}");
     assert!(collapsed.contains("编译进度 48"), "{collapsed:?}");
     assert!(collapsed.contains("… +40 行"), "{collapsed:?}");
+    assert!(collapsed.contains("Click to expand"), "{collapsed:?}");
     assert!(!collapsed.contains("编译进度 20"), "{collapsed:?}");
 
     msg.tool_expanded = true;
@@ -262,7 +264,9 @@ fn running_tool_lines_show_latest_output() {
         .collect::<String>();
 
     // 展开详情只保留最新 40 行，被折叠的行数以 `… +N 行` 标注。
+    assert!(!text.contains('▾'), "{text:?}");
     assert!(text.contains("… +8 行"), "{text:?}");
+    assert!(text.contains("Click to collapse"), "{text:?}");
     assert!(!text.contains("编译进度 1\n"), "{text:?}");
     assert!(text.contains("编译进度 48"), "{text:?}");
 }
@@ -385,6 +389,10 @@ fn clicking_tool_message_toggles_expanded_details() {
         .collect::<String>();
     assert!(
         expanded_text.contains("details-visible"),
+        "{expanded_text:?}"
+    );
+    assert!(
+        expanded_text.contains("Click to collapse"),
         "{expanded_text:?}"
     );
 
@@ -662,7 +670,7 @@ fn short_tool_message_is_neither_marked_nor_clickable() {
         .collect::<String>();
 
     assert!(!app.messages[0].is_tool_expandable());
-    assert!(!screen.contains('▸'), "{screen}");
+    assert!(!screen.contains("Click to expand"), "{screen}");
     assert!(
         app.tool_message_hit_regions.is_empty(),
         "短结果不应注册热区"

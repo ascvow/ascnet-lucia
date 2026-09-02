@@ -420,8 +420,7 @@ fn rendered_text(message: &Msg) -> String {
 
 /// 详情未超过上限的 renderer 帧全部直接展示，且不可展开。
 ///
-/// 这类消息不应出现三角标记，也不应注册点击热区——否则点一下只会把 `▸` 翻成 `▾`，
-/// 内容却毫无变化。
+/// 这类消息不应出现操作提示，也不应注册点击热区，避免点击后内容毫无变化。
 #[test]
 #[cfg(feature = "plugins")]
 fn short_tool_renderer_is_not_expandable() {
@@ -430,13 +429,13 @@ fn short_tool_renderer_is_not_expandable() {
     let text = rendered_text(&message);
     assert!(text.contains("自定义摘要"), "{text:?}");
     assert!(text.contains("自定义详情 2"), "{text:?}");
-    assert!(!text.contains('▸'), "{text:?}");
+    assert!(!text.contains("Click to expand"), "{text:?}");
     assert!(!message.is_tool_expandable());
 
-    // 即使外部错误地置位展开标志，也不得凭空出现展开标记。
+    // 即使外部错误地置位展开标志，也不得凭空出现收起提示。
     message.tool_expanded = true;
     let text = rendered_text(&message);
-    assert!(!text.contains('▾'), "{text:?}");
+    assert!(!text.contains("Click to collapse"), "{text:?}");
 }
 
 /// 超过上限的 renderer 帧默认折叠尾部，展开后展示更多详情行。
@@ -447,15 +446,19 @@ fn long_tool_renderer_supports_collapsed_details() {
     assert!(message.is_tool_expandable());
 
     let collapsed = rendered_text(&message);
-    assert!(collapsed.contains("▸ 自定义摘要"), "{collapsed:?}");
+    assert!(collapsed.contains("自定义摘要"), "{collapsed:?}");
+    assert!(!collapsed.contains('▸'), "{collapsed:?}");
     assert!(collapsed.contains("自定义详情 8"), "{collapsed:?}");
     assert!(!collapsed.contains("自定义详情 12"), "{collapsed:?}");
     assert!(collapsed.contains("… +4 行"), "{collapsed:?}");
+    assert!(collapsed.contains("Click to expand"), "{collapsed:?}");
 
     message.tool_expanded = true;
     let expanded = rendered_text(&message);
-    assert!(expanded.contains("▾ 自定义摘要"), "{expanded:?}");
+    assert!(expanded.contains("自定义摘要"), "{expanded:?}");
+    assert!(!expanded.contains('▾'), "{expanded:?}");
     assert!(expanded.contains("自定义详情 12"), "{expanded:?}");
+    assert!(expanded.contains("Click to collapse"), "{expanded:?}");
 }
 
 /// 晚到的旧 revision 不得覆盖较新的工具消息帧。
