@@ -1,10 +1,10 @@
 [package]
 name = "knowledge-plugin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["ascvow"]
 license = "MIT"
-description = "把历史对话蒸馏为可检索知识库，并按索引回溯对话原文的 WASM 插件。"
+description = "把历史会话按用户轮次建立词法索引，并按消息区间回溯原文的 WASM 插件。"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

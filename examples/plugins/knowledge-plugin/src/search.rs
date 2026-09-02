@@ -1,9 +1,8 @@
-//! 知识库的本地词法检索。
+//! 历史会话片段的本地词法检索。
 //!
 //! 这里刻意**不用向量检索**。语料是用户自己的对话记录：查询词与正文里是同一批标识符、
-//! 文件路径、报错串和命令名，正是精确词匹配最强、而稠密向量最弱的场合。而向量本该提供
-//! 的语义归一化，已经由索引期模型写摘要完成了——那一步做一次、可审查，比一个不透明的
-//! 向量空间更适合这个规模的语料。
+//! 文件路径、报错串和命令名，正是精确词匹配最强的场合。插件同时索引会话标题、用户请求、
+//! 最后助手回复、工具名和有界原文证据，以可审查的字段组合补足单一正文的召回范围。
 //!
 //! 何况当前平台也不具备条件：宿主没有嵌入接口，插件单次调用只有 5000 万 fuel、
 //! 64 MiB 线性内存，在 WASM 里跑嵌入模型不可行。
@@ -103,7 +102,7 @@ fn count_occurrences(haystack: &str, needle: &str) -> u32 {
 
 /// 在文档集合上执行两段式检索。
 ///
-/// `documents` 是每条知识条目拼接后的可检索文本，必须已经小写化 ASCII 部分——
+/// `documents` 是每个历史片段拼接后的可检索文本，必须已经小写化 ASCII 部分——
 /// 调用方用 [`searchable_text`] 构造即可。返回按得分降序、至多 `limit` 条的命中。
 pub fn search(documents: &[String], query: &str, limit: usize) -> Vec<SearchHit> {
     let terms = dedup(tokenize(query));
@@ -147,7 +146,8 @@ pub fn search(documents: &[String], query: &str, limit: usize) -> Vec<SearchHit>
         .into_iter()
         .map(|(index, counts)| {
             let length = documents[index].chars().count() as f64;
-            let normalization = BM25_K1 * (1.0 - BM25_B + BM25_B * length / average_length.max(1.0));
+            let normalization =
+                BM25_K1 * (1.0 - BM25_B + BM25_B * length / average_length.max(1.0));
             let score = terms
                 .iter()
                 .zip(counts.iter())
@@ -184,7 +184,7 @@ fn dedup(tokens: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// 把知识条目的各字段拼成统一的可检索文本。
+/// 把历史片段的各字段拼成统一的可检索文本。
 ///
 /// ASCII 统一转小写，与 [`tokenize`] 的处理保持一致，否则大小写不同的标识符会漏召回。
 pub fn searchable_text(parts: &[&str]) -> String {
