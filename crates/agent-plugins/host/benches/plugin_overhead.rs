@@ -512,6 +512,7 @@ fn context_request() -> ContextLoadRequest {
         messages: (0..64)
             .map(|index| ModelMessage::text(MessageRole::User, format!("历史消息 {index}")))
             .collect(),
+        tools: Vec::new(),
     }
 }
 

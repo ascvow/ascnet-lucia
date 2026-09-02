@@ -377,6 +377,11 @@ fn build_chat_completions_request(req: ModelRequest) -> Result<Value> {
 }
 
 /// 根据稳定提示前缀生成 OpenAI 缓存亲和键，不要求调用方提供专用运行参数。
+///
+/// 键只覆盖真正决定缓存前缀的部分：模型、system 提示和工具定义。消息不参与哈希，
+/// 因此同一会话的主请求、上下文摘要请求和其他复用同一前缀的内部调用会落在同一个键上，
+/// 被路由到同一台机器并共享已写入的前缀缓存。把首条消息纳入键会让每次一次性调用都产生
+/// 新键，反而使共享前缀无法命中。
 fn openai_prompt_cache_key(req: &ModelRequest) -> Result<Option<String>> {
     if req.cache_retention == crate::model::PromptCacheRetention::None {
         return Ok(None);
@@ -385,7 +390,6 @@ fn openai_prompt_cache_key(req: &ModelRequest) -> Result<Option<String>> {
         "model": &req.model,
         "system": &req.system,
         "tools": &req.tools,
-        "first_message": req.messages.first(),
     });
     let encoded =
         serde_json::to_vec(&stable_prefix).context("failed to encode OpenAI cache key")?;

@@ -373,6 +373,8 @@ async fn reload_session_context(
         model: model_name,
         system: record.session.system().cloned(),
         messages: record.session.model_messages(),
+        // 手动压缩发生在 Agent Run 之外，没有本轮工具定义可复刻。
+        tools: Vec::new(),
         user_initiated: true,
     };
     let loaded = context_loader.load(request.clone()).await?;

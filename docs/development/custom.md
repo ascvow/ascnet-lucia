@@ -157,7 +157,7 @@ pub fn new(gateway: ModelGateway, options: AgentOptions) -> Agent
 
 `AgentOptions.max_steps = 0` 表示单条用户指令不设置总 ReAct 步数上限。服务端后台任务通常应使用正数上限；交互应用还应提供取消能力。
 
-`AgentOptions.cache_retention` 默认是 `PromptCacheRetention::Short`，普通 `run`、`run_continue` 和 `run_session` 都会自动应用。`None` 不发送显式缓存控制；`Long` 请求 OpenAI 24 小时或 Anthropic 1 小时缓存。OpenAI 缓存亲和键由稳定提示前缀自动生成；自定义兼容网关需要覆盖该字段时，通过 `provider_options` 配置。
+`AgentOptions.cache_retention` 默认是 `PromptCacheRetention::Short`，普通 `run`、`run_continue` 和 `run_session` 都会自动应用。`None` 不发送显式缓存控制；`Long` 请求 OpenAI 24 小时或 Anthropic 1 小时缓存。OpenAI 缓存亲和键由模型、system 与工具定义组成的稳定前缀自动生成，不含消息；自定义兼容网关需要覆盖该字段时，通过 `provider_options` 配置。
 
 ## 注册原生工具
 

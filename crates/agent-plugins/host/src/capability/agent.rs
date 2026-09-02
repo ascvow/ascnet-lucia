@@ -174,6 +174,8 @@ impl CapabilityState {
                 .clamp(1, binding.max_output_tokens),
         );
         model_request.reasoning = ReasoningLevel::Off;
+        // 与主 Agent 使用同一缓存策略：插件补全常复用同一 system 前缀，策略一致才能命中。
+        model_request.cache_retention = binding.cache_retention;
         let response = if binding.stream {
             binding
                 .gateway

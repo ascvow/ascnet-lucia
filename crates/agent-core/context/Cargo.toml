@@ -8,6 +8,7 @@ description = "Lucia 原生上下文压缩、摘要和策略校验能力。"
 
 [dependencies]
 agent-core = { path = "../kernel", default-features = false }
+agent-tool = { path = "../tool", version = "0.1.0", default-features = false }
 anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true

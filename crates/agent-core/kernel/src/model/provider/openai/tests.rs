@@ -248,6 +248,36 @@ fn default_short_cache_adds_automatic_openai_cache_key() {
     assert!(chat.get("prompt_cache_retention").is_none());
 }
 
+/// 复用同一前缀的内部调用必须与主请求落在同一缓存亲和键上。
+///
+/// 上下文摘要请求携带相同的 system 与工具定义、只在消息末尾追加压缩指令；键随消息变化
+/// 会让它被路由到别处，共享前缀就白写了。
+#[test]
+fn openai_cache_key_ignores_messages_for_shared_prefix() {
+    let mut main_request = ModelRequest::new(
+        "gpt-test",
+        vec![crate::model::ModelMessage::text(
+            crate::model::MessageRole::User,
+            "第一轮请求",
+        )],
+    );
+    main_request.system = Some("系统提示".into());
+    let mut summary_request = main_request.clone();
+    summary_request
+        .messages
+        .push(crate::model::ModelMessage::text(
+            crate::model::MessageRole::User,
+            "压缩上文",
+        ));
+
+    let main = build_responses_request(main_request, RESPONSES_PARAMS_COMPATIBLE)
+        .expect("主请求应成功构建");
+    let summary = build_responses_request(summary_request, RESPONSES_PARAMS_COMPATIBLE)
+        .expect("摘要请求应成功构建");
+
+    assert_eq!(main["prompt_cache_key"], summary["prompt_cache_key"]);
+}
+
 /// 显式关闭缓存时不得生成 OpenAI 缓存字段。
 #[test]
 fn no_cache_retention_omits_openai_cache_fields() {

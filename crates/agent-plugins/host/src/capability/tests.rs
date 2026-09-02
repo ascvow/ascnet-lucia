@@ -11,7 +11,7 @@ use crate::manifest::{AgentCapabilitySection, CapabilitySection};
 use crate::service::{PluginService, PluginServiceCall, ServiceHandler, ServiceRegistry};
 use crate::PluginHostServices;
 use agent_core::{model::ModelEventStream, ChatModel, ModelResponse, ProviderAdapter};
-use agent_core::{ModelRequest, ReasoningLevel, ToolChoice};
+use agent_core::{ModelRequest, PromptCacheRetention, ReasoningLevel, ToolChoice};
 use agent_runtime::{
     AgentDeriveConfig, AgentHandle, AgentLineage, AgentOutcome, AgentPermissions, AgentProfileId,
     AgentRuntimeError, AgentRuntimeProvisioner, AgentSnapshot, AgentStatus,
@@ -730,7 +730,14 @@ async fn model_completion_uses_trusted_route_and_limits() {
         )
         .expect("注册测试模型");
     let binding = PluginHostServices::new()
-        .with_model_completion(gateway, "trusted-provider", "trusted-model", 128, true)
+        .with_model_completion(
+            gateway,
+            "trusted-provider",
+            "trusted-model",
+            128,
+            true,
+            PromptCacheRetention::Short,
+        )
         .expect("注入流式模型服务")
         .model_completion()
         .expect("模型服务绑定应存在");
@@ -768,7 +775,14 @@ async fn model_completion_can_use_non_streaming_route() {
         )
         .expect("注册非流式测试模型");
     let binding = PluginHostServices::new()
-        .with_model_completion(gateway, "trusted-provider", "trusted-model", 20_000, false)
+        .with_model_completion(
+            gateway,
+            "trusted-provider",
+            "trusted-model",
+            20_000,
+            false,
+            PromptCacheRetention::Short,
+        )
         .expect("注入非流式模型服务")
         .model_completion()
         .expect("模型服务绑定应存在");
@@ -802,7 +816,14 @@ async fn model_completion_enforces_execution_policy_budget() {
     policy.limits.max_plugin_model_completions = Some(1);
     let binding = PluginHostServices::new()
         .restrict_execution_policy(&policy)
-        .with_model_completion(gateway, "trusted-provider", "trusted-model", 128, false)
+        .with_model_completion(
+            gateway,
+            "trusted-provider",
+            "trusted-model",
+            128,
+            false,
+            PromptCacheRetention::Short,
+        )
         .expect("注入预算模型服务")
         .model_completion()
         .expect("模型服务绑定应存在");
@@ -838,7 +859,14 @@ async fn model_completion_budget_is_isolated_per_plugin_activation() {
     policy.limits.max_plugin_model_completions = Some(1);
     let services = PluginHostServices::new()
         .restrict_execution_policy(&policy)
-        .with_model_completion(gateway, "trusted-provider", "trusted-model", 128, false)
+        .with_model_completion(
+            gateway,
+            "trusted-provider",
+            "trusted-model",
+            128,
+            false,
+            PromptCacheRetention::Short,
+        )
         .expect("注入预算模型服务");
     let first_activation = services
         .model_completion()
@@ -1236,10 +1264,7 @@ impl crate::session::PluginSessionSource for StubSessionSource {
         }])
     }
 
-    async fn load_session(
-        &self,
-        id: &str,
-    ) -> anyhow::Result<Option<agent_core::session::Session>> {
+    async fn load_session(&self, id: &str) -> anyhow::Result<Option<agent_core::session::Session>> {
         if id != self.id {
             return Ok(None);
         }

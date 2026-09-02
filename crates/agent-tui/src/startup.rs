@@ -386,7 +386,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             DEFAULT_MAX_SUMMARY_TOKENS,
             application_events,
         )?
-        .with_context_window(context_window),
+        .with_context_window(context_window)
+        .with_cache_retention(base_agent.options().cache_retention),
     );
     let agent_context_loader: Arc<dyn ContextLoader> = Arc::new(
         NativeContextLoader::new(
@@ -397,7 +398,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             DEFAULT_MAX_SUMMARY_TOKENS,
             base_agent.event_sink(),
         )?
-        .with_context_window(context_window),
+        .with_context_window(context_window)
+        .with_cache_retention(base_agent.options().cache_retention),
     );
     let base_agent = base_agent.with_context_loader(agent_context_loader);
     #[cfg(feature = "plugins")]
