@@ -374,22 +374,29 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .with_event_sink(Arc::clone(&application_events));
     // 手动压缩发生在 Agent Run 之外，只写应用事件；两条路径使用相同模型路由和策略实现，
     // 且都不经过 Plugin Host。
-    let manual_context_loader: Arc<dyn ContextLoader> = Arc::new(NativeContextLoader::new(
-        base_agent.gateway().clone(),
-        base_agent.options().provider.clone(),
-        base_agent.options().model.clone(),
-        base_agent.options().stream,
-        DEFAULT_MAX_SUMMARY_TOKENS,
-        application_events,
-    )?);
-    let agent_context_loader: Arc<dyn ContextLoader> = Arc::new(NativeContextLoader::new(
-        base_agent.gateway().clone(),
-        base_agent.options().provider.clone(),
-        base_agent.options().model.clone(),
-        base_agent.options().stream,
-        DEFAULT_MAX_SUMMARY_TOKENS,
-        base_agent.event_sink(),
-    )?);
+    // 压缩水位由真实上下文窗口推导；窗口未知时压缩器按 200k 假定值兜底。
+    let manual_context_loader: Arc<dyn ContextLoader> = Arc::new(
+        NativeContextLoader::new(
+            base_agent.gateway().clone(),
+            base_agent.options().provider.clone(),
+            base_agent.options().model.clone(),
+            base_agent.options().stream,
+            DEFAULT_MAX_SUMMARY_TOKENS,
+            application_events,
+        )?
+        .with_context_window(context_window),
+    );
+    let agent_context_loader: Arc<dyn ContextLoader> = Arc::new(
+        NativeContextLoader::new(
+            base_agent.gateway().clone(),
+            base_agent.options().provider.clone(),
+            base_agent.options().model.clone(),
+            base_agent.options().stream,
+            DEFAULT_MAX_SUMMARY_TOKENS,
+            base_agent.event_sink(),
+        )?
+        .with_context_window(context_window),
+    );
     let base_agent = base_agent.with_context_loader(agent_context_loader);
     #[cfg(feature = "plugins")]
     let live_plugin_host = Arc::new(LivePluginHost::new());

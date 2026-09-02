@@ -13,16 +13,32 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-/// 200k 上下文扣除 20k 摘要输出预算和 13k 下一轮缓冲后的自动压缩阈值。
-const DEFAULT_COMPACT_THRESHOLD_TOKENS: usize = 167_000;
-/// 百万上下文使用与 Claude Code 相同的摘要输出和下一轮缓冲预留。
-const LARGE_COMPACT_THRESHOLD_TOKENS: usize = 967_000;
-/// 在完整压缩前先清理旧工具结果，降低无效历史占用。
-const DEFAULT_MICRO_COMPACT_THRESHOLD_TOKENS: usize = 120_000;
-/// 百万上下文的微压缩水位。
-const LARGE_MICRO_COMPACT_THRESHOLD_TOKENS: usize = 900_000;
-/// 完整压缩后至少保留的近期上下文目标。
-const RECENT_CONTEXT_TARGET_TOKENS: usize = 40_000;
+/// 未知上下文窗口时假定的窗口大小。
+///
+/// 只在既没有配置也没有 models.dev 元数据时兜底；正常路径应由调用方传入真实窗口。
+const ASSUMED_CONTEXT_WINDOW_TOKENS: usize = 200_000;
+/// 触发完整压缩前为下一轮请求预留的缓冲。
+///
+/// 压缩本身要发一次模型请求，压缩后还要立刻发起真正的那一轮；不留缓冲会在压缩
+/// 完成的同一步就再次越界。
+const NEXT_TURN_BUFFER_TOKENS: usize = 13_000;
+/// 完整压缩水位相对窗口的下限比例。
+///
+/// 小窗口模型减去固定预留后可能归零，此时改用窗口比例，避免每一轮都触发压缩。
+const MIN_COMPACT_THRESHOLD_RATIO: usize = 55;
+/// 微压缩水位相对完整压缩水位的比例。
+///
+/// 先用无损代价更低的手段清理旧工具结果，尽量把完整摘要推迟到真正需要时。
+const MICRO_COMPACT_THRESHOLD_RATIO: usize = 72;
+/// 完整压缩后保留的近期上下文占窗口的比例。
+///
+/// 固定 40k 在小窗口上会吃掉整个预算、在百万窗口上又过于吝啬，因此按窗口比例伸缩。
+const RECENT_CONTEXT_TARGET_RATIO: usize = 20;
+/// 保留区内单个工具结果允许的最大字符数。
+///
+/// 超过该长度的结果保留首尾片段：巨型日志和堆栈的中段几乎不携带增量信息，
+/// 但首尾同时决定了"这是什么"和"最终怎么了"。
+const MAX_RETAINED_TOOL_RESULT_CHARS: usize = 2_000;
 /// 微压缩始终原样保留的最近工具结果数量。
 const RECENT_TOOL_RESULTS_TO_KEEP: usize = 3;
 /// Claude Code 为完整摘要预留的最大输出 token 数。
@@ -106,6 +122,8 @@ pub struct NativeContextLoader {
     model: String,
     stream: bool,
     max_summary_tokens: u32,
+    /// 目标模型的真实上下文窗口；`None` 时按假定窗口推导水位。
+    context_window: Option<usize>,
     events: Arc<dyn EventSink>,
     state: Mutex<CompressionState>,
 }
@@ -160,9 +178,21 @@ impl NativeContextLoader {
             model,
             stream,
             max_summary_tokens,
+            context_window: None,
             events,
             state: Mutex::new(CompressionState::default()),
         })
+    }
+
+    /// 声明目标模型的真实上下文窗口。
+    ///
+    /// 未声明时按 200k 假定窗口推导水位；真实窗口更大时会过早压缩，更小时会越界。
+    /// 调用方应把配置或 models.dev 元数据里的窗口传进来。
+    pub fn with_context_window(mut self, context_window: Option<u64>) -> Self {
+        self.context_window = context_window
+            .filter(|window| *window > 0)
+            .map(|window| usize::try_from(window).unwrap_or(usize::MAX));
+        self
     }
 
     /// 在不持有锁的情况下构造本轮有效请求及缓存更新元数据。
@@ -275,7 +305,9 @@ impl ContextLoader for NativeContextLoader {
     /// 手动请求跳过自动水位并清空增量缓存；摘要失败或事件持久化失败时关闭本轮模型请求。
     async fn load(&self, request: CoreContextLoadRequest) -> Result<CoreLoadedContext> {
         let (effective, plan) = self.prepare_request(encode_core_request(request)?)?;
-        let outcome = compress_context(effective.clone(), effective.user_initiated, self).await?;
+        let budget = compaction_budget(self.context_window, self.max_summary_tokens as usize);
+        let outcome =
+            compress_context(effective.clone(), effective.user_initiated, budget, self).await?;
         self.commit_cache(plan, &outcome)?;
         self.emit_event(&effective, outcome.event.as_ref()).await?;
         decode_core_context(outcome.context)
@@ -292,6 +324,8 @@ struct CompressionOutcome {
 struct CompactedMessages {
     messages: Vec<Value>,
     summarized_messages: usize,
+    /// 保留区内被折叠为首尾片段的超长工具结果数量。
+    capped_results: usize,
     summary_usage: Option<Value>,
 }
 
@@ -312,17 +346,25 @@ trait ContextSummarizer: Send + Sync {
 async fn compress_context(
     request: ContextLoadRequest,
     manual: bool,
+    budget: CompactionBudget,
     summarizer: &dyn ContextSummarizer,
 ) -> Result<CompressionOutcome> {
     let before_messages = request.messages.len();
     let before_tokens = estimate_context_tokens(request.system.as_deref(), &request.messages);
-    let (micro_threshold, compact_threshold) = thresholds_for_model(&request.model);
+    let CompactionBudget {
+        compact: compact_threshold,
+        micro: micro_threshold,
+        recent_target,
+    } = budget;
 
     if manual || before_tokens >= compact_threshold {
-        if let Some(compacted) = compact_messages(&request.messages, manual, summarizer).await? {
+        if let Some(compacted) =
+            compact_messages(&request.messages, manual, recent_target, summarizer).await?
+        {
             let CompactedMessages {
                 messages,
                 summarized_messages,
+                capped_results,
                 summary_usage,
             } = compacted;
             let after_tokens = estimate_context_tokens(request.system.as_deref(), &messages);
@@ -340,6 +382,7 @@ async fn compress_context(
                         "before_messages": before_messages,
                         "after_messages": after_messages,
                         "summarized_messages": summarized_messages,
+                        "capped_tool_results": capped_results,
                         "estimated_tokens_before": before_tokens,
                         "estimated_tokens_after": after_tokens,
                         "summary_usage": summary_usage,
@@ -360,7 +403,10 @@ async fn compress_context(
 
     if manual || before_tokens >= micro_threshold {
         let (messages, cleared_results) = micro_compact_tool_results(&request.messages);
-        if cleared_results > 0 {
+        // 最近若干条结果不清空，但同样需要封顶：巨型输出常常就出现在最新几条里。
+        let (messages, capped_results) =
+            cap_retained_tool_results(&messages, MAX_RETAINED_TOOL_RESULT_CHARS);
+        if cleared_results > 0 || capped_results > 0 {
             let after_tokens = estimate_context_tokens(request.system.as_deref(), &messages);
             return Ok(CompressionOutcome {
                 context: LoadedContext {
@@ -375,10 +421,11 @@ async fn compress_context(
                         "before_messages": before_messages,
                         "after_messages": before_messages,
                         "cleared_tool_results": cleared_results,
+                        "capped_tool_results": capped_results,
                         "estimated_tokens_before": before_tokens,
                         "estimated_tokens_after": after_tokens,
                         "trigger": if manual { "manual" } else { "auto" },
-                        "strategy": "clear_old_successful_tool_results"
+                        "strategy": "clear_old_successful_tool_results_and_cap_retained"
                     },
                     "presentation": { "target": "none" }
                 })),
@@ -420,22 +467,41 @@ async fn compress_context(
     })
 }
 
-/// 根据 Claude Code 的 `[1m]` 模型标记返回微压缩和完整压缩水位。
-fn thresholds_for_model(model: &str) -> (usize, usize) {
-    if model.to_ascii_lowercase().contains("[1m]") {
-        (
-            LARGE_MICRO_COMPACT_THRESHOLD_TOKENS,
-            LARGE_COMPACT_THRESHOLD_TOKENS,
-        )
-    } else {
-        (
-            DEFAULT_MICRO_COMPACT_THRESHOLD_TOKENS,
-            DEFAULT_COMPACT_THRESHOLD_TOKENS,
-        )
+/// 一次压缩决策使用的水位与保留预算，全部由真实上下文窗口推导。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactionBudget {
+    /// 触发完整模型摘要的水位。
+    compact: usize,
+    /// 触发工具结果微压缩的水位。
+    micro: usize,
+    /// 完整压缩后期望保留的近期上下文规模。
+    recent_target: usize,
+}
+
+/// 按上下文窗口与摘要输出预算推导各级水位。
+///
+/// 此前按模型名里是否含 `[1m]` 在两组硬编码常量之间二选一：模型名是展示字符串，
+/// 换个服务商或别名就失配，而 128k、256k 这类窗口根本无法表达。这里改为从调用方
+/// 传入的真实窗口推导，未知窗口才回落到假定值。
+fn compaction_budget(context_window: Option<usize>, summary_tokens: usize) -> CompactionBudget {
+    let window = context_window
+        .filter(|window| *window > 0)
+        .unwrap_or(ASSUMED_CONTEXT_WINDOW_TOKENS);
+    // 摘要输出与下一轮请求都要占用同一个窗口，先扣掉再决定何时压缩。
+    let reserved = summary_tokens.saturating_add(NEXT_TURN_BUFFER_TOKENS);
+    // 小窗口扣完预留可能归零，此时用窗口比例兜底，避免每轮都压缩。
+    let compact = window
+        .saturating_sub(reserved)
+        .max(window * MIN_COMPACT_THRESHOLD_RATIO / 100)
+        .max(1);
+    CompactionBudget {
+        compact,
+        micro: (compact * MICRO_COMPACT_THRESHOLD_RATIO / 100).max(1),
+        recent_target: (window * RECENT_CONTEXT_TARGET_RATIO / 100).max(1),
     }
 }
 
-/// 用序列化字节数进行保守估算；三字节约一个 token，兼顾英文和中文内容。
+/// 用序列化字节数进行估算，ASCII 与非 ASCII 分别计费。
 fn estimate_context_tokens(system: Option<&str>, messages: &[Value]) -> usize {
     let system_tokens = system.map_or(0, estimate_text_tokens);
     system_tokens
@@ -446,8 +512,14 @@ fn estimate_context_tokens(system: Option<&str>, messages: &[Value]) -> usize {
 }
 
 /// 将文本字节数换算为粗略 token 数。
+///
+/// 统一按三字节一个 token 会把英文高估约三成——英文约四字节一个 token，中文才是
+/// 三字节（一个汉字）一个 token。高估直接导致英文为主的会话提前触发压缩，白白
+/// 损失可用上下文，因此两类字节分开折算。
 fn estimate_text_tokens(text: &str) -> usize {
-    text.len().div_ceil(3)
+    let non_ascii_bytes = text.bytes().filter(|byte| !byte.is_ascii()).count();
+    let ascii_bytes = text.len() - non_ascii_bytes;
+    ascii_bytes.div_ceil(4) + non_ascii_bytes.div_ceil(3)
 }
 
 /// 清理较旧的成功工具结果正文，同时保留调用关联、错误结果和最近成功结果。
@@ -503,6 +575,64 @@ fn micro_compact_tool_results(messages: &[Value]) -> (Vec<Value>, usize) {
     (compacted, cleared)
 }
 
+/// 把超长文本折叠为首尾片段，中段替换为省略标记。
+///
+/// 保留首尾而不是只留开头：巨型日志和堆栈的中段几乎不携带增量信息，但开头决定
+/// "这是什么"，结尾决定"最终怎么了"，只留其一都会让结果失去判断价值。
+fn truncate_middle(text: &str, max_chars: usize) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return None;
+    }
+    // 首段多留一些：工具结果的开头通常是路径、命令或错误类型。
+    let head = max_chars * 2 / 3;
+    let tail = max_chars - head;
+    let omitted = chars.len() - head - tail;
+    Some(format!(
+        "{}\n… [已省略 {omitted} 字符] …\n{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>(),
+    ))
+}
+
+/// 折叠保留区内超长的工具结果正文，返回新消息与被折叠的结果数。
+///
+/// 与微压缩互补：微压缩整体清空**较旧**结果的正文，这里只对**保留下来**的结果做
+/// 长度封顶。近期结果仍需可读，因此不能清空，但单条动辄上百 KB 的输出同样会挤占
+/// 窗口——完整压缩此前完全没有处理保留区，尾部经常仍是几万 token。
+fn cap_retained_tool_results(messages: &[Value], max_chars: usize) -> (Vec<Value>, usize) {
+    let mut capped = 0;
+    let compacted = messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                return message;
+            };
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                    continue;
+                }
+                let Some(content) = block.pointer_mut("/result/content") else {
+                    continue;
+                };
+                let Some(text) = content.as_str() else {
+                    continue;
+                };
+                if text == CLEARED_TOOL_RESULT {
+                    continue;
+                }
+                if let Some(truncated) = truncate_middle(text, max_chars) {
+                    *content = Value::String(truncated);
+                    capped += 1;
+                }
+            }
+            message
+        })
+        .collect();
+    (compacted, capped)
+}
+
 /// 统计一条消息中允许微压缩的成功工具结果块数量。
 fn compactable_tool_result_count(message: &Value) -> usize {
     message
@@ -527,6 +657,7 @@ fn compactable_tool_result_count(message: &Value) -> usize {
 async fn compact_messages(
     messages: &[Value],
     manual: bool,
+    recent_target: usize,
     summarizer: &dyn ContextSummarizer,
 ) -> Result<Option<CompactedMessages>> {
     let group_starts = api_round_group_starts(messages);
@@ -534,7 +665,7 @@ async fn compact_messages(
         return Ok(None);
     }
 
-    let split_index = recent_tail_start(messages, &group_starts, manual);
+    let split_index = recent_tail_start(messages, &group_starts, manual, recent_target);
     if split_index == 0 || split_index >= messages.len() {
         return Ok(None);
     }
@@ -543,7 +674,10 @@ async fn compact_messages(
         .summarize(&messages[..split_index], DEFAULT_MAX_SUMMARY_TOKENS)
         .await?;
     let summary = normalize_model_summary(&response.text)?;
-    let mut compacted = Vec::with_capacity(messages.len() - split_index + 1);
+    // 保留区仍是原文，单条超长结果会让尾部继续占据数万 token；这里只封顶不清空。
+    let (retained, capped_results) =
+        cap_retained_tool_results(&messages[split_index..], MAX_RETAINED_TOOL_RESULT_CHARS);
+    let mut compacted = Vec::with_capacity(retained.len() + 1);
     compacted.push(json!({
         "role": "developer",
         "content": [{
@@ -553,10 +687,11 @@ async fn compact_messages(
             )
         }]
     }));
-    compacted.extend_from_slice(&messages[split_index..]);
+    compacted.extend(retained);
     Ok(Some(CompactedMessages {
         messages: compacted,
         summarized_messages: split_index,
+        capped_results,
         summary_usage: response.usage,
     }))
 }
@@ -573,7 +708,12 @@ fn api_round_group_starts(messages: &[Value]) -> Vec<usize> {
 }
 
 /// 自动模式保留约 40k 尾部；手动模式只保留最新完整轮次以确保实际发生压缩。
-fn recent_tail_start(messages: &[Value], group_starts: &[usize], manual: bool) -> usize {
+fn recent_tail_start(
+    messages: &[Value],
+    group_starts: &[usize],
+    manual: bool,
+    recent_target: usize,
+) -> usize {
     if manual {
         return *group_starts.last().unwrap_or(&0);
     }
@@ -587,9 +727,7 @@ fn recent_tail_start(messages: &[Value], group_starts: &[usize], manual: bool) -
             .copied()
             .unwrap_or(messages.len());
         let group_tokens = estimate_context_tokens(None, &messages[group_start..group_end]);
-        if preserved_groups >= 1
-            && preserved_tokens.saturating_add(group_tokens) > RECENT_CONTEXT_TARGET_TOKENS
-        {
+        if preserved_groups >= 1 && preserved_tokens.saturating_add(group_tokens) > recent_target {
             break;
         }
         preserved_tokens += group_tokens;
@@ -744,9 +882,23 @@ mod tests {
         }
     }
 
+    /// 测试统一使用 200k 窗口推导出的水位，与未声明窗口时的默认行为一致。
+    fn test_budget() -> CompactionBudget {
+        compaction_budget(None, DEFAULT_MAX_SUMMARY_TOKENS as usize)
+    }
+
+    /// 返回单条 ASCII 工具结果跨过指定 token 水位所需的字符数。
+    ///
+    /// 夹具按当前估算口径反推，而不是写死字节数：估算口径调整时测试意图仍然成立，
+    /// 不会因为常量过时而误判为行为回归。
+    fn chars_to_exceed(tokens: usize, messages: usize) -> usize {
+        // ASCII 按四字节一个 token 折算，留一条消息的余量覆盖 JSON 包装开销。
+        tokens * 4 / messages + 1_024
+    }
+
     /// 使用确定性摘要器执行一次测试压缩。
     async fn compress_for_test(request: ContextLoadRequest, manual: bool) -> CompressionOutcome {
-        compress_context(request, manual, &TestSummarizer)
+        compress_context(request, manual, test_budget(), &TestSummarizer)
             .await
             .expect("测试压缩应成功")
     }
@@ -776,8 +928,9 @@ mod tests {
     /// 微压缩只清理旧结果，最近三条工具结果必须保持原文。
     #[tokio::test]
     async fn micro_compaction_preserves_recent_tool_results() {
+        let size = chars_to_exceed(test_budget().micro, 6);
         let messages = (0..6)
-            .map(|index| tool_result_message(index, 70_000))
+            .map(|index| tool_result_message(index, size))
             .collect::<Vec<_>>();
         let outcome = compress_for_test(
             ContextLoadRequest {
@@ -825,8 +978,9 @@ mod tests {
     #[tokio::test]
     async fn micro_compaction_preserves_failed_tool_results() {
         let failure = failed_tool_result_message(0, "文件不存在：src/missing.rs");
+        let size = chars_to_exceed(test_budget().micro, 4);
         let mut messages = vec![failure.clone()];
-        messages.extend((0..4).map(|index| tool_result_message(index, 100_000)));
+        messages.extend((0..4).map(|index| tool_result_message(index, size)));
         let outcome = compress_for_test(
             ContextLoadRequest {
                 run_id: "run-micro-error".into(),
@@ -856,7 +1010,7 @@ mod tests {
             text_message("user", "分析上下文压缩"),
             text_message("assistant", "已定位压缩入口"),
             failed_tool_result_message(0, "读取配置失败：权限不足"),
-            tool_result_message(0, 520_000),
+            tool_result_message(0, chars_to_exceed(test_budget().compact, 1)),
             text_message("assistant", "已完成旧历史分析"),
             text_message("user", recent_request),
             text_message("assistant", "正在处理最新用例"),
@@ -887,6 +1041,7 @@ mod tests {
                 messages,
             },
             false,
+            test_budget(),
             &summarizer,
         )
         .await
@@ -923,6 +1078,102 @@ mod tests {
             .any(|message| { message["content"][0]["text"].as_str() == Some(recent_request) }));
     }
 
+    /// 水位必须随真实上下文窗口伸缩，而不是按模型名猜测。
+    #[test]
+    fn budget_scales_with_real_context_window() {
+        let summary = DEFAULT_MAX_SUMMARY_TOKENS as usize;
+        let small = compaction_budget(Some(200_000), summary);
+        let large = compaction_budget(Some(1_000_000), summary);
+
+        // 200k 扣掉 20k 摘要输出与 13k 下一轮缓冲。
+        assert_eq!(small.compact, 167_000);
+        assert_eq!(large.compact, 967_000);
+        assert!(small.micro < small.compact);
+        assert!(large.recent_target > small.recent_target);
+
+        // 未声明窗口时按 200k 假定值兜底，与显式传入 200k 等价。
+        assert_eq!(compaction_budget(None, summary), small);
+        assert_eq!(compaction_budget(Some(0), summary), small);
+    }
+
+    /// 小窗口扣除固定预留后不得归零，否则每一轮都会触发压缩。
+    #[test]
+    fn small_window_budget_falls_back_to_window_ratio() {
+        let budget = compaction_budget(Some(32_000), DEFAULT_MAX_SUMMARY_TOKENS as usize);
+
+        assert_eq!(budget.compact, 32_000 * MIN_COMPACT_THRESHOLD_RATIO / 100);
+        assert!(budget.compact > 0);
+        assert!(budget.micro > 0);
+        assert!(budget.recent_target > 0);
+    }
+
+    /// 英文与中文按不同字节率折算，避免英文会话被高估而提前压缩。
+    #[test]
+    fn token_estimate_separates_ascii_from_wide_characters() {
+        // 400 字节 ASCII 约 100 token；统一按三字节折算会高估到 134。
+        assert_eq!(estimate_text_tokens(&"x".repeat(400)), 100);
+        // 100 个汉字共 300 字节，约 100 token。
+        assert_eq!(estimate_text_tokens(&"中".repeat(100)), 100);
+    }
+
+    /// 超长文本折叠为首尾片段，短文本保持原样。
+    #[test]
+    fn oversized_text_keeps_head_and_tail() {
+        assert_eq!(truncate_middle("短文本", 100), None);
+
+        let text = format!("开头{}结尾", "x".repeat(500));
+        let truncated = truncate_middle(&text, 100).expect("超长文本应被折叠");
+
+        assert!(truncated.starts_with("开头"), "{truncated}");
+        assert!(truncated.ends_with("结尾"), "{truncated}");
+        assert!(truncated.contains("已省略"), "{truncated}");
+        assert!(truncated.chars().count() < text.chars().count());
+    }
+
+    /// 保留区内的超长工具结果必须封顶，否则完整压缩后尾部仍占据大量窗口。
+    #[tokio::test]
+    async fn full_compaction_caps_oversized_retained_results() {
+        let messages = vec![
+            text_message("user", "分析压缩"),
+            text_message("assistant", "已定位入口"),
+            text_message(
+                "user",
+                "x".repeat(chars_to_exceed(test_budget().compact, 1)),
+            ),
+            text_message("assistant", "最新一轮"),
+            tool_result_message(9, MAX_RETAINED_TOOL_RESULT_CHARS * 4),
+        ];
+        let outcome = compress_for_test(
+            ContextLoadRequest {
+                run_id: "run-cap".into(),
+                user_initiated: false,
+                step: 1,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages,
+            },
+            false,
+        )
+        .await;
+
+        let event = outcome.event.as_ref().expect("应发生完整压缩");
+        assert_eq!(event["name"], "context.compaction.completed");
+        assert_eq!(event["data"]["capped_tool_results"], 1);
+
+        let retained = outcome
+            .context
+            .messages
+            .iter()
+            .filter_map(|message| message.pointer("/content/0/result/content"))
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1);
+        // 折叠后仍远小于原文，同时保留了首尾片段。
+        assert!(retained[0].chars().count() < MAX_RETAINED_TOOL_RESULT_CHARS * 2);
+        assert!(retained[0].contains("已省略"));
+    }
+
     /// 只有两个 API 轮次时也必须能压缩超大前缀，不能因保留轮次数下限失效。
     #[tokio::test]
     async fn full_compaction_handles_two_api_rounds() {
@@ -936,7 +1187,10 @@ mod tests {
                 model: "test-model".into(),
                 system: None,
                 messages: vec![
-                    text_message("user", "x".repeat(520_000)),
+                    text_message(
+                        "user",
+                        "x".repeat(chars_to_exceed(test_budget().compact, 1)),
+                    ),
                     text_message("assistant", "已接收旧请求"),
                     text_message("user", recent_request),
                 ],
@@ -1023,7 +1277,7 @@ mod tests {
                 messages: original_messages.clone(),
             })
             .expect("应准备首次压缩请求");
-        let first = compress_context(request, false, &TestSummarizer)
+        let first = compress_context(request, false, test_budget(), &TestSummarizer)
             .await
             .expect("首次增量压缩应成功");
         loader
@@ -1044,7 +1298,7 @@ mod tests {
                 messages: extended_messages,
             })
             .expect("应准备追加压缩请求");
-        let second = compress_context(request, false, &TestSummarizer)
+        let second = compress_context(request, false, test_budget(), &TestSummarizer)
             .await
             .expect("后续增量压缩应成功");
         loader
@@ -1080,7 +1334,7 @@ mod tests {
             ],
             user_initiated: true,
         };
-        let outcome = compress_context(request, true, &TestSummarizer)
+        let outcome = compress_context(request, true, test_budget(), &TestSummarizer)
             .await
             .expect("主动压缩应立即返回结果");
 
