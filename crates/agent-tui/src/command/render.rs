@@ -563,7 +563,7 @@ mod plugin_capability_summary_tests {
                 id = "render-test"
                 name = "Render Test"
                 version = "1.0.0"
-                api_version = "0.8.0"
+                api_version = "0.9.0"
                 wasm = "render-test.wasm"
             "#,
         )
@@ -607,7 +607,7 @@ mod plugin_capability_summary_tests {
 
         assert_eq!(
             format_plugin_authorization(&profile),
-            "ABI 0.8.0 固有权限 9 项 · 插件服务依赖(provider@^1.0;optional=false)"
+            "ABI 0.9.0 固有权限 9 项 · 插件服务依赖(provider@^1.0;optional=false)"
         );
     }
 

@@ -6,7 +6,7 @@
 
 use agent_plugin::{
     export_plugin, ActivationContext, AgentId, AgentOutcome, AgentPlugin, AgentSpawnRequest,
-    AgentViewSession, PluginHostApi, PromptContribution, Result, ToolCall, ToolPermissionScope,
+    AgentViewSession, PluginHostApi, Result, ToolCall, ToolPermissionScope,
     ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
     UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
     UiViewInstance,
@@ -23,10 +23,6 @@ const WORKER_PROFILE: &str = "worker";
 const MAX_PARALLELISM: usize = 4;
 /// 任务提示词的最大字节数，避免状态和跨 ABI 请求无限增长。
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
-/// 引导主 Agent 合理使用动态任务列表的 developer 提示 ID。
-const TASK_ORCHESTRATION_PROMPT_ID: &str = "workflow-orchestration";
-/// 引导主 Agent 以动态任务列表编排多阶段工作的规则。
-const TASK_ORCHESTRATION_PROMPT: &str = "包含多个阶段或明确依赖关系的任务，用 task_create 维护动态任务列表：先登记当前已知的任务与依赖，执行中随时追加新任务、修改待处理任务或取消不再需要的任务。依赖齐备的任务会自动派生 worker Agent 并注入依赖任务结果，无需手动推进；用 task_list 观察进度，用 task_get 读取任务输出，失败任务用 task_update 重置为 pending 即可重跑。简单的一次性任务不要创建任务列表。";
 /// 输入框上方展示任务进度的紧凑视图。
 const TASK_SHELF_VIEW: &str = "workflow-shelf";
 /// 展示任务列表及选中任务详情的工作台子视图。
@@ -105,19 +101,14 @@ enum UpdateStatus {
 }
 
 impl AgentPlugin for WorkflowPlugin {
-    /// 注册任务编排提示，使主 Agent 能在多阶段任务中主动维护任务列表。
-    fn activate(&mut self, host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
-        host.upsert_prompt(&PromptContribution {
-            id: TASK_ORCHESTRATION_PROMPT_ID.into(),
-            content: TASK_ORCHESTRATION_PROMPT.into(),
-            priority: 110,
-        })?;
+    /// 插件不注册常驻提示：任务列表的使用时机由 `task_create` 的工具描述承载。
+    fn activate(&mut self, _host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
         Ok(())
     }
 
-    /// 删除本插件注册的任务编排提示，避免插件卸载后继续影响模型决策。
-    fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
-        host.remove_prompt(TASK_ORCHESTRATION_PROMPT_ID)
+    /// 无常驻提示与 service 需要注销。
+    fn deactivate(&mut self, _host: &dyn PluginHostApi) -> Result<()> {
+        Ok(())
     }
 
     /// 返回动态任务列表控制面工具。
@@ -125,7 +116,7 @@ impl AgentPlugin for WorkflowPlugin {
         vec![
             ToolSpec::new(
                 "task_create",
-                "创建一个或多个任务加入动态任务列表。依赖可以引用已有任务或同批任务；依赖齐备的任务会立即自动派生 worker Agent 执行，无需手动推进。",
+                "为包含多个阶段或明确依赖关系的任务创建动态任务列表。依赖可以引用已有任务或同批任务；依赖齐备的任务会立即自动派生 worker Agent 执行并注入依赖任务结果，无需手动推进。简单的一次性任务不要创建任务列表。",
                 create_tasks_schema(),
             ),
             ToolSpec::new(

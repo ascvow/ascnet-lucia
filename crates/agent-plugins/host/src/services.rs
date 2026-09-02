@@ -102,6 +102,9 @@ pub struct PluginHostServices {
     service_call_observer: Option<Arc<dyn audit::HostServiceCallObserver>>,
     #[cfg(feature = "wasm")]
     pub(crate) persistent_state_dir: Option<PathBuf>,
+    /// 当前项目的可信作用域标识，用于按项目隔离插件持久存储。
+    #[cfg(feature = "wasm")]
+    pub(crate) workspace_scope: Option<String>,
     /// Host 持有且只能通过 `restrict` 收紧的运行平面策略。
     pub(crate) execution_policy: ExecutionPolicy,
 }
@@ -166,6 +169,24 @@ impl PluginHostServices {
             return Err(anyhow!("插件持久状态目录不能为空"));
         }
         self.persistent_state_dir = Some(path);
+        Ok(self)
+    }
+
+    /// 声明当前项目的可信作用域标识。
+    ///
+    /// 该标识只用于隔离插件持久存储的命名空间，不会传给 Guest。未声明时按项目隔离的
+    /// 存储作用域不可用，插件只能使用用户级存储——不会退化为跨项目共享。
+    ///
+    /// # Errors
+    ///
+    /// 标识为空白时返回错误，避免产生无法稳定寻址的命名空间。
+    #[cfg(feature = "wasm")]
+    pub fn with_workspace_scope(mut self, scope: impl Into<String>) -> Result<Self> {
+        let scope = scope.into();
+        if scope.trim().is_empty() {
+            return Err(anyhow!("插件持久存储的项目作用域不能为空"));
+        }
+        self.workspace_scope = Some(scope);
         Ok(self)
     }
 
@@ -288,6 +309,12 @@ impl PluginHostServices {
     #[cfg(feature = "wasm")]
     pub(crate) fn persistent_state_dir(&self) -> Option<PathBuf> {
         self.persistent_state_dir.clone()
+    }
+
+    /// 返回应用注入的项目作用域标识；未注入时按项目隔离的存储不可用。
+    #[cfg(feature = "wasm")]
+    pub(crate) fn workspace_scope(&self) -> Option<String> {
+        self.workspace_scope.clone()
     }
 
     /// 返回 Host 内部持有的可信执行策略快照。

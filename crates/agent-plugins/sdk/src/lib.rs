@@ -23,7 +23,7 @@ pub use serde_json as __serde_json;
 /// WIT contract used by both host and guest.
 /// 宿主和 guest 共用的 WIT 契约。
 pub const PLUGIN_WIT: &str = r#"
-package ascnet:lucia-plugin@0.8.0;
+package ascnet:lucia-plugin@0.9.0;
 
 world plugin {
   import host-agent-upsert-tool: func(request-json: string) -> string;
@@ -34,6 +34,10 @@ world plugin {
   import host-state-get: func(request-json: string) -> string;
   import host-state-set: func(request-json: string) -> string;
   import host-state-remove: func(request-json: string) -> string;
+  import host-store-get: func(request-json: string) -> string;
+  import host-store-set: func(request-json: string) -> string;
+  import host-store-remove: func(request-json: string) -> string;
+  import host-store-list: func(request-json: string) -> string;
   import host-service-upsert: func(request-json: string) -> string;
   import host-service-remove: func(request-json: string) -> string;
   import host-service-list: func(request-json: string) -> string;
@@ -605,6 +609,49 @@ pub trait PluginHostApi {
     /// 删除插件状态并返回旧值；持久保存失败时 Host 保留原值并返回错误。
     fn remove_state(&self, key: &str) -> Result<Option<serde_json::Value>>;
 
+    /// 读取本插件私有持久存储中的一个键。
+    ///
+    /// 与 [`PluginHostApi::get_state`] 的区别是**生命周期**而非权限范围：两者都只能访问
+    /// 本插件自己的命名空间，但 state 在插件代码变化时清空，store 跨版本保留。记忆、
+    /// 索引一类的用户数据必须用 store，否则一次插件升级就会清空用户资产。
+    ///
+    /// 需要 manifest 声明 `storage = true`。
+    fn store_get(
+        &self,
+        scope: PluginStoreScope,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let _ = (scope, key);
+        Err(anyhow!("当前宿主未提供插件持久存储能力"))
+    }
+
+    /// 写入本插件私有持久存储。
+    fn store_set(
+        &self,
+        scope: PluginStoreScope,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<()> {
+        let _ = (scope, key, value);
+        Err(anyhow!("当前宿主未提供插件持久存储能力"))
+    }
+
+    /// 删除本插件私有持久存储中的一个键，返回被删除的值。
+    fn store_remove(
+        &self,
+        scope: PluginStoreScope,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let _ = (scope, key);
+        Err(anyhow!("当前宿主未提供插件持久存储能力"))
+    }
+
+    /// 列出指定作用域下的全部键，按字典序稳定排列。
+    fn store_list(&self, scope: PluginStoreScope) -> Result<Vec<String>> {
+        let _ = scope;
+        Err(anyhow!("当前宿主未提供插件持久存储能力"))
+    }
+
     /// 注册或替换当前插件拥有的服务。
     fn upsert_service(&self, service: &ServiceSpec) -> Result<()>;
 
@@ -883,7 +930,7 @@ macro_rules! export_plugin {
             wit_bindgen::generate!({
                 path: [],
                 inline: r#"
-package ascnet:lucia-plugin@0.8.0;
+package ascnet:lucia-plugin@0.9.0;
 
 world plugin {
   import host-agent-upsert-tool: func(request-json: string) -> string;
@@ -894,6 +941,10 @@ world plugin {
   import host-state-get: func(request-json: string) -> string;
   import host-state-set: func(request-json: string) -> string;
   import host-state-remove: func(request-json: string) -> string;
+  import host-store-get: func(request-json: string) -> string;
+  import host-store-set: func(request-json: string) -> string;
+  import host-store-remove: func(request-json: string) -> string;
+  import host-store-list: func(request-json: string) -> string;
   import host-service-upsert: func(request-json: string) -> string;
   import host-service-remove: func(request-json: string) -> string;
   import host-service-list: func(request-json: string) -> string;
@@ -999,6 +1050,54 @@ world plugin {
                 ) -> $crate::Result<Option<$crate::__serde_json::Value>> {
                     let request = $crate::__serde_json::json!({"key": key});
                     $crate::decode_host_response(&host_state_remove(
+                        &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn store_get(
+                    &self,
+                    scope: $crate::PluginStoreScope,
+                    key: &str,
+                ) -> $crate::Result<Option<$crate::__serde_json::Value>> {
+                    let request = $crate::__serde_json::json!({"scope": scope, "key": key});
+                    $crate::decode_host_response(&host_store_get(
+                        &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn store_set(
+                    &self,
+                    scope: $crate::PluginStoreScope,
+                    key: &str,
+                    value: &$crate::__serde_json::Value,
+                ) -> $crate::Result<()> {
+                    let request = $crate::__serde_json::json!({
+                        "scope": scope,
+                        "key": key,
+                        "value": value,
+                    });
+                    $crate::decode_host_response(&host_store_set(
+                        &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn store_remove(
+                    &self,
+                    scope: $crate::PluginStoreScope,
+                    key: &str,
+                ) -> $crate::Result<Option<$crate::__serde_json::Value>> {
+                    let request = $crate::__serde_json::json!({"scope": scope, "key": key});
+                    $crate::decode_host_response(&host_store_remove(
+                        &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn store_list(
+                    &self,
+                    scope: $crate::PluginStoreScope,
+                ) -> $crate::Result<Vec<String>> {
+                    let request = $crate::__serde_json::json!({"scope": scope});
+                    $crate::decode_host_response(&host_store_list(
                         &$crate::to_json_string(&request),
                     ))
                 }
@@ -1621,6 +1720,35 @@ impl PluginHostApi for NoopHostApi {
 
     fn remove_state(&self, _key: &str) -> Result<Option<serde_json::Value>> {
         Ok(None)
+    }
+
+    fn store_get(
+        &self,
+        _scope: PluginStoreScope,
+        _key: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    fn store_set(
+        &self,
+        _scope: PluginStoreScope,
+        _key: &str,
+        _value: &serde_json::Value,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn store_remove(
+        &self,
+        _scope: PluginStoreScope,
+        _key: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    fn store_list(&self, _scope: PluginStoreScope) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
 
     fn upsert_service(&self, _service: &ServiceSpec) -> Result<()> {

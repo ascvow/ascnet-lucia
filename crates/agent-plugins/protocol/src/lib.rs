@@ -787,6 +787,22 @@ mod tests {
     }
 }
 
+/// 插件私有持久存储的作用域。
+///
+/// 两个作用域都只能访问**本插件自己**的命名空间，插件之间互不可见；作用域只决定
+/// 数据跟随项目还是跟随用户。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginStoreScope {
+    /// 按当前项目隔离；换项目即换命名空间。
+    ///
+    /// 宿主未提供项目标识时该作用域不可用，而不是退化为跨项目共享——那会让一个
+    /// 项目的数据泄漏到另一个项目。
+    Workspace,
+    /// 跨项目共享的用户级存储。
+    User,
+}
+
 /// Core 在 ReAct 循环各决策点发布的事件名。
 ///
 /// 插件在 manifest 的 `[[events]]` 中按这些名字声明订阅。名字是 Host 与 Guest 之间的

@@ -6,7 +6,7 @@
 use agent_plugin::{
     export_plugin, ActivationContext, AgentHandle, AgentId, AgentOutcome, AgentPlugin,
     AgentSpawnRequest, AgentStatus, AgentViewSession, ExtensionEvent, PluginHostApi,
-    PromptContribution, Result, ServiceCall, ServiceSpec, ToolCall, ToolPermissionScope,
+    Result, ServiceCall, ServiceSpec, ToolCall, ToolPermissionScope,
     ToolResult, ToolSpec, UiColor, UiCursor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
     UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
     UiViewInstance,
@@ -22,10 +22,6 @@ const WORKER_PROFILE: &str = "worker";
 const TEAMMATE_SERVICE: &str = "teammate.mailbox";
 /// 当前邮箱服务协议版本。
 const TEAMMATE_SERVICE_VERSION: &str = "1.0.0";
-/// 引导主 Agent 合理拆分协作任务的 developer 提示 ID。
-const TEAMMATE_ORCHESTRATION_PROMPT_ID: &str = "teammate-orchestration";
-/// 引导主 Agent 选择 teammate 工具的协作规则。
-const TEAMMATE_ORCHESTRATION_PROMPT: &str = "当任务可拆分为两个或更多相互独立的子任务、需要并行调研，或需要独立审查时，优先使用 teammate_spawn 创建角色明确的 teammate。需要队长时，必须创建独立成员并设置 captain=true；主 Agent 只负责控制团队，不能作为队长。每个团队最多一个队长。向成员提供完整且可执行的任务输入；完成后使用 teammate_result 获取结果并整合。简单、顺序依赖强或拆分成本高的任务不要创建 teammate。";
 /// 单个 owner 可创建的最大成员数。
 const MAX_MEMBERS_PER_OWNER: usize = 16;
 /// 单个成员邮箱可保留的最大未确认消息数。
@@ -1089,17 +1085,11 @@ impl AgentPlugin for TeammatePlugin {
             version: TEAMMATE_SERVICE_VERSION.into(),
             description: Some("管理隔离的 teammate 成员、短期邮箱、确认和续跑注入".into()),
         })?;
-        host.upsert_prompt(&PromptContribution {
-            id: TEAMMATE_ORCHESTRATION_PROMPT_ID.into(),
-            content: TEAMMATE_ORCHESTRATION_PROMPT.into(),
-            priority: 110,
-        })?;
         Ok(())
     }
 
-    /// 注销协作提示和 service，并清空仅对当前激活实例有效的短期状态。
+    /// 注销 service，并清空仅对当前激活实例有效的短期状态。
     fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
-        host.remove_prompt(TEAMMATE_ORCHESTRATION_PROMPT_ID)?;
         host.remove_service(TEAMMATE_SERVICE)?;
         self.plugin_id = None;
         self.state = TeamState::default();
@@ -1471,7 +1461,7 @@ fn teammate_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
             "teammate_spawn",
-            "使用受限 worker profile 创建带角色的 teammate；可将独立成员指定为唯一队长，主 Agent 不能作为队长；立即返回成员地址，不等待任务完成。",
+            "任务可拆分为两个或更多相互独立的子任务、需要并行调研或独立审查时，用受限 worker profile 创建带角色的 teammate，并提供完整可执行的任务输入。可将独立成员指定为唯一队长，主 Agent 不能作为队长；立即返回成员地址，不等待任务完成，完成后用 teammate_result 取回结果。顺序依赖强或拆分成本高的任务不要创建 teammate。",
             json!({
                 "type": "object",
                 "properties": {

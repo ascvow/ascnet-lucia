@@ -7,7 +7,7 @@
 id = "example"
 name = "Example Plugin"
 version = "0.1.0"
-api_version = "0.8.0"
+api_version = "0.9.0"
 wasm = "target/wasm32-wasip2/release/example_plugin.wasm"
 description = "示例插件"
 
@@ -89,12 +89,40 @@ ABI 基线混入其中会把“启用即可使用”误报为“当前 Guest 实
 | `agent` | 可用 | 分操作授权、profile allowlist、可信身份与卸载撤销 |
 | `model_completion` | 可用 | 应用固定 provider/model/stream，Host 禁用工具与推理并限制输出 |
 | `surface_action_allowlist` | 可用 | 按动作授权 `set_input`、会话操作或退出，禁止一项权限覆盖全部动作 |
+| `storage` | 可用 | 仅本插件私有命名空间，按 `workspace`/`user` 作用域隔离；宿主未提供项目身份时 `workspace` 不可用 |
 | `tool_scopes` | 可用 | Host 按公开工具名绑定 scope；未声明工具降级为 `unknown`，已授 component 能力会进一步抬高风险下限 |
 | `fs_write` | 尚未开放 | manifest 申请会被拒绝 |
 | `http` | 尚未开放 | manifest 申请会被拒绝 |
 | `secrets` | 尚未开放 | manifest 申请会被拒绝 |
 
 Host 不继承 WASI 环境变量、预打开目录或 stdio。需要 I/O 的插件必须使用 `PluginHostApi`。
+
+## 持久存储权限
+
+```toml
+[capabilities]
+storage = true
+```
+
+允许插件读写自己的私有持久存储。插件只能访问自身命名空间，无法枚举或触达其他插件的数据，
+也不能指定磁盘路径——路径由 Host 按插件 ID 与作用域派生。
+
+两个作用域：`workspace` 跟随当前项目，`user` 跨项目共享。项目作用域由应用通过
+`PluginHostServices::with_workspace_scope` 注入；未注入时 `workspace` 访问失败，而不是退化为
+跨项目共享。
+
+与实例状态的区别是**生命周期**而非权限范围：
+
+| | 实例状态 (`state`) | 持久存储 (`store`) |
+| --- | --- | --- |
+| 插件代码变化 | 清空 | 保留 |
+| 适用内容 | 游标、缓存等可重建的派生数据 | 记忆、索引等用户资产 |
+
+实例状态把 Component 字节混入身份，因此升级插件即换命名空间——这对派生数据是正确的，但对
+用户资产意味着一次重建就清空。持久存储因此不混入代码字节；替换 Bundle 冒名读取旧数据由
+Plugin Manager 的完整性锁与授权摘要在安装层拦截，而不是靠存储层每次哈希字节。
+
+存储受条目数与总字节配额约束，超限写入失败而不是静默丢弃。
 
 ## 模型完成权限
 
@@ -143,4 +171,4 @@ profiles = ["worker", "reviewer"]
 
 ## ABI 兼容
 
-当前 manifest 版本是 `0.8.0`，Host 只接受该版本并要求 WIT 导出完整存在。WIT 函数表面发生破坏性变化时必须升级 ABI；当前 Host 不保留旧 component 的探测加载分支。
+当前 manifest 版本是 `0.9.0`，Host 只接受该版本并要求 WIT 导出完整存在。WIT 函数表面发生破坏性变化时必须升级 ABI；当前 Host 不保留旧 component 的探测加载分支。

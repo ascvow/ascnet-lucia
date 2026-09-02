@@ -4,7 +4,9 @@ use crate::capability::agent::AgentCapabilityChecks;
 use crate::capability::process::ManagedProcess;
 use crate::capability::requests::parse_request;
 use crate::capability::requests::resolve_from;
-use crate::capability::requests::validate_state_key;
+use crate::capability::requests::{
+    validate_state_key, StoreKeyRequest, StoreScopeRequest, StoreSetRequest,
+};
 use crate::capability::requests::ExtensionEventRequest;
 use crate::capability::requests::FileEntry;
 use crate::capability::requests::IdRequest;
@@ -25,6 +27,7 @@ use crate::service::PluginServiceCall;
 use crate::service::ServiceRegistry;
 use crate::services::ModelCompletionHostServices;
 use crate::state::PluginStateStore;
+use agent_plugin_protocol::PluginStoreScope;
 use crate::ui::UiHostActionRequest;
 pub(crate) use agent::AgentRuntimeBinding;
 use agent_tool::ExecutionPolicy;
@@ -85,6 +88,8 @@ pub(crate) struct CapabilityState {
     processes: HashMap<u64, ManagedProcess>,
     next_process_handle: u64,
     state: HashMap<String, Value>,
+    /// 按作用域缓存的持久存储句柄与已加载内容。
+    stores: HashMap<PluginStoreScope, PluginStoreSlot>,
     /// 当前 Guest 回调所属的可信 Agent run；独立 RAII 绑定保证异步导出被取消时也会恢复。
     active_run_id: ActiveRunBinding,
     /// 应用可选注入的持久存储；缺失时保留实例内存语义。
@@ -170,6 +175,10 @@ pub(crate) struct CapabilityHostContext {
     execution_policy: ExecutionPolicy,
     /// 应用拥有的持久状态目录；Guest 与 manifest 均不能声明或覆盖。
     persistent_state_dir: Option<PathBuf>,
+    /// 当前项目的可信作用域标识，用于按项目隔离插件持久存储。
+    ///
+    /// 由 Host 应用层从工作区身份生成；缺失时按项目隔离的存储不可用，只保留用户级存储。
+    workspace_scope: Option<String>,
 }
 
 impl CapabilityHostContext {
@@ -182,12 +191,14 @@ impl CapabilityHostContext {
         model_completion: Option<ModelCompletionHostServices>,
         execution_policy: ExecutionPolicy,
         persistent_state_dir: Option<PathBuf>,
+        workspace_scope: Option<String>,
     ) -> Self {
         Self {
             agent_runtime,
             model_completion,
             execution_policy,
             persistent_state_dir,
+            workspace_scope,
         }
     }
 }
@@ -276,6 +287,7 @@ impl CapabilityState {
     ) -> Result<Self> {
         let state_store = host_context
             .persistent_state_dir
+            .clone()
             .map(|root| PluginStateStore::new(root, &plugin_id, &state_identity))
             .transpose()?;
         let state = state_store
@@ -283,6 +295,22 @@ impl CapabilityState {
             .map(PluginStateStore::load)
             .transpose()?
             .unwrap_or_default();
+        // 持久存储只在 manifest 显式申请且应用注入了存储目录时建立。
+        let mut stores = HashMap::new();
+        if permissions.storage {
+            if let Some(root) = host_context.persistent_state_dir.as_ref() {
+                for scope in [PluginStoreScope::User, PluginStoreScope::Workspace] {
+                    let Some(scope_key) =
+                        store_scope_key(scope, host_context.workspace_scope.as_deref())
+                    else {
+                        continue;
+                    };
+                    let store = PluginStateStore::durable(root.clone(), &plugin_id, &scope_key)?;
+                    let values = store.load()?;
+                    stores.insert(scope, PluginStoreSlot { store, values });
+                }
+            }
+        }
         Ok(Self {
             plugin_id,
             plugin_dir,
@@ -295,6 +323,7 @@ impl CapabilityState {
             processes: HashMap::new(),
             next_process_handle: 1,
             state,
+            stores,
             active_run_id: ActiveRunBinding::default(),
             state_store,
         })
@@ -362,6 +391,62 @@ impl CapabilityState {
             }),
         )?;
         Ok(Value::Null)
+    }
+
+    /// 按作用域取出持久存储槽位，并把缺失原因转换为可读的能力拒绝。
+    fn store_slot_mut(&mut self, scope: PluginStoreScope) -> Result<&mut PluginStoreSlot> {
+        if !self.permissions.storage {
+            return Err(capability_denied("插件 manifest 未声明 storage 能力"));
+        }
+        self.stores.get_mut(&scope).ok_or_else(|| {
+            capability_denied(match scope {
+                PluginStoreScope::Workspace => "当前宿主未提供项目作用域，按项目隔离的存储不可用",
+                PluginStoreScope::User => "当前宿主未启用插件持久存储目录",
+            })
+        })
+    }
+
+    /// 读取本插件持久存储中的一个键。
+    pub(crate) fn store_get(&mut self, request_json: &str) -> Result<Value> {
+        let request: StoreKeyRequest = parse_request(request_json)?;
+        validate_state_key(&request.key)?;
+        let slot = self.store_slot_mut(request.scope)?;
+        Ok(serde_json::to_value(slot.values.get(&request.key))?)
+    }
+
+    /// 事务性写入本插件持久存储；落盘失败时保留原内存值。
+    pub(crate) fn store_set(&mut self, request_json: &str) -> Result<Value> {
+        let request: StoreSetRequest = parse_request(request_json)?;
+        validate_state_key(&request.key)?;
+        let slot = self.store_slot_mut(request.scope)?;
+        let mut values = slot.values.clone();
+        values.insert(request.key, request.value);
+        slot.store.save(&values)?;
+        slot.values = values;
+        Ok(Value::Null)
+    }
+
+    /// 事务性删除本插件持久存储中的一个键；落盘失败时保留原内存值。
+    pub(crate) fn store_remove(&mut self, request_json: &str) -> Result<Value> {
+        let request: StoreKeyRequest = parse_request(request_json)?;
+        validate_state_key(&request.key)?;
+        let slot = self.store_slot_mut(request.scope)?;
+        let mut values = slot.values.clone();
+        let Some(removed) = values.remove(&request.key) else {
+            return Ok(Value::Null);
+        };
+        slot.store.save(&values)?;
+        slot.values = values;
+        Ok(removed)
+    }
+
+    /// 列出本插件持久存储中的全部键，按字典序稳定排列。
+    pub(crate) fn store_list(&mut self, request_json: &str) -> Result<Value> {
+        let request: StoreScopeRequest = parse_request(request_json)?;
+        let slot = self.store_slot_mut(request.scope)?;
+        let mut keys = slot.values.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        Ok(serde_json::to_value(keys)?)
     }
 
     /// 读取当前插件实例状态；应用注入持久目录时该映射已在激活前恢复。
@@ -511,5 +596,26 @@ impl CapabilityState {
             "插件无权读取路径：{}",
             requested.display()
         )))
+    }
+}
+
+/// 一个作用域下已加载的持久存储。
+struct PluginStoreSlot {
+    /// 该作用域对应的磁盘地址。
+    store: PluginStateStore,
+    /// 已加载的键值映射；写入成功后才更新，保证与磁盘一致。
+    values: HashMap<String, Value>,
+}
+
+/// 返回持久存储作用域的可信命名空间标识。
+///
+/// 按项目隔离需要宿主提供工作区标识；缺失时返回 `None`，对应作用域直接不可用，
+/// 而不是退化成跨项目共享——那会让一个项目的数据泄漏到另一个项目。
+fn store_scope_key(scope: PluginStoreScope, workspace_scope: Option<&str>) -> Option<String> {
+    match scope {
+        PluginStoreScope::User => Some("user".to_string()),
+        PluginStoreScope::Workspace => workspace_scope
+            .filter(|scope| !scope.trim().is_empty())
+            .map(|scope| format!("workspace:{scope}")),
     }
 }

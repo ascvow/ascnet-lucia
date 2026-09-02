@@ -284,7 +284,7 @@ fn process_state(process_exec: bool, execution_policy: ExecutionPolicy) -> Capab
         },
         Arc::new(ContributionRegistry::default()),
         Arc::new(ServiceRegistry::default()),
-        CapabilityHostContext::new(None, None, execution_policy, None),
+        CapabilityHostContext::new(None, None, execution_policy, None, None),
     )
     .expect("创建进程测试能力状态")
 }
@@ -342,7 +342,7 @@ fn persistent_instance_state_survives_recreation() {
             CapabilitySection::default(),
             Arc::new(ContributionRegistry::default()),
             Arc::new(ServiceRegistry::default()),
-            CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), Some(root.clone())),
+            CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), Some(root.clone()), Some("test-workspace".into())),
         )
         .expect("创建持久能力状态")
     };
@@ -377,7 +377,7 @@ fn persistent_permission_state_is_isolated_by_bundle_identity() {
             CapabilitySection::default(),
             Arc::new(ContributionRegistry::default()),
             Arc::new(ServiceRegistry::default()),
-            CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), Some(root.clone())),
+            CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), Some(root.clone()), Some("test-workspace".into())),
         )
         .expect("创建持久能力状态")
     };
@@ -1034,4 +1034,184 @@ async fn service_call_ignores_forged_caller_id() {
             value_kind: JsonValueKind::Object
         }
     );
+}
+
+/// 构造申请了持久存储能力的测试用能力状态。
+fn storage_state(
+    root: &std::path::Path,
+    plugin_id: &str,
+    state_identity: &str,
+    workspace: Option<&str>,
+) -> CapabilityState {
+    CapabilityState::new(
+        plugin_id.into(),
+        state_identity.into(),
+        PathBuf::from("."),
+        CapabilitySection {
+            storage: true,
+            ..CapabilitySection::default()
+        },
+        Arc::new(ContributionRegistry::default()),
+        Arc::new(ServiceRegistry::default()),
+        CapabilityHostContext::new(
+            None,
+            None,
+            ExecutionPolicy::serve(),
+            Some(root.to_path_buf()),
+            workspace.map(str::to_string),
+        ),
+    )
+    .expect("创建持久存储能力状态")
+}
+
+/// 创建一次性测试目录。
+fn storage_test_root(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "lucia-plugin-store-{name}-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+}
+
+/// 持久存储必须跨 Bundle 身份保留——插件升级不能清空用户数据。
+///
+/// 这正是它与私有 state 的分界：state 换代码即换命名空间，store 不换。
+#[test]
+fn durable_store_survives_bundle_identity_change() {
+    let root = storage_test_root("upgrade");
+
+    let mut original = storage_state(&root, "memory", "bundle-a", Some("project-a"));
+    original
+        .store_set(r#"{"scope":"workspace","key":"fact-1","value":"用户偏好 Bun"}"#)
+        .expect("写入持久存储");
+
+    // 代码字节变化会产生新的 Bundle 身份，私有 state 会因此清空。
+    let mut upgraded = storage_state(&root, "memory", "bundle-b", Some("project-a"));
+    assert_eq!(
+        upgraded
+            .store_get(r#"{"scope":"workspace","key":"fact-1"}"#)
+            .expect("读取持久存储"),
+        json!("用户偏好 Bun")
+    );
+
+    std::fs::remove_dir_all(root).expect("清理持久存储测试目录");
+}
+
+/// 不同项目的工作区存储必须互相不可见。
+#[test]
+fn workspace_store_is_isolated_by_project() {
+    let root = storage_test_root("workspace");
+
+    let mut first = storage_state(&root, "memory", "bundle-a", Some("project-a"));
+    first
+        .store_set(r#"{"scope":"workspace","key":"note","value":"甲项目"}"#)
+        .expect("写入甲项目存储");
+
+    let mut second = storage_state(&root, "memory", "bundle-a", Some("project-b"));
+    assert_eq!(
+        second
+            .store_get(r#"{"scope":"workspace","key":"note"}"#)
+            .expect("读取乙项目存储"),
+        Value::Null
+    );
+
+    std::fs::remove_dir_all(root).expect("清理持久存储测试目录");
+}
+
+/// 不同插件的持久存储必须互相不可见。
+#[test]
+fn durable_store_is_isolated_by_plugin() {
+    let root = storage_test_root("plugin");
+
+    let mut owner = storage_state(&root, "memory", "bundle-a", Some("project-a"));
+    owner
+        .store_set(r#"{"scope":"user","key":"secret","value":"仅记忆插件可见"}"#)
+        .expect("写入本插件存储");
+
+    let mut other = storage_state(&root, "workflow", "bundle-a", Some("project-a"));
+    assert_eq!(
+        other
+            .store_get(r#"{"scope":"user","key":"secret"}"#)
+            .expect("读取其他插件存储"),
+        Value::Null
+    );
+
+    std::fs::remove_dir_all(root).expect("清理持久存储测试目录");
+}
+
+/// 未声明 storage 能力的插件不得访问持久存储。
+#[test]
+fn store_requires_declared_capability() {
+    let root = storage_test_root("denied");
+    let mut state = CapabilityState::new(
+        "memory".into(),
+        "bundle-a".into(),
+        PathBuf::from("."),
+        CapabilitySection::default(),
+        Arc::new(ContributionRegistry::default()),
+        Arc::new(ServiceRegistry::default()),
+        CapabilityHostContext::new(
+            None,
+            None,
+            ExecutionPolicy::serve(),
+            Some(root.clone()),
+            Some("project-a".into()),
+        ),
+    )
+    .expect("创建未声明存储能力的状态");
+
+    let error = state
+        .store_get(r#"{"scope":"user","key":"any"}"#)
+        .expect_err("未声明能力必须拒绝");
+    assert!(error.to_string().contains("storage"), "{error}");
+}
+
+/// 宿主未提供项目标识时，按项目隔离的存储必须不可用而不是退化为跨项目共享。
+#[test]
+fn workspace_store_is_unavailable_without_project_scope() {
+    let root = storage_test_root("no-scope");
+    let mut state = storage_state(&root, "memory", "bundle-a", None);
+
+    let error = state
+        .store_set(r#"{"scope":"workspace","key":"note","value":"x"}"#)
+        .expect_err("缺少项目作用域必须拒绝");
+    assert!(error.to_string().contains("项目作用域"), "{error}");
+
+    // 用户级存储仍然可用。
+    state
+        .store_set(r#"{"scope":"user","key":"note","value":"x"}"#)
+        .expect("用户级存储应可用");
+
+    std::fs::remove_dir_all(root).expect("清理持久存储测试目录");
+}
+
+/// 列键按字典序稳定返回，删除后不再出现。
+#[test]
+fn store_list_is_stable_and_reflects_removals() {
+    let root = storage_test_root("list");
+    let mut state = storage_state(&root, "memory", "bundle-a", Some("project-a"));
+    for key in ["gamma", "alpha", "beta"] {
+        state
+            .store_set(&format!(r#"{{"scope":"user","key":"{key}","value":1}}"#))
+            .expect("写入持久存储");
+    }
+
+    assert_eq!(
+        state
+            .store_list(r#"{"scope":"user"}"#)
+            .expect("列出持久存储键"),
+        json!(["alpha", "beta", "gamma"])
+    );
+
+    state
+        .store_remove(r#"{"scope":"user","key":"beta"}"#)
+        .expect("删除持久存储键");
+    assert_eq!(
+        state
+            .store_list(r#"{"scope":"user"}"#)
+            .expect("列出持久存储键"),
+        json!(["alpha", "gamma"])
+    );
+
+    std::fs::remove_dir_all(root).expect("清理持久存储测试目录");
 }

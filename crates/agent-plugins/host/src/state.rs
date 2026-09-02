@@ -1,4 +1,14 @@
-//! Plugin Host 可选的按插件隔离持久状态。
+//! Plugin Host 可选的按插件隔离磁盘存储。
+//!
+//! 同一套文件机制承载两类语义不同的数据：
+//!
+//! - **私有状态**（`volatile`）：命名空间绑定 Bundle 身份，插件代码字节变化即换命名空间，
+//!   新二进制不得继承旧二进制的私有数据。适合缓存、句柄一类的临时草稿。
+//! - **持久存储**（`durable`）：命名空间只绑定插件 ID 与作用域，**跨版本保留**。
+//!   适合记忆、索引一类的用户数据——这类数据在插件升级后必须还在，否则功能本身不成立。
+//!
+//! 两者的替身攻击面由不同层负责：私有状态靠字节摘要，持久存储靠 Plugin Manager 的
+//! 完整性锁与授权摘要——替换 bundle 需要重新授权，这正是身份应该被把关的地方。
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,20 +26,33 @@ use std::{
 
 /// 单个插件状态文件的最大编码大小，防止 Guest 借助多次小写入形成无界文件。
 const MAX_PLUGIN_STATE_BYTES: usize = 1024 * 1024;
+/// 单个插件持久存储文件的最大编码大小。
+///
+/// 比私有状态宽松：记忆、索引一类的用户数据本就需要更大容量，但仍需硬上限，
+/// 避免插件把整个磁盘写满。
+const MAX_PLUGIN_STORE_BYTES: usize = 8 * 1024 * 1024;
 /// 单个插件允许持有的最大状态键数量。
 const MAX_PLUGIN_STATE_ENTRIES: usize = 1024;
+/// 单个插件持久存储允许持有的最大键数量。
+const MAX_PLUGIN_STORE_ENTRIES: usize = 8192;
+/// 持久存储所在的子目录；与私有状态分开存放，便于用户单独查看与备份。
+const DURABLE_SUBDIRECTORY: &str = "durable";
 /// 当前磁盘状态信封版本；该版本独立于插件 ABI 与 manifest 版本。
 const PLUGIN_STATE_SCHEMA_VERSION: u32 = 2;
 /// 临时文件名使用的进程内序号，避免同一进程连续写入发生冲突。
 static STATE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// 单个插件的可选持久状态文件；未注入该对象时 Host 保持原有内存语义。
+/// 单个插件的可选磁盘存储文件；未注入该对象时 Host 保持原有内存语义。
 #[derive(Clone)]
 pub(crate) struct PluginStateStore {
     root: PathBuf,
     path: PathBuf,
     plugin_id: String,
     state_identity: String,
+    /// 该文件的容量上限，由构造入口按语义选择。
+    max_bytes: usize,
+    /// 该文件的键数量上限。
+    max_entries: usize,
 }
 
 /// 磁盘中的版本化插件状态信封。
@@ -48,6 +71,44 @@ impl PluginStateStore {
     /// `state_identity` 必须由 Host 根据真实 Component 与 capability profile 生成，不能接受
     /// manifest metadata 或 Guest 输入。文件名使用摘要编码，禁止路径分隔符进入目标路径。
     pub(crate) fn new(root: PathBuf, plugin_id: &str, state_identity: &str) -> Result<Self> {
+        Self::with_namespace(
+            root,
+            plugin_id,
+            state_identity,
+            b"lucia-plugin-state-v2\0",
+            MAX_PLUGIN_STATE_BYTES,
+            MAX_PLUGIN_STATE_ENTRIES,
+        )
+    }
+
+    /// 创建跨插件版本保留的持久存储地址。
+    ///
+    /// 命名空间只由插件 ID 与 `scope_key` 决定，**刻意不含 Component 字节**：记忆、索引
+    /// 一类的用户数据在插件升级后必须还在，把代码字节算进命名空间会让每次重建都清空
+    /// 用户数据，功能本身就不成立。替换 bundle 的身份把关交给 Plugin Manager 的完整性锁
+    /// 与授权摘要，那里才是能真正区分"升级"与"替身"的位置。
+    ///
+    /// `scope_key` 由 Host 生成（用户级或按项目隔离），不接受 Guest 输入。
+    pub(crate) fn durable(root: PathBuf, plugin_id: &str, scope_key: &str) -> Result<Self> {
+        Self::with_namespace(
+            root.join(DURABLE_SUBDIRECTORY),
+            plugin_id,
+            scope_key,
+            b"lucia-plugin-store-v1\0",
+            MAX_PLUGIN_STORE_BYTES,
+            MAX_PLUGIN_STORE_ENTRIES,
+        )
+    }
+
+    /// 按命名空间标签派生隔离存储地址；文件名使用摘要编码，禁止路径分隔符进入目标路径。
+    fn with_namespace(
+        root: PathBuf,
+        plugin_id: &str,
+        state_identity: &str,
+        namespace: &[u8],
+        max_bytes: usize,
+        max_entries: usize,
+    ) -> Result<Self> {
         if root.as_os_str().is_empty() {
             bail!("插件状态目录不能为空");
         }
@@ -58,7 +119,7 @@ impl PluginStateStore {
             bail!("插件状态可信身份无效");
         }
         let mut digest = Sha256::new();
-        digest.update(b"lucia-plugin-state-v2\0");
+        digest.update(namespace);
         update_identity_field(&mut digest, plugin_id.as_bytes());
         update_identity_field(&mut digest, state_identity.as_bytes());
         let encoded_id = format!("{:x}", digest.finalize());
@@ -68,6 +129,8 @@ impl PluginStateStore {
             path,
             plugin_id: plugin_id.to_string(),
             state_identity: state_identity.to_string(),
+            max_bytes,
+            max_entries,
         })
     }
 
@@ -84,8 +147,12 @@ impl PluginStateStore {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             bail!("插件状态必须是非符号链接普通文件：{}", self.path.display());
         }
-        if metadata.len() > MAX_PLUGIN_STATE_BYTES as u64 {
-            bail!("插件状态文件超过 1 MiB 限制：{}", self.path.display());
+        if metadata.len() > self.max_bytes as u64 {
+            bail!(
+                "插件状态文件超过 {} 字节限制：{}",
+                self.max_bytes,
+                self.path.display()
+            );
         }
         let bytes = fs::read(&self.path)
             .with_context(|| format!("读取插件状态失败：{}", self.path.display()))?;
@@ -104,13 +171,13 @@ impl PluginStateStore {
         if stored.state_identity != self.state_identity {
             bail!("插件状态 Bundle 身份不匹配：期望 `{}`", self.plugin_id);
         }
-        validate_values(&stored.values)?;
+        validate_values(&stored.values, self.max_entries)?;
         Ok(stored.values)
     }
 
     /// 原子保存完整状态映射；任一步失败时不会提交调用方的新内存状态。
     pub(crate) fn save(&self, values: &HashMap<String, Value>) -> Result<()> {
-        validate_values(values)?;
+        validate_values(values, self.max_entries)?;
         ensure_real_state_directory(&self.root)?;
         match fs::symlink_metadata(&self.path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -130,8 +197,8 @@ impl PluginStateStore {
             values: values.clone(),
         })
         .context("序列化插件状态失败")?;
-        if contents.len() > MAX_PLUGIN_STATE_BYTES {
-            bail!("插件状态编码超过 1 MiB 限制");
+        if contents.len() > self.max_bytes {
+            bail!("插件状态编码超过 {} 字节限制", self.max_bytes);
         }
 
         let sequence = STATE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -178,9 +245,9 @@ fn update_identity_field(digest: &mut Sha256, value: &[u8]) {
 }
 
 /// 校验持久映射的数量和键边界，防止绕过 Guest 请求校验注入异常磁盘状态。
-fn validate_values(values: &HashMap<String, Value>) -> Result<()> {
-    if values.len() > MAX_PLUGIN_STATE_ENTRIES {
-        bail!("插件状态键数量超过 {MAX_PLUGIN_STATE_ENTRIES} 项限制");
+fn validate_values(values: &HashMap<String, Value>, max_entries: usize) -> Result<()> {
+    if values.len() > max_entries {
+        bail!("插件状态键数量超过 {max_entries} 项限制");
     }
     for key in values.keys() {
         if key.trim().is_empty() || key.len() > 256 {

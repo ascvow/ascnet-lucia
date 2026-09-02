@@ -42,7 +42,7 @@ wit-bindgen = "0.59"
 id = "my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = "0.8.0"
+api_version = "0.9.0"
 wasm = "target/wasm32-wasip2/release/my_plugin.wasm"
 description = "提供示例工具的 Lucia 插件。"
 

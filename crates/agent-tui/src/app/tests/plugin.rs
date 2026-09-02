@@ -203,7 +203,7 @@ fn explicit_plugin_manifest_overrides_managed_manifest() {
     fs::create_dir_all(&root).expect("创建插件合并测试目录");
     let manifest = |id: &str, name: &str| {
         format!(
-            "[plugin]\nid = \"{id}\"\nname = \"{name}\"\nversion = \"1.0.0\"\napi_version = \"0.8.0\"\nwasm = \"plugin.wasm\"\n"
+            "[plugin]\nid = \"{id}\"\nname = \"{name}\"\nversion = \"1.0.0\"\napi_version = \"0.9.0\"\nwasm = \"plugin.wasm\"\n"
         )
     };
     fs::write(&explicit, manifest("mcp", "显式 MCP")).expect("写入显式插件 manifest");
@@ -280,7 +280,7 @@ fn disabled_plugins_are_removed_from_runtime_composition() {
     fs::create_dir_all(&root).expect("创建插件禁用测试目录");
     let manifest = |id: &str| {
         format!(
-            "[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1.0.0\"\napi_version = \"0.8.0\"\nwasm = \"plugin.wasm\"\n"
+            "[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1.0.0\"\napi_version = \"0.9.0\"\nwasm = \"plugin.wasm\"\n"
         )
     };
     let teammate = root.join("teammate.toml");

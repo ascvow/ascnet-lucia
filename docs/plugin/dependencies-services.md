@@ -17,7 +17,7 @@ Lucia 的插件组合分为两层：manifest 依赖保证插件存在、版本�
 id = "audit-consumer"
 name = "Audit Consumer"
 version = "1.0.0"
-api_version = "0.8.0"
+api_version = "0.9.0"
 wasm = "target/wasm32-wasip2/release/audit_consumer.wasm"
 
 [[dependencies]]

@@ -527,6 +527,7 @@ impl WasmPluginHost {
                             host_services.model_completion(),
                             host_services.execution_policy(),
                             host_services.persistent_state_dir(),
+                            host_services.workspace_scope(),
                         ),
                     )?,
                     store_limits,

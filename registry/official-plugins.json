@@ -35,6 +35,12 @@
       "crate": "permission-plugin",
       "directory": "examples/plugins/permission-plugin",
       "files": ["plugin.toml", "target/wasm32-wasip2/release/permission_plugin.wasm"]
+    },
+    {
+      "id": "memory",
+      "crate": "memory-plugin",
+      "directory": "examples/plugins/memory-plugin",
+      "files": ["plugin.toml", "target/wasm32-wasip2/release/memory_plugin.wasm"]
     }
   ]
 }

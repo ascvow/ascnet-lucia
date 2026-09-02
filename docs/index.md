@@ -58,4 +58,5 @@ Lucia 同时提供可直接使用的终端 Agent 和可嵌入、可扩展的 Rus
 | 多 Agent 协作 | `examples/plugins/teammate-plugin` |
 | 工作流 | `examples/plugins/workflow-plugin` |
 | 结构化计划 | `examples/plugins/plan-plugin` |
+| 跨会话记忆 | `examples/plugins/memory-plugin` |
 | 插件 TUI | `examples/plugins/ui-showcase-plugin` |

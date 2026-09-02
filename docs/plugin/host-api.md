@@ -43,6 +43,25 @@ Host 会覆盖事件的 `source`，插件不能伪造其他 owner。静态 `list
 ID、真实加载来源、Component 字节、版本和 capability profile 生成可信身份，事务性保存并只在
 身份一致的插件重新加载前恢复，Guest 不接触也不能声明实际状态路径。
 
+## 持久存储
+
+| 方法 | 说明 |
+| --- | --- |
+| `store_get(scope, key)` | 读取 JSON 值，不存在返回 `None` |
+| `store_set(scope, key, value)` | 写入或替换 JSON 值 |
+| `store_remove(scope, key)` | 删除并返回旧值 |
+| `store_list(scope)` | 按字典序列出该作用域全部键 |
+
+需要 manifest 声明 `storage = true`。`scope` 为 `PluginStoreScope::Workspace`（跟随当前项目）
+或 `PluginStoreScope::User`（跨项目共享）。插件只能访问自身命名空间。
+
+与上面的实例状态区别在生命周期：state 在插件代码变化时清空，适合游标一类可重建的派生数据；
+store 跨插件版本保留，适合记忆、索引等用户资产。判断标准是"重建插件后丢了会不会让用户损失
+东西"——会，就用 store。
+
+宿主未注入项目作用域时 `Workspace` 访问失败而不是退化为跨项目共享，插件应据此降级为只用
+`User` 作用域，而不是把项目数据写进用户级。
+
 ## 插件服务
 
 | 方法 | 说明 |

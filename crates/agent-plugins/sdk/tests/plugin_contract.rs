@@ -14,7 +14,7 @@ const HOST_WASM_SOURCES: &[&str] = &[
     include_str!("../../host/src/wasm/mod.rs"),
     include_str!("../../host/src/wasm/linker.rs"),
 ];
-const WIT_PACKAGE: &str = "package ascnet:lucia-plugin@0.8.0;";
+const WIT_PACKAGE: &str = "package ascnet:lucia-plugin@0.9.0;";
 
 /// 读取单一 UI 契约样本。
 fn ui_fixture() -> Value {

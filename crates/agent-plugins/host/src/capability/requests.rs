@@ -6,6 +6,7 @@ use crate::capability::{
     MAX_PROCESS_ENV_BYTES, MAX_PROCESS_ENV_ENTRIES,
 };
 use agent_core::model::ModelMessage;
+use agent_plugin_protocol::PluginStoreScope;
 use agent_runtime::AgentId;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -259,4 +260,31 @@ pub(crate) fn validate_state_key(key: &str) -> Result<()> {
         return Err(anyhow!("插件状态键不能超过 256 字节"));
     }
     Ok(())
+}
+
+/// 指定持久存储作用域的请求。
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StoreScopeRequest {
+    /// 目标作用域。
+    pub(crate) scope: PluginStoreScope,
+}
+
+/// 指定持久存储作用域与键的请求。
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StoreKeyRequest {
+    /// 目标作用域。
+    pub(crate) scope: PluginStoreScope,
+    /// 目标键。
+    pub(crate) key: String,
+}
+
+/// 写入持久存储的请求。
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StoreSetRequest {
+    /// 目标作用域。
+    pub(crate) scope: PluginStoreScope,
+    /// 目标键。
+    pub(crate) key: String,
+    /// 待写入的值。
+    pub(crate) value: Value,
 }

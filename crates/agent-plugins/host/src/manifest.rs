@@ -13,7 +13,7 @@ use std::{
 };
 
 /// 当前支持的插件 ABI 版本。
-pub const SUPPORTED_PLUGIN_API_VERSION: &str = "0.8.0";
+pub const SUPPORTED_PLUGIN_API_VERSION: &str = "0.9.0";
 
 /// 上下文加载器使用的标准能力 ID。
 pub const CONTEXT_LOADER_CAPABILITY: &str = "agent.context-loader";
@@ -305,7 +305,7 @@ manifest = "/opt/lucia/plugin.toml"
                 id = "workflow"
                 name = "Workflow"
                 version = "1.0.0"
-                api_version = "0.8.0"
+                api_version = "0.9.0"
                 wasm = "workflow.wasm"
 
                 [capabilities.agent]
@@ -400,7 +400,7 @@ manifest = "/opt/lucia/plugin.toml"
         let error = manifest
             .validate()
             .expect_err("旧 ABI manifest 必须在 component 加载前失败");
-        assert!(error.to_string().contains("仅支持当前版本 `0.8.0`"));
+        assert!(error.to_string().contains("仅支持当前版本 `0.9.0`"));
     }
 
     /// Spawn 权限必须同时声明至少一个可请求的 profile。
@@ -413,6 +413,35 @@ manifest = "/opt/lucia/plugin.toml"
             .validate()
             .expect_err("缺少 profile allowlist 时必须失败");
         assert!(error.to_string().contains("至少一个 profiles"));
+    }
+
+    /// 持久存储已实现，manifest 声明必须被接受。
+    #[test]
+    fn storage_capability_is_supported() {
+        let mut manifest = test_manifest("memory", "1.0.0", Vec::new());
+        manifest.capabilities = CapabilitySection {
+            storage: true,
+            ..CapabilitySection::default()
+        };
+
+        manifest
+            .capabilities
+            .validate_supported()
+            .expect("持久存储能力应被接受");
+    }
+
+    /// 持久存储只触达插件自己的命名空间，不得抬高工具权限下限。
+    ///
+    /// 抬高会让记忆写入这类纯内部调用退化为逐次审批：没有换来任何外部访问约束，
+    /// 只是把审批噪声堆到用户面前。
+    #[test]
+    fn storage_capability_does_not_raise_tool_permission_floor() {
+        let capabilities = CapabilitySection {
+            storage: true,
+            ..CapabilitySection::default()
+        };
+
+        assert_eq!(capabilities.component_capability_scope_floor(), None);
     }
 
     /// Guest 声明不得在 Host 尚无真实实现时打开网络或 Secret 能力。
@@ -902,6 +931,14 @@ pub struct CapabilitySection {
     /// 插件是否希望通过宿主 API 读取 secret。
     #[serde(default)]
     pub secrets: bool,
+
+    /// 插件是否申请跨版本保留的私有持久存储。
+    ///
+    /// 与 `state` 的区别是生命周期而非权限范围：两者都只能访问本插件自己的命名空间，
+    /// 但 `state` 在插件代码变化时清空，`storage` 跨版本保留。记忆、索引一类的用户
+    /// 数据必须用 `storage`，否则一次插件升级就会清空用户资产。
+    #[serde(default)]
+    pub storage: bool,
 
     /// 插件请求读取的路径。
     #[serde(default)]

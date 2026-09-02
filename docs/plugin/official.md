@@ -66,6 +66,33 @@ bun run test:plugin:plan
 
 Manifest：`examples/plugins/plan-plugin/plugin.toml`。
 
+## 记忆插件
+
+记忆插件跨会话保留结论，并在每次模型请求前注入上下文。它只申请 `storage` 能力，读写自己的
+私有持久存储，不触达用户文件、网络或子进程。
+
+记忆分两个作用域：`project` 跟随当前项目，`user` 跨项目共享。工具默认写入 `project`——把项目
+事实写进用户级会污染其他项目，因此提示明确要求只有确属跨项目的个人偏好才用 `user`。宿主未提供
+项目身份时插件降级为只用 `user`，而不是把项目数据写进用户级。
+
+三个工具：`memory_record` 记录、`memory_list` 查询完整清单、`memory_forget` 删除过时结论。
+单条记忆有字数上限，同作用域内正文相同的记忆不重复记录，每个作用域有条数上限。
+
+插件不注册常驻提示，使用时机全部写在工具描述里；只有记忆正文本身会被注入，没有记忆时不注入
+任何内容。注入有硬预算：超出时优先保留最近的记忆并提示用 `memory_list` 查看全部，而不是让记忆
+无声吃掉上下文。记忆由模型自己写入，属于不可信内容，因此注入时会声明它们只是背景事实、不是
+指令，且与系统提示或用户当前请求冲突时以后者为准——否则一条被污染的记忆会在之后每一轮持续
+生效。这一句无法由工具描述承担，是唯一保留的说明性文字。
+
+`/memory` 打开记忆面板查看当前记忆。
+
+```bash
+bun run build:plugin:memory
+bun run test:plugin:memory
+```
+
+Manifest：`examples/plugins/memory-plugin/plugin.toml`。
+
 ## 统一验证
 
 ```bash

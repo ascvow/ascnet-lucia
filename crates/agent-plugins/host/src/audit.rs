@@ -407,6 +407,9 @@ pub fn snapshot_manifest_capabilities(
     if capabilities.secrets {
         requested.push(capability_request("secrets"));
     }
+    if capabilities.storage {
+        requested.push(capability_request("storage"));
+    }
     if !capabilities.fs_read.is_empty() {
         requested.push(ManifestCapabilityRequest {
             capability_id: "fs_read".into(),
@@ -828,7 +831,7 @@ mod tests {
                 id = "consumer"
                 name = "Consumer"
                 version = "1.0.0"
-                api_version = "0.8.0"
+                api_version = "0.9.0"
                 wasm = "consumer.wasm"
 
                 [capabilities]
@@ -863,7 +866,7 @@ mod tests {
                 id = "consumer"
                 name = "Consumer"
                 version = "1.0.0"
-                api_version = "0.8.0"
+                api_version = "0.9.0"
                 wasm = "consumer.wasm"
 
                 [[dependencies]]
@@ -900,7 +903,7 @@ mod tests {
                 id = "minimal"
                 name = "Minimal"
                 version = "1.0.0"
-                api_version = "0.8.0"
+                api_version = "0.9.0"
                 wasm = "minimal.wasm"
             "#,
         );
@@ -957,7 +960,7 @@ mod tests {
                 id = "provider-b"
                 name = "Provider B"
                 version = "1.0.0"
-                api_version = "0.8.0"
+                api_version = "0.9.0"
                 wasm = "provider-b.wasm"
 
                 [[provides]]
@@ -972,7 +975,7 @@ mod tests {
                 id = "provider-a"
                 name = "Provider A"
                 version = "1.0.0"
-                api_version = "0.8.0"
+                api_version = "0.9.0"
                 wasm = "provider-a.wasm"
 
                 [[provides]]

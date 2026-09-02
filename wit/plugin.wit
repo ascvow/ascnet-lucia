@@ -1,4 +1,4 @@
-package ascnet:lucia-plugin@0.8.0;
+package ascnet:lucia-plugin@0.9.0;
 
 /// ascnet-lucia 的 WASM 插件 world。
 ///
@@ -27,6 +27,20 @@ world plugin {
 
   /// 删除插件实例内存状态。
   import host-state-remove: func(request-json: string) -> string;
+
+  /// 读取插件私有持久存储中的一个键。
+  ///
+  /// 与 state 的区别是生命周期：state 在插件代码变化时清空，store 跨版本保留。
+  import host-store-get: func(request-json: string) -> string;
+
+  /// 写入插件私有持久存储。
+  import host-store-set: func(request-json: string) -> string;
+
+  /// 删除插件私有持久存储中的一个键。
+  import host-store-remove: func(request-json: string) -> string;
+
+  /// 列出插件私有持久存储中指定作用域下的全部键。
+  import host-store-list: func(request-json: string) -> string;
 
   /// 注册或替换当前插件拥有的服务。
   import host-service-upsert: func(request-json: string) -> string;

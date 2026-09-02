@@ -1,9 +1,9 @@
-# WIT API 0.8
+# WIT API 0.9
 
-Lucia 插件 ABI 的 world 是 `ascnet:lucia-plugin@0.8.0`。WIT 只固定函数名和 `string` 边界，业务结构通过 JSON 传递；这样可选字段可以按 serde 默认值演进，而不必为每个字段变化重写 Component 类型。
+Lucia 插件 ABI 的 world 是 `ascnet:lucia-plugin@0.9.0`。WIT 只固定函数名和 `string` 边界，业务结构通过 JSON 传递；这样可选字段可以按 serde 默认值演进，而不必为每个字段变化重写 Component 类型。
 
 ```txt
-package ascnet:lucia-plugin@0.8.0;
+package ascnet:lucia-plugin@0.9.0;
 
 world plugin {
   // Host imports
@@ -42,7 +42,7 @@ world plugin {
 }
 ```
 
-- `schema_version`：Host 能力响应信封版本，当前为 `1`，与插件 ABI `0.8.0` 独立。
+- `schema_version`：Host 能力响应信封版本，当前为 `1`，与插件 ABI `0.9.0` 独立。
 - `ok = true`：读取 `value`；无返回值的操作使用 JSON `null`。
 - `ok = false`：读取 `error`，不得同时把缺失 `value` 当作成功空值。
 - Guest SDK 的 `decode_host_response<T>` 会把失败信封转为 Rust `Err`，并把 `value` 反序列化为目标类型。
@@ -181,6 +181,57 @@ Rust SDK：`set_state(key, value) -> Result<()>`。
 成功 `value` 是被删除的旧 JSON；不存在时为 `null`。
 
 Rust SDK：`remove_state(key) -> Result<Option<Value>>`。
+
+## 持久存储 imports
+
+需要 manifest 声明 `storage = true`。所有请求都带 `scope`，取值为 `"workspace"` 或 `"user"`。
+插件只能访问自己的命名空间；Host 按插件 ID 与作用域派生路径，Guest 不接触也不能声明路径。
+
+与实例状态的区别是生命周期：state 在插件代码变化时清空，store 跨版本保留。
+
+### `host-store-get`
+
+```json
+{ "scope": "workspace", "key": "memories" }
+```
+
+成功 `value` 是此前保存的任意 JSON；不存在时为 `null`。
+
+Rust SDK：`store_get(scope, key) -> Result<Option<Value>>`。
+
+### `host-store-set`
+
+```json
+{
+  "scope": "workspace",
+  "key": "memories",
+  "value": { "entries": [] }
+}
+```
+
+写入或替换任意 JSON，成功 `value` 为 `null`。超出条目数或字节配额时失败。
+
+Rust SDK：`store_set(scope, key, value) -> Result<()>`。
+
+### `host-store-remove`
+
+```json
+{ "scope": "user", "key": "memories" }
+```
+
+成功 `value` 是被删除的旧 JSON；不存在时为 `null`。
+
+Rust SDK：`store_remove(scope, key) -> Result<Option<Value>>`。
+
+### `host-store-list`
+
+```json
+{ "scope": "user" }
+```
+
+成功 `value` 是该作用域下全部键的字典序数组。
+
+Rust SDK：`store_list(scope) -> Result<Vec<String>>`。
 
 ## 插件服务 imports
 
@@ -827,7 +878,7 @@ Host 会验证工具 owner、覆盖 `plugin_id`，并维护 `tool_name -> render
 
 ## 兼容规则
 
-1. Host 当前只加载 manifest `api_version = "0.8.0"`，且要求 world 的全部 exports 存在。0.7 插件因 `on-event` 签名变化无法加载，必须重新编译。
+1. Host 当前只加载 manifest `api_version = "0.9.0"`，且要求 world 的全部 exports 存在。0.7 插件因 `on-event` 签名变化无法加载，必须重新编译。
 2. 修改 WIT import/export、删除或改名函数、改变字符串返回含义时必须升级插件 ABI。
 3. JSON 新字段必须可选并提供 serde 默认值；读取方必须忽略未知加法字段。
 4. 删除、改名、收紧枚举或改变既有字段含义属于破坏性变化，需要升级对应协议。

@@ -2,7 +2,7 @@
 
 use agent_plugin::{
     core_events, export_plugin, ActivationContext, AgentPlugin, EventOutcome, PluginEvent,
-    PluginHostApi, PromptContribution, Result, RunFinishEventData, ToolCall, ToolPermissionScope,
+    PluginHostApi, Result, RunFinishEventData, ToolCall, ToolPermissionScope,
     ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
     UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
     UiViewInstance,
@@ -23,10 +23,6 @@ const PLAN_SCHEMA_VERSION: u32 = 1;
 const PLAN_SHELF_CONTENT_LINES: usize = 5;
 /// 紧凑计划架的总布局高度，包含一行宿主顶部分隔线。
 const PLAN_SHELF_HEIGHT: u16 = 6;
-/// 引导主 Agent 使用结构化计划的 developer 提示 ID。
-const PLAN_MANAGEMENT_PROMPT_ID: &str = "plan-management";
-/// 引导主 Agent 在复杂任务中维护结构化计划的规则。
-const PLAN_MANAGEMENT_PROMPT: &str = "面对多步骤、持续时间较长，或需要向用户清晰呈现进度的任务时，先使用 update_plan 建立简短、可验证的计划。执行过程中及时将已完成步骤标记为 completed，并保持至多一个 in_progress 步骤。简单的一步问答或无需追踪的任务不要创建计划。";
 
 /// 单个计划步骤的执行状态。
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -169,17 +165,12 @@ impl AgentPlugin for PlanPlugin {
         } else {
             host.set_state(PLAN_STATE_KEY, &serde_json::to_value(&self.state)?)?;
         }
-        host.upsert_prompt(&PromptContribution {
-            id: PLAN_MANAGEMENT_PROMPT_ID.into(),
-            content: PLAN_MANAGEMENT_PROMPT.into(),
-            priority: 110,
-        })?;
         Ok(())
     }
 
-    /// 删除本插件注册的计划提示，保留持久化计划状态供下次激活恢复。
-    fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
-        host.remove_prompt(PLAN_MANAGEMENT_PROMPT_ID)
+    /// 保留持久化计划状态供下次激活恢复；插件不注册常驻提示，使用时机由工具描述承载。
+    fn deactivate(&mut self, _host: &dyn PluginHostApi) -> Result<()> {
+        Ok(())
     }
 
     /// 返回更新和读取当前计划的模型工具。
@@ -433,7 +424,7 @@ impl PlanPlugin {
 fn update_plan_tool() -> ToolSpec {
     ToolSpec::new(
         UPDATE_PLAN_TOOL,
-        "创建或更新当前任务计划。复杂任务开始时设置步骤，执行过程中及时更新状态；始终提交完整计划，且最多一个步骤为 in_progress。",
+        "创建或更新当前任务计划。多步骤、耗时较长或需要向用户呈现进度的任务开始时设置步骤，执行中及时把完成的步骤标记为 completed；始终提交完整计划，且最多一个步骤为 in_progress。一步问答或无需追踪的任务不要创建计划。",
         json!({
             "type": "object",
             "properties": {

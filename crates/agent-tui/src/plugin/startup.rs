@@ -282,8 +282,10 @@ pub(crate) async fn load_plugins_for_tui(
     let mut host_services = PluginHostServices::new().restrict_execution_policy(&execution_policy);
     host_services = host_services.with_activation_metadata(
         "permission",
-        HashMap::from([("workspace_scope".to_string(), workspace_scope)]),
+        HashMap::from([("workspace_scope".to_string(), workspace_scope.clone())]),
     )?;
+    // 插件持久存储按项目隔离，作用域由宿主注入，不经过 manifest 或 Guest。
+    host_services = host_services.with_workspace_scope(workspace_scope)?;
     if let Some(state_dir) = persistent_state_dir {
         host_services = host_services.with_persistent_state_dir(state_dir)?;
     }

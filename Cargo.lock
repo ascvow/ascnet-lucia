@@ -1779,6 +1779,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-plugin"
+version = "0.1.0"
+dependencies = [
+ "agent-plugin",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "unicode-width 0.2.0",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

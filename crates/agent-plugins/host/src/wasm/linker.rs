@@ -133,6 +133,31 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     )
     .into_anyhow()
     .context("注册 host-state-remove 失败")?;
+    for (name, handler) in [
+        (
+            "host-store-get",
+            (|state: &mut PluginWasiState, request: &str| state.capabilities.store_get(request))
+                as fn(&mut PluginWasiState, &str) -> anyhow::Result<serde_json::Value>,
+        ),
+        ("host-store-set", |state: &mut PluginWasiState, request| {
+            state.capabilities.store_set(request)
+        }),
+        ("host-store-remove", |state: &mut PluginWasiState, request| {
+            state.capabilities.store_remove(request)
+        }),
+        ("host-store-list", |state: &mut PluginWasiState, request| {
+            state.capabilities.store_list(request)
+        }),
+    ] {
+        root.func_wrap(
+            name,
+            move |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+                Ok((encode_host_response(handler(caller.data_mut(), &request)),))
+            },
+        )
+        .into_anyhow()
+        .with_context(|| format!("注册 {name} 失败"))?;
+    }
     root.func_wrap(
         "host-service-upsert",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
