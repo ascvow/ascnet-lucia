@@ -10,7 +10,7 @@ use agent_plugin::{
 use anyhow::anyhow;
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// 记录调用的宿主替身。
 #[derive(Default)]
@@ -244,5 +244,193 @@ impl PluginHostApi for TestHost {
 
     fn kill_process(&self, _handle: u64) -> Result<()> {
         Err(anyhow!("本插件不申请子进程能力"))
+    }
+}
+
+/// 带虚拟仓库的宿主替身。
+///
+/// 用真实目录做扫描测试会把断言绑死在测试运行时的工作目录上，而且无法构造"读取失败"
+/// 与"列举失败"这类必须覆盖的错误分支。这里用一张路径到内容的表模拟仓库，目录结构由
+/// 路径前缀推导，与宿主 `list_dir` 返回仓库相对路径且按路径排序的行为一致。
+pub struct RepoHost {
+    /// 复用已有替身处理存储、工具与事件。
+    inner: TestHost,
+    /// 仓库相对路径 → 文件内容。
+    files: BTreeMap<String, String>,
+    /// 读取时必定失败的路径，用于模拟二进制或权限问题。
+    unreadable: HashSet<String>,
+    /// 列举时必定失败的目录，用于模拟权限问题。
+    unlistable: HashSet<String>,
+    /// 已发生的宿主文件调用次数，用于验证分片预算真的被遵守。
+    calls: RefCell<u32>,
+}
+
+impl RepoHost {
+    /// 用一组 `(路径, 内容)` 构造虚拟仓库。
+    pub fn new(files: &[(&str, &str)]) -> Self {
+        Self {
+            inner: TestHost::new(),
+            files: files
+                .iter()
+                .map(|(path, content)| (path.to_string(), content.to_string()))
+                .collect(),
+            unreadable: HashSet::new(),
+            unlistable: HashSet::new(),
+            calls: RefCell::new(0),
+        }
+    }
+
+    /// 标记一个文件为不可读，模拟二进制内容或权限失败。
+    pub fn with_unreadable(mut self, path: &str) -> Self {
+        self.unreadable.insert(path.to_string());
+        self
+    }
+
+    /// 标记一个目录为不可列举，模拟权限失败。
+    pub fn with_unlistable(mut self, dir: &str) -> Self {
+        self.unlistable.insert(dir.to_string());
+        self
+    }
+
+    /// 返回已发生的文件读取与目录列举总次数。
+    pub fn file_calls(&self) -> u32 {
+        *self.calls.borrow()
+    }
+
+    /// 把宿主请求路径规范化为仓库相对目录。
+    fn normalize_dir(path: &str) -> String {
+        if path == "." {
+            return String::new();
+        }
+        path.trim_matches('/').to_string()
+    }
+}
+
+impl PluginHostApi for RepoHost {
+    fn upsert_tool(&self, local_name: &str, spec: &ToolSpec) -> Result<String> {
+        self.inner.upsert_tool(local_name, spec)
+    }
+
+    fn remove_tool(&self, public_name: &str) -> Result<()> {
+        self.inner.remove_tool(public_name)
+    }
+
+    fn upsert_prompt(&self, prompt: &PromptContribution) -> Result<String> {
+        self.inner.upsert_prompt(prompt)
+    }
+
+    fn remove_prompt(&self, id: &str) -> Result<()> {
+        self.inner.remove_prompt(id)
+    }
+
+    fn emit_event(&self, event: &ExtensionEvent) -> Result<()> {
+        self.inner.emit_event(event)
+    }
+
+    fn get_state(&self, key: &str) -> Result<Option<Value>> {
+        self.inner.get_state(key)
+    }
+
+    fn set_state(&self, key: &str, value: &Value) -> Result<()> {
+        self.inner.set_state(key, value)
+    }
+
+    fn remove_state(&self, key: &str) -> Result<Option<Value>> {
+        self.inner.remove_state(key)
+    }
+
+    fn store_get(&self, scope: PluginStoreScope, key: &str) -> Result<Option<Value>> {
+        self.inner.store_get(scope, key)
+    }
+
+    fn store_set(&self, scope: PluginStoreScope, key: &str, value: &Value) -> Result<()> {
+        self.inner.store_set(scope, key, value)
+    }
+
+    fn store_remove(&self, scope: PluginStoreScope, key: &str) -> Result<Option<Value>> {
+        self.inner.store_remove(scope, key)
+    }
+
+    fn store_list(&self, scope: PluginStoreScope) -> Result<Vec<String>> {
+        self.inner.store_list(scope)
+    }
+
+    fn upsert_service(&self, service: &ServiceSpec) -> Result<()> {
+        self.inner.upsert_service(service)
+    }
+
+    fn remove_service(&self, name: &str) -> Result<()> {
+        self.inner.remove_service(name)
+    }
+
+    fn list_services(&self, plugin_id: Option<&str>) -> Result<Vec<ServiceDescriptor>> {
+        self.inner.list_services(plugin_id)
+    }
+
+    fn call_service(&self, plugin_id: &str, name: &str, payload: &Value) -> Result<Value> {
+        self.inner.call_service(plugin_id, name, payload)
+    }
+
+    fn read_file(&self, path: &str) -> Result<String> {
+        *self.calls.borrow_mut() += 1;
+        let path = path.trim_start_matches("./");
+        if self.unreadable.contains(path) {
+            return Err(anyhow!("stream did not contain valid UTF-8"));
+        }
+        self.files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| anyhow!("读取插件文件失败：{path}"))
+    }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>> {
+        *self.calls.borrow_mut() += 1;
+        let dir = Self::normalize_dir(path);
+        if self.unlistable.contains(&dir) {
+            return Err(anyhow!("列出插件目录失败：{dir}"));
+        }
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+
+        // 目录本身没有实体，用前缀是否命中任何文件来判断它是否存在。
+        let mut entries: BTreeMap<String, bool> = BTreeMap::new();
+        for file_path in self.files.keys() {
+            let Some(rest) = file_path.strip_prefix(&prefix) else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            match rest.split_once('/') {
+                Some((head, _)) => entries.insert(format!("{prefix}{head}"), true),
+                None => entries.insert(format!("{prefix}{rest}"), false),
+            };
+        }
+        if entries.is_empty() && !dir.is_empty() {
+            return Err(anyhow!("插件请求的路径不是目录：{dir}"));
+        }
+        Ok(entries
+            .into_iter()
+            .map(|(path, is_dir)| FileEntry { path, is_dir })
+            .collect())
+    }
+
+    fn spawn_process(&self, spec: &ProcessSpec) -> Result<u64> {
+        self.inner.spawn_process(spec)
+    }
+
+    fn write_process(&self, handle: u64, data: &str) -> Result<()> {
+        self.inner.write_process(handle, data)
+    }
+
+    fn read_process_line(&self, handle: u64, timeout_ms: u64) -> Result<Option<String>> {
+        self.inner.read_process_line(handle, timeout_ms)
+    }
+
+    fn kill_process(&self, handle: u64) -> Result<()> {
+        self.inner.kill_process(handle)
     }
 }

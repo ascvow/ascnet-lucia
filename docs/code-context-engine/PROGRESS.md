@@ -7,15 +7,15 @@
 
 ## Current Phase
 
-Phase 2 — Repository Discovery
+Phase 3 — Structural Parsing
 
-Status: IN_PROGRESS
+Status: NOT_STARTED
 
 ## Overall Status
 
 - [x] Phase 0 — Architecture Revalidation
 - [x] Phase 1 — Plugin Skeleton
-- [ ] Phase 2 — Repository Discovery
+- [x] Phase 2 — Repository Discovery
 - [ ] Phase 3 — Structural Parsing
 - [ ] Phase 4 — Structural Index
 - [ ] Phase 5 — Lexical & Symbol Retrieval
@@ -158,6 +158,86 @@ Known limitations:
 
 Next: Phase 2 — Repository Discovery
 
+---
+
+### Phase 2 — Repository Discovery
+
+Status: COMPLETE
+Completed Date: 2026-09-03
+
+Summary：实现仓库扫描器，从宿主注入的可信工作区稳定输出 `IndexableFile[]`（路径、语言、
+内容哈希、字节数、行数）。含忽略规则、语言识别、敏感文件排除、错误隔离与 fuel 分片游标。
+
+Implemented:
+- **可分片扫描游标**：`RepositoryScan::advance(host, budget)` 消耗到预算上限即保存游标返回。
+  预算含 `max_host_calls` 与 `max_bytes_read` 两个维度——只限调用次数挡不住一批大文件，
+  只限字节数挡不住海量空文件。**这是全局机制，Phase 4 与 Phase 11 复用同一形态。**
+- **`.gitignore` 语义**：注释、否定（`!`）、目录限定（结尾 `/`）、锚定（开头 `/` 或含内部 `/`）、
+  `*`、`?`、字符类（含区间与否定）、`**` 跨段匹配、行尾空白与 `\!` 转义。
+- **三层优先级**：硬排除（`.git`/`.hg`/`.svn`，不可覆盖）→ 内置默认忽略（可被 `!` 覆盖）→
+  规则文件（`.gitignore` 后接 `.agentignore`，深层目录覆盖浅层）。
+- **规则链 arena**：每个待遍历目录只持有一个 `u32` 链节点下标，而不是完整规则副本。深目录树下
+  逐层复制规则会让游标体积随深度平方增长。
+- **语言识别**：扩展名白名单（22 种语言 + 无扩展名文件名表），未识别扩展名直接跳过而不是
+  当作文本读取。`Language::supports_structural_parsing()` 标注 V1 的 Tier 2 覆盖范围。
+- **敏感文件排除**：`.env*`、`*.pem`、`*.key`、`*.p12` 等无条件排除；`credential*` / `secret*`
+  前缀规则**只作用于非源码文件**（理由见下方 Important decisions）。敏感文件单独计数。
+- **错误隔离**：目录列举失败、文件读取失败、超大文件、内嵌 NUL 的二进制内容全部降级为告警，
+  不中断扫描。告警数量有上限，总数仍如实计数。
+- **规模上限**：深度、目录数、文件数、单目录条目数、单文件字节数、告警数。
+
+Key files:
+- `examples/plugins/code-context-plugin/src/repository/mod.rs` — 扫描器与分片游标
+- `.../src/repository/ignore.rs` — gitignore 语义规则引擎
+- `.../src/repository/language.rs` — 语言识别与文件归类
+- `.../src/repository/tests.rs` — 扫描器测试
+- `.../src/testing.rs` — 新增 `RepoHost` 虚拟文件系统替身
+
+Tests：新增 57 个（扫描器 26 + 忽略规则 20 + 语言识别 11），插件单测总数 55 → 112。
+
+覆盖：常规文件、忽略文件、嵌套 `.gitignore`、`.agentignore` 覆盖、二进制、超大文件、
+未识别语言、敏感文件、深度上限、规模上限、告警上限、读取失败隔离、列举失败隔离、
+内嵌 NUL、空仓库、分片恢复一致性、预算约束、输出确定性。
+
+Tests Executed / Result:
+- `cargo test --offline -p code-context-plugin`：112 单元测试 + 1 文档测试，全通过。
+- `cargo clippy --offline -p code-context-plugin --all-targets`：无警告。
+- `bun run test:plugin:code-context`：全链通过（单测 → WASM release 构建 → 7 个 smoke test）。
+
+Build Result：`wasm32-wasip2` release 构建成功，7 个真实 Host smoke test 全通过，无 regression。
+
+Important decisions:
+1. **扩展名白名单而非黑名单**。`FileEntry` 没有 size/mtime，"先读了再判断"要为每个未知扩展名
+   付出一次完整读取，还可能把几百 MB 的产物读进 64 MiB 线性内存。白名单把风险挡在读取之前。
+2. **`credential*` / `secret*` 只作用于非源码文件**。需求要求过滤这两个前缀，但直接按前缀过滤
+   会排除 `secrets.rs`、`credentials.ts` 这类**定义凭证处理逻辑的源码**——Agent 恰恰经常需要
+   检索它们，且它们存的是代码不是凭证值。真正的风险集中在 `secrets.json`、`credentials.yaml`
+   这类数据文件。`.env` / `*.pem` / `*.key` 则无条件排除，这些形态不存在"其实是源码"的情况。
+3. **硬排除独立成层**。把 `.git/` 交给可被否定的规则去挡，等于允许一条用户规则让扫描器走进
+   版本库内部。
+4. **`.agentignore` 排在 `.gitignore` 之后**。用户用它表达的是"给检索引擎看什么"，理应比版本
+   控制规则更靠后，因此可以用 `!` 重新包含被 git 忽略的目录。
+5. **完成时按路径排序**。下游增量 diff 需要在两次扫描结果间做有序比较，保留广度优先的发现
+   顺序会让目录结构的微小变化产生大量伪差异。
+6. **符号链接环靠深度与数量上限防御**，不靠路径去重。软链目标的相对路径每次都不同，
+   按路径去重挡不住它；宿主的 `canonicalize` + 前缀校验已挡住指向工作区外部的符号链接。
+
+Known limitations:
+- **子目录列举的运行时验证推迟到 Phase 4。** 扫描器尚未接入任何导出函数，因此只在 `RepoHost`
+  替身上验证过。其依赖的宿主契约（`list_dir` 对子目录返回完整仓库相对路径、按路径排序）
+  已通过直接阅读 `capability/mod.rs` 的 `strip_prefix(&resolved.display_root)` 确认，
+  且 `list_dir(".")` 这条路径已由 Phase 1 的 smoke test 端到端验证。Phase 4 把扫描接入索引
+  构建后，必须补一个真实 Host 上的子目录扫描 smoke test。
+- 单文件体量上限只能在读取后生效（宿主不提供 size），因此超大文件仍会产生一次完整读取的
+  内存峰值。`FileEntry` 增加 size/mtime 是架构中的 Recommended 级 Host 改动。
+- 未实现文件 watcher（属于 Phase 11 与 Optional 级 Host 能力）。
+
+Deferred items:
+- 扫描结果的持久化（`hash_index` 已提供路径→哈希映射，落盘属于 Phase 4）。
+- 增量 diff（added / modified / deleted）属于 Phase 11。
+
+Next: Phase 3 — Structural Parsing
+
 ## Blocked Phases
 
 三个阶段因 Host 能力缺失无法实现。按开发任务书 §25，记录 Blocker 而**不绕开架构做 hack 实现**。
@@ -254,11 +334,14 @@ Recommended solution：方案 1。在此之前产品显示 `Local Mode: NOT SUPP
 
 ## Active Work
 
-Phase 2 — Repository Discovery。目标是稳定输出 `IndexableFile[]`（path、language、hash、metadata）。
+Phase 3 — Structural Parsing。目标是把 `IndexableFile` 转换为 `CodeChunk[]` 与 `Symbol[]`。
 
 ## Known Issues
 
-无。Phase 1 全部验证通过，未发现 regression。
+无。Phase 1、Phase 2 全部验证通过，未发现 regression。
+
+待补验证（不阻塞，已在 Phase 2 条目登记）：扫描器的子目录遍历尚未在真实 Host 上跑过，
+Phase 4 接入索引构建时必须补一个真实 Host 的子目录扫描 smoke test。
 
 ## Architecture Drift
 
@@ -295,14 +378,19 @@ Phase 2 — Repository Discovery。目标是稳定输出 `IndexableFile[]`（pat
 
 ## Next Action
 
-开始 Phase 2 — Repository Discovery：
+开始 Phase 3 — Structural Parsing：
 
-1. 新建 `examples/plugins/code-context-plugin/src/repository/`（有真实实现时才创建，不预建空模块）。
-2. 基于 `host-fs-list` 的有界递归遍历：深度上限、条目数上限、稳定顺序、路径去重、错误隔离。
-3. `.gitignore` 解析与匹配（作为普通 UTF-8 文件读取），叠加内置默认忽略。
-4. 语言检测（按路径与扩展名），未知语言进入文本兜底。
-5. 内容哈希计算。注意 `FileEntry` 无 size/mtime，无法先用元数据排除未变更文件。
-6. 敏感文件过滤（`.env`、`*.pem`、`*.key`、`credential*`、`secret*`）——API 模式会把源码发往
-   外部 provider，该过滤是隐私前提而非可选项。
-7. fuel 分片游标机制：单次调用消耗到阈值即保存游标返回，下次继续。**这是全局机制，后续所有
-   重活都复用它**，接口需在本阶段冻结。
+1. 新建 `examples/plugins/code-context-plugin/src/parser/`（有真实实现时才创建）。
+2. 定义 `LanguageAdapter` 抽象。**该接口尚未冻结**，必须按实际解析需求设计，不得猜测。
+3. Tier 2 纯 Rust 结构化解析器，覆盖 `Language::supports_structural_parsing()` 声明的五种语言：
+   Rust、TypeScript、JavaScript、Python、Go。**不引入 tree-sitter**（本机无 wasi-sdk，
+   `clang` 无 wasm 后端，构建流水线 `--offline`，见 `plugin-system-audit.md`）。
+4. Tier 3 文本兜底：未覆盖语言、解析失败、超大文件。
+5. 从源文件提取 `CodeChunk` 与 `Symbol`：符号名、限定名、kind、父符号、行区间、签名、
+   doc 注释、imports、内容哈希。这两个类型在 Phase 1 已冻结，**不得加入存储后端字段**。
+6. **单文件解析失败必须捕获并降级为 Tier 3，绝不向上传播**——一个语法错误的文件不能让整个
+   仓库无法检索（`architecture.md` 第 12 问的硬性要求）。
+7. 复用 Phase 2 的分片游标形态，不发明第二套。
+
+Definition of Done：fixture 源文件可稳定转换为 `CodeChunk[]` + `Symbol[]` 并通过测试，
+含语法错误降级、未覆盖语言降级与确定性输出。

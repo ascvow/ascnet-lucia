@@ -26,6 +26,7 @@ mod config;
 mod embedding;
 mod error;
 mod model;
+mod repository;
 mod storage;
 mod tool;
 
@@ -44,6 +45,12 @@ pub use error::CodeContextError;
 pub use model::{
     CodeChunk, EmbeddingSpace, IndexManifest, IndexStatus, ManifestCompatibility,
     RepositoryIdentity, Symbol, SymbolKind, INDEX_SCHEMA_VERSION, STRUCTURAL_INDEX_VERSION,
+};
+pub use repository::ignore::{IgnoreRuleSet, IgnoreStack, AGENT_IGNORE_FILE, GIT_IGNORE_FILE};
+pub use repository::language::{classify, Language, PathClass, SkipReason};
+pub use repository::{
+    content_hash, hash_index, IndexableFile, RepositoryScan, ScanBudget, ScanLimits, ScanProgress,
+    ScanStats, ScanWarning, ScanWarningKind,
 };
 pub use storage::{IndexStore, ManifestLoad};
 pub use tool::{CodeSearchRequest, TOOL_NAME};
