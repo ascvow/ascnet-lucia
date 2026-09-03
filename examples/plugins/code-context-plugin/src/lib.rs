@@ -61,7 +61,8 @@ pub use repository::{
     ScanStats, ScanWarning, ScanWarningKind,
 };
 pub use retrieval::{
-    tokenize, CandidateSource, RetrievalIndex, RetrievalStats, SearchCandidate, SymbolMatch,
+    tokenize, CandidateSource, FusionConfig, FusionDebug, RetrievalIndex, RetrievalStats,
+    SearchCandidate, SearchResult, SymbolMatch,
 };
 pub use storage::{IndexStore, ManifestLoad};
 pub use tool::{CodeSearchRequest, TOOL_NAME};

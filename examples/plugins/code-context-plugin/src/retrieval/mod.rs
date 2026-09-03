@@ -14,16 +14,21 @@
 //! 两路都在语义分支缺席时可用，因此 V1 交付的检索能力不依赖任何嵌入 provider——这正是
 //! `architecture.md` 第 13 问要求的 `Degraded` 形态。
 
+mod fusion;
 mod lexical;
 mod symbol;
 mod tokenize;
 
 #[cfg(test)]
+mod fusion_tests;
+#[cfg(test)]
 mod tests;
 
+pub use fusion::{FusionConfig, FusionDebug, SearchResult};
 pub use symbol::SymbolMatch;
 pub use tokenize::tokenize;
 
+use crate::index::StructuralIndex;
 use crate::model::CodeChunk;
 use lexical::LexicalIndex;
 use symbol::SymbolIndex;
@@ -35,6 +40,12 @@ pub enum CandidateSource {
     Symbol,
     /// 词法检索。
     Lexical,
+    /// 语义检索。
+    ///
+    /// V1 不产出该来源——语义索引依赖的宿主能力尚未落地（见 `PROGRESS.md` 的
+    /// Blocked Phases）。变体现在就存在，是为了让融合层的"任意通道子集"能被**实际测试**
+    /// 而不只是被声称：`fusion` 的测试会喂一路合成语义候选，验证三路融合无需改动代码。
+    Semantic,
 }
 
 impl CandidateSource {
@@ -43,6 +54,7 @@ impl CandidateSource {
         match self {
             Self::Symbol => "symbol",
             Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
         }
     }
 }
@@ -169,9 +181,10 @@ impl RetrievalIndex {
             .collect()
     }
 
-    /// 同时执行两路检索，返回各自的候选列表。
+    /// 同时执行两路检索，返回各自**未经融合**的候选列表。
     ///
-    /// 刻意**不在这里融合**：融合是 Phase 9 的职责，它需要看到未经合并的分通道排名。
+    /// 这是融合层的输入，也是内部检索诊断的数据来源：想知道"这条结果从哪来"，
+    /// 对比本方法与 [`RetrievalIndex::search`] 的输出即可。
     pub fn search_all(
         &self,
         query: &str,
@@ -182,5 +195,35 @@ impl RetrievalIndex {
             self.search_symbols(query, path_scope, limit),
             self.search_lexical(query, path_scope, limit),
         ]
+    }
+
+    /// 执行混合检索：多路候选 → RRF 融合 → 稳定排序。
+    ///
+    /// 语义通道缺席时结果依然有意义——RRF 在任意通道子集上都成立，这是它相对加权分数
+    /// 融合的关键优势（见 [`fusion`] 模块文档）。
+    pub fn search(
+        &self,
+        index: &StructuralIndex,
+        query: &str,
+        path_scope: Option<&str>,
+        limit: usize,
+    ) -> Vec<SearchResult> {
+        self.search_with(index, query, path_scope, limit, &FusionConfig::default())
+    }
+
+    /// 用指定融合参数执行混合检索。
+    ///
+    /// 参数化只服务于调参与 benchmark；正常路径一律使用 [`FusionConfig::default`]。
+    pub fn search_with(
+        &self,
+        index: &StructuralIndex,
+        query: &str,
+        path_scope: Option<&str>,
+        limit: usize,
+        config: &FusionConfig,
+    ) -> Vec<SearchResult> {
+        // 各通道取比最终结果更多的候选，否则融合退化成简单拼接。
+        let channels = self.search_all(query, path_scope, fusion::candidate_limit(limit));
+        fusion::fuse(&channels, query, index, config, limit)
     }
 }

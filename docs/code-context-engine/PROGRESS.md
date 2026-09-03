@@ -7,7 +7,7 @@
 
 ## Current Phase
 
-Phase 9 — Hybrid Retrieval
+Phase 10 — Context Builder
 
 Status: NOT_STARTED
 
@@ -22,7 +22,7 @@ Status: NOT_STARTED
 - [x] Phase 6 — Embedding Abstraction
 - [ ] Phase 7 — API Embedding Provider — **BLOCKED**（Host 无 HTTP 能力）
 - [ ] Phase 8 — Semantic Vector Index — **BLOCKED**（依赖 Phase 7 与 blob 存储）
-- [ ] Phase 9 — Hybrid Retrieval
+- [x] Phase 9 — Hybrid Retrieval
 - [ ] Phase 10 — Context Builder
 - [ ] Phase 11 — Incremental Indexing
 - [ ] Phase 12 — Local Embedding Provider — **BLOCKED**（Host 无 embedding 能力）
@@ -550,6 +550,76 @@ Known limitations:
 
 Next: Phase 9 — Hybrid Retrieval（Phase 7 / 8 被阻塞，按既定顺序跳过）
 
+---
+
+### Phase 9 — Hybrid Retrieval
+
+Status: COMPLETE
+Completed Date: 2026-09-03
+
+Summary：用 RRF 把多路候选融合成稳定排序的 `SearchResult[]`。融合层在**任意通道子集**上
+成立，因此语义分支缺席不影响可用性——这是架构第 13 问要求的降级形态。
+
+Implemented:
+- **RRF 融合**：`score = Σ 1 / (k + rank)`，k = 60。用排名而非分数，因为各通道分数量纲
+  不可比（BM25 无上界且随语料漂移、符号分固定 0..1、语义是余弦相似度），
+  加权相加需要先归一化，而归一化依赖分布假设、换个仓库就失效。
+- **任意通道子集**：空输入、单通道、三通道全部正常工作，有测试逐一覆盖。
+  新增 `CandidateSource::Semantic` 变体并用**合成语义候选**验证三路融合无需改动代码——
+  把"为语义分支预留"从声称变成事实。
+- **集中配置的提升**（`FusionConfig`）：精确限定名 3.0、精确短名 1.5、路径 1.0，
+  单位是 `rank_one_unit() = 1/(k+1)`，即"相当于在一路里排第一"。
+  **没有散落的魔数**：每个值都以可读量级表达并写明依据。
+- **精确符号不被挤下去**：RRF 天然偏好"多路都命中"，但用户查确切符号名时那个符号必须
+  排第一。3.0 当量使单路精确匹配稳定压过双路各排第一（约 2.0 当量），有测试守护。
+- **弱匹配不提升**：后缀与前缀匹配本就是弱信号，再提升会让"查 check 命中所有名字带
+  check 的东西"淹没目标。
+- **路径提升按命中比例缩放**，且严格弱于符号提升——否则"搜某个函数"会变成"搜某个目录"。
+- **内部诊断** `FusionDebug`：各通道排名、RRF 原始分、各项提升、可读理由。
+  分数严格等于各部分之和，有测试核对。**不对 Agent 暴露**（任务书 §9）。
+- **确定性**：分数相同时按 chunk ID 升序，同一查询在任何进程得到同一顺序。
+- **失效候选被跳过**：候选指向已不存在的 chunk 时跳过而不是 panic——增量索引期间
+  检索索引与结构索引可能短暂不同步。
+
+Key files:
+- `examples/plugins/code-context-plugin/src/retrieval/fusion.rs` — RRF、提升、`SearchResult`
+- `.../src/retrieval/fusion_tests.rs` — 融合测试
+- `.../src/retrieval/mod.rs` — `RetrievalIndex::search` / `search_with` 入口
+
+Tests：新增 24 个，插件单测总数 226 → 250。
+
+覆盖：跨通道一致性胜过单通道、通道内排名、任意子集（空/单路/三路）、确定性、
+并列稳定排序、limit 约束、候选池不变量、精确符号压过多路命中、弱匹配无提升、
+限定名提升强于短名、路径提升、提升量级次序、rank-1 当量、诊断记录各路排名、
+可读理由、分数可分解、端到端精确符号排首位、结果携带定位元数据、
+自然语言查询、路径过滤贯穿融合、无命中、空索引、失效候选。
+
+Tests Executed / Result:
+- `cargo test --offline -p code-context-plugin`：250 单元测试 + 1 文档测试，全通过。
+- `cargo clippy --offline -p code-context-plugin --all-targets`：无警告。
+- `bun run test:plugin:code-context`：全链通过（单测 → WASM release 构建 → 8 个 smoke test）。
+
+Build Result：`wasm32-wasip2` release 构建成功，无 regression。
+
+Important decisions:
+1. **RRF 而非加权分数融合。** 决定性理由是它在任意通道子集上成立，无需重新配权重。
+   语义分支目前缺席、将来可能因 provider 故障临时缺席，这条性质是刚需而非优雅。
+2. **提升以 rank-1 当量表达。** `exact_symbol_boost = 3.0` 的含义是"相当于额外在三路里
+   各排第一"，比 `0.049` 这样的绝对值可读得多，也让调参有量纲依据。
+3. **k 保持 60。** 该取值让"两路中等"胜过"单路第一"，对代码检索方向正确。
+   精确符号的优先级由提升项保证，而不是靠调小 k 破坏 RRF 的一致性偏好。
+4. **`Semantic` 变体现在就加。** 不是为未来预留字段，而是为了让"任意子集"能被实际测试。
+
+Known limitations:
+- **提升值未经真实检索质量校准。** 3.0 / 1.5 / 1.0 是按量级推理选定并有次序测试守护，
+  但没有基于 Recall/MRR 验证。**Phase 14 必须校准**，与 `BUILD_BUDGET` 和 BM25 参数
+  一并纳入同一次测量。
+- `SearchResult` 不含正文片段：正文由 Phase 10 按需重读并打包（存储 ADR 的既定分工）。
+- 融合按线性查找聚合候选（候选量数百级）。候选池上限提高后需要改为哈希聚合。
+- 尚未接入 `code_search`：工具返回值的最终形态属于 Phase 10 / 13。
+
+Next: Phase 10 — Context Builder
+
 ## Blocked Phases
 
 三个阶段因 Host 能力缺失无法实现。按开发任务书 §25，记录 Blocker 而**不绕开架构做 hack 实现**。
@@ -646,13 +716,12 @@ Recommended solution：方案 1。在此之前产品显示 `Local Mode: NOT SUPP
 
 ## Active Work
 
-Phase 9 — Hybrid Retrieval。Phase 7 与 Phase 8 被宿主能力阻塞（见 Blocked Phases），
-按既定执行顺序跳过，直接进入融合层。目标是把符号与词法两路候选融合成稳定排序，
-且融合层从一开始就按「任意子集」设计，使语义分支将来接入时无需重构。
+Phase 10 — Context Builder。目标是把融合结果打包成 Agent 可用的上下文：
+去重、区间合并、父子抑制、多样性与 token 预算。
 
 ## Known Issues
 
-无。Phase 1–6 全部验证通过，未发现 regression。
+无。Phase 1–6 与 Phase 9 全部验证通过，未发现 regression。
 
 Phase 2 遗留的真实 Host 验证已在 Phase 4 补齐：
 `wasm_host_scans_nested_directories_and_builds_index` 覆盖三层嵌套目录、多语言解析与忽略规则。
@@ -718,21 +787,21 @@ Tier 3  文本分块              —— 未覆盖语言、解析失败、无声
 
 ## Next Action
 
-开始 Phase 9 — Hybrid Retrieval。**Phase 7 与 Phase 8 被宿主能力阻塞，按既定执行顺序跳过。**
+开始 Phase 10 — Context Builder：
 
-1. 新建 `examples/plugins/code-context-plugin/src/retrieval/fusion.rs`。
-2. 实现 **RRF**（Reciprocal Rank Fusion）：`score = Σ 1 / (k + rank)`，k 取常用的 60。
-   Phase 5 的 `SearchCandidate` 已带通道内排名，正是为此准备。
-3. **融合层必须能在任意通道子集上工作**——当前只有符号 + 词法两路，语义分支缺席时
-   不能退化或报错。这是架构第 13 问的硬性要求，也是选 RRF 而非加权分数融合的原因。
-4. 允许有限的、**集中配置**的加权：精确符号提升、路径提升。
-   **不得散落 magic constant**——全部常量集中在一处并写明依据。
-5. 实现内部 `retrieval debug`：能看到各通道候选与融合分数。
-   **不得作为正常 Agent Tool 暴露**（任务书 §9）。
-6. 产出稳定的 `SearchResult[]`（内部形态），供 Phase 10 的上下文打包消费。
+1. 新建 `examples/plugins/code-context-plugin/src/context/`。
+2. **不要简单取 top 10**。必须实现：去重、重叠区间合并、同文件合并、父子抑制、
+   多样性、token 预算、上下文打包。
+3. **父子抑制**是关键：Phase 3 对容器与其成员都产出 chunk（`impl` 块与它的方法都在索引里），
+   因此融合结果天然含父子重叠。返回 `PermissionManager` 整块又返回 `PermissionManager::check`
+   是纯粹的 token 浪费。
+4. 正文在这里按需重读（`host.read_file`），并**比对 `content_hash`**：不一致说明文件被外部
+   修改，需即时重解析并修正结果。这是架构第 8 问的惰性一致性校验。
+5. token 预算：没有 tokenizer，用字符数或字节数做保守估计，并写明估算方式与误差方向。
+6. `SearchResult` 增加 `snippet` 字段；内部诊断保留但不进 Agent 可见输出。
 
-Definition of Done：融合结果稳定确定，单通道缺席时正常工作，
-精确符号匹配不会被词法结果挤下去，并有单元与集成测试覆盖。
+Definition of Done：输入融合候选，输出满足 token 预算的 Agent 可用上下文，
+不含大量重复代码，父子重叠被抑制，且有测试覆盖。
 
 ---
 
