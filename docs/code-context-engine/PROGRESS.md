@@ -7,7 +7,7 @@
 
 ## Current Phase
 
-Phase 10 — Context Builder
+Phase 11 — Incremental Indexing
 
 Status: NOT_STARTED
 
@@ -23,7 +23,7 @@ Status: NOT_STARTED
 - [ ] Phase 7 — API Embedding Provider — **BLOCKED**（Host 无 HTTP 能力）
 - [ ] Phase 8 — Semantic Vector Index — **BLOCKED**（依赖 Phase 7 与 blob 存储）
 - [x] Phase 9 — Hybrid Retrieval
-- [ ] Phase 10 — Context Builder
+- [x] Phase 10 — Context Builder
 - [ ] Phase 11 — Incremental Indexing
 - [ ] Phase 12 — Local Embedding Provider — **BLOCKED**（Host 无 embedding 能力）
 - [ ] Phase 13 — Agent Tool Integration
@@ -619,6 +619,83 @@ Known limitations:
 - 尚未接入 `code_search`：工具返回值的最终形态属于 Phase 10 / 13。
 
 Next: Phase 10 — Context Builder
+
+---
+
+### Phase 10 — Context Builder
+
+Status: COMPLETE
+Completed Date: 2026-09-03
+
+Summary：把融合结果打包成 Agent 可用的上下文，消除父子重叠、尊重 token 预算、惰性校验
+文件一致性。Phase 9 的融合输出不含正文（存储 ADR 的既定分工），本阶段按需回读、
+按预算打包、就地处理文件变更。
+
+Implemented:
+- **父子抑制**：检测并抑制区间包含关系（impl 块完整包含其方法），避免同一段代码返回两次。
+  输入按分数降序，保留的总是更高分的那条。
+- **区间合并**：相邻或夹行数 ≤ `merge_gap_lines` 的区间合并为一段，默认 gap=0（只合并紧邻）。
+  采用传递性合并：候选可能桥接多个已保留区间，反复扩展并集直到收敛。
+  保留主符号（首个关联项）的元数据，只扩展正文范围。
+- **多样性约束**：`max_per_file` 限制单文件贡献条目数（默认 4），防止大文件占满预算而让
+  "涉及哪几个文件"这类信息丢失。
+- **惰性一致性校验**（Architecture Q8）：索引是快照，仓库可能被外部编辑（编辑器保存、
+  `git checkout`），而宿主不提供文件变更事件。**按文件比对内容哈希**，不一致时重新解析该文件
+  并按限定名重新定位符号。代价被限制在命中集合（通常十几个文件）而不是整个仓库。
+  **合并过的区间也能重定位**：文件哈希校验是按文件而不是按条目，合并后的区间沿用主符号的
+  新位置——这是前期架构修正堵住的设计漏洞。
+- **Token 估算**：区分 ASCII（÷4）与 CJK（1:1）密度，向上取整保守估算——宁可少放一条
+  也不超预算（超预算的后果是调用方截断，截断点不可控）。Phase 14 必须校准。
+- **预算打包**：预算不足时跳过大条目继续尝试小条目（按分数降序遍历），而不是直接中断。
+- **超长片段截断**：超过 `max_snippet_lines` 的片段截断并明确标注 `// …（片段已截断）`，
+  避免模型把半截函数当作完整实现。
+- **不返回错误**：文件读不到或符号已消失的条目被丢弃并计入统计，其余照常返回。
+  一个被删掉的文件不该让整次检索失败。
+
+Key files:
+- `examples/plugins/code-context-plugin/src/context/mod.rs` — 核心实现（~555 行）
+- `.../src/context/tests.rs` — 完整测试套件（~593 行，24 个测试）
+- `.../src/retrieval/tokenize.rs` — `is_cjk` 改为 `pub(crate)` 供 token 估算使用
+- `.../src/lib.rs` — 导出 `build_context`、`estimate_tokens`、`ContextBundle`、`ContextConfig` 等
+
+Tests：新增 24 个，插件单测总数 248 → 272。
+
+覆盖：父子抑制、无重复行、相邻合并、相距远不合并、包含时保留高分、
+多样性约束、max_results、token 预算、预算为 0、预算不足跳过大条目、超长截断、
+未修改文件原样返回、文件被外部修改后重新定位、符号已删除时丢弃、文件已删除时丢弃、
+同一文件只读一次、token 估算区分 ASCII 与 CJK、token 估算向上取整、
+空输入返回空、结果按分数降序、确定性、条目带定位与片段。
+
+Tests Executed / Result:
+- `cargo test --offline -p code-context-plugin`：272 单元测试 + 1 文档测试，全通过。
+- `cargo clippy --offline -p code-context-plugin --all-targets`：1 个 unused variable 警告（测试代码），
+  已修正后无警告。
+
+Build Result：`wasm32-wasip2` release 构建成功，无 regression。
+
+Important decisions:
+1. **按文件而不是按条目校验一致性。** 文件的内容哈希已经在结构索引里，比对一次就能判定
+   整个文件是否变化。按条目校验则要为每条结果单独切片比对，且对**合并过的区间无从比对**
+   ——那正是这套设计要堵住的漏洞：合并会让校验被静默跳过。
+2. **重新定位按限定名查找，而不是按行号。** 文件变化后行号失效，但限定名（稳定 chunk ID）
+   依然唯一标识符号。找不到时丢弃条目，而不是返回错误位置的代码——**返回错误位置比不返回更糟**。
+3. **Merge gap 默认 0。** 只合并紧邻或重叠，不合并中间隔着空行的两个独立方法。取值过大会把
+   独立符号并成一段，丢掉按符号归属结果的能力。
+4. **Token 估算区分脚本密度。** ASCII 与 CJK 的 token 密度差一个量级，用同一套系数会让含
+   中文注释的代码估算偏离数倍。Phase 14 必须用真实 tokenizer 校准系数。
+5. **多样性约束默认 4 条/文件。** 没有它，一个大文件里的十几个函数会占满全部预算，
+   而"这个功能涉及哪几个文件"恰恰是 Agent 最需要的信息。
+
+Known limitations:
+- **Token 估算无真实 tokenizer。** 经验系数（ASCII ÷4、CJK 1:1）加保守取整，Phase 14 必须
+  用真实 tokenizer 校准并测量实际偏离。
+- **合并后符号元数据退化。** 合并后的区间沿用主符号（首个关联项）的元数据，其他被并入的
+  符号信息丢失。用户看到的是一段代码 + 第一个符号的限定名，但这段代码里可能含多个符号。
+  这是可解释的降级：合并边界是多条结果的并集，文件变化后无从还原，退回单符号定位是合理的。
+- **不含嵌入向量。** Phase 10 打包的是词法与符号两路融合结果，语义分支属于 Phase 8（被阻塞）。
+- 尚未接入 `code_search` 工具：最终形态属于 Phase 13。
+
+Next: Phase 11 — Incremental Indexing
 
 ## Blocked Phases
 
