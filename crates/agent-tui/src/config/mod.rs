@@ -1,5 +1,6 @@
 //! Lucia TUI 的应用级配置初始化与路径解析。
 
+pub(crate) mod instructions;
 pub(crate) mod model_metadata;
 
 use agent_core::config::AgentRootConfig;

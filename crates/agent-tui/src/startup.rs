@@ -5,6 +5,7 @@ use crate::app::PluginKeyRoute;
 use crate::app::{is_copy_shortcut, reasoning_level_label, App, ChannelEventSink};
 use crate::cli::Args;
 use crate::command::resume_native_session;
+use crate::config::instructions::{load_project_instructions, render_instructions_prompt};
 use crate::config::{
     configured_model_key_is_available, initialize_config, load_tui_settings, lucia_home_dir,
     resolve_config_path, resolve_config_relative_path, TuiSettings,
@@ -324,6 +325,21 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             0,
             format!("Created default configuration: {}", config_path.display()),
         );
+    }
+
+    // 项目约定并入系统提示：模型从第一次请求就知道本项目的规矩，且随 system 段进入
+    // 提示缓存前缀，不会每轮重复计费。
+    let project_instructions =
+        load_project_instructions(&lucia_home, &workspace.cwd).context("加载项目约定失败")?;
+    let instructions_count = project_instructions.len();
+    if let Some(instructions_prompt) = render_instructions_prompt(&project_instructions) {
+        options.system_prompt.push_str("\n\n");
+        options.system_prompt.push_str(&instructions_prompt);
+    }
+    if instructions_count > 0 {
+        startup_notices.push(format!(
+            "已加载 {instructions_count} 份项目约定 (AGENTS.md)"
+        ));
     }
 
     let skill_catalog = SkillCatalog::load_local([
