@@ -27,6 +27,7 @@ mod tests;
 pub use fusion::{FusionConfig, FusionDebug, SearchResult};
 pub use symbol::SymbolMatch;
 pub use tokenize::tokenize;
+pub(crate) use tokenize::is_cjk as tokenize_is_cjk;
 
 use crate::index::StructuralIndex;
 use crate::model::CodeChunk;

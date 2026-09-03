@@ -35,7 +35,10 @@ const MIN_TOKEN_CHARS: usize = 2;
 const MAX_TOKENS: usize = 4096;
 
 /// 判断是否为中日韩表意文字或假名。
-fn is_cjk(character: char) -> bool {
+///
+/// 除切词外，token 预算估算也需要它：中日韩字符与 ASCII 的 token 密度差一个量级，
+/// 用同一套系数会让预算估算偏离数倍。
+pub(crate) fn is_cjk(character: char) -> bool {
     matches!(character as u32,
         0x3040..=0x30FF      // 平假名、片假名
         | 0x3400..=0x4DBF    // 扩展 A

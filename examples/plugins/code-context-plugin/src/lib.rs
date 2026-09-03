@@ -23,6 +23,7 @@
 //! 下次调用继续。该游标协议属于 Phase 2 的扫描器，不在骨架阶段预先发明。
 
 mod config;
+mod context;
 mod embedding;
 mod error;
 mod index;
@@ -46,6 +47,10 @@ pub use config::{CodeContextConfig, EmbeddingMode};
 pub use embedding::{
     select_provider, EmbeddingInputKind, EmbeddingProvider, UnconfiguredEmbeddingProvider,
     DEFAULT_MAX_BATCH_SIZE,
+};
+pub use context::{
+    build as build_context, estimate_tokens, ContextBundle, ContextConfig, ContextEntry,
+    ContextStats,
 };
 pub use error::CodeContextError;
 pub use index::{FileRecord, IndexBuild, IndexStats, StructuralIndex, BUILD_BUDGET};
