@@ -14,6 +14,7 @@
 
 use crate::error::CodeContextError;
 use crate::model::IndexManifest;
+use crate::semantic::SemanticSnapshot;
 use agent_plugin::{PluginHostApi, PluginStoreScope};
 use std::collections::BTreeMap;
 
@@ -22,6 +23,9 @@ const MANIFEST_KEY: &str = "index.manifest";
 
 /// 保存路径 → 内容哈希表的存储键。
 const FILE_HASHES_KEY: &str = "index.file_hashes";
+
+/// 保存语义向量快照的存储键。
+const SEMANTIC_KEY: &str = "index.semantic";
 
 /// 哈希表允许写入的最大条目数。
 ///
@@ -175,6 +179,57 @@ impl IndexStore {
             &serde_json::Value::Object(map),
         )
         .map_err(|error| CodeContextError::Storage(error.to_string()))
+    }
+
+    /// 保存语义向量快照。
+    ///
+    /// 快照本身已按 `MAX_PERSISTED_VECTORS` 截断，这里只负责序列化与写入。
+    ///
+    /// # Errors
+    ///
+    /// 存储不可用或宿主写入失败时返回错误。写入失败不影响本次检索——内存里的向量仍然
+    /// 可用，只是下次启动要重新嵌入。
+    pub fn save_semantic(
+        self,
+        host: &dyn PluginHostApi,
+        snapshot: &SemanticSnapshot,
+    ) -> Result<(), CodeContextError> {
+        if !self.available {
+            return Err(CodeContextError::CapabilityUnavailable(
+                "宿主未提供项目作用域持久存储，语义向量无法保存".into(),
+            ));
+        }
+        let value = serde_json::to_value(snapshot)
+            .map_err(|error| CodeContextError::Storage(error.to_string()))?;
+        host.store_set(PluginStoreScope::Workspace, SEMANTIC_KEY, &value)
+            .map_err(|error| CodeContextError::Storage(error.to_string()))
+    }
+
+    /// 读取语义向量快照；不存在或损坏时返回 `None`。
+    ///
+    /// 损坏不构成错误路径：向量可以重新嵌入，退化为「这次要多花一点钱」而不是加载失败。
+    pub fn load_semantic(self, host: &dyn PluginHostApi) -> Option<SemanticSnapshot> {
+        if !self.available {
+            return None;
+        }
+        let value = host
+            .store_get(PluginStoreScope::Workspace, SEMANTIC_KEY)
+            .ok()??;
+        serde_json::from_value(value).ok()
+    }
+
+    /// 删除语义向量快照。
+    ///
+    /// # Errors
+    ///
+    /// 宿主删除失败时返回错误；存储不可用时视为已清理。
+    pub fn clear_semantic(self, host: &dyn PluginHostApi) -> Result<(), CodeContextError> {
+        if !self.available {
+            return Ok(());
+        }
+        host.store_remove(PluginStoreScope::Workspace, SEMANTIC_KEY)
+            .map(|_| ())
+            .map_err(|error| CodeContextError::Storage(error.to_string()))
     }
 
     /// 读取路径 → 内容哈希表。

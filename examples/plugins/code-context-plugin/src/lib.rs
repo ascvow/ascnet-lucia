@@ -263,6 +263,15 @@ impl CodeContextPlugin {
             status = IndexStatus::NotIndexed;
         }
 
+        // 尝试从持久存储恢复语义向量。需要当前 provider 的嵌入空间来校验兼容性：
+        // 快照的 space_id 与当前不一致时直接丢弃，避免混用不同模型的向量。
+        let mut semantic = SemanticIndex::new();
+        if let Some(space) = self.embedding_provider(host).space() {
+            if let Some(snapshot) = store.load_semantic(host) {
+                semantic.restore(&space, &snapshot);
+            }
+        }
+
         self.repository = Some(RepositoryContext {
             identity,
             workspace_root: workspace_root.to_string(),
@@ -272,7 +281,7 @@ impl CodeContextPlugin {
             build: None,
             index: None,
             retrieval: None,
-            semantic: SemanticIndex::new(),
+            semantic,
             dirty_paths: BTreeSet::new(),
             pending_writes: BTreeMap::new(),
         });
@@ -822,6 +831,14 @@ impl CodeContextPlugin {
             Ok(vectors) => {
                 for ((chunk_id, file_path, _), vector) in pending.iter().zip(vectors.iter()) {
                     context.semantic.upsert(chunk_id, file_path, vector);
+                }
+                // 向量落盘：失败不影响本次检索，只让下次启动需要重新嵌入。
+                if let Some(snapshot) = context.semantic.snapshot() {
+                    if let Err(error) = context.store.save_semantic(host, &snapshot) {
+                        self.degraded_reason =
+                            Some(format!("语义向量未能持久化：{error}"));
+                        return context.semantic.is_ready();
+                    }
                 }
                 self.degraded_reason = None;
                 context.semantic.is_ready()

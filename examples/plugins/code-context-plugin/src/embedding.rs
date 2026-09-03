@@ -226,6 +226,8 @@ pub struct ApiEmbeddingProvider<'host> {
     space: EmbeddingSpace,
     /// 单批最大条数。
     batch_size: usize,
+    /// 是否在请求中发送 `dimensions` 参数。
+    send_dimensions: bool,
 }
 
 impl std::fmt::Debug for ApiEmbeddingProvider<'_> {
@@ -260,16 +262,19 @@ impl<'host> ApiEmbeddingProvider<'host> {
                 document_template_version: 1,
             },
             batch_size: config.embedding_batch_size.max(1),
+            send_dimensions: config.embedding_send_dimensions,
         })
     }
 
     /// 向端点提交一次嵌入请求并解析返回的向量。
     fn request_embeddings(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, CodeContextError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.space.model,
             "input": inputs,
-            "dimensions": self.space.dimension,
         });
+        if self.send_dimensions {
+            body["dimensions"] = serde_json::json!(self.space.dimension);
+        }
         let request = HttpRequest {
             method: "POST".to_string(),
             path: "embeddings".to_string(),

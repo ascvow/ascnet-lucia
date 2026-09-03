@@ -75,6 +75,11 @@ pub struct CodeContextConfig {
     pub embedding_dimension: u32,
     /// 单批提交的最大条数。
     pub embedding_batch_size: usize,
+    /// 是否在嵌入请求中发送 `dimensions` 参数。
+    ///
+    /// 部分 OpenAI 兼容端点（如 SiliconFlow 的 `BAAI/bge-m3`）不接受该参数，设为 `false`
+    /// 可避免 400 错误。维度校验仍在返回时执行，因此关闭此项不影响安全性。
+    pub embedding_send_dimensions: bool,
     /// 宿主注入的 HTTP 端点摘要；未配置 HTTP 时为 `None`。
     ///
     /// 由宿主从 `base_url` 计算后作为可信元数据下发，插件看不到地址与凭证。它参与嵌入
@@ -90,6 +95,7 @@ impl Default for CodeContextConfig {
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             embedding_dimension: DEFAULT_EMBEDDING_DIMENSION,
             embedding_batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+            embedding_send_dimensions: true,
             http_endpoint_id: None,
         }
     }
@@ -135,6 +141,17 @@ impl CodeContextConfig {
         if let Some(value) = metadata.get("embedding_batch_size") {
             config.embedding_batch_size =
                 parse_positive_u32(value, "embedding_batch_size")? as usize;
+        }
+        if let Some(value) = metadata.get("embedding_send_dimensions") {
+            config.embedding_send_dimensions = match value.trim() {
+                "true" => true,
+                "false" => false,
+                other => {
+                    return Err(CodeContextError::InvalidConfiguration(format!(
+                        "embedding_send_dimensions 必须是 `true` 或 `false`，实际为 `{other}`"
+                    )))
+                }
+            };
         }
         // 该键由宿主注入，不接受插件配置伪造：宿主写入发生在用户配置合并之后。
         config.http_endpoint_id = metadata

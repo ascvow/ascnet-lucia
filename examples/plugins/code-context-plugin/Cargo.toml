@@ -30,3 +30,6 @@ oxc_parser = "0.148"
 oxc_span = "0.148"
 rustpython-parser = "0.4"
 gosyn = "0.2"
+
+[dev-dependencies]
+ureq = "3"

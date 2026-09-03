@@ -1,14 +1,21 @@
 //! 语义向量索引。
 //!
-//! # 为什么是内存驻留
+//! # 持久化与 int8 量化
 //!
-//! `adr-storage.md` 把嵌入向量列为「V1 不存在」，理由是数十 MB 远超 `host-store` 的
-//! 8 MiB 上限。但那条结论说的是**持久化**，不是**存在**：结构索引、符号表与倒排索引
-//! 同样装不下，它们的处理方式是内存驻留、进程启动后按需重建。向量走同一条路，语义检索
-//! 就能在 V1 成立，而落盘仍留给 blob 存储落地后的 V2。
+//! `adr-storage.md` 把嵌入向量列为「V1 不存在」，理由是 f32 原样存放远超 `host-store`
+//! 的 8 MiB 上限——本仓库约 5000 个 chunk × 1024 维 × 4 字节就是 20 MB 以上。
 //!
-//! 代价要说清楚：进程重启后向量需要重新嵌入，对 API provider 意味着重新付费与等待。
-//! 这不是本模块能解决的问题——它的解法就是 blob 存储。
+//! 但那条结论的前提是**不量化**。检索用的向量对精度并不敏感：向量已归一化，
+//! 每个分量都落在 `[-1, 1]`，用一个 f32 缩放因子加 int8 分量即可还原到千分之一的误差，
+//! 而体积降到四分之一。再算上 base64 的 4/3 膨胀，单条约 1.4 KB，8 MiB 能装下约 5000 条
+//! ——正好是本仓库的量级。
+//!
+//! 因此本模块**持久化量化后的向量**：重启后直接加载，不必重新嵌入。这对 API provider
+//! 是实打实的省钱与省时间。容量不足时按 [`MAX_PERSISTED_VECTORS`] 截断并如实报告，
+//! 而不是写一份残缺数据——被截断的部分下次会重新嵌入，结果仍然正确。
+//!
+//! 真正解除容量上限仍要靠 blob 存储（见 `adr-storage.md` 的 V2），届时换掉序列化层即可，
+//! 检索逻辑不受影响。
 //!
 //! # 为什么是线性扫描而不是 ANN
 //!
@@ -21,6 +28,40 @@
 mod tests;
 
 use crate::model::EmbeddingSpace;
+use serde::{Deserialize, Serialize};
+
+/// 允许持久化的最大向量条数。
+///
+/// 宿主存储 8 MiB、每次写入重写全量。单条量化记录约 1.4 KB（1024 维 int8 经 base64
+/// 膨胀后约 1366 字节，加 chunk ID 与路径约 100 字节），5000 条约 7 MiB，
+/// 给 manifest 与哈希表留出余量。超出部分不写入，下次启动重新嵌入。
+const MAX_PERSISTED_VECTORS: usize = 5_000;
+
+/// 一条可持久化的量化向量记录。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SemanticRecord {
+    /// 稳定 chunk ID。
+    pub chunk_id: String,
+    /// 所属文件路径。
+    pub file_path: String,
+    /// 还原量化分量所需的缩放因子。
+    pub scale: f32,
+    /// base64 编码的 int8 分量。
+    pub vector: String,
+}
+
+/// 语义索引的持久化载荷。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SemanticSnapshot {
+    /// 向量所属的嵌入空间标识；不一致时整份丢弃。
+    pub space_id: String,
+    /// 向量维度，用于加载时校验。
+    pub dimension: u32,
+    /// 量化后的向量记录。
+    pub records: Vec<SemanticRecord>,
+    /// 是否因容量上限被截断。
+    pub truncated: bool,
+}
 
 /// 索引中的一条向量记录。
 #[derive(Debug, Clone)]
@@ -178,6 +219,144 @@ impl SemanticIndex {
         scored.truncate(limit);
         scored
     }
+}
+
+impl SemanticIndex {
+    /// 导出可持久化的量化快照。
+    ///
+    /// 未声明嵌入空间时返回 `None`——没有空间标识的向量无法判断加载时是否仍然可比。
+    /// 条数超过 [`MAX_PERSISTED_VECTORS`] 时截断并置位 `truncated`，
+    /// 而不是放弃整份快照：存下大部分依然能省掉大部分嵌入调用。
+    pub fn snapshot(&self) -> Option<SemanticSnapshot> {
+        let space = self.space.as_ref()?;
+        let dimension = self.entries.first().map(|entry| entry.vector.len())?;
+        let truncated = self.entries.len() > MAX_PERSISTED_VECTORS;
+        let records = self
+            .entries
+            .iter()
+            .take(MAX_PERSISTED_VECTORS)
+            .map(|entry| {
+                let (scale, quantized) = quantize(&entry.vector);
+                SemanticRecord {
+                    chunk_id: entry.chunk_id.clone(),
+                    file_path: entry.file_path.clone(),
+                    scale,
+                    vector: base64_encode(&quantized),
+                }
+            })
+            .collect();
+        Some(SemanticSnapshot {
+            space_id: space.id(),
+            dimension: u32::try_from(dimension).unwrap_or(u32::MAX),
+            records,
+            truncated,
+        })
+    }
+
+    /// 从持久化快照恢复向量。
+    ///
+    /// 嵌入空间标识不一致时**整份丢弃并返回 `false`**：混用不同空间的向量会让检索结果
+    /// 长期缓慢地不正确，重新嵌入的代价远小于给出错误结果。维度不符的单条记录被跳过。
+    pub fn restore(&mut self, space: &EmbeddingSpace, snapshot: &SemanticSnapshot) -> bool {
+        if snapshot.space_id != space.id() {
+            return false;
+        }
+        self.reset(space.clone());
+        for record in &snapshot.records {
+            let Some(bytes) = base64_decode(&record.vector) else {
+                continue;
+            };
+            if bytes.len() != snapshot.dimension as usize {
+                continue;
+            }
+            let vector = dequantize(&bytes, record.scale);
+            self.upsert(&record.chunk_id, &record.file_path, &vector);
+        }
+        !self.entries.is_empty()
+    }
+}
+
+/// 把归一化向量量化为 int8 分量与一个缩放因子。
+///
+/// 缩放因子取最大绝对值而不是固定 `1.0`：归一化向量的分量普遍远小于 1，
+/// 用固定刻度会浪费掉大部分量化区间，误差反而更大。
+fn quantize(vector: &[f32]) -> (f32, Vec<u8>) {
+    let peak = vector
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0f32, f32::max);
+    if peak <= f32::EPSILON {
+        return (0.0, vec![0; vector.len()]);
+    }
+    let scale = peak / 127.0;
+    let quantized = vector
+        .iter()
+        .map(|value| ((value / scale).round().clamp(-127.0, 127.0) as i8) as u8)
+        .collect();
+    (scale, quantized)
+}
+
+/// 把 int8 分量还原为浮点向量。
+fn dequantize(bytes: &[u8], scale: f32) -> Vec<f32> {
+    bytes
+        .iter()
+        .map(|byte| f32::from(*byte as i8) * scale)
+        .collect()
+}
+
+/// base64 字母表。
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// 把字节编码为 base64。
+///
+/// 自实现而不是引入依赖：插件产物已有 3.4 MB，为二十行代码再加一个 crate 不划算，
+/// 且这里只需要标准字母表与填充。
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let block = (u32::from(group[0]) << 16)
+            | (group.get(1).map_or(0, |byte| u32::from(*byte)) << 8)
+            | group.get(2).map_or(0, |byte| u32::from(*byte));
+        for offset in 0..4 {
+            if offset <= group.len() {
+                let index = (block >> (18 - offset * 6)) & 0x3F;
+                out.push(char::from(BASE64_ALPHABET[index as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// 解码 base64；含非法字符时返回 `None`。
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    /// 把 base64 字符映射回 6 位值。
+    fn value_of(character: u8) -> Option<u32> {
+        match character {
+            b'A'..=b'Z' => Some(u32::from(character - b'A')),
+            b'a'..=b'z' => Some(u32::from(character - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(character - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let raw: Vec<u8> = text.bytes().filter(|byte| *byte != b'=').collect();
+    let mut out = Vec::with_capacity(raw.len() * 3 / 4);
+    for group in raw.chunks(4) {
+        let mut block = 0u32;
+        for (offset, character) in group.iter().enumerate() {
+            block |= value_of(*character)? << (18 - offset * 6);
+        }
+        // 4 个字符还原 3 字节，末组按实际字符数决定还原几个。
+        for offset in 0..group.len().saturating_sub(1) {
+            out.push(((block >> (16 - offset * 8)) & 0xFF) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// 归一化向量；零向量或含非有限分量时返回 `None`。
