@@ -411,6 +411,21 @@ pub(crate) async fn load_plugins_for_tui(
             model_output_limit,
         )?;
     }
+    // 配置了 HTTP 端点的插件获得受限网络能力；凭证留在 Host 侧，不进入激活元数据。
+    // 实际能否发请求还要看 manifest 的 allow_hosts 是否覆盖该 base URL。
+    for (plugin_id, settings) in &plugin_settings {
+        let Some(http) = settings.http.as_ref() else {
+            continue;
+        };
+        host_services = host_services.with_plugin_http(
+            plugin_id,
+            &http.base_url,
+            http.credential_headers.clone(),
+            http.max_request_bytes,
+            http.max_response_bytes,
+            http.timeout_ms,
+        )?;
+    }
     let host_services = host_services.with_agent_runtime(
         Arc::new(runtime),
         controller_profile,
