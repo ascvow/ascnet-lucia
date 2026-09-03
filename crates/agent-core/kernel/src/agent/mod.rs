@@ -361,6 +361,10 @@ impl AgentControl {
     pub fn cancel(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // 先唤醒当前所有等待者：同一批并行执行的工具必须全部收到取消，只唤醒一个会让
+        // 其余工具继续跑到自然结束。
+        self.cancel_notify.notify_waiters();
+        // 再留下一个 permit，供取消之后才进入等待的调用点消费，保持逐个执行时的语义。
         self.cancel_notify.notify_one();
     }
 

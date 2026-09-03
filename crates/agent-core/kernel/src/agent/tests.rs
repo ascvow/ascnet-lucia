@@ -1668,6 +1668,157 @@ async fn model_cannot_forge_tool_permission_scope() {
         .contains("forged-run"));
 }
 
+/// 记录进入与离开顺序的测试工具，用于观察调用是否真的重叠执行。
+struct OverlapProbeTool {
+    name: &'static str,
+    scope: ToolPermissionScope,
+    /// 按发生顺序记录 `enter`/`exit` 事件。
+    events: Arc<std::sync::Mutex<Vec<String>>>,
+    /// 当前并发进入该工具的调用数峰值。
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for OverlapProbeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(self.name, "并发探针", ToolSpec::empty_object_schema())
+            .with_permission_scope(self.scope)
+    }
+
+    async fn call(&self, call: ToolCall) -> Result<ToolResult> {
+        let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(current, Ordering::SeqCst);
+        self.events
+            .lock()
+            .expect("事件锁不应中毒")
+            .push(format!("enter:{}", call.id));
+        // 让出执行权，使可以并发的调用有机会真正重叠。
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        self.events
+            .lock()
+            .expect("事件锁不应中毒")
+            .push(format!("exit:{}", call.id));
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolResult::success(call.id, call.name, json!({"ok": true})))
+    }
+}
+
+/// 组装一次多工具运行，返回运行结果与探针记录。
+async fn run_with_probe(
+    calls: Vec<ToolCall>,
+    scopes: &[(&'static str, ToolPermissionScope)],
+) -> (
+    AgentRun,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    Arc<AtomicUsize>,
+) {
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let mut gateway = ModelGateway::new();
+    gateway
+        .register(
+            "scripted",
+            Arc::new(ScriptedModel::new(vec![
+                ModelResponse::tool_calls(calls),
+                ModelResponse::text("完成"),
+            ])),
+        )
+        .expect("注册脚本模型");
+    let mut agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("scripted", "test-model"),
+    );
+    for (name, scope) in scopes {
+        agent
+            .tools_mut()
+            .register(OverlapProbeTool {
+                name,
+                scope: *scope,
+                events: Arc::clone(&events),
+                active: Arc::clone(&active),
+                peak: Arc::clone(&peak),
+            })
+            .expect("注册探针工具");
+    }
+
+    let run = agent.run("执行工具").await.expect("运行应成功");
+    (run, events, peak)
+}
+
+/// 同一批连续只读调用必须并发执行，并保持与请求一致的结果顺序。
+#[tokio::test]
+async fn consecutive_read_only_calls_run_concurrently() {
+    let calls = (0..3)
+        .map(|index| ToolCall::new(format!("read-{index}"), "probe_read", json!({})))
+        .collect::<Vec<_>>();
+
+    let (run, events, peak) =
+        run_with_probe(calls, &[("probe_read", ToolPermissionScope::Read)]).await;
+
+    assert!(peak.load(Ordering::SeqCst) > 1, "只读批必须真正并发执行");
+    // 三个调用应先全部进入，再陆续退出；结果顺序仍与请求顺序一致。
+    let events = events.lock().expect("事件锁不应中毒");
+    assert_eq!(
+        events[..3]
+            .iter()
+            .filter(|e| e.starts_with("enter"))
+            .count(),
+        3
+    );
+    let results = run
+        .session
+        .messages()
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            crate::model::ContentBlock::ToolResult { result } => Some(result.call_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results, vec!["read-0", "read-1", "read-2"]);
+}
+
+/// 写入类调用必须保持逐个执行，且不与相邻只读调用合并成一批。
+#[tokio::test]
+async fn write_calls_stay_serial_and_split_batches() {
+    let calls = vec![
+        ToolCall::new("read-0", "probe_read", json!({})),
+        ToolCall::new("write-0", "probe_write", json!({})),
+        ToolCall::new("read-1", "probe_read", json!({})),
+    ];
+
+    let (_run, events, peak) = run_with_probe(
+        calls,
+        &[
+            ("probe_read", ToolPermissionScope::Read),
+            ("probe_write", ToolPermissionScope::Write),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        1,
+        "写入调用把批切开后不应出现并发"
+    );
+    // 每个调用都必须在下一个开始前结束，顺序严格交替。
+    let events = events.lock().expect("事件锁不应中毒");
+    assert_eq!(
+        *events,
+        vec![
+            "enter:read-0",
+            "exit:read-0",
+            "enter:write-0",
+            "exit:write-0",
+            "enter:read-1",
+            "exit:read-1",
+        ]
+    );
+}
+
 /// 返回结构化 UI 细节的测试工具。
 struct DetailedTool;
 

@@ -28,6 +28,41 @@ impl ToolExecutionOutcome {
     }
 }
 
+/// 返回从 `start` 开始的连续只读调用批的结束下标（不含）。
+///
+/// 只有 [`ToolPermissionScope::Read`] 的调用可以并发：它们不产生副作用，彼此之间没有顺序
+/// 依赖。遇到写入、执行或未知 scope 就必须停下，因为后续调用可能依赖前面的副作用，乱序
+/// 执行会改变语义。批必须是**连续**的，跨过中间的写调用去合并两侧只读调用同样会破坏顺序。
+fn read_only_batch_end(
+    tool_calls: &[ToolCall],
+    start: usize,
+    permission_scopes: &HashMap<String, ToolPermissionScope>,
+) -> usize {
+    let is_read_only = |call: &ToolCall| {
+        permission_scopes
+            .get(&call.name)
+            .copied()
+            .unwrap_or_default()
+            == ToolPermissionScope::Read
+    };
+    if !tool_calls.get(start).is_some_and(is_read_only) {
+        return start + 1;
+    }
+    tool_calls[start..]
+        .iter()
+        .take_while(|call| is_read_only(call))
+        .count()
+        + start
+}
+
+/// 工具准入阶段的结论。
+enum ToolAdmission {
+    /// 调用在准入阶段就已有最终结果，不再进入执行阶段。
+    Settled(ToolExecutionOutcome),
+    /// 调用通过准入，可以按裁决后的形态执行。
+    Ready(ToolCall),
+}
+
 /// 用一次性审批说明替换最新的完整工具对，不改写持久会话。
 ///
 /// 上下文加载器可以摘要或删除原始工具调用。若目标调用与结果不再成对存在，先清理
@@ -791,12 +826,14 @@ impl Agent {
                 });
             }
 
-            // 逐个执行工具；每个工具执行前检查取消，完成后检查 steering 队列。
+            // 按批执行工具：连续的只读调用并发执行，其余逐个执行。每批之前检查取消，
+            // 之后检查 steering 队列。
             self.update_state(|state| state.phase = AgentPhase::ExecutingTools);
             let mut results = Vec::new();
             let mut steering_message = None;
             let mut run_cancelled = false;
-            for (index, call) in tool_calls.iter().enumerate() {
+            let mut index = 0;
+            while index < tool_calls.len() {
                 // 检查点：取消优先于 steering，跳过所有尚未执行的工具。
                 if self.take_cancelled() {
                     for skipped in &tool_calls[index..] {
@@ -821,13 +858,35 @@ impl Agent {
                     break;
                 }
 
-                let outcome = self
-                    .execute_tool_with_hooks(&run_id, call.clone(), &tool_permission_scopes, step)
-                    .await?;
-                if let Some(request_result) = outcome.request_result {
-                    next_request_tool_results.push(request_result);
+                let batch_end = read_only_batch_end(&tool_calls, index, &tool_permission_scopes);
+                let outcomes = if batch_end > index + 1 {
+                    self.run_read_only_batch(
+                        &run_id,
+                        &tool_calls[index..batch_end],
+                        &tool_permission_scopes,
+                        step,
+                    )
+                    .await?
+                } else {
+                    vec![
+                        self.execute_tool_with_hooks(
+                            &run_id,
+                            tool_calls[index].clone(),
+                            &tool_permission_scopes,
+                            step,
+                        )
+                        .await?,
+                    ]
+                };
+                for outcome in outcomes {
+                    if let Some(request_result) = outcome.request_result {
+                        next_request_tool_results.push(request_result);
+                    }
+                    results.push(outcome.result);
                 }
-                results.push(outcome.result);
+                // 游标推进到本批最后一个已执行的调用；循环末尾统一 +1 跨到下一个未执行项，
+                // 中间的跳过范围因此也以整批为界，不会重复标记批内已执行的调用。
+                index = batch_end.max(index + 1) - 1;
 
                 // 工具前置策略可以取消当前运行；立即跳过同一批剩余工具。
                 if self.take_cancelled() {
@@ -883,6 +942,7 @@ impl Agent {
                         break;
                     }
                 }
+                index += 1;
             }
             session.push_tool_results(results);
             self.update_state(|state| state.session = session.clone());
@@ -1012,10 +1072,81 @@ impl Agent {
     async fn execute_tool_with_hooks(
         &self,
         run_id: &str,
-        mut call: ToolCall,
+        call: ToolCall,
         permission_scopes: &HashMap<String, ToolPermissionScope>,
         step: usize,
     ) -> Result<ToolExecutionOutcome> {
+        match self
+            .admit_tool(run_id, call, permission_scopes, step)
+            .await?
+        {
+            ToolAdmission::Settled(outcome) => Ok(outcome),
+            ToolAdmission::Ready(call) => self.run_admitted_call(run_id, call, step).await,
+        }
+    }
+
+    /// 并发执行一批只读工具调用，返回与输入顺序一致的结果。
+    ///
+    /// 准入仍然逐个串行完成：审批交互、策略门禁和监听者裁决都依赖稳定的先后顺序，插件的
+    /// 审批队列也按到达顺序展示。只有通过准入之后的执行体并发，因此收益来自 IO 重叠，而
+    /// 权限与审批语义与逐个执行完全一致。
+    ///
+    /// 取消在两处生效：准入阶段逐个检查，执行阶段由 [`Agent::cancel`] 唤醒全部等待者。
+    async fn run_read_only_batch(
+        &self,
+        run_id: &str,
+        calls: &[ToolCall],
+        permission_scopes: &HashMap<String, ToolPermissionScope>,
+        step: usize,
+    ) -> Result<Vec<ToolExecutionOutcome>> {
+        let mut admissions = Vec::with_capacity(calls.len());
+        for call in calls {
+            admissions.push(
+                self.admit_tool(run_id, call.clone(), permission_scopes, step)
+                    .await?,
+            );
+        }
+
+        // 通过准入的调用并发执行；已有结论的调用保持原位，保证结果顺序与请求一致。
+        let mut pending = Vec::new();
+        let mut settled = Vec::with_capacity(admissions.len());
+        for admission in admissions {
+            match admission {
+                ToolAdmission::Settled(outcome) => settled.push(Some(outcome)),
+                ToolAdmission::Ready(call) => {
+                    settled.push(None);
+                    pending.push((settled.len() - 1, call));
+                }
+            }
+        }
+        let executed = futures_util::future::try_join_all(pending.into_iter().map(
+            |(slot, call)| async move {
+                self.run_admitted_call(run_id, call, step)
+                    .await
+                    .map(|outcome| (slot, outcome))
+            },
+        ))
+        .await?;
+        for (slot, outcome) in executed {
+            settled[slot] = Some(outcome);
+        }
+        Ok(settled
+            .into_iter()
+            .map(|outcome| outcome.expect("每个调用都必须产出结果"))
+            .collect())
+    }
+
+    /// 执行工具准入：策略门禁、监听者裁决与取消检查。
+    ///
+    /// 返回 [`ToolAdmission::Settled`] 表示调用已经有最终结果（被拒绝、取消或策略否决），
+    /// 调用方不应再执行；[`ToolAdmission::Ready`] 表示可以进入执行阶段。
+    async fn admit_tool(
+        &self,
+        run_id: &str,
+        mut call: ToolCall,
+        permission_scopes: &HashMap<String, ToolPermissionScope>,
+        step: usize,
+    ) -> Result<ToolAdmission> {
         // 覆盖模型响应或历史消息携带的同名字段，只信任当前注册表中的 ToolSpec。
         call.bind_permission_scope(
             permission_scopes
@@ -1029,7 +1160,7 @@ impl Agent {
         // 第一道策略门禁：在任何插件钩子之前拒绝策略不允许的工具，
         // 避免插件通过 `core.tool.call` 观察到本不该暴露的调用。
         if let Some(result) = self.reject_if_policy_denies(run_id, &call, step).await? {
-            return Ok(ToolExecutionOutcome::plain(result));
+            return Ok(ToolAdmission::Settled(ToolExecutionOutcome::plain(result)));
         }
 
         // 工具准入决策点：监听者可以改写调用、拒绝执行或连带取消整个运行。
@@ -1058,7 +1189,7 @@ impl Agent {
             self.finish_tool_state(&result);
             self.emit_tool_finished(run_id, step, &result, "runtime")
                 .await?;
-            return Ok(ToolExecutionOutcome::plain(result));
+            return Ok(ToolAdmission::Settled(ToolExecutionOutcome::plain(result)));
         };
 
         let canceller = admission.canceller().unwrap_or("unknown").to_string();
@@ -1088,7 +1219,7 @@ impl Agent {
             self.finish_tool_state(&result);
             self.emit_tool_finished(run_id, step, &result, "runtime")
                 .await?;
-            return Ok(ToolExecutionOutcome::plain(result));
+            return Ok(ToolAdmission::Settled(ToolExecutionOutcome::plain(result)));
         }
 
         if cancelled {
@@ -1125,10 +1256,10 @@ impl Agent {
                 "plugin_policy",
             )
             .await?;
-            return Ok(ToolExecutionOutcome {
+            return Ok(ToolAdmission::Settled(ToolExecutionOutcome {
                 result,
                 request_result,
-            });
+            }));
         }
 
         // 改写可以改变名称或伪造字段；最终调用必须重新绑定目标工具的可信 scope。
@@ -1143,9 +1274,22 @@ impl Agent {
         // 第二道策略门禁：插件可以重写工具调用，但不能借重写换成策略拒绝的工具。
         // 与 `RestrictedExtension` 对 allowlist 的处理保持一致。
         if let Some(result) = self.reject_if_policy_denies(run_id, &call, step).await? {
-            return Ok(ToolExecutionOutcome::plain(result));
+            return Ok(ToolAdmission::Settled(ToolExecutionOutcome::plain(result)));
         }
 
+        Ok(ToolAdmission::Ready(call))
+    }
+
+    /// 执行已经通过准入的工具调用，并发布运行期输出与终态事件。
+    ///
+    /// 调用方必须先经过 [`Self::admit_tool`]：这里不再做策略或审批判断，只负责执行。
+    /// 拆分出该阶段是为了让同一批只读调用可以并发执行，而准入与审批仍严格串行。
+    async fn run_admitted_call(
+        &self,
+        run_id: &str,
+        call: ToolCall,
+        step: usize,
+    ) -> Result<ToolExecutionOutcome> {
         self.update_state(|state| {
             if let Some(tool) = state
                 .tool_calls
