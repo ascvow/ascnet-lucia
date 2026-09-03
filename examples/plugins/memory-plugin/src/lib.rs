@@ -105,7 +105,10 @@ impl MemoryCollection {
                 return Err(anyhow!("记忆缺少 ID"));
             }
             if entry.text.chars().count() > MAX_MEMORY_CHARS {
-                return Err(anyhow!("记忆 `{}` 超过 {MAX_MEMORY_CHARS} 字上限", entry.id));
+                return Err(anyhow!(
+                    "记忆 `{}` 超过 {MAX_MEMORY_CHARS} 字上限",
+                    entry.id
+                ));
             }
         }
         Ok(())
@@ -518,15 +521,14 @@ impl MemoryPlugin {
         let entries = scopes
             .iter()
             .flat_map(|scope| {
-                self.collection(*scope)
-                    .entries
-                    .iter()
-                    .map(move |entry| json!({
+                self.collection(*scope).entries.iter().map(move |entry| {
+                    json!({
                         "id": entry.id,
                         "scope": scope.label(),
                         "text": entry.text,
                         "tags": entry.tags,
-                    }))
+                    })
+                })
             })
             .collect::<Vec<_>>();
         Ok(ToolResult::success(
@@ -856,7 +858,10 @@ mod tests {
         plugin
             .call_tool_with_host(
                 &host,
-                call("memory_record", json!({"text": "本仓库使用 Bun 而不是 npm"})),
+                call(
+                    "memory_record",
+                    json!({"text": "本仓库使用 Bun 而不是 npm"}),
+                ),
             )
             .expect("记录记忆");
 
@@ -866,7 +871,10 @@ mod tests {
             .expect("再次激活");
 
         assert_eq!(reloaded.project.entries.len(), 1);
-        assert_eq!(reloaded.project.entries[0].text, "本仓库使用 Bun 而不是 npm");
+        assert_eq!(
+            reloaded.project.entries[0].text,
+            "本仓库使用 Bun 而不是 npm"
+        );
         assert!(host.injected_prompt().contains("本仓库使用 Bun"));
     }
 
@@ -885,9 +893,7 @@ mod tests {
     fn scopes_are_independent_and_default_to_project() {
         let host = StoreHost::new();
         let mut plugin = MemoryPlugin::default();
-        plugin
-            .activate(&host, activation_context())
-            .expect("激活");
+        plugin.activate(&host, activation_context()).expect("激活");
 
         plugin
             .call_tool_with_host(&host, call("memory_record", json!({"text": "项目事实"})))
@@ -895,7 +901,10 @@ mod tests {
         plugin
             .call_tool_with_host(
                 &host,
-                call("memory_record", json!({"text": "个人偏好", "scope": "user"})),
+                call(
+                    "memory_record",
+                    json!({"text": "个人偏好", "scope": "user"}),
+                ),
             )
             .expect("记录用户记忆");
 
@@ -910,9 +919,7 @@ mod tests {
     fn duplicate_text_is_not_recorded_twice() {
         let host = StoreHost::new();
         let mut plugin = MemoryPlugin::default();
-        plugin
-            .activate(&host, activation_context())
-            .expect("激活");
+        plugin.activate(&host, activation_context()).expect("激活");
 
         let first = plugin
             .call_tool_with_host(&host, call("memory_record", json!({"text": "同一条结论"})))
@@ -932,9 +939,7 @@ mod tests {
     fn oversized_memory_is_rejected_with_guidance() {
         let host = StoreHost::new();
         let mut plugin = MemoryPlugin::default();
-        plugin
-            .activate(&host, activation_context())
-            .expect("激活");
+        plugin.activate(&host, activation_context()).expect("激活");
 
         let result = plugin
             .call_tool_with_host(
@@ -956,13 +961,14 @@ mod tests {
     fn forgetting_removes_memory_from_injection() {
         let host = StoreHost::new();
         let mut plugin = MemoryPlugin::default();
-        plugin
-            .activate(&host, activation_context())
-            .expect("激活");
+        plugin.activate(&host, activation_context()).expect("激活");
         let recorded = plugin
             .call_tool_with_host(&host, call("memory_record", json!({"text": "会被删除"})))
             .expect("记录记忆");
-        let id = recorded.content["id"].as_str().expect("应返回 ID").to_string();
+        let id = recorded.content["id"]
+            .as_str()
+            .expect("应返回 ID")
+            .to_string();
 
         plugin
             .call_tool_with_host(&host, call("memory_forget", json!({"id": id})))
@@ -980,9 +986,7 @@ mod tests {
     fn injected_memories_are_framed_as_untrusted_data() {
         let host = StoreHost::new();
         let mut plugin = MemoryPlugin::default();
-        plugin
-            .activate(&host, activation_context())
-            .expect("激活");
+        plugin.activate(&host, activation_context()).expect("激活");
         plugin
             .call_tool_with_host(&host, call("memory_record", json!({"text": "任意记忆"})))
             .expect("记录记忆");
@@ -997,9 +1001,7 @@ mod tests {
     fn injection_is_bounded_and_reports_omissions() {
         let host = StoreHost::new();
         let mut plugin = MemoryPlugin::default();
-        plugin
-            .activate(&host, activation_context())
-            .expect("激活");
+        plugin.activate(&host, activation_context()).expect("激活");
         for index in 0..40 {
             plugin
                 .call_tool_with_host(
@@ -1013,7 +1015,10 @@ mod tests {
         }
 
         let prompt = host.injected_prompt();
-        assert!(prompt.chars().count() < MAX_INJECTED_CHARS * 2, "注入必须有界");
+        assert!(
+            prompt.chars().count() < MAX_INJECTED_CHARS * 2,
+            "注入必须有界"
+        );
         assert!(prompt.contains("未展示"), "{prompt}");
         // 最新的记忆必须保留在注入内容里。
         assert!(prompt.contains("039"), "{prompt}");
@@ -1037,7 +1042,10 @@ mod tests {
         plugin
             .call_tool_with_host(
                 &host,
-                call("memory_record", json!({"text": "个人偏好", "scope": "user"})),
+                call(
+                    "memory_record",
+                    json!({"text": "个人偏好", "scope": "user"}),
+                ),
             )
             .expect("用户级记录应可用");
     }
@@ -1046,7 +1054,10 @@ mod tests {
     #[test]
     fn unknown_scope_is_rejected() {
         assert!(MemoryScope::parse(Some("everything")).is_err());
-        assert_eq!(MemoryScope::parse(None).expect("默认作用域"), MemoryScope::Project);
+        assert_eq!(
+            MemoryScope::parse(None).expect("默认作用域"),
+            MemoryScope::Project
+        );
     }
 
     /// 面板在触发前缀出现时展示，Esc 收起。

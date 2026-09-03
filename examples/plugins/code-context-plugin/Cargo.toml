@@ -16,3 +16,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 wit-bindgen = "0.59"
+
+# 结构化解析一律使用现成的纯 Rust 解析器，不自建语法分析。
+# 选型理由与 tree-sitter 的对比见 docs/code-context-engine/adr-structural-parsing.md：
+# 这些 crate 没有 C 依赖，可直接编译到 wasm32-wasip2，因此原 ADR 中"缺 C 工具链只能手写
+# Tier 2 解析器"的前提不再成立。
+syn = { version = "3", features = ["full", "parsing"] }
+# syn 的行号来自 proc-macro2 的 fallback span，必须显式开启该 feature 才有 line/column。
+proc-macro2 = { version = "1", features = ["span-locations"] }
+oxc_allocator = "0.148"
+oxc_ast = "0.148"
+oxc_parser = "0.148"
+oxc_span = "0.148"
+rustpython-parser = "0.4"
+gosyn = "0.2"

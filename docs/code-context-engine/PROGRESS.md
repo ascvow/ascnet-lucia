@@ -7,7 +7,7 @@
 
 ## Current Phase
 
-Phase 3 — Structural Parsing
+Phase 4 — Structural Index
 
 Status: NOT_STARTED
 
@@ -16,7 +16,7 @@ Status: NOT_STARTED
 - [x] Phase 0 — Architecture Revalidation
 - [x] Phase 1 — Plugin Skeleton
 - [x] Phase 2 — Repository Discovery
-- [ ] Phase 3 — Structural Parsing
+- [x] Phase 3 — Structural Parsing
 - [ ] Phase 4 — Structural Index
 - [ ] Phase 5 — Lexical & Symbol Retrieval
 - [ ] Phase 6 — Embedding Abstraction
@@ -238,6 +238,87 @@ Deferred items:
 
 Next: Phase 3 — Structural Parsing
 
+---
+
+### Phase 3 — Structural Parsing
+
+Status: COMPLETE
+Completed Date: 2026-09-03
+
+Summary：把源文件转换为 `CodeChunk` 与 `Symbol`。**结构化解析一律使用现成的纯 Rust 解析器，
+不自建语法分析**——这推翻了原计划的"手写 Tier 2 启发式解析器"，详见下方 Architecture Drift
+与新增的 [adr-structural-parsing.md](./adr-structural-parsing.md)。
+
+Implemented:
+- 统一的 `Declaration` 归一化层：各家 AST 折算成同一结构后，限定名推导、chunk 装配与符号表
+  构建对所有语言共用一套代码。**新增语言 = 新增一个适配器**，不是新增一套解析器。
+- 四个语言适配器：
+  | 语言 | 解析器 | 覆盖 |
+  | --- | --- | --- |
+  | Rust | `syn` 3 | fn / struct / enum / trait / impl / mod / const / static / type / macro_rules，含 trait 与 impl 内部条目 |
+  | TS / JS（含 TSX / JSX） | `oxc_parser` 0.148 | function / class + 方法 / interface + 成员 / enum / type / namespace / 箭头函数与函数表达式赋值 |
+  | Python | `rustpython-parser` 0.4 | def / async def / class + 方法、全大写模块级常量、docstring |
+  | Go | `gosyn` 0.2 | func / 方法（按接收者限定）/ struct / interface / type / const / var |
+- 限定名推导：Rust 用 `::`，其余用 `.`；Go 方法通过 `owner` 得到 `Repo.Get`——接收者参与限定名
+  但不是词法父节点。
+- 文档注释：Rust 从 `#[doc]` 属性、Python 从 docstring、Go 从 `docs` 注释节点提取。
+- import 收集：Rust 的 `use` 树还原、TS/JS 的模块路径、Python 的 `import` / `from`、Go 的 import 块。
+- **稳定 chunk 标识**：由仓库身份 + 文件路径 + 限定名 + 符号种类 + 同名序号决定，
+  **不含行号**——行号会在文件任意位置插入一行后全部改变，让增量索引把整个文件判成新内容。
+- Tier 3 文本分块：未覆盖语言、解析失败、无声明的文件。优先在空行处切分，行区间连续不重叠。
+
+Key files:
+- `examples/plugins/code-context-plugin/src/parser/mod.rs` — 归一化层、限定名、chunk 装配、文本兜底
+- `.../src/parser/rust_lang.rs`、`typescript.rs`、`python.rs`、`golang.rs` — 四个 AST 适配器
+- `.../src/parser/tests.rs` — 解析测试
+- `docs/code-context-engine/adr-structural-parsing.md` — 选型 ADR
+
+Tests：新增 34 个，插件单测总数 112 → 146。
+
+覆盖：五种语言的声明种类与限定名、方法归属、嵌套模块 / namespace、行区间、文档注释、import、
+TSX / JSX、语法错误降级、未覆盖语言降级、无声明文件降级、空文件、纯空白文件、
+长文本切分连续性、chunk 身份跨行号平移稳定、内容变化时哈希变化、跨文件 ID 区分、
+解析确定性、多字节字符行号。
+
+Tests Executed / Result:
+- `cargo test --offline -p code-context-plugin`：146 单元测试 + 1 文档测试，全通过。
+- `cargo clippy --offline -p code-context-plugin --all-targets`：无警告。
+- `bun run test:plugin:code-context`：全链通过（单测 → WASM release 构建 → 7 个 smoke test）。
+
+Build Result：`wasm32-wasip2` release 构建成功，无 regression。
+
+**体积影响**：解析器全部链接进产物后，插件 wasm 从 592 KB 增至 **3.4 MB**（实测，用临时探针
+强制链接后测量；当前 592 KB 是因为解析器尚未被任何导出路径引用而被死代码消除，
+Phase 4 接入后会体现为 3.4 MB）。模块体积不占用 64 MiB 线性内存预算，可接受。
+
+Important decisions:
+1. **不自建语法分析。** 手写解析器每新增一种语言就要重写一套词法屏蔽 + 声明识别 + 边界推导，
+   且必须自行处理字符串里的括号、注释里的关键字、Rust 生命周期与字符字面量歧义、模板字面量、
+   JSX——这些在成熟解析器里早已解决。
+2. **原"缺 C 工具链所以只能手写"的论证只对 Tree-sitter 成立。** 纯 Rust 解析器走 `rustc` 的
+   `wasm32-wasip2` 后端，与 C 工具链无关。已实测验证四个解析器均可编译并正确工作。
+3. **`oxc` 的容错特性被刻意保留**：语法错误时仍返回可用 AST，只在 `panicked` 时降级。
+   编辑中的半成品文件依然应该可被检索，这正是 Coding Agent 场景所需。
+4. **箭头函数赋值归类为函数**：`export const foo = () => {}` 是现代 TS/JS 最主流的函数定义
+   形态，归类为常量会让"某某函数在哪"的查询大面积落空。
+5. **Python 只收全大写模块级赋值为常量**：Python 没有 const，全大写是社区通行约定；
+   收录每个模块级变量会让符号检索被噪声淹没。
+6. **Rust impl 块以被实现的类型命名**，trait 名记入 `owner`：用户找的是"这个类型的方法在哪"。
+
+Known limitations:
+- **未覆盖语言走 Tier 3**：Vue、PHP、Java、C/C++、Ruby 等仍进入索引、仍可被词法与标识符检索
+  命中，但没有符号级边界。后续按需增加适配器，**不因为缺适配器就把文件排除在索引外**。
+- Vue 单文件组件的 `<script>` 块理论上可交给 `oxc` 解析，属后续优化。
+- Go 的类型与常量声明没有结束偏移（`gosyn` 不提供），结束行退化为起始行；函数有精确结束位置。
+- 解析器大版本升级会带来 API 变更（本次已遇 `oxc` 0.148 拆分 `TSModuleDeclaration`），
+  适配层集中在四个文件，影响面可控。
+
+Deferred items:
+- 解析结果的持久化与索引构建属于 Phase 4。
+- 增量 diff 属于 Phase 11；Phase 3 已通过稳定 chunk ID 为其铺好前提。
+
+Next: Phase 4 — Structural Index
+
 ## Blocked Phases
 
 三个阶段因 Host 能力缺失无法实现。按开发任务书 §25，记录 Blocker 而**不绕开架构做 hack 实现**。
@@ -334,11 +415,11 @@ Recommended solution：方案 1。在此之前产品显示 `Local Mode: NOT SUPP
 
 ## Active Work
 
-Phase 3 — Structural Parsing。目标是把 `IndexableFile` 转换为 `CodeChunk[]` 与 `Symbol[]`。
+Phase 4 — Structural Index。目标是把扫描与解析的产物真正持久化并可跨重启恢复。
 
 ## Known Issues
 
-无。Phase 1、Phase 2 全部验证通过，未发现 regression。
+无。Phase 1–3 全部验证通过，未发现 regression。
 
 待补验证（不阻塞，已在 Phase 2 条目登记）：扫描器的子目录遍历尚未在真实 Host 上跑过，
 Phase 4 接入索引构建时必须补一个真实 Host 的子目录扫描 smoke test。
@@ -360,6 +441,32 @@ Phase 4 接入索引构建时必须补一个真实 Host 的子目录扫描 smoke
 
 未发现新增 drift。三份 ADR 的判定在当前代码上逐条重新验证，全部成立（证据见 Phase 0 条目）。
 
+### 2026-09-03 · Phase 3 · 结构化解析选型修订（重大）
+
+**偏离内容。** `architecture.md` 第 12 问与 `implementation-plan.md` Phase 3 规定
+"Tier 2 纯 Rust 结构化解析，按 `LanguageAdapter` 自行实现"。实际实现改为
+**一律使用现成的纯 Rust 解析器**（`syn` / `oxc_parser` / `rustpython-parser` / `gosyn`），
+取消自建启发式解析层。
+
+**原因。** 原论证——"本机无 wasi-sdk、`clang` 无 wasm 后端、构建 `--offline`"——
+**只对 Tree-sitter 成立**（它的运行时与语法都是 C），却被外推到了所有第三方解析器。
+纯 Rust 解析器走 `rustc` 的 `wasm32-wasip2` 后端，与 C 工具链无关。
+
+**验证。** 依赖可获取、`cargo build --target wasm32-wasip2` 通过、四种语言实际解析与位置信息
+正确、体积 592 KB → 3.4 MB。
+
+**修订后的层级模型。**
+
+```
+Tier 1  现成解析器的完整 AST   —— Rust / TS / JS / Python / Go
+Tier 2  （取消）              —— 不再自建启发式解析
+Tier 3  文本分块              —— 未覆盖语言、解析失败、无声明的文件
+```
+
+**已同步文档。** 新增 [adr-structural-parsing.md](./adr-structural-parsing.md) 记录完整论证。
+`adr-storage.md` 中"SQLite 无法编译"的论证不受影响——那确实是 C 库；本次只修正了把该论证
+外推到解析器选型的部分。Tree-sitter 仍不使用，理由不变。
+
 ## Deferred Work
 
 以下属于 V1 明确不做，非阻塞项，不得 scope creep：
@@ -378,19 +485,20 @@ Phase 4 接入索引构建时必须补一个真实 Host 的子目录扫描 smoke
 
 ## Next Action
 
-开始 Phase 3 — Structural Parsing：
+开始 Phase 4 — Structural Index：
 
-1. 新建 `examples/plugins/code-context-plugin/src/parser/`（有真实实现时才创建）。
-2. 定义 `LanguageAdapter` 抽象。**该接口尚未冻结**，必须按实际解析需求设计，不得猜测。
-3. Tier 2 纯 Rust 结构化解析器，覆盖 `Language::supports_structural_parsing()` 声明的五种语言：
-   Rust、TypeScript、JavaScript、Python、Go。**不引入 tree-sitter**（本机无 wasi-sdk，
-   `clang` 无 wasm 后端，构建流水线 `--offline`，见 `plugin-system-audit.md`）。
-4. Tier 3 文本兜底：未覆盖语言、解析失败、超大文件。
-5. 从源文件提取 `CodeChunk` 与 `Symbol`：符号名、限定名、kind、父符号、行区间、签名、
-   doc 注释、imports、内容哈希。这两个类型在 Phase 1 已冻结，**不得加入存储后端字段**。
-6. **单文件解析失败必须捕获并降级为 Tier 3，绝不向上传播**——一个语法错误的文件不能让整个
-   仓库无法检索（`architecture.md` 第 12 问的硬性要求）。
-7. 复用 Phase 2 的分片游标形态，不发明第二套。
+1. 把 Phase 2 的扫描器与 Phase 3 的解析器接到一条索引流水线上，复用 Phase 2 已冻结的
+   `ScanBudget` 分片游标形态，**不发明第二套**。
+2. 实现 chunk / symbol / 文件哈希的内存索引结构，支持 insert / update / delete / get / list
+   与仓库隔离。
+3. 按 [adr-storage.md](./adr-storage.md) 分流持久化：`IndexManifest` 与
+   路径→内容哈希表落 Host JSON KV（`storage.rs` 已预留 `index.` 键前缀）；
+   **chunk 正文、符号表与倒排索引一律内存驻留**，8 MiB JSON 装不下。
+   不得因为方便就把索引本体塞进 KV。
+4. 用 `content_hash` + Phase 3 的稳定 chunk ID 判断内容变化，为 Phase 11 增量索引铺路。
+5. 冷启动路径：读 manifest → 读哈希表 → 按需重建内存索引（懒构建，不在 `activate` 里做）。
+6. **补 Phase 2 遗留的真实 Host 验证**：扫描器的子目录遍历尚未在真实 Host 上跑过，
+   本阶段接入后必须补一个真实 Host 的子目录扫描 smoke test。
 
-Definition of Done：fixture 源文件可稳定转换为 `CodeChunk[]` + `Symbol[]` 并通过测试，
-含语法错误降级、未覆盖语言降级与确定性输出。
+Definition of Done：可以 index repository → restart plugin → restore structural index
+并正确查询数据；扫描 + 解析全链在真实 Host 上验证通过。

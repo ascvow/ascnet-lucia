@@ -26,6 +26,7 @@ mod config;
 mod embedding;
 mod error;
 mod model;
+mod parser;
 mod repository;
 mod storage;
 mod tool;
@@ -46,6 +47,7 @@ pub use model::{
     CodeChunk, EmbeddingSpace, IndexManifest, IndexStatus, ManifestCompatibility,
     RepositoryIdentity, Symbol, SymbolKind, INDEX_SCHEMA_VERSION, STRUCTURAL_INDEX_VERSION,
 };
+pub use parser::{parse_file, Declaration, ParseOutput, ParseTier, ParsedFile};
 pub use repository::ignore::{IgnoreRuleSet, IgnoreStack, AGENT_IGNORE_FILE, GIT_IGNORE_FILE};
 pub use repository::language::{classify, Language, PathClass, SkipReason};
 pub use repository::{
