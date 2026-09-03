@@ -477,6 +477,7 @@ fn format_plugin_capability_lines(
         for request in &snapshot.requested {
             let label = match request.capability_id.as_str() {
                 "service_dependencies" => "服务依赖",
+                "workspace_read" => "当前项目只读",
                 capability_id => capability_id,
             };
             lines.push(format!("  - {}", escape_plugin_metadata(label)));
@@ -530,6 +531,7 @@ fn format_plugin_authorization(
         .map(|request| {
             let label = match request.capability_id.as_str() {
                 "service_dependencies" => "插件服务依赖",
+                "workspace_read" => "当前项目只读",
                 _ => request.capability_id.as_str(),
             };
             if request.scopes.is_empty() {
@@ -609,6 +611,31 @@ mod plugin_capability_summary_tests {
             format_plugin_authorization(&profile),
             "ABI 0.10.0 固有权限 9 项 · 插件服务依赖(provider@^1.0;optional=false)"
         );
+    }
+
+    /// 当前工作区读取权限必须使用面向用户的明确文案，而不是暴露内部 capability ID。
+    #[test]
+    fn workspace_read_uses_project_readonly_review_label() {
+        let profile = authorization_profile(ManifestCapabilitySnapshot {
+            plugin_id: "repository-reader".into(),
+            requested: vec![ManifestCapabilityRequest {
+                capability_id: "workspace_read".into(),
+                scopes: Vec::new(),
+            }],
+            provided: Vec::new(),
+        });
+        let identity = PluginBundleIdentity {
+            source: "registry:repository-reader".into(),
+            version: "1.0.0".into(),
+            sha256: "b".repeat(64),
+        };
+
+        assert!(format_plugin_authorization(&profile).contains("当前项目只读"));
+        let review =
+            format_plugin_enable_review("repository-reader", &identity, Some(&profile), None)
+                .join("\n");
+        assert!(review.contains("当前项目只读"), "{review}");
+        assert!(!review.contains("workspace_read"), "{review}");
     }
 
     /// 长路径不能吞掉排在后面的进程能力、服务依赖或提供能力。

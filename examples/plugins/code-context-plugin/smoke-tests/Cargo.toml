@@ -1,0 +1,13 @@
+[package]
+name = "code-context-plugin-smoke-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agent-core = { path = "../../../../crates/agent-core/kernel", default-features = false }
+agent-plugin-host = { path = "../../../../crates/agent-plugins/host" }
+agent-tool = { path = "../../../../crates/agent-core/tool" }
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

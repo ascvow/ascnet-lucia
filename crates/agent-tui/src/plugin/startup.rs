@@ -331,7 +331,8 @@ pub(crate) async fn load_plugins_for_tui(
     let model_stream = agent_template.options().stream;
     // 插件补全的缓存策略跟随主 Agent 配置；缓存键由 Host 按插件 ID 生成。
     let model_cache_retention = agent_template.options().cache_retention;
-    let workspace_root = workspace_root.to_string_lossy().into_owned();
+    let workspace_root_path = workspace_root;
+    let workspace_root = workspace_root_path.to_string_lossy().into_owned();
     let controller_profile =
         AgentProfileId::new("tui-controller").context("创建 TUI controller profile 失败")?;
     runtime
@@ -365,22 +366,24 @@ pub(crate) async fn load_plugins_for_tui(
         .map(|(plugin_id, settings)| (plugin_id.clone(), settings.metadata.clone()))
         .collect::<HashMap<_, _>>();
     // 宿主注入的可信项排在插件配置之后写入，插件不得用配置伪造工作区身份。
-    activation_metadata
-        .entry("permission".to_string())
-        .or_default()
-        .extend([
+    //
+    // 工作区身份对全部插件注入，而不是按插件 ID 白名单：它与可信 plugin_id 属于同一类
+    // 宿主事实，任何需要按项目隔离自身数据的插件都要用它，按名单发放只会让每个新插件
+    // 都得回来改这里。注意这里给出的只是标识与路径，读取仓库内容仍需 manifest 的
+    // 文件能力单独授权。
+    for metadata in activation_metadata.values_mut() {
+        metadata.extend([
             ("workspace_scope".to_string(), workspace_scope.clone()),
             ("workspace_root".to_string(), workspace_root.clone()),
         ]);
-    activation_metadata
-        .entry("teammate".to_string())
-        .or_default()
-        .insert("workspace_root".to_string(), workspace_root);
+    }
     for (plugin_id, metadata) in activation_metadata {
         host_services = host_services.with_activation_metadata(plugin_id, metadata)?;
     }
     // 插件持久存储按项目隔离，作用域由宿主注入，不经过 manifest 或 Guest。
     host_services = host_services.with_workspace_scope(workspace_scope)?;
+    // 工作区读取边界使用 Host 持有的规范化路径，不能依赖可被插件配置覆盖的激活元数据。
+    host_services = host_services.with_workspace_root(workspace_root_path)?;
     // 只读会话来源同样由宿主注入；传入的端口不含写入方法。
     host_services =
         host_services.with_session_source(Arc::new(TuiPluginSessionSource::new(session_store)));

@@ -142,9 +142,10 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         ("host-store-set", |state: &mut PluginWasiState, request| {
             state.capabilities.store_set(request)
         }),
-        ("host-store-remove", |state: &mut PluginWasiState, request| {
-            state.capabilities.store_remove(request)
-        }),
+        (
+            "host-store-remove",
+            |state: &mut PluginWasiState, request| state.capabilities.store_remove(request),
+        ),
         ("host-store-list", |state: &mut PluginWasiState, request| {
             state.capabilities.store_list(request)
         }),

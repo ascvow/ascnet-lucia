@@ -14,6 +14,7 @@ description = "示例插件"
 [capabilities]
 process_exec = false
 model_completion = false
+workspace_read = false
 fs_read = ["config", "assets/schema.json"]
 surface_action_allowlist = ["set_input"]
 
@@ -84,6 +85,7 @@ ABI 基线混入其中会把“启用即可使用”误报为“当前 Guest 实
 | Capability | 状态 | 边界 |
 | --- | --- | --- |
 | 纯计算 | 默认允许 | 受 Wasmtime fuel 与线性内存上限控制 |
+| `workspace_read` | 可用 | Host 注入当前项目的可信规范化根，只允许读取根及其后代；工具权限下限为 `read` |
 | `fs_read` | 可用 | 仅允许声明路径及其目录后代 |
 | `process_exec` | 可用 | 无 shell，stdin/stdout 由 Host 管理 |
 | `agent` | 可用 | 分操作授权、profile allowlist、可信身份与卸载撤销 |
@@ -97,6 +99,22 @@ ABI 基线混入其中会把“启用即可使用”误报为“当前 Guest 实
 | `secrets` | 尚未开放 | manifest 申请会被拒绝 |
 
 Host 不继承 WASI 环境变量、预打开目录或 stdio。需要 I/O 的插件必须使用 `PluginHostApi`。
+
+## 当前工作区只读权限
+
+```toml
+[capabilities]
+workspace_read = true
+```
+
+允许插件通过现有 `PluginHostApi::read_file` 与 `list_dir` 读取当前项目。实际根目录不写入 manifest，
+而是由应用调用 `PluginHostServices::with_workspace_root` 注入；Host 会在注入时规范化并确认路径存在且
+为目录。每次访问仍会重新规范化目标并校验根前缀，因此父目录穿越和指向项目外的符号链接都会被
+拒绝。`list_dir` 返回相对当前项目根的路径。
+
+未注入工作区根时能力调用失败，不会退化成插件安装目录。插件也不能仅凭激活元数据获得读取权：
+manifest 声明与 Host 可信根必须同时存在。该能力复用 `host-fs-read` / `host-fs-list`，没有增加 WIT
+函数，适用于 linter、依赖分析和代码上下文等所有仓库感知插件。
 
 ## 持久存储权限
 

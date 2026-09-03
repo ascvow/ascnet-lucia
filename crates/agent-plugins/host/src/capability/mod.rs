@@ -4,9 +4,6 @@ use crate::capability::agent::AgentCapabilityChecks;
 use crate::capability::process::ManagedProcess;
 use crate::capability::requests::parse_request;
 use crate::capability::requests::resolve_from;
-use crate::capability::requests::{
-    validate_state_key, StoreKeyRequest, StoreScopeRequest, StoreSetRequest,
-};
 use crate::capability::requests::ExtensionEventRequest;
 use crate::capability::requests::FileEntry;
 use crate::capability::requests::IdRequest;
@@ -19,6 +16,9 @@ use crate::capability::requests::ServiceSpecRequest;
 use crate::capability::requests::SessionReadRequest;
 use crate::capability::requests::StateSetRequest;
 use crate::capability::requests::StoreScopelessRequest;
+use crate::capability::requests::{
+    validate_state_key, StoreKeyRequest, StoreScopeRequest, StoreSetRequest,
+};
 use crate::contribution::ContributionRegistry;
 use crate::contribution::PromptContribution;
 use crate::contribution::ToolRegistrationRequest;
@@ -30,10 +30,10 @@ use crate::service::ServiceRegistry;
 use crate::services::ModelCompletionHostServices;
 use crate::session::{project_session, PluginSessionSource, MAX_SESSION_PAGE_MESSAGES};
 use crate::state::PluginStateStore;
-use agent_plugin_protocol::PluginSessionSummary;
-use agent_plugin_protocol::PluginStoreScope;
 use crate::ui::UiHostActionRequest;
 pub(crate) use agent::AgentRuntimeBinding;
+use agent_plugin_protocol::PluginSessionSummary;
+use agent_plugin_protocol::PluginStoreScope;
 use agent_tool::ExecutionPolicy;
 use anyhow::anyhow;
 use anyhow::{Context, Result};
@@ -99,6 +99,8 @@ pub(crate) struct CapabilityState {
     active_run_id: ActiveRunBinding,
     /// 应用可选注入的持久存储；缺失时保留实例内存语义。
     state_store: Option<PluginStateStore>,
+    /// Host 注入的可信规范化工作区根；只供 `workspace_read` 路径校验使用。
+    workspace_root: Option<PathBuf>,
 }
 
 /// Host 在真实 Manifest 或执行策略边界拒绝插件能力时使用的类型化错误。
@@ -186,6 +188,8 @@ pub(crate) struct CapabilityHostContext {
     ///
     /// 由 Host 应用层从工作区身份生成；缺失时按项目隔离的存储不可用，只保留用户级存储。
     workspace_scope: Option<String>,
+    /// 当前项目的可信规范化根目录；缺失时 `workspace_read` 调用必须失败。
+    workspace_root: Option<PathBuf>,
 }
 
 impl CapabilityHostContext {
@@ -200,6 +204,7 @@ impl CapabilityHostContext {
         persistent_state_dir: Option<PathBuf>,
         workspace_scope: Option<String>,
         session_source: Option<Arc<dyn PluginSessionSource>>,
+        workspace_root: Option<PathBuf>,
     ) -> Self {
         Self {
             agent_runtime,
@@ -208,6 +213,7 @@ impl CapabilityHostContext {
             persistent_state_dir,
             workspace_scope,
             session_source,
+            workspace_root,
         }
     }
 }
@@ -336,6 +342,7 @@ impl CapabilityState {
             stores,
             active_run_id: ActiveRunBinding::default(),
             state_store,
+            workspace_root: host_context.workspace_root,
         })
     }
 
@@ -608,27 +615,30 @@ impl CapabilityState {
     /// 在 manifest 允许的目录中读取 UTF-8 文件。
     pub(crate) fn read_file(&mut self, request_json: &str) -> Result<Value> {
         let request: PathRequest = parse_request(request_json)?;
-        let path = self.resolve_read_path(&request.path)?;
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("读取插件文件失败：{}", path.display()))?;
+        let resolved = self.resolve_read_path(&request.path)?;
+        let content = std::fs::read_to_string(&resolved.path)
+            .with_context(|| format!("读取插件文件失败：{}", resolved.path.display()))?;
         Ok(json!(content))
     }
 
     /// 在 manifest 允许的目录中列出一层目录项。
     pub(crate) fn list_dir(&mut self, request_json: &str) -> Result<Value> {
         let request: PathRequest = parse_request(request_json)?;
-        let path = self.resolve_read_path(&request.path)?;
-        if !path.is_dir() {
-            return Err(anyhow!("插件请求的路径不是目录：{}", path.display()));
+        let resolved = self.resolve_read_path(&request.path)?;
+        if !resolved.path.is_dir() {
+            return Err(anyhow!(
+                "插件请求的路径不是目录：{}",
+                resolved.path.display()
+            ));
         }
 
-        let mut entries = std::fs::read_dir(&path)
-            .with_context(|| format!("列出插件目录失败：{}", path.display()))?
+        let mut entries = std::fs::read_dir(&resolved.path)
+            .with_context(|| format!("列出插件目录失败：{}", resolved.path.display()))?
             .map(|entry| {
                 let entry = entry.context("读取插件目录项失败")?;
                 let entry_path = entry.path();
                 let relative = entry_path
-                    .strip_prefix(&self.plugin_dir)
+                    .strip_prefix(&resolved.display_root)
                     .unwrap_or(&entry_path)
                     .to_string_lossy()
                     .into_owned();
@@ -645,26 +655,73 @@ impl CapabilityState {
         Ok(serde_json::to_value(entries)?)
     }
 
-    fn resolve_read_path(&self, requested: &str) -> Result<PathBuf> {
-        if self.permissions.fs_read.is_empty() {
-            return Err(capability_denied("插件 manifest 未声明 fs_read 能力"));
+    /// 将 Guest 路径解析到 manifest 声明的插件文件范围或 Host 注入的当前工作区范围。
+    ///
+    /// 两个候选都在规范化后做前缀校验，因此 `..` 与指向工作区外部的符号链接无法越界。
+    /// 返回值同时携带目录列表使用的展示根，确保工作区条目只暴露仓库相对路径。
+    fn resolve_read_path(&self, requested: &str) -> Result<ResolvedReadPath> {
+        if !self.permissions.workspace_read && self.permissions.fs_read.is_empty() {
+            return Err(capability_denied(
+                "插件 manifest 未声明 workspace_read 或 fs_read 能力",
+            ));
         }
-        let requested = resolve_from(&self.plugin_dir, requested)
+
+        if self.permissions.workspace_read {
+            let Some(workspace_root) = self.workspace_root.as_ref() else {
+                if self.permissions.fs_read.is_empty() {
+                    return Err(capability_denied(
+                        "宿主未注入 workspace_read 所需的工作区根目录",
+                    ));
+                }
+                return self.resolve_plugin_read_path(requested);
+            };
+            if let Ok(path) = resolve_from(workspace_root, requested).canonicalize() {
+                if path == *workspace_root || path.starts_with(workspace_root) {
+                    return Ok(ResolvedReadPath {
+                        path,
+                        display_root: workspace_root.clone(),
+                    });
+                }
+            }
+        }
+
+        self.resolve_plugin_read_path(requested)
+    }
+
+    /// 按 manifest 的插件目录相对 `fs_read` allowlist 解析路径。
+    fn resolve_plugin_read_path(&self, requested: &str) -> Result<ResolvedReadPath> {
+        if self.permissions.fs_read.is_empty() {
+            return Err(capability_denied(format!(
+                "插件无权读取当前工作区之外的路径：{requested}"
+            )));
+        }
+        let path = resolve_from(&self.plugin_dir, requested)
             .canonicalize()
             .with_context(|| format!("插件读取路径不存在：{requested}"))?;
         for allowed in &self.permissions.fs_read {
             let allowed = resolve_from(&self.plugin_dir, allowed)
                 .canonicalize()
                 .with_context(|| format!("manifest 中的 fs_read 路径不存在：{allowed}"))?;
-            if requested == allowed || (allowed.is_dir() && requested.starts_with(&allowed)) {
-                return Ok(requested);
+            if path == allowed || (allowed.is_dir() && path.starts_with(&allowed)) {
+                return Ok(ResolvedReadPath {
+                    path,
+                    display_root: self.plugin_dir.clone(),
+                });
             }
         }
         Err(capability_denied(format!(
             "插件无权读取路径：{}",
-            requested.display()
+            path.display()
         )))
     }
+}
+
+/// 已通过授权边界校验的读取路径及目录列表展示根。
+struct ResolvedReadPath {
+    /// Host 实际访问的规范化路径。
+    path: PathBuf,
+    /// `list_dir` 返回相对路径时使用的可信根。
+    display_root: PathBuf,
 }
 
 /// 一个作用域下已加载的持久存储。

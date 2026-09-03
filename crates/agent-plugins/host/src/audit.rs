@@ -413,6 +413,9 @@ pub fn snapshot_manifest_capabilities(
     if capabilities.sessions {
         requested.push(capability_request("sessions"));
     }
+    if capabilities.workspace_read {
+        requested.push(capability_request("workspace_read"));
+    }
     if !capabilities.fs_read.is_empty() {
         requested.push(ManifestCapabilityRequest {
             capability_id: "fs_read".into(),
@@ -770,7 +773,7 @@ fn mapped_host_imports(capability_id: &str) -> &'static [&'static str] {
             "host-process-spawn",
             "host-process-write",
         ],
-        "fs_read" => &["host-fs-list", "host-fs-read"],
+        "fs_read" | "workspace_read" => &["host-fs-list", "host-fs-read"],
         _ => &[],
     }
 }
@@ -840,6 +843,7 @@ mod tests {
                 [capabilities]
                 fs_read = ["z", "a"]
                 model_completion = true
+                workspace_read = true
 
                 [capabilities.agent]
                 spawn = true
@@ -854,7 +858,12 @@ mod tests {
                 .iter()
                 .map(|request| request.capability_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["agent.spawn", "fs_read", "model_completion"]
+            vec![
+                "agent.spawn",
+                "fs_read",
+                "model_completion",
+                "workspace_read"
+            ]
         );
         assert_eq!(snapshot.requested[0].scopes, ["builder", "reviewer"]);
         assert_eq!(snapshot.requested[1].scopes, ["a", "z"]);
@@ -1003,6 +1012,7 @@ mod tests {
             plugin_id: "consumer".into(),
             requested: vec![
                 capability_request("fs_read"),
+                capability_request("workspace_read"),
                 capability_request("process_exec"),
                 capability_request("http"),
                 capability_request("service_dependencies"),
@@ -1024,9 +1034,10 @@ mod tests {
         let checks = check_manifest_import_reachability(&manifest, &component);
         assert!(checks[0].satisfied);
         assert!(checks[1].satisfied);
-        assert!(!checks[2].satisfied);
-        assert!(checks[3].satisfied);
-        assert_eq!(checks[3].mapped_host_imports, ["host-service-call"]);
+        assert!(checks[2].satisfied);
+        assert!(!checks[3].satisfied);
+        assert!(checks[4].satisfied);
+        assert_eq!(checks[4].mapped_host_imports, ["host-service-call"]);
     }
 
     /// 构造根 Component 函数条目。

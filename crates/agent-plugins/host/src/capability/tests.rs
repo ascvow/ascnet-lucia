@@ -24,7 +24,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -299,9 +299,108 @@ fn process_state(process_exec: bool, execution_policy: ExecutionPolicy) -> Capab
         },
         Arc::new(ContributionRegistry::default()),
         Arc::new(ServiceRegistry::default()),
-        CapabilityHostContext::new(None, None, execution_policy, None, None, None),
+        CapabilityHostContext::new(None, None, execution_policy, None, None, None, None),
     )
     .expect("创建进程测试能力状态")
+}
+
+/// 创建声明或未声明当前工作区只读能力的测试状态。
+fn workspace_read_state(workspace_root: Option<&Path>, declared: bool) -> CapabilityState {
+    CapabilityState::new(
+        "workspace-reader".into(),
+        "workspace-reader-bundle".into(),
+        PathBuf::from("."),
+        CapabilitySection {
+            workspace_read: declared,
+            ..CapabilitySection::default()
+        },
+        Arc::new(ContributionRegistry::default()),
+        Arc::new(ServiceRegistry::default()),
+        CapabilityHostContext::new(
+            None,
+            None,
+            ExecutionPolicy::serve(),
+            None,
+            None,
+            None,
+            workspace_root.map(Path::to_path_buf),
+        ),
+    )
+    .expect("创建工作区只读能力状态")
+}
+
+/// 声明能力且 Host 注入工作区根后，可以读取文件并得到仓库相对目录项。
+#[test]
+fn workspace_read_accesses_only_injected_root() {
+    let root = storage_test_root("workspace-read");
+    let source_dir = root.join("src");
+    std::fs::create_dir_all(&source_dir).expect("创建工作区测试目录");
+    std::fs::write(source_dir.join("lib.rs"), "pub fn demo() {}\n").expect("写入工作区测试文件");
+    let canonical_root = root.canonicalize().expect("规范化工作区测试目录");
+    let mut state = workspace_read_state(Some(&canonical_root), true);
+
+    assert_eq!(
+        state
+            .read_file(r#"{"path":"src/lib.rs"}"#)
+            .expect("读取工作区文件"),
+        json!("pub fn demo() {}\n")
+    );
+    let entries = state.list_dir(r#"{"path":"src"}"#).expect("列出工作区目录");
+    assert_eq!(entries[0]["path"], "src/lib.rs");
+    assert_eq!(entries[0]["is_dir"], false);
+
+    std::fs::remove_dir_all(root).expect("清理工作区只读测试目录");
+}
+
+/// Manifest 声明能力但应用未注入工作区根时，调用必须返回清晰拒绝而不是回退到插件目录。
+#[test]
+fn workspace_read_requires_host_workspace_root() {
+    let mut state = workspace_read_state(None, true);
+
+    let error = state
+        .list_dir(r#"{"path":"."}"#)
+        .expect_err("缺少可信工作区根必须拒绝");
+    assert!(error.to_string().contains("工作区根目录"), "{error}");
+}
+
+/// Host 注入路径不能替代 manifest 授权；未声明能力的插件仍不得读取当前项目。
+#[test]
+fn workspace_read_requires_manifest_declaration() {
+    let root = storage_test_root("workspace-read-undeclared");
+    std::fs::create_dir_all(&root).expect("创建未授权工作区测试目录");
+    let canonical_root = root.canonicalize().expect("规范化未授权工作区测试目录");
+    let mut state = workspace_read_state(Some(&canonical_root), false);
+
+    let error = state
+        .list_dir(r#"{"path":"."}"#)
+        .expect_err("未声明能力必须拒绝");
+    assert!(error.to_string().contains("未声明"), "{error}");
+
+    std::fs::remove_dir_all(root).expect("清理未授权工作区测试目录");
+}
+
+/// 指向工作区外部的符号链接必须在规范化后被拒绝。
+#[cfg(unix)]
+#[test]
+fn workspace_read_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let root = storage_test_root("workspace-read-symlink");
+    let outside = storage_test_root("workspace-read-outside");
+    std::fs::create_dir_all(&root).expect("创建工作区测试目录");
+    std::fs::create_dir_all(&outside).expect("创建工作区外测试目录");
+    std::fs::write(outside.join("secret.txt"), "不可读取").expect("写入工作区外测试文件");
+    symlink(&outside, root.join("outside-link")).expect("创建越界符号链接");
+    let canonical_root = root.canonicalize().expect("规范化工作区测试目录");
+    let mut state = workspace_read_state(Some(&canonical_root), true);
+
+    let error = state
+        .read_file(r#"{"path":"outside-link/secret.txt"}"#)
+        .expect_err("越界符号链接必须拒绝");
+    assert!(error.to_string().contains("无权读取"), "{error}");
+
+    std::fs::remove_dir_all(root).expect("清理符号链接工作区测试目录");
+    std::fs::remove_dir_all(outside).expect("清理工作区外测试目录");
 }
 
 /// 插件实例状态应支持读取、替换和删除。
@@ -364,6 +463,7 @@ fn persistent_instance_state_survives_recreation() {
                 Some(root.clone()),
                 Some("test-workspace".into()),
                 None,
+                None,
             ),
         )
         .expect("创建持久能力状态")
@@ -405,6 +505,7 @@ fn persistent_permission_state_is_isolated_by_bundle_identity() {
                 ExecutionPolicy::serve(),
                 Some(root.clone()),
                 Some("test-workspace".into()),
+                None,
                 None,
             ),
         )
@@ -1276,6 +1377,7 @@ fn storage_state(
             Some(root.to_path_buf()),
             workspace.map(str::to_string),
             None,
+            None,
         ),
     )
     .expect("创建持久存储能力状态")
@@ -1373,6 +1475,7 @@ fn store_requires_declared_capability() {
             ExecutionPolicy::serve(),
             Some(root.clone()),
             Some("project-a".into()),
+            None,
             None,
         ),
     )
@@ -1487,6 +1590,7 @@ fn session_state(sessions: bool) -> CapabilityState {
             Some(Arc::new(StubSessionSource {
                 id: "session-a".into(),
             })),
+            None,
         ),
     )
     .expect("创建会话能力状态")

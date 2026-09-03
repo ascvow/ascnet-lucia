@@ -8,11 +8,12 @@
 WASM + HOST CAPABILITIES
 ```
 
-不是 Pure WASM，因为插件今天连当前工作区都读不到。也不是"需要大改 Host"——**必需的 Host 改动只有一项，且是通用能力，不含任何 ACE 语义。**
+不是 Pure WASM：插件读取当前工作区仍必须经过 Host 的可信能力边界。也不是"需要大改 Host"——
+**唯一必需的通用 Host 改动已经落地，不含任何 ACE 语义。**
 
 ```
-Required Host Changes: 1 项（工作区只读能力）
-Pure plugin implementation is NOT feasible today, but the gap is a single generic capability.
+Required Host Changes: 1 项（工作区只读能力，已实现）
+Plugin business logic remains inside the WASM component.
 ```
 
 分模式结论：
@@ -42,11 +43,12 @@ Local Mode: NOT CURRENTLY SUPPORTED（需要通用 embedding.embed()；V1 不交
 │       ├── Api    ── V2，依赖 http 能力                     │
 │       └── Local  ── V3，依赖 embedding 能力                │
 └──────────┬───────────────────────────────────────────────┘
-           │ 现有 ABI                    │ 需新增
+           │ 现有 ABI / Host 能力         │ 后续需新增
            ▼                             ▼
   host-fs-read / host-fs-list      workspace 只读能力（Required）
   host-store-*                     http.request()（API Mode）
-  host-agent-upsert-tool           embedding.embed()（Local Mode）
+  workspace_read                   embedding.embed()（Local Mode）
+  host-agent-upsert-tool
   on-event(core.tool.result)
   host-agent-emit-event
 ```
@@ -65,7 +67,7 @@ Local Mode: NOT CURRENTLY SUPPORTED（需要通用 embedding.embed()；V1 不交
 
 | 能力 | 现状 | 用途 |
 | --- | --- | --- |
-| 受控只读文件（工作区范围） | **需新增** | 扫描与读取源码 |
+| 受控只读文件（工作区范围） | **已实现** | 扫描与读取源码 |
 | 私有持久存储 | 已有（容量待扩） | 索引 manifest 与内容哈希 |
 | 工具注册 + 事件订阅 | 已有 | 注册 `code_search`、感知文件改动 |
 | 结构化 HTTP 请求 | 需新增（V2） | API embedding |
@@ -77,7 +79,7 @@ Local Mode: NOT CURRENTLY SUPPORTED（需要通用 embedding.embed()；V1 不交
 
 | 级别 | 改动 | 阻塞什么 |
 | --- | --- | --- |
-| **Required** | 工作区只读能力 | V1 完全无法运行 |
+| **Required（已实现）** | 工作区只读能力 | V1 运行门禁 |
 | Recommended | 索引 blob 存储 | 每次启动全量重建 |
 | Recommended | `http.request()` | API Mode |
 | Recommended | 后台任务 handle | 首次索引阻塞用户 |
@@ -143,7 +145,10 @@ Agent 写文件 → core.tool.result → on-event → 标记 dirty → 下次 co
 
 ### 9. Plugin 如何注册 code_search？
 
-标准静态工具注册，无任何新机制：`list-tools` 导出返回 `ToolSpec` JSON 数组（`wasm/mod.rs:576`），manifest 声明权威 scope。
+使用现有动态工具注册：`list-tools` 在 `activate` 之前执行，那时尚未获得配置与工作区能力状态；
+插件在 `activate` 完成能力探测和 manifest 恢复后调用 `host-agent-upsert-tool`。Host 返回的公开工具名
+被保存在运行时状态中，并在 `deactivate` 时通过 `host-agent-remove-tool` 注销。Manifest 仍声明权威
+scope，没有新增 Plugin abstraction。
 
 ```toml
 [capabilities.tool_scopes]
@@ -164,7 +169,7 @@ code_search(query, max_results?, token_budget?, path_scope?)
 
 | 事件 | 索引处理 | 依据 |
 | --- | --- | --- |
-| `deactivate` | 内存索引释放；manifest 已在每次变更后落盘，无需在此保存 | `wasm/mod.rs:694`，且加载 future 被取消时不保证执行 `deactivate`（`capability/mod.rs:215` 只兜底杀进程） |
+| `deactivate` | 注销动态工具、尽力 flush 未保存 metadata、释放仓库上下文 | `wasm/mod.rs:694`，且加载 future 被取消时不保证执行 `deactivate`（`capability/mod.rs:215` 只兜底杀进程） |
 | 插件 disable | `store` 数据保留不动 | `manager.rs:524` 的 `disable` 不触碰存储 |
 | 插件 update | 按 `schema_version` 决定迁移级别 | `store` 命名空间刻意不含 Component 字节（`state.rs:92`），升级后数据仍在 |
 | 插件 uninstall | 由 Plugin Manager 负责；插件侧不做自清理 | 插件在卸载后没有执行机会 |
@@ -217,11 +222,11 @@ API 离线、密钥失效、本地模型不可用时，`code_search` **继续正
 
 ## 必需的 Host 改动
 
-### Required：工作区只读能力
+### Required：工作区只读能力（已实现）
 
 **问题。** manifest `fs_read` 在安装时固化（`capability/mod.rs:648`），无法表达"当前工作区根"。全局安装的插件读不到用户当前项目。这不是 ACE 独有的问题——任何仓库感知型插件（linter、依赖分析、约定检查）都会撞上它。
 
-**提案。** 新增独立 capability，由 Host 用它已经持有的可信工作区根解析，Guest 不能指定路径：
+**实现。** 新增独立 capability，由 Host 用应用注入的可信工作区根解析，Guest 不能指定路径：
 
 ```toml
 [capabilities]
@@ -238,7 +243,22 @@ workspace_read = true
 
 **为什么不是给 `fs_read` 加 `${workspace_root}` 占位符。** 占位符会让 manifest 里出现需要展开的模板语法，用户在审查界面上看到的不再是最终授权范围；而独立布尔能力在审查时的语义是一句话就能说清的。
 
-**同时。** 把 `crates/agent-tui/src/plugin/startup.rs:368` 硬编码的 `workspace_root` 激活元数据推广为对全部插件注入，不再按插件 ID 白名单。这本身就是当前实现的一个偶然限制，不是设计。
+TUI 已把原先按插件 ID 白名单注入的 `workspace_root` 元数据推广到全部已解析插件配置，并通过
+`PluginHostServices::with_workspace_root` 单独注入不可被 Guest 覆盖的可信能力根。
+
+## Architecture Drift
+
+2026-09-03 的骨架实现确认了三处与初始文档不同的事实，并已同步到本文：
+
+1. `code_search` 使用现有动态注册，而非静态 `list-tools`。原因是静态工具收集发生在
+   `activate` 之前，无法依据 `enabled` 配置与工作区能力状态决定是否暴露工具。
+2. Host 当前没有 repository open/change/close 事件。骨架把进程启动映射为 repository attach，
+   把 `deactivate` 映射为 detach；真实 change 事件与 watcher 仍属于后续能力。
+3. Manifest 当前没有配置 schema 字段。`enabled` 与 `embedding_mode` 继续通过激活元数据下发，
+   由 Guest 做严格类型和值校验；这不是新增的假想 manifest 格式。
+
+Guest 侧也没有可持有的取消令牌或后台任务句柄。骨架阶段不启动内部任务，因此 shutdown 只需要
+注销工具、flush metadata 与释放状态；后续长任务必须等通用后台任务能力或采用明确的 fuel 分片协议。
 
 ### Recommended：索引 blob 存储
 

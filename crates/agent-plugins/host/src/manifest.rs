@@ -444,6 +444,35 @@ manifest = "/opt/lucia/plugin.toml"
         assert_eq!(capabilities.component_capability_scope_floor(), None);
     }
 
+    /// 当前工作区只读能力已由 Host 实现，manifest 声明必须被接受。
+    #[test]
+    fn workspace_read_capability_is_supported() {
+        let mut manifest = test_manifest("repository-reader", "1.0.0", Vec::new());
+        manifest.capabilities = CapabilitySection {
+            workspace_read: true,
+            ..CapabilitySection::default()
+        };
+
+        manifest
+            .capabilities
+            .validate_supported()
+            .expect("当前工作区只读能力应被接受");
+    }
+
+    /// 当前工作区只读能力必须把插件全部公开工具的权限下限抬到 `read`。
+    #[test]
+    fn workspace_read_capability_raises_tool_permission_floor_to_read() {
+        let capabilities = CapabilitySection {
+            workspace_read: true,
+            ..CapabilitySection::default()
+        };
+
+        assert_eq!(
+            capabilities.component_capability_scope_floor(),
+            Some(ToolPermissionScope::Read)
+        );
+    }
+
     /// 只读会话访问已实现，manifest 声明必须被接受。
     #[test]
     fn sessions_capability_is_supported() {
@@ -981,6 +1010,13 @@ pub struct CapabilitySection {
     #[serde(default)]
     pub sessions: bool,
 
+    /// 插件是否申请只读访问当前工作区根及其目录后代。
+    ///
+    /// 工作区根由应用通过可信 Host 服务注入，Guest 与 manifest 都不能指定实际路径。
+    /// 该能力复用 `host-fs-read` 与 `host-fs-list`，用于仓库感知型插件读取当前项目。
+    #[serde(default)]
+    pub workspace_read: bool,
+
     /// 插件请求读取的路径。
     #[serde(default)]
     pub fs_read: Vec<String>,
@@ -1100,7 +1136,7 @@ impl CapabilitySection {
         if self.process_exec {
             include(ToolPermissionScope::Shell);
         }
-        if !self.fs_read.is_empty() {
+        if self.workspace_read || !self.fs_read.is_empty() {
             include(ToolPermissionScope::Read);
         }
         if !self.fs_write.is_empty() {

@@ -114,6 +114,9 @@ pub struct PluginHostServices {
     /// 当前项目的可信作用域标识，用于按项目隔离插件持久存储。
     #[cfg(feature = "wasm")]
     pub(crate) workspace_scope: Option<String>,
+    /// 当前项目的可信规范化根目录，用于约束 `workspace_read` 文件访问。
+    #[cfg(feature = "wasm")]
+    pub(crate) workspace_root: Option<PathBuf>,
     /// Host 持有且只能通过 `restrict` 收紧的运行平面策略。
     pub(crate) execution_policy: ExecutionPolicy,
 }
@@ -202,6 +205,30 @@ impl PluginHostServices {
             return Err(anyhow!("插件持久存储的项目作用域不能为空"));
         }
         self.workspace_scope = Some(scope);
+        Ok(self)
+    }
+
+    /// 注入当前项目的可信根目录，供声明 `workspace_read` 的插件只读访问。
+    ///
+    /// 根目录在注入时规范化，后续 Guest 路径仍会逐次规范化并校验前缀；这样符号链接和
+    /// `..` 都不能把读取范围扩张到项目之外。该路径不会从 manifest 或激活元数据读取。
+    ///
+    /// # Errors
+    ///
+    /// 路径为空、不存在、无法规范化或不是目录时返回错误。
+    #[cfg(feature = "wasm")]
+    pub fn with_workspace_root(mut self, path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if path.as_os_str().is_empty() {
+            return Err(anyhow!("插件工作区根目录不能为空"));
+        }
+        let path = path
+            .canonicalize()
+            .map_err(|error| anyhow!("无法解析插件工作区根目录 `{}`：{error}", path.display()))?;
+        if !path.is_dir() {
+            return Err(anyhow!("插件工作区根路径不是目录：{}", path.display()));
+        }
+        self.workspace_root = Some(path);
         Ok(self)
     }
 
@@ -404,6 +431,12 @@ impl PluginHostServices {
     #[cfg(feature = "wasm")]
     pub(crate) fn workspace_scope(&self) -> Option<String> {
         self.workspace_scope.clone()
+    }
+
+    /// 返回应用注入的可信规范化工作区根；未注入时 `workspace_read` 不可用。
+    #[cfg(feature = "wasm")]
+    pub(crate) fn workspace_root(&self) -> Option<PathBuf> {
+        self.workspace_root.clone()
     }
 
     /// 返回 Host 内部持有的可信执行策略快照。

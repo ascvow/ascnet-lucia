@@ -13,7 +13,7 @@ Code Context Engine 所需能力在当前插件系统（ABI `0.10.0`，wasmtime 
 
 | Capability | Available | WASM Direct | Host Bridge | Missing | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Repository read | 部分 | 否 | `host-fs-read` | **是** | `capability/mod.rs:609` 只返回 UTF-8；`:648` 按 manifest `fs_read` 前缀校验。**无法表达"当前工作区"**，`fs_read` 在安装时固化（见[缺口 G1](#g1-工作区读取)） |
+| Repository read | 是 | 否 | `host-fs-read` / `host-fs-list` + `workspace_read` | 否 | Host 通过 `PluginHostServices::with_workspace_root` 注入可信规范化根；路径逐次 canonicalize 并做根前缀校验，目录项返回仓库相对路径（见[已解决 G1](#g1-工作区读取已解决)） |
 | Repository write | 否 | 否 | 否 | 是 | `manifest.rs:1153` 加载期拒绝 `fs_write`。索引不写仓库，此项对 V1 非阻塞 |
 | Recursive scanning | 是 | 否 | `host-fs-list` | 否 | `capability/mod.rs:618` 只列一层，返回 `{path, is_dir}`。递归 = N 次 JSON 往返，每次计入调用方 fuel |
 | File metadata（size/mtime） | **否** | 否 | 否 | 是 | `capability/requests.rs:20` 的 `FileEntry` 只有 `path` 与 `is_dir`。增量索引无法做廉价 stat 判断（见[缺口 G4](#g4-变更检测)） |
@@ -116,11 +116,11 @@ tree-sitter 运行时与全部官方 grammar 均为 C。`cc` crate 编译到 `wa
 
 ## 缺口清单
 
-### G1 工作区读取
+### G1 工作区读取（已解决）
 
-**阻塞 V1。** manifest `fs_read` 在安装时固化，无法表达"当前工作区根"。`crates/agent-tui/src/plugin/startup.rs:368` 的 `workspace_root` 激活元数据只硬编码给 `permission` 与 `teammate`，且拿到路径也无法通过 `resolve_read_path` 校验。
+**已于 2026-09-03 落地。** Manifest 新增 `workspace_read = true`；Host 应用层用 `PluginHostServices::with_workspace_root` 注入可信规范化路径，Guest 复用 `host-fs-read` / `host-fs-list`，不能指定授权根。路径在访问时再次规范化并做前缀校验，因此 `..` 与指向工作区外的符号链接都会被拒绝。
 
-规避手段：项目本地安装 + `fs_read = ["../../.."]`。可用于开发，不是产品形态。
+TUI 已向全部已解析插件配置注入工作区激活元数据，并单独向 Host 能力层注入可信根。宿主未注入根时能力调用明确失败，不退化到插件目录。该能力的工具权限下限为 `Read`。
 
 ### G2 索引持久化
 
@@ -152,6 +152,6 @@ tree-sitter 运行时与全部官方 grammar 均为 C。`cc` crate 编译到 `wa
 | G4 API 凭证 | 配置与 Secret 引用 | P0 |
 | API Embedding | HTTP client | P0 |
 | G3 后台任务 | 后台任务（start/status/result/cancel handle） | P0 |
-| G1 工作区写入侧 | 文件写入（Host 分配的目录） | P1 |
+| 工作区写入侧 | 文件写入（Host 分配的目录） | P1 |
 
 **这不是巧合，而是一个强信号：Code Context Engine 需要的全部 Host 扩展都落在项目已经认可的通用能力清单内，没有一项是 ACE 专属 API。** 提案应沿用这些既有条目的推荐契约，而不是另立一套。

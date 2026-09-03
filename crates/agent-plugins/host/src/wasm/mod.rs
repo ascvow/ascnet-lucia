@@ -529,6 +529,7 @@ impl WasmPluginHost {
                             host_services.persistent_state_dir(),
                             host_services.workspace_scope(),
                             host_services.session_source(),
+                            host_services.workspace_root(),
                         ),
                     )?,
                     store_limits,

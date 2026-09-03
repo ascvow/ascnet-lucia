@@ -1,0 +1,28 @@
+[plugin]
+id = "code-context"
+name = "Code Context Engine"
+version = "0.1.0"
+api_version = "0.10.0"
+wasm = "target/wasm32-wasip2/release/code_context_plugin.wasm"
+description = "为 Agent 提供 code_search 的仓库上下文引擎；当前为骨架阶段，索引尚未建立。"
+
+[capabilities]
+# 插件启动时只列出一次仓库根以确认 Host 已注入可信读取边界；本阶段不扫描或读取源码。
+workspace_read = true
+
+# 索引 manifest 与仓库元数据跨插件版本保留，必须用 storage 而不是实例状态：
+# 一次插件重建就清空用户索引会让功能本身不成立。
+storage = true
+
+# 本阶段刻意不申请的能力，逐项说明，避免后来者误以为是遗漏：
+#
+# http           —— API 嵌入（Phase 9）才需要，且 Host 当前在加载期拒绝该声明。
+# process_exec   —— 明确否决：它会把本插件全部工具的 scope 抬到 shell，
+#                   使 code_search 每次调用都需要审批，与产品目标冲突。
+# sessions       —— 明确否决：会把工具 scope 下限抬到 unknown，且与代码检索无关。
+
+[capabilities.tool_scopes]
+# code_search 只读取仓库源码并返回位置，权限语义等同于读文件。
+# 该 scope 成立的前提是本插件不持有进程、网络或会话能力；新增任一类能力都会
+# 被 Host 自动抬高 scope，届时必须重新评估工具可用性而不是照抄这一行。
+code_search = "read"

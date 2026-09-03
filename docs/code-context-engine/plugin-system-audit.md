@@ -251,7 +251,11 @@ TUI 使用渐进加载（`wasm/loader.rs:684`），最多 3 个并发实例化�
 
 Host 在调用 component 前把公开工具名替换回注册时的本地 ID（`wasm/mod.rs:808`），因此插件内部命名与模型可见命名解耦。
 
-`code_search` 走标准静态注册即可，不需要任何新机制。
+Code Context Engine 最终采用**现有动态注册**：`list-tools` 在 `activate` 之前执行，无法读取
+`enabled` 配置，也无法确认 Host 是否注入工作区读取边界。插件在 `activate` 完成能力探测与
+manifest 恢复后调用 `host-agent-upsert-tool`，并保存 Host 返回的公开名，在 `deactivate` 中用
+`host-agent-remove-tool` 注销。这里没有新增注册机制，只是选择了现有两条路径中符合生命周期的
+一条。
 
 ## 11. 构建流水线
 
@@ -290,13 +294,16 @@ Code Context Engine 应直接复用这一形态，不需要新的测试机制。
 - 插件服务与依赖 ACL（未来拆分 provider 插件的现成手段）
 - 三层测试与离线构建流水线
 
-**缺失且必须解决**的：
+**骨架阶段已解决**的：
 
-1. 无法读取当前工作区（`fs_read` 在安装时固化，无 workspace 占位符）——阻塞 V1。
-2. 存储容量与写入模型无法承载代码索引——阻塞任何持久索引。
-3. 无 HTTP——阻塞 API Embedding。
-4. 无二进制文件读取、64 MiB 内存、无线程——阻塞 Local Embedding。
-5. 无后台任务——阻塞不阻塞用户的全量索引构建。
-6. 无文件系统 watcher——外部编辑无法感知，只能靠轮询或惰性校验。
+1. `workspace_read` 已提供当前工作区可信只读边界，`fs_read` 仍保留插件目录相对 allowlist 语义。
+
+**仍缺失且影响后续阶段**的：
+
+1. 存储容量与写入模型无法承载代码索引——阻塞任何持久索引。
+2. 无 HTTP——阻塞 API Embedding。
+3. 无二进制文件读取、64 MiB 内存、无线程——阻塞 Local Embedding。
+4. 无后台任务——阻塞不阻塞用户的全量索引构建。
+5. 无文件系统 watcher——外部编辑无法感知，只能靠轮询或惰性校验。
 
 逐项判定与建议见[能力矩阵](./plugin-capability-matrix.md)，架构决策见[架构](./architecture.md)。

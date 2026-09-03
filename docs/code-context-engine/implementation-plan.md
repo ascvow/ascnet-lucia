@@ -2,16 +2,16 @@
 
 本计划建立在[架构](./architecture.md)的判定之上。阶段顺序按 Plugin Audit 的结论重排过：原计划把 EmbeddingProvider 与语义索引放在中段，现在推迟到 Host 能力落地之后，前段全部是零新增能力就能交付的部分。
 
-## 门禁：开工前必须完成的 Host 改动
+## 门禁：已完成的 Host 改动
 
-**唯一必需项：工作区只读能力。** 在它落地前，插件读不到用户当前项目，任何阶段都无法真实验证。
+**唯一必需项：工作区只读能力，已于 2026-09-03 完成。**
 
 ```toml
 [capabilities]
 workspace_read = true
 ```
 
-实现范围（预估很小，集中在三处）：
+实际实现范围：
 
 1. `crates/agent-plugins/host/src/manifest.rs` — `CapabilitySection` 增加 `workspace_read: bool`；`validate_supported` 不再拒绝；`component_capability_scope_floor` 映射为 `Read`。
 2. `crates/agent-plugins/host/src/capability/mod.rs` — `CapabilityHostContext` 增加可信 `workspace_root`；`resolve_read_path` 在 `workspace_read` 开启时把工作区根加入 allowlist，沿用现有 canonicalize + 前缀校验。
@@ -19,15 +19,17 @@ workspace_read = true
 
 配套：Host 单元测试（无能力时拒绝、越界路径拒绝、宿主未注入工作区时失败而非退化）、启用审查文案。
 
-**这项改动由 Claude Code 负责**，因为它跨 Host 权限模型与 TUI 装配，属于信任边界。
+该改动保持通用能力语义，没有把 Code Context Engine 业务逻辑移入 Host。
 
 ## 阶段划分
 
 ### Phase 1 — 插件骨架与索引生命周期
 
+**状态：完成。** 真实实现与验证结果见 [implementation-status.md](./implementation-status.md)。
+
 - crate `code-context-plugin`，`crate-type = ["cdylib", "rlib"]`，加入根 workspace members。
 - `plugin.toml`：`api_version = "0.10.0"`，`capabilities = { workspace_read = true, storage = true }`，`tool_scopes.code_search = "read"`。
-- `activate` 只读 `IndexManifest` 与哈希表，**不做任何解析**（fuel 预算约束，见 [ADR：存储](./adr-storage.md)）。
+- `activate` 只列出仓库根一次用于能力探测，然后读取 `IndexManifest`；**不扫描文件、不做任何解析**（fuel 预算约束，见 [ADR：存储](./adr-storage.md)）。
 - `IndexManifest` 的读写、schema 版本校验、三级迁移判定（compatible / semantic rebuild / full rebuild）。
 - `smoke-tests` 子 crate，验证真实 Host 加载 + 工具注册 + 存储往返。
 
@@ -82,10 +84,10 @@ workspace_read = true
 - 对照组：Lexical / Semantic / Hybrid（V1 只有 Lexical，Semantic 与 Hybrid 在 V2 补齐对照）。
 - 加固：超大仓库行为、fuel 边界、内存边界、解析异常、存储配额耗尽。
 
-### Phase 8 — EmbeddingProvider 抽象（V2 起）
+### Phase 8 — Embedding Provider 接入（V2 起）
 
-- `EmbeddingProvider` trait，Api / Local 双分支，两者都可返回"能力不可用"。
-- `EmbeddingSpace` 与 `embedding_space_id` 派生。
+- Phase 1 已冻结 `EmbeddingProvider`、`UnconfiguredEmbeddingProvider`、`EmbeddingSpace` 与
+  `embedding_space_id` 边界；本阶段接入 Api / Local 的真实实现。
 - 语义缺席时的 `Degraded` 路径打通并测试。
 
 **该阶段可以在 Host HTTP 能力落地前完成**——它只是抽象与降级路径，不含实际网络调用。
@@ -134,7 +136,9 @@ RRF 加入第三路。Phase 5 的融合层无需重构。
 | `.../src/tests/` 单元测试 | — |
 | Benchmark fixture 与评测脚本 | — |
 
-**交界面由 Claude Code 先定义并冻结**：`CodeChunk`、`IndexManifest`、`EmbeddingSpace`、`LanguageAdapter` trait、`EmbeddingProvider` trait、fuel 分片游标协议。Codex 在这些类型确定后再开始实现。
+**Phase 1 已冻结的交界面**：`CodeChunk`、`Symbol`、`IndexManifest`、`EmbeddingSpace`、
+`EmbeddingProvider`。`LanguageAdapter` 与 fuel 分片游标尚未冻结，下一阶段必须根据实际扫描与
+解析需求设计，不得猜测接口。
 
 **Codex 在架构冻结前不得开始**：SQLite / LanceDB / Qwen runtime / tree-sitter 架构 / file watcher 的任何实现——这些选型全部已在 ADR 中被否决或推迟，提前实现是纯浪费。
 
