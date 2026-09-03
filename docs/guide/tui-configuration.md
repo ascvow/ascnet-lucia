@@ -66,6 +66,27 @@ review_model = "gpt-5.6-luna"
 `model.extra_headers` 暂不支持，因为它可能同时携带 Secret 和未经审阅的行为。模型密钥缺失
 时使用内置演示模型，并在界面中显示配置提示。
 
+## 插件配置
+
+每个插件可以有自己的配置段，段名就是插件 ID：
+
+```toml
+[plugins.permission]
+# 该插件专属的模型路由；不配置则沿用 tui.review_model。
+model = "gpt-5.6-luna"
+base_url = "https://ai.phrolova.uno"
+api_key = "sk-..."            # 或 api_key_env = "REVIEW_API_KEY"
+gateway = "open-ai-compatible"
+# 其余键值由插件自己解释。
+auto_approve_reads = true
+```
+
+配置有两个来源，主配置的同名键覆盖插件目录里随 bundle 分发的 `config.toml`（与 `plugin.toml` 同级），因此插件作者可以给出默认值，你只覆盖需要改的项。
+
+路由字段是 `provider`、`model`、`base_url`、`api_key`、`api_key_env`、`openai_protocol`、`gateway`、`stream`、`max_output_tokens`，取值与 `[model]` 段一致；它们由宿主消费并注册成该插件专属的服务商（网关内命名为 `plugin:<插件 ID>`），密钥只留在宿主侧，不会进入插件的 WASM 实例。声明了 `model` 却没有 `api_key` 或 `api_key_env` 时启动即报错，不会拖到第一次调用模型才失败。`max_output_tokens` 仍受执行策略上限约束，插件配置只能调小。
+
+其余键值原样作为激活元数据交给插件读取，值统一转成字符串。宿主注入的可信项（如工作区标识）优先级最高，插件无法用配置覆盖它们。没有配置专属路由的插件继续使用 `tui.review_model`。
+
 ## 会话恢复
 
 Lucia 启动时规范化当前目录，并据此生成稳定 `project-id`。同一个工作目录可以保存多个会话，不同工作目录不会混用列表；实际文件位于 `<sessions_dir>/<project-id>/sessions`。

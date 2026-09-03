@@ -1,7 +1,13 @@
 //! 插件 manifest 合并与容错启动。
 
 use crate::event::UiEvent;
+#[cfg(feature = "plugins")]
+use crate::plugin::config::{
+    load_plugin_dir_config, resolve_plugin_settings, PluginRouteDefaults, PluginSettings,
+};
 use crate::plugin::sessions::TuiPluginSessionSource;
+use agent_core::model::ModelProviderConfig;
+use agent_core::AgentModelConfig;
 use agent_plugin_host::manifest::PluginManifest;
 use agent_plugin_host::wasm::load_wasm_plugins_progressively_with_selection_and_services;
 use agent_plugin_host::{LivePluginHost, PluginHostServices};
@@ -49,6 +55,8 @@ pub(crate) struct PluginExecutionContext {
     pub(crate) runtime: AgentRuntime,
     /// 插件无工具模型完成使用的固定模型 ID；缺省时沿用主模型。
     pub(crate) model: Option<String>,
+    /// 应用默认路由使用的服务商配置；插件未配置专属路由时沿用它。
+    pub(crate) model_provider: ModelProviderConfig,
     /// Serve 平面使用的应用插件状态目录；受限平面必须保持为 `None`。
     pub(crate) persistent_state_dir: Option<PathBuf>,
 }
@@ -63,6 +71,7 @@ impl PluginExecutionContext {
         execution_policy: agent_tool::ExecutionPolicy,
         run_observer: Option<Arc<dyn agent_runtime::RuntimeRunObserver>>,
         model: Option<String>,
+        model_provider: ModelProviderConfig,
         persistent_state_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let runtime_limits = plugin_runtime_limits(&execution_policy);
@@ -75,6 +84,7 @@ impl PluginExecutionContext {
             execution_policy,
             runtime,
             model,
+            model_provider,
             persistent_state_dir,
         })
     }
@@ -89,6 +99,51 @@ impl PluginExecutionContext {
 #[cfg(feature = "plugins")]
 fn plugin_runtime_limits(policy: &agent_tool::ExecutionPolicy) -> RuntimeLimits {
     RuntimeLimits::default().clamped_by(&policy.limits)
+}
+
+/// 返回插件专属模型路由在网关中注册使用的 provider 名称。
+///
+/// 加前缀是为了与用户配置的服务商名称隔离，避免插件 ID 与 `[model].name` 撞名后互相
+/// 覆盖路由。
+#[cfg(feature = "plugins")]
+fn plugin_provider_name(plugin_id: &str) -> String {
+    format!("plugin:{plugin_id}")
+}
+
+/// 按 manifest 逐个解析插件配置，合并插件目录默认值与主配置段。
+///
+/// 返回值按插件 ID 索引；manifest 无法解析时跳过该条目，由后续加载流程统一报告失败。
+///
+/// # Errors
+///
+/// 插件配置文件不合法，或模型路由字段缺少凭据、类型不符时返回错误，使问题在启动期而不是
+/// 首次调用模型时暴露。
+#[cfg(feature = "plugins")]
+fn resolve_all_plugin_settings(
+    manifests: &[PathBuf],
+    plugin_configs: &HashMap<String, toml::Value>,
+    defaults: &PluginRouteDefaults,
+) -> Result<HashMap<String, PluginSettings>> {
+    let mut resolved = HashMap::new();
+    for path in manifests {
+        let Ok(manifest) = PluginManifest::load(path) else {
+            continue;
+        };
+        let plugin_id = manifest.plugin.id;
+        let plugin_dir = path.parent().unwrap_or(Path::new("."));
+        let dir_config = load_plugin_dir_config(plugin_dir)
+            .with_context(|| format!("读取插件 `{plugin_id}` 的配置失败"))?;
+        let settings = resolve_plugin_settings(
+            &plugin_id,
+            &plugin_provider_name(&plugin_id),
+            dir_config,
+            plugin_configs.get(&plugin_id),
+            defaults,
+        )
+        .with_context(|| format!("解析插件 `{plugin_id}` 的配置失败"))?;
+        resolved.insert(plugin_id, settings);
+    }
+    Ok(resolved)
 }
 
 /// 返回插件模型完成服务的有效输出上限，不能超过 Host 固定上限或执行策略上限。
@@ -243,9 +298,11 @@ pub(crate) fn plugin_manifest_ids(manifests: &[PathBuf]) -> Vec<String> {
 /// 全局 manifest、依赖或能力规划错误会终止加载；单插件激活失败由 Host 转换为
 /// `PluginLoadUpdate`，不会撤销��前已经发布的无关插件。
 #[cfg(feature = "plugins")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn load_plugins_for_tui(
     manifests: Vec<PathBuf>,
     capability_selection: HashMap<String, String>,
+    plugin_configs: HashMap<String, toml::Value>,
     agent_template: AgentTemplate,
     execution: PluginExecutionContext,
     workspace_scope: String,
@@ -262,10 +319,10 @@ pub(crate) async fn load_plugins_for_tui(
         execution_policy,
         runtime,
         model,
+        model_provider,
         persistent_state_dir,
     } = execution;
-    let model_gateway = agent_template.gateway().clone();
-    let model_provider = agent_template.options().provider.clone();
+    let mut model_gateway = agent_template.gateway().clone();
     let model_name = model
         .clone()
         .unwrap_or_else(|| agent_template.options().model.clone());
@@ -286,18 +343,42 @@ pub(crate) async fn load_plugins_for_tui(
         .await
         .context("注册 TUI controller profile 失败")?;
     let model_output_limit = plugin_model_output_limit(&execution_policy);
+    // 插件配置在 Host 侧解析：模型路由由宿主消费并注册成专属 provider，其余键值作为激活
+    // 元数据下发，密钥不进入 Guest。
+    let route_defaults = PluginRouteDefaults {
+        stream: model_stream,
+        cache_retention: model_cache_retention,
+    };
+    let plugin_settings =
+        resolve_all_plugin_settings(&prepared_manifests, &plugin_configs, &route_defaults)?;
+    for (plugin_id, settings) in &plugin_settings {
+        let Some(route) = settings.route.as_ref() else {
+            continue;
+        };
+        model_gateway
+            .register_from_config(route.provider.clone())
+            .with_context(|| format!("注册插件 `{plugin_id}` 的专属模型路由失败"))?;
+    }
     let mut host_services = PluginHostServices::new().restrict_execution_policy(&execution_policy);
-    host_services = host_services.with_activation_metadata(
-        "permission",
-        HashMap::from([
+    let mut activation_metadata = plugin_settings
+        .iter()
+        .map(|(plugin_id, settings)| (plugin_id.clone(), settings.metadata.clone()))
+        .collect::<HashMap<_, _>>();
+    // 宿主注入的可信项排在插件配置之后写入，插件不得用配置伪造工作区身份。
+    activation_metadata
+        .entry("permission".to_string())
+        .or_default()
+        .extend([
             ("workspace_scope".to_string(), workspace_scope.clone()),
             ("workspace_root".to_string(), workspace_root.clone()),
-        ]),
-    )?;
-    host_services = host_services.with_activation_metadata(
-        "teammate",
-        HashMap::from([("workspace_root".to_string(), workspace_root)]),
-    )?;
+        ]);
+    activation_metadata
+        .entry("teammate".to_string())
+        .or_default()
+        .insert("workspace_root".to_string(), workspace_root);
+    for (plugin_id, metadata) in activation_metadata {
+        host_services = host_services.with_activation_metadata(plugin_id, metadata)?;
+    }
     // 插件持久存储按项目隔离，作用域由宿主注入，不经过 manifest 或 Guest。
     host_services = host_services.with_workspace_scope(workspace_scope)?;
     // 只读会话来源同样由宿主注入；传入的端口不含写入方法。
@@ -306,20 +387,32 @@ pub(crate) async fn load_plugins_for_tui(
     if let Some(state_dir) = persistent_state_dir {
         host_services = host_services.with_persistent_state_dir(state_dir)?;
     }
-    let host_services = host_services
-        .with_model_completion(
-            model_gateway,
-            model_provider,
-            model_name,
+    // 应用默认路由沿用主 Agent 的服务商，只替换模型与调用参数。
+    let mut default_route = AgentModelConfig::new(model_provider, model_name);
+    default_route.stream = model_stream;
+    default_route.cache_retention = model_cache_retention;
+    host_services = host_services.with_model_completion(
+        model_gateway.clone(),
+        default_route,
+        model_output_limit,
+    )?;
+    // 配置了专属路由的插件覆盖应用默认值；输出上限仍受执行策略约束。
+    for (plugin_id, settings) in &plugin_settings {
+        let Some(route) = settings.route.as_ref() else {
+            continue;
+        };
+        host_services = host_services.with_plugin_model_completion(
+            plugin_id,
+            model_gateway.clone(),
+            route.clone(),
             model_output_limit,
-            model_stream,
-            model_cache_retention,
-        )?
-        .with_agent_runtime(
-            Arc::new(runtime),
-            controller_profile,
-            HashMap::from([("worker".to_string(), worker_agent_derive_config())]),
         )?;
+    }
+    let host_services = host_services.with_agent_runtime(
+        Arc::new(runtime),
+        controller_profile,
+        HashMap::from([("worker".to_string(), worker_agent_derive_config())]),
+    )?;
     load_wasm_plugins_progressively_with_selection_and_services(
         &prepared_manifests,
         &capability_selection,

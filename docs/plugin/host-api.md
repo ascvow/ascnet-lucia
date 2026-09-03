@@ -139,7 +139,7 @@ let response = host.complete_model(&ModelCompletionRequest {
 })?;
 ```
 
-该能力要求 manifest 声明 `model_completion = true`，且应用通过 `PluginHostServices::with_model_completion` 注入模型网关、provider、model、流式模式、最大输出预算和提示缓存保留策略。缓存键由 Host 按调用方插件 ID 生成（`plugin:<id>`）：插件补全通常是"固定 system + 短小可变正文"的高频调用，按插件分组才能让同一份 system 前缀持续命中，同时与主会话的缓存分区互不驱逐。Guest 不能提交模型路由、流式模式、工具、推理级别或 provider options；Host 固定这些设置并收窄输出预算。ExecutionPolicy 的累计调用次数和请求输入字节预算按单个插件激活隔离，同一激活内的并发 clone 共享原子账本，不会消耗其他插件实例的额度。调用失败或返回空文本时直接返回错误，不会静默退回本地裁剪。
+该能力要求 manifest 声明 `model_completion = true`，且应用通过 `PluginHostServices::with_model_completion` 注入模型网关、provider、model、流式模式、最大输出预算和提示缓存保留策略。应用还可以用 `with_plugin_model_completion` 为单个插件注入专属路由（TUI 从 `[plugins.<id>]` 配置解析），覆盖默认值；未覆盖的插件继续使用默认路由，覆盖后的插件拥有独立预算账本，密钥只留在 Host 侧。缓存键由 Host 按调用方插件 ID 生成（`plugin:<id>`）：插件补全通常是"固定 system + 短小可变正文"的高频调用，按插件分组才能让同一份 system 前缀持续命中，同时与主会话的缓存分区互不驱逐。Guest 不能提交模型路由、流式模式、工具、推理级别或 provider options；Host 固定这些设置并收窄输出预算。ExecutionPolicy 的累计调用次数和请求输入字节预算按单个插件激活隔离，同一激活内的并发 clone 共享原子账本，不会消耗其他插件实例的额度。调用失败或返回空文本时直接返回错误，不会静默退回本地裁剪。
 
 ## 错误信封
 

@@ -11,7 +11,7 @@ use crate::capability::{
 };
 use crate::manifest::AgentCapabilitySection;
 use crate::services::{AgentRuntimeHostServices, ModelCompletionHostServices};
-use agent_core::{AgentEvent, AgentEventKind, ModelRequest, ReasoningLevel, ToolChoice};
+use agent_core::{AgentEvent, AgentEventKind, ModelRequest, ToolChoice};
 use agent_runtime::{
     AgentEventStream, AgentId, AgentRuntimeApi, AgentSpawnRequest, RuntimePrincipal,
 };
@@ -170,25 +170,30 @@ impl CapabilityState {
             .reserve(request_json.len())
             .map_err(capability_denied)?;
 
-        let mut model_request = ModelRequest::new(binding.model, request.messages);
+        // 路由的全部调用参数来自 Core 的模型配置；Host 只强制工具禁用与输出上限。
+        let config = binding.config;
+        let mut model_request = ModelRequest::new(config.model, request.messages);
         model_request.system = request.system;
         model_request.tool_choice = ToolChoice::None;
         model_request.max_tokens = Some(
             request
                 .max_tokens
+                .or(config.max_tokens)
                 .unwrap_or(binding.max_output_tokens)
                 .clamp(1, binding.max_output_tokens),
         );
-        model_request.reasoning = ReasoningLevel::Off;
-        model_request.cache_retention = binding.cache_retention;
+        model_request.reasoning = config.reasoning;
+        model_request.temperature = config.temperature;
+        model_request.cache_retention = config.cache_retention;
+        model_request.provider_options = config.provider_options;
         // 插件补全通常是"固定 system + 短小可变正文"的高频调用，前缀在多次调用之间完全
         // 相同，值得缓存。键按插件而不是按会话分组：同一插件的补全共享同一份 system 前缀
         // 缓存，同时与主会话的缓存分区分开，互不驱逐。
         model_request.session_id = Some(format!("plugin:{plugin_id}"));
-        let response = if binding.stream {
+        let response = if config.stream {
             binding
                 .gateway
-                .stream(&binding.provider, model_request)
+                .stream(&config.provider.name, model_request)
                 .await
                 .context("启动插件模型完成流失败")?
                 .result()
@@ -197,7 +202,7 @@ impl CapabilityState {
         } else {
             binding
                 .gateway
-                .complete(&binding.provider, model_request)
+                .complete(&config.provider.name, model_request)
                 .await
                 .context("插件模型非流式完成调用失败")?
         };

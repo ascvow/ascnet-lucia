@@ -52,8 +52,17 @@ stream = true
 [tui]
 sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
-# 权限插件“帮我审批”模式使用的独立审核模型。
+# 权限插件“帮我审批”模式使用的独立审核模型；插件段配置了 model 时以插件段为准。
 review_model = "gpt-5.6-luna"
+
+# 插件配置：段名是插件 ID，键值由各插件自行解释。
+# 配置了 model 的插件使用自己的模型路由，未配置的沿用上面的 review_model。
+# 同名键会覆盖插件目录下 config.toml 里的默认值。
+# [plugins.permission]
+# model = "gpt-5.6-luna"
+# base_url = "https://ai.phrolova.uno"
+# api_key = "sk-..."          # 或改用 api_key_env = "REVIEW_API_KEY"
+# gateway = "open-ai-compatible"
 "#;
 
 /// 配置文件中由 TUI 消费的应用设置。

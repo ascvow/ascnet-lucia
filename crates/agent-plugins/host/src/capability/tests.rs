@@ -102,6 +102,21 @@ impl ProviderAdapter for CapturingCompletionModel {
     }
 }
 
+/// 构造测试用的插件模型完成配置。
+fn completion_config(provider: &str, model: &str, stream: bool) -> agent_core::AgentModelConfig {
+    let mut config = agent_core::AgentModelConfig::new(
+        agent_core::model::ModelProviderConfig::new(
+            provider,
+            agent_core::model::ProviderKind::OpenAiCompatible,
+            "test-key",
+        ),
+        model,
+    );
+    config.stream = stream;
+    config.cache_retention = PromptCacheRetention::Short;
+    config
+}
+
 /// 回显 Host 最终注入调用方的测试服务。
 struct CallerEchoService;
 
@@ -342,7 +357,14 @@ fn persistent_instance_state_survives_recreation() {
             CapabilitySection::default(),
             Arc::new(ContributionRegistry::default()),
             Arc::new(ServiceRegistry::default()),
-            CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), Some(root.clone()), Some("test-workspace".into()), None),
+            CapabilityHostContext::new(
+                None,
+                None,
+                ExecutionPolicy::serve(),
+                Some(root.clone()),
+                Some("test-workspace".into()),
+                None,
+            ),
         )
         .expect("创建持久能力状态")
     };
@@ -377,7 +399,14 @@ fn persistent_permission_state_is_isolated_by_bundle_identity() {
             CapabilitySection::default(),
             Arc::new(ContributionRegistry::default()),
             Arc::new(ServiceRegistry::default()),
-            CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), Some(root.clone()), Some("test-workspace".into()), None),
+            CapabilityHostContext::new(
+                None,
+                None,
+                ExecutionPolicy::serve(),
+                Some(root.clone()),
+                Some("test-workspace".into()),
+                None,
+            ),
         )
         .expect("创建持久能力状态")
     };
@@ -736,14 +765,11 @@ async fn model_completion_uses_trusted_route_and_limits() {
     let binding = PluginHostServices::new()
         .with_model_completion(
             gateway,
-            "trusted-provider",
-            "trusted-model",
+            completion_config("trusted-provider", "trusted-model", true),
             128,
-            true,
-            PromptCacheRetention::Short,
         )
         .expect("注入流式模型服务")
-        .model_completion()
+        .model_completion_for("test-plugin")
         .expect("模型服务绑定应存在");
 
     let response = CapabilityState::complete_model_with(
@@ -772,6 +798,158 @@ async fn model_completion_uses_trusted_route_and_limits() {
     );
 }
 
+/// 配置了专属路由的插件走自己的模型，其余插件继续使用应用默认路由。
+#[tokio::test]
+async fn plugin_specific_route_overrides_application_default() {
+    let default_requests = Arc::new(Mutex::new(Vec::new()));
+    let plugin_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut gateway = agent_core::ModelGateway::new();
+    gateway
+        .register(
+            "default-provider",
+            Arc::new(CapturingCompletionModel {
+                requests: default_requests.clone(),
+                expect_stream: false,
+            }),
+        )
+        .expect("注册默认模型");
+    gateway
+        .register(
+            "plugin:reviewer",
+            Arc::new(CapturingCompletionModel {
+                requests: plugin_requests.clone(),
+                expect_stream: false,
+            }),
+        )
+        .expect("注册插件专属模型");
+    let services = PluginHostServices::new()
+        .with_model_completion(
+            gateway.clone(),
+            completion_config("default-provider", "default-model", false),
+            128,
+        )
+        .expect("注入默认模型服务")
+        .with_plugin_model_completion(
+            "reviewer",
+            gateway,
+            completion_config("plugin:reviewer", "reviewer-model", false),
+            64,
+        )
+        .expect("注入插件专属模型服务");
+    let request = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"审核"}]}]}"#;
+
+    CapabilityState::complete_model_with(
+        true,
+        services.model_completion_for("reviewer"),
+        "reviewer",
+        request,
+    )
+    .await
+    .expect("插件专属路由应成功");
+    CapabilityState::complete_model_with(
+        true,
+        services.model_completion_for("other"),
+        "other",
+        request,
+    )
+    .await
+    .expect("默认路由应成功");
+
+    let plugin_captured = plugin_requests.lock().expect("锁定插件模型请求");
+    let default_captured = default_requests.lock().expect("锁定默认模型请求");
+    assert_eq!(plugin_captured.len(), 1);
+    assert_eq!(plugin_captured[0].model, "reviewer-model");
+    // 插件自己的输出上限同样生效，且仍受 Host 传入的上限约束。
+    assert_eq!(plugin_captured[0].max_tokens, Some(64));
+    assert_eq!(default_captured.len(), 1);
+    assert_eq!(default_captured[0].model, "default-model");
+    assert_eq!(default_captured[0].max_tokens, Some(128));
+}
+
+/// 路由里的思考级别与采样温度必须原样进入模型请求。
+///
+/// 插件补全过去固定关闭推理，配置了小模型的思考档位也无法生效；改用 Core 的模型配置后，
+/// 这些参数与主 Agent 走同一套语义。
+#[tokio::test]
+async fn plugin_route_forwards_reasoning_and_sampling() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut gateway = agent_core::ModelGateway::new();
+    gateway
+        .register(
+            "plugin:reviewer",
+            Arc::new(CapturingCompletionModel {
+                requests: requests.clone(),
+                expect_stream: false,
+            }),
+        )
+        .expect("注册插件专属模型");
+    let mut config = completion_config("plugin:reviewer", "reviewer-model", false);
+    config.reasoning = ReasoningLevel::High;
+    config.temperature = Some(0.2);
+    let services = PluginHostServices::new()
+        .with_plugin_model_completion("reviewer", gateway, config, 64)
+        .expect("注入插件专属模型服务");
+
+    CapabilityState::complete_model_with(
+        true,
+        services.model_completion_for("reviewer"),
+        "reviewer",
+        r#"{"messages":[{"role":"user","content":[{"type":"text","text":"审核"}]}]}"#,
+    )
+    .await
+    .expect("插件专属路由应成功");
+
+    let captured = requests.lock().expect("锁定模型请求");
+    assert_eq!(captured[0].reasoning, ReasoningLevel::High);
+    assert_eq!(captured[0].temperature, Some(0.2));
+}
+
+/// 插件专属路由的预算账本与默认路由隔离，一个插件耗尽额度不影响其他插件。
+#[tokio::test]
+async fn plugin_specific_route_keeps_isolated_budget() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut gateway = agent_core::ModelGateway::new();
+    gateway
+        .register(
+            "plugin:reviewer",
+            Arc::new(CapturingCompletionModel {
+                requests: requests.clone(),
+                expect_stream: false,
+            }),
+        )
+        .expect("注册插件专属模型");
+    let mut policy = ExecutionPolicy::serve();
+    policy.limits.max_plugin_model_completions = Some(1);
+    let services = PluginHostServices::new()
+        .restrict_execution_policy(&policy)
+        .with_plugin_model_completion(
+            "reviewer",
+            gateway,
+            completion_config("plugin:reviewer", "reviewer-model", false),
+            64,
+        )
+        .expect("注入插件专属模型服务");
+    let request = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"审核"}]}]}"#;
+
+    let binding = services
+        .model_completion_for("reviewer")
+        .expect("专属绑定应存在");
+    CapabilityState::complete_model_with(true, Some(binding.clone()), "reviewer", request)
+        .await
+        .expect("首次调用应在预算内");
+    let exhausted =
+        CapabilityState::complete_model_with(true, Some(binding), "reviewer", request).await;
+    // 另一次激活重新取绑定，拿到独立账本，不受上一轮耗尽影响。
+    let fresh = services
+        .model_completion_for("reviewer")
+        .expect("专属绑定应存在");
+    let renewed =
+        CapabilityState::complete_model_with(true, Some(fresh), "reviewer", request).await;
+
+    assert!(exhausted.is_err(), "同一激活内超出次数上限必须失败");
+    assert!(renewed.is_ok(), "新激活应获得独立预算账本");
+}
+
 /// Host 关闭流式模式后必须改用模型的非流式完成接口。
 #[tokio::test]
 async fn model_completion_can_use_non_streaming_route() {
@@ -789,14 +967,11 @@ async fn model_completion_can_use_non_streaming_route() {
     let binding = PluginHostServices::new()
         .with_model_completion(
             gateway,
-            "trusted-provider",
-            "trusted-model",
+            completion_config("trusted-provider", "trusted-model", false),
             20_000,
-            false,
-            PromptCacheRetention::Short,
         )
         .expect("注入非流式模型服务")
-        .model_completion()
+        .model_completion_for("test-plugin")
         .expect("模型服务绑定应存在");
 
     CapabilityState::complete_model_with(
@@ -831,14 +1006,11 @@ async fn model_completion_enforces_execution_policy_budget() {
         .restrict_execution_policy(&policy)
         .with_model_completion(
             gateway,
-            "trusted-provider",
-            "trusted-model",
+            completion_config("trusted-provider", "trusted-model", false),
             128,
-            false,
-            PromptCacheRetention::Short,
         )
         .expect("注入预算模型服务")
-        .model_completion()
+        .model_completion_for("test-plugin")
         .expect("模型服务绑定应存在");
     let request = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"审核"}]}]}"#;
 
@@ -874,18 +1046,15 @@ async fn model_completion_budget_is_isolated_per_plugin_activation() {
         .restrict_execution_policy(&policy)
         .with_model_completion(
             gateway,
-            "trusted-provider",
-            "trusted-model",
+            completion_config("trusted-provider", "trusted-model", false),
             128,
-            false,
-            PromptCacheRetention::Short,
         )
         .expect("注入预算模型服务");
     let first_activation = services
-        .model_completion()
+        .model_completion_for("test-plugin")
         .expect("第一插件激活应获得模型服务");
     let second_activation = services
-        .model_completion()
+        .model_completion_for("test-plugin")
         .expect("第二插件激活应获得模型服务");
     let request = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"审核"}]}]}"#;
 

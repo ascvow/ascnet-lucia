@@ -5,7 +5,9 @@ use crate::audit;
 use crate::host::PluginHost;
 use crate::session::PluginSessionSource;
 #[cfg(feature = "wasm")]
-use agent_core::model::{ModelGateway, PromptCacheRetention};
+use agent_core::model::ModelGateway;
+#[cfg(feature = "wasm")]
+use agent_core::AgentModelConfig;
 #[cfg(feature = "wasm")]
 use agent_runtime::{AgentDeriveConfig, AgentProfileId, AgentRuntimeProvisioner};
 use agent_tool::ExecutionPolicy;
@@ -22,12 +24,13 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct ModelCompletionHostServices {
     pub(crate) gateway: ModelGateway,
-    pub(crate) provider: String,
-    pub(crate) model: String,
+    /// Core 的模型调用配置原语；模型、推理级别、缓存策略等全部由它描述。
+    ///
+    /// 直接复用 Core 类型而不是在 Host 侧另立一套字段：插件补全与主 Agent 支持同样的
+    /// 调用参数，新增能力只需扩展 Core 的配置，不必在这一层同步。
+    pub(crate) config: AgentModelConfig,
+    /// Host 允许的单次输出上限；Guest 与配置都只能取更小值。
     pub(crate) max_output_tokens: u32,
-    pub(crate) stream: bool,
-    /// 应用配置的提示缓存保留策略，与主 Agent 取同一配置值。
-    pub(crate) cache_retention: PromptCacheRetention,
     execution_policy: ExecutionPolicy,
     completed_calls: Arc<AtomicUsize>,
     submitted_input_bytes: Arc<AtomicUsize>,
@@ -39,11 +42,8 @@ impl ModelCompletionHostServices {
     fn for_plugin_activation(&self) -> Self {
         Self {
             gateway: self.gateway.clone(),
-            provider: self.provider.clone(),
-            model: self.model.clone(),
+            config: self.config.clone(),
             max_output_tokens: self.max_output_tokens,
-            stream: self.stream,
-            cache_retention: self.cache_retention,
             execution_policy: self.execution_policy.clone(),
             completed_calls: Arc::new(AtomicUsize::new(0)),
             submitted_input_bytes: Arc::new(AtomicUsize::new(0)),
@@ -100,6 +100,9 @@ pub struct PluginHostServices {
     pub(crate) agent_runtime: Option<AgentRuntimeHostServices>,
     #[cfg(feature = "wasm")]
     pub(crate) model_completion: Option<ModelCompletionHostServices>,
+    /// 按插件 ID 覆盖的模型路由；未覆盖的插件沿用 `model_completion`。
+    #[cfg(feature = "wasm")]
+    pub(crate) plugin_model_completion: HashMap<String, ModelCompletionHostServices>,
     /// 应用注入的只读会话来源；缺失时插件的 `sessions` 能力保持关闭。
     pub(crate) session_source: Option<Arc<dyn PluginSessionSource>>,
     #[cfg(feature = "wasm")]
@@ -138,10 +141,16 @@ impl PluginHostServices {
     pub fn restrict_execution_policy(mut self, requested: &ExecutionPolicy) -> Self {
         self.execution_policy = self.execution_policy.restrict(requested);
         #[cfg(feature = "wasm")]
-        if let Some(model_completion) = self.model_completion.as_mut() {
-            model_completion.execution_policy = model_completion
-                .execution_policy
-                .restrict(&self.execution_policy);
+        {
+            let policy = self.execution_policy.clone();
+            // 按插件覆盖的路由同样受收紧后的策略约束，避免绕过预算上限。
+            for binding in self
+                .model_completion
+                .iter_mut()
+                .chain(self.plugin_model_completion.values_mut())
+            {
+                binding.execution_policy = binding.execution_policy.restrict(&policy);
+            }
         }
         self
     }
@@ -246,48 +255,95 @@ impl PluginHostServices {
 
     /// 注入插件可请求的固定模型路由和最大输出预算。
     ///
-    /// Guest 只能提交 system、messages 和更小的输出上限；provider、model、流式模式、
-    /// 工具、缓存策略和 provider options 均由 Host 控制。插件 manifest 还必须声明
-    /// `model_completion`。
+    /// 路由用 Core 的 [`AgentModelConfig`] 描述：模型、推理级别、缓存策略、采样温度和
+    /// provider options 都由它承载，插件补全因此与主 Agent 支持同一套调用参数。Guest 只能
+    /// 提交 system、messages 和更小的输出上限，其余全部由 Host 控制。插件 manifest 还必须
+    /// 声明 `model_completion`。
     ///
-    /// `cache_retention` 应传入与主 Agent 相同的配置值；缓存键由 Host 按插件 ID 生成，
-    /// 使同一插件反复使用的 system 前缀能持续命中，且与主会话的缓存分区互不干扰。
+    /// `max_output_tokens` 是 Host 强制上限，配置里更大的值会被收敛到它。
+    ///
+    /// # Errors
+    ///
+    /// model 为空、provider 未注册到网关或输出上限为零时返回错误。
     #[cfg(feature = "wasm")]
     pub fn with_model_completion(
         mut self,
         gateway: ModelGateway,
-        provider: impl Into<String>,
-        model: impl Into<String>,
+        config: AgentModelConfig,
         max_output_tokens: u32,
-        stream: bool,
-        cache_retention: PromptCacheRetention,
     ) -> Result<Self> {
-        let provider = provider.into();
-        let model = model.into();
-        if provider.trim().is_empty() {
-            return Err(anyhow!("模型完成 provider 不能为空"));
+        self.model_completion =
+            Some(self.build_model_completion(None, gateway, config, max_output_tokens)?);
+        Ok(self)
+    }
+
+    /// 为单个插件注入专属模型路由，覆盖 [`Self::with_model_completion`] 的应用默认值。
+    ///
+    /// 供应用把插件自己的配置（模型、地址、密钥、推理级别）解析成独立路由；密钥只存在于
+    /// Host 侧，Guest 仍然只能提交 system、messages 和更小的输出上限。未覆盖的插件继续
+    /// 使用默认路由；覆盖后的插件拥有独立的调用次数与输入字节预算账本。
+    ///
+    /// # Errors
+    ///
+    /// 插件 ID 或 model 为空、provider 未注册到网关、输出上限为零时返回错误。
+    #[cfg(feature = "wasm")]
+    pub fn with_plugin_model_completion(
+        mut self,
+        plugin_id: impl Into<String>,
+        gateway: ModelGateway,
+        config: AgentModelConfig,
+        max_output_tokens: u32,
+    ) -> Result<Self> {
+        let plugin_id = plugin_id.into();
+        if plugin_id.trim().is_empty() {
+            return Err(anyhow!("插件模型路由的 plugin_id 不能为空"));
         }
-        if model.trim().is_empty() {
-            return Err(anyhow!("模型完成 model 不能为空"));
+        let binding =
+            self.build_model_completion(Some(&plugin_id), gateway, config, max_output_tokens)?;
+        self.plugin_model_completion.insert(plugin_id, binding);
+        Ok(self)
+    }
+
+    /// 校验路由并按当前执行策略构造模型完成绑定。
+    ///
+    /// `plugin_id` 只用于错误信息，`None` 表示应用默认路由。配置里的输出上限会被收敛到
+    /// Host 允许的上限。
+    #[cfg(feature = "wasm")]
+    fn build_model_completion(
+        &self,
+        plugin_id: Option<&str>,
+        gateway: ModelGateway,
+        mut config: AgentModelConfig,
+        max_output_tokens: u32,
+    ) -> Result<ModelCompletionHostServices> {
+        let scope = plugin_id.map_or(String::new(), |id| format!("插件 `{id}` 的"));
+        if config.model.trim().is_empty() {
+            return Err(anyhow!("{scope}模型完成 model 不能为空"));
         }
-        if !gateway.contains(&provider) {
-            return Err(anyhow!("模型完成 provider `{provider}` 未注册"));
+        if !gateway.contains(&config.provider.name) {
+            return Err(anyhow!(
+                "{scope}模型完成 provider `{}` 未注册",
+                config.provider.name
+            ));
         }
         if max_output_tokens == 0 {
-            return Err(anyhow!("模型完成最大输出 token 必须大于零"));
+            return Err(anyhow!("{scope}模型完成最大输出 token 必须大于零"));
         }
-        self.model_completion = Some(ModelCompletionHostServices {
+        // 配置只能把输出上限调小；Host 上限始终生效。
+        config.max_tokens = Some(
+            config
+                .max_tokens
+                .unwrap_or(max_output_tokens)
+                .min(max_output_tokens),
+        );
+        Ok(ModelCompletionHostServices {
             gateway,
-            provider,
-            model,
+            config,
             max_output_tokens,
-            stream,
-            cache_retention,
             execution_policy: self.execution_policy.clone(),
             completed_calls: Arc::new(AtomicUsize::new(0)),
             submitted_input_bytes: Arc::new(AtomicUsize::new(0)),
-        });
-        Ok(self)
+        })
     }
 
     /// 注入插件可只读访问的历史会话来源。
@@ -313,14 +369,19 @@ impl PluginHostServices {
         self.agent_runtime.clone()
     }
 
-    /// 返回单个插件激活使用的固定模型完成服务快照。
+    /// 返回指定插件激活使用的模型完成服务快照。
     ///
-    /// 每次调用创建独立预算账本，避免一个插件耗尽其他插件的额度；同一返回值的 clone
-    /// 仍共享计数器，使该插件实例内的并发调用无法绕过累计上限。
+    /// 优先返回该插件的专属路由，没有配置时回退到应用默认路由。每次调用创建独立预算
+    /// 账本，避免一个插件耗尽其他插件的额度；同一返回值的 clone 仍共享计数器，使该插件
+    /// 实例内的并发调用无法绕过累计上限。
     #[cfg(feature = "wasm")]
-    pub(crate) fn model_completion(&self) -> Option<ModelCompletionHostServices> {
-        self.model_completion
-            .as_ref()
+    pub(crate) fn model_completion_for(
+        &self,
+        plugin_id: &str,
+    ) -> Option<ModelCompletionHostServices> {
+        self.plugin_model_completion
+            .get(plugin_id)
+            .or(self.model_completion.as_ref())
             .map(ModelCompletionHostServices::for_plugin_activation)
     }
 

@@ -39,6 +39,8 @@ use agent_core::config::AgentRootConfig;
 use agent_core::event::{
     AgentEvent, AgentEventKind, CompositeEventSink, EventSink, JsonlEventSink,
 };
+#[cfg(feature = "plugins")]
+use agent_core::model::ModelProviderConfig;
 use agent_core::{Agent, ContextLoader};
 #[cfg(feature = "plugins")]
 use agent_plugin_host::manifest::load_plugin_runtime_config;
@@ -371,6 +373,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     }
 
     let application_events: Arc<dyn EventSink> = Arc::new(sink);
+    // 插件默认路由要按名索引网关里已注册的服务商，先留存实际生效的名称。
+    #[cfg(feature = "plugins")]
+    let active_provider_name = options.provider.clone();
     let base_agent = Agent::new(gateway, options)
         .with_tools(native_tools)
         .with_event_sink(Arc::clone(&application_events));
@@ -483,14 +488,32 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             .map(|notice| Msg::new(MsgKind::Info, notice)),
     );
     #[cfg(feature = "plugins")]
+    // 插件默认路由复用主 Agent 实际生效的服务商；配置了专属路由的插件会覆盖它。
+    // 判断依据是 demo_mode 而不是配置是否存在：密钥缺失时主 Agent 也会回退到演示模型，
+    // 此时配置里的服务商并未注册到网关。
+    #[cfg(feature = "plugins")]
+    let plugin_default_provider = match configured_agent.as_ref().filter(|_| !demo_mode) {
+        Some(config) => config.model.to_provider_config()?,
+        // 演示模型由应用直接注册到网关，没有对应的服务商配置，这里只需要它的名称。
+        None => ModelProviderConfig::new(
+            active_provider_name,
+            agent_core::model::ProviderKind::OpenAiCompatible,
+            String::new(),
+        ),
+    };
+    #[cfg(feature = "plugins")]
     let plugin_execution = PluginExecutionContext::new(
         agent_tool::ExecutionPolicy::serve(),
         None,
         tui_settings.review_model.clone(),
+        plugin_default_provider,
         Some(persistent_plugin_state_dir(&lucia_home)),
     )?;
     #[cfg(feature = "plugins")]
     let plugin_agent_runtime = plugin_execution.runtime().clone();
+    // 插件配置与主配置同源；解析失败直接终止启动，避免带着半套路由进入交互。
+    #[cfg(feature = "plugins")]
+    let plugin_configs = crate::plugin::config::load_main_plugin_configs(&config_path)?;
     #[cfg(feature = "plugins")]
     let plugin_load_task = {
         app = app.with_loading_plugins(loading_plugin_ids);
@@ -502,6 +525,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             let result = load_plugins_for_tui(
                 plugin_manifests,
                 capability_selection,
+                plugin_configs,
                 plugin_agent_template,
                 plugin_execution,
                 plugin_workspace_scope,

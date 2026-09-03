@@ -1,9 +1,9 @@
 //! 权限插件真实 WASM Host 路由测试。
 
+use agent_core::model::{ModelProviderConfig, ProviderKind};
 use agent_core::{
-    AgentEvent, AgentEventKind, AgentExtension, AgentRecordEvent, ChatModel, EventBus,
-    ModelGateway, ModelRequest, ModelResponse, PromptCacheRetention, ProviderAdapter,
-    ToolCallEvent,
+    AgentEvent, AgentEventKind, AgentExtension, AgentModelConfig, AgentRecordEvent, ChatModel,
+    EventBus, ModelGateway, ModelRequest, ModelResponse, ProviderAdapter, ToolCallEvent,
 };
 use agent_plugin_host::{
     manifest::TOOL_POLICY_CAPABILITY,
@@ -230,11 +230,15 @@ async fn wasm_host_keeps_component_enterable_after_cancelled_model_import() {
     let services = PluginHostServices::new()
         .with_model_completion(
             gateway,
-            "blocking-permission-review",
-            "review-model",
+            AgentModelConfig::new(
+                ModelProviderConfig::new(
+                    "blocking-permission-review",
+                    ProviderKind::OpenAiCompatible,
+                    "smoke-key",
+                ),
+                "review-model",
+            ),
             128,
-            false,
-            PromptCacheRetention::Short,
         )
         .expect("注入阻塞审批模型");
     let host = Arc::new(
