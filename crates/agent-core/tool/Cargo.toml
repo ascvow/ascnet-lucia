@@ -20,3 +20,7 @@ tokio = { version = "1", optional = true, features = ["fs", "process", "io-util"
 # Shell 超时后按进程组回收整棵进程树，需要向负 PID 发送信号。
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+# 内置工具是异步的，回归测试需要运行时与 `#[tokio::test]` 宏。
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -1,12 +1,14 @@
 //! 内置基础工具集。
 //! Built-in basic tools.
 
+mod edit_file;
 mod list_dir;
 mod read_file;
 mod search;
 mod shell;
 mod write_file;
 
+pub use edit_file::EditFileTool;
 pub use list_dir::ListDirectoryTool;
 pub use read_file::ReadFileTool;
 pub use search::SearchFilesTool;
@@ -27,6 +29,7 @@ use anyhow::Result;
 pub fn register_builtins(registry: &mut ToolRegistry, guard: WorkspaceGuard) -> Result<()> {
     registry.register(ReadFileTool::new(guard.clone()))?;
     registry.register(WriteFileTool::new(guard.clone()))?;
+    registry.register(EditFileTool::new(guard.clone()))?;
     registry.register(ListDirectoryTool::new(guard.clone()))?;
     registry.register(ShellTool::new(guard.clone()))?;
     registry.register(SearchFilesTool::new(guard))?;
@@ -44,6 +47,7 @@ mod tests {
         let specs = [
             ReadFileTool::default().spec(),
             WriteFileTool::default().spec(),
+            EditFileTool::default().spec(),
             ListDirectoryTool::default().spec(),
             ShellTool::default().spec(),
             SearchFilesTool::default().spec(),
@@ -59,6 +63,7 @@ mod tests {
 
         assert!(description("read_file").contains("locate it with search_files first"));
         assert!(description("write_file").contains("does not support partial edits or appends"));
+        assert!(description("edit_file").contains("Prefer this over write_file"));
         assert!(description("list_directory").contains("without recursing"));
         assert!(description("shell").contains("Prefer the dedicated tools"));
         assert!(description("search_files").contains("Regular expressions are not supported"));
