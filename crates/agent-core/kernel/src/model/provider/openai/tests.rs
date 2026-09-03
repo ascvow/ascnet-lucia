@@ -5,7 +5,7 @@ use super::stream::{
     ChatCompletionsStreamState, ResponsesStreamState,
 };
 use super::*;
-use crate::model::{ModelStreamEvent, PromptCacheRetention};
+use crate::model::{GatewayKind, ModelStreamEvent, PromptCacheRetention};
 
 /// 构造带文本、图片和 PDF 的用户消息，覆盖附件转换路径。
 fn attachment_message() -> crate::model::ModelMessage {
@@ -170,7 +170,7 @@ fn responses_reasoning_requests_visible_summary() {
     let mut request = ModelRequest::new("gpt-test", Vec::new());
     request.reasoning = ReasoningLevel::High;
 
-    let body = build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, true)
+    let body = build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, GatewayKind::OpenAi)
         .expect("应构建推理请求");
 
     assert_eq!(
@@ -184,7 +184,7 @@ fn responses_reasoning_requests_visible_summary() {
 fn responses_reasoning_off_omits_reasoning_object() {
     let request = ModelRequest::new("gpt-test", Vec::new());
 
-    let body = build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, true)
+    let body = build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, GatewayKind::OpenAi)
         .expect("应构建普通请求");
 
     assert!(body.get("reasoning").is_none());
@@ -200,9 +200,12 @@ fn provider_options_cannot_override_trusted_output_limits() {
         "max_tokens": 88_888,
         "n": 4
     });
-    let responses_body =
-        build_responses_request(responses_request, RESPONSES_PARAMS_COMPATIBLE, true)
-            .expect("Responses 请求应成功构建");
+    let responses_body = build_responses_request(
+        responses_request,
+        RESPONSES_PARAMS_COMPATIBLE,
+        GatewayKind::OpenAi,
+    )
+    .expect("Responses 请求应成功构建");
 
     let mut chat_request = ModelRequest::new("gpt-test", Vec::new());
     chat_request.max_tokens = Some(256);
@@ -211,8 +214,8 @@ fn provider_options_cannot_override_trusted_output_limits() {
         "max_completion_tokens": 88_888,
         "best_of": 3
     });
-    let chat_body =
-        build_chat_completions_request(chat_request, true).expect("Chat 请求应成功构建");
+    let chat_body = build_chat_completions_request(chat_request, GatewayKind::OpenAi)
+        .expect("Chat 请求应成功构建");
 
     assert_eq!(responses_body["max_output_tokens"], 128);
     assert_eq!(responses_body["max_tokens"], 128);
@@ -235,9 +238,14 @@ fn default_short_cache_sends_session_id_as_cache_key() {
     request.system = Some("系统提示".into());
     request.session_id = Some("session-abc".into());
 
-    let responses = build_responses_request(request.clone(), RESPONSES_PARAMS_COMPATIBLE, true)
-        .expect("Responses 请求应成功构建");
-    let chat = build_chat_completions_request(request, true).expect("Chat 请求应成功构建");
+    let responses = build_responses_request(
+        request.clone(),
+        RESPONSES_PARAMS_COMPATIBLE,
+        GatewayKind::OpenAi,
+    )
+    .expect("Responses 请求应成功构建");
+    let chat =
+        build_chat_completions_request(request, GatewayKind::OpenAi).expect("Chat 请求应成功构建");
 
     assert_eq!(responses["prompt_cache_key"], "session-abc");
     assert_eq!(chat["prompt_cache_key"], "session-abc");
@@ -270,8 +278,8 @@ fn openai_cache_key_tracks_session_only() {
     let other_session = request_for("session-2", "第一轮请求");
 
     let key = |request: ModelRequest| {
-        build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, true).expect("请求应成功构建")
-            ["prompt_cache_key"]
+        build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, GatewayKind::OpenAi)
+            .expect("请求应成功构建")["prompt_cache_key"]
             .as_str()
             .expect("应包含缓存亲和键")
             .to_string()
@@ -286,9 +294,14 @@ fn openai_cache_key_tracks_session_only() {
 fn missing_session_id_omits_openai_cache_key() {
     let request = ModelRequest::new("gpt-test", Vec::new());
 
-    let responses = build_responses_request(request.clone(), RESPONSES_PARAMS_COMPATIBLE, true)
-        .expect("Responses 请求应成功构建");
-    let chat = build_chat_completions_request(request, true).expect("Chat 请求应成功构建");
+    let responses = build_responses_request(
+        request.clone(),
+        RESPONSES_PARAMS_COMPATIBLE,
+        GatewayKind::OpenAi,
+    )
+    .expect("Responses 请求应成功构建");
+    let chat =
+        build_chat_completions_request(request, GatewayKind::OpenAi).expect("Chat 请求应成功构建");
 
     assert!(responses.get("prompt_cache_key").is_none());
     assert!(chat.get("prompt_cache_key").is_none());
@@ -300,8 +313,9 @@ fn oversized_session_id_is_clamped_to_key_limit() {
     let mut request = ModelRequest::new("gpt-test", Vec::new());
     request.session_id = Some("会".repeat(100));
 
-    let responses = build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, true)
-        .expect("Responses 请求应成功构建");
+    let responses =
+        build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, GatewayKind::OpenAi)
+            .expect("Responses 请求应成功构建");
 
     let key = responses["prompt_cache_key"]
         .as_str()
@@ -317,9 +331,14 @@ fn no_cache_retention_omits_openai_cache_fields() {
     // 即使调用方给了会话 ID，关闭缓存时也不得发送缓存键。
     request.session_id = Some("session-abc".into());
 
-    let responses = build_responses_request(request.clone(), RESPONSES_PARAMS_COMPATIBLE, true)
-        .expect("Responses 无缓存请求应成功构建");
-    let chat = build_chat_completions_request(request, true).expect("Chat 无缓存请求应成功构建");
+    let responses = build_responses_request(
+        request.clone(),
+        RESPONSES_PARAMS_COMPATIBLE,
+        GatewayKind::OpenAi,
+    )
+    .expect("Responses 无缓存请求应成功构建");
+    let chat = build_chat_completions_request(request, GatewayKind::OpenAi)
+        .expect("Chat 无缓存请求应成功构建");
 
     assert!(responses.get("prompt_cache_key").is_none());
     assert!(responses.get("prompt_cache_retention").is_none());
@@ -333,9 +352,14 @@ fn long_cache_retention_maps_to_openai_24h() {
     let mut request = ModelRequest::new("gpt-test", Vec::new());
     request.cache_retention = PromptCacheRetention::Long;
 
-    let responses = build_responses_request(request.clone(), RESPONSES_PARAMS_COMPATIBLE, true)
-        .expect("Responses 长缓存请求应成功构建");
-    let chat = build_chat_completions_request(request, true).expect("Chat 长缓存请求应成功构建");
+    let responses = build_responses_request(
+        request.clone(),
+        RESPONSES_PARAMS_COMPATIBLE,
+        GatewayKind::OpenAi,
+    )
+    .expect("Responses 长缓存请求应成功构建");
+    let chat = build_chat_completions_request(request, GatewayKind::OpenAi)
+        .expect("Chat 长缓存请求应成功构建");
 
     assert_eq!(responses["prompt_cache_retention"], "24h");
     assert_eq!(chat["prompt_cache_retention"], "24h");
@@ -350,20 +374,51 @@ fn compatible_gateway_omits_cache_key_unless_long_retention() {
     let mut request = ModelRequest::new("gpt-test", Vec::new());
     request.session_id = Some("session-abc".into());
 
-    let short = build_responses_request(request.clone(), RESPONSES_PARAMS_COMPATIBLE, false)
-        .expect("兼容网关短缓存请求应成功构建");
-    let chat = build_chat_completions_request(request.clone(), false)
+    let short = build_responses_request(
+        request.clone(),
+        RESPONSES_PARAMS_COMPATIBLE,
+        GatewayKind::OpenAiCompatible,
+    )
+    .expect("兼容网关短缓存请求应成功构建");
+    let chat = build_chat_completions_request(request.clone(), GatewayKind::OpenAiCompatible)
         .expect("兼容网关 Chat 请求应成功构建");
     request.cache_retention = PromptCacheRetention::Long;
-    let long = build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, false)
-        .expect("兼容网关长缓存请求应成功构建");
+    let long = build_responses_request(
+        request,
+        RESPONSES_PARAMS_COMPATIBLE,
+        GatewayKind::OpenAiCompatible,
+    )
+    .expect("兼容网关长缓存请求应成功构建");
 
     assert!(short.get("prompt_cache_key").is_none());
     assert!(chat.get("prompt_cache_key").is_none());
     assert_eq!(long["prompt_cache_key"], "session-abc");
 }
 
-/// 会话亲和 header 按配置的网关格式发送，未配置时一个都不加。
+/// 网关厂商决定整套缓存路由约定：官方端点用 body 缓存键，其余网关用亲和 header。
+#[test]
+fn gateway_kind_selects_cache_routing_convention() {
+    assert!(GatewayKind::OpenAi.reads_prompt_cache_key());
+    assert!(!GatewayKind::OpenAiCompatible.reads_prompt_cache_key());
+    assert!(!GatewayKind::OpenRouter.reads_prompt_cache_key());
+
+    assert_eq!(GatewayKind::OpenAi.session_affinity(), SessionAffinity::Off);
+    assert_eq!(
+        GatewayKind::Anthropic.session_affinity(),
+        SessionAffinity::Off
+    );
+    assert_eq!(
+        GatewayKind::OpenRouter.session_affinity(),
+        SessionAffinity::OpenRouter
+    );
+    // 缺省的通用兼容网关必须拿到亲和 header，否则完全没有会话级缓存路由。
+    assert_eq!(
+        GatewayKind::default().session_affinity(),
+        SessionAffinity::OpenAi
+    );
+}
+
+/// 会话亲和 header 按网关格式发送，`Off` 时一个都不加。
 #[test]
 fn session_affinity_headers_follow_configured_format() {
     let base = HeaderMap::new();
@@ -394,7 +449,7 @@ fn provider_options_can_supply_openai_cache_affinity() {
     let mut request = ModelRequest::new("gpt-test", Vec::new());
     request.provider_options = json!({"prompt_cache_key": "stable-session"});
 
-    let body = build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, true)
+    let body = build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, GatewayKind::OpenAi)
         .expect("兼容网关缓存路由请求应成功构建");
 
     assert_eq!(body["prompt_cache_key"], "stable-session");

@@ -19,9 +19,9 @@ use super::support::{
     header_map, merge_provider_options,
 };
 use crate::model::{
-    ChatModel, ContentBlock, FinishReason, MessageRole, ModelEventStream, ModelProviderConfig,
-    ModelRequest, ModelResponse, ProviderAdapter, ProviderBilling, ProviderKind, ReasoningLevel,
-    SessionAffinity, TokenUsage, ToolChoice,
+    ChatModel, ContentBlock, FinishReason, GatewayKind, MessageRole, ModelEventStream,
+    ModelProviderConfig, ModelRequest, ModelResponse, ProviderAdapter, ProviderBilling,
+    ProviderKind, ReasoningLevel, SessionAffinity, TokenUsage, ToolChoice,
 };
 use agent_tool::{ToolCall, ToolSpec};
 use anyhow::{anyhow, Context, Result};
@@ -167,10 +167,8 @@ pub struct OpenAiResponsesAdapter {
     extra_headers: HeaderMap,
     /// 当前 provider 支持的 Responses API 参数白名单。
     allowed_params: &'static [&'static str],
-    /// 是否为官方 OpenAI 端点，决定是否默认发送 `prompt_cache_key`。
-    official_endpoint: bool,
-    /// 会话亲和 header 格式。
-    session_affinity: SessionAffinity,
+    /// 目标网关厂商，决定缓存键与会话亲和 header 的约定。
+    gateway: GatewayKind,
 }
 
 impl OpenAiResponsesAdapter {
@@ -178,15 +176,13 @@ impl OpenAiResponsesAdapter {
     pub fn new(config: ModelProviderConfig) -> Result<Self> {
         let base_url = normalize_openai_base_url(config.base_url)?;
         let allowed_params = responses_allowed_params(&config.kind, &base_url);
-        let official_endpoint = is_official_openai_url(&base_url);
         Ok(Self {
             client: reqwest::Client::new(),
             base_url,
             api_key: config.api_key,
             extra_headers: header_map(config.extra_headers)?,
             allowed_params,
-            official_endpoint,
-            session_affinity: config.session_affinity,
+            gateway: config.gateway,
         })
     }
 }
@@ -196,10 +192,10 @@ impl ChatModel for OpenAiResponsesAdapter {
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse> {
         let headers = session_affinity_headers(
             &self.extra_headers,
-            self.session_affinity,
+            self.gateway.session_affinity(),
             req.session_id.as_deref(),
         );
-        let body = build_responses_request(req, self.allowed_params, self.official_endpoint)?;
+        let body = build_responses_request(req, self.allowed_params, self.gateway)?;
         let url = endpoint_url(&self.base_url, "/responses");
         let response = self
             .client
@@ -221,14 +217,13 @@ impl ChatModel for OpenAiResponsesAdapter {
     async fn stream(&self, req: ModelRequest) -> ModelEventStream {
         let headers = session_affinity_headers(
             &self.extra_headers,
-            self.session_affinity,
+            self.gateway.session_affinity(),
             req.session_id.as_deref(),
         );
-        let mut body =
-            match build_responses_request(req, self.allowed_params, self.official_endpoint) {
-                Ok(body) => body,
-                Err(error) => return failed_model_stream(error),
-            };
+        let mut body = match build_responses_request(req, self.allowed_params, self.gateway) {
+            Ok(body) => body,
+            Err(error) => return failed_model_stream(error),
+        };
         body["stream"] = json!(true);
         spawn_openai_stream(
             self.client.clone(),
@@ -258,24 +253,19 @@ pub struct OpenAiChatCompletionsAdapter {
     base_url: String,
     api_key: String,
     extra_headers: HeaderMap,
-    /// 是否为官方 OpenAI 端点，决定是否默认发送 `prompt_cache_key`。
-    official_endpoint: bool,
-    /// 会话亲和 header 格式。
-    session_affinity: SessionAffinity,
+    /// 目标网关厂商，决定缓存键与会话亲和 header 的约定。
+    gateway: GatewayKind,
 }
 
 impl OpenAiChatCompletionsAdapter {
     /// 创建适配器。
     pub fn new(config: ModelProviderConfig) -> Result<Self> {
-        let base_url = normalize_openai_base_url(config.base_url)?;
-        let official_endpoint = is_official_openai_url(&base_url);
         Ok(Self {
             client: reqwest::Client::new(),
-            base_url,
+            base_url: normalize_openai_base_url(config.base_url)?,
             api_key: config.api_key,
             extra_headers: header_map(config.extra_headers)?,
-            official_endpoint,
-            session_affinity: config.session_affinity,
+            gateway: config.gateway,
         })
     }
 }
@@ -285,10 +275,10 @@ impl ChatModel for OpenAiChatCompletionsAdapter {
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse> {
         let headers = session_affinity_headers(
             &self.extra_headers,
-            self.session_affinity,
+            self.gateway.session_affinity(),
             req.session_id.as_deref(),
         );
-        let body = build_chat_completions_request(req, self.official_endpoint)?;
+        let body = build_chat_completions_request(req, self.gateway)?;
         let url = endpoint_url(&self.base_url, "/chat/completions");
         let response = self
             .client
@@ -310,10 +300,10 @@ impl ChatModel for OpenAiChatCompletionsAdapter {
     async fn stream(&self, req: ModelRequest) -> ModelEventStream {
         let headers = session_affinity_headers(
             &self.extra_headers,
-            self.session_affinity,
+            self.gateway.session_affinity(),
             req.session_id.as_deref(),
         );
-        let mut body = match build_chat_completions_request(req, self.official_endpoint) {
+        let mut body = match build_chat_completions_request(req, self.gateway) {
             Ok(body) => body,
             Err(error) => return failed_model_stream(error),
         };
@@ -350,11 +340,11 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
 fn build_responses_request(
     req: ModelRequest,
     allowed_params: &[&str],
-    official_endpoint: bool,
+    gateway: GatewayKind,
 ) -> Result<Value> {
     let trusted_max_tokens = req.max_tokens;
     let cache_retention = req.cache_retention;
-    let prompt_cache_key = openai_prompt_cache_key(&req, official_endpoint);
+    let prompt_cache_key = openai_prompt_cache_key(&req, gateway);
     let mut body = json!({
         "model": &req.model,
         "input": messages_to_responses_input(&req.messages)?,
@@ -406,10 +396,10 @@ fn build_responses_request(
     Ok(body)
 }
 
-fn build_chat_completions_request(req: ModelRequest, official_endpoint: bool) -> Result<Value> {
+fn build_chat_completions_request(req: ModelRequest, gateway: GatewayKind) -> Result<Value> {
     let trusted_max_tokens = req.max_tokens;
     let cache_retention = req.cache_retention;
-    let prompt_cache_key = openai_prompt_cache_key(&req, official_endpoint);
+    let prompt_cache_key = openai_prompt_cache_key(&req, gateway);
     let mut messages = Vec::new();
 
     if let Some(system) = req.system {
@@ -455,15 +445,15 @@ fn build_chat_completions_request(req: ModelRequest, official_endpoint: bool) ->
 /// 天然把不同会话区分开，而任何按内容推导的键都会随消息或工具变化而改变，把同一会话的
 /// 连续请求路由到不同机器，缓存全部落空。
 ///
-/// 只有官方 OpenAI 端点默认发送该字段。兼容网关大多不认这个 body 参数，它们的缓存路由
-/// 走会话亲和 header；对它们只在显式要求长期缓存时才发送，避免把未知字段推给网关。
+/// 只有读取该字段的网关才会收到它。兼容网关大多忽略这个 OpenAI 专有参数，缓存路由走
+/// 会话亲和 header；对它们只在显式要求长期缓存时才发送，避免把未知字段推给网关。
 /// 关闭缓存或调用方未提供会话 ID 时同样不发送。
-fn openai_prompt_cache_key(req: &ModelRequest, official_endpoint: bool) -> Option<String> {
+fn openai_prompt_cache_key(req: &ModelRequest, gateway: GatewayKind) -> Option<String> {
     let retention = req.cache_retention;
     if retention == crate::model::PromptCacheRetention::None {
         return None;
     }
-    if !official_endpoint && retention != crate::model::PromptCacheRetention::Long {
+    if !gateway.reads_prompt_cache_key() && retention != crate::model::PromptCacheRetention::Long {
         return None;
     }
     req.session_id.as_deref().map(clamp_prompt_cache_key)

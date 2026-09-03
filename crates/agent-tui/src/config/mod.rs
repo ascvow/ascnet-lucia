@@ -34,10 +34,9 @@ api_key = ""
 # api_key_env = "OPENAI_API_KEY"
 # context_window = 200000
 openai_protocol = "responses"
-# 兼容网关多按 HTTP header 做提示缓存路由；按网关文档选择格式后开启。
-# open-ai 发送 session_id、x-client-request-id、x-session-affinity；
-# open-ai-no-session 只发送后两个；open-router 发送 x-session-id。
-# session_affinity = "open-ai"
+# 网关厂商，决定提示缓存的路由方式：官方 open-ai 用请求体里的 prompt_cache_key，
+# open-router 与缺省的 open-ai-compatible 用会话亲和 HTTP header。
+# gateway = "open-ai-compatible"
 
 [agent]
 # 0 表示交互主会话不设置总 ReAct 步数上限。

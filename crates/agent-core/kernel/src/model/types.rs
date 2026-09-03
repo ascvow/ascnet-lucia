@@ -405,10 +405,46 @@ pub enum PromptCacheRetention {
     Long,
 }
 
-/// 服务商侧会话亲和 header 的格式。
+/// 目标网关的厂商类型。
 ///
-/// 兼容网关通常不读 body 里的 `prompt_cache_key`，而是按 HTTP header 把同一会话的请求
-/// 固定路由到持有其前缀缓存的副本。格式由网关决定，因此必须由配置显式声明。
+/// 各家网关的提示缓存路由约定互不相同：官方 OpenAI 读 body 里的 `prompt_cache_key`，
+/// OpenRouter 和多数兼容网关只认 HTTP header，且 header 名称还不一样。调用方声明网关
+/// 厂商，适配器据此选择整套缓存行为，不需要逐项配置。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GatewayKind {
+    /// 官方 OpenAI API。
+    OpenAi,
+    /// OpenRouter 聚合网关。
+    OpenRouter,
+    /// 官方 Anthropic API。
+    Anthropic,
+    /// 其他 OpenAI 协议兼容网关；自建代理与第三方中转都归到这一类。
+    #[default]
+    OpenAiCompatible,
+}
+
+impl GatewayKind {
+    /// 返回该网关使用的会话亲和 header 格式。
+    pub fn session_affinity(self) -> SessionAffinity {
+        match self {
+            // 官方端点按 body 里的 prompt_cache_key 路由，额外 header 没有作用。
+            Self::OpenAi | Self::Anthropic => SessionAffinity::Off,
+            Self::OpenRouter => SessionAffinity::OpenRouter,
+            Self::OpenAiCompatible => SessionAffinity::OpenAi,
+        }
+    }
+
+    /// 返回该网关是否读取 body 中的 `prompt_cache_key`。
+    ///
+    /// 兼容网关大多忽略这个 OpenAI 专有字段，缓存路由完全依赖 header；对它们照发只是把
+    /// 未知字段推给网关，没有收益。
+    pub fn reads_prompt_cache_key(self) -> bool {
+        matches!(self, Self::OpenAi)
+    }
+}
+
+/// 服务商侧会话亲和 header 的格式，由 [`GatewayKind`] 决定。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionAffinity {

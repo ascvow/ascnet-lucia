@@ -4,8 +4,8 @@
 use crate::{
     agent::{Agent, AgentModelConfig, AgentOptions},
     model::{
-        ModelGateway, ModelProviderConfig, OpenAiProtocol, PromptCacheRetention, ProviderKind,
-        ReasoningLevel, SessionAffinity,
+        GatewayKind, ModelGateway, ModelProviderConfig, OpenAiProtocol, PromptCacheRetention,
+        ProviderKind, ReasoningLevel,
     },
 };
 use anyhow::{anyhow, Context, Result};
@@ -144,12 +144,11 @@ pub struct ModelConfig {
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
 
-    /// 会话亲和 header 格式：off、open-ai、open-ai-no-session、open-router。
+    /// 网关厂商：open-ai、open-router、anthropic、open-ai-compatible。
     ///
-    /// 兼容网关多数按 header 做提示缓存路由；官方 OpenAI 端点用 body 里的
-    /// `prompt_cache_key`，无需开启。
+    /// 决定提示缓存键与会话亲和 header 的约定；缺省按通用 OpenAI 兼容网关处理。
     #[serde(default)]
-    pub session_affinity: SessionAffinity,
+    pub gateway: GatewayKind,
 }
 
 impl ModelConfig {
@@ -175,7 +174,7 @@ impl ModelConfig {
             base_url: self.base_url.clone(),
             openai_protocol: self.openai_protocol.clone(),
             extra_headers: self.extra_headers.clone(),
-            session_affinity: self.session_affinity,
+            gateway: self.gateway,
         })
     }
 }

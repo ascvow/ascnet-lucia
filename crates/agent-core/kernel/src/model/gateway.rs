@@ -1,7 +1,7 @@
 //! ModelGateway routes provider-neutral requests to concrete protocol adapters.
 //! ModelGateway 把与服务商无关的请求路由到具体协议适配器。
 
-use super::{ChatModel, ModelRequest, ModelResponse, ProviderAdapter, SessionAffinity};
+use super::{ChatModel, GatewayKind, ModelRequest, ModelResponse, ProviderAdapter};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -62,12 +62,12 @@ pub struct ModelProviderConfig {
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
 
-    /// 会话亲和 header 格式；默认不发送。
+    /// 目标网关厂商；决定提示缓存键与会话亲和 header 的整套约定。
     ///
-    /// 兼容网关多数按 header 而不是 `prompt_cache_key` 做提示缓存路由，但 header 名称
-    /// 各不相同，发错反而可能被网关拒绝，因此必须由调用方按网关文档显式声明。
+    /// 默认按通用 OpenAI 兼容网关处理。指向官方 OpenAI 或 OpenRouter 时应如实声明，
+    /// 否则会按错误的约定发送缓存路由信息。
     #[serde(default)]
-    pub session_affinity: SessionAffinity,
+    pub gateway: GatewayKind,
 }
 
 impl ModelProviderConfig {
@@ -81,13 +81,13 @@ impl ModelProviderConfig {
             base_url: None,
             openai_protocol: OpenAiProtocol::default(),
             extra_headers: HashMap::new(),
-            session_affinity: SessionAffinity::default(),
+            gateway: GatewayKind::default(),
         }
     }
 
-    /// 声明服务商侧会话亲和 header 的格式。
-    pub fn with_session_affinity(mut self, session_affinity: SessionAffinity) -> Self {
-        self.session_affinity = session_affinity;
+    /// 声明目标网关厂商，决定提示缓存路由约定。
+    pub fn with_gateway(mut self, gateway: GatewayKind) -> Self {
+        self.gateway = gateway;
         self
     }
 
