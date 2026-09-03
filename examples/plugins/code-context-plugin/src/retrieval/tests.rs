@@ -429,3 +429,121 @@ fn text_tier_chunks_are_lexical_only() {
     let found = retrieval.search_lexical("审批流程", None, 10);
     assert_any(&labels(&index, &found), "docs/guide.md");
 }
+
+// ---------------------------------------------------------------------------
+// 语义通道接入
+// ---------------------------------------------------------------------------
+
+/// 构造一个覆盖固定装置全部 chunk 的语义索引。
+///
+/// 向量按 chunk 顺序取单位基向量，使"哪条最相似"完全可控——这里验证的是通道接线，
+/// 不是嵌入质量，用可预测的向量才能把断言写死。
+fn semantic_fixture(index: &crate::index::StructuralIndex) -> crate::semantic::SemanticIndex {
+    let space = crate::model::EmbeddingSpace {
+        provider_type: "api".to_string(),
+        provider_id: "test-endpoint".to_string(),
+        model: "test-model".to_string(),
+        model_revision: String::new(),
+        dimension: 8,
+        normalization: true,
+        query_template_version: 1,
+        document_template_version: 1,
+    };
+    let mut semantic = crate::semantic::SemanticIndex::with_space(space);
+    for (position, chunk) in index.chunks().enumerate().take(8) {
+        let mut vector = vec![0.0f32; 8];
+        vector[position] = 1.0;
+        semantic.upsert(&chunk.id, &chunk.file_path, &vector);
+    }
+    semantic
+}
+
+/// 语义通道必须能把一条只有向量命中的结果带进融合结果。
+#[test]
+fn semantic_channel_contributes_to_fusion() {
+    let (index, retrieval) = fixture_index();
+    let semantic = semantic_fixture(&index);
+    let target = index.chunks().next().expect("应有 chunk").id.clone();
+
+    // 构造与首个 chunk 完全同向的查询向量。
+    let mut query_vector = vec![0.0f32; 8];
+    query_vector[0] = 1.0;
+
+    let results = retrieval.search_hybrid(
+        &index,
+        &semantic,
+        "完全无关的查询词",
+        Some(&query_vector),
+        None,
+        10,
+    );
+
+    assert!(
+        results.iter().any(|result| result.chunk_id == target),
+        "语义命中必须进入融合结果"
+    );
+}
+
+/// 没有查询向量时，结果必须与两路检索完全一致。
+#[test]
+fn absent_query_vector_degrades_to_two_channels() {
+    let (index, retrieval) = fixture_index();
+    let semantic = semantic_fixture(&index);
+
+    let hybrid = retrieval.search_hybrid(&index, &semantic, "permission check", None, None, 10);
+    let baseline = retrieval.search(&index, "permission check", None, 10);
+
+    assert_eq!(
+        hybrid.iter().map(|r| &r.chunk_id).collect::<Vec<_>>(),
+        baseline.iter().map(|r| &r.chunk_id).collect::<Vec<_>>(),
+        "嵌入缺席不应改变检索结果"
+    );
+}
+
+/// 语义索引未就绪时必须安全退化，而不是返回空结果。
+#[test]
+fn unready_semantic_index_degrades_safely() {
+    let (index, retrieval) = fixture_index();
+    let empty = crate::semantic::SemanticIndex::new();
+    let query_vector = vec![1.0f32; 8];
+
+    let results =
+        retrieval.search_hybrid(&index, &empty, "permission", Some(&query_vector), None, 10);
+
+    assert!(!results.is_empty(), "语义未就绪不应让检索返回空");
+}
+
+/// 维度不符的查询向量必须被语义通道拒绝，而不是污染排序。
+#[test]
+fn mismatched_vector_dimension_is_ignored() {
+    let (index, retrieval) = fixture_index();
+    let semantic = semantic_fixture(&index);
+    // 库内是 8 维，这里给 4 维。
+    let wrong = vec![1.0f32; 4];
+
+    let results = retrieval.search_hybrid(&index, &semantic, "permission", Some(&wrong), None, 10);
+    let baseline = retrieval.search(&index, "permission", None, 10);
+
+    assert_eq!(
+        results.iter().map(|r| &r.chunk_id).collect::<Vec<_>>(),
+        baseline.iter().map(|r| &r.chunk_id).collect::<Vec<_>>(),
+        "维度不符应等同于语义通道缺席"
+    );
+}
+
+/// 三路融合的候选必须带上语义通道来源，供内部诊断区分。
+#[test]
+fn semantic_candidates_declare_their_source() {
+    let (index, retrieval) = fixture_index();
+    let semantic = semantic_fixture(&index);
+    let mut query_vector = vec![0.0f32; 8];
+    query_vector[0] = 1.0;
+
+    let channels =
+        retrieval.search_all_with_semantic(&semantic, "permission", Some(&query_vector), None, 10);
+
+    assert_eq!(channels.len(), 3, "应有符号、词法、语义三路");
+    assert!(channels[2]
+        .iter()
+        .all(|candidate| candidate.source == CandidateSource::Semantic));
+}

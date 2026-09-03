@@ -147,7 +147,7 @@ fn returned_lines_do_not_repeat() {
 /// 相邻区间必须被合并成一段。
 #[test]
 fn adjacent_ranges_are_merged() {
-    let (host, index, _) = fixture(FIXTURE);
+    let (_host, index, _) = fixture(FIXTURE);
     let chunk = index
         .chunks()
         .find(|chunk| chunk.qualified_symbol.as_deref() == Some("PermissionManager::check"))

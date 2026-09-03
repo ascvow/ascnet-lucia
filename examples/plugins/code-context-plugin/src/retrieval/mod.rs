@@ -31,6 +31,7 @@ pub use tokenize::tokenize;
 
 use crate::index::StructuralIndex;
 use crate::model::CodeChunk;
+use crate::semantic::SemanticIndex;
 use lexical::LexicalIndex;
 use symbol::SymbolIndex;
 
@@ -197,6 +198,34 @@ impl RetrievalIndex {
             .collect()
     }
 
+    /// 执行语义检索。
+    ///
+    /// `semantic` 未就绪或查询向量与库内向量维度不符时返回空列表——空通道对 RRF 是
+    /// 合法输入，融合结果退化为词法与符号两路，这正是降级形态。
+    pub fn search_semantic(
+        &self,
+        semantic: &SemanticIndex,
+        query_vector: &[f32],
+        path_scope: Option<&str>,
+        limit: usize,
+    ) -> Vec<SearchCandidate> {
+        if !semantic.is_ready() {
+            return Vec::new();
+        }
+        semantic
+            .search(query_vector, path_scope, limit)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (chunk_id, score))| SearchCandidate {
+                chunk_id: chunk_id.to_string(),
+                source: CandidateSource::Semantic,
+                rank: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                score,
+                symbol_match: None,
+            })
+            .collect()
+    }
+
     /// 同时执行两路检索，返回各自**未经融合**的候选列表。
     ///
     /// 这是融合层的输入，也是内部检索诊断的数据来源：想知道"这条结果从哪来"，
@@ -211,6 +240,28 @@ impl RetrievalIndex {
             self.search_symbols(query, path_scope, limit),
             self.search_lexical(query, path_scope, limit),
         ]
+    }
+
+    /// 执行三路检索，语义通道缺席时自动退化为两路。
+    ///
+    /// `query_vector` 为 `None` 表示嵌入不可用（未配置 provider、端点失败或索引未建），
+    /// 此时结果与 [`RetrievalIndex::search_all`] 完全一致。
+    pub fn search_all_with_semantic(
+        &self,
+        semantic: &SemanticIndex,
+        query: &str,
+        query_vector: Option<&[f32]>,
+        path_scope: Option<&str>,
+        limit: usize,
+    ) -> Vec<Vec<SearchCandidate>> {
+        let mut channels = self.search_all(query, path_scope, limit);
+        if let Some(vector) = query_vector {
+            let candidates = self.search_semantic(semantic, vector, path_scope, limit);
+            if !candidates.is_empty() {
+                channels.push(candidates);
+            }
+        }
+        channels
     }
 
     /// 执行混合检索：多路候选 → RRF 融合 → 稳定排序。
@@ -241,5 +292,34 @@ impl RetrievalIndex {
         // 各通道取比最终结果更多的候选，否则融合退化成简单拼接。
         let channels = self.search_all(query, path_scope, fusion::candidate_limit(limit));
         fusion::fuse(&channels, query, index, config, limit)
+    }
+
+    /// 执行含语义通道的三路混合检索。
+    ///
+    /// `query_vector` 为 `None` 时结果与 [`RetrievalIndex::search`] 完全一致——RRF 在任意
+    /// 通道子集上都成立，因此嵌入不可用不影响检索可用性，只影响召回质量。
+    pub fn search_hybrid(
+        &self,
+        index: &StructuralIndex,
+        semantic: &SemanticIndex,
+        query: &str,
+        query_vector: Option<&[f32]>,
+        path_scope: Option<&str>,
+        limit: usize,
+    ) -> Vec<SearchResult> {
+        let channels = self.search_all_with_semantic(
+            semantic,
+            query,
+            query_vector,
+            path_scope,
+            fusion::candidate_limit(limit),
+        );
+        fusion::fuse(
+            &channels,
+            query,
+            index,
+            &FusionConfig::default(),
+            limit,
+        )
     }
 }

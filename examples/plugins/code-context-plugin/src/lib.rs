@@ -31,6 +31,7 @@ mod model;
 mod parser;
 mod repository;
 mod retrieval;
+mod semantic;
 mod storage;
 mod tool;
 
