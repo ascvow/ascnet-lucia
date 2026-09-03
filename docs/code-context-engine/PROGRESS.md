@@ -7,7 +7,7 @@
 
 ## Current Phase
 
-Phase 6 — Embedding Abstraction
+Phase 9 — Hybrid Retrieval
 
 Status: NOT_STARTED
 
@@ -19,7 +19,7 @@ Status: NOT_STARTED
 - [x] Phase 3 — Structural Parsing
 - [x] Phase 4 — Structural Index
 - [x] Phase 5 — Lexical & Symbol Retrieval
-- [ ] Phase 6 — Embedding Abstraction
+- [x] Phase 6 — Embedding Abstraction
 - [ ] Phase 7 — API Embedding Provider — **BLOCKED**（Host 无 HTTP 能力）
 - [ ] Phase 8 — Semantic Vector Index — **BLOCKED**（依赖 Phase 7 与 blob 存储）
 - [ ] Phase 9 — Hybrid Retrieval
@@ -479,6 +479,77 @@ Known limitations:
 
 Next: Phase 6 — Embedding Abstraction
 
+---
+
+### Phase 6 — Embedding Abstraction
+
+Status: COMPLETE
+Completed Date: 2026-09-03
+
+Summary：把语义层的边界补齐到可以接入真实 provider 的程度。Phase 1 已冻结
+`EmbeddingProvider::space` / `embed`、`EmbeddingSpace` 与 `embedding_space_id`，
+**本阶段是补齐而非重做**：围绕这两个必需方法加默认实现，让分批、维度校验与降级判断
+对所有 provider 一致。
+
+Implemented:
+- **最小实现契约**：provider 只需实现 `space()` 与 `embed()`；`provider_id` / `model_id` /
+  `dimension` 全部从嵌入空间派生，不重复保存状态。新增 provider 的成本是两个方法。
+- **`embed_documents` / `embed_query` 分离**，并自动按 `max_batch_size` 分批。两者分开是
+  因为提示模板不同，而模板版本参与嵌入空间标识——混用会让查询向量与文档向量不可比较。
+  测试验证同一段文本作为查询与作为文档得到**不同**向量。
+- **返回值校验**（`embed_batched`）：条数与维度不符即报错。向量与 chunk 是按下标对齐的，
+  provider 少返回一条会让后面全部向量错位挂到别的 chunk 上——**这种错误不会让检索失败，
+  只会让结果长期缓慢地不正确**，是最难发现的一类 bug。在抽象层一次挡住比让每个 provider
+  各自记得检查可靠。
+- **`health_check()`**：使降级判断不必等到第一次真正嵌入失败才发生。默认实现检查是否声明
+  嵌入空间；真实 provider 应覆盖为轻量探测。
+- **`select_provider(config)`**：provider 选择集中到一处，Phase 7 / 12 接入时只改这里。
+  **刻意不提供"选不到就用 Mock"的回退。**
+- **`EmbeddingSpace::is_compatible_with`**：比较完整标识而不是维度。
+- **`MockEmbeddingProvider`**（`#[cfg(test)]`）：确定性伪向量，用于在真实 provider 缺席时
+  验证接口契约本身。带 `cfg(test)` 因此不会编译进插件产物，也无法被 `select_provider` 选中。
+
+Key files:
+- `examples/plugins/code-context-plugin/src/embedding.rs` — provider 契约、分批校验、选择、mock
+- `.../src/model.rs` — `EmbeddingSpace::is_compatible_with` 与兼容性测试
+
+Tests：新增 19 个，插件单测总数 207 → 226。
+
+覆盖：派生元数据、批量顺序与条数对应、确定性、查询与文档模板分离、自动分批、
+批大小为 0、空输入、少返回向量被拒、错误维度被拒、失败降级、归一化单位向量、
+trait 对象可用、伪向量分布合理、provider 选择遵循配置、未配置 provider 健康检查失败。
+
+**嵌入空间兼容性**（DoD 明确要求）：
+- `same_dimension_different_model_is_incompatible` — 两个 1024 维空间因模型不同判定为不兼容。
+- `every_space_field_affects_compatibility` — 八个字段逐一变化都必须打破兼容性。
+- `switching_model_invalidates_the_space_even_at_same_dimension` — 从 provider 侧验证同一条。
+- `switching_embedding_space_rebuilds_semantics_only` — 换空间只触发语义重建，结构索引保留。
+
+Tests Executed / Result:
+- `cargo test --offline -p code-context-plugin`：226 单元测试 + 1 文档测试，全通过。
+- `cargo clippy --offline -p code-context-plugin --all-targets`：无警告。
+- `bun run test:plugin:code-context`：全链通过（单测 → WASM release 构建 → 8 个 smoke test）。
+
+Build Result：`wasm32-wasip2` release 构建成功，无 regression。
+
+Important decisions:
+1. **补齐而非重做冻结接口。** `space()` 与 `embed()` 保持原样，新增能力全部走默认方法。
+   重新设计已冻结的契约会让 Phase 1 的 smoke test 与 manifest 兼容判断一并失效。
+2. **维度校验放在抽象层。** 这是 Phase 7 DoD 明确要求的检查项之一；放在抽象层意味着
+   Api 与 Local 两个 provider 都自动获得，不会有一个忘记做。
+3. **Mock 严格限定在测试中。** 生产路径上"绝不返回伪造向量"的约束从骨架阶段延续至今。
+4. **兼容性比较完整标识而不是维度。** 这是语义索引最容易犯且最难发现的错误。
+
+Known limitations:
+- **没有真实 provider 可测。** 本阶段验证的是接口契约，不是任何真实嵌入质量。
+  Phase 7 / 12 被宿主能力阻塞，见 Blocked Phases。
+- `health_check` 的默认实现只检查是否声明空间，不做真实探测——真实探测要等 provider 落地。
+- 提示模板本身尚未定义（只有版本号参与空间标识）。模板内容属于 Phase 7 / 12 的 provider 实现。
+- 语义管线的**下游**（向量索引、语义检索）属于 Phase 8，当前被阻塞，因此本阶段只能验证
+  provider 边界，无法端到端验证"语义管线"。
+
+Next: Phase 9 — Hybrid Retrieval（Phase 7 / 8 被阻塞，按既定顺序跳过）
+
 ## Blocked Phases
 
 三个阶段因 Host 能力缺失无法实现。按开发任务书 §25，记录 Blocker 而**不绕开架构做 hack 实现**。
@@ -575,13 +646,13 @@ Recommended solution：方案 1。在此之前产品显示 `Local Mode: NOT SUPP
 
 ## Active Work
 
-Phase 6 — Embedding Abstraction。目标是建立 Semantic Layer 的稳定边界。
-Phase 1 已冻结 `EmbeddingProvider`、`EmbeddingSpace` 与 `UnconfiguredEmbeddingProvider`，
-本阶段补齐 `MockEmbeddingProvider`、provider 选择与嵌入空间兼容性测试。
+Phase 9 — Hybrid Retrieval。Phase 7 与 Phase 8 被宿主能力阻塞（见 Blocked Phases），
+按既定执行顺序跳过，直接进入融合层。目标是把符号与词法两路候选融合成稳定排序，
+且融合层从一开始就按「任意子集」设计，使语义分支将来接入时无需重构。
 
 ## Known Issues
 
-无。Phase 1–5 全部验证通过，未发现 regression。
+无。Phase 1–6 全部验证通过，未发现 regression。
 
 Phase 2 遗留的真实 Host 验证已在 Phase 4 补齐：
 `wasm_host_scans_nested_directories_and_builds_index` 覆盖三层嵌套目录、多语言解析与忽略规则。
@@ -647,22 +718,21 @@ Tier 3  文本分块              —— 未覆盖语言、解析失败、无声
 
 ## Next Action
 
-开始 Phase 6 — Embedding Abstraction：
+开始 Phase 9 — Hybrid Retrieval。**Phase 7 与 Phase 8 被宿主能力阻塞，按既定执行顺序跳过。**
 
-1. Phase 1 已冻结 `EmbeddingProvider`、`EmbeddingSpace`、`embedding_space_id` 与
-   `UnconfiguredEmbeddingProvider`。**不要重新设计这些接口**，本阶段是补齐而非重做。
-2. 新增 `MockEmbeddingProvider`：产出确定性的伪向量，用于在没有真实 provider 的情况下
-   完整测试语义管线接口。**它只能出现在测试中**，绝不可被生产路径选中——
-   骨架阶段确立的"不返回伪造向量"约束依然有效。
-3. 明确区分 `embed_documents` 与 `embed_query`，支持 batching 语义。
-4. Provider 选择与配置：按 `embedding_mode` 选择实现，Api / Local 两个分支目前都返回
-   "能力不可用"错误（Host 缺 HTTP 与 embedding 能力，见 Blocked Phases）。
-5. **嵌入空间兼容性必须测试**：维度相同但 provider / model / 归一化不同的两个空间
-   必须判定为不兼容。禁止"两个模型都是 1024 维就认为向量可比"。
-6. 本阶段**不做** Local 模型，API 也不做真实网络调用——那是 Phase 7 / 12 且当前被阻塞。
+1. 新建 `examples/plugins/code-context-plugin/src/retrieval/fusion.rs`。
+2. 实现 **RRF**（Reciprocal Rank Fusion）：`score = Σ 1 / (k + rank)`，k 取常用的 60。
+   Phase 5 的 `SearchCandidate` 已带通道内排名，正是为此准备。
+3. **融合层必须能在任意通道子集上工作**——当前只有符号 + 词法两路，语义分支缺席时
+   不能退化或报错。这是架构第 13 问的硬性要求，也是选 RRF 而非加权分数融合的原因。
+4. 允许有限的、**集中配置**的加权：精确符号提升、路径提升。
+   **不得散落 magic constant**——全部常量集中在一处并写明依据。
+5. 实现内部 `retrieval debug`：能看到各通道候选与融合分数。
+   **不得作为正常 Agent Tool 暴露**（任务书 §9）。
+6. 产出稳定的 `SearchResult[]`（内部形态），供 Phase 10 的上下文打包消费。
 
-Definition of Done：可以通过 `MockEmbeddingProvider` 完整测试语义管线的接口边界，
-且嵌入空间兼容性判定有测试覆盖。
+Definition of Done：融合结果稳定确定，单通道缺席时正常工作，
+精确符号匹配不会被词法结果挤下去，并有单元与集成测试覆盖。
 
 ---
 

@@ -43,7 +43,10 @@ use agent_plugin::{
 use serde_json::json;
 
 pub use config::{CodeContextConfig, EmbeddingMode};
-pub use embedding::{EmbeddingInputKind, EmbeddingProvider, UnconfiguredEmbeddingProvider};
+pub use embedding::{
+    select_provider, EmbeddingInputKind, EmbeddingProvider, UnconfiguredEmbeddingProvider,
+    DEFAULT_MAX_BATCH_SIZE,
+};
 pub use error::CodeContextError;
 pub use index::{FileRecord, IndexBuild, IndexStats, StructuralIndex, BUILD_BUDGET};
 pub use model::{
@@ -132,12 +135,11 @@ impl CodeContextPlugin {
 
     /// 返回当前生效的嵌入 provider。
     ///
-    /// 两种模式的真实实现都尚未存在，因此这里始终返回未配置 provider。返回类型保持
-    /// trait 对象，使 Phase 9 与 Phase 12 接入真实实现时调用方不需要改动。
+    /// 选择逻辑集中在 [`embedding::select_provider`]：两种模式当前都被宿主能力阻塞，
+    /// 因此都返回未配置 provider。返回类型保持 trait 对象，使 Phase 7 与 Phase 12
+    /// 接入真实实现时调用方不需要改动。
     pub fn embedding_provider(&self) -> Box<dyn EmbeddingProvider> {
-        Box::new(UnconfiguredEmbeddingProvider::new(
-            self.config.embedding_mode,
-        ))
+        embedding::select_provider(&self.config)
     }
 
     /// 把当前仓库附着到引擎。

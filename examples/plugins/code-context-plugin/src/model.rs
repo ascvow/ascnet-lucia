@@ -115,6 +115,20 @@ impl EmbeddingSpace {
         digest.update(self.document_template_version.to_be_bytes());
         format!("{:x}", digest.finalize())
     }
+
+    /// 判断两个嵌入空间的向量是否可以放在同一个索引里比较。
+    ///
+    /// # 维度相同不等于可比较
+    ///
+    /// 这是语义索引最容易犯的错：两个模型都输出 1024 维，于是复用同一批向量。
+    /// 但不同模型的 1024 维空间之间没有任何几何关系，混用得到的相似度是噪声——
+    /// 而且**不会报错**，只会让检索结果长期缓慢地不正确。
+    ///
+    /// 因此这里比较的是完整标识而不是维度：provider、模型、修订、归一化策略与提示模板
+    /// 版本任一不同，向量就不可比较。
+    pub fn is_compatible_with(&self, other: &EmbeddingSpace) -> bool {
+        self.id() == other.id()
+    }
 }
 
 /// 索引生命周期状态。
@@ -537,6 +551,142 @@ mod tests {
         assert_ne!(base.id(), changed_dimension.id());
         assert_ne!(base.id(), changed_model.id());
         assert_ne!(base.id(), changed_normalization.id());
+    }
+
+    /// 维度相同但模型不同的两个空间必须判定为不兼容。
+    ///
+    /// 这条是语义索引的核心防线：两个模型都是 1024 维不代表向量可以混用，
+    /// 混用不会报错，只会让相似度变成噪声。
+    #[test]
+    fn same_dimension_different_model_is_incompatible() {
+        let base = EmbeddingSpace {
+            provider_type: "api".into(),
+            provider_id: "provider-a".into(),
+            model: "model-a".into(),
+            model_revision: "r1".into(),
+            dimension: 1024,
+            normalization: true,
+            query_template_version: 1,
+            document_template_version: 1,
+        };
+
+        let mut other_model = base.clone();
+        other_model.model = "model-b".into();
+        assert_eq!(other_model.dimension, base.dimension, "前提：维度相同");
+        assert!(
+            !base.is_compatible_with(&other_model),
+            "维度相同但模型不同，向量绝不可比较"
+        );
+
+        assert!(base.is_compatible_with(&base.clone()), "同一空间必须兼容");
+    }
+
+    /// 空间的每一个字段变化都必须打破兼容性。
+    #[test]
+    fn every_space_field_affects_compatibility() {
+        let base = EmbeddingSpace {
+            provider_type: "api".into(),
+            provider_id: "provider-a".into(),
+            model: "model-a".into(),
+            model_revision: "r1".into(),
+            dimension: 1024,
+            normalization: true,
+            query_template_version: 1,
+            document_template_version: 1,
+        };
+
+        let mutations: Vec<(&str, EmbeddingSpace)> = vec![
+            (
+                "provider_type",
+                EmbeddingSpace {
+                    provider_type: "local".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "provider_id",
+                EmbeddingSpace {
+                    provider_id: "provider-b".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "model",
+                EmbeddingSpace {
+                    model: "model-b".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "model_revision",
+                EmbeddingSpace {
+                    model_revision: "r2".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "dimension",
+                EmbeddingSpace {
+                    dimension: 768,
+                    ..base.clone()
+                },
+            ),
+            (
+                "normalization",
+                EmbeddingSpace {
+                    normalization: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "query_template_version",
+                EmbeddingSpace {
+                    query_template_version: 2,
+                    ..base.clone()
+                },
+            ),
+            (
+                "document_template_version",
+                EmbeddingSpace {
+                    document_template_version: 2,
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (field, mutated) in mutations {
+            assert!(
+                !base.is_compatible_with(&mutated),
+                "{field} 变化后必须判定为不兼容"
+            );
+        }
+    }
+
+    /// 切换嵌入空间必须只触发语义重建，结构索引原样保留。
+    #[test]
+    fn switching_embedding_space_rebuilds_semantics_only() {
+        let mut manifest = IndexManifest::new(identity("/repo/a"));
+        let api = EmbeddingSpace {
+            provider_type: "api".into(),
+            provider_id: "provider-a".into(),
+            model: "model-a".into(),
+            model_revision: String::new(),
+            dimension: 1024,
+            normalization: true,
+            query_template_version: 1,
+            document_template_version: 1,
+        };
+        let local = EmbeddingSpace {
+            provider_type: "local".into(),
+            ..api.clone()
+        };
+        manifest.embedding_space_id = Some(api.id());
+
+        assert_eq!(
+            manifest.compatibility(&identity("/repo/a"), Some(&local.id())),
+            ManifestCompatibility::SemanticRebuildRequired,
+            "换 provider 只需重建语义索引，不应丢弃结构索引"
+        );
     }
 
     /// 只有就绪与降级状态可以返回检索结果。
