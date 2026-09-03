@@ -4,13 +4,23 @@
 //! 其余入口一律返回错误，使任何越界调用在测试中立即暴露，而不是悄悄拿到空结果。
 
 use agent_plugin::{
-    ActivationContext, ExtensionEvent, FileEntry, PluginHostApi, PluginStoreScope, ProcessSpec,
-    PromptContribution, Result, ServiceDescriptor, ServiceSpec, ToolSpec,
+    ActivationContext, ExtensionEvent, FileEntry, HttpRequest, HttpResponse, PluginHostApi,
+    PluginStoreScope, ProcessSpec, PromptContribution, Result, ServiceDescriptor, ServiceSpec,
+    ToolSpec,
 };
 use anyhow::anyhow;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// 构造一条成功的 JSON 应答，供 [`TestHost::with_http_responses`] 使用。
+pub fn http_json(status: u16, body: &str) -> Result<HttpResponse> {
+    Ok(HttpResponse {
+        status,
+        headers: HashMap::new(),
+        body: body.to_string(),
+    })
+}
 
 /// 记录调用的宿主替身。
 #[derive(Default)]
@@ -27,6 +37,13 @@ pub struct TestHost {
     workspace_available: bool,
     /// 当前工作区只读能力是否可用。
     workspace_read_available: bool,
+    /// 按调用顺序返回的 HTTP 应答队列；为空时 `http_request` 失败。
+    ///
+    /// 嵌入 provider 的正确性几乎全在「怎么解析端点返回的东西」上：顺序错乱、条数不符、
+    /// 维度不符、非 2xx。真实端点无法稳定复现这些，用队列逐一构造。
+    http_responses: RefCell<Vec<Result<HttpResponse>>>,
+    /// 已收到的 HTTP 请求，用于断言插件提交了什么。
+    http_requests: RefCell<Vec<HttpRequest>>,
 }
 
 impl TestHost {
@@ -53,6 +70,18 @@ impl TestHost {
             workspace_available: true,
             ..Self::default()
         }
+    }
+
+    /// 预置按序返回的 HTTP 应答。
+    pub fn with_http_responses(mut self, responses: Vec<Result<HttpResponse>>) -> Self {
+        // 反转一次，使 `pop` 按传入顺序取用。
+        self.http_responses = RefCell::new(responses.into_iter().rev().collect());
+        self
+    }
+
+    /// 返回已收到的 HTTP 请求快照。
+    pub fn http_requests(&self) -> Vec<HttpRequest> {
+        self.http_requests.borrow().clone()
     }
 
     /// 返回该替身持有的存储内容，用于模拟应用重启后重新加载。
@@ -252,6 +281,14 @@ impl PluginHostApi for TestHost {
 
     fn kill_process(&self, _handle: u64) -> Result<()> {
         Err(anyhow!("本插件不申请子进程能力"))
+    }
+
+    fn http_request(&self, request: &HttpRequest) -> Result<HttpResponse> {
+        self.http_requests.borrow_mut().push(request.clone());
+        self.http_responses
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| Err(anyhow!("测试替身没有更多预置 HTTP 应答")))
     }
 }
 
@@ -471,5 +508,9 @@ impl PluginHostApi for RepoHost {
 
     fn kill_process(&self, handle: u64) -> Result<()> {
         self.inner.kill_process(handle)
+    }
+
+    fn http_request(&self, request: &HttpRequest) -> Result<HttpResponse> {
+        self.inner.http_request(request)
     }
 }

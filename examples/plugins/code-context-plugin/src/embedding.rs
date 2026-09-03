@@ -16,6 +16,8 @@
 use crate::config::{CodeContextConfig, EmbeddingMode};
 use crate::error::CodeContextError;
 use crate::model::EmbeddingSpace;
+use agent_plugin::{HttpRequest, PluginHostApi};
+use std::collections::HashMap;
 
 /// 单批默认最大输入条数。
 ///
@@ -192,13 +194,205 @@ fn embed_batched<P: EmbeddingProvider + ?Sized>(
 
 /// 按配置选择嵌入 provider。
 ///
-/// 两种模式当前都返回 [`UnconfiguredEmbeddingProvider`]：Api 分支等待宿主 HTTP 能力，
-/// Local 分支等待宿主受控推理能力，理由见各自 ADR 与 `PROGRESS.md` 的 Blocked Phases。
-/// **真实实现在 Phase 7 与 Phase 12 接入时替换本函数的分支，调用方不需要改动。**
+/// Api 分支在宿主注入了 HTTP 端点时返回 [`ApiEmbeddingProvider`]；没有端点说明用户
+/// 没配 `http_base_url`，此时返回未配置 provider 并说明缺什么。Local 分支仍等待宿主
+/// 受控推理能力，理由见 `adr-local-embedding.md` 与 `PROGRESS.md` 的 Blocked Phases。
 ///
 /// 刻意不提供"选不到就用 Mock"的回退：伪造向量会让语义链路的错误推迟到检索结果里才暴露。
-pub fn select_provider(config: &CodeContextConfig) -> Box<dyn EmbeddingProvider> {
-    Box::new(UnconfiguredEmbeddingProvider::new(config.embedding_mode))
+pub fn select_provider<'host>(
+    config: &CodeContextConfig,
+    host: &'host dyn PluginHostApi,
+) -> Box<dyn EmbeddingProvider + 'host> {
+    match config.embedding_mode {
+        EmbeddingMode::Api => match ApiEmbeddingProvider::from_config(config, host) {
+            Some(provider) => Box::new(provider),
+            None => Box::new(UnconfiguredEmbeddingProvider::new(config.embedding_mode)),
+        },
+        EmbeddingMode::Local => Box::new(UnconfiguredEmbeddingProvider::new(config.embedding_mode)),
+    }
+}
+
+/// 通过宿主 HTTP 能力访问 OpenAI 兼容 `/v1/embeddings` 端点的 provider。
+///
+/// # 边界
+///
+/// provider **不知道端点地址，也拿不到密钥**：宿主按 manifest allowlist 与应用配置
+/// 注入 base URL 和 `Authorization`，这里只提交相对路径 `embeddings` 与请求体。
+/// 这是 `adr-api-embedding.md` 定下的分工，也是 `host-model-complete` 的同一条范式。
+pub struct ApiEmbeddingProvider<'host> {
+    /// 宿主能力入口。
+    host: &'host dyn PluginHostApi,
+    /// 该 provider 声明的嵌入空间。
+    space: EmbeddingSpace,
+    /// 单批最大条数。
+    batch_size: usize,
+}
+
+impl std::fmt::Debug for ApiEmbeddingProvider<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApiEmbeddingProvider")
+            .field("space", &self.space)
+            .field("batch_size", &self.batch_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'host> ApiEmbeddingProvider<'host> {
+    /// 按配置构造 provider；宿主未注入 HTTP 端点时返回 `None`。
+    ///
+    /// 端点摘要必须存在：没有它就无法判定嵌入空间是否变化，而把不同端点的向量混在
+    /// 同一个索引里，检索结果会长期缓慢地不正确。
+    pub fn from_config(config: &CodeContextConfig, host: &'host dyn PluginHostApi) -> Option<Self> {
+        let endpoint_id = config.http_endpoint_id.as_ref()?;
+        Some(Self {
+            host,
+            space: EmbeddingSpace {
+                provider_type: "api".to_string(),
+                provider_id: endpoint_id.clone(),
+                model: config.embedding_model.clone(),
+                // 端点不提供模型修订信息；留空而不是编造一个值。
+                model_revision: String::new(),
+                dimension: config.embedding_dimension,
+                // OpenAI 兼容端点返回已归一化向量；余弦相似度因此可退化为点积。
+                normalization: true,
+                query_template_version: 1,
+                document_template_version: 1,
+            },
+            batch_size: config.embedding_batch_size.max(1),
+        })
+    }
+
+    /// 向端点提交一次嵌入请求并解析返回的向量。
+    fn request_embeddings(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, CodeContextError> {
+        let body = serde_json::json!({
+            "model": self.space.model,
+            "input": inputs,
+            "dimensions": self.space.dimension,
+        });
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "embeddings".to_string(),
+            headers: HashMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            body: Some(body.to_string()),
+        };
+        let response = self.host.http_request(&request).map_err(|error| {
+            CodeContextError::EmbeddingUnavailable(format!("嵌入端点调用失败：{error}"))
+        })?;
+        if !(200..300).contains(&response.status) {
+            // 回传状态码与正文摘要：4xx 通常是配置错误（模型名、维度、密钥），
+            // 用户需要看到端点自己的说明才能改对。
+            return Err(CodeContextError::EmbeddingUnavailable(format!(
+                "嵌入端点返回 HTTP {}：{}",
+                response.status,
+                truncate_for_message(&response.body)
+            )));
+        }
+        parse_embedding_response(&response.body)
+    }
+}
+
+impl EmbeddingProvider for ApiEmbeddingProvider<'_> {
+    fn space(&self) -> Option<EmbeddingSpace> {
+        Some(self.space.clone())
+    }
+
+    fn max_batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// 提交一批文本并返回向量。
+    ///
+    /// 查询与文档走同一个端点：OpenAI 兼容的嵌入接口没有 query/document 之分，模板
+    /// 版本差异体现在 [`EmbeddingSpace`] 的标识里，供将来换用非对称模型时区分。
+    fn embed(
+        &self,
+        _kind: EmbeddingInputKind,
+        inputs: &[String],
+    ) -> Result<Vec<Vec<f32>>, CodeContextError> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.request_embeddings(inputs)
+    }
+
+    /// 用一次最小请求探测端点可用性。
+    ///
+    /// 覆盖默认实现是必要的：默认实现只检查是否声明了嵌入空间，而 API provider 的
+    /// 声明总是成立，真正会失败的是密钥、模型名与网络。把失败提前到这里，降级判断
+    /// 才不必等到第一次真正嵌入。
+    fn health_check(&self) -> Result<(), CodeContextError> {
+        self.request_embeddings(std::slice::from_ref(&"ping".to_string()))
+            .map(|_| ())
+    }
+}
+
+/// 解析 OpenAI 兼容嵌入响应。
+///
+/// 按 `index` 字段重排：接口不保证返回顺序与输入一致，而向量与 chunk 是按下标对齐的，
+/// 顺序错了不会报错，只会让检索结果长期缓慢地不正确。
+fn parse_embedding_response(body: &str) -> Result<Vec<Vec<f32>>, CodeContextError> {
+    /// 响应中的单条嵌入。
+    #[derive(serde::Deserialize)]
+    struct EmbeddingItem {
+        /// 对应输入的下标；部分端点省略该字段。
+        #[serde(default)]
+        index: Option<usize>,
+        /// 向量本体。
+        embedding: Vec<f32>,
+    }
+
+    /// 嵌入响应信封。
+    #[derive(serde::Deserialize)]
+    struct EmbeddingEnvelope {
+        /// 与输入等长的嵌入列表。
+        data: Vec<EmbeddingItem>,
+    }
+
+    let envelope: EmbeddingEnvelope = serde_json::from_str(body).map_err(|error| {
+        CodeContextError::EmbeddingUnavailable(format!(
+            "解析嵌入响应失败：{error}；响应片段：{}",
+            truncate_for_message(body)
+        ))
+    })?;
+    let count = envelope.data.len();
+    let mut slots: Vec<Option<Vec<f32>>> = vec![None; count];
+    for (position, item) in envelope.data.into_iter().enumerate() {
+        let index = item.index.unwrap_or(position);
+        let slot = slots.get_mut(index).ok_or_else(|| {
+            CodeContextError::EmbeddingUnavailable(format!(
+                "嵌入响应的 index {index} 超出返回条数 {count}"
+            ))
+        })?;
+        if slot.is_some() {
+            return Err(CodeContextError::EmbeddingUnavailable(format!(
+                "嵌入响应的 index {index} 重复"
+            )));
+        }
+        *slot = Some(item.embedding);
+    }
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            slot.ok_or_else(|| {
+                CodeContextError::EmbeddingUnavailable(format!("嵌入响应缺少 index {index}"))
+            })
+        })
+        .collect()
+}
+
+/// 截断用于错误信息的文本，避免把整个响应体塞进日志。
+fn truncate_for_message(text: &str) -> String {
+    const LIMIT: usize = 256;
+    let trimmed = text.trim();
+    match trimmed.char_indices().nth(LIMIT) {
+        Some((offset, _)) => format!("{}…", &trimmed[..offset]),
+        None => trimmed.to_string(),
+    }
 }
 
 /// 尚未配置的嵌入 provider。
@@ -392,6 +586,213 @@ impl EmbeddingProvider for MockEmbeddingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{http_json, TestHost};
+
+    /// 构造已注入宿主端点的 API 配置。
+    fn api_config() -> CodeContextConfig {
+        CodeContextConfig {
+            embedding_mode: EmbeddingMode::Api,
+            embedding_dimension: 3,
+            http_endpoint_id: Some("endpoint-abc".to_string()),
+            ..CodeContextConfig::default()
+        }
+    }
+
+    /// 构造一条 OpenAI 兼容的嵌入响应正文。
+    fn embedding_body(vectors: &[(usize, [f32; 3])]) -> String {
+        let items: Vec<String> = vectors
+            .iter()
+            .map(|(index, vector)| {
+                format!(
+                    r#"{{"index":{index},"embedding":[{},{},{}]}}"#,
+                    vector[0], vector[1], vector[2]
+                )
+            })
+            .collect();
+        format!(r#"{{"data":[{}]}}"#, items.join(","))
+    }
+
+    // -----------------------------------------------------------------------
+    // API provider
+    // -----------------------------------------------------------------------
+
+    /// provider 必须只提交相对路径，绝不能构造绝对地址或携带凭证。
+    #[test]
+    fn api_provider_submits_relative_path_without_credentials() {
+        let host = TestHost::new().with_http_responses(vec![http_json(
+            200,
+            &embedding_body(&[(0, [1.0, 0.0, 0.0])]),
+        )]);
+        let provider =
+            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+
+        provider
+            .embed(EmbeddingInputKind::Document, &["fn check()".to_string()])
+            .expect("嵌入应成功");
+
+        let requests = host.http_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "embeddings", "只能提交相对路径");
+        // 凭证由宿主注入，插件不得自行设置任何认证 header。
+        assert!(!requests[0].headers.contains_key("authorization"));
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().expect("应有正文"))
+                .expect("正文应是 JSON");
+        assert_eq!(body["model"], "text-embedding-3-small");
+        assert_eq!(body["dimensions"], 3);
+    }
+
+    /// 端点乱序返回时必须按 index 重排，否则向量会错挂到别的 chunk 上。
+    #[test]
+    fn out_of_order_response_is_reordered_by_index() {
+        let host = TestHost::new().with_http_responses(vec![http_json(
+            200,
+            // 刻意倒序返回。
+            &embedding_body(&[(1, [0.0, 1.0, 0.0]), (0, [1.0, 0.0, 0.0])]),
+        )]);
+        let provider =
+            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+
+        let vectors = provider
+            .embed(
+                EmbeddingInputKind::Document,
+                &["first".to_string(), "second".to_string()],
+            )
+            .expect("嵌入应成功");
+
+        assert_eq!(vectors[0], vec![1.0, 0.0, 0.0], "index 0 必须排在前面");
+        assert_eq!(vectors[1], vec![0.0, 1.0, 0.0]);
+    }
+
+    /// 缺少某个 index 的响应必须失败，而不是返回条数不足的结果。
+    #[test]
+    fn response_with_missing_index_is_rejected() {
+        let host = TestHost::new().with_http_responses(vec![http_json(
+            200,
+            r#"{"data":[{"index":1,"embedding":[1,0,0]},{"index":1,"embedding":[0,1,0]}]}"#,
+        )]);
+        let provider =
+            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+
+        let error = provider
+            .embed(
+                EmbeddingInputKind::Document,
+                &["a".to_string(), "b".to_string()],
+            )
+            .expect_err("index 重复应被拒绝");
+        assert!(matches!(error, CodeContextError::EmbeddingUnavailable(_)));
+    }
+
+    /// 条数与输入不符必须在抽象层被拒绝。
+    #[test]
+    fn response_with_wrong_count_is_rejected() {
+        let host = TestHost::new().with_http_responses(vec![http_json(
+            200,
+            &embedding_body(&[(0, [1.0, 0.0, 0.0])]),
+        )]);
+        let provider =
+            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+
+        let error = provider
+            .embed_documents(&["a".to_string(), "b".to_string()])
+            .expect_err("条数不符应被拒绝");
+        assert!(matches!(error, CodeContextError::EmbeddingUnavailable(_)));
+    }
+
+    /// 维度与声明不符必须被拒绝——向量不可比时静默接受最难发现。
+    #[test]
+    fn response_with_wrong_dimension_is_rejected() {
+        let host = TestHost::new().with_http_responses(vec![http_json(
+            200,
+            r#"{"data":[{"index":0,"embedding":[1,0]}]}"#,
+        )]);
+        let provider =
+            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+
+        let error = provider
+            .embed_documents(&["a".to_string()])
+            .expect_err("维度不符应被拒绝");
+        assert!(matches!(error, CodeContextError::EmbeddingUnavailable(_)));
+    }
+
+    /// 非 2xx 必须携带状态码与端点说明，便于用户改对配置。
+    #[test]
+    fn non_success_status_reports_endpoint_message() {
+        let host = TestHost::new().with_http_responses(vec![http_json(
+            401,
+            r#"{"error":{"message":"Incorrect API key provided"}}"#,
+        )]);
+        let provider =
+            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+
+        let error = provider
+            .embed_documents(&["a".to_string()])
+            .expect_err("401 应失败");
+        let message = error.to_string();
+        assert!(message.contains("401"), "应带状态码：{message}");
+        assert!(message.contains("Incorrect API key"), "应带端点说明：{message}");
+    }
+
+    /// 宿主 HTTP 失败必须降级为嵌入不可用，而不是让整次检索崩溃。
+    #[test]
+    fn host_failure_degrades_to_unavailable() {
+        let host = TestHost::new().with_http_responses(vec![Err(anyhow::anyhow!("网络不可达"))]);
+        let provider =
+            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+
+        let error = provider
+            .embed_documents(&["a".to_string()])
+            .expect_err("宿主失败应传播");
+        assert!(matches!(error, CodeContextError::EmbeddingUnavailable(_)));
+    }
+
+    /// 健康检查必须真的打一次请求，而不是只看配置是否齐全。
+    #[test]
+    fn health_check_probes_the_endpoint() {
+        let host = TestHost::new().with_http_responses(vec![http_json(
+            200,
+            &embedding_body(&[(0, [1.0, 0.0, 0.0])]),
+        )]);
+        let provider =
+            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+
+        provider.health_check().expect("端点可用时应通过");
+        assert_eq!(host.http_requests().len(), 1, "必须真的发起探测请求");
+    }
+
+    /// 端点摘要变化必须让嵌入空间失效，触发语义索引重建。
+    #[test]
+    fn changing_endpoint_invalidates_the_space() {
+        let host = TestHost::new();
+        let first = ApiEmbeddingProvider::from_config(&api_config(), &host)
+            .expect("应构造成功")
+            .space()
+            .expect("应有空间");
+        let second = ApiEmbeddingProvider::from_config(
+            &CodeContextConfig {
+                http_endpoint_id: Some("endpoint-xyz".to_string()),
+                ..api_config()
+            },
+            &host,
+        )
+        .expect("应构造成功")
+        .space()
+        .expect("应有空间");
+
+        assert_ne!(first.id(), second.id(), "换端点必须改变嵌入空间标识");
+    }
+
+    /// 空输入不得发起请求。
+    #[test]
+    fn empty_input_makes_no_request() {
+        let host = TestHost::new();
+        let provider =
+            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+
+        assert!(provider.embed_documents(&[]).expect("空输入应成功").is_empty());
+        assert!(host.http_requests().is_empty(), "空输入不应发起请求");
+    }
 
     /// 未配置 provider 不得声明任何嵌入空间，否则会污染语义索引兼容判断。
     #[test]
@@ -439,22 +840,44 @@ mod tests {
         assert!(provider.dimension().is_none());
     }
 
-    /// provider 选择必须遵循配置模式，且**永远不会选中 mock**。
+    /// 没有宿主 HTTP 端点时，两种模式都必须是"不可用"而不是伪造实现。
     #[test]
-    fn provider_selection_follows_configuration() {
+    fn provider_selection_without_endpoint_is_unavailable() {
+        let host = crate::testing::TestHost::new();
         for mode in [EmbeddingMode::Api, EmbeddingMode::Local] {
             let config = CodeContextConfig {
-                enabled: true,
                 embedding_mode: mode,
+                http_endpoint_id: None,
+                ..CodeContextConfig::default()
             };
-            let provider = select_provider(&config);
-            // 两条分支目前都被宿主能力阻塞，因此都必须是"不可用"而不是伪造实现。
+            let provider = select_provider(&config, &host);
             assert!(provider.space().is_none(), "{mode:?} 不应声明嵌入空间");
             assert!(provider.health_check().is_err());
             assert!(provider
                 .embed_query("permission check")
                 .is_err_and(|error| matches!(error, CodeContextError::EmbeddingUnavailable(_))));
         }
+    }
+
+    /// 宿主注入端点后，Api 模式必须选中真实 provider；Local 模式仍不可用。
+    #[test]
+    fn api_mode_selects_real_provider_when_endpoint_is_injected() {
+        let host = crate::testing::TestHost::new();
+        let config = api_config();
+
+        let provider = select_provider(&config, &host);
+        let space = provider.space().expect("Api 模式应声明嵌入空间");
+        assert_eq!(space.provider_type, "api");
+        assert_eq!(space.model, "text-embedding-3-small");
+
+        let local = select_provider(
+            &CodeContextConfig {
+                embedding_mode: EmbeddingMode::Local,
+                ..config
+            },
+            &host,
+        );
+        assert!(local.space().is_none(), "Local 分支仍被宿主能力阻塞");
     }
 
     // -----------------------------------------------------------------------

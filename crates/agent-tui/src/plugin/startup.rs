@@ -377,6 +377,16 @@ pub(crate) async fn load_plugins_for_tui(
             ("workspace_root".to_string(), workspace_root.clone()),
         ]);
     }
+    // 配置了 HTTP 端点的插件额外拿到该端点的非敏感摘要。插件用它判定「端点是否换过」
+    // ——换端点意味着嵌入空间失效、语义索引必须重建。下发的是摘要而不是地址与密钥。
+    for (plugin_id, settings) in &plugin_settings {
+        let Some(http) = settings.http.as_ref() else {
+            continue;
+        };
+        if let Some(metadata) = activation_metadata.get_mut(plugin_id) {
+            metadata.insert("http_endpoint_id".to_string(), http.endpoint_id());
+        }
+    }
     for (plugin_id, metadata) in activation_metadata {
         host_services = host_services.with_activation_metadata(plugin_id, metadata)?;
     }

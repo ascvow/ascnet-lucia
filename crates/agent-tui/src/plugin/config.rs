@@ -13,6 +13,7 @@ use agent_core::model::{
 use agent_core::{AgentModelConfig, ReasoningLevel};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use toml::Value;
@@ -102,6 +103,20 @@ pub(crate) struct PluginHttpSettings {
     pub(crate) max_response_bytes: usize,
     /// 单次请求超时，单位毫秒。
     pub(crate) timeout_ms: u64,
+}
+
+impl PluginHttpSettings {
+    /// 返回该端点的非敏感稳定标识。
+    ///
+    /// 取 `base_url` 的摘要而不是原文：插件需要它来判定嵌入空间是否变化（换端点必须
+    /// 重建语义索引），但端点地址属于用户环境信息，没有下发原文的必要。凭证不参与摘要
+    /// ——换密钥不改变向量空间，把它算进去会导致无谓的全量重建。
+    pub(crate) fn endpoint_id(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"lucia-plugin-http-endpoint-v1\0");
+        digest.update(self.base_url.as_bytes());
+        format!("{:x}", digest.finalize())[..16].to_string()
+    }
 }
 
 /// 主配置中 `[plugins]` 段的原始内容，键为插件 ID。

@@ -44,6 +44,18 @@ impl EmbeddingMode {
     }
 }
 
+/// API 嵌入默认使用的模型。
+///
+/// 选 OpenAI 的 `text-embedding-3-small`：绝大多数 OpenAI 兼容端点都实现了它，
+/// 且维度与价格都适合代码检索这种高频场景。
+const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+
+/// API 嵌入默认向量维度。
+const DEFAULT_EMBEDDING_DIMENSION: u32 = 1536;
+
+/// 单批最多提交的嵌入条数。
+const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 64;
+
 /// Code Context Engine 配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeContextConfig {
@@ -51,9 +63,23 @@ pub struct CodeContextConfig {
     pub enabled: bool,
     /// 语义嵌入模式。
     ///
-    /// 默认 `api`：它是最低硬件压力路径，且不要求用户具备本地推理条件。当前两种模式
-    /// 的 provider 都尚未实现，该值只决定将来启用哪条分支与如何报告不可用原因。
+    /// 默认 `api`：它是最低硬件压力路径，且不要求用户具备本地推理条件。
     pub embedding_mode: EmbeddingMode,
+    /// 嵌入模型名称，随请求发给端点。
+    pub embedding_model: String,
+    /// 期望的向量维度。
+    ///
+    /// 参与嵌入空间标识，因此改动它会触发语义索引重建。端点实际返回的维度与之不符时
+    /// 嵌入会失败而不是静默接受——维度不符意味着向量不可比，静默接受会让检索长期缓慢
+    /// 地不正确。
+    pub embedding_dimension: u32,
+    /// 单批提交的最大条数。
+    pub embedding_batch_size: usize,
+    /// 宿主注入的 HTTP 端点摘要；未配置 HTTP 时为 `None`。
+    ///
+    /// 由宿主从 `base_url` 计算后作为可信元数据下发，插件看不到地址与凭证。它参与嵌入
+    /// 空间标识：换端点意味着向量不可比，必须重建语义索引。
+    pub http_endpoint_id: Option<String>,
 }
 
 impl Default for CodeContextConfig {
@@ -61,6 +87,10 @@ impl Default for CodeContextConfig {
         Self {
             enabled: true,
             embedding_mode: EmbeddingMode::Api,
+            embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
+            embedding_dimension: DEFAULT_EMBEDDING_DIMENSION,
+            embedding_batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+            http_endpoint_id: None,
         }
     }
 }
@@ -90,8 +120,46 @@ impl CodeContextConfig {
         if let Some(value) = metadata.get("embedding_mode") {
             config.embedding_mode = EmbeddingMode::parse(value)?;
         }
+        if let Some(value) = metadata.get("embedding_model") {
+            let model = value.trim();
+            if model.is_empty() {
+                return Err(CodeContextError::InvalidConfiguration(
+                    "embedding_model 不能为空".into(),
+                ));
+            }
+            config.embedding_model = model.to_string();
+        }
+        if let Some(value) = metadata.get("embedding_dimension") {
+            config.embedding_dimension = parse_positive_u32(value, "embedding_dimension")?;
+        }
+        if let Some(value) = metadata.get("embedding_batch_size") {
+            config.embedding_batch_size =
+                parse_positive_u32(value, "embedding_batch_size")? as usize;
+        }
+        // 该键由宿主注入，不接受插件配置伪造：宿主写入发生在用户配置合并之后。
+        config.http_endpoint_id = metadata
+            .get("http_endpoint_id")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         Ok(config)
     }
+}
+
+/// 解析必须为正数的整数配置项。
+///
+/// # Errors
+///
+/// 值不是整数或为零时返回 [`CodeContextError::InvalidConfiguration`]。
+fn parse_positive_u32(value: &str, key: &str) -> Result<u32, CodeContextError> {
+    let parsed: u32 = value.trim().parse().map_err(|_| {
+        CodeContextError::InvalidConfiguration(format!("{key} 必须是正整数，实际为 `{value}`"))
+    })?;
+    if parsed == 0 {
+        return Err(CodeContextError::InvalidConfiguration(format!(
+            "{key} 必须大于零"
+        )));
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]

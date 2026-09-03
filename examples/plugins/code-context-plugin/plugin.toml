@@ -32,13 +32,34 @@ storage = true
 
 # 本插件刻意不申请的能力，逐项说明，避免后来者误以为是遗漏：
 #
-# http           —— API 嵌入（Phase 9）才需要，且 Host 当前在加载期拒绝该声明。
 # process_exec   —— 明确否决：它会把本插件全部工具的 scope 抬到 shell，
 #                   使 code_search 每次调用都需要审批，与产品目标冲突。
 # sessions       —— 明确否决：会把工具 scope 下限抬到 unknown，且与代码检索无关。
 
+# API 嵌入访问用户自配的 OpenAI 兼容端点。base_url 与密钥由宿主从应用配置注入，
+# 插件只提交相对路径，看不到地址也拿不到凭证。
+#
+# allow_hosts 是用户与审计者能看到的授权边界：宿主注入的 base_url 必须落在其中，
+# 否则请求在能力层被拒绝。换用自建端点或其他服务商时，必须同步改这里——
+# 这条约束是刻意的，它保证 manifest 上写明的边界始终是真实生效的边界。
+[capabilities.http]
+allow_hosts = [
+    "api.openai.com",
+    "api.siliconflow.cn",
+    "dashscope.aliyuncs.com",
+    "open.bigmodel.cn",
+    "api.deepseek.com",
+]
+
 [capabilities.tool_scopes]
-# code_search 只读取仓库源码并返回位置，权限语义等同于读文件。
-# 该 scope 成立的前提是本插件不持有进程、网络或会话能力；新增任一类能力都会
-# 被 Host 自动抬高 scope，届时必须重新评估工具可用性而不是照抄这一行。
+# code_search 只读取仓库源码并返回位置，声明的权限语义等同于读文件。
+#
+# 但**实际生效的 scope 是 unknown**，这里的 read 只是声明值。原因是 Host 的能力下限
+# 合并规则（manifest.rs 的 component_capability_scope_floor 与 merge_tool_permission_scopes）：
+# workspace_read 贡献 read，http 贡献 network，两个不相等且都不是 control 的 scope
+# 合并后落到 unknown——WASM 无法证明某个工具内部不会调用网络，这条下限不可绕过。
+#
+# 代价是明确的：code_search 进入最保守的审批档位，且不再参与 run.rs 的只读并行批处理。
+# 这是启用 API 语义检索换来的，不是疏漏。不需要语义检索的部署删掉上面的
+# [capabilities.http] 段即可，scope 会自动回落到 read。
 code_search = "read"

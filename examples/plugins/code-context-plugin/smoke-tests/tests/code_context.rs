@@ -116,7 +116,12 @@ async fn wasm_host_loads_and_registers_code_search() {
         .expect("激活后必须注册 code_search");
 
     // scope 由 Host 按 manifest 绑定；这里断言的是最终生效值，而不是 Guest 自报值。
-    assert_eq!(tool.permission_scope, ToolPermissionScope::Read);
+    //
+    // manifest 声明的是 read，但插件同时持有 workspace_read（贡献 read）与 http
+    // （贡献 network）两项能力，两个不相等的 scope 合并后落到 unknown。这不是配置错误，
+    // 而是「启用 API 语义检索必然抬高工具审批档位」的直接体现，见 plugin.toml 的说明。
+    // 删掉 manifest 的 [capabilities.http] 段后该断言应改回 Read。
+    assert_eq!(tool.permission_scope, ToolPermissionScope::Unknown);
     let schema = serde_json::to_string(&tool.input_schema).expect("序列化工具 schema");
     assert!(schema.contains("query"), "{schema}");
     assert!(schema.contains("max_results"), "{schema}");

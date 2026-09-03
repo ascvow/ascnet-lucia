@@ -160,11 +160,14 @@ impl CodeContextPlugin {
 
     /// 返回当前生效的嵌入 provider。
     ///
-    /// 选择逻辑集中在 [`embedding::select_provider`]：两种模式当前都被宿主能力阻塞，
-    /// 因此都返回未配置 provider。返回类型保持 trait 对象，使 Phase 7 与 Phase 12
-    /// 接入真实实现时调用方不需要改动。
-    pub fn embedding_provider(&self) -> Box<dyn EmbeddingProvider> {
-        embedding::select_provider(&self.config)
+    /// 选择逻辑集中在 [`embedding::select_provider`]：Api 模式在宿主注入 HTTP 端点时
+    /// 返回真实 provider，否则连同 Local 模式一起返回未配置 provider。返回类型保持
+    /// trait 对象，借用 `host` 是因为真实 provider 需要宿主能力入口发请求。
+    pub fn embedding_provider<'host>(
+        &self,
+        host: &'host dyn PluginHostApi,
+    ) -> Box<dyn EmbeddingProvider + 'host> {
+        embedding::select_provider(&self.config, host)
     }
 
     /// 把当前仓库附着到引擎。
@@ -185,7 +188,10 @@ impl CodeContextPlugin {
 
         let (mut manifest, mut status, mut dirty) = match store.load_manifest(host) {
             ManifestLoad::Loaded(existing) => {
-                let expected_space = self.embedding_provider().space().map(|space| space.id());
+                let expected_space = self
+                    .embedding_provider(host)
+                    .space()
+                    .map(|space| space.id());
                 let compatibility = existing.compatibility(&identity, expected_space.as_deref());
                 match compatibility {
                     // 结构索引内存驻留、不落盘，因此 manifest 兼容也不代表现在有索引可用：
@@ -1484,13 +1490,13 @@ mod tests {
         assert_eq!(terminal_count, 1, "一次构建只能发布一个终态事件");
     }
 
-    /// 骨架阶段绝不能返回任何伪造向量。
+    /// 宿主未注入 HTTP 端点时绝不能返回任何伪造向量。
     #[test]
-    fn embedding_provider_is_unavailable() {
+    fn embedding_provider_is_unavailable_without_endpoint() {
         let host = TestHost::new();
         let plugin = activated(&host, "/repo/a");
 
-        let provider = plugin.embedding_provider();
+        let provider = plugin.embedding_provider(&host);
         assert!(provider.space().is_none());
         assert!(provider
             .embed(EmbeddingInputKind::Query, &["x".to_string()])
