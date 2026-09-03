@@ -281,7 +281,7 @@ fn sharded_build_matches_single_pass() {
     ];
     let host = RepoHost::new(files);
 
-    let single = build_all(&host).into_index();
+    let single = build_all(&host).into_parts().0;
 
     let mut sharded = IndexBuild::with_default_limits(repository());
     let mut rounds = 0;
@@ -296,7 +296,7 @@ fn sharded_build_matches_single_pass() {
         rounds += 1;
         assert!(rounds < 1000, "分片构建不应无法收敛");
     }
-    let sharded = sharded.into_index();
+    let sharded = sharded.into_parts().0;
 
     assert!(rounds > 3, "预算为 1 时必须发生多轮中断，实际 {rounds} 轮");
     assert_eq!(single.stats(), sharded.stats());
@@ -390,7 +390,7 @@ fn file_hashes_round_trip_through_store() {
         ("src/a.rs", "pub fn a() {}\n"),
         ("src/b.rs", "pub fn b() {}\n"),
     ]);
-    let index = build_all(&host).into_index();
+    let index = build_all(&host).into_parts().0;
     let store = IndexStore::probe(&host);
 
     store
@@ -418,7 +418,7 @@ fn rebuild_after_restart_reproduces_same_index() {
     ];
     let host = RepoHost::new(files);
 
-    let first = build_all(&host).into_index();
+    let first = build_all(&host).into_parts().0;
     let store = IndexStore::probe(&host);
     store
         .save_file_hashes(&host, &first.file_hashes())
@@ -426,7 +426,7 @@ fn rebuild_after_restart_reproduces_same_index() {
 
     // 模拟进程重启：新宿主沿用同一份持久存储，索引本体从零重建。
     let restarted = RepoHost::restored_from(files, host.snapshot());
-    let second = build_all(&restarted).into_index();
+    let second = build_all(&restarted).into_parts().0;
 
     assert_eq!(first.stats(), second.stats());
     assert_eq!(first.file_hashes(), second.file_hashes());
@@ -445,7 +445,7 @@ fn rebuild_after_restart_reproduces_same_index() {
 #[test]
 fn hash_persistence_requires_workspace_scope() {
     let host = RepoHost::without_workspace_scope(&[("src/a.rs", "pub fn a() {}\n")]);
-    let index = build_all(&host).into_index();
+    let index = build_all(&host).into_parts().0;
     let store = IndexStore::probe(&host);
 
     assert!(store.save_file_hashes(&host, &index.file_hashes()).is_err());
@@ -460,7 +460,7 @@ fn hash_persistence_requires_workspace_scope() {
 #[test]
 fn clearing_hashes_removes_them() {
     let host = RepoHost::new(&[("src/a.rs", "pub fn a() {}\n")]);
-    let index = build_all(&host).into_index();
+    let index = build_all(&host).into_parts().0;
     let store = IndexStore::probe(&host);
     store
         .save_file_hashes(&host, &index.file_hashes())

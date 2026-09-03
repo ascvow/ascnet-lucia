@@ -12,11 +12,12 @@
 
 use super::StructuralIndex;
 use crate::model::RepositoryIdentity;
-use crate::parser::{parse_file, ParseTier};
+use crate::parser::parse_file;
 use crate::repository::{
     FileSink, IndexableFile, RepositoryScan, ScanBudget, ScanLimits, ScanProgress, ScanStats,
     ScanWarning,
 };
+use crate::retrieval::RetrievalIndex;
 use agent_plugin::PluginHostApi;
 
 /// 单次构建推进的默认预算。
@@ -34,8 +35,10 @@ pub const BUILD_BUDGET: ScanBudget = ScanBudget {
 pub struct IndexBuild {
     /// 底层仓库扫描。
     scan: RepositoryScan,
-    /// 构建中的索引。
+    /// 构建中的结构索引。
     index: StructuralIndex,
+    /// 构建中的检索索引。
+    retrieval: RetrievalIndex,
 }
 
 impl IndexBuild {
@@ -44,6 +47,7 @@ impl IndexBuild {
         Self {
             scan: RepositoryScan::new(limits),
             index: StructuralIndex::new(repository),
+            retrieval: RetrievalIndex::new(),
         }
     }
 
@@ -61,11 +65,25 @@ impl IndexBuild {
     ///
     /// 不返回错误。单个文件的读取或解析失败被隔离为扫描告警或文本兜底，不中断构建。
     pub fn advance(&mut self, host: &dyn PluginHostApi, budget: ScanBudget) -> ScanProgress {
-        // 拆分借用：sink 需要 &mut index，而 advance_with 需要 &mut scan。
-        let Self { scan, index } = self;
+        // 拆分借用：sink 需要 &mut index 与 &mut retrieval，而 advance_with 需要 &mut scan。
+        let Self {
+            scan,
+            index,
+            retrieval,
+        } = self;
         let repository = index.repository().clone();
-        let mut sink = IndexSink { index, repository };
-        scan.advance_with(host, budget, &mut sink)
+        let mut sink = IndexSink {
+            index,
+            retrieval,
+            repository,
+        };
+        let progress = scan.advance_with(host, budget, &mut sink);
+        if progress == ScanProgress::Complete {
+            // 符号表必须在检索前完成排序；放在这里而不是交给调用方，
+            // 是为了让"构建完成"与"可检索"成为同一件事。
+            self.retrieval.finalize();
+        }
+        progress
     }
 
     /// 构建是否已完成。
@@ -73,14 +91,19 @@ impl IndexBuild {
         self.scan.is_complete()
     }
 
-    /// 返回构建中的索引。
+    /// 返回构建中的结构索引。
     pub fn index(&self) -> &StructuralIndex {
         &self.index
     }
 
-    /// 取出构建完成的索引。
-    pub fn into_index(self) -> StructuralIndex {
-        self.index
+    /// 返回构建中的检索索引。
+    pub fn retrieval(&self) -> &RetrievalIndex {
+        &self.retrieval
+    }
+
+    /// 取出构建完成的结构索引与检索索引。
+    pub fn into_parts(self) -> (StructuralIndex, RetrievalIndex) {
+        (self.index, self.retrieval)
     }
 
     /// 返回扫描统计。
@@ -94,10 +117,12 @@ impl IndexBuild {
     }
 }
 
-/// 把扫描读到的正文解析后写入索引。
+/// 把扫描读到的正文解析后写入结构索引与检索索引。
 struct IndexSink<'a> {
-    /// 目标索引。
+    /// 目标结构索引。
     index: &'a mut StructuralIndex,
+    /// 目标检索索引。
+    retrieval: &'a mut RetrievalIndex,
     /// 仓库身份，供 chunk 构造使用。
     repository: RepositoryIdentity,
 }
@@ -107,10 +132,25 @@ impl FileSink for IndexSink<'_> {
         // parse_file 内部已经把解析失败降级为文本分块，因此这里不需要再处理错误：
         // 任何输入都会得到可检索的产物（`architecture.md` 第 12 问）。
         let parsed = parse_file(&self.repository, &file.path, file.language, content);
-        debug_assert!(
-            matches!(parsed.tier, ParseTier::Structural | ParseTier::Text),
-            "解析层级必须是已知取值"
-        );
+
+        // 建倒排索引需要 chunk 正文，但正文不会被保留：切词后即丢弃。这样
+        // `execute_command` 这类只出现在函数体里的标识符也能被检索到，同时不违反
+        // 存储 ADR 的"不驻留 chunk 全文"。
+        let lines: Vec<&str> = content.lines().collect();
+        for chunk in &parsed.chunks {
+            let body = slice_lines(&lines, chunk.start_line, chunk.end_line);
+            self.retrieval.index_chunk(chunk, &body);
+        }
         self.index.upsert_file(file, parsed);
     }
+}
+
+/// 取闭区间行范围的正文。
+fn slice_lines(lines: &[&str], start_line: u32, end_line: u32) -> String {
+    let start = start_line.saturating_sub(1) as usize;
+    let end = (end_line as usize).min(lines.len());
+    if start >= end {
+        return String::new();
+    }
+    lines[start..end].join("\n")
 }

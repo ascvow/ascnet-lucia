@@ -7,7 +7,7 @@
 
 ## Current Phase
 
-Phase 5 — Lexical & Symbol Retrieval
+Phase 6 — Embedding Abstraction
 
 Status: NOT_STARTED
 
@@ -18,7 +18,7 @@ Status: NOT_STARTED
 - [x] Phase 2 — Repository Discovery
 - [x] Phase 3 — Structural Parsing
 - [x] Phase 4 — Structural Index
-- [ ] Phase 5 — Lexical & Symbol Retrieval
+- [x] Phase 5 — Lexical & Symbol Retrieval
 - [ ] Phase 6 — Embedding Abstraction
 - [ ] Phase 7 — API Embedding Provider — **BLOCKED**（Host 无 HTTP 能力）
 - [ ] Phase 8 — Semantic Vector Index — **BLOCKED**（依赖 Phase 7 与 blob 存储）
@@ -400,6 +400,85 @@ Deferred items:
 
 Next: Phase 5 — Lexical & Symbol Retrieval
 
+---
+
+### Phase 5 — Lexical & Symbol Retrieval
+
+Status: COMPLETE
+Completed Date: 2026-09-03
+
+Summary：在零 embedding 的前提下建立两路检索能力——符号检索与 BM25 词法检索，
+产出内部候选 `SearchCandidate`。**刻意不绑定到 Agent API**：候选还要经过 Phase 9 的融合与
+Phase 10 的打包，现在绑定会让融合层无处安放，也会让模型先学到一套很快作废的输出形态。
+
+Implemented:
+- **代码专用切词**（`tokenize`）：驼峰 / 帕斯卡 / 蛇形 / 全大写蛇形 / 路径 / 限定名，
+  首字母缩写边界（`HTTPServer` → http + server），数字后接大写（`sha256Digest`）。
+  完整标识符与子词都入索引，使精确查询强于部分匹配。
+- **中日韩支持**：单字 + 双字（bigram）词元。本仓库注释是中文，只切 ASCII 等于放弃全部
+  文档注释检索；只有单字则"权限"与"限权"无法区分。不引入分词器——词典依赖与体积代价
+  不成比例。
+- **符号检索**：两份排序下标数组 + `partition_point` 二分。四档匹配（精确限定名 1.0 /
+  精确短名 0.85 / 限定名后缀 0.75 / 短名前缀 0.4），档次刻意拉开，使融合层无论怎么加权
+  都不会把前缀匹配排到精确匹配前面。同时处理"整条查询是标识符"与"自然语言里夹标识符"。
+- **BM25 词法检索**：标准 BM25（k1=1.2, b=0.75）+ **字段加权**，通过重复计入词频实现：
+  符号名 5 倍、限定名 3 倍、路径 / 签名 / 文档 2 倍、正文 1 倍。无需改公式即体现字段重要性。
+- **索引正文但不驻留正文**：倒排索引保存 `term → (chunk, 词频)`，正文切词后即丢弃。
+  这让 `execute_command` 这类只出现在函数体里的标识符可被检索，同时不违反存储 ADR。
+- **`SearchCandidate`**：带通道内排名（从 1 开始）。融合用排名而非分数——BM25 分数无上界、
+  符号分在 0..1，量纲不可比。**这正是选 RRF 而不是加权分数融合的直接原因。**
+- 路径过滤作用于两路通道；结果顺序完全确定（分数相同时按 chunk ID 排序，避免 HashMap
+  遍历顺序让同一查询在不同进程返回不同排名）。
+
+Key files:
+- `examples/plugins/code-context-plugin/src/retrieval/mod.rs` — `SearchCandidate`、`RetrievalIndex`
+- `.../src/retrieval/tokenize.rs` — 代码与中日韩切词
+- `.../src/retrieval/symbol.rs` — 符号索引与四档匹配
+- `.../src/retrieval/lexical.rs` — BM25 倒排索引与字段加权
+- `.../src/retrieval/tests.rs` — 六类查询验证
+- `.../src/index/build.rs` — 构建时同步建立检索索引
+
+Tests：新增 38 个（切词 14 + 检索 24），插件单测总数 169 → 207。
+
+Definition of Done 的六类查询逐条验证：
+
+| 查询类型 | 测试 | 结果 |
+| --- | --- | --- |
+| 精确符号 | `exact_qualified_symbol_ranks_first` | `PermissionManager::check` 命中且排首位 |
+| 部分符号 | `partial_symbol_prefix_is_found` | `Permission` 命中 Manager 与 Rule |
+| 标识符 | `snake_case_identifier_in_body_is_found` | `tool_call_id` 命中 |
+| 文件路径词 | `file_path_term_is_searchable` | `session store` 命中 `src/session/store.rs` |
+| 源码关键字 | `source_keyword_inside_body_is_found` | `execute_command` 命中函数体内调用 |
+| 文档注释关键字 | `chinese_doc_comment_keyword_is_found` | 中文「审批」「会话状态」命中 |
+
+Tests Executed / Result:
+- `cargo test --offline -p code-context-plugin`：207 单元测试 + 1 文档测试，全通过。
+- `cargo clippy --offline -p code-context-plugin --all-targets`：无警告。
+- `bun run test:plugin:code-context`：全链通过（单测 → WASM release 构建 → 8 个 smoke test）。
+
+Build Result：`wasm32-wasip2` release 构建成功，无 regression。
+
+Important decisions:
+1. **候选不绑定 Agent API。** Phase 5 交付的是内部候选；`code_search` 仍返回状态而不是结果。
+   发明一个会被 Phase 10 整体替换的临时结果格式，是纯浪费，且会污染模型学到的调用形态。
+2. **字段加权用重复计入词频实现**，而不是维护多套倒排表。后者要为每个字段各存一份 posting，
+   内存翻数倍，收益相同。
+3. **中日韩用 bigram 而非分词器。** 本仓库注释全中文，不支持等于放弃文档注释检索。
+4. **查询侧词频只计一次。** BM25 的查询词频对代码检索没有增益，反而会让重复词放大成噪声。
+5. **符号检索要求 `finalize`。** 未排序时返回空而不是错序结果——错序结果比没结果更有害，
+   有专门测试守护这条。
+
+Known limitations:
+- **BM25 参数未经调优。** k1 / b 与六个字段权重都是常用默认值，没有基于真实检索质量校准。
+  Phase 14 的 benchmark 必须用 Recall@5 / Recall@10 / MRR 验证并调整。
+- 倒排索引 posting 上限 300 万，触顶后停止收录并标记 `truncated`。大仓库的实际内存占用
+  未实测，Phase 14 需要一并测量。
+- 前缀匹配要求至少 3 字符，更短的前缀会匹配到成百上千符号并淹没精确匹配。
+- 未实现拼写纠错与同义词扩展，属于 V1 明确不做的范围。
+- `RetrievalIndex` 尚无 `remove_file`：Phase 11 增量索引需要时再加，现在加是空转。
+
+Next: Phase 6 — Embedding Abstraction
+
 ## Blocked Phases
 
 三个阶段因 Host 能力缺失无法实现。按开发任务书 §25，记录 Blocker 而**不绕开架构做 hack 实现**。
@@ -496,12 +575,13 @@ Recommended solution：方案 1。在此之前产品显示 `Local Mode: NOT SUPP
 
 ## Active Work
 
-Phase 5 — Lexical & Symbol Retrieval。目标是在没有任何 embedding 的情况下，
-`code_search` 已经具备有价值的代码搜索能力。
+Phase 6 — Embedding Abstraction。目标是建立 Semantic Layer 的稳定边界。
+Phase 1 已冻结 `EmbeddingProvider`、`EmbeddingSpace` 与 `UnconfiguredEmbeddingProvider`，
+本阶段补齐 `MockEmbeddingProvider`、provider 选择与嵌入空间兼容性测试。
 
 ## Known Issues
 
-无。Phase 1–4 全部验证通过，未发现 regression。
+无。Phase 1–5 全部验证通过，未发现 regression。
 
 Phase 2 遗留的真实 Host 验证已在 Phase 4 补齐：
 `wasm_host_scans_nested_directories_and_builds_index` 覆盖三层嵌套目录、多语言解析与忽略规则。
@@ -567,21 +647,22 @@ Tier 3  文本分块              —— 未覆盖语言、解析失败、无声
 
 ## Next Action
 
-开始 Phase 5 — Lexical & Symbol Retrieval：
+开始 Phase 6 — Embedding Abstraction：
 
-1. 新建 `examples/plugins/code-context-plugin/src/retrieval/`。
-2. **符号检索**：基于 `StructuralIndex::symbols()` 建立限定名排序数组 + 二分，支持精确、
-   前缀与限定名匹配。
-3. **词法检索**：标识符切分（camelCase / snake_case 拆词）+ BM25 倒排索引。必须适合代码
-   标识符形态：`PermissionRule`、`ALLOW_ALWAYS`、`tool_call_id`、`execute_command`。
-   索引来源是 chunk 的符号名、限定名、签名、文档注释与文件路径——**不驻留 chunk 全文**
-   （存储 ADR：正文按需重读）。
-4. 建立内部统一的 `SearchCandidate`，**不要直接绑定 Agent API**——Phase 9 的融合层要在它
-   之上工作。
-5. 索引结构在 `IndexBuild` 完成时一并构建，复用同一分片游标。
+1. Phase 1 已冻结 `EmbeddingProvider`、`EmbeddingSpace`、`embedding_space_id` 与
+   `UnconfiguredEmbeddingProvider`。**不要重新设计这些接口**，本阶段是补齐而非重做。
+2. 新增 `MockEmbeddingProvider`：产出确定性的伪向量，用于在没有真实 provider 的情况下
+   完整测试语义管线接口。**它只能出现在测试中**，绝不可被生产路径选中——
+   骨架阶段确立的"不返回伪造向量"约束依然有效。
+3. 明确区分 `embed_documents` 与 `embed_query`，支持 batching 语义。
+4. Provider 选择与配置：按 `embedding_mode` 选择实现，Api / Local 两个分支目前都返回
+   "能力不可用"错误（Host 缺 HTTP 与 embedding 能力，见 Blocked Phases）。
+5. **嵌入空间兼容性必须测试**：维度相同但 provider / model / 归一化不同的两个空间
+   必须判定为不兼容。禁止"两个模型都是 1024 维就认为向量可比"。
+6. 本阶段**不做** Local 模型，API 也不做真实网络调用——那是 Phase 7 / 12 且当前被阻塞。
 
-Definition of Done：精确符号、部分符号、标识符、文件路径词、源码关键字、文档注释关键字
-六类 query 都有合理结果并有测试覆盖。
+Definition of Done：可以通过 `MockEmbeddingProvider` 完整测试语义管线的接口边界，
+且嵌入空间兼容性判定有测试覆盖。
 
 ---
 

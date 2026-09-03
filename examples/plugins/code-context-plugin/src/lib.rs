@@ -29,6 +29,7 @@ mod index;
 mod model;
 mod parser;
 mod repository;
+mod retrieval;
 mod storage;
 mod tool;
 
@@ -55,6 +56,9 @@ pub use repository::language::{classify, Language, PathClass, SkipReason};
 pub use repository::{
     content_hash, hash_index, IndexableFile, RepositoryScan, ScanBudget, ScanLimits, ScanProgress,
     ScanStats, ScanWarning, ScanWarningKind,
+};
+pub use retrieval::{
+    tokenize, CandidateSource, RetrievalIndex, RetrievalStats, SearchCandidate, SymbolMatch,
 };
 pub use storage::{IndexStore, ManifestLoad};
 pub use tool::{CodeSearchRequest, TOOL_NAME};
@@ -87,6 +91,8 @@ struct RepositoryContext {
     /// 内存驻留，不落盘：宿主存储装不下 chunk 与符号表，理由见
     /// [ADR：索引存储后端](../../docs/code-context-engine/adr-storage.md)。
     index: Option<StructuralIndex>,
+    /// 已建成的检索索引（符号表 + 词法倒排）。
+    retrieval: Option<RetrievalIndex>,
 }
 
 /// Code Context Engine 插件。
@@ -204,6 +210,7 @@ impl CodeContextPlugin {
             dirty,
             build: None,
             index: None,
+            retrieval: None,
         });
         self.index_status = status;
         Ok(())
@@ -303,7 +310,7 @@ impl CodeContextPlugin {
             return;
         }
 
-        let index = context.build.take().expect("构建已存在").into_index();
+        let (index, retrieval) = context.build.take().expect("构建已存在").into_parts();
         // 哈希表在这里落盘、由 Phase 11 的增量索引在下次启动时读回。本阶段不读它：
         // 结构索引内存驻留、每次启动重建，因此"上一轮的哈希"对本轮构建没有用处。
         if let Err(error) = context.store.save_file_hashes(host, &index.file_hashes()) {
@@ -313,6 +320,7 @@ impl CodeContextPlugin {
         context.manifest.touch();
         let _ = context.store.save_manifest(host, &context.manifest);
         context.index = Some(index);
+        context.retrieval = Some(retrieval);
         // 语义分支尚未接入（Host 缺 HTTP 与 embedding 能力，见 PROGRESS.md 的 Blocked Phases），
         // 因此就绪状态是 Degraded 而不是 Ready——这与架构第 13 问的定义一致，不是错误。
         self.index_status = IndexStatus::Degraded;
@@ -355,12 +363,18 @@ impl CodeContextPlugin {
                 Some(stats),
             ));
         }
-        // 索引已就绪但检索尚未接入，必须如实报告而不是返回空结果——空结果会被模型读成
-        // "仓库里没有相关代码"，比明确的不可用更有害。
+        // 符号与词法两路检索已经可用（见 `retrieval` 模块与其测试），但**结果尚未绑定到
+        // 工具返回值**：候选还要经过 Phase 9 的 RRF 融合与 Phase 10 的去重、合并与 token
+        // 预算打包才能成为 Agent 可用的上下文。这里刻意不发明一个临时结果格式——那会在
+        // Phase 10 落地时被整体替换，且会让模型先学到一套很快作废的输出形态。
+        //
+        // 仍然返回错误结果而不是空列表：空列表会被模型读成"仓库里没有相关代码"。
         let stats = self.index_stats().unwrap_or_default();
+        let retrieval = self.retrieval_stats().unwrap_or_default();
         let mut detail = format!(
-            "结构索引已就绪（{} 个文件、{} 个代码块、{} 个符号），检索实现尚未接入",
-            stats.files, stats.chunks, stats.symbols
+            "结构索引与检索索引已就绪（{} 个文件、{} 个代码块、{} 个符号、{} 个词元），\
+             候选融合与上下文打包尚未接入",
+            stats.files, stats.chunks, retrieval.symbols, retrieval.terms
         );
         if let Some(reason) = self.degraded_reason.as_deref() {
             detail.push('；');
@@ -372,6 +386,31 @@ impl CodeContextPlugin {
             &detail,
             Some(stats),
         ))
+    }
+
+    /// 在已建成的索引上执行两路检索，返回未融合的分通道候选。
+    ///
+    /// 这是 Phase 9 融合层的输入。返回的是**内部候选**，不是 Agent 可见结果。
+    /// 索引尚未建成时返回空。
+    pub fn search_candidates(
+        &self,
+        query: &str,
+        path_scope: Option<&str>,
+        limit: usize,
+    ) -> Vec<Vec<SearchCandidate>> {
+        self.repository
+            .as_ref()
+            .and_then(|context| context.retrieval.as_ref())
+            .map(|retrieval| retrieval.search_all(query, path_scope, limit))
+            .unwrap_or_default()
+    }
+
+    /// 返回检索索引规模；尚未建成时为 `None`。
+    pub fn retrieval_stats(&self) -> Option<RetrievalStats> {
+        self.repository
+            .as_ref()
+            .and_then(|context| context.retrieval.as_ref())
+            .map(RetrievalIndex::stats)
     }
 
     /// 返回构建进行中的索引规模。
