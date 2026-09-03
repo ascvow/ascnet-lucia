@@ -336,9 +336,9 @@ async fn channel_event_sink_coalesces_model_text_notifications() {
     assert!(matches!(rx.recv().await, Some(UiEvent::ModelTextReady)));
 }
 
-/// 底栏上下文用量必须合并未缓存输入与缓存读写分项。
+/// 模型用量必须按分项转发，供底栏分别计算上下文规模与缓存命中率。
 #[tokio::test]
-async fn channel_event_sink_sums_prompt_cache_context_tokens() {
+async fn channel_event_sink_forwards_prompt_cache_usage_breakdown() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (sink, _model_deltas, _thinking_deltas) = ChannelEventSink::new(tx);
     let event = AgentEvent::new(
@@ -348,15 +348,55 @@ async fn channel_event_sink_sums_prompt_cache_context_tokens() {
         json!({
             "usage": {
                 "input_tokens": 100,
+                "output_tokens": 20,
                 "cache_read_tokens": 700,
                 "cache_write_tokens": 180
             }
         }),
     );
 
-    sink.record(&event).await.expect("应转发缓存上下文用量");
+    sink.record(&event).await.expect("应转发缓存用量分项");
 
-    assert!(matches!(rx.recv().await, Some(UiEvent::ContextUsage(980))));
+    let Some(UiEvent::ModelUsage(usage)) = rx.recv().await else {
+        panic!("应收到模型用量事件");
+    };
+    assert_eq!(usage.input_tokens, Some(100));
+    assert_eq!(usage.output_tokens, Some(20));
+    assert_eq!(usage.cache_read_tokens, Some(700));
+    assert_eq!(usage.cache_write_tokens, Some(180));
+}
+
+/// 缓存命中率按「缓存读取 ÷（缓存读取 + 未缓存输入）」计算，缓存写入不计入分母。
+///
+/// 写入是建立缓存的一次性成本；计进分母会让刚建立缓存的会话显示成低命中。
+#[test]
+fn cache_hit_rate_excludes_cache_writes_from_denominator() {
+    let usage = agent_core::model::TokenUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(20),
+        total_tokens: None,
+        cache_read_tokens: Some(900),
+        cache_write_tokens: Some(500),
+    };
+
+    let (label, _color) =
+        crate::ui::chat::cache_hit_status(&usage).expect("有缓存读取时应给出命中率");
+
+    assert!(label.starts_with("↺ 90%"), "{label}");
+}
+
+/// 没有缓存读取记录时不展示命中率，避免把"尚未命中"显示成 0%。
+#[test]
+fn cache_hit_rate_is_hidden_without_cache_reads() {
+    let usage = agent_core::model::TokenUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(20),
+        total_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: Some(500),
+    };
+
+    assert!(crate::ui::chat::cache_hit_status(&usage).is_none());
 }
 
 /// 高频推理摘要增量必须与回答文本分开合并，避免写入助手消息缓冲区。

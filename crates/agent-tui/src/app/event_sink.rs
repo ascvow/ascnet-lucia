@@ -5,6 +5,7 @@ use crate::theme::{COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_USER, COLOR_W
 #[cfg(feature = "plugins")]
 use crate::ui::plugin_bridge::plugin_footer_event;
 use agent_core::event::{AgentEvent, AgentEventKind, EventSink};
+use agent_core::model::TokenUsage;
 #[cfg(feature = "plugins")]
 use agent_plugin_protocol::{UiNavigationRequest, UI_NAVIGATION_EVENT};
 use agent_tool::{ToolCall, ToolOutputDelta, ToolResult};
@@ -77,9 +78,9 @@ impl EventSink for ChannelEventSink {
                 let _ = self.tx.send(UiEvent::ModelStarted);
             }
             AgentEventKind::ModelResponse => {
-                // 上下文包含未缓存输入与缓存读写分项，底栏必须显示本轮完整输入规模。
-                if let Some(tokens) = model_context_tokens(&event.payload) {
-                    let _ = self.tx.send(UiEvent::ContextUsage(tokens));
+                // 完整分项一并上送：底栏按输入合计显示上下文规模，缓存读写用于累计命中率。
+                if let Some(usage) = model_usage(&event.payload) {
+                    let _ = self.tx.send(UiEvent::ModelUsage(usage));
                 }
             }
             AgentEventKind::ModelTextDelta => {
@@ -202,16 +203,9 @@ impl EventSink for ChannelEventSink {
     }
 }
 
-/// 汇总模型响应中的全部输入分项，供底栏展示本轮真实上下文规模。
-fn model_context_tokens(payload: &Value) -> Option<u64> {
+/// 解析模型响应中的用量分项；全部字段缺失时返回 `None`。
+fn model_usage(payload: &Value) -> Option<TokenUsage> {
     let usage = payload.get("usage")?;
-    let parts = [
-        usage.get("input_tokens").and_then(Value::as_u64),
-        usage.get("cache_read_tokens").and_then(Value::as_u64),
-        usage.get("cache_write_tokens").and_then(Value::as_u64),
-    ];
-    parts
-        .iter()
-        .any(Option::is_some)
-        .then(|| parts.into_iter().flatten().fold(0, u64::saturating_add))
+    let usage: TokenUsage = serde_json::from_value(usage.clone()).ok()?;
+    (!usage.is_empty()).then_some(usage)
 }

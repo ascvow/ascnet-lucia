@@ -1,6 +1,7 @@
 //! TUI 事件循环在通道上传递的宿主事件与运行结果。
 
 use crate::session::conversation::UserSubmission;
+use agent_core::model::TokenUsage;
 use agent_core::AgentRun;
 use agent_session::{SessionId, SessionRecord, SessionStoreError, SessionSummary};
 use agent_tool::{ToolCall, ToolOutputDelta, ToolResult};
@@ -64,8 +65,10 @@ pub(crate) enum UiEvent {
         plugin_id: String,
         request: UiNavigationRequest,
     },
-    /// 最近一次模型请求的未缓存输入与缓存读写 token 总数。
-    ContextUsage(u64),
+    /// 最近一次模型响应的完整用量分项。
+    ///
+    /// 底栏用输入合计显示当前上下文规模，缓存读写分项用于累计会话命中率。
+    ModelUsage(TokenUsage),
     /// Agent 运行结束，携带至少一次持久化后的会话状态。
     AgentDone(Box<AgentCompletion>),
     /// 原生会话 Dialog 的摘要查询完成。

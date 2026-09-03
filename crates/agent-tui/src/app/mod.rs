@@ -21,7 +21,7 @@ use crate::session::{restore_session_messages, WorkspaceContext};
 use crate::theme::{COLOR_TEXT, COLOR_WARNING};
 #[cfg(feature = "plugins")]
 use crate::ui::view::ViewStack;
-use agent_core::model::ReasoningLevel;
+use agent_core::model::{ReasoningLevel, TokenUsage};
 use agent_core::{ContextLoader, Session};
 #[cfg(feature = "plugins")]
 use agent_plugin_protocol::UiFrame as PluginUiFrame;
@@ -194,6 +194,11 @@ pub(crate) struct App {
     pub(crate) last_message_width: u16,
     /// 最近一次模型请求消耗的上下文 token 数。
     pub(crate) context_tokens: Option<u64>,
+    /// 本次进程内累计的模型用量，跨会话切换保留。
+    ///
+    /// 与 `context_tokens` 的区别：后者是最近一轮的上下文规模，会随压缩回落；这里是累计
+    /// 消耗，用于观察缓存命中率和总输出量。
+    pub(crate) session_usage: TokenUsage,
     /// 配置的模型上下文窗口，用于状态栏计算占比。
     pub(crate) context_window: Option<u64>,
     /// models.dev 为当前模型声明的可选推理等级。
@@ -426,6 +431,7 @@ impl App {
             #[cfg(feature = "plugins")]
             last_message_width: 0,
             context_tokens: None,
+            session_usage: TokenUsage::default(),
             context_window: None,
             reasoning_levels: vec![ReasoningLevel::Off],
             reasoning_level: ReasoningLevel::Off,

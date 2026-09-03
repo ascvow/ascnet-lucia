@@ -910,8 +910,16 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     ));
                 }
             }
-            Some(UiEvent::ContextUsage(tokens)) => {
-                app.context_tokens = Some(tokens);
+            Some(UiEvent::ModelUsage(usage)) => {
+                // 输入合计代表本轮上下文规模：未缓存输入加上缓存读写都要真实送达模型。
+                let context_tokens = usage
+                    .input_tokens
+                    .into_iter()
+                    .chain(usage.cache_read_tokens)
+                    .chain(usage.cache_write_tokens)
+                    .fold(0, u64::saturating_add);
+                app.context_tokens = Some(context_tokens);
+                app.session_usage.add_assign(&usage);
             }
             Some(UiEvent::NativeSessionsLoaded(result)) => {
                 app.handle_native_sessions_loaded(result);

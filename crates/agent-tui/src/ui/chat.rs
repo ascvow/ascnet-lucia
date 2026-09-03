@@ -10,6 +10,7 @@ use crate::ui::markdown::truncate_line;
 #[cfg(feature = "plugins")]
 use crate::ui::plugin_render::render_composer_panels;
 use crate::ui::wrapped_line_count;
+use agent_core::model::TokenUsage;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
@@ -394,6 +395,15 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             Span::styled(format!("◔ {label}"), Style::new().fg(color)),
         ]);
     }
+    // 缓存命中率直接反映提示缓存是否真的在生效，只在窄终端下让位给更基础的信息。
+    if workspace.width >= 72 {
+        if let Some((label, color)) = cache_hit_status(&app.session_usage) {
+            footer.extend([
+                Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+                Span::styled(label, Style::new().fg(color)),
+            ]);
+        }
+    }
     let footer_area = footer_section;
     // 稳定运行期隐藏常驻插件计数，仅在加载中、启动详情或存在失败时占用右侧区域。
     #[cfg(feature = "plugins")]
@@ -463,6 +473,31 @@ fn format_token_count(tokens: u64) -> String {
     } else {
         format!("{:.1}m", tokens as f64 / 1_000_000.0)
     }
+}
+
+/// 格式化会话累计的提示缓存命中率；没有缓存读写记录时返回 `None`。
+///
+/// 分母取「缓存读取 + 未缓存输入」而不是全部输入：缓存写入是建立缓存的一次性成本，把它算进
+/// 分母会让刚开始的会话看起来永远命中不了。命中率低于三成标为警告色，那通常意味着前缀在
+/// 每轮之间发生了变化。
+pub(crate) fn cache_hit_status(usage: &TokenUsage) -> Option<(String, Color)> {
+    let cache_read = usage.cache_read_tokens?;
+    let uncached = usage.input_tokens.unwrap_or(0);
+    let considered = cache_read.saturating_add(uncached);
+    if considered == 0 {
+        return None;
+    }
+    let percentage =
+        (u128::from(cache_read) * 100 + u128::from(considered) / 2) / u128::from(considered);
+    let color = if percentage < 30 {
+        COLOR_WARNING
+    } else {
+        COLOR_MUTED
+    };
+    Some((
+        format!("↺ {percentage}% · {}", format_token_count(cache_read)),
+        color,
+    ))
 }
 
 /// 格式化上下文用量；配置窗口后追加百分比，并按 80% 与 95% 阈值着色。
