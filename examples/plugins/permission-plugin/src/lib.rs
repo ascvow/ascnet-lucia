@@ -214,6 +214,10 @@ struct PendingApproval {
     scope: &'static str,
     /// 审批卡片展示的静态风险等级，由可信 scope 决定。
     risk: &'static str,
+    /// 待应用变更的逐行预览；仅在调用参数自带前后文本时存在。
+    ///
+    /// 只用调用参数渲染，不读取文件：插件没有文件系统能力，也不该为了展示去获取它。
+    change_preview: Vec<ChangeLine>,
     /// Host 参数中可验证的保守运行级授权键；缺失资源选择器时不允许临时放行。
     rule_key: Option<String>,
     /// 当前 scope 是否允许创建本次运行临时规则；高风险和未知操作始终只能逐次批准。
@@ -566,6 +570,7 @@ impl PermissionPlugin {
                 key: approval_key,
                 tool_name: call.name.clone(),
                 summary: approval_summary(&call),
+                change_preview: change_preview(&call),
                 review_context: approval_review_context(&call, self.workspace_root.as_deref()),
                 action: approval_action(call.permission_scope),
                 reason: approval_reason(&call),
@@ -903,6 +908,68 @@ fn approval_rule_key(call: &ToolCall, workspace_root: Option<&Path>) -> Option<S
         .filter(|path| !path.is_empty())
         .unwrap_or(".");
     Some(format!("read:{}:{parent}", call.name))
+}
+
+/// 审批卡片中一行变更预览。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangeLine {
+    /// 行首标记：`-` 表示将被移除，`+` 表示将被写入。
+    marker: char,
+    /// 行内容，已按宽度截断。
+    text: String,
+}
+
+/// 变更预览允许展示的最大行数，超出部分折叠为计数。
+const MAX_CHANGE_PREVIEW_LINES: usize = 12;
+
+/// 单行变更预览允许展示的最大字符数。
+const MAX_CHANGE_PREVIEW_WIDTH: usize = 72;
+
+/// 从调用参数构造待应用变更的逐行预览。
+///
+/// 只处理自带前后文本的编辑类调用（`old_string`/`new_string`）。审批发生在执行之前，此时
+/// 文件尚未改动，而这两个参数已经完整描述了将要发生的替换，因此不需要读取文件就能让用户
+/// 看清改动内容。其他工具没有等价参数，返回空预览，卡片维持原样。
+fn change_preview(call: &ToolCall) -> Vec<ChangeLine> {
+    let string_arg = |key: &str| call.args.get(key).and_then(|value| value.as_str());
+    let (Some(old_text), Some(new_text)) = (string_arg("old_string"), string_arg("new_string"))
+    else {
+        return Vec::new();
+    };
+
+    let mut lines: Vec<ChangeLine> = old_text
+        .lines()
+        .map(|line| ChangeLine {
+            marker: '-',
+            text: truncate_preview(line),
+        })
+        .chain(new_text.lines().map(|line| ChangeLine {
+            marker: '+',
+            text: truncate_preview(line),
+        }))
+        .collect();
+    if lines.len() > MAX_CHANGE_PREVIEW_LINES {
+        let hidden = lines.len() - MAX_CHANGE_PREVIEW_LINES;
+        lines.truncate(MAX_CHANGE_PREVIEW_LINES);
+        lines.push(ChangeLine {
+            marker: ' ',
+            text: format!("… 其余 {hidden} 行未显示"),
+        });
+    }
+    lines
+}
+
+/// 按字符数截断预览行，避免超宽内容撑破审批卡片。
+fn truncate_preview(line: &str) -> String {
+    if line.chars().count() <= MAX_CHANGE_PREVIEW_WIDTH {
+        return line.to_string();
+    }
+    format!(
+        "{}…",
+        line.chars()
+            .take(MAX_CHANGE_PREVIEW_WIDTH)
+            .collect::<String>()
+    )
 }
 
 /// 生成不包含文件内容或密钥值的审批摘要。
@@ -1382,6 +1449,29 @@ fn approval_lines(pending: &PendingApproval, selected: usize, notice: Option<&st
             ],
         },
         UiLine { spans: Vec::new() },
+    ];
+    // 有具体改动内容时先展示它：用户判断该不该批准，看的就是这段。
+    if !pending.change_preview.is_empty() {
+        lines.push(UiLine {
+            spans: vec![styled_span("Change", UiColor::Gray, true)],
+        });
+        for line in &pending.change_preview {
+            let color = match line.marker {
+                '-' => UiColor::Red,
+                '+' => UiColor::Green,
+                _ => UiColor::Gray,
+            };
+            lines.push(UiLine {
+                spans: vec![styled_span(
+                    format!("{}{}", line.marker, line.text),
+                    color,
+                    false,
+                )],
+            });
+        }
+        lines.push(UiLine { spans: Vec::new() });
+    }
+    lines.extend([
         UiLine {
             spans: vec![styled_span("Reason", UiColor::Gray, true)],
         },
@@ -1401,7 +1491,7 @@ fn approval_lines(pending: &PendingApproval, selected: usize, notice: Option<&st
                 styled_span(pending.risk, UiColor::Yellow, false),
             ],
         },
-    ];
+    ]);
     if let Some(notice) = notice {
         lines.push(UiLine {
             spans: vec![styled_span(notice, UiColor::Yellow, false)],
@@ -2136,6 +2226,85 @@ mod tests {
         );
 
         assert_eq!(approval_summary(&call), "https://example.test/api");
+    }
+
+    /// 编辑类调用把待应用的前后文本渲染成增删预览，供用户在批准前看清改动。
+    #[test]
+    fn edit_calls_preview_the_pending_change() {
+        let call = scoped_call(
+            "edit-preview",
+            "edit_file",
+            json!({
+                "path": "src/lib.rs",
+                "old_string": "fn old() {}",
+                "new_string": "fn new() {}\nfn extra() {}",
+            }),
+            ToolPermissionScope::Write,
+        );
+
+        let preview = change_preview(&call);
+
+        assert_eq!(
+            preview,
+            vec![
+                ChangeLine {
+                    marker: '-',
+                    text: "fn old() {}".into()
+                },
+                ChangeLine {
+                    marker: '+',
+                    text: "fn new() {}".into()
+                },
+                ChangeLine {
+                    marker: '+',
+                    text: "fn extra() {}".into()
+                },
+            ]
+        );
+    }
+
+    /// 没有前后文本的调用不产生预览，审批卡片维持原有形态。
+    #[test]
+    fn non_edit_calls_have_no_change_preview() {
+        let call = scoped_call(
+            "write-whole",
+            "write_file",
+            json!({"path": "src/lib.rs", "content": "全量内容"}),
+            ToolPermissionScope::Write,
+        );
+
+        assert!(change_preview(&call).is_empty());
+    }
+
+    /// 超长改动按行数折叠、按宽度截断，不会撑破审批卡片。
+    #[test]
+    fn oversized_change_preview_is_bounded() {
+        let long_line = "x".repeat(MAX_CHANGE_PREVIEW_WIDTH + 40);
+        let many_lines = (0..MAX_CHANGE_PREVIEW_LINES + 5)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let call = scoped_call(
+            "edit-large",
+            "edit_file",
+            json!({
+                "path": "src/lib.rs",
+                "old_string": long_line,
+                "new_string": many_lines,
+            }),
+            ToolPermissionScope::Write,
+        );
+
+        let preview = change_preview(&call);
+
+        assert_eq!(preview.len(), MAX_CHANGE_PREVIEW_LINES + 1);
+        assert!(preview[0].text.ends_with('…'), "{:?}", preview[0]);
+        assert_eq!(
+            preview[0].text.chars().count(),
+            MAX_CHANGE_PREVIEW_WIDTH + 1
+        );
+        let last = preview.last().expect("应保留折叠说明");
+        assert!(last.text.contains("其余"), "{last:?}");
     }
 
     /// Unknown 工具应保留结构化标识并省略任务正文，避免正文路径被当成当前直接访问。
