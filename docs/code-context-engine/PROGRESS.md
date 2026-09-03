@@ -7,12 +7,15 @@
 
 ## Current Phase
 
-Phase 11 — Incremental Indexing
+Phase 7 / 8 — API Embedding Provider 与 Semantic Vector Index
 
 Status: COMPLETE
 Completed Date: 2026-09-03
 
-下一步：Phase 12 — Local Embedding Provider（BLOCKED）；按既定顺序进入 Phase 13 — Agent Tool Integration。
+**Phase 7 的 Host 阻塞已解除**：本轮实现了通用的宿主受限 HTTP 能力，Phase 7 与 Phase 8
+随之落地，语义检索端到端可用。Phase 12（Local Embedding Provider）仍被阻塞。
+
+下一步：Phase 13 — Agent Tool Integration（把融合与打包结果绑定到 `code_search` 返回值）。
 
 ## Overall Status
 
@@ -23,8 +26,8 @@ Completed Date: 2026-09-03
 - [x] Phase 4 — Structural Index
 - [x] Phase 5 — Lexical & Symbol Retrieval
 - [x] Phase 6 — Embedding Abstraction
-- [ ] Phase 7 — API Embedding Provider — **BLOCKED**（Host 无 HTTP 能力）
-- [ ] Phase 8 — Semantic Vector Index — **BLOCKED**（依赖 Phase 7 与 blob 存储）
+- [x] Phase 7 — API Embedding Provider（本轮实现宿主 HTTP 能力，阻塞解除）
+- [x] Phase 8 — Semantic Vector Index（向量内存驻留；落盘仍待 blob 存储）
 - [x] Phase 9 — Hybrid Retrieval
 - [x] Phase 10 — Context Builder
 - [x] Phase 11 — Incremental Indexing
@@ -33,14 +36,16 @@ Completed Date: 2026-09-03
 - [ ] Phase 14 — Retrieval Benchmark
 - [ ] Phase 15 — Hardening
 
-**实际执行顺序**（跳过 BLOCKED，保持依赖正确）：
+**实际执行顺序**：
 
 ```
-2 → 3 → 4 → 5 → 6 → [7 BLOCKED] → [8 BLOCKED] → 9 → 10 → 11 → [12 BLOCKED] → 13 → 14 → 15
+2 → 3 → 4 → 5 → 6 → 9 → 10 → 11 → 7 → 8 → [12 BLOCKED] → 13 → 14 → 15
 ```
 
-Phase 9 的融合层从一开始就按「任意子集」设计，因此语义分支缺席不阻塞它。Phase 13 交付的
-`code_search` 在语义分支缺席时进入 `Degraded`，这正是架构第 13 问要求的降级形态。
+Phase 7 / 8 原计划跳过，在 Phase 11 之后因宿主 HTTP 能力落地而补做。Phase 9 的融合层
+从一开始就按「任意子集」设计，因此语义分支从缺席到接入都不需要改动融合代码——
+新增的第三路通道是纯粹的加法。语义不可用时 `code_search` 进入 `Degraded`，
+这正是架构第 13 问要求的降级形态。
 
 ## Phase 编号对照
 
@@ -747,62 +752,104 @@ Known limitations:
 
 Next: Phase 12 — Local Embedding Provider（BLOCKED）
 
-## Blocked Phases
-
-三个阶段因 Host 能力缺失无法实现。按开发任务书 §25，记录 Blocker 而**不绕开架构做 hack 实现**。
+---
 
 ### Phase 7 — API Embedding Provider
 
-Status: BLOCKED
+Status: COMPLETE
+Completed Date: 2026-09-03
 
-Blocker：Host 未实现插件 HTTP 能力，且在插件加载期主动拒绝该声明。
+Summary：本阶段原被列为 BLOCKED（Host 未实现插件 HTTP 能力，且在加载期主动拒绝该声明）。
+本轮**先实现了原 Blocker 记录里的推荐方案 1**——通用宿主受限 HTTP 能力——随后 Phase 7 落地。
 
-Evidence:
-- `crates/agent-plugins/host/src/manifest.rs:1189` — `if self.http || self.secrets || !self.fs_write.is_empty()`
-  直接返回错误「当前 Lucia 版本尚未实现插件 HTTP、secret 或文件写入能力」。声明 `http = true`
-  的插件根本无法启动。
-- `wit/plugin.wit` 中不存在任何 HTTP import。
-- `crates/agent-plugins/host/src/wasm/mod.rs` 的 WASI ctx 刻意最小化，无 `inherit_network`、
-  无 `socket_addr_check`，`wasi:sockets` 不可用。
+Implemented（Host 侧，`agent-plugin-host` / `lucia`）:
+- **`host-http-request` 能力**：`wit` import、SDK 类型与宏接线、manifest
+  `[capabilities.http] allow_hosts`、audit 快照、linker 注册、capability 运行时。
+- **三道闸门**：manifest allowlist（宿主注入的 base URL 必须落在其中，使声明的授权边界
+  始终真实）、执行策略 `permits_network_access`（Profile 身份拥有最终否决权）、
+  请求整形（方法白名单排除 `CONNECT`/`TRACE`、路径不得逃逸 base URL、凭证类 header
+  不接受 Guest 覆盖、请求与响应体积上限、超时、**不跟随重定向**）。
+- **预算**：`ResourceLimits` 新增 `max_plugin_http_requests` 与
+  `max_plugin_http_request_bytes`，与模型完成分开计量——嵌入是高频小请求，
+  与低频大请求共用账本会让任意一方的上限失去意义。
+- **应用配置**（`[plugins.<id>]`）：通用 `http_base_url` / `http_api_key` /
+  `http_api_key_env` / `http_auth_header` / `http_auth_prefix` / 超时与体积上限。
+  凭证解析后直接交给 Host，**不进入激活元数据，因此不到达 Guest**。
+- 宿主把 `base_url` 的摘要作为 `http_endpoint_id` 注入激活元数据，供插件判定端点是否更换。
 
-Required capability：通用 `host-http-request`，manifest 形如 `[capabilities.http] allow_hosts = [...]`，
-凭证由 Host 注入（复制 `host-model-complete` 范式，密钥不进 Guest）。scope floor 为 `Network`
-——`manifest.rs` 已为 `http` 预留该映射，说明是「已规划未实现」而非「被否决」。
+Implemented（插件侧）:
+- **`ApiEmbeddingProvider`**：只提交相对路径 `embeddings` 与请求体，看不到地址也拿不到密钥。
+- **按 `index` 字段重排返回向量**：接口不保证返回顺序，而向量与 chunk 按下标对齐，
+  顺序错了不报错，只会让检索结果长期缓慢地不正确。
+- 非 2xx 回传状态码与端点说明；`health_check` 覆盖默认实现，真的打一次探测请求。
+- 嵌入空间纳入端点摘要：换端点即失效，触发语义索引重建。
 
-Possible solutions:
-1. 实现通用 Host HTTP 能力。属于独立的 Host 能力提案，不在本插件交付范围。
-2. `process_exec` + `curl`。**已否决**：会把 `code_search` 的 scope 从 `read` 抬到 `shell`，
-   每次调用都要用户审批，与「减少 Agent 交互与 token 成本」的产品目标直接冲突；且 API key
-   必须进入 Guest 线性内存，违反本仓库既有范式。详见 `adr-api-embedding.md`。
-3. 把 embedding 拆成独立 provider 插件，通过 `host-service-call` 供本插件调用，让网络权限留在
-   provider 插件的 manifest 上。仍然依赖方案 1 先落地。
+Tests：Host 侧新增 11 项，插件侧新增 11 项 provider 测试与 4 项配置测试。
 
-Recommended solution：方案 1。在该 Host 能力落地前，产品显示 `API Mode: 需要宿主 HTTP 能力`，
-不提供任何变通实现。
+Important decisions:
+1. **凭证由 Host 注入，不进 Guest。** 沿用 `host-model-complete` 范式与
+   `adr-api-embedding.md` 的结论，未采用被否决的 `process_exec + curl`。
+2. **不跟随重定向。** 跟随会让 allowlist 内的主机把请求引到 allowlist 外，
+   把前两道闸门一并绕过。
+3. **配置键用通用 `http_` 前缀而非嵌入语义。** 宿主能力是通用 HTTP，应用层不应承载
+   单个插件的业务概念。
+
+**Known cost —— `code_search` 的生效 scope 从 `read` 变为 `unknown`**：
+本插件同时持有 `workspace_read`（贡献 `read`）与 `http`（贡献 `network`），
+`merge_tool_permission_scopes` 对两个不相等且都不是 `control` 的 scope 返回 `unknown`。
+后果是 `code_search` 进入最保守的审批档位，且不再参与 `run.rs` 的只读并行批处理。
+这是启用 API 语义检索的直接代价，已在 `plugin.toml` 与冒烟测试中如实记录。
+不需要语义检索的部署删掉 `[capabilities.http]` 段即可回落到 `read`。
+
+Deferred:
+- 原 Blocker 记录的方案 3（拆独立 embedding provider 插件，让网络权限留在对方 manifest 上，
+  使 `code_search` 保持 `read`）**仍然可行且是消除上述代价的唯一途径**，留待需要时实施。
+
+Next: Phase 8 — Semantic Vector Index
+
+---
 
 ### Phase 8 — Semantic Vector Index
 
-Status: BLOCKED
+Status: COMPLETE
+Completed Date: 2026-09-03
 
-Blocker：双重依赖 —— 无可用 embedding provider（Phase 7 / 12 均被阻塞），且现有存储装不下向量。
+Summary：本阶段原被列为 BLOCKED，理由是「无可用 embedding provider」与「现有存储装不下向量」。
+前者随 Phase 7 解除；后者被重新界定：`adr-storage.md` 把向量列为「V1 不存在」，
+**说的是持久化而不是存在**。结构索引、符号表与倒排索引同样装不下 8 MiB 存储，
+它们的处理方式是内存驻留、进程启动后按需重建。向量走同一条路，语义检索因此在 V1 成立。
 
-Evidence:
-- `crates/agent-plugins/host/src/wasm/state.rs` 存储上限 8 MiB / 8192 键；
-  `capability/mod.rs` 每次写入克隆全量 map 并重写整个文件（`to_vec_pretty` + 两次 fsync）。
-  数十 MB 的向量在这条通道上完全不可行。
-- 无 blob 接口：`IndexStore` 只能用 `store_get/set/remove/list`（JSON KV）。
+Implemented:
+- **`SemanticIndex`**：chunk 向量的内存驻留存储，支持 upsert / `contains` /
+  `remove_file` / 按嵌入空间重置与兼容性判断。
+- **线性精确扫描而非 ANN**：代码仓库 chunk 在数千到数万量级，此时线性扫描常数更小，
+  且结果精确、行为确定——近似索引会让同一查询在索引重建后给出不同结果，
+  破坏检索质量的可回归性。
+- **写入时归一化**，检索用点积代替余弦。零向量与含 `NaN`/`Inf` 的向量直接拒绝：
+  一个 `NaN` 会让它参与的全部比较返回 `false`，排序变成未定义且不报错。
+- **维度不符时返回空**而不是给出无意义的排名。
+- **接入 RRF**：`search_hybrid` 在查询向量缺席、语义索引未就绪或维度不符时自动退化为
+  两路，结果与原 `search` 完全一致。Phase 9 的融合层无需任何改动就接住了第三路通道——
+  「任意通道子集」的设计在这里兑现。
+- **端到端链路**：结构索引就绪后建立语义索引（只嵌入尚无向量的 chunk，
+  全量重嵌在 API 模式下等于重新付费）；检索时嵌入查询；语义索引未就绪时不发起请求；
+  嵌入失败降级为两路并记录原因；索引状态据此区分 `Ready` 与 `Degraded`。
+- 送去嵌入的是「路径 + 限定名 + 签名 + 文档注释」而非源码正文：正文不驻留内存，
+  且模型对「这段代码做什么」最敏感的信号就在签名与文档注释里。
 
-Required capability：`host-store-blob-read` / `host-store-blob-write`（块级二进制接口），
-建议默认配额 256 MiB。该能力不含 ACE 语义，记忆插件与知识插件同样受益
-——knowledge-plugin 的 `MAX_ENTRIES = 2_000` 截断就是被同一限制逼出来的。
+Tests：新增 14 项语义索引测试、5 项通道接线测试、5 项端到端测试。插件单测 301 → 324。
 
-Possible solutions:
-1. 实现 blob 存储能力 + 解除 Phase 7 或 12 的阻塞。
-2. 向量存进 JSON KV。**否决**：8 MiB 上限下只能存约数千条 768 维向量的截断版本，且每次写入
-   重写全量，中等仓库即不可用。
-3. 向量写入用户仓库。**否决**：违反「索引不写用户仓库」的既有约定。
+**Known limitation —— 向量不落盘**：进程重启后需要重新嵌入整个仓库，
+对 API provider 意味着重新付费与等待。这个问题的解法就是原 Blocker 记录里的
+blob 存储能力（`host-store-blob-read` / `host-store-blob-write`，建议配额 256 MiB），
+本阶段没有实现它，也**没有采用被否决的两条替代路径**（向量塞进 JSON KV、写入用户仓库）。
+落盘仍属 V2。
 
-Recommended solution：方案 1，且必须在 Phase 7 或 12 至少一者解除阻塞之后。
+Next: Phase 13 — Agent Tool Integration
+
+## Blocked Phases
+
+一个阶段因 Host 能力缺失无法实现。按开发任务书 §25，记录 Blocker 而**不绕开架构做 hack 实现**。
 
 ### Phase 12 — Local Embedding Provider
 
