@@ -23,8 +23,8 @@ mod tests;
 use crate::index::StructuralIndex;
 use crate::model::{CodeChunk, SymbolKind};
 use crate::parser::parse_file;
-use crate::retrieval::{tokenize_is_cjk, FusionDebug, SearchResult};
 use crate::repository::content_hash;
+use crate::retrieval::{tokenize_is_cjk, FusionDebug, SearchResult};
 use agent_plugin::PluginHostApi;
 use std::collections::BTreeMap;
 
@@ -262,7 +262,11 @@ struct Selected {
 ///
 /// 数量与多样性约束必须等条目成功回读后再施加：前排候选可能已失效或超出 token 预算，
 /// 提前截断会让后面的有效候选无法补位。
-fn select(results: Vec<SearchResult>, config: &ContextConfig, stats: &mut ContextStats) -> Vec<Selected> {
+fn select(
+    results: Vec<SearchResult>,
+    config: &ContextConfig,
+    stats: &mut ContextStats,
+) -> Vec<Selected> {
     let mut kept: Vec<Selected> = Vec::new();
 
     // 输入已按分数降序；逐条尝试并入已保留集合，因此保留的总是更高分的那一条。
@@ -529,7 +533,12 @@ fn slice_lines(lines: &[&str], start_line: u32, end_line: u32) -> String {
 }
 
 /// 取行范围并按上限截断，返回正文、实际结束行与是否截断。
-fn take_lines(lines: &[&str], start_line: u32, end_line: u32, max_lines: u32) -> (String, u32, bool) {
+fn take_lines(
+    lines: &[&str],
+    start_line: u32,
+    end_line: u32,
+    max_lines: u32,
+) -> (String, u32, bool) {
     if max_lines == 0 || start_line == 0 || end_line < start_line {
         return (String::new(), start_line.saturating_sub(1), false);
     }
