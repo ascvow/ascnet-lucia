@@ -75,8 +75,29 @@ pub use retrieval::{
     tokenize, CandidateSource, FusionConfig, FusionDebug, RetrievalIndex, RetrievalStats,
     SearchCandidate, SearchResult, SymbolMatch,
 };
+pub use semantic::SemanticIndex;
 pub use storage::{IndexStore, ManifestLoad};
 pub use tool::{CodeSearchRequest, TOOL_NAME};
+
+/// 构造送去嵌入的文档文本。
+///
+/// 拼接限定名、签名与文档注释，而不是直接用源码正文：正文不驻留内存（见 adr-storage.md），
+/// 且嵌入模型对"这段代码是干什么的"最敏感的信号恰恰在签名与文档注释里。缺失的字段直接
+/// 跳过，不填占位符——占位符会成为所有同类 chunk 的共同噪声。
+fn semantic_document_text(chunk: &CodeChunk) -> String {
+    let mut parts = Vec::new();
+    parts.push(chunk.file_path.clone());
+    if let Some(qualified) = chunk.qualified_symbol.as_deref() {
+        parts.push(qualified.to_string());
+    }
+    if let Some(signature) = chunk.signature.as_deref() {
+        parts.push(signature.to_string());
+    }
+    if let Some(doc) = chunk.doc_comment.as_deref() {
+        parts.push(doc.to_string());
+    }
+    parts.join("\n")
+}
 
 /// 宿主注入工作区根的激活元数据键。
 const WORKSPACE_ROOT_KEY: &str = "workspace_root";
@@ -118,6 +139,11 @@ struct RepositoryContext {
     index: Option<StructuralIndex>,
     /// 已建成的检索索引（符号表 + 词法倒排）。
     retrieval: Option<RetrievalIndex>,
+    /// 语义向量索引。
+    ///
+    /// 同样内存驻留：向量体量远超宿主存储上限，落盘要等 blob 能力（见 adr-storage.md）。
+    /// 未配置嵌入 provider 时保持为空，检索自动退化为词法与符号两路。
+    semantic: SemanticIndex,
     /// 已确认成功写入、等待下一次增量构建的仓库相对路径。
     dirty_paths: BTreeSet<String>,
     /// 尚未收到终态结果的写入调用，键为运行 ID 与调用 ID 的组合。
@@ -246,6 +272,7 @@ impl CodeContextPlugin {
             build: None,
             index: None,
             retrieval: None,
+            semantic: SemanticIndex::new(),
             dirty_paths: BTreeSet::new(),
             pending_writes: BTreeMap::new(),
         });
@@ -416,16 +443,24 @@ impl CodeContextPlugin {
             .is_err();
         context.index = Some(index);
         context.retrieval = Some(retrieval);
-        // 语义分支尚未接入（Host 缺 HTTP 与 embedding 能力，见 PROGRESS.md 的 Blocked Phases），
-        // 因此就绪状态是 Degraded 而不是 Ready——这与架构第 13 问的定义一致，不是错误。
-        self.index_status = IndexStatus::Degraded;
+        // 在交出 `context` 的可变借用前取走事件所需的计数。
+        let remaining_dirty_count = context.dirty_paths.len();
+
+        // 语义向量在结构索引就绪后建立。失败不影响已就绪的两路检索，只是把状态留在
+        // Degraded——这与架构第 13 问对降级形态的定义一致，不是错误。
+        let semantic_ready = self.build_semantic_index(host);
+        self.index_status = if semantic_ready {
+            IndexStatus::Ready
+        } else {
+            IndexStatus::Degraded
+        };
         Self::emit_index_progress(
             host,
             is_incremental,
             ScanProgress::Complete,
             scan_stats,
             incremental_stats,
-            context.dirty_paths.len(),
+            remaining_dirty_count,
         );
     }
 
@@ -688,6 +723,114 @@ impl CodeContextPlugin {
             &detail,
             Some(stats),
         ))
+    }
+
+    /// 执行含语义通道的混合检索。
+    ///
+    /// 查询嵌入失败时降级为两路检索而不是返回错误：用户要的是结果，不是一条
+    /// "嵌入端点挂了"的报错。降级原因记录在 `degraded_reason` 里供工具返回值携带。
+    pub fn search_results(
+        &mut self,
+        host: &dyn PluginHostApi,
+        query: &str,
+        path_scope: Option<&str>,
+        limit: usize,
+    ) -> Vec<SearchResult> {
+        let query_vector = self.embed_query(host, query);
+        let Some(context) = self.repository.as_ref() else {
+            return Vec::new();
+        };
+        let (Some(index), Some(retrieval)) = (context.index.as_ref(), context.retrieval.as_ref())
+        else {
+            return Vec::new();
+        };
+        retrieval.search_hybrid(
+            index,
+            &context.semantic,
+            query,
+            query_vector.as_deref(),
+            path_scope,
+            limit,
+        )
+    }
+
+    /// 计算查询向量；嵌入不可用或语义索引未就绪时返回 `None`。
+    ///
+    /// 语义索引未就绪时**不发起嵌入请求**：没有可比对的库内向量，这次调用纯属浪费
+    /// 配额与延迟。
+    fn embed_query(&mut self, host: &dyn PluginHostApi, query: &str) -> Option<Vec<f32>> {
+        if !self
+            .repository
+            .as_ref()
+            .is_some_and(|context| context.semantic.is_ready())
+        {
+            return None;
+        }
+        let provider = embedding::select_provider(&self.config, host);
+        match provider.embed_query(query) {
+            Ok(vector) => Some(vector),
+            Err(error) => {
+                self.degraded_reason = Some(format!("查询嵌入失败，已降级为两路检索：{error}"));
+                None
+            }
+        }
+    }
+
+    /// 为已建成的结构索引计算语义向量。
+    ///
+    /// 返回语义索引是否可用于检索。嵌入不可用时返回 `false` 并记录降级原因，
+    /// **不返回错误**：两路检索已经就绪，语义缺席只降低召回质量，不该让整次构建失败。
+    ///
+    /// 嵌入空间发生变化时先整体重置——旧向量与新查询向量不可比较，混用会让检索结果
+    /// 长期缓慢地不正确。
+    fn build_semantic_index(&mut self, host: &dyn PluginHostApi) -> bool {
+        let provider = embedding::select_provider(&self.config, host);
+        let Some(space) = provider.space() else {
+            // 未配置嵌入 provider 是正常状态，不构成降级原因。
+            return false;
+        };
+        let Some(context) = self.repository.as_mut() else {
+            return false;
+        };
+        let Some(index) = context.index.as_ref() else {
+            return false;
+        };
+        if !context.semantic.is_compatible_with(&space) {
+            context.semantic.reset(space);
+        } else if context.semantic.space().is_none() {
+            context.semantic.reset(space);
+        }
+
+        // 只嵌入尚无向量的 chunk：全量重嵌在 API 模式下等于重新付费。
+        let pending: Vec<(String, String, String)> = index
+            .chunks()
+            .filter(|chunk| !context.semantic.contains(&chunk.id))
+            .map(|chunk| {
+                (
+                    chunk.id.clone(),
+                    chunk.file_path.clone(),
+                    semantic_document_text(chunk),
+                )
+            })
+            .collect();
+        if pending.is_empty() {
+            return context.semantic.is_ready();
+        }
+
+        let inputs: Vec<String> = pending.iter().map(|(_, _, text)| text.clone()).collect();
+        match provider.embed_documents(&inputs) {
+            Ok(vectors) => {
+                for ((chunk_id, file_path, _), vector) in pending.iter().zip(vectors.iter()) {
+                    context.semantic.upsert(chunk_id, file_path, vector);
+                }
+                self.degraded_reason = None;
+                context.semantic.is_ready()
+            }
+            Err(error) => {
+                self.degraded_reason = Some(format!("语义索引不可用：{error}"));
+                false
+            }
+        }
     }
 
     /// 在已建成的索引上执行两路检索，返回未融合的分通道候选。
@@ -1502,6 +1645,117 @@ mod tests {
         assert!(provider
             .embed(EmbeddingInputKind::Query, &["x".to_string()])
             .is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // 端到端语义检索
+    // -----------------------------------------------------------------------
+
+    /// 语义链路测试用的最小仓库。
+    const SEMANTIC_FIXTURE: &[(&str, &str)] = &[(
+        "src/permission.rs",
+        "/// 检查工具调用是否需要审批。\npub fn check_permission(id: &str) -> bool {\n    id.is_empty()\n}\n",
+    )];
+
+    /// 构造启用 API 嵌入的激活上下文。
+    fn api_activation_context(workspace_root: &str) -> ActivationContext {
+        let mut context = activation_context(workspace_root);
+        context
+            .metadata
+            .insert("embedding_dimension".into(), "4".into());
+        // 该键正常由宿主注入，测试里直接给出。
+        context
+            .metadata
+            .insert("http_endpoint_id".into(), "test-endpoint".into());
+        context
+    }
+
+    /// 在带仓库内容的宿主上激活并推进索引至完成。
+    fn indexed(host: &crate::testing::RepoHost, context: ActivationContext) -> CodeContextPlugin {
+        let mut plugin = CodeContextPlugin::default();
+        plugin.activate(host, context).expect("激活插件");
+        // 构建按 fuel 预算分片；小仓库通常一轮完成，这里仍循环以免依赖分片粒度。
+        for _ in 0..8 {
+            plugin.advance_index(host);
+            if plugin.index_status() != IndexStatus::Indexing {
+                break;
+            }
+        }
+        plugin
+    }
+
+    /// 嵌入可用时必须建立语义索引并报告 Ready。
+    #[test]
+    fn semantic_index_is_built_when_embedding_is_available() {
+        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE).with_echo_embeddings(4);
+        let plugin = indexed(&host, api_activation_context("/repo/a"));
+
+        assert_eq!(
+            plugin.index_status(),
+            IndexStatus::Ready,
+            "语义索引建成后应报告 Ready 而不是 Degraded"
+        );
+        assert!(!host.http_requests().is_empty(), "必须真的调用嵌入端点");
+    }
+
+    /// 嵌入端点失败时必须降级为两路检索，而不是让索引构建失败。
+    #[test]
+    fn embedding_failure_degrades_instead_of_failing_the_build() {
+        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE)
+            .with_http_responses(vec![crate::testing::http_json(500, "upstream error")]);
+        let plugin = indexed(&host, api_activation_context("/repo/a"));
+
+        assert_eq!(plugin.index_status(), IndexStatus::Degraded);
+        assert!(
+            plugin
+                .degraded_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("语义索引不可用")),
+            "必须说明降级原因，实际：{:?}",
+            plugin.degraded_reason
+        );
+        // 两路检索仍然可用。
+        assert!(!plugin.search_candidates("permission", None, 10).is_empty());
+    }
+
+    /// 未配置嵌入端点时必须走两路检索，且不发起任何 HTTP 调用。
+    #[test]
+    fn without_endpoint_no_http_call_is_made() {
+        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE);
+        let plugin = indexed(&host, activation_context("/repo/a"));
+
+        assert_eq!(plugin.index_status(), IndexStatus::Degraded);
+        assert!(host.http_requests().is_empty(), "没有端点时不应发起嵌入请求");
+        assert!(!plugin.search_candidates("permission", None, 10).is_empty());
+    }
+
+    /// 语义索引就绪后，检索必须真的嵌入查询并返回融合结果。
+    #[test]
+    fn search_embeds_query_and_returns_fused_results() {
+        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE).with_echo_embeddings(4);
+        let mut plugin = indexed(&host, api_activation_context("/repo/a"));
+        assert_eq!(plugin.index_status(), IndexStatus::Ready);
+
+        let results = plugin.search_results(&host, "permission check", None, 10);
+
+        assert!(!results.is_empty(), "混合检索应返回结果");
+        assert_eq!(
+            host.http_requests().len(),
+            2,
+            "建索引一次、查询一次，共两次端点调用"
+        );
+    }
+
+    /// 语义索引未就绪时不得为查询发起嵌入请求——没有可比对的向量，纯属浪费配额。
+    #[test]
+    fn query_is_not_embedded_when_semantic_index_is_unready() {
+        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE);
+        let mut plugin = indexed(&host, activation_context("/repo/a"));
+
+        let results = plugin.search_results(&host, "permission check", None, 10);
+
+        assert!(!results.is_empty(), "两路检索仍应有结果");
+        assert!(host.http_requests().is_empty(), "不应为查询发起嵌入");
     }
 
     /// 卸载后必须释放仓库上下文并回到未索引状态。

@@ -124,6 +124,13 @@ impl SemanticIndex {
         }
     }
 
+    /// 判断某个 chunk 是否已有向量。
+    ///
+    /// 增量嵌入依赖它跳过已算过的 chunk：在 API 模式下重复嵌入等于重新付费。
+    pub fn contains(&self, chunk_id: &str) -> bool {
+        self.entries.iter().any(|entry| entry.chunk_id == chunk_id)
+    }
+
     /// 移除一个文件的全部向量，供增量重建使用。
     pub fn remove_file(&mut self, file_path: &str) {
         self.entries.retain(|entry| entry.file_path != file_path);

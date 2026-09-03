@@ -22,6 +22,31 @@ pub fn http_json(status: u16, body: &str) -> Result<HttpResponse> {
     })
 }
 
+/// 按请求中的 `input` 条数生成一份合法嵌入应答。
+///
+/// 固定条数的伪应答会在 chunk 数变化时失效，而 chunk 数取决于解析器——把断言绑在它上面
+/// 等于让无关改动去改测试。这里按请求实际条数生成，行为与真实端点一致。
+///
+/// 第 i 条向量把第 `i % dimension` 位置一，使"哪条最相似"完全可预测。
+fn echo_embeddings(request: &HttpRequest, dimension: usize) -> Result<HttpResponse> {
+    let body: Value = serde_json::from_str(request.body.as_deref().unwrap_or("{}"))
+        .map_err(|error| anyhow!("伪端点无法解析请求正文：{error}"))?;
+    let count = body
+        .get("input")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .ok_or_else(|| anyhow!("伪端点要求请求带 input 数组"))?;
+    let items: Vec<String> = (0..count)
+        .map(|index| {
+            let vector: Vec<String> = (0..dimension)
+                .map(|axis| if axis == index % dimension { "1" } else { "0" }.to_string())
+                .collect();
+            format!(r#"{{"index":{index},"embedding":[{}]}}"#, vector.join(","))
+        })
+        .collect();
+    http_json(200, &format!(r#"{{"data":[{}]}}"#, items.join(",")))
+}
+
 /// 记录调用的宿主替身。
 #[derive(Default)]
 pub struct TestHost {
@@ -37,11 +62,13 @@ pub struct TestHost {
     workspace_available: bool,
     /// 当前工作区只读能力是否可用。
     workspace_read_available: bool,
-    /// 按调用顺序返回的 HTTP 应答队列；为空时 `http_request` 失败。
+    /// 按调用顺序返回的 HTTP 应答队列；为空时回落到 `echo_embeddings` 或失败。
     ///
     /// 嵌入 provider 的正确性几乎全在「怎么解析端点返回的东西」上：顺序错乱、条数不符、
     /// 维度不符、非 2xx。真实端点无法稳定复现这些，用队列逐一构造。
     http_responses: RefCell<Vec<Result<HttpResponse>>>,
+    /// 队列耗尽后按请求条数自动生成嵌入应答的维度；`None` 表示不自动生成。
+    echo_embedding_dimension: Option<usize>,
     /// 已收到的 HTTP 请求，用于断言插件提交了什么。
     http_requests: RefCell<Vec<HttpRequest>>,
 }
@@ -76,6 +103,12 @@ impl TestHost {
     pub fn with_http_responses(mut self, responses: Vec<Result<HttpResponse>>) -> Self {
         // 反转一次，使 `pop` 按传入顺序取用。
         self.http_responses = RefCell::new(responses.into_iter().rev().collect());
+        self
+    }
+
+    /// 让替身像真实嵌入端点那样按请求条数生成应答。
+    pub fn with_echo_embeddings(mut self, dimension: usize) -> Self {
+        self.echo_embedding_dimension = Some(dimension);
         self
     }
 
@@ -285,10 +318,13 @@ impl PluginHostApi for TestHost {
 
     fn http_request(&self, request: &HttpRequest) -> Result<HttpResponse> {
         self.http_requests.borrow_mut().push(request.clone());
-        self.http_responses
-            .borrow_mut()
-            .pop()
-            .unwrap_or_else(|| Err(anyhow!("测试替身没有更多预置 HTTP 应答")))
+        if let Some(queued) = self.http_responses.borrow_mut().pop() {
+            return queued;
+        }
+        match self.echo_embedding_dimension {
+            Some(dimension) => echo_embeddings(request, dimension),
+            None => Err(anyhow!("测试替身没有更多预置 HTTP 应答")),
+        }
     }
 }
 
@@ -354,6 +390,23 @@ impl RepoHost {
     /// 返回虚拟仓库宿主收到的扩展事件快照。
     pub fn emitted_event_payloads(&self) -> Vec<ExtensionEvent> {
         self.inner.emitted_event_payloads()
+    }
+
+    /// 预置按序返回的 HTTP 应答，供语义索引的端到端测试使用。
+    pub fn with_http_responses(mut self, responses: Vec<Result<HttpResponse>>) -> Self {
+        self.inner = self.inner.with_http_responses(responses);
+        self
+    }
+
+    /// 让替身像真实嵌入端点那样按请求条数生成应答。
+    pub fn with_echo_embeddings(mut self, dimension: usize) -> Self {
+        self.inner = self.inner.with_echo_embeddings(dimension);
+        self
+    }
+
+    /// 返回已收到的 HTTP 请求快照。
+    pub fn http_requests(&self) -> Vec<HttpRequest> {
+        self.inner.http_requests()
     }
 
     /// 标记一个文件为不可读，模拟二进制内容或权限失败。
