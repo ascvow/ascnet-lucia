@@ -405,6 +405,24 @@ pub enum PromptCacheRetention {
     Long,
 }
 
+/// 服务商侧会话亲和 header 的格式。
+///
+/// 兼容网关通常不读 body 里的 `prompt_cache_key`，而是按 HTTP header 把同一会话的请求
+/// 固定路由到持有其前缀缓存的副本。格式由网关决定，因此必须由配置显式声明。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionAffinity {
+    /// 不发送任何会话亲和 header。
+    #[default]
+    Off,
+    /// 发送 `session_id`、`x-client-request-id` 和 `x-session-affinity`。
+    OpenAi,
+    /// 只发送 `x-client-request-id` 和 `x-session-affinity`。
+    OpenAiNoSession,
+    /// 发送 `x-session-id`。
+    OpenRouter,
+}
+
 /// Request sent from ReAct loop to a model adapter.
 /// ReAct loop 发送给模型适配器的请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]

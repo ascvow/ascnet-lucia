@@ -1,7 +1,7 @@
 //! ModelGateway routes provider-neutral requests to concrete protocol adapters.
 //! ModelGateway 把与服务商无关的请求路由到具体协议适配器。
 
-use super::{ChatModel, ModelRequest, ModelResponse, ProviderAdapter};
+use super::{ChatModel, ModelRequest, ModelResponse, ProviderAdapter, SessionAffinity};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,13 @@ pub struct ModelProviderConfig {
     /// 发送给服务商的额外 HTTP header。
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
+
+    /// 会话亲和 header 格式；默认不发送。
+    ///
+    /// 兼容网关多数按 header 而不是 `prompt_cache_key` 做提示缓存路由，但 header 名称
+    /// 各不相同，发错反而可能被网关拒绝，因此必须由调用方按网关文档显式声明。
+    #[serde(default)]
+    pub session_affinity: SessionAffinity,
 }
 
 impl ModelProviderConfig {
@@ -74,7 +81,14 @@ impl ModelProviderConfig {
             base_url: None,
             openai_protocol: OpenAiProtocol::default(),
             extra_headers: HashMap::new(),
+            session_affinity: SessionAffinity::default(),
         }
+    }
+
+    /// 声明服务商侧会话亲和 header 的格式。
+    pub fn with_session_affinity(mut self, session_affinity: SessionAffinity) -> Self {
+        self.session_affinity = session_affinity;
+        self
     }
 
     /// Build an OpenAI Responses provider config.
