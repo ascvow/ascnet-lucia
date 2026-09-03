@@ -78,6 +78,11 @@ if self.process_exec {
 
 **API Mode 的实现前置条件是 Host 新增通用 HTTP 能力。** 在此之前，产品显示 `API Mode: 需要宿主 HTTP 能力`，不提供子进程变通实现。
 
+> **实施状态（2026-09-03 更新）**：该前置条件已满足。通用 `host-http-request` 能力已实现
+> （`crates/agent-plugins/host/src/capability/http.rs`、`services.rs` 的 `HttpHostServices`、
+> `wasm/linker.rs` 注册），API Mode 可用。本节以下的契约设计**全部按原样落地**，
+> 仅有一处判断被实测推翻，见下方「scope floor 的实际结果」。
+
 契约沿用 `docs/plugin/api-capability-map.md:39` 已列为 P0 的推荐形状（Host 执行的结构化请求；域名 allowlist、响应上限、超时与重定向策略），并补充凭证处理：
 
 ```toml
@@ -99,17 +104,36 @@ import host-http-request: func(request-json: string) -> string;
 | `base_url` 实际值 | 应用配置 | 与 `[plugins.<id>]` 模型路由同一处 |
 | `Authorization` 等凭证 header | **Host 注入** | 复制 `host-model-complete` 范式，密钥不进 Guest |
 | 超时、重定向、响应体上限、并发 | Host | 与 `ExecutionPolicy` 的既有收紧语义一致 |
-| scope floor | `Network`（`manifest.rs:1109` 已定义） | 比 `Shell` 低一档，且语义准确 |
+| scope floor | 见下方「scope floor 的实际结果」 | 原判断为 `Network`，实测为 `Unknown` |
 
-注意 `manifest.rs:1109` 已经为 `http` 预留了 `ToolPermissionScope::Network` 的映射——能力被拒绝，但 scope 语义已经设计好了。这说明 HTTP 能力在本仓库是"已规划未实现"，不是"被否决"。
+注意 `manifest.rs` 已经为 `http` 预留了 `ToolPermissionScope::Network` 的映射——能力被拒绝，但 scope 语义已经设计好了。这说明 HTTP 能力在本仓库是"已规划未实现"，不是"被否决"。
 
-`Network` scope 仍然高于 `Read`。因此 API Mode 启用后 `code_search` 的审批要求会上升。缓解方式：把 embedding 调用与 `code_search` 工具解耦——索引构建时批量嵌入（后台任务，不经过工具调用路径），查询时的单条查询嵌入才是 `code_search` 内的网络访问。若这一点在实践中仍造成摩擦，可考虑把 embedding 拆成独立的 provider 插件，通过 `host-service-call` 供 Code Context Engine 调用，让网络权限留在 provider 插件的 manifest 上——这是本仓库已有的插件依赖与服务机制（`docs/plugin/dependencies-services.md`），不需要新能力。
+### scope floor 的实际结果
+
+**本节原先的判断「scope floor 为 `Network`，比 `Shell` 低一档」在本插件上不成立，实测结果是 `Unknown`。**
+
+原因是 `component_capability_scope_floor()` 会把插件持有的**全部**能力折算成一个下限，再用 `merge_tool_permission_scopes()` 合并：本插件同时持有 `workspace_read`（贡献 `Read`）与 `http`（贡献 `Network`），而该函数对两个不相等且都不是 `Control` 的 scope 返回 `Unknown`。这不是缺陷——它准确表达了「Host 无法刻画这个工具的副作用范围」，但代价比原先预计的更大：
+
+- `code_search` 进入最保守的审批档位，而不是 `Network` 档；
+- `code_search` 不再满足 `agent/run.rs` 中 `read_only_batch_end()` 的 `Read` 判定，因此**失去与其他只读工具并行批处理的资格**。
+
+原文提出的缓解方式（把批量嵌入放在索引构建期、不经过工具调用路径）**已经实现**，但它缓解的是调用频次，不改变 scope 折算结果——scope 是按 component 持有的能力静态计算的，与实际调用时机无关。
+
+因此真正能消除该代价的只有原文末尾提到的方案：**把 embedding 拆成独立 provider 插件**，通过 `host-service-call` 供 Code Context Engine 调用，让网络权限留在 provider 插件的 manifest 上，使本插件保持 `Read`。这是本仓库已有的插件依赖与服务机制（`docs/plugin/dependencies-services.md`），不需要新能力。当前实现选择了承担代价而不拆分，该方案保留待需要时实施。
 
 ## 隐私
 
-API Mode 会把**源码片段**（chunk 正文）发送到用户配置的 provider。
+API Mode 会把**源码信息**发送到用户配置的 provider。
 
-插件配置界面与文档必须原样写出这句话。**禁止使用"只有查询会离开你的机器"这类表述**——那是错的：文档嵌入阶段发送的正是源码本身。
+插件配置界面与文档必须原样写出这句话。**禁止使用"只有查询会离开你的机器"这类表述**——那是错的：文档嵌入阶段发送的正是仓库内容。
+
+**实际发送范围（2026-09-03 更新）**：当前实现发送的是每个 chunk 的
+**文件路径 + 限定符号名 + 声明签名 + 文档注释**（`semantic_document_text()`），
+**不含函数体正文**。这不是为隐私做的取舍，而是既有架构的结果——chunk 正文本来就不驻留内存
+（见 `adr-storage.md`），且嵌入模型对"这段代码做什么"最敏感的信号就在签名与文档注释里。
+
+即便如此，发送范围仍然包含仓库的完整结构与全部文档注释，**足以还原代码库的设计意图**。
+上面那句警告继续有效，不得因为"只发签名不发正文"就淡化它。
 
 用户首次启用 API 语义索引时应有一次明确确认，说明将要发送的内容范围（受 `path_scope` 与 ignore 规则约束）与目标地址。
 
