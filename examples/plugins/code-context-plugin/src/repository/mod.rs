@@ -84,6 +84,23 @@ impl Default for ScanBudget {
     }
 }
 
+/// 扫描过程中接收文件正文的回调。
+///
+/// 扫描器读取文件本就是为了算内容哈希，而索引构建需要同一份正文去做解析。让调用方在
+/// 读取的**同一时刻**拿到正文，既避免"扫描读一遍、解析再读一遍"的双倍宿主调用，
+/// 也避免为了后续解析而把整个仓库的正文驻留在内存里。
+pub trait FileSink {
+    /// 接收一个刚读取并通过校验的文件。
+    ///
+    /// `content` 在本次调用之后即失效，实现必须自行提取需要保留的信息。
+    fn accept(&mut self, file: &IndexableFile, content: &str);
+}
+
+/// 丢弃全部正文的 sink，用于只需要哈希与元数据的场景。
+impl FileSink for () {
+    fn accept(&mut self, _file: &IndexableFile, _content: &str) {}
+}
+
 /// 一个应当进入索引的文件。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexableFile {
@@ -260,6 +277,13 @@ impl RepositoryScan {
 
     /// 在给定预算内推进扫描。
     ///
+    /// 等价于不带 sink 的 [`RepositoryScan::advance_with`]，只计算文件哈希与元数据。
+    pub fn advance(&mut self, host: &dyn PluginHostApi, budget: ScanBudget) -> ScanProgress {
+        self.advance_with(host, budget, &mut ())
+    }
+
+    /// 在给定预算内推进扫描，并把每个文件的正文交给 `sink`。
+    ///
     /// 每轮循环先检查预算再发起宿主调用，因此返回时实际消耗不会超过预算。目录列举与
     /// 文件读取共享同一预算：先耗尽目录队列，再逐个读取文件内容。
     ///
@@ -267,7 +291,12 @@ impl RepositoryScan {
     ///
     /// 不返回错误。单个目录或文件的失败被记录为告警并继续——一个读不了的文件不能让整个
     /// 仓库无法检索。
-    pub fn advance(&mut self, host: &dyn PluginHostApi, budget: ScanBudget) -> ScanProgress {
+    pub fn advance_with(
+        &mut self,
+        host: &dyn PluginHostApi,
+        budget: ScanBudget,
+        sink: &mut dyn FileSink,
+    ) -> ScanProgress {
         let mut calls = 0u32;
         let mut bytes = 0u64;
 
@@ -285,7 +314,7 @@ impl RepositoryScan {
             }
             if let Some(file) = self.pending_files.pop_front() {
                 calls += 1;
-                bytes += self.read_file(host, &file);
+                bytes += self.read_file(host, &file, sink);
                 continue;
             }
 
@@ -429,7 +458,12 @@ impl RepositoryScan {
     }
 
     /// 读取文件内容并生成索引条目，返回读取的字节数。
-    fn read_file(&mut self, host: &dyn PluginHostApi, file: &PendingFile) -> u64 {
+    fn read_file(
+        &mut self,
+        host: &dyn PluginHostApi,
+        file: &PendingFile,
+        sink: &mut dyn FileSink,
+    ) -> u64 {
         let content = match host.read_file(&file.path) {
             Ok(content) => content,
             // 宿主的 `read_file` 走 UTF-8 校验，因此漏网的二进制文件会在这里失败。
@@ -465,13 +499,17 @@ impl RepositoryScan {
             return byte_len as u64;
         }
 
-        self.files.push(IndexableFile {
+        let indexable = IndexableFile {
             path: file.path.clone(),
             language: file.language,
             content_hash: content_hash(&content),
             byte_len: u32::try_from(byte_len).unwrap_or(u32::MAX),
             line_count: u32::try_from(content.lines().count()).unwrap_or(u32::MAX),
-        });
+        };
+        // 正文在这里交给 sink 后即被丢弃：索引构建需要它做解析，但把整个仓库的正文
+        // 驻留在 64 MiB 线性内存里是不可行的。
+        sink.accept(&indexable, &content);
+        self.files.push(indexable);
         self.stats.files_indexed += 1;
         byte_len as u64
     }

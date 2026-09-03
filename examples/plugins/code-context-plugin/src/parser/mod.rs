@@ -151,11 +151,6 @@ impl LineIndex {
         };
         u32::try_from(index + 1).unwrap_or(u32::MAX)
     }
-
-    /// 返回总行数。
-    pub fn line_count(&self) -> u32 {
-        u32::try_from(self.starts.len()).unwrap_or(u32::MAX)
-    }
 }
 
 /// 按语言解析源码。

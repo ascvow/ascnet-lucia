@@ -9,6 +9,7 @@
 //! 暴露出去，等于让模型去调一个它无法评估效果的旋钮，同时把内部实现焊死在工具契约上。
 
 use crate::error::CodeContextError;
+use crate::index::IndexStats;
 use crate::model::IndexStatus;
 use agent_plugin::{ToolCall, ToolPermissionScope, ToolResult, ToolSpec};
 use serde_json::{json, Value};
@@ -151,16 +152,41 @@ pub fn spec() -> ToolSpec {
 /// 用错误结果而不是「成功但结果为空」：后者会被模型读成「仓库里没有相关代码」，
 /// 从而得出错误结论并停止查找。错误结果配合明确的后续动作建议，模型会退回常规检索。
 pub fn unavailable_result(call: &ToolCall, status: IndexStatus, detail: &str) -> ToolResult {
+    unavailable_result_with_index(call, status, detail, None)
+}
+
+/// 构造带索引规模的不可用结果。
+///
+/// `index` 是当前结构索引的规模；索引尚未建成时为 `None`。这组数字既让用户知道引擎在
+/// 干什么，也是 smoke test 验证扫描与解析真的跑通的唯一可观测出口——没有它，
+/// "索引建成了"就只能靠推断。
+pub fn unavailable_result_with_index(
+    call: &ToolCall,
+    status: IndexStatus,
+    detail: &str,
+    index: Option<IndexStats>,
+) -> ToolResult {
+    let mut details = json!({
+        "status": status.as_str(),
+        "results": [],
+        "detail": detail,
+    });
+    if let Some(stats) = index {
+        details["index"] = json!({
+            "files": stats.files,
+            "chunks": stats.chunks,
+            "symbols": stats.symbols,
+            "structural_files": stats.structural_files,
+            "text_files": stats.text_files,
+            "truncated": stats.truncated,
+        });
+    }
     ToolResult::error(
         call.id.clone(),
         call.name.clone(),
         format!("代码索引不可用（{}）：{detail}", status.as_str()),
     )
-    .with_details(json!({
-        "status": status.as_str(),
-        "results": [],
-        "detail": detail,
-    }))
+    .with_details(details)
 }
 
 #[cfg(test)]

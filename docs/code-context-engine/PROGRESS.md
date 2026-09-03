@@ -7,7 +7,7 @@
 
 ## Current Phase
 
-Phase 4 — Structural Index
+Phase 5 — Lexical & Symbol Retrieval
 
 Status: NOT_STARTED
 
@@ -17,7 +17,7 @@ Status: NOT_STARTED
 - [x] Phase 1 — Plugin Skeleton
 - [x] Phase 2 — Repository Discovery
 - [x] Phase 3 — Structural Parsing
-- [ ] Phase 4 — Structural Index
+- [x] Phase 4 — Structural Index
 - [ ] Phase 5 — Lexical & Symbol Retrieval
 - [ ] Phase 6 — Embedding Abstraction
 - [ ] Phase 7 — API Embedding Provider — **BLOCKED**（Host 无 HTTP 能力）
@@ -319,6 +319,87 @@ Deferred items:
 
 Next: Phase 4 — Structural Index
 
+---
+
+### Phase 4 — Structural Index
+
+Status: COMPLETE
+Completed Date: 2026-09-03
+
+Summary：把 Phase 2 的扫描器与 Phase 3 的解析器接成一条索引流水线，产出可查询的结构索引，
+并按存储 ADR 分流持久化。`code_search` 现在真实驱动索引构建并如实上报索引规模。
+
+Implemented:
+- **`StructuralIndex`**：文件记录、chunk、符号的驻留存储，支持 upsert / remove / get / list、
+  按路径取 chunk、规模统计与清空。`upsert_file` 幂等——重复索引同一文件不产生孤儿 chunk，
+  这正是 Phase 11 增量重建依赖的性质。跨仓库写入被拒绝。
+- **`IndexBuild` 流水线**：扫描 → 解析 → 入库，复用 Phase 2 已冻结的 `ScanBudget` 游标形态，
+  **没有发明第二套分片机制**。
+- **`FileSink` 回调**：扫描器在读取文件的同一时刻把正文交给解析器，随后即丢弃。
+  避免了"扫描读一遍、解析再读一遍"的双倍宿主调用（有测试断言每个文件只读一次），
+  也避免为后续解析而把整个仓库的正文驻留在内存里。
+- **惰性构建**：由首次 `code_search` 触发，之后每次调用推进一个预算片。**不在 `activate` 里做**
+  ——`activate` 与其他导出共用同一份 fuel 预算，在那里做全量索引必然 trap。
+- **哈希表持久化**：`IndexStore::save_file_hashes` / `load_file_hashes` / `clear_file_hashes`，
+  键 `index.file_hashes`，上限 5 万条。超限时**不写入**而不是截断——残缺的哈希表会让 Phase 11
+  把未变更文件误判成已变更，比没有哈希表更糟。
+- **索引规模进入工具返回值**：`unavailable_result_with_index` 让 `code_search` 的 details 带上
+  files / chunks / symbols / structural_files / text_files / truncated。这既是用户可见的进度，
+  也是 smoke test 验证扫描与解析真跑通的唯一可观测出口。
+- **补齐 Phase 2 遗留的真实 Host 验证**：新增 smoke test 覆盖三层嵌套目录、多语言解析、
+  `.gitignore` 与默认忽略规则。
+
+Key files:
+- `examples/plugins/code-context-plugin/src/index/mod.rs` — `StructuralIndex`、`FileRecord`、`IndexStats`
+- `.../src/index/build.rs` — `IndexBuild` 流水线与 `BUILD_BUDGET`
+- `.../src/index/tests.rs` — 索引与流水线测试
+- `.../src/storage.rs` — 哈希表持久化
+- `.../src/repository/mod.rs` — 新增 `FileSink` 与 `advance_with`
+- `.../smoke-tests/tests/code_context.rs` — 真实 Host 嵌套目录索引测试
+
+Tests：新增 23 个，插件单测总数 146 → 169；smoke test 7 → 8。
+
+覆盖：索引增删改查、幂等 upsert、旧 chunk 清理、跨仓库拒绝、文本兜底统计、清空、
+哈希表导出与变更判断、端到端构建、每文件只读一次、分片与一次跑完结果一致、
+未完成构建的部分状态、读取失败隔离、解析失败文本兜底、空仓库、哈希表往返、
+重启后重建产出同一批 chunk 身份、无项目作用域时拒绝写入、清理哈希表。
+
+Tests Executed / Result:
+- `cargo test --offline -p code-context-plugin`：169 单元测试 + 1 文档测试，全通过。
+- `cargo clippy --offline -p code-context-plugin --all-targets`：无警告。
+- `bun run test:plugin:code-context`：全链通过（单测 → WASM release 构建 → 8 个 smoke test）。
+
+Build Result：`wasm32-wasip2` release 构建成功，无 regression。
+
+Important decisions:
+1. **索引本体内存驻留，不落盘。** 宿主存储是 8 MiB JSON KV 且每次写入重写全量，装不下 chunk
+   与符号表。这是存储 ADR 的既定结论，本阶段严格执行：落盘的只有 manifest 与路径→哈希表。
+2. **"重启恢复"的含义是重建结果确定。** 因为索引不落盘，恢复不是把索引读回来，而是
+   **重建产出与上一轮完全一致的 chunk 身份与哈希表**。测试按这个定义验证。
+3. **`FileSink` 而不是让扫描器保留正文。** 保留正文会让内存占用与仓库总体积成正比；
+   重新读一遍会让宿主调用翻倍。回调让两者都避免。
+4. **构建完成后的状态是 `Degraded` 而不是 `Ready`。** 语义分支缺席（Host 缺 HTTP 与 embedding
+   能力），按架构第 13 问的定义这就是 `Degraded`。**这不是错误，是如实反映能力边界。**
+5. **哈希表本阶段只写不读。** 结构索引每次启动重建，"上一轮的哈希"对本轮构建没有用处；
+   它的消费者是 Phase 11 的增量索引。刻意不预先把它读进上下文，避免留下无用字段。
+6. **`BUILD_BUDGET` 取值保守**（32 次宿主调用 / 512 KiB）。构建比纯扫描多跑一遍语法解析，
+   单位字节指令数高一个量级。**真实 fuel 消耗需在 Phase 14 benchmark 实测后再调**——
+   宁可多跑几轮，也不要 trap。
+
+Known limitations:
+- **`BUILD_BUDGET` 未经实测。** 当前取值是保守估计，可能过于保守（索引大仓库需要很多次
+  `code_search` 调用才能建成）。Phase 14 必须实测 fuel 消耗并校准。
+- 大仓库的首次索引会跨多次 `code_search` 调用，期间工具返回 `indexing` 状态与已处理文件数。
+  这是 fuel 模型的直接后果，不是缺陷；但用户体验上需要 Phase 13 给出更好的提示。
+- 索引规模上限（5 万文件 / 40 万 chunk）触顶时标记 `truncated` 并如实上报，不静默丢弃。
+- 检索尚未接入：`code_search` 仍返回明确的不可用状态 + 索引规模，不返回结果（Phase 5）。
+
+Deferred items:
+- 符号表与倒排索引的检索结构属于 Phase 5。
+- 增量 diff（added / modified / deleted）属于 Phase 11，哈希表已为其就位。
+
+Next: Phase 5 — Lexical & Symbol Retrieval
+
 ## Blocked Phases
 
 三个阶段因 Host 能力缺失无法实现。按开发任务书 §25，记录 Blocker 而**不绕开架构做 hack 实现**。
@@ -415,14 +496,15 @@ Recommended solution：方案 1。在此之前产品显示 `Local Mode: NOT SUPP
 
 ## Active Work
 
-Phase 4 — Structural Index。目标是把扫描与解析的产物真正持久化并可跨重启恢复。
+Phase 5 — Lexical & Symbol Retrieval。目标是在没有任何 embedding 的情况下，
+`code_search` 已经具备有价值的代码搜索能力。
 
 ## Known Issues
 
-无。Phase 1–3 全部验证通过，未发现 regression。
+无。Phase 1–4 全部验证通过，未发现 regression。
 
-待补验证（不阻塞，已在 Phase 2 条目登记）：扫描器的子目录遍历尚未在真实 Host 上跑过，
-Phase 4 接入索引构建时必须补一个真实 Host 的子目录扫描 smoke test。
+Phase 2 遗留的真实 Host 验证已在 Phase 4 补齐：
+`wasm_host_scans_nested_directories_and_builds_index` 覆盖三层嵌套目录、多语言解析与忽略规则。
 
 ## Architecture Drift
 
@@ -485,7 +567,25 @@ Tier 3  文本分块              —— 未覆盖语言、解析失败、无声
 
 ## Next Action
 
-开始 Phase 4 — Structural Index：
+开始 Phase 5 — Lexical & Symbol Retrieval：
+
+1. 新建 `examples/plugins/code-context-plugin/src/retrieval/`。
+2. **符号检索**：基于 `StructuralIndex::symbols()` 建立限定名排序数组 + 二分，支持精确、
+   前缀与限定名匹配。
+3. **词法检索**：标识符切分（camelCase / snake_case 拆词）+ BM25 倒排索引。必须适合代码
+   标识符形态：`PermissionRule`、`ALLOW_ALWAYS`、`tool_call_id`、`execute_command`。
+   索引来源是 chunk 的符号名、限定名、签名、文档注释与文件路径——**不驻留 chunk 全文**
+   （存储 ADR：正文按需重读）。
+4. 建立内部统一的 `SearchCandidate`，**不要直接绑定 Agent API**——Phase 9 的融合层要在它
+   之上工作。
+5. 索引结构在 `IndexBuild` 完成时一并构建，复用同一分片游标。
+
+Definition of Done：精确符号、部分符号、标识符、文件路径词、源码关键字、文档注释关键字
+六类 query 都有合理结果并有测试覆盖。
+
+---
+
+已完成的 Phase 4 原始计划（保留供追溯）：
 
 1. 把 Phase 2 的扫描器与 Phase 3 的解析器接到一条索引流水线上，复用 Phase 2 已冻结的
    `ScanBudget` 分片游标形态，**不发明第二套**。

@@ -15,9 +15,20 @@
 use crate::error::CodeContextError;
 use crate::model::IndexManifest;
 use agent_plugin::{PluginHostApi, PluginStoreScope};
+use std::collections::BTreeMap;
 
 /// 保存索引 manifest 的存储键。
 const MANIFEST_KEY: &str = "index.manifest";
+
+/// 保存路径 → 内容哈希表的存储键。
+const FILE_HASHES_KEY: &str = "index.file_hashes";
+
+/// 哈希表允许写入的最大条目数。
+///
+/// 宿主存储是 8 MiB 单文件、每次写入重写全量。单条记录约 80 字节（路径 + 摘要），
+/// 5 万条约 4 MiB——已经是该通道能承受的上限量级。超出时**不写入**而不是截断：
+/// 一份残缺的哈希表会让 Phase 11 把未变更文件误判成已变更，比没有哈希表更糟。
+const MAX_HASH_ENTRIES: usize = 50_000;
 
 /// 一次 manifest 读取的结果。
 ///
@@ -125,6 +136,78 @@ impl IndexStore {
             return Ok(());
         }
         host.store_remove(PluginStoreScope::Workspace, MANIFEST_KEY)
+            .map(|_| ())
+            .map_err(|error| CodeContextError::Storage(error.to_string()))
+    }
+
+    /// 保存路径 → 内容哈希表。
+    ///
+    /// 该表是[存储 ADR](../../docs/code-context-engine/adr-storage.md) 认定可以落宿主 JSON KV
+    /// 的两类数据之一，**不是索引本体**。它的用途是给下次启动提供"上一轮各文件是什么内容"
+    /// 的基线，供增量索引判断哪些文件真的变了。
+    ///
+    /// # Errors
+    ///
+    /// 存储不可用、条目数超过 [`MAX_HASH_ENTRIES`] 或宿主写入失败时返回错误。
+    pub fn save_file_hashes(
+        self,
+        host: &dyn PluginHostApi,
+        hashes: &[(String, String)],
+    ) -> Result<(), CodeContextError> {
+        if !self.available {
+            return Err(CodeContextError::CapabilityUnavailable(
+                "宿主未提供项目作用域持久存储，文件哈希表无法保存".into(),
+            ));
+        }
+        if hashes.len() > MAX_HASH_ENTRIES {
+            return Err(CodeContextError::Storage(format!(
+                "文件哈希表有 {} 条，超过宿主存储可承载的 {MAX_HASH_ENTRIES} 条",
+                hashes.len()
+            )));
+        }
+        let map: serde_json::Map<String, serde_json::Value> = hashes
+            .iter()
+            .map(|(path, hash)| (path.clone(), serde_json::Value::String(hash.clone())))
+            .collect();
+        host.store_set(
+            PluginStoreScope::Workspace,
+            FILE_HASHES_KEY,
+            &serde_json::Value::Object(map),
+        )
+        .map_err(|error| CodeContextError::Storage(error.to_string()))
+    }
+
+    /// 读取路径 → 内容哈希表。
+    ///
+    /// 读不出来一律返回空表：哈希表只是增量判断的优化输入，损坏时退化为全量重建，
+    /// 不构成错误路径。
+    pub fn load_file_hashes(self, host: &dyn PluginHostApi) -> BTreeMap<String, String> {
+        if !self.available {
+            return BTreeMap::new();
+        }
+        let Ok(Some(serde_json::Value::Object(map))) =
+            host.store_get(PluginStoreScope::Workspace, FILE_HASHES_KEY)
+        else {
+            return BTreeMap::new();
+        };
+        map.into_iter()
+            .filter_map(|(path, value)| match value {
+                serde_json::Value::String(hash) => Some((path, hash)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 删除路径 → 内容哈希表。
+    ///
+    /// # Errors
+    ///
+    /// 宿主删除失败时返回错误；存储不可用时视为已清理。
+    pub fn clear_file_hashes(self, host: &dyn PluginHostApi) -> Result<(), CodeContextError> {
+        if !self.available {
+            return Ok(());
+        }
+        host.store_remove(PluginStoreScope::Workspace, FILE_HASHES_KEY)
             .map(|_| ())
             .map_err(|error| CodeContextError::Storage(error.to_string()))
     }

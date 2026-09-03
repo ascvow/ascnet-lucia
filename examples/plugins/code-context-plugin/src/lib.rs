@@ -25,6 +25,7 @@
 mod config;
 mod embedding;
 mod error;
+mod index;
 mod model;
 mod parser;
 mod repository;
@@ -43,6 +44,7 @@ use serde_json::json;
 pub use config::{CodeContextConfig, EmbeddingMode};
 pub use embedding::{EmbeddingInputKind, EmbeddingProvider, UnconfiguredEmbeddingProvider};
 pub use error::CodeContextError;
+pub use index::{FileRecord, IndexBuild, IndexStats, StructuralIndex, BUILD_BUDGET};
 pub use model::{
     CodeChunk, EmbeddingSpace, IndexManifest, IndexStatus, ManifestCompatibility,
     RepositoryIdentity, Symbol, SymbolKind, INDEX_SCHEMA_VERSION, STRUCTURAL_INDEX_VERSION,
@@ -78,6 +80,13 @@ struct RepositoryContext {
     manifest: IndexManifest,
     /// manifest 是否有尚未落盘的改动。
     dirty: bool,
+    /// 进行中的索引构建；完成后转入 `index`。
+    build: Option<IndexBuild>,
+    /// 已建成的结构索引。
+    ///
+    /// 内存驻留，不落盘：宿主存储装不下 chunk 与符号表，理由见
+    /// [ADR：索引存储后端](../../docs/code-context-engine/adr-storage.md)。
+    index: Option<StructuralIndex>,
 }
 
 /// Code Context Engine 插件。
@@ -91,6 +100,10 @@ pub struct CodeContextPlugin {
     index_status: IndexStatus,
     /// 引擎不可用时面向用户的原因。
     unavailable_reason: Option<String>,
+    /// 引擎可用但能力受限时的原因，例如哈希表未能落盘。
+    ///
+    /// 与 `unavailable_reason` 区分：后者会让 `code_search` 拒绝服务，这个不会。
+    degraded_reason: Option<String>,
     /// Host 返回的 `code_search` 公开名称；存在时表示工具已经注册给 Agent。
     registered_tool_name: Option<String>,
 }
@@ -142,9 +155,10 @@ impl CodeContextPlugin {
                 let expected_space = self.embedding_provider().space().map(|space| space.id());
                 let compatibility = existing.compatibility(&identity, expected_space.as_deref());
                 match compatibility {
-                    // 结构索引产物尚未实现：即使 manifest 兼容，磁盘上也没有可检索的
-                    // 数据，报告 Ready 会让 code_search 去搜一个空索引。Phase 3 落地
-                    // 真实分块后，这里直接改用 compatibility.to_status()。
+                    // 结构索引内存驻留、不落盘，因此 manifest 兼容也不代表现在有索引可用：
+                    // 进程刚起来时索引一定是空的，必须先重建。报告 Ready 会让 code_search
+                    // 去搜一个空索引，把"还没建好"误报成"仓库里没有相关代码"。
+                    // 这不是待办，而是存储 ADR 的既定结果。
                     ManifestCompatibility::Compatible => {
                         (*existing, IndexStatus::NotIndexed, false)
                     }
@@ -188,6 +202,8 @@ impl CodeContextPlugin {
             store,
             manifest,
             dirty,
+            build: None,
+            index: None,
         });
         self.index_status = status;
         Ok(())
@@ -262,16 +278,56 @@ impl CodeContextPlugin {
         })
     }
 
+    /// 推进索引构建。
+    ///
+    /// 构建是**惰性**的：首次调用时创建，之后每次调用推进一个预算片。放在这里而不是
+    /// `activate` 里，是因为 `activate` 与其他导出共用同一份 fuel 预算，在那里做全量索引
+    /// 必然 trap（见 [ADR：索引存储后端](../../docs/code-context-engine/adr-storage.md)）。
+    ///
+    /// 构建完成后把文件哈希表落盘，供下次启动做增量判断；哈希表写入失败不影响索引可用性，
+    /// 只会让下次启动退化为全量重建。
+    fn advance_index(&mut self, host: &dyn PluginHostApi) {
+        let Some(context) = self.repository.as_mut() else {
+            return;
+        };
+        if context.build.is_none() && context.index.is_none() {
+            context.build = Some(IndexBuild::with_default_limits(context.identity.clone()));
+            self.index_status = IndexStatus::Indexing;
+        }
+        let Some(build) = context.build.as_mut() else {
+            return;
+        };
+
+        if build.advance(host, BUILD_BUDGET) == ScanProgress::Incomplete {
+            self.index_status = IndexStatus::Indexing;
+            return;
+        }
+
+        let index = context.build.take().expect("构建已存在").into_index();
+        // 哈希表在这里落盘、由 Phase 11 的增量索引在下次启动时读回。本阶段不读它：
+        // 结构索引内存驻留、每次启动重建，因此"上一轮的哈希"对本轮构建没有用处。
+        if let Err(error) = context.store.save_file_hashes(host, &index.file_hashes()) {
+            // 哈希表只是增量判断的优化输入，写不进去不影响本次检索能力。
+            self.degraded_reason = Some(format!("文件哈希表未能落盘：{error}"));
+        }
+        context.manifest.touch();
+        let _ = context.store.save_manifest(host, &context.manifest);
+        context.index = Some(index);
+        // 语义分支尚未接入（Host 缺 HTTP 与 embedding 能力，见 PROGRESS.md 的 Blocked Phases），
+        // 因此就绪状态是 Degraded 而不是 Ready——这与架构第 13 问的定义一致，不是错误。
+        self.index_status = IndexStatus::Degraded;
+    }
+
     /// 执行一次 `code_search` 调用。
     ///
-    /// 索引尚未建立，因此这里只做参数校验并如实报告状态。参数校验现在就做，是为了让
-    /// 工具契约从第一天起就是稳定的：模型学到的调用形态不会在索引落地后改变。
-    fn search(&mut self, call: ToolCall) -> Result<ToolResult> {
+    /// 检索实现属于 Phase 5；本阶段负责驱动索引构建并如实报告索引规模。参数校验从第一天
+    /// 就做，是为了让工具契约稳定：模型学到的调用形态不会在检索落地后改变。
+    fn search(&mut self, host: &dyn PluginHostApi, call: ToolCall) -> Result<ToolResult> {
         let request = match CodeSearchRequest::parse(&call.args) {
             Ok(request) => request,
             Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
         };
-        // 请求已通过校验但无法服务；保留解析结果，使参数错误与索引缺失在返回值中可区分。
+        // 请求已通过校验但检索未接入；保留解析结果，使参数错误与索引缺失在返回值中可区分。
         let _ = request;
 
         if !self.config.enabled {
@@ -284,20 +340,65 @@ impl CodeContextPlugin {
         if let Some(reason) = self.unavailable_reason.clone() {
             return Ok(tool::unavailable_result(&call, self.index_status, &reason));
         }
-        if !self.index_status.can_serve_search() {
-            return Ok(tool::unavailable_result(
+
+        self.advance_index(host);
+
+        if self.index_status == IndexStatus::Indexing {
+            let stats = self.building_stats();
+            return Ok(tool::unavailable_result_with_index(
                 &call,
                 self.index_status,
-                "代码索引尚未建立；本插件当前仅完成骨架，请改用常规检索工具",
+                &format!(
+                    "代码索引正在构建（已处理 {} 个文件）；索引按 fuel 预算分片推进，请稍后重试",
+                    stats.files
+                ),
+                Some(stats),
             ));
         }
-        // 状态可服务却没有检索实现，说明状态机与实现进度不一致，必须如实报告而不是
-        // 返回空结果——空结果会被模型读成"仓库里没有相关代码"。
-        Ok(tool::unavailable_result(
+        // 索引已就绪但检索尚未接入，必须如实报告而不是返回空结果——空结果会被模型读成
+        // "仓库里没有相关代码"，比明确的不可用更有害。
+        let stats = self.index_stats().unwrap_or_default();
+        let mut detail = format!(
+            "结构索引已就绪（{} 个文件、{} 个代码块、{} 个符号），检索实现尚未接入",
+            stats.files, stats.chunks, stats.symbols
+        );
+        if let Some(reason) = self.degraded_reason.as_deref() {
+            detail.push('；');
+            detail.push_str(reason);
+        }
+        Ok(tool::unavailable_result_with_index(
             &call,
             self.index_status,
-            "检索实现尚未接入",
+            &detail,
+            Some(stats),
         ))
+    }
+
+    /// 返回构建进行中的索引规模。
+    ///
+    /// 构建未完成时索引还在 `build` 里，`index` 仍为 `None`，因此进度必须从构建中读取，
+    /// 否则用户看到的永远是 0 个文件。
+    fn building_stats(&self) -> IndexStats {
+        self.repository
+            .as_ref()
+            .and_then(|context| context.build.as_ref())
+            .map(|build| build.index().stats())
+            .unwrap_or_default()
+    }
+
+    /// 返回当前索引的规模统计；索引尚未建成时为 `None`。
+    pub fn index_stats(&self) -> Option<IndexStats> {
+        self.repository
+            .as_ref()
+            .and_then(|context| context.index.as_ref())
+            .map(StructuralIndex::stats)
+    }
+
+    /// 返回当前结构索引；尚未建成时为 `None`。
+    pub fn index(&self) -> Option<&StructuralIndex> {
+        self.repository
+            .as_ref()
+            .and_then(|context| context.index.as_ref())
     }
 }
 
@@ -378,7 +479,7 @@ impl AgentPlugin for CodeContextPlugin {
 
     fn call_tool_with_host(
         &mut self,
-        _host: &dyn PluginHostApi,
+        host: &dyn PluginHostApi,
         call: ToolCall,
     ) -> Result<ToolResult> {
         if call.name != TOOL_NAME {
@@ -388,7 +489,7 @@ impl AgentPlugin for CodeContextPlugin {
                 "Code Context Engine 未实现该工具",
             ));
         }
-        self.search(call)
+        self.search(host, call)
     }
 }
 
@@ -588,9 +689,13 @@ mod tests {
         assert!(plugin.activate(&host, context).is_err());
     }
 
-    /// 索引未建立时 code_search 必须返回明确的不可用状态。
+    /// 检索实现未接入时必须返回明确的不可用状态，绝不返回空结果。
+    ///
+    /// 空仓库的索引会立刻建成，因此状态是 `degraded`（结构索引就绪、语义分支缺席），
+    /// 而不是 `not_indexed`。无论哪种状态，都必须是**错误结果**——返回一个成功的空列表
+    /// 会被模型读成"仓库里没有相关代码"，比明确的不可用更有害。
     #[test]
-    fn search_reports_not_indexed() {
+    fn search_reports_unavailable_instead_of_empty_results() {
         let host = TestHost::new();
         let mut plugin = activated(&host, "/repo/a");
 
@@ -600,8 +705,49 @@ mod tests {
 
         assert!(result.is_error, "不可用必须是错误结果，避免被读成没有匹配");
         let details = result.details.expect("应带结构化细节");
-        assert_eq!(details["status"], IndexStatus::NotIndexed.as_str());
+        assert_eq!(details["status"], IndexStatus::Degraded.as_str());
         assert_eq!(details["results"], json!([]));
+    }
+
+    /// 首次 code_search 必须触发索引构建，而不是让索引永远停在未建立状态。
+    #[test]
+    fn search_drives_index_build() {
+        let host = crate::testing::RepoHost::new(&[
+            ("src/a.rs", "pub fn alpha() {}\n"),
+            ("src/b.rs", "pub struct Beta;\n"),
+        ]);
+        let mut plugin = CodeContextPlugin::default();
+        plugin
+            .activate(&host, activation_context("/repo/a"))
+            .expect("激活插件");
+
+        assert!(plugin.index().is_none(), "activate 不得构建索引");
+
+        plugin
+            .call_tool_with_host(&host, search_call(json!({"query": "alpha"})))
+            .expect("工具调用不应失败");
+
+        let stats = plugin.index_stats().expect("检索调用后索引应已建成");
+        assert_eq!(stats.files, 2);
+        assert!(stats.symbols >= 2);
+        assert_eq!(plugin.index_status(), IndexStatus::Degraded);
+    }
+
+    /// 索引建成后必须把文件哈希表落盘，供下次启动做增量判断。
+    #[test]
+    fn completed_build_persists_file_hashes() {
+        let host = crate::testing::RepoHost::new(&[("src/a.rs", "pub fn alpha() {}\n")]);
+        let mut plugin = CodeContextPlugin::default();
+        plugin
+            .activate(&host, activation_context("/repo/a"))
+            .expect("激活插件");
+        plugin
+            .call_tool_with_host(&host, search_call(json!({"query": "alpha"})))
+            .expect("工具调用不应失败");
+
+        let persisted = IndexStore::probe(&host).load_file_hashes(&host);
+        assert_eq!(persisted.len(), 1);
+        assert!(persisted.contains_key("src/a.rs"));
     }
 
     /// 参数错误必须与索引缺失区分开。

@@ -573,7 +573,6 @@ fn line_index_maps_offsets() {
     assert_eq!(index.line_of(0), 1);
     assert_eq!(index.line_of(2), 2);
     assert_eq!(index.line_of(5), 3);
-    assert_eq!(index.line_count(), 4);
 }
 
 /// 含多字节字符的源码不得让行号错位或 panic。

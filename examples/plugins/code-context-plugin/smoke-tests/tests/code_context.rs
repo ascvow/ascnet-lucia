@@ -45,6 +45,15 @@ fn create_workspace(label: &str) -> PathBuf {
     root.canonicalize().expect("规范化临时工作区")
 }
 
+/// 在工作区中写入一个文件，自动创建父目录。
+fn write_file(root: &Path, relative: &str, content: &str) {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("创建父目录");
+    }
+    std::fs::write(path, content).expect("写入文件");
+}
+
 /// 按宿主真实注入方式装配服务：持久状态目录、项目作用域与可信工作区根。
 fn services(
     state_root: &Path,
@@ -128,9 +137,13 @@ async fn wasm_host_loads_and_registers_code_search() {
     let _ = std::fs::remove_dir_all(&workspace_root);
 }
 
-/// 索引尚未建立时，code_search 必须返回明确的不可用状态而不是伪造结果。
+/// 检索实现未接入时，code_search 必须返回明确的不可用状态而不是伪造结果。
+///
+/// 空工作区的索引会立刻建成，因此状态是 `degraded`（结构索引就绪、语义分支缺席）。
+/// 关键断言不是具体状态值，而是**它必须是错误结果且结果列表为空**——一个成功的空列表
+/// 会被模型读成"仓库里没有相关代码"。
 #[tokio::test]
-async fn code_search_reports_not_indexed() {
+async fn code_search_reports_unavailable_instead_of_empty_results() {
     let state_root = unique_state_root("search");
     let workspace_root = create_workspace("search");
     let host = load_wasm_plugins_with_services(
@@ -163,8 +176,94 @@ async fn code_search_reports_not_indexed() {
         "索引不可用必须返回错误结果，避免被模型读成「仓库里没有相关代码」"
     );
     let details = result.details.expect("不可用结果应带结构化状态");
-    assert_eq!(details["status"], "not_indexed");
+    assert_eq!(details["status"], "degraded", "实际 {details}");
     assert_eq!(details["results"], json!([]));
+    // 空工作区没有任何可索引文件，索引规模必须如实为 0，而不是缺失或伪造。
+    assert_eq!(details["index"]["files"], 0, "实际 {details}");
+
+    host.shutdown().await.expect("卸载插件");
+    let _ = std::fs::remove_dir_all(&state_root);
+    let _ = std::fs::remove_dir_all(&workspace_root);
+}
+
+/// 真实 Host 上必须能递归扫描子目录、解析源码并建成结构索引。
+///
+/// 这是扫描器唯一一处依赖宿主契约的地方：`list_dir` 对**子目录**返回的是完整的仓库相对
+/// 路径（而不是目录内的短名），且按路径排序。插件内单元测试用的是替身宿主，证明不了这一点；
+/// 一旦该契约与假设不符，整个索引会只剩仓库根一层。
+#[tokio::test]
+async fn wasm_host_scans_nested_directories_and_builds_index() {
+    let state_root = unique_state_root("index");
+    let workspace_root = create_workspace("index");
+
+    // 三层嵌套 + 多语言 + 一个必须被忽略的依赖目录。
+    write_file(&workspace_root, "src/lib.rs", "pub fn top_level() {}\n");
+    write_file(
+        &workspace_root,
+        "src/nested/manager.rs",
+        "pub struct PermissionManager;\nimpl PermissionManager {\n    pub fn check(&self) -> bool { true }\n}\n",
+    );
+    write_file(
+        &workspace_root,
+        "src/nested/deep/service.ts",
+        "export class Service {\n  run(): void {}\n}\n",
+    );
+    write_file(&workspace_root, "app/main.py", "def entry():\n    pass\n");
+    write_file(&workspace_root, "README.md", "# 项目\n\n说明。\n");
+    write_file(&workspace_root, ".gitignore", "ignored.rs\n");
+    write_file(&workspace_root, "ignored.rs", "pub fn ignored() {}\n");
+    write_file(
+        &workspace_root,
+        "node_modules/pkg/index.js",
+        "module.exports = 1;\n",
+    );
+
+    let host = load_wasm_plugins_with_services(
+        &[manifest_path()],
+        services(&state_root, "scope-index", &workspace_root).expect("装配宿主服务"),
+    )
+    .await
+    .expect("加载 Code Context 插件");
+
+    AgentExtension::list_tools(&host)
+        .await
+        .expect("建立插件工具路由");
+
+    // 索引按 fuel 预算分片推进，因此可能需要多次调用才能建成。
+    let mut details = Value::Null;
+    for _ in 0..64 {
+        let result = AgentExtension::call_tool(
+            &host,
+            ToolCall::new("call-1", TOOL_NAME, json!({"query": "permission check"})),
+        )
+        .await
+        .expect("工具调用不应失败")
+        .expect("code_search 应由本插件处理");
+        details = result.details.expect("必须带结构化状态");
+        if details["status"] != "indexing" {
+            break;
+        }
+    }
+
+    assert_eq!(
+        details["status"], "degraded",
+        "结构索引建成后应为 degraded（语义分支缺席），实际 {details}"
+    );
+    // 5 个源文件：src/lib.rs、src/nested/manager.rs、src/nested/deep/service.ts、
+    // app/main.py、README.md。ignored.rs 被 .gitignore 排除，node_modules 被默认规则排除，
+    // .gitignore 自身扩展名不在白名单内。
+    assert_eq!(
+        details["index"]["files"], 5,
+        "必须扫到三层嵌套下的全部源文件并正确应用忽略规则，实际 {details}"
+    );
+    assert!(
+        details["index"]["symbols"].as_u64().unwrap_or(0) >= 5,
+        "多语言符号必须被解析出来，实际 {details}"
+    );
+    assert!(
+        details["index"]["chunks"].as_u64().unwrap_or(0) >= 5,
+        "实际 {details}"
+    );
 
     host.shutdown().await.expect("卸载插件");
     let _ = std::fs::remove_dir_all(&state_root);

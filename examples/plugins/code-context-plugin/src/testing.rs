@@ -280,6 +280,32 @@ impl RepoHost {
         }
     }
 
+    /// 用既有存储内容构造虚拟仓库，模拟进程重启后读到同一份磁盘数据。
+    pub fn restored_from(files: &[(&str, &str)], values: HashMap<(String, String), Value>) -> Self {
+        Self {
+            inner: TestHost::restored_from(values),
+            ..Self::new(files)
+        }
+    }
+
+    /// 构造缺少项目作用域存储的虚拟仓库。
+    pub fn without_workspace_scope(files: &[(&str, &str)]) -> Self {
+        Self {
+            inner: TestHost::without_workspace_scope(),
+            ..Self::new(files)
+        }
+    }
+
+    /// 返回该替身持有的存储内容。
+    pub fn snapshot(&self) -> HashMap<(String, String), Value> {
+        self.inner.snapshot()
+    }
+
+    /// 返回用户作用域中的全部键。
+    pub fn user_keys(&self) -> Vec<String> {
+        self.inner.user_keys()
+    }
+
     /// 标记一个文件为不可读，模拟二进制内容或权限失败。
     pub fn with_unreadable(mut self, path: &str) -> Self {
         self.unreadable.insert(path.to_string());
