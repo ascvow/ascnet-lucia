@@ -26,7 +26,7 @@ use ignore::{ChainId, IgnoreRuleSet, IgnoreStack, AGENT_IGNORE_FILE, GIT_IGNORE_
 use language::{classify, Language, PathClass, SkipReason};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 /// 扫描规模上限。
 ///
@@ -217,6 +217,17 @@ pub struct RepositoryScan {
     pending_files: VecDeque<PendingFile>,
     /// 已收录的文件。
     files: Vec<IndexableFile>,
+    /// 本轮成功列举到的全部非目录路径。
+    ///
+    /// 增量索引用它判断删除：路径从目录快照中消失才可视为删除；仅仅读取失败不能
+    /// 擅自删除上一轮仍然有效的索引。
+    discovered_paths: BTreeSet<String>,
+    /// 本轮被识别为可索引类型的路径。
+    indexable_paths: BTreeSet<String>,
+    /// 因文件类型或正文校验而明确无法进入索引的路径。
+    rejected_paths: BTreeSet<String>,
+    /// 宿主读取失败的路径。该类失败通常是暂时的权限或编码问题，增量索引应保留旧值。
+    read_failed_paths: BTreeSet<String>,
     /// 保留的告警。
     warnings: Vec<ScanWarning>,
     /// 统计。
@@ -242,6 +253,10 @@ impl RepositoryScan {
             pending_dirs,
             pending_files: VecDeque::new(),
             files: Vec::new(),
+            discovered_paths: BTreeSet::new(),
+            indexable_paths: BTreeSet::new(),
+            rejected_paths: BTreeSet::new(),
+            read_failed_paths: BTreeSet::new(),
             warnings: Vec::new(),
             stats: ScanStats::default(),
             complete: false,
@@ -258,6 +273,46 @@ impl RepositoryScan {
     /// 扫描完成后按路径升序排列；未完成时为发现顺序。
     pub fn files(&self) -> &[IndexableFile] {
         &self.files
+    }
+
+    /// 返回本轮目录快照中出现的全部非目录路径。
+    pub fn discovered_paths(&self) -> &BTreeSet<String> {
+        &self.discovered_paths
+    }
+
+    /// 返回本轮被识别为可索引类型的路径。
+    pub fn indexable_paths(&self) -> &BTreeSet<String> {
+        &self.indexable_paths
+    }
+
+    /// 返回本轮明确被判定为不可索引的路径。
+    pub fn rejected_paths(&self) -> &BTreeSet<String> {
+        &self.rejected_paths
+    }
+
+    /// 返回本轮宿主读取失败的路径。
+    pub fn read_failed_paths(&self) -> &BTreeSet<String> {
+        &self.read_failed_paths
+    }
+
+    /// 判断目录快照是否足以安全推断删除。
+    ///
+    /// 目录列举失败、深度限制或规模限制都会留下未知区域；此时增量索引必须保留
+    /// 未出现在快照中的旧文件，等待下一轮完整快照，而不是误删索引。
+    pub fn snapshot_is_complete(&self) -> bool {
+        // 告警达到上限后，未保留的告警种类未知；宁可暂缓删除，也不能把未知区域误判为
+        // 已消失文件。
+        if self.stats.warnings_total as usize > self.warnings.len() {
+            return false;
+        }
+        !self.warnings.iter().any(|warning| {
+            matches!(
+                warning.kind,
+                ScanWarningKind::ListFailed { .. }
+                    | ScanWarningKind::DepthExceeded
+                    | ScanWarningKind::LimitReached
+            )
+        })
     }
 
     /// 保留的告警。
@@ -297,6 +352,21 @@ impl RepositoryScan {
         budget: ScanBudget,
         sink: &mut dyn FileSink,
     ) -> ScanProgress {
+        self.advance_with_filter(host, budget, sink, &|_, _| true)
+    }
+
+    /// 在给定预算内推进扫描，并按 `read_filter` 选择需要读取正文的文件。
+    ///
+    /// 目录仍会完整遍历，因此调用方可以发现新增与删除；被过滤掉的既有文件不会发起
+    /// `read_file`，适合脏集合驱动的增量重建。筛选只影响正文读取，不改变目录快照与路径
+    /// 分类结果。过滤器必须保持幂等，因为同一个扫描器会跨多次调用保存游标。
+    pub fn advance_with_filter(
+        &mut self,
+        host: &dyn PluginHostApi,
+        budget: ScanBudget,
+        sink: &mut dyn FileSink,
+        read_filter: &dyn Fn(&str, Language) -> bool,
+    ) -> ScanProgress {
         let mut calls = 0u32;
         let mut bytes = 0u64;
 
@@ -313,6 +383,9 @@ impl RepositoryScan {
                 continue;
             }
             if let Some(file) = self.pending_files.pop_front() {
+                if !read_filter(&file.path, file.language) {
+                    continue;
+                }
                 calls += 1;
                 bytes += self.read_file(host, &file, sink);
                 continue;
@@ -369,6 +442,9 @@ impl RepositoryScan {
             if self.ignores.is_ignored(chain, path, entry.is_dir) {
                 self.stats.entries_ignored += 1;
                 continue;
+            }
+            if !entry.is_dir {
+                self.discovered_paths.insert(path.to_string());
             }
             if entry.is_dir {
                 self.enqueue_dir(path, dir.depth + 1, chain);
@@ -437,6 +513,7 @@ impl RepositoryScan {
     fn enqueue_file(&mut self, path: &str) {
         match classify(path) {
             PathClass::Indexable(language) => {
+                self.indexable_paths.insert(path.to_string());
                 if self.stats.files_indexed + self.pending_files.len() as u32
                     >= self.limits.max_files
                 {
@@ -450,10 +527,16 @@ impl RepositoryScan {
             }
             // 敏感文件单独计数：API 模式会把文件内容发往外部 provider，这个数字是隐私
             // 审计的直接依据，不能和普通跳过混在一起。
-            PathClass::Sensitive => self.stats.files_sensitive += 1,
+            PathClass::Sensitive => {
+                self.rejected_paths.insert(path.to_string());
+                self.stats.files_sensitive += 1;
+            }
             PathClass::Skipped(
                 SkipReason::Binary | SkipReason::Generated | SkipReason::Unrecognized,
-            ) => self.stats.files_skipped += 1,
+            ) => {
+                self.rejected_paths.insert(path.to_string());
+                self.stats.files_skipped += 1;
+            }
         }
     }
 
@@ -469,6 +552,7 @@ impl RepositoryScan {
             // 宿主的 `read_file` 走 UTF-8 校验，因此漏网的二进制文件会在这里失败。
             // 记录并跳过即可，不需要额外的内容嗅探。
             Err(error) => {
+                self.read_failed_paths.insert(file.path.clone());
                 self.warn(
                     &file.path,
                     ScanWarningKind::ReadFailed {
@@ -483,6 +567,7 @@ impl RepositoryScan {
         let byte_len = content.len();
         self.stats.bytes_read += byte_len as u64;
         if byte_len > self.limits.max_file_bytes as usize {
+            self.rejected_paths.insert(file.path.clone());
             self.warn(
                 &file.path,
                 ScanWarningKind::TooLarge {
@@ -494,6 +579,7 @@ impl RepositoryScan {
         }
         // UTF-8 校验挡不住内嵌 NUL 的文件；它们能解码成字符串但不是可检索的文本。
         if content.contains('\0') {
+            self.rejected_paths.insert(file.path.clone());
             self.warn(&file.path, ScanWarningKind::BinaryContent);
             self.stats.files_skipped += 1;
             return byte_len as u64;

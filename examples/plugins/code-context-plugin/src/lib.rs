@@ -5,9 +5,8 @@
 //!
 //! # 当前阶段
 //!
-//! **骨架阶段。** 已经建立的是生命周期、仓库身份、索引 manifest 持久化、配置、
-//! 存储边界与工具契约；**没有任何索引实现**。`code_search` 在索引就绪前一律返回
-//! 明确的不可用状态，不返回任何伪造结果。
+//! 已完成仓库扫描、结构与检索索引、上下文构建，以及按写入事件触发的文件级增量重建。
+//! `code_search` 仍会在最终检索结果接入前报告明确状态，不返回伪造结果。
 //!
 //! # 能力边界
 //!
@@ -20,12 +19,13 @@
 //! 宿主对同一插件的全部导出调用串行执行（单 Store + 独占锁），因此插件内部不需要任何
 //! 锁或并发原语。宿主也不提供调用级取消：已进入 component 的调用一定会跑到返回。
 //! 长任务的唯一可行形态是**按 fuel 预算分片**——单次调用消耗到阈值就保存游标返回，
-//! 下次调用继续。该游标协议属于 Phase 2 的扫描器，不在骨架阶段预先发明。
+//! 下次调用继续。该游标协议由 Phase 2 的扫描器提供，增量构建沿用同一套机制。
 
 mod config;
 mod context;
 mod embedding;
 mod error;
+mod incremental;
 mod index;
 mod model;
 mod parser;
@@ -38,22 +38,27 @@ mod tool;
 mod testing;
 
 use agent_plugin::{
-    export_plugin, ActivationContext, AgentPlugin, EventPresentation, EventPresentationTone,
-    ExtensionEvent, PluginHostApi, Result, ToolCall, ToolResult, ToolSpec,
+    core_events, export_plugin, ActivationContext, AgentPlugin, EventOutcome, EventPresentation,
+    EventPresentationTone, ExtensionEvent, PluginEvent, PluginHostApi, Result, RunFinishEventData,
+    ToolCall, ToolCallEventData, ToolResult, ToolResultEventData, ToolSpec,
 };
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use config::{CodeContextConfig, EmbeddingMode};
-pub use embedding::{
-    select_provider, EmbeddingInputKind, EmbeddingProvider, UnconfiguredEmbeddingProvider,
-    DEFAULT_MAX_BATCH_SIZE,
-};
 pub use context::{
     build as build_context, estimate_tokens, ContextBundle, ContextConfig, ContextEntry,
     ContextStats,
 };
+pub use embedding::{
+    select_provider, EmbeddingInputKind, EmbeddingProvider, UnconfiguredEmbeddingProvider,
+    DEFAULT_MAX_BATCH_SIZE,
+};
 pub use error::CodeContextError;
-pub use index::{FileRecord, IndexBuild, IndexStats, StructuralIndex, BUILD_BUDGET};
+pub use index::{
+    FileChangeKind, FileRecord, IncrementalStats, IndexBuild, IndexChange, IndexStats,
+    StructuralIndex, BUILD_BUDGET,
+};
 pub use model::{
     CodeChunk, EmbeddingSpace, IndexManifest, IndexStatus, ManifestCompatibility,
     RepositoryIdentity, Symbol, SymbolKind, INDEX_SCHEMA_VERSION, STRUCTURAL_INDEX_VERSION,
@@ -78,6 +83,14 @@ const WORKSPACE_ROOT_KEY: &str = "workspace_root";
 /// 插件发布状态变化使用的扩展事件名。
 const STATUS_EVENT: &str = "code-context.status";
 
+/// 索引分片推进时发布的底栏事件名。
+const INDEX_PROGRESS_EVENT: &str = "code-context.index.progress";
+
+/// 组合运行与调用身份，避免不同并发运行复用调用 ID 时互相覆盖。
+fn pending_write_key(run_id: &str, call_id: &str) -> String {
+    format!("{run_id}\u{0}{call_id}")
+}
+
 /// 已附着仓库的运行时上下文。
 ///
 /// 宿主当前没有仓库打开/切换事件：工作区在进程启动时确定，换项目等于重启进程
@@ -87,6 +100,8 @@ const STATUS_EVENT: &str = "code-context.status";
 struct RepositoryContext {
     /// 当前仓库的稳定身份。
     identity: RepositoryIdentity,
+    /// Host 注入的可信工作区根，仅用于把事件中的绝对路径转换为相对路径；不落盘、不发布。
+    workspace_root: String,
     /// 索引元数据存储。
     store: IndexStore,
     /// 当前仓库的索引 manifest。
@@ -102,6 +117,10 @@ struct RepositoryContext {
     index: Option<StructuralIndex>,
     /// 已建成的检索索引（符号表 + 词法倒排）。
     retrieval: Option<RetrievalIndex>,
+    /// 已确认成功写入、等待下一次增量构建的仓库相对路径。
+    dirty_paths: BTreeSet<String>,
+    /// 尚未收到终态结果的写入调用，键为运行 ID 与调用 ID 的组合。
+    pending_writes: BTreeMap<String, incremental::PendingWrite>,
 }
 
 /// Code Context Engine 插件。
@@ -213,12 +232,15 @@ impl CodeContextPlugin {
 
         self.repository = Some(RepositoryContext {
             identity,
+            workspace_root: workspace_root.to_string(),
             store,
             manifest,
             dirty,
             build: None,
             index: None,
             retrieval: None,
+            dirty_paths: BTreeSet::new(),
+            pending_writes: BTreeMap::new(),
         });
         self.index_status = status;
         Ok(())
@@ -305,33 +327,298 @@ impl CodeContextPlugin {
         let Some(context) = self.repository.as_mut() else {
             return;
         };
-        if context.build.is_none() && context.index.is_none() {
-            context.build = Some(IndexBuild::with_default_limits(context.identity.clone()));
+        if context.build.is_none() {
+            // 把本轮脏集合从上下文中移出。构建期间新收到的事件会进入新的集合，完成时
+            // 只合并构建自身的失败路径，因此不会误清理构建开始后再次变脏的同一路径。
+            let requested_dirty = std::mem::take(&mut context.dirty_paths);
+            // 结构索引与检索索引必须成对接管。只存在一侧时先恢复已有值，再启动全量构建，
+            // 避免 `take()` 把另一侧静默丢掉。
+            let existing_index = context.index.take();
+            let existing_retrieval = context.retrieval.take();
+            match (existing_index, existing_retrieval) {
+                (Some(index), Some(retrieval)) if !requested_dirty.is_empty() => {
+                    context.build = Some(IndexBuild::new_incremental(
+                        index,
+                        retrieval,
+                        requested_dirty,
+                        ScanLimits::default(),
+                    ));
+                }
+                (Some(index), Some(retrieval)) => {
+                    context.index = Some(index);
+                    context.retrieval = Some(retrieval);
+                    context.dirty_paths.extend(requested_dirty);
+                    return;
+                }
+                (index, retrieval) => {
+                    context.index = index;
+                    context.retrieval = retrieval;
+                    // 没有完整的既有索引时只能全量构建；把已积累的脏路径交给构建，便于在
+                    // 完成后只保留确实失败的路径。
+                    context.build = Some(IndexBuild::new_full_with_dirty(
+                        context.identity.clone(),
+                        ScanLimits::default(),
+                        requested_dirty,
+                    ));
+                }
+            }
             self.index_status = IndexStatus::Indexing;
         }
-        let Some(build) = context.build.as_mut() else {
-            return;
+
+        let (progress, is_incremental, scan_stats, incremental_stats) = {
+            let build = context.build.as_mut().expect("已创建索引构建");
+            let progress = build.advance(host, BUILD_BUDGET);
+            (
+                progress,
+                build.is_incremental(),
+                build.scan_stats(),
+                build.incremental_stats(),
+            )
         };
-
-        if build.advance(host, BUILD_BUDGET) == ScanProgress::Incomplete {
+        if progress == ScanProgress::Incomplete {
             self.index_status = IndexStatus::Indexing;
+            Self::emit_index_progress(
+                host,
+                is_incremental,
+                progress,
+                scan_stats,
+                incremental_stats,
+                context.dirty_paths.len(),
+            );
             return;
         }
 
-        let (index, retrieval) = context.build.take().expect("构建已存在").into_parts();
-        // 哈希表在这里落盘、由 Phase 11 的增量索引在下次启动时读回。本阶段不读它：
-        // 结构索引内存驻留、每次启动重建，因此"上一轮的哈希"对本轮构建没有用处。
-        if let Err(error) = context.store.save_file_hashes(host, &index.file_hashes()) {
-            // 哈希表只是增量判断的优化输入，写不进去不影响本次检索能力。
-            self.degraded_reason = Some(format!("文件哈希表未能落盘：{error}"));
+        let build = context.build.take().expect("完成的构建必须存在");
+        let remaining_dirty = build.remaining_dirty_paths();
+        let (index, retrieval) = build.into_parts();
+        context.dirty_paths.extend(remaining_dirty);
+
+        // 哈希表只是增量判断的优化输入，写不进去不影响本次检索能力。
+        match context.store.save_file_hashes(host, &index.file_hashes()) {
+            Ok(()) => {
+                self.degraded_reason = None;
+            }
+            Err(error) => {
+                self.degraded_reason = Some(format!("文件哈希表未能落盘：{error}"));
+            }
         }
         context.manifest.touch();
-        let _ = context.store.save_manifest(host, &context.manifest);
+        context.dirty = context
+            .store
+            .save_manifest(host, &context.manifest)
+            .is_err();
         context.index = Some(index);
         context.retrieval = Some(retrieval);
         // 语义分支尚未接入（Host 缺 HTTP 与 embedding 能力，见 PROGRESS.md 的 Blocked Phases），
         // 因此就绪状态是 Degraded 而不是 Ready——这与架构第 13 问的定义一致，不是错误。
         self.index_status = IndexStatus::Degraded;
+        Self::emit_index_progress(
+            host,
+            is_incremental,
+            ScanProgress::Complete,
+            scan_stats,
+            incremental_stats,
+            context.dirty_paths.len(),
+        );
+    }
+
+    /// 发布一次索引推进快照；事件失败只记录在 Host 侧，不得阻塞索引本身。
+    fn emit_index_progress(
+        host: &dyn PluginHostApi,
+        is_incremental: bool,
+        progress: ScanProgress,
+        scan_stats: ScanStats,
+        incremental_stats: Option<IncrementalStats>,
+        pending_dirty: usize,
+    ) {
+        let complete = progress == ScanProgress::Complete;
+        let mode = if is_incremental {
+            "incremental"
+        } else {
+            "full"
+        };
+        let stats = incremental_stats.unwrap_or_default();
+        let discovered_files = if is_incremental {
+            stats.discovered_files
+        } else {
+            scan_stats.files_indexed
+        };
+        let processed_files = if is_incremental {
+            stats.processed_files
+        } else {
+            scan_stats.files_indexed
+        };
+        let text = if complete {
+            if is_incremental {
+                format!(
+                    "Code Context：增量更新完成（新增 {}、修改 {}、删除 {}）",
+                    stats.added_files, stats.modified_files, stats.deleted_files
+                )
+            } else {
+                format!(
+                    "Code Context：索引构建完成（{} 个文件）",
+                    scan_stats.files_indexed
+                )
+            }
+        } else if is_incremental {
+            format!(
+                "Code Context：正在增量更新（已处理 {} 个文件）",
+                stats.processed_files
+            )
+        } else {
+            format!(
+                "Code Context：正在构建索引（已处理 {} 个文件）",
+                scan_stats.files_indexed
+            )
+        };
+        let _ = host.emit_event(&ExtensionEvent {
+            name: INDEX_PROGRESS_EVENT.into(),
+            data: json!({
+                "status": if complete { IndexStatus::Degraded.as_str() } else { IndexStatus::Indexing.as_str() },
+                "mode": mode,
+                "complete": complete,
+                "pending_dirty_paths": pending_dirty,
+                "scan": scan_stats,
+                "incremental": incremental_stats,
+                "discovered_files": discovered_files,
+                "processed_files": processed_files,
+                "unchanged_files": stats.unchanged_files,
+                "added_files": stats.added_files,
+                "modified_files": stats.modified_files,
+                "deleted_files": stats.deleted_files,
+                "failed_files": stats.failed_files,
+                "changed_chunks": stats.changed_chunks,
+                "removed_chunks": stats.removed_chunks,
+            }),
+            presentation: Some(EventPresentation::footer(
+                text,
+                if complete {
+                    EventPresentationTone::Info
+                } else {
+                    EventPresentationTone::Muted
+                },
+            )),
+        });
+    }
+
+    /// 在有界集合中加入已确认成功写入的路径，避免恶意或异常事件耗尽插件内存。
+    fn mark_dirty_paths(&mut self, paths: impl IntoIterator<Item = String>) {
+        let Some(context) = self.repository.as_mut() else {
+            return;
+        };
+        for path in paths {
+            context.dirty_paths.insert(path);
+            while context.dirty_paths.len() > incremental::MAX_DIRTY_PATHS {
+                // 保留字典序较小的前缀，保证达到上限时结果仍然确定。
+                let Some(last) = context.dirty_paths.iter().next_back().cloned() else {
+                    break;
+                };
+                context.dirty_paths.remove(&last);
+            }
+        }
+    }
+
+    /// 记录一次可能修改文件的工具调用，等待成功终态后再标记脏路径。
+    fn observe_tool_call(&mut self, event: &PluginEvent) {
+        let Ok(data) = event.parse::<ToolCallEventData>() else {
+            return;
+        };
+        if data.run_id.trim().is_empty() || data.call.id.trim().is_empty() {
+            return;
+        }
+        let Some(context) = self.repository.as_mut() else {
+            return;
+        };
+        let key = pending_write_key(&data.run_id, &data.call.id);
+        if event.is_cancelled() {
+            // 取消的重复投递也要清理先前登记的调用，避免悬挂记录一直占用容量。
+            context.pending_writes.remove(&key);
+            return;
+        }
+        if !incremental::is_write_tool(&data.call.name) {
+            // 同一调用若被重写成只读工具，旧的写入登记不能继续影响成功结果。
+            context.pending_writes.remove(&key);
+            return;
+        }
+        let paths = incremental::extract_paths_in_workspace(
+            &data.call.name,
+            &data.call.args,
+            &context.workspace_root,
+        );
+        if let Some(existing) = context.pending_writes.get_mut(&key) {
+            // 同一调用可能因总线重投收到多次 call 事件；合并而不是重复分配记录。
+            existing.paths.extend(paths);
+            return;
+        }
+        if context.pending_writes.len() >= incremental::MAX_PENDING_WRITES {
+            // 丢弃字典序最大的旧项，给最新调用留出确认机会；结果事件仍会走 content.path
+            // 兜底，不会因为这里的内存保护而永久漏记一个成功写入。
+            if let Some(largest) = context.pending_writes.keys().next_back().cloned() {
+                context.pending_writes.remove(&largest);
+            }
+        }
+        context.pending_writes.insert(
+            key,
+            incremental::PendingWrite {
+                run_id: data.run_id,
+                tool_name: data.call.name,
+                paths,
+            },
+        );
+    }
+
+    /// 在工具成功终态到达后提交脏路径；失败、取消或非写入工具一律忽略。
+    fn observe_tool_result(&mut self, event: &PluginEvent) {
+        let Ok(data) = event.parse::<ToolResultEventData>() else {
+            return;
+        };
+        if data.run_id.trim().is_empty() || data.result.call_id.trim().is_empty() {
+            return;
+        }
+        if event.is_cancelled() || data.result.is_error {
+            if let Some(context) = self.repository.as_mut() {
+                let key = pending_write_key(&data.run_id, &data.result.call_id);
+                context.pending_writes.remove(&key);
+            }
+            return;
+        }
+        let paths = {
+            let Some(context) = self.repository.as_mut() else {
+                return;
+            };
+            let key = pending_write_key(&data.run_id, &data.result.call_id);
+            let pending = context.pending_writes.remove(&key);
+            let tool_name = pending
+                .as_ref()
+                .map(|write| write.tool_name.clone())
+                .unwrap_or_else(|| data.result.name.clone());
+            if !incremental::is_write_tool(&tool_name) {
+                return;
+            }
+            let mut paths = pending.map(|write| write.paths).unwrap_or_default();
+            paths.extend(incremental::extract_result_paths_in_workspace(
+                &tool_name,
+                &data.result.content,
+                &context.workspace_root,
+            ));
+            paths
+        };
+        self.mark_dirty_paths(paths);
+    }
+
+    /// 清理运行结束后没有收到终态结果的待处理写入，避免取消运行泄漏瞬时状态。
+    fn finish_run(&mut self, event: &PluginEvent) {
+        let Ok(data) = event.parse::<RunFinishEventData>() else {
+            return;
+        };
+        if data.run_id.trim().is_empty() {
+            return;
+        }
+        if let Some(context) = self.repository.as_mut() {
+            context
+                .pending_writes
+                .retain(|_, pending| pending.run_id != data.run_id);
+        }
     }
 
     /// 执行一次 `code_search` 调用。
@@ -475,8 +762,8 @@ impl AgentPlugin for CodeContextPlugin {
             self.unavailable_reason = Some(CodeContextError::RepositoryUnavailable.to_string());
             return self.emit_status(host);
         }
-        // 只列出仓库根一次来验证 Host 已提供 manifest 声明的可信读取边界；本阶段不会
-        // 递归扫描，也不会读取任何源码文件。
+        // 只列出仓库根一次来验证 Host 已提供 manifest 声明的可信读取边界；真正的递归扫描
+        // 延迟到首次 code_search，并按预算分片执行。
         if let Err(error) = host.list_dir(".") {
             self.index_status = IndexStatus::Error;
             self.unavailable_reason = Some(
@@ -524,6 +811,23 @@ impl AgentPlugin for CodeContextPlugin {
         Vec::new()
     }
 
+    /// 观察工具生命周期，把成功的写入转换为有界脏路径集合。
+    ///
+    /// 该监听器不改写也不取消任何事件：写入必须等 Host 发布成功终态后才会生效，失败或
+    /// 被取消的调用只清理待处理记录。运行结束事件负责回收没有终态的调用。
+    fn on_event(&mut self, _host: &dyn PluginHostApi, event: &mut PluginEvent) -> EventOutcome {
+        if self.repository.is_none() || !self.config.enabled {
+            return EventOutcome::ready();
+        }
+        match event.name() {
+            core_events::TOOL_CALL => self.observe_tool_call(event),
+            core_events::TOOL_RESULT => self.observe_tool_result(event),
+            core_events::RUN_FINISH => self.finish_run(event),
+            _ => {}
+        }
+        EventOutcome::ready()
+    }
+
     fn call_tool_with_host(
         &mut self,
         host: &dyn PluginHostApi,
@@ -546,6 +850,7 @@ export_plugin!(CodeContextPlugin);
 mod tests {
     use super::*;
     use crate::testing::{activation_context, TestHost};
+    use agent_plugin::PluginEventEnvelope;
     use serde_json::Value;
 
     /// 激活一个附着到指定工作区的插件。
@@ -560,6 +865,57 @@ mod tests {
     /// 构造一次 code_search 调用。
     fn search_call(args: Value) -> ToolCall {
         ToolCall::new("call-1", TOOL_NAME, args)
+    }
+
+    /// 构造一条供事件监听测试使用的插件事件。
+    fn plugin_event(name: &str, data: Value) -> PluginEvent {
+        PluginEvent::new(PluginEventEnvelope {
+            event: name.to_string(),
+            cancelled: false,
+            canceller: None,
+            subscriber: "code-context".to_string(),
+            data,
+        })
+    }
+
+    /// 构造工具调用生命周期事件。
+    fn tool_call_event(run_id: &str, call_id: &str, name: &str, args: Value) -> PluginEvent {
+        plugin_event(
+            core_events::TOOL_CALL,
+            serde_json::to_value(ToolCallEventData {
+                run_id: run_id.to_string(),
+                step: 0,
+                call: ToolCall::new(call_id, name, args),
+                block_reason: None,
+                agent_guidance: None,
+                cancel_run: false,
+            })
+            .expect("序列化工具调用事件"),
+        )
+    }
+
+    /// 构造工具结果生命周期事件。
+    fn tool_result_event(
+        run_id: &str,
+        call_id: &str,
+        name: &str,
+        content: Value,
+        is_error: bool,
+    ) -> PluginEvent {
+        plugin_event(
+            core_events::TOOL_RESULT,
+            serde_json::to_value(ToolResultEventData {
+                run_id: run_id.to_string(),
+                step: 0,
+                result: if is_error {
+                    ToolResult::error(call_id, name, "写入失败")
+                } else {
+                    ToolResult::success(call_id, name, content)
+                },
+                origin: "test".to_string(),
+            })
+            .expect("序列化工具结果事件"),
+        )
     }
 
     /// 激活后必须建立仓库身份、注册工具并进入未索引状态。
@@ -821,6 +1177,311 @@ mod tests {
             .call_tool_with_host(&host, ToolCall::new("call-1", "other_tool", json!({})))
             .expect("未知工具不应 panic");
         assert!(result.is_error);
+    }
+
+    /// 只有成功的写入结果才会把调用参数中的路径加入脏集合。
+    #[test]
+    fn successful_write_result_marks_dirty_paths() {
+        let host = TestHost::new();
+        let mut plugin = activated(&host, "/repo/a");
+        let mut call = tool_call_event(
+            "run-1",
+            "write-1",
+            "write_file",
+            json!({"path": "src/a.rs", "content": "fn a() {}"}),
+        );
+        assert_eq!(plugin.on_event(&host, &mut call), EventOutcome::ready());
+        let mut result = tool_result_event(
+            "run-1",
+            "write-1",
+            "write_file",
+            json!({"path": "/repo/a/src/a.rs", "bytes_written": 9}),
+            false,
+        );
+        assert_eq!(plugin.on_event(&host, &mut result), EventOutcome::ready());
+
+        let context = plugin.repository.as_ref().expect("仓库上下文");
+        assert_eq!(
+            context.dirty_paths,
+            BTreeSet::from(["src/a.rs".to_string()])
+        );
+        assert!(context.pending_writes.is_empty());
+    }
+
+    /// 失败、取消和只读工具结果都不得触发增量重建。
+    #[test]
+    fn failed_cancelled_and_read_results_do_not_mark_dirty() {
+        let host = TestHost::new();
+        let mut plugin = activated(&host, "/repo/a");
+
+        let mut failed_call =
+            tool_call_event("run-1", "write-1", "edit_file", json!({"path": "src/a.rs"}));
+        plugin.on_event(&host, &mut failed_call);
+        let mut failed = tool_result_event(
+            "run-1",
+            "write-1",
+            "edit_file",
+            json!({"path": "src/a.rs"}),
+            true,
+        );
+        plugin.on_event(&host, &mut failed);
+
+        let mut read_result = tool_result_event(
+            "run-1",
+            "read-1",
+            "read_file",
+            json!({"path": "src/read.rs"}),
+            false,
+        );
+        plugin.on_event(&host, &mut read_result);
+
+        let context = plugin.repository.as_ref().expect("仓库上下文");
+        assert!(context.dirty_paths.is_empty());
+        assert!(context.pending_writes.is_empty());
+    }
+
+    /// 重复投递同一调用与结果必须保持幂等，并且运行结束会清理悬挂调用。
+    #[test]
+    fn duplicate_events_are_idempotent_and_finish_cleans_pending() {
+        let host = TestHost::new();
+        let mut plugin = activated(&host, "/repo/a");
+        let mut first_call = tool_call_event(
+            "run-1",
+            "write-1",
+            "rename_file",
+            json!({"old_path": "src/old.rs", "new_path": "src/new.rs"}),
+        );
+        plugin.on_event(&host, &mut first_call);
+        let mut duplicate_call = tool_call_event(
+            "run-1",
+            "write-1",
+            "rename_file",
+            json!({"old_path": "src/old.rs", "new_path": "src/new.rs"}),
+        );
+        plugin.on_event(&host, &mut duplicate_call);
+        let mut result = tool_result_event(
+            "run-1",
+            "write-1",
+            "rename_file",
+            json!({"path": "src/new.rs"}),
+            false,
+        );
+        plugin.on_event(&host, &mut result);
+        let mut duplicate_result = tool_result_event(
+            "run-1",
+            "write-1",
+            "rename_file",
+            json!({"path": "src/new.rs"}),
+            false,
+        );
+        plugin.on_event(&host, &mut duplicate_result);
+
+        let context = plugin.repository.as_ref().expect("仓库上下文");
+        assert_eq!(
+            context.dirty_paths,
+            BTreeSet::from(["src/new.rs".to_string(), "src/old.rs".to_string()])
+        );
+
+        let mut cancellable_call = tool_call_event(
+            "run-cancel",
+            "write-cancel",
+            "write_file",
+            json!({"path": "src/cancelled.rs"}),
+        );
+        plugin.on_event(&host, &mut cancellable_call);
+        let mut cancelled_duplicate = tool_call_event(
+            "run-cancel",
+            "write-cancel",
+            "write_file",
+            json!({"path": "src/cancelled.rs"}),
+        );
+        cancelled_duplicate.cancel();
+        plugin.on_event(&host, &mut cancelled_duplicate);
+        assert!(plugin
+            .repository
+            .as_ref()
+            .expect("仓库上下文")
+            .pending_writes
+            .is_empty());
+
+        let mut pending_call = tool_call_event(
+            "run-2",
+            "write-2",
+            "write_file",
+            json!({"path": "src/pending.rs"}),
+        );
+        plugin.on_event(&host, &mut pending_call);
+        let mut finish = plugin_event(
+            core_events::RUN_FINISH,
+            json!({"run_id": "run-2", "steps_used": 1, "cancelled": true}),
+        );
+        plugin.on_event(&host, &mut finish);
+        assert!(plugin
+            .repository
+            .as_ref()
+            .expect("仓库上下文")
+            .pending_writes
+            .is_empty());
+    }
+
+    /// 没有 call 事件时，成功写入结果中的相对或工作区内绝对路径仍可作为兜底。
+    #[test]
+    fn successful_result_uses_path_fallback_without_call_event() {
+        let host = TestHost::new();
+        let mut plugin = activated(&host, "/repo/a");
+        let mut result = tool_result_event(
+            "run-1",
+            "write-1",
+            "write_file",
+            json!({"path": "/repo/a/src/fallback.rs"}),
+            false,
+        );
+        plugin.on_event(&host, &mut result);
+        assert_eq!(
+            plugin.repository.as_ref().expect("仓库上下文").dirty_paths,
+            BTreeSet::from(["src/fallback.rs".to_string()])
+        );
+    }
+
+    /// 工作区之外的绝对路径必须被拒绝，即使它出现在成功结果中。
+    #[test]
+    fn outside_workspace_result_is_rejected() {
+        let host = TestHost::new();
+        let mut plugin = activated(&host, "/repo/a");
+        let mut result = tool_result_event(
+            "run-1",
+            "write-1",
+            "write_file",
+            json!({"path": "/repo/other/src/a.rs"}),
+            false,
+        );
+        plugin.on_event(&host, &mut result);
+        assert!(plugin
+            .repository
+            .as_ref()
+            .expect("仓库上下文")
+            .dirty_paths
+            .is_empty());
+    }
+
+    /// 已建成索引收到成功写入事件后，下一次搜索应走增量构建并保留未变更文件。
+    #[test]
+    fn search_triggers_incremental_build_after_successful_write() {
+        let initial = crate::testing::RepoHost::new(&[
+            ("src/keep.rs", "pub fn keep() {}\n"),
+            ("src/change.rs", "pub fn old_name() {}\n"),
+        ]);
+        let mut plugin = CodeContextPlugin::default();
+        plugin
+            .activate(&initial, activation_context("/repo/a"))
+            .expect("激活插件");
+        plugin
+            .call_tool_with_host(&initial, search_call(json!({"query": "old_name"})))
+            .expect("首次搜索应推进全量构建");
+        assert!(plugin
+            .index()
+            .expect("全量索引")
+            .file("src/change.rs")
+            .is_some());
+
+        let mut call = tool_call_event(
+            "run-1",
+            "write-1",
+            "edit_file",
+            json!({"path": "src/change.rs"}),
+        );
+        plugin.on_event(&initial, &mut call);
+        let mut result = tool_result_event(
+            "run-1",
+            "write-1",
+            "edit_file",
+            json!({"path": "src/change.rs"}),
+            false,
+        );
+        plugin.on_event(&initial, &mut result);
+
+        let changed = crate::testing::RepoHost::new(&[
+            ("src/keep.rs", "pub fn keep() {}\n"),
+            ("src/change.rs", "pub fn new_name() {}\n"),
+        ]);
+        plugin
+            .call_tool_with_host(&changed, search_call(json!({"query": "new_name"})))
+            .expect("增量构建应推进完成");
+
+        let index = plugin.index().expect("增量索引");
+        assert!(index.file("src/keep.rs").is_some());
+        assert!(index.symbols().any(|symbol| symbol.name == "new_name"));
+        assert!(!index.symbols().any(|symbol| symbol.name == "old_name"));
+        assert!(plugin
+            .repository
+            .as_ref()
+            .expect("仓库上下文")
+            .dirty_paths
+            .is_empty());
+    }
+
+    /// 索引分片必须发布带 Footer 展示的结构化进度，并在完成时发布终态快照。
+    #[test]
+    fn index_progress_event_contains_footer_and_terminal_payload() {
+        let files: Vec<(&'static str, &'static str)> = (0..40)
+            .map(|index| {
+                let path: &'static str = Box::leak(format!("src/file-{index}.rs").into_boxed_str());
+                (path, "pub fn indexed() {}\n")
+            })
+            .collect();
+        let host = crate::testing::RepoHost::new(&files);
+        let mut plugin = CodeContextPlugin::default();
+        plugin
+            .activate(&host, activation_context("/repo/a"))
+            .expect("激活插件");
+        plugin
+            .call_tool_with_host(&host, search_call(json!({"query": "indexed"})))
+            .expect("首次搜索");
+
+        let first_progress = host
+            .emitted_event_payloads()
+            .into_iter()
+            .find(|event| event.name == INDEX_PROGRESS_EVENT)
+            .expect("应发布索引进度事件");
+        assert_eq!(first_progress.data["mode"], "full");
+        assert_eq!(first_progress.data["complete"], false);
+        assert_eq!(
+            first_progress
+                .presentation
+                .as_ref()
+                .map(|presentation| &presentation.target),
+            Some(&agent_plugin::EventPresentationTarget::Footer)
+        );
+
+        for _ in 0..8 {
+            if plugin.index().is_some() {
+                break;
+            }
+            plugin
+                .call_tool_with_host(&host, search_call(json!({"query": "indexed"})))
+                .expect("继续构建");
+        }
+        assert!(plugin.index().is_some(), "分片构建应在有限轮次内完成");
+        let terminal = host
+            .emitted_event_payloads()
+            .into_iter()
+            .rev()
+            .find(|event| event.name == INDEX_PROGRESS_EVENT)
+            .expect("应发布终态进度事件");
+        assert_eq!(terminal.data["complete"], true);
+        assert_eq!(
+            terminal
+                .presentation
+                .as_ref()
+                .map(|presentation| &presentation.target),
+            Some(&agent_plugin::EventPresentationTarget::Footer)
+        );
+        let terminal_count = host
+            .emitted_event_payloads()
+            .into_iter()
+            .filter(|event| event.name == INDEX_PROGRESS_EVENT && event.data["complete"] == true)
+            .count();
+        assert_eq!(terminal_count, 1, "一次构建只能发布一个终态事件");
     }
 
     /// 骨架阶段绝不能返回任何伪造向量。

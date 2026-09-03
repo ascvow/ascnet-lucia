@@ -8,6 +8,7 @@
 //! `partition_point` 定位区间，不需要额外的 trie。
 
 use crate::model::CodeChunk;
+use std::collections::HashSet;
 
 /// 前缀匹配要求的最小查询长度。
 ///
@@ -107,6 +108,36 @@ impl SymbolIndex {
             file_path: chunk.file_path.clone(),
         });
         self.sorted = false;
+    }
+
+    /// 移除指定 chunk 在符号表中的记录。
+    ///
+    /// 返回实际移除的符号条数。删除后排序下标会失效，下一次 [`Self::finalize`] 会重新
+    /// 建立；在重新 finalize 前搜索继续安全返回空结果。
+    pub fn remove_chunks(&mut self, chunk_ids: &[String]) -> usize {
+        if chunk_ids.is_empty() || self.entries.is_empty() {
+            return 0;
+        }
+        let ids: HashSet<&str> = chunk_ids.iter().map(String::as_str).collect();
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| !ids.contains(entry.chunk_id.as_str()));
+        let removed = before.saturating_sub(self.entries.len());
+        if removed > 0 {
+            self.sorted = false;
+        }
+        removed
+    }
+
+    /// 移除指定文件的全部符号记录。
+    pub fn remove_file(&mut self, path: &str) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.file_path != path);
+        let removed = before.saturating_sub(self.entries.len());
+        if removed > 0 {
+            self.sorted = false;
+        }
+        removed
     }
 
     /// 建立排序索引。

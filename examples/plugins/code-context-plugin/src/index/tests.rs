@@ -7,9 +7,10 @@ use super::*;
 use crate::model::RepositoryIdentity;
 use crate::parser::parse_file;
 use crate::repository::language::Language;
-use crate::repository::{ScanBudget, ScanProgress};
+use crate::repository::{ScanBudget, ScanLimits, ScanProgress};
 use crate::storage::IndexStore;
 use crate::testing::RepoHost;
+use std::collections::BTreeSet;
 
 /// 不设限的预算，用于一次跑完。
 const UNLIMITED: ScanBudget = ScanBudget {
@@ -130,6 +131,37 @@ fn upsert_replaces_previous_chunks() {
         .all(|symbol| symbol.name != "old_one" && symbol.name != "old_two"));
 }
 
+/// 增量更新应保留未变化声明的稳定 chunk ID，并只报告真正变化的块。
+#[test]
+fn incremental_diff_preserves_unchanged_chunk_ids() {
+    let mut index = StructuralIndex::new(repository());
+    let old_source = "pub fn keep() {}\npub fn change() {}\n";
+    insert(&mut index, "src/a.rs", Language::Rust, old_source);
+    let old_ids = index
+        .file("src/a.rs")
+        .expect("旧文件记录")
+        .chunk_ids
+        .clone();
+
+    let new_source = "// 插入一行\npub fn keep() {}\npub fn changed() {}\n";
+    let file = indexable("src/a.rs", Language::Rust, new_source);
+    let parsed = parse_file(index.repository(), "src/a.rs", Language::Rust, new_source);
+    let change = index
+        .upsert_file_incremental(&file, parsed)
+        .expect("增量更新应成功");
+
+    assert_eq!(change.kind, FileChangeKind::Modified);
+    // 行号平移会更新 chunk 元数据，但稳定 ID 仍应复用；未变化字段才会进入
+    // `unchanged_chunk_ids`。
+    let new_ids = index
+        .file("src/a.rs")
+        .expect("新文件记录")
+        .chunk_ids
+        .clone();
+    assert!(old_ids.iter().any(|id| new_ids.contains(id)));
+    assert!(!change.updated_chunk_ids.is_empty() || !change.added_chunk_ids.is_empty());
+}
+
 /// 删除文件必须连同其 chunk 与符号一起移除。
 #[test]
 fn remove_file_clears_chunks_and_symbols() {
@@ -156,6 +188,93 @@ fn foreign_repository_chunks_are_rejected() {
 
     assert!(!index.upsert_file(&file, parsed), "跨仓库写入必须被拒绝");
     assert!(index.is_empty());
+}
+
+/// 解析产物的文件路径不一致时必须拒绝，并完整保留旧索引。
+#[test]
+fn malformed_paths_are_rejected_atomically() {
+    let mut index = StructuralIndex::new(repository());
+    insert(
+        &mut index,
+        "src/a.rs",
+        Language::Rust,
+        "pub fn stable() {}\n",
+    );
+    let before_stats = index.stats();
+    let before_file = index.file("src/a.rs").cloned();
+    let before_chunks = index.chunks().cloned().collect::<Vec<_>>();
+    let before_symbols = index.symbols().cloned().collect::<Vec<_>>();
+
+    let source = "pub fn replacement() {}\n";
+    let file = indexable("src/a.rs", Language::Rust, source);
+    let mut parsed = parse_file(index.repository(), "src/a.rs", Language::Rust, source);
+    parsed.chunks[0].file_path = "src/other.rs".to_string();
+    assert!(
+        index.upsert_file_incremental(&file, parsed).is_none(),
+        "chunk 路径与目标文件不一致时必须拒绝"
+    );
+
+    let mut parsed = parse_file(index.repository(), "src/a.rs", Language::Rust, source);
+    parsed.symbols[0].file_path = "src/other.rs".to_string();
+    assert!(
+        index.upsert_file_incremental(&file, parsed).is_none(),
+        "symbol 路径与目标文件不一致时必须拒绝"
+    );
+
+    assert_eq!(index.stats(), before_stats);
+    assert_eq!(index.file("src/a.rs").cloned(), before_file);
+    assert_eq!(index.chunks().cloned().collect::<Vec<_>>(), before_chunks);
+    assert_eq!(index.symbols().cloned().collect::<Vec<_>>(), before_symbols);
+}
+
+/// 新产物不得复用其他文件已占用的 chunk ID，也不得在同一文件内重复 ID。
+#[test]
+fn chunk_id_conflicts_are_rejected_atomically() {
+    let mut index = StructuralIndex::new(repository());
+    insert(
+        &mut index,
+        "src/a.rs",
+        Language::Rust,
+        "pub fn owner() {}\n",
+    );
+    insert(
+        &mut index,
+        "src/b.rs",
+        Language::Rust,
+        "pub fn first() {}\npub fn second() {}\n",
+    );
+    let before_files = index.files().cloned().collect::<Vec<_>>();
+    let before_chunks = index.chunks().cloned().collect::<Vec<_>>();
+    let before_symbols = index.symbols().cloned().collect::<Vec<_>>();
+
+    let source = "pub fn replacement() {}\n";
+    let file = indexable("src/b.rs", Language::Rust, source);
+    let mut parsed = parse_file(index.repository(), "src/b.rs", Language::Rust, source);
+    parsed.chunks[0].id = index.file("src/a.rs").expect("已有文件记录").chunk_ids[0].clone();
+    assert!(
+        index.upsert_file_incremental(&file, parsed).is_none(),
+        "其他文件已占用的 chunk ID 必须被拒绝"
+    );
+
+    let duplicate_source = "pub fn first() {}\npub fn second() {}\n";
+    let duplicate_file = indexable("src/b.rs", Language::Rust, duplicate_source);
+    let mut duplicate = parse_file(
+        index.repository(),
+        "src/b.rs",
+        Language::Rust,
+        duplicate_source,
+    );
+    duplicate.chunks[1].id = duplicate.chunks[0].id.clone();
+    assert!(
+        index
+            .upsert_file_incremental(&duplicate_file, duplicate)
+            .is_none(),
+        "同一文件内重复的 chunk ID 必须被拒绝"
+    );
+
+    assert_eq!(index.files().cloned().collect::<Vec<_>>(), before_files);
+    assert_eq!(index.chunks().cloned().collect::<Vec<_>>(), before_chunks);
+    assert_eq!(index.symbols().cloned().collect::<Vec<_>>(), before_symbols);
 }
 
 /// 文本兜底的文件必须被单独统计。
@@ -347,6 +466,60 @@ fn build_isolates_file_failures() {
     assert!(build.index().file("src/c.rs").is_some());
 }
 
+/// 增量读取失败必须保留旧索引、保留待重试路径，并计入失败统计。
+#[test]
+fn incremental_read_failure_keeps_old_index_and_counts_failure() {
+    let initial = RepoHost::new(&[("src/a.rs", "pub fn stable() {}\n")]);
+    let (old_index, old_retrieval) = build_all(&initial).into_parts();
+    let changed =
+        RepoHost::new(&[("src/a.rs", "pub fn replacement() {}\n")]).with_unreadable("src/a.rs");
+    let mut build = IndexBuild::new_incremental(
+        old_index,
+        old_retrieval,
+        BTreeSet::from(["src/a.rs".to_string()]),
+        ScanLimits::default(),
+    );
+
+    assert_eq!(build.advance(&changed, UNLIMITED), ScanProgress::Complete);
+    let stats = build.incremental_stats().expect("增量统计");
+    assert_eq!(stats.failed_files, 1);
+    assert_eq!(
+        build.remaining_dirty_paths(),
+        BTreeSet::from(["src/a.rs".to_string()])
+    );
+    let (index, _) = build.into_parts();
+    assert!(index.symbols().any(|symbol| symbol.name == "stable"));
+    assert!(!index.symbols().any(|symbol| symbol.name == "replacement"));
+}
+
+/// 新发现文件读取失败时也必须进入待重试集合，而不能只记录统计后遗忘路径。
+#[test]
+fn incremental_new_file_read_failure_is_retried() {
+    let initial = RepoHost::new(&[("src/keep.rs", "pub fn keep() {}\n")]);
+    let (old_index, old_retrieval) = build_all(&initial).into_parts();
+    let changed = RepoHost::new(&[
+        ("src/keep.rs", "pub fn keep() {}\n"),
+        ("src/new.rs", "pub fn new_file() {}\n"),
+    ])
+    .with_unreadable("src/new.rs");
+    let mut build = IndexBuild::new_incremental(
+        old_index,
+        old_retrieval,
+        BTreeSet::new(),
+        ScanLimits::default(),
+    );
+
+    assert_eq!(build.advance(&changed, UNLIMITED), ScanProgress::Complete);
+    assert_eq!(
+        build.incremental_stats().expect("增量统计").failed_files,
+        1
+    );
+    assert_eq!(
+        build.remaining_dirty_paths(),
+        BTreeSet::from(["src/new.rs".to_string()])
+    );
+}
+
 /// 语法错误的文件必须以文本兜底进入索引，而不是让构建失败。
 #[test]
 fn build_falls_back_to_text_on_parse_errors() {
@@ -377,6 +550,80 @@ fn build_handles_empty_repository() {
 
     assert!(build.is_complete());
     assert!(build.index().is_empty());
+}
+
+/// 增量扫描应只读取脏文件与新增文件，并同步 added/modified/deleted/unchanged 结果。
+#[test]
+fn incremental_build_updates_only_changed_files_and_retrieval() {
+    let initial_host = RepoHost::new(&[
+        ("src/keep.rs", "pub fn keep() {}\n"),
+        ("src/change.rs", "pub fn old_marker() {}\n"),
+        ("src/delete.rs", "pub fn removed_marker() {}\n"),
+    ]);
+    let (old_index, old_retrieval) = build_all(&initial_host).into_parts();
+    let stale_change_ids = old_index
+        .chunks_of("src/change.rs")
+        .into_iter()
+        .map(|chunk| chunk.id.clone())
+        .collect::<BTreeSet<_>>();
+    let stale_delete_ids = old_index
+        .chunks_of("src/delete.rs")
+        .into_iter()
+        .map(|chunk| chunk.id.clone())
+        .collect::<BTreeSet<_>>();
+    let initial_calls = initial_host.file_calls();
+
+    let changed_host = RepoHost::new(&[
+        ("src/keep.rs", "pub fn keep() {}\n"),
+        ("src/change.rs", "pub fn new_marker() {}\n"),
+        ("src/add.rs", "pub fn added_marker() {}\n"),
+    ]);
+    let mut build = IndexBuild::new_incremental(
+        old_index,
+        old_retrieval,
+        BTreeSet::from(["src/change.rs".to_string(), "src/keep.rs".to_string()]),
+        ScanLimits::default(),
+    );
+    assert_eq!(
+        build.advance(&changed_host, UNLIMITED),
+        ScanProgress::Complete
+    );
+    let stats = build.incremental_stats().expect("增量统计");
+    assert_eq!(stats.added_files, 1);
+    assert_eq!(stats.modified_files, 1);
+    assert_eq!(stats.deleted_files, 1);
+    assert_eq!(stats.unchanged_files, 1);
+    assert!(stats.changed_chunks >= 2);
+    assert!(stats.removed_chunks >= 1);
+    assert!(build.remaining_dirty_paths().is_empty());
+
+    let (index, retrieval) = build.into_parts();
+    assert!(index.file("src/add.rs").is_some());
+    assert!(index.file("src/delete.rs").is_none());
+    let new_ids = index
+        .chunks_of("src/change.rs")
+        .into_iter()
+        .map(|chunk| chunk.id.clone())
+        .collect::<BTreeSet<_>>();
+    assert!(retrieval
+        .search_all("new_marker", None, 10)
+        .into_iter()
+        .flatten()
+        .any(|candidate| new_ids.contains(&candidate.chunk_id)));
+    assert!(retrieval
+        .search_all("old_marker", None, 10)
+        .into_iter()
+        .flatten()
+        .all(|candidate| !stale_change_ids.contains(&candidate.chunk_id)));
+    assert!(retrieval
+        .search_all("removed_marker", None, 10)
+        .into_iter()
+        .flatten()
+        .all(|candidate| !stale_delete_ids.contains(&candidate.chunk_id)));
+    // 目录列举次数仍会发生，但未变化的 keep.rs 不应再次 read_file；相较全量构建至少少一次
+    // 文件读取，验证过滤器确实作用在正文读取层。
+    assert_eq!(changed_host.file_calls(), 5);
+    assert!(initial_calls >= 5);
 }
 
 // ---------------------------------------------------------------------------

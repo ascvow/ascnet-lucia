@@ -21,6 +21,8 @@ pub struct TestHost {
     tools: RefCell<Vec<String>>,
     /// 已发布的扩展事件名。
     events: RefCell<Vec<String>>,
+    /// 已发布的扩展事件快照，用于验证结构化进度与 Footer 展示载荷。
+    event_payloads: RefCell<Vec<ExtensionEvent>>,
     /// 项目作用域是否可用；关闭后模拟宿主未注入项目身份。
     workspace_available: bool,
     /// 当前工作区只读能力是否可用。
@@ -100,6 +102,11 @@ impl TestHost {
         self.events.borrow().clone()
     }
 
+    /// 返回已发布的扩展事件快照。
+    pub fn emitted_event_payloads(&self) -> Vec<ExtensionEvent> {
+        self.event_payloads.borrow().clone()
+    }
+
     /// 返回作用域的存储命名空间键。
     fn scope_key(scope: PluginStoreScope) -> String {
         match scope {
@@ -148,6 +155,7 @@ impl PluginHostApi for TestHost {
 
     fn emit_event(&self, event: &ExtensionEvent) -> Result<()> {
         self.events.borrow_mut().push(event.name.clone());
+        self.event_payloads.borrow_mut().push(event.clone());
         Ok(())
     }
 
@@ -304,6 +312,11 @@ impl RepoHost {
     /// 返回用户作用域中的全部键。
     pub fn user_keys(&self) -> Vec<String> {
         self.inner.user_keys()
+    }
+
+    /// 返回虚拟仓库宿主收到的扩展事件快照。
+    pub fn emitted_event_payloads(&self) -> Vec<ExtensionEvent> {
+        self.inner.emitted_event_payloads()
     }
 
     /// 标记一个文件为不可读，模拟二进制内容或权限失败。

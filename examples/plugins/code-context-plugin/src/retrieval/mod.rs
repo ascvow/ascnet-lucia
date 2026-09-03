@@ -26,8 +26,8 @@ mod tests;
 
 pub use fusion::{FusionConfig, FusionDebug, SearchResult};
 pub use symbol::SymbolMatch;
-pub use tokenize::tokenize;
 pub(crate) use tokenize::is_cjk as tokenize_is_cjk;
+pub use tokenize::tokenize;
 
 use crate::index::StructuralIndex;
 use crate::model::CodeChunk;
@@ -116,6 +116,21 @@ impl RetrievalIndex {
     pub fn index_chunk(&mut self, chunk: &CodeChunk, body: &str) {
         self.symbols.index_chunk(chunk);
         self.lexical.index_chunk(chunk, body);
+    }
+
+    /// 移除指定 chunk 在两路检索索引中的记录。
+    ///
+    /// 词法 posting 会在删除后重映射文档下标，符号排序表则标记为待重建；调用方应在
+    /// 当前增量批次结束时调用 [`Self::finalize`]。返回实际移除的词法文档数。
+    pub fn remove_chunks(&mut self, chunk_ids: &[String]) -> usize {
+        self.symbols.remove_chunks(chunk_ids);
+        self.lexical.remove_chunks(chunk_ids)
+    }
+
+    /// 移除指定文件在两路检索索引中的全部记录。
+    pub fn remove_file(&mut self, path: &str) -> usize {
+        self.symbols.remove_file(path);
+        self.lexical.remove_file(path)
     }
 
     /// 完成索引构建。

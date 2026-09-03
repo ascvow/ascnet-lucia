@@ -4,17 +4,33 @@ name = "Code Context Engine"
 version = "0.1.0"
 api_version = "0.10.0"
 wasm = "target/wasm32-wasip2/release/code_context_plugin.wasm"
-description = "为 Agent 提供 code_search 的仓库上下文引擎；当前为骨架阶段，索引尚未建立。"
+description = "为 Agent 提供可分片构建、增量更新的 code_search 仓库上下文引擎。"
+
+# 通过 Core 已有工具生命周期感知 Agent 写入；只在成功终态后把安全的仓库相对路径加入
+# 脏集合，不申请文件 watcher，也不参与工具准入或事件改写。
+[[events]]
+name = "core.tool.call"
+ignore_cancelled = true
+
+[[events]]
+name = "core.tool.result"
+priority = "monitor"
+
+# 运行取消或异常收尾时清理没有结果的待处理写入。
+[[events]]
+name = "core.run.finish"
+priority = "monitor"
 
 [capabilities]
-# 插件启动时只列出一次仓库根以确认 Host 已注入可信读取边界；本阶段不扫描或读取源码。
+# 插件启动时只列出一次仓库根以确认 Host 已注入可信读取边界；索引在首次 code_search 时
+# 按 fuel 预算分片构建，后续写入通过事件触发文件级增量更新。
 workspace_read = true
 
 # 索引 manifest 与仓库元数据跨插件版本保留，必须用 storage 而不是实例状态：
 # 一次插件重建就清空用户索引会让功能本身不成立。
 storage = true
 
-# 本阶段刻意不申请的能力，逐项说明，避免后来者误以为是遗漏：
+# 本插件刻意不申请的能力，逐项说明，避免后来者误以为是遗漏：
 #
 # http           —— API 嵌入（Phase 9）才需要，且 Host 当前在加载期拒绝该声明。
 # process_exec   —— 明确否决：它会把本插件全部工具的 scope 抬到 shell，

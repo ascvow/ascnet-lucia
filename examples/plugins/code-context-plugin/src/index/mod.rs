@@ -21,13 +21,13 @@ mod build;
 #[cfg(test)]
 mod tests;
 
-pub use build::{IndexBuild, BUILD_BUDGET};
+pub use build::{IncrementalStats, IndexBuild, BUILD_BUDGET};
 
 use crate::model::{CodeChunk, RepositoryIdentity, Symbol};
 use crate::parser::{ParseTier, ParsedFile};
 use crate::repository::language::Language;
 use crate::repository::IndexableFile;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// 索引最多容纳的文件数。
 const MAX_FILES: usize = 50_000;
@@ -72,6 +72,47 @@ pub struct IndexStats {
     pub text_files: u32,
     /// 是否因触及上限而截断。
     pub truncated: bool,
+}
+
+/// 一次文件索引更新的类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChangeKind {
+    /// 该路径此前不在结构索引中。
+    Added,
+    /// 该路径已存在，但正文或解析产物发生变化。
+    Modified,
+    /// 新旧文件记录与全部 chunk 都相同，无需更新检索索引。
+    Unchanged,
+    /// 该路径已从仓库中消失。
+    Deleted,
+}
+
+/// 结构索引对一个文件应用更新后的差异摘要。
+///
+/// `removed_chunk_ids` 与 `added_chunk_ids`/`updated_chunk_ids` 是检索索引同步的唯一输入：
+/// 调用方应先移除旧 ID，再为新增或更新的 ID 重新建立词法与符号 posting。未变化的 chunk
+/// 保留原对象，避免因文件内局部编辑而重建整份检索数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexChange {
+    /// 发生变化的仓库相对路径。
+    pub path: String,
+    /// 文件级变化类型。
+    pub kind: FileChangeKind,
+    /// 新文件中新增的 chunk ID。
+    pub added_chunk_ids: Vec<String>,
+    /// ID 保持不变但内容或定位字段变化的 chunk ID。
+    pub updated_chunk_ids: Vec<String>,
+    /// 旧文件中已不存在的 chunk ID。
+    pub removed_chunk_ids: Vec<String>,
+    /// 新旧版本完全相同、可直接复用的 chunk ID。
+    pub unchanged_chunk_ids: Vec<String>,
+}
+
+impl IndexChange {
+    /// 返回需要在检索索引中重新写入的 chunk ID 数量。
+    pub fn changed_chunk_count(&self) -> usize {
+        self.added_chunk_ids.len() + self.updated_chunk_ids.len()
+    }
 }
 
 /// 结构化索引。
@@ -139,63 +180,187 @@ impl StructuralIndex {
 
     /// 写入或更新一个文件的索引。
     ///
-    /// 同路径的旧 chunk 与旧符号先被完整移除，因此重复索引同一文件是幂等的——这正是
-    /// Phase 11 增量重建所依赖的性质。
+    /// 同路径的旧 chunk 与旧符号按稳定 ID 计算差异并替换，因此重复索引同一文件是幂等的，
+    /// 且不会无谓地重建未变化的检索条目——这正是 Phase 11 增量重建所依赖的性质。
     ///
-    /// 来自其他仓库的 chunk 会被拒绝并返回 `false`。
+    /// 来自其他仓库或其他文件的 chunk 会被拒绝并返回 `false`。
     pub fn upsert_file(&mut self, file: &IndexableFile, parsed: ParsedFile) -> bool {
-        if parsed
-            .chunks
-            .iter()
-            .any(|chunk| chunk.repository_id != self.repository)
-        {
-            return false;
+        self.upsert_file_incremental(file, parsed).is_some()
+    }
+
+    /// 写入或更新一个文件，并返回新旧 chunk 的精确差异。
+    ///
+    /// 与旧版 `upsert_file` 相比，该方法只替换新增或实际变化的 chunk；同 ID 且字段完全
+    /// 相同的 chunk 保留在原位。容量检查会先扣除旧文件占用，避免更新同一文件时因旧 chunk
+    /// 尚未移除而误报容量不足。
+    ///
+    /// # Errors
+    ///
+    /// 返回 `None` 表示输入路径/仓库不匹配、出现重复或跨文件 ID、或更新后会超过文件/chunk
+    /// 上限；除容量截断标记外，失败时索引内容保持不变。
+    pub fn upsert_file_incremental(
+        &mut self,
+        file: &IndexableFile,
+        parsed: ParsedFile,
+    ) -> Option<IndexChange> {
+        let ParsedFile {
+            chunks: parsed_chunks,
+            symbols: parsed_symbols,
+            tier,
+        } = parsed;
+        let old_record = self.files.get(&file.path).cloned();
+        let old_chunk_ids = old_record
+            .as_ref()
+            .map(|record| record.chunk_ids.clone())
+            .unwrap_or_default();
+        let old_chunk_id_set: HashSet<&str> = old_chunk_ids.iter().map(String::as_str).collect();
+
+        // 先完成所有输入校验，再触碰索引状态。这样异常解析结果不会删除旧文件，也不会
+        // 把一个文件的 chunk ID 覆盖到另一个文件上。
+        if parsed_chunks.iter().any(|chunk| {
+            chunk.repository_id != self.repository
+                || chunk.file_path != file.path
+                || self.chunks.get(&chunk.id).is_some_and(|existing| {
+                    existing.file_path != file.path || !old_chunk_id_set.contains(chunk.id.as_str())
+                })
+        }) {
+            return None;
         }
+        if parsed_symbols
+            .iter()
+            .any(|symbol| symbol.file_path != file.path)
+        {
+            return None;
+        }
+
+        let new_chunk_ids: Vec<String> =
+            parsed_chunks.iter().map(|chunk| chunk.id.clone()).collect();
+        let mut new_chunks = BTreeMap::new();
+        for chunk in parsed_chunks {
+            if new_chunks.insert(chunk.id.clone(), chunk).is_some() {
+                return None;
+            }
+        }
+        let old_chunk_count = old_chunk_ids.len();
         if self.files.len() >= MAX_FILES && !self.files.contains_key(&file.path) {
             self.truncated = true;
-            return false;
+            return None;
         }
-        if self.chunks.len() + parsed.chunks.len() > MAX_CHUNKS {
+        let projected_chunks = self
+            .chunks
+            .len()
+            .saturating_sub(old_chunk_count)
+            .saturating_add(new_chunks.len());
+        if projected_chunks > MAX_CHUNKS {
             self.truncated = true;
-            return false;
+            return None;
         }
 
-        self.remove_file(&file.path);
+        let mut removed_chunk_ids = Vec::new();
+        let mut updated_chunk_ids = Vec::new();
+        let mut unchanged_chunk_ids = Vec::new();
+        let mut added_chunk_ids = Vec::new();
+        for old_id in &old_chunk_ids {
+            if !new_chunks.contains_key(old_id) {
+                removed_chunk_ids.push(old_id.clone());
+            }
+        }
+        for (id, new_chunk) in &new_chunks {
+            match self.chunks.get(id) {
+                Some(old_chunk) if old_chunk == new_chunk => unchanged_chunk_ids.push(id.clone()),
+                Some(_) => updated_chunk_ids.push(id.clone()),
+                None => added_chunk_ids.push(id.clone()),
+            }
+        }
+        for id in &removed_chunk_ids {
+            self.chunks.remove(id);
+        }
+        for id in &updated_chunk_ids {
+            self.chunks.remove(id);
+        }
+        for (id, chunk) in new_chunks {
+            if added_chunk_ids.iter().any(|added| added == &id)
+                || updated_chunk_ids.iter().any(|updated| updated == &id)
+            {
+                self.chunks.insert(id, chunk);
+            }
+        }
 
-        let chunk_ids: Vec<String> = parsed.chunks.iter().map(|chunk| chunk.id.clone()).collect();
-        for chunk in parsed.chunks {
-            self.chunks.insert(chunk.id.clone(), chunk);
+        let symbols_unchanged = self
+            .symbols
+            .get(&file.path)
+            .map(|old| old == &parsed_symbols)
+            .unwrap_or_else(|| parsed_symbols.is_empty());
+        self.symbols.remove(&file.path);
+        if !parsed_symbols.is_empty() {
+            self.symbols.insert(file.path.clone(), parsed_symbols);
         }
-        if !parsed.symbols.is_empty() {
-            self.symbols.insert(file.path.clone(), parsed.symbols);
-        }
+        // `FileRecord::chunk_ids` 必须遵循解析器给出的文件内顺序，不能按 BTreeMap 的
+        // 字典序重排，否则上下文构建的父子关系与输出顺序会改变。
+        let ordered_chunk_ids = new_chunk_ids;
+        let metadata_unchanged = old_record.as_ref().is_some_and(|record| {
+            record.language == file.language
+                && record.tier == tier
+                && record.byte_len == file.byte_len
+                && record.line_count == file.line_count
+                && record.content_hash == file.content_hash
+        });
+        let kind = if old_record.is_none() {
+            FileChangeKind::Added
+        } else if metadata_unchanged
+            && removed_chunk_ids.is_empty()
+            && updated_chunk_ids.is_empty()
+            && added_chunk_ids.is_empty()
+            && symbols_unchanged
+        {
+            FileChangeKind::Unchanged
+        } else {
+            FileChangeKind::Modified
+        };
         self.files.insert(
             file.path.clone(),
             FileRecord {
                 path: file.path.clone(),
                 language: file.language,
                 content_hash: file.content_hash.clone(),
-                tier: parsed.tier,
-                chunk_ids,
+                tier,
+                chunk_ids: ordered_chunk_ids,
                 byte_len: file.byte_len,
                 line_count: file.line_count,
             },
         );
-        true
+        Some(IndexChange {
+            path: file.path.clone(),
+            kind,
+            added_chunk_ids,
+            updated_chunk_ids,
+            removed_chunk_ids,
+            unchanged_chunk_ids,
+        })
     }
 
     /// 移除一个文件及其全部 chunk 与符号。
     ///
     /// 返回该文件此前是否在索引中。
     pub fn remove_file(&mut self, path: &str) -> bool {
-        let Some(record) = self.files.remove(path) else {
-            return false;
-        };
+        self.remove_file_with_diff(path).is_some()
+    }
+
+    /// 移除一个文件并返回被删除的 chunk ID。
+    pub fn remove_file_with_diff(&mut self, path: &str) -> Option<IndexChange> {
+        let record = self.files.remove(path)?;
         for id in &record.chunk_ids {
             self.chunks.remove(id);
         }
         self.symbols.remove(path);
-        true
+        Some(IndexChange {
+            path: path.to_string(),
+            kind: FileChangeKind::Deleted,
+            added_chunk_ids: Vec::new(),
+            updated_chunk_ids: Vec::new(),
+            removed_chunk_ids: record.chunk_ids,
+            unchanged_chunk_ids: Vec::new(),
+        })
     }
 
     /// 按 ID 取一个 chunk。

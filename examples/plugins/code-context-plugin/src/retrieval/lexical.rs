@@ -14,7 +14,7 @@
 
 use super::tokenize::tokenize;
 use crate::model::CodeChunk;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// BM25 的词频饱和参数。
 const BM25_K1: f32 = 1.2;
@@ -159,6 +159,67 @@ impl LexicalIndex {
             file_path: chunk.file_path.clone(),
             length,
         });
+    }
+
+    /// 移除指定 chunk 的词法文档及其全部 posting。
+    ///
+    /// 文档下标是 posting 的内部引用，删除时会压缩文档数组并重映射剩余 posting，确保
+    /// BM25 不会访问失效下标，也不会残留旧词元。返回实际移除的文档数。
+    pub fn remove_chunks(&mut self, chunk_ids: &[String]) -> usize {
+        if chunk_ids.is_empty() || self.documents.is_empty() {
+            return 0;
+        }
+        let ids: HashSet<&str> = chunk_ids.iter().map(String::as_str).collect();
+        self.remove_documents(|document| ids.contains(document.chunk_id.as_str()))
+    }
+
+    /// 移除指定文件的全部词法文档。
+    pub fn remove_file(&mut self, path: &str) -> usize {
+        if self.documents.is_empty() {
+            return 0;
+        }
+        self.remove_documents(|document| document.file_path == path)
+    }
+
+    /// 按谓词压缩文档与 posting，并重算 BM25 的全局长度统计。
+    fn remove_documents(&mut self, should_remove: impl Fn(&Document) -> bool) -> usize {
+        let mut remap = vec![None; self.documents.len()];
+        let mut retained = Vec::with_capacity(self.documents.len());
+        let mut removed = 0usize;
+        for (old_doc, document) in self.documents.iter().enumerate() {
+            if should_remove(document) {
+                removed += 1;
+                continue;
+            }
+            let new_doc = u32::try_from(retained.len()).unwrap_or(u32::MAX);
+            remap[old_doc] = Some(new_doc);
+            retained.push(document.clone());
+        }
+        if removed == 0 {
+            return 0;
+        }
+        self.documents = retained;
+        self.postings.retain(|_, postings| {
+            let mut rewritten = Vec::with_capacity(postings.len());
+            for posting in postings.iter() {
+                let Some(new_doc) = remap.get(posting.doc as usize).and_then(|doc| *doc) else {
+                    continue;
+                };
+                rewritten.push(Posting {
+                    doc: new_doc,
+                    frequency: posting.frequency,
+                });
+            }
+            *postings = rewritten;
+            !postings.is_empty()
+        });
+        self.posting_count = self.postings.values().map(Vec::len).sum();
+        self.total_length = self
+            .documents
+            .iter()
+            .map(|document| u64::from(document.length))
+            .sum();
+        removed
     }
 
     /// 执行一次 BM25 检索。

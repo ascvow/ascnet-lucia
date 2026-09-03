@@ -9,7 +9,10 @@
 
 Phase 11 — Incremental Indexing
 
-Status: NOT_STARTED
+Status: COMPLETE
+Completed Date: 2026-09-03
+
+下一步：Phase 12 — Local Embedding Provider（BLOCKED）；按既定顺序进入 Phase 13 — Agent Tool Integration。
 
 ## Overall Status
 
@@ -24,7 +27,7 @@ Status: NOT_STARTED
 - [ ] Phase 8 — Semantic Vector Index — **BLOCKED**（依赖 Phase 7 与 blob 存储）
 - [x] Phase 9 — Hybrid Retrieval
 - [x] Phase 10 — Context Builder
-- [ ] Phase 11 — Incremental Indexing
+- [x] Phase 11 — Incremental Indexing
 - [ ] Phase 12 — Local Embedding Provider — **BLOCKED**（Host 无 embedding 能力）
 - [ ] Phase 13 — Agent Tool Integration
 - [ ] Phase 14 — Retrieval Benchmark
@@ -230,11 +233,12 @@ Known limitations:
   构建后，必须补一个真实 Host 上的子目录扫描 smoke test。
 - 单文件体量上限只能在读取后生效（宿主不提供 size），因此超大文件仍会产生一次完整读取的
   内存峰值。`FileEntry` 增加 size/mtime 是架构中的 Recommended 级 Host 改动。
-- 未实现文件 watcher（属于 Phase 11 与 Optional 级 Host 能力）。
+- 未实现文件 watcher；当前由 Phase 11 的 `core.tool.call` / `core.tool.result` 路径覆盖 Agent
+  写入，编辑器等外部修改仍由 Phase 10 惰性一致性校验兜底。watcher 仍是 Optional 级 Host 能力。
 
 Deferred items:
 - 扫描结果的持久化（`hash_index` 已提供路径→哈希映射，落盘属于 Phase 4）。
-- 增量 diff（added / modified / deleted）属于 Phase 11。
+- 增量 diff（added / modified / deleted）已在 Phase 11 完成。
 
 Next: Phase 3 — Structural Parsing
 
@@ -315,7 +319,7 @@ Known limitations:
 
 Deferred items:
 - 解析结果的持久化与索引构建属于 Phase 4。
-- 增量 diff 属于 Phase 11；Phase 3 已通过稳定 chunk ID 为其铺好前提。
+- Phase 11 复用本阶段提供的稳定 chunk ID，按文件应用增量 diff。
 
 Next: Phase 4 — Structural Index
 
@@ -396,7 +400,7 @@ Known limitations:
 
 Deferred items:
 - 符号表与倒排索引的检索结构属于 Phase 5。
-- 增量 diff（added / modified / deleted）属于 Phase 11，哈希表已为其就位。
+- Phase 11 已复用文件哈希与稳定 chunk ID 完成 added / modified / deleted / unchanged diff。
 
 Next: Phase 5 — Lexical & Symbol Retrieval
 
@@ -475,7 +479,7 @@ Known limitations:
   未实测，Phase 14 需要一并测量。
 - 前缀匹配要求至少 3 字符，更短的前缀会匹配到成百上千符号并淹没精确匹配。
 - 未实现拼写纠错与同义词扩展，属于 V1 明确不做的范围。
-- `RetrievalIndex` 尚无 `remove_file`：Phase 11 增量索引需要时再加，现在加是空转。
+- `RetrievalIndex` 已提供按 chunk 与按文件删除接口，供 Phase 11 同步清理符号和词法 posting。
 
 Next: Phase 6 — Embedding Abstraction
 
@@ -697,6 +701,52 @@ Known limitations:
 
 Next: Phase 11 — Incremental Indexing
 
+---
+
+### Phase 11 — Incremental Indexing
+
+Status: COMPLETE
+Completed Date: 2026-09-03
+
+Summary：在不引入 watcher 或新 Host 能力的前提下，把 Agent 成功写入事件转换为有界脏路径集合，
+并复用 Phase 2 扫描器的游标、预算与目录快照，以及 Phase 4 的幂等 upsert，实现文件级增量重建。
+
+Implemented:
+- **事件驱动脏集合**：订阅 `core.tool.call`、`core.tool.result` 与 `core.run.finish`；只为成功
+  的写入类工具标记路径，失败、取消、只读工具和未解析事件不产生变更。调用参数与结果
+  `content.path` 均支持安全的仓库相对路径，工作区内绝对路径会先转换，越界路径拒绝。
+- **有界与幂等状态**：脏路径最多 4096 项，未完成写入最多 1024 项；调用 ID 按
+  `run_id + call_id` 隔离，重复 call/result 投递不会重复扩大集合，运行结束清理悬挂调用。
+- **文件级增量扫描**：目录仍完整遍历以发现新增、删除和不可索引路径，但正文只读取脏文件
+  与当前结构索引中不存在的新文件；哈希、语言、大小和行数均未变化的文件跳过解析。
+- **稳定 chunk diff**：`StructuralIndex::upsert_file_incremental` 原子计算并应用新增、更新、
+  删除与未变化 chunk，容量或跨仓库校验失败时保留旧索引并记录待重试路径。
+- **双路检索同步**：更新前从符号表和词法倒排移除旧 chunk，更新后只重建变化 chunk；词法
+  文档删除会重映射 posting 下标并重算长度统计，避免 stale candidate。
+- **安全删除与错误隔离**：只有完整目录快照才推断删除；列举失败、深度/规模截断或未保留告警
+  会保留旧索引。单文件读取失败保留旧值并让路径进入下一轮重试。
+- **分片进度**：增量构建沿用 `ScanBudget`，每次推进发布 `code-context.index.progress` 的
+  结构化 Footer 事件；完成后持久化文件哈希与 manifest，新一轮事件不会被当前构建清掉。
+
+Key files:
+- `examples/plugins/code-context-plugin/src/incremental.rs` — 写入工具识别、路径提取与边界校验
+- `.../src/index/build.rs` — Full / Incremental 构建模式、分片推进与删除策略
+- `.../src/index/mod.rs` — 文件级 chunk diff 与原子 upsert
+- `.../src/retrieval/{symbol,lexical,mod}.rs` — 双路索引删除与 posting 重映射
+- `.../src/repository/mod.rs` — 目录快照集合、过滤读取与完整性判断
+- `.../src/lib.rs`、`plugin.toml` — 生命周期接入、事件订阅与 Footer 进度
+
+Tests：覆盖增量 added / modified / deleted / unchanged、事件幂等与失败隔离、路径安全、检索
+清理、预算分片和 Footer 进度；插件单元测试总数以本次构建输出为准，全部通过。
+
+Known limitations:
+- 外部编辑器或 `git checkout` 没有事件时，仍依赖 Phase 10 命中结果的惰性一致性校验；统一
+  `filesystem.watch()` 仍待 Host 的 Optional 能力。
+- 结构索引本体仍驻留内存，进程重启后需要全量重建；持久化哈希表只作为元数据基线。
+- `BUILD_BUDGET` 与增量统计的真实吞吐仍需 Phase 14 benchmark 校准。
+
+Next: Phase 12 — Local Embedding Provider（BLOCKED）
+
 ## Blocked Phases
 
 三个阶段因 Host 能力缺失无法实现。按开发任务书 §25，记录 Blocker 而**不绕开架构做 hack 实现**。
@@ -864,21 +914,9 @@ Tier 3  文本分块              —— 未覆盖语言、解析失败、无声
 
 ## Next Action
 
-开始 Phase 10 — Context Builder：
-
-1. 新建 `examples/plugins/code-context-plugin/src/context/`。
-2. **不要简单取 top 10**。必须实现：去重、重叠区间合并、同文件合并、父子抑制、
-   多样性、token 预算、上下文打包。
-3. **父子抑制**是关键：Phase 3 对容器与其成员都产出 chunk（`impl` 块与它的方法都在索引里），
-   因此融合结果天然含父子重叠。返回 `PermissionManager` 整块又返回 `PermissionManager::check`
-   是纯粹的 token 浪费。
-4. 正文在这里按需重读（`host.read_file`），并**比对 `content_hash`**：不一致说明文件被外部
-   修改，需即时重解析并修正结果。这是架构第 8 问的惰性一致性校验。
-5. token 预算：没有 tokenizer，用字符数或字节数做保守估计，并写明估算方式与误差方向。
-6. `SearchResult` 增加 `snippet` 字段；内部诊断保留但不进 Agent 可见输出。
-
-Definition of Done：输入融合候选，输出满足 token 预算的 Agent 可用上下文，
-不含大量重复代码，父子重叠被抑制，且有测试覆盖。
+Phase 11 已完成：事件驱动的脏路径、文件级增量 diff、双路检索清理、分片进度和失败重试
+均已接入并通过插件测试。Phase 12 — Local Embedding Provider 受 Host embedding 能力缺失阻塞，
+不绕过架构实现；下一步按计划进入 Phase 13 — Agent Tool Integration。
 
 ---
 
