@@ -291,6 +291,18 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     .into_anyhow()
     .context("注册 host-session-read 失败")?;
     root.func_wrap_async(
+        "host-http-request",
+        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+            let (allowlist, binding) = caller.data().capabilities.http_context();
+            Box::new(async move {
+                let result = CapabilityState::http_request_with(allowlist, binding, &request).await;
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
+            })
+        },
+    )
+    .into_anyhow()
+    .context("注册 host-http-request 失败")?;
+    root.func_wrap_async(
         "host-model-complete",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             let (allowed, binding, plugin_id) =

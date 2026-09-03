@@ -186,6 +186,15 @@ pub struct ResourceLimits {
     /// 单个插件激活生命周期内允许提交的模型完成请求累计字节数。
     #[serde(default)]
     pub max_plugin_model_input_bytes: Option<usize>,
+    /// 单个插件激活生命周期内允许发起的宿主 HTTP 请求总数。
+    ///
+    /// 与模型完成分开计量：嵌入这类调用是高频小请求，与低频大请求的模型完成共用同一个
+    /// 账本会让任意一方的上限失去意义。
+    #[serde(default)]
+    pub max_plugin_http_requests: Option<usize>,
+    /// 单个插件激活生命周期内允许提交的宿主 HTTP 请求累计字节数。
+    #[serde(default)]
+    pub max_plugin_http_request_bytes: Option<usize>,
 }
 
 /// 取两个可选限额中更严格的一个，`None` 视为无上限。
@@ -237,6 +246,14 @@ impl ResourceLimits {
             max_plugin_model_input_bytes: tighter(
                 self.max_plugin_model_input_bytes,
                 requested.max_plugin_model_input_bytes,
+            ),
+            max_plugin_http_requests: tighter(
+                self.max_plugin_http_requests,
+                requested.max_plugin_http_requests,
+            ),
+            max_plugin_http_request_bytes: tighter(
+                self.max_plugin_http_request_bytes,
+                requested.max_plugin_http_request_bytes,
             ),
         }
     }
@@ -311,6 +328,10 @@ impl ExecutionPolicy {
                 max_agent_model_output_tokens_per_principal: Some(512 * 20_000),
                 max_plugin_model_completions: Some(128),
                 max_plugin_model_input_bytes: Some(8 * 1024 * 1024),
+                // 嵌入索引是高频小请求：一次全量索引可能提交数千批，上限按此量级设定，
+                // 与低频大请求的模型完成分开计量。
+                max_plugin_http_requests: Some(4096),
+                max_plugin_http_request_bytes: Some(64 * 1024 * 1024),
                 ..ResourceLimits::default()
             },
         }
@@ -342,6 +363,9 @@ impl ExecutionPolicy {
                 max_processes: Some(0),
                 max_plugin_model_completions: Some(32),
                 max_plugin_model_input_bytes: Some(1024 * 1024),
+                // 该档位 `allow_network` 为 false，限额置零与之保持一致。
+                max_plugin_http_requests: Some(0),
+                max_plugin_http_request_bytes: Some(0),
             },
         }
     }
@@ -374,6 +398,8 @@ impl ExecutionPolicy {
                 max_processes: Some(0),
                 max_plugin_model_completions: Some(0),
                 max_plugin_model_input_bytes: Some(0),
+                max_plugin_http_requests: Some(0),
+                max_plugin_http_request_bytes: Some(0),
             },
         }
     }

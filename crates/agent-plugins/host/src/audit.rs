@@ -401,8 +401,11 @@ pub fn snapshot_manifest_capabilities(
     if capabilities.process_exec {
         requested.push(capability_request("process_exec"));
     }
-    if capabilities.http {
-        requested.push(capability_request("http"));
+    if let Some(http) = &capabilities.http {
+        requested.push(ManifestCapabilityRequest {
+            capability_id: "http".into(),
+            scopes: sorted_unique(http.allow_hosts.clone()),
+        });
     }
     if capabilities.secrets {
         requested.push(capability_request("secrets"));
@@ -765,6 +768,7 @@ fn mapped_host_imports(capability_id: &str) -> &'static [&'static str] {
     match capability_id {
         "agent.spawn" | "agent.observe" | "agent.cancel" => &["host-agent-runtime-call"],
         "model_completion" => &["host-model-complete"],
+        "http" => &["host-http-request"],
         "surface_actions" => &["host-agent-emit-event"],
         "service_dependencies" => &["host-service-call"],
         "process_exec" => &[

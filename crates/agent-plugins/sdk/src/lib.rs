@@ -50,6 +50,7 @@ world plugin {
   import host-process-write: func(request-json: string) -> string;
   import host-process-read-line: func(request-json: string) -> string;
   import host-process-kill: func(request-json: string) -> string;
+  import host-http-request: func(request-json: string) -> string;
   import host-model-complete: func(request-json: string) -> string;
   import host-agent-runtime-call: func(request-json: string) -> string;
   export activate: func(context-json: string) -> string;
@@ -360,6 +361,37 @@ pub struct ProcessSpec {
     /// 是否把子进程 stderr 连接到 Lucia 的 stderr。
     #[serde(default)]
     pub inherit_stderr: bool,
+}
+
+/// 插件提交给宿主的一次受限 HTTP 请求。
+///
+/// 请求只能携带相对路径和非敏感 header。目标主机、认证 header、超时和响应上限由 Host
+/// 根据 manifest 与应用配置注入，Guest 不能借此访问任意地址或读取 API 密钥。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpRequest {
+    /// HTTP 方法，例如 `GET` 或 `POST`。
+    pub method: String,
+    /// 相对于 Host 配置 base URL 的路径，可带查询字符串。
+    pub path: String,
+    /// 由插件提交的非敏感请求 header。
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// 可选 UTF-8 请求正文；二进制协议应在插件层自行编码。
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+/// 宿主执行受限 HTTP 请求后返回的响应快照。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpResponse {
+    /// HTTP 状态码；非 2xx 状态由调用方按具体协议解释。
+    pub status: u16,
+    /// 经 Host 清理后的响应 header。
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// UTF-8 响应正文；超过 Host 上限的响应会在读取前失败。
+    #[serde(default)]
+    pub body: String,
 }
 
 /// 插件发起的一次受限模型完成请求。
@@ -713,6 +745,14 @@ pub trait PluginHostApi {
     /// 终止并释放子进程句柄。
     fn kill_process(&self, handle: u64) -> Result<()>;
 
+    /// 执行一次由 manifest 允许的结构化 HTTP 请求。
+    ///
+    /// Host 会注入可信 base URL 与认证信息，并在返回前执行主机 allowlist、网络策略、
+    /// 请求/响应大小和超时校验。默认实现返回能力不可用，便于旧宿主与单元测试明确失败。
+    fn http_request(&self, _request: &HttpRequest) -> Result<HttpResponse> {
+        Err(anyhow!("宿主未提供 HTTP 请求能力"))
+    }
+
     /// 使用应用固定的 provider 和模型执行一次无工具模型完成。
     fn complete_model(&self, _request: &ModelCompletionRequest) -> Result<ModelCompletionResponse> {
         Err(anyhow!("宿主未提供模型完成 API"))
@@ -983,6 +1023,7 @@ world plugin {
   import host-process-write: func(request-json: string) -> string;
   import host-process-read-line: func(request-json: string) -> string;
   import host-process-kill: func(request-json: string) -> string;
+  import host-http-request: func(request-json: string) -> string;
   import host-model-complete: func(request-json: string) -> string;
   import host-agent-runtime-call: func(request-json: string) -> string;
   export activate: func(context-json: string) -> string;
@@ -1237,6 +1278,15 @@ world plugin {
                     let request = $crate::__serde_json::json!({"handle": handle});
                     $crate::decode_host_response(&host_process_kill(
                         &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn http_request(
+                    &self,
+                    request: &$crate::HttpRequest,
+                ) -> $crate::Result<$crate::HttpResponse> {
+                    $crate::decode_host_response(&host_http_request(
+                        &$crate::to_json_string(request),
                     ))
                 }
 

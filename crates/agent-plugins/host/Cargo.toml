@@ -8,7 +8,7 @@ description = "ascnet-lucia 的插件宿主、WASM 运行时和 UI 协议。"
 
 [features]
 default = ["wasm"]
-wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:reqwest", "dep:url"]
 
 [dependencies]
 anyhow.workspace = true
@@ -20,6 +20,8 @@ agent-tool = { path = "../../agent-core/tool", default-features = false }
 async-trait.workspace = true
 futures-util.workspace = true
 libc.workspace = true
+reqwest = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

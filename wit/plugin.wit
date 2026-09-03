@@ -83,6 +83,9 @@ world plugin {
   /// 终止并释放子进程。
   import host-process-kill: func(request-json: string) -> string;
 
+  /// 执行一次由 manifest allowlist 约束的结构化 HTTP 请求。
+  import host-http-request: func(request-json: string) -> string;
+
   /// 使用宿主固定的模型路由执行一次无工具模型完成。
   import host-model-complete: func(request-json: string) -> string;
 

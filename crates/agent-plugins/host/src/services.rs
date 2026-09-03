@@ -12,13 +12,140 @@ use agent_core::AgentModelConfig;
 use agent_runtime::{AgentDeriveConfig, AgentProfileId, AgentRuntimeProvisioner};
 use agent_tool::ExecutionPolicy;
 #[cfg(feature = "wasm")]
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 #[cfg(feature = "wasm")]
 use std::path::PathBuf;
 #[cfg(feature = "wasm")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// 应用注入的受限 HTTP 端点服务。
+///
+/// 承载 `adr-api-embedding.md` 定下的分工：`base_url` 与凭证 header 由应用配置提供，
+/// Guest 只能给出相对路径。凭证保存在这里而不是下发给插件，因此**插件无法读回密钥**，
+/// 也无法把请求发往 base URL 之外的地址。
+#[cfg(feature = "wasm")]
+#[derive(Clone)]
+pub(crate) struct HttpHostServices {
+    /// 可信 base URL；Guest 的相对路径都拼接在它之后。
+    base_url: url::Url,
+    /// Host 注入的凭证与固定 header，Guest 既不可见也不可覆盖。
+    injected_headers: Arc<Vec<(String, String)>>,
+    /// 复用连接池的 HTTP 客户端。
+    client: reqwest::Client,
+    /// 单次请求正文的字节上限。
+    pub(crate) max_request_bytes: usize,
+    /// 单次响应正文的字节上限。
+    max_response_bytes: usize,
+    execution_policy: ExecutionPolicy,
+    completed_calls: Arc<AtomicUsize>,
+    submitted_input_bytes: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "wasm")]
+impl HttpHostServices {
+    /// 为单个插件激活创建独立预算账本；返回值自身的后续 clone 继续共享该账本。
+    fn for_plugin_activation(&self) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            injected_headers: self.injected_headers.clone(),
+            client: self.client.clone(),
+            max_request_bytes: self.max_request_bytes,
+            max_response_bytes: self.max_response_bytes,
+            execution_policy: self.execution_policy.clone(),
+            completed_calls: Arc::new(AtomicUsize::new(0)),
+            submitted_input_bytes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// 把 Guest 提交的相对路径解析为可信绝对 URL。
+    pub(crate) fn resolve(&self, path: &str) -> Result<url::Url> {
+        crate::capability::http::join_base_url(&self.base_url, path)
+    }
+
+    /// 预留一次插件 HTTP 调用预算；失败时不增加任何计数。
+    pub(crate) fn reserve(&self, input_bytes: usize) -> std::result::Result<(), String> {
+        // Profile 身份拥有最终否决权：Evaluation 与 Mutation 即使限额被写成正数也不放行。
+        if !self.execution_policy.permits_network_access() {
+            return Err("当前执行策略禁止插件发起网络请求".to_string());
+        }
+        let limits = &self.execution_policy.limits;
+        if !try_reserve(
+            &self.submitted_input_bytes,
+            input_bytes,
+            limits.max_plugin_http_request_bytes,
+        ) {
+            return Err(format!(
+                "插件 HTTP 请求累计输入超过策略上限 {} 字节",
+                limits.max_plugin_http_request_bytes.unwrap_or(0)
+            ));
+        }
+        if !try_reserve(&self.completed_calls, 1, limits.max_plugin_http_requests) {
+            self.submitted_input_bytes
+                .fetch_sub(input_bytes, Ordering::AcqRel);
+            return Err(format!(
+                "插件 HTTP 请求次数超过策略上限 {} 次",
+                limits.max_plugin_http_requests.unwrap_or(0)
+            ));
+        }
+        Ok(())
+    }
+
+    /// 执行一次已通过全部校验的 HTTP 请求。
+    ///
+    /// 注入 header 在 Guest header 之后写入，因此 Guest 无法覆盖凭证；响应按字节上限
+    /// 截断前就拒绝，避免把超大响应读进内存。
+    pub(crate) async fn execute(
+        &self,
+        method: String,
+        target: url::Url,
+        headers: Vec<(String, String)>,
+        body: String,
+    ) -> Result<serde_json::Value> {
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|error| anyhow!("HTTP 方法无效：{error}"))?;
+        let mut request = self.client.request(method, target);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        // 凭证最后注入，Guest 的同名 header 已在能力层被拒绝，这里是第二重保证。
+        for (name, value) in self.injected_headers.iter() {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        if !body.is_empty() {
+            request = request.body(body);
+        }
+        let response = request.send().await.context("插件 HTTP 请求失败")?;
+        let status = response.status().as_u16();
+        let response_headers = crate::capability::http::sanitize_response_headers(response.headers());
+        // 先看 Content-Length：能提前拒绝的超大响应就不必读进内存。
+        if let Some(length) = response.content_length() {
+            if length > self.max_response_bytes as u64 {
+                return Err(anyhow!(
+                    "HTTP 响应超过 {} 字节限制",
+                    self.max_response_bytes
+                ));
+            }
+        }
+        let bytes = response.bytes().await.context("读取插件 HTTP 响应失败")?;
+        // 分块响应没有 Content-Length，必须在读完后再校验一次。
+        if bytes.len() > self.max_response_bytes {
+            return Err(anyhow!(
+                "HTTP 响应超过 {} 字节限制",
+                self.max_response_bytes
+            ));
+        }
+        let body = String::from_utf8(bytes.to_vec())
+            .context("插件 HTTP 响应不是合法 UTF-8；二进制响应需由插件自行约定编码")?;
+        Ok(crate::capability::http::encode_http_response(
+            status,
+            response_headers,
+            body,
+        ))
+    }
+}
+
 /// 应用固定路由的受限模型完成服务。
 #[cfg(feature = "wasm")]
 #[derive(Clone)]
@@ -103,6 +230,12 @@ pub struct PluginHostServices {
     /// 按插件 ID 覆盖的模型路由；未覆盖的插件沿用 `model_completion`。
     #[cfg(feature = "wasm")]
     pub(crate) plugin_model_completion: HashMap<String, ModelCompletionHostServices>,
+    /// 按插件 ID 注入的 HTTP 端点；没有应用默认值。
+    ///
+    /// 与模型路由不同，HTTP 端点**刻意不提供全局默认**：一个插件的 base URL 与凭证
+    /// 对另一个插件没有意义，共享默认值只会让密钥流向不该拿到它的插件。
+    #[cfg(feature = "wasm")]
+    pub(crate) plugin_http: HashMap<String, HttpHostServices>,
     /// 应用注入的只读会话来源；缺失时插件的 `sessions` 能力保持关闭。
     pub(crate) session_source: Option<Arc<dyn PluginSessionSource>>,
     #[cfg(feature = "wasm")]
@@ -152,6 +285,10 @@ impl PluginHostServices {
                 .iter_mut()
                 .chain(self.plugin_model_completion.values_mut())
             {
+                binding.execution_policy = binding.execution_policy.restrict(&policy);
+            }
+            // HTTP 端点同样受收紧后的策略约束，否则网络预算可被绕过。
+            for binding in self.plugin_http.values_mut() {
                 binding.execution_policy = binding.execution_policy.restrict(&policy);
             }
         }
@@ -371,6 +508,102 @@ impl PluginHostServices {
             completed_calls: Arc::new(AtomicUsize::new(0)),
             submitted_input_bytes: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// 为单个插件注入受限 HTTP 端点。
+    ///
+    /// `base_url` 与 `credential_headers` 来自应用配置（与 `[plugins.<id>]` 模型路由同一处），
+    /// 凭证只保存在 Host 侧。插件 manifest 还必须声明 `[capabilities.http] allow_hosts`
+    /// 且覆盖 `base_url` 的主机——两者不一致时请求会在能力层被拒绝，使 manifest 里写明的
+    /// 授权边界始终是真实的。
+    ///
+    /// # Errors
+    ///
+    /// 插件 ID 为空、`base_url` 无法解析、scheme 不是 http/https、带有用户名密码、
+    /// 凭证 header 名称非法或体积上限为零时返回错误。
+    #[cfg(feature = "wasm")]
+    pub fn with_plugin_http(
+        mut self,
+        plugin_id: impl Into<String>,
+        base_url: &str,
+        credential_headers: Vec<(String, String)>,
+        max_request_bytes: usize,
+        max_response_bytes: usize,
+        timeout_ms: u64,
+    ) -> Result<Self> {
+        let plugin_id = plugin_id.into();
+        if plugin_id.trim().is_empty() {
+            return Err(anyhow!("插件 HTTP 端点的 plugin_id 不能为空"));
+        }
+        let mut base_url = url::Url::parse(base_url)
+            .map_err(|error| anyhow!("插件 `{plugin_id}` 的 HTTP base_url 无效：{error}"))?;
+        if !matches!(base_url.scheme(), "http" | "https") {
+            return Err(anyhow!(
+                "插件 `{plugin_id}` 的 HTTP base_url 只支持 http/https，实际为 `{}`",
+                base_url.scheme()
+            ));
+        }
+        // URL 内嵌凭证会随日志与错误信息外泄，且绕开 header 注入路径。
+        if !base_url.username().is_empty() || base_url.password().is_some() {
+            return Err(anyhow!(
+                "插件 `{plugin_id}` 的 HTTP base_url 不得内嵌用户名或密码"
+            ));
+        }
+        if base_url.host_str().is_none() {
+            return Err(anyhow!("插件 `{plugin_id}` 的 HTTP base_url 缺少主机名"));
+        }
+        // 结尾不带斜杠时 `Url::join` 会丢掉最后一段路径，导致 base 前缀校验与用户预期不符。
+        if !base_url.path().ends_with('/') {
+            let path = format!("{}/", base_url.path());
+            base_url.set_path(&path);
+        }
+        if max_request_bytes == 0 || max_response_bytes == 0 {
+            return Err(anyhow!(
+                "插件 `{plugin_id}` 的 HTTP 请求与响应上限必须大于零"
+            ));
+        }
+        for (name, _) in &credential_headers {
+            if name.trim().is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            {
+                return Err(anyhow!(
+                    "插件 `{plugin_id}` 的 HTTP 凭证 header 名称无效：`{name}`"
+                ));
+            }
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            // 重定向会把请求带出 allowlist，使 manifest 的授权边界失效。
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .with_context(|| format!("构造插件 `{plugin_id}` 的 HTTP 客户端失败"))?;
+        self.plugin_http.insert(
+            plugin_id,
+            HttpHostServices {
+                base_url,
+                injected_headers: Arc::new(credential_headers),
+                client,
+                max_request_bytes,
+                max_response_bytes,
+                execution_policy: self.execution_policy.clone(),
+                completed_calls: Arc::new(AtomicUsize::new(0)),
+                submitted_input_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        Ok(self)
+    }
+
+    /// 返回指定插件激活使用的 HTTP 端点快照。
+    ///
+    /// 每次激活创建独立预算账本，避免一个插件耗尽其他插件的额度；同一返回值的 clone
+    /// 仍共享计数器，使该插件实例内的并发调用无法绕过累计上限。
+    #[cfg(feature = "wasm")]
+    pub(crate) fn http_for(&self, plugin_id: &str) -> Option<HttpHostServices> {
+        self.plugin_http
+            .get(plugin_id)
+            .map(HttpHostServices::for_plugin_activation)
     }
 
     /// 注入插件可只读访问的历史会话来源。

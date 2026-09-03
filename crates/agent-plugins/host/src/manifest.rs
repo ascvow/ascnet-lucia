@@ -505,36 +505,39 @@ manifest = "/opt/lucia/plugin.toml"
         );
     }
 
-    /// Guest 声明不得在 Host 尚无真实实现时打开网络或 Secret 能力。
+    /// HTTP allowlist 配置必须被接受，而 Secret 仍需在加载期拒绝。
     #[test]
-    fn unsupported_network_and_secret_capabilities_fail_before_instantiation() {
-        for (capability_name, capabilities) in [
-            (
-                "HTTP",
-                CapabilitySection {
-                    http: true,
-                    ..CapabilitySection::default()
-                },
-            ),
-            (
-                "Secret",
-                CapabilitySection {
-                    secrets: true,
-                    ..CapabilitySection::default()
-                },
-            ),
-        ] {
-            let mut manifest = test_manifest("untrusted", "1.0.0", Vec::new());
-            manifest.capabilities = capabilities;
+    fn http_allowlist_is_supported_but_secret_is_rejected() {
+        let mut manifest = test_manifest("http", "1.0.0", Vec::new());
+        manifest.capabilities = CapabilitySection {
+            http: Some(HttpCapabilitySection {
+                allow_hosts: vec!["api.openai.com".into()],
+            }),
+            ..CapabilitySection::default()
+        };
+        manifest
+            .validate()
+            .expect("带 allowlist 的 HTTP 能力应被接受");
 
-            let error = manifest
-                .validate()
-                .expect_err("未实现的真实能力必须在 component 实例化前拒绝");
-            assert!(
-                error.to_string().contains("尚未实现插件 HTTP、secret"),
-                "{capability_name} 声明应被 Host 拒绝，实际为：{error}"
-            );
-        }
+        manifest.capabilities.secrets = true;
+        let error = manifest
+            .validate()
+            .expect_err("Secret 能力仍必须在实例化前拒绝");
+        assert!(error.to_string().contains("secret"), "实际错误：{error}");
+    }
+
+    /// 空的 HTTP allowlist 必须在加载前拒绝。
+    #[test]
+    fn empty_http_allowlist_is_rejected() {
+        let mut manifest = test_manifest("http-empty", "1.0.0", Vec::new());
+        manifest.capabilities = CapabilitySection {
+            http: Some(HttpCapabilitySection::default()),
+            ..CapabilitySection::default()
+        };
+        let error = manifest
+            .validate()
+            .expect_err("空 allowlist 不应授予网络能力");
+        assert!(error.to_string().contains("allow_hosts"), "实际错误：{error}");
     }
 }
 
@@ -985,9 +988,13 @@ pub struct CapabilitySection {
     #[serde(default)]
     pub process_exec: bool,
 
-    /// 插件是否希望通过宿主 API 访问 HTTP。
+    /// 插件是否希望通过宿主 API 访问 HTTP，以及允许访问的目标主机。
+    ///
+    /// 使用可选表而不是布尔值，是为了让授权边界和具体域名同时出现在 manifest 中。
+    /// 声明空 allowlist 会在加载前被拒绝，避免把「申请了网络但没有明确目的地」误当成安全
+    /// 配置。旧版 `http = true` manifest 不再被接受，需迁移到 `[capabilities.http]`。
     #[serde(default)]
-    pub http: bool,
+    pub http: Option<HttpCapabilitySection>,
 
     /// 插件是否希望通过宿主 API 读取 secret。
     #[serde(default)]
@@ -1028,6 +1035,121 @@ pub struct CapabilitySection {
     /// Host 按公开工具名绑定的权威权限 scope；未声明的插件工具统一降级为 `unknown`。
     #[serde(default)]
     pub tool_scopes: HashMap<String, ToolPermissionScope>,
+}
+
+/// 插件 HTTP 能力的可审计配置。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpCapabilitySection {
+    /// 允许访问的主机名；不含 scheme、路径或通配符。
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
+}
+
+impl HttpCapabilitySection {
+    /// 校验 HTTP 主机 allowlist 的格式与边界。
+    ///
+    /// Host 会在实际请求时再次以可信 base URL 做匹配；这里只负责尽早拒绝空值、注入
+    /// 分隔符和不受支持的通配符。
+    pub fn validate(&self) -> Result<()> {
+        if self.allow_hosts.is_empty() {
+            return Err(anyhow!("capabilities.http.allow_hosts 不能为空"));
+        }
+        if self.allow_hosts.len() > 64 {
+            return Err(anyhow!(
+                "capabilities.http.allow_hosts 不能超过 64 个主机"
+            ));
+        }
+        let mut seen = HashSet::new();
+        for host in &self.allow_hosts {
+            let normalized = host.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return Err(anyhow!("capabilities.http.allow_hosts 不能包含空主机"));
+            }
+            if normalized.len() > 253
+                || normalized.contains("://")
+                || normalized.contains('/')
+                || normalized.contains('?')
+                || normalized.contains('#')
+                || normalized.contains('\\')
+                || normalized.contains('*')
+                || normalized.bytes().any(|byte| byte.is_ascii_whitespace() || byte < 0x20)
+            {
+                return Err(anyhow!(
+                    "HTTP allowlist 主机格式无效：`{host}`（只允许主机名和可选端口）"
+                ));
+            }
+            if !valid_http_host(&normalized) {
+                return Err(anyhow!("HTTP allowlist 主机格式无效：`{host}`"));
+            }
+            if !seen.insert(normalized) {
+                return Err(anyhow!("HTTP allowlist 主机重复：`{host}`"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 判断目标主机是否命中 allowlist；未写端口的条目允许同主机的显式端口。
+    pub(crate) fn allows_host(&self, host: &str, port: Option<u16>) -> bool {
+        let host = host.trim().to_ascii_lowercase();
+        self.allow_hosts.iter().any(|allowed| {
+            let allowed = allowed.trim().to_ascii_lowercase();
+            let (allowed_host, allowed_port) = split_host_port(&allowed);
+            allowed_host == host && (allowed_port.is_none() || allowed_port == port)
+        })
+    }
+}
+
+/// 校验不带 scheme 与路径的主机名，允许 IPv4、IPv6（方括号形式）和 DNS 名称。
+fn valid_http_host(host: &str) -> bool {
+    let (name, port) = split_host_port(host);
+    if let Some(port) = port {
+        if port == 0 {
+            return false;
+        }
+    }
+    if name.starts_with('[') || name.ends_with(']') {
+        return name.starts_with('[')
+            && name.ends_with(']')
+            && name.len() > 2
+            && name[1..name.len() - 1]
+                .parse::<std::net::IpAddr>()
+                .is_ok();
+    }
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let labels = name.split('.').collect::<Vec<_>>();
+    !labels.is_empty()
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+/// 分离主机和可选端口；IPv6 仅接受 `[addr]:port` 形式。
+fn split_host_port(host: &str) -> (String, Option<u16>) {
+    if let Some(stripped) = host.strip_prefix('[') {
+        if let Some(end) = stripped.find(']') {
+            let name = format!("[{}]", &stripped[..end]);
+            let port = stripped
+                .get(end + 1..)
+                .and_then(|suffix| suffix.strip_prefix(':'))
+                .and_then(|value| value.parse::<u16>().ok());
+            return (name, port);
+        }
+    }
+    if let Some((name, port)) = host.rsplit_once(':') {
+        if !name.contains(':') {
+            return (name.to_string(), port.parse::<u16>().ok());
+        }
+    }
+    (host.to_string(), None)
 }
 
 /// 插件访问 Agent Runtime 的最小权限集合。
@@ -1142,7 +1264,7 @@ impl CapabilitySection {
         if !self.fs_write.is_empty() {
             include(ToolPermissionScope::Write);
         }
-        if self.http {
+        if self.http.is_some() {
             include(ToolPermissionScope::Network);
         }
         if self.sessions
@@ -1157,10 +1279,10 @@ impl CapabilitySection {
         scope
     }
 
-    /// 校验当前宿主尚未实现的能力。
+    /// 校验能力声明与当前 Host 支持范围。
     ///
-    /// 只读文件和子进程能力由宿主 API 在运行时逐次鉴权。尚未实现的 HTTP、secret
-    /// 和文件写入能力在加载阶段直接拒绝，不会静默授予。
+    /// 只读文件、HTTP 和子进程能力由宿主 API 在运行时逐次鉴权；secret 与文件写入仍在
+    /// 加载阶段拒绝，不会静默授予。HTTP 必须同时提供非空 allowlist。
     pub fn validate_supported(&self) -> Result<()> {
         self.agent.validate()?;
         if self.surface_actions && !self.surface_action_allowlist.is_empty() {
@@ -1186,9 +1308,12 @@ impl CapabilitySection {
             .validate_name()
             .map_err(|error| anyhow!("manifest 工具 scope 名称 `{name}` 无效：{error}"))?;
         }
-        if self.http || self.secrets || !self.fs_write.is_empty() {
+        if let Some(http) = &self.http {
+            http.validate()?;
+        }
+        if self.secrets || !self.fs_write.is_empty() {
             return Err(anyhow!(
-                "当前 Lucia 版本尚未实现插件 HTTP、secret 或文件写入能力"
+                "当前 Lucia 版本尚未实现插件 secret 或文件写入能力"
             ));
         }
         Ok(())

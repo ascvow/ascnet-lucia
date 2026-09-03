@@ -27,7 +27,7 @@ use crate::manifest::CapabilitySection;
 use crate::service::PluginService;
 use crate::service::PluginServiceCall;
 use crate::service::ServiceRegistry;
-use crate::services::ModelCompletionHostServices;
+use crate::services::{HttpHostServices, ModelCompletionHostServices};
 use crate::session::{project_session, PluginSessionSource, MAX_SESSION_PAGE_MESSAGES};
 use crate::state::PluginStateStore;
 use crate::ui::UiHostActionRequest;
@@ -43,6 +43,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 mod agent;
+pub(crate) mod http;
 mod process;
 mod requests;
 #[cfg(test)]
@@ -89,6 +90,8 @@ pub(crate) struct CapabilityState {
     services: Arc<ServiceRegistry>,
     agent_runtime: Option<AgentRuntimeBinding>,
     model_completion: Option<ModelCompletionHostServices>,
+    /// 应用注入的受限 HTTP 端点；缺失时 `http` 能力不可用。
+    http: Option<HttpHostServices>,
     session_source: Option<Arc<dyn PluginSessionSource>>,
     processes: HashMap<u64, ManagedProcess>,
     next_process_handle: u64,
@@ -178,6 +181,8 @@ pub(crate) struct CapabilityHostContext {
     agent_runtime: Option<AgentRuntimeBinding>,
     /// Host 固定模型路由；缺失时关闭模型完成能力。
     model_completion: Option<ModelCompletionHostServices>,
+    /// Host 注入的受限 HTTP 端点；缺失时关闭 HTTP 能力。
+    http: Option<HttpHostServices>,
     /// 应用注入的只读会话来源；缺失时关闭会话读取能力。
     session_source: Option<Arc<dyn PluginSessionSource>>,
     /// Host 运行平面的可信策略，默认 Serve 以保持既有加载行为。
@@ -209,12 +214,22 @@ impl CapabilityHostContext {
         Self {
             agent_runtime,
             model_completion,
+            http: None,
             execution_policy,
             persistent_state_dir,
             workspace_scope,
             session_source,
             workspace_root,
         }
+    }
+
+    /// 注入该插件的受限 HTTP 端点。
+    ///
+    /// 用 builder 而不是再加一个构造参数：参数表已有七项，继续扩张会让调用点的位置实参
+    /// 难以核对，而这正是把服务绑定接错插件的典型来源。
+    pub(crate) fn with_http(mut self, http: Option<HttpHostServices>) -> Self {
+        self.http = http;
+        self
     }
 }
 
@@ -335,6 +350,7 @@ impl CapabilityState {
             services,
             agent_runtime: host_context.agent_runtime,
             model_completion: host_context.model_completion,
+            http: host_context.http,
             session_source: host_context.session_source,
             processes: HashMap::new(),
             next_process_handle: 1,
