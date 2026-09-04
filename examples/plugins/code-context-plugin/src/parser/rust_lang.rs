@@ -269,6 +269,12 @@ fn push<T: Spanned>(
     owner: Option<String>,
 ) -> usize {
     let span = node.span();
+    // 测试属性向下继承：`#[cfg(test)] mod tests` 里的每个函数都是测试代码，
+    // 但只有模块本身带属性。
+    let inherited = parent
+        .and_then(|index| output.declarations.get(index))
+        .is_some_and(|declaration| declaration.is_test);
+    let is_test = inherited || has_test_attribute(attrs);
     output.declarations.push(Declaration {
         name,
         kind,
@@ -278,6 +284,7 @@ fn push<T: Spanned>(
         doc_comment: doc_of(attrs),
         parent,
         owner,
+        is_test,
     });
     output.declarations.len() - 1
 }
@@ -355,6 +362,31 @@ fn use_tree_text(tree: &syn::UseTree) -> Option<String> {
 }
 
 /// 追加一条 import，去重。
+/// 判断属性列表是否把该条目标记为测试代码。
+///
+/// 覆盖 `#[test]`、`#[cfg(test)]`、`#[bench]` 以及 `#[tokio::test]` 这类带路径的测试宏。
+fn has_test_attribute(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attribute| {
+        let path = attribute.path();
+        if path.is_ident("test") || path.is_ident("bench") {
+            return true;
+        }
+        // `#[tokio::test]`、`#[async_std::test]` 等：末段是 `test` 即可。
+        if path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "test")
+        {
+            return true;
+        }
+        // `#[cfg(test)]`：只认这一种 cfg，避免把 `#[cfg(feature = "x")]` 也算进去。
+        path.is_ident("cfg")
+            && attribute
+                .parse_args::<syn::Meta>()
+                .is_ok_and(|meta| meta.path().is_ident("test"))
+    })
+}
+
 fn push_import(output: &mut ParseOutput, text: String) {
     if !output.imports.contains(&text) {
         output.imports.push(text);

@@ -385,6 +385,14 @@ pub struct CodeChunk {
     /// 紧邻的文档注释。
     #[serde(default)]
     pub doc_comment: Option<String>,
+    /// 该代码块是否属于测试代码。
+    ///
+    /// 测试的文档注释往往把被测行为描述得比实现本身还清楚，因此在自然语言检索里会**压过
+    /// 实现代码**——实测中"代码块是怎么切分出来的"的语义第一名是一个测试函数。用户问
+    /// "某功能实现在哪"时要的几乎总是实现，所以检索层需要这一位来降权，而不是把测试
+    /// 从索引里删掉（有时确实要找测试）。
+    #[serde(default)]
+    pub is_test: bool,
     /// 该文件的导入语句，用于补全检索上下文。
     #[serde(default)]
     pub imports: Vec<String>,

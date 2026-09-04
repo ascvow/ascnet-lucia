@@ -627,7 +627,8 @@ fn score_decomposes_into_its_parts() {
     let sum = result.debug.rrf_score
         + result.debug.symbol_boost
         + result.debug.path_boost
-        + result.debug.rerank_boost;
+        + result.debug.rerank_boost
+        - result.debug.penalty;
 
     assert!(
         (result.score - sum).abs() < 1e-6,

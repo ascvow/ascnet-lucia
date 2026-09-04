@@ -262,6 +262,7 @@ mod tests {
                 symbol_boost: 0.0,
                 path_boost: 0.0,
                 rerank_boost: 0.0,
+                penalty: 0.0,
                 rerank_matched_tokens: 0,
                 rerank_query_tokens: 0,
                 symbol_match: None,

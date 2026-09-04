@@ -80,6 +80,11 @@ pub struct Declaration {
     ///
     /// 它参与限定名但不是词法父节点：`func (r *Repo) Get()` 里 `Repo` 并不在语法上包含 `Get`。
     pub owner: Option<String>,
+    /// 该声明是否为测试代码。
+    ///
+    /// 由各语言适配器按自己的惯例判定（Rust 看 `#[test]` 与 `#[cfg(test)]`），
+    /// 与路径判定取并集。
+    pub is_test: bool,
 }
 
 /// 一次解析的产物。
@@ -188,6 +193,7 @@ pub fn parse_file(
         };
     };
 
+    let file_is_test = is_test_path(file_path);
     let separator = separator_of(language);
     let mut imports = output.imports;
     imports.truncate(MAX_IMPORTS);
@@ -223,6 +229,9 @@ pub fn parse_file(
                 .doc_comment
                 .clone()
                 .map(|doc| truncate(doc, MAX_DOC_LEN)),
+            // 路径与声明属性取并集：`tests/` 目录下的一切都是测试，而 `src/lib.rs` 里的
+            // `#[cfg(test)] mod tests` 只能靠属性识别。
+            is_test: file_is_test || declaration.is_test,
             imports: imports.clone(),
             content_hash: content_hash(&body),
         });
@@ -241,6 +250,38 @@ pub fn parse_file(
         symbols,
         tier: ParseTier::Structural,
     }
+}
+
+/// 按路径判断一个文件是否属于测试代码。
+///
+/// 覆盖各语言的通行约定：`tests/`、`test/`、`__tests__/`、`benches/`、`spec/` 目录，
+/// 以及 `*_test.go`、`*.test.ts`、`*.spec.ts`、`test_*.py`、`*_spec.rb`、`tests.rs`
+/// 这类文件名。仅靠路径覆盖不到 Rust 内联的 `#[cfg(test)] mod tests`，那部分由解析器
+/// 的属性判定补上。
+pub fn is_test_path(file_path: &str) -> bool {
+    let lower = file_path.to_ascii_lowercase();
+    let segments: Vec<&str> = lower.split('/').collect();
+    if segments.iter().rev().skip(1).any(|segment| {
+        matches!(
+            *segment,
+            "tests" | "test" | "__tests__" | "benches" | "spec"
+        )
+    }) {
+        return true;
+    }
+    let Some(name) = segments.last() else {
+        return false;
+    };
+    *name == "tests.rs"
+        || *name == "conftest.py"
+        || name.starts_with("test_")
+        || name.ends_with("_test.go")
+        || name.ends_with("_test.rs")
+        || name.ends_with("_test.py")
+        || name.ends_with("_spec.rb")
+        || [".test.", ".spec."]
+            .iter()
+            .any(|marker| name.contains(marker))
 }
 
 /// 返回语言的限定名分隔符。
@@ -373,6 +414,7 @@ fn text_chunks(
     language: Language,
     lines: &[&str],
 ) -> Vec<CodeChunk> {
+    let file_is_test = is_test_path(file_path);
     if lines.iter().all(|line| line.trim().is_empty()) {
         return Vec::new();
     }
@@ -407,6 +449,7 @@ fn text_chunks(
                 end_line: u32::try_from(end).unwrap_or(u32::MAX),
                 signature: None,
                 doc_comment: None,
+                is_test: file_is_test,
                 imports: Vec::new(),
                 content_hash: content_hash(&body),
             });

@@ -1176,6 +1176,15 @@ impl CodeContextPlugin {
             .unwrap_or_default()
     }
 
+    /// 返回已建成的结构索引；尚未建成时为 `None`。
+    ///
+    /// 供评测与诊断读取代码块分布。检索本身不经由该入口，因此它不构成新的检索路径。
+    pub fn structural_index(&self) -> Option<&StructuralIndex> {
+        self.repository
+            .as_ref()
+            .and_then(|context| context.index.as_ref())
+    }
+
     /// 返回当前索引的规模统计；索引尚未建成时为 `None`。
     pub fn index_stats(&self) -> Option<IndexStats> {
         self.repository
@@ -1395,6 +1404,7 @@ mod tests {
             end_line: 3,
             signature: Some("pub fn save(&mut self)".into()),
             doc_comment: None,
+            is_test: false,
             imports: Vec::new(),
             content_hash: "hash".into(),
         };

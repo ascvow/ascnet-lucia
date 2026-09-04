@@ -167,6 +167,9 @@ fn push(
         doc_comment,
         parent,
         owner,
+        // 这些语言的测试约定体现在文件名上（`*_test.go`、`*.test.ts`、`test_*.py`），
+        // 由 `is_test_path` 统一判定，声明层不再重复判断。
+        is_test: false,
     });
 }
 

@@ -168,6 +168,9 @@ fn push(
         doc_comment,
         parent,
         owner: None,
+        // Python 的测试约定在文件名与目录上（`test_*.py`、`tests/`），
+        // 由 `is_test_path` 统一判定。
+        is_test: false,
     });
     output.declarations.len() - 1
 }

@@ -911,3 +911,138 @@ fn semantic_channel_diagnosis() {
         eprintln!("[诊断] 通道 {source}：{} 条候选", channel.len());
     }
 }
+
+/// 诊断：代码块的规模分布。
+///
+/// 切块粒度直接决定语义向量的区分度——大量三五行的小块彼此高度相似，嵌入后挤在向量
+/// 空间的同一片区域，检索时谁排第一近乎随机。先量出分布再决定怎么合并，避免凭感觉调参。
+#[test]
+fn chunk_size_distribution() {
+    let root = repository_root();
+    let files = collect_repository_files(&root);
+    let file_refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    let host = RepoHost::new(&file_refs);
+    let plugin = indexed_plugin(&host);
+    let index = plugin.structural_index().expect("索引应已建成");
+
+    let mut lines: Vec<u32> = Vec::new();
+    let mut by_kind: BTreeMap<String, (usize, u64)> = BTreeMap::new();
+    let mut without_symbol = 0usize;
+    for chunk in index.chunks() {
+        let span = chunk.end_line.saturating_sub(chunk.start_line) + 1;
+        lines.push(span);
+        let kind = chunk
+            .symbol_kind
+            .map(|kind| format!("{kind:?}"))
+            .unwrap_or_else(|| "文本块".to_string());
+        let entry = by_kind.entry(kind).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += u64::from(span);
+        if chunk.symbol_name.is_none() {
+            without_symbol += 1;
+        }
+    }
+    lines.sort_unstable();
+
+    let percentile = |p: f64| -> u32 {
+        let index = ((lines.len() as f64 - 1.0) * p).round() as usize;
+        lines[index.min(lines.len() - 1)]
+    };
+    let tiny = lines.iter().filter(|span| **span <= 3).count();
+    let small = lines.iter().filter(|span| **span <= 6).count();
+
+    println!("\n# 代码块规模分布\n");
+    println!("| 指标 | 数值 |");
+    println!("| --- | --- |");
+    println!("| 代码块总数 | {} |", lines.len());
+    println!("| 无符号名（文本兜底） | {without_symbol} |");
+    println!("| 行数 P50 | {} |", percentile(0.50));
+    println!("| 行数 P75 | {} |", percentile(0.75));
+    println!("| 行数 P90 | {} |", percentile(0.90));
+    println!("| 行数 P99 | {} |", percentile(0.99));
+    println!("| 最大行数 | {} |", lines.last().copied().unwrap_or(0));
+    println!(
+        "| ≤3 行 | {tiny}（{:.1}%） |",
+        tiny as f64 / lines.len() as f64 * 100.0
+    );
+    println!(
+        "| ≤6 行 | {small}（{:.1}%） |",
+        small as f64 / lines.len() as f64 * 100.0
+    );
+
+    println!("\n| 符号种类 | 数量 | 平均行数 |");
+    println!("| --- | --- | --- |");
+    for (kind, (count, total)) in &by_kind {
+        println!(
+            "| {kind} | {count} | {:.1} |",
+            *total as f64 / *count as f64
+        );
+    }
+}
+
+/// 诊断：中文行为描述类查询的实际返回，逐条列出前五名。
+///
+/// 这类查询的 Recall@10 已达 0.938 而 Recall@1 仅 0.12——目标被召回却排不到第一。
+/// 聚合指标看不出"第一名到底是什么"，必须逐条看排在目标前面的是哪些块，才能判断
+/// 该改切块、改嵌入文档，还是改排序。
+#[test]
+#[ignore = "需要网络与嵌入 API 密钥"]
+fn chinese_query_failure_analysis() {
+    let api_key = std::env::var(API_KEY_ENV).expect("需要 API 密钥");
+    let root = repository_root();
+    let files = collect_repository_files(&root);
+    let file_refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    let host = RepoHost::new(&file_refs).with_http_handler(forward_to_endpoint(api_key));
+    let ablation = Ablation {
+        label: "语义",
+        semantic: true,
+        rerank: false,
+    };
+    let mut plugin = CodeContextPlugin::default();
+    plugin
+        .activate(&host, ablation_context(&root.to_string_lossy(), &ablation))
+        .expect("激活插件");
+    for _ in 0..400 {
+        let call = ToolCall::new("diag", "code_search", json!({"query": "初始化索引"}));
+        let _ = plugin.call_tool_with_host(&host, call);
+        if plugin.index_status() != IndexStatus::Indexing {
+            break;
+        }
+    }
+    assert_eq!(
+        plugin.index_status(),
+        IndexStatus::Ready,
+        "语义索引必须就绪"
+    );
+
+    println!("\n# 中文查询失败分析\n");
+    for query in eval_queries()
+        .iter()
+        .filter(|query| query.kind == QueryKind::ChineseBehavior)
+    {
+        let results = plugin.search_results(&host, query.query, None, 5);
+        let outcome = evaluate(&results, query);
+        println!(
+            "## {}（目标 {:?}，名次 {:?}）\n",
+            query.query, query.expected_paths, outcome.file_rank
+        );
+        for (rank, result) in results.iter().enumerate() {
+            println!(
+                "{}. `{}:{}-{}` {} — {}",
+                rank + 1,
+                result.file_path,
+                result.start_line,
+                result.end_line,
+                result.symbol_name.as_deref().unwrap_or("（文本块）"),
+                result.debug.reason()
+            );
+        }
+        println!();
+    }
+}

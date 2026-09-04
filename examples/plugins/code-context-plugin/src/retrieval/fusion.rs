@@ -88,6 +88,26 @@ pub struct FusionConfig {
     /// 取 0.5：足以让"工具函数 formatDate 定义在哪"把定义排到使用点之前，又不至于让
     /// 一个顺带提到的标识符压过语义与词法通道的共同判断。
     pub natural_language_identifier_ratio: f32,
+    /// 测试代码在非测试意图查询下的分数系数。
+    ///
+    /// 测试的文档注释常把被测行为描述得比实现更清楚，因此在自然语言检索里会压过实现
+    /// 代码——实测中"代码块是怎么切分出来的"的语义第一名是一条测试。用户问"某功能实现
+    /// 在哪"时要的几乎总是实现。
+    ///
+    /// 用**乘性**系数而不是减去固定值：候选分数的绝对量级随通道数与命中排名变化很大
+    /// （实测同一次检索里 top 分数只有 rank-1 当量的一半），减去固定值会让惩罚在低分区
+    /// 压过一切、把本该保留的结果挤出结果集。乘性系数则只改变相对位置。
+    ///
+    /// 查询确实指向测试时（含"测试"、`test`、`spec` 等词）该系数不生效。
+    pub test_code_weight: f32,
+    /// 过短代码块在自然语言查询下的分数系数。
+    ///
+    /// 两行的常量声明配一句精炼中文注释，与短中文查询的余弦相似度很高，但作为"这个功能
+    /// 实现在哪"的答案毫无用处。实测中 `SEMANTIC_KEY`、`MAX_SOURCE_CHARS` 这类块反复挤进
+    /// 前五。仅对自然语言查询生效——标识符查询里，一个两行常量完全可能就是目标本身。
+    pub short_chunk_weight: f32,
+    /// 触发短块系数的行数上限。
+    pub short_chunk_lines: u32,
     /// 元数据完整覆盖查询词时的重排提升，单位为 rank-1 当量。
     ///
     /// 取 0.75：足以调整分数接近的候选，但小于一路第一名与末位候选的最大分差，确保
@@ -105,6 +125,9 @@ impl Default for FusionConfig {
             natural_language_semantic_weight: 1.75,
             cjk_semantic_weight: 3.5,
             cjk_lexical_weight: 0.4,
+            test_code_weight: 0.55,
+            short_chunk_weight: 0.8,
+            short_chunk_lines: 6,
             natural_language_identifier_ratio: 0.5,
             path_boost: 1.0,
             metadata_rerank_boost: 0.75,
@@ -137,6 +160,10 @@ pub struct FusionDebug {
     pub path_boost: f32,
     /// 元数据覆盖率产生的实际重排加成。
     pub rerank_boost: f32,
+    /// 测试代码与过短代码块产生的实际扣分。
+    ///
+    /// 与各项加成一样进入诊断：分数必须能被完整拆解，否则调参只能靠猜。
+    pub penalty: f32,
     /// 元数据至少命中的去重查询词数量。
     pub rerank_matched_tokens: usize,
     /// 参与元数据重排的去重查询词总数。
@@ -164,6 +191,9 @@ impl FusionDebug {
                 "元数据重排 {:.3} ({}/{})",
                 self.rerank_boost, self.rerank_matched_tokens, self.rerank_query_tokens
             ));
+        }
+        if self.penalty > 0.0 {
+            parts.push(format!("扣分 {:.3}", self.penalty));
         }
         parts.join(" + ")
     }
@@ -235,6 +265,7 @@ pub fn fuse(
         super::tokenize::tokenize_query(query).into_iter().collect();
     let intent = QueryIntent::classify(query);
     let query_has_identifier = has_identifier_shaped_token(query);
+    let wants_tests = query_targets_tests(query);
     let semantic_available = channels
         .iter()
         .flatten()
@@ -303,6 +334,10 @@ pub fn fuse(
             let path_boost = path_boost_of(&query_tokens, &chunk.file_path, config) * boost_unit;
             let rerank = metadata_rerank_of(&rerank_query_tokens, chunk, intent, config);
             let rerank_boost = rerank.boost_units * boost_unit;
+            let raw = item.rrf_score + symbol_boost + path_boost + rerank_boost;
+            let weight = score_weight_of(chunk, intent, wants_tests, config);
+            // 记为扣分而不是系数，使 `score = 各项之和 - penalty` 这条诊断不变量继续成立。
+            let penalty = raw * (1.0 - weight);
             let mut ranks = item.ranks;
             ranks.sort_by_key(|(source, rank)| (source.as_str(), *rank));
 
@@ -318,13 +353,14 @@ pub fn fuse(
                 parent_symbol: chunk.parent_symbol.clone(),
                 signature: chunk.signature.clone(),
                 doc_comment: chunk.doc_comment.clone(),
-                score: item.rrf_score + symbol_boost + path_boost + rerank_boost,
+                score: raw - penalty,
                 debug: FusionDebug {
                     ranks,
                     rrf_score: item.rrf_score,
                     symbol_boost,
                     path_boost,
                     rerank_boost,
+                    penalty,
                     rerank_matched_tokens: rerank.matched_tokens,
                     rerank_query_tokens: rerank.query_tokens,
                     symbol_match: item.symbol_match,
@@ -488,6 +524,41 @@ pub(crate) fn has_identifier_shaped_token(query: &str) -> bool {
             word.chars().any(char::is_lowercase) && word.chars().skip(1).any(char::is_uppercase);
         has_separator || has_case_boundary
     })
+}
+
+/// 判断查询是否明确指向测试代码。
+///
+/// 只在用户确实要找测试时放行测试代码的正常排名；这条判断存在的意义是让降权**可被
+/// 用户意图关闭**，而不是一刀切地埋掉整个测试目录。
+fn query_targets_tests(query: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    ["测试", "单测", "用例", "test", "spec", "assert", "fixture"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// 返回该代码块的分数系数，`1.0` 表示不惩罚。
+///
+/// 两类惩罚都只在自然语言查询下生效：标识符查询表达的是精确导航意图，用户查
+/// `MAX_SOURCE_CHARS` 时那个两行常量就是答案本身，此时任何"块太短"的惩罚都是错的。
+fn score_weight_of(
+    chunk: &CodeChunk,
+    intent: QueryIntent,
+    wants_tests: bool,
+    config: &FusionConfig,
+) -> f32 {
+    if intent == QueryIntent::Identifier {
+        return 1.0;
+    }
+    let mut weight = 1.0;
+    if chunk.is_test && !wants_tests {
+        weight *= config.test_code_weight;
+    }
+    let span = chunk.end_line.saturating_sub(chunk.start_line) + 1;
+    if span <= config.short_chunk_lines {
+        weight *= config.short_chunk_weight;
+    }
+    weight
 }
 
 /// 返回指定查询意图下某个检索通道的 RRF 权重。
