@@ -41,3 +41,4 @@ required-features = ["test-support"]
 [dev-dependencies]
 code-context-plugin = { path = ".", features = ["test-support"] }
 ureq = "3"
+url.workspace = true

@@ -596,6 +596,7 @@ dependencies = [
  "sha2",
  "syn 3.0.4",
  "ureq",
+ "url",
  "wit-bindgen",
 ]
 

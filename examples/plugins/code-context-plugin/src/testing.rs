@@ -13,6 +13,9 @@ use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// 测试宿主可注入的 HTTP 请求处理函数。
+type HttpHandler = dyn Fn(&HttpRequest) -> Result<HttpResponse>;
+
 /// 构造一条成功的 JSON 应答，供 [`TestHost::with_http_responses`] 使用。
 pub fn http_json(status: u16, body: &str) -> Result<HttpResponse> {
     Ok(HttpResponse {
@@ -71,6 +74,10 @@ pub struct TestHost {
     echo_embedding_dimension: Option<usize>,
     /// 已收到的 HTTP 请求，用于断言插件提交了什么。
     http_requests: RefCell<Vec<HttpRequest>>,
+    /// 可选的真实 HTTP 转发函数；示例程序用它接入用户提供的嵌入端点。
+    ///
+    /// 单元测试仍优先使用预置应答和确定性伪向量，避免网络状态影响测试稳定性。
+    http_handler: Option<Box<HttpHandler>>,
 }
 
 impl TestHost {
@@ -109,6 +116,18 @@ impl TestHost {
     /// 让替身像真实嵌入端点那样按请求条数生成应答。
     pub fn with_echo_embeddings(mut self, dimension: usize) -> Self {
         self.echo_embedding_dimension = Some(dimension);
+        self
+    }
+
+    /// 注入自定义 HTTP 处理函数。
+    ///
+    /// 处理函数只接收 Guest 构造的相对路径请求；base URL、凭证、超时与响应上限仍应由
+    /// 调用方在处理函数中控制。预置应答队列优先于该函数，便于测试特定失败分支。
+    pub fn with_http_handler(
+        mut self,
+        handler: impl Fn(&HttpRequest) -> Result<HttpResponse> + 'static,
+    ) -> Self {
+        self.http_handler = Some(Box::new(handler));
         self
     }
 
@@ -321,6 +340,9 @@ impl PluginHostApi for TestHost {
         if let Some(queued) = self.http_responses.borrow_mut().pop() {
             return queued;
         }
+        if let Some(handler) = self.http_handler.as_ref() {
+            return handler(request);
+        }
         match self.echo_embedding_dimension {
             Some(dimension) => echo_embeddings(request, dimension),
             None => Err(anyhow!("测试替身没有更多预置 HTTP 应答")),
@@ -401,6 +423,15 @@ impl RepoHost {
     /// 让替身像真实嵌入端点那样按请求条数生成应答。
     pub fn with_echo_embeddings(mut self, dimension: usize) -> Self {
         self.inner = self.inner.with_echo_embeddings(dimension);
+        self
+    }
+
+    /// 注入自定义 HTTP 处理函数，供可执行示例连接真实嵌入端点。
+    pub fn with_http_handler(
+        mut self,
+        handler: impl Fn(&HttpRequest) -> Result<HttpResponse> + 'static,
+    ) -> Self {
+        self.inner = self.inner.with_http_handler(handler);
         self
     }
 

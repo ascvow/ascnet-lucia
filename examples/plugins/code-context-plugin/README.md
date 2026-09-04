@@ -49,11 +49,17 @@ Guest 负责配置校验、仓库身份、索引状态、manifest 兼容性、�
 
 ## 直接搜索当前仓库
 
-从仓库根目录运行以下命令，查询可以使用自然语言或代码标识符：
+默认先通过 SiliconFlow `BAAI/bge-m3` 为整个仓库的全部代码块生成向量，再执行符号、BM25
+与语义三路混合检索。API 密钥只从环境变量读取，不写入命令参数或插件元数据：
 
 ```bash
-cargo run -p code-context-plugin --example search_repository --features test-support -- "PluginHostApi"
+export SILICONFLOW_API_KEY='<你的密钥>'
+cargo run -p code-context-plugin --example search_repository --features test-support
 ```
+
+命令先完成全仓库向量化，再显示 `搜索>` 提示符。此后可以连续输入自然语言或代码标识符，
+输入 `exit`、`quit` 或 `:q` 结束；同一进程中的查询会复用已经建立的向量索引。也可以在
+命令末尾直接提供一条查询，以单次搜索模式运行。
 
 限定搜索目录并控制结果数：
 
@@ -63,7 +69,12 @@ cargo run -p code-context-plugin --example search_repository --features test-sup
 ```
 
 命令会读取当前 Lucia 仓库中所有受支持的源码、文档和配置文件，完成索引后输出文件路径、
-行号、符号名称和代码片段。使用 `--root <路径>` 可以搜索其他仓库。
+行号、符号名称和代码片段。使用 `--root <路径>` 可以搜索其他仓库；使用
+`--embedding-base-url`、`--embedding-api-key-env`、`--embedding-model`、
+`--embedding-dimension` 和 `--embedding-batch-size` 可以连接其他 OpenAI 兼容嵌入端点。
+
+没有嵌入端点时可以显式追加 `--lexical-only`，只验证符号与 BM25 检索。该模式不会生成
+向量，也不能作为语义搜索验收结果。
 
 ## 构建与测试
 
