@@ -34,6 +34,10 @@ gosyn = "0.2"
 [features]
 test-support = []
 
+[[example]]
+name = "search_repository"
+required-features = ["test-support"]
+
 [dev-dependencies]
 code-context-plugin = { path = ".", features = ["test-support"] }
 ureq = "3"
