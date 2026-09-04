@@ -42,6 +42,29 @@ world plugin {
   /// 列出插件私有持久存储中指定作用域下的全部键。
   import host-store-list: func(request-json: string) -> string;
 
+  /// 打开插件私有向量库并绑定一个向量空间。
+  ///
+  /// 向量库与 store 的区别是形态而非生命周期：store 是重写全量的小 JSON，装不下成千上万
+  /// 条高维向量；向量库按记录增量写入，检索在宿主侧完成，Guest 只传一条查询向量。
+  /// 空间标识或维度与库中不符时整库清空重建——混用不同嵌入空间的向量会让检索长期缓慢地
+  /// 不正确。需要 manifest 声明 `vector_store = true`。
+  import host-vector-open: func(request-json: string) -> string;
+
+  /// 分批对账当前记录清单，返回其中缺失或版本不符的记录 ID。
+  ///
+  /// `first` 开启一次对账会话，`last` 让宿主删除本次会话未出现的全部记录。它同时承担
+  /// “哪些需要重新计算向量”与“哪些已经失效”两件事，避免 Guest 把整库 ID 拉回本地比对。
+  import host-vector-sync: func(request-json: string) -> string;
+
+  /// 批量写入或替换向量记录。向量为 base64 编码的小端 f32 序列。
+  import host-vector-upsert: func(request-json: string) -> string;
+
+  /// 在宿主侧执行一次向量近邻检索，返回按相似度降序的记录。
+  import host-vector-search: func(request-json: string) -> string;
+
+  /// 按记录 ID 或路径前缀删除向量记录。
+  import host-vector-remove: func(request-json: string) -> string;
+
   /// 列出当前项目的历史会话摘要。
   ///
   /// 需要 manifest 声明 `sessions = true`。该能力会把插件全部公开工具的权限下限

@@ -16,6 +16,11 @@ use crate::capability::requests::ServiceSpecRequest;
 use crate::capability::requests::SessionReadRequest;
 use crate::capability::requests::StateSetRequest;
 use crate::capability::requests::StoreScopelessRequest;
+#[cfg(feature = "vector-store")]
+use crate::capability::requests::{
+    decode_vector, VectorOpenRequest, VectorRemoveRequest, VectorSearchRequest, VectorSyncRequest,
+    VectorUpsertRequest,
+};
 use crate::capability::requests::{
     validate_state_key, StoreKeyRequest, StoreScopeRequest, StoreSetRequest,
 };
@@ -48,6 +53,8 @@ mod process;
 mod requests;
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "vector-store")]
+mod vector;
 
 const MAX_PLUGIN_PROCESSES: usize = 16;
 
@@ -104,6 +111,15 @@ pub(crate) struct CapabilityState {
     state_store: Option<PluginStateStore>,
     /// Host 注入的可信规范化工作区根；只供 `workspace_read` 路径校验使用。
     workspace_root: Option<PathBuf>,
+    /// 向量库的落盘目录与作用域；manifest 未申请或应用未注入存储目录时为 `None`。
+    ///
+    /// 只保留寻址信息而不是打开的句柄：向量库要付出建库与加载扩展的代价，而多数插件
+    /// 一次也不会用到它，惰性打开让这份代价只落在真正使用的插件上。
+    #[cfg(feature = "vector-store")]
+    vector_location: Option<(PathBuf, String)>,
+    /// 已打开的向量库；首次调用 `host-vector-*` 时建立。
+    #[cfg(feature = "vector-store")]
+    vectors: Option<vector::PluginVectorStore>,
 }
 
 /// Host 在真实 Manifest 或执行策略边界拒绝插件能力时使用的类型化错误。
@@ -341,6 +357,22 @@ impl CapabilityState {
                 }
             }
         }
+        // 向量库按项目隔离：索引天然属于某个仓库，用户级作用域会让不同项目互相污染。
+        // 没有项目作用域时退回用户级，保证单仓库以外的使用场景依然可用。
+        #[cfg(feature = "vector-store")]
+        let vector_location = permissions
+            .vector_store
+            .then(|| {
+                let root = host_context.persistent_state_dir.as_ref()?;
+                let scope_key = store_scope_key(
+                    PluginStoreScope::Workspace,
+                    host_context.workspace_scope.as_deref(),
+                )
+                .or_else(|| store_scope_key(PluginStoreScope::User, None))?;
+                Some((root.clone(), scope_key))
+            })
+            .flatten();
+
         Ok(Self {
             plugin_id,
             plugin_dir,
@@ -359,7 +391,126 @@ impl CapabilityState {
             active_run_id: ActiveRunBinding::default(),
             state_store,
             workspace_root: host_context.workspace_root,
+            #[cfg(feature = "vector-store")]
+            vector_location,
+            #[cfg(feature = "vector-store")]
+            vectors: None,
         })
+    }
+
+    /// 返回已打开的向量库，必要时惰性建立。
+    ///
+    /// # Errors
+    ///
+    /// manifest 未申请 `vector_store`、应用未注入持久存储目录，或打开数据库失败时返回错误。
+    #[cfg(feature = "vector-store")]
+    fn vector_store(&mut self) -> Result<&mut vector::PluginVectorStore> {
+        if self.vectors.is_none() {
+            let Some((root, scope_key)) = self.vector_location.clone() else {
+                return Err(capability_denied(if self.permissions.vector_store {
+                    "当前宿主未启用插件持久存储目录，向量库不可用"
+                } else {
+                    "插件 manifest 未申请 vector_store 能力"
+                }));
+            };
+            self.vectors = Some(vector::PluginVectorStore::open(
+                &root,
+                &self.plugin_id,
+                &scope_key,
+            )?);
+        }
+        self.vectors
+            .as_mut()
+            .ok_or_else(|| anyhow!("插件向量库未能建立"))
+    }
+
+    /// 处理绑定向量空间的请求。
+    #[cfg(feature = "vector-store")]
+    pub(crate) fn vector_open(&mut self, request_json: &str) -> Result<Value> {
+        let request: VectorOpenRequest = parse_request(request_json)?;
+        let count = self
+            .vector_store()?
+            .bind_space(&request.space_id, request.dimension)?;
+        Ok(json!({ "count": count }))
+    }
+
+    /// 处理分批对账请求。
+    #[cfg(feature = "vector-store")]
+    pub(crate) fn vector_sync(&mut self, request_json: &str) -> Result<Value> {
+        let request: VectorSyncRequest = parse_request(request_json)?;
+        request.validate()?;
+        let entries: Vec<vector::SyncEntry> = request
+            .entries
+            .into_iter()
+            .map(|entry| vector::SyncEntry {
+                record_id: entry.record_id,
+                revision: entry.revision,
+            })
+            .collect();
+        let (stale, removed) = self
+            .vector_store()?
+            .sync(&entries, request.first, request.last)?;
+        Ok(json!({ "stale": stale, "removed": removed }))
+    }
+
+    /// 处理批量写入向量的请求。
+    #[cfg(feature = "vector-store")]
+    pub(crate) fn vector_upsert(&mut self, request_json: &str) -> Result<Value> {
+        let request: VectorUpsertRequest = parse_request(request_json)?;
+        request.validate()?;
+        let mut records = Vec::with_capacity(request.records.len());
+        for record in request.records {
+            records.push(vector::VectorRecord {
+                record_id: record.record_id,
+                path: record.path,
+                revision: record.revision,
+                vector: decode_vector(&record.vector)?,
+            });
+        }
+        let written = self.vector_store()?.upsert(&records)?;
+        Ok(json!({ "written": written }))
+    }
+
+    /// 处理向量检索请求。
+    #[cfg(feature = "vector-store")]
+    pub(crate) fn vector_search(&mut self, request_json: &str) -> Result<Value> {
+        let request: VectorSearchRequest = parse_request(request_json)?;
+        let query = decode_vector(&request.vector)?;
+        let limit = request.effective_limit();
+        let prefix = request
+            .path_prefix
+            .as_deref()
+            .filter(|prefix| !prefix.is_empty());
+        let hits = self.vector_store()?.search(&query, limit, prefix)?;
+        Ok(json!({
+            "hits": hits
+                .into_iter()
+                .map(|hit| json!({
+                    "record_id": hit.record_id,
+                    "path": hit.path,
+                    "score": hit.score,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// 处理删除向量记录的请求。
+    #[cfg(feature = "vector-store")]
+    pub(crate) fn vector_remove(&mut self, request_json: &str) -> Result<Value> {
+        let request: VectorRemoveRequest = parse_request(request_json)?;
+        request.validate()?;
+        let removed = self
+            .vector_store()?
+            .remove(&request.record_ids, &request.path_prefixes)?;
+        Ok(json!({ "removed": removed }))
+    }
+
+    /// 关闭 `vector-store` feature 时的占位实现，保证 ABI 形状不随构建配置变化。
+    #[cfg(not(feature = "vector-store"))]
+    pub(crate) fn vector_unavailable(&mut self, _request_json: &str) -> Result<Value> {
+        Err(capability_denied(
+            "当前宿主构建未启用 vector-store，插件向量库不可用",
+        ))
     }
 
     /// 绑定当前 Guest 导出调用所属的可信运行；`None` 用于启动、服务与 UI 控制面。

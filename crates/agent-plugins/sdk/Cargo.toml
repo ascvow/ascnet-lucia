@@ -8,6 +8,7 @@ description = "Guest-side WASM plugin SDK for ascnet-lucia."
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 agent-plugin-protocol = { path = "../protocol" }
 agent-tool = { path = "../../agent-core/tool", default-features = false }
 serde.workspace = true
