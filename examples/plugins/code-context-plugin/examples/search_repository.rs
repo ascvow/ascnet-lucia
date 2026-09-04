@@ -97,6 +97,15 @@ struct SearchOptions {
     rerank_model: Option<String>,
 }
 
+/// 单个仓库在本地缓存目录中的持久化文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryCachePaths {
+    /// manifest、文件哈希等小型宿主键值。
+    metadata: PathBuf,
+    /// sqlite-vec 向量数据库。
+    vectors: PathBuf,
+}
+
 /// 全仓库语义向量化使用的端点配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EmbeddingOptions {
@@ -178,34 +187,36 @@ fn run() -> Result<()> {
         .map(|(path, content)| (path.as_str(), content.as_str()))
         .collect();
     let mut context = activation_context(&root.to_string_lossy());
-    let cache_path = repository_cache_path(&options.cache_dir, &root);
+    let cache_paths = repository_cache_paths(&options.cache_dir, &root);
     if options.rebuild_cache {
-        match fs::remove_file(&cache_path) {
-            Ok(()) => eprintln!("已删除旧索引缓存：{}", cache_path.display()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(anyhow!(
-                    "删除旧索引缓存 `{}` 失败：{error}",
-                    cache_path.display()
-                ))
-            }
-        }
+        remove_cache_file(&cache_paths.metadata)?;
+        remove_sqlite_database(&cache_paths.vectors)?;
     }
     let host = if options.cache_enabled {
-        let existed = cache_path.is_file();
         eprintln!(
-            "索引缓存：{}（{}）",
-            cache_path.display(),
-            if existed {
+            "索引元数据：{}（{}）",
+            cache_paths.metadata.display(),
+            if cache_paths.metadata.is_file() {
                 "将复用已有数据"
             } else {
                 "首次创建"
             }
         );
-        RepoHost::persisted(&file_refs, &cache_path).with_context(|| {
+        if options.embedding.is_some() {
+            eprintln!(
+                "sqlite-vec 向量数据库：{}（{}）",
+                cache_paths.vectors.display(),
+                if cache_paths.vectors.is_file() {
+                    "将复用已有向量"
+                } else {
+                    "首次创建；存在旧 JSON 向量时自动迁移"
+                }
+            );
+        }
+        RepoHost::persisted(&file_refs, &cache_paths.metadata).with_context(|| {
             format!(
-                "打开索引缓存 `{}` 失败；可使用 --rebuild-cache 重建",
-                cache_path.display()
+                "打开索引元数据 `{}` 失败；可使用 --rebuild-cache 重建",
+                cache_paths.metadata.display()
             )
         })?
     } else {
@@ -235,7 +246,11 @@ fn run() -> Result<()> {
             host
         }
     };
-    let mut plugin = CodeContextPlugin::default();
+    let mut plugin = if options.cache_enabled && options.embedding.is_some() {
+        CodeContextPlugin::default().with_sqlite_vector_database(&cache_paths.vectors)
+    } else {
+        CodeContextPlugin::default()
+    };
     plugin
         .activate(&host, context)
         .context("激活 Code Context 插件失败")?;
@@ -533,7 +548,7 @@ impl EmbeddingEndpoint {
             let inputs = self.inputs.get() + input_count;
             self.batches.set(batch);
             self.inputs.set(inputs);
-            if batch == 1 || batch % 10 == 0 {
+            if batch == 1 || batch.is_multiple_of(10) {
                 eprintln!("正在生成语义向量：已提交 {batch} 批、{inputs} 条输入");
             }
         }
@@ -646,12 +661,48 @@ fn default_cache_dir() -> PathBuf {
 }
 
 /// 按规范化仓库根路径派生稳定且不泄露本地路径的缓存文件名。
-fn repository_cache_path(cache_dir: &Path, root: &Path) -> PathBuf {
+fn repository_cache_paths(cache_dir: &Path, root: &Path) -> RepositoryCachePaths {
     let identity = content_hash(&format!(
         "code-context-search-repository\0{}",
         root.to_string_lossy()
     ));
-    cache_dir.join(format!("{identity}.json"))
+    RepositoryCachePaths {
+        metadata: cache_dir.join(format!("{identity}.json")),
+        vectors: cache_dir.join(format!("{identity}.sqlite3")),
+    }
+}
+
+/// 删除一个普通缓存文件；文件不存在视为成功。
+///
+/// # Errors
+///
+/// 删除失败且原因不是文件不存在时返回错误。
+fn remove_cache_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            eprintln!("已删除旧索引缓存：{}", path.display());
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow!("删除旧索引缓存 `{}` 失败：{error}", path.display())),
+    }
+}
+
+/// 删除 SQLite 主文件及 WAL/SHM 辅助文件；不存在的文件会被忽略。
+///
+/// # Errors
+///
+/// 任一实际存在的数据库文件无法删除时返回错误。
+fn remove_sqlite_database(path: &Path) -> Result<()> {
+    remove_cache_file(path)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("sqlite-vec 数据库路径缺少有效文件名：{}", path.display()))?;
+    for suffix in ["-wal", "-shm"] {
+        remove_cache_file(&path.with_file_name(format!("{file_name}{suffix}")))?;
+    }
+    Ok(())
 }
 
 /// 递归读取仓库内全部受生产分类器支持的 UTF-8 文件。
@@ -1061,7 +1112,7 @@ fn rust_declaration_start(signature: &str) -> Option<usize> {
 /// 打印命令用法与可选参数。
 fn print_help() {
     println!(
-        "用法：\n  cargo run -p code-context-plugin --example search_repository --features test-support -- [选项] [查询]\n\n未提供查询时，索引完成后进入交互搜索，可连续输入多条查询。语义向量默认按仓库持久化，第二次运行只计算新增或变化的代码块。\n\n选项：\n  --root <路径>                         仓库根目录，默认使用当前 Lucia 仓库\n  --max-results <数量>                  最多返回结果数，默认 10\n  --token-budget <数量>                 代码片段 token 预算，默认 8000\n  --path-scope <前缀>                   限定仓库相对路径，可重复指定\n  --cache-dir <目录>                    索引缓存目录，默认 ~/.lucia/code-context\n  --no-cache                            不读取或写入跨进程索引缓存\n  --rebuild-cache                       删除当前仓库缓存后重新生成全部向量\n  --embedding-base-url <URL>            OpenAI 兼容端点，默认使用 SiliconFlow\n  --embedding-api-key-env <变量名>      API 密钥环境变量，默认 SILICONFLOW_API_KEY\n  --embedding-model <模型>              嵌入模型，默认 BAAI/bge-m3\n  --embedding-dimension <维度>          向量维度，默认 1024\n  --embedding-batch-size <数量>         单批代码块数，默认 32\n  --embedding-send-dimensions <布尔值>  是否发送 dimensions，默认 false\n  --rerank-model <模型>                 重排模型，默认 Qwen/Qwen3-Reranker-4B\n  --no-rerank                           禁用远端模型重排，只使用本地融合排序\n  --lexical-only                        关闭向量化与模型重排，只运行符号和 BM25 检索\n  -h, --help                            显示帮助"
+        "用法：\n  cargo run -p code-context-plugin --example search_repository --features test-support -- [选项] [查询]\n\n未提供查询时，索引完成后进入交互搜索，可连续输入多条查询。语义向量默认保存到本地 sqlite-vec 数据库，第二次运行只计算新增或变化的代码块。\n\n选项：\n  --root <路径>                         仓库根目录，默认使用当前 Lucia 仓库\n  --max-results <数量>                  最多返回结果数，默认 10\n  --token-budget <数量>                 代码片段 token 预算，默认 8000\n  --path-scope <前缀>                   限定仓库相对路径，可重复指定\n  --cache-dir <目录>                    索引缓存目录，默认 ~/.lucia/code-context\n  --no-cache                            不读取或写入 sqlite-vec 与元数据缓存\n  --rebuild-cache                       删除当前仓库缓存后重新生成全部向量\n  --embedding-base-url <URL>            OpenAI 兼容端点，默认使用 SiliconFlow\n  --embedding-api-key-env <变量名>      API 密钥环境变量，默认 SILICONFLOW_API_KEY\n  --embedding-model <模型>              嵌入模型，默认 BAAI/bge-m3\n  --embedding-dimension <维度>          向量维度，默认 1024\n  --embedding-batch-size <数量>         单批代码块数，默认 32\n  --embedding-send-dimensions <布尔值>  是否发送 dimensions，默认 false\n  --rerank-model <模型>                 重排模型，默认 Qwen/Qwen3-Reranker-4B\n  --no-rerank                           禁用远端模型重排，只使用本地融合排序\n  --lexical-only                        关闭向量化与模型重排，只运行符号和 BM25 检索\n  -h, --help                            显示帮助"
     );
 }
 
@@ -1215,13 +1266,22 @@ mod tests {
 
     /// 同一仓库必须得到稳定缓存文件，不同仓库不得共享缓存。
     #[test]
-    fn repository_cache_path_is_stable_and_isolated() {
+    fn repository_cache_paths_are_stable_and_isolated() {
         let cache = Path::new("/cache");
-        let first = repository_cache_path(cache, Path::new("/repo/a"));
+        let first = repository_cache_paths(cache, Path::new("/repo/a"));
 
-        assert_eq!(first, repository_cache_path(cache, Path::new("/repo/a")));
-        assert_ne!(first, repository_cache_path(cache, Path::new("/repo/b")));
-        assert_eq!(first.parent(), Some(cache));
+        assert_eq!(first, repository_cache_paths(cache, Path::new("/repo/a")));
+        assert_ne!(first, repository_cache_paths(cache, Path::new("/repo/b")));
+        assert_eq!(first.metadata.parent(), Some(cache));
+        assert_eq!(first.vectors.parent(), Some(cache));
+        assert_eq!(
+            first.metadata.extension().and_then(|value| value.to_str()),
+            Some("json")
+        );
+        assert_eq!(
+            first.vectors.extension().and_then(|value| value.to_str()),
+            Some("sqlite3")
+        );
     }
 
     /// 搜索结果必须突出汇总、位置、符号、签名和带行号的源码，且纯文本模式不含 ANSI 控制符。

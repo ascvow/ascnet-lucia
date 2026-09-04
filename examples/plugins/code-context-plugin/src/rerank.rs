@@ -65,7 +65,6 @@ pub(crate) fn rerank_results(
             path: "rerank".to_string(),
             headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
             body: Some(body.to_string()),
-            endpoint: None,
         })
         .map_err(|error| format!("rerank 端点调用失败：{error}"))?;
     if !(200..300).contains(&response.status) {

@@ -28,7 +28,7 @@ fixture 与完整 Lucia 仓库基准均已通过。查询侧中文高频单字�
 - [x] Phase 5 — Lexical & Symbol Retrieval
 - [x] Phase 6 — Embedding Abstraction
 - [x] Phase 7 — API Embedding Provider（本轮实现宿主 HTTP 能力，阻塞解除）
-- [x] Phase 8 — Semantic Vector Index（int4 量化持久化，启动时恢复）
+- [x] Phase 8 — Semantic Vector Index（WASM int4 快照；原生入口 sqlite-vec 持久化）
 - [x] Phase 9 — Hybrid Retrieval
 - [x] Phase 10 — Context Builder
 - [x] Phase 11 — Incremental Indexing
@@ -846,17 +846,18 @@ Implemented:
 
 Tests：新增 14 项语义索引测试、5 项通道接线测试、5 项端到端测试。插件单测 301 → 324。
 
-**向量持久化已实现（int4 量化）**：f32 向量以单条 scale factor 加四位有符号分量打包，
+**WASM 向量持久化已实现（int4 量化）**：f32 向量以单条 scale factor 加四位有符号分量打包，
 两个维度共用一个字节，base64 编码后存入 `host-store` 的 `index.semantic` 键。快照不再按固定
 条数截断，而是按 7 MiB 实际 JSON 字节预算保留记录，给 8 MiB Host KV 中的 manifest 与
 文件哈希表留出空间。进程重启时先按 `space_id` 校验嵌入空间，再按 chunk 内容哈希校验每条
 向量；旧 int8 快照仍可读取，但因缺少内容哈希会安全地重新嵌入一次。删除、重命名和正文变化
 产生的旧记录会在写回快照前清理。
 
-`search_repository` 的测试宿主已使用原子 JSON 文件把 Workspace 存储落到
-`~/.lucia/code-context/`，按仓库路径哈希隔离。离线回归验证了首次构建会请求文档向量、重新
-打开同一缓存时零文档请求、正文变化后只重新请求变化代码块；真实 SiliconFlow 全仓库二次
-复用仍需在有凭证环境中运行两次命令确认。
+原生 `search_repository` 已改用 sqlite-vec：同一仓库的 manifest 与文件哈希仍保存在
+`~/.lucia/code-context/<仓库哈希>.json`，归一化 f32 向量保存在同名 `.sqlite3` 数据库并由
+`vec0` 执行余弦 KNN。数据库重开、路径范围过滤、嵌入空间隔离、批量事务、增量删除和旧 JSON
+int4 快照迁移均有离线回归；迁移成功后会删除 JSON 中的重复向量。真实 SiliconFlow 全仓库
+二次复用仍需在有凭证环境中运行两次命令确认。
 
 Next: Phase 13 — Agent Tool Integration
 
@@ -934,9 +935,9 @@ Implemented:
   7 MiB 语义快照预算，不触发截断。
 
 Benchmark Result:
-- fixture：Recall@1 `0.781`，Recall@5 `0.969`，MRR `0.885`。
-- 完整仓库：341 个输入文件、340 个已索引文件、6471 个代码块、6200 个符号，16 个预算
-  轮次完成；Recall@1 `0.600`、Recall@5 `0.867`、Recall@10 `0.933`、MRR `0.710`。
+- fixture：Recall@1 `0.781`，Recall@5 `0.969`，MRR `0.906`。
+- 完整仓库：344 个输入文件、343 个已索引文件、6539 个代码块、6266 个符号，16 个预算
+  轮次完成；Recall@1 `0.600`、Recall@5 `0.933`、Recall@10 `0.933`、MRR `0.756`。
 - 真实 SiliconFlow 查询未在本次会话重跑：当前进程没有 `SILICONFLOW_API_KEY`。离线端到端测试
   已覆盖三路融合与跨进程向量复用，不能把它替代为真实服务验收。
 
@@ -1001,6 +1002,22 @@ Phase 2 遗留的真实 Host 验证已在 Phase 4 补齐：
 
 ## Architecture Drift
 
+### 2026-09-04 · 原生搜索入口采用 sqlite-vec
+
+**偏离内容。** 原存储 ADR 拒绝 SQLite，并把语义向量统一保存为 Host JSON int4 快照。该结论
+对 WASM Guest 仍然成立；独立运行的原生 `search_repository` 不受 Guest 文件能力限制，现改用
+bundled SQLite + sqlite-vec 保存 f32 向量并执行余弦 KNN。
+
+**边界。** WASM 构建默认不启用 `sqlite-vector-store` feature，插件 manifest 没有增加
+`fs_write`。SQLite 路径由原生入口固定派生为 `~/.lucia/code-context/<仓库哈希>.sqlite3`，不是
+Guest 可控制的通用文件接口。旧 JSON int4 快照保留为 WASM 后端和原生入口的一次性迁移来源。
+
+**验证。** sqlite-vec 重开、KNN、路径范围、嵌入空间变化清库、查询失败内存降级与旧快照迁移
+测试通过；348 项插件库测试、11 项搜索命令测试和 8 项真实 WASM Host smoke test 通过；
+`cargo clippy --all-targets --features test-support -D warnings` 无警告；默认 `wasm32-wasip2`
+release 构建通过且正常依赖树不含 SQLite。真实 SiliconFlow 缓存迁移未运行：当前进程未设置
+`SILICONFLOW_API_KEY`，现有旧 JSON 缓存保持未改动。
+
 ### 2026-09-03 · Phase 1 骨架阶段（已同步至 architecture.md）
 
 1. `code_search` 使用动态注册而非静态 `list-tools`。原因：静态工具收集发生在 `activate` 之前，
@@ -1050,7 +1067,8 @@ Tier 3  文本分块              —— 未覆盖语言、解析失败、无声
   `CodeChunk` 保留 `qualified_symbol`、`symbol_kind`、`parent_symbol` 与精确行区间，
   LSP 将来作为**独立插件**通过 `host-service-call` 提供。
 - Code Graph、Git history 语义索引、跨仓库 / 团队 / 分布式索引、云端托管索引。
-- LLM query rewrite、LLM reranker。
+- LLM query rewrite。远端 reranker 已由原生搜索入口实现，默认模型为
+  `Qwen/Qwen3-Reranker-4B`；WASM Guest 仍只通过受限 Host HTTP 能力调用模型端点。
 - Tier 1 完整 AST（tree-sitter）：本机无 wasi-sdk，`clang` 注册目标中无 wasm 后端，构建流水线
   使用 `--offline`。V1 用 Tier 2 纯 Rust 解析 + Tier 3 文本兜底。作为后续独立 ADR。
 - 文件 watcher：V1 用 `core.tool.result` + 惰性校验兜底。若将来实现，必须是宿主统一的仓库变更

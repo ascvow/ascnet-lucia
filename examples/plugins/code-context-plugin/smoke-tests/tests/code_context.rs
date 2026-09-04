@@ -142,13 +142,13 @@ async fn wasm_host_loads_and_registers_code_search() {
     let _ = std::fs::remove_dir_all(&workspace_root);
 }
 
-/// 检索实现未接入时，code_search 必须返回明确的不可用状态而不是伪造结果。
+/// 空工作区索引完成后，code_search 必须返回成功的空结果与真实降级状态。
 ///
 /// 空工作区的索引会立刻建成，因此状态是 `degraded`（结构索引就绪、语义分支缺席）。
-/// 关键断言不是具体状态值，而是**它必须是错误结果且结果列表为空**——一个成功的空列表
-/// 会被模型读成"仓库里没有相关代码"。
+/// 此时检索链路本身已经成功执行，空列表表达仓库确实没有匹配内容，不应再沿用 Phase 1
+/// “检索尚未实现”的错误协议。
 #[tokio::test]
-async fn code_search_reports_unavailable_instead_of_empty_results() {
+async fn code_search_returns_successful_empty_results_for_empty_workspace() {
     let state_root = unique_state_root("search");
     let workspace_root = create_workspace("search");
     let host = load_wasm_plugins_with_services(
@@ -176,13 +176,15 @@ async fn code_search_reports_unavailable_instead_of_empty_results() {
     .expect("工具调用不应失败")
     .expect("code_search 应由本插件处理");
 
-    assert!(
-        result.is_error,
-        "索引不可用必须返回错误结果，避免被模型读成「仓库里没有相关代码」"
+    assert!(!result.is_error, "索引完成后的空结果应是成功结果");
+    assert_eq!(
+        result.content["status"], "degraded",
+        "实际 {}",
+        result.content
     );
-    let details = result.details.expect("不可用结果应带结构化状态");
+    assert_eq!(result.content["results"], json!([]));
+    let details = result.details.expect("成功结果应带结构化状态");
     assert_eq!(details["status"], "degraded", "实际 {details}");
-    assert_eq!(details["results"], json!([]));
     // 空工作区没有任何可索引文件，索引规模必须如实为 0，而不是缺失或伪造。
     assert_eq!(details["index"]["files"], 0, "实际 {details}");
 

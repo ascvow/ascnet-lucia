@@ -1,49 +1,46 @@
 # Code Context Engine 实现状态
 
-更新日期：2026-09-03
+更新日期：2026-09-04
 
 ## Phase
 
-Phase 1：WASM Plugin 初始化与基础架构 Skeleton。
+Phase 15：Hardening。Phase 0–11、13–14 已完成；Phase 12 因 Host 无本地嵌入能力阻塞。
 
 ## Status
 
-实现已完成，最终构建与集成验证进行中。
+WASM 插件检索链路已完成，当前加固原生全仓库搜索、持久化与检索质量。详细阶段记录以
+[`PROGRESS.md`](./PROGRESS.md) 为准。
 
 ## Implemented
 
-- `examples/plugins/code-context-plugin` 独立 Guest crate、manifest 与 smoke-test crate
-- `wasm32-wasip2` / ABI `0.10.0` 构建配置
-- 通用 Host `workspace_read` capability、可信工作区根注入、权限审查和路径越界防护
-- `storage` Workspace 作用域中的 `IndexManifest` 读写、校验、兼容性判断和重启恢复
-- `NotIndexed`、`Initializing`、`Indexing`、`Ready`、`Degraded`、`NeedsSemanticRebuild`、
-  `NeedsFullRebuild`、`Error` 状态模型
-- `enabled`、`embedding_mode = local | api` 配置解析与校验
-- `EmbeddingProvider` 稳定接口和不会返回伪造向量的 `UnconfiguredEmbeddingProvider`
-- 动态注册 `code_search(query, max_results?, token_budget?, path_scope?)`
-- 卸载时按 Host 返回的公开工具名注销工具、flush metadata 并解除仓库附着
-- 单元测试与真实 WASM Host smoke 测试
+- 仓库扫描、忽略规则、五类结构化解析、稳定 chunk 与增量索引
+- 符号、BM25、语义三路检索，RRF 融合、上下文打包与模型重排
+- WASM Guest 通过 Host Workspace KV 保存 manifest、文件哈希与 int4 语义快照
+- 原生 `search_repository` 通过 sqlite-vec 保存 f32 向量并执行余弦 KNN
+- `~/.lucia/code-context/<仓库哈希>.json` 与 `.sqlite3` 跨进程缓存
+- 旧 JSON 向量自动迁移、嵌入空间隔离、增量删除和数据库重开恢复
+- 默认 `BAAI/bge-m3` 嵌入与 `Qwen/Qwen3-Reranker-4B` 重排
 
 ## Deferred
 
-- Repository Scanner、ignore rules、语言检测
-- Tree-sitter 与完整 AST parser
-- 结构化分块、符号索引、词法索引和完整 indexing
-- Embedding API、本地模型、向量索引和持久化 blob
-- Hybrid Retrieval、RRF、Context Packing、Reranker
+- Host 原生 embedding capability 与 Local Embedding Provider
+- Host blob 存储，以及正式 WASM 插件的大规模完整 f32 向量后端
 - 文件 watcher、LSP、Code Graph、Git indexing
 
 ## Known Limitations
 
-- `code_search` 当前只返回结构化 `not_indexed` 或其他真实状态，不返回检索结果。
-- Host 没有 repository open/change/close 事件；启动映射为 attach，`deactivate` 映射为 detach。
-- Host 没有 manifest 配置 schema；配置通过激活元数据下发并由 Guest 校验。
-- Guest 没有后台任务与取消 handle；骨架阶段不启动内部任务。
-- Host JSON KV 只适合 manifest 和小型 metadata，不适合 chunk、倒排索引或向量。
+- sqlite-vec 只用于独立原生搜索入口，WASM Guest 不直接拥有文件写入能力。
+- Host 没有 repository open/change/close 事件；外部编辑依赖惰性一致性校验。
+- Guest 没有后台任务与取消 handle；长索引任务通过明确的分片推进协议完成。
+- Host JSON KV 仍不适合原始 f32 向量；WASM 使用有 7 MiB 预算的 int4 快照。
 
 ## Verification
 
-- `cargo test --offline -p code-context-plugin`：通过，55 个单元测试与 1 个文档测试。
-- `cargo test --offline -p agent-plugin-host`：通过，132 个单元测试与 2 个契约测试。
-- `cargo test --offline -p agent-plugin-manager`：通过，53 个单元测试。
-- WASM build、smoke test、TUI feature 测试与全仓检查：待本阶段最终验证后更新。
+- `cargo test -p code-context-plugin --lib --features test-support`：348 项通过。
+- `cargo test -p code-context-plugin --example search_repository --features test-support`：11 项通过。
+- sqlite-vec 重开、KNN、路径范围、空间隔离、查询失败降级与旧快照迁移测试：通过。
+- `cargo clippy -p code-context-plugin --all-targets --features test-support -- -D warnings`：通过。
+- 默认 `wasm32-wasip2` release 构建：通过，正常依赖树不含 SQLite。
+- `cargo test --offline -p code-context-plugin-smoke-tests`：8 项通过。
+- 完整仓库基准：Recall@1 `0.600`、Recall@5/10 `0.933`、MRR `0.756`。
+- 真实 SiliconFlow 跨进程复用未重跑：当前进程未设置 `SILICONFLOW_API_KEY`。

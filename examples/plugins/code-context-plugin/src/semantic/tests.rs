@@ -88,6 +88,40 @@ fn path_scope_filters_results() {
     assert!(found.iter().all(|(id, _)| *id != "chunk-x"));
 }
 
+/// sqlite-vec 查询失败后必须固定退回内存索引，不能让损坏数据库遮蔽已加载向量。
+#[cfg(feature = "sqlite-vector-store")]
+#[test]
+fn sqlite_query_failure_falls_back_to_memory() {
+    let path = std::env::temp_dir().join(format!(
+        "lucia-code-context-sqlite-fallback-{}-{}.sqlite3",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut index = SemanticIndex::with_sqlite(space("m", 3), &path).expect("创建数据库");
+    index.upsert("chunk-x", "src/a.rs", Some("hash-x"), &[1.0, 0.0, 0.0]);
+    assert!(index.take_backend_error().is_none());
+
+    let connection = rusqlite::Connection::open(&path).expect("打开破坏连接");
+    connection
+        .execute("DROP TABLE code_context_vectors", [])
+        .expect("删除向量表");
+    drop(connection);
+
+    let first = index.search(&[1.0, 0.0, 0.0], None, 1);
+    assert_eq!(first[0].0, "chunk-x", "查询失败后应使用内存向量");
+    assert!(index.take_backend_error().is_some(), "必须上报数据库错误");
+    let second = index.search(&[1.0, 0.0, 0.0], None, 1);
+    assert_eq!(second[0].0, "chunk-x", "后续查询不得重复使用损坏数据库");
+    assert!(index.take_backend_error().is_none());
+    assert!(index.snapshot().is_some(), "数据库失效后应允许导出回退快照");
+
+    drop(index);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+}
+
 /// 重复写入同一 chunk 必须替换而不是追加。
 #[test]
 fn upsert_replaces_existing_vector() {

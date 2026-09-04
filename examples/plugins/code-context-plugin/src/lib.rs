@@ -34,6 +34,8 @@ mod repository;
 mod rerank;
 mod retrieval;
 mod semantic;
+#[cfg(feature = "sqlite-vector-store")]
+mod sqlite_vector;
 mod storage;
 mod tool;
 
@@ -143,8 +145,8 @@ struct RepositoryContext {
     retrieval: Option<RetrievalIndex>,
     /// 语义向量索引。
     ///
-    /// 同样内存驻留：向量体量远超宿主存储上限，落盘要等 blob 能力（见 adr-storage.md）。
-    /// 未配置嵌入 provider 时保持为空，检索自动退化为词法与符号两路。
+    /// 运行时使用归一化 f32；原生搜索示例由 sqlite-vec 持久化并执行 KNN，WASM 插件继续
+    /// 使用 int4 宿主快照。未配置嵌入 provider 时保持为空，检索自动退化为词法与符号两路。
     semantic: SemanticIndex,
     /// 已确认成功写入、等待下一次增量构建的仓库相对路径。
     dirty_paths: BTreeSet<String>,
@@ -171,9 +173,22 @@ pub struct CodeContextPlugin {
     last_rerank_degraded_reason: Option<String>,
     /// Host 返回的 `code_search` 公开名称；存在时表示工具已经注册给 Agent。
     registered_tool_name: Option<String>,
+    /// 原生测试入口使用的 sqlite-vec 数据库路径；WASM 构建不包含该字段。
+    #[cfg(feature = "sqlite-vector-store")]
+    sqlite_vector_path: Option<std::path::PathBuf>,
 }
 
 impl CodeContextPlugin {
+    /// 指定本地 sqlite-vec 数据库文件。
+    ///
+    /// 该入口只在原生 `sqlite-vector-store` feature 下提供，供可执行搜索示例把向量持久化到
+    /// Lucia 用户目录。WASM Guest 不直接打开文件，正式宿主仍通过能力边界管理持久数据。
+    #[cfg(feature = "sqlite-vector-store")]
+    pub fn with_sqlite_vector_database(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.sqlite_vector_path = Some(path.into());
+        self
+    }
+
     /// 返回当前索引状态。
     pub fn index_status(&self) -> IndexStatus {
         self.index_status
@@ -267,12 +282,26 @@ impl CodeContextPlugin {
             status = IndexStatus::NotIndexed;
         }
 
-        // 尝试从持久存储恢复语义向量。需要当前 provider 的嵌入空间来校验兼容性：
-        // 快照的 space_id 与当前不一致时直接丢弃，避免混用不同模型的向量。
+        // 尝试从持久存储恢复语义向量。原生搜索示例优先打开 sqlite-vec；数据库为空时
+        // 自动迁移旧 int4 JSON 快照，避免切换存储后重新调用嵌入 API。
         let mut semantic = SemanticIndex::new();
         if let Some(space) = self.embedding_provider(host).space() {
-            if let Some(snapshot) = store.load_semantic(host) {
-                semantic.restore(&space, &snapshot);
+            #[cfg(feature = "sqlite-vector-store")]
+            if let Some(path) = self.sqlite_vector_path.as_ref() {
+                semantic = SemanticIndex::with_sqlite(space.clone(), path)
+                    .map_err(CodeContextError::Storage)?;
+            }
+            if semantic.is_empty() {
+                if let Some(snapshot) = store.load_semantic(host) {
+                    semantic.restore(&space, &snapshot);
+                }
+            }
+            #[cfg(feature = "sqlite-vector-store")]
+            if semantic.sqlite_path().is_some() {
+                if let Some(error) = semantic.take_backend_error() {
+                    return Err(CodeContextError::Storage(error));
+                }
+                store.clear_semantic(host)?;
             }
         }
 
@@ -739,10 +768,7 @@ impl CodeContextPlugin {
         }
 
         let bundle = {
-            let idx = self
-                .repository
-                .as_ref()
-                .and_then(|ctx| ctx.index.as_ref());
+            let idx = self.repository.as_ref().and_then(|ctx| ctx.index.as_ref());
             match idx {
                 Some(index) => context::build(
                     host,
@@ -812,6 +838,11 @@ impl CodeContextPlugin {
             path_scope,
             recall_limit,
         );
+        #[cfg(feature = "sqlite-vector-store")]
+        if let Some(error) = context.semantic.take_backend_error() {
+            self.degraded_reason =
+                Some(format!("sqlite-vec 查询失败，已退回内存语义检索：{error}"));
+        }
         if let Some(model) = rerank_model {
             match rerank::rerank_results(host, &model, query, &results) {
                 Ok(reranked) => results = reranked,
@@ -866,10 +897,13 @@ impl CodeContextPlugin {
         let Some(index) = context.index.as_ref() else {
             return false;
         };
-        if !context.semantic.is_compatible_with(&space) {
+        if context.semantic.space().is_none() || !context.semantic.is_compatible_with(&space) {
             context.semantic.reset(space);
-        } else if context.semantic.space().is_none() {
-            context.semantic.reset(space);
+        }
+        #[cfg(feature = "sqlite-vector-store")]
+        if let Some(error) = context.semantic.take_backend_error() {
+            self.degraded_reason = Some(format!("sqlite-vec 索引重置失败：{error}"));
+            return false;
         }
 
         let current_chunks: Vec<(&str, &str)> = index
@@ -877,6 +911,11 @@ impl CodeContextPlugin {
             .map(|chunk| (chunk.id.as_str(), chunk.content_hash.as_str()))
             .collect();
         context.semantic.retain_current(&current_chunks);
+        #[cfg(feature = "sqlite-vector-store")]
+        if let Some(error) = context.semantic.take_backend_error() {
+            self.degraded_reason = Some(format!("sqlite-vec 过期向量清理失败：{error}"));
+            return context.semantic.is_ready();
+        }
 
         // 只嵌入尚无当前向量的 chunk：内容哈希可防止正文变化后误复用同 ID 的旧向量。
         let pending: Vec<(String, String, String, String)> = index
@@ -902,18 +941,29 @@ impl CodeContextPlugin {
         let inputs: Vec<String> = pending.iter().map(|(_, _, _, text)| text.clone()).collect();
         match provider.embed_documents(&inputs) {
             Ok(vectors) => {
-                for ((chunk_id, file_path, content_hash, _), vector) in
-                    pending.iter().zip(vectors.iter())
-                {
-                    context
-                        .semantic
-                        .upsert(chunk_id, file_path, Some(content_hash), vector);
+                let batch: Vec<(&str, &str, Option<&str>, &[f32])> = pending
+                    .iter()
+                    .zip(vectors.iter())
+                    .map(|((chunk_id, file_path, content_hash, _), vector)| {
+                        (
+                            chunk_id.as_str(),
+                            file_path.as_str(),
+                            Some(content_hash.as_str()),
+                            vector.as_slice(),
+                        )
+                    })
+                    .collect();
+                context.semantic.upsert_batch(&batch);
+                #[cfg(feature = "sqlite-vector-store")]
+                if let Some(error) = context.semantic.take_backend_error() {
+                    self.degraded_reason = Some(format!("sqlite-vec 向量写入失败：{error}"));
+                    return context.semantic.is_ready();
                 }
-                // 向量落盘：失败不影响本次检索，只让下次启动需要重新嵌入。
+                // WASM 插件继续通过宿主 KV 保存 int4 快照；sqlite-vec 模式的 snapshot
+                // 返回 None，避免同一批向量重复写进 JSON。
                 if let Some(snapshot) = context.semantic.snapshot() {
                     if let Err(error) = context.store.save_semantic(host, &snapshot) {
-                        self.degraded_reason =
-                            Some(format!("语义向量未能持久化：{error}"));
+                        self.degraded_reason = Some(format!("语义向量未能持久化：{error}"));
                         return context.semantic.is_ready();
                     }
                 }
@@ -1871,6 +1921,124 @@ mod tests {
         std::fs::remove_file(&cache_path).expect("清理语义缓存测试文件");
     }
 
+    /// sqlite-vec 必须迁移旧 JSON 向量，并在独立插件实例中继续复用与执行语义检索。
+    #[cfg(feature = "sqlite-vector-store")]
+    #[test]
+    fn sqlite_vector_database_migrates_snapshot_and_survives_reopen() {
+        let base = std::env::temp_dir().join(format!(
+            "lucia-code-context-sqlite-migration-{}",
+            std::process::id()
+        ));
+        let metadata_path = base.with_extension("json");
+        let vector_path = base.with_extension("sqlite3");
+        for path in [
+            metadata_path.clone(),
+            vector_path.clone(),
+            vector_path.with_file_name(format!(
+                "{}-wal",
+                vector_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            )),
+            vector_path.with_file_name(format!(
+                "{}-shm",
+                vector_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            )),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let legacy_host = crate::testing::RepoHost::persisted(SEMANTIC_FIXTURE, &metadata_path)
+            .expect("创建旧快照宿主")
+            .with_echo_embeddings(4);
+        let legacy = indexed(&legacy_host, api_activation_context("/repo/a"));
+        assert_eq!(legacy_host.http_requests().len(), 1, "首次应生成文档向量");
+        drop(legacy);
+        drop(legacy_host);
+
+        let migrated_host = crate::testing::RepoHost::persisted(SEMANTIC_FIXTURE, &metadata_path)
+            .expect("打开待迁移快照")
+            .with_echo_embeddings(4);
+        let mut migrated = CodeContextPlugin::default().with_sqlite_vector_database(&vector_path);
+        migrated
+            .activate(&migrated_host, api_activation_context("/repo/a"))
+            .expect("激活 sqlite-vec 插件");
+        for _ in 0..8 {
+            migrated.advance_index(&migrated_host);
+            if migrated.index_status() != IndexStatus::Indexing {
+                break;
+            }
+        }
+        assert_eq!(migrated.index_status(), IndexStatus::Ready);
+        assert!(vector_path.is_file(), "迁移后必须生成 sqlite3 数据库");
+        assert!(
+            migrated_host.http_requests().is_empty(),
+            "迁移旧快照时不得重新生成文档向量"
+        );
+        assert!(
+            migrated_host
+                .store_get(agent_plugin::PluginStoreScope::Workspace, "index.semantic")
+                .expect("读取旧快照键")
+                .is_none(),
+            "迁移成功后必须删除重复 JSON 向量"
+        );
+        drop(migrated);
+        drop(migrated_host);
+
+        let reopened_host = crate::testing::RepoHost::persisted(SEMANTIC_FIXTURE, &metadata_path)
+            .expect("重新打开元数据")
+            .with_echo_embeddings(4);
+        let mut reopened = CodeContextPlugin::default().with_sqlite_vector_database(&vector_path);
+        reopened
+            .activate(&reopened_host, api_activation_context("/repo/a"))
+            .expect("重新打开 sqlite-vec 插件");
+        for _ in 0..8 {
+            reopened.advance_index(&reopened_host);
+            if reopened.index_status() != IndexStatus::Indexing {
+                break;
+            }
+        }
+        assert_eq!(reopened.index_status(), IndexStatus::Ready);
+        assert!(
+            reopened_host.http_requests().is_empty(),
+            "重开时应复用文档向量"
+        );
+        let results = reopened.search_results(&reopened_host, "permission", None, 10);
+        assert!(!results.is_empty(), "sqlite-vec KNN 应参与混合检索");
+        assert_eq!(
+            reopened_host.http_requests().len(),
+            1,
+            "搜索只应生成一次查询向量"
+        );
+        drop(reopened);
+        drop(reopened_host);
+
+        for path in [
+            metadata_path,
+            vector_path.clone(),
+            vector_path.with_file_name(format!(
+                "{}-wal",
+                vector_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            )),
+            vector_path.with_file_name(format!(
+                "{}-shm",
+                vector_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            )),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// 嵌入端点失败时必须降级为两路检索，而不是让索引构建失败。
     #[test]
     fn embedding_failure_degrades_instead_of_failing_the_build() {
@@ -1898,7 +2066,10 @@ mod tests {
         let plugin = indexed(&host, activation_context("/repo/a"));
 
         assert_eq!(plugin.index_status(), IndexStatus::Degraded);
-        assert!(host.http_requests().is_empty(), "没有端点时不应发起嵌入请求");
+        assert!(
+            host.http_requests().is_empty(),
+            "没有端点时不应发起嵌入请求"
+        );
         assert!(!plugin.search_candidates("permission", None, 10).is_empty());
     }
 

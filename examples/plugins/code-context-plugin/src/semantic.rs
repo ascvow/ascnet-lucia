@@ -1,35 +1,36 @@
 //! 语义向量索引。
 //!
-//! # 持久化与 int4 量化
+//! # 双持久化后端
 //!
-//! `adr-storage.md` 把嵌入向量列为「V1 不存在」，理由是 f32 原样存放远超 `host-store`
-//! 的 8 MiB 上限——本仓库约 5000 个 chunk × 1024 维 × 4 字节就是 20 MB 以上。
+//! WASM Guest 没有文件写入能力，因此继续把向量压缩为 int4 快照，通过 `host-store` 的
+//! Workspace 作用域持久化。原生 `search_repository` 示例不受 WASM 文件能力限制，启用
+//! `sqlite-vector-store` feature 后改用 sqlite-vec 保存归一化 f32 向量并执行余弦 KNN。
 //!
-//! 但那条结论的前提是**不量化**。检索用的向量对精度并不敏感：向量已归一化，
-//! 每个分量都落在 `[-1, 1]`，用一个 f32 缩放因子加 4 位有符号分量即可把两个维度装入
-//! 一个字节，体积降到八分之一。再算上 base64 的 4/3 膨胀，1024 维单条约 700 字节，
-//! 当前 Lucia 仓库的六千余个代码块可以完整放入宿主存储预算。
+//! int4 快照使用一个 f32 缩放因子加四位有符号分量，把两个维度装入一个字节；容量不足时
+//! 按实际 JSON 字节预算截断并如实报告。sqlite-vec 数据库与完整嵌入空间绑定，模型、端点或
+//! 维度变化时清空旧向量；首次切换时会迁移兼容的旧 JSON 快照，避免重新调用付费嵌入接口。
 //!
-//! 因此本模块**持久化量化后的向量**：重启后直接加载，不必重新嵌入。这对 API provider
-//! 是实打实的省钱与省时间。容量不足时按实际 JSON 字节预算截断并如实报告；被截断的
-//! 部分下次会重新嵌入，结果仍然正确。
-//!
-//! 真正解除容量上限仍要靠 blob 存储（见 `adr-storage.md` 的 V2），届时换掉序列化层即可，
-//! 检索逻辑不受影响。
+//! 两种后端都在启动时按 chunk 内容哈希丢弃过期记录，只为新增或变化的代码块生成向量。
+//! sqlite-vec 写入或查询失败时保留内存副本并降级，WASM 与原生入口共享同一检索接口。
 //!
 //! # 为什么是线性扫描而不是 ANN
 //!
-//! HNSW 这类近似索引的收益出现在十万级向量以上。代码仓库的 chunk 数量通常在数千到数万，
-//! 此时线性扫描的常数因子更小，且**结果精确、行为确定**——确定性对检索质量的可回归性
-//! 很重要，近似索引会让同一查询在索引重建后给出不同结果。真正需要 ANN 时再换，
-//! 届时本模块的对外接口不变。
+//! HNSW 这类近似索引的收益出现在更大规模。代码仓库的 chunk 数量通常在数千到数万，
+//! 当前内存后端使用线性精确扫描，sqlite-vec 后端使用 `vec0` 精确 KNN；两者都保持结果
+//! 可回归。真正需要 ANN 时再替换存储层，对外检索接口无需变化。
 
 #[cfg(test)]
 mod tests;
 
 use crate::model::EmbeddingSpace;
+#[cfg(feature = "sqlite-vector-store")]
+use crate::sqlite_vector::{SqliteVectorStore, VectorWrite};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "sqlite-vector-store")]
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+#[cfg(feature = "sqlite-vector-store")]
+use std::path::Path;
 
 /// 语义快照允许占用的最大 JSON 字节数。
 ///
@@ -101,12 +102,36 @@ struct SemanticEntry {
 ///
 /// 与结构索引分离：嵌入空间变化时只需重建本索引，结构与词法索引保持有效。
 /// 这正是 [`EmbeddingSpace`] 参与兼容性判断的意义所在。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SemanticIndex {
     /// 当前向量所属的嵌入空间；为空表示索引未建立。
     space: Option<EmbeddingSpace>,
     /// 全部向量记录。
     entries: Vec<SemanticEntry>,
+    /// 原生搜索入口使用的 sqlite-vec 后端；WASM 插件构建不包含该字段。
+    #[cfg(feature = "sqlite-vector-store")]
+    sqlite: Option<SqliteVectorStore>,
+    /// 最近一次 sqlite-vec 错误；调用方读取后清空并决定是否降级。
+    #[cfg(feature = "sqlite-vector-store")]
+    backend_error: RefCell<Option<String>>,
+    /// sqlite-vec 是否仍可用于本轮运行；失败后固定退回内存检索与 JSON 快照。
+    #[cfg(feature = "sqlite-vector-store")]
+    sqlite_healthy: Cell<bool>,
+}
+
+impl Default for SemanticIndex {
+    fn default() -> Self {
+        Self {
+            space: None,
+            entries: Vec::new(),
+            #[cfg(feature = "sqlite-vector-store")]
+            sqlite: None,
+            #[cfg(feature = "sqlite-vector-store")]
+            backend_error: RefCell::new(None),
+            #[cfg(feature = "sqlite-vector-store")]
+            sqlite_healthy: Cell::new(true),
+        }
+    }
 }
 
 impl SemanticIndex {
@@ -120,7 +145,61 @@ impl SemanticIndex {
         Self {
             space: Some(space),
             entries: Vec::new(),
+            #[cfg(feature = "sqlite-vector-store")]
+            sqlite: None,
+            #[cfg(feature = "sqlite-vector-store")]
+            backend_error: RefCell::new(None),
+            #[cfg(feature = "sqlite-vector-store")]
+            sqlite_healthy: Cell::new(true),
         }
+    }
+
+    /// 使用本地 sqlite-vec 数据库创建语义索引，并恢复已持久化向量。
+    ///
+    /// 仅原生 `sqlite-vector-store` feature 可用。数据库与完整嵌入空间绑定；空间变化时
+    /// sqlite-vec 会安全清空旧记录。
+    ///
+    /// # Errors
+    ///
+    /// 数据库文件无法创建、扩展初始化失败或已有记录损坏时返回错误。
+    #[cfg(feature = "sqlite-vector-store")]
+    pub fn with_sqlite(space: EmbeddingSpace, path: impl AsRef<Path>) -> Result<Self, String> {
+        let (sqlite, records) = SqliteVectorStore::open(path, &space.id(), space.dimension)?;
+        let entries = records
+            .into_iter()
+            .map(|record| SemanticEntry {
+                chunk_id: record.chunk_id,
+                file_path: record.file_path,
+                content_hash: record.content_hash,
+                vector: record.vector,
+            })
+            .collect();
+        Ok(Self {
+            space: Some(space),
+            entries,
+            sqlite: Some(sqlite),
+            backend_error: RefCell::new(None),
+            sqlite_healthy: Cell::new(true),
+        })
+    }
+
+    /// 返回 sqlite-vec 数据库路径；内存索引返回 `None`。
+    #[cfg(feature = "sqlite-vector-store")]
+    pub fn sqlite_path(&self) -> Option<&Path> {
+        self.sqlite.as_ref().map(SqliteVectorStore::path)
+    }
+
+    /// 取出最近一次 sqlite-vec 错误。
+    #[cfg(feature = "sqlite-vector-store")]
+    pub fn take_backend_error(&self) -> Option<String> {
+        self.backend_error.borrow_mut().take()
+    }
+
+    /// 标记 sqlite-vec 在本轮运行中不可再用，并保存首个待上报错误。
+    #[cfg(feature = "sqlite-vector-store")]
+    fn disable_sqlite(&self, error: String) {
+        self.sqlite_healthy.set(false);
+        *self.backend_error.borrow_mut() = Some(error);
     }
 
     /// 返回当前嵌入空间。
@@ -158,6 +237,16 @@ impl SemanticIndex {
 
     /// 清空索引并切换到新的嵌入空间。
     pub fn reset(&mut self, space: EmbeddingSpace) {
+        #[cfg(feature = "sqlite-vector-store")]
+        if self.sqlite_healthy.get() {
+            let error = self
+                .sqlite
+                .as_mut()
+                .and_then(|sqlite| sqlite.reset(&space.id(), space.dimension).err());
+            if let Some(error) = error {
+                self.disable_sqlite(error);
+            }
+        }
         self.space = Some(space);
         self.entries.clear();
     }
@@ -174,25 +263,64 @@ impl SemanticIndex {
         content_hash: Option<&str>,
         vector: &[f32],
     ) {
-        let Some(normalized) = normalize(vector) else {
-            return;
-        };
-        match self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.chunk_id == chunk_id)
-        {
-            Some(existing) => {
-                existing.file_path = file_path.to_string();
-                existing.content_hash = content_hash.map(str::to_string);
-                existing.vector = normalized;
+        self.upsert_batch(&[(chunk_id, file_path, content_hash, vector)]);
+    }
+
+    /// 批量写入向量，并在 sqlite-vec 模式下用单个事务持久化整批数据。
+    ///
+    /// 无效零向量或包含非有限数的向量会被跳过；sqlite-vec 写入失败时内存索引仍保留本轮
+    /// 可用结果，并通过 [`Self::take_backend_error`] 把错误交给上层报告。
+    pub fn upsert_batch(&mut self, records: &[(&str, &str, Option<&str>, &[f32])]) {
+        let normalized: Vec<(String, String, Option<String>, Vec<f32>)> = records
+            .iter()
+            .filter_map(|(chunk_id, file_path, content_hash, vector)| {
+                normalize(vector).map(|vector| {
+                    (
+                        (*chunk_id).to_string(),
+                        (*file_path).to_string(),
+                        content_hash.map(str::to_string),
+                        vector,
+                    )
+                })
+            })
+            .collect();
+        for (chunk_id, file_path, content_hash, vector) in &normalized {
+            match self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.chunk_id == *chunk_id)
+            {
+                Some(existing) => {
+                    existing.file_path.clone_from(file_path);
+                    existing.content_hash.clone_from(content_hash);
+                    existing.vector.clone_from(vector);
+                }
+                None => self.entries.push(SemanticEntry {
+                    chunk_id: chunk_id.clone(),
+                    file_path: file_path.clone(),
+                    content_hash: content_hash.clone(),
+                    vector: vector.clone(),
+                }),
             }
-            None => self.entries.push(SemanticEntry {
-                chunk_id: chunk_id.to_string(),
-                file_path: file_path.to_string(),
-                content_hash: content_hash.map(str::to_string),
-                vector: normalized,
-            }),
+        }
+        #[cfg(feature = "sqlite-vector-store")]
+        if self.sqlite_healthy.get() {
+            let writes: Vec<VectorWrite<'_>> = normalized
+                .iter()
+                .map(|(chunk_id, file_path, content_hash, vector)| VectorWrite {
+                    chunk_id,
+                    file_path,
+                    content_hash: content_hash.as_deref(),
+                    vector,
+                })
+                .collect();
+            let error = self
+                .sqlite
+                .as_mut()
+                .and_then(|sqlite| sqlite.upsert_batch(&writes).err());
+            if let Some(error) = error {
+                self.disable_sqlite(error);
+            }
         }
     }
 
@@ -213,17 +341,55 @@ impl SemanticIndex {
     pub fn retain_current(&mut self, chunks: &[(&str, &str)]) -> usize {
         let current: HashMap<&str, &str> = chunks.iter().copied().collect();
         let before = self.entries.len();
+        #[cfg(feature = "sqlite-vector-store")]
+        let removed_ids: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                current
+                    .get(entry.chunk_id.as_str())
+                    .is_none_or(|hash| entry.content_hash.as_deref() != Some(*hash))
+            })
+            .map(|entry| entry.chunk_id.clone())
+            .collect();
         self.entries.retain(|entry| {
             current
                 .get(entry.chunk_id.as_str())
                 .is_some_and(|hash| entry.content_hash.as_deref() == Some(*hash))
         });
+        #[cfg(feature = "sqlite-vector-store")]
+        if self.sqlite_healthy.get() {
+            let error = self
+                .sqlite
+                .as_mut()
+                .and_then(|sqlite| sqlite.delete_ids(&removed_ids).err());
+            if let Some(error) = error {
+                self.disable_sqlite(error);
+            }
+        }
         before - self.entries.len()
     }
 
     /// 移除一个文件的全部向量，供增量重建使用。
     pub fn remove_file(&mut self, file_path: &str) {
+        #[cfg(feature = "sqlite-vector-store")]
+        let removed_ids: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.file_path == file_path)
+            .map(|entry| entry.chunk_id.clone())
+            .collect();
         self.entries.retain(|entry| entry.file_path != file_path);
+        #[cfg(feature = "sqlite-vector-store")]
+        if self.sqlite_healthy.get() {
+            let error = self
+                .sqlite
+                .as_mut()
+                .and_then(|sqlite| sqlite.delete_ids(&removed_ids).err());
+            if let Some(error) = error {
+                self.disable_sqlite(error);
+            }
+        }
     }
 
     /// 执行一次语义检索，返回按相似度降序的 `(chunk_id, 相似度)`。
@@ -235,7 +401,7 @@ impl SemanticIndex {
         query_vector: &[f32],
         path_scope: Option<&str>,
         limit: usize,
-    ) -> Vec<(&str, f32)> {
+    ) -> Vec<(String, f32)> {
         if limit == 0 || self.entries.is_empty() {
             return Vec::new();
         }
@@ -250,18 +416,28 @@ impl SemanticIndex {
             return Vec::new();
         }
 
-        let mut scored: Vec<(&str, f32)> = self
+        #[cfg(feature = "sqlite-vector-store")]
+        if self.sqlite_healthy.get() {
+            if let Some(sqlite) = self.sqlite.as_ref() {
+                match sqlite.search(&query, path_scope, limit, self.entries.len()) {
+                    Ok(matches) => return matches,
+                    Err(error) => self.disable_sqlite(error),
+                }
+            }
+        }
+
+        let mut scored: Vec<(String, f32)> = self
             .entries
             .iter()
             .filter(|entry| path_scope.is_none_or(|scope| entry.file_path.starts_with(scope)))
-            .map(|entry| (entry.chunk_id.as_str(), dot(&query, &entry.vector)))
+            .map(|entry| (entry.chunk_id.clone(), dot(&query, &entry.vector)))
             .collect();
         scored.sort_by(|left, right| {
             right
                 .1
                 .partial_cmp(&left.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.0.cmp(right.0))
+                .then_with(|| left.0.cmp(&right.0))
         });
         scored.truncate(limit);
         scored
@@ -275,6 +451,10 @@ impl SemanticIndex {
     /// 序列化体积超过 [`MAX_SEMANTIC_SNAPSHOT_BYTES`] 时截断并置位 `truncated`，
     /// 而不是放弃整份快照：存下大部分依然能省掉大部分嵌入调用。
     pub fn snapshot(&self) -> Option<SemanticSnapshot> {
+        #[cfg(feature = "sqlite-vector-store")]
+        if self.sqlite.is_some() && self.sqlite_healthy.get() {
+            return None;
+        }
         self.snapshot_with_budget(MAX_SEMANTIC_SNAPSHOT_BYTES)
     }
 
@@ -322,6 +502,7 @@ impl SemanticIndex {
             return false;
         }
         self.reset(space.clone());
+        let mut restored = Vec::new();
         for record in &snapshot.records {
             let Some(bytes) = base64_decode(&record.vector) else {
                 continue;
@@ -338,13 +519,25 @@ impl SemanticIndex {
                 SemanticQuantization::Int8 => dequantize_int8(&bytes, record.scale),
                 SemanticQuantization::Int4 => dequantize_int4(&bytes, record.scale, dimension),
             };
-            self.upsert(
-                &record.chunk_id,
-                &record.file_path,
-                record.content_hash.as_deref(),
-                &vector,
-            );
+            restored.push((
+                record.chunk_id.clone(),
+                record.file_path.clone(),
+                record.content_hash.clone(),
+                vector,
+            ));
         }
+        let records: Vec<(&str, &str, Option<&str>, &[f32])> = restored
+            .iter()
+            .map(|(chunk_id, file_path, content_hash, vector)| {
+                (
+                    chunk_id.as_str(),
+                    file_path.as_str(),
+                    content_hash.as_deref(),
+                    vector.as_slice(),
+                )
+            })
+            .collect();
+        self.upsert_batch(&records);
         !self.entries.is_empty()
     }
 }

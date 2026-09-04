@@ -1,7 +1,8 @@
 # Code Context Engine Plugin
 
 Code Context Engine 是标准 Lucia WASM 插件，目标是为 Agent 提供稳定的 `code_search` 仓库检索工具。
-当前已实现仓库扫描、结构化解析、增量索引、符号与 BM25 检索、RRF 融合、可选模型重排和上下文打包。
+当前已实现仓库扫描、结构化解析、增量索引、符号与 BM25 检索、sqlite-vec 语义检索、
+RRF 融合、可选模型重排和上下文打包。
 
 ## 当前状态
 
@@ -23,6 +24,8 @@ Guest 负责配置校验、仓库身份、索引状态、manifest 兼容性、�
 - `src/model.rs`：仓库身份、`IndexStatus`、`IndexManifest` 与稳定领域类型
 - `src/storage.rs`：Host `store` 的 Workspace 作用域适配
 - `src/embedding.rs`：嵌入 provider、批量请求与降级处理
+- `src/semantic.rs`：语义索引、WASM int4 快照与原生存储适配
+- `src/sqlite_vector.rs`：仅原生入口启用的 sqlite-vec 数据库与余弦 KNN
 - `src/rerank.rs`：扩大候选召回、源码组装、远端模型重排与失败降级
 - `src/repository/`：全仓库扫描、忽略规则和语言识别
 - `src/parser/`：Rust、TypeScript、JavaScript、Python 与 Go 结构化解析
@@ -33,7 +36,8 @@ Guest 负责配置校验、仓库身份、索引状态、manifest 兼容性、�
 ## Capabilities
 
 - `workspace_read`：Host 注入当前项目可信根；首次检索时递归扫描并建立索引。
-- `storage`：保存 manifest、文件哈希表和 int4 语义快照，由 Host 按插件和 Workspace 作用域隔离。
+- `storage`：WASM Guest 保存 manifest、文件哈希表和 int4 语义快照，由 Host 按插件和
+  Workspace 作用域隔离。
 
 插件仅在 API 嵌入模式下申请受限 HTTP 网络能力，不申请 secret、子进程、会话、文件写入或
 本地推理能力。
@@ -60,10 +64,16 @@ export SILICONFLOW_API_KEY='<你的密钥>'
 cargo run -p code-context-plugin --example search_repository --features test-support
 ```
 
-命令先完成全仓库索引，再显示 `搜索>` 提示符。语义向量以 int4 快照保存到
-`~/.lucia/code-context/`，同一仓库第二次运行会复用未变化代码块，只重新计算新增或内容变化的
-代码块。可以连续输入自然语言或代码标识符，输入 `exit`、`quit` 或 `:q` 结束；也可以在命令
-末尾直接提供一条查询，以单次搜索模式运行。
+命令先完成全仓库索引，再显示 `搜索>` 提示符。它是独立运行的原生入口，不把 SQLite 文件能力
+授予 WASM Guest。每个仓库在 `~/.lucia/code-context/` 下生成两个由规范化仓库路径摘要隔离的文件：
+
+- `<仓库哈希>.json`：manifest、文件哈希等小型元数据；
+- `<仓库哈希>.sqlite3`：sqlite-vec f32 向量与代码块定位元数据。
+
+同一仓库第二次运行会直接打开 SQLite，只重新计算新增或内容变化的代码块。若目录中已有旧版
+JSON int4 向量，首次运行会自动迁移到 SQLite 并删除 JSON 中的重复向量，不会重新调用嵌入接口。
+可以连续输入自然语言或代码标识符，输入 `exit`、`quit` 或 `:q` 结束；也可以在命令末尾直接
+提供一条查询，以单次搜索模式运行。
 
 限定搜索目录并控制结果数：
 
@@ -74,7 +84,8 @@ cargo run -p code-context-plugin --example search_repository --features test-sup
 
 命令会读取当前 Lucia 仓库中所有受支持的源码、文档和配置文件，完成索引后输出文件路径、
 行号、符号名称和代码片段。使用 `--root <路径>` 可以搜索其他仓库；`--cache-dir <目录>`
-可覆盖默认缓存位置，`--rebuild-cache` 强制重新生成全部向量，`--no-cache` 禁用跨进程缓存。
+可覆盖默认缓存位置，`--rebuild-cache` 会删除当前仓库的 JSON 元数据、SQLite 主文件及
+WAL/SHM 辅助文件后重新生成全部向量，`--no-cache` 禁用跨进程缓存。
 使用
 `--embedding-base-url`、`--embedding-api-key-env`、`--embedding-model`、
 `--embedding-dimension` 和 `--embedding-batch-size` 可以连接其他兼容端点；`--rerank-model`
@@ -96,6 +107,7 @@ cargo run -p code-context-plugin --example search_repository --features test-sup
 ```bash
 cargo test --offline -p code-context-plugin
 cargo test --offline -p code-context-plugin --example search_repository --features test-support
+cargo test --offline -p code-context-plugin --features test-support sqlite_vector
 bun run build:plugin:code-context
 cargo test --offline -p code-context-plugin-smoke-tests
 ```

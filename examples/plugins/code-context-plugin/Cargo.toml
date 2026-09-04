@@ -16,6 +16,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 wit-bindgen = "0.59"
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+sqlite-vec = { version = "0.1.9", optional = true }
 
 # 结构化解析一律使用现成的纯 Rust 解析器，不自建语法分析。
 # 选型理由与 tree-sitter 的对比见 docs/code-context-engine/adr-structural-parsing.md：
@@ -32,7 +34,8 @@ rustpython-parser = "0.4"
 gosyn = "0.2"
 
 [features]
-test-support = []
+test-support = ["sqlite-vector-store"]
+sqlite-vector-store = ["dep:rusqlite", "dep:sqlite-vec"]
 
 [[example]]
 name = "search_repository"
