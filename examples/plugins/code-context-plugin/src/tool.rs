@@ -208,7 +208,10 @@ pub fn search_result(
             let mut item = json!({
                 "file": entry.file_path,
                 "lines": [entry.start_line, entry.end_line],
+                "retrieval_lines": [entry.retrieval_start_line, entry.retrieval_end_line],
+                "hydrated_lines": [entry.hydrated_start_line, entry.hydrated_end_line],
                 "language": entry.language,
+                "role": entry.role.as_str(),
                 "snippet": entry.snippet,
             });
             if let Some(ref name) = entry.symbol_name {
@@ -254,6 +257,7 @@ pub fn search_result(
             "dropped_by_budget": bundle.stats.dropped_by_budget,
             "dropped_stale": bundle.stats.dropped_stale,
             "relocated": bundle.stats.relocated,
+            "hydrated": bundle.stats.hydrated,
             "files_read": bundle.stats.files_read,
             "estimated_tokens": bundle.stats.estimated_tokens,
         },

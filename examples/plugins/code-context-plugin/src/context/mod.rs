@@ -21,10 +21,10 @@
 mod tests;
 
 use crate::index::StructuralIndex;
-use crate::model::{CodeChunk, SymbolKind};
+use crate::model::{CodeChunk, Symbol, SymbolKind};
 use crate::parser::parse_file;
 use crate::repository::content_hash;
-use crate::retrieval::{tokenize_is_cjk, FusionDebug, SearchResult};
+use crate::retrieval::{tokenize_is_cjk, ChunkRole, FusionDebug, SearchResult};
 use agent_plugin::PluginHostApi;
 use std::collections::BTreeMap;
 
@@ -58,7 +58,7 @@ impl Default for ContextConfig {
             max_results: 20,
             max_per_file: 4,
             merge_gap_lines: 0,
-            max_snippet_lines: 120,
+            max_snippet_lines: 240,
         }
     }
 }
@@ -68,10 +68,18 @@ impl Default for ContextConfig {
 pub struct ContextEntry {
     /// 仓库相对路径。
     pub file_path: String,
-    /// 起始行，从 1 开始。
+    /// 实际返回正文的起始行，从 1 开始。
     pub start_line: u32,
-    /// 结束行，闭区间。
+    /// 实际返回正文的结束行，闭区间。
     pub end_line: u32,
+    /// 检索阶段命中代码块的起始行。
+    pub retrieval_start_line: u32,
+    /// 检索阶段命中代码块的结束行。
+    pub retrieval_end_line: u32,
+    /// 结构解析得到的完整正文目标起始行。
+    pub hydrated_start_line: u32,
+    /// 结构解析得到的完整正文目标结束行；即使正文被截断也保留完整目标范围。
+    pub hydrated_end_line: u32,
     /// 语言标识。
     pub language: String,
     /// 符号短名。
@@ -84,6 +92,8 @@ pub struct ContextEntry {
     pub signature: Option<String>,
     /// 文档注释。
     pub doc_comment: Option<String>,
+    /// 该结果在代码结构中的角色。
+    pub role: ChunkRole,
     /// 代码片段正文。
     pub snippet: String,
     /// 片段是否因超过行数上限被截断。
@@ -117,6 +127,8 @@ pub struct ContextStats {
     pub dropped_stale: u32,
     /// 因文件被外部修改而重新定位的条目数。
     pub relocated: u32,
+    /// 从检索代码块扩展到完整符号范围的条目数。
+    pub hydrated: u32,
     /// 实际读取的文件数。
     pub files_read: u32,
     /// 估算的总 token 数。
@@ -168,7 +180,7 @@ pub fn build(
         ..ContextStats::default()
     };
 
-    let selected = select(results, config, &mut stats);
+    let selected = select(index, results, config, &mut stats);
     if config.max_results == 0 || config.max_snippet_lines == 0 {
         return ContextBundle {
             entries: Vec::new(),
@@ -208,12 +220,17 @@ pub fn build(
             file_path: item.file_path,
             start_line: resolved.start_line,
             end_line: resolved.end_line,
+            retrieval_start_line: resolved.retrieval_start_line,
+            retrieval_end_line: resolved.retrieval_end_line,
+            hydrated_start_line: resolved.hydrated_start_line,
+            hydrated_end_line: resolved.hydrated_end_line,
             language: resolved.language,
             symbol_name: resolved.symbol_name,
             qualified_symbol: resolved.qualified_symbol,
             symbol_kind: resolved.symbol_kind,
             signature: resolved.signature,
             doc_comment: resolved.doc_comment,
+            role: item.role,
             snippet: resolved.snippet,
             truncated: resolved.truncated,
             relocated: resolved.relocated,
@@ -240,6 +257,10 @@ struct Selected {
     start_line: u32,
     /// 结束行。
     end_line: u32,
+    /// 检索阶段命中代码块的起始行。
+    retrieval_start_line: u32,
+    /// 检索阶段命中代码块的结束行。
+    retrieval_end_line: u32,
     /// 语言标识。
     language: String,
     /// 符号短名。
@@ -252,10 +273,52 @@ struct Selected {
     signature: Option<String>,
     /// 文档注释。
     doc_comment: Option<String>,
+    /// 代码结构角色。
+    role: ChunkRole,
     /// 融合分数。
     score: f32,
     /// 内部诊断。
     debug: FusionDebug,
+}
+
+/// 根据候选的结构元数据解析完整符号范围。
+///
+/// 只有原检索范围完整落在符号范围内时才扩展，避免用陈旧或人工合并的异常区间覆盖正确定位。
+/// 限定名优先；缺少限定名时仅接受文件内唯一的同名、同种类符号。
+fn hydration_range(index: &StructuralIndex, result: &SearchResult) -> Option<(u32, u32)> {
+    let symbol = matching_symbol(
+        index.symbols_of(&result.file_path),
+        result.qualified_symbol.as_deref(),
+        result.symbol_name.as_deref(),
+        result.symbol_kind,
+    )?;
+    (symbol.start_line <= result.start_line && symbol.end_line >= result.end_line)
+        .then_some((symbol.start_line, symbol.end_line))
+}
+
+/// 在一个文件的符号表中解析候选主符号。
+fn matching_symbol<'a>(
+    symbols: &'a [Symbol],
+    qualified_symbol: Option<&str>,
+    symbol_name: Option<&str>,
+    symbol_kind: Option<SymbolKind>,
+) -> Option<&'a Symbol> {
+    if let Some(qualified) = qualified_symbol {
+        let mut matches = symbols
+            .iter()
+            .filter(|symbol| symbol.qualified_name == qualified);
+        let first = matches.next()?;
+        return matches
+            .find(|symbol| symbol_kind.is_some_and(|kind| symbol.kind == kind))
+            .or(Some(first));
+    }
+
+    let name = symbol_name?;
+    let mut matches = symbols
+        .iter()
+        .filter(|symbol| symbol.name == name && symbol_kind.is_none_or(|kind| symbol.kind == kind));
+    let only = matches.next()?;
+    matches.next().is_none().then_some(only)
 }
 
 /// 执行去重、父子抑制与区间合并。
@@ -263,6 +326,7 @@ struct Selected {
 /// 数量与多样性约束必须等条目成功回读后再施加：前排候选可能已失效或超出 token 预算，
 /// 提前截断会让后面的有效候选无法补位。
 fn select(
+    index: &StructuralIndex,
     results: Vec<SearchResult>,
     config: &ContextConfig,
     stats: &mut ContextStats,
@@ -271,17 +335,24 @@ fn select(
 
     // 输入已按分数降序；逐条尝试并入已保留集合，因此保留的总是更高分的那一条。
     for result in results {
+        let retrieval_start_line = result.start_line;
+        let retrieval_end_line = result.end_line;
+        let (start_line, end_line) =
+            hydration_range(index, &result).unwrap_or((retrieval_start_line, retrieval_end_line));
         let candidate = Selected {
             chunk_id: result.chunk_id,
             file_path: result.file_path,
-            start_line: result.start_line,
-            end_line: result.end_line,
+            start_line,
+            end_line,
+            retrieval_start_line,
+            retrieval_end_line,
             language: result.language,
             symbol_name: result.symbol_name,
             qualified_symbol: result.qualified_symbol,
             symbol_kind: result.symbol_kind,
             signature: result.signature,
             doc_comment: result.doc_comment,
+            role: result.role,
             score: result.score,
             debug: result.debug,
         };
@@ -308,6 +379,8 @@ fn select(
             {
                 kept[index].start_line = candidate.start_line;
                 kept[index].end_line = candidate.end_line;
+                kept[index].retrieval_start_line = candidate.retrieval_start_line;
+                kept[index].retrieval_end_line = candidate.retrieval_end_line;
                 // 定位元数据一并换成被包含的那条，否则重定位与展示会指向容器符号。
                 kept[index].chunk_id = candidate.chunk_id;
                 kept[index].symbol_name = candidate.symbol_name;
@@ -315,6 +388,7 @@ fn select(
                 kept[index].symbol_kind = candidate.symbol_kind;
                 kept[index].signature = candidate.signature;
                 kept[index].doc_comment = candidate.doc_comment;
+                kept[index].role = candidate.role;
             }
             stats.suppressed_contained += 1;
             continue;
@@ -403,6 +477,14 @@ struct Resolved {
     start_line: u32,
     /// 实际结束行。
     end_line: u32,
+    /// 当前文件中实际命中的检索范围起始行。
+    retrieval_start_line: u32,
+    /// 当前文件中实际命中的检索范围结束行。
+    retrieval_end_line: u32,
+    /// 完整符号正文目标的起始行。
+    hydrated_start_line: u32,
+    /// 完整符号正文目标的结束行。
+    hydrated_end_line: u32,
     /// 是否被行数上限截断。
     truncated: bool,
     /// 是否因文件被外部修改而重新定位。
@@ -431,6 +513,8 @@ struct FileState {
     ///
     /// 只在文件确实变化时构建，未变更的文件不付出任何解析代价。
     relocations: BTreeMap<String, CodeChunk>,
+    /// 文件已变时重新解析得到的当前符号表。
+    symbols: Vec<Symbol>,
 }
 
 /// 已读文件的缓存。
@@ -461,19 +545,25 @@ impl SourceCache {
                     host.read_file(path).ok().map(|content| {
                         let changed = content_hash(&content) != record.content_hash;
                         // 只有确实变化的文件才重新解析，代价被限制在这一个文件上。
-                        let relocations = if changed {
-                            parse_file(index.repository(), path, record.language, &content)
-                                .chunks
-                                .into_iter()
-                                .map(|chunk| (chunk.id.clone(), chunk))
-                                .collect()
+                        let (relocations, symbols) = if changed {
+                            let parsed =
+                                parse_file(index.repository(), path, record.language, &content);
+                            (
+                                parsed
+                                    .chunks
+                                    .into_iter()
+                                    .map(|chunk| (chunk.id.clone(), chunk))
+                                    .collect(),
+                                parsed.symbols,
+                            )
                         } else {
-                            BTreeMap::new()
+                            (BTreeMap::new(), Vec::new())
                         };
                         FileState {
                             content,
                             changed,
                             relocations,
+                            symbols,
                         }
                     })
                 }
@@ -483,6 +573,32 @@ impl SourceCache {
         }
         self.files.get(path).and_then(Option::as_ref)
     }
+}
+
+/// 在重解析后的代码块中定位原候选，用限定名与唯一短名兜底稳定 ID 变化。
+fn matching_chunk<'a>(state: &'a FileState, item: &Selected) -> Option<&'a CodeChunk> {
+    if let Some(chunk) = state.relocations.get(&item.chunk_id) {
+        return Some(chunk);
+    }
+    if let Some(qualified) = item.qualified_symbol.as_deref() {
+        if let Some(chunk) = state.relocations.values().find(|chunk| {
+            chunk.qualified_symbol.as_deref() == Some(qualified)
+                && item
+                    .symbol_kind
+                    .is_none_or(|kind| chunk.symbol_kind == Some(kind))
+        }) {
+            return Some(chunk);
+        }
+    }
+    let name = item.symbol_name.as_deref()?;
+    let mut matches = state.relocations.values().filter(|chunk| {
+        chunk.symbol_name.as_deref() == Some(name)
+            && item
+                .symbol_kind
+                .is_none_or(|kind| chunk.symbol_kind == Some(kind))
+    });
+    let only = matches.next()?;
+    matches.next().is_none().then_some(only)
 }
 
 /// 回读正文并做一致性校验。
@@ -501,27 +617,78 @@ fn resolve(
     let state = sources.state(host, index, &item.file_path)?;
     let lines: Vec<&str> = state.content.lines().collect();
 
-    let (start, end, relocated_chunk) = if state.changed {
+    let (
+        retrieval_start_line,
+        retrieval_end_line,
+        hydrated_start_line,
+        hydrated_end_line,
+        relocated_chunk,
+    ) = if state.changed {
         // 合并过的区间只保留主符号的新位置：合并边界是多条结果的并集，文件变化后无从
         // 还原，退回单符号定位是可解释的降级。
-        let chunk = state.relocations.get(&item.chunk_id)?;
-        (chunk.start_line, chunk.end_line, Some(chunk))
+        let chunk = matching_chunk(state, item);
+        let has_symbol = item.qualified_symbol.is_some() || item.symbol_name.is_some();
+        if has_symbol {
+            let symbol = matching_symbol(
+                &state.symbols,
+                item.qualified_symbol.as_deref(),
+                item.symbol_name.as_deref(),
+                item.symbol_kind,
+            )?;
+            let retrieval = chunk
+                .map(|chunk| (chunk.start_line, chunk.end_line))
+                .unwrap_or((symbol.start_line, symbol.end_line));
+            (
+                retrieval.0,
+                retrieval.1,
+                symbol.start_line,
+                symbol.end_line,
+                chunk,
+            )
+        } else {
+            let chunk = chunk?;
+            (
+                chunk.start_line,
+                chunk.end_line,
+                chunk.start_line,
+                chunk.end_line,
+                Some(chunk),
+            )
+        }
     } else {
-        (item.start_line, item.end_line, None)
+        (
+            item.retrieval_start_line,
+            item.retrieval_end_line,
+            item.start_line,
+            item.end_line,
+            None,
+        )
     };
-    let relocated = relocated_chunk.is_some();
+    let relocated = state.changed;
     if relocated {
         stats.relocated += 1;
     }
+    if (retrieval_start_line, retrieval_end_line) != (hydrated_start_line, hydrated_end_line) {
+        stats.hydrated += 1;
+    }
 
-    let (snippet, actual_end, truncated) = take_lines(&lines, start, end, config.max_snippet_lines);
+    let (snippet, actual_end, truncated) = take_lines(
+        &lines,
+        hydrated_start_line,
+        hydrated_end_line,
+        config.max_snippet_lines,
+    );
     if snippet.trim().is_empty() {
         return None;
     }
     Some(Resolved {
         snippet,
-        start_line: start,
+        start_line: hydrated_start_line,
         end_line: actual_end,
+        retrieval_start_line,
+        retrieval_end_line,
+        hydrated_start_line,
+        hydrated_end_line,
         truncated,
         relocated,
         language: relocated_chunk

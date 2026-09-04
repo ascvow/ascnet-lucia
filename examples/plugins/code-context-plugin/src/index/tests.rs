@@ -89,6 +89,8 @@ fn chunks_are_retrievable_by_id_and_path() {
         assert_eq!(chunk.file_path, "src/a.rs");
     }
     assert_eq!(index.chunks_of("src/a.rs").len(), record.chunk_ids.len());
+    assert!(!index.symbols_of("src/a.rs").is_empty());
+    assert!(index.symbols_of("src/missing.rs").is_empty());
 }
 
 /// 重复索引同一文件必须幂等，不得留下孤儿 chunk。

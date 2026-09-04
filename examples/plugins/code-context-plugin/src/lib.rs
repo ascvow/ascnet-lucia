@@ -1895,6 +1895,15 @@ mod tests {
         let first = &results[0];
         assert!(first["file"].is_string(), "结果应包含文件路径");
         assert!(first["lines"].is_array(), "结果应包含行区间");
+        assert!(
+            first["retrieval_lines"].is_array(),
+            "结果应包含原始检索区间"
+        );
+        assert!(
+            first["hydrated_lines"].is_array(),
+            "结果应包含完整正文目标区间"
+        );
+        assert!(first["role"].is_string(), "结果应包含代码角色");
         assert!(first["snippet"].is_string(), "结果应包含代码片段");
 
         let details = result.details.expect("应带构建统计");

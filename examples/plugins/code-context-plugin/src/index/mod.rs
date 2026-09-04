@@ -409,6 +409,13 @@ impl StructuralIndex {
         self.symbols.values().flatten()
     }
 
+    /// 取一个文件产出的全部符号，按文件内出现顺序。
+    ///
+    /// 路径不存在或该文件使用文本兜底解析时返回空切片。
+    pub fn symbols_of(&self, path: &str) -> &[Symbol] {
+        self.symbols.get(path).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// 清空索引，保留仓库身份。
     pub fn clear(&mut self) {
         self.files.clear();

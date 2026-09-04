@@ -160,7 +160,12 @@ fn adjacent_ranges_are_merged() {
     second.score = 1.0;
 
     let mut stats = ContextStats::default();
-    let selected = select(vec![first, second], &ContextConfig::default(), &mut stats);
+    let selected = select(
+        &index,
+        vec![first, second],
+        &ContextConfig::default(),
+        &mut stats,
+    );
 
     assert_eq!(selected.len(), 1, "相邻区间应合并为一段");
     assert_eq!(selected[0].start_line, 6);
@@ -178,7 +183,12 @@ fn distant_ranges_are_not_merged() {
     let second = synthetic(chunk, 40, 45);
 
     let mut stats = ContextStats::default();
-    let selected = select(vec![first, second], &ContextConfig::default(), &mut stats);
+    let selected = select(
+        &index,
+        vec![first, second],
+        &ContextConfig::default(),
+        &mut stats,
+    );
 
     assert_eq!(selected.len(), 2);
     assert_eq!(stats.merged, 0);
@@ -197,7 +207,12 @@ fn containment_keeps_the_higher_scoring_entry() {
     child.score = 1.0;
 
     let mut stats = ContextStats::default();
-    let selected = select(vec![parent, child], &ContextConfig::default(), &mut stats);
+    let selected = select(
+        &index,
+        vec![parent, child],
+        &ContextConfig::default(),
+        &mut stats,
+    );
 
     assert_eq!(selected.len(), 1);
     assert_eq!(
@@ -379,6 +394,14 @@ fn oversized_snippet_is_truncated_and_marked() {
     assert!(entry.truncated, "超长片段必须标记截断");
     assert!(entry.snippet.contains("片段已截断"), "必须明确标注");
     assert!(entry.snippet.lines().count() <= 21, "行数应受上限约束");
+    assert_eq!(
+        (entry.retrieval_start_line, entry.retrieval_end_line),
+        (entry.hydrated_start_line, entry.hydrated_end_line)
+    );
+    assert!(
+        entry.end_line < entry.hydrated_end_line,
+        "截断后仍必须保留完整目标范围"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +424,38 @@ fn unchanged_file_is_returned_verbatim() {
     assert!(!entry.relocated);
     assert_eq!(bundle.stats.relocated, 0);
     assert!(entry.snippet.contains("pub fn check"), "{}", entry.snippet);
+}
+
+/// 检索命中符号内部片段时，最终上下文必须回填完整符号正文并保留原命中范围。
+#[test]
+fn symbol_hit_hydrates_complete_body() {
+    let (host, index, _) = fixture(FIXTURE);
+    let chunk = index
+        .chunks()
+        .find(|chunk| chunk.qualified_symbol.as_deref() == Some("PermissionManager::check"))
+        .expect("固定装置应含 check 方法");
+    let retrieval_start = chunk.start_line + 1;
+    let retrieval_end = chunk.end_line - 1;
+    let result = synthetic(chunk, retrieval_start, retrieval_end);
+
+    let bundle = build(&host, &index, vec![result], &ContextConfig::default());
+    let entry = bundle.entries.first().expect("应返回完整符号");
+
+    assert_eq!(
+        (entry.retrieval_start_line, entry.retrieval_end_line),
+        (retrieval_start, retrieval_end)
+    );
+    assert_eq!(
+        (entry.hydrated_start_line, entry.hydrated_end_line),
+        (chunk.start_line, chunk.end_line)
+    );
+    assert_eq!(
+        (entry.start_line, entry.end_line),
+        (chunk.start_line, chunk.end_line)
+    );
+    assert!(entry.snippet.contains("pub fn check"));
+    assert!(entry.snippet.contains("tool_call_id.is_empty()"));
+    assert_eq!(bundle.stats.hydrated, 1);
 }
 
 /// 文件被外部修改后，符号位置必须被重新定位到正确的行。
@@ -597,6 +652,9 @@ fn entries_carry_location_and_snippet() {
     assert!(entry.start_line > 0);
     assert!(entry.end_line >= entry.start_line);
     assert_eq!(entry.language, "rust");
+    assert_eq!(entry.role, crate::retrieval::ChunkRole::Implementation);
+    assert!(entry.retrieval_start_line > 0);
+    assert!(entry.hydrated_end_line >= entry.hydrated_start_line);
     assert!(!entry.snippet.is_empty());
     assert!(entry.estimated_tokens > 0);
 }
@@ -659,6 +717,7 @@ fn oversized_container_is_narrowed_to_the_contained_child() {
 
     // 容器 200 行远超 20 行上限，子块只有 5 行；容器分数更高，排在前面。
     let selected = select(
+        &index,
         vec![synthetic(container, 1, 200), synthetic(method, 40, 44)],
         &config,
         &mut stats,
@@ -697,6 +756,7 @@ fn container_within_snippet_limit_is_kept_whole() {
         .expect("固定装置必须含 check 方法");
 
     let selected = select(
+        &index,
         vec![synthetic(container, 1, 100), synthetic(method, 40, 44)],
         &config,
         &mut stats,

@@ -1013,6 +1013,21 @@ Implemented:
   Fast/Normal/Hard 路径端到端各 1 项、rerank 9 项与 sqlite-vec 重启语义检索 1 项通过；
   `cargo test -p code-context-plugin --lib` 共 386 项通过，`cargo check -p code-context-plugin`
   通过。
+- **Symbol Resolution 与 Body Hydration**：Context Builder 在父子抑制和预算打包前，按文件内
+  限定名或唯一短名把检索代码块解析为完整符号范围；文件变化时继续用重解析结果定位当前
+  符号。`ContextEntry` 与工具输出同时保留 `retrieval_lines`、`hydrated_lines` 和实际返回
+  `lines`，并携带 `role` 与明确截断标记。单条默认上限从 120 行提高到 240 行，超过上限的
+  大符号仍保留完整目标范围并标记截断。Phase 6 验证：Context 25 项、插件库 387 项通过，
+  真实仓库离线报告 6 项通过、3 项真实 API 报告按设计忽略。
+
+Phase 6 Real Repository Result（2026-09-04）:
+- 8 条业务式查询目标文件进入 Top-10 从 `7/8` 提升到 `8/8`，定义、实现本体与完整实现覆盖
+  均为 `5/8`；`render_native_plugin_dialog` 的正文覆盖从约 `55%` 提升到 `100%`。
+- 检索加上下文打包平均 `145.883 ms`、P50 `149.171 ms`、P95 `184.820 ms`，平均上下文
+  估算 token 为 `4636`，未进入 2 秒级默认路径。
+- `retrieval_benchmark` 仍有 2 条排序断言失败：合成语料的 `embedding_space_id` 查询未同时
+  保留 storage 目标，真实仓库的“增量索引 脏路径”候选在 lexical 原始列表中但被融合挤出
+  Top-20。两项属于 Phase 7 的 fusion/benchmark 问题，不属于正文回填，本阶段不改评测答案。
 
 Scale Result（Lucia 当前仓库）:
 - 原子代码块 6641 个，语义复合块 262 个，其中 970 个原子块由复合块代表。
