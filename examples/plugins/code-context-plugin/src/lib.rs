@@ -95,9 +95,15 @@ const MAX_SEMANTIC_BODY_CHARS: usize = 1_200;
 /// 让整个文件的向量挤成一团。300 字符足以容纳一段说明职责的开头。
 const MAX_FILE_DOC_CHARS: usize = 300;
 
+/// 注入嵌入文本的 import 最大条数。
+const MAX_SEMANTIC_IMPORTS: usize = 16;
+
+/// 注入嵌入文本的 import 总字符上限。
+const MAX_SEMANTIC_IMPORT_CHARS: usize = 600;
+
 /// 构造送去嵌入的文档文本。
 ///
-/// 拼接路径、**文件级文档**、限定名、签名、块级文档注释与**代码正文**。
+/// 拼接路径、**文件级文档**、父符号、限定名、签名、块级文档注释、import 与**代码正文**。
 ///
 /// 正文是最关键的一项：没有它，一个没写文档注释的函数就只剩下路径和签名可供嵌入，向量
 /// 几乎只编码了"它叫什么、在哪个文件"；而没有结构化解析器的语言（Java、Vue、PHP 等）
@@ -116,6 +122,9 @@ fn semantic_document_text(chunk: &CodeChunk, file_doc: Option<&str>, body: Optio
     if let Some(doc) = file_doc.map(str::trim).filter(|doc| !doc.is_empty()) {
         parts.push(truncate_chars(doc, MAX_FILE_DOC_CHARS));
     }
+    if let Some(parent) = chunk.parent_symbol.as_deref() {
+        parts.push(format!("父符号：{parent}"));
+    }
     if let Some(qualified) = chunk.qualified_symbol.as_deref() {
         parts.push(qualified.to_string());
     }
@@ -124,6 +133,19 @@ fn semantic_document_text(chunk: &CodeChunk, file_doc: Option<&str>, body: Optio
     }
     if let Some(doc) = chunk.doc_comment.as_deref() {
         parts.push(doc.to_string());
+    }
+    if !chunk.imports.is_empty() {
+        let imports = chunk
+            .imports
+            .iter()
+            .take(MAX_SEMANTIC_IMPORTS)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        parts.push(format!(
+            "依赖：\n{}",
+            truncate_chars(&imports, MAX_SEMANTIC_IMPORT_CHARS)
+        ));
     }
     if let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) {
         parts.push(truncate_chars(body, MAX_SEMANTIC_BODY_CHARS));
@@ -145,6 +167,14 @@ fn slice_body(content: &str, start_line: u32, end_line: u32) -> Option<String> {
     let start = start_line.saturating_sub(1) as usize;
     let end = (end_line as usize).min(lines.len());
     (start < end).then(|| lines[start..end].join("\n"))
+}
+
+/// 判断一个结构 chunk 是否应拥有独立语义向量。
+///
+/// 语义复合块参与；被复合块覆盖的原子成员不参与；其余普通块保持原有行为。这样符号与
+/// BM25 的精确粒度不变，同时减少过短代码块对嵌入请求和向量候选的占用。
+fn participates_in_semantic_index(chunk: &CodeChunk) -> bool {
+    chunk.semantic_only || chunk.semantic_group_id.is_none()
 }
 
 /// 单次调用最多提交的嵌入批次数。
@@ -1037,8 +1067,13 @@ impl CodeContextPlugin {
             return SemanticBuild::Incomplete;
         }
 
-        let current_chunks: Vec<(&str, &str)> = index
+        let semantic_chunks: Vec<&CodeChunk> = index
             .chunks()
+            .filter(|chunk| participates_in_semantic_index(chunk))
+            .collect();
+        let semantic_total = semantic_chunks.len();
+        let current_chunks: Vec<(&str, &str)> = semantic_chunks
+            .iter()
             .map(|chunk| (chunk.id.as_str(), chunk.content_hash.as_str()))
             .collect();
         context.semantic.retain_current(&current_chunks);
@@ -1053,8 +1088,9 @@ impl CodeContextPlugin {
         // 正文按文件缓存回读：待嵌入的 chunk 通常成片来自同几个文件，逐条读会把宿主调用
         // 次数放大到 chunk 数量级。读取失败的文件退化为只用元数据嵌入，不中断整批。
         let mut sources: BTreeMap<String, Option<String>> = BTreeMap::new();
-        let pending: Vec<(String, String, String, String)> = index
-            .chunks()
+        let pending: Vec<(String, String, String, String)> = semantic_chunks
+            .iter()
+            .copied()
             .filter(|chunk| {
                 !context
                     .semantic
@@ -1132,9 +1168,9 @@ impl CodeContextPlugin {
                 // 有新向量产出说明端点仍在工作，只是没做完；重置停滞计数继续推进。
                 self.semantic_stalled_rounds = 0;
                 self.degraded_reason = Some(format!(
-                    "语义索引仍在建立（已完成 {} / {} 个代码块）：{error}",
+                    "语义索引仍在建立（已完成 {} / {} 个语义块）：{error}",
                     context.semantic.len(),
-                    index.stats().chunks
+                    semantic_total
                 ));
                 SemanticBuild::Incomplete
             }
@@ -1147,9 +1183,9 @@ impl CodeContextPlugin {
                     return SemanticBuild::Unavailable;
                 }
                 self.degraded_reason = Some(format!(
-                    "语义索引仍在建立（已完成 {} / {} 个代码块）：{error}",
+                    "语义索引仍在建立（已完成 {} / {} 个语义块）：{error}",
                     context.semantic.len(),
-                    index.stats().chunks
+                    semantic_total
                 ));
                 SemanticBuild::Incomplete
             }
@@ -1426,6 +1462,8 @@ mod tests {
             signature: Some("pub fn save(&mut self)".into()),
             doc_comment: None,
             is_test: false,
+            semantic_only: false,
+            semantic_group_id: None,
             imports: Vec::new(),
             content_hash: "hash".into(),
         };
@@ -1443,6 +1481,7 @@ mod tests {
             "嵌入文档必须包含正文：{with}"
         );
         assert!(with.contains("src/session.rs") && with.contains("SessionStore::save"));
+        assert!(with.contains("父符号：SessionStore"));
 
         // 文件级文档必须进入嵌入文本：自然语言查询表达的常常是文件职责而非函数细节。
         let with_file_doc =
@@ -1451,6 +1490,39 @@ mod tests {
             with_file_doc.contains("会话持久化"),
             "嵌入文档必须包含文件级文档：{with_file_doc}"
         );
+    }
+
+    /// 被语义复合块覆盖的原子块不得重复生成向量。
+    #[test]
+    fn semantic_group_members_do_not_get_individual_vectors() {
+        let mut member = CodeChunk {
+            id: "member".into(),
+            repository_id: RepositoryIdentity::from_workspace_root("/repo").expect("仓库身份"),
+            file_path: "src/service.rs".into(),
+            language: "rust".into(),
+            symbol_name: Some("first".into()),
+            qualified_symbol: Some("Service::first".into()),
+            symbol_kind: Some(model::SymbolKind::Function),
+            parent_symbol: Some("Service".into()),
+            start_line: 1,
+            end_line: 3,
+            signature: Some("fn first(&self)".into()),
+            doc_comment: None,
+            is_test: false,
+            semantic_only: false,
+            semantic_group_id: Some("group".into()),
+            imports: vec!["crate::domain::Order".into()],
+            content_hash: "member-hash".into(),
+        };
+        assert!(!participates_in_semantic_index(&member));
+
+        member.id = "group".into();
+        member.semantic_only = true;
+        member.semantic_group_id = None;
+        assert!(participates_in_semantic_index(&member));
+
+        let document = semantic_document_text(&member, None, Some("self.persist_order();"));
+        assert!(document.contains("依赖：\ncrate::domain::Order"));
     }
 
     /// 超长正文必须按字符边界截断，不能在多字节字符中间切开。

@@ -37,6 +37,7 @@ use crate::model::{CodeChunk, RepositoryIdentity, Symbol, SymbolKind};
 use crate::repository::content_hash;
 use crate::repository::language::Language;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 /// 单个文件最多产出的 chunk 数。
 const MAX_CHUNKS_PER_FILE: usize = 2048;
@@ -55,6 +56,23 @@ const MAX_DOC_LEN: usize = 600;
 
 /// 最多保留的 import 条数。
 const MAX_IMPORTS: usize = 128;
+
+/// 可并入语义复合块的单个声明最大行数。
+///
+/// 六行与检索层的短块判定保持一致：这类声明单独嵌入时常只表达通用控制流，缺少足够的
+/// 领域语境；精确符号与词法索引仍保留原子块，因此合并不会损伤定义导航。
+const SEMANTIC_GROUP_MEMBER_MAX_LINES: u32 = 6;
+
+/// 单个语义复合块允许覆盖的最大行数。
+const SEMANTIC_GROUP_MAX_LINES: u32 = 40;
+
+/// 单个语义复合块允许发送给嵌入端点的最大字符数。
+///
+/// 与 crate 根的正文嵌入上限保持一致，确保复合块不会因截断再次丢失尾部兄弟节点。
+const SEMANTIC_GROUP_MAX_CHARS: usize = 1_200;
+
+/// 相邻兄弟声明之间允许存在的最大空白行数。
+const SEMANTIC_GROUP_MAX_GAP_LINES: u32 = 2;
 
 /// 归一化后的一个声明。
 ///
@@ -242,6 +260,8 @@ pub fn parse_file(
             // 路径与声明属性取并集：`tests/` 目录下的一切都是测试，而 `src/lib.rs` 里的
             // `#[cfg(test)] mod tests` 只能靠属性识别。
             is_test: file_is_test || declaration.is_test,
+            semantic_only: false,
+            semantic_group_id: None,
             imports: imports.clone(),
             content_hash: content_hash(&body),
         });
@@ -255,12 +275,235 @@ pub fn parse_file(
         });
     }
 
+    append_semantic_groups(
+        repository,
+        file_path,
+        language,
+        &lines,
+        &output.declarations,
+        &imports,
+        &mut chunks,
+    );
+
     ParsedFile {
         chunks,
         symbols,
         tier: ParseTier::Structural,
         file_doc: output.file_doc.map(|doc| truncate(doc, MAX_DOC_LEN)),
     }
+}
+
+/// 把相邻的过短兄弟声明合成语义专用复合块。
+///
+/// 原子块不会被删除：符号和 BM25 仍需要它们的精确定位。这里只给满足同父节点、同测试
+/// 属性、同叶子类别、源码连续且总长度有界的声明建立复合表示，并在原子块上记录归属，供
+/// 语义索引跳过重复向量。少于两个成员时不生成复合块。
+fn append_semantic_groups(
+    repository: &RepositoryIdentity,
+    file_path: &str,
+    language: Language,
+    lines: &[&str],
+    declarations: &[Declaration],
+    imports: &[String],
+    chunks: &mut Vec<CodeChunk>,
+) {
+    let original_len = chunks.len().min(declarations.len());
+    let mut sibling_sets: BTreeMap<(Option<usize>, Option<String>), Vec<usize>> = BTreeMap::new();
+    for (index, declaration) in declarations.iter().take(original_len).enumerate() {
+        sibling_sets
+            .entry((declaration.parent, declaration.owner.clone()))
+            .or_default()
+            .push(index);
+    }
+
+    for ((parent, owner), siblings) in sibling_sets {
+        let mut run = Vec::new();
+        for index in siblings {
+            if !is_semantic_group_member(&declarations[index]) {
+                flush_semantic_group(
+                    repository,
+                    file_path,
+                    language,
+                    lines,
+                    declarations,
+                    imports,
+                    chunks,
+                    parent,
+                    owner.as_deref(),
+                    &mut run,
+                );
+                continue;
+            }
+
+            if !run.is_empty()
+                && !can_extend_semantic_group(lines, declarations, chunks, &run, index)
+            {
+                flush_semantic_group(
+                    repository,
+                    file_path,
+                    language,
+                    lines,
+                    declarations,
+                    imports,
+                    chunks,
+                    parent,
+                    owner.as_deref(),
+                    &mut run,
+                );
+            }
+            run.push(index);
+        }
+        flush_semantic_group(
+            repository,
+            file_path,
+            language,
+            lines,
+            declarations,
+            imports,
+            chunks,
+            parent,
+            owner.as_deref(),
+            &mut run,
+        );
+    }
+}
+
+/// 判断一个声明是否适合与兄弟节点共享语义表示。
+fn is_semantic_group_member(declaration: &Declaration) -> bool {
+    let span = declaration
+        .end_line
+        .saturating_sub(declaration.start_line)
+        .saturating_add(1);
+    span <= SEMANTIC_GROUP_MEMBER_MAX_LINES
+        && matches!(
+            declaration.kind,
+            SymbolKind::Function | SymbolKind::Constant | SymbolKind::TypeAlias | SymbolKind::Other
+        )
+}
+
+/// 判断候选声明加入当前复合块后是否仍满足连续性与输入预算。
+fn can_extend_semantic_group(
+    lines: &[&str],
+    declarations: &[Declaration],
+    chunks: &[CodeChunk],
+    run: &[usize],
+    candidate: usize,
+) -> bool {
+    let first = run[0];
+    let previous = *run.last().expect("非空分组必须有末项");
+    if chunks[first].is_test != chunks[candidate].is_test
+        || semantic_group_category(declarations[first].kind)
+            != semantic_group_category(declarations[candidate].kind)
+    {
+        return false;
+    }
+    let gap_lines = declarations[candidate]
+        .start_line
+        .saturating_sub(declarations[previous].end_line)
+        .saturating_sub(1);
+    if gap_lines > SEMANTIC_GROUP_MAX_GAP_LINES {
+        return false;
+    }
+    let start_line = declarations[first].start_line;
+    let end_line = declarations[candidate].end_line;
+    if end_line.saturating_sub(start_line).saturating_add(1) > SEMANTIC_GROUP_MAX_LINES {
+        return false;
+    }
+    slice_lines(lines, start_line, end_line).chars().count() <= SEMANTIC_GROUP_MAX_CHARS
+}
+
+/// 把符号种类折算为可安全共享语义上下文的叶子类别。
+fn semantic_group_category(kind: SymbolKind) -> u8 {
+    match kind {
+        SymbolKind::Function => 1,
+        SymbolKind::Constant | SymbolKind::TypeAlias => 2,
+        SymbolKind::Other => 3,
+        SymbolKind::Struct
+        | SymbolKind::Enum
+        | SymbolKind::Trait
+        | SymbolKind::Impl
+        | SymbolKind::Module => 0,
+    }
+}
+
+/// 完成一个候选分组，并清空临时成员列表。
+#[allow(clippy::too_many_arguments)]
+fn flush_semantic_group(
+    repository: &RepositoryIdentity,
+    file_path: &str,
+    language: Language,
+    lines: &[&str],
+    declarations: &[Declaration],
+    imports: &[String],
+    chunks: &mut Vec<CodeChunk>,
+    parent: Option<usize>,
+    owner: Option<&str>,
+    run: &mut Vec<usize>,
+) {
+    if run.len() < 2 || chunks.len() >= MAX_CHUNKS_PER_FILE {
+        run.clear();
+        return;
+    }
+
+    let start_line = declarations[run[0]].start_line;
+    let end_line = declarations[*run.last().expect("复合块必须有末项")].end_line;
+    let body = slice_lines(lines, start_line, end_line);
+    if body.chars().count() > SEMANTIC_GROUP_MAX_CHARS {
+        run.clear();
+        return;
+    }
+    let member_ids: Vec<&str> = run.iter().map(|index| chunks[*index].id.as_str()).collect();
+    let group_id = semantic_group_id(repository, file_path, &member_ids);
+    for index in run.iter().copied() {
+        chunks[index].semantic_group_id = Some(group_id.clone());
+    }
+    let parent_symbol = parent
+        .and_then(|index| chunks.get(index))
+        .and_then(|chunk| chunk.qualified_symbol.clone())
+        .or_else(|| owner.map(str::to_string));
+    let is_test = chunks[run[0]].is_test;
+    chunks.push(CodeChunk {
+        id: group_id,
+        repository_id: repository.clone(),
+        file_path: file_path.to_string(),
+        language: language.as_str().to_string(),
+        symbol_name: None,
+        qualified_symbol: None,
+        symbol_kind: None,
+        parent_symbol,
+        start_line,
+        end_line,
+        signature: None,
+        doc_comment: None,
+        is_test,
+        semantic_only: true,
+        semantic_group_id: None,
+        imports: imports.to_vec(),
+        content_hash: content_hash(&body),
+    });
+    run.clear();
+}
+
+/// 根据成员的稳定 chunk ID 计算语义复合块 ID。
+///
+/// 不包含行号与正文；仅插入空行或在文件前添加内容时成员 ID 不变，复合块可以继续复用。
+/// 正文变化由 `content_hash` 单独识别并触发重嵌。
+fn semantic_group_id(
+    repository: &RepositoryIdentity,
+    file_path: &str,
+    member_ids: &[&str],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"code-context-semantic-group-v1\0");
+    for field in [repository.as_str(), file_path] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    for member_id in member_ids {
+        digest.update((member_id.len() as u64).to_be_bytes());
+        digest.update(member_id.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 /// 提取文件开头的注释块作为文件级文档。
@@ -518,6 +761,8 @@ fn text_chunks(
                 signature: None,
                 doc_comment: None,
                 is_test: file_is_test,
+                semantic_only: false,
+                semantic_group_id: None,
                 imports: Vec::new(),
                 content_hash: content_hash(&body),
             });

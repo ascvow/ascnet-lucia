@@ -113,8 +113,12 @@ impl RetrievalIndex {
 
     /// 把一个 chunk 连同正文加入两路索引。
     ///
-    /// `body` 只在切词时被使用，调用返回后即可丢弃。
+    /// `body` 只在切词时被使用，调用返回后即可丢弃。语义专用复合块被跳过：它们只用于
+    /// 向量召回，若再次进入符号或词法通道，会与其保留的原子成员重复计分。
     pub fn index_chunk(&mut self, chunk: &CodeChunk, body: &str) {
+        if chunk.semantic_only {
+            return;
+        }
         self.symbols.index_chunk(chunk);
         self.lexical.index_chunk(chunk, body);
     }

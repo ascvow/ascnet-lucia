@@ -83,6 +83,8 @@ workspace_read = true
 - 指标：Recall@5、Recall@10、MRR。
 - 对照组：Lexical / Semantic / Hybrid（V1 只有 Lexical，Semantic 与 Hybrid 在 V2 补齐对照）。
 - 加固：超大仓库行为、fuel 边界、内存边界、解析异常、存储配额耗尽。
+- 语义粒度加固：保留原子块的符号与词法定位，并为相邻过短兄弟声明建立有界复合表示；
+  嵌入文本补充文件职责、父符号、import 上下文与正文，模板变化必须触发语义索引重建。
 
 ### Phase 8 — Embedding Provider 接入（V2 起）
 

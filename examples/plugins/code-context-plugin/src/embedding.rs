@@ -321,7 +321,7 @@ impl<'host> ApiEmbeddingProvider<'host> {
                 // OpenAI 兼容端点返回已归一化向量；余弦相似度因此可退化为点积。
                 normalization: true,
                 query_template_version: 1,
-                document_template_version: 1,
+                document_template_version: 2,
             },
             batch_size: config.embedding_batch_size.max(1),
             send_dimensions: config.embedding_send_dimensions,
@@ -549,7 +549,7 @@ impl MockEmbeddingProvider {
                 dimension,
                 normalization: true,
                 query_template_version: 1,
-                document_template_version: 1,
+                document_template_version: 2,
             },
             batch_size: DEFAULT_MAX_BATCH_SIZE,
             failure: None,

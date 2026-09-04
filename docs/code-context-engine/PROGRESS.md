@@ -7,16 +7,13 @@
 
 ## Current Phase
 
-Phase 14 — Retrieval Benchmark
+Phase 15 — Hardening
 
-Status: COMPLETE
-Completed Date: 2026-09-04
+Status: IN PROGRESS
 
-fixture 与完整 Lucia 仓库基准均已通过。查询侧中文高频单字不再干扰 BM25；融合层会根据
-语义通道是否存在调整自然语言中的符号权重，并用符号、签名、文档注释与路径覆盖率执行
-确定性轻量重排，同时保留独立标识符的精确导航能力。
-
-下一步：Phase 15 — Hardening。
+当前加固重点是中文行为描述的语义排序区分度。符号与 BM25 继续使用原子块；相邻过短兄弟
+声明新增有界语义复合表示，并把父符号、import 上下文与正文送入嵌入模板。真实模型质量指标
+尚未重跑，当前只确认结构、索引隔离与离线回归。
 
 ## Overall Status
 
@@ -948,6 +945,49 @@ Tests Executed / Result:
 
 Next: Phase 15 — Hardening
 
+---
+
+### Phase 15 — Hardening
+
+Status: IN PROGRESS
+
+Summary：32 条真实查询的消融表明，符号 + 词法 + 语义已把 Recall@10 提升到 `0.938`，但中文
+行为描述的 Recall@1 在加入语义后仍为 `0.12`，加入 `Qwen/Qwen3-Reranker-4B` 后为 `0.38`。
+候选池已经覆盖目标，当前瓶颈是大量三五行代码块在嵌入空间里区分度不足，而不是融合权重。
+
+Implemented:
+- **语义专用复合块**：同一父节点、owner、测试属性与叶子类别下，相邻的短兄弟声明可合成
+  复合块。单成员最多 6 行，间隔最多 2 个空白行，复合块最多 40 行和 1200 个字符；少于两个
+  成员不生成。
+- **保留精确检索粒度**：原子块继续进入符号表与 BM25；复合块只进入语义通道和模型重排。
+  原子成员通过 `semantic_group_id` 记录归属，不再重复生成向量。
+- **补充结构上下文**：嵌入文档现在包含路径、文件级文档、父符号、限定名、签名、块级文档、
+  最多 16 条 / 600 字符的 import 上下文，以及最多 1200 字符的正文。
+- **兼容性版本更新**：`STRUCTURAL_INDEX_VERSION` 从 1 提升到 2，触发结构索引全量重建；
+  `document_template_version` 从 1 提升到 2，触发语义向量重建。
+
+Scale Result（Lucia 当前仓库）:
+- 原子代码块 6641 个，语义复合块 262 个，其中 970 个原子块由复合块代表。
+- 实际语义文档 5933 个，比逐原子块嵌入减少 708 个，约 `10.7%`。
+
+Verified:
+- `cargo test -p code-context-plugin --lib`：362 项通过。
+- `cargo test -p code-context-plugin --test retrieval_benchmark -- --nocapture`：9 项通过。
+- `cargo test -p code-context-plugin --features test-support --test retrieval_report -- --nocapture`：
+  2 项离线报告通过，3 项真实 API 报告按设计忽略。
+- `cargo test -p code-context-plugin --example search_repository --features test-support`：11 项通过。
+- `cargo clippy -p code-context-plugin --all-targets`：退出成功；四个语言适配器仍有 4 条既有
+  `field_reassign_with_default` 警告，本轮未做无关重构。
+- `bun run build:plugin:code-context`：`wasm32-wasip2` release 构建通过。
+- `cargo test -p code-context-plugin-smoke-tests`：9 项真实 WASM Host smoke 通过。
+- 上述数字是结构规模与离线回归结果，**不是新策略的真实模型质量提升证明**。
+
+Pending:
+- 用真实 `BAAI/bge-m3` + `Qwen/Qwen3-Reranker-4B` 重跑 32 条消融，确认中文行为描述
+  Recall@1 是否改善。2026-09-04 已尝试运行，当前进程未设置 `SILICONFLOW_API_KEY`，测试在
+  发起网络请求前停止。
+- 继续验证超大仓库、fuel、内存与宿主存储配额边界。
+
 ## Blocked Phases
 
 一个阶段因 Host 能力缺失无法实现。按开发任务书 §25，记录 Blocker 而**不绕开架构做 hack 实现**。
@@ -991,11 +1031,13 @@ Recommended solution：方案 1。在此之前产品显示 `Local Mode: NOT SUPP
 
 ## Active Work
 
-Phase 15 — Hardening。继续验证超大仓库、fuel、内存和宿主存储配额边界。
+Phase 15 — Hardening。先完成语义复合块的真实模型消融，再继续验证超大仓库、fuel、内存和
+宿主存储配额边界。
 
 ## Known Issues
 
-无。Phase 1–6 与 Phase 9 全部验证通过，未发现 regression。
+语义复合块已通过离线结构与回归验证，但尚未取得真实模型消融结果，不能声明中文行为描述的
+Recall@1 已改善。
 
 Phase 2 遗留的真实 Host 验证已在 Phase 4 补齐：
 `wasm_host_scans_nested_directories_and_builds_index` 覆盖三层嵌套目录、多语言解析与忽略规则。
@@ -1078,9 +1120,9 @@ Tier 3  文本分块              —— 未覆盖语言、解析失败、无声
 
 ## Next Action
 
-Phase 14 已完成：fixture 与完整仓库检索基准通过，中文查询和自然语言融合权重已校准。
-Phase 12 — Local Embedding Provider 受 Host embedding 能力缺失阻塞（跳过）；
-下一步进入 Phase 15 — Hardening。
+Phase 15 正在进行：语义复合块、父符号与 import 上下文已实现并通过离线回归；下一步使用真实
+`BAAI/bge-m3` + `Qwen/Qwen3-Reranker-4B` 重跑消融。Phase 12 — Local Embedding Provider
+仍受 Host embedding 能力缺失阻塞（跳过）。
 
 ---
 

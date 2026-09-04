@@ -430,6 +430,31 @@ fn text_tier_chunks_are_lexical_only() {
     assert_any(&labels(&index, &found), "docs/guide.md");
 }
 
+/// 语义复合块不得进入符号表或 BM25，原子成员仍必须可精确检索。
+#[test]
+fn semantic_groups_do_not_duplicate_structural_channels() {
+    let host = RepoHost::new(&[(
+        "src/service.rs",
+        "pub struct Service;\nimpl Service {\n    pub fn create(&self) { self.persist(); }\n    pub fn notify(&self) { self.publish(); }\n}\n",
+    )]);
+    let mut build = IndexBuild::with_default_limits(repository());
+    build.advance(&host, UNLIMITED);
+    let (index, retrieval) = build.into_parts();
+    let ordinary_chunks = index.chunks().filter(|chunk| !chunk.semantic_only).count();
+    let groups = index.chunks().filter(|chunk| chunk.semantic_only).count();
+
+    assert_eq!(groups, 1, "两个相邻短方法应生成一个语义复合块");
+    assert_eq!(retrieval.stats().documents as usize, ordinary_chunks);
+    let symbols = retrieval.search_symbols("Service::create", None, 10);
+    assert_any(&labels(&index, &symbols), "src/service.rs#Service::create");
+    let lexical = retrieval.search_lexical("persist", None, 10);
+    assert!(lexical.iter().all(|candidate| {
+        index
+            .chunk(&candidate.chunk_id)
+            .is_some_and(|chunk| !chunk.semantic_only)
+    }));
+}
+
 // ---------------------------------------------------------------------------
 // 语义通道接入
 // ---------------------------------------------------------------------------

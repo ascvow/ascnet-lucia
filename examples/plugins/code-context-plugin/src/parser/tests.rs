@@ -100,6 +100,78 @@ impl PermissionManager {
     );
 }
 
+/// 相邻的短方法必须共享一个语义复合块，同时保留各自的原子定义。
+#[test]
+fn short_sibling_methods_share_semantic_group() {
+    let source = r#"
+pub struct Service;
+
+impl Service {
+    pub fn create(&self) {
+        self.persist();
+    }
+
+
+    pub fn notify(&self) {
+        self.publish();
+    }
+}
+"#;
+    let parsed = parse("src/service.rs", Language::Rust, source);
+    let create = parsed
+        .chunks
+        .iter()
+        .find(|chunk| chunk.qualified_symbol.as_deref() == Some("Service::create"))
+        .expect("应保留 create 原子块");
+    let notify = parsed
+        .chunks
+        .iter()
+        .find(|chunk| chunk.qualified_symbol.as_deref() == Some("Service::notify"))
+        .expect("应保留 notify 原子块");
+    let group_id = create
+        .semantic_group_id
+        .as_deref()
+        .expect("短方法应归入语义复合块");
+
+    assert_eq!(notify.semantic_group_id.as_deref(), Some(group_id));
+    assert!(!create.semantic_only && !notify.semantic_only);
+    let group = parsed
+        .chunks
+        .iter()
+        .find(|chunk| chunk.id == group_id)
+        .expect("应生成语义复合块");
+    assert!(group.semantic_only);
+    assert_eq!(group.parent_symbol.as_deref(), Some("Service"));
+    assert_eq!(group.start_line, create.start_line);
+    assert_eq!(group.end_line, notify.end_line);
+    assert!(
+        find(&parsed, "Service::create").start_line < find(&parsed, "Service::notify").start_line
+    );
+}
+
+/// 语义复合块 ID 不得随文件前部插入空行而变化。
+#[test]
+fn semantic_group_id_is_stable_across_line_shifts() {
+    let source = "fn first() {}\n\nfn second() {}\n";
+    let shifted = "// 文件说明\n\nfn first() {}\n\nfn second() {}\n";
+    let first = parse("src/group.rs", Language::Rust, source);
+    let second = parse("src/group.rs", Language::Rust, shifted);
+    let first_group = first
+        .chunks
+        .iter()
+        .find(|chunk| chunk.semantic_only)
+        .expect("应生成复合块");
+    let second_group = second
+        .chunks
+        .iter()
+        .find(|chunk| chunk.semantic_only)
+        .expect("行号平移后仍应生成复合块");
+
+    assert_eq!(first_group.id, second_group.id);
+    assert_eq!(first_group.content_hash, second_group.content_hash);
+    assert_ne!(first_group.start_line, second_group.start_line);
+}
+
 /// trait 实现的 impl 块必须以被实现的类型命名，trait 名记入 owner。
 #[test]
 fn rust_trait_impl_is_named_after_the_type() {

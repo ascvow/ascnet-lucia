@@ -339,7 +339,9 @@ CodeChunk {
     file_path, language,
     symbol_name, qualified_symbol, symbol_kind, parent_symbol,
     start_line, end_line,
-    signature, doc_comment, content, imports,
+    signature, doc_comment, is_test,
+    semantic_only, semantic_group_id,
+    imports,
     content_hash
 }
 
@@ -358,6 +360,9 @@ IndexManifest {
     created_at, updated_at
 }
 ```
+
+`CodeChunk` 不持有正文，正文按行区间回读。`semantic_only` 标记只进入语义通道的复合块；
+`semantic_group_id` 让原子成员保留精确符号与词法定位，同时避免重复生成向量。
 
 **Embedding 与结构化 chunk 严格分离。** 用户从 API 切到 Local 时，只有 `embedding_space_id` 不兼容，重建语义索引即可，结构索引原样保留。
 

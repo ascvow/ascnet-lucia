@@ -25,7 +25,7 @@ pub const INDEX_SCHEMA_VERSION: u32 = 1;
 ///
 /// Phase 3 引入真实分块后，任何改变 chunk 边界或字段语义的调整都必须提升该版本，
 /// 使已有索引进入 `FullRebuildRequired`。
-pub const STRUCTURAL_INDEX_VERSION: u32 = 1;
+pub const STRUCTURAL_INDEX_VERSION: u32 = 2;
 
 /// 返回当前 Unix 毫秒时间戳。
 ///
@@ -393,6 +393,18 @@ pub struct CodeChunk {
     /// 从索引里删掉（有时确实要找测试）。
     #[serde(default)]
     pub is_test: bool,
+    /// 是否只参与语义检索。
+    ///
+    /// 结构化解析会把相邻的过短兄弟声明合成一个复合块，使嵌入模型看到足够完整的行为
+    /// 上下文。复合块不进入符号表和词法倒排，避免与保留精确定位的原子块重复召回。
+    #[serde(default)]
+    pub semantic_only: bool,
+    /// 当前原子块所属的语义复合块 ID。
+    ///
+    /// 非空时，该原子块继续服务符号与词法检索，但不再单独生成向量；语义通道改由对应
+    /// 复合块代表。复合块自身与未合并块为 `None`。
+    #[serde(default)]
+    pub semantic_group_id: Option<String>,
     /// 该文件的导入语句，用于补全检索上下文。
     #[serde(default)]
     pub imports: Vec<String>,

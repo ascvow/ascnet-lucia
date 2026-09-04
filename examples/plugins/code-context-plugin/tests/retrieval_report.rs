@@ -931,7 +931,16 @@ fn chunk_size_distribution() {
     let mut lines: Vec<u32> = Vec::new();
     let mut by_kind: BTreeMap<String, (usize, u64)> = BTreeMap::new();
     let mut without_symbol = 0usize;
+    let mut semantic_groups = 0usize;
+    let mut grouped_members = 0usize;
     for chunk in index.chunks() {
+        if chunk.semantic_only {
+            semantic_groups += 1;
+            continue;
+        }
+        if chunk.semantic_group_id.is_some() {
+            grouped_members += 1;
+        }
         let span = chunk.end_line.saturating_sub(chunk.start_line) + 1;
         lines.push(span);
         let kind = chunk
@@ -953,11 +962,20 @@ fn chunk_size_distribution() {
     };
     let tiny = lines.iter().filter(|span| **span <= 3).count();
     let small = lines.iter().filter(|span| **span <= 6).count();
+    let semantic_documents = lines.len() + semantic_groups - grouped_members;
+    let saved_embeddings = grouped_members.saturating_sub(semantic_groups);
 
     println!("\n# 代码块规模分布\n");
     println!("| 指标 | 数值 |");
     println!("| --- | --- |");
-    println!("| 代码块总数 | {} |", lines.len());
+    println!("| 原子代码块总数 | {} |", lines.len());
+    println!("| 语义复合块 | {semantic_groups} |");
+    println!("| 被合并原子块 | {grouped_members} |");
+    println!("| 实际语义文档数 | {semantic_documents} |");
+    println!(
+        "| 减少嵌入请求 | {saved_embeddings}（{:.1}%） |",
+        saved_embeddings as f64 / lines.len() as f64 * 100.0
+    );
     println!("| 无符号名（文本兜底） | {without_symbol} |");
     println!("| 行数 P50 | {} |", percentile(0.50));
     println!("| 行数 P75 | {} |", percentile(0.75));
