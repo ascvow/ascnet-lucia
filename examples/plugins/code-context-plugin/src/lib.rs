@@ -837,14 +837,25 @@ impl CodeContextPlugin {
             context.semantic.reset(space);
         }
 
-        // 只嵌入尚无向量的 chunk：全量重嵌在 API 模式下等于重新付费。
-        let pending: Vec<(String, String, String)> = index
+        let current_chunks: Vec<(&str, &str)> = index
             .chunks()
-            .filter(|chunk| !context.semantic.contains(&chunk.id))
+            .map(|chunk| (chunk.id.as_str(), chunk.content_hash.as_str()))
+            .collect();
+        context.semantic.retain_current(&current_chunks);
+
+        // 只嵌入尚无当前向量的 chunk：内容哈希可防止正文变化后误复用同 ID 的旧向量。
+        let pending: Vec<(String, String, String, String)> = index
+            .chunks()
+            .filter(|chunk| {
+                !context
+                    .semantic
+                    .contains_current(&chunk.id, &chunk.content_hash)
+            })
             .map(|chunk| {
                 (
                     chunk.id.clone(),
                     chunk.file_path.clone(),
+                    chunk.content_hash.clone(),
                     semantic_document_text(chunk),
                 )
             })
@@ -853,11 +864,15 @@ impl CodeContextPlugin {
             return context.semantic.is_ready();
         }
 
-        let inputs: Vec<String> = pending.iter().map(|(_, _, text)| text.clone()).collect();
+        let inputs: Vec<String> = pending.iter().map(|(_, _, _, text)| text.clone()).collect();
         match provider.embed_documents(&inputs) {
             Ok(vectors) => {
-                for ((chunk_id, file_path, _), vector) in pending.iter().zip(vectors.iter()) {
-                    context.semantic.upsert(chunk_id, file_path, vector);
+                for ((chunk_id, file_path, content_hash, _), vector) in
+                    pending.iter().zip(vectors.iter())
+                {
+                    context
+                        .semantic
+                        .upsert(chunk_id, file_path, Some(content_hash), vector);
                 }
                 // 向量落盘：失败不影响本次检索，只让下次启动需要重新嵌入。
                 if let Some(snapshot) = context.semantic.snapshot() {
@@ -1768,6 +1783,57 @@ mod tests {
             "语义索引建成后应报告 Ready 而不是 Degraded"
         );
         assert!(!host.http_requests().is_empty(), "必须真的调用嵌入端点");
+    }
+
+    /// 磁盘快照必须让下一进程跳过未变化代码块，并让内容变化的代码块重新嵌入。
+    #[test]
+    fn persisted_semantic_index_reuses_only_current_chunks() {
+        let cache_path = std::env::temp_dir().join(format!(
+            "lucia-code-context-semantic-{}.json",
+            std::process::id()
+        ));
+        match std::fs::remove_file(&cache_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("清理旧测试缓存失败：{error}"),
+        }
+        let first_host = crate::testing::RepoHost::persisted(SEMANTIC_FIXTURE, &cache_path)
+            .expect("创建首次磁盘宿主")
+            .with_echo_embeddings(4);
+        let first = indexed(&first_host, api_activation_context("/repo/a"));
+        assert_eq!(first.index_status(), IndexStatus::Ready);
+        assert_eq!(first_host.http_requests().len(), 1, "首次必须生成文档向量");
+        drop(first);
+        drop(first_host);
+
+        let reopened = crate::testing::RepoHost::persisted(SEMANTIC_FIXTURE, &cache_path)
+            .expect("重新打开磁盘宿主")
+            .with_echo_embeddings(4);
+        let reused = indexed(&reopened, api_activation_context("/repo/a"));
+        assert_eq!(reused.index_status(), IndexStatus::Ready);
+        assert!(
+            reopened.http_requests().is_empty(),
+            "未变化代码块应直接复用磁盘向量"
+        );
+        drop(reused);
+        drop(reopened);
+
+        let changed_fixture = &[(
+            "src/permission.rs",
+            "/// 检查工具调用是否需要人工审批。\npub fn check_permission(id: &str) -> bool {\n    !id.is_empty()\n}\n",
+        )];
+        let changed_host = crate::testing::RepoHost::persisted(changed_fixture, &cache_path)
+            .expect("打开变更后的磁盘宿主")
+            .with_echo_embeddings(4);
+        let changed = indexed(&changed_host, api_activation_context("/repo/a"));
+        assert_eq!(changed.index_status(), IndexStatus::Ready);
+        assert_eq!(
+            changed_host.http_requests().len(),
+            1,
+            "正文变化后必须重新生成向量"
+        );
+
+        std::fs::remove_file(&cache_path).expect("清理语义缓存测试文件");
     }
 
     /// 嵌入端点失败时必须降级为两路检索，而不是让索引构建失败。

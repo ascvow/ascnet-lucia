@@ -9,9 +9,29 @@ use agent_plugin::{
     ToolSpec,
 };
 use anyhow::anyhow;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// 测试宿主磁盘存储的格式版本。
+const PERSISTED_STORE_SCHEMA_VERSION: u32 = 1;
+
+/// 原子写入临时文件使用的进程内序号。
+static PERSISTED_STORE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// 测试宿主磁盘文件中的 JSON 信封。
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedHostStore {
+    /// 存储格式版本，用于拒绝无法安全解释的未来格式。
+    schema_version: u32,
+    /// 按作用域分组的宿主键值内容。
+    values: BTreeMap<String, BTreeMap<String, Value>>,
+}
 
 /// 测试宿主可注入的 HTTP 请求处理函数。
 type HttpHandler = dyn Fn(&HttpRequest) -> Result<HttpResponse>;
@@ -55,6 +75,8 @@ fn echo_embeddings(request: &HttpRequest, dimension: usize) -> Result<HttpRespon
 pub struct TestHost {
     /// 按 (作用域, 键) 保存的持久存储内容。
     values: RefCell<HashMap<(String, String), Value>>,
+    /// 可选的磁盘存储路径；存在时每次变更都先原子落盘再更新内存。
+    store_path: Option<PathBuf>,
     /// 已注册的工具本地名。
     tools: RefCell<Vec<String>>,
     /// 已发布的扩展事件名。
@@ -88,6 +110,26 @@ impl TestHost {
             workspace_read_available: true,
             ..Self::default()
         }
+    }
+
+    /// 创建使用指定 JSON 文件持久化键值的宿主替身。
+    ///
+    /// 文件不存在时从空存储开始；已存在时读取同一份作用域数据，使独立进程可以复用
+    /// manifest、文件哈希和语义向量快照。
+    ///
+    /// # Errors
+    ///
+    /// 文件无法读取、JSON 损坏或格式版本不受支持时返回错误。
+    pub fn persisted(path: impl Into<PathBuf>) -> Result<Self> {
+        let store_path = path.into();
+        let values = load_persisted_store(&store_path)?;
+        Ok(Self {
+            values: RefCell::new(values),
+            store_path: Some(store_path),
+            workspace_available: true,
+            workspace_read_available: true,
+            ..Self::default()
+        })
     }
 
     /// 创建缺少项目作用域的替身。
@@ -203,6 +245,101 @@ impl TestHost {
         }
         Ok(())
     }
+
+    /// 在启用磁盘存储时事务性保存一份候选值；失败时调用方保留原内存状态。
+    fn persist_values(&self, values: &HashMap<(String, String), Value>) -> Result<()> {
+        match self.store_path.as_deref() {
+            Some(path) => save_persisted_store(path, values),
+            None => Ok(()),
+        }
+    }
+}
+
+/// 从磁盘读取测试宿主 JSON，并还原为宿主 API 使用的扁平键空间。
+fn load_persisted_store(path: &Path) -> Result<HashMap<(String, String), Value>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => {
+            return Err(anyhow!(
+                "读取代码索引缓存 `{}` 失败：{error}",
+                path.display()
+            ))
+        }
+    };
+    let stored: PersistedHostStore = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow!("解析代码索引缓存 `{}` 失败：{error}", path.display()))?;
+    if stored.schema_version != PERSISTED_STORE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "代码索引缓存 `{}` 的格式版本为 {}，当前只支持 {}",
+            path.display(),
+            stored.schema_version,
+            PERSISTED_STORE_SCHEMA_VERSION
+        ));
+    }
+    Ok(stored
+        .values
+        .into_iter()
+        .flat_map(|(scope, values)| {
+            values
+                .into_iter()
+                .map(move |(key, value)| ((scope.clone(), key), value))
+        })
+        .collect())
+}
+
+/// 把测试宿主键值原子写入磁盘，避免中断留下半份语义快照。
+fn save_persisted_store(path: &Path, values: &HashMap<(String, String), Value>) -> Result<()> {
+    let mut grouped: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
+    for ((scope, key), value) in values {
+        grouped
+            .entry(scope.clone())
+            .or_default()
+            .insert(key.clone(), value.clone());
+    }
+    let contents = serde_json::to_vec(&PersistedHostStore {
+        schema_version: PERSISTED_STORE_SCHEMA_VERSION,
+        values: grouped,
+    })
+    .map_err(|error| anyhow!("序列化代码索引缓存失败：{error}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("代码索引缓存路径缺少父目录：{}", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| anyhow!("创建代码索引缓存目录 `{}` 失败：{error}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("代码索引缓存文件名无效：{}", path.display()))?;
+    let sequence = PERSISTED_STORE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| {
+            anyhow!(
+                "创建代码索引临时缓存 `{}` 失败：{error}",
+                temporary.display()
+            )
+        })?;
+    let result = (|| -> Result<()> {
+        file.write_all(&contents)
+            .map_err(|error| anyhow!("写入代码索引缓存 `{}` 失败：{error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| anyhow!("同步代码索引缓存 `{}` 失败：{error}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .map_err(|error| anyhow!("替换代码索引缓存 `{}` 失败：{error}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// 构造带工作区根的测试激活上下文。
@@ -263,18 +400,22 @@ impl PluginHostApi for TestHost {
 
     fn store_set(&self, scope: PluginStoreScope, key: &str, value: &Value) -> Result<()> {
         self.ensure_scope(scope)?;
-        self.values
-            .borrow_mut()
-            .insert((Self::scope_key(scope), key.to_string()), value.clone());
+        let mut values = self.values.borrow().clone();
+        values.insert((Self::scope_key(scope), key.to_string()), value.clone());
+        self.persist_values(&values)?;
+        *self.values.borrow_mut() = values;
         Ok(())
     }
 
     fn store_remove(&self, scope: PluginStoreScope, key: &str) -> Result<Option<Value>> {
         self.ensure_scope(scope)?;
-        Ok(self
-            .values
-            .borrow_mut()
-            .remove(&(Self::scope_key(scope), key.to_string())))
+        let mut values = self.values.borrow().clone();
+        let removed = values.remove(&(Self::scope_key(scope), key.to_string()));
+        if removed.is_some() {
+            self.persist_values(&values)?;
+            *self.values.borrow_mut() = values;
+        }
+        Ok(removed)
     }
 
     fn store_list(&self, scope: PluginStoreScope) -> Result<Vec<String>> {
@@ -381,6 +522,24 @@ impl RepoHost {
             unlistable: HashSet::new(),
             calls: RefCell::new(0),
         }
+    }
+
+    /// 用指定 JSON 文件构造可跨进程复用存储的虚拟仓库宿主。
+    ///
+    /// # Errors
+    ///
+    /// 缓存文件无法读取、JSON 损坏或格式版本不受支持时返回错误。
+    pub fn persisted(files: &[(&str, &str)], path: impl Into<PathBuf>) -> Result<Self> {
+        Ok(Self {
+            inner: TestHost::persisted(path)?,
+            files: files
+                .iter()
+                .map(|(path, content)| (path.to_string(), content.to_string()))
+                .collect(),
+            unreadable: HashSet::new(),
+            unlistable: HashSet::new(),
+            calls: RefCell::new(0),
+        })
     }
 
     /// 用既有存储内容构造虚拟仓库，模拟进程重启后读到同一份磁盘数据。
@@ -596,5 +755,38 @@ impl PluginHostApi for RepoHost {
 
     fn http_request(&self, request: &HttpRequest) -> Result<HttpResponse> {
         self.inner.http_request(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 磁盘宿主必须在实例销毁后从同一路径恢复完整工作区键值。
+    #[test]
+    fn persisted_host_survives_reopen() {
+        let sequence = PERSISTED_STORE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "lucia-code-context-host-{}-{sequence}.json",
+            std::process::id()
+        ));
+        let host = TestHost::persisted(&path).expect("创建磁盘宿主");
+        host.store_set(
+            PluginStoreScope::Workspace,
+            "index.semantic",
+            &serde_json::json!({"records": [1, 2, 3]}),
+        )
+        .expect("写入缓存");
+        drop(host);
+
+        let reopened = TestHost::persisted(&path).expect("重新打开磁盘宿主");
+        assert_eq!(
+            reopened
+                .store_get(PluginStoreScope::Workspace, "index.semantic")
+                .expect("读取缓存"),
+            Some(serde_json::json!({"records": [1, 2, 3]}))
+        );
+
+        fs::remove_file(&path).expect("清理测试缓存");
     }
 }

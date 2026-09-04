@@ -13,6 +13,7 @@ use code_context_plugin::{
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use url::Url;
@@ -34,6 +35,9 @@ const DEFAULT_EMBEDDING_DIMENSION: u32 = 1_024;
 
 /// 默认单批嵌入代码块数量。
 const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
+
+/// 默认缓存目录在用户主目录中的相对路径。
+const DEFAULT_CACHE_SUBDIRECTORY: &str = ".lucia/code-context";
 
 /// 构建本地搜索夹具时跳过的版本库元数据、依赖目录与构建产物。
 const SKIPPED_DIRECTORIES: &[&str] = &[
@@ -77,6 +81,12 @@ struct SearchOptions {
     token_budget: u64,
     /// 可选的仓库相对路径前缀。
     path_scope: Vec<String>,
+    /// 保存跨进程索引快照的目录。
+    cache_dir: PathBuf,
+    /// 是否启用磁盘缓存。
+    cache_enabled: bool,
+    /// 启动前是否删除当前仓库的旧缓存。
+    rebuild_cache: bool,
     /// 语义嵌入配置；`None` 表示用户显式要求只运行符号与 BM25 检索。
     embedding: Option<EmbeddingOptions>,
 }
@@ -162,6 +172,40 @@ fn run() -> Result<()> {
         .map(|(path, content)| (path.as_str(), content.as_str()))
         .collect();
     let mut context = activation_context(&root.to_string_lossy());
+    let cache_path = repository_cache_path(&options.cache_dir, &root);
+    if options.rebuild_cache {
+        match fs::remove_file(&cache_path) {
+            Ok(()) => eprintln!("已删除旧索引缓存：{}", cache_path.display()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow!(
+                    "删除旧索引缓存 `{}` 失败：{error}",
+                    cache_path.display()
+                ))
+            }
+        }
+    }
+    let host = if options.cache_enabled {
+        let existed = cache_path.is_file();
+        eprintln!(
+            "索引缓存：{}（{}）",
+            cache_path.display(),
+            if existed {
+                "将复用已有数据"
+            } else {
+                "首次创建"
+            }
+        );
+        RepoHost::persisted(&file_refs, &cache_path).with_context(|| {
+            format!(
+                "打开索引缓存 `{}` 失败；可使用 --rebuild-cache 重建",
+                cache_path.display()
+            )
+        })?
+    } else {
+        eprintln!("已禁用索引缓存，本次退出后不会复用语义向量");
+        RepoHost::new(&file_refs)
+    };
     let host = match options.embedding.as_ref() {
         Some(embedding) => {
             let endpoint = EmbeddingEndpoint::new(embedding)?;
@@ -170,11 +214,11 @@ fn run() -> Result<()> {
                 "将先为整个仓库生成语义向量：模型 {}，维度 {}，批大小 {}",
                 embedding.model, embedding.dimension, embedding.batch_size
             );
-            RepoHost::new(&file_refs).with_http_handler(move |request| endpoint.send(request))
+            host.with_http_handler(move |request| endpoint.send(request))
         }
         None => {
             eprintln!("已启用纯词法模式：只建立符号索引与 BM25 索引");
-            RepoHost::new(&file_refs)
+            host
         }
     };
     let mut plugin = CodeContextPlugin::default();
@@ -212,6 +256,9 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Search
     let mut token_budget = 8_000;
     let mut path_scope = Vec::new();
     let mut embedding = EmbeddingOptions::default();
+    let mut cache_dir = default_cache_dir();
+    let mut cache_enabled = true;
+    let mut rebuild_cache = false;
     let mut lexical_only = false;
     let mut query_parts = Vec::new();
     let mut args = args.into_iter();
@@ -231,6 +278,15 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Search
             }
             "--path-scope" => {
                 path_scope.push(next_value(&mut args, "--path-scope")?);
+            }
+            "--cache-dir" => {
+                cache_dir = PathBuf::from(next_value(&mut args, "--cache-dir")?);
+            }
+            "--no-cache" => {
+                cache_enabled = false;
+            }
+            "--rebuild-cache" => {
+                rebuild_cache = true;
             }
             "--lexical-only" => {
                 lexical_only = true;
@@ -269,6 +325,10 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Search
         }
     }
 
+    if rebuild_cache && !cache_enabled {
+        return Err(anyhow!("--rebuild-cache 不能与 --no-cache 同时使用"));
+    }
+
     let query = query_parts.join(" ").trim().to_string();
     Ok(Some(SearchOptions {
         root,
@@ -276,6 +336,9 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Search
         max_results,
         token_budget,
         path_scope,
+        cache_dir,
+        cache_enabled,
+        rebuild_cache,
         embedding: (!lexical_only).then_some(embedding),
     }))
 }
@@ -526,6 +589,25 @@ fn default_repository_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// 返回跨进程索引默认缓存目录 `~/.lucia/code-context`。
+///
+/// 极简运行环境没有主目录信息时退回系统临时目录，避免仅因缓存不可寻址阻止搜索。
+fn default_cache_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(DEFAULT_CACHE_SUBDIRECTORY)
+}
+
+/// 按规范化仓库根路径派生稳定且不泄露本地路径的缓存文件名。
+fn repository_cache_path(cache_dir: &Path, root: &Path) -> PathBuf {
+    let identity = content_hash(&format!(
+        "code-context-search-repository\0{}",
+        root.to_string_lossy()
+    ));
+    cache_dir.join(format!("{identity}.json"))
+}
+
 /// 递归读取仓库内全部受生产分类器支持的 UTF-8 文件。
 ///
 /// 符号链接不会跟随，避免越过用户指定的仓库边界；依赖目录和构建产物在装入测试宿主前
@@ -734,7 +816,7 @@ fn print_search_result(result: &agent_plugin::ToolResult) {
 /// 打印命令用法与可选参数。
 fn print_help() {
     println!(
-        "用法：\n  cargo run -p code-context-plugin --example search_repository --features test-support -- [选项] [查询]\n\n未提供查询时，索引完成后进入交互搜索，可连续输入多条查询。\n\n选项：\n  --root <路径>                         仓库根目录，默认使用当前 Lucia 仓库\n  --max-results <数量>                  最多返回结果数，默认 10\n  --token-budget <数量>                 代码片段 token 预算，默认 8000\n  --path-scope <前缀>                   限定仓库相对路径，可重复指定\n  --embedding-base-url <URL>            OpenAI 兼容端点，默认使用 SiliconFlow\n  --embedding-api-key-env <变量名>      API 密钥环境变量，默认 SILICONFLOW_API_KEY\n  --embedding-model <模型>              嵌入模型，默认 BAAI/bge-m3\n  --embedding-dimension <维度>          向量维度，默认 1024\n  --embedding-batch-size <数量>         单批代码块数，默认 32\n  --embedding-send-dimensions <布尔值>  是否发送 dimensions，默认 false\n  --lexical-only                        跳过向量化，只运行符号与 BM25 检索\n  -h, --help                            显示帮助"
+        "用法：\n  cargo run -p code-context-plugin --example search_repository --features test-support -- [选项] [查询]\n\n未提供查询时，索引完成后进入交互搜索，可连续输入多条查询。语义向量默认按仓库持久化，第二次运行只计算新增或变化的代码块。\n\n选项：\n  --root <路径>                         仓库根目录，默认使用当前 Lucia 仓库\n  --max-results <数量>                  最多返回结果数，默认 10\n  --token-budget <数量>                 代码片段 token 预算，默认 8000\n  --path-scope <前缀>                   限定仓库相对路径，可重复指定\n  --cache-dir <目录>                    索引缓存目录，默认 ~/.lucia/code-context\n  --no-cache                            不读取或写入跨进程索引缓存\n  --rebuild-cache                       删除当前仓库缓存后重新生成全部向量\n  --embedding-base-url <URL>            OpenAI 兼容端点，默认使用 SiliconFlow\n  --embedding-api-key-env <变量名>      API 密钥环境变量，默认 SILICONFLOW_API_KEY\n  --embedding-model <模型>              嵌入模型，默认 BAAI/bge-m3\n  --embedding-dimension <维度>          向量维度，默认 1024\n  --embedding-batch-size <数量>         单批代码块数，默认 32\n  --embedding-send-dimensions <布尔值>  是否发送 dimensions，默认 false\n  --lexical-only                        跳过向量化，只运行符号与 BM25 检索\n  -h, --help                            显示帮助"
     );
 }
 
@@ -755,6 +837,9 @@ mod tests {
                 "2000",
                 "--path-scope",
                 "crates/agent-core/",
+                "--cache-dir",
+                "/tmp/code-context-cache",
+                "--rebuild-cache",
                 "插件",
                 "权限",
             ]
@@ -769,6 +854,9 @@ mod tests {
         assert_eq!(options.max_results, 5);
         assert_eq!(options.token_budget, 2_000);
         assert_eq!(options.path_scope, ["crates/agent-core/"]);
+        assert_eq!(options.cache_dir, PathBuf::from("/tmp/code-context-cache"));
+        assert!(options.cache_enabled);
+        assert!(options.rebuild_cache);
         assert_eq!(options.embedding, Some(EmbeddingOptions::default()));
     }
 
@@ -842,5 +930,31 @@ mod tests {
 
         assert!(options.query.is_none());
         assert_eq!(options.embedding, Some(EmbeddingOptions::default()));
+        assert!(options.cache_enabled);
+        assert!(!options.rebuild_cache);
+    }
+
+    /// 禁用缓存时不得同时请求删除缓存，避免选项语义互相矛盾。
+    #[test]
+    fn no_cache_rejects_rebuild_cache() {
+        let error = parse_options(
+            ["--no-cache", "--rebuild-cache"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect_err("冲突选项应失败");
+
+        assert!(error.to_string().contains("不能与"));
+    }
+
+    /// 同一仓库必须得到稳定缓存文件，不同仓库不得共享缓存。
+    #[test]
+    fn repository_cache_path_is_stable_and_isolated() {
+        let cache = Path::new("/cache");
+        let first = repository_cache_path(cache, Path::new("/repo/a"));
+
+        assert_eq!(first, repository_cache_path(cache, Path::new("/repo/a")));
+        assert_ne!(first, repository_cache_path(cache, Path::new("/repo/b")));
+        assert_eq!(first.parent(), Some(cache));
     }
 }

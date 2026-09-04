@@ -1,18 +1,18 @@
 //! 语义向量索引。
 //!
-//! # 持久化与 int8 量化
+//! # 持久化与 int4 量化
 //!
 //! `adr-storage.md` 把嵌入向量列为「V1 不存在」，理由是 f32 原样存放远超 `host-store`
 //! 的 8 MiB 上限——本仓库约 5000 个 chunk × 1024 维 × 4 字节就是 20 MB 以上。
 //!
 //! 但那条结论的前提是**不量化**。检索用的向量对精度并不敏感：向量已归一化，
-//! 每个分量都落在 `[-1, 1]`，用一个 f32 缩放因子加 int8 分量即可还原到千分之一的误差，
-//! 而体积降到四分之一。再算上 base64 的 4/3 膨胀，单条约 1.4 KB，8 MiB 能装下约 5000 条
-//! ——正好是本仓库的量级。
+//! 每个分量都落在 `[-1, 1]`，用一个 f32 缩放因子加 4 位有符号分量即可把两个维度装入
+//! 一个字节，体积降到八分之一。再算上 base64 的 4/3 膨胀，1024 维单条约 700 字节，
+//! 当前 Lucia 仓库的六千余个代码块可以完整放入宿主存储预算。
 //!
 //! 因此本模块**持久化量化后的向量**：重启后直接加载，不必重新嵌入。这对 API provider
-//! 是实打实的省钱与省时间。容量不足时按 [`MAX_PERSISTED_VECTORS`] 截断并如实报告，
-//! 而不是写一份残缺数据——被截断的部分下次会重新嵌入，结果仍然正确。
+//! 是实打实的省钱与省时间。容量不足时按实际 JSON 字节预算截断并如实报告；被截断的
+//! 部分下次会重新嵌入，结果仍然正确。
 //!
 //! 真正解除容量上限仍要靠 blob 存储（见 `adr-storage.md` 的 V2），届时换掉序列化层即可，
 //! 检索逻辑不受影响。
@@ -29,13 +29,26 @@ mod tests;
 
 use crate::model::EmbeddingSpace;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-/// 允许持久化的最大向量条数。
+/// 语义快照允许占用的最大 JSON 字节数。
 ///
-/// 宿主存储 8 MiB、每次写入重写全量。单条量化记录约 1.4 KB（1024 维 int8 经 base64
-/// 膨胀后约 1366 字节，加 chunk ID 与路径约 100 字节），5000 条约 7 MiB，
-/// 给 manifest 与哈希表留出余量。超出部分不写入，下次启动重新嵌入。
-const MAX_PERSISTED_VECTORS: usize = 5_000;
+/// 宿主存储总上限为 8 MiB；保留约 1 MiB 给 manifest、文件哈希表和 JSON 信封。
+/// 快照构建按序列化后的真实字节数判断，而不是用固定条数猜测不同仓库的路径长度。
+const MAX_SEMANTIC_SNAPSHOT_BYTES: usize = 7 * 1024 * 1024;
+
+/// 语义快照中的向量量化格式。
+///
+/// `Int8` 是旧快照的兼容格式；新快照使用 `Int4`，把相邻两个维度打包进一个字节。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticQuantization {
+    /// 每个维度使用一个有符号字节。
+    #[default]
+    Int8,
+    /// 每个维度使用四位有符号分量，两个维度共享一个字节。
+    Int4,
+}
 
 /// 一条可持久化的量化向量记录。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,9 +57,14 @@ pub struct SemanticRecord {
     pub chunk_id: String,
     /// 所属文件路径。
     pub file_path: String,
+    /// 生成该向量时对应的代码块内容哈希。
+    ///
+    /// 旧快照没有该字段；恢复后会被视为待重新嵌入，避免复用正文已经变化的向量。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
     /// 还原量化分量所需的缩放因子。
     pub scale: f32,
-    /// base64 编码的 int8 分量。
+    /// base64 编码的量化分量，具体打包方式由快照格式决定。
     pub vector: String,
 }
 
@@ -57,6 +75,9 @@ pub struct SemanticSnapshot {
     pub space_id: String,
     /// 向量维度，用于加载时校验。
     pub dimension: u32,
+    /// 向量分量的打包格式；旧快照缺失该字段时按 int8 读取。
+    #[serde(default)]
+    pub quantization: SemanticQuantization,
     /// 量化后的向量记录。
     pub records: Vec<SemanticRecord>,
     /// 是否因容量上限被截断。
@@ -70,6 +91,8 @@ struct SemanticEntry {
     chunk_id: String,
     /// 所属文件路径，用于 `path_scope` 过滤。
     file_path: String,
+    /// 生成向量时对应的代码块内容哈希。
+    content_hash: Option<String>,
     /// 已归一化的向量。
     vector: Vec<f32>,
 }
@@ -144,7 +167,13 @@ impl SemanticIndex {
     /// 同一 `chunk_id` 重复写入时替换旧值，使增量重建无需先删除。向量在写入时归一化，
     /// 检索因此可以用点积代替余弦相似度。零向量被丢弃——它无法归一化，且与任何查询的
     /// 相似度都是零，留着只会白白拖慢扫描。
-    pub fn upsert(&mut self, chunk_id: &str, file_path: &str, vector: &[f32]) {
+    pub fn upsert(
+        &mut self,
+        chunk_id: &str,
+        file_path: &str,
+        content_hash: Option<&str>,
+        vector: &[f32],
+    ) {
         let Some(normalized) = normalize(vector) else {
             return;
         };
@@ -155,21 +184,41 @@ impl SemanticIndex {
         {
             Some(existing) => {
                 existing.file_path = file_path.to_string();
+                existing.content_hash = content_hash.map(str::to_string);
                 existing.vector = normalized;
             }
             None => self.entries.push(SemanticEntry {
                 chunk_id: chunk_id.to_string(),
                 file_path: file_path.to_string(),
+                content_hash: content_hash.map(str::to_string),
                 vector: normalized,
             }),
         }
     }
 
-    /// 判断某个 chunk 是否已有向量。
+    /// 判断某个 chunk 是否已有与当前正文一致的向量。
     ///
-    /// 增量嵌入依赖它跳过已算过的 chunk：在 API 模式下重复嵌入等于重新付费。
-    pub fn contains(&self, chunk_id: &str) -> bool {
-        self.entries.iter().any(|entry| entry.chunk_id == chunk_id)
+    /// 增量嵌入依赖它跳过已算过的 chunk：在 API 模式下重复嵌入等于重新付费；只比较
+    /// chunk ID 会错误复用正文变化后的旧向量，因此内容哈希必须同时一致。
+    pub fn contains_current(&self, chunk_id: &str, content_hash: &str) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.chunk_id == chunk_id && entry.content_hash.as_deref() == Some(content_hash)
+        })
+    }
+
+    /// 移除当前结构索引中已不存在或内容哈希已变化的向量。
+    ///
+    /// 返回删除条数。调用方应在计算待嵌入集合前执行，使删除、重命名和正文变化不会在
+    /// 持久快照中累积孤儿记录。
+    pub fn retain_current(&mut self, chunks: &[(&str, &str)]) -> usize {
+        let current: HashMap<&str, &str> = chunks.iter().copied().collect();
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            current
+                .get(entry.chunk_id.as_str())
+                .is_some_and(|hash| entry.content_hash.as_deref() == Some(*hash))
+        });
+        before - self.entries.len()
     }
 
     /// 移除一个文件的全部向量，供增量重建使用。
@@ -204,9 +253,7 @@ impl SemanticIndex {
         let mut scored: Vec<(&str, f32)> = self
             .entries
             .iter()
-            .filter(|entry| {
-                path_scope.is_none_or(|scope| entry.file_path.starts_with(scope))
-            })
+            .filter(|entry| path_scope.is_none_or(|scope| entry.file_path.starts_with(scope)))
             .map(|entry| (entry.chunk_id.as_str(), dot(&query, &entry.vector)))
             .collect();
         scored.sort_by(|left, right| {
@@ -225,32 +272,45 @@ impl SemanticIndex {
     /// 导出可持久化的量化快照。
     ///
     /// 未声明嵌入空间时返回 `None`——没有空间标识的向量无法判断加载时是否仍然可比。
-    /// 条数超过 [`MAX_PERSISTED_VECTORS`] 时截断并置位 `truncated`，
+    /// 序列化体积超过 [`MAX_SEMANTIC_SNAPSHOT_BYTES`] 时截断并置位 `truncated`，
     /// 而不是放弃整份快照：存下大部分依然能省掉大部分嵌入调用。
     pub fn snapshot(&self) -> Option<SemanticSnapshot> {
+        self.snapshot_with_budget(MAX_SEMANTIC_SNAPSHOT_BYTES)
+    }
+
+    /// 按给定 JSON 字节预算导出 int4 快照。
+    ///
+    /// 该内部入口让容量边界可以用小夹具精确测试；正式调用统一使用宿主预算。
+    fn snapshot_with_budget(&self, max_bytes: usize) -> Option<SemanticSnapshot> {
         let space = self.space.as_ref()?;
         let dimension = self.entries.first().map(|entry| entry.vector.len())?;
-        let truncated = self.entries.len() > MAX_PERSISTED_VECTORS;
-        let records = self
-            .entries
-            .iter()
-            .take(MAX_PERSISTED_VECTORS)
-            .map(|entry| {
-                let (scale, quantized) = quantize(&entry.vector);
-                SemanticRecord {
-                    chunk_id: entry.chunk_id.clone(),
-                    file_path: entry.file_path.clone(),
-                    scale,
-                    vector: base64_encode(&quantized),
-                }
-            })
-            .collect();
-        Some(SemanticSnapshot {
+        let mut snapshot = SemanticSnapshot {
             space_id: space.id(),
             dimension: u32::try_from(dimension).unwrap_or(u32::MAX),
-            records,
-            truncated,
-        })
+            quantization: SemanticQuantization::Int4,
+            records: Vec::new(),
+            truncated: false,
+        };
+        let mut serialized_bytes = serde_json::to_vec(&snapshot).ok()?.len();
+        for entry in &self.entries {
+            let (scale, quantized) = quantize_int4(&entry.vector);
+            let record = SemanticRecord {
+                chunk_id: entry.chunk_id.clone(),
+                file_path: entry.file_path.clone(),
+                content_hash: entry.content_hash.clone(),
+                scale,
+                vector: base64_encode(&quantized),
+            };
+            let separator = usize::from(!snapshot.records.is_empty());
+            let record_bytes = serde_json::to_vec(&record).ok()?.len() + separator;
+            if serialized_bytes.saturating_add(record_bytes) > max_bytes {
+                snapshot.truncated = true;
+                break;
+            }
+            serialized_bytes += record_bytes;
+            snapshot.records.push(record);
+        }
+        Some(snapshot)
     }
 
     /// 从持久化快照恢复向量。
@@ -266,42 +326,79 @@ impl SemanticIndex {
             let Some(bytes) = base64_decode(&record.vector) else {
                 continue;
             };
-            if bytes.len() != snapshot.dimension as usize {
+            let dimension = snapshot.dimension as usize;
+            let expected_bytes = match snapshot.quantization {
+                SemanticQuantization::Int8 => dimension,
+                SemanticQuantization::Int4 => dimension.div_ceil(2),
+            };
+            if bytes.len() != expected_bytes {
                 continue;
             }
-            let vector = dequantize(&bytes, record.scale);
-            self.upsert(&record.chunk_id, &record.file_path, &vector);
+            let vector = match snapshot.quantization {
+                SemanticQuantization::Int8 => dequantize_int8(&bytes, record.scale),
+                SemanticQuantization::Int4 => dequantize_int4(&bytes, record.scale, dimension),
+            };
+            self.upsert(
+                &record.chunk_id,
+                &record.file_path,
+                record.content_hash.as_deref(),
+                &vector,
+            );
         }
         !self.entries.is_empty()
     }
 }
 
-/// 把归一化向量量化为 int8 分量与一个缩放因子。
+/// 把归一化向量量化为 int4 分量与一个缩放因子。
 ///
 /// 缩放因子取最大绝对值而不是固定 `1.0`：归一化向量的分量普遍远小于 1，
 /// 用固定刻度会浪费掉大部分量化区间，误差反而更大。
-fn quantize(vector: &[f32]) -> (f32, Vec<u8>) {
+fn quantize_int4(vector: &[f32]) -> (f32, Vec<u8>) {
     let peak = vector
         .iter()
         .map(|value| value.abs())
         .fold(0.0f32, f32::max);
     if peak <= f32::EPSILON {
-        return (0.0, vec![0; vector.len()]);
+        return (0.0, vec![0x88; vector.len().div_ceil(2)]);
     }
-    let scale = peak / 127.0;
-    let quantized = vector
-        .iter()
-        .map(|value| ((value / scale).round().clamp(-127.0, 127.0) as i8) as u8)
-        .collect();
-    (scale, quantized)
+    let scale = peak / 7.0;
+    let mut packed = Vec::with_capacity(vector.len().div_ceil(2));
+    for pair in vector.chunks(2) {
+        let high = quantize_nibble(pair[0], scale);
+        let low = pair
+            .get(1)
+            .map_or(8, |value| quantize_nibble(*value, scale));
+        packed.push((high << 4) | low);
+    }
+    (scale, packed)
 }
 
-/// 把 int8 分量还原为浮点向量。
-fn dequantize(bytes: &[u8], scale: f32) -> Vec<f32> {
+/// 把一个浮点分量压缩为偏移后的四位有符号值。
+fn quantize_nibble(value: f32, scale: f32) -> u8 {
+    let quantized = (value / scale).round().clamp(-7.0, 7.0) as i8;
+    (quantized + 8) as u8
+}
+
+/// 把旧快照的 int8 分量还原为浮点向量。
+fn dequantize_int8(bytes: &[u8], scale: f32) -> Vec<f32> {
     bytes
         .iter()
         .map(|byte| f32::from(*byte as i8) * scale)
         .collect()
+}
+
+/// 把打包的 int4 分量还原为指定维度的浮点向量。
+fn dequantize_int4(bytes: &[u8], scale: f32, dimension: usize) -> Vec<f32> {
+    let mut vector = Vec::with_capacity(dimension);
+    for byte in bytes {
+        for nibble in [byte >> 4, byte & 0x0F] {
+            if vector.len() == dimension {
+                return vector;
+            }
+            vector.push(f32::from(nibble as i8 - 8) * scale);
+        }
+    }
+    vector
 }
 
 /// base64 字母表。
@@ -367,11 +464,7 @@ fn normalize(vector: &[f32]) -> Option<Vec<f32>> {
     if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
         return None;
     }
-    let norm = vector
-        .iter()
-        .map(|value| value * value)
-        .sum::<f32>()
-        .sqrt();
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
     if norm <= f32::EPSILON {
         return None;
     }
@@ -382,8 +475,5 @@ fn normalize(vector: &[f32]) -> Option<Vec<f32>> {
 ///
 /// 两侧都已归一化时，点积即余弦相似度。
 fn dot(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right.iter())
-        .map(|(a, b)| a * b)
-        .sum()
+    left.iter().zip(right.iter()).map(|(a, b)| a * b).sum()
 }

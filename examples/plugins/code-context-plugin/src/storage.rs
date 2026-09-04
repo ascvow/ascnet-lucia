@@ -1,16 +1,16 @@
 //! 索引持久化。
 //!
-//! 按 `docs/code-context-engine/adr-storage.md` 的分层决策：**只有体量受控的元数据**
-//! 走宿主的 JSON KV 持久存储，chunk、倒排索引与向量不放在这里。宿主存储当前是单个
-//! JSON 文件、8 MiB 上限、每次写入重写全量，装不下索引本体。
+//! 按 `docs/code-context-engine/adr-storage.md` 的分层决策：结构 chunk 与倒排索引保持内存驻留，
+//! 体量受控的 manifest、文件哈希表和 int4 语义快照走宿主 JSON KV。宿主存储当前是单个
+//! JSON 文件、8 MiB 上限、每次写入重写全量，因此语义快照必须按真实字节预算截断。
 //!
 //! 存储位置由宿主按插件 ID 与作用域派生，插件不能指定磁盘路径，因此索引不会污染
 //! 用户仓库。`Workspace` 作用域天然实现按项目隔离。
 //!
 //! # 键命名
 //!
-//! 全部键使用 `index.` 前缀，为将来的块存储迁移留出独立命名空间。当前只有
-//! [`MANIFEST_KEY`] 一个键；Phase 2 起会增加文件哈希表，Phase 10 起向量迁往块存储。
+//! 全部键使用 `index.` 前缀，为将来的块存储迁移留出独立命名空间。当前包含 manifest、
+//! 文件哈希表和量化语义快照三个键。
 
 use crate::error::CodeContextError;
 use crate::model::IndexManifest;
@@ -183,7 +183,7 @@ impl IndexStore {
 
     /// 保存语义向量快照。
     ///
-    /// 快照本身已按 `MAX_PERSISTED_VECTORS` 截断，这里只负责序列化与写入。
+    /// 快照本身已按语义索引定义的 JSON 字节预算截断，这里只负责序列化与写入。
     ///
     /// # Errors
     ///

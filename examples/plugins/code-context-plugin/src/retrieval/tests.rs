@@ -453,7 +453,12 @@ fn semantic_fixture(index: &crate::index::StructuralIndex) -> crate::semantic::S
     for (position, chunk) in index.chunks().enumerate().take(8) {
         let mut vector = vec![0.0f32; 8];
         vector[position] = 1.0;
-        semantic.upsert(&chunk.id, &chunk.file_path, &vector);
+        semantic.upsert(
+            &chunk.id,
+            &chunk.file_path,
+            Some(&chunk.content_hash),
+            &vector,
+        );
     }
     semantic
 }
