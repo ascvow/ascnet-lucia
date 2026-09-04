@@ -1593,11 +1593,43 @@ fn real_repo_every_query_finds_target() {
             .iter()
             .any(|pattern| found.iter().any(|path| path.contains(pattern)))
         {
+            let target_candidates = plugin
+                .search_candidates(bq.query, None, 10_000)
+                .into_iter()
+                .flatten()
+                .filter_map(|candidate| {
+                    let chunk = plugin.index()?.chunk(&candidate.chunk_id)?;
+                    bq.expected_path_patterns
+                        .iter()
+                        .any(|pattern| chunk.file_path.contains(pattern))
+                        .then(|| {
+                            format!(
+                                "{}#{} score={:.6} {}:{}",
+                                candidate.source.as_str(),
+                                candidate.rank,
+                                candidate.score,
+                                chunk.file_path,
+                                chunk.symbol_name.as_deref().unwrap_or("-")
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
             failures.push(format!(
-                "查询 {:35} 期望匹配 {:?}，实际 top-5: {:?}",
+                "查询 {:35} 期望匹配 {:?}，目标候选 {:?}，实际 top-20:\n{}",
                 bq.query,
                 bq.expected_path_patterns,
-                found.iter().take(5).collect::<Vec<_>>()
+                target_candidates,
+                results
+                    .iter()
+                    .map(|result| format!(
+                        "  {:.6} {}:{} ({})",
+                        result.score,
+                        result.file_path,
+                        result.symbol_name.as_deref().unwrap_or("-"),
+                        result.debug.reason()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
     }

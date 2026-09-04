@@ -150,6 +150,22 @@ pub fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
+/// 把查询文本切成用于相关性计算的词元。
+///
+/// 索引阶段保留中日韩单字以支持单字查询；多字查询已经拥有区分度更高的双字词元，继续把
+/// 每个单字等权加入 BM25 会放大“化”“引”这类高频噪声。查询侧因此仅在存在双字词元时
+/// 移除中日韩单字，独立单字查询仍保持原有召回能力。
+pub fn tokenize_query(text: &str) -> Vec<String> {
+    let mut tokens = tokenize(text);
+    let has_cjk_bigram = tokens
+        .iter()
+        .any(|token| token.chars().count() > 1 && token.chars().all(is_cjk));
+    if has_cjk_bigram {
+        tokens.retain(|token| !(token.chars().count() == 1 && token.chars().all(is_cjk)));
+    }
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +255,20 @@ mod tests {
         assert!(tokens.iter().any(|token| token == "权"));
         assert!(tokens.iter().any(|token| token == "权限"));
         assert!(tokens.iter().any(|token| token == "检查"));
+    }
+
+    /// 多字中文查询只应保留区分度更高的双字词元，避免高频单字主导 BM25。
+    #[test]
+    fn query_tokens_drop_cjk_unigrams_when_bigrams_exist() {
+        let tokens = tokenize_query("权限 provider 审批流程");
+
+        assert_eq!(tokens, ["权限", "provider", "审批", "批流", "流程"]);
+    }
+
+    /// 独立中文单字没有可替代的双字词元，必须继续支持检索。
+    #[test]
+    fn query_tokens_keep_standalone_cjk_unigrams() {
+        assert_eq!(tokenize_query("权 限"), ["权", "限"]);
     }
 
     /// 中英混排必须各自正确切分。

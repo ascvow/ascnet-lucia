@@ -32,7 +32,7 @@ Guest 负责配置校验、仓库身份、索引状态、manifest 兼容性、�
 ## Capabilities
 
 - `workspace_read`：Host 注入当前项目可信根；首次检索时递归扫描并建立索引。
-- `storage`：保存 `index.manifest`，由 Host 按插件和 Workspace 作用域隔离。
+- `storage`：保存 manifest、文件哈希表和 int4 语义快照，由 Host 按插件和 Workspace 作用域隔离。
 
 插件仅在 API 嵌入模式下申请受限 HTTP 网络能力，不申请 secret、子进程、会话、文件写入或
 本地推理能力。
@@ -49,17 +49,18 @@ Guest 负责配置校验、仓库身份、索引状态、manifest 兼容性、�
 
 ## 直接搜索当前仓库
 
-默认先通过 SiliconFlow `BAAI/bge-m3` 为整个仓库的全部代码块生成向量，再执行符号、BM25
-与语义三路混合检索。API 密钥只从环境变量读取，不写入命令参数或插件元数据：
+首次运行默认通过 SiliconFlow `BAAI/bge-m3` 为整个仓库的全部代码块生成向量，再执行符号、
+BM25 与语义三路混合检索。API 密钥只从环境变量读取，不写入命令参数、缓存或插件元数据：
 
 ```bash
 export SILICONFLOW_API_KEY='<你的密钥>'
 cargo run -p code-context-plugin --example search_repository --features test-support
 ```
 
-命令先完成全仓库向量化，再显示 `搜索>` 提示符。此后可以连续输入自然语言或代码标识符，
-输入 `exit`、`quit` 或 `:q` 结束；同一进程中的查询会复用已经建立的向量索引。也可以在
-命令末尾直接提供一条查询，以单次搜索模式运行。
+命令先完成全仓库索引，再显示 `搜索>` 提示符。语义向量以 int4 快照保存到
+`~/.lucia/code-context/`，同一仓库第二次运行会复用未变化代码块，只重新计算新增或内容变化的
+代码块。可以连续输入自然语言或代码标识符，输入 `exit`、`quit` 或 `:q` 结束；也可以在命令
+末尾直接提供一条查询，以单次搜索模式运行。
 
 限定搜索目录并控制结果数：
 
@@ -69,9 +70,16 @@ cargo run -p code-context-plugin --example search_repository --features test-sup
 ```
 
 命令会读取当前 Lucia 仓库中所有受支持的源码、文档和配置文件，完成索引后输出文件路径、
-行号、符号名称和代码片段。使用 `--root <路径>` 可以搜索其他仓库；使用
+行号、符号名称和代码片段。使用 `--root <路径>` 可以搜索其他仓库；`--cache-dir <目录>`
+可覆盖默认缓存位置，`--rebuild-cache` 强制重新生成全部向量，`--no-cache` 禁用跨进程缓存。
+使用
 `--embedding-base-url`、`--embedding-api-key-env`、`--embedding-model`、
 `--embedding-dimension` 和 `--embedding-batch-size` 可以连接其他 OpenAI 兼容嵌入端点。
+
+融合排序会区分查询形态：`Agent`、`PermissionManager::check` 这类独立标识符保留精确符号
+提升；“一个agent对话”这类自然语言会压低普通精确词的符号权重，语义通道可用时同时提高
+语义权重。语义不可用时，前缀与后缀符号匹配恢复标准权重，避免纯词法降级丢失分散在不同
+代码块里的有效信号。多字中文查询只用双字词元参与 BM25，单字查询仍然可用。
 
 没有嵌入端点时可以显式追加 `--lexical-only`，只验证符号与 BM25 检索。该模式不会生成
 向量，也不能作为语义搜索验收结果。

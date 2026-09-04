@@ -12,7 +12,7 @@
 //! 字段加权：符号名的词元按 5 倍计，正文按 1 倍计。这样 BM25 无需改动公式即可体现字段
 //! 重要性，也避免了维护多套倒排表。
 
-use super::tokenize::tokenize;
+use super::tokenize::{tokenize, tokenize_query};
 use crate::model::CodeChunk;
 use std::collections::{HashMap, HashSet};
 
@@ -230,7 +230,7 @@ impl LexicalIndex {
         if self.documents.is_empty() || limit == 0 {
             return Vec::new();
         }
-        let terms = tokenize(query);
+        let terms = tokenize_query(query);
         if terms.is_empty() {
             return Vec::new();
         }

@@ -312,7 +312,13 @@ fn exact_symbol_match_outranks_multi_channel_lexical() {
         vec![candidate(&noisy, CandidateSource::Semantic, 1)],
     ];
 
-    let results = fuse(&channels, "", &index, &FusionConfig::default(), 10);
+    let results = fuse(
+        &channels,
+        "PermissionManager::check",
+        &index,
+        &FusionConfig::default(),
+        10,
+    );
 
     assert_eq!(
         results[0].chunk_id,
@@ -321,6 +327,91 @@ fn exact_symbol_match_outranks_multi_channel_lexical() {
         names(&results)
     );
     assert!(results[0].debug.symbol_boost > 0.0);
+}
+
+/// 自然语言里夹带的普通符号词不得靠符号与词法重复计分压过真正的语义命中。
+#[test]
+fn natural_language_prefers_semantic_match_over_generic_symbol_word() {
+    let (index, _) = fixture();
+    let generic = chunk_id_of(&index, "PermissionManager::check");
+    let relevant = chunk_id_of(&index, "SessionStore::persist");
+    let mut generic_symbol = candidate(&generic, CandidateSource::Symbol, 1);
+    generic_symbol.symbol_match = Some(SymbolMatch::ExactName);
+    let channels = vec![
+        vec![generic_symbol],
+        vec![candidate(&generic, CandidateSource::Lexical, 1)],
+        vec![candidate(&relevant, CandidateSource::Semantic, 1)],
+    ];
+
+    let results = fuse(
+        &channels,
+        "一个agent对话",
+        &index,
+        &FusionConfig::default(),
+        10,
+    );
+
+    assert_eq!(results[0].chunk_id, relevant, "实际 {:?}", names(&results));
+    let generic_result = results
+        .iter()
+        .find(|result| result.chunk_id == generic)
+        .expect("普通符号候选应仍被保留");
+    assert_eq!(generic_result.debug.symbol_boost, 0.0);
+}
+
+/// 语义通道缺席时必须恢复符号通道标准权重，保证纯词法降级仍能合并代码导航信号。
+#[test]
+fn natural_language_fallback_keeps_full_symbol_weight() {
+    let (index, _) = fixture();
+    let target = chunk_id_of(&index, "PermissionManager::check");
+    let competitor = chunk_id_of(&index, "SessionStore::persist");
+    let mut target_symbol = candidate(&target, CandidateSource::Symbol, 20);
+    target_symbol.symbol_match = Some(SymbolMatch::NamePrefix);
+    let channels = vec![
+        vec![target_symbol],
+        vec![
+            candidate(&competitor, CandidateSource::Lexical, 1),
+            candidate(&target, CandidateSource::Lexical, 20),
+        ],
+    ];
+
+    let results = fuse(
+        &channels,
+        "查找权限处理逻辑",
+        &index,
+        &FusionConfig::default(),
+        10,
+    );
+
+    assert_eq!(results[0].chunk_id, target, "实际 {:?}", names(&results));
+    assert_eq!(results[0].debug.symbol_boost, 0.0);
+}
+
+/// 纯词法降级也不能把自然语言中的普通精确词重复当成代码导航意图。
+#[test]
+fn natural_language_fallback_still_suppresses_generic_exact_symbol() {
+    let (index, _) = fixture();
+    let generic = chunk_id_of(&index, "PermissionManager::check");
+    let relevant = chunk_id_of(&index, "SessionStore::persist");
+    let mut generic_symbol = candidate(&generic, CandidateSource::Symbol, 20);
+    generic_symbol.symbol_match = Some(SymbolMatch::ExactName);
+    let channels = vec![
+        vec![generic_symbol],
+        vec![
+            candidate(&relevant, CandidateSource::Lexical, 1),
+            candidate(&generic, CandidateSource::Lexical, 20),
+        ],
+    ];
+
+    let results = fuse(
+        &channels,
+        "一个agent对话",
+        &index,
+        &FusionConfig::default(),
+        10,
+    );
+
+    assert_eq!(results[0].chunk_id, relevant, "实际 {:?}", names(&results));
 }
 
 /// 弱符号匹配不得获得提升。
@@ -349,9 +440,15 @@ fn qualified_match_boost_exceeds_name_match() {
     let boost_of = |kind: SymbolMatch| {
         let mut item = candidate(&target, CandidateSource::Symbol, 1);
         item.symbol_match = Some(kind);
-        fuse(&[vec![item]], "", &index, &FusionConfig::default(), 10)[0]
-            .debug
-            .symbol_boost
+        fuse(
+            &[vec![item]],
+            "PermissionManager::check",
+            &index,
+            &FusionConfig::default(),
+            10,
+        )[0]
+        .debug
+        .symbol_boost
     };
 
     assert!(boost_of(SymbolMatch::ExactQualified) > boost_of(SymbolMatch::ExactName));
@@ -392,6 +489,8 @@ fn path_boost_is_weaker_than_symbol_boost() {
     let config = FusionConfig::default();
     assert!(config.path_boost < config.name_match_boost);
     assert!(config.name_match_boost < config.exact_symbol_boost);
+    assert!(config.natural_language_symbol_weight < 1.0);
+    assert!(config.natural_language_semantic_weight > 1.0);
 }
 
 /// 全部提升必须以 rank-1 当量表达，使量级可读。
@@ -441,7 +540,7 @@ fn debug_reason_is_readable() {
 
     let results = fuse(
         &[vec![item]],
-        "session store",
+        "session",
         &index,
         &FusionConfig::default(),
         10,

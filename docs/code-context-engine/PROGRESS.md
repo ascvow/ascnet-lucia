@@ -7,15 +7,15 @@
 
 ## Current Phase
 
-Phase 13 — Agent Tool Integration
+Phase 14 — Retrieval Benchmark
 
 Status: COMPLETE
 Completed Date: 2026-09-04
 
-`code_search` 工具已接入完整检索管线：混合检索 → RRF 融合 → 上下文打包 → 带代码片段的
-结构化成功结果。语义不可用时自动降级为两路检索，不返回错误。
+fixture 与完整 Lucia 仓库基准均已通过。查询侧中文高频单字不再干扰 BM25；融合层会根据
+语义通道是否存在调整自然语言中的符号权重，同时保留独立标识符的精确导航能力。
 
-下一步：Phase 14 — Retrieval Benchmark（校准 BUILD_BUDGET、BM25 参数、融合提升与 token 估算）。
+下一步：Phase 15 — Hardening。
 
 ## Overall Status
 
@@ -27,13 +27,13 @@ Completed Date: 2026-09-04
 - [x] Phase 5 — Lexical & Symbol Retrieval
 - [x] Phase 6 — Embedding Abstraction
 - [x] Phase 7 — API Embedding Provider（本轮实现宿主 HTTP 能力，阻塞解除）
-- [x] Phase 8 — Semantic Vector Index（int8 量化持久化，启动时恢复）
+- [x] Phase 8 — Semantic Vector Index（int4 量化持久化，启动时恢复）
 - [x] Phase 9 — Hybrid Retrieval
 - [x] Phase 10 — Context Builder
 - [x] Phase 11 — Incremental Indexing
 - [ ] Phase 12 — Local Embedding Provider — **BLOCKED**（Host 无 embedding 能力）
 - [x] Phase 13 — Agent Tool Integration
-- [ ] Phase 14 — Retrieval Benchmark
+- [x] Phase 14 — Retrieval Benchmark
 - [ ] Phase 15 — Hardening
 
 **实际执行顺序**：
@@ -77,6 +77,7 @@ Phase 7 / 8 原计划跳过，在 Phase 11 之后因宿主 HTTP 能力落地而�
 
 Status: COMPLETE
 Completed Date: 2026-09-03
+Updated Date: 2026-09-04
 
 Summary：复核既有设计文档与仓库实际实现的一致性。全部已有文档已读取，Plugin / Host 边界、
 存储决策、API 与 Local 嵌入路径的结论在当前代码上重新验证，**全部仍然成立**。
@@ -820,8 +821,8 @@ Summary：本阶段原被列为 BLOCKED，理由是「无可用 embedding provid
 它们的处理方式是内存驻留、进程启动后按需重建。向量走同一条路，语义检索因此在 V1 成立。
 
 Implemented:
-- **`SemanticIndex`**：chunk 向量的内存驻留存储，支持 upsert / `contains` /
-  `remove_file` / 按嵌入空间重置与兼容性判断。
+- **`SemanticIndex`**：chunk 向量的内存驻留存储，支持 upsert / `contains_current` /
+  `retain_current` / `remove_file` / 按嵌入空间重置与兼容性判断。
 - **线性精确扫描而非 ANN**：代码仓库 chunk 在数千到数万量级，此时线性扫描常数更小，
   且结果精确、行为确定——近似索引会让同一查询在索引重建后给出不同结果，
   破坏检索质量的可回归性。
@@ -839,11 +840,17 @@ Implemented:
 
 Tests：新增 14 项语义索引测试、5 项通道接线测试、5 项端到端测试。插件单测 301 → 324。
 
-**向量持久化已实现（int8 量化）**：f32 向量量化为 int8 + scale factor，base64 编码后
-存入 `host-store` 的 `index.semantic` 键。1024 维 × 5000 条约 5 MiB，在 8 MiB 限制内。
-进程重启时按 `space_id` 校验兼容性：匹配则恢复、不匹配则丢弃并重新嵌入。
-`vectors_are_persisted_and_restored` 端到端测试验证：首次运行 33 次 HTTP 调用，
-重启后 0 次调用且检索结果仍然可用。
+**向量持久化已实现（int4 量化）**：f32 向量以单条 scale factor 加四位有符号分量打包，
+两个维度共用一个字节，base64 编码后存入 `host-store` 的 `index.semantic` 键。快照不再按固定
+条数截断，而是按 7 MiB 实际 JSON 字节预算保留记录，给 8 MiB Host KV 中的 manifest 与
+文件哈希表留出空间。进程重启时先按 `space_id` 校验嵌入空间，再按 chunk 内容哈希校验每条
+向量；旧 int8 快照仍可读取，但因缺少内容哈希会安全地重新嵌入一次。删除、重命名和正文变化
+产生的旧记录会在写回快照前清理。
+
+`search_repository` 的测试宿主已使用原子 JSON 文件把 Workspace 存储落到
+`~/.lucia/code-context/`，按仓库路径哈希隔离。离线回归验证了首次构建会请求文档向量、重新
+打开同一缓存时零文档请求、正文变化后只重新请求变化代码块；真实 SiliconFlow 全仓库二次
+复用仍需在有凭证环境中运行两次命令确认。
 
 Next: Phase 13 — Agent Tool Integration
 
@@ -898,6 +905,42 @@ Known limitations:
 
 Next: Phase 14 — Retrieval Benchmark
 
+---
+
+### Phase 14 — Retrieval Benchmark
+
+Status: COMPLETE
+Completed Date: 2026-09-04
+
+Summary：建立 fixture 与完整 Lucia 仓库两级检索基准，覆盖独立标识符、中文自然语言、
+中英混合查询、路径相关查询、符号 / BM25 / 语义融合和 token 预算。调优后全部查询都能在
+规定候选范围内找到目标文件。
+
+Implemented:
+- **查询侧中文降噪**：索引继续保留单字与双字词元；多字中文查询只让双字词元参与 BM25，
+  避免“化”“引”等高频单字主导排序，独立单字查询保持可用。
+- **按可用通道调整符号权重**：自然语言中的普通精确符号保持弱提示；有语义通道时全面压低
+  符号噪声，缺少语义通道时让前缀 / 后缀符号恢复标准权重。这样“一个agent对话”优先返回
+  TUI 对话框实现，“索引 manifest 持久化”同时能命中 `storage.rs`。
+- **失败诊断**：真实仓库基准失败时打印 top-20 分数、各通道排名和目标文件原始候选排名，
+  后续调参可以直接定位召回还是融合问题。
+- **容量回归**：6500 条 1024 维 int4 向量及真实长度的 chunk ID、内容哈希和路径可完整装入
+  7 MiB 语义快照预算，不触发截断。
+
+Benchmark Result:
+- fixture：Recall@1 `0.781`，Recall@5 `0.969`，MRR `0.885`。
+- 完整仓库：341 个输入文件、340 个已索引文件、6471 个代码块、6200 个符号，16 个预算
+  轮次完成；Recall@1 `0.600`、Recall@5 `0.867`、Recall@10 `0.933`、MRR `0.710`。
+- 真实 SiliconFlow 查询未在本次会话重跑：当前进程没有 `SILICONFLOW_API_KEY`。离线端到端测试
+  已覆盖三路融合与跨进程向量复用，不能把它替代为真实服务验收。
+
+Tests Executed / Result:
+- `cargo test -p code-context-plugin --lib`：338 项通过。
+- `cargo test -p code-context-plugin --test retrieval_benchmark -- --nocapture`：9 项通过。
+- `cargo test -p code-context-plugin --example search_repository --features test-support`：7 项通过。
+
+Next: Phase 15 — Hardening
+
 ## Blocked Phases
 
 一个阶段因 Host 能力缺失无法实现。按开发任务书 §25，记录 Blocker 而**不绕开架构做 hack 实现**。
@@ -941,7 +984,7 @@ Recommended solution：方案 1。在此之前产品显示 `Local Mode: NOT SUPP
 
 ## Active Work
 
-Phase 14 — Retrieval Benchmark。校准 BUILD_BUDGET、BM25 参数、融合提升与 token 估算。
+Phase 15 — Hardening。继续验证超大仓库、fuel、内存和宿主存储配额边界。
 
 ## Known Issues
 
@@ -1011,9 +1054,9 @@ Tier 3  文本分块              —— 未覆盖语言、解析失败、无声
 
 ## Next Action
 
-Phase 13 已完成：`code_search` 返回真实检索结果，含代码片段、符号元数据与定位信息。
+Phase 14 已完成：fixture 与完整仓库检索基准通过，中文查询和自然语言融合权重已校准。
 Phase 12 — Local Embedding Provider 受 Host embedding 能力缺失阻塞（跳过）；
-下一步进入 Phase 14 — Retrieval Benchmark，随后 Phase 15 — Hardening。
+下一步进入 Phase 15 — Hardening。
 
 ---
 

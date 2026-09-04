@@ -6,9 +6,11 @@
 //! 将来的语义通道是余弦相似度。把它们加权相加需要先归一化，而归一化本身又依赖分布假设——
 //! 换一个仓库就失效。
 //!
-//! RRF 只用**排名**：`score = Σ 1 / (k + rank)`。这带来一条关键性质——
+//! RRF 只用**排名**：`score = Σ weight(channel, intent) / (k + rank)`。这带来一条关键性质——
 //! **它在任意通道子集上都成立**。语义分支缺席时，公式不需要改，权重不需要重新配，
-//! 结果依然有意义。这正是架构第 13 问要求的降级形态，也是 Phase 5 让
+//! 结果依然有意义。通道权重只区分“独立代码标识符”和“自然语言描述”：前者保留符号
+//! 精确匹配，后者降低夹带普通代码词造成的符号重复计分，并提高语义通道的影响。这正是
+//! 架构第 13 问要求的降级形态，也是 Phase 5 让
 //! [`SearchCandidate`] 携带排名而不只是分数的原因。
 //!
 //! # 全部常量集中在这里
@@ -51,6 +53,16 @@ pub struct FusionConfig {
     pub exact_symbol_boost: f32,
     /// 短名精确匹配的提升，单位为 rank-1 当量。
     pub name_match_boost: f32,
+    /// 有语义通道时，自然语言查询中的符号通道权重。
+    ///
+    /// 自然语言经常夹带 `agent`、`session` 这类普通代码词；它们同时命中符号和 BM25 时
+    /// 不应被当作用户明确查询了该符号，因此只保留弱提示。语义通道缺席时，前缀与后缀
+    /// 符号恢复标准权重；普通精确符号仍使用本权重，避免重复放大自然语言中的代码词。
+    pub natural_language_symbol_weight: f32,
+    /// 自然语言查询中的语义通道权重。
+    ///
+    /// 取 1.75 使语义第一名能够压过“符号第一名 + 词法第一名”的普通词重复命中。
+    pub natural_language_semantic_weight: f32,
     /// 查询词命中文件路径的提升，单位为 rank-1 当量。
     ///
     /// 取 1.0：路径相关是有用信号但远弱于符号命中，不应盖过内容匹配。
@@ -63,6 +75,8 @@ impl Default for FusionConfig {
             rrf_k: RRF_K,
             exact_symbol_boost: 3.0,
             name_match_boost: 1.5,
+            natural_language_symbol_weight: 0.25,
+            natural_language_semantic_weight: 1.75,
             path_boost: 1.0,
         }
     }
@@ -175,6 +189,11 @@ pub fn fuse(
     }
     let unit = config.rank_one_unit();
     let query_tokens = super::tokenize::tokenize(query);
+    let intent = QueryIntent::classify(query);
+    let semantic_available = channels
+        .iter()
+        .flatten()
+        .any(|candidate| candidate.source == CandidateSource::Semantic);
 
     // 按 chunk 聚合各通道的排名。用 Vec 而不是 HashMap：候选量在数百级，
     // 线性查找足够快，且天然保持插入顺序，便于结果确定。
@@ -191,7 +210,13 @@ pub fn fuse(
                     merged.last_mut().expect("刚插入必然存在")
                 }
             };
-            slot.rrf_score += 1.0 / (config.rrf_k + candidate.rank as f32);
+            slot.rrf_score += channel_weight(
+                candidate.source,
+                candidate.symbol_match,
+                intent,
+                semantic_available,
+                config,
+            ) / (config.rrf_k + candidate.rank as f32);
             slot.ranks.push((candidate.source, candidate.rank));
             // 同一 chunk 可能被符号通道以多种方式命中，保留最强的那一种。
             if let Some(kind) = candidate.symbol_match {
@@ -207,7 +232,7 @@ pub fn fuse(
         .into_iter()
         .filter_map(|item| {
             let chunk = index.chunk(&item.chunk_id)?;
-            let symbol_boost = symbol_boost_of(item.symbol_match, config) * unit;
+            let symbol_boost = symbol_boost_of(item.symbol_match, intent, config) * unit;
             let path_boost = path_boost_of(&query_tokens, &chunk.file_path, config) * unit;
             let mut ranks = item.ranks;
             ranks.sort_by_key(|(source, rank)| (source.as_str(), *rank));
@@ -260,6 +285,36 @@ struct Accumulator {
     symbol_match: Option<SymbolMatch>,
 }
 
+/// 查询形态决定符号精确提升和通道权重。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryIntent {
+    /// 单独的代码标识符或限定名，例如 `Agent`、`PermissionManager::check`。
+    Identifier,
+    /// 包含中文、空白或说明性标点的自然语言描述。
+    NaturalLanguage,
+}
+
+impl QueryIntent {
+    /// 根据查询表面形态做保守分类。
+    ///
+    /// 只有完全由常见标识符字符组成且不含空白的查询才视为标识符；无法确定时按自然语言
+    /// 处理，避免把普通词误当成精确代码导航意图。
+    fn classify(query: &str) -> Self {
+        let trimmed = query.trim();
+        if !trimmed.is_empty()
+            && !trimmed.chars().any(char::is_whitespace)
+            && trimmed.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '_' | ':' | '.' | '#' | '<' | '>')
+            })
+        {
+            Self::Identifier
+        } else {
+            Self::NaturalLanguage
+        }
+    }
+}
+
 impl Accumulator {
     /// 创建空聚合。
     fn new(chunk_id: &str) -> Self {
@@ -276,11 +331,45 @@ impl Accumulator {
 ///
 /// 只有精确匹配获得提升。后缀与前缀匹配不提升——它们本就是弱信号，再提升会让
 /// "查 check 命中所有名字里带 check 的东西"淹没真正的目标。
-fn symbol_boost_of(symbol_match: Option<SymbolMatch>, config: &FusionConfig) -> f32 {
+fn symbol_boost_of(
+    symbol_match: Option<SymbolMatch>,
+    intent: QueryIntent,
+    config: &FusionConfig,
+) -> f32 {
+    if intent == QueryIntent::NaturalLanguage {
+        return 0.0;
+    }
     match symbol_match {
         Some(SymbolMatch::ExactQualified) => config.exact_symbol_boost,
         Some(SymbolMatch::ExactName) => config.name_match_boost,
         _ => 0.0,
+    }
+}
+
+/// 返回指定查询意图下某个检索通道的 RRF 权重。
+fn channel_weight(
+    source: CandidateSource,
+    symbol_match: Option<SymbolMatch>,
+    intent: QueryIntent,
+    semantic_available: bool,
+    config: &FusionConfig,
+) -> f32 {
+    if intent == QueryIntent::Identifier {
+        return 1.0;
+    }
+    match source {
+        CandidateSource::Symbol if semantic_available => config.natural_language_symbol_weight,
+        CandidateSource::Symbol
+            if matches!(
+                symbol_match,
+                Some(SymbolMatch::ExactQualified | SymbolMatch::ExactName)
+            ) =>
+        {
+            config.natural_language_symbol_weight
+        }
+        CandidateSource::Symbol => 1.0,
+        CandidateSource::Lexical => 1.0,
+        CandidateSource::Semantic => config.natural_language_semantic_weight,
     }
 }
 
