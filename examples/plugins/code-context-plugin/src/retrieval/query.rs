@@ -70,6 +70,14 @@ pub struct AnalyzedQuery {
     pub identifiers: Vec<String>,
     /// 查询是否以中日韩字符为主；用于调整词法与语义通道权重。
     pub cjk_dominant: bool,
+    /// 剥离开头指令性动词后、真正送去检索的文本。
+    ///
+    /// 用户习惯把查询写成"搜索 X""帮我找 X""find X"——这些词表达的是**动作**，不是要找的
+    /// 内容，但检索层无法区分：实测"搜索 agent 一轮对话的代码实现"里的"搜索"同时污染了
+    /// 词法与语义两路，返回清一色的代码检索子系统实现，而真正的目标一条都没进来。
+    ///
+    /// 意图与目标分类仍然基于原始查询（"在哪里定义"这类措辞必须保留），只有召回使用本字段。
+    pub retrieval_text: String,
 }
 
 impl AnalyzedQuery {
@@ -97,6 +105,7 @@ impl AnalyzedQuery {
         Self {
             intent,
             goal: classify_goal(trimmed),
+            retrieval_text: strip_leading_directive(trimmed),
             identifiers,
             cjk_dominant: cjk_dominant(trimmed),
         }
@@ -390,6 +399,122 @@ fn classify_goal(query: &str) -> QueryGoal {
     QueryGoal::Behavior
 }
 
+/// 剥离查询开头的指令性动词，返回真正要检索的内容。
+///
+/// # 为什么这张表不是"随便列的"
+///
+/// 实测五种说法后可以看到，未被剥离的指令词（"看下""我想知道""帮忙定位"）只让名次
+/// 轻微波动，结果仍落在正确的文件里——它们在语料中不指代任何东西，只是噪声。真正会
+/// 造成灾难性偏离的，是**既是指令、又恰好是代码领域名词**的那批词：一个代码检索项目里
+/// 的"搜索"会把整条查询的语义拖向检索子系统，词法与语义两路同时中招。
+///
+/// 因此这张表要覆盖的不是"所有指令词"（那不可枚举），而是这批高风险的同形词，它们是
+/// 有限且稳定的。其余说法交给召回本身容错。
+///
+/// 只处理**开头**：句中的"搜索"往往是真实内容（"搜索结果怎么打包"里它就是主题）。逐个
+/// 剥离并允许连用（"帮我找一下 X"），剥净后若为空则退回原文——宁可保留噪声，也不能把
+/// 查询变成空串。
+fn strip_leading_directive(query: &str) -> String {
+    /// 开头出现即视为指令的词，按长的优先，避免"帮我找"被"找"提前截断。
+    const DIRECTIVES: &[&str] = &[
+        "帮我搜索一下",
+        "帮我查找一下",
+        "帮我找一下",
+        "帮忙搜索一下",
+        "帮忙查找一下",
+        "帮忙定位一下",
+        "帮忙找一下",
+        "帮忙搜索",
+        "帮忙查找",
+        "帮忙定位",
+        "帮忙找",
+        "帮我搜索",
+        "帮我查找",
+        "帮我找",
+        "我想找",
+        "我要找",
+        "给我找",
+        "给我看看",
+        "查找一下",
+        "搜索一下",
+        "检索一下",
+        "定位一下",
+        "找一下",
+        "看一下",
+        "看下",
+        "看看",
+        "搜索",
+        "查找",
+        "检索",
+        "查询",
+        "定位",
+        "列出",
+        "显示",
+        "search for",
+        "search",
+        "find me",
+        "find",
+        "show me",
+        "locate",
+        "look for",
+    ];
+
+    let mut current = query.trim();
+    loop {
+        let lower = current.to_ascii_lowercase();
+        let Some(directive) = DIRECTIVES
+            .iter()
+            .find(|directive| lower.starts_with(**directive))
+        else {
+            break;
+        };
+        let tail = &current[directive.len()..];
+        if !is_directive_boundary(directive, tail) {
+            break;
+        }
+        let rest = tail
+            .trim_start_matches(|character: char| character.is_whitespace() || character == ':');
+        if rest.is_empty() {
+            break;
+        }
+        current = rest;
+    }
+    current.to_string()
+}
+
+/// 判断开头的疑似指令词后面是不是真的跟着"要找的内容"。
+///
+/// # 为什么需要这条判据
+///
+/// 中文没有词边界，"搜索"既可能是指令（"搜索 agent 一轮对话"），也可能是复合名词的前半
+/// （"搜索结果怎么打包"里它就是查询主题）。无条件剥离会把后者砍成"结果怎么打包"，丢掉
+/// 最重要的限定词。
+///
+/// 两个确定性信号说明它是指令：后面跟着**分隔符**（空格、冒号），或者后面**换了字符集**
+/// （中文指令词后紧跟拉丁标识符）。中文指令词后紧跟中文且无分隔时按复合名词处理。
+///
+/// # 已知局限
+///
+/// "搜索会话保存逻辑"这类"中文指令 + 中文目标且无分隔"的写法无法与复合名词区分，会被
+/// 保守地保留。这是纯表层规则的边界；真要覆盖需要分词或模型，代价与收益暂不匹配。
+fn is_directive_boundary(directive: &str, tail: &str) -> bool {
+    let Some(next) = tail.chars().next() else {
+        return false;
+    };
+    if next.is_whitespace() || next == ':' || next == '：' {
+        return true;
+    }
+    let directive_is_cjk = directive.chars().next().is_some_and(is_cjk_char);
+    // 换字符集即视为边界：中文指令后接拉丁标识符，或英文指令后接中文。
+    directive_is_cjk != is_cjk_char(next)
+}
+
+/// 判断字符是否属于中日韩表意文字区。
+fn is_cjk_char(character: char) -> bool {
+    matches!(character as u32,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2A6DF)
+}
+
 /// 判断文本是否包含任意一个固定意图词。
 fn contains_any(text: &str, markers: &[&str]) -> bool {
     markers.iter().any(|marker| text.contains(marker))
@@ -400,6 +525,52 @@ mod tests {
     use super::*;
 
     /// 四类查询形态必须按确定性字符规则区分。
+    /// 开头的指令词必须被剥离，句中的同形词必须保留。
+    ///
+    /// 保留句中同形词是这条规则成立的前提："搜索结果怎么打包"里的"搜索"就是查询主题，
+    /// 一并剥掉会让查询失去最重要的限定词。
+    #[test]
+    fn leading_directives_are_stripped_without_touching_content() {
+        for (query, expected) in [
+            ("搜索agent一轮对话的代码实现", "agent一轮对话的代码实现"),
+            ("帮我找一下 权限检查", "权限检查"),
+            ("帮忙定位 索引构建流程", "索引构建流程"),
+            ("看下 会话怎么保存", "会话怎么保存"),
+            ("find the permission check", "the permission check"),
+            ("show me PermissionManager", "PermissionManager"),
+        ] {
+            assert_eq!(
+                AnalyzedQuery::analyze(query).retrieval_text,
+                expected,
+                "查询 `{query}` 的剥离结果不符"
+            );
+        }
+        // 复合名词与句中同形词都是内容，不能剥离。中文指令后紧跟中文且无分隔时，
+        // 无法与复合名词区分，一律保守保留。
+        for query in [
+            "搜索结果怎么打包",
+            "查询计划怎么生成",
+            "定位服务在哪里初始化",
+            "检索索引怎么建立",
+        ] {
+            assert_eq!(
+                AnalyzedQuery::analyze(query).retrieval_text,
+                query,
+                "句中同形词不得被剥离：{query}"
+            );
+        }
+    }
+
+    /// 整条查询都是指令词时必须退回原文，不能变成空串。
+    #[test]
+    fn all_directive_query_falls_back_to_original() {
+        assert_eq!(AnalyzedQuery::analyze("搜索").retrieval_text, "搜索");
+        assert_eq!(
+            AnalyzedQuery::analyze("帮我找一下").retrieval_text,
+            "帮我找一下"
+        );
+    }
+
     #[test]
     fn classifies_query_intents() {
         assert_eq!(

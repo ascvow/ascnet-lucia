@@ -359,9 +359,14 @@ fn natural_language_prefers_semantic_match_over_generic_symbol_word() {
     assert_eq!(generic_result.debug.symbol_boost, 0.0);
 }
 
-/// 语义通道缺席时必须恢复符号通道标准权重，保证纯词法降级仍能合并代码导航信号。
+/// 语义缺席时符号信号仍要合并，但弱前缀匹配不得压过强词法命中。
+///
+/// 早期实现让前缀匹配在语义缺席时拿满权重，结果是自然语言查询里出现任意一个常见词
+/// （agent、config、index），符号表中所有同前缀的符号就会倾巢而出并占满结果——真正
+/// 相关的实现一条都进不来。前缀匹配的含义仅仅是"某个符号名以这个词开头"，它必须弱于
+/// 词法证据，但仍应作为兜底召回保留在结果中。
 #[test]
-fn natural_language_fallback_keeps_full_symbol_weight() {
+fn weak_symbol_prefix_cannot_outrank_strong_lexical_hit() {
     let (index, _) = fixture();
     let target = chunk_id_of(&index, "PermissionManager::check");
     let competitor = chunk_id_of(&index, "SessionStore::persist");
@@ -383,8 +388,25 @@ fn natural_language_fallback_keeps_full_symbol_weight() {
         10,
     );
 
-    assert_eq!(results[0].chunk_id, target, "实际 {:?}", names(&results));
-    assert_eq!(results[0].debug.symbol_boost, 0.0);
+    assert_eq!(
+        results[0].chunk_id,
+        competitor,
+        "词法第一名必须压过前缀第 20 名，实际 {:?}",
+        names(&results)
+    );
+    let target_result = results
+        .iter()
+        .find(|result| result.chunk_id == target)
+        .expect("前缀候选应作为兜底召回保留在结果中");
+    assert!(
+        target_result
+            .debug
+            .ranks
+            .iter()
+            .any(|(source, _)| *source == CandidateSource::Symbol),
+        "符号通道的贡献必须仍被合并并记录"
+    );
+    assert_eq!(target_result.debug.symbol_boost, 0.0);
 }
 
 /// 纯词法降级也不能把自然语言中的普通精确词重复当成代码导航意图。

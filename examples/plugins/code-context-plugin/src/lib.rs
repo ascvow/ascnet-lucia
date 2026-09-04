@@ -1065,7 +1065,7 @@ impl CodeContextPlugin {
             SearchPlan::for_query(&analyzed, limit, semantic_available, rerank_model.is_some());
         let query_vector = plan
             .enable_semantic
-            .then(|| self.embed_query(host, query))
+            .then(|| self.embed_query(host, &analyzed.retrieval_text))
             .flatten();
         let Some(context) = self.repository.as_ref() else {
             return empty_search_execution(analyzed, plan);
@@ -1077,7 +1077,8 @@ impl CodeContextPlugin {
         let mut run = retrieval.search_planned(
             index,
             &context.semantic,
-            query,
+            // 召回使用剥离指令词后的文本；意图与目标仍由原查询决定。
+            &analyzed.retrieval_text,
             query_vector.as_deref(),
             path_scope,
             &plan,

@@ -77,6 +77,12 @@ pub struct FusionConfig {
     /// 从 0.750 升到 0.844），却因为与词法等权而排不到第一（Recall@1 纹丝不动）。
     /// 取 3.5 让语义在这类查询上主导排序。
     pub cjk_semantic_weight: f32,
+    /// 自然语言查询中符号前缀匹配的通道权重。
+    ///
+    /// 前缀匹配的含义只是"某个符号名以查询里的某个词开头"。在精确标识符查询里这是有用的
+    /// 补全信号，但在自然语言查询里，任意一个常见词都会命中成百上千个符号，与用户意图
+    /// 无关。取 0.15：保留它作为兜底召回，但不让它与词法证据竞争排名。
+    pub natural_language_prefix_weight: f32,
     /// 查询以中日韩文字为主时的词法通道权重。
     ///
     /// 不置零：文档注释是中文的仓库里，BM25 仍能提供真实信号。取 0.4 把它降为辅助。
@@ -144,6 +150,7 @@ impl Default for FusionConfig {
             natural_language_semantic_weight: 1.75,
             cjk_semantic_weight: 3.5,
             cjk_lexical_weight: 0.4,
+            natural_language_prefix_weight: 0.15,
             test_code_weight: 0.55,
             short_chunk_weight: 0.9,
             short_chunk_lines: 6,
@@ -730,6 +737,13 @@ fn channel_weight(
         return 1.0;
     }
     match source {
+        // 前缀匹配在自然语言查询里是**最弱的证据**：查询里出现一个常见词（agent、config、
+        // index）就足以让符号表中所有同前缀的符号倾巢而出，与查询真正的意思无关。实测
+        // "搜索 agent 一轮对话的代码实现"曾因此返回清一色的 AgentRuntime、AgentState、
+        // AgentEvent……而真正的实现一条都没进来。它必须弱于词法，不能与之竞争。
+        CandidateSource::Symbol if matches!(symbol_match, Some(SymbolMatch::NamePrefix)) => {
+            config.natural_language_prefix_weight
+        }
         CandidateSource::Symbol if semantic_available => config.natural_language_symbol_weight,
         CandidateSource::Symbol
             if matches!(
@@ -740,7 +754,9 @@ fn channel_weight(
             config.natural_language_symbol_weight
         }
         CandidateSource::Symbol => 1.0,
-        CandidateSource::Lexical if cjk_dominant => config.cjk_lexical_weight,
+        // 中文查询下调低词法权重的前提是"语义通道会补上内容信号"。语义缺席时词法是唯一
+        // 的内容来源，此时再降权只会把结果整体让给证据更弱的符号前缀匹配。
+        CandidateSource::Lexical if cjk_dominant && semantic_available => config.cjk_lexical_weight,
         CandidateSource::Lexical => 1.0,
         CandidateSource::Semantic if cjk_dominant => config.cjk_semantic_weight,
         CandidateSource::Semantic => config.natural_language_semantic_weight,
