@@ -31,5 +31,9 @@ oxc_span = "0.148"
 rustpython-parser = "0.4"
 gosyn = "0.2"
 
+[features]
+test-support = []
+
 [dev-dependencies]
+code-context-plugin = { path = ".", features = ["test-support"] }
 ureq = "3"

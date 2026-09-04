@@ -583,6 +583,7 @@ version = "0.1.0"
 dependencies = [
  "agent-plugin",
  "anyhow",
+ "code-context-plugin",
  "gosyn",
  "oxc_allocator",
  "oxc_ast",

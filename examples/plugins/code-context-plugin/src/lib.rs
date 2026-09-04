@@ -36,8 +36,8 @@ mod semantic;
 mod storage;
 mod tool;
 
-#[cfg(test)]
-mod testing;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 use agent_plugin::{
     core_events, export_plugin, ActivationContext, AgentPlugin, EventOutcome, EventPresentation,
