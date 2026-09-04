@@ -983,6 +983,11 @@ Implemented:
   与正式搜索缓存隔离。进程在 5760/6600 等部分进度中断后，重跑会复用已有向量继续建立。
 - **真实测试凭证收口**：`siliconflow_e2e` 不再保存源码内密钥，只从宿主进程的
   `SILICONFLOW_API_KEY` 环境变量读取，凭证不进入插件元数据或持久化文件。
+- **候选阶段诊断与 union 保底**：混合检索现在记录 symbol、lexical、semantic、去重 union、
+  post-fusion 全序和 final Top-K 六个阶段的 chunk 身份。语义通道仍是对分路候选的纯加法，
+  新增回归测试断言开启语义后原有符号与词法候选不会在 candidate generation 阶段消失；
+  后续 Recall 下降可明确归因到召回器、union、融合排序或最终截断。Phase 1 验证：
+  `cargo test -p code-context-plugin retrieval::tests --lib`，32 项通过。
 
 Scale Result（Lucia 当前仓库）:
 - 原子代码块 6641 个，语义复合块 262 个，其中 970 个原子块由复合块代表。

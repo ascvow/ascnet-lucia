@@ -33,6 +33,7 @@ use crate::index::StructuralIndex;
 use crate::model::CodeChunk;
 use crate::semantic::SemanticIndex;
 use lexical::LexicalIndex;
+use std::collections::BTreeSet;
 use symbol::SymbolIndex;
 
 /// 候选的来源通道。
@@ -78,6 +79,60 @@ pub struct SearchCandidate {
     pub score: f32,
     /// 符号通道的匹配方式；词法通道为 `None`。
     pub symbol_match: Option<SymbolMatch>,
+}
+
+/// 一次检索各阶段的候选快照。
+///
+/// 各通道保留通道内排名顺序；`union` 按 chunk ID 稳定排序，只表达候选是否存在；
+/// `post_fusion` 与 `final_results` 保留排序顺序。benchmark 可据此区分召回器缺失、union
+/// 丢失、融合降级和最终 Top-K 截断，不再只能从最终结果反推原因。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CandidateStages {
+    /// 符号通道候选，按通道内排名排列。
+    pub symbol: Vec<String>,
+    /// 词法通道候选，按通道内排名排列。
+    pub lexical: Vec<String>,
+    /// 语义通道候选，按通道内排名排列。
+    pub semantic: Vec<String>,
+    /// 三路候选去重后的并集，按 chunk ID 排列。
+    pub union: Vec<String>,
+    /// 融合排序后的完整候选池，尚未执行最终 Top-K 截断。
+    pub post_fusion: Vec<String>,
+    /// 最终返回候选，按最终排名排列。
+    pub final_results: Vec<String>,
+}
+
+impl CandidateStages {
+    /// 从分路候选建立通道与 union 快照。
+    ///
+    /// 同一 chunk 在多个通道出现时只在 `union` 中保留一次；通道快照本身不去重，便于暴露
+    /// 召回器内部异常。该方法没有外部副作用。
+    fn from_channels(channels: &[Vec<SearchCandidate>]) -> Self {
+        let mut stages = Self::default();
+        let mut union = BTreeSet::new();
+        for candidate in channels.iter().flatten() {
+            union.insert(candidate.chunk_id.clone());
+            let target = match candidate.source {
+                CandidateSource::Symbol => &mut stages.symbol,
+                CandidateSource::Lexical => &mut stages.lexical,
+                CandidateSource::Semantic => &mut stages.semantic,
+            };
+            target.push(candidate.chunk_id.clone());
+        }
+        stages.union = union.into_iter().collect();
+        stages
+    }
+}
+
+/// 一次带阶段诊断的检索结果。
+///
+/// `results` 与原有检索 API 的返回完全一致；`stages` 仅增加可观测性，不参与排序。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievalRun {
+    /// 最终排序结果。
+    pub results: Vec<SearchResult>,
+    /// 各召回与排序阶段的候选快照。
+    pub stages: CandidateStages,
 }
 
 /// 检索索引规模。
@@ -293,9 +348,24 @@ impl RetrievalIndex {
         limit: usize,
         config: &FusionConfig,
     ) -> Vec<SearchResult> {
+        self.search_with_diagnostics(index, query, path_scope, limit, config)
+            .results
+    }
+
+    /// 用指定融合参数执行两路检索，并返回完整候选阶段诊断。
+    ///
+    /// 排序行为与 [`RetrievalIndex::search_with`] 相同；额外快照用于 benchmark 归因。
+    pub fn search_with_diagnostics(
+        &self,
+        index: &StructuralIndex,
+        query: &str,
+        path_scope: Option<&str>,
+        limit: usize,
+        config: &FusionConfig,
+    ) -> RetrievalRun {
         // 各通道取比最终结果更多的候选，否则融合退化成简单拼接。
         let channels = self.search_all(query, path_scope, fusion::candidate_limit(limit));
-        fusion::fuse(&channels, query, index, config, limit)
+        fuse_with_diagnostics(&channels, query, index, config, limit)
     }
 
     /// 执行含语义通道的三路混合检索。
@@ -311,6 +381,23 @@ impl RetrievalIndex {
         path_scope: Option<&str>,
         limit: usize,
     ) -> Vec<SearchResult> {
+        self.search_hybrid_with_diagnostics(index, semantic, query, query_vector, path_scope, limit)
+            .results
+    }
+
+    /// 执行含语义通道的三路混合检索，并返回完整候选阶段诊断。
+    ///
+    /// 各通道先独立取候选，再按 chunk ID 去重形成 union；语义候选只会增加并集，不能删除
+    /// 已由符号或词法召回的候选。最终 Top-K 截断发生在完整融合排序之后。
+    pub fn search_hybrid_with_diagnostics(
+        &self,
+        index: &StructuralIndex,
+        semantic: &SemanticIndex,
+        query: &str,
+        query_vector: Option<&[f32]>,
+        path_scope: Option<&str>,
+        limit: usize,
+    ) -> RetrievalRun {
         let channels = self.search_all_with_semantic(
             semantic,
             query,
@@ -318,6 +405,32 @@ impl RetrievalIndex {
             path_scope,
             fusion::candidate_limit(limit),
         );
-        fusion::fuse(&channels, query, index, &FusionConfig::default(), limit)
+        fuse_with_diagnostics(&channels, query, index, &FusionConfig::default(), limit)
     }
+}
+
+/// 对分路候选执行完整融合，并在最终截断前后记录候选身份。
+///
+/// `fusion::fuse` 的排序仍是唯一排序实现；这里把上限临时放宽到 union 大小，以便记录
+/// post-fusion 全序，再截断到调用方要求的 `limit`。因此新增诊断不会产生第二套排序逻辑。
+fn fuse_with_diagnostics(
+    channels: &[Vec<SearchCandidate>],
+    query: &str,
+    index: &StructuralIndex,
+    config: &FusionConfig,
+    limit: usize,
+) -> RetrievalRun {
+    let mut stages = CandidateStages::from_channels(channels);
+    let fusion_limit = stages.union.len().max(limit);
+    let mut results = fusion::fuse(channels, query, index, config, fusion_limit);
+    stages.post_fusion = results
+        .iter()
+        .map(|result| result.chunk_id.clone())
+        .collect();
+    results.truncate(limit);
+    stages.final_results = results
+        .iter()
+        .map(|result| result.chunk_id.clone())
+        .collect();
+    RetrievalRun { results, stages }
 }

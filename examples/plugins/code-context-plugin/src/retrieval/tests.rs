@@ -577,3 +577,54 @@ fn semantic_candidates_declare_their_source() {
         .iter()
         .all(|candidate| candidate.source == CandidateSource::Semantic));
 }
+
+/// 语义通道只能扩充候选并集，不能让符号或词法候选在 candidate generation 阶段消失。
+#[test]
+fn semantic_union_preserves_symbol_and_lexical_candidates() {
+    let (index, retrieval) = fixture_index();
+    let semantic = semantic_fixture(&index);
+    let mut query_vector = vec![0.0f32; 8];
+    query_vector[0] = 1.0;
+    let channel_limit = super::fusion::candidate_limit(10);
+    let baseline = retrieval.search_all("permission check", None, channel_limit);
+
+    let run = retrieval.search_hybrid_with_diagnostics(
+        &index,
+        &semantic,
+        "permission check",
+        Some(&query_vector),
+        None,
+        10,
+    );
+
+    for candidate in baseline.iter().flatten() {
+        assert!(
+            run.stages.union.contains(&candidate.chunk_id),
+            "开启语义后 union 不得丢失原有候选 {}",
+            candidate.chunk_id
+        );
+    }
+    assert!(!run.stages.semantic.is_empty(), "测试必须真实启用语义通道");
+}
+
+/// 阶段诊断必须保留融合全序，并明确记录最终 Top-K 截断造成的候选减少。
+#[test]
+fn candidate_stages_distinguish_fusion_from_final_truncation() {
+    let (index, retrieval) = fixture_index();
+    let run = retrieval.search_with_diagnostics(
+        &index,
+        "permission check",
+        None,
+        2,
+        &super::FusionConfig::default(),
+    );
+
+    assert_eq!(run.results.len(), 2);
+    assert_eq!(run.stages.final_results.len(), 2);
+    assert_eq!(run.stages.final_results, run.stages.post_fusion[..2]);
+    assert_eq!(run.stages.post_fusion.len(), run.stages.union.len());
+    assert!(
+        run.stages.post_fusion.len() > run.stages.final_results.len(),
+        "测试语料必须覆盖最终截断"
+    );
+}
