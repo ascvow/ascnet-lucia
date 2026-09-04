@@ -13,8 +13,9 @@ use code_context_plugin::{
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -777,13 +778,51 @@ fn print_index_stats(plugin: &CodeContextPlugin) {
 
 /// 以适合终端阅读的格式输出一次搜索返回的代码片段。
 fn print_search_result(result: &agent_plugin::ToolResult) {
+    print!(
+        "{}",
+        format_search_result(result, terminal_colors_enabled())
+    );
+}
+
+/// 把结构化工具结果格式化为带分组、元数据和源码行号的终端文本。
+///
+/// `colors_enabled` 只控制 ANSI 样式，不改变可见文字，便于重定向输出和单元测试稳定比较。
+fn format_search_result(result: &agent_plugin::ToolResult, colors_enabled: bool) -> String {
     let Some(results) = result.content.get("results").and_then(Value::as_array) else {
-        println!("未返回结构化搜索结果：{}", result.content);
-        return;
+        return format!("搜索结果格式异常\n{}\n", result.content);
     };
+    let mut output = String::new();
+    let stats = result
+        .details
+        .as_ref()
+        .and_then(|details| details.get("stats"));
+    let mut summary = vec![format!("{} 条结果", results.len())];
+    if let Some(candidates) = stats
+        .and_then(|value| value.get("candidates"))
+        .and_then(Value::as_u64)
+    {
+        summary.push(format!("{candidates} 个候选"));
+    }
+    if let Some(tokens) = stats
+        .and_then(|value| value.get("estimated_tokens"))
+        .and_then(Value::as_u64)
+    {
+        summary.push(format!("约 {tokens} tokens"));
+    }
+    let heading = paint(
+        &format!("搜索结果  {}", summary.join(" · ")),
+        "1;36",
+        colors_enabled,
+    );
+    writeln!(output, "\n{heading}").expect("写入 String 不会失败");
+
     if results.is_empty() {
-        println!("未找到匹配结果");
-        return;
+        writeln!(output, "未找到匹配结果").expect("写入 String 不会失败");
+        return output;
+    }
+    if let Some(note) = result.content.get("note").and_then(Value::as_str) {
+        writeln!(output, "{} {note}", paint("提示：", "1;33", colors_enabled))
+            .expect("写入 String 不会失败");
     }
 
     for (index, item) in results.iter().enumerate() {
@@ -791,26 +830,187 @@ fn print_search_result(result: &agent_plugin::ToolResult) {
             .get("file")
             .and_then(Value::as_str)
             .unwrap_or("未知文件");
-        let lines = item
+        let (start_line, end_line) = item
             .get("lines")
             .and_then(Value::as_array)
             .map(|range| {
                 let start = range.first().and_then(Value::as_u64).unwrap_or(0);
                 let end = range.get(1).and_then(Value::as_u64).unwrap_or(start);
-                format!("{start}-{end}")
+                (start, end)
             })
-            .unwrap_or_else(|| "未知行".to_string());
+            .unwrap_or((0, 0));
+        let line_range = if start_line == 0 {
+            "未知行".to_string()
+        } else if start_line == end_line {
+            start_line.to_string()
+        } else {
+            format!("{start_line}-{end_line}")
+        };
         let symbol = item
             .get("qualified_symbol")
             .or_else(|| item.get("symbol"))
             .and_then(Value::as_str)
-            .map(|value| format!(" {value}"))
-            .unwrap_or_default();
-        println!("\n{}. {}:{}{}", index + 1, file, lines, symbol);
-        if let Some(snippet) = item.get("snippet").and_then(Value::as_str) {
-            println!("{snippet}");
+            .unwrap_or("文本片段");
+        let mut metadata = Vec::new();
+        if let Some(language) = item.get("language").and_then(Value::as_str) {
+            metadata.push(language.to_string());
         }
+        if let Some(kind) = item.get("kind").and_then(Value::as_str) {
+            metadata.push(kind.to_string());
+        }
+        if item.get("relocated").and_then(Value::as_bool) == Some(true) {
+            metadata.push("位置已重定位".to_string());
+        }
+        if item.get("truncated").and_then(Value::as_bool) == Some(true) {
+            metadata.push("片段已截断".to_string());
+        }
+
+        let rank = paint(&format!("[{}]", index + 1), "1;32", colors_enabled);
+        let symbol = paint(symbol, "1;33", colors_enabled);
+        writeln!(
+            output,
+            "{} {rank} {symbol}",
+            paint("╭─", "2", colors_enabled)
+        )
+        .expect("写入 String 不会失败");
+        let location = paint(&format!("{file}:{line_range}"), "36", colors_enabled);
+        if metadata.is_empty() {
+            writeln!(output, "{} {location}", paint("│ ", "2", colors_enabled))
+                .expect("写入 String 不会失败");
+        } else {
+            writeln!(
+                output,
+                "{} {location}  {}",
+                paint("│ ", "2", colors_enabled),
+                paint(&metadata.join(" · "), "2", colors_enabled)
+            )
+            .expect("写入 String 不会失败");
+        }
+        if let Some(signature) = item
+            .get("signature")
+            .and_then(Value::as_str)
+            .and_then(|value| format_signature(value, item.get("language").and_then(Value::as_str)))
+        {
+            writeln!(
+                output,
+                "{} {} {signature}",
+                paint("│ ", "2", colors_enabled),
+                paint("签名", "1;35", colors_enabled)
+            )
+            .expect("写入 String 不会失败");
+        }
+        writeln!(
+            output,
+            "{}",
+            paint(
+                "├────────────────────────────────────────────────────────────────────────",
+                "2",
+                colors_enabled
+            )
+        )
+        .expect("写入 String 不会失败");
+        if let Some(snippet) = item.get("snippet").and_then(Value::as_str) {
+            let number_width = end_line.max(start_line).to_string().len().max(1);
+            for (offset, source) in snippet.lines().enumerate() {
+                let source_line = start_line.saturating_add(offset as u64);
+                let number = if start_line == 0 {
+                    " ".repeat(number_width)
+                } else {
+                    format!("{source_line:>number_width$}")
+                };
+                writeln!(
+                    output,
+                    "{} {} {} {source}",
+                    paint("│", "2", colors_enabled),
+                    paint(&number, "2", colors_enabled),
+                    paint("│", "2", colors_enabled)
+                )
+                .expect("写入 String 不会失败");
+            }
+        }
+        writeln!(
+            output,
+            "{}\n",
+            paint(
+                "╰────────────────────────────────────────────────────────────────────────",
+                "2",
+                colors_enabled
+            )
+        )
+        .expect("写入 String 不会失败");
     }
+
+    output
+}
+
+/// 判断当前标准输出是否适合使用 ANSI 颜色。
+///
+/// 重定向到文件或设置 `NO_COLOR` 时返回 `false`，避免把控制字符写进日志和测试快照。
+fn terminal_colors_enabled() -> bool {
+    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// 按需为一段终端文本添加 ANSI SGR 样式。
+fn paint(text: &str, style: &str, enabled: bool) -> String {
+    if enabled {
+        format!("\x1b[{style}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+/// 清理并限制用于终端展示的声明签名。
+///
+/// Rust 解析结果可能把前导文档注释与属性折叠进签名；展示层只保留真正的声明，并把连续
+/// 空白压成一个空格。超出 160 个字符时按字符边界截断，避免长泛型签名撑破终端布局。
+fn format_signature(signature: &str, language: Option<&str>) -> Option<String> {
+    let compact = signature.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    let declaration = if language == Some("rust") {
+        rust_declaration_start(&compact)
+            .map(|start| compact[start..].trim())
+            .unwrap_or(compact.as_str())
+    } else {
+        compact.as_str()
+    };
+    const MAX_VISIBLE_CHARS: usize = 160;
+    if declaration.chars().count() <= MAX_VISIBLE_CHARS {
+        return Some(declaration.to_string());
+    }
+    let mut shortened: String = declaration.chars().take(MAX_VISIBLE_CHARS - 1).collect();
+    shortened.push('…');
+    Some(shortened)
+}
+
+/// 定位折叠后 Rust 签名中的实际声明起点，跳过 Rustdoc 与 `#[...]` 属性。
+fn rust_declaration_start(signature: &str) -> Option<usize> {
+    const MARKERS: &[&str] = &[
+        "pub(crate) ",
+        "pub(super) ",
+        "pub(self) ",
+        "pub(in ",
+        "pub ",
+        "async ",
+        "unsafe ",
+        "extern ",
+        "const ",
+        "static ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "impl ",
+        "type ",
+        "fn ",
+        "mod ",
+        "use ",
+        "macro_rules! ",
+    ];
+    MARKERS
+        .iter()
+        .filter_map(|marker| signature.find(marker))
+        .min()
 }
 
 /// 打印命令用法与可选参数。
@@ -956,5 +1156,76 @@ mod tests {
         assert_eq!(first, repository_cache_path(cache, Path::new("/repo/a")));
         assert_ne!(first, repository_cache_path(cache, Path::new("/repo/b")));
         assert_eq!(first.parent(), Some(cache));
+    }
+
+    /// 搜索结果必须突出汇总、位置、符号、签名和带行号的源码，且纯文本模式不含 ANSI 控制符。
+    #[test]
+    fn search_result_format_is_grouped_and_readable() {
+        let result = agent_plugin::ToolResult::success(
+            "call-1",
+            "code_search",
+            json!({
+                "status": "ready",
+                "results": [{
+                    "file": "crates/agent-tui/src/ui/plugin_render.rs",
+                    "lines": [205, 206],
+                    "language": "rust",
+                    "symbol": "render_plugin_dialog",
+                    "qualified_symbol": "render_plugin_dialog",
+                    "kind": "function",
+                    "signature": "pub(crate) fn render_plugin_dialog(...) ",
+                    "snippet": "/// 渲染插件对话框。\npub(crate) fn render_plugin_dialog() {}",
+                    "relocated": true,
+                    "truncated": true
+                }]
+            }),
+        )
+        .with_details(json!({
+            "stats": {
+                "candidates": 24,
+                "estimated_tokens": 128
+            }
+        }));
+
+        let rendered = format_search_result(&result, false);
+
+        assert!(rendered.contains("搜索结果  1 条结果 · 24 个候选 · 约 128 tokens"));
+        assert!(rendered.contains("╭─ [1] render_plugin_dialog"));
+        assert!(rendered
+            .contains("plugin_render.rs:205-206  rust · function · 位置已重定位 · 片段已截断"));
+        assert!(rendered.contains("签名 pub(crate) fn render_plugin_dialog(...)"));
+        assert!(rendered.contains("│ 205 │ /// 渲染插件对话框。"));
+        assert!(rendered.contains("│ 206 │ pub(crate) fn render_plugin_dialog() {}"));
+        assert!(!rendered.contains('\x1b'));
+    }
+
+    /// 空结果也必须显示本次返回数量，不能只留下没有上下文的提示。
+    #[test]
+    fn empty_search_result_has_clear_summary() {
+        let result = agent_plugin::ToolResult::success(
+            "call-1",
+            "code_search",
+            json!({"status": "ready", "results": []}),
+        );
+
+        let rendered = format_search_result(&result, false);
+
+        assert!(rendered.contains("搜索结果  0 条结果"));
+        assert!(rendered.contains("未找到匹配结果"));
+    }
+
+    /// Rust 签名展示必须去掉重复的文档注释和测试属性，并限制超长文本。
+    #[test]
+    fn rust_signature_display_removes_prefixes_and_truncates() {
+        let cleaned = format_signature(
+            "/// 验证对话框。 #[test] #[cfg(feature = \"plugins\")] fn plugin_dialog_is_modal()",
+            Some("rust"),
+        );
+        assert_eq!(cleaned.as_deref(), Some("fn plugin_dialog_is_modal()"));
+
+        let long = format!("pub fn generated({})", "parameter: String, ".repeat(20));
+        let shortened = format_signature(&long, Some("rust")).expect("长签名应仍可展示");
+        assert_eq!(shortened.chars().count(), 160);
+        assert!(shortened.ends_with('…'));
     }
 }
