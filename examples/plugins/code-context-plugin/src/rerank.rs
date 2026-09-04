@@ -25,11 +25,14 @@ const RRF_K: f32 = 60.0;
 /// 多路一致性已经建立的强本地证据。
 const MAX_RERANK_DELTA: f32 = 0.75 / (RRF_K + 1.0);
 
-/// 每条候选最多携带的源码字符数。
+/// 每条候选携带的文件级模块文档最大字符数。
 ///
-/// 限制单条长度可以把 40 条左右的候选稳定控制在常见 rerank 上下文窗口内，同时保留
-/// 足够的函数实现供模型判断调用流程，而不是只看符号名。
-const MAX_SOURCE_CHARS: usize = 1_800;
+/// 模块文档是区分**词汇相近子系统**的关键信号：判断"多路召回的结果怎么合成排名"问的是
+/// 融合还是重排，靠的正是两个文件顶部那句职责说明，而不是函数体里的实现细节。
+const MAX_MODULE_DOC_CHARS: usize = 240;
+
+/// 每条候选携带的文档注释最大字符数。
+const MAX_DOC_CHARS: usize = 320;
 
 /// 计算本地融合结果的可解释置信度。
 ///
@@ -202,10 +205,12 @@ pub(crate) fn rerank_results(
         return Ok(results.to_vec());
     }
 
-    let mut sources: HashMap<String, Option<String>> = HashMap::new();
+    // 只发紧凑签名而不是源码正文：区分词汇相近的两个子系统靠的是模块职责与函数签名，
+    // 函数体里的实现细节是噪声。单次请求因此从约 3 万 token 降到 2 千量级。
+    let mut module_docs: HashMap<String, Option<String>> = HashMap::new();
     let documents: Vec<String> = results
         .iter()
-        .map(|result| candidate_document(host, result, &mut sources))
+        .map(|result| candidate_document(host, result, &mut module_docs))
         .collect();
     let body = serde_json::json!({
         "model": model,
@@ -236,21 +241,23 @@ pub(crate) fn rerank_results(
 fn candidate_document(
     host: &dyn PluginHostApi,
     result: &SearchResult,
-    sources: &mut HashMap<String, Option<String>>,
+    module_docs: &mut HashMap<String, Option<String>>,
 ) -> String {
-    let source = sources
+    // 文件级模块文档按文件缓存，同一文件的多条候选只读一次。
+    let module_doc = module_docs
         .entry(result.file_path.clone())
-        .or_insert_with(|| host.read_file(&result.file_path).ok())
+        .or_insert_with(|| {
+            host.read_file(&result.file_path)
+                .ok()
+                .and_then(|content| module_doc_of(&content))
+        })
         .as_deref();
-    let snippet = source
-        .and_then(|content| slice_lines(content, result.start_line, result.end_line))
-        .map(|content| truncate_chars(&content, MAX_SOURCE_CHARS))
-        .unwrap_or_default();
 
-    let mut document = format!(
-        "文件：{}\n语言：{}\n行号：{}-{}",
-        result.file_path, result.language, result.start_line, result.end_line
-    );
+    let mut document = format!("文件：{}\n语言：{}", result.file_path, result.language);
+    if let Some(doc) = module_doc {
+        document.push_str("\n所属模块：");
+        document.push_str(&truncate_chars(doc, MAX_MODULE_DOC_CHARS));
+    }
     if let Some(symbol) = result
         .qualified_symbol
         .as_deref()
@@ -259,22 +266,76 @@ fn candidate_document(
         document.push_str("\n符号：");
         document.push_str(symbol);
     }
+    if let Some(parent) = result.parent_symbol.as_deref() {
+        document.push_str("\n所属：");
+        document.push_str(parent);
+    }
     if let Some(kind) = result.symbol_kind {
         document.push_str(&format!("\n类型：{kind:?}"));
     }
+    document.push_str(&format!("\n角色：{}", result.role.as_str()));
     if let Some(signature) = result.signature.as_deref() {
         document.push_str("\n签名：");
         document.push_str(signature.trim());
     }
     if let Some(comment) = result.doc_comment.as_deref() {
         document.push_str("\n说明：");
-        document.push_str(comment.trim());
-    }
-    if !snippet.is_empty() {
-        document.push_str("\n源码：\n");
-        document.push_str(&snippet);
+        document.push_str(&truncate_chars(comment.trim(), MAX_DOC_CHARS));
     }
     document
+}
+
+/// 从文件正文提取顶部的模块级文档。
+///
+/// 只取第一个声明之前的连续注释：再往后的注释属于某个具体声明，已经由 `doc_comment`
+/// 单独携带。Rust 的 `//!` 与其他语言的 `//`、`/* */` 一并处理。
+fn module_doc_of(content: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut in_block = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if in_block {
+            match trimmed.find("*/") {
+                Some(end) => {
+                    parts.push(trimmed[..end].trim_start_matches('*').trim().to_string());
+                    in_block = false;
+                }
+                None => parts.push(trimmed.trim_start_matches('*').trim().to_string()),
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            if parts.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("//") {
+            // `//!` 与 `///` 的前缀字符一并剥掉，只留正文。
+            parts.push(rest.trim_start_matches(['/', '!']).trim().to_string());
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            let rest = trimmed
+                .trim_start_matches("/*")
+                .trim_start_matches(['*', '!']);
+            match rest.find("*/") {
+                Some(end) => parts.push(rest[..end].trim().to_string()),
+                None => {
+                    parts.push(rest.trim().to_string());
+                    in_block = true;
+                }
+            }
+            continue;
+        }
+        break;
+    }
+    let doc = parts
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!doc.trim().is_empty()).then_some(doc)
 }
 
 /// 候选需要保留的最低排名保护级别。
@@ -535,14 +596,6 @@ fn apply_rank_floors(results: &mut Vec<RerankedResult>, protections: &[(String, 
         let item = results.remove(position);
         results.insert((*floor).min(results.len()), item);
     }
-}
-
-/// 读取闭区间行范围；范围失效时返回 `None`。
-fn slice_lines(content: &str, start_line: u32, end_line: u32) -> Option<String> {
-    let lines: Vec<&str> = content.lines().collect();
-    let start = start_line.saturating_sub(1) as usize;
-    let end = (end_line as usize).min(lines.len());
-    (start < end).then(|| lines[start..end].join("\n"))
 }
 
 /// 按字符边界截断候选正文。

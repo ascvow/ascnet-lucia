@@ -2270,3 +2270,78 @@ fn agent_scenario_report() {
         }
     }
 }
+
+/// 诊断：一次模型重排实际提交的请求体规模。
+///
+/// 延迟受远端抖动影响很大，单看耗时无法判断"只发紧凑签名"是否真的降低了开销。请求体
+/// 字节数与候选条数是确定性的，直接量它。
+#[test]
+#[ignore = "需要网络与嵌入 API 密钥"]
+fn rerank_payload_size() {
+    let api_key = std::env::var(API_KEY_ENV).expect("需要 API 密钥");
+    let root = repository_root();
+    let files = collect_evaluation_files(&root);
+    let file_refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    let host = RepoHost::new(&file_refs).with_http_handler(forward_to_endpoint(api_key));
+    let ablation = Ablation {
+        label: "全栈",
+        semantic: true,
+        rerank: true,
+    };
+    let mut plugin = CodeContextPlugin::default();
+    plugin
+        .activate(&host, ablation_context(&root.to_string_lossy(), &ablation))
+        .expect("激活插件");
+    for _ in 0..400 {
+        let call = ToolCall::new("payload", "code_search", json!({"query": "初始化索引"}));
+        let _ = plugin.call_tool_with_host(&host, call);
+        if plugin.index_status() != IndexStatus::Indexing {
+            break;
+        }
+    }
+
+    println!("\n# 重排请求体规模\n");
+    println!("| 查询 | 是否重排 | 候选数 | 请求体字节 | 单条平均字节 |");
+    println!("| --- | --- | --- | --- | --- |");
+    for query in scenario_queries() {
+        let before = host.http_requests().len();
+        let execution = plugin.search_execution(&host, query.query, None, 10);
+        let requests = host.http_requests();
+        let rerank_request = requests[before..]
+            .iter()
+            .find(|request| request.path.trim_matches('/') == "rerank");
+        let (count, bytes) = match rerank_request {
+            Some(request) => {
+                let body = request.body.as_deref().unwrap_or("");
+                let count = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("documents")
+                            .and_then(|v| v.as_array())
+                            .map(Vec::len)
+                    })
+                    .unwrap_or(0);
+                (count, body.len())
+            }
+            None => (0, 0),
+        };
+        println!(
+            "| {} | {} | {count} | {bytes} | {} |",
+            query.query,
+            if execution.diagnostics.rerank_activated {
+                "是"
+            } else {
+                "否"
+            },
+            if count == 0 {
+                "—".to_string()
+            } else {
+                (bytes / count).to_string()
+            }
+        );
+    }
+}
