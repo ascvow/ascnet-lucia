@@ -15,8 +15,10 @@ use std::rc::Rc;
 pub fn parse(source: &str) -> Option<ParseOutput> {
     let file = gosyn::parse_source(source).ok()?;
     let index = LineIndex::new(source);
-    let mut output = ParseOutput::default();
-    output.file_doc = super::leading_doc_comment(source);
+    let mut output = ParseOutput {
+        file_doc: super::leading_doc_comment(source),
+        ..ParseOutput::default()
+    };
 
     for import in &file.imports {
         push_import(&mut output, import.path.value.trim_matches('"').to_string());

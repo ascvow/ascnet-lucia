@@ -12,9 +12,11 @@ use syn::spanned::Spanned;
 /// 语法错误时返回 `None`，由调用方降级为文本分块。
 pub fn parse(source: &str) -> Option<ParseOutput> {
     let file = syn::parse_file(source).ok()?;
-    let mut output = ParseOutput::default();
     // `//!` 内层文档注释挂在 `File` 上，描述的是整个文件的职责。
-    output.file_doc = doc_of(&file.attrs);
+    let mut output = ParseOutput {
+        file_doc: doc_of(&file.attrs),
+        ..ParseOutput::default()
+    };
     walk_items(&file.items, None, &mut output);
     Some(output)
 }

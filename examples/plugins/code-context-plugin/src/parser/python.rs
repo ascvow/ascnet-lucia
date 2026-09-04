@@ -11,9 +11,11 @@ use rustpython_parser::Parse;
 pub fn parse(source: &str) -> Option<ParseOutput> {
     let suite = ast::Suite::parse(source, "<repository>").ok()?;
     let index = LineIndex::new(source);
-    let mut output = ParseOutput::default();
     // 模块开头的字符串字面量就是模块 docstring，描述整个文件的职责。
-    output.file_doc = docstring(&suite);
+    let mut output = ParseOutput {
+        file_doc: docstring(&suite),
+        ..ParseOutput::default()
+    };
     walk_body(&suite, None, &index, &mut output);
     Some(output)
 }
