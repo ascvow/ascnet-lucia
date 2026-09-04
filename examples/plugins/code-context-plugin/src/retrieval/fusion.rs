@@ -1,4 +1,4 @@
-//! 候选融合：Reciprocal Rank Fusion。
+//! 候选融合与轻量重排：Reciprocal Rank Fusion + 元数据覆盖率。
 //!
 //! # 为什么是 RRF 而不是加权分数
 //!
@@ -17,10 +17,15 @@
 //!
 //! 融合的每一个数值都在 [`FusionConfig`] 里，并以 [`FusionConfig::rank_one_unit`] 为单位
 //! 表达，使"这个提升相当于在另一路里排第一"成为可读的量级说明，而不是散落各处的魔数。
+//!
+//! RRF 完成跨通道融合后，再用符号、签名、文档注释和路径对查询词的覆盖率做一次确定性
+//! 重排。它不调用模型或网络，只负责在分数接近的候选之间优先展示元数据更贴近查询意图的
+//! 代码块；加成严格小于一路第一名的 RRF 分值，避免重排覆盖原始召回顺序。
 
 use super::{CandidateSource, SearchCandidate, SymbolMatch};
 use crate::index::StructuralIndex;
-use crate::model::SymbolKind;
+use crate::model::{CodeChunk, SymbolKind};
+use std::collections::BTreeSet;
 
 /// RRF 的排名平滑常量。
 ///
@@ -67,6 +72,11 @@ pub struct FusionConfig {
     ///
     /// 取 1.0：路径相关是有用信号但远弱于符号命中，不应盖过内容匹配。
     pub path_boost: f32,
+    /// 元数据完整覆盖查询词时的重排提升，单位为 rank-1 当量。
+    ///
+    /// 取 0.75：足以调整分数接近的候选，但小于一路第一名与末位候选的最大分差，确保
+    /// RRF 召回仍是主信号。这里只检查已驻留的元数据，不回读正文，也不调用外部服务。
+    pub metadata_rerank_boost: f32,
 }
 
 impl Default for FusionConfig {
@@ -78,6 +88,7 @@ impl Default for FusionConfig {
             natural_language_symbol_weight: 0.25,
             natural_language_semantic_weight: 1.75,
             path_boost: 1.0,
+            metadata_rerank_boost: 0.75,
         }
     }
 }
@@ -105,6 +116,12 @@ pub struct FusionDebug {
     pub symbol_boost: f32,
     /// 路径提升的实际加成。
     pub path_boost: f32,
+    /// 元数据覆盖率产生的实际重排加成。
+    pub rerank_boost: f32,
+    /// 元数据至少命中的去重查询词数量。
+    pub rerank_matched_tokens: usize,
+    /// 参与元数据重排的去重查询词总数。
+    pub rerank_query_tokens: usize,
     /// 符号通道的匹配方式。
     pub symbol_match: Option<SymbolMatch>,
 }
@@ -122,6 +139,12 @@ impl FusionDebug {
         }
         if self.path_boost > 0.0 {
             parts.push(format!("路径提升 {:.3}", self.path_boost));
+        }
+        if self.rerank_boost > 0.0 {
+            parts.push(format!(
+                "元数据重排 {:.3} ({}/{})",
+                self.rerank_boost, self.rerank_matched_tokens, self.rerank_query_tokens
+            ));
         }
         parts.join(" + ")
     }
@@ -189,6 +212,8 @@ pub fn fuse(
     }
     let unit = config.rank_one_unit();
     let query_tokens = super::tokenize::tokenize(query);
+    let rerank_query_tokens: BTreeSet<String> =
+        super::tokenize::tokenize_query(query).into_iter().collect();
     let intent = QueryIntent::classify(query);
     let semantic_available = channels
         .iter()
@@ -234,6 +259,8 @@ pub fn fuse(
             let chunk = index.chunk(&item.chunk_id)?;
             let symbol_boost = symbol_boost_of(item.symbol_match, intent, config) * unit;
             let path_boost = path_boost_of(&query_tokens, &chunk.file_path, config) * unit;
+            let rerank = metadata_rerank_of(&rerank_query_tokens, chunk, intent, config);
+            let rerank_boost = rerank.boost_units * unit;
             let mut ranks = item.ranks;
             ranks.sort_by_key(|(source, rank)| (source.as_str(), *rank));
 
@@ -249,12 +276,15 @@ pub fn fuse(
                 parent_symbol: chunk.parent_symbol.clone(),
                 signature: chunk.signature.clone(),
                 doc_comment: chunk.doc_comment.clone(),
-                score: item.rrf_score + symbol_boost + path_boost,
+                score: item.rrf_score + symbol_boost + path_boost + rerank_boost,
                 debug: FusionDebug {
                     ranks,
                     rrf_score: item.rrf_score,
                     symbol_boost,
                     path_boost,
+                    rerank_boost,
+                    rerank_matched_tokens: rerank.matched_tokens,
+                    rerank_query_tokens: rerank.query_tokens,
                     symbol_match: item.symbol_match,
                 },
             })
@@ -283,6 +313,17 @@ struct Accumulator {
     ranks: Vec<(CandidateSource, u32)>,
     /// 符号通道中最强的匹配方式。
     symbol_match: Option<SymbolMatch>,
+}
+
+/// 一条候选的元数据重排结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct MetadataRerank {
+    /// 尚未换算为实际 RRF 分数的 rank-1 当量。
+    boost_units: f32,
+    /// 至少命中一个元数据字段的查询词数量。
+    matched_tokens: usize,
+    /// 参与计算的去重查询词总数。
+    query_tokens: usize,
 }
 
 /// 查询形态决定符号精确提升和通道权重。
@@ -398,4 +439,79 @@ fn path_boost_of(query_tokens: &[String], file_path: &str, config: &FusionConfig
         return 0.0;
     }
     config.path_boost * (matched as f32 / considered as f32)
+}
+
+/// 根据查询词对代码块元数据的覆盖率计算二次重排提升。
+///
+/// 标识符查询更信任符号字段；自然语言查询更信任文档注释。每个查询词只采用命中字段中的
+/// 最高权重，避免同一文本同时出现在限定名和签名时被重复计分。路径已拥有独立提升，因此
+/// 在这里仅保留较弱权重，作为分数接近时的稳定辅助信号。
+fn metadata_rerank_of(
+    query_tokens: &BTreeSet<String>,
+    chunk: &CodeChunk,
+    intent: QueryIntent,
+    config: &FusionConfig,
+) -> MetadataRerank {
+    if query_tokens.is_empty() {
+        return MetadataRerank::default();
+    }
+
+    let mut symbol_tokens = BTreeSet::new();
+    for value in [
+        chunk.symbol_name.as_deref(),
+        chunk.qualified_symbol.as_deref(),
+        chunk.parent_symbol.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        symbol_tokens.extend(super::tokenize::tokenize(value));
+    }
+    let signature_tokens: BTreeSet<String> = chunk
+        .signature
+        .as_deref()
+        .into_iter()
+        .flat_map(super::tokenize::tokenize)
+        .collect();
+    let doc_tokens: BTreeSet<String> = chunk
+        .doc_comment
+        .as_deref()
+        .into_iter()
+        .flat_map(super::tokenize::tokenize)
+        .collect();
+    let path_tokens: BTreeSet<String> = super::tokenize::tokenize(&chunk.file_path)
+        .into_iter()
+        .collect();
+    let (symbol_weight, signature_weight, doc_weight, path_weight) = match intent {
+        QueryIntent::Identifier => (1.0, 0.8, 0.45, 0.25),
+        QueryIntent::NaturalLanguage => (0.55, 0.7, 1.0, 0.25),
+    };
+
+    let mut weighted_matches = 0.0f32;
+    let mut matched_tokens = 0usize;
+    for token in query_tokens {
+        let mut weight = 0.0f32;
+        if symbol_tokens.contains(token) {
+            weight = weight.max(symbol_weight);
+        }
+        if signature_tokens.contains(token) {
+            weight = weight.max(signature_weight);
+        }
+        if doc_tokens.contains(token) {
+            weight = weight.max(doc_weight);
+        }
+        if path_tokens.contains(token) {
+            weight = weight.max(path_weight);
+        }
+        if weight > 0.0 {
+            matched_tokens += 1;
+            weighted_matches += weight;
+        }
+    }
+
+    MetadataRerank {
+        boost_units: config.metadata_rerank_boost * (weighted_matches / query_tokens.len() as f32),
+        matched_tokens,
+        query_tokens: query_tokens.len(),
+    }
 }

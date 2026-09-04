@@ -487,10 +487,65 @@ fn path_match_receives_boost() {
 #[test]
 fn path_boost_is_weaker_than_symbol_boost() {
     let config = FusionConfig::default();
+    assert!(config.metadata_rerank_boost < config.path_boost);
     assert!(config.path_boost < config.name_match_boost);
     assert!(config.name_match_boost < config.exact_symbol_boost);
     assert!(config.natural_language_symbol_weight < 1.0);
     assert!(config.natural_language_semantic_weight > 1.0);
+}
+
+/// 元数据覆盖更多查询词的候选应在原始分数接近时获得更高排名。
+#[test]
+fn metadata_rerank_promotes_better_query_coverage() {
+    let (index, _) = fixture();
+    let relevant = chunk_id_of(&index, "PermissionManager::check");
+    let noisy = chunk_id_of(&index, "PermissionRule::matches");
+    let channels = vec![vec![
+        candidate(&noisy, CandidateSource::Lexical, 1),
+        candidate(&relevant, CandidateSource::Lexical, 5),
+    ]];
+
+    let results = fuse(
+        &channels,
+        "工具 权限 审批",
+        &index,
+        &FusionConfig::default(),
+        10,
+    );
+
+    assert_eq!(results[0].chunk_id, relevant, "实际 {:?}", names(&results));
+    assert_eq!(results[0].debug.rerank_matched_tokens, 3);
+    assert_eq!(results[0].debug.rerank_query_tokens, 3);
+    assert!(results[0].debug.rerank_boost > results[1].debug.rerank_boost);
+}
+
+/// 轻量重排只能调整接近的候选，不能覆盖原始融合形成的大幅领先。
+#[test]
+fn metadata_rerank_remains_secondary_to_fusion_score() {
+    let (index, _) = fixture();
+    let first = chunk_id_of(&index, "PermissionRule::matches");
+    let metadata_match = chunk_id_of(&index, "SessionStore");
+    let channels = vec![vec![
+        candidate(&first, CandidateSource::Lexical, 1),
+        candidate(&metadata_match, CandidateSource::Lexical, 200),
+    ]];
+
+    let results = fuse(
+        &channels,
+        "会话 状态 持久化",
+        &index,
+        &FusionConfig::default(),
+        10,
+    );
+
+    assert_eq!(results[0].chunk_id, first, "实际 {:?}", names(&results));
+    let matched = results
+        .iter()
+        .find(|result| result.chunk_id == metadata_match)
+        .expect("元数据候选应保留在结果中");
+    assert_eq!(matched.debug.rerank_matched_tokens, 4);
+    assert_eq!(matched.debug.rerank_query_tokens, 4);
+    assert!(matched.debug.rerank_boost > 0.0);
 }
 
 /// 全部提升必须以 rank-1 当量表达，使量级可读。
@@ -550,6 +605,7 @@ fn debug_reason_is_readable() {
     assert!(reason.contains("symbol#1"), "{reason}");
     assert!(reason.contains("符号提升"), "{reason}");
     assert!(reason.contains("路径提升"), "{reason}");
+    assert!(reason.contains("元数据重排"), "{reason}");
 }
 
 /// 分数必须等于 RRF 分与各项提升之和，使诊断可核对。
@@ -568,7 +624,10 @@ fn score_decomposes_into_its_parts() {
         10,
     );
     let result = &results[0];
-    let sum = result.debug.rrf_score + result.debug.symbol_boost + result.debug.path_boost;
+    let sum = result.debug.rrf_score
+        + result.debug.symbol_boost
+        + result.debug.path_boost
+        + result.debug.rerank_boost;
 
     assert!(
         (result.score - sum).abs() < 1e-6,

@@ -246,6 +246,9 @@ fn diversity_caps_per_file_contribution() {
                 rrf_score: 10.0 - rank as f32,
                 symbol_boost: 0.0,
                 path_boost: 0.0,
+                rerank_boost: 0.0,
+                rerank_matched_tokens: 0,
+                rerank_query_tokens: 0,
                 symbol_match: None,
             },
         })
@@ -617,6 +620,9 @@ fn synthetic(chunk: &crate::model::CodeChunk, start: u32, end: u32) -> SearchRes
             rrf_score: 1.0,
             symbol_boost: 0.0,
             path_boost: 0.0,
+            rerank_boost: 0.0,
+            rerank_matched_tokens: 0,
+            rerank_query_tokens: 0,
             symbol_match: None,
         },
     }
