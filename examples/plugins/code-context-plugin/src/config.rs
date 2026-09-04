@@ -56,6 +56,24 @@ const DEFAULT_EMBEDDING_DIMENSION: u32 = 1536;
 /// 单批最多提交的嵌入条数。
 const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 64;
 
+/// API 嵌入请求之间的默认最小间隔。
+const DEFAULT_EMBEDDING_REQUEST_INTERVAL_MS: u64 = 1_500;
+
+/// 单批 API 嵌入请求默认允许的重试次数。
+const DEFAULT_EMBEDDING_MAX_RETRIES: u32 = 4;
+
+/// API 嵌入瞬时错误的默认指数退避基数。
+const DEFAULT_EMBEDDING_RETRY_BASE_MS: u64 = 5_000;
+
+/// 请求间隔的配置上限，避免误配置让一次工具调用长时间无响应。
+const MAX_EMBEDDING_REQUEST_INTERVAL_MS: u64 = 60_000;
+
+/// 单批重试次数的配置上限。
+const MAX_EMBEDDING_MAX_RETRIES: u32 = 10;
+
+/// 指数退避基数的配置上限；实际单次等待还会在 provider 内限制为 30 秒。
+const MAX_EMBEDDING_RETRY_BASE_MS: u64 = 30_000;
+
 /// Code Context Engine 配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeContextConfig {
@@ -75,6 +93,18 @@ pub struct CodeContextConfig {
     pub embedding_dimension: u32,
     /// 单批提交的最大条数。
     pub embedding_batch_size: usize,
+    /// 相邻 API 请求之间的最小间隔，单位毫秒；设为 0 可关闭主动限速。
+    ///
+    /// 该限制同时覆盖正常批次和重试请求，避免全仓库向量化连续提交几十批后触发 TPM
+    /// 限流。它不改变嵌入空间，因此调整后可以继续复用已有向量。
+    pub embedding_request_interval_ms: u64,
+    /// 单批请求遇到 HTTP 429 或 5xx 后允许的重试次数；设为 0 表示立即交回续建流程。
+    pub embedding_max_retries: u32,
+    /// HTTP 429 或 5xx 的指数退避基数，单位毫秒；设为 0 只用于关闭等待。
+    ///
+    /// 第 n 次重试按该值乘以 `2^n`，单次等待最多 30 秒；响应携带整数形式的
+    /// `Retry-After` 时优先采用响应值。
+    pub embedding_retry_base_ms: u64,
     /// 是否在嵌入请求中发送 `dimensions` 参数。
     ///
     /// **默认关闭。** 该参数只对支持维度截断的模型有意义（OpenAI 的
@@ -108,6 +138,9 @@ impl Default for CodeContextConfig {
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             embedding_dimension: DEFAULT_EMBEDDING_DIMENSION,
             embedding_batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+            embedding_request_interval_ms: DEFAULT_EMBEDDING_REQUEST_INTERVAL_MS,
+            embedding_max_retries: DEFAULT_EMBEDDING_MAX_RETRIES,
+            embedding_retry_base_ms: DEFAULT_EMBEDDING_RETRY_BASE_MS,
             embedding_send_dimensions: false,
             rerank_model: None,
             http_endpoint_id: None,
@@ -156,6 +189,24 @@ impl CodeContextConfig {
             config.embedding_batch_size =
                 parse_positive_u32(value, "embedding_batch_size")? as usize;
         }
+        if let Some(value) = metadata.get("embedding_request_interval_ms") {
+            config.embedding_request_interval_ms = parse_bounded_u64(
+                value,
+                "embedding_request_interval_ms",
+                MAX_EMBEDDING_REQUEST_INTERVAL_MS,
+            )?;
+        }
+        if let Some(value) = metadata.get("embedding_max_retries") {
+            config.embedding_max_retries =
+                parse_bounded_u32(value, "embedding_max_retries", MAX_EMBEDDING_MAX_RETRIES)?;
+        }
+        if let Some(value) = metadata.get("embedding_retry_base_ms") {
+            config.embedding_retry_base_ms = parse_bounded_u64(
+                value,
+                "embedding_retry_base_ms",
+                MAX_EMBEDDING_RETRY_BASE_MS,
+            )?;
+        }
         if let Some(value) = metadata.get("embedding_send_dimensions") {
             config.embedding_send_dimensions = match value.trim() {
                 "true" => true,
@@ -202,6 +253,44 @@ fn parse_positive_u32(value: &str, key: &str) -> Result<u32, CodeContextError> {
     Ok(parsed)
 }
 
+/// 解析允许为零但不能超过上限的 `u64` 配置项。
+///
+/// # Errors
+///
+/// 值不是整数或超过 `maximum` 时返回 [`CodeContextError::InvalidConfiguration`]。
+fn parse_bounded_u64(value: &str, key: &str, maximum: u64) -> Result<u64, CodeContextError> {
+    let parsed: u64 = value.trim().parse().map_err(|_| {
+        CodeContextError::InvalidConfiguration(format!(
+            "{key} 必须是 0 到 {maximum} 之间的整数，实际为 `{value}`"
+        ))
+    })?;
+    if parsed > maximum {
+        return Err(CodeContextError::InvalidConfiguration(format!(
+            "{key} 不能超过 {maximum}，实际为 {parsed}"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// 解析允许为零但不能超过上限的 `u32` 配置项。
+///
+/// # Errors
+///
+/// 值不是整数或超过 `maximum` 时返回 [`CodeContextError::InvalidConfiguration`]。
+fn parse_bounded_u32(value: &str, key: &str, maximum: u32) -> Result<u32, CodeContextError> {
+    let parsed: u32 = value.trim().parse().map_err(|_| {
+        CodeContextError::InvalidConfiguration(format!(
+            "{key} 必须是 0 到 {maximum} 之间的整数，实际为 `{value}`"
+        ))
+    })?;
+    if parsed > maximum {
+        return Err(CodeContextError::InvalidConfiguration(format!(
+            "{key} 不能超过 {maximum}，实际为 {parsed}"
+        )));
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,11 +318,17 @@ mod tests {
         let config = CodeContextConfig::from_metadata(&metadata(&[
             ("enabled", "false"),
             ("embedding_mode", "local"),
+            ("embedding_request_interval_ms", "2500"),
+            ("embedding_max_retries", "6"),
+            ("embedding_retry_base_ms", "7500"),
             ("rerank_model", "Qwen/Qwen3-Reranker-4B"),
         ]))
         .expect("显式配置应可解析");
         assert!(!config.enabled);
         assert_eq!(config.embedding_mode, EmbeddingMode::Local);
+        assert_eq!(config.embedding_request_interval_ms, 2_500);
+        assert_eq!(config.embedding_max_retries, 6);
+        assert_eq!(config.embedding_retry_base_ms, 7_500);
         assert_eq!(
             config.rerank_model.as_deref(),
             Some("Qwen/Qwen3-Reranker-4B")
@@ -267,5 +362,39 @@ mod tests {
             CodeContextConfig::from_metadata(&metadata(&[("embedding_mode", "cloud")])),
             Err(CodeContextError::InvalidConfiguration(_))
         ));
+    }
+
+    /// 限速与重试配置允许显式设为零，供无等待环境关闭对应机制。
+    #[test]
+    fn retry_timing_can_be_disabled() {
+        let config = CodeContextConfig::from_metadata(&metadata(&[
+            ("embedding_request_interval_ms", "0"),
+            ("embedding_max_retries", "0"),
+            ("embedding_retry_base_ms", "0"),
+        ]))
+        .expect("零值应关闭限速与重试等待");
+
+        assert_eq!(config.embedding_request_interval_ms, 0);
+        assert_eq!(config.embedding_max_retries, 0);
+        assert_eq!(config.embedding_retry_base_ms, 0);
+    }
+
+    /// 限速与重试配置必须拒绝超过边界或无法解析的值。
+    #[test]
+    fn invalid_retry_configuration_is_rejected() {
+        for (key, value) in [
+            ("embedding_request_interval_ms", "60001"),
+            ("embedding_max_retries", "11"),
+            ("embedding_retry_base_ms", "30001"),
+            ("embedding_retry_base_ms", "not-a-number"),
+        ] {
+            assert!(
+                matches!(
+                    CodeContextConfig::from_metadata(&metadata(&[(key, value)])),
+                    Err(CodeContextError::InvalidConfiguration(_))
+                ),
+                "{key}={value} 应被拒绝"
+            );
+        }
     }
 }

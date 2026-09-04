@@ -50,10 +50,16 @@ Guest 负责配置校验、仓库身份、索引状态、manifest 兼容性、�
 
 - `enabled = true | false`，默认 `true`
 - `embedding_mode = local | api`，默认 `api`
+- `embedding_request_interval_ms = <0..60000>`，默认 `1500`；限制相邻嵌入请求的最小间隔
+- `embedding_max_retries = <0..10>`，默认 `4`；控制单批 429/5xx 自动重试次数
+- `embedding_retry_base_ms = <0..30000>`，默认 `5000`；控制指数退避基数，单次等待最多 30 秒
+- `embedding_send_dimensions = true | false`，默认 `false`；仅端点支持维度截断时开启
 - `rerank_model = <模型名>`，可选；配置后调用同一 HTTP 端点的 `/v1/rerank`
 
-`api` 模式通过 Host 受限 HTTP 能力调用用户配置的兼容嵌入端点；端点未配置或请求失败时，
-检索自动降级为符号与 BM25 两路。`local` 模式当前仍返回未配置状态。
+`api` 模式通过 Host 受限 HTTP 能力调用用户配置的兼容嵌入端点。鉴权、模型名或参数错误会让
+检索降级为符号与 BM25 两路；429 与 5xx 会按配置限速并自动退避重试，已经写入的向量不会
+丢失。持续 429 保持 `Indexing` 并在后续调用续建，不会因普通停滞阈值永久降级。
+`local` 模式当前仍返回未配置状态。
 
 ## 直接搜索当前仓库
 
@@ -74,6 +80,8 @@ cargo run -p code-context-plugin --example search_repository --features test-sup
 
 同一仓库第二次运行会直接打开 SQLite，只重新计算新增或内容变化的代码块。若目录中已有旧版
 JSON int4 向量，首次运行会自动迁移到 SQLite 并删除 JSON 中的重复向量，不会重新调用嵌入接口。
+每批成功向量会立即事务写入 SQLite；遇到 429、进程中断或手动退出后，重新运行同一命令会从
+已有向量继续，不要添加 `--rebuild-cache`。
 可以连续输入自然语言或代码标识符，输入 `exit`、`quit` 或 `:q` 结束；也可以在命令末尾直接
 提供一条查询，以单次搜索模式运行。
 
@@ -97,8 +105,9 @@ cargo run -p code-context-plugin --example search_repository --features test-sup
 WAL/SHM 辅助文件后重新生成全部向量，`--no-cache` 禁用跨进程缓存。
 使用
 `--embedding-base-url`、`--embedding-api-key-env`、`--embedding-model`、
-`--embedding-dimension` 和 `--embedding-batch-size` 可以连接其他兼容端点；`--rerank-model`
-可以更换重排模型，`--no-rerank` 可以只保留本地融合排序。
+`--embedding-dimension`、`--embedding-batch-size`、`--embedding-request-interval-ms`、
+`--embedding-max-retries` 和 `--embedding-retry-base-ms` 可以连接并适配其他兼容端点；
+`--rerank-model` 可以更换重排模型，`--no-rerank` 可以只保留本地融合排序。
 
 融合排序会区分查询形态：`Agent`、`PermissionManager::check` 这类独立标识符保留精确符号
 提升；“一个agent对话”这类自然语言会压低普通精确词的符号权重，语义通道可用时同时提高
@@ -125,6 +134,16 @@ clang 与 `wasm32-wasip2` sysroot。这是插件自己的依赖，Lucia 本体�
 cargo test --offline -p code-context-plugin
 cargo test --offline -p code-context-plugin --example search_repository --features test-support
 cargo test --offline -p code-context-plugin --features test-support sqlite_vector
+cargo test --offline -p code-context-plugin --features test-support --test retrieval_report -- --nocapture
 bun run build:plugin:code-context
 cargo test --offline -p code-context-plugin-smoke-tests
+```
+
+真实消融需要设置 `SILICONFLOW_API_KEY` 并单独运行 `retrieval_ablation_report`。语义向量保存在
+`~/.lucia/code-context/retrieval-report/`，因此限流或进程中断后可跨进程续建；该目录与正式搜索
+缓存隔离，不会删除或污染 `search_repository` 已有向量。
+
+```bash
+cargo test -p code-context-plugin --features test-support \
+  --test retrieval_report retrieval_ablation_report -- --ignored --nocapture
 ```

@@ -41,6 +41,12 @@ pub enum CodeContextError {
     /// 是静默的——检索照常返回结果，只是少了语义那一路。调用方应当保留已完成的部分并
     /// 在后续轮次继续。
     EmbeddingTransient(String),
+    /// 嵌入端点触发速率限制，重试耗尽后仍应保留可续建状态。
+    ///
+    /// 与 [`Self::EmbeddingTransient`] 分开，是因为持续 5xx 可以在有限轮次后降级，持续
+    /// 429 却只表示当前配额窗口尚未恢复。把两者混在一起会让一个已经写入数千条向量的
+    /// 索引仅因 TPM 限流永久放弃剩余部分。
+    EmbeddingRateLimited(String),
     /// 插件配置非法。
     InvalidConfiguration(String),
 }
@@ -63,6 +69,7 @@ impl fmt::Display for CodeContextError {
             Self::NotIndexed => write!(formatter, "当前仓库尚未建立代码索引"),
             Self::EmbeddingUnavailable(detail) => write!(formatter, "嵌入能力不可用：{detail}"),
             Self::EmbeddingTransient(detail) => write!(formatter, "嵌入端点暂时不可用：{detail}"),
+            Self::EmbeddingRateLimited(detail) => write!(formatter, "嵌入端点触发限流：{detail}"),
             Self::InvalidConfiguration(detail) => write!(formatter, "插件配置无效：{detail}"),
         }
     }
@@ -74,7 +81,18 @@ impl CodeContextError {
     /// 只有明确判定为瞬时的失败才返回 `true`；无法确定时返回 `false`，避免对着一个
     /// 永久性配置错误无限重试。
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::EmbeddingTransient(_))
+        matches!(
+            self,
+            Self::EmbeddingTransient(_) | Self::EmbeddingRateLimited(_)
+        )
+    }
+
+    /// 该错误是否由端点速率限制导致。
+    ///
+    /// 429 即使跨多个构建轮次持续出现也不应转为永久不可用；调用方用该判别保留已有
+    /// 向量并继续等待下一次配额窗口。
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, Self::EmbeddingRateLimited(_))
     }
 }
 
@@ -101,5 +119,14 @@ mod tests {
     fn domain_error_is_a_standard_error() {
         let error = anyhow::Error::new(CodeContextError::NotIndexed);
         assert!(error.downcast_ref::<CodeContextError>().is_some());
+    }
+
+    /// 限流错误必须可重试且可与普通瞬时故障区分。
+    #[test]
+    fn rate_limit_is_a_distinct_transient_error() {
+        let error = CodeContextError::EmbeddingRateLimited("HTTP 429".into());
+        assert!(error.is_transient());
+        assert!(error.is_rate_limited());
+        assert!(error.to_string().contains("限流"));
     }
 }

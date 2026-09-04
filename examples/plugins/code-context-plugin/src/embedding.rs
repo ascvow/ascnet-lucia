@@ -17,13 +17,18 @@ use crate::config::{CodeContextConfig, EmbeddingMode};
 use crate::error::CodeContextError;
 use crate::model::EmbeddingSpace;
 use agent_plugin::{HttpRequest, PluginHostApi};
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// 单批默认最大输入条数。
 ///
 /// 远端嵌入端点普遍对单次请求的条数与总字节数设限；本地推理则受批大小与显存约束。
 /// 这个默认值只在 provider 未声明自己的上限时生效。
 pub const DEFAULT_MAX_BATCH_SIZE: usize = 64;
+
+/// 单次指数退避或 `Retry-After` 最多等待 30 秒。
+const MAX_EMBEDDING_RETRY_DELAY_MS: u64 = 30_000;
 
 /// 嵌入输入的用途。
 ///
@@ -290,6 +295,14 @@ pub struct ApiEmbeddingProvider<'host> {
     batch_size: usize,
     /// 是否在请求中发送 `dimensions` 参数。
     send_dimensions: bool,
+    /// 相邻请求之间的最小间隔。
+    request_interval: Duration,
+    /// 单批请求允许的重试次数。
+    max_retries: u32,
+    /// 瞬时错误指数退避的基础等待时间。
+    retry_base: Duration,
+    /// 最近一次请求开始时间，用于在正常批次和重试之间统一限速。
+    last_request_at: Cell<Option<Instant>>,
 }
 
 impl std::fmt::Debug for ApiEmbeddingProvider<'_> {
@@ -298,6 +311,9 @@ impl std::fmt::Debug for ApiEmbeddingProvider<'_> {
             .debug_struct("ApiEmbeddingProvider")
             .field("space", &self.space)
             .field("batch_size", &self.batch_size)
+            .field("request_interval", &self.request_interval)
+            .field("max_retries", &self.max_retries)
+            .field("retry_base", &self.retry_base)
             .finish_non_exhaustive()
     }
 }
@@ -325,10 +341,38 @@ impl<'host> ApiEmbeddingProvider<'host> {
             },
             batch_size: config.embedding_batch_size.max(1),
             send_dimensions: config.embedding_send_dimensions,
+            request_interval: Duration::from_millis(config.embedding_request_interval_ms),
+            max_retries: config.embedding_max_retries,
+            retry_base: Duration::from_millis(config.embedding_retry_base_ms),
+            last_request_at: Cell::new(None),
         })
     }
 
-    /// 向端点提交一次嵌入请求并解析返回的向量。
+    /// 等待相邻请求的最小间隔，并记录本次请求开始时间。
+    fn wait_for_request_slot(&self) {
+        let now = Instant::now();
+        let delay =
+            remaining_request_interval(self.last_request_at.get(), now, self.request_interval);
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        self.last_request_at.set(Some(Instant::now()));
+    }
+
+    /// 按响应头或指数退避等待下一次重试。
+    fn wait_before_retry(&self, response: &agent_plugin::HttpResponse, retry_index: u32) {
+        let delay_ms = retry_after_delay_ms(&response.headers).unwrap_or_else(|| {
+            exponential_retry_delay_ms(self.retry_base.as_millis() as u64, retry_index)
+        });
+        if delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+    }
+
+    /// 向端点提交嵌入请求，遇到 429 或 5xx 时在单批内部自动退避重试。
+    ///
+    /// 429 重试耗尽后返回专用限流错误，使上层保留已完成向量并继续等待配额窗口；其他
+    /// 4xx 直接判为配置错误，避免无意义重试。
     fn request_embeddings(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, CodeContextError> {
         let mut body = serde_json::json!({
             "model": self.space.model,
@@ -343,11 +387,17 @@ impl<'host> ApiEmbeddingProvider<'host> {
             headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
             body: Some(body.to_string()),
         };
-        let response = self.host.http_request(&request).map_err(|error| {
-            // 宿主 HTTP 失败多为网络抖动或超时，按瞬时处理并在后续轮次重试。
-            CodeContextError::EmbeddingTransient(format!("嵌入端点调用失败：{error}"))
-        })?;
-        if !(200..300).contains(&response.status) {
+        let mut retries = 0;
+        loop {
+            self.wait_for_request_slot();
+            let response = self.host.http_request(&request).map_err(|error| {
+                // 宿主 HTTP 失败多为网络抖动或超时，按瞬时处理并在后续轮次重试。
+                CodeContextError::EmbeddingTransient(format!("嵌入端点调用失败：{error}"))
+            })?;
+            if (200..300).contains(&response.status) {
+                return parse_embedding_response(&response.body);
+            }
+
             // 回传状态码与正文摘要：4xx 通常是配置错误（模型名、维度、密钥），
             // 用户需要看到端点自己的说明才能改对。
             let detail = format!(
@@ -355,16 +405,63 @@ impl<'host> ApiEmbeddingProvider<'host> {
                 response.status,
                 truncate_for_message(&response.body)
             );
-            // 429 是限流、5xx 是服务端故障，两者都会自行恢复；其余状态码是配置问题，
-            // 重试只会把同一个错误再犯一遍。
-            return Err(if response.status == 429 || response.status >= 500 {
-                CodeContextError::EmbeddingTransient(detail)
+            let retryable = response.status == 429 || response.status >= 500;
+            if retryable && retries < self.max_retries {
+                self.wait_before_retry(&response, retries);
+                retries += 1;
+                continue;
+            }
+
+            return Err(if response.status == 429 {
+                CodeContextError::EmbeddingRateLimited(format!(
+                    "{detail}（已自动重试 {retries} 次）"
+                ))
+            } else if response.status >= 500 {
+                CodeContextError::EmbeddingTransient(format!("{detail}（已自动重试 {retries} 次）"))
             } else {
                 CodeContextError::EmbeddingUnavailable(detail)
             });
         }
-        parse_embedding_response(&response.body)
     }
+}
+
+/// 计算距离下一个请求槽位还需等待多久。
+///
+/// `last_request_at` 为空或已经超过间隔时返回零；使用饱和时长差避免单调时钟异常导致
+/// 下溢。该函数无副作用，便于离线测试限速计算而不实际休眠。
+fn remaining_request_interval(
+    last_request_at: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> Duration {
+    let Some(last_request_at) = last_request_at else {
+        return Duration::ZERO;
+    };
+    interval.saturating_sub(now.saturating_duration_since(last_request_at))
+}
+
+/// 从响应头解析整数秒形式的 `Retry-After`，并限制为单次最多 30 秒。
+///
+/// HTTP 日期形式和非法值返回 `None`，由调用方回退到本地指数退避。header 名大小写不敏感，
+/// 兼容不同宿主的规范化方式。
+fn retry_after_delay_ms(headers: &HashMap<String, String>) -> Option<u64> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        .map(|seconds| {
+            seconds
+                .saturating_mul(1_000)
+                .min(MAX_EMBEDDING_RETRY_DELAY_MS)
+        })
+}
+
+/// 计算第 `retry_index` 次重试的指数退避，并限制为单次最多 30 秒。
+fn exponential_retry_delay_ms(base_ms: u64, retry_index: u32) -> u64 {
+    let multiplier = 1_u64.checked_shl(retry_index).unwrap_or(u64::MAX);
+    base_ms
+        .saturating_mul(multiplier)
+        .min(MAX_EMBEDDING_RETRY_DELAY_MS)
 }
 
 impl EmbeddingProvider for ApiEmbeddingProvider<'_> {
@@ -665,6 +762,9 @@ mod tests {
         CodeContextConfig {
             embedding_mode: EmbeddingMode::Api,
             embedding_dimension: 3,
+            embedding_request_interval_ms: 0,
+            embedding_max_retries: 0,
+            embedding_retry_base_ms: 0,
             http_endpoint_id: Some("endpoint-abc".to_string()),
             ..CodeContextConfig::default()
         }
@@ -833,6 +933,132 @@ mod tests {
         assert!(
             message.contains("Incorrect API key"),
             "应带端点说明：{message}"
+        );
+    }
+
+    /// 429 与 5xx 必须在同一批请求内自动退避重试，而不是立即交回上层放弃本轮。
+    #[test]
+    fn transient_statuses_are_retried_within_the_batch() {
+        let mut config = api_config();
+        config.embedding_max_retries = 2;
+        let host = TestHost::new().with_http_responses(vec![
+            Ok(agent_plugin::HttpResponse {
+                status: 429,
+                headers: HashMap::from([("Retry-After".to_string(), "0".to_string())]),
+                body: r#"{"message":"TPM limit reached"}"#.to_string(),
+            }),
+            http_json(503, "upstream unavailable"),
+            http_json(200, &embedding_body(&[(0, [1.0, 0.0, 0.0])])),
+        ]);
+        let provider = ApiEmbeddingProvider::from_config(&config, &host).expect("应构造成功");
+
+        let vectors = provider
+            .embed_documents(&["a".to_string()])
+            .expect("重试后应成功");
+
+        assert_eq!(vectors, [vec![1.0, 0.0, 0.0]]);
+        assert_eq!(host.http_requests().len(), 3, "初始请求后应重试两次");
+    }
+
+    /// 429 重试耗尽后必须返回专用限流错误，供构建层保持可续状态。
+    #[test]
+    fn exhausted_rate_limit_returns_distinct_error() {
+        let mut config = api_config();
+        config.embedding_max_retries = 2;
+        let responses = (0..=config.embedding_max_retries)
+            .map(|_| http_json(429, r#"{"message":"TPM limit reached"}"#))
+            .collect();
+        let host = TestHost::new().with_http_responses(responses);
+        let provider = ApiEmbeddingProvider::from_config(&config, &host).expect("应构造成功");
+
+        let error = provider
+            .embed_documents(&["a".to_string()])
+            .expect_err("持续限流应停止本批");
+
+        assert!(matches!(error, CodeContextError::EmbeddingRateLimited(_)));
+        assert!(error.is_rate_limited());
+        assert_eq!(host.http_requests().len(), 3);
+    }
+
+    /// 5xx 重试耗尽后仍是普通瞬时故障，允许构建层执行有限轮次降级。
+    #[test]
+    fn exhausted_server_error_remains_transient() {
+        let mut config = api_config();
+        config.embedding_max_retries = 1;
+        let host = TestHost::new().with_http_responses(vec![
+            http_json(500, "first failure"),
+            http_json(503, "second failure"),
+        ]);
+        let provider = ApiEmbeddingProvider::from_config(&config, &host).expect("应构造成功");
+
+        let error = provider
+            .embed_documents(&["a".to_string()])
+            .expect_err("持续 5xx 应停止本批");
+
+        assert!(matches!(error, CodeContextError::EmbeddingTransient(_)));
+        assert!(!error.is_rate_limited());
+        assert_eq!(host.http_requests().len(), 2);
+    }
+
+    /// Retry-After 只接受整数秒、大小写不敏感，并限制单次最多等待 30 秒。
+    #[test]
+    fn retry_after_is_parsed_and_capped() {
+        assert_eq!(
+            retry_after_delay_ms(&HashMap::from([(
+                "Retry-After".to_string(),
+                "7".to_string()
+            )])),
+            Some(7_000)
+        );
+        assert_eq!(
+            retry_after_delay_ms(&HashMap::from([(
+                "retry-after".to_string(),
+                "120".to_string()
+            )])),
+            Some(MAX_EMBEDDING_RETRY_DELAY_MS)
+        );
+        assert_eq!(
+            retry_after_delay_ms(&HashMap::from([(
+                "retry-after".to_string(),
+                "Wed, 21 Oct 2015 07:28:00 GMT".to_string()
+            )])),
+            None
+        );
+    }
+
+    /// 指数退避按基数翻倍，并在 30 秒处封顶。
+    #[test]
+    fn exponential_backoff_is_capped() {
+        assert_eq!(exponential_retry_delay_ms(5_000, 0), 5_000);
+        assert_eq!(exponential_retry_delay_ms(5_000, 1), 10_000);
+        assert_eq!(exponential_retry_delay_ms(5_000, 2), 20_000);
+        assert_eq!(exponential_retry_delay_ms(5_000, 3), 30_000);
+        assert_eq!(exponential_retry_delay_ms(u64::MAX, 10), 30_000);
+    }
+
+    /// 正常批次之间必须补足配置的最小请求间隔。
+    #[test]
+    fn request_interval_waits_only_for_the_remaining_time() {
+        let started = Instant::now();
+        assert_eq!(
+            remaining_request_interval(
+                Some(started),
+                started + Duration::from_millis(400),
+                Duration::from_millis(1_500),
+            ),
+            Duration::from_millis(1_100)
+        );
+        assert_eq!(
+            remaining_request_interval(
+                Some(started),
+                started + Duration::from_millis(1_500),
+                Duration::from_millis(1_500),
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            remaining_request_interval(None, started, Duration::from_millis(1_500)),
+            Duration::ZERO
         );
     }
 

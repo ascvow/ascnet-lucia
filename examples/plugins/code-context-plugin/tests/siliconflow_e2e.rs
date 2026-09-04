@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// SiliconFlow 嵌入 API 的 base URL。
 const SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.cn/v1/";
 
-/// 测试用 API 密钥。
-const SILICONFLOW_API_KEY: &str = "sk-sjnbrxiagakhmfmnaszyumeonhubdhsridmloclnzdkkdlfv";
+/// 读取 SiliconFlow API 密钥的环境变量名。
+const SILICONFLOW_API_KEY_ENV: &str = "SILICONFLOW_API_KEY";
 
 /// 嵌入模型——SiliconFlow 支持的 BAAI/bge-m3 维度 1024。
 const EMBEDDING_MODEL: &str = "BAAI/bge-m3";
@@ -72,6 +72,8 @@ struct LiveApiHost {
     tools: RefCell<Vec<String>>,
     /// 已发出的 HTTP 请求计数。
     http_call_count: RefCell<usize>,
+    /// 仅保存在测试宿主内存中的 API 密钥；不会写入插件元数据或持久化存储。
+    api_key: Option<String>,
 }
 
 impl LiveApiHost {
@@ -88,12 +90,34 @@ impl LiveApiHost {
             values: RefCell::new(values),
             tools: RefCell::new(Vec::new()),
             http_call_count: RefCell::new(0),
+            api_key: None,
         }
+    }
+
+    /// 创建允许访问真实 SiliconFlow 端点的宿主替身。
+    ///
+    /// 密钥只从 [`SILICONFLOW_API_KEY_ENV`] 指定的环境变量读取，并保存在宿主侧内存中。
+    ///
+    /// # Panics
+    ///
+    /// 环境变量缺失或为空时终止忽略测试，避免把凭证写入源码或测试缓存。
+    fn for_live_test(repo_root: impl Into<PathBuf>, namespace: impl Into<String>) -> Self {
+        let api_key = std::env::var(SILICONFLOW_API_KEY_ENV)
+            .unwrap_or_else(|_| panic!("请设置 {SILICONFLOW_API_KEY_ENV} 后再运行真实 API 测试"));
+        assert!(
+            !api_key.trim().is_empty(),
+            "{SILICONFLOW_API_KEY_ENV} 不能为空"
+        );
+        let mut host = Self::for_test(repo_root, namespace);
+        host.api_key = Some(api_key);
+        host
     }
 
     /// 返回同一场景的新宿主实例，用于模拟跨进程重启。
     fn reopen(&self) -> Self {
-        Self::for_test(self.repo_root.clone(), self.store_namespace.clone())
+        let mut reopened = Self::for_test(self.repo_root.clone(), self.store_namespace.clone());
+        reopened.api_key.clone_from(&self.api_key);
+        reopened
     }
 
     /// 返回磁盘上的存储快照，而不是当前实例的内存缓存。
@@ -388,8 +412,12 @@ impl PluginHostApi for LiveApiHost {
         if request.method.to_uppercase() != "POST" {
             return Err(anyhow!("集成测试只支持 POST，收到 {}", request.method));
         }
+        let api_key = self
+            .api_key
+            .as_deref()
+            .ok_or_else(|| anyhow!("真实 API 测试宿主未配置 {SILICONFLOW_API_KEY_ENV}"))?;
         let mut builder = agent.post(&url);
-        builder = builder.header("authorization", &format!("Bearer {SILICONFLOW_API_KEY}"));
+        builder = builder.header("authorization", &format!("Bearer {api_key}"));
         for (key, value) in &request.headers {
             builder = builder.header(key.as_str(), value.as_str());
         }
@@ -402,13 +430,20 @@ impl PluginHostApi for LiveApiHost {
         match response {
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                // 真实端点的限流窗口提示必须交给插件退避策略，其他响应头不扩大到 Guest。
+                let headers = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| HashMap::from([("retry-after".to_string(), value.to_string())]))
+                    .unwrap_or_default();
                 let body = resp
                     .into_body()
                     .read_to_string()
                     .map_err(|error| anyhow!("读取响应正文失败：{error}"))?;
                 Ok(HttpResponse {
                     status,
-                    headers: HashMap::new(),
+                    headers,
                     body,
                 })
             }
@@ -430,6 +465,12 @@ fn siliconflow_activation_context(workspace_root: &str) -> ActivationContext {
                 EMBEDDING_DIMENSION.to_string(),
             ),
             ("embedding_batch_size".to_string(), "32".to_string()),
+            (
+                "embedding_request_interval_ms".to_string(),
+                "1500".to_string(),
+            ),
+            ("embedding_max_retries".to_string(), "4".to_string()),
+            ("embedding_retry_base_ms".to_string(), "5000".to_string()),
             // bge-m3 不接受 dimensions 参数；关闭后靠返回值校验维度。
             ("embedding_send_dimensions".to_string(), "false".to_string()),
             (
@@ -513,7 +554,7 @@ fn full_pipeline_index_embed_search() {
     use agent_plugin::AgentPlugin;
 
     let src = plugin_src_dir();
-    let host = LiveApiHost::for_test(&src, "full-pipeline");
+    let host = LiveApiHost::for_live_test(&src, "full-pipeline");
     let context = siliconflow_activation_context(src.to_str().expect("路径应为 UTF-8"));
 
     let mut plugin = CodeContextPlugin::default();
@@ -559,7 +600,7 @@ fn vectors_are_persisted_and_restored() {
     use agent_plugin::AgentPlugin;
 
     let src = plugin_src_dir();
-    let host = LiveApiHost::for_test(&src, "vectors");
+    let host = LiveApiHost::for_live_test(&src, "vectors");
     let workspace_root = src.to_str().expect("路径应为 UTF-8");
     let context = siliconflow_activation_context(workspace_root);
 
@@ -626,7 +667,7 @@ fn semantic_search_returns_relevant_results() {
     use agent_plugin::AgentPlugin;
 
     let src = plugin_src_dir();
-    let host = LiveApiHost::for_test(&src, "semantic-search");
+    let host = LiveApiHost::for_live_test(&src, "semantic-search");
     let workspace_root = src.to_str().expect("路径应为 UTF-8");
     let context = siliconflow_activation_context(workspace_root);
 
@@ -673,7 +714,7 @@ fn search_demo() {
     use agent_plugin::AgentPlugin;
 
     let src = plugin_src_dir();
-    let host = LiveApiHost::for_test(&src, "search-demo");
+    let host = LiveApiHost::for_live_test(&src, "search-demo");
     let workspace_root = src.to_str().expect("路径应为 UTF-8");
 
     let mut plugin = CodeContextPlugin::default();

@@ -40,6 +40,15 @@ const DEFAULT_EMBEDDING_DIMENSION: u32 = 1_024;
 /// 默认单批嵌入代码块数量。
 const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
 
+/// 默认嵌入请求最小间隔，单位毫秒。
+const DEFAULT_EMBEDDING_REQUEST_INTERVAL_MS: u64 = 1_500;
+
+/// 默认单批瞬时错误重试次数。
+const DEFAULT_EMBEDDING_MAX_RETRIES: u32 = 4;
+
+/// 默认指数退避基数，单位毫秒。
+const DEFAULT_EMBEDDING_RETRY_BASE_MS: u64 = 5_000;
+
 /// 默认缓存目录在用户主目录中的相对路径。
 const DEFAULT_CACHE_SUBDIRECTORY: &str = ".lucia/code-context";
 
@@ -119,6 +128,12 @@ struct EmbeddingOptions {
     dimension: u32,
     /// 每次 API 请求提交的代码块数量。
     batch_size: usize,
+    /// 相邻 API 请求之间的最小间隔，单位毫秒。
+    request_interval_ms: u64,
+    /// 单批请求遇到 429 或 5xx 后允许的重试次数。
+    max_retries: u32,
+    /// 429 或 5xx 指数退避的基础等待时间，单位毫秒。
+    retry_base_ms: u64,
     /// 是否向端点发送 `dimensions` 字段。
     send_dimensions: bool,
 }
@@ -131,6 +146,9 @@ impl Default for EmbeddingOptions {
             model: DEFAULT_EMBEDDING_MODEL.to_string(),
             dimension: DEFAULT_EMBEDDING_DIMENSION,
             batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+            request_interval_ms: DEFAULT_EMBEDDING_REQUEST_INTERVAL_MS,
+            max_retries: DEFAULT_EMBEDDING_MAX_RETRIES,
+            retry_base_ms: DEFAULT_EMBEDDING_RETRY_BASE_MS,
             send_dimensions: false,
         }
     }
@@ -233,8 +251,12 @@ fn run() -> Result<()> {
                 endpoint.endpoint_id(),
             );
             eprintln!(
-                "将先为整个仓库生成语义向量：模型 {}，维度 {}，批大小 {}",
-                embedding.model, embedding.dimension, embedding.batch_size
+                "将先为整个仓库生成语义向量：模型 {}，维度 {}，批大小 {}，请求间隔 {} ms，最多重试 {} 次",
+                embedding.model,
+                embedding.dimension,
+                embedding.batch_size,
+                embedding.request_interval_ms,
+                embedding.max_retries
             );
             if let Some(model) = options.rerank_model.as_deref() {
                 eprintln!("搜索结果将使用重排模型：{model}");
@@ -352,6 +374,24 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Search
                     "--embedding-batch-size",
                 )?;
             }
+            "--embedding-request-interval-ms" => {
+                embedding.request_interval_ms = parse_nonnegative_u64(
+                    next_value(&mut args, "--embedding-request-interval-ms")?,
+                    "--embedding-request-interval-ms",
+                )?;
+            }
+            "--embedding-max-retries" => {
+                embedding.max_retries = parse_nonnegative_u32(
+                    next_value(&mut args, "--embedding-max-retries")?,
+                    "--embedding-max-retries",
+                )?;
+            }
+            "--embedding-retry-base-ms" => {
+                embedding.retry_base_ms = parse_nonnegative_u64(
+                    next_value(&mut args, "--embedding-retry-base-ms")?,
+                    "--embedding-retry-base-ms",
+                )?;
+            }
             "--embedding-send-dimensions" => {
                 embedding.send_dimensions = parse_bool(
                     next_value(&mut args, "--embedding-send-dimensions")?,
@@ -426,6 +466,28 @@ fn parse_u32(value: String, option: &str) -> Result<u32> {
 fn parse_usize(value: String, option: &str) -> Result<usize> {
     let parsed = parse_u64(value, option)?;
     usize::try_from(parsed).with_context(|| format!("选项 {option} 超出 usize 范围：{parsed}"))
+}
+
+/// 解析允许为零的 `u64` 选项。
+///
+/// # Errors
+///
+/// 值不是 `u64` 范围内的十进制整数时返回错误；具体业务上限由插件配置校验统一执行。
+fn parse_nonnegative_u64(value: String, option: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .with_context(|| format!("选项 {option} 需要非负整数，实际为 `{value}`"))
+}
+
+/// 解析允许为零的 `u32` 选项。
+///
+/// # Errors
+///
+/// 值不是 `u32` 范围内的十进制整数时返回错误；具体业务上限由插件配置校验统一执行。
+fn parse_nonnegative_u32(value: String, option: &str) -> Result<u32> {
+    value
+        .parse::<u32>()
+        .with_context(|| format!("选项 {option} 需要非负整数，实际为 `{value}`"))
 }
 
 /// 解析严格布尔选项。
@@ -559,6 +621,13 @@ impl EmbeddingEndpoint {
         }
         .map_err(|error| anyhow!("嵌入 HTTP 请求失败：{error}"))?;
         let status = response.status().as_u16();
+        // 只回传插件重试策略需要的非敏感响应头，避免把服务端其他元数据扩大到 Guest。
+        let headers = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| HashMap::from([("retry-after".to_string(), value.to_string())]))
+            .unwrap_or_default();
         let body = response
             .into_body()
             .into_with_config()
@@ -567,7 +636,7 @@ impl EmbeddingEndpoint {
             .map_err(|error| anyhow!("读取嵌入响应失败：{error}"))?;
         Ok(HttpResponse {
             status,
-            headers: HashMap::new(),
+            headers,
             body,
         })
     }
@@ -626,6 +695,18 @@ fn configure_semantic_index(
     context.metadata.insert(
         "embedding_batch_size".to_string(),
         options.batch_size.to_string(),
+    );
+    context.metadata.insert(
+        "embedding_request_interval_ms".to_string(),
+        options.request_interval_ms.to_string(),
+    );
+    context.metadata.insert(
+        "embedding_max_retries".to_string(),
+        options.max_retries.to_string(),
+    );
+    context.metadata.insert(
+        "embedding_retry_base_ms".to_string(),
+        options.retry_base_ms.to_string(),
     );
     context.metadata.insert(
         "embedding_send_dimensions".to_string(),
@@ -1112,7 +1193,7 @@ fn rust_declaration_start(signature: &str) -> Option<usize> {
 /// 打印命令用法与可选参数。
 fn print_help() {
     println!(
-        "用法：\n  cargo run -p code-context-plugin --example search_repository --features test-support -- [选项] [查询]\n\n未提供查询时，索引完成后进入交互搜索，可连续输入多条查询。语义向量默认保存到本地 sqlite-vec 数据库，第二次运行只计算新增或变化的代码块。\n\n选项：\n  --root <路径>                         仓库根目录，默认使用当前 Lucia 仓库\n  --max-results <数量>                  最多返回结果数，默认 10\n  --token-budget <数量>                 代码片段 token 预算，默认 8000\n  --path-scope <前缀>                   限定仓库相对路径，可重复指定\n  --cache-dir <目录>                    索引缓存目录，默认 ~/.lucia/code-context\n  --no-cache                            不读取或写入 sqlite-vec 与元数据缓存\n  --rebuild-cache                       删除当前仓库缓存后重新生成全部向量\n  --embedding-base-url <URL>            OpenAI 兼容端点，默认使用 SiliconFlow\n  --embedding-api-key-env <变量名>      API 密钥环境变量，默认 SILICONFLOW_API_KEY\n  --embedding-model <模型>              嵌入模型，默认 BAAI/bge-m3\n  --embedding-dimension <维度>          向量维度，默认 1024\n  --embedding-batch-size <数量>         单批代码块数，默认 32\n  --embedding-send-dimensions <布尔值>  是否发送 dimensions，默认 false\n  --rerank-model <模型>                 重排模型，默认 Qwen/Qwen3-Reranker-4B\n  --no-rerank                           禁用远端模型重排，只使用本地融合排序\n  --lexical-only                        关闭向量化与模型重排，只运行符号和 BM25 检索\n  -h, --help                            显示帮助"
+        "用法：\n  cargo run -p code-context-plugin --example search_repository --features test-support -- [选项] [查询]\n\n未提供查询时，索引完成后进入交互搜索，可连续输入多条查询。语义向量默认保存到本地 sqlite-vec 数据库，第二次运行只计算新增或变化的代码块。\n\n选项：\n  --root <路径>                         仓库根目录，默认使用当前 Lucia 仓库\n  --max-results <数量>                  最多返回结果数，默认 10\n  --token-budget <数量>                 代码片段 token 预算，默认 8000\n  --path-scope <前缀>                   限定仓库相对路径，可重复指定\n  --cache-dir <目录>                    索引缓存目录，默认 ~/.lucia/code-context\n  --no-cache                            不读取或写入 sqlite-vec 与元数据缓存\n  --rebuild-cache                       删除当前仓库缓存后重新生成全部向量\n  --embedding-base-url <URL>            OpenAI 兼容端点，默认使用 SiliconFlow\n  --embedding-api-key-env <变量名>      API 密钥环境变量，默认 SILICONFLOW_API_KEY\n  --embedding-model <模型>              嵌入模型，默认 BAAI/bge-m3\n  --embedding-dimension <维度>          向量维度，默认 1024\n  --embedding-batch-size <数量>         单批代码块数，默认 32\n  --embedding-request-interval-ms <毫秒> 相邻请求最小间隔，默认 1500\n  --embedding-max-retries <数量>        单批 429/5xx 重试次数，默认 4\n  --embedding-retry-base-ms <毫秒>      指数退避基数，默认 5000\n  --embedding-send-dimensions <布尔值>  是否发送 dimensions，默认 false\n  --rerank-model <模型>                 重排模型，默认 Qwen/Qwen3-Reranker-4B\n  --no-rerank                           禁用远端模型重排，只使用本地融合排序\n  --lexical-only                        关闭向量化与模型重排，只运行符号和 BM25 检索\n  -h, --help                            显示帮助"
     );
 }
 
@@ -1172,6 +1253,12 @@ mod tests {
                 "768",
                 "--embedding-batch-size",
                 "16",
+                "--embedding-request-interval-ms",
+                "2500",
+                "--embedding-max-retries",
+                "6",
+                "--embedding-retry-base-ms",
+                "7500",
                 "--embedding-send-dimensions",
                 "true",
                 "--rerank-model",
@@ -1192,6 +1279,9 @@ mod tests {
                 model: "embed-code".to_string(),
                 dimension: 768,
                 batch_size: 16,
+                request_interval_ms: 2_500,
+                max_retries: 6,
+                retry_base_ms: 7_500,
                 send_dimensions: true,
             })
         );

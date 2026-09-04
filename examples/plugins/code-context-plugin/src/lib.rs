@@ -186,9 +186,9 @@ const MAX_EMBEDDING_BATCHES_PER_ROUND: usize = 24;
 
 /// 连续多少轮毫无进展后放弃语义索引。
 ///
-/// 瞬时错误值得重试，但不能无限重试：端点长时间不可用时，状态必须落到一个终态，
-/// 否则界面会永远停在"正在建立索引"，用户既看不到原因也等不到结果。只有**完全没有
-/// 新向量产出**的轮次才计数，因此限流下的缓慢推进不会触发放弃。
+/// 普通 5xx 或网络瞬时错误值得重试，但不能无限重试：端点长时间不可用时，状态必须落到
+/// 一个终态，否则界面会永远停在"正在建立索引"。HTTP 429 不使用该计数，因为它只表示
+/// 当前配额窗口未恢复，不能据此永久放弃已经完成大半的语义索引。
 const MAX_SEMANTIC_STALLED_ROUNDS: u32 = 3;
 
 /// 一次语义索引构建的结果。
@@ -653,8 +653,8 @@ impl CodeContextPlugin {
         // 在交出 `context` 的可变借用前取走事件所需的计数。
         let remaining_dirty_count = context.dirty_paths.len();
 
-        // 语义向量在结构索引就绪后建立。失败不影响已就绪的两路检索，只是把状态留在
-        // Degraded——这与架构第 13 问对降级形态的定义一致，不是错误。
+        // 语义向量在结构索引就绪后建立。永久错误进入 Degraded；限流或仍有进展的瞬时错误
+        // 保持 Indexing 供后续调用续建。两种状态都不破坏已就绪的符号与词法索引。
         let semantic = self.build_semantic_index(host);
         self.index_status = semantic.into_status();
         Self::emit_index_progress(
@@ -1041,8 +1041,10 @@ impl CodeContextPlugin {
 
     /// 为已建成的结构索引计算语义向量。
     ///
-    /// 返回语义索引是否可用于检索。嵌入不可用时返回 `false` 并记录降级原因，
-    /// **不返回错误**：两路检索已经就绪，语义缺席只降低召回质量，不该让整次构建失败。
+    /// 返回本轮语义构建状态：未配置、仍可续建、已经就绪或永久不可用。
+    ///
+    /// 嵌入失败不会向上传播为结构索引错误：符号与词法两路已经就绪，语义缺席只降低召回
+    /// 质量。429 与普通瞬时故障还需分开，使配额窗口未恢复时不会被停滞阈值永久降级。
     ///
     /// 嵌入空间发生变化时先整体重置——旧向量与新查询向量不可比较，混用会让检索结果
     /// 长期缓慢地不正确。
@@ -1163,6 +1165,17 @@ impl CodeContextPlugin {
                 self.degraded_reason = None;
                 self.semantic_stalled_rounds = 0;
                 SemanticBuild::Ready
+            }
+            Some(error) if error.is_rate_limited() => {
+                // 限流只代表当前配额窗口尚未恢复。即使连续多轮没有新增向量，也必须保留
+                // 已完成部分并继续等待；转成 Unavailable 会让 5760/6600 这类索引永久残缺。
+                self.semantic_stalled_rounds = 0;
+                self.degraded_reason = Some(format!(
+                    "语义索引等待限流恢复（已完成 {} / {} 个语义块）：{error}",
+                    context.semantic.len(),
+                    semantic_total
+                ));
+                SemanticBuild::Incomplete
             }
             Some(error) if error.is_transient() && context.semantic.len() > before => {
                 // 有新向量产出说明端点仍在工作，只是没做完；重置停滞计数继续推进。
@@ -2151,12 +2164,38 @@ mod tests {
         "/// 检查工具调用是否需要审批。\npub fn check_permission(id: &str) -> bool {\n    id.is_empty()\n}\n",
     )];
 
+    /// 持续限流恢复测试使用的多批语义仓库。
+    const SEMANTIC_RATE_LIMIT_FIXTURE: &[(&str, &str)] = &[
+        (
+            "src/permission.rs",
+            "/// 检查工具调用是否需要审批。\npub fn check_permission(id: &str) -> bool {\n    id.is_empty()\n}\n",
+        ),
+        (
+            "src/session.rs",
+            "/// 恢复指定会话。\npub fn resume_session(id: &str) -> bool {\n    !id.is_empty()\n}\n",
+        ),
+        (
+            "src/storage.rs",
+            "/// 保存索引快照。\npub fn save_snapshot(id: &str) -> bool {\n    !id.is_empty()\n}\n",
+        ),
+    ];
+
     /// 构造启用 API 嵌入的激活上下文。
     fn api_activation_context(workspace_root: &str) -> ActivationContext {
         let mut context = activation_context(workspace_root);
         context
             .metadata
             .insert("embedding_dimension".into(), "4".into());
+        // 离线测试验证状态机，不实际等待限速窗口。
+        context
+            .metadata
+            .insert("embedding_request_interval_ms".into(), "0".into());
+        context
+            .metadata
+            .insert("embedding_max_retries".into(), "0".into());
+        context
+            .metadata
+            .insert("embedding_retry_base_ms".into(), "0".into());
         // 该键正常由宿主注入，测试里直接给出。
         context
             .metadata
@@ -2361,33 +2400,39 @@ mod tests {
         }
     }
 
-    /// 限流中断后必须保留可续状态，并在端点恢复后把语义索引补齐。
+    /// 持续限流必须保留已有向量与可续状态，并在端点恢复后把语义索引补齐。
     ///
     /// 这是语义检索能否在真实仓库上建成的关键：嵌入几千个代码块需要几百次请求，429 几乎
     /// 必然发生。旧实现是全有或全无——一次限流丢弃整轮结果、状态落到终态 Degraded，
     /// 于是语义索引永远停在空表上，而检索照常返回结果，失败完全不可见。
     #[test]
-    fn rate_limited_embedding_resumes_and_completes() {
-        // 第一次嵌入请求被限流，其后回落到确定性伪向量。
-        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE)
-            .with_http_responses(vec![crate::testing::http_json(
-                429,
-                r#"{"message":"TPM limit reached"}"#,
-            )])
+    fn rate_limited_embedding_preserves_vectors_and_resumes() {
+        let mut responses = vec![crate::testing::http_json(
+            200,
+            r#"{"data":[{"index":0,"embedding":[1,0,0,0]}]}"#,
+        )];
+        responses.extend(
+            (0..MAX_SEMANTIC_STALLED_ROUNDS + 2)
+                .map(|_| crate::testing::http_json(429, r#"{"message":"TPM limit reached"}"#)),
+        );
+        let host = crate::testing::RepoHost::new(SEMANTIC_RATE_LIMIT_FIXTURE)
+            .with_http_responses(responses)
             .with_echo_embeddings(4);
         let mut plugin = CodeContextPlugin::default();
-        plugin
-            .activate(&host, api_activation_context("/repo/a"))
-            .expect("激活插件");
+        let mut context = api_activation_context("/repo/a");
+        context
+            .metadata
+            .insert("embedding_batch_size".into(), "1".into());
+        plugin.activate(&host, context).expect("激活插件");
 
-        // 手动推进到限流那一轮，观察中间状态而不是只看终态。
+        // 首批成功、第二批限流，先证明成功前缀已经写入而不是整轮丢弃。
         let mut hit_rate_limit = false;
         for _ in 0..8 {
             plugin.advance_index(&host);
             if plugin
                 .degraded_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("仍在建立"))
+                .is_some_and(|reason| reason.contains("等待限流恢复"))
             {
                 hit_rate_limit = true;
                 assert_eq!(
@@ -2395,6 +2440,7 @@ mod tests {
                     IndexStatus::Indexing,
                     "限流应保持可续状态，而不是终态降级"
                 );
+                assert_eq!(plugin.semantic_len(), 1, "限流前的成功向量必须保留");
                 break;
             }
             if plugin.index_status() != IndexStatus::Indexing {
@@ -2403,20 +2449,31 @@ mod tests {
         }
         assert!(hit_rate_limit, "测试应至少触发一次限流续建路径");
 
+        // 连续超过普通瞬时故障的停滞阈值，429 仍不得转成终态 Degraded。
+        for _ in 0..=MAX_SEMANTIC_STALLED_ROUNDS {
+            plugin.advance_index(&host);
+            assert_eq!(
+                plugin.index_status(),
+                IndexStatus::Indexing,
+                "持续 429 不得经过停滞计数永久降级"
+            );
+            assert_eq!(plugin.semantic_len(), 1, "重试期间不得丢失已有向量");
+        }
+
+        // 预置 429 耗尽后，测试宿主恢复为正常嵌入响应。
         for _ in 0..8 {
             if plugin.index_status() != IndexStatus::Indexing {
                 break;
             }
             plugin.advance_index(&host);
         }
-
         assert_eq!(
             plugin.index_status(),
             IndexStatus::Ready,
             "端点恢复后必须把语义索引补齐，实际降级原因：{:?}",
             plugin.degraded_reason
         );
-        assert!(plugin.semantic_len() > 0, "补齐后必须有向量");
+        assert!(plugin.semantic_len() > 1, "恢复后必须补齐剩余向量");
     }
 
     /// 嵌入端点持续失败时必须降级为两路检索，而不是让索引构建失败或永远停在建立中。

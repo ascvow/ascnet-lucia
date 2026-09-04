@@ -11,10 +11,10 @@ Phase 15 — Hardening
 
 Status: IN PROGRESS
 
-当前加固重点是中文行为描述的语义排序区分度。符号与 BM25 继续使用原子块；相邻过短兄弟
-声明新增有界语义复合表示，并把父符号、import 上下文与正文送入嵌入模板。现已补充八类
-业务式查询、实现正文、可复现性与延迟评测；真实模型质量指标尚未重跑，当前只确认结构、
-索引隔离与离线回归。
+当前加固重点是中文行为描述的语义排序区分度与真实 API 长任务可靠性。符号与 BM25 继续使用
+原子块；相邻过短兄弟声明新增有界语义复合表示，并把父符号、import 上下文与正文送入嵌入
+模板。API 嵌入现已增加主动限速、429/5xx 单批重试、429 可续状态与跨进程 sqlite-vec 缓存；
+真实模型质量指标尚未重跑，当前只确认结构、索引隔离、限流恢复状态机与离线回归。
 
 ## Overall Status
 
@@ -975,6 +975,14 @@ Implemented:
   行覆盖；调用链和影响面明确标为不支持，不把源码片段伪装成符号图谱能力。
 - **评测污染隔离**：真实仓库报告排除 `retrieval_report.rs`、`retrieval_benchmark.rs`、本进度
   文件和生成报告，防止查询文本、目标符号与既有结果被同一个索引读回并造成指标虚高。
+- **嵌入请求限速与重试**：相邻请求默认至少间隔 1500 ms；单批 429/5xx 默认重试 4 次，
+  退避基数 5000 ms，支持整数秒 `Retry-After`，单次等待最多 30 秒。三项均可配置并允许设为 0。
+- **429 专用可续状态**：持续限流不再累计普通瞬时故障的停滞轮次，也不会转成终态
+  `Degraded`；成功前缀立即写入语义索引，端点恢复后只补剩余向量。
+- **真实消融跨进程缓存**：`retrieval_report` 的真实 API 场景使用独立 sqlite-vec 数据库，
+  与正式搜索缓存隔离。进程在 5760/6600 等部分进度中断后，重跑会复用已有向量继续建立。
+- **真实测试凭证收口**：`siliconflow_e2e` 不再保存源码内密钥，只从宿主进程的
+  `SILICONFLOW_API_KEY` 环境变量读取，凭证不进入插件元数据或持久化文件。
 
 Scale Result（Lucia 当前仓库）:
 - 原子代码块 6641 个，语义复合块 262 个，其中 970 个原子块由复合块代表。
@@ -992,21 +1000,25 @@ Offline Acceptance Result（2026-09-04，本机单次报告）:
 - 八类结果证明当前主要差距仍在排序与实现区分：候选召回 `87.5%`，实现本体只命中 `50.0%`。
 
 Verified:
-- `cargo test -p code-context-plugin --lib`：362 项通过。
+- `cargo test --offline -p code-context-plugin --lib`：371 项通过。
 - `cargo test -p code-context-plugin --test retrieval_benchmark -- --nocapture`：9 项通过。
 - `cargo test -p code-context-plugin --features test-support --test retrieval_report -- --nocapture`：
-  2 项离线报告通过，3 项真实 API 报告按设计忽略。
+  6 项离线报告通过，3 项真实 API 报告按设计忽略。
 - `cargo test -p code-context-plugin --example search_repository --features test-support`：11 项通过。
 - `cargo clippy -p code-context-plugin --all-targets`：退出成功；四个语言适配器仍有 4 条既有
   `field_reassign_with_default` 警告，本轮未做无关重构。
 - `bun run build:plugin:code-context`：`wasm32-wasip2` release 构建通过。
 - `cargo test -p code-context-plugin-smoke-tests`：9 项真实 WASM Host smoke 通过。
+- `cargo test --offline -p code-context-plugin --test siliconflow_e2e`：1 项磁盘持久化测试通过，
+  4 项真实网络测试按设计忽略；测试宿主已通过编译且不再包含源码凭证。
+- 当前仓库目标查询基线：以纯词法、无缓存模式运行“app用户下单接口实现”，完成 344 个文件、
+  6980 个代码块索引，Top-10 没有下单实现；Lucia 仓库不存在正样本，只用于确认工具链行为。
 - 上述数字是结构规模与离线回归结果，**不是新策略的真实模型质量提升证明**。
 
 Pending:
 - 用真实 `BAAI/bge-m3` + `Qwen/Qwen3-Reranker-4B` 重跑 32 条消融，确认中文行为描述
-  Recall@1 是否改善。2026-09-04 已尝试运行，当前进程未设置 `SILICONFLOW_API_KEY`，测试在
-  发起网络请求前停止。
+  Recall@1 是否改善。2026-09-04 当前进程未设置 `SILICONFLOW_API_KEY`，因此没有发起真实
+  网络请求；设置后应直接重跑，不删除 `~/.lucia/code-context/retrieval-report/` 下的缓存。
 - 最终查询 `search_code("app用户下单接口实现")` 需要在真实包含 App 下单业务的仓库上验收；
   Lucia 仓库不存在该业务实现，不能通过添加伪造源码制造正样本。当前工具正式名称仍为
   `code_search`，`search_code(...)` 只作为目标调用写法，是否增加兼容别名需单独确定协议需求。
@@ -1144,10 +1156,10 @@ Tier 3  文本分块              —— 未覆盖语言、解析失败、无声
 
 ## Next Action
 
-Phase 15 正在进行：语义复合块、父符号、import 上下文和八类业务式验收已实现并通过离线回归；
-下一步使用真实 `BAAI/bge-m3` + `Qwen/Qwen3-Reranker-4B` 重跑消融，并在真实 App 仓库验收
-“app 用户下单接口实现”。Phase 12 — Local Embedding Provider 仍受 Host embedding 能力缺失
-阻塞（跳过）。
+Phase 15 正在进行：语义复合块、结构上下文、API 限速重试、429 可续建和真实消融缓存已实现并
+通过离线与 WASM Host 回归；下一步设置 `SILICONFLOW_API_KEY` 后复用现有 sqlite-vec 缓存重跑
+真实 `BAAI/bge-m3` + `Qwen/Qwen3-Reranker-4B` 消融，并在真实 App 仓库验收“app 用户下单接口
+实现”。Phase 12 — Local Embedding Provider 仍受 Host embedding 能力缺失阻塞（跳过）。
 
 ---
 

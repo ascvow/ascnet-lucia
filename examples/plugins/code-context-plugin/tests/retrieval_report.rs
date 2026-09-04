@@ -34,13 +34,14 @@
 use code_context_plugin::{
     build_context,
     testing::{activation_context, collect_repository_files, repository_root, RepoHost},
-    CodeContextPlugin, ContextBundle, ContextConfig, IndexStatus, SearchResult,
+    CodeContextPlugin, ContextBundle, ContextConfig, IndexStatus, RepositoryIdentity, SearchResult,
 };
 
 use agent_plugin::{AgentPlugin, ToolCall};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 // ===========================================================================
@@ -1344,10 +1345,32 @@ const EMBEDDING_BASE_URL: &str = "https://api.siliconflow.cn/v1/";
 const EMBEDDING_MODEL: &str = "BAAI/bge-m3";
 /// 嵌入维度。
 const EMBEDDING_DIMENSION: u32 = 1024;
+/// 真实消融请求的最小间隔，单位毫秒。
+const EMBEDDING_REQUEST_INTERVAL_MS: u64 = 1_500;
+/// 单批真实消融请求允许的重试次数。
+const EMBEDDING_MAX_RETRIES: u32 = 4;
+/// 真实消融瞬时错误的指数退避基数，单位毫秒。
+const EMBEDDING_RETRY_BASE_MS: u64 = 5_000;
 /// 默认重排模型。
 const RERANK_MODEL: &str = "Qwen/Qwen3-Reranker-4B";
 /// 读取 API 密钥的环境变量名。
 const API_KEY_ENV: &str = "SILICONFLOW_API_KEY";
+/// 真实评测向量缓存相对用户主目录的位置。
+const REPORT_CACHE_SUBDIRECTORY: &str = ".lucia/code-context/retrieval-report";
+
+/// 返回可跨进程续建的真实评测 sqlite-vec 路径。
+///
+/// 路径只包含仓库身份摘要与固定场景名，不泄露本地绝对路径。没有主目录信息时退回系统临时
+/// 目录；不同评测场景使用独立数据库，避免并行执行忽略测试时争用同一连接。
+fn retrieval_report_vector_path(root: &Path, scenario: &str) -> PathBuf {
+    let identity = RepositoryIdentity::from_workspace_root(&root.to_string_lossy())
+        .expect("真实评测仓库根必须有效");
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(REPORT_CACHE_SUBDIRECTORY)
+        .join(format!("{}-{scenario}.sqlite3", identity.as_str()))
+}
 
 /// 一次消融配置。
 struct Ablation {
@@ -1390,6 +1413,18 @@ fn ablation_context(root: &str, ablation: &Ablation) -> agent_plugin::Activation
         context
             .metadata
             .insert("embedding_batch_size".into(), "32".into());
+        context.metadata.insert(
+            "embedding_request_interval_ms".into(),
+            EMBEDDING_REQUEST_INTERVAL_MS.to_string(),
+        );
+        context.metadata.insert(
+            "embedding_max_retries".into(),
+            EMBEDDING_MAX_RETRIES.to_string(),
+        );
+        context.metadata.insert(
+            "embedding_retry_base_ms".into(),
+            EMBEDDING_RETRY_BASE_MS.to_string(),
+        );
         context
             .metadata
             .insert("http_endpoint_id".into(), "retrieval-report".into());
@@ -1429,6 +1464,15 @@ fn forward_to_endpoint(
         }
         .map_err(|error| anyhow::anyhow!("端点请求失败：{error}"))?;
         let status = response.status().as_u16();
+        // 只保留自动重试需要的非敏感响应头。
+        let headers = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                std::collections::HashMap::from([("retry-after".to_string(), value.to_string())])
+            })
+            .unwrap_or_default();
         let body = response
             .into_body()
             .into_with_config()
@@ -1437,7 +1481,7 @@ fn forward_to_endpoint(
             .map_err(|error| anyhow::anyhow!("读取端点响应失败：{error}"))?;
         Ok(agent_plugin::HttpResponse {
             status,
-            headers: std::collections::HashMap::new(),
+            headers,
             body,
         })
     }
@@ -1465,6 +1509,8 @@ fn retrieval_ablation_report() {
         .collect();
     let queries = eval_queries();
     let acceptance_queries = acceptance_queries();
+    let vector_path = retrieval_report_vector_path(&root, "ablation");
+    eprintln!("[消融] 语义向量缓存：{}", vector_path.display());
 
     let ablations = [
         Ablation {
@@ -1489,7 +1535,11 @@ fn retrieval_ablation_report() {
         eprintln!("[消融] 正在运行配置：{}", ablation.label);
         let host =
             RepoHost::new(&file_refs).with_http_handler(forward_to_endpoint(api_key.clone()));
-        let mut plugin = CodeContextPlugin::default();
+        let mut plugin = if ablation.semantic {
+            CodeContextPlugin::default().with_sqlite_vector_database(&vector_path)
+        } else {
+            CodeContextPlugin::default()
+        };
         plugin
             .activate(&host, ablation_context(&root.to_string_lossy(), ablation))
             .expect("激活插件");
@@ -1652,7 +1702,8 @@ fn semantic_channel_diagnosis() {
         semantic: true,
         rerank: false,
     };
-    let mut plugin = CodeContextPlugin::default();
+    let vector_path = retrieval_report_vector_path(&root, "semantic-diagnosis");
+    let mut plugin = CodeContextPlugin::default().with_sqlite_vector_database(&vector_path);
     plugin
         .activate(&host, ablation_context(&root.to_string_lossy(), &ablation))
         .expect("激活插件");
@@ -1814,7 +1865,8 @@ fn chinese_query_failure_analysis() {
         semantic: true,
         rerank: false,
     };
-    let mut plugin = CodeContextPlugin::default();
+    let vector_path = retrieval_report_vector_path(&root, "chinese-query-analysis");
+    let mut plugin = CodeContextPlugin::default().with_sqlite_vector_database(&vector_path);
     plugin
         .activate(&host, ablation_context(&root.to_string_lossy(), &ablation))
         .expect("激活插件");
