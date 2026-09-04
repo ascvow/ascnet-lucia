@@ -32,6 +32,7 @@ pub fn parse(source: &str, typescript: bool) -> Option<ParseOutput> {
 
     let index = LineIndex::new(source);
     let mut output = ParseOutput::default();
+    output.file_doc = super::leading_doc_comment(source);
     for statement in &result.program.body {
         walk_statement(statement, None, &index, &mut output);
     }

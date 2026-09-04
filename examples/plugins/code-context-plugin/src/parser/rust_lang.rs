@@ -13,6 +13,8 @@ use syn::spanned::Spanned;
 pub fn parse(source: &str) -> Option<ParseOutput> {
     let file = syn::parse_file(source).ok()?;
     let mut output = ParseOutput::default();
+    // `//!` 内层文档注释挂在 `File` 上，描述的是整个文件的职责。
+    output.file_doc = doc_of(&file.attrs);
     walk_items(&file.items, None, &mut output);
     Some(output)
 }

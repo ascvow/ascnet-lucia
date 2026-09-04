@@ -89,18 +89,33 @@ pub use tool::{CodeSearchRequest, TOOL_NAME};
 /// 30–40 行代码，既覆盖绝大多数函数的完整实现，又不会让一个超长函数挤占整批的配额。
 const MAX_SEMANTIC_BODY_CHARS: usize = 1_200;
 
+/// 注入嵌入文本的文件级文档最大字符数。
+///
+/// 比块级文档更短：它在同一文件的每个块里重复出现，过长会把各块之间真正的差异冲淡，
+/// 让整个文件的向量挤成一团。300 字符足以容纳一段说明职责的开头。
+const MAX_FILE_DOC_CHARS: usize = 300;
+
 /// 构造送去嵌入的文档文本。
 ///
-/// 拼接限定名、签名、文档注释与**代码正文**。正文是这里最关键的一项：没有它，一个没写
-/// 文档注释的函数就只剩下路径和签名可供嵌入，向量几乎只编码了"它叫什么、在哪个文件"；
-/// 而没有结构化解析器的语言（Java、Vue、PHP 等）连符号和签名都没有，向量退化成一条路径。
-/// 这正是"自然语言描述某个行为却检索不到实现"的首要原因。
+/// 拼接路径、**文件级文档**、限定名、签名、块级文档注释与**代码正文**。
+///
+/// 正文是最关键的一项：没有它，一个没写文档注释的函数就只剩下路径和签名可供嵌入，向量
+/// 几乎只编码了"它叫什么、在哪个文件"；而没有结构化解析器的语言（Java、Vue、PHP 等）
+/// 连符号和签名都没有，向量退化成一条路径。
+///
+/// 文件级文档解决的是另一个问题：自然语言查询表达的常常是**文件的职责**而不是某个函数
+/// 的细节。"代码块是怎么切分出来的"对应的是 `parser/mod.rs` 顶部那句"把源文件转换为
+/// CodeChunk 与 Symbol"，但这段文字不属于文件里任何一个声明，按声明切块时会整段丢失，
+/// 于是文件里每个函数都缺少"我属于干什么的模块"这一层语境。
 ///
 /// `body` 为 `None` 表示正文回读失败，此时退回元数据——比完全跳过这个 chunk 更好。
 /// 缺失字段直接跳过，不填占位符：占位符会成为所有同类 chunk 的共同噪声。
-fn semantic_document_text(chunk: &CodeChunk, body: Option<&str>) -> String {
+fn semantic_document_text(chunk: &CodeChunk, file_doc: Option<&str>, body: Option<&str>) -> String {
     let mut parts = Vec::new();
     parts.push(chunk.file_path.clone());
+    if let Some(doc) = file_doc.map(str::trim).filter(|doc| !doc.is_empty()) {
+        parts.push(truncate_chars(doc, MAX_FILE_DOC_CHARS));
+    }
     if let Some(qualified) = chunk.qualified_symbol.as_deref() {
         parts.push(qualified.to_string());
     }
@@ -1055,7 +1070,13 @@ impl CodeContextPlugin {
                     chunk.id.clone(),
                     chunk.file_path.clone(),
                     chunk.content_hash.clone(),
-                    semantic_document_text(chunk, body.as_deref()),
+                    semantic_document_text(
+                        chunk,
+                        index
+                            .file(&chunk.file_path)
+                            .and_then(|file| file.doc.as_deref()),
+                        body.as_deref(),
+                    ),
                 )
             })
             .collect();
@@ -1409,9 +1430,12 @@ mod tests {
             content_hash: "hash".into(),
         };
 
-        let without = semantic_document_text(&chunk, None);
-        let with =
-            semantic_document_text(&chunk, Some("self.flush_to_disk();\nself.mark_clean();"));
+        let without = semantic_document_text(&chunk, None, None);
+        let with = semantic_document_text(
+            &chunk,
+            None,
+            Some("self.flush_to_disk();\nself.mark_clean();"),
+        );
 
         assert!(!without.contains("flush_to_disk"));
         assert!(
@@ -1419,6 +1443,14 @@ mod tests {
             "嵌入文档必须包含正文：{with}"
         );
         assert!(with.contains("src/session.rs") && with.contains("SessionStore::save"));
+
+        // 文件级文档必须进入嵌入文本：自然语言查询表达的常常是文件职责而非函数细节。
+        let with_file_doc =
+            semantic_document_text(&chunk, Some("会话持久化：把会话状态写入磁盘。"), None);
+        assert!(
+            with_file_doc.contains("会话持久化"),
+            "嵌入文档必须包含文件级文档：{with_file_doc}"
+        );
     }
 
     /// 超长正文必须按字符边界截断，不能在多字节字符中间切开。

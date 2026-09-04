@@ -55,6 +55,11 @@ pub struct FileRecord {
     pub byte_len: u32,
     /// 文件行数。
     pub line_count: u32,
+    /// 文件级文档注释；解析不到时为 `None`。
+    ///
+    /// 只在文件记录上保留一份，而不是复制进每个 chunk：一个文件动辄几十个 chunk，
+    /// 逐块复制同一段文字会白白占掉线性内存。
+    pub doc: Option<String>,
 }
 
 /// 索引规模统计。
@@ -207,6 +212,7 @@ impl StructuralIndex {
             chunks: parsed_chunks,
             symbols: parsed_symbols,
             tier,
+            file_doc,
         } = parsed;
         let old_record = self.files.get(&file.path).cloned();
         let old_chunk_ids = old_record
@@ -327,6 +333,7 @@ impl StructuralIndex {
                 chunk_ids: ordered_chunk_ids,
                 byte_len: file.byte_len,
                 line_count: file.line_count,
+                doc: file_doc,
             },
         );
         Some(IndexChange {

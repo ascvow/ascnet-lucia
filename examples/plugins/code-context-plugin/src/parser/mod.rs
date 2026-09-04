@@ -94,6 +94,13 @@ pub struct ParseOutput {
     pub declarations: Vec<Declaration>,
     /// 文件的导入语句。
     pub imports: Vec<String>,
+    /// 文件级文档注释（Rust 的 `//!`、Python 的模块 docstring 等）。
+    ///
+    /// 它描述的是整个文件的职责，而这恰恰是自然语言查询最常表达的东西——
+    /// "代码块是怎么切分出来的"对应的正是 `parser/mod.rs` 顶部那句"把源文件转换为
+    /// CodeChunk 与 Symbol"。但这段文字不属于文件里任何一个声明，因此在按声明切块的
+    /// 索引里会整段丢失。保留它，供嵌入时注入每个代码块。
+    pub file_doc: Option<String>,
 }
 
 /// 解析所处的层级。
@@ -124,6 +131,8 @@ pub struct ParsedFile {
     pub symbols: Vec<Symbol>,
     /// 实际使用的解析层级。
     pub tier: ParseTier,
+    /// 文件级文档注释，供嵌入时补充每个代码块的所属语境。
+    pub file_doc: Option<String>,
 }
 
 /// 字节偏移到行号的映射。
@@ -190,12 +199,13 @@ pub fn parse_file(
             chunks: text_chunks(repository, file_path, language, &lines),
             symbols: Vec::new(),
             tier: ParseTier::Text,
+            file_doc: None,
         };
     };
 
     let file_is_test = is_test_path(file_path);
     let separator = separator_of(language);
-    let mut imports = output.imports;
+    let mut imports = output.imports.clone();
     imports.truncate(MAX_IMPORTS);
 
     let mut chunks = Vec::new();
@@ -249,7 +259,65 @@ pub fn parse_file(
         chunks,
         symbols,
         tier: ParseTier::Structural,
+        file_doc: output.file_doc.map(|doc| truncate(doc, MAX_DOC_LEN)),
     }
+}
+
+/// 提取文件开头的注释块作为文件级文档。
+///
+/// 供没有专门"文件文档"语法的语言使用（TypeScript、Go）。只取**第一个声明之前**的连续
+/// 注释：再往后的注释属于某个具体声明，已经由解析器归到对应 chunk 上，重复收进来只会
+/// 让每个块的嵌入文本被同一段文字稀释。
+///
+/// 跳过 shebang 与 `//go:build` 这类构建指令——它们是给工具看的，不描述文件职责。
+pub fn leading_doc_comment(source: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut in_block = false;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if in_block {
+            if let Some(end) = trimmed.find("*/") {
+                parts.push(trimmed[..end].trim_start_matches('*').trim().to_string());
+                in_block = false;
+            } else {
+                parts.push(trimmed.trim_start_matches('*').trim().to_string());
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            // 注释块已经开始时，空行意味着它结束了。
+            if parts.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if trimmed.starts_with("#!") || trimmed.starts_with("//go:") || trimmed.starts_with("#") {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("//") {
+            parts.push(rest.trim_start_matches('/').trim().to_string());
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            let rest = trimmed.trim_start_matches("/*").trim_start_matches('*');
+            match rest.find("*/") {
+                Some(end) => parts.push(rest[..end].trim().to_string()),
+                None => {
+                    parts.push(rest.trim().to_string());
+                    in_block = true;
+                }
+            }
+            continue;
+        }
+        // 到达第一个非注释内容，文件级注释到此为止。
+        break;
+    }
+    let doc = parts
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!doc.trim().is_empty()).then(|| truncate(doc, MAX_DOC_LEN))
 }
 
 /// 按路径判断一个文件是否属于测试代码。
