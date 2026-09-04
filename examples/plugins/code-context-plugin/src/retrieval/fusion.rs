@@ -72,6 +72,11 @@ pub struct FusionConfig {
     ///
     /// 取 1.0：路径相关是有用信号但远弱于符号命中，不应盖过内容匹配。
     pub path_boost: f32,
+    /// 自然语言查询中夹带标识符时，符号精确提升的折减比例。
+    ///
+    /// 取 0.5：足以让"工具函数 formatDate 定义在哪"把定义排到使用点之前，又不至于让
+    /// 一个顺带提到的标识符压过语义与词法通道的共同判断。
+    pub natural_language_identifier_ratio: f32,
     /// 元数据完整覆盖查询词时的重排提升，单位为 rank-1 当量。
     ///
     /// 取 0.75：足以调整分数接近的候选，但小于一路第一名与末位候选的最大分差，确保
@@ -87,6 +92,7 @@ impl Default for FusionConfig {
             name_match_boost: 1.5,
             natural_language_symbol_weight: 0.25,
             natural_language_semantic_weight: 1.75,
+            natural_language_identifier_ratio: 0.5,
             path_boost: 1.0,
             metadata_rerank_boost: 0.75,
         }
@@ -215,6 +221,7 @@ pub fn fuse(
     let rerank_query_tokens: BTreeSet<String> =
         super::tokenize::tokenize_query(query).into_iter().collect();
     let intent = QueryIntent::classify(query);
+    let query_has_identifier = has_identifier_shaped_token(query);
     let semantic_available = channels
         .iter()
         .flatten()
@@ -257,7 +264,8 @@ pub fn fuse(
         .into_iter()
         .filter_map(|item| {
             let chunk = index.chunk(&item.chunk_id)?;
-            let symbol_boost = symbol_boost_of(item.symbol_match, intent, config) * unit;
+            let symbol_boost =
+                symbol_boost_of(item.symbol_match, intent, query_has_identifier, config) * unit;
             let path_boost = path_boost_of(&query_tokens, &chunk.file_path, config) * unit;
             let rerank = metadata_rerank_of(&rerank_query_tokens, chunk, intent, config);
             let rerank_boost = rerank.boost_units * unit;
@@ -328,7 +336,7 @@ struct MetadataRerank {
 
 /// 查询形态决定符号精确提升和通道权重。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueryIntent {
+pub(crate) enum QueryIntent {
     /// 单独的代码标识符或限定名，例如 `Agent`、`PermissionManager::check`。
     Identifier,
     /// 包含中文、空白或说明性标点的自然语言描述。
@@ -372,19 +380,65 @@ impl Accumulator {
 ///
 /// 只有精确匹配获得提升。后缀与前缀匹配不提升——它们本就是弱信号，再提升会让
 /// "查 check 命中所有名字里带 check 的东西"淹没真正的目标。
-fn symbol_boost_of(
+///
+/// # 自然语言查询里夹带的标识符
+///
+/// 早期实现对自然语言查询一律返回 0，代价是"工具函数 formatDate 定义在哪"这类**混合
+/// 查询**完全拿不到定义优先：词法通道会把每一处调用点都召回，而定义本身往往因为函数体
+/// 更长、BM25 长度归一化更吃亏而排在后面，于是结果全是使用点、没有函数本体。
+///
+/// 现在改为：自然语言查询中，只要有一个**具备标识符特征**的查询词与该 chunk 的符号精确
+/// 相同，就给一份折减后的提升。判定见 [`has_identifier_shaped_token`]——它要求驼峰、
+/// 下划线、限定分隔符或足够长度，因此 `agent`、`check`、`session` 这类普通英文词不会
+/// 触发，而 `formatDate`、`refresh_token`、`PermissionManager` 会。
+pub(crate) fn symbol_boost_of(
     symbol_match: Option<SymbolMatch>,
     intent: QueryIntent,
+    query_has_identifier: bool,
     config: &FusionConfig,
 ) -> f32 {
-    if intent == QueryIntent::NaturalLanguage {
-        return 0.0;
-    }
-    match symbol_match {
+    let base = match symbol_match {
         Some(SymbolMatch::ExactQualified) => config.exact_symbol_boost,
         Some(SymbolMatch::ExactName) => config.name_match_boost,
-        _ => 0.0,
+        _ => return 0.0,
+    };
+    match intent {
+        QueryIntent::Identifier => base,
+        // 折减而不是等同：自然语言查询里的标识符是"顺带提到"，不像纯标识符查询那样
+        // 明确表达了导航意图，不应压过语义与词法通道的共同判断。
+        QueryIntent::NaturalLanguage if query_has_identifier => {
+            base * config.natural_language_identifier_ratio
+        }
+        QueryIntent::NaturalLanguage => 0.0,
     }
+}
+
+/// 判断查询中是否存在具备标识符特征的词。
+///
+/// 两类特征任一成立即可：含下划线或限定分隔符（`snake_case`、`Foo::bar`），或含大小写
+/// 混排边界（`formatDate`、`HTTPServer`）。
+///
+/// 刻意**不使用长度规则**：`provider`、`manifest`、`approval` 这类既是普通英文词又常被
+/// 用作符号名的词，长度上与真实标识符无法区分，按长度放行会把符号提升发给一大批同名
+/// 符号，实测反而拉低 MRR。形态特征比长度可靠得多。
+pub(crate) fn has_identifier_shaped_token(query: &str) -> bool {
+    query.split_whitespace().any(|word| {
+        let word = word.trim_matches(|character: char| {
+            !character.is_alphanumeric() && !matches!(character, '_' | ':' | '.')
+        });
+        if word.chars().count() < 2 {
+            return false;
+        }
+        let has_separator = word.contains('_') || word.contains("::") || word.contains('.');
+        // 驼峰要求**大小写混排**且大写不只出现在首字符：
+        //   formatDate / HTTPServer / PermissionManager → 是
+        //   Session（仅句首大写）、RRF / HTTP（全大写缩写）→ 否
+        // 全大写缩写必须排除：它们在中英混排查询里就是普通名词（"RRF 融合"、"HTTP 客户端"），
+        // 当成标识符会把符号提升发给一大批同名常量。
+        let has_case_boundary =
+            word.chars().any(char::is_lowercase) && word.chars().skip(1).any(char::is_uppercase);
+        has_separator || has_case_boundary
+    })
 }
 
 /// 返回指定查询意图下某个检索通道的 RRF 权重。

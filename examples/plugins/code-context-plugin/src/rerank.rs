@@ -11,6 +11,11 @@ use std::collections::{HashMap, HashSet};
 /// 单次模型重排最多提交的候选数量。
 const MAX_RERANK_CANDIDATES: usize = 48;
 
+/// 本地名次与模型名次做 RRF 时的平滑常量。
+///
+/// 与 [`crate::retrieval::FusionConfig`] 取同一个值，使两处"排名融合"的量级一致。
+const RRF_K: f32 = 60.0;
+
 /// 每条候选最多携带的源码字符数。
 ///
 /// 限制单条长度可以把 40 条左右的候选稳定控制在常见 rerank 上下文窗口内，同时保留
@@ -156,25 +161,40 @@ fn apply_response(body: &str, results: Vec<SearchResult>) -> Result<Vec<SearchRe
 
     let mut seen = HashSet::with_capacity(expected);
     let mut slots: Vec<Option<SearchResult>> = results.into_iter().map(Some).collect();
-    let mut scored = Vec::with_capacity(expected);
-    for item in envelope.results {
+    // 先按模型分数排出模型自己的名次，再与本地融合名次做一次 RRF。
+    let mut model_order: Vec<(f32, usize)> = Vec::with_capacity(expected);
+    for item in &envelope.results {
         if !item.relevance_score.is_finite() {
             return Err(format!("rerank 响应的 index {} 分数不是有限数", item.index));
         }
         if !seen.insert(item.index) {
             return Err(format!("rerank 响应的 index {} 重复", item.index));
         }
-        let slot = slots
-            .get_mut(item.index)
-            .ok_or_else(|| format!("rerank 响应的 index {} 超出候选数量 {expected}", item.index))?;
-        let mut result = slot
-            .take()
-            .ok_or_else(|| format!("rerank 响应的 index {} 重复", item.index))?;
-        let fusion_score = result.score;
-        result.score = item.relevance_score;
-        scored.push((item.relevance_score, fusion_score, result));
+        if item.index >= expected {
+            return Err(format!(
+                "rerank 响应的 index {} 超出候选数量 {expected}",
+                item.index
+            ));
+        }
+        model_order.push((item.relevance_score, item.index));
+    }
+    model_order.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
+
+    let mut scored = Vec::with_capacity(expected);
+    for (model_rank, (relevance, index)) in model_order.into_iter().enumerate() {
+        let mut result = slots
+            .get_mut(index)
+            .and_then(Option::take)
+            .ok_or_else(|| format!("rerank 响应的 index {index} 重复"))?;
+        // `results` 传入时已按本地融合分降序，因此下标即本地名次。
+        let fused = rrf_score(index) + rrf_score(model_rank);
+        result.score = relevance;
+        scored.push((fused, relevance, result));
     }
 
+    // 与模型分数直接排序的区别：本地融合名次仍占一半权重。rerank 模型对代码的判断并不
+    // 总是可靠，一旦它把正确结果压到末位，纯模型排序会让本来正确的顺序被整体摧毁；
+    // 排名融合则要求两边都认为不相关，才会真的沉下去。
     scored.sort_by(|left, right| {
         right
             .0
@@ -183,6 +203,14 @@ fn apply_response(body: &str, results: Vec<SearchResult>) -> Result<Vec<SearchRe
             .then_with(|| left.2.chunk_id.cmp(&right.2.chunk_id))
     });
     Ok(scored.into_iter().map(|(_, _, result)| result).collect())
+}
+
+/// 返回名次对应的 RRF 分量；`rank` 从 0 开始。
+///
+/// 与融合层使用同一个平滑常量 60，使"本地第一 + 模型末位"与"本地末位 + 模型第一"
+/// 得到对称的处理。
+fn rrf_score(rank: usize) -> f32 {
+    1.0 / (RRF_K + rank as f32 + 1.0)
 }
 
 /// 读取闭区间行范围；范围失效时返回 `None`。
@@ -292,6 +320,67 @@ mod tests {
         .expect_err("缺少候选的响应必须失败");
 
         assert!(error.contains("与提交的 2 条候选不符"), "{error}");
+    }
+
+    /// 模型把本地第一名压到末位时，排名融合必须保留它的竞争力。
+    ///
+    /// 纯模型分数排序下，一次误判就能把正确结果打到最后；与本地名次做 RRF 后，
+    /// 只有两边都认为不相关的候选才会真的沉下去。
+    #[test]
+    fn hostile_model_cannot_bury_the_local_top_result() {
+        let candidates: Vec<SearchResult> = (0..8)
+            .map(|index| result(&format!("chunk-{index}"), &format!("symbol{index}"), 1, 1.0))
+            .collect();
+        // 模型给出与本地完全相反的顺序。
+        let items: Vec<String> = (0..8)
+            .map(|index| {
+                format!(
+                    r#"{{"index":{index},"relevance_score":{:.2}}}"#,
+                    index as f32 / 10.0
+                )
+            })
+            .collect();
+
+        let reranked = apply_response(
+            &format!(r#"{{"results":[{}]}}"#, items.join(",")),
+            candidates,
+        )
+        .expect("重排应成功");
+
+        let position = reranked
+            .iter()
+            .position(|item| item.chunk_id == "chunk-0")
+            .expect("本地第一名必须仍在结果中");
+        assert!(
+            position < 4,
+            "本地第一名被模型判为最差时仍应留在前半段，实际排在第 {}",
+            position + 1
+        );
+    }
+
+    /// 两边一致认为不相关的候选仍应沉到末位，否则融合就成了无视模型。
+    #[test]
+    fn agreed_irrelevant_candidate_still_sinks() {
+        let candidates: Vec<SearchResult> = (0..4)
+            .map(|index| result(&format!("chunk-{index}"), &format!("symbol{index}"), 1, 1.0))
+            .collect();
+        // 本地末位的 chunk-3 同时被模型判为最差。
+        let reranked = apply_response(
+            r#"{"results":[
+                {"index":0,"relevance_score":0.9},
+                {"index":1,"relevance_score":0.8},
+                {"index":2,"relevance_score":0.7},
+                {"index":3,"relevance_score":0.0}
+            ]}"#,
+            candidates,
+        )
+        .expect("重排应成功");
+
+        assert_eq!(
+            reranked.last().expect("结果非空").chunk_id,
+            "chunk-3",
+            "两边一致判为不相关的候选必须排在末位"
+        );
     }
 
     /// 默认召回深度必须扩大，但不能无限增加远端输入。

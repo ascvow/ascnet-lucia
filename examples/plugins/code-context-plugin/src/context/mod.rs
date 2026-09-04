@@ -286,13 +286,36 @@ fn select(
             debug: result.debug,
         };
 
-        let contained = kept.iter().any(|existing| {
+        let contained = kept.iter().position(|existing| {
             existing.file_path == candidate.file_path
                 && (contains(existing, &candidate) || contains(&candidate, existing))
         });
-        if contained {
-            // 父子包含：保留已在集合里的那条（分数更高）。被包含的一方内容
-            // 已经在保留的区间里，丢弃它不损失信息，只省 token。
+        if let Some(index) = contained {
+            // 父子包含：默认保留已在集合里的那条（分数更高）。被包含的一方内容已经在
+            // 保留的区间里，丢弃它不损失信息，只省 token。
+            //
+            // 但"已经在区间里"有个前提：那个区间真的会被完整展示。容器 chunk（`impl` 块、
+            // class）动辄数百行，超过 `max_snippet_lines` 后会从起始行硬截断，目标方法很
+            // 可能整段落在截断之外——于是结果里出现的是容器开头几十行，真正要找的方法反而
+            // 不见了。这种情况下把窗口收窄到被包含的那一条：宁可少给容器的头部，
+            // 也不能把用户要的符号截掉。
+            let container = &kept[index];
+            let container_span = container.end_line.saturating_sub(container.start_line) + 1;
+            let candidate_span = candidate.end_line.saturating_sub(candidate.start_line) + 1;
+            if contains(container, &candidate)
+                && container_span > config.max_snippet_lines
+                && candidate_span <= config.max_snippet_lines
+            {
+                kept[index].start_line = candidate.start_line;
+                kept[index].end_line = candidate.end_line;
+                // 定位元数据一并换成被包含的那条，否则重定位与展示会指向容器符号。
+                kept[index].chunk_id = candidate.chunk_id;
+                kept[index].symbol_name = candidate.symbol_name;
+                kept[index].qualified_symbol = candidate.qualified_symbol;
+                kept[index].symbol_kind = candidate.symbol_kind;
+                kept[index].signature = candidate.signature;
+                kept[index].doc_comment = candidate.doc_comment;
+            }
             stats.suppressed_contained += 1;
             continue;
         }

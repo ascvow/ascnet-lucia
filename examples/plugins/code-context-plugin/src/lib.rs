@@ -83,12 +83,22 @@ pub use semantic::SemanticIndex;
 pub use storage::{IndexStore, ManifestLoad};
 pub use tool::{CodeSearchRequest, TOOL_NAME};
 
+/// 单个 chunk 参与嵌入的最大正文字符数。
+///
+/// 嵌入模型的输入窗口有限，且一段代码的语义在前若干行里已经基本确定。取 1200 字符约合
+/// 30–40 行代码，既覆盖绝大多数函数的完整实现，又不会让一个超长函数挤占整批的配额。
+const MAX_SEMANTIC_BODY_CHARS: usize = 1_200;
+
 /// 构造送去嵌入的文档文本。
 ///
-/// 拼接限定名、签名与文档注释，而不是直接用源码正文：正文不驻留内存（见 adr-storage.md），
-/// 且嵌入模型对"这段代码是干什么的"最敏感的信号恰恰在签名与文档注释里。缺失的字段直接
-/// 跳过，不填占位符——占位符会成为所有同类 chunk 的共同噪声。
-fn semantic_document_text(chunk: &CodeChunk) -> String {
+/// 拼接限定名、签名、文档注释与**代码正文**。正文是这里最关键的一项：没有它，一个没写
+/// 文档注释的函数就只剩下路径和签名可供嵌入，向量几乎只编码了"它叫什么、在哪个文件"；
+/// 而没有结构化解析器的语言（Java、Vue、PHP 等）连符号和签名都没有，向量退化成一条路径。
+/// 这正是"自然语言描述某个行为却检索不到实现"的首要原因。
+///
+/// `body` 为 `None` 表示正文回读失败，此时退回元数据——比完全跳过这个 chunk 更好。
+/// 缺失字段直接跳过，不填占位符：占位符会成为所有同类 chunk 的共同噪声。
+fn semantic_document_text(chunk: &CodeChunk, body: Option<&str>) -> String {
     let mut parts = Vec::new();
     parts.push(chunk.file_path.clone());
     if let Some(qualified) = chunk.qualified_symbol.as_deref() {
@@ -100,7 +110,26 @@ fn semantic_document_text(chunk: &CodeChunk) -> String {
     if let Some(doc) = chunk.doc_comment.as_deref() {
         parts.push(doc.to_string());
     }
+    if let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) {
+        parts.push(truncate_chars(body, MAX_SEMANTIC_BODY_CHARS));
+    }
     parts.join("\n")
+}
+
+/// 按字符边界截断文本，避免在多字节字符中间切开。
+fn truncate_chars(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((offset, _)) => text[..offset].to_string(),
+        None => text.to_string(),
+    }
+}
+
+/// 取闭区间行范围的正文；范围失效时返回 `None`。
+fn slice_body(content: &str, start_line: u32, end_line: u32) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = start_line.saturating_sub(1) as usize;
+    let end = (end_line as usize).min(lines.len());
+    (start < end).then(|| lines[start..end].join("\n"))
 }
 
 /// 宿主 preopen 的插件私有数据目录在 Guest 中的挂载点。
@@ -941,6 +970,10 @@ impl CodeContextPlugin {
         }
 
         // 只嵌入尚无当前向量的 chunk：内容哈希可防止正文变化后误复用同 ID 的旧向量。
+        //
+        // 正文按文件缓存回读：待嵌入的 chunk 通常成片来自同几个文件，逐条读会把宿主调用
+        // 次数放大到 chunk 数量级。读取失败的文件退化为只用元数据嵌入，不中断整批。
+        let mut sources: BTreeMap<String, Option<String>> = BTreeMap::new();
         let pending: Vec<(String, String, String, String)> = index
             .chunks()
             .filter(|chunk| {
@@ -949,11 +982,16 @@ impl CodeContextPlugin {
                     .contains_current(&chunk.id, &chunk.content_hash)
             })
             .map(|chunk| {
+                let body = sources
+                    .entry(chunk.file_path.clone())
+                    .or_insert_with(|| host.read_file(&chunk.file_path).ok())
+                    .as_deref()
+                    .and_then(|content| slice_body(content, chunk.start_line, chunk.end_line));
                 (
                     chunk.id.clone(),
                     chunk.file_path.clone(),
                     chunk.content_hash.clone(),
-                    semantic_document_text(chunk),
+                    semantic_document_text(chunk, body.as_deref()),
                 )
             })
             .collect();
@@ -1236,6 +1274,52 @@ mod tests {
     }
 
     /// 激活后必须建立仓库身份、注册工具并进入未索引状态。
+    /// 嵌入文档必须带上代码正文。
+    ///
+    /// 没有正文时，一个不写文档注释的函数就只剩路径和签名可嵌入，向量几乎只编码了
+    /// "它叫什么、在哪个文件"；而没有结构化解析器的语言连符号和签名都没有，向量会退化
+    /// 成一条路径。这正是"用自然语言描述某个行为却检索不到实现"的首要原因。
+    #[test]
+    fn semantic_document_includes_source_body() {
+        let chunk = CodeChunk {
+            id: "chunk".into(),
+            repository_id: RepositoryIdentity::from_workspace_root("/repo").expect("仓库身份"),
+            file_path: "src/session.rs".into(),
+            language: "rust".into(),
+            symbol_name: Some("save".into()),
+            qualified_symbol: Some("SessionStore::save".into()),
+            symbol_kind: Some(model::SymbolKind::Function),
+            parent_symbol: Some("SessionStore".into()),
+            start_line: 1,
+            end_line: 3,
+            signature: Some("pub fn save(&mut self)".into()),
+            doc_comment: None,
+            imports: Vec::new(),
+            content_hash: "hash".into(),
+        };
+
+        let without = semantic_document_text(&chunk, None);
+        let with =
+            semantic_document_text(&chunk, Some("self.flush_to_disk();\nself.mark_clean();"));
+
+        assert!(!without.contains("flush_to_disk"));
+        assert!(
+            with.contains("flush_to_disk") && with.contains("mark_clean"),
+            "嵌入文档必须包含正文：{with}"
+        );
+        assert!(with.contains("src/session.rs") && with.contains("SessionStore::save"));
+    }
+
+    /// 超长正文必须按字符边界截断，不能在多字节字符中间切开。
+    #[test]
+    fn semantic_document_body_is_truncated_on_char_boundary() {
+        let body = "中文注释".repeat(1_000);
+        let truncated = truncate_chars(&body, MAX_SEMANTIC_BODY_CHARS);
+
+        assert_eq!(truncated.chars().count(), MAX_SEMANTIC_BODY_CHARS);
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
     #[test]
     fn activation_attaches_repository_and_registers_tool() {
         let host = TestHost::new();

@@ -622,3 +622,77 @@ fn synthetic(chunk: &crate::model::CodeChunk, start: u32, end: u32) -> SearchRes
         },
     }
 }
+
+/// 容器会被截断时，父子抑制必须把窗口收窄到被包含的子块。
+///
+/// 这是"容器排第 1、目标排第 2"的成因：`impl` 块或 class 动辄数百行，被保留后从起始行
+/// 硬截断，用户真正要找的方法整段落在截断之外——结果里出现的是容器开头几十行，目标符号
+/// 反而不见了。宁可少给容器头部，也不能把目标截掉。
+#[test]
+fn oversized_container_is_narrowed_to_the_contained_child() {
+    let mut stats = ContextStats::default();
+    let config = ContextConfig {
+        max_snippet_lines: 20,
+        ..ContextConfig::default()
+    };
+    let (_host, index, _retrieval) = fixture(FIXTURE);
+    let container = index
+        .chunks()
+        .find(|chunk| chunk.symbol_kind == Some(crate::model::SymbolKind::Impl))
+        .expect("固定装置必须含 impl 容器");
+    let method = index
+        .chunks()
+        .find(|chunk| chunk.symbol_name.as_deref() == Some("check"))
+        .expect("固定装置必须含 check 方法");
+
+    // 容器 200 行远超 20 行上限，子块只有 5 行；容器分数更高，排在前面。
+    let selected = select(
+        vec![synthetic(container, 1, 200), synthetic(method, 40, 44)],
+        &config,
+        &mut stats,
+    );
+
+    assert_eq!(selected.len(), 1, "父子包含仍应只保留一条");
+    assert_eq!(stats.suppressed_contained, 1);
+    assert_eq!(
+        (selected[0].start_line, selected[0].end_line),
+        (40, 44),
+        "窗口必须收窄到子块区间，否则目标符号会被截断掉"
+    );
+    assert_eq!(
+        selected[0].symbol_name.as_deref(),
+        Some("check"),
+        "元数据必须一并换成子块，否则展示与重定位会指向容器符号"
+    );
+}
+
+/// 容器本身放得下时不应被收窄——完整容器比孤立方法信息更全。
+#[test]
+fn container_within_snippet_limit_is_kept_whole() {
+    let mut stats = ContextStats::default();
+    let config = ContextConfig {
+        max_snippet_lines: 200,
+        ..ContextConfig::default()
+    };
+    let (_host, index, _retrieval) = fixture(FIXTURE);
+    let container = index
+        .chunks()
+        .find(|chunk| chunk.symbol_kind == Some(crate::model::SymbolKind::Impl))
+        .expect("固定装置必须含 impl 容器");
+    let method = index
+        .chunks()
+        .find(|chunk| chunk.symbol_name.as_deref() == Some("check"))
+        .expect("固定装置必须含 check 方法");
+
+    let selected = select(
+        vec![synthetic(container, 1, 100), synthetic(method, 40, 44)],
+        &config,
+        &mut stats,
+    );
+
+    assert_eq!(
+        (selected[0].start_line, selected[0].end_line),
+        (1, 100),
+        "容器完整展示得下时必须保持原样"
+    );
+}

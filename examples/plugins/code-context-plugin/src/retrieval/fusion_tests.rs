@@ -741,3 +741,68 @@ fn stale_candidates_are_skipped() {
     assert_eq!(results.len(), 1, "失效候选必须被跳过");
     assert_eq!(results[0].chunk_id, valid);
 }
+
+/// 标识符形态判定必须认出真实标识符，同时放过普通英文词与全大写缩写。
+///
+/// 这条边界直接决定自然语言查询能不能拿到符号提升：放得太松，"RRF 融合"里的 `RRF`
+/// 会被当成标识符，把提升发给一大批同名常量；收得太紧，"parse_file 代码解析"就退回
+/// 只能返回调用点的旧行为。
+#[test]
+fn identifier_shape_detection_separates_symbols_from_plain_words() {
+    for query in [
+        "parse_file 代码解析",
+        "工具函数 formatDate 定义在哪",
+        "HTTPServer 怎么启动",
+        "PermissionManager::check 在哪",
+        "看看 agent.rs 里的实现",
+    ] {
+        assert!(
+            super::fusion::has_identifier_shaped_token(query),
+            "`{query}` 应被识别为夹带标识符"
+        );
+    }
+    for query in [
+        "RRF 融合",
+        "HTTP 客户端",
+        "嵌入向量 provider",
+        "索引 manifest 持久化",
+        "Session 是怎么保存的",
+        "权限检查流程",
+    ] {
+        assert!(
+            !super::fusion::has_identifier_shaped_token(query),
+            "`{query}` 不应被识别为夹带标识符"
+        );
+    }
+}
+
+/// 自然语言查询夹带标识符时，符号精确命中必须拿到折减后的提升而不是零。
+///
+/// 归零正是"返回各使用点、函数本体没出现"的成因：调用点所在的 chunk 更短，BM25 长度
+/// 归一化更占便宜，定义本身反而排在后面。
+#[test]
+fn natural_language_with_identifier_keeps_reduced_symbol_boost() {
+    let config = FusionConfig::default();
+    let identifier = super::fusion::symbol_boost_of(
+        Some(SymbolMatch::ExactName),
+        super::fusion::QueryIntent::Identifier,
+        true,
+        &config,
+    );
+    let mixed = super::fusion::symbol_boost_of(
+        Some(SymbolMatch::ExactName),
+        super::fusion::QueryIntent::NaturalLanguage,
+        true,
+        &config,
+    );
+    let plain = super::fusion::symbol_boost_of(
+        Some(SymbolMatch::ExactName),
+        super::fusion::QueryIntent::NaturalLanguage,
+        false,
+        &config,
+    );
+
+    assert!(mixed > 0.0, "夹带标识符时必须保留提升");
+    assert!(mixed < identifier, "混合查询的提升必须弱于纯标识符查询");
+    assert_eq!(plain, 0.0, "不含标识符的自然语言查询不得获得符号提升");
+}
