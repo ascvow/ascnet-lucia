@@ -124,6 +124,66 @@ pub struct SearchPlan {
     pub allow_rerank: bool,
 }
 
+/// 检索结果的置信度等级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfidenceLevel {
+    /// 本地结构证据足够明确，可直接返回。
+    High,
+    /// 候选分歧、分差过小或角色不匹配，可能需要模型重排。
+    Low,
+}
+
+impl ConfidenceLevel {
+    /// 返回稳定的机器可读名称。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Low => "low",
+        }
+    }
+}
+
+/// 一次本地检索排序的可解释置信度。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievalConfidence {
+    /// 高或低置信度。
+    pub level: ConfidenceLevel,
+    /// Top-1 相对 Top-2 的归一化分差；候选不足两条时为 1。
+    pub top_margin: f32,
+    /// Top-1 是否同时得到符号与词法通道支持。
+    pub symbol_lexical_agreement: bool,
+    /// Top-1 是否为精确符号命中。
+    pub exact_symbol_hit: bool,
+    /// Top-1 角色与候选池中的目标角色是否冲突。
+    pub role_conflict: bool,
+    /// 候选池是否至少包含一个实现角色。
+    pub has_implementation: bool,
+    /// 形成当前结论的可读原因。
+    pub reasons: Vec<String>,
+}
+
+/// 一次请求实际采用的延迟路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchPath {
+    /// 精确标识符、限定名或强本地命中，不访问模型重排。
+    Fast,
+    /// 多路召回与结构融合，但没有模型重排。
+    Normal,
+    /// 低置信度困难查询，调用了远端模型重排。
+    Hard,
+}
+
+impl SearchPath {
+    /// 返回稳定的机器可读名称。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Normal => "normal",
+            Self::Hard => "hard",
+        }
+    }
+}
+
 impl SearchPlan {
     /// 根据查询形态、语义能力和模型配置生成检索计划。
     ///

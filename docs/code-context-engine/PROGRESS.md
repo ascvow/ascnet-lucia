@@ -1006,6 +1006,13 @@ Implemented:
   Top-3，强 lexical + implementation 候选保持 Top-5；同名重载只保护本地最强候选，避免多个
   候选争抢同一位置。每条结果记录模型原始相关度与实际增量，便于归因。Phase 4 验证：
   rerank 7 项全部通过，`cargo check -p code-context-plugin` 通过。
+- **可解释置信度与 Conditional Rerank**：本地排序根据精确符号、多路一致、目标角色、Top-1
+  分差和角色冲突计算高低置信度。只有自然语言或混合查询、候选多于一条且置信度低时才调用
+  远端模型；精确查询、高置信度定义/实现和通道一致结果直接返回。执行诊断记录 QueryIntent、
+  SearchPlan、候选阶段、置信度、重排是否尝试/应用及 Fast/Normal/Hard 路径。Phase 5 验证：
+  Fast/Normal/Hard 路径端到端各 1 项、rerank 9 项与 sqlite-vec 重启语义检索 1 项通过；
+  `cargo test -p code-context-plugin --lib` 共 386 项通过，`cargo check -p code-context-plugin`
+  通过。
 
 Scale Result（Lucia 当前仓库）:
 - 原子代码块 6641 个，语义复合块 262 个，其中 970 个原子块由复合块代表。

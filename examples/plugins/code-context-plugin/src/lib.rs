@@ -76,9 +76,10 @@ pub use repository::{
     ScanStats, ScanWarning, ScanWarningKind,
 };
 pub use retrieval::{
-    tokenize, AnalyzedQuery, CandidateSource, CandidateStages, ChunkRole, FusionConfig,
-    FusionDebug, QueryGoal, QueryIntent, RetrievalIndex, RetrievalRun, RetrievalStats,
-    SearchCandidate, SearchPlan, SearchResult, SymbolMatch,
+    tokenize, AnalyzedQuery, CandidateSource, CandidateStages, ChunkRole, ConfidenceLevel,
+    FusionConfig, FusionDebug, QueryGoal, QueryIntent, RetrievalConfidence, RetrievalIndex,
+    RetrievalRun, RetrievalStats, SearchCandidate, SearchPath, SearchPlan, SearchResult,
+    SymbolMatch,
 };
 pub use semantic::SemanticIndex;
 pub use storage::{IndexStore, ManifestLoad};
@@ -306,6 +307,65 @@ pub struct CodeContextPlugin {
     /// 原生测试入口使用的 sqlite-vec 数据库路径；WASM 构建不包含该字段。
     #[cfg(feature = "sqlite-vector-store")]
     sqlite_vector_path: Option<std::path::PathBuf>,
+}
+
+/// 一次代码检索的结构化诊断。
+///
+/// 该信息供 benchmark 与工具 `details` 使用，不进入模型可见代码片段。它记录查询分析、
+/// 实际计划、候选阶段、置信度和模型重排决策，使延迟与 Recall 变化都可归因。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchDiagnostics {
+    /// 确定性的查询分析结果。
+    pub analyzed_query: AnalyzedQuery,
+    /// 实际执行的检索计划。
+    pub plan: SearchPlan,
+    /// 各召回与排序阶段的候选身份。
+    pub stages: CandidateStages,
+    /// 模型重排前的本地置信度。
+    pub confidence: RetrievalConfidence,
+    /// 实际采用的 Fast、Normal 或 Hard 路径。
+    pub path: SearchPath,
+    /// 是否向远端模型发起了重排请求。
+    pub rerank_activated: bool,
+    /// 模型响应是否成功应用到最终排序。
+    pub rerank_applied: bool,
+    /// 重排被启用、跳过或降级的可读原因。
+    pub rerank_reason: String,
+}
+
+/// 一次带完整诊断的代码检索结果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchExecution {
+    /// 最终返回候选。
+    pub results: Vec<SearchResult>,
+    /// 本次检索的结构化诊断。
+    pub diagnostics: SearchDiagnostics,
+}
+
+/// 构造索引上下文缺席时的空检索结果，同时保留查询分析与计划诊断。
+fn empty_search_execution(analyzed_query: AnalyzedQuery, plan: SearchPlan) -> SearchExecution {
+    let confidence = rerank::assess_confidence(&analyzed_query, &[]);
+    let path = if matches!(
+        analyzed_query.intent,
+        QueryIntent::Identifier | QueryIntent::QualifiedSymbol
+    ) {
+        SearchPath::Fast
+    } else {
+        SearchPath::Normal
+    };
+    SearchExecution {
+        results: Vec::new(),
+        diagnostics: SearchDiagnostics {
+            analyzed_query,
+            plan,
+            stages: CandidateStages::default(),
+            confidence,
+            path,
+            rerank_activated: false,
+            rerank_applied: false,
+            rerank_reason: "索引上下文不可用，未执行模型重排".to_string(),
+        },
+    }
 }
 
 impl CodeContextPlugin {
@@ -979,6 +1039,21 @@ impl CodeContextPlugin {
         path_scope: Option<&str>,
         limit: usize,
     ) -> Vec<SearchResult> {
+        self.search_execution(host, query, path_scope, limit)
+            .results
+    }
+
+    /// 执行查询意图驱动的检索，并返回排序结果与完整阶段诊断。
+    ///
+    /// 与 [`Self::search_results`] 的结果一致；额外诊断供 benchmark、稳定性和延迟分档统计。
+    /// 查询嵌入与模型重排仅在 SearchPlan 和置信度共同允许时发生。
+    pub fn search_execution(
+        &mut self,
+        host: &dyn PluginHostApi,
+        query: &str,
+        path_scope: Option<&str>,
+        limit: usize,
+    ) -> SearchExecution {
         self.last_rerank_degraded_reason = None;
         let rerank_model = self.config.rerank_model.clone();
         let analyzed = AnalyzedQuery::analyze(query);
@@ -993,42 +1068,85 @@ impl CodeContextPlugin {
             .then(|| self.embed_query(host, query))
             .flatten();
         let Some(context) = self.repository.as_ref() else {
-            return Vec::new();
+            return empty_search_execution(analyzed, plan);
         };
         let (Some(index), Some(retrieval)) = (context.index.as_ref(), context.retrieval.as_ref())
         else {
-            return Vec::new();
+            return empty_search_execution(analyzed, plan);
         };
-        let mut results = retrieval
-            .search_planned(
-                index,
-                &context.semantic,
-                query,
-                query_vector.as_deref(),
-                path_scope,
-                &plan,
-            )
-            .results;
+        let mut run = retrieval.search_planned(
+            index,
+            &context.semantic,
+            query,
+            query_vector.as_deref(),
+            path_scope,
+            &plan,
+        );
         #[cfg(feature = "sqlite-vector-store")]
         if let Some(error) = context.semantic.take_backend_error() {
             self.degraded_reason =
                 Some(format!("sqlite-vec 查询失败，已退回内存语义检索：{error}"));
         }
-        if plan.allow_rerank {
-            let Some(model) = rerank_model else {
-                results.truncate(limit);
-                return results;
-            };
-            match rerank::rerank_results(host, &model, query, &results) {
-                Ok(reranked) => results = reranked,
+        let confidence = rerank::assess_confidence(&analyzed, &run.results);
+        let rerank_activated = plan.allow_rerank
+            && rerank_model.is_some()
+            && rerank::should_rerank(&analyzed, &run.results, &confidence);
+        let mut rerank_applied = false;
+        let mut rerank_reason = if !plan.allow_rerank {
+            "查询计划禁用模型重排".to_string()
+        } else if rerank_model.is_none() {
+            "未配置模型重排".to_string()
+        } else if confidence.level == ConfidenceLevel::High {
+            "本地检索置信度高，直接返回".to_string()
+        } else if run.results.len() <= 1 {
+            "候选不足两条，无需模型重排".to_string()
+        } else {
+            "低置信度候选存在分歧，启用模型重排".to_string()
+        };
+        if rerank_activated {
+            let model = rerank_model.as_deref().expect("已确认配置了重排模型");
+            match rerank::rerank_results(host, model, query, &run.results) {
+                Ok(reranked) => {
+                    run.results = reranked;
+                    rerank_applied = true;
+                }
                 Err(reason) => {
                     self.last_rerank_degraded_reason =
                         Some(format!("模型重排不可用，已保留本地融合排序：{reason}"));
+                    rerank_reason = format!("模型重排失败，保留本地排序：{reason}");
                 }
             }
         }
-        results.truncate(limit);
-        results
+        run.results.truncate(limit);
+        run.stages.final_results = run
+            .results
+            .iter()
+            .map(|result| result.chunk_id.clone())
+            .collect();
+        let path = if matches!(
+            analyzed.intent,
+            QueryIntent::Identifier | QueryIntent::QualifiedSymbol
+        ) || (!plan.enable_semantic && confidence.level == ConfidenceLevel::High)
+        {
+            SearchPath::Fast
+        } else if rerank_activated {
+            SearchPath::Hard
+        } else {
+            SearchPath::Normal
+        };
+        SearchExecution {
+            results: run.results,
+            diagnostics: SearchDiagnostics {
+                analyzed_query: analyzed,
+                plan,
+                stages: run.stages,
+                confidence,
+                path,
+                rerank_activated,
+                rerank_applied,
+                rerank_reason,
+            },
+        }
     }
 
     /// 计算查询向量；嵌入不可用或语义索引未就绪时返回 `None`。
@@ -2382,8 +2500,16 @@ mod tests {
             reopened_host.http_requests().is_empty(),
             "重开时应复用文档向量"
         );
-        let results = reopened.search_results(&reopened_host, "permission", None, 10);
-        assert!(!results.is_empty(), "sqlite-vec KNN 应参与混合检索");
+        let execution = reopened.search_execution(&reopened_host, "permission check", None, 10);
+        assert!(
+            !execution.results.is_empty(),
+            "sqlite-vec KNN 应参与混合检索"
+        );
+        assert!(execution.diagnostics.plan.enable_semantic);
+        assert!(
+            !execution.diagnostics.stages.semantic.is_empty(),
+            "重开后的 sqlite-vec 必须产生语义候选"
+        );
         assert_eq!(
             reopened_host.http_requests().len(),
             1,
@@ -2563,14 +2689,43 @@ mod tests {
         let mut plugin = indexed(&host, context);
         let requests_after_build = host.http_requests().len();
 
-        let results = plugin.search_results(&host, "check_permission", None, 10);
+        let execution = plugin.search_execution(&host, "check_permission", None, 10);
 
-        assert_eq!(results[0].symbol_name.as_deref(), Some("check_permission"));
+        assert_eq!(
+            execution.results[0].symbol_name.as_deref(),
+            Some("check_permission")
+        );
+        assert_eq!(execution.diagnostics.path, SearchPath::Fast);
+        assert!(!execution.diagnostics.rerank_activated);
         assert_eq!(
             host.http_requests().len(),
             requests_after_build,
             "精确标识符不得调用 embedding 或 rerank 端点"
         );
+    }
+
+    /// 混合查询已有精确符号与目标实现时，应走 Normal Path 并跳过模型重排。
+    #[test]
+    fn high_confidence_mixed_query_skips_rerank() {
+        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE).with_echo_embeddings(4);
+        let mut context = api_activation_context("/repo/a");
+        context
+            .metadata
+            .insert("rerank_model".into(), "test-reranker".into());
+        let mut plugin = indexed(&host, context);
+
+        let execution = plugin.search_execution(&host, "check_permission 怎么实现", None, 10);
+
+        assert_eq!(execution.diagnostics.path, SearchPath::Normal);
+        assert_eq!(
+            execution.diagnostics.confidence.level,
+            ConfidenceLevel::High
+        );
+        assert!(!execution.diagnostics.rerank_activated);
+        assert!(host
+            .http_requests()
+            .iter()
+            .all(|request| request.path == "embeddings"));
     }
 
     /// 语义索引未就绪时不得为查询发起嵌入请求——没有可比对的向量，纯属浪费配额。
@@ -2606,9 +2761,12 @@ mod tests {
         let expected = plugin.search_results(&host, "permission behavior", None, 10);
         plugin.config.rerank_model = Some("test-reranker".into());
 
-        let actual = plugin.search_results(&host, "permission behavior", None, 10);
+        let actual = plugin.search_execution(&host, "permission behavior", None, 10);
 
-        assert_eq!(actual, expected, "失败降级不得改变原有融合顺序");
+        assert_eq!(actual.results, expected, "失败降级不得改变原有融合顺序");
+        assert_eq!(actual.diagnostics.path, SearchPath::Hard);
+        assert!(actual.diagnostics.rerank_activated);
+        assert!(!actual.diagnostics.rerank_applied);
         assert!(plugin
             .last_rerank_degraded_reason
             .as_deref()

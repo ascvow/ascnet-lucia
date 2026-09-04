@@ -4,7 +4,8 @@
 //! 远端不可用时由调用方保留原有融合顺序，因此模型重排始终是可降级的质量增强项。
 
 use crate::retrieval::{
-    AnalyzedQuery, CandidateSource, ChunkRole, QueryGoal, QueryIntent, SearchResult, SymbolMatch,
+    AnalyzedQuery, CandidateSource, ChunkRole, ConfidenceLevel, QueryGoal, QueryIntent,
+    RetrievalConfidence, SearchResult, SymbolMatch,
 };
 use agent_plugin::{HttpRequest, PluginHostApi};
 use serde::Deserialize;
@@ -29,6 +30,118 @@ const MAX_RERANK_DELTA: f32 = 0.75 / (RRF_K + 1.0);
 /// 限制单条长度可以把 40 条左右的候选稳定控制在常见 rerank 上下文窗口内，同时保留
 /// 足够的函数实现供模型判断调用流程，而不是只看符号名。
 const MAX_SOURCE_CHARS: usize = 1_800;
+
+/// 计算本地融合结果的可解释置信度。
+///
+/// 精确符号、多路一致、目标角色匹配和 Top-1 分差共同形成高置信度；文档压过实现、候选
+/// 分差过小或通道分歧会保持低置信度。该判断不调用模型，也不读取源码。
+pub(crate) fn assess_confidence(
+    query: &AnalyzedQuery,
+    candidates: &[SearchResult],
+) -> RetrievalConfidence {
+    let Some(top) = candidates.first() else {
+        return RetrievalConfidence {
+            level: ConfidenceLevel::Low,
+            top_margin: 0.0,
+            symbol_lexical_agreement: false,
+            exact_symbol_hit: false,
+            role_conflict: false,
+            has_implementation: false,
+            reasons: vec!["没有候选".to_string()],
+        };
+    };
+    let top_margin = candidates.get(1).map_or(1.0, |second| {
+        (top.score - second.score).max(0.0) / top.score.abs().max(f32::MIN_POSITIVE)
+    });
+    let symbol_lexical_agreement = [CandidateSource::Symbol, CandidateSource::Lexical]
+        .into_iter()
+        .all(|source| {
+            top.debug
+                .ranks
+                .iter()
+                .any(|(candidate, _)| *candidate == source)
+        });
+    let protection = protection_of(query, top);
+    let exact_symbol_hit = matches!(
+        protection,
+        CandidateProtection::ExactQualified | CandidateProtection::ExactSymbol
+    );
+    let has_implementation = candidates
+        .iter()
+        .any(|candidate| candidate.role == ChunkRole::Implementation);
+    let top_role_matches = role_matches_goal(query.goal, top.role);
+    let role_conflict = !top_role_matches
+        && candidates
+            .iter()
+            .skip(1)
+            .any(|candidate| role_matches_goal(query.goal, candidate.role));
+    let high = exact_symbol_hit
+        || (symbol_lexical_agreement && top_role_matches)
+        || (top_margin >= 0.20 && top_role_matches && !role_conflict);
+    let mut reasons = Vec::new();
+    if exact_symbol_hit {
+        reasons.push("Top-1 为精确符号命中".to_string());
+    }
+    if symbol_lexical_agreement {
+        reasons.push("符号与词法通道一致支持 Top-1".to_string());
+    }
+    if top_role_matches {
+        reasons.push(format!("Top-1 角色 {} 匹配查询目标", top.role.as_str()));
+    }
+    if role_conflict {
+        reasons.push("Top-1 角色与后续目标角色候选冲突".to_string());
+    }
+    if top_margin < 0.20 {
+        reasons.push(format!("Top-1 相对分差仅 {:.3}", top_margin));
+    }
+    RetrievalConfidence {
+        level: if high {
+            ConfidenceLevel::High
+        } else {
+            ConfidenceLevel::Low
+        },
+        top_margin,
+        symbol_lexical_agreement,
+        exact_symbol_hit,
+        role_conflict,
+        has_implementation,
+        reasons,
+    }
+}
+
+/// 判断本次查询是否需要调用远端模型重排。
+///
+/// 只有自然语言或混合查询、候选多于一条且本地置信度低时返回 `true`。精确查询与高置信度
+/// 本地结果直接返回，避免把绝大多数请求推入 1 到 2 秒的 Hard Path。
+pub(crate) fn should_rerank(
+    query: &AnalyzedQuery,
+    candidates: &[SearchResult],
+    confidence: &RetrievalConfidence,
+) -> bool {
+    candidates.len() > 1
+        && confidence.level == ConfidenceLevel::Low
+        && matches!(
+            query.intent,
+            QueryIntent::NaturalLanguage | QueryIntent::Mixed
+        )
+}
+
+/// 判断代码角色是否直接满足查询目标。
+fn role_matches_goal(goal: QueryGoal, role: ChunkRole) -> bool {
+    match goal {
+        QueryGoal::Definition => matches!(role, ChunkRole::Definition | ChunkRole::TypeDefinition),
+        QueryGoal::Implementation | QueryGoal::Behavior => role == ChunkRole::Implementation,
+        QueryGoal::CallSite => role == ChunkRole::CallSite,
+        QueryGoal::TypeLookup => role == ChunkRole::TypeDefinition,
+        QueryGoal::Concept => matches!(
+            role,
+            ChunkRole::Documentation
+                | ChunkRole::Definition
+                | ChunkRole::TypeDefinition
+                | ChunkRole::Config
+        ),
+    }
+}
 
 /// 计算模型重排前的召回数量。
 ///
@@ -622,5 +735,39 @@ mod tests {
         assert_eq!(candidate_limit(10), 40);
         assert_eq!(candidate_limit(20), 48);
         assert_eq!(candidate_limit(50), 50);
+    }
+
+    /// 精确符号命中必须形成高置信度，并跳过模型重排。
+    #[test]
+    fn exact_symbol_is_high_confidence_without_rerank() {
+        let mut candidates = vec![result("exact", "split_camel_case", 1, 0.05)];
+        candidates[0].debug.symbol_match = Some(SymbolMatch::ExactName);
+        candidates[0].debug.ranks =
+            vec![(CandidateSource::Symbol, 1), (CandidateSource::Lexical, 1)];
+        let query = AnalyzedQuery::analyze("split_camel_case");
+
+        let confidence = assess_confidence(&query, &candidates);
+
+        assert_eq!(confidence.level, ConfidenceLevel::High);
+        assert!(confidence.exact_symbol_hit);
+        assert!(!should_rerank(&query, &candidates, &confidence));
+    }
+
+    /// 实现查询中文档压过实现且分差接近时必须进入低置信度模型重排。
+    #[test]
+    fn documentation_implementation_conflict_triggers_rerank() {
+        let mut candidates = vec![
+            result("docs", "plugin_management", 1, 0.020),
+            result("impl", "render_plugin_dialog", 4, 0.019),
+        ];
+        candidates[0].role = ChunkRole::Documentation;
+        candidates[0].debug.role = ChunkRole::Documentation;
+        let query = AnalyzedQuery::analyze("插件管理页面怎么绘制");
+
+        let confidence = assess_confidence(&query, &candidates);
+
+        assert_eq!(confidence.level, ConfidenceLevel::Low);
+        assert!(confidence.role_conflict);
+        assert!(should_rerank(&query, &candidates, &confidence));
     }
 }
