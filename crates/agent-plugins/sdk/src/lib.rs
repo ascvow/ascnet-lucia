@@ -38,11 +38,6 @@ world plugin {
   import host-store-set: func(request-json: string) -> string;
   import host-store-remove: func(request-json: string) -> string;
   import host-store-list: func(request-json: string) -> string;
-  import host-vector-open: func(request-json: string) -> string;
-  import host-vector-sync: func(request-json: string) -> string;
-  import host-vector-upsert: func(request-json: string) -> string;
-  import host-vector-search: func(request-json: string) -> string;
-  import host-vector-remove: func(request-json: string) -> string;
   import host-session-list: func(request-json: string) -> string;
   import host-session-read: func(request-json: string) -> string;
   import host-service-upsert: func(request-json: string) -> string;
@@ -616,66 +611,6 @@ pub struct AgentSnapshot {
     pub permissions: AgentPermissions,
 }
 
-/// 向量库中的一条记录。
-///
-/// `path` 与 `revision` 是宿主唯一理解的两个附加字段：前者供检索时按前缀过滤，后者供对账
-/// 判断向量是否已经过期。插件不需要其中某一项时留空即可。
-#[derive(Debug, Clone, PartialEq)]
-pub struct VectorRecord {
-    /// 插件自定义的稳定记录 ID。
-    pub record_id: String,
-    /// 供前缀过滤的路径；不需要过滤时为空串。
-    pub path: String,
-    /// 记录版本标识，通常是内容摘要。
-    pub revision: Option<String>,
-    /// 向量分量；长度必须与已绑定的维度一致。
-    pub vector: Vec<f32>,
-}
-
-/// 一条向量检索命中。
-#[derive(Debug, Clone, PartialEq)]
-pub struct VectorHit {
-    /// 命中的记录 ID。
-    pub record_id: String,
-    /// 记录路径。
-    pub path: String,
-    /// 余弦相似度，越大越相关。
-    pub score: f32,
-}
-
-/// 对账中提交的一条记录标识。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VectorSyncEntry {
-    /// 记录 ID。
-    pub record_id: String,
-    /// 期望的记录版本；`None` 表示只要存在即视为最新。
-    pub revision: Option<String>,
-}
-
-/// 一次对账的结果。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VectorSyncOutcome {
-    /// 缺失或版本不符、需要重新计算向量的记录 ID。
-    pub stale: Vec<String>,
-    /// 本次对账收尾时删除的过期记录数；非收尾批次为 0。
-    pub removed: u64,
-}
-
-/// 把向量编码为 ABI 使用的 base64 小端 f32 序列。
-///
-/// ABI 用 base64 而不是 JSON 数字数组：1024 维向量的数字数组约 10 KiB，base64 只要 5.5 KiB，
-/// 且没有浮点文本往返的精度损失。
-#[doc(hidden)]
-pub fn encode_vector(vector: &[f32]) -> String {
-    use base64::Engine;
-
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
-    for value in vector {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
 /// 插件可调用的协议无关宿主 API。
 pub trait PluginHostApi {
     /// 注册或替换工具，返回暴露给模型的公开工具名。
@@ -715,7 +650,11 @@ pub trait PluginHostApi {
     /// 索引一类的用户数据必须用 store，否则一次插件升级就会清空用户资产。
     ///
     /// 需要 manifest 声明 `storage = true`。
-    fn store_get(&self, scope: PluginStoreScope, key: &str) -> Result<Option<serde_json::Value>> {
+    fn store_get(
+        &self,
+        scope: PluginStoreScope,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>> {
         let _ = (scope, key);
         Err(anyhow!("当前宿主未提供插件持久存储能力"))
     }
@@ -745,57 +684,6 @@ pub trait PluginHostApi {
     fn store_list(&self, scope: PluginStoreScope) -> Result<Vec<String>> {
         let _ = scope;
         Err(anyhow!("当前宿主未提供插件持久存储能力"))
-    }
-
-    /// 打开本插件私有向量库并绑定一个向量空间，返回库中现有记录数。
-    ///
-    /// 与 [`PluginHostApi::store_set`] 的区别是**形态**而非权限范围：store 是重写全量的小
-    /// JSON，装不下成千上万条高维向量；向量库按记录增量写入，检索在宿主侧完成。
-    ///
-    /// `space_id` 或 `dimension` 与库中不符时整库清空重建——混用不同嵌入空间的向量会让
-    /// 检索结果长期缓慢地不正确。
-    ///
-    /// 需要 manifest 声明 `vector_store = true`。
-    fn vector_open(&self, space_id: &str, dimension: u32) -> Result<u64> {
-        let _ = (space_id, dimension);
-        Err(anyhow!("当前宿主未提供插件向量库能力"))
-    }
-
-    /// 分批对账当前记录清单，返回其中需要重新计算向量的记录 ID。
-    ///
-    /// `first` 开启一次对账会话，`last` 让宿主删除本次会话未出现的全部记录。它同时承担
-    /// "哪些需要重算"与"哪些已失效"两件事，调用方不必把整库 ID 拉回本地比对。
-    fn vector_sync(
-        &self,
-        entries: &[VectorSyncEntry],
-        first: bool,
-        last: bool,
-    ) -> Result<VectorSyncOutcome> {
-        let _ = (entries, first, last);
-        Err(anyhow!("当前宿主未提供插件向量库能力"))
-    }
-
-    /// 批量写入或替换向量记录，返回实际写入条数。
-    fn vector_upsert(&self, records: &[VectorRecord]) -> Result<u64> {
-        let _ = records;
-        Err(anyhow!("当前宿主未提供插件向量库能力"))
-    }
-
-    /// 执行一次余弦近邻检索，返回按相似度降序排列的命中。
-    fn vector_search(
-        &self,
-        vector: &[f32],
-        limit: usize,
-        path_prefix: Option<&str>,
-    ) -> Result<Vec<VectorHit>> {
-        let _ = (vector, limit, path_prefix);
-        Err(anyhow!("当前宿主未提供插件向量库能力"))
-    }
-
-    /// 按记录 ID 与路径前缀删除向量记录，返回实际删除条数。
-    fn vector_remove(&self, record_ids: &[String], path_prefixes: &[String]) -> Result<u64> {
-        let _ = (record_ids, path_prefixes);
-        Err(anyhow!("当前宿主未提供插件向量库能力"))
     }
 
     /// 列出当前项目的历史会话摘要。
@@ -1123,11 +1011,6 @@ world plugin {
   import host-store-set: func(request-json: string) -> string;
   import host-store-remove: func(request-json: string) -> string;
   import host-store-list: func(request-json: string) -> string;
-  import host-vector-open: func(request-json: string) -> string;
-  import host-vector-sync: func(request-json: string) -> string;
-  import host-vector-upsert: func(request-json: string) -> string;
-  import host-vector-search: func(request-json: string) -> string;
-  import host-vector-remove: func(request-json: string) -> string;
   import host-session-list: func(request-json: string) -> string;
   import host-session-read: func(request-json: string) -> string;
   import host-service-upsert: func(request-json: string) -> string;
@@ -1286,155 +1169,6 @@ world plugin {
                     $crate::decode_host_response(&host_store_list(
                         &$crate::to_json_string(&request),
                     ))
-                }
-
-                fn vector_open(&self, space_id: &str, dimension: u32) -> $crate::Result<u64> {
-                    let request = $crate::__serde_json::json!({
-                        "space_id": space_id,
-                        "dimension": dimension,
-                    });
-                    let response: $crate::__serde_json::Value =
-                        $crate::decode_host_response(&host_vector_open(
-                            &$crate::to_json_string(&request),
-                        ))?;
-                    Ok(response
-                        .get("count")
-                        .and_then($crate::__serde_json::Value::as_u64)
-                        .unwrap_or(0))
-                }
-
-                fn vector_sync(
-                    &self,
-                    entries: &[$crate::VectorSyncEntry],
-                    first: bool,
-                    last: bool,
-                ) -> $crate::Result<$crate::VectorSyncOutcome> {
-                    let entries: Vec<$crate::__serde_json::Value> = entries
-                        .iter()
-                        .map(|entry| {
-                            $crate::__serde_json::json!({
-                                "record_id": entry.record_id,
-                                "revision": entry.revision,
-                            })
-                        })
-                        .collect();
-                    let request = $crate::__serde_json::json!({
-                        "entries": entries,
-                        "first": first,
-                        "last": last,
-                    });
-                    let response: $crate::__serde_json::Value =
-                        $crate::decode_host_response(&host_vector_sync(
-                            &$crate::to_json_string(&request),
-                        ))?;
-                    let stale = response
-                        .get("stale")
-                        .and_then($crate::__serde_json::Value::as_array)
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map($crate::__serde_json::Value::as_str)
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    Ok($crate::VectorSyncOutcome {
-                        stale,
-                        removed: response
-                            .get("removed")
-                            .and_then($crate::__serde_json::Value::as_u64)
-                            .unwrap_or(0),
-                    })
-                }
-
-                fn vector_upsert(
-                    &self,
-                    records: &[$crate::VectorRecord],
-                ) -> $crate::Result<u64> {
-                    let records: Vec<$crate::__serde_json::Value> = records
-                        .iter()
-                        .map(|record| {
-                            $crate::__serde_json::json!({
-                                "record_id": record.record_id,
-                                "path": record.path,
-                                "revision": record.revision,
-                                "vector": $crate::encode_vector(&record.vector),
-                            })
-                        })
-                        .collect();
-                    let request = $crate::__serde_json::json!({"records": records});
-                    let response: $crate::__serde_json::Value =
-                        $crate::decode_host_response(&host_vector_upsert(
-                            &$crate::to_json_string(&request),
-                        ))?;
-                    Ok(response
-                        .get("written")
-                        .and_then($crate::__serde_json::Value::as_u64)
-                        .unwrap_or(0))
-                }
-
-                fn vector_search(
-                    &self,
-                    vector: &[f32],
-                    limit: usize,
-                    path_prefix: Option<&str>,
-                ) -> $crate::Result<Vec<$crate::VectorHit>> {
-                    let request = $crate::__serde_json::json!({
-                        "vector": $crate::encode_vector(vector),
-                        "limit": limit,
-                        "path_prefix": path_prefix,
-                    });
-                    let response: $crate::__serde_json::Value =
-                        $crate::decode_host_response(&host_vector_search(
-                            &$crate::to_json_string(&request),
-                        ))?;
-                    let hits = response
-                        .get("hits")
-                        .and_then($crate::__serde_json::Value::as_array)
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|item| {
-                                    Some($crate::VectorHit {
-                                        record_id: item
-                                            .get("record_id")?
-                                            .as_str()?
-                                            .to_string(),
-                                        path: item
-                                            .get("path")
-                                            .and_then($crate::__serde_json::Value::as_str)
-                                            .unwrap_or_default()
-                                            .to_string(),
-                                        score: item
-                                            .get("score")
-                                            .and_then($crate::__serde_json::Value::as_f64)
-                                            .unwrap_or(0.0)
-                                            as f32,
-                                    })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    Ok(hits)
-                }
-
-                fn vector_remove(
-                    &self,
-                    record_ids: &[String],
-                    path_prefixes: &[String],
-                ) -> $crate::Result<u64> {
-                    let request = $crate::__serde_json::json!({
-                        "record_ids": record_ids,
-                        "path_prefixes": path_prefixes,
-                    });
-                    let response: $crate::__serde_json::Value =
-                        $crate::decode_host_response(&host_vector_remove(
-                            &$crate::to_json_string(&request),
-                        ))?;
-                    Ok(response
-                        .get("removed")
-                        .and_then($crate::__serde_json::Value::as_u64)
-                        .unwrap_or(0))
                 }
 
                 fn session_list(
@@ -2090,7 +1824,11 @@ impl PluginHostApi for NoopHostApi {
         Ok(None)
     }
 
-    fn store_get(&self, _scope: PluginStoreScope, _key: &str) -> Result<Option<serde_json::Value>> {
+    fn store_get(
+        &self,
+        _scope: PluginStoreScope,
+        _key: &str,
+    ) -> Result<Option<serde_json::Value>> {
         Ok(None)
     }
 

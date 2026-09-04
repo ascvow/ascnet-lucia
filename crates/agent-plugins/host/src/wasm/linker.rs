@@ -149,58 +149,6 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         ("host-store-list", |state: &mut PluginWasiState, request| {
             state.capabilities.store_list(request)
         }),
-        // 向量库能力在关闭 vector-store feature 的构建里仍然注册，只是统一返回不可用：
-        // 导入表必须与 WIT world 完全一致，缺一个导入会让插件直接加载失败。
-        #[cfg(feature = "vector-store")]
-        (
-            "host-vector-open",
-            |state: &mut PluginWasiState, request| state.capabilities.vector_open(request),
-        ),
-        #[cfg(feature = "vector-store")]
-        (
-            "host-vector-sync",
-            |state: &mut PluginWasiState, request| state.capabilities.vector_sync(request),
-        ),
-        #[cfg(feature = "vector-store")]
-        (
-            "host-vector-upsert",
-            |state: &mut PluginWasiState, request| state.capabilities.vector_upsert(request),
-        ),
-        #[cfg(feature = "vector-store")]
-        (
-            "host-vector-search",
-            |state: &mut PluginWasiState, request| state.capabilities.vector_search(request),
-        ),
-        #[cfg(feature = "vector-store")]
-        (
-            "host-vector-remove",
-            |state: &mut PluginWasiState, request| state.capabilities.vector_remove(request),
-        ),
-        #[cfg(not(feature = "vector-store"))]
-        (
-            "host-vector-open",
-            |state: &mut PluginWasiState, request| state.capabilities.vector_unavailable(request),
-        ),
-        #[cfg(not(feature = "vector-store"))]
-        (
-            "host-vector-sync",
-            |state: &mut PluginWasiState, request| state.capabilities.vector_unavailable(request),
-        ),
-        #[cfg(not(feature = "vector-store"))]
-        (
-            "host-vector-upsert",
-            |state: &mut PluginWasiState, request| state.capabilities.vector_unavailable(request),
-        ),
-        #[cfg(not(feature = "vector-store"))]
-        (
-            "host-vector-search",
-            |state: &mut PluginWasiState, request| state.capabilities.vector_unavailable(request),
-        ),
-        #[cfg(not(feature = "vector-store"))]
-        (
-            "host-vector-remove",
-            |state: &mut PluginWasiState, request| state.capabilities.vector_unavailable(request),
-        ),
     ] {
         root.func_wrap(
             name,

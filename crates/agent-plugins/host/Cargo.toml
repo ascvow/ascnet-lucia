@@ -7,15 +7,11 @@ license.workspace = true
 description = "ascnet-lucia 的插件宿主、WASM 运行时和 UI 协议。"
 
 [features]
-default = ["wasm", "vector-store"]
+default = ["wasm"]
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:reqwest", "dep:url"]
-# 插件私有向量库：向量与元数据同库，向量检索由 sqlite-vec 承担。
-# 关闭后 host-vector-* 能力统一返回不可用，插件按既有降级路径工作。
-vector-store = ["dep:rusqlite", "dep:sqlite-vec"]
 
 [dependencies]
 anyhow.workspace = true
-base64.workspace = true
 agent-event = { path = "../../agent-core/event" }
 agent-runtime = { path = "../../agent-core/runtime" }
 agent-core = { path = "../../agent-core/kernel", default-features = false }
@@ -26,9 +22,6 @@ futures-util.workspace = true
 libc.workspace = true
 reqwest = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
-# 使用 bundled SQLite，避免依赖宿主机器上是否装了合适版本的 libsqlite3。
-rusqlite = { version = "0.37", features = ["bundled"], optional = true }
-sqlite-vec = { version = "0.1.9", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
