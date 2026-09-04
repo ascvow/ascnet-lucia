@@ -2337,11 +2337,9 @@ fn rerank_payload_size() {
             } else {
                 "否"
             },
-            if count == 0 {
-                "—".to_string()
-            } else {
-                (bytes / count).to_string()
-            }
+            bytes
+                .checked_div(count)
+                .map_or_else(|| "—".to_string(), |average| average.to_string())
         );
     }
 }
