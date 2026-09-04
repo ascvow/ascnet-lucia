@@ -77,8 +77,16 @@ pub struct CodeContextConfig {
     pub embedding_batch_size: usize,
     /// 是否在嵌入请求中发送 `dimensions` 参数。
     ///
-    /// 部分 OpenAI 兼容端点（如 SiliconFlow 的 `BAAI/bge-m3`）不接受该参数，设为 `false`
-    /// 可避免 400 错误。维度校验仍在返回时执行，因此关闭此项不影响安全性。
+    /// **默认关闭。** 该参数只对支持维度截断的模型有意义（OpenAI 的
+    /// `text-embedding-3-*` 系列）；`BAAI/bge-m3` 这类固定维度模型会直接返回
+    /// HTTP 400 `The parameter is invalid`。
+    ///
+    /// 默认开启曾让整条语义链路静默失效：首次嵌入请求被拒 → 语义索引放弃建立 →
+    /// 检索退化为符号与词法两路。而这一路恰恰是中文自然语言查询唯一能依赖的通道，
+    /// 于是"用中文描述一个行为"几乎必然检索不到——但工具仍然正常返回结果，
+    /// 失败完全不可见。默认值必须是"能用"的那一个。
+    ///
+    /// 维度校验仍在返回时执行，因此关闭此项不影响安全性。
     pub embedding_send_dimensions: bool,
     /// 可选的远端候选重排模型。
     ///
@@ -100,7 +108,7 @@ impl Default for CodeContextConfig {
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             embedding_dimension: DEFAULT_EMBEDDING_DIMENSION,
             embedding_batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
-            embedding_send_dimensions: true,
+            embedding_send_dimensions: false,
             rerank_model: None,
             http_endpoint_id: None,
         }

@@ -30,7 +30,17 @@ pub enum CodeContextError {
     /// 索引尚未建立，无法回答检索请求。
     NotIndexed,
     /// 嵌入能力不可用（未配置 provider，或宿主缺少对应能力）。
+    ///
+    /// 表示**永久性**失败：模型名写错、密钥无效、参数不被接受。重试没有意义，
+    /// 应当直接进入降级并把原因暴露给用户。
     EmbeddingUnavailable(String),
+    /// 嵌入端点暂时不可用（限流、网关错误、网络抖动）。
+    ///
+    /// 与 [`Self::EmbeddingUnavailable`] 的区别是**能否恢复**。嵌入一个中等仓库需要
+    /// 几百次请求，429 几乎必然发生；把它当成永久失败会让语义索引永远建不完，而且失败
+    /// 是静默的——检索照常返回结果，只是少了语义那一路。调用方应当保留已完成的部分并
+    /// 在后续轮次继续。
+    EmbeddingTransient(String),
     /// 插件配置非法。
     InvalidConfiguration(String),
 }
@@ -52,8 +62,19 @@ impl fmt::Display for CodeContextError {
             }
             Self::NotIndexed => write!(formatter, "当前仓库尚未建立代码索引"),
             Self::EmbeddingUnavailable(detail) => write!(formatter, "嵌入能力不可用：{detail}"),
+            Self::EmbeddingTransient(detail) => write!(formatter, "嵌入端点暂时不可用：{detail}"),
             Self::InvalidConfiguration(detail) => write!(formatter, "插件配置无效：{detail}"),
         }
+    }
+}
+
+impl CodeContextError {
+    /// 该错误是否值得重试。
+    ///
+    /// 只有明确判定为瞬时的失败才返回 `true`；无法确定时返回 `false`，避免对着一个
+    /// 永久性配置错误无限重试。
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::EmbeddingTransient(_))
     }
 }
 

@@ -68,6 +68,17 @@ pub struct FusionConfig {
     ///
     /// 取 1.75 使语义第一名能够压过“符号第一名 + 词法第一名”的普通词重复命中。
     pub natural_language_semantic_weight: f32,
+    /// 查询以中日韩文字为主时的语义通道权重。
+    ///
+    /// 中文查询词**不可能**通过 BM25 匹配英文标识符：词法那一路能命中的只有注释里的
+    /// 偶然共现，是噪声而非信号。实测中，语义通道把正确结果召回进了候选池（Recall@5
+    /// 从 0.750 升到 0.844），却因为与词法等权而排不到第一（Recall@1 纹丝不动）。
+    /// 取 3.5 让语义在这类查询上主导排序。
+    pub cjk_semantic_weight: f32,
+    /// 查询以中日韩文字为主时的词法通道权重。
+    ///
+    /// 不置零：文档注释是中文的仓库里，BM25 仍能提供真实信号。取 0.4 把它降为辅助。
+    pub cjk_lexical_weight: f32,
     /// 查询词命中文件路径的提升，单位为 rank-1 当量。
     ///
     /// 取 1.0：路径相关是有用信号但远弱于符号命中，不应盖过内容匹配。
@@ -92,6 +103,8 @@ impl Default for FusionConfig {
             name_match_boost: 1.5,
             natural_language_symbol_weight: 0.25,
             natural_language_semantic_weight: 1.75,
+            cjk_semantic_weight: 3.5,
+            cjk_lexical_weight: 0.4,
             natural_language_identifier_ratio: 0.5,
             path_boost: 1.0,
             metadata_rerank_boost: 0.75,
@@ -227,6 +240,26 @@ pub fn fuse(
         .flatten()
         .any(|candidate| candidate.source == CandidateSource::Semantic);
 
+    // 各类 boost 以"在某一路里排第一"为单位。通道权重被调低时（例如中文查询下的词法
+    // 通道），RRF 分数整体缩小，而 boost 若保持不变就会反客为主，把召回顺序盖掉。
+    // 因此按本次实际生效的最大通道权重缩放，使"boost 弱于一路第一名"这条不变量与
+    // 权重方案无关。
+    let weight_scale = channels
+        .iter()
+        .flatten()
+        .map(|candidate| {
+            channel_weight(
+                candidate.source,
+                candidate.symbol_match,
+                intent,
+                semantic_available,
+                config,
+            )
+        })
+        .fold(0.0f32, f32::max)
+        .max(f32::MIN_POSITIVE);
+    let boost_unit = unit * weight_scale;
+
     // 按 chunk 聚合各通道的排名。用 Vec 而不是 HashMap：候选量在数百级，
     // 线性查找足够快，且天然保持插入顺序，便于结果确定。
     let mut merged: Vec<Accumulator> = Vec::new();
@@ -265,10 +298,11 @@ pub fn fuse(
         .filter_map(|item| {
             let chunk = index.chunk(&item.chunk_id)?;
             let symbol_boost =
-                symbol_boost_of(item.symbol_match, intent, query_has_identifier, config) * unit;
-            let path_boost = path_boost_of(&query_tokens, &chunk.file_path, config) * unit;
+                symbol_boost_of(item.symbol_match, intent, query_has_identifier, config)
+                    * boost_unit;
+            let path_boost = path_boost_of(&query_tokens, &chunk.file_path, config) * boost_unit;
             let rerank = metadata_rerank_of(&rerank_query_tokens, chunk, intent, config);
-            let rerank_boost = rerank.boost_units * unit;
+            let rerank_boost = rerank.boost_units * boost_unit;
             let mut ranks = item.ranks;
             ranks.sort_by_key(|(source, rank)| (source.as_str(), *rank));
 
@@ -339,8 +373,13 @@ struct MetadataRerank {
 pub(crate) enum QueryIntent {
     /// 单独的代码标识符或限定名，例如 `Agent`、`PermissionManager::check`。
     Identifier,
-    /// 包含中文、空白或说明性标点的自然语言描述。
+    /// 包含空白或说明性标点的自然语言描述，主体仍是拉丁字符。
     NaturalLanguage,
+    /// 以中日韩文字为主的自然语言描述。
+    ///
+    /// 单独成一类，因为它对词法通道的期望完全不同：中文查询词与英文标识符之间没有
+    /// 词面重叠，BM25 在这里几乎只能贡献噪声。
+    CjkNaturalLanguage,
 }
 
 impl QueryIntent {
@@ -357,7 +396,17 @@ impl QueryIntent {
                     || matches!(character, '_' | ':' | '.' | '#' | '<' | '>')
             })
         {
-            Self::Identifier
+            return Self::Identifier;
+        }
+        // "以中日韩为主"按字母类字符的占比判定：混排查询里只要拉丁词还占一定比例，
+        // 词法通道就仍有可用信号，不该被降权。
+        let letters = trimmed.chars().filter(|c| c.is_alphanumeric()).count();
+        let cjk = trimmed
+            .chars()
+            .filter(|c| super::tokenize_is_cjk(*c))
+            .count();
+        if letters > 0 && cjk * 2 > letters {
+            Self::CjkNaturalLanguage
         } else {
             Self::NaturalLanguage
         }
@@ -406,10 +455,10 @@ pub(crate) fn symbol_boost_of(
         QueryIntent::Identifier => base,
         // 折减而不是等同：自然语言查询里的标识符是"顺带提到"，不像纯标识符查询那样
         // 明确表达了导航意图，不应压过语义与词法通道的共同判断。
-        QueryIntent::NaturalLanguage if query_has_identifier => {
+        QueryIntent::NaturalLanguage | QueryIntent::CjkNaturalLanguage if query_has_identifier => {
             base * config.natural_language_identifier_ratio
         }
-        QueryIntent::NaturalLanguage => 0.0,
+        QueryIntent::NaturalLanguage | QueryIntent::CjkNaturalLanguage => 0.0,
     }
 }
 
@@ -452,6 +501,7 @@ fn channel_weight(
     if intent == QueryIntent::Identifier {
         return 1.0;
     }
+    let cjk = intent == QueryIntent::CjkNaturalLanguage;
     match source {
         CandidateSource::Symbol if semantic_available => config.natural_language_symbol_weight,
         CandidateSource::Symbol
@@ -463,7 +513,9 @@ fn channel_weight(
             config.natural_language_symbol_weight
         }
         CandidateSource::Symbol => 1.0,
+        CandidateSource::Lexical if cjk => config.cjk_lexical_weight,
         CandidateSource::Lexical => 1.0,
+        CandidateSource::Semantic if cjk => config.cjk_semantic_weight,
         CandidateSource::Semantic => config.natural_language_semantic_weight,
     }
 }
@@ -538,7 +590,8 @@ fn metadata_rerank_of(
         .collect();
     let (symbol_weight, signature_weight, doc_weight, path_weight) = match intent {
         QueryIntent::Identifier => (1.0, 0.8, 0.45, 0.25),
-        QueryIntent::NaturalLanguage => (0.55, 0.7, 1.0, 0.25),
+        // 中文查询与英文符号名没有词面重叠，元数据里唯一可能匹配的就是中文文档注释。
+        QueryIntent::NaturalLanguage | QueryIntent::CjkNaturalLanguage => (0.55, 0.7, 1.0, 0.25),
     };
 
     let mut weighted_matches = 0.0f32;

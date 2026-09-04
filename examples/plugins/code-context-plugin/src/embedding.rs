@@ -120,7 +120,23 @@ pub trait EmbeddingProvider {
     ///
     /// provider 失败，或返回的向量条数、维度与预期不符时返回错误。
     fn embed_documents(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, CodeContextError> {
-        embed_batched(self, EmbeddingInputKind::Document, inputs)
+        let outcome = embed_batched(self, EmbeddingInputKind::Document, inputs, usize::MAX);
+        match outcome.stopped_by {
+            Some(error) => Err(error),
+            None => Ok(outcome.vectors),
+        }
+    }
+
+    /// 分批嵌入文档，允许中途失败并保留已完成的部分。
+    ///
+    /// 与 [`EmbeddingProvider::embed_documents`] 的区别是**失败语义**：那个入口是全有或
+    /// 全无，一个批次被限流就丢弃整轮结果；这个入口保留成功前缀，把中断原因一并交回。
+    ///
+    /// 这条区分不是可有可无的。嵌入一个中等仓库需要几百次请求，429 限流几乎必然发生；
+    /// 全有或全无意味着**永远建不完索引**，而且失败是静默的——检索照常返回结果，只是
+    /// 少了语义那一路。`max_batches` 限制单轮工作量，让调用方可以跨多次调用续建。
+    fn embed_documents_resumable(&self, inputs: &[String], max_batches: usize) -> BatchOutcome {
+        embed_batched(self, EmbeddingInputKind::Document, inputs, max_batches)
     }
 
     /// 嵌入一条检索查询。
@@ -132,11 +148,16 @@ pub trait EmbeddingProvider {
     ///
     /// provider 失败或未返回恰好一条向量时返回错误。
     fn embed_query(&self, query: &str) -> Result<Vec<f32>, CodeContextError> {
-        let mut vectors = embed_batched(
+        let outcome = embed_batched(
             self,
             EmbeddingInputKind::Query,
             std::slice::from_ref(&query.to_string()),
-        )?;
+            usize::MAX,
+        );
+        if let Some(error) = outcome.stopped_by {
+            return Err(error);
+        }
+        let mut vectors = outcome.vectors;
         if vectors.len() != 1 {
             return Err(CodeContextError::EmbeddingUnavailable(format!(
                 "查询嵌入应返回 1 条向量，实际 {}",
@@ -145,6 +166,17 @@ pub trait EmbeddingProvider {
         }
         Ok(vectors.remove(0))
     }
+}
+
+/// 一次分批嵌入的产物。
+///
+/// `vectors` 始终对应 `inputs` 的**前缀**：第 n 条向量属于第 n 条输入。中断时后续输入
+/// 没有向量，调用方据此决定哪些还需要重试。
+pub struct BatchOutcome {
+    /// 已成功嵌入的向量，与输入前缀一一对应。
+    pub vectors: Vec<Vec<f32>>,
+    /// 中断原因；全部完成时为 `None`。
+    pub stopped_by: Option<CodeContextError>,
 }
 
 /// 按 provider 声明的批大小分批调用，并校验返回结果。
@@ -158,23 +190,47 @@ fn embed_batched<P: EmbeddingProvider + ?Sized>(
     provider: &P,
     kind: EmbeddingInputKind,
     inputs: &[String],
-) -> Result<Vec<Vec<f32>>, CodeContextError> {
+    max_batches: usize,
+) -> BatchOutcome {
     if inputs.is_empty() {
-        return Ok(Vec::new());
+        return BatchOutcome {
+            vectors: Vec::new(),
+            stopped_by: None,
+        };
     }
     let batch_size = provider.max_batch_size().max(1);
     let expected_dimension = provider.dimension();
     let mut vectors = Vec::with_capacity(inputs.len());
 
-    for batch in inputs.chunks(batch_size) {
-        let produced = provider.embed(kind, batch)?;
+    for (index, batch) in inputs.chunks(batch_size).enumerate() {
+        if index >= max_batches {
+            return BatchOutcome {
+                vectors,
+                stopped_by: Some(CodeContextError::EmbeddingTransient(format!(
+                    "本轮已提交 {max_batches} 批，剩余部分留待下一轮继续"
+                ))),
+            };
+        }
+        let produced = match provider.embed(kind, batch) {
+            Ok(produced) => produced,
+            Err(error) => {
+                return BatchOutcome {
+                    vectors,
+                    stopped_by: Some(error),
+                }
+            }
+        };
+        // 条数或维度不符属于协议级错误，不是瞬时故障：保留已完成的前缀，但中断本轮。
         if produced.len() != batch.len() {
-            return Err(CodeContextError::EmbeddingUnavailable(format!(
-                "{} 嵌入返回 {} 条向量，与输入的 {} 条不符",
-                kind.as_str(),
-                produced.len(),
-                batch.len()
-            )));
+            return BatchOutcome {
+                vectors,
+                stopped_by: Some(CodeContextError::EmbeddingUnavailable(format!(
+                    "{} 嵌入返回 {} 条向量，与输入的 {} 条不符",
+                    kind.as_str(),
+                    produced.len(),
+                    batch.len()
+                ))),
+            };
         }
         if let Some(dimension) = expected_dimension {
             if let Some(actual) = produced
@@ -182,14 +238,20 @@ fn embed_batched<P: EmbeddingProvider + ?Sized>(
                 .map(Vec::len)
                 .find(|length| *length != dimension as usize)
             {
-                return Err(CodeContextError::EmbeddingUnavailable(format!(
-                    "嵌入维度为 {actual}，与嵌入空间声明的 {dimension} 不符"
-                )));
+                return BatchOutcome {
+                    vectors,
+                    stopped_by: Some(CodeContextError::EmbeddingUnavailable(format!(
+                        "嵌入维度为 {actual}，与嵌入空间声明的 {dimension} 不符"
+                    ))),
+                };
             }
         }
         vectors.extend(produced);
     }
-    Ok(vectors)
+    BatchOutcome {
+        vectors,
+        stopped_by: None,
+    }
 }
 
 /// 按配置选择嵌入 provider。
@@ -282,16 +344,24 @@ impl<'host> ApiEmbeddingProvider<'host> {
             body: Some(body.to_string()),
         };
         let response = self.host.http_request(&request).map_err(|error| {
-            CodeContextError::EmbeddingUnavailable(format!("嵌入端点调用失败：{error}"))
+            // 宿主 HTTP 失败多为网络抖动或超时，按瞬时处理并在后续轮次重试。
+            CodeContextError::EmbeddingTransient(format!("嵌入端点调用失败：{error}"))
         })?;
         if !(200..300).contains(&response.status) {
             // 回传状态码与正文摘要：4xx 通常是配置错误（模型名、维度、密钥），
             // 用户需要看到端点自己的说明才能改对。
-            return Err(CodeContextError::EmbeddingUnavailable(format!(
+            let detail = format!(
                 "嵌入端点返回 HTTP {}：{}",
                 response.status,
                 truncate_for_message(&response.body)
-            )));
+            );
+            // 429 是限流、5xx 是服务端故障，两者都会自行恢复；其余状态码是配置问题，
+            // 重试只会把同一个错误再犯一遍。
+            return Err(if response.status == 429 || response.status >= 500 {
+                CodeContextError::EmbeddingTransient(detail)
+            } else {
+                CodeContextError::EmbeddingUnavailable(detail)
+            });
         }
         parse_embedding_response(&response.body)
     }
@@ -641,6 +711,33 @@ mod tests {
             serde_json::from_str(requests[0].body.as_deref().expect("应有正文"))
                 .expect("正文应是 JSON");
         assert_eq!(body["model"], "text-embedding-3-small");
+        // 默认不发 `dimensions`：固定维度模型（bge-m3 等）会用 HTTP 400 拒绝它，
+        // 而那次失败会让整条语义链路静默失效。
+        assert!(
+            body.get("dimensions").is_none(),
+            "默认不得发送 dimensions：{body}"
+        );
+    }
+
+    /// 显式开启后才发送 `dimensions`，供支持维度截断的模型使用。
+    #[test]
+    fn dimensions_are_sent_only_when_explicitly_enabled() {
+        let host = TestHost::new().with_http_responses(vec![http_json(
+            200,
+            &embedding_body(&[(0, [1.0, 0.0, 0.0])]),
+        )]);
+        let mut config = api_config();
+        config.embedding_send_dimensions = true;
+        let provider = ApiEmbeddingProvider::from_config(&config, &host).expect("应构造成功");
+
+        provider
+            .embed(EmbeddingInputKind::Document, &["fn check()".to_string()])
+            .expect("嵌入应成功");
+
+        let requests = host.http_requests();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().expect("应有正文"))
+                .expect("正文应是 JSON");
         assert_eq!(body["dimensions"], 3);
     }
 
@@ -680,7 +777,9 @@ mod tests {
                 &["a".to_string(), "b".to_string()],
             )
             .expect_err("index 重复应被拒绝");
+        // 协议级错误（条数、维度、下标）是永久性的：同一个端点重试只会再犯一次。
         assert!(matches!(error, CodeContextError::EmbeddingUnavailable(_)));
+        assert!(!error.is_transient(), "协议错误不应被重试");
     }
 
     /// 条数与输入不符必须在抽象层被拒绝。
@@ -695,7 +794,9 @@ mod tests {
         let error = provider
             .embed_documents(&["a".to_string(), "b".to_string()])
             .expect_err("条数不符应被拒绝");
+        // 协议级错误（条数、维度、下标）是永久性的：同一个端点重试只会再犯一次。
         assert!(matches!(error, CodeContextError::EmbeddingUnavailable(_)));
+        assert!(!error.is_transient(), "协议错误不应被重试");
     }
 
     /// 维度与声明不符必须被拒绝——向量不可比时静默接受最难发现。
@@ -710,7 +811,9 @@ mod tests {
         let error = provider
             .embed_documents(&["a".to_string()])
             .expect_err("维度不符应被拒绝");
+        // 协议级错误（条数、维度、下标）是永久性的：同一个端点重试只会再犯一次。
         assert!(matches!(error, CodeContextError::EmbeddingUnavailable(_)));
+        assert!(!error.is_transient(), "协议错误不应被重试");
     }
 
     /// 非 2xx 必须携带状态码与端点说明，便于用户改对配置。
@@ -733,7 +836,9 @@ mod tests {
         );
     }
 
-    /// 宿主 HTTP 失败必须降级为嵌入不可用，而不是让整次检索崩溃。
+    /// 宿主 HTTP 失败必须降级为**瞬时**不可用，而不是让整次检索崩溃。
+    ///
+    /// 归为瞬时而不是永久：网络抖动与超时会自行恢复，判成永久会让语义索引就此停摆。
     #[test]
     fn host_failure_degrades_to_unavailable() {
         let host = TestHost::new().with_http_responses(vec![Err(anyhow::anyhow!("网络不可达"))]);
@@ -742,7 +847,8 @@ mod tests {
         let error = provider
             .embed_documents(&["a".to_string()])
             .expect_err("宿主失败应传播");
-        assert!(matches!(error, CodeContextError::EmbeddingUnavailable(_)));
+        assert!(matches!(error, CodeContextError::EmbeddingTransient(_)));
+        assert!(error.is_transient(), "网络失败必须可重试");
     }
 
     /// 健康检查必须真的打一次请求，而不是只看配置是否齐全。

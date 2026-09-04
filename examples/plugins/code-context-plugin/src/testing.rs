@@ -758,6 +758,77 @@ impl PluginHostApi for RepoHost {
     }
 }
 
+/// 递归收集仓库中全部可索引文件，返回按路径排序的 `(仓库相对路径, 内容)`。
+///
+/// 只负责避开版本库元数据与构建产物；文件类型与敏感路径的判定复用生产代码的
+/// [`crate::classify`]，使评测覆盖的文件集合与真实索引完全一致。读取失败的单个文件
+/// 被跳过而不是中断收集——评测夹具不应因为一个二进制文件而整体失败。
+///
+/// 供基准测试、评测报告与可执行搜索示例共用，避免同一份遍历逻辑出现三份副本。
+pub fn collect_repository_files(root: &Path) -> Vec<(String, String)> {
+    /// 不参与索引的版本库元数据、依赖目录与构建产物。
+    const SKIPPED: &[&str] = &[
+        ".git",
+        ".hg",
+        ".svn",
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        "out",
+        "coverage",
+        "vendor",
+        "__pycache__",
+        ".venv",
+        ".idea",
+        ".vscode",
+        ".cache",
+    ];
+
+    fn walk(root: &Path, directory: &Path, output: &mut Vec<(String, String)>) {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if !SKIPPED.contains(&name.as_ref()) {
+                    walk(root, &path, output);
+                }
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if !matches!(crate::classify(&relative), crate::PathClass::Indexable(_)) {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(&path) {
+                output.push((relative, content));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    walk(root, root, &mut files);
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+/// 从插件的 `CARGO_MANIFEST_DIR` 推导 Lucia 仓库根目录。
+///
+/// 插件固定位于 `examples/plugins/<name>`，因此向上三级即仓库根。
+pub fn repository_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .expect("插件目录必须位于 Lucia 仓库的 examples/plugins 下")
+        .to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

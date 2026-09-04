@@ -132,6 +132,52 @@ fn slice_body(content: &str, start_line: u32, end_line: u32) -> Option<String> {
     (start < end).then(|| lines[start..end].join("\n"))
 }
 
+/// 单次调用最多提交的嵌入批次数。
+///
+/// 嵌入一个中等仓库需要几百次请求，全部塞进一次工具调用会让首次检索长时间无响应，
+/// 也更容易触发端点的速率限制。分摊到多次调用后，每轮的停顿都是有界的，而限流恰好
+/// 得到天然退避——两次工具调用之间的间隔就是退避窗口。
+const MAX_EMBEDDING_BATCHES_PER_ROUND: usize = 24;
+
+/// 连续多少轮毫无进展后放弃语义索引。
+///
+/// 瞬时错误值得重试，但不能无限重试：端点长时间不可用时，状态必须落到一个终态，
+/// 否则界面会永远停在"正在建立索引"，用户既看不到原因也等不到结果。只有**完全没有
+/// 新向量产出**的轮次才计数，因此限流下的缓慢推进不会触发放弃。
+const MAX_SEMANTIC_STALLED_ROUNDS: u32 = 3;
+
+/// 一次语义索引构建的结果。
+///
+/// 区分"没配"、"没建完"和"建好了"三种状态，而不是一个布尔值：只有第一种是正常状态，
+/// 第二种必须让调用方在下一轮继续，第三种才允许把状态置为 Ready。此前用布尔值把后两种
+/// 混为一谈，结果是一次限流就让语义索引永久停在空表上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticBuild {
+    /// 未配置嵌入 provider；这是正常状态，不构成降级。
+    NotConfigured,
+    /// 仍有代码块没有向量，但失败是瞬时的，需要在后续调用中继续。
+    Incomplete,
+    /// 嵌入永久不可用（模型名错误、密钥失效、参数不被接受），重试没有意义。
+    Unavailable,
+    /// 全部代码块都已有当前向量。
+    Ready,
+}
+
+impl SemanticBuild {
+    /// 把构建结果折算成对外的索引状态。
+    ///
+    /// `Incomplete` 映射到 `Indexing` 而不是 `Degraded`：后者是终态，会让调用方停止推进，
+    /// 于是被限流打断的语义索引永远补不齐。未配置嵌入与永久不可用都落到 `Degraded`——
+    /// 那正是架构定义的降级形态：符号与词法两路可用，语义缺席。
+    fn into_status(self) -> IndexStatus {
+        match self {
+            Self::Ready => IndexStatus::Ready,
+            Self::Incomplete => IndexStatus::Indexing,
+            Self::NotConfigured | Self::Unavailable => IndexStatus::Degraded,
+        }
+    }
+}
+
 /// 宿主 preopen 的插件私有数据目录在 Guest 中的挂载点。
 ///
 /// 由 manifest 的 `data_dir` 能力授予，按插件与项目作用域隔离，**没有容量上限**——
@@ -209,6 +255,8 @@ pub struct CodeContextPlugin {
     last_rerank_degraded_reason: Option<String>,
     /// Host 返回的 `code_search` 公开名称；存在时表示工具已经注册给 Agent。
     registered_tool_name: Option<String>,
+    /// 连续没有新向量产出的语义构建轮次；有进展时清零。
+    semantic_stalled_rounds: u32,
     /// 原生测试入口使用的 sqlite-vec 数据库路径；WASM 构建不包含该字段。
     #[cfg(feature = "sqlite-vector-store")]
     sqlite_vector_path: Option<std::path::PathBuf>,
@@ -234,6 +282,21 @@ impl CodeContextPlugin {
     fn default_vector_database() -> Option<std::path::PathBuf> {
         let root = std::path::Path::new(PLUGIN_DATA_DIR);
         root.is_dir().then(|| root.join("vectors.sqlite3"))
+    }
+
+    /// 返回最近一次降级原因；正常时为 `None`。
+    ///
+    /// 语义通道失效通常是静默的——检索照样返回结果，只是少了一路召回。把原因暴露出来，
+    /// 调用方与评测才能区分"语义没帮上忙"和"语义压根没跑起来"。
+    pub fn degraded_reason(&self) -> Option<&str> {
+        self.degraded_reason.as_deref()
+    }
+
+    /// 返回语义索引中的向量条数；未建立时为 0。
+    pub fn semantic_len(&self) -> usize {
+        self.repository
+            .as_ref()
+            .map_or(0, |context| context.semantic.len())
     }
 
     /// 返回当前索引状态。
@@ -476,6 +539,11 @@ impl CodeContextPlugin {
                     context.index = Some(index);
                     context.retrieval = Some(retrieval);
                     context.dirty_paths.extend(requested_dirty);
+                    // 结构索引已就绪，但语义索引可能还差一截（限流中断、分轮未完）。
+                    // 在这里继续推进，否则被中断的语义索引永远补不齐。
+                    if self.index_status == IndexStatus::Indexing {
+                        self.index_status = self.build_semantic_index(host).into_status();
+                    }
                     return;
                 }
                 (index, retrieval) => {
@@ -542,12 +610,8 @@ impl CodeContextPlugin {
 
         // 语义向量在结构索引就绪后建立。失败不影响已就绪的两路检索，只是把状态留在
         // Degraded——这与架构第 13 问对降级形态的定义一致，不是错误。
-        let semantic_ready = self.build_semantic_index(host);
-        self.index_status = if semantic_ready {
-            IndexStatus::Ready
-        } else {
-            IndexStatus::Degraded
-        };
+        let semantic = self.build_semantic_index(host);
+        self.index_status = semantic.into_status();
         Self::emit_index_progress(
             host,
             is_incremental,
@@ -937,17 +1001,17 @@ impl CodeContextPlugin {
     ///
     /// 嵌入空间发生变化时先整体重置——旧向量与新查询向量不可比较，混用会让检索结果
     /// 长期缓慢地不正确。
-    fn build_semantic_index(&mut self, host: &dyn PluginHostApi) -> bool {
+    fn build_semantic_index(&mut self, host: &dyn PluginHostApi) -> SemanticBuild {
         let provider = embedding::select_provider(&self.config, host);
         let Some(space) = provider.space() else {
             // 未配置嵌入 provider 是正常状态，不构成降级原因。
-            return false;
+            return SemanticBuild::NotConfigured;
         };
         let Some(context) = self.repository.as_mut() else {
-            return false;
+            return SemanticBuild::NotConfigured;
         };
         let Some(index) = context.index.as_ref() else {
-            return false;
+            return SemanticBuild::NotConfigured;
         };
         if context.semantic.space().is_none() || !context.semantic.is_compatible_with(&space) {
             context.semantic.reset(space);
@@ -955,7 +1019,7 @@ impl CodeContextPlugin {
         #[cfg(feature = "sqlite-vector-store")]
         if let Some(error) = context.semantic.take_backend_error() {
             self.degraded_reason = Some(format!("sqlite-vec 索引重置失败：{error}"));
-            return false;
+            return SemanticBuild::Incomplete;
         }
 
         let current_chunks: Vec<(&str, &str)> = index
@@ -966,7 +1030,7 @@ impl CodeContextPlugin {
         #[cfg(feature = "sqlite-vector-store")]
         if let Some(error) = context.semantic.take_backend_error() {
             self.degraded_reason = Some(format!("sqlite-vec 过期向量清理失败：{error}"));
-            return context.semantic.is_ready();
+            return SemanticBuild::Incomplete;
         }
 
         // 只嵌入尚无当前向量的 chunk：内容哈希可防止正文变化后误复用同 ID 的旧向量。
@@ -996,12 +1060,19 @@ impl CodeContextPlugin {
             })
             .collect();
         if pending.is_empty() {
-            return context.semantic.is_ready();
+            self.degraded_reason = None;
+            return SemanticBuild::Ready;
         }
 
         let inputs: Vec<String> = pending.iter().map(|(_, _, _, text)| text.clone()).collect();
-        match provider.embed_documents(&inputs) {
-            Ok(vectors) => {
+        // 可续嵌入：限流或端点抖动只中断本轮，已完成的向量照常写入，剩余部分留给下一次
+        // `code_search` 继续。全有或全无会让中等以上规模的仓库永远建不完索引。
+        let before = context.semantic.len();
+        let outcome = provider.embed_documents_resumable(&inputs, MAX_EMBEDDING_BATCHES_PER_ROUND);
+        let stopped_by = outcome.stopped_by;
+        {
+            let vectors = outcome.vectors;
+            {
                 let batch: Vec<(&str, &str, Option<&str>, &[f32])> = pending
                     .iter()
                     .zip(vectors.iter())
@@ -1018,22 +1089,52 @@ impl CodeContextPlugin {
                 #[cfg(feature = "sqlite-vector-store")]
                 if let Some(error) = context.semantic.take_backend_error() {
                     self.degraded_reason = Some(format!("sqlite-vec 向量写入失败：{error}"));
-                    return context.semantic.is_ready();
+                    return SemanticBuild::Incomplete;
                 }
                 // WASM 插件继续通过宿主 KV 保存 int4 快照；sqlite-vec 模式的 snapshot
                 // 返回 None，避免同一批向量重复写进 JSON。
                 if let Some(snapshot) = context.semantic.snapshot() {
                     if let Err(error) = context.store.save_semantic(host, &snapshot) {
                         self.degraded_reason = Some(format!("语义向量未能持久化：{error}"));
-                        return context.semantic.is_ready();
+                        return SemanticBuild::Incomplete;
                     }
                 }
-                self.degraded_reason = None;
-                context.semantic.is_ready()
             }
-            Err(error) => {
+        }
+        match stopped_by {
+            None => {
+                self.degraded_reason = None;
+                self.semantic_stalled_rounds = 0;
+                SemanticBuild::Ready
+            }
+            Some(error) if error.is_transient() && context.semantic.len() > before => {
+                // 有新向量产出说明端点仍在工作，只是没做完；重置停滞计数继续推进。
+                self.semantic_stalled_rounds = 0;
+                self.degraded_reason = Some(format!(
+                    "语义索引仍在建立（已完成 {} / {} 个代码块）：{error}",
+                    context.semantic.len(),
+                    index.stats().chunks
+                ));
+                SemanticBuild::Incomplete
+            }
+            Some(error) if error.is_transient() => {
+                // 本轮一条新向量都没产出。重试若干轮仍无进展就落到终态，避免界面永远
+                // 停在"正在建立索引"。
+                self.semantic_stalled_rounds = self.semantic_stalled_rounds.saturating_add(1);
+                if self.semantic_stalled_rounds > MAX_SEMANTIC_STALLED_ROUNDS {
+                    self.degraded_reason = Some(format!("语义索引不可用：{error}"));
+                    return SemanticBuild::Unavailable;
+                }
+                self.degraded_reason = Some(format!(
+                    "语义索引仍在建立（已完成 {} / {} 个代码块）：{error}",
+                    context.semantic.len(),
+                    index.stats().chunks
+                ));
+                SemanticBuild::Incomplete
+            }
+            Some(error) => {
                 self.degraded_reason = Some(format!("语义索引不可用：{error}"));
-                false
+                SemanticBuild::Unavailable
             }
         }
     }
@@ -2146,12 +2247,81 @@ mod tests {
         }
     }
 
-    /// 嵌入端点失败时必须降级为两路检索，而不是让索引构建失败。
+    /// 限流中断后必须保留可续状态，并在端点恢复后把语义索引补齐。
+    ///
+    /// 这是语义检索能否在真实仓库上建成的关键：嵌入几千个代码块需要几百次请求，429 几乎
+    /// 必然发生。旧实现是全有或全无——一次限流丢弃整轮结果、状态落到终态 Degraded，
+    /// 于是语义索引永远停在空表上，而检索照常返回结果，失败完全不可见。
+    #[test]
+    fn rate_limited_embedding_resumes_and_completes() {
+        // 第一次嵌入请求被限流，其后回落到确定性伪向量。
+        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE)
+            .with_http_responses(vec![crate::testing::http_json(
+                429,
+                r#"{"message":"TPM limit reached"}"#,
+            )])
+            .with_echo_embeddings(4);
+        let mut plugin = CodeContextPlugin::default();
+        plugin
+            .activate(&host, api_activation_context("/repo/a"))
+            .expect("激活插件");
+
+        // 手动推进到限流那一轮，观察中间状态而不是只看终态。
+        let mut hit_rate_limit = false;
+        for _ in 0..8 {
+            plugin.advance_index(&host);
+            if plugin
+                .degraded_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("仍在建立"))
+            {
+                hit_rate_limit = true;
+                assert_eq!(
+                    plugin.index_status(),
+                    IndexStatus::Indexing,
+                    "限流应保持可续状态，而不是终态降级"
+                );
+                break;
+            }
+            if plugin.index_status() != IndexStatus::Indexing {
+                break;
+            }
+        }
+        assert!(hit_rate_limit, "测试应至少触发一次限流续建路径");
+
+        for _ in 0..8 {
+            if plugin.index_status() != IndexStatus::Indexing {
+                break;
+            }
+            plugin.advance_index(&host);
+        }
+
+        assert_eq!(
+            plugin.index_status(),
+            IndexStatus::Ready,
+            "端点恢复后必须把语义索引补齐，实际降级原因：{:?}",
+            plugin.degraded_reason
+        );
+        assert!(plugin.semantic_len() > 0, "补齐后必须有向量");
+    }
+
+    /// 嵌入端点持续失败时必须降级为两路检索，而不是让索引构建失败或永远停在建立中。
+    ///
+    /// 5xx 属于瞬时错误，会先重试若干轮；连续 [`MAX_SEMANTIC_STALLED_ROUNDS`] 轮没有
+    /// 任何新向量产出后才落到终态降级。
     #[test]
     fn embedding_failure_degrades_instead_of_failing_the_build() {
-        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE)
-            .with_http_responses(vec![crate::testing::http_json(500, "upstream error")]);
-        let plugin = indexed(&host, api_activation_context("/repo/a"));
+        let responses: Vec<_> = (0..16)
+            .map(|_| crate::testing::http_json(500, "upstream error"))
+            .collect();
+        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE).with_http_responses(responses);
+        let mut plugin = indexed(&host, api_activation_context("/repo/a"));
+        for _ in 0..=MAX_SEMANTIC_STALLED_ROUNDS {
+            if plugin.index_status() != IndexStatus::Indexing {
+                break;
+            }
+            plugin.advance_index(&host);
+        }
 
         assert_eq!(plugin.index_status(), IndexStatus::Degraded);
         assert!(
