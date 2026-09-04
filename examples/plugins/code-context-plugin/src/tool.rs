@@ -8,6 +8,7 @@
 //! 检索策略参数（词法与语义的权重、RRF 常数、召回深度）永远属于插件内部：把它们
 //! 暴露出去，等于让模型去调一个它无法评估效果的旋钮，同时把内部实现焊死在工具契约上。
 
+use crate::context::ContextBundle;
 use crate::error::CodeContextError;
 use crate::index::IndexStats;
 use crate::model::IndexStatus;
@@ -187,6 +188,91 @@ pub fn unavailable_result_with_index(
         format!("代码索引不可用（{}）：{detail}", status.as_str()),
     )
     .with_details(details)
+}
+
+/// 构造检索成功时的工具结果。
+///
+/// `content` 发送给模型，包含定位信息与代码片段；`details` 仅供 UI 展示，
+/// 包含构建统计与索引规模。模型不需要知道融合过程的细节。
+pub fn search_result(
+    call: &ToolCall,
+    bundle: &ContextBundle,
+    status: IndexStatus,
+    degraded_reason: Option<&str>,
+    index: Option<IndexStats>,
+) -> ToolResult {
+    let entries: Vec<Value> = bundle
+        .entries
+        .iter()
+        .map(|entry| {
+            let mut item = json!({
+                "file": entry.file_path,
+                "lines": [entry.start_line, entry.end_line],
+                "language": entry.language,
+                "snippet": entry.snippet,
+            });
+            if let Some(ref name) = entry.symbol_name {
+                item["symbol"] = json!(name);
+            }
+            if let Some(ref qualified) = entry.qualified_symbol {
+                item["qualified_symbol"] = json!(qualified);
+            }
+            if let Some(kind) = entry.symbol_kind {
+                if let Ok(kind_value) = serde_json::to_value(kind) {
+                    item["kind"] = kind_value;
+                }
+            }
+            if let Some(ref sig) = entry.signature {
+                item["signature"] = json!(sig);
+            }
+            if entry.truncated {
+                item["truncated"] = json!(true);
+            }
+            if entry.relocated {
+                item["relocated"] = json!(true);
+            }
+            item
+        })
+        .collect();
+
+    let mut content = json!({
+        "status": status.as_str(),
+        "results": entries,
+    });
+    if let Some(reason) = degraded_reason {
+        content["note"] = json!(reason);
+    }
+
+    let mut details = json!({
+        "status": status.as_str(),
+        "stats": {
+            "candidates": bundle.stats.candidates,
+            "returned": bundle.stats.returned,
+            "suppressed_contained": bundle.stats.suppressed_contained,
+            "merged": bundle.stats.merged,
+            "dropped_by_diversity": bundle.stats.dropped_by_diversity,
+            "dropped_by_budget": bundle.stats.dropped_by_budget,
+            "dropped_stale": bundle.stats.dropped_stale,
+            "relocated": bundle.stats.relocated,
+            "files_read": bundle.stats.files_read,
+            "estimated_tokens": bundle.stats.estimated_tokens,
+        },
+    });
+    if let Some(reason) = degraded_reason {
+        details["degraded_reason"] = json!(reason);
+    }
+    if let Some(stats) = index {
+        details["index"] = json!({
+            "files": stats.files,
+            "chunks": stats.chunks,
+            "symbols": stats.symbols,
+            "structural_files": stats.structural_files,
+            "text_files": stats.text_files,
+            "truncated": stats.truncated,
+        });
+    }
+
+    ToolResult::success(call.id.clone(), call.name.clone(), content).with_details(details)
 }
 
 #[cfg(test)]

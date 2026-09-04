@@ -3,19 +3,19 @@
 本文件是 Code Context Engine 开发的 **Single Source of Truth**。任何新 Session、接手的 Agent
 或人工开发者，只需阅读 `docs/code-context-engine/` 与本文件即可确定开发进度与下一步动作。
 
-更新日期：2026-09-03
+更新日期：2026-09-04
 
 ## Current Phase
 
-Phase 7 / 8 — API Embedding Provider 与 Semantic Vector Index
+Phase 13 — Agent Tool Integration
 
 Status: COMPLETE
-Completed Date: 2026-09-03
+Completed Date: 2026-09-04
 
-**Phase 7 的 Host 阻塞已解除**：本轮实现了通用的宿主受限 HTTP 能力，Phase 7 与 Phase 8
-随之落地，语义检索端到端可用。Phase 12（Local Embedding Provider）仍被阻塞。
+`code_search` 工具已接入完整检索管线：混合检索 → RRF 融合 → 上下文打包 → 带代码片段的
+结构化成功结果。语义不可用时自动降级为两路检索，不返回错误。
 
-下一步：Phase 13 — Agent Tool Integration（把融合与打包结果绑定到 `code_search` 返回值）。
+下一步：Phase 14 — Retrieval Benchmark（校准 BUILD_BUDGET、BM25 参数、融合提升与 token 估算）。
 
 ## Overall Status
 
@@ -27,12 +27,12 @@ Completed Date: 2026-09-03
 - [x] Phase 5 — Lexical & Symbol Retrieval
 - [x] Phase 6 — Embedding Abstraction
 - [x] Phase 7 — API Embedding Provider（本轮实现宿主 HTTP 能力，阻塞解除）
-- [x] Phase 8 — Semantic Vector Index（向量内存驻留；落盘仍待 blob 存储）
+- [x] Phase 8 — Semantic Vector Index（int8 量化持久化，启动时恢复）
 - [x] Phase 9 — Hybrid Retrieval
 - [x] Phase 10 — Context Builder
 - [x] Phase 11 — Incremental Indexing
 - [ ] Phase 12 — Local Embedding Provider — **BLOCKED**（Host 无 embedding 能力）
-- [ ] Phase 13 — Agent Tool Integration
+- [x] Phase 13 — Agent Tool Integration
 - [ ] Phase 14 — Retrieval Benchmark
 - [ ] Phase 15 — Hardening
 
@@ -839,13 +839,64 @@ Implemented:
 
 Tests：新增 14 项语义索引测试、5 项通道接线测试、5 项端到端测试。插件单测 301 → 324。
 
-**Known limitation —— 向量不落盘**：进程重启后需要重新嵌入整个仓库，
-对 API provider 意味着重新付费与等待。这个问题的解法就是原 Blocker 记录里的
-blob 存储能力（`host-store-blob-read` / `host-store-blob-write`，建议配额 256 MiB），
-本阶段没有实现它，也**没有采用被否决的两条替代路径**（向量塞进 JSON KV、写入用户仓库）。
-落盘仍属 V2。
+**向量持久化已实现（int8 量化）**：f32 向量量化为 int8 + scale factor，base64 编码后
+存入 `host-store` 的 `index.semantic` 键。1024 维 × 5000 条约 5 MiB，在 8 MiB 限制内。
+进程重启时按 `space_id` 校验兼容性：匹配则恢复、不匹配则丢弃并重新嵌入。
+`vectors_are_persisted_and_restored` 端到端测试验证：首次运行 33 次 HTTP 调用，
+重启后 0 次调用且检索结果仍然可用。
 
 Next: Phase 13 — Agent Tool Integration
+
+---
+
+### Phase 13 — Agent Tool Integration
+
+Status: COMPLETE
+Completed Date: 2026-09-04
+
+Summary：把混合检索 + RRF 融合 + 上下文打包接入 `code_search` 工具返回值。此前工具报告
+"候选融合与上下文打包尚未接入"；现在返回带代码片段、符号元数据与定位信息的成功结果。
+
+Implemented:
+- **`tool::search_result`**：构造检索成功时的 `ToolResult`。`content`（发送给模型）包含
+  结构化 JSON：`status`、`results[]`（每条含 `file`、`lines`、`language`、`snippet`、
+  `symbol`、`qualified_symbol`、`kind`、`signature`，以及可选的 `truncated` / `relocated`）。
+  `details`（仅供 UI）包含构建统计（候选数、返回数、抑制 / 合并 / 预算 / 多样性丢弃数、
+  重定位数、读取文件数、估算 token 数）与索引规模。
+- **`search()` 方法重写**：索引就绪后调用 `search_results`（混合检索 + 查询嵌入）→
+  `context::build`（去重、父子抑制、区间合并、多样性约束、一致性校验、token 预算打包）→
+  `tool::search_result`。**不再返回 unavailable_result**。
+- **多路径范围支持**：底层检索只接受单前缀；单前缀直传、多前缀时不传 scope 后置过滤取并集。
+- **降级信息对模型可见**：语义通道不可用时 `content.note` 附带降级原因。
+
+Key files:
+- `examples/plugins/code-context-plugin/src/tool.rs` — 新增 `search_result`
+- `.../src/lib.rs` — `search()` 方法接入真实检索管线
+
+Tests：新增 1 个 `search_returns_context_entries_when_index_is_ready`，修改 1 个
+`search_on_empty_repo_returns_success_with_no_results`。插件单测 324 → 325。
+
+覆盖：有内容仓库返回包含代码片段的成功结果（验证 file / lines / snippet 字段与构建统计），
+空仓库返回成功但结果为空且状态为 degraded。
+
+Tests Executed / Result:
+- `cargo test -p code-context-plugin`：325 单元测试 + 1 文档测试 + 1 集成测试，全通过。
+
+Important decisions:
+1. **索引就绪后一律返回成功结果，包括结果为空时。** 此前返回错误是因为检索未实现——
+   模型不应把"工具坏了"当作"仓库里没有相关代码"。现在检索已实现，空结果如实反映
+   "没有匹配"，模型可据此调整查询策略或改用其他工具。
+2. **`content` 与 `details` 严格分离。** 模型看到定位信息与代码片段，不看到融合诊断与统计——
+   那些是开发者调参和 Phase 14 benchmark 的输入，暴露给模型只增加噪声。
+3. **SymbolKind 用 serde 序列化。** `#[serde(rename_all = "snake_case")]` 保证稳定的机器可读名。
+
+Known limitations:
+- **path_scope 多前缀时走后置过滤。** 底层检索只支持单前缀，多前缀时先搜全局再过滤，
+  可能在 limit 较小时错过一些结果。改为底层支持多前缀需改动 retrieval 层，留给 Phase 15。
+- **未测试 token 预算是否准确。** `estimate_tokens` 的经验系数未经真实 tokenizer 校准，
+  Phase 14 必须验证。
+
+Next: Phase 14 — Retrieval Benchmark
 
 ## Blocked Phases
 
@@ -890,8 +941,7 @@ Recommended solution：方案 1。在此之前产品显示 `Local Mode: NOT SUPP
 
 ## Active Work
 
-Phase 10 — Context Builder。目标是把融合结果打包成 Agent 可用的上下文：
-去重、区间合并、父子抑制、多样性与 token 预算。
+Phase 14 — Retrieval Benchmark。校准 BUILD_BUDGET、BM25 参数、融合提升与 token 估算。
 
 ## Known Issues
 
@@ -961,9 +1011,9 @@ Tier 3  文本分块              —— 未覆盖语言、解析失败、无声
 
 ## Next Action
 
-Phase 11 已完成：事件驱动的脏路径、文件级增量 diff、双路检索清理、分片进度和失败重试
-均已接入并通过插件测试。Phase 12 — Local Embedding Provider 受 Host embedding 能力缺失阻塞，
-不绕过架构实现；下一步按计划进入 Phase 13 — Agent Tool Integration。
+Phase 13 已完成：`code_search` 返回真实检索结果，含代码片段、符号元数据与定位信息。
+Phase 12 — Local Embedding Provider 受 Host embedding 能力缺失阻塞（跳过）；
+下一步进入 Phase 14 — Retrieval Benchmark，随后 Phase 15 — Hardening。
 
 ---
 

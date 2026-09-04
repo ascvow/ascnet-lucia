@@ -5,8 +5,9 @@
 //!
 //! # 当前阶段
 //!
-//! 已完成仓库扫描、结构与检索索引、上下文构建，以及按写入事件触发的文件级增量重建。
-//! `code_search` 仍会在最终检索结果接入前报告明确状态，不返回伪造结果。
+//! 已完成仓库扫描、结构与检索索引、上下文构建、语义向量索引（含持久化），以及按写入
+//! 事件触发的文件级增量重建。`code_search` 返回经 RRF 融合、去重、父子抑制与 token
+//! 预算打包后的真实检索结果。
 //!
 //! # 能力边界
 //!
@@ -674,15 +675,14 @@ impl CodeContextPlugin {
 
     /// 执行一次 `code_search` 调用。
     ///
-    /// 检索实现属于 Phase 5；本阶段负责驱动索引构建并如实报告索引规模。参数校验从第一天
-    /// 就做，是为了让工具契约稳定：模型学到的调用形态不会在检索落地后改变。
+    /// 完整流程：参数校验 → 索引推进 → 混合检索（符号 + 词法 + 语义）→ RRF 融合 →
+    /// 上下文打包（去重、父子抑制、token 预算）→ 工具结果。语义通道不可用时自动
+    /// 降级为两路检索，不返回错误。
     fn search(&mut self, host: &dyn PluginHostApi, call: ToolCall) -> Result<ToolResult> {
         let request = match CodeSearchRequest::parse(&call.args) {
             Ok(request) => request,
             Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
         };
-        // 请求已通过校验但检索未接入；保留解析结果，使参数错误与索引缺失在返回值中可区分。
-        let _ = request;
 
         if !self.config.enabled {
             return Ok(tool::unavailable_result(
@@ -709,28 +709,55 @@ impl CodeContextPlugin {
                 Some(stats),
             ));
         }
-        // 符号与词法两路检索已经可用（见 `retrieval` 模块与其测试），但**结果尚未绑定到
-        // 工具返回值**：候选还要经过 Phase 9 的 RRF 融合与 Phase 10 的去重、合并与 token
-        // 预算打包才能成为 Agent 可用的上下文。这里刻意不发明一个临时结果格式——那会在
-        // Phase 10 落地时被整体替换，且会让模型先学到一套很快作废的输出形态。
-        //
-        // 仍然返回错误结果而不是空列表：空列表会被模型读成"仓库里没有相关代码"。
-        let stats = self.index_stats().unwrap_or_default();
-        let retrieval = self.retrieval_stats().unwrap_or_default();
-        let mut detail = format!(
-            "结构索引与检索索引已就绪（{} 个文件、{} 个代码块、{} 个符号、{} 个词元），\
-             候选融合与上下文打包尚未接入",
-            stats.files, stats.chunks, retrieval.symbols, retrieval.terms
-        );
-        if let Some(reason) = self.degraded_reason.as_deref() {
-            detail.push('；');
-            detail.push_str(reason);
+
+        // 底层检索只支持单路径前缀；多前缀时不传 scope、由后置过滤取并集。
+        let limit = request.max_results as usize;
+        let single_scope = if request.path_scope.len() == 1 {
+            Some(request.path_scope[0].as_str())
+        } else {
+            None
+        };
+        let mut results = self.search_results(host, &request.query, single_scope, limit);
+        if request.path_scope.len() > 1 {
+            results.retain(|result| {
+                request
+                    .path_scope
+                    .iter()
+                    .any(|scope| result.file_path.starts_with(scope.as_str()))
+            });
         }
-        Ok(tool::unavailable_result_with_index(
+
+        let bundle = {
+            let idx = self
+                .repository
+                .as_ref()
+                .and_then(|ctx| ctx.index.as_ref());
+            match idx {
+                Some(index) => context::build(
+                    host,
+                    index,
+                    results,
+                    &context::ContextConfig {
+                        token_budget: request.token_budget as u32,
+                        max_results: limit,
+                        ..context::ContextConfig::default()
+                    },
+                ),
+                None => context::ContextBundle {
+                    entries: Vec::new(),
+                    stats: context::ContextStats::default(),
+                },
+            }
+        };
+
+        let stats = self.index_stats();
+        let degraded = self.degraded_reason.clone();
+        Ok(tool::search_result(
             &call,
+            &bundle,
             self.index_status,
-            &detail,
-            Some(stats),
+            degraded.as_deref(),
+            stats,
         ))
     }
 
@@ -1259,13 +1286,9 @@ mod tests {
         assert!(plugin.activate(&host, context).is_err());
     }
 
-    /// 检索实现未接入时必须返回明确的不可用状态，绝不返回空结果。
-    ///
-    /// 空仓库的索引会立刻建成，因此状态是 `degraded`（结构索引就绪、语义分支缺席），
-    /// 而不是 `not_indexed`。无论哪种状态，都必须是**错误结果**——返回一个成功的空列表
-    /// 会被模型读成"仓库里没有相关代码"，比明确的不可用更有害。
+    /// 空仓库检索返回成功但结果为空，状态为 degraded（无语义通道）。
     #[test]
-    fn search_reports_unavailable_instead_of_empty_results() {
+    fn search_on_empty_repo_returns_success_with_no_results() {
         let host = TestHost::new();
         let mut plugin = activated(&host, "/repo/a");
 
@@ -1273,10 +1296,42 @@ mod tests {
             .call_tool_with_host(&host, search_call(json!({"query": "权限在哪里检查"})))
             .expect("工具调用不应失败");
 
-        assert!(result.is_error, "不可用必须是错误结果，避免被读成没有匹配");
+        assert!(!result.is_error, "索引就绪时应返回成功结果");
+        assert_eq!(result.content["status"], IndexStatus::Degraded.as_str());
+        assert_eq!(result.content["results"], json!([]));
         let details = result.details.expect("应带结构化细节");
         assert_eq!(details["status"], IndexStatus::Degraded.as_str());
-        assert_eq!(details["results"], json!([]));
+    }
+
+    /// 索引就绪后 code_search 必须返回包含代码片段的成功结果。
+    #[test]
+    fn search_returns_context_entries_when_index_is_ready() {
+        let host = crate::testing::RepoHost::new(&[
+            ("src/a.rs", "pub fn alpha() {}\n"),
+            ("src/b.rs", "pub struct Beta;\n"),
+        ]);
+        let mut plugin = CodeContextPlugin::default();
+        plugin
+            .activate(&host, activation_context("/repo/a"))
+            .expect("激活插件");
+
+        let result = plugin
+            .call_tool_with_host(&host, search_call(json!({"query": "alpha"})))
+            .expect("工具调用不应失败");
+
+        assert!(!result.is_error, "索引就绪时检索应返回成功结果");
+        assert_eq!(result.content["status"], IndexStatus::Degraded.as_str());
+        let results = result.content["results"]
+            .as_array()
+            .expect("results 应是数组");
+        assert!(!results.is_empty(), "应返回匹配的代码片段");
+        let first = &results[0];
+        assert!(first["file"].is_string(), "结果应包含文件路径");
+        assert!(first["lines"].is_array(), "结果应包含行区间");
+        assert!(first["snippet"].is_string(), "结果应包含代码片段");
+
+        let details = result.details.expect("应带构建统计");
+        assert!(details["stats"]["returned"].as_u64().unwrap_or(0) > 0);
     }
 
     /// 首次 code_search 必须触发索引构建，而不是让索引永远停在未建立状态。

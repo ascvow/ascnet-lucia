@@ -14,12 +14,17 @@ use agent_plugin::{
     PluginStoreScope, ProcessSpec, PromptContribution, Result, ServiceDescriptor, ServiceSpec,
     ToolSpec,
 };
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use code_context_plugin::{CodeContextPlugin, IndexStatus};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// SiliconFlow 嵌入 API 的 base URL。
 const SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.cn/v1/";
@@ -33,13 +38,35 @@ const EMBEDDING_MODEL: &str = "BAAI/bge-m3";
 /// 嵌入维度。
 const EMBEDDING_DIMENSION: u32 = 1024;
 
+/// 测试宿主存储文件的版本；只用于识别测试夹具自身的 JSON 格式。
+const TEST_STORE_SCHEMA_VERSION: u32 = 1;
+
+/// 测试宿主持久化文件所在的目录名。
+const TEST_STORE_DIRECTORY: &str = "lucia-code-context-siliconflow";
+
+/// 原子写入临时文件使用的进程内序号。
+static STORE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// 测试宿主磁盘文件中的 JSON 信封。
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedTestStore {
+    /// 测试夹具存储格式版本。
+    schema_version: u32,
+    /// 按作用域分组的键值内容。
+    values: HashMap<String, HashMap<String, Value>>,
+}
+
 /// 使用真实文件系统与真实 HTTP 的宿主替身。
 ///
 /// 文件从指定根目录读取；HTTP 请求转发到 SiliconFlow，自动注入凭证。
 struct LiveApiHost {
     /// 仓库根目录的绝对路径。
     repo_root: PathBuf,
-    /// 按 (作用域, 键) 保存的持久存储。
+    /// 当前测试场景的存储命名空间，避免被其他忽略测试互相污染。
+    store_namespace: String,
+    /// 宿主持久存储对应的 JSON 文件。
+    store_path: PathBuf,
+    /// 从磁盘载入的键值缓存；每次写入成功后才更新。
     values: RefCell<HashMap<(String, String), Value>>,
     /// 已注册的工具名。
     tools: RefCell<Vec<String>>,
@@ -48,32 +75,35 @@ struct LiveApiHost {
 }
 
 impl LiveApiHost {
-    /// 用真实目录创建宿主替身。
-    fn new(repo_root: impl Into<PathBuf>) -> Self {
+    /// 用真实目录创建宿主替身，并从磁盘加载指定场景的存储。
+    fn for_test(repo_root: impl Into<PathBuf>, namespace: impl Into<String>) -> Self {
+        let repo_root = repo_root.into();
+        let store_namespace = namespace.into();
+        let store_path = test_store_path(&repo_root, &store_namespace);
+        let values = load_store(&store_path).expect("读取测试宿主持久存储");
         Self {
-            repo_root: repo_root.into(),
-            values: RefCell::new(HashMap::new()),
-            tools: RefCell::new(Vec::new()),
-            http_call_count: RefCell::new(0),
-        }
-    }
-
-    /// 用既有存储创建替身，模拟重启后读到同一份持久数据。
-    fn restored_from(
-        repo_root: impl Into<PathBuf>,
-        values: HashMap<(String, String), Value>,
-    ) -> Self {
-        Self {
-            repo_root: repo_root.into(),
+            repo_root,
+            store_namespace,
+            store_path,
             values: RefCell::new(values),
             tools: RefCell::new(Vec::new()),
             http_call_count: RefCell::new(0),
         }
     }
 
-    /// 返回当前存储快照。
+    /// 返回同一场景的新宿主实例，用于模拟跨进程重启。
+    fn reopen(&self) -> Self {
+        Self::for_test(self.repo_root.clone(), self.store_namespace.clone())
+    }
+
+    /// 返回磁盘上的存储快照，而不是当前实例的内存缓存。
     fn snapshot(&self) -> HashMap<(String, String), Value> {
-        self.values.borrow().clone()
+        load_store(&self.store_path).expect("读取测试宿主持久存储快照")
+    }
+
+    /// 返回测试宿主实际使用的 JSON 文件路径。
+    fn store_path(&self) -> &Path {
+        &self.store_path
     }
 
     /// 返回已发出的 HTTP 请求计数。
@@ -88,6 +118,112 @@ impl LiveApiHost {
             PluginStoreScope::User => "user".into(),
         }
     }
+
+    /// 事务性保存当前键值映射；落盘失败时不修改内存缓存。
+    fn persist_values(&self, values: &HashMap<(String, String), Value>) -> Result<()> {
+        save_store(&self.store_path, values)
+    }
+}
+
+/// 按仓库路径与测试场景派生稳定的存储文件名。
+///
+/// 文件放在系统临时目录而不是被扫描的仓库目录中；不包含进程 ID，因此独立运行的
+/// 第二个测试进程仍能打开同一份数据。场景命名空间让多个忽略测试可以并行执行而不互相
+/// 覆盖索引。
+fn test_store_path(repo_root: &Path, namespace: &str) -> PathBuf {
+    let canonical_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut digest = Sha256::new();
+    digest.update(b"lucia-code-context-siliconflow-test-store\0");
+    digest.update(canonical_root.to_string_lossy().as_bytes());
+    digest.update([0]);
+    digest.update(namespace.as_bytes());
+    let file_name = format!("{:x}.json", digest.finalize());
+    std::env::temp_dir()
+        .join(TEST_STORE_DIRECTORY)
+        .join(file_name)
+}
+
+/// 从磁盘读取测试宿主 JSON，并还原为宿主 API 使用的扁平键空间。
+fn load_store(path: &Path) -> Result<HashMap<(String, String), Value>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取测试宿主存储失败：{}", path.display()))
+        }
+    };
+    let stored: PersistedTestStore = serde_json::from_slice(&bytes)
+        .with_context(|| format!("解析测试宿主存储失败：{}", path.display()))?;
+    if stored.schema_version != TEST_STORE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "测试宿主存储版本不受支持：{}",
+            stored.schema_version
+        ));
+    }
+
+    let mut values = HashMap::new();
+    for (scope, entries) in stored.values {
+        for (key, value) in entries {
+            values.insert((scope.clone(), key), value);
+        }
+    }
+    Ok(values)
+}
+
+/// 将扁平键空间以 JSON 信封原子写入磁盘。
+///
+/// 先写同目录临时文件并同步，再通过重命名替换目标；写入失败时不会留下半份存储，
+/// 也不会影响调用方尚未提交的内存缓存。
+fn save_store(path: &Path, values: &HashMap<(String, String), Value>) -> Result<()> {
+    let mut scoped_values: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for ((scope, key), value) in values {
+        scoped_values
+            .entry(scope.clone())
+            .or_default()
+            .insert(key.clone(), value.clone());
+    }
+    let contents = serde_json::to_vec_pretty(&PersistedTestStore {
+        schema_version: TEST_STORE_SCHEMA_VERSION,
+        values: scoped_values,
+    })
+    .context("序列化测试宿主存储失败")?;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("测试宿主存储路径没有父目录：{}", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("创建测试宿主存储目录失败：{}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("测试宿主存储文件名不是有效 UTF-8：{}", path.display()))?;
+    let sequence = STORE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| format!("创建测试宿主临时存储失败：{}", temporary.display()))?;
+    let result = (|| -> Result<()> {
+        file.write_all(&contents)
+            .with_context(|| format!("写入测试宿主存储失败：{}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("同步测试宿主存储失败：{}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("替换测试宿主存储失败：{}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 impl PluginHostApi for LiveApiHost {
@@ -97,9 +233,7 @@ impl PluginHostApi for LiveApiHost {
     }
 
     fn remove_tool(&self, public_name: &str) -> Result<()> {
-        self.tools
-            .borrow_mut()
-            .retain(|name| name != public_name);
+        self.tools.borrow_mut().retain(|name| name != public_name);
         Ok(())
     }
 
@@ -136,28 +270,34 @@ impl PluginHostApi for LiveApiHost {
     }
 
     fn store_set(&self, scope: PluginStoreScope, key: &str, value: &Value) -> Result<()> {
-        self.values
-            .borrow_mut()
-            .insert((Self::scope_key(scope), key.to_string()), value.clone());
+        let mut values = self.values.borrow().clone();
+        values.insert((Self::scope_key(scope), key.to_string()), value.clone());
+        self.persist_values(&values)?;
+        *self.values.borrow_mut() = values;
         Ok(())
     }
 
     fn store_remove(&self, scope: PluginStoreScope, key: &str) -> Result<Option<Value>> {
-        Ok(self
-            .values
-            .borrow_mut()
-            .remove(&(Self::scope_key(scope), key.to_string())))
+        let mut values = self.values.borrow().clone();
+        let removed = values.remove(&(Self::scope_key(scope), key.to_string()));
+        if removed.is_some() {
+            self.persist_values(&values)?;
+            *self.values.borrow_mut() = values;
+        }
+        Ok(removed)
     }
 
     fn store_list(&self, scope: PluginStoreScope) -> Result<Vec<String>> {
         let scope = Self::scope_key(scope);
-        Ok(self
+        let mut keys: Vec<String> = self
             .values
             .borrow()
             .keys()
             .filter(|(entry_scope, _)| *entry_scope == scope)
             .map(|(_, key)| key.clone())
-            .collect())
+            .collect();
+        keys.sort();
+        Ok(keys)
     }
 
     fn upsert_service(&self, _service: &ServiceSpec) -> Result<()> {
@@ -238,6 +378,7 @@ impl PluginHostApi for LiveApiHost {
             "{SILICONFLOW_BASE_URL}{}",
             request.path.trim_start_matches('/')
         );
+
         // 嵌入端点只用 POST；关闭 http_status_as_error 使 4xx/5xx 走 Ok 分支。
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
@@ -245,10 +386,7 @@ impl PluginHostApi for LiveApiHost {
                 .build(),
         );
         if request.method.to_uppercase() != "POST" {
-            return Err(anyhow!(
-                "集成测试只支持 POST，收到 {}",
-                request.method
-            ));
+            return Err(anyhow!("集成测试只支持 POST，收到 {}", request.method));
         }
         let mut builder = agent.post(&url);
         builder = builder.header("authorization", &format!("Bearer {SILICONFLOW_API_KEY}"));
@@ -293,11 +431,11 @@ fn siliconflow_activation_context(workspace_root: &str) -> ActivationContext {
             ),
             ("embedding_batch_size".to_string(), "32".to_string()),
             // bge-m3 不接受 dimensions 参数；关闭后靠返回值校验维度。
+            ("embedding_send_dimensions".to_string(), "false".to_string()),
             (
-                "embedding_send_dimensions".to_string(),
-                "false".to_string(),
+                "http_endpoint_id".to_string(),
+                "siliconflow-test".to_string(),
             ),
-            ("http_endpoint_id".to_string(), "siliconflow-test".to_string()),
         ]),
     }
 }
@@ -329,20 +467,44 @@ fn advance_until_ready(
 /// 定位本项目的插件源码目录作为测试仓库。
 fn plugin_src_dir() -> PathBuf {
     // 集成测试 cwd 通常是包根目录。
-    let manifest_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let src = manifest_dir.join("src");
+    // let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = PathBuf::from("/Users/teriri/teririProjects/ascnet-lucia");
     assert!(
-        src.is_dir(),
+        manifest_dir.is_dir(),
         "测试仓库路径不存在：{}",
-        src.display()
+        manifest_dir.display()
     );
-    src
+    manifest_dir
 }
 
 // ---------------------------------------------------------------------------
 // 测试用例
 // ---------------------------------------------------------------------------
+
+/// 测试宿主写入的键值必须能被新实例从磁盘重新读取。
+#[test]
+fn disk_store_survives_reopen() {
+    let src = plugin_src_dir();
+    let namespace = format!("disk-roundtrip-{}", std::process::id());
+    let path = test_store_path(&src, &namespace);
+    let _ = fs::remove_file(&path);
+
+    let host = LiveApiHost::for_test(&src, &namespace);
+    let value = serde_json::json!({"persisted": true});
+    host.store_set(PluginStoreScope::Workspace, "disk.probe", &value)
+        .expect("写入测试宿主存储");
+    assert!(path.is_file(), "存储文件应落盘：{}", path.display());
+
+    let reopened = host.reopen();
+    assert_eq!(
+        reopened
+            .store_get(PluginStoreScope::Workspace, "disk.probe")
+            .expect("读取测试宿主存储"),
+        Some(value)
+    );
+
+    fs::remove_file(&path).expect("清理测试宿主存储文件");
+}
 
 /// 全流程：索引构建 → SiliconFlow 嵌入 → 语义检索返回相关结果。
 #[test]
@@ -351,7 +513,7 @@ fn full_pipeline_index_embed_search() {
     use agent_plugin::AgentPlugin;
 
     let src = plugin_src_dir();
-    let host = LiveApiHost::new(&src);
+    let host = LiveApiHost::for_test(&src, "full-pipeline");
     let context = siliconflow_activation_context(src.to_str().expect("路径应为 UTF-8"));
 
     let mut plugin = CodeContextPlugin::default();
@@ -387,9 +549,7 @@ fn full_pipeline_index_embed_search() {
     let hit_embedding = results
         .iter()
         .any(|result| result.file_path.contains("embedding"));
-    println!(
-        "是否命中 embedding 相关文件：{hit_embedding}"
-    );
+    println!("是否命中 embedding 相关文件：{hit_embedding}");
 }
 
 /// 向量持久化：索引建成后存储快照不为空，重启后可恢复并跳过重复嵌入。
@@ -399,7 +559,7 @@ fn vectors_are_persisted_and_restored() {
     use agent_plugin::AgentPlugin;
 
     let src = plugin_src_dir();
-    let host = LiveApiHost::new(&src);
+    let host = LiveApiHost::for_test(&src, "vectors");
     let workspace_root = src.to_str().expect("路径应为 UTF-8");
     let context = siliconflow_activation_context(workspace_root);
 
@@ -407,20 +567,26 @@ fn vectors_are_persisted_and_restored() {
     let mut plugin = CodeContextPlugin::default();
     plugin.activate(&host, context).expect("首次激活");
     let status = advance_until_ready(&mut plugin, &host, 20);
-    println!("首次索引状态：{status:?}，HTTP 调用：{}", host.http_call_count());
+    println!(
+        "首次索引状态：{status:?}，HTTP 调用：{}",
+        host.http_call_count()
+    );
 
     let first_http_count = host.http_call_count();
     assert!(first_http_count > 0, "首次构建应发起 HTTP 嵌入请求");
 
     // 持久化存储应包含语义快照。
     let stored = host.snapshot();
-    let has_semantic = stored
-        .keys()
-        .any(|(_, key)| key.contains("semantic"));
+    let has_semantic = stored.keys().any(|(_, key)| key.contains("semantic"));
     assert!(has_semantic, "向量快照应被写入持久存储");
+    assert!(
+        host.store_path().is_file(),
+        "向量快照应真实写入 JSON 文件：{}",
+        host.store_path().display()
+    );
 
-    // 第二次：模拟重启——用同一份存储创建新宿主。
-    let restored_host = LiveApiHost::restored_from(&src, stored);
+    // 第二次：模拟重启——重新打开同一场景的磁盘 JSON。
+    let restored_host = host.reopen();
     let mut plugin2 = CodeContextPlugin::default();
     plugin2
         .activate(
@@ -460,7 +626,7 @@ fn semantic_search_returns_relevant_results() {
     use agent_plugin::AgentPlugin;
 
     let src = plugin_src_dir();
-    let host = LiveApiHost::new(&src);
+    let host = LiveApiHost::for_test(&src, "semantic-search");
     let workspace_root = src.to_str().expect("路径应为 UTF-8");
     let context = siliconflow_activation_context(workspace_root);
 
@@ -498,4 +664,57 @@ fn semantic_search_returns_relevant_results() {
         files_1, files_2,
         "不同语义查询应返回不同结果顺序，说明向量比较在发挥作用"
     );
+}
+
+/// 搜索演示：多条查询展示语义检索效果。
+#[test]
+#[ignore = "需要网络访问 SiliconFlow API"]
+fn search_demo() {
+    use agent_plugin::AgentPlugin;
+
+    let src = plugin_src_dir();
+    let host = LiveApiHost::for_test(&src, "search-demo");
+    let workspace_root = src.to_str().expect("路径应为 UTF-8");
+
+    let mut plugin = CodeContextPlugin::default();
+    plugin
+        .activate(&host, siliconflow_activation_context(workspace_root))
+        .expect("激活");
+    let status = advance_until_ready(&mut plugin, &host, 20);
+    let stats = plugin.index_stats().expect("索引应已建成");
+    println!("=== 索引完成 ===");
+    println!(
+        "状态: {status:?} | 文件: {} | 代码块: {} | HTTP 调用: {}",
+        stats.files,
+        stats.chunks,
+        host.http_call_count()
+    );
+    println!();
+
+    let queries = ["agent调用的方法"];
+
+    for query in &queries {
+        let results = plugin.search_results(&host, query, None, 5);
+        println!("──────────────────────────────────────────────");
+        println!("查询: {query}");
+        println!("──────────────────────────────────────────────");
+        if results.is_empty() {
+            println!("  (无结果)");
+        }
+        for (i, r) in results.iter().enumerate() {
+            println!(
+                "  [{}] {:<40} 行 {:>4}–{:<4}  分数 {:.4}",
+                i + 1,
+                r.file_path,
+                r.start_line,
+                r.end_line,
+                r.score
+            );
+            if let Some(name) = r.symbol_name.as_deref() {
+                let kind = r.symbol_kind.map(|k| format!("{k:?}")).unwrap_or_default();
+                println!("       符号: {name} ({kind})");
+            }
+        }
+        println!();
+    }
 }
