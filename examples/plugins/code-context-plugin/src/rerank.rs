@@ -44,6 +44,7 @@ pub(crate) fn assess_confidence(
             level: ConfidenceLevel::Low,
             top_margin: 0.0,
             symbol_lexical_agreement: false,
+            multi_channel_top: false,
             exact_symbol_hit: false,
             role_conflict: false,
             has_implementation: false,
@@ -61,6 +62,12 @@ pub(crate) fn assess_confidence(
                 .iter()
                 .any(|(candidate, _)| *candidate == source)
         });
+    // 同一通道可能以多种方式命中同一 chunk，按通道去重后再计数。
+    let mut top_channels: Vec<CandidateSource> =
+        top.debug.ranks.iter().map(|(source, _)| *source).collect();
+    top_channels.sort_by_key(|source| source.as_str());
+    top_channels.dedup();
+    let multi_channel_top = top_channels.len() >= 2;
     let protection = protection_of(query, top);
     let exact_symbol_hit = matches!(
         protection,
@@ -77,10 +84,14 @@ pub(crate) fn assess_confidence(
             .any(|candidate| role_matches_goal(query.goal, candidate.role));
     let high = exact_symbol_hit
         || (symbol_lexical_agreement && top_role_matches)
+        || (multi_channel_top && top_role_matches && !role_conflict)
         || (top_margin >= 0.20 && top_role_matches && !role_conflict);
     let mut reasons = Vec::new();
     if exact_symbol_hit {
         reasons.push("Top-1 为精确符号命中".to_string());
+    }
+    if multi_channel_top {
+        reasons.push(format!("{} 路召回共同支持 Top-1", top_channels.len()));
     }
     if symbol_lexical_agreement {
         reasons.push("符号与词法通道一致支持 Top-1".to_string());
@@ -102,6 +113,7 @@ pub(crate) fn assess_confidence(
         },
         top_margin,
         symbol_lexical_agreement,
+        multi_channel_top,
         exact_symbol_hit,
         role_conflict,
         has_implementation,
@@ -111,8 +123,13 @@ pub(crate) fn assess_confidence(
 
 /// 判断本次查询是否需要调用远端模型重排。
 ///
-/// 只有自然语言或混合查询、候选多于一条且本地置信度低时返回 `true`。精确查询与高置信度
-/// 本地结果直接返回，避免把绝大多数请求推入 1 到 2 秒的 Hard Path。
+/// 只有自然语言或混合查询、候选多于一条、本地置信度低，**且 Top-1 缺少多路佐证**时才
+/// 返回 `true`。
+///
+/// 最后一条是实测加上的：低置信度只说明"本地没把握"，不等于"模型能做得更好"。当 Top-1
+/// 已被两路及以上召回器共同选中时，本地排序已有相互独立的证据支撑，此时再花一次远端
+/// 往返，模型往往只是把正确结果往下压——实测中一条中文查询的三个候选拿到的增量全是负值，
+/// 其中语义第一名被压得最狠，净效果是多付一秒并让排序变差。
 pub(crate) fn should_rerank(
     query: &AnalyzedQuery,
     candidates: &[SearchResult],
@@ -120,6 +137,7 @@ pub(crate) fn should_rerank(
 ) -> bool {
     candidates.len() > 1
         && confidence.level == ConfidenceLevel::Low
+        && !confidence.multi_channel_top
         && matches!(
             query.intent,
             QueryIntent::NaturalLanguage | QueryIntent::Mixed
@@ -257,6 +275,11 @@ enum CandidateProtection {
     ExactSymbol,
     /// 强词法与实现角色共同命中。
     StrongImplementation,
+    /// 被两路及以上召回器共同召回。
+    ///
+    /// 多路一致是相互独立的佐证，强度弱于精确符号命中，但足以要求模型重排不得把它压出
+    /// 前列——模型只看候选文本，看不到"这条同时被词法和语义选中"这个事实。
+    MultiChannel,
     /// 不需要排名保护。
     None,
 }
@@ -268,6 +291,7 @@ impl CandidateProtection {
             Self::ExactQualified => Some(0),
             Self::ExactSymbol => Some(2),
             Self::StrongImplementation => Some(4),
+            Self::MultiChannel => Some(5),
             Self::None => None,
         }
     }
@@ -440,6 +464,19 @@ fn protection_of(query: &AnalyzedQuery, result: &SearchResult) -> CandidateProte
     {
         return CandidateProtection::StrongImplementation;
     }
+    // 多路一致：两个相互独立的召回器同时选中它。模型只看候选文本，看不到这个事实，
+    // 因此不能让它把这类候选压出前列。
+    let mut channels: Vec<CandidateSource> = result
+        .debug
+        .ranks
+        .iter()
+        .map(|(source, _)| *source)
+        .collect();
+    channels.sort_by_key(|source| source.as_str());
+    channels.dedup();
+    if channels.len() >= 2 {
+        return CandidateProtection::MultiChannel;
+    }
     CandidateProtection::None
 }
 
@@ -451,6 +488,7 @@ fn strongest_protections(query: &str, results: &[SearchResult]) -> Vec<(String, 
         CandidateProtection::ExactQualified,
         CandidateProtection::ExactSymbol,
         CandidateProtection::StrongImplementation,
+        CandidateProtection::MultiChannel,
     ] {
         let Some(result) = results
             .iter()
@@ -726,6 +764,85 @@ mod tests {
             reranked.last().expect("结果非空").chunk_id,
             "chunk-3",
             "两边一致判为不相关的候选必须排在末位"
+        );
+    }
+
+    /// Top-1 已被多路召回共同支持时不得再触发模型重排。
+    ///
+    /// 低置信度只说明"本地没把握"，不等于"模型能做得更好"。实测中一条中文查询的三个
+    /// 候选拿到的重排增量全为负，其中语义第一名被压得最狠——多付一秒还让排序变差。
+    #[test]
+    fn multi_channel_top_skips_rerank() {
+        let query = AnalyzedQuery::analyze("权限检查在哪里实现");
+        let mut agreed = result("agreed", "check_permission", 1, 0.9);
+        agreed.debug.ranks = vec![
+            (CandidateSource::Lexical, 3),
+            (CandidateSource::Semantic, 1),
+        ];
+        agreed.role = ChunkRole::Documentation;
+        let mut single = result("single", "other", 2, 0.89);
+        single.debug.ranks = vec![(CandidateSource::Semantic, 2)];
+        single.role = ChunkRole::Documentation;
+
+        let candidates = vec![agreed.clone(), single.clone()];
+        let confidence = assess_confidence(&query, &candidates);
+        assert!(confidence.multi_channel_top, "Top-1 应被判为多路一致");
+        assert!(
+            !should_rerank(&query, &candidates, &confidence),
+            "多路一致的 Top-1 不应触发重排"
+        );
+
+        // 只有单路支持时仍然允许重排，避免把这条规则变成"永不重排"。
+        let single_only = vec![single, agreed];
+        let confidence = assess_confidence(&query, &single_only);
+        assert!(!confidence.multi_channel_top);
+        assert!(should_rerank(&query, &single_only, &confidence));
+    }
+
+    /// 多路一致的候选不得被模型重排压出前列。
+    #[test]
+    fn multi_channel_candidate_keeps_rank_floor() {
+        let mut agreed = result("agreed", "check_permission", 1, 0.9);
+        agreed.debug.ranks = vec![
+            (CandidateSource::Lexical, 2),
+            (CandidateSource::Semantic, 1),
+        ];
+        let mut others: Vec<SearchResult> = (0..9)
+            .map(|index| {
+                let mut item = result(&format!("other-{index}"), &format!("other{index}"), 2, 0.5);
+                item.debug.ranks = vec![(CandidateSource::Semantic, index as u32 + 2)];
+                item
+            })
+            .collect();
+        let mut candidates = vec![agreed];
+        candidates.append(&mut others);
+
+        // 模型把多路一致的候选判为最差。
+        let items: Vec<String> = (0..candidates.len())
+            .map(|index| {
+                let score = if index == 0 {
+                    0.0
+                } else {
+                    1.0 - index as f32 / 100.0
+                };
+                format!(r#"{{"index":{index},"relevance_score":{score}}}"#)
+            })
+            .collect();
+        let reranked = apply_response(
+            &format!(r#"{{"results":[{}]}}"#, items.join(",")),
+            "权限检查在哪里实现",
+            candidates,
+        )
+        .expect("重排应成功");
+
+        let position = reranked
+            .iter()
+            .position(|item| item.chunk_id == "agreed")
+            .expect("多路一致候选应仍在结果中");
+        assert!(
+            position <= 5,
+            "多路一致候选不得被压到第 {} 位",
+            position + 1
         );
     }
 

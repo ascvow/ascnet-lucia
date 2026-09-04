@@ -161,6 +161,12 @@ pub struct RetrievalConfidence {
     pub top_margin: f32,
     /// Top-1 是否同时得到符号与词法通道支持。
     pub symbol_lexical_agreement: bool,
+    /// Top-1 是否被两路及以上召回器共同召回。
+    ///
+    /// 比 [`Self::symbol_lexical_agreement`] 宽：语义 + 词法同样是相互独立的佐证，而在
+    /// 中文自然语言查询里这才是常见组合。多通道一致意味着本地排序已有独立证据支撑，
+    /// 不该再花一次远端往返让模型重新猜。
+    pub multi_channel_top: bool,
     /// Top-1 是否为精确符号命中。
     pub exact_symbol_hit: bool,
     /// Top-1 角色与候选池中的目标角色是否冲突。
