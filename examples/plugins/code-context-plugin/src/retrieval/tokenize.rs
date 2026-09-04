@@ -86,12 +86,30 @@ fn push_cjk_tokens(run: &[char], out: &mut Vec<String>) {
     }
 }
 
+/// 处理累积的完整标识符。
+///
+/// 蛇形命名此前只留下子词：`parse_file` 被切成 `parse` 与 `file`，完整形态从不入索引。
+/// 后果是自然语言里夹带的蛇形标识符**永远拿不到精确符号命中**——查 `parse_file 在哪里
+/// 定义`时，子词 `parse` 会精确命中各语言的 `parse` 函数，而真正的目标只能靠前缀匹配
+/// 这种最弱的证据被召回。驼峰命名一直保留完整形态，蛇形理应一致。
+fn flush_identifier(identifier: &mut String, out: &mut Vec<String>) {
+    let lower = identifier.trim_matches('_').to_lowercase();
+    identifier.clear();
+    // 只在确实含分隔符时补充：不含下划线时它与 `flush_ascii` 的产物完全重复。
+    if lower.contains('_') && lower.chars().count() >= MIN_TOKEN_CHARS {
+        out.push(lower);
+    }
+}
+
 /// 把一段文本切成检索词元。
 ///
 /// 输出全部小写。同一词元可能重复出现，调用方据此统计词频。
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut ascii_part = String::new();
+    // 连同下划线一起累积的完整标识符。它与 `ascii_part` 并行维护：后者按分隔符切出子词，
+    // 前者保留 `parse_file` 这样的整体形态。
+    let mut identifier = String::new();
     let mut cjk_run: Vec<char> = Vec::new();
 
     /// 处理累积的 ASCII 标识符片段。
@@ -121,6 +139,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
     for character in text.chars() {
         if is_cjk(character) {
             flush_ascii(&mut ascii_part, &mut out);
+            flush_identifier(&mut identifier, &mut out);
             cjk_run.push(character);
             continue;
         }
@@ -129,7 +148,8 @@ pub fn tokenize(text: &str) -> Vec<String> {
             cjk_run.clear();
         }
         if character.is_alphanumeric() || character == '_' {
-            // 下划线在这里不参与累积：它是命名分隔符，直接触发一次切分。
+            identifier.push(character);
+            // 下划线不参与子词累积：它是命名分隔符，直接触发一次切分。
             if character == '_' {
                 flush_ascii(&mut ascii_part, &mut out);
             } else {
@@ -137,12 +157,14 @@ pub fn tokenize(text: &str) -> Vec<String> {
             }
         } else {
             flush_ascii(&mut ascii_part, &mut out);
+            flush_identifier(&mut identifier, &mut out);
         }
         if out.len() >= MAX_TOKENS {
             return out;
         }
     }
     flush_ascii(&mut ascii_part, &mut out);
+    flush_identifier(&mut identifier, &mut out);
     if !cjk_run.is_empty() {
         push_cjk_tokens(&cjk_run, &mut out);
     }
@@ -203,11 +225,32 @@ mod tests {
         assert_contains("parseJSONData", &["parse", "json", "data"]);
     }
 
-    /// 蛇形命名必须按下划线切分。
+    /// 蛇形命名必须按下划线切分，同时保留完整标识符。
+    ///
+    /// 只留子词会让自然语言里夹带的蛇形标识符永远拿不到精确符号命中：查 `parse_file`
+    /// 时子词 `parse` 会精确命中各语言的 `parse` 函数，而真正的目标只能靠前缀匹配。
     #[test]
-    fn splits_snake_case() {
-        assert_contains("tool_call_id", &["tool", "call", "id"]);
-        assert_contains("execute_command", &["execute", "command"]);
+    fn splits_snake_case_and_keeps_whole_identifier() {
+        assert_contains("tool_call_id", &["tool_call_id", "tool", "call", "id"]);
+        assert_contains(
+            "execute_command",
+            &["execute_command", "execute", "command"],
+        );
+        assert_contains(
+            "parse_file 是在哪里定义的",
+            &["parse_file", "parse", "file"],
+        );
+    }
+
+    /// 不含分隔符的标识符不得产生重复词元。
+    #[test]
+    fn plain_identifier_is_not_duplicated() {
+        let tokens = tokenize("execute");
+        assert_eq!(
+            tokens.iter().filter(|token| *token == "execute").count(),
+            1,
+            "实际词元 {tokens:?}"
+        );
     }
 
     /// 全大写常量必须被拆成单词。
