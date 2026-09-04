@@ -36,11 +36,13 @@ Guest 负责配置校验、仓库身份、索引状态、manifest 兼容性、�
 ## Capabilities
 
 - `workspace_read`：Host 注入当前项目可信根；首次检索时递归扫描并建立索引。
-- `storage`：WASM Guest 保存 manifest、文件哈希表和 int4 语义快照，由 Host 按插件和
-  Workspace 作用域隔离。
+- `storage`：保存 manifest 与文件哈希表这类小元数据，由 Host 按插件和 Workspace
+  作用域隔离。它是重写全量的 8 MiB JSON，只适合小体积数据。
+- `data_dir`：Host 按插件与项目作用域派生一个隔离目录并 preopen 成 `/data`，**没有容量
+  上限**。语义向量与代码索引放在这里：它们的体积由用户仓库规模决定，塞进 `storage`
+  会在超限后被静默截断，表现为功能随仓库变大而悄悄退化。
 
-插件仅在 API 嵌入模式下申请受限 HTTP 网络能力，不申请 secret、子进程、会话、文件写入或
-本地推理能力。
+插件仅在 API 嵌入模式下申请受限 HTTP 网络能力，不申请 secret、子进程、会话或本地推理能力。
 
 ## 配置
 
@@ -103,6 +105,13 @@ WAL/SHM 辅助文件后重新生成全部向量，`--no-cache` 禁用跨进程�
 向量或调用 rerank，也不能作为语义搜索验收结果。
 
 ## 构建与测试
+
+插件把 SQLite（元数据 + `sqlite-vec` 向量索引）编进 WASM，因此构建需要 **wasi-sdk** 提供
+clang 与 `wasm32-wasip2` sysroot。这是插件自己的依赖，Lucia 本体不因此增加任何构建前置。
+
+从 [wasi-sdk releases](https://github.com/WebAssembly/wasi-sdk/releases) 下载对应平台的包，
+解压到 `~/.wasi-sdk`（或任意位置并设置 `WASI_SDK_PATH`）；`scripts/build-plugin.ts` 会自动
+发现它并注入交叉编译变量。
 
 ```bash
 cargo test --offline -p code-context-plugin

@@ -510,10 +510,7 @@ fn incremental_new_file_read_failure_is_retried() {
     );
 
     assert_eq!(build.advance(&changed, UNLIMITED), ScanProgress::Complete);
-    assert_eq!(
-        build.incremental_stats().expect("增量统计").failed_files,
-        1
-    );
+    assert_eq!(build.incremental_stats().expect("增量统计").failed_files, 1);
     assert_eq!(
         build.remaining_dirty_paths(),
         BTreeSet::from(["src/new.rs".to_string()])

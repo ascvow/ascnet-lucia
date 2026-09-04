@@ -451,3 +451,61 @@ async fn missing_workspace_root_degrades_without_registering_tool() {
     host.shutdown().await.expect("卸载插件");
     let _ = std::fs::remove_dir_all(&state_root);
 }
+
+/// 声明 `data_dir` 的插件必须在加载时拿到一个隔离的私有数据目录。
+///
+/// 这条路径是语义向量持久化的前提：目录缺席时插件会退回受 8 MiB 上限约束的 int4 快照，
+/// 大仓库的向量会被静默截断。测试直接检查宿主真的按项目作用域建出了目录，而不是只看
+/// 加载有没有报错——加载成功但没有目录，正是那种"功能悄悄退化"的形态。
+#[tokio::test]
+async fn plugin_receives_isolated_data_directory() -> Result<()> {
+    let state_root = unique_state_root("data-dir");
+    let workspace = create_workspace("data-dir");
+    write_file(&workspace, "src/lib.rs", "pub fn demo() {}\n");
+
+    let host = load_wasm_plugins_with_services(
+        &[manifest_path()],
+        services(&state_root, "data-dir-scope", &workspace)?,
+    )
+    .await?;
+    host.shutdown().await?;
+
+    let data_root = state_root.join("data");
+    let entries: Vec<PathBuf> = std::fs::read_dir(&data_root)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        entries.len(),
+        1,
+        "应恰好为该插件建出一个数据目录，实际：{entries:?}"
+    );
+    assert!(entries[0].is_dir(), "数据目录必须是真实目录");
+
+    // 同一插件换一个项目作用域必须拿到不同目录，否则两个仓库的索引会互相污染。
+    let other_workspace = create_workspace("data-dir-other");
+    write_file(&other_workspace, "src/lib.rs", "pub fn other() {}\n");
+    let other = load_wasm_plugins_with_services(
+        &[manifest_path()],
+        services(&state_root, "data-dir-other-scope", &other_workspace)?,
+    )
+    .await?;
+    other.shutdown().await?;
+
+    let after: Vec<PathBuf> = std::fs::read_dir(&data_root)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(after.len(), 2, "不同项目作用域必须得到各自的数据目录");
+
+    std::fs::remove_dir_all(&state_root).ok();
+    std::fs::remove_dir_all(&workspace).ok();
+    std::fs::remove_dir_all(&other_workspace).ok();
+    Ok(())
+}

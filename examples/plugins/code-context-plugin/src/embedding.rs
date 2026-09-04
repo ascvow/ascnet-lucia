@@ -278,10 +278,7 @@ impl<'host> ApiEmbeddingProvider<'host> {
         let request = HttpRequest {
             method: "POST".to_string(),
             path: "embeddings".to_string(),
-            headers: HashMap::from([(
-                "content-type".to_string(),
-                "application/json".to_string(),
-            )]),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
             body: Some(body.to_string()),
         };
         let response = self.host.http_request(&request).map_err(|error| {
@@ -628,8 +625,7 @@ mod tests {
             200,
             &embedding_body(&[(0, [1.0, 0.0, 0.0])]),
         )]);
-        let provider =
-            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+        let provider = ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
 
         provider
             .embed(EmbeddingInputKind::Document, &["fn check()".to_string()])
@@ -656,8 +652,7 @@ mod tests {
             // 刻意倒序返回。
             &embedding_body(&[(1, [0.0, 1.0, 0.0]), (0, [1.0, 0.0, 0.0])]),
         )]);
-        let provider =
-            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+        let provider = ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
 
         let vectors = provider
             .embed(
@@ -677,8 +672,7 @@ mod tests {
             200,
             r#"{"data":[{"index":1,"embedding":[1,0,0]},{"index":1,"embedding":[0,1,0]}]}"#,
         )]);
-        let provider =
-            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+        let provider = ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
 
         let error = provider
             .embed(
@@ -696,8 +690,7 @@ mod tests {
             200,
             &embedding_body(&[(0, [1.0, 0.0, 0.0])]),
         )]);
-        let provider =
-            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+        let provider = ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
 
         let error = provider
             .embed_documents(&["a".to_string(), "b".to_string()])
@@ -712,8 +705,7 @@ mod tests {
             200,
             r#"{"data":[{"index":0,"embedding":[1,0]}]}"#,
         )]);
-        let provider =
-            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+        let provider = ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
 
         let error = provider
             .embed_documents(&["a".to_string()])
@@ -728,23 +720,24 @@ mod tests {
             401,
             r#"{"error":{"message":"Incorrect API key provided"}}"#,
         )]);
-        let provider =
-            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+        let provider = ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
 
         let error = provider
             .embed_documents(&["a".to_string()])
             .expect_err("401 应失败");
         let message = error.to_string();
         assert!(message.contains("401"), "应带状态码：{message}");
-        assert!(message.contains("Incorrect API key"), "应带端点说明：{message}");
+        assert!(
+            message.contains("Incorrect API key"),
+            "应带端点说明：{message}"
+        );
     }
 
     /// 宿主 HTTP 失败必须降级为嵌入不可用，而不是让整次检索崩溃。
     #[test]
     fn host_failure_degrades_to_unavailable() {
         let host = TestHost::new().with_http_responses(vec![Err(anyhow::anyhow!("网络不可达"))]);
-        let provider =
-            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+        let provider = ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
 
         let error = provider
             .embed_documents(&["a".to_string()])
@@ -759,8 +752,7 @@ mod tests {
             200,
             &embedding_body(&[(0, [1.0, 0.0, 0.0])]),
         )]);
-        let provider =
-            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+        let provider = ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
 
         provider.health_check().expect("端点可用时应通过");
         assert_eq!(host.http_requests().len(), 1, "必须真的发起探测请求");
@@ -792,10 +784,12 @@ mod tests {
     #[test]
     fn empty_input_makes_no_request() {
         let host = TestHost::new();
-        let provider =
-            ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
+        let provider = ApiEmbeddingProvider::from_config(&api_config(), &host).expect("应构造成功");
 
-        assert!(provider.embed_documents(&[]).expect("空输入应成功").is_empty());
+        assert!(provider
+            .embed_documents(&[])
+            .expect("空输入应成功")
+            .is_empty());
         assert!(host.http_requests().is_empty(), "空输入不应发起请求");
     }
 

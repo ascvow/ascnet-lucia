@@ -103,6 +103,13 @@ fn semantic_document_text(chunk: &CodeChunk) -> String {
     parts.join("\n")
 }
 
+/// 宿主 preopen 的插件私有数据目录在 Guest 中的挂载点。
+///
+/// 由 manifest 的 `data_dir` 能力授予，按插件与项目作用域隔离，**没有容量上限**——
+/// 索引与向量的体积由用户仓库规模决定，宿主只保证除本插件与宿主外无人可访问。
+#[cfg(feature = "sqlite-vector-store")]
+const PLUGIN_DATA_DIR: &str = "/data";
+
 /// 宿主注入工作区根的激活元数据键。
 const WORKSPACE_ROOT_KEY: &str = "workspace_root";
 
@@ -181,12 +188,23 @@ pub struct CodeContextPlugin {
 impl CodeContextPlugin {
     /// 指定本地 sqlite-vec 数据库文件。
     ///
-    /// 该入口只在原生 `sqlite-vector-store` feature 下提供，供可执行搜索示例把向量持久化到
-    /// Lucia 用户目录。WASM Guest 不直接打开文件，正式宿主仍通过能力边界管理持久数据。
+    /// 可执行搜索示例用它把向量落到 Lucia 用户目录。未显式指定时，WASM Guest 会自动落到
+    /// 宿主 preopen 的私有数据目录，见 [`Self::default_vector_database`]。
     #[cfg(feature = "sqlite-vector-store")]
     pub fn with_sqlite_vector_database(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.sqlite_vector_path = Some(path.into());
         self
+    }
+
+    /// 返回宿主授予的私有数据目录中的向量库路径；目录不存在时为 `None`。
+    ///
+    /// `/data` 由宿主在 manifest 声明 `data_dir` 时 preopen。目录缺席说明宿主未授予该能力
+    /// （旧版宿主、或用户关闭了它），此时调用方退回 int4 快照——功能不中断，只是大仓库会
+    /// 因快照容量上限丢失一部分向量。
+    #[cfg(feature = "sqlite-vector-store")]
+    fn default_vector_database() -> Option<std::path::PathBuf> {
+        let root = std::path::Path::new(PLUGIN_DATA_DIR);
+        root.is_dir().then(|| root.join("vectors.sqlite3"))
     }
 
     /// 返回当前索引状态。
@@ -287,8 +305,13 @@ impl CodeContextPlugin {
         let mut semantic = SemanticIndex::new();
         if let Some(space) = self.embedding_provider(host).space() {
             #[cfg(feature = "sqlite-vector-store")]
-            if let Some(path) = self.sqlite_vector_path.as_ref() {
-                semantic = SemanticIndex::with_sqlite(space.clone(), path)
+            // 显式指定的路径优先（可执行示例）；否则落到宿主 preopen 的私有数据目录。
+            if let Some(path) = self
+                .sqlite_vector_path
+                .clone()
+                .or_else(Self::default_vector_database)
+            {
+                semantic = SemanticIndex::with_sqlite(space.clone(), &path)
                     .map_err(CodeContextError::Storage)?;
             }
             if semantic.is_empty() {

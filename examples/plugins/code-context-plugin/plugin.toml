@@ -30,6 +30,12 @@ workspace_read = true
 # 一次插件重建就清空用户索引会让功能本身不成立。
 storage = true
 
+# 语义向量与代码索引放插件自己的数据目录，不放 storage：storage 是重写全量的 8 MiB JSON，
+# 一条 1024 维 int4 向量 base64 后约 900 字节，只够装约八千条，超出部分被静默丢弃——
+# 仓库越大，语义检索覆盖到的比例越小。数据目录由宿主 preopen 成 /data，没有容量上限，
+# 插件在其中自建 SQLite（元数据 + sqlite-vec 向量索引）。
+data_dir = true
+
 # 本插件刻意不申请的能力，逐项说明，避免后来者误以为是遗漏：
 #
 # process_exec   —— 明确否决：它会把本插件全部工具的 scope 抬到 shell，

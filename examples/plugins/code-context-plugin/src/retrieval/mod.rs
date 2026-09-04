@@ -314,12 +314,6 @@ impl RetrievalIndex {
             path_scope,
             fusion::candidate_limit(limit),
         );
-        fusion::fuse(
-            &channels,
-            query,
-            index,
-            &FusionConfig::default(),
-            limit,
-        )
+        fusion::fuse(&channels, query, index, &FusionConfig::default(), limit)
     }
 }

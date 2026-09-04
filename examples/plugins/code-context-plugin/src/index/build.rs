@@ -286,8 +286,8 @@ impl IndexBuild {
                 ..
             } => {
                 let mut snapshot = *stats;
-                snapshot.discovered_files = u32::try_from(self.scan.discovered_paths().len())
-                    .unwrap_or(u32::MAX);
+                snapshot.discovered_files =
+                    u32::try_from(self.scan.discovered_paths().len()).unwrap_or(u32::MAX);
                 // 读取失败不会进入 `FileSink`，因此需要把扫描器记录的路径并入失败统计；
                 // 与容量拒绝路径合并后再计数，避免同一路径重复计算。
                 let read_failed = self.scan.read_failed_paths();

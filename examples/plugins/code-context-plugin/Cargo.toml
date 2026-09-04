@@ -16,6 +16,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 wit-bindgen = "0.59"
+# 向量与元数据同库。SQLite 是 C 代码，编译到 wasm32-wasip2 需要 wasi-sdk 提供 sysroot，
+# 构建方式见 README；这条依赖刻意留在插件里，Lucia 本体不因此增加任何构建前置。
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 sqlite-vec = { version = "0.1.9", optional = true }
 
@@ -34,6 +36,8 @@ rustpython-parser = "0.4"
 gosyn = "0.2"
 
 [features]
+# 默认启用向量库：它是 WASM 正式路径的持久化后端，不再只是原生示例的可选项。
+default = ["sqlite-vector-store"]
 test-support = ["sqlite-vector-store"]
 sqlite-vector-store = ["dep:rusqlite", "dep:sqlite-vec"]
 

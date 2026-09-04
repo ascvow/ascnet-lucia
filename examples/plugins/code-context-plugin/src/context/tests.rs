@@ -342,7 +342,8 @@ fn budget_skips_oversized_entries_and_continues() {
     second.score = 1.0;
 
     let config = ContextConfig {
-        token_budget: estimate_tokens("    /// 保存会话状态到磁盘。\n    pub fn persist(&self) {}") + 2,
+        token_budget: estimate_tokens("    /// 保存会话状态到磁盘。\n    pub fn persist(&self) {}")
+            + 2,
         ..ContextConfig::default()
     };
     let bundle = build(&host, &index, vec![first, second], &config);
@@ -411,10 +412,7 @@ fn externally_modified_file_is_relocated() {
         "// 新增的第一行\n// 新增的第二行\n// 新增的第三行\n{}",
         FIXTURE[0].1
     );
-    let modified = RepoHost::new(&[
-        ("src/permission/manager.rs", shifted.as_str()),
-        FIXTURE[1],
-    ]);
+    let modified = RepoHost::new(&[("src/permission/manager.rs", shifted.as_str()), FIXTURE[1]]);
 
     let bundle = build(&modified, &index, results, &ContextConfig::default());
     let entry = bundle
@@ -451,10 +449,7 @@ impl PermissionManager {
     }
 }
 "#;
-    let modified = RepoHost::new(&[
-        ("src/permission/manager.rs", without_check),
-        FIXTURE[1],
-    ]);
+    let modified = RepoHost::new(&[("src/permission/manager.rs", without_check), FIXTURE[1]]);
 
     let bundle = build(&modified, &index, results, &ContextConfig::default());
 
