@@ -32,14 +32,16 @@
 //! 出现在结果中，这才是"能不能替代人工翻代码"的真实判据。
 
 use code_context_plugin::{
+    build_context,
     testing::{activation_context, collect_repository_files, repository_root, RepoHost},
-    CodeContextPlugin, IndexStatus, SearchResult,
+    CodeContextPlugin, ContextBundle, ContextConfig, IndexStatus, SearchResult,
 };
 
 use agent_plugin::{AgentPlugin, ToolCall};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::time::Instant;
 
 // ===========================================================================
 // 查询集
@@ -307,11 +309,102 @@ fn eval_queries() -> Vec<EvalQuery> {
     ]
 }
 
+/// 判断文件是否属于评测答案或评测结果，必须从被测语料中排除。
+fn is_evaluation_artifact(path: &str) -> bool {
+    matches!(
+        path,
+        "examples/plugins/code-context-plugin/tests/retrieval_report.rs"
+            | "examples/plugins/code-context-plugin/tests/retrieval_benchmark.rs"
+            | "docs/code-context-engine/PROGRESS.md"
+    ) || path.starts_with("docs/code-context-engine/retrieval-acceptance-")
+}
+
+/// 收集真实仓库语料，并排除包含查询、答案和指标的评测产物。
+///
+/// 不做这一步时，评测脚本中的查询文本与目标符号会被同一个索引读到，生成的报告也会反过来
+/// 出现在 Top-10，导致指标随报告内容虚高而不是反映产品检索能力。
+fn collect_evaluation_files(root: &std::path::Path) -> Vec<(String, String)> {
+    collect_repository_files(root)
+        .into_iter()
+        .filter(|(path, _)| !is_evaluation_artifact(path))
+        .collect()
+}
+
+/// 一条面向真实使用场景的业务式验收查询。
+///
+/// 查询刻意不包含目标符号名，模拟用户只描述“要找什么实现”时的输入。目标路径与符号共同
+/// 约束实现本体，避免把同文件内的调用点或测试代码误算为成功。
+struct AcceptanceQuery {
+    /// 截图式报告中的业务类别。
+    category: &'static str,
+    /// 提交给检索链路的中文行为描述。
+    query: &'static str,
+    /// 目标实现所在文件的路径子串。
+    expected_paths: &'static [&'static str],
+    /// 目标实现符号；命中同名调用点不算成功。
+    expected_symbols: &'static [&'static str],
+}
+
+/// 返回覆盖八类常见代码定位任务的 Lucia 业务式查询。
+fn acceptance_queries() -> Vec<AcceptanceQuery> {
+    vec![
+        AcceptanceQuery {
+            category: "实体类定义",
+            query: "代码搜索请求参数实体在哪里定义",
+            expected_paths: &["code-context-plugin/src/tool.rs"],
+            expected_symbols: &["CodeSearchRequest"],
+        },
+        AcceptanceQuery {
+            category: "页面组件",
+            query: "插件管理页面怎么绘制",
+            expected_paths: &["agent-tui/src/command/render.rs"],
+            expected_symbols: &["render_native_plugin_dialog"],
+        },
+        AcceptanceQuery {
+            category: "鉴权过滤器",
+            query: "工具调用在什么情况下需要用户审批",
+            expected_paths: &["permission-plugin/src/lib.rs"],
+            expected_symbols: &["requires_approval"],
+        },
+        AcceptanceQuery {
+            category: "状态下钻功能",
+            query: "代码索引进度怎么发布到终端底栏",
+            expected_paths: &["code-context-plugin/src/lib.rs"],
+            expected_symbols: &["emit_index_progress"],
+        },
+        AcceptanceQuery {
+            category: "选择器组件",
+            query: "思考等级选择面板怎么渲染",
+            expected_paths: &["agent-tui/src/command/render.rs"],
+            expected_symbols: &["render_native_reasoning_panel"],
+        },
+        AcceptanceQuery {
+            category: "工具函数",
+            query: "驼峰命名的标识符如何拆成可检索的词",
+            expected_paths: &["code-context-plugin/src/retrieval/tokenize.rs"],
+            expected_symbols: &["split_camel_case"],
+        },
+        AcceptanceQuery {
+            category: "控制器",
+            query: "仓库代码搜索请求如何执行并打包代码片段",
+            expected_paths: &["code-context-plugin/src/lib.rs"],
+            expected_symbols: &["search"],
+        },
+        AcceptanceQuery {
+            category: "刷新接口",
+            query: "文件修改后如何增量刷新代码索引",
+            expected_paths: &["code-context-plugin/src/lib.rs"],
+            expected_symbols: &["advance_index"],
+        },
+    ]
+}
+
 // ===========================================================================
 // 指标
 // ===========================================================================
 
 /// 单条查询的评测结果。
+#[derive(Clone)]
 struct QueryOutcome {
     /// 目标文件首次出现的名次，从 1 开始；未命中为 `None`。
     file_rank: Option<usize>,
@@ -352,25 +445,42 @@ impl QueryOutcome {
     }
 }
 
-/// 对一条查询求值。
-fn evaluate(results: &[SearchResult], query: &EvalQuery) -> QueryOutcome {
-    let file_rank = results.iter().position(|result| {
-        query
-            .expected_paths
-            .iter()
-            .any(|pattern| result.file_path.contains(pattern))
-    });
+/// 判断结果路径是否属于目标实现文件。
+fn matches_target_path(file_path: &str, expected_paths: &[&str]) -> bool {
+    expected_paths
+        .iter()
+        .any(|pattern| file_path.contains(pattern))
+}
+
+/// 判断结果符号是否为目标定义，而不是同文件中的调用点。
+fn matches_target_symbol(
+    symbol_name: Option<&str>,
+    qualified_symbol: Option<&str>,
+    expected_symbols: &[&str],
+) -> bool {
+    expected_symbols
+        .iter()
+        .any(|symbol| symbol_name == Some(*symbol) || qualified_symbol == Some(*symbol))
+}
+
+/// 按目标路径与符号对一组候选求值。
+fn evaluate_target(
+    results: &[SearchResult],
+    expected_paths: &[&str],
+    expected_symbols: &[&str],
+) -> QueryOutcome {
+    let file_rank = results
+        .iter()
+        .position(|result| matches_target_path(&result.file_path, expected_paths));
     // 定义命中要求同时落在目标文件里：同名符号在别处出现不算找到定义。
     let symbol_rank = results.iter().position(|result| {
-        let in_target = query
-            .expected_paths
-            .iter()
-            .any(|pattern| result.file_path.contains(pattern));
+        let in_target = matches_target_path(&result.file_path, expected_paths);
         in_target
-            && query.expected_symbols.iter().any(|symbol| {
-                result.symbol_name.as_deref() == Some(*symbol)
-                    || result.qualified_symbol.as_deref() == Some(*symbol)
-            })
+            && matches_target_symbol(
+                result.symbol_name.as_deref(),
+                result.qualified_symbol.as_deref(),
+                expected_symbols,
+            )
     });
     let top = results
         .iter()
@@ -387,9 +497,626 @@ fn evaluate(results: &[SearchResult], query: &EvalQuery) -> QueryOutcome {
     QueryOutcome {
         file_rank: file_rank.map(|index| index + 1),
         symbol_rank: symbol_rank.map(|index| index + 1),
-        checks_symbol: !query.expected_symbols.is_empty(),
+        checks_symbol: !expected_symbols.is_empty(),
         top,
     }
+}
+
+/// 对一条标准评测查询求值。
+fn evaluate(results: &[SearchResult], query: &EvalQuery) -> QueryOutcome {
+    evaluate_target(results, query.expected_paths, query.expected_symbols)
+}
+
+/// 一次用户可见上下文构建的质量结果。
+#[derive(Clone, Copy, Default)]
+struct ContextOutcome {
+    /// 是否返回了至少一段有效源码。
+    has_snippet: bool,
+    /// 目标定义是否带有效源码返回。
+    implementation_hit: bool,
+    /// 目标定义是否完整覆盖，且没有因行数上限被截断。
+    complete_implementation: bool,
+    /// 返回片段对目标定义行区间的覆盖率。
+    target_coverage: f64,
+    /// 最终返回的上下文条目数。
+    returned: usize,
+    /// 上下文构建器估算的 token 数。
+    estimated_tokens: u32,
+}
+
+/// 计算两个闭区间的行覆盖率；目标区间非法时返回 0。
+fn line_coverage(target_start: u32, target_end: u32, actual_start: u32, actual_end: u32) -> f64 {
+    if target_start == 0 || target_end < target_start || actual_end < actual_start {
+        return 0.0;
+    }
+    let overlap_start = target_start.max(actual_start);
+    let overlap_end = target_end.min(actual_end);
+    if overlap_end < overlap_start {
+        return 0.0;
+    }
+    let overlap = overlap_end.saturating_sub(overlap_start).saturating_add(1);
+    let target = target_end.saturating_sub(target_start).saturating_add(1);
+    f64::from(overlap) / f64::from(target)
+}
+
+/// 评估用户可见上下文是否真正包含目标实现本体。
+fn evaluate_context(
+    results: &[SearchResult],
+    bundle: &ContextBundle,
+    expected_paths: &[&str],
+    expected_symbols: &[&str],
+) -> ContextOutcome {
+    let target_result = results.iter().find(|result| {
+        matches_target_path(&result.file_path, expected_paths)
+            && matches_target_symbol(
+                result.symbol_name.as_deref(),
+                result.qualified_symbol.as_deref(),
+                expected_symbols,
+            )
+    });
+    let target_entry = bundle.entries.iter().find(|entry| {
+        matches_target_path(&entry.file_path, expected_paths)
+            && matches_target_symbol(
+                entry.symbol_name.as_deref(),
+                entry.qualified_symbol.as_deref(),
+                expected_symbols,
+            )
+    });
+    let implementation_hit = target_entry.is_some_and(|entry| {
+        !entry.snippet.trim().is_empty()
+            && entry.start_line > 0
+            && entry.end_line >= entry.start_line
+    });
+    let target_coverage = match (target_result, target_entry) {
+        (Some(result), Some(entry)) => line_coverage(
+            result.start_line,
+            result.end_line,
+            entry.start_line,
+            entry.end_line,
+        ),
+        _ => 0.0,
+    };
+    let complete_implementation = implementation_hit
+        && target_entry.is_some_and(|entry| !entry.truncated)
+        && target_coverage >= 1.0;
+
+    ContextOutcome {
+        has_snippet: bundle.entries.iter().any(|entry| {
+            !entry.snippet.trim().is_empty()
+                && entry.start_line > 0
+                && entry.end_line >= entry.start_line
+        }),
+        implementation_hit,
+        complete_implementation,
+        target_coverage,
+        returned: bundle.entries.len(),
+        estimated_tokens: bundle.stats.estimated_tokens,
+    }
+}
+
+/// 一次业务查询运行的排名、上下文与耗时记录。
+struct AcceptanceSample {
+    /// Top-10 排名质量。
+    ranking: QueryOutcome,
+    /// 用户可见代码片段质量。
+    context: ContextOutcome,
+    /// Top-10 chunk 身份序列，用于验证可复现性。
+    order: Vec<String>,
+    /// 检索与上下文打包的端到端耗时，单位毫秒。
+    latency_ms: f64,
+}
+
+/// 同一业务查询的多轮运行记录。
+struct AcceptanceMeasurement {
+    /// 固定次数的重复样本。
+    samples: Vec<AcceptanceSample>,
+}
+
+impl AcceptanceMeasurement {
+    /// 返回第一轮样本；评测固定至少运行一次。
+    fn first(&self) -> &AcceptanceSample {
+        self.samples.first().expect("业务查询至少运行一次")
+    }
+
+    /// 判断各轮 Top-1 身份是否完全一致。
+    fn top_1_stable(&self) -> bool {
+        let expected = self.first().order.first();
+        self.samples
+            .iter()
+            .all(|sample| sample.order.first() == expected)
+    }
+
+    /// 判断各轮完整 Top-10 身份与顺序是否完全一致。
+    fn full_order_stable(&self) -> bool {
+        let expected = &self.first().order;
+        self.samples.iter().all(|sample| sample.order == *expected)
+    }
+
+    /// 返回该查询多轮运行的平均耗时。
+    fn average_latency_ms(&self) -> f64 {
+        mean(self.samples.iter().map(|sample| sample.latency_ms))
+    }
+
+    /// 返回该查询多轮运行的 P95 耗时。
+    fn p95_latency_ms(&self) -> f64 {
+        percentile(
+            &self
+                .samples
+                .iter()
+                .map(|sample| sample.latency_ms)
+                .collect::<Vec<_>>(),
+            0.95,
+        )
+    }
+
+    /// 返回逐题表中的成功、部分成功或失败判定。
+    fn verdict(&self) -> &'static str {
+        let first = self.first();
+        if first.ranking.hit_at(1) && first.context.complete_implementation {
+            "命中"
+        } else if first.ranking.hit_at(10) || first.context.implementation_hit {
+            "部分命中"
+        } else {
+            "未命中"
+        }
+    }
+
+    /// 返回可直接指导后续调优的判定原因。
+    fn reason(&self) -> String {
+        let first = self.first();
+        if first.ranking.hit_at(1) && first.context.complete_implementation {
+            return "目标定义位于第一名，正文完整".to_string();
+        }
+        if first.ranking.file_rank.is_none() {
+            return "目标文件未进入 Top-10".to_string();
+        }
+        if first.ranking.symbol_rank.is_none() {
+            return format!(
+                "目标文件位于第 {} 名，但定义未返回",
+                first.ranking.file_rank.expect("已确认文件命中")
+            );
+        }
+        if !first.context.implementation_hit {
+            return format!(
+                "定义位于第 {} 名，但上下文未返回实现正文",
+                first.ranking.symbol_rank.expect("已确认定义命中")
+            );
+        }
+        if !first.context.complete_implementation {
+            return format!(
+                "实现正文覆盖 {:.0}%，存在截断或区间缺失",
+                first.context.target_coverage * 100.0
+            );
+        }
+        format!(
+            "目标实现位于第 {} 名，尚未排到第一",
+            first.ranking.symbol_rank.expect("已确认定义命中")
+        )
+    }
+}
+
+/// 业务验收的重复运行次数。
+const ACCEPTANCE_REPEATS: usize = 3;
+
+/// 对一组有限浮点数求平均值；空输入返回 0。
+fn mean(values: impl Iterator<Item = f64>) -> f64 {
+    let values = values.collect::<Vec<_>>();
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+/// 使用 nearest-rank 规则计算分位数；`p` 会收敛到 0 到 1。
+fn percentile(values: &[f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let p = p.clamp(0.0, 1.0);
+    let rank = (p * sorted.len() as f64).ceil().max(1.0) as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+/// 重复运行八类业务查询，并测量实际检索与上下文打包链路。
+///
+/// `candidate_limit` 应与工具实际交给上下文层的候选数一致：启用远端重排时为 40，其他配置
+/// 为 10。这样指标同时覆盖重排后的候选补位和最终返回上限。
+fn measure_acceptance(
+    plugin: &mut CodeContextPlugin,
+    host: &RepoHost,
+    queries: &[AcceptanceQuery],
+    candidate_limit: usize,
+) -> Vec<AcceptanceMeasurement> {
+    queries
+        .iter()
+        .map(|query| {
+            let samples = (0..ACCEPTANCE_REPEATS)
+                .map(|_| {
+                    let started = Instant::now();
+                    let results = plugin.search_results(host, query.query, None, candidate_limit);
+                    let ranking = evaluate_target(
+                        &results[..results.len().min(RESULT_LIMIT)],
+                        query.expected_paths,
+                        query.expected_symbols,
+                    );
+                    let order = results
+                        .iter()
+                        .take(RESULT_LIMIT)
+                        .map(|result| result.chunk_id.clone())
+                        .collect();
+                    let bundle = build_context(
+                        host,
+                        plugin.structural_index().expect("索引应已建成"),
+                        results.clone(),
+                        &ContextConfig {
+                            max_results: RESULT_LIMIT,
+                            ..ContextConfig::default()
+                        },
+                    );
+                    let context = evaluate_context(
+                        &results,
+                        &bundle,
+                        query.expected_paths,
+                        query.expected_symbols,
+                    );
+                    AcceptanceSample {
+                        ranking,
+                        context,
+                        order,
+                        latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                    }
+                })
+                .collect();
+            AcceptanceMeasurement { samples }
+        })
+        .collect()
+}
+
+/// 八类业务验收的汇总指标。
+#[derive(Default)]
+struct AcceptanceMetrics {
+    /// 查询总数。
+    queries: usize,
+    /// 目标文件进入 Top-10 的数量。
+    hits: usize,
+    /// 目标定义进入 Top-10 的数量。
+    definition_hits: usize,
+    /// 用户可见结果包含目标实现正文的数量。
+    implementation_hits: usize,
+    /// 用户可见结果完整覆盖目标实现的数量。
+    complete_implementations: usize,
+    /// 至少返回一段源码的查询数量。
+    snippet_queries: usize,
+    /// Top-1 可复现的查询数量。
+    stable_top_1: usize,
+    /// 完整 Top-10 身份与顺序可复现的查询数量。
+    stable_full_order: usize,
+    /// 所有重复运行的平均耗时。
+    average_latency_ms: f64,
+    /// 所有重复运行的 P50 耗时。
+    p50_latency_ms: f64,
+    /// 所有重复运行的 P95 耗时。
+    p95_latency_ms: f64,
+    /// 第一轮平均返回上下文条目数。
+    average_returned: f64,
+    /// 第一轮目标实现平均行覆盖率。
+    average_coverage: f64,
+    /// 第一轮上下文平均估算 token 数。
+    average_tokens: f64,
+}
+
+impl AcceptanceMetrics {
+    /// 从逐题重复测量中汇总业务验收指标。
+    fn from_measurements(measurements: &[AcceptanceMeasurement]) -> Self {
+        if measurements.is_empty() {
+            return Self::default();
+        }
+        let latencies = measurements
+            .iter()
+            .flat_map(|measurement| measurement.samples.iter().map(|sample| sample.latency_ms))
+            .collect::<Vec<_>>();
+        Self {
+            queries: measurements.len(),
+            hits: measurements
+                .iter()
+                .filter(|measurement| measurement.first().ranking.hit_at(10))
+                .count(),
+            definition_hits: measurements
+                .iter()
+                .filter(|measurement| measurement.first().ranking.symbol_hit())
+                .count(),
+            implementation_hits: measurements
+                .iter()
+                .filter(|measurement| measurement.first().context.implementation_hit)
+                .count(),
+            complete_implementations: measurements
+                .iter()
+                .filter(|measurement| measurement.first().context.complete_implementation)
+                .count(),
+            snippet_queries: measurements
+                .iter()
+                .filter(|measurement| measurement.first().context.has_snippet)
+                .count(),
+            stable_top_1: measurements
+                .iter()
+                .filter(|measurement| measurement.top_1_stable())
+                .count(),
+            stable_full_order: measurements
+                .iter()
+                .filter(|measurement| measurement.full_order_stable())
+                .count(),
+            average_latency_ms: mean(latencies.iter().copied()),
+            p50_latency_ms: percentile(&latencies, 0.50),
+            p95_latency_ms: percentile(&latencies, 0.95),
+            average_returned: mean(
+                measurements
+                    .iter()
+                    .map(|measurement| measurement.first().context.returned as f64),
+            ),
+            average_coverage: mean(
+                measurements
+                    .iter()
+                    .map(|measurement| measurement.first().context.target_coverage),
+            ),
+            average_tokens: mean(
+                measurements
+                    .iter()
+                    .map(|measurement| f64::from(measurement.first().context.estimated_tokens)),
+            ),
+        }
+    }
+
+    /// 返回计数指标的百分比展示文本。
+    fn rate(&self, count: usize) -> String {
+        if self.queries == 0 {
+            return "—".to_string();
+        }
+        format!(
+            "{count}/{} ({:.1}%)",
+            self.queries,
+            count as f64 / self.queries as f64 * 100.0
+        )
+    }
+}
+
+/// 写入八类业务查询的汇总指标。
+fn write_acceptance_overview(report: &mut String, metrics: &AcceptanceMetrics) {
+    writeln!(report, "## 八类业务式验收\n").expect("写入报告");
+    writeln!(
+        report,
+        "每条查询重复运行 {ACCEPTANCE_REPEATS} 次，延迟包含检索、可选远端重排与上下文打包。\n"
+    )
+    .expect("写入报告");
+    writeln!(report, "| 指标 | 数值 |").expect("写入报告");
+    writeln!(report, "| --- | --- |").expect("写入报告");
+    writeln!(report, "| 业务查询数 | {} |", metrics.queries).expect("写入报告");
+    writeln!(
+        report,
+        "| 命中率（目标文件进入 Top-10） | {} |",
+        metrics.rate(metrics.hits)
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 定义命中率 | {} |",
+        metrics.rate(metrics.definition_hits)
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 实现本体命中率 | {} |",
+        metrics.rate(metrics.implementation_hits)
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 完整实现覆盖率 | {} |",
+        metrics.rate(metrics.complete_implementations)
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 返回有效代码片段 | {} |",
+        metrics.rate(metrics.snippet_queries)
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| Top-1 完全一致率 | {} |",
+        metrics.rate(metrics.stable_top_1)
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| Top-10 身份与顺序完全一致率 | {} |",
+        metrics.rate(metrics.stable_full_order)
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 响应时间平均值 | {:.3} ms |",
+        metrics.average_latency_ms
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 响应时间 P50 | {:.3} ms |",
+        metrics.p50_latency_ms
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 响应时间 P95 | {:.3} ms |",
+        metrics.p95_latency_ms
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 平均返回上下文条目 | {:.2} |",
+        metrics.average_returned
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 目标实现平均行覆盖 | {:.1}% |",
+        metrics.average_coverage * 100.0
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 平均上下文估算 token | {:.0} |",
+        metrics.average_tokens
+    )
+    .expect("写入报告");
+}
+
+/// 写入八类业务查询的逐题结果。
+fn write_acceptance_details(
+    report: &mut String,
+    heading: &str,
+    queries: &[AcceptanceQuery],
+    measurements: &[AcceptanceMeasurement],
+) {
+    writeln!(report, "\n### {heading}\n").expect("写入报告");
+    writeln!(
+        report,
+        "| 类别 | 查询 | 判定 | 文件名次 | 定义名次 | 实现正文 | 行覆盖 | Top-1 稳定 | 全序稳定 | 平均/P95 | 前三结果 | 原因 |"
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    )
+    .expect("写入报告");
+    for (query, measurement) in queries.iter().zip(measurements) {
+        let first = measurement.first();
+        writeln!(
+            report,
+            "| {} | {} | {} | {} | {} | {} | {:.0}% | {} | {} | {:.3}/{:.3} ms | {} | {} |",
+            query.category,
+            query.query,
+            measurement.verdict(),
+            first
+                .ranking
+                .file_rank
+                .map_or("—".to_string(), |rank| rank.to_string()),
+            first
+                .ranking
+                .symbol_rank
+                .map_or("—".to_string(), |rank| rank.to_string()),
+            if first.context.implementation_hit {
+                if first.context.complete_implementation {
+                    "完整"
+                } else {
+                    "部分"
+                }
+            } else {
+                "未返回"
+            },
+            first.context.target_coverage * 100.0,
+            if measurement.top_1_stable() {
+                "是"
+            } else {
+                "否"
+            },
+            if measurement.full_order_stable() {
+                "是"
+            } else {
+                "否"
+            },
+            measurement.average_latency_ms(),
+            measurement.p95_latency_ms(),
+            first.ranking.top.join("、"),
+            measurement.reason(),
+        )
+        .expect("写入报告");
+    }
+}
+
+/// 写入当前实现能够提供与明确不支持的附带信息。
+fn write_capability_boundary(report: &mut String) {
+    writeln!(report, "\n## 附带信息能力边界\n").expect("写入报告");
+    writeln!(report, "| 能力 | 当前状态 | 验收方式 |").expect("写入报告");
+    writeln!(report, "| --- | --- | --- |").expect("写入报告");
+    writeln!(report, "| 文件、行区间、符号、签名 | 支持 | 逐条结果字段 |").expect("写入报告");
+    writeln!(
+        report,
+        "| 实际代码片段 | 支持 | 非空正文、合法行区间与截断标记 |"
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 实现本体而非使用点 | 支持并量化 | 目标路径 + 目标符号 + 正文同时命中 |"
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 调用链 | 不支持 | 当前没有符号引用图或 Call Hierarchy 索引 |"
+    )
+    .expect("写入报告");
+    writeln!(
+        report,
+        "| 影响面 | 不支持 | 当前没有 references、依赖传播或代码图谱 |"
+    )
+    .expect("写入报告");
+}
+
+/// 分位数必须使用稳定的 nearest-rank 规则，并正确处理空样本。
+#[test]
+fn latency_percentile_uses_nearest_rank() {
+    assert_eq!(percentile(&[], 0.95), 0.0);
+    assert_eq!(percentile(&[4.0, 1.0, 3.0, 2.0], 0.50), 2.0);
+    assert_eq!(percentile(&[4.0, 1.0, 3.0, 2.0], 0.95), 4.0);
+}
+
+/// Top-1 稳定与完整排序稳定必须分开统计。
+#[test]
+fn reproducibility_distinguishes_top_1_and_full_order() {
+    let sample = |order: &[&str]| AcceptanceSample {
+        ranking: QueryOutcome {
+            file_rank: Some(1),
+            symbol_rank: Some(1),
+            checks_symbol: true,
+            top: Vec::new(),
+        },
+        context: ContextOutcome::default(),
+        order: order.iter().map(|value| (*value).to_string()).collect(),
+        latency_ms: 1.0,
+    };
+    let same_top = AcceptanceMeasurement {
+        samples: vec![sample(&["a", "b"]), sample(&["a", "c"])],
+    };
+    assert!(same_top.top_1_stable());
+    assert!(!same_top.full_order_stable());
+
+    let changed_top = AcceptanceMeasurement {
+        samples: vec![sample(&["a", "b"]), sample(&["c", "b"])],
+    };
+    assert!(!changed_top.top_1_stable());
+}
+
+/// 行覆盖率必须按目标定义区间计算，不能把任意非空片段算成完整实现。
+#[test]
+fn implementation_line_coverage_tracks_partial_context() {
+    assert_eq!(line_coverage(10, 19, 10, 19), 1.0);
+    assert_eq!(line_coverage(10, 19, 10, 14), 0.5);
+    assert_eq!(line_coverage(10, 19, 20, 25), 0.0);
+}
+
+/// 查询定义、答案和生成报告必须排除，普通产品源码仍进入语料。
+#[test]
+fn evaluation_artifacts_are_excluded_from_corpus() {
+    assert!(is_evaluation_artifact(
+        "examples/plugins/code-context-plugin/tests/retrieval_report.rs"
+    ));
+    assert!(is_evaluation_artifact(
+        "docs/code-context-engine/retrieval-acceptance-2026-09-04.md"
+    ));
+    assert!(!is_evaluation_artifact(
+        "examples/plugins/code-context-plugin/src/retrieval/fusion.rs"
+    ));
 }
 
 /// 一次配置下的汇总指标。
@@ -479,12 +1206,14 @@ fn indexed_plugin(host: &RepoHost) -> CodeContextPlugin {
 
 /// 每条查询取回的结果数。
 const RESULT_LIMIT: usize = 10;
+/// 启用远端重排时交给上下文层的候选数，与生产工具的四倍扩展规则一致。
+const RERANK_CONTEXT_CANDIDATE_LIMIT: usize = 40;
 
 /// 生成报告：逐类型汇总 + 逐题明细。
 #[test]
 fn retrieval_quality_report() {
     let root = repository_root();
-    let files = collect_repository_files(&root);
+    let files = collect_evaluation_files(&root);
     assert!(!files.is_empty(), "仓库中应有可索引文件");
     let file_refs: Vec<(&str, &str)> = files
         .iter()
@@ -500,6 +1229,10 @@ fn retrieval_quality_report() {
         let results = plugin.search_results(&host, query.query, None, RESULT_LIMIT);
         outcomes.push(evaluate(&results, query));
     }
+    let acceptance_queries = acceptance_queries();
+    let acceptance_measurements =
+        measure_acceptance(&mut plugin, &host, &acceptance_queries, RESULT_LIMIT);
+    let acceptance_metrics = AcceptanceMetrics::from_measurements(&acceptance_measurements);
 
     let mut report = String::new();
     writeln!(report, "\n# Code Context 检索质量报告\n").expect("写入报告");
@@ -524,6 +1257,14 @@ fn retrieval_quality_report() {
     writeln!(report, "| MRR | {:.3} |", overall.mrr).expect("写入报告");
     writeln!(report, "| 定义命中率 | {} |", overall.definition_rate()).expect("写入报告");
 
+    write_acceptance_overview(&mut report, &acceptance_metrics);
+    write_acceptance_details(
+        &mut report,
+        "逐题结果",
+        &acceptance_queries,
+        &acceptance_measurements,
+    );
+
     // --- 按查询类型 ---
     let mut grouped: BTreeMap<QueryKind, Vec<usize>> = BTreeMap::new();
     for (index, query) in queries.iter().enumerate() {
@@ -539,12 +1280,7 @@ fn retrieval_quality_report() {
     for (kind, indexes) in &grouped {
         let subset: Vec<QueryOutcome> = indexes
             .iter()
-            .map(|index| QueryOutcome {
-                file_rank: outcomes[*index].file_rank,
-                symbol_rank: outcomes[*index].symbol_rank,
-                checks_symbol: outcomes[*index].checks_symbol,
-                top: Vec::new(),
-            })
+            .map(|index| outcomes[*index].clone())
             .collect();
         let metrics = Metrics::from_outcomes(&subset);
         writeln!(
@@ -586,6 +1322,8 @@ fn retrieval_quality_report() {
         .expect("写入报告");
     }
 
+    write_capability_boundary(&mut report);
+
     println!("{report}");
 
     // 报告本身也是门禁：整体 Recall@5 跌破 0.7 说明检索链路出了结构性问题。
@@ -619,6 +1357,20 @@ struct Ablation {
     semantic: bool,
     /// 是否启用模型重排。
     rerank: bool,
+}
+
+/// 一组消融配置的质量、分类与业务验收结果。
+struct AblationReportRow {
+    /// 报告中展示的配置名称。
+    label: &'static str,
+    /// 32 条标准查询的总体指标。
+    metrics: Metrics,
+    /// 标准查询按类型分组后的指标。
+    by_kind: BTreeMap<QueryKind, Metrics>,
+    /// 八类业务查询的逐题重复测量。
+    acceptance: Vec<AcceptanceMeasurement>,
+    /// 八类业务查询的汇总指标。
+    acceptance_metrics: AcceptanceMetrics,
 }
 
 /// 构造带嵌入与重排配置的激活上下文。
@@ -706,12 +1458,13 @@ fn retrieval_ablation_report() {
         panic!("请设置 {API_KEY_ENV} 后再运行消融对比");
     };
     let root = repository_root();
-    let files = collect_repository_files(&root);
+    let files = collect_evaluation_files(&root);
     let file_refs: Vec<(&str, &str)> = files
         .iter()
         .map(|(path, content)| (path.as_str(), content.as_str()))
         .collect();
     let queries = eval_queries();
+    let acceptance_queries = acceptance_queries();
 
     let ablations = [
         Ablation {
@@ -731,7 +1484,7 @@ fn retrieval_ablation_report() {
         },
     ];
 
-    let mut rows: Vec<(&'static str, Metrics, BTreeMap<QueryKind, Metrics>)> = Vec::new();
+    let mut rows = Vec::new();
     for ablation in &ablations {
         eprintln!("[消融] 正在运行配置：{}", ablation.label);
         let host =
@@ -786,7 +1539,25 @@ fn retrieval_ablation_report() {
                 .collect();
             by_kind.insert(kind, Metrics::from_outcomes(&subset));
         }
-        rows.push((ablation.label, Metrics::from_outcomes(&outcomes), by_kind));
+        let context_candidate_limit = if ablation.rerank {
+            RERANK_CONTEXT_CANDIDATE_LIMIT
+        } else {
+            RESULT_LIMIT
+        };
+        let acceptance = measure_acceptance(
+            &mut plugin,
+            &host,
+            &acceptance_queries,
+            context_candidate_limit,
+        );
+        let acceptance_metrics = AcceptanceMetrics::from_measurements(&acceptance);
+        rows.push(AblationReportRow {
+            label: ablation.label,
+            metrics: Metrics::from_outcomes(&outcomes),
+            by_kind,
+            acceptance,
+            acceptance_metrics,
+        });
     }
 
     let mut report = String::new();
@@ -799,27 +1570,42 @@ fn retrieval_ablation_report() {
     writeln!(report, "## 总体\n").expect("写入报告");
     writeln!(
         report,
-        "| 配置 | Recall@1 | Recall@5 | Recall@10 | MRR | 定义命中 |"
+        "| 配置 | Recall@1 | Recall@5 | Recall@10 | MRR | 定义命中 | 业务命中 | 实现本体 | Top-1 稳定 | 全序稳定 | 平均/P50/P95 |"
     )
     .expect("写入报告");
-    writeln!(report, "| --- | --- | --- | --- | --- | --- |").expect("写入报告");
-    for (label, metrics, _) in &rows {
+    writeln!(
+        report,
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    )
+    .expect("写入报告");
+    for row in &rows {
         writeln!(
             report,
-            "| {label} | {:.3} | {:.3} | {:.3} | {:.3} | {} |",
-            metrics.recall_1,
-            metrics.recall_5,
-            metrics.recall_10,
-            metrics.mrr,
-            metrics.definition_rate()
+            "| {} | {:.3} | {:.3} | {:.3} | {:.3} | {} | {} | {} | {} | {} | {:.3}/{:.3}/{:.3} ms |",
+            row.label,
+            row.metrics.recall_1,
+            row.metrics.recall_5,
+            row.metrics.recall_10,
+            row.metrics.mrr,
+            row.metrics.definition_rate(),
+            row.acceptance_metrics.rate(row.acceptance_metrics.hits),
+            row.acceptance_metrics
+                .rate(row.acceptance_metrics.implementation_hits),
+            row.acceptance_metrics
+                .rate(row.acceptance_metrics.stable_top_1),
+            row.acceptance_metrics
+                .rate(row.acceptance_metrics.stable_full_order),
+            row.acceptance_metrics.average_latency_ms,
+            row.acceptance_metrics.p50_latency_ms,
+            row.acceptance_metrics.p95_latency_ms,
         )
         .expect("写入报告");
     }
 
     writeln!(report, "\n## 按查询类型的 Recall@1\n").expect("写入报告");
     write!(report, "| 查询类型 |").expect("写入报告");
-    for (label, _, _) in &rows {
-        write!(report, " {label} |").expect("写入报告");
+    for row in &rows {
+        write!(report, " {} |", row.label).expect("写入报告");
     }
     writeln!(report).expect("写入报告");
     writeln!(report, "| --- |{}", " --- |".repeat(rows.len())).expect("写入报告");
@@ -831,11 +1617,17 @@ fn retrieval_ablation_report() {
         QueryKind::Conceptual,
     ] {
         write!(report, "| {} |", kind.label()).expect("写入报告");
-        for (_, _, by_kind) in &rows {
-            write!(report, " {:.2} |", by_kind[&kind].recall_1).expect("写入报告");
+        for row in &rows {
+            write!(report, " {:.2} |", row.by_kind[&kind].recall_1).expect("写入报告");
         }
         writeln!(report).expect("写入报告");
     }
+
+    writeln!(report, "\n## 八类业务式逐题对比\n").expect("写入报告");
+    for row in &rows {
+        write_acceptance_details(&mut report, row.label, &acceptance_queries, &row.acceptance);
+    }
+    write_capability_boundary(&mut report);
 
     println!("{report}");
 }
@@ -849,7 +1641,7 @@ fn retrieval_ablation_report() {
 fn semantic_channel_diagnosis() {
     let api_key = std::env::var(API_KEY_ENV).expect("需要 API 密钥");
     let root = repository_root();
-    let files = collect_repository_files(&root);
+    let files = collect_evaluation_files(&root);
     let file_refs: Vec<(&str, &str)> = files
         .iter()
         .map(|(path, content)| (path.as_str(), content.as_str()))
@@ -919,7 +1711,7 @@ fn semantic_channel_diagnosis() {
 #[test]
 fn chunk_size_distribution() {
     let root = repository_root();
-    let files = collect_repository_files(&root);
+    let files = collect_evaluation_files(&root);
     let file_refs: Vec<(&str, &str)> = files
         .iter()
         .map(|(path, content)| (path.as_str(), content.as_str()))
@@ -1011,7 +1803,7 @@ fn chunk_size_distribution() {
 fn chinese_query_failure_analysis() {
     let api_key = std::env::var(API_KEY_ENV).expect("需要 API 密钥");
     let root = repository_root();
-    let files = collect_repository_files(&root);
+    let files = collect_evaluation_files(&root);
     let file_refs: Vec<(&str, &str)> = files
         .iter()
         .map(|(path, content)| (path.as_str(), content.as_str()))
