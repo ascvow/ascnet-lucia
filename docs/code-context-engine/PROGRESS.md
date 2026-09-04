@@ -1001,6 +1001,11 @@ Implemented:
   chunk ID，避免集合遍历顺序造成漂移。当前没有 references graph，`CallSite` 只保留协议角色，
   不伪造调用链结果。Phase 3 验证：角色推导 2 项、fusion 32 项、Context 24 项、rerank 5 项
   全部通过。
+- **强命中保护与有界模型增量**：远端相关度不再覆盖本地融合分，而是按本地/模型名次差施加
+  最多 0.75 个 rank-1 当量的有界增量。最强限定名精确命中保持 Top-1，最强精确短名保持
+  Top-3，强 lexical + implementation 候选保持 Top-5；同名重载只保护本地最强候选，避免多个
+  候选争抢同一位置。每条结果记录模型原始相关度与实际增量，便于归因。Phase 4 验证：
+  rerank 7 项全部通过，`cargo check -p code-context-plugin` 通过。
 
 Scale Result（Lucia 当前仓库）:
 - 原子代码块 6641 个，语义复合块 262 个，其中 970 个原子块由复合块代表。

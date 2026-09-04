@@ -3,7 +3,9 @@
 //! 混合检索负责高召回，rerank 模型负责理解自然语言问题与候选源码之间的整体相关性。
 //! 远端不可用时由调用方保留原有融合顺序，因此模型重排始终是可降级的质量增强项。
 
-use crate::retrieval::SearchResult;
+use crate::retrieval::{
+    AnalyzedQuery, CandidateSource, ChunkRole, QueryGoal, QueryIntent, SearchResult, SymbolMatch,
+};
 use agent_plugin::{HttpRequest, PluginHostApi};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -15,6 +17,12 @@ const MAX_RERANK_CANDIDATES: usize = 48;
 ///
 /// 与 [`crate::retrieval::FusionConfig`] 取同一个值，使两处"排名融合"的量级一致。
 const RRF_K: f32 = 60.0;
+
+/// 模型重排允许施加的最大分数增量。
+///
+/// 取 0.75 个 rank-1 当量：足以区分本地分数接近的困难候选，但不足以覆盖精确符号、角色与
+/// 多路一致性已经建立的强本地证据。
+const MAX_RERANK_DELTA: f32 = 0.75 / (RRF_K + 1.0);
 
 /// 每条候选最多携带的源码字符数。
 ///
@@ -79,7 +87,7 @@ pub(crate) fn rerank_results(
             truncate_for_message(&response.body)
         ));
     }
-    apply_response(&response.body, results.to_vec())
+    apply_response(&response.body, query, results.to_vec())
 }
 
 /// 构造一条供模型判断的候选文档。
@@ -127,8 +135,47 @@ fn candidate_document(
     document
 }
 
-/// 把 rerank 响应映射回候选并按模型分数排序。
-fn apply_response(body: &str, results: Vec<SearchResult>) -> Result<Vec<SearchResult>, String> {
+/// 候选需要保留的最低排名保护级别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateProtection {
+    /// 精确限定名命中，最强保护。
+    ExactQualified,
+    /// 精确短名或高置信度定义命中。
+    ExactSymbol,
+    /// 强词法与实现角色共同命中。
+    StrongImplementation,
+    /// 不需要排名保护。
+    None,
+}
+
+impl CandidateProtection {
+    /// 返回该保护级别允许的最差零基排名。
+    fn rank_floor(self) -> Option<usize> {
+        match self {
+            Self::ExactQualified => Some(0),
+            Self::ExactSymbol => Some(2),
+            Self::StrongImplementation => Some(4),
+            Self::None => None,
+        }
+    }
+}
+
+/// 模型调整后的一条候选及其稳定决胜信息。
+struct RerankedResult {
+    /// 模型原始相关度。
+    relevance: f32,
+    /// 模型重排前的本地名次。
+    local_rank: usize,
+    /// 已施加有界增量的候选。
+    result: SearchResult,
+}
+
+/// 把 rerank 响应映射回候选，并在本地融合分上施加有界调整。
+fn apply_response(
+    body: &str,
+    query: &str,
+    results: Vec<SearchResult>,
+) -> Result<Vec<SearchResult>, String> {
     /// 端点返回的一条重排结果。
     #[derive(Deserialize)]
     struct RerankItem {
@@ -159,6 +206,7 @@ fn apply_response(body: &str, results: Vec<SearchResult>) -> Result<Vec<SearchRe
         ));
     }
 
+    let protections = strongest_protections(query, &results);
     let mut seen = HashSet::with_capacity(expected);
     let mut slots: Vec<Option<SearchResult>> = results.into_iter().map(Some).collect();
     // 先按模型分数排出模型自己的名次，再与本地融合名次做一次 RRF。
@@ -180,37 +228,151 @@ fn apply_response(body: &str, results: Vec<SearchResult>) -> Result<Vec<SearchRe
     }
     model_order.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
 
+    let denominator = expected.saturating_sub(1).max(1) as f32;
     let mut scored = Vec::with_capacity(expected);
     for (model_rank, (relevance, index)) in model_order.into_iter().enumerate() {
         let mut result = slots
             .get_mut(index)
             .and_then(Option::take)
             .ok_or_else(|| format!("rerank 响应的 index {index} 重复"))?;
-        // `results` 传入时已按本地融合分降序，因此下标即本地名次。
-        let fused = rrf_score(index) + rrf_score(model_rank);
-        result.score = relevance;
-        scored.push((fused, relevance, result));
+        // `results` 传入时已按本地融合分降序，因此下标即本地名次。模型只能按名次差施加
+        // 有界增量，不能把原始相关度直接覆盖本地结构分。
+        let rank_shift = (index as f32 - model_rank as f32) / denominator;
+        let delta = rank_shift.clamp(-1.0, 1.0) * MAX_RERANK_DELTA;
+        result.score += delta;
+        result.debug.model_rerank_score = Some(relevance);
+        result.debug.model_rerank_delta = delta;
+        scored.push(RerankedResult {
+            relevance,
+            local_rank: index,
+            result,
+        });
     }
 
-    // 与模型分数直接排序的区别：本地融合名次仍占一半权重。rerank 模型对代码的判断并不
-    // 总是可靠，一旦它把正确结果压到末位，纯模型排序会让本来正确的顺序被整体摧毁；
-    // 排名融合则要求两边都认为不相关，才会真的沉下去。
+    // 分数之后使用模型分、原本本地名次、路径、符号与 chunk ID 稳定决胜。
     scored.sort_by(|left, right| {
         right
-            .0
-            .total_cmp(&left.0)
-            .then_with(|| right.1.total_cmp(&left.1))
-            .then_with(|| left.2.chunk_id.cmp(&right.2.chunk_id))
+            .result
+            .score
+            .total_cmp(&left.result.score)
+            .then_with(|| right.relevance.total_cmp(&left.relevance))
+            .then_with(|| left.local_rank.cmp(&right.local_rank))
+            .then_with(|| left.result.file_path.cmp(&right.result.file_path))
+            .then_with(|| {
+                left.result
+                    .qualified_symbol
+                    .as_deref()
+                    .or(left.result.symbol_name.as_deref())
+                    .cmp(
+                        &right
+                            .result
+                            .qualified_symbol
+                            .as_deref()
+                            .or(right.result.symbol_name.as_deref()),
+                    )
+            })
+            .then_with(|| left.result.chunk_id.cmp(&right.result.chunk_id))
     });
-    Ok(scored.into_iter().map(|(_, _, result)| result).collect())
+    apply_rank_floors(&mut scored, &protections);
+    Ok(scored.into_iter().map(|item| item.result).collect())
 }
 
-/// 返回名次对应的 RRF 分量；`rank` 从 0 开始。
-///
-/// 与融合层使用同一个平滑常量 60，使"本地第一 + 模型末位"与"本地末位 + 模型第一"
-/// 得到对称的处理。
-fn rrf_score(rank: usize) -> f32 {
-    1.0 / (RRF_K + rank as f32 + 1.0)
+/// 计算候选的强命中保护级别。
+fn protection_of(query: &AnalyzedQuery, result: &SearchResult) -> CandidateProtection {
+    let identifier_matches = query.identifiers.iter().any(|identifier| {
+        result
+            .symbol_name
+            .as_deref()
+            .is_some_and(|symbol| symbol.eq_ignore_ascii_case(identifier))
+            || result
+                .qualified_symbol
+                .as_deref()
+                .is_some_and(|symbol| symbol.eq_ignore_ascii_case(identifier))
+    });
+    if query.intent == QueryIntent::QualifiedSymbol
+        && result.debug.symbol_match == Some(SymbolMatch::ExactQualified)
+        && identifier_matches
+    {
+        return CandidateProtection::ExactQualified;
+    }
+    if matches!(
+        query.intent,
+        QueryIntent::Identifier | QueryIntent::QualifiedSymbol | QueryIntent::Mixed
+    ) && matches!(
+        result.debug.symbol_match,
+        Some(SymbolMatch::ExactQualified | SymbolMatch::ExactName)
+    ) && identifier_matches
+    {
+        return CandidateProtection::ExactSymbol;
+    }
+    let lexical_rank = result
+        .debug
+        .ranks
+        .iter()
+        .find_map(|(source, rank)| (*source == CandidateSource::Lexical).then_some(*rank));
+    let symbol_rank = result
+        .debug
+        .ranks
+        .iter()
+        .find_map(|(source, rank)| (*source == CandidateSource::Symbol).then_some(*rank));
+    let metadata_coverage = if result.debug.rerank_query_tokens == 0 {
+        0.0
+    } else {
+        result.debug.rerank_matched_tokens as f32 / result.debug.rerank_query_tokens as f32
+    };
+    if matches!(query.goal, QueryGoal::Implementation | QueryGoal::Behavior)
+        && result.role == ChunkRole::Implementation
+        && lexical_rank.is_some_and(|rank| rank <= 3)
+        && (symbol_rank.is_some_and(|rank| rank <= 5) || metadata_coverage >= 0.5)
+    {
+        return CandidateProtection::StrongImplementation;
+    }
+    CandidateProtection::None
+}
+
+/// 从本地顺序选择每类最强候选，避免多个同名重载争抢同一个保护位置。
+fn strongest_protections(query: &str, results: &[SearchResult]) -> Vec<(String, usize)> {
+    let analyzed = AnalyzedQuery::analyze(query);
+    let mut selected = Vec::new();
+    for level in [
+        CandidateProtection::ExactQualified,
+        CandidateProtection::ExactSymbol,
+        CandidateProtection::StrongImplementation,
+    ] {
+        let Some(result) = results
+            .iter()
+            .find(|result| protection_of(&analyzed, result) == level)
+        else {
+            continue;
+        };
+        if selected
+            .iter()
+            .any(|(chunk_id, _)| chunk_id == &result.chunk_id)
+        {
+            continue;
+        }
+        if let Some(floor) = level.rank_floor() {
+            selected.push((result.chunk_id.clone(), floor));
+        }
+    }
+    selected
+}
+
+/// 把受保护候选移回允许的最差排名，其他候选保持当前相对顺序。
+fn apply_rank_floors(results: &mut Vec<RerankedResult>, protections: &[(String, usize)]) {
+    for (chunk_id, floor) in protections {
+        let Some(position) = results
+            .iter()
+            .position(|item| item.result.chunk_id == *chunk_id)
+        else {
+            continue;
+        };
+        if position <= *floor {
+            continue;
+        }
+        let item = results.remove(position);
+        results.insert((*floor).min(results.len()), item);
+    }
 }
 
 /// 读取闭区间行范围；范围失效时返回 `None`。
@@ -264,6 +426,8 @@ mod tests {
                 path_boost: 0.0,
                 rerank_boost: 0.0,
                 role_boost: 0.0,
+                model_rerank_score: None,
+                model_rerank_delta: 0.0,
                 penalty: 0.0,
                 rerank_matched_tokens: 0,
                 rerank_query_tokens: 0,
@@ -273,7 +437,7 @@ mod tests {
         }
     }
 
-    /// 模型分数必须成为最终排序依据，并且请求必须包含真实源码。
+    /// 模型分数应能重排本地分接近的候选，并且请求必须包含真实源码。
     #[test]
     fn model_score_reorders_candidates_with_source_documents() {
         let host = RepoHost::new(&[(
@@ -290,14 +454,15 @@ mod tests {
             "Qwen/Qwen3-Reranker-4B",
             "Agent 怎么进行对话",
             &[
-                result("first", "unrelated", 1, 0.9),
-                result("second", "prepare_session", 3, 0.2),
+                result("first", "unrelated", 1, 0.020),
+                result("second", "prepare_session", 3, 0.019),
             ],
         )
         .expect("模型重排应成功");
 
         assert_eq!(reranked[0].chunk_id, "second");
-        assert_eq!(reranked[0].score, 0.93);
+        assert_eq!(reranked[0].debug.model_rerank_score, Some(0.93));
+        assert!(reranked[0].debug.model_rerank_delta > 0.0);
         let requests = host.http_requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].path, "rerank");
@@ -316,6 +481,7 @@ mod tests {
     fn incomplete_response_is_rejected() {
         let error = apply_response(
             r#"{"results":[{"index":0,"relevance_score":0.9}]}"#,
+            "候选排序",
             vec![
                 result("first", "first", 1, 0.2),
                 result("second", "second", 2, 0.1),
@@ -332,9 +498,10 @@ mod tests {
     /// 只有两边都认为不相关的候选才会真的沉下去。
     #[test]
     fn hostile_model_cannot_bury_the_local_top_result() {
-        let candidates: Vec<SearchResult> = (0..8)
+        let mut candidates: Vec<SearchResult> = (0..8)
             .map(|index| result(&format!("chunk-{index}"), &format!("symbol{index}"), 1, 1.0))
             .collect();
+        candidates[0].debug.symbol_match = Some(SymbolMatch::ExactName);
         // 模型给出与本地完全相反的顺序。
         let items: Vec<String> = (0..8)
             .map(|index| {
@@ -347,6 +514,7 @@ mod tests {
 
         let reranked = apply_response(
             &format!(r#"{{"results":[{}]}}"#, items.join(",")),
+            "symbol0",
             candidates,
         )
         .expect("重排应成功");
@@ -356,8 +524,68 @@ mod tests {
             .position(|item| item.chunk_id == "chunk-0")
             .expect("本地第一名必须仍在结果中");
         assert!(
-            position < 4,
-            "本地第一名被模型判为最差时仍应留在前半段，实际排在第 {}",
+            position <= 2,
+            "精确符号被模型判为最差时仍应留在 Top-3，实际排在第 {}",
+            position + 1
+        );
+    }
+
+    /// 精确限定名即使被模型判为最差，也必须保持第一名。
+    #[test]
+    fn exact_qualified_symbol_keeps_top_one_rank_floor() {
+        let mut candidates = vec![
+            result("qualified", "remove_chunks", 1, 0.02),
+            result("other", "remove_file", 4, 0.019),
+            result("third", "search", 7, 0.018),
+        ];
+        candidates[0].debug.symbol_match = Some(SymbolMatch::ExactQualified);
+        let reranked = apply_response(
+            r#"{"results":[
+                {"index":2,"relevance_score":0.9},
+                {"index":1,"relevance_score":0.8},
+                {"index":0,"relevance_score":0.0}
+            ]}"#,
+            "Agent::remove_chunks",
+            candidates,
+        )
+        .expect("重排应成功");
+
+        assert_eq!(reranked[0].chunk_id, "qualified");
+    }
+
+    /// 强词法与实现角色共同命中时，模型不得把候选移出 Top-5 保护窗口。
+    #[test]
+    fn strong_implementation_hit_keeps_protected_window() {
+        let mut candidates: Vec<SearchResult> = (0..8)
+            .map(|index| result(&format!("chunk-{index}"), &format!("symbol{index}"), 1, 1.0))
+            .collect();
+        candidates[0].debug.ranks =
+            vec![(CandidateSource::Lexical, 1), (CandidateSource::Symbol, 3)];
+        candidates[0].debug.rerank_matched_tokens = 2;
+        candidates[0].debug.rerank_query_tokens = 3;
+        let items: Vec<String> = (0..8)
+            .map(|index| {
+                format!(
+                    r#"{{"index":{index},"relevance_score":{:.2}}}"#,
+                    index as f32 / 10.0
+                )
+            })
+            .collect();
+
+        let reranked = apply_response(
+            &format!(r#"{{"results":[{}]}}"#, items.join(",")),
+            "插件管理页面怎么绘制",
+            candidates,
+        )
+        .expect("重排应成功");
+
+        let position = reranked
+            .iter()
+            .position(|item| item.chunk_id == "chunk-0")
+            .expect("强实现候选必须仍在结果中");
+        assert!(
+            position <= 4,
+            "强实现候选应保持 Top-5，实际第 {}",
             position + 1
         );
     }
@@ -376,6 +604,7 @@ mod tests {
                 {"index":2,"relevance_score":0.7},
                 {"index":3,"relevance_score":0.0}
             ]}"#,
+            "候选排序",
             candidates,
         )
         .expect("重排应成功");

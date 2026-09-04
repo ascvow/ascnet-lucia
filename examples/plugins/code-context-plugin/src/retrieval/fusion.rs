@@ -176,6 +176,10 @@ pub struct FusionDebug {
     pub rerank_boost: f32,
     /// 代码角色与查询目标匹配产生的实际加成。
     pub role_boost: f32,
+    /// 远端模型返回的原始相关度；未执行模型重排时为 `None`。
+    pub model_rerank_score: Option<f32>,
+    /// 模型重排对本地融合分施加的有界增量。
+    pub model_rerank_delta: f32,
     /// 测试代码与过短代码块产生的实际扣分。
     ///
     /// 与各项加成一样进入诊断：分数必须能被完整拆解，否则调参只能靠猜。
@@ -215,6 +219,12 @@ impl FusionDebug {
                 "角色提升 {} {:.3}",
                 self.role.as_str(),
                 self.role_boost
+            ));
+        }
+        if let Some(score) = self.model_rerank_score {
+            parts.push(format!(
+                "模型重排 {:.3} 增量 {:+.3}",
+                score, self.model_rerank_delta
             ));
         }
         if self.penalty > 0.0 {
@@ -394,6 +404,8 @@ pub fn fuse(
                     path_boost,
                     rerank_boost,
                     role_boost,
+                    model_rerank_score: None,
+                    model_rerank_delta: 0.0,
                     penalty,
                     rerank_matched_tokens: rerank.matched_tokens,
                     rerank_query_tokens: rerank.query_tokens,
