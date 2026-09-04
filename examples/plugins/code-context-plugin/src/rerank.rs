@@ -121,15 +121,25 @@ pub(crate) fn assess_confidence(
     }
 }
 
+/// Top-1 与 Top-2 的相对分差低于该值时，才认为候选之间真正无法区分。
+///
+/// 16 条真实任务查询的 A/B 显示，模型重排在 Recall@1 与 Recall@3 上**零收益**，MRR 只差
+/// 0.003，唯一改善是 Recall@10 多一条；代价是平均延迟从 359 ms 涨到 887 ms。因此它不该
+/// 在三分之一的查询上默认触发。取 0.05：Top-1 与 Top-2 相差不到 5% 才算本地分不出高下。
+const AMBIGUOUS_TOP_MARGIN: f32 = 0.05;
+
 /// 判断本次查询是否需要调用远端模型重排。
 ///
-/// 只有自然语言或混合查询、候选多于一条、本地置信度低，**且 Top-1 缺少多路佐证**时才
-/// 返回 `true`。
+/// 前三个条件是门槛：自然语言或混合查询、候选多于一条、本地置信度低且 Top-1 缺少多路
+/// 佐证。在此之上还要出现**两种"本地确实没判对"的迹象之一**：
 ///
-/// 最后一条是实测加上的：低置信度只说明"本地没把握"，不等于"模型能做得更好"。当 Top-1
-/// 已被两路及以上召回器共同选中时，本地排序已有相互独立的证据支撑，此时再花一次远端
-/// 往返，模型往往只是把正确结果往下压——实测中一条中文查询的三个候选拿到的增量全是负值，
-/// 其中语义第一名被压得最狠，净效果是多付一秒并让排序变差。
+/// - Top-1 与 Top-2 的分差小到分不出高下；
+/// - 存在角色冲突，即 Top-1 的代码角色不匹配查询目标而候选池里存在匹配的（典型形态是
+///   说明文档压过了真正的实现）。
+///
+/// 第三条来自实测：低置信度只说明"本地没把握"，不等于"模型能做得更好"——Top-1 已被两路
+/// 召回器共同选中时，再花一次远端往返，模型往往只是把正确结果往下压。最后一组条件同样
+/// 来自实测：把重排收敛到"本地确实判错或分不出"的场合，才对得起它 2.5 倍的延迟代价。
 pub(crate) fn should_rerank(
     query: &AnalyzedQuery,
     candidates: &[SearchResult],
@@ -138,6 +148,7 @@ pub(crate) fn should_rerank(
     candidates.len() > 1
         && confidence.level == ConfidenceLevel::Low
         && !confidence.multi_channel_top
+        && (confidence.top_margin < AMBIGUOUS_TOP_MARGIN || confidence.role_conflict)
         && matches!(
             query.intent,
             QueryIntent::NaturalLanguage | QueryIntent::Mixed

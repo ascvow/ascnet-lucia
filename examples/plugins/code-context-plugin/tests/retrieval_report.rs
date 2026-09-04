@@ -2025,3 +2025,248 @@ fn semantic_regression_stage_localization() {
         }
     }
 }
+
+// ===========================================================================
+// 真实使用场景评测
+// ===========================================================================
+
+/// 一条模拟真实使用的查询。
+///
+/// 与 `eval_queries` 的区别是**出发点**：那一组按查询与目标的词面距离分层，用来定位
+/// 检索链路的哪一段失效；这一组模拟 Coding Agent 在真实任务里会问什么——改代码前先定位、
+/// 排查问题时找实现、理解系统时问机制。措辞刻意保持随意，包含"的函数""怎么弄的"这类
+/// 真实但不精确的说法。
+struct ScenarioQuery {
+    /// 触发这次检索的真实任务。
+    task: &'static str,
+    /// 实际提交的查询串。
+    query: &'static str,
+    /// 目标文件路径子串。
+    expected_paths: &'static [&'static str],
+}
+
+/// 覆盖定位、排查与理解三类任务的真实场景查询。
+fn scenario_queries() -> Vec<ScenarioQuery> {
+    vec![
+        ScenarioQuery {
+            task: "改审批逻辑前先定位",
+            query: "工具调用的权限是怎么校验的",
+            expected_paths: &["agent-core/kernel/src/agent/run.rs"],
+        },
+        ScenarioQuery {
+            task: "加一种只读工具时确认并发规则",
+            query: "哪些工具调用可以并发执行",
+            expected_paths: &["agent-core/kernel/src/agent/run.rs"],
+        },
+        ScenarioQuery {
+            task: "排查取消没生效",
+            query: "取消请求是在哪里被消费的",
+            expected_paths: &[
+                "agent-core/kernel/src/agent/run.rs",
+                "agent-core/runtime/src/runtime/mod.rs",
+            ],
+        },
+        ScenarioQuery {
+            task: "理解流式输出",
+            query: "模型返回的流式增量怎么处理",
+            expected_paths: &["agent-core/kernel/src/model/stream.rs"],
+        },
+        ScenarioQuery {
+            task: "改会话存储",
+            query: "会话是怎么保存下来的",
+            expected_paths: &["agent-core/session/", "agent-tui/src/session/"],
+        },
+        ScenarioQuery {
+            task: "加新插件能力前看现有实现",
+            query: "插件怎么把工具注册给模型",
+            expected_paths: &["agent-plugins/host/src/", "agent-plugins/sdk/src/lib.rs"],
+        },
+        ScenarioQuery {
+            task: "排查插件网络请求被拒",
+            query: "插件的 HTTP 请求头是怎么过滤的",
+            expected_paths: &["agent-plugins/host/src/capability/http.rs"],
+        },
+        ScenarioQuery {
+            task: "理解 WASM 沙箱边界",
+            query: "插件能力是怎么被限制的",
+            expected_paths: &["agent-plugins/host/src/capability/"],
+        },
+        ScenarioQuery {
+            task: "改索引构建",
+            query: "索引是怎么分批构建的",
+            expected_paths: &["code-context-plugin/src/index/build.rs"],
+        },
+        ScenarioQuery {
+            task: "排查某文件没被索引",
+            query: "怎么决定一个文件要不要索引",
+            expected_paths: &["code-context-plugin/src/repository/"],
+        },
+        ScenarioQuery {
+            task: "改忽略规则",
+            query: "gitignore 的匹配是怎么实现的",
+            expected_paths: &["code-context-plugin/src/repository/ignore.rs"],
+        },
+        ScenarioQuery {
+            task: "理解向量落盘",
+            query: "向量存到磁盘上的函数",
+            expected_paths: &["code-context-plugin/src/sqlite_vector.rs"],
+        },
+        ScenarioQuery {
+            task: "排查重排超时",
+            query: "重排失败之后怎么降级",
+            expected_paths: &["code-context-plugin/src/rerank.rs"],
+        },
+        ScenarioQuery {
+            task: "改切块粒度",
+            query: "源码是怎么切成代码块的",
+            expected_paths: &["code-context-plugin/src/parser/"],
+        },
+        ScenarioQuery {
+            task: "理解检索排序",
+            query: "多路召回的结果怎么合成一个排名",
+            expected_paths: &["code-context-plugin/src/retrieval/fusion.rs"],
+        },
+        ScenarioQuery {
+            task: "改上下文预算",
+            query: "返回给模型的代码片段怎么控制大小",
+            expected_paths: &["code-context-plugin/src/context/"],
+        },
+    ]
+}
+
+/// 真实场景评测：模拟 Coding Agent 的实际提问方式。
+///
+/// 需要网络与 `SILICONFLOW_API_KEY`；默认忽略：
+///
+/// ```sh
+/// SILICONFLOW_API_KEY=sk-... cargo test -p code-context-plugin --features test-support \
+///     --test retrieval_report scenario -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "需要网络与嵌入 API 密钥"]
+fn agent_scenario_report() {
+    let api_key = std::env::var(API_KEY_ENV).expect("需要 API 密钥");
+    let root = repository_root();
+    let files = collect_evaluation_files(&root);
+    let file_refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    let queries = scenario_queries();
+    for ablation in [
+        Ablation {
+            label: "语义 + 条件重排",
+            semantic: true,
+            rerank: true,
+        },
+        Ablation {
+            label: "仅语义（无重排）",
+            semantic: true,
+            rerank: false,
+        },
+    ] {
+        let host =
+            RepoHost::new(&file_refs).with_http_handler(forward_to_endpoint(api_key.clone()));
+        let mut plugin = CodeContextPlugin::default();
+        plugin
+            .activate(&host, ablation_context(&root.to_string_lossy(), &ablation))
+            .expect("激活插件");
+        for _ in 0..400 {
+            let call = ToolCall::new("scenario", "code_search", json!({"query": "初始化索引"}));
+            let _ = plugin.call_tool_with_host(&host, call);
+            if plugin.index_status() != IndexStatus::Indexing {
+                break;
+            }
+        }
+        assert_eq!(
+            plugin.index_status(),
+            IndexStatus::Ready,
+            "语义索引必须就绪"
+        );
+        let mut hits_at_1 = 0usize;
+        let mut hits_at_3 = 0usize;
+        let mut hits_at_10 = 0usize;
+        let mut reciprocal = 0.0f64;
+        let mut reranked = 0usize;
+        let mut total_ms = 0.0f64;
+        let mut rows = Vec::new();
+
+        for query in &queries {
+            let started = std::time::Instant::now();
+            let execution = plugin.search_execution(&host, query.query, None, 10);
+            let millis = started.elapsed().as_secs_f64() * 1000.0;
+            total_ms += millis;
+            if execution.diagnostics.rerank_activated {
+                reranked += 1;
+            }
+            let rank = execution.results.iter().position(|result| {
+                query
+                    .expected_paths
+                    .iter()
+                    .any(|pattern| result.file_path.contains(pattern))
+            });
+            match rank {
+                Some(0) => {
+                    hits_at_1 += 1;
+                    hits_at_3 += 1;
+                    hits_at_10 += 1;
+                }
+                Some(index) if index < 3 => {
+                    hits_at_3 += 1;
+                    hits_at_10 += 1;
+                }
+                Some(_) => hits_at_10 += 1,
+                None => {}
+            }
+            reciprocal += rank.map_or(0.0, |index| 1.0 / (index + 1) as f64);
+            let top: Vec<String> = execution
+                .results
+                .iter()
+                .take(3)
+                .map(|result| {
+                    let file = result.file_path.rsplit('/').next().unwrap_or("?");
+                    format!(
+                        "{file}:{}",
+                        result.symbol_name.as_deref().unwrap_or("（文本块）")
+                    )
+                })
+                .collect();
+            rows.push((
+                query.task,
+                query.query,
+                rank,
+                execution.diagnostics.path.as_str(),
+                execution.diagnostics.rerank_activated,
+                millis,
+                top.join("、"),
+            ));
+        }
+
+        let total = queries.len() as f64;
+        println!("\n# 真实场景评测 — {}\n", ablation.label);
+        println!("| 指标 | 数值 |");
+        println!("| --- | --- |");
+        println!("| 场景数 | {} |", queries.len());
+        println!("| Recall@1 | {:.3} |", hits_at_1 as f64 / total);
+        println!("| Recall@3 | {:.3} |", hits_at_3 as f64 / total);
+        println!("| Recall@10 | {:.3} |", hits_at_10 as f64 / total);
+        println!("| MRR | {:.3} |", reciprocal / total);
+        println!(
+            "| 重排触发率 | {}/{} ({:.0}%) |",
+            reranked,
+            queries.len(),
+            reranked as f64 / total * 100.0
+        );
+        println!("| 平均延迟 | {:.1} ms |", total_ms / total);
+
+        println!("\n| 任务 | 查询 | 目标名次 | 路径 | 重排 | 耗时 | 前三结果 |");
+        println!("| --- | --- | --- | --- | --- | --- | --- |");
+        for (task, query, rank, path, did_rerank, millis, top) in rows {
+            println!(
+                "| {task} | {query} | {} | {path} | {} | {millis:.0} ms | {top} |",
+                rank.map_or("未命中".to_string(), |index| format!("第 {}", index + 1)),
+                if did_rerank { "是" } else { "否" },
+            );
+        }
+    }
+}
