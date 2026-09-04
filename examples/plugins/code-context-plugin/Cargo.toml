@@ -45,6 +45,10 @@ sqlite-vector-store = ["dep:rusqlite", "dep:sqlite-vec"]
 name = "search_repository"
 required-features = ["test-support"]
 
+[[example]]
+name = "search_playground"
+required-features = ["test-support"]
+
 [dev-dependencies]
 code-context-plugin = { path = ".", features = ["test-support"] }
 ureq = "3"
