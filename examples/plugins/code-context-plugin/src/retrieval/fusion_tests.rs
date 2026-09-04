@@ -758,7 +758,7 @@ fn identifier_shape_detection_separates_symbols_from_plain_words() {
         "看看 agent.rs 里的实现",
     ] {
         assert!(
-            super::fusion::has_identifier_shaped_token(query),
+            !super::AnalyzedQuery::analyze(query).identifiers.is_empty(),
             "`{query}` 应被识别为夹带标识符"
         );
     }
@@ -771,7 +771,7 @@ fn identifier_shape_detection_separates_symbols_from_plain_words() {
         "权限检查流程",
     ] {
         assert!(
-            !super::fusion::has_identifier_shaped_token(query),
+            super::AnalyzedQuery::analyze(query).identifiers.is_empty(),
             "`{query}` 不应被识别为夹带标识符"
         );
     }
@@ -786,19 +786,19 @@ fn natural_language_with_identifier_keeps_reduced_symbol_boost() {
     let config = FusionConfig::default();
     let identifier = super::fusion::symbol_boost_of(
         Some(SymbolMatch::ExactName),
-        super::fusion::QueryIntent::Identifier,
+        super::QueryIntent::Identifier,
         true,
         &config,
     );
     let mixed = super::fusion::symbol_boost_of(
         Some(SymbolMatch::ExactName),
-        super::fusion::QueryIntent::NaturalLanguage,
+        super::QueryIntent::Mixed,
         true,
         &config,
     );
     let plain = super::fusion::symbol_boost_of(
         Some(SymbolMatch::ExactName),
-        super::fusion::QueryIntent::NaturalLanguage,
+        super::QueryIntent::NaturalLanguage,
         false,
         &config,
     );

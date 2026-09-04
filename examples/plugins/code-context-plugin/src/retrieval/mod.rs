@@ -16,6 +16,7 @@
 
 mod fusion;
 mod lexical;
+mod query;
 mod symbol;
 mod tokenize;
 
@@ -25,6 +26,7 @@ mod fusion_tests;
 mod tests;
 
 pub use fusion::{FusionConfig, FusionDebug, SearchResult};
+pub use query::{AnalyzedQuery, QueryGoal, QueryIntent, SearchPlan};
 pub use symbol::SymbolMatch;
 pub(crate) use tokenize::is_cjk as tokenize_is_cjk;
 pub use tokenize::tokenize;
@@ -406,6 +408,44 @@ impl RetrievalIndex {
             fusion::candidate_limit(limit),
         );
         fuse_with_diagnostics(&channels, query, index, &FusionConfig::default(), limit)
+    }
+
+    /// 按查询计划执行分路召回、union 与融合排序。
+    ///
+    /// 每个通道使用计划中的独立配额；被关闭的通道不会执行。`query_vector` 只在语义通道
+    /// 启用时读取，调用方因此可以在生成向量前先确定计划，避免 Fast Path 产生网络开销。
+    pub fn search_planned(
+        &self,
+        index: &StructuralIndex,
+        semantic: &SemanticIndex,
+        query: &str,
+        query_vector: Option<&[f32]>,
+        path_scope: Option<&str>,
+        plan: &SearchPlan,
+    ) -> RetrievalRun {
+        let mut channels = Vec::with_capacity(3);
+        if plan.enable_symbol {
+            channels.push(self.search_symbols(query, path_scope, plan.symbol_limit));
+        }
+        if plan.enable_lexical {
+            channels.push(self.search_lexical(query, path_scope, plan.lexical_limit));
+        }
+        if plan.enable_semantic {
+            if let Some(vector) = query_vector {
+                let candidates =
+                    self.search_semantic(semantic, vector, path_scope, plan.semantic_limit);
+                if !candidates.is_empty() {
+                    channels.push(candidates);
+                }
+            }
+        }
+        fuse_with_diagnostics(
+            &channels,
+            query,
+            index,
+            &FusionConfig::default(),
+            plan.candidate_pool_limit,
+        )
     }
 }
 

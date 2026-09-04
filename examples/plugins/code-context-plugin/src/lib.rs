@@ -76,8 +76,9 @@ pub use repository::{
     ScanStats, ScanWarning, ScanWarningKind,
 };
 pub use retrieval::{
-    tokenize, CandidateSource, FusionConfig, FusionDebug, RetrievalIndex, RetrievalStats,
-    SearchCandidate, SearchResult, SymbolMatch,
+    tokenize, AnalyzedQuery, CandidateSource, CandidateStages, FusionConfig, FusionDebug,
+    QueryGoal, QueryIntent, RetrievalIndex, RetrievalRun, RetrievalStats, SearchCandidate,
+    SearchPlan, SearchResult, SymbolMatch,
 };
 pub use semantic::SemanticIndex;
 pub use storage::{IndexStore, ManifestLoad};
@@ -979,8 +980,18 @@ impl CodeContextPlugin {
         limit: usize,
     ) -> Vec<SearchResult> {
         self.last_rerank_degraded_reason = None;
-        let query_vector = self.embed_query(host, query);
         let rerank_model = self.config.rerank_model.clone();
+        let analyzed = AnalyzedQuery::analyze(query);
+        let semantic_available = self
+            .repository
+            .as_ref()
+            .is_some_and(|context| context.semantic.is_ready());
+        let plan =
+            SearchPlan::for_query(&analyzed, limit, semantic_available, rerank_model.is_some());
+        let query_vector = plan
+            .enable_semantic
+            .then(|| self.embed_query(host, query))
+            .flatten();
         let Some(context) = self.repository.as_ref() else {
             return Vec::new();
         };
@@ -988,23 +999,26 @@ impl CodeContextPlugin {
         else {
             return Vec::new();
         };
-        let recall_limit = rerank_model
-            .as_ref()
-            .map_or(limit, |_| rerank::candidate_limit(limit));
-        let mut results = retrieval.search_hybrid(
-            index,
-            &context.semantic,
-            query,
-            query_vector.as_deref(),
-            path_scope,
-            recall_limit,
-        );
+        let mut results = retrieval
+            .search_planned(
+                index,
+                &context.semantic,
+                query,
+                query_vector.as_deref(),
+                path_scope,
+                &plan,
+            )
+            .results;
         #[cfg(feature = "sqlite-vector-store")]
         if let Some(error) = context.semantic.take_backend_error() {
             self.degraded_reason =
                 Some(format!("sqlite-vec 查询失败，已退回内存语义检索：{error}"));
         }
-        if let Some(model) = rerank_model {
+        if plan.allow_rerank {
+            let Some(model) = rerank_model else {
+                results.truncate(limit);
+                return results;
+            };
             match rerank::rerank_results(host, &model, query, &results) {
                 Ok(reranked) => results = reranked,
                 Err(reason) => {
@@ -2538,6 +2552,27 @@ mod tests {
         );
     }
 
+    /// 精确标识符必须走 Fast Path，不得产生查询嵌入或模型重排请求。
+    #[test]
+    fn exact_identifier_skips_semantic_and_rerank_requests() {
+        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE).with_echo_embeddings(4);
+        let mut context = api_activation_context("/repo/a");
+        context
+            .metadata
+            .insert("rerank_model".into(), "test-reranker".into());
+        let mut plugin = indexed(&host, context);
+        let requests_after_build = host.http_requests().len();
+
+        let results = plugin.search_results(&host, "check_permission", None, 10);
+
+        assert_eq!(results[0].symbol_name.as_deref(), Some("check_permission"));
+        assert_eq!(
+            host.http_requests().len(),
+            requests_after_build,
+            "精确标识符不得调用 embedding 或 rerank 端点"
+        );
+    }
+
     /// 语义索引未就绪时不得为查询发起嵌入请求——没有可比对的向量，纯属浪费配额。
     #[test]
     fn query_is_not_embedded_when_semantic_index_is_unready() {
@@ -2568,10 +2603,10 @@ mod tests {
             .insert("rerank_model".into(), "test-reranker".into());
         let mut plugin = indexed(&host, context);
         plugin.config.rerank_model = None;
-        let expected = plugin.search_results(&host, "permission", None, 10);
+        let expected = plugin.search_results(&host, "permission behavior", None, 10);
         plugin.config.rerank_model = Some("test-reranker".into());
 
-        let actual = plugin.search_results(&host, "permission", None, 10);
+        let actual = plugin.search_results(&host, "permission behavior", None, 10);
 
         assert_eq!(actual, expected, "失败降级不得改变原有融合顺序");
         assert!(plugin

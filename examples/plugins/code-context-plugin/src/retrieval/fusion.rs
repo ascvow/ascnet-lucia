@@ -22,7 +22,7 @@
 //! 重排。它不调用模型或网络，只负责在分数接近的候选之间优先展示元数据更贴近查询意图的
 //! 代码块；加成严格小于一路第一名的 RRF 分值，避免重排覆盖原始召回顺序。
 
-use super::{CandidateSource, SearchCandidate, SymbolMatch};
+use super::{AnalyzedQuery, CandidateSource, QueryIntent, SearchCandidate, SymbolMatch};
 use crate::index::StructuralIndex;
 use crate::model::{CodeChunk, SymbolKind};
 use std::collections::BTreeSet;
@@ -263,8 +263,9 @@ pub fn fuse(
     let query_tokens = super::tokenize::tokenize(query);
     let rerank_query_tokens: BTreeSet<String> =
         super::tokenize::tokenize_query(query).into_iter().collect();
-    let intent = QueryIntent::classify(query);
-    let query_has_identifier = has_identifier_shaped_token(query);
+    let analyzed = AnalyzedQuery::analyze(query);
+    let intent = analyzed.intent;
+    let query_has_identifier = !analyzed.identifiers.is_empty();
     let wants_tests = query_targets_tests(query);
     let semantic_available = channels
         .iter()
@@ -283,6 +284,7 @@ pub fn fuse(
                 candidate.source,
                 candidate.symbol_match,
                 intent,
+                analyzed.cjk_dominant,
                 semantic_available,
                 config,
             )
@@ -310,6 +312,7 @@ pub fn fuse(
                 candidate.source,
                 candidate.symbol_match,
                 intent,
+                analyzed.cjk_dominant,
                 semantic_available,
                 config,
             ) / (config.rrf_k + candidate.rank as f32);
@@ -404,51 +407,6 @@ struct MetadataRerank {
     query_tokens: usize,
 }
 
-/// 查询形态决定符号精确提升和通道权重。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QueryIntent {
-    /// 单独的代码标识符或限定名，例如 `Agent`、`PermissionManager::check`。
-    Identifier,
-    /// 包含空白或说明性标点的自然语言描述，主体仍是拉丁字符。
-    NaturalLanguage,
-    /// 以中日韩文字为主的自然语言描述。
-    ///
-    /// 单独成一类，因为它对词法通道的期望完全不同：中文查询词与英文标识符之间没有
-    /// 词面重叠，BM25 在这里几乎只能贡献噪声。
-    CjkNaturalLanguage,
-}
-
-impl QueryIntent {
-    /// 根据查询表面形态做保守分类。
-    ///
-    /// 只有完全由常见标识符字符组成且不含空白的查询才视为标识符；无法确定时按自然语言
-    /// 处理，避免把普通词误当成精确代码导航意图。
-    fn classify(query: &str) -> Self {
-        let trimmed = query.trim();
-        if !trimmed.is_empty()
-            && !trimmed.chars().any(char::is_whitespace)
-            && trimmed.chars().all(|character| {
-                character.is_ascii_alphanumeric()
-                    || matches!(character, '_' | ':' | '.' | '#' | '<' | '>')
-            })
-        {
-            return Self::Identifier;
-        }
-        // "以中日韩为主"按字母类字符的占比判定：混排查询里只要拉丁词还占一定比例，
-        // 词法通道就仍有可用信号，不该被降权。
-        let letters = trimmed.chars().filter(|c| c.is_alphanumeric()).count();
-        let cjk = trimmed
-            .chars()
-            .filter(|c| super::tokenize_is_cjk(*c))
-            .count();
-        if letters > 0 && cjk * 2 > letters {
-            Self::CjkNaturalLanguage
-        } else {
-            Self::NaturalLanguage
-        }
-    }
-}
-
 impl Accumulator {
     /// 创建空聚合。
     fn new(chunk_id: &str) -> Self {
@@ -488,42 +446,14 @@ pub(crate) fn symbol_boost_of(
         _ => return 0.0,
     };
     match intent {
-        QueryIntent::Identifier => base,
+        QueryIntent::Identifier | QueryIntent::QualifiedSymbol => base,
         // 折减而不是等同：自然语言查询里的标识符是"顺带提到"，不像纯标识符查询那样
         // 明确表达了导航意图，不应压过语义与词法通道的共同判断。
-        QueryIntent::NaturalLanguage | QueryIntent::CjkNaturalLanguage if query_has_identifier => {
+        QueryIntent::Mixed if query_has_identifier => {
             base * config.natural_language_identifier_ratio
         }
-        QueryIntent::NaturalLanguage | QueryIntent::CjkNaturalLanguage => 0.0,
+        QueryIntent::NaturalLanguage | QueryIntent::Mixed => 0.0,
     }
-}
-
-/// 判断查询中是否存在具备标识符特征的词。
-///
-/// 两类特征任一成立即可：含下划线或限定分隔符（`snake_case`、`Foo::bar`），或含大小写
-/// 混排边界（`formatDate`、`HTTPServer`）。
-///
-/// 刻意**不使用长度规则**：`provider`、`manifest`、`approval` 这类既是普通英文词又常被
-/// 用作符号名的词，长度上与真实标识符无法区分，按长度放行会把符号提升发给一大批同名
-/// 符号，实测反而拉低 MRR。形态特征比长度可靠得多。
-pub(crate) fn has_identifier_shaped_token(query: &str) -> bool {
-    query.split_whitespace().any(|word| {
-        let word = word.trim_matches(|character: char| {
-            !character.is_alphanumeric() && !matches!(character, '_' | ':' | '.')
-        });
-        if word.chars().count() < 2 {
-            return false;
-        }
-        let has_separator = word.contains('_') || word.contains("::") || word.contains('.');
-        // 驼峰要求**大小写混排**且大写不只出现在首字符：
-        //   formatDate / HTTPServer / PermissionManager → 是
-        //   Session（仅句首大写）、RRF / HTTP（全大写缩写）→ 否
-        // 全大写缩写必须排除：它们在中英混排查询里就是普通名词（"RRF 融合"、"HTTP 客户端"），
-        // 当成标识符会把符号提升发给一大批同名常量。
-        let has_case_boundary =
-            word.chars().any(char::is_lowercase) && word.chars().skip(1).any(char::is_uppercase);
-        has_separator || has_case_boundary
-    })
 }
 
 /// 判断查询是否明确指向测试代码。
@@ -547,7 +477,10 @@ fn score_weight_of(
     wants_tests: bool,
     config: &FusionConfig,
 ) -> f32 {
-    if intent == QueryIntent::Identifier {
+    if matches!(
+        intent,
+        QueryIntent::Identifier | QueryIntent::QualifiedSymbol
+    ) {
         return 1.0;
     }
     let mut weight = 1.0;
@@ -566,13 +499,16 @@ fn channel_weight(
     source: CandidateSource,
     symbol_match: Option<SymbolMatch>,
     intent: QueryIntent,
+    cjk_dominant: bool,
     semantic_available: bool,
     config: &FusionConfig,
 ) -> f32 {
-    if intent == QueryIntent::Identifier {
+    if matches!(
+        intent,
+        QueryIntent::Identifier | QueryIntent::QualifiedSymbol
+    ) {
         return 1.0;
     }
-    let cjk = intent == QueryIntent::CjkNaturalLanguage;
     match source {
         CandidateSource::Symbol if semantic_available => config.natural_language_symbol_weight,
         CandidateSource::Symbol
@@ -584,9 +520,9 @@ fn channel_weight(
             config.natural_language_symbol_weight
         }
         CandidateSource::Symbol => 1.0,
-        CandidateSource::Lexical if cjk => config.cjk_lexical_weight,
+        CandidateSource::Lexical if cjk_dominant => config.cjk_lexical_weight,
         CandidateSource::Lexical => 1.0,
-        CandidateSource::Semantic if cjk => config.cjk_semantic_weight,
+        CandidateSource::Semantic if cjk_dominant => config.cjk_semantic_weight,
         CandidateSource::Semantic => config.natural_language_semantic_weight,
     }
 }
@@ -660,9 +596,9 @@ fn metadata_rerank_of(
         .into_iter()
         .collect();
     let (symbol_weight, signature_weight, doc_weight, path_weight) = match intent {
-        QueryIntent::Identifier => (1.0, 0.8, 0.45, 0.25),
+        QueryIntent::Identifier | QueryIntent::QualifiedSymbol => (1.0, 0.8, 0.45, 0.25),
         // 中文查询与英文符号名没有词面重叠，元数据里唯一可能匹配的就是中文文档注释。
-        QueryIntent::NaturalLanguage | QueryIntent::CjkNaturalLanguage => (0.55, 0.7, 1.0, 0.25),
+        QueryIntent::NaturalLanguage | QueryIntent::Mixed => (0.55, 0.7, 1.0, 0.25),
     };
 
     let mut weighted_matches = 0.0f32;

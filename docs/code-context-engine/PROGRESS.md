@@ -988,6 +988,12 @@ Implemented:
   新增回归测试断言开启语义后原有符号与词法候选不会在 candidate generation 阶段消失；
   后续 Recall 下降可明确归因到召回器、union、融合排序或最终截断。Phase 1 验证：
   `cargo test -p code-context-plugin retrieval::tests --lib`，32 项通过。
+- **确定性 Query Analyzer 与 SearchPlan**：查询按 `Identifier`、`QualifiedSymbol`、
+  `NaturalLanguage`、`Mixed` 分类，并附加定义、实现、调用点、类型、行为、概念六类轻量目标。
+  SearchPlan 为三路召回分配独立配额；精确标识符与限定名跳过查询嵌入和模型重排，自然语言
+  与混合查询才启用语义候选。判断只使用字符形态和通用意图词，不调用 LLM，也不绑定路径
+  或 benchmark 题目。Phase 2 验证：Query Analyzer 4 项、fusion 31 项、Fast Path 端到端
+  1 项全部通过，`cargo check -p code-context-plugin` 通过。
 
 Scale Result（Lucia 当前仓库）:
 - 原子代码块 6641 个，语义复合块 262 个，其中 970 个原子块由复合块代表。
