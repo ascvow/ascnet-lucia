@@ -458,6 +458,9 @@ impl RetrievalIndex {
 ///
 /// `fusion::fuse` 的排序仍是唯一排序实现；这里把上限临时放宽到 union 大小，以便记录
 /// post-fusion 全序，再截断到调用方要求的 `limit`。因此新增诊断不会产生第二套排序逻辑。
+///
+/// 同文件名额上限必须施加在**这一步**而不是 `fuse` 内部：`fuse` 收到的上限是 union 全量，
+/// 它眼里"没有需要淘汰的候选"，配额自然不生效；真正决定谁被淘汰的是下面这次截断。
 fn fuse_with_diagnostics(
     channels: &[Vec<SearchCandidate>],
     query: &str,
@@ -467,12 +470,12 @@ fn fuse_with_diagnostics(
 ) -> RetrievalRun {
     let mut stages = CandidateStages::from_channels(channels);
     let fusion_limit = stages.union.len().max(limit);
-    let mut results = fusion::fuse(channels, query, index, config, fusion_limit);
+    let results = fusion::fuse(channels, query, index, config, fusion_limit);
     stages.post_fusion = results
         .iter()
         .map(|result| result.chunk_id.clone())
         .collect();
-    results.truncate(limit);
+    let results = fusion::select_with_file_quota(results, limit, config.max_per_file);
     stages.final_results = results
         .iter()
         .map(|result| result.chunk_id.clone())

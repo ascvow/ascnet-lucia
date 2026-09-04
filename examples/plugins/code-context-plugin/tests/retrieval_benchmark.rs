@@ -1344,7 +1344,7 @@ fn every_query_finds_its_target() {
                     "查询 {:30} 期望 {} 出现在 top-10，实际: {:?}",
                     bq.query,
                     expected,
-                    found.iter().take(5).collect::<Vec<_>>()
+                    found.iter().collect::<Vec<_>>()
                 ));
             }
         }

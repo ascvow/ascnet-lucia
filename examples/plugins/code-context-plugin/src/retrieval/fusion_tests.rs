@@ -733,6 +733,41 @@ fn implementation_intent_prefers_code_over_documentation() {
     assert!(results[1].debug.penalty > 0.0, "文档应记录明确扣分");
 }
 
+/// 角色提升只能细化已有相关性，不能把通道内很弱的实现候选抬过强词法候选。
+#[test]
+fn weak_role_match_cannot_displace_strong_lexical_candidate() {
+    let (index, _) = fixture();
+    let strong = chunk_id_of(&index, "SessionStore");
+    let weak_implementation = chunk_id_of(&index, "PermissionRule::matches");
+    let channels = vec![vec![
+        candidate(&strong, CandidateSource::Lexical, 15),
+        candidate(&weak_implementation, CandidateSource::Lexical, 200),
+    ]];
+
+    let results = fuse(
+        &channels,
+        "插件管理页面怎么绘制",
+        &index,
+        &FusionConfig::default(),
+        10,
+    );
+
+    assert_eq!(
+        results[0].chunk_id,
+        strong,
+        "强词法候选不得被弱角色候选挤出，实际 {:?}",
+        names(&results)
+    );
+    let weak = results
+        .iter()
+        .find(|result| result.chunk_id == weak_implementation)
+        .expect("弱实现候选应仍保留在候选池");
+    assert!(
+        weak.debug.role_boost <= weak.debug.rrf_score * 0.3 + f32::EPSILON,
+        "默认实现角色提升最多为候选 RRF 分的 30%"
+    );
+}
+
 /// 路径过滤必须贯穿融合。
 #[test]
 fn path_scope_survives_fusion() {

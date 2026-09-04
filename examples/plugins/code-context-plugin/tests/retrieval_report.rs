@@ -1908,3 +1908,120 @@ fn chinese_query_failure_analysis() {
         println!();
     }
 }
+
+/// 诊断：语义通道加入后，原本被词法/符号召回的目标丢在了哪一阶段。
+///
+/// 消融显示业务命中从 8/8 掉到 6/8——"仓库代码搜索请求如何执行并打包代码片段"与
+/// "文件修改后如何增量刷新代码索引"在只有符号+词法时分别排第 9 和第 6，加入语义后双双
+/// 跌出 Top-10。聚合指标只能说明"变差了"，无法区分是召回器没召回、union 丢失、融合降级
+/// 还是最终截断，因此这里逐阶段比对目标 chunk 的存在性与位置。
+#[test]
+#[ignore = "需要网络与嵌入 API 密钥"]
+fn semantic_regression_stage_localization() {
+    let api_key = std::env::var(API_KEY_ENV).expect("需要 API 密钥");
+    let root = repository_root();
+    let files = collect_repository_files(&root);
+    let file_refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+
+    // 只关注消融中出现回退的两条业务查询及其期望路径。
+    let cases: [(&str, &str); 2] = [
+        (
+            "仓库代码搜索请求如何执行并打包代码片段",
+            "code-context-plugin/src/lib.rs",
+        ),
+        (
+            "文件修改后如何增量刷新代码索引",
+            "code-context-plugin/src/lib.rs",
+        ),
+    ];
+
+    println!("\n# 语义回退阶段定位\n");
+    for (label, semantic) in [("符号 + 词法", false), ("+ 语义", true)] {
+        let ablation = Ablation {
+            label,
+            semantic,
+            rerank: false,
+        };
+        let host = RepoHost::new(&file_refs);
+        let host = if semantic {
+            host.with_http_handler(forward_to_endpoint(api_key.clone()))
+        } else {
+            host
+        };
+        let mut plugin = CodeContextPlugin::default();
+        plugin
+            .activate(&host, ablation_context(&root.to_string_lossy(), &ablation))
+            .expect("激活插件");
+        for _ in 0..400 {
+            let call = ToolCall::new("stage", "code_search", json!({"query": "初始化索引"}));
+            let _ = plugin.call_tool_with_host(&host, call);
+            if plugin.index_status() != IndexStatus::Indexing {
+                break;
+            }
+        }
+
+        println!("## {label}\n");
+        for (query, expected_path) in cases {
+            let execution = plugin.search_execution(&host, query, None, RESULT_LIMIT);
+            let stages = &execution.diagnostics.stages;
+            let index = plugin.structural_index().expect("索引应已建成");
+            // 目标 chunk：期望文件下的全部 chunk，命中任一即算该阶段保住了目标。
+            let targets: Vec<&str> = index
+                .chunks()
+                .filter(|chunk| chunk.file_path.contains(expected_path))
+                .map(|chunk| chunk.id.as_str())
+                .collect();
+            let locate = |stage: &Vec<String>| -> String {
+                match stage
+                    .iter()
+                    .position(|id| targets.iter().any(|target| target == id))
+                {
+                    Some(position) => format!("第 {} 位 / 共 {}", position + 1, stage.len()),
+                    None => format!("缺失 / 共 {}", stage.len()),
+                }
+            };
+            println!("### {query}\n");
+            println!(
+                "目标文件 `{expected_path}`，该文件共 {} 个 chunk\n",
+                targets.len()
+            );
+            println!("| 阶段 | 目标位置 |");
+            println!("| --- | --- |");
+            println!("| symbol 通道 | {} |", locate(&stages.symbol));
+            println!("| lexical 通道 | {} |", locate(&stages.lexical));
+            println!("| semantic 通道 | {} |", locate(&stages.semantic));
+            println!("| union | {} |", locate(&stages.union));
+            println!("| post_fusion | {} |", locate(&stages.post_fusion));
+            println!("| final | {} |", locate(&stages.final_results));
+            println!();
+            // 只看名次说明不了"被谁挤掉"，把前列的通道来源一并列出。
+            println!("融合后前 12 名：\n");
+            for (rank, chunk_id) in stages.post_fusion.iter().take(12).enumerate() {
+                let chunk = index.chunk(chunk_id);
+                let mark = if targets.iter().any(|target| target == chunk_id) {
+                    " ← 目标"
+                } else {
+                    ""
+                };
+                let reason = execution
+                    .results
+                    .iter()
+                    .find(|result| &result.chunk_id == chunk_id)
+                    .map(|result| result.debug.reason())
+                    .unwrap_or_else(|| "（已被最终截断，无诊断）".to_string());
+                println!(
+                    "{}. `{}` {} — {reason}{mark}",
+                    rank + 1,
+                    chunk.map(|c| c.file_path.as_str()).unwrap_or("?"),
+                    chunk
+                        .and_then(|c| c.symbol_name.as_deref())
+                        .unwrap_or("（文本块）"),
+                );
+            }
+            println!();
+        }
+    }
+}

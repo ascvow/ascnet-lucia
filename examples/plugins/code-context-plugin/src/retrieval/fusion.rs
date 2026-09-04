@@ -27,7 +27,7 @@ use super::{
 };
 use crate::index::StructuralIndex;
 use crate::model::{CodeChunk, SymbolKind};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// RRF 的排名平滑常量。
 ///
@@ -115,8 +115,17 @@ pub struct FusionConfig {
     /// 取 0.75：足以调整分数接近的候选，但小于一路第一名与末位候选的最大分差，确保
     /// RRF 召回仍是主信号。这里只检查已驻留的元数据，不回读正文，也不调用外部服务。
     pub metadata_rerank_boost: f32,
-    /// 代码角色与查询目标完全一致时的提升，单位为 rank-1 当量。
+    /// 代码角色与查询目标完全一致时，相对候选 RRF 原始分的提升比例。
+    ///
+    /// 角色只能细化已有相关性，不能凭一个固定绝对加成把通道内排名很低的弱候选抬到强词法
+    /// 候选之前。具体角色强度由 [`role_boost_of`] 再乘以该比例。
     pub role_match_boost: f32,
+    /// 融合结果中同一文件最多占据的名额。
+    ///
+    /// 取 5：查一个类型时，它的定义、impl 与若干方法本就同属一个文件，聚集是正确结果而
+    /// 非噪声，配额过紧会把正确的同文件结果挤掉。取 5 仍能把单文件压到最终结果的一半
+    /// 以内，足以阻断单个文件占满整个结果集的垄断。设为 0 表示不限制。
+    pub max_per_file: usize,
     /// 实现、行为或调用点查询下说明性文档的分数系数。
     pub documentation_weight: f32,
     /// 实现查询下纯类型定义的分数系数。
@@ -136,12 +145,13 @@ impl Default for FusionConfig {
             cjk_semantic_weight: 3.5,
             cjk_lexical_weight: 0.4,
             test_code_weight: 0.55,
-            short_chunk_weight: 0.8,
+            short_chunk_weight: 0.9,
             short_chunk_lines: 6,
             natural_language_identifier_ratio: 0.5,
             path_boost: 1.0,
             metadata_rerank_boost: 0.75,
-            role_match_boost: 1.0,
+            role_match_boost: 0.2,
+            max_per_file: 5,
             documentation_weight: 0.4,
             non_implementation_weight: 0.82,
             config_weight: 0.7,
@@ -375,7 +385,20 @@ pub fn fuse(
             let rerank = metadata_rerank_of(&rerank_query_tokens, chunk, intent, config);
             let rerank_boost = rerank.boost_units * boost_unit;
             let role = ChunkRole::from_chunk(chunk);
-            let role_boost = role_boost_of(analyzed.goal, role, config) * boost_unit;
+            // 角色是结构性细化信号，不是独立召回信号。按候选自身 RRF 分成比例提升，保证
+            // 通道内排名很低的弱实现不会只靠角色标签挤掉排名靠前的词法或符号候选。
+            //
+            // 精确标识符与限定名查询下角色完全不参与排序：用户已经点名了要找什么，此时让
+            // "定义比方法更像定义"这类先验介入，会让查 `Foo::bar` 时返回 `Foo` 本身。
+            // 这与 `score_weight_of` 对同类意图直接返回 1.0 是同一条原则。
+            let role_boost = if matches!(
+                intent,
+                QueryIntent::Identifier | QueryIntent::QualifiedSymbol
+            ) {
+                0.0
+            } else {
+                role_boost_of(analyzed.goal, role, config) * item.rrf_score
+            };
             let raw = item.rrf_score + symbol_boost + path_boost + rerank_boost + role_boost;
             let weight = score_weight_of(chunk, role, analyzed.goal, intent, wants_tests, config);
             // 记为扣分而不是系数，使 `score = 各项之和 - penalty` 这条诊断不变量继续成立。
@@ -439,8 +462,7 @@ pub fn fuse(
             })
             .then_with(|| left.chunk_id.cmp(&right.chunk_id))
     });
-    results.truncate(limit);
-    results
+    select_with_file_quota(results, limit, config.max_per_file)
 }
 
 /// 聚合中的单个 chunk。
@@ -515,6 +537,69 @@ pub(crate) fn symbol_boost_of(
     }
 }
 
+/// 在保持分数顺序的前提下施加同文件名额上限。
+///
+/// # 为什么必须在融合阶段做
+///
+/// 上下文层本来就有 `max_per_file`，但它作用在**融合截断之后**：融合先按分数取前 `limit`
+/// 条，多样性约束再从这批里筛。一旦前 `limit` 名已被单个文件占满，约束就只能把它们删掉，
+/// 无法把别的文件补进来——实测中一个示例程序曾占据融合前 12 名里的 10 条，真正的实现被
+/// 压到第 38 名，上下文层再怎么筛也救不回来。
+///
+/// # 为什么溢出项要补回而不是丢弃
+///
+/// 命中集中在少数文件是常态（查一个类型时，它的定义、impl 与方法本就同属一个文件）。
+/// 直接丢弃溢出项会让结果数少于用户请求的数量，把"多样性"变成"少给结果"。这里先按配额
+/// 选，不足再用溢出项按分数补齐，因此返回条数与不设配额时完全一致。
+pub(crate) fn select_with_file_quota(
+    results: Vec<SearchResult>,
+    limit: usize,
+    max_per_file: usize,
+) -> Vec<SearchResult> {
+    if max_per_file == 0 || results.len() <= limit {
+        let mut results = results;
+        results.truncate(limit);
+        return results;
+    }
+    let mut per_file: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut selected_indexes: Vec<usize> = Vec::with_capacity(limit);
+    let mut overflow: Vec<usize> = Vec::new();
+    for (index, result) in results.iter().enumerate() {
+        if selected_indexes.len() == limit {
+            break;
+        }
+        let used = per_file.entry(result.file_path.as_str()).or_insert(0);
+        if *used < max_per_file {
+            *used += 1;
+            selected_indexes.push(index);
+        } else {
+            overflow.push(index);
+        }
+    }
+    // 配额筛完仍不足时，用溢出项按原分数顺序补齐，保证返回条数不因多样性而减少。
+    for index in overflow {
+        if selected_indexes.len() == limit {
+            break;
+        }
+        selected_indexes.push(index);
+    }
+    selected_indexes.sort_unstable();
+    let mut kept: Vec<Option<SearchResult>> = results.into_iter().map(Some).collect();
+    let mut selected: Vec<SearchResult> = selected_indexes
+        .into_iter()
+        .filter_map(|index| kept[index].take())
+        .collect();
+    // 补齐步骤会打乱名次，重新按分数恢复顺序；决胜规则与主排序一致。
+    selected.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.file_path.cmp(&right.file_path))
+            .then_with(|| left.chunk_id.cmp(&right.chunk_id))
+    });
+    selected
+}
+
 /// 判断查询是否明确指向测试代码。
 ///
 /// 只在用户确实要找测试时放行测试代码的正常排名；这条判断存在的意义是让降权**可被
@@ -530,6 +615,7 @@ fn query_targets_tests(query: &str) -> bool {
 ///
 /// 两类惩罚都只在自然语言查询下生效：标识符查询表达的是精确导航意图，用户查
 /// `MAX_SOURCE_CHARS` 时那个两行常量就是答案本身，此时任何"块太短"的惩罚都是错的。
+///
 fn score_weight_of(
     chunk: &CodeChunk,
     role: ChunkRole,
