@@ -17,6 +17,7 @@
 mod fusion;
 mod lexical;
 mod query;
+mod role;
 mod symbol;
 mod tokenize;
 
@@ -27,6 +28,7 @@ mod tests;
 
 pub use fusion::{FusionConfig, FusionDebug, SearchResult};
 pub use query::{AnalyzedQuery, QueryGoal, QueryIntent, SearchPlan};
+pub use role::ChunkRole;
 pub use symbol::SymbolMatch;
 pub(crate) use tokenize::is_cjk as tokenize_is_cjk;
 pub use tokenize::tokenize;

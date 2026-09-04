@@ -994,6 +994,13 @@ Implemented:
   与混合查询才启用语义候选。判断只使用字符形态和通用意图词，不调用 LLM，也不绑定路径
   或 benchmark 题目。Phase 2 验证：Query Analyzer 4 项、fusion 31 项、Fast Path 端到端
   1 项全部通过，`cargo check -p code-context-plugin` 通过。
+- **ChunkRole 与角色感知融合**：不修改持久化 schema，直接从符号种类、文件扩展名与测试标记
+  推导 `Definition`、`Implementation`、`CallSite`、`TypeDefinition`、`Documentation`、`Test`、
+  `Config`、`Other`。融合层按 QueryGoal 提升定义、类型或实现角色；实现、行为与调用点查询会
+  显式压低说明性文档，概念查询仍允许文档参与。最终同分决胜固定为分数、角色、路径、符号、
+  chunk ID，避免集合遍历顺序造成漂移。当前没有 references graph，`CallSite` 只保留协议角色，
+  不伪造调用链结果。Phase 3 验证：角色推导 2 项、fusion 32 项、Context 24 项、rerank 5 项
+  全部通过。
 
 Scale Result（Lucia 当前仓库）:
 - 原子代码块 6641 个，语义复合块 262 个，其中 970 个原子块由复合块代表。

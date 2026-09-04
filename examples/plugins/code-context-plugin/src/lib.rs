@@ -76,9 +76,9 @@ pub use repository::{
     ScanStats, ScanWarning, ScanWarningKind,
 };
 pub use retrieval::{
-    tokenize, AnalyzedQuery, CandidateSource, CandidateStages, FusionConfig, FusionDebug,
-    QueryGoal, QueryIntent, RetrievalIndex, RetrievalRun, RetrievalStats, SearchCandidate,
-    SearchPlan, SearchResult, SymbolMatch,
+    tokenize, AnalyzedQuery, CandidateSource, CandidateStages, ChunkRole, FusionConfig,
+    FusionDebug, QueryGoal, QueryIntent, RetrievalIndex, RetrievalRun, RetrievalStats,
+    SearchCandidate, SearchPlan, SearchResult, SymbolMatch,
 };
 pub use semantic::SemanticIndex;
 pub use storage::{IndexStore, ManifestLoad};

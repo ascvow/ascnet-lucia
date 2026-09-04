@@ -240,6 +240,7 @@ fn diversity_caps_per_file_contribution() {
             parent_symbol: chunk.parent_symbol.clone(),
             signature: chunk.signature.clone(),
             doc_comment: chunk.doc_comment.clone(),
+            role: crate::retrieval::ChunkRole::from_chunk(chunk),
             score: 10.0 - rank as f32,
             debug: FusionDebug {
                 ranks: Vec::new(),
@@ -247,10 +248,12 @@ fn diversity_caps_per_file_contribution() {
                 symbol_boost: 0.0,
                 path_boost: 0.0,
                 rerank_boost: 0.0,
+                role_boost: 0.0,
                 penalty: 0.0,
                 rerank_matched_tokens: 0,
                 rerank_query_tokens: 0,
                 symbol_match: None,
+                role: crate::retrieval::ChunkRole::from_chunk(chunk),
             },
         })
         .collect();
@@ -610,6 +613,7 @@ fn synthetic(chunk: &crate::model::CodeChunk, start: u32, end: u32) -> SearchRes
         parent_symbol: chunk.parent_symbol.clone(),
         signature: chunk.signature.clone(),
         doc_comment: chunk.doc_comment.clone(),
+        role: crate::retrieval::ChunkRole::from_chunk(chunk),
         score: 1.0,
         debug: FusionDebug {
             ranks: Vec::new(),
@@ -617,10 +621,12 @@ fn synthetic(chunk: &crate::model::CodeChunk, start: u32, end: u32) -> SearchRes
             symbol_boost: 0.0,
             path_boost: 0.0,
             rerank_boost: 0.0,
+            role_boost: 0.0,
             penalty: 0.0,
             rerank_matched_tokens: 0,
             rerank_query_tokens: 0,
             symbol_match: None,
+            role: crate::retrieval::ChunkRole::from_chunk(chunk),
         },
     }
 }

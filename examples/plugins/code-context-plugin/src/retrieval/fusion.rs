@@ -22,7 +22,9 @@
 //! 重排。它不调用模型或网络，只负责在分数接近的候选之间优先展示元数据更贴近查询意图的
 //! 代码块；加成严格小于一路第一名的 RRF 分值，避免重排覆盖原始召回顺序。
 
-use super::{AnalyzedQuery, CandidateSource, QueryIntent, SearchCandidate, SymbolMatch};
+use super::{
+    AnalyzedQuery, CandidateSource, ChunkRole, QueryGoal, QueryIntent, SearchCandidate, SymbolMatch,
+};
 use crate::index::StructuralIndex;
 use crate::model::{CodeChunk, SymbolKind};
 use std::collections::BTreeSet;
@@ -113,6 +115,14 @@ pub struct FusionConfig {
     /// 取 0.75：足以调整分数接近的候选，但小于一路第一名与末位候选的最大分差，确保
     /// RRF 召回仍是主信号。这里只检查已驻留的元数据，不回读正文，也不调用外部服务。
     pub metadata_rerank_boost: f32,
+    /// 代码角色与查询目标完全一致时的提升，单位为 rank-1 当量。
+    pub role_match_boost: f32,
+    /// 实现、行为或调用点查询下说明性文档的分数系数。
+    pub documentation_weight: f32,
+    /// 实现查询下纯类型定义的分数系数。
+    pub non_implementation_weight: f32,
+    /// 实现或行为查询下配置文件的分数系数。
+    pub config_weight: f32,
 }
 
 impl Default for FusionConfig {
@@ -131,6 +141,10 @@ impl Default for FusionConfig {
             natural_language_identifier_ratio: 0.5,
             path_boost: 1.0,
             metadata_rerank_boost: 0.75,
+            role_match_boost: 1.0,
+            documentation_weight: 0.4,
+            non_implementation_weight: 0.82,
+            config_weight: 0.7,
         }
     }
 }
@@ -160,6 +174,8 @@ pub struct FusionDebug {
     pub path_boost: f32,
     /// 元数据覆盖率产生的实际重排加成。
     pub rerank_boost: f32,
+    /// 代码角色与查询目标匹配产生的实际加成。
+    pub role_boost: f32,
     /// 测试代码与过短代码块产生的实际扣分。
     ///
     /// 与各项加成一样进入诊断：分数必须能被完整拆解，否则调参只能靠猜。
@@ -170,6 +186,8 @@ pub struct FusionDebug {
     pub rerank_query_tokens: usize,
     /// 符号通道的匹配方式。
     pub symbol_match: Option<SymbolMatch>,
+    /// 由结构元数据推导出的代码角色。
+    pub role: ChunkRole,
 }
 
 impl FusionDebug {
@@ -190,6 +208,13 @@ impl FusionDebug {
             parts.push(format!(
                 "元数据重排 {:.3} ({}/{})",
                 self.rerank_boost, self.rerank_matched_tokens, self.rerank_query_tokens
+            ));
+        }
+        if self.role_boost > 0.0 {
+            parts.push(format!(
+                "角色提升 {} {:.3}",
+                self.role.as_str(),
+                self.role_boost
             ));
         }
         if self.penalty > 0.0 {
@@ -227,6 +252,8 @@ pub struct SearchResult {
     pub signature: Option<String>,
     /// 文档注释。
     pub doc_comment: Option<String>,
+    /// 由结构元数据推导出的代码角色。
+    pub role: ChunkRole,
     /// 当前最终排序分数；启用模型重排时为相关度分数，否则为本地融合分数。
     pub score: f32,
     /// 内部诊断。
@@ -337,8 +364,10 @@ pub fn fuse(
             let path_boost = path_boost_of(&query_tokens, &chunk.file_path, config) * boost_unit;
             let rerank = metadata_rerank_of(&rerank_query_tokens, chunk, intent, config);
             let rerank_boost = rerank.boost_units * boost_unit;
-            let raw = item.rrf_score + symbol_boost + path_boost + rerank_boost;
-            let weight = score_weight_of(chunk, intent, wants_tests, config);
+            let role = ChunkRole::from_chunk(chunk);
+            let role_boost = role_boost_of(analyzed.goal, role, config) * boost_unit;
+            let raw = item.rrf_score + symbol_boost + path_boost + rerank_boost + role_boost;
+            let weight = score_weight_of(chunk, role, analyzed.goal, intent, wants_tests, config);
             // 记为扣分而不是系数，使 `score = 各项之和 - penalty` 这条诊断不变量继续成立。
             let penalty = raw * (1.0 - weight);
             let mut ranks = item.ranks;
@@ -356,6 +385,7 @@ pub fn fuse(
                 parent_symbol: chunk.parent_symbol.clone(),
                 signature: chunk.signature.clone(),
                 doc_comment: chunk.doc_comment.clone(),
+                role,
                 score: raw - penalty,
                 debug: FusionDebug {
                     ranks,
@@ -363,21 +393,38 @@ pub fn fuse(
                     symbol_boost,
                     path_boost,
                     rerank_boost,
+                    role_boost,
                     penalty,
                     rerank_matched_tokens: rerank.matched_tokens,
                     rerank_query_tokens: rerank.query_tokens,
                     symbol_match: item.symbol_match,
+                    role,
                 },
             })
         })
         .collect();
 
-    // 分数相同时按 chunk ID 排序，保证同一查询在任何进程都得到同一顺序。
+    // 分数相同时按角色、路径、符号和 chunk ID 决胜，避免 HashMap 或解析插入顺序造成漂移。
     results.sort_by(|left, right| {
         right
             .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&left.score)
+            .then_with(|| {
+                role_priority(analyzed.goal, left.role)
+                    .cmp(&role_priority(analyzed.goal, right.role))
+            })
+            .then_with(|| left.file_path.cmp(&right.file_path))
+            .then_with(|| {
+                left.qualified_symbol
+                    .as_deref()
+                    .or(left.symbol_name.as_deref())
+                    .cmp(
+                        &right
+                            .qualified_symbol
+                            .as_deref()
+                            .or(right.symbol_name.as_deref()),
+                    )
+            })
             .then_with(|| left.chunk_id.cmp(&right.chunk_id))
     });
     results.truncate(limit);
@@ -473,6 +520,8 @@ fn query_targets_tests(query: &str) -> bool {
 /// `MAX_SOURCE_CHARS` 时那个两行常量就是答案本身，此时任何"块太短"的惩罚都是错的。
 fn score_weight_of(
     chunk: &CodeChunk,
+    role: ChunkRole,
+    goal: QueryGoal,
     intent: QueryIntent,
     wants_tests: bool,
     config: &FusionConfig,
@@ -491,7 +540,80 @@ fn score_weight_of(
     if span <= config.short_chunk_lines {
         weight *= config.short_chunk_weight;
     }
+    match (goal, role) {
+        (
+            QueryGoal::Implementation | QueryGoal::Behavior | QueryGoal::CallSite,
+            ChunkRole::Documentation,
+        ) => weight *= config.documentation_weight,
+        (QueryGoal::Definition | QueryGoal::TypeLookup, ChunkRole::Documentation) => {
+            weight *= config.documentation_weight.max(0.65)
+        }
+        (QueryGoal::Implementation, ChunkRole::TypeDefinition) => {
+            weight *= config.non_implementation_weight
+        }
+        (QueryGoal::Implementation | QueryGoal::Behavior, ChunkRole::Config) => {
+            weight *= config.config_weight
+        }
+        _ => {}
+    }
     weight
+}
+
+/// 返回代码角色与查询目标匹配时的提升倍数。
+fn role_boost_of(goal: QueryGoal, role: ChunkRole, config: &FusionConfig) -> f32 {
+    let strength = match (goal, role) {
+        (QueryGoal::Definition, ChunkRole::Definition | ChunkRole::TypeDefinition) => 1.25,
+        (QueryGoal::TypeLookup, ChunkRole::TypeDefinition) => 1.5,
+        (QueryGoal::Implementation | QueryGoal::Behavior, ChunkRole::Implementation) => 1.5,
+        (QueryGoal::CallSite, ChunkRole::CallSite) => 1.5,
+        (QueryGoal::CallSite, ChunkRole::Implementation) => 0.35,
+        (QueryGoal::Concept, ChunkRole::Documentation) => 1.0,
+        (QueryGoal::Concept, ChunkRole::TypeDefinition | ChunkRole::Definition) => 0.5,
+        _ => 0.0,
+    };
+    strength * config.role_match_boost
+}
+
+/// 返回分数完全相同时的稳定角色优先级，数值越小越优先。
+fn role_priority(goal: QueryGoal, role: ChunkRole) -> u8 {
+    match goal {
+        QueryGoal::Implementation | QueryGoal::Behavior => match role {
+            ChunkRole::Implementation => 0,
+            ChunkRole::Definition | ChunkRole::TypeDefinition => 1,
+            ChunkRole::CallSite => 2,
+            ChunkRole::Other => 3,
+            ChunkRole::Test => 4,
+            ChunkRole::Config => 5,
+            ChunkRole::Documentation => 6,
+        },
+        QueryGoal::Definition | QueryGoal::TypeLookup => match role {
+            ChunkRole::Definition | ChunkRole::TypeDefinition => 0,
+            ChunkRole::Implementation => 1,
+            ChunkRole::Other => 2,
+            ChunkRole::CallSite => 3,
+            ChunkRole::Config => 4,
+            ChunkRole::Test => 5,
+            ChunkRole::Documentation => 6,
+        },
+        QueryGoal::CallSite => match role {
+            ChunkRole::CallSite => 0,
+            ChunkRole::Implementation => 1,
+            ChunkRole::Definition | ChunkRole::TypeDefinition => 2,
+            ChunkRole::Other => 3,
+            ChunkRole::Test => 4,
+            ChunkRole::Config => 5,
+            ChunkRole::Documentation => 6,
+        },
+        QueryGoal::Concept => match role {
+            ChunkRole::Documentation => 0,
+            ChunkRole::TypeDefinition | ChunkRole::Definition => 1,
+            ChunkRole::Implementation => 2,
+            ChunkRole::Config => 3,
+            ChunkRole::Other => 4,
+            ChunkRole::Test => 5,
+            ChunkRole::CallSite => 6,
+        },
+    }
 }
 
 /// 返回指定查询意图下某个检索通道的 RRF 权重。

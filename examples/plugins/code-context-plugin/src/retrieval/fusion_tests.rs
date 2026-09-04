@@ -628,6 +628,7 @@ fn score_decomposes_into_its_parts() {
         + result.debug.symbol_boost
         + result.debug.path_boost
         + result.debug.rerank_boost
+        + result.debug.role_boost
         - result.debug.penalty;
 
     assert!(
@@ -687,6 +688,49 @@ fn natural_language_query_returns_relevant_results() {
         "实际 {:?}",
         names(&results)
     );
+}
+
+/// 实现意图下，说明性 Markdown 不得凭更靠前的词法名次压过真实函数正文。
+#[test]
+fn implementation_intent_prefers_code_over_documentation() {
+    let host = RepoHost::new(&[
+        (
+            "src/plugin_ui.rs",
+            "/// 绘制插件管理页面。\npub fn render_plugin_dialog() {\n    draw_plugins();\n}\n",
+        ),
+        (
+            "docs/plugin-management.md",
+            "# 插件管理页面怎么绘制\n\n这份文档说明插件管理页面怎么绘制。\n",
+        ),
+    ]);
+    let mut build = IndexBuild::with_default_limits(repository());
+    assert_eq!(build.advance(&host, UNLIMITED), ScanProgress::Complete);
+    let (index, _) = build.into_parts();
+    let implementation = index
+        .chunks()
+        .find(|chunk| chunk.symbol_name.as_deref() == Some("render_plugin_dialog"))
+        .expect("应有实现 chunk");
+    let documentation = index
+        .chunks()
+        .find(|chunk| chunk.file_path == "docs/plugin-management.md")
+        .expect("应有文档 chunk");
+    let channels = vec![vec![
+        candidate(&documentation.id, CandidateSource::Lexical, 1),
+        candidate(&implementation.id, CandidateSource::Lexical, 2),
+    ]];
+
+    let results = fuse(
+        &channels,
+        "插件管理页面怎么绘制",
+        &index,
+        &FusionConfig::default(),
+        10,
+    );
+
+    assert_eq!(results[0].chunk_id, implementation.id);
+    assert_eq!(results[0].role, ChunkRole::Implementation);
+    assert_eq!(results[1].role, ChunkRole::Documentation);
+    assert!(results[1].debug.penalty > 0.0, "文档应记录明确扣分");
 }
 
 /// 路径过滤必须贯穿融合。

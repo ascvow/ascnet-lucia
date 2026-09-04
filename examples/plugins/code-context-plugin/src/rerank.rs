@@ -238,7 +238,7 @@ fn truncate_for_message(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::SymbolKind;
-    use crate::retrieval::FusionDebug;
+    use crate::retrieval::{ChunkRole, FusionDebug};
     use crate::testing::{http_json, RepoHost};
 
     /// 构造最小候选，便于聚焦 rerank 协议本身。
@@ -255,6 +255,7 @@ mod tests {
             parent_symbol: Some("Agent".to_string()),
             signature: Some(format!("pub fn {symbol}(&self)")),
             doc_comment: Some(format!("执行 {symbol}。")),
+            role: ChunkRole::Implementation,
             score,
             debug: FusionDebug {
                 ranks: Vec::new(),
@@ -262,10 +263,12 @@ mod tests {
                 symbol_boost: 0.0,
                 path_boost: 0.0,
                 rerank_boost: 0.0,
+                role_boost: 0.0,
                 penalty: 0.0,
                 rerank_matched_tokens: 0,
                 rerank_query_tokens: 0,
                 symbol_match: None,
+                role: ChunkRole::Implementation,
             },
         }
     }
