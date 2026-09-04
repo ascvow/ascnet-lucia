@@ -37,6 +37,8 @@ const MAX_PLUGIN_STATE_ENTRIES: usize = 1024;
 const MAX_PLUGIN_STORE_ENTRIES: usize = 8192;
 /// 持久存储所在的子目录；与私有状态分开存放，便于用户单独查看与备份。
 const DURABLE_SUBDIRECTORY: &str = "durable";
+/// 插件私有数据目录所在的子目录。
+const DATA_SUBDIRECTORY: &str = "data";
 /// 当前磁盘状态信封版本；该版本独立于插件 ABI 与 manifest 版本。
 const PLUGIN_STATE_SCHEMA_VERSION: u32 = 2;
 /// 临时文件名使用的进程内序号，避免同一进程连续写入发生冲突。
@@ -384,5 +386,100 @@ mod tests {
         );
         fs::remove_dir_all(root).expect("清理插件状态测试目录");
         fs::remove_file(external).expect("清理符号链接外部目标");
+    }
+}
+
+/// 解析并创建一个插件的私有数据目录。
+///
+/// 目录名由插件 ID 与 Host 生成的 `scope_key` 摘要而来，与持久 store 使用同一套隔离规则：
+/// 路径分隔符不会进入目录名，不同插件与不同项目作用域互不可见。**摘要刻意不含 Component
+/// 字节**——索引一类的数据在插件升级后必须还在，把代码字节算进命名空间会让每次重建都清空
+/// 用户数据。
+///
+/// 与持久 store 不同，这里**不设任何字节上限**：目录的内容完全由插件掌握，宿主要保证的是
+/// 访问边界（除本插件与宿主外无人可见），而不是替插件决定它的数据该有多大。
+///
+/// # Errors
+///
+/// 根目录为空、插件 ID 或作用域标识非法，以及目录创建失败时返回错误。
+pub(crate) fn plugin_data_dir(root: &Path, plugin_id: &str, scope_key: &str) -> Result<PathBuf> {
+    if root.as_os_str().is_empty() {
+        bail!("插件数据目录的根路径不能为空");
+    }
+    if plugin_id.trim().is_empty() {
+        bail!("插件数据目录的 plugin_id 不能为空");
+    }
+    if scope_key.trim().is_empty() || scope_key.len() > 256 {
+        bail!("插件数据目录的作用域标识无效");
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"lucia-plugin-data-v1\0");
+    update_identity_field(&mut digest, plugin_id.as_bytes());
+    update_identity_field(&mut digest, scope_key.as_bytes());
+    let path = root
+        .join(DATA_SUBDIRECTORY)
+        .join(format!("{:x}", digest.finalize()));
+    fs::create_dir_all(&path)
+        .with_context(|| format!("创建插件数据目录 `{}` 失败", path.display()))?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod data_dir_tests {
+    use super::*;
+
+    /// 创建一个用完即弃的测试根目录。
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "lucia-plugin-data-{label}-{}-{}",
+            std::process::id(),
+            STATE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// 同一插件与作用域必须稳定得到同一目录，不同插件或作用域必须互相隔离。
+    #[test]
+    fn data_dirs_are_stable_and_isolated() {
+        let root = temp_root("isolation");
+        let first = plugin_data_dir(&root, "code-context", "workspace:demo").expect("创建数据目录");
+
+        assert_eq!(
+            first,
+            plugin_data_dir(&root, "code-context", "workspace:demo").expect("重复解析")
+        );
+        assert_ne!(
+            first,
+            plugin_data_dir(&root, "other-plugin", "workspace:demo").expect("另一插件")
+        );
+        assert_ne!(
+            first,
+            plugin_data_dir(&root, "code-context", "workspace:other").expect("另一项目")
+        );
+        assert!(first.is_dir(), "数据目录必须已经创建");
+        fs::remove_dir_all(root).expect("清理插件数据测试目录");
+    }
+
+    /// 插件 ID 中的路径分隔符不得逃出根目录。
+    #[test]
+    fn data_dir_never_escapes_root() {
+        let root = temp_root("escape");
+        let path = plugin_data_dir(&root, "../../etc", "workspace:../..").expect("创建数据目录");
+
+        assert!(
+            path.starts_with(root.join(DATA_SUBDIRECTORY)),
+            "实际路径 {}",
+            path.display()
+        );
+        fs::remove_dir_all(root).expect("清理插件数据测试目录");
+    }
+
+    /// 非法输入必须被拒绝而不是落到一个可预测的共享目录上。
+    #[test]
+    fn invalid_identities_are_rejected() {
+        let root = temp_root("invalid");
+
+        assert!(plugin_data_dir(&root, "  ", "workspace:demo").is_err());
+        assert!(plugin_data_dir(&root, "demo", "").is_err());
+        assert!(plugin_data_dir(Path::new(""), "demo", "user").is_err());
     }
 }

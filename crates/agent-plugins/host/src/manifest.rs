@@ -537,7 +537,10 @@ manifest = "/opt/lucia/plugin.toml"
         let error = manifest
             .validate()
             .expect_err("空 allowlist 不应授予网络能力");
-        assert!(error.to_string().contains("allow_hosts"), "实际错误：{error}");
+        assert!(
+            error.to_string().contains("allow_hosts"),
+            "实际错误：{error}"
+        );
     }
 }
 
@@ -1008,6 +1011,18 @@ pub struct CapabilitySection {
     #[serde(default)]
     pub storage: bool,
 
+    /// 插件是否申请一个跨版本保留的私有数据目录。
+    ///
+    /// 与 `storage` 的区别是**形态与归属**：`storage` 是宿主代管的键值 JSON，每次写入重写
+    /// 全量并受字节上限约束，只适合 manifest 这类小元数据；数据目录则由插件自己完全掌握，
+    /// 想用什么格式、分几个文件、多大体积都由插件决定，宿主只负责把它 preopen 成 `/data`
+    /// 并保证除了本插件与宿主之外没有人能访问。
+    ///
+    /// 索引、向量库这类"体积随用户仓库增长"的数据必须放这里——把它们塞进 `storage` 会在
+    /// 超过上限后被静默截断，表现为功能随仓库变大而悄悄退化。
+    #[serde(default)]
+    pub data_dir: bool,
+
     /// 插件是否申请只读访问当前项目的历史会话。
     ///
     /// 该能力的覆盖面远大于它的名字：会话内容是 Agent 历史上见过的一切的并集——
@@ -1056,9 +1071,7 @@ impl HttpCapabilitySection {
             return Err(anyhow!("capabilities.http.allow_hosts 不能为空"));
         }
         if self.allow_hosts.len() > 64 {
-            return Err(anyhow!(
-                "capabilities.http.allow_hosts 不能超过 64 个主机"
-            ));
+            return Err(anyhow!("capabilities.http.allow_hosts 不能超过 64 个主机"));
         }
         let mut seen = HashSet::new();
         for host in &self.allow_hosts {
@@ -1073,7 +1086,9 @@ impl HttpCapabilitySection {
                 || normalized.contains('#')
                 || normalized.contains('\\')
                 || normalized.contains('*')
-                || normalized.bytes().any(|byte| byte.is_ascii_whitespace() || byte < 0x20)
+                || normalized
+                    .bytes()
+                    .any(|byte| byte.is_ascii_whitespace() || byte < 0x20)
             {
                 return Err(anyhow!(
                     "HTTP allowlist 主机格式无效：`{host}`（只允许主机名和可选端口）"
@@ -1112,9 +1127,7 @@ fn valid_http_host(host: &str) -> bool {
         return name.starts_with('[')
             && name.ends_with(']')
             && name.len() > 2
-            && name[1..name.len() - 1]
-                .parse::<std::net::IpAddr>()
-                .is_ok();
+            && name[1..name.len() - 1].parse::<std::net::IpAddr>().is_ok();
     }
     if name.parse::<std::net::IpAddr>().is_ok() {
         return true;
@@ -1312,9 +1325,7 @@ impl CapabilitySection {
             http.validate()?;
         }
         if self.secrets || !self.fs_write.is_empty() {
-            return Err(anyhow!(
-                "当前 Lucia 版本尚未实现插件 secret 或文件写入能力"
-            ));
+            return Err(anyhow!("当前 Lucia 版本尚未实现插件 secret 或文件写入能力"));
         }
         Ok(())
     }

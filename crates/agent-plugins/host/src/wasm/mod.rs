@@ -119,6 +119,32 @@ fn update_state_identity_field(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
+/// 解析插件私有数据目录；未申请该能力或应用未注入存储根时返回 `None`。
+///
+/// 数据目录按项目作用域隔离——索引天然属于某个仓库，用户级作用域会让不同项目互相污染。
+/// 应用没有提供项目身份时退回用户级，保证单仓库以外的场景依然可用。
+///
+/// # Errors
+///
+/// 目录创建失败时返回错误：申请了该能力却拿不到目录，属于必须让加载失败的配置问题，
+/// 静默降级只会让插件在运行时才发现自己无处落盘。
+fn plugin_data_dir_for(
+    manifest: &PluginManifest,
+    host_services: &PluginHostServices,
+) -> Result<Option<PathBuf>> {
+    if !manifest.capabilities.data_dir {
+        return Ok(None);
+    }
+    let Some(root) = host_services.persistent_state_dir() else {
+        return Ok(None);
+    };
+    let scope_key = host_services
+        .workspace_scope()
+        .filter(|scope| !scope.trim().is_empty())
+        .map_or_else(|| "user".to_string(), |scope| format!("workspace:{scope}"));
+    crate::state::plugin_data_dir(&root, &manifest.plugin.id, &scope_key).map(Some)
+}
+
 /// 为一次插件激活创建独占 controller，并把 manifest profile 请求与应用注册表求交集。
 async fn provision_agent_runtime(
     manifest: &PluginManifest,
@@ -503,8 +529,25 @@ impl WasmPluginHost {
         let mut cleanup_agent_runtime = AgentRuntimeLoadGuard::new(agent_runtime.clone());
         let loading: Result<Self> = async {
             let mut wasi = WasiCtxBuilder::new();
-            // 刻意保持最小 WASI：不继承环境变量、不预打开目录、不继承 stdio。
+            // 刻意保持最小 WASI：不继承环境变量、不继承 stdio，也不预打开工作区或任何
+            // 系统目录。唯一的例外是插件自己申请的私有数据目录，见下方。
             wasi.arg(&manifest.plugin.id);
+            // 声明 `data_dir` 的插件获得一个 preopen 成 `/data` 的私有目录。
+            //
+            // 这里刻意**不设容量上限**：索引、向量库这类数据的体积由用户仓库规模决定，
+            // 替插件猜一个字节上限只会让功能在超限后静默退化。需要约束的是访问边界——
+            // 目录按插件与项目作用域隔离，插件看不到 `/data` 以外的任何路径。
+            let data_dir = plugin_data_dir_for(&manifest, &host_services)?;
+            if let Some(path) = data_dir.as_ref() {
+                wasi.preopened_dir(
+                    path,
+                    "/data",
+                    wasmtime_wasi::DirPerms::all(),
+                    wasmtime_wasi::FilePerms::all(),
+                )
+                .into_anyhow()
+                .with_context(|| format!("预打开插件数据目录 `{}` 失败", path.display()))?;
+            }
 
             let contributions = Arc::new(ContributionRegistry::default());
             let store_limits = StoreLimitsBuilder::new()
