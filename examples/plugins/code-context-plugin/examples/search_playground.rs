@@ -387,7 +387,9 @@ fn parse_options() -> Result<Options> {
     // 默认跟随生产配置：只要给了密钥就开语义。中文自然语言查询几乎完全依赖语义通道
     // ——词法无法区分"对话"与"对话框"这类子串关系，默认关掉会给出误导性的糟糕结果。
     let mut semantic = std::env::var(API_KEY_ENV).is_ok();
-    let mut rerank = false;
+    // 重排同样默认开启：它是**条件触发**的，只在低置信度的自然语言查询上才真正发起请求，
+    // 因此打开它不等于每次查询都付 1.7 秒。诊断里的"实际发起"一行会如实反映是否触发。
+    let mut rerank = semantic;
     let mut parts: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
 
@@ -412,6 +414,7 @@ fn parse_options() -> Result<Options> {
                 semantic = false;
                 rerank = false;
             }
+            "--no-rerank" => rerank = false,
             "--rerank" => {
                 semantic = true;
                 rerank = true;
@@ -444,7 +447,8 @@ fn print_help() {
          \x20 --limit <数量>  返回条数，默认 {DEFAULT_LIMIT}\n\
          \x20 --semantic      开启语义检索；设置了 {API_KEY_ENV} 时默认即开启\n\
          \x20 --no-semantic   强制只跑符号 + 词法（中文自然语言查询会明显变差）\n\
-         \x20 --rerank        在语义之上再开模型重排（较慢）\n\
+         \x20 --rerank        在语义之上再开模型重排；设置了密钥时默认即开启\n\
+         \x20 --no-rerank     关闭模型重排，只保留本地融合排序\n\
          \x20 -h, --help      显示本帮助\n\n\
          不带查询时进入交互模式，可连续输入多条查询。"
     );
