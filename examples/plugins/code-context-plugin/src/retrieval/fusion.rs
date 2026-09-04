@@ -178,7 +178,7 @@ pub struct SearchResult {
     pub signature: Option<String>,
     /// 文档注释。
     pub doc_comment: Option<String>,
-    /// 融合后的最终分数。
+    /// 当前最终排序分数；启用模型重排时为相关度分数，否则为本地融合分数。
     pub score: f32,
     /// 内部诊断。
     pub debug: FusionDebug,

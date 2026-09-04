@@ -31,6 +31,9 @@ const DEFAULT_EMBEDDING_API_KEY_ENV: &str = "SILICONFLOW_API_KEY";
 /// 默认嵌入模型。
 const DEFAULT_EMBEDDING_MODEL: &str = "BAAI/bge-m3";
 
+/// 默认候选重排模型。
+const DEFAULT_RERANK_MODEL: &str = "Qwen/Qwen3-Reranker-4B";
+
 /// 默认嵌入维度。
 const DEFAULT_EMBEDDING_DIMENSION: u32 = 1_024;
 
@@ -90,6 +93,8 @@ struct SearchOptions {
     rebuild_cache: bool,
     /// 语义嵌入配置；`None` 表示用户显式要求只运行符号与 BM25 检索。
     embedding: Option<EmbeddingOptions>,
+    /// 可选的远端候选重排模型。
+    rerank_model: Option<String>,
 }
 
 /// 全仓库语义向量化使用的端点配置。
@@ -122,7 +127,7 @@ impl Default for EmbeddingOptions {
     }
 }
 
-/// 示例程序使用的受限嵌入 HTTP 客户端。
+/// 示例程序使用的受限模型 HTTP 客户端。
 ///
 /// API 密钥只保存在该宿主侧对象中，不会写入激活元数据、插件请求或终端输出。
 struct EmbeddingEndpoint {
@@ -210,11 +215,19 @@ fn run() -> Result<()> {
     let host = match options.embedding.as_ref() {
         Some(embedding) => {
             let endpoint = EmbeddingEndpoint::new(embedding)?;
-            configure_semantic_index(&mut context, embedding, endpoint.endpoint_id());
+            configure_semantic_index(
+                &mut context,
+                embedding,
+                options.rerank_model.as_deref(),
+                endpoint.endpoint_id(),
+            );
             eprintln!(
                 "将先为整个仓库生成语义向量：模型 {}，维度 {}，批大小 {}",
                 embedding.model, embedding.dimension, embedding.batch_size
             );
+            if let Some(model) = options.rerank_model.as_deref() {
+                eprintln!("搜索结果将使用重排模型：{model}");
+            }
             host.with_http_handler(move |request| endpoint.send(request))
         }
         None => {
@@ -261,6 +274,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Search
     let mut cache_enabled = true;
     let mut rebuild_cache = false;
     let mut lexical_only = false;
+    let mut rerank_model = Some(DEFAULT_RERANK_MODEL.to_string());
     let mut query_parts = Vec::new();
     let mut args = args.into_iter();
 
@@ -291,6 +305,16 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Search
             }
             "--lexical-only" => {
                 lexical_only = true;
+            }
+            "--no-rerank" => {
+                rerank_model = None;
+            }
+            "--rerank-model" => {
+                let model = next_value(&mut args, "--rerank-model")?;
+                if model.trim().is_empty() {
+                    return Err(anyhow!("--rerank-model 不能为空"));
+                }
+                rerank_model = Some(model);
             }
             "--embedding-base-url" => {
                 embedding.base_url = next_value(&mut args, "--embedding-base-url")?;
@@ -341,6 +365,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Search
         cache_enabled,
         rebuild_cache,
         embedding: (!lexical_only).then_some(embedding),
+        rerank_model: (!lexical_only).then_some(rerank_model).flatten(),
     }))
 }
 
@@ -460,15 +485,15 @@ impl EmbeddingEndpoint {
         format!("search-example:{}", content_hash(self.base_url.as_str()))
     }
 
-    /// 转发一条 Guest 嵌入请求并注入宿主侧凭证。
+    /// 转发一条 Guest 模型请求并注入宿主侧凭证。
     ///
     /// # Errors
     ///
     /// 请求不是 POST、路径可能逃离 base URL、携带敏感 header、网络失败或响应超过限制时
-    /// 返回错误。非 2xx 响应仍作为 [`HttpResponse`] 返回，由嵌入 provider 解释正文。
+    /// 返回错误。非 2xx 响应仍作为 [`HttpResponse`] 返回，由插件内对应协议解释正文。
     fn send(&self, request: &HttpRequest) -> agent_plugin::Result<HttpResponse> {
         if !request.method.eq_ignore_ascii_case("POST") {
-            return Err(anyhow!("嵌入示例只允许 POST，收到 {}", request.method));
+            return Err(anyhow!("搜索示例只允许 POST，收到 {}", request.method));
         }
         validate_relative_path(&request.path)?;
         let url = self
@@ -485,18 +510,32 @@ impl EmbeddingEndpoint {
         }
         builder = builder.header("authorization", &format!("Bearer {}", self.api_key));
 
-        let input_count = request
+        let request_body = request
             .body
             .as_deref()
-            .and_then(|body| serde_json::from_str::<Value>(body).ok())
-            .and_then(|body| body.get("input").and_then(Value::as_array).map(Vec::len))
-            .unwrap_or(0);
-        let batch = self.batches.get() + 1;
-        let inputs = self.inputs.get() + input_count;
-        self.batches.set(batch);
-        self.inputs.set(inputs);
-        if batch == 1 || batch % 10 == 0 {
-            eprintln!("正在生成语义向量：已提交 {batch} 批、{inputs} 条输入");
+            .and_then(|body| serde_json::from_str::<Value>(body).ok());
+        if request.path.trim_matches('/') == "rerank" {
+            let candidates = request_body
+                .as_ref()
+                .and_then(|body| body.get("documents"))
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            eprintln!("正在使用模型重排 {candidates} 个候选");
+        } else {
+            let input_count = request_body
+                .as_ref()
+                .and_then(|body| body.get("input"))
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let batch = self.batches.get() + 1;
+            let inputs = self.inputs.get() + input_count;
+            self.batches.set(batch);
+            self.inputs.set(inputs);
+            if batch == 1 || batch % 10 == 0 {
+                eprintln!("正在生成语义向量：已提交 {batch} 批、{inputs} 条输入");
+            }
         }
 
         let response = match request.body.as_deref() {
@@ -556,6 +595,7 @@ fn is_sensitive_header(name: &str) -> bool {
 fn configure_semantic_index(
     context: &mut ActivationContext,
     options: &EmbeddingOptions,
+    rerank_model: Option<&str>,
     endpoint_id: String,
 ) {
     context
@@ -579,6 +619,11 @@ fn configure_semantic_index(
     context
         .metadata
         .insert("http_endpoint_id".to_string(), endpoint_id);
+    if let Some(model) = rerank_model {
+        context
+            .metadata
+            .insert("rerank_model".to_string(), model.to_string());
+    }
 }
 
 /// 从插件清单目录推导 Lucia 仓库根目录。
@@ -1016,7 +1061,7 @@ fn rust_declaration_start(signature: &str) -> Option<usize> {
 /// 打印命令用法与可选参数。
 fn print_help() {
     println!(
-        "用法：\n  cargo run -p code-context-plugin --example search_repository --features test-support -- [选项] [查询]\n\n未提供查询时，索引完成后进入交互搜索，可连续输入多条查询。语义向量默认按仓库持久化，第二次运行只计算新增或变化的代码块。\n\n选项：\n  --root <路径>                         仓库根目录，默认使用当前 Lucia 仓库\n  --max-results <数量>                  最多返回结果数，默认 10\n  --token-budget <数量>                 代码片段 token 预算，默认 8000\n  --path-scope <前缀>                   限定仓库相对路径，可重复指定\n  --cache-dir <目录>                    索引缓存目录，默认 ~/.lucia/code-context\n  --no-cache                            不读取或写入跨进程索引缓存\n  --rebuild-cache                       删除当前仓库缓存后重新生成全部向量\n  --embedding-base-url <URL>            OpenAI 兼容端点，默认使用 SiliconFlow\n  --embedding-api-key-env <变量名>      API 密钥环境变量，默认 SILICONFLOW_API_KEY\n  --embedding-model <模型>              嵌入模型，默认 BAAI/bge-m3\n  --embedding-dimension <维度>          向量维度，默认 1024\n  --embedding-batch-size <数量>         单批代码块数，默认 32\n  --embedding-send-dimensions <布尔值>  是否发送 dimensions，默认 false\n  --lexical-only                        跳过向量化，只运行符号与 BM25 检索\n  -h, --help                            显示帮助"
+        "用法：\n  cargo run -p code-context-plugin --example search_repository --features test-support -- [选项] [查询]\n\n未提供查询时，索引完成后进入交互搜索，可连续输入多条查询。语义向量默认按仓库持久化，第二次运行只计算新增或变化的代码块。\n\n选项：\n  --root <路径>                         仓库根目录，默认使用当前 Lucia 仓库\n  --max-results <数量>                  最多返回结果数，默认 10\n  --token-budget <数量>                 代码片段 token 预算，默认 8000\n  --path-scope <前缀>                   限定仓库相对路径，可重复指定\n  --cache-dir <目录>                    索引缓存目录，默认 ~/.lucia/code-context\n  --no-cache                            不读取或写入跨进程索引缓存\n  --rebuild-cache                       删除当前仓库缓存后重新生成全部向量\n  --embedding-base-url <URL>            OpenAI 兼容端点，默认使用 SiliconFlow\n  --embedding-api-key-env <变量名>      API 密钥环境变量，默认 SILICONFLOW_API_KEY\n  --embedding-model <模型>              嵌入模型，默认 BAAI/bge-m3\n  --embedding-dimension <维度>          向量维度，默认 1024\n  --embedding-batch-size <数量>         单批代码块数，默认 32\n  --embedding-send-dimensions <布尔值>  是否发送 dimensions，默认 false\n  --rerank-model <模型>                 重排模型，默认 Qwen/Qwen3-Reranker-4B\n  --no-rerank                           禁用远端模型重排，只使用本地融合排序\n  --lexical-only                        关闭向量化与模型重排，只运行符号和 BM25 检索\n  -h, --help                            显示帮助"
     );
 }
 
@@ -1058,6 +1103,7 @@ mod tests {
         assert!(options.cache_enabled);
         assert!(options.rebuild_cache);
         assert_eq!(options.embedding, Some(EmbeddingOptions::default()));
+        assert_eq!(options.rerank_model.as_deref(), Some(DEFAULT_RERANK_MODEL));
     }
 
     /// 嵌入端点选项必须覆盖默认值，并保持密钥只通过环境变量引用。
@@ -1077,6 +1123,8 @@ mod tests {
                 "16",
                 "--embedding-send-dimensions",
                 "true",
+                "--rerank-model",
+                "custom-reranker",
                 "权限检查",
             ]
             .into_iter()
@@ -1096,6 +1144,7 @@ mod tests {
                 send_dimensions: true,
             })
         );
+        assert_eq!(options.rerank_model.as_deref(), Some("custom-reranker"));
     }
 
     /// 纯词法开关必须显式关闭语义向量化，便于无网络环境单独验证基础检索。
@@ -1110,6 +1159,7 @@ mod tests {
         .expect("不应进入帮助分支");
 
         assert!(options.embedding.is_none());
+        assert!(options.rerank_model.is_none());
     }
 
     /// 相对路径校验必须阻止端点逃逸与父目录穿越。
@@ -1130,8 +1180,24 @@ mod tests {
 
         assert!(options.query.is_none());
         assert_eq!(options.embedding, Some(EmbeddingOptions::default()));
+        assert_eq!(options.rerank_model.as_deref(), Some(DEFAULT_RERANK_MODEL));
         assert!(options.cache_enabled);
         assert!(!options.rebuild_cache);
+    }
+
+    /// 用户必须能单独关闭模型重排，同时保留语义向量检索。
+    #[test]
+    fn no_rerank_keeps_embedding_enabled() {
+        let options = parse_options(
+            ["--no-rerank", "PluginHostApi"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("参数应有效")
+        .expect("不应进入帮助分支");
+
+        assert_eq!(options.embedding, Some(EmbeddingOptions::default()));
+        assert!(options.rerank_model.is_none());
     }
 
     /// 禁用缓存时不得同时请求删除缓存，避免选项语义互相矛盾。

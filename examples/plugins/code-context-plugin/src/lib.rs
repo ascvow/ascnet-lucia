@@ -6,14 +6,14 @@
 //! # 当前阶段
 //!
 //! 已完成仓库扫描、结构与检索索引、上下文构建、语义向量索引（含持久化），以及按写入
-//! 事件触发的文件级增量重建。`code_search` 返回经 RRF 融合、去重、父子抑制与 token
-//! 预算打包后的真实检索结果。
+//! 事件触发的文件级增量重建。`code_search` 返回经 RRF 融合、可选模型重排、去重、父子
+//! 抑制与 token 预算打包后的真实检索结果。
 //!
 //! # 能力边界
 //!
-//! 本插件只申请 `workspace_read` 与 `storage`。工作区读取由 Host 注入可信根并限制为只读，
-//! 权限下限仍为 `read`。插件刻意不申请进程、网络与会话能力——那些会抬高工具权限，
-//! 使 `code_search` 每次调用都需要额外审批。详见 `plugin.toml` 中逐项说明。
+//! 本插件申请 `workspace_read`、`storage` 与受限 `http`。工作区读取由 Host 注入可信根并
+//! 限制为只读；HTTP 仅访问 manifest 白名单内、由应用注入地址与凭证的模型端点。插件不
+//! 申请进程与会话能力。HTTP 会把工具权限下限提升为最保守档位，详见 `plugin.toml`。
 //!
 //! # 并发与取消
 //!
@@ -31,6 +31,7 @@ mod index;
 mod model;
 mod parser;
 mod repository;
+mod rerank;
 mod retrieval;
 mod semantic;
 mod storage;
@@ -166,6 +167,8 @@ pub struct CodeContextPlugin {
     ///
     /// 与 `unavailable_reason` 区分：后者会让 `code_search` 拒绝服务，这个不会。
     degraded_reason: Option<String>,
+    /// 最近一次检索中模型重排失败的降级原因；下一次检索开始时清空。
+    last_rerank_degraded_reason: Option<String>,
     /// Host 返回的 `code_search` 公开名称；存在时表示工具已经注册给 Agent。
     registered_tool_name: Option<String>,
 }
@@ -717,7 +720,15 @@ impl CodeContextPlugin {
         } else {
             None
         };
-        let mut results = self.search_results(host, &request.query, single_scope, limit);
+        // 模型重排启用时把更多已排序候选交给上下文层，使父子抑制、路径并集和单文件
+        // 多样性过滤之后仍有足够条目补满用户请求的数量。
+        let context_candidate_limit = if self.config.rerank_model.is_some() {
+            rerank::candidate_limit(limit)
+        } else {
+            limit
+        };
+        let mut results =
+            self.search_results(host, &request.query, single_scope, context_candidate_limit);
         if request.path_scope.len() > 1 {
             results.retain(|result| {
                 request
@@ -751,7 +762,15 @@ impl CodeContextPlugin {
         };
 
         let stats = self.index_stats();
-        let degraded = self.degraded_reason.clone();
+        let degraded = match (
+            self.degraded_reason.as_deref(),
+            self.last_rerank_degraded_reason.as_deref(),
+        ) {
+            (Some(index), Some(rerank)) => Some(format!("{index}；{rerank}")),
+            (Some(index), None) => Some(index.to_string()),
+            (None, Some(rerank)) => Some(rerank.to_string()),
+            (None, None) => None,
+        };
         Ok(tool::search_result(
             &call,
             &bundle,
@@ -772,7 +791,9 @@ impl CodeContextPlugin {
         path_scope: Option<&str>,
         limit: usize,
     ) -> Vec<SearchResult> {
+        self.last_rerank_degraded_reason = None;
         let query_vector = self.embed_query(host, query);
+        let rerank_model = self.config.rerank_model.clone();
         let Some(context) = self.repository.as_ref() else {
             return Vec::new();
         };
@@ -780,14 +801,28 @@ impl CodeContextPlugin {
         else {
             return Vec::new();
         };
-        retrieval.search_hybrid(
+        let recall_limit = rerank_model
+            .as_ref()
+            .map_or(limit, |_| rerank::candidate_limit(limit));
+        let mut results = retrieval.search_hybrid(
             index,
             &context.semantic,
             query,
             query_vector.as_deref(),
             path_scope,
-            limit,
-        )
+            recall_limit,
+        );
+        if let Some(model) = rerank_model {
+            match rerank::rerank_results(host, &model, query, &results) {
+                Ok(reranked) => results = reranked,
+                Err(reason) => {
+                    self.last_rerank_degraded_reason =
+                        Some(format!("模型重排不可用，已保留本地融合排序：{reason}"));
+                }
+            }
+        }
+        results.truncate(limit);
+        results
     }
 
     /// 计算查询向量；嵌入不可用或语义索引未就绪时返回 `None`。
@@ -1894,6 +1929,39 @@ mod tests {
 
         assert!(!results.is_empty(), "两路检索仍应有结果");
         assert!(host.http_requests().is_empty(), "不应为查询发起嵌入");
+    }
+
+    /// 模型重排失败时必须完整保留本地融合结果，并记录本次查询的降级原因。
+    #[test]
+    fn rerank_failure_keeps_local_results() {
+        let fixture = &[(
+            "src/permission.rs",
+            "/// 检查权限。\npub fn check_permission() {}\n\n/// 描述权限。\npub fn describe_permission() {}\n",
+        )];
+        let host = crate::testing::RepoHost::new(fixture)
+            .with_http_responses(vec![crate::testing::http_json(503, "rerank unavailable")]);
+        let mut context = activation_context("/repo/a");
+        context
+            .metadata
+            .insert("embedding_mode".into(), "local".into());
+        context
+            .metadata
+            .insert("rerank_model".into(), "test-reranker".into());
+        let mut plugin = indexed(&host, context);
+        plugin.config.rerank_model = None;
+        let expected = plugin.search_results(&host, "permission", None, 10);
+        plugin.config.rerank_model = Some("test-reranker".into());
+
+        let actual = plugin.search_results(&host, "permission", None, 10);
+
+        assert_eq!(actual, expected, "失败降级不得改变原有融合顺序");
+        assert!(plugin
+            .last_rerank_degraded_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("HTTP 503")));
+        let requests = host.http_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "rerank");
     }
 
     /// 卸载后必须释放仓库上下文并回到未索引状态。

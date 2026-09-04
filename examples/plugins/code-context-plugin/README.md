@@ -1,7 +1,7 @@
 # Code Context Engine Plugin
 
 Code Context Engine 是标准 Lucia WASM 插件，目标是为 Agent 提供稳定的 `code_search` 仓库检索工具。
-当前已实现仓库扫描、结构化解析、增量索引、符号与 BM25 检索、RRF 融合和上下文打包。
+当前已实现仓库扫描、结构化解析、增量索引、符号与 BM25 检索、RRF 融合、可选模型重排和上下文打包。
 
 ## 当前状态
 
@@ -23,6 +23,7 @@ Guest 负责配置校验、仓库身份、索引状态、manifest 兼容性、�
 - `src/model.rs`：仓库身份、`IndexStatus`、`IndexManifest` 与稳定领域类型
 - `src/storage.rs`：Host `store` 的 Workspace 作用域适配
 - `src/embedding.rs`：嵌入 provider、批量请求与降级处理
+- `src/rerank.rs`：扩大候选召回、源码组装、远端模型重排与失败降级
 - `src/repository/`：全仓库扫描、忽略规则和语言识别
 - `src/parser/`：Rust、TypeScript、JavaScript、Python 与 Go 结构化解析
 - `src/retrieval/`：符号、BM25、语义候选与 RRF 融合
@@ -43,6 +44,7 @@ Guest 负责配置校验、仓库身份、索引状态、manifest 兼容性、�
 
 - `enabled = true | false`，默认 `true`
 - `embedding_mode = local | api`，默认 `api`
+- `rerank_model = <模型名>`，可选；配置后调用同一 HTTP 端点的 `/v1/rerank`
 
 `api` 模式通过 Host 受限 HTTP 能力调用用户配置的兼容嵌入端点；端点未配置或请求失败时，
 检索自动降级为符号与 BM25 两路。`local` 模式当前仍返回未配置状态。
@@ -50,7 +52,8 @@ Guest 负责配置校验、仓库身份、索引状态、manifest 兼容性、�
 ## 直接搜索当前仓库
 
 首次运行默认通过 SiliconFlow `BAAI/bge-m3` 为整个仓库的全部代码块生成向量，再执行符号、
-BM25 与语义三路混合检索。API 密钥只从环境变量读取，不写入命令参数、缓存或插件元数据：
+BM25 与语义三路混合检索，并通过 `Qwen/Qwen3-Reranker-4B` 对扩大后的候选源码重排。API 密钥
+只从环境变量读取，不写入命令参数、缓存或插件元数据：
 
 ```bash
 export SILICONFLOW_API_KEY='<你的密钥>'
@@ -74,15 +77,19 @@ cargo run -p code-context-plugin --example search_repository --features test-sup
 可覆盖默认缓存位置，`--rebuild-cache` 强制重新生成全部向量，`--no-cache` 禁用跨进程缓存。
 使用
 `--embedding-base-url`、`--embedding-api-key-env`、`--embedding-model`、
-`--embedding-dimension` 和 `--embedding-batch-size` 可以连接其他 OpenAI 兼容嵌入端点。
+`--embedding-dimension` 和 `--embedding-batch-size` 可以连接其他兼容端点；`--rerank-model`
+可以更换重排模型，`--no-rerank` 可以只保留本地融合排序。
 
 融合排序会区分查询形态：`Agent`、`PermissionManager::check` 这类独立标识符保留精确符号
 提升；“一个agent对话”这类自然语言会压低普通精确词的符号权重，语义通道可用时同时提高
 语义权重。语义不可用时，前缀与后缀符号匹配恢复标准权重，避免纯词法降级丢失分散在不同
 代码块里的有效信号。多字中文查询只用双字词元参与 BM25，单字查询仍然可用。
 
-没有嵌入端点时可以显式追加 `--lexical-only`，只验证符号与 BM25 检索。该模式不会生成
-向量，也不能作为语义搜索验收结果。
+模型重排会把查询以及候选的路径、符号、注释和源码片段发送到用户配置的 API 端点。接口
+失败时搜索不会中断，而是保留原有 RRF 融合顺序并在结果提示中说明降级原因。
+
+没有模型端点时可以显式追加 `--lexical-only`，只验证符号与 BM25 检索。该模式不会生成
+向量或调用 rerank，也不能作为语义搜索验收结果。
 
 ## 构建与测试
 

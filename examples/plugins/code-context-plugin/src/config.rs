@@ -80,6 +80,11 @@ pub struct CodeContextConfig {
     /// 部分 OpenAI 兼容端点（如 SiliconFlow 的 `BAAI/bge-m3`）不接受该参数，设为 `false`
     /// 可避免 400 错误。维度校验仍在返回时执行，因此关闭此项不影响安全性。
     pub embedding_send_dimensions: bool,
+    /// 可选的远端候选重排模型。
+    ///
+    /// 配置后，插件先扩大混合检索候选池，再把查询与候选源码提交给兼容 `/v1/rerank`
+    /// 的端点；未配置时保持纯本地融合排序。
+    pub rerank_model: Option<String>,
     /// 宿主注入的 HTTP 端点摘要；未配置 HTTP 时为 `None`。
     ///
     /// 由宿主从 `base_url` 计算后作为可信元数据下发，插件看不到地址与凭证。它参与嵌入
@@ -96,6 +101,7 @@ impl Default for CodeContextConfig {
             embedding_dimension: DEFAULT_EMBEDDING_DIMENSION,
             embedding_batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
             embedding_send_dimensions: true,
+            rerank_model: None,
             http_endpoint_id: None,
         }
     }
@@ -153,6 +159,15 @@ impl CodeContextConfig {
                 }
             };
         }
+        if let Some(value) = metadata.get("rerank_model") {
+            let model = value.trim();
+            if model.is_empty() {
+                return Err(CodeContextError::InvalidConfiguration(
+                    "rerank_model 不能为空".into(),
+                ));
+            }
+            config.rerank_model = Some(model.to_string());
+        }
         // 该键由宿主注入，不接受插件配置伪造：宿主写入发生在用户配置合并之后。
         config.http_endpoint_id = metadata
             .get("http_endpoint_id")
@@ -206,10 +221,15 @@ mod tests {
         let config = CodeContextConfig::from_metadata(&metadata(&[
             ("enabled", "false"),
             ("embedding_mode", "local"),
+            ("rerank_model", "Qwen/Qwen3-Reranker-4B"),
         ]))
         .expect("显式配置应可解析");
         assert!(!config.enabled);
         assert_eq!(config.embedding_mode, EmbeddingMode::Local);
+        assert_eq!(
+            config.rerank_model.as_deref(),
+            Some("Qwen/Qwen3-Reranker-4B")
+        );
     }
 
     /// 宿主注入的其他元数据不得干扰配置解析。
