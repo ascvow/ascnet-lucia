@@ -131,6 +131,11 @@ fn run() -> Result<()> {
     eprintln!("正在索引 {} 个文件：{}", files.len(), root.display());
     if options.semantic {
         eprintln!("语义检索已开启（{EMBEDDING_MODEL}），首次索引需要调用嵌入接口，请稍候");
+    } else {
+        eprintln!(
+            "语义检索未开启：只跑符号 + 词法。中文自然语言查询会明显变差——词法无法区分\
+             「对话」与「对话框」这类子串关系。设置 {API_KEY_ENV} 后默认即可开启。"
+        );
     }
     let started = Instant::now();
     for round in 0..2_000 {
@@ -379,7 +384,9 @@ fn parse_options() -> Result<Options> {
     // 默认索引整个 Lucia 仓库：试验场的意义就是在真实规模的代码上试检索。
     let mut root = repository_root();
     let mut limit = DEFAULT_LIMIT;
-    let mut semantic = false;
+    // 默认跟随生产配置：只要给了密钥就开语义。中文自然语言查询几乎完全依赖语义通道
+    // ——词法无法区分"对话"与"对话框"这类子串关系，默认关掉会给出误导性的糟糕结果。
+    let mut semantic = std::env::var(API_KEY_ENV).is_ok();
     let mut rerank = false;
     let mut parts: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -401,6 +408,10 @@ fn parse_options() -> Result<Options> {
                     .context("--limit 需要正整数")?;
             }
             "--semantic" => semantic = true,
+            "--no-semantic" => {
+                semantic = false;
+                rerank = false;
+            }
             "--rerank" => {
                 semantic = true;
                 rerank = true;
@@ -431,7 +442,8 @@ fn print_help() {
          选项：\n\
          \x20 --root <目录>   被索引的目录，默认当前 Lucia 仓库根\n\
          \x20 --limit <数量>  返回条数，默认 {DEFAULT_LIMIT}\n\
-         \x20 --semantic      开启语义检索，需要环境变量 {API_KEY_ENV}\n\
+         \x20 --semantic      开启语义检索；设置了 {API_KEY_ENV} 时默认即开启\n\
+         \x20 --no-semantic   强制只跑符号 + 词法（中文自然语言查询会明显变差）\n\
          \x20 --rerank        在语义之上再开模型重排（较慢）\n\
          \x20 -h, --help      显示本帮助\n\n\
          不带查询时进入交互模式，可连续输入多条查询。"
