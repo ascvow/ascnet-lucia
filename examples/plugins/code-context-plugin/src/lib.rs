@@ -281,6 +281,8 @@ struct RepositoryContext {
     dirty_paths: BTreeSet<String>,
     /// 尚未收到终态结果的写入调用，键为运行 ID 与调用 ID 的组合。
     pending_writes: BTreeMap<String, incremental::PendingWrite>,
+    /// 仓库生命周期内的查询向量缓存：空间 ID、查询摘要、向量；最多 32 条，不落盘。
+    query_vectors: Vec<(String, String, Vec<f32>)>,
 }
 
 /// Code Context Engine 插件。
@@ -538,6 +540,7 @@ impl CodeContextPlugin {
             semantic,
             dirty_paths: BTreeSet::new(),
             pending_writes: BTreeMap::new(),
+            query_vectors: Vec::new(),
         });
         self.index_status = status;
         Ok(())
@@ -1167,8 +1170,31 @@ impl CodeContextPlugin {
             return None;
         }
         let provider = embedding::select_provider(&self.config, host);
+        let space_id = provider.space()?.id();
+        let query_hash = content_hash(query);
+        if let Some(vector) = self.repository.as_ref().and_then(|context| {
+            context
+                .query_vectors
+                .iter()
+                .find(|(space, hash, _)| space == &space_id && hash == &query_hash)
+        }) {
+            return Some(vector.2.clone());
+        }
         match provider.embed_query(query) {
-            Ok(vector) => Some(vector),
+            Ok(vector) => {
+                // 不保留失败或异常超大输入；按 FIFO 淘汰，缓存向量总量最多约 1 MiB。
+                if vector.len() <= 8192 {
+                    if let Some(context) = self.repository.as_mut() {
+                        if context.query_vectors.len() == 32 {
+                            context.query_vectors.remove(0);
+                        }
+                        context
+                            .query_vectors
+                            .push((space_id, query_hash, vector.clone()));
+                    }
+                }
+                Some(vector)
+            }
             Err(error) => {
                 self.degraded_reason = Some(format!("查询嵌入失败，已降级为两路检索：{error}"));
                 None
@@ -2375,6 +2401,49 @@ mod tests {
             "语义索引建成后应报告 Ready 而不是 Degraded"
         );
         assert!(!host.http_requests().is_empty(), "必须真的调用嵌入端点");
+    }
+
+    /// 重复查询省去请求，缓存有界且不能跨嵌入空间或仓库生命周期复用。
+    #[test]
+    fn query_vectors_are_bounded_and_scoped_to_space_and_repository() {
+        let host = crate::testing::RepoHost::new(SEMANTIC_FIXTURE).with_echo_embeddings(4);
+        let mut plugin = indexed(&host, api_activation_context("/repo/a"));
+        let initial = host.http_requests().len();
+        let first = plugin.embed_query(&host, "库存查询").expect("查询向量");
+        assert_eq!(plugin.embed_query(&host, "库存查询"), Some(first));
+        assert_eq!(host.http_requests().len(), initial + 1);
+        for n in 0..33 {
+            plugin
+                .embed_query(&host, &format!("查询 {n}"))
+                .expect("查询向量");
+        }
+        assert_eq!(plugin.repository.as_ref().unwrap().query_vectors.len(), 32);
+        let count = host.http_requests().len();
+        plugin
+            .embed_query(&host, "库存查询")
+            .expect("被淘汰查询重新嵌入");
+        assert_eq!(host.http_requests().len(), count + 1);
+        plugin.repository.as_mut().unwrap().query_vectors[31].0 = "old-space".into();
+        plugin
+            .embed_query(&host, "库存查询")
+            .expect("旧空间不可复用");
+        assert_eq!(host.http_requests().len(), count + 2);
+        plugin
+            .activate(&host, api_activation_context("/repo/b"))
+            .expect("切换仓库");
+        assert!(plugin.repository.as_ref().unwrap().query_vectors.is_empty());
+    }
+
+    /// 瞬时请求失败不得进入缓存，恢复后必须重新生成查询向量。
+    #[test]
+    fn failed_query_embeddings_are_not_cached() {
+        let good = crate::testing::RepoHost::new(SEMANTIC_FIXTURE).with_echo_embeddings(4);
+        let mut plugin = indexed(&good, api_activation_context("/repo/a"));
+        let failing = crate::testing::RepoHost::new(SEMANTIC_FIXTURE);
+        assert!(plugin.embed_query(&failing, "未缓存查询").is_none());
+        assert!(plugin.embed_query(&failing, "未缓存查询").is_none());
+        assert!(plugin.repository.as_ref().unwrap().query_vectors.is_empty());
+        assert!(plugin.embed_query(&good, "未缓存查询").is_some());
     }
 
     /// 磁盘快照必须让下一进程跳过未变化代码块，并让内容变化的代码块重新嵌入。
