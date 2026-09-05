@@ -1002,6 +1002,16 @@ impl CodeContextPlugin {
                     &context::ContextConfig {
                         token_budget: request.token_budget as u32,
                         max_results: limit,
+                        prefer_method_locations: {
+                            let query = AnalyzedQuery::analyze(&request.query);
+                            query.intent == QueryIntent::NaturalLanguage
+                                && !matches!(
+                                    query.goal,
+                                    QueryGoal::TypeLookup
+                                        | QueryGoal::Definition
+                                        | QueryGoal::CallSite
+                                )
+                        },
                         ..context::ContextConfig::default()
                     },
                 ),

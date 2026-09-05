@@ -227,6 +227,36 @@ fn containment_keeps_the_higher_scoring_entry() {
 // 多样性与预算
 // ---------------------------------------------------------------------------
 
+/// 方法定位只收窄近似同分父块，默认模式和低相关子项仍保留父块。
+#[test]
+fn near_tied_methods_are_narrowed_only_for_location_queries() {
+    let (_, index, _) = fixture(FIXTURE);
+    let chunk = index.chunks().next().expect("代码块");
+    for (enabled, child_score, expected) in [
+        (true, 0.9998, (20, 29)),
+        (false, 0.9998, (1, 100)),
+        (true, 0.5, (1, 100)),
+    ] {
+        let mut parent = synthetic(chunk, 1, 100);
+        parent.symbol_kind = Some(crate::model::SymbolKind::Constant);
+        parent.debug.model_rerank_score = Some(0.9999);
+        let mut child = synthetic(chunk, 20, 29);
+        child.symbol_kind = Some(crate::model::SymbolKind::Function);
+        child.debug.model_rerank_score = Some(child_score);
+        let selected = select(
+            &index,
+            vec![parent, child],
+            &ContextConfig {
+                prefer_method_locations: enabled,
+                ..ContextConfig::default()
+            },
+            &mut ContextStats::default(),
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!((selected[0].start_line, selected[0].end_line), expected);
+    }
+}
+
 /// 单个文件的贡献必须受配额约束。
 #[test]
 fn diversity_caps_per_file_contribution() {

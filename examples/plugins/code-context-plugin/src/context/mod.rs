@@ -49,6 +49,8 @@ pub struct ContextConfig {
     ///
     /// 设为 0 时不返回任何上下文条目。
     pub max_snippet_lines: u32,
+    /// 自然语言定位时，模型近似同分的容器与方法优先展示明显更短的方法。
+    pub prefer_method_locations: bool,
 }
 
 impl Default for ContextConfig {
@@ -59,6 +61,7 @@ impl Default for ContextConfig {
             max_per_file: 4,
             merge_gap_lines: 0,
             max_snippet_lines: 240,
+            prefer_method_locations: false,
         }
     }
 }
@@ -373,8 +376,23 @@ fn select(
             let container = &kept[index];
             let container_span = container.end_line.saturating_sub(container.start_line) + 1;
             let candidate_span = candidate.end_line.saturating_sub(candidate.start_line) + 1;
+            // 仅在模型分数近似相等时牺牲容器范围；不把明显低相关的方法提升为答案。
+            let near_tied_method = config.prefer_method_locations
+                && candidate.symbol_kind == Some(crate::model::SymbolKind::Function)
+                && matches!(
+                    container.symbol_kind,
+                    Some(
+                        crate::model::SymbolKind::Constant
+                            | crate::model::SymbolKind::Struct
+                            | crate::model::SymbolKind::Impl
+                            | crate::model::SymbolKind::Module
+                    )
+                )
+                && container_span >= candidate_span.saturating_mul(4)
+                && matches!((container.debug.model_rerank_score, candidate.debug.model_rerank_score),
+                    (Some(parent), Some(child)) if parent > 0.0 && child > 0.0 && (parent - child).abs() <= 0.01);
             if contains(container, &candidate)
-                && container_span > config.max_snippet_lines
+                && (container_span > config.max_snippet_lines || near_tied_method)
                 && candidate_span <= config.max_snippet_lines
             {
                 kept[index].start_line = candidate.start_line;
