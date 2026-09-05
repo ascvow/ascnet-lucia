@@ -106,6 +106,47 @@ fn fixture_index() -> (crate::index::StructuralIndex, RetrievalIndex) {
     build.into_parts()
 }
 
+/// 重排前的候选池必须保留同文件高分方法，不能提前用展示配额淘汰。
+#[test]
+fn rerank_pool_keeps_dense_file_candidates_in_score_order() {
+    let dense: String = (0..8)
+        .map(|i| format!("/// 执行 payment processing。\npub fn process_{i}() {{}}\n"))
+        .collect();
+    let host = RepoHost::new(&[
+        ("src/payment.rs", dense.as_str()),
+        (
+            "src/other.rs",
+            "pub const payment: u32 = 1;\npub fn payment_report() {}\n",
+        ),
+    ]);
+    let mut build = IndexBuild::with_default_limits(repository());
+    assert_eq!(build.advance(&host, UNLIMITED), ScanProgress::Complete);
+    let (index, retrieval) = build.into_parts();
+    let mut plan = SearchPlan::for_query(
+        &AnalyzedQuery::analyze("payment processing behavior"),
+        6,
+        false,
+        true,
+    );
+    plan.candidate_pool_limit = 6;
+    let run = retrieval.search_planned(
+        &index,
+        &SemanticIndex::default(),
+        "payment processing behavior",
+        None,
+        None,
+        &plan,
+    );
+    assert!(
+        run.results
+            .iter()
+            .filter(|r| r.file_path == "src/payment.rs")
+            .count()
+            > 3
+    );
+    assert_eq!(run.stages.final_results, run.stages.post_fusion[..6]);
+}
+
 /// 把候选还原成 `文件路径#限定名` 便于断言。
 fn labels(index: &crate::index::StructuralIndex, candidates: &[SearchCandidate]) -> Vec<String> {
     candidates

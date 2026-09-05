@@ -445,13 +445,17 @@ impl RetrievalIndex {
                 }
             }
         }
-        fuse_with_diagnostics(
-            &channels,
-            query,
-            index,
-            &FusionConfig::default(),
-            plan.candidate_pool_limit,
-        )
+        // 模型尚未判断源码相关性时，不因同文件命中密集而淘汰高分业务方法。
+        // 候选总量仍由计划限制；最终展示多样性由重排后与上下文层负责。
+        let config = FusionConfig {
+            max_per_file: if plan.allow_rerank {
+                0
+            } else {
+                FusionConfig::default().max_per_file
+            },
+            ..FusionConfig::default()
+        };
+        fuse_with_diagnostics(&channels, query, index, &config, plan.candidate_pool_limit)
     }
 }
 
