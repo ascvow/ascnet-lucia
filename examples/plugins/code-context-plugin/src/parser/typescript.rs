@@ -220,13 +220,17 @@ fn walk_variables(
         let Some(name) = declarator.id.get_identifier_name() else {
             continue;
         };
-        let kind = match declarator.init.as_ref() {
+        let value = declarator
+            .init
+            .as_ref()
+            .map(Expression::get_inner_expression);
+        let kind = match value {
             Some(Expression::ArrowFunctionExpression(_))
             | Some(Expression::FunctionExpression(_)) => SymbolKind::Function,
             Some(Expression::ClassExpression(_)) => SymbolKind::Struct,
             _ => SymbolKind::Constant,
         };
-        push(
+        let variable = push(
             output,
             name.as_str(),
             kind,
@@ -235,6 +239,50 @@ fn walk_variables(
             parent,
             None,
         );
+        if let Some(Expression::ObjectExpression(object)) = value {
+            walk_object(object, variable, index, output);
+        }
+    }
+}
+
+/// 为对象服务提取独立方法和嵌套对象，避免正文预算只覆盖整个服务的开头。
+/// 动态计算属性与展开属性没有可确定的限定名，保留在父块中而不猜测符号。
+fn walk_object(
+    node: &oxc_ast::ast::ObjectExpression<'_>,
+    parent: usize,
+    index: &LineIndex,
+    output: &mut ParseOutput,
+) {
+    for property in &node.properties {
+        let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) = property else {
+            continue;
+        };
+        if property.computed {
+            continue;
+        }
+        let Some(name) = property.key.name() else {
+            continue;
+        };
+        let value = property.value.get_inner_expression();
+        let kind = match value {
+            Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {
+                SymbolKind::Function
+            }
+            Expression::ObjectExpression(_) => SymbolKind::Constant,
+            _ => continue,
+        };
+        let member = push(
+            output,
+            name.as_ref(),
+            kind,
+            property.span,
+            index,
+            Some(parent),
+            None,
+        );
+        if let Expression::ObjectExpression(object) = value {
+            walk_object(object, member, index, output);
+        }
     }
 }
 
@@ -314,12 +362,12 @@ fn walk_interface(
         None,
     );
     for member in &node.body.body {
-        let (name, span) = match member {
+        let (name, span, kind) = match member {
             oxc_ast::ast::TSSignature::TSMethodSignature(method) => {
-                (method.key.name(), method.span)
+                (method.key.name(), method.span, SymbolKind::Function)
             }
             oxc_ast::ast::TSSignature::TSPropertySignature(property) => {
-                (property.key.name(), property.span)
+                (property.key.name(), property.span, SymbolKind::Other)
             }
             _ => continue,
         };
@@ -327,7 +375,7 @@ fn walk_interface(
             push(
                 output,
                 name.as_ref(),
-                SymbolKind::Function,
+                kind,
                 span,
                 index,
                 Some(interface),

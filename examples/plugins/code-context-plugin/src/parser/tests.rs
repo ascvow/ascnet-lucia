@@ -273,6 +273,37 @@ fn typescript_arrow_functions_are_functions() {
     assert_eq!(find(&parsed, "plain").kind, SymbolKind::Constant);
 }
 
+/// 无注释对象服务须提取独立方法、嵌套限定名，且普通接口字段不能冒充函数。
+#[test]
+fn typescript_object_services_preserve_method_boundaries() {
+    let parsed = parse(
+        "src/service.ts",
+        Language::TypeScript,
+        r#"
+export const Service = ({
+  async create() { return 1; },
+  remove: (id: number) => id,
+  nested: { run: function () { return true; } },
+  [dynamicName]() {},
+  ...external,
+} satisfies Record<string, unknown>);
+interface Result { amount: number; run(): void; }
+"#,
+    );
+    for name in [
+        "Service.create",
+        "Service.remove",
+        "Service.nested.run",
+        "Result.run",
+    ] {
+        assert_eq!(find(&parsed, name).kind, SymbolKind::Function);
+    }
+    assert_eq!(find(&parsed, "Service.create").start_line, 3);
+    assert_eq!(find(&parsed, "Service.create").end_line, 3);
+    assert_eq!(find(&parsed, "Result.amount").kind, SymbolKind::Other);
+    assert!(!qualified(&parsed).contains(&"Service.dynamicName"));
+}
+
 /// 未被 export 包装的顶层声明同样必须被识别。
 #[test]
 fn typescript_handles_unexported_declarations() {
