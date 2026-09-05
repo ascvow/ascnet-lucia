@@ -107,7 +107,7 @@ impl Language {
     pub fn supports_structural_parsing(self) -> bool {
         matches!(
             self,
-            Self::Rust | Self::TypeScript | Self::JavaScript | Self::Python | Self::Go
+            Self::Rust | Self::TypeScript | Self::JavaScript | Self::Python | Self::Go | Self::Vue
         )
     }
 }
@@ -176,6 +176,7 @@ const EXTENSION_LANGUAGES: &[(&str, Language)] = &[
     ("pyi", Language::Python),
     ("go", Language::Go),
     ("vue", Language::Vue),
+    ("nvue", Language::Vue),
     ("java", Language::Java),
     ("php", Language::Php),
     ("c", Language::C),
@@ -441,9 +442,10 @@ mod tests {
         assert_language("tool/main.py", Language::Python);
         assert_language("cmd/server/main.go", Language::Go);
         assert_language("src/App.vue", Language::Vue);
+        assert_language("src/App.nvue", Language::Vue);
     }
 
-    /// 只有 V1 覆盖的五种语言声明结构化解析。
+    /// 已实现解析器的语言声明结构化能力，Vue/nvue 共享 SFC 适配器。
     #[test]
     fn only_tier_two_languages_support_structural_parsing() {
         for language in [
@@ -452,11 +454,11 @@ mod tests {
             Language::JavaScript,
             Language::Python,
             Language::Go,
+            Language::Vue,
         ] {
             assert!(language.supports_structural_parsing(), "{language:?}");
         }
         for language in [
-            Language::Vue,
             Language::Java,
             Language::Markdown,
             Language::Json,

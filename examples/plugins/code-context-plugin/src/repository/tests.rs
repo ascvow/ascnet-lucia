@@ -302,7 +302,7 @@ fn unrecognized_extensions_are_skipped() {
 #[test]
 fn languages_without_structural_parser_are_still_indexed() {
     let host = RepoHost::new(&[
-        ("src/App.vue", "<template></template>"),
+        ("src/App.html", "<main></main>"),
         ("src/Main.java", "class Main {}"),
         ("config.toml", "[a]\nb = 1"),
     ]);
@@ -310,7 +310,7 @@ fn languages_without_structural_parser_are_still_indexed() {
 
     assert_eq!(
         indexed_paths(&scan),
-        vec!["config.toml", "src/App.vue", "src/Main.java"]
+        vec!["config.toml", "src/App.html", "src/Main.java"]
     );
     assert!(scan
         .files()

@@ -367,6 +367,117 @@ fn typescript_collects_imports() {
 
 // ---------------------------------------------------------------------------
 // Python
+/// Vue 脚本必须独立定位，模板与样式仍作为文本保留，中文不得改变源码行号。
+#[test]
+fn vue_scripts_keep_original_lines_and_non_script_text() {
+    let source = "<template><view>中文页面</view></template>\n<script setup lang=\"ts\">\nconst pay = async () => {\n  return 1;\n};\n</script>\n<style>.title { color: red; }</style>\n";
+    let parsed = parse("src/Page.vue", Language::Vue, source);
+    assert_eq!(parsed.tier, ParseTier::Structural);
+    let pay = find(&parsed, "pay");
+    assert_eq!((pay.start_line, pay.end_line), (3, 5));
+    assert!(parsed.chunks.iter().any(|c| c.semantic_only));
+    assert!(parsed
+        .chunks
+        .iter()
+        .any(|c| c.symbol_name.is_none() && c.start_line == 1));
+    assert!(parsed
+        .chunks
+        .iter()
+        .any(|c| c.symbol_name.is_none() && c.end_line == 7));
+    let lines: Vec<_> = source.lines().collect();
+    for chunk in &parsed.chunks {
+        let body = lines[chunk.start_line as usize - 1..chunk.end_line as usize].join("\n");
+        assert_eq!(chunk.content_hash, crate::repository::content_hash(&body));
+    }
+}
+
+/// 模板中的脚本外观、HTML 注释和外链脚本不能制造可执行函数。
+#[test]
+fn vue_ignores_fake_external_and_unknown_scripts() {
+    let source = "<!-- <script>function fake() {}</script> -->\n<template><div title=\"<script>\">页面</div><script>function nested() {}</script></template>\n<script src=\"./remote.js\">function remote() {}</script>\n<script lang=\"coffee\">function unknown() {}</script>\n<script>function real() {}</script>";
+    let parsed = parse("src/Page.vue", Language::Vue, source);
+    assert_eq!(qualified(&parsed), vec!["real"]);
+    assert_eq!(find(&parsed, "real").start_line, 5);
+}
+
+/// uni-app renderjs 与普通脚本均需解析，Options API 方法具有父限定名。
+#[test]
+fn nvue_multiple_scripts_and_options_methods_are_indexed() {
+    let source = "<template><input/><view>视频</view></template>\n<script>export default { methods: { play() { const nested = () => 1; } } };</script>\n<script module=\"video\" lang=\"renderjs\">\nexport default { mounted() {} };\n</script>";
+    let parsed = parse("src/Page.nvue", Language::Vue, source);
+    assert!(qualified(&parsed).contains(&"default.methods.play"));
+    assert!(qualified(&parsed).contains(&"default.methods.play.nested"));
+    assert!(qualified(&parsed).contains(&"default.mounted"));
+    assert_eq!(find(&parsed, "default.mounted").start_line, 4);
+}
+
+/// Hook 内嵌套方法不再只能以整个工厂函数返回。
+#[test]
+fn javascript_nested_hook_functions_have_qualified_names() {
+    let parsed = parse("src/hook.js", Language::JavaScript, "export const usePayment = () => {\n const purchase = async () => {};\n return { purchase };\n};\n");
+    assert_eq!(
+        find(&parsed, "usePayment.purchase").kind,
+        SymbolKind::Function
+    );
+    assert_eq!(find(&parsed, "usePayment.purchase").start_line, 2);
+}
+
+/// 匿名回调槽不制造假方法名，但其内部命名函数保留词法父级。
+#[test]
+fn anonymous_callback_slots_do_not_replace_business_methods() {
+    let parsed = parse("src/modal.js", Language::JavaScript, "export const cancelOrder = () => { showModal({ success: () => { const retry = () => 1; } }); };");
+    assert!(qualified(&parsed).contains(&"cancelOrder.retry"));
+    assert!(!qualified(&parsed).contains(&"cancelOrder.success"));
+}
+
+/// 注释只归属首个声明，数据字典不制造方法树，命名空间常量保持可导航。
+#[test]
+fn typescript_docs_and_data_objects_do_not_create_false_methods() {
+    let parsed = parse(
+        "src/service.ts",
+        Language::TypeScript,
+        "/** 保存订单。 */\nexport const saveOrder = () => { const inner = () => 1; };\n",
+    );
+    let save = parsed
+        .chunks
+        .iter()
+        .find(|c| c.qualified_symbol.as_deref() == Some("saveOrder"))
+        .unwrap();
+    assert!(save.doc_comment.as_deref().unwrap().contains("保存订单"));
+    let inner = parsed
+        .chunks
+        .iter()
+        .find(|c| c.qualified_symbol.as_deref() == Some("saveOrder.inner"))
+        .unwrap();
+    assert!(inner.doc_comment.is_none());
+    let data = parse(
+        "src/locale.js",
+        Language::JavaScript,
+        "export default { page: { title: '标题' } };",
+    );
+    assert_eq!(data.tier, ParseTier::Text);
+    assert!(data.symbols.is_empty());
+    let namespace = parse(
+        "src/scope.ts",
+        Language::TypeScript,
+        "namespace Config { export const value = 42; }",
+    );
+    assert!(qualified(&namespace).contains(&"Config.value"));
+}
+
+/// 没有可识别声明的 SFC 必须完整降级，不能变成空索引。
+#[test]
+fn vue_without_script_keeps_text_fallback() {
+    let parsed = parse(
+        "src/Static.vue",
+        Language::Vue,
+        "<template>页面文本</template>\n<style>.title { color: red }</style>",
+    );
+    assert_eq!(parsed.tier, ParseTier::Text);
+    assert!(!parsed.chunks.is_empty());
+}
+
+// Python
 // ---------------------------------------------------------------------------
 
 /// Python 的类、方法与函数必须被识别并正确限定。

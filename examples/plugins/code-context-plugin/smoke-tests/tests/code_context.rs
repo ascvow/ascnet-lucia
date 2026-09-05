@@ -95,6 +95,49 @@ async fn activate_and_read_status(
     Ok(status["data"].clone())
 }
 
+/// 真实 WASM Host 必须识别 nvue 并返回方法的原始源码行号。
+#[tokio::test]
+async fn wasm_host_searches_nvue_method_at_original_lines() {
+    let state_root = unique_state_root("nvue");
+    let workspace_root = create_workspace("nvue");
+    write_file(&workspace_root, "src/Page.nvue", "<template><view>页面</view></template>\n<script setup lang=\"ts\">\nconst submitPurchase = () => {\n  return 42;\n};\n</script>\n");
+    let host = load_wasm_plugins_with_services(
+        &[manifest_path()],
+        services(&state_root, "scope-nvue", &workspace_root).expect("配置宿主"),
+    )
+    .await
+    .expect("加载插件");
+    AgentExtension::list_tools(&host).await.expect("注册路由");
+    let mut found = false;
+    for _ in 0..64 {
+        let result = AgentExtension::call_tool(
+            &host,
+            ToolCall::new("nvue", TOOL_NAME, json!({"query":"submitPurchase"})),
+        )
+        .await
+        .expect("调用成功")
+        .expect("存在工具");
+        if result
+            .details
+            .as_ref()
+            .is_some_and(|d| d["status"] == "indexing")
+        {
+            continue;
+        }
+        let items = result.content["results"].as_array().expect("检索结果");
+        let first = items.first().expect("必须找到方法");
+        assert_eq!(first["file"], "src/Page.nvue");
+        assert_eq!(first["lines"], json!([3, 5]));
+        assert!(first["snippet"].as_str().unwrap().contains("return 42"));
+        found = true;
+        break;
+    }
+    assert!(found, "必须在预算内完成索引");
+    host.shutdown().await.expect("卸载");
+    let _ = std::fs::remove_dir_all(state_root);
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
 /// 插件必须能被真实 Host 加载、完成激活并注册 code_search。
 #[tokio::test]
 async fn wasm_host_loads_and_registers_code_search() {

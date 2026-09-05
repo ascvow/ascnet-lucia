@@ -25,7 +25,7 @@ pub const INDEX_SCHEMA_VERSION: u32 = 1;
 ///
 /// Phase 3 引入真实分块后，任何改变 chunk 边界或字段语义的调整都必须提升该版本，
 /// 使已有索引进入 `FullRebuildRequired`。
-pub const STRUCTURAL_INDEX_VERSION: u32 = 3;
+pub const STRUCTURAL_INDEX_VERSION: u32 = 4;
 
 /// 返回当前 Unix 毫秒时间戳。
 ///

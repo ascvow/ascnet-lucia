@@ -32,6 +32,8 @@ oxc_allocator = "0.148"
 oxc_ast = "0.148"
 oxc_parser = "0.148"
 oxc_span = "0.148"
+# 只负责 SFC 标签和源码偏移；脚本语法继续由 Oxc 所有，不引入浏览器或 Host 依赖。
+html5gum = { version = "0.8.4", default-features = false }
 rustpython-parser = "0.4"
 gosyn = "0.2"
 

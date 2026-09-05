@@ -38,6 +38,27 @@ pub fn parse(source: &str, typescript: bool) -> Option<ParseOutput> {
     for statement in &result.program.body {
         walk_statement(statement, None, &index, &mut output);
     }
+    // Oxc 已标注注释归属；只取与声明首行相连的前导注释，避免吸收上一函数的尾注释。
+    let mut comments_by_line: std::collections::BTreeMap<u32, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for comment in result
+        .program
+        .comments
+        .iter()
+        .filter(|comment| comment.is_leading())
+    {
+        if let Some(text) = source.get(comment.span.start as usize..comment.span.end as usize) {
+            comments_by_line
+                .entry(index.line_of(comment.attached_to as usize))
+                .or_default()
+                .push(text);
+        }
+    }
+    for declaration in &mut output.declarations {
+        if let Some(comments) = comments_by_line.remove(&declaration.start_line) {
+            declaration.doc_comment = Some(comments.join("\n"));
+        }
+    }
     Some(output)
 }
 
@@ -55,22 +76,45 @@ fn walk_statement(
         }
         Statement::ExportDefaultDeclaration(node) => match &node.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
-                if let Some(id) = function.id.as_ref() {
-                    push(
-                        output,
-                        id.name.as_str(),
-                        SymbolKind::Function,
-                        function.span,
-                        index,
-                        parent,
-                        None,
-                    );
+                let owner = push(
+                    output,
+                    function
+                        .id
+                        .as_ref()
+                        .map_or("default", |id| id.name.as_str()),
+                    SymbolKind::Function,
+                    function.span,
+                    index,
+                    parent,
+                    None,
+                );
+                if let Some(body) = &function.body {
+                    for statement in &body.statements {
+                        walk_statement(statement, Some(owner), index, output);
+                    }
                 }
             }
             ExportDefaultDeclarationKind::ClassDeclaration(class) => {
                 walk_class(class, parent, index, output);
             }
-            _ => {}
+            declaration => {
+                if let Some(expression) = declaration.as_expression() {
+                    if matches!(expression.get_inner_expression(), Expression::ObjectExpression(object) if !object_has_methods(object))
+                    {
+                        return;
+                    }
+                    let kind = if matches!(
+                        expression.get_inner_expression(),
+                        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+                    ) {
+                        SymbolKind::Function
+                    } else {
+                        SymbolKind::Module
+                    };
+                    let default = push(output, "default", kind, node.span, index, parent, None);
+                    walk_expression(expression, Some(default), index, output);
+                }
+            }
         },
         Statement::ImportDeclaration(node) => {
             push_import(output, node.source.value.as_str());
@@ -79,7 +123,7 @@ fn walk_statement(
         // 直接以语句形式出现，需要在这里逐一接住。
         Statement::FunctionDeclaration(node) => {
             if let Some(id) = node.id.as_ref() {
-                push(
+                let function = push(
                     output,
                     id.name.as_str(),
                     SymbolKind::Function,
@@ -88,6 +132,11 @@ fn walk_statement(
                     parent,
                     None,
                 );
+                if let Some(body) = &node.body {
+                    for statement in &body.statements {
+                        walk_statement(statement, Some(function), index, output);
+                    }
+                }
             }
         }
         Statement::ClassDeclaration(node) => walk_class(node, parent, index, output),
@@ -116,6 +165,47 @@ fn walk_statement(
         }
         Statement::TSNamespaceDeclaration(node) => walk_namespace(node, parent, index, output),
         Statement::VariableDeclaration(node) => walk_variables(node, parent, index, output),
+        Statement::BlockStatement(node) => {
+            for statement in &node.body {
+                walk_statement(statement, parent, index, output);
+            }
+        }
+        Statement::ExpressionStatement(node) => {
+            walk_expression(&node.expression, parent, index, output)
+        }
+        Statement::IfStatement(node) => {
+            walk_statement(&node.consequent, parent, index, output);
+            if let Some(alternate) = &node.alternate {
+                walk_statement(alternate, parent, index, output);
+            }
+        }
+        Statement::TryStatement(node) => {
+            for statement in &node.block.body {
+                walk_statement(statement, parent, index, output);
+            }
+            if let Some(handler) = &node.handler {
+                for statement in &handler.body.body {
+                    walk_statement(statement, parent, index, output);
+                }
+            }
+            if let Some(finalizer) = &node.finalizer {
+                for statement in &finalizer.body {
+                    walk_statement(statement, parent, index, output);
+                }
+            }
+        }
+        Statement::ForStatement(node) => walk_statement(&node.body, parent, index, output),
+        Statement::ForOfStatement(node) => walk_statement(&node.body, parent, index, output),
+        Statement::ForInStatement(node) => walk_statement(&node.body, parent, index, output),
+        Statement::WhileStatement(node) => walk_statement(&node.body, parent, index, output),
+        Statement::DoWhileStatement(node) => walk_statement(&node.body, parent, index, output),
+        Statement::SwitchStatement(node) => {
+            for case in &node.cases {
+                for statement in &case.consequent {
+                    walk_statement(statement, parent, index, output);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -161,7 +251,7 @@ fn walk_declaration(
     match declaration {
         OxcDeclaration::FunctionDeclaration(node) => {
             if let Some(id) = node.id.as_ref() {
-                push(
+                let function = push(
                     output,
                     id.name.as_str(),
                     SymbolKind::Function,
@@ -170,6 +260,11 @@ fn walk_declaration(
                     parent,
                     None,
                 );
+                if let Some(body) = &node.body {
+                    for statement in &body.statements {
+                        walk_statement(statement, Some(function), index, output);
+                    }
+                }
             }
         }
         OxcDeclaration::ClassDeclaration(node) => walk_class(node, parent, index, output),
@@ -230,6 +325,16 @@ fn walk_variables(
             Some(Expression::ClassExpression(_)) => SymbolKind::Struct,
             _ => SymbolKind::Constant,
         };
+        // 局部标量由函数正文覆盖，只单独索引可导航的函数、类和对象；回调中仍继续找声明。
+        if parent.is_some_and(|parent| output.declarations[parent].kind == SymbolKind::Function)
+            && !matches!(kind, SymbolKind::Function | SymbolKind::Struct)
+            && !matches!(value, Some(Expression::ObjectExpression(_)))
+        {
+            if let Some(value) = value {
+                walk_expression(value, parent, index, output);
+            }
+            continue;
+        }
         let variable = push(
             output,
             name.as_str(),
@@ -239,9 +344,68 @@ fn walk_variables(
             parent,
             None,
         );
-        if let Some(Expression::ObjectExpression(object)) = value {
-            walk_object(object, variable, index, output);
+        if let Some(value) = value {
+            walk_expression(value, Some(variable), index, output);
         }
+    }
+}
+
+/// 进入函数体和回调以提取嵌套命名声明；匿名回调不制造虚构符号，沿用词法父级。
+fn walk_expression(
+    expression: &Expression<'_>,
+    parent: Option<usize>,
+    index: &LineIndex,
+    output: &mut ParseOutput,
+) {
+    match expression.get_inner_expression() {
+        Expression::ArrowFunctionExpression(function) => {
+            if let oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) = &function.body {
+                for statement in &body.statements {
+                    walk_statement(statement, parent, index, output);
+                }
+            } else if let Some(expression) = function.body.as_expression() {
+                walk_expression(expression, parent, index, output);
+            }
+        }
+        Expression::FunctionExpression(function) => {
+            if let Some(body) = &function.body {
+                for statement in &body.statements {
+                    walk_statement(statement, parent, index, output);
+                }
+            }
+        }
+        Expression::ObjectExpression(object) => {
+            if let Some(parent) = parent {
+                walk_object(object, parent, index, output);
+            }
+        }
+        Expression::CallExpression(call) => {
+            for argument in &call.arguments {
+                if let Some(expression) = argument.as_expression() {
+                    walk_callback(expression, parent, index, output);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// API 参数对象中的 success/fail 等是匿名回调槽，不作为业务方法替代外层函数。
+/// 回调内部真正命名的局部函数仍由普通语句遍历提取。
+fn walk_callback(
+    expression: &Expression<'_>,
+    parent: Option<usize>,
+    index: &LineIndex,
+    output: &mut ParseOutput,
+) {
+    if let Expression::ObjectExpression(object) = expression.get_inner_expression() {
+        for property in &object.properties {
+            if let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) = property {
+                walk_callback(&property.value, parent, index, output);
+            }
+        }
+    } else {
+        walk_expression(expression, parent, index, output);
     }
 }
 
@@ -268,7 +432,9 @@ fn walk_object(
             Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {
                 SymbolKind::Function
             }
-            Expression::ObjectExpression(_) => SymbolKind::Constant,
+            Expression::ObjectExpression(object) if object_has_methods(object) => {
+                SymbolKind::Constant
+            }
             _ => continue,
         };
         let member = push(
@@ -280,10 +446,22 @@ fn walk_object(
             Some(parent),
             None,
         );
-        if let Expression::ObjectExpression(object) = value {
-            walk_object(object, member, index, output);
-        }
+        walk_expression(value, Some(member), index, output);
     }
+}
+
+/// 纯数据字典没有可导航的方法；避免把语言包的每层键误建成服务对象候选。
+fn object_has_methods(object: &oxc_ast::ast::ObjectExpression<'_>) -> bool {
+    object.properties.iter().any(|property| {
+        let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) = property else {
+            return false;
+        };
+        match property.value.get_inner_expression() {
+            Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => true,
+            Expression::ObjectExpression(nested) => object_has_methods(nested),
+            _ => false,
+        }
+    })
 }
 
 /// 处理类声明及其成员。
@@ -309,7 +487,7 @@ fn walk_class(
         match element {
             ClassElement::MethodDefinition(method) => {
                 if let Some(name) = method.key.name() {
-                    push(
+                    let member = push(
                         output,
                         name.as_ref(),
                         SymbolKind::Function,
@@ -318,6 +496,11 @@ fn walk_class(
                         Some(class),
                         None,
                     );
+                    if let Some(body) = &method.value.body {
+                        for statement in &body.statements {
+                            walk_statement(statement, Some(member), index, output);
+                        }
+                    }
                 }
             }
             ClassElement::PropertyDefinition(property) => {
@@ -330,7 +513,7 @@ fn walk_class(
                     | Some(Expression::FunctionExpression(_)) => SymbolKind::Function,
                     _ => continue,
                 };
-                push(
+                let member = push(
                     output,
                     name.as_ref(),
                     kind,
@@ -339,6 +522,9 @@ fn walk_class(
                     Some(class),
                     None,
                 );
+                if let Some(value) = &property.value {
+                    walk_expression(value, Some(member), index, output);
+                }
             }
             _ => {}
         }
@@ -401,7 +587,7 @@ fn push(
         start_line: index.line_of(span.start as usize),
         end_line: index.line_of(span.end.saturating_sub(1) as usize),
         signature: None,
-        // oxc 默认不把注释挂到节点上；文档注释由上层按源码行回溯补齐。
+        // 文档注释在文件遍历结束后按 Oxc 的 attached_to 位置补齐。
         doc_comment: None,
         parent,
         owner,

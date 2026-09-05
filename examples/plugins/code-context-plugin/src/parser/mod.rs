@@ -10,6 +10,7 @@
 //! | --- | --- | --- |
 //! | Rust | `syn` | 完整 AST |
 //! | TypeScript / JavaScript（含 TSX / JSX） | `oxc_parser` | 完整 AST |
+//! | Vue / nvue | `html5gum` + `oxc_parser` | SFC 脚本 AST，其他区域文本兜底 |
 //! | Python | `rustpython-parser` | 完整 AST |
 //! | Go | `gosyn` | 完整 AST |
 //! | 其余语言 | 无 | 文本分块 |
@@ -22,13 +23,14 @@
 //! # 失败必须隔离
 //!
 //! 单个文件解析失败只降级为文本分块，**绝不向上传播**——一个语法错误的文件不能让整个仓库
-//! 无法检索（`architecture.md` 第 12 问）。四个解析器都返回 `Result` 或错误列表，因此这里
+//! 无法检索（`architecture.md` 第 12 问）。解析器都返回 `Result` 或错误列表，因此这里
 //! 处理的是错误值而不是 panic。
 
 mod golang;
 mod python;
 mod rust_lang;
 mod typescript;
+mod vue;
 
 #[cfg(test)]
 mod tests;
@@ -195,6 +197,7 @@ fn parse_source(language: Language, source: &str) -> Option<ParseOutput> {
         Language::JavaScript => typescript::parse(source, false),
         Language::Python => python::parse(source),
         Language::Go => golang::parse(source),
+        Language::Vue => vue::parse(source),
         _ => None,
     }
 }
@@ -284,6 +287,64 @@ pub fn parse_file(
         &imports,
         &mut chunks,
     );
+
+    if language == Language::Vue {
+        // SFC 的模板、样式和未被声明覆盖的脚本仍可检索，行号直接映射到原文件。
+        let mut covered = vec![false; lines.len()];
+        for declaration in &output.declarations {
+            for line in covered
+                .iter_mut()
+                .take(declaration.end_line as usize)
+                .skip(declaration.start_line.saturating_sub(1) as usize)
+            {
+                *line = true;
+            }
+        }
+        let mut start = 0;
+        while start < lines.len() && chunks.len() < MAX_CHUNKS_PER_FILE {
+            if covered[start] {
+                start += 1;
+                continue;
+            }
+            let end = (start..lines.len())
+                .find(|i| covered[*i])
+                .unwrap_or(lines.len());
+            for mut chunk in text_chunks(repository, file_path, language, &lines[start..end]) {
+                if chunks.len() >= MAX_CHUNKS_PER_FILE {
+                    break;
+                }
+                chunk.start_line += start as u32;
+                chunk.end_line += start as u32;
+                chunk.id = chunk_id(repository, file_path, "", SymbolKind::Other, chunks.len());
+                chunks.push(chunk);
+            }
+            start = end;
+        }
+        // 方法块负责精确导航，窗口负责跨方法上下文与长函数尾部召回，避免只嵌入函数开头。
+        // 不覆盖任何声明的窗口已有文本兜底，不再重复建立向量。
+        for mut chunk in text_chunks(repository, file_path, language, &lines) {
+            if chunks.len() >= MAX_CHUNKS_PER_FILE {
+                break;
+            }
+            if !covered
+                .iter()
+                .take(chunk.end_line as usize)
+                .skip(chunk.start_line.saturating_sub(1) as usize)
+                .any(|value| *value)
+            {
+                continue;
+            }
+            chunk.id = chunk_id(
+                repository,
+                file_path,
+                "sfc-context",
+                SymbolKind::Other,
+                chunks.len(),
+            );
+            chunk.semantic_only = true;
+            chunks.push(chunk);
+        }
+    }
 
     ParsedFile {
         chunks,
