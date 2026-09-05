@@ -1,7 +1,7 @@
 //! 代码检索试验场：拿你自己的代码试排序，并看清"为什么是这个排名"。
 //!
 //! 与 `search_repository` 的分工：那个示例面向"在真实仓库里找代码"，输出的是结果本身；
-//! 这个示例面向**调参与排查**，把检索链路的每一层判断都摊开——查询意图、检索目标、
+//! 这个示例默认展示 Agent 工具结果；`--diagnostics` 额外展开检索链路——查询意图、检索目标、
 //! 实际执行的通道与配额、走的哪条延迟路径、是否触发了模型重排，以及每条结果的通道来源、
 //! 代码角色与分数构成。
 //!
@@ -25,11 +25,13 @@
 //! ```
 //!
 //! 交互模式下输入 `exit`、`quit` 或 `:q` 退出。
+//! 默认持久化缓存以复用 API 向量；源码是启动时的快照，修改源码后请重启示例。
+//! 模型只通过 SiliconFlow API 调用，不加载本地模型。`--exclude` 可排除调试或第三方目录。
 
 use agent_plugin::{AgentPlugin, HttpRequest, HttpResponse, ToolCall};
 use anyhow::{anyhow, Context, Result};
 use code_context_plugin::{
-    testing::{activation_context, collect_repository_files, repository_root, RepoHost},
+    testing::{activation_context, repository_root, RepoHost},
     CandidateSource, CodeContextPlugin, IndexStatus, SearchExecution,
 };
 use serde_json::json;
@@ -63,6 +65,14 @@ struct Options {
     semantic: bool,
     /// 是否允许模型重排；仅在启用语义时有意义。
     rerank: bool,
+    /// 跨进程元数据及向量缓存目录；为空时禁用持久缓存。
+    cache_dir: Option<PathBuf>,
+    /// Agent 实际输出的 token 预算。
+    token_budget: u64,
+    /// 显式开启额外检索诊断，可能多一次重排调用。
+    diagnostics: bool,
+    /// 不扫描的仓库相对路径前缀。
+    excludes: Vec<String>,
 }
 
 fn main() {
@@ -84,7 +94,7 @@ fn run() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("无法访问目录 `{}`", options.root.display()))?;
 
-    let files = collect_repository_files(&root);
+    let files = collect_files(&root, &options.excludes)?;
     if files.is_empty() {
         return Err(anyhow!(
             "目录 `{}` 里没有可索引的文件；放几个源码文件进去再试",
@@ -96,6 +106,19 @@ fn run() -> Result<()> {
         .map(|(path, content)| (path.as_str(), content.as_str()))
         .collect();
 
+    let cache_prefix = options.cache_dir.as_ref().map(|dir| {
+        dir.join(code_context_plugin::content_hash(&format!(
+            "playground-v1:{}",
+            root.display()
+        )))
+    });
+    let host = if let Some(prefix) = &cache_prefix {
+        std::fs::create_dir_all(prefix.parent().expect("缓存父目录"))?;
+        eprintln!("缓存：{}（复用未变化源码的向量）", prefix.display());
+        RepoHost::persisted(&file_refs, prefix.with_extension("json"))?
+    } else {
+        RepoHost::new(&file_refs)
+    };
     let mut context = activation_context(&root.to_string_lossy());
     let host = if options.semantic {
         let key = std::env::var(API_KEY_ENV)
@@ -118,17 +141,24 @@ fn run() -> Result<()> {
                 .metadata
                 .insert("rerank_model".into(), RERANK_MODEL.into());
         }
-        RepoHost::new(&file_refs).with_http_handler(forward_to_endpoint(key))
+        if key.trim().is_empty() {
+            return Err(anyhow!("{API_KEY_ENV} 不能为空"));
+        }
+        host.with_http_handler(forward_to_endpoint(key))
     } else {
-        RepoHost::new(&file_refs)
+        host
     };
 
     let mut plugin = CodeContextPlugin::default();
+    if let Some(prefix) = cache_prefix {
+        plugin = plugin.with_sqlite_vector_database(prefix.with_extension("sqlite3"));
+    }
     plugin
         .activate(&host, context)
         .context("激活 Code Context 插件失败")?;
 
     eprintln!("正在索引 {} 个文件：{}", files.len(), root.display());
+    eprintln!("本轮使用启动时的源码快照；修改源码后重启，默认复用磁盘缓存。模型仅使用 API。");
     if options.semantic {
         eprintln!("语义检索已开启（{EMBEDDING_MODEL}），首次索引需要调用嵌入接口，请稍候");
     } else {
@@ -142,15 +172,27 @@ fn run() -> Result<()> {
         let call = ToolCall::new(
             format!("playground-init-{round}"),
             "code_search",
-            json!({"query": "初始化索引"}),
+            json!({"query": "__playground_index__"}),
         );
-        let _ = plugin.call_tool_with_host(&host, call);
+        plugin
+            .call_tool_with_host(&host, call)
+            .context("推进索引失败")?;
+        if round % 10 == 0 {
+            eprintln!(
+                "索引进行中：第 {} 轮，状态 {}",
+                round + 1,
+                plugin.index_status().as_str()
+            );
+        }
         if plugin.index_status() != IndexStatus::Indexing {
             break;
         }
     }
     if plugin.index_status() == IndexStatus::Indexing {
         return Err(anyhow!("索引未能在限定轮次内完成"));
+    }
+    if !plugin.index_status().can_serve_search() {
+        return Err(anyhow!("索引不可用：{}", plugin.index_status().as_str()));
     }
     if let Some(stats) = plugin.index_stats() {
         eprintln!(
@@ -167,10 +209,7 @@ fn run() -> Result<()> {
     }
 
     match options.query.clone() {
-        Some(query) => {
-            run_query(&mut plugin, &host, &root, &query, &options);
-            Ok(())
-        }
+        Some(query) => run_query(&mut plugin, &host, &root, &query, &options),
         None => interactive_loop(&mut plugin, &host, &root, &options),
     }
 }
@@ -203,7 +242,9 @@ fn interactive_loop(
         if matches!(query, "exit" | "quit" | ":q") {
             return Ok(());
         }
-        run_query(plugin, host, root, query, options);
+        if let Err(error) = run_query(plugin, host, root, query, options) {
+            eprintln!("查询失败：{error:#}");
+        }
     }
 }
 
@@ -214,12 +255,132 @@ fn run_query(
     root: &Path,
     query: &str,
     options: &Options,
-) {
+) -> Result<()> {
     let started = Instant::now();
-    let execution = plugin.search_execution(host, query, None, options.limit);
-    let elapsed = started.elapsed();
-    print_diagnostics(&execution, elapsed.as_secs_f64() * 1000.0);
-    print_results(&execution, root);
+    let result = plugin.call_tool_with_host(
+        host,
+        ToolCall::new(
+            "manual-search",
+            "code_search",
+            json!({
+                "query": query, "max_results": options.limit, "token_budget": options.token_budget,
+            }),
+        ),
+    )?;
+    println!(
+        "\nAgent 工具结果，用时 {:.1} ms",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    if result.is_error {
+        return Err(anyhow!("{}", result.content));
+    }
+    if let Some(note) = result.content.get("note").and_then(|v| v.as_str()) {
+        println!("提示：{note}");
+    }
+    let results = result.content["results"]
+        .as_array()
+        .ok_or_else(|| anyhow!("工具结果缺少 results"))?;
+    if results.is_empty() {
+        println!("没有命中结果。");
+    }
+    for (rank, item) in results.iter().enumerate() {
+        let file = item["file"].as_str().unwrap_or("未知文件");
+        let symbol = item
+            .get("qualified_symbol")
+            .or_else(|| item.get("symbol"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("文本块");
+        let first = item["lines"][0].as_u64().unwrap_or(0);
+        let last = item["lines"][1].as_u64().unwrap_or(first);
+        println!(
+            "\n[{}] {symbol}\n{}:{first}-{last}",
+            rank + 1,
+            root.join(file).display()
+        );
+        if let Some(snippet) = item["snippet"].as_str() {
+            for (offset, line) in snippet.lines().enumerate() {
+                println!("{:>5} │ {line}", first + offset as u64);
+            }
+        }
+    }
+    if options.diagnostics {
+        println!("\n额外诊断：以下是内部候选，不是 Agent 最终结果，可能额外调用 API。");
+        let started = Instant::now();
+        let execution = plugin.search_execution(host, query, None, options.limit);
+        print_diagnostics(&execution, started.elapsed().as_secs_f64() * 1000.0);
+        print_results(&execution, root);
+    }
+    Ok(())
+}
+
+/// 只读取允许的源码，跳过符号链接、依赖和显式排除路径，错误不静默吞掉。
+fn collect_files(root: &Path, excludes: &[String]) -> Result<Vec<(String, String)>> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        excludes: &[String],
+        depth: usize,
+        files: &mut Vec<(String, String)>,
+    ) -> Result<()> {
+        if depth > 24 {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if excludes
+                .iter()
+                .any(|prefix| relative == *prefix || relative.starts_with(&format!("{prefix}/")))
+            {
+                continue;
+            }
+            if ty.is_dir() {
+                if matches!(
+                    entry.file_name().to_str(),
+                    Some(
+                        ".git"
+                            | "node_modules"
+                            | "target"
+                            | "dist"
+                            | "build"
+                            | "coverage"
+                            | "vendor"
+                            | ".idea"
+                            | ".vscode"
+                            | ".cache"
+                            | ".venv"
+                    )
+                ) {
+                    continue;
+                }
+                walk(root, &path, excludes, depth + 1, files)?;
+            } else if ty.is_file()
+                && matches!(
+                    code_context_plugin::classify(&relative),
+                    code_context_plugin::PathClass::Indexable(_)
+                )
+            {
+                files.push((
+                    relative,
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("读取 {} 失败", path.display()))?,
+                ));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(root, root, excludes, 0, &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
 }
 
 /// 打印检索链路各层的判断依据。
@@ -292,7 +453,12 @@ fn print_results(execution: &SearchExecution, root: &Path) {
         );
         println!("    来源 {}", channel_summary(result));
         println!("    构成 {}", result.debug.reason());
-        if let Some(preview) = read_preview(root, result.file_path.as_str(), result.start_line) {
+        if let Some(preview) = read_preview(
+            root,
+            result.file_path.as_str(),
+            result.start_line,
+            result.end_line,
+        ) {
             for (offset, line) in preview.iter().enumerate() {
                 println!("    {:>5} │ {line}", result.start_line as usize + offset);
             }
@@ -323,14 +489,22 @@ fn channel_summary(result: &code_context_plugin::SearchResult) -> String {
 }
 
 /// 读取结果起始行开始的若干行源码。
-fn read_preview(root: &Path, relative: &str, start_line: u32) -> Option<Vec<String>> {
+fn read_preview(
+    root: &Path,
+    relative: &str,
+    start_line: u32,
+    end_line: u32,
+) -> Option<Vec<String>> {
+    if start_line == 0 || end_line < start_line {
+        return None;
+    }
     let content = std::fs::read_to_string(root.join(relative)).ok()?;
     let start = start_line.saturating_sub(1) as usize;
     Some(
         content
             .lines()
             .skip(start)
-            .take(PREVIEW_LINES)
+            .take(PREVIEW_LINES.min((end_line - start_line + 1) as usize))
             .map(str::to_string)
             .collect(),
     )
@@ -347,6 +521,14 @@ fn forward_to_endpoint(api_key: String) -> impl Fn(&HttpRequest) -> Result<HttpR
             .build(),
     );
     move |request: &HttpRequest| {
+        if !request.method.eq_ignore_ascii_case("POST")
+            || !matches!(
+                request.path.trim_start_matches('/'),
+                "embeddings" | "rerank"
+            )
+        {
+            return Err(anyhow!("试验场只允许嵌入和重排 POST 请求"));
+        }
         let url = url::Url::parse(EMBEDDING_BASE_URL)
             .and_then(|base| base.join(request.path.trim_start_matches('/')))
             .map_err(|error| anyhow!("拼接端点路径失败：{error}"))?;
@@ -381,17 +563,30 @@ fn forward_to_endpoint(api_key: String) -> impl Fn(&HttpRequest) -> Result<HttpR
 ///
 /// 选项缺少取值或数值非法时返回错误。
 fn parse_options() -> Result<Options> {
+    parse_args(std::env::args().skip(1), std::env::var(API_KEY_ENV).is_ok())
+}
+
+/// 解析可测试的参数序列；路径和数值错误在索引前报告。
+fn parse_args(arguments: impl IntoIterator<Item = String>, has_key: bool) -> Result<Options> {
     // 默认索引整个 Lucia 仓库：试验场的意义就是在真实规模的代码上试检索。
     let mut root = repository_root();
     let mut limit = DEFAULT_LIMIT;
     // 默认跟随生产配置：只要给了密钥就开语义。中文自然语言查询几乎完全依赖语义通道
     // ——词法无法区分"对话"与"对话框"这类子串关系，默认关掉会给出误导性的糟糕结果。
-    let mut semantic = std::env::var(API_KEY_ENV).is_ok();
-    // 重排同样默认开启：它是**条件触发**的，只在低置信度的自然语言查询上才真正发起请求，
-    // 因此打开它不等于每次查询都付 1.7 秒。诊断里的"实际发起"一行会如实反映是否触发。
+    let mut semantic = has_key;
+    // 自然语言默认源码重排；精确符号跳过，重复输入可能命中已校验的响应缓存。
     let mut rerank = semantic;
+    let mut cache_dir = Some(
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".lucia/code-context/playground"),
+    );
+    let mut token_budget = 8000;
+    let mut diagnostics = false;
+    let mut excludes = Vec::new();
     let mut parts: Vec<String> = Vec::new();
-    let mut args = std::env::args().skip(1);
+    let mut args = arguments.into_iter();
 
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -409,7 +604,37 @@ fn parse_options() -> Result<Options> {
                     .parse()
                     .context("--limit 需要正整数")?;
             }
-            "--semantic" => semantic = true,
+            "--semantic" => {
+                semantic = true;
+                rerank = true;
+            }
+            "--cache-dir" => {
+                cache_dir = Some(PathBuf::from(
+                    args.next().ok_or_else(|| anyhow!("--cache-dir 缺少路径"))?,
+                ))
+            }
+            "--no-cache" => cache_dir = None,
+            "--token-budget" => {
+                token_budget = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--token-budget 缺少数值"))?
+                    .parse()
+                    .context("token 预算须为整数")?
+            }
+            "--diagnostics" => diagnostics = true,
+            "--exclude" => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--exclude 缺少相对路径"))?
+                    .replace('\\', "/");
+                if path.starts_with('/')
+                    || path.split('/').any(|p| p == "..")
+                    || path.trim_matches('/').is_empty()
+                {
+                    return Err(anyhow!("--exclude 必须是非空仓库相对路径"));
+                }
+                excludes.push(path.trim_end_matches('/').to_string());
+            }
             "--no-semantic" => {
                 semantic = false;
                 rerank = false;
@@ -427,12 +652,22 @@ fn parse_options() -> Result<Options> {
     }
 
     let query = parts.join(" ").trim().to_string();
+    if !(1..=50).contains(&limit) {
+        return Err(anyhow!("--limit 范围为 1–50"));
+    }
+    if !(500..=50000).contains(&token_budget) {
+        return Err(anyhow!("--token-budget 范围为 500–50000"));
+    }
     Ok(Options {
         root,
         query: (!query.is_empty()).then_some(query),
         limit: limit.max(1),
         semantic,
         rerank,
+        cache_dir,
+        token_budget,
+        diagnostics,
+        excludes,
     })
 }
 
@@ -449,6 +684,11 @@ fn print_help() {
          \x20 --no-semantic   强制只跑符号 + 词法（中文自然语言查询会明显变差）\n\
          \x20 --rerank        在语义之上再开模型重排；设置了密钥时默认即开启\n\
          \x20 --no-rerank     关闭模型重排，只保留本地融合排序\n\
+         \x20 --cache-dir <目录>  缓存目录，默认 ~/.lucia/code-context/playground\n\
+         \x20 --no-cache      禁用跨进程缓存\n\
+         \x20 --token-budget <数量>  Agent 输出预算，默认 8000\n\
+         \x20 --exclude <相对路径>  排除目录或文件，可重复\n\
+         \x20 --diagnostics   额外运行内部排序诊断，可能多一次 API 请求\n\
          \x20 -h, --help      显示本帮助\n\n\
          不带查询时进入交互模式，可连续输入多条查询。"
     );
@@ -476,4 +716,101 @@ fn yes_no(value: bool) -> &'static str {
 #[allow(dead_code)]
 fn is_tty() -> bool {
     io::stdout().is_terminal()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试参数不读取当前机器的凭证状态。
+    fn options(args: &[&str]) -> Result<Options> {
+        parse_args(args.iter().map(|s| s.to_string()), false)
+    }
+
+    /// 显式启用语义时默认同步启用重排，所有模型都使用 API。
+    #[test]
+    fn semantic_flag_enables_rerank_and_manual_options() {
+        let parsed = options(&[
+            "--semantic",
+            "--root",
+            "/tmp/project",
+            "--cache-dir",
+            "/tmp/cache",
+            "--token-budget",
+            "12000",
+            "--exclude",
+            "src/debug/",
+            "--diagnostics",
+            "查找下单实现",
+        ])
+        .unwrap();
+        assert!(parsed.semantic && parsed.rerank && parsed.diagnostics);
+        assert_eq!(parsed.root, PathBuf::from("/tmp/project"));
+        assert_eq!(parsed.cache_dir, Some(PathBuf::from("/tmp/cache")));
+        assert_eq!(parsed.excludes, ["src/debug"]);
+        assert_eq!(parsed.token_budget, 12000);
+        assert_eq!(parsed.query.as_deref(), Some("查找下单实现"));
+        let offline = options(&["--semantic", "--no-semantic", "--no-cache"]).unwrap();
+        assert!(!offline.semantic && !offline.rerank && offline.cache_dir.is_none());
+    }
+
+    /// 非法边界和未知选项必须在索引前失败。
+    #[test]
+    fn invalid_options_fail_early() {
+        for args in [
+            &["--limit", "0"][..],
+            &["--limit", "51"],
+            &["--token-budget", "499"],
+            &["--token-budget", "50001"],
+            &["--exclude", "../secret"],
+            &["--root"],
+            &["--local-model"],
+        ] {
+            assert!(options(args).is_err(), "{args:?}");
+        }
+    }
+
+    /// 小仓库实际工具调用、排除目录和预览边界可离线验证，不运行本地模型。
+    #[test]
+    fn fixture_scan_tool_result_and_preview_are_bounded() {
+        let root = std::env::temp_dir().join(format!(
+            "playground-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("debug")).unwrap();
+        std::fs::write(
+            root.join("main.ts"),
+            "export function submitOrder() { return 1; }\nconst unrelated = 2;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("debug/secret.ts"), "const hidden = 1;").unwrap();
+        std::fs::write(root.join(".env"), "SECRET=not-a-real-secret").unwrap();
+        let files = collect_files(&root, &["debug".into()]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(read_preview(&root, "main.ts", 1, 1).unwrap().len(), 1);
+        assert!(read_preview(&root, "main.ts", 0, 1).is_none());
+        let refs: Vec<_> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        let host = RepoHost::persisted(&refs, root.join("cache.json")).unwrap();
+        let mut plugin = CodeContextPlugin::default();
+        plugin
+            .activate(&host, activation_context(&root.to_string_lossy()))
+            .unwrap();
+        run_query(
+            &mut plugin,
+            &host,
+            &root,
+            "submitOrder",
+            &options(&["--no-cache"]).unwrap(),
+        )
+        .unwrap();
+        assert!(root.join("cache.json").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
