@@ -77,7 +77,8 @@ pub use repository::{
 };
 pub use retrieval::{
     tokenize, AnalyzedQuery, CandidateSource, CandidateStages, ChunkRole, ConfidenceLevel,
-    FusionConfig, FusionDebug, QueryGoal, QueryIntent, RetrievalConfidence, RetrievalIndex,
+    FusionConfig, FusionDebug, PendingDirective, QueryGoal, QueryIntent, RetrievalConfidence,
+    RetrievalIndex,
     RetrievalRun, RetrievalStats, SearchCandidate, SearchPath, SearchPlan, SearchResult,
     SymbolMatch,
 };
@@ -1072,7 +1073,18 @@ impl CodeContextPlugin {
     ) -> SearchExecution {
         self.last_rerank_degraded_reason = None;
         let rerank_model = self.config.rerank_model.clone();
-        let analyzed = AnalyzedQuery::analyze(query);
+        let mut analyzed = AnalyzedQuery::analyze(query);
+        // "搜索主播开播代码"里的"搜索"到底是指令还是主题，只有语料能回答：本仓库从未出现
+        // 过"搜索主播"这个组合，就说明它是指令。裁决必须在生成查询向量之前完成，否则被
+        // 污染的文本会直接进入嵌入请求。
+        if let Some(retrieval) = self
+            .repository
+            .as_ref()
+            .and_then(|context| context.retrieval.as_ref())
+        {
+            analyzed.resolve_leading_directive(|term| retrieval.document_frequency(term));
+        }
+        let analyzed = analyzed;
         let semantic_available = self
             .repository
             .as_ref()
@@ -1131,7 +1143,15 @@ impl CodeContextPlugin {
                 .as_mut()
                 .expect("索引已就绪")
                 .rerank_responses;
-            match rerank::rerank_results(host, model, query, &run.results, cache) {
+            // 重排与召回必须看同一份查询文本：指令词对交叉编码器同样是噪声，两处不一致
+            // 还会让模型给出的名次无法与本地名次对齐。
+            match rerank::rerank_results(
+                host,
+                model,
+                &analyzed.retrieval_text,
+                &run.results,
+                cache,
+            ) {
                 Ok((reranked, cached)) => {
                     run.results = reranked;
                     rerank_applied = true;
@@ -1147,7 +1167,14 @@ impl CodeContextPlugin {
                 }
             }
         }
-        run.results.truncate(limit);
+        // 同文件名额必须施加在这里。池级配额（candidate_pool_limit，自然语言查询下是 40）
+        // 形同虚设：候选池里的不同文件数通常少于 40，配额筛完后的“溢出补齐”会把同文件的
+        // 高分块原样放回，再按分数重排后它们又回到前列。只有最终截断这一步的名额是稀缺的。
+        run.results = retrieval::fusion::select_with_file_quota(
+            std::mem::take(&mut run.results),
+            limit,
+            retrieval::fusion::FusionConfig::default().max_per_file,
+        );
         run.stages.final_results = run
             .results
             .iter()

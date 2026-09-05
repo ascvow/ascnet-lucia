@@ -106,15 +106,11 @@ fn run() -> Result<()> {
         .map(|(path, content)| (path.as_str(), content.as_str()))
         .collect();
 
-    let cache_prefix = options.cache_dir.as_ref().map(|dir| {
-        dir.join(code_context_plugin::content_hash(&format!(
-            "playground-v1:{}",
-            root.display()
-        )))
-    });
+    let cache_prefix = options.cache_dir.as_ref().map(|dir| cache_prefix_for(dir, &root));
     let host = if let Some(prefix) = &cache_prefix {
         std::fs::create_dir_all(prefix.parent().expect("缓存父目录"))?;
-        eprintln!("缓存：{}（复用未变化源码的向量）", prefix.display());
+        migrate_legacy_cache(options.cache_dir.as_ref().expect("启用缓存"), prefix)?;
+        eprintln!("向量缓存：{}（重启复用，未变化的代码不重新调用嵌入 API）", prefix.with_extension("sqlite3").display());
         RepoHost::persisted(&file_refs, prefix.with_extension("json"))?
     } else {
         RepoHost::new(&file_refs)
@@ -307,8 +303,48 @@ fn run_query(
         println!("\n额外诊断：以下是内部候选，不是 Agent 最终结果，可能额外调用 API。");
         let started = Instant::now();
         let execution = plugin.search_execution(host, query, None, options.limit);
-        print_diagnostics(&execution, started.elapsed().as_secs_f64() * 1000.0);
+        print_diagnostics(&execution, query, started.elapsed().as_secs_f64() * 1000.0);
         print_results(&execution, root);
+    }
+    Ok(())
+}
+
+/// 只读取允许的源码，跳过符号链接、依赖和显式排除路径，错误不静默吞掉。
+fn cache_prefix_for(base: &Path, root: &Path) -> PathBuf {
+    // --root 指向 src 等子目录时，向上找项目标识，避免所有项目都缓存到名为 src 的目录。
+    let project = root.ancestors().find(|path| {
+        path.join(".git").exists() || path.join("package.json").is_file()
+            || path.join("Cargo.toml").is_file() || path.join("pom.xml").is_file()
+    }).unwrap_or(root);
+    let name = project.file_name().filter(|name| !name.is_empty()).unwrap_or_else(|| std::ffi::OsStr::new("workspace"));
+    // 同名项目或同一项目不同扫描根仍隔离，目录可读，文件名保留稳定根摘要。
+    base.join(name).join(code_context_plugin::content_hash(&format!("playground-v1:{}", root.display())))
+}
+
+/// 把旧平铺缓存迁入项目目录；SQLite 使用一致性快照，包含 WAL 中已提交的数据。
+/// 保留旧文件，新缓存已存在时不覆盖；迁移失败会报错，不静默重新付费生成向量。
+fn migrate_legacy_cache(base: &Path, destination: &Path) -> Result<()> {
+    let name = destination.file_name().context("缓存文件名缺失")?;
+    let json = destination.with_extension("json");
+    let database = destination.with_extension("sqlite3");
+    if json.exists() || database.exists() { return Ok(()); }
+    for legacy in [base.join(name), base.join("playground").join(name)] {
+        let old_json = legacy.with_extension("json");
+        let old_database = legacy.with_extension("sqlite3");
+        if !old_json.is_file() { continue; }
+        let metadata = std::fs::read(&old_json).context("读取旧缓存元数据失败")?;
+        serde_json::from_slice::<serde_json::Value>(&metadata).context("旧缓存元数据不是有效 JSON")?;
+        if old_database.is_file() {
+            let connection = rusqlite::Connection::open_with_flags(&old_database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .context("打开旧向量数据库失败")?;
+            connection.execute("VACUUM INTO ?1", [database.to_string_lossy().as_ref()])
+                .context("迁移旧向量数据库失败")?;
+        }
+        let temporary = json.with_extension("json.migrating");
+        std::fs::write(&temporary, metadata).context("写入迁移元数据失败")?;
+        std::fs::rename(&temporary, &json).context("落盘迁移元数据失败")?;
+        eprintln!("已迁移旧缓存：{}；旧文件保留", legacy.display());
+        break;
     }
     Ok(())
 }
@@ -384,7 +420,9 @@ fn collect_files(root: &Path, excludes: &[String]) -> Result<Vec<(String, String
 }
 
 /// 打印检索链路各层的判断依据。
-fn print_diagnostics(execution: &SearchExecution, millis: f64) {
+///
+/// `query` 为用户原始输入，用于对照实际送去召回的文本是否被剥离了开头指令词。
+fn print_diagnostics(execution: &SearchExecution, query: &str, millis: f64) {
     let diagnostics = &execution.diagnostics;
     let plan = &diagnostics.plan;
     let confidence = &diagnostics.confidence;
@@ -397,6 +435,13 @@ fn print_diagnostics(execution: &SearchExecution, millis: f64) {
         diagnostics.analyzed_query.goal,
         diagnostics.path.as_str()
     );
+    // 指令词是否被剥离，直接决定两路召回看到的是什么；只在与原查询不同时提示，避免刷屏。
+    if diagnostics.analyzed_query.retrieval_text != query {
+        println!(
+            "检索文本  {}（已剥离开头指令词）",
+            diagnostics.analyzed_query.retrieval_text
+        );
+    }
     println!(
         "检索计划  符号 {}（上限 {}）· 词法 {}（上限 {}）· 语义 {}（上限 {}）· 候选池 {}",
         on_off(plan.enable_symbol),
@@ -580,7 +625,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>, has_key: bool) -> Res
         std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
-            .join(".lucia/code-context/playground"),
+            .join(".lucia/code-context"),
     );
     let mut token_budget = 8000;
     let mut diagnostics = false;
@@ -684,7 +729,7 @@ fn print_help() {
          \x20 --no-semantic   强制只跑符号 + 词法（中文自然语言查询会明显变差）\n\
          \x20 --rerank        在语义之上再开模型重排；设置了密钥时默认即开启\n\
          \x20 --no-rerank     关闭模型重排，只保留本地融合排序\n\
-         \x20 --cache-dir <目录>  缓存目录，默认 ~/.lucia/code-context/playground\n\
+         \x20 --cache-dir <目录>  缓存基础目录，默认 ~/.lucia/code-context；下设 <项目名>/\n\
          \x20 --no-cache      禁用跨进程缓存\n\
          \x20 --token-budget <数量>  Agent 输出预算，默认 8000\n\
          \x20 --exclude <相对路径>  排除目录或文件，可重复\n\

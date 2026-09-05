@@ -78,6 +78,24 @@ pub struct AnalyzedQuery {
     ///
     /// 意图与目标分类仍然基于原始查询（"在哪里定义"这类措辞必须保留），只有召回使用本字段。
     pub retrieval_text: String,
+    /// 表层规则无法判定的开头指令词，等待语料频次裁决。
+    ///
+    /// 为 `None` 表示查询开头没有歧义：要么没有指令词，要么已经被确定性规则剥离。
+    pub pending_directive: Option<PendingDirective>,
+}
+
+/// 一个"既可能是指令、也可能是复合名词前半"的开头中文词。
+///
+/// "搜索主播开播代码"里的"搜索"是指令，"搜索结果怎么打包"里的"搜索"是主题的一部分。
+/// 中文没有词边界，仅凭字符形态无法区分这两者，因此把判据留到能看到语料的调用方。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDirective {
+    /// 跨越指令词与后续内容的双字词元，例如"搜索主播"的"索主"。
+    ///
+    /// 它是判据本身：真正的复合名词必然在语料里留下这个 bigram，纯指令则不会。
+    pub boundary_bigram: String,
+    /// 判定为指令时应当采用的检索文本。
+    pub stripped_text: String,
 }
 
 impl AnalyzedQuery {
@@ -102,13 +120,48 @@ impl AnalyzedQuery {
         } else {
             QueryIntent::Mixed
         };
+        let (retrieval_text, pending_directive) = strip_leading_directive(trimmed);
         Self {
             intent,
             goal: classify_goal(trimmed),
-            retrieval_text: strip_leading_directive(trimmed),
+            retrieval_text,
+            pending_directive,
             identifiers,
             cjk_dominant: cjk_dominant(trimmed),
         }
+    }
+
+    /// 用语料的词元频次裁决开头那个歧义中文指令词，必要时改写 [`Self::retrieval_text`]。
+    ///
+    /// # 判据
+    ///
+    /// 看跨界 bigram（"搜索主播"的"索主"）在语料中出现过几篇文档。复合名词一定会把这个
+    /// bigram 带进索引——"搜索结果"出现过，"索结"就必然出现过；反之，纯指令与后面的内容
+    /// 之间不存在这个组合。因此 `document_frequency` 返回 0 时判为指令并剥离。
+    ///
+    /// 判据方向是安全的：即便某个复合名词恰好没进语料而被误剥，它本来也检索不到任何东西，
+    /// 剥离后至少还能召回剩余部分；反之保留指令词会持续污染词法与语义两路。
+    ///
+    /// # 已知局限
+    ///
+    /// 阈值取 0 而不是一个小正数，是为了让误判只会退回改动前的行为。代价是跨界 bigram
+    /// 在大语料里偶然出现一两次（中文注释里跨词边界的巧合）就会让指令词继续保留。放宽
+    /// 阈值能多修一些查询，但会开始误剥低频真复合词——那是把"没修好"换成"改坏了"。
+    ///
+    /// `document_frequency` 接收一个词元，返回包含它的文档数。该方法不发起网络请求。
+    /// 返回是否真的剥离了指令词，供诊断展示。
+    pub fn resolve_leading_directive(
+        &mut self,
+        document_frequency: impl Fn(&str) -> usize,
+    ) -> bool {
+        let Some(pending) = self.pending_directive.take() else {
+            return false;
+        };
+        if document_frequency(&pending.boundary_bigram) > 0 {
+            return false;
+        }
+        self.retrieval_text = pending.stripped_text;
+        true
     }
 }
 
@@ -434,7 +487,13 @@ fn classify_goal(query: &str) -> QueryGoal {
 /// 只处理**开头**：句中的"搜索"往往是真实内容（"搜索结果怎么打包"里它就是主题）。逐个
 /// 剥离并允许连用（"帮我找一下 X"），剥净后若为空则退回原文——宁可保留噪声，也不能把
 /// 查询变成空串。
-fn strip_leading_directive(query: &str) -> String {
+///
+/// # 返回值
+///
+/// 第一项是按确定性规则剥离后的检索文本。第二项在"中文指令词紧接中文"这种表层无法判定
+/// 的情况下给出待裁决信息，由 [`AnalyzedQuery::resolve_leading_directive`] 用语料频次决定
+/// 是否采纳；确定无歧义时为 `None`。
+fn strip_leading_directive(query: &str) -> (String, Option<PendingDirective>) {
     /// 开头出现即视为指令的词，按长的优先，避免"帮我找"被"找"提前截断。
     const DIRECTIVES: &[&str] = &[
         "帮我搜索一下",
@@ -489,17 +548,34 @@ fn strip_leading_directive(query: &str) -> String {
             break;
         };
         let tail = &current[directive.len()..];
-        if !is_directive_boundary(directive, tail) {
-            break;
-        }
-        let rest = tail
-            .trim_start_matches(|character: char| character.is_whitespace() || character == ':');
+        let rest = tail.trim_start_matches(|character: char| {
+            character.is_whitespace() || character == ':' || character == '：'
+        });
         if rest.is_empty() {
             break;
         }
+        if !is_directive_boundary(directive, tail) {
+            // 中文指令词紧接中文：留住原文，同时备好"判定为指令"时该用的文本与判据。
+            return (
+                current.to_string(),
+                boundary_bigram(directive, rest).map(|boundary_bigram| PendingDirective {
+                    boundary_bigram,
+                    stripped_text: strip_leading_directive(rest).0,
+                }),
+            );
+        }
         current = rest;
     }
-    current.to_string()
+    (current.to_string(), None)
+}
+
+/// 取指令词末字与后续首字组成的双字词元；任一侧不是中日韩文字时返回 `None`。
+///
+/// 词元形态必须与 [`super::tokenize`] 对中文的切分一致，否则拿它去查倒排索引永远查不到。
+fn boundary_bigram(directive: &str, rest: &str) -> Option<String> {
+    let last = directive.chars().next_back().filter(|c| is_cjk_char(*c))?;
+    let next = rest.chars().next().filter(|c| is_cjk_char(*c))?;
+    Some([last, next].iter().collect())
 }
 
 /// 判断开头的疑似指令词后面是不是真的跟着"要找的内容"。
@@ -511,12 +587,13 @@ fn strip_leading_directive(query: &str) -> String {
 /// 最重要的限定词。
 ///
 /// 两个确定性信号说明它是指令：后面跟着**分隔符**（空格、冒号），或者后面**换了字符集**
-/// （中文指令词后紧跟拉丁标识符）。中文指令词后紧跟中文且无分隔时按复合名词处理。
+/// （中文指令词后紧跟拉丁标识符）。
 ///
-/// # 已知局限
+/// # 表层规则到此为止
 ///
-/// "搜索会话保存逻辑"这类"中文指令 + 中文目标且无分隔"的写法无法与复合名词区分，会被
-/// 保守地保留。这是纯表层规则的边界；真要覆盖需要分词或模型，代价与收益暂不匹配。
+/// "搜索主播开播代码"这类"中文指令 + 中文目标且无分隔"的写法，无法与"搜索结果怎么打包"
+/// 这样的复合名词区分。本函数对它返回 `false`，由调用方带着语料频次继续裁决——见
+/// [`AnalyzedQuery::resolve_leading_directive`]。纯表层规则在这里没有更多信息可用。
 fn is_directive_boundary(directive: &str, tail: &str) -> bool {
     let Some(next) = tail.chars().next() else {
         return false;
@@ -579,6 +656,59 @@ mod tests {
                 "句中同形词不得被剥离：{query}"
             );
         }
+    }
+
+    /// 中文指令词紧接中文时，必须由语料频次而不是字符形态做最终裁决。
+    ///
+    /// 这是"搜索主播开播代码"返回一堆 `searchUser` 的直接原因：未被剥离的"搜索"同时污染
+    /// 词法与语义两路，把整条查询拖向检索子系统本身。
+    #[test]
+    fn ambiguous_cjk_directive_is_resolved_by_corpus() {
+        let mut stripped = AnalyzedQuery::analyze("搜索主播开播代码");
+        assert_eq!(stripped.retrieval_text, "搜索主播开播代码");
+        assert_eq!(
+            stripped
+                .pending_directive
+                .as_ref()
+                .map(|pending| pending.boundary_bigram.as_str()),
+            Some("索主")
+        );
+        // 语料里没有"搜索主播"这个组合，判为指令。
+        assert!(stripped.resolve_leading_directive(|_| 0));
+        assert_eq!(stripped.retrieval_text, "主播开播代码");
+        // 裁决只发生一次，重复调用不再改写文本。
+        assert!(!stripped.resolve_leading_directive(|_| 0));
+
+        // 语料里存在"搜索结果"，跨界 bigram 出现过，按复合名词保留。
+        let mut kept = AnalyzedQuery::analyze("搜索结果怎么打包");
+        assert!(!kept.resolve_leading_directive(|term| usize::from(term == "索结")));
+        assert_eq!(kept.retrieval_text, "搜索结果怎么打包");
+    }
+
+    /// 已由确定性规则处理的查询不得留下待裁决状态，避免语料频次二次改写。
+    #[test]
+    fn unambiguous_queries_leave_nothing_pending() {
+        for query in [
+            "搜索 agent 一轮对话的代码实现",
+            "帮我找一下 权限检查",
+            "find the permission check",
+            "会话怎么保存",
+            "PermissionManager",
+        ] {
+            assert!(
+                AnalyzedQuery::analyze(query).pending_directive.is_none(),
+                "`{query}` 不应留下待裁决指令词"
+            );
+        }
+    }
+
+    /// 指令词后的全角冒号必须与半角冒号一样被剥离。
+    #[test]
+    fn full_width_colon_is_treated_as_separator() {
+        assert_eq!(
+            AnalyzedQuery::analyze("搜索：权限检查").retrieval_text,
+            "权限检查"
+        );
     }
 
     /// 整条查询都是指令词时必须退回原文，不能变成空串。

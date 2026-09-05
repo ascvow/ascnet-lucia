@@ -2242,7 +2242,8 @@ fn agent_scenario_report() {
         assert_eq!(
             plugin.index_status(),
             IndexStatus::Ready,
-            "语义索引必须就绪"
+            "语义索引必须就绪，降级原因：{:?}",
+            plugin.degraded_reason()
         );
         let mut hits_at_1 = 0usize;
         let mut hits_at_3 = 0usize;
@@ -2285,9 +2286,13 @@ fn agent_scenario_report() {
                 .iter()
                 .take(3)
                 .map(|result| {
-                    let file = result.file_path.rsplit('/').next().unwrap_or("?");
+                    // 仓库里同名文件（mod.rs、lib.rs）和同名函数都很多，只印文件名无法
+                    // 判断命中的到底是哪一处，保留父目录一级。
+                    let mut segments = result.file_path.rsplit('/');
+                    let file = segments.next().unwrap_or("?");
+                    let parent = segments.next().unwrap_or("");
                     format!(
-                        "{file}:{}",
+                        "{parent}/{file}:{}",
                         result.symbol_name.as_deref().unwrap_or("（文本块）")
                     )
                 })

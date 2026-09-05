@@ -158,7 +158,7 @@ impl Default for FusionConfig {
             path_boost: 1.0,
             metadata_rerank_boost: 0.75,
             role_match_boost: 0.2,
-            max_per_file: 5,
+            max_per_file: 3,
             documentation_weight: 0.4,
             non_implementation_weight: 0.82,
             config_weight: 0.7,

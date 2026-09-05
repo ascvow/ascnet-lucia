@@ -107,6 +107,14 @@ impl LexicalIndex {
         self.postings.len()
     }
 
+    /// 返回包含指定词元的文档数。
+    ///
+    /// 词元必须已按 [`tokenize`] 的规则规范化（小写、中文按单字与双字切分），否则永远
+    /// 返回 0。查询分析用它判断一个中文组合在本仓库里到底存不存在。
+    pub fn document_frequency(&self, term: &str) -> usize {
+        self.postings.get(term).map_or(0, Vec::len)
+    }
+
     /// 把一个 chunk 连同它的正文加入索引。
     ///
     /// `body` 在本次调用后即可丢弃：索引只保留切词结果。

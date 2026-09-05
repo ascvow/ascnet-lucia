@@ -315,6 +315,11 @@ pub fn parse_file(
                 }
                 chunk.start_line += start as u32;
                 chunk.end_line += start as u32;
+                if !is_substantive_block(
+                    &lines[chunk.start_line.saturating_sub(1) as usize..chunk.end_line as usize],
+                ) {
+                    continue;
+                }
                 chunk.id = chunk_id(repository, file_path, "", SymbolKind::Other, chunks.len());
                 chunks.push(chunk);
             }
@@ -774,6 +779,39 @@ fn truncate(mut text: String, limit: usize) -> String {
         .map_or(text.len(), |(offset, _)| offset);
     text.truncate(cut);
     text
+}
+
+/// 纯注释块仍值得单独建索引所需的最少非空行数。
+///
+/// 取 5 行：一段真正在解释设计的注释不会只有一两行，而声明之间遗留的 `// 播放错误`
+/// 恰恰只有一行。
+const MIN_COMMENT_ONLY_BLOCK_LINES: usize = 5;
+
+/// 判断一段源码是否含有值得单独占用一个检索结果位置的内容。
+///
+/// Vue SFC 的声明之间常常只剩空行、单行注释和收尾括号。这类块拿到再高的名次也回答不了
+/// 任何问题，却会把真正的实现挤出 Top-N——实测一次中文查询的八条结果里有四条是
+/// `// 播放错误`、`//邀请码` 这样的一行注释。
+///
+/// 判据：存在任意一行既不是注释、又含有字母或数字，即认为整块有实质内容；全是注释时，
+/// 只有达到 [`MIN_COMMENT_ONLY_BLOCK_LINES`] 行的成段说明才保留。
+fn is_substantive_block(lines: &[&str]) -> bool {
+    let mut non_blank = 0usize;
+    for line in lines {
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        non_blank += 1;
+        let is_comment = text.starts_with("//")
+            || text.starts_with("/*")
+            || text.starts_with('*')
+            || text.starts_with("<!--");
+        if !is_comment && text.chars().any(char::is_alphanumeric) {
+            return true;
+        }
+    }
+    non_blank >= MIN_COMMENT_ONLY_BLOCK_LINES
 }
 
 /// Tier 3 文本分块。

@@ -29,8 +29,8 @@ mod tests;
 
 pub use fusion::{FusionConfig, FusionDebug, SearchResult};
 pub use query::{
-    AnalyzedQuery, ConfidenceLevel, QueryGoal, QueryIntent, RetrievalConfidence, SearchPath,
-    SearchPlan,
+    AnalyzedQuery, ConfidenceLevel, PendingDirective, QueryGoal, QueryIntent, RetrievalConfidence,
+    SearchPath, SearchPlan,
 };
 pub use role::ChunkRole;
 pub use symbol::SymbolMatch;
@@ -211,6 +211,14 @@ impl RetrievalIndex {
     /// 索引是否为空。
     pub fn is_empty(&self) -> bool {
         self.symbols.is_empty() && self.lexical.is_empty()
+    }
+
+    /// 返回包含指定词元的文档数。
+    ///
+    /// 供查询分析判断一个中文组合是否真的存在于本仓库，见
+    /// [`AnalyzedQuery::resolve_leading_directive`]。
+    pub fn document_frequency(&self, term: &str) -> usize {
+        self.lexical.document_frequency(term)
     }
 
     /// 返回索引规模。
