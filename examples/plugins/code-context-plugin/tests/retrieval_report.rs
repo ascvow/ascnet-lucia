@@ -1347,6 +1347,10 @@ const EMBEDDING_MODEL: &str = "BAAI/bge-m3";
 const EMBEDDING_DIMENSION: u32 = 1024;
 /// 真实消融请求的最小间隔，单位毫秒。
 const EMBEDDING_REQUEST_INTERVAL_MS: u64 = 1_500;
+/// 响应缓存已预热时的请求间隔，单位毫秒。
+///
+/// 缓存命中不产生任何真实请求，再按限流节奏休眠会让一轮评测多花四分钟。
+const CACHED_REQUEST_INTERVAL_MS: u64 = 0;
 /// 单批真实消融请求允许的重试次数。
 const EMBEDDING_MAX_RETRIES: u32 = 4;
 /// 真实消融瞬时错误的指数退避基数，单位毫秒。
@@ -1415,7 +1419,11 @@ fn ablation_context(root: &str, ablation: &Ablation) -> agent_plugin::Activation
             .insert("embedding_batch_size".into(), "32".into());
         context.metadata.insert(
             "embedding_request_interval_ms".into(),
-            EMBEDDING_REQUEST_INTERVAL_MS.to_string(),
+            if std::env::var("RETRIEVAL_CACHE").as_deref() == Ok("warm") {
+                CACHED_REQUEST_INTERVAL_MS.to_string()
+            } else {
+                EMBEDDING_REQUEST_INTERVAL_MS.to_string()
+            },
         );
         context.metadata.insert(
             "embedding_max_retries".into(),
@@ -1443,6 +1451,7 @@ fn ablation_context(root: &str, ablation: &Ablation) -> agent_plugin::Activation
 fn forward_to_endpoint(
     api_key: String,
 ) -> impl Fn(&agent_plugin::HttpRequest) -> anyhow::Result<agent_plugin::HttpResponse> {
+    let cache_dir = response_cache_dir();
     let agent = ureq::Agent::new_with_config(
         ureq::config::Config::builder()
             .http_status_as_error(false)
@@ -1450,6 +1459,12 @@ fn forward_to_endpoint(
             .build(),
     );
     move |request: &agent_plugin::HttpRequest| {
+        let cache_key = cache_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.json", request_fingerprint(request))));
+        if let Some(hit) = cache_key.as_ref().and_then(|path| read_cached(path)) {
+            return Ok(hit);
+        }
         let url = url::Url::parse(EMBEDDING_BASE_URL)
             .and_then(|base| base.join(request.path.trim_start_matches('/')))
             .map_err(|error| anyhow::anyhow!("拼接端点路径失败：{error}"))?;
@@ -1479,11 +1494,62 @@ fn forward_to_endpoint(
             .limit(32 * 1024 * 1024)
             .read_to_string()
             .map_err(|error| anyhow::anyhow!("读取端点响应失败：{error}"))?;
-        Ok(agent_plugin::HttpResponse {
+        let response = agent_plugin::HttpResponse {
             status,
             headers,
             body,
-        })
+        };
+        // 只缓存成功响应：限流与服务端错误必须让插件自己走重试逻辑。
+        if status == 200 {
+            if let Some(path) = cache_key.as_ref() {
+                write_cached(path, &response);
+            }
+        }
+        Ok(response)
+    }
+}
+
+/// 端点响应的磁盘缓存目录，返回 `None` 表示本轮不缓存。
+///
+/// 嵌入与重排请求对同一输入是确定性的，缓存后重复评测不再重算整仓库向量，
+/// 权重调参从十分钟一轮降到秒级。设 `RETRIEVAL_CACHE=off` 可强制走真实端点。
+fn response_cache_dir() -> Option<std::path::PathBuf> {
+    if std::env::var("RETRIEVAL_CACHE").as_deref() == Ok("off") {
+        return None;
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("retrieval-response-cache");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// 用请求路径与请求体的哈希作为缓存键。
+fn request_fingerprint(request: &agent_plugin::HttpRequest) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(request.path.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(request.body.as_deref().unwrap_or_default().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// 读取缓存的响应，文件缺失或损坏都视为未命中。
+fn read_cached(path: &std::path::Path) -> Option<agent_plugin::HttpResponse> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some(agent_plugin::HttpResponse {
+        status: value.get("status")?.as_u64()? as u16,
+        headers: std::collections::HashMap::new(),
+        body: value.get("body")?.as_str()?.to_string(),
+    })
+}
+
+/// 写入缓存，失败只影响下轮命中率，不影响本轮结果。
+fn write_cached(path: &std::path::Path, response: &agent_plugin::HttpResponse) {
+    let value = serde_json::json!({ "status": response.status, "body": response.body });
+    if let Ok(raw) = serde_json::to_string(&value) {
+        let _ = std::fs::write(path, raw);
     }
 }
 
@@ -2153,18 +2219,13 @@ fn agent_scenario_report() {
         .map(|(path, content)| (path.as_str(), content.as_str()))
         .collect();
     let queries = scenario_queries();
-    for ablation in [
-        Ablation {
-            label: "语义 + 条件重排",
-            semantic: true,
-            rerank: true,
-        },
-        Ablation {
-            label: "仅语义（无重排）",
-            semantic: true,
-            rerank: false,
-        },
-    ] {
+    // 每档都要为整个仓库重算向量，连续跑多档容易撞上端点的 TPM 限流；默认只跑生产配置，
+    // 需要对照时把另一档取消注释单独运行。
+    for ablation in [Ablation {
+        label: "语义 + 条件重排",
+        semantic: true,
+        rerank: true,
+    }] {
         let host =
             RepoHost::new(&file_refs).with_http_handler(forward_to_endpoint(api_key.clone()));
         let mut plugin = CodeContextPlugin::default();
