@@ -12,7 +12,10 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
 /// 单次模型重排最多提交的候选数量。
-const MAX_RERANK_CANDIDATES: usize = 48;
+///
+/// 与 [`crate::retrieval::SearchPlan`] 的候选池上限保持一致：本地融合在中文自然语言查询上
+/// 排不准，只能保证目标落进候选池，真正的判别交给交叉编码器，因此池子必须够深。
+const MAX_RERANK_CANDIDATES: usize = 150;
 
 /// 本地名次与模型名次做 RRF 时的平滑常量。
 ///
@@ -1132,8 +1135,10 @@ mod tests {
     #[test]
     fn candidate_pool_is_expanded_and_bounded() {
         assert_eq!(candidate_limit(10), 40);
-        assert_eq!(candidate_limit(20), 48);
-        assert_eq!(candidate_limit(50), 50);
+        assert_eq!(candidate_limit(20), 80);
+        assert_eq!(candidate_limit(50), MAX_RERANK_CANDIDATES);
+        // 请求数超过上限时以请求为准，调用方不该拿到少于期望的结果。
+        assert_eq!(candidate_limit(200), 200);
     }
 
     /// 精确符号命中必须形成高置信度，并跳过模型重排。

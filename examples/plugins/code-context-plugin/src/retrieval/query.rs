@@ -230,6 +230,24 @@ pub struct RetrievalConfidence {
     pub reasons: Vec<String>,
 }
 
+/// 送入模型重排的候选池相对返回条数的倍数。
+const RERANK_POOL_MULTIPLIER: usize = 12;
+
+/// 送入模型重排的候选池上限。
+///
+/// 本地融合排序在中文自然语言查询上并不可靠——它排不出正确答案，只能保证正确答案落在
+/// 候选池里。真正做判别的是交叉编码器，因此候选池越深，它能纠正的错误越多；瓶颈从
+/// "本地排序准不准"变成"目标有没有进池子"。检索文献里的通行做法也是先召回一两百条再重排。
+///
+/// 取 150：与召回通道 200 条的上限同量级，且单次重排请求（每条候选正文上限 1800 字符）
+/// 仍在端点可接受的负载内。代价是重排延迟随候选数近似线性增长。
+const MAX_RERANK_POOL: usize = 150;
+
+/// 自然语言查询的候选池下限。
+///
+/// 即使只要一条结果，判别所需的候选深度不变；把输出条数当成召回深度会让重排无从纠错。
+const MIN_NATURAL_LANGUAGE_POOL: usize = 120;
+
 /// 一次请求实际采用的延迟路径。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchPath {
@@ -275,15 +293,15 @@ impl SearchPlan {
             );
         let candidate_pool_limit = if rerank_allowed {
             result_limit
-                .saturating_mul(4)
-                .min(48usize.max(result_limit))
+                .saturating_mul(RERANK_POOL_MULTIPLIER)
+                .min(MAX_RERANK_POOL.max(result_limit))
         } else {
             result_limit
         };
         // 返回一条位置也需要同样的判别候选，不能把输出条数误当召回深度。
         let natural_language = query.intent == QueryIntent::NaturalLanguage && result_limit > 0;
         let candidate_pool_limit = if natural_language && rerank_allowed {
-            candidate_pool_limit.max(40)
+            candidate_pool_limit.max(MIN_NATURAL_LANGUAGE_POOL)
         } else {
             candidate_pool_limit
         };
@@ -796,7 +814,7 @@ mod tests {
         );
         assert!(natural.enable_semantic);
         assert!(natural.allow_rerank);
-        assert_eq!(natural.candidate_pool_limit, 40);
+        assert_eq!(natural.candidate_pool_limit, 120);
         assert_eq!(natural.lexical_limit, 120);
         assert_eq!(natural.semantic_limit, 120);
         let empty = SearchPlan::for_query(&AnalyzedQuery::analyze("会话保存"), 0, true, true);
@@ -807,6 +825,6 @@ mod tests {
         let single = SearchPlan::for_query(&AnalyzedQuery::analyze("会话保存"), 1, true, true);
         assert_eq!(single.semantic_limit, 120);
         assert_eq!(single.lexical_limit, 120);
-        assert_eq!(single.candidate_pool_limit, 40);
+        assert_eq!(single.candidate_pool_limit, MIN_NATURAL_LANGUAGE_POOL);
     }
 }
