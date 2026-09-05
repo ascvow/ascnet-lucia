@@ -227,9 +227,23 @@ impl SearchPlan {
         } else {
             result_limit
         };
+        // 返回一条位置也需要同样的判别候选，不能把输出条数误当召回深度。
+        let natural_language = query.intent == QueryIntent::NaturalLanguage && result_limit > 0;
+        let candidate_pool_limit = if natural_language && rerank_allowed {
+            candidate_pool_limit.max(40)
+        } else {
+            candidate_pool_limit
+        };
+        let natural_limit = if natural_language {
+            expanded(12).max(120)
+        } else {
+            0
+        };
         let (symbol_limit, lexical_limit, semantic_limit) = match query.intent {
             QueryIntent::Identifier | QueryIntent::QualifiedSymbol => (expanded(4), expanded(2), 0),
-            QueryIntent::NaturalLanguage => (expanded(2), expanded(4), expanded(4)),
+            // 自然语言通常没有符号锚点，先扩大本地召回覆盖，再把有限候选交给重排。
+            // 返回条数为 10 时两路各取 120 条，仍受 200 条上限约束，不扩大模型候选预算。
+            QueryIntent::NaturalLanguage => (expanded(2), natural_limit, natural_limit),
             QueryIntent::Mixed => (expanded(4), expanded(4), expanded(4)),
         };
         Self {
@@ -653,6 +667,16 @@ mod tests {
         assert!(natural.enable_semantic);
         assert!(natural.allow_rerank);
         assert_eq!(natural.candidate_pool_limit, 40);
-        assert!(natural.lexical_limit >= 10 && natural.semantic_limit >= 10);
+        assert_eq!(natural.lexical_limit, 120);
+        assert_eq!(natural.semantic_limit, 120);
+        let empty = SearchPlan::for_query(&AnalyzedQuery::analyze("会话保存"), 0, true, true);
+        assert_eq!(empty.candidate_pool_limit, 0);
+        assert!(!empty.enable_semantic);
+        let large = SearchPlan::for_query(&AnalyzedQuery::analyze("会话保存"), 50, true, true);
+        assert_eq!(large.semantic_limit, 200);
+        let single = SearchPlan::for_query(&AnalyzedQuery::analyze("会话保存"), 1, true, true);
+        assert_eq!(single.semantic_limit, 120);
+        assert_eq!(single.lexical_limit, 120);
+        assert_eq!(single.candidate_pool_limit, 40);
     }
 }

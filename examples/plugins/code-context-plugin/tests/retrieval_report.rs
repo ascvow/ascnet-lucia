@@ -2332,6 +2332,211 @@ fn agent_scenario_report() {
     }
 }
 
+/// 验证 Agent 通过业务描述找到具体定义，而不是仅命中同文件。
+///
+/// 使用与既有验收相同的八条查询，输出分路、融合与最终位置；真实响应可复用缓存，
+/// 但索引必须就绪且语义通道实际运行。`RETRIEVAL_LOCATION_REPORT` 可指定 JSON 报告路径。
+#[test]
+#[ignore = "需要网络与嵌入 API 密钥"]
+fn implementation_location_report() {
+    let api_key = std::env::var(API_KEY_ENV).expect("需要 API 密钥");
+    let root = repository_root();
+    let files = collect_evaluation_files(&root);
+    let file_refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    let host = RepoHost::new(&file_refs).with_http_handler(forward_to_endpoint(api_key));
+    let mut plugin = CodeContextPlugin::default();
+    plugin
+        .activate(
+            &host,
+            ablation_context(
+                &root.to_string_lossy(),
+                &Ablation {
+                    label: "实现定位",
+                    semantic: true,
+                    rerank: true,
+                },
+            ),
+        )
+        .expect("激活插件");
+    for _ in 0..400 {
+        let call = ToolCall::new("location", "code_search", json!({"query": "初始化索引"}));
+        let _ = plugin.call_tool_with_host(&host, call);
+        if plugin.index_status() != IndexStatus::Indexing {
+            break;
+        }
+    }
+    assert_eq!(
+        plugin.index_status(),
+        IndexStatus::Ready,
+        "语义索引未就绪：{:?}",
+        plugin.degraded_reason()
+    );
+    let mut rows = Vec::new();
+    let mut hits = [0usize; 3];
+    let mut tool_hits = [0usize; 3];
+    for query in acceptance_queries() {
+        let execution = plugin.search_execution(&host, query.query, None, 10);
+        assert!(
+            !execution.diagnostics.stages.semantic.is_empty(),
+            "{} 没有语义候选",
+            query.query
+        );
+        assert!(
+            execution.diagnostics.rerank_applied,
+            "{} 的源码重排未成功",
+            query.query
+        );
+        let index = plugin.structural_index().expect("结构索引");
+        let targets: std::collections::HashSet<&str> = index
+            .chunks()
+            .filter(|chunk| {
+                matches_target_path(&chunk.file_path, query.expected_paths)
+                    && chunk
+                        .symbol_name
+                        .as_deref()
+                        .is_some_and(|name| query.expected_symbols.contains(&name))
+            })
+            .map(|chunk| chunk.id.as_str())
+            .collect();
+        assert!(
+            !targets.is_empty(),
+            "{} 的预期定义必须真实存在",
+            query.query
+        );
+        let rank_of = |ids: &[String]| {
+            ids.iter()
+                .position(|id| targets.contains(id.as_str()))
+                .map(|i| i + 1)
+        };
+        let rank = rank_of(&execution.diagnostics.stages.final_results);
+        for (count, k) in hits.iter_mut().zip([1, 3, 10]) {
+            *count += usize::from(rank.is_some_and(|rank| rank <= k));
+        }
+        let locations: Vec<_> = execution
+            .results
+            .iter()
+            .map(|result| {
+                let source = files
+                    .iter()
+                    .find(|(path, _)| path == &result.file_path)
+                    .expect("返回文件必须存在");
+                assert!(result.start_line > 0 && result.start_line <= result.end_line);
+                assert!(
+                    result.end_line as usize <= source.1.lines().count(),
+                    "返回行号不得越界"
+                );
+                json!({"path": result.file_path, "symbol": result.qualified_symbol,
+                "start_line": result.start_line, "end_line": result.end_line,
+                "score": result.score, "channels": format!("{:?}", result.debug.ranks)})
+            })
+            .collect();
+        let stages = &execution.diagnostics.stages;
+        let mut row = json!({"query": query.query, "rank": rank,
+            "symbol_rank": rank_of(&stages.symbol), "lexical_rank": rank_of(&stages.lexical),
+            "semantic_rank": rank_of(&stages.semantic), "union_rank": rank_of(&stages.union),
+            "fusion_rank": rank_of(&stages.post_fusion), "rerank_applied": execution.diagnostics.rerank_applied,
+            "locations": locations});
+        // 额外经过真正的工具入口，覆盖扩大候选、去重、正文回填与 token 预算，而非只测内部列表。
+        let started = Instant::now();
+        let call = ToolCall::new(
+            "location-query",
+            "code_search",
+            json!({"query": query.query, "max_results": 10}),
+        );
+        let tool = plugin
+            .call_tool_with_host(&host, call)
+            .expect("工具执行成功");
+        assert!(!tool.is_error, "索引就绪后工具不应报错");
+        let entries = tool.content["results"]
+            .as_array()
+            .expect("工具返回位置数组");
+        let tool_rank = entries
+            .iter()
+            .position(|entry| {
+                entry["file"]
+                    .as_str()
+                    .is_some_and(|path| matches_target_path(path, query.expected_paths))
+                    && entry["symbol"]
+                        .as_str()
+                        .is_some_and(|name| query.expected_symbols.contains(&name))
+            })
+            .map(|i| i + 1);
+        for (count, k) in tool_hits.iter_mut().zip([1, 3, 10]) {
+            *count += usize::from(tool_rank.is_some_and(|rank| rank <= k));
+        }
+        let tool_locations: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                let path = entry["file"].as_str().expect("工具文件路径");
+                let source = &files
+                    .iter()
+                    .find(|(file, _)| file == path)
+                    .expect("工具返回文件存在")
+                    .1;
+                let start = entry["lines"][0].as_u64().expect("起始行") as usize;
+                let end = entry["lines"][1].as_u64().expect("结束行") as usize;
+                assert!(start > 0 && start <= end && end <= source.lines().count());
+                let expected = source
+                    .lines()
+                    .skip(start - 1)
+                    .take(end - start + 1)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let snippet = entry["snippet"].as_str().expect("源码正文");
+                // 截断提示属于工具协议而非源码，只在显式 truncated 标记存在时剥离。
+                let snippet = if entry["truncated"].as_bool() == Some(true) {
+                    snippet
+                        .strip_suffix("\n// …（片段已截断）")
+                        .expect("截断结果必须附带提示")
+                } else {
+                    snippet
+                };
+                assert_eq!(
+                    snippet.trim(),
+                    expected.trim(),
+                    "返回片段必须来自报告中的真实行号"
+                );
+                json!({"path": path, "symbol": entry["qualified_symbol"], "lines": entry["lines"],
+                "hydrated_lines": entry["hydrated_lines"], "truncated": entry["truncated"]})
+            })
+            .collect();
+        row["tool_rank"] = json!(tool_rank);
+        row["tool_latency_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
+        row["tool_locations"] = json!(tool_locations);
+        println!("{}", serde_json::to_string(&row).expect("序列化定位结果"));
+        rows.push(row);
+    }
+    let report = json!({"queries": rows.len(), "hits_at_1": hits[0], "hits_at_3": hits[1],
+        "hits_at_10": hits[2], "tool_hits_at_1": tool_hits[0], "tool_hits_at_3": tool_hits[1],
+        "tool_hits_at_10": tool_hits[2], "results": rows});
+    println!(
+        "实现定位：Top-1={} Top-3={} Top-10={} / {}",
+        hits[0],
+        hits[1],
+        hits[2],
+        rows.len()
+    );
+    println!(
+        "工具定位：Top-1={} Top-3={} Top-10={} / {}",
+        tool_hits[0],
+        tool_hits[1],
+        tool_hits[2],
+        rows.len()
+    );
+    if let Ok(path) = std::env::var("RETRIEVAL_LOCATION_REPORT") {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&report).expect("序列化报告"),
+        )
+        .expect("写入定位报告");
+    }
+    assert_eq!(hits[2], rows.len(), "每条业务查询的目标定义必须进入 Top-10");
+    assert_eq!(tool_hits[2], rows.len(), "上下文打包不能丢失目标定义");
+}
+
 /// 诊断：一次模型重排实际提交的请求体规模。
 ///
 /// 延迟受远端抖动影响很大，单看耗时无法判断"只发紧凑签名"是否真的降低了开销。请求体

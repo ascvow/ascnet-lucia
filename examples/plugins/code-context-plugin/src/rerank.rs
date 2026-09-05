@@ -19,7 +19,7 @@ const MAX_RERANK_CANDIDATES: usize = 48;
 /// 与 [`crate::retrieval::FusionConfig`] 取同一个值，使两处"排名融合"的量级一致。
 const RRF_K: f32 = 60.0;
 
-/// 模型重排允许施加的最大分数增量。
+/// 带标识符查询的模型重排允许施加的最大分数增量。
 ///
 /// 取 0.75 个 rank-1 当量：足以区分本地分数接近的困难候选，但不足以覆盖精确符号、角色与
 /// 多路一致性已经建立的强本地证据。
@@ -33,6 +33,9 @@ const MAX_MODULE_DOC_CHARS: usize = 240;
 
 /// 每条候选携带的文档注释最大字符数。
 const MAX_DOC_CHARS: usize = 320;
+
+/// 重排正文的字符上限，限制网络负载并保留判断实际行为的源码证据。
+const MAX_BODY_CHARS: usize = 1_800;
 
 /// 计算本地融合结果的可解释置信度。
 ///
@@ -133,21 +136,17 @@ const AMBIGUOUS_TOP_MARGIN: f32 = 0.05;
 
 /// 判断本次查询是否需要调用远端模型重排。
 ///
-/// 前三个条件是门槛：自然语言或混合查询、候选多于一条、本地置信度低且 Top-1 缺少多路
-/// 佐证。在此之上还要出现**两种"本地确实没判对"的迹象之一**：
-///
-/// - Top-1 与 Top-2 的分差小到分不出高下；
-/// - 存在角色冲突，即 Top-1 的代码角色不匹配查询目标而候选池里存在匹配的（典型形态是
-///   说明文档压过了真正的实现）。
-///
-/// 第三条来自实测：低置信度只说明"本地没把握"，不等于"模型能做得更好"——Top-1 已被两路
-/// 召回器共同选中时，再花一次远端往返，模型往往只是把正确结果往下压。最后一组条件同样
-/// 来自实测：把重排收敛到"本地确实判错或分不出"的场合，才对得起它 2.5 倍的延迟代价。
+/// 自然语言没有精确符号证据，多路召回一致不等于已经定位到实现，因此候选多于一条时
+/// 交给源码重排。混合查询仍按本地置信度、分差与角色冲突触发；精确查询保持快速路径。
+/// 调用方负责检查模型是否已配置，该判断本身不发起网络请求。
 pub(crate) fn should_rerank(
     query: &AnalyzedQuery,
     candidates: &[SearchResult],
     confidence: &RetrievalConfidence,
 ) -> bool {
+    if query.intent == QueryIntent::NaturalLanguage {
+        return candidates.len() > 1;
+    }
     candidates.len() > 1
         && confidence.level == ConfidenceLevel::Low
         && !confidence.multi_channel_top
@@ -205,13 +204,22 @@ pub(crate) fn rerank_results(
         return Ok(results.to_vec());
     }
 
-    // 只发紧凑签名而不是源码正文：区分词汇相近的两个子系统靠的是模块职责与函数签名，
-    // 函数体里的实现细节是噪声。单次请求因此从约 3 万 token 降到 2 千量级。
-    let mut module_docs: HashMap<String, Option<String>> = HashMap::new();
-    let documents: Vec<String> = results
-        .iter()
-        .map(|result| candidate_document(host, result, &mut module_docs))
-        .collect();
+    // 同文件只读一次，提取完受限片段即释放全文，避免候选横跨大文件时耗尽 WASM 内存。
+    let mut documents = vec![String::new(); results.len()];
+    let mut visited = HashSet::new();
+    for result in results {
+        if !visited.insert(result.file_path.as_str()) {
+            continue;
+        }
+        let source = host.read_file(&result.file_path).ok();
+        let module_doc = source.as_deref().and_then(module_doc_of);
+        for (index, candidate) in results.iter().enumerate() {
+            if candidate.file_path == result.file_path {
+                documents[index] =
+                    candidate_document(candidate, module_doc.as_deref(), source.as_deref());
+            }
+        }
+    }
     let body = serde_json::json!({
         "model": model,
         "query": query,
@@ -237,22 +245,12 @@ pub(crate) fn rerank_results(
     apply_response(&response.body, query, results.to_vec())
 }
 
-/// 构造一条供模型判断的候选文档。
+/// 构造带定义信息与受限源码的重排文档；回读失败时只使用已有元数据，不伪造正文。
 fn candidate_document(
-    host: &dyn PluginHostApi,
     result: &SearchResult,
-    module_docs: &mut HashMap<String, Option<String>>,
+    module_doc: Option<&str>,
+    source: Option<&str>,
 ) -> String {
-    // 文件级模块文档按文件缓存，同一文件的多条候选只读一次。
-    let module_doc = module_docs
-        .entry(result.file_path.clone())
-        .or_insert_with(|| {
-            host.read_file(&result.file_path)
-                .ok()
-                .and_then(|content| module_doc_of(&content))
-        })
-        .as_deref();
-
     let mut document = format!("文件：{}\n语言：{}", result.file_path, result.language);
     if let Some(doc) = module_doc {
         document.push_str("\n所属模块：");
@@ -281,6 +279,21 @@ fn candidate_document(
     if let Some(comment) = result.doc_comment.as_deref() {
         document.push_str("\n说明：");
         document.push_str(&truncate_chars(comment.trim(), MAX_DOC_CHARS));
+    }
+    if let Some(source) =
+        source.filter(|_| result.start_line > 0 && result.end_line >= result.start_line)
+    {
+        let body: String = source
+            .lines()
+            .skip(result.start_line.saturating_sub(1) as usize)
+            .take(result.end_line.saturating_sub(result.start_line) as usize + 1)
+            .flat_map(|line| line.chars().chain(std::iter::once('\n')))
+            .take(MAX_BODY_CHARS)
+            .collect();
+        if !body.is_empty() {
+            document.push_str("\n源码：\n");
+            document.push_str(&body);
+        }
     }
     document
 }
@@ -379,7 +392,7 @@ struct RerankedResult {
     result: SearchResult,
 }
 
-/// 把 rerank 响应映射回候选，并在本地融合分上施加有界调整。
+/// 把重排响应映射回候选：自然语言按模型相关度排序，带标识符查询保留有界调整和排名保护。
 fn apply_response(
     body: &str,
     query: &str,
@@ -438,17 +451,34 @@ fn apply_response(
     model_order.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
 
     let denominator = expected.saturating_sub(1).max(1) as f32;
+    let natural_language = AnalyzedQuery::analyze(query).intent == QueryIntent::NaturalLanguage;
+    let wants_tests = crate::retrieval::fusion::query_targets_tests(query);
     let mut scored = Vec::with_capacity(expected);
     for (model_rank, (relevance, index)) in model_order.into_iter().enumerate() {
         let mut result = slots
             .get_mut(index)
             .and_then(Option::take)
             .ok_or_else(|| format!("rerank 响应的 index {index} 重复"))?;
-        // `results` 传入时已按本地融合分降序，因此下标即本地名次。模型只能按名次差施加
-        // 有界增量，不能把原始相关度直接覆盖本地结构分。
+        // 自然语言没有精确导航证据，相关度直接作为最终分；混合查询仍保留结构分的保护。
         let rank_shift = (index as f32 - model_rank as f32) / denominator;
-        let delta = rank_shift.clamp(-1.0, 1.0) * MAX_RERANK_DELTA;
-        result.score += delta;
+        // 模型常把描述行为的测试判得很高；延续融合层的测试意图约束，但不惩罚短实现。
+        let model_score = if result.role == ChunkRole::Test && !wants_tests {
+            relevance
+                - relevance.abs()
+                    * (1.0 - crate::retrieval::FusionConfig::default().test_code_weight)
+        } else {
+            relevance
+        };
+        let delta = if natural_language {
+            model_score - result.score
+        } else {
+            rank_shift.clamp(-1.0, 1.0) * MAX_RERANK_DELTA
+        };
+        result.score = if natural_language {
+            model_score
+        } else {
+            result.score + delta
+        };
         result.debug.model_rerank_score = Some(relevance);
         result.debug.model_rerank_delta = delta;
         scored.push(RerankedResult {
@@ -482,7 +512,9 @@ fn apply_response(
             })
             .then_with(|| left.result.chunk_id.cmp(&right.result.chunk_id))
     });
-    apply_rank_floors(&mut scored, &protections);
+    if !natural_language {
+        apply_rank_floors(&mut scored, &protections);
+    }
     Ok(scored.into_iter().map(|item| item.result).collect())
 }
 
@@ -768,7 +800,7 @@ mod tests {
         assert_eq!(reranked[0].chunk_id, "qualified");
     }
 
-    /// 强词法与实现角色共同命中时，模型不得把候选移出 Top-5 保护窗口。
+    /// 混合查询的强词法与实现角色共同命中时，仍保留 Top-5 保护窗口。
     #[test]
     fn strong_implementation_hit_keeps_protected_window() {
         let mut candidates: Vec<SearchResult> = (0..8)
@@ -789,7 +821,7 @@ mod tests {
 
         let reranked = apply_response(
             &format!(r#"{{"results":[{}]}}"#, items.join(",")),
-            "插件管理页面怎么绘制",
+            "renderPanel 插件管理页面怎么绘制",
             candidates,
         )
         .expect("重排应成功");
@@ -831,13 +863,10 @@ mod tests {
         );
     }
 
-    /// Top-1 已被多路召回共同支持时不得再触发模型重排。
-    ///
-    /// 低置信度只说明"本地没把握"，不等于"模型能做得更好"。实测中一条中文查询的三个
-    /// 候选拿到的重排增量全为负，其中语义第一名被压得最狠——多付一秒还让排序变差。
+    /// 混合查询的 Top-1 已被多路召回共同支持时，继续保留快速跳过规则。
     #[test]
     fn multi_channel_top_skips_rerank() {
-        let query = AnalyzedQuery::analyze("权限检查在哪里实现");
+        let query = AnalyzedQuery::analyze("permission_check 权限检查在哪里实现");
         let mut agreed = result("agreed", "check_permission", 1, 0.9);
         agreed.debug.ranks = vec![
             (CandidateSource::Lexical, 3),
@@ -863,7 +892,7 @@ mod tests {
         assert!(should_rerank(&query, &single_only, &confidence));
     }
 
-    /// 多路一致的候选不得被模型重排压出前列。
+    /// 混合查询的多路一致候选仍保留排名保护。
     #[test]
     fn multi_channel_candidate_keeps_rank_floor() {
         let mut agreed = result("agreed", "check_permission", 1, 0.9);
@@ -894,7 +923,7 @@ mod tests {
             .collect();
         let reranked = apply_response(
             &format!(r#"{{"results":[{}]}}"#, items.join(",")),
-            "权限检查在哪里实现",
+            "permission_check 权限检查在哪里实现",
             candidates,
         )
         .expect("重排应成功");
@@ -908,6 +937,99 @@ mod tests {
             "多路一致候选不得被压到第 {} 位",
             position + 1
         );
+    }
+
+    /// 自然语言多路一致只能证明相关，不能替代实现定位，必须允许重排纠正。
+    #[test]
+    fn natural_language_reranks_agreement_and_uses_model_order() {
+        let query = AnalyzedQuery::analyze("会话保存逻辑在哪里实现");
+        let mut first = result("caller", "invoke", 1, 0.9);
+        first.debug.ranks = vec![
+            (CandidateSource::Lexical, 1),
+            (CandidateSource::Semantic, 1),
+        ];
+        let candidates = vec![first, result("definition", "persist", 5, 0.01)];
+        let confidence = assess_confidence(&query, &candidates);
+        assert_eq!(confidence.level, ConfidenceLevel::High);
+        assert!(should_rerank(&query, &candidates, &confidence));
+        let reranked = apply_response(
+            r#"{"results":[{"index":0,"relevance_score":0.1},{"index":1,"relevance_score":0.9}]}"#,
+            &query.retrieval_text,
+            candidates.clone(),
+        )
+        .expect("模型响应有效");
+        assert_eq!(reranked[0].chunk_id, "definition");
+        assert_eq!(reranked[0].score, 0.9);
+        assert!(reranked
+            .windows(2)
+            .all(|pair| pair[0].score >= pair[1].score));
+        assert!(
+            (reranked[0].score - candidates[1].score - reranked[0].debug.model_rerank_delta).abs()
+                < 1e-6
+        );
+        assert!(!should_rerank(&query, &[], &confidence));
+        assert!(!should_rerank(&query, &candidates[..1], &confidence));
+    }
+
+    /// 同分模型结果保持原顺序，不因响应下标顺序改变而抖动。
+    #[test]
+    fn equal_model_scores_preserve_local_order() {
+        let reranked = apply_response(
+            r#"{"results":[{"index":1,"relevance_score":0.5},{"index":0,"relevance_score":0.5}]}"#,
+            "会话保存逻辑",
+            vec![
+                result("first", "first", 1, 0.9),
+                result("second", "second", 5, 0.1),
+            ],
+        )
+        .expect("模型响应有效");
+        assert_eq!(reranked[0].chunk_id, "first");
+    }
+
+    /// 找实现时保留测试降权，显式找测试时不得隐藏测试候选。
+    #[test]
+    fn natural_language_preserves_test_intent_after_model_rerank() {
+        let mut test = result("test", "persist_test", 1, 0.1);
+        test.role = ChunkRole::Test;
+        let candidates = vec![test, result("implementation", "persist", 5, 0.09)];
+        let response =
+            r#"{"results":[{"index":0,"relevance_score":0.99},{"index":1,"relevance_score":0.8}]}"#;
+        let implementation =
+            apply_response(response, "会话保存逻辑", candidates.clone()).expect("响应有效");
+        assert_eq!(implementation[0].chunk_id, "implementation");
+        let tests = apply_response(response, "会话保存测试", candidates).expect("响应有效");
+        assert_eq!(tests[0].chunk_id, "test");
+    }
+
+    /// 重排必须包含目标行范围内的真实正文，而不是仅重复函数签名。
+    #[test]
+    fn candidate_document_contains_bounded_source_and_handles_missing_files() {
+        let candidate = result("target", "persist", 2, 0.1);
+        let text = candidate_document(
+            &candidate,
+            Some("会话模块"),
+            Some("outside_before\nfn persist() {\n    write_snapshot();\n}\noutside_after"),
+        );
+        assert!(text.contains("write_snapshot();"));
+        assert!(!text.contains("outside_before"));
+        assert!(!text.contains("outside_after"));
+        let long = format!("ignored\n{}", "持久化".repeat(MAX_BODY_CHARS));
+        let text = candidate_document(&candidate, None, Some(&long));
+        assert_eq!(
+            text.split_once("\n源码：\n")
+                .expect("源码字段")
+                .1
+                .chars()
+                .count(),
+            MAX_BODY_CHARS
+        );
+        assert!(!candidate_document(&candidate, None, None).contains("源码："));
+        let mut invalid = candidate.clone();
+        invalid.start_line = 0;
+        assert!(!candidate_document(&invalid, None, Some(&long)).contains("源码："));
+        invalid.start_line = 5;
+        invalid.end_line = 2;
+        assert!(!candidate_document(&invalid, None, Some(&long)).contains("源码："));
     }
 
     /// 默认召回深度必须扩大，但不能无限增加远端输入。

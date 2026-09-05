@@ -14,7 +14,8 @@
 //! 两路都在语义分支缺席时可用，因此 V1 交付的检索能力不依赖任何嵌入 provider——这正是
 //! `architecture.md` 第 13 问要求的 `Degraded` 形态。
 
-mod fusion;
+// 插件入口在最终截断前复用配额选择，不向其他 crate 暴露融合实现。
+pub(crate) mod fusion;
 mod lexical;
 mod query;
 mod role;

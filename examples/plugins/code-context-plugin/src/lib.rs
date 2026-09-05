@@ -1097,12 +1097,16 @@ impl CodeContextPlugin {
             "查询计划禁用模型重排".to_string()
         } else if rerank_model.is_none() {
             "未配置模型重排".to_string()
+        } else if rerank_activated && analyzed.intent == QueryIntent::NaturalLanguage {
+            "自然语言缺少精确符号证据，使用源码相关度重排".to_string()
         } else if confidence.level == ConfidenceLevel::High {
             "本地检索置信度高，直接返回".to_string()
         } else if run.results.len() <= 1 {
             "候选不足两条，无需模型重排".to_string()
-        } else {
+        } else if rerank_activated {
             "低置信度候选存在分歧，启用模型重排".to_string()
+        } else {
+            "混合查询已有多路证据或分差足够，保留本地排序".to_string()
         };
         if rerank_activated {
             let model = rerank_model.as_deref().expect("已确认配置了重排模型");

@@ -611,7 +611,7 @@ pub(crate) fn select_with_file_quota(
 ///
 /// 只在用户确实要找测试时放行测试代码的正常排名；这条判断存在的意义是让降权**可被
 /// 用户意图关闭**，而不是一刀切地埋掉整个测试目录。
-fn query_targets_tests(query: &str) -> bool {
+pub(crate) fn query_targets_tests(query: &str) -> bool {
     let lower = query.to_ascii_lowercase();
     ["测试", "单测", "用例", "test", "spec", "assert", "fixture"]
         .iter()
