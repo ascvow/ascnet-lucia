@@ -184,6 +184,13 @@ pub(crate) fn candidate_limit(limit: usize) -> usize {
         .min(MAX_RERANK_CANDIDATES.max(limit))
 }
 
+/// 仓库作用域内的重排响应缓存，不保存源码和问题原文。
+#[derive(Debug, Default)]
+pub(crate) struct ResponseCache {
+    /// 仅保存摘要和已校验响应，最多 16 条，每条响应最多 64 KiB，不落盘。
+    entries: Vec<(String, String)>,
+}
+
 /// 使用宿主 HTTP 能力调用兼容 `/v1/rerank` 的模型端点。
 ///
 /// `results` 必须保持初始融合顺序；该顺序用于模型分数相同时稳定决胜。请求会按文件缓存
@@ -194,24 +201,33 @@ pub(crate) fn candidate_limit(limit: usize) -> usize {
 ///
 /// 宿主 HTTP 调用失败、端点返回非 2xx、响应结构非法、下标重复或缺失时返回可读错误。
 /// 调用方应保留输入候选作为降级结果。
+/// 重排并返回是否复用了已校验响应；缓存随仓库销毁，源码变化使键失效。
 pub(crate) fn rerank_results(
     host: &dyn PluginHostApi,
     model: &str,
     query: &str,
     results: &[SearchResult],
-) -> Result<Vec<SearchResult>, String> {
+    cache: &mut ResponseCache,
+) -> Result<(Vec<SearchResult>, bool), String> {
     if results.len() <= 1 {
-        return Ok(results.to_vec());
+        return Ok((results.to_vec(), false));
     }
 
     // 同文件只读一次，提取完受限片段即释放全文，避免候选横跨大文件时耗尽 WASM 内存。
     let mut documents = vec![String::new(); results.len()];
     let mut visited = HashSet::new();
+    let mut source_hashes = Vec::new();
+    let mut cacheable = true;
     for result in results {
         if !visited.insert(result.file_path.as_str()) {
             continue;
         }
         let source = host.read_file(&result.file_path).ok();
+        if let Some(source) = source.as_deref() {
+            source_hashes.push(crate::repository::content_hash(source));
+        } else {
+            cacheable = false;
+        }
         let module_doc = source.as_deref().and_then(module_doc_of);
         for (index, candidate) in results.iter().enumerate() {
             if candidate.file_path == result.file_path {
@@ -227,12 +243,20 @@ pub(crate) fn rerank_results(
         "top_n": results.len(),
         "return_documents": false,
     });
+    let body = body.to_string();
+    let key = crate::repository::content_hash(&format!("{body}\n{}", source_hashes.join("\n")));
+    if cacheable {
+        if let Some((_, response)) = cache.entries.iter().find(|(hash, _)| hash == &key) {
+            return apply_response(response, query, results.to_vec())
+                .map(|results| (results, true));
+        }
+    }
     let response = host
         .http_request(&HttpRequest {
             method: "POST".to_string(),
             path: "rerank".to_string(),
             headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
-            body: Some(body.to_string()),
+            body: Some(body),
         })
         .map_err(|error| format!("rerank 端点调用失败：{error}"))?;
     if !(200..300).contains(&response.status) {
@@ -242,7 +266,14 @@ pub(crate) fn rerank_results(
             truncate_for_message(&response.body)
         ));
     }
-    apply_response(&response.body, query, results.to_vec())
+    let ranked = apply_response(&response.body, query, results.to_vec())?;
+    if cacheable && response.body.len() <= 64 * 1024 {
+        if cache.entries.len() == 16 {
+            cache.entries.remove(0);
+        }
+        cache.entries.push((key, response.body));
+    }
+    Ok((ranked, false))
 }
 
 /// 构造带定义信息与受限源码的重排文档；回读失败时只使用已有元数据，不伪造正文。
@@ -704,8 +735,10 @@ mod tests {
                 result("first", "unrelated", 1, 0.020),
                 result("second", "prepare_session", 3, 0.019),
             ],
+            &mut ResponseCache::default(),
         )
-        .expect("模型重排应成功");
+        .expect("模型重排应成功")
+        .0;
 
         assert_eq!(reranked[0].chunk_id, "second");
         assert_eq!(reranked[0].debug.model_rerank_score, Some(0.93));
@@ -721,6 +754,69 @@ mod tests {
         assert!(body["documents"][1]
             .as_str()
             .is_some_and(|document| document.contains("pub fn prepare_session")));
+    }
+
+    /// 响应缓存只在完整源码和模型不变时命中，容量上限触发淘汰。
+    #[test]
+    fn response_cache_checks_full_source_model_and_capacity() {
+        let host = RepoHost::new(&[("src/agent.rs", "fn a() {}\nfn b() {}\n")])
+            .with_http_handler(|_| http_json(200, r#"{"results":[{"index":0,"relevance_score":0.9},{"index":1,"relevance_score":0.8}]}"#));
+        let candidates = vec![result("a", "a", 1, 0.02), result("b", "b", 2, 0.01)];
+        let mut cache = ResponseCache::default();
+        assert!(
+            !rerank_results(&host, "model", "方法实现", &candidates, &mut cache)
+                .unwrap()
+                .1
+        );
+        assert!(
+            rerank_results(&host, "model", "方法实现", &candidates, &mut cache)
+                .unwrap()
+                .1
+        );
+        assert_eq!(host.http_requests().len(), 1);
+        assert!(
+            !rerank_results(&host, "other-model", "方法实现", &candidates, &mut cache)
+                .unwrap()
+                .1
+        );
+        // 修改候选范围外的正文也必须使缓存失效，而不只比较送给模型的截断片段。
+        let changed = RepoHost::new(&[("src/agent.rs", "fn a() {}\nfn b() {}\n\n\nfn changed() {}")])
+            .with_http_handler(|_| http_json(200, r#"{"results":[{"index":0,"relevance_score":0.9},{"index":1,"relevance_score":0.8}]}"#));
+        assert!(
+            !rerank_results(&changed, "model", "方法实现", &candidates, &mut cache)
+                .unwrap()
+                .1
+        );
+        for n in 0..17 {
+            rerank_results(&host, "model", &format!("查询{n}"), &candidates, &mut cache).unwrap();
+        }
+        assert_eq!(cache.entries.len(), 16);
+        assert!(
+            !rerank_results(&host, "model", "方法实现", &candidates, &mut cache)
+                .unwrap()
+                .1
+        );
+    }
+
+    /// 非法响应和源码读取失败都不能进入缓存。
+    #[test]
+    fn response_cache_does_not_preserve_failures() {
+        let candidates = vec![result("a", "a", 1, 0.02), result("b", "b", 2, 0.01)];
+        let mut cache = ResponseCache::default();
+        let invalid = RepoHost::new(&[("src/agent.rs", "fn a() {}")])
+            .with_http_handler(|_| http_json(200, "{}"));
+        assert!(rerank_results(&invalid, "model", "查询", &candidates, &mut cache).is_err());
+        assert!(cache.entries.is_empty());
+        let missing = RepoHost::new(&[]).with_http_handler(|_| http_json(200, r#"{"results":[{"index":0,"relevance_score":0.9},{"index":1,"relevance_score":0.8}]}"#));
+        for _ in 0..2 {
+            assert!(
+                !rerank_results(&missing, "model", "查询", &candidates, &mut cache)
+                    .unwrap()
+                    .1
+            );
+        }
+        assert!(cache.entries.is_empty());
+        assert_eq!(missing.http_requests().len(), 2);
     }
 
     /// 响应少返回候选时必须失败，调用方才能完整保留本地排序。

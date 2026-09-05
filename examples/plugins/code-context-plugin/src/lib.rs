@@ -283,6 +283,8 @@ struct RepositoryContext {
     pending_writes: BTreeMap<String, incremental::PendingWrite>,
     /// 仓库生命周期内的查询向量缓存：空间 ID、查询摘要、向量；最多 32 条，不落盘。
     query_vectors: Vec<(String, String, Vec<f32>)>,
+    /// 同一仓库生命周期内，按完整候选源码和请求摘要复用已校验的模型响应。
+    rerank_responses: rerank::ResponseCache,
 }
 
 /// Code Context Engine 插件。
@@ -541,6 +543,7 @@ impl CodeContextPlugin {
             dirty_paths: BTreeSet::new(),
             pending_writes: BTreeMap::new(),
             query_vectors: Vec::new(),
+            rerank_responses: rerank::ResponseCache::default(),
         });
         self.index_status = status;
         Ok(())
@@ -1102,7 +1105,7 @@ impl CodeContextPlugin {
                 Some(format!("sqlite-vec 查询失败，已退回内存语义检索：{error}"));
         }
         let confidence = rerank::assess_confidence(&analyzed, &run.results);
-        let rerank_activated = plan.allow_rerank
+        let mut rerank_activated = plan.allow_rerank
             && rerank_model.is_some()
             && rerank::should_rerank(&analyzed, &run.results, &confidence);
         let mut rerank_applied = false;
@@ -1123,10 +1126,19 @@ impl CodeContextPlugin {
         };
         if rerank_activated {
             let model = rerank_model.as_deref().expect("已确认配置了重排模型");
-            match rerank::rerank_results(host, model, query, &run.results) {
-                Ok(reranked) => {
+            let cache = &mut self
+                .repository
+                .as_mut()
+                .expect("索引已就绪")
+                .rerank_responses;
+            match rerank::rerank_results(host, model, query, &run.results, cache) {
+                Ok((reranked, cached)) => {
                     run.results = reranked;
                     rerank_applied = true;
+                    if cached {
+                        rerank_activated = false;
+                        rerank_reason = "源码和请求未变化，复用已校验模型重排响应".to_string();
+                    }
                 }
                 Err(reason) => {
                     self.last_rerank_degraded_reason =
