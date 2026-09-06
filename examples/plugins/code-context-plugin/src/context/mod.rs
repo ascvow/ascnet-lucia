@@ -99,7 +99,7 @@ pub struct ContextEntry {
     pub role: ChunkRole,
     /// 代码片段正文。
     pub snippet: String,
-    /// 片段是否因超过行数上限被截断。
+    /// 是否因行数上限或重叠去重而只返回完整目标的一部分。
     pub truncated: bool,
     /// 该条目是否因文件被外部修改而重新定位过。
     pub relocated: bool,
@@ -260,6 +260,8 @@ struct Selected {
     start_line: u32,
     /// 结束行。
     end_line: u32,
+    /// 重叠裁剪前的完整目标；裁剪片只展示实际区间，文件变化后不能按原符号整体重定位。
+    partial_target: Option<(u32, u32)>,
     /// 检索阶段命中代码块的起始行。
     retrieval_start_line: u32,
     /// 检索阶段命中代码块的结束行。
@@ -347,6 +349,7 @@ fn select(
             file_path: result.file_path,
             start_line,
             end_line,
+            partial_target: None,
             retrieval_start_line,
             retrieval_end_line,
             language: result.language,
@@ -360,60 +363,7 @@ fn select(
             debug: result.debug,
         };
 
-        let contained = kept.iter().position(|existing| {
-            existing.file_path == candidate.file_path
-                && (contains(existing, &candidate) || contains(&candidate, existing))
-        });
-        if let Some(index) = contained {
-            // 父子包含：默认保留已在集合里的那条（分数更高）。被包含的一方内容已经在
-            // 保留的区间里，丢弃它不损失信息，只省 token。
-            //
-            // 但"已经在区间里"有个前提：那个区间真的会被完整展示。容器 chunk（`impl` 块、
-            // class）动辄数百行，超过 `max_snippet_lines` 后会从起始行硬截断，目标方法很
-            // 可能整段落在截断之外——于是结果里出现的是容器开头几十行，真正要找的方法反而
-            // 不见了。这种情况下把窗口收窄到被包含的那一条：宁可少给容器的头部，
-            // 也不能把用户要的符号截掉。
-            let container = &kept[index];
-            let container_span = container.end_line.saturating_sub(container.start_line) + 1;
-            let candidate_span = candidate.end_line.saturating_sub(candidate.start_line) + 1;
-            // 仅在模型分数近似相等时牺牲容器范围；不把明显低相关的方法提升为答案。
-            let near_tied_method = config.prefer_method_locations
-                && candidate.symbol_kind == Some(crate::model::SymbolKind::Function)
-                && matches!(
-                    container.symbol_kind,
-                    Some(
-                        crate::model::SymbolKind::Constant
-                            | crate::model::SymbolKind::Struct
-                            | crate::model::SymbolKind::Impl
-                            | crate::model::SymbolKind::Module
-                    )
-                )
-                && container_span >= candidate_span.saturating_mul(4)
-                && matches!((container.debug.model_rerank_score, candidate.debug.model_rerank_score),
-                    (Some(parent), Some(child)) if parent > 0.0 && child > 0.0 && (parent - child).abs() <= 0.01);
-            if contains(container, &candidate)
-                && (container_span > config.max_snippet_lines || near_tied_method)
-                && candidate_span <= config.max_snippet_lines
-            {
-                kept[index].start_line = candidate.start_line;
-                kept[index].end_line = candidate.end_line;
-                kept[index].retrieval_start_line = candidate.retrieval_start_line;
-                kept[index].retrieval_end_line = candidate.retrieval_end_line;
-                // 定位元数据一并换成被包含的那条，否则重定位与展示会指向容器符号。
-                kept[index].chunk_id = candidate.chunk_id;
-                kept[index].symbol_name = candidate.symbol_name;
-                kept[index].qualified_symbol = candidate.qualified_symbol;
-                kept[index].symbol_kind = candidate.symbol_kind;
-                kept[index].signature = candidate.signature;
-                kept[index].doc_comment = candidate.doc_comment;
-                kept[index].role = candidate.role;
-            }
-            stats.suppressed_contained += 1;
-            continue;
-        }
-
-        // 候选可能同时桥接多个已保留区间。反复扩展并集直到收敛，确保合并后的集合仍满足
-        // “同文件区间互不重叠”的不变量，而不是只合并第一个命中项后留下重复行。
+        // 先计算连通并集，包含多个已选区间的低分桥接也必须经过行限检查。
         let mut merged_start = candidate.start_line;
         let mut merged_end = candidate.end_line;
         loop {
@@ -431,6 +381,86 @@ fn select(
                 break;
             }
         }
+        let merge_fits =
+            merged_end.saturating_sub(merged_start).saturating_add(1) <= config.max_snippet_lines;
+
+        let contained = kept.iter().position(|existing| {
+            existing.file_path == candidate.file_path
+                && (contains(existing, &candidate)
+                    || (merge_fits && contains(&candidate, existing)))
+        });
+        if let Some(index) = contained {
+            // 父子包含：默认保留已在集合里的那条（分数更高）。被包含的一方内容已经在
+            // 保留的区间里，丢弃它不损失信息，只省 token。
+            //
+            // 但"已经在区间里"有个前提：那个区间真的会被完整展示。容器 chunk（`impl` 块、
+            // class）动辄数百行，超过 `max_snippet_lines` 后会从起始行硬截断，目标方法很
+            // 可能整段落在截断之外——于是结果里出现的是容器开头几十行，真正要找的方法反而
+            // 不见了。这种情况下把窗口收窄到被包含的那一条：宁可少给容器的头部，
+            // 也不能把用户要的符号截掉。
+            let container = &kept[index];
+            let container_span = container.end_line.saturating_sub(container.start_line) + 1;
+            let candidate_span = candidate.end_line.saturating_sub(candidate.start_line) + 1;
+            // 收窄只适用于结构容器中的方法，不能让低分类型别名或普通文本替换已有正文。
+            let is_contained_method = candidate.symbol_kind == Some(SymbolKind::Function)
+                && matches!(
+                    container.symbol_kind,
+                    Some(
+                        SymbolKind::Constant
+                            | SymbolKind::Struct
+                            | SymbolKind::Impl
+                            | SymbolKind::Module
+                    )
+                );
+            // 放得下的容器仅在模型分数近似相等时收窄，不提升明显低相关的方法。
+            let near_tied_method = config.prefer_method_locations
+                && is_contained_method
+                && container_span >= candidate_span.saturating_mul(4)
+                && matches!((container.debug.model_rerank_score, candidate.debug.model_rerank_score),
+                    (Some(parent), Some(child)) if parent > 0.0 && child > 0.0 && (parent - child).abs() <= 0.01);
+            if contains(container, &candidate)
+                && ((container_span > config.max_snippet_lines && is_contained_method)
+                    || near_tied_method)
+                && candidate_span <= config.max_snippet_lines
+            {
+                kept[index].start_line = candidate.start_line;
+                kept[index].end_line = candidate.end_line;
+                kept[index].partial_target = candidate.partial_target;
+                kept[index].retrieval_start_line = candidate.retrieval_start_line;
+                kept[index].retrieval_end_line = candidate.retrieval_end_line;
+                // 定位元数据一并换成被包含的那条，否则重定位与展示会指向容器符号。
+                kept[index].chunk_id = candidate.chunk_id;
+                kept[index].symbol_name = candidate.symbol_name;
+                kept[index].qualified_symbol = candidate.qualified_symbol;
+                kept[index].symbol_kind = candidate.symbol_kind;
+                kept[index].signature = candidate.signature;
+                kept[index].doc_comment = candidate.doc_comment;
+                kept[index].role = candidate.role;
+            } else if config.max_snippet_lines > 0
+                && contains(container, &candidate)
+                && container_span > config.max_snippet_lines
+                && candidate.end_line
+                    > container
+                        .start_line
+                        .saturating_add(config.max_snippet_lines - 1)
+            {
+                // 完整函数与语义尾窗也可能互相包含，但前缀截断后的实际正文没有覆盖尾窗。
+                // 固定高分条目的真实前缀，再按可见覆盖扣除尾窗；不能拿不可见行抑制已召回正文。
+                let target = container
+                    .partial_target
+                    .unwrap_or((container.start_line, container.end_line));
+                let visible_end = container
+                    .start_line
+                    .saturating_add(config.max_snippet_lines - 1);
+                kept[index] = container.partial_range(container.start_line, visible_end);
+                let mut remainder = candidate;
+                remainder.partial_target = Some(target);
+                kept.extend(remainder.uncovered_fragments(&kept, config.max_snippet_lines));
+                continue;
+            }
+            stats.suppressed_contained += 1;
+            continue;
+        }
 
         let related: Vec<usize> = kept
             .iter()
@@ -447,9 +477,32 @@ fn select(
             continue;
         };
 
+        if !merge_fits {
+            // 前方的低分窗口不能把高分命中推到截断之外。保留既有区间，仅追加未覆盖正文；
+            // 一个桥接候选可能留下多段，不能只保留第一段或原样追加重叠部分。
+            // 部分重叠同样只能扣除实际前缀，不能用尚未展示的超长目标范围遮掉新候选。
+            if config.max_snippet_lines > 0 {
+                for &index in &related {
+                    let existing = &kept[index];
+                    let visible_end = existing
+                        .start_line
+                        .saturating_add(config.max_snippet_lines - 1);
+                    if existing.end_line > visible_end {
+                        kept[index] = existing.partial_range(existing.start_line, visible_end);
+                    }
+                }
+            }
+            kept.extend(candidate.uncovered_fragments(&kept, config.max_snippet_lines));
+            continue;
+        }
+
         // `kept` 保持输入排名顺序，首个关联项分数最高；沿用它的符号元数据，只扩展正文范围。
         kept[primary].start_line = merged_start;
         kept[primary].end_line = merged_end;
+        if let Some((start, end)) = kept[primary].partial_target.as_mut() {
+            *start = (*start).min(merged_start);
+            *end = (*end).max(merged_end);
+        }
         for &index in related.iter().skip(1).rev() {
             kept.remove(index);
         }
@@ -467,6 +520,67 @@ impl Selected {
         range.start_line = start_line;
         range.end_line = end_line;
         range
+    }
+
+    /// 保留原完整目标并截取实际区间；部分正文不能继续声明自己是完整符号定义。
+    fn partial_range(&self, start_line: u32, end_line: u32) -> Self {
+        let mut fragment = self.with_range(start_line, end_line);
+        fragment.partial_target = Some(
+            self.partial_target
+                .unwrap_or((self.start_line, self.end_line)),
+        );
+        fragment.symbol_name = None;
+        fragment.qualified_symbol = None;
+        fragment.symbol_kind = None;
+        fragment.signature = None;
+        fragment.doc_comment = None;
+        fragment
+    }
+
+    /// 扣除同文件已有覆盖，按行限保留所有非空余段；裁剪片不冒充完整符号定义。
+    ///
+    /// 原检索范围和完整目标用于说明缺失内容；实际余段独立保留，外部修改后保守丢弃。
+    fn uncovered_fragments(&self, kept: &[Self], max_lines: u32) -> Vec<Self> {
+        if max_lines == 0 {
+            return Vec::new();
+        }
+        let mut ranges = vec![(self.start_line, self.end_line)];
+        for existing in kept.iter().filter(|item| item.file_path == self.file_path) {
+            let mut remaining = Vec::new();
+            for (start, end) in ranges {
+                if existing.end_line < start || existing.start_line > end {
+                    remaining.push((start, end));
+                    continue;
+                }
+                if start < existing.start_line {
+                    remaining.push((start, existing.start_line - 1));
+                }
+                if end > existing.end_line {
+                    remaining.push((existing.end_line + 1, end));
+                }
+            }
+            ranges = remaining;
+        }
+
+        let mut fragments = Vec::new();
+        for (mut start, end) in ranges {
+            while start <= end {
+                let fragment_end = end.min(start.saturating_add(max_lines - 1));
+                let fragment = if self.partial_target.is_some()
+                    || (start, fragment_end) != (self.start_line, self.end_line)
+                {
+                    self.partial_range(start, fragment_end)
+                } else {
+                    self.with_range(start, fragment_end)
+                };
+                fragments.push(fragment);
+                if fragment_end == end {
+                    break;
+                }
+                start = fragment_end + 1;
+            }
+        }
+        fragments
     }
 }
 
@@ -503,7 +617,7 @@ struct Resolved {
     hydrated_start_line: u32,
     /// 完整符号正文目标的结束行。
     hydrated_end_line: u32,
-    /// 是否被行数上限截断。
+    /// 是否因行数上限或重叠去重而只返回部分目标。
     truncated: bool,
     /// 是否因文件被外部修改而重新定位。
     relocated: bool,
@@ -633,6 +747,10 @@ fn resolve(
     stats: &mut ContextStats,
 ) -> Option<Resolved> {
     let state = sources.state(host, index, &item.file_path)?;
+    // 裁剪边界来自旧快照中其他高分条目的覆盖，单独重定位原 chunk 会重新引入重复或错行。
+    if state.changed && item.partial_target.is_some() {
+        return None;
+    }
     let lines: Vec<&str> = state.content.lines().collect();
 
     let (
@@ -674,11 +792,14 @@ fn resolve(
             )
         }
     } else {
+        let target = item
+            .partial_target
+            .unwrap_or((item.start_line, item.end_line));
         (
             item.retrieval_start_line,
             item.retrieval_end_line,
-            item.start_line,
-            item.end_line,
+            target.0,
+            target.1,
             None,
         )
     };
@@ -690,18 +811,23 @@ fn resolve(
         stats.hydrated += 1;
     }
 
-    let (snippet, actual_end, truncated) = take_lines(
-        &lines,
-        hydrated_start_line,
-        hydrated_end_line,
-        config.max_snippet_lines,
-    );
+    let (actual_start, selected_end) = if item.partial_target.is_some() {
+        (item.start_line, item.end_line)
+    } else {
+        (hydrated_start_line, hydrated_end_line)
+    };
+    let (mut snippet, actual_end, line_truncated) =
+        take_lines(&lines, actual_start, selected_end, config.max_snippet_lines);
     if snippet.trim().is_empty() {
         return None;
     }
+    let truncated = line_truncated || item.partial_target.is_some();
+    if truncated && !line_truncated {
+        snippet.push_str("\n// …（片段已截断）");
+    }
     Some(Resolved {
         snippet,
-        start_line: hydrated_start_line,
+        start_line: actual_start,
         end_line: actual_end,
         retrieval_start_line,
         retrieval_end_line,

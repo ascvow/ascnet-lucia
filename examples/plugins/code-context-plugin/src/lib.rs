@@ -985,8 +985,17 @@ impl CodeContextPlugin {
         } else {
             limit
         };
-        let mut results =
-            self.search_results(host, &request.query, single_scope, context_candidate_limit);
+        // 上下文层先合并同文件的重叠区间，再执行最终文件配额；在这里提前筛选会让
+        // 多个窗口占满名额，将已经召回和重排的完整函数丢掉。
+        let mut results = self
+            .search_execution_with_file_quota(
+                host,
+                &request.query,
+                single_scope,
+                context_candidate_limit,
+                false,
+            )
+            .results;
         if request.path_scope.len() > 1 {
             results.retain(|result| {
                 request
@@ -1070,6 +1079,21 @@ impl CodeContextPlugin {
         query: &str,
         path_scope: Option<&str>,
         limit: usize,
+    ) -> SearchExecution {
+        self.search_execution_with_file_quota(host, query, path_scope, limit, true)
+    }
+
+    /// 共用检索流程，并按结果消费者决定是否执行最终文件配额。
+    ///
+    /// 直接返回检索列表时保留原配额；工具路径传入 `false`，交给上下文层在水合、
+    /// 去重和合并后执行配额。工具保留已有有界候选池供合并后补位，不扩大模型候选或调用次数。
+    fn search_execution_with_file_quota(
+        &mut self,
+        host: &dyn PluginHostApi,
+        query: &str,
+        path_scope: Option<&str>,
+        limit: usize,
+        apply_file_quota: bool,
     ) -> SearchExecution {
         self.last_rerank_degraded_reason = None;
         let rerank_model = self.config.rerank_model.clone();
@@ -1167,14 +1191,15 @@ impl CodeContextPlugin {
                 }
             }
         }
-        // 同文件名额必须施加在这里。池级配额（candidate_pool_limit，自然语言查询下是 40）
-        // 形同虚设：候选池里的不同文件数通常少于 40，配额筛完后的“溢出补齐”会把同文件的
-        // 高分块原样放回，再按分数重排后它们又回到前列。只有最终截断这一步的名额是稀缺的。
-        run.results = retrieval::fusion::select_with_file_quota(
-            std::mem::take(&mut run.results),
-            limit,
-            retrieval::fusion::FusionConfig::default().max_per_file,
-        );
+        if apply_file_quota {
+            run.results = retrieval::fusion::select_with_file_quota(
+                std::mem::take(&mut run.results),
+                limit,
+                retrieval::fusion::FusionConfig::default().max_per_file,
+            );
+        }
+        // 工具路径保留现有有界候选池：前排可能合并为同一段或超出预算，后续候选需能补位。
+        // 最终数量和文件名额由上下文层控制，不另发模型请求。
         run.stages.final_results = run
             .results
             .iter()
