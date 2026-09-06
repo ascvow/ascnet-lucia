@@ -637,11 +637,39 @@ fn score_weight_of(
     ) {
         return 1.0;
     }
+    role_size_weight(
+        role,
+        goal,
+        chunk.is_test,
+        wants_tests,
+        chunk.end_line.saturating_sub(chunk.start_line) + 1,
+        config,
+    )
+}
+
+/// 返回仅由角色、体量和查询目标决定的分数系数，`1.0` 表示不惩罚。
+///
+/// 与 [`score_weight_of`] 共用同一套规则，但不依赖 [`CodeChunk`]，因此**模型重排之后也能
+/// 施加同一份约束**。这一点是必需的：自然语言查询的重排会用模型相关度直接替换本地分数，
+/// 若不在那里复用本函数，融合阶段的文档、配置与短块降权就被整个抹掉。
+///
+/// 实测后果：查"用户开播代码"时，`docs/tasks/remove-live-code.md` 这份**说明如何删除直播
+/// 代码的文档**拿到 0.82 的模型相关度排在第一。它与查询确实语义相关，但用户要的是代码。
+///
+/// 调用方负责先排除精确标识符查询——那类查询表达的是精确导航意图，任何"块太短""这是文档"
+/// 的惩罚都是错的。
+pub(crate) fn role_size_weight(
+    role: ChunkRole,
+    goal: QueryGoal,
+    is_test: bool,
+    wants_tests: bool,
+    span: u32,
+    config: &FusionConfig,
+) -> f32 {
     let mut weight = 1.0;
-    if chunk.is_test && !wants_tests {
+    if is_test && !wants_tests {
         weight *= config.test_code_weight;
     }
-    let span = chunk.end_line.saturating_sub(chunk.start_line) + 1;
     if span <= config.short_chunk_lines {
         weight *= config.short_chunk_weight;
     }

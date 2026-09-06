@@ -485,7 +485,9 @@ fn apply_response(
     model_order.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
 
     let denominator = expected.saturating_sub(1).max(1) as f32;
-    let natural_language = AnalyzedQuery::analyze(query).intent == QueryIntent::NaturalLanguage;
+    let analyzed = AnalyzedQuery::analyze(query);
+    let natural_language = analyzed.intent == QueryIntent::NaturalLanguage;
+    let goal = analyzed.goal;
     let wants_tests = crate::retrieval::fusion::query_targets_tests(query);
     let mut scored = Vec::with_capacity(expected);
     for (model_rank, (relevance, index)) in model_order.into_iter().enumerate() {
@@ -495,14 +497,21 @@ fn apply_response(
             .ok_or_else(|| format!("rerank 响应的 index {index} 重复"))?;
         // 自然语言没有精确导航证据，相关度直接作为最终分；混合查询仍保留结构分的保护。
         let rank_shift = (index as f32 - model_rank as f32) / denominator;
-        // 模型常把描述行为的测试判得很高；延续融合层的测试意图约束，但不惩罚短实现。
-        let model_score = if result.role == ChunkRole::Test && !wants_tests {
-            relevance
-                - relevance.abs()
-                    * (1.0 - crate::retrieval::FusionConfig::default().test_code_weight)
-        } else {
-            relevance
-        };
+        // 自然语言重排用模型分直接替换本地分，融合阶段的角色与体量降权会一并消失。这里
+        // 复用同一套系数补回来：模型只判断"语义是否相关"，判断不了"用户要的是代码还是
+        // 讲这段代码的文档"。实测查"用户开播代码"时，一份说明如何删除直播代码的 Markdown
+        // 拿到 0.82 的相关度排在第一——它确实相关，但它不是代码。
+        let model_score = relevance
+            - relevance.abs()
+                * (1.0
+                    - crate::retrieval::fusion::role_size_weight(
+                        result.role,
+                        goal,
+                        result.role == ChunkRole::Test,
+                        wants_tests,
+                        result.end_line.saturating_sub(result.start_line) + 1,
+                        &crate::retrieval::FusionConfig::default(),
+                    ));
         let delta = if natural_language {
             model_score - result.score
         } else {
@@ -1058,7 +1067,10 @@ mod tests {
         )
         .expect("模型响应有效");
         assert_eq!(reranked[0].chunk_id, "definition");
-        assert_eq!(reranked[0].score, 0.9);
+        // 模型分不再原样落地：融合阶段的角色与体量降权在重排之后同样生效，这里的候选
+        // 只有三行，因此按短块系数折减。
+        let short_chunk_weight = crate::retrieval::FusionConfig::default().short_chunk_weight;
+        assert!((reranked[0].score - 0.9 * short_chunk_weight).abs() < 1e-6);
         assert!(reranked
             .windows(2)
             .all(|pair| pair[0].score >= pair[1].score));
