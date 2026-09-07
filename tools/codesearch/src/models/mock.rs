@@ -79,7 +79,11 @@ impl MockProvider {
                     bytes[offset + 3],
                 ]) as usize
                     % dimensions;
-                let sign = if bytes[offset + 4].is_multiple_of(2) { 1.0 } else { -1.0 };
+                let sign = if bytes[offset + 4].is_multiple_of(2) {
+                    1.0
+                } else {
+                    -1.0
+                };
                 vector[index] += sign;
             }
         }
@@ -100,8 +104,14 @@ mod tests {
     #[tokio::test]
     async fn same_input_always_yields_same_vector() {
         let provider = MockProvider::with_model("mock", 64);
-        let first = provider.embed(&["fn retry() {}".to_string()]).await.expect("embed");
-        let second = provider.embed(&["fn retry() {}".to_string()]).await.expect("embed");
+        let first = provider
+            .embed(&["fn retry() {}".to_string()])
+            .await
+            .expect("embed");
+        let second = provider
+            .embed(&["fn retry() {}".to_string()])
+            .await
+            .expect("embed");
         assert_eq!(first, second);
         assert_eq!(provider.call_count(), 2);
     }

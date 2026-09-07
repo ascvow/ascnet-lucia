@@ -15,7 +15,14 @@ use crate::types::ChunkKind;
 /// 遍历 `program` 并提取顶层定义与导入。
 pub fn extract(ctx: &Context<'_>, root: Node<'_>, parsed: &mut ParsedFile) {
     let mut scope: Vec<String> = Vec::new();
-    walk(ctx, root, &mut scope, None, &mut parsed.definitions, &mut parsed.imports);
+    walk(
+        ctx,
+        root,
+        &mut scope,
+        None,
+        &mut parsed.definitions,
+        &mut parsed.imports,
+    );
 }
 
 fn walk(
@@ -80,7 +87,8 @@ fn handle_node(
             }
         }
         "interface_declaration" => {
-            if let Some(definition) = container(ctx, outer, node, ChunkKind::Trait, scope, imports) {
+            if let Some(definition) = container(ctx, outer, node, ChunkKind::Trait, scope, imports)
+            {
                 out.push(definition);
             }
         }
@@ -101,13 +109,15 @@ fn handle_node(
             }
         }
         "type_alias_declaration" => {
-            if let Some(definition) = leaf(ctx, outer, node, ChunkKind::TypeAlias, scope, parent_symbol)
+            if let Some(definition) =
+                leaf(ctx, outer, node, ChunkKind::TypeAlias, scope, parent_symbol)
             {
                 out.push(definition);
             }
         }
         "enum_declaration" => {
-            if let Some(definition) = leaf(ctx, outer, node, ChunkKind::Enum, scope, parent_symbol) {
+            if let Some(definition) = leaf(ctx, outer, node, ChunkKind::Enum, scope, parent_symbol)
+            {
                 out.push(definition);
             }
         }
@@ -181,7 +191,15 @@ fn function(
     parent_symbol: Option<&str>,
 ) -> Option<Definition> {
     let name = ctx.field_text(node, "name")?;
-    build_callable(ctx, outer, node, name, scope, parent_symbol, ChunkKind::Function)
+    build_callable(
+        ctx,
+        outer,
+        node,
+        name,
+        scope,
+        parent_symbol,
+        ChunkKind::Function,
+    )
 }
 
 fn method(
@@ -192,7 +210,15 @@ fn method(
     parent_symbol: Option<&str>,
 ) -> Option<Definition> {
     let name = ctx.field_text(node, "name")?;
-    build_callable(ctx, outer, node, name, scope, parent_symbol, ChunkKind::Method)
+    build_callable(
+        ctx,
+        outer,
+        node,
+        name,
+        scope,
+        parent_symbol,
+        ChunkKind::Method,
+    )
 }
 
 fn build_callable(
@@ -377,8 +403,15 @@ namespace Inner {
         assert!(text.contains("export class RetryClient"));
 
         // 类方法与访问器都被提取，限定名使用 `.`。
-        let methods: Vec<&str> = class.children.iter().map(|d| d.qualified.as_str()).collect();
-        assert_eq!(methods, vec!["RetryClient.execute", "RetryClient.attemptCount"]);
+        let methods: Vec<&str> = class
+            .children
+            .iter()
+            .map(|d| d.qualified.as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            vec!["RetryClient.execute", "RetryClient.attemptCount"]
+        );
         let execute = &class.children[0];
         assert_eq!(execute.kind, ChunkKind::Method);
         assert_eq!(execute.doc.as_deref(), Some("执行请求并在失败后重试。"));
@@ -394,8 +427,14 @@ namespace Inner {
         assert_eq!(parsed.definitions[6].kind, ChunkKind::Const);
 
         // interface 的方法签名与 namespace 的嵌套函数。
-        assert_eq!(parsed.definitions[1].children[0].qualified, "Retryable.shouldRetry");
-        assert_eq!(parsed.definitions[7].children[0].qualified, "Inner.nestedHelper");
+        assert_eq!(
+            parsed.definitions[1].children[0].qualified,
+            "Retryable.shouldRetry"
+        );
+        assert_eq!(
+            parsed.definitions[7].children[0].qualified,
+            "Inner.nestedHelper"
+        );
     }
 
     #[test]
@@ -430,7 +469,8 @@ namespace Inner {
         assert_eq!(parsed.definitions[0].children[0].qualified, "Widget.render");
         assert_eq!(parsed.definitions[1].name, "go");
 
-        let tsx = "export function View(): JSX.Element {\n  return <div className=\"x\">hi</div>;\n}\n";
+        let tsx =
+            "export function View(): JSX.Element {\n  return <div className=\"x\">hi</div>;\n}\n";
         let parsed = parse(Language::Tsx, tsx).expect("parse tsx");
         assert!(!parsed.has_errors, "TSX 应由 TSX 语法解析");
         assert_eq!(parsed.definitions[0].name, "View");

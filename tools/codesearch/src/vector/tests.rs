@@ -115,7 +115,10 @@ fn replay_catches_up_when_sqlite_committed_but_index_never_updated() {
     // 目录里没有检查点，但 SQLite 已有向量，因此走重建路径。
     assert_eq!(index.origin(), LoadOrigin::RebuiltFromStore);
     assert_eq!(index.len(), 3);
-    assert_eq!(index.applied_seq(), store.max_vector_seq(&space.id).expect("max"));
+    assert_eq!(
+        index.applied_seq(),
+        store.max_vector_seq(&space.id).expect("max")
+    );
     // 重建出来的内容尚未持久化。
     assert_eq!(index.durable_seq(), 0);
 
@@ -153,7 +156,10 @@ fn removing_a_missing_key_is_harmless_during_replay() {
     index.applied_seq = 0;
     index.replay(&store).expect("replay again");
     assert!(index.is_empty());
-    assert!(index.search(&unit(0), 5, &allow(&ids)).expect("search").is_empty());
+    assert!(index
+        .search(&unit(0), 5, &allow(&ids))
+        .expect("search")
+        .is_empty());
 }
 
 #[test]
@@ -201,7 +207,10 @@ fn crash_after_memory_update_but_before_checkpoint_replays_the_tail() {
         .expect("attach");
     index.replay(&store).expect("replay in memory");
     assert_eq!(index.len(), 3);
-    assert!(index.applied_seq() > index.durable_seq(), "内存领先于持久化");
+    assert!(
+        index.applied_seq() > index.durable_seq(),
+        "内存领先于持久化"
+    );
     drop(index); // 崩溃：内存中的第三个向量没有落盘。
 
     let recovered = VectorIndex::open(dir.path(), &store, &space.id, DIM).expect("reopen");
@@ -345,8 +354,14 @@ fn search_only_returns_keys_in_the_allowed_set() {
     assert!(hits.iter().all(|(id, _)| allowed.contains(id)));
 
     // 空集合直接短路，不做无谓检索。
-    assert!(index.search(&unit(0), 4, &HashSet::new()).expect("search").is_empty());
-    assert!(index.search(&unit(0), 0, &allow(&ids)).expect("search").is_empty());
+    assert!(index
+        .search(&unit(0), 4, &HashSet::new())
+        .expect("search")
+        .is_empty());
+    assert!(index
+        .search(&unit(0), 0, &allow(&ids))
+        .expect("search")
+        .is_empty());
 }
 
 #[test]

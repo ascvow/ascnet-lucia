@@ -335,7 +335,12 @@ impl Store {
     }
 
     /// 查找覆盖指定字节偏移、且属于同一版本的最小定义块，用于上下文扩展。
-    pub fn containing_definition(&self, revision_id: i64, start: i64, end: i64) -> Result<Option<ChunkRow>> {
+    pub fn containing_definition(
+        &self,
+        revision_id: i64,
+        start: i64,
+        end: i64,
+    ) -> Result<Option<ChunkRow>> {
         let sql = format!(
             "SELECT {CHUNK_COLUMNS} FROM chunks c
              JOIN files f ON f.id = c.file_id
@@ -368,11 +373,7 @@ impl Store {
     }
 
     /// 读取某个空间下指定代码块的向量，用于小范围精确距离计算。
-    pub fn vectors_for_chunks(
-        &self,
-        space_id: &str,
-        ids: &[i64],
-    ) -> Result<Vec<(i64, Vec<f32>)>> {
+    pub fn vectors_for_chunks(&self, space_id: &str, ids: &[i64]) -> Result<Vec<(i64, Vec<f32>)>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -547,8 +548,11 @@ mod tests {
 
     #[test]
     fn symbol_lookup_prefers_exact_match() {
-        let (store, chunk_id) = store_with_file("fn execute() {}", "src/retry.rs", "RetryPolicy::execute");
-        let hits = store.symbol_candidates("RetryPolicy::execute", 10).expect("symbols");
+        let (store, chunk_id) =
+            store_with_file("fn execute() {}", "src/retry.rs", "RetryPolicy::execute");
+        let hits = store
+            .symbol_candidates("RetryPolicy::execute", 10)
+            .expect("symbols");
         assert_eq!(hits, vec![(chunk_id, true)]);
         let by_name = store.symbol_candidates("execute", 10).expect("symbols");
         assert_eq!(by_name, vec![(chunk_id, true)]);
@@ -559,15 +563,26 @@ mod tests {
 
     #[test]
     fn path_and_literal_recall_work_on_current_version() {
-        let (store, chunk_id) =
-            store_with_file("fn boom() { panic!(\"连接超时: timeout\"); }", "src/net/retry.rs", "boom");
-        assert_eq!(store.path_candidates("net/retry", 10).expect("path"), vec![chunk_id]);
-        // 含中文与特殊字符的字面量按原样子串匹配，不经过 FTS 语法。
+        let (store, chunk_id) = store_with_file(
+            "fn boom() { panic!(\"连接超时: timeout\"); }",
+            "src/net/retry.rs",
+            "boom",
+        );
         assert_eq!(
-            store.literal_candidates("连接超时: timeout", 100, 10).expect("literal"),
+            store.path_candidates("net/retry", 10).expect("path"),
             vec![chunk_id]
         );
-        assert!(store.literal_candidates("不存在的字符串", 100, 10).expect("literal").is_empty());
+        // 含中文与特殊字符的字面量按原样子串匹配，不经过 FTS 语法。
+        assert_eq!(
+            store
+                .literal_candidates("连接超时: timeout", 100, 10)
+                .expect("literal"),
+            vec![chunk_id]
+        );
+        assert!(store
+            .literal_candidates("不存在的字符串", 100, 10)
+            .expect("literal")
+            .is_empty());
     }
 
     #[test]

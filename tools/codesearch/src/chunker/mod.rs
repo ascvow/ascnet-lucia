@@ -63,7 +63,11 @@ pub fn chunk_file(ctx: &ChunkContext<'_>, parsed: &ParsedFile) -> Result<Vec<Pre
         raw.extend(text_chunks(ctx, 0, ctx.source.len(), None));
     }
 
-    raw.sort_by(|a, b| a.start_byte.cmp(&b.start_byte).then(a.end_byte.cmp(&b.end_byte)));
+    raw.sort_by(|a, b| {
+        a.start_byte
+            .cmp(&b.start_byte)
+            .then(a.end_byte.cmp(&b.end_byte))
+    });
     Ok(finalize(ctx, raw))
 }
 
@@ -181,8 +185,7 @@ fn split_long_definition(ctx: &ChunkContext<'_>, definition: &Definition, out: &
         while cursor + 1 < boundaries.len() {
             let candidate = boundaries[cursor + 1];
             let tokens = estimate_tokens(slice(ctx.source, segment_start, candidate));
-            if tokens > ctx.config.target_tokens
-                || candidate - segment_start > ctx.config.max_chars
+            if tokens > ctx.config.target_tokens || candidate - segment_start > ctx.config.max_chars
             {
                 break;
             }
@@ -209,7 +212,11 @@ fn split_long_definition(ctx: &ChunkContext<'_>, definition: &Definition, out: &
             parent_symbol: Some(definition.qualified.clone()),
             module_path: definition.module_path.clone(),
             signature: definition.signature.clone(),
-            doc: if part_index == 0 { definition.doc.clone() } else { None },
+            doc: if part_index == 0 {
+                definition.doc.clone()
+            } else {
+                None
+            },
             start_byte: *start,
             end_byte: *end,
             synthetic: None,
@@ -264,12 +271,7 @@ fn overview_chunk(definition: &Definition) -> RawChunk {
     }
     for child in &definition.children {
         text.push_str("    ");
-        text.push_str(
-            child
-                .signature
-                .as_deref()
-                .unwrap_or(child.name.as_str()),
-        );
+        text.push_str(child.signature.as_deref().unwrap_or(child.name.as_str()));
         text.push_str(";\n");
     }
     text.push_str("}\n");
@@ -394,7 +396,11 @@ fn markdown_chunks(ctx: &ChunkContext<'_>) -> Vec<RawChunk> {
         } else {
             out.push(RawChunk {
                 kind: ChunkKind::Section,
-                symbol: if title.is_empty() { None } else { Some(title.clone()) },
+                symbol: if title.is_empty() {
+                    None
+                } else {
+                    Some(title.clone())
+                },
                 parent_symbol: None,
                 module_path: None,
                 signature: None,
@@ -458,7 +464,11 @@ fn text_chunk(
             parent_symbol: Some(definition.qualified.clone()),
             module_path: definition.module_path.clone(),
             signature: definition.signature.clone(),
-            doc: if index == 0 { definition.doc.clone() } else { None },
+            doc: if index == 0 {
+                definition.doc.clone()
+            } else {
+                None
+            },
             start_byte: start,
             end_byte: end,
             synthetic: None,
@@ -521,7 +531,11 @@ fn is_mergeable(ctx: &ChunkContext<'_>, definition: &Definition) -> bool {
 }
 
 fn tokens_of(ctx: &ChunkContext<'_>, definition: &Definition) -> usize {
-    estimate_tokens(slice(ctx.source, definition.start_byte, definition.end_byte))
+    estimate_tokens(slice(
+        ctx.source,
+        definition.start_byte,
+        definition.end_byte,
+    ))
 }
 
 /// 把偏移回退到所在行的行首。
@@ -586,19 +600,15 @@ fn finalize(ctx: &ChunkContext<'_>, raw: Vec<RawChunk>) -> Vec<PreparedChunk> {
                 .iter()
                 .map(|record| Some(record.qualified.as_str())),
         );
-        let fts = build_fts_text(
-            ctx.rel_path,
-            &symbol_fields,
-            chunk.doc.as_deref(),
-            &code,
-        );
+        let fts = build_fts_text(ctx.rel_path, &symbol_fields, chunk.doc.as_deref(), &code);
         out.push(PreparedChunk {
             ordinal,
             kind: chunk.kind,
             symbol: chunk.symbol.clone(),
-            symbol_key: chunk.symbol.as_ref().map(|symbol| {
-                format!("{}:{}#{}", ctx.language.as_str(), ctx.rel_path, symbol)
-            }),
+            symbol_key: chunk
+                .symbol
+                .as_ref()
+                .map(|symbol| format!("{}:{}#{}", ctx.language.as_str(), ctx.rel_path, symbol)),
             parent_symbol: chunk.parent_symbol,
             module_path: chunk.module_path,
             signature: chunk.signature,
@@ -693,7 +703,12 @@ mod tests {
     use super::*;
     use crate::parser::parse;
 
-    fn context<'a>(path: &'a str, language: Language, source: &'a str, config: &'a ChunkConfig) -> ChunkContext<'a> {
+    fn context<'a>(
+        path: &'a str,
+        language: Language,
+        source: &'a str,
+        config: &'a ChunkConfig,
+    ) -> ChunkContext<'a> {
         ChunkContext {
             rel_path: path,
             language,
@@ -704,7 +719,12 @@ mod tests {
         }
     }
 
-    fn chunk(path: &str, language: Language, source: &str, config: &ChunkConfig) -> Vec<PreparedChunk> {
+    fn chunk(
+        path: &str,
+        language: Language,
+        source: &str,
+        config: &ChunkConfig,
+    ) -> Vec<PreparedChunk> {
         let parsed = parse(language, source).expect("parse");
         let ctx = context(path, language, source, config);
         chunk_file(&ctx, &parsed).expect("chunk")
@@ -718,9 +738,8 @@ mod tests {
                 continue; // 合成块（imports）没有源码范围。
             }
             let code = &source[chunk.start_byte..chunk.end_byte];
-            let expected: String = lines
-                [(chunk.start_line as usize - 1)..(chunk.end_line as usize)]
-                .concat();
+            let expected: String =
+                lines[(chunk.start_line as usize - 1)..(chunk.end_line as usize)].concat();
             assert!(
                 expected.contains(code.trim_end()),
                 "块 {:?} 行号 {}..{} 与内容不一致\n块内容: {code:?}\n行内容: {expected:?}",
@@ -755,7 +774,10 @@ mod tests {
         };
         let chunks = chunk("src/retry.rs", Language::Rust, &source, &config);
         let kinds: Vec<ChunkKind> = chunks.iter().map(|c| c.kind).collect();
-        assert!(kinds.contains(&ChunkKind::Overview), "应生成容器概览: {kinds:?}");
+        assert!(
+            kinds.contains(&ChunkKind::Overview),
+            "应生成容器概览: {kinds:?}"
+        );
         assert_eq!(
             kinds.iter().filter(|k| **k == ChunkKind::Method).count(),
             2,
@@ -763,7 +785,10 @@ mod tests {
         );
 
         // 概览块只含签名，不重复方法体。
-        let overview = chunks.iter().find(|c| c.kind == ChunkKind::Overview).expect("overview");
+        let overview = chunks
+            .iter()
+            .find(|c| c.kind == ChunkKind::Overview)
+            .expect("overview");
         assert!(overview.embed_input.contains("pub fn execute(&self)"));
         assert!(overview.embed_input.contains("pub fn backoff(&self)"));
         assert!(
@@ -952,7 +977,9 @@ mod tests {
             max_input_chars: 16_000,
         };
         let chunks = chunk_file(&ctx, &parsed).expect("chunk");
-        assert!(chunks[0].embed_input.starts_with("passage: \nLanguage: rust"));
+        assert!(chunks[0]
+            .embed_input
+            .starts_with("passage: \nLanguage: rust"));
     }
 
     #[test]

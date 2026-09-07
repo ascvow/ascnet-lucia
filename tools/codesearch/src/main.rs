@@ -24,8 +24,8 @@ async fn main() -> std::process::ExitCode {
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
 
-    let filter = EnvFilter::try_from_env("CODESEARCH_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter =
+        EnvFilter::try_from_env("CODESEARCH_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
     // 忽略重复初始化错误：库使用者可能已经装好了全局订阅者。
     let _ = fmt()
         .with_env_filter(filter)

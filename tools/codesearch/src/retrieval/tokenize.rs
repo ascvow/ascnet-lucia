@@ -44,7 +44,8 @@ pub fn split_identifier(identifier: &str) -> Vec<String> {
         if !current.is_empty() {
             let previous = chars[index - 1];
             // 小写/数字后接大写：valueOf -> value | Of
-            let lower_to_upper = ch.is_uppercase() && (previous.is_lowercase() || previous.is_numeric());
+            let lower_to_upper =
+                ch.is_uppercase() && (previous.is_lowercase() || previous.is_numeric());
             // 连续大写后接小写：HTTPServer -> HTTP | Server
             let acronym_end = ch.is_lowercase()
                 && previous.is_uppercase()
@@ -233,7 +234,13 @@ pub fn fts_term_expression(fragment: &str) -> Option<String> {
         let spaced = space_cjk(fragment);
         let cleaned: String = spaced
             .chars()
-            .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+            .map(|c| {
+                if c.is_alphanumeric() || c.is_whitespace() {
+                    c
+                } else {
+                    ' '
+                }
+            })
             .collect();
         let terms: Vec<&str> = cleaned.split_whitespace().collect();
         if terms.is_empty() {
@@ -243,7 +250,13 @@ pub fn fts_term_expression(fragment: &str) -> Option<String> {
     }
     let cleaned: String = fragment
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect();
     let terms: Vec<&str> = cleaned.split_whitespace().collect();
     if terms.is_empty() {
@@ -285,17 +298,29 @@ mod tests {
     fn splits_common_identifier_styles() {
         assert_eq!(split_identifier("retry_policy"), vec!["retry", "policy"]);
         assert_eq!(split_identifier("RetryPolicy"), vec!["retry", "policy"]);
-        assert_eq!(split_identifier("executeWithBackoff"), vec!["execute", "with", "backoff"]);
+        assert_eq!(
+            split_identifier("executeWithBackoff"),
+            vec!["execute", "with", "backoff"]
+        );
         assert_eq!(split_identifier("HTTPServer"), vec!["http", "server"]);
-        assert_eq!(split_identifier("parseURL2Path"), vec!["parse", "url2", "path"]);
-        assert_eq!(split_identifier("src/network/retry.rs"), vec!["src", "network", "retry", "rs"]);
+        assert_eq!(
+            split_identifier("parseURL2Path"),
+            vec!["parse", "url2", "path"]
+        );
+        assert_eq!(
+            split_identifier("src/network/retry.rs"),
+            vec!["src", "network", "retry", "rs"]
+        );
         assert_eq!(split_identifier("simple"), vec!["simple"]);
     }
 
     #[test]
     fn cjk_characters_become_separate_tokens() {
         let spaced = space_cjk("重试逻辑retry");
-        assert_eq!(spaced.split_whitespace().collect::<Vec<_>>(), vec!["重", "试", "逻", "辑", "retry"]);
+        assert_eq!(
+            spaced.split_whitespace().collect::<Vec<_>>(),
+            vec!["重", "试", "逻", "辑", "retry"]
+        );
     }
 
     #[test]
@@ -307,7 +332,10 @@ mod tests {
             "fn execute(&self) { let max_retries = 3; }",
         );
         let symbols: Vec<&str> = text.symbol_terms.split_whitespace().collect();
-        assert!(symbols.contains(&"retrypolicy::execute"), "保留完整符号: {symbols:?}");
+        assert!(
+            symbols.contains(&"retrypolicy::execute"),
+            "保留完整符号: {symbols:?}"
+        );
         assert!(symbols.contains(&"retrypolicy"));
         assert!(symbols.contains(&"retry"));
         assert!(symbols.contains(&"execute"));
@@ -325,8 +353,8 @@ mod tests {
     fn quoting_neutralizes_fts_syntax_characters() {
         assert_eq!(quote_fts_term("a\"b"), "\"a\"\"b\"");
         // 括号、冒号、星号等都不会破坏表达式。
-        let expression = build_match_expression(&["failed to connect: (timeout)*".to_string()])
-            .expect("表达式");
+        let expression =
+            build_match_expression(&["failed to connect: (timeout)*".to_string()]).expect("表达式");
         assert_eq!(expression, "\"failed to connect timeout\"");
         assert!(build_match_expression(&["()".to_string()]).is_none());
     }

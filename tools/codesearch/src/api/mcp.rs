@@ -15,9 +15,7 @@
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{
-    Implementation, InitializeResult, ServerCapabilities, ServerInfo,
-};
+use rmcp::model::{Implementation, InitializeResult, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
 
@@ -25,9 +23,7 @@ use crate::engine::Engine;
 // 刻意不引入 crate 的 `Result` 别名：`#[tool_handler]` 展开后使用裸 `Result<T, E>`，
 // 别名进入作用域会让宏生成的代码解析到错误的类型。
 use crate::error::Error;
-use crate::types::{
-    Language, ReadExpand, ReadRequest, ScopeFilter, SearchMode, SearchRequest,
-};
+use crate::types::{Language, ReadExpand, ReadRequest, ScopeFilter, SearchMode, SearchRequest};
 
 /// `search_code` 的输入。
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -139,8 +135,8 @@ expand=containing_symbol 可扩展到包含它的函数或类型，expand=file �
         &self,
         Parameters(input): Parameters<ReadCodeInput>,
     ) -> std::result::Result<Json<serde_json::Value>, ErrorData> {
-        let expand = ReadExpand::parse(input.expand.as_deref().unwrap_or("none"))
-            .map_err(to_mcp_error)?;
+        let expand =
+            ReadExpand::parse(input.expand.as_deref().unwrap_or("none")).map_err(to_mcp_error)?;
         let request = ReadRequest {
             code_ref: input.code_ref,
             expand,

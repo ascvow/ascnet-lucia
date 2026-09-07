@@ -252,9 +252,7 @@ pub struct IdentityReranker;
 
 impl Reranker for IdentityReranker {
     fn rerank(&self, _query: &str, documents: &[String]) -> Vec<f32> {
-        (0..documents.len())
-            .map(|index| -(index as f32))
-            .collect()
+        (0..documents.len()).map(|index| -(index as f32)).collect()
     }
 }
 
@@ -290,11 +288,17 @@ mod tests {
             EmbeddingSpace::new("openai_compatible", &config("m1", "r1"), 1024).id
         );
         // Provider 不同。
-        assert_ne!(base.id, EmbeddingSpace::new("other", &config("m1", "r1"), 768).id);
+        assert_ne!(
+            base.id,
+            EmbeddingSpace::new("other", &config("m1", "r1"), 768).id
+        );
         // 前缀不同。
         let mut prefixed = config("m1", "r1");
         prefixed.query_prefix = "query: ".into();
-        assert_ne!(base.id, EmbeddingSpace::new("openai_compatible", &prefixed, 768).id);
+        assert_ne!(
+            base.id,
+            EmbeddingSpace::new("openai_compatible", &prefixed, 768).id
+        );
         // 相同配置必须得到相同身份。
         assert_eq!(
             base.id,
@@ -354,12 +358,18 @@ mod tests {
     async fn offline_and_none_provider_yield_no_provider() {
         let mut config = Config::default();
         // 未配置模型。
-        assert!(build_provider(&config, false, None).await.expect("none").is_none());
+        assert!(build_provider(&config, false, None)
+            .await
+            .expect("none")
+            .is_none());
         // 即使配置了模型，offline 也不允许建立连接。
         config.embedding.provider = ProviderKind::OpenaiCompatible;
         config.embedding.base_url = "http://127.0.0.1:1/v1".into();
         config.embedding.model = "test".into();
-        assert!(build_provider(&config, true, None).await.expect("offline").is_none());
+        assert!(build_provider(&config, true, None)
+            .await
+            .expect("offline")
+            .is_none());
     }
 
     #[test]

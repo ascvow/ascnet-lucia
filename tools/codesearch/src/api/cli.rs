@@ -9,9 +9,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::engine::{render_read, render_results, AccessMode, Engine, EngineOptions};
 use crate::error::{Error, Result};
-use crate::types::{
-    Language, ReadExpand, ReadRequest, ScopeFilter, SearchMode, SearchRequest,
-};
+use crate::types::{Language, ReadExpand, ReadRequest, ScopeFilter, SearchMode, SearchRequest};
 
 /// codesearch 命令行工具。
 #[derive(Debug, Parser)]
@@ -118,7 +116,10 @@ pub enum Command {
         common: CommonArgs,
 
         /// 查询：自然语言、符号名、路径或错误消息。
-        #[arg(long, short)]
+        ///
+        /// `allow_hyphen_values` 是必需的：查询语法本身支持 `-path:`、`-lang:` 这类取反
+        /// 前缀，用户也可能直接搜索 `--offline` 之类的字面量，不能被当作命令行参数解析。
+        #[arg(long, short, allow_hyphen_values = true)]
         query: String,
 
         /// 作用域参数。
@@ -201,10 +202,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             let engine = Engine::open(common.options(AccessMode::ReadWrite)).await?;
             if watch {
                 let (_tx, rx) = tokio::sync::watch::channel(false);
-                eprintln!(
-                    "已开始监听 {}，按 Ctrl-C 退出。",
-                    engine.root().display()
-                );
+                eprintln!("已开始监听 {}，按 Ctrl-C 退出。", engine.root().display());
                 tokio::select! {
                     result = engine.watch_loop(rx) => result?,
                     _ = tokio::signal::ctrl_c() => {
@@ -311,7 +309,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 match &report.embedding_space {
                     Some(space) => println!(
                         "Embedding 空间: {} model={} dim={} metric={} 模板 v{}",
-                        space.id, space.model, space.dimensions, space.metric, space.template_version
+                        space.id,
+                        space.model,
+                        space.dimensions,
+                        space.metric,
+                        space.template_version
                     ),
                     None => println!("Embedding 空间: 未配置（仅符号与全文检索）"),
                 }
@@ -351,4 +353,29 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 查询语法自带 `-path:` 取反前缀，命令行解析不能把它当成参数。
+    ///
+    /// 曾出现 `--query '-path:**/tests/** RetryPolicy'` 报
+    /// `unexpected argument '-p' found`，使文档中的取反语法在 CLI 上无法使用。
+    #[test]
+    fn query_accepts_leading_hyphen() {
+        for raw in [
+            "-path:**/tests/** RetryPolicy",
+            "-lang:markdown 重试",
+            "--force-rebuild",
+        ] {
+            let cli = Cli::try_parse_from(["codesearch", "search", "--query", raw])
+                .unwrap_or_else(|error| panic!("查询 `{raw}` 应可解析: {error}"));
+            let Command::Search { query, .. } = cli.command else {
+                panic!("应解析为 search 子命令");
+            };
+            assert_eq!(query, raw, "查询文本必须原样传入");
+        }
+    }
 }

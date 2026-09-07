@@ -191,7 +191,15 @@ pub struct EmbeddingConfig {
     /// 存放 API Key 的环境变量名；为空表示不发送 Authorization 头。
     pub api_key_env: String,
     /// 期望向量维度；为空时以首个成功响应的维度为准并固定到 embedding space。
+    ///
+    /// 只用于校验与避免探测请求，默认**不会**写进请求体，见 [`Self::send_dimensions`]。
     pub dimensions: Option<usize>,
+    /// 是否把 `dimensions` 写进请求体。
+    ///
+    /// 只有支持按维度截断的服务（如 OpenAI `text-embedding-3-*`）才应开启。
+    /// 多数服务（含硅基流动 `BAAI/bge-m3`）对未知参数直接返回 400，
+    /// 因此默认关闭：配置 `dimensions` 用于校验，不代表要求服务改变输出维度。
+    pub send_dimensions: bool,
     /// 单次请求超时（秒）。
     pub timeout_secs: u64,
     /// 每批文档数。
@@ -220,6 +228,7 @@ impl Default for EmbeddingConfig {
             model: String::new(),
             api_key_env: String::new(),
             dimensions: None,
+            send_dimensions: false,
             timeout_secs: 60,
             batch_size: 32,
             max_concurrency: 2,
@@ -313,8 +322,8 @@ impl Default for WatchConfig {
 impl Config {
     /// 从 TOML 文本解析配置并校验。
     pub fn from_toml(text: &str) -> Result<Self> {
-        let config: Config =
-            toml::from_str(text).map_err(|error| Error::Config(format!("TOML 解析失败: {error}")))?;
+        let config: Config = toml::from_str(text)
+            .map_err(|error| Error::Config(format!("TOML 解析失败: {error}")))?;
         config.validate()?;
         Ok(config)
     }
@@ -336,10 +345,14 @@ impl Config {
     /// 校验配置取值范围；错误信息面向用户。
     pub fn validate(&self) -> Result<()> {
         if self.chunk.target_tokens == 0 || self.chunk.max_tokens == 0 {
-            return Err(Error::Config("chunk.target_tokens 与 chunk.max_tokens 必须大于 0".into()));
+            return Err(Error::Config(
+                "chunk.target_tokens 与 chunk.max_tokens 必须大于 0".into(),
+            ));
         }
         if self.chunk.max_tokens < self.chunk.target_tokens {
-            return Err(Error::Config("chunk.max_tokens 不能小于 chunk.target_tokens".into()));
+            return Err(Error::Config(
+                "chunk.max_tokens 不能小于 chunk.target_tokens".into(),
+            ));
         }
         if self.chunk.max_chars < 256 {
             return Err(Error::Config("chunk.max_chars 不能小于 256".into()));
@@ -364,7 +377,9 @@ impl Config {
                 return Err(Error::Config("embedding.timeout_secs 必须大于 0".into()));
             }
             if self.embedding.max_input_chars < 512 {
-                return Err(Error::Config("embedding.max_input_chars 不能小于 512".into()));
+                return Err(Error::Config(
+                    "embedding.max_input_chars 不能小于 512".into(),
+                ));
             }
             if matches!(self.embedding.dimensions, Some(0)) {
                 return Err(Error::Config("embedding.dimensions 必须大于 0".into()));
@@ -380,10 +395,14 @@ impl Config {
             return Err(Error::Config("retrieval.max_results 必须大于 0".into()));
         }
         if retrieval.max_results > retrieval.max_results_cap {
-            return Err(Error::Config("retrieval.max_results 不能超过 max_results_cap".into()));
+            return Err(Error::Config(
+                "retrieval.max_results 不能超过 max_results_cap".into(),
+            ));
         }
         if retrieval.token_budget == 0 || retrieval.token_budget > retrieval.token_budget_cap {
-            return Err(Error::Config("retrieval.token_budget 必须在 (0, token_budget_cap] 内".into()));
+            return Err(Error::Config(
+                "retrieval.token_budget 必须在 (0, token_budget_cap] 内".into(),
+            ));
         }
         if retrieval.rrf_k <= 0.0 {
             return Err(Error::Config("retrieval.rrf_k 必须大于 0".into()));
@@ -393,7 +412,9 @@ impl Config {
             return Err(Error::Config("retrieval 候选数必须大于 0".into()));
         }
         if retrieval.vector_overfetch_max == 0 {
-            return Err(Error::Config("retrieval.vector_overfetch_max 必须大于 0".into()));
+            return Err(Error::Config(
+                "retrieval.vector_overfetch_max 必须大于 0".into(),
+            ));
         }
         if self.watch.debounce_ms == 0 {
             return Err(Error::Config("watch.debounce_ms 必须大于 0".into()));
@@ -438,9 +459,7 @@ fn looks_like_secret(value: &str) -> bool {
     if value.is_empty() {
         return false;
     }
-    let valid_env_name = value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let valid_env_name = value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !value.chars().next().is_some_and(|c| c.is_ascii_digit());
     !valid_env_name || value.starts_with("sk-") || value.len() > 64
 }
@@ -479,5 +498,25 @@ api_key_env = "sk-abcdef0123456789"
         assert_eq!(config.chunk.target_tokens, 300);
         assert_eq!(config.chunk.max_tokens, ChunkConfig::default().max_tokens);
         assert_eq!(config.embedding.provider, ProviderKind::None);
+    }
+
+    /// 示例配置必须始终可解析。
+    ///
+    /// `deny_unknown_fields` 意味着示例里任何过时字段都会让用户的配置直接报错，
+    /// 因此这份文档必须随代码一起验证，而不是靠人工同步。
+    #[test]
+    fn example_config_file_stays_valid() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("codesearch.example.toml");
+        let text = std::fs::read_to_string(&path).expect("读取示例配置");
+        let config = Config::from_toml(&text).expect("示例配置必须可解析");
+        config.validate().expect("示例配置必须合法");
+        // 示例中只能出现环境变量名，不能出现真实凭证。
+        assert!(!text.contains("sk-"), "示例配置不得包含真实凭证");
+        assert_eq!(config.embedding.api_key_env, "SILICONFLOW_API_KEY");
+        assert_eq!(config.embedding.dimensions, Some(1024));
+        assert!(
+            !config.embedding.send_dimensions,
+            "硅基流动会拒绝请求体中的 dimensions，示例必须保持关闭"
+        );
     }
 }

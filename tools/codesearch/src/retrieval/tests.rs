@@ -133,7 +133,12 @@ impl Fixture {
         self.search_plan(&plan, use_vectors)
     }
 
-    fn search_scoped(&self, query: &str, scope: ScopeFilter, use_vectors: bool) -> RetrievalOutcome {
+    fn search_scoped(
+        &self,
+        query: &str,
+        scope: ScopeFilter,
+        use_vectors: bool,
+    ) -> RetrievalOutcome {
         let plan = analyze(query, &scope).expect("analyze");
         self.search_plan(&plan, use_vectors)
     }
@@ -147,7 +152,11 @@ impl Fixture {
         let input = RetrievalInput {
             plan,
             query_vector: vector.as_deref(),
-            space_id: if use_vectors { Some(&self.space.id) } else { None },
+            space_id: if use_vectors {
+                Some(&self.space.id)
+            } else {
+                None
+            },
         };
         let index = if use_vectors { Some(&self.index) } else { None };
         retrieve(&self.store, index, &self.config.retrieval, &input).expect("retrieve")
@@ -275,7 +284,9 @@ fn full_symbol_query_hits_the_exact_definition_first() {
     let outcome = fixture.search("RetryPolicy::execute", true);
     assert!(!outcome.candidates.is_empty());
     assert!(outcome.candidates[0].exact, "首位应是精确符号命中");
-    assert!(outcome.candidates[0].matched_by.contains(&MatchSource::Symbol));
+    assert!(outcome.candidates[0]
+        .matched_by
+        .contains(&MatchSource::Symbol));
     // 方法定义在小型 impl 块内，因此首位代码块应包含该方法的完整实现。
     let top = fixture.content_of(outcome.candidates[0].chunk_id);
     assert!(
@@ -355,7 +366,10 @@ fn special_characters_in_queries_do_not_break_fts_syntax() {
         let outcome = fixture.search(query, false);
         // 关键断言是"不 panic 也不返回错误"；FTS 通路不应报告失败。
         assert!(
-            !outcome.notes.iter().any(|note| note.contains("FTS 召回不可用")),
+            !outcome
+                .notes
+                .iter()
+                .any(|note| note.contains("FTS 召回不可用")),
             "查询 `{query}` 触发了 FTS 语法错误: {:?}",
             outcome.notes
         );
@@ -423,7 +437,9 @@ fn include_and_exclude_globs_are_applied() {
     };
     let paths = fixture.paths(&fixture.search_scoped("retry", excluded, true));
     assert!(
-        paths.iter().all(|p| !p.starts_with("tests/") && !p.starts_with("web/")),
+        paths
+            .iter()
+            .all(|p| !p.starts_with("tests/") && !p.starts_with("web/")),
         "exclude 未生效: {paths:?}"
     );
 }
@@ -462,10 +478,7 @@ fn candidates_are_deduplicated_across_recall_paths() {
     assert_eq!(ids.len(), unique.len(), "融合后不应出现重复候选: {ids:?}");
     // 多路命中的候选会记录多个来源。
     assert!(
-        outcome
-            .candidates
-            .iter()
-            .any(|c| c.matched_by.len() > 1),
+        outcome.candidates.iter().any(|c| c.matched_by.len() > 1),
         "至少应有候选被多路召回"
     );
 }
@@ -527,7 +540,10 @@ fn empty_vector_index_is_reported_instead_of_claiming_success() {
     .expect("retrieve");
     assert!(!outcome.vector_used);
     assert!(
-        outcome.notes.iter().any(|note| note.contains("向量索引为空")),
+        outcome
+            .notes
+            .iter()
+            .any(|note| note.contains("向量索引为空")),
         "空索引必须明确说明: {:?}",
         outcome.notes
     );
@@ -580,11 +596,21 @@ fn stale_chunks_never_appear_in_results() {
 #[test]
 fn deleted_files_disappear_from_all_recall_paths() {
     let mut fixture = Fixture::build(true);
-    assert!(fixture.store.mark_deleted("src/json/parser.rs").expect("delete"));
+    assert!(fixture
+        .store
+        .mark_deleted("src/json/parser.rs")
+        .expect("delete"));
     // 向量索引同步重放删除操作。
-    fixture.index.rebuild_from_store(&fixture.store).expect("rebuild");
+    fixture
+        .index
+        .rebuild_from_store(&fixture.store)
+        .expect("rebuild");
 
-    for (query, use_vectors) in [("JsonLexer", false), ("next_token", false), ("JSON 词法", true)] {
+    for (query, use_vectors) in [
+        ("JsonLexer", false),
+        ("next_token", false),
+        ("JSON 词法", true),
+    ] {
         let outcome = fixture.search(query, use_vectors);
         let paths = fixture.paths(&outcome);
         assert!(

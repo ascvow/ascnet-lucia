@@ -14,7 +14,14 @@ use crate::types::ChunkKind;
 /// 遍历 `source_file` 并提取顶层定义与导入。
 pub fn extract(ctx: &Context<'_>, root: Node<'_>, parsed: &mut ParsedFile) {
     let mut scope: Vec<String> = Vec::new();
-    walk(ctx, root, &mut scope, None, &mut parsed.definitions, &mut parsed.imports);
+    walk(
+        ctx,
+        root,
+        &mut scope,
+        None,
+        &mut parsed.definitions,
+        &mut parsed.imports,
+    );
 }
 
 fn walk(
@@ -39,7 +46,11 @@ fn walk(
                 let range = node.byte_range();
                 imports.push(ImportRecord {
                     raw,
-                    module: if module.is_empty() { None } else { Some(module) },
+                    module: if module.is_empty() {
+                        None
+                    } else {
+                        Some(module)
+                    },
                     start_byte: range.start,
                     end_byte: range.end,
                 });
@@ -351,7 +362,10 @@ pub enum Outcome { Success, Failure }
         assert_eq!(structure.doc.as_deref(), Some("重试策略。"));
         // 起始位置必须包含文档注释与属性。
         let text = &SOURCE[structure.start_byte..structure.end_byte];
-        assert!(text.starts_with("/// 重试策略。"), "块应包含文档注释: {text}");
+        assert!(
+            text.starts_with("/// 重试策略。"),
+            "块应包含文档注释: {text}"
+        );
         assert!(text.contains("#[derive(Debug, Clone)]"), "块应包含属性");
 
         let impl_block = &parsed.definitions[1];

@@ -53,6 +53,8 @@ usearch = "2.26"
 codesearch = { path = ".", features = ["test-support"] }
 rmcp = { version = "3.2", features = ["client", "transport-child-process"] }
 tempfile = "3"
+# 集成测试用本地 HTTP Embedding 服务验证真实协议，需要 TcpListener。
+tokio = { version = "1", features = ["net"] }
 
 [profile.dev]
 debug = 1

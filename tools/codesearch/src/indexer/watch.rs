@@ -53,12 +53,7 @@ pub fn start(workspace: &Workspace, config: &Config) -> Result<WatchHandle> {
     .map_err(|e| Error::Internal(format!("创建文件监听失败: {e}")))?;
     watcher
         .watch(workspace.root(), RecursiveMode::Recursive)
-        .map_err(|e| {
-            Error::Internal(format!(
-                "监听 {} 失败: {e}",
-                workspace.root().display()
-            ))
-        })?;
+        .map_err(|e| Error::Internal(format!("监听 {} 失败: {e}", workspace.root().display())))?;
 
     // 通道容量有界：消费不及时时发送端阻塞，形成自然背压而不是堆积任务。
     let (batch_tx, batches) = tokio::sync::mpsc::channel::<WatchBatch>(64);
@@ -70,14 +65,7 @@ pub fn start(workspace: &Workspace, config: &Config) -> Result<WatchHandle> {
     std::thread::Builder::new()
         .name("codesearch-watch".to_string())
         .spawn(move || {
-            debounce_loop(
-                raw_rx,
-                batch_tx,
-                &workspace,
-                &filter,
-                debounce,
-                max_pending,
-            );
+            debounce_loop(raw_rx, batch_tx, &workspace, &filter, debounce, max_pending);
         })
         .map_err(|e| Error::io("启动监听线程", e))?;
 

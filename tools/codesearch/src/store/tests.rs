@@ -76,8 +76,14 @@ fn modified_file_stops_returning_old_version_as_current() {
     let old_chunk = outcome.chunk_ids[0];
 
     // 旧版本此时是当前版本，符号与 FTS 都能命中。
-    assert!(!store.symbol_candidates("alpha", 10).expect("symbol").is_empty());
-    assert!(!store.fts_candidates("\"alpha\"", 10).expect("fts").is_empty());
+    assert!(!store
+        .symbol_candidates("alpha", 10)
+        .expect("symbol")
+        .is_empty());
+    assert!(!store
+        .fts_candidates("\"alpha\"", 10)
+        .expect("fts")
+        .is_empty());
 
     let second = prepared("src/a.rs", "fn beta() {}\n", &[("beta", "fn beta() {}")]);
     store.commit_file(&second).expect("commit v2");
@@ -86,9 +92,18 @@ fn modified_file_stops_returning_old_version_as_current() {
     let old = store.chunk_by_id(old_chunk).expect("row").expect("exists");
     assert!(!old.is_current, "旧代码块必须失效");
     // 旧符号与旧 FTS 记录都不能再作为当前代码返回。
-    assert!(store.symbol_candidates("alpha", 10).expect("symbol").is_empty());
-    assert!(store.fts_candidates("\"alpha\"", 10).expect("fts").is_empty());
-    assert!(!store.fts_candidates("\"beta\"", 10).expect("fts").is_empty());
+    assert!(store
+        .symbol_candidates("alpha", 10)
+        .expect("symbol")
+        .is_empty());
+    assert!(store
+        .fts_candidates("\"alpha\"", 10)
+        .expect("fts")
+        .is_empty());
+    assert!(!store
+        .fts_candidates("\"beta\"", 10)
+        .expect("fts")
+        .is_empty());
     assert_eq!(store.counters().expect("counters").current_chunks, 1);
 }
 
@@ -101,8 +116,14 @@ fn deleted_file_is_not_searchable_but_old_reference_still_reads() {
 
     assert!(store.mark_deleted("src/gone.rs").expect("delete"));
 
-    assert!(store.symbol_candidates("gone", 10).expect("symbol").is_empty());
-    assert!(store.fts_candidates("\"gone\"", 10).expect("fts").is_empty());
+    assert!(store
+        .symbol_candidates("gone", 10)
+        .expect("symbol")
+        .is_empty());
+    assert!(store
+        .fts_candidates("\"gone\"", 10)
+        .expect("fts")
+        .is_empty());
     assert_eq!(store.counters().expect("counters").current_chunks, 0);
     // 历史快照保留，旧引用仍能读到当时的源码。
     let row = store.chunk_by_id(chunk_id).expect("row").expect("exists");
@@ -118,18 +139,29 @@ fn rename_moves_content_without_losing_old_path_history() {
     let mut store = Store::open_in_memory().expect("open");
     let body = "fn shared() {}\n";
     store
-        .commit_file(&prepared("src/old.rs", body, &[("shared", "fn shared() {}")]))
+        .commit_file(&prepared(
+            "src/old.rs",
+            body,
+            &[("shared", "fn shared() {}")],
+        ))
         .expect("commit old");
     // 重命名 = 旧路径删除 + 新路径新增。
     store.mark_deleted("src/old.rs").expect("delete old");
     store
-        .commit_file(&prepared("src/new.rs", body, &[("shared", "fn shared() {}")]))
+        .commit_file(&prepared(
+            "src/new.rs",
+            body,
+            &[("shared", "fn shared() {}")],
+        ))
         .expect("commit new");
 
     let hits = store.path_candidates("new.rs", 10).expect("path");
     assert!(!hits.is_empty(), "新路径应可检索");
     assert!(
-        store.path_candidates("old.rs", 10).expect("path").is_empty(),
+        store
+            .path_candidates("old.rs", 10)
+            .expect("path")
+            .is_empty(),
         "旧路径不应再作为当前代码返回"
     );
     assert_eq!(store.counters().expect("counters").current_chunks, 1);
@@ -177,7 +209,9 @@ fn embedding_cache_is_reused_and_isolated_per_space() {
     store.ensure_embedding_space(&right).expect("right");
 
     let vector = vec![1.0f32, 0.0, 0.0, 0.0];
-    store.put_cached_vector(&left.id, "key-1", &vector).expect("put");
+    store
+        .put_cached_vector(&left.id, "key-1", &vector)
+        .expect("put");
 
     assert_eq!(
         store.cached_vector(&left.id, "key-1").expect("get"),
@@ -214,19 +248,26 @@ fn late_embedding_cannot_reactivate_a_stale_chunk() {
     let fresh_chunk = store.commit_file(&v2).expect("v2").chunk_ids[0];
 
     let vector = vec![0.5f32, 0.5, 0.5, 0.5];
-    store.put_cached_vector(&target.id, "stale", &vector).expect("cache");
+    store
+        .put_cached_vector(&target.id, "stale", &vector)
+        .expect("cache");
 
     // 晚到的旧结果：缓存保留，但不允许重新激活旧代码块。
     let attached = store
         .attach_embedding(stale_chunk, &target.id, "stale")
         .expect("attach stale");
     assert!(!attached, "已失效的代码块不能被重新关联");
-    let stale_row = store.chunk_by_id(stale_chunk).expect("row").expect("exists");
+    let stale_row = store
+        .chunk_by_id(stale_chunk)
+        .expect("row")
+        .expect("exists");
     assert!(!stale_row.is_current);
     assert_eq!(stale_row.embed_state, "pending");
 
     // 当前版本可以正常关联。
-    store.put_cached_vector(&target.id, "fresh", &vector).expect("cache");
+    store
+        .put_cached_vector(&target.id, "fresh", &vector)
+        .expect("cache");
     assert!(store
         .attach_embedding(fresh_chunk, &target.id, "fresh")
         .expect("attach fresh"));
@@ -266,7 +307,12 @@ fn vector_ops_record_removals_and_additions_in_order() {
     // 序号严格递增，Vector Writer 因此可以顺序消费。
     assert!(ops[1].seq > ops[0].seq);
     assert_eq!(store.max_vector_seq(&target.id).expect("max"), ops[1].seq);
-    assert_eq!(store.vector_ops_backlog(&target.id, ops[0].seq).expect("backlog"), 1);
+    assert_eq!(
+        store
+            .vector_ops_backlog(&target.id, ops[0].seq)
+            .expect("backlog"),
+        1
+    );
 }
 
 #[test]
@@ -291,8 +337,13 @@ fn switching_space_invalidates_old_vectors_without_reusing_them() {
 
     // 旧空间登记了删除操作，新空间没有可用向量。
     let old_ops = store.vector_ops_since(&old_space.id, 0, 100).expect("ops");
-    assert!(old_ops.iter().any(|op| op.op == "remove" && op.vector_key == chunk_id));
-    assert!(store.ready_vectors(&new_space.id).expect("ready").is_empty());
+    assert!(old_ops
+        .iter()
+        .any(|op| op.op == "remove" && op.vector_key == chunk_id));
+    assert!(store
+        .ready_vectors(&new_space.id)
+        .expect("ready")
+        .is_empty());
     let row = store.chunk_by_id(chunk_id).expect("row").expect("exists");
     assert_eq!(row.embed_state, "pending");
 }
@@ -340,7 +391,9 @@ fn catalog_epoch_advances_only_on_catalog_changes() {
 fn workspace_binding_rejects_mismatched_index_directory() {
     let store = Store::open_in_memory().expect("open");
     store.bind_workspace("workspace-a").expect("first bind");
-    store.bind_workspace("workspace-a").expect("same id is fine");
+    store
+        .bind_workspace("workspace-a")
+        .expect("same id is fine");
     assert!(
         store.bind_workspace("workspace-b").is_err(),
         "索引目录不能被另一个 workspace 复用"

@@ -133,8 +133,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ws = Workspace::open(dir.path(), None).expect("open");
         assert!(matches!(ws.resolve("../x"), Err(Error::PathOutOfScope(_))));
-        assert!(matches!(ws.resolve("a/../../x"), Err(Error::PathOutOfScope(_))));
-        assert!(matches!(ws.resolve("/etc/passwd"), Err(Error::PathOutOfScope(_))));
+        assert!(matches!(
+            ws.resolve("a/../../x"),
+            Err(Error::PathOutOfScope(_))
+        ));
+        assert!(matches!(
+            ws.resolve("/etc/passwd"),
+            Err(Error::PathOutOfScope(_))
+        ));
         assert!(matches!(ws.resolve(""), Err(Error::PathOutOfScope(_))));
         assert!(ws.resolve("src/lib.rs").is_ok());
     }
@@ -145,10 +151,16 @@ mod tests {
         let outside = tempfile::tempdir().expect("outside");
         std::fs::write(outside.path().join("secret.txt"), "secret").expect("write");
         let dir = tempfile::tempdir().expect("tempdir");
-        std::os::unix::fs::symlink(outside.path().join("secret.txt"), dir.path().join("link.txt"))
-            .expect("symlink");
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("link.txt"),
+        )
+        .expect("symlink");
         let ws = Workspace::open(dir.path(), None).expect("open");
-        assert!(matches!(ws.resolve("link.txt"), Err(Error::PathOutOfScope(_))));
+        assert!(matches!(
+            ws.resolve("link.txt"),
+            Err(Error::PathOutOfScope(_))
+        ));
     }
 
     #[test]

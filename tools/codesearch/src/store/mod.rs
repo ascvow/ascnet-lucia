@@ -16,14 +16,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
 use crate::types::Language;
 
-pub use types::{
-    CommitOutcome, FtsText, ImportRecord, PreparedChunk, PreparedFile, SymbolRecord,
-};
+pub use types::{CommitOutcome, FtsText, ImportRecord, PreparedChunk, PreparedFile, SymbolRecord};
 
 /// 目录修订号在 `meta` 中的键。
 const META_CATALOG_EPOCH: &str = "catalog_epoch";
@@ -184,16 +182,20 @@ impl Store {
 
     /// 当前 schema 版本。
     pub fn schema_version(&self) -> Result<i64> {
-        Ok(self.conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+        Ok(self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?)
     }
 
     /// 读取 `meta` 中的字符串值。
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
             .optional()?)
     }
 
@@ -403,9 +405,11 @@ impl Store {
         let now = now_secs();
         let tx = self.conn.transaction()?;
         let file_id: Option<i64> = tx
-            .query_row("SELECT id FROM files WHERE path = ?1", params![path], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT id FROM files WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )
             .optional()?;
         let Some(file_id) = file_id else {
             tx.commit()?;
@@ -595,8 +599,8 @@ impl Store {
                  WHERE is_current = 1 AND embed_state = 'ready'
                    AND embedding_space_id IS NOT NULL AND embedding_space_id <> ?1",
             )?;
-            let rows = statement
-                .query_map(params![space_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let rows =
+                statement.query_map(params![space_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for (chunk_id, old_space) in &stale {
@@ -697,19 +701,17 @@ fn upsert_file(
          ON CONFLICT(path) DO UPDATE SET language = excluded.language, updated_at = excluded.updated_at",
         params![path, language.as_str(), now],
     )?;
-    Ok(tx.query_row("SELECT id FROM files WHERE path = ?1", params![path], |row| {
-        row.get(0)
-    })?)
+    Ok(tx.query_row(
+        "SELECT id FROM files WHERE path = ?1",
+        params![path],
+        |row| row.get(0),
+    )?)
 }
 
 /// 失效文件的全部当前代码块，同步清理 FTS 与符号，并记录向量删除操作。
 ///
 /// 删除 FTS 行是必须的：否则旧版本的拆词文本会继续作为当前代码被检索到。
-fn deactivate_current_chunks(
-    tx: &rusqlite::Transaction<'_>,
-    file_id: i64,
-    now: i64,
-) -> Result<()> {
+fn deactivate_current_chunks(tx: &rusqlite::Transaction<'_>, file_id: i64, now: i64) -> Result<()> {
     let ready: Vec<(i64, String)> = {
         let mut statement = tx.prepare(
             "SELECT id, embedding_space_id FROM chunks

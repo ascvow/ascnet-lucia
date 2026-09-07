@@ -59,7 +59,9 @@ struct EmbeddingItem {
 }
 
 /// Provider 内部共享状态，便于并发任务克隆。
-#[derive(Debug)]
+///
+/// 手写 [`std::fmt::Debug`]：派生实现会把 API Key 原样打印出来，
+/// 任何一次 `tracing::debug!(?provider)` 就会把凭证写进日志。
 struct Inner {
     client: reqwest::Client,
     endpoint: String,
@@ -69,6 +71,19 @@ struct Inner {
     request_dimensions: Option<usize>,
     max_retries: usize,
     semaphore: Semaphore,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("endpoint", &self.endpoint)
+            .field("model", &self.model)
+            // 只暴露"是否配置了凭证"，不暴露取值。
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("request_dimensions", &self.request_dimensions)
+            .field("max_retries", &self.max_retries)
+            .finish()
+    }
 }
 
 /// 真实 HTTP Embedding Provider。
@@ -98,7 +113,11 @@ impl HttpProvider {
             endpoint: build_endpoint(&config.base_url),
             api_key,
             model: config.model.clone(),
-            request_dimensions: config.dimensions,
+            // 只有显式开启时才把 dimensions 写进请求体：多数服务会拒绝未知参数。
+            request_dimensions: config
+                .send_dimensions
+                .then_some(config.dimensions)
+                .flatten(),
             max_retries: config.max_retries,
             semaphore: Semaphore::new(config.max_concurrency.max(1)),
         });
@@ -152,8 +171,8 @@ impl HttpProvider {
 
         let mut collected: Vec<Option<Vec<Vec<f32>>>> = Vec::new();
         while let Some(joined) = tasks.join_next().await {
-            let (index, result) = joined
-                .map_err(|e| Error::Provider(format!("Embedding 任务失败: {e}")))?;
+            let (index, result) =
+                joined.map_err(|e| Error::Provider(format!("Embedding 任务失败: {e}")))?;
             let vectors = result?;
             if collected.len() <= index {
                 collected.resize(index + 1, None);
@@ -164,9 +183,8 @@ impl HttpProvider {
         // 按批次序号拼接，保证整体顺序与输入一致。
         let mut out = Vec::with_capacity(inputs.len());
         for (index, batch) in collected.into_iter().enumerate() {
-            let batch = batch.ok_or_else(|| {
-                Error::Provider(format!("第 {index} 批 Embedding 结果缺失"))
-            })?;
+            let batch = batch
+                .ok_or_else(|| Error::Provider(format!("第 {index} 批 Embedding 结果缺失")))?;
             out.extend(batch);
         }
         if out.len() != inputs.len() {
@@ -181,11 +199,7 @@ impl HttpProvider {
 }
 
 /// 请求一批向量并按 `index` 重排。
-async fn embed_batch(
-    inner: &Inner,
-    batch: &[String],
-    dimensions: usize,
-) -> Result<Vec<Vec<f32>>> {
+async fn embed_batch(inner: &Inner, batch: &[String], dimensions: usize) -> Result<Vec<Vec<f32>>> {
     let permit = inner
         .semaphore
         .acquire()
@@ -221,8 +235,8 @@ async fn embed_batch(
 
     let mut out = Vec::with_capacity(batch.len());
     for (position, slot) in slots.into_iter().enumerate() {
-        let mut vector = slot
-            .ok_or_else(|| Error::Provider(format!("响应缺少 index {position} 的向量")))?;
+        let mut vector =
+            slot.ok_or_else(|| Error::Provider(format!("响应缺少 index {position} 的向量")))?;
         if vector.is_empty() {
             return Err(Error::Provider(format!("index {position} 的向量为空")));
         }
@@ -378,8 +392,14 @@ mod tests {
 
     #[test]
     fn endpoint_derivation_handles_common_shapes() {
-        assert_eq!(build_endpoint("https://api.openai.com/v1"), "https://api.openai.com/v1/embeddings");
-        assert_eq!(build_endpoint("https://api.openai.com/v1/"), "https://api.openai.com/v1/embeddings");
+        assert_eq!(
+            build_endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/embeddings"
+        );
+        assert_eq!(
+            build_endpoint("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/embeddings"
+        );
         // 已经是完整端点时不重复追加。
         assert_eq!(
             build_endpoint("http://127.0.0.1:8080/v1/embeddings"),
@@ -393,7 +413,9 @@ mod tests {
         let missing = read_api_key("CODESEARCH_TEST_MISSING_KEY_VAR").expect_err("应报错");
         assert!(matches!(missing, Error::Config(_)));
         // 错误信息只提到变量名，不含任何取值。
-        assert!(missing.to_string().contains("CODESEARCH_TEST_MISSING_KEY_VAR"));
+        assert!(missing
+            .to_string()
+            .contains("CODESEARCH_TEST_MISSING_KEY_VAR"));
     }
 
     #[test]
@@ -432,7 +454,8 @@ mod tests {
 
     #[test]
     fn response_parsing_accepts_out_of_order_and_missing_index() {
-        let text = r#"{"data":[{"index":1,"embedding":[0.0,1.0]},{"index":0,"embedding":[1.0,0.0]}]}"#;
+        let text =
+            r#"{"data":[{"index":1,"embedding":[0.0,1.0]},{"index":0,"embedding":[1.0,0.0]}]}"#;
         let parsed: EmbeddingResponse = serde_json::from_str(text).expect("解析");
         assert_eq!(parsed.data.len(), 2);
         assert_eq!(parsed.data[0].index, Some(1));

@@ -176,11 +176,8 @@ pub fn retrieve(
         }
     }
     for literal in &plan.literals {
-        let hits = store.literal_candidates(
-            literal,
-            config.literal_scan_limit,
-            EXACT_PATH_LIMIT,
-        )?;
+        let hits =
+            store.literal_candidates(literal, config.literal_scan_limit, EXACT_PATH_LIMIT)?;
         for chunk_id in hits {
             if keep(chunk_id) {
                 push_unique(&mut exact, chunk_id);
@@ -258,7 +255,8 @@ pub fn retrieve(
     }
 
     let fused = fusion::fuse(&lists, config.rrf_k, &exact_ids);
-    outcome.candidates = fusion::apply_exact_reserve(fused, config.candidate_limit, config.exact_reserve);
+    outcome.candidates =
+        fusion::apply_exact_reserve(fused, config.candidate_limit, config.exact_reserve);
     Ok(outcome)
 }
 
@@ -304,7 +302,9 @@ fn vector_recall(
     loop {
         let count = wanted.saturating_mul(multiplier).min(allowed.len());
         hits = index.search(query_vector, count, allowed)?;
-        if hits.len() >= wanted || multiplier >= config.vector_overfetch_max || count >= allowed.len()
+        if hits.len() >= wanted
+            || multiplier >= config.vector_overfetch_max
+            || count >= allowed.len()
         {
             break;
         }

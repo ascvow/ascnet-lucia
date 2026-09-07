@@ -159,7 +159,10 @@ mod tests {
         // 1 出现在两路，累计分数最高。
         assert_eq!(ranked[0], 1);
         let first = &fused[0];
-        assert_eq!(first.matched_by, vec![MatchSource::Fts, MatchSource::Vector]);
+        assert_eq!(
+            first.matched_by,
+            vec![MatchSource::Fts, MatchSource::Vector]
+        );
     }
 
     #[test]

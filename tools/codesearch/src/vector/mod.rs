@@ -240,10 +240,7 @@ impl VectorIndex {
         match op.op.as_str() {
             "add" => {
                 let Some(cache_key) = op.cache_key.as_deref() else {
-                    return Err(Error::Vector(format!(
-                        "add 操作 seq={} 缺少缓存键",
-                        op.seq
-                    )));
+                    return Err(Error::Vector(format!("add 操作 seq={} 缺少缓存键", op.seq)));
                 };
                 match store.cached_vector(&self.space_id, cache_key)? {
                     Some(vector) => self.upsert(key, &vector)?,
@@ -381,7 +378,10 @@ impl VectorIndex {
 
         self.index
             .save(snapshot_path.to_str().ok_or_else(|| {
-                Error::Vector(format!("快照路径不是合法 UTF-8: {}", snapshot_path.display()))
+                Error::Vector(format!(
+                    "快照路径不是合法 UTF-8: {}",
+                    snapshot_path.display()
+                ))
             })?)
             .map_err(|e| Error::Vector(format!("保存向量快照失败: {e}")))?;
         // USearch 自行写文件，这里再打开一次做 fsync，确保内容落盘。
@@ -409,7 +409,9 @@ impl VectorIndex {
 
         // 新 manifest 已生效，旧快照可以安全删除。
         if previous_generation > 0 {
-            let old = self.dir.join(snapshot_name(&self.space_id, previous_generation));
+            let old = self
+                .dir
+                .join(snapshot_name(&self.space_id, previous_generation));
             if let Err(error) = std::fs::remove_file(&old) {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     tracing::debug!(path = %old.display(), error = %error, "删除旧向量快照失败");
@@ -422,18 +424,16 @@ impl VectorIndex {
     /// 原子发布 manifest：写临时文件 → fsync → rename → fsync 目录。
     fn publish_manifest(&self, manifest: &Manifest) -> Result<()> {
         let target = self.manifest_path();
-        let temporary = self.dir.join(format!(
-            "{}.manifest.tmp",
-            sanitize(&self.space_id)
-        ));
+        let temporary = self
+            .dir
+            .join(format!("{}.manifest.tmp", sanitize(&self.space_id)));
         let json = serde_json::to_vec_pretty(manifest)?;
         {
             let mut file = File::create(&temporary)
                 .map_err(|e| Error::io(format!("创建 {}", temporary.display()), e))?;
             file.write_all(&json)
                 .map_err(|e| Error::io("写入 manifest", e))?;
-            file.sync_all()
-                .map_err(|e| Error::io("同步 manifest", e))?;
+            file.sync_all().map_err(|e| Error::io("同步 manifest", e))?;
         }
         std::fs::rename(&temporary, &target)
             .map_err(|e| Error::io(format!("发布 manifest 到 {}", target.display()), e))?;
@@ -482,14 +482,15 @@ impl VectorIndex {
             )));
         }
         let snapshot = self.dir.join(&manifest.file_name);
-        let bytes = std::fs::read(&snapshot).map_err(|e| {
-            Error::io(format!("读取快照 {}", snapshot.display()), e)
-        })?;
+        let bytes = std::fs::read(&snapshot)
+            .map_err(|e| Error::io(format!("读取快照 {}", snapshot.display()), e))?;
         if bytes.len() as u64 != manifest.file_size {
             return Err(Error::Vector("快照大小与 manifest 不一致".to_string()));
         }
         if blake3::hash(&bytes).to_hex().to_string() != manifest.file_hash {
-            return Err(Error::Vector("快照哈希与 manifest 不一致，文件已损坏".to_string()));
+            return Err(Error::Vector(
+                "快照哈希与 manifest 不一致，文件已损坏".to_string(),
+            ));
         }
         let capacity = manifest.vector_count.max(CAPACITY_STEP);
         let index = new_index(self.dimensions, capacity)?;
@@ -550,8 +551,8 @@ fn sanitize(space_id: &str) -> String {
 }
 
 fn sync_file(path: &Path) -> Result<()> {
-    let file = File::open(path)
-        .map_err(|e| Error::io(format!("打开 {} 以同步", path.display()), e))?;
+    let file =
+        File::open(path).map_err(|e| Error::io(format!("打开 {} 以同步", path.display()), e))?;
     file.sync_all()
         .map_err(|e| Error::io(format!("同步 {}", path.display()), e))?;
     Ok(())

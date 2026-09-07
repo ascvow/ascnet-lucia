@@ -128,7 +128,10 @@ impl Engine {
             AccessMode::ReadOnly => (None, false),
             AccessMode::ReadWrite => {
                 workspace.ensure_data_dir()?;
-                (Some(WorkspaceLock::try_exclusive(workspace.data_dir())?), true)
+                (
+                    Some(WorkspaceLock::try_exclusive(workspace.data_dir())?),
+                    true,
+                )
             }
             AccessMode::Auto => {
                 workspace.ensure_data_dir()?;
@@ -573,9 +576,12 @@ impl Engine {
 
         let mut cancel = cancel;
         let verify_interval = self.config.index.verify_interval_secs;
-        let mut verify_timer = tokio::time::interval(std::time::Duration::from_secs(
-            if verify_interval == 0 { 3600 } else { verify_interval },
-        ));
+        let mut verify_timer =
+            tokio::time::interval(std::time::Duration::from_secs(if verify_interval == 0 {
+                3600
+            } else {
+                verify_interval
+            }));
         verify_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         verify_timer.tick().await;
 
@@ -630,7 +636,11 @@ fn plan_info(plan: &retrieval::QueryPlan) -> QueryPlanInfo {
         paths: plan.paths.clone(),
         literals: plan.literals.clone(),
         terms: plan.terms.clone(),
-        intents: plan.intents.iter().map(|i| i.as_str().to_string()).collect(),
+        intents: plan
+            .intents
+            .iter()
+            .map(|i| i.as_str().to_string())
+            .collect(),
         scope: plan.scope.clone(),
     }
 }

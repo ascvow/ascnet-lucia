@@ -1,0 +1,106 @@
+{
+  "description": "codesearch 自身源码的评测查询集。ground truth 为人工标注的相关文件，用于比较 FTS-only 与 Hybrid 的 Recall@k / MRR。查询集很小，结果只用于回归对比，不构成通用检索质量结论。",
+  "root_hint": "tools/codesearch",
+  "queries": [
+    {
+      "query": "崩溃恢复时怎么重放向量更新日志",
+      "expect_paths": ["src/vector/mod.rs"],
+      "note": "VectorIndex::replay / apply"
+    },
+    {
+      "query": "检查点是怎么原子发布的",
+      "expect_paths": ["src/vector/mod.rs"],
+      "note": "先写快照再原子替换 manifest"
+    },
+    {
+      "query": "怎么保证旧版本的代码不会被当成当前代码返回",
+      "expect_paths": ["src/store/mod.rs", "src/retrieval/mod.rs", "src/context/mod.rs"],
+      "note": "commit_file 失效旧版本 + 检索时按当前版本过滤"
+    },
+    {
+      "query": "API Key 是从哪里读取的",
+      "expect_paths": ["src/models/http.rs"],
+      "note": "read_api_key 从环境变量读取"
+    },
+    {
+      "query": "多路召回的结果是怎么合并排序的",
+      "expect_paths": ["src/retrieval/fusion.rs"],
+      "note": "RRF 融合"
+    },
+    {
+      "query": "怎么把驼峰和下划线命名拆成搜索词",
+      "expect_paths": ["src/retrieval/tokenize.rs"],
+      "note": "标识符拆词"
+    },
+    {
+      "query": "同一个目录被两个进程同时打开会怎样",
+      "expect_paths": ["src/workspace/lock.rs"],
+      "note": "workspace 独占锁"
+    },
+    {
+      "query": "哪些文件会被跳过不索引",
+      "expect_paths": ["src/workspace/scan.rs"],
+      "note": "默认排除规则与跳过原因"
+    },
+    {
+      "query": "超长函数是怎么被切分的",
+      "expect_paths": ["src/chunker/mod.rs"],
+      "note": "递归结构化拆分"
+    },
+    {
+      "query": "返回结果的长度预算是怎么控制的",
+      "expect_paths": ["src/context/mod.rs"],
+      "note": "token 预算与截断"
+    },
+    {
+      "query": "怎么避免重复请求已经算过的向量",
+      "expect_paths": ["src/store/mod.rs", "src/models/mod.rs", "src/indexer/mod.rs"],
+      "note": "embedding 缓存键与复用"
+    },
+    {
+      "query": "文件保存后多久会被重新索引",
+      "expect_paths": ["src/indexer/watch.rs", "src/config/mod.rs"],
+      "note": "去抖窗口"
+    },
+    {
+      "query": "TypeScript 的箭头函数是怎么解析的",
+      "expect_paths": ["src/parser/typescript.rs"],
+      "note": "TS 适配层"
+    },
+    {
+      "query": "向 Agent 暴露了哪些工具",
+      "expect_paths": ["src/api/mcp.rs"],
+      "note": "search_code / read_code"
+    },
+    {
+      "query": "请求超时和重试是怎么配置的",
+      "expect_paths": ["src/models/http.rs", "src/config/mod.rs"],
+      "note": "timeout_secs / max_retries"
+    },
+    {
+      "query": "数据库表结构定义在哪",
+      "expect_paths": ["src/store/schema.rs"],
+      "note": "schema DDL"
+    },
+    {
+      "query": "RetryPolicy",
+      "expect_paths": ["tests/fixtures/sample_repo/src/network/retry.rs"],
+      "note": "符号查询：FTS 本身就该命中"
+    },
+    {
+      "query": "looks_like_symbol",
+      "expect_paths": ["src/retrieval/query.rs"],
+      "note": "符号查询"
+    },
+    {
+      "query": "src/vector/mod.rs",
+      "expect_paths": ["src/vector/mod.rs"],
+      "note": "路径查询"
+    },
+    {
+      "query": "workspace 写锁被其他进程持有",
+      "expect_paths": ["src/engine.rs"],
+      "note": "字面量：源码中的中文提示语"
+    }
+  ]
+}

@@ -103,9 +103,7 @@ impl CodeRef {
         let (start, end) = lines
             .split_once('-')
             .ok_or_else(|| invalid("行范围必须形如 <start>-<end>"))?;
-        let start_line: u32 = start
-            .parse()
-            .map_err(|_| invalid("起始行不是整数"))?;
+        let start_line: u32 = start.parse().map_err(|_| invalid("起始行不是整数"))?;
         let end_line: u32 = end.parse().map_err(|_| invalid("结束行不是整数"))?;
         if start_line == 0 || end_line < start_line {
             return Err(invalid("行号必须从 1 开始且结束行不小于起始行"));
@@ -546,7 +544,11 @@ pub fn read(store: &Store, request: &ReadRequest, default_budget: usize) -> Resu
         ReadExpand::ContainingSymbol => {
             let (start_byte, end_byte) =
                 line_range_to_bytes(&content, code_ref.start_line, code_ref.end_line);
-            match store.containing_definition(row.revision_id, start_byte as i64, end_byte as i64)? {
+            match store.containing_definition(
+                row.revision_id,
+                start_byte as i64,
+                end_byte as i64,
+            )? {
                 Some(parent) => {
                     if parent.symbol.is_some() {
                         symbol = parent.symbol.clone();

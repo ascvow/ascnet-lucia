@@ -59,11 +59,14 @@ pub enum Error {
     Vector(String),
 
     /// `code_ref` 指向的源码版本已不存在。
-    #[error("reference_expired: {0}")]
+    ///
+    /// 文案只描述现象；机器可读的错误码由 [`Error::code`] 统一给出，
+    /// CLI 与 MCP 都会在外层附加它，因此这里不能重复写进文案。
+    #[error("引用的源码版本已失效: {0}")]
     ReferenceExpired(String),
 
     /// `code_ref` 格式无法解析或与当前 workspace 不匹配。
-    #[error("invalid_reference: {0}")]
+    #[error("引用无效: {0}")]
     InvalidReference(String),
 
     /// 查询为空或作用域表达式不合法。

@@ -144,13 +144,23 @@ impl<'a> Context<'a> {
         if scope.is_empty() {
             return name.to_string();
         }
-        format!("{}{}{}", scope.join(self.separator()), self.separator(), name)
+        format!(
+            "{}{}{}",
+            scope.join(self.separator()),
+            self.separator(),
+            name
+        )
     }
 
     /// 收集节点前方绑定的文档注释与属性/装饰器。
     ///
     /// 只接受紧邻的兄弟节点，并且中间不能出现空行，避免把无关注释绑定到定义上。
-    pub fn leading(&self, node: Node<'_>, is_doc: fn(&str) -> bool, is_attr: fn(&str) -> bool) -> Leading {
+    pub fn leading(
+        &self,
+        node: Node<'_>,
+        is_doc: fn(&str) -> bool,
+        is_attr: fn(&str) -> bool,
+    ) -> Leading {
         let mut start_byte = node.start_byte();
         let mut start_row = node.start_position().row;
         let mut docs: Vec<String> = Vec::new();
@@ -209,7 +219,10 @@ impl<'a> Context<'a> {
         let end = end.max(node.start_byte()).min(self.source.len());
         let text = self.source.get(node.start_byte()..end)?;
         let signature = collapse_whitespace(text);
-        let signature = signature.trim_end_matches(['{', '=', ';']).trim().to_string();
+        let signature = signature
+            .trim_end_matches(['{', '=', ';'])
+            .trim()
+            .to_string();
         if signature.is_empty() {
             None
         } else {
@@ -300,7 +313,10 @@ mod tests {
 
     #[test]
     fn collapse_whitespace_produces_single_line() {
-        assert_eq!(collapse_whitespace("pub  fn   a(\n  x: u32\n)"), "pub fn a( x: u32 )");
+        assert_eq!(
+            collapse_whitespace("pub  fn   a(\n  x: u32\n)"),
+            "pub fn a( x: u32 )"
+        );
     }
 
     #[test]

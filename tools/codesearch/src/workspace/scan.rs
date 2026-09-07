@@ -399,7 +399,10 @@ pub fn read_snapshot(
         Err(error) => {
             return Ok(Err((
                 SkipReason::NotUtf8,
-                format!("字节偏移 {} 处不是合法 UTF-8", error.utf8_error().valid_up_to()),
+                format!(
+                    "字节偏移 {} 处不是合法 UTF-8",
+                    error.utf8_error().valid_up_to()
+                ),
             )))
         }
     };
@@ -463,10 +466,19 @@ mod tests {
         let files: Vec<&str> = output.files.iter().map(|f| f.rel_path.as_str()).collect();
         assert_eq!(
             files,
-            vec![".codesearchignore", ".env.example", "blob.txt", "docs/guide.md", "src/lib.rs"]
+            vec![
+                ".codesearchignore",
+                ".env.example",
+                "blob.txt",
+                "docs/guide.md",
+                "src/lib.rs"
+            ]
         );
-        let skipped: Vec<(&str, SkipReason)> =
-            output.skipped.iter().map(|s| (s.path.as_str(), s.reason)).collect();
+        let skipped: Vec<(&str, SkipReason)> = output
+            .skipped
+            .iter()
+            .map(|s| (s.path.as_str(), s.reason))
+            .collect();
         assert!(skipped.contains(&(".env", SkipReason::Sensitive)));
         assert!(skipped.contains(&("id_rsa", SkipReason::Sensitive)));
         assert!(skipped.contains(&("logo.png", SkipReason::Binary)));
@@ -507,7 +519,9 @@ mod tests {
         assert_eq!(bad.err().map(|(r, _)| r), Some(SkipReason::NotUtf8));
         let big = read_snapshot(&root.join("big.txt"), 10).expect("read");
         assert_eq!(big.err().map(|(r, _)| r), Some(SkipReason::TooLarge));
-        let ok = read_snapshot(&root.join("ok.rs"), 1024).expect("read").expect("ok");
+        let ok = read_snapshot(&root.join("ok.rs"), 1024)
+            .expect("read")
+            .expect("ok");
         assert_eq!(ok.text, "fn 中文() {}");
         assert_eq!(ok.hash.len(), 64);
     }

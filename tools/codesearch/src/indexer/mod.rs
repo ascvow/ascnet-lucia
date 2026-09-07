@@ -73,7 +73,11 @@ enum Prepared {
     /// 需要写入的新版本。
     Ready(Box<PreparedFile>),
     /// 内容未变化，只需刷新采集元数据。
-    Unchanged { path: String, size: u64, mtime_ns: i64 },
+    Unchanged {
+        path: String,
+        size: u64,
+        mtime_ns: i64,
+    },
     /// 应记录跳过原因。
     Skip {
         path: String,
@@ -498,9 +502,7 @@ pub async fn embed_pending(
 /// 一个批次的请求结果。
 enum BatchOutcome {
     /// 成功：`(chunk_id, cache_key, 归一化后的向量)`。
-    Ok {
-        items: Vec<(i64, String, Vec<f32>)>,
-    },
+    Ok { items: Vec<(i64, String, Vec<f32>)> },
     /// 失败：该批全部代码块记一次失败。
     Failed {
         chunk_ids: Vec<i64>,
@@ -584,7 +586,9 @@ async fn request_embeddings(
 }
 
 /// 获取存储锁；锁中毒说明此前有线程 panic，此时明确报错而不是继续使用可疑状态。
-pub(crate) fn lock_store(store: &std::sync::Mutex<Store>) -> Result<std::sync::MutexGuard<'_, Store>> {
+pub(crate) fn lock_store(
+    store: &std::sync::Mutex<Store>,
+) -> Result<std::sync::MutexGuard<'_, Store>> {
     store
         .lock()
         .map_err(|_| Error::Internal("存储锁已中毒".to_string()))

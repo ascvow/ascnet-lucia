@@ -102,15 +102,39 @@ impl QueryPlan {
 
     /// 供 JSON 输出的意图字符串。
     pub fn intent_names(&self) -> Vec<String> {
-        self.intents.iter().map(|i| i.as_str().to_string()).collect()
+        self.intents
+            .iter()
+            .map(|i| i.as_str().to_string())
+            .collect()
     }
 }
 
 /// 中文疑问词与语气助词。仅剥离明确的提问框架，不做同义词扩展。
 const CJK_STOP_PHRASES: &[&str] = &[
-    "在哪里实现", "在哪里定义", "在哪里", "在哪儿", "在哪", "哪里", "哪个文件", "哪个",
-    "是什么", "为什么", "怎么样", "怎么做", "怎么写", "怎么", "怎样", "如何", "请问",
-    "帮我找", "帮我", "找一下", "找出", "查一下", "看一下", "告诉我",
+    "在哪里实现",
+    "在哪里定义",
+    "在哪里",
+    "在哪儿",
+    "在哪",
+    "哪里",
+    "哪个文件",
+    "哪个",
+    "是什么",
+    "为什么",
+    "怎么样",
+    "怎么做",
+    "怎么写",
+    "怎么",
+    "怎样",
+    "如何",
+    "请问",
+    "帮我找",
+    "帮我",
+    "找一下",
+    "找出",
+    "查一下",
+    "看一下",
+    "告诉我",
 ];
 
 /// 英文意图关键词。
@@ -149,7 +173,11 @@ pub fn analyze(raw: &str, explicit: &ScopeFilter) -> Result<QueryPlan> {
     // 3. 剥离中文疑问框架。
     let text = strip_cjk_stop_phrases(&text_with_stop);
     let text = text.trim().to_string();
-    let effective = if text.is_empty() { text_with_stop.clone() } else { text };
+    let effective = if text.is_empty() {
+        text_with_stop.clone()
+    } else {
+        text
+    };
 
     let mut plan = QueryPlan {
         raw: raw.to_string(),
@@ -162,7 +190,8 @@ pub fn analyze(raw: &str, explicit: &ScopeFilter) -> Result<QueryPlan> {
     // 4. 逐 token 判定符号 / 路径。
     let tokens: Vec<&str> = effective.split_whitespace().collect();
     for token in &tokens {
-        let cleaned = token.trim_matches(|c: char| matches!(c, ',' | '，' | '。' | '?' | '？' | '!' | '；' | ';'));
+        let cleaned = token
+            .trim_matches(|c: char| matches!(c, ',' | '，' | '。' | '?' | '？' | '!' | '；' | ';'));
         if cleaned.is_empty() {
             continue;
         }
@@ -303,8 +332,20 @@ pub fn looks_like_path(token: &str) -> bool {
     }
     matches!(
         ext.to_ascii_lowercase().as_str(),
-        "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" | "md" | "toml"
-            | "json" | "txt" | "yaml" | "yml"
+        "rs" | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "mts"
+            | "cts"
+            | "md"
+            | "toml"
+            | "json"
+            | "txt"
+            | "yaml"
+            | "yml"
     )
 }
 
@@ -327,10 +368,15 @@ pub fn looks_like_symbol(token: &str) -> bool {
     if !body_ok {
         return false;
     }
-    // 纯小写单词且不含分隔符时，只有在包含下划线或较长时才当作符号，
-    // 否则像 "retry" 这类普通英文词会挤占精确召回预算。
+    // 不含分隔符的单个英文词，只有在形似 CamelCase 或足够长时才当作完整符号，
+    // 否则 "retry" 这类普通词会挤占精确召回预算。
     let has_separator = token.contains("::") || token.contains('.') || token.contains('_');
-    let has_case_mix = token.chars().any(|c| c.is_uppercase());
+    // 必须**同时**有大小写才算 CamelCase：`API`、`JSON`、`HTTP` 这类全大写缩写
+    // 在自然语言提问里出现得远比符号引用频繁，一旦被当成完整符号精确命中，
+    // 就会凭 exact_reserve 挤掉真正相关的结果（例如 "API Key 是怎么读取的"
+    // 会让 `api` 模块排到第一）。全大写常量通常带下划线，已由 has_separator 覆盖。
+    let has_case_mix =
+        token.chars().any(|c| c.is_uppercase()) && token.chars().any(|c| c.is_lowercase());
     has_separator || has_case_mix || token.len() >= 12
 }
 
@@ -382,7 +428,14 @@ fn build_terms(text: &str, literals: &[String]) -> Vec<String> {
     for token in text.split_whitespace() {
         let cleaned: String = token
             .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == ':' || *c == '.' || *c == '/' || is_cjk(*c))
+            .filter(|c| {
+                c.is_alphanumeric()
+                    || *c == '_'
+                    || *c == ':'
+                    || *c == '.'
+                    || *c == '/'
+                    || is_cjk(*c)
+            })
             .collect();
         if cleaned.is_empty() {
             continue;
@@ -484,6 +537,42 @@ mod tests {
         assert!(!analyze_plain("retry").has_exact_symbol());
     }
 
+    /// 全大写缩写在自然语言提问里是普通词汇，不能占用精确召回预算。
+    ///
+    /// 真实查询 "API Key 是怎么读取的" 曾因把 `API` 当成完整符号，
+    /// 让 `api` 模块凭精确命中排到第一，挤掉了 `read_api_key`。
+    #[test]
+    fn uppercase_acronyms_are_not_treated_as_full_symbols() {
+        for (query, acronym) in [
+            ("API Key 是怎么读取的", "API"),
+            ("HTTP 请求怎么重试", "HTTP"),
+            ("JSON 解析在哪", "JSON"),
+            ("SQL 语句写在哪个文件", "SQL"),
+        ] {
+            let plan = analyze_plain(query);
+            assert!(
+                !plan.symbols.iter().any(|symbol| symbol == acronym),
+                "查询 `{query}` 不应把 `{acronym}` 当成完整符号: {:?}",
+                plan.symbols
+            );
+            // 缩写仍然参与 FTS 召回，只是不再享有精确命中的保留额度。
+            assert!(
+                plan.terms
+                    .iter()
+                    .any(|term| term.eq_ignore_ascii_case(acronym)),
+                "`{acronym}` 应仍进入 FTS 词条: {:?}",
+                plan.terms
+            );
+        }
+        // 单个纯缩写查询也不再是精确符号命中。
+        assert!(!analyze_plain("JSON").has_exact_symbol());
+
+        // 全大写常量通常带下划线，仍按完整符号处理。
+        assert!(analyze_plain("MAX_BACKOFF").has_exact_symbol());
+        assert!(analyze_plain("HttpClient").has_exact_symbol());
+        assert!(analyze_plain("http::HttpProvider").has_exact_symbol());
+    }
+
     #[test]
     fn path_queries_are_recognized() {
         let plan = analyze_plain("src/network/retry.rs");
@@ -496,16 +585,22 @@ mod tests {
     #[test]
     fn quoted_literals_are_extracted_verbatim() {
         let plan = analyze_plain("错误 \"connection refused: timeout\" 在哪里");
-        assert!(plan.literals.contains(&"connection refused: timeout".to_string()));
+        assert!(plan
+            .literals
+            .contains(&"connection refused: timeout".to_string()));
         assert!(plan.kinds.contains(&QueryKind::Literal));
         // 引号内容原样进入词条，特殊字符由 FTS 转义层处理。
-        assert!(plan.terms.contains(&"connection refused: timeout".to_string()));
+        assert!(plan
+            .terms
+            .contains(&"connection refused: timeout".to_string()));
     }
 
     #[test]
     fn error_message_without_quotes_becomes_literal() {
         let plan = analyze_plain("failed to connect: timeout");
-        assert!(plan.literals.contains(&"failed to connect: timeout".to_string()));
+        assert!(plan
+            .literals
+            .contains(&"failed to connect: timeout".to_string()));
     }
 
     #[test]
@@ -560,11 +655,17 @@ mod tests {
 
     #[test]
     fn intents_are_detected_in_both_languages() {
-        assert!(analyze_plain("retry implementation").intents.contains(&Intent::Implementation));
-        assert!(analyze_plain("重试的实现").intents.contains(&Intent::Implementation));
+        assert!(analyze_plain("retry implementation")
+            .intents
+            .contains(&Intent::Implementation));
+        assert!(analyze_plain("重试的实现")
+            .intents
+            .contains(&Intent::Implementation));
         assert!(analyze_plain("retry test").intents.contains(&Intent::Test));
         assert!(analyze_plain("重试的测试").intents.contains(&Intent::Test));
-        assert!(analyze_plain("RetryPolicy definition").intents.contains(&Intent::Definition));
+        assert!(analyze_plain("RetryPolicy definition")
+            .intents
+            .contains(&Intent::Definition));
     }
 
     #[test]
