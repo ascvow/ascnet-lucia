@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// 支持的语言。`Text` 与 `Markdown` 走兜底分块。
+/// 支持的语言。
+///
+/// 分三类：Tree-sitter 结构化解析、单文件组件（拆出内嵌块后委派子语言）、
+/// 以及走兜底分块的标记与配置格式。配置格式仍然拥有独立取值，
+/// 这样 `--language yaml` 之类的过滤才可用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Language {
@@ -25,6 +29,49 @@ pub enum Language {
     /// JavaScript / JSX（Tree-sitter 结构化解析）。
     #[serde(rename = "javascript")]
     JavaScript,
+    /// Python（Tree-sitter 结构化解析）。
+    Python,
+    /// Go（Tree-sitter 结构化解析）。
+    Go,
+    /// Java（Tree-sitter 结构化解析）。
+    Java,
+    /// C（Tree-sitter 结构化解析）。
+    C,
+    /// C++（Tree-sitter 结构化解析）。
+    Cpp,
+    /// C#（Tree-sitter 结构化解析）。
+    #[serde(rename = "csharp")]
+    CSharp,
+    /// Ruby（Tree-sitter 结构化解析）。
+    Ruby,
+    /// PHP（Tree-sitter 结构化解析）。
+    Php,
+    /// Swift（Tree-sitter 结构化解析）。
+    Swift,
+    /// Kotlin（Tree-sitter 结构化解析）。
+    Kotlin,
+    /// Scala（Tree-sitter 结构化解析）。
+    Scala,
+    /// Lua（Tree-sitter 结构化解析）。
+    Lua,
+    /// Shell 脚本（Tree-sitter bash 语法）。
+    Bash,
+    /// CSS 及其预处理器方言（Tree-sitter 结构化解析）。
+    Css,
+    /// SQL（Tree-sitter 结构化解析）。
+    Sql,
+    /// Vue 单文件组件（拆出 script/style 后委派子语言）。
+    Vue,
+    /// Svelte 单文件组件（拆出 script/style 后委派子语言）。
+    Svelte,
+    /// HTML（有界文本兜底）。
+    Html,
+    /// JSON（有界文本兜底）。
+    Json,
+    /// YAML（有界文本兜底）。
+    Yaml,
+    /// TOML（有界文本兜底）。
+    Toml,
     /// Markdown（按标题分块）。
     Markdown,
     /// 其他纯文本（有界文本兜底）。
@@ -32,6 +79,40 @@ pub enum Language {
 }
 
 impl Language {
+    /// 全部取值。
+    ///
+    /// 一致性测试与 [`Language::parse_filter`] 的提示信息都由此生成，
+    /// 新增变体时不会漏掉任何一处。
+    pub const ALL: &'static [Language] = &[
+        Language::Rust,
+        Language::TypeScript,
+        Language::Tsx,
+        Language::JavaScript,
+        Language::Python,
+        Language::Go,
+        Language::Java,
+        Language::C,
+        Language::Cpp,
+        Language::CSharp,
+        Language::Ruby,
+        Language::Php,
+        Language::Swift,
+        Language::Kotlin,
+        Language::Scala,
+        Language::Lua,
+        Language::Bash,
+        Language::Css,
+        Language::Sql,
+        Language::Vue,
+        Language::Svelte,
+        Language::Html,
+        Language::Json,
+        Language::Yaml,
+        Language::Toml,
+        Language::Markdown,
+        Language::Text,
+    ];
+
     /// 稳定的字符串标识（写入数据库与 JSON 输出）。
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -39,38 +120,91 @@ impl Language {
             Language::TypeScript => "typescript",
             Language::Tsx => "tsx",
             Language::JavaScript => "javascript",
+            Language::Python => "python",
+            Language::Go => "go",
+            Language::Java => "java",
+            Language::C => "c",
+            Language::Cpp => "cpp",
+            Language::CSharp => "csharp",
+            Language::Ruby => "ruby",
+            Language::Php => "php",
+            Language::Swift => "swift",
+            Language::Kotlin => "kotlin",
+            Language::Scala => "scala",
+            Language::Lua => "lua",
+            Language::Bash => "bash",
+            Language::Css => "css",
+            Language::Sql => "sql",
+            Language::Vue => "vue",
+            Language::Svelte => "svelte",
+            Language::Html => "html",
+            Language::Json => "json",
+            Language::Yaml => "yaml",
+            Language::Toml => "toml",
             Language::Markdown => "markdown",
             Language::Text => "text",
         }
     }
 
     /// 由数据库或配置中的字符串解析语言。
+    ///
+    /// 除稳定标识外还接受常见别名与扩展名写法，方便直接把扩展名当过滤值使用。
     pub fn from_str_opt(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "rust" | "rs" => Some(Language::Rust),
-            "typescript" | "ts" => Some(Language::TypeScript),
-            "tsx" => Some(Language::Tsx),
-            "javascript" | "js" | "jsx" => Some(Language::JavaScript),
-            "markdown" | "md" => Some(Language::Markdown),
-            "text" | "txt" | "plain" => Some(Language::Text),
-            _ => None,
-        }
+        let lowered = value.trim().to_ascii_lowercase();
+        let language = match lowered.as_str() {
+            "rust" | "rs" => Language::Rust,
+            "typescript" | "ts" => Language::TypeScript,
+            "tsx" => Language::Tsx,
+            "javascript" | "js" | "jsx" => Language::JavaScript,
+            "python" | "py" => Language::Python,
+            "go" | "golang" => Language::Go,
+            "java" => Language::Java,
+            "c" => Language::C,
+            "cpp" | "c++" | "cxx" | "cc" => Language::Cpp,
+            "csharp" | "c#" | "cs" => Language::CSharp,
+            "ruby" | "rb" => Language::Ruby,
+            "php" => Language::Php,
+            "swift" => Language::Swift,
+            "kotlin" | "kt" => Language::Kotlin,
+            "scala" => Language::Scala,
+            "lua" => Language::Lua,
+            "bash" | "sh" | "shell" | "zsh" => Language::Bash,
+            "css" | "scss" | "less" | "sass" => Language::Css,
+            "sql" => Language::Sql,
+            "vue" => Language::Vue,
+            "svelte" => Language::Svelte,
+            "html" | "htm" => Language::Html,
+            "json" => Language::Json,
+            "yaml" | "yml" => Language::Yaml,
+            "toml" => Language::Toml,
+            "markdown" | "md" => Language::Markdown,
+            "text" | "txt" | "plain" => Language::Text,
+            _ => return None,
+        };
+        Some(language)
     }
 
     /// 解析用户提供的语言过滤值，非法值返回 [`Error::InvalidQuery`]。
     pub fn parse_filter(value: &str) -> Result<Self> {
         Self::from_str_opt(value).ok_or_else(|| {
+            let available: Vec<&str> = Self::ALL.iter().map(|language| language.as_str()).collect();
             Error::InvalidQuery(format!(
-                "不支持的语言 `{value}`；可用值: rust, typescript, tsx, javascript, markdown, text"
+                "不支持的语言 `{value}`；可用值: {}",
+                available.join(", ")
             ))
         })
     }
 
-    /// 是否由 Tree-sitter 做结构化解析。
+    /// 是否由 Tree-sitter 做结构化解析（含单文件组件的委派解析）。
     pub fn is_structured(&self) -> bool {
-        matches!(
+        !matches!(
             self,
-            Language::Rust | Language::TypeScript | Language::Tsx | Language::JavaScript
+            Language::Html
+                | Language::Json
+                | Language::Yaml
+                | Language::Toml
+                | Language::Markdown
+                | Language::Text
         )
     }
 }
@@ -97,6 +231,8 @@ pub enum ChunkKind {
     TypeAlias,
     /// 常量或静态变量。
     Const,
+    /// 具名声明式规则：CSS 选择器规则、SQL 索引等。
+    Rule,
     /// 导入声明聚合块。
     Imports,
     /// 父节点的结构概览（只含签名，不重复子节点完整代码）。
@@ -122,6 +258,7 @@ impl ChunkKind {
             ChunkKind::Module => "module",
             ChunkKind::TypeAlias => "type_alias",
             ChunkKind::Const => "const",
+            ChunkKind::Rule => "rule",
             ChunkKind::Imports => "imports",
             ChunkKind::Overview => "overview",
             ChunkKind::Part => "part",
@@ -142,6 +279,7 @@ impl ChunkKind {
             "module" => ChunkKind::Module,
             "type_alias" => ChunkKind::TypeAlias,
             "const" => ChunkKind::Const,
+            "rule" => ChunkKind::Rule,
             "imports" => ChunkKind::Imports,
             "overview" => ChunkKind::Overview,
             "part" => ChunkKind::Part,
@@ -151,6 +289,25 @@ impl ChunkKind {
         };
         Some(kind)
     }
+
+    /// 全部取值，供一致性测试遍历。
+    pub const ALL: &'static [ChunkKind] = &[
+        ChunkKind::Function,
+        ChunkKind::Method,
+        ChunkKind::Struct,
+        ChunkKind::Enum,
+        ChunkKind::Trait,
+        ChunkKind::Impl,
+        ChunkKind::Module,
+        ChunkKind::TypeAlias,
+        ChunkKind::Const,
+        ChunkKind::Rule,
+        ChunkKind::Imports,
+        ChunkKind::Overview,
+        ChunkKind::Part,
+        ChunkKind::Section,
+        ChunkKind::Text,
+    ];
 
     /// 是否代表一个可命名的定义（用于符号表与上下文扩展）。
     pub fn is_definition(&self) -> bool {
@@ -164,6 +321,7 @@ impl ChunkKind {
                 | ChunkKind::Module
                 | ChunkKind::TypeAlias
                 | ChunkKind::Const
+                | ChunkKind::Rule
         )
     }
 }
@@ -578,18 +736,63 @@ mod tests {
 
     #[test]
     fn language_round_trips_through_str() {
-        for language in [
-            Language::Rust,
-            Language::TypeScript,
-            Language::Tsx,
-            Language::JavaScript,
-            Language::Markdown,
-            Language::Text,
-        ] {
-            assert_eq!(Language::from_str_opt(language.as_str()), Some(language));
+        for language in Language::ALL {
+            assert_eq!(Language::from_str_opt(language.as_str()), Some(*language));
         }
         assert_eq!(Language::from_str_opt("RS"), Some(Language::Rust));
+        assert_eq!(Language::from_str_opt("golang"), Some(Language::Go));
+        assert_eq!(Language::from_str_opt("scss"), Some(Language::Css));
         assert!(Language::parse_filter("cobol").is_err());
+    }
+
+    /// `ALL` 必须真的覆盖每一个变体。
+    ///
+    /// 一致性测试、`parse_filter` 的可用值提示都由 `ALL` 生成；漏登记一个变体
+    /// 就会让它绕过全部校验，因此这里用稳定标识去重来反查数量。
+    #[test]
+    fn language_all_has_no_duplicates_and_covers_every_variant() {
+        let mut seen: Vec<&str> = Language::ALL
+            .iter()
+            .map(|language| language.as_str())
+            .collect();
+        let total = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "ALL 中存在重复语言");
+
+        // 穷举匹配：新增变体而忘记登记 ALL 时，这里不会编译通过。
+        for language in Language::ALL {
+            let covered = match language {
+                Language::Rust
+                | Language::TypeScript
+                | Language::Tsx
+                | Language::JavaScript
+                | Language::Python
+                | Language::Go
+                | Language::Java
+                | Language::C
+                | Language::Cpp
+                | Language::CSharp
+                | Language::Ruby
+                | Language::Php
+                | Language::Swift
+                | Language::Kotlin
+                | Language::Scala
+                | Language::Lua
+                | Language::Bash
+                | Language::Css
+                | Language::Sql
+                | Language::Vue
+                | Language::Svelte
+                | Language::Html
+                | Language::Json
+                | Language::Yaml
+                | Language::Toml
+                | Language::Markdown
+                | Language::Text => true,
+            };
+            assert!(covered);
+        }
     }
 
     /// JSON 表示、`as_str` 与过滤值解析必须是同一套标识。
@@ -597,20 +800,13 @@ mod tests {
     /// 三者一旦分叉，Agent 把搜索结果里的 `language` 直接当作过滤值就会报错。
     #[test]
     fn language_json_matches_as_str_and_is_accepted_as_a_filter() {
-        for language in [
-            Language::Rust,
-            Language::TypeScript,
-            Language::Tsx,
-            Language::JavaScript,
-            Language::Markdown,
-            Language::Text,
-        ] {
+        for language in Language::ALL {
             let json = serde_json::to_value(language).expect("序列化");
             let text = json.as_str().expect("语言应序列化为字符串");
             assert_eq!(text, language.as_str(), "JSON 表示与 as_str 不一致");
             assert_eq!(
                 Language::parse_filter(text).expect("JSON 值必须能当作过滤值"),
-                language
+                *language
             );
         }
     }
@@ -618,22 +814,7 @@ mod tests {
     /// 其余对外枚举同样要求 JSON 表示与稳定标识一致。
     #[test]
     fn chunk_kind_and_match_source_json_match_as_str() {
-        for kind in [
-            ChunkKind::Function,
-            ChunkKind::Method,
-            ChunkKind::Struct,
-            ChunkKind::Enum,
-            ChunkKind::Trait,
-            ChunkKind::Impl,
-            ChunkKind::Module,
-            ChunkKind::TypeAlias,
-            ChunkKind::Const,
-            ChunkKind::Imports,
-            ChunkKind::Overview,
-            ChunkKind::Part,
-            ChunkKind::Section,
-            ChunkKind::Text,
-        ] {
+        for kind in ChunkKind::ALL {
             let json = serde_json::to_value(kind).expect("序列化");
             assert_eq!(json.as_str(), Some(kind.as_str()));
         }
@@ -654,23 +835,8 @@ mod tests {
 
     #[test]
     fn chunk_kind_round_trips_through_str() {
-        for kind in [
-            ChunkKind::Function,
-            ChunkKind::Method,
-            ChunkKind::Struct,
-            ChunkKind::Enum,
-            ChunkKind::Trait,
-            ChunkKind::Impl,
-            ChunkKind::Module,
-            ChunkKind::TypeAlias,
-            ChunkKind::Const,
-            ChunkKind::Imports,
-            ChunkKind::Overview,
-            ChunkKind::Part,
-            ChunkKind::Section,
-            ChunkKind::Text,
-        ] {
-            assert_eq!(ChunkKind::from_str_opt(kind.as_str()), Some(kind));
+        for kind in ChunkKind::ALL {
+            assert_eq!(ChunkKind::from_str_opt(kind.as_str()), Some(*kind));
         }
         assert_eq!(ChunkKind::from_str_opt("nope"), None);
     }

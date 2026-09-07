@@ -912,6 +912,136 @@ export default router;
         }
     }
 
+    /// Vue 单文件组件必须同时满足：能产出符号、模板区域不丢内容。
+    ///
+    /// 回归：`.vue` 曾经没有任何解析器、整体按纯文本处理，符号列恒为空，
+    /// 符号查询对 Vue 组件完全无效——而实测前端项目里 87% 的被索引行来自这类文件。
+    #[test]
+    fn vue_component_yields_symbols_and_keeps_every_line() {
+        let config = ChunkConfig::default();
+        let source = r#"<template>
+  <div class="login">
+    <button class="btn-primary" @click="submit">登录</button>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref } from "vue";
+
+const username = ref("");
+
+/** 提交登录表单。 */
+async function submit(): Promise<void> {
+  await login(username.value);
+}
+</script>
+
+<style scoped>
+.btn-primary {
+  color: red;
+}
+</style>
+"#;
+        let chunks = chunk("src/views/Login.vue", Language::Vue, source, &config);
+        assert_lines_match(source, &chunks);
+
+        // 脚本符号与样式选择器都要能被符号通路命中。
+        let symbols: Vec<&str> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.symbols.iter())
+            .map(|record| record.qualified.as_str())
+            .collect();
+        assert!(symbols.contains(&"submit"), "缺少脚本符号: {symbols:?}");
+        assert!(
+            symbols.contains(&".btn-primary"),
+            "缺少样式选择器符号: {symbols:?}"
+        );
+
+        // 模板区域没有解析器，必须由未覆盖区间兜底，不能整段消失。
+        let joined: String = chunks
+            .iter()
+            .filter(|chunk| chunk.end_byte > chunk.start_byte)
+            .map(|chunk| source[chunk.start_byte..chunk.end_byte].to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("<button class=\"btn-primary\""),
+            "模板内容丢失"
+        );
+
+        assert_every_line_is_indexed(source, &chunks);
+    }
+
+    /// 新接入的语言都必须做到"不丢行"，这是检索结果可信的底线。
+    #[test]
+    fn newly_supported_languages_index_every_line() {
+        let config = ChunkConfig::default();
+        let cases: &[(&str, Language, &str)] = &[
+            (
+                "app/service.py",
+                Language::Python,
+                "import os\n\nCONST = 1\n\nclass Service:\n    def run(self):\n        return 1\n\napp.run(host=\"0.0.0.0\")\n",
+            ),
+            (
+                "cmd/main.go",
+                Language::Go,
+                "package main\n\nimport \"fmt\"\n\nfunc main() {\n    fmt.Println(1)\n}\n\nvar hook = register()\n",
+            ),
+            (
+                "src/Main.java",
+                Language::Java,
+                "package a;\n\npublic class Main {\n    public static void main(String[] a) {}\n}\n",
+            ),
+            (
+                "src/user.rb",
+                Language::Ruby,
+                "require \"json\"\n\nclass User\n  def name\n    @name\n  end\nend\n\nUser.new\n",
+            ),
+            (
+                "src/Controller.php",
+                Language::Php,
+                "<?php\nnamespace App;\n\nclass C {\n    public function go() {}\n}\n\n$app->run();\n",
+            ),
+            (
+                "styles/app.scss",
+                Language::Css,
+                ".a {\n  color: red;\n}\n\n.b {\n  color: blue;\n}\n",
+            ),
+            (
+                "scripts/deploy.sh",
+                Language::Bash,
+                "#!/usr/bin/env bash\nset -e\n\ndeploy() {\n  echo hi\n}\n\ndeploy\n",
+            ),
+        ];
+        for (path, language, source) in cases {
+            let chunks = chunk(path, *language, source, &config);
+            assert!(!chunks.is_empty(), "{path} 未产出任何代码块");
+            assert_lines_match(source, &chunks);
+            assert_every_line_is_indexed(source, &chunks);
+        }
+    }
+
+    /// 除空行外，每一行都必须落在某个代码块的行号范围内。
+    fn assert_every_line_is_indexed(source: &str, chunks: &[PreparedChunk]) {
+        let total = source.lines().count();
+        let mut covered = vec![false; total + 2];
+        for chunk in chunks {
+            for line in chunk.start_line..=chunk.end_line.min(total as u32) {
+                covered[line as usize] = true;
+            }
+        }
+        for (index, line) in source.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            assert!(
+                covered[index + 1],
+                "第 {} 行未进入任何块: {line}",
+                index + 1
+            );
+        }
+    }
+
     /// 所有块的行号必须与内容严格对应，这是结果可信的前提。
     fn assert_lines_match(source: &str, chunks: &[PreparedChunk]) {
         let lines: Vec<&str> = source.split_inclusive('\n').collect();

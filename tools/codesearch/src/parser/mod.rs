@@ -1,12 +1,16 @@
 //! Tree-sitter 解析与定义提取。
 //!
-//! 每种语言只提供一个小型适配层（[`rust_lang`]、[`typescript`]），公共的遍历、
-//! 文档注释绑定与签名提取逻辑放在本模块共享。
+//! 三条路径：Rust 与 TypeScript 系各有手写适配层（[`rust_lang`]、[`typescript`]）；
+//! 其余语言共用一个由 [`generic::LanguageSpec`] 表驱动的通用适配层；
+//! 单文件组件（Vue / Svelte）由 [`sfc`] 拆出内嵌块后委派给上面两者。
+//! 公共的遍历、文档注释绑定与签名提取逻辑放在本模块共享。
 //!
 //! 提取结果只描述"源码里写了什么"，不做任何跨文件解析。Tree-sitter 能看到调用表达式，
 //! 但那不等于已解析的调用目标，因此本模块不产出调用图。
 
+pub mod generic;
 pub mod rust_lang;
+pub mod sfc;
 pub mod typescript;
 
 use tree_sitter::{Node, Parser};
@@ -84,13 +88,27 @@ pub fn parse(language: Language, source: &str) -> Result<ParsedFile> {
     if !language.is_structured() {
         return Ok(ParsedFile::default());
     }
-    let ts_language: tree_sitter::Language = match language {
-        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        _ => return Ok(ParsedFile::default()),
+    // 单文件组件不是一种语法，先拆块再按内嵌语言委派。
+    if matches!(language, Language::Vue | Language::Svelte) {
+        return sfc::parse(source);
+    }
+
+    // 手写适配层覆盖 Rust 与 TypeScript 系，其余语言走表驱动的通用适配层。
+    let handwritten: Option<tree_sitter::Language> = match language {
+        Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+        Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        Language::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+        _ => None,
     };
+    let (ts_language, spec) = match handwritten {
+        Some(ts_language) => (ts_language, None),
+        None => match generic::spec_for(language) {
+            Some((ts_language, spec)) => (ts_language, Some(spec)),
+            None => return Ok(ParsedFile::default()),
+        },
+    };
+
     let mut parser = Parser::new();
     parser
         .set_language(&ts_language)
@@ -104,9 +122,10 @@ pub fn parse(language: Language, source: &str) -> Result<ParsedFile> {
         has_errors: root.has_error(),
         ..Default::default()
     };
-    match language {
-        Language::Rust => rust_lang::extract(&ctx, root, &mut parsed),
-        _ => typescript::extract(&ctx, root, &mut parsed),
+    match spec {
+        Some(spec) => generic::extract(&ctx, spec, root, &mut parsed),
+        None if language == Language::Rust => rust_lang::extract(&ctx, root, &mut parsed),
+        None => typescript::extract(&ctx, root, &mut parsed),
     }
     Ok(parsed)
 }
@@ -141,15 +160,19 @@ impl<'a> Context<'a> {
 
     /// 用当前作用域拼出限定名。
     pub fn qualify(&self, scope: &[String], name: &str) -> String {
+        self.qualify_with(self.separator(), scope, name)
+    }
+
+    /// 用指定分隔符拼出限定名。
+    ///
+    /// 通用适配层的分隔符来自 [`crate::parser::generic::LanguageSpec`]，
+    /// 与 [`Context::separator`] 的两分法（Rust 用 `::`，其余用 `.`）不同：
+    /// Ruby 用 `::`、PHP 用 `\`，因此需要显式传入。
+    pub fn qualify_with(&self, separator: &str, scope: &[String], name: &str) -> String {
         if scope.is_empty() {
             return name.to_string();
         }
-        format!(
-            "{}{}{}",
-            scope.join(self.separator()),
-            self.separator(),
-            name
-        )
+        format!("{}{}{}", scope.join(separator), separator, name)
     }
 
     /// 收集节点前方绑定的文档注释与属性/装饰器。
@@ -161,6 +184,41 @@ impl<'a> Context<'a> {
         is_doc: fn(&str) -> bool,
         is_attr: fn(&str) -> bool,
     ) -> Leading {
+        self.leading_impl(node, &is_doc, &is_attr, &is_doc_text)
+    }
+
+    /// 按节点类别名单收集前置文档与属性。
+    ///
+    /// 供通用适配层使用：类别名单来自各语言的 spec 表。`doc_prefixes` 为空表示
+    /// 该语言没有专门的文档注释语法（Python、Go、Ruby、Shell 等），
+    /// 此时任何紧邻注释都视为文档，否则文档会全部丢失。
+    pub fn leading_with(
+        &self,
+        node: Node<'_>,
+        comments: &[&str],
+        attributes: &[&str],
+        doc_prefixes: &[&str],
+    ) -> Leading {
+        self.leading_impl(
+            node,
+            &|kind| comments.contains(&kind),
+            &|kind| attributes.contains(&kind),
+            &|text| {
+                doc_prefixes.is_empty()
+                    || doc_prefixes
+                        .iter()
+                        .any(|prefix| text.trim_start().starts_with(prefix))
+            },
+        )
+    }
+
+    fn leading_impl(
+        &self,
+        node: Node<'_>,
+        is_doc: &dyn Fn(&str) -> bool,
+        is_attr: &dyn Fn(&str) -> bool,
+        is_doc_body: &dyn Fn(&str) -> bool,
+    ) -> Leading {
         let mut start_byte = node.start_byte();
         let mut start_row = node.start_position().row;
         let mut docs: Vec<String> = Vec::new();
@@ -168,7 +226,7 @@ impl<'a> Context<'a> {
         while let Some(previous) = current.prev_sibling() {
             let kind = previous.kind();
             let text = self.text(previous);
-            let doc = is_doc(kind) && is_doc_text(text);
+            let doc = is_doc(kind) && is_doc_body(text);
             let attr = is_attr(kind);
             if !doc && !attr {
                 break;
@@ -254,6 +312,7 @@ pub fn clean_doc(raw: &str) -> String {
     let mut lines = Vec::new();
     for line in raw.lines() {
         let line = line.trim();
+        // `#` 与 `--` 覆盖 Python / Ruby / Shell / Lua 的注释语法。
         let line = line
             .strip_prefix("///")
             .or_else(|| line.strip_prefix("//!"))
@@ -261,6 +320,9 @@ pub fn clean_doc(raw: &str) -> String {
             .or_else(|| line.strip_prefix("*/"))
             .or_else(|| line.strip_prefix('*'))
             .or_else(|| line.strip_prefix("//"))
+            .or_else(|| line.strip_prefix("#!"))
+            .or_else(|| line.strip_prefix('#'))
+            .or_else(|| line.strip_prefix("--"))
             .unwrap_or(line);
         let line = line.trim_end_matches("*/").trim();
         lines.push(line);

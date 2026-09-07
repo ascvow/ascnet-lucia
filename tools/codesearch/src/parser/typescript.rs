@@ -72,6 +72,14 @@ fn handle_node(
                 handle_node(ctx, outer, declaration, scope, parent_symbol, out, imports);
             }
         }
+        // `declare module 'x' {}` / `declare global {}` / `declare function f()`。
+        // `.d.ts` 里几乎全是这种写法，不下钻的话整个声明文件提取不到任何符号。
+        "ambient_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                handle_node(ctx, outer, child, scope, parent_symbol, out, imports);
+            }
+        }
         // `namespace X {}` 在语法树中包在 expression_statement 里。
         "expression_statement" => {
             if let Some(child) = node.named_child(0) {
@@ -474,6 +482,52 @@ namespace Inner {
         let parsed = parse(Language::Tsx, tsx).expect("parse tsx");
         assert!(!parsed.has_errors, "TSX 应由 TSX 语法解析");
         assert_eq!(parsed.definitions[0].name, "View");
+    }
+
+    /// `.d.ts` 声明文件必须能提取出符号。
+    ///
+    /// 回归：`declare module 'x' {}` 解析为 `ambient_declaration` 包装节点，
+    /// 不下钻就会让整个声明文件零符号。实测前端项目里 `env.d.ts`、
+    /// `components.d.ts` 这类自动生成的声明文件全部是这种写法。
+    #[test]
+    fn ambient_declarations_in_d_ts_yield_symbols() {
+        let source = r#"export {}
+
+declare module 'vue' {
+  export interface GlobalComponents {
+    ElButton: typeof import('element-plus/es')['ElButton']
+  }
+}
+
+declare global {
+  interface Window { __APP__: string }
+}
+
+declare function legacyHelper(value: number): string;
+"#;
+        let parsed = parse(Language::TypeScript, source).expect("parse");
+        let names: Vec<&str> = parsed.definitions.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            names.iter().any(|name| name.contains("vue")),
+            "declare module 未提取: {names:?}"
+        );
+        assert!(
+            names.contains(&"legacyHelper"),
+            "declare function 未提取: {names:?}"
+        );
+        // 模块内部的 interface 也要成为子定义。
+        let module = parsed
+            .definitions
+            .iter()
+            .find(|d| d.name.contains("vue"))
+            .expect("declare module");
+        assert!(
+            module
+                .children
+                .iter()
+                .any(|child| child.name == "GlobalComponents"),
+            "declare module 内部的 interface 未提取"
+        );
     }
 
     #[test]

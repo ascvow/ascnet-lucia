@@ -416,6 +416,9 @@ pub fn read_snapshot(
 }
 
 /// 按扩展名与文件名推断语言。
+///
+/// 无扩展名的常见脚本按文件名识别；识别不出的一律归为 [`Language::Text`]，
+/// 走文本兜底分块，因此不会有文件因为语言未知而丢失。
 pub fn detect_language(rel_path: &str) -> Language {
     let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
     let ext = file_name
@@ -427,7 +430,41 @@ pub fn detect_language(rel_path: &str) -> Language {
         "ts" | "mts" | "cts" => Language::TypeScript,
         "tsx" => Language::Tsx,
         "js" | "mjs" | "cjs" | "jsx" => Language::JavaScript,
-        "md" | "markdown" | "mdx" => Language::Markdown,
+        "py" | "pyi" | "pyw" => Language::Python,
+        "go" => Language::Go,
+        "java" => Language::Java,
+        // `.h` 归为 C：C++ 头文件按 C 语法解析仍能提取出大部分结构，
+        // 而把纯 C 头文件按 C++ 解析同样有偏差，这里选择更常见的一侧。
+        "c" | "h" => Language::C,
+        "cc" | "cpp" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "ipp" => Language::Cpp,
+        "cs" => Language::CSharp,
+        "rb" | "rake" | "gemspec" => Language::Ruby,
+        "php" | "phtml" => Language::Php,
+        "swift" => Language::Swift,
+        "kt" | "kts" => Language::Kotlin,
+        "scala" | "sc" => Language::Scala,
+        "lua" => Language::Lua,
+        "sh" | "bash" | "zsh" | "ksh" => Language::Bash,
+        "css" | "scss" | "less" | "sass" | "pcss" | "postcss" => Language::Css,
+        "sql" | "ddl" | "dml" => Language::Sql,
+        // `.nvue` 是 uni-app 的原生渲染组件，与 `.vue` 是同一套单文件组件结构。
+        "vue" | "nvue" | "uvue" => Language::Vue,
+        "svelte" => Language::Svelte,
+        "html" | "htm" | "xhtml" | "vm" => Language::Html,
+        "json" | "jsonc" | "json5" => Language::Json,
+        "yaml" | "yml" => Language::Yaml,
+        "toml" => Language::Toml,
+        // `.mdc` 是 Cursor 规则文件，正文就是 Markdown。
+        "md" | "markdown" | "mdx" | "mdc" => Language::Markdown,
+        _ => detect_by_file_name(file_name),
+    }
+}
+
+/// 无扩展名文件按文件名识别，覆盖常见的无后缀脚本与配置。
+fn detect_by_file_name(file_name: &str) -> Language {
+    match file_name.to_ascii_lowercase().as_str() {
+        ".bashrc" | ".bash_profile" | ".zshrc" | ".zshenv" | ".profile" => Language::Bash,
+        "gemfile" | "rakefile" | "podfile" => Language::Ruby,
         _ => Language::Text,
     }
 }
@@ -534,5 +571,48 @@ mod tests {
         assert_eq!(detect_language("index.mjs"), Language::JavaScript);
         assert_eq!(detect_language("README.md"), Language::Markdown);
         assert_eq!(detect_language("Makefile"), Language::Text);
+    }
+
+    #[test]
+    fn language_detection_covers_the_added_languages() {
+        let cases: &[(&str, Language)] = &[
+            ("app/main.py", Language::Python),
+            ("cmd/server.go", Language::Go),
+            ("src/Main.java", Language::Java),
+            ("lib/util.c", Language::C),
+            ("lib/util.h", Language::C),
+            ("lib/util.cpp", Language::Cpp),
+            ("lib/util.hpp", Language::Cpp),
+            ("App/Program.cs", Language::CSharp),
+            ("app/models/user.rb", Language::Ruby),
+            ("src/Controller.php", Language::Php),
+            ("Sources/App.swift", Language::Swift),
+            ("src/Main.kt", Language::Kotlin),
+            ("src/Main.scala", Language::Scala),
+            ("init.lua", Language::Lua),
+            ("scripts/deploy.sh", Language::Bash),
+            ("src/style.scss", Language::Css),
+            ("migrations/001.sql", Language::Sql),
+            ("src/components/Login.vue", Language::Vue),
+            ("pages/Detail.nvue", Language::Vue),
+            ("src/App.svelte", Language::Svelte),
+            (".cursor/rules/style.mdc", Language::Markdown),
+            ("public/index.html", Language::Html),
+            ("package.json", Language::Json),
+            (".github/workflows/ci.yml", Language::Yaml),
+            ("Cargo.toml", Language::Toml),
+            ("Gemfile", Language::Ruby),
+            (".zshrc", Language::Bash),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(detect_language(path), *expected, "路径 {path} 语言识别错误");
+        }
+    }
+
+    /// 大小写不同的扩展名必须识别为同一种语言。
+    #[test]
+    fn language_detection_is_case_insensitive() {
+        assert_eq!(detect_language("src/Main.PY"), Language::Python);
+        assert_eq!(detect_language("A.VUE"), Language::Vue);
     }
 }
