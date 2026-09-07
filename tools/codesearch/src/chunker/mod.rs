@@ -52,6 +52,7 @@ pub fn chunk_file(ctx: &ChunkContext<'_>, parsed: &ParsedFile) -> Result<Vec<Pre
         let mut definitions: Vec<&Definition> = parsed.definitions.iter().collect();
         definitions.sort_by_key(|d| d.start_byte);
         emit_definitions(ctx, &definitions, &mut raw);
+        raw.extend(uncovered_text_chunks(ctx, &raw));
     } else if ctx.language == Language::Markdown {
         raw.extend(markdown_chunks(ctx));
     } else {
@@ -457,6 +458,37 @@ fn markdown_chunks(ctx: &ChunkContext<'_>) -> Vec<RawChunk> {
     out
 }
 
+/// 为结构化解析未覆盖的区间补文本块。
+///
+/// 结构化解析只产出声明。顶层表达式语句不是声明，因此
+/// `router.beforeEach(...)`、`service.interceptors.request.use(...)`、
+/// `app.use(pinia)` 这类代码不会进入任何块，整段从索引中消失——
+/// 而这正是前端项目里最常被搜索的接线逻辑。
+///
+/// 这里把未覆盖且含有效内容的区间按文本兜底切分，保证任何语言都不丢内容。
+/// 空白与纯符号区间由 [`text_chunks`] 自行跳过。
+fn uncovered_text_chunks(ctx: &ChunkContext<'_>, covered_by: &[RawChunk]) -> Vec<RawChunk> {
+    let mut spans: Vec<(usize, usize)> = covered_by
+        .iter()
+        .filter(|chunk| chunk.end_byte > chunk.start_byte)
+        .map(|chunk| (chunk.start_byte, chunk.end_byte))
+        .collect();
+    spans.sort_unstable();
+
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for (start, end) in spans {
+        if start > cursor {
+            out.extend(text_chunks(ctx, cursor, start, None));
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < ctx.source.len() {
+        out.extend(text_chunks(ctx, cursor, ctx.source.len(), None));
+    }
+    out
+}
+
 /// 有界文本兜底分块：始终在行边界切分。
 fn text_chunks(
     ctx: &ChunkContext<'_>,
@@ -819,6 +851,65 @@ mod tests {
             !source[head.start_byte..head.end_byte].contains("helper_10"),
             "顶部导入块不应包含函数体"
         );
+    }
+
+    /// 顶层表达式语句不是声明，但必须进入索引。
+    ///
+    /// 回归：结构化解析只产出声明，`router.beforeEach(...)`、
+    /// `service.interceptors.request.use(...)`、`app.use(pinia)` 这类接线代码
+    /// 不落在任何块里，整段从索引消失。实测三个前端项目的 JS 覆盖率只有 87%~91%，
+    /// 缺的正好是最常被搜索的部分。
+    #[test]
+    fn top_level_statements_are_indexed_not_dropped() {
+        let config = ChunkConfig::default();
+        let source = r#"import { createRouter } from "vue-router";
+
+const router = createRouter({ routes: [] });
+
+router.beforeEach((to, from, next) => {
+  if (!localStorage.getItem("token")) {
+    return next("/login");
+  }
+  next();
+});
+
+service.interceptors.response.use((response) => {
+  if (response.data.code === 401) {
+    redirectToLogin();
+  }
+  return response;
+});
+
+export default router;
+"#;
+        let chunks = chunk("src/router/index.js", Language::JavaScript, source, &config);
+        assert_lines_match(source, &chunks);
+
+        // 逐行覆盖：除空行外，每一行都必须落在某个块里。
+        let total = source.lines().count();
+        let mut covered = vec![false; total + 1];
+        for chunk in &chunks {
+            for line in chunk.start_line..=chunk.end_line.min(total as u32) {
+                covered[line as usize] = true;
+            }
+        }
+        for (index, line) in source.lines().enumerate() {
+            let number = index + 1;
+            if line.trim().is_empty() {
+                continue;
+            }
+            assert!(covered[number], "第 {number} 行未进入任何块: {line}");
+        }
+
+        // 关键接线代码必须能在某个块的正文里找到。
+        let joined: String = chunks
+            .iter()
+            .map(|chunk| source[chunk.start_byte..chunk.end_byte].to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in ["router.beforeEach", "interceptors.response", "code === 401"] {
+            assert!(joined.contains(needle), "索引内容缺少 `{needle}`");
+        }
     }
 
     /// 所有块的行号必须与内容严格对应，这是结果可信的前提。
