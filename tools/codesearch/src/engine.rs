@@ -468,6 +468,16 @@ impl Engine {
         notes.dedup();
 
         let degraded = !vector_used || counters.embeddings_pending > 0;
+        // degraded 必须带着原因出现。作用域筛掉全部候选时向量通路不会执行，
+        // 前面几路都没有话可说，只报一个孤零零的 degraded=true 会让调用方
+        // 以为工具坏了，而不是自己的过滤条件没匹配上任何文件。
+        if degraded && notes.is_empty() {
+            notes.push(if results.is_empty() {
+                "作用域未匹配到任何代码块，向量召回未执行".to_string()
+            } else {
+                "本次未使用向量召回，仅符号与全文结果".to_string()
+            });
+        }
         Ok(SearchResponse {
             catalog_epoch: epoch,
             mode: request.mode,

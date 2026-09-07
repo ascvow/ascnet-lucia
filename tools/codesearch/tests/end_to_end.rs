@@ -729,3 +729,57 @@ async fn one_huge_chunk_does_not_starve_the_other_results() {
     let total: usize = response.results.iter().map(|r| r.estimated_tokens).sum();
     assert!(total <= budget, "结果合计 {total} 超出预算 {budget}");
 }
+
+/// `degraded=true` 必须同时给出原因，不能只丢一个孤零零的布尔值。
+///
+/// 回归：作用域筛掉全部候选时向量召回不执行，degraded 被置位但 reasons 为空，
+/// 调用方无法区分"工具坏了"和"我的过滤条件没匹配上任何文件"。
+#[tokio::test(flavor = "multi_thread")]
+async fn degraded_always_carries_a_reason() {
+    let server = EmbeddingServer::start().await;
+    let repo = sample_repo();
+    write_file(
+        &repo.path().join("codesearch.toml"),
+        &config_toml(server.base_url(), ""),
+    );
+
+    let engine = open_engine(repo.path(), false).await;
+    engine.index(false).await.expect("索引");
+
+    // 作用域指向 workspace 外，必然匹配不到任何代码块。
+    let response = engine
+        .search(&SearchRequest {
+            query: "retry".to_string(),
+            scope: ScopeFilter {
+                include: vec!["/etc/**".to_string()],
+                ..ScopeFilter::default()
+            },
+            mode: SearchMode::Fast,
+            max_results: Some(5),
+            token_budget: None,
+        })
+        .await
+        .expect("搜索");
+
+    assert!(
+        response.results.is_empty(),
+        "workspace 外的作用域不能返回结果"
+    );
+    assert!(response.status.degraded, "向量召回未执行应报告降级");
+    assert!(
+        !response.status.reasons.is_empty(),
+        "degraded=true 时必须说明原因，否则调用方无法判断是工具故障还是作用域为空"
+    );
+
+    // 正常查询不应该被误报为降级。
+    let healthy = engine
+        .search(&search_request("RetryPolicy"))
+        .await
+        .expect("搜索");
+    assert!(!healthy.results.is_empty());
+    assert!(
+        !healthy.status.degraded,
+        "语义索引完整时不应报告降级: {:?}",
+        healthy.status.reasons
+    );
+}
