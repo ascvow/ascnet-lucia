@@ -23,6 +23,14 @@ const CUTOFFS: [usize; 3] = [1, 3, 5];
 /// 每次查询取回的结果数，需不小于最大 cutoff。
 const MAX_RESULTS: usize = 10;
 
+/// 从评测作用域中排除的路径。
+///
+/// 就地索引本仓库时，查询集文件本身也会被索引。它逐字包含每一条查询文本
+/// **以及**标注好的期望路径，于是稳定地成为自己那条查询的头部结果——
+/// 这是测量装置的自我污染，不是检索能力。两条通路都受影响，
+/// 排除它才能让排名反映代码检索本身。
+const EXCLUDE_FROM_EVAL: &[&str] = &["eval/**"];
+
 /// 一条标注查询。
 #[derive(serde::Deserialize)]
 struct Case {
@@ -151,7 +159,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for case in &set.queries {
         let request = SearchRequest {
             query: case.query.clone(),
-            scope: ScopeFilter::default(),
+            scope: ScopeFilter {
+                exclude: EXCLUDE_FROM_EVAL.iter().map(|p| p.to_string()).collect(),
+                ..ScopeFilter::default()
+            },
             mode: SearchMode::Fast,
             max_results: Some(MAX_RESULTS),
             token_budget: None,

@@ -308,12 +308,12 @@ score(d) = Σ weight_i / (k + rank_i(d))
 ### 检查
 
 ```bash
-cargo fmt --all -- --check                              # 通过
+cargo fmt --all -- --check                               # 通过
 cargo clippy --all-features --all-targets -- -D warnings # 通过，无告警
-cargo test --all-features                                # 197 passed; 0 failed
+cargo test --all-features                                # 200 passed; 0 failed
 ```
 
-测试分布：单元测试 161、`end_to_end` 10、`http_provider` 18、`mcp_stdio` 6、
+测试分布：单元测试 164、`end_to_end` 10、`http_provider` 18、`mcp_stdio` 6、
 `real_model_smoke` 2（无凭证时跳过并打印说明）。
 
 Embedding 测试分层：单元测试用确定性 Mock Provider；HTTP Provider 用本地测试服务器
@@ -321,21 +321,25 @@ Embedding 测试分层：单元测试用确定性 Mock Provider；HTTP Provider 
 
 ### 真实模型（硅基流动 `BAAI/bge-m3`）
 
-从零索引本工具自身源码（含测试与 fixture）：
+从零索引本工具自身源码（含测试与 fixture），release 构建，
+`batch_size=16`、`max_concurrency=1`：
 
 ```
-57 个文件 → 873 个代码块，873 个向量全部生成成功，pending 0，failed 0，degraded=false
-实测约 7.9s（debug 构建，batch_size=16，max_concurrency=2）
+57 个文件 → 875 个代码块，875 个向量全部生成成功，pending 0，failed 0，degraded=false
+目录扫描 80 ms，整体 14.1s（绝大部分是等待 Embedding 服务）
+无变更时再跑一次 index：目录扫描 1 ms，整体 0.01s，不重新请求模型
 ```
 
-自然语言查询实测（结果为命中的文件与符号）：
+自然语言查询实测 Top-1（`--max-results 1`，排除了下节说明的 `eval/`）：
 
-| 查询 | Top-1 结果 |
-| --- | --- |
-| 崩溃恢复时如何重放向量更新日志 | `src/vector/mod.rs` `VectorIndex::apply` |
-| 怎么保证旧版本代码不会被当成当前代码返回 | `src/context/mod.rs` `CodeRef` |
-| API Key 是怎么读取的 | `src/models/http.rs` `read_api_key` |
-| RRF 融合 | `src/retrieval/fusion.rs` |
+| 查询 | Top-1 结果 | 命中通路 |
+| --- | --- | --- |
+| API Key 是从哪里读取的 | `src/models/http.rs` `read_api_key` | symbol+fts+vector |
+| 多路召回的结果是怎么合并排序的 | `src/retrieval/fusion.rs` `RecallList, Candidate` | fts+vector |
+| 哪些文件会被跳过不索引 | `src/workspace/scan.rs` `SkippedFile, ScanOutput, …` | fts+vector |
+
+注意第 2、3 行的 `symbol` 是一个**列表**：小型容器会整体保留为一个代码块，
+并用块内全部符号标注，而不是把父节点和每个子节点重复索引成大量相同代码。
 
 ### 评测：FTS-only vs Hybrid
 
@@ -348,19 +352,37 @@ export SILICONFLOW_API_KEY=...
 cargo run --release --example eval -- --root . --queries eval/queries.json
 ```
 
+评测会把 `eval/**` 排除在作用域外。就地索引本仓库时查询集文件本身也会被索引，
+而它逐字包含每一条查询**以及**标注好的期望路径，于是稳定地成为自己那条查询的头部结果。
+那是测量装置在污染自己，不是检索能力，所以必须排除。
+
 本次实际结果：
 
 | 指标 | FTS-only | Hybrid |
 | --- | --- | --- |
-| Recall@1 | 0.200 | 0.300 |
-| Recall@3 | 0.650 | 0.700 |
+| Recall@1 | 0.400 | **0.550** |
+| Recall@3 | **0.800** | 0.750 |
 | Recall@5 | 0.800 | 0.800 |
-| MRR | 0.441 | 0.505 |
+| MRR | 0.577 | **0.645** |
 
 **这些数字只反映本次运行在这 20 条人工标注样本上的表现，不能外推为通用检索质量结论。**
-查询集很小，主要用途是同一份代码上的回归对比。其中 2 条查询
-（"同一个目录被两个进程同时打开会怎样"、"文件保存后多久会被重新索引"）
-两种配置都未命中，属于已知短板。
+查询集很小，主要用途是同一份代码上的回归对比。
+
+结果不是单方面的，值得如实说明：混合检索把更多正确答案顶到了第 1 位
+（Recall@1 0.400 → 0.550，MRR 0.577 → 0.645），但 **Recall@3 反而下降**
+（0.800 → 0.750）。20 条里 8 条排名上升、3 条下降：
+
+- "请求超时和重试是怎么配置的" `#1 → #7`
+- "数据库表结构定义在哪" `#1 → #3`
+- "怎么把驼峰和下划线命名拆成搜索词" `#3 → 未命中`
+
+这三条 FTS 本来就靠关键词精确命中，语义近邻引入的相关块把它们挤了下去。
+`exact_reserve` 只保护完整符号的精确命中，护不住这类普通关键词查询。
+这是当前融合权重的真实代价，没有调参去掩盖它。
+
+另有 2 条查询（"同一个目录被两个进程同时打开会怎样"、"文件保存后多久会被重新索引"）
+两种配置都未命中标注路径。实际返回的是 README 中对应的说明小节——
+对人来说是合理答案，但标注只认源码文件。这既是已知短板，也是小样本标注的局限。
 
 ---
 

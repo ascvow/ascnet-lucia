@@ -14,10 +14,16 @@ pub enum Language {
     /// Rust（Tree-sitter 结构化解析）。
     Rust,
     /// TypeScript（Tree-sitter 结构化解析）。
+    ///
+    /// 显式重命名：`snake_case` 会得到 `type_script`，既与 [`Language::as_str`]
+    /// 不一致，也无法被 [`Language::parse_filter`] 接受，Agent 把结果里的
+    /// `language` 原样当作过滤值就会失败。
+    #[serde(rename = "typescript")]
     TypeScript,
     /// TSX（Tree-sitter 结构化解析）。
     Tsx,
     /// JavaScript / JSX（Tree-sitter 结构化解析）。
+    #[serde(rename = "javascript")]
     JavaScript,
     /// Markdown（按标题分块）。
     Markdown,
@@ -584,6 +590,66 @@ mod tests {
         }
         assert_eq!(Language::from_str_opt("RS"), Some(Language::Rust));
         assert!(Language::parse_filter("cobol").is_err());
+    }
+
+    /// JSON 表示、`as_str` 与过滤值解析必须是同一套标识。
+    ///
+    /// 三者一旦分叉，Agent 把搜索结果里的 `language` 直接当作过滤值就会报错。
+    #[test]
+    fn language_json_matches_as_str_and_is_accepted_as_a_filter() {
+        for language in [
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Markdown,
+            Language::Text,
+        ] {
+            let json = serde_json::to_value(language).expect("序列化");
+            let text = json.as_str().expect("语言应序列化为字符串");
+            assert_eq!(text, language.as_str(), "JSON 表示与 as_str 不一致");
+            assert_eq!(
+                Language::parse_filter(text).expect("JSON 值必须能当作过滤值"),
+                language
+            );
+        }
+    }
+
+    /// 其余对外枚举同样要求 JSON 表示与稳定标识一致。
+    #[test]
+    fn chunk_kind_and_match_source_json_match_as_str() {
+        for kind in [
+            ChunkKind::Function,
+            ChunkKind::Method,
+            ChunkKind::Struct,
+            ChunkKind::Enum,
+            ChunkKind::Trait,
+            ChunkKind::Impl,
+            ChunkKind::Module,
+            ChunkKind::TypeAlias,
+            ChunkKind::Const,
+            ChunkKind::Imports,
+            ChunkKind::Overview,
+            ChunkKind::Part,
+            ChunkKind::Section,
+            ChunkKind::Text,
+        ] {
+            let json = serde_json::to_value(kind).expect("序列化");
+            assert_eq!(json.as_str(), Some(kind.as_str()));
+        }
+        for source in [
+            MatchSource::Symbol,
+            MatchSource::Path,
+            MatchSource::Literal,
+            MatchSource::Fts,
+            MatchSource::Vector,
+            MatchSource::Expanded,
+        ] {
+            let json = serde_json::to_value(source).expect("序列化");
+            assert_eq!(json.as_str(), Some(source.as_str()));
+        }
+        let json = serde_json::to_value(SearchMode::Fast).expect("序列化");
+        assert_eq!(json.as_str(), Some(SearchMode::Fast.as_str()));
     }
 
     #[test]
