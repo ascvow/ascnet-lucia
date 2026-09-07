@@ -19,6 +19,8 @@
 需要：
 
 - Rust 1.89 或更高（`rust-version = "1.89"`；本次开发使用 rustc 1.96.1）。
+  这个下界来自 workspace 写锁：它用标准库的 `File::try_lock`（1.89 稳定），
+  因此不必为文件锁引入第三方依赖。
 - 一个支持 **C++17** 的 C/C++ 工具链。`usearch` 通过 `cc` 编译 C++ 源码，
   `rusqlite` 使用 `bundled` 特性从 C 源码编译 SQLite（含 FTS5），`tree-sitter` 语法同样需要 C 编译器。
   **不需要** cmake。
