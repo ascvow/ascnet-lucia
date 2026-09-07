@@ -676,6 +676,11 @@ pub struct IndexReport {
     pub current_chunks: i64,
     /// 目录索引耗时毫秒。
     pub catalog_duration_ms: i64,
+    /// 本次是否因分块器升级而强制全量重新分块。
+    ///
+    /// 为真时本次耗时会明显高于普通增量索引，属于预期行为。
+    #[serde(default)]
+    pub rechunked: bool,
     /// 本次新生成的 Embedding 数量。
     pub embeddings_created: i64,
     /// 命中缓存复用的 Embedding 数量。

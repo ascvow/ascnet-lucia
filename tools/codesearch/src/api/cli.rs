@@ -224,6 +224,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     report.skipped.len(),
                     report.catalog_duration_ms
                 );
+                if report.rechunked {
+                    println!("说明：分块器已升级，本次全量重建分块，后续恢复增量");
+                }
                 println!(
                     "当前代码块 {}，语义索引：新生成 {}，命中缓存 {}，等待 {}，失败 {}",
                     report.current_chunks,

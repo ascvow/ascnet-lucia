@@ -70,6 +70,15 @@ fn handle_node(
         "export_statement" => {
             if let Some(declaration) = node.child_by_field_name("declaration") {
                 handle_node(ctx, outer, declaration, scope, parent_symbol, out, imports);
+                return;
+            }
+            // `export default { methods: { submit() {} } }`：Vue 2 选项式组件的写法，
+            // 没有 declaration 字段，成员藏在对象字面量里。
+            if let Some(value) = node.child_by_field_name("value") {
+                if value.kind() == "object" {
+                    let lead = leading(ctx, outer);
+                    out.extend(object_members(ctx, value, scope, None, lead.doc.as_deref()));
+                }
             }
         }
         // `declare module 'x' {}` / `declare global {}` / `declare function f()`。
@@ -82,10 +91,18 @@ fn handle_node(
         }
         // `namespace X {}` 在语法树中包在 expression_statement 里。
         "expression_statement" => {
-            if let Some(child) = node.named_child(0) {
-                if matches!(child.kind(), "internal_module" | "module") {
-                    handle_node(ctx, outer, child, scope, parent_symbol, out, imports);
-                }
+            let Some(child) = node.named_child(0) else {
+                return;
+            };
+            if matches!(child.kind(), "internal_module" | "module") {
+                handle_node(ctx, outer, child, scope, parent_symbol, out, imports);
+                return;
+            }
+            // AMD / UMD / IIFE 模块包装：整个文件的代码都在包装函数体内，
+            // 不穿过去就提取不到任何符号。实测 FastAdmin 后台的自有 JS
+            // 全部是 `define([...], function () { ... })` 写法。
+            for body in module_wrapper_bodies(ctx, child) {
+                walk(ctx, body, scope, parent_symbol, out, imports);
             }
         }
         "class_declaration" | "abstract_class_declaration" => {
@@ -149,6 +166,180 @@ fn handle_node(
 
 fn leading(ctx: &Context<'_>, node: Node<'_>) -> crate::parser::Leading {
     ctx.leading(node, |kind| kind == "comment", |kind| kind == "decorator")
+}
+
+/// 找出模块包装调用的函数体，作为模块作用域继续提取声明。
+///
+/// 只认三种确定的包装形态，不对任意调用下钻——`router.beforeEach(cb)` 这类
+/// 回调是处理器而非模块作用域，把里面的局部变量提成顶层符号只会污染符号表：
+///
+/// 1. `define([...], function () { ... })` / `require([...], function () { ... })`；
+/// 2. `(function () { ... })()` 立即执行函数；
+/// 3. UMD 的 `(function (root, factory) { ... })(this, function () { ... })`，
+///    包装函数与工厂函数都要进入。
+///
+/// 只穿过这一层：函数体内的嵌套函数由常规规则按子定义处理，不会无限展开。
+fn module_wrapper_bodies<'tree>(ctx: &Context<'_>, node: Node<'tree>) -> Vec<Node<'tree>> {
+    // `!function(){}()` 这类前缀写法先剥掉一元运算符。
+    let node = if node.kind() == "unary_expression" {
+        node.named_child(0).unwrap_or(node)
+    } else {
+        node
+    };
+    if node.kind() != "call_expression" {
+        return Vec::new();
+    }
+    let Some(callee) = node.child_by_field_name("function") else {
+        return Vec::new();
+    };
+
+    let callee_is_function = unwrap_function(callee).is_some();
+    let callee_is_loader =
+        callee.kind() == "identifier" && matches!(ctx.text(callee), "define" | "require");
+    if !callee_is_function && !callee_is_loader {
+        return Vec::new();
+    }
+
+    let mut bodies = Vec::new();
+    if let Some(function) = unwrap_function(callee) {
+        if let Some(body) = function.child_by_field_name("body") {
+            bodies.push(body);
+        }
+    }
+    if let Some(arguments) = node.child_by_field_name("arguments") {
+        let mut cursor = arguments.walk();
+        for argument in arguments.named_children(&mut cursor) {
+            if let Some(function) = unwrap_function(argument) {
+                if let Some(body) = function.child_by_field_name("body") {
+                    bodies.push(body);
+                }
+            }
+        }
+    }
+    bodies
+}
+
+/// 取出函数节点，必要时剥掉外层括号。
+fn unwrap_function<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    let node = if node.kind() == "parenthesized_expression" {
+        node.named_child(0)?
+    } else {
+        node
+    };
+    matches!(
+        node.kind(),
+        "function_expression" | "function" | "arrow_function" | "generator_function"
+    )
+    .then_some(node)
+}
+
+/// 提取对象字面量里的函数成员。
+///
+/// 覆盖两种常见写法：`var Controller = { index: function () {} }`（FastAdmin 后台）
+/// 与 `export default { methods: { submit() {} } }`（Vue 2 选项式组件）。
+/// 这两种写法下真正的入口全部是对象属性，不提取就一个符号都没有。
+///
+/// `container` 为 `None` 时不加前缀——`export default` 的对象没有可用名字，
+/// 强行拼一个只会让符号查询更难命中。
+fn object_members(
+    ctx: &Context<'_>,
+    object: Node<'_>,
+    scope: &[String],
+    container: Option<&str>,
+    doc: Option<&str>,
+) -> Vec<Definition> {
+    collect_object_members(ctx, object, scope, container, doc, 3)
+}
+
+fn collect_object_members(
+    ctx: &Context<'_>,
+    object: Node<'_>,
+    scope: &[String],
+    container: Option<&str>,
+    doc: Option<&str>,
+    depth: usize,
+) -> Vec<Definition> {
+    if depth == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cursor = object.walk();
+    for member in object.named_children(&mut cursor) {
+        match member.kind() {
+            // `submit() {}` 简写方法。
+            "method_definition" => {
+                if let Some(definition) = object_method(ctx, member, member, scope, container, doc)
+                {
+                    out.push(definition);
+                }
+            }
+            // `submit: function () {}` 与 `methods: { ... }`。
+            "pair" => {
+                let Some(value) = member.child_by_field_name("value") else {
+                    continue;
+                };
+                if unwrap_function(value).is_some() {
+                    if let Some(definition) =
+                        object_method(ctx, member, value, scope, container, doc)
+                    {
+                        out.push(definition);
+                    }
+                } else if value.kind() == "object" {
+                    // `methods: {}` / `computed: {}` 这类分组再下一层。
+                    out.extend(collect_object_members(
+                        ctx,
+                        value,
+                        scope,
+                        container,
+                        None,
+                        depth - 1,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn object_method(
+    ctx: &Context<'_>,
+    member: Node<'_>,
+    value: Node<'_>,
+    scope: &[String],
+    container: Option<&str>,
+    doc: Option<&str>,
+) -> Option<Definition> {
+    let name = ctx
+        .field_text(member, "key")
+        .or_else(|| ctx.field_text(member, "name"))?
+        .trim_matches(['"', '\'', '`'])
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let body = unwrap_function(value).and_then(|f| f.child_by_field_name("body"));
+    let lead = leading(ctx, member);
+    let qualified = match container {
+        Some(container) => format!("{container}.{name}"),
+        None => ctx.qualify(scope, &name),
+    };
+    Some(Definition {
+        kind: ChunkKind::Method,
+        qualified,
+        name,
+        parent: container.map(str::to_string),
+        module_path: module_path(scope),
+        signature: ctx.signature(member, body),
+        doc: lead.doc.or_else(|| doc.map(str::to_string)),
+        start_byte: lead.start_byte,
+        end_byte: member.end_byte(),
+        start_line: lead.start_line,
+        end_line: member.end_position().row as u32 + 1,
+        body_start_byte: body.map(|b| b.start_byte()),
+        split_points: ctx.split_points(body),
+        children: Vec::new(),
+    })
 }
 
 fn body_of(node: Node<'_>) -> Option<Node<'_>> {
@@ -311,9 +502,16 @@ fn variable(
     // 只有函数型常量才值得单独成块；普通常量交给相邻声明合并逻辑处理。
     let body = value.and_then(body_of);
     let lead = leading(ctx, outer);
+    let qualified = ctx.qualify(scope, &name);
+    // `var Controller = { index: function () {} }`：对象的函数成员就是模块入口，
+    // 作为子定义登记后 `Controller.index` 才能走符号通路命中。
+    let children = value
+        .filter(|value| value.kind() == "object")
+        .map(|value| object_members(ctx, value, scope, Some(&qualified), None))
+        .unwrap_or_default();
     Some(Definition {
         kind,
-        qualified: ctx.qualify(scope, &name),
+        qualified,
         name,
         parent: parent_symbol.map(str::to_string),
         module_path: module_path(scope),
@@ -325,7 +523,7 @@ fn variable(
         end_line: outer.end_position().row as u32 + 1,
         body_start_byte: body.map(|b| b.start_byte()),
         split_points: ctx.split_points(body),
-        children: Vec::new(),
+        children,
     })
 }
 
@@ -482,6 +680,113 @@ namespace Inner {
         let parsed = parse(Language::Tsx, tsx).expect("parse tsx");
         assert!(!parsed.has_errors, "TSX 应由 TSX 语法解析");
         assert_eq!(parsed.definitions[0].name, "View");
+    }
+
+    /// AMD 模块包装必须穿过，对象成员必须提取。
+    ///
+    /// 回归：FastAdmin 后台的自有 JS 全部是 `define([...], function () { var Controller = {...} })`，
+    /// 所有代码都在包装函数体内且入口都是对象属性。此前实测某项目自有 JS 共 11080 行、
+    /// 符号覆盖 0%，`Controller.index` 这类最常被搜索的入口一个都命中不了。
+    #[test]
+    fn amd_module_and_object_members_yield_symbols() {
+        let source = r#"define(['jquery', 'backend'], function ($, Backend) {
+    var Controller = {
+        index: function () {
+            Table.api.init({ index_url: 'addon/index' });
+        },
+        add: function () {
+            Controller.api.bindevent();
+        },
+        api: {
+            bindevent: function () {
+                Form.api.bindevent($("form[role=form]"));
+            }
+        }
+    };
+    return Controller;
+});
+"#;
+        let parsed = parse(Language::JavaScript, source).expect("parse");
+        let mut names = Vec::new();
+        fn push(definitions: &[crate::parser::Definition], out: &mut Vec<String>) {
+            for definition in definitions {
+                out.push(definition.qualified.clone());
+                push(&definition.children, out);
+            }
+        }
+        push(&parsed.definitions, &mut names);
+
+        assert!(names.contains(&"Controller".to_string()), "{names:?}");
+        assert!(names.contains(&"Controller.index".to_string()), "{names:?}");
+        assert!(names.contains(&"Controller.add".to_string()), "{names:?}");
+        // 分组对象里的方法也要提取。
+        assert!(
+            names.contains(&"Controller.bindevent".to_string()),
+            "{names:?}"
+        );
+
+        // 行号必须落在真实位置上。
+        let index = parsed.definitions[0]
+            .children
+            .iter()
+            .find(|d| d.name == "index")
+            .expect("index");
+        assert!(source[index.start_byte..index.end_byte].starts_with("index: function"));
+    }
+
+    /// IIFE / UMD 包装同样要穿过。
+    #[test]
+    fn iife_and_umd_wrappers_are_traversed() {
+        let iife = "(function ($) {\n  function helper() {}\n  var Widget = { run: function () {} };\n})(jQuery);\n";
+        let parsed = parse(Language::JavaScript, iife).expect("parse");
+        let names: Vec<&str> = parsed.definitions.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"helper"), "{names:?}");
+        assert!(names.contains(&"Widget"), "{names:?}");
+
+        let umd = "(function (root, factory) {\n  module.exports = factory();\n})(this, function () {\n  function core() {}\n  return core;\n});\n";
+        let parsed = parse(Language::JavaScript, umd).expect("parse");
+        let names: Vec<&str> = parsed.definitions.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"core"), "工厂函数体未进入: {names:?}");
+    }
+
+    /// 普通回调不得被当成模块作用域下钻。
+    ///
+    /// `router.beforeEach(cb)` 里的局部变量不是模块导出，提成顶层符号只会污染符号表。
+    #[test]
+    fn ordinary_callbacks_are_not_treated_as_module_scopes() {
+        let source =
+            "router.beforeEach(function (to, from, next) {\n  var localOnly = 1;\n  function innerHelper() {}\n  next();\n});\n";
+        let parsed = parse(Language::JavaScript, source).expect("parse");
+        let names: Vec<&str> = parsed.definitions.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            !names.contains(&"localOnly") && !names.contains(&"innerHelper"),
+            "普通回调内部不应产出顶层符号: {names:?}"
+        );
+    }
+
+    /// Vue 2 选项式组件的方法要能被搜到。
+    #[test]
+    fn vue_options_api_methods_are_extracted() {
+        let source = r#"export default {
+  name: "LoginPage",
+  data() {
+    return { username: "" };
+  },
+  methods: {
+    async submit() {
+      await this.$store.dispatch("login");
+    },
+    reset() {
+      this.username = "";
+    }
+  }
+};
+"#;
+        let parsed = parse(Language::JavaScript, source).expect("parse");
+        let names: Vec<&str> = parsed.definitions.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"submit"), "{names:?}");
+        assert!(names.contains(&"reset"), "{names:?}");
+        assert!(names.contains(&"data"), "{names:?}");
     }
 
     /// `.d.ts` 声明文件必须能提取出符号。

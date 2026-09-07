@@ -294,6 +294,7 @@ impl Engine {
             scanned_files: catalog.scanned,
             changed_files: catalog.changed,
             unchanged_files: catalog.unchanged,
+            rechunked: catalog.rechunked,
             removed_files: catalog.removed,
             skipped: catalog.skipped,
             current_chunks: counters.current_chunks,

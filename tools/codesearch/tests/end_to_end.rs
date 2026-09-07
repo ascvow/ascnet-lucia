@@ -829,3 +829,47 @@ async fn exact_method_beats_its_container_overview() {
         top.content
     );
 }
+
+/// 分块器升级后必须强制重建分块。
+///
+/// 增量索引按文件大小与 mtime 判断跳过，发现不了"分块方式"变了。新增语言支持后，
+/// 未改动过的文件会一直留着旧分块——升级完仍然零符号且没有任何提示。
+#[tokio::test(flavor = "multi_thread")]
+async fn chunker_upgrade_forces_reindex_of_unchanged_files() {
+    let repo = sample_repo();
+    let engine = open_engine(repo.path(), true).await;
+
+    let first = engine.index(false).await.expect("首次索引");
+    assert!(first.changed_files > 0);
+    assert!(!first.rechunked, "首次索引不是重建");
+
+    // 源码没有任何改动：普通增量应当全部跳过。
+    let incremental = engine.index(false).await.expect("增量索引");
+    assert_eq!(incremental.changed_files, 0, "源码未变时不应重新分块");
+    assert!(!incremental.rechunked);
+    drop(engine);
+
+    // 模拟升级到新版分块器：把索引里记录的版本改成旧值。
+    let db_path = repo.path().join(".codesearch").join("index.db");
+    {
+        let store = codesearch::store::Store::open(&db_path, false).expect("打开索引");
+        store.set_meta("chunker_version", "0").expect("写入旧版本");
+    }
+
+    let engine = open_engine(repo.path(), true).await;
+    let upgraded = engine.index(false).await.expect("升级后索引");
+    assert!(upgraded.rechunked, "版本不一致时必须标记为重建");
+    assert_eq!(
+        upgraded.changed_files, first.changed_files,
+        "所有文件都应重新分块，而不是只处理源码有改动的"
+    );
+    assert_eq!(
+        upgraded.current_chunks, first.current_chunks,
+        "重建后代码块数应与首次索引一致"
+    );
+
+    // 重建之后恢复增量，不能每次都全量。
+    let after = engine.index(false).await.expect("重建后的增量索引");
+    assert_eq!(after.changed_files, 0, "重建后应恢复增量");
+    assert!(!after.rechunked);
+}

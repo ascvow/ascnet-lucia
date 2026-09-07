@@ -588,7 +588,9 @@ pub(crate) static RUBY: LanguageSpec = LanguageSpec {
 };
 
 pub(crate) static PHP: LanguageSpec = LanguageSpec {
-    separator: "\\",
+    // PHP 用 `\` 分隔命名空间、用 `::` 分隔类成员。限定名里出现的几乎都是后者，
+    // 且 `Token::check` 正是调用点的写法，也是搜索时会输入的形式。
+    separator: "::",
     containers: &[
         ("namespace_definition", ChunkKind::Module),
         ("class_declaration", ChunkKind::Struct),

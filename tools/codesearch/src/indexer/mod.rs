@@ -38,6 +38,20 @@ const PREPARE_BATCH: usize = 64;
 /// 单次 Embedding 处理的最大代码块数，避免一次拉取过多待办。
 const EMBED_PASS_LIMIT: usize = 512;
 
+/// 解析与分块产物的版本。
+///
+/// 增量索引按文件大小与 mtime 判断是否跳过，只能发现**源码**的变化，发现不了
+/// **分块方式**的变化。新增语言支持或改动分块规则后，未改动过的文件会一直留着
+/// 旧分块：升级完仍然零符号，而且没有任何提示。因此把版本记在索引里，
+/// 不一致就强制全量重新分块。
+///
+/// 修改 `parser`、`chunker` 或语言识别，使同一份源码产出不同分块时必须递增。
+/// 这与 `SCHEMA_VERSION` 是两个维度：schema 描述表结构，本项描述表内容的产出方式。
+const CHUNKER_VERSION: i64 = 1;
+
+/// 记录分块器版本的元数据键。
+const META_CHUNKER_VERSION: &str = "chunker_version";
+
 /// 目录索引阶段的统计。
 #[derive(Debug, Clone, Default)]
 pub struct CatalogStats {
@@ -53,6 +67,8 @@ pub struct CatalogStats {
     pub skipped: Vec<SkippedFile>,
     /// 耗时毫秒。
     pub duration_ms: i64,
+    /// 是否因分块器升级而强制全量重新分块。
+    pub rechunked: bool,
 }
 
 /// Embedding 阶段的统计。
@@ -136,9 +152,17 @@ pub fn refresh_catalog(
     let started = std::time::Instant::now();
     let scan = scan_workspace(workspace, config)?;
     let catalog = store.catalog()?;
+
+    // 分块器升级后旧分块全部作废：内容 Hash 没变，只能靠版本号发现。
+    let indexed_version = store
+        .meta(META_CHUNKER_VERSION)?
+        .and_then(|value| value.parse::<i64>().ok());
+    let rechunk_all = indexed_version != Some(CHUNKER_VERSION) && !catalog.is_empty();
+
     let mut stats = CatalogStats {
         scanned: scan.files.len() as i64,
         skipped: scan.skipped.clone(),
+        rechunked: rechunk_all,
         ..Default::default()
     };
 
@@ -156,6 +180,7 @@ pub fn refresh_catalog(
     let mut to_process: Vec<&ScannedFile> = Vec::new();
     for file in &scan.files {
         let unchanged_metadata = !verify
+            && !rechunk_all
             && catalog.get(&file.rel_path).is_some_and(|entry| {
                 entry.state == crate::store::FileState::Active
                     && entry.size == file.size as i64
@@ -168,10 +193,15 @@ pub fn refresh_catalog(
         }
     }
 
-    let known_hashes: HashMap<&str, Option<&str>> = catalog
-        .iter()
-        .map(|(path, entry)| (path.as_str(), entry.file_hash.as_deref()))
-        .collect();
+    // 重新分块时必须连内容 Hash 的短路也一起绕开：源码没变，要重做的是分块。
+    let known_hashes: HashMap<&str, Option<&str>> = if rechunk_all {
+        HashMap::new()
+    } else {
+        catalog
+            .iter()
+            .map(|(path, entry)| (path.as_str(), entry.file_hash.as_deref()))
+            .collect()
+    };
 
     for batch in to_process.chunks(PREPARE_BATCH) {
         for prepared in prepare_batch(config, batch, &known_hashes)? {
@@ -222,6 +252,9 @@ pub fn refresh_catalog(
             stats.removed += 1;
         }
     }
+
+    // 整轮走完才落版本号：中途失败时下次仍会重新分块，不会留下半新半旧的索引。
+    store.set_meta(META_CHUNKER_VERSION, &CHUNKER_VERSION.to_string())?;
 
     stats.duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     Ok(stats)
