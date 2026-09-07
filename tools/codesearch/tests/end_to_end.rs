@@ -873,3 +873,58 @@ async fn chunker_upgrade_forces_reindex_of_unchanged_files() {
     assert_eq!(after.changed_files, 0, "重建后应恢复增量");
     assert!(!after.rechunked);
 }
+
+/// 查询不得触发重建分块，否则一次搜索就让整个仓库的语义检索掉线。
+///
+/// 查询路径不做 Embedding，重新分块会作废全部向量关联。正确做法是继续用旧分块
+/// 并在降级说明里告诉用户执行 index，而不是在用户毫无预期时自伤。
+#[tokio::test(flavor = "multi_thread")]
+async fn search_does_not_rebuild_chunks_and_says_what_to_run() {
+    let repo = sample_repo();
+    let server = EmbeddingServer::start().await;
+    // 这条用例验证的正是查询前那次增量扫描的行为，必须开启。
+    write_file(
+        &repo.path().join("codesearch.toml"),
+        &config_toml(server.base_url(), "")
+            .replace("refresh_on_search = false", "refresh_on_search = true"),
+    );
+
+    let engine = open_engine(repo.path(), false).await;
+    engine.index(false).await.expect("首次索引");
+    let before = engine
+        .search(&search_request("retry"))
+        .await
+        .expect("重建前查询");
+    assert!(before.status.vector_search_used, "基线：语义检索本应可用");
+    drop(engine);
+
+    // 模拟升级到新版分块器。
+    let db_path = repo.path().join(".codesearch").join("index.db");
+    {
+        let store = codesearch::store::Store::open(&db_path, false).expect("打开索引");
+        store.set_meta("chunker_version", "0").expect("写入旧版本");
+    }
+
+    let engine = open_engine(repo.path(), false).await;
+    let response = engine
+        .search(&search_request("retry"))
+        .await
+        .expect("版本落后时查询");
+    assert!(
+        response.status.vector_search_used,
+        "查询不该把自己的向量索引作废"
+    );
+    assert!(
+        response
+            .status
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("codesearch index")),
+        "应当说明需要执行什么: {:?}",
+        response.status.reasons
+    );
+
+    // 提示仍然有效：查询没有偷偷把版本号写成新的。
+    let report = engine.index(false).await.expect("按提示重建");
+    assert!(report.rechunked, "显式索引时才真正重建");
+}

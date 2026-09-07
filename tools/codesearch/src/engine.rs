@@ -385,10 +385,20 @@ impl Engine {
         // 写模式下先做一次增量扫描，让刚保存的文件能被搜到。
         if self.writable && self.config.index.refresh_on_search {
             let mut guard = lock_store(&self.store)?;
-            if let Err(error) =
-                indexer::refresh_catalog(&mut guard, &self.workspace, &self.config, false)
-            {
-                notes.push(format!("查询前增量扫描失败: {error}"));
+            // 查询路径不重建分块：那会作废全部向量关联，而这里不做 Embedding。
+            match indexer::refresh_catalog_with(
+                &mut guard,
+                &self.workspace,
+                &self.config,
+                false,
+                false,
+            ) {
+                Ok(stats) if stats.stale_chunker => notes.push(
+                    "索引由旧版分块器产出，部分符号可能缺失，请执行 codesearch index 重建"
+                        .to_string(),
+                ),
+                Ok(_) => {}
+                Err(error) => notes.push(format!("查询前增量扫描失败: {error}")),
             }
         }
 

@@ -69,6 +69,10 @@ pub struct CatalogStats {
     pub duration_ms: i64,
     /// 是否因分块器升级而强制全量重新分块。
     pub rechunked: bool,
+    /// 索引里的分块是否由旧版分块器产出且本次未重建。
+    ///
+    /// 查询路径不允许重建，因此这里为真时结果基于旧分块，需要提示用户跑一次索引。
+    pub stale_chunker: bool,
 }
 
 /// Embedding 阶段的统计。
@@ -149,6 +153,22 @@ pub fn refresh_catalog(
     config: &Config,
     verify: bool,
 ) -> Result<CatalogStats> {
+    refresh_catalog_with(store, workspace, config, verify, true)
+}
+
+/// 与 `refresh_catalog` 相同，但可以关闭分块器升级触发的全量重建。
+///
+/// 查询路径必须传 `false`。重新分块会作废全部代码块的向量关联，而查询进程
+/// 不做 Embedding，一次搜索就会让整个仓库的语义检索掉线，直到用户手动跑
+/// 一次 index。与其在用户毫无预期时自伤，不如让查询继续用旧分块，
+/// 由降级说明告诉他该执行什么。
+pub fn refresh_catalog_with(
+    store: &mut Store,
+    workspace: &Workspace,
+    config: &Config,
+    verify: bool,
+    allow_rechunk: bool,
+) -> Result<CatalogStats> {
     let started = std::time::Instant::now();
     let scan = scan_workspace(workspace, config)?;
     let catalog = store.catalog()?;
@@ -157,12 +177,14 @@ pub fn refresh_catalog(
     let indexed_version = store
         .meta(META_CHUNKER_VERSION)?
         .and_then(|value| value.parse::<i64>().ok());
-    let rechunk_all = indexed_version != Some(CHUNKER_VERSION) && !catalog.is_empty();
+    let stale_chunker = indexed_version != Some(CHUNKER_VERSION) && !catalog.is_empty();
+    let rechunk_all = stale_chunker && allow_rechunk;
 
     let mut stats = CatalogStats {
         scanned: scan.files.len() as i64,
         skipped: scan.skipped.clone(),
         rechunked: rechunk_all,
+        stale_chunker: stale_chunker && !allow_rechunk,
         ..Default::default()
     };
 
@@ -254,7 +276,10 @@ pub fn refresh_catalog(
     }
 
     // 整轮走完才落版本号：中途失败时下次仍会重新分块，不会留下半新半旧的索引。
-    store.set_meta(META_CHUNKER_VERSION, &CHUNKER_VERSION.to_string())?;
+    // 本次没被允许重建时不能落盘，否则待办的重建就被永久遗忘了。
+    if !stale_chunker || rechunk_all {
+        store.set_meta(META_CHUNKER_VERSION, &CHUNKER_VERSION.to_string())?;
+    }
 
     stats.duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     Ok(stats)
