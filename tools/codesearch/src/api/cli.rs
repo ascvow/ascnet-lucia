@@ -68,7 +68,10 @@ pub struct ScopeArgs {
     #[arg(long)]
     pub exclude: Vec<String>,
 
-    /// 仅搜索这些语言，可重复（rust/typescript/tsx/javascript/markdown/text）。
+    /// 仅搜索这些语言，可重复。
+    ///
+    /// 可用值见 `Language::ALL`；非法值会在解析时列出全部取值，
+    /// 因此这里不再重复维护一份容易过期的清单。
     #[arg(long = "language")]
     pub languages: Vec<String>,
 }
