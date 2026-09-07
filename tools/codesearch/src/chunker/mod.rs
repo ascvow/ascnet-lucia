@@ -15,7 +15,7 @@ use crate::config::ChunkConfig;
 use crate::error::Result;
 use crate::parser::{Definition, ParsedFile};
 use crate::retrieval::tokenize::build_fts_text;
-use crate::store::{PreparedChunk, SymbolRecord};
+use crate::store::{ImportRecord, PreparedChunk, SymbolRecord};
 use crate::types::{estimate_tokens, ChunkKind, Language};
 
 /// Embedding 输入模板版本。修改模板结构必须递增本常量，
@@ -47,7 +47,7 @@ pub fn chunk_file(ctx: &ChunkContext<'_>, parsed: &ParsedFile) -> Result<Vec<Pre
     let mut raw = Vec::new();
     if ctx.language.is_structured() && !parsed.is_empty() {
         if !parsed.imports.is_empty() {
-            raw.push(imports_chunk(ctx, parsed));
+            raw.extend(imports_chunks(ctx, parsed));
         }
         let mut definitions: Vec<&Definition> = parsed.definitions.iter().collect();
         definitions.sort_by_key(|d| d.start_byte);
@@ -315,22 +315,64 @@ fn merged_chunk(ctx: &ChunkContext<'_>, definitions: &[&Definition]) -> RawChunk
 /// 导入块：合成文本用于 Embedding 与 FTS，字节范围指向导入语句在源码中的真实位置。
 ///
 /// 范围必须真实，否则按引用回读时会切出空内容。
-fn imports_chunk(ctx: &ChunkContext<'_>, parsed: &ParsedFile) -> RawChunk {
-    let text = parsed
-        .imports
+///
+/// 每一段**连续**的导入产出一个块。不能把全文件的导入合成单个 `min..max` 区间：
+/// `mod tests { use super::*; }` 这类尾部导入会让区间跨越中间上千行无关代码，
+/// 回读时切出整个文件，并在检索结果里吃掉整个 token 预算。
+fn imports_chunks(ctx: &ChunkContext<'_>, parsed: &ParsedFile) -> Vec<RawChunk> {
+    let mut ordered: Vec<&ImportRecord> = parsed.imports.iter().collect();
+    ordered.sort_by_key(|import| import.start_byte);
+
+    let mut chunks = Vec::new();
+    let mut group: Vec<&ImportRecord> = Vec::new();
+    for import in ordered {
+        if let Some(previous) = group.last() {
+            // 两条导入之间夹着真实代码时断开分组，只允许空白、注释与属性。
+            let gap = ctx
+                .source
+                .get(previous.end_byte..import.start_byte)
+                .unwrap_or("");
+            if !is_import_gap(gap) {
+                chunks.push(finish_imports_group(ctx, &group));
+                group.clear();
+            }
+        }
+        group.push(import);
+    }
+    if !group.is_empty() {
+        chunks.push(finish_imports_group(ctx, &group));
+    }
+    chunks
+}
+
+/// 判断两条导入之间的文本是否只有空白、注释与属性。
+fn is_import_gap(gap: &str) -> bool {
+    gap.lines().all(|line| {
+        let trimmed = line.trim();
+        trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+            || trimmed.starts_with("*/")
+            || trimmed.starts_with("#[")
+            || trimmed.starts_with("#![")
+    })
+}
+
+/// 把一组连续导入收敛成一个块。
+fn finish_imports_group(ctx: &ChunkContext<'_>, group: &[&ImportRecord]) -> RawChunk {
+    let text = group
         .iter()
         .map(|import| import.raw.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let start = parsed
-        .imports
+    let start = group
         .iter()
         .map(|import| import.start_byte)
         .min()
         .unwrap_or(0)
         .min(ctx.source.len());
-    let end = parsed
-        .imports
+    let end = group
         .iter()
         .map(|import| import.end_byte)
         .max()
@@ -728,6 +770,55 @@ mod tests {
         let parsed = parse(language, source).expect("parse");
         let ctx = context(path, language, source, config);
         chunk_file(&ctx, &parsed).expect("chunk")
+    }
+
+    /// 尾部 `mod tests { use super::*; }` 不能让导入块吞掉中间的全部代码。
+    ///
+    /// 曾经的实现取全文件导入的 `min(start)..max(end)`，于是一个 3000 行的文件
+    /// 会产出一个跨越 1600 行的导入块：回读时切出整个文件，检索时吃光 token 预算。
+    #[test]
+    fn trailing_test_imports_do_not_swallow_the_file() {
+        let config = ChunkConfig::default();
+        let mut source = String::from("use std::io;\nuse std::fmt;\n\n");
+        for index in 0..40 {
+            source.push_str(&format!(
+                "/// 第 {index} 个函数。\npub fn helper_{index}(value: u32) -> u32 {{\n    value + {index}\n}}\n\n"
+            ));
+        }
+        source.push_str("#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn works() {\n        assert_eq!(helper_0(1), 1);\n    }\n}\n");
+
+        let chunks = chunk("src/lib.rs", Language::Rust, &source, &config);
+        let imports: Vec<&PreparedChunk> = chunks
+            .iter()
+            .filter(|chunk| chunk.kind == ChunkKind::Imports)
+            .collect();
+
+        assert!(
+            imports.len() >= 2,
+            "顶部与 mod tests 内的导入应分成不同的块，实际 {} 个",
+            imports.len()
+        );
+        let total: usize = source.len();
+        for chunk in &imports {
+            let span = chunk.end_byte - chunk.start_byte;
+            assert!(
+                span * 4 < total,
+                "导入块跨度 {span} 字节，接近整文件 {total} 字节，说明又把中间代码吞进去了"
+            );
+        }
+        // 顶部那组必须仍然只覆盖开头的两行导入。
+        let head = imports
+            .iter()
+            .min_by_key(|chunk| chunk.start_byte)
+            .expect("至少一个导入块");
+        assert!(
+            source[head.start_byte..head.end_byte].contains("use std::fmt"),
+            "顶部导入块应覆盖开头的连续导入"
+        );
+        assert!(
+            !source[head.start_byte..head.end_byte].contains("helper_10"),
+            "顶部导入块不应包含函数体"
+        );
     }
 
     /// 所有块的行号必须与内容严格对应，这是结果可信的前提。

@@ -36,6 +36,11 @@ const MAX_EXPAND_HOPS: usize = 1;
 /// 测试意图下为测试候选保留的结果比例（分母）。
 const TEST_RESERVE_DIVISOR: usize = 3;
 
+/// 单条结果按份额裁剪后仍保证的最小 token 数。
+///
+/// 份额过小会把每条结果削成几行、失去可读性；低于这个下限时宁可少返回几条。
+const MIN_RESULT_TOKENS: usize = 120;
+
 /// 指向确定源码版本的代码引用。
 ///
 /// 形如 `cs1:<chunk_id>:<file_hash 前 16 位>:<start_line>-<end_line>`。
@@ -223,6 +228,10 @@ pub fn assemble(store: &Store, input: &AssembleInput<'_>) -> Result<AssembleOutp
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            // 同分时精确命中优先。各通道权重相等时 RRF 首位得分都是 `1/(k+1)`，
+            // 若直接按路径排序，逐字命中的字面量或符号会仅因路径字母序落到
+            // 语义近邻之后。这里只影响并列项，不改变通道权重。
+            .then(b.exact.cmp(&a.exact))
             .then(a.path.cmp(&b.path))
             .then(a.start_line.cmp(&b.start_line))
     });
@@ -231,8 +240,11 @@ pub fn assemble(store: &Store, input: &AssembleInput<'_>) -> Result<AssembleOutp
     let mut output = AssembleOutput::default();
     let mut seen_content: HashSet<String> = HashSet::new();
     let mut used_tokens = 0usize;
+    // 还未处理的候选数，用于给单条结果分配公平份额。
+    let mut candidates_left = ordered.len();
 
     for selection in ordered {
+        candidates_left = candidates_left.saturating_sub(1);
         if output.results.len() >= input.max_results {
             output.truncated = true;
             break;
@@ -264,7 +276,19 @@ pub fn assemble(store: &Store, input: &AssembleInput<'_>) -> Result<AssembleOutp
             output.truncated = true;
             break;
         }
-        let content_budget = remaining - overhead;
+        // 单条结果最多占用剩余预算中属于自己的那一份，否则一个超大代码块
+        // （容器概览、超长函数分片）会吃光预算，把后面所有结果挤掉，
+        // 让多路召回退化成"只返回一条"。后面确实没有候选时才允许独占。
+        let slots_left = input
+            .max_results
+            .saturating_sub(output.results.len())
+            .min(candidates_left + 1)
+            .max(1);
+        let content_budget = if slots_left > 1 {
+            ((remaining - overhead) / slots_left).max(MIN_RESULT_TOKENS)
+        } else {
+            remaining - overhead
+        };
         let (content, truncated, end_line) =
             truncate_to_lines(&content, selection.start_line, content_budget);
         if content.is_empty() {

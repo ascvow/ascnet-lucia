@@ -673,3 +673,59 @@ async fn provider_failures_are_recorded_without_losing_the_catalog() {
         "服务恢复后应补齐向量"
     );
 }
+
+/// 一个超大代码块不能吃光 token 预算，把其余结果全部挤掉。
+///
+/// 回归：容器概览块的字节范围覆盖整个容器，命中时会占满整个预算，
+/// 使多路召回退化成"只返回一条结果"。预算现在按剩余名额分摊。
+#[tokio::test(flavor = "multi_thread")]
+async fn one_huge_chunk_does_not_starve_the_other_results() {
+    let server = EmbeddingServer::start().await;
+    let repo = sample_repo();
+    write_file(
+        &repo.path().join("codesearch.toml"),
+        &config_toml(server.base_url(), ""),
+    );
+
+    // 一个远超预算的巨大容器，且带有会被查询命中的符号。
+    let mut huge = String::from(
+        "//! 超大容器，用于验证预算分摊。\n\npub struct BudgetHog;\n\nimpl BudgetHog {\n",
+    );
+    for index in 0..400 {
+        huge.push_str(&format!(
+            "    /// 第 {index} 个方法，正文足够长以撑满 token 预算。\n    pub fn budget_hog_{index}(&self, value: u64) -> u64 {{\n        let intermediate = value.wrapping_mul({index} + 1);\n        intermediate.wrapping_add(0x5DEECE66D)\n    }}\n\n"
+        ));
+    }
+    huge.push_str("}\n");
+    write_file(&repo.path().join("src").join("budget_hog.rs"), &huge);
+
+    let engine = open_engine(repo.path(), false).await;
+    engine.index(false).await.expect("索引");
+
+    let response = engine
+        .search(&SearchRequest {
+            query: "budget_hog".to_string(),
+            scope: ScopeFilter::default(),
+            mode: SearchMode::Fast,
+            max_results: Some(5),
+            token_budget: Some(4_000),
+        })
+        .await
+        .expect("搜索");
+
+    assert!(
+        response.results.len() > 1,
+        "超大代码块吃光了预算，只返回了 {} 条结果",
+        response.results.len()
+    );
+    let budget = 4_000usize;
+    for result in &response.results {
+        assert!(
+            result.estimated_tokens < budget,
+            "单条结果占用 {} tokens，几乎等于全部预算 {budget}",
+            result.estimated_tokens
+        );
+    }
+    let total: usize = response.results.iter().map(|r| r.estimated_tokens).sum();
+    assert!(total <= budget, "结果合计 {total} 超出预算 {budget}");
+}

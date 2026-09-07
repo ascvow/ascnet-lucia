@@ -102,6 +102,9 @@ token_budget_cap = 60000
 literal_scan_limit = 5000
 # RRF 常数：score(d) = Σ weight_i / (k + rank_i(d))
 rrf_k = 60.0
+# 三路权重默认相等。此时各通道首位的 RRF 得分同为 1/(k+1)，并列由"精确命中优先"
+# 的排序规则处理，不需要靠调权重把逐字命中顶上去。
+# 调高本项会连带放大符号后缀、路径片段这类弱精确匹配，在自然语言查询上反而更差。
 weight_exact = 1.0
 weight_fts = 1.0
 weight_vector = 1.0

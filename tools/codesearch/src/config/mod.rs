@@ -265,6 +265,10 @@ pub struct RetrievalConfig {
     /// RRF 常数 k。
     pub rrf_k: f64,
     /// 精确通道权重。
+    ///
+    /// 默认与其他通道相等。精确命中不被语义结果淹没，靠的是并列时"精确优先"的排序规则，
+    /// 而不是调高本项：本项会连带放大符号后缀、路径片段这类弱精确匹配，
+    /// 实测在自然语言查询上会降低 Recall@1。
     pub weight_exact: f64,
     /// FTS 通道权重。
     pub weight_fts: f64,
