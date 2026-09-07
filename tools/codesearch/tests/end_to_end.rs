@@ -783,3 +783,49 @@ async fn degraded_always_carries_a_reason() {
         healthy.status.reasons
     );
 }
+
+/// 查具体方法时不能被容器概览吞掉。
+///
+/// 回归：概览块的字节范围覆盖整个容器，排序后排在容器内每个定义之前，
+/// 相邻合并会把方法并进概览，最终只返回一份签名清单，看不到方法正文。
+#[tokio::test(flavor = "multi_thread")]
+async fn exact_method_beats_its_container_overview() {
+    let server = EmbeddingServer::start().await;
+    let repo = sample_repo();
+    write_file(
+        &repo.path().join("codesearch.toml"),
+        &config_toml(server.base_url(), ""),
+    );
+
+    // 足够大的容器才会产生概览块。
+    let mut source = String::from("//! 大容器。\n\npub struct Registry;\n\nimpl Registry {\n");
+    for index in 0..60 {
+        source.push_str(&format!(
+            "    /// 第 {index} 个方法。\n    pub fn handler_{index}(&self, value: u64) -> u64 {{\n        value.wrapping_add({index})\n    }}\n\n"
+        ));
+    }
+    source.push_str("    /// 需要被精确命中的方法。\n    pub fn resolve_pending_grant(&self, id: u64) -> bool {\n        id % 7 == 0\n    }\n}\n");
+    write_file(&repo.path().join("src").join("registry.rs"), &source);
+
+    let engine = open_engine(repo.path(), false).await;
+    engine.index(false).await.expect("索引");
+
+    let response = engine
+        .search(&search_request("resolve_pending_grant"))
+        .await
+        .expect("搜索");
+
+    let top = response.results.first().expect("应有结果");
+    assert_eq!(
+        top.symbol.as_deref(),
+        Some("Registry::resolve_pending_grant"),
+        "首条应是方法本身，实际是 {:?}（kind={:?}）",
+        top.symbol,
+        top.kind
+    );
+    assert!(
+        top.content.contains("id % 7 == 0"),
+        "结果必须包含方法正文，而不是容器的签名清单：\n{}",
+        top.content
+    );
+}

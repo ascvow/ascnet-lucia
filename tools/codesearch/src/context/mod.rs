@@ -389,6 +389,28 @@ fn merge_adjacent(mut selections: Vec<Selection>) -> Vec<Selection> {
         let same_revision = last.revision_id == selection.revision_id;
         let overlaps = selection.start_byte <= last.end_byte;
         let adjacent_lines = selection.start_line <= last.end_line.saturating_add(1);
+        // 概览块的范围覆盖整个容器，会吞掉容器内每一个具体定义。
+        // 查 `PluginManager::validate_enabled_plugins` 时，若容器概览也被召回，
+        // 排序后概览在前，方法被并进去，最终只剩一份签名清单，看不到方法正文。
+        // 这种情况下丢掉概览、保留更具体的定义。
+        if same_revision
+            && last.kind == ChunkKind::Overview
+            && selection.kind != ChunkKind::Overview
+            && last.start_byte <= selection.start_byte
+            && selection.end_byte <= last.end_byte
+        {
+            let mut specific = selection;
+            specific.score = specific.score.max(last.score);
+            specific.exact |= last.exact;
+            for source in std::mem::take(&mut last.matched_by) {
+                if !specific.matched_by.contains(&source) {
+                    specific.matched_by.push(source);
+                }
+            }
+            specific.matched_by.sort_unstable();
+            *last = specific;
+            continue;
+        }
         if same_revision && overlaps && adjacent_lines {
             last.end_byte = last.end_byte.max(selection.end_byte);
             last.end_line = last.end_line.max(selection.end_line);
