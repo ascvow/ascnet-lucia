@@ -373,6 +373,23 @@ fn expand_to_containing_symbols(store: &Store, selections: &mut [Selection]) -> 
 /// 合并同一版本内相邻或重叠的范围。
 ///
 /// 只合并重叠或紧邻（间隔不超过一行）的片段，避免把两个无关定义粘在一起。
+/// 该类别的定义是否足以单独作为一条结果。
+///
+/// 函数、类型这类有独立语义的定义，用户查的就是其中某一个，各自成条才对得上。
+/// 常量、CSS 选择器规则、导入则通常成组阅读，合并展示信息量更高。
+fn is_standalone_answer(kind: ChunkKind) -> bool {
+    matches!(
+        kind,
+        ChunkKind::Function
+            | ChunkKind::Method
+            | ChunkKind::Struct
+            | ChunkKind::Enum
+            | ChunkKind::Trait
+            | ChunkKind::Module
+            | ChunkKind::TypeAlias
+    )
+}
+
 fn merge_adjacent(mut selections: Vec<Selection>) -> Vec<Selection> {
     selections.sort_by(|a, b| {
         a.revision_id
@@ -409,6 +426,22 @@ fn merge_adjacent(mut selections: Vec<Selection>) -> Vec<Selection> {
             }
             specific.matched_by.sort_unstable();
             *last = specific;
+            continue;
+        }
+        // 两个各自成答案的定义不合并。合并后范围横跨两个函数，符号名却只留下
+        // 排在前面的那个，等于给结果贴了错标签：实测查「表单校验失败提示」命中
+        // `handleSubmit`，却因为与相邻的 `handleDelete` 合并而显示成后者，
+        // 正确结果看上去像是搜错了。常量、CSS 选择器这类天然成组的仍然合并。
+        if same_revision
+            && overlaps
+            && adjacent_lines
+            && is_standalone_answer(last.kind)
+            && is_standalone_answer(selection.kind)
+            && last.symbol.is_some()
+            && selection.symbol.is_some()
+            && last.symbol != selection.symbol
+        {
+            merged.push(selection);
             continue;
         }
         if same_revision && overlaps && adjacent_lines {
@@ -642,6 +675,72 @@ pub fn read(store: &Store, request: &ReadRequest, default_budget: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selection(
+        chunk_id: i64,
+        kind: ChunkKind,
+        symbol: Option<&str>,
+        start_line: u32,
+        end_line: u32,
+    ) -> Selection {
+        Selection {
+            chunk_id,
+            revision_id: 1,
+            path: "src/pages/address/edit/index.vue".to_string(),
+            language: crate::types::Language::Vue,
+            kind,
+            symbol: symbol.map(str::to_string),
+            file_hash: "0123456789abcdef0123".to_string(),
+            // 让相邻行的字节区间首尾相接，才能触发合并判定。
+            start_byte: start_line as i64 * 40,
+            end_byte: (end_line as i64 + 1) * 40,
+            start_line,
+            end_line,
+            score: 0.01,
+            matched_by: vec![MatchSource::Fts],
+            exact: false,
+        }
+    }
+
+    /// 相邻的两个函数不得合并成一条并只显示前一个的名字。
+    ///
+    /// 回归：实测查「表单校验失败提示」命中 `handleSubmit`（249-283），
+    /// 但它与相邻的 `handleDelete`（216-246）被合并成 216-283 后只留下
+    /// `handleDelete` 这个名字，正确结果看上去像是搜错了。
+    #[test]
+    fn adjacent_functions_keep_their_own_names() {
+        let merged = merge_adjacent(vec![
+            selection(1, ChunkKind::Function, Some("handleDelete"), 216, 246),
+            selection(2, ChunkKind::Text, None, 246, 248),
+            selection(3, ChunkKind::Function, Some("handleSubmit"), 249, 283),
+        ]);
+
+        let names: Vec<Option<&str>> = merged.iter().map(|s| s.symbol.as_deref()).collect();
+        assert_eq!(
+            names,
+            vec![Some("handleDelete"), Some("handleSubmit")],
+            "两个函数应各自成条: {names:?}"
+        );
+        // 中间的空隙文本仍然并入前一个函数。
+        assert_eq!((merged[0].start_line, merged[0].end_line), (216, 248));
+        assert_eq!((merged[1].start_line, merged[1].end_line), (249, 283));
+    }
+
+    /// 常量与 CSS 规则这类成组内容仍然合并。
+    #[test]
+    fn grouped_declarations_still_merge() {
+        let merged = merge_adjacent(vec![
+            selection(1, ChunkKind::Const, Some("PAGE_SIZE"), 10, 10),
+            selection(2, ChunkKind::Const, Some("TIMEOUT"), 11, 11),
+        ]);
+        assert_eq!(merged.len(), 1, "相邻常量应合并展示");
+
+        let rules = merge_adjacent(vec![
+            selection(1, ChunkKind::Rule, Some(".container"), 20, 24),
+            selection(2, ChunkKind::Rule, Some(".header"), 25, 29),
+        ]);
+        assert_eq!(rules.len(), 1, "相邻 CSS 规则应合并展示");
+    }
 
     #[test]
     fn code_ref_round_trips() {

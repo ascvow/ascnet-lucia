@@ -10,10 +10,11 @@
 //! 所有候选在融合前都已按当前版本与作用域过滤。
 
 pub mod fusion;
+pub mod prior;
 pub mod query;
 pub mod tokenize;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
@@ -150,13 +151,20 @@ pub fn retrieve(
     // ---- A. 精确召回 ----
     let mut exact: Vec<i64> = Vec::new();
     for symbol in &plan.symbols {
-        for (chunk_id, is_exact) in store.symbol_candidates(symbol, EXACT_PATH_LIMIT)? {
-            if !keep(chunk_id) {
-                continue;
-            }
-            push_unique(&mut exact, chunk_id);
-            if is_exact && !exact_ids.contains(&chunk_id) {
-                exact_ids.push(chunk_id);
+        // 限定名的层级分隔符各语言不同（`::`/`.`/`\`/`#`），使用者不该被要求
+        // 先想清楚"这个语言用哪个"再搜。原写法排在最前，变体只是补充。
+        let spellings = std::iter::once(symbol.clone())
+            .chain(query::separator_variants(symbol))
+            .collect::<Vec<_>>();
+        for spelling in &spellings {
+            for (chunk_id, is_exact) in store.symbol_candidates(spelling, EXACT_PATH_LIMIT)? {
+                if !keep(chunk_id) {
+                    continue;
+                }
+                push_unique(&mut exact, chunk_id);
+                if is_exact && !exact_ids.contains(&chunk_id) {
+                    exact_ids.push(chunk_id);
+                }
             }
         }
         // 完整符号未命中时，退回后缀匹配（查询 `execute` 命中 `RetryPolicy::execute`）。
@@ -255,9 +263,33 @@ pub fn retrieve(
     }
 
     let fused = fusion::fuse(&lists, config.rrf_k, &exact_ids);
+    // 内容类型先验必须在截断之前生效：先截断再降权，被文档挤出候选集的代码
+    // 就再也回不来了。
+    let fused = apply_content_prior(store, config, fused)?;
     outcome.candidates =
         fusion::apply_exact_reserve(fused, config.candidate_limit, config.exact_reserve);
     Ok(outcome)
+}
+
+/// 按内容类型对融合结果做乘性修正。
+///
+/// 只为当前候选取一次元数据，不扫全表。取元数据失败时原样返回：排序修正是
+/// 锦上添花，不该让整次查询失败。
+fn apply_content_prior(
+    store: &Store,
+    config: &RetrievalConfig,
+    candidates: Vec<Candidate>,
+) -> Result<Vec<Candidate>> {
+    if candidates.is_empty() || config.prose_weight == 1.0 {
+        return Ok(candidates);
+    }
+    let ids: Vec<i64> = candidates.iter().map(|c| c.chunk_id).collect();
+    let rows = match store.chunks_by_ids(&ids) {
+        Ok(rows) => rows,
+        Err(_) => return Ok(candidates),
+    };
+    let languages: HashMap<i64, Language> = rows.iter().map(|row| (row.id, row.language)).collect();
+    Ok(prior::apply(candidates, &languages, config.prose_weight))
 }
 
 /// 向量召回。

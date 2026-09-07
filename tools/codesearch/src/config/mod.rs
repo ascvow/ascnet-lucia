@@ -278,6 +278,13 @@ pub struct RetrievalConfig {
     pub exact_reserve: usize,
     /// 字面量搜索最多扫描的文件数。
     pub literal_scan_limit: usize,
+    /// 散文（Markdown/纯文本）在融合后的降权系数。
+    ///
+    /// 自然语言查询与散文的向量相似度天然高于与代码的相似度，不修正会让 README
+    /// 稳定压过真实实现。默认值由 34 条带真值的查询扫参得到：1.0 时 hit@1 为
+    /// 62%，0.85 升到 68%，继续压到 0.6 不再有收益且会把「文档本身就是答案」
+    /// 的情形挤出前 5。取 1.0 关闭该修正。详见 `retrieval::prior`。
+    pub prose_weight: f64,
 }
 
 impl Default for RetrievalConfig {
@@ -297,6 +304,7 @@ impl Default for RetrievalConfig {
             weight_vector: 1.0,
             exact_reserve: 3,
             literal_scan_limit: 5000,
+            prose_weight: 0.85,
         }
     }
 }

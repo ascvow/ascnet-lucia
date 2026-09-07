@@ -349,6 +349,40 @@ pub fn looks_like_path(token: &str) -> bool {
     )
 }
 
+/// 各语言用于分隔限定名层级的符号。
+const SYMBOL_SEPARATORS: &[&str] = &["::", "->", "\\", ".", "#"];
+
+/// 为限定名生成换用其他分隔符的等价写法。
+///
+/// 每种语言的层级分隔符都不一样：Rust 与 C++ 用 `::`，Java 与 Go 用 `.`，
+/// PHP 命名空间用 `\`，Ruby 实例方法习惯写 `#`。使用者不该被要求先想清楚
+/// 「这个语言用哪个分隔符」再搜索——查 `Token.check` 与查 `Token::check`
+/// 指的是同一个东西，都应该命中。
+///
+/// 只替换分隔符，不改动标识符本身，因此不会把 `a.b` 变成无关符号。
+/// 单段标识符（不含任何分隔符）不产生变体。
+///
+/// 变体属于"怎么查"，不属于"用户要找什么"，因此不写进 `QueryPlan::symbols`，
+/// 而是由召回阶段按需展开。
+pub(crate) fn separator_variants(token: &str) -> Vec<String> {
+    let Some(found) = SYMBOL_SEPARATORS
+        .iter()
+        .find(|separator| token.contains(**separator))
+    else {
+        return Vec::new();
+    };
+    // 形如 `../foo` 或 `1.5` 的片段拆出来是空段，不当作限定名处理。
+    let segments: Vec<&str> = token.split(found).collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Vec::new();
+    }
+    SYMBOL_SEPARATORS
+        .iter()
+        .filter(|separator| *separator != found)
+        .map(|separator| segments.join(separator))
+        .collect()
+}
+
 /// 是否形似完整符号：无空格的标识符、限定名或 `Type::method` / `Obj.method`。
 pub fn looks_like_symbol(token: &str) -> bool {
     if token.len() < 2 || token.contains(char::is_whitespace) {
@@ -527,6 +561,41 @@ mod tests {
         // 拆词结果同时进入 FTS 词条，但完整符号必须保留。
         assert!(plan.terms.contains(&"RetryPolicy::execute".to_string()));
         assert!(plan.terms.iter().any(|t| t == "retry"));
+    }
+
+    /// 限定名要能跨分隔符命中。
+    ///
+    /// 回归：PHP 的 `Token::check` 在索引里曾按命名空间约定存成 `Token\check`，
+    /// 用调用点的写法 `Token::check` 去搜，符号通路完全不触发，正确答案掉到第 2，
+    /// 被一个 vendored 大文本块压在下面。
+    #[test]
+    fn qualified_names_expand_to_other_separators() {
+        for query in ["Token::check", "Token.check"] {
+            let variants = separator_variants(query);
+            for expected in ["Token::check", "Token.check", "Token\\check", "Token#check"] {
+                let found = query == expected || variants.iter().any(|v| v == expected);
+                assert!(found, "`{query}` 应能查到 `{expected}`: {variants:?}");
+            }
+        }
+    }
+
+    /// 分隔符变体不得把普通词或路径变成无关符号。
+    #[test]
+    fn separator_variants_do_not_invent_symbols() {
+        // 单段标识符没有层级，不产生变体。
+        assert!(separator_variants("execute").is_empty());
+        // 空段说明不是限定名。
+        assert!(separator_variants("../utils").is_empty());
+        assert!(separator_variants("a..b").is_empty());
+        // 正常限定名只换分隔符，段本身不变。
+        let variants = separator_variants("Auth::login");
+        assert!(variants
+            .iter()
+            .all(|v| v.contains("Auth") && v.contains("login")));
+        assert!(
+            !variants.contains(&"Auth::login".to_string()),
+            "不重复原写法"
+        );
     }
 
     #[test]
