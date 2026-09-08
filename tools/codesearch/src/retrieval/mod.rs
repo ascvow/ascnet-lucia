@@ -357,5 +357,36 @@ fn push_unique(list: &mut Vec<i64>, value: i64) {
     }
 }
 
+/// 只为已召回候选准备重排文档；概览复用结构摘要，正文从同版本快照提取，字符上限保持 UTF-8 完整。
+pub(crate) fn rerank_documents(
+    store: &Store,
+    candidates: &[Candidate],
+    max_chars: usize,
+) -> Result<Vec<String>> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            let row = store
+                .chunk_by_id(candidate.chunk_id)?
+                .ok_or_else(|| Error::Internal("重排候选不存在".into()))?;
+            let body = if row.kind == crate::types::ChunkKind::Overview {
+                store.embedding_input(row.id)?
+            } else {
+                store.chunk_content(row.revision_id, row.start_byte, row.end_byte)?
+            };
+            Ok(format!(
+                "{}\n{}\n{}\n{}",
+                row.path,
+                row.symbol.as_deref().unwrap_or(""),
+                row.signature.as_deref().unwrap_or(""),
+                body
+            )
+            .chars()
+            .take(max_chars)
+            .collect())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;

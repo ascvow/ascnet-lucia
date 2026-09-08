@@ -117,3 +117,13 @@ debounce_ms = 300
 # 待处理路径队列上限，超过后退化为整目录重扫。
 max_pending_paths = 2000
 checkpoint_interval_secs = 60
+
+# 可选质量优先重排：取消以下注释才会向该模型额外发送候选正文，可能产生费用和数秒延迟。
+# 仅对自然语言类别执行；纯符号/路径查询和 offline 模式不调用。失败明确报错，不静默降级。
+# [rerank]
+# base_url = "https://api.siliconflow.cn/v1"
+# model = "Qwen/Qwen3-Reranker-8B"
+# api_key_env = "SILICONFLOW_API_KEY"
+# timeout_secs = 60
+# max_candidates = 160
+# max_input_chars = 6000

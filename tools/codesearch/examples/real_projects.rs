@@ -25,6 +25,9 @@ struct Arguments {
     /// 使用诊断构建跑一轮并保留 JSONL；不得覆盖基线报告或重建索引。
     #[arg(long)]
     diagnostic_binary: Option<PathBuf>,
+    /// 仅实验配置启用指定重排模型，不修改原项目或冻结配置。
+    #[arg(long, requires = "diagnostic_binary")]
+    rerank_model: Option<String>,
     #[arg(long)]
     supplement_php: bool,
     #[arg(long)]
@@ -328,6 +331,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let mut project = project.clone();
+        if arguments.rerank_model.is_some()
+            && !supplement
+            && project.index.as_ref().is_some_and(|index| {
+                index["embeddings_failed"].as_u64().unwrap_or(0) > 0
+                    || index["embeddings_pending"].as_u64().unwrap_or(0) > 0
+            })
+        {
+            println!("{} 原始索引不完整，重排仅运行其独立完整补测", project.id);
+            continue;
+        }
         // 补测只适配模型输入限制，保留原配置、原索引和默认报告，不调整查询或答案。
         if supplement && arguments.diagnostic_binary.is_some() {
             // 诊断只复用已完成的补测索引，不重新索引或写配置。
@@ -359,6 +372,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             project.index = Some(serde_json::from_slice(&output.stdout)?);
             println!("PHP 输入上限补测索引: {}", project.index.as_ref().unwrap());
+        }
+        if let Some(model) = &arguments.rerank_model {
+            let mut config = codesearch::config::Config::load(&project.config)?;
+            config.rerank = Some(codesearch::config::RerankConfig {
+                base_url: config.embedding.base_url.clone(),
+                api_key_env: config.embedding.api_key_env.clone(),
+                model: model.clone(),
+                ..Default::default()
+            });
+            project.config = out.join(format!("{}-{}-rerank.toml", project.id, arguments.label));
+            std::fs::write(&project.config, toml::to_string(&config)?)?;
         }
         let queries = &set
             .projects

@@ -118,6 +118,12 @@ refresh_on_search = false
 /// 服务对下一批请求的响应方式，用于验证错误处理与重试。
 #[derive(Debug, Clone)]
 pub enum Reply {
+    /// 重排协议：逆序返回全部索引，分数按原始索引递增。
+    Rerank,
+    /// 原始响应体，用于验证模型协议拒绝非法数据。
+    Raw(String),
+    /// 延迟两秒响应，用于测试请求总超时。
+    Slow,
     /// 正常返回确定性向量。
     Ok,
     /// 返回指定状态码与错误体。
@@ -146,6 +152,10 @@ pub enum Reply {
 /// 服务端记录的一次请求。
 #[derive(Debug, Clone)]
 pub struct RecordedRequest {
+    /// 实际请求端点与结构化请求体，供模型协议断言使用。
+    pub path: String,
+    /// 完整结构化请求体，仅用于本地协议测试。
+    pub body: serde_json::Value,
     /// 请求体中的 `model`。
     pub model: String,
     /// 请求体中的 `input` 列表。
@@ -292,6 +302,7 @@ async fn serve_connection(
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
     let inputs: Vec<String> = parsed
         .get("input")
+        .or_else(|| parsed.get("documents"))
         .and_then(|value| value.as_array())
         .map(|items| {
             items
@@ -304,6 +315,13 @@ async fn serve_connection(
     let reply = {
         let mut guard = state.lock().expect("锁");
         guard.requests.push(RecordedRequest {
+            path: header_text
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .into(),
+            body: parsed.clone(),
             model: parsed
                 .get("model")
                 .and_then(|value| value.as_str())
@@ -327,6 +345,9 @@ async fn serve_connection(
         }
     };
 
+    if matches!(reply, Reply::Slow) {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
     let response = build_response(&reply, &inputs);
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
@@ -335,6 +356,9 @@ async fn serve_connection(
 
 fn build_response(reply: &Reply, inputs: &[String]) -> String {
     match reply {
+        Reply::Rerank => http_response(200, &serde_json::json!({"results":(0..inputs.len()).rev()
+            .map(|index| serde_json::json!({"index":index,"relevance_score":index as f64})).collect::<Vec<_>>()}).to_string()),
+        Reply::Raw(body) => http_response(200, body),
         Reply::Status(code) => http_response(
             *code,
             &serde_json::json!({ "error": { "message": "injected failure" } }).to_string(),

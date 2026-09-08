@@ -26,6 +26,8 @@ pub struct Config {
     pub embedding: EmbeddingConfig,
     /// 检索与融合配置。
     pub retrieval: RetrievalConfig,
+    /// 显式配置才启用远程重排；默认不增加源码发送和搜索延迟。
+    pub rerank: Option<RerankConfig>,
     /// 文件监听配置。
     pub watch: WatchConfig,
 }
@@ -242,6 +244,37 @@ impl Default for EmbeddingConfig {
     }
 }
 
+/// 可选远程重排配置；只有显式提供该表才会启用额外的候选源码请求。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RerankConfig {
+    /// 兼容 `/rerank` 协议的服务基础地址，也允许完整端点。
+    pub base_url: String,
+    /// 必须显式指定的交叉编码器模型名。
+    pub model: String,
+    /// 只存放 API Key 的环境变量名；空字符串表示本地免鉴权服务。
+    pub api_key_env: String,
+    /// 包括排队、请求和响应读取的整次调用超时秒数。
+    pub timeout_secs: u64,
+    /// 每次最多发送的融合并集候选数，在最终候选截断之前生效。
+    pub max_candidates: usize,
+    /// 单个文档输入字符上限，截断严格保持 UTF-8 边界。
+    pub max_input_chars: usize,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            model: String::new(),
+            api_key_env: String::new(),
+            timeout_secs: 60,
+            max_candidates: 160,
+            max_input_chars: 6000,
+        }
+    }
+}
+
 /// 检索配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -403,6 +436,27 @@ impl Config {
             }
         }
         let retrieval = &self.retrieval;
+        if let Some(rerank) = &self.rerank {
+            let url = reqwest::Url::parse(&rerank.base_url)
+                .map_err(|_| Error::Config("rerank.base_url 必须是 HTTP(S) URL".into()))?;
+            if !matches!(url.scheme(), "http" | "https")
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || rerank.model.trim().is_empty()
+                || rerank.timeout_secs == 0
+                || rerank.timeout_secs > 300
+                || rerank.max_candidates < retrieval.candidate_limit
+                || rerank.max_candidates > 512
+                || !(512..=16000).contains(&rerank.max_input_chars)
+                || looks_like_secret(&rerank.api_key_env)
+            {
+                return Err(Error::Config(
+                    "重排配置无效：检查地址、模型、超时、候选数、输入上限及凭证变量名".into(),
+                ));
+            }
+        }
         if retrieval.max_results == 0 || retrieval.max_results_cap == 0 {
             return Err(Error::Config("retrieval.max_results 必须大于 0".into()));
         }
@@ -512,6 +566,37 @@ api_key_env = "sk-abcdef0123456789"
         assert_eq!(config.embedding.provider, ProviderKind::None);
     }
 
+    /// 旧配置默认不增加网络调用；显式开启时拒绝危险地址和无界资源参数。
+    #[test]
+    fn rerank_is_explicit_and_bounded() {
+        assert!(Config::default().rerank.is_none());
+        let valid = "[rerank]\nbase_url='http://127.0.0.1:8080/v1'\nmodel='fixture'\n";
+        assert!(Config::from_toml(valid).unwrap().rerank.is_some());
+        for invalid in [
+            "timeout_secs=0",
+            "max_candidates=513",
+            "max_candidates=1",
+            "max_input_chars=10",
+        ] {
+            assert!(Config::from_toml(&format!("{valid}{invalid}\n")).is_err());
+        }
+        for url in [
+            "file:///tmp/a",
+            "https://user:password@example.com/v1",
+            "https://example.com/v1?key=value",
+        ] {
+            let config = Config {
+                rerank: Some(RerankConfig {
+                    base_url: url.into(),
+                    model: "fixture".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
+    }
+
     /// 示例配置必须始终可解析。
     ///
     /// `deny_unknown_fields` 意味着示例里任何过时字段都会让用户的配置直接报错，
@@ -530,5 +615,12 @@ api_key_env = "sk-abcdef0123456789"
             !config.embedding.send_dimensions,
             "硅基流动会拒绝请求体中的 dimensions，示例必须保持关闭"
         );
+        let quality = Config::load(&path.with_file_name("codesearch.quality.example.toml"))
+            .expect("质量优先示例可解析");
+        assert_eq!(
+            quality.rerank.as_ref().unwrap().model,
+            "Qwen/Qwen3-Reranker-8B"
+        );
+        assert_eq!(quality.embedding.max_input_chars, 6000);
     }
 }

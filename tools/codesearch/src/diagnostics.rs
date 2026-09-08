@@ -22,6 +22,13 @@ pub(crate) struct Capture {
 }
 
 impl Capture {
+    /// 在 await 前移出当前线程记录；恢复时可位于其他执行线程，不留下全局活动记录器。
+    pub(crate) fn pause(mut self) -> Paused {
+        Paused {
+            path: self.path.take(),
+            events: EVENTS.with(|events| events.borrow_mut().take()),
+        }
+    }
     /// 环境变量显式指定本地 JSONL 路径才启用；调用方负责目录存在和日志保留策略。
     pub(crate) fn start() -> Self {
         Self::at(
@@ -66,6 +73,23 @@ impl Capture {
         if let Err(error) = write() {
             tracing::warn!(%error, "搜索诊断写入失败");
         }
+    }
+}
+
+/// 跨异步网络调用传递已完成阶段，不持有存储锁或线程局部可变借用。
+pub(crate) struct Paused {
+    path: Option<PathBuf>,
+    events: Option<Vec<Value>>,
+}
+
+impl Paused {
+    /// 在下一个同步组装区间恢复本次调用的阶段记录。
+    pub(crate) fn resume(self) -> Capture {
+        let capture = Capture::at(self.path);
+        EVENTS.with(|events| {
+            events.replace(self.events);
+        });
+        capture
     }
 }
 
@@ -117,5 +141,25 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         Capture::at(Some(directory.path().to_path_buf())).finish("查询", 0);
         record("disabled", || panic!("退出后应关闭"));
+    }
+
+    /// 网络等待期间无活动线程记录器，跨线程恢复仍只输出同一次调用的事件。
+    #[test]
+    fn paused_capture_can_resume_on_another_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.jsonl");
+        let capture = Capture::at(Some(path.clone()));
+        record("recall", || json!([1]));
+        let paused = capture.pause();
+        record("inactive", || panic!("暂停后不应记录"));
+        std::thread::spawn(move || {
+            let capture = paused.resume();
+            record("context", || json!([2]));
+            capture.finish("查询", 1);
+        })
+        .join()
+        .unwrap();
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["stages"].as_array().unwrap().len(), 2);
     }
 }

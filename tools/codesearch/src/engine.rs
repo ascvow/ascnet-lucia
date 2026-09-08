@@ -84,6 +84,7 @@ pub struct Engine {
     store: Mutex<Store>,
     vector: Mutex<Option<VectorIndex>>,
     provider: Option<Arc<Provider>>,
+    reranker: Option<models::rerank::HttpReranker>,
     space: Option<EmbeddingSpace>,
     /// 持有期间独占该 workspace 的写权限；`None` 表示只读会话。
     _lock: Option<WorkspaceLock>,
@@ -200,12 +201,22 @@ impl Engine {
             }
         }
 
+        let reranker = if options.offline {
+            None
+        } else {
+            config
+                .rerank
+                .as_ref()
+                .map(models::rerank::HttpReranker::new)
+                .transpose()?
+        };
         let mut engine = Self {
             workspace,
             config,
             store: Mutex::new(store),
             vector: Mutex::new(vector),
             provider,
+            reranker,
             space,
             _lock: lock,
             writable,
@@ -425,7 +436,12 @@ impl Engine {
             .unwrap_or(self.config.retrieval.token_budget)
             .clamp(1, self.config.retrieval.token_budget_cap);
 
-        let (results, truncated, total_tokens, counters, epoch, vector_used, mut recall_notes) = {
+        // 类别可同时包含符号与自然语言（尤其中文）；识别到符号不能成为跳过重排的依据。
+        let reranker = self
+            .reranker
+            .as_ref()
+            .filter(|_| plan.kinds.contains(&retrieval::QueryKind::Natural));
+        let (mut outcome, documents, paused) = {
             let store = lock_store(&self.store)?;
             let vector_guard = lock_index(&self.vector)?;
             // 捕获器不得跨 await；它只观察这次同步检索和组装，并在同一线程结束。
@@ -441,12 +457,69 @@ impl Engine {
                 query_vector: query_vector.as_deref(),
                 space_id: self.space.as_ref().map(|space| space.id.as_str()),
             };
-            let outcome = retrieval::retrieve(
-                &store,
-                vector_guard.as_ref(),
-                &self.config.retrieval,
-                &input,
-            )?;
+            let mut recall_config = self.config.retrieval.clone();
+            if reranker.is_some() {
+                recall_config.candidate_limit = self
+                    .config
+                    .rerank
+                    .as_ref()
+                    .expect("重排配置存在")
+                    .max_candidates;
+            }
+            let outcome =
+                retrieval::retrieve(&store, vector_guard.as_ref(), &recall_config, &input)?;
+            let documents = if reranker.is_some() {
+                retrieval::rerank_documents(
+                    &store,
+                    &outcome.candidates,
+                    self.config
+                        .rerank
+                        .as_ref()
+                        .expect("重排配置存在")
+                        .max_input_chars,
+                )?
+            } else {
+                Vec::new()
+            };
+            if reranker.is_some() {
+                crate::diagnostics::record("rerank_input", || {
+                    serde_json::json!({
+                        "model":self.config.rerank.as_ref().expect("重排配置存在").model,
+                        "documents":documents.iter().map(|document| blake3::hash(document.as_bytes()).to_hex().to_string()).collect::<Vec<_>>()
+                    })
+                });
+            }
+            (outcome, documents, capture.pause())
+        };
+        // 不持有 SQLite/USearch 锁等待网络；失败直接返回 Provider 错误，不伪装成成功重排。
+        if let Some(reranker) = reranker {
+            let scores = reranker.score(query, &documents).await?;
+            for (candidate, score) in outcome.candidates.iter_mut().zip(scores) {
+                candidate.score = score;
+            }
+            outcome.candidates.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then(a.chunk_id.cmp(&b.chunk_id))
+            });
+            outcome.candidates = retrieval::fusion::apply_exact_reserve(
+                outcome.candidates,
+                self.config.retrieval.candidate_limit,
+                self.config.retrieval.exact_reserve,
+            );
+            if !documents.is_empty() {
+                outcome.notes.push(format!(
+                    "已使用 {} 重排模型",
+                    self.config.rerank.as_ref().expect("重排配置存在").model
+                ));
+            }
+        }
+        let (results, truncated, total_tokens, counters, epoch, vector_used, mut recall_notes) = {
+            let store = lock_store(&self.store)?;
+            let capture = paused.resume();
+            if reranker.is_some() {
+                crate::diagnostics::record("reranked", || serde_json::json!(outcome.candidates));
+            }
             let assembled = context::assemble(
                 &store,
                 &AssembleInput {

@@ -352,7 +352,7 @@ async fn probe_dimensions(inner: &Inner) -> Result<usize> {
 ///
 /// 变量名为空表示该服务不需要鉴权（常见于本地推理服务）。
 /// 变量名已配置但未设置值时报错，避免静默发出未鉴权请求。
-fn read_api_key(env_name: &str) -> Result<Option<String>> {
+pub(super) fn read_api_key(env_name: &str) -> Result<Option<String>> {
     let name = env_name.trim();
     if name.is_empty() {
         return Ok(None);

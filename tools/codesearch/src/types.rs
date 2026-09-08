@@ -420,7 +420,7 @@ pub struct SearchRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
-    /// 混合召回 + RRF 融合 + 基础上下文组装。
+    /// 兼容的默认入口：混合召回与上下文组装，可由部署配置显式启用重排。
     #[default]
     Fast,
 }

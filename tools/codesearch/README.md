@@ -188,6 +188,13 @@ codesearch search --root . --query '-path:**/tests/** RetryPolicy::execute'
 访问及清理保留的日志。新文件在 Unix 上使用 0600 权限，已有文件权限不修改；写入失败只记警告。
 记录器只覆盖无 await 的同步检索与组装区间，错误退出丢弃未完成记录。启用时存在额外磁盘写入开销。
 
+可选的 `[rerank]` 配置接入真实 `/rerank` 交叉编码器（见 `codesearch.example.toml` 的注释段）。
+自然语言查询先保留最多 `rerank.max_candidates=160` 个候选，发送路径、符号、签名和至多 6000 字符正文，
+重排后才应用原 `candidate_limit=40`。默认未启用，不会自动使用已有 Embedding 凭证调用其他模型。
+启用后会额外发送候选源码，可能产生费用；并发上限为 2，整次请求含排队默认超时 60 秒，
+失败直接返回 `provider_error`，不把原排序冒充重排成功。`--offline` 禁止此网络调用；纯符号和路径类别仍走原通路。
+诊断记录在网络等待前移出线程、完成后恢复，保持每次成功调用一条记录；不在等待网络时持有索引锁。
+
 ```json
 {
   "mcpServers": {
@@ -343,6 +350,10 @@ score(d) = Σ weight_i / (k + rank_i(d))
 
 随后增加[原始命中锚点保留](reports/context-anchor-2026-09-08.md)：固定真实候选重放与 MCP 验证中，
 实现 Top-10 从 8/22 到 9/22，无已实现问题名次退步；这只是局部内容丢失修复，不代表整体可靠性达标。
+
+[后续重排优化与向量审计](reports/retrieval-optimization-2026-09-08.md)：显式启用 Qwen 重排后，
+最终真实 MCP 实现 Top-5 为 14/22、Top-10 为 16/22，中位搜索耗时约 6.3 秒；PHP 独立补测为 1/4。
+可用 `--config codesearch.quality.example.toml` 选择质量优先配置。未完成新项目盲测，不能将调优集结果视为泛化保证。
 
 ```bash
 cargo fmt --all -- --check                               # 通过

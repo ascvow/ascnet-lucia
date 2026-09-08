@@ -92,6 +92,14 @@ fn map_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
 }
 
 impl Store {
+    /// 读取既有语义输入，供概览重排复用；不重新生成或修改索引正文。
+    pub(crate) fn embedding_input(&self, id: i64) -> Result<String> {
+        Ok(self
+            .conn()
+            .query_row("SELECT embed_input FROM chunks WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?)
+    }
     /// 按 ID 批量读取代码块元数据（不限制是否为当前版本）。
     pub fn chunks_by_ids(&self, ids: &[i64]) -> Result<Vec<ChunkRow>> {
         if ids.is_empty() {

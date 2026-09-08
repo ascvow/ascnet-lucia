@@ -8,6 +8,7 @@
 pub mod http;
 #[cfg(feature = "test-support")]
 pub mod mock;
+pub mod rerank;
 
 use crate::chunker::EMBED_TEMPLATE_VERSION;
 use crate::config::{Config, EmbeddingConfig, ProviderKind};
