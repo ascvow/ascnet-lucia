@@ -328,6 +328,10 @@ score(d) = Σ weight_i / (k + rank_i(d))
 下列数字为初版历史记录，不代表当前测试数量。本次语言扩展与实测见
 [语言扩展评测记录](reports/language-support-2026-09-08.md)。
 
+后续已在用户的 6 个真实项目上测试：[真实项目语义定位报告](reports/real-projects-2026-09-08.md)。
+默认配置、索引完整的 22 条已实现问题中，文件 Top-5 为 63.6%，关键实现 Top-5 仅 18.2%；
+人工样例的高分不能作为真实项目可靠性的依据。
+
 ```bash
 cargo fmt --all -- --check                               # 通过
 cargo clippy --all-features --all-targets -- -D warnings # 通过，无告警
