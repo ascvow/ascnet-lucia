@@ -408,6 +408,22 @@ struct CompactedMessages {
     summary_usage: Option<Value>,
 }
 
+/// 完整摘要前可直接应用的确定性工具结果收缩候选。
+struct MicroCompaction {
+    messages: Vec<Value>,
+    cleared_results: usize,
+    capped_results: usize,
+    clear_target: usize,
+    estimated_tokens: usize,
+}
+
+impl MicroCompaction {
+    /// 是否实际改写了至少一条工具结果。
+    fn changed(&self) -> bool {
+        self.cleared_results > 0 || self.capped_results > 0
+    }
+}
+
 /// 摘要模型调用的最小内部结果。
 struct SummaryResponse {
     text: String,
@@ -448,7 +464,33 @@ async fn compress_context(
         summary_max_tokens,
     } = budget;
 
-    if manual || before_tokens >= compact_threshold {
+    // 先执行无模型成本的工具结果收缩。若它已经把上下文拉回完整压缩水位以下，
+    // 本轮无需让摘要模型再次读取和概括大量工具正文。
+    let micro = if manual || before_tokens >= micro_threshold {
+        let clear_target = micro_clear_target(&request.messages, micro_floor, manual);
+        let (messages, cleared_results) =
+            micro_compact_tool_results(&request.messages, clear_target);
+        let (messages, capped_results) =
+            cap_tool_results(&messages, MAX_RETAINED_TOOL_RESULT_CHARS);
+        let estimated_tokens = estimate_context_tokens(request.system.as_deref(), &messages);
+        Some(MicroCompaction {
+            messages,
+            cleared_results,
+            capped_results,
+            clear_target,
+            estimated_tokens,
+        })
+    } else {
+        None
+    };
+
+    let needs_full_compaction = manual
+        || (before_tokens >= compact_threshold
+            && micro
+                .as_ref()
+                .is_none_or(|micro| micro.estimated_tokens >= compact_threshold));
+
+    if needs_full_compaction {
         if let Some(compacted) = compact_messages(
             &request.messages,
             &request.run_id,
@@ -501,20 +543,12 @@ async fn compress_context(
         }
     }
 
-    if manual || before_tokens >= micro_threshold {
-        // 手动压缩本就要立刻见效，不受批量迟滞约束。
-        let clear_target = micro_clear_target(&request.messages, micro_floor, manual);
-        let (messages, cleared_results) =
-            micro_compact_tool_results(&request.messages, clear_target);
-        // 最近若干条结果不清空，但同样需要封顶：巨型输出常常就出现在最新几条里。
-        let (messages, capped_results) =
-            cap_retained_tool_results(&messages, MAX_RETAINED_TOOL_RESULT_CHARS);
-        if cleared_results > 0 || capped_results > 0 {
-            let after_tokens = estimate_context_tokens(request.system.as_deref(), &messages);
+    if let Some(micro) = micro {
+        if micro.changed() {
             return Ok(CompressionOutcome {
                 context: LoadedContext {
                     system: request.system,
-                    messages,
+                    messages: micro.messages,
                 },
                 event: Some(json!({
                     "name": "context.micro_compaction.completed",
@@ -523,16 +557,16 @@ async fn compress_context(
                         "step": request.step,
                         "before_messages": before_messages,
                         "after_messages": before_messages,
-                        "cleared_tool_results": cleared_results,
-                        "capped_tool_results": capped_results,
+                        "cleared_tool_results": micro.cleared_results,
+                        "capped_tool_results": micro.capped_results,
                         "estimated_tokens_before": before_tokens,
-                        "estimated_tokens_after": after_tokens,
+                        "estimated_tokens_after": micro.estimated_tokens,
                         "trigger": if manual { "manual" } else { "auto" },
-                        "strategy": "clear_old_successful_tool_results_and_cap_retained"
+                        "strategy": "reduce_tool_results_before_model_summary"
                     },
                     "presentation": { "target": "none" }
                 })),
-                micro_cleared: clear_target,
+                micro_cleared: micro.clear_target,
             });
         }
         // 本轮没有推进边界：保持上下文原样，让前缀继续命中缓存。
@@ -541,10 +575,10 @@ async fn compress_context(
             return Ok(CompressionOutcome {
                 context: LoadedContext {
                     system: request.system,
-                    messages,
+                    messages: micro.messages,
                 },
                 event: None,
-                micro_cleared: clear_target,
+                micro_cleared: micro.clear_target,
             });
         }
     }
@@ -765,12 +799,11 @@ fn truncate_middle(text: &str, max_chars: usize) -> Option<String> {
     ))
 }
 
-/// 折叠保留区内超长的工具结果正文，返回新消息与被折叠的结果数。
+/// 折叠指定消息内超长的工具结果正文，返回新消息与被折叠的结果数。
 ///
-/// 与微压缩互补：微压缩整体清空**较旧**结果的正文，这里只对**保留下来**的结果做
-/// 长度封顶。近期结果仍需可读，因此不能清空，但单条动辄上百 KB 的输出同样会挤占
-/// 窗口——完整压缩此前完全没有处理保留区，尾部经常仍是几万 token。
-fn cap_retained_tool_results(messages: &[Value], max_chars: usize) -> (Vec<Value>, usize) {
+/// 该处理同时用于完整摘要的旧前缀和最终保留的近期尾部：旧前缀需要给摘要模型留下
+/// 错误、路径和最终状态证据，近期尾部则要保持可继续执行，但两者都不应携带巨型原文。
+fn cap_tool_results(messages: &[Value], max_chars: usize) -> (Vec<Value>, usize) {
     let mut capped = 0;
     let compacted = messages
         .iter()
@@ -842,13 +875,16 @@ async fn compact_messages(
         return Ok(None);
     }
 
+    // 摘要模型只读取折叠后的工具证据，避免冷启动或单次巨型输出直接撑爆摘要请求。
+    let (summary_input, summarized_capped_results) =
+        cap_tool_results(&messages[..split_index], MAX_RETAINED_TOOL_RESULT_CHARS);
     let response = summarizer
-        .summarize(route, &messages[..split_index], summary_max_tokens)
+        .summarize(route, &summary_input, summary_max_tokens)
         .await?;
     let summary = normalize_model_summary(&response.text)?;
     // 保留区仍是原文，单条超长结果会让尾部继续占据数万 token；这里只封顶不清空。
-    let (retained, capped_results) =
-        cap_retained_tool_results(&messages[split_index..], MAX_RETAINED_TOOL_RESULT_CHARS);
+    let (retained, retained_capped_results) =
+        cap_tool_results(&messages[split_index..], MAX_RETAINED_TOOL_RESULT_CHARS);
     let mut compacted = Vec::with_capacity(retained.len() + 1);
     compacted.push(json!({
         "role": "developer",
@@ -865,7 +901,7 @@ async fn compact_messages(
     Ok(Some(CompactedMessages {
         messages: compacted,
         summarized_messages: split_index,
-        capped_results,
+        capped_results: summarized_capped_results.saturating_add(retained_capped_results),
         summary_usage: response.usage,
     }))
 }
@@ -1286,7 +1322,11 @@ mod tests {
             text_message("user", "分析上下文压缩"),
             text_message("assistant", "已定位压缩入口"),
             failed_tool_result_message(0, "读取配置失败：权限不足"),
-            tool_result_message(0, chars_to_exceed(test_budget().compact, 1)),
+            tool_result_message(0, MAX_RETAINED_TOOL_RESULT_CHARS * 4),
+            text_message(
+                "user",
+                "x".repeat(chars_to_exceed(test_budget().compact, 1)),
+            ),
             text_message("assistant", "已完成旧历史分析"),
             text_message("user", recent_request),
             text_message("assistant", "正在处理最新用例"),
@@ -1338,12 +1378,16 @@ mod tests {
             .expect("摘要应为文本");
         assert!(summary.contains("模型生成的上下文摘要"));
         assert!(!summary.contains("测试草稿"));
-        assert!(summarizer
-            .0
-            .lock()
-            .expect("记录锁不应损坏")
+        let summarized = summarizer.0.lock().expect("记录锁不应损坏");
+        assert!(summarized
             .iter()
             .any(|message| message.to_string().contains("读取配置失败：权限不足")));
+        assert!(summarized
+            .iter()
+            .filter_map(|message| message.pointer("/content/0/result/content"))
+            .filter_map(Value::as_str)
+            .any(|content| content.contains("characters elided")));
+        drop(summarized);
         assert_eq!(
             outcome.event.as_ref().expect("应发布压缩事件")["data"]["summary_usage"]
                 ["output_tokens"],
@@ -1354,6 +1398,58 @@ mod tests {
             .messages
             .iter()
             .any(|message| { message["content"][0]["text"].as_str() == Some(recent_request) }));
+    }
+
+    /// 工具结果收缩后低于完整水位时，不应再调用昂贵的模型摘要。
+    #[tokio::test]
+    async fn tool_result_reduction_can_avoid_full_compaction() {
+        struct RejectingSummarizer;
+
+        #[async_trait]
+        impl ContextSummarizer for RejectingSummarizer {
+            async fn summarize(
+                &self,
+                _route: &str,
+                _messages: &[Value],
+                _max_tokens: u32,
+            ) -> Result<SummaryResponse> {
+                Err(anyhow!("工具结果收缩后不应调用摘要模型"))
+            }
+        }
+
+        let size = chars_to_exceed(test_budget().compact, 6);
+        let mut messages = vec![
+            text_message("user", "执行一组工具调用"),
+            text_message("assistant", "开始执行"),
+        ];
+        messages.extend((0..6).map(|index| tool_result_message(index, size)));
+        messages.push(text_message("assistant", "工具调用已完成"));
+        messages.push(text_message("user", "继续处理结果"));
+        let outcome = compress_context(
+            ContextLoadRequest {
+                run_id: "reduce-before-summary".into(),
+                user_initiated: false,
+                step: 1,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages,
+            },
+            false,
+            test_budget(),
+            &RejectingSummarizer,
+            0,
+        )
+        .await
+        .expect("工具结果收缩应避免完整摘要");
+
+        let event = outcome.event.expect("应发布工具结果收缩事件");
+        assert_eq!(event["name"], "context.micro_compaction.completed");
+        assert!(event["data"]["estimated_tokens_after"]
+            .as_u64()
+            .is_some_and(|tokens| tokens < test_budget().compact as u64));
+        assert_eq!(event["data"]["cleared_tool_results"], 3);
+        assert_eq!(event["data"]["capped_tool_results"], 3);
     }
 
     /// 水位必须随真实上下文窗口伸缩，而不是按模型名猜测。
