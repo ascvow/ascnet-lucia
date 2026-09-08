@@ -500,8 +500,8 @@ mod tests {
     #[test]
     fn settings_without_http_base_url_have_no_endpoint() {
         let settings = resolve_plugin_settings(
-            "code-context",
-            "plugin:code-context",
+            "http-client",
+            "plugin:http-client",
             table("max_entries = 20\n"),
             None,
             &defaults(),
@@ -515,8 +515,8 @@ mod tests {
     #[test]
     fn http_endpoint_is_parsed_and_credentials_stay_host_side() {
         let settings = resolve_plugin_settings(
-            "code-context",
-            "plugin:code-context",
+            "http-client",
+            "plugin:http-client",
             table(
                 "http_base_url = \"https://api.openai.com/v1/\"\nhttp_api_key = \"sk-test\"\nembedding_mode = \"api\"\n",
             ),
@@ -545,8 +545,8 @@ mod tests {
     #[test]
     fn http_endpoint_without_credentials_is_accepted() {
         let settings = resolve_plugin_settings(
-            "code-context",
-            "plugin:code-context",
+            "http-client",
+            "plugin:http-client",
             table("http_base_url = \"http://localhost:11434/v1/\"\n"),
             None,
             &defaults(),
@@ -561,8 +561,8 @@ mod tests {
     #[test]
     fn custom_auth_header_and_prefix_are_applied() {
         let settings = resolve_plugin_settings(
-            "code-context",
-            "plugin:code-context",
+            "http-client",
+            "plugin:http-client",
             table(
                 "http_base_url = \"https://example.com/\"\nhttp_api_key = \"k\"\nhttp_auth_header = \"x-api-key\"\nhttp_auth_prefix = \"\"\n",
             ),
@@ -582,8 +582,8 @@ mod tests {
     #[test]
     fn zero_http_limits_are_rejected() {
         let error = resolve_plugin_settings(
-            "code-context",
-            "plugin:code-context",
+            "http-client",
+            "plugin:http-client",
             table("http_base_url = \"https://example.com/\"\nhttp_timeout_ms = 0\n"),
             None,
             &defaults(),

@@ -14,7 +14,7 @@ const sharedTarget = join(repositoryRoot, 'target')
 /**
  * 定位 wasi-sdk 安装目录。
  *
- * 带 C 依赖的插件（例如 code-context-plugin 内嵌的 SQLite）需要 wasi-sdk 提供的 clang 与
+ * 带 C 依赖的插件需要 wasi-sdk 提供的 clang 与
  * wasm32-wasip2 sysroot 才能编译；纯 Rust 插件不需要。按 `WASI_SDK_PATH`、`~/.wasi-sdk`、
  * `/opt/wasi-sdk` 的顺序查找，找不到时返回 `undefined` 而不是报错——不能让纯 Rust 插件的
  * 构建被一个它用不到的工具链挡住。

@@ -441,11 +441,11 @@ mod data_dir_tests {
     #[test]
     fn data_dirs_are_stable_and_isolated() {
         let root = temp_root("isolation");
-        let first = plugin_data_dir(&root, "code-context", "workspace:demo").expect("创建数据目录");
+        let first = plugin_data_dir(&root, "data-plugin", "workspace:demo").expect("创建数据目录");
 
         assert_eq!(
             first,
-            plugin_data_dir(&root, "code-context", "workspace:demo").expect("重复解析")
+            plugin_data_dir(&root, "data-plugin", "workspace:demo").expect("重复解析")
         );
         assert_ne!(
             first,
@@ -453,7 +453,7 @@ mod data_dir_tests {
         );
         assert_ne!(
             first,
-            plugin_data_dir(&root, "code-context", "workspace:other").expect("另一项目")
+            plugin_data_dir(&root, "data-plugin", "workspace:other").expect("另一项目")
         );
         assert!(first.is_dir(), "数据目录必须已经创建");
         fs::remove_dir_all(root).expect("清理插件数据测试目录");

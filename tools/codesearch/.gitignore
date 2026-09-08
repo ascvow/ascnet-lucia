@@ -1,5 +1,0 @@
-# 索引数据目录（SQLite、USearch 快照与检查点）。就地索引本仓库时产生。
-.codesearch/
-
-# 本地配置：可能含有指向私有服务的地址。示例见 codesearch.example.toml。
-codesearch.toml
