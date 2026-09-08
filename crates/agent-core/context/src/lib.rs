@@ -11,6 +11,8 @@ use agent_core::{
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 /// 未知上下文窗口时假定的窗口大小。
@@ -148,13 +150,15 @@ struct CompressionState {
 /// 最近一次自动压缩的追加边界与有效模型上下文。
 #[derive(Clone)]
 struct CompressionCache {
-    /// 同一 Agent 运行内的会话消息只会追加，跨运行必须使缓存失效。
+    /// 跨运行必须使缓存失效；同一运行内仍需校验消息前缀，防止动态提示或历史被修订。
     run_id: String,
     provider: String,
     model: String,
     system: Option<String>,
     /// 生成压缩结果时原始上下文的消息数，用于识别后续追加内容。
     source_message_count: usize,
+    /// 原始消息前缀的稳定摘要；内容被修订时不得复用旧压缩结果。
+    source_messages_digest: [u8; 32],
     /// 上一轮生效的微压缩清理边界，即已被清空的成功工具结果条数。
     micro_cleared: usize,
     loaded_messages: Vec<Value>,
@@ -213,22 +217,47 @@ impl NativeContextLoader {
         &self,
         request: ContextLoadRequest,
     ) -> Result<(ContextLoadRequest, CachePlan)> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?;
         if request.user_initiated {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?;
             state.cache = None;
             return Ok((request, CachePlan::Manual));
         }
-        let cache = state.cache.clone();
-        let cache_hit = cache.as_ref().is_some_and(|cache| {
+        // 大历史的摘要计算不应占用缓存锁，否则并行请求会被纯 CPU 工作串行阻塞。
+        let cache = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?
+            .cache
+            .clone();
+        let cache_candidate = cache.as_ref().filter(|cache| {
             cache.run_id == request.run_id
                 && cache.provider == request.provider
                 && cache.model == request.model
                 && cache.system == request.system
                 && request.messages.len() >= cache.source_message_count
         });
+        let cache_hit = match cache_candidate {
+            Some(cache) => {
+                message_digest(&request.messages[..cache.source_message_count])?
+                    == cache.source_messages_digest
+            }
+            None => false,
+        };
+        let source_messages_digest = if let Some(cache) = cache_candidate
+            .filter(|cache| cache_hit && request.messages.len() == cache.source_message_count)
+        {
+            Some(cache.source_messages_digest)
+        } else if cache_hit
+            || estimate_context_tokens(request.system.as_deref(), &request.messages)
+                >= compaction_budget(self.context_window, self.max_summary_tokens as usize).micro
+        {
+            Some(message_digest(&request.messages)?)
+        } else {
+            None
+        };
         // 缓存未命中说明前缀不是上一轮的延续，清理边界必须从零重新推导。
         let micro_floor = cache
             .as_ref()
@@ -240,6 +269,7 @@ impl NativeContextLoader {
             model: request.model.clone(),
             system: request.system.clone(),
             source_message_count: request.messages.len(),
+            source_messages_digest,
             micro_floor,
             cache_hit,
         };
@@ -272,15 +302,19 @@ impl NativeContextLoader {
                 model,
                 system,
                 source_message_count,
+                source_messages_digest,
                 cache_hit,
                 ..
             } if cache_hit || outcome.event.is_some() => {
+                let source_messages_digest = source_messages_digest
+                    .ok_or_else(|| anyhow!("原生上下文压缩缓存缺少原始消息摘要"))?;
                 state.cache = Some(CompressionCache {
                     run_id,
                     provider,
                     model,
                     system,
                     source_message_count,
+                    source_messages_digest,
                     micro_cleared: outcome.micro_cleared,
                     loaded_messages: outcome.context.messages.clone(),
                 });
@@ -315,6 +349,8 @@ enum CachePlan {
         model: String,
         system: Option<String>,
         source_message_count: usize,
+        /// 本轮原始消息的稳定摘要；未达到压缩水位且没有旧缓存时延迟计算。
+        source_messages_digest: Option<[u8; 32]>,
         /// 本轮允许沿用的微压缩清理边界下限。
         micro_floor: usize,
         cache_hit: bool,
@@ -409,6 +445,7 @@ async fn compress_context(
         compact: compact_threshold,
         micro: micro_threshold,
         recent_target,
+        summary_max_tokens,
     } = budget;
 
     if manual || before_tokens >= compact_threshold {
@@ -417,6 +454,7 @@ async fn compress_context(
             &request.run_id,
             manual,
             recent_target,
+            summary_max_tokens,
             summarizer,
         )
         .await?
@@ -448,7 +486,7 @@ async fn compress_context(
                         "summary_usage": summary_usage,
                         "trigger": if manual { "manual" } else { "auto" },
                         "strategy": "model_summary_with_recent_tail",
-                        "summary_max_output_tokens": DEFAULT_MAX_SUMMARY_TOKENS
+                        "summary_max_output_tokens": summary_max_tokens
                     },
                     "presentation": {
                         "target": "main_event_list",
@@ -556,6 +594,8 @@ struct CompactionBudget {
     micro: usize,
     /// 完整压缩后期望保留的近期上下文规模。
     recent_target: usize,
+    /// 本轮摘要模型实际允许的最大输出 token 数。
+    summary_max_tokens: u32,
 }
 
 /// 按上下文窗口与摘要输出预算推导各级水位。
@@ -572,13 +612,44 @@ fn compaction_budget(context_window: Option<usize>, summary_tokens: usize) -> Co
     // 小窗口扣完预留可能归零，此时用窗口比例兜底，避免每轮都压缩。
     let compact = window
         .saturating_sub(reserved)
-        .max(window * MIN_COMPACT_THRESHOLD_RATIO / 100)
+        .max(percentage_of(window, MIN_COMPACT_THRESHOLD_RATIO))
         .max(1);
     CompactionBudget {
         compact,
-        micro: (compact * MICRO_COMPACT_THRESHOLD_RATIO / 100).max(1),
-        recent_target: (window * RECENT_CONTEXT_TARGET_RATIO / 100).max(1),
+        micro: percentage_of(compact, MICRO_COMPACT_THRESHOLD_RATIO).max(1),
+        recent_target: percentage_of(window, RECENT_CONTEXT_TARGET_RATIO).max(1),
+        summary_max_tokens: u32::try_from(summary_tokens).unwrap_or(u32::MAX).max(1),
     }
+}
+
+/// 计算不超过百分之百的整数比例，并在极大上下文窗口下避免乘法溢出。
+fn percentage_of(value: usize, percentage: usize) -> usize {
+    value / 100 * percentage + value % 100 * percentage / 100
+}
+
+/// 把序列化消息直接写入 SHA-256，避免为大历史额外分配完整 JSON 字符串。
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl Write for DigestWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 计算消息序列的稳定摘要；零字节分隔符用于保留消息边界。
+fn message_digest(messages: &[Value]) -> Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    for message in messages {
+        serde_json::to_writer(DigestWriter(&mut digest), message)
+            .context("计算原生上下文消息摘要失败")?;
+        digest.update([0]);
+    }
+    Ok(digest.finalize().into())
 }
 
 /// 用序列化字节数进行估算，ASCII 与非 ASCII 分别计费。
@@ -758,6 +829,7 @@ async fn compact_messages(
     route: &str,
     manual: bool,
     recent_target: usize,
+    summary_max_tokens: u32,
     summarizer: &dyn ContextSummarizer,
 ) -> Result<Option<CompactedMessages>> {
     let group_starts = api_round_group_starts(messages);
@@ -771,7 +843,7 @@ async fn compact_messages(
     }
 
     let response = summarizer
-        .summarize(route, &messages[..split_index], DEFAULT_MAX_SUMMARY_TOKENS)
+        .summarize(route, &messages[..split_index], summary_max_tokens)
         .await?;
     let summary = normalize_model_summary(&response.text)?;
     // 保留区仍是原文，单条超长结果会让尾部继续占据数万 token；这里只封顶不清空。
@@ -1155,7 +1227,7 @@ mod tests {
         assert_eq!(first.micro_cleared, 3);
 
         // 追加一条新结果：积压只有一条，远不到一批，边界必须原地不动。
-        let mut extended = first.context.messages.clone();
+        let mut extended = messages;
         extended.push(tool_result_message(6, size));
         let (prepared, plan) = loader
             .prepare_request(request(extended.clone()))
@@ -1173,7 +1245,9 @@ mod tests {
         assert_eq!(second.micro_cleared, 3);
         assert!(second.event.is_none(), "边界未推进时不应发布微压缩事件");
         // 前缀逐字节不变，新消息只在末尾追加，服务端缓存才能继续命中。
-        assert_eq!(second.context.messages, extended);
+        let mut expected = first.context.messages;
+        expected.push(tool_result_message(6, size));
+        assert_eq!(second.context.messages, expected);
     }
 
     /// 微压缩不能清理失败结果，否则后续模型会失去仍待处理的错误状态。
@@ -1309,6 +1383,18 @@ mod tests {
         assert!(budget.compact > 0);
         assert!(budget.micro > 0);
         assert!(budget.recent_target > 0);
+    }
+
+    /// 极大窗口的比例预算不得因中间乘法溢出而回绕或 panic。
+    #[test]
+    fn maximum_window_budget_avoids_percentage_overflow() {
+        let budget = compaction_budget(Some(usize::MAX), DEFAULT_MAX_SUMMARY_TOKENS as usize);
+
+        assert_eq!(
+            budget.recent_target,
+            percentage_of(usize::MAX, RECENT_CONTEXT_TARGET_RATIO)
+        );
+        assert!(budget.micro < budget.compact);
     }
 
     /// 英文与中文按不同字节率折算，避免英文会话被高估而提前压缩。
@@ -1523,6 +1609,129 @@ mod tests {
         assert_eq!(
             second.context.messages.last(),
             Some(&text_message("user", "检查刚才的修改"))
+        );
+    }
+
+    /// 同一运行内的历史被修订时必须使缓存失效，不能只凭消息数量沿用旧摘要。
+    #[tokio::test]
+    async fn incremental_compaction_rejects_revised_source_prefix() {
+        let large_history = "历史工具输出".repeat(90_000);
+        let original_messages = vec![
+            text_message("user", &large_history),
+            text_message("assistant", "已分析历史"),
+            text_message("user", "继续处理"),
+            text_message("assistant", "正在处理"),
+        ];
+        let loader = NativeContextLoader::new(
+            ModelGateway::new(),
+            "test",
+            "test-model",
+            false,
+            DEFAULT_MAX_SUMMARY_TOKENS,
+            Arc::new(agent_core::InMemoryEventSink::new()),
+        )
+        .expect("应创建原生上下文加载器");
+        let (request, plan) = loader
+            .prepare_request(ContextLoadRequest {
+                run_id: "revised-run".into(),
+                step: 0,
+                user_initiated: false,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages: original_messages.clone(),
+            })
+            .expect("应准备首次压缩请求");
+        let first = compress_context(request, false, test_budget(), &TestSummarizer, 0)
+            .await
+            .expect("首次压缩应成功");
+        loader
+            .commit_cache(plan, &first)
+            .expect("应提交首次压缩缓存");
+
+        let mut revised_messages = original_messages;
+        revised_messages[2] = text_message("user", "修正：改为检查缓存一致性");
+        revised_messages.push(text_message("assistant", "已收到修正"));
+        let (prepared, plan) = loader
+            .prepare_request(ContextLoadRequest {
+                run_id: "revised-run".into(),
+                step: 1,
+                user_initiated: false,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages: revised_messages.clone(),
+            })
+            .expect("修订历史后仍应准备请求");
+
+        assert_eq!(prepared.messages, revised_messages);
+        assert!(matches!(
+            plan,
+            CachePlan::Automatic {
+                cache_hit: false,
+                micro_floor: 0,
+                ..
+            }
+        ));
+    }
+
+    /// 自定义摘要上限必须同时约束模型调用并写入压缩事件。
+    #[tokio::test]
+    async fn compaction_uses_configured_summary_token_limit() {
+        struct TokenRecordingSummarizer(Mutex<Vec<u32>>);
+
+        #[async_trait]
+        impl ContextSummarizer for TokenRecordingSummarizer {
+            async fn summarize(
+                &self,
+                route: &str,
+                messages: &[Value],
+                max_tokens: u32,
+            ) -> Result<SummaryResponse> {
+                self.0
+                    .lock()
+                    .expect("摘要上限记录锁不应损坏")
+                    .push(max_tokens);
+                TestSummarizer.summarize(route, messages, max_tokens).await
+            }
+        }
+
+        let max_summary_tokens = 1_234;
+        let budget = compaction_budget(None, max_summary_tokens as usize);
+        let summarizer = TokenRecordingSummarizer(Mutex::new(Vec::new()));
+        let outcome = compress_context(
+            ContextLoadRequest {
+                run_id: "custom-summary-limit".into(),
+                step: 0,
+                user_initiated: false,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages: vec![
+                    text_message("user", "x".repeat(chars_to_exceed(budget.compact, 1))),
+                    text_message("assistant", "已处理旧历史"),
+                    text_message("user", "继续处理"),
+                ],
+            },
+            false,
+            budget,
+            &summarizer,
+            0,
+        )
+        .await
+        .expect("自定义摘要上限的压缩应成功");
+
+        assert_eq!(
+            summarizer
+                .0
+                .lock()
+                .expect("摘要上限记录锁不应损坏")
+                .as_slice(),
+            &[max_summary_tokens]
+        );
+        assert_eq!(
+            outcome.event.expect("应发布压缩事件")["data"]["summary_max_output_tokens"],
+            max_summary_tokens
         );
     }
 
