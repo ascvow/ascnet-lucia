@@ -172,6 +172,10 @@ struct Selection {
     end_byte: i64,
     start_line: u32,
     end_line: u32,
+    /// 扩展或合并不能改变原始最高分命中的预算锚点。
+    anchor_start_byte: i64,
+    anchor_end_byte: i64,
+    anchor_start_line: u32,
     score: f64,
     matched_by: Vec<MatchSource>,
     exact: bool,
@@ -191,6 +195,9 @@ impl Selection {
             end_byte: row.end_byte,
             start_line: row.start_line,
             end_line: row.end_line,
+            anchor_start_byte: row.start_byte,
+            anchor_end_byte: row.end_byte,
+            anchor_start_line: row.start_line,
             score: candidate.score,
             matched_by: candidate.matched_by.clone(),
             exact: candidate.exact,
@@ -293,12 +300,13 @@ pub fn assemble(store: &Store, input: &AssembleInput<'_>) -> Result<AssembleOutp
         } else {
             remaining - overhead
         };
-        let (content, truncated, end_line) =
-            truncate_to_lines(&content, selection.start_line, content_budget);
+        let (content, truncated, start_line, end_line, start_byte) =
+            truncate_selection(&content, &selection, content_budget);
         crate::diagnostics::record("budget", || {
             serde_json::json!({
                 "selection":selection,"content_budget":content_budget,"truncated":truncated,
-                "end_line":end_line,"end_byte":selection.start_byte + content.len() as i64,
+                "start_line":start_line,"start_byte":start_byte,
+                "end_line":end_line,"end_byte":start_byte + content.len() as i64,
                 "result_index":output.results.len()
             })
         });
@@ -316,7 +324,7 @@ pub fn assemble(store: &Store, input: &AssembleInput<'_>) -> Result<AssembleOutp
             CodeRef::new(
                 selection.chunk_id,
                 &selection.file_hash,
-                selection.start_line,
+                start_line,
                 end_line,
             )
         } else {
@@ -330,7 +338,7 @@ pub fn assemble(store: &Store, input: &AssembleInput<'_>) -> Result<AssembleOutp
             kind: selection.kind,
             file_hash: selection.file_hash.clone(),
             revision_id: selection.revision_id,
-            start_line: selection.start_line,
+            start_line,
             end_line,
             matched_by: selection.matched_by.clone(),
             score: selection.score,
@@ -439,10 +447,7 @@ fn merge_adjacent(mut selections: Vec<Selection>) -> Vec<Selection> {
             *last = specific;
             continue;
         }
-        // 两个各自成答案的定义不合并。合并后范围横跨两个函数，符号名却只留下
-        // 排在前面的那个，等于给结果贴了错标签：实测查「表单校验失败提示」命中
-        // `handleSubmit`，却因为与相邻的 `handleDelete` 合并而显示成后者，
-        // 正确结果看上去像是搜错了。常量、CSS 选择器这类天然成组的仍然合并。
+        // 两个独立定义保持分离；与无名上下文合并时由原始命中锚点保证预算优先级。
         if same_revision
             && overlaps
             && adjacent_lines
@@ -456,6 +461,14 @@ fn merge_adjacent(mut selections: Vec<Selection>) -> Vec<Selection> {
             continue;
         }
         if same_revision && overlaps && adjacent_lines {
+            // 合并只扩大可读上下文；预算不足时仍以原始最高分命中为起点。
+            if selection.score > last.score
+                || (selection.score == last.score && selection.exact && !last.exact)
+            {
+                last.anchor_start_byte = selection.anchor_start_byte;
+                last.anchor_end_byte = selection.anchor_end_byte;
+                last.anchor_start_line = selection.anchor_start_line;
+            }
             last.end_byte = last.end_byte.max(selection.end_byte);
             last.end_line = last.end_line.max(selection.end_line);
             last.start_byte = last.start_byte.min(selection.start_byte);
@@ -569,6 +582,41 @@ fn truncate_to_lines(content: &str, start_line: u32, budget: usize) -> (String, 
     }
     let end_line = start_line + kept_lines.saturating_sub(1);
     (kept, true, end_line.max(start_line))
+}
+
+/// 优先保留原始命中；头部窗口放不下锚点时，从锚点开始取连续原文，不拼接或生成代码。
+/// 返回正文、截断标记、实际起止行和起始字节，供引用和旁路诊断使用。
+fn truncate_selection(
+    content: &str,
+    selection: &Selection,
+    budget: usize,
+) -> (String, bool, u32, u32, i64) {
+    let (prefix, truncated, end_line) = truncate_to_lines(content, selection.start_line, budget);
+    if truncated && selection.start_byte + (prefix.len() as i64) < selection.anchor_end_byte {
+        let offset = selection
+            .anchor_start_byte
+            .saturating_sub(selection.start_byte) as usize;
+        if offset > 0 {
+            if let Some(anchored) = content.get(offset..) {
+                let (body, _, end) =
+                    truncate_to_lines(anchored, selection.anchor_start_line, budget);
+                return (
+                    body,
+                    true,
+                    selection.anchor_start_line,
+                    end,
+                    selection.anchor_start_byte,
+                );
+            }
+        }
+    }
+    (
+        prefix,
+        truncated,
+        selection.start_line,
+        end_line,
+        selection.start_byte,
+    )
 }
 
 /// 统计文本行数（末尾无换行时最后一段也算一行）。
@@ -707,6 +755,9 @@ mod tests {
             end_byte: (end_line as i64 + 1) * 40,
             start_line,
             end_line,
+            anchor_start_byte: start_line as i64 * 40,
+            anchor_end_byte: (end_line as i64 + 1) * 40,
+            anchor_start_line: start_line,
             score: 0.01,
             matched_by: vec![MatchSource::Fts],
             exact: false,
@@ -751,6 +802,38 @@ mod tests {
             selection(2, ChunkKind::Rule, Some(".header"), 25, 29),
         ]);
         assert_eq!(rules.len(), 1, "相邻 CSS 规则应合并展示");
+    }
+
+    /// 与前导文本合并后，最高分函数仍提供原始预算锚点。
+    #[test]
+    fn leading_text_does_not_swallow_function() {
+        let mut function = selection(2, ChunkKind::Function, Some("startRecording"), 101, 104);
+        function.score = 0.02;
+        let merged = merge_adjacent(vec![selection(1, ChunkKind::Text, None, 1, 100), function]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].anchor_start_line, 101);
+    }
+
+    /// 多字节与 CRLF 下的锚点窗口仍与真实字节、行号一致；预算充足时保留完整上下文。
+    #[test]
+    fn budget_preserves_original_anchor_after_expansion() {
+        let prefix = "无关上下文\r\n".repeat(40);
+        let body = "执行录音();\r\n结束();\r\n";
+        let content = format!("{prefix}{body}");
+        let mut item = selection(1, ChunkKind::Text, None, 1, 42);
+        item.start_byte = 0;
+        item.end_byte = content.len() as i64;
+        item.anchor_start_byte = prefix.len() as i64;
+        item.anchor_end_byte = content.len() as i64;
+        item.anchor_start_line = 41;
+        let (text, truncated, start, end, byte) = truncate_selection(&content, &item, 30);
+        assert_eq!(text, body);
+        assert!(truncated);
+        assert_eq!((start, end, byte), (41, 42, prefix.len() as i64));
+        let (text, truncated, start, _, _) = truncate_selection(&content, &item, 10000);
+        assert_eq!(text, content);
+        assert!(!truncated);
+        assert_eq!(start, 1);
     }
 
     #[test]

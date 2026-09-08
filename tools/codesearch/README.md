@@ -341,6 +341,9 @@ score(d) = Σ weight_i / (k + rank_i(d))
 [同次调用损失诊断](reports/real-projects-stages-2026-09-08.md)进一步定位：默认 22 道实现题中，
 4 道未召回、4 道候选截断、4 道输出选择丢失、2 道正文裁剪，最终命中 8 道。本轮仅添加诊断，未优化算法。
 
+随后增加[原始命中锚点保留](reports/context-anchor-2026-09-08.md)：固定真实候选重放与 MCP 验证中，
+实现 Top-10 从 8/22 到 9/22，无已实现问题名次退步；这只是局部内容丢失修复，不代表整体可靠性达标。
+
 ```bash
 cargo fmt --all -- --check                               # 通过
 cargo clippy --all-features --all-targets -- -D warnings # 通过，无告警

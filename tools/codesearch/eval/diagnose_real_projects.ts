@@ -119,7 +119,9 @@ async function main() {
       for (const name of ["selected", "expanded", "ordered"]) ranks[name] = rank(stages[name] ?? [], target.locations);
       const budgets = trace.stages.filter((stage: any) => stage.stage === "budget").map((stage: any) => stage.data);
       ranks.budget_before = rank(budgets.map((budget: any) => budget.selection), target.locations);
-      ranks.budget_after = rank(budgets.map((budget: any) => ({ ...budget.selection, end_line: budget.end_line, end_byte: budget.end_byte })), target.locations);
+      ranks.budget_after = rank(budgets.map((budget: any) => ({ ...budget.selection,
+        start_line: budget.start_line ?? budget.selection.start_line, start_byte: budget.start_byte ?? budget.selection.start_byte,
+        end_line: budget.end_line, end_byte: budget.end_byte })), target.locations);
       ranks.final = row.observation.implementation_rank;
       if (ranks.budget_after !== ranks.final) throw new Error(`${row.id} 阶段字节判定与实际返回判定不一致`);
       rows.push({ id: row.id, query: row.query, kind: target.kind, supplement: php, ranks,
