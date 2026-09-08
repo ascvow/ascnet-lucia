@@ -159,7 +159,7 @@ pub struct AssembleOutput {
 }
 
 /// 组装过程中的一个待选片段。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct Selection {
     chunk_id: i64,
     revision_id: i64,
@@ -221,7 +221,10 @@ pub fn assemble(store: &Store, input: &AssembleInput<'_>) -> Result<AssembleOutp
         return Ok(AssembleOutput::default());
     }
 
+    // 记录范围变化，离线区分扩展、合并与预算裁剪；不复制源码正文。
+    crate::diagnostics::record("selected", || serde_json::json!(selections));
     expand_to_containing_symbols(store, &mut selections)?;
+    crate::diagnostics::record("expanded", || serde_json::json!(selections));
     let mut merged = merge_adjacent(selections);
     // 融合分数降序；同分时按路径与起始行保证确定性。
     merged.sort_by(|a, b| {
@@ -236,6 +239,7 @@ pub fn assemble(store: &Store, input: &AssembleInput<'_>) -> Result<AssembleOutp
             .then(a.start_line.cmp(&b.start_line))
     });
     let ordered = reserve_test_slots(merged, input.plan, input.max_results);
+    crate::diagnostics::record("ordered", || serde_json::json!(ordered));
 
     let mut output = AssembleOutput::default();
     let mut seen_content: HashSet<String> = HashSet::new();
@@ -291,6 +295,13 @@ pub fn assemble(store: &Store, input: &AssembleInput<'_>) -> Result<AssembleOutp
         };
         let (content, truncated, end_line) =
             truncate_to_lines(&content, selection.start_line, content_budget);
+        crate::diagnostics::record("budget", || {
+            serde_json::json!({
+                "selection":selection,"content_budget":content_budget,"truncated":truncated,
+                "end_line":end_line,"end_byte":selection.start_byte + content.len() as i64,
+                "result_index":output.results.len()
+            })
+        });
         if content.is_empty() {
             output.truncated = true;
             break;

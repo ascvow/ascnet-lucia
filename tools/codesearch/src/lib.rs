@@ -14,6 +14,7 @@ pub mod api;
 pub mod chunker;
 pub mod config;
 pub mod context;
+mod diagnostics;
 pub mod engine;
 pub mod error;
 pub mod indexer;

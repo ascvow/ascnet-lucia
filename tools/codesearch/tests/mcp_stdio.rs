@@ -22,6 +22,14 @@ const NO_PROVIDER_CONFIG: &str = "[embedding]\nprovider = \"none\"\n";
 ///
 /// 关闭 watch，避免后台监听带来时序不确定性。
 async fn start_server(root: &Path) -> RunningService<RoleClient, ()> {
+    start_server_with_trace(root, None).await
+}
+
+/// 诊断开关只注入子进程，避免并行测试修改全局环境；默认清除继承的开关。
+async fn start_server_with_trace(
+    root: &Path,
+    trace: Option<&Path>,
+) -> RunningService<RoleClient, ()> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codesearch"));
     command
         .arg("serve")
@@ -34,8 +42,77 @@ async fn start_server(root: &Path) -> RunningService<RoleClient, ()> {
         // 保持默认日志级别：子进程 stderr 会直接进入测试输出，开高会淹没结果。
         // stdout 纯净性由 `stdout_carries_only_protocol_frames` 在 trace 级别单独验证。
         .env("CODESEARCH_LOG", "warn");
+    command.env_remove("CODESEARCH_TRACE_JSONL");
+    if let Some(path) = trace {
+        command.env("CODESEARCH_TRACE_JSONL", path);
+    }
     let process = rmcp::transport::TokioChildProcess::new(command).expect("启动 codesearch serve");
     ().serve(process).await.expect("MCP 握手")
+}
+
+/// 重启扫描会推进目录 epoch；其他搜索及读取字段必须一致，且日志不得含源码。
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_preserve_search_and_read_responses() {
+    let repo = sample_repo();
+    write_file(&repo.path().join("codesearch.toml"), NO_PROVIDER_CONFIG);
+    let logs = tempfile::tempdir().unwrap();
+    let trace = logs.path().join("trace.jsonl");
+    let mut baseline: Vec<(serde_json::Value, serde_json::Value)> = Vec::new();
+    for enabled in [false, true] {
+        let service =
+            start_server_with_trace(repo.path(), enabled.then_some(trace.as_path())).await;
+        for (index, query) in [
+            "RetryPolicy",
+            "请求失败后的重试逻辑在哪里",
+            "nonexistent_symbol_abcdef",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut response = structured(
+                &call(
+                    &service,
+                    "search_context",
+                    serde_json::json!({"query":query}),
+                )
+                .await
+                .unwrap(),
+            );
+            response.as_object_mut().unwrap().remove("catalog_epoch");
+            let read = if let Some(hit) = response["results"].as_array().unwrap().first() {
+                structured(
+                    &call(
+                        &service,
+                        "read_code",
+                        serde_json::json!({"code_ref":hit["code_ref"]}),
+                    )
+                    .await
+                    .unwrap(),
+                )
+            } else {
+                serde_json::Value::Null
+            };
+            if enabled {
+                assert_eq!((&response, &read), (&baseline[index].0, &baseline[index].1));
+            } else {
+                baseline.push((response, read));
+            }
+        }
+        service.cancel().await.unwrap();
+    }
+    let text = std::fs::read_to_string(trace).unwrap();
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 3);
+    assert!(!text.contains("\"content\":"));
+    assert_eq!(records[0]["query"], "RetryPolicy");
+    assert!(records[0]["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|stage| stage["stage"] == "budget"));
 }
 
 /// 调用一个工具。

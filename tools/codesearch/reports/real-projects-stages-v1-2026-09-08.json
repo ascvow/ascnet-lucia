@@ -1,0 +1,3059 @@
+{
+  "schema": 1,
+  "label": "stages-v1",
+  "queries_sha256": "671be2325bdf3409546e5e447a981fb5ddbb5664b74a51ce822b3af4081bcb12",
+  "truth_sha256": "be47ce98129d5134194d4f936adbcfa4bf1e042ab48cf6f8e8283e3ec2227236",
+  "diagnostic_binary_sha256": "aaf29bc378f22f3a8dd1fa8b3ab69e3b361bdc99f848d06fed1f15f5ffa61049",
+  "baseline_binary_sha256": "a83dd72146eda120f1ebd74a901d5763cb8e1def33798fe13bdfcd34b7afd05a",
+  "integrity": [
+    {
+      "id": "1007",
+      "changed": [],
+      "added": [],
+      "git_available": true,
+      "git_status_unchanged": true,
+      "source_unchanged": true
+    },
+    {
+      "id": "1182",
+      "changed": [],
+      "added": [],
+      "git_available": true,
+      "git_status_unchanged": true,
+      "source_unchanged": true
+    },
+    {
+      "id": "1167",
+      "changed": [],
+      "added": [],
+      "git_available": true,
+      "git_status_unchanged": true,
+      "source_unchanged": true
+    },
+    {
+      "id": "1086",
+      "changed": [],
+      "added": [],
+      "git_available": false,
+      "git_status_unchanged": null,
+      "source_unchanged": true
+    },
+    {
+      "id": "1507",
+      "changed": [],
+      "added": [],
+      "git_available": true,
+      "git_status_unchanged": true,
+      "source_unchanged": true
+    },
+    {
+      "id": "1491",
+      "changed": [],
+      "added": [],
+      "git_available": true,
+      "git_status_unchanged": true,
+      "source_unchanged": true
+    }
+  ],
+  "comparisons": [
+    {
+      "id": "1007-1",
+      "response_identical_except_epoch": true,
+      "before_epoch": 76,
+      "after_epoch": 76,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1007-2",
+      "response_identical_except_epoch": false,
+      "before_epoch": 76,
+      "after_epoch": 76,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1007-3",
+      "response_identical_except_epoch": true,
+      "before_epoch": 76,
+      "after_epoch": 76,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1007-4",
+      "response_identical_except_epoch": false,
+      "before_epoch": 76,
+      "after_epoch": 76,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1007-5",
+      "response_identical_except_epoch": true,
+      "before_epoch": 76,
+      "after_epoch": 76,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1007-6",
+      "response_identical_except_epoch": true,
+      "before_epoch": 76,
+      "after_epoch": 76,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1182-1",
+      "response_identical_except_epoch": true,
+      "before_epoch": 74,
+      "after_epoch": 74,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1182-2",
+      "response_identical_except_epoch": true,
+      "before_epoch": 74,
+      "after_epoch": 74,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1182-3",
+      "response_identical_except_epoch": true,
+      "before_epoch": 74,
+      "after_epoch": 74,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1182-4",
+      "response_identical_except_epoch": true,
+      "before_epoch": 74,
+      "after_epoch": 74,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1182-5",
+      "response_identical_except_epoch": true,
+      "before_epoch": 74,
+      "after_epoch": 74,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1182-6",
+      "response_identical_except_epoch": true,
+      "before_epoch": 74,
+      "after_epoch": 74,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1167-1",
+      "response_identical_except_epoch": true,
+      "before_epoch": 46,
+      "after_epoch": 46,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1167-2",
+      "response_identical_except_epoch": true,
+      "before_epoch": 46,
+      "after_epoch": 46,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1167-3",
+      "response_identical_except_epoch": true,
+      "before_epoch": 46,
+      "after_epoch": 46,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1167-4",
+      "response_identical_except_epoch": true,
+      "before_epoch": 46,
+      "after_epoch": 46,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1167-5",
+      "response_identical_except_epoch": true,
+      "before_epoch": 46,
+      "after_epoch": 46,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1167-6",
+      "response_identical_except_epoch": true,
+      "before_epoch": 46,
+      "after_epoch": 46,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1086-1",
+      "response_identical_except_epoch": true,
+      "before_epoch": 433,
+      "after_epoch": 433,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1086-2",
+      "response_identical_except_epoch": true,
+      "before_epoch": 433,
+      "after_epoch": 433,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1086-3",
+      "response_identical_except_epoch": true,
+      "before_epoch": 433,
+      "after_epoch": 433,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1086-4",
+      "response_identical_except_epoch": false,
+      "before_epoch": 433,
+      "after_epoch": 433,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1086-5",
+      "response_identical_except_epoch": true,
+      "before_epoch": 433,
+      "after_epoch": 433,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1086-6",
+      "response_identical_except_epoch": true,
+      "before_epoch": 433,
+      "after_epoch": 433,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1507-1",
+      "response_identical_except_epoch": true,
+      "before_epoch": 495,
+      "after_epoch": 495,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1507-2",
+      "response_identical_except_epoch": true,
+      "before_epoch": 495,
+      "after_epoch": 495,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1507-3",
+      "response_identical_except_epoch": true,
+      "before_epoch": 495,
+      "after_epoch": 495,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1507-4",
+      "response_identical_except_epoch": true,
+      "before_epoch": 495,
+      "after_epoch": 495,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1507-5",
+      "response_identical_except_epoch": false,
+      "before_epoch": 495,
+      "after_epoch": 495,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1507-6",
+      "response_identical_except_epoch": true,
+      "before_epoch": 495,
+      "after_epoch": 495,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1491-1",
+      "response_identical_except_epoch": true,
+      "before_epoch": 122,
+      "after_epoch": 122,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1491-2",
+      "response_identical_except_epoch": true,
+      "before_epoch": 122,
+      "after_epoch": 122,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1491-3",
+      "response_identical_except_epoch": true,
+      "before_epoch": 122,
+      "after_epoch": 122,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1491-4",
+      "response_identical_except_epoch": true,
+      "before_epoch": 122,
+      "after_epoch": 122,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1491-5",
+      "response_identical_except_epoch": true,
+      "before_epoch": 122,
+      "after_epoch": 122,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    },
+    {
+      "id": "1491-6",
+      "response_identical_except_epoch": true,
+      "before_epoch": 122,
+      "after_epoch": 122,
+      "file_rank_unchanged": true,
+      "implementation_rank_unchanged": true,
+      "references_verified": 10
+    }
+  ],
+  "default_losses": {
+    "recall_miss": 4,
+    "hit": 8,
+    "candidate_limit": 4,
+    "result_selection": 4,
+    "context_clipping": 2
+  },
+  "php_supplement_losses": {
+    "candidate_limit": 1,
+    "result_selection": 1,
+    "recall_miss": 2
+  },
+  "rows": [
+    {
+      "id": "1007-1",
+      "query": "酒店转让列表如何按地区筛选？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": null,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": null,
+        "prior": null,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "recall_miss",
+      "targets": [
+        {
+          "id": 452,
+          "path": "src/pages/modules/index.vue",
+          "start_line": 161,
+          "end_line": 172,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "酒店转让列表 按地区筛选？",
+        "terms": [
+          "酒店转让列表",
+          "酒店",
+          "店转",
+          "转让",
+          "让列",
+          "列表",
+          "按地区筛选",
+          "按地",
+          "地区",
+          "区筛",
+          "筛选"
+        ],
+        "symbols": [
+          "酒店转让列表",
+          "按地区筛选"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 832
+        }
+      ]
+    },
+    {
+      "id": "1007-2",
+      "query": "发布一条酒店信息时怎么提交填写的数据？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": null,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": null,
+        "prior": null,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "recall_miss",
+      "targets": [
+        {
+          "id": 477,
+          "path": "src/pages/publish/add.vue",
+          "start_line": 95,
+          "end_line": 141,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        },
+        {
+          "id": 492,
+          "path": "src/pages/publish/components/modules1.vue",
+          "start_line": 255,
+          "end_line": 278,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "发布一条酒店信息时 提交填写的数据？",
+        "terms": [
+          "发布一条酒店信息时",
+          "发布",
+          "布一",
+          "一条",
+          "条酒",
+          "酒店",
+          "店信",
+          "信息",
+          "息时",
+          "提交填写的数据",
+          "提交",
+          "交填",
+          "填写",
+          "写的",
+          "的数",
+          "数据"
+        ],
+        "symbols": [
+          "发布一条酒店信息时",
+          "提交填写的数据"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 832
+        }
+      ]
+    },
+    {
+      "id": "1007-3",
+      "query": "查看酒店详情时联系电话从哪里拨出？",
+      "kind": "unimplemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 1,
+        "fts": 11,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 2,
+        "prior": 2,
+        "candidates": 2,
+        "selected": 2,
+        "expanded": 2,
+        "ordered": 2,
+        "budget_before": 2,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "not_scored",
+      "targets": [
+        {
+          "id": 431,
+          "path": "src/pages/modules/detail.vue",
+          "start_line": 470,
+          "end_line": 505,
+          "kind": "text",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "src/pages/modules/detail.vue",
+          "before_start": 418,
+          "before_end": 505,
+          "after_end": 480,
+          "result_rank": 2,
+          "content_budget": 612
+        }
+      ],
+      "query_plan": {
+        "text": "查看酒店详情时联系电话从 拨出？",
+        "terms": [
+          "查看酒店详情时联系电话从",
+          "查看",
+          "看酒",
+          "酒店",
+          "店详",
+          "详情",
+          "情时",
+          "时联",
+          "联系",
+          "系电",
+          "电话",
+          "话从",
+          "拨出"
+        ],
+        "symbols": [
+          "查看酒店详情时联系电话从"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 832
+        }
+      ]
+    },
+    {
+      "id": "1007-4",
+      "query": "我发布过的信息是在哪里加载的？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": null,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": null,
+        "prior": null,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "recall_miss",
+      "targets": [
+        {
+          "id": 753,
+          "path": "src/pages/user/publish.vue",
+          "start_line": 114,
+          "end_line": 133,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "我发布过的信息是 加载的？",
+        "terms": [
+          "我发布过的信息是",
+          "我发",
+          "发布",
+          "布过",
+          "过的",
+          "的信",
+          "信息",
+          "息是",
+          "加载的",
+          "加载",
+          "载的"
+        ],
+        "symbols": [
+          "我发布过的信息是"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 832
+        }
+      ]
+    },
+    {
+      "id": "1007-5",
+      "query": "更换个人头像后怎么保存？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 2,
+        "fts": 28,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 8,
+        "prior": 8,
+        "candidates": 8,
+        "selected": 8,
+        "expanded": 8,
+        "ordered": 8,
+        "budget_before": 8,
+        "budget_after": 8,
+        "final": 8
+      },
+      "loss": "hit",
+      "targets": [
+        {
+          "id": 740,
+          "path": "src/pages/user/info.vue",
+          "start_line": 117,
+          "end_line": 134,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "src/pages/user/info.vue",
+          "before_start": 114,
+          "before_end": 134,
+          "after_end": 134,
+          "result_rank": 8,
+          "content_budget": 1527
+        }
+      ],
+      "query_plan": {
+        "text": "更换个人头像后 保存？",
+        "terms": [
+          "更换个人头像后",
+          "更换",
+          "换个",
+          "个人",
+          "人头",
+          "头像",
+          "像后",
+          "保存"
+        ],
+        "symbols": [
+          "更换个人头像后"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 832
+        }
+      ]
+    },
+    {
+      "id": "1007-6",
+      "query": "没有登录时如何阻止进入需要身份的页面？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 18,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 35,
+        "prior": 35,
+        "candidates": 35,
+        "selected": 35,
+        "expanded": 35,
+        "ordered": 1,
+        "budget_before": 1,
+        "budget_after": 1,
+        "final": 1
+      },
+      "loss": "hit",
+      "targets": [
+        {
+          "id": 381,
+          "path": "src/interceptors/route.js",
+          "start_line": 21,
+          "end_line": 36,
+          "kind": "const",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "src/interceptors/route.js",
+          "before_start": 10,
+          "before_end": 36,
+          "after_end": 36,
+          "result_rank": 1,
+          "content_budget": 597
+        }
+      ],
+      "query_plan": {
+        "text": "没有登录时 阻止进入需要身份的页面？",
+        "terms": [
+          "没有登录时",
+          "没有",
+          "有登",
+          "登录",
+          "录时",
+          "阻止进入需要身份的页面",
+          "阻止",
+          "止进",
+          "进入",
+          "入需",
+          "需要",
+          "要身",
+          "身份",
+          "份的",
+          "的页",
+          "页面"
+        ],
+        "symbols": [
+          "没有登录时",
+          "阻止进入需要身份的页面"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 832
+        }
+      ]
+    },
+    {
+      "id": "1182-1",
+      "query": "排班表如何切换门店和日期？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 42,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 67,
+        "prior": 67,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "candidate_limit",
+      "targets": [
+        {
+          "id": 1218,
+          "path": "src/views/workingScheduleLayout.vue",
+          "start_line": 269,
+          "end_line": 276,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        },
+        {
+          "id": 1219,
+          "path": "src/views/workingScheduleLayout.vue",
+          "start_line": 278,
+          "end_line": 287,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "排班表 切换门店和日期？",
+        "terms": [
+          "排班表",
+          "排班",
+          "班表",
+          "切换门店和日期",
+          "切换",
+          "换门",
+          "门店",
+          "店和",
+          "和日",
+          "日期"
+        ],
+        "symbols": [
+          "切换门店和日期"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 1267
+        }
+      ]
+    },
+    {
+      "id": "1182-2",
+      "query": "给员工安排一个服务任务时如何保存？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 12,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 26,
+        "prior": 26,
+        "candidates": 26,
+        "selected": 26,
+        "expanded": 26,
+        "ordered": 22,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "result_selection",
+      "targets": [
+        {
+          "id": 464,
+          "path": "src/components/TaskDialog.vue",
+          "start_line": 1873,
+          "end_line": 1927,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "给员工安排一个服务任务时 保存？",
+        "terms": [
+          "给员工安排一个服务任务时",
+          "给员",
+          "员工",
+          "工安",
+          "安排",
+          "排一",
+          "一个",
+          "个服",
+          "服务",
+          "务任",
+          "任务",
+          "务时",
+          "保存"
+        ],
+        "symbols": [
+          "给员工安排一个服务任务时"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 1267
+        }
+      ]
+    },
+    {
+      "id": "1182-3",
+      "query": "礼券列表按状态筛选的处理在哪？",
+      "kind": "unimplemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 13,
+        "fts": 4,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 3,
+        "prior": 3,
+        "candidates": 3,
+        "selected": 3,
+        "expanded": 3,
+        "ordered": 3,
+        "budget_before": 3,
+        "budget_after": 3,
+        "final": 3
+      },
+      "loss": "not_scored",
+      "targets": [
+        {
+          "id": 953,
+          "path": "src/views/gift/useGiftPage.js",
+          "start_line": 12,
+          "end_line": 195,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "src/views/gift/useGiftPage.js",
+          "before_start": 12,
+          "before_end": 195,
+          "after_end": 103,
+          "result_rank": 3,
+          "content_budget": 718
+        }
+      ],
+      "query_plan": {
+        "text": "礼券列表按状态筛选的处理 ？",
+        "terms": [
+          "礼券列表按状态筛选的处理",
+          "礼券",
+          "券列",
+          "列表",
+          "表按",
+          "按状",
+          "状态",
+          "态筛",
+          "筛选",
+          "选的",
+          "的处",
+          "处理"
+        ],
+        "symbols": [
+          "礼券列表按状态筛选的处理"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 1267
+        }
+      ]
+    },
+    {
+      "id": "1182-4",
+      "query": "新增商品如何提交到后台？",
+      "kind": "ambiguous",
+      "supplement": false,
+      "ranks": {
+        "vector": 5,
+        "fts": 22,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 5,
+        "prior": 5,
+        "candidates": 5,
+        "selected": 5,
+        "expanded": 5,
+        "ordered": 5,
+        "budget_before": 5,
+        "budget_after": 5,
+        "final": 5
+      },
+      "loss": "not_scored",
+      "targets": [
+        {
+          "id": 1005,
+          "path": "src/views/good/components/GoodsDialog.vue",
+          "start_line": 1136,
+          "end_line": 1233,
+          "kind": "part",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "src/views/good/components/GoodsDialog.vue",
+          "before_start": 1136,
+          "before_end": 1233,
+          "after_end": 1217,
+          "result_rank": 5,
+          "content_budget": 947
+        }
+      ],
+      "query_plan": {
+        "text": "新增商品 提交到后台？",
+        "terms": [
+          "新增商品",
+          "新增",
+          "增商",
+          "商品",
+          "提交到后台",
+          "提交",
+          "交到",
+          "到后",
+          "后台"
+        ],
+        "symbols": [
+          "新增商品",
+          "提交到后台"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 1267
+        }
+      ]
+    },
+    {
+      "id": "1182-5",
+      "query": "每天的营业报表从哪里获取？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 8,
+        "fts": 4,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 1,
+        "prior": 1,
+        "candidates": 1,
+        "selected": 1,
+        "expanded": 1,
+        "ordered": 1,
+        "budget_before": 1,
+        "budget_after": 1,
+        "final": 1
+      },
+      "loss": "hit",
+      "targets": [
+        {
+          "id": 933,
+          "path": "src/views/everydayReportView.vue",
+          "start_line": 622,
+          "end_line": 652,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "src/views/everydayReportView.vue",
+          "before_start": 622,
+          "before_end": 655,
+          "after_end": 655,
+          "result_rank": 1,
+          "content_budget": 597
+        }
+      ],
+      "query_plan": {
+        "text": "每天的营业报表从 获取？",
+        "terms": [
+          "每天的营业报表从",
+          "每天",
+          "天的",
+          "的营",
+          "营业",
+          "业报",
+          "报表",
+          "表从",
+          "获取"
+        ],
+        "symbols": [
+          "每天的营业报表从"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 1267
+        }
+      ]
+    },
+    {
+      "id": "1182-6",
+      "query": "各门店的业绩统计怎么汇总展示？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 9,
+        "fts": 36,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 8,
+        "prior": 8,
+        "candidates": 8,
+        "selected": 8,
+        "expanded": 8,
+        "ordered": 4,
+        "budget_before": 4,
+        "budget_after": 4,
+        "final": 4
+      },
+      "loss": "hit",
+      "targets": [
+        {
+          "id": 903,
+          "path": "src/views/dataSummaryView.vue",
+          "start_line": 528,
+          "end_line": 544,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        },
+        {
+          "id": 905,
+          "path": "src/views/dataSummaryView.vue",
+          "start_line": 547,
+          "end_line": 555,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "src/views/dataSummaryView.vue",
+          "before_start": 525,
+          "before_end": 547,
+          "after_end": 547,
+          "result_rank": 4,
+          "content_budget": 827
+        }
+      ],
+      "query_plan": {
+        "text": "各门店的业绩统计 汇总展示？",
+        "terms": [
+          "各门店的业绩统计",
+          "各门",
+          "门店",
+          "店的",
+          "的业",
+          "业绩",
+          "绩统",
+          "统计",
+          "汇总展示",
+          "汇总",
+          "总展",
+          "展示"
+        ],
+        "symbols": [
+          "各门店的业绩统计",
+          "汇总展示"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 1267
+        }
+      ]
+    },
+    {
+      "id": "1167-1",
+      "query": "输入文字点击发送后消息如何提交？",
+      "kind": "unimplemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 5,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 24,
+        "prior": 24,
+        "candidates": 24,
+        "selected": 24,
+        "expanded": 24,
+        "ordered": 24,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "not_scored",
+      "targets": [
+        {
+          "id": 247,
+          "path": "src/pages/index/index.vue",
+          "start_line": 186,
+          "end_line": 186,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "输入文字点击发送后消息 提交？",
+        "terms": [
+          "输入文字点击发送后消息",
+          "输入",
+          "入文",
+          "文字",
+          "字点",
+          "点击",
+          "击发",
+          "发送",
+          "送后",
+          "后消",
+          "消息",
+          "提交"
+        ],
+        "symbols": [
+          "输入文字点击发送后消息"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 335
+        }
+      ]
+    },
+    {
+      "id": "1167-2",
+      "query": "按住说话时在哪里开始录音？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 1,
+        "fts": 1,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 1,
+        "prior": 1,
+        "candidates": 1,
+        "selected": 1,
+        "expanded": 1,
+        "ordered": 1,
+        "budget_before": 1,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "context_clipping",
+      "targets": [
+        {
+          "id": 244,
+          "path": "src/pages/index/index.vue",
+          "start_line": 172,
+          "end_line": 175,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "src/pages/index/index.vue",
+          "before_start": 66,
+          "before_end": 175,
+          "after_end": 171,
+          "result_rank": 1,
+          "content_budget": 590
+        }
+      ],
+      "query_plan": {
+        "text": "按住说话时 开始录音？",
+        "terms": [
+          "按住说话时",
+          "按住",
+          "住说",
+          "说话",
+          "话时",
+          "开始录音",
+          "开始",
+          "始录",
+          "录音"
+        ],
+        "symbols": [
+          "按住说话时",
+          "开始录音"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 335
+        }
+      ]
+    },
+    {
+      "id": "1167-3",
+      "query": "松开录音后音频如何转成文字？",
+      "kind": "partial",
+      "supplement": false,
+      "ranks": {
+        "vector": 7,
+        "fts": 12,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 8,
+        "prior": 8,
+        "candidates": 8,
+        "selected": 8,
+        "expanded": 8,
+        "ordered": 8,
+        "budget_before": 8,
+        "budget_after": 8,
+        "final": 8
+      },
+      "loss": "not_scored",
+      "targets": [
+        {
+          "id": 245,
+          "path": "src/pages/index/index.vue",
+          "start_line": 177,
+          "end_line": 180,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        },
+        {
+          "id": 280,
+          "path": "src/service/ChatService.js",
+          "start_line": 17,
+          "end_line": 887,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 289,
+          "path": "src/service/ChatService.js",
+          "start_line": 414,
+          "end_line": 474,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "src/pages/index/index.vue",
+          "before_start": 177,
+          "before_end": 180,
+          "after_end": 180,
+          "result_rank": 8,
+          "content_budget": 1244
+        }
+      ],
+      "query_plan": {
+        "text": "松开录音后音频 转成文字？",
+        "terms": [
+          "松开录音后音频",
+          "松开",
+          "开录",
+          "录音",
+          "音后",
+          "后音",
+          "音频",
+          "转成文字",
+          "转成",
+          "成文",
+          "文字"
+        ],
+        "symbols": [
+          "松开录音后音频",
+          "转成文字"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 335
+        }
+      ]
+    },
+    {
+      "id": "1167-4",
+      "query": "取消语音输入时如何停止录制？",
+      "kind": "unimplemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 5,
+        "fts": 4,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 3,
+        "prior": 3,
+        "candidates": 3,
+        "selected": 3,
+        "expanded": 3,
+        "ordered": 3,
+        "budget_before": 3,
+        "budget_after": 3,
+        "final": 3
+      },
+      "loss": "not_scored",
+      "targets": [
+        {
+          "id": 246,
+          "path": "src/pages/index/index.vue",
+          "start_line": 182,
+          "end_line": 184,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "src/pages/index/index.vue",
+          "before_start": 182,
+          "before_end": 184,
+          "after_end": 184,
+          "result_rank": 3,
+          "content_budget": 655
+        }
+      ],
+      "query_plan": {
+        "text": "取消语音输入时 停止录制？",
+        "terms": [
+          "取消语音输入时",
+          "取消",
+          "消语",
+          "语音",
+          "音输",
+          "输入",
+          "入时",
+          "停止录制",
+          "停止",
+          "止录",
+          "录制"
+        ],
+        "symbols": [
+          "取消语音输入时",
+          "停止录制"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 335
+        }
+      ]
+    },
+    {
+      "id": "1167-5",
+      "query": "切换聊天角色时如何更新当前身份？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 6,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 21,
+        "prior": 21,
+        "candidates": 21,
+        "selected": 21,
+        "expanded": 21,
+        "ordered": 19,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "result_selection",
+      "targets": [
+        {
+          "id": 47,
+          "path": "src/components/chat/RoleSwitch.vue",
+          "start_line": 23,
+          "end_line": 26,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "切换聊天角色时 更新当前身份？",
+        "terms": [
+          "切换聊天角色时",
+          "切换",
+          "换聊",
+          "聊天",
+          "天角",
+          "角色",
+          "色时",
+          "更新当前身份",
+          "更新",
+          "新当",
+          "当前",
+          "前身",
+          "身份"
+        ],
+        "symbols": [
+          "切换聊天角色时",
+          "更新当前身份"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 335
+        }
+      ]
+    },
+    {
+      "id": "1167-6",
+      "query": "聊天消息里的头像和内容在哪里渲染？",
+      "kind": "partial",
+      "supplement": false,
+      "ranks": {
+        "vector": 9,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 18,
+        "prior": 18,
+        "candidates": 18,
+        "selected": 18,
+        "expanded": 18,
+        "ordered": 10,
+        "budget_before": 10,
+        "budget_after": 10,
+        "final": 10
+      },
+      "loss": "not_scored",
+      "targets": [
+        {
+          "id": 39,
+          "path": "src/components/chat/ChatMessage.vue",
+          "start_line": 4,
+          "end_line": 24,
+          "kind": "text",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "src/components/chat/ChatMessage.vue",
+          "before_start": 2,
+          "before_end": 35,
+          "after_end": 35,
+          "result_rank": 10,
+          "content_budget": 3780
+        }
+      ],
+      "query_plan": {
+        "text": "聊天消息里的头像和内容 渲染？",
+        "terms": [
+          "聊天消息里的头像和内容",
+          "聊天",
+          "天消",
+          "消息",
+          "息里",
+          "里的",
+          "的头",
+          "头像",
+          "像和",
+          "和内",
+          "内容",
+          "渲染"
+        ],
+        "symbols": [
+          "聊天消息里的头像和内容"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 335
+        }
+      ]
+    },
+    {
+      "id": "1086-1",
+      "query": "贷款工单列表如何限制为当前公司能看的数据？",
+      "kind": "unconfirmed",
+      "supplement": true,
+      "ranks": {
+        "vector": 75,
+        "fts": 2,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 17,
+        "prior": 17,
+        "candidates": 17,
+        "selected": 17,
+        "expanded": 17,
+        "ordered": 15,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "not_scored",
+      "targets": [
+        {
+          "id": 1068,
+          "path": "application/admin/controller/Workorder.php",
+          "start_line": 8,
+          "end_line": 308,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 1074,
+          "path": "application/admin/controller/Workorder.php",
+          "start_line": 265,
+          "end_line": 305,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        },
+        {
+          "id": 2006,
+          "path": "application/common/controller/Backend.php",
+          "start_line": 16,
+          "end_line": 614,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 2015,
+          "path": "application/common/controller/Backend.php",
+          "start_line": 441,
+          "end_line": 459,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "贷款工单列表 限制为当前公司能看的数据？",
+        "terms": [
+          "贷款工单列表",
+          "贷款",
+          "款工",
+          "工单",
+          "单列",
+          "列表",
+          "限制为当前公司能看的数据",
+          "限制",
+          "制为",
+          "为当",
+          "当前",
+          "前公",
+          "公司",
+          "司能",
+          "能看",
+          "看的",
+          "的数",
+          "数据"
+        ],
+        "symbols": [
+          "贷款工单列表",
+          "限制为当前公司能看的数据"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 8567
+        }
+      ]
+    },
+    {
+      "id": "1086-2",
+      "query": "新增贷款工单时客户和车辆信息怎么入库？",
+      "kind": "implemented",
+      "supplement": true,
+      "ranks": {
+        "vector": 76,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 103,
+        "prior": 103,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "candidate_limit",
+      "targets": [
+        {
+          "id": 1280,
+          "path": "application/admin/library/traits/Backend.php",
+          "start_line": 20,
+          "end_line": 481,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 1284,
+          "path": "application/admin/library/traits/Backend.php",
+          "start_line": 91,
+          "end_line": 130,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "新增贷款工单时客户和车辆信息 入库？",
+        "terms": [
+          "新增贷款工单时客户和车辆信息",
+          "新增",
+          "增贷",
+          "贷款",
+          "款工",
+          "工单",
+          "单时",
+          "时客",
+          "客户",
+          "户和",
+          "和车",
+          "车辆",
+          "辆信",
+          "入库"
+        ],
+        "symbols": [
+          "新增贷款工单时客户和车辆信息"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 8567
+        }
+      ]
+    },
+    {
+      "id": "1086-3",
+      "query": "审核员通过或退回工单的处理在哪里？",
+      "kind": "implemented",
+      "supplement": true,
+      "ranks": {
+        "vector": 18,
+        "fts": 10,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 15,
+        "prior": 15,
+        "candidates": 15,
+        "selected": 15,
+        "expanded": 15,
+        "ordered": 15,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "result_selection",
+      "targets": [
+        {
+          "id": 1068,
+          "path": "application/admin/controller/Workorder.php",
+          "start_line": 8,
+          "end_line": 308,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 1070,
+          "path": "application/admin/controller/Workorder.php",
+          "start_line": 49,
+          "end_line": 114,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "审核员通过或退回工单的处理 ？",
+        "terms": [
+          "审核员通过或退回工单的处理",
+          "审核",
+          "核员",
+          "员通",
+          "通过",
+          "过或",
+          "或退",
+          "退回",
+          "回工",
+          "工单",
+          "单的",
+          "的处",
+          "处理"
+        ],
+        "symbols": [
+          "审核员通过或退回工单的处理"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 8567
+        }
+      ]
+    },
+    {
+      "id": "1086-4",
+      "query": "抵押完成后怎样保存抵押文件和备注？",
+      "kind": "implemented",
+      "supplement": true,
+      "ranks": {
+        "vector": null,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": null,
+        "prior": null,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "recall_miss",
+      "targets": [
+        {
+          "id": 1068,
+          "path": "application/admin/controller/Workorder.php",
+          "start_line": 8,
+          "end_line": 308,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 1070,
+          "path": "application/admin/controller/Workorder.php",
+          "start_line": 49,
+          "end_line": 114,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        },
+        {
+          "id": 1072,
+          "path": "application/admin/controller/Workorder.php",
+          "start_line": 198,
+          "end_line": 245,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "抵押完成后 保存抵押文件和备注？",
+        "terms": [
+          "抵押完成后",
+          "抵押",
+          "押完",
+          "完成",
+          "成后",
+          "保存抵押文件和备注",
+          "保存",
+          "存抵",
+          "押文",
+          "文件",
+          "件和",
+          "和备",
+          "备注"
+        ],
+        "symbols": [
+          "抵押完成后",
+          "保存抵押文件和备注"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 8567
+        }
+      ]
+    },
+    {
+      "id": "1086-5",
+      "query": "后台导出贷款工单表格的代码在哪里？",
+      "kind": "implemented",
+      "supplement": true,
+      "ranks": {
+        "vector": null,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": null,
+        "prior": null,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "recall_miss",
+      "targets": [
+        {
+          "id": 8436,
+          "path": "public/assets/js/require-table.js",
+          "start_line": 2,
+          "end_line": 1071,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "后台导出贷款工单表格的代码 ？",
+        "terms": [
+          "后台导出贷款工单表格的代码",
+          "后台",
+          "台导",
+          "导出",
+          "出贷",
+          "贷款",
+          "款工",
+          "工单",
+          "单表",
+          "表格",
+          "格的",
+          "的代",
+          "代码"
+        ],
+        "symbols": [
+          "后台导出贷款工单表格的代码"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 8567
+        }
+      ]
+    },
+    {
+      "id": "1086-6",
+      "query": "管理员修改密码时如何校验旧密码？",
+      "kind": "unimplemented",
+      "supplement": true,
+      "ranks": {
+        "vector": 15,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 34,
+        "prior": 34,
+        "candidates": 34,
+        "selected": 34,
+        "expanded": 34,
+        "ordered": 28,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "not_scored",
+      "targets": [
+        {
+          "id": 1167,
+          "path": "application/admin/controller/general/Profile.php",
+          "start_line": 11,
+          "end_line": 84,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 1169,
+          "path": "application/admin/controller/general/Profile.php",
+          "start_line": 45,
+          "end_line": 83,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "管理员修改密码时 校验旧密码？",
+        "terms": [
+          "管理员修改密码时",
+          "管理",
+          "理员",
+          "员修",
+          "修改",
+          "改密",
+          "密码",
+          "码时",
+          "校验旧密码",
+          "校验",
+          "验旧",
+          "旧密"
+        ],
+        "symbols": [
+          "管理员修改密码时",
+          "校验旧密码"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 8567
+        }
+      ]
+    },
+    {
+      "id": "1507-1",
+      "query": "客户创建采购单时怎么保存明细？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 42,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 76,
+        "prior": 76,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "candidate_limit",
+      "targets": [
+        {
+          "id": 5274,
+          "path": "backend/src/main/java/com/zhongdong/erp/service/customer/CustomerPurchaseOrderService.java",
+          "start_line": 28,
+          "end_line": 270,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 5279,
+          "path": "backend/src/main/java/com/zhongdong/erp/service/customer/CustomerPurchaseOrderService.java",
+          "start_line": 129,
+          "end_line": 157,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "客户创建采购单时 保存明细？",
+        "terms": [
+          "客户创建采购单时",
+          "客户",
+          "户创",
+          "创建",
+          "建采",
+          "采购",
+          "购单",
+          "单时",
+          "保存明细",
+          "保存",
+          "存明",
+          "明细"
+        ],
+        "symbols": [
+          "客户创建采购单时",
+          "保存明细"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 5555
+        }
+      ]
+    },
+    {
+      "id": "1507-2",
+      "query": "境外仓库确认入库后怎么更新库存？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": null,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": null,
+        "prior": null,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "recall_miss",
+      "targets": [
+        {
+          "id": 4843,
+          "path": "backend/src/main/java/com/zhongdong/erp/service/admin/outland/OutlandAdminShouHuoService.java",
+          "start_line": 34,
+          "end_line": 373,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 4854,
+          "path": "backend/src/main/java/com/zhongdong/erp/service/admin/outland/OutlandAdminShouHuoService.java",
+          "start_line": 215,
+          "end_line": 272,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "境外仓库确认入库后 更新库存？",
+        "terms": [
+          "境外仓库确认入库后",
+          "境外",
+          "外仓",
+          "仓库",
+          "库确",
+          "确认",
+          "认入",
+          "入库",
+          "库后",
+          "更新库存",
+          "更新",
+          "新库",
+          "库存"
+        ],
+        "symbols": [
+          "境外仓库确认入库后",
+          "更新库存"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 5555
+        }
+      ]
+    },
+    {
+      "id": "1507-3",
+      "query": "订单发货时在哪里校验库存够不够？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 53,
+        "fts": 31,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 60,
+        "prior": 60,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "candidate_limit",
+      "targets": [
+        {
+          "id": 5247,
+          "path": "backend/src/main/java/com/zhongdong/erp/service/customer/CustomerNoonOrderService.java",
+          "start_line": 29,
+          "end_line": 260,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 5249,
+          "path": "backend/src/main/java/com/zhongdong/erp/service/customer/CustomerNoonOrderService.java",
+          "start_line": 87,
+          "end_line": 212,
+          "kind": "part",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        },
+        {
+          "id": 5383,
+          "path": "backend/src/main/java/com/zhongdong/erp/util/PickupListValidateUtil.java",
+          "start_line": 10,
+          "end_line": 124,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 5387,
+          "path": "backend/src/main/java/com/zhongdong/erp/util/PickupListValidateUtil.java",
+          "start_line": 50,
+          "end_line": 78,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "订单发货时 校验库存够不够？",
+        "terms": [
+          "订单发货时",
+          "订单",
+          "单发",
+          "发货",
+          "货时",
+          "校验库存够不够",
+          "校验",
+          "验库",
+          "库存",
+          "存够",
+          "够不",
+          "不够"
+        ],
+        "symbols": [
+          "订单发货时",
+          "校验库存够不够"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 5555
+        }
+      ]
+    },
+    {
+      "id": "1507-4",
+      "query": "客户充值金额在哪里计入账户余额？",
+      "kind": "unconfirmed",
+      "supplement": false,
+      "ranks": {
+        "vector": null,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": null,
+        "prior": null,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "not_scored",
+      "targets": [],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "客户充值金额 计入账户余额？",
+        "terms": [
+          "客户充值金额",
+          "客户",
+          "户充",
+          "充值",
+          "值金",
+          "金额",
+          "计入账户余额",
+          "计入",
+          "入账",
+          "账户",
+          "户余",
+          "余额"
+        ],
+        "symbols": [
+          "客户充值金额",
+          "计入账户余额"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 5555
+        }
+      ]
+    },
+    {
+      "id": "1507-5",
+      "query": "子账号如何创建并关联到客户？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 2,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 19,
+        "prior": 19,
+        "candidates": 19,
+        "selected": 19,
+        "expanded": 19,
+        "ordered": 18,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "result_selection",
+      "targets": [
+        {
+          "id": 5320,
+          "path": "backend/src/main/java/com/zhongdong/erp/service/customer/CustomerSubAccountService.java",
+          "start_line": 19,
+          "end_line": 109,
+          "kind": "overview",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": false
+        },
+        {
+          "id": 5322,
+          "path": "backend/src/main/java/com/zhongdong/erp/service/customer/CustomerSubAccountService.java",
+          "start_line": 48,
+          "end_line": 70,
+          "kind": "method",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "子账号 创建并关联到客户？",
+        "terms": [
+          "子账号",
+          "子账",
+          "账号",
+          "创建并关联到客户",
+          "创建",
+          "建并",
+          "并关",
+          "关联",
+          "联到",
+          "到客",
+          "客户"
+        ],
+        "symbols": [
+          "创建并关联到客户"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 5555
+        }
+      ]
+    },
+    {
+      "id": "1507-6",
+      "query": "外箱标签的二维码和文本是怎么生成的？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 1,
+        "fts": 4,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 2,
+        "prior": 2,
+        "candidates": 2,
+        "selected": 2,
+        "expanded": 2,
+        "ordered": 2,
+        "budget_before": 2,
+        "budget_after": 2,
+        "final": 2
+      },
+      "loss": "hit",
+      "targets": [
+        {
+          "id": 322,
+          "path": "admin-ui/src/utils/outerBoxLabel.js",
+          "start_line": 133,
+          "end_line": 164,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "admin-ui/src/utils/outerBoxLabel.js",
+          "before_start": 133,
+          "before_end": 164,
+          "after_end": 164,
+          "result_rank": 2,
+          "content_budget": 624
+        }
+      ],
+      "query_plan": {
+        "text": "外箱标签的二维码和文本是 生成的？",
+        "terms": [
+          "外箱标签的二维码和文本是",
+          "外箱",
+          "箱标",
+          "标签",
+          "签的",
+          "的二",
+          "二维",
+          "维码",
+          "码和",
+          "和文",
+          "文本",
+          "本是",
+          "生成的",
+          "生成",
+          "成的"
+        ],
+        "symbols": [
+          "外箱标签的二维码和文本是"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 5555
+        }
+      ]
+    },
+    {
+      "id": "1491-1",
+      "query": "今天的护理日报为什么不能生成？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 11,
+        "fts": 16,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 6,
+        "prior": 6,
+        "candidates": 6,
+        "selected": 6,
+        "expanded": 6,
+        "ordered": 6,
+        "budget_before": 6,
+        "budget_after": 6,
+        "final": 6
+      },
+      "loss": "hit",
+      "targets": [
+        {
+          "id": 811,
+          "path": "pages/report/generate.js",
+          "start_line": 68,
+          "end_line": 123,
+          "kind": "text",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "pages/report/generate.js",
+          "before_start": 68,
+          "before_end": 123,
+          "after_end": 123,
+          "result_rank": 6,
+          "content_budget": 720
+        }
+      ],
+      "query_plan": {
+        "text": "今天的护理日报 不能生成？",
+        "terms": [
+          "今天的护理日报",
+          "今天",
+          "天的",
+          "的护",
+          "护理",
+          "理日",
+          "日报",
+          "不能生成",
+          "不能",
+          "能生",
+          "生成"
+        ],
+        "symbols": [
+          "今天的护理日报",
+          "不能生成"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 939
+        }
+      ]
+    },
+    {
+      "id": "1491-2",
+      "query": "护理日报的统计时间范围怎么算？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 44,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 75,
+        "prior": 72,
+        "candidates": null,
+        "selected": null,
+        "expanded": null,
+        "ordered": null,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "candidate_limit",
+      "targets": [
+        {
+          "id": 313,
+          "path": "cloudfunctions/generateDailyReportPdf/index.js",
+          "start_line": 68,
+          "end_line": 78,
+          "kind": "function",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "护理日报的统计时间范围 算？",
+        "terms": [
+          "护理日报的统计时间范围",
+          "护理",
+          "理日",
+          "日报",
+          "报的",
+          "的统",
+          "统计",
+          "计时",
+          "时间",
+          "间范",
+          "范围",
+          "算"
+        ],
+        "symbols": [
+          "护理日报的统计时间范围"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 939
+        }
+      ]
+    },
+    {
+      "id": "1491-3",
+      "query": "填写食材禁忌后怎样生成六天餐单？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 46,
+        "fts": 39,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 26,
+        "prior": 24,
+        "candidates": 24,
+        "selected": 24,
+        "expanded": 24,
+        "ordered": 19,
+        "budget_before": null,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "result_selection",
+      "targets": [
+        {
+          "id": 798,
+          "path": "pages/meal/preference/preference.js",
+          "start_line": 236,
+          "end_line": 265,
+          "kind": "text",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [],
+      "query_plan": {
+        "text": "填写食材禁忌后 生成六天餐单？",
+        "terms": [
+          "填写食材禁忌后",
+          "填写",
+          "写食",
+          "食材",
+          "材禁",
+          "禁忌",
+          "忌后",
+          "生成六天餐单",
+          "生成",
+          "成六",
+          "六天",
+          "天餐",
+          "餐单"
+        ],
+        "symbols": [
+          "填写食材禁忌后",
+          "生成六天餐单"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 939
+        }
+      ]
+    },
+    {
+      "id": "1491-4",
+      "query": "语音输入的食材偏好如何识别并填回表单？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 8,
+        "fts": null,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 26,
+        "prior": 25,
+        "candidates": 25,
+        "selected": 25,
+        "expanded": 25,
+        "ordered": 3,
+        "budget_before": 3,
+        "budget_after": null,
+        "final": null
+      },
+      "loss": "context_clipping",
+      "targets": [
+        {
+          "id": 796,
+          "path": "pages/meal/preference/preference.js",
+          "start_line": 145,
+          "end_line": 184,
+          "kind": "text",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "pages/meal/preference/preference.js",
+          "before_start": 9,
+          "before_end": 265,
+          "after_end": 109,
+          "result_rank": 3,
+          "content_budget": 687
+        }
+      ],
+      "query_plan": {
+        "text": "语音输入的食材偏好 识别并填回表单？",
+        "terms": [
+          "语音输入的食材偏好",
+          "语音",
+          "音输",
+          "输入",
+          "入的",
+          "的食",
+          "食材",
+          "材偏",
+          "偏好",
+          "识别并填回表单",
+          "识别",
+          "别并",
+          "并填",
+          "填回",
+          "回表",
+          "表单"
+        ],
+        "symbols": [
+          "语音输入的食材偏好",
+          "识别并填回表单"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 939
+        }
+      ]
+    },
+    {
+      "id": "1491-5",
+      "query": "宝宝生长曲线的数据怎么计算和绘制？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 4,
+        "fts": 49,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 10,
+        "prior": 9,
+        "candidates": 9,
+        "selected": 9,
+        "expanded": 9,
+        "ordered": 9,
+        "budget_before": 9,
+        "budget_after": 9,
+        "final": 9
+      },
+      "loss": "hit",
+      "targets": [
+        {
+          "id": 738,
+          "path": "pages/growth-chart/index.js",
+          "start_line": 209,
+          "end_line": 269,
+          "kind": "text",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "pages/growth-chart/index.js",
+          "before_start": 154,
+          "before_end": 269,
+          "after_end": 269,
+          "result_rank": 9,
+          "content_budget": 1394
+        }
+      ],
+      "query_plan": {
+        "text": "宝宝生长曲线的数据 计算和绘制？",
+        "terms": [
+          "宝宝生长曲线的数据",
+          "宝宝",
+          "宝生",
+          "生长",
+          "长曲",
+          "曲线",
+          "线的",
+          "的数",
+          "数据",
+          "计算和绘制",
+          "计算",
+          "算和",
+          "和绘",
+          "绘制"
+        ],
+        "symbols": [
+          "宝宝生长曲线的数据",
+          "计算和绘制"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 939
+        }
+      ]
+    },
+    {
+      "id": "1491-6",
+      "query": "删除客户时如何同时处理相关记录？",
+      "kind": "implemented",
+      "supplement": false,
+      "ranks": {
+        "vector": 7,
+        "fts": 25,
+        "symbol": null,
+        "path": null,
+        "literal": null,
+        "fused": 10,
+        "prior": 10,
+        "candidates": 10,
+        "selected": 10,
+        "expanded": 10,
+        "ordered": 6,
+        "budget_before": 6,
+        "budget_after": 6,
+        "final": 6
+      },
+      "loss": "hit",
+      "targets": [
+        {
+          "id": 303,
+          "path": "cloudfunctions/deleteCustomer/index.js",
+          "start_line": 42,
+          "end_line": 71,
+          "kind": "text",
+          "embed_state": "ready",
+          "embed_input_truncated": 0,
+          "embedding_contains_needles": true
+        }
+      ],
+      "budget_windows": [
+        {
+          "path": "cloudfunctions/deleteCustomer/index.js",
+          "before_start": 32,
+          "before_end": 71,
+          "after_end": 71,
+          "result_rank": 6,
+          "content_budget": 762
+        }
+      ],
+      "query_plan": {
+        "text": "删除客户时 同时处理相关记录？",
+        "terms": [
+          "删除客户时",
+          "删除",
+          "除客",
+          "客户",
+          "户时",
+          "同时处理相关记录",
+          "同时",
+          "时处",
+          "处理",
+          "理相",
+          "相关",
+          "关记",
+          "记录"
+        ],
+        "symbols": [
+          "删除客户时",
+          "同时处理相关记录"
+        ],
+        "paths": [],
+        "literals": []
+      },
+      "index_state": [
+        {
+          "embed_state": "ready",
+          "count": 939
+        }
+      ]
+    }
+  ]
+}

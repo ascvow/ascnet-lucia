@@ -428,6 +428,14 @@ impl Engine {
         let (results, truncated, total_tokens, counters, epoch, vector_used, mut recall_notes) = {
             let store = lock_store(&self.store)?;
             let vector_guard = lock_index(&self.vector)?;
+            // 捕获器不得跨 await；它只观察这次同步检索和组装，并在同一线程结束。
+            let capture = crate::diagnostics::Capture::start();
+            crate::diagnostics::record("query_plan", || {
+                serde_json::json!({
+                    "text":plan.text,"terms":plan.terms,"symbols":plan.symbols,
+                    "paths":plan.paths,"literals":plan.literals
+                })
+            });
             let input = RetrievalInput {
                 plan: &plan,
                 query_vector: query_vector.as_deref(),
@@ -449,12 +457,14 @@ impl Engine {
                     config: &self.config.retrieval,
                 },
             )?;
+            let epoch = store.catalog_epoch()?;
+            capture.finish(&request.query, epoch);
             (
                 assembled.results,
                 assembled.truncated,
                 assembled.total_estimated_tokens,
                 store.counters()?,
-                store.catalog_epoch()?,
+                epoch,
                 outcome.vector_used,
                 outcome.notes,
             )

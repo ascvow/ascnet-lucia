@@ -22,6 +22,9 @@ struct Manifest {
 /// 实验阶段和单项目重测开关；重测只换报告标签，不更改冻结查询或真值。
 #[derive(Parser)]
 struct Arguments {
+    /// 使用诊断构建跑一轮并保留 JSONL；不得覆盖基线报告或重建索引。
+    #[arg(long)]
+    diagnostic_binary: Option<PathBuf>,
     #[arg(long)]
     supplement_php: bool,
     #[arg(long)]
@@ -186,7 +189,12 @@ async fn run_project(
     queries: &[Case],
     truth: &HashMap<String, Truth>,
     destination: &Path,
+    diagnostic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let trace = destination.with_extension("jsonl");
+    if diagnostic && (destination.exists() || trace.exists()) {
+        return Err("诊断输出已存在，请使用新标签以保留原始证据".into());
+    }
     if project
         .index
         .as_ref()
@@ -210,10 +218,14 @@ async fn run_project(
         .arg("--watch")
         .arg("false")
         .env("CODESEARCH_LOG", "error");
+    command.env_remove("CODESEARCH_TRACE_JSONL");
+    if diagnostic {
+        command.env("CODESEARCH_TRACE_JSONL", &trace);
+    }
     let process = rmcp::transport::TokioChildProcess::new(command)?;
     let service = ().serve(process).await?;
     let mut rows = Vec::new();
-    for round in 0..3 {
+    for round in 0..if diagnostic { 1 } else { 3 } {
         for case in queries {
             let answer = &truth[&case.id];
             let result = observe(&service, &project.root, case, answer).await;
@@ -262,6 +274,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let truth: HashMap<String, Truth> =
         serde_json::from_slice(&std::fs::read(base.join("eval/real-projects-truth.json"))?)?;
     let arguments = Arguments::parse();
+    if arguments.diagnostic_binary.is_some() && arguments.label == "verified" {
+        return Err("诊断必须显式指定独立 --label，不能覆盖冻结报告".into());
+    }
     let supplement = arguments.supplement_php;
     if arguments.label.is_empty()
         || !arguments
@@ -314,7 +329,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut project = project.clone();
         // 补测只适配模型输入限制，保留原配置、原索引和默认报告，不调整查询或答案。
-        if supplement {
+        if supplement && arguments.diagnostic_binary.is_some() {
+            // 诊断只复用已完成的补测索引，不重新索引或写配置。
+            project.config = project.config.with_file_name("codesearch-input6000.toml");
+            project.data_dir = project.data_dir.with_file_name("index-input6000");
+            let saved: Value =
+                serde_json::from_slice(&std::fs::read(out.join("1086-input6000-results.json"))?)?;
+            project.index = Some(saved["index"].clone());
+        } else if supplement {
             let mut config: codesearch::config::Config =
                 toml::from_str(&std::fs::read_to_string(&project.config)?)?;
             config.embedding.max_input_chars = 6000;
@@ -345,19 +367,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
             .queries;
         run_project(
-            &manifest.binary,
+            arguments
+                .diagnostic_binary
+                .as_deref()
+                .unwrap_or(&manifest.binary),
             &project,
             queries,
             &truth,
             &out.join(format!(
                 "{}{}-results.json",
                 project.id,
-                if supplement {
+                if supplement && arguments.diagnostic_binary.is_some() {
+                    format!("-input6000-{}", arguments.label)
+                } else if supplement {
                     "-input6000".to_string()
                 } else {
                     format!("-{}", arguments.label)
                 }
             )),
+            arguments.diagnostic_binary.is_some(),
         )
         .await?;
     }

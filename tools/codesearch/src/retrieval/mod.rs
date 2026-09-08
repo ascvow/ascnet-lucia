@@ -262,12 +262,17 @@ pub fn retrieve(
         }
     }
 
+    // 旁路记录本次调用的原始排序，不重新检索或向搜索传入评测真值。
+    crate::diagnostics::record("recall", || serde_json::json!(lists));
     let fused = fusion::fuse(&lists, config.rrf_k, &exact_ids);
+    crate::diagnostics::record("fused", || serde_json::json!(fused));
     // 内容类型先验必须在截断之前生效：先截断再降权，被文档挤出候选集的代码
     // 就再也回不来了。
     let fused = apply_content_prior(store, config, fused)?;
+    crate::diagnostics::record("prior", || serde_json::json!(fused));
     outcome.candidates =
         fusion::apply_exact_reserve(fused, config.candidate_limit, config.exact_reserve);
+    crate::diagnostics::record("candidates", || serde_json::json!(outcome.candidates));
     Ok(outcome)
 }
 

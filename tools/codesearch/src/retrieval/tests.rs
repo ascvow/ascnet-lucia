@@ -504,6 +504,61 @@ fn retrieval_is_deterministic_for_the_same_query() {
     assert_eq!(left, right, "相同查询必须得到相同顺序");
 }
 
+/// 固定查询向量与索引，验证旁路捕获不改变任何候选分数、来源或组装正文。
+#[test]
+fn diagnostics_do_not_change_hybrid_retrieval_or_context() {
+    let fixture = Fixture::build(true);
+    let plan = analyze("请求失败后的重试逻辑", &ScopeFilter::default()).unwrap();
+    let vector = query_vector(&fixture.provider, &plan);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("trace.jsonl");
+    let run = || {
+        let outcome = retrieve(
+            &fixture.store,
+            Some(&fixture.index),
+            &fixture.config.retrieval,
+            &RetrievalInput {
+                plan: &plan,
+                query_vector: Some(&vector),
+                space_id: Some(&fixture.space.id),
+            },
+        )
+        .unwrap();
+        assert!(outcome.vector_used);
+        let assembled = crate::context::assemble(
+            &fixture.store,
+            &crate::context::AssembleInput {
+                candidates: &outcome.candidates,
+                plan: &plan,
+                max_results: 10,
+                token_budget: 6000,
+                config: &fixture.config.retrieval,
+            },
+        )
+        .unwrap();
+        serde_json::json!({"candidates":outcome.candidates,"notes":outcome.notes,"results":assembled.results,
+            "tokens":assembled.total_estimated_tokens,"truncated":assembled.truncated})
+    };
+    let before = run();
+    let capture = crate::diagnostics::Capture::at(Some(path.clone()));
+    let after = run();
+    capture.finish(&plan.raw, fixture.store.catalog_epoch().unwrap());
+    assert_eq!(before, after);
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let recall = record["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["stage"] == "recall")
+        .unwrap();
+    assert!(recall["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|list| list["source"] == "vector"));
+}
+
 #[test]
 fn vector_path_reports_degradation_when_unavailable() {
     let fixture = Fixture::build(false);

@@ -182,6 +182,12 @@ codesearch search --root . --query '-path:**/tests/** RetryPolicy::execute'
 `serve` 使用 stdio 传输。**stdout 只输出 MCP 协议帧，所有日志走 stderr**，
 日志级别由 `CODESEARCH_LOG` 控制（默认 `warn`）。
 
+需要定位搜索丢失阶段时，可显式设置 `CODESEARCH_TRACE_JSONL=/绝对路径/search-trace.jsonl`。
+默认关闭；启用后每次成功搜索追加一条查询、阶段代码块 ID、分数及范围记录，不记录源码正文或模型向量，
+不改变 MCP 响应。目录必须事先存在，建议使用工作区外的私有常规文件；查询和路径仍可能敏感，需自行限制
+访问及清理保留的日志。新文件在 Unix 上使用 0600 权限，已有文件权限不修改；写入失败只记警告。
+记录器只覆盖无 await 的同步检索与组装区间，错误退出丢弃未完成记录。启用时存在额外磁盘写入开销。
+
 ```json
 {
   "mcpServers": {
@@ -331,6 +337,9 @@ score(d) = Σ weight_i / (k + rank_i(d))
 后续已在用户的 6 个真实项目上测试：[真实项目语义定位报告](reports/real-projects-2026-09-08.md)。
 默认配置、索引完整的 22 条已实现问题中，文件 Top-5 为 63.6%，关键实现 Top-5 仅 18.2%；
 人工样例的高分不能作为真实项目可靠性的依据。
+
+[同次调用损失诊断](reports/real-projects-stages-2026-09-08.md)进一步定位：默认 22 道实现题中，
+4 道未召回、4 道候选截断、4 道输出选择丢失、2 道正文裁剪，最终命中 8 道。本轮仅添加诊断，未优化算法。
 
 ```bash
 cargo fmt --all -- --check                               # 通过

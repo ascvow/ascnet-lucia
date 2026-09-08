@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use crate::types::MatchSource;
 
 /// 一路召回的结果：按相关度降序排列的代码块 ID。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RecallList {
     /// 召回通路。
     pub source: MatchSource,
@@ -25,7 +25,7 @@ pub struct RecallList {
 }
 
 /// 融合后的候选。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Candidate {
     /// 代码块 ID。
     pub chunk_id: i64,

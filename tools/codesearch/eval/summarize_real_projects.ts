@@ -21,7 +21,7 @@ export function metrics(rows: any[]) {
 }
 
 /** 逐文件校验初始清单，并用 Git 状态辅助发现新增、删除和目录外的其他改动。 */
-async function verifyProject(project: any, scope: any) {
+export async function verifyProject(project: any, scope: any) {
   const hash = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("hex");
   const changed: string[] = [];
   for (const file of project.files) {
