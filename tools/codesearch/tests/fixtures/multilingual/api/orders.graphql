@@ -1,0 +1,17 @@
+"""订单列表使用游标分页，不依赖页码。"""
+type OrderConnection {
+  edges: [OrderEdge!]!
+  pageInfo: PageInfo!
+}
+
+type OrderEdge {
+  cursor: String!
+  node: Order!
+}
+
+query RecentOrders($after: String) {
+  orders(first: 20, after: $after) {
+    edges { cursor node { id total } }
+    pageInfo { hasNextPage endCursor }
+  }
+}

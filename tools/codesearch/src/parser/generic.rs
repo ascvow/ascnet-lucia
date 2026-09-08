@@ -26,6 +26,10 @@ pub enum NameSource {
     ChildText(&'static str),
     /// 取指定类别后代节点的文本。SQL 的 `object_reference` 藏在下一层。
     DescendantText(&'static str),
+    /// 从独立的签名节点读取名称，不进入参数或函数体。
+    SignatureName,
+    /// HCL 块的种类与全部标签组成唯一名称，例如 resource.aws_s3_bucket.archive。
+    BlockLabels,
 }
 
 /// 一种语言的语法节点约定。
@@ -66,6 +70,16 @@ pub struct LanguageSpec {
 
 /// 遍历语法树根节点并提取定义与导入。
 pub fn extract(ctx: &Context<'_>, spec: &LanguageSpec, root: Node<'_>, parsed: &mut ParsedFile) {
+    // 这些语法把全部声明包在根节点的单独列表中；列表不是一个声明，不能复用其范围。
+    let list_kind = match ctx.language {
+        Language::Haskell => Some("declarations"),
+        Language::Hcl => Some("body"),
+        Language::Graphql => Some("document"),
+        _ => None,
+    };
+    let root = list_kind
+        .and_then(|kind| child_of_kind(root, kind))
+        .unwrap_or(root);
     let mut scope: Vec<String> = Vec::new();
     walk(
         ctx,
@@ -109,6 +123,18 @@ fn handle(
     imports: &mut Vec<ImportRecord>,
 ) {
     let kind = node.kind();
+
+    // Haskell 的类型签名和紧随其后的同名实现共同构成一个定义，避免只召回签名却丢失实现。
+    if ctx.language == Language::Haskell && kind == "signature" {
+        if let Some(next) = node.next_named_sibling() {
+            if matches!(next.kind(), "function" | "bind")
+                && ctx.field_text(node, "name").is_some()
+                && ctx.field_text(node, "name") == ctx.field_text(next, "name")
+            {
+                return;
+            }
+        }
+    }
 
     if spec.imports.contains(&kind) {
         push_import(ctx, node, imports);
@@ -233,14 +259,32 @@ fn leaf(
 ) -> Option<Definition> {
     let name = name_of(ctx, spec, node)?;
     let body = body_of(spec, node);
-    let lead = leading(ctx, spec, outer);
+    let mut lead = leading(ctx, spec, outer);
+    let qualified = if ctx.language == Language::Go && node.kind() == "method_declaration" {
+        go_receiver(ctx, node)
+            .map(|receiver| format!("{receiver}.{name}"))
+            .unwrap_or_else(|| ctx.qualify_with(spec.separator, scope, &name))
+    } else {
+        ctx.qualify_with(spec.separator, scope, &name)
+    };
+    let mut signature = ctx.signature(node, body);
+    if ctx.language == Language::Haskell && matches!(node.kind(), "function" | "bind") {
+        if let Some(previous) = node.prev_named_sibling() {
+            if previous.kind() == "signature"
+                && ctx.field_text(previous, "name").as_deref() == Some(&name)
+            {
+                lead = leading(ctx, spec, previous);
+                signature = Some(crate::parser::collapse_whitespace(ctx.text(previous)));
+            }
+        }
+    }
     Some(Definition {
         kind: chunk_kind,
-        qualified: ctx.qualify_with(spec.separator, scope, &name),
+        qualified,
         name,
         parent: parent_symbol.map(str::to_string),
         module_path: module_path(spec, scope),
-        signature: ctx.signature(node, body),
+        signature,
         doc: lead.doc.or_else(|| docstring(ctx, spec, body)),
         start_byte: lead.start_byte,
         end_byte: outer.end_byte(),
@@ -252,7 +296,34 @@ fn leaf(
     })
 }
 
+/// 接收者决定 Go 方法身份；只剥离指针与泛型类型包装，不使用局部接收者变量名。
+///
+/// 方法与类型在源码中并非包含关系，因此这里只限定符号名，不伪造 parent 包含边。
+fn go_receiver(ctx: &Context<'_>, node: Node<'_>) -> Option<String> {
+    let receiver = node.child_by_field_name("receiver")?.named_child(0)?;
+    let mut ty = receiver.child_by_field_name("type")?;
+    if ty.kind() == "pointer_type" {
+        ty = ty.named_child(0)?;
+    }
+    if ty.kind() == "generic_type" {
+        ty = ty.child_by_field_name("type")?;
+    }
+    (ty.kind() == "type_identifier").then(|| ctx.text(ty).to_string())
+}
+
 fn leading(ctx: &Context<'_>, spec: &LanguageSpec, node: Node<'_>) -> crate::parser::Leading {
+    // Haskell/HCL 的第一条声明前注释属于根列表的兄弟节点，不属于声明列表内部。
+    if matches!(ctx.language, Language::Haskell | Language::Hcl)
+        && node.prev_named_sibling().is_none()
+    {
+        if let Some(parent) = node.parent() {
+            if matches!(parent.kind(), "declarations" | "body")
+                && parent.start_byte() == node.start_byte()
+            {
+                return ctx.leading_with(parent, spec.comments, spec.attributes, spec.doc_prefixes);
+            }
+        }
+    }
     ctx.leading_with(node, spec.comments, spec.attributes, spec.doc_prefixes)
 }
 
@@ -267,6 +338,27 @@ fn name_of(ctx: &Context<'_>, spec: &LanguageSpec, node: Node<'_>) -> Option<Str
             }
             NameSource::DescendantText(kind) => {
                 descendant_of_kind(node, kind, 3).map(|n| ctx.text(n).trim().to_string())
+            }
+            NameSource::SignatureName => {
+                node.child_by_field_name("signature").and_then(|signature| {
+                    ctx.field_text(signature, "name").or_else(|| {
+                        let mut cursor = signature.walk();
+                        let name = signature
+                            .named_children(&mut cursor)
+                            .find_map(|child| ctx.field_text(child, "name"));
+                        name
+                    })
+                })
+            }
+            NameSource::BlockLabels => {
+                let mut cursor = node.walk();
+                let labels: Vec<&str> = node
+                    .named_children(&mut cursor)
+                    .take_while(|child| child.kind() != "block_start")
+                    .filter(|child| matches!(child.kind(), "identifier" | "string_lit"))
+                    .map(|child| ctx.text(child).trim_matches('"'))
+                    .collect();
+                (!labels.is_empty()).then(|| labels.join("."))
             }
         };
         let name = name
@@ -404,6 +496,11 @@ pub fn spec_for(language: Language) -> Option<(tree_sitter::Language, &'static L
         Language::Bash => (tree_sitter_bash::LANGUAGE.into(), &BASH),
         Language::Css => (tree_sitter_css::LANGUAGE.into(), &CSS),
         Language::Sql => (tree_sitter_sequel::LANGUAGE.into(), &SQL),
+        Language::Dart => (tree_sitter_dart::LANGUAGE.into(), &DART),
+        Language::Zig => (tree_sitter_zig::LANGUAGE.into(), &ZIG),
+        Language::Haskell => (tree_sitter_haskell::LANGUAGE.into(), &HASKELL),
+        Language::Hcl => (tree_sitter_hcl::LANGUAGE.into(), &HCL),
+        Language::Graphql => (tree_sitter_graphql::LANGUAGE.into(), &GRAPHQL),
         _ => return None,
     };
     Some(pair)
@@ -411,6 +508,169 @@ pub fn spec_for(language: Language) -> Option<(tree_sitter::Language, &'static L
 
 /// 大多数 C 风格语言共用的注释与文档约定。
 const BLOCK_DOC: &[&str] = &["/**", "///"];
+
+/// Dart 的类成员与方法签名有额外包装层，函数体仍采用同一套边界处理。
+static DART: LanguageSpec = LanguageSpec {
+    separator: ".",
+    containers: &[
+        ("class_declaration", ChunkKind::Struct),
+        ("mixin_declaration", ChunkKind::Trait),
+        ("extension_declaration", ChunkKind::Impl),
+        ("extension_type_declaration", ChunkKind::Struct),
+        ("enum_declaration", ChunkKind::Enum),
+    ],
+    callables: &[
+        ("function_declaration", ChunkKind::Function),
+        ("method_declaration", ChunkKind::Method),
+        ("getter_declaration", ChunkKind::Method),
+        ("setter_declaration", ChunkKind::Method),
+        ("function_signature", ChunkKind::Function),
+        ("constructor_signature", ChunkKind::Method),
+        ("constant_constructor_signature", ChunkKind::Method),
+        ("getter_signature", ChunkKind::Method),
+        ("setter_signature", ChunkKind::Method),
+    ],
+    leaves: &[
+        ("initialized_identifier", ChunkKind::Const),
+        ("type_alias", ChunkKind::TypeAlias),
+    ],
+    imports: &["import_or_export"],
+    wrappers: &[
+        "class_member",
+        "declaration",
+        "initialized_identifier_list",
+        "external_function_declaration",
+    ],
+    comments: &["comment", "documentation_comment"],
+    attributes: &["annotation"],
+    doc_prefixes: BLOCK_DOC,
+    name_sources: &[
+        NameSource::Field("name"),
+        NameSource::SignatureName,
+        NameSource::ChildText("type_identifier"),
+    ],
+    body_fields: &["body"],
+    body_kinds: &["class_body", "extension_body", "enum_body"],
+    docstring: false,
+};
+
+/// Zig 的类型绑定也是变量声明；只递归其直接容器值，不把函数局部变量提升为符号。
+static ZIG: LanguageSpec = LanguageSpec {
+    separator: ".",
+    containers: &[("variable_declaration", ChunkKind::Const)],
+    callables: &[
+        ("function_declaration", ChunkKind::Function),
+        ("test_declaration", ChunkKind::Function),
+    ],
+    leaves: &[],
+    imports: &[],
+    wrappers: &[],
+    comments: &["comment"],
+    attributes: &[],
+    doc_prefixes: BLOCK_DOC,
+    name_sources: &[
+        NameSource::Field("name"),
+        NameSource::ChildText("identifier"),
+        NameSource::ChildText("string"),
+    ],
+    body_fields: &["body"],
+    body_kinds: &[
+        "struct_declaration",
+        "enum_declaration",
+        "union_declaration",
+        "opaque_declaration",
+        "block",
+    ],
+    docstring: false,
+};
+
+/// Haskell 的函数方程、签名与类型分别保留原始位置。
+static HASKELL: LanguageSpec = LanguageSpec {
+    separator: ".",
+    containers: &[("class", ChunkKind::Trait), ("instance", ChunkKind::Impl)],
+    callables: &[
+        ("function", ChunkKind::Function),
+        ("bind", ChunkKind::Function),
+        ("signature", ChunkKind::Function),
+    ],
+    leaves: &[
+        ("data_type", ChunkKind::Enum),
+        ("newtype", ChunkKind::Struct),
+        ("type_synomym", ChunkKind::TypeAlias),
+    ],
+    imports: &["import"],
+    wrappers: &["imports"],
+    comments: &["comment", "haddock"],
+    attributes: &[],
+    doc_prefixes: &[],
+    name_sources: &[NameSource::Field("name")],
+    body_fields: &["declarations"],
+    body_kinds: &[],
+    docstring: false,
+};
+
+/// Terraform 使用完整块标签，避免所有资源都被错误命名为 resource。
+static HCL: LanguageSpec = LanguageSpec {
+    separator: ".",
+    containers: &[("block", ChunkKind::Module)],
+    callables: &[],
+    leaves: &[("attribute", ChunkKind::Const)],
+    imports: &[],
+    wrappers: &[],
+    comments: &["comment"],
+    attributes: &[],
+    doc_prefixes: &[],
+    name_sources: &[NameSource::BlockLabels],
+    body_fields: &[],
+    body_kinds: &["body"],
+    docstring: false,
+};
+
+/// GraphQL 仅提取具名定义；匿名操作不借用选中字段的名称冒充声明。
+static GRAPHQL: LanguageSpec = LanguageSpec {
+    separator: ".",
+    containers: &[
+        ("object_type_definition", ChunkKind::Struct),
+        ("interface_type_definition", ChunkKind::Trait),
+        ("input_object_type_definition", ChunkKind::Struct),
+        ("object_type_extension", ChunkKind::Struct),
+    ],
+    callables: &[
+        ("operation_definition", ChunkKind::Function),
+        ("fragment_definition", ChunkKind::Function),
+    ],
+    leaves: &[
+        ("enum_type_definition", ChunkKind::Enum),
+        ("scalar_type_definition", ChunkKind::TypeAlias),
+        ("union_type_definition", ChunkKind::TypeAlias),
+        ("directive_definition", ChunkKind::Rule),
+        ("field_definition", ChunkKind::Const),
+        ("input_value_definition", ChunkKind::Const),
+    ],
+    imports: &[],
+    wrappers: &[
+        "definition",
+        "type_system_definition",
+        "type_definition",
+        "executable_definition",
+        "type_system_extension",
+        "type_extension",
+    ],
+    comments: &["comment"],
+    attributes: &[],
+    doc_prefixes: &[],
+    name_sources: &[
+        NameSource::ChildText("name"),
+        NameSource::ChildText("fragment_name"),
+    ],
+    body_fields: &[],
+    body_kinds: &[
+        "fields_definition",
+        "input_fields_definition",
+        "selection_set",
+    ],
+    docstring: false,
+};
 
 pub(crate) static PYTHON: LanguageSpec = LanguageSpec {
     separator: ".",
@@ -859,7 +1119,7 @@ func (s *Server) Start() error { return nil }
         assert!(names.contains(&"Server".to_string()), "{names:?}");
         assert!(names.contains(&"Version".to_string()), "{names:?}");
         assert!(names.contains(&"NewServer".to_string()), "{names:?}");
-        assert!(names.contains(&"Start".to_string()), "{names:?}");
+        assert!(names.contains(&"Server.Start".to_string()), "{names:?}");
 
         let parsed = parse(Language::Go, source).expect("parse");
         let server = parsed

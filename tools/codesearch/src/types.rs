@@ -60,11 +60,23 @@ pub enum Language {
     Css,
     /// SQL（Tree-sitter 结构化解析）。
     Sql,
+    /// Dart，包含 Flutter 类与方法。
+    Dart,
+    /// Elixir 模块、函数与宏。
+    Elixir,
+    /// Zig 函数与容器声明。
+    Zig,
+    /// Haskell 函数与类型声明。
+    Haskell,
+    /// HCL 与 Terraform 声明块。
+    Hcl,
+    /// GraphQL 类型、操作与片段。
+    Graphql,
     /// Vue 单文件组件（拆出 script/style 后委派子语言）。
     Vue,
     /// Svelte 单文件组件（拆出 script/style 后委派子语言）。
     Svelte,
-    /// HTML（有界文本兜底）。
+    /// HTML（脚本与样式结构化解析，其余标记保留原文）。
     Html,
     /// JSON（有界文本兜底）。
     Json,
@@ -103,6 +115,12 @@ impl Language {
         Language::Bash,
         Language::Css,
         Language::Sql,
+        Language::Dart,
+        Language::Elixir,
+        Language::Zig,
+        Language::Haskell,
+        Language::Hcl,
+        Language::Graphql,
         Language::Vue,
         Language::Svelte,
         Language::Html,
@@ -135,6 +153,12 @@ impl Language {
             Language::Bash => "bash",
             Language::Css => "css",
             Language::Sql => "sql",
+            Language::Dart => "dart",
+            Language::Elixir => "elixir",
+            Language::Zig => "zig",
+            Language::Haskell => "haskell",
+            Language::Hcl => "hcl",
+            Language::Graphql => "graphql",
             Language::Vue => "vue",
             Language::Svelte => "svelte",
             Language::Html => "html",
@@ -171,6 +195,12 @@ impl Language {
             "bash" | "sh" | "shell" | "zsh" => Language::Bash,
             "css" | "scss" | "less" | "sass" => Language::Css,
             "sql" => Language::Sql,
+            "dart" => Language::Dart,
+            "elixir" | "ex" | "exs" => Language::Elixir,
+            "zig" => Language::Zig,
+            "haskell" | "hs" => Language::Haskell,
+            "hcl" | "tf" | "tfvars" | "terraform" => Language::Hcl,
+            "graphql" | "gql" => Language::Graphql,
             "vue" => Language::Vue,
             "svelte" => Language::Svelte,
             "html" | "htm" => Language::Html,
@@ -199,12 +229,7 @@ impl Language {
     pub fn is_structured(&self) -> bool {
         !matches!(
             self,
-            Language::Html
-                | Language::Json
-                | Language::Yaml
-                | Language::Toml
-                | Language::Markdown
-                | Language::Text
+            Language::Json | Language::Yaml | Language::Toml | Language::Markdown | Language::Text
         )
     }
 }
@@ -787,6 +812,12 @@ mod tests {
                 | Language::Bash
                 | Language::Css
                 | Language::Sql
+                | Language::Dart
+                | Language::Elixir
+                | Language::Zig
+                | Language::Haskell
+                | Language::Hcl
+                | Language::Graphql
                 | Language::Vue
                 | Language::Svelte
                 | Language::Html

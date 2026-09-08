@@ -1,0 +1,14 @@
+# 只用于显式执行真实语义评测；凭证由环境变量提供，不包含任何秘密值。
+[embedding]
+provider = "openai_compatible"
+base_url = "https://api.siliconflow.cn/v1"
+model = "BAAI/bge-m3"
+api_key_env = "SILICONFLOW_API_KEY"
+dimensions = 1024
+send_dimensions = false
+batch_size = 16
+max_concurrency = 1
+max_retries = 5
+
+[index]
+refresh_on_search = false

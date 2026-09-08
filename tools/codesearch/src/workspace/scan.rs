@@ -447,6 +447,12 @@ pub fn detect_language(rel_path: &str) -> Language {
         "sh" | "bash" | "zsh" | "ksh" => Language::Bash,
         "css" | "scss" | "less" | "sass" | "pcss" | "postcss" => Language::Css,
         "sql" | "ddl" | "dml" => Language::Sql,
+        "dart" => Language::Dart,
+        "ex" | "exs" => Language::Elixir,
+        "zig" => Language::Zig,
+        "hs" => Language::Haskell,
+        "tf" | "tfvars" | "hcl" => Language::Hcl,
+        "graphql" | "gql" => Language::Graphql,
         // `.nvue` 是 uni-app 的原生渲染组件，与 `.vue` 是同一套单文件组件结构。
         "vue" | "nvue" | "uvue" => Language::Vue,
         "svelte" => Language::Svelte,

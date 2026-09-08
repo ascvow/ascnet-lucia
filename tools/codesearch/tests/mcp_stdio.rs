@@ -59,7 +59,8 @@ fn structured(result: &CallToolResult) -> serde_json::Value {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tools_list_exposes_exactly_the_two_core_tools() {
+/// 工具清单包含新的语义入口，同时保留旧入口以兼容已有 Agent 配置。
+async fn tools_list_exposes_search_context_and_compatible_tools() {
     let repo = sample_repo();
     write_file(&repo.path().join("codesearch.toml"), NO_PROVIDER_CONFIG);
     let service = start_server(repo.path()).await;
@@ -82,8 +83,8 @@ async fn tools_list_exposes_exactly_the_two_core_tools() {
     names.sort_unstable();
     assert_eq!(
         names,
-        vec!["read_code", "search_code"],
-        "只应向 Agent 暴露两个核心工具"
+        vec!["read_code", "search_code", "search_context"],
+        "新入口与旧入口必须同时可用"
     );
 
     for tool in &tools {
@@ -111,6 +112,14 @@ async fn tools_list_exposes_exactly_the_two_core_tools() {
         .find(|tool| tool.name == "search_code")
         .expect("search_code");
     let schema = serde_json::to_value(&search.input_schema).expect("schema");
+    let context = tools
+        .iter()
+        .find(|tool| tool.name == "search_context")
+        .expect("search_context");
+    assert_eq!(
+        context.input_schema, search.input_schema,
+        "两个入口参数必须完全一致"
+    );
     assert_eq!(schema["required"], serde_json::json!(["query"]));
     let properties = schema["properties"].as_object().expect("properties");
     for key in [
@@ -128,7 +137,8 @@ async fn tools_list_exposes_exactly_the_two_core_tools() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn search_code_and_read_code_round_trip_over_the_wire() {
+/// 从新入口实际走 stdio 定位并读取，比较旧入口结果以验证不是空注册。
+async fn search_context_and_read_code_round_trip_over_the_wire() {
     let repo = sample_repo();
     write_file(&repo.path().join("codesearch.toml"), NO_PROVIDER_CONFIG);
     let service = start_server(repo.path()).await;
@@ -136,7 +146,7 @@ async fn search_code_and_read_code_round_trip_over_the_wire() {
     // ---- search_code ----
     let result = call(
         &service,
-        "search_code",
+        "search_context",
         serde_json::json!({ "query": "RetryPolicy", "max_results": 5 }),
     )
     .await
@@ -144,6 +154,14 @@ async fn search_code_and_read_code_round_trip_over_the_wire() {
     assert_ne!(result.is_error, Some(true), "搜索不应返回错误");
 
     let response = structured(&result);
+    let legacy = call(
+        &service,
+        "search_code",
+        serde_json::json!({ "query": "RetryPolicy", "max_results": 5 }),
+    )
+    .await
+    .expect("旧入口仍可调用");
+    assert_eq!(response["results"], structured(&legacy)["results"]);
     // 对外 JSON 字段必须稳定，Agent 依赖这些键。
     for key in [
         "catalog_epoch",
@@ -207,6 +225,116 @@ async fn search_code_and_read_code_round_trip_over_the_wire() {
         "必须返回原始代码"
     );
 
+    service.cancel().await.expect("关闭服务");
+}
+
+/// 新语言必须通过真实 MCP 参数校验、索引、符号定位和版本化读取，不仅是解析器单测。
+#[tokio::test(flavor = "multi_thread")]
+async fn new_language_filters_and_references_work_over_stdio() {
+    let repo = sample_repo();
+    write_file(&repo.path().join("codesearch.toml"), NO_PROVIDER_CONFIG);
+    let cases = [
+        (
+            "cart.dart",
+            "dart",
+            "CartTotal.payable",
+            include_str!("fixtures/multilingual/mobile/cart.dart"),
+        ),
+        (
+            "session.ex",
+            "elixir",
+            "Portal.Session.valid?",
+            include_str!("fixtures/multilingual/server/session.ex"),
+        ),
+        (
+            "frame.zig",
+            "zig",
+            "ReceiveBuffer.reset",
+            include_str!("fixtures/multilingual/native/frame.zig"),
+        ),
+        (
+            "pricing.hs",
+            "haskell",
+            "shippingCost",
+            include_str!("fixtures/multilingual/server/pricing.hs"),
+        ),
+        (
+            "storage.tf",
+            "hcl",
+            "resource.aws_s3_bucket_versioning.archive",
+            include_str!("fixtures/multilingual/infra/storage.tf"),
+        ),
+        (
+            "orders.graphql",
+            "graphql",
+            "RecentOrders",
+            include_str!("fixtures/multilingual/api/orders.graphql"),
+        ),
+        (
+            "preview.html",
+            "html",
+            "releasePreview",
+            include_str!("fixtures/multilingual/web/preview.html"),
+        ),
+    ];
+    for (path, _, _, source) in cases {
+        write_file(&repo.path().join(path), source);
+    }
+    let service = start_server(repo.path()).await;
+    for (path, language, symbol, source) in cases {
+        let result = call(
+            &service,
+            "search_context",
+            serde_json::json!({"query": symbol, "language": [language]}),
+        )
+        .await
+        .expect("新语言可调用");
+        assert_ne!(result.is_error, Some(true));
+        let response = structured(&result);
+        let hits = response["results"].as_array().expect("结果列表");
+        assert!(!hits.is_empty(), "{language} {symbol} 应能定位");
+        assert!(hits
+            .iter()
+            .all(|hit| hit["language"] == language && hit["path"] == path));
+        let first = &hits[0];
+        // 小型类会作为完整代码块返回，展示符号是类名；子方法仍必须经符号通道命中且原文可见。
+        assert!(
+            first["matched_by"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|channel| channel == "symbol"),
+            "{first}"
+        );
+        assert!(
+            first["content"]
+                .as_str()
+                .unwrap()
+                .contains(symbol.rsplit('.').next().unwrap()),
+            "{first}"
+        );
+        let read = call(
+            &service,
+            "read_code",
+            serde_json::json!({"code_ref": first["code_ref"]}),
+        )
+        .await
+        .expect("读取新语言源码");
+        let read = structured(&read);
+        // 搜索展示可以省略最后的换行，版本化读取保留原始行结束符；正文与版本必须一致。
+        assert_eq!(read["file_hash"], first["file_hash"]);
+        assert_eq!(
+            read["content"]
+                .as_str()
+                .unwrap()
+                .trim_end_matches(['\r', '\n']),
+            first["content"]
+                .as_str()
+                .unwrap()
+                .trim_end_matches(['\r', '\n'])
+        );
+        assert!(source.contains(read["content"].as_str().unwrap().trim_end()));
+    }
     service.cancel().await.expect("关闭服务");
 }
 
@@ -427,7 +555,7 @@ async fn stdout_carries_only_protocol_frames() {
     assert_eq!(frames.len(), 2, "应收到 initialize 与 tools/list 两帧");
     assert_eq!(frames[0]["result"]["serverInfo"]["name"], "codesearch");
     let tools = frames[1]["result"]["tools"].as_array().expect("tools 数组");
-    assert_eq!(tools.len(), 2, "应有两个工具");
+    assert_eq!(tools.len(), 3, "应有两个搜索入口与一个读取工具");
 
     // 确认日志确实写到了 stderr：否则上面的断言可能只是因为压根没有日志。
     drop(stdin);

@@ -47,7 +47,7 @@ const EMBED_PASS_LIMIT: usize = 512;
 ///
 /// 修改 `parser`、`chunker` 或语言识别，使同一份源码产出不同分块时必须递增。
 /// 这与 `SCHEMA_VERSION` 是两个维度：schema 描述表结构，本项描述表内容的产出方式。
-const CHUNKER_VERSION: i64 = 1;
+const CHUNKER_VERSION: i64 = 2;
 
 /// 记录分块器版本的元数据键。
 const META_CHUNKER_VERSION: &str = "chunker_version";

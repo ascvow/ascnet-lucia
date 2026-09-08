@@ -159,7 +159,10 @@ dimensions = 1024
 | `status` | 查看索引状态 | `--json` |
 | `serve` | 启动 MCP 服务 | `--transport stdio`、`--watch true\|false` |
 
-`--language` 可选值：`rust`、`typescript`、`tsx`、`javascript`、`markdown`、`text`。
+`--language` 接受 33 类格式：`rust`、`typescript`、`tsx`、`javascript`、`python`、`go`、
+`java`、`c`、`cpp`、`csharp`、`ruby`、`php`、`swift`、`kotlin`、`scala`、`lua`、`bash`、
+`css`、`sql`、`dart`、`elixir`、`zig`、`haskell`、`hcl`、`graphql`、`vue`、`svelte`、
+`html`、`json`、`yaml`、`toml`、`markdown`、`text`。支持常见别名，如 `tf`、`gql`、`ex`。
 
 查询里也可以内联作用域，与命令行参数叠加生效：
 
@@ -191,11 +194,16 @@ codesearch search --root . --query '-path:**/tests/** RetryPolicy::execute'
 }
 ```
 
-只向 Agent 暴露两个工具：
+向 Agent 暴露以下工具：
 
-- **`search_code`** — 入参 `query`（必填）、`include`/`exclude`/`language`、`max_results`、`token_budget`。
+- **`search_context`** — 入参 `query`（必填）、`include`/`exclude`/`language`、`max_results`、`token_budget`。
   返回 `catalog_epoch`、`status`、`results`、token 统计与 `estimated`/`truncated` 标志。
+- **`search_code`** — 既有兼容入口，与 `search_context` 的参数、实现、返回值和错误完全一致。
 - **`read_code`** — 入参 `code_ref`、`expand`、`token_budget`。返回该版本的原始代码与出处。
+
+调用示例：`search_context({"query":"请求失败后在哪里等待并重试"})`。
+先检查 `status.degraded` 与 `status.vector_search_used`，再按返回的 `code_ref` 读取源码确认。
+未配置 Embedding 时没有纯语义能力；命中分数不表示答案一定正确。
 
 workspace 范围由启动参数 `--root` 决定。**工具入参里没有任何根目录参数**，
 Agent 无法通过参数访问其他本地目录；路径穿越与指向 workspace 外的符号链接都会被拒绝。
@@ -285,9 +293,17 @@ score(d) = Σ weight_i / (k + rank_i(d))
 - **关系扩展是启发式的**：只做父子包含、明确的导入信息与简单的测试关联，默认最多扩展一跳。
   Tree-sitter 提取的调用表达式**不等于**已解析的调用目标，按名称匹配得到的关系
   只标记为启发式，不冒充确定的引用或调用图。
-- **语言支持**：结构化分块覆盖 Rust、TypeScript、JavaScript、TSX；
-  Markdown 按标题分块；其他文本走有界兜底分块。解析失败但内容是有效文本时同样兜底，
-  文件不会凭空消失，跳过原因可通过 `status` 观察。
+- **语言支持**：28 类结构化入口覆盖 Rust、TS/TSX/JS、Python、Go、Java、C/C++、C#、
+  Ruby、PHP、Swift、Kotlin、Scala、Lua、Bash、CSS、SQL、Dart、Elixir、Zig、Haskell、
+  HCL、GraphQL、Vue、Svelte、HTML。Markdown 按标题分块；JSON/YAML/TOML/其他文本走有界文本分块。
+  解析失败时有效文本仍保留，不会因未知语法丢失整个文件。
+- **框架范围**：Flutter 类与方法走 Dart；React/Next.js 走 JSX/TSX；Vue/Nuxt/uni-app
+  的 `.vue`/`.nvue`/`.uvue` 拆出脚本与样式；Vue `defineComponent` 与 Pinia `defineStore`
+  提取静态选项对象方法；FastAPI/Spring 等装饰器、注解随声明保留。框架工厂名称是语法识别，
+  不冒充跨文件导入解析。Terraform 块按种类与标签命名；GraphQL 只提取具名定义。
+- **方言边界**：SCSS/Less/Sass 仍使用 CSS 语法，复杂预处理器结构可能只保留文本；
+  Elixir 不展开宏，Haskell 不执行类型推导，HTML/Vue/Svelte 模板不生成绑定或调用图。
+  这些都不是框架编译器或语言服务器。
 - 未实现：完整跨语言调用图、LLM 全仓摘要、多仓库搜索、Web UI、向量库服务化、Reranker
   （只预留了接口，检索不依赖它）。
 
@@ -308,6 +324,9 @@ score(d) = Σ weight_i / (k + rank_i(d))
 以下是本机真实执行结果，非估计值。环境：macOS (darwin 25.6.0)、rustc 1.96.1、Apple clang 21.0.0。
 
 ### 检查
+
+下列数字为初版历史记录，不代表当前测试数量。本次语言扩展与实测见
+[语言扩展评测记录](reports/language-support-2026-09-08.md)。
 
 ```bash
 cargo fmt --all -- --check                               # 通过
@@ -417,7 +436,7 @@ src/
   config/        配置与校验
   workspace/     路径身份、扫描过滤、进程锁
   indexer/       索引流水线与文件监听
-  parser/        Tree-sitter 适配层（rust / typescript）
+  parser/        Tree-sitter 适配层（Rust / TS / Elixir、通用语法表、HTML/SFC）
   chunker/       结构化分块
   store/         SQLite、FTS5、向量与缓存的权威记录
   models/        Embedding Provider（HTTP / Mock）与空间身份

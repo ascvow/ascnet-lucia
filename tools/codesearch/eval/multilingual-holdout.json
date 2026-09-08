@@ -1,0 +1,24 @@
+{
+  "queries": [
+    { "query": "Clamp the checkout total when a discount exceeds the basket value", "expect_paths": ["mobile/cart.dart"], "expect_text": "double payable()" },
+    { "query": "Render the amount due with exactly two decimal places in the mobile UI", "expect_paths": ["mobile/cart.dart"], "expect_text": "Widget build(" },
+    { "query": "Reject a credential whose expiration time has already passed", "expect_paths": ["server/session.ex"], "expect_text": "def valid?" },
+    { "query": "Remove the stored authentication session during logout", "expect_paths": ["server/session.ex"], "expect_text": "def revoke" },
+    { "query": "Compute the XOR integrity byte for a serial protocol message", "expect_paths": ["native/frame.zig"], "expect_text": "pub fn checksum" },
+    { "query": "Reset the number of occupied bytes in the receive buffer", "expect_paths": ["native/frame.zig"], "expect_text": "pub fn reset" },
+    { "query": "Calculate delivery fees by weight with free delivery above the purchase threshold", "expect_paths": ["server/pricing.hs"], "expect_text": "shippingCost amount" },
+    { "query": "Enable historical object versions so accidentally deleted files can be recovered", "expect_paths": ["infra/storage.tf"], "expect_text": "resource \"aws_s3_bucket_versioning\"" },
+    { "query": "Configure automatic expiration of application logs after a month", "expect_paths": ["infra/storage.tf"], "expect_text": "retention_in_days = 30" },
+    { "query": "Fetch the next batch of orders after a cursor and check whether more results exist", "expect_paths": ["api/orders.graphql"], "expect_text": "query RecentOrders" },
+    { "query": "Validate the minimum password length before posting the login form", "expect_paths": ["web/login.vue"], "expect_text": "async function submit" },
+    { "query": "Persist unsaved editor contents across browser refreshes", "expect_paths": ["web/draft.svelte"], "expect_text": "function persistDraft" },
+    { "query": "Clean up event subscriptions when a React component unmounts", "expect_paths": ["web/notification.tsx"], "expect_text": "export function NotificationFeed" },
+    { "query": "Refuse to reserve merchandise when available inventory cannot satisfy the requested quantity", "expect_paths": ["server/inventory.py"], "expect_text": "async def reserve_stock" },
+    { "query": "Commit the payment receipt and paid order status in a single database transaction", "expect_paths": ["server/PaymentService.java"], "expect_text": "void confirmPayment" },
+    { "query": "Authenticate incoming payment webhooks using a constant-time MAC comparison", "expect_paths": ["server/webhook.php"], "expect_text": "function verify" },
+    { "query": "Synchronize quota consumption to prevent simultaneous requests from exceeding the limit", "expect_paths": ["server/limiter.go"], "expect_text": "func (l *Limiter) Allow" },
+    { "query": "Sanitize uploaded filenames to prevent directory traversal", "expect_paths": ["server/upload.cs"], "expect_text": "string SafeName" },
+    { "query": "Cap exponentially increasing retry delays at thirty seconds", "expect_paths": ["native/retry.rs"], "expect_text": "pub fn next_delay" },
+    { "query": "Release an object URL after finishing a browser download preview", "expect_paths": ["web/preview.html"], "expect_text": "export function releasePreview" }
+  ]
+}

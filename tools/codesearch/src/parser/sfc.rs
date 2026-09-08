@@ -1,21 +1,19 @@
-//! 单文件组件（Vue / Svelte）解析。
+//! 单文件组件（Vue / Svelte）与 HTML 内嵌代码解析。
 //!
-//! SFC 本身不是一种语法，而是若干内嵌块的容器。这里不引入 SFC 专用语法，
-//! 而是切分出 `<script>` 与 `<style>` 块，交给已有的 TypeScript / JavaScript / CSS
+//! 使用 HTML 语法识别真实 `<script>` 与 `<style>` 元素，交给 TypeScript / JavaScript / CSS
 //! 适配层解析，再把子解析结果的字节偏移与行号平移回外层文件坐标。
 //!
-//! 只识别 `<script>` 和 `<style>`，不解析 `<template>`：模板不会嵌套出现 script 或
-//! style，因此无需处理标签嵌套；模板区域由 [`crate::chunker`] 的未覆盖区间兜底成
-//! 文本块，内容不会丢失。
+//! 注释、属性值中的伪标签以及 JSON 数据脚本不会成为代码定义。
+//! 模板区域由 [`crate::chunker`] 的未覆盖区间保留为文本块，内容不会丢失。
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::parser::{Definition, ParsedFile};
 use crate::types::Language;
 
 /// 解析单文件组件。
 pub fn parse(source: &str) -> Result<ParsedFile> {
     let mut parsed = ParsedFile::default();
-    for block in find_blocks(source) {
+    for block in find_blocks(source)? {
         let content = &source[block.content_start..block.content_end];
         let mut inner = super::parse(block.language, content)?;
         let line_offset = source[..block.content_start].matches('\n').count() as u32;
@@ -60,131 +58,99 @@ fn shift_definition(definition: &mut Definition, byte_offset: usize, line_offset
     }
 }
 
-/// 扫描出全部 `<script>` 与 `<style>` 块。
-///
-/// 大小写不敏感，允许任意属性。开始标签以第一个 `>` 结束——属性值里带 `>` 的
-/// 写法在 SFC 中不成立，因此不做引号状态机。
-fn find_blocks(source: &str) -> Vec<Block> {
-    let lowered = source.to_ascii_lowercase();
+/// 使用语法树扫描内嵌块，闭合缺失、外部脚本与非代码 MIME 类型不参与声明提取。
+fn find_blocks(source: &str) -> Result<Vec<Block>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_html::LANGUAGE.into())
+        .map_err(|error| Error::Internal(format!("加载 HTML 语法失败: {error}")))?;
+    let Some(tree) = parser.parse(source, None) else {
+        return Ok(Vec::new());
+    };
     let mut blocks = Vec::new();
-    let mut cursor = 0usize;
-    while cursor < lowered.len() {
-        let Some((tag_start, tag)) = next_tag(&lowered, cursor) else {
-            break;
-        };
-        // 开始标签的结束位置。
-        let Some(open_end) = lowered[tag_start..].find('>').map(|at| tag_start + at + 1) else {
-            break;
-        };
-        let close = format!("</{}", tag.name);
-        let Some(content_end) = lowered[open_end..].find(&close).map(|at| open_end + at) else {
-            // 没有闭合标签时放弃该块，避免把文件尾部整段误当成代码。
-            cursor = open_end;
-            continue;
-        };
-        let attributes = &source[tag_start..open_end];
-        if let Some(language) = (tag.resolve)(attributes) {
-            blocks.push(Block {
-                language,
-                content_start: open_end,
-                content_end,
-            });
-        }
-        cursor = content_end + close.len();
-    }
-    blocks
-}
-
-/// 待扫描的标签种类。
-struct TagKind {
-    name: &'static str,
-    /// 由开始标签的属性文本判断内嵌语言；返回 `None` 表示不做结构化解析。
-    resolve: fn(&str) -> Option<Language>,
-}
-
-fn next_tag(lowered: &str, from: usize) -> Option<(usize, TagKind)> {
-    const TAGS: &[TagKind] = &[
-        TagKind {
-            name: "script",
-            resolve: script_language,
-        },
-        TagKind {
-            name: "style",
-            resolve: style_language,
-        },
-    ];
-    let mut best: Option<(usize, TagKind)> = None;
-    for tag in TAGS {
-        // 只匹配 `<script` 后紧跟空白、`>` 或 `/` 的位置，避免命中 `<scriptx`。
-        let mut search = from;
-        while let Some(at) = lowered[search..].find(&format!("<{}", tag.name)) {
-            let start = search + at;
-            let after = start + 1 + tag.name.len();
-            let next = lowered.as_bytes().get(after).copied();
-            if matches!(
-                next,
-                Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'>') | Some(b'/')
-            ) {
-                if best.as_ref().is_none_or(|(current, _)| start < *current) {
-                    best = Some((
-                        start,
-                        TagKind {
-                            name: tag.name,
-                            resolve: tag.resolve,
-                        },
-                    ));
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "script_element" | "style_element") {
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            let open = children.iter().find(|child| child.kind() == "start_tag");
+            let close = children
+                .iter()
+                .find(|child| child.kind() == "end_tag" && !child.is_missing());
+            if let (Some(open), Some(close)) = (open, close) {
+                if let Some(language) =
+                    block_language(source, *open, node.kind() == "script_element")
+                {
+                    blocks.push(Block {
+                        language,
+                        content_start: open.end_byte(),
+                        content_end: close.start_byte(),
+                    });
                 }
-                break;
             }
-            search = after;
+            continue;
+        }
+        // 注释、属性、原始文本中的标签只是文本，不递归扫描。
+        if matches!(node.kind(), "comment" | "attribute" | "raw_text") {
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    blocks.sort_by_key(|block| block.content_start);
+    Ok(blocks)
+}
+
+/// 按完整属性名解析语言，data-lang 与属性值中的 lang 不会影响判断。
+fn block_language(source: &str, open: tree_sitter::Node<'_>, script: bool) -> Option<Language> {
+    let mut lang = None;
+    let mut mime = None;
+    let mut cursor = open.walk();
+    for attr in open
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "attribute")
+    {
+        let name = attr.named_child(0)?;
+        let value = attr
+            .named_child(1)
+            .map(|value| {
+                source[value.byte_range()]
+                    .trim_matches(['\'', '"'])
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        match source[name.byte_range()].to_ascii_lowercase().as_str() {
+            "src" => return None,
+            "lang" => lang = Some(value),
+            "type" => mime = Some(value),
+            _ => {}
         }
     }
-    best
-}
-
-/// `<script lang="ts">` 决定用哪套 JS 系语法解析。
-fn script_language(attributes: &str) -> Option<Language> {
-    let language = match lang_attribute(attributes).as_deref() {
-        Some("ts") | Some("typescript") => Language::TypeScript,
-        Some("tsx") => Language::Tsx,
-        Some("jsx") => Language::JavaScript,
-        // 未标注 lang 的 Vue / Svelte script 块默认是 JavaScript。
-        None | Some("js") | Some("javascript") => Language::JavaScript,
-        // 其他方言（coffee 等）没有对应语法，交给文本兜底。
-        Some(_) => return None,
-    };
-    Some(language)
-}
-
-/// `<style lang="scss">` 等预处理器方言仍按 CSS 解析。
-///
-/// CSS 语法能覆盖嵌套与变量之外的绝大多数结构；解析出错时定义列表为空，
-/// 由文本兜底接管，不会丢内容。
-fn style_language(attributes: &str) -> Option<Language> {
-    match lang_attribute(attributes).as_deref() {
-        None | Some("css") | Some("scss") | Some("less") | Some("sass") | Some("postcss") => {
-            Some(Language::Css)
+    if script {
+        if mime.as_deref().is_some_and(|mime| {
+            !matches!(
+                mime,
+                "" | "module"
+                    | "text/javascript"
+                    | "application/javascript"
+                    | "text/ecmascript"
+                    | "application/ecmascript"
+            )
+        }) {
+            return None;
         }
-        Some(_) => None,
-    }
-}
-
-/// 取出 `lang="xxx"` / `lang='xxx'` / `lang=xxx` 的值。
-fn lang_attribute(attributes: &str) -> Option<String> {
-    let at = attributes.to_ascii_lowercase().find("lang")?;
-    let rest = attributes[at + "lang".len()..].trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
-    let value = match rest.chars().next()? {
-        quote @ ('"' | '\'') => rest[1..].split(quote).next()?,
-        _ => rest
-            .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
-            .next()?,
-    };
-    let value = value.trim().to_ascii_lowercase();
-    if value.is_empty() {
-        None
+        match lang.as_deref() {
+            None | Some("" | "js" | "javascript" | "jsx") => Some(Language::JavaScript),
+            Some("ts" | "typescript") => Some(Language::TypeScript),
+            Some("tsx") => Some(Language::Tsx),
+            _ => None,
+        }
     } else {
-        Some(value)
+        match lang.as_deref() {
+            None | Some("" | "css" | "scss" | "less" | "sass" | "postcss") => Some(Language::Css),
+            _ => None,
+        }
     }
 }
 

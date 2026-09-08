@@ -1,6 +1,6 @@
 //! MCP stdio 服务。
 //!
-//! 只向 Agent 暴露两个核心工具：`search_code` 与 `read_code`。
+//! 暴露 `search_context`、兼容入口 `search_code` 与 `read_code`，共用同一引擎。
 //!
 //! # 输出通道
 //!
@@ -39,7 +39,7 @@ pub struct SearchCodeInput {
     #[serde(default)]
     pub exclude: Vec<String>,
 
-    /// 仅搜索这些语言：rust / typescript / tsx / javascript / markdown / text。
+    /// 语言过滤值使用结果中的 language；例如 rust、python、dart、vue、hcl、graphql。
     #[serde(default)]
     pub language: Vec<String>,
 
@@ -90,6 +90,18 @@ impl CodesearchServer {
             engine,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// 语义定位入口，与既有 search_code 完全共用参数、检索与错误契约。
+    #[tool(
+        name = "search_context",
+        description = "用自然语言描述要找的行为，定位当前工作目录中的代码上下文。返回原始代码、路径、行号和 code_ref，可用 read_code 继续读取。语义能力依赖配置的 Embedding 服务；检查 status.degraded 和 vector_search_used，不把降级结果视为语义检索。"
+    )]
+    pub async fn search_context(
+        &self,
+        input: Parameters<SearchCodeInput>,
+    ) -> std::result::Result<Json<serde_json::Value>, ErrorData> {
+        self.search_code(input).await
     }
 
     /// 搜索代码。
@@ -160,7 +172,7 @@ impl ServerHandler for CodesearchServer {
             ))
             .with_instructions(
                 "codesearch 检索启动时指定的那个工作目录。\
-先用 search_code 定位代码，再用返回的 code_ref 调用 read_code 获取完整上下文。\
+先用 search_context 定位代码，再用返回的 code_ref 调用 read_code 获取完整上下文；search_code 是兼容入口。\
 所有结果都带文件路径、行号和内容哈希；token 统计均为估算值（estimated=true）。\
 新鲜度语义为 best_effort：结果反映最近一次采集的状态，不等于磁盘此刻的绝对最新版本。",
             )

@@ -75,9 +75,15 @@ fn handle_node(
             // `export default { methods: { submit() {} } }`：Vue 2 选项式组件的写法，
             // 没有 declaration 字段，成员藏在对象字面量里。
             if let Some(value) = node.child_by_field_name("value") {
-                if value.kind() == "object" {
+                if let Some(object) = component_options(ctx, value) {
                     let lead = leading(ctx, outer);
-                    out.extend(object_members(ctx, value, scope, None, lead.doc.as_deref()));
+                    out.extend(object_members(
+                        ctx,
+                        object,
+                        scope,
+                        None,
+                        lead.doc.as_deref(),
+                    ));
                 }
             }
         }
@@ -231,6 +237,31 @@ fn unwrap_function<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
         "function_expression" | "function" | "arrow_function" | "generator_function"
     )
     .then_some(node)
+}
+
+/// 读取 Vue/Pinia 工厂调用的静态选项对象；仅检查语法形态，不声明已解析框架导入。
+///
+/// 不遍历任意函数参数，避免把普通业务调用里的临时对象提升为模块声明。
+fn component_options<'tree>(ctx: &Context<'_>, node: Node<'tree>) -> Option<Node<'tree>> {
+    if node.kind() == "object" {
+        return Some(node);
+    }
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let callee = node.child_by_field_name("function")?;
+    if !matches!(
+        ctx.text(callee),
+        "defineComponent" | "Vue.defineComponent" | "defineStore"
+    ) {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let object = arguments
+        .named_children(&mut cursor)
+        .find(|argument| argument.kind() == "object");
+    object
 }
 
 /// 提取对象字面量里的函数成员。
@@ -506,7 +537,7 @@ fn variable(
     // `var Controller = { index: function () {} }`：对象的函数成员就是模块入口，
     // 作为子定义登记后 `Controller.index` 才能走符号通路命中。
     let children = value
-        .filter(|value| value.kind() == "object")
+        .and_then(|value| component_options(ctx, value))
         .map(|value| object_members(ctx, value, scope, Some(&qualified), None))
         .unwrap_or_default();
     Some(Definition {

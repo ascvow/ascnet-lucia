@@ -1,13 +1,14 @@
 //! Tree-sitter 解析与定义提取。
 //!
-//! 三条路径：Rust 与 TypeScript 系各有手写适配层（[`rust_lang`]、[`typescript`]）；
+//! Rust、TypeScript 与 Elixir 有独立适配层（[`rust_lang`]、[`typescript`]、[`elixir`]）；
 //! 其余语言共用一个由 [`generic::LanguageSpec`] 表驱动的通用适配层；
-//! 单文件组件（Vue / Svelte）由 [`sfc`] 拆出内嵌块后委派给上面两者。
+//! 单文件组件与 HTML 由 [`sfc`] 提取内嵌块后委派给对应语言适配层。
 //! 公共的遍历、文档注释绑定与签名提取逻辑放在本模块共享。
 //!
 //! 提取结果只描述"源码里写了什么"，不做任何跨文件解析。Tree-sitter 能看到调用表达式，
 //! 但那不等于已解析的调用目标，因此本模块不产出调用图。
 
+pub mod elixir;
 pub mod generic;
 pub mod rust_lang;
 pub mod sfc;
@@ -89,8 +90,11 @@ pub fn parse(language: Language, source: &str) -> Result<ParsedFile> {
         return Ok(ParsedFile::default());
     }
     // 单文件组件不是一种语法，先拆块再按内嵌语言委派。
-    if matches!(language, Language::Vue | Language::Svelte) {
+    if matches!(language, Language::Vue | Language::Svelte | Language::Html) {
         return sfc::parse(source);
+    }
+    if language == Language::Elixir {
+        return elixir::parse(source);
     }
 
     // 手写适配层覆盖 Rust 与 TypeScript 系，其余语言走表驱动的通用适配层。

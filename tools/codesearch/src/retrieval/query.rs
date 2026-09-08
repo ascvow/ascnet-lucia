@@ -190,6 +190,27 @@ pub fn analyze(raw: &str, explicit: &ScopeFilter) -> Result<QueryPlan> {
     // 4. 逐 token 判定符号 / 路径。
     let tokens: Vec<&str> = effective.split_whitespace().collect();
     for token in &tokens {
+        // Elixir/Ruby 的 ?/! 是符号的一部分。只对明确语言或独立标识符保留原拼写，
+        // 自然语言句末标点仍按原规则清洗，避免扩大普通问句的精确召回预算。
+        let spelling = token.trim_matches([',', '，', '。', '？', '；', ';']);
+        let suffix = spelling.ends_with(['?', '!']);
+        let stem = spelling.trim_end_matches(['?', '!']);
+        let language_suffix = plan
+            .scope
+            .languages
+            .iter()
+            .any(|language| matches!(language, Language::Elixir | Language::Ruby));
+        if suffix
+            && (language_suffix || tokens.len() == 1)
+            && spelling.len() == stem.len() + 1
+            && stem.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && stem
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'))
+        {
+            push_unique(&mut plan.symbols, spelling.to_string());
+            continue;
+        }
         let cleaned = token
             .trim_matches(|c: char| matches!(c, ',' | '，' | '。' | '?' | '？' | '!' | '；' | ';'));
         if cleaned.is_empty() {
@@ -551,6 +572,26 @@ mod tests {
     #[test]
     fn empty_query_is_rejected() {
         assert!(analyze("   ", &ScopeFilter::default()).is_err());
+    }
+
+    /// Ruby/Elixir 的合法后缀不得被改写成另一个函数名，也不能改变普通问句的符号集合。
+    #[test]
+    fn predicate_and_bang_symbols_keep_their_suffix() {
+        for symbol in [
+            "Portal.Session.valid?",
+            "valid?",
+            "User.save!",
+            "save!",
+            "Store::empty?",
+        ] {
+            assert_eq!(analyze_plain(symbol).symbols, [symbol]);
+        }
+        assert_eq!(
+            analyze_plain("Where is RetryPolicy implemented?").symbols,
+            analyze_plain("Where is RetryPolicy implemented").symbols
+        );
+        assert!(analyze_plain("123?").symbols.is_empty());
+        assert!(analyze_plain("如何验证?").symbols.is_empty());
     }
 
     #[test]
