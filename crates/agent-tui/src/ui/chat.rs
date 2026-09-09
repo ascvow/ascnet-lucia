@@ -78,6 +78,8 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         horizontal: 1,
         vertical: 1,
     });
+    // 每帧重置热区，空会话和窗口缩小时不能保留上一帧的跳转按钮。
+    app.jump_hint_area = None;
     #[cfg(feature = "plugins")]
     {
         app.last_message_width = chat_area.width.max(1);
@@ -190,36 +192,41 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         let chat = chat.scroll((scroll, 0));
         frame.render_widget(chat, chat_area);
 
-        // 手动翻阅时在消息区右下角提示距底部的行数，并作为回到底部的点击热区。
-        app.jump_hint_area = None;
+        // 使用消息区底部的留白行，避免覆盖正文及宽字符的续占单元格。
         if let Some(position) = app.scroll {
             let below = max_scroll.saturating_sub(position);
-            if below > 0 && chat_area.height > 0 {
+            if below > 0 && chat_area.height > 0 && chat_area.bottom() < chat_section.bottom() {
                 // 宽终端显式写出点击提示；窄终端退回只带行数的紧凑形式。
                 let verbose = format!(" ↓ {below} lines · click to jump ");
                 let compact = format!(" ↓ {below} lines ");
+                let minimal = format!("↓{below}");
                 let fits = |text: &str| {
                     u16::try_from(unicode_width::UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
                         <= chat_area.width
                 };
-                let hint = if fits(&verbose) { verbose } else { compact };
-                let hint_width = unicode_width::UnicodeWidthStr::width(hint.as_str()) as u16;
-                let width = hint_width.min(chat_area.width);
-                let hint_area = Rect {
-                    x: chat_area.x + chat_area.width - width,
-                    y: chat_area.y + chat_area.height - 1,
-                    width,
-                    height: 1,
-                };
-                // 角标覆盖在消息文字上，补暗色背景保证可读。
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        hint,
-                        Style::new().fg(COLOR_WARNING).bg(COLOR_USER_BG),
-                    ))),
-                    hint_area,
-                );
-                app.jump_hint_area = Some(hint_area);
+                let hint = [verbose, compact, minimal]
+                    .into_iter()
+                    .find(|text| fits(text));
+                if let Some(hint) = hint {
+                    let hint_width = unicode_width::UnicodeWidthStr::width(hint.as_str()) as u16;
+                    let width = hint_width;
+                    let hint_area = Rect {
+                        x: chat_area.x + chat_area.width - width,
+                        y: chat_area.bottom(),
+                        width,
+                        height: 1,
+                    };
+                    // 清空提示区域后绘制完整文本，尺寸变化时不依赖底层内容覆盖。
+                    frame.render_widget(Clear, hint_area);
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            hint,
+                            Style::new().fg(COLOR_WARNING).bg(COLOR_USER_BG),
+                        ))),
+                        hint_area,
+                    );
+                    app.jump_hint_area = Some(hint_area);
+                }
             }
         }
     }

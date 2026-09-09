@@ -2,6 +2,54 @@
 
 use super::*;
 
+/// 跳转提示独占留白行；连续重绘、窗口缩小与回到底部不能截断或残留点击区域。
+#[test]
+fn jump_hint_uses_separate_row_and_clears_when_hidden() {
+    for width in [100, 40, 16] {
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.messages.push(Msg::new(
+            MsgKind::Assistant,
+            "中文宽字符正文测试\n".repeat(80),
+        ));
+        for position in [0, 1, 20] {
+            app.scroll = Some(position);
+            terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+            let area = app.jump_hint_area.expect("滚动时应显示提示");
+            assert_eq!(
+                area.y,
+                1 + app.last_viewport,
+                "提示应在正文视口之后的留白行"
+            );
+            let text: String = (area.x..area.right())
+                .map(|x| terminal.backend().buffer()[(x, area.y)].symbol())
+                .collect();
+            assert!(text.starts_with(" ↓ ") || text.starts_with('↓'), "{text}");
+            assert!(!text.contains("中文"));
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(text.as_str()),
+                usize::from(area.width)
+            );
+            assert!(app
+                .tool_message_hit_regions
+                .iter()
+                .all(|region| region.area.bottom() <= area.y));
+            // 留白行上方仍为正文，提示不能覆盖最后一行。
+            let above: String = (0..width)
+                .map(|x| terminal.backend().buffer()[(x, area.y - 1)].symbol())
+                .collect();
+            assert!(!above.contains("click to jump"));
+        }
+        app.scroll = None;
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        assert!(app.jump_hint_area.is_none());
+        app.messages.clear();
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        assert!(app.jump_hint_area.is_none());
+    }
+}
+
 /// 验证常规尺寸下角色标记、输入提示和底部信息行均可见。
 #[test]
 fn render_shows_visual_hierarchy() {
