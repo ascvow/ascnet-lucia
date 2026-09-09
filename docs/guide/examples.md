@@ -99,26 +99,6 @@ events_jsonl = "events.jsonl"
 
 相对路径以配置文件所在目录为基准。事件包含模型请求、工具调用和运行状态，可能带有用户输入或工具结果，分享前应先检查内容。
 
-## 加载 Echo WASM 插件
-
-构建插件并用最小 CLI 调用：
-
-```bash
-bun run build:plugin:echo
-cargo run -p agent-basic-cli -- --demo \
-  --plugin-manifest examples/plugins/echo-plugin/plugin.toml \
-  "hello from wasm"
-```
-
-在 TUI 中查看插件右侧面板：
-
-```bash
-cargo run -p lucia -- --demo \
-  --plugin-manifest examples/plugins/echo-plugin/plugin.toml
-```
-
-按 `Tab` 把焦点切换到插件面板。插件的 crate、manifest 和实现位于 `examples/plugins/echo-plugin`。
-
 ## 在 Rust 中从 TOML 构造 Agent
 
 应用的 `Cargo.toml`：

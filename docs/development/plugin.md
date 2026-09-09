@@ -367,14 +367,14 @@ Runtime 的模型、provider options、工具范围和 owner 由服务端策略�
 构建示例插件：
 
 ```bash
-bun run build:plugin:echo
+bun run build:plugin:examples
 ```
 
 自定义插件可复用 `scripts/build-plugin.ts` 的 component 构建方式，或直接运行：
 
 ```bash
 cargo build \
-  --manifest-path examples/plugins/echo-plugin/Cargo.toml \
+  --manifest-path examples/plugins/ui-showcase-plugin/Cargo.toml \
   --target wasm32-wasip2 \
   --release
 ```

@@ -650,11 +650,7 @@ pub trait PluginHostApi {
     /// 索引一类的用户数据必须用 store，否则一次插件升级就会清空用户资产。
     ///
     /// 需要 manifest 声明 `storage = true`。
-    fn store_get(
-        &self,
-        scope: PluginStoreScope,
-        key: &str,
-    ) -> Result<Option<serde_json::Value>> {
+    fn store_get(&self, scope: PluginStoreScope, key: &str) -> Result<Option<serde_json::Value>> {
         let _ = (scope, key);
         Err(anyhow!("当前宿主未提供插件持久存储能力"))
     }
@@ -1824,11 +1820,7 @@ impl PluginHostApi for NoopHostApi {
         Ok(None)
     }
 
-    fn store_get(
-        &self,
-        _scope: PluginStoreScope,
-        _key: &str,
-    ) -> Result<Option<serde_json::Value>> {
+    fn store_get(&self, _scope: PluginStoreScope, _key: &str) -> Result<Option<serde_json::Value>> {
         Ok(None)
     }
 

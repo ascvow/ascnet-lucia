@@ -6,10 +6,9 @@
 
 use agent_plugin::{
     export_plugin, ActivationContext, AgentId, AgentOutcome, AgentPlugin, AgentSpawnRequest,
-    AgentViewSession, PluginHostApi, Result, ToolCall, ToolPermissionScope,
-    ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
-    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
-    UiViewInstance,
+    AgentViewSession, PluginHostApi, Result, ToolCall, ToolPermissionScope, ToolResult, ToolSpec,
+    UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
+    UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::Deserialize;

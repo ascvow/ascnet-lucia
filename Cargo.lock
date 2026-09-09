@@ -42,6 +42,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
@@ -72,20 +73,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "agent-live-tests"
-version = "0.1.0"
-dependencies = [
- "agent-core",
- "agent-plugin-host",
- "agent-tool",
- "anyhow",
- "clap",
  "serde",
  "serde_json",
  "tokio",
@@ -915,16 +902,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "echo-plugin"
-version = "0.1.0"
-dependencies = [
- "agent-plugin",
- "anyhow",
- "serde_json",
- "wit-bindgen",
 ]
 
 [[package]]

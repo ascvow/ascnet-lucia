@@ -118,7 +118,8 @@ impl HttpHostServices {
         }
         let response = request.send().await.context("插件 HTTP 请求失败")?;
         let status = response.status().as_u16();
-        let response_headers = crate::capability::http::sanitize_response_headers(response.headers());
+        let response_headers =
+            crate::capability::http::sanitize_response_headers(response.headers());
         // 先看 Content-Length：能提前拒绝的超大响应就不必读进内存。
         if let Some(length) = response.content_length() {
             if length > self.max_response_bytes as u64 {

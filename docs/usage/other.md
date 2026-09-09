@@ -1,6 +1,6 @@
 # 其他使用方式
 
-本章收录不属于日常 TUI、CLI 参数或插件管理的运行方式，包括离线示例、不同分发形态、诊断、事件排障和真实模型测试。
+本章收录不属于日常 TUI、CLI 参数或插件管理的运行方式，包括离线示例、不同分发形态、诊断和事件排障。
 
 ## 离线 CLI 示例
 
@@ -9,17 +9,6 @@ cargo run -p agent-basic-cli -- --demo "你好"
 ```
 
 `agent-basic-cli` 使用确定性的脚本模型演示完整 ReAct 循环。模型先请求 `echo` 工具，再读取工具结果生成最终文本，不需要 API key 或网络。
-
-加载 WASM Echo 插件：
-
-```bash
-bun run build:plugin:echo
-cargo run -p agent-basic-cli -- --demo \
-  --plugin-manifest examples/plugins/echo-plugin/plugin.toml \
-  "hello from wasm"
-```
-
-未传 manifest 时示例使用原生 Echo fallback；传入 manifest 后，同名工具由 WASM 插件提供。
 
 ## 构建形态
 
@@ -75,15 +64,6 @@ JSONL 记录 run、模型、工具和扩展事件。排查时优先按同一 `ru
 事件文件可能包含提示内容、工具参数、结果和仅供可信界面展示的完整审批拒绝原因；它不属于
 模型 Session，但仍应按敏感日志保护，不应提交到公开仓库。
 
-## 真实模型测试
-
-仓库的 live test 默认不会自动使用任意环境变量。按[真实模型测试](/guide/live-testing)准备显式配置后运行：
-
-```bash
-bun run test:live
-```
-
-插件场景需要先构建对应 WASM component。live test 涉及真实网络和费用，不应替代离线单元测试。
 
 ## 性能检查
 

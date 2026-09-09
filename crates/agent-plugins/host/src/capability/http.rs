@@ -163,7 +163,9 @@ fn sanitize_request_headers(headers: &HashMap<String, String>) -> Result<Vec<(St
             )));
         }
         if lowered.len() > MAX_HTTP_HEADER_BYTES || value.len() > MAX_HTTP_HEADER_BYTES {
-            return Err(anyhow!("HTTP header `{name}` 超过 {MAX_HTTP_HEADER_BYTES} 字节限制"));
+            return Err(anyhow!(
+                "HTTP header `{name}` 超过 {MAX_HTTP_HEADER_BYTES} 字节限制"
+            ));
         }
         if !lowered
             .bytes()
@@ -338,7 +340,10 @@ mod tests {
     fn response_cookies_are_redacted() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("set-cookie", "session=secret".parse().expect("测试 header"));
-        headers.insert("content-type", "application/json".parse().expect("测试 header"));
+        headers.insert(
+            "content-type",
+            "application/json".parse().expect("测试 header"),
+        );
         let sanitized = sanitize_response_headers(&headers);
 
         assert!(!sanitized.contains_key("set-cookie"));

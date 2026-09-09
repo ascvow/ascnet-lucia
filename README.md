@@ -110,20 +110,6 @@ cargo install \
   --features plugins
 ```
 
-You can also build and load a single plugin without Bun. This example uses the Echo plugin:
-
-```bash
-cargo build \
-  -p echo-plugin \
-  --release \
-  --target wasm32-wasip2 \
-  --target-dir examples/plugins/echo-plugin/target
-
-./target/plugin-tui/release/lucia \
-  --demo \
-  --plugin-manifest examples/plugins/echo-plugin/plugin.toml
-```
-
 ### Option 3: Install the Plugin-enabled TUI
 
 To use the plugin loader, install Bun and run:

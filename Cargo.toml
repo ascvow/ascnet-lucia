@@ -13,7 +13,6 @@ members = [
     "crates/agent-core/skill",
     "examples/basic-cli",
     "crates/agent-tui",
-    "examples/plugins/echo-plugin",
     "examples/plugins/mcp-plugin",
     "examples/plugins/mcp-plugin/smoke-tests",
     "examples/plugins/teammate-plugin",
@@ -28,7 +27,6 @@ members = [
     "examples/plugins/knowledge-plugin",
     "examples/plugins/permission-plugin",
     "examples/plugins/permission-plugin/smoke-tests",
-    "tools/lucia-live-tests",
 ]
 default-members = [
     "crates/agent-core/tool",

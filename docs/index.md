@@ -18,7 +18,7 @@ Lucia 同时提供可直接使用的终端 Agent 和可嵌入、可扩展的 Rus
 
 ### 其他
 
-[其他使用方式](/usage/other)收录离线 CLI 示例、纯 Core 与插件版构建、全局诊断、事件排障和真实模型测试。
+[其他使用方式](/usage/other)收录离线 CLI 示例、纯 Core 与插件版构建、全局诊断和事件排障。
 
 ## 开发者指南
 
@@ -50,7 +50,6 @@ Lucia 同时提供可直接使用的终端 Agent 和可嵌入、可扩展的 Rus
 | 目标 | 目录 |
 | --- | --- |
 | 最小 ReAct 与原生工具 | `examples/basic-cli` |
-| 最小 WASM 工具插件 | `examples/plugins/echo-plugin` |
 | stdio MCP | `examples/plugins/mcp-plugin` |
 | Skill 按需加载 | `crates/agent-core/skill` |
 | 命令与 Dialog | `crates/agent-tui/src/native_command.rs` |

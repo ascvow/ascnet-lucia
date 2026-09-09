@@ -137,7 +137,12 @@ fn project_message(index: usize, message: &ModelMessage) -> PluginSessionMessage
 ///
 /// `offset` 越界时返回空页而不是错误：调用方按页推进到末尾是正常控制流，
 /// 不应当被当作失败处理。
-pub fn project_session(id: &str, session: &Session, offset: usize, limit: usize) -> PluginSessionPage {
+pub fn project_session(
+    id: &str,
+    session: &Session,
+    offset: usize,
+    limit: usize,
+) -> PluginSessionPage {
     let messages = session.messages();
     let limit = limit.clamp(1, MAX_SESSION_PAGE_MESSAGES);
     let mut projected = Vec::new();
@@ -225,7 +230,9 @@ mod tests {
         let page = project_session("s1", &mixed_session(), 0, 50);
 
         assert_eq!(page.messages[1].tool_calls[0].name, "shell");
-        assert!(page.messages[1].tool_calls[0].arguments.contains("bun run build"));
+        assert!(page.messages[1].tool_calls[0]
+            .arguments
+            .contains("bun run build"));
         assert_eq!(page.messages[2].tool_results[0].name, "shell");
         assert!(!page.messages[2].tool_results[0].is_error);
     }

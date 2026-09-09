@@ -243,8 +243,8 @@ fn resolve_http(
             .unwrap_or_else(|| DEFAULT_HTTP_AUTH_PREFIX.to_string());
         credential_headers.push((header, format!("{prefix}{api_key}")));
     }
-    let timeout_ms = optional_u64(plugin_id, config, "http_timeout_ms")?
-        .unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
+    let timeout_ms =
+        optional_u64(plugin_id, config, "http_timeout_ms")?.unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
     let max_request_bytes = optional_usize(plugin_id, config, "http_max_request_bytes")?
         .unwrap_or(DEFAULT_HTTP_MAX_REQUEST_BYTES);
     let max_response_bytes = optional_usize(plugin_id, config, "http_max_response_bytes")?
@@ -529,10 +529,7 @@ mod tests {
         assert_eq!(http.base_url, "https://api.openai.com/v1/");
         assert_eq!(
             http.credential_headers,
-            vec![(
-                "authorization".to_string(),
-                "Bearer sk-test".to_string()
-            )]
+            vec![("authorization".to_string(), "Bearer sk-test".to_string())]
         );
         // 非 HTTP 键继续作为激活元数据下发。
         assert_eq!(settings.metadata["embedding_mode"], "api");
