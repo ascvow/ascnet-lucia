@@ -541,9 +541,9 @@ fn tool_message_lines(tool: &AgentViewTool, width: usize) -> Vec<UiLine> {
         let prefix = if index == 0 { "  └ " } else { "    " };
         let result_color = if matches!(tool.state, AgentViewToolState::Failed) {
             UiColor::Red
-        } else if result.starts_with('+') {
+        } else if result.starts_with('+') && !result.starts_with("+++ ") {
             UiColor::Green
-        } else if result.starts_with('-') {
+        } else if result.starts_with('-') && !result.starts_with("--- ") {
             UiColor::Red
         } else {
             UiColor::Gray
@@ -671,16 +671,26 @@ fn tool_result_lines(
         return Vec::new();
     };
     let text = match value {
-        serde_json::Value::Object(map) => match map.get("content") {
+        // 文件编辑结果以 diff 为正文，不能把结构化补丁压成一行 JSON。
+        serde_json::Value::Object(map) => match map.get("diff").or_else(|| map.get("content")) {
             Some(serde_json::Value::String(text)) => text.as_str(),
             _ => return vec![summarize_json(value, max_width)],
         },
         serde_json::Value::String(text) => text.as_str(),
         _ => return vec![summarize_json(value, max_width)],
     };
-    let total = text.lines().count();
-    let mut lines = text
+    // 文件路径已经展示在工具标题，补丁头不占用有限的增删预览行。
+    let structured_diff = value
+        .get("diff")
+        .and_then(serde_json::Value::as_str)
+        .is_some();
+    let rows: Vec<_> = text
         .lines()
+        .filter(|line| !structured_diff || (!line.starts_with("--- ") && !line.starts_with("+++ ")))
+        .collect();
+    let total = rows.len();
+    let mut lines = rows
+        .into_iter()
         .take(max_lines)
         .map(|line| truncate_line(line.trim_end(), max_width))
         .collect::<Vec<_>>();
@@ -752,6 +762,28 @@ fn styled_span(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 成员视图必须从结构化编辑结果取出补丁，并在有限预览中同时显示红绿改动行。
+    #[test]
+    fn structured_edit_diff_has_red_and_green_rows() {
+        let tool = AgentViewTool {
+            call_id: "edit".into(),
+            name: "edit_file".into(),
+            args: json!({"path":"sample.rs"}),
+            output: String::new(),
+            result: Some(
+                json!({"path":"sample.rs", "diff":"--- a/sample.rs\n+++ b/sample.rs\n@@ -1,4 +1,4 @@\n a\n b\n c\n-old\n+new\n"}),
+            ),
+            state: AgentViewToolState::Succeeded,
+        };
+        let rows = tool_message_lines(&tool, 80);
+        for (text, color) in [("-old", UiColor::Red), ("+new", UiColor::Green)] {
+            assert!(rows
+                .iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| span.text == text && span.style.foreground == Some(color)));
+        }
+    }
 
     /// 连续增量合并后保留初始任务，回看首行仍能显示发送给成员的 prompt。
     #[test]

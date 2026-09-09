@@ -69,7 +69,9 @@ fn shorten_path(path: &str) -> String {
 pub(crate) fn tool_target(call: &ToolCall) -> Option<String> {
     let args = &call.args;
     let target = match call.name.as_str() {
-        "read_file" | "write_file" | "list_directory" => text_field(args, "path").map(shorten_path),
+        "read_file" | "write_file" | "edit_file" | "list_directory" => {
+            text_field(args, "path").map(shorten_path)
+        }
         "search_files" => text_field(args, "pattern").map(str::to_string),
         "shell" => text_field(args, "command").map(str::to_string),
         _ => None,
@@ -305,6 +307,13 @@ fn collection_preview(result: &ToolResult, max_lines: usize) -> Option<Vec<Previ
 
 /// 判断一段文本是否是统一 diff：存在 `+`/`-` 前缀行且不是普通正文。
 fn looks_like_diff(lines: &[&str]) -> bool {
+    // 标准补丁允许上下文行远多于改动行，不能按增删行比例拒绝它。
+    if lines.first().is_some_and(|line| line.starts_with("--- "))
+        && lines.get(1).is_some_and(|line| line.starts_with("+++ "))
+        && lines.iter().any(|line| line.starts_with("@@ "))
+    {
+        return true;
+    }
     let marked = lines
         .iter()
         .filter(|line| {
@@ -318,14 +327,14 @@ fn looks_like_diff(lines: &[&str]) -> bool {
 
 /// 从结构化工具结果中取出可逐行展开的正文。
 ///
-/// 约定的正文字段优先：`content` 覆盖文件与通用工具，`stdout`/`stderr` 覆盖命令类。
+/// 优先读取编辑结果的 `diff`；`content` 覆盖普通正文，`stdout`/`stderr` 覆盖命令类。
 /// 都不存在时返回 `None`，由调用方退回 JSON 摘要——直接序列化整个对象会把
 /// `{"content":"..."}` 这类信封当成正文，预览也就失去意义。
 fn result_body(result: &ToolResult) -> Option<String> {
     match &result.content {
         Value::String(text) => Some(text.clone()),
         Value::Object(_) => {
-            for key in ["content", "error"] {
+            for key in ["diff", "content", "error"] {
                 if let Some(text) = text_field(&result.content, key) {
                     return Some(text.to_string());
                 }
@@ -550,15 +559,11 @@ pub(crate) fn render_preview(
                 }
                 spans.push(Span::styled(marker.to_string(), row_style.fg(marker_color)));
                 let body = truncate_line(text, body_width);
-                // diff 正文保持语法着色，只叠加整行背景，便于同时读出改动与语义。
+                // 增删行正文与标记使用一致的红绿前景，避免语法配色掩盖修改方向。
                 if error {
                     spans.push(Span::styled(body, row_style.fg(COLOR_DANGER)));
                 } else {
-                    spans.extend(
-                        highlight_line(&body, language)
-                            .into_iter()
-                            .map(|span| span.patch_style(row_style)),
-                    );
+                    spans.push(Span::styled(body, row_style.fg(marker_color)));
                 }
                 // 缩进不参与背景，因此从行号列开始计算已占宽度。
                 let used = spans_width(&spans) - PREVIEW_INDENT.len();
@@ -590,6 +595,7 @@ pub(crate) fn tool_display_name(name: &str) -> &str {
     match name {
         "read_file" => "Read",
         "write_file" => "Write",
+        "edit_file" => "Edit",
         "list_directory" => "List",
         "search_files" => "Search",
         "shell" => "Shell",
@@ -689,6 +695,55 @@ mod tests {
             tool_summary(Some(&call), &full).as_deref(),
             Some("读取 20 行，来自 a.rs")
         );
+    }
+
+    /// 真实文件编辑的结构化结果必须显示红色删除、绿色新增及正确摘要。
+    #[tokio::test]
+    async fn real_file_edit_renders_red_deletion_and_green_addition() {
+        use agent_tool::{builtins::EditFileTool, Tool, WorkspaceGuard};
+        let root = std::env::temp_dir().join(format!(
+            "lucia-diff-ui-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("sample.rs"),
+            "fn a() {}\nfn b() {}\nfn c() {}\nlet old = 1;\nfn d() {}\nfn e() {}\nfn f() {}\n",
+        )
+        .unwrap();
+        let tool = EditFileTool::new(WorkspaceGuard::rooted(&root).unwrap());
+        let call = ToolCall::new(
+            "edit-ui",
+            "edit_file",
+            json!({"path":"sample.rs", "old_string":"let old = 1;", "new_string":"let new = 2;"}),
+        );
+        let result = tool.call(call.clone()).await.unwrap();
+        assert!(!result.is_error);
+        let lines = preview_lines(Some(&call), &result, 8);
+        assert!(lines.iter().any(
+            |line| matches!(line, PreviewLine::Removed { text, .. } if text == "let old = 1;")
+        ));
+        assert!(lines
+            .iter()
+            .any(|line| matches!(line, PreviewLine::Added { text, .. } if text == "let new = 2;")));
+        let rendered = render_preview(&lines, 80, CodeLanguage::CLike, false);
+        for (text, foreground, background) in [
+            ("let old = 1;", COLOR_DIFF_DEL_FG, COLOR_DIFF_DEL_BG),
+            ("let new = 2;", COLOR_DIFF_ADD_FG, COLOR_DIFF_ADD_BG),
+        ] {
+            assert!(rendered
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content == text
+                    && span.style.fg == Some(foreground)
+                    && span.style.bg == Some(background)));
+        }
+        assert_eq!(
+            tool_summary(Some(&call), &result).as_deref(),
+            Some("新增 1 行，删除 1 行")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// 统一 diff 必须被识别为增删行，而不是普通正文。
