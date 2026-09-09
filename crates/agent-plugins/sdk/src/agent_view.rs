@@ -511,7 +511,7 @@ fn assistant_message_lines(text: &str, width: usize, streaming: bool) -> Vec<UiL
     lines
 }
 
-/// 绘制主界面样式的单个工具块，并限制结果预览高度。
+/// 绘制紧凑工具块，不追加分隔空行，并限制结果预览高度。
 fn tool_message_lines(tool: &AgentViewTool, width: usize) -> Vec<UiLine> {
     let (color, note) = match tool.state {
         AgentViewToolState::Running => (UiColor::Yellow, ""),
@@ -559,7 +559,6 @@ fn tool_message_lines(tool: &AgentViewTool, width: usize) -> Vec<UiLine> {
             ],
         });
     }
-    lines.push(UiLine { spans: Vec::new() });
     lines
 }
 

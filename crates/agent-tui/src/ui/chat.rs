@@ -113,12 +113,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             wrapped_height = wrapped_height.saturating_add(message_height);
             lines.extend(message_lines);
 
-            // 每条工具消息后固定留一行空白：连续调用之间不再挤成一片，
-            // 工具组结束后也与普通消息或状态行保持分隔。
-            if message.is_tool() {
-                lines.push(Line::default());
-                wrapped_height = wrapped_height.saturating_add(1);
-            }
+            // 工具结果直接连续排列，不额外增加分隔空行或滚动高度。
         }
         if app.running && timeline_streaming_message.is_none() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];

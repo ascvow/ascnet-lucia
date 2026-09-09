@@ -369,9 +369,9 @@ fn tool_lines_accept_empty_result() {
     assert!(!text.contains("null"), "{text:?}");
 }
 
-/// 连续工具消息之间保留一行间隔，工具组结束后与普通回复同样保留一行间隔。
+/// 工具消息紧凑排列，不在工具结果后额外插入空行。
 #[test]
-fn consecutive_tool_messages_keep_blank_line_spacing() {
+fn consecutive_tool_messages_have_no_extra_spacing() {
     let backend = TestBackend::new(80, 18);
     let mut terminal = Terminal::new(backend).expect("创建工具组间距测试终端");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -384,7 +384,7 @@ fn consecutive_tool_messages_keep_blank_line_spacing() {
 
     terminal
         .draw(|frame| render_root(frame, &mut app))
-        .expect("渲染带间距的工具组");
+        .expect("渲染紧凑工具组");
     let rows = (0..18)
         .map(|y| {
             (0..80)
@@ -405,8 +405,8 @@ fn consecutive_tool_messages_keep_blank_line_spacing() {
         .expect("应展示工具组后的回复");
 
     assert_eq!(tool_rows.len(), 2, "{rows:?}");
-    assert_eq!(tool_rows[1], tool_rows[0] + 2, "{rows:?}");
-    assert_eq!(reply_row, tool_rows[1] + 2, "{rows:?}");
+    assert_eq!(tool_rows[1], tool_rows[0] + 1, "{rows:?}");
+    assert_eq!(reply_row, tool_rows[1] + 1, "{rows:?}");
 }
 
 /// 左键按下与释放命中同一工具消息时切换详情，第二次点击可以收起。
