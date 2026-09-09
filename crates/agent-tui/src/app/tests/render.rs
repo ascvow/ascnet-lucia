@@ -2,6 +2,39 @@
 
 use super::*;
 
+/// 长篇混排回复之后的下一轮用户消息必须立即出现在自动跟随视口中。
+#[test]
+fn long_mixed_reply_keeps_next_user_message_visible() {
+    for width in [40, 79, 100, 123] {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        let body = "这是一个架构方向正确、复杂业务边界考虑充分的项目。Worker reliability 与 shared contracts 需要持续验证。\n\n- 状态恢复：apps/web/src/services/project-session.ts\n- 组合字符：e\u{301} 与 emoji 👩‍💻 测试。\n\n".repeat(100);
+        app.messages.push(Msg::new(
+            MsgKind::Assistant,
+            format!("{}\n\n{body}", "👩‍💻".repeat(600)),
+        ));
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        for marker in ["NEXT-TURN-ONE", "NEXT-TURN-TWO"] {
+            app.messages.push(Msg::new(MsgKind::User, marker));
+            app.scroll = None;
+            app.running = true;
+            terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                text.contains(marker),
+                "width={width}, marker={marker}, screen={text}"
+            );
+        }
+    }
+}
+
 /// 跳转提示独占留白行；连续重绘、窗口缩小与回到底部不能截断或残留点击区域。
 #[test]
 fn jump_hint_uses_separate_row_and_clears_when_hidden() {
