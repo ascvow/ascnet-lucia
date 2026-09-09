@@ -330,7 +330,11 @@ async fn plugin_view_refresh_coalesces_pending_requests() {
         .await
         .expect("后台插件刷新应按时返回")
         .expect("后台插件刷新通道不应关闭");
-    assert!(matches!(event, UiEvent::PluginFramesLoaded(_)));
+    assert!(matches!(event, UiEvent::PluginFrameLoaded(_)));
+    assert!(matches!(
+        rx.recv().await,
+        Some(UiEvent::PluginFramesLoaded(_))
+    ));
     app.plugin_refresh_task
         .take()
         .expect("后台刷新任务应存在")
@@ -608,6 +612,11 @@ fn plugin_subview_replaces_main_view_and_routes_instance_input() {
         },
     )
     .expect("打开插件子视图");
+    // 首次布局之前就必须生成当前实例的优先请求，不能空等下一次周期刷新。
+    let initial = app.plugin_render_requests();
+    assert_eq!(initial[0].view_id, "subview");
+    assert_eq!(initial[0].instance_id.as_deref(), Some("agent-1"));
+    assert!(initial[0].width > 0 && initial[0].height > 0);
     app.update_plugin_frame(
         "test-plugin",
         Some("agent-1"),

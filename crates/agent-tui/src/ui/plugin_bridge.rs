@@ -10,7 +10,7 @@ use agent_plugin_protocol::{
     UiInput, UiNavigationRequest, UiPlacement, UiRenderRequest, UI_NAVIGATION_EVENT,
 };
 use anyhow::{anyhow, Result};
-use futures_util::future::join_all;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use ratatui::style::Color;
 use serde_json::Value;
 use std::sync::Arc;
@@ -75,13 +75,21 @@ pub(crate) type PluginRenderResult = (
 pub(crate) async fn render_plugin_views(
     plugin_host: Arc<LivePluginHost>,
     requests: Vec<UiRenderRequest>,
-) -> Vec<PluginRenderResult> {
-    join_all(
-        requests
-            .into_iter()
-            .map(|request| render_plugin_request(plugin_host.as_ref(), request)),
-    )
-    .await
+    tx: tokio::sync::mpsc::UnboundedSender<crate::event::UiEvent>,
+) {
+    let mut pending = requests
+        .into_iter()
+        .map(|request| render_plugin_request(plugin_host.as_ref(), request))
+        .collect::<FuturesUnordered<_>>();
+    // 单帧完成即可提交，当前视图不等待同批次中其他插件的慢调用。
+    while let Some(rendered) = pending.next().await {
+        if tx
+            .send(crate::event::UiEvent::PluginFrameLoaded(rendered))
+            .is_err()
+        {
+            break;
+        }
+    }
 }
 
 /// 把后台完成的插件视图帧提交到 App 缓存。

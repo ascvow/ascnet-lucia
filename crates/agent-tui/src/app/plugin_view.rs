@@ -240,8 +240,8 @@ impl App {
         }
         let tx = self.tx.clone();
         self.plugin_refresh_task = Some(tokio::spawn(async move {
-            let rendered = render_plugin_views(host, requests).await;
-            let _ = tx.send(UiEvent::PluginFramesLoaded(rendered));
+            render_plugin_views(host, requests, tx.clone()).await;
+            let _ = tx.send(UiEvent::PluginFramesLoaded(Vec::new()));
         }));
     }
 
@@ -765,20 +765,28 @@ impl App {
                 frame: self.plugin_frame,
             })
             .collect::<Vec<_>>();
-        if let Some(active) = self
-            .view_stack
-            .active()
-            .filter(|active| !active.area.is_empty())
-        {
-            requests.push(UiRenderRequest {
-                plugin_id: active.plugin_id.clone(),
-                view_id: active.view.view_id.clone(),
-                instance_id: Some(active.view.instance_id.clone()),
-                width: active.area.width.max(1),
-                height: active.area.height.max(1),
-                focused: true,
-                frame: self.plugin_frame,
-            });
+        if let Some(active) = self.view_stack.active() {
+            // 首次导航尚未布局时仍发起请求，并优先于同插件的停靠视图取得执行机会。
+            requests.insert(
+                0,
+                UiRenderRequest {
+                    plugin_id: active.plugin_id.clone(),
+                    view_id: active.view.view_id.clone(),
+                    instance_id: Some(active.view.instance_id.clone()),
+                    width: if active.area.width == 0 {
+                        self.last_message_width.max(40)
+                    } else {
+                        active.area.width
+                    },
+                    height: if active.area.height == 0 {
+                        self.last_viewport.max(12)
+                    } else {
+                        active.area.height
+                    },
+                    focused: true,
+                    frame: self.plugin_frame,
+                },
+            );
         }
         requests
     }

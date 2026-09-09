@@ -471,10 +471,14 @@ impl TeammatePlugin {
         };
         let agent_input =
             worker_agent_input(identity, &role, &input, self.workspace_root.as_deref());
-        let handle = host.spawn_agent(&AgentSpawnRequest::new(WORKER_PROFILE, agent_input))?;
+        let handle =
+            host.spawn_agent(&AgentSpawnRequest::new(WORKER_PROFILE, agent_input.clone()))?;
         let member = self
             .state
             .add_member(owner, role, request.captain, handle)?;
+        let mut session = AgentViewSession::new(member.current_agent_id.clone());
+        session.record_user_message(agent_input);
+        self.member_sessions.insert(member.id.clone(), session);
         emit(
             host,
             "teammate.member.spawned",
@@ -565,6 +569,8 @@ impl TeammatePlugin {
             .clone();
         let cancelled = host.cancel_agent(&target)?;
         let member = self.state.remove_member(owner, &request.member_id)?;
+        // 成员移除后同步释放预先创建的 prompt 与历史视图，避免重复派生持续占用内存。
+        self.member_sessions.remove(&request.member_id);
         emit(
             host,
             "teammate.member.removed",
@@ -628,24 +634,32 @@ impl TeammatePlugin {
             message.topic,
             payload
         );
-        let handle =
-            match host.continue_agent(&agent_plugin::AgentContinueRequest::new(target, input)) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    self.state
-                        .record_dispatch_failure(&request.member_id, request.message_id);
-                    return Err(error.context(format!(
-                        "dispatch 消息 `{}` 失败，消息仍保留在邮箱中",
-                        request.message_id
-                    )));
-                }
-            };
+        let handle = match host.continue_agent(&agent_plugin::AgentContinueRequest::new(
+            target,
+            input.clone(),
+        )) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.state
+                    .record_dispatch_failure(&request.member_id, request.message_id);
+                return Err(error.context(format!(
+                    "dispatch 消息 `{}` 失败，消息仍保留在邮箱中",
+                    request.message_id
+                )));
+            }
+        };
         self.state.finish_dispatch(
             owner,
             &request.member_id,
             request.message_id,
             handle.clone(),
         )?;
+        let session = self
+            .member_sessions
+            .entry(request.member_id.clone())
+            .or_insert_with(|| AgentViewSession::new(handle.id.clone()));
+        session.replace_target(handle.id.clone());
+        session.record_user_message(input);
         emit(
             host,
             "teammate.message.dispatched",
@@ -1031,17 +1045,17 @@ impl TeammatePlugin {
         else {
             return;
         };
-        if let Ok(snapshot) = host.agent_status(&member.current_agent_id) {
-            if let Ok(stored) = self.state.member_mut(&owner, &member.id) {
-                stored.status = snapshot.status;
-            }
-        }
         let session = self
             .member_sessions
             .entry(member.id.clone())
             .or_insert_with(|| AgentViewSession::new(member.current_agent_id.clone()));
         session.replace_target(member.current_agent_id);
         session.refresh(host);
+        if let Some(status) = session.status() {
+            if let Ok(stored) = self.state.member_mut(&owner, &member.id) {
+                stored.status = status;
+            }
+        }
     }
 
     /// 请求宿主把团队工作台压入通用子视图导航栈。
@@ -1245,7 +1259,7 @@ impl AgentPlugin for TeammatePlugin {
             UiInputEvent::Key { code, .. }
                 if input.view_id == TEAM_DOCK_VIEW && code == "enter" =>
             {
-                self.refresh_ui_statuses(host);
+                // 状态由进入后的视图刷新统一读取，导航本身不重复查询全部成员。
                 self.open_team_workspace(host);
             }
             UiInputEvent::Key { code, .. } if input.view_id == TEAM_WORKSPACE_VIEW => {

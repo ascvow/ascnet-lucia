@@ -702,6 +702,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             },
             #[cfg(feature = "plugins")]
+            Some(UiEvent::PluginFrameLoaded(rendered)) => {
+                apply_plugin_frames(&mut app, vec![rendered]);
+            }
+            #[cfg(feature = "plugins")]
             Some(UiEvent::PluginFramesLoaded(rendered)) => {
                 app.plugin_refresh_task = None;
                 apply_plugin_frames(&mut app, rendered);

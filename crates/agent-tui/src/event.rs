@@ -108,6 +108,9 @@ pub(crate) enum UiEvent {
     /// 后台插件视图批量渲染完成。
     #[cfg(feature = "plugins")]
     PluginFramesLoaded(Vec<PluginRenderResult>),
+    /// 后台单个视图已完成，立即展示而不等待整批结束。
+    #[cfg(feature = "plugins")]
+    PluginFrameLoaded(PluginRenderResult),
     /// 后台渐进加载全部结束，或全局规划失败。
     #[cfg(feature = "plugins")]
     PluginsLoaded(Box<Result<()>>),

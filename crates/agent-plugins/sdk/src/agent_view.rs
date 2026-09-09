@@ -20,6 +20,8 @@ pub struct AgentViewSession {
     input: String,
     feedback: Option<std::result::Result<String, String>>,
     status: Option<AgentStatus>,
+    /// 相对最新内容的回看行数，零表示自动跟随。
+    scroll: std::cell::Cell<usize>,
 }
 
 /// Agent 主界面按到达顺序保存的 Runtime 事件或本地用户消息。
@@ -39,6 +41,7 @@ impl AgentViewSession {
             input: String::new(),
             feedback: None,
             status: None,
+            scroll: std::cell::Cell::new(0),
         }
     }
 
@@ -69,17 +72,31 @@ impl AgentViewSession {
                 return;
             }
         }
-        match host.agent_events(&self.target, 256) {
-            Ok(events) => {
-                self.feedback = self.feedback.take().filter(|result| result.is_err());
-                for event in events {
-                    self.push_item(AgentViewItem::Event(event));
+        // 一帧最多读取 4096 条已到达事件，避免历史回放每 256 条都等待下一次 UI tick。
+        for _ in 0..8 {
+            match host.agent_events(&self.target, 512) {
+                Ok(events) => {
+                    let complete = events.len() < 512;
+                    self.feedback = self.feedback.take().filter(|result| result.is_err());
+                    for event in events {
+                        self.push_item(AgentViewItem::Event(event));
+                    }
+                    if complete {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    self.feedback = Some(Err(format!("Failed to read Agent events: {error}")));
+                    break;
                 }
             }
-            Err(error) => {
-                self.feedback = Some(Err(format!("Failed to read Agent events: {error}")));
-            }
         }
+    }
+
+    /// 记录调用插件已成功发送的实际任务正文，供成员视图回看；不会再次发送给 Agent。
+    pub fn record_user_message(&mut self, prompt: String) {
+        self.push_item(AgentViewItem::User(prompt));
+        self.scroll.set(0);
     }
 
     /// 处理通用子视图输入；成功续跑时返回新句柄供 owner 更新稳定映射。
@@ -94,6 +111,33 @@ impl AgentViewSession {
         let UiInputEvent::Key { code, modifiers } = event else {
             return None;
         };
+        match code.as_str() {
+            "up" => {
+                self.scroll.set(self.scroll.get().saturating_add(1));
+                return None;
+            }
+            "page_up" | "pageup" => {
+                self.scroll.set(self.scroll.get().saturating_add(12));
+                return None;
+            }
+            "down" => {
+                self.scroll.set(self.scroll.get().saturating_sub(1));
+                return None;
+            }
+            "page_down" | "pagedown" => {
+                self.scroll.set(self.scroll.get().saturating_sub(12));
+                return None;
+            }
+            "home" => {
+                self.scroll.set(usize::MAX);
+                return None;
+            }
+            "end" => {
+                self.scroll.set(0);
+                return None;
+            }
+            _ => {}
+        }
         if code == "enter" {
             return self.submit(host);
         }
@@ -120,9 +164,15 @@ impl AgentViewSession {
         let feedback_height = usize::from(self.feedback.is_some());
         let available = height.saturating_sub(INPUT_BOX_HEIGHT + feedback_height);
         let event_lines = agent_event_lines(&self.timeline, usize::from(width), self.status);
+        let offset = self
+            .scroll
+            .get()
+            .min(event_lines.len().saturating_sub(available));
+        self.scroll.set(offset);
         let mut lines = event_lines
             .into_iter()
             .rev()
+            .skip(offset)
             .take(available)
             .rev()
             .collect::<Vec<_>>();
@@ -196,7 +246,7 @@ impl AgentViewSession {
         };
         match result {
             Ok((handle, message)) => {
-                self.push_item(AgentViewItem::User(input));
+                self.record_user_message(input);
                 self.input.clear();
                 self.feedback = Some(Ok(message));
                 if let Some(handle) = handle {
@@ -217,6 +267,24 @@ impl AgentViewSession {
 
     /// 追加一项并维持固定内存上限。
     fn push_item(&mut self, item: AgentViewItem) {
+        // 合并同一回复的连续文本增量，避免 token 事件挤掉任务 prompt；单块限制为 64 KiB。
+        if let AgentViewItem::Event(incoming) = &item {
+            if incoming.kind == AgentEventKind::ModelTextDelta {
+                if let Some(AgentViewItem::Event(previous)) = self.timeline.back_mut() {
+                    if previous.kind == incoming.kind && previous.run_id == incoming.run_id {
+                        if let (Some(serde_json::Value::String(text)), Some(delta)) = (
+                            previous.payload.get_mut("delta"),
+                            incoming.payload["delta"].as_str(),
+                        ) {
+                            if text.len().saturating_add(delta.len()) <= 64 * 1024 {
+                                text.push_str(delta);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if self.timeline.len() >= EVENT_LIMIT {
             self.timeline.pop_front();
         }
@@ -551,6 +619,11 @@ fn wrap_display(value: &str, max_width: usize) -> Vec<String> {
     let mut current = String::new();
     let mut width = 0usize;
     for character in value.chars() {
+        if character == '\n' {
+            chunks.push(std::mem::take(&mut current));
+            width = 0;
+            continue;
+        }
         let character_width = character.width().unwrap_or(0);
         if width.saturating_add(character_width) > max_width && !current.is_empty() {
             chunks.push(std::mem::take(&mut current));
@@ -679,6 +752,36 @@ fn styled_span(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 连续增量合并后保留初始任务，回看首行仍能显示发送给成员的 prompt。
+    #[test]
+    fn token_history_preserves_prompt_and_latest_reply() {
+        let mut session = AgentViewSession::new(AgentId::parse("history-agent").unwrap());
+        session.record_user_message("PROMPT-CHECK".into());
+        for index in 0..2000 {
+            session.push_item(AgentViewItem::Event(AgentEvent {
+                id: index.to_string(),
+                run_id: "run".into(),
+                timestamp_ms: 0,
+                kind: AgentEventKind::ModelTextDelta,
+                step: 0,
+                payload: json!({"delta":"x"}),
+            }));
+        }
+        assert_eq!(session.timeline.len(), 2);
+        session.scroll.set(usize::MAX);
+        let text: String = session
+            .render(40, 10)
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect();
+        assert!(text.contains("PROMPT-CHECK"));
+        assert_eq!(
+            wrap_display("第一行\n\n第二行", 40),
+            vec!["第一行", "", "第二行"]
+        );
+    }
 
     /// 连续模型增量与工具事件应归并为主界面的助手正文和工具块。
     #[test]

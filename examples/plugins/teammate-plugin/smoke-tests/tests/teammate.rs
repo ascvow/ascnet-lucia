@@ -27,6 +27,27 @@ impl ChatModel for FixedModel {
     async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
         Ok(ModelResponse::text("teammate 已完成"))
     }
+
+    /// 模拟大量 token 增量，验证首次进入视图无需跨多个 UI tick 才追上历史。
+    async fn stream(&self, _request: ModelRequest) -> agent_core::model::ModelEventStream {
+        use agent_core::model::{ModelEventStream, ModelStreamEvent};
+        let (sender, stream) = ModelEventStream::channel();
+        for _ in 0..1500 {
+            sender.send(ModelStreamEvent::TextDelta {
+                index: 0,
+                delta: "x".into(),
+            });
+        }
+        sender.send(ModelStreamEvent::TextDelta {
+            index: 0,
+            delta: "teammate 已完成".into(),
+        });
+        sender.done(ModelResponse::text(format!(
+            "{}teammate 已完成",
+            "x".repeat(1500)
+        )));
+        stream
+    }
 }
 
 impl ProviderAdapter for FixedModel {
@@ -229,6 +250,7 @@ async fn component_runs_mailbox_dispatch_flow() {
             && event["data"]["action"]["view"]["view_id"] == "teammate-member-session"
             && event["data"]["action"]["view"]["instance_id"] == member_id
     }));
+    let render_started = std::time::Instant::now();
     let session = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
@@ -253,6 +275,50 @@ async fn component_runs_mailbox_dispatch_flow() {
     assert!(!session_text.contains("Run completed"), "{session_text}");
     assert!(!session_text.contains("Analyzing · Step"), "{session_text}");
     assert!(session_text.contains("Message Agent..."), "{session_text}");
+    assert!(
+        session_text.contains("teammate 已完成"),
+        "首次渲染必须追上 1500 条增量：{session_text}"
+    );
+    eprintln!(
+        "1500 条历史增量首次渲染耗时：{:?}",
+        render_started.elapsed()
+    );
+    PluginHost::on_ui_input(
+        &host,
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-member-session".into(),
+            instance_id: Some(member_id.into()),
+            event: UiInputEvent::Key {
+                code: "home".into(),
+                modifiers: Vec::new(),
+            },
+        },
+    )
+    .await
+    .expect("应可回看任务 prompt");
+    let first = PluginHost::render_ui(
+        &host,
+        &UiRenderRequest {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-member-session".into(),
+            instance_id: Some(member_id.into()),
+            width: 80,
+            height: 24,
+            focused: true,
+            frame: 3,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let first_text: String = first
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .map(|span| span.text.as_str())
+        .collect();
+    assert!(first_text.contains("检查首轮实现"), "{first_text}");
 
     for code in ["r", "e", "v", "i", "e", "w"] {
         PluginHost::on_ui_input(
