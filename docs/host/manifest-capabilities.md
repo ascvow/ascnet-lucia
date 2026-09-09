@@ -173,6 +173,8 @@ sessions = true
 
 ## 模型完成权限
 
+默认 `ExecutionPolicy::serve()` 不限制插件激活期间的模型调用总次数或累计输入字节数，避免长会话中的安全审核耗尽额度。应用仍可显式配置 `max_plugin_model_completions`、`max_plugin_model_input_bytes` 收紧预算；单次输出上限、能力鉴权及 Evaluation 等其他策略的限额继续生效。
+
 ```toml
 [capabilities]
 model_completion = true

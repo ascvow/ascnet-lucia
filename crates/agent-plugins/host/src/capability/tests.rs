@@ -1005,6 +1005,50 @@ async fn plugin_route_forwards_reasoning_and_sampling() {
     assert_eq!(captured[0].temperature, Some(0.2));
 }
 
+/// 默认长会话跨过旧累计阈值后仍可审核，但单次输出预算必须继续收紧。
+#[tokio::test]
+async fn default_completion_budget_survives_long_interactive_sessions() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut gateway = agent_core::ModelGateway::new();
+    gateway
+        .register(
+            "reviewer",
+            Arc::new(CapturingCompletionModel {
+                requests: requests.clone(),
+                expect_stream: false,
+            }),
+        )
+        .unwrap();
+    let binding = PluginHostServices::new()
+        .with_model_completion(
+            gateway,
+            completion_config("reviewer", "review-model", false),
+            64,
+        )
+        .unwrap()
+        .model_completion_for("permission")
+        .unwrap();
+    // 在同一激活账本中同时跨过旧的 128 次和 8 MiB 上限。
+    for _ in 0..256 {
+        binding
+            .reserve(64 * 1024)
+            .expect("默认交互预算不能因累计使用而耗尽");
+    }
+    CapabilityState::complete_model_with(
+        true,
+        Some(binding),
+        "permission",
+        r#"{"messages":[{"role":"user","content":[{"type":"text","text":"继续审核"}]}]}"#,
+    )
+    .await
+    .expect("长会话后仍应执行审核模型请求");
+    assert_eq!(
+        requests.lock().unwrap()[0].max_tokens,
+        Some(64),
+        "单次输出上限仍须生效"
+    );
+}
+
 /// 插件专属路由的预算账本与默认路由隔离，一个插件耗尽额度不影响其他插件。
 #[tokio::test]
 async fn plugin_specific_route_keeps_isolated_budget() {

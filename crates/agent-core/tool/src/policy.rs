@@ -311,7 +311,8 @@ impl Default for ExecutionPolicy {
 impl ExecutionPolicy {
     /// Serve 平面策略：保持现有功能，不额外收紧。
     ///
-    /// 授权仍由 Host 的工具门禁与工具策略插件共同决定；本策略不放宽任何既有限制。
+    /// 授权由 Host 的工具门禁与工具策略插件共同决定；长期驻留插件默认不设模型调用累计
+    /// 限额，调用方可以通过策略收缩显式设置次数与输入预算。
     pub fn serve() -> Self {
         Self {
             profile: ExecutionProfile::Serve,
@@ -326,8 +327,9 @@ impl ExecutionPolicy {
                 max_agent_model_requests_per_principal: Some(512),
                 max_agent_model_request_bytes_per_principal: Some(64 * 1024 * 1024),
                 max_agent_model_output_tokens_per_principal: Some(512 * 20_000),
-                max_plugin_model_completions: Some(128),
-                max_plugin_model_input_bytes: Some(8 * 1024 * 1024),
+                // 交互插件长期驻留，审核次数与累计输入不应随使用时间耗尽；调用方仍可显式收紧。
+                max_plugin_model_completions: None,
+                max_plugin_model_input_bytes: None,
                 // 嵌入索引是高频小请求：一次全量索引可能提交数千批，上限按此量级设定，
                 // 与低频大请求的模型完成分开计量。
                 max_plugin_http_requests: Some(4096),
