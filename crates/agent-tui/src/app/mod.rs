@@ -194,7 +194,9 @@ pub(crate) struct App {
     pub(crate) last_message_width: u16,
     /// 最近一次模型请求消耗的上下文 token 数。
     pub(crate) context_tokens: Option<u64>,
-    /// 本次进程内累计的模型用量，跨会话切换保留。
+    /// 最近实际模型请求的脱敏分类估算；切换会话后失效。
+    pub(crate) context_snapshot: Option<crate::command::ContextSnapshot>,
+    /// 本次打开当前会话期间累计的模型用量，切换或重载会话时清零。
     ///
     /// 与 `context_tokens` 的区别：后者是最近一轮的上下文规模，会随压缩回落；这里是累计
     /// 消耗，用于观察缓存命中率和总输出量。
@@ -431,6 +433,7 @@ impl App {
             #[cfg(feature = "plugins")]
             last_message_width: 0,
             context_tokens: None,
+            context_snapshot: None,
             session_usage: TokenUsage::default(),
             context_window: None,
             reasoning_levels: vec![ReasoningLevel::Off],
@@ -561,6 +564,9 @@ impl App {
         self.tool_message_hit_regions.clear();
         self.tool_click_candidate = None;
         self.context_tokens = None;
+        self.context_snapshot = None;
+        self.session_usage = TokenUsage::default();
+        self.native_command.context_open = false;
         self.last_escape_at = None;
         self.native_command.dialog = None;
         self.native_command.reasoning_panel = None;

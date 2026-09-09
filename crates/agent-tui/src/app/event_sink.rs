@@ -75,6 +75,13 @@ impl EventSink for ChannelEventSink {
     async fn record(&self, event: &AgentEvent) -> Result<()> {
         match event.kind {
             AgentEventKind::ModelRequest => {
+                if let Some(snapshot) = event
+                    .payload
+                    .get("context")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                {
+                    let _ = self.tx.send(UiEvent::ContextSnapshot(snapshot));
+                }
                 let _ = self.tx.send(UiEvent::ModelStarted);
             }
             AgentEventKind::ModelResponse => {

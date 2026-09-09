@@ -233,9 +233,9 @@ fn streamed_deltas_update_one_assistant_message() {
     assert!(app.streaming_message.is_none());
 }
 
-/// 运行完成提示必须展示服务商返回的缓存读取与写入 token。
+/// 运行完成后不再向对话插入 token 统计，避免打断正文阅读。
 #[test]
-fn completed_run_displays_prompt_cache_usage() {
+fn completed_run_does_not_display_prompt_cache_usage() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let mut completed_session = Session::new();
@@ -265,7 +265,7 @@ fn completed_run_displays_prompt_cache_usage() {
         input: "测试缓存".into(),
     });
 
-    assert!(app.messages.iter().any(|message| {
+    assert!(!app.messages.iter().any(|message| {
         matches!(message.kind, MsgKind::Info)
             && message.text == "↑100 ↓20 cache read 700 write 180 Σ1000 tokens · 2 steps"
     }));
@@ -334,6 +334,29 @@ async fn channel_event_sink_coalesces_model_text_notifications() {
 
     sink.record(&first).await.expect("消费后应允许再次通知");
     assert!(matches!(rx.recv().await, Some(UiEvent::ModelTextReady)));
+}
+
+/// 新请求的分类快照通过事件边界传递，缺少该字段的旧请求仍可启动显示。
+#[tokio::test]
+async fn channel_event_sink_accepts_context_snapshot_and_legacy_requests() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, _, _) = ChannelEventSink::new(tx);
+    let event = AgentEvent::new(
+        "context",
+        AgentEventKind::ModelRequest,
+        0,
+        json!({"context": {"tokens": {"system": 25, "tools": 10},
+            "attachments": 0, "messages": 2, "tools": 1}}),
+    );
+    sink.record(&event).await.unwrap();
+    let Some(UiEvent::ContextSnapshot(snapshot)) = rx.try_recv().ok() else {
+        panic!("模型请求应提供上下文快照");
+    };
+    assert_eq!(snapshot.tokens["system"], 25);
+    assert!(matches!(rx.try_recv(), Ok(UiEvent::ModelStarted)));
+    let legacy = AgentEvent::new("context", AgentEventKind::ModelRequest, 0, json!({}));
+    sink.record(&legacy).await.unwrap();
+    assert!(matches!(rx.try_recv(), Ok(UiEvent::ModelStarted)));
 }
 
 /// 模型用量必须按分项转发，供底栏分别计算上下文规模与缓存命中率。

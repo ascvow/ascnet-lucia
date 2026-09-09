@@ -40,6 +40,7 @@ fn native_registry_contains_default_commands() {
     assert_eq!(
         names,
         vec![
+            "context",
             "new",
             "resume",
             "sessions",
@@ -56,6 +57,7 @@ fn native_registry_contains_default_commands() {
     assert_eq!(
         names,
         vec![
+            "context",
             "new",
             "resume",
             "sessions",
@@ -592,6 +594,22 @@ fn native_sessions_browse_switches_selected_session_on_enter() {
             revision: 7,
         } if requested_id == session_id
     ));
+}
+
+/// `/context` 在本地打开且可关闭，不向 Agent 发送消息。
+#[test]
+fn context_command_opens_and_closes_without_model_request() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "/context".into();
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    assert!(app.native_command.context_open);
+    assert!(app.native_dialog_active());
+    assert!(app.input.is_empty());
+    assert!(rx.try_recv().is_err());
+    assert!(app.handle_native_command_key(KeyCode::Esc, KeyModifiers::NONE, None));
+    assert!(!app.native_dialog_active());
 }
 
 /// `/compact` 在任何 feature 组合下都必须进入原生重载路径。

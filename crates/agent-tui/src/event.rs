@@ -69,6 +69,8 @@ pub(crate) enum UiEvent {
     ///
     /// 底栏用输入合计显示当前上下文规模，缓存读写分项用于累计会话命中率。
     ModelUsage(TokenUsage),
+    /// 压缩和工具筛选后，实际模型请求的上下文分类快照。
+    ContextSnapshot(crate::command::ContextSnapshot),
     /// Agent 运行结束，携带至少一次持久化后的会话状态。
     AgentDone(Box<AgentCompletion>),
     /// 原生会话 Dialog 的摘要查询完成。

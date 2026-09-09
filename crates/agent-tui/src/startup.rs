@@ -921,6 +921,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 app.context_tokens = Some(context_tokens);
                 app.session_usage.add_assign(&usage);
             }
+            Some(UiEvent::ContextSnapshot(snapshot)) => {
+                app.context_snapshot = Some(snapshot);
+                app.context_tokens = None;
+            }
             Some(UiEvent::NativeSessionsLoaded(result)) => {
                 app.handle_native_sessions_loaded(result);
             }

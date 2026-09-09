@@ -2,6 +2,59 @@
 
 use super::*;
 
+/// 为实际模型请求生成不含正文的上下文分类快照；文本按 ASCII 四字节、其他三字节估算。
+/// 多模态与不透明推理载荷无法由文本估算，单独计数；结果不作为服务商计费依据。
+fn request_context_snapshot(req: &ModelRequest) -> Value {
+    use crate::model::{ContentBlock, MessageRole};
+    let estimate = |text: &str| -> u64 {
+        let wide = text.bytes().filter(|byte| !byte.is_ascii()).count();
+        ((text.len() - wide).div_ceil(4) + wide.div_ceil(3)) as u64
+    };
+    let mut tokens = std::collections::BTreeMap::<&str, u64>::new();
+    tokens.insert("system", req.system.as_deref().map_or(0, estimate));
+    let mut attachments = 0_u64;
+    for tool in &req.tools {
+        // 权限元数据由宿主消费，不进入模型上下文。
+        *tokens.entry("tools").or_default() += estimate(&tool.name)
+            + estimate(&tool.description)
+            + estimate(&tool.input_schema.to_string());
+    }
+    for message in &req.messages {
+        for block in &message.content {
+            let (category, amount) = match block {
+                ContentBlock::Text { text } => (
+                    match message.role {
+                        MessageRole::System => "system",
+                        MessageRole::Developer => "developer",
+                        MessageRole::User => "user",
+                        MessageRole::Assistant => "assistant",
+                        MessageRole::Tool => "results",
+                    },
+                    estimate(text),
+                ),
+                ContentBlock::ToolCall { call } => ("calls", estimate(&json!(call).to_string())),
+                ContentBlock::ToolResult { result } => {
+                    ("results", estimate(&result.content_text()))
+                }
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    attachments += u64::from(signature.is_some());
+                    ("thinking", estimate(thinking))
+                }
+                ContentBlock::Image { .. } | ContentBlock::File { .. } => {
+                    attachments += 1;
+                    continue;
+                }
+            };
+            *tokens.entry(category).or_default() += amount;
+        }
+    }
+    json!({"tokens": tokens, "attachments": attachments,
+        "messages": req.messages.len(), "tools": req.tools.len()})
+}
+
 /// 模型只返回思考摘要时使用的一次性纠偏提示；该提示只参与下一次请求，不写入会话。
 const EMPTY_RESPONSE_RECOVERY_PROMPT: &str =
     "上一轮模型响应没有返回可见正文或工具调用。请继续处理原始用户请求；需要工具时立即调用工具，否则直接给出完整答复。";
@@ -217,6 +270,31 @@ fn bounded_one_time_guidance(guidance: &str) -> String {
 #[cfg(test)]
 mod one_time_guidance_tests {
     use super::bounded_one_time_guidance;
+
+    /// 分类快照只包含估算和数量，且附件不能误按 base64 长度计算 token。
+    #[test]
+    fn context_snapshot_classifies_text_without_leaking_content() {
+        use crate::model::{ContentBlock, MessageRole, ModelMessage, ModelRequest};
+        let mut req = ModelRequest::new(
+            "test",
+            vec![
+                ModelMessage::text(MessageRole::Developer, "中".repeat(20)),
+                ModelMessage::text(MessageRole::User, "x".repeat(40)),
+            ],
+        );
+        req.system = Some("s".repeat(80));
+        req.messages[1].content.push(ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "sensitive-base64".repeat(100),
+        });
+        let snapshot = super::request_context_snapshot(&req);
+        assert_eq!(snapshot["tokens"]["system"], 20);
+        assert_eq!(snapshot["tokens"]["developer"], 20);
+        assert_eq!(snapshot["tokens"]["user"], 10);
+        assert_eq!(snapshot["attachments"], 1);
+        assert_eq!(snapshot["messages"], 2);
+        assert!(!snapshot.to_string().contains("sensitive-base64"));
+    }
 
     /// 扩展文本不得通过闭合标签或换行伪造 Core 提供的可信结构边界。
     #[test]
@@ -564,6 +642,7 @@ impl Agent {
                     "model": &self.options.model,
                     "message_count": req.messages.len(),
                     "tool_count": req.tools.len(),
+                    "context": request_context_snapshot(&req),
                 }),
             )
             .await?;

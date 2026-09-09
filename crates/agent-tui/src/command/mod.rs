@@ -1,8 +1,10 @@
 //! Lucia TUI 原生斜杠命令、补全面板和会话对话框。
 
+mod context;
 #[cfg(feature = "plugins")]
 mod plugin_dialog;
 mod render;
+pub(crate) use context::{render_context_dialog, ContextSnapshot};
 mod session_dialog;
 #[cfg(test)]
 mod tests;
@@ -54,6 +56,13 @@ struct SlashCommandMatch {
 
 /// Lucia 默认提供的全部斜杠命令。
 const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
+    NativeCommandSpec {
+        name: "context",
+        aliases: &[],
+        summary: "查看上下文占用",
+        description: "查看最近模型请求的上下文分类、窗口占用和当前会话用量。",
+        idle_only: false,
+    },
     NativeCommandSpec {
         name: "new",
         aliases: &[],
@@ -286,6 +295,10 @@ pub(crate) struct NativePluginDialog {
 /// TUI 原生命令状态；不依赖 Plugin Host，纯 Core 构建同样可用。
 #[derive(Debug, Default)]
 pub(crate) struct NativeCommandState {
+    /// 上下文检查视图是否占用键盘焦点。
+    pub(crate) context_open: bool,
+    /// 窄终端上下文视图的垂直滚动位置。
+    pub(crate) context_scroll: u16,
     /// 补全面板当前高亮候选。
     pub(crate) selected: usize,
     /// 用户按 Esc 隐藏面板时的完整输入；输入发生变化后自动失效。
@@ -302,7 +315,8 @@ pub(crate) struct NativeCommandState {
 impl App {
     /// 返回任一原生全屏 Dialog 是否正在占用键盘焦点；内联面板不计入。
     pub(crate) fn native_dialog_active(&self) -> bool {
-        self.native_command.dialog.is_some()
+        self.native_command.context_open
+            || self.native_command.dialog.is_some()
             || cfg!(feature = "plugins") && {
                 #[cfg(feature = "plugins")]
                 {
@@ -425,6 +439,22 @@ impl App {
         modifiers: KeyModifiers,
         agent: Option<&Arc<Agent>>,
     ) -> bool {
+        if self.native_command.context_open {
+            match code {
+                KeyCode::Esc | KeyCode::Enter => self.native_command.context_open = false,
+                KeyCode::Up => {
+                    self.native_command.context_scroll =
+                        self.native_command.context_scroll.saturating_sub(1)
+                }
+                KeyCode::Down => {
+                    self.native_command.context_scroll =
+                        self.native_command.context_scroll.saturating_add(1)
+                }
+                KeyCode::Home => self.native_command.context_scroll = 0,
+                _ => {}
+            }
+            return true;
+        }
         if !matches!(code, KeyCode::Esc) {
             self.last_escape_at = None;
         }
@@ -546,6 +576,10 @@ impl App {
             return;
         }
         match command.name {
+            "context" => {
+                self.native_command.context_open = true;
+                self.native_command.context_scroll = 0;
+            }
             "help" => self.show_native_command_help(parts.next()),
             "resume" => self.open_native_sessions(NativeSessionDialogMode::Resume),
             "sessions" => self.open_native_sessions(NativeSessionDialogMode::Browse),

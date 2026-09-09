@@ -388,20 +388,23 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             ]);
         }
     }
-    if let Some(tokens) = app.context_tokens {
-        let (label, color) = context_status(tokens, app.context_window);
-        footer.extend([
-            Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
-            Span::styled(format!("◔ {label}"), Style::new().fg(color)),
-        ]);
-    }
-    // 缓存命中率直接反映提示缓存是否真的在生效，只在窄终端下让位给更基础的信息。
-    if workspace.width >= 72 {
-        if let Some((label, color)) = cache_hit_status(&app.session_usage) {
+    // 用量仅在运行中提示，结束后通过 /context 按需查看。
+    if app.running {
+        if let Some(tokens) = app.context_tokens {
+            let (label, color) = context_status(tokens, app.context_window);
             footer.extend([
                 Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
-                Span::styled(label, Style::new().fg(color)),
+                Span::styled(format!("◔ {label}"), Style::new().fg(color)),
             ]);
+        }
+        // 缓存命中率直接反映提示缓存是否真的在生效，只在窄终端下让位给更基础的信息。
+        if workspace.width >= 72 {
+            if let Some((label, color)) = cache_hit_status(&app.session_usage) {
+                footer.extend([
+                    Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+                    Span::styled(label, Style::new().fg(color)),
+                ]);
+            }
         }
     }
     let footer_area = footer_section;
