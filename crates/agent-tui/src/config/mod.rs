@@ -35,8 +35,8 @@ api_key = ""
 # api_key_env = "OPENAI_API_KEY"
 # context_window = 200000
 openai_protocol = "responses"
-# 网关厂商，决定提示缓存的路由方式：官方 open-ai 用请求体里的 prompt_cache_key，
-# open-router 与缺省的 open-ai-compatible 用会话亲和 HTTP header。
+# 网关厂商决定提示缓存的路由方式：open-ai 与缺省的 open-ai-compatible 发送 prompt_cache_key，
+# open-ai-compatible 额外发送会话亲和 HTTP header；open-router 使用独立的亲和 header。
 # gateway = "open-ai-compatible"
 
 [agent]

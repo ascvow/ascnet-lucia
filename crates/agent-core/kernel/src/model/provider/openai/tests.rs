@@ -277,16 +277,24 @@ fn openai_cache_key_tracks_session_only() {
     let later_turn = request_for("session-1", "完全不同的一轮请求");
     let other_session = request_for("session-2", "第一轮请求");
 
-    let key = |request: ModelRequest| {
-        build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, GatewayKind::OpenAi)
-            .expect("请求应成功构建")["prompt_cache_key"]
-            .as_str()
-            .expect("应包含缓存亲和键")
-            .to_string()
-    };
-
-    assert_eq!(key(first_turn.clone()), key(later_turn));
-    assert_ne!(key(first_turn), key(other_session));
+    for gateway in [GatewayKind::OpenAi, GatewayKind::OpenAiCompatible] {
+        for chat in [false, true] {
+            let key = |request: ModelRequest| {
+                let body = if chat {
+                    build_chat_completions_request(request, gateway)
+                } else {
+                    build_responses_request(request, RESPONSES_PARAMS_COMPATIBLE, gateway)
+                }
+                .expect("请求应成功构建");
+                body["prompt_cache_key"]
+                    .as_str()
+                    .expect("应包含缓存亲和键")
+                    .to_string()
+            };
+            assert_eq!(key(first_turn.clone()), key(later_turn.clone()));
+            assert_ne!(key(first_turn.clone()), key(other_session.clone()));
+        }
+    }
 }
 
 /// 未提供会话 ID 时不发送缓存键，交给服务商按前缀隐式缓存。
@@ -365,41 +373,46 @@ fn long_cache_retention_maps_to_openai_24h() {
     assert_eq!(chat["prompt_cache_retention"], "24h");
 }
 
-/// 兼容网关默认不发送 `prompt_cache_key`，只有显式要求长期缓存时才带上。
-///
-/// 该 body 参数是 OpenAI 官方语义，兼容网关多数不认；它们的缓存路由走会话亲和 header，
-/// 盲发未知字段没有收益还可能被网关拒绝。
+/// 兼容网关的两种协议均保留稳定缓存键，并遵守保留策略和缺少会话 ID 的边界。
 #[test]
-fn compatible_gateway_omits_cache_key_unless_long_retention() {
-    let mut request = ModelRequest::new("gpt-test", Vec::new());
-    request.session_id = Some("session-abc".into());
-
-    let short = build_responses_request(
-        request.clone(),
-        RESPONSES_PARAMS_COMPATIBLE,
-        GatewayKind::OpenAiCompatible,
-    )
-    .expect("兼容网关短缓存请求应成功构建");
-    let chat = build_chat_completions_request(request.clone(), GatewayKind::OpenAiCompatible)
-        .expect("兼容网关 Chat 请求应成功构建");
-    request.cache_retention = PromptCacheRetention::Long;
-    let long = build_responses_request(
-        request,
-        RESPONSES_PARAMS_COMPATIBLE,
-        GatewayKind::OpenAiCompatible,
-    )
-    .expect("兼容网关长缓存请求应成功构建");
-
-    assert!(short.get("prompt_cache_key").is_none());
-    assert!(chat.get("prompt_cache_key").is_none());
-    assert_eq!(long["prompt_cache_key"], "session-abc");
+fn compatible_gateway_preserves_cache_key_and_retention() {
+    for retention in [
+        PromptCacheRetention::Short,
+        PromptCacheRetention::Long,
+        PromptCacheRetention::None,
+    ] {
+        for session_id in [Some("session-abc"), None] {
+            let mut request = ModelRequest::new("gpt-test", Vec::new());
+            request.session_id = session_id.map(str::to_owned);
+            request.cache_retention = retention;
+            let responses = build_responses_request(
+                request.clone(),
+                RESPONSES_PARAMS_COMPATIBLE,
+                GatewayKind::OpenAiCompatible,
+            )
+            .expect("兼容网关 Responses 请求应成功构建");
+            let chat = build_chat_completions_request(request, GatewayKind::OpenAiCompatible)
+                .expect("兼容网关 Chat 请求应成功构建");
+            for body in [responses, chat] {
+                let expected_key = session_id.filter(|_| retention != PromptCacheRetention::None);
+                assert_eq!(
+                    body.get("prompt_cache_key").and_then(Value::as_str),
+                    expected_key
+                );
+                assert_eq!(
+                    body.get("prompt_cache_retention").and_then(Value::as_str),
+                    (retention == PromptCacheRetention::Long).then_some("24h")
+                );
+            }
+        }
+    }
 }
 
-/// 网关厂商决定整套缓存路由约定：官方端点用 body 缓存键，其余网关用亲和 header。
+/// 兼容网关同时保留标准缓存键和亲和 header，其他网关的路由约定不变。
 #[test]
 fn gateway_kind_selects_cache_routing_convention() {
     assert!(GatewayKind::OpenAi.reads_prompt_cache_key());
-    assert!(!GatewayKind::OpenAiCompatible.reads_prompt_cache_key());
+    assert!(GatewayKind::OpenAiCompatible.reads_prompt_cache_key());
     assert!(!GatewayKind::OpenRouter.reads_prompt_cache_key());
 
     assert_eq!(GatewayKind::OpenAi.session_affinity(), SessionAffinity::Off);
@@ -411,7 +424,7 @@ fn gateway_kind_selects_cache_routing_convention() {
         GatewayKind::OpenRouter.session_affinity(),
         SessionAffinity::OpenRouter
     );
-    // 缺省的通用兼容网关必须拿到亲和 header，否则完全没有会话级缓存路由。
+    // 标准缓存键不能替代中转层已有的会话亲和 header。
     assert_eq!(
         GatewayKind::default().session_affinity(),
         SessionAffinity::OpenAi

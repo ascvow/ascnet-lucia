@@ -407,9 +407,9 @@ pub enum PromptCacheRetention {
 
 /// 目标网关的厂商类型。
 ///
-/// 各家网关的提示缓存路由约定互不相同：官方 OpenAI 读 body 里的 `prompt_cache_key`，
-/// OpenRouter 和多数兼容网关只认 HTTP header，且 header 名称还不一样。调用方声明网关
-/// 厂商，适配器据此选择整套缓存行为，不需要逐项配置。
+/// 官方 OpenAI 与兼容网关发送请求体中的 `prompt_cache_key`；兼容网关还保留会话亲和
+/// header，供中转层路由使用。OpenRouter 使用独立的 header 约定。
+/// 调用方声明网关厂商，适配器据此选择缓存请求字段；实际命中由服务端决定。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GatewayKind {
@@ -435,12 +435,11 @@ impl GatewayKind {
         }
     }
 
-    /// 返回该网关是否读取 body 中的 `prompt_cache_key`。
+    /// 返回是否为该网关发送请求体中的 `prompt_cache_key`。
     ///
-    /// 兼容网关大多忽略这个 OpenAI 专有字段，缓存路由完全依赖 header；对它们照发只是把
-    /// 未知字段推给网关，没有收益。
+    /// 兼容网关也应携带标准缓存键，不能假定中转层的亲和 header 会转化为上游缓存键。
     pub fn reads_prompt_cache_key(self) -> bool {
-        matches!(self, Self::OpenAi)
+        matches!(self, Self::OpenAi | Self::OpenAiCompatible)
     }
 }
 

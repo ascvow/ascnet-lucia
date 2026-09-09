@@ -442,11 +442,10 @@ fn build_chat_completions_request(req: ModelRequest, gateway: GatewayKind) -> Re
 /// 返回本次请求使用的 OpenAI 缓存亲和键。
 ///
 /// 键直接取调用方给出的会话 ID，不按请求内容推导：会话 ID 在整个会话生命周期内恒定，
-/// 天然把不同会话区分开，而任何按内容推导的键都会随消息或工具变化而改变，把同一会话的
-/// 连续请求路由到不同机器，缓存全部落空。
+/// 避免追加消息或工具变化导致缓存亲和键改变。实际命中仍取决于服务端和相同输入前缀。
 ///
-/// 只有读取该字段的网关才会收到它。兼容网关大多忽略这个 OpenAI 专有参数，缓存路由走
-/// 会话亲和 header；对它们只在显式要求长期缓存时才发送，避免把未知字段推给网关。
+/// 官方与兼容网关均发送标准缓存键，兼容网关的亲和 header 独立保留。
+/// 其他网关维持原有约定，仅在显式要求长期缓存时发送该字段。
 /// 关闭缓存或调用方未提供会话 ID 时同样不发送。
 fn openai_prompt_cache_key(req: &ModelRequest, gateway: GatewayKind) -> Option<String> {
     let retention = req.cache_retention;
