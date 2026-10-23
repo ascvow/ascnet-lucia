@@ -175,7 +175,7 @@ fn signs_request_with_sigv4() {
         .expect("应包含 x-amz-date");
     assert_eq!(amz_date.len(), 16);
     assert!(amz_date.ends_with('Z'));
-    assert!(amz_date[8..9].chars().next() == Some('T'));
+    assert!(amz_date[8..9].starts_with('T'));
 }
 
 /// 缺少 AWS 凭据字段时必须拒绝创建适配器。

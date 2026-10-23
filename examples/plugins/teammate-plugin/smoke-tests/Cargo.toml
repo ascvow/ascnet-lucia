@@ -14,3 +14,6 @@ agent-tool = { path = "../../../../crates/agent-core/tool", default-features = f
 async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

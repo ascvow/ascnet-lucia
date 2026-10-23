@@ -82,7 +82,7 @@ async fn wait_result(host: &WasmPluginHost, member_id: &str) -> Value {
 /// 验证派生、可信发送、邮箱、dispatch 自动确认和续跑句柄更新链路。
 #[tokio::test]
 async fn component_runs_mailbox_dispatch_flow() {
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("fixed", Arc::new(FixedModel))
         .expect("固定模型应注册成功");

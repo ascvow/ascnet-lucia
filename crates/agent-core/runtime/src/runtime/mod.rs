@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use futures_util::FutureExt;
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
-    io::{Error as IoError, ErrorKind as IoErrorKind, Write},
+    io::{Error as IoError, Write},
     panic::AssertUnwindSafe,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -708,11 +708,11 @@ impl Write for BoundedRequestSizeCounter {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         let Some(next) = self.bytes.checked_add(buffer.len()) else {
             self.exceeded = true;
-            return Err(IoError::new(IoErrorKind::Other, "模型请求字节计数溢出"));
+            return Err(IoError::other("模型请求字节计数溢出"));
         };
         if next > self.limit {
             self.exceeded = true;
-            return Err(IoError::new(IoErrorKind::Other, "模型请求超过剩余字节预算"));
+            return Err(IoError::other("模型请求超过剩余字节预算"));
         }
         self.bytes = next;
         Ok(buffer.len())
@@ -957,6 +957,11 @@ struct AgentEntry {
 }
 
 impl AgentEntry {
+    /// 创建 Agent 条目。
+    ///
+    /// 参数一一对应条目的不可变身份与初始状态，且只由 Runtime 内部的派生路径构造；
+    /// 为它们再包一层参数对象只会把同一组字段搬一次，因此保留逐个参数。
+    #[allow(clippy::too_many_arguments)]
     fn new(
         id: AgentId,
         lineage: AgentLineage,
@@ -1004,7 +1009,7 @@ impl AgentEntry {
 
     fn reserve_child(&self, limit: usize) -> RuntimeResult<()> {
         self.child_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < limit).then_some(count + 1)
             })
             .map(|_| ())
@@ -1290,7 +1295,7 @@ async fn run_agent_task(
     let extension = agent.extension();
     let core_run_id = run_id.clone();
     let core_future = AssertUnwindSafe(async move {
-        let session = agent.prepare_session(session.unwrap_or_else(Session::new), input);
+        let session = agent.prepare_session(session.unwrap_or_default(), input);
         agent.run_session_with_id(session, core_run_id).await
     })
     .catch_unwind();

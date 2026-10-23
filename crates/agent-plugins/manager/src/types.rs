@@ -92,18 +92,14 @@ impl Default for PluginLock {
 }
 
 /// 安装行为选项。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 安装只验证并落盘 Bundle；启用必须是展示 capability 后的独立用户动作，因此默认值
+/// 依赖 `enabled: bool` 的 `false`，不需要手写 `Default` 实现。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InstallOptions {
     /// 是否请求以启用状态提交 Bundle。
     ///
     /// 公开人工安装入口只接受 `false`；人工替换即使收到 `true` 也会保持禁用并要求重新审查。
     /// 该标记仅供 Manager 内部可信迁移在重新核验来源、身份、能力和依赖后受限继承授权。
     pub enabled: bool,
-}
-
-impl Default for InstallOptions {
-    fn default() -> Self {
-        // 安装只验证并落盘 Bundle；启用必须是展示 capability 后的独立用户动作。
-        Self { enabled: false }
-    }
 }

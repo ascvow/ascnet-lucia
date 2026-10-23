@@ -435,7 +435,7 @@ async fn policy_zero_max_steps_blocks_before_model_request() {
     let model = Arc::new(ScriptedModel::new(vec![ModelResponse::text(
         "不应到达模型",
     )]));
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("zero-step", model.clone())
         .expect("注册零步测试模型");
@@ -502,7 +502,7 @@ async fn extension_prompt_is_injected_without_persisting_to_session() {
     let model = Arc::new(CapturingModel {
         requests: std::sync::Mutex::new(Vec::new()),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("capturing", model.clone())
         .expect("注册捕获模型应成功");
@@ -541,7 +541,7 @@ async fn blocked_tool_guidance_continues_run_without_persisting_review_reason() 
             .into(),
         ),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("capturing-scripted", model.clone())
         .expect("注册脚本模型应成功");
@@ -582,31 +582,34 @@ async fn blocked_tool_guidance_continues_run_without_persisting_review_reason() 
     assert!(!persisted.contains("目标路径不在允许范围内"));
     assert!(persisted.contains("工具调用未获批准"));
 
-    let context_messages = context_messages.lock().expect("上下文加载记录锁不应中毒");
-    assert_eq!(context_messages.len(), 2);
-    let context_visible = serde_json::to_string(&context_messages[1]).expect("序列化加载器消息");
-    assert!(context_visible.contains("工具调用未获批准"));
-    assert!(!context_visible.contains("目标路径不在允许范围内"));
-    assert!(!context_visible.contains("approval-guidance"));
+    {
+        let context_messages = context_messages.lock().expect("上下文加载记录锁不应中毒");
+        assert_eq!(context_messages.len(), 2);
+        let context_visible =
+            serde_json::to_string(&context_messages[1]).expect("序列化加载器消息");
+        assert!(context_visible.contains("工具调用未获批准"));
+        assert!(!context_visible.contains("目标路径不在允许范围内"));
+        assert!(!context_visible.contains("approval-guidance"));
 
-    let requests = model.requests.lock().expect("模型请求锁不应中毒");
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1].messages.iter().any(|message| {
-        matches!(message.role, crate::model::MessageRole::Tool)
-            && message.content.iter().any(|block| {
-                matches!(
-                    block,
-                    crate::model::ContentBlock::ToolResult { result }
-                        if result.content_text().contains("请改用工作区内的只读方案继续")
-                )
-            })
-    }));
-    assert!(requests[1].messages.iter().all(|message| {
-        !matches!(message.role, crate::model::MessageRole::Developer)
-            || !message
-                .text_content()
-                .contains("请改用工作区内的只读方案继续")
-    }));
+        let requests = model.requests.lock().expect("模型请求锁不应中毒");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.iter().any(|message| {
+            matches!(message.role, crate::model::MessageRole::Tool)
+                && message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        crate::model::ContentBlock::ToolResult { result }
+                            if result.content_text().contains("请改用工作区内的只读方案继续")
+                    )
+                })
+        }));
+        assert!(requests[1].messages.iter().all(|message| {
+            !matches!(message.role, crate::model::MessageRole::Developer)
+                || !message
+                    .text_content()
+                    .contains("请改用工作区内的只读方案继续")
+        }));
+    }
     let events = sink.events().await;
     let displayed = events
         .iter()
@@ -652,7 +655,7 @@ async fn blocked_tool_does_not_skip_allowed_call_in_same_model_response() {
             .into(),
         ),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("same-batch-block", model)
         .expect("注册脚本模型应成功");
@@ -720,7 +723,7 @@ async fn blocked_tool_guidance_is_consumed_before_third_model_request() {
             .into(),
         ),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("one-time-guidance", model.clone())
         .expect("注册脚本模型应成功");
@@ -771,7 +774,7 @@ async fn blocked_tool_guidance_survives_context_loader_dropping_tool_history() {
             .into(),
         ),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("capturing-scripted", model.clone())
         .expect("注册脚本模型应成功");
@@ -851,7 +854,7 @@ async fn blocked_tool_without_guidance_never_persists_or_broadcasts_reason() {
             .into(),
         ),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("block-without-guidance", model.clone())
         .expect("注册脚本模型应成功");
@@ -887,29 +890,32 @@ async fn blocked_tool_without_guidance_never_persists_or_broadcasts_reason() {
     assert!(persisted.contains("工具调用未获批准"));
     assert!(!persisted.contains("仅可信界面可见的审批失败详情"));
 
-    let requests = model.requests.lock().expect("模型请求锁不应中毒");
-    assert_eq!(requests.len(), 2);
-    let second_request = serde_json::to_string(&requests[1].messages).expect("序列化第二次请求");
-    assert!(second_request.contains("工具调用未获批准"));
-    assert!(!second_request.contains("仅可信界面可见的审批失败详情"));
+    {
+        let requests = model.requests.lock().expect("模型请求锁不应中毒");
+        assert_eq!(requests.len(), 2);
+        let second_request =
+            serde_json::to_string(&requests[1].messages).expect("序列化第二次请求");
+        assert!(second_request.contains("工具调用未获批准"));
+        assert!(!second_request.contains("仅可信界面可见的审批失败详情"));
 
-    let broadcast_results = observer.broadcast_results();
-    assert_eq!(broadcast_results.len(), 1);
-    assert!(broadcast_results[0]
-        .content_text()
-        .contains("工具调用未获批准"));
-    assert!(!broadcast_results[0]
-        .content_text()
-        .contains("仅可信界面可见的审批失败详情"));
-    let broadcast_events = observer.finished_events();
-    assert_eq!(broadcast_events.len(), 1);
-    let broadcast_result: ToolResult = serde_json::from_value(broadcast_events[0].payload.clone())
-        .expect("解析监听者可见工具结果");
-    assert!(broadcast_result.content_text().contains("工具调用未获批准"));
-    assert!(!broadcast_result
-        .content_text()
-        .contains("仅可信界面可见的审批失败详情"));
-
+        let broadcast_results = observer.broadcast_results();
+        assert_eq!(broadcast_results.len(), 1);
+        assert!(broadcast_results[0]
+            .content_text()
+            .contains("工具调用未获批准"));
+        assert!(!broadcast_results[0]
+            .content_text()
+            .contains("仅可信界面可见的审批失败详情"));
+        let broadcast_events = observer.finished_events();
+        assert_eq!(broadcast_events.len(), 1);
+        let broadcast_result: ToolResult =
+            serde_json::from_value(broadcast_events[0].payload.clone())
+                .expect("解析监听者可见工具结果");
+        assert!(broadcast_result.content_text().contains("工具调用未获批准"));
+        assert!(!broadcast_result
+            .content_text()
+            .contains("仅可信界面可见的审批失败详情"));
+    }
     let trusted_event = sink
         .events()
         .await
@@ -937,7 +943,7 @@ async fn blocked_tool_guidance_continues_in_non_stream_mode() {
             .into(),
         ),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("capturing-scripted", model.clone())
         .expect("注册脚本模型应成功");
@@ -995,7 +1001,7 @@ async fn multiple_blocked_tools_keep_one_time_guidance_scoped_by_call_id() {
             .into(),
         ),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("capturing-scripted", model.clone())
         .expect("注册脚本模型应成功");
@@ -1023,27 +1029,28 @@ async fn multiple_blocked_tools_keep_one_time_guidance_scoped_by_call_id() {
     assert!(!persisted.contains("审批详情仅属于"));
     assert_eq!(persisted.matches("工具调用未获批准").count(), 2);
 
-    let requests = model.requests.lock().expect("模型请求锁不应中毒");
-    assert_eq!(requests.len(), 2);
-    let mut request_results = std::collections::HashMap::new();
-    for message in &requests[1].messages {
-        for block in &message.content {
-            if let crate::model::ContentBlock::ToolResult { result } = block {
-                request_results.insert(result.call_id.as_str(), result.content_text());
+    {
+        let requests = model.requests.lock().expect("模型请求锁不应中毒");
+        assert_eq!(requests.len(), 2);
+        let mut request_results = std::collections::HashMap::new();
+        for message in &requests[1].messages {
+            for block in &message.content {
+                if let crate::model::ContentBlock::ToolResult { result } = block {
+                    request_results.insert(result.call_id.as_str(), result.content_text());
+                }
             }
         }
+        let first = request_results
+            .get("blocked-first")
+            .expect("第一条调用应有一次性指导");
+        let second = request_results
+            .get("blocked-second")
+            .expect("第二条调用应有一次性指导");
+        assert!(first.contains("调用 blocked-first"));
+        assert!(!first.contains("调用 blocked-second"));
+        assert!(second.contains("调用 blocked-second"));
+        assert!(!second.contains("调用 blocked-first"));
     }
-    let first = request_results
-        .get("blocked-first")
-        .expect("第一条调用应有一次性指导");
-    let second = request_results
-        .get("blocked-second")
-        .expect("第二条调用应有一次性指导");
-    assert!(first.contains("调用 blocked-first"));
-    assert!(!first.contains("调用 blocked-second"));
-    assert!(second.contains("调用 blocked-second"));
-    assert!(!second.contains("调用 blocked-first"));
-
     let events = sink.events().await;
     let displayed_reasons = events
         .iter()
@@ -1073,7 +1080,7 @@ async fn duplicate_tool_call_ids_fail_before_tool_execution() {
             .into(),
         ),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("capturing-scripted", model)
         .expect("注册脚本模型应成功");
@@ -1128,7 +1135,7 @@ async fn reused_tool_call_id_across_model_responses_is_rejected() {
             .into(),
         ),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("cross-turn-duplicate", model)
         .expect("注册脚本模型应成功");
@@ -1165,7 +1172,7 @@ async fn context_loader_replaces_messages_sent_to_model() {
     let model = Arc::new(CapturingModel {
         requests: std::sync::Mutex::new(Vec::new()),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("capturing", model.clone())
         .expect("注册捕获模型应成功");
@@ -1237,7 +1244,7 @@ async fn model_request_gate_runs_before_provider() {
     let model = Arc::new(CapturingModel {
         requests: std::sync::Mutex::new(Vec::new()),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("gated", model.clone())
         .expect("注册捕获模型应成功");
@@ -1264,7 +1271,7 @@ async fn model_request_gate_runs_before_provider() {
 /// 扩展发布的载荷应进入统一事件 sink，且标记为 Extension。
 #[tokio::test]
 async fn extension_events_are_recorded_by_agent_sink() {
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register(
             "scripted",
@@ -1389,7 +1396,7 @@ impl ProviderAdapter for BlockingModel {
 /// ExecutionPolicy 的墙钟上限必须终止阻塞模型请求，不能只停留在序列化声明中。
 #[tokio::test]
 async fn execution_policy_enforces_wall_clock_limit() {
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register(
             "blocking",
@@ -1457,7 +1464,7 @@ impl EventSink for StateObserver {
 
 /// 构造使用脚本化模型的 agent。
 fn agent_with_script(responses: Vec<ModelResponse>) -> Agent {
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("mock", Arc::new(ScriptedModel::new(responses)))
         .expect("register mock provider");
@@ -1510,7 +1517,7 @@ async fn dynamic_reasoning_level_updates_next_request() {
     let model = Arc::new(CapturingModel {
         requests: std::sync::Mutex::new(Vec::new()),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("capturing", model.clone())
         .expect("注册捕获模型应成功");
@@ -1532,7 +1539,7 @@ async fn regular_run_uses_default_short_prompt_cache() {
     let model = Arc::new(CapturingModel {
         requests: std::sync::Mutex::new(Vec::new()),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("capturing", model.clone())
         .expect("注册捕获模型应成功");
@@ -1556,7 +1563,7 @@ async fn model_requests_carry_the_injected_session_id() {
     let model = Arc::new(CapturingModel {
         requests: std::sync::Mutex::new(Vec::new()),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("capturing", model.clone())
         .expect("注册捕获模型应成功");
@@ -1717,7 +1724,7 @@ async fn run_with_probe(
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     let peak = Arc::new(AtomicUsize::new(0));
     let active = Arc::new(AtomicUsize::new(0));
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register(
             "scripted",
@@ -1904,7 +1911,7 @@ impl Tool for BlockingTool {
 /// 状态快照应覆盖模型流式阶段，并在成功后保留完整会话和运行摘要。
 #[tokio::test]
 async fn state_tracks_streaming_and_success_terminal_snapshot() {
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("stream", Arc::new(StreamingModel))
         .expect("注册流式模型");
@@ -2075,7 +2082,7 @@ async fn state_preserves_failure_diagnostics_and_session() {
 async fn state_rejects_concurrent_runs_on_the_same_agent() {
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register(
             "blocking",
@@ -2173,7 +2180,7 @@ async fn control_cancel_interrupts_pending_before_tool_hook() {
 #[tokio::test]
 async fn control_cancel_interrupts_pending_model_request() {
     let started = Arc::new(tokio::sync::Notify::new());
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register(
             "blocking",
@@ -2245,7 +2252,7 @@ async fn control_cancel_interrupts_running_native_tool() {
 /// Agent 会转发模型文本增量，同时保留完整最终响应。
 #[tokio::test]
 async fn model_stream_deltas_are_forwarded_to_event_sink() {
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("stream", Arc::new(StreamingModel))
         .expect("注册流式模型");
@@ -2288,7 +2295,7 @@ async fn model_stream_deltas_are_forwarded_to_event_sink() {
 async fn model_streaming_defaults_on_and_can_be_disabled() {
     assert!(AgentOptions::default().stream);
 
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("stream", Arc::new(StreamingModel))
         .expect("注册双模式模型");
@@ -2553,7 +2560,7 @@ impl EventSink for CancelOnDelta {
 /// 流中途取消：已生成的部分文本保留进会话，RunFinished 标记 cancelled。
 #[tokio::test]
 async fn cancel_mid_stream_keeps_partial_text() {
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("stream", Arc::new(StreamingModel))
         .expect("注册流式模型");

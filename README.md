@@ -45,7 +45,7 @@ This example uses a deterministic built-in model. It needs no API key and does n
 
 ## Requirements
 
-- Rust stable. The exact toolchain is defined in `rust-toolchain.toml`.
+- A Rust toolchain: the exact pinned version and components are declared in `rust-toolchain.toml`.
 - `wasm32-wasip2`, only when building WASM plugins.
 - Bun is optional. It automates bulk builds and packaging for the official plugins, but it is not required to build Lucia Core.
 

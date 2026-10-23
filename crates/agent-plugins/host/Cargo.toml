@@ -35,3 +35,6 @@ wasmtime-wasi = { workspace = true, optional = true }
 [[bench]]
 name = "plugin_overhead"
 harness = false
+
+[lints]
+workspace = true

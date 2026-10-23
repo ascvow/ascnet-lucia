@@ -24,3 +24,6 @@ libc.workspace = true
 # 内置工具是异步的，回归测试需要运行时与 `#[tokio::test]` 宏。
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

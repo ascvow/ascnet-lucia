@@ -80,6 +80,13 @@ wasmtime = { version = "46", features = ["component-model", "async"] }
 wasmtime-wasi = "46"
 wit-bindgen = "0.59"
 
+# 静态检查策略：`bun run check` 用 `-D warnings` 把全部告警升级为错误，因此放行清单
+# 只能放在这里，且每一项都必须说明为什么无法在源码中消除。
+[workspace.lints.clippy]
+# `async_trait` 会为生成的 trait 方法补上 `#[must_use]`，而返回类型（`Result`、
+# `Self` 等）本身已带 `must_use`；告警指向宏展开，改动我们自己的源码无法消除。
+double_must_use = "allow"
+
 # 开发与测试构建只为工作区代码保留行号，第三方依赖不生成调试符号。
 # 关闭增量编译可避免频繁切换 feature 和测试目标后长期积累历史缓存。
 [profile.dev]

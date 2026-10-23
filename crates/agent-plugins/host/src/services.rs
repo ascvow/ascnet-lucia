@@ -211,7 +211,7 @@ impl ModelCompletionHostServices {
 #[cfg(feature = "wasm")]
 fn try_reserve(counter: &AtomicUsize, amount: usize, limit: Option<usize>) -> bool {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             let next = current.checked_add(amount)?;
             limit.is_none_or(|limit| next <= limit).then_some(next)
         })

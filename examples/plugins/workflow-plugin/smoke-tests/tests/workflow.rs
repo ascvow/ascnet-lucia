@@ -93,7 +93,7 @@ async fn list_until_status(host: &WasmPluginHost, task_id: &str, expected: &str)
 #[tokio::test]
 async fn component_runs_dynamic_task_list() {
     let inputs = Arc::new(Mutex::new(Vec::new()));
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register(
             "workflow-fixed",

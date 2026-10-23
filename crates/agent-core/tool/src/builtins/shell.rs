@@ -123,7 +123,7 @@ impl ShellTool {
         };
         let reserved =
             self.active_processes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     (current < limit).then_some(current + 1)
                 });
         match reserved {

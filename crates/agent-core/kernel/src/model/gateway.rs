@@ -630,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn gateway_binds_registered_provider_alias() {
         let observed = Arc::new(Mutex::new(Vec::new()));
-        let mut gateway = ModelGateway::new();
+        let gateway = ModelGateway::new();
         gateway
             .register(
                 "custom-anthropic",

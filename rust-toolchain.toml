@@ -1,4 +1,6 @@
 [toolchain]
-channel = "stable"
+# 固定到具体补丁版本：`bun run check` 用 `-D warnings` 把 clippy 告警升级为错误，
+# 浮动的 stable 会让新版本新增的 lint 直接把 CI 变红，与改动内容无关。
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-wasip2"]

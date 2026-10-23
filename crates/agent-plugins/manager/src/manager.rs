@@ -1086,8 +1086,10 @@ impl PluginManager {
                 );
             }
         }
+        // 锁文件只承载排他状态，显式声明不清空已有内容。
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)

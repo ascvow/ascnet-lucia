@@ -14,3 +14,6 @@ agent-plugin = { path = "../../../crates/agent-plugins/sdk" }
 serde.workspace = true
 serde_json = "1"
 wit-bindgen = "0.59"
+
+[lints]
+workspace = true

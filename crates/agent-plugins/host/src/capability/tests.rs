@@ -853,7 +853,7 @@ async fn model_completion_rejects_forged_route_fields() {
 #[tokio::test]
 async fn model_completion_uses_trusted_route_and_limits() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut gateway = agent_core::ModelGateway::new();
+    let gateway = agent_core::ModelGateway::new();
     gateway
         .register(
             "trusted-provider",
@@ -904,7 +904,7 @@ async fn model_completion_uses_trusted_route_and_limits() {
 async fn plugin_specific_route_overrides_application_default() {
     let default_requests = Arc::new(Mutex::new(Vec::new()));
     let plugin_requests = Arc::new(Mutex::new(Vec::new()));
-    let mut gateway = agent_core::ModelGateway::new();
+    let gateway = agent_core::ModelGateway::new();
     gateway
         .register(
             "default-provider",
@@ -974,7 +974,7 @@ async fn plugin_specific_route_overrides_application_default() {
 #[tokio::test]
 async fn plugin_route_forwards_reasoning_and_sampling() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut gateway = agent_core::ModelGateway::new();
+    let gateway = agent_core::ModelGateway::new();
     gateway
         .register(
             "plugin:reviewer",
@@ -1009,7 +1009,7 @@ async fn plugin_route_forwards_reasoning_and_sampling() {
 #[tokio::test]
 async fn default_completion_budget_survives_long_interactive_sessions() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut gateway = agent_core::ModelGateway::new();
+    let gateway = agent_core::ModelGateway::new();
     gateway
         .register(
             "reviewer",
@@ -1053,7 +1053,7 @@ async fn default_completion_budget_survives_long_interactive_sessions() {
 #[tokio::test]
 async fn plugin_specific_route_keeps_isolated_budget() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut gateway = agent_core::ModelGateway::new();
+    let gateway = agent_core::ModelGateway::new();
     gateway
         .register(
             "plugin:reviewer",
@@ -1099,7 +1099,7 @@ async fn plugin_specific_route_keeps_isolated_budget() {
 #[tokio::test]
 async fn model_completion_can_use_non_streaming_route() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut gateway = agent_core::ModelGateway::new();
+    let gateway = agent_core::ModelGateway::new();
     gateway
         .register(
             "trusted-provider",
@@ -1135,7 +1135,7 @@ async fn model_completion_can_use_non_streaming_route() {
 #[tokio::test]
 async fn model_completion_enforces_execution_policy_budget() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut gateway = agent_core::ModelGateway::new();
+    let gateway = agent_core::ModelGateway::new();
     gateway
         .register(
             "trusted-provider",
@@ -1175,7 +1175,7 @@ async fn model_completion_enforces_execution_policy_budget() {
 #[tokio::test]
 async fn model_completion_budget_is_isolated_per_plugin_activation() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut gateway = agent_core::ModelGateway::new();
+    let gateway = agent_core::ModelGateway::new();
     gateway
         .register(
             "trusted-provider",

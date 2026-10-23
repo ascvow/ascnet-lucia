@@ -322,7 +322,7 @@ pub(crate) async fn load_plugins_for_tui(
         model_provider,
         persistent_state_dir,
     } = execution;
-    let mut model_gateway = agent_template.gateway().clone();
+    let model_gateway = agent_template.gateway().clone();
     let model_name = model
         .clone()
         .unwrap_or_else(|| agent_template.options().model.clone());

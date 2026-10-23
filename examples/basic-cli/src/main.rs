@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
 }
 
 fn build_demo_gateway() -> (ModelGateway, AgentOptions) {
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("default", Arc::new(ScriptedReActModel))
         .expect("register scripted model");

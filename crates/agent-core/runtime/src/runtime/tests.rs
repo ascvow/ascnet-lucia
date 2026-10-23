@@ -233,7 +233,7 @@ impl ProviderAdapter for ConcurrencyModel {
 
 /// 使用指定模型和工具名称构造测试模板。
 fn template(adapter: Arc<dyn ProviderAdapter>, provider: &str, tools: &[&str]) -> AgentTemplate {
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register(provider, adapter)
         .expect("测试模型应成功注册");
@@ -711,7 +711,7 @@ async fn cancellation_is_idempotent_and_terminal() {
 async fn external_cancellation_finishes_run_extension_lifecycle() {
     let entered = Arc::new(AtomicBool::new(false));
     let finished_runs = Arc::new(Mutex::new(Vec::new()));
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register(
             "blocking-cleanup",
@@ -1320,7 +1320,7 @@ async fn concurrent_model_output_token_reservation_is_atomic() {
         calls: Arc::clone(&calls),
         max_tokens: Arc::clone(&max_tokens),
     });
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("output-budget", model)
         .expect("注册记录模型应成功");

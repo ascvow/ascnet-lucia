@@ -140,17 +140,18 @@ impl FinalPolicyPluginHost {
     }
 }
 
+/// 一次工具准入观测：工具名、run ID、权限 scope 与会话 ID。
+type ObservedToolScope = Vec<(String, String, ToolPermissionScope, Option<String>)>;
+
 /// 记录最终策略收到的工具名与权限 scope，验证组合宿主的可信绑定顺序。
 struct CapturingScopePolicyPluginHost {
-    observed: Arc<std::sync::Mutex<Vec<(String, String, ToolPermissionScope, Option<String>)>>>,
+    observed: Arc<std::sync::Mutex<ObservedToolScope>>,
     subscriptions: Vec<EventSubscription>,
 }
 
 impl CapturingScopePolicyPluginHost {
     /// 创建记录最终工具准入视图的策略宿主。
-    fn new(
-        observed: Arc<std::sync::Mutex<Vec<(String, String, ToolPermissionScope, Option<String>)>>>,
-    ) -> Self {
+    fn new(observed: Arc<std::sync::Mutex<ObservedToolScope>>) -> Self {
         Self {
             observed,
             subscriptions: vec![tool_call_subscription()],

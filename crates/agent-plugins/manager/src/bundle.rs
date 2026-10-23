@@ -111,8 +111,8 @@ fn copy_runtime_bundle_file(
     relative: &Path,
     label: &str,
 ) -> Result<()> {
-    let source_file = validate_runtime_bundle_file(source, &relative, label)?;
-    let target = destination.join(&relative);
+    let source_file = validate_runtime_bundle_file(source, relative, label)?;
+    let target = destination.join(relative);
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("无法创建运行时 Bundle 文件父目录：{}", parent.display()))?;
@@ -433,8 +433,8 @@ pub fn hash_plugin_bundle(root: &Path) -> Result<String> {
     let mut buffer = [0_u8; 64 * 1024];
     for entry in entries {
         digest.update(match entry.kind {
-            BundleEntryKind::Directory => [b'd'],
-            BundleEntryKind::File => [b'f'],
+            BundleEntryKind::Directory => *b"d",
+            BundleEntryKind::File => *b"f",
         });
         let path_bytes = entry.normalized.as_bytes();
         digest.update((path_bytes.len() as u64).to_be_bytes());

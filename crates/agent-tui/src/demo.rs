@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 /// 构建无需外部模型服务的确定性演示运行时。
 pub(crate) fn build_demo_gateway() -> (ModelGateway, AgentOptions) {
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("default", Arc::new(ScriptedReActModel))
         .expect("注册脚本模型");

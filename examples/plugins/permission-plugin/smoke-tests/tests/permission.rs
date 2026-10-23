@@ -217,7 +217,7 @@ async fn wasm_host_keeps_component_enterable_after_cancelled_model_import() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register(
             "blocking-permission-review",

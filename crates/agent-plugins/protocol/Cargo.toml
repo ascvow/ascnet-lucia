@@ -10,3 +10,6 @@ description = "Lucia 插件 Host、Guest SDK 与应用共享的宿主无关协�
 agent-tool = { path = "../../agent-core/tool", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+
+[lints]
+workspace = true

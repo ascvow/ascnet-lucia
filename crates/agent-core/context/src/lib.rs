@@ -1871,7 +1871,7 @@ mod tests {
     #[tokio::test]
     async fn summary_request_disables_cache_and_keeps_session_route() {
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let mut gateway = ModelGateway::new();
+        let gateway = ModelGateway::new();
         gateway
             .register(
                 "test",

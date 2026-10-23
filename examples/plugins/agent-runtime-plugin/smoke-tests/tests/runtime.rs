@@ -58,7 +58,7 @@ async fn wait_result(host: &WasmPluginHost, target: &str) -> Value {
 /// 注入 Runtime、加载真实 component，并验证派生、结果与私有会话续跑链路。
 #[tokio::test]
 async fn component_spawns_and_continues_agent() {
-    let mut gateway = ModelGateway::new();
+    let gateway = ModelGateway::new();
     gateway
         .register("fixed", Arc::new(FixedModel))
         .expect("固定模型应注册成功");
