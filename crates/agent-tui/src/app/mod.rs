@@ -106,8 +106,6 @@ pub(crate) struct MainEventSnapshot {
     pub(crate) messages: Vec<Msg>,
     /// 快照建立时正在接收增量的助手消息索引。
     pub(crate) streaming_message: Option<usize>,
-    /// 快照建立时模型是否处于思考阶段。
-    pub(crate) model_is_thinking: bool,
 }
 
 /// 最近一帧中可点击的工具消息区域，索引始终指向实时消息列表。

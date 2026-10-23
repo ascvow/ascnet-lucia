@@ -14,6 +14,7 @@ use crate::ui::transcript::{tool_display_name, tool_target};
 use agent_core::model::TokenUsage;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use std::fmt::Write as _;
 
 /// 主内容区左右留白列数：正文两侧各留两列，任何一行都不再贴住终端边缘。
 const CHAT_PADDING_X: u16 = 2;
@@ -22,6 +23,11 @@ const CHAT_PADDING_X: u16 = 2;
 /// 底部这一行就是输入框上方的分隔空行：日志最后一行与输入盒之间始终隔着一行空白，
 /// 滚动到顶部时它同时充当跳转提示的落点。
 const CHAT_PADDING_Y: u16 = 1;
+
+/// 输入框边框标题的最小可用宽度。
+///
+/// 比它更窄时标题只剩省略号，既读不出状态又贴着圆角，不如让边框保持干净。
+const MIN_PROMPT_TITLE_WIDTH: usize = 8;
 
 /// 在插件占用后的中心区域渲染 Lucia 主界面。
 pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
@@ -35,12 +41,10 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     let timeline_uses_snapshot = app.main_event_snapshot.is_some();
     #[cfg(feature = "plugins")]
     let (timeline_messages, timeline_streaming_message) =
-        app.main_event_snapshot
-            .as_ref()
-            .map_or_else(
-                || (app.messages.as_slice(), app.streaming_message),
-                |snapshot| (snapshot.messages.as_slice(), snapshot.streaming_message),
-            );
+        app.main_event_snapshot.as_ref().map_or_else(
+            || (app.messages.as_slice(), app.streaming_message),
+            |snapshot| (snapshot.messages.as_slice(), snapshot.streaming_message),
+        );
     #[cfg(not(feature = "plugins"))]
     let timeline_uses_snapshot = false;
     #[cfg(not(feature = "plugins"))]
@@ -106,45 +110,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     } else {
         let inner_width = chat_area.width.max(1);
         // 布局缓存按内容指纹复用高度，只有变化的消息会重新排版。
-        let mut total_height =
+        let total_height =
             app.transcript_layout
                 .sync(timeline_messages, timeline_streaming_message, inner_width);
-
-        // 运行指示与后台重载提示不属于消息，作为尾部附加行单独测量与绘制。
-        let mut trailing: Vec<Line<'static>> = Vec::new();
-        if app.running && timeline_streaming_message.is_none() {
-            let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
-            let mut spans = vec![
-                Span::styled(format!("{spinner} "), Style::new().fg(COLOR_WARNING)),
-                Span::styled(
-                    if timeline_is_thinking {
-                        "Thinking..."
-                    } else {
-                        "Working..."
-                    },
-                    Style::new().fg(COLOR_MUTED),
-                ),
-            ];
-            // 运行耗时随 UI tick 刷新，长任务时可感知进展。
-            if let Some(started) = app.run_started_at {
-                spans.push(Span::styled(
-                    format!(" {}", format_elapsed(started.elapsed())),
-                    Style::new().fg(COLOR_MUTED),
-                ));
-            }
-            trailing.push(Line::from(spans));
-        }
-        // 后台原生上下文重载以调用方提供的标签作为进行中指示。
-        #[cfg(feature = "plugins")]
-        if let Some(label) = app.pending_reload.as_deref() {
-            let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
-            trailing.push(Line::from(vec![
-                Span::styled(format!("{spinner} "), Style::new().fg(COLOR_WARNING)),
-                Span::styled(label.to_string(), Style::new().fg(COLOR_MUTED)),
-            ]));
-        }
-        let trailing_height = crate::ui::transcript_layout::measure_lines(&trailing, inner_width);
-        total_height = total_height.saturating_add(trailing_height);
 
         let viewport = chat_area.height;
         let max_scroll = total_height.saturating_sub(viewport);
@@ -162,14 +130,6 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             chat_area,
             timeline_messages,
             timeline_streaming_message,
-            scroll,
-        );
-        render_trailing_lines(
-            frame,
-            chat_area,
-            &trailing,
-            trailing_height,
-            total_height,
             scroll,
         );
         // 滚动条落在消息区右侧的留白列上，与正文互不重叠。
@@ -300,28 +260,18 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             COLOR_MUTED
         }))
         .padding(Padding::new(1, 1, 0, 0));
-    // 输入盒标题按优先级展示当前最需要用户注意的状态：待确认退出 > 运行中 > 排队。
-    let state_title = if app.exit_confirmation_pending() {
-        " 再按一次 Ctrl+C 退出 ".to_string()
-    } else if app.running {
-        let queued = app.queued_inputs.len();
-        if queued > 0 {
-            format!(" Running · Esc to stop · {queued} queued ")
-        } else {
-            " Running · Esc to stop ".to_string()
+    // 输入盒标题是界面上唯一的"当前活动"出口：主内容区不再输出状态文本，
+    // 因此日志滚动不会让状态丢失，也不会出现两条互相矛盾的进度说明。
+    if let Some((title, color)) = prompt_title(app) {
+        // 标题落在圆角边框上，两侧内边距占掉四列；窄到只够一个省略号时宁可不显示，
+        // 也不要让碎片标题贴着圆角。
+        let max_title_width = usize::from(input_area.width.saturating_sub(4));
+        if max_title_width >= MIN_PROMPT_TITLE_WIDTH {
+            input_block = input_block.title(Span::styled(
+                fit_title(title, max_title_width),
+                Style::new().fg(color),
+            ));
         }
-    } else if !app.queued_inputs.is_empty() {
-        format!(" {} queued ", app.queued_inputs.len())
-    } else {
-        String::new()
-    };
-    let state_color = if app.exit_confirmation_pending() {
-        COLOR_DANGER
-    } else {
-        COLOR_WARNING
-    };
-    if !state_title.is_empty() {
-        input_block = input_block.title(Span::styled(state_title, Style::new().fg(state_color)));
     }
     let input_inner = input_block.inner(input_area);
 
@@ -548,49 +498,164 @@ fn render_scrollbar(
     app.scrollbar_area = Some(column);
 }
 
-/// 将运行指示等尾部附加行绘制到消息区末尾。
+/// 底部输入框边框左上角展示的唯一活动状态。
 ///
-/// `trailing_height` 是这些行换行后的视觉行数，`total_height` 是消息区总行数；两者与
-/// `scroll` 一起决定附加行在视口中的位置，被裁掉的部分由 `Paragraph` 自身跳过。
-fn render_trailing_lines(
-    frame: &mut Frame,
-    area: Rect,
-    lines: &[Line<'static>],
-    trailing_height: u16,
-    total_height: u16,
-    scroll: u16,
-) {
-    if lines.is_empty() || trailing_height == 0 {
-        return;
-    }
-    let top = i32::from(area.y) + i32::from(total_height - trailing_height) - i32::from(scroll);
-    let bottom = top + i32::from(trailing_height);
-    let clipped_top = top.max(i32::from(area.y));
-    let clipped_bottom = bottom.min(i32::from(area.bottom()));
-    if clipped_top >= clipped_bottom {
-        return;
-    }
-    let skip = u16::try_from(clipped_top - top).unwrap_or(0);
-    frame.render_widget(
-        Paragraph::new(lines.to_vec())
-            .wrap(Wrap { trim: false })
-            .scroll((skip, 0)),
-        Rect {
-            x: area.x,
-            y: u16::try_from(clipped_top).unwrap_or(u16::MAX),
-            width: area.width,
-            height: u16::try_from(clipped_bottom - clipped_top).unwrap_or(0),
-        },
-    );
+/// 全局活动只在这一处汇总：主内容区不再输出任何状态文本，因此长任务滚出视口也不会
+/// 丢失状态，同屏也不会出现两条互相矛盾的进度说明。
+///
+/// 独占 `Input` 插件视图（例如权限审批卡片）会整块覆盖主输入框并自带标题，因此这里
+/// 不重复判断"等待授权"——宿主只认通用放置位，不解析具体插件语义。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PromptActivity {
+    /// 空输入上按过一次 Ctrl+C，等待第二次确认退出。
+    ExitConfirm,
+    /// 后台会话上下文重载（如 `/compact`）正在执行，携带调用方提供的标签。
+    Maintenance(String),
+    /// 模型处于思考阶段。
+    Thinking,
+    /// 正在执行某个工具，携带 `Read(src/main.rs)` 形式的标题。
+    Tool(String),
+    /// 运行中但既未思考也未执行工具，例如等待模型首包。
+    Working,
+    /// 空闲但仍有 Agent 就绪前排队的输入。
+    Queued(usize),
 }
 
-/// 将运行耗时格式化为 `47s` 或 `3m21s` 的紧凑显示。
-fn format_elapsed(elapsed: std::time::Duration) -> String {
-    let total = elapsed.as_secs();
-    if total < 60 {
-        format!("{total}s")
+/// 汇总当前唯一的全局活动状态；完全空闲时返回 `None`。
+///
+/// 优先级从高到低为：退出确认、后台维护、思考、工具执行、普通运行、排队。思考优先于
+/// 工具，是因为并行工具运行期间模型才是主要推进者；工具结束后消息状态立刻离开
+/// `ToolRunning`，不会残留旧标题。正文已经流式出现时不再额外显示状态，避免与正在
+/// 生成的回复争夺注意力。
+pub(crate) fn prompt_activity(app: &App) -> Option<PromptActivity> {
+    if app.exit_confirmation_pending() {
+        return Some(PromptActivity::ExitConfirm);
+    }
+    if let Some(label) = app.pending_reload.as_deref() {
+        return Some(PromptActivity::Maintenance(label.to_string()));
+    }
+    if app.running {
+        if app.model_is_thinking {
+            return Some(PromptActivity::Thinking);
+        }
+        if let Some(title) = running_tool_title(app) {
+            return Some(PromptActivity::Tool(title));
+        }
+        if app.streaming_message.is_none() {
+            return Some(PromptActivity::Working);
+        }
+    }
+    let queued = app.queued_inputs.len();
+    (queued > 0).then_some(PromptActivity::Queued(queued))
+}
+
+/// 返回最近一条运行中工具的可读标题，如 `Shell(cargo test)`。
+///
+/// 名称与目标沿用工具列表的取法，保证同一工具在边框标题和正文消息里显示一致；
+/// 缺少调用信息时退回消息文本，不让第三方工具变成空白标题。
+fn running_tool_title(app: &App) -> Option<String> {
+    let message = app
+        .messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message.kind, MsgKind::ToolRunning))?;
+    let Some(call) = message.tool_call.as_ref() else {
+        return Some(message.text.clone());
+    };
+    let name = tool_display_name(&call.name);
+    Some(match tool_target(call) {
+        Some(target) => format!("{name}({target})"),
+        None => name.to_string(),
+    })
+}
+
+/// 把输入框边框标题裁剪到可用宽度。
+///
+/// 标题本身够短且不含控制字符时直接复用原来的缓冲区，省掉每帧一次重新分配；否则交给
+/// `truncate_line` 按显示宽度裁剪——工具目标可能带换行或宽字符，靠它保证标题始终单行
+/// 且不撑坏边框。
+fn fit_title(title: String, max_width: usize) -> String {
+    let needs_fit = unicode_width::UnicodeWidthStr::width(title.as_str()) > max_width
+        || title.chars().any(char::is_control);
+    if needs_fit {
+        truncate_line(&title, max_width)
     } else {
-        format!("{}m{:02}s", total / 60, total % 60)
+        title
+    }
+}
+
+/// 构造输入框边框标题文本与颜色；空闲时返回 `None`，保持边框干净。
+///
+/// 文案统一使用英文并自带两侧空格，与边框之间留出距离。标题每帧都会重绘，因此所有
+/// 片段直接写进同一个缓冲区，不为耗时、排队数等临时片段分配 `String`。动画帧与耗时
+/// 都取自 App 现有字段：`spinner_frame` 由 UI tick 推进，`run_started_at` 是本次运行
+/// 的起点，这里不额外保存计时状态。
+fn prompt_title(app: &App) -> Option<(String, Color)> {
+    let activity = prompt_activity(app)?;
+    let mut title = String::with_capacity(64);
+    // 标题两侧各留一个空格，避免文字紧贴圆角。
+    title.push(' ');
+    let color = match activity {
+        PromptActivity::ExitConfirm => {
+            title.push_str("再按一次 Ctrl+C 退出");
+            COLOR_DANGER
+        }
+        PromptActivity::Maintenance(label) => {
+            push_activity_spark(&mut title, app);
+            title.push_str(&label);
+            COLOR_WARNING
+        }
+        PromptActivity::Thinking => {
+            push_activity_spark(&mut title, app);
+            title.push_str("Thinking");
+            push_run_suffix(&mut title, app);
+            COLOR_WARNING
+        }
+        PromptActivity::Tool(tool) => {
+            title.push_str("● ");
+            title.push_str(&tool);
+            push_run_suffix(&mut title, app);
+            COLOR_SUCCESS
+        }
+        PromptActivity::Working => {
+            push_activity_spark(&mut title, app);
+            title.push_str("Working");
+            push_run_suffix(&mut title, app);
+            COLOR_WARNING
+        }
+        PromptActivity::Queued(pending) => {
+            let _ = write!(title, "{pending} queued");
+            COLOR_WARNING
+        }
+    };
+    title.push(' ');
+    Some((title, color))
+}
+
+/// 追加当前动画帧的星号及其后的分隔空格。
+///
+/// 帧号由 UI tick 推进，两帧取一格，约 160ms 换一次，形成缓慢的呼吸感而不是快速闪烁。
+fn push_activity_spark(title: &mut String, app: &App) {
+    title.push_str(ACTIVITY_SPARK[(app.spinner_frame / 2) % ACTIVITY_SPARK.len()]);
+    title.push(' ');
+}
+
+/// 追加运行状态的「耗时 · 停止提示 · 排队数」尾巴。
+///
+/// 耗时按秒取整，超过一分钟折算成 `3m21s`；排队数只在运行中出现，因为新一轮要等当前
+/// 运行结束才会启动。
+fn push_run_suffix(title: &mut String, app: &App) {
+    if let Some(started) = app.run_started_at {
+        let total = started.elapsed().as_secs();
+        let _ = if total < 60 {
+            write!(title, " · {total}s")
+        } else {
+            write!(title, " · {}m{:02}s", total / 60, total % 60)
+        };
+    }
+    title.push_str(" · Esc to stop");
+    if !app.queued_inputs.is_empty() {
+        let _ = write!(title, " · {} queued", app.queued_inputs.len());
     }
 }
 

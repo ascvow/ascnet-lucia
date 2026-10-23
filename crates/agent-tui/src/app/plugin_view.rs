@@ -863,7 +863,6 @@ impl App {
                 self.main_event_snapshot = Some(MainEventSnapshot {
                     messages: self.messages.clone(),
                     streaming_message: self.streaming_message,
-                    model_is_thinking: self.model_is_thinking,
                 });
             }
         } else {

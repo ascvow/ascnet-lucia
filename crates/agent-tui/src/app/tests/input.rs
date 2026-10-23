@@ -391,12 +391,6 @@ fn visible_permission_input_freezes_main_event_timeline() {
     assert!(!frozen.contains("审批中正文"), "{frozen:?}");
     assert!(!frozen.contains("审批中思考"), "{frozen:?}");
     assert!(!frozen.contains("审批期间工具"), "{frozen:?}");
-    assert!(
-        app.main_event_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.model_is_thinking),
-        "审批期间必须保留冻结时的思考阶段"
-    );
     assert_eq!(app.messages.len(), 2, "后台事件仍应更新真实状态");
 
     apply_plugin_frames(
@@ -430,8 +424,9 @@ fn visible_permission_input_freezes_main_event_timeline() {
     assert!(resumed.contains("审批中正文"), "{resumed:?}");
     assert!(!resumed.contains("审批中思考"), "{resumed:?}");
     assert!(resumed.contains("审批期间工具"), "{resumed:?}");
-    assert!(resumed.contains("Working..."), "{resumed:?}");
-    assert!(!resumed.contains("Thinking..."), "{resumed:?}");
+    // 审批结束后仍在运行的工具接管边框标题，思考状态不再残留。
+    assert!(resumed.contains("Esctostop"), "{resumed:?}");
+    assert!(!resumed.contains("Thinking"), "{resumed:?}");
 }
 
 /// 审批视图隐藏后必须归还主输入焦点，避免下一次 Esc 被旧插件焦点吞掉。

@@ -1003,7 +1003,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::NativeCompactRequested) => {
-                start_session_context_reload(&mut app, "正在压缩当前上下文".into());
+                start_session_context_reload(&mut app, "Compacting context".into());
             }
             #[cfg(feature = "plugins")]
             Some(UiEvent::NativePluginsLoaded(result)) => {

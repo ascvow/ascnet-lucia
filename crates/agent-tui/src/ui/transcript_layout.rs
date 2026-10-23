@@ -198,14 +198,6 @@ fn measure(lines: &[Line<'static>], width: u16) -> u16 {
     .unwrap_or(u16::MAX)
 }
 
-/// 计算一组附加行换行后的视觉行数，供消息区之外的运行指示复用。
-pub(crate) fn measure_lines(lines: &[Line<'static>], width: u16) -> u16 {
-    if lines.is_empty() {
-        return 0;
-    }
-    measure(lines, width.max(1))
-}
-
 /// 把借用消息文本的行转换为可独立保存的行。
 fn to_owned_lines(lines: Vec<Line<'_>>) -> Vec<Line<'static>> {
     lines

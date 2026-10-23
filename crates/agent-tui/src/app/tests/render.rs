@@ -2,6 +2,8 @@
 
 use super::*;
 
+use crate::ui::chat::{prompt_activity, PromptActivity};
+
 /// 长篇混排回复之后的下一轮用户消息必须立即出现在自动跟随视口中。
 #[test]
 fn long_mixed_reply_keeps_next_user_message_visible() {
@@ -420,14 +422,278 @@ fn multiline_input_renders_six_visible_rows() {
     }
 }
 
-/// 验证运行状态使用 steering 文案，并在窄终端隐藏目录信息。
-#[test]
-fn render_adapts_to_running_state_and_narrow_width() {
-    let text = render_text(60, 16, true);
+/// 把终端缓冲区按行切分，保留框线字符以便定位输入盒边框。
+fn buffer_rows(terminal: &Terminal<TestBackend>, width: u16) -> Vec<String> {
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(usize::from(width))
+        .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect()
+}
 
-    assert!(text.contains("Working..."), "{text:?}");
+/// 返回输入盒上边框所在行；边框圆角是唯一可靠的定位锚点。
+fn prompt_border_row(rows: &[String]) -> usize {
+    rows.iter()
+        .position(|row| row.contains('╭'))
+        .expect("输入盒上边框应存在")
+}
+
+/// 验证运行状态（含耗时与停止提示）落在输入框边框上，日志区不再重复输出，
+/// 同时窄终端仍隐藏工作目录。
+#[test]
+fn running_activity_renders_on_prompt_border_only() {
+    let width = 60;
+    let backend = TestBackend::new(width, 16);
+    let mut terminal = Terminal::new(backend).expect("创建运行状态测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    app.messages.extend([
+        Msg::new(MsgKind::User, "测试消息"),
+        Msg::new(MsgKind::Assistant, "测试回复"),
+    ]);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染运行状态");
+    let rows = buffer_rows(&terminal, width);
+    let border_row = prompt_border_row(&rows);
+    let title = &rows[border_row];
+
+    assert!(title.contains("Working"), "{title:?}");
+    assert!(title.contains("Esc to stop"), "{title:?}");
+    // 标题与边框之间必须留出空隙，否则状态会贴着圆角。
+    assert!(title.contains(" Working"), "{title:?}");
+    assert!(
+        rows[..border_row]
+            .iter()
+            .all(|row| !row.contains("Working") && !row.contains("Esc to stop")),
+        "日志区不再输出活动状态：{rows:?}"
+    );
+    let text: String = rows
+        .concat()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
     assert!(text.contains("Steerthecurrentrun..."), "{text:?}");
     assert!(!text.contains("ascnet-lucia"), "{text:?}");
+}
+
+/// 输入框边框标题中某个片段的单元格颜色，用于验证语义配色。
+fn border_title_color(terminal: &Terminal<TestBackend>, rows: &[String], needle: &str) -> Color {
+    let row = prompt_border_row(rows);
+    let x = rows[row].find(needle).expect("标题片段应存在") as u16;
+    terminal.backend().buffer()[(x, row as u16)].fg
+}
+
+/// 后台上下文压缩不需要 Agent 运行中：标题显示调用方标签，且不出现运行态尾巴。
+#[test]
+fn maintenance_activity_shows_label_without_run_suffix() {
+    let width = 60;
+    let backend = TestBackend::new(width, 16);
+    let mut terminal = Terminal::new(backend).expect("创建维护状态测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.pending_reload = Some("Compacting context".into());
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染维护状态");
+    let rows = buffer_rows(&terminal, width);
+    let title = &rows[prompt_border_row(&rows)];
+
+    assert!(title.contains("Compacting context"), "{title:?}");
+    assert!(
+        !title.contains("Esc to stop"),
+        "压缩不是可中断的 Agent 运行：{title:?}"
+    );
+}
+
+/// 动画帧随 UI tick 推进：相邻两格必须给出不同的星号，否则标题是死画面。
+#[test]
+fn activity_spark_advances_with_tick() {
+    let width = 60;
+    let mut terminal = Terminal::new(TestBackend::new(width, 16)).expect("创建动画测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.mark_model_thinking();
+
+    let mut frames = Vec::new();
+    for frame in [0, 2] {
+        app.spinner_frame = frame;
+        terminal
+            .draw(|frame| render_root(frame, &mut app))
+            .expect("渲染动画帧");
+        let rows = buffer_rows(&terminal, width);
+        let title = rows[prompt_border_row(&rows)].clone();
+        assert!(title.contains("Thinking"), "{title:?}");
+        frames.push(title);
+    }
+
+    assert_ne!(frames[0], frames[1], "两帧标题应不同：{frames:?}");
+}
+
+/// 超过一分钟的耗时折算成 `1m05s`，避免标题随秒数无限变宽。
+#[test]
+fn activity_elapsed_switches_to_minutes() {
+    let width = 60;
+    let mut terminal = Terminal::new(TestBackend::new(width, 16)).expect("创建耗时测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.run_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(125));
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染耗时状态");
+    let rows = buffer_rows(&terminal, width);
+    let title = &rows[prompt_border_row(&rows)];
+
+    assert!(title.contains("2m05s"), "{title:?}");
+}
+
+/// 边框变窄时标题先按宽度截断，窄到只剩碎片则整体隐藏，始终保持纯框线或可读标题。
+#[test]
+fn activity_title_degrades_on_narrow_borders() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.run_started_at = Some(std::time::Instant::now());
+
+    // 中等宽度：标题放不下完整文案，按显示宽度截断并留下省略号。
+    let width = 24;
+    let mut terminal = Terminal::new(TestBackend::new(width, 16)).expect("创建窄边框测试终端");
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染窄边框");
+    let rows = buffer_rows(&terminal, width);
+    let title = &rows[prompt_border_row(&rows)];
+    assert!(title.contains('…'), "窄边框应截断而不是撑破边框：{title:?}");
+
+    // 极窄宽度：可用宽度不足一行有意义的文字，标题整体隐藏。
+    let width = 14;
+    let mut terminal = Terminal::new(TestBackend::new(width, 16)).expect("创建极窄边框测试终端");
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染极窄边框");
+    let rows = buffer_rows(&terminal, width);
+    let title = &rows[prompt_border_row(&rows)];
+    assert!(
+        title
+            .chars()
+            .all(|character| character == ' ' || "╭╮╰╯─│".contains(character)),
+        "过窄时不应绘制标题：{title:?}"
+    );
+}
+
+/// 工具执行状态用工具名与目标作为边框标题，并以成功色区分思考状态。
+#[test]
+fn tool_activity_renders_tool_title_on_prompt_border() {
+    let width = 72;
+    let backend = TestBackend::new(width, 16);
+    let mut terminal = Terminal::new(backend).expect("创建工具状态测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    app.messages.push(Msg::tool_started(ToolCall::new(
+        "call-running",
+        "shell",
+        json!({ "command": "cargo test" }),
+    )));
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染工具状态");
+    let rows = buffer_rows(&terminal, width);
+    let title = &rows[prompt_border_row(&rows)];
+
+    assert!(title.contains("Shell(cargo test)"), "{title:?}");
+    assert!(title.contains("Esc to stop"), "{title:?}");
+    assert!(!title.contains("Thinking"), "{title:?}");
+    assert_eq!(
+        border_title_color(&terminal, &rows, "Shell"),
+        crate::theme::COLOR_SUCCESS,
+        "工具执行状态应使用成功色：{title:?}"
+    );
+}
+
+/// 空闲时输入框上边框不带任何标题，保持干净。
+#[test]
+fn idle_prompt_border_has_no_title() {
+    let width = 60;
+    let backend = TestBackend::new(width, 16);
+    let mut terminal = Terminal::new(backend).expect("创建空闲状态测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages.extend([
+        Msg::new(MsgKind::User, "测试消息"),
+        Msg::new(MsgKind::Assistant, "测试回复"),
+    ]);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染空闲状态");
+    let rows = buffer_rows(&terminal, width);
+    let border_row = &rows[prompt_border_row(&rows)];
+
+    assert!(
+        border_row
+            .chars()
+            .all(|character| character == ' ' || "╭╮╰╯─│".contains(character)),
+        "空闲时边框只应有框线字符：{border_row:?}"
+    );
+}
+
+/// 活动状态只取唯一最高优先级的一项，供边框标题直接使用。
+#[test]
+fn prompt_activity_reports_single_highest_priority_state() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    assert_eq!(prompt_activity(&app), None, "空闲时没有活动状态");
+
+    app.queued_inputs.push_back("排队输入".into());
+    assert_eq!(prompt_activity(&app), Some(PromptActivity::Queued(1)));
+
+    app.running = true;
+    app.pending_reload = Some("Reloading context".into());
+    assert_eq!(
+        prompt_activity(&app),
+        Some(PromptActivity::Maintenance("Reloading context".into())),
+        "后台维护优先于运行状态"
+    );
+
+    app.pending_reload = None;
+    assert_eq!(prompt_activity(&app), Some(PromptActivity::Working));
+
+    app.messages.push(Msg::tool_started(ToolCall::new(
+        "call-running",
+        "shell",
+        json!({ "command": "cargo test" }),
+    )));
+    assert_eq!(
+        prompt_activity(&app),
+        Some(PromptActivity::Tool("Shell(cargo test)".into())),
+        "工具执行状态应展示工具名与目标"
+    );
+
+    app.mark_model_thinking();
+    assert_eq!(
+        prompt_activity(&app),
+        Some(PromptActivity::Thinking),
+        "思考阶段优先于工具执行"
+    );
+
+    app.last_exit_request_at = Some(std::time::Instant::now());
+    assert_eq!(
+        prompt_activity(&app),
+        Some(PromptActivity::ExitConfirm),
+        "退出确认优先于一切活动状态"
+    );
 }
 
 /// 思考阶段只显示状态文案，不渲染服务商返回的推理摘要文本。
@@ -445,17 +711,21 @@ fn render_hides_reasoning_text_and_shows_thinking_status() {
     terminal
         .draw(|frame| render_root(frame, &mut app))
         .expect("渲染思考阶段");
-    let text = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
-
-    assert!(text.contains("Thinking..."), "{text:?}");
+    let rows = buffer_rows(&terminal, 80);
+    let border_row = prompt_border_row(&rows);
+    let title = &rows[border_row];
+    assert!(title.contains("Thinking"), "{title:?}");
+    assert!(title.contains("Esc to stop"), "{title:?}");
+    assert!(!title.contains("Working"), "{title:?}");
+    // 推理摘要文本不得进入任何一行，包括状态行与正文。
+    let text = rows.concat();
     assert!(!text.contains("thinking("), "{text:?}");
-    assert!(!text.contains("Working..."), "{text:?}");
+    assert!(
+        rows[..border_row]
+            .iter()
+            .all(|row| !row.contains("Thinking")),
+        "思考状态只应出现在输入框边框：{rows:?}"
+    );
 }
 
 /// 验证工具结果默认收起，展开后展示目标内容且过长行按显示宽度截断。
@@ -757,7 +1027,6 @@ fn approval_snapshot_disables_tool_message_clicks() {
     app.main_event_snapshot = Some(crate::app::MainEventSnapshot {
         messages: app.messages.clone(),
         streaming_message: None,
-        model_is_thinking: false,
     });
 
     for kind in [
