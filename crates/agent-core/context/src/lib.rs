@@ -239,10 +239,17 @@ impl NativeContextLoader {
                 && cache.system == request.system
                 && request.messages.len() >= cache.source_message_count
         });
+        // 缓存命中判定只覆盖已压缩前缀。需要为新缓存计算全量摘要时从同一哈希状态
+        // 继续追加剩余消息，避免把整段历史重复扫描两遍。
+        let mut prefix_digest = Sha256::new();
+        let prefix_len = cache_candidate.map(|cache| cache.source_message_count);
         let cache_hit = match cache_candidate {
             Some(cache) => {
-                message_digest(&request.messages[..cache.source_message_count])?
-                    == cache.source_messages_digest
+                hash_messages_into(
+                    &mut prefix_digest,
+                    &request.messages[..cache.source_message_count],
+                )?;
+                <[u8; 32]>::from(prefix_digest.clone().finalize()) == cache.source_messages_digest
             }
             None => false,
         };
@@ -254,7 +261,13 @@ impl NativeContextLoader {
             || estimate_context_tokens(request.system.as_deref(), &request.messages)
                 >= compaction_budget(self.context_window, self.max_summary_tokens as usize).micro
         {
-            Some(message_digest(&request.messages)?)
+            match prefix_len {
+                Some(prefix_len) => {
+                    hash_messages_into(&mut prefix_digest, &request.messages[prefix_len..])?;
+                    Some(<[u8; 32]>::from(prefix_digest.finalize()))
+                }
+                None => Some(message_digest(&request.messages)?),
+            }
         } else {
             None
         };
@@ -675,14 +688,20 @@ impl Write for DigestWriter<'_> {
     }
 }
 
-/// 计算消息序列的稳定摘要；零字节分隔符用于保留消息边界。
-fn message_digest(messages: &[Value]) -> Result<[u8; 32]> {
-    let mut digest = Sha256::new();
+/// 把一段消息追加进进行中的 SHA-256 状态；零字节分隔符用于保留消息边界。
+fn hash_messages_into(digest: &mut Sha256, messages: &[Value]) -> Result<()> {
     for message in messages {
-        serde_json::to_writer(DigestWriter(&mut digest), message)
+        serde_json::to_writer(DigestWriter(digest), message)
             .context("计算原生上下文消息摘要失败")?;
         digest.update([0]);
     }
+    Ok(())
+}
+
+/// 计算消息序列的稳定摘要；零字节分隔符用于保留消息边界。
+fn message_digest(messages: &[Value]) -> Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    hash_messages_into(&mut digest, messages)?;
     Ok(digest.finalize().into())
 }
 
@@ -1185,6 +1204,31 @@ mod tests {
         compress_context(request, manual, test_budget(), &TestSummarizer, 0)
             .await
             .expect("测试压缩应成功")
+    }
+
+    /// 分段续算的摘要必须与一次性计算整段历史完全一致。
+    ///
+    /// 缓存命中判定先对前缀取摘要，再决定是否续算全量摘要；两段拼接的结果必须与
+    /// `message_digest` 逐位相同，否则缓存会在命中时被误判为失效。
+    #[test]
+    fn incremental_digest_matches_single_pass() {
+        let messages = vec![
+            text_message("user", "第一段"),
+            text_message("assistant", "mixed 中文 ascii"),
+            json!({ "role": "tool", "content": "x".repeat(1024) }),
+            text_message("user", "queued"),
+        ];
+        let expected = message_digest(&messages).expect("整段摘要应成功");
+        for split in 0..=messages.len() {
+            let mut hasher = Sha256::new();
+            hash_messages_into(&mut hasher, &messages[..split]).expect("前缀摘要应成功");
+            hash_messages_into(&mut hasher, &messages[split..]).expect("后缀摘要应成功");
+            assert_eq!(
+                <[u8; 32]>::from(hasher.finalize()),
+                expected,
+                "切分位置 {split} 的续算摘要与整段摘要不一致"
+            );
+        }
     }
 
     /// 不分配字符串的字节统计必须与先 `to_string` 再折算的结果逐位一致。
