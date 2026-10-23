@@ -22,6 +22,8 @@ const PLAN_SCHEMA_VERSION: u32 = 1;
 const PLAN_SHELF_CONTENT_LINES: usize = 5;
 /// 紧凑计划架的总布局高度，包含一行宿主顶部分隔线。
 const PLAN_SHELF_HEIGHT: u16 = 6;
+/// 值得长期跟踪的计划最少步骤数；少于该数量的任务直接执行即可。
+const MIN_TRACKED_STEPS: usize = 3;
 
 /// 单个计划步骤的执行状态。
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -111,6 +113,7 @@ impl PlanState {
             plan,
         };
         state.validate()?;
+        state.ensure_worth_tracking()?;
         Ok(state)
     }
 
@@ -137,6 +140,21 @@ impl PlanState {
             return Err(anyhow!("计划最多只能有一个 in_progress 步骤"));
         }
         Ok(())
+    }
+
+    /// 校验计划是否值得长期跟踪，拒绝把单点任务包装成计划。
+    ///
+    /// 这是**使用策略**而不是状态不变量：激活恢复和运行结束收敛都不调用它，
+    /// 因此升级前保存的小计划仍然可读、可完成，只是不再接受新的小计划。
+    /// 空计划是显式清空，始终放行。
+    fn ensure_worth_tracking(&self) -> Result<()> {
+        if self.plan.is_empty() || self.plan.len() >= MIN_TRACKED_STEPS {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "计划只有 {} 个步骤，不足以构成需要跟踪的任务。请直接完成该任务，不要为单点或窄范围工作创建计划；确实需要跟踪时，至少拆出 {MIN_TRACKED_STEPS} 个可独立验证的步骤，并始终提交包含已完成项在内的完整计划。",
+            self.plan.len()
+        ))
     }
 }
 
@@ -420,10 +438,17 @@ impl PlanPlugin {
 }
 
 /// 构建整体替换当前计划的工具定义。
+///
+/// 描述是使用时机的主要约束：计划只服务困难或较大的任务，普通单点任务直接执行。
+/// 这里刻意写出可判断的准入条件与反例，避免模型仅因为工具存在就为每个任务开计划。
+/// 最小步骤数直接取自 [`MIN_TRACKED_STEPS`]，描述与准入策略不会各自漂移。
 fn update_plan_tool() -> ToolSpec {
+    let description = format!(
+        "仅为困难或较大的任务创建或更新计划；默认不要创建。满足以下任一条件才使用：改动跨多个模块或多个文件且顺序有依赖；任务能拆成 {MIN_TRACKED_STEPS} 个以上可独立验证的阶段；预计多轮长时执行，可能中途暂停或需要持续向用户汇报进度；用户明确要求维护计划。以下情况不要创建计划：直接问答与代码解释、代码阅读与初步探索、单文件小改动、单条命令或单次测试、格式化与重命名、窄范围修复，以及一次连续执行就能完成的任务。计划至少 {MIN_TRACKED_STEPS} 个步骤，每步必须是独立可验证的成果，不要把同一个动作拆成多步凑数；使用后及时把完成项标记为 completed，始终提交包含已完成项的完整计划，且最多一个步骤为 in_progress。"
+    );
     ToolSpec::new(
         UPDATE_PLAN_TOOL,
-        "创建或更新当前任务计划。用于复杂项目、跨模块改动、需要多个可独立验证阶段的任务，或用户明确要求持续展示进度的场景。直接问答、初步探索、窄范围修改，以及一次连续执行即可完成的任务通常不需要计划。使用后应及时更新 completed 状态；始终提交完整计划，且最多一个步骤为 in_progress。",
+        description,
         json!({
             "type": "object",
             "properties": {
@@ -433,7 +458,7 @@ fn update_plan_tool() -> ToolSpec {
                 },
                 "plan": {
                     "type": "array",
-                    "description": "按执行顺序排列的完整计划；空数组用于清空计划。",
+                    "description": format!("按执行顺序排列的完整计划，至少 {MIN_TRACKED_STEPS} 步；空数组用于清空计划。"),
                     "items": {
                         "type": "object",
                         "properties": {
@@ -541,17 +566,101 @@ mod tests {
             .all(|tool| tool.permission_scope == ToolPermissionScope::Control));
     }
 
-    /// 工具描述必须把计划限定为复杂或真正需要持续追踪的多阶段任务。
+    /// 工具描述必须把计划限定为困难或较大的任务，并给出可判断的反例与最小步骤数。
     #[test]
     fn update_plan_description_requires_real_task_complexity() {
         let description = update_plan_tool().description;
 
-        assert!(description.contains("复杂项目"));
-        assert!(description.contains("跨模块改动"));
-        assert!(description.contains("多个可独立验证阶段"));
-        assert!(description.contains("用户明确要求持续展示进度"));
+        assert!(description.contains("默认不要创建"));
+        assert!(description.contains("跨多个模块或多个文件"));
+        assert!(description.contains("3 个以上可独立验证的阶段"));
+        assert!(description.contains("用户明确要求维护计划"));
         assert!(description.contains("直接问答"));
-        assert!(description.contains("一次连续执行即可完成"));
+        assert!(description.contains("单文件小改动"));
+        assert!(description.contains("一次连续执行就能完成"));
+        assert!(description.contains("计划至少 3 个步骤"));
+        assert!(description.contains("不要把同一个动作拆成多步凑数"));
+    }
+
+    /// 不足三步的计划会被拒绝，并明确提示直接执行任务。
+    #[test]
+    fn update_rejects_plans_too_small_to_track() {
+        for plan in [
+            vec![item("修改一个常量", PlanStatus::InProgress)],
+            vec![
+                item("修改实现", PlanStatus::InProgress),
+                item("运行测试", PlanStatus::Pending),
+            ],
+        ] {
+            let error = PlanState::from_update(
+                UpdatePlanArgs {
+                    explanation: None,
+                    plan,
+                },
+                1,
+            )
+            .expect_err("少于三步的计划必须被拒绝");
+            assert!(error.to_string().contains("不足以构成需要跟踪的任务"));
+            assert!(error.to_string().contains("至少拆出 3 个"));
+        }
+    }
+
+    /// 三步及以上的计划仍可正常创建，避免准入策略误伤真实的大型任务。
+    #[test]
+    fn update_accepts_plan_with_enough_steps() {
+        let state = PlanState::from_update(
+            UpdatePlanArgs {
+                explanation: None,
+                plan: vec![
+                    item("定位跨模块调用链", PlanStatus::InProgress),
+                    item("修改两层接口", PlanStatus::Pending),
+                    item("补集成测试", PlanStatus::Pending),
+                ],
+            },
+            1,
+        )
+        .expect("三步计划应通过校验");
+
+        assert_eq!(state.plan.len(), MIN_TRACKED_STEPS);
+    }
+
+    /// 准入策略只是使用策略：升级前保存的小计划仍可恢复、读取并完成。
+    #[test]
+    fn small_legacy_plan_remains_readable() {
+        let legacy = PlanState {
+            revision: 4,
+            plan: vec![item("检查实现", PlanStatus::InProgress)],
+            ..PlanState::default()
+        };
+
+        legacy.validate().expect("旧的小计划仍是合法状态");
+        assert!(legacy.ensure_worth_tracking().is_err());
+    }
+
+    /// 工具调用被准入策略拒绝时不写入 Host 状态，也不覆盖已有计划。
+    #[test]
+    fn rejected_update_keeps_existing_plan() {
+        let mut plugin = PlanPlugin::default();
+        plugin.state.plan = vec![
+            item("定位问题", PlanStatus::Completed),
+            item("修复实现", PlanStatus::InProgress),
+            item("补充测试", PlanStatus::Pending),
+        ];
+        let before = plugin.state.clone();
+
+        let result = plugin
+            .call_tool_with_host(
+                &NoopHostApi,
+                ToolCall::new(
+                    "call-small-plan",
+                    UPDATE_PLAN_TOOL,
+                    json!({"plan": [{"step": "只做一件小事", "status": "in_progress"}]}),
+                ),
+            )
+            .expect("准入策略应返回工具结果而不是插件错误");
+
+        assert!(result.is_error, "小计划必须以工具错误形式返回");
+        assert_eq!(plugin.state, before, "被拒绝的更新不能改变当前计划");
     }
 
     /// 创建测试计划项，减少状态校验用例中的重复结构。
@@ -568,7 +677,11 @@ mod tests {
         let state = PlanState::from_update(
             UpdatePlanArgs {
                 explanation: Some("  调整执行顺序  ".into()),
-                plan: vec![item("  定位实现  ", PlanStatus::InProgress)],
+                plan: vec![
+                    item("  定位实现  ", PlanStatus::InProgress),
+                    item("修改接口", PlanStatus::Pending),
+                    item("补回归测试", PlanStatus::Pending),
+                ],
             },
             3,
         )
@@ -588,6 +701,7 @@ mod tests {
                 plan: vec![
                     item("实现功能", PlanStatus::InProgress),
                     item("运行测试", PlanStatus::InProgress),
+                    item("更新文档", PlanStatus::Pending),
                 ],
             },
             1,
