@@ -881,6 +881,16 @@ fn markdown_code_blocks_are_visually_separated() {
         .all(|span| span.style.bg.is_none()));
 }
 
+/// 极窄终端下 Markdown 渲染不得 panic：列宽与折行宽度都会被压到下界。
+#[test]
+fn markdown_survives_very_narrow_width() {
+    let body = "## 标题\n\n- 列表项内容很长需要折行\n\n| 甲 | 乙 |\n|---|---|\n| 一 | 二 |\n\n```rust\nfn main() {}\n```\n\n> 引用";
+    for width in [6u16, 10, 16, 24] {
+        let lines = markdown_lines(body, true, width);
+        assert!(!lines.is_empty(), "width={width}");
+    }
+}
+
 /// 流式光标跟在代码块最后一行之后，不会被整行底色挤到下一行行首。
 #[test]
 fn streaming_cursor_stays_on_last_code_line() {
