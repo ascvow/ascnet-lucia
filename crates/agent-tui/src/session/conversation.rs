@@ -445,9 +445,10 @@ fn tool_toggle_hint(expanded: bool, width: u16) -> Line<'static> {
     } else {
         "Click to expand"
     };
-    let available = usize::from(width).saturating_sub(4).max(1);
+    // 与工具正文同列（两列缩进），提示不额外右移，窄终端里也不会先被截断。
+    let available = usize::from(width).saturating_sub(2).max(1);
     Line::from(vec![
-        Span::raw("    "),
+        Span::raw("  "),
         Span::styled(truncate_line(text, available), Style::new().fg(COLOR_MUTED)),
     ])
 }

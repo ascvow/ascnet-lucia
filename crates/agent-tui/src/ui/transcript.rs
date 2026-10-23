@@ -526,7 +526,10 @@ pub(crate) fn output_preview_lines(text: &str, max_lines: usize) -> Vec<PreviewL
 /// 行号列宽度：右对齐到该宽度，与 Claude Code 的预览观感一致。
 const GUTTER_WIDTH: usize = 4;
 /// 预览块相对消息左边缘的缩进。
-const PREVIEW_INDENT: &str = "    ";
+///
+/// 正文与标题行里 `● ` 之后的工具名同列：缩进再宽会让长代码在窄终端里提前折行，而
+/// 这块内容本就是"背景信息"，不值得占掉代码的列数。
+const PREVIEW_INDENT: &str = "  ";
 /// 行号列与正文之间的标记列宽：一列标记左侧留白加一列标记本身。
 ///
 /// 留白的作用是让 `+`/`-` 不直接顶住行号列：标记贴着数字时，整行色块看起来像从行号里
@@ -534,6 +537,19 @@ const PREVIEW_INDENT: &str = "    ";
 const DIFF_MARKER_PAD: usize = 1;
 /// 标记列总宽（留白 + 标记），用于把正文宽度与行号列一并扣掉。
 const MARKER_COLUMNS: usize = DIFF_MARKER_PAD + 1;
+
+/// 把预览正文裁到 `width` 列，截断时把省略号也算进可用宽度。
+///
+/// 共享的 [`truncate_line`] 在用满 `width` 之后才补省略号，结果比 `width` 多一列；其他
+/// 调用方都预留了余量，预览行却是逐列铺满的，多出的一列会被 `Paragraph` 折到下一行，
+/// 一行日志变成两行。这里只在真的放不下时把省略号计进宽度。
+fn truncate_body(text: &str, width: usize) -> String {
+    let body = truncate_line(text, width);
+    if unicode_width::UnicodeWidthStr::width(body.as_str()) <= width {
+        return body;
+    }
+    truncate_line(text, width.saturating_sub(1))
+}
 
 /// 渲染行号列。
 fn gutter(number: Option<usize>, color: Color) -> Span<'static> {
@@ -592,9 +608,18 @@ pub(crate) fn render_preview(
         )
     });
     let gutter_width = if show_gutter { GUTTER_WIDTH } else { 0 };
+    // 标记列只在真的渲染标记时占位：diff 块留出「留白 + 标记」两列，只有行号的块留一列
+    // 与增删行对齐，纯文本预览（shell 输出）不为它留空，把整段宽度让给正文。
+    let marker_width = if diff_block {
+        MARKER_COLUMNS
+    } else if show_gutter {
+        1
+    } else {
+        0
+    };
     // 缩进、行号列与标记列之后剩余的正文宽度。
     let body_width = total_width
-        .saturating_sub(PREVIEW_INDENT.len() + gutter_width + MARKER_COLUMNS)
+        .saturating_sub(PREVIEW_INDENT.len() + gutter_width + marker_width)
         .max(1);
 
     lines
@@ -624,7 +649,7 @@ pub(crate) fn render_preview(
                 } else if show_gutter {
                     spans.push(Span::raw(" "));
                 }
-                let body = truncate_line(text, body_width);
+                let body = truncate_body(text, body_width);
                 if error {
                     spans.push(Span::styled(body, Style::new().fg(COLOR_DANGER)));
                 } else {
@@ -688,7 +713,7 @@ fn diff_changed_row(
     }
     spans.push(Span::styled(" ".repeat(DIFF_MARKER_PAD), row_style));
     spans.push(Span::styled(marker.to_string(), row_style.fg(palette.fg)));
-    let body = truncate_line(text, body_width);
+    let body = truncate_body(text, body_width);
     // 增删行正文与标记使用一致的红绿前景，避免语法配色掩盖修改方向。
     let body_color = if error { COLOR_DANGER } else { palette.fg };
     spans.push(Span::styled(body, row_style.fg(body_color)));
@@ -719,7 +744,7 @@ fn diff_structure_row(
     }
     // 结构文本落在标记列上，与原样补丁的列位置一致。
     spans.push(Span::raw(" ".repeat(DIFF_MARKER_PAD)));
-    spans.push(Span::styled(truncate_line(text, body_width), style));
+    spans.push(Span::styled(truncate_body(text, body_width), style));
     Line::from(spans)
 }
 
@@ -892,6 +917,60 @@ mod tests {
             Some("新增 1 行，删除 1 行")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 纯文本预览（shell 输出）不为标记列留空：省下的列全部让给正文。
+    ///
+    /// 只有 diff 块才会真的画出 `+`/`-` 与结构行；无行号、非 diff 的正文如果仍按标记列
+    /// 扣宽，长命令会在还能放下的时候被提前截断。
+    #[test]
+    fn plain_preview_uses_the_full_body_width() {
+        let lines = vec![PreviewLine::Context {
+            number: None,
+            text: "x".repeat(60),
+        }];
+
+        let rendered = render_preview(&lines, 40, CodeLanguage::Plain, false);
+
+        // 40 列减去两列缩进，正文吃满剩余 38 列：整行恰好铺满 40 列，末列是省略号。
+        let text = text_of(&rendered[0]);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(text.as_str()), 40);
+        assert!(text.starts_with("  xxx"), "{text:?}");
+        assert!(text.ends_with('…'), "{text:?}");
+    }
+
+    /// 只有行号的块只留一列标记位，而不是 diff 块的「留白 + 标记」两列。
+    #[test]
+    fn numbered_preview_reserves_a_single_marker_column() {
+        let lines = vec![PreviewLine::Context {
+            number: Some(7),
+            text: "x".repeat(60),
+        }];
+
+        let rendered = render_preview(&lines, 40, CodeLanguage::Plain, false);
+
+        // 40 列减去缩进 2、行号列 4、标记位 1，正文剩 33 列：整行恰好铺满 40 列。
+        let text = text_of(&rendered[0]);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(text.as_str()), 40);
+        assert!(
+            text.starts_with(&format!("{PREVIEW_INDENT}   7 ")),
+            "{text:?}"
+        );
+        assert!(text.ends_with('…'), "{text:?}");
+    }
+
+    /// 工具块正文与标题行里的工具名同列：缩进只占两列，宽出的空间留给代码与日志。
+    #[test]
+    fn tool_preview_is_indented_two_columns() {
+        assert_eq!(PREVIEW_INDENT, "  ");
+        let lines = vec![PreviewLine::Context {
+            number: None,
+            text: "cargo build".into(),
+        }];
+
+        let rendered = render_preview(&lines, 40, CodeLanguage::Plain, false);
+
+        assert_eq!(text_of(&rendered[0]), "  cargo build");
     }
 
     /// 统一 diff 必须被识别为增删行，而不是普通正文。

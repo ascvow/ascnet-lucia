@@ -758,9 +758,9 @@ fn activity_title_degrades_on_narrow_borders() {
     );
 }
 
-/// 工具执行状态用工具名与目标作为边框标题，并以成功色区分思考状态。
+/// 工具执行期间底栏只显示通用运行状态，不暴露工具名、命令或单次调用计时。
 #[test]
-fn tool_activity_renders_tool_title_on_prompt_border() {
+fn tool_activity_falls_back_to_generic_working_title() {
     let width = 72;
     let backend = TestBackend::new(width, 16);
     let mut terminal = Terminal::new(backend).expect("创建工具状态测试终端");
@@ -780,14 +780,20 @@ fn tool_activity_renders_tool_title_on_prompt_border() {
     let rows = buffer_rows(&terminal, width);
     let title = &rows[prompt_border_row(&rows)];
 
-    assert!(title.contains("Shell(cargo test)"), "{title:?}");
+    assert!(title.contains("Working"), "{title:?}");
     assert!(title.contains("Esc to stop"), "{title:?}");
+    // 工具名、命令与思考文案都不该出现在底栏。
+    assert!(!title.contains("Shell"), "{title:?}");
+    assert!(!title.contains("cargo test"), "{title:?}");
     assert!(!title.contains("Thinking"), "{title:?}");
     assert_eq!(
-        border_title_color(&terminal, &rows, "Shell"),
-        crate::theme::COLOR_SUCCESS,
-        "工具执行状态应使用成功色：{title:?}"
+        border_title_color(&terminal, &rows, "Working"),
+        crate::theme::COLOR_WARNING,
+        "通用运行状态使用警示色：{title:?}"
     );
+    // 工具结果仍然落在主内容区，只是不再进底栏。
+    let transcript = rows[..prompt_border_row(&rows)].concat();
+    assert!(transcript.contains("Shell(cargo test)"), "{transcript:?}");
 }
 
 /// 空闲时输入框上边框不带任何标题，保持干净。
@@ -845,8 +851,16 @@ fn prompt_activity_reports_single_highest_priority_state() {
     )));
     assert_eq!(
         prompt_activity(&app),
-        Some(PromptActivity::Tool("Shell(cargo test)".into())),
-        "工具执行状态应展示工具名与目标"
+        Some(PromptActivity::Working),
+        "工具执行折叠为通用运行状态，不携带工具名"
+    );
+
+    // 正文已经半截流式落地时，工具仍在跑也继续显示通用状态：活动可见性优先。
+    app.start_model_response();
+    assert_eq!(
+        prompt_activity(&app),
+        Some(PromptActivity::Working),
+        "流式正文与工具并行时仍显示运行状态"
     );
 
     app.mark_model_thinking();
@@ -1614,6 +1628,54 @@ fn context_status_uses_configured_window_thresholds() {
     assert_eq!(
         crate::ui::chat::context_status(5_300, None),
         ("5.3k".into(), COLOR_MUTED)
+    );
+}
+
+/// 工具正文紧贴标题下的工具名：内容区只缩进两列，代码与日志因此多出可用宽度。
+///
+/// 工具块是"背景信息"，缩进再宽会直接吃掉长命令行与代码行的可见列数；这里锁定
+/// 「正文起始列 == 标题行工具名起始列」，缩进一旦被改回去就会失败。
+#[test]
+fn tool_output_is_indented_under_its_title() {
+    let width = 80;
+    let backend = TestBackend::new(width, 20);
+    let mut terminal = Terminal::new(backend).expect("创建工具缩进测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut message = Msg::tool_started(ToolCall::new(
+        "call-indent",
+        "shell",
+        json!({"command": "cargo build"}),
+    ));
+    message.append_tool_output("cargo build --release\n");
+    app.messages.push(message);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染工具缩进");
+    let rows = buffer_rows(&terminal, width);
+    let title = rows
+        .iter()
+        .position(|row| row.contains("Shell(cargo build)"))
+        .expect("应展示工具标题");
+    let output = rows
+        .iter()
+        .position(|row| row.contains("cargo build --release"))
+        .expect("应展示工具输出");
+
+    // 主内容区左侧留白两列，标题的 `● ` 之后就是工具名；正文与之同列。
+    // `find` 给的是字节偏移，`●` 占 3 字节，因此按显示宽度重新算列号。
+    let column = |row: &str, needle: &str| {
+        let prefix = &row[..row.find(needle).expect("应包含目标文本")];
+        unicode_width::UnicodeWidthStr::width(prefix)
+    };
+    let title_column = column(&rows[title], "Shell(cargo build)");
+    let output_column = column(&rows[output], "cargo build --release");
+    assert_eq!(title_column, 4, "工具名应从第四列开始：{:?}", rows[title]);
+    assert_eq!(
+        output_column, title_column,
+        "工具正文应与工具名同列：{:?} / {:?}",
+        rows[title], rows[output]
     );
 }
 

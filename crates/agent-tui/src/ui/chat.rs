@@ -124,6 +124,10 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         app.last_max_scroll = 0;
         app.last_viewport = chat_area.height;
         app.tool_message_hit_regions.clear();
+        // 首屏没有可滚动内容：选区行号相对消息区顶部，提取时再映射回屏幕坐标。
+        app.content_area = Some(chat_area);
+        app.content_scroll = 0;
+        app.content_rows = 0;
         render_hero(frame, chat_area, &cwd_display);
     } else {
         let inner_width = chat_area.width.max(1);
@@ -141,6 +145,11 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             app.scroll = None;
         }
         let scroll = app.scroll.unwrap_or(max_scroll);
+        // 记录内容区几何：鼠标选区用"内容行号"定位，需要在屏幕行与内容行之间换算，
+        // 同时保证滚出屏幕的历史也能被选中并复制。
+        app.content_area = Some(chat_area);
+        app.content_scroll = scroll;
+        app.content_rows = total_height;
 
         // 只渲染与视口相交的消息，窗口之外的历史不构建任何行。
         app.transcript_layout.render_visible(
