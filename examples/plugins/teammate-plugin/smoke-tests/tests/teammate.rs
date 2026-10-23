@@ -320,6 +320,131 @@ async fn component_runs_mailbox_dispatch_flow() {
         .collect();
     assert!(first_text.contains("检查首轮实现"), "{first_text}");
 
+    // 高视口没有溢出时渲染会把滚动位置收敛回底部，重新按 home 回到最早内容。
+    PluginHost::on_ui_input(
+        &host,
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-member-session".into(),
+            instance_id: Some(member_id.into()),
+            event: UiInputEvent::Key {
+                code: "home".into(),
+                modifiers: Vec::new(),
+            },
+        },
+    )
+    .await
+    .expect("成员会话应可再次回到最早内容");
+
+    // 缩小视口制造确定的溢出，验证真实 Host 会把滚轮事件送到成员会话并改变回看位置。
+    let compact = PluginHost::render_ui(
+        &host,
+        &UiRenderRequest {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-member-session".into(),
+            instance_id: Some(member_id.into()),
+            width: 80,
+            height: 12,
+            focused: true,
+            frame: 4,
+        },
+    )
+    .await
+    .expect("窄视口成员会话渲染不应失败")
+    .expect("窄视口成员会话应返回可见帧");
+    let compact_text: String = compact
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .map(|span| span.text.as_str())
+        .collect();
+    assert!(
+        compact.lines.iter().any(|line| line
+            .spans
+            .last()
+            .is_some_and(|span| matches!(span.text.as_str(), "│" | "┃"))),
+        "溢出成员会话必须显示右侧滚动条\n{compact_text}"
+    );
+
+    PluginHost::on_ui_input(
+        &host,
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-member-session".into(),
+            instance_id: Some(member_id.into()),
+            event: UiInputEvent::Mouse {
+                kind: "scroll_down".into(),
+                x: 10,
+                y: 10,
+            },
+        },
+    )
+    .await
+    .expect("成员会话滚轮向下滚动不应失败");
+    let scrolled = PluginHost::render_ui(
+        &host,
+        &UiRenderRequest {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-member-session".into(),
+            instance_id: Some(member_id.into()),
+            width: 80,
+            height: 12,
+            focused: true,
+            frame: 5,
+        },
+    )
+    .await
+    .expect("滚轮滚动后成员会话渲染不应失败")
+    .expect("滚轮滚动后成员会话应返回可见帧");
+    let scrolled_text: String = scrolled
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .map(|span| span.text.as_str())
+        .collect();
+    assert_ne!(
+        scrolled_text, compact_text,
+        "滚轮必须改变成员会话的回看位置"
+    );
+
+    PluginHost::on_ui_input(
+        &host,
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-member-session".into(),
+            instance_id: Some(member_id.into()),
+            event: UiInputEvent::Mouse {
+                kind: "scroll_up".into(),
+                x: 10,
+                y: 10,
+            },
+        },
+    )
+    .await
+    .expect("成员会话滚轮向上滚动不应失败");
+    let restored = PluginHost::render_ui(
+        &host,
+        &UiRenderRequest {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-member-session".into(),
+            instance_id: Some(member_id.into()),
+            width: 80,
+            height: 12,
+            focused: true,
+            frame: 6,
+        },
+    )
+    .await
+    .expect("滚轮回滚后成员会话渲染不应失败")
+    .expect("滚轮回滚后成员会话应返回可见帧");
+    let restored_text: String = restored
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .map(|span| span.text.as_str())
+        .collect();
+    assert_eq!(restored_text, compact_text, "滚轮上下滚动应回到原位置");
+
     for code in ["r", "e", "v", "i", "e", "w"] {
         PluginHost::on_ui_input(
             &host,

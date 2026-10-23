@@ -1016,6 +1016,37 @@ impl TeammatePlugin {
         session.cursor_position(request.width, request.height)
     }
 
+    /// 把成员会话的键盘或滚轮输入交给共享 Agent 视图，并在续跑产生新句柄时更新成员映射。
+    fn handle_member_session_input(
+        &mut self,
+        host: &dyn PluginHostApi,
+        instance_id: Option<&str>,
+        event: UiInputEvent,
+    ) {
+        let Some(instance_id) = instance_id else {
+            return;
+        };
+        let Some(member_id) = self
+            .member_sessions
+            .keys()
+            .find(|member_id| member_id.as_str() == instance_id)
+            .cloned()
+        else {
+            return;
+        };
+        let continued = self
+            .member_sessions
+            .get_mut(&member_id)
+            .and_then(|session| session.handle_input(host, &event));
+        if let Some(handle) = continued {
+            let owner = self.plugin_id.clone().unwrap_or_default();
+            if let Ok(member) = self.state.member_mut(&owner, &member_id) {
+                member.current = handle;
+                member.status = AgentStatus::Queued;
+            }
+        }
+    }
+
     /// 刷新当前工具 owner 名下全部成员的 Runtime 状态缓存。
     fn refresh_ui_statuses(&mut self, host: &dyn PluginHostApi) {
         let owner = self.plugin_id.clone().unwrap_or_default();
@@ -1276,29 +1307,18 @@ impl AgentPlugin for TeammatePlugin {
                 }
             }
             UiInputEvent::Key { code, modifiers } if input.view_id == TEAM_SESSION_VIEW => {
-                let Some(instance_id) = input.instance_id.as_deref() else {
-                    return;
-                };
-                let Some(member_id) = self
-                    .member_sessions
-                    .keys()
-                    .find(|member_id| member_id.as_str() == instance_id)
-                    .cloned()
-                else {
-                    return;
-                };
-                let event = UiInputEvent::Key { code, modifiers };
-                let continued = self
-                    .member_sessions
-                    .get_mut(&member_id)
-                    .and_then(|session| session.handle_input(host, &event));
-                if let Some(handle) = continued {
-                    let owner = self.plugin_id.clone().unwrap_or_default();
-                    if let Ok(member) = self.state.member_mut(&owner, &member_id) {
-                        member.current = handle;
-                        member.status = AgentStatus::Queued;
-                    }
-                }
+                self.handle_member_session_input(
+                    host,
+                    input.instance_id.as_deref(),
+                    UiInputEvent::Key { code, modifiers },
+                );
+            }
+            UiInputEvent::Mouse { kind, x, y } if input.view_id == TEAM_SESSION_VIEW => {
+                self.handle_member_session_input(
+                    host,
+                    input.instance_id.as_deref(),
+                    UiInputEvent::Mouse { kind, x, y },
+                );
             }
             UiInputEvent::Mouse { kind, y, .. }
                 if input.view_id == TEAM_WORKSPACE_VIEW && kind.starts_with("down_") =>

@@ -9,6 +9,14 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// 单个 Agent 主界面最多保留的 Runtime 事件和本地用户消息数量。
 const EVENT_LIMIT: usize = 512;
+/// 鼠标滚轮单次滚动的正文行数，与主界面保持一致。
+const SCROLL_STEP: isize = 3;
+/// 分页键单次滚动的正文行数。
+const PAGE_SCROLL: isize = 12;
+/// 正文右侧滚动条占用的列数。
+const SCROLLBAR_WIDTH: usize = 1;
+/// 滚动条滑块的最小高度，避免长历史里退化成难以辨认的一格。
+const SCROLLBAR_MIN_THUMB: usize = 3;
 
 /// 插件可嵌入子视图的通用 Agent 主界面状态。
 ///
@@ -99,33 +107,54 @@ impl AgentViewSession {
         self.scroll.set(0);
     }
 
+    /// 按相对最新内容的行数调整回看位置；正值回看更早内容，负值回到更新内容。
+    ///
+    /// 这里只做饱和加减，真正的最远边界由渲染时按当前视口高度收敛。
+    fn scroll_by(&self, lines: isize) {
+        let current = self.scroll.get();
+        let next = if lines >= 0 {
+            current.saturating_add(lines.unsigned_abs())
+        } else {
+            current.saturating_sub(lines.unsigned_abs())
+        };
+        self.scroll.set(next);
+    }
+
     /// 处理通用子视图输入；成功续跑时返回新句柄供 owner 更新稳定映射。
     ///
     /// 排队或运行中的 Agent 接收 steering；成功终态 Agent 创建后续运行。失败或
-    /// 取消状态不隐式重试，错误会保留在视图反馈中。
+    /// 取消状态不隐式重试，错误会保留在视图反馈中。鼠标滚轮只改变回看位置，
+    /// 点击等其余鼠标事件由宿主自行处理。
     pub fn handle_input(
         &mut self,
         host: &dyn PluginHostApi,
         event: &UiInputEvent,
     ) -> Option<AgentHandle> {
         let UiInputEvent::Key { code, modifiers } = event else {
+            if let UiInputEvent::Mouse { kind, .. } = event {
+                match kind.as_str() {
+                    "scroll_up" => self.scroll_by(SCROLL_STEP),
+                    "scroll_down" => self.scroll_by(-SCROLL_STEP),
+                    _ => {}
+                }
+            }
             return None;
         };
         match code.as_str() {
             "up" => {
-                self.scroll.set(self.scroll.get().saturating_add(1));
+                self.scroll_by(1);
                 return None;
             }
             "page_up" | "pageup" => {
-                self.scroll.set(self.scroll.get().saturating_add(12));
+                self.scroll_by(PAGE_SCROLL);
                 return None;
             }
             "down" => {
-                self.scroll.set(self.scroll.get().saturating_sub(1));
+                self.scroll_by(-1);
                 return None;
             }
             "page_down" | "pagedown" => {
-                self.scroll.set(self.scroll.get().saturating_sub(12));
+                self.scroll_by(-PAGE_SCROLL);
                 return None;
             }
             "home" => {
@@ -158,16 +187,23 @@ impl AgentViewSession {
     }
 
     /// 按给定尺寸渲染事件时间线、交互反馈和固定在底部的输入框。
+    ///
+    /// 正文右侧固定让出一列给滚动条：换行宽度不能随内容是否溢出而跳变，否则滚动到
+    /// 边界时整段文字会重新排版。极窄终端放不下这一列时退回全宽渲染。
     pub fn render(&self, width: u16, height: u16) -> Vec<UiLine> {
         const INPUT_BOX_HEIGHT: usize = 3;
+        let width = usize::from(width);
         let height = usize::from(height);
         let feedback_height = usize::from(self.feedback.is_some());
         let available = height.saturating_sub(INPUT_BOX_HEIGHT + feedback_height);
-        let event_lines = agent_event_lines(&self.timeline, usize::from(width), self.status);
+        let scrollbar_width = if width >= 4 { SCROLLBAR_WIDTH } else { 0 };
+        let content_width = width.saturating_sub(scrollbar_width).max(1);
+        let event_lines = agent_event_lines(&self.timeline, content_width, self.status);
+        let total_height = event_lines.len();
         let offset = self
             .scroll
             .get()
-            .min(event_lines.len().saturating_sub(available));
+            .min(total_height.saturating_sub(available));
         self.scroll.set(offset);
         let mut lines = event_lines
             .into_iter()
@@ -190,6 +226,20 @@ impl AgentViewSession {
         while lines.len() < available {
             lines.push(UiLine { spans: Vec::new() });
         }
+        if scrollbar_width > 0 && total_height > available && available > 0 {
+            let (thumb_top, thumb_height) =
+                scrollbar_thumb(available, total_height, available, offset);
+            for (row, line) in lines.iter_mut().enumerate() {
+                fit_line_width(line, content_width);
+                let (glyph, color) =
+                    if row >= thumb_top && row < thumb_top.saturating_add(thumb_height) {
+                        ("┃", UiColor::White)
+                    } else {
+                        ("│", UiColor::Gray)
+                    };
+                line.spans.push(span(glyph, Some(color), false));
+            }
+        }
         if let Some(feedback) = &self.feedback {
             let (text, color) = match feedback {
                 Ok(text) => (text.as_str(), UiColor::Green),
@@ -197,7 +247,7 @@ impl AgentViewSession {
             };
             lines.push(line(text, Some(color), false));
         }
-        lines.extend(input_box_lines(&self.input, usize::from(width)));
+        lines.extend(input_box_lines(&self.input, width));
         lines.truncate(height);
         lines
     }
@@ -436,6 +486,61 @@ fn agent_event_lines(
         });
     }
     lines
+}
+
+/// 计算滚动条滑块在正文轨道内的起始行与高度。
+///
+/// 高度按 `视口 / 总行数` 缩放，但保留 [`SCROLLBAR_MIN_THUMB`] 的下限，避免长历史里
+/// 滑块退化成看不出位置的一格。
+///
+/// `scroll` 与 [`AgentViewSession`] 一致，是相对最新内容的回看行数：零表示贴底跟随，
+/// 因此映射到轨道位置时要取 `max_scroll - scroll`，否则滚动方向会和鼠标滚轮相反。
+fn scrollbar_thumb(
+    track: usize,
+    total_height: usize,
+    viewport: usize,
+    scroll: usize,
+) -> (usize, usize) {
+    let scaled = track
+        .saturating_mul(viewport)
+        .checked_div(total_height)
+        .unwrap_or(0);
+    let thumb_height = scaled.max(SCROLLBAR_MIN_THUMB).min(track);
+    let span = track.saturating_sub(thumb_height);
+    let max_scroll = total_height.saturating_sub(viewport);
+    let thumb_top = if span == 0 || max_scroll == 0 {
+        0
+    } else {
+        max_scroll
+            .saturating_sub(scroll.min(max_scroll))
+            .saturating_mul(span)
+            / max_scroll
+    };
+    (thumb_top, thumb_height)
+}
+
+/// 把一行裁剪并补齐到指定显示宽度，使随后追加的滚动条列严格贴住右边界。
+fn fit_line_width(line: &mut UiLine, width: usize) {
+    let mut used = 0usize;
+    let mut clipped = false;
+    line.spans.retain_mut(|span| {
+        if clipped {
+            return false;
+        }
+        let span_width = span.text.width();
+        if used.saturating_add(span_width) <= width {
+            used = used.saturating_add(span_width);
+            return true;
+        }
+        span.text = clip_to_width(&span.text, width.saturating_sub(used));
+        used = used.saturating_add(span.text.width());
+        clipped = true;
+        !span.text.is_empty()
+    });
+    if used < width {
+        line.spans
+            .push(span(&" ".repeat(width - used), None, false));
+    }
 }
 
 /// 返回与完成事件调用 ID 对应的最近工具消息。
@@ -896,6 +1001,84 @@ mod tests {
         assert_eq!(lines[0].spans[0].style.foreground, Some(UiColor::Magenta));
         assert_eq!(lines[0].spans[1].style.background, Some(UiColor::Black));
         assert!(!lines[0].spans.iter().any(|span| span.text.contains("You")));
+    }
+
+    /// 拼接一帧中的全部文本，供滚动位置断言使用。
+    fn render_text(lines: &[UiLine]) -> String {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect()
+    }
+
+    /// 返回一行最后一列的滚动条字符；没有滚动条时返回空串。
+    fn scrollbar_glyph(line: &UiLine) -> &str {
+        line.spans
+            .last()
+            .filter(|span| matches!(span.text.as_str(), "│" | "┃"))
+            .map_or("", |span| span.text.as_str())
+    }
+
+    /// 滚轮步进只改变回看位置，并在到达最早内容后停止。
+    #[test]
+    fn wheel_scroll_step_reviews_history_and_stops_at_oldest() {
+        let target = AgentId::parse("agent-scroll").expect("创建测试 Agent ID");
+        let mut session = AgentViewSession::new(target);
+        for index in 0..40 {
+            session.record_user_message(format!("message-{index}"));
+        }
+
+        let bottom = render_text(&session.render(30, 10));
+        assert!(bottom.contains("message-39"), "{bottom}");
+        assert!(!bottom.contains("message-0 "), "{bottom}");
+
+        session.scroll_by(SCROLL_STEP);
+        let scrolled = render_text(&session.render(30, 10));
+        assert!(!scrolled.contains("message-39"), "{scrolled}");
+        assert_ne!(bottom, scrolled);
+
+        session.scroll_by(isize::MAX);
+        let oldest = render_text(&session.render(30, 10));
+        assert!(oldest.contains("message-0"), "{oldest}");
+        assert!(!oldest.contains("message-39"), "{oldest}");
+    }
+
+    /// 内容溢出时右侧必须出现可辨识的滚动条，滑块随滚动位置移动且输入框保持全宽。
+    #[test]
+    fn overflowing_history_renders_tracked_scrollbar() {
+        let target = AgentId::parse("agent-scrollbar").expect("创建测试 Agent ID");
+        let mut session = AgentViewSession::new(target);
+        for index in 0..40 {
+            session.record_user_message(format!("message-{index}"));
+        }
+
+        let bottom = session.render(30, 10);
+        assert_eq!(bottom.len(), 10);
+        assert!(bottom[..7]
+            .iter()
+            .all(|line| matches!(scrollbar_glyph(line), "│" | "┃")));
+        assert_eq!(scrollbar_glyph(&bottom[6]), "┃");
+        let bottom_width: usize = bottom[0].spans.iter().map(|span| span.text.width()).sum();
+        assert_eq!(bottom_width, 30);
+        assert_eq!(bottom[9].spans[0].text.width(), 30);
+
+        session.scroll_by(isize::MAX);
+        let oldest = session.render(30, 10);
+        assert_eq!(scrollbar_glyph(&oldest[0]), "┃");
+        assert_eq!(scrollbar_glyph(&oldest[6]), "│");
+    }
+
+    /// 内容不足一屏时不绘制滚动条字符，避免空白历史出现无意义的轨道。
+    #[test]
+    fn fitting_history_has_no_scrollbar() {
+        let target = AgentId::parse("agent-no-scrollbar").expect("创建测试 Agent ID");
+        let mut session = AgentViewSession::new(target);
+        session.record_user_message("short message".into());
+
+        let lines = session.render(20, 8);
+
+        assert!(lines.iter().all(|line| scrollbar_glyph(line).is_empty()));
     }
 
     /// 事件数量超过视口后，输入框仍应固定在底部并保持完整边框宽度。

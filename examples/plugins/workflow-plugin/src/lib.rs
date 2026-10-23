@@ -274,17 +274,18 @@ impl AgentPlugin for WorkflowPlugin {
                 }
             }
             UiInputEvent::Key { code, modifiers } if input.view_id == TASK_AGENT_VIEW => {
-                let Some(task_id) = input.instance_id.as_deref() else {
-                    return;
-                };
-                let event = UiInputEvent::Key { code, modifiers };
-                let continued = self
-                    .task_sessions
-                    .get_mut(task_id)
-                    .and_then(|session| session.handle_input(host, &event));
-                if let Some(handle) = continued {
-                    self.replace_task_agent(task_id, handle.id);
-                }
+                self.handle_task_agent_input(
+                    host,
+                    input.instance_id.as_deref(),
+                    UiInputEvent::Key { code, modifiers },
+                );
+            }
+            UiInputEvent::Mouse { kind, x, y } if input.view_id == TASK_AGENT_VIEW => {
+                self.handle_task_agent_input(
+                    host,
+                    input.instance_id.as_deref(),
+                    UiInputEvent::Mouse { kind, x, y },
+                );
             }
             _ => {}
         }
@@ -486,6 +487,25 @@ impl WorkflowPlugin {
         }
         lines.truncate(usize::from(request.height));
         lines
+    }
+
+    /// 把任务会话的键盘或滚轮输入交给共享 Agent 视图，并同步续跑产生的新句柄。
+    fn handle_task_agent_input(
+        &mut self,
+        host: &dyn PluginHostApi,
+        task_id: Option<&str>,
+        event: UiInputEvent,
+    ) {
+        let Some(task_id) = task_id else {
+            return;
+        };
+        let continued = self
+            .task_sessions
+            .get_mut(task_id)
+            .and_then(|session| session.handle_input(host, &event));
+        if let Some(handle) = continued {
+            self.replace_task_agent(task_id, handle.id);
+        }
     }
 
     /// 刷新任务对应的共享 Agent 主界面，不推进其他任务调度。
