@@ -130,17 +130,22 @@ async fn component_runs_dynamic_task_list() {
         .await
         .expect("动态工作流 component 应加载成功");
 
+    // 插件不注册常驻提示：任务列表的使用时机由 `task_create` 的工具描述承载，
+    // 因此这里校验提示为空、使用时机出现在工具描述里，避免把说明搬回提示后无人发现。
     let prompts = AgentExtension::prompt_messages(&host)
         .await
         .expect("任务编排提示应可读取");
-    assert!(prompts
-        .iter()
-        .any(|prompt| prompt.text_content().contains("task_create")));
+    assert!(prompts.is_empty());
 
     let tools = AgentExtension::list_tools(&host)
         .await
         .expect("插件工具应可读取");
     assert_eq!(tools.len(), 4);
+    let task_create = tools
+        .iter()
+        .find(|tool| tool.name == "task_create")
+        .expect("应声明 task_create 工具");
+    assert!(task_create.description.contains("动态任务列表"));
     let declarations = PluginHost::ui_declarations(&host)
         .await
         .expect("任务 UI 声明应可读取");
