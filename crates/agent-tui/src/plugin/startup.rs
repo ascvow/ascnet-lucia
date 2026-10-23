@@ -293,6 +293,23 @@ pub(crate) fn plugin_manifest_ids(manifests: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+/// 没有插件需要加载时立即结束能力规划。
+///
+/// 返回 `true` 表示调用方可以直接收尾。Host 的工具准入守卫在能力规划完成前一律拒绝
+/// 调用；没有插件时不存在「等待策略 owner Ready」的加载窗口，因此这一步必须显式完成，
+/// 否则「不装插件」会表现为「所有工具都没有权限」，而界面上没有任何插件报错可看。
+#[cfg(feature = "plugins")]
+fn finish_planning_when_no_plugins(
+    manifests: &[PathBuf],
+    live_host: &LivePluginHost,
+) -> Result<bool> {
+    if !manifests.is_empty() {
+        return Ok(false);
+    }
+    live_host.finish_capability_planning()?;
+    Ok(true)
+}
+
 /// 在 TUI 事件循环之外复核并渐进加载插件，把每个 Ready/Failed 状态立即发回主循环。
 ///
 /// 全局 manifest、依赖或能力规划错误会终止加载；单插件激活失败由 Host 转换为
@@ -311,7 +328,7 @@ pub(crate) async fn load_plugins_for_tui(
     live_host: Arc<LivePluginHost>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
-    if manifests.is_empty() {
+    if finish_planning_when_no_plugins(&manifests, live_host.as_ref())? {
         return Ok(());
     }
     let prepared_manifests = manifests;
@@ -505,5 +522,52 @@ mod tests {
                 "worker 不得获得 {denied}"
             );
         }
+    }
+
+    /// 不装任何插件时工具必须照常放行。
+    ///
+    /// 工具准入守卫挂在总线上，规划未完成就拒绝一切调用；如果「没有 manifest」这条
+    /// 早退路径忘了收尾，用户看到的就是「所有工具都没有权限」，而没有任何插件报错。
+    #[tokio::test]
+    async fn empty_plugin_set_still_admits_tool_calls() {
+        use agent_core::{AgentEvent, AgentEventKind, AgentRecordEvent, EventBus, ToolCallEvent};
+        use agent_tool::ToolCall;
+        use serde_json::json;
+
+        let live = LivePluginHost::new();
+        let bus = EventBus::new();
+        live.attach_bus(bus.clone()).expect("挂载事件总线");
+        assert!(
+            finish_planning_when_no_plugins(&[], &live).expect("没有插件时应直接结束规划"),
+            "空 manifest 集合必须由该分支收尾"
+        );
+
+        bus.dispatch(AgentRecordEvent {
+            record: AgentEvent::new("no-plugin-run", AgentEventKind::RunStarted, 0, json!({})),
+        })
+        .await;
+
+        let mut call = ToolCall::new("native-1", "read_file", json!({ "path": "AGENTS.md" }));
+        call.bind_run_id("no-plugin-run");
+        let dispatched = bus
+            .dispatch(ToolCallEvent::new("no-plugin-run", 0, call))
+            .await;
+
+        assert!(
+            !dispatched.is_cancelled(),
+            "没有插件时不应拒绝工具：{:?}",
+            dispatched.event.block_reason
+        );
+    }
+
+    /// 有 manifest 时该分支必须保持沉默，把收尾交给真实加载流程。
+    #[test]
+    fn plugin_manifest_set_is_not_finished_early() {
+        let live = LivePluginHost::new();
+        assert!(
+            !finish_planning_when_no_plugins(&[PathBuf::from("plugin.toml")], &live)
+                .expect("非空 manifest 不应报错"),
+            "有插件时不能在加载前提前结束规划"
+        );
     }
 }
