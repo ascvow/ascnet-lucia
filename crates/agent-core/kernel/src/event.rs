@@ -17,7 +17,10 @@ use std::{
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
@@ -291,6 +294,12 @@ impl EventSink for InMemoryEventSink {
 pub struct JsonlEventSink {
     path: PathBuf,
     lock: Arc<Mutex<()>>,
+    /// 输出目录是否已确认创建。
+    ///
+    /// 逐 token 的增量事件会让 `record` 非常密集，每次都调用 `create_dir_all` 等于为
+    /// 每个事件额外引入一串系统调用。首次成功后置位跳过；若目录随后被外部删除，
+    /// 打开失败时会复位该标志，让下一次事件重新创建。
+    directory_ready: Arc<AtomicBool>,
 }
 
 impl JsonlEventSink {
@@ -300,6 +309,7 @@ impl JsonlEventSink {
         Self {
             path: path.into(),
             lock: Arc::new(Mutex::new(())),
+            directory_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -308,13 +318,12 @@ impl JsonlEventSink {
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
 
-#[async_trait]
-impl EventSink for JsonlEventSink {
-    async fn record(&self, event: &AgentEvent) -> Result<()> {
-        let _guard = self.lock.lock().await;
-
+    /// 确认输出目录存在；成功后不再重复调用 `create_dir_all`。
+    fn ensure_directory(&self) -> Result<()> {
+        if self.directory_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).with_context(|| {
@@ -322,12 +331,40 @@ impl EventSink for JsonlEventSink {
                 })?;
             }
         }
+        self.directory_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
 
-        let mut file = OpenOptions::new()
+    /// 以追加方式打开事件文件；文件不存在时创建。
+    fn open_append(&self) -> std::io::Result<std::fs::File> {
+        OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
-            .with_context(|| format!("failed to open event jsonl: {}", self.path.display()))?;
+    }
+}
+
+#[async_trait]
+impl EventSink for JsonlEventSink {
+    async fn record(&self, event: &AgentEvent) -> Result<()> {
+        let _guard = self.lock.lock().await;
+
+        self.ensure_directory()?;
+
+        // 每个事件独立打开是刻意的：文档约定由调用方在应用层轮转日志，
+        // 常驻句柄会让外部轮转后的写入落到已被移走的旧文件上。
+        let mut file = match self.open_append() {
+            Ok(file) => file,
+            Err(_) => {
+                // 目录可能在运行期间被外部删除。缓存标志会让这里直接失败，
+                // 因此复位后重建并重试一次，保持与"每次创建目录"相同的自愈能力。
+                self.directory_ready.store(false, Ordering::Relaxed);
+                self.ensure_directory()?;
+                self.open_append().with_context(|| {
+                    format!("failed to open event jsonl: {}", self.path.display())
+                })?
+            }
+        };
         let line = serde_json::to_string(event).context("failed to serialize agent event")?;
         writeln!(file, "{line}")
             .with_context(|| format!("failed to write event jsonl: {}", self.path.display()))?;
@@ -341,4 +378,42 @@ fn unix_timestamp_ms() -> u64 {
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
     millis.min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentEvent, AgentEventKind, EventSink, JsonlEventSink};
+    use serde_json::json;
+
+    /// 事件按 JSON Lines 追加；目录被外部删除后必须自动重建而不是永久失败。
+    ///
+    /// 目录创建被缓存成一次性动作，这里验证缓存不会把"目录消失"变成不可恢复的错误，
+    /// 否则日志会在长时间运行中静默失效。
+    #[tokio::test]
+    async fn jsonl_sink_appends_and_recovers_directory() {
+        let root = std::env::temp_dir().join(format!("lucia-event-sink-{}", uuid::Uuid::new_v4()));
+        let path = root.join("nested").join("events.jsonl");
+        let sink = JsonlEventSink::new(path.clone());
+
+        let first = AgentEvent::new("run-1", AgentEventKind::TurnStarted, 0, json!({}));
+        sink.record(&first)
+            .await
+            .expect("首次写入应成功并创建输出目录");
+
+        std::fs::remove_dir_all(&root).expect("删除测试目录");
+
+        let second = AgentEvent::new("run-1", AgentEventKind::TurnFinished, 0, json!({}));
+        sink.record(&second)
+            .await
+            .expect("目录被删除后应重新创建并写入");
+
+        let content = std::fs::read_to_string(&path).expect("读取事件文件");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "重建后的文件只应包含删除之后写入的事件");
+        let parsed: AgentEvent = serde_json::from_str(lines[0]).expect("每行必须是合法事件 JSON");
+        assert_eq!(parsed.kind, AgentEventKind::TurnFinished);
+        assert_eq!(parsed.run_id, "run-1");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
