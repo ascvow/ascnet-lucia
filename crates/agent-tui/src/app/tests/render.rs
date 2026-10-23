@@ -1013,3 +1013,42 @@ fn short_tool_message_is_neither_marked_nor_clickable() {
     ))));
     assert!(!app.messages[0].tool_expanded);
 }
+
+/// 内容溢出时缩小窗口：上一帧的滚动条轨道会被新画布裁掉，清屏必须按交集处理。
+#[test]
+fn shrinking_window_clears_stale_scrollbar_safely() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages
+        .push(Msg::new(MsgKind::Assistant, "长正文\n".repeat(200)));
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let stale = app.scrollbar_area.expect("内容溢出时应绘制滚动条");
+    assert!(stale.bottom() > 2, "上一帧轨道应跨过新画布的第二行");
+
+    // 高度缩到 1 时，上一帧轨道整体落在画布之外；宽度收窄则只留下部分列。
+    for (width, height) in [(80u16, 1u16), (80, 2), (20, 3), (1, 1), (200, 40)] {
+        terminal.backend_mut().resize(width, height);
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    }
+}
+
+/// 终端比对话框的设计下限还小时，会话对话框仍要落在画布内而不是越界清屏。
+#[test]
+fn session_dialog_survives_tiny_terminal() {
+    use crate::command::{NativeSessionDialog, NativeSessionDialogMode, NativeSessionDialogStatus};
+
+    for (width, height) in [(1u16, 1u16), (8, 4), (19, 5), (20, 6), (88, 24)] {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.messages
+            .push(Msg::new(MsgKind::Assistant, "正文".to_string()));
+        app.native_command.dialog = Some(NativeSessionDialog {
+            mode: NativeSessionDialogMode::Resume,
+            selected: 0,
+            status: NativeSessionDialogStatus::Loading,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    }
+}

@@ -80,8 +80,14 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     // 每帧重置热区，空会话和窗口缩小时不能保留上一帧的跳转按钮。
     app.jump_hint_area = None;
     // 滚动条同理：内容不再溢出时先擦掉上一帧的轨道，避免右侧留白残留竖线。
+    //
+    // 这一块记录的是上一帧的几何尺寸，拖动缩放后可能落在新画布之外；`Clear` 直接
+    // 按坐标写单元格、不做裁剪，越界就会 panic，所以先与当前画布求交集。
     if let Some(previous) = app.scrollbar_area.take() {
-        frame.render_widget(Clear, previous);
+        let stale = frame.area().intersection(previous);
+        if !stale.is_empty() {
+            frame.render_widget(Clear, stale);
+        }
     }
     #[cfg(feature = "plugins")]
     {

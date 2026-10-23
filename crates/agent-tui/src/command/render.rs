@@ -90,8 +90,17 @@ pub(crate) fn render_native_session_dialog(frame: &mut Frame, app: &App, outer: 
     let Some(dialog) = app.native_command.dialog.as_ref() else {
         return;
     };
-    let width = outer.width.saturating_sub(4).clamp(20, 88);
-    let height = outer.height.saturating_sub(4).clamp(6, 24);
+    // 尺寸下限是为了保证可读性，但终端比下限还小时必须先收回画布以内：`Clear`
+    // 按坐标直接写单元格、不做裁剪，越界会 panic。
+    let width = outer.width.saturating_sub(4).clamp(20, 88).min(outer.width);
+    let height = outer
+        .height
+        .saturating_sub(4)
+        .clamp(6, 24)
+        .min(outer.height);
+    if width == 0 || height == 0 {
+        return;
+    }
     let area = Rect::new(
         outer.x + outer.width.saturating_sub(width) / 2,
         outer.y + outer.height.saturating_sub(height) / 2,
