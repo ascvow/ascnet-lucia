@@ -98,7 +98,7 @@ fn scrollbar_marks_overflow_and_clears_when_content_fits() {
     let area = app.scrollbar_area.expect("内容溢出时应显示滚动条");
     assert_eq!(area.width, 1);
     assert_eq!(area.height, app.last_viewport);
-    assert_eq!(area.x, 58, "滚动条应贴在消息区右侧留白列");
+    assert_eq!(area.x, 59, "滚动条应贴在终端最右一列");
     // 轨道与滑块只用一列宽字符，且不会挤掉正文：正文右边界在滚动条左侧。
     let column: String = (area.y..area.bottom())
         .map(|y| terminal.backend().buffer()[(area.x, y)].symbol())

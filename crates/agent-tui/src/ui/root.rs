@@ -19,10 +19,8 @@ pub(crate) fn render_root(frame: &mut Frame, app: &mut App) {
     for view in &mut app.plugin_views {
         view.area = Rect::default();
     }
-    let outer = frame.area().inner(Margin {
-        horizontal: 1,
-        vertical: 0,
-    });
+    // 直接占满整屏：留白交给各区域自己的内边距，正文与底栏靠 horizontal padding 对齐。
+    let outer = frame.area();
     #[cfg(feature = "plugins")]
     if !app.view_stack.is_main() {
         // 离开主视图后清空主界面热区，避免点击被上一帧的滚动条或跳转提示拦截。
