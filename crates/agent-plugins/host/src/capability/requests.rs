@@ -240,6 +240,34 @@ pub(crate) fn resolve_from(base: &Path, path: &str) -> PathBuf {
     }
 }
 
+/// 解析 manifest 或 Guest 提供的本地路径。
+///
+/// 三种形态：`~/` 前缀展开为宿主 home 目录、绝对路径原样返回、其余以 `base` 为基准。
+/// 只支持 `~/` 一种展开形式：`~user/` 与嵌在中间的 `~` 在 shell 里语义不一致，凭猜测
+/// 展开会把授权边界变成不可预测的前缀匹配。
+pub(crate) fn resolve_local_path(base: &Path, path: &str) -> Result<PathBuf> {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| anyhow!("宿主未提供 HOME，无法展开 `~/` 路径：{path}"))?;
+        return Ok(PathBuf::from(home).join(rest));
+    }
+    Ok(resolve_from(base, path))
+}
+
+/// 把原始字节编码成跨 ABI 传输的 base64 文本。
+pub(crate) fn encode_base64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// 解码 Guest 提交的 base64 数据。
+pub(crate) fn decode_base64(text: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .map_err(|error| anyhow!("socket 数据不是合法 base64：{error}"))
+}
+
 pub(crate) fn copy_safe_process_environment(command: &mut Command) {
     for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
         if let Some(value) = std::env::var_os(key) {

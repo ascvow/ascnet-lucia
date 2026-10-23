@@ -303,6 +303,54 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     .into_anyhow()
     .context("注册 host-http-request 失败")?;
     root.func_wrap_async(
+        "host-socket-connect",
+        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+            Box::new(async move {
+                let result = caller
+                    .data_mut()
+                    .capabilities
+                    .socket_connect(&request)
+                    .await;
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
+            })
+        },
+    )
+    .into_anyhow()
+    .context("注册 host-socket-connect 失败")?;
+    root.func_wrap_async(
+        "host-socket-send",
+        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+            Box::new(async move {
+                let result = caller.data_mut().capabilities.socket_send(&request).await;
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
+            })
+        },
+    )
+    .into_anyhow()
+    .context("注册 host-socket-send 失败")?;
+    root.func_wrap_async(
+        "host-socket-recv",
+        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+            Box::new(async move {
+                let result = caller.data_mut().capabilities.socket_recv(&request).await;
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
+            })
+        },
+    )
+    .into_anyhow()
+    .context("注册 host-socket-recv 失败")?;
+    root.func_wrap_async(
+        "host-socket-close",
+        |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+            Box::new(async move {
+                let result = caller.data_mut().capabilities.socket_close(&request).await;
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
+            })
+        },
+    )
+    .into_anyhow()
+    .context("注册 host-socket-close 失败")?;
+    root.func_wrap_async(
         "host-model-complete",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             let (allowed, binding, plugin_id) =

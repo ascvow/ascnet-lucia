@@ -150,6 +150,49 @@ bun run test:plugin:knowledge
 
 Manifest：`examples/plugins/knowledge-plugin/plugin.toml`。
 
+## Eden 编辑器上下文插件
+
+Eden 是一个 macOS 编辑器，它随 App 启动一个 Unix domain socket，回答「用户此刻在编辑器里看着
+什么」，并在用户可见时把某一行显示出来。插件把这条协议翻译成四个工具：
+
+| 工具 | 作用 |
+| --- | --- |
+| `eden_selection` | 读取选区文本、起止行与光标行；无选区时仍返回文件与光标位置 |
+| `eden_editors` | 列出所有已打开文件及其 tab、语言和未保存状态 |
+| `eden_context` | 读取会话所在 tab 的标题、窗格、`cwd` 与文件树根 |
+| `eden_reveal` | 把已打开文件的某一行显示出来（唯一的写操作） |
+
+### 为什么不用 `eden-cli` + 子进程
+
+早期做法是让插件执行 CLI 再解析 stdout。`process_exec` 是完整原生进程信任：为了读一次选区
+就交出执行任意命令的能力，权限与收益完全不成比例。现在只申请三条窄能力：连接一个声明在
+manifest 里的 socket 路径、只读一个声明路径的令牌文件、读取 Eden 注入的三个环境变量。
+Host 只搬运字节，`hello`、`welcome`、`call`、`result` 的编解码与 id 配对全部留在插件里。
+
+### 作用域与写操作仲裁
+
+握手用 Eden 注入的 `EDEN_SESSION` 声明「我是哪个终端窗格」，服务端据此解析到对应 tab 的编辑器；
+拿不到会话时服务端退回用户当前选中的 tab。`eden_selection` 默认 `scope = "session"`，也接受
+`active` 跟随用户视线。
+
+`eden_reveal` 只对「用户正看着的那个 tab」生效。握手时 `focused` 为假、或服务端返回
+`user_in_another_tab` 时，插件不重试也不抢焦点，而是返回 `revealed: false` 加一句建议文案，
+让模型直接用文字告诉用户文件与行号。
+
+### 权限
+
+令牌文件与 socket 各需要一条 allowlist 声明，默认路径是 Eden 的约定位置；若用户通过
+`EDEN_SOCKET` / `EDEN_TOKEN_FILE` 改到别处，需要在 `plugin.toml` 中同步声明，否则 Host 会拒绝
+连接并说明原因。读写能力叠加后，本插件全部工具的权限下限是 `unknown`，会进入当前审批模式——
+它既能读本地凭证又能连本地服务，副作用无法用单一 scope 描述。
+
+```bash
+bun run build:plugin:eden
+bun run test:plugin:eden
+```
+
+Manifest：`examples/plugins/eden-plugin/plugin.toml`。
+
 ## 统一验证
 
 ```bash
@@ -157,4 +200,4 @@ bun run build:plugin:official
 bun run test:plugin:official
 ```
 
-Context、MCP、Skill、Command、Teammate、Plan 和 Permission 都以独立插件 workspace 构建，不加入原生 Workspace；每个 bundle 都包含独立 `cdylib` component。它们的扫描、解析、协议和业务规则不会进入 Agent Core 或 Plugin Host。
+Context、MCP、Skill、Command、Teammate、Plan、Permission 和 Eden 都以独立插件 workspace 构建，不加入原生 Workspace；每个 bundle 都包含独立 `cdylib` component。它们的扫描、解析、协议和业务规则不会进入 Agent Core 或 Plugin Host。

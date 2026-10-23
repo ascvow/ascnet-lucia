@@ -86,6 +86,20 @@ world plugin {
   /// 执行一次由 manifest allowlist 约束的结构化 HTTP 请求。
   import host-http-request: func(request-json: string) -> string;
 
+  /// 连接 manifest `capabilities.socket.allow_paths` 允许的 Unix domain socket。
+  ///
+  /// 只是字节流，宿主不解析任何上层协议；返回实例内有效的连接句柄。
+  import host-socket-connect: func(request-json: string) -> string;
+
+  /// 向 socket 句柄写入原始数据。
+  import host-socket-send: func(request-json: string) -> string;
+
+  /// 从 socket 句柄读取一段数据，或返回超时/对端关闭。
+  import host-socket-recv: func(request-json: string) -> string;
+
+  /// 关闭 socket 句柄；不存在时保持幂等。
+  import host-socket-close: func(request-json: string) -> string;
+
   /// 使用宿主固定的模型路由执行一次无工具模型完成。
   import host-model-complete: func(request-json: string) -> string;
 

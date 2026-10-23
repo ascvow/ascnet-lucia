@@ -1,0 +1,20 @@
+[package]
+name = "eden-plugin"
+version = "0.1.0"
+edition = "2021"
+authors = ["ascvow"]
+license = "MIT"
+description = "通过 Eden 编辑器的本地 socket 读取选区与上下文，并在用户可见时定位某一行。"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+agent-plugin = { path = "../../../crates/agent-plugins/sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wit-bindgen = "0.59"
+
+[lints]
+workspace = true

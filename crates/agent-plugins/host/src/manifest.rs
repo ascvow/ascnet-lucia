@@ -569,6 +569,93 @@ mod tests {
         assert!(error.to_string().contains("secret"), "实际错误：{error}");
     }
 
+    /// socket allowlist 必须逐条是绝对路径，且拒绝通配符、穿越与空声明。
+    #[test]
+    fn socket_allowlist_is_validated() {
+        let mut manifest = test_manifest("socket", "1.0.0", Vec::new());
+        manifest.capabilities = CapabilitySection {
+            socket: Some(SocketCapabilitySection {
+                allow_paths: vec!["~/Library/Application Support/Eden/agent.sock".into()],
+            }),
+            ..CapabilitySection::default()
+        };
+        manifest
+            .validate()
+            .expect("带绝对路径的 socket 能力应被接受");
+
+        for (paths, expected) in [
+            (Vec::new(), "不能为空"),
+            (vec!["agent.sock".into()], "绝对路径"),
+            (vec!["/tmp/../etc/passwd".into()], "绝对路径"),
+            (vec!["/tmp/*.sock".into()], "通配符"),
+            (vec!["/tmp/".into()], "斜杠结尾"),
+        ] {
+            manifest.capabilities.socket = Some(SocketCapabilitySection {
+                allow_paths: paths.clone(),
+            });
+            let error = manifest
+                .validate()
+                .expect_err(&format!("{paths:?} 应被拒绝"));
+            assert!(
+                error.to_string().contains(expected),
+                "{paths:?} 的实际错误：{error}"
+            );
+        }
+    }
+
+    /// `env_read` 只接受大写 POSIX 变量名，并拒绝重复声明。
+    #[test]
+    fn env_read_names_are_validated() {
+        let mut manifest = test_manifest("env", "1.0.0", Vec::new());
+        manifest.capabilities = CapabilitySection {
+            env_read: vec!["EDEN_SESSION".into(), "EDEN_SOCKET".into()],
+            ..CapabilitySection::default()
+        };
+        manifest.validate().expect("合法变量名应被接受");
+
+        for (names, expected) in [
+            (vec!["eden_session".into()], "大写字母"),
+            (vec!["EDEN-SESSION".into()], "大写字母"),
+            (
+                vec!["EDEN_SESSION".into(), "EDEN_SESSION".into()],
+                "重复声明",
+            ),
+        ] {
+            manifest.capabilities.env_read = names.clone();
+            let error = manifest
+                .validate()
+                .expect_err(&format!("{names:?} 应被拒绝"));
+            assert!(
+                error.to_string().contains(expected),
+                "{names:?} 的实际错误：{error}"
+            );
+        }
+    }
+
+    /// socket 按 network 抬升工具权限下限，`env_read` 按只读数据抬升。
+    #[test]
+    fn socket_and_env_read_raise_tool_scope_floor() {
+        let socket_only = CapabilitySection {
+            socket: Some(SocketCapabilitySection {
+                allow_paths: vec!["/tmp/agent.sock".into()],
+            }),
+            ..CapabilitySection::default()
+        };
+        assert_eq!(
+            socket_only.component_capability_scope_floor(),
+            Some(ToolPermissionScope::Network)
+        );
+
+        let env_only = CapabilitySection {
+            env_read: vec!["EDEN_SESSION".into()],
+            ..CapabilitySection::default()
+        };
+        assert_eq!(
+            env_only.component_capability_scope_floor(),
+            Some(ToolPermissionScope::Read)
+        );
+    }
+
     /// 空的 HTTP allowlist 必须在加载前拒绝。
     #[test]
     fn empty_http_allowlist_is_rejected() {
@@ -1042,6 +1129,21 @@ pub struct CapabilitySection {
     #[serde(default)]
     pub http: Option<HttpCapabilitySection>,
 
+    /// 插件是否希望通过宿主 API 连接 Unix domain socket，以及允许连接的具体路径。
+    ///
+    /// 同样是可选表而非布尔值：socket 的价值来自「连到哪一个本地服务」，把路径写进
+    /// manifest 才能让用户与审计者看到授权边界。声明空 allowlist 会在加载前被拒绝。
+    #[serde(default)]
+    pub socket: Option<SocketCapabilitySection>,
+
+    /// 插件请求宿主注入给 Guest 的环境变量名。
+    ///
+    /// WASI 默认不继承任何环境变量——继承会把 API 密钥一类的凭证直接交给插件。需要读取
+    /// 运行时身份（例如编辑器注入的会话标识）的插件必须逐个列出变量名，Host 只注入这些
+    /// 变量，其余仍然不可见。
+    #[serde(default)]
+    pub env_read: Vec<String>,
+
     /// 插件是否希望通过宿主 API 读取 secret。
     #[serde(default)]
     pub secrets: bool,
@@ -1093,6 +1195,103 @@ pub struct CapabilitySection {
     /// Host 按公开工具名绑定的权威权限 scope；未声明的插件工具统一降级为 `unknown`。
     #[serde(default)]
     pub tool_scopes: HashMap<String, ToolPermissionScope>,
+}
+
+/// 插件 Unix domain socket 能力的可审计配置。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SocketCapabilitySection {
+    /// 允许连接的 socket 绝对路径；`~/` 表示宿主 home 目录。
+    ///
+    /// 只接受精确路径，不接受通配符：socket 名通常固定，允许前缀匹配等于把同目录下任意
+    /// 本地服务都授权给插件。
+    #[serde(default)]
+    pub allow_paths: Vec<String>,
+}
+
+impl SocketCapabilitySection {
+    /// 校验 socket allowlist 的格式边界。
+    ///
+    /// 只做语法检查，不要求路径此刻存在：Eden 一类的服务可能尚未启动，加载期检查存在性
+    /// 会让插件在服务未运行时直接加载失败，而正确行为是工具调用时返回可重试错误。
+    pub fn validate(&self) -> Result<()> {
+        if self.allow_paths.is_empty() {
+            return Err(anyhow!("capabilities.socket.allow_paths 不能为空"));
+        }
+        if self.allow_paths.len() > 16 {
+            return Err(anyhow!(
+                "capabilities.socket.allow_paths 不能超过 16 个路径"
+            ));
+        }
+        let mut seen = HashSet::new();
+        for path in &self.allow_paths {
+            let normalized = path.trim();
+            if normalized != path {
+                return Err(anyhow!("capabilities.socket.allow_paths 不能包含首尾空白"));
+            }
+            if !is_pinned_local_path(path) {
+                return Err(anyhow!(
+                    "capabilities.socket.allow_paths 必须以 `/` 或 `~/` 开头的绝对路径：`{path}`"
+                ));
+            }
+            if path.ends_with('/') {
+                return Err(anyhow!(
+                    "capabilities.socket.allow_paths 不能以斜杠结尾：`{path}`"
+                ));
+            }
+            if path
+                .bytes()
+                .any(|byte| byte < 0x20 || byte == 0x7F || byte == b'*' || byte == b'?')
+            {
+                return Err(anyhow!(
+                    "capabilities.socket.allow_paths 含非法字符或通配符：`{path}`"
+                ));
+            }
+            if !seen.insert(path.clone()) {
+                return Err(anyhow!("capabilities.socket.allow_paths 重复声明 `{path}`"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 判断路径是否是允许的本地绝对路径形式（`/` 或 `~/` 开头，且不含父目录穿越）。
+///
+/// `~` 只支持紧跟分隔符的 `~/`：把 `~user/...` 或 `~` 中间出现当作普通字符会让展开逻辑
+/// 与用户的 shell 直觉不一致，从而把授权边界变成猜测。
+pub(crate) fn is_pinned_local_path(path: &str) -> bool {
+    if path.is_empty() || path == "~" || !(path.starts_with('/') || path.starts_with("~/")) {
+        return false;
+    }
+    !path.split('/').any(|segment| segment == "..")
+}
+
+/// 校验插件请求注入的环境变量名列表。
+///
+/// 只接受 POSIX 变量名的常见子集，并拒绝重复：环境名会被拼进 WASI 环境表，宽松的字符
+/// 集合没有收益，只会给不同平台的解释差异留下空间。
+pub(crate) fn validate_env_read(names: &[String]) -> Result<()> {
+    if names.len() > 32 {
+        return Err(anyhow!("capabilities.env_read 不能超过 32 个变量"));
+    }
+    let mut seen = HashSet::new();
+    for name in names {
+        let valid = !name.is_empty()
+            && name.len() <= 128
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            && !name.as_bytes()[0].is_ascii_digit();
+        if !valid {
+            return Err(anyhow!(
+                "capabilities.env_read 中的变量名必须是大写字母、数字或下划线：`{name}`"
+            ));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(anyhow!("capabilities.env_read 重复声明 `{name}`"));
+        }
+    }
+    Ok(())
 }
 
 /// 插件 HTTP 能力的可审计配置。
@@ -1323,6 +1522,15 @@ impl CapabilitySection {
         if self.http.is_some() {
             include(ToolPermissionScope::Network);
         }
+        if self.socket.is_some() {
+            // socket 是出站连接：它能访问的本机服务不亚于一条网络连接，按 network 计入下限。
+            include(ToolPermissionScope::Network);
+        }
+        if !self.env_read.is_empty() {
+            // 环境变量是受 manifest 逐项声明的只读数据，与 `fs_read` 同档；`secrets` 那种
+            // 无 allowlist 的通用读取才升到 unknown。
+            include(ToolPermissionScope::Read);
+        }
         if self.sessions
             || self.secrets
             || self.model_completion
@@ -1367,6 +1575,10 @@ impl CapabilitySection {
         if let Some(http) = &self.http {
             http.validate()?;
         }
+        if let Some(socket) = &self.socket {
+            socket.validate()?;
+        }
+        validate_env_read(&self.env_read)?;
         if self.secrets || !self.fs_write.is_empty() {
             return Err(anyhow!("当前 Lucia 版本尚未实现插件 secret 或文件写入能力"));
         }

@@ -26,7 +26,7 @@ example_run = "shell"
 config_dir = "config"
 ```
 
-`wasm`、`fs_read` 和插件元数据中的相对路径都以 `plugin.toml` 所在目录为基准。
+`wasm`、`fs_read` 和插件元数据中的相对路径都以 `plugin.toml` 所在目录为基准；`~/` 前缀表示宿主 home 目录，是唯一支持的展开形式，`~user/` 与嵌在中间的 `~` 都按普通字符处理。展开与其他路径一样要经过 canonicalize 与 allowlist 校验。
 
 ## 插件依赖
 
@@ -86,19 +86,21 @@ ABI 基线混入其中会把“启用即可使用”误报为“当前 Guest 实
 | --- | --- | --- |
 | 纯计算 | 默认允许 | 受 Wasmtime fuel 与线性内存上限控制 |
 | `workspace_read` | 可用 | Host 注入当前项目的可信规范化根，只允许读取根及其后代；工具权限下限为 `read` |
-| `fs_read` | 可用 | 仅允许声明路径及其目录后代 |
+| `fs_read` | 可用 | 仅允许声明路径及其目录后代；支持 `~/` 展开 |
 | `process_exec` | 可用 | 无 shell，stdin/stdout 由 Host 管理 |
 | `agent` | 可用 | 分操作授权、profile allowlist、可信身份与卸载撤销 |
 | `model_completion` | 可用 | 应用固定 provider/model/stream，Host 禁用工具与推理并限制输出 |
 | `surface_action_allowlist` | 可用 | 按动作授权 `set_input`、会话操作或退出，禁止一项权限覆盖全部动作 |
 | `storage` | 可用 | 仅本插件私有命名空间，按 `workspace`/`user` 作用域隔离；宿主未提供项目身份时 `workspace` 不可用 |
 | `sessions` | 可用 | 只读当前项目历史会话；无写入路径，投影剔除私有推理与图片字节，并把工具权限下限抬到 `unknown` |
+| `socket` | 可用 | 只连接 allowlist 中的 Unix domain socket；只搬字节，不解析上层协议；工具权限下限为 `network` |
+| `env_read` | 可用 | 只注入 manifest 逐个列出的环境变量；默认不继承任何宿主环境；工具权限下限为 `read` |
 | `tool_scopes` | 可用 | Host 按公开工具名绑定 scope；未声明工具降级为 `unknown`，已授 component 能力会进一步抬高风险下限 |
 | `fs_write` | 尚未开放 | manifest 申请会被拒绝 |
 | `http` | 尚未开放 | manifest 申请会被拒绝 |
 | `secrets` | 尚未开放 | manifest 申请会被拒绝 |
 
-Host 不继承 WASI 环境变量、预打开目录或 stdio。需要 I/O 的插件必须使用 `PluginHostApi`。
+Host 默认不继承 WASI 环境变量、不预打开目录、不接 stdio。唯一的环境变量入口是 manifest 逐个列出的 `env_read`；其余 I/O 必须使用 `PluginHostApi`。
 
 ## 当前工作区只读权限
 
@@ -142,6 +144,49 @@ storage = true
 Plugin Manager 的完整性锁与授权摘要在安装层拦截，而不是靠存储层每次哈希字节。
 
 存储受条目数与总字节配额约束，超限写入失败而不是静默丢弃。
+
+## Unix domain socket 权限
+
+```toml
+[capabilities.socket]
+allow_paths = ["~/Library/Application Support/Eden/agent.sock"]
+```
+
+允许插件通过 `host-socket-*` 连接 manifest 列出的本地 socket。`~/` 表示宿主 home 目录，
+由 Host 展开；其余必须是绝对路径。声明空 allowlist 会在加载前被拒绝，避免把「申请了本地
+通信但没有明确服务」误当成安全配置。
+
+每次连接都会：
+
+1. 拒绝相对路径、`..` 段与 `@` 抽象命名空间；
+2. canonicalize 请求路径与 allowlist，再逐条精确比较——不做前缀或通配符匹配，否则同目录下
+   任意本地服务都会被一并授权；
+3. 要求目标文件类型确实是 socket，普通文件不能借这条能力变成文件读取；
+4. 按 `ExecutionPolicy.permits_network_access` 复核，受限档位即使 manifest 声明也不放行。
+
+结构限制：单个插件实例最多 4 条并发连接，单次读写 1 MiB，单次读取等待 2 秒，单条连接累计
+读取 16 MiB；超过后必须重连。socket 与子进程共用 `ExecutionPolicy.limits.max_processes` 这一
+原生句柄维度，把它设为 0 会同时关闭两者。Host 只搬运字节，不解析 NDJSON、JSON-RPC 或任何
+具体协议。
+
+allowlist 约束的是**路径**，不是对端身份：同一用户可以替换该路径下的 socket 文件，连接之后
+真正证明对端身份的是协议自己的握手（例如令牌）。Host 不替插件判断对端是否可信。
+
+该能力把插件全部工具的权限下限抬到 `network`：本地 socket 能访问的服务不亚于一条网络连接。
+
+## 环境变量读取权限
+
+```toml
+[capabilities]
+env_read = ["EDEN_SESSION", "EDEN_SOCKET", "EDEN_TOKEN_FILE"]
+```
+
+WASI 默认不继承任何宿主环境变量——宿主进程里通常就有模型 API 密钥，整体继承等于把凭证交给
+插件。需要运行时身份的插件必须逐个列出变量名，Host 只把这些变量注入 WASI 环境表，其余仍然
+不可见；变量名只接受大写字母、数字与下划线，并拒绝重复声明。
+
+缺失的变量不会注入，也不会报错：插件应按「拿不到就用默认值」处理。该能力把工具权限下限抬到
+`read`——它与 `fs_read` 同档，都是 manifest 逐项声明的只读数据。
 
 ## 只读会话权限
 

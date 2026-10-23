@@ -532,6 +532,14 @@ impl WasmPluginHost {
             // 刻意保持最小 WASI：不继承环境变量、不继承 stdio，也不预打开工作区或任何
             // 系统目录。唯一的例外是插件自己申请的私有数据目录，见下方。
             wasi.arg(&manifest.plugin.id);
+            // manifest 逐个列出的变量才会进入 Guest。默认不继承是刻意的：宿主进程的环境
+            // 里通常就有模型 API 密钥，整体继承等于把凭证直接交给插件。
+            for name in &manifest.capabilities.env_read {
+                // WASI 环境表只承载 UTF-8 文本；非 UTF-8 值无法表达，按不可见处理。
+                if let Ok(value) = std::env::var(name) {
+                    wasi.env(name, value);
+                }
+            }
             // 声明 `data_dir` 的插件获得一个 preopen 成 `/data` 的私有目录。
             //
             // 这里刻意**不设容量上限**：索引、向量库这类数据的体积由用户仓库规模决定，

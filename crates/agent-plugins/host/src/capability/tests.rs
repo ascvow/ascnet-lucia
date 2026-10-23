@@ -1699,3 +1699,295 @@ async fn missing_session_source_fails_instead_of_reporting_empty() {
 
     assert!(error.to_string().contains("未注入"), "{error}");
 }
+
+/// 测试用临时 Unix domain socket 服务端。
+///
+/// 每个实例独占一个临时目录，测试结束随目录一起删除；监听器由测试自己 accept，从而能
+/// 精确控制「有数据」「没数据」「对端关闭」三种时序。
+#[cfg(unix)]
+struct TempSocket {
+    /// 存放 socket 文件的临时目录，drop 时递归删除。
+    directory: PathBuf,
+    /// socket 文件路径。
+    path: PathBuf,
+    /// 待接受的监听器。
+    listener: tokio::net::UnixListener,
+}
+
+#[cfg(unix)]
+impl TempSocket {
+    /// 在临时目录中创建监听器。
+    ///
+    /// 目录固定在 `/tmp` 并用短 ID：`sockaddr_un` 的路径上限约 100 字节，macOS 的
+    /// `TMPDIR` 本身就占掉大半，放进去会直接绑定失败。
+    async fn bind() -> Self {
+        let directory = PathBuf::from("/tmp").join(format!(
+            "lucia-sock-{}",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&directory).expect("创建临时目录");
+        let path = directory.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("绑定测试 socket");
+        Self {
+            directory,
+            path,
+            listener,
+        }
+    }
+
+    /// 返回 socket 文件的绝对路径字符串。
+    fn path_string(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+
+    /// 等待一次来自插件侧的连接。
+    async fn accept(&self) -> tokio::net::UnixStream {
+        let (stream, _) = self.listener.accept().await.expect("接受测试连接");
+        stream
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TempSocket {
+    /// 清理临时目录与 socket 文件。
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// 构造声明了 socket 能力的测试状态。
+#[cfg(unix)]
+fn socket_state(allow_paths: Option<Vec<String>>) -> CapabilityState {
+    CapabilityState::new(
+        "socket-test-plugin".into(),
+        "socket-test-bundle".into(),
+        PathBuf::from("."),
+        CapabilitySection {
+            socket: allow_paths
+                .map(|allow_paths| crate::manifest::SocketCapabilitySection { allow_paths }),
+            ..CapabilitySection::default()
+        },
+        Arc::new(ContributionRegistry::default()),
+        Arc::new(ServiceRegistry::default()),
+        CapabilityHostContext::new(None, None, ExecutionPolicy::serve(), None, None, None, None),
+    )
+    .expect("创建 socket 测试能力状态")
+}
+
+/// 未声明 socket 能力的插件必须在触达系统调用前被拒绝。
+#[cfg(unix)]
+#[tokio::test]
+async fn socket_capability_requires_manifest_declaration() {
+    let mut state = socket_state(None);
+    let error = state
+        .socket_connect(r#"{"path":"/tmp/lucia-missing.sock"}"#)
+        .await
+        .expect_err("未声明能力应失败");
+
+    assert!(is_capability_denied(&error), "{error:#}");
+}
+
+/// allowlist 之外的路径必须被拒绝，即使该 socket 真实存在。
+#[cfg(unix)]
+#[tokio::test]
+async fn socket_path_outside_allowlist_is_rejected() {
+    let fixture = TempSocket::bind().await;
+    let other = TempSocket::bind().await;
+    let mut state = socket_state(Some(vec![other.path_string()]));
+    let error = state
+        .socket_connect(&json!({ "path": fixture.path_string() }).to_string())
+        .await
+        .expect_err("allowlist 之外应失败");
+
+    assert!(is_capability_denied(&error), "{error:#}");
+}
+
+/// 已声明的 socket 必须能连接、写入、读取并关闭。
+#[cfg(unix)]
+#[tokio::test]
+async fn allowlisted_socket_round_trips_bytes() {
+    let fixture = TempSocket::bind().await;
+    let mut state = socket_state(Some(vec![fixture.path_string()]));
+    let handle = state
+        .socket_connect(&json!({ "path": fixture.path_string() }).to_string())
+        .await
+        .expect("连接应成功")
+        .as_u64()
+        .expect("句柄应为整数");
+    let mut server = fixture.accept().await;
+
+    state
+        .socket_send(
+            &json!({
+                "handle": handle,
+                "data_base64": crate::capability::requests::encode_base64(b"ping\n"),
+            })
+            .to_string(),
+        )
+        .await
+        .expect("写入应成功");
+    let mut received = [0u8; 5];
+    tokio::io::AsyncReadExt::read_exact(&mut server, &mut received)
+        .await
+        .expect("服务端应读到请求");
+    assert_eq!(&received, b"ping\n");
+
+    tokio::io::AsyncWriteExt::write_all(&mut server, b"pong\n")
+        .await
+        .expect("服务端应能回复");
+    let value = state
+        .socket_recv(&json!({ "handle": handle, "max_bytes": 16, "timeout_ms": 1000 }).to_string())
+        .await
+        .expect("读取应成功");
+    assert_eq!(value["state"], "data");
+    let data = crate::capability::requests::decode_base64(
+        value["data_base64"].as_str().expect("读取结果应带数据"),
+    )
+    .expect("返回数据应是合法 base64");
+    assert_eq!(data, b"pong\n");
+
+    state
+        .socket_close(&json!({ "handle": handle }).to_string())
+        .await
+        .expect("关闭应成功");
+    // 关闭后句柄必须失效，避免 Guest 复用一条已回收的连接。
+    let error = state
+        .socket_send(
+            &json!({
+                "handle": handle,
+                "data_base64": crate::capability::requests::encode_base64(b"x"),
+            })
+            .to_string(),
+        )
+        .await
+        .expect_err("已关闭句柄应失败");
+    assert!(format!("{error:#}").contains("未知 socket 句柄"));
+}
+
+/// 没有数据时必须返回超时状态，而不是错误或断开。
+#[cfg(unix)]
+#[tokio::test]
+async fn empty_socket_read_reports_timeout() {
+    let fixture = TempSocket::bind().await;
+    let mut state = socket_state(Some(vec![fixture.path_string()]));
+    let handle = state
+        .socket_connect(&json!({ "path": fixture.path_string() }).to_string())
+        .await
+        .expect("连接应成功")
+        .as_u64()
+        .expect("句柄应为整数");
+    let _server = fixture.accept().await;
+
+    let value = state
+        .socket_recv(&json!({ "handle": handle, "max_bytes": 8, "timeout_ms": 50 }).to_string())
+        .await
+        .expect("读取应成功");
+    assert_eq!(value["state"], "timeout");
+}
+
+/// 普通文件即使被写进 allowlist 也不能连接：socket 能力不能退化成文件读取。
+#[cfg(unix)]
+#[tokio::test]
+async fn non_socket_path_is_rejected() {
+    let directory = std::env::temp_dir().join(format!(
+        "lucia-socket-not-a-socket-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).expect("创建临时目录");
+    let file = directory.join("plain.txt");
+    std::fs::write(&file, b"not a socket").expect("写入普通文件");
+    let mut state = socket_state(Some(vec![file.to_string_lossy().into_owned()]));
+
+    let error = state
+        .socket_connect(&json!({ "path": file.to_string_lossy() }).to_string())
+        .await
+        .expect_err("普通文件应被拒绝");
+    assert!(format!("{error:#}").contains("不是 Unix domain socket"));
+
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// 父目录穿越与相对路径都必须在规范化之前被拒绝。
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_socket_paths_are_rejected() {
+    let mut state = socket_state(Some(vec!["/tmp/allowed.sock".into()]));
+
+    let error = state
+        .socket_connect(&json!({ "path": "/tmp/../etc/passwd" }).to_string())
+        .await
+        .expect_err("路径穿越应被拒绝");
+    assert!(format!("{error:#}").contains("不含 `..`"), "{error:#}");
+
+    let error = state
+        .socket_connect(&json!({ "path": "agent.sock" }).to_string())
+        .await
+        .expect_err("相对路径应被拒绝");
+    assert!(format!("{error:#}").contains("绝对路径"), "{error:#}");
+}
+
+/// 执行策略把原生句柄上限设为 0 时，socket 能力必须与服务端的子进程能力一起关闭。
+#[cfg(unix)]
+#[tokio::test]
+async fn socket_is_closed_when_native_handles_are_disabled() {
+    let fixture = TempSocket::bind().await;
+    let mut policy = ExecutionPolicy::serve();
+    policy.limits.max_processes = Some(0);
+    let mut state = CapabilityState::new(
+        "socket-test-plugin".into(),
+        "socket-test-bundle".into(),
+        PathBuf::from("."),
+        CapabilitySection {
+            socket: Some(crate::manifest::SocketCapabilitySection {
+                allow_paths: vec![fixture.path_string()],
+            }),
+            ..CapabilitySection::default()
+        },
+        Arc::new(ContributionRegistry::default()),
+        Arc::new(ServiceRegistry::default()),
+        CapabilityHostContext::new(None, None, policy, None, None, None, None),
+    )
+    .expect("创建受限 socket 测试状态");
+
+    let error = state
+        .socket_connect(&json!({ "path": fixture.path_string() }).to_string())
+        .await
+        .expect_err("句柄上限为 0 应拒绝 socket");
+    assert!(is_capability_denied(&error), "{error:#}");
+}
+
+/// 执行策略关闭网络时，即使 manifest 声明了 socket 也必须拒绝。
+#[cfg(unix)]
+#[tokio::test]
+async fn socket_requires_network_permission() {
+    let fixture = TempSocket::bind().await;
+    let mut state = CapabilityState::new(
+        "socket-test-plugin".into(),
+        "socket-test-bundle".into(),
+        PathBuf::from("."),
+        CapabilitySection {
+            socket: Some(crate::manifest::SocketCapabilitySection {
+                allow_paths: vec![fixture.path_string()],
+            }),
+            ..CapabilitySection::default()
+        },
+        Arc::new(ContributionRegistry::default()),
+        Arc::new(ServiceRegistry::default()),
+        CapabilityHostContext::new(
+            None,
+            None,
+            ExecutionPolicy::mutation(),
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    .expect("创建受限 socket 测试状态");
+
+    let error = state
+        .socket_connect(&json!({ "path": fixture.path_string() }).to_string())
+        .await
+        .expect_err("受限策略应拒绝 socket");
+    assert!(is_capability_denied(&error), "{error:#}");
+}

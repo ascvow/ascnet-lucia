@@ -35,3 +35,49 @@ fn process_spec_accepts_additive_fields() {
 
     assert_eq!(spec.command, "bun");
 }
+
+/// socket 读取结果的三种状态必须能被旧 Guest 正确解码。
+#[test]
+fn socket_recv_states_are_decoded() {
+    use agent_plugin::{decode_host_response, SocketRecv};
+
+    let data: SocketRecv = decode_host_response(
+        r#"{"schema_version":1,"ok":true,"value":{"state":"data","data_base64":"aGVsbG8="},"future":0}"#,
+    )
+    .expect("数据状态应可解析");
+    assert_eq!(data, SocketRecv::Data(b"hello".to_vec()));
+
+    let timeout: SocketRecv = decode_host_response(r#"{"ok":true,"value":{"state":"timeout"}}"#)
+        .expect("超时状态应可解析");
+    assert_eq!(timeout, SocketRecv::Timeout);
+
+    let closed: SocketRecv = decode_host_response(r#"{"ok":true,"value":{"state":"closed"}}"#)
+        .expect("关闭状态应可解析");
+    assert_eq!(closed, SocketRecv::Closed);
+}
+
+/// 未知读取状态必须明确失败，不能被当成超时静默重试。
+#[test]
+fn unknown_socket_state_is_rejected() {
+    use agent_plugin::{decode_host_response, SocketRecv};
+
+    let error = decode_host_response::<SocketRecv>(r#"{"ok":true,"value":{"state":"draining"}}"#)
+        .expect_err("未知状态应失败");
+    assert!(
+        format!("{error:#}").contains("未知 socket 读取状态"),
+        "{error:#}"
+    );
+}
+
+/// socket 字节跨 ABI 传输必须无损，含非 UTF-8 数据。
+#[test]
+fn socket_bytes_round_trip() {
+    use agent_plugin::{decode_base64, encode_base64};
+
+    let bytes = [0u8, 159, 146, 150, b'\n', 0xFF];
+    let encoded = encode_base64(&bytes);
+    assert_eq!(decode_base64(&encoded).expect("应可解码"), bytes);
+
+    let error = decode_base64("not base64").expect_err("非法 base64 应失败");
+    assert!(format!("{error:#}").contains("base64"), "{error:#}");
+}

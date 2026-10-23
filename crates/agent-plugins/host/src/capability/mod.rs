@@ -4,6 +4,7 @@ use crate::capability::agent::AgentCapabilityChecks;
 use crate::capability::process::ManagedProcess;
 use crate::capability::requests::parse_request;
 use crate::capability::requests::resolve_from;
+use crate::capability::requests::resolve_local_path;
 use crate::capability::requests::ExtensionEventRequest;
 use crate::capability::requests::FileEntry;
 use crate::capability::requests::IdRequest;
@@ -46,10 +47,36 @@ mod agent;
 pub(crate) mod http;
 mod process;
 mod requests;
+#[cfg(unix)]
+mod socket;
+#[cfg(not(unix))]
+#[path = "socket_unsupported.rs"]
+mod socket;
 #[cfg(test)]
 mod tests;
 
 const MAX_PLUGIN_PROCESSES: usize = 16;
+
+/// 单个插件实例允许同时持有的 socket 连接数上限。
+const MAX_PLUGIN_SOCKETS: usize = 4;
+
+/// socket 单次读写允许搬运的字节数上限。
+const MAX_SOCKET_TRANSFER_BYTES: usize = 1024 * 1024;
+
+/// 单条 socket 连接累计允许读取的字节数；超过后必须重连。
+///
+/// 上限按「一次激活生命周期」而不是「单次调用」计，否则长驻连接可以把一个本地服务的
+/// 全部输出持续搬进 Guest 内存，而每次调用都刚好合规。
+const MAX_SOCKET_READ_BUDGET: usize = 16 * 1024 * 1024;
+
+/// socket 单次读取允许等待的毫秒数上限。
+///
+/// 有意取小值：Host 调用的等待会占住运行时任务。需要更久等待的客户端应循环切片读取，
+/// 把「多久算超时」留在插件自己的协议层。
+const MAX_SOCKET_RECV_TIMEOUT_MS: u64 = 2_000;
+
+/// socket 连接与写入允许等待的毫秒数上限。
+const MAX_SOCKET_WAIT_TIMEOUT_MS: u64 = 5_000;
 
 const MAX_PROCESS_LINE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -95,6 +122,12 @@ pub(crate) struct CapabilityState {
     session_source: Option<Arc<dyn PluginSessionSource>>,
     processes: HashMap<u64, ManagedProcess>,
     next_process_handle: u64,
+    /// 受管 socket 连接；非 Unix 平台没有该能力。
+    #[cfg(unix)]
+    sockets: HashMap<u64, socket::ManagedSocket>,
+    /// 下一个 socket 句柄；句柄只在当前实例内有效。
+    #[cfg(unix)]
+    next_socket_handle: u64,
     state: HashMap<String, Value>,
     /// 按作用域缓存的持久存储句柄与已加载内容。
     stores: HashMap<PluginStoreScope, PluginStoreSlot>,
@@ -354,6 +387,10 @@ impl CapabilityState {
             session_source: host_context.session_source,
             processes: HashMap::new(),
             next_process_handle: 1,
+            #[cfg(unix)]
+            sockets: HashMap::new(),
+            #[cfg(unix)]
+            next_socket_handle: 1,
             state,
             stores,
             active_run_id: ActiveRunBinding::default(),
@@ -711,11 +748,13 @@ impl CapabilityState {
                 "插件无权读取当前工作区之外的路径：{requested}"
             )));
         }
-        let path = resolve_from(&self.plugin_dir, requested)
+        let path = resolve_local_path(&self.plugin_dir, requested)
+            .with_context(|| format!("解析插件读取路径失败：{requested}"))?
             .canonicalize()
             .with_context(|| format!("插件读取路径不存在：{requested}"))?;
         for allowed in &self.permissions.fs_read {
-            let allowed = resolve_from(&self.plugin_dir, allowed)
+            let allowed = resolve_local_path(&self.plugin_dir, allowed)
+                .with_context(|| format!("解析 manifest fs_read 路径失败：{allowed}"))?
                 .canonicalize()
                 .with_context(|| format!("manifest 中的 fs_read 路径不存在：{allowed}"))?;
             if path == allowed || (allowed.is_dir() && path.starts_with(&allowed)) {

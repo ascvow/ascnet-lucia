@@ -114,6 +114,24 @@ host.kill_process(handle)?;
 
 该 API 不理解 JSON-RPC、MCP 或任何 framing。协议解析全部由插件负责。
 
+## Unix domain socket
+
+```rust
+let handle = host.socket_connect("~/Library/Application Support/Eden/agent.sock", 5_000)?;
+host.socket_send(handle, b"{\"op\":\"hello\"}\n")?;
+match host.socket_recv(handle, 65_536, 500)? {
+    SocketRecv::Data(bytes) => { /* 自己按协议分帧 */ }
+    SocketRecv::Timeout => { /* 本次没数据，连接仍可用 */ }
+    SocketRecv::Closed => { host.socket_close(handle)?; }
+}
+```
+
+需要 manifest 声明 `capabilities.socket.allow_paths`。该 API 只提供字节流；握手、分帧、错误码
+和重连策略都属于插件自己的协议层。`timeout` 与 `closed` 必须分开处理：前者可继续复用连接，
+后者必须重新握手。
+
+Host 对单次 `recv` 的等待有硬上限，插件需要更长等待时应循环切片并把总期限留在自己的协议层。
+
 ## Agent Runtime
 
 | 方法 | 说明 |

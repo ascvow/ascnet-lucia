@@ -1,0 +1,25 @@
+[plugin]
+id = "eden"
+name = "Lucia Eden 编辑器上下文插件"
+version = "0.1.0"
+api_version = "0.10.0"
+wasm = "target/wasm32-wasip2/release/eden_plugin.wasm"
+description = "通过 Eden 编辑器的本地 socket 读取当前选区与编辑器上下文，并在用户可见时定位某一行。"
+
+[capabilities]
+# Eden 启动每个终端窗格时注入这三个变量；宿主默认不继承任何环境变量，只有这里列出的
+# 名字才会被注入 WASM 沙箱。
+env_read = ["EDEN_SESSION", "EDEN_SOCKET", "EDEN_TOKEN_FILE"]
+# 握手令牌只读且路径固定；它同时让本插件全部工具按 unknown 计算权限下限——
+# 既能读本地凭证又能连本地服务，副作用无法用单一 scope 描述。
+fs_read = ["~/Library/Application Support/Eden/agent.token"]
+
+[capabilities.socket]
+# 只允许连接 Eden 自己的 agent socket，逐条精确匹配。
+allow_paths = ["~/Library/Application Support/Eden/agent.sock"]
+
+[capabilities.tool_scopes]
+eden_selection = "network"
+eden_editors = "network"
+eden_context = "network"
+eden_reveal = "network"

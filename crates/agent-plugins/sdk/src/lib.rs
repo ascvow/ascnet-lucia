@@ -51,6 +51,10 @@ world plugin {
   import host-process-read-line: func(request-json: string) -> string;
   import host-process-kill: func(request-json: string) -> string;
   import host-http-request: func(request-json: string) -> string;
+  import host-socket-connect: func(request-json: string) -> string;
+  import host-socket-send: func(request-json: string) -> string;
+  import host-socket-recv: func(request-json: string) -> string;
+  import host-socket-close: func(request-json: string) -> string;
   import host-model-complete: func(request-json: string) -> string;
   import host-agent-runtime-call: func(request-json: string) -> string;
   export activate: func(context-json: string) -> string;
@@ -392,6 +396,65 @@ pub struct HttpResponse {
     /// UTF-8 响应正文；超过 Host 上限的响应会在读取前失败。
     #[serde(default)]
     pub body: String,
+}
+
+/// 一次 Unix domain socket 读取的结果。
+///
+/// 超时与对端关闭必须可区分：超时表示「服务没在时限内回应」，连接仍然可用；关闭表示
+/// 对端已经断开，继续复用只会读到 EOF。把两者混成一个错误会让客户端无法判断该重试还是重连。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocketRecv {
+    /// 成功读到的一段原始字节；长度不超过请求的 `max_bytes`。
+    Data(Vec<u8>),
+    /// 在给定时限内没有新数据，连接仍然可用。
+    Timeout,
+    /// 对端已关闭连接。
+    Closed,
+}
+
+impl<'de> Deserialize<'de> for SocketRecv {
+    /// 按 Host 的稳定 JSON 形状反序列化：`{state, data_base64?}`。
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            state: String,
+            #[serde(default)]
+            data_base64: Option<String>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        match wire.state.as_str() {
+            "data" => {
+                let encoded = wire.data_base64.unwrap_or_default();
+                let bytes = decode_base64(&encoded).map_err(serde::de::Error::custom)?;
+                Ok(Self::Data(bytes))
+            }
+            "timeout" => Ok(Self::Timeout),
+            "closed" => Ok(Self::Closed),
+            other => Err(serde::de::Error::custom(format!(
+                "未知 socket 读取状态：`{other}`"
+            ))),
+        }
+    }
+}
+
+/// 把任意字节编码成跨 ABI 传输的 base64 文本。
+#[doc(hidden)]
+pub fn encode_base64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// 解码 Host 返回的 base64 数据。
+#[doc(hidden)]
+pub fn decode_base64(text: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .map_err(|error| anyhow!("socket 数据不是合法 base64：{error}"))
 }
 
 /// 插件发起的一次受限模型完成请求。
@@ -754,6 +817,32 @@ pub trait PluginHostApi {
         Err(anyhow!("宿主未提供模型完成 API"))
     }
 
+    /// 连接 manifest `capabilities.socket.allow_paths` 允许的 Unix domain socket。
+    ///
+    /// Host 只搬运字节，不解析任何上层协议。路径必须以 `/` 或 `~/` 开头，规范化后必须
+    /// 精确命中 allowlist 且确实是 socket 文件；返回的句柄只在当前插件实例内有效。
+    fn socket_connect(&self, _path: &str, _timeout_ms: u64) -> Result<u64> {
+        Err(anyhow!("宿主未提供 Unix domain socket 能力"))
+    }
+
+    /// 向 socket 句柄写入全部字节。
+    fn socket_send(&self, _handle: u64, _data: &[u8]) -> Result<()> {
+        Err(anyhow!("宿主未提供 Unix domain socket 能力"))
+    }
+
+    /// 从 socket 句柄读取一段数据，最长等待 `timeout_ms`。
+    ///
+    /// Host 会把 `max_bytes` 与等待时长夹到自身上限；调用方需要更长时间时应循环切片读取，
+    /// 而不是要求宿主阻塞更久。
+    fn socket_recv(&self, _handle: u64, _max_bytes: usize, _timeout_ms: u64) -> Result<SocketRecv> {
+        Err(anyhow!("宿主未提供 Unix domain socket 能力"))
+    }
+
+    /// 关闭 socket 句柄并释放文件描述符；不存在时保持幂等。
+    fn socket_close(&self, _handle: u64) -> Result<()> {
+        Err(anyhow!("宿主未提供 Unix domain socket 能力"))
+    }
+
     /// 返回分配给当前插件激活实例的 controller Agent 身份。
     fn agent_identity(&self) -> Result<AgentId> {
         Err(anyhow!("宿主未提供 Agent Runtime API"))
@@ -1020,6 +1109,10 @@ world plugin {
   import host-process-read-line: func(request-json: string) -> string;
   import host-process-kill: func(request-json: string) -> string;
   import host-http-request: func(request-json: string) -> string;
+  import host-socket-connect: func(request-json: string) -> string;
+  import host-socket-send: func(request-json: string) -> string;
+  import host-socket-recv: func(request-json: string) -> string;
+  import host-socket-close: func(request-json: string) -> string;
   import host-model-complete: func(request-json: string) -> string;
   import host-agent-runtime-call: func(request-json: string) -> string;
   export activate: func(context-json: string) -> string;
@@ -1292,6 +1385,49 @@ world plugin {
                 ) -> $crate::Result<$crate::ModelCompletionResponse> {
                     $crate::decode_host_response(&host_model_complete(
                         &$crate::to_json_string(request),
+                    ))
+                }
+
+                fn socket_connect(&self, path: &str, timeout_ms: u64) -> $crate::Result<u64> {
+                    let request = $crate::__serde_json::json!({
+                        "path": path,
+                        "timeout_ms": timeout_ms,
+                    });
+                    $crate::decode_host_response(&host_socket_connect(
+                        &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn socket_send(&self, handle: u64, data: &[u8]) -> $crate::Result<()> {
+                    let request = $crate::__serde_json::json!({
+                        "handle": handle,
+                        "data_base64": $crate::encode_base64(data),
+                    });
+                    $crate::decode_host_response(&host_socket_send(
+                        &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn socket_recv(
+                    &self,
+                    handle: u64,
+                    max_bytes: usize,
+                    timeout_ms: u64,
+                ) -> $crate::Result<$crate::SocketRecv> {
+                    let request = $crate::__serde_json::json!({
+                        "handle": handle,
+                        "max_bytes": max_bytes,
+                        "timeout_ms": timeout_ms,
+                    });
+                    $crate::decode_host_response(&host_socket_recv(
+                        &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn socket_close(&self, handle: u64) -> $crate::Result<()> {
+                    let request = $crate::__serde_json::json!({"handle": handle});
+                    $crate::decode_host_response(&host_socket_close(
+                        &$crate::to_json_string(&request),
                     ))
                 }
 

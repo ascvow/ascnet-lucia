@@ -438,6 +438,67 @@ Rust SDK：`read_process_line(handle, timeout_ms) -> Result<Option<String>>`。
 
 Rust SDK：`kill_process(handle) -> Result<()>`。
 
+## Socket imports
+
+所有 socket 操作要求 manifest 声明 `capabilities.socket.allow_paths`，且路径逐条精确匹配。
+Host 只搬运字节，不解析 NDJSON、JSON-RPC 或任何上层协议；连接数、单次读写字节、单次等待
+时长与单条连接的累计读取量都有上限。
+
+### `host-socket-connect`
+
+```json
+{ "path": "~/Library/Application Support/Eden/agent.sock", "timeout_ms": 5000 }
+```
+
+- `path`：绝对路径或以 `~/` 开头的路径；`~/` 由 Host 展开。拒绝 `..`、抽象命名空间与相对路径。
+- `timeout_ms`：可选，Host 夹到自身上限。
+- Host canonicalize 后与 allowlist 逐条比较，并要求目标确实是 socket 文件；普通文件、目录
+  与不存在的路径一律失败。
+- 成功 `value`：`u64` 连接句柄，只在当前激活实例内有效。
+
+Rust SDK：`socket_connect(path, timeout_ms) -> Result<u64>`。
+
+### `host-socket-send`
+
+```json
+{ "handle": 1, "data_base64": "eyJvcCI6ImhlbGxvIn0K" }
+```
+
+`data_base64` 是标准 base64。Host 写满全部字节后返回，`value` 为 `null`；超过单次写入上限、
+未知句柄或对端不收回进入失败信封。
+
+Rust SDK：`socket_send(handle, bytes) -> Result<()>`。
+
+### `host-socket-recv`
+
+```json
+{ "handle": 1, "max_bytes": 65536, "timeout_ms": 500 }
+```
+
+成功 `value` 的三种稳定状态：
+
+```json
+{ "state": "data", "data_base64": "eyJvcCI6IndlbGNvbWUifQo=" }
+{ "state": "timeout" }
+{ "state": "closed" }
+```
+
+`timeout` 表示本次等待内没有数据，连接仍然可用；`closed` 表示对端已关闭，应释放句柄。
+Host 把 `max_bytes` 与等待时长夹到自身上限，需要更长等待时应由插件循环切片读取。
+
+Rust SDK：`socket_recv(handle, max_bytes, timeout_ms) -> Result<SocketRecv>`。
+
+### `host-socket-close`
+
+```json
+{ "handle": 1 }
+```
+
+关闭并释放文件描述符，成功 `value` 为 `null`；句柄不存在时保持幂等。Guest 应在 `deactivate`
+主动清理，Host 丢弃 store 时也会回收全部句柄。
+
+Rust SDK：`socket_close(handle) -> Result<()>`。
+
 ## 模型完成 import
 
 ### `host-model-complete`

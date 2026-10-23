@@ -47,6 +47,12 @@
       "crate": "knowledge-plugin",
       "directory": "examples/plugins/knowledge-plugin",
       "files": ["plugin.toml", "target/wasm32-wasip2/release/knowledge_plugin.wasm"]
+    },
+    {
+      "id": "eden",
+      "crate": "eden-plugin",
+      "directory": "examples/plugins/eden-plugin",
+      "files": ["plugin.toml", "target/wasm32-wasip2/release/eden_plugin.wasm"]
     }
   ]
 }

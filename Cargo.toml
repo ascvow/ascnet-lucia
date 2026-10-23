@@ -25,6 +25,8 @@ members = [
     "examples/plugins/plan-plugin",
     "examples/plugins/memory-plugin",
     "examples/plugins/knowledge-plugin",
+    "examples/plugins/eden-plugin",
+    "examples/plugins/eden-plugin/smoke-tests",
     "examples/plugins/permission-plugin",
     "examples/plugins/permission-plugin/smoke-tests",
 ]
@@ -69,7 +71,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 semver = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
