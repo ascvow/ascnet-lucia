@@ -487,9 +487,10 @@ pub(crate) fn output_preview_lines(text: &str, max_lines: usize) -> Vec<PreviewL
         lines.push(PreviewLine::Elided { hidden: start });
     }
     let is_diff = diff::looks_like_diff(&rows);
-    let kinds = is_diff.then(|| diff::classify_rows(&rows));
+    // 只分类要渲染的尾部：运行期输出可涨到 200KB，逐帧全量分类是纯粹的浪费。
+    let kinds = is_diff.then(|| diff::classify_tail(&rows, start));
     lines.extend(rows[start..].iter().enumerate().map(|(offset, row)| {
-        let kind = kinds.as_ref().map(|kinds| kinds[start + offset]);
+        let kind = kinds.as_ref().map(|kinds| kinds[offset]);
         match kind {
             Some(DiffLineKind::FileHeader) => PreviewLine::FileHeader {
                 text: row.trim_end().to_string(),

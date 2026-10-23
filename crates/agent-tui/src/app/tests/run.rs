@@ -305,7 +305,7 @@ fn thinking_deltas_only_toggle_run_phase() {
 #[tokio::test]
 async fn channel_event_sink_coalesces_model_text_notifications() {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, model_deltas, _thinking_deltas) = ChannelEventSink::new(tx);
+    let (sink, model_deltas, _thinking_deltas, _tool_deltas) = ChannelEventSink::new(tx);
     let first = AgentEvent::new(
         "run-test",
         AgentEventKind::ModelTextDelta,
@@ -340,7 +340,7 @@ async fn channel_event_sink_coalesces_model_text_notifications() {
 #[tokio::test]
 async fn channel_event_sink_accepts_context_snapshot_and_legacy_requests() {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, _, _) = ChannelEventSink::new(tx);
+    let (sink, _, _, _) = ChannelEventSink::new(tx);
     let event = AgentEvent::new(
         "context",
         AgentEventKind::ModelRequest,
@@ -363,7 +363,7 @@ async fn channel_event_sink_accepts_context_snapshot_and_legacy_requests() {
 #[tokio::test]
 async fn channel_event_sink_forwards_prompt_cache_usage_breakdown() {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, _model_deltas, _thinking_deltas) = ChannelEventSink::new(tx);
+    let (sink, _model_deltas, _thinking_deltas, _tool_deltas) = ChannelEventSink::new(tx);
     let event = AgentEvent::new(
         "run-cache",
         AgentEventKind::ModelResponse,
@@ -426,7 +426,7 @@ fn cache_hit_rate_is_hidden_without_cache_reads() {
 #[tokio::test]
 async fn channel_event_sink_coalesces_thinking_notifications_separately() {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, model_deltas, thinking_deltas) = ChannelEventSink::new(tx);
+    let (sink, model_deltas, thinking_deltas, _tool_deltas) = ChannelEventSink::new(tx);
     for delta in ["检查", "边界"] {
         sink.record(&AgentEvent::new(
             "run-test",
@@ -454,30 +454,61 @@ async fn channel_event_sink_coalesces_thinking_notifications_separately() {
     );
 }
 
-/// 工具输出事件应保留调用 ID、输出流和文本，供消息状态机增量更新。
+/// 工具输出应按共享缓冲区合批，一个 chunk 不再单独触发一次整帧重绘。
+///
+/// 命令狂打日志时事件率可到每秒数千；逐个转发等于逐个整帧重绘，是能把渲染线程打满的
+/// 唯一路径。这里断言：连发三段只产生**一次**就绪通知，且取出后顺序与内容完整。
 #[tokio::test]
-async fn channel_event_sink_forwards_tool_output_delta() {
+async fn channel_event_sink_batches_tool_output_deltas() {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (sink, _model_deltas, _thinking_deltas) = ChannelEventSink::new(tx);
-    let output = ToolOutputDelta {
-        call_id: "call-live".into(),
-        stream: agent_tool::ToolOutputStream::Stderr,
-        delta: "Compiling agent-core\n".into(),
-    };
+    let (sink, _model_deltas, _thinking_deltas, tool_deltas) = ChannelEventSink::new(tx);
+    let outputs = [
+        ToolOutputDelta {
+            call_id: "call-live".into(),
+            stream: agent_tool::ToolOutputStream::Stderr,
+            delta: "Compiling agent-core\n".into(),
+        },
+        ToolOutputDelta {
+            call_id: "call-live".into(),
+            stream: agent_tool::ToolOutputStream::Stderr,
+            delta: "Compiling lucia\n".into(),
+        },
+        ToolOutputDelta {
+            call_id: "call-other".into(),
+            stream: agent_tool::ToolOutputStream::Stdout,
+            delta: "done\n".into(),
+        },
+    ];
 
+    for output in &outputs {
+        sink.record(&AgentEvent::new(
+            "run-test",
+            AgentEventKind::ToolOutputDelta,
+            0,
+            serde_json::to_value(output).expect("应序列化工具输出"),
+        ))
+        .await
+        .expect("应记录工具输出");
+    }
+
+    let Some(UiEvent::ToolOutputReady) = rx.recv().await else {
+        panic!("应收到工具输出就绪事件");
+    };
+    assert!(rx.try_recv().is_err(), "同一次合批不应产生第二个就绪事件");
+
+    let received = tool_deltas.lock().expect("工具输出缓冲区锁不应中毒").take();
+    assert_eq!(received, outputs, "合批必须保持到达顺序与内容完整");
+
+    // 取走之后，下一段输出会重新触发就绪通知。
     sink.record(&AgentEvent::new(
         "run-test",
         AgentEventKind::ToolOutputDelta,
         0,
-        serde_json::to_value(&output).expect("应序列化工具输出"),
+        serde_json::to_value(&outputs[0]).expect("应序列化工具输出"),
     ))
     .await
     .expect("应记录工具输出");
-
-    let Some(UiEvent::ToolOutputDelta(received)) = rx.recv().await else {
-        panic!("应收到工具输出 UI 事件");
-    };
-    assert_eq!(received, output);
+    assert!(matches!(rx.recv().await, Some(UiEvent::ToolOutputReady)));
 }
 
 /// 验证成功轮次创建并更新同一稳定会话，且每次保存都会推进 revision。
@@ -856,4 +887,159 @@ fn cancelled_completion_keeps_frozen_visible_history() {
         .messages
         .iter()
         .any(|message| message.text == "Run cancelled; visible output was frozen"));
+}
+
+/// 小段增量（正常逐 token 流式）必须一帧全出，不能引入额外延迟。
+///
+/// 揭示预算的下限远高于真实 token 大小，这是"优化流畅度但不拖慢输出"的关键前提。
+#[test]
+fn trickle_deltas_are_revealed_in_a_single_frame() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+
+    app.queue_model_delta("正在读取配置文件…");
+    let revealed = app.reveal_pending_stream();
+
+    assert_eq!(revealed, "正在读取配置文件…".chars().count());
+    assert!(!app.has_pending_stream(), "小段文本不应滞留在缓冲里");
+    assert!(app
+        .messages
+        .iter()
+        .any(|message| message.text == "正在读取配置文件…"));
+}
+
+/// 网络一次推来的整段文本会被摊平到多帧，而不是一帧整块蹦出。
+///
+/// 这是"卡顿感"的根因修复：屏幕节奏不再等于网络到达节奏。
+#[test]
+fn burst_text_is_revealed_across_a_few_frames() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    let payload = "字".repeat(500);
+
+    app.queue_model_delta(&payload);
+    let mut frames = 0;
+    let mut per_frame = Vec::new();
+    while app.has_pending_stream() && frames < 64 {
+        per_frame.push(app.reveal_pending_stream());
+        frames += 1;
+    }
+
+    assert!(frames > 1, "整段突发不应在一帧内全部出现：{per_frame:?}");
+    assert!(frames <= 12, "突发应快速铺完，不能变成慢放：{per_frame:?}");
+    // 最后一帧只揭示剩余量，必然可能低于下限；下限约束的是每帧的预算。
+    let budgeted = &per_frame[..per_frame.len() - 1];
+    assert!(
+        budgeted
+            .iter()
+            .all(|chars| *chars >= crate::theme::REVEAL_CHARS_PER_FRAME),
+        "每帧揭示量不应低于下限：{per_frame:?}"
+    );
+    let shown = app
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<String>();
+    assert_eq!(
+        shown.chars().count(),
+        payload.chars().count(),
+        "字符不能丢失"
+    );
+}
+
+/// 积压超过背压上限时立即清空超出部分，模型结束时不会还差半屏没显示。
+#[test]
+fn backlog_beyond_limit_is_flushed_immediately() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    let oversized = "a".repeat(crate::theme::REVEAL_BACKLOG_LIMIT * 2);
+
+    app.queue_model_delta(&oversized);
+    let revealed = app.reveal_pending_stream();
+
+    assert!(
+        revealed >= crate::theme::REVEAL_BACKLOG_LIMIT,
+        "超出背压上限的部分应一次性上屏：{revealed}"
+    );
+    assert!(
+        app.pending_stream.len() <= crate::theme::REVEAL_BACKLOG_LIMIT,
+        "剩余积压应回落到上限以内：{}",
+        app.pending_stream.len()
+    );
+}
+
+/// 揭示只能在字符边界切分：切坏多字节字符会渲染成乱码。
+#[test]
+fn reveal_never_splits_a_multibyte_character() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    // 每个字符占 3 字节，且总量超过单帧下限，逼迫预算落在字符中间。
+    let payload = "汉".repeat(97);
+
+    app.queue_model_delta(&payload);
+    while app.has_pending_stream() {
+        app.reveal_pending_stream();
+        let shown: String = app.messages.iter().map(|m| m.text.as_str()).collect();
+        assert!(
+            payload.starts_with(&shown),
+            "已显示的文本必须是原文的完整前缀（不允许半个字符）：{shown:?}"
+        );
+    }
+}
+
+/// 工具开始前必须把待揭示文本补完，否则后续揭示的文字会跑到工具卡片上方。
+#[test]
+fn flush_completes_text_before_the_next_boundary() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    let payload = "字".repeat(400);
+
+    app.queue_model_delta(&payload);
+    app.flush_pending_stream();
+
+    assert!(!app.has_pending_stream());
+    let shown = app
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<String>();
+    assert_eq!(shown, payload);
+}
+
+/// 运行已结束时残留缓冲会被丢弃，不会写进下一条消息。
+#[test]
+fn pending_text_is_dropped_after_the_run_ends() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.queue_model_delta("迟到正文");
+    app.running = false;
+
+    assert_eq!(app.reveal_pending_stream(), 0);
+    assert!(!app.has_pending_stream());
+    assert!(app.messages.is_empty(), "取消后的迟到正文不应上屏");
+}
+
+/// 有待揭示文本时 tick 必须重绘，否则打字机停在当前字符等下一个网络事件。
+#[test]
+fn tick_requires_redraw_while_text_is_pending() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    assert!(app.tick_requires_redraw(), "运行中需要推进动画");
+
+    app.queue_model_delta("待揭示");
+    // 运行已结束但缓冲仍有残余：这是 Done 与最后一批揭示之间的防御性状态，
+    // 此时必须继续出帧，否则残余文本永远不会上屏。
+    app.running = false;
+    assert!(app.has_pending_stream());
+    assert!(app.tick_requires_redraw(), "有待揭示文本时必须继续出帧");
+
+    app.reveal_pending_stream();
+    assert!(!app.tick_requires_redraw(), "残余清空后回到纯事件驱动");
 }

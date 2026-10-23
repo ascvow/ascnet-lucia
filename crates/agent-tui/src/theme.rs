@@ -123,7 +123,31 @@ pub(crate) const COLOR_SYNTAX_PUNCT: Color = Color::Rgb(150, 148, 142);
 #[cfg(feature = "plugins")]
 pub(crate) const PLUGIN_STATUS_DETAIL_TICKS: u16 = 75;
 /// UI 动画和后台维护使用的基础 tick 间隔。
+///
+/// 这个 tick 只负责推进动画（spinner、插件状态计时），不承担流式文本的节拍：文本由
+/// [`REVEAL_FRAME_INTERVAL_MS`] 的揭示时钟驱动，只有在确实有待显示文本时才启用。
+/// 因此调大或调小它都不会改变打字机的流畅度。
 pub(crate) const UI_TICK_INTERVAL_MS: u64 = 80;
+/// 流式文本揭示帧间隔（约 60fps）。
+///
+/// 屏幕节奏必须与网络到达节奏解耦：若只在收到数据时重绘，网络一抖动就会"静止一段时间
+/// 后整段蹦出"。这个间隔只在有待揭示文本时驱动一次重绘，空闲时完全不唤醒。
+pub(crate) const REVEAL_FRAME_INTERVAL_MS: u64 = 16;
+/// 单帧至少揭示的字符数。
+///
+/// 按 60fps 计算约 3000 字符/秒，远高于任何模型的实际输出速度（约 200 字符/秒）：
+/// 因此正常的逐 token 流式会被一次性全部上屏，不引入额外延迟。
+pub(crate) const REVEAL_CHARS_PER_FRAME: usize = 48;
+/// 一次突发被摊平的目标帧数。
+///
+/// 网络一次推来 N 个字符时，每帧揭示 N/该值（不低于 [`REVEAL_CHARS_PER_FRAME`]）：
+/// 突发越大摊得越快，几百字符的整段输出约 4~6 帧铺完，观感是连续吐字。
+pub(crate) const REVEAL_SPREAD_FRAMES: usize = 6;
+/// 待揭示缓冲的背压上限（字节）。
+///
+/// 网络远快于屏幕时，允许积压到这个量级；超过后立即清空积压，保证模型结束时屏幕上
+/// 不会还差半屏没显示。
+pub(crate) const REVEAL_BACKLOG_LIMIT: usize = 4096;
 /// 单个附件大小上限（10 MiB），兼顾常见模型接口的请求体限制。
 pub(crate) const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 /// 周期插件视图刷新间隔，约为一秒。

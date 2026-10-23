@@ -164,6 +164,12 @@ pub(crate) struct App {
     pub(crate) spinner_frame: usize,
     /// 当前正在接收增量文本的助手消息索引。
     pub(crate) streaming_message: Option<usize>,
+    /// 已收到但尚未显示到屏幕上的模型增量文本（打字机揭示缓冲）。
+    ///
+    /// 网络层按 TCP/SSE 的节奏交付文本，而屏幕需要固定的帧节拍：直接把每个增量写进
+    /// 消息会让"屏幕刷新节奏"等于"网络到达节奏"。网络抖动时就表现为一会儿静止、
+    /// 一会儿蹦出一整段。这里把到达与显示分开，由每帧的揭示预算决定上屏多少。
+    pub(crate) pending_stream: String,
     /// 用户取消当前运行后立即关闭可见流，防止已排队的模型或工具增量继续刷新界面。
     pub(crate) run_stream_cancelled: bool,
     /// 当前模型是否处于思考阶段；仅控制状态文案，不保存推理摘要文本。
@@ -431,6 +437,7 @@ impl App {
             config_path: None,
             spinner_frame: 0,
             streaming_message: None,
+            pending_stream: String::new(),
             run_stream_cancelled: false,
             model_is_thinking: false,
             #[cfg(feature = "plugins")]
@@ -507,7 +514,11 @@ impl App {
         let plugin_activity = self.plugins_loading || self.plugin_status_ticks > 0;
         #[cfg(not(feature = "plugins"))]
         let plugin_activity = false;
-        self.running || self.pending_reload.is_some() || plugin_activity
+        // 有待揭示文本时必须继续出帧，否则打字机会停在当前字符上等下一个网络事件。
+        self.running
+            || self.has_pending_stream()
+            || self.pending_reload.is_some()
+            || plugin_activity
     }
 
     /// 注入启动时读取的渲染模式；缺省为全屏。

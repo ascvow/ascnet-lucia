@@ -130,6 +130,27 @@ fn is_hunk_header(row: &str) -> bool {
             .all(|ch| ch.is_ascii_digit() || matches!(ch, '-' | '+' | ',' | ' '))
 }
 
+/// 只分类 `rows[start..]` 这一段尾部，用于运行期预览这种只渲染末尾若干行的场景。
+///
+/// hunk 状态必须从缓冲区开头累积：只看尾部会把 hunk 内的 `--- 内容` 误判成文件头。
+/// 因此先用一次廉价的前缀扫描（只做形状校验）定位尾部起点是否已在 hunk 内，再逐行分类。
+/// 判定"整段是不是 diff"仍由 [`looks_like_diff`] 对全量文本完成：那个结论必须稳定，
+/// 否则滚动过程中预览会在"diff 着色"和"普通文本"之间反复跳变。
+pub(crate) fn classify_tail(rows: &[&str], start: usize) -> Vec<DiffLineKind> {
+    let start = start.min(rows.len());
+    let mut in_hunk = rows[..start].iter().any(|row| is_hunk_header(row));
+    rows[start..]
+        .iter()
+        .map(|row| {
+            let kind = classify(row, in_hunk);
+            if kind == DiffLineKind::HunkHeader {
+                in_hunk = true;
+            }
+            kind
+        })
+        .collect()
+}
+
 /// 逐行分类整段 diff，并自动维护"是否已进入 hunk"的状态。
 ///
 /// 渲染层需要逐行取类别，而 hunk 状态必须跨行推进；把状态机放在这里，调用方就不必

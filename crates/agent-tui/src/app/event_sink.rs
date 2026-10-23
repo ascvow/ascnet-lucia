@@ -1,6 +1,7 @@
 //! 把 Agent 事件流转换为 TUI 通道事件的宿主 Sink。
 
 use crate::event::UiEvent;
+use crate::stream_probe::StreamProbe;
 use crate::theme::{COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_USER, COLOR_WARNING};
 #[cfg(feature = "plugins")]
 use crate::ui::plugin_bridge::plugin_footer_event;
@@ -40,32 +41,76 @@ impl ModelDeltaBuffer {
     }
 }
 
+/// 合并工具运行期输出，避免每个 chunk 都触发一次整帧重绘。
+///
+/// 模型文本早就有同样的合批，工具输出却一直是"一个 chunk 一个事件"。命令狂打日志时
+/// 事件率可以到每秒数千，而每个事件都要整帧重扫预览缓冲：这是唯一能把渲染线程打满的
+/// 路径。这里按到达顺序保留全部 chunk，UI 一次取走并顺序拼接，保证输出不乱序、不丢失。
+#[derive(Default)]
+pub(crate) struct ToolOutputBuffer {
+    deltas: Vec<ToolOutputDelta>,
+    notification_pending: bool,
+}
+
+impl ToolOutputBuffer {
+    /// 追加一段输出，并返回是否需要向 UI 发送新的就绪通知。
+    fn push(&mut self, delta: ToolOutputDelta) -> bool {
+        self.deltas.push(delta);
+        if self.notification_pending {
+            false
+        } else {
+            self.notification_pending = true;
+            true
+        }
+    }
+
+    /// 取出当前积累的全部输出片段并允许生产者发送下一次就绪通知。
+    pub(crate) fn take(&mut self) -> Vec<ToolOutputDelta> {
+        self.notification_pending = false;
+        std::mem::take(&mut self.deltas)
+    }
+}
+
 /// 将 Agent 事件转换为 TUI 事件；高频模型文本通过共享缓冲区合并。
 pub(crate) struct ChannelEventSink {
     tx: mpsc::UnboundedSender<UiEvent>,
     model_deltas: Arc<std::sync::Mutex<ModelDeltaBuffer>>,
     thinking_deltas: Arc<std::sync::Mutex<ModelDeltaBuffer>>,
+    tool_output: Arc<std::sync::Mutex<ToolOutputBuffer>>,
+    /// 可选的流式诊断探针；只记录到达节奏，不参与 UI 决策。
+    probe: Option<StreamProbe>,
 }
 
 impl ChannelEventSink {
-    /// 创建事件 sink，并返回供 UI 分别消费回答文本和推理摘要的共享缓冲区。
+    /// 绑定流式诊断探针；未启用诊断时传入 `None`，所有记录点都会短路。
+    pub(crate) fn with_probe(mut self, probe: Option<StreamProbe>) -> Self {
+        self.probe = probe;
+        self
+    }
+
+    /// 创建事件 sink，并返回供 UI 消费回答文本、推理摘要与工具输出的共享缓冲区。
     pub(crate) fn new(
         tx: mpsc::UnboundedSender<UiEvent>,
     ) -> (
         Self,
         Arc<std::sync::Mutex<ModelDeltaBuffer>>,
         Arc<std::sync::Mutex<ModelDeltaBuffer>>,
+        Arc<std::sync::Mutex<ToolOutputBuffer>>,
     ) {
         let model_deltas = Arc::new(std::sync::Mutex::new(ModelDeltaBuffer::default()));
         let thinking_deltas = Arc::new(std::sync::Mutex::new(ModelDeltaBuffer::default()));
+        let tool_output = Arc::new(std::sync::Mutex::new(ToolOutputBuffer::default()));
         (
             Self {
                 tx,
                 model_deltas: model_deltas.clone(),
                 thinking_deltas: thinking_deltas.clone(),
+                tool_output: tool_output.clone(),
+                probe: None,
             },
             model_deltas,
             thinking_deltas,
+            tool_output,
         )
     }
 }
@@ -92,6 +137,9 @@ impl EventSink for ChannelEventSink {
             }
             AgentEventKind::ModelTextDelta => {
                 if let Some(delta) = event.payload.get("delta").and_then(Value::as_str) {
+                    if let Some(probe) = self.probe.as_ref() {
+                        probe.record_model_delta(delta.len());
+                    }
                     let should_notify = self
                         .model_deltas
                         .lock()
@@ -119,8 +167,18 @@ impl EventSink for ChannelEventSink {
                 let _ = self.tx.send(UiEvent::ToolStarted(call));
             }
             AgentEventKind::ToolOutputDelta => {
+                if let Some(probe) = self.probe.as_ref() {
+                    probe.record_tool_delta();
+                }
                 let output = serde_json::from_value::<ToolOutputDelta>(event.payload.clone())?;
-                let _ = self.tx.send(UiEvent::ToolOutputDelta(output));
+                let should_notify = self
+                    .tool_output
+                    .lock()
+                    .expect("工具输出缓冲区锁不应中毒")
+                    .push(output);
+                if should_notify {
+                    let _ = self.tx.send(UiEvent::ToolOutputReady);
+                }
             }
             AgentEventKind::ToolFinished => {
                 let result = serde_json::from_value::<ToolResult>(event.payload.clone())?;

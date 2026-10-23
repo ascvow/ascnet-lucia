@@ -316,6 +316,8 @@ impl App {
         if self.run_stream_cancelled {
             return;
         }
+        // 取消前先把已收到的文本补完：否则屏幕会永远停在"差几个字"的状态。
+        self.flush_pending_stream();
         self.run_stream_cancelled = true;
         self.model_is_thinking = false;
         self.streaming_message = None;

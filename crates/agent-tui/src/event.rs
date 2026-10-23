@@ -4,7 +4,7 @@ use crate::session::conversation::UserSubmission;
 use agent_core::model::TokenUsage;
 use agent_core::AgentRun;
 use agent_session::{SessionId, SessionRecord, SessionStoreError, SessionSummary};
-use agent_tool::{ToolCall, ToolOutputDelta, ToolResult};
+use agent_tool::{ToolCall, ToolResult};
 use anyhow::Result;
 use crossterm::event::Event;
 use ratatui::style::Color;
@@ -27,8 +27,11 @@ pub(crate) enum UiEvent {
     ModelThinkingReady,
     /// 工具开始执行，携带未经裁剪的调用数据。
     ToolStarted(ToolCall),
-    /// 工具运行期间产生一段可立即展示的输出。
-    ToolOutputDelta(ToolOutputDelta),
+    /// 共享工具输出缓冲区已有尚未展示的运行期输出。
+    ///
+    /// 命令可以每秒产生上千个 chunk；逐个转发等于逐个整帧重绘，会把渲染线程打满。
+    /// 与模型文本一样按缓冲区合并，UI 一次取走本帧积累的全部 chunk。
+    ToolOutputReady,
     /// 工具完成执行，携带未经裁剪的结果与 UI 细节。
     ToolFinished(ToolResult),
     /// 工具未执行，保留原始调用和跳过原因。

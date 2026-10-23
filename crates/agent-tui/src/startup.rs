@@ -26,9 +26,10 @@ use crate::session::{
     load_startup_session, print_persisted_sessions, resolve_tui_path, start_session_context_reload,
     LazyFileSessionStore, WorkspaceContext,
 };
+use crate::stream_probe::StreamProbe;
 #[cfg(feature = "plugins")]
 use crate::theme::PLUGIN_REFRESH_TICKS;
-use crate::theme::UI_TICK_INTERVAL_MS;
+use crate::theme::{REVEAL_FRAME_INTERVAL_MS, UI_TICK_INTERVAL_MS};
 #[cfg(feature = "plugins")]
 use crate::ui::plugin_bridge::{
     apply_plugin_footer_event, apply_plugin_frames, apply_plugin_navigation_event,
@@ -56,6 +57,7 @@ use agent_skill::SkillCatalog;
 use agent_tool::{JsonTool, ToolRegistry};
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, KeyEventKind, MouseEventKind};
+use crossterm::SynchronizedUpdate;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use serde_json::{json, Value};
@@ -419,7 +421,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
 
     // UI 通道 sink 之外，可选叠加 JSONL sink 用于排查请求与工具调用。
     let mut sink = CompositeEventSink::new();
-    let (ui_sink, model_deltas, thinking_deltas) = ChannelEventSink::new(tx.clone());
+    // 流式诊断探针：只有显式设置 LUCIA_STREAM_DEBUG=1 时才创建，默认零开销。
+    let probe = StreamProbe::from_env();
+    let (ui_sink, model_deltas, thinking_deltas, tool_deltas) = ChannelEventSink::new(tx.clone());
+    let ui_sink = ui_sink.with_probe(probe.clone());
     sink.push(Arc::new(ui_sink));
     if let Some(path) = events_jsonl.as_ref() {
         sink.push(Arc::new(JsonlEventSink::new(path.clone())));
@@ -609,17 +614,47 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             apply_fullscreen_switch(&mut terminal, fullscreen)?;
             needs_redraw = true;
         }
+        // 打字机揭示：先按本帧预算把已收到但未显示的文本铺上屏，再决定是否重绘。
+        // 这一步让"屏幕节奏"由帧时钟决定，而不是由网络到达节奏决定。
+        let revealed = app.reveal_pending_stream();
+        if revealed > 0 {
+            needs_redraw = true;
+        }
         if needs_redraw {
-            let rendered = terminal.draw(|frame| {
-                render_root(frame, &mut app);
-                app.render_text_selection(frame.buffer_mut());
-            })?;
+            // 同步更新事务：终端在收到结束标记前不刷新画面，避免一帧内的多次写入被
+            // 逐条呈现（高帧率下表现为闪烁/撕裂）。不支持该扩展的终端会忽略它。
+            let frame_started = std::time::Instant::now();
+            let mut stdout = std::io::stdout();
+            let rendered = stdout.sync_update(|_| {
+                terminal.draw(|frame| {
+                    render_root(frame, &mut app);
+                    app.render_text_selection(frame.buffer_mut());
+                })
+            })??;
             // 复制一份帧缓冲区：鼠标选择需要读取刚绘制的内容，而终端在下一次绘制时
             // 会复用同一块缓冲区，跨迭代持有借用会与可变借用冲突。
             rendered_buffer.clone_from(rendered.buffer);
+            if let Some(probe) = probe.as_ref() {
+                probe.record_frame(frame_started.elapsed(), revealed);
+            }
         }
 
-        let event = rx.recv().await;
+        // 有待揭示文本时按揭示帧时钟等待：既不会漏掉网络事件，也不会因为网络静止而
+        // 停止出帧。没有待揭示文本时保持纯事件驱动，空闲不空转。
+        let event = if app.has_pending_stream() {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(REVEAL_FRAME_INTERVAL_MS),
+                rx.recv(),
+            )
+            .await
+            {
+                Ok(event) => event,
+                // 超时只代表"这一帧没有新事件"：继续揭示下一批，不算通道关闭。
+                Err(_) => continue,
+            }
+        } else {
+            rx.recv().await
+        };
         // 任何事件都可能改变界面；只有 tick 需要按动画状态判断是否值得刷新。
         needs_redraw = !matches!(event, Some(UiEvent::Tick)) || app.tick_requires_redraw();
 
@@ -843,7 +878,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     .expect("模型增量缓冲区锁不应中毒")
                     .take();
                 if !delta.is_empty() {
-                    app.append_model_delta(&delta);
+                    // 只入缓冲，由每帧的揭示预算决定上屏多少：一次突发的整段文本不会
+                    // 变成一次整屏重排。
+                    app.queue_model_delta(&delta);
                 }
             }
             Some(UiEvent::ModelThinkingReady) => {
@@ -859,6 +896,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 if !app.accepts_run_stream_output() {
                     continue;
                 }
+                // 工具消息要插在助手正文之后：先把待揭示文本补完，否则后续揭示的文字
+                // 会出现在工具卡片上方，视觉顺序与真实发生顺序相反。
+                app.flush_pending_stream();
                 app.finish_model_thinking();
                 #[cfg(feature = "plugins")]
                 let call_id = call.id.clone();
@@ -868,15 +908,20 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     app.schedule_tool_render(Arc::clone(host), &call_id);
                 }
             }
-            Some(UiEvent::ToolOutputDelta(output)) => {
-                if app.accepts_run_stream_output() {
+            Some(UiEvent::ToolOutputReady) => {
+                // 一次取出本帧积累的全部 chunk：命令狂打日志时事件率不再等于帧率。
+                let deltas = tool_deltas.lock().expect("工具输出缓冲区锁不应中毒").take();
+                if deltas.is_empty() || !app.accepts_run_stream_output() {
+                    continue;
+                }
+                for delta in deltas {
                     if let Some(message) = app
                         .messages
                         .iter_mut()
                         .rev()
-                        .find(|message| message.tool_call_id() == Some(output.call_id.as_str()))
+                        .find(|message| message.tool_call_id() == Some(delta.call_id.as_str()))
                     {
-                        message.append_tool_output(&output.delta);
+                        message.append_tool_output(&delta.delta);
                     }
                 }
             }
@@ -1183,6 +1228,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
 
     // 终端恢复由 TerminalGuard 的 Drop 统一执行。
     drop(terminal_guard);
+    // 诊断报告在终端恢复之后写：文件写入与提示都不能打扰 TUI 画面。
+    if let Some(probe) = probe.as_ref() {
+        if let Some(path) = probe.write_report(&lucia_home) {
+            println!("流式诊断报告已写入 {}", path.display());
+        }
+    }
     #[cfg(feature = "plugins")]
     if let Some(error) = plugin_shutdown_error {
         return Err(error);
