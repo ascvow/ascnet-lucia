@@ -280,7 +280,7 @@ impl Msg {
     pub(crate) fn to_lines(&self, streaming: bool, width: u16) -> Vec<Line<'_>> {
         match self.kind {
             MsgKind::User => user_lines(&self.text, width),
-            MsgKind::Assistant => markdown_lines(&self.text, streaming),
+            MsgKind::Assistant => markdown_lines(&self.text, streaming, width),
             MsgKind::ToolRunning => self.tool_lines("", COLOR_WARNING, width),
             MsgKind::ToolOk => self.tool_lines("", COLOR_SUCCESS, width),
             MsgKind::ToolError => self.tool_lines("failed", COLOR_DANGER, width),

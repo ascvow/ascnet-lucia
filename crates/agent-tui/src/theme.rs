@@ -40,6 +40,10 @@ pub(crate) const COLOR_SELECTION_MARK: Color = Color::Rgb(226, 61, 82);
 
 /// 代码预览左侧行号列颜色；比正文更暗，避免与内容争夺注意力。
 pub(crate) const COLOR_LINE_NUMBER: Color = Color::Rgb(92, 90, 86);
+/// 行内代码与围栏代码块的文字颜色：暖色，与正文的中性灰区分开。
+pub(crate) const COLOR_CODE: Color = Color::Rgb(206, 184, 146);
+/// 围栏代码块的整块底色：比消息区略亮的深灰，把代码从正文里垫出来。
+pub(crate) const COLOR_CODE_BG: Color = Color::Rgb(34, 33, 38);
 /// diff 新增行的整行背景色。
 pub(crate) const COLOR_DIFF_ADD_BG: Color = Color::Rgb(26, 56, 36);
 /// diff 删除行的整行背景色。

@@ -45,6 +45,18 @@ impl CodeLanguage {
         }
     }
 
+    /// 按围栏代码块声明的语言标签推断语言族。
+    ///
+    /// 标签是写给人看的名字（`rust`、`python`、`bash`），并不总是扩展名，
+    /// 因此先映射常见别名，其余退回按扩展名判断；未知标签返回纯文本。
+    pub(crate) fn from_tag(tag: &str) -> Self {
+        match tag.trim().to_ascii_lowercase().as_str() {
+            "rust" | "javascript" | "typescript" | "js" | "ts" | "jsx" | "tsx" => Self::CLike,
+            "python" | "shell" | "bash" | "zsh" | "console" | "shell-session" => Self::Hash,
+            other => Self::from_path(&format!("file.{other}")),
+        }
+    }
+
     /// 判断该语言是否使用 `#` 起始的行注释。
     fn hash_comment(self) -> bool {
         matches!(self, Self::Hash)

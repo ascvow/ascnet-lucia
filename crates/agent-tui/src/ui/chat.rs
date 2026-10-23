@@ -4,7 +4,7 @@ use crate::app::{input_ref_spans, App, ToolMessageHitRegion};
 use crate::command::{reasoning_level_command_value, render_native_command_panel};
 use crate::theme::{
     COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SEPARATOR, COLOR_SUCCESS, COLOR_TEXT,
-    COLOR_USER, COLOR_USER_BG, COLOR_WARNING, SPINNER,
+    COLOR_USER, COLOR_WARNING, SPINNER,
 };
 use crate::ui::markdown::truncate_line;
 #[cfg(feature = "plugins")]
@@ -224,10 +224,11 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                     };
                     // 清空提示区域后绘制完整文本，尺寸变化时不依赖底层内容覆盖。
                     frame.render_widget(Clear, hint_area);
+                    // 只用文字色不用底色：这行是留白行，铺满色块会把呼吸感挤掉。
                     frame.render_widget(
                         Paragraph::new(Line::from(Span::styled(
                             hint,
-                            Style::new().fg(COLOR_WARNING).bg(COLOR_USER_BG),
+                            Style::new().fg(COLOR_WARNING),
                         ))),
                         hint_area,
                     );

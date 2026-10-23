@@ -658,14 +658,9 @@ fn summarize_json_folds_nested_structures() {
     assert_eq!(summary, "path: src, entries: [2 项], meta: {…}");
 }
 
-/// 验证 Markdown 表格排版为对齐行：分隔行转为横线，中文列按显示宽度补齐。
-#[test]
-fn markdown_tables_render_aligned() {
-    let lines = markdown_lines(
-        "说明\n\n| 模块 | 作用 |\n|---|---|\n| core | Agent 循环 |\n| tool | 工具注册 |\n\n结尾",
-        false,
-    );
-    let rows: Vec<String> = lines
+/// 拼接一组渲染行的可读文本，供 Markdown 断言使用。
+fn line_texts(lines: &[Line<'_>]) -> Vec<String> {
+    lines
         .iter()
         .map(|line| {
             line.spans
@@ -673,7 +668,19 @@ fn markdown_tables_render_aligned() {
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
         })
-        .collect();
+        .collect()
+}
+
+/// 验证 Markdown 表格排版为对齐行：分隔行转为横线，中文列按显示宽度补齐。
+#[test]
+fn markdown_tables_render_aligned() {
+    let width = 60;
+    let lines = markdown_lines(
+        "说明\n\n| 模块 | 作用 |\n|---|---|\n| core | Agent 循环 |\n| tool | 工具注册 |\n\n结尾",
+        false,
+        width,
+    );
+    let rows = line_texts(&lines);
     let text = rows.join("\n");
 
     assert!(text.contains("┼"), "{text:?}");
@@ -689,12 +696,55 @@ fn markdown_tables_render_aligned() {
         .expect("tool 行");
     assert_eq!(core_row.find('│'), tool_row.find('│'), "{text:?}");
     assert!(text.contains("结尾"), "{text:?}");
+    // 表格必须整体收进消息区，任何一行都不能越界。
+    for line in &lines {
+        assert!(line.width() <= usize::from(width), "{line:?}");
+    }
+}
+
+/// 窄终端下表格压缩列宽并在单元格内折行，竖线位置仍然对齐、不出现字面分隔行。
+#[test]
+fn narrow_markdown_table_wraps_inside_columns() {
+    let width = 42;
+    let lines = markdown_lines(
+        "| 问题 | 表现 | 修法 |\n|---|---|---|\n| 光标越界 | 粘贴长路径时触发 panic，因为光标落在输入长度之外 | clamp 到输入长度内 |",
+        false,
+        width,
+    );
+    let rows = line_texts(&lines);
+    let text = rows.join("\n");
+
+    assert!(!text.contains("|---"), "{text:?}");
+    assert!(text.contains("光标越界"), "{text:?}");
+    for line in &lines {
+        assert!(
+            line.width() <= usize::from(width),
+            "行宽越界：{:?}",
+            line_texts(std::slice::from_ref(line))
+        );
+    }
+    // 折行后各行仍共用同一组竖线列，单元格不会顶过竖线。
+    let columns: Vec<Vec<usize>> = rows
+        .iter()
+        .filter(|row| !row.trim().is_empty() && !row.contains('┼'))
+        .map(|row| {
+            row.char_indices()
+                .filter(|(_, ch)| *ch == '│')
+                .map(|(index, _)| unicode_width::UnicodeWidthStr::width(&row[..index]))
+                .collect()
+        })
+        .collect();
+    assert!(columns.len() > 3, "{text:?}");
+    assert!(
+        columns.windows(2).all(|pair| pair[0] == pair[1]),
+        "竖线列不一致：{columns:?}\n{text}"
+    );
 }
 
 /// 验证 Markdown 渲染保留标题与行内代码的强调样式，且不产生任何背景色。
 #[test]
 fn markdown_renders_emphasis_without_background() {
-    let lines = markdown_lines("# 标题\n\n**重点** 与 `代码` 内容", false);
+    let lines = markdown_lines("# 标题\n\n**重点** 与 `代码` 内容", false, 60);
 
     let no_background = lines.iter().all(|line| {
         line.style.bg.is_none() && line.spans.iter().all(|span| span.style.bg.is_none())
@@ -705,7 +755,14 @@ fn markdown_renders_emphasis_without_background() {
         .iter()
         .find(|line| line.spans.iter().any(|span| span.content.contains("标题")))
         .expect("应包含标题行");
-    assert!(heading.style.add_modifier.contains(Modifier::BOLD));
+    assert!(
+        heading
+            .spans
+            .iter()
+            .filter(|span| span.content.contains("标题"))
+            .all(|span| span.style.add_modifier.contains(Modifier::BOLD)),
+        "标题正文应加粗"
+    );
 
     let bold_span = lines
         .iter()
@@ -715,22 +772,137 @@ fn markdown_renders_emphasis_without_background() {
     assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
 }
 
-/// 验证围栏代码块隐藏围栏、保留语言标签，并且不干扰相邻表格。
+/// 行内代码去掉反引号、改用代码色，并且不继承 tui-markdown 的黑色背景。
+#[test]
+fn inline_code_drops_backticks_and_background() {
+    let lines = markdown_lines("调用 `convert_input_path_to_attachment` 转换", false, 80);
+    let text = line_texts(&lines).join("\n");
+
+    assert!(
+        text.contains("convert_input_path_to_attachment"),
+        "{text:?}"
+    );
+    assert!(!text.contains('`'), "行内代码不应显示反引号：{text:?}");
+    let span = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "convert_input_path_to_attachment")
+        .expect("应包含行内代码片段");
+    assert_eq!(span.style.fg, Some(crate::theme::COLOR_CODE));
+    assert!(span.style.bg.is_none(), "行内代码不带背景");
+}
+
+/// 标题不再输出字面 `#`：层级靠标记块形状与文字权重区分。
+#[test]
+fn markdown_headings_render_without_hash_marks() {
+    let lines = markdown_lines("# 一级\n\n## 二级\n\n### 三级", false, 60);
+    let rows = line_texts(&lines);
+    let text = rows.join("\n");
+
+    assert!(!text.contains('#'), "标题不应残留 `#`：{text:?}");
+    assert!(rows[0].contains("■ 一级"), "{text:?}");
+    let second = rows
+        .iter()
+        .find(|row| row.contains("二级"))
+        .expect("二级标题");
+    let third = rows
+        .iter()
+        .find(|row| row.contains("三级"))
+        .expect("三级标题");
+    // 层级越深方块越小：一级实心方块、二级小方块、三级空心方块。
+    assert!(second.contains("▪ 二级"), "{text:?}");
+    assert!(third.contains("▫ 三级"), "{text:?}");
+    let first_mark = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "■ ")
+        .and_then(|span| span.style.fg);
+    assert_eq!(first_mark, Some(crate::theme::COLOR_USER));
+}
+
+/// 列表项渲染为圆点并带悬挂缩进：续行对齐正文首列，而不是回到行首。
+#[test]
+fn markdown_lists_use_bullets_with_hanging_indent() {
+    let lines = markdown_lines(
+        "- 第一项内容足够长，用来检查折行后的续行是否对齐到正文列而不是行首\n- 第二项",
+        false,
+        36,
+    );
+    let rows = line_texts(&lines);
+    let text = rows.join("\n");
+
+    assert!(rows[0].starts_with("● • 第一项"), "{text:?}");
+    assert!(!text.contains("- 第一项"), "列表标记不应残留字面 `- `");
+    let continuation = rows.get(1).expect("第一项应折行产生续行").clone();
+    // 行首两列消息前缀 + 两列悬挂缩进，正文从第 5 列开始。
+    assert!(continuation.starts_with("    "), "{text:?}");
+    assert!(!continuation.starts_with("     "), "{text:?}");
+    assert!(rows.iter().any(|row| row.contains("• 第二项")), "{text:?}");
+}
+
+/// 验证围栏代码块隐藏围栏、保留语言标签、整行铺底色，并且不干扰相邻表格。
 #[test]
 fn markdown_code_blocks_are_visually_separated() {
     let lines = markdown_lines(
         "```rust\nfn main() {}\n```\n| 列一 | 列二 |\n|---|---|\n| 值一 | 值二 |\n```txt\n未闭合",
         false,
+        60,
     );
-    let text = lines
-        .iter()
-        .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
-        .collect::<String>();
+    let rows = line_texts(&lines);
+    let text = rows.join("\n");
 
     assert!(!text.contains("```"), "{text:?}");
-    assert!(text.contains("▎ fn main() {}  rust"), "{text:?}");
+    assert!(text.contains("rust"), "{text:?}");
+    assert!(text.contains("fn main() {}"), "{text:?}");
     assert!(text.contains('┼'), "{text:?}");
-    assert!(text.contains("▎ 未闭合  txt"), "{text:?}");
+    assert!(text.contains("未闭合"), "{text:?}");
+
+    // 代码行整行铺底色（含尾部补齐），首列消息标记除外；正文与表格行不带底色。
+    let code = rows
+        .iter()
+        .position(|row| row.contains("fn main()"))
+        .expect("代码行");
+    assert!(
+        lines[code].spans[1..]
+            .iter()
+            .all(|span| span.style.bg == Some(crate::theme::COLOR_CODE_BG)),
+        "{:?}",
+        rows[code]
+    );
+    // 底色必须铺满整行，否则代码块右边缘会缺一块。
+    assert_eq!(lines[code].width(), 60, "代码行应铺满消息区宽度");
+    let prose = rows
+        .iter()
+        .position(|row| row.contains("列一"))
+        .expect("表格行");
+    assert!(lines[prose]
+        .spans
+        .iter()
+        .all(|span| span.style.bg.is_none()));
+}
+
+/// 流式光标跟在代码块最后一行之后，不会被整行底色挤到下一行行首。
+#[test]
+fn streaming_cursor_stays_on_last_code_line() {
+    let width = 40;
+    let lines = markdown_lines("```rust\nfn main() {}\n```", true, width);
+    let last = lines
+        .iter()
+        .rev()
+        .find(|line| line.width() > 0)
+        .expect("应有内容行");
+    let text: String = last
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+
+    assert!(text.trim_end().ends_with('▌'), "{text:?}");
+    assert!(
+        last.width() <= usize::from(width),
+        "光标不应撑出消息区：{}",
+        last.width()
+    );
 }
 
 /// 拖选高亮只修改单元格样式，不得改写可复制的字符内容。
