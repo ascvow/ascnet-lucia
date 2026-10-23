@@ -686,14 +686,52 @@ fn message_digest(messages: &[Value]) -> Result<[u8; 32]> {
     Ok(digest.finalize().into())
 }
 
+/// 直接统计序列化字节的 ASCII / 非 ASCII 分布，避免为每条消息额外分配完整 JSON 字符串。
+///
+/// 折算比例与 [`estimate_text_tokens`] 一致，因此结果与先 `to_string` 再折算完全相同。
+#[derive(Default)]
+struct TokenCountingWriter {
+    /// ASCII 字节数，按四字节一个 token 折算。
+    ascii_bytes: usize,
+    /// 非 ASCII 字节数，按三字节一个 token 折算。
+    non_ascii_bytes: usize,
+}
+
+impl TokenCountingWriter {
+    /// 按 ASCII 四字节、非 ASCII 三字节的比例折算 token 数。
+    fn tokens(&self) -> usize {
+        self.ascii_bytes.div_ceil(4) + self.non_ascii_bytes.div_ceil(3)
+    }
+}
+
+impl Write for TokenCountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let non_ascii_bytes = buffer.iter().filter(|byte| !byte.is_ascii()).count();
+        self.non_ascii_bytes += non_ascii_bytes;
+        self.ascii_bytes += buffer.len() - non_ascii_bytes;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 估算单条 JSON 消息的 token 数，等价于序列化后按字节折算，但不分配字符串。
+fn estimate_value_tokens(value: &Value) -> usize {
+    let mut writer = TokenCountingWriter::default();
+    // `Value` 不包含无法表达的数（如 NaN），序列化实际不会失败；回退分支只为保持
+    // 与旧实现一致的"总能给出估算"语义，不改变返回值。
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return estimate_text_tokens(&value.to_string());
+    }
+    writer.tokens()
+}
+
 /// 用序列化字节数进行估算，ASCII 与非 ASCII 分别计费。
 fn estimate_context_tokens(system: Option<&str>, messages: &[Value]) -> usize {
     let system_tokens = system.map_or(0, estimate_text_tokens);
-    system_tokens
-        + messages
-            .iter()
-            .map(|message| estimate_text_tokens(&message.to_string()))
-            .sum::<usize>()
+    system_tokens + messages.iter().map(estimate_value_tokens).sum::<usize>()
 }
 
 /// 将文本字节数换算为粗略 token 数。
@@ -1147,6 +1185,45 @@ mod tests {
         compress_context(request, manual, test_budget(), &TestSummarizer, 0)
             .await
             .expect("测试压缩应成功")
+    }
+
+    /// 不分配字符串的字节统计必须与先 `to_string` 再折算的结果逐位一致。
+    ///
+    /// 估算口径直接决定何时触发压缩，任何偏差都会改变会话行为，因此用混合 ASCII、
+    /// 中日韩文字、转义字符和数字的消息覆盖，防止只对纯 ASCII 成立。
+    #[test]
+    fn token_estimation_matches_string_round_trip() {
+        let messages = vec![
+            text_message("user", "plain ascii only"),
+            text_message("user", "中文与日本語の混在文本"),
+            text_message("assistant", "quote \" backslash \\ newline \n tab \t"),
+            json!({ "role": "tool", "content": json!({ "value": 12345, "flag": true, "nil": null }) }),
+            json!({ "role": "tool", "content": "x".repeat(4096) }),
+        ];
+        for message in &messages {
+            assert_eq!(
+                estimate_value_tokens(message),
+                estimate_text_tokens(&message.to_string()),
+                "单条消息估算必须与字符串折算一致: {message}"
+            );
+        }
+        for split in 0..messages.len() {
+            let expected =
+                estimate_text_tokens(&Value::Array(messages[..split].to_vec()).to_string());
+            let mut writer = TokenCountingWriter::default();
+            serde_json::to_writer(&mut writer, &Value::Array(messages[..split].to_vec()))
+                .expect("序列化测试消息应成功");
+            assert_eq!(writer.tokens(), expected, "数组前缀长度 {split} 估算不一致");
+        }
+        let expected_total = messages
+            .iter()
+            .map(|message| estimate_text_tokens(&message.to_string()))
+            .sum::<usize>();
+        assert_eq!(
+            estimate_context_tokens(None, &messages),
+            expected_total,
+            "整体估算必须等于逐条字符串折算之和"
+        );
     }
 
     /// 低于水位时必须完整透传，避免短会话发生无意义改写。
