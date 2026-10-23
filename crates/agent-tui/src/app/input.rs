@@ -8,7 +8,7 @@ use crate::session::attachment::{
     looks_like_file_path, pasted_file_path,
 };
 use crate::session::conversation::{
-    submission_text, Msg, MsgKind, PendingAttachment, UserSubmission,
+    retained_refs, submission_text, Msg, MsgKind, PendingAttachment, UserSubmission,
 };
 use crate::theme::MAX_ATTACHMENT_BYTES;
 use agent_core::Agent;
@@ -180,6 +180,8 @@ impl App {
                     });
                     if double_pressed {
                         self.input.clear();
+                        self.attachments.clear();
+                        self.refs.clear();
                         self.cursor = 0;
                         self.finish_input_edit();
                     } else {
@@ -352,6 +354,7 @@ impl App {
             self.last_exit_request_at = None;
             self.input.clear();
             self.attachments.clear();
+            self.refs.clear();
             self.cursor = 0;
             self.finish_input_edit();
             return;
@@ -501,6 +504,7 @@ impl App {
         self.input_history_cursor = None;
         self.last_escape_at = None;
         self.prune_attachments();
+        self.prune_refs();
     }
 
     /// 召回更早的一条输入；空历史保持当前编辑器不变。
@@ -515,6 +519,7 @@ impl App {
         self.input.clone_from(&self.input_history[index]);
         self.cursor = self.input.len();
         self.prune_attachments();
+        self.prune_refs();
     }
 
     /// 向较新的输入回溯；越过最新记录时恢复空编辑器。
@@ -742,20 +747,53 @@ impl App {
         self.attachments.retain(|a| input.contains(&a.label));
     }
 
-    /// 光标紧跟附件引用标签时整体删除标签及对应附件，返回是否命中。
+    /// 丢弃引用标签已不在输入文本中的上下文引用。
+    ///
+    /// 用户删掉标签就是在说「这段上下文不要带」，因此记入丢弃集合：轮询即使再次
+    /// 看到同一段选区，也不会把标签补回去。只有选区变化产生新 ID 才会重新出现。
+    pub(crate) fn prune_refs(&mut self) {
+        if self.refs.is_empty() {
+            return;
+        }
+        let input = &self.input;
+        let (kept, dropped): (Vec<_>, Vec<_>) = self
+            .refs
+            .iter()
+            .cloned()
+            .partition(|entry| input.contains(&entry.label));
+        self.refs = kept;
+        for entry in dropped {
+            self.dismissed_refs.insert(entry.id);
+        }
+        // 丢弃集合只用于判重，不需要无限增长；超出后整体清空，最多让已删除的旧标签
+        // 在选区未变时再出现一次，代价远低于长期增长。
+        if self.dismissed_refs.len() > 64 {
+            self.dismissed_refs.clear();
+        }
+    }
+
+    /// 光标紧跟附件或引用标签时整体删除标签及对应条目，返回是否命中。
     pub(crate) fn remove_attachment_before_cursor(&mut self) -> bool {
         let prefix = &self.input[..self.cursor];
-        let Some(index) = self
+        if let Some(index) = self
             .attachments
             .iter()
             .position(|a| prefix.ends_with(&a.label))
-        else {
+        {
+            let start = self.cursor - self.attachments[index].label.len();
+            self.input.replace_range(start..self.cursor, "");
+            self.cursor = start;
+            self.attachments.remove(index);
+            return true;
+        }
+        let Some(index) = self.refs.iter().position(|r| prefix.ends_with(&r.label)) else {
             return false;
         };
-        let start = self.cursor - self.attachments[index].label.len();
+        let start = self.cursor - self.refs[index].label.len();
         self.input.replace_range(start..self.cursor, "");
         self.cursor = start;
-        self.attachments.remove(index);
+        let removed = self.refs.remove(index);
+        self.dismissed_refs.insert(removed.id);
         true
     }
 
@@ -1058,6 +1096,7 @@ impl App {
         let input = self.input.trim().to_string();
         self.input.clear();
         self.attachments.clear();
+        self.refs.clear();
         self.cursor = 0;
         self.last_escape_at = None;
         if input.is_empty() {
@@ -1069,7 +1108,10 @@ impl App {
 
     /// 取出并清空当前输入与附件；文本和附件都为空时返回 `None`。
     pub(crate) fn take_submission(&mut self) -> Option<UserSubmission> {
-        if !submission_text(&self.input, &self.attachments).is_empty() {
+        // 标签被删掉的引用视为用户主动丢弃，不能因为条目还在列表里就照旧发送。
+        let refs = retained_refs(&self.input, &self.refs);
+        let visible = submission_text(&self.input, &self.attachments, &refs);
+        if !visible.is_empty() {
             if let Err(message) = self
                 .validate_attachment_modality(&crate::config::model_metadata::ModelModality::Text)
             {
@@ -1080,14 +1122,27 @@ impl App {
         let text = self.input.trim().to_string();
         let attachments = std::mem::take(&mut self.attachments);
         self.input.clear();
+        self.refs.clear();
         self.cursor = 0;
         self.last_escape_at = None;
-        if text.is_empty() && attachments.is_empty() {
+        if text.is_empty() && attachments.is_empty() && refs.is_empty() {
             return None;
         }
         self.remember_input(&text);
-        Some(UserSubmission { text, attachments })
+        Some(UserSubmission {
+            text,
+            attachments,
+            refs,
+        })
     }
+}
+
+/// 判断一段粘贴文本是否长到应该折叠成引用标签。
+///
+/// 判据是"会不会把输入盒撑坏"：多行必然增加逻辑行数；单行按显示宽度算，宽字符占两列。
+/// 短内容返回 `false`，由调用方按普通输入插入。
+fn paste_needs_label(text: &str) -> bool {
+    text.lines().count() > 1 || unicode_width::UnicodeWidthStr::width(text) > PASTE_TAG_COLUMNS
 }
 
 /// 判断字符是否为按词移动与删除使用的分隔符。

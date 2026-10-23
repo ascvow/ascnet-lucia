@@ -976,3 +976,297 @@ pub struct RunStartEventData {
     /// 模型 ID。
     pub model: String,
 }
+
+/// 上下文引用 provider 在 manifest `[[provides]]` 中声明的能力 ID。
+///
+/// 应用据此发现「谁能在用户操作设备/编辑器时提供一段当前上下文」，而不需要认识
+/// 任何具体插件或它的业务协议。
+pub const CONTEXT_REF_CAPABILITY: &str = "agent.context-ref";
+
+/// 上下文引用服务的稳定服务名。
+pub const CONTEXT_REF_SERVICE: &str = "context.ref";
+
+/// 上下文引用服务的契约版本。
+pub const CONTEXT_REF_SERVICE_VERSION: &str = "1.0.0";
+
+/// 单次快照最多接受的引用条数。
+///
+/// 引用会被自动带进下一条用户消息，条数上限是「自动」这件事的安全阀：没有上限的自动
+/// 注入等于让插件单方面决定模型看到的上下文规模。
+pub const MAX_CONTEXT_REFS: usize = 4;
+
+/// 单个引用 ID 的字节上限。
+pub const MAX_CONTEXT_REF_ID_BYTES: usize = 256;
+
+/// 单个引用标题的字节上限。
+pub const MAX_CONTEXT_REF_TITLE_BYTES: usize = 256;
+
+/// 单个引用正文的字节上限。
+pub const MAX_CONTEXT_REF_BODY_BYTES: usize = 64 * 1024;
+
+/// 一次快照全部正文的字节上限。
+pub const MAX_CONTEXT_REF_TOTAL_BODY_BYTES: usize = 128 * 1024;
+
+/// 上下文引用服务的快照请求。
+///
+/// 当前不接受任何字段；保留对象形态是为了后续以可选字段演进，而不是改服务名。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextRefRequest {}
+
+/// 插件观测到的一段用户当前引用的上下文。
+///
+/// 宿主不解释 `body` 的语义，只做边界校验与传递；格式（文件、选区、网页……）由
+/// provider 自己决定，因此新增一类引用不需要改宿主。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextRef {
+    /// provider 内稳定的引用标识。
+    ///
+    /// 同一段上下文必须给出同一个 ID：宿主用它在多次轮询之间判重与更新，ID 变化会被
+    /// 当成「用户换了一段选区」。
+    pub id: String,
+    /// 面向用户的一行标题，例如 `App.swift:12-20`。
+    pub title: String,
+    /// 随下一条用户消息注入模型的正文。
+    pub body: String,
+}
+
+/// 一次上下文引用快照。
+///
+/// 空数组是合法结果：表示 provider 当前没有可引用的内容（例如用户没有选区）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextRefSnapshot {
+    /// 当前可引用的上下文片段。
+    #[serde(default)]
+    pub refs: Vec<ContextRef>,
+}
+
+/// 上下文引用契约的边界校验失败原因。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextRefError(String);
+
+impl std::fmt::Display for ContextRefError {
+    /// 输出面向插件作者的单行说明。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ContextRefError {}
+
+impl ContextRefError {
+    /// 用给定原因构造校验错误。
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl ContextRef {
+    /// 校验单条引用是否满足契约边界。
+    ///
+    /// # Errors
+    ///
+    /// ID 或标题不合规、正文为空或超限时返回错误。宿主据此丢弃整份快照，而不是把
+    /// 可疑内容注入下一条消息。
+    pub fn validate(&self) -> Result<(), ContextRefError> {
+        if self.id.is_empty() || self.id.len() > MAX_CONTEXT_REF_ID_BYTES {
+            return Err(ContextRefError::new(format!(
+                "上下文引用 ID 长度必须在 1..={MAX_CONTEXT_REF_ID_BYTES} 字节之间"
+            )));
+        }
+        if !self
+            .id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+        {
+            return Err(ContextRefError::new(format!(
+                "上下文引用 ID 只能包含 ASCII 字母、数字与 `.` `_` `:` `-`：`{}`",
+                self.id
+            )));
+        }
+        let title = self.title.trim();
+        if title.is_empty() || self.title.len() > MAX_CONTEXT_REF_TITLE_BYTES {
+            return Err(ContextRefError::new(format!(
+                "上下文引用标题长度必须在 1..={MAX_CONTEXT_REF_TITLE_BYTES} 字节之间"
+            )));
+        }
+        if title != self.title {
+            return Err(ContextRefError::new("上下文引用标题不能包含首尾空白"));
+        }
+        if self.title.bytes().any(|byte| byte < 0x20 || byte == 0x7F) {
+            return Err(ContextRefError::new("上下文引用标题必须是单行文本"));
+        }
+        if self.body.is_empty() {
+            return Err(ContextRefError::new("上下文引用正文不能为空"));
+        }
+        if self.body.len() > MAX_CONTEXT_REF_BODY_BYTES {
+            return Err(ContextRefError::new(format!(
+                "上下文引用正文超过 {MAX_CONTEXT_REF_BODY_BYTES} 字节限制"
+            )));
+        }
+        if self.body.bytes().any(|byte| byte == 0) {
+            return Err(ContextRefError::new("上下文引用正文不能包含 NUL"));
+        }
+        Ok(())
+    }
+}
+
+impl ContextRefSnapshot {
+    /// 校验整份快照，并返回其中的引用。
+    ///
+    /// # Errors
+    ///
+    /// 条数超限、ID 重复、单条不合法或正文总量超限时返回错误。任何一项失败都拒绝
+    /// 整份快照：部分接受会让「插件给出什么」与「宿主注入什么」难以对照。
+    pub fn validate(&self) -> Result<&[ContextRef], ContextRefError> {
+        if self.refs.len() > MAX_CONTEXT_REFS {
+            return Err(ContextRefError::new(format!(
+                "上下文引用最多 {MAX_CONTEXT_REFS} 条，实际 {} 条",
+                self.refs.len()
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0usize;
+        for entry in &self.refs {
+            entry.validate()?;
+            if !seen.insert(entry.id.as_str()) {
+                return Err(ContextRefError::new(format!(
+                    "上下文引用 ID 重复：`{}`",
+                    entry.id
+                )));
+            }
+            total = total.saturating_add(entry.body.len());
+        }
+        if total > MAX_CONTEXT_REF_TOTAL_BODY_BYTES {
+            return Err(ContextRefError::new(format!(
+                "上下文引用正文总量超过 {MAX_CONTEXT_REF_TOTAL_BODY_BYTES} 字节限制"
+            )));
+        }
+        Ok(&self.refs)
+    }
+}
+
+#[cfg(test)]
+mod context_ref_tests {
+    use super::*;
+
+    /// 构造一条边界内的引用。
+    fn entry(id: &str) -> ContextRef {
+        ContextRef {
+            id: id.to_string(),
+            title: format!("App.swift:{id}"),
+            body: "```swift\nlet value = 1\n```".to_string(),
+        }
+    }
+
+    /// 正常快照必须通过，并保持插件给出的顺序。
+    #[test]
+    fn valid_snapshot_keeps_order() {
+        let snapshot = ContextRefSnapshot {
+            refs: vec![entry("a"), entry("b")],
+        };
+        let refs = snapshot.validate().expect("合法快照应通过");
+        assert_eq!(refs[0].id, "a");
+        assert_eq!(refs[1].id, "b");
+    }
+
+    /// 空快照合法：用户没有选区是常态，不是错误。
+    #[test]
+    fn empty_snapshot_is_valid() {
+        assert!(ContextRefSnapshot::default()
+            .validate()
+            .expect("空快照应通过")
+            .is_empty());
+    }
+
+    /// 条数超限必须整份拒绝，避免插件单方面放大自动注入的上下文。
+    #[test]
+    fn too_many_refs_is_rejected() {
+        let snapshot = ContextRefSnapshot {
+            refs: (0..=MAX_CONTEXT_REFS)
+                .map(|index| entry(&format!("ref{index}")))
+                .collect(),
+        };
+        let error = snapshot.validate().expect_err("超限应失败");
+        assert!(error.to_string().contains("最多"), "{error}");
+    }
+
+    /// 重复 ID 会让宿主无法区分「更新」与「另一段上下文」。
+    #[test]
+    fn duplicate_ids_are_rejected() {
+        let snapshot = ContextRefSnapshot {
+            refs: vec![entry("same"), entry("same")],
+        };
+        let error = snapshot.validate().expect_err("重复 ID 应失败");
+        assert!(error.to_string().contains("重复"), "{error}");
+    }
+
+    /// ID 会进入宿主内部索引，只接受稳定的 ASCII 字符集。
+    #[test]
+    fn unsafe_ids_are_rejected() {
+        for id in ["", "with space", "path/segment", "换行\n"] {
+            let mut value = entry("ok");
+            value.id = id.to_string();
+            assert!(value.validate().is_err(), "`{id}` 应被拒绝");
+        }
+    }
+
+    /// 标题是单行展示文本，不能夹带换行或控制字符。
+    #[test]
+    fn title_must_be_single_line() {
+        let mut value = entry("a");
+        value.title = "App.swift\n第二行".to_string();
+        assert!(value.validate().is_err());
+
+        value.title = " 前后空白 ".to_string();
+        assert!(value.validate().is_err());
+
+        value.title = String::new();
+        assert!(value.validate().is_err());
+    }
+
+    /// 正文是自动注入模型的输入，空值与 NUL 都必须拒绝。
+    #[test]
+    fn body_must_be_non_empty_and_clean() {
+        let mut value = entry("a");
+        value.body.clear();
+        assert!(value.validate().is_err());
+
+        value.body = "abc\0def".to_string();
+        assert!(value.validate().is_err());
+    }
+
+    /// 单条与总量上限都必须生效。
+    #[test]
+    fn body_limits_are_enforced() {
+        let mut value = entry("a");
+        value.body = "x".repeat(MAX_CONTEXT_REF_BODY_BYTES + 1);
+        assert!(value.validate().is_err());
+
+        // 单条不超限但总量超限时同样拒绝。
+        let chunk = "x".repeat(MAX_CONTEXT_REF_BODY_BYTES);
+        let snapshot = ContextRefSnapshot {
+            refs: (0..3)
+                .map(|index| {
+                    let mut value = entry(&format!("ref{index}"));
+                    value.body = chunk.clone();
+                    value
+                })
+                .collect(),
+        };
+        let error = snapshot.validate().expect_err("总量超限应失败");
+        assert!(error.to_string().contains("总量"), "{error}");
+    }
+
+    /// 服务请求必须拒绝未知字段，避免调用方以为可选参数生效了。
+    #[test]
+    fn request_rejects_unknown_fields() {
+        assert!(serde_json::from_value::<ContextRefRequest>(serde_json::json!({})).is_ok());
+        assert!(
+            serde_json::from_value::<ContextRefRequest>(serde_json::json!({
+                "scope": "session"
+            }))
+            .is_err()
+        );
+    }
+}

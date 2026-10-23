@@ -1,97 +1,86 @@
 //! Eden 编辑器上下文插件。
 //!
-//! 插件通过 Eden 暴露的本地 Unix domain socket 读取「用户此刻在编辑器里看着什么」，
-//! 并在用户确实看着同一个 tab 时把某一行显示出来。
+//! 插件把 Eden 的选区协议翻译成 Lucia 的通用「上下文引用」契约：应用按固定节拍调用
+//! `context.ref` 服务，拿到用户此刻在编辑器里选中的一段代码，校验后自动生成
+//! `[REF#N]` 标签，随下一条消息一起带给模型。
 //!
-//! # 为什么走宿主能力而不是 process_exec
+//! # 为什么不是一个工具
 //!
-//! 早期做法是调用 `eden-cli` 再解析 stdout。那要求宿主机上装着这个 CLI，而且 `process_exec`
-//! 是完整原生进程信任——为了读一次选区就交出执行任意命令的能力，权限与收益完全不成比例。
-//! 现在插件只申请三条窄能力：连接一个写死的 socket 路径、只读一个写死的令牌文件、读取
-//! 三个 Eden 注入的环境变量。
+//! 选区是**用户此刻的状态**，不是模型决定要去查的东西。做成工具等于要求模型先猜
+//! 「我现在该不该读选区」，而用户已经用鼠标表达过意图了。做成引用则相反：用户选中
+//! 什么，下一条消息就自动带上什么，模型不需要为此多一轮往返。
 //!
-//! # 工具与协议
+//! # 为什么由宿主轮询
 //!
-//! 每个工具对应一个 Eden 协议工具，参数做本地校验后再发出去：本地能判定的错误不必浪费
-//! 一次往返，也能给出更贴近模型的提示。协议错误码与 `hint` 全部保留并回传，模型据此
-//! 自我纠错（例如把 `scope` 改成 `active`，或退化成文字告知）。
+//! Eden 协议 v1 只有「客户端请求、服务端应答」，没有事件推送；WASM 插件也没有后台
+//! 线程。因此「推送」落在插件与宿主的交界上：插件保留协议细节（握手、令牌、分帧、
+//! id 配对、超时），宿主只按节拍索要一份已经成形的快照。Eden 将来支持推送后，只需
+//! 让插件在收到事件时更新缓存，服务契约与宿主的调用方式都不用改。
 //!
 //! # 不做的事
 //!
-//! 插件不读整个文件、不轮询选区变化、不在多个 tab 之间抢焦点。协议 v1 没有事件推送，
-//! 抢焦点被 Eden 用 `user_in_another_tab` 明确拒绝——这里直接按文字结论处理。
+//! 插件不读整个文件、不改编辑器内容、不抢焦点。用户没有选区时返回空快照，而不是
+//! 猜一个光标位置塞给模型。
 
 mod client;
 mod protocol;
 
 use agent_plugin::{
-    export_plugin, ActivationContext, AgentPlugin, PluginHostApi, Result, ToolCall,
-    ToolPermissionScope, ToolResult, ToolSpec,
+    anyhow, export_plugin, ActivationContext, AgentPlugin, ContextRef, ContextRefRequest,
+    ContextRefSnapshot, PluginHostApi, Result, ServiceCall, ServiceSpec, ToolSpec,
+    CONTEXT_REF_SERVICE, CONTEXT_REF_SERVICE_VERSION, MAX_CONTEXT_REF_BODY_BYTES,
+    MAX_CONTEXT_REF_ID_BYTES, MAX_CONTEXT_REF_TITLE_BYTES,
 };
-use anyhow::anyhow;
-use client::{EdenClient, EdenConfig, EdenFailure};
-use protocol::Welcome;
+use client::{EdenClient, EdenConfig};
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
+use std::fmt::Write as _;
+use std::path::Path;
 
-/// 读取选区与光标位置的工具名。
-const SELECTION_TOOL: &str = "eden_selection";
-/// 列出已打开文件的工具名。
-const EDITORS_TOOL: &str = "eden_editors";
-/// 读取会话所在 tab 上下文的工具名。
-const CONTEXT_TOOL: &str = "eden_context";
-/// 定位某一行（唯一的写操作）的工具名。
-const REVEAL_TOOL: &str = "eden_reveal";
-
-/// 协议侧的对应工具名。
+/// 协议侧的选区读取工具名。
 const SELECTION_RPC: &str = "selection.get";
-/// 协议侧的对应工具名。
-const EDITORS_RPC: &str = "editors.list";
-/// 协议侧的对应工具名。
-const CONTEXT_RPC: &str = "context.get";
-/// 协议侧的对应工具名。
-const REVEAL_RPC: &str = "editor.reveal";
 
-/// 协议默认的选区文本上限。
-const DEFAULT_MAX_TEXT: i64 = 8_000;
-/// 协议允许的选区文本上限。
-const MAX_TEXT_LIMIT: i64 = 200_000;
+/// 向 Eden 请求的选区文本上限。
+///
+/// 略大于引用正文上限：正文还要加位置头与围栏，留出余量后由本地截断兜底，避免
+/// 一次请求就逼近宿主 1 MiB 的单帧上限。
+const MAX_SELECTION_TEXT: i64 = 24_000;
 
-/// 无参数工具使用的严格空对象。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EmptyArgs {}
+/// 选区截断后追加的说明。
+const TRUNCATION_MARKER: &str = "\n…（选区已截断）";
 
-/// `eden_selection` 的参数。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SelectionArgs {
-    /// `session`（默认）或 `active`。
+/// `selection.get` 响应中插件真正需要的字段。
+///
+/// 不启用 `deny_unknown_fields`：Eden 新增字段属于兼容变更，客户端必须忽略。
+#[derive(Debug, Default, Deserialize)]
+struct Selection {
+    /// 选区所在文件的绝对路径。
     #[serde(default)]
-    scope: Option<String>,
-    /// 是否返回选中的原文。
-    #[serde(default)]
-    include_text: Option<bool>,
-    /// 文本上限，夹在 `0…200000`。
-    #[serde(default)]
-    max_text: Option<i64>,
-}
-
-/// `eden_reveal` 的参数。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RevealArgs {
-    /// 已打开文件的绝对路径。
     path: String,
-    /// 1-based 行号。
+    /// 1-based 起始行；无选区时缺失。
+    #[serde(rename = "startLine", default)]
+    start_line: Option<i64>,
+    /// 1-based 结束行；无选区时缺失。
+    #[serde(rename = "endLine", default)]
+    end_line: Option<i64>,
+    /// 选中的原文；`includeText` 为假时缺失。
     #[serde(default)]
-    line: Option<i64>,
+    text: Option<String>,
+    /// 语言标识，例如 `swift`。
+    #[serde(default)]
+    language: Option<String>,
+    /// 文件是否有未保存修改。
+    #[serde(default)]
+    dirty: bool,
+    /// 选区所在 tab 的标题。
+    #[serde(default)]
+    tab: Option<String>,
 }
 
 /// Eden 编辑器上下文插件实例。
 #[derive(Default)]
 struct EdenPlugin {
-    /// 长驻客户端；第一个工具调用时按 Eden 注入的环境变量创建。
+    /// 长驻客户端；第一个服务调用时按 Eden 注入的环境变量创建。
     client: Option<EdenClient>,
 }
 
@@ -99,268 +88,218 @@ impl EdenPlugin {
     /// 取出或惰性创建客户端。
     ///
     /// 不在 `activate` 里连接：Eden 可能没在运行，加载阶段失败会让整个插件被禁用，
-    /// 而正确行为是「需要时再连，连不上就报一次可读错误」。
+    /// 而正确行为是「需要时再连，连不上就返回空快照」。
     fn client(&mut self) -> &mut EdenClient {
         self.client
             .get_or_insert_with(|| EdenClient::new(EdenConfig::from_env()))
     }
 
-    /// 执行一次协议调用并转成工具结果。
-    fn run_rpc(
-        &mut self,
-        host: &dyn PluginHostApi,
-        call: ToolCall,
-        rpc: &str,
-        args: Value,
-    ) -> Result<ToolResult> {
-        match self.client().call(host, rpc, args) {
-            Ok(value) => Ok(ToolResult::success(call.id, call.name, value)),
-            Err(failure) => Ok(failure_result(call, failure)),
+    /// 读取一次当前选区快照。
+    ///
+    /// 任何 Eden 侧失败都退化为空快照：引用是增益信息，插件不可用不应该让应用每次
+    /// 轮询都弹一条错误。连接失败、没有编辑器、没有选区都返回「本次没有可引用内容」。
+    fn snapshot(&mut self, host: &dyn PluginHostApi) -> ContextRefSnapshot {
+        let empty = ContextRefSnapshot::default();
+        if self.client().ensure_connected(host).is_err() {
+            return empty;
         }
-    }
-
-    /// 读取选区或光标位置。
-    fn selection(&mut self, host: &dyn PluginHostApi, call: ToolCall) -> Result<ToolResult> {
-        let args: SelectionArgs = parse_args(&call)?;
-        let scope = match args.scope.as_deref() {
-            None | Some("session") => "session",
-            Some("active") => "active",
-            Some(other) => {
-                return Ok(ToolResult::error(
-                    call.id,
-                    call.name,
-                    format!("scope 只能是 `session` 或 `active`，收到 `{other}`"),
-                ))
-            }
-        };
-        let include_text = args.include_text.unwrap_or(true);
-        let max_text = args
-            .max_text
-            .unwrap_or(DEFAULT_MAX_TEXT)
-            .clamp(0, MAX_TEXT_LIMIT);
-
-        let mut request = Map::new();
-        request.insert("scope".to_string(), json!(scope));
-        request.insert("includeText".to_string(), json!(include_text));
-        request.insert("maxText".to_string(), json!(max_text));
-        self.run_rpc(host, call, SELECTION_RPC, Value::Object(request))
-    }
-
-    /// 列出已打开的文件。
-    fn editors(&mut self, host: &dyn PluginHostApi, call: ToolCall) -> Result<ToolResult> {
-        let _: EmptyArgs = parse_args(&call)?;
-        self.run_rpc(host, call, EDITORS_RPC, json!({}))
-    }
-
-    /// 读取会话所在 tab 的上下文。
-    fn context(&mut self, host: &dyn PluginHostApi, call: ToolCall) -> Result<ToolResult> {
-        let _: EmptyArgs = parse_args(&call)?;
-        self.run_rpc(host, call, CONTEXT_RPC, json!({}))
-    }
-
-    /// 请求 Eden 定位某一行。
-    fn reveal(&mut self, host: &dyn PluginHostApi, call: ToolCall) -> Result<ToolResult> {
-        let args: RevealArgs = parse_args(&call)?;
-        if !args.path.starts_with('/') {
-            return Ok(ToolResult::error(
-                call.id,
-                call.name,
-                format!("path 必须是绝对路径，收到 `{}`", args.path),
-            ));
-        }
-        let line = args.line.unwrap_or(1);
-        if line < 1 {
-            return Ok(ToolResult::error(
-                call.id,
-                call.name,
-                format!("line 必须是 1-based 正整数，收到 `{line}`"),
-            ));
-        }
-
-        // 先握手才能判断焦点：没有 welcome 就没有可信的 focused 值，盲发写请求只会被拒。
-        if let Err(failure) = self.client().ensure_connected(host) {
-            return Ok(failure_result(call, failure));
-        }
+        // capabilities 是唯一可靠的能力来源，不硬编码 Eden 的工具表。
         if self
             .client()
             .welcome()
-            .and_then(Welcome::focused)
-            .is_some_and(|focused| !focused)
+            .is_some_and(|welcome| !welcome.supports(SELECTION_RPC))
         {
-            return Ok(out_of_focus_result(call, &args.path, line));
+            return empty;
         }
-
-        let request = json!({ "path": args.path, "line": line });
-        match self.client().call(host, REVEAL_RPC, request) {
-            Ok(value) => Ok(ToolResult::success(call.id, call.name, value)),
-            // 焦点可能在握手之后才被切走；按协议建议退化成文字告知，而不是让模型反复重试。
-            Err(EdenFailure::Protocol(error)) if error.code == "user_in_another_tab" => {
-                Ok(out_of_focus_result(call, &args.path, line))
-            }
-            Err(failure) => Ok(failure_result(call, failure)),
+        let request = json!({
+            "scope": "session",
+            "includeText": true,
+            "maxText": MAX_SELECTION_TEXT,
+        });
+        let Ok(value) = self.client().call(host, SELECTION_RPC, request) else {
+            return empty;
+        };
+        match selection_ref(&value) {
+            Some(entry) => ContextRefSnapshot { refs: vec![entry] },
+            None => empty,
         }
     }
 }
 
 impl AgentPlugin for EdenPlugin {
-    /// 读取 Eden 注入的连接参数；实际连接推迟到第一次工具调用。
-    fn activate(&mut self, _host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
+    /// 读取 Eden 注入的连接参数，并注册上下文引用服务。
+    fn activate(&mut self, host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
         self.client = Some(EdenClient::new(EdenConfig::from_env()));
+        host.upsert_service(&ServiceSpec {
+            name: CONTEXT_REF_SERVICE.to_string(),
+            version: CONTEXT_REF_SERVICE_VERSION.to_string(),
+            description: Some("把 Eden 当前编辑器选区作为随下一条消息发送的上下文引用".into()),
+        })?;
         Ok(())
     }
 
-    /// 卸载前发送 `bye` 并释放 socket 句柄。
+    /// 注销服务并释放 socket 句柄。
     fn deactivate(&mut self, host: &dyn PluginHostApi) -> Result<()> {
+        let _ = host.remove_service(CONTEXT_REF_SERVICE);
         if let Some(client) = self.client.as_mut() {
             client.close(host);
         }
         Ok(())
     }
 
-    /// 声明四个编辑器上下文工具。
+    /// 不向模型暴露任何工具：选区的读取与注入完全由应用驱动。
     fn list_tools(&self) -> Vec<ToolSpec> {
-        vec![
-            selection_tool(),
-            editors_tool(),
-            context_tool(),
-            reveal_tool(),
-        ]
+        Vec::new()
     }
 
-    /// 按工具名分发；只有 reveal 会产生界面副作用。
-    fn call_tool_with_host(
+    /// 响应 `context.ref` 快照请求。
+    fn handle_service(
         &mut self,
         host: &dyn PluginHostApi,
-        call: ToolCall,
-    ) -> Result<ToolResult> {
-        match call.name.as_str() {
-            SELECTION_TOOL => self.selection(host, call),
-            EDITORS_TOOL => self.editors(host, call),
-            CONTEXT_TOOL => self.context(host, call),
-            REVEAL_TOOL => self.reveal(host, call),
-            other => {
-                let message = format!("Eden 插件收到未知工具调用 `{other}`");
-                Ok(ToolResult::error(call.id, call.name, message))
-            }
+        call: ServiceCall,
+    ) -> Result<serde_json::Value> {
+        if call.name != CONTEXT_REF_SERVICE {
+            return Err(anyhow!("Eden 插件未实现服务 `{}`", call.name));
         }
+        let _: ContextRefRequest = serde_json::from_value(call.payload)
+            .map_err(|error| anyhow!("`{CONTEXT_REF_SERVICE}` 请求不合法：{error}"))?;
+        Ok(serde_json::to_value(self.snapshot(host))?)
     }
 }
 
-/// 解析工具参数，并把反序列化错误转成可读说明。
-fn parse_args<T: serde::de::DeserializeOwned>(call: &ToolCall) -> Result<T> {
-    serde_json::from_value(call.args.clone())
-        .map_err(|error| anyhow!("工具 `{}` 的参数不合法：{error}", call.name))
+/// 把一个 `selection.get` 响应转换成上下文引用。
+///
+/// 只有「真实存在选区」才返回引用：缺少起止行说明用户没有选中任何文本，此时让插件
+/// 猜一个光标行只会把无关内容塞进下一条消息。
+fn selection_ref(value: &Value) -> Option<ContextRef> {
+    let selection: Selection = serde_json::from_value(value.clone()).ok()?;
+    let path = selection.path.trim();
+    if !path.starts_with('/') {
+        return None;
+    }
+    let start = selection.start_line.filter(|line| *line >= 1)?;
+    let end = selection.end_line.filter(|line| *line >= start)?;
+    let text = selection.text.as_deref().unwrap_or_default();
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    Some(ContextRef {
+        id: selection_id(path, start, end),
+        title: selection_title(path, start, end),
+        body: selection_body(&selection, path, start, end, text),
+    })
 }
 
-/// 把失败原因转成工具错误结果，保留 Eden 的 hint。
-fn failure_result(call: ToolCall, failure: EdenFailure) -> ToolResult {
-    let message = match &failure {
-        EdenFailure::Protocol(error) if error.is_retryable() => {
-            format!("{}。Eden 暂时不可用，稍后重试即可。", failure)
+/// 生成与选区位置绑定、与正文内容无关的稳定 ID。
+///
+/// 正文会随用户编辑变化，但「同一段选区」应当继续复用同一个标签；ID 里包含正文
+/// 摘要会让用户每敲一个字就多出一个引用。
+fn selection_id(path: &str, start: i64, end: i64) -> String {
+    let id = format!("selection-{:016x}-{start}-{end}", stable_hash(path));
+    id.chars().take(MAX_CONTEXT_REF_ID_BYTES).collect()
+}
+
+/// 生成面向用户的一行标题：文件名加行号范围。
+fn selection_title(path: &str, start: i64, end: i64) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let name = sanitize_inline(&name);
+    let name = truncate_chars(&name, MAX_CONTEXT_REF_TITLE_BYTES.saturating_sub(24));
+    format!("{name}:{start}-{end}")
+}
+
+/// 生成随消息注入的正文。
+///
+/// 采用带属性的标签包裹原文，模型能直接看出这段代码来自哪个文件、哪几行；正文超限时
+/// 在字符边界截断并显式标注，而不是让整条引用被宿主静默丢弃。
+fn selection_body(selection: &Selection, path: &str, start: i64, end: i64, text: &str) -> String {
+    let mut header = format!(
+        "<selection path=\"{}\" lines=\"{start}-{end}\"",
+        sanitize_attribute(path)
+    );
+    if let Some(language) = selection
+        .language
+        .as_deref()
+        .filter(|language| is_plain_token(language))
+    {
+        let _ = write!(header, " language=\"{language}\"");
+    }
+    if selection.dirty {
+        header.push_str(" dirty=\"true\"");
+    }
+    if let Some(tab) = selection
+        .tab
+        .as_deref()
+        .filter(|tab| !tab.trim().is_empty())
+    {
+        let _ = write!(header, " tab=\"{}\"", sanitize_attribute(tab));
+    }
+
+    let tail = "\n</selection>";
+    let budget = MAX_CONTEXT_REF_BODY_BYTES.saturating_sub(header.len() + tail.len());
+    let text = truncate_chars(text, budget);
+    format!("{header}>\n{text}{tail}")
+}
+
+/// 计算 FNV-1a 64 位摘要，用于生成稳定且长度固定的引用 ID。
+fn stable_hash(text: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 把任意文本压成单行，避免标题或属性破坏注入正文的结构。
+fn sanitize_inline(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// 转义 XML 风格属性值，防止路径里的引号提前闭合标签。
+fn sanitize_attribute(text: &str) -> String {
+    sanitize_inline(text)
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// 判断语言标识是否可以安全地原样写入属性。
+fn is_plain_token(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'+' | b'.' | b'#')
+        })
+}
+
+/// 在字符边界截断到给定字节预算，截断时追加说明。
+fn truncate_chars(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let marker_budget = TRUNCATION_MARKER.len();
+    if max_bytes <= marker_budget {
+        return TRUNCATION_MARKER.chars().take(max_bytes).collect();
+    }
+    let budget = max_bytes - marker_budget;
+    let mut end = 0;
+    for (index, ch) in text.char_indices() {
+        if index + ch.len_utf8() > budget {
+            break;
         }
-        EdenFailure::Protocol(_) => failure.to_string(),
-        EdenFailure::Transport(_) => format!(
-            "{}（提示：确认 Eden 正在运行，且 Lucia 是从 Eden 的终端窗格启动的）",
-            failure
-        ),
-    };
-    ToolResult::error(call.id, call.name, message)
-}
-
-/// 用户没在看本 tab 时的降级结果：告诉模型位置而不是抢焦点。
-fn out_of_focus_result(call: ToolCall, path: &str, line: i64) -> ToolResult {
-    ToolResult::success(
-        call.id,
-        call.name,
-        json!({
-            "revealed": false,
-            "reason": "user_in_another_tab",
-            "path": path,
-            "line": line,
-            "message": format!(
-                "用户正在看别的 tab，未切换界面。请直接用文字告诉用户：{path} 第 {line} 行。"
-            ),
-        }),
-    )
-}
-
-/// 构建 `eden_selection` 的工具定义。
-fn selection_tool() -> ToolSpec {
-    ToolSpec::new(
-        SELECTION_TOOL,
-        "读取用户此刻在 Eden 编辑器里选中的文本与行号范围；没有选区时仍返回文件路径和光标所在行。\
-         仅当用户询问当前代码、选区或「我正在看哪一行」时使用。",
-        json!({
-            "type": "object",
-            "properties": {
-                "scope": {
-                    "type": "string",
-                    "enum": ["session", "active"],
-                    "description": "session（默认）读取本会话所在 tab 的编辑器；active 跟随用户当前选中的 tab。"
-                },
-                "include_text": {
-                    "type": "boolean",
-                    "description": "是否返回选中的原文，默认 true。"
-                },
-                "max_text": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": MAX_TEXT_LIMIT,
-                    "description": "选区文本上限，默认 8000；超出会被截断并标记 truncated。"
-                }
-            },
-            "additionalProperties": false
-        }),
-    )
-    .with_permission_scope(ToolPermissionScope::Network)
-}
-
-/// 构建 `eden_editors` 的工具定义。
-fn editors_tool() -> ToolSpec {
-    ToolSpec::new(
-        EDITORS_TOOL,
-        "列出 Eden 中所有已打开的文件，含是否未保存、语言、所属 tab 与是否为会话所在 tab。\
-         用于判断某个文件是否已经打开。",
-        ToolSpec::empty_object_schema(),
-    )
-    .with_permission_scope(ToolPermissionScope::Network)
-}
-
-/// 构建 `eden_context` 的工具定义。
-fn context_tool() -> ToolSpec {
-    ToolSpec::new(
-        CONTEXT_TOOL,
-        "读取 Eden 当前会话所在 tab 的上下文：tab 标题、激活窗格、分屏列表、工作目录与文件树根。\
-         需要知道用户在哪个项目或哪个窗格时使用。",
-        ToolSpec::empty_object_schema(),
-    )
-    .with_permission_scope(ToolPermissionScope::Network)
-}
-
-/// 构建 `eden_reveal` 的工具定义。
-fn reveal_tool() -> ToolSpec {
-    ToolSpec::new(
-        REVEAL_TOOL,
-        "在 Eden 中定位并显示某个已打开文件的某一行。只在用户正看着发起请求的 tab 时生效；\
-         用户在看别的 tab 或文件未打开时会返回说明，此时应改用文字告知路径与行号。",
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "已打开文件的绝对路径；未打开的文件不会被读取或创建。"
-                },
-                "line": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "1-based 行号，默认 1。"
-                }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        }),
-    )
-    .with_permission_scope(ToolPermissionScope::Network)
+        end = index + ch.len_utf8();
+    }
+    let mut truncated = text[..end].to_string();
+    truncated.push_str(TRUNCATION_MARKER);
+    truncated
 }
 
 export_plugin!(EdenPlugin);
@@ -369,85 +308,160 @@ export_plugin!(EdenPlugin);
 mod tests {
     use super::*;
 
-    /// 工具表面必须稳定：四个工具名与权限 scope 是 manifest 与模型约定的边界。
+    /// 构造一份 Eden 的选区响应。
+    fn selection_json() -> Value {
+        json!({
+            "path": "/Users/me/proj/Sources/App.swift",
+            "startLine": 12,
+            "endLine": 20,
+            "caretLine": 20,
+            "text": "func run() {\n    print(1)\n}\n",
+            "truncated": false,
+            "dirty": true,
+            "language": "swift",
+            "tab": "zsh ~/proj",
+            "inSessionTab": true,
+            "focused": true
+        })
+    }
+
+    /// 插件不再向模型暴露工具：选区完全由应用驱动的引用通道承担。
     #[test]
-    fn tool_surface_is_stable() {
-        let plugin = EdenPlugin::default();
-        let tools = plugin.list_tools();
-        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec![SELECTION_TOOL, EDITORS_TOOL, CONTEXT_TOOL, REVEAL_TOOL]
-        );
-        for tool in tools {
-            assert_eq!(tool.permission_scope, ToolPermissionScope::Network);
-            tool.validate_name().expect("工具名必须合法");
+    fn no_tools_are_exposed() {
+        assert!(EdenPlugin::default().list_tools().is_empty());
+    }
+
+    /// 合法选区必须转换成带位置信息的引用。
+    #[test]
+    fn selection_becomes_context_ref() {
+        let entry = selection_ref(&selection_json()).expect("应生成引用");
+        assert!(entry.validate().is_ok(), "{entry:?}");
+        assert_eq!(entry.title, "App.swift:12-20");
+        assert!(entry.body.contains("func run() {"), "{}", entry.body);
+        assert!(entry.body.contains("lines=\"12-20\""), "{}", entry.body);
+        assert!(entry.body.contains("language=\"swift\""), "{}", entry.body);
+        assert!(entry.body.contains("dirty=\"true\""), "{}", entry.body);
+    }
+
+    /// 同一段选区的 ID 只与路径和行号有关，正文变化不应产生新标签。
+    #[test]
+    fn ref_id_is_stable_across_edits() {
+        let first = selection_ref(&selection_json()).expect("应生成引用");
+        let mut edited = selection_json();
+        edited["text"] = json!("func run() {\n    print(2)\n}\n");
+        let second = selection_ref(&edited).expect("应生成引用");
+
+        assert_eq!(first.id, second.id);
+        assert_ne!(first.body, second.body);
+
+        let mut moved = selection_json();
+        moved["startLine"] = json!(13);
+        let third = selection_ref(&moved).expect("应生成引用");
+        assert_ne!(first.id, third.id, "行号变化应视为另一段选区");
+    }
+
+    /// 没有选区、路径非绝对或正文为空都必须返回空快照。
+    #[test]
+    fn absent_selection_is_ignored() {
+        for mutate in [
+            |value: &mut Value| {
+                value.as_object_mut().expect("对象").remove("startLine");
+            },
+            |value: &mut Value| {
+                value["path"] = json!("Sources/App.swift");
+            },
+            |value: &mut Value| {
+                value["text"] = json!("   \n");
+            },
+            |value: &mut Value| {
+                value["startLine"] = json!(0);
+            },
+            |value: &mut Value| {
+                value["endLine"] = json!(5);
+            },
+        ] {
+            let mut value = selection_json();
+            mutate(&mut value);
+            assert!(selection_ref(&value).is_none(), "{value}");
         }
     }
 
-    /// 未知 scope 必须在本地被拒绝，且错误信息给出允许值。
+    /// 超长选区必须在字符边界截断，并保持整份引用仍然合法。
     #[test]
-    fn invalid_scope_is_rejected_locally() {
+    fn oversized_selection_is_truncated_within_contract() {
+        let mut value = selection_json();
+        value["text"] = json!("中".repeat(MAX_CONTEXT_REF_BODY_BYTES));
+        let entry = selection_ref(&value).expect("应生成引用");
+
+        assert!(entry.body.len() <= MAX_CONTEXT_REF_BODY_BYTES);
+        assert!(entry.body.contains("已截断"));
+        assert!(entry.validate().is_ok());
+    }
+
+    /// 路径里的引号与新行不得破坏注入正文的结构。
+    #[test]
+    fn unsafe_paths_are_escaped() {
+        let mut value = selection_json();
+        value["path"] = json!("/tmp/we\"ird\nname.swift");
+        let entry = selection_ref(&value).expect("应生成引用");
+
+        assert!(!entry.body.contains("we\"ird"), "{}", entry.body);
+        assert!(!entry.body.contains("\nname"), "{}", entry.body);
+        assert!(entry.validate().is_ok());
+        assert!(!entry.title.contains('\n'));
+    }
+
+    /// 服务名不匹配时必须报错，避免调用方误以为请求已生效。
+    #[test]
+    fn unknown_service_is_rejected() {
         let mut plugin = EdenPlugin::default();
         let host = agent_plugin::NoopHostApi;
-        let call = ToolCall::new("call-1", SELECTION_TOOL, json!({ "scope": "current-tab" }));
-        let result = plugin
-            .call_tool_with_host(&host, call)
-            .expect("应返回工具结果而不是插件错误");
-        assert!(result.is_error);
-        assert!(
-            result.content.to_string().contains("session"),
-            "{}",
-            result.content
-        );
+        let error = plugin
+            .handle_service(
+                &host,
+                ServiceCall {
+                    caller_id: "lucia-tui".into(),
+                    name: "other.service".into(),
+                    payload: json!({}),
+                },
+            )
+            .expect_err("未知服务应失败");
+        assert!(error.to_string().contains("未实现服务"), "{error}");
     }
 
-    /// reveal 的路径必须是绝对路径，行号必须从 1 开始。
+    /// 宿主不可用时返回空快照而不是错误：引用失败不应打扰用户。
     #[test]
-    fn reveal_rejects_relative_path_and_bad_line() {
+    fn unavailable_host_yields_empty_snapshot() {
         let mut plugin = EdenPlugin::default();
         let host = agent_plugin::NoopHostApi;
-
-        let relative = ToolCall::new("call-2", REVEAL_TOOL, json!({ "path": "a.swift" }));
-        let result = plugin
-            .call_tool_with_host(&host, relative)
-            .expect("应返回工具结果");
-        assert!(result.is_error);
-        assert!(result.content.to_string().contains("绝对路径"));
-
-        let zero_line = ToolCall::new(
-            "call-3",
-            REVEAL_TOOL,
-            json!({ "path": "/tmp/a.swift", "line": 0 }),
-        );
-        let result = plugin
-            .call_tool_with_host(&host, zero_line)
-            .expect("应返回工具结果");
-        assert!(result.is_error);
-        assert!(result.content.to_string().contains("1-based"));
+        let value = plugin
+            .handle_service(
+                &host,
+                ServiceCall {
+                    caller_id: "lucia-tui".into(),
+                    name: CONTEXT_REF_SERVICE.into(),
+                    payload: json!({}),
+                },
+            )
+            .expect("空快照应是正常结果");
+        let snapshot: ContextRefSnapshot = serde_json::from_value(value).expect("应返回快照结构");
+        assert!(snapshot.refs.is_empty());
     }
 
-    /// 传输失败必须给出「确认 Eden 正在运行」这类可执行提示。
+    /// 请求契约拒绝未知字段，防止调用方以为可选参数生效了。
     #[test]
-    fn transport_failure_mentions_eden_runtime() {
-        let call = ToolCall::new("call-4", CONTEXT_TOOL, json!({}));
-        let result = failure_result(call, EdenFailure::Transport("连接超时".to_string()));
-        assert!(result.is_error);
-        let text = result.content.to_string();
-        assert!(text.contains("Eden 正在运行"), "{text}");
-    }
-
-    /// 焦点在别处时的降级结果必须说明原因与建议文案，而不是报错。
-    #[test]
-    fn out_of_focus_result_degrades_to_text() {
-        let call = ToolCall::new("call-5", REVEAL_TOOL, json!({}));
-        let result = out_of_focus_result(call, "/tmp/a.swift", 42);
-        assert!(!result.is_error);
-        assert_eq!(result.content["revealed"], false);
-        assert_eq!(result.content["reason"], "user_in_another_tab");
-        assert!(result.content["message"]
-            .as_str()
-            .expect("应有建议文案")
-            .contains("/tmp/a.swift 第 42 行"));
+    fn unknown_request_fields_are_rejected() {
+        let mut plugin = EdenPlugin::default();
+        let host = agent_plugin::NoopHostApi;
+        assert!(plugin
+            .handle_service(
+                &host,
+                ServiceCall {
+                    caller_id: "lucia-tui".into(),
+                    name: CONTEXT_REF_SERVICE.into(),
+                    payload: json!({ "scope": "session" }),
+                },
+            )
+            .is_err());
     }
 }

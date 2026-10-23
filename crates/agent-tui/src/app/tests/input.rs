@@ -881,7 +881,7 @@ fn input_ref_spans_highlight_labels() {
         pasted_text: None,
     }];
 
-    let spans = input_ref_spans("看 [IMAGE#1] 这个", &attachments);
+    let spans = input_ref_spans("看 [IMAGE#1] 这个", &attachments, &[]);
     let contents: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
 
     assert_eq!(contents, vec!["看 ", "[IMAGE#1]", " 这个"]);

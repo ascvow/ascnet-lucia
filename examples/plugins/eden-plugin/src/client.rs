@@ -692,7 +692,7 @@ mod tests {
 
         let welcome = client.welcome().expect("应记录 welcome");
         assert!(welcome.supports("selection.get"));
-        assert_eq!(welcome.focused(), Some(true));
+        assert_eq!(welcome.scope["focused"], true);
     }
 
     /// 结果必须按 id 配对：先到的旧 id 帧要被跳过。

@@ -89,10 +89,12 @@ impl App {
                 let input = std::mem::take(&mut self.input);
                 let cursor = self.cursor;
                 let attachments = std::mem::take(&mut self.attachments);
+                let refs = std::mem::take(&mut self.refs);
                 self.replace_session(saved, None);
                 self.input = input;
                 self.cursor = cursor;
                 self.attachments = attachments;
+                self.refs = refs;
             }
             Ok(SessionReloadOutcome::Unchanged) => {}
             Err(error) => self.messages.push(Msg::new(
@@ -451,6 +453,7 @@ impl App {
                 self.input = input.text.clone();
                 self.cursor = self.input.len();
                 self.attachments = input.attachments.clone();
+                self.refs = input.refs.clone();
             }
             if !queued_run
                 && self.messages.last().is_some_and(|message| {

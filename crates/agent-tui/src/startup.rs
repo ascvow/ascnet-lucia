@@ -802,6 +802,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 apply_plugin_frames(&mut app, vec![rendered]);
             }
             #[cfg(feature = "plugins")]
+            Some(UiEvent::ContextRefsLoaded(outcomes)) => {
+                app.context_ref_task = None;
+                if app.apply_context_refs(outcomes) {
+                    needs_redraw = true;
+                }
+            }
+            #[cfg(feature = "plugins")]
             Some(UiEvent::PluginFramesLoaded(rendered)) => {
                 app.plugin_refresh_task = None;
                 apply_plugin_frames(&mut app, rendered);
@@ -1108,6 +1115,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     }
                     if let Some(host) = plugin_host.as_ref() {
                         app.schedule_stale_tool_renders(Arc::clone(host));
+                    }
+                    // 上下文引用按固定节拍拉取：Eden 一类的编辑器协议 v1 没有推送通道，
+                    // 由应用在空闲时索要快照，用户选中后无需再手动触发任何工具。
+                    // 拉取本身在后台任务里完成，避免 Eden 无响应时卡住渲染与输入。
+                    if let Some(host) = plugin_host.as_ref() {
+                        app.schedule_context_ref_poll(Arc::clone(host));
                     }
                 }
             }

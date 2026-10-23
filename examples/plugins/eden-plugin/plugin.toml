@@ -1,10 +1,17 @@
 [plugin]
 id = "eden"
 name = "Lucia Eden 编辑器上下文插件"
-version = "0.1.0"
+version = "0.2.0"
 api_version = "0.10.0"
 wasm = "target/wasm32-wasip2/release/eden_plugin.wasm"
-description = "通过 Eden 编辑器的本地 socket 读取当前选区与编辑器上下文，并在用户可见时定位某一行。"
+description = "把 Eden 编辑器当前选区作为上下文引用自动带给下一条消息；不向模型暴露任何工具。"
+
+# 上下文引用 provider：应用按节拍调用 context.ref 服务，把快照里的内容作为
+# 随下一条消息发送的引用。声明该能力是注册服务的资格，也出现在安装审查里。
+[[provides]]
+id = "agent.context-ref"
+version = "1.0.0"
+mode = "multi"
 
 [capabilities]
 # Eden 启动每个终端窗格时注入这三个变量；宿主默认不继承任何环境变量，只有这里列出的
@@ -17,9 +24,3 @@ fs_read = ["~/Library/Application Support/Eden/agent.token"]
 [capabilities.socket]
 # 只允许连接 Eden 自己的 agent socket，逐条精确匹配。
 allow_paths = ["~/Library/Application Support/Eden/agent.sock"]
-
-[capabilities.tool_scopes]
-eden_selection = "network"
-eden_editors = "network"
-eden_context = "network"
-eden_reveal = "network"

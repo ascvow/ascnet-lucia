@@ -16,7 +16,7 @@ use crate::command::NativeCommandState;
 use crate::event::UiEvent;
 #[cfg(feature = "plugins")]
 use crate::plugin::management::PluginManagementService;
-use crate::session::conversation::{Msg, MsgKind, PendingAttachment, UserSubmission};
+use crate::session::conversation::{Msg, MsgKind, PendingAttachment, PendingRef, UserSubmission};
 use crate::session::{restore_session_messages, WorkspaceContext};
 use crate::theme::{COLOR_TEXT, COLOR_WARNING};
 #[cfg(feature = "plugins")]
@@ -63,23 +63,26 @@ pub(crate) const ESC_DOUBLE_PRESS_WINDOW: std::time::Duration =
 /// 读到提示再决定。
 pub(crate) const EXIT_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// 将输入文本切分为普通文本与附件引用标签片段，标签使用高亮样式。
+/// 将输入文本切分为普通文本与附件/引用标签片段，标签使用高亮样式。
 pub(crate) fn input_ref_spans<'a>(
     input: &'a str,
     attachments: &'a [PendingAttachment],
+    refs: &'a [PendingRef],
 ) -> Vec<Span<'a>> {
     let base = Style::new().fg(COLOR_TEXT);
     let clip = Style::new().fg(COLOR_WARNING).bold();
-    if attachments.is_empty() {
+    if attachments.is_empty() && refs.is_empty() {
         return vec![Span::styled(input, base)];
     }
     let mut spans = Vec::new();
     let mut rest = input;
     while !rest.is_empty() {
-        // 取最靠前的附件标签作为下一个高亮片段。
+        // 取最靠前的引用标签作为下一个高亮片段。
         let earliest = attachments
             .iter()
-            .filter_map(|a| rest.find(&a.label).map(|pos| (pos, a.label.len())))
+            .map(|attachment| attachment.label.as_str())
+            .chain(refs.iter().map(|entry| entry.label.as_str()))
+            .filter_map(|label| rest.find(label).map(|pos| (pos, label.len())))
             .min_by_key(|(pos, _)| *pos);
         let Some((start, len)) = earliest else {
             spans.push(Span::styled(rest, base));
@@ -124,6 +127,19 @@ pub(crate) struct App {
     pub(crate) input: String,
     /// 等待随下一条消息发送的附件；引用标签内嵌在 `input` 文本中。
     pub(crate) attachments: Vec<PendingAttachment>,
+    /// 等待随下一条消息发送的上下文引用；标签同样内嵌在 `input` 文本中。
+    pub(crate) refs: Vec<PendingRef>,
+    /// 上一次向上下文引用 provider 拉取快照的时间。
+    #[cfg(feature = "plugins")]
+    pub(crate) context_ref_polled_at: Option<std::time::Instant>,
+    /// 用户删除标签后主动丢弃的引用 ID；同一段上下文被重新选中前不再自动补回。
+    pub(crate) dismissed_refs: std::collections::HashSet<String>,
+    /// 最近一次引用快照的校验失败原因，按 provider 记录以抑制重复提示。
+    #[cfg(feature = "plugins")]
+    pub(crate) context_ref_error: Option<(String, String)>,
+    /// 在途的上下文引用拉取任务；任一时刻至多一个。
+    #[cfg(feature = "plugins")]
+    pub(crate) context_ref_task: Option<tokio::task::JoinHandle<()>>,
     /// FIFO inputs accepted before the Agent becomes ready. Agent 就绪前接收的 FIFO 输入队列。
     pub(crate) queued_inputs: VecDeque<UserSubmission>,
     /// 当前运行是否来自 FIFO 队首；成功预写后才允许移除对应输入。
@@ -463,6 +479,14 @@ impl App {
             messages: Vec::new(),
             input: String::new(),
             attachments: Vec::new(),
+            refs: Vec::new(),
+            #[cfg(feature = "plugins")]
+            context_ref_polled_at: None,
+            dismissed_refs: std::collections::HashSet::new(),
+            #[cfg(feature = "plugins")]
+            context_ref_error: None,
+            #[cfg(feature = "plugins")]
+            context_ref_task: None,
             queued_inputs: VecDeque::new(),
             queued_run_active: false,
             cursor: 0,

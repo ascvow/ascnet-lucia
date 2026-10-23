@@ -1,12 +1,14 @@
 //! Eden 插件的真实 WASM Host 端到端测试。
 //!
 //! 这里不复用原生单元测试的假宿主：只有真正实例化 component、由 Host 建立 Unix socket
-//! 连接、再让一个最小 Eden 服务端回话，才能证明 ABI 注册、manifest allowlist、环境变量
-//! 注入和协议编码在同一路径上都是通的。原生单测与 component 编译都不能替代这一项。
+//! 连接、再让一个最小 Eden 服务端回话，才能证明 ABI 注册、manifest 能力声明、环境变量
+//! 注入、服务路由与协议编码在同一路径上都是通的。原生单测与 component 编译都不能替代
+//! 这一项。
 
 use agent_core::AgentExtension;
 use agent_plugin_host::wasm::WasmPluginHost;
-use agent_tool::ToolCall;
+use agent_plugin_host::{PluginHost, PluginServiceCall};
+use agent_plugin_protocol::{ContextRefSnapshot, CONTEXT_REF_SERVICE, CONTEXT_REF_SERVICE_VERSION};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,7 +19,7 @@ use tokio::task::JoinHandle;
 /// 冒烟测试使用的会话 id。
 const SESSION: &str = "smoke-session";
 
-/// 一个最小 Eden 服务端：只实现 v1 的握手与结果回包。
+/// 一个最小 Eden 服务端：只实现 v1 的握手与选区回包。
 struct MockEden {
     /// 存放 socket、令牌与 manifest 的临时目录。
     directory: PathBuf,
@@ -82,10 +84,15 @@ impl MockEden {
             r#"[plugin]
 id = "eden"
 name = "Eden smoke"
-version = "0.1.0"
+version = "0.2.0"
 api_version = "0.10.0"
 wasm = "{}"
 description = "冒烟测试用 manifest。"
+
+[[provides]]
+id = "agent.context-ref"
+version = "1.0.0"
+mode = "multi"
 
 [capabilities]
 env_read = ["EDEN_SESSION", "EDEN_SOCKET", "EDEN_TOKEN_FILE"]
@@ -93,12 +100,6 @@ fs_read = ["{}"]
 
 [capabilities.socket]
 allow_paths = ["{}"]
-
-[capabilities.tool_scopes]
-eden_selection = "network"
-eden_editors = "network"
-eden_context = "network"
-eden_reveal = "network"
 "#,
             wasm.to_string_lossy(),
             self.token_path(),
@@ -108,11 +109,11 @@ eden_reveal = "network"
         manifest
     }
 
-    /// 启动一个只回一固定结果的服务端任务。
-    fn serve(self, focused: bool, result: Value) -> JoinHandle<Observed> {
+    /// 启动一个只回固定选区结果的服务端任务。
+    fn serve(self, selection: Value) -> JoinHandle<Observed> {
         tokio::spawn(async move {
             let (stream, _) = self.listener.accept().await.expect("接受插件连接");
-            observe(stream, focused, result).await
+            observe(stream, selection).await
         })
     }
 }
@@ -125,7 +126,7 @@ impl Drop for MockEden {
 }
 
 /// 处理一条连接：读 hello、回 welcome，然后逐条回 call 结果。
-async fn observe(stream: UnixStream, focused: bool, result: Value) -> Observed {
+async fn observe(stream: UnixStream, selection: Value) -> Observed {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
 
@@ -138,22 +139,25 @@ async fn observe(stream: UnixStream, focused: bool, result: Value) -> Observed {
     assert_eq!(hello["op"], "hello");
     assert_eq!(hello["v"], 1);
 
-    let welcome = json!({
-        "op": "welcome",
-        "v": 1,
-        "session": SESSION,
-        "capabilities": ["selection.get", "editors.list", "context.get", "editor.reveal", "ping"],
-        "scope": {
-            "resolved": true,
-            "tab": "zsh ~/proj",
-            "tabID": "A636878F",
-            "focused": focused,
-            "hasEditor": true,
-            "cwd": "/Users/me/proj",
-            "pane": "terminal"
-        }
-    });
-    write_line(&mut write, &welcome).await;
+    write_line(
+        &mut write,
+        &json!({
+            "op": "welcome",
+            "v": 1,
+            "session": SESSION,
+            "capabilities": ["selection.get", "editors.list", "context.get", "editor.reveal", "ping"],
+            "scope": {
+                "resolved": true,
+                "tab": "zsh ~/proj",
+                "tabID": "A636878F",
+                "focused": true,
+                "hasEditor": true,
+                "cwd": "/Users/me/proj",
+                "pane": "terminal"
+            }
+        }),
+    )
+    .await;
 
     let mut calls = Vec::new();
     while let Some(line) = lines.next_line().await.expect("读取客户端帧") {
@@ -161,13 +165,16 @@ async fn observe(stream: UnixStream, focused: bool, result: Value) -> Observed {
         match frame["op"].as_str() {
             Some("call") => {
                 calls.push(frame.clone());
-                let reply = json!({
-                    "op": "result",
-                    "id": frame["id"],
-                    "ok": true,
-                    "result": result,
-                });
-                write_line(&mut write, &reply).await;
+                write_line(
+                    &mut write,
+                    &json!({
+                        "op": "result",
+                        "id": frame["id"],
+                        "ok": true,
+                        "result": selection,
+                    }),
+                )
+                .await;
             }
             Some("bye") => break,
             _ => continue,
@@ -195,54 +202,66 @@ fn point_env_at(source: &MockEden) {
     std::env::set_var("EDEN_TOKEN_FILE", source.token_path());
 }
 
-/// 真实 component 必须完成握手、读取上下文，并在焦点不在本 tab 时退化成文字结果。
+/// 真实 component 必须注册上下文引用服务、不暴露工具，并返回可用的选区引用。
 ///
-/// 两个场景合并成一个测试并串行执行：连接参数通过进程环境变量注入，而环境变量是进程全局
-/// 状态，并行跑两个测试会让彼此的 `EDEN_SOCKET` 互相覆盖，最终测得的是竞态而不是行为。
+/// 两个场景合并成一个测试并串行执行：连接参数通过进程环境变量注入，而环境变量是
+/// 进程全局状态，并行跑两个测试会让彼此的 `EDEN_SOCKET` 互相覆盖，最终测得的是竞态
+/// 而不是行为。
 #[tokio::test]
-async fn component_bridges_eden_protocol() {
-    // 场景一：正常读取上下文。
-    let first = MockEden::new(&"a".repeat(64));
-    point_env_at(&first);
-    let manifest = first.write_manifest("context");
-    let server = first.serve(
-        true,
-        json!({
-            "tab": "zsh ~/proj",
-            "tabID": "A636878F",
-            "focused": true,
-            "activePane": "terminal",
-            "panes": [{ "kind": "terminal", "title": "zsh" }],
-            "cwd": "/Users/me/proj",
-            "treeRoot": "/Users/me/proj",
-            "session": SESSION
-        }),
-    );
+async fn component_serves_context_refs_from_eden() {
+    let eden = MockEden::new(&"a".repeat(64));
+    point_env_at(&eden);
+    let manifest = eden.write_manifest("context");
+    let server = eden.serve(json!({
+        "path": "/Users/me/proj/Sources/App.swift",
+        "startLine": 12,
+        "endLine": 20,
+        "caretLine": 20,
+        "text": "func run() {\n    print(1)\n}\n",
+        "truncated": false,
+        "dirty": true,
+        "language": "swift",
+        "tab": "zsh ~/proj",
+        "inSessionTab": true,
+        "focused": true
+    }));
 
     let host = WasmPluginHost::load_from_manifest(&manifest)
         .await
         .expect("Eden component 应加载成功");
-    let tools = host.list_tools().await.expect("读取工具列表");
-    let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
-    names.sort_unstable();
-    assert_eq!(
-        names,
-        vec![
-            "eden_context",
-            "eden_editors",
-            "eden_reveal",
-            "eden_selection"
-        ]
-    );
 
-    let result = host
-        .call_tool(ToolCall::new("call-1", "eden_context", json!({})))
+    // 选区不再是模型工具：工具表必须为空。
+    let tools = host.list_tools().await.expect("读取工具列表");
+    assert!(tools.is_empty(), "插件不应暴露工具：{tools:?}");
+
+    let services = host.services().await.expect("读取服务目录");
+    let service = services
+        .iter()
+        .find(|service| service.name == CONTEXT_REF_SERVICE)
+        .expect("应注册 context.ref 服务");
+    assert_eq!(service.plugin_id, "eden");
+    assert_eq!(service.version, CONTEXT_REF_SERVICE_VERSION);
+
+    let response = host
+        .call_service(&PluginServiceCall {
+            caller_id: "lucia-tui".into(),
+            plugin_id: "eden".into(),
+            name: CONTEXT_REF_SERVICE.into(),
+            payload: json!({}),
+        })
         .await
-        .expect("工具路由不应失败")
-        .expect("插件应处理自己的工具");
-    assert!(!result.is_error, "{}", result.content);
-    assert_eq!(result.content["tab"], "zsh ~/proj");
-    assert_eq!(result.content["session"], SESSION);
+        .expect("服务调用不应失败")
+        .expect("目标插件应处理该服务");
+    let snapshot: ContextRefSnapshot =
+        serde_json::from_value(response).expect("应返回上下文引用快照");
+    snapshot.validate().expect("快照必须通过宿主契约校验");
+
+    assert_eq!(snapshot.refs.len(), 1);
+    let entry = &snapshot.refs[0];
+    assert_eq!(entry.title, "App.swift:12-20");
+    assert!(entry.body.contains("func run() {"), "{}", entry.body);
+    assert!(entry.body.contains("lines=\"12-20\""), "{}", entry.body);
+    assert!(entry.body.contains("language=\"swift\""), "{}", entry.body);
 
     drop(host);
     let observed = tokio::time::timeout(Duration::from_secs(10), server)
@@ -252,38 +271,46 @@ async fn component_bridges_eden_protocol() {
     assert_eq!(observed.hello["token"], "a".repeat(64));
     assert_eq!(observed.hello["session"], SESSION);
     assert_eq!(observed.calls.len(), 1);
-    assert_eq!(observed.calls[0]["tool"], "context.get");
+    assert_eq!(observed.calls[0]["tool"], "selection.get");
+    assert_eq!(observed.calls[0]["args"]["scope"], "session");
+    assert_eq!(observed.calls[0]["args"]["includeText"], true);
 
-    // 场景二：用户在看别的 tab，reveal 必须退化成文字结果且不发出写请求。
-    let second = MockEden::new(&"b".repeat(64));
-    point_env_at(&second);
-    let manifest = second.write_manifest("reveal");
-    let server = second.serve(false, json!({}));
+    // 场景二：用户没有选区时必须返回空快照，而不是退回光标位置。
+    let eden = MockEden::new(&"b".repeat(64));
+    point_env_at(&eden);
+    let manifest = eden.write_manifest("no-selection");
+    let server = eden.serve(json!({
+        "path": "/Users/me/proj/Sources/App.swift",
+        "caretLine": 7,
+        "truncated": false,
+        "dirty": false,
+        "language": "swift",
+        "tab": "zsh ~/proj",
+        "inSessionTab": true,
+        "focused": true
+    }));
 
     let host = WasmPluginHost::load_from_manifest(&manifest)
         .await
         .expect("Eden component 应加载成功");
-    let result = host
-        .call_tool(ToolCall::new(
-            "call-2",
-            "eden_reveal",
-            json!({ "path": "/Users/me/proj/Sources/App.swift", "line": 42 }),
-        ))
+    let response = host
+        .call_service(&PluginServiceCall {
+            caller_id: "lucia-tui".into(),
+            plugin_id: "eden".into(),
+            name: CONTEXT_REF_SERVICE.into(),
+            payload: json!({}),
+        })
         .await
-        .expect("工具路由不应失败")
-        .expect("插件应处理自己的工具");
-    assert!(!result.is_error, "{}", result.content);
-    assert_eq!(result.content["revealed"], false);
-    assert_eq!(result.content["reason"], "user_in_another_tab");
+        .expect("服务调用不应失败")
+        .expect("目标插件应处理该服务");
+    let snapshot: ContextRefSnapshot =
+        serde_json::from_value(response).expect("应返回上下文引用快照");
+    assert!(snapshot.refs.is_empty(), "{snapshot:?}");
 
     drop(host);
     let observed = tokio::time::timeout(Duration::from_secs(10), server)
         .await
         .expect("服务端任务不应挂住")
         .expect("服务端任务不应 panic");
-    assert!(
-        observed.calls.is_empty(),
-        "焦点在别处时不应发出 editor.reveal：{:?}",
-        observed.calls
-    );
+    assert_eq!(observed.calls.len(), 1, "无选区时仍应只查询一次");
 }

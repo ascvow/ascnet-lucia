@@ -30,22 +30,57 @@ pub(crate) struct PendingAttachment {
     pub(crate) pasted_text: Option<String>,
 }
 
-/// 一次用户提交：含附件引用标签的文本与对应附件。
+/// 输入框中等待随下一条消息发送的上下文引用。
+///
+/// 与 [`PendingAttachment`] 的区别是内容形态：附件是文件字节，引用是 provider 已经
+/// 生成好的一段正文。宿主不解释正文语义，只负责边界校验、标签展示与随消息发送。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingRef {
+    /// 输入框中展示的引用标签，如 `[REF#1]`。
+    pub(crate) label: String,
+    /// 提供该引用的插件 ID；不同 provider 的 ID 空间互不相干。
+    pub(crate) provider: String,
+    /// provider 给出的稳定引用 ID；宿主用它判重与更新。
+    pub(crate) id: String,
+    /// 面向用户的一行标题，例如 `App.swift:12-20`。
+    pub(crate) title: String,
+    /// 随消息注入模型的正文。
+    pub(crate) body: String,
+}
+
+impl PendingRef {
+    /// 引用在输入框中占据的片段（标签加一个尾随空格）。
+    ///
+    /// 只有插件宿主存在时才可能自动插入引用，因此纯 Core 构建不需要该辅助方法。
+    #[cfg(feature = "plugins")]
+    pub(crate) fn clip(&self) -> String {
+        format!("{} ", self.label)
+    }
+}
+
+/// 一次用户提交：含引用标签的文本、附件与上下文引用。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct UserSubmission {
-    /// 含附件引用标签的输入文本。
+    /// 含附件与引用标签的输入文本。
     pub(crate) text: String,
     /// 与文本中引用标签对应的附件，按插入顺序排列。
     pub(crate) attachments: Vec<PendingAttachment>,
+    /// 随本条消息发送的上下文引用；标签被用户删掉的条目不会出现在这里。
+    pub(crate) refs: Vec<PendingRef>,
 }
 
 impl UserSubmission {
-    /// 转换为一次用户消息的内容块：文本在前，附件按加入顺序排在其后。
+    /// 转换为一次用户消息的内容块：正文在前，引用其次，附件最后。
     pub(crate) fn blocks(&self) -> Vec<ContentBlock> {
-        let mut blocks = Vec::with_capacity(self.attachments.len() + 1);
-        let visible_text = submission_text(&self.text, &self.attachments);
+        let mut blocks = Vec::with_capacity(self.attachments.len() + self.refs.len() + 1);
+        let visible_text = submission_text(&self.text, &self.attachments, &self.refs);
         if !visible_text.is_empty() {
             blocks.push(ContentBlock::Text { text: visible_text });
+        }
+        for entry in &self.refs {
+            blocks.push(ContentBlock::Text {
+                text: entry.body.clone(),
+            });
         }
         for attachment in &self.attachments {
             if attachment.pasted_text.is_some() {
@@ -68,12 +103,27 @@ impl UserSubmission {
     }
 }
 
-/// 展开粘贴文本并移除文件类展示标签，返回真正发送给模型的正文。
-pub(crate) fn submission_text(text: &str, attachments: &[PendingAttachment]) -> String {
+/// 按输入文本过滤引用：标签已被删除的条目不再发送。
+pub(crate) fn retained_refs(text: &str, refs: &[PendingRef]) -> Vec<PendingRef> {
+    refs.iter()
+        .filter(|entry| text.contains(entry.label.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// 展开粘贴文本并移除文件与引用标签，返回真正发送给模型的正文。
+pub(crate) fn submission_text(
+    text: &str,
+    attachments: &[PendingAttachment],
+    refs: &[PendingRef],
+) -> String {
     let mut body = text.to_string();
     for attachment in attachments {
         let replacement = attachment.pasted_text.as_deref().unwrap_or_default();
         body = body.replace(&attachment.label, replacement);
+    }
+    for entry in refs {
+        body = body.replace(&entry.label, "");
     }
     body.trim().to_string()
 }
@@ -83,6 +133,7 @@ impl From<&str> for UserSubmission {
         Self {
             text: text.to_string(),
             attachments: Vec::new(),
+            refs: Vec::new(),
         }
     }
 }
@@ -92,6 +143,7 @@ impl From<String> for UserSubmission {
         Self {
             text,
             attachments: Vec::new(),
+            refs: Vec::new(),
         }
     }
 }

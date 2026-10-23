@@ -14,7 +14,8 @@ Host API 的目标不是预先实现所有插件，而是提供可复用、可�
 | 插件协作 | 依赖、能力声明、版本化 JSON 服务 | command provider、公共基础插件 |
 | 实例状态 | component 实例内 JSON KV | 计数、短期连接状态 |
 | 文件与进程 | 受控只读文件、无 shell 子进程 stdio | Skill 扫描、MCP client |
-| 本地进程间通信 | allowlist 约束的 Unix domain socket 字节流 | 编辑器上下文、本地守护进程集成 |
+| 本地进程间通信 | allowlist 约束的 Unix domain socket 字节流 | MCP over socket、本地守护进程集成 |
+| 上下文引用 | `context.ref` 服务契约 + `agent.context-ref` 提供者声明，应用按节拍拉取快照并校验后随下一条消息发送 | 编辑器选区、剪贴板片段、当前网页 |
 | 资源限制 | fuel、线性内存、进程数、超时与 Agent 限额 | 全部插件 |
 | 会话持久化 | 原生 `SessionStore` trait、内存与文件实现 | 应用、原生扩展 |
 

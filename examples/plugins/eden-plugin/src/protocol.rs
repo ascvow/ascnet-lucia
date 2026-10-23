@@ -104,11 +104,6 @@ impl EdenError {
             None => format!("Eden 返回 `{}`：{}", self.code, self.message),
         }
     }
-
-    /// 是否为「稍后重试可能成功」的错误。
-    pub(crate) fn is_retryable(&self) -> bool {
-        self.code == "busy"
-    }
 }
 
 /// `welcome` 报文中客户端真正需要的部分。
@@ -166,11 +161,6 @@ impl Welcome {
     /// 而不是在客户端伪造一份硬编码工具表。
     pub(crate) fn supports(&self, tool: &str) -> bool {
         self.capabilities.is_empty() || self.capabilities.iter().any(|entry| entry == tool)
-    }
-
-    /// 握手时用户是否正看着本会话所在的 tab。
-    pub(crate) fn focused(&self) -> Option<bool> {
-        self.scope.get("focused").and_then(Value::as_bool)
     }
 }
 
@@ -253,7 +243,7 @@ mod tests {
         assert!(welcome.supports("selection.get"));
         assert!(welcome.supports("future.tool"));
         assert!(!welcome.supports("editor.reveal"));
-        assert_eq!(welcome.focused(), Some(false));
+        assert_eq!(welcome.scope["focused"], false);
     }
 
     /// 协议版本不一致必须明确失败，而不是按 v1 猜着解析。

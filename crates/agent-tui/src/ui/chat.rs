@@ -321,7 +321,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             .map(|(index, line)| {
                 let prefix = if index == 0 { "› " } else { "  " };
                 let mut spans = vec![Span::styled(prefix, Style::new().fg(input_color).bold())];
-                spans.extend(input_ref_spans(line, &app.attachments));
+                spans.extend(input_ref_spans(line, &app.attachments, &app.refs));
                 Line::from(spans)
             })
             .collect();

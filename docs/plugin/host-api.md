@@ -87,6 +87,30 @@ store 跨插件版本保留，适合记忆、索引等用户资产。判断标�
 
 服务 owner、调用方 ID 和可调用依赖集合均由 Host 注入。Guest 不能发现或调用 manifest 未声明的插件服务；提供方仍需按业务资源 owner 校验请求。完整依赖模型和 command 复用示例见[依赖与服务](/plugin/dependencies-services)。
 
+## 上下文引用服务
+
+`context.ref@1.x` 是宿主与应用之间的稳定服务契约：provider 在 manifest 声明
+`[[provides]] id = "agent.context-ref"`，应用按固定节拍调用该服务并索要一份快照。
+
+```rust
+host.upsert_service(&ServiceSpec {
+    name: "context.ref".into(),
+    version: "1.0.0".into(),
+    description: Some("把当前编辑器选区作为随下一条消息发送的引用".into()),
+})?;
+
+// 之后在 handle_service 中应答：
+// { "refs": [ { "id": "…", "title": "App.swift:12-20", "body": "…" } ] }
+```
+
+宿主只校验边界（条数、ID 字符集、标题单行、正文上限与总量）并把它当作**下一条用户消息的
+一部分**发送；它不解释正文语义，因此新增一类引用源（剪贴板、当前网页）不需要改 Host。没有可
+引用内容时返回 `{"refs":[]}`。
+
+这条通道的特别之处是「无需用户逐次确认」：内容会自动进入模型上下文。因此注册资格来自
+manifest 的 `agent.context-ref` 声明，任意插件不能只靠在运行时宣布服务名接入；宿主还会把每条
+引用展开成独立的文本块，标签由用户删除即视为丢弃。
+
 ## 文件读取
 
 ```rust

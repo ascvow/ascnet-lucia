@@ -41,6 +41,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 mod agent;
@@ -137,6 +138,8 @@ pub(crate) struct CapabilityState {
     state_store: Option<PluginStateStore>,
     /// Host 注入的可信规范化工作区根；只供 `workspace_read` 路径校验使用。
     workspace_root: Option<PathBuf>,
+    /// manifest 声明的能力 ID；契约型服务注册时按此校验资格。
+    provided_capabilities: HashSet<String>,
 }
 
 /// Host 在真实 Manifest 或执行策略边界拒绝插件能力时使用的类型化错误。
@@ -228,6 +231,8 @@ pub(crate) struct CapabilityHostContext {
     workspace_scope: Option<String>,
     /// 当前项目的可信规范化根目录；缺失时 `workspace_read` 调用必须失败。
     workspace_root: Option<PathBuf>,
+    /// manifest `[[provides]]` 声明的能力 ID；用于校验契约型服务的注册资格。
+    provided_capabilities: Vec<String>,
 }
 
 impl CapabilityHostContext {
@@ -253,7 +258,17 @@ impl CapabilityHostContext {
             workspace_scope,
             session_source,
             workspace_root,
+            provided_capabilities: Vec::new(),
         }
+    }
+
+    /// 注入 manifest `[[provides]]` 声明的能力 ID。
+    ///
+    /// 用于契约型服务（如 `agent.context-ref`）的注册资格校验：服务名对所有插件可见，
+    /// 但只有 manifest 明确声明过的插件才能注册，用户才能在安装审查时看到这条授权。
+    pub(crate) fn with_provided_capabilities(mut self, capabilities: Vec<String>) -> Self {
+        self.provided_capabilities = capabilities;
+        self
     }
 
     /// 注入该插件的受限 HTTP 端点。
@@ -396,6 +411,7 @@ impl CapabilityState {
             active_run_id: ActiveRunBinding::default(),
             state_store,
             workspace_root: host_context.workspace_root,
+            provided_capabilities: host_context.provided_capabilities.into_iter().collect(),
         })
     }
 
@@ -615,6 +631,7 @@ impl CapabilityState {
     /// 注册或替换当前插件拥有的服务。
     pub(crate) fn upsert_service(&mut self, request_json: &str) -> Result<Value> {
         let request: ServiceSpecRequest = parse_request(request_json)?;
+        self.require_contract_service(&request)?;
         self.services.upsert(
             &self.plugin_id,
             PluginService {
@@ -625,6 +642,38 @@ impl CapabilityState {
             },
         )?;
         Ok(Value::Null)
+    }
+
+    /// 校验契约型服务的注册资格。
+    ///
+    /// `context.ref` 的返回值会被自动带进用户下一条消息，属于「无需用户逐次确认」的
+    /// 输入通道。注册资格因此必须来自 manifest 声明的 `agent.context-ref`，而不是
+    /// 任意插件在运行时自行宣布；版本主号还必须与宿主实现的契约一致。
+    fn require_contract_service(&self, request: &ServiceSpecRequest) -> Result<()> {
+        if request.name != agent_plugin_protocol::CONTEXT_REF_SERVICE {
+            return Ok(());
+        }
+        if !self
+            .provided_capabilities
+            .contains(agent_plugin_protocol::CONTEXT_REF_CAPABILITY)
+        {
+            return Err(capability_denied(format!(
+                "插件 manifest 未声明 [[provides]] `{}`，不能注册服务 `{}`",
+                agent_plugin_protocol::CONTEXT_REF_CAPABILITY,
+                request.name
+            )));
+        }
+        let version = semver::Version::parse(&request.version)
+            .map_err(|error| anyhow!("服务 `{}` 的版本无效：{error}", request.name))?;
+        let supported = semver::Version::parse(agent_plugin_protocol::CONTEXT_REF_SERVICE_VERSION)
+            .expect("上下文引用契约版本必须是合法语义化版本");
+        if version.major != supported.major {
+            return Err(capability_denied(format!(
+                "服务 `{}` 的版本 `{version}` 与宿主契约 `{supported}` 不兼容",
+                request.name
+            )));
+        }
+        Ok(())
     }
 
     /// 删除当前插件拥有的服务。

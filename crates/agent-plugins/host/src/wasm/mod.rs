@@ -582,7 +582,14 @@ impl WasmPluginHost {
                             host_services.session_source(),
                             host_services.workspace_root(),
                         )
-                        .with_http(host_services.http_for(&manifest.plugin.id)),
+                        .with_http(host_services.http_for(&manifest.plugin.id))
+                        .with_provided_capabilities(
+                            manifest
+                                .provides
+                                .iter()
+                                .map(|provided| provided.id.clone())
+                                .collect(),
+                        ),
                     )?,
                     store_limits,
                 ),

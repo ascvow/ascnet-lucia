@@ -111,12 +111,24 @@ pub(crate) enum UiEvent {
     /// 后台插件视图批量渲染完成。
     #[cfg(feature = "plugins")]
     PluginFramesLoaded(Vec<PluginRenderResult>),
+    /// 后台上下文引用快照拉取完成。
+    #[cfg(feature = "plugins")]
+    ContextRefsLoaded(Vec<ContextRefOutcome>),
     /// 后台单个视图已完成，立即展示而不等待整批结束。
     #[cfg(feature = "plugins")]
     PluginFrameLoaded(PluginRenderResult),
     /// 后台渐进加载全部结束，或全局规划失败。
     #[cfg(feature = "plugins")]
     PluginsLoaded(Box<Result<()>>),
+}
+
+/// 单个上下文引用 provider 的一次快照结果。
+#[cfg(feature = "plugins")]
+pub(crate) struct ContextRefOutcome {
+    /// 提供快照的可信插件 ID。
+    pub(crate) provider: String,
+    /// 通过契约校验的引用；失败时携带面向用户的说明。
+    pub(crate) refs: Result<Vec<agent_plugin_protocol::ContextRef>, String>,
 }
 
 /// 一次用户输入从先行持久化到模型运行结束的完整结果。
