@@ -223,6 +223,20 @@ pub(super) fn endpoint_url(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
 }
 
+/// 对 URL path 组件做百分号编码；未保留字符保持原样。
+pub(super) fn url_encode_component(component: &str) -> String {
+    let mut encoded = String::with_capacity(component.len());
+    for byte in component.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
 /// 判断附件媒体类型是否可以安全地内联为纯文本。
 pub(super) fn is_text_media_type(media_type: &str) -> bool {
     media_type.starts_with("text/")

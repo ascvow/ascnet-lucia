@@ -21,7 +21,10 @@ pub mod model;
 pub mod session;
 pub mod state;
 
-pub use agent::{Agent, AgentControl, AgentModelConfig, AgentOptions, AgentRun, ModelRequestGate};
+pub use agent::{
+    ActiveModelRoute, Agent, AgentControl, AgentModelConfig, AgentOptions, AgentRun,
+    ModelRequestGate,
+};
 pub use agent_event::declare_event;
 pub use agent_event::{
     Cancellation, DispatchOutcome, Dispatched, Event, EventBus, EventContext, EventData,

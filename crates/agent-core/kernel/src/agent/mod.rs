@@ -62,6 +62,18 @@ pub trait ModelRequestGate: Send + Sync {
     fn before_request(&self, request: &ModelRequest) -> Result<()>;
 }
 
+/// 下一次模型请求实际使用的路由。
+///
+/// 热切换覆盖或静态运行选项的只读快照；`provider` 是 ModelGateway 注册键，
+/// `model` 是发送给服务商适配器的模型 ID。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveModelRoute {
+    /// 逻辑 provider 名称。
+    pub provider: String,
+    /// 模型 ID。
+    pub model: String,
+}
+
 /// Runtime options for one agent instance.
 /// 一个 agent 实例的运行选项。
 #[derive(Debug, Clone)]
@@ -403,6 +415,9 @@ pub struct Agent {
     /// 应用在共享 Agent 上动态覆盖的推理强度；`u8::MAX` 表示沿用静态运行选项。
     reasoning_override: std::sync::atomic::AtomicU8,
 
+    /// 应用在共享 Agent 上热切换的模型路由覆盖；`None` 表示沿用静态运行选项。
+    model_override: Arc<std::sync::Mutex<Option<ActiveModelRoute>>>,
+
     /// 应用注入的会话路由标识，随模型请求下发给支持会话亲和的服务商。
     ///
     /// 用共享可变而不是运行选项：同一个 Agent 实例会在多个会话之间切换，键必须跟着
@@ -442,6 +457,7 @@ impl Agent {
             bus: EventBus::new(),
             options,
             reasoning_override: std::sync::atomic::AtomicU8::new(u8::MAX),
+            model_override: Arc::new(std::sync::Mutex::new(None)),
             session_id: Arc::new(std::sync::Mutex::new(None)),
             steering: Arc::new(std::sync::Mutex::new(Vec::new())),
             follow_ups: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -806,6 +822,46 @@ impl Agent {
     pub fn set_session_id(&self, session_id: Option<String>) {
         if let Ok(mut slot) = self.session_id.lock() {
             *slot = session_id;
+        }
+    }
+
+    /// 在共享 Agent 上热切换模型上游，并选择该上游下的模型 ID。
+    ///
+    /// 适配器立即按配置构造并注册进网关；静态 [`AgentOptions`] 保持不变，后续
+    /// ReAct 循环通过 [`Self::active_route`] 读取覆盖路由。已经发出的请求不会被
+    /// 修改；正在运行的循环从下一次模型请求开始生效。
+    ///
+    /// # Errors
+    ///
+    /// 上游配置无法构造对应协议适配器时返回错误，此时当前路由保持不变。
+    pub fn switch_model_upstream(
+        &self,
+        provider_config: ModelProviderConfig,
+        model: impl Into<String>,
+    ) -> Result<()> {
+        let provider = provider_config.name.clone();
+        self.gateway.upsert_from_config(provider_config)?;
+        if let Ok(mut route) = self.model_override.lock() {
+            *route = Some(ActiveModelRoute {
+                provider,
+                model: model.into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 返回下一次模型请求实际使用的逻辑 provider 与模型 ID。
+    ///
+    /// 存在热切换覆盖时优先返回覆盖值，否则回落到静态运行选项。
+    pub fn active_route(&self) -> ActiveModelRoute {
+        if let Ok(route) = self.model_override.lock() {
+            if let Some(route) = route.as_ref() {
+                return route.clone();
+            }
+        }
+        ActiveModelRoute {
+            provider: self.options.provider.clone(),
+            model: self.options.model.clone(),
         }
     }
 

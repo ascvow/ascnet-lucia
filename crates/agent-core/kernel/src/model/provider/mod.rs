@@ -5,8 +5,19 @@
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
 
+#[cfg(feature = "bedrock")]
+pub mod bedrock;
+
+#[cfg(feature = "google")]
+pub mod google;
+
 #[cfg(feature = "openai")]
 pub mod openai;
 
-#[cfg(any(feature = "openai", feature = "anthropic"))]
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "google",
+    feature = "bedrock"
+))]
 pub(crate) mod support;

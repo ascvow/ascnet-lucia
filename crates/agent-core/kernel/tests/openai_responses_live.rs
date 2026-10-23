@@ -52,7 +52,10 @@ async fn compatible_responses_short_cache_hits_across_agent_turns(
     options.system_prompt = (0..240)
         .map(|index| format!("Record {index}: This is synthetic cache verification data. Preserve the common prefix and reply only OK.\n"))
         .collect();
-    assert_eq!(config.model.gateway, GatewayKind::OpenAiCompatible);
+    assert_eq!(
+        config.default_upstream()?.gateway,
+        GatewayKind::OpenAiCompatible
+    );
     agent.set_session_id(Some(uuid::Uuid::new_v4().to_string()));
 
     let mut session = None;

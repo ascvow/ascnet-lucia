@@ -10,9 +10,15 @@ pub mod types;
 #[doc(hidden)]
 pub use contract as adapter;
 pub use contract::{ChatModel, ProviderAdapter};
-pub use gateway::{ModelGateway, ModelProviderConfig, OpenAiProtocol, ProviderKind};
+pub use gateway::{
+    ModelGateway, ModelProviderConfig, OpenAiProtocol, ProviderAdapterFactory, ProviderKind,
+};
 #[cfg(feature = "anthropic")]
 pub use provider::anthropic;
+#[cfg(feature = "bedrock")]
+pub use provider::bedrock;
+#[cfg(feature = "google")]
+pub use provider::google;
 #[cfg(feature = "openai")]
 pub use provider::openai;
 pub use stream::{ModelEventSender, ModelEventStream, ModelStreamEvent};

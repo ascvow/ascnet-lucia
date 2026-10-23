@@ -2821,3 +2821,30 @@ fn with_execution_policy_only_narrows() {
     assert!(!options.execution_policy.allow_network);
     assert!(!options.execution_policy.allow_process);
 }
+
+/// 共享 Agent 热切换必须覆盖 active_route，且未切换时回落到静态选项。
+#[test]
+fn switch_model_upstream_overrides_active_route() {
+    let agent = Agent::new(ModelGateway::new(), AgentOptions::default());
+    let fallback = agent.active_route();
+    assert_eq!(fallback.provider, "default");
+
+    let config = ModelProviderConfig::google("gemini-test", "key");
+    agent
+        .switch_model_upstream(config, "gemini-2.5-pro")
+        .expect("热切换应成功注册上游");
+    let route = agent.active_route();
+    assert_eq!(route.provider, "gemini-test");
+    assert_eq!(route.model, "gemini-2.5-pro");
+    assert!(agent.gateway().contains("gemini-test"));
+
+    // 切换失败时当前路由必须保持不变。
+    let bad =
+        ModelProviderConfig::new("bad", crate::model::ProviderKind::Custom("nope".into()), "");
+    let error = agent
+        .switch_model_upstream(bad, "whatever")
+        .expect_err("未注册协议应失败");
+    assert!(error.to_string().contains("no factory registered"));
+    let route = agent.active_route();
+    assert_eq!(route.provider, "gemini-test");
+}

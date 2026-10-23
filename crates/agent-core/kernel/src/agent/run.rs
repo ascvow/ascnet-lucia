@@ -500,18 +500,19 @@ impl Agent {
             AgentEventKind::RunStarted,
             0,
             json!({
-                "provider": &self.options.provider,
-                "model": &self.options.model,
+                "provider": &self.active_route().provider,
+                "model": &self.active_route().model,
             }),
         )
         .await?;
 
         // 运行准入：监听者可以在进入循环前否决整次运行。
+        let run_start_route = self.active_route();
         let run_start = self
             .dispatch_cancellable(RunStartEvent {
                 run_id: run_id.clone(),
-                provider: self.options.provider.clone(),
-                model: self.options.model.clone(),
+                provider: run_start_route.provider,
+                model: run_start_route.model,
             })
             .await;
         if run_start.is_cancelled() {
@@ -585,13 +586,16 @@ impl Agent {
                 ));
             }
             source_messages.extend(session.model_messages());
+            // 每次模型请求前读取当前路由：热切换在共享 Agent 上生效后，
+            // 运行中的循环从下一次请求开始使用新上游。
+            let route = self.active_route();
             let mut loaded_context = self
                 .context_loader
                 .load(ContextLoadRequest {
                     run_id: run_id.clone(),
                     step,
-                    provider: self.options.provider.clone(),
-                    model: self.options.model.clone(),
+                    provider: route.provider.clone(),
+                    model: route.model.clone(),
                     system: session.system().cloned(),
                     messages: source_messages,
                     user_initiated: false,
@@ -605,12 +609,12 @@ impl Agent {
                 std::mem::take(&mut next_request_tool_results),
             );
             let req = ModelRequest {
-                model: self.options.model.clone(),
+                model: route.model.clone(),
                 system: loaded_context.system,
                 messages: crate::model::transform::transform_messages_for_route(
                     &loaded_context.messages,
-                    &self.options.provider,
-                    &self.options.model,
+                    &route.provider,
+                    &route.model,
                 ),
                 tools,
                 tool_choice: self.options.tool_choice.clone(),
@@ -638,8 +642,8 @@ impl Agent {
                 AgentEventKind::ModelRequest,
                 step,
                 json!({
-                    "provider": &self.options.provider,
-                    "model": &self.options.model,
+                    "provider": &route.provider,
+                    "model": &route.model,
                     "message_count": req.messages.len(),
                     "tool_count": req.tools.len(),
                     "context": request_context_snapshot(&req),
@@ -649,12 +653,7 @@ impl Agent {
 
             // 模型请求准入：监听者可以在请求发往 provider 前结束运行。
             let model_request = self
-                .dispatch_cancellable(ModelRequestEvent::new(
-                    &run_id,
-                    step,
-                    &self.options.provider,
-                    &req,
-                ))
+                .dispatch_cancellable(ModelRequestEvent::new(&run_id, step, &route.provider, &req))
                 .await;
             if model_request.is_cancelled() {
                 tracing::info!(
@@ -676,7 +675,7 @@ impl Agent {
                     tokio::pin!(cancel_notified);
                     if self.options.stream {
                         tokio::select! {
-                            result = self.gateway.stream(&self.options.provider, req.clone()) => {
+                            result = self.gateway.stream(&route.provider, req.clone()) => {
                                 let stream = result?;
                                 self.update_state(|state| state.phase = AgentPhase::StreamingModel);
                                 break stream;
@@ -691,7 +690,7 @@ impl Agent {
                         }
                     } else {
                         tokio::select! {
-                            result = self.gateway.complete(&self.options.provider, req.clone()) => {
+                            result = self.gateway.complete(&route.provider, req.clone()) => {
                                 let (sender, stream) = crate::model::ModelEventStream::channel();
                                 sender.done(result?);
                                 break stream;
@@ -808,8 +807,8 @@ impl Agent {
             }
 
             let billing = BillingUsage::new(
-                self.options.provider.clone(),
-                self.options.model.clone(),
+                route.provider.clone(),
+                route.model.clone(),
                 usage,
                 provider_billing,
             );
@@ -1234,6 +1233,8 @@ impl Agent {
                 .unwrap_or_default(),
         );
         call.bind_run_id(run_id);
+        // 会话作用域由应用绑定到 Agent，覆盖模型或历史消息携带的同名字段。
+        call.session_id = self.session_id();
         let original_call = call.clone();
 
         // 第一道策略门禁：在任何插件钩子之前拒绝策略不允许的工具，
@@ -1349,6 +1350,7 @@ impl Agent {
                 .unwrap_or_default(),
         );
         call.bind_run_id(run_id);
+        call.session_id.clone_from(&original_call.session_id);
 
         // 第二道策略门禁：插件可以重写工具调用，但不能借重写换成策略拒绝的工具。
         // 与 `RestrictedExtension` 对 allowlist 的处理保持一致。

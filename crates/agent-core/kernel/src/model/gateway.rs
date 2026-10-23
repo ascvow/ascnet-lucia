@@ -5,12 +5,18 @@ use super::{ChatModel, GatewayKind, ModelRequest, ModelResponse, ProviderAdapter
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
-/// Provider family.
-/// 服务商类型。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
+/// Provider family or protocol id.
+/// 服务商协议类型。
+///
+/// 内置协议是封闭变体；其余字符串统一归入 [`ProviderKind::Custom`]，由应用通过
+/// [`ModelGateway::register_factory`] 注册的自定义工厂构造适配器。序列化始终使用
+/// kebab-case 协议 ID，未知 ID 反序列化为 [`ProviderKind::Custom`]，保证配置向后兼容。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
     /// OpenAI 官方接口，可选择 Responses 或 Chat Completions 协议。
     OpenAi,
@@ -18,6 +24,46 @@ pub enum ProviderKind {
     OpenAiCompatible,
     /// Anthropic Messages 接口。
     Anthropic,
+    /// Google Generative AI（Gemini）generateContent 接口。
+    Google,
+    /// Amazon Bedrock Converse 接口。
+    Bedrock,
+    /// 未内置的协议 ID，由调用方注册的自定义工厂解析。
+    Custom(String),
+}
+
+impl ProviderKind {
+    /// 返回该协议的稳定 kebab-case ID，同时作为工厂注册表的键。
+    pub fn protocol_id(&self) -> &str {
+        match self {
+            Self::OpenAi => "open-ai",
+            Self::OpenAiCompatible => "open-ai-compatible",
+            Self::Anthropic => "anthropic",
+            Self::Google => "google",
+            Self::Bedrock => "bedrock",
+            Self::Custom(id) => id,
+        }
+    }
+}
+
+impl serde::Serialize for ProviderKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.protocol_id())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ProviderKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "open-ai" => Self::OpenAi,
+            "open-ai-compatible" => Self::OpenAiCompatible,
+            "anthropic" => Self::Anthropic,
+            "google" => Self::Google,
+            "bedrock" => Self::Bedrock,
+            other => Self::Custom(other.to_string()),
+        })
+    }
 }
 
 /// OpenAI-compatible protocol variant.
@@ -68,6 +114,22 @@ pub struct ModelProviderConfig {
     /// 否则会按错误的约定发送缓存路由信息。
     #[serde(default)]
     pub gateway: GatewayKind,
+
+    /// AWS 区域；仅 Bedrock 协议使用，例如 `us-east-1`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_region: Option<String>,
+
+    /// AWS 访问密钥 ID；仅 Bedrock 协议使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_access_key_id: Option<String>,
+
+    /// AWS 秘密访问密钥；仅 Bedrock 协议使用。建议通过环境变量注入后构造。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_secret_access_key: Option<String>,
+
+    /// AWS 临时会话令牌；仅 Bedrock 协议使用，长期凭据留空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_session_token: Option<String>,
 }
 
 impl ModelProviderConfig {
@@ -82,6 +144,10 @@ impl ModelProviderConfig {
             openai_protocol: OpenAiProtocol::default(),
             extra_headers: HashMap::new(),
             gateway: GatewayKind::default(),
+            aws_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_session_token: None,
         }
     }
 
@@ -116,6 +182,30 @@ impl ModelProviderConfig {
         Self::new(name, ProviderKind::Anthropic, api_key)
     }
 
+    /// Build a Google Generative AI provider config.
+    /// 构建 Google Generative AI 服务商配置。
+    pub fn google(name: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self::new(name, ProviderKind::Google, api_key)
+    }
+
+    /// Build an Amazon Bedrock Converse provider config.
+    ///
+    /// `api_key` 字段对 Bedrock 无意义，凭据通过 AWS 字段提供。
+    pub fn bedrock(
+        name: impl Into<String>,
+        region: impl Into<String>,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ProviderKind::Bedrock,
+            aws_region: Some(region.into()),
+            aws_access_key_id: Some(access_key_id.into()),
+            aws_secret_access_key: Some(secret_access_key.into()),
+            ..Self::new(name, ProviderKind::Bedrock, String::new())
+        }
+    }
+
     /// Set base URL.
     /// 设置 base URL。
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -140,126 +230,293 @@ impl ModelProviderConfig {
 
 /// Registry and router for model providers.
 /// 模型服务商注册表和路由器。
+///
+/// 网关同时持有协议适配器实例和协议工厂：内置协议工厂在 [`ModelGateway::new`]
+/// 时注册，应用可通过 [`ModelGateway::register_factory`] 注册自定义协议工厂，
+/// 使新协议在不修改网关的情况下接入（开闭原则）。
+///
+/// 注册表使用内部读写锁：克隆共享同一份注册状态，因此运行期通过 [`Self::upsert`]
+/// 完成的热切换对全部克隆可见，包括派生 Agent 与插件模型路由。
 #[derive(Clone, Default)]
 pub struct ModelGateway {
-    providers: HashMap<String, Arc<dyn ProviderAdapter>>,
+    providers: Arc<RwLock<HashMap<String, Arc<dyn ProviderAdapter>>>>,
+    factories: Arc<RwLock<HashMap<String, Arc<dyn ProviderAdapterFactory>>>>,
+}
+
+/// 根据服务商配置构造协议适配器的工厂。
+///
+/// 工厂按 [`ProviderKind::protocol_id`] 注册进 [`ModelGateway`]；一个工厂实例可以
+/// 服务多种协议变体（例如 OpenAI 系同时覆盖官方与兼容网关），具体变体在
+/// [`ProviderAdapterFactory::build`] 内部根据配置决定。
+pub trait ProviderAdapterFactory: Send + Sync {
+    /// 该工厂负责的协议类型。
+    fn kind(&self) -> ProviderKind;
+
+    /// 根据配置构造一个协议适配器。
+    ///
+    /// 错误：配置缺少该协议必需的字段（凭据、区域等）或对应协议 feature 未启用时返回。
+    fn build(&self, config: ModelProviderConfig) -> Result<Arc<dyn ProviderAdapter>>;
+}
+
+/// OpenAI 系协议适配器工厂，覆盖官方 OpenAI 与 OpenAI 兼容网关。
+#[derive(Debug, Clone)]
+struct OpenAiAdapterFactory {
+    /// 工厂注册时声明的协议类型；同一实现按两种协议 ID 分别注册。
+    kind: ProviderKind,
+}
+
+impl ProviderAdapterFactory for OpenAiAdapterFactory {
+    fn kind(&self) -> ProviderKind {
+        self.kind.clone()
+    }
+
+    fn build(&self, config: ModelProviderConfig) -> Result<Arc<dyn ProviderAdapter>> {
+        #[cfg(feature = "openai")]
+        {
+            use super::provider::openai::{OpenAiChatCompletionsAdapter, OpenAiResponsesAdapter};
+            match config.openai_protocol.clone() {
+                OpenAiProtocol::Responses => Ok(Arc::new(OpenAiResponsesAdapter::new(config)?)),
+                OpenAiProtocol::ChatCompletions => {
+                    Ok(Arc::new(OpenAiChatCompletionsAdapter::new(config)?))
+                }
+            }
+        }
+
+        #[cfg(not(feature = "openai"))]
+        {
+            let _ = config;
+            anyhow::bail!("openai feature is disabled")
+        }
+    }
+}
+
+/// Anthropic Messages 协议适配器工厂。
+#[derive(Debug, Clone, Copy, Default)]
+struct AnthropicAdapterFactory;
+
+impl ProviderAdapterFactory for AnthropicAdapterFactory {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Anthropic
+    }
+
+    fn build(&self, config: ModelProviderConfig) -> Result<Arc<dyn ProviderAdapter>> {
+        #[cfg(feature = "anthropic")]
+        {
+            use super::provider::anthropic::AnthropicMessagesAdapter;
+            Ok(Arc::new(AnthropicMessagesAdapter::new(config)?))
+        }
+
+        #[cfg(not(feature = "anthropic"))]
+        {
+            let _ = config;
+            anyhow::bail!("anthropic feature is disabled")
+        }
+    }
+}
+
+/// Google Generative AI 协议适配器工厂。
+#[cfg(feature = "google")]
+#[derive(Debug, Clone, Copy, Default)]
+struct GoogleAdapterFactory;
+
+#[cfg(feature = "google")]
+impl ProviderAdapterFactory for GoogleAdapterFactory {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Google
+    }
+
+    fn build(&self, config: ModelProviderConfig) -> Result<Arc<dyn ProviderAdapter>> {
+        #[cfg(feature = "google")]
+        {
+            use super::provider::google::GoogleGenerativeAdapter;
+            Ok(Arc::new(GoogleGenerativeAdapter::new(config)?))
+        }
+
+        #[cfg(not(feature = "google"))]
+        {
+            let _ = config;
+            anyhow::bail!("google feature is disabled")
+        }
+    }
+}
+
+/// Amazon Bedrock Converse 协议适配器工厂。
+#[cfg(feature = "bedrock")]
+#[derive(Debug, Clone, Copy, Default)]
+struct BedrockAdapterFactory;
+
+#[cfg(feature = "bedrock")]
+impl ProviderAdapterFactory for BedrockAdapterFactory {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Bedrock
+    }
+
+    fn build(&self, config: ModelProviderConfig) -> Result<Arc<dyn ProviderAdapter>> {
+        #[cfg(feature = "bedrock")]
+        {
+            use super::provider::bedrock::BedrockConverseAdapter;
+            Ok(Arc::new(BedrockConverseAdapter::new(config)?))
+        }
+
+        #[cfg(not(feature = "bedrock"))]
+        {
+            let _ = config;
+            anyhow::bail!("bedrock feature is disabled")
+        }
+    }
 }
 
 impl ModelGateway {
-    /// Create an empty gateway.
-    /// 创建空网关。
+    /// Create an empty gateway with built-in protocol factories registered.
+    ///
+    /// 创建空网关，并注册随 feature 启用的内置协议工厂。
     pub fn new() -> Self {
-        Self::default()
+        let gateway = Self::default();
+        #[cfg(feature = "openai")]
+        {
+            gateway.register_factory(OpenAiAdapterFactory {
+                kind: ProviderKind::OpenAi,
+            });
+            gateway.register_factory(OpenAiAdapterFactory {
+                kind: ProviderKind::OpenAiCompatible,
+            });
+        }
+        #[cfg(feature = "anthropic")]
+        gateway.register_factory(AnthropicAdapterFactory);
+        #[cfg(feature = "google")]
+        gateway.register_factory(GoogleAdapterFactory);
+        #[cfg(feature = "bedrock")]
+        gateway.register_factory(BedrockAdapterFactory);
+        gateway
+    }
+
+    /// 注册或替换一个协议工厂；键取 `factory.kind().protocol_id()`。
+    pub fn register_factory(&self, factory: impl ProviderAdapterFactory + 'static) -> &Self {
+        self.factories
+            .write()
+            .expect("协议工厂注册表锁不应中毒")
+            .insert(factory.kind().protocol_id().to_string(), Arc::new(factory));
+        self
     }
 
     /// Build a gateway with one provider config.
     /// 使用一个服务商配置构建网关。
     pub fn from_config(config: ModelProviderConfig) -> Result<Self> {
-        let mut gateway = Self::new();
+        let gateway = Self::new();
         gateway.register_from_config(config)?;
         Ok(gateway)
     }
 
     /// Register an adapter under a logical provider name.
     /// 使用逻辑服务商名称注册适配器。
+    ///
+    /// # Errors
+    ///
+    /// 名称非法或已被注册时返回错误。
     pub fn register(
-        &mut self,
+        &self,
         provider_name: impl Into<String>,
         adapter: Arc<dyn ProviderAdapter>,
-    ) -> Result<&mut Self> {
+    ) -> Result<&Self> {
         let provider_name = provider_name.into();
         validate_provider_name(&provider_name)?;
-        if self.providers.contains_key(&provider_name) {
+        let mut providers = self.providers.write().expect("服务商注册表锁不应中毒");
+        if providers.contains_key(&provider_name) {
             return Err(anyhow!("duplicated provider: {provider_name}"));
         }
-        self.providers.insert(provider_name, adapter);
+        providers.insert(provider_name, adapter);
         Ok(self)
     }
 
     /// Register or replace an adapter under a logical provider name.
-    /// 使用逻辑服务商名称注册或替换适配器。
+    /// 使用逻辑服务商名称注册或替换适配器；运行期热切换上游使用该入口。
+    ///
+    /// # Errors
+    ///
+    /// 名称非法时返回错误。
     pub fn upsert(
-        &mut self,
+        &self,
         provider_name: impl Into<String>,
         adapter: Arc<dyn ProviderAdapter>,
-    ) -> Result<&mut Self> {
+    ) -> Result<&Self> {
         let provider_name = provider_name.into();
         validate_provider_name(&provider_name)?;
-        self.providers.insert(provider_name, adapter);
+        self.providers
+            .write()
+            .expect("服务商注册表锁不应中毒")
+            .insert(provider_name, adapter);
         Ok(self)
     }
 
     /// Create and register an adapter from config.
     /// 根据配置创建并注册适配器。
-    pub fn register_from_config(&mut self, config: ModelProviderConfig) -> Result<&mut Self> {
+    ///
+    /// # Errors
+    ///
+    /// 名称重复或适配器构造失败时返回错误。
+    pub fn register_from_config(&self, config: ModelProviderConfig) -> Result<&Self> {
         let name = config.name.clone();
-        let adapter = Self::adapter_from_config(config)?;
+        let adapter = self.adapter_from_config(config)?;
         self.register(name, adapter)
     }
 
     /// Create and register-or-replace an adapter from config.
     /// 根据配置创建并注册或替换适配器。
-    pub fn upsert_from_config(&mut self, config: ModelProviderConfig) -> Result<&mut Self> {
+    ///
+    /// # Errors
+    ///
+    /// 适配器构造失败时返回错误。
+    pub fn upsert_from_config(&self, config: ModelProviderConfig) -> Result<&Self> {
         let name = config.name.clone();
-        let adapter = Self::adapter_from_config(config)?;
+        let adapter = self.adapter_from_config(config)?;
         self.upsert(name, adapter)
     }
 
     /// Remove one provider.
     /// 移除一个服务商。
-    pub fn remove(&mut self, provider_name: &str) -> Option<Arc<dyn ProviderAdapter>> {
-        self.providers.remove(provider_name)
+    pub fn remove(&self, provider_name: &str) -> Option<Arc<dyn ProviderAdapter>> {
+        self.providers
+            .write()
+            .expect("服务商注册表锁不应中毒")
+            .remove(provider_name)
     }
 
-    /// Build an adapter from config.
-    /// 根据配置构造适配器。
-    pub fn adapter_from_config(config: ModelProviderConfig) -> Result<Arc<dyn ProviderAdapter>> {
-        match config.kind.clone() {
-            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => {
-                #[cfg(feature = "openai")]
-                {
-                    use super::provider::openai::{
-                        OpenAiChatCompletionsAdapter, OpenAiResponsesAdapter,
-                    };
-                    match config.openai_protocol.clone() {
-                        OpenAiProtocol::Responses => {
-                            Ok(Arc::new(OpenAiResponsesAdapter::new(config)?))
-                        }
-                        OpenAiProtocol::ChatCompletions => {
-                            Ok(Arc::new(OpenAiChatCompletionsAdapter::new(config)?))
-                        }
-                    }
-                }
-
-                #[cfg(not(feature = "openai"))]
-                {
-                    let _ = config;
-                    anyhow::bail!("openai feature is disabled")
-                }
-            }
-            ProviderKind::Anthropic => {
-                #[cfg(feature = "anthropic")]
-                {
-                    use super::provider::anthropic::AnthropicMessagesAdapter;
-                    Ok(Arc::new(AnthropicMessagesAdapter::new(config)?))
-                }
-
-                #[cfg(not(feature = "anthropic"))]
-                {
-                    let _ = config;
-                    anyhow::bail!("anthropic feature is disabled")
-                }
-            }
-        }
+    /// Build an adapter from the registered protocol factories.
+    ///
+    /// 根据已注册的协议工厂构造适配器。错误：协议 ID 没有对应工厂（未启用 feature
+    /// 或未注册自定义工厂）时返回。
+    ///
+    /// # Errors
+    ///
+    /// 协议未注册或工厂构造失败时返回错误。
+    fn adapter_from_config(&self, config: ModelProviderConfig) -> Result<Arc<dyn ProviderAdapter>> {
+        let protocol_id = config.kind.protocol_id();
+        let factory = self
+            .factories
+            .read()
+            .expect("协议工厂注册表锁不应中毒")
+            .get(protocol_id)
+            .ok_or_else(|| {
+                anyhow!("unsupported provider protocol `{protocol_id}`: no factory registered")
+            })?
+            .clone();
+        factory.build(config)
     }
 
     /// Call one registered provider.
     /// 调用一个已注册服务商。
+    ///
+    /// # Errors
+    ///
+    /// provider 未注册时返回错误；模型调用错误原样传播。
     pub async fn complete(&self, provider: &str, req: ModelRequest) -> Result<ModelResponse> {
         let adapter = self
             .providers
+            .read()
+            .expect("服务商注册表锁不应中毒")
             .get(provider)
-            .ok_or_else(|| anyhow!("unknown model provider: {provider}"))?;
+            .ok_or_else(|| anyhow!("unknown model provider: {provider}"))?
+            .clone();
         // 逻辑路由只从 Gateway 的实际注册键传入，不能信任请求或插件自行声明。
         adapter.complete_for_provider(provider, req).await
     }
@@ -274,8 +531,11 @@ impl ModelGateway {
     ) -> Result<super::stream::ModelEventStream> {
         let adapter = self
             .providers
+            .read()
+            .expect("服务商注册表锁不应中毒")
             .get(provider)
-            .ok_or_else(|| anyhow!("unknown model provider: {provider}"))?;
+            .ok_or_else(|| anyhow!("unknown model provider: {provider}"))?
+            .clone();
         // 与非流式路径保持相同的可信路由绑定。
         Ok(adapter.stream_for_provider(provider, req).await)
     }
@@ -283,13 +543,21 @@ impl ModelGateway {
     /// Whether a provider exists.
     /// 服务商是否存在。
     pub fn contains(&self, provider: &str) -> bool {
-        self.providers.contains_key(provider)
+        self.providers
+            .read()
+            .expect("服务商注册表锁不应中毒")
+            .contains_key(provider)
     }
 
     /// Return provider names.
     /// 返回所有服务商名称。
-    pub fn provider_names(&self) -> Vec<&str> {
-        self.providers.keys().map(String::as_str).collect()
+    pub fn provider_names(&self) -> Vec<String> {
+        self.providers
+            .read()
+            .expect("服务商注册表锁不应中毒")
+            .keys()
+            .cloned()
+            .collect()
     }
 }
 
