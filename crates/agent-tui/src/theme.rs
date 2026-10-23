@@ -60,6 +60,17 @@ pub(crate) const COLOR_SELECTION_BG: Color = Color::Rgb(56, 54, 60);
 /// 选中项左侧的指示条颜色。
 pub(crate) const COLOR_SELECTION_MARK: Color = Color::Rgb(226, 61, 82);
 
+/// 命令补全菜单中选中项的背景色。
+///
+/// 比通用 [`COLOR_SELECTION_BG`] 再暗一档：补全菜单紧贴输入框，行距与留白已经把选中
+/// 行拎出来了，底色只需一层极浅的抬升，过亮会像一块糊在输入框上的色板。
+pub(crate) const COLOR_PALETTE_SELECTION_BG: Color = Color::Rgb(45, 45, 52);
+
+/// 命令补全菜单中命令名的颜色。
+///
+/// 青蓝只给命令名：描述文字保持中性灰，一眼就能把"能敲什么"和"它做什么"分开。
+pub(crate) const COLOR_PALETTE_COMMAND: Color = Color::Rgb(126, 200, 216);
+
 /// 代码预览左侧行号列颜色；比正文更暗，避免与内容争夺注意力。
 pub(crate) const COLOR_LINE_NUMBER: Color = Color::Rgb(92, 90, 86);
 /// 行内代码与围栏代码块的文字颜色：暖色，与正文的中性灰区分开。

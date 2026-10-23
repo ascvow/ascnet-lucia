@@ -4,7 +4,7 @@ use super::*;
 use crate::demo::build_demo_gateway;
 #[cfg(feature = "plugins")]
 use crate::plugin::management::PluginManagementOutcome;
-use ratatui::{backend::TestBackend, Terminal};
+use ratatui::{backend::TestBackend, style::Color, Terminal};
 use tokio::sync::mpsc;
 
 /// 为插件页测试补充 Host 当前 ABI 固有授权，避免测试复制另一份权限基线。
@@ -81,28 +81,162 @@ fn native_registry_contains_default_commands() {
     );
 }
 
-/// 命令与说明使用固定紧凑间距，不因最长命令扩大整列留白。
+/// 取出终端缓冲区的每一行，便于按列断言行距与对齐。
+fn palette_rows(terminal: &Terminal<TestBackend>, width: u16) -> Vec<String> {
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(usize::from(width))
+        .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect()
+}
+
+/// 返回某一行中首个目标字符所在的显示列。
+///
+/// `str::find` 返回字节偏移，行内的 `▌` 是多字节字符，用它比较列号会偏；逐字符定位
+/// 才能和终端列号一一对应。
+fn palette_column(row: &str, needle: char) -> usize {
+    row.chars()
+        .position(|character| character == needle)
+        .unwrap_or_else(|| panic!("行内应出现 {needle:?}：{row:?}"))
+}
+
+/// 命令补全菜单按两列对齐，条目之间留空行，左侧留出两列空白。
 #[test]
-fn slash_panel_uses_compact_command_spacing() {
+fn slash_panel_aligns_columns_and_spaces_rows() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.input = "/".into();
-    let mut terminal = Terminal::new(TestBackend::new(80, 14)).expect("应创建命令面板终端");
+    let mut terminal = Terminal::new(TestBackend::new(80, 30)).expect("应创建命令面板终端");
 
     terminal
         .draw(|frame| render_native_command_panel(frame, &app, frame.area()))
         .expect("应渲染命令面板");
-    let text = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
+    let rows = palette_rows(&terminal, 80);
 
-    // TestBackend 为全角字符保留空白单元格，因此只比较命令与首个说明字符的间距。
-    assert!(text.contains("/new  新"), "{text}");
-    assert!(!text.contains("/new      新"), "{text}");
+    // 首行是顶部分隔边框，随后每条命令占一行、隔一行空行。
+    assert!(rows[0].starts_with('─'), "{:?}", rows[0]);
+    assert!(rows[1].contains("/context"), "{:?}", rows[1]);
+    assert!(rows[2].trim().is_empty(), "条目之间应留空行：{:?}", rows[2]);
+    assert!(rows[3].contains("/new"), "{:?}", rows[3]);
+
+    // 左侧留白两列后接选中指示条，命令名不贴终端边缘。
+    assert!(rows[1].starts_with("  ▌ /context"), "{:?}", rows[1]);
+    assert!(rows[3].starts_with("    /new"), "{:?}", rows[3]);
+
+    // 描述列起点在所有条目上一致，形成表格式对齐。
+    // TestBackend 会把全角字符的占位列重置为空格，因此用首个说明字符定位列号。
+    let new_column = palette_column(&rows[3], '新');
+    let resume_column = palette_column(&rows[5], '恢');
+    assert_eq!(new_column, resume_column, "{rows:?}");
+}
+
+/// 过滤到单条命令时命令列宽保持不变，描述不会因为筛选而左右跳动。
+#[test]
+fn slash_panel_keeps_column_width_under_filtering() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let full_app = {
+        let mut app = App::new(tx.clone(), "测试模型".into());
+        app.input = "/".into();
+        app
+    };
+    let filtered_app = {
+        let mut app = App::new(tx, "测试模型".into());
+        app.input = "/n".into();
+        app
+    };
+
+    let mut full_terminal = Terminal::new(TestBackend::new(80, 30)).expect("应创建完整面板终端");
+    full_terminal
+        .draw(|frame| render_native_command_panel(frame, &full_app, frame.area()))
+        .expect("应渲染完整命令面板");
+    let full_rows = palette_rows(&full_terminal, 80);
+
+    let mut filtered_terminal =
+        Terminal::new(TestBackend::new(80, 10)).expect("应创建过滤面板终端");
+    filtered_terminal
+        .draw(|frame| render_native_command_panel(frame, &filtered_app, frame.area()))
+        .expect("应渲染过滤后的命令面板");
+    let filtered_rows = palette_rows(&filtered_terminal, 80);
+
+    // `/n` 只应留下 `/new`，其余命令不再出现。
+    assert!(filtered_rows[1].contains("/new"), "{:?}", filtered_rows[1]);
+    let command_rows = filtered_rows.iter().filter(|row| row.contains('/')).count();
+    assert_eq!(command_rows, 1, "{filtered_rows:?}");
+    // 列宽取自全部原生命令，因此说明文字仍落在完整列表的同一列。
+    let full_column = palette_column(&full_rows[3], '新');
+    let filtered_column = palette_column(&filtered_rows[1], '新');
+    assert_eq!(full_column, filtered_column, "过滤不应改变命令列宽");
+}
+
+/// 选中项用柔和深灰底色铺满整行，命令名统一用青蓝色，描述保持中性灰。
+#[test]
+fn slash_panel_styles_selection_and_command_names() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "/".into();
+    let mut terminal = Terminal::new(TestBackend::new(80, 30)).expect("应创建命令面板终端");
+
+    terminal
+        .draw(|frame| render_native_command_panel(frame, &app, frame.area()))
+        .expect("应渲染命令面板");
+
+    let buffer = terminal.backend().buffer();
+    // 第 1 行是选中项：底色从指示条铺到行尾，命令名保持青蓝。
+    assert_eq!(
+        buffer[(2, 1)].bg,
+        crate::theme::COLOR_PALETTE_SELECTION_BG,
+        "选中底色应覆盖指示条"
+    );
+    assert_eq!(buffer[(4, 1)].fg, crate::theme::COLOR_PALETTE_COMMAND);
+    assert_eq!(buffer[(77, 1)].bg, crate::theme::COLOR_PALETTE_SELECTION_BG);
+    // 左侧两列留白属于边框外区域，不应带底色。
+    assert_eq!(buffer[(1, 1)].bg, Color::Reset);
+    // 未选中行不铺底色，但命令名同样可辨识。
+    assert_eq!(buffer[(4, 3)].bg, Color::Reset);
+    assert_eq!(buffer[(4, 3)].fg, crate::theme::COLOR_PALETTE_COMMAND);
+    // 间隔空行完全是空白，不留残余底色。
+    assert_eq!(buffer[(3, 2)].bg, Color::Reset);
+}
+
+/// 面板高度不足时（终端过矮）列表跟随选中项滚动，高亮不会滚出可视区。
+#[test]
+fn slash_panel_scrolls_to_keep_selection_visible() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "/".into();
+    app.native_command.selected = 5;
+    let mut terminal = Terminal::new(TestBackend::new(80, 9)).expect("应创建矮面板终端");
+
+    terminal
+        .draw(|frame| render_native_command_panel(frame, &app, frame.area()))
+        .expect("应渲染矮面板");
+    let rows = palette_rows(&terminal, 80);
+    let marker_row = rows
+        .iter()
+        .position(|row| row.contains('▌'))
+        .expect("选中项必须留在可视区内");
+
+    assert!(rows[marker_row].contains("/clear"), "{rows:?}");
+    // 滚动后首条命令让出位置，顶部分隔边框仍固定在首行。
+    assert!(rows[0].starts_with('─'), "{rows:?}");
+    assert!(!rows.iter().any(|row| row.contains("/context")), "{rows:?}");
+}
+
+/// 面板高度必须与行距一致，否则列表底部会被裁掉。
+#[test]
+fn slash_panel_height_matches_spaced_rows() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "/".into();
+
+    let count = app.slash_command_matches().len();
+    assert_eq!(
+        app.native_command_panel_height(),
+        u16::try_from(count).unwrap() * 2 + 1,
+        "每条命令占两行，加顶部分隔边框"
+    );
 }
 
 /// 空斜杠菜单必须展示完整原生命令，不能因固定高度截掉思考入口。

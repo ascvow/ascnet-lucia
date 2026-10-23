@@ -3,12 +3,14 @@
 use crate::app::{reasoning_level_label, App};
 use crate::command::{
     reasoning_level_command_value, NativeSessionDialogMode, NativeSessionDialogStatus,
+    SlashCommandMatch,
 };
 #[cfg(feature = "plugins")]
 use crate::command::{NativePluginDialogStatus, NativePluginPathMode};
 use crate::theme::{
-    COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SELECTION_BG, COLOR_SELECTION_MARK,
-    COLOR_TEXT,
+    COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_PALETTE_COMMAND,
+    COLOR_PALETTE_SELECTION_BG, COLOR_SELECTION_BG, COLOR_SELECTION_MARK, COLOR_TEXT,
+    COLOR_TEXT_SOFT,
 };
 #[cfg(feature = "plugins")]
 use crate::theme::{COLOR_USER, COLOR_WARNING};
@@ -45,6 +47,111 @@ fn selected_row(label: &str, active: bool, row_width: usize) -> Vec<Span<'static
     ]
 }
 
+/// 命令补全菜单的左侧留白列数。
+///
+/// 补全面板贴着输入框，正文若直接顶到终端最左侧，扫读时视线要来回蹭屏幕边缘。
+const PALETTE_PADDING_X: u16 = 2;
+
+/// 选中行指示条左侧到命令名之间的左内边距列数。
+///
+/// 同时是选中底色与命令名之间的呼吸空间，右侧留白由行尾补足，两者对称。
+const PALETTE_ROW_INSET: usize = 1;
+
+/// 命令名列与描述列之间的固定间距。
+const PALETTE_COLUMN_GAP: usize = 2;
+
+/// 命令补全菜单中每个条目的行数：一行正文加一行间隔空行。
+const PALETTE_ROW_HEIGHT: u16 = 2;
+
+/// 返回 `count` 个命令占用的面板高度（含顶部分隔边框）。
+///
+/// 行距由渲染时的空行决定，布局拿到的高度必须出自同一份行几何：两边各算一套迟早会
+/// 对不上，表现为列表底部被裁掉或输入框上方多出一片空白。
+pub(super) fn command_palette_height(count: usize) -> u16 {
+    let count = u16::try_from(count).unwrap_or(u16::MAX);
+    count
+        .saturating_mul(PALETTE_ROW_HEIGHT)
+        .saturating_add(u16::from(count > 0))
+}
+
+/// 计算命令名列应占的显示宽度。
+///
+/// 取全部原生命令而不是当前匹配集：输入 `/n` 过滤到单条时列宽保持不变，描述列不会
+/// 随筛选左右跳动。插件斜杠触发器等更长的名字参与取宽，避免命令名压到描述上。
+fn command_column_width(matches: &[SlashCommandMatch]) -> usize {
+    let native = super::NATIVE_COMMANDS
+        .iter()
+        .map(|command| unicode_width::UnicodeWidthStr::width(command.name).saturating_add(1));
+    let dynamic = matches.iter().map(|command| {
+        unicode_width::UnicodeWidthStr::width(command.name.as_str()).saturating_add(1)
+    });
+    native.chain(dynamic).max().unwrap_or(0)
+}
+
+/// 按宽度裁剪文本；宽度为零时直接返回空串。
+///
+/// [`truncate_line`] 在零宽度下仍会输出一个省略号，用于列对齐时会挤掉后面的列，因此
+/// 这里把"没有空间"与"空间不足"分开处理。
+fn fit_column(text: &str, width: usize) -> String {
+    if width == 0 {
+        String::new()
+    } else {
+        truncate_line(text, width)
+    }
+}
+
+/// 构造命令补全菜单的一行：指示条、命令名、描述三列加整行底色。
+///
+/// `name_width` 是命令名列宽，`row_width` 是去掉边框与左侧留白后的整行宽度。命令名与
+/// 描述各自裁剪到列宽内，保证一行永远只占一个终端行——行距由渲染列表追加的空行决定，
+/// 一旦这里换行，面板高度就会和布局算出的高度对不上。
+fn palette_row(
+    command: &SlashCommandMatch,
+    selected: bool,
+    name_width: usize,
+    row_width: usize,
+) -> Line<'static> {
+    // 未选中行不铺底色：整列底色会让菜单糊成一片，选中项也就失去了锚点。
+    let row = if selected {
+        Style::new().bg(COLOR_PALETTE_SELECTION_BG)
+    } else {
+        Style::new()
+    };
+    // 指示条 1 列 + 左内边距 + 命令列 + 列间距，右侧再留一列内边距。
+    let prefix_width = 1 + PALETTE_ROW_INSET + name_width + PALETTE_COLUMN_GAP;
+    let summary_width = row_width.saturating_sub(prefix_width + PALETTE_ROW_INSET);
+    let name = fit_column(&format!("/{}", command.name), name_width);
+    let name_pad = name_width.saturating_sub(unicode_width::UnicodeWidthStr::width(name.as_str()));
+    let summary = fit_column(&command.summary, summary_width);
+    // 行尾补白把底色铺到整行右边界；它同时是描述的右内边距，因此不再额外预留一列。
+    let filler = row_width
+        .saturating_sub(prefix_width + unicode_width::UnicodeWidthStr::width(summary.as_str()));
+    // 选中项只加粗命令名：整行加粗会让底色块里全是高亮字，反而更难扫。
+    let name_style = if selected {
+        row.fg(COLOR_PALETTE_COMMAND).bold()
+    } else {
+        row.fg(COLOR_PALETTE_COMMAND)
+    };
+    Line::from(vec![
+        Span::styled(
+            if selected { "▌" } else { " " },
+            Style::new().fg(COLOR_SELECTION_MARK).patch(row),
+        ),
+        Span::styled(" ".repeat(PALETTE_ROW_INSET), row),
+        Span::styled(name, name_style),
+        Span::styled(" ".repeat(name_pad + PALETTE_COLUMN_GAP), row),
+        Span::styled(
+            summary,
+            if selected {
+                row.fg(COLOR_TEXT)
+            } else {
+                row.fg(COLOR_TEXT_SOFT)
+            },
+        ),
+        Span::styled(" ".repeat(filler), row),
+    ])
+}
+
 /// 在输入区上方绘制原生命令补全面板。
 pub(crate) fn render_native_command_panel(frame: &mut Frame, app: &App, area: Rect) {
     if area.is_empty() {
@@ -63,24 +170,36 @@ pub(crate) fn render_native_command_panel(frame: &mut Frame, app: &App, area: Re
         return;
     }
     let selected = app.native_command.selected.min(matches.len() - 1);
-    // 去掉边框、内边距与选中指示条后剩余的整行宽度，用于让选中背景铺满。
-    let row_width = usize::from(area.width.saturating_sub(4));
-    let lines = matches
-        .iter()
-        .enumerate()
-        .map(|(index, command)| {
-            // 命令与说明保持固定紧凑间距，不按最长命令补齐整列留白。
-            let label = format!("/{}  {}", command.name, command.summary);
-            Line::from(selected_row(&label, index == selected, row_width))
-        })
-        .collect::<Vec<_>>();
+    // 去掉左侧留白后剩余的整行宽度，用于让选中底色铺满。
+    let row_width = usize::from(area.width.saturating_sub(PALETTE_PADDING_X * 2));
+    let name_width = command_column_width(&matches);
+    // 每个条目前后各留一行空行：条目之间靠空行分段，最后一条下方也留一格，
+    // 让面板与紧贴其下的输入框之间不至于粘在一起。
+    let mut lines = Vec::with_capacity(matches.len() * usize::from(PALETTE_ROW_HEIGHT));
+    for (index, command) in matches.iter().enumerate() {
+        lines.push(palette_row(
+            command,
+            index == selected,
+            name_width,
+            row_width,
+        ));
+        lines.push(Line::default());
+    }
+    // 面板高度不足时（终端过矮）用行偏移跟随选中项，避免高亮滚出可视区。
+    let visible_rows = usize::from(area.height.saturating_sub(1));
+    let selected_top = usize::from(PALETTE_ROW_HEIGHT) * selected;
+    let offset = (selected_top + usize::from(PALETTE_ROW_HEIGHT))
+        .saturating_sub(visible_rows)
+        .min(lines.len().saturating_sub(visible_rows));
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::new()
-                .borders(Borders::TOP)
-                .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
-                .padding(Padding::horizontal(1)),
-        ),
+        Paragraph::new(lines)
+            .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0))
+            .block(
+                Block::new()
+                    .borders(Borders::TOP)
+                    .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
+                    .padding(Padding::horizontal(PALETTE_PADDING_X)),
+            ),
         area,
     );
 }

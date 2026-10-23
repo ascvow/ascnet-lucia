@@ -467,10 +467,8 @@ impl App {
         if self.native_command.dismissed_input.as_deref() == Some(self.input.as_str()) {
             return 0;
         }
-        let count = u16::try_from(self.slash_command_matches().len())
-            .unwrap_or(u16::MAX)
-            .min(MAX_VISIBLE_COMMANDS as u16);
-        count.saturating_add(u16::from(count > 0))
+        let count = self.slash_command_matches().len().min(MAX_VISIBLE_COMMANDS);
+        render::command_palette_height(count)
     }
 
     /// 判断主输入是否精确命中插件斜杠触发器；命中后应让位给插件二级面板。
