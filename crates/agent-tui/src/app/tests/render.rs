@@ -227,7 +227,7 @@ fn empty_session_renders_pixel_portrait() {
     assert!(portrait_cells >= 80, "像素头像应包含足够的可见终端像素");
 }
 
-/// 输入提示应紧跟输入盒上边框，下边框之后立即进入状态栏。
+/// 输入提示应紧跟输入盒上边框；下边框之前留一行内部空白，之后立即进入状态栏。
 #[test]
 fn input_editor_starts_immediately_after_rule() {
     let width = 80;
@@ -252,18 +252,109 @@ fn input_editor_starts_immediately_after_rule() {
         .expect("输入盒上边框应存在");
 
     assert!(rows[rule_row + 1].contains("Message Lucia..."));
-    // 编辑行之后是输入盒下边框，再往下一行是状态栏。
+    // 编辑行之后是输入盒内部的留白行（只剩左右边框），再往下才是下边框与状态栏。
+    let interior = rows[rule_row + 2].trim().trim_matches('│').trim();
+    assert_eq!(interior, "", "单行输入时输入盒内部应有第二行留白：{rows:?}");
     assert!(
-        rows[rule_row + 2]
+        rows[rule_row + 3]
             .chars()
             .filter(|character| *character == '─')
             .count()
             > 20
     );
-    assert!(!rows[rule_row + 3].trim().is_empty());
+    assert!(!rows[rule_row + 4].trim().is_empty());
 }
 
-/// 主内容区左右各留 2 列：正文标记不贴终端边缘，状态栏与正文左对齐。
+/// 助手回答渲染为一块连续的卡片底色，并与随后的工具日志隔一行真正的空白。
+///
+/// 这三件事必须同时成立：回答内部（含段落之间的空行）色块不断；卡片右边界之外回到
+/// 终端底色；卡片与工具日志之间留一行没有底色的空行，两者才不会粘成一片。
+#[test]
+fn assistant_card_is_continuous_and_separated_from_tool_logs() {
+    let width = 80;
+    let backend = TestBackend::new(width, 26);
+    let mut terminal = Terminal::new(backend).expect("创建卡片测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages
+        .push(Msg::new(MsgKind::Assistant, "第一段\n\n第二段"));
+    let mut tool = Msg::tool_started(ToolCall::new(
+        "call-card",
+        "shell",
+        json!({"command": "cargo test"}),
+    ));
+    tool.append_tool_output("line one\n");
+    app.messages.push(tool);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染卡片场景");
+    let buffer = terminal.backend().buffer();
+    let rows = buffer
+        .content()
+        .chunks(usize::from(width))
+        .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>();
+    // 宽字符占两列，缓冲区里每列各存一个符号，比较前先去掉空白。
+    let compact = |row: &str| -> String {
+        row.chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    };
+    let card_rows = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            let row = compact(row);
+            row.contains("第一段") || row.contains("第二段")
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(card_rows.len(), 2, "应渲染两段回答：{rows:?}");
+    let (first, second) = (card_rows[0], card_rows[1]);
+    assert_eq!(second, first + 2, "段落之间应只隔一行：{rows:?}");
+
+    let card_bg = crate::theme::COLOR_ASSISTANT_BG;
+    // 回答内部（含段落间空行）直到卡片右边界都是卡片底色。
+    //
+    // 只看空白单元格：宽字符的第二列由终端按字形铺满，缓冲里不写样式（写了也没有
+    // 视觉效果），检查它会得到假失败。文字之外的每一列才真正体现卡片底色是否连续。
+    for row in first..=second {
+        // 主内容区左右各留两列，卡片右边界就在 width - 2。
+        for column in 2..width - 2 {
+            let cell = &buffer[(column, row as u16)];
+            // 宽字符的续占单元格由终端按字形铺满，缓冲里不写样式，跳过它。
+            let wide_tail = column > 2
+                && unicode_width::UnicodeWidthStr::width(buffer[(column - 1, row as u16)].symbol())
+                    == 2;
+            if cell.symbol() == " " && !wide_tail {
+                assert_eq!(
+                    cell.bg, card_bg,
+                    "第 {row} 行第 {column} 列应是卡片底色：{rows:?}"
+                );
+            }
+        }
+    }
+    // 卡片下方一行是消息间距：回到终端底色，工具日志因此不会与卡片粘连。
+    assert_eq!(
+        buffer[(2, second as u16 + 1)].bg,
+        Color::Reset,
+        "卡片与工具日志之间应留一行空白：{rows:?}"
+    );
+    let tool_row = rows
+        .iter()
+        .position(|row| row.contains("Shell"))
+        .expect("应展示工具标题");
+    assert_eq!(
+        buffer[(2, tool_row as u16)].bg,
+        Color::Reset,
+        "工具日志不铺卡片底色"
+    );
+}
+
+/// 主内容区左右各留 2 列：正文不贴终端边缘，状态栏与正文区左边界对齐。
+///
+/// 助手回答在最外层留白之内还有自己的卡片内边距，因此行首标记整体缩进四列。
 #[test]
 fn main_content_keeps_two_column_padding() {
     let width = 80;
@@ -290,9 +381,15 @@ fn main_content_keeps_two_column_padding() {
         .position(|row| row.contains('●'))
         .expect("应展示助手回复");
     assert!(
-        rows[marker_row].starts_with("  ● "),
-        "正文应缩进两列：{:?}",
+        rows[marker_row].starts_with("    ● "),
+        "正文应缩进两列、卡片内边距再缩进两列：{:?}",
         rows[marker_row]
+    );
+    // 卡片底色从正文区左边界开始铺：内边距本身就带底色，卡片左边缘因此是一条直线。
+    assert_eq!(
+        terminal.backend().buffer()[(2, marker_row as u16)].bg,
+        crate::theme::COLOR_ASSISTANT_BG,
+        "卡片底色应铺到正文区左边界"
     );
     let footer_row = rows.last().expect("底栏应存在");
     assert!(
@@ -340,7 +437,7 @@ fn prompt_is_separated_from_log_by_blank_row() {
     );
 }
 
-/// 引用块渲染为独立卡片：整行铺底色并补齐到阅读列宽。
+/// 引用块渲染为独立卡片：整行铺代码底色，并在卡片内部左右各留余量。
 #[test]
 fn quote_blocks_render_as_cards() {
     let width = 40;
@@ -361,10 +458,11 @@ fn quote_blocks_render_as_cards() {
             .any(|span| span.style.bg == Some(crate::theme::COLOR_QUOTE_BG)),
         "引用行应铺卡片底色"
     );
+    // 左内边距两列 + 消息标记两列之外，右侧还要留两列卡片底色。
     assert_eq!(
         quote.width(),
-        usize::from(width),
-        "引用卡片应补齐到整行宽度"
+        usize::from(width) - 2,
+        "引用卡片应铺满正文列并留下右内边距"
     );
 }
 
@@ -375,12 +473,11 @@ fn code_blocks_have_card_padding_rows() {
     let padding_rows = lines
         .iter()
         .filter(|line| {
-            // 首个片段是消息行首标记，卡片内容从第二个片段开始。
-            line.spans.iter().skip(1).all(|span| {
+            let body = card_body_spans(line);
+            body.iter().all(|span| {
                 let text = span.content.trim();
                 text.is_empty() || text == "▎"
-            }) && line
-                .spans
+            }) && body
                 .iter()
                 .any(|span| span.style.bg == Some(crate::theme::COLOR_CODE_BG))
         })
@@ -409,11 +506,10 @@ fn diff_fence_colors_rows_by_meaning() {
             .find(|line| line.spans.iter().any(|span| span.content.contains(needle)))
             .unwrap_or_else(|| panic!("应包含 {needle} 行"))
     };
-    // 首个片段是消息行首标记 `● `，卡片内容从第二个片段开始。
+    // 正体片段才铺 diff/代码底色：首尾的内边距属于回答卡片本身。
     let card_backgrounds = |line: &Line<'_>| {
-        line.spans
+        card_body_spans(line)
             .iter()
-            .skip(1)
             .map(|span| span.style.bg)
             .collect::<Vec<_>>()
     };
@@ -1050,6 +1146,7 @@ fn dragging_tool_message_does_not_toggle_details() {
         .draw(|frame| render_root(frame, &mut app))
         .expect("渲染工具拖选场景");
     let area = app.tool_message_hit_regions[0].area;
+    // 选区必须真的覆盖到文字：视口首行可能是只有缩进的省略提示行。
     for (kind, column) in [
         (
             MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -1057,11 +1154,11 @@ fn dragging_tool_message_does_not_toggle_details() {
         ),
         (
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            area.x + 2,
+            area.x + 8,
         ),
         (
             MouseEventKind::Up(crossterm::event::MouseButton::Left),
-            area.x + 2,
+            area.x + 8,
         ),
     ] {
         let event = MouseEvent {
@@ -1145,6 +1242,14 @@ fn line_texts(lines: &[Line<'_>]) -> Vec<String> {
         .collect()
 }
 
+/// 取出回答卡片内部的片段（代码卡片、引用卡片、表格行等）。
+///
+/// 卡片化之后每一行都以「左侧两列内边距 + 消息标记」开头，之后才是正体；卡片底色
+/// 由绘制层整块铺出，因此正体片段里只会出现块级结构自己的色块。
+fn card_body_spans<'a>(line: &'a Line<'a>) -> &'a [Span<'a>] {
+    &line.spans[2.min(line.spans.len())..]
+}
+
 /// 验证 Markdown 表格排版为对齐行：分隔行转为横线，中文列按显示宽度补齐。
 #[test]
 fn markdown_tables_render_aligned() {
@@ -1215,18 +1320,20 @@ fn narrow_markdown_table_wraps_inside_columns() {
     );
 }
 
-/// 验证 Markdown 渲染保留标题与行内代码的强调样式，且正文段落本身不带背景色。
+/// 验证 Markdown 渲染保留标题与行内代码的强调样式，且正文不自己铺底色。
+///
+/// 卡片底色由绘制层整块铺出（`render_card`），正文片段只带前景色：若这里也给
+/// 片段刷底色，空行与行尾留白就会变成"只有空格的行"，段落间距会被算成两行。
 #[test]
-fn markdown_renders_emphasis_without_paragraph_background() {
+fn markdown_renders_emphasis_inside_the_answer_card() {
     let lines = markdown_lines("# 标题\n\n**重点** 与 `代码` 内容", false, 60);
 
-    // 行片段整体不铺底色：只有行内代码自己带一枚"标签底色"。
     let no_line_background = lines.iter().all(|line| line.style.bg.is_none());
     assert!(no_line_background);
-    let plain_background_free = lines.iter().flat_map(|line| line.spans.iter()).all(|span| {
+    let only_inline_code_paints = lines.iter().flat_map(|line| line.spans.iter()).all(|span| {
         span.style.bg.is_none() || span.style.bg == Some(crate::theme::COLOR_INLINE_CODE_BG)
     });
-    assert!(plain_background_free);
+    assert!(only_inline_code_paints);
 
     let heading = lines
         .iter()
@@ -1249,6 +1356,33 @@ fn markdown_renders_emphasis_without_paragraph_background() {
     assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
 }
 
+/// 回答卡片左侧留两列内边距，右侧留白交给整块底色。
+#[test]
+fn assistant_card_indents_and_leaves_room_on_the_right() {
+    let width = 60;
+    let lines = markdown_lines("卡片正文", false, width);
+    let body = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("卡片正文"))
+        })
+        .expect("应包含正文行");
+
+    assert_eq!(body.spans[0].content, "  ", "左侧应有两列内边距");
+    assert_eq!(
+        body.spans[0].style.bg, None,
+        "内边距不自己铺色：底色由卡片矩形统一铺出"
+    );
+    // 卡片宽度 = 60，左右内边距各两列、消息标记两列，正文最多排到第 54 列。
+    assert!(
+        body.width() <= usize::from(width) - 4,
+        "正文不应顶到卡片右边缘：{}",
+        body.width()
+    );
+}
+
 /// 段落正文使用明细灰而非纯白，强调片段保留自己的前景色。
 #[test]
 fn prose_body_uses_soft_gray() {
@@ -1262,7 +1396,7 @@ fn prose_body_uses_soft_gray() {
     assert!(!body.style.add_modifier.contains(Modifier::BOLD));
 }
 
-/// 解释性正文最多排到 100 列：更宽的终端把余量留成右侧空白，而不是拉长行。
+/// 解释性正文最多排到阅读宽度：助手卡片整体收在 100 列阅读宽 + 两侧内边距内。
 #[test]
 fn prose_lines_stop_at_reading_width() {
     let text = "字".repeat(200);
@@ -1270,13 +1404,13 @@ fn prose_lines_stop_at_reading_width() {
     let longest = lines.iter().map(|line| line.width()).max().unwrap_or(0);
 
     assert!(
-        longest <= 102,
-        "正文行宽应限制在阅读宽度内（含 2 列行首标记）：{longest}"
+        longest <= 104,
+        "正文卡片宽度应限制在阅读宽度内（100 列 + 两侧 2 列内边距）：{longest}"
     );
-    // 代码块仍然吃满整宽：它的对齐语义依赖可用列数。
+    // 代码块在卡片内部仍然吃满整个卡片宽度：它的对齐语义依赖可用列数。
     let code = markdown_lines("```rust\nlet value = 1;\n```", false, 200);
     let widest_code = code.iter().map(|line| line.width()).max().unwrap_or(0);
-    assert_eq!(widest_code, 200, "代码块应保持全宽");
+    assert_eq!(widest_code, longest, "代码块应铺满卡片宽度");
 }
 
 /// 行内代码去掉反引号、改用代码色，并带一层与代码块同族的标签底色。
@@ -1342,12 +1476,13 @@ fn markdown_lists_use_bullets_with_hanging_indent() {
     let rows = line_texts(&lines);
     let text = rows.join("\n");
 
-    assert!(rows[0].starts_with("● • 第一项"), "{text:?}");
+    // 卡片内边距两列 + 行首标记两列，圆点正文从第五列开始。
+    assert!(rows[0].starts_with("  ● • 第一项"), "{text:?}");
     assert!(!text.contains("- 第一项"), "列表标记不应残留字面 `- `");
     let continuation = rows.get(1).expect("第一项应折行产生续行").clone();
-    // 行首两列消息前缀 + 两列悬挂缩进，正文从第 5 列开始。
-    assert!(continuation.starts_with("    "), "{text:?}");
-    assert!(!continuation.starts_with("     "), "{text:?}");
+    // 卡片内边距两列 + 消息前缀两列 + 悬挂缩进两列，正文从第七列开始。
+    assert!(continuation.starts_with("      "), "{text:?}");
+    assert!(!continuation.starts_with("       "), "{text:?}");
     assert!(rows.iter().any(|row| row.contains("• 第二项")), "{text:?}");
 }
 
@@ -1368,20 +1503,25 @@ fn markdown_code_blocks_are_visually_separated() {
     assert!(text.contains('┼'), "{text:?}");
     assert!(text.contains("未闭合"), "{text:?}");
 
-    // 代码行整行铺底色（含尾部补齐），首列消息标记除外；正文与表格行不带底色。
+    // 代码行整行铺代码底色（含尾部补齐），正体之外只有回答卡片自己的内边距；
+    // 正文与表格行只铺卡片底色，不出现代码色块。
     let code = rows
         .iter()
         .position(|row| row.contains("fn main()"))
         .expect("代码行");
     assert!(
-        lines[code].spans[1..]
+        card_body_spans(&lines[code])
             .iter()
             .all(|span| span.style.bg == Some(crate::theme::COLOR_CODE_BG)),
         "{:?}",
         rows[code]
     );
-    // 底色必须铺满整行，否则代码块右边缘会缺一块。
-    assert_eq!(lines[code].width(), 60, "代码行应铺满消息区宽度");
+    // 底色必须铺满正文列，否则代码块右边缘会缺一块。
+    assert_eq!(
+        lines[code].width(),
+        58,
+        "代码行应铺满卡片的正文列（60 列卡片扣除两侧各 2 列内边距）"
+    );
     let prose = rows
         .iter()
         .position(|row| row.contains("列一"))
@@ -1389,7 +1529,7 @@ fn markdown_code_blocks_are_visually_separated() {
     assert!(lines[prose]
         .spans
         .iter()
-        .all(|span| span.style.bg.is_none()));
+        .all(|span| span.style.bg != Some(crate::theme::COLOR_CODE_BG)));
 }
 
 /// 极窄终端下 Markdown 渲染不得 panic：列宽与折行宽度都会被压到下界。

@@ -42,6 +42,12 @@ pub(crate) const COLOR_DANGER: Color = Color::Rgb(205, 101, 101);
 pub(crate) const COLOR_DANGER_BRIGHT: Color = Color::Rgb(255, 110, 110);
 /// 用户消息块背景色：与绯红强调同系的暗红灰，用于与助手正文区分。
 pub(crate) const COLOR_USER_BG: Color = Color::Rgb(58, 38, 43);
+/// 助手回答卡片的背景色：只比终端底色亮一点点。
+///
+/// 回答需要成为一块"卡片"而不是飘在背景上的字，但底色一旦明显，正文的可读性就会被
+/// 色块压过去；因此取一档极轻微的抬升，远看是一条连续的浅色块，近看与默认底色几乎
+/// 没有差别。代码块与引用块自带更暗的底色，仍然压在这层之上。
+pub(crate) const COLOR_ASSISTANT_BG: Color = Color::Rgb(28, 30, 34);
 
 /// 面板之间分隔线的颜色。
 ///

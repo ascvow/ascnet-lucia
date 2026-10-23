@@ -23,6 +23,18 @@ const CHAT_PADDING_X: u16 = 2;
 /// 底部这一行就是输入框上方的分隔空行：日志最后一行与输入盒之间始终隔着一行空白，
 /// 滚动到顶部时它同时充当跳转提示的落点。
 const CHAT_PADDING_Y: u16 = 1;
+/// 主内容区的最大阅读宽度（显示列）。
+///
+/// 宽屏下正文不再一行拉到底：超过这个宽度后余量留成右侧空白。一行超过百来列后，
+/// 眼睛从行尾折回行首时容易串行，助手卡片也会被拉成一条横贯屏幕的色带；右边界
+/// 留在同一列上，滚动条正好落在这条空白里。
+const MAX_CONTENT_WIDTH: u16 = 100;
+
+/// 输入框内部在内容之外额外保留的空白行数。
+///
+/// 这一行是内容下方的呼吸留白：单行输入时输入框因此是「两行边框 + 两行内部」，
+/// 光标落在内部第一行，下方不再紧贴下边框。
+const PROMPT_PADDING_ROWS: u16 = 1;
 
 /// 输入框边框标题的最小可用宽度。
 ///
@@ -31,12 +43,12 @@ const MIN_PROMPT_TITLE_WIDTH: usize = 8;
 
 /// 在插件占用后的中心区域渲染 Lucia 主界面。
 pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
-    // 输入区随逻辑行数在一至六行间增长，边框额外占两行。
+    // 输入区随逻辑行数在一至六行间增长；内部再留一行空白，边框额外占两行。
     let desired_input_rows = u16::try_from(app.input.split('\n').count())
         .unwrap_or(6)
         .clamp(1, 6);
-    let input_rows = desired_input_rows.min(workspace.height.saturating_sub(5).clamp(1, 6));
-    let input_height = input_rows + 2;
+    let input_rows = desired_input_rows.min(workspace.height.saturating_sub(6).clamp(1, 6));
+    let input_height = input_rows + PROMPT_PADDING_ROWS + 2;
     #[cfg(feature = "plugins")]
     let timeline_uses_snapshot = app.main_event_snapshot.is_some();
     #[cfg(feature = "plugins")]
@@ -74,11 +86,17 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         (sections[0], sections[1], sections[2], sections[3]);
 
     // 消息流不使用容器边框，长文交给自动换行控制。
-    // 留白：左右各 2 列（原为 1 列），上下各 1 行；底部的这一行同时是输入框上方的分隔空行。
-    let chat_area = chat_section.inner(Margin {
+    // 留白：左右各 2 列，上下各 1 行；底部的这一行同时是输入框上方的分隔空行。
+    let padded_chat = chat_section.inner(Margin {
         horizontal: CHAT_PADDING_X,
         vertical: CHAT_PADDING_Y,
     });
+    // 阅读宽度封顶后只从右侧让出余量：正文、输入盒边框与底栏继续共用同一条左对齐
+    // 线，宽屏下多出来的列留成右侧空白，滚动条正好落在这条空白里。
+    let chat_area = Rect {
+        width: padded_chat.width.min(MAX_CONTENT_WIDTH),
+        ..padded_chat
+    };
     // 每帧重置热区，空会话和窗口缩小时不能保留上一帧的跳转按钮。
     app.jump_hint_area = None;
     // 滚动条同理：内容不再溢出时先擦掉上一帧的轨道，避免右侧留白残留竖线。
@@ -259,7 +277,8 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         } else {
             COLOR_MUTED
         }))
-        .padding(Padding::new(1, 1, 0, 0));
+        // 左右各一列、下方再留一行：内容不与边框相贴，单行输入也不再显得局促。
+        .padding(Padding::new(1, 1, 0, PROMPT_PADDING_ROWS));
     // 输入盒标题是界面上唯一的"当前活动"出口：主内容区不再输出状态文本，
     // 因此日志滚动不会让状态丢失，也不会出现两条互相矛盾的进度说明。
     if let Some((title, color)) = prompt_title(app) {
@@ -792,21 +811,12 @@ fn hero_portrait_lines() -> Vec<Line<'static>> {
 
 /// 空会话首屏：垂直居中展示像素头像、版本、工作目录与快捷键速查。
 ///
-/// 尺寸不足以容纳头像时退化为纯文字信息，区域过小则完全不绘制。
+/// 尺寸不足时按「先砍速查条目、再砍头像」的顺序降级：任何尺寸下都不会画出被矩形
+/// 裁掉半行的内容，也不会为了塞下头像而把版本信息挤没。区域过小则完全不绘制。
 fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
     if area.width < 30 || area.height < 6 {
         return;
     }
-    let mut lines: Vec<Line> = Vec::new();
-    // 头像宽 36 列、高 9 行；与版本和速查合计 18 行。
-    if area.height >= 18 && area.width >= 38 {
-        lines.extend(hero_portrait_lines());
-    }
-    lines.push(Line::from(Span::styled(
-        format!("lucia v{} · {cwd}", env!("CARGO_PKG_VERSION")),
-        Style::new().fg(COLOR_MUTED),
-    )));
-    lines.push(Line::default());
     // 键位列右对齐、说明列按显示宽度补齐，保证整行居中后两列仍纵向对齐。
     let shortcuts = [
         ("Enter", "Send message"),
@@ -817,7 +827,27 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
         ("Up/Down", "Recall input"),
         ("PgUp/PgDn", "Scroll history"),
     ];
-    for (key, action) in shortcuts {
+    /// 头像占 36 列 × 9 行。
+    const PORTRAIT_ROWS: usize = 9;
+    /// 展示头像时至少要留出的速查条目数：只剩一两行说明的头像首屏比纯文字更零碎。
+    const MIN_SHORTCUTS_WITH_PORTRAIT: usize = 4;
+    // 版本行与它下方的空行各占一行。
+    const FIXED_ROWS: usize = 2;
+    let available = usize::from(area.height);
+    let fits_with_portrait = available >= PORTRAIT_ROWS + FIXED_ROWS + MIN_SHORTCUTS_WITH_PORTRAIT;
+
+    let mut lines: Vec<Line> = Vec::new();
+    if fits_with_portrait && area.width >= 38 {
+        lines.extend(hero_portrait_lines());
+    }
+    lines.push(Line::from(Span::styled(
+        format!("lucia v{} · {cwd}", env!("CARGO_PKG_VERSION")),
+        Style::new().fg(COLOR_MUTED),
+    )));
+    lines.push(Line::default());
+    // 高度紧张时从末尾裁掉速查条目，剩余内容仍然完整可见。
+    let budget = available.saturating_sub(lines.len());
+    for (key, action) in shortcuts.into_iter().take(budget) {
         let pad = 18usize.saturating_sub(unicode_width::UnicodeWidthStr::width(action));
         lines.push(Line::from(vec![
             Span::styled(format!("{key:>9}"), Style::new().fg(COLOR_TEXT)),

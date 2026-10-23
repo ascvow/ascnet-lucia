@@ -10,8 +10,10 @@
 //!    避免把整段历史拼成一个大 `Paragraph` 再整体滚动。
 
 use crate::session::conversation::{Msg, MsgKind};
+use crate::theme::COLOR_ASSISTANT_BG;
+use crate::ui::markdown::card_width;
 use ratatui::prelude::*;
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 /// FNV-1a 64 位初始值。
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -116,22 +118,37 @@ impl TranscriptLayout {
         let mut cursor = viewport_top - i32::from(scroll);
 
         for (index, entry) in self.entries.iter_mut().enumerate() {
+            let height = entry.height;
             let start = cursor;
-            cursor = cursor.saturating_add(i32::from(entry.height));
-            let visible = entry.height > 0 && cursor > viewport_top && start < viewport_bottom;
+            cursor = cursor.saturating_add(i32::from(height));
+            let visible = height > 0 && cursor > viewport_top && start < viewport_bottom;
             if !visible {
                 // 视口外的消息只需要高度，行内容立即释放。
                 entry.lines = None;
                 continue;
             }
             // 消息列表比布局条目短时跳过：没有内容可画，也不该继续推进光标。
-            if messages.get(index).is_none() {
+            let Some(message) = messages.get(index) else {
                 continue;
-            }
+            };
             let width = entry.width;
             let lines = entry.lines.get_or_insert_with(|| {
                 message_lines(messages, index, streaming == Some(index), width)
             });
+
+            // 助手回答是一张卡片：先整块铺上极浅的底色，文字再画在它上面。
+            // 正文片段只带前景色，因此会保留这层底色；工具日志与用户消息不铺。
+            if matches!(message.kind, MsgKind::Assistant) {
+                let blank_tail = lines
+                    .iter()
+                    .rev()
+                    .take_while(|line| line.width() == 0)
+                    .count();
+                // 尾部空行是消息之间的间距，不属于卡片，卡片才能与下一条日志真正隔开。
+                let card_height =
+                    height.saturating_sub(u16::try_from(blank_tail).unwrap_or(u16::MAX));
+                render_card(frame, area, start, card_height);
+            }
 
             // 顶部被裁掉的消息用 Paragraph 自身的滚动跳过整行，底部裁掉的部分由矩形高度截断。
             let clipped_top = start.max(viewport_top);
@@ -164,6 +181,34 @@ impl TranscriptLayout {
         }
         rows
     }
+}
+
+/// 在消息区按整块矩形铺出助手回答的卡片底色。
+///
+/// `start` 是这条消息在全局行坐标中的起始行，`height` 是卡片高度（不含消息之间的
+/// 尾部空行）。只有与视口相交的部分会被绘制：`Rect` 越界写入会让 ratatui 直接
+/// panic，而滚动到视口外的消息仍然带着完整高度。
+fn render_card(frame: &mut Frame, area: Rect, start: i32, height: u16) {
+    if height == 0 || area.width == 0 {
+        return;
+    }
+    let top = start.max(i32::from(area.y));
+    let bottom = start
+        .saturating_add(i32::from(height))
+        .min(i32::from(area.bottom()));
+    if bottom <= top {
+        return;
+    }
+    let card = Rect {
+        x: area.x,
+        y: u16::try_from(top).unwrap_or(u16::MAX),
+        width: card_width(area.width),
+        height: u16::try_from(bottom - top).unwrap_or(0),
+    };
+    frame.render_widget(
+        Block::new().style(Style::new().bg(COLOR_ASSISTANT_BG)),
+        card,
+    );
 }
 
 /// 构造一条消息的渲染行，并处理消息之间的段落空行。

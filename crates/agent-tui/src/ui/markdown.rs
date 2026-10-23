@@ -102,8 +102,19 @@ const TABLE_MIN_COLUMN: usize = 4;
 /// 解释性正文的最大行宽（显示列）。
 ///
 /// 终端再宽也不把段落拉到整屏：一行超过百来列后，眼睛从行尾折回行首时容易串行。
-/// 代码块与表格不参与这个上限——它们的对齐语义依赖实际可用列数。
+/// 代码块与表格不参与这个上限——它们的对齐语义依赖实际可用列数；但整张回答卡片
+/// 的宽度仍由它封顶，见 [`MAX_CARD_WIDTH`]。
 const MAX_PROSE_WIDTH: usize = 100;
+/// 助手回答卡片左右两侧的内边距（显示列）。
+///
+/// 卡片底色不能贴着文字：留出两列后，色块才像一张"垫在文字下面的卡片"，而不是给
+/// 每一行文字刷了一层背景。
+const CARD_PADDING: usize = 2;
+/// 助手回答卡片的最大总宽度：阅读列宽加两侧内边距。
+///
+/// 外部传入再宽的可用宽度（超宽终端、直接调用渲染器），回答也不会被拉成一整行；
+/// 实际显示宽度取它和可用宽度的较小值。
+const MAX_CARD_WIDTH: usize = MAX_PROSE_WIDTH + CARD_PADDING * 2;
 /// 围栏代码块卡片左侧的竖条与内部左留白（`▎` 后两列空白）。
 ///
 /// 这道留白是"卡片"感的关键：代码直接贴在竖条上仍然像一段缩进文本。
@@ -159,15 +170,31 @@ enum ListMarker<'a> {
     Ordered(&'a str),
 }
 
+/// 计算助手回答卡片的显示宽度。
+///
+/// 卡片底色由绘制层按这个宽度整块铺出，正文行也按它排版：两处必须取同一个值，
+/// 否则卡片右侧会露出半列底色，或文字越出色块。可用宽度再宽也不会超过
+/// [`MAX_CARD_WIDTH`]，回答因此在宽屏上不会被拉成一整行。
+pub(crate) fn card_width(width: u16) -> u16 {
+    u16::try_from(usize::from(width).min(MAX_CARD_WIDTH).max(1)).unwrap_or(u16::MAX)
+}
+
 /// 将助手回复按 Markdown 渲染，首行带 `●` 标记，续行缩进对齐。
 ///
 /// `width` 为消息区可用显示宽度：表格列宽、列表悬挂缩进、代码块底色宽度都按它
 /// 计算，缺了它这些结构会被 `Paragraph` 的自动换行从中间折断。连续空行折叠为
 /// 一行；`streaming` 为真时在末尾追加光标。
+///
+/// 整段回答最终被包进一张卡片：宽度不超过 [`MAX_CARD_WIDTH`]，左侧留
+/// [`CARD_PADDING`] 列内边距。卡片底色由绘制层按 [`card_width`] 整块铺出，这里只
+/// 负责缩进与行宽，因此逐行不会写满整行——文字右侧的余量留着让底色透出来。
 pub(crate) fn markdown_lines(text: &str, streaming: bool, width: u16) -> Vec<Line<'static>> {
-    // 行首标记列由本函数统一添加，正文排版宽度必须先扣掉它。
-    let body_width = usize::from(width).saturating_sub(PREFIX_WIDTH).max(1);
-    // 解释性正文的阅读列宽：超过 MAX_PROSE_WIDTH 之后不再跟着终端拉长。
+    // 卡片总宽先收在阅读宽度内，行首标记与内边距再从它里面扣除。
+    let card_columns = usize::from(card_width(width));
+    let body_width = card_columns
+        .saturating_sub(CARD_PADDING * 2 + PREFIX_WIDTH)
+        .max(1);
+    // 解释性正文的阅读列宽：超过 MAX_PROSE_WIDTH 之后不再跟着卡片拉长。
     let text_width = body_width.min(MAX_PROSE_WIDTH);
     let mut rendered: Vec<Line<'static>> = Vec::new();
     let mut previous_is_list = false;
@@ -214,8 +241,28 @@ pub(crate) fn markdown_lines(text: &str, streaming: bool, width: u16) -> Vec<Lin
             last.push_span(Span::styled(" ▌", Style::new().fg(COLOR_USER)));
         }
     }
-    lines.push(Line::default());
-    lines
+    // 卡片化的最后一步：补左内边距，回答之间再留一行真正的空行（不属于卡片）。
+    let mut card: Vec<Line<'static>> = lines.into_iter().map(card_line).collect();
+    card.push(Line::default());
+    card
+}
+
+/// 给一行回答加上卡片左内边距。
+///
+/// 只负责缩进，不铺底色：卡片底色由绘制层按整块矩形铺出（见
+/// [`crate::ui::transcript_layout::TranscriptLayout::render_visible`]），逐行铺色会把
+/// 段落之间的空行变成"只有空格的行"，而 ratatui 的换行器会把这种行算成两行，
+/// 回答里的段落间距于是莫名翻倍。
+///
+/// 空行保持零宽度原样返回：它由卡片底色填满，补上内边距就会多占一行。
+fn card_line(line: Line<'static>) -> Line<'static> {
+    if line.width() == 0 {
+        return line;
+    }
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::raw(" ".repeat(CARD_PADDING)));
+    spans.extend(line.spans);
+    Line::from(spans).style(line.style)
 }
 
 /// 卡片左侧竖条字符；只由竖条与空白构成的行属于卡片内边距，不含正文。
