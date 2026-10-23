@@ -23,6 +23,7 @@ Lucia 是一套完全开源的 Agent 运行时与终端界面，用于连接语�
 ## 主要能力
 
 - 在终端中与真实模型交互，并按项目保存和恢复会话。
+- 默认全屏渲染（终端备用屏幕），每帧只排版可见消息，长会话依然流畅；`/tui` 可切回主屏绘制。
 - 接入 OpenAI、Anthropic 和 OpenAI-compatible 模型服务。
 - 通过 WASM 插件增加 MCP、Skill、命令、上下文压缩、计划、审批和多 Agent 协作等能力。
 - 只使用轻量的 Agent Core，或按需组合会话、Runtime、Plugin Host 和 TUI。

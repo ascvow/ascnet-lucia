@@ -5,6 +5,7 @@ pub(crate) mod highlight;
 pub(crate) mod markdown;
 pub(crate) mod root;
 pub(crate) mod transcript;
+pub(crate) mod transcript_layout;
 
 #[cfg(feature = "plugins")]
 pub(crate) mod plugin_bridge;

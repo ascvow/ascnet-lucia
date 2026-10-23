@@ -23,6 +23,7 @@ Lucia is a fully open-source agent runtime and terminal interface for working wi
 ## Capabilities
 
 - Work with real models from a terminal while saving and resuming sessions per project.
+- Render in fullscreen (alternate screen) and lay out only the visible messages, so long sessions stay smooth; `/tui` switches back to main-screen drawing.
 - Connect to OpenAI, Anthropic, and OpenAI-compatible model services.
 - Add MCP, Skills, commands, context compression, planning, approvals, and multi-agent collaboration through WASM plugins.
 - Run as a lightweight Agent Core or compose session storage, Runtime, Plugin Host, and the TUI as needed.

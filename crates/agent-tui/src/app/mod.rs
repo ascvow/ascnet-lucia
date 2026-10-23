@@ -187,6 +187,8 @@ pub(crate) struct App {
     pub(crate) jump_hint_area: Option<Rect>,
     /// 最近一帧可见且具有详情的工具消息点击区域。
     pub(crate) tool_message_hit_regions: Vec<ToolMessageHitRegion>,
+    /// 主事件区的消息布局缓存；只保留可见窗口内的渲染结果。
+    pub(crate) transcript_layout: crate::ui::transcript_layout::TranscriptLayout,
     /// 左键按下时命中的工具消息；拖动或释放到其他区域时取消。
     pub(crate) tool_click_candidate: Option<usize>,
     /// 最近一次渲染得到的消息区宽度，用于工具消息 renderer 分配尺寸。
@@ -213,6 +215,10 @@ pub(crate) struct App {
     pub(crate) model_upstreams: Vec<agent_core::config::ModelConfig>,
     /// 鼠标捕获是否开启；默认开启，由应用同时处理滚轮、文本拖选和插件点击。
     pub(crate) mouse_capture: bool,
+    /// 当前是否使用全屏渲染（终端备用屏幕）。
+    pub(crate) fullscreen: bool,
+    /// 等待主循环应用的渲染模式切换；终端句柄由主循环持有，应用只登记意图。
+    pub(crate) pending_fullscreen: Option<bool>,
     /// 当前屏幕文本选择；鼠标释放只保留高亮，不主动写入系统剪贴板。
     pub(crate) text_selection: Option<MouseTextSelection>,
     /// 左键释放时从渲染缓冲区冻结的选区文本，供后续显式复制使用。
@@ -431,6 +437,7 @@ impl App {
             key_inspect: false,
             jump_hint_area: None,
             tool_message_hit_regions: Vec::new(),
+            transcript_layout: crate::ui::transcript_layout::TranscriptLayout::default(),
             tool_click_candidate: None,
             #[cfg(feature = "plugins")]
             last_message_width: 0,
@@ -443,6 +450,8 @@ impl App {
             model_input_modalities: None,
             model_upstreams: Vec::new(),
             mouse_capture: true,
+            fullscreen: true,
+            pending_fullscreen: None,
             text_selection: None,
             text_selection_content: None,
             #[cfg(feature = "plugins")]
@@ -480,6 +489,25 @@ impl App {
             #[cfg(feature = "plugins")]
             applied_host_actions: VecDeque::new(),
         }
+    }
+
+    /// 判断一次 UI tick 是否需要重绘。
+    ///
+    /// tick 只推进动画帧、插件状态倒计时和插件视图刷新；空闲时这些都不会改变可见内容，
+    /// 因此主循环可以跳过绘制，避免空转占用 CPU。运行中、后台重载和插件加载期间的
+    /// 旋转指示与耗时文本仍需逐帧刷新。
+    pub(crate) fn tick_requires_redraw(&self) -> bool {
+        #[cfg(feature = "plugins")]
+        let plugin_activity = self.plugins_loading || self.plugin_status_ticks > 0;
+        #[cfg(not(feature = "plugins"))]
+        let plugin_activity = false;
+        self.running || self.pending_reload.is_some() || plugin_activity
+    }
+
+    /// 注入启动时读取的渲染模式；缺省为全屏。
+    pub(crate) fn with_fullscreen(mut self, fullscreen: bool) -> Self {
+        self.fullscreen = fullscreen;
+        self
     }
 
     /// 注入主函数启动时捕获的项目上下文。

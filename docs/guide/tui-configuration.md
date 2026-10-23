@@ -96,7 +96,8 @@ lucia --config ./lucia.json --init
   "tui": {
     "sessions_dir": "projects",
     "events_jsonl": "events.jsonl",
-    "review_model": "gpt-5.6-luna"
+    "review_model": "gpt-5.6-luna",
+    "fullscreen": true
   }
 }
 ```
@@ -105,6 +106,18 @@ lucia --config ./lucia.json --init
 
 `model.extra_headers` 暂不支持，因为它可能同时携带 Secret 和未经审阅的行为。模型密钥缺失
 时使用内置演示模型，并在界面中显示配置提示。
+
+## 全屏渲染
+
+Lucia 默认使用全屏渲染：进入终端备用屏幕（类似 vim），界面固定在整屏内重绘，退出后恢复终端原有内容。每帧只排版与视口相交的消息，历史部分只保留换行后的视觉行数，滚出窗口的渲染结果立即释放，因此会话再长，单帧开销和内存占用都基本不变。空闲时主循环不再按 tick 重绘，只在状态真正变化或存在动画时刷新。
+
+```bash
+/tui                # 查看当前渲染模式
+/tui fullscreen     # 开启全屏渲染（默认）
+/tui default        # 关闭备用屏幕，直接在主屏绘制
+```
+
+切换立即生效，并写入配置文件的 `tui.fullscreen`；也可以启动前直接编辑该字段。主屏模式下退出后最后一帧留在终端里，适合想用终端原生滚动和搜索回看输出的场景；全屏模式则把对话留在备用屏幕内，由应用自己处理滚动和选择。
 
 ## 底栏用量
 

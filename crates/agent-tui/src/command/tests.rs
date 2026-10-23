@@ -49,6 +49,7 @@ fn native_registry_contains_default_commands() {
             "reasoning",
             "model",
             "plugins",
+            "tui",
             "keys",
             "help",
             "exit"
@@ -66,6 +67,7 @@ fn native_registry_contains_default_commands() {
             "clear",
             "reasoning",
             "model",
+            "tui",
             "keys",
             "help",
             "exit"
@@ -640,6 +642,63 @@ fn native_help_executes_inside_tui() {
     assert!(app.input.is_empty());
     assert_eq!(app.messages.len(), 1);
     assert!(app.messages[0].text.contains("恢复历史会话"));
+}
+
+/// `/tui` 不带参数只报告当前渲染模式，不登记任何切换。
+#[test]
+fn native_tui_command_reports_current_mode() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "/tui".into();
+    app.cursor = app.input.len();
+
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+
+    assert!(app.fullscreen);
+    assert!(app.pending_fullscreen.is_none());
+    assert_eq!(app.messages.len(), 1);
+    assert!(app.messages[0].text.contains("fullscreen"));
+}
+
+/// `/tui default` 必须登记切换意图，并把选择写回配置文件其余字段保持不变。
+#[test]
+fn native_tui_command_switches_and_persists_mode() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let root = std::env::temp_dir().join(format!(
+        "lucia-tui-mode-{}",
+        agent_session::SessionId::generate()
+    ));
+    std::fs::create_dir_all(&root).expect("创建配置目录");
+    let path = root.join("config.json");
+    std::fs::write(&path, r#"{"tui":{"sessions_dir":"projects"}}"#).expect("写入配置");
+    let mut app = App::new(tx, "测试模型".into()).with_config_path(path.clone());
+    app.input = "/tui default".into();
+    app.cursor = app.input.len();
+
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+
+    assert!(!app.fullscreen);
+    assert_eq!(app.pending_fullscreen, Some(false));
+    let text = std::fs::read_to_string(&path).expect("读取写回后的配置");
+    assert!(text.contains("\"fullscreen\": false"));
+    assert!(text.contains("\"sessions_dir\": \"projects\""));
+    std::fs::remove_dir_all(root).expect("清理配置目录");
+}
+
+/// 未知渲染模式必须报错，且不改变当前设置也不登记切换。
+#[test]
+fn native_tui_command_rejects_unknown_mode() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "/tui htop".into();
+    app.cursor = app.input.len();
+
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+
+    assert!(app.fullscreen);
+    assert!(app.pending_fullscreen.is_none());
+    assert_eq!(app.messages.len(), 1);
+    assert!(app.messages[0].text.contains("未知渲染模式"));
 }
 
 /// `/reasoning` 必须按 models.dev 可用等级更新 TUI 与共享 Agent。

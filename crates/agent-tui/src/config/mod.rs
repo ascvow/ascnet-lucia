@@ -38,7 +38,8 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
   },
   "tui": {
     "sessions_dir": "projects",
-    "review_model": "gpt-5.6-luna"
+    "review_model": "gpt-5.6-luna",
+    "fullscreen": true
   }
 }
 "#;
@@ -70,6 +71,8 @@ pub(crate) struct TuiSettings {
     /// 权限插件代审使用的独立模型 ID；旧 `plugin_model` 字段仍可读取以兼容已有配置。
     #[serde(alias = "plugin_model")]
     pub(crate) review_model: Option<String>,
+    /// 是否使用全屏渲染（终端备用屏幕）；缺省为开启。
+    pub(crate) fullscreen: Option<bool>,
 }
 
 /// 只反序列化根配置中的 TUI 字段，模型和插件字段由各自 crate 处理。
@@ -200,11 +203,27 @@ pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
 /// 该写入使用目标目录内的 0600 临时文件并在同步后替换原文件。读取、解析、创建、同步或
 /// 重命名失败时返回错误，原配置和调用方当前运行参数都应保持不变。
 pub(crate) fn persist_reasoning_level(path: &Path, level: ReasoningLevel) -> Result<()> {
+    update_config_document(path, |document| {
+        document["agent"]["reasoning"] = Value::String(reasoning_level_value(level).to_string());
+    })
+}
+
+/// 原子更新 `tui.fullscreen`，保留其他字段。
+///
+/// 与思考等级写回使用同一套原子替换流程：失败时原配置保持不变，调用方不应切换渲染模式。
+pub(crate) fn persist_tui_fullscreen(path: &Path, fullscreen: bool) -> Result<()> {
+    update_config_document(path, |document| {
+        document["tui"]["fullscreen"] = Value::Bool(fullscreen);
+    })
+}
+
+/// 读取、就地修改并原子写回配置文件。
+fn update_config_document(path: &Path, update: impl FnOnce(&mut Value)) -> Result<()> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
     let mut document: Value = serde_json::from_str(&text)
         .with_context(|| format!("解析配置文件失败：{}", path.display()))?;
-    document["agent"]["reasoning"] = Value::String(reasoning_level_value(level).to_string());
+    update(&mut document);
     let contents = serde_json::to_string_pretty(&document)
         .with_context(|| format!("序列化配置文件失败：{}", path.display()))?;
     atomic_write_config(path, contents.as_bytes())

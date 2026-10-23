@@ -9,7 +9,6 @@ use crate::theme::{
 use crate::ui::markdown::truncate_line;
 #[cfg(feature = "plugins")]
 use crate::ui::plugin_render::render_composer_panels;
-use crate::ui::wrapped_line_count;
 use agent_core::model::TokenUsage;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -98,23 +97,13 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         render_hero(frame, chat_area, &cwd_display);
     } else {
         let inner_width = chat_area.width.max(1);
-        let mut lines = Vec::new();
-        let mut wrapped_height = 0u16;
-        let mut tool_message_rows = Vec::new();
-        for (index, message) in timeline_messages.iter().enumerate() {
-            let message_lines =
-                message.to_lines(timeline_streaming_message == Some(index), inner_width);
-            let message_height = message_lines.iter().fold(0u16, |height, line| {
-                height.saturating_add(wrapped_line_count(line, inner_width))
-            });
-            if !timeline_uses_snapshot && message.is_tool_expandable() && message_height > 0 {
-                tool_message_rows.push((index, wrapped_height, message_height));
-            }
-            wrapped_height = wrapped_height.saturating_add(message_height);
-            lines.extend(message_lines);
+        // 布局缓存按内容指纹复用高度，只有变化的消息会重新排版。
+        let mut total_height =
+            app.transcript_layout
+                .sync(timeline_messages, timeline_streaming_message, inner_width);
 
-            // 工具结果直接连续排列，不额外增加分隔空行或滚动高度。
-        }
+        // 运行指示与后台重载提示不属于消息，作为尾部附加行单独测量与绘制。
+        let mut trailing: Vec<Line<'static>> = Vec::new();
         if app.running && timeline_streaming_message.is_none() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
             let mut spans = vec![
@@ -135,25 +124,22 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                     Style::new().fg(COLOR_MUTED),
                 ));
             }
-            let line = Line::from(spans);
-            wrapped_height = wrapped_height.saturating_add(wrapped_line_count(&line, inner_width));
-            lines.push(line);
+            trailing.push(Line::from(spans));
         }
         // 后台原生上下文重载以调用方提供的标签作为进行中指示。
         #[cfg(feature = "plugins")]
         if let Some(label) = app.pending_reload.as_deref() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
-            let line = Line::from(vec![
+            trailing.push(Line::from(vec![
                 Span::styled(format!("{spinner} "), Style::new().fg(COLOR_WARNING)),
                 Span::styled(label.to_string(), Style::new().fg(COLOR_MUTED)),
-            ]);
-            wrapped_height = wrapped_height.saturating_add(wrapped_line_count(&line, inner_width));
-            lines.push(line);
+            ]));
         }
+        let trailing_height = crate::ui::transcript_layout::measure_lines(&trailing, inner_width);
+        total_height = total_height.saturating_add(trailing_height);
 
-        let chat = Paragraph::new(lines).wrap(Wrap { trim: false });
         let viewport = chat_area.height;
-        let max_scroll = wrapped_height.saturating_sub(viewport);
+        let max_scroll = total_height.saturating_sub(viewport);
         app.last_max_scroll = max_scroll;
         app.last_viewport = viewport;
         // 手动滚动位置到达底部后恢复自动跟随。
@@ -162,8 +148,30 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         }
         let scroll = app.scroll.unwrap_or(max_scroll);
 
+        // 只渲染与视口相交的消息，窗口之外的历史不构建任何行。
+        app.transcript_layout.render_visible(
+            frame,
+            chat_area,
+            timeline_messages,
+            timeline_streaming_message,
+            scroll,
+        );
+        render_trailing_lines(
+            frame,
+            chat_area,
+            &trailing,
+            trailing_height,
+            total_height,
+            scroll,
+        );
+
         // 将未滚动的逻辑行范围映射到当前终端视口，供左键释放时切换详情。
         let viewport_end = scroll.saturating_add(viewport);
+        let tool_message_rows = if timeline_uses_snapshot {
+            Vec::new()
+        } else {
+            app.transcript_layout.tool_rows()
+        };
         app.tool_message_hit_regions = tool_message_rows
             .into_iter()
             .filter_map(|(message_index, start, height)| {
@@ -183,9 +191,6 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                 )
             })
             .collect();
-
-        let chat = chat.scroll((scroll, 0));
-        frame.render_widget(chat, chat_area);
 
         // 使用消息区底部的留白行，避免覆盖正文及宽字符的续占单元格。
         if let Some(position) = app.scroll {
@@ -457,6 +462,42 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             plugin_area,
         );
     }
+}
+
+/// 将运行指示等尾部附加行绘制到消息区末尾。
+///
+/// `trailing_height` 是这些行换行后的视觉行数，`total_height` 是消息区总行数；两者与
+/// `scroll` 一起决定附加行在视口中的位置，被裁掉的部分由 `Paragraph` 自身跳过。
+fn render_trailing_lines(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[Line<'static>],
+    trailing_height: u16,
+    total_height: u16,
+    scroll: u16,
+) {
+    if lines.is_empty() || trailing_height == 0 {
+        return;
+    }
+    let top = i32::from(area.y) + i32::from(total_height - trailing_height) - i32::from(scroll);
+    let bottom = top + i32::from(trailing_height);
+    let clipped_top = top.max(i32::from(area.y));
+    let clipped_bottom = bottom.min(i32::from(area.bottom()));
+    if clipped_top >= clipped_bottom {
+        return;
+    }
+    let skip = u16::try_from(clipped_top - top).unwrap_or(0);
+    frame.render_widget(
+        Paragraph::new(lines.to_vec())
+            .wrap(Wrap { trim: false })
+            .scroll((skip, 0)),
+        Rect {
+            x: area.x,
+            y: u16::try_from(clipped_top).unwrap_or(u16::MAX),
+            width: area.width,
+            height: u16::try_from(clipped_bottom - clipped_top).unwrap_or(0),
+        },
+    );
 }
 
 /// 将运行耗时格式化为 `47s` 或 `3m21s` 的紧凑显示。

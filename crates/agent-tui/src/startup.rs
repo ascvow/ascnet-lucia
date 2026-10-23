@@ -56,6 +56,8 @@ use agent_skill::SkillCatalog;
 use agent_tool::{JsonTool, ToolRegistry};
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, KeyEventKind, MouseEventKind};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use serde_json::{json, Value};
 #[cfg(feature = "plugins")]
 use std::collections::HashMap;
@@ -122,6 +124,40 @@ impl Drop for TerminalGuard {
         );
         ratatui::restore();
     }
+}
+
+/// 按配置初始化终端。
+///
+/// 全屏模式进入终端备用屏幕（类似 vim），退出后恢复原屏幕内容；关闭时直接在主屏绘制，
+/// 退出后保留最后一帧。两种模式都启用 raw mode，按键与鼠标处理保持一致。
+fn init_terminal(fullscreen: bool) -> Result<ratatui::DefaultTerminal> {
+    if fullscreen {
+        return Ok(ratatui::init());
+    }
+    crossterm::terminal::enable_raw_mode().context("启用终端原始模式失败")?;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+            .context("初始化终端失败")?;
+    terminal.clear().context("清空终端失败")?;
+    Ok(terminal)
+}
+
+/// 在运行期切换全屏渲染。
+///
+/// 终端由主循环持有，`/tui` 只登记意图；这里完成备用屏幕的进出并强制清屏，避免残留
+/// 上一次渲染模式的画面。
+fn apply_fullscreen_switch(
+    terminal: &mut ratatui::DefaultTerminal,
+    fullscreen: bool,
+) -> Result<()> {
+    use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+    if fullscreen {
+        crossterm::execute!(std::io::stdout(), EnterAlternateScreen).context("进入备用屏幕失败")?;
+    } else {
+        crossterm::execute!(std::io::stdout(), LeaveAlternateScreen).context("退出备用屏幕失败")?;
+    }
+    terminal.clear().context("切换渲染模式后清屏失败")?;
+    Ok(())
 }
 
 pub(crate) async fn run(args: Args) -> Result<()> {
@@ -436,7 +472,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     #[cfg(feature = "plugins")]
     let loading_plugin_ids = plugin_manifest_ids(&plugin_manifests);
 
-    let mut terminal = ratatui::init();
+    let mut terminal = init_terminal(tui_settings.fullscreen.unwrap_or(true))?;
     // 键盘增强协议让 Shift+Enter 等修饰组合可被区分（传统协议下它就是裸 Enter）。
     // 该查询会读取终端应答，必须在输入读取线程启动前完成，否则应答被线程吞掉。
     let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -486,6 +522,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let mut app = App::new(tx.clone(), model_name)
         .with_workspace(workspace)
         .with_config_path(config_path.clone())
+        .with_fullscreen(tui_settings.fullscreen.unwrap_or(true))
         .with_context_window(context_window)
         .with_reasoning_levels(reasoning_levels, reasoning_level)
         .with_persistent_session(Arc::clone(&session_store), session_record)
@@ -563,14 +600,30 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         })
     };
 
+    // 首帧必须绘制；之后只在状态可能变化时重绘，空闲 tick 不再整帧刷新。
+    let mut needs_redraw = true;
+    let mut rendered_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
     loop {
-        let rendered = terminal.draw(|frame| {
-            render_root(frame, &mut app);
-            app.render_text_selection(frame.buffer_mut());
-        })?;
-        let rendered_buffer = rendered.buffer;
+        // `/tui` 只登记意图，真正的备用屏幕切换在这里完成。
+        if let Some(fullscreen) = app.pending_fullscreen.take() {
+            apply_fullscreen_switch(&mut terminal, fullscreen)?;
+            needs_redraw = true;
+        }
+        if needs_redraw {
+            let rendered = terminal.draw(|frame| {
+                render_root(frame, &mut app);
+                app.render_text_selection(frame.buffer_mut());
+            })?;
+            // 复制一份帧缓冲区：鼠标选择需要读取刚绘制的内容，而终端在下一次绘制时
+            // 会复用同一块缓冲区，跨迭代持有借用会与可变借用冲突。
+            rendered_buffer.clone_from(rendered.buffer);
+        }
 
-        match rx.recv().await {
+        let event = rx.recv().await;
+        // 任何事件都可能改变界面；只有 tick 需要按动画状态判断是否值得刷新。
+        needs_redraw = !matches!(event, Some(UiEvent::Tick)) || app.tick_requires_redraw();
+
+        match event {
             Some(UiEvent::Input(Event::Key(key))) => {
                 if key.kind == KeyEventKind::Press {
                     // 界面准入：监听者可以在按键进入任何路由之前吞掉它。
@@ -1018,7 +1071,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 if app.handle_jump_hint_click(&mouse) {
                     continue;
                 }
-                app.handle_text_selection(&mouse, rendered_buffer);
+                app.handle_text_selection(&mouse, &rendered_buffer);
                 if app.handle_tool_message_click(&mouse) {
                     continue;
                 }

@@ -14,6 +14,7 @@ pub(crate) use render::render_native_plugin_dialog;
 pub(crate) use render::{render_native_command_panel, render_native_session_dialog};
 
 use crate::app::App;
+use crate::config::persist_tui_fullscreen;
 use crate::event::UiEvent;
 #[cfg(feature = "plugins")]
 use crate::plugin::management::PluginManagementService;
@@ -119,6 +120,13 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
         summary: "管理固定插件依赖",
         description: "打开人工插件管理页；变更创建新基线，当前会话不热重载。",
         idle_only: true,
+    },
+    NativeCommandSpec {
+        name: "tui",
+        aliases: &[],
+        summary: "查看或切换全屏渲染",
+        description: "用法：/tui [fullscreen|default]；不带参数时显示当前渲染模式。fullscreen 使用终端备用屏幕（类似 vim，只渲染可见消息），default 回到主屏绘制。切换会写入配置文件。",
+        idle_only: false,
     },
     NativeCommandSpec {
         name: "keys",
@@ -626,6 +634,7 @@ impl App {
             "compact" => self.execute_native_compact(),
             "reasoning" => self.execute_reasoning_command(parts.next(), agent),
             "model" => self.execute_model_command(parts.next(), agent),
+            "tui" => self.execute_tui_command(parts.next()),
             "keys" => self.start_key_inspection(),
             "exit" => self.should_quit = true,
             _ => unreachable!("原生命令表与执行路由必须同步"),
@@ -655,6 +664,58 @@ impl App {
             return;
         };
         self.set_reasoning_level(level, agent);
+    }
+
+    /// 执行 `/tui`：无参数显示当前渲染模式，带参数切换全屏渲染。
+    ///
+    /// 渲染模式的真正切换由持有终端的主循环完成；这里只登记意图并写回配置。写回失败时
+    /// 不切换，避免出现"本次生效、下次启动回退"的不一致。
+    fn execute_tui_command(&mut self, value: Option<&str>) {
+        let Some(value) = value else {
+            let current = if self.fullscreen {
+                "fullscreen（备用屏幕，只渲染可见消息）"
+            } else {
+                "default（主屏绘制）"
+            };
+            self.messages
+                .push(Msg::new(MsgKind::Info, format!("当前渲染模式：{current}")));
+            return;
+        };
+        let target = if value.eq_ignore_ascii_case("fullscreen") || value == "全屏" {
+            true
+        } else if value.eq_ignore_ascii_case("default") || value == "默认" {
+            false
+        } else {
+            self.messages.push(Msg::new(
+                MsgKind::Error,
+                format!("未知渲染模式 `{value}`；用法：/tui [fullscreen|default]。"),
+            ));
+            return;
+        };
+        if target == self.fullscreen {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "渲染模式未变化。"));
+            return;
+        }
+        if let Some(path) = self.config_path.as_deref() {
+            if let Err(error) = persist_tui_fullscreen(path, target) {
+                self.messages.push(Msg::new(
+                    MsgKind::Error,
+                    format!("保存渲染模式失败，当前设置未改变：{error:#}"),
+                ));
+                return;
+            }
+        }
+        self.fullscreen = target;
+        self.pending_fullscreen = Some(target);
+        self.messages.push(Msg::new(
+            MsgKind::Info,
+            if target {
+                "已切换到全屏渲染"
+            } else {
+                "已切换到主屏渲染"
+            },
+        ));
     }
 
     /// 执行 `/model`：无参数打开上游选择界面，带参数按名称直接切换。
