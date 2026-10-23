@@ -226,12 +226,8 @@ fn render_native_model_panel(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 " "
             };
-            let label = format!(
-                "{current} {:<14} {}  {}",
-                entry.name,
-                entry.provider.protocol_id(),
-                entry.model
-            );
+            // 模型 ID 决定实际请求，方括号里的上游名才是 `/model <名称>` 的切换键。
+            let label = format!("{current} {} [{}]", entry.model, entry.name);
             Line::from(selected_row(&label, index == selected, row_width))
         })
         .collect::<Vec<_>>();
@@ -747,6 +743,63 @@ mod plugin_capability_summary_tests {
             "{review}"
         );
         assert!(review.contains("依赖 ACL"), "{review}");
+    }
+}
+
+#[cfg(test)]
+mod model_panel_tests {
+    use super::render_native_model_panel;
+    use crate::app::App;
+    use crate::command::NativeModelPanel;
+    use agent_core::config::ModelConfig;
+    use agent_core::model::{OpenAiProtocol, ProviderKind};
+    use ratatui::{backend::TestBackend, Terminal};
+    use tokio::sync::mpsc;
+
+    /// 构造仅用于面板渲染的上游配置，避免测试复制完整模型网关。
+    fn upstream(name: &str, model: &str) -> ModelConfig {
+        ModelConfig {
+            name: name.into(),
+            provider: ProviderKind::OpenAi,
+            model: model.into(),
+            api_key: Some("test-key".into()),
+            api_key_env: None,
+            base_url: Some("https://api.example.test/v1".into()),
+            openai_protocol: OpenAiProtocol::Responses,
+            extra_headers: Default::default(),
+            gateway: Default::default(),
+            aws_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_session_token: None,
+        }
+    }
+
+    /// 面板每行按「模型 ID [上游名]」显示；方括号里必须是 `/model <名称>` 的切换键。
+    #[test]
+    fn model_panel_lists_model_id_with_upstream_name() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "gpt-5.6-sol".into());
+        app.model_upstreams = vec![
+            upstream("default", "gpt-5.6-sol"),
+            upstream("gpt-6-astra", "gpt-6-astra"),
+        ];
+        app.native_command.model_panel = Some(NativeModelPanel { selected: 1 });
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).expect("创建测试终端");
+        terminal
+            .draw(|frame| render_native_model_panel(frame, &app, frame.area()))
+            .expect("渲染模型面板");
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(screen.contains("gpt-5.6-sol [default]"), "{screen}");
+        assert!(screen.contains("gpt-6-astra [gpt-6-astra]"), "{screen}");
     }
 }
 
