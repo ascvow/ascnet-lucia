@@ -230,9 +230,20 @@ pub(crate) struct App {
     /// 等待主循环应用的渲染模式切换；终端句柄由主循环持有，应用只登记意图。
     pub(crate) pending_fullscreen: Option<bool>,
     /// 当前屏幕文本选择；鼠标释放只保留高亮，不主动写入系统剪贴板。
+    ///
+    /// 选区坐标以**内容行号**为基准，而不是屏幕行：滚轮滚动或拖到屏幕外自动滚动后，
+    /// 高亮仍然贴在同一段文字上，也才能复制跨越一屏以上的内容。
     pub(crate) text_selection: Option<MouseTextSelection>,
-    /// 左键释放时从渲染缓冲区冻结的选区文本，供后续显式复制使用。
+    /// 左键释放时冻结的选区文本，供后续显式复制使用。
     pub(crate) text_selection_content: Option<String>,
+    /// 消息内容区在屏幕上的矩形，用于在"内容行号"与"屏幕行"之间换算。
+    ///
+    /// 由 `ui::chat` 在每帧布局后写入；`None` 表示本帧没有可选择的正文区域。
+    pub(crate) content_area: Option<Rect>,
+    /// 上一帧消息区实际使用的滚动偏移（内容行），换算选区行号时使用。
+    pub(crate) content_scroll: u16,
+    /// 消息内容的逻辑总行数；滚出屏幕的历史同样在可选范围内。
+    pub(crate) content_rows: u16,
     /// 插件声明的视图及宿主缓存的最近一帧。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_views: Vec<PluginViewState>,
@@ -297,10 +308,13 @@ pub(crate) struct PluginViewState {
     pub(crate) area: Rect,
 }
 
-/// 应用内鼠标文本选择的屏幕坐标范围。
+/// 应用内鼠标文本选择的**内容坐标**范围。
+///
+/// `y` 不是终端屏幕行，而是整段消息内容的逻辑行号（0 为内容顶部）：滚轮滚动只改变
+/// 视口偏移，不会改变选区指向的文字，因此"滚动后再复制"能拿到正确内容。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MouseTextSelection {
-    /// 拖动起点，对应终端缓冲区坐标。
+    /// 拖动起点，对应内容坐标。
     anchor: Position,
     /// 最近一次拖动或释放位置。
     current: Position,
@@ -322,6 +336,16 @@ impl MouseTextSelection {
     pub(crate) fn update(&mut self, current: Position) {
         self.current = current;
         self.dragged |= current != self.anchor;
+    }
+
+    /// 选区覆盖的内容行范围（已排序，含端点）。
+    pub(crate) fn row_span(self) -> (u16, u16) {
+        let (start, end) = if (self.anchor.y, self.anchor.x) <= (self.current.y, self.current.x) {
+            (self.anchor, self.current)
+        } else {
+            (self.current, self.anchor)
+        };
+        (start.y, end.y)
     }
 
     /// 按终端线性选择顺序遍历范围内坐标，越界端点会收窄到缓冲区。
@@ -405,6 +429,25 @@ pub(crate) enum PluginKeyRoute {
     Input(UiInput),
 }
 
+/// 返回当前应显示在消息流里的消息切片，以及正在流式输出的消息索引。
+///
+/// 插件审批快照存在时，消息流切换到快照内容。渲染与文本选择必须看到同一份内容，
+/// 否则选区行号会指向另一份列表。
+///
+/// 参数是**具体字段**而不是 `&App`：调用方通常还要同时可变借用
+/// `app.transcript_layout`，若这里借用整个 `App`，借用检查会直接拒绝。
+pub(crate) fn timeline_messages<'a>(
+    #[cfg(feature = "plugins")] snapshot: &'a Option<MainEventSnapshot>,
+    messages: &'a [Msg],
+    streaming: Option<usize>,
+) -> (&'a [Msg], Option<usize>) {
+    #[cfg(feature = "plugins")]
+    if let Some(snapshot) = snapshot.as_ref() {
+        return (snapshot.messages.as_slice(), snapshot.streaming_message);
+    }
+    (messages, streaming)
+}
+
 impl App {
     /// 创建空白会话，使首屏保持与参考界面一致的低干扰状态。
     pub(crate) fn new(tx: mpsc::UnboundedSender<UiEvent>, model_name: String) -> Self {
@@ -467,6 +510,9 @@ impl App {
             pending_fullscreen: None,
             text_selection: None,
             text_selection_content: None,
+            content_area: None,
+            content_scroll: 0,
+            content_rows: 0,
             #[cfg(feature = "plugins")]
             plugin_views: Vec::new(),
             #[cfg(feature = "plugins")]

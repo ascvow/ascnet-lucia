@@ -716,12 +716,20 @@ fn reasoning_change_is_transactional_when_config_write_fails() {
     }));
 }
 
-/// 鼠标释放只结束拖选并保留高亮范围，不依赖渲染缓冲区触发隐式复制。
+/// 鼠标释放只结束拖选并保留高亮范围，选区的行号是内容行号而非屏幕行。
+///
+/// 这是"滚动复制"的前提：滚动只改变视口偏移，选区指向的内容不受影响。
 #[test]
-fn mouse_release_preserves_selection_without_buffer_side_effects() {
+fn mouse_release_preserves_selection_in_content_coordinates() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let buffer = Buffer::with_lines(["01234567", "abcdefgh", "ABCDEFGH"]);
+    // 内容区从屏幕第 1 行开始、视口已滚动 5 行：屏幕第 2 行对应内容第 6 行。
+    app.content_area = Some(Rect::new(0, 1, 8, 2));
+    app.content_scroll = 5;
+    app.content_rows = 20;
+    app.scroll = Some(5);
+    app.last_max_scroll = 15;
     for (kind, column) in [
         (MouseEventKind::Down(crossterm::event::MouseButton::Left), 1),
         (MouseEventKind::Drag(crossterm::event::MouseButton::Left), 4),
@@ -740,9 +748,10 @@ fn mouse_release_preserves_selection_without_buffer_side_effects() {
 
     let selection = app.text_selection.expect("释放后应保留拖选高亮");
     assert!(selection.dragged);
-    assert_eq!(selection.anchor, Position::new(1, 2));
-    assert_eq!(selection.current, Position::new(4, 2));
-    assert_eq!(app.text_selection_content.as_deref(), Some("BCDE"));
+    // 屏幕第 2 行 - 内容区顶部第 1 行 + 滚动 5 行 = 内容第 6 行。
+    assert_eq!(selection.anchor, Position::new(1, 6));
+    assert_eq!(selection.current, Position::new(4, 6));
+    assert_eq!(selection.row_span(), (6, 6));
 }
 
 /// 显式复制使用的选区文本必须保留换行和中文宽字符，并移除行尾布局空白。

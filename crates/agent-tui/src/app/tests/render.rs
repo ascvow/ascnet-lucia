@@ -1589,10 +1589,14 @@ fn streaming_cursor_stays_on_last_code_line() {
 }
 
 /// 拖选高亮只修改单元格样式，不得改写可复制的字符内容。
+///
+/// 选区存内容行号，绘制时按当前滚动偏移换算成屏幕行。
 #[test]
 fn mouse_text_selection_renders_reversed_cells() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
+    app.content_area = Some(Rect::new(0, 0, 4, 1));
+    app.content_rows = 1;
     let mut selection = MouseTextSelection::new(Position::new(1, 0));
     selection.update(Position::new(2, 0));
     app.text_selection = Some(selection);
@@ -1604,6 +1608,259 @@ fn mouse_text_selection_renders_reversed_cells() {
     assert!(buffer[(1, 0)].modifier.contains(Modifier::REVERSED));
     assert!(buffer[(2, 0)].modifier.contains(Modifier::REVERSED));
     assert!(!buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+}
+
+/// 向长消息区域发送一次鼠标事件。
+fn send_mouse(app: &mut App, buffer: &Buffer, kind: MouseEventKind, column: u16, row: u16) {
+    app.handle_text_selection(
+        &MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        buffer,
+    );
+}
+
+/// 构造一条足够长的助手回复，每行都带可检索的标记。
+fn long_assistant_reply(lines: usize) -> Msg {
+    let mut text = String::new();
+    for index in 0..lines {
+        text.push_str(&format!("MARK-{index:02}\n"));
+    }
+    Msg::new(MsgKind::Assistant, text)
+}
+
+/// 向下拖动越过内容区底部时必须自动滚动，并且选区继续向屏幕外延伸。
+///
+/// 这是"选中一屏以上内容再复制"的核心：没有自动滚动，选区永远只有一屏。
+#[test]
+fn drag_past_bottom_edge_autoscrolls_and_extends_selection() {
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages.push(long_assistant_reply(80));
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let area = app.content_area.expect("应记录内容区几何");
+    // 先回到顶部，确认后续滚动完全由拖动触发。
+    app.scroll = Some(0);
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    send_mouse(
+        &mut app,
+        &buffer,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        area.x,
+        area.y,
+    );
+    let mut last_row = area.y;
+    for _ in 0..3 {
+        // 每次都在下边界之外一格：越界即触发滚动与选区延伸。
+        send_mouse(
+            &mut app,
+            &buffer,
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            area.x + 2,
+            area.bottom(),
+        );
+        last_row = area.bottom();
+    }
+
+    let selection = app.text_selection.expect("拖动后应存在选区");
+    assert!(
+        app.scroll.unwrap_or(0) > 0,
+        "拖动越过下边界后视口应向前滚动"
+    );
+    assert!(
+        selection.current.y >= area.height,
+        "选区终点应扩展到首屏之外：{:?}（视口高 {}）",
+        selection.current,
+        area.height
+    );
+    assert_eq!(selection.current.x, area.x + 2);
+    assert_eq!(last_row, area.bottom());
+}
+
+/// 同一段文字在滚动前后必须保持被选中：滚轮不该取消选区，高亮也随内容一起移动。
+#[test]
+fn wheel_scroll_keeps_text_selection() {
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages.push(long_assistant_reply(80));
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    app.scroll = Some(10);
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let area = app.content_area.expect("应记录内容区几何");
+    let buffer = terminal.backend().buffer().clone();
+
+    send_mouse(
+        &mut app,
+        &buffer,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        area.x + 1,
+        area.y + 1,
+    );
+    send_mouse(
+        &mut app,
+        &buffer,
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        area.x + 3,
+        area.y + 3,
+    );
+    let before = app.text_selection.expect("拖动后应存在选区");
+    let highlighted_before = reversed_rows(&mut terminal, &mut app);
+
+    app.scroll_up(5);
+
+    let after = app.text_selection.expect("滚轮滚动不应取消选区");
+    assert_eq!(before.anchor, after.anchor, "滚动不能移动选区起点");
+    assert_eq!(before.current, after.current, "滚动不能移动选区终点");
+    let highlighted_after = reversed_rows(&mut terminal, &mut app);
+    assert_eq!(
+        highlighted_after.len(),
+        highlighted_before.len(),
+        "高亮行数应保持不变：{highlighted_before:?} → {highlighted_after:?}"
+    );
+    // 内容向下移了 5 行，高亮必须跟着一起下移，而不是留在原地。
+    for (before_row, after_row) in highlighted_before.iter().zip(&highlighted_after) {
+        assert_eq!(
+            *after_row,
+            before_row + 5,
+            "高亮应随内容一起滚动：{highlighted_before:?} → {highlighted_after:?}"
+        );
+    }
+}
+
+/// 读出当前帧里被 REVERSED 标记的行号，用于断言高亮位置。
+fn reversed_rows(terminal: &mut Terminal<TestBackend>, app: &mut App) -> Vec<u16> {
+    terminal
+        .draw(|frame| {
+            render_root(frame, app);
+            app.render_text_selection(frame.buffer_mut());
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let mut rows = Vec::new();
+    for y in 0..buffer.area.height {
+        let reversed =
+            (0..buffer.area.width).any(|x| buffer[(x, y)].modifier.contains(Modifier::REVERSED));
+        if reversed {
+            rows.push(y);
+        }
+    }
+    rows
+}
+
+/// 跨屏选区在释放后要能复制到屏幕之外的内容。
+///
+/// 提取走离屏渲染而非当前帧缓冲区，因此被滚出视口的历史同样在复制范围内。
+#[test]
+fn selection_extending_above_viewport_is_fully_copyable() {
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages.push(long_assistant_reply(80));
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let area = app.content_area.expect("应记录内容区几何");
+    assert!(area.y > 0, "内容区上方应留出可越界的行：{area:?}");
+    // 起点停在中间偏下：上方仍有大量未显示内容。
+    let start_scroll = 12;
+    app.scroll = Some(start_scroll);
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    send_mouse(
+        &mut app,
+        &buffer,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        area.x + 1,
+        area.y,
+    );
+    // 向上拖出内容区：每次越界都会滚动，直到回到内容顶部。
+    for _ in 0..20 {
+        if app.scroll == Some(0) {
+            break;
+        }
+        send_mouse(
+            &mut app,
+            &buffer,
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            area.x + 1,
+            area.y - 1,
+        );
+    }
+    send_mouse(
+        &mut app,
+        &buffer,
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        area.x + 1,
+        area.y - 1,
+    );
+
+    let selection = app.text_selection.expect("应保留选区");
+    let copied = app
+        .text_selection_content
+        .expect("跨屏选区释放后应生成可复制文本");
+    assert!(
+        selection.row_span().0 < start_scroll,
+        "选区起点应早于按下时的视口顶部：{:?} vs {start_scroll}",
+        selection.row_span()
+    );
+    // 这些行在按下时都已滚出视口，只有离屏渲染才拿得到。
+    for marker in ["MARK-00", "MARK-01", "MARK-02"] {
+        assert!(
+            copied.contains(marker),
+            "应能复制到视口之上的内容：{copied:?}"
+        );
+    }
+}
+
+/// 首屏没有可滚动内容，选区行号相对消息区顶部：仍能选中并复制首屏文字。
+///
+/// 这条回退路径容易被"内容行数为零"的夹取逻辑压成一行，因此单独锁住。
+#[test]
+fn hero_screen_text_can_still_be_selected_and_copied() {
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let area = app.content_area.expect("首屏也应记录可选区域");
+    assert_eq!(app.content_rows, 0, "首屏没有消息内容");
+    let buffer = terminal.backend().buffer().clone();
+
+    send_mouse(
+        &mut app,
+        &buffer,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        area.x,
+        area.y + 2,
+    );
+    send_mouse(
+        &mut app,
+        &buffer,
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        area.x + 20,
+        area.y + 4,
+    );
+    send_mouse(
+        &mut app,
+        &buffer,
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        area.x + 20,
+        area.y + 4,
+    );
+
+    let selection = app.text_selection.expect("首屏应保留选区");
+    assert!(
+        selection.row_span().0 < selection.row_span().1,
+        "首屏选区应能跨多行：{:?}",
+        selection.row_span()
+    );
+    let copied = app.text_selection_content.expect("首屏选区应可复制");
+    assert!(!copied.trim().is_empty(), "首屏复制内容不应为空");
 }
 
 /// 上下文状态在配置窗口后展示占比，并按超过 80% 与 95% 的阈值着色。

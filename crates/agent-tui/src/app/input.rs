@@ -17,6 +17,11 @@ use ratatui::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
 
+/// 拖动选区越过内容区边界时，单次拖动事件最多滚动的行数。
+///
+/// 上限的作用是让靠近边界时的拖动保持精细：贴边一格只滚一行，拖到屏幕外很远才加速。
+const AUTOSCROLL_MAX_STEP: i32 = 5;
+
 impl App {
     pub(crate) fn handle_key(
         &mut self,
@@ -443,16 +448,19 @@ impl App {
     }
 
     /// 向上滚动 n 行，进入手动滚动模式。
+    ///
+    /// 不取消文本选区：选区以内容行号为基准，滚动只改变视口偏移，高亮仍贴在原来的
+    /// 文字上。这正是"滚动着选中一屏以上内容再复制"的前提。
     pub(crate) fn scroll_up(&mut self, n: u16) {
-        self.dismiss_text_selection();
         self.tool_click_candidate = None;
         let current = self.scroll.unwrap_or(self.last_max_scroll);
         self.scroll = Some(current.saturating_sub(n));
     }
 
     /// 向下滚动 n 行；到达底部时恢复自动跟随。
+    ///
+    /// 与 [`Self::scroll_up`] 相同，保留现有选区。
     pub(crate) fn scroll_down(&mut self, n: u16) {
-        self.dismiss_text_selection();
         self.tool_click_candidate = None;
         if let Some(current) = self.scroll {
             let next = current.saturating_add(n);
@@ -461,6 +469,20 @@ impl App {
             } else {
                 self.scroll = Some(next);
             }
+        }
+    }
+
+    /// 按符号滚动若干行：正数向上（查看更早内容），负数向下。
+    ///
+    /// 拖动自动滚动用这个入口，逻辑与滚轮、键盘完全一致，避免出现"拖到边界时的滚动"
+    /// 和"滚轮滚动"两套行为。
+    fn scroll_selection_view(&mut self, delta: i32) {
+        match delta {
+            delta if delta > 0 => self.scroll_up(u16::try_from(delta).unwrap_or(u16::MAX)),
+            delta if delta < 0 => {
+                self.scroll_down(delta.unsigned_abs().try_into().unwrap_or(u16::MAX))
+            }
+            _ => {}
         }
     }
 
@@ -785,33 +807,132 @@ impl App {
     ///
     /// 单击只重置选择；发生拖动后，选择按终端的线性行顺序展开。选区必须再由
     /// `Ctrl+C` 显式复制，避免鼠标释放意外覆盖用户已有剪贴板内容。
+    ///
+    /// 选区以内容行号为基准，因此：
+    /// - 拖动越过内容区上下边界时自动滚动，可以选中一屏以上的内容；
+    /// - 滚轮滚动不会取消选区，高亮继续贴在原来的文字上。
     pub(crate) fn handle_text_selection(&mut self, mouse: &MouseEvent, buffer: &Buffer) {
-        let position = Position::new(mouse.column, mouse.row);
+        let Some(area) = self.content_area.filter(|area| !area.is_empty()) else {
+            // 本帧没有可选择的正文区域（例如审批覆盖层），不建立选区。
+            self.dismiss_text_selection();
+            return;
+        };
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 self.dismiss_text_selection();
-                self.text_selection = Some(MouseTextSelection::new(position));
+                self.text_selection =
+                    Some(MouseTextSelection::new(self.content_position(area, mouse)));
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
                 self.text_selection_content = None;
+                if self.text_selection.is_none() {
+                    return;
+                }
+                // 先滚动再取坐标：滚动量改变后，同一个鼠标行对应不同的内容行，
+                // 顺序反了选区就会落后一帧、拖不到屏幕外。
+                self.autoscroll_selection(mouse.row, area);
+                let position = self.content_position(area, mouse);
                 if let Some(selection) = self.text_selection.as_mut() {
                     selection.update(position);
                 }
             }
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                let Some(selection) = self.text_selection.as_mut() else {
+                let Some(mut selection) = self.text_selection else {
                     return;
                 };
-                selection.update(position);
+                selection.update(self.content_position(area, mouse));
                 let text = if selection.dragged {
-                    selection.extract(buffer)
+                    self.extract_selection_text(selection, buffer)
                 } else {
                     String::new()
                 };
+                self.text_selection = Some(selection);
                 self.text_selection_content = (!text.is_empty()).then_some(text);
             }
             _ => {}
         }
+    }
+
+    /// 把鼠标屏幕坐标换算成选区使用的**内容坐标**。
+    ///
+    /// 横向夹取在内容区的左右边界内（内容不越出该区域），纵向用未裁剪的行号，
+    /// 这样拖到屏幕外仍能表达"继续向外扩展"的意图，再由调用方滚动把它变成可见。
+    ///
+    /// 滚动偏移取**当前**值而不是上一帧渲染时记下的 `content_scroll`：拖动自动滚动会
+    /// 在两次绘制之间改变偏移，用旧值会让选区永远落后一步、拖不出屏幕。
+    fn content_position(&self, area: Rect, mouse: &MouseEvent) -> Position {
+        let column = mouse
+            .column
+            .clamp(area.left(), area.right().saturating_sub(1));
+        let scroll = i32::from(self.scroll.unwrap_or(self.last_max_scroll));
+        let row = i32::from(mouse.row) - i32::from(area.y) + scroll;
+        // 首屏没有消息内容（`content_rows == 0`）：此时可选范围就是消息区本身，
+        // 按内容行数夹取会把整块区域压成一行。
+        let last_row = if self.content_rows == 0 {
+            i32::from(area.height.saturating_sub(1))
+        } else {
+            i32::from(self.content_rows.saturating_sub(1))
+        };
+        let row = row.clamp(0, last_row.max(0));
+        Position::new(column, u16::try_from(row).unwrap_or(0))
+    }
+
+    /// 拖动越过内容区上下边界时滚动视图，让选区可以延伸到一屏之外。
+    ///
+    /// 每次拖动事件按越界距离滚动若干行：拖得越远滚得越快，靠近边界时保持精细控制。
+    /// 终端在鼠标静止时不产生拖动事件，因此"按住不动"不会持续滚动；这是明确的取舍，
+    /// 换来的是没有额外的定时器与重绘。
+    fn autoscroll_selection(&mut self, row: u16, area: Rect) {
+        let step = if row < area.top() {
+            i32::from(area.top() - row).min(AUTOSCROLL_MAX_STEP)
+        } else if row >= area.bottom() {
+            -i32::from(row - area.bottom() + 1).max(-AUTOSCROLL_MAX_STEP)
+        } else {
+            return;
+        };
+        self.scroll_selection_view(step);
+    }
+
+    /// 提取选区覆盖的文本，支持跨越一屏以上的范围。
+    ///
+    /// 首屏（没有消息内容）没有滚动，选区行号相对内容区顶部，映射回屏幕坐标后直接从
+    /// 当前帧缓冲区取；正常运行中用离屏缓冲区重新渲染选中的行范围，因此滚出屏幕的
+    /// 历史同样能被复制。
+    fn extract_selection_text(&mut self, selection: MouseTextSelection, buffer: &Buffer) -> String {
+        if self.content_rows == 0 {
+            let offset = self.content_area.map_or(0, |area| area.y);
+            let translated = MouseTextSelection {
+                anchor: Position::new(
+                    selection.anchor.x,
+                    selection.anchor.y.saturating_add(offset),
+                ),
+                current: Position::new(
+                    selection.current.x,
+                    selection.current.y.saturating_add(offset),
+                ),
+                dragged: selection.dragged,
+            };
+            return translated.extract(buffer);
+        }
+        let Some(area) = self.content_area else {
+            return String::new();
+        };
+        let (start, end) = selection.row_span();
+        let end = end.min(self.content_rows.saturating_sub(1));
+        let height = end.saturating_sub(start).saturating_add(1);
+        if height == 0 {
+            return String::new();
+        }
+        let (messages, streaming) = crate::app::timeline_messages(
+            #[cfg(feature = "plugins")]
+            &self.main_event_snapshot,
+            &self.messages,
+            self.streaming_message,
+        );
+        let rendered = self
+            .transcript_layout
+            .render_range(area, messages, streaming, start, height);
+        selection.extract(&rendered)
     }
 
     /// 处理工具消息的左键点击，并在未发生文本拖选时切换详情展开状态。
@@ -899,12 +1020,31 @@ impl App {
     }
 
     /// 在当前帧缓冲区中反色显示应用内鼠标选择，不改变字符内容。
+    ///
+    /// 选区存的是内容行号，这里换算成屏幕行：滚动之后高亮仍贴在原来的文字上，
+    /// 滚出屏幕的部分自然不绘制。
     pub(crate) fn render_text_selection(&self, buffer: &mut Buffer) {
         let Some(selection) = self.text_selection.filter(|selection| selection.dragged) else {
             return;
         };
-        selection.for_each_position(buffer.area, |position| {
-            if let Some(cell) = buffer.cell_mut(position) {
+        let Some(area) = self.content_area else {
+            return;
+        };
+        if area.is_empty() {
+            return;
+        }
+        // 内容行 0 对应屏幕上的 area.y - content_scroll：滚动越大，内容越靠上。
+        let content_bounds = Rect::new(area.x, 0, area.width, self.content_rows.max(area.height));
+        let scroll = i32::from(self.content_scroll);
+        selection.for_each_position(content_bounds, |position| {
+            let screen_y = i32::from(position.y) - scroll + i32::from(area.y);
+            let Ok(screen_y) = u16::try_from(screen_y) else {
+                return;
+            };
+            if screen_y < area.top() || screen_y >= area.bottom() {
+                return;
+            }
+            if let Some(cell) = buffer.cell_mut(Position::new(position.x, screen_y)) {
                 cell.modifier.insert(Modifier::REVERSED);
             }
         });

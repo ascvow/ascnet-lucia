@@ -169,6 +169,64 @@ impl TranscriptLayout {
         }
     }
 
+    /// 把内容行区间 `[top, top + height)` 渲染到一个独立缓冲区，供跨屏选区提取纯文本。
+    ///
+    /// 选区存在内容坐标里，因此滚出屏幕的历史也要能被复制；这里按内容行号重新排版
+    /// 选中的那几行，坐标与屏幕上的内容行一一对应（缓冲区 `area.y == top`）。
+    /// 视口外的消息按需重建行、但不写回缓存——缓存的"只保留可见窗口"策略不受影响。
+    ///
+    /// 助手卡片的底色不铺：提取纯文本只关心字符，多画一层底色没有意义。
+    pub(crate) fn render_range(
+        &mut self,
+        area: Rect,
+        messages: &[Msg],
+        streaming: Option<usize>,
+        top: u16,
+        height: u16,
+    ) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(area.x, top, area.width, height));
+        if area.width == 0 || height == 0 {
+            return buffer;
+        }
+        let range_top = i32::from(top);
+        let range_bottom = range_top.saturating_add(i32::from(height));
+        let mut cursor = 0i32;
+
+        for (index, entry) in self.entries.iter().enumerate() {
+            let entry_height = i32::from(entry.height);
+            let start = cursor;
+            cursor = cursor.saturating_add(entry_height);
+            if entry_height == 0 || cursor <= range_top || start >= range_bottom {
+                continue;
+            }
+            let Some(message) = messages.get(index) else {
+                continue;
+            };
+            let width = entry.width;
+            let lines = entry
+                .lines
+                .clone()
+                .unwrap_or_else(|| message_lines(messages, index, streaming == Some(index), width));
+            let clipped_top = start.max(range_top);
+            let clipped_bottom = cursor.min(range_bottom);
+            let skip = u16::try_from(clipped_top.saturating_sub(start)).unwrap_or(u16::MAX);
+            let target = Rect {
+                x: area.x,
+                y: u16::try_from(clipped_top).unwrap_or(u16::MAX),
+                width: area.width,
+                height: u16::try_from(clipped_bottom.saturating_sub(clipped_top)).unwrap_or(0),
+            };
+            if target.height == 0 {
+                continue;
+            }
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((skip, 0))
+                .render(target, &mut buffer);
+        }
+        buffer
+    }
+
     /// 返回可点击工具消息的 `(消息索引, 起始行, 高度)`；起始行相对全部消息顶部。
     pub(crate) fn tool_rows(&self) -> Vec<(usize, u16, u16)> {
         let mut rows = Vec::new();
