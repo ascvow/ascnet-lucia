@@ -48,6 +48,7 @@ fn native_registry_contains_default_commands() {
             "clear",
             "reasoning",
             "model",
+            "attach",
             "plugins",
             "tui",
             "keys",
@@ -67,6 +68,7 @@ fn native_registry_contains_default_commands() {
             "clear",
             "reasoning",
             "model",
+            "attach",
             "tui",
             "keys",
             "help",
@@ -768,6 +770,87 @@ fn native_reasoning_panel_applies_selected_level() {
     assert!(app.native_command.reasoning_panel.is_none());
     assert_eq!(app.reasoning_level, ReasoningLevel::Medium);
     assert_eq!(agent.reasoning_level(), ReasoningLevel::Medium);
+}
+
+/// `/attach` 必须把可读取的本地文件加入附件，一行可添加多个路径。
+#[test]
+fn native_attach_command_adds_local_file() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let first = std::env::temp_dir().join(format!(
+        "lucia-attach-command-{}-a-{}.png",
+        std::process::id(),
+        agent_session::SessionId::generate()
+    ));
+    let second = std::env::temp_dir().join(format!(
+        "lucia-attach-command-{}-b-{}.pdf",
+        std::process::id(),
+        agent_session::SessionId::generate()
+    ));
+    std::fs::write(&first, b"\x89PNG\r\n\x1a\n").expect("写入附件命令测试文件");
+    std::fs::write(&second, b"%PDF-1.7").expect("写入附件命令测试文件");
+
+    app.input = format!("/attach {} {}", first.display(), second.display());
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    std::fs::remove_file(&first).ok();
+    std::fs::remove_file(&second).ok();
+
+    assert_eq!(app.attachments.len(), 2);
+    assert_eq!(app.attachments[0].media_type, "image/png");
+    assert_eq!(app.attachments[1].media_type, "application/pdf");
+    assert_eq!(app.input, "[IMAGE#1] [PDF#1] ");
+    assert!(app.messages.is_empty());
+}
+
+/// 已有待发送附件时，`/attach` 与其他斜杠命令一样被拒绝并提示先移除。
+#[test]
+fn native_attach_command_rejects_when_attachment_pending() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = std::env::temp_dir().join(format!(
+        "lucia-attach-pending-{}-{}.png",
+        std::process::id(),
+        agent_session::SessionId::generate()
+    ));
+    std::fs::write(&path, b"\x89PNG\r\n\x1a\n").expect("写入附件命令测试文件");
+
+    app.input = format!("/attach {}", path.display());
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    assert_eq!(app.attachments.len(), 1);
+
+    app.input = format!("/attach {}", path.display());
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(app.attachments.len(), 1);
+    assert!(app
+        .messages
+        .last()
+        .is_some_and(|message| message.text.contains("斜杠命令不能携带附件")));
+}
+
+/// `/attach` 找不到文件或缺少参数时必须给出提示，且不创建附件。
+#[test]
+fn native_attach_command_reports_missing_file_and_usage() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.input = "/attach".into();
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    assert!(app.messages[0].text.contains("用法：/attach"));
+
+    app.input = "/attach /nonexistent/lucia.png".into();
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+
+    assert!(app.attachments.is_empty());
+    assert!(app.messages.last().is_some_and(|message| {
+        matches!(message.kind, MsgKind::Error) && message.text.contains("/nonexistent/lucia.png")
+    }));
 }
 
 /// `/model` 必须热切换共享 Agent 上游，并同步状态栏模型名；无上游时给出提示。

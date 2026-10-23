@@ -230,13 +230,17 @@ pub(crate) fn restore_session_messages(session: &Session) -> Vec<Msg> {
             MessageRole::User => {
                 let mut text = message.text_content();
                 // TUI 提交的附件引用标签内嵌在文本中；其他来源的纯附件消息
-                // 没有文本时补充占位标签，保证恢复后可见。
+                // 没有文本时补充占位标签，保证恢复后可见。标签与提交时的编号写法一致。
                 if text.is_empty() {
+                    let mut image_index = 0;
                     let labels: Vec<String> = message
                         .content
                         .iter()
                         .filter_map(|block| match block {
-                            ContentBlock::Image { .. } => Some("[Image]".to_string()),
+                            ContentBlock::Image { .. } => {
+                                image_index += 1;
+                                Some(format!("[IMAGE#{image_index}]"))
+                            }
                             ContentBlock::File { name, .. } => Some(format!("[FILE#{name}]")),
                             _ => None,
                         })

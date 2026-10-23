@@ -465,21 +465,70 @@ fn hidden_permission_input_returns_escape_to_main() {
     ));
 }
 
-/// 粘贴的引号包裹或转义路径解析为文件；普通文本返回 None。
+/// 粘贴的引号包裹或转义路径解析为文件；相对路径按基准目录解析；普通文本返回 None。
 #[test]
 fn pasted_file_path_parses_dropped_paths() {
     let path = write_temp_attachment("带 空格.txt", b"x");
     let display = path.display().to_string();
+    let base = std::env::temp_dir();
 
     let quoted = format!("'{display}'");
-    assert_eq!(pasted_file_path(&quoted), Some(path.clone()));
+    assert_eq!(pasted_file_path(&quoted, &base), Some(path.clone()));
 
     let escaped = display.replace(' ', "\\ ");
-    assert_eq!(pasted_file_path(&escaped), Some(path.clone()));
+    assert_eq!(pasted_file_path(&escaped, &base), Some(path.clone()));
+
+    // 裸文件名按基准目录解析：Finder 复制文件时剪贴板文本只有文件名。
+    let bare = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(pasted_file_path(&bare, &base), Some(path.clone()));
+
+    // `./` 前缀同样按基准目录解析。
+    let relative = format!("./{bare}");
+    assert_eq!(pasted_file_path(&relative, &base), Some(path.clone()));
+
+    // 基准目录不含该文件时，相对路径不得误判为附件。
+    assert_eq!(
+        pasted_file_path(&bare, Path::new("/nonexistent-base")),
+        None
+    );
 
     std::fs::remove_file(&path).ok();
-    assert_eq!(pasted_file_path("普通粘贴文本"), None);
-    assert_eq!(pasted_file_path(&display), None);
+    assert_eq!(pasted_file_path("普通粘贴文本", &base), None);
+    assert_eq!(pasted_file_path(&display, &base), None);
+}
+
+/// Finder 复制文件时粘贴的文本只有文件名：应回查剪贴板文件引用并附加该文件。
+#[test]
+fn paste_bare_filename_uses_clipboard_file_reference() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("截图.png", b"\x89PNG\r\n\x1a\n");
+    let bare = path.file_name().unwrap().to_string_lossy().into_owned();
+
+    app.handle_paste_with(&bare, || Some(path.clone()));
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(app.input, "[IMAGE#1] ");
+    assert_eq!(app.attachments.len(), 1);
+    assert!(app.attachments[0].name.ends_with("截图.png"));
+    assert_eq!(app.attachments[0].media_type, "image/png");
+}
+
+/// 剪贴板没有文件引用且按工作目录找不到时，必须报错而不是静默折叠成文本附件。
+#[test]
+fn paste_unresolvable_attachment_name_reports_error() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.handle_paste_with("不存在的截图.png", || None);
+
+    assert!(app.attachments.is_empty());
+    assert!(app.input.is_empty());
+    assert!(app
+        .messages
+        .last()
+        .is_some_and(|message| matches!(message.kind, MsgKind::Error)
+            && message.text.contains("不存在的截图.png")));
 }
 
 /// 粘贴非路径文本时折叠为标签，提交时保留统一后的逻辑换行。

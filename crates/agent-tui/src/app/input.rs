@@ -3,7 +3,8 @@
 use super::App;
 use crate::app::{is_command_modifier, MouseTextSelection, ESC_DOUBLE_PRESS_WINDOW};
 use crate::session::attachment::{
-    attachment_media_type, attachment_modality, copy_to_clipboard, pasted_file_path,
+    attachment_media_type, attachment_modality, clipboard_file_path, copy_to_clipboard,
+    looks_like_file_path, pasted_file_path,
 };
 use crate::session::conversation::{
     submission_text, Msg, MsgKind, PendingAttachment, UserSubmission,
@@ -515,8 +516,37 @@ impl App {
 
     /// 处理终端粘贴：文件路径转为附件，其余文本折叠为引用标签并保留原文待发送。
     pub(crate) fn handle_paste(&mut self, pasted: &str) {
-        if let Some(path) = pasted_file_path(pasted) {
+        self.handle_paste_with(pasted, clipboard_file_path);
+    }
+
+    /// [`App::handle_paste`] 的可测试实现。
+    ///
+    /// `clipboard` 注入剪贴板文件引用的读取方式：Finder 复制文件时剪贴板文本只有
+    /// 文件名，必须回查文件引用才能定位；测试传入固定结果，避免依赖本机剪贴板状态。
+    pub(crate) fn handle_paste_with(
+        &mut self,
+        pasted: &str,
+        clipboard: impl FnOnce() -> Option<std::path::PathBuf>,
+    ) {
+        let cwd = self.workspace.cwd.clone();
+        if let Some(path) = pasted_file_path(pasted, &cwd) {
             self.attach_file(&path);
+            return;
+        }
+        // 文本看起来是附件路径但按工作目录找不到：回查剪贴板文件引用（Finder 复制场景）。
+        if looks_like_file_path(pasted) {
+            match clipboard() {
+                Some(path) => {
+                    self.attach_file(&path);
+                }
+                None => self.messages.push(Msg::new(
+                    MsgKind::Error,
+                    format!(
+                        "无法定位附件 `{}`：请粘贴绝对路径，或重新从文件管理器复制该文件。",
+                        pasted.trim()
+                    ),
+                )),
+            }
             return;
         }
         // 统一平台换行，制表符仍降级为空格以避免不同终端产生不可见差异。

@@ -18,6 +18,7 @@ use crate::config::persist_tui_fullscreen;
 use crate::event::UiEvent;
 #[cfg(feature = "plugins")]
 use crate::plugin::management::PluginManagementService;
+use crate::session::attachment::pasted_file_path;
 use crate::session::conversation::{Msg, MsgKind};
 use agent_core::model::ReasoningLevel;
 use agent_core::Agent;
@@ -112,6 +113,13 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
         summary: "查看或切换模型上游",
         description: "用法：/model [名称]；不带参数时打开上游选择界面。切换只在当前会话生效，重启后回到配置的默认上游。",
         idle_only: true,
+    },
+    NativeCommandSpec {
+        name: "attach",
+        aliases: &["file"],
+        summary: "添加本地附件",
+        description: "用法：/attach <路径> [路径...]；把本地文件加入待发送附件，路径可为绝对路径、`~/` 前缀或相对当前项目目录。已有附件时需先移除。",
+        idle_only: false,
     },
     #[cfg(feature = "plugins")]
     NativeCommandSpec {
@@ -590,9 +598,13 @@ impl App {
             return;
         };
         self.native_command.dismissed_input = None;
-        let mut parts = input.split_whitespace();
-        let invoked = parts.next().unwrap_or_default();
+        let invoked = input.split_whitespace().next().unwrap_or_default();
         let name = invoked.trim_start_matches('/');
+        // 首个空白之后的完整内容作为参数，保留路径里的空格。
+        let argument = input
+            .split_once(char::is_whitespace)
+            .map(|(_, rest)| rest.trim())
+            .filter(|rest| !rest.is_empty());
         let Some(command) = NATIVE_COMMANDS
             .iter()
             .find(|command| command.name == name || command.aliases.contains(&name))
@@ -615,7 +627,10 @@ impl App {
                 self.native_command.context_open = true;
                 self.native_command.context_scroll = 0;
             }
-            "help" => self.show_native_command_help(parts.next()),
+            "help" => {
+                let topic = argument.and_then(|rest| rest.split_whitespace().next());
+                self.show_native_command_help(topic);
+            }
             "resume" => self.open_native_sessions(NativeSessionDialogMode::Resume),
             "sessions" => self.open_native_sessions(NativeSessionDialogMode::Browse),
             #[cfg(feature = "plugins")]
@@ -632,13 +647,51 @@ impl App {
                 }
             }
             "compact" => self.execute_native_compact(),
-            "reasoning" => self.execute_reasoning_command(parts.next(), agent),
-            "model" => self.execute_model_command(parts.next(), agent),
-            "tui" => self.execute_tui_command(parts.next()),
+            "attach" => self.execute_attach_command(argument),
+            "reasoning" => self.execute_reasoning_command(argument, agent),
+            "model" => self.execute_model_command(argument, agent),
+            "tui" => self.execute_tui_command(argument),
             "keys" => self.start_key_inspection(),
             "exit" => self.should_quit = true,
             _ => unreachable!("原生命令表与执行路由必须同步"),
         }
+    }
+
+    /// 执行 `/attach`：把本地文件加入待发送附件。
+    ///
+    /// 路径解析复用粘贴路径逻辑，因此支持绝对路径、`~/` 前缀、引号包裹以及相对
+    /// 当前项目目录的写法。先尝试把整段参数当作一个路径（保留其中的空格），失败后
+    /// 再按空白拆成多个路径，便于一次添加多个附件；无法解析的路径逐个报错，
+    /// 已成功的附件不受影响。
+    fn execute_attach_command(&mut self, argument: Option<&str>) {
+        let Some(argument) = argument else {
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                "用法：/attach <路径> [路径...]；路径可为绝对路径、`~/` 前缀或相对当前项目目录。",
+            ));
+            return;
+        };
+        let cwd = self.workspace.cwd.clone();
+        // 整段就是一个可读路径（含未加引号的空格）时不再拆分。
+        if let Some(path) = pasted_file_path(argument, &cwd) {
+            self.append_attachment(&path);
+            return;
+        }
+        for candidate in argument.split_whitespace() {
+            match pasted_file_path(candidate, &cwd) {
+                Some(path) => self.append_attachment(&path),
+                None => self.messages.push(Msg::new(
+                    MsgKind::Error,
+                    format!("找不到可读取的文件 `{candidate}`；请确认路径存在且是普通文件。"),
+                )),
+            }
+        }
+    }
+
+    /// 追加一个附件引用标签到输入末尾，符合"继续添加"的直觉。
+    fn append_attachment(&mut self, path: &std::path::Path) {
+        self.cursor = self.input.len();
+        self.attach_file(path);
     }
 
     /// 执行 `/reasoning`：无参数打开二级选择界面，`next` 循环，其余参数精确设置等级。
