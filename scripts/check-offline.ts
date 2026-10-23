@@ -22,7 +22,12 @@ interface CheckStep {
 
 const repoRoot = `${import.meta.dir}/..`
 
-/** M0-01 定义的标准离线验证序列，顺序敏感：先快后慢，先检查后构建。 */
+/**
+ * 标准离线验证序列，顺序敏感：格式与静态检查最先失败，插件 WASM 必须先于
+ * workspace 测试构建——插件冒烟测试直接加载 `target/wasm32-wasip2/release` 下的
+ * component，源码 checkout 里没有产物，顺序颠倒会让测试因缺文件而失败。TUI 的两种
+ * 构建变体放在最后，它们最慢。
+ */
 const steps: CheckStep[] = [
   {
     id: 'fmt',
@@ -35,11 +40,6 @@ const steps: CheckStep[] = [
     command: ['cargo', 'clippy', '--workspace', '--all-targets', '--offline', '--', '-D', 'warnings'],
   },
   {
-    id: 'test',
-    description: '运行 workspace 单元与集成测试',
-    command: ['cargo', 'test', '--workspace', '--offline'],
-  },
-  {
     id: 'build:plugin:official',
     description: '构建官方插件 WASM',
     command: ['bun', 'run', 'build:plugin:official'],
@@ -48,6 +48,11 @@ const steps: CheckStep[] = [
     id: 'build:plugin:all',
     description: '构建全部示例插件 WASM',
     command: ['bun', 'run', 'build:plugin:all'],
+  },
+  {
+    id: 'test',
+    description: '运行 workspace 单元与集成测试',
+    command: ['cargo', 'test', '--workspace', '--offline'],
   },
   {
     id: 'build:tui:core',
