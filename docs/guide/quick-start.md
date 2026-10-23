@@ -36,7 +36,7 @@ lucia --demo
 `--demo` 强制使用内置模型。退出后直接运行 `lucia` 即可按配置连接真实服务。
 
 
-首次运行时，Lucia 会创建 `$HOME/.lucia/config.toml`。也可以只初始化配置并退出：
+首次运行时，Lucia 会创建 `$HOME/.lucia/config.json`。也可以只初始化配置并退出：
 
 ```bash
 lucia --init
@@ -46,28 +46,25 @@ lucia --init
 
 ## 3. 配置真实模型
 
-编辑 `$HOME/.lucia/config.toml`：
+编辑 `$HOME/.lucia/config.json`：
 
-```toml
-[model]
-name = "default"
-provider = "open-ai"
-base_url = "https://api.openai.com/v1"
-model = "替换为账号可用的模型 ID"
-api_key_env = "OPENAI_API_KEY"
-openai_protocol = "responses"
-
-[agent]
-# 0 表示交互主会话不设置总 ReAct 步数上限。
-max_steps = 0
-max_tokens = 4096
-# 默认 short；可选 none、short、long。
-cache_retention = "short"
-# 默认 true；设为 false 时等待完整模型响应。
-stream = true
-
-[tui]
-sessions_dir = "projects"
+```json
+{
+  "model": {
+    "name": "default",
+    "provider": "open-ai",
+    "base_url": "https://api.openai.com/v1",
+    "model": "替换为账号可用的模型 ID",
+    "api_key_env": "OPENAI_API_KEY",
+    "openai_protocol": "responses"
+  },
+  "agent": {
+    "max_steps": 0,
+    "max_tokens": 4096,
+    "cache_retention": "short",
+    "stream": true
+  }
+}
 ```
 
 `api_key_env` 保存的是环境变量名。设置密钥后启动：

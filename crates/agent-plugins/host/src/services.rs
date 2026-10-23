@@ -513,7 +513,7 @@ impl PluginHostServices {
 
     /// 为单个插件注入受限 HTTP 端点。
     ///
-    /// `base_url` 与 `credential_headers` 来自应用配置（与 `[plugins.<id>]` 模型路由同一处），
+    /// `base_url` 与 `credential_headers` 来自应用配置（与 `plugins.<id>` 模型路由同一处），
     /// 凭证只保存在 Host 侧。插件 manifest 还必须声明 `[capabilities.http] allow_hosts`
     /// 且覆盖 `base_url` 的主机——两者不一致时请求会在能力层被拒绝，使 manifest 里写明的
     /// 授权边界始终是真实的。

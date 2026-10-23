@@ -5,24 +5,14 @@ use super::*;
 /// 验证空模型密钥触发演示模式，而非空明文密钥允许构建真实模型运行时。
 #[test]
 fn model_key_availability_rejects_empty_values() {
-    let without_key: AgentRootConfig = toml::from_str(
-        r#"
-            [model]
-            provider = "open-ai"
-            model = "test-model"
-            api_key = "   "
-        "#,
+    let without_key: AgentRootConfig = serde_json::from_str(
+        r#"{ "model": { "provider": "open-ai", "model": "test-model", "api_key": "   " } }"#,
     )
     .expect("解析无密钥测试配置");
     assert!(!configured_model_key_is_available(&without_key));
 
-    let with_key: AgentRootConfig = toml::from_str(
-        r#"
-            [model]
-            provider = "open-ai"
-            model = "test-model"
-            api_key = "test-key"
-        "#,
+    let with_key: AgentRootConfig = serde_json::from_str(
+        r#"{ "model": { "provider": "open-ai", "model": "test-model", "api_key": "test-key" } }"#,
     )
     .expect("解析有密钥测试配置");
     assert!(configured_model_key_is_available(&with_key));

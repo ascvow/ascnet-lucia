@@ -7,6 +7,7 @@ use agent_core::config::AgentRootConfig;
 use agent_core::ReasoningLevel;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
@@ -15,7 +16,6 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
-use toml_edit::{value, DocumentMut};
 
 /// 配置原子写入使用的进程内序号，避免连续切换复用同一临时文件名。
 static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -23,73 +23,24 @@ static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// 首次初始化写入的安全配置模板。
 ///
 /// 模板集中声明模型 URL、模型 ID 和密钥，并保留环境变量密钥的替代配置。
-const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Lucia TUI 配置
-# api_key 与 api_key_env 二选一；推荐使用环境变量，避免保存密钥明文。
-
-[model]
-name = "default"
-provider = "open-ai"
-base_url = "https://api.openai.com/v1"
-model = "gpt-5"
-api_key = ""
-# api_key_env = "OPENAI_API_KEY"
-# context_window = 200000
-openai_protocol = "responses"
-# 网关厂商决定提示缓存的路由方式：open-ai 与缺省的 open-ai-compatible 发送 prompt_cache_key，
-# open-ai-compatible 额外发送会话亲和 HTTP header；open-router 使用独立的亲和 header。
-# gateway = "open-ai-compatible"
-
-[agent]
-# 0 表示交互主会话不设置总 ReAct 步数上限。
-max_steps = 0
-# max_tokens 和 reasoning 缺省时从打包内置的 models.dev 快照读取。
-# max_tokens = 4096
-# reasoning = "medium"
-# 提示缓存默认使用 short；none 不发送显式控制，long 请求服务商的长期缓存。
-# cache_retention = "short"
-# 默认使用流式模型接口；设为 false 时等待完整响应。
-stream = true
-
-# 多上游配置：每个 [[models]] 注册一个可用 provider，TUI 内用 /model 随时切换。
-# default_model 指定启动默认；缺省取 [model] 或第一个 [[models]]。
-# name 在全部上游中必须唯一，协议支持 open-ai、open-ai-compatible、anthropic、
-# google、bedrock 以及注册了自定义工厂的协议 ID。
-# [[models]]
-# name = "deepseek"
-# provider = "open-ai-compatible"
-# base_url = "https://api.deepseek.com/v1"
-# model = "deepseek-chat"
-# api_key_env = "DEEPSEEK_API_KEY"
-#
-# [[models]]
-# name = "gemini"
-# provider = "google"
-# model = "gemini-2.5-pro"
-# api_key_env = "GEMINI_API_KEY"
-#
-# [[models]]
-# name = "bedrock"
-# provider = "bedrock"
-# model = "anthropic.claude-sonnet-4-5-20250929-v1:0"
-# aws_region = "us-east-1"
-# aws_access_key_id = "AKIA..."
-# aws_secret_access_key = "..."
-# default_model = "gemini"
-
-[tui]
-sessions_dir = "projects"
-# events_jsonl = "events.jsonl"
-# 权限插件“帮我审批”模式使用的独立审核模型；插件段配置了 model 时以插件段为准。
-review_model = "gpt-5.6-luna"
-
-# 插件配置：段名是插件 ID，键值由各插件自行解释。
-# 配置了 model 的插件使用自己的模型路由，未配置的沿用上面的 review_model。
-# 同名键会覆盖插件目录下 config.toml 里的默认值。
-# [plugins.permission]
-# model = "gpt-5.6-luna"
-# base_url = "https://ai.phrolova.uno"
-# api_key = "sk-..."          # 或改用 api_key_env = "REVIEW_API_KEY"
-# gateway = "open-ai-compatible"
+const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
+  "model": {
+    "name": "default",
+    "provider": "open-ai",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-5",
+    "api_key": "",
+    "openai_protocol": "responses"
+  },
+  "agent": {
+    "max_steps": 0,
+    "stream": true
+  },
+  "tui": {
+    "sessions_dir": "projects",
+    "review_model": "gpt-5.6-luna"
+  }
+}
 "#;
 
 /// 配置文件中由 TUI 消费的应用设置。
@@ -130,7 +81,7 @@ struct TuiConfigEnvelope {
     tui: TuiSettings,
 }
 
-/// TUI 从 `[model]` 读取的展示元数据，不参与 Core 模型网关配置。
+/// TUI 从 `model` 对象读取的展示元数据，不参与 Core 模型网关配置。
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct TuiModelSettings {
@@ -173,7 +124,7 @@ pub(crate) fn lucia_home_dir() -> Result<PathBuf> {
 /// 解析本次启动使用的配置文件路径。
 ///
 /// CLI 显式路径优先，其次读取 `LUCIA_CONFIG`，最后使用 Lucia 应用目录中的
-/// `config.toml`。
+/// `config.json`。
 pub(crate) fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
@@ -181,7 +132,7 @@ pub(crate) fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = env::var_os("LUCIA_CONFIG").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
-    Ok(lucia_home_dir()?.join("config.toml"))
+    Ok(lucia_home_dir()?.join("config.json"))
 }
 
 /// 创建默认配置文件，并拒绝覆盖已有文件。
@@ -217,8 +168,8 @@ pub(crate) fn initialize_config(path: &Path) -> Result<()> {
 pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
-    let config: TuiConfigEnvelope =
-        toml::from_str(&text).with_context(|| format!("解析 TUI 配置失败：{}", path.display()))?;
+    let config: TuiConfigEnvelope = serde_json::from_str(&text)
+        .with_context(|| format!("解析 TUI 配置失败：{}", path.display()))?;
     let mut settings = config.tui;
     settings.review_model = settings
         .review_model
@@ -244,18 +195,19 @@ pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
     Ok(settings)
 }
 
-/// 原子更新 `[agent].reasoning`，同时保留配置中的注释、顺序和其他用户字段。
+/// 原子更新 `agent.reasoning`，保留其他字段。
 ///
 /// 该写入使用目标目录内的 0600 临时文件并在同步后替换原文件。读取、解析、创建、同步或
 /// 重命名失败时返回错误，原配置和调用方当前运行参数都应保持不变。
 pub(crate) fn persist_reasoning_level(path: &Path, level: ReasoningLevel) -> Result<()> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
-    let mut document = text
-        .parse::<DocumentMut>()
+    let mut document: Value = serde_json::from_str(&text)
         .with_context(|| format!("解析配置文件失败：{}", path.display()))?;
-    document["agent"]["reasoning"] = value(reasoning_level_value(level));
-    atomic_write_config(path, document.to_string().as_bytes())
+    document["agent"]["reasoning"] = Value::String(reasoning_level_value(level).to_string());
+    let contents = serde_json::to_string_pretty(&document)
+        .with_context(|| format!("序列化配置文件失败：{}", path.display()))?;
+    atomic_write_config(path, contents.as_bytes())
 }
 
 /// 返回配置文件使用的稳定推理等级值。
@@ -352,7 +304,7 @@ mod tests {
     #[test]
     fn initializes_config_without_overwrite() {
         let root = temp_dir();
-        let path = root.join("config.toml");
+        let path = root.join("config.json");
         initialize_config(&path).expect("首次初始化应成功");
 
         let model_config = agent_core::config::AgentRootConfig::load(&path)
@@ -394,10 +346,10 @@ mod tests {
     fn loads_legacy_plugin_model_as_review_model() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("创建兼容配置测试目录");
-        let path = root.join("config.toml");
+        let path = root.join("config.json");
         fs::write(
             &path,
-            "[model]\nmodel = \"gpt-test\"\n[tui]\nplugin_model = \"legacy-review\"\n",
+            "{\"model\":{\"model\":\"gpt-test\"},\"tui\":{\"plugin_model\":\"legacy-review\"}}",
         )
         .expect("写入旧审核模型配置");
 
@@ -412,42 +364,46 @@ mod tests {
     fn loads_model_context_window_for_status_display() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("创建配置测试目录");
-        let path = root.join("config.toml");
+        let path = root.join("config.json");
         fs::write(
             &path,
-            "[model]\ncontext_window = 200000\n[tui]\nsessions_dir = \"sessions\"\n",
+            "{\"model\":{\"context_window\":200000},\"tui\":{\"sessions_dir\":\"sessions\"}}",
         )
         .expect("写入上下文窗口配置");
 
         let settings = load_tui_settings(&path).expect("读取上下文窗口配置");
         assert_eq!(settings.context_window, Some(200_000));
 
-        fs::write(&path, "[model]\ncontext_window = 0\n").expect("写入零窗口配置");
+        fs::write(&path, "{\"model\":{\"context_window\":0}}").expect("写入零窗口配置");
         let settings = load_tui_settings(&path).expect("读取零窗口配置");
         assert_eq!(settings.context_window, None);
         fs::remove_dir_all(root).expect("清理配置测试目录");
     }
 
-    /// 切换推理等级必须保留用户注释和其他字段，并能被 Core 在下一次启动时读取。
+    /// 切换推理等级必须保留其他字段，并能被 Core 在下一次启动时读取。
     #[test]
     fn persists_reasoning_level_without_reformatting_config() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("创建配置测试目录");
-        let path = root.join("config.toml");
+        let path = root.join("config.json");
         fs::write(
             &path,
-            "# 用户注释\n[model]\nprovider = \"open-ai\"\nmodel = \"gpt-test\"\n\n[agent]\nmax_steps = 7 # 保留行尾注释\n",
+            r#"{
+  "model": { "provider": "open-ai", "model": "gpt-test" },
+  "agent": { "max_steps": 7 }
+}"#,
         )
         .expect("写入推理配置");
 
         persist_reasoning_level(&path, ReasoningLevel::XHigh).expect("持久化推理等级");
 
         let text = fs::read_to_string(&path).expect("读取更新后的配置");
-        assert!(text.contains("# 用户注释"));
-        assert!(text.contains("max_steps = 7 # 保留行尾注释"));
-        assert!(text.contains("reasoning = \"x_high\""));
+        assert!(text.contains("\"max_steps\": 7"));
+        assert!(text.contains("\"reasoning\": \"x_high\""));
+        assert!(text.contains("\"model\": \"gpt-test\""));
         let config = agent_core::config::AgentRootConfig::load(&path).expect("Core 应读取新等级");
         assert_eq!(config.agent.reasoning, Some(ReasoningLevel::XHigh));
+        assert_eq!(config.agent.max_steps, Some(7));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -468,10 +424,10 @@ mod tests {
     fn loads_unique_model_metadata_by_model_id() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("创建配置测试目录");
-        let path = root.join("config.toml");
+        let path = root.join("config.json");
         fs::write(
             &path,
-            "[model]\nprovider = \"open-ai\"\nmodel = \"gpt-5.6-luna\"\n",
+            "{\"model\":{\"provider\":\"open-ai\",\"model\":\"gpt-5.6-luna\"}}",
         )
         .expect("写入模型配置");
 
@@ -492,7 +448,7 @@ mod tests {
     /// TUI 路径必须相对配置文件目录解析，而不是相对启动工作目录。
     #[test]
     fn resolves_paths_relative_to_config() {
-        let config = Path::new("/tmp/lucia/config.toml");
+        let config = Path::new("/tmp/lucia/config.json");
         assert_eq!(
             resolve_config_relative_path(config, Path::new("sessions")),
             PathBuf::from("/tmp/lucia/sessions")

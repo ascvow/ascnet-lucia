@@ -2,7 +2,7 @@
 //!
 //! 配置有两个来源，按优先级从低到高合并：
 //! 1. 插件目录下与 `plugin.toml` 同级的 `config.toml`，随 bundle 分发，负责默认值；
-//! 2. 主配置 `[plugins.<插件 ID>]` 段，属于用户自己的配置，覆盖前者。
+//! 2. 主配置 `plugins.<插件 ID>` 段，属于用户自己的配置，覆盖前者。
 //!
 //! 解析全部发生在 Host 可信侧。模型路由字段由 Host 消费并注册成该插件专属的 provider，
 //! 密钥不会进入 Guest；其余键值作为激活元数据交给插件自己读取。
@@ -119,33 +119,33 @@ impl PluginHttpSettings {
     }
 }
 
-/// 主配置中 `[plugins]` 段的原始内容，键为插件 ID。
-#[derive(Debug, Default, Deserialize)]
-struct PluginConfigEnvelope {
-    #[serde(default)]
-    plugins: HashMap<String, Value>,
-}
-
-/// 从主配置文件读取 `[plugins]` 段；缺失时返回空映射。
+/// 从主配置文件读取 `plugins` 段；缺失时返回空映射。
+///
+/// 主配置为 JSON，`plugins.<插件 ID>` 是一个对象；解析后转成 `toml::Value`，
+/// 与插件目录的 TOML 默认配置在合并阶段保持同一表示。
 ///
 /// # Errors
 ///
-/// 文件不可读或 TOML 不合法时返回错误；`[plugins.<id>]` 不是表时同样报错，避免把
-/// 标量误当成插件配置静默丢弃。
+/// 文件不可读或 JSON 不合法时返回错误；`plugins.<id>` 不是对象、或含 TOML 不支持的
+/// 值（如 null）时同样报错，避免把标量误当成插件配置静默丢弃。
 pub(crate) fn load_main_plugin_configs(path: &Path) -> Result<HashMap<String, Value>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
-    let envelope: PluginConfigEnvelope = toml::from_str(&text)
-        .with_context(|| format!("解析配置文件的 [plugins] 段失败：{}", path.display()))?;
-    for (plugin_id, value) in &envelope.plugins {
-        if !value.is_table() {
-            return Err(anyhow!(
-                "配置项 [plugins.{plugin_id}] 必须是表，实际是 {}",
-                value.type_str()
-            ));
+    let root: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("解析配置文件失败：{}", path.display()))?;
+    let Some(plugins) = root.get("plugins").and_then(serde_json::Value::as_object) else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    for (plugin_id, value) in plugins {
+        if !value.is_object() {
+            return Err(anyhow!("配置项 plugins.{plugin_id} 必须是对象"));
         }
+        let converted = toml::Value::deserialize(value.clone())
+            .map_err(|error| anyhow!("配置项 plugins.{plugin_id} 含不支持的值：{error}"))?;
+        out.insert(plugin_id.clone(), converted);
     }
-    Ok(envelope.plugins)
+    Ok(out)
 }
 
 /// 读取插件目录中随 bundle 分发的 `config.toml`；文件不存在时返回空映射。

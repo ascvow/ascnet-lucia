@@ -10,7 +10,7 @@ pub(crate) struct Args {
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
 
-    /// 初始化配置文件后退出；默认写入 `$LUCIA_HOME/config.toml`。
+    /// 初始化配置文件后退出；默认写入 `$LUCIA_HOME/config.json`。
     #[arg(long = "init", alias = "init-config")]
     pub(crate) init: bool,
 
@@ -18,7 +18,7 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) demo: bool,
 
-    /// TOML 配置文件路径；默认读取 `LUCIA_CONFIG` 或 `$LUCIA_HOME/config.toml`。
+    /// JSON 配置文件路径；默认读取 `LUCIA_CONFIG` 或 `$LUCIA_HOME/config.json`。
     #[arg(long, global = true)]
     pub(crate) config: Option<PathBuf>,
 

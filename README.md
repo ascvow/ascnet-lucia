@@ -135,7 +135,7 @@ The outputs are written to `target/core-tui/release/lucia`, `target/plugin-tui/r
 
 ## Configure a Model
 
-On first launch, Lucia creates `$HOME/.lucia/config.toml`. You can also initialize the configuration and exit:
+On first launch, Lucia creates `$HOME/.lucia/config.json`. You can also initialize the configuration and exit:
 
 ```bash
 lucia --init
@@ -143,23 +143,26 @@ lucia --init
 
 A minimal configuration looks like this:
 
-```toml
-[model]
-name = "default"
-provider = "open-ai"
-base_url = "https://api.openai.com/v1"
-model = "replace-with-an-available-model-id"
-api_key_env = "OPENAI_API_KEY"
-openai_protocol = "responses"
-
-[agent]
-max_steps = 0
-max_tokens = 4096
-cache_retention = "short"
-stream = true
-
-[tui]
-sessions_dir = "projects"
+```json
+{
+  "model": {
+    "name": "default",
+    "provider": "open-ai",
+    "base_url": "https://api.openai.com/v1",
+    "model": "replace-with-an-available-model-id",
+    "api_key_env": "OPENAI_API_KEY",
+    "openai_protocol": "responses"
+  },
+  "agent": {
+    "max_steps": 0,
+    "max_tokens": 4096,
+    "cache_retention": "short",
+    "stream": true
+  },
+  "tui": {
+    "sessions_dir": "projects"
+  }
+}
 ```
 
 `api_key_env` stores the name of an environment variable, not the key itself. Set the variable before starting Lucia:
@@ -169,7 +172,7 @@ export OPENAI_API_KEY="your-api-key"
 lucia
 ```
 
-The `provider` field also supports `open-ai-compatible` and `anthropic`. See [TUI configuration and sessions](docs/guide/tui-configuration.md) for local model services, custom endpoints, and the full configuration reference.
+The `provider` field also supports `open-ai-compatible`, `anthropic`, `google` (Generative AI), and `bedrock` (Converse). See [TUI configuration and sessions](docs/guide/tui-configuration.md) for local model services, custom endpoints, multi-upstream configuration, and the full configuration reference.
 
 ## Security Model
 

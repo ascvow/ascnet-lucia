@@ -18,33 +18,33 @@ cargo run -p lucia -- --demo
 
 ## 使用 OpenAI Responses
 
-先确认 `examples/config/openai-responses.toml` 中的 `model` 是账号可用的模型 ID，再执行：
+先确认 `examples/config/openai-responses.json` 中的 `model` 是账号可用的模型 ID，再执行：
 
 ```bash
 export OPENAI_API_KEY="你的密钥"
 cargo run -p agent-basic-cli -- \
-  --config examples/config/openai-responses.toml \
+  --config examples/config/openai-responses.json \
   "用三句话介绍 Lucia"
 ```
 
 ## 使用 Anthropic Messages
 
-修改 `examples/config/anthropic.toml` 中的模型 ID：
+修改 `examples/config/anthropic.json` 中的模型 ID：
 
 ```bash
 export ANTHROPIC_API_KEY="你的密钥"
 cargo run -p agent-basic-cli -- \
-  --config examples/config/anthropic.toml \
+  --config examples/config/anthropic.json \
   "解释当前任务"
 ```
 
 ## 使用本地 OpenAI-compatible 服务
 
-`examples/config/openai-compatible.toml` 默认指向 `http://localhost:11434/v1`，适用于提供 OpenAI Chat Completions 兼容接口的本地服务：
+`examples/config/openai-compatible.json` 默认指向 `http://localhost:11434/v1`，适用于提供 OpenAI Chat Completions 兼容接口的本地服务：
 
 ```bash
 cargo run -p agent-basic-cli -- \
-  --config examples/config/openai-compatible.toml \
+  --config examples/config/openai-compatible.json \
   "你好"
 ```
 
@@ -62,10 +62,10 @@ LUCIA_HOME="$PWD/.lucia-dev" lucia --demo
 只覆盖配置文件：
 
 ```bash
-lucia --config ./lucia.toml
+lucia --config ./lucia.json
 ```
 
-配置路径选择顺序是 `--config`、`LUCIA_CONFIG`、`$LUCIA_HOME/config.toml`。
+配置路径选择顺序是 `--config`、`LUCIA_CONFIG`、`$LUCIA_HOME/config.json`。
 
 ## 恢复和查看会话
 
@@ -92,14 +92,17 @@ lucia --events-jsonl ./runs/events.jsonl
 
 也可以写入配置：
 
-```toml
-[tui]
-events_jsonl = "events.jsonl"
+```json
+{
+  "tui": {
+    "events_jsonl": "events.jsonl"
+  }
+}
 ```
 
 相对路径以配置文件所在目录为基准。事件包含模型请求、工具调用和运行状态，可能带有用户输入或工具结果，分享前应先检查内容。
 
-## 在 Rust 中从 TOML 构造 Agent
+## 在 Rust 中从 JSON 构造 Agent
 
 应用的 `Cargo.toml`：
 
@@ -118,7 +121,7 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = AgentRootConfig::load("lucia.toml")?;
+    let config = AgentRootConfig::load("lucia.json")?;
     let agent = config.build_agent()?;
     let result = agent.run("列出当前任务").await?;
     println!("{}", result.final_text);

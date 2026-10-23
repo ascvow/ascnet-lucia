@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 /// 返回仓库内 OpenAI Responses 示例配置路径。
 fn openai_responses_config_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/config/openai-responses.toml")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/config/openai-responses.json")
 }
 
 /// 使用示例配置真实调用 OpenAI Responses，验证 core 对话路径可解析服务商响应。
@@ -31,7 +31,7 @@ async fn openai_responses_config_runs_core_agent() -> Result<(), Box<dyn std::er
 
 /// 使用显式指定的配置验证默认短期缓存在真实 Agent 续聊中的命中。
 ///
-/// `LUCIA_CACHE_TEST_CONFIG` 指向含模型凭据的 TOML；只发送合成文本，不加载插件或工作区。
+/// `LUCIA_CACHE_TEST_CONFIG` 指向含模型凭据的 JSON；只发送合成文本，不加载插件或工作区。
 /// 最多发送四次付费请求，每次限制输出为 256 token，并等待服务端缓存建立。
 /// 配置、网络、响应失败或服务端始终未报告缓存读取时返回错误；日志仅输出用量。
 #[tokio::test]

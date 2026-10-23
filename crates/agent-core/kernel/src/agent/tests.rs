@@ -2309,16 +2309,13 @@ async fn model_streaming_defaults_on_and_can_be_disabled() {
         .any(|event| event.kind == AgentEventKind::ModelTextDelta));
 }
 
-/// TOML 未声明 stream 时保持默认流式，显式 false 时切换为非流式。
+/// 未声明 stream 时保持默认流式，显式 false 时切换为非流式。
 #[test]
 fn agent_config_controls_streaming_mode() {
-    let default_config: crate::AgentRootConfig = toml::from_str(
-        r#"
-            [model]
-            provider = "open-ai"
-            model = "test-model"
-            api_key = "test-key"
-        "#,
+    let default_config: crate::AgentRootConfig = serde_json::from_str(
+        r#"{
+            "model": { "provider": "open-ai", "model": "test-model", "api_key": "test-key" }
+        }"#,
     )
     .expect("解析默认流式配置");
     assert!(default_config.agent_options().stream);
@@ -2329,16 +2326,11 @@ fn agent_config_controls_streaming_mode() {
             .stream
     );
 
-    let non_streaming_config: crate::AgentRootConfig = toml::from_str(
-        r#"
-            [model]
-            provider = "open-ai"
-            model = "test-model"
-            api_key = "test-key"
-
-            [agent]
-            stream = false
-        "#,
+    let non_streaming_config: crate::AgentRootConfig = serde_json::from_str(
+        r#"{
+            "model": { "provider": "open-ai", "model": "test-model", "api_key": "test-key" },
+            "agent": { "stream": false }
+        }"#,
     )
     .expect("解析非流式配置");
     assert!(!non_streaming_config.agent_options().stream);
@@ -2350,16 +2342,13 @@ fn agent_config_controls_streaming_mode() {
     );
 }
 
-/// TOML 缺省使用短期缓存，并允许显式选择关闭或长期保留策略。
+/// 缺省使用短期缓存，并允许显式选择关闭或长期保留策略。
 #[test]
 fn agent_config_controls_prompt_cache_retention() {
-    let default_config: crate::AgentRootConfig = toml::from_str(
-        r#"
-            [model]
-            provider = "open-ai"
-            model = "test-model"
-            api_key = "test-key"
-        "#,
+    let default_config: crate::AgentRootConfig = serde_json::from_str(
+        r#"{
+            "model": { "provider": "open-ai", "model": "test-model", "api_key": "test-key" }
+        }"#,
     )
     .expect("解析默认缓存配置");
     assert_eq!(
@@ -2367,16 +2356,11 @@ fn agent_config_controls_prompt_cache_retention() {
         PromptCacheRetention::Short
     );
 
-    let configured: crate::AgentRootConfig = toml::from_str(
-        r#"
-            [model]
-            provider = "anthropic"
-            model = "claude-test"
-            api_key = "test-key"
-
-            [agent]
-            cache_retention = "long"
-        "#,
+    let configured: crate::AgentRootConfig = serde_json::from_str(
+        r#"{
+            "model": { "provider": "anthropic", "model": "claude-test", "api_key": "test-key" },
+            "agent": { "cache_retention": "long" }
+        }"#,
     )
     .expect("解析长期缓存配置");
     assert_eq!(

@@ -146,7 +146,7 @@ bun run build:plugin:official
 
 ## 配置模型
 
-首次启动会创建 `$HOME/.lucia/config.toml`。也可以先初始化配置后退出：
+首次启动会创建 `$HOME/.lucia/config.json`。也可以先初始化配置后退出：
 
 ```bash
 lucia --init
@@ -154,22 +154,25 @@ lucia --init
 
 下面是一份最小配置：
 
-```toml
-[model]
-name = "default"
-provider = "open-ai"
-base_url = "https://api.openai.com/v1"
-model = "替换为账号可用的模型 ID"
-api_key_env = "OPENAI_API_KEY"
-openai_protocol = "responses"
-
-[agent]
-max_steps = 0
-max_tokens = 4096
-stream = true
-
-[tui]
-sessions_dir = "projects"
+```json
+{
+  "model": {
+    "name": "default",
+    "provider": "open-ai",
+    "base_url": "https://api.openai.com/v1",
+    "model": "替换为账号可用的模型 ID",
+    "api_key_env": "OPENAI_API_KEY",
+    "openai_protocol": "responses"
+  },
+  "agent": {
+    "max_steps": 0,
+    "max_tokens": 4096,
+    "stream": true
+  },
+  "tui": {
+    "sessions_dir": "projects"
+  }
+}
 ```
 
 `api_key_env` 保存的是环境变量名，不是密钥本身。设置环境变量后启动：
@@ -179,7 +182,7 @@ export OPENAI_API_KEY="你的密钥"
 lucia
 ```
 
-`provider` 还支持 `open-ai-compatible` 和 `anthropic`。本地模型服务、其他接口地址及完整配置项见 [TUI 配置与会话](docs/guide/tui-configuration.md)。
+`provider` 还支持 `open-ai-compatible`、`anthropic`、`google`（Generative AI）与 `bedrock`（Converse）。本地模型服务、其他接口地址、多上游配置及完整配置项见 [TUI 配置与会话](docs/guide/tui-configuration.md)。
 
 ## 安全模型
 

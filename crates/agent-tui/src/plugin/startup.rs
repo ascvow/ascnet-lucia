@@ -103,7 +103,7 @@ fn plugin_runtime_limits(policy: &agent_tool::ExecutionPolicy) -> RuntimeLimits 
 
 /// 返回插件专属模型路由在网关中注册使用的 provider 名称。
 ///
-/// 加前缀是为了与用户配置的服务商名称隔离，避免插件 ID 与 `[model].name` 撞名后互相
+/// 加前缀是为了与用户配置的服务商名称隔离，避免插件 ID 与 `model.name` 撞名后互相
 /// 覆盖路由。
 #[cfg(feature = "plugins")]
 fn plugin_provider_name(plugin_id: &str) -> String {

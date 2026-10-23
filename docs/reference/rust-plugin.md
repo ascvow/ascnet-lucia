@@ -208,7 +208,7 @@ Guest 不能提交模型、provider options、工具权限或 owner。`profile` 
 
 `resolve_plugin_load_order(manifests)` 在实例化前检查必选依赖、SemVer 与循环。`resolve_plugin_capabilities(manifests, selections)` 解析 multi/exclusive owner；多个 exclusive provider 没有显式选择时失败。
 
-`load_plugin_runtime_config(config_path)` 只读取应用 TOML 中的插件路径和 `capability_selection`。相对 manifest 路径以配置文件目录为基准。
+`load_plugin_runtime_config(config_path)` 只读取应用 JSON 中的插件路径和 `capability_selection`。相对 manifest 路径以配置文件目录为基准。
 
 ### WASM 加载函数
 

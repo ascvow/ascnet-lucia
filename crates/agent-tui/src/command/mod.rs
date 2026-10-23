@@ -664,7 +664,7 @@ impl App {
         if self.model_upstreams.is_empty() {
             self.messages.push(Msg::new(
                 MsgKind::Info,
-                "配置中没有可切换的上游；在 config.toml 添加 [[models]] 后即可使用 /model。",
+                "配置中没有可切换的上游；在 config.json 添加 models 数组后即可使用 /model。",
             ));
             return;
         }

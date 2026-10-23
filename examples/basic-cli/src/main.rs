@@ -27,8 +27,8 @@ struct Args {
     #[arg(long)]
     demo: bool,
 
-    /// Path to ascnet-lucia TOML config for real OpenAI / Anthropic calls.
-    /// 真实 OpenAI / Anthropic 调用所用的 ascnet-lucia TOML 配置路径。
+    /// Path to ascnet-lucia JSON config for real OpenAI / Anthropic calls.
+    /// 真实 OpenAI / Anthropic 调用所用的 ascnet-lucia JSON 配置路径。
     #[arg(long)]
     config: Option<PathBuf>,
 

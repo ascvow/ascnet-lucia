@@ -575,7 +575,7 @@ fn reasoning_shortcut_cycles_model_supported_levels() {
 #[test]
 fn reasoning_change_is_transactional_when_config_write_fails() {
     let missing_config = std::env::temp_dir().join(format!(
-        "lucia-missing-config-{}.toml",
+        "lucia-missing-config-{}.json",
         SessionId::generate()
     ));
     let (tx, _rx) = mpsc::unbounded_channel();

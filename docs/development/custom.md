@@ -20,7 +20,7 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = AgentRootConfig::load("lucia.toml")?;
+    let config = AgentRootConfig::load("lucia.json")?;
     let agent = config.build_agent()?;
     let run = agent.run("分析当前项目").await?;
     println!("{}", run.final_text);
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-这个路径适合配置文件由应用维护的场景。`build_agent` 只构造进程内对象，不会保存 TOML，也不会创建 Session 文件。
+这个路径适合配置文件由应用维护的场景。`build_agent` 只构造进程内对象，不会保存 JSON，也不会创建 Session 文件。
 
 ## 配置函数
 
@@ -38,11 +38,11 @@ async fn main() -> Result<()> {
 pub fn load(path: impl AsRef<Path>) -> Result<AgentRootConfig>
 ```
 
-从指定 TOML 文件读取模型与 Agent 配置。
+从指定 JSON 文件读取模型与 Agent 配置。
 
 - `path`：文件路径。Core 原样交给文件系统，不应用 TUI 的 `LUCIA_CONFIG` 或 `$LUCIA_HOME` 规则。
 - 返回值：成功时返回反序列化后的 `AgentRootConfig`，包含 `model` 和 `agent` 两部分。
-- 错误：文件不可读、TOML 语法错误或字段类型不匹配时返回带路径上下文的错误。
+- 错误：文件不可读、JSON 语法错误或字段类型不匹配时返回带路径上下文的错误。
 - 副作用：只读文件，不连接模型、不读取 `api_key_env` 指向的变量。
 
 ### `AgentRootConfig::agent_model_config`
@@ -51,7 +51,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<AgentRootConfig>
 pub fn agent_model_config(&self) -> Result<AgentModelConfig>
 ```
 
-把 TOML 配置转换为运行时模型配置。
+把 JSON 配置转换为运行时模型配置。
 
 - 参数：只使用 `self.model` 和与模型请求有关的 `self.agent` 字段。
 - 返回值：包含 provider、model、tool choice、token、温度、推理等级、提示缓存策略和 provider options。
@@ -72,7 +72,7 @@ pub fn build_agent(&self) -> Result<Agent>
 
 ## 编程式模型配置
 
-不使用 TOML 时，直接构造 `ModelProviderConfig`：
+不使用配置文件时，直接构造 `ModelProviderConfig`：
 
 ```rust
 use agent_core::{Agent, ModelProviderConfig};

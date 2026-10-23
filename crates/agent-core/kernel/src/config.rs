@@ -1,5 +1,5 @@
-//! TOML configuration helpers.
-//! TOML 配置辅助工具。
+//! JSON configuration helpers.
+//! JSON 配置辅助工具。
 
 use crate::{
     agent::{Agent, AgentModelConfig, AgentOptions},
@@ -35,13 +35,13 @@ pub struct AgentRootConfig {
 }
 
 impl AgentRootConfig {
-    /// Load config from TOML.
-    /// 从 TOML 加载配置。
+    /// Load config from JSON.
+    /// 从 JSON 加载配置。
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config: {}", path.display()))?;
-        let config: Self = toml::from_str(&text)
+        let config: Self = serde_json::from_str(&text)
             .with_context(|| format!("failed to parse config: {}", path.display()))?;
         config.validate()?;
         Ok(config)
@@ -64,7 +64,7 @@ impl AgentRootConfig {
     pub fn default_upstream(&self) -> Result<&ModelConfig> {
         let upstreams = self.upstreams();
         if upstreams.is_empty() {
-            anyhow::bail!("config requires a `[model]` section or at least one `[[models]]` entry");
+            anyhow::bail!("config requires a `model` object or at least one `models` entry");
         }
         for (index, config) in upstreams.iter().enumerate() {
             if upstreams[..index]
@@ -183,8 +183,8 @@ impl AgentRootConfig {
     }
 }
 
-/// Model provider config from TOML.
-/// TOML 中的模型服务商配置。
+/// Model provider config from JSON.
+/// JSON 中的模型服务商配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Logical provider name.
@@ -281,8 +281,8 @@ fn default_provider_name() -> String {
     "default".to_string()
 }
 
-/// Agent-level options from TOML.
-/// TOML 中的 agent 级选项。
+/// Agent-level options from JSON.
+/// JSON 中的 agent 级选项。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentConfig {
     /// 单条用户指令允许连续执行的最大 ReAct 步数；`0` 表示不设置总步数上限。
@@ -310,23 +310,24 @@ pub struct AgentConfig {
 mod tests {
     use super::*;
 
-    /// 解析内联 TOML 配置，供多上游用例复用。
+    /// 解析内联 JSON 配置，供多上游用例复用。
     fn parse(text: &str) -> Result<AgentRootConfig> {
-        let config: AgentRootConfig = toml::from_str(text)?;
+        let config: AgentRootConfig = serde_json::from_str(text)?;
         config.validate()?;
         Ok(config)
     }
 
-    /// 单 `[model]` 段必须保持向后兼容，默认上游取该段。
+    /// 单 `model` 对象必须保持向后兼容，默认上游取该对象。
     #[test]
     fn single_model_section_stays_compatible() {
         let config = parse(
-            r#"
-[model]
-provider = "anthropic"
-model = "claude-sonnet-4-5"
-api_key = "test-anthropic-key"
-"#,
+            r#"{
+  "model": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-5",
+    "api_key": "test-anthropic-key"
+  }
+}"#,
         )
         .expect("单上游配置应可解析");
         assert_eq!(config.upstreams().len(), 1);
@@ -340,22 +341,13 @@ api_key = "test-anthropic-key"
     #[test]
     fn registers_all_upstreams_and_honors_default() {
         let config = parse(
-            r#"
-# default_model 属于根表，必须写在任何 [[models]] 之前。
-default_model = "gemini"
-
-[[models]]
-name = "openai"
-provider = "open-ai"
-model = "gpt-5"
-api_key = "test-openai-key"
-
-[[models]]
-name = "gemini"
-provider = "google"
-model = "gemini-2.5-pro"
-api_key = "test-gemini-key"
-"#,
+            r#"{
+  "default_model": "gemini",
+  "models": [
+    { "name": "openai", "provider": "open-ai", "model": "gpt-5", "api_key": "test-openai-key" },
+    { "name": "gemini", "provider": "google", "model": "gemini-2.5-pro", "api_key": "test-gemini-key" }
+  ]
+}"#,
         )
         .expect("多上游配置应可解析");
         let gateway = config.build_gateway().expect("网关应可构建");
@@ -372,19 +364,12 @@ api_key = "test-gemini-key"
     #[test]
     fn falls_back_to_first_upstream() {
         let config = parse(
-            r#"
-[[models]]
-name = "first"
-provider = "open-ai"
-model = "gpt-5"
-api_key = "test-openai-key"
-
-[[models]]
-name = "second"
-provider = "anthropic"
-model = "claude"
-api_key = "test-anthropic-key"
-"#,
+            r#"{
+  "models": [
+    { "name": "first", "provider": "open-ai", "model": "gpt-5", "api_key": "test-openai-key" },
+    { "name": "second", "provider": "anthropic", "model": "claude", "api_key": "test-anthropic-key" }
+  ]
+}"#,
         )
         .expect("配置应可解析");
         assert_eq!(
@@ -397,32 +382,22 @@ api_key = "test-anthropic-key"
     #[test]
     fn rejects_duplicated_names_and_unknown_default() {
         let duplicated = parse(
-            r#"
-[[models]]
-name = "same"
-provider = "open-ai"
-model = "a"
-api_key = "a"
-
-[[models]]
-name = "same"
-provider = "anthropic"
-model = "b"
-api_key = "b"
-"#,
+            r#"{
+  "models": [
+    { "name": "same", "provider": "open-ai", "model": "a", "api_key": "a" },
+    { "name": "same", "provider": "anthropic", "model": "b", "api_key": "b" }
+  ]
+}"#,
         );
         assert!(duplicated.is_err());
 
         let unknown_default = parse(
-            r#"
-default_model = "missing"
-
-[[models]]
-name = "a"
-provider = "open-ai"
-model = "a"
-api_key = "a"
-"#,
+            r#"{
+  "default_model": "missing",
+  "models": [
+    { "name": "a", "provider": "open-ai", "model": "a", "api_key": "a" }
+  ]
+}"#,
         );
         assert!(unknown_default.is_err());
     }

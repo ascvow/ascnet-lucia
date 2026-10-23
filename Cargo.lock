@@ -64,7 +64,6 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
- "toml",
  "tracing",
  "uuid",
 ]
@@ -1713,7 +1712,6 @@ dependencies = [
  "sha2",
  "tokio",
  "toml",
- "toml_edit",
  "tui-markdown",
  "unicode-width 0.2.0",
 ]
@@ -2909,7 +2907,6 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
- "toml_writer",
  "winnow 1.0.3",
 ]
 

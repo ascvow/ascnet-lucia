@@ -25,8 +25,11 @@ pub const TOOL_POLICY_CAPABILITY: &str = "agent.tool-policy";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PluginListConfig {
     /// 按加载顺序排列的插件 manifest 条目。
+    ///
+    /// 主配置的 `plugins` 既可以是 manifest 数组，也可以是按插件 ID 组织的插件配置对象；
+    /// 对象形态只承载插件自身设置，不贡献 manifest 路径。
     #[serde(default)]
-    plugins: Vec<PluginConfigEntry>,
+    plugins: PluginsSection,
 
     /// 独占能力 ID 到插件 ID 的显式选择。
     #[serde(default)]
@@ -37,6 +40,33 @@ struct PluginListConfig {
     disabled_plugins: Vec<String>,
 }
 
+/// 主配置 `plugins` 字段的两种合法形态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PluginsSection {
+    /// 数组形态：`[{ "manifest": "plugins/demo/plugin.toml" }]`。
+    Entries(Vec<PluginConfigEntry>),
+
+    /// 对象形态：键为插件 ID，值为该插件的设置，由应用层消费。
+    Settings(HashMap<String, serde_json::Value>),
+}
+
+impl Default for PluginsSection {
+    fn default() -> Self {
+        Self::Entries(Vec::new())
+    }
+}
+
+impl PluginsSection {
+    /// 返回数组形态声明的 manifest 条目；对象形态没有 manifest 条目。
+    fn manifest_entries(&self) -> &[PluginConfigEntry] {
+        match self {
+            Self::Entries(entries) => entries,
+            Self::Settings(_) => &[],
+        }
+    }
+}
+
 /// 应用配置文件中的单个插件 manifest 条目。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PluginConfigEntry {
@@ -44,7 +74,7 @@ struct PluginConfigEntry {
     manifest: String,
 }
 
-/// 从应用 TOML 配置中读取插件路径，并相对配置文件目录完成解析。
+/// 从应用 JSON 配置中读取插件路径，并相对配置文件目录完成解析。
 ///
 /// 该函数只反序列化 `plugins` 字段，因此模型和 Agent 配置仍由调用方交给 core 处理。
 pub fn load_plugin_manifest_paths(config_path: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
@@ -62,7 +92,7 @@ pub struct PluginRuntimeConfig {
     pub disabled_plugins: Vec<String>,
 }
 
-/// 从应用 TOML 配置中读取插件路径和独占能力选择。
+/// 从应用 JSON 配置中读取插件路径和独占能力选择。
 pub fn load_plugin_runtime_config(config_path: impl AsRef<Path>) -> Result<PluginRuntimeConfig> {
     let config_path = config_path.as_ref();
     let text = fs::read_to_string(config_path)
@@ -72,14 +102,15 @@ pub fn load_plugin_runtime_config(config_path: impl AsRef<Path>) -> Result<Plugi
 
 /// 解析应用配置文本中的插件运行时配置，供文件加载入口和单元测试复用。
 fn parse_plugin_runtime_config(text: &str, config_path: &Path) -> Result<PluginRuntimeConfig> {
-    let config: PluginListConfig = toml::from_str(text)
+    let config: PluginListConfig = serde_json::from_str(text)
         .with_context(|| format!("failed to parse config: {}", config_path.display()))?;
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let manifest_paths = config
         .plugins
-        .into_iter()
+        .manifest_entries()
+        .iter()
         .map(|plugin| {
-            let path = PathBuf::from(plugin.manifest);
+            let path = PathBuf::from(&plugin.manifest);
             if path.is_absolute() {
                 path
             } else {
@@ -101,19 +132,15 @@ mod tests {
     /// 验证插件宿主只读取插件字段，并按应用配置目录解析相对路径。
     #[test]
     fn plugin_paths_are_loaded_independently_from_core_config() {
-        let config = r#"
-[model]
-provider = "open-ai"
-model = "test"
+        let config = r#"{
+  "model": { "provider": "open-ai", "model": "test" },
+  "plugins": [
+    { "manifest": "plugins/demo/plugin.toml" },
+    { "manifest": "/opt/lucia/plugin.toml" }
+  ]
+}"#;
 
-[[plugins]]
-manifest = "plugins/demo/plugin.toml"
-
-[[plugins]]
-manifest = "/opt/lucia/plugin.toml"
-"#;
-
-        let paths = parse_plugin_runtime_config(config, Path::new("/tmp/lucia/config.toml"))
+        let paths = parse_plugin_runtime_config(config, Path::new("/tmp/lucia/config.json"))
             .expect("插件配置应可独立解析")
             .manifest_paths;
 
@@ -269,16 +296,16 @@ manifest = "/opt/lucia/plugin.toml"
     #[test]
     fn plugin_runtime_config_includes_capability_selection() {
         let config = parse_plugin_runtime_config(
-            r#"
-                disabled_plugins = ["teammate"]
-
-                [[plugins]]
-                manifest = "plugins/context/plugin.toml"
-
-                [capability_selection]
-                "agent.context-loader" = "context-summary"
-            "#,
-            Path::new("/tmp/lucia/config.toml"),
+            r#"{
+  "disabled_plugins": ["teammate"],
+  "plugins": [
+    { "manifest": "plugins/context/plugin.toml" }
+  ],
+  "capability_selection": {
+    "agent.context-loader": "context-summary"
+  }
+}"#,
+            Path::new("/tmp/lucia/config.json"),
         )
         .expect("插件运行时配置应可解析");
 
@@ -294,6 +321,22 @@ manifest = "/opt/lucia/plugin.toml"
             Some("context-summary")
         );
         assert_eq!(config.disabled_plugins, vec!["teammate".to_string()]);
+    }
+
+    /// `plugins` 为按插件 ID 组织的设置对象时不得阻断启动，也不产生 manifest 路径。
+    #[test]
+    fn plugin_settings_object_contributes_no_manifests() {
+        let config = parse_plugin_runtime_config(
+            r#"{
+  "plugins": {
+    "permission": { "model": "gpt-5.6-luna" }
+  }
+}"#,
+            Path::new("/tmp/lucia/config.json"),
+        )
+        .expect("插件设置对象应可解析");
+
+        assert!(config.manifest_paths.is_empty());
     }
 
     /// Agent Runtime 权限应从嵌套 capability 解析，并保留明确的 profile allowlist。

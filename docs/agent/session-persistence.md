@@ -116,7 +116,7 @@ async fn persist_and_resume(agent: &Agent) -> Result<()> {
 
 `lucia` TUI 默认把项目会话根目录设为 `$LUCIA_HOME/projects`，未设置 `LUCIA_HOME` 时
 使用 `$HOME/.lucia/projects`。启动目录经过规范化并映射为稳定 `project-id`，实际存储
-目录为 `<会话根目录>/<project-id>/sessions`。配置文件 `[tui]` 与 `--sessions-dir <目录>`
+目录为 `<会话根目录>/<project-id>/sessions`。配置文件 `tui.sessions_dir` 与 `--sessions-dir <目录>`
 覆盖的是根目录，而不是绕过项目隔离。完整启动规则见 [TUI 配置与会话](/guide/tui-configuration)。
 
 普通启动只创建内存 Draft。首次普通消息到达后，TUI 先通过 CAS 保存包含用户输入的

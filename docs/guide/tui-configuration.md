@@ -10,51 +10,54 @@
 lucia
 ```
 
-首次启动会自动创建默认配置。默认配置路径是 `$LUCIA_HOME/config.toml`，未设置 `LUCIA_HOME` 时使用 `$HOME/.lucia/config.toml`。插件版只加载插件管理器中已启用的插件，以及配置或命令行显式指定的 manifest。未检测到模型密钥时，TUI 会进入本地演示模式，并在主事件区显示配置提示。
+首次启动会自动创建默认配置。默认配置路径是 `$LUCIA_HOME/config.json`，未设置 `LUCIA_HOME` 时使用 `$HOME/.lucia/config.json`。插件版只加载插件管理器中已启用的插件，以及配置或命令行显式指定的 manifest。未检测到模型密钥时，TUI 会进入本地演示模式，并在主事件区显示配置提示。
 
 模型服务完全由配置文件决定：
 
-```toml
-[model]
-name = "default"
-provider = "open-ai"
-base_url = "https://api.openai.com/v1"
-model = "gpt-5"
-api_key = "sk-..."
-# models.dev 中使用其他服务商 ID 的兼容网关可显式指定：
-# models_dev_provider = "openrouter"
-# context_window = 200000
-openai_protocol = "responses"
+```json
+{
+  "model": {
+    "name": "default",
+    "provider": "open-ai",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-5",
+    "api_key": "sk-...",
+    "openai_protocol": "responses"
+  }
+}
 ```
 
 ### 多上游配置与模型切换
 
-除单 `[model]` 段外，可以用 `[[models]]` 数组配置任意数量的上游，并混用协议；`default_model` 指定启动默认（缺省取 `[model]` 或第一个 `[[models]]`）。`name` 在全部上游中必须唯一。
+除单 `model` 对象外，可以用 `models` 数组配置任意数量的上游，并混用协议；`default_model` 指定启动默认（缺省取 `model` 或 `models` 第一个元素）。`name` 在全部上游中必须唯一。
 
-```toml
-default_model = "deepseek"
-
-[[models]]
-name = "deepseek"
-provider = "open-ai-compatible"
-base_url = "https://api.deepseek.com/v1"
-model = "deepseek-chat"
-api_key_env = "DEEPSEEK_API_KEY"
-
-[[models]]
-name = "gemini"
-provider = "google"
-model = "gemini-2.5-pro"
-api_key_env = "GEMINI_API_KEY"
-
-[[models]]
-name = "bedrock"
-provider = "bedrock"
-model = "anthropic.claude-sonnet-4-5-20250929-v1:0"
-aws_region = "us-east-1"
-aws_access_key_id = "AKIA..."
-aws_secret_access_key = "..."
-# aws_session_token = "..."
+```json
+{
+  "default_model": "deepseek",
+  "models": [
+    {
+      "name": "deepseek",
+      "provider": "open-ai-compatible",
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat",
+      "api_key_env": "DEEPSEEK_API_KEY"
+    },
+    {
+      "name": "gemini",
+      "provider": "google",
+      "model": "gemini-2.5-pro",
+      "api_key_env": "GEMINI_API_KEY"
+    },
+    {
+      "name": "bedrock",
+      "provider": "bedrock",
+      "model": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+      "aws_region": "us-east-1",
+      "aws_access_key_id": "AKIA...",
+      "aws_secret_access_key": "..."
+    }
+  ]
+}
 ```
 
 `provider` 支持内置协议 `open-ai`（Responses）、`open-ai-compatible`（Chat Completions）、`anthropic`（Messages）、`google`（Generative AI `generateContent`）与 `bedrock`（Converse）；第三方可通过应用层注册自定义协议工厂扩展新的协议 ID。TUI 内输入 `/model` 打开上游选择面板，或用 `/model <名称>` 直接切换；切换只在当前会话生效（会话级），重启后回到 `default_model`。网关注册表使用内部读写锁，运行期切换对派生 Agent 与插件模型路由同样生效。
@@ -68,7 +71,7 @@ aws_secret_access_key = "..."
 也可以显式初始化指定文件后退出：
 
 ```bash
-lucia --config ./lucia.toml --init
+lucia --config ./lucia.json --init
 ```
 
 初始化使用原子排他创建，不会覆盖已有文件。macOS/Linux 下配置文件权限为 `0600`；运行前需要填写密钥，并确认 `model.model` 是账号可用的模型 ID。
@@ -79,20 +82,23 @@ lucia --config ./lucia.toml --init
 
 1. `--config <path>`；
 2. `LUCIA_CONFIG` 环境变量；
-3. `$LUCIA_HOME/config.toml`；
-4. `$HOME/.lucia/config.toml`。
+3. `$LUCIA_HOME/config.json`；
+4. `$HOME/.lucia/config.json`。
 
 配置存在后，直接运行 `lucia` 即可，不再需要每次传入 `--config`。`--demo` 仍可在没有模型配置时使用离线脚本模型。
 
 ## TUI 字段
 
-模型与 Agent 字段继续使用 Core 的 `[model]` 和 `[agent]`。TUI 设置位于独立段落：
+模型与 Agent 字段继续使用 Core 的 `model` 和 `agent` 对象。TUI 设置位于独立的 `tui` 对象：
 
-```toml
-[tui]
-sessions_dir = "projects"
-events_jsonl = "events.jsonl"
-review_model = "gpt-5.6-luna"
+```json
+{
+  "tui": {
+    "sessions_dir": "projects",
+    "events_jsonl": "events.jsonl",
+    "review_model": "gpt-5.6-luna"
+  }
+}
 ```
 
 `sessions_dir` 是项目会话根目录。相对配置值与 `events_jsonl` 都以配置文件所在目录为基准；CLI 的 `--sessions-dir` 与 `--events-jsonl` 仍以当前工作目录为基准，并覆盖配置值。`review_model` 是 Host 固定提供给权限插件“帮我审批”模式的模型 ID；缺省时兼容沿用主模型，建议显式配置同服务商下可用的小模型。旧字段 `plugin_model` 仍可读取，但新配置统一使用 `review_model`。旧配置中的 `default_session` 和 `resume_latest` 仍可解析，但普通启动不再用它们自动恢复会话。
@@ -123,22 +129,27 @@ review_model = "gpt-5.6-luna"
 
 ## 插件配置
 
-每个插件可以有自己的配置段，段名就是插件 ID：
+每个插件可以有自己的配置，键名就是插件 ID：
 
-```toml
-[plugins.permission]
-# 该插件专属的模型路由；不配置则沿用 tui.review_model。
-model = "gpt-5.6-luna"
-base_url = "https://ai.phrolova.uno"
-api_key = "sk-..."            # 或 api_key_env = "REVIEW_API_KEY"
-gateway = "open-ai-compatible"
-# 其余键值由插件自己解释。
-auto_approve_reads = true
+```json
+{
+  "plugins": {
+    "permission": {
+      "model": "gpt-5.6-luna",
+      "base_url": "https://ai.phrolova.uno",
+      "api_key": "sk-...",
+      "gateway": "open-ai-compatible",
+      "auto_approve_reads": true
+    }
+  }
+}
 ```
+
+上面的 `api_key` 也可以换成 `api_key_env`；其余键值由插件自己解释。
 
 配置有两个来源，主配置的同名键覆盖插件目录里随 bundle 分发的 `config.toml`（与 `plugin.toml` 同级），因此插件作者可以给出默认值，你只覆盖需要改的项。
 
-路由字段是 `provider`、`model`、`base_url`、`api_key`、`api_key_env`、`openai_protocol`、`gateway`、`stream`、`max_output_tokens`，取值与 `[model]` 段一致；它们由宿主消费并注册成该插件专属的服务商（网关内命名为 `plugin:<插件 ID>`），密钥只留在宿主侧，不会进入插件的 WASM 实例。声明了 `model` 却没有 `api_key` 或 `api_key_env` 时启动即报错，不会拖到第一次调用模型才失败。`max_output_tokens` 仍受执行策略上限约束，插件配置只能调小。
+路由字段是 `provider`、`model`、`base_url`、`api_key`、`api_key_env`、`openai_protocol`、`gateway`、`stream`、`max_output_tokens`，取值与 `model` 对象一致；它们由宿主消费并注册成该插件专属的服务商（网关内命名为 `plugin:<插件 ID>`），密钥只留在宿主侧，不会进入插件的 WASM 实例。声明了 `model` 却没有 `api_key` 或 `api_key_env` 时启动即报错，不会拖到第一次调用模型才失败。`max_output_tokens` 仍受执行策略上限约束，插件配置只能调小。
 
 其余键值原样作为激活元数据交给插件读取，值统一转成字符串。宿主注入的可信项（如工作区标识）优先级最高，插件无法用配置覆盖它们。没有配置专属路由的插件继续使用 `tui.review_model`。
 
@@ -181,7 +192,7 @@ lucia --list-sessions
 
 | 项目 | 第一优先 | 第二优先 | 默认值 |
 | --- | --- | --- | --- |
-| 配置文件 | `--config` | `LUCIA_CONFIG` | `$LUCIA_HOME/config.toml` |
+| 配置文件 | `--config` | `LUCIA_CONFIG` | `$LUCIA_HOME/config.json` |
 | 项目会话根目录 | `--sessions-dir` | `tui.sessions_dir` | `$LUCIA_HOME/projects` |
 | 启动会话 | `--session-id` | `--resume-latest` | 新的空白 Draft |
 | 事件日志 | `--events-jsonl` | `tui.events_jsonl` | 不写入 |

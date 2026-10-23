@@ -17,7 +17,7 @@ lucia plugins disable <plugin-id>
 
 ```bash
 lucia --init
-lucia --config ./lucia.toml --init
+lucia --config ./lucia.json --init
 ```
 
 创建默认配置后退出。别名是 `--init-config`。初始化使用排他创建，不覆盖已有文件；macOS/Linux 下新文件权限为 `0600`。
@@ -33,10 +33,10 @@ lucia --demo
 ### `--config <path>`
 
 ```bash
-lucia --config ./configs/lucia.toml
+lucia --config ./configs/lucia.json
 ```
 
-指定 TOML 配置文件。路径按当前工作目录解析，并覆盖 `LUCIA_CONFIG`、`LUCIA_HOME` 和默认应用目录。该参数是全局参数，也可用于 `doctor`。
+指定 JSON 配置文件。路径按当前工作目录解析，并覆盖 `LUCIA_CONFIG`、`LUCIA_HOME` 和默认应用目录。该参数是全局参数，也可用于 `doctor`。
 
 ### `--events-jsonl <path>`
 
@@ -44,7 +44,7 @@ lucia --config ./configs/lucia.toml
 lucia --events-jsonl ./runs/events.jsonl
 ```
 
-把模型、工具、ReAct 和扩展生命周期事件按 JSONL 追加到文件。CLI 相对路径以当前工作目录为基准，并覆盖 `[tui].events_jsonl`。写入错误会作为运行错误报告，不会被静默忽略。
+把模型、工具、ReAct 和扩展生命周期事件按 JSONL 追加到文件。CLI 相对路径以当前工作目录为基准，并覆盖 `tui.events_jsonl`。写入错误会作为运行错误报告，不会被静默忽略。
 
 ### `--sessions-dir <path>`
 
@@ -118,7 +118,7 @@ lucia plugins disable workflow
 
 | 项目 | 第一优先 | 第二优先 | 默认值 |
 | --- | --- | --- | --- |
-| 配置文件 | `--config` | `LUCIA_CONFIG` | `$LUCIA_HOME/config.toml` |
+| 配置文件 | `--config` | `LUCIA_CONFIG` | `$LUCIA_HOME/config.json` |
 | 应用目录 | `LUCIA_HOME` | `$HOME/.lucia` | 当前目录的 `.lucia` |
 | 会话根目录 | `--sessions-dir` | `tui.sessions_dir` | `$LUCIA_HOME/projects` |
 | 启动会话 | `--session-id` | `--resume-latest` | 新的空白 Draft |

@@ -13,7 +13,7 @@ lucia
 
 `install:tui` 会构建插件版 `lucia` 并安装到 Cargo bin 目录，不会安装任何功能插件。启动时会加载 TUI `/plugins` 人工管理且已经启用的插件，并自动扫描 `$LUCIA_HOME/plugins` 与 `$LUCIA_HOME/official-plugins` 的直接子目录；未设置 `LUCIA_HOME` 时，应用目录是 `$HOME/.lucia`。
 
-第一次启动会创建 `$LUCIA_HOME/config.toml`。配置不存在或模型密钥不可用时，TUI 使用本地演示模型；也可以显式运行：
+第一次启动会创建 `$LUCIA_HOME/config.json`。配置不存在或模型密钥不可用时，TUI 使用本地演示模型；也可以显式运行：
 
 ```bash
 lucia --demo
@@ -23,24 +23,26 @@ lucia --demo
 
 推荐在配置中保存环境变量名，不保存密钥明文：
 
-```toml
-[model]
-name = "default"
-provider = "open-ai"
-base_url = "https://api.openai.com/v1"
-model = "替换为账号可用的模型 ID"
-api_key_env = "OPENAI_API_KEY"
-openai_protocol = "responses"
-context_window = 200000
-
-[agent]
-max_steps = 0
-max_tokens = 4096
-stream = true
-
-[tui]
-sessions_dir = "projects"
-# events_jsonl = "events.jsonl"
+```json
+{
+  "model": {
+    "name": "default",
+    "provider": "open-ai",
+    "base_url": "https://api.openai.com/v1",
+    "model": "替换为账号可用的模型 ID",
+    "api_key_env": "OPENAI_API_KEY",
+    "openai_protocol": "responses",
+    "context_window": 200000
+  },
+  "agent": {
+    "max_steps": 0,
+    "max_tokens": 4096,
+    "stream": true
+  },
+  "tui": {
+    "sessions_dir": "projects"
+  }
+}
 ```
 
 设置密钥后重新启动：
