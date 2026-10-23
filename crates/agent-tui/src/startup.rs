@@ -1067,7 +1067,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::Input(Event::Mouse(mouse))) => {
-                // 回到底部热区必须先于拖选判定，否则点击会被当成一次选择起点。
+                // 滚动条与回到底部热区都先于拖选判定：否则按下会被当成一次选择起点。
+                if app.handle_scrollbar_drag(&mouse) {
+                    continue;
+                }
                 if app.handle_jump_hint_click(&mouse) {
                     continue;
                 }

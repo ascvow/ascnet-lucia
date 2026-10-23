@@ -25,6 +25,10 @@ pub(crate) fn render_root(frame: &mut Frame, app: &mut App) {
     });
     #[cfg(feature = "plugins")]
     if !app.view_stack.is_main() {
+        // 离开主视图后清空主界面热区，避免点击被上一帧的滚动条或跳转提示拦截。
+        app.jump_hint_area = None;
+        app.scrollbar_area = None;
+        app.scrollbar_drag = false;
         render_plugin_subview(frame, app, outer);
         return;
     }

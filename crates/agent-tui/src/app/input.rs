@@ -381,6 +381,58 @@ impl App {
         true
     }
 
+    /// 处理滚动条上的按下与拖拽，返回事件是否已被热区消费。
+    ///
+    /// 必须排在文本拖选之前：滚动条只占右侧一列，若不先截获，按下会被当作选择起点，
+    /// 拖动则会变成选区而永远滚不动。拖到最底部时恢复自动跟随，与键盘滚动语义一致。
+    pub(crate) fn handle_scrollbar_drag(&mut self, mouse: &MouseEvent) -> bool {
+        use crossterm::event::MouseButton;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(area) = self.scrollbar_area else {
+                    return false;
+                };
+                if !area.contains(Position::new(mouse.column, mouse.row)) {
+                    return false;
+                }
+                self.dismiss_text_selection();
+                self.tool_click_candidate = None;
+                self.scrollbar_drag = true;
+                self.scrub_to_row(mouse.row);
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if !self.scrollbar_drag {
+                    return false;
+                }
+                self.scrub_to_row(mouse.row);
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => std::mem::take(&mut self.scrollbar_drag),
+            _ => false,
+        }
+    }
+
+    /// 把滚动条上的行号映射为滚动位置；行号越界时按端点处理。
+    fn scrub_to_row(&mut self, row: u16) {
+        let Some(area) = self.scrollbar_area else {
+            return;
+        };
+        if area.height == 0 || self.last_max_scroll == 0 {
+            return;
+        }
+        let offset = row.saturating_sub(area.y).min(area.height - 1);
+        // 轨道首行对应顶部、末行对应底部；两端都能精确命中，避免滑块"够不到"边界。
+        let span = u32::from(area.height.saturating_sub(1)).max(1);
+        let scaled = u32::from(offset) * u32::from(self.last_max_scroll);
+        let position = u16::try_from((scaled + span / 2) / span).unwrap_or(u16::MAX);
+        if position >= self.last_max_scroll {
+            self.scroll = None;
+        } else {
+            self.scroll = Some(position);
+        }
+    }
+
     /// 向上滚动 n 行，进入手动滚动模式。
     pub(crate) fn scroll_up(&mut self, n: u16) {
         self.dismiss_text_selection();

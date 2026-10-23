@@ -949,6 +949,76 @@ fn jump_hint_click_is_inert_without_hint() {
     assert_eq!(app.scroll, Some(5));
 }
 
+/// 滚动条上的按下与拖拽把行号线性映射为滚动偏移，拖到底部恢复自动跟随。
+#[test]
+fn scrollbar_drag_maps_rows_to_scroll_positions() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.last_max_scroll = 100;
+    // 轨道覆盖第 2 至 22 行，共 21 行；首行对应顶部、末行对应底部。
+    app.scrollbar_area = Some(Rect::new(80, 2, 1, 21));
+
+    let event = |kind, row| MouseEvent {
+        kind,
+        column: 80,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(app.handle_scrollbar_drag(&event(MouseEventKind::Down(MouseButton::Left), 2)));
+    assert_eq!(app.scroll, Some(0));
+    assert!(app.scrollbar_drag);
+
+    assert!(app.handle_scrollbar_drag(&event(MouseEventKind::Drag(MouseButton::Left), 12)));
+    assert_eq!(app.scroll, Some(50), "轨道中点应落在滚动范围的中点");
+    assert!(app.scrollbar_drag);
+
+    assert!(app.handle_scrollbar_drag(&event(MouseEventKind::Drag(MouseButton::Left), 22)));
+    assert_eq!(app.scroll, None, "拖到末行应恢复自动跟随");
+    assert!(app.scrollbar_drag, "释放前仍处于拖拽态");
+
+    assert!(app.handle_scrollbar_drag(&event(MouseEventKind::Up(MouseButton::Left), 22)));
+    assert!(!app.scrollbar_drag, "释放后退出拖拽态");
+}
+
+/// 滚动条热区之外的点击、以及未开始的拖拽都必须交还给其他鼠标处理。
+#[test]
+fn scrollbar_ignores_events_outside_track() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.last_max_scroll = 100;
+    app.scroll = Some(40);
+    app.scrollbar_area = Some(Rect::new(80, 2, 1, 21));
+
+    let outside = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 79,
+        row: 10,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(!app.handle_scrollbar_drag(&outside));
+    assert_eq!(app.scroll, Some(40));
+
+    // 没有先按下时，拖动不能被滚动条截获。
+    let drag = MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: 80,
+        row: 20,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(!app.handle_scrollbar_drag(&drag));
+    assert_eq!(app.scroll, Some(40));
+
+    // 滚动条未展示时任何按下都不生效。
+    app.scrollbar_area = None;
+    assert!(!app.handle_scrollbar_drag(&outside));
+    assert_eq!(app.scroll, Some(40));
+}
+
 /// 命令修饰键必须同时接受 Control 与 Super，覆盖 macOS 重映射后的上报差异。
 #[test]
 fn command_modifier_accepts_control_and_super() {

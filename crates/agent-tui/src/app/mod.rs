@@ -185,6 +185,12 @@ pub(crate) struct App {
     ///
     /// 提示同时是可点击热区：手动翻阅后用鼠标即可回到底部，不必记快捷键。
     pub(crate) jump_hint_area: Option<Rect>,
+    /// 最近一帧滚动条所占的区域；内容未溢出时为 `None`。
+    ///
+    /// 该区域同时是可拖拽热区：在滑块轨道上按下或拖动即可定位到对应位置。
+    pub(crate) scrollbar_area: Option<Rect>,
+    /// 是否正在拖拽滚动条；拖拽期间只响应左键拖动与释放。
+    pub(crate) scrollbar_drag: bool,
     /// 最近一帧可见且具有详情的工具消息点击区域。
     pub(crate) tool_message_hit_regions: Vec<ToolMessageHitRegion>,
     /// 主事件区的消息布局缓存；只保留可见窗口内的渲染结果。
@@ -436,6 +442,8 @@ impl App {
             last_viewport: 0,
             key_inspect: false,
             jump_hint_area: None,
+            scrollbar_area: None,
+            scrollbar_drag: false,
             tool_message_hit_regions: Vec::new(),
             transcript_layout: crate::ui::transcript_layout::TranscriptLayout::default(),
             tool_click_candidate: None,

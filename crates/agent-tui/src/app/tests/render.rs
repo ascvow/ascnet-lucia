@@ -83,6 +83,65 @@ fn jump_hint_uses_separate_row_and_clears_when_hidden() {
     }
 }
 
+/// 滚动条只在内容溢出时占用右侧留白列，正文不被覆盖；清空后不得残留轨道。
+#[test]
+fn scrollbar_marks_overflow_and_clears_when_content_fits() {
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages.push(Msg::new(
+        MsgKind::Assistant,
+        "滚动条轨道测试正文\n".repeat(40),
+    ));
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+
+    let area = app.scrollbar_area.expect("内容溢出时应显示滚动条");
+    assert_eq!(area.width, 1);
+    assert_eq!(area.height, app.last_viewport);
+    assert_eq!(area.x, 58, "滚动条应贴在消息区右侧留白列");
+    // 轨道与滑块只用一列宽字符，且不会挤掉正文：正文右边界在滚动条左侧。
+    let column: String = (area.y..area.bottom())
+        .map(|y| terminal.backend().buffer()[(area.x, y)].symbol())
+        .collect();
+    assert!(
+        column.chars().all(|glyph| glyph == '│' || glyph == '┃'),
+        "滚动条列只应出现轨道或滑块：{column:?}"
+    );
+    assert!(column.contains('┃'), "应能看到滑块：{column:?}");
+
+    // 内容不再溢出时滚动条消失，上一帧的轨道必须被擦掉。
+    app.messages.clear();
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    assert!(app.scrollbar_area.is_none());
+    let leftover: String = (area.y..area.bottom())
+        .map(|y| terminal.backend().buffer()[(area.x, y)].symbol())
+        .collect();
+    assert_eq!(leftover.trim(), "", "残留轨道：{leftover:?}");
+}
+
+/// 短对话与超窄终端都不绘制滚动条，避免为一屏以内的内容添加噪声。
+#[test]
+fn scrollbar_hidden_for_short_or_narrow_content() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages.push(Msg::new(MsgKind::User, "短消息"));
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    assert!(app.scrollbar_area.is_none(), "内容不足一屏时不应显示滚动条");
+
+    app.messages.push(Msg::new(
+        MsgKind::Assistant,
+        "窄终端滚动条测试\n".repeat(40),
+    ));
+    let mut terminal = Terminal::new(TestBackend::new(12, 10)).unwrap();
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    assert_eq!(
+        app.scrollbar_area.map(|area| area.height),
+        Some(app.last_viewport),
+        "窄终端仍保留一列滚动条，正文宽度自动收窄"
+    );
+}
+
 /// 验证常规尺寸下角色标记、输入提示和底部信息行均可见。
 #[test]
 fn render_shows_visual_hierarchy() {

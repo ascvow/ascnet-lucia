@@ -254,9 +254,18 @@ fn write_byte(mut hash: u64, byte: u8) -> u64 {
 }
 
 /// 把字节序列混入指纹。
+///
+/// 每次吃掉 8 字节再混合，而不是逐字节乘一遍：长对话每帧都要重算全部消息的指纹，
+/// 逐字节版本会稳定吃掉整个帧预算的大部分（1200 条消息约 0.75ms），按机器字混合
+/// 后同样的输入降到十分之一量级。指纹只用于判断"内容是否变化"，不做安全用途。
 fn write_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     hash = write_bytes_len(hash, bytes.len());
-    for byte in bytes {
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("chunks_exact 保证整块长度"));
+        hash = (hash ^ word).wrapping_mul(FNV_PRIME);
+    }
+    for byte in chunks.remainder() {
         hash = write_byte(hash, *byte);
     }
     hash

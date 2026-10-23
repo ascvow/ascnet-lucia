@@ -3,8 +3,8 @@
 use crate::app::{input_ref_spans, App, ToolMessageHitRegion};
 use crate::command::{reasoning_level_command_value, render_native_command_panel};
 use crate::theme::{
-    COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_TEXT, COLOR_USER,
-    COLOR_USER_BG, COLOR_WARNING, SPINNER,
+    COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SEPARATOR, COLOR_SUCCESS, COLOR_TEXT,
+    COLOR_USER, COLOR_USER_BG, COLOR_WARNING, SPINNER,
 };
 use crate::ui::markdown::truncate_line;
 #[cfg(feature = "plugins")]
@@ -79,6 +79,10 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     });
     // 每帧重置热区，空会话和窗口缩小时不能保留上一帧的跳转按钮。
     app.jump_hint_area = None;
+    // 滚动条同理：内容不再溢出时先擦掉上一帧的轨道，避免右侧留白残留竖线。
+    if let Some(previous) = app.scrollbar_area.take() {
+        frame.render_widget(Clear, previous);
+    }
     #[cfg(feature = "plugins")]
     {
         app.last_message_width = chat_area.width.max(1);
@@ -164,6 +168,8 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             total_height,
             scroll,
         );
+        // 滚动条落在消息区右侧的留白列上，与正文互不重叠。
+        render_scrollbar(frame, app, chat_area, total_height, viewport, scroll);
 
         // 将未滚动的逻辑行范围映射到当前终端视口，供左键释放时切换详情。
         let viewport_end = scroll.saturating_add(viewport);
@@ -462,6 +468,46 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             plugin_area,
         );
     }
+}
+
+/// 在消息区右侧留白列绘制滚动条。
+///
+/// 内容不足一屏时不绘制，短对话里多一根竖线只是噪声。轨道与滑块的字符都取自常见
+/// 制表符，缩到一列也不会挤压正文；滑块长度按"视口行数 / 总行数"计算，因此长对话
+/// 里滑块很短，能直观看出当前位置在整体中的比例。
+fn render_scrollbar(
+    frame: &mut Frame,
+    app: &mut App,
+    chat_area: Rect,
+    total_height: u16,
+    viewport: u16,
+    scroll: u16,
+) {
+    // 留白列位于正文右侧一列；正文宽度为零时不画，避免竖条飘在空白里。
+    if chat_area.width == 0 || chat_area.height < 3 || total_height <= viewport {
+        return;
+    }
+    let column = Rect {
+        x: chat_area.right(),
+        y: chat_area.y,
+        width: 1,
+        height: chat_area.height,
+    };
+    let mut state = ScrollbarState::new(usize::from(total_height))
+        .position(usize::from(scroll))
+        .viewport_content_length(usize::from(viewport));
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .track_style(Style::new().fg(COLOR_SEPARATOR))
+            .thumb_symbol("┃")
+            .thumb_style(Style::new().fg(COLOR_BORDER_FOCUS)),
+        column,
+        &mut state,
+    );
+    app.scrollbar_area = Some(column);
 }
 
 /// 将运行指示等尾部附加行绘制到消息区末尾。

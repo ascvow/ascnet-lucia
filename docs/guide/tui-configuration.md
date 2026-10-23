@@ -60,7 +60,7 @@ lucia
 }
 ```
 
-`provider` 支持内置协议 `open-ai`（Responses）、`open-ai-compatible`（Chat Completions）、`anthropic`（Messages）、`google`（Generative AI `generateContent`）与 `bedrock`（Converse）；第三方可通过应用层注册自定义协议工厂扩展新的协议 ID。TUI 内输入 `/model` 打开上游选择面板，或用 `/model <名称>` 直接切换；切换只在当前会话生效（会话级），重启后回到 `default_model`。网关注册表使用内部读写锁，运行期切换对派生 Agent 与插件模型路由同样生效。
+`provider` 支持内置协议 `open-ai`（Responses）、`open-ai-compatible`（Chat Completions）、`anthropic`（Messages）、`google`（Generative AI `generateContent`）与 `bedrock`（Converse）；第三方可通过应用层注册自定义协议工厂扩展新的协议 ID。TUI 内输入 `/model` 打开上游选择面板，面板每行按 `模型 ID [上游名]` 显示，行首 `●` 标记当前上游，方括号里的上游名就是 `/model <名称>` 的切换键；也可以用 `/model <名称>` 直接切换。切换只在当前会话生效（会话级），重启后回到 `default_model`。网关注册表使用内部读写锁，运行期切换对派生 Agent 与插件模型路由同样生效。
 
 ### 模型协议映射
 
@@ -109,7 +109,7 @@ lucia --config ./lucia.json --init
 
 ## 全屏渲染
 
-Lucia 默认使用全屏渲染：进入终端备用屏幕（类似 vim），界面固定在整屏内重绘，退出后恢复终端原有内容。每帧只排版与视口相交的消息，历史部分只保留换行后的视觉行数，滚出窗口的渲染结果立即释放，因此会话再长，单帧开销和内存占用都基本不变。空闲时主循环不再按 tick 重绘，只在状态真正变化或存在动画时刷新。
+Lucia 默认使用全屏渲染：进入终端备用屏幕（类似 vim），界面固定在整屏内重绘，退出后恢复终端原有内容。每帧只排版与视口相交的消息，历史部分只保留换行后的视觉行数，滚出窗口的渲染结果立即释放，因此会话再长，单帧开销和内存占用都基本不变。消息超出视口时，右侧留白列会出现滚动条，滑块长度按可见比例计算；在轨道上按下或拖动可直接定位，拖到底部恢复自动跟随。空闲时主循环不再按 tick 重绘，只在状态真正变化或存在动画时刷新。
 
 ```bash
 /tui                # 查看当前渲染模式
