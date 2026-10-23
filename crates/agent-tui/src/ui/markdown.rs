@@ -1,8 +1,9 @@
 //! 会话正文的 Markdown、表格与工具输出行渲染。
 
 use crate::theme::{
-    COLOR_ACCENT, COLOR_BORDER_FOCUS, COLOR_CODE, COLOR_CODE_BG, COLOR_MUTED, COLOR_SEPARATOR,
-    COLOR_TEXT, COLOR_USER, COLOR_USER_BG,
+    COLOR_ACCENT, COLOR_BORDER_FOCUS, COLOR_CODE, COLOR_CODE_BG, COLOR_INLINE_CODE_BG, COLOR_META,
+    COLOR_MUTED, COLOR_QUOTE_BG, COLOR_SEPARATOR, COLOR_TEXT, COLOR_TEXT_SOFT, COLOR_USER,
+    COLOR_USER_BG,
 };
 use crate::ui::highlight::{highlight_line, CodeLanguage};
 use ratatui::prelude::*;
@@ -97,6 +98,17 @@ pub(crate) fn conversation_lines<'a>(
 const PREFIX_WIDTH: usize = 2;
 /// 表格单列最小内容宽度；再窄竖线之间就只剩空白。
 const TABLE_MIN_COLUMN: usize = 4;
+/// 解释性正文的最大行宽（显示列）。
+///
+/// 终端再宽也不把段落拉到整屏：一行超过百来列后，眼睛从行尾折回行首时容易串行。
+/// 代码块与表格不参与这个上限——它们的对齐语义依赖实际可用列数。
+const MAX_PROSE_WIDTH: usize = 100;
+/// 围栏代码块卡片左侧的竖条与内部左留白（`▎` 后两列空白）。
+///
+/// 这道留白是"卡片"感的关键：代码直接贴在竖条上仍然像一段缩进文本。
+const CODE_GUTTER: &str = "▎  ";
+/// 引用块卡片左侧的竖条与内部左留白。
+const QUOTE_GUTTER: &str = "▏ ";
 
 /// Markdown 语法块。
 ///
@@ -154,9 +166,18 @@ enum ListMarker<'a> {
 pub(crate) fn markdown_lines(text: &str, streaming: bool, width: u16) -> Vec<Line<'static>> {
     // 行首标记列由本函数统一添加，正文排版宽度必须先扣掉它。
     let body_width = usize::from(width).saturating_sub(PREFIX_WIDTH).max(1);
+    // 解释性正文的阅读列宽：超过 MAX_PROSE_WIDTH 之后不再跟着终端拉长。
+    let text_width = body_width.min(MAX_PROSE_WIDTH);
     let mut rendered: Vec<Line<'static>> = Vec::new();
+    let mut previous_is_list = false;
     for block in split_markdown_blocks(text) {
-        render_block(block, body_width, &mut rendered);
+        let is_list = matches!(&block, MdBlock::ListItem { .. });
+        // 列表接在正文之后时先停一拍；连续的列表项属于同一个列表，彼此之间不再插空行。
+        if is_list && !previous_is_list && rendered.last().is_some_and(|line| line.width() > 0) {
+            rendered.push(Line::default());
+        }
+        previous_is_list = is_list;
+        render_block(block, body_width, text_width, &mut rendered);
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -184,7 +205,9 @@ pub(crate) fn markdown_lines(text: &str, streaming: bool, width: u16) -> Vec<Lin
         )));
     }
     if streaming {
-        if let Some(last) = lines.last_mut() {
+        // 光标跟在最后一段真实文字之后：代码块与引用块的卡片尾部留白行不含文字，
+        // 落到那里会让光标看起来悬在卡片外面。
+        if let Some(last) = lines.iter_mut().rev().find(|line| has_visible_text(line)) {
             // 代码块与表格行铺满整行，先收回尾部留白再放光标。
             trim_line_end(last);
             last.push_span(Span::styled(" ▌", Style::new().fg(COLOR_USER)));
@@ -192,6 +215,21 @@ pub(crate) fn markdown_lines(text: &str, streaming: bool, width: u16) -> Vec<Lin
     }
     lines.push(Line::default());
     lines
+}
+
+/// 卡片左侧竖条字符；只由竖条与空白构成的行属于卡片内边距，不含正文。
+const CARD_BARS: [char; 2] = ['▎', '▏'];
+
+/// 判断一行是否含有可见文字（只有空白的卡片留白行返回 `false`）。
+///
+/// 流式光标定位需要区分"整行铺底色但没字"的卡片内边距与真正的正文行：卡片留白行
+/// 仍然带着左侧竖条，因此不能只按"有没有非空白字符"判断。
+fn has_visible_text(line: &Line<'_>) -> bool {
+    line.spans.iter().any(|span| {
+        span.content
+            .chars()
+            .any(|ch| !ch.is_whitespace() && !CARD_BARS.contains(&ch))
+    })
 }
 
 /// 按行扫描文本并归类为 Markdown 块，围栏代码块与表格整块切出。
@@ -348,28 +386,54 @@ fn list_item(line: &str) -> Option<(ListMarker<'_>, &str)> {
     Some((ListMarker::Ordered(&line[..digits + 1]), text.trim_start()))
 }
 
-/// 渲染单个 Markdown 块，`body_width` 为消息区扣除行首标记后的可用列数。
-fn render_block(block: MdBlock<'_>, body_width: usize, out: &mut Vec<Line<'static>>) {
+/// 渲染单个 Markdown 块。
+///
+/// `body_width` 为消息区扣除行首标记后的整宽，供代码块与表格使用；
+/// `text_width` 是解释性正文的阅读列宽（不超过 [`MAX_PROSE_WIDTH`]）。
+fn render_block(
+    block: MdBlock<'_>,
+    body_width: usize,
+    text_width: usize,
+    out: &mut Vec<Line<'static>>,
+) {
     match block {
         MdBlock::Blank => out.push(Line::default()),
-        MdBlock::Heading { level, text } => render_heading(level, text, body_width, out),
+        MdBlock::Heading { level, text } => render_heading(level, text, text_width, out),
         MdBlock::ListItem {
             indent,
             marker,
             text,
-        } => render_list_item(indent, marker, text, body_width, out),
-        MdBlock::Quote(text) => render_quote(text, body_width, out),
+        } => render_list_item(indent, marker, text, text_width, out),
+        MdBlock::Quote(text) => render_quote(text, text_width, out),
         MdBlock::Rule => out.push(Line::from(Span::styled(
-            "─".repeat(body_width),
+            "─".repeat(text_width),
             Style::new().fg(COLOR_SEPARATOR),
         ))),
         MdBlock::Table(rows) => render_table(&rows, body_width, out),
         MdBlock::Code { language, lines } => render_code(language, &lines, body_width, out),
         MdBlock::Prose(text) => {
-            let chunks = wrap_inline(inline_spans(text), body_width);
+            // 段落正文降为明细灰；强调片段在 soften_spans 里保留自己的前景色。
+            let chunks = wrap_inline(inline_spans(text), text_width)
+                .into_iter()
+                .map(soften_spans)
+                .collect();
             push_wrapped(out, chunks, Vec::new(), 0);
         }
     }
+}
+
+/// 把正文行内片段降到"明细灰"，强调片段保留自己的颜色与字形。
+///
+/// 段落与列表正文是阅读主体，亮度必须低于标题、标记与警告；粗体、行内代码、链接在
+/// `patch` 之后仍然带着自己的前景色与修饰符。
+fn soften_spans(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    spans
+        .into_iter()
+        .map(|span| {
+            let style = Style::new().fg(COLOR_TEXT_SOFT).patch(span.style);
+            Span::styled(span.content, style)
+        })
+        .collect()
 }
 
 /// 渲染标题：终端没有字号，层级靠标记形状与颜色区分。
@@ -417,7 +481,11 @@ fn render_list_item(
     };
     let marker_width = unicode_width::UnicodeWidthStr::width(marker_text.as_str()) + 1;
     let available = body_width.saturating_sub(indent + marker_width).max(1);
-    let chunks = wrap_inline(inline_spans(text), available);
+    // 列表正文与段落同属阅读主体，使用同一档明细灰。
+    let chunks = wrap_inline(inline_spans(text), available)
+        .into_iter()
+        .map(soften_spans)
+        .collect();
     let first = vec![
         Span::raw(" ".repeat(indent)),
         Span::styled(format!("{marker_text} "), Style::new().fg(COLOR_MUTED)),
@@ -425,34 +493,55 @@ fn render_list_item(
     push_wrapped(out, chunks, first, indent + marker_width);
 }
 
-/// 渲染引用：每行都带一条暗色竖线，正文降为次要色。
-fn render_quote(text: &str, body_width: usize, out: &mut Vec<Line<'static>>) {
-    let chunks = wrap_inline(inline_spans(text), body_width.saturating_sub(2).max(1));
+/// 渲染引用：每行带一条暗色竖线，并按卡片样式铺一层比正文更暗的底色。
+///
+/// 引用块的宽度按阅读列宽计算，底色补齐到整行，右边缘与代码块一样齐平；正文颜色
+/// 降为明细灰，强调片段保留自己的前景色。
+fn render_quote(text: &str, text_width: usize, out: &mut Vec<Line<'static>>) {
+    let gutter = unicode_width::UnicodeWidthStr::width(QUOTE_GUTTER);
+    let chunks = wrap_inline(inline_spans(text), text_width.saturating_sub(gutter).max(1));
     for chunk in chunks {
-        let mut spans = vec![Span::styled("▏ ", Style::new().fg(COLOR_SEPARATOR))];
+        let used = spans_width(&chunk);
+        let mut spans = vec![Span::styled(
+            QUOTE_GUTTER,
+            Style::new().fg(COLOR_SEPARATOR).bg(COLOR_QUOTE_BG),
+        )];
         spans.extend(chunk.into_iter().map(|span| {
-            let style = Style::new().fg(COLOR_MUTED).patch(span.style);
+            // 底色最后写入：行内代码在引用块里也保持整块连续，不切出第二个色块。
+            let style = Style::new()
+                .fg(COLOR_TEXT_SOFT)
+                .patch(span.style)
+                .bg(COLOR_QUOTE_BG);
             Span::styled(span.content, style)
         }));
+        // 补齐尾部空白，让引用卡片的右边界整齐。
+        let pad = text_width.saturating_sub(used + gutter);
+        spans.push(Span::styled(
+            " ".repeat(pad),
+            Style::new().bg(COLOR_QUOTE_BG),
+        ));
         out.push(Line::from(spans));
     }
 }
 
 /// 渲染围栏代码块：隐藏围栏行，标注语言，并按语言族做轻量高亮。
 ///
-/// 整块铺一层比正文略亮的底色，左侧竖线沿用聚焦边框色，让代码与正文之间形成
-/// 明确的分区；超宽代码按显示宽度自行折行，避免被 `Paragraph` 折到行首。
+/// 整块是一张卡片：上下各留一行只铺底色的内边距，左侧竖条之后还有两列空白，
+/// 语言标签退到元信息色。超宽代码按显示宽度自行折行，避免被 `Paragraph` 折到行首。
 fn render_code(language: &str, rows: &[&str], body_width: usize, out: &mut Vec<Line<'static>>) {
     let language = language.trim();
     if out.last().is_some_and(|line| line.width() > 0) {
         out.push(Line::default());
     }
+    // 卡片内部的上留白：把代码从上一段正文里"垫"出来。
+    out.push(code_line(Vec::new(), body_width));
     let code_language = CodeLanguage::from_tag(language);
     if !language.is_empty() {
+        // 语言标签属于元信息，降到最暗一档，不与代码正文争夺注意力。
         out.push(code_line(
             vec![Span::styled(
                 language.to_string(),
-                Style::new().fg(COLOR_MUTED),
+                Style::new().fg(COLOR_META),
             )],
             body_width,
         ));
@@ -462,27 +551,33 @@ fn render_code(language: &str, rows: &[&str], body_width: usize, out: &mut Vec<L
     } else {
         rows.to_vec()
     };
-    let available = body_width.saturating_sub(2).max(1);
+    // 正文宽度要扣除卡片左侧的竖条与内边距。
+    let available = body_width
+        .saturating_sub(unicode_width::UnicodeWidthStr::width(CODE_GUTTER))
+        .max(1);
     for row in rows {
         for chunk in wrap_display(row, available) {
             out.push(code_line(highlight_line(&chunk, code_language), body_width));
         }
     }
+    // 卡片内部的下留白。
+    out.push(code_line(Vec::new(), body_width));
     out.push(Line::default());
 }
 
-/// 构造铺满消息区宽度的一行代码：左侧竖条、整块底色与尾部补齐。
+/// 构造铺满消息区宽度的一行代码：左侧竖条加内边距、整块底色与尾部补齐。
 fn code_line(content: Vec<Span<'static>>, body_width: usize) -> Line<'static> {
     let used = spans_width(&content);
+    let gutter = unicode_width::UnicodeWidthStr::width(CODE_GUTTER);
     let mut spans = vec![Span::styled(
-        "▎ ",
+        CODE_GUTTER,
         Style::new().fg(COLOR_BORDER_FOCUS).bg(COLOR_CODE_BG),
     )];
     spans.extend(content.into_iter().map(|span| {
         let style = span.style.patch(Style::new().bg(COLOR_CODE_BG));
         Span::styled(span.content, style)
     }));
-    let pad = body_width.saturating_sub(used + 2);
+    let pad = body_width.saturating_sub(used + gutter);
     spans.push(Span::styled(
         " ".repeat(pad),
         Style::new().bg(COLOR_CODE_BG),
@@ -659,11 +754,12 @@ fn spans_width(spans: &[Span<'static>]) -> usize {
 
 /// 把 tui-markdown 的行内样式映射到 Lucia 色板。
 ///
-/// 行内代码在 tui-markdown 里是黑底白字，这里去掉背景换成暖色前景；链接去掉
-/// 下划线改用强调色。粗体、斜体不带前景色，原样保留。
+/// 行内代码在 tui-markdown 里是黑底白字：换成代码色前景并加一层浅淡的"标签底色"，
+/// 让它像一枚色块而不是普通文字。链接去掉下划线改用强调色。粗体、斜体不带前景色，
+/// 原样保留。
 fn restyle_inline(style: Style) -> Style {
     if style.bg.is_some() {
-        return Style::new().fg(COLOR_CODE);
+        return Style::new().fg(COLOR_CODE).bg(COLOR_INLINE_CODE_BG);
     }
     if style.fg.is_some() {
         let mut modifiers = style.add_modifier;

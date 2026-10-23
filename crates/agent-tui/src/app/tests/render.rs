@@ -261,6 +261,135 @@ fn input_editor_starts_immediately_after_rule() {
     assert!(!rows[rule_row + 3].trim().is_empty());
 }
 
+/// 主内容区左右各留 2 列：正文标记不贴终端边缘，状态栏与正文左对齐。
+#[test]
+fn main_content_keeps_two_column_padding() {
+    let width = 80;
+    let backend = TestBackend::new(width, 20);
+    let mut terminal = Terminal::new(backend).expect("创建左右留白测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages
+        .push(Msg::new(MsgKind::Assistant, "左右留白测试正文"));
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染左右留白");
+    let rows = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(usize::from(width))
+        .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>();
+
+    let marker_row = rows
+        .iter()
+        .position(|row| row.contains('●'))
+        .expect("应展示助手回复");
+    assert!(
+        rows[marker_row].starts_with("  ● "),
+        "正文应缩进两列：{:?}",
+        rows[marker_row]
+    );
+    let footer_row = rows.last().expect("底栏应存在");
+    assert!(
+        footer_row.starts_with("  lucia"),
+        "底栏应与正文左对齐：{footer_row:?}"
+    );
+}
+
+/// 输入框上方始终留一行空白，日志与输入盒之间不再紧贴。
+#[test]
+fn prompt_is_separated_from_log_by_blank_row() {
+    let width = 80;
+    let backend = TestBackend::new(width, 18);
+    let mut terminal = Terminal::new(backend).expect("创建输入留白测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    // 填满视口：日志末尾贴着消息区底部，留白行才是唯一的分隔。
+    app.messages
+        .push(Msg::new(MsgKind::Assistant, "日志行\n".repeat(40)));
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染输入留白");
+    let rows = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(usize::from(width))
+        .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>();
+
+    let border_row = rows
+        .iter()
+        .position(|row| row.contains('╭'))
+        .expect("输入盒上边框应存在");
+    assert!(border_row >= 2, "{rows:?}");
+    assert_eq!(
+        rows[border_row - 1].trim(),
+        "",
+        "输入框上方应有一行空白：{rows:?}"
+    );
+    assert!(
+        !rows[border_row - 2].trim().is_empty(),
+        "留白只占一行，再往上应仍有内容：{rows:?}"
+    );
+}
+
+/// 引用块渲染为独立卡片：整行铺底色并补齐到阅读列宽。
+#[test]
+fn quote_blocks_render_as_cards() {
+    let width = 40;
+    let lines = markdown_lines("> 引用内容", false, width);
+    let quote = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("引用内容"))
+        })
+        .expect("应包含引用行");
+
+    assert!(
+        quote
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(crate::theme::COLOR_QUOTE_BG)),
+        "引用行应铺卡片底色"
+    );
+    assert_eq!(
+        quote.width(),
+        usize::from(width),
+        "引用卡片应补齐到整行宽度"
+    );
+}
+
+/// 代码块卡片内部上下各留一行只铺底色的内边距。
+#[test]
+fn code_blocks_have_card_padding_rows() {
+    let lines = markdown_lines("```rust\nfn main() {}\n```", false, 40);
+    let padding_rows = lines
+        .iter()
+        .filter(|line| {
+            // 首个片段是消息行首标记，卡片内容从第二个片段开始。
+            line.spans.iter().skip(1).all(|span| {
+                let text = span.content.trim();
+                text.is_empty() || text == "▎"
+            }) && line
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(crate::theme::COLOR_CODE_BG))
+        })
+        .count();
+
+    assert!(
+        padding_rows >= 2,
+        "代码卡片上下应各有一行内边距：{padding_rows}"
+    );
+}
+
 /// 多行输入框最多展示六个逻辑行，并自动滚动到光标所在的末行。
 #[test]
 fn multiline_input_renders_six_visible_rows() {
@@ -428,9 +557,12 @@ fn tool_lines_accept_empty_result() {
     assert!(!text.contains("null"), "{text:?}");
 }
 
-/// 工具消息紧凑排列，不在工具结果后额外插入空行。
+/// 同一工具组内紧凑排列；组结束后与后续回复之间保留一行空行。
+///
+/// 工具组内的连续调用属于同一次动作，插入空行会把一次动作拆散；组与助手正文之间
+/// 则是不同逻辑模块，必须留白，否则 Shell 输出与随后的分析会糊成一片。
 #[test]
-fn consecutive_tool_messages_have_no_extra_spacing() {
+fn tool_group_keeps_compact_rows_and_blank_line_before_reply() {
     let backend = TestBackend::new(80, 18);
     let mut terminal = Terminal::new(backend).expect("创建工具组间距测试终端");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -443,7 +575,7 @@ fn consecutive_tool_messages_have_no_extra_spacing() {
 
     terminal
         .draw(|frame| render_root(frame, &mut app))
-        .expect("渲染紧凑工具组");
+        .expect("渲染工具组间距");
     let rows = (0..18)
         .map(|y| {
             (0..80)
@@ -465,7 +597,8 @@ fn consecutive_tool_messages_have_no_extra_spacing() {
 
     assert_eq!(tool_rows.len(), 2, "{rows:?}");
     assert_eq!(tool_rows[1], tool_rows[0] + 1, "{rows:?}");
-    assert_eq!(reply_row, tool_rows[1] + 1, "{rows:?}");
+    assert_eq!(reply_row, tool_rows[1] + 2, "{rows:?}");
+    assert_eq!(rows[reply_row - 1].trim(), "", "{rows:?}");
 }
 
 /// 左键按下与释放命中同一工具消息时切换详情，第二次点击可以收起。
@@ -741,15 +874,18 @@ fn narrow_markdown_table_wraps_inside_columns() {
     );
 }
 
-/// 验证 Markdown 渲染保留标题与行内代码的强调样式，且不产生任何背景色。
+/// 验证 Markdown 渲染保留标题与行内代码的强调样式，且正文段落本身不带背景色。
 #[test]
-fn markdown_renders_emphasis_without_background() {
+fn markdown_renders_emphasis_without_paragraph_background() {
     let lines = markdown_lines("# 标题\n\n**重点** 与 `代码` 内容", false, 60);
 
-    let no_background = lines.iter().all(|line| {
-        line.style.bg.is_none() && line.spans.iter().all(|span| span.style.bg.is_none())
+    // 行片段整体不铺底色：只有行内代码自己带一枚"标签底色"。
+    let no_line_background = lines.iter().all(|line| line.style.bg.is_none());
+    assert!(no_line_background);
+    let plain_background_free = lines.iter().flat_map(|line| line.spans.iter()).all(|span| {
+        span.style.bg.is_none() || span.style.bg == Some(crate::theme::COLOR_INLINE_CODE_BG)
     });
-    assert!(no_background);
+    assert!(plain_background_free);
 
     let heading = lines
         .iter()
@@ -772,9 +908,39 @@ fn markdown_renders_emphasis_without_background() {
     assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
 }
 
-/// 行内代码去掉反引号、改用代码色，并且不继承 tui-markdown 的黑色背景。
+/// 段落正文使用明细灰而非纯白，强调片段保留自己的前景色。
 #[test]
-fn inline_code_drops_backticks_and_background() {
+fn prose_body_uses_soft_gray() {
+    let lines = markdown_lines("普通说明文字与 **重点** 内容", false, 80);
+    let body = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.contains("普通说明文字"))
+        .expect("应包含正文片段");
+    assert_eq!(body.style.fg, Some(crate::theme::COLOR_TEXT_SOFT));
+    assert!(!body.style.add_modifier.contains(Modifier::BOLD));
+}
+
+/// 解释性正文最多排到 100 列：更宽的终端把余量留成右侧空白，而不是拉长行。
+#[test]
+fn prose_lines_stop_at_reading_width() {
+    let text = "字".repeat(200);
+    let lines = markdown_lines(&text, false, 200);
+    let longest = lines.iter().map(|line| line.width()).max().unwrap_or(0);
+
+    assert!(
+        longest <= 102,
+        "正文行宽应限制在阅读宽度内（含 2 列行首标记）：{longest}"
+    );
+    // 代码块仍然吃满整宽：它的对齐语义依赖可用列数。
+    let code = markdown_lines("```rust\nlet value = 1;\n```", false, 200);
+    let widest_code = code.iter().map(|line| line.width()).max().unwrap_or(0);
+    assert_eq!(widest_code, 200, "代码块应保持全宽");
+}
+
+/// 行内代码去掉反引号、改用代码色，并带一层与代码块同族的标签底色。
+#[test]
+fn inline_code_drops_backticks_and_gains_chip_background() {
     let lines = markdown_lines("调用 `convert_input_path_to_attachment` 转换", false, 80);
     let text = line_texts(&lines).join("\n");
 
@@ -789,7 +955,11 @@ fn inline_code_drops_backticks_and_background() {
         .find(|span| span.content.as_ref() == "convert_input_path_to_attachment")
         .expect("应包含行内代码片段");
     assert_eq!(span.style.fg, Some(crate::theme::COLOR_CODE));
-    assert!(span.style.bg.is_none(), "行内代码不带背景");
+    assert_eq!(
+        span.style.bg,
+        Some(crate::theme::COLOR_INLINE_CODE_BG),
+        "行内代码应带标签底色"
+    );
 }
 
 /// 标题不再输出字面 `#`：层级靠标记块形状与文字权重区分。
@@ -891,15 +1061,22 @@ fn markdown_survives_very_narrow_width() {
     }
 }
 
-/// 流式光标跟在代码块最后一行之后，不会被整行底色挤到下一行行首。
+/// 流式光标跟在代码块最后一行代码之后，不会被卡片内边距或整行底色挤到别处。
 #[test]
 fn streaming_cursor_stays_on_last_code_line() {
     let width = 40;
     let lines = markdown_lines("```rust\nfn main() {}\n```", true, width);
+    // 代码卡片底部的内边距行只铺底色与竖条，不算"内容行"。
     let last = lines
         .iter()
         .rev()
-        .find(|line| line.width() > 0)
+        .find(|line| {
+            line.spans.iter().any(|span| {
+                span.content
+                    .chars()
+                    .any(|ch| !ch.is_whitespace() && !matches!(ch, '▎' | '▏'))
+            })
+        })
         .expect("应有内容行");
     let text: String = last
         .spans
@@ -908,6 +1085,7 @@ fn streaming_cursor_stays_on_last_code_line() {
         .collect();
 
     assert!(text.trim_end().ends_with('▌'), "{text:?}");
+    assert!(text.contains("fn main() {}"), "{text:?}");
     assert!(
         last.width() <= usize::from(width),
         "光标不应撑出消息区：{}",

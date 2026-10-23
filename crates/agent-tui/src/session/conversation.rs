@@ -1,6 +1,6 @@
 //! 对话消息、Markdown 渲染、附件引用与剪贴板处理。
 
-use crate::theme::{COLOR_DANGER, COLOR_MUTED, COLOR_SUCCESS, COLOR_WARNING};
+use crate::theme::{COLOR_DANGER, COLOR_DANGER_BRIGHT, COLOR_MUTED, COLOR_SUCCESS, COLOR_WARNING};
 use crate::ui::highlight::CodeLanguage;
 use crate::ui::markdown::{conversation_lines, markdown_lines, truncate_line, user_lines};
 use crate::ui::transcript::{
@@ -286,7 +286,8 @@ impl Msg {
             MsgKind::ToolError => self.tool_lines("failed", COLOR_DANGER, width),
             MsgKind::ToolSkipped => self.tool_lines("skipped", COLOR_MUTED, width),
             MsgKind::Error => {
-                conversation_lines("✗", &self.text, COLOR_DANGER, COLOR_DANGER, false)
+                // 错误标记用更亮的一档红：失败信息读漏的代价最高。
+                conversation_lines("✗", &self.text, COLOR_DANGER_BRIGHT, COLOR_DANGER, false)
             }
             // Info 行作为块结束标记（token 统计、插话提示），追加空行与后续消息分隔。
             MsgKind::Info => vec![
@@ -412,7 +413,12 @@ impl Msg {
             .and_then(|result| tool_summary(call, result));
 
         if let Some(summary) = summary {
-            let summary_color = if is_error { COLOR_DANGER } else { COLOR_MUTED };
+            // 失败摘要用亮红：这是唯一必须被读到的工具结果。
+            let summary_color = if is_error {
+                COLOR_DANGER_BRIGHT
+            } else {
+                COLOR_MUTED
+            };
             lines.push(Line::from(vec![
                 Span::styled("  └ ", Style::new().fg(COLOR_MUTED)),
                 Span::styled(

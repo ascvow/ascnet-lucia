@@ -2,16 +2,26 @@
 
 use crate::app::{input_ref_spans, App, ToolMessageHitRegion};
 use crate::command::{reasoning_level_command_value, render_native_command_panel};
+use crate::session::conversation::MsgKind;
 use crate::theme::{
-    COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SEPARATOR, COLOR_SUCCESS, COLOR_TEXT,
-    COLOR_USER, COLOR_WARNING, SPINNER,
+    ACTIVITY_SPARK, COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_META, COLOR_MUTED, COLOR_SEPARATOR,
+    COLOR_SUCCESS, COLOR_TEXT, COLOR_USER, COLOR_WARNING,
 };
 use crate::ui::markdown::truncate_line;
 #[cfg(feature = "plugins")]
 use crate::ui::plugin_render::render_composer_panels;
+use crate::ui::transcript::{tool_display_name, tool_target};
 use agent_core::model::TokenUsage;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+
+/// 主内容区左右留白列数：正文两侧各留两列，任何一行都不再贴住终端边缘。
+const CHAT_PADDING_X: u16 = 2;
+/// 主内容区上下留白行数。
+///
+/// 底部这一行就是输入框上方的分隔空行：日志最后一行与输入盒之间始终隔着一行空白，
+/// 滚动到顶部时它同时充当跳转提示的落点。
+const CHAT_PADDING_Y: u16 = 1;
 
 /// 在插件占用后的中心区域渲染 Lucia 主界面。
 pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
@@ -24,31 +34,18 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     #[cfg(feature = "plugins")]
     let timeline_uses_snapshot = app.main_event_snapshot.is_some();
     #[cfg(feature = "plugins")]
-    let (timeline_messages, timeline_streaming_message, timeline_is_thinking) =
-        app.main_event_snapshot.as_ref().map_or_else(
-            || {
-                (
-                    app.messages.as_slice(),
-                    app.streaming_message,
-                    app.model_is_thinking,
-                )
-            },
-            |snapshot| {
-                (
-                    snapshot.messages.as_slice(),
-                    snapshot.streaming_message,
-                    snapshot.model_is_thinking,
-                )
-            },
-        );
+    let (timeline_messages, timeline_streaming_message) =
+        app.main_event_snapshot
+            .as_ref()
+            .map_or_else(
+                || (app.messages.as_slice(), app.streaming_message),
+                |snapshot| (snapshot.messages.as_slice(), snapshot.streaming_message),
+            );
     #[cfg(not(feature = "plugins"))]
     let timeline_uses_snapshot = false;
     #[cfg(not(feature = "plugins"))]
-    let (timeline_messages, timeline_streaming_message, timeline_is_thinking) = (
-        app.messages.as_slice(),
-        app.streaming_message,
-        app.model_is_thinking,
-    );
+    let (timeline_messages, timeline_streaming_message) =
+        (app.messages.as_slice(), app.streaming_message);
     let native_panel_height = app.native_command_panel_height();
     #[cfg(feature = "plugins")]
     let plugin_panel_height = app.composer_panel_height();
@@ -73,9 +70,10 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         (sections[0], sections[1], sections[2], sections[3]);
 
     // 消息流不使用容器边框，长文交给自动换行控制。
+    // 留白：左右各 2 列（原为 1 列），上下各 1 行；底部的这一行同时是输入框上方的分隔空行。
     let chat_area = chat_section.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
+        horizontal: CHAT_PADDING_X,
+        vertical: CHAT_PADDING_Y,
     });
     // 每帧重置热区，空会话和窗口缩小时不能保留上一帧的跳转按钮。
     app.jump_hint_area = None;
@@ -209,18 +207,32 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
             let below = max_scroll.saturating_sub(position);
             if below > 0 && chat_area.height > 0 && chat_area.bottom() < chat_section.bottom() {
                 // 宽终端显式写出点击提示；窄终端退回只带行数的紧凑形式。
-                let verbose = format!(" ↓ {below} lines · click to jump ");
-                let compact = format!(" ↓ {below} lines ");
-                let minimal = format!("↓{below}");
-                let fits = |text: &str| {
-                    u16::try_from(unicode_width::UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
-                        <= chat_area.width
+                // 行数与可视操作分成两种颜色：行数属元信息，`click to jump` 才是交互重点。
+                let dim = Style::new().fg(COLOR_META);
+                let hot = Style::new().fg(COLOR_WARNING).bold();
+                let verbose = vec![
+                    (format!(" ↓ {below} lines · "), dim),
+                    ("click to jump ".to_string(), hot),
+                ];
+                let compact = vec![(format!(" ↓ {below} lines "), dim)];
+                let minimal = vec![(format!("↓{below}"), hot)];
+                let fits = |spans: &[(String, Style)]| {
+                    let width: usize = spans
+                        .iter()
+                        .map(|(text, _)| unicode_width::UnicodeWidthStr::width(text.as_str()))
+                        .sum();
+                    u16::try_from(width).unwrap_or(u16::MAX) <= chat_area.width
                 };
                 let hint = [verbose, compact, minimal]
                     .into_iter()
-                    .find(|text| fits(text));
+                    .find(|spans| fits(spans));
                 if let Some(hint) = hint {
-                    let hint_width = unicode_width::UnicodeWidthStr::width(hint.as_str()) as u16;
+                    let hint_width: u16 = hint
+                        .iter()
+                        .map(|(text, _)| {
+                            unicode_width::UnicodeWidthStr::width(text.as_str()) as u16
+                        })
+                        .sum();
                     let width = hint_width;
                     let hint_area = Rect {
                         x: chat_area.x + chat_area.width - width,
@@ -232,10 +244,11 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
                     frame.render_widget(Clear, hint_area);
                     // 只用文字色不用底色：这行是留白行，铺满色块会把呼吸感挤掉。
                     frame.render_widget(
-                        Paragraph::new(Line::from(Span::styled(
-                            hint,
-                            Style::new().fg(COLOR_WARNING),
-                        ))),
+                        Paragraph::new(Line::from(
+                            hint.into_iter()
+                                .map(|(text, style)| Span::styled(text, style))
+                                .collect::<Vec<_>>(),
+                        )),
                         hint_area,
                     );
                     app.jump_hint_area = Some(hint_area);
@@ -258,7 +271,11 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     }
 
     // 输入区是四边圆角边框的多行输入盒，内容超过六行后内部垂直滚动。
-    let input_area = input_section;
+    // 与消息区共用左右留白：圆角边框与正文左边界对齐，输入框也不再贴住终端边缘。
+    let input_area = input_section.inner(Margin {
+        horizontal: CHAT_PADDING_X,
+        vertical: 0,
+    });
     let input_color = if app.running {
         COLOR_WARNING
     } else {
@@ -368,42 +385,43 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     }
 
     // 底部信息行：品牌标识、模型、工作目录与当前上下文 token 数，窄终端时隐藏目录。
+    // 层级：品牌与模型是主动作信息，其余（思考强度、目录、分支、分隔符）退到元信息灰。
     let mut footer = vec![
         Span::styled("lucia", Style::new().fg(COLOR_USER).bold()),
         Span::raw("  "),
         Span::styled(app.model_name.as_str(), Style::new().fg(COLOR_TEXT)),
-        Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+        Span::styled("  |  ", Style::new().fg(COLOR_META)),
         Span::styled(
             reasoning_level_command_value(app.reasoning_level),
-            Style::new().fg(COLOR_MUTED),
+            Style::new().fg(COLOR_META),
         ),
     ];
     #[cfg(feature = "plugins")]
     for (text, color) in app.plugin_footer_statuses.values() {
         footer.extend([
-            Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+            Span::styled("  |  ", Style::new().fg(COLOR_META)),
             Span::styled(truncate_line(text, 28), Style::new().fg(*color)),
         ]);
     }
     if app.has_copyable_text_selection() {
         footer.extend([
-            Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+            Span::styled("  |  ", Style::new().fg(COLOR_META)),
             Span::styled("Selection · Ctrl+C copy", Style::new().fg(COLOR_SUCCESS)),
         ]);
     }
     if workspace.width >= 96 {
         footer.extend([
-            Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
-            Span::styled(cwd_display, Style::new().fg(COLOR_MUTED)),
+            Span::styled("  |  ", Style::new().fg(COLOR_META)),
+            Span::styled(cwd_display, Style::new().fg(COLOR_META)),
         ]);
     }
     if workspace.width >= 64 {
         if let Some(branch) = app.workspace.git_branch.as_deref() {
             footer.extend([
-                Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+                Span::styled("  |  ", Style::new().fg(COLOR_META)),
                 Span::styled(
                     format!("⎇ {}", truncate_line(branch, 24)),
-                    Style::new().fg(COLOR_MUTED),
+                    Style::new().fg(COLOR_META),
                 ),
             ]);
         }
@@ -413,7 +431,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         if let Some(tokens) = app.context_tokens {
             let (label, color) = context_status(tokens, app.context_window);
             footer.extend([
-                Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+                Span::styled("  |  ", Style::new().fg(COLOR_META)),
                 Span::styled(format!("◔ {label}"), Style::new().fg(color)),
             ]);
         }
@@ -421,7 +439,7 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         if workspace.width >= 72 {
             if let Some((label, color)) = cache_hit_status(&app.session_usage) {
                 footer.extend([
-                    Span::styled("  |  ", Style::new().fg(COLOR_BORDER_FOCUS)),
+                    Span::styled("  |  ", Style::new().fg(COLOR_META)),
                     Span::styled(label, Style::new().fg(color)),
                 ]);
             }
@@ -454,8 +472,10 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
     };
     #[cfg(not(feature = "plugins"))]
     let metadata_area = footer_area;
+    // 底栏与正文左对齐：留白 2 列，和消息区左右留白保持一致。
     frame.render_widget(
-        Paragraph::new(Line::from(footer)).block(Block::new().padding(Padding::horizontal(1))),
+        Paragraph::new(Line::from(footer))
+            .block(Block::new().padding(Padding::horizontal(CHAT_PADDING_X))),
         metadata_area,
     );
     // 在底栏右侧为插件详情预留独立区域，避免覆盖左侧元数据。
@@ -482,6 +502,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
 /// 内容不足一屏时不绘制，短对话里多一根竖线只是噪声。轨道与滑块的字符都取自常见
 /// 制表符，缩到一列也不会挤压正文；滑块长度按"视口行数 / 总行数"计算，因此长对话
 /// 里滑块很短，能直观看出当前位置在整体中的比例。
+///
+/// 竖条贴在终端最右一列，正文与竖条之间因此始终留有一列空白：滚动条不贴在字上，
+/// 内容也不会看起来被"框"住。
 fn render_scrollbar(
     frame: &mut Frame,
     app: &mut App,
@@ -490,12 +513,20 @@ fn render_scrollbar(
     viewport: u16,
     scroll: u16,
 ) {
-    // 留白列位于正文右侧一列；正文宽度为零时不画，避免竖条飘在空白里。
+    // 留白列位于正文右侧；正文宽度为零时不画，避免竖条飘在空白里。
     if chat_area.width == 0 || chat_area.height < 3 || total_height <= viewport {
         return;
     }
+    let x = chat_area
+        .right()
+        .saturating_add(1)
+        .min(frame.area().right().saturating_sub(1));
+    // 画布太窄时宁可不画，也不能让竖条压到正文最后一列。
+    if x <= chat_area.right() {
+        return;
+    }
     let column = Rect {
-        x: chat_area.right(),
+        x,
         y: chat_area.y,
         width: 1,
         height: chat_area.height,

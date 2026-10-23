@@ -81,7 +81,7 @@ impl TranscriptLayout {
             let is_streaming = streaming == Some(index);
             let entry = &mut self.entries[index];
             if !entry.matches(message, is_streaming, width) {
-                let lines = to_owned_lines(message.to_lines(is_streaming, width));
+                let lines = message_lines(messages, index, is_streaming, width);
                 entry.width = width;
                 entry.fingerprint = fingerprint(message, is_streaming);
                 entry.height = measure(&lines, width);
@@ -124,12 +124,13 @@ impl TranscriptLayout {
                 entry.lines = None;
                 continue;
             }
-            let Some(message) = messages.get(index) else {
+            // 消息列表比布局条目短时跳过：没有内容可画，也不该继续推进光标。
+            if messages.get(index).is_none() {
                 continue;
-            };
+            }
             let width = entry.width;
             let lines = entry.lines.get_or_insert_with(|| {
-                to_owned_lines(message.to_lines(streaming == Some(index), width))
+                message_lines(messages, index, streaming == Some(index), width)
             });
 
             // 顶部被裁掉的消息用 Paragraph 自身的滚动跳过整行，底部裁掉的部分由矩形高度截断。
@@ -163,6 +164,26 @@ impl TranscriptLayout {
         }
         rows
     }
+}
+
+/// 构造一条消息的渲染行，并处理消息之间的段落空行。
+///
+/// 同一个工具组里的连续调用保持紧凑——它们属于同一次动作；组结束时（下一条不是
+/// 工具消息）补一行空行，否则 Shell 输出与随后的分析文字会糊成一片。空行计入
+/// 该条消息的高度，因此滚动与点击热区都能保持一致。
+fn message_lines(
+    messages: &[Msg],
+    index: usize,
+    streaming: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let message = &messages[index];
+    let mut lines = to_owned_lines(message.to_lines(streaming, width));
+    let next_is_tool = messages.get(index + 1).is_some_and(Msg::is_tool);
+    if message.is_tool() && !next_is_tool {
+        lines.push(Line::default());
+    }
+    lines
 }
 
 /// 计算整条消息换行后的视觉行数。

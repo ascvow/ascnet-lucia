@@ -4,12 +4,27 @@ use ratatui::style::Color;
 
 pub(crate) const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// 输入框边框活动标题使用的星号闪烁帧。
+///
+/// 与 [`SPINNER`] 的分工：进度点用于"正在加载"这类后台任务，星号只用于输入框边框上的
+/// 思考与维护提示——边框是静态装饰，需要一个更轻的呼吸感，而不是从头转到底的进度点。
+pub(crate) const ACTIVITY_SPARK: &[&str] = &["✳", "✶", "✷", "✸", "✹", "✺", "✻", "✼"];
+
 /// 输入区域的聚焦边框颜色。
 pub(crate) const COLOR_BORDER_FOCUS: Color = Color::Rgb(112, 110, 104);
 /// 主要文字颜色。
 pub(crate) const COLOR_TEXT: Color = Color::Rgb(224, 222, 216);
+/// 正文明细文字颜色：偏灰而非纯白。
+///
+/// 长段落整屏用 [`COLOR_TEXT`] 会把界面拉成一片高亮，读者找不到落点；解释性正文降一档
+/// 亮度后，标题、标记与错误信息才真正"跳"出来。
+pub(crate) const COLOR_TEXT_SOFT: Color = Color::Rgb(180, 180, 180);
 /// 次要文字和边框颜色。
 pub(crate) const COLOR_MUTED: Color = Color::Rgb(124, 122, 116);
+/// 元信息颜色：行号、路径、Git 状态与状态栏分隔符。
+///
+/// 比 [`COLOR_MUTED`] 再暗一档，让这些只在需要时被查找的信息退到背景里。
+pub(crate) const COLOR_META: Color = Color::Rgb(100, 100, 100);
 /// 用户消息强调色：露西亚主题绯红。
 pub(crate) const COLOR_USER: Color = Color::Rgb(226, 61, 82);
 /// 成功状态颜色。
@@ -18,6 +33,11 @@ pub(crate) const COLOR_SUCCESS: Color = Color::Rgb(104, 190, 126);
 pub(crate) const COLOR_WARNING: Color = Color::Rgb(197, 164, 103);
 /// 错误状态颜色。
 pub(crate) const COLOR_DANGER: Color = Color::Rgb(205, 101, 101);
+/// 必须一眼看到的失败提示颜色：比 [`COLOR_DANGER`] 更亮。
+///
+/// 只用于错误标记与错误摘要这类"读漏就要付出代价"的信息；正文里的普通失败描述仍用
+/// [`COLOR_DANGER`]，否则整屏都是警报色，警报本身也就不再是警报。
+pub(crate) const COLOR_DANGER_BRIGHT: Color = Color::Rgb(255, 110, 110);
 /// 用户消息块背景色：与绯红强调同系的暗红灰，用于与助手正文区分。
 pub(crate) const COLOR_USER_BG: Color = Color::Rgb(58, 38, 43);
 
@@ -44,6 +64,13 @@ pub(crate) const COLOR_LINE_NUMBER: Color = Color::Rgb(92, 90, 86);
 pub(crate) const COLOR_CODE: Color = Color::Rgb(206, 184, 146);
 /// 围栏代码块的整块底色：比消息区略亮的深灰，把代码从正文里垫出来。
 pub(crate) const COLOR_CODE_BG: Color = Color::Rgb(34, 33, 38);
+/// 行内代码的底色：与围栏代码块同族、略亮一档。
+///
+/// 行内代码只有几个字符宽，用代码块的底色会显得脏；提高一点亮度后它更像一枚
+/// "标签"，在段落里能被一眼扫到。
+pub(crate) const COLOR_INLINE_CODE_BG: Color = Color::Rgb(45, 44, 50);
+/// 引用块的整块底色：比代码块更暗，靠色差而非竖线区分两种卡片。
+pub(crate) const COLOR_QUOTE_BG: Color = Color::Rgb(28, 28, 32);
 /// diff 新增行的整行背景色。
 pub(crate) const COLOR_DIFF_ADD_BG: Color = Color::Rgb(26, 56, 36);
 /// diff 删除行的整行背景色。
