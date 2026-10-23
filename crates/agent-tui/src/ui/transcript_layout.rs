@@ -11,7 +11,6 @@
 
 use crate::session::conversation::{Msg, MsgKind};
 use crate::theme::COLOR_ASSISTANT_BG;
-use crate::ui::markdown::card_width;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
@@ -260,7 +259,7 @@ fn render_card(frame: &mut Frame, area: Rect, start: i32, height: u16) {
     let card = Rect {
         x: area.x,
         y: u16::try_from(top).unwrap_or(u16::MAX),
-        width: card_width(area.width),
+        width: area.width,
         height: u16::try_from(bottom - top).unwrap_or(0),
     };
     frame.render_widget(

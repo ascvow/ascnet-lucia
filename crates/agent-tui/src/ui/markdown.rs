@@ -99,22 +99,12 @@ pub(crate) fn conversation_lines<'a>(
 const PREFIX_WIDTH: usize = 2;
 /// 表格单列最小内容宽度；再窄竖线之间就只剩空白。
 const TABLE_MIN_COLUMN: usize = 4;
-/// 解释性正文的最大行宽（显示列）。
+/// 回答卡片左右两侧的内边距（显示列）。
 ///
-/// 终端再宽也不把段落拉到整屏：一行超过百来列后，眼睛从行尾折回行首时容易串行。
-/// 代码块与表格不参与这个上限——它们的对齐语义依赖实际可用列数；但整张回答卡片
-/// 的宽度仍由它封顶，见 [`MAX_CARD_WIDTH`]。
-const MAX_PROSE_WIDTH: usize = 100;
-/// 助手回答卡片左右两侧的内边距（显示列）。
-///
-/// 卡片底色不能贴着文字：留出两列后，色块才像一张"垫在文字下面的卡片"，而不是给
-/// 每一行文字刷了一层背景。
-const CARD_PADDING: usize = 2;
-/// 助手回答卡片的最大总宽度：阅读列宽加两侧内边距。
-///
-/// 外部传入再宽的可用宽度（超宽终端、直接调用渲染器），回答也不会被拉成一整行；
-/// 实际显示宽度取它和可用宽度的较小值。
-const MAX_CARD_WIDTH: usize = MAX_PROSE_WIDTH + CARD_PADDING * 2;
+/// 这是全篇唯一一处横向留白：它让文字不贴死卡片与屏幕边缘，同时保持左右对称。
+/// 除它之外没有任何宽度上限——终端多宽，正文、表格与代码块就用多宽。
+/// 跨模块可见是为了让测试能断言"行宽 = 可用宽度 - 这个内边距"。
+pub(crate) const CARD_PADDING: usize = 2;
 /// 围栏代码块卡片左侧的竖条与内部左留白（`▎` 后两列空白）。
 ///
 /// 这道留白是"卡片"感的关键：代码直接贴在竖条上仍然像一段缩进文本。
@@ -170,32 +160,20 @@ enum ListMarker<'a> {
     Ordered(&'a str),
 }
 
-/// 计算助手回答卡片的显示宽度。
-///
-/// 卡片底色由绘制层按这个宽度整块铺出，正文行也按它排版：两处必须取同一个值，
-/// 否则卡片右侧会露出半列底色，或文字越出色块。可用宽度再宽也不会超过
-/// [`MAX_CARD_WIDTH`]，回答因此在宽屏上不会被拉成一整行。
-pub(crate) fn card_width(width: u16) -> u16 {
-    u16::try_from(usize::from(width).min(MAX_CARD_WIDTH).max(1)).unwrap_or(u16::MAX)
-}
-
 /// 将助手回复按 Markdown 渲染，首行带 `●` 标记，续行缩进对齐。
 ///
-/// `width` 为消息区可用显示宽度：表格列宽、列表悬挂缩进、代码块底色宽度都按它
-/// 计算，缺了它这些结构会被 `Paragraph` 的自动换行从中间折断。连续空行折叠为
-/// 一行；`streaming` 为真时在末尾追加光标。
+/// `width` 为消息区的**全部**可用显示宽度：表格列宽、列表悬挂缩进、代码块与引用块
+/// 的底色宽度都按它铺满，不存在任何宽度上限。表格因此能吃掉整行、长测试用例名不再
+/// 被挤成碎块；被压缩成窄盒子的排版只会出现在终端本身变窄的时候。
 ///
-/// 整段回答最终被包进一张卡片：宽度不超过 [`MAX_CARD_WIDTH`]，左侧留
-/// [`CARD_PADDING`] 列内边距。卡片底色由绘制层按 [`card_width`] 整块铺出，这里只
-/// 负责缩进与行宽，因此逐行不会写满整行——文字右侧的余量留着让底色透出来。
+/// 连续空行折叠为一行；`streaming` 为真时在末尾追加光标。整段回答被包进一张卡片，
+/// 卡片宽度等于可用宽度，正文左右各留 [`CARD_PADDING`] 列——这层内边距是唯一的
+/// 横向留白，由绘制层按同一宽度铺出底色。
 pub(crate) fn markdown_lines(text: &str, streaming: bool, width: u16) -> Vec<Line<'static>> {
-    // 卡片总宽先收在阅读宽度内，行首标记与内边距再从它里面扣除。
-    let card_columns = usize::from(card_width(width));
-    let body_width = card_columns
+    // 行首标记与左右内边距从可用宽度里扣除，剩下的全部给正文。
+    let body_width = usize::from(width)
         .saturating_sub(CARD_PADDING * 2 + PREFIX_WIDTH)
         .max(1);
-    // 解释性正文的阅读列宽：超过 MAX_PROSE_WIDTH 之后不再跟着卡片拉长。
-    let text_width = body_width.min(MAX_PROSE_WIDTH);
     let mut rendered: Vec<Line<'static>> = Vec::new();
     let mut previous_is_list = false;
     for block in split_markdown_blocks(text) {
@@ -205,7 +183,7 @@ pub(crate) fn markdown_lines(text: &str, streaming: bool, width: u16) -> Vec<Lin
             rendered.push(Line::default());
         }
         previous_is_list = is_list;
-        render_block(block, body_width, text_width, &mut rendered);
+        render_block(block, body_width, &mut rendered);
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -434,34 +412,29 @@ fn list_item(line: &str) -> Option<(ListMarker<'_>, &str)> {
     Some((ListMarker::Ordered(&line[..digits + 1]), text.trim_start()))
 }
 
-/// 渲染单个 Markdown 块。
+/// 渲染单个 Markdown 块，`body_width` 为消息区扣除行首标记与卡片内边距后的可用列数。
 ///
-/// `body_width` 为消息区扣除行首标记后的整宽，供代码块与表格使用；
-/// `text_width` 是解释性正文的阅读列宽（不超过 [`MAX_PROSE_WIDTH`]）。
-fn render_block(
-    block: MdBlock<'_>,
-    body_width: usize,
-    text_width: usize,
-    out: &mut Vec<Line<'static>>,
-) {
+/// 所有块共用同一个宽度：正文、标题、列表、引用、分隔线与表格都铺满可用宽度，
+/// 不再区分"阅读列宽"与"代码整宽"。
+fn render_block(block: MdBlock<'_>, body_width: usize, out: &mut Vec<Line<'static>>) {
     match block {
         MdBlock::Blank => out.push(Line::default()),
-        MdBlock::Heading { level, text } => render_heading(level, text, text_width, out),
+        MdBlock::Heading { level, text } => render_heading(level, text, body_width, out),
         MdBlock::ListItem {
             indent,
             marker,
             text,
-        } => render_list_item(indent, marker, text, text_width, out),
-        MdBlock::Quote(text) => render_quote(text, text_width, out),
+        } => render_list_item(indent, marker, text, body_width, out),
+        MdBlock::Quote(text) => render_quote(text, body_width, out),
         MdBlock::Rule => out.push(Line::from(Span::styled(
-            "─".repeat(text_width),
+            "─".repeat(body_width),
             Style::new().fg(COLOR_SEPARATOR),
         ))),
         MdBlock::Table(rows) => render_table(&rows, body_width, out),
         MdBlock::Code { language, lines } => render_code(language, &lines, body_width, out),
         MdBlock::Prose(text) => {
             // 段落正文降为明细灰；强调片段在 soften_spans 里保留自己的前景色。
-            let chunks = wrap_inline(inline_spans(text), text_width)
+            let chunks = wrap_inline(inline_spans(text), body_width)
                 .into_iter()
                 .map(soften_spans)
                 .collect();

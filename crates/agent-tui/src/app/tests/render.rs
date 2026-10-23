@@ -1410,21 +1410,62 @@ fn prose_body_uses_soft_gray() {
     assert!(!body.style.add_modifier.contains(Modifier::BOLD));
 }
 
-/// 解释性正文最多排到阅读宽度：助手卡片整体收在 100 列阅读宽 + 两侧内边距内。
+/// 正文必须用满可用宽度：不存在任何阅读宽度上限，也不做居中。
+///
+/// 这条断言覆盖的正是"两侧留出夸张空白"的回归：一旦有人再引入宽度上限，长段落就会
+/// 提前折行、右侧留下空白带。
 #[test]
-fn prose_lines_stop_at_reading_width() {
-    let text = "字".repeat(200);
+fn prose_uses_the_full_available_width() {
+    let text = "字".repeat(400);
     let lines = markdown_lines(&text, false, 200);
     let longest = lines.iter().map(|line| line.width()).max().unwrap_or(0);
 
-    assert!(
-        longest <= 104,
-        "正文卡片宽度应限制在阅读宽度内（100 列 + 两侧 2 列内边距）：{longest}"
+    // 行宽 = 可用宽度 - 卡片右侧内边距：左侧内边距与行首标记已含在行内容里，
+    // 因此唯一余下的空白就是那 2 列对称边距，没有额外窄列。
+    assert_eq!(
+        longest,
+        200 - crate::ui::markdown::CARD_PADDING,
+        "正文行应铺满可用宽度，只在右侧留出与左侧对称的内边距"
     );
-    // 代码块在卡片内部仍然吃满整个卡片宽度：它的对齐语义依赖可用列数。
+    // 代码块与正文同宽：两者都吃满整行，不存在"正文列"与"代码列"两套宽度。
     let code = markdown_lines("```rust\nlet value = 1;\n```", false, 200);
     let widest_code = code.iter().map(|line| line.width()).max().unwrap_or(0);
-    assert_eq!(widest_code, longest, "代码块应铺满卡片宽度");
+    assert_eq!(widest_code, longest, "代码块应与正文同宽");
+}
+
+/// 表格列宽随终端宽度伸展：宽终端上长测试用例名不再被挤成碎块。
+///
+/// 表格是最容易暴露"宽度被限制"的结构：一旦可用宽度被压到百来列，一行的用例名会被
+/// 折成三段，读者无法看出这是一条还是三条结果。
+#[test]
+fn table_columns_expand_with_available_width() {
+    const CASE: &str = "renders_a_very_long_test_case_name_without_breaking_the_columns";
+    let table = format!("| 测试 | 结果 |\n| --- | --- |\n| {CASE} | ok |\n");
+    let narrow = line_texts(&markdown_lines(&table, false, 60));
+    let wide = line_texts(&markdown_lines(&table, false, 180));
+    let widest = |rows: &[String]| rows.iter().map(|row| row.chars().count()).max().unwrap_or(0);
+
+    assert!(
+        widest(&wide) > widest(&narrow),
+        "表格应随终端变宽：{} → {}",
+        widest(&narrow),
+        widest(&wide)
+    );
+    // 宽终端上用例名必须完整落在同一行里，这是"没被挤碎"的直接证据。
+    assert!(
+        wide.iter().any(|row| row.contains(CASE)),
+        "宽终端上用例名不应折行：{wide:#?}"
+    );
+    // 窄终端允许折行，但必须用满窄宽度，不能缩进到小盒子里。
+    assert!(
+        !narrow.iter().any(|row| row.contains(CASE)),
+        "窄终端上用例名应当折行：{narrow:#?}"
+    );
+    assert_eq!(
+        widest(&narrow),
+        60 - crate::ui::markdown::CARD_PADDING,
+        "窄终端上表格也要占满可用宽度"
+    );
 }
 
 /// 行内代码去掉反引号、改用代码色，并带一层与代码块同族的标签底色。

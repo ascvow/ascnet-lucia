@@ -23,12 +23,6 @@ const CHAT_PADDING_X: u16 = 2;
 /// 底部这一行就是输入框上方的分隔空行：日志最后一行与输入盒之间始终隔着一行空白，
 /// 滚动到顶部时它同时充当跳转提示的落点。
 const CHAT_PADDING_Y: u16 = 1;
-/// 主内容区的最大阅读宽度（显示列）。
-///
-/// 宽屏下正文不再一行拉到底：超过这个宽度后余量留成右侧空白。一行超过百来列后，
-/// 眼睛从行尾折回行首时容易串行，助手卡片也会被拉成一条横贯屏幕的色带；右边界
-/// 留在同一列上，滚动条正好落在这条空白里。
-const MAX_CONTENT_WIDTH: u16 = 100;
 
 /// 输入框内部在内容之外额外保留的空白行数。
 ///
@@ -91,12 +85,10 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         horizontal: CHAT_PADDING_X,
         vertical: CHAT_PADDING_Y,
     });
-    // 阅读宽度封顶后只从右侧让出余量：正文、输入盒边框与底栏继续共用同一条左对齐
-    // 线，宽屏下多出来的列留成右侧空白，滚动条正好落在这条空白里。
-    let chat_area = Rect {
-        width: padded_chat.width.min(MAX_CONTENT_WIDTH),
-        ..padded_chat
-    };
+    // 消息区横向铺满窗口：只保留 CHAT_PADDING_X 这一层最基础的左右边距，不再有
+    // 任何最大宽度。表格与长文本因此能吃掉整行，宽终端上右侧不会再留一条空白带；
+    // 正文、输入盒边框与底栏也继续共用同一条左对齐线。
+    let chat_area = padded_chat;
     // 每帧重置热区，空会话和窗口缩小时不能保留上一帧的跳转按钮。
     app.jump_hint_area = None;
     // 滚动条同理：内容不再溢出时先擦掉上一帧的轨道，避免右侧留白残留竖线。
