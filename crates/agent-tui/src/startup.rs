@@ -77,8 +77,8 @@ fn native_workspace_guard(workspace_root: &Path) -> Result<agent_tool::Workspace
 
 /// 返回应用插件持久状态目录。
 #[cfg(feature = "plugins")]
-fn persistent_plugin_state_dir(lucia_home: &Path) -> PathBuf {
-    lucia_home.join("plugin-state")
+fn persistent_plugin_state_dir(lucia_home: &Path, workspace_scope: &str) -> PathBuf {
+    lucia_home.join("plugin-state").join(workspace_scope)
 }
 
 /// 把动态插件宿主同时装配到主 Agent 和后续派生模板。
@@ -252,8 +252,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             (config.build_gateway()?, options, false, Vec::new())
         } else {
             let key_hint = config
-                .model
-                .api_key_env
+                .default_upstream()
+                .ok()
+                .and_then(|upstream| upstream.api_key_env.clone())
                 .as_deref()
                 .map(|name| format!("set environment variable {name}"))
                 .unwrap_or_else(|| {
@@ -489,6 +490,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .with_reasoning_levels(reasoning_levels, reasoning_level)
         .with_persistent_session(Arc::clone(&session_store), session_record)
         .with_context_loader(manual_context_loader);
+    // /model 面板的上游列表来自配置文件；demo 模式没有配置，保持为空。
+    if let Some(config) = configured_agent.as_ref() {
+        app.model_upstreams = config.upstreams().into_iter().cloned().collect();
+    }
     if let Some(input) = model_input_modalities {
         app = app.with_model_modalities(input);
     }
@@ -509,7 +514,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     // 此时配置里的服务商并未注册到网关。
     #[cfg(feature = "plugins")]
     let plugin_default_provider = match configured_agent.as_ref().filter(|_| !demo_mode) {
-        Some(config) => config.model.to_provider_config()?,
+        Some(config) => config.default_upstream()?.to_provider_config()?,
         // 演示模型由应用直接注册到网关，没有对应的服务商配置，这里只需要它的名称。
         None => ModelProviderConfig::new(
             active_provider_name,
@@ -523,7 +528,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         None,
         tui_settings.review_model.clone(),
         plugin_default_provider,
-        Some(persistent_plugin_state_dir(&lucia_home)),
+        Some(persistent_plugin_state_dir(
+            &lucia_home,
+            &plugin_workspace_scope,
+        )),
     )?;
     #[cfg(feature = "plugins")]
     let plugin_agent_runtime = plugin_execution.runtime().clone();
@@ -1172,12 +1180,19 @@ async fn record_run_failure_event(events_jsonl: Option<&Path>, completion: &Agen
 mod tests {
     use super::*;
 
-    /// 插件持久状态目录必须固定落在 Lucia Home 之下。
+    /// 插件持久状态目录必须同时按 Lucia Home 和项目作用域隔离。
     #[cfg(feature = "plugins")]
     #[test]
-    fn persistent_plugin_state_lives_under_lucia_home() {
+    fn persistent_plugin_state_lives_under_project_scope() {
         let home = Path::new("/tmp/lucia-home");
-        assert_eq!(persistent_plugin_state_dir(home), home.join("plugin-state"));
+        assert_eq!(
+            persistent_plugin_state_dir(home, "project-a"),
+            home.join("plugin-state").join("project-a")
+        );
+        assert_ne!(
+            persistent_plugin_state_dir(home, "project-a"),
+            persistent_plugin_state_dir(home, "project-b")
+        );
     }
 
     /// 插件派生模板必须继承动态 Host，确保 worker 工具同样经过审批门禁。

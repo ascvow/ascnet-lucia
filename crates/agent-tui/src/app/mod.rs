@@ -209,6 +209,8 @@ pub(crate) struct App {
     pub(crate) reasoning_level: ReasoningLevel,
     /// models.dev 为当前模型声明的输入模态；`None` 表示快照未匹配，不限制旧行为。
     pub(crate) model_input_modalities: Option<Vec<crate::config::model_metadata::ModelModality>>,
+    /// 配置文件声明的全部上游；`/model` 面板从中选择并热切换。
+    pub(crate) model_upstreams: Vec<agent_core::config::ModelConfig>,
     /// 鼠标捕获是否开启；默认开启，由应用同时处理滚轮、文本拖选和插件点击。
     pub(crate) mouse_capture: bool,
     /// 当前屏幕文本选择；鼠标释放只保留高亮，不主动写入系统剪贴板。
@@ -439,6 +441,7 @@ impl App {
             reasoning_levels: vec![ReasoningLevel::Off],
             reasoning_level: ReasoningLevel::Off,
             model_input_modalities: None,
+            model_upstreams: Vec::new(),
             mouse_capture: true,
             text_selection: None,
             text_selection_content: None,

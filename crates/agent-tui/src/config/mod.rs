@@ -50,6 +50,32 @@ max_steps = 0
 # 默认使用流式模型接口；设为 false 时等待完整响应。
 stream = true
 
+# 多上游配置：每个 [[models]] 注册一个可用 provider，TUI 内用 /model 随时切换。
+# default_model 指定启动默认；缺省取 [model] 或第一个 [[models]]。
+# name 在全部上游中必须唯一，协议支持 open-ai、open-ai-compatible、anthropic、
+# google、bedrock 以及注册了自定义工厂的协议 ID。
+# [[models]]
+# name = "deepseek"
+# provider = "open-ai-compatible"
+# base_url = "https://api.deepseek.com/v1"
+# model = "deepseek-chat"
+# api_key_env = "DEEPSEEK_API_KEY"
+#
+# [[models]]
+# name = "gemini"
+# provider = "google"
+# model = "gemini-2.5-pro"
+# api_key_env = "GEMINI_API_KEY"
+#
+# [[models]]
+# name = "bedrock"
+# provider = "bedrock"
+# model = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+# aws_region = "us-east-1"
+# aws_access_key_id = "AKIA..."
+# aws_secret_access_key = "..."
+# default_model = "gemini"
+
 [tui]
 sessions_dir = "projects"
 # events_jsonl = "events.jsonl"
@@ -295,21 +321,21 @@ pub(crate) fn resolve_config_relative_path(config_path: &Path, path: &Path) -> P
     }
 }
 
-/// 判断配置中的模型密钥是否可以用于本次启动。
+/// 判断配置中至少一个上游的模型密钥是否可以用于本次启动。
 ///
-/// 明文密钥和环境变量任一包含非空值即视为可用；该检查不会读取或记录密钥内容。
+/// 任一上游的明文密钥或环境变量包含非空值即视为可用；该检查不会读取或记录密钥内容。
 pub(crate) fn configured_model_key_is_available(config: &AgentRootConfig) -> bool {
-    config
-        .model
-        .api_key
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-        || config
-            .model
-            .api_key_env
+    config.upstreams().iter().any(|model| {
+        model
+            .api_key
             .as_deref()
-            .and_then(std::env::var_os)
-            .is_some_and(|value| !value.is_empty())
+            .is_some_and(|value| !value.trim().is_empty())
+            || model
+                .api_key_env
+                .as_deref()
+                .and_then(std::env::var_os)
+                .is_some_and(|value| !value.is_empty())
+    })
 }
 
 #[cfg(test)]
@@ -331,13 +357,14 @@ mod tests {
 
         let model_config = agent_core::config::AgentRootConfig::load(&path)
             .expect("模板中的模型配置应可由 Core 解析");
+        let default_model = model_config.default_upstream().expect("模板应有默认上游");
         assert_eq!(
-            model_config.model.base_url.as_deref(),
+            default_model.base_url.as_deref(),
             Some("https://api.openai.com/v1")
         );
-        assert_eq!(model_config.model.model, "gpt-5");
-        assert_eq!(model_config.model.api_key.as_deref(), Some(""));
-        assert!(model_config.model.api_key_env.is_none());
+        assert_eq!(default_model.model, "gpt-5");
+        assert_eq!(default_model.api_key.as_deref(), Some(""));
+        assert!(default_model.api_key_env.is_none());
         assert_eq!(model_config.agent.max_steps, Some(0));
         #[cfg(unix)]
         {

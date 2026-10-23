@@ -309,6 +309,10 @@ fn resolve_route(
         )?,
         extra_headers: HashMap::new(),
         gateway: parse_enum(plugin_id, config, "gateway", GatewayKind::default())?,
+        aws_region: optional_string(plugin_id, config, "aws_region")?,
+        aws_access_key_id: optional_string(plugin_id, config, "aws_access_key_id")?,
+        aws_secret_access_key: optional_string(plugin_id, config, "aws_secret_access_key")?,
+        aws_session_token: optional_string(plugin_id, config, "aws_session_token")?,
     };
 
     let mut route = AgentModelConfig::new(provider, model);

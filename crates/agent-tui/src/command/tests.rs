@@ -47,6 +47,7 @@ fn native_registry_contains_default_commands() {
             "compact",
             "clear",
             "reasoning",
+            "model",
             "plugins",
             "keys",
             "help",
@@ -64,6 +65,7 @@ fn native_registry_contains_default_commands() {
             "compact",
             "clear",
             "reasoning",
+            "model",
             "keys",
             "help",
             "exit"
@@ -707,4 +709,75 @@ fn native_reasoning_panel_applies_selected_level() {
     assert!(app.native_command.reasoning_panel.is_none());
     assert_eq!(app.reasoning_level, ReasoningLevel::Medium);
     assert_eq!(agent.reasoning_level(), ReasoningLevel::Medium);
+}
+
+/// `/model` 必须热切换共享 Agent 上游，并同步状态栏模型名；无上游时给出提示。
+#[test]
+fn model_command_switches_shared_agent_upstream() {
+    use agent_core::config::ModelConfig;
+    use agent_core::Agent;
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "gpt-5".into());
+    app.model_upstreams = vec![
+        ModelConfig {
+            name: "openai-main".into(),
+            provider: agent_core::model::ProviderKind::OpenAi,
+            model: "gpt-5".into(),
+            api_key: Some("test-key".into()),
+            api_key_env: None,
+            base_url: None,
+            openai_protocol: agent_core::model::OpenAiProtocol::default(),
+            extra_headers: Default::default(),
+            gateway: Default::default(),
+            aws_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_session_token: None,
+        },
+        ModelConfig {
+            name: "deepseek".into(),
+            provider: agent_core::model::ProviderKind::OpenAiCompatible,
+            model: "deepseek-chat".into(),
+            api_key: Some("test-key".into()),
+            api_key_env: None,
+            base_url: Some("https://api.deepseek.com/v1".into()),
+            openai_protocol: agent_core::model::OpenAiProtocol::ChatCompletions,
+            extra_headers: Default::default(),
+            gateway: Default::default(),
+            aws_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_session_token: None,
+        },
+    ];
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+
+    // 面板打开后按 Enter 切换到当前高亮项。
+    app.input = "/model".into();
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
+    assert!(app.native_command.model_panel.is_some());
+    assert!(app.handle_native_command_key(KeyCode::Down, KeyModifiers::NONE, Some(&agent)));
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
+    assert!(app.native_command.model_panel.is_none());
+    assert_eq!(app.model_name, "deepseek-chat");
+    let route = agent.active_route();
+    assert_eq!(route.provider, "deepseek");
+    assert_eq!(route.model, "deepseek-chat");
+
+    // 按名称切换未知上游必须报错而不改变当前路由。
+    app.input = "/model missing".into();
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
+    assert_eq!(agent.active_route().provider, "deepseek");
+
+    // 无上游配置时给出可读提示。
+    let (tx2, _rx2) = mpsc::unbounded_channel();
+    let mut empty = App::new(tx2, "gpt-5".into());
+    empty.input = "/model".into();
+    empty.cursor = empty.input.len();
+    assert!(empty.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
+    assert!(empty.native_command.model_panel.is_none());
 }

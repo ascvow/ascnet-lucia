@@ -252,7 +252,13 @@ fn inspect_config(path: &Path, explicit: bool, report: &mut DoctorReport) -> Tui
                 "config",
                 "model",
                 CheckStatus::Pass,
-                format!("模型配置可解析：{}", config.model.model),
+                format!(
+                    "模型配置可解析：{}",
+                    config
+                        .default_upstream()
+                        .map(|upstream| upstream.model.as_str())
+                        .unwrap_or("<missing>")
+                ),
             );
             if configured_model_key_is_available(&config) {
                 report.push(

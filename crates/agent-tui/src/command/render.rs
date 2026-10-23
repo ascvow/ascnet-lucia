@@ -54,6 +54,10 @@ pub(crate) fn render_native_command_panel(frame: &mut Frame, app: &App, area: Re
         render_native_reasoning_panel(frame, app, area);
         return;
     }
+    if app.native_command.model_panel.is_some() {
+        render_native_model_panel(frame, app, area);
+        return;
+    }
     let matches = app.slash_command_matches();
     if matches.is_empty() {
         return;
@@ -179,6 +183,45 @@ fn render_native_reasoning_panel(frame: &mut Frame, app: &App, area: Rect) {
                 "{current} {:<6} {}",
                 reasoning_level_command_value(*level),
                 reasoning_level_label(*level)
+            );
+            Line::from(selected_row(&label, index == selected, row_width))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::new()
+                .borders(Borders::TOP)
+                .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
+                .padding(Padding::horizontal(1)),
+        ),
+        area,
+    );
+}
+
+/// 在输入框上方绘制命令面板风格的模型上游选择；选项来自配置文件的多上游定义。
+fn render_native_model_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(panel) = app.native_command.model_panel.as_ref() else {
+        return;
+    };
+    let selected = panel
+        .selected
+        .min(app.model_upstreams.len().saturating_sub(1));
+    let row_width = usize::from(area.width.saturating_sub(4));
+    let lines = app
+        .model_upstreams
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let current = if entry.model == app.model_name {
+                "●"
+            } else {
+                " "
+            };
+            let label = format!(
+                "{current} {:<14} {}  {}",
+                entry.name,
+                entry.provider.protocol_id(),
+                entry.model
             );
             Line::from(selected_row(&label, index == selected, row_width))
         })

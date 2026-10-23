@@ -27,6 +27,40 @@ api_key = "sk-..."
 openai_protocol = "responses"
 ```
 
+### 多上游配置与模型切换
+
+除单 `[model]` 段外，可以用 `[[models]]` 数组配置任意数量的上游，并混用协议；`default_model` 指定启动默认（缺省取 `[model]` 或第一个 `[[models]]`）。`name` 在全部上游中必须唯一。
+
+```toml
+default_model = "deepseek"
+
+[[models]]
+name = "deepseek"
+provider = "open-ai-compatible"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[[models]]
+name = "gemini"
+provider = "google"
+model = "gemini-2.5-pro"
+api_key_env = "GEMINI_API_KEY"
+
+[[models]]
+name = "bedrock"
+provider = "bedrock"
+model = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+aws_region = "us-east-1"
+aws_access_key_id = "AKIA..."
+aws_secret_access_key = "..."
+# aws_session_token = "..."
+```
+
+`provider` 支持内置协议 `open-ai`（Responses）、`open-ai-compatible`（Chat Completions）、`anthropic`（Messages）、`google`（Generative AI `generateContent`）与 `bedrock`（Converse）；第三方可通过应用层注册自定义协议工厂扩展新的协议 ID。TUI 内输入 `/model` 打开上游选择面板，或用 `/model <名称>` 直接切换；切换只在当前会话生效（会话级），重启后回到 `default_model`。网关注册表使用内部读写锁，运行期切换对派生 Agent 与插件模型路由同样生效。
+
+### 模型协议映射
+
 `base_url` 是模型服务 URL，`model` 是请求使用的模型名称。Lucia 打包时下载并内置 `models.dev/api.json`，运行时优先按服务商和模型 ID 精确读取上下文窗口、输出 token 上限、思考等级及输入输出模态；服务商未命中但模型 ID 在快照中唯一时仍会使用该模型配置，不依赖网络。重复模型 ID 必须通过 `models_dev_provider` 指定服务商消歧。`context_window`、`agent.max_tokens` 和 `agent.reasoning` 可显式覆盖；其中输出上限和思考等级不得超出快照声明的能力。未显式配置 `agent.max_tokens` 时采用快照声明的输出上限，OpenAI Responses 兼容网关也会收到标准 `max_output_tokens` 字段，避免回落到过小的网关默认额度。图片、普通文件和 PDF 在输入框中分别显示为 `[IMAGE#N]`、`[FILE#N]`、`[PDF#N]`，并在加入时校验模型输入能力；普通粘贴文本折叠为 `[粘贴的文本]`，删除标签会同步删除绑定的原文。音频、视频能力会被识别，但 Lucia 当前模型协议尚未实现对应内容块，因此不会误发送。输入输出模态只用于能力校验，不在底栏显示，也不会把尚未实现的图片、音频或视频输出伪装成文本。OpenAI 与 Anthropic 自动映射官方服务商 ID；兼容网关可用 `models_dev_provider` 指定对应 ID。密钥默认使用 `api_key = "..."` 直接配置，也可以删除该字段并改用 `api_key_env = "OPENAI_API_KEY"` 指定环境变量名；两者同时存在时 `api_key` 优先。TUI 输入 `/reasoning` 后会在输入框上方打开命令面板风格的等级列表，可用方向键选择 models.dev 声明的等级并按 Enter 应用；`/effort` 与 `/effo` 是兼容别名。也可使用 `/reasoning high` 精确切换，或使用 `/reasoning next`、`Ctrl+R` 循环切换。切换成功后会原子写回本次启动实际使用的配置文件，只影响后续模型请求；写回失败时运行态保持原等级。OpenAI Responses 的非关闭等级仍会请求自动推理摘要，用于判断模型是否处于思考阶段；摘要文本不显示、不进入消息或 Session，思考期间的运行状态显示为 `Thinking...`。
 
 `agent.cache_retention` 控制提示缓存保留策略，缺省为 `short`，普通 `run` 和 `run_session` 会自动使用，不需要缓存专用运行 API。`none` 不发送显式缓存控制；`long` 对 OpenAI 请求 `24h`，对 Anthropic 请求 `1h`。OpenAI 以当前会话 ID 作为缓存亲和键，Anthropic 会在 system、最后一个工具和最近用户内容上写入缓存断点。路由方式由 `model.gateway` 声明的网关厂商决定：`open-ai` 用请求体里的 `prompt_cache_key`；`open-router` 发送 `x-session-id`；缺省的 `open-ai-compatible` 同时发送标准 `prompt_cache_key` 和 `session_id`、`x-client-request-id`、`x-session-affinity` 三个会话亲和 header；`anthropic` 不需要额外路由字段。自建代理和第三方中转保持缺省即可。上下文压缩摘要的前缀在压缩完成后就不再出现，因此固定关闭缓存保留，只保留会话路由标识。插件模型补全反过来是"固定 system + 短小可变正文"的高频调用，跟随同一份缓存配置，并按插件 ID 分组缓存键（`plugin:<id>`），与主会话的缓存分区互不驱逐。兼容网关需要覆盖路由字段时，可通过现有 `agent.provider_options` 显式配置。

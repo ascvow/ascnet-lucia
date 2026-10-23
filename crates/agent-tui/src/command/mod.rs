@@ -105,6 +105,13 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
         description: "用法：/reasoning [off|minimal|low|medium|high|xhigh|max|next]；不带参数时打开等级选择界面。",
         idle_only: false,
     },
+    NativeCommandSpec {
+        name: "model",
+        aliases: &[],
+        summary: "查看或切换模型上游",
+        description: "用法：/model [名称]；不带参数时打开上游选择界面。切换只在当前会话生效，重启后回到配置的默认上游。",
+        idle_only: true,
+    },
     #[cfg(feature = "plugins")]
     NativeCommandSpec {
         name: "plugins",
@@ -198,6 +205,13 @@ pub(crate) struct NativeSessionDialog {
 #[derive(Debug)]
 pub(crate) struct NativeReasoningPanel {
     /// 当前高亮等级在 models.dev 可用等级列表中的下标。
+    pub(crate) selected: usize,
+}
+
+/// 模型上游内联选择面板的交互状态。
+#[derive(Debug)]
+pub(crate) struct NativeModelPanel {
+    /// 当前高亮上游在配置列表中的下标。
     pub(crate) selected: usize,
 }
 
@@ -307,6 +321,8 @@ pub(crate) struct NativeCommandState {
     pub(crate) dialog: Option<NativeSessionDialog>,
     /// 当前显示在输入框上方的思考等级选择面板。
     pub(crate) reasoning_panel: Option<NativeReasoningPanel>,
+    /// 当前显示在输入框上方的模型上游选择面板。
+    pub(crate) model_panel: Option<NativeModelPanel>,
     /// 当前人工插件管理页；纯 Core 构建不包含该状态。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_dialog: Option<NativePluginDialog>,
@@ -394,6 +410,11 @@ impl App {
                 .unwrap_or(u16::MAX)
                 .saturating_add(1);
         }
+        if self.native_command.model_panel.is_some() {
+            return u16::try_from(self.model_upstreams.len().max(1))
+                .unwrap_or(u16::MAX)
+                .saturating_add(1);
+        }
         #[cfg(feature = "plugins")]
         if self.plugin_slash_trigger_is_exact() {
             return 0;
@@ -469,6 +490,12 @@ impl App {
                 self.last_escape_at = None;
             }
             return self.handle_native_reasoning_panel_key(code, modifiers, agent);
+        }
+        if self.native_command.model_panel.is_some() {
+            if matches!(code, KeyCode::Esc) {
+                self.last_escape_at = None;
+            }
+            return self.handle_native_model_panel_key(code, modifiers, agent);
         }
         #[cfg(feature = "plugins")]
         if self.native_command.plugin_dialog.is_some() {
@@ -598,6 +625,7 @@ impl App {
             }
             "compact" => self.execute_native_compact(),
             "reasoning" => self.execute_reasoning_command(parts.next(), agent),
+            "model" => self.execute_model_command(parts.next(), agent),
             "keys" => self.start_key_inspection(),
             "exit" => self.should_quit = true,
             _ => unreachable!("原生命令表与执行路由必须同步"),
@@ -627,6 +655,152 @@ impl App {
             return;
         };
         self.set_reasoning_level(level, agent);
+    }
+
+    /// 执行 `/model`：无参数打开上游选择界面，带参数按名称直接切换。
+    ///
+    /// 切换为会话级：只覆盖共享 Agent 的路由，不写回配置文件。
+    fn execute_model_command(&mut self, value: Option<&str>, agent: Option<&Arc<Agent>>) {
+        if self.model_upstreams.is_empty() {
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                "配置中没有可切换的上游；在 config.toml 添加 [[models]] 后即可使用 /model。",
+            ));
+            return;
+        }
+        if let Some(value) = value {
+            let matched = self
+                .model_upstreams
+                .iter()
+                .find(|entry| entry.name == value)
+                .cloned();
+            let Some(entry) = matched else {
+                self.messages.push(Msg::new(
+                    MsgKind::Error,
+                    format!(
+                        "未知上游 `{value}`；可用上游：{}",
+                        self.model_upstreams
+                            .iter()
+                            .map(|entry| entry.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ),
+                ));
+                return;
+            };
+            self.switch_to_upstream(&entry, agent);
+            return;
+        }
+        let selected = self
+            .model_upstreams
+            .iter()
+            .position(|entry| entry.model == self.model_name)
+            .unwrap_or(0);
+        self.native_command.model_panel = Some(NativeModelPanel { selected });
+    }
+
+    /// 处理模型上游内联面板的键盘导航，并在确认后热切换共享 Agent。
+    fn handle_native_model_panel_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        agent: Option<&Arc<Agent>>,
+    ) -> bool {
+        if crate::app::is_copy_shortcut(code, modifiers) {
+            return false;
+        }
+        let item_count = self.model_upstreams.len();
+        let Some(panel) = self.native_command.model_panel.as_mut() else {
+            return false;
+        };
+        match code {
+            KeyCode::Esc => self.native_command.model_panel = None,
+            KeyCode::Up if item_count > 0 => {
+                panel.selected = panel.selected.checked_sub(1).unwrap_or(item_count - 1);
+            }
+            KeyCode::Down if item_count > 0 => {
+                panel.selected = (panel.selected + 1) % item_count;
+            }
+            KeyCode::Enter if item_count > 0 => {
+                let entry = self.model_upstreams[panel.selected.min(item_count - 1)].clone();
+                self.native_command.model_panel = None;
+                self.switch_to_upstream(&entry, agent);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// 把共享 Agent 热切换到指定上游，并刷新状态栏与 models.dev 元数据。
+    fn switch_to_upstream(
+        &mut self,
+        entry: &agent_core::config::ModelConfig,
+        agent: Option<&Arc<Agent>>,
+    ) {
+        let Some(agent) = agent else {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "模型尚未就绪，无法切换上游"));
+            return;
+        };
+        let provider_config = match entry.to_provider_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.messages.push(Msg::new(
+                    MsgKind::Error,
+                    format!("上游 `{}` 凭据不可用：{error}", entry.name),
+                ));
+                return;
+            }
+        };
+        if let Err(error) = agent.switch_model_upstream(provider_config, entry.model.clone()) {
+            self.messages.push(Msg::new(
+                MsgKind::Error,
+                format!("切换到上游 `{}` 失败：{error}", entry.name),
+            ));
+            return;
+        }
+        self.model_name = entry.model.clone();
+        self.refresh_model_metadata(entry);
+        self.messages.push(Msg::new(
+            MsgKind::Info,
+            format!(
+                "模型已切换为 {}（{}，{}）",
+                entry.name,
+                entry.provider.protocol_id(),
+                entry.model
+            ),
+        ));
+    }
+
+    /// 按切换后的上游重新解析 models.dev 元数据；未命中时恢复缺省展示。
+    fn refresh_model_metadata(&mut self, entry: &agent_core::config::ModelConfig) {
+        let provider_id = match entry.provider.protocol_id() {
+            "open-ai" | "open-ai-compatible" => Some("openai"),
+            "anthropic" => Some("anthropic"),
+            _ => None,
+        };
+        let metadata = provider_id.and_then(|provider| {
+            crate::config::model_metadata::find_model_metadata(provider, &entry.model)
+                .ok()
+                .flatten()
+        });
+        self.context_window = metadata.as_ref().and_then(|meta| meta.context_window);
+        self.model_input_modalities = metadata.as_ref().map(|meta| meta.input_modalities.clone());
+        let levels = metadata
+            .map(|meta| meta.reasoning_levels)
+            .filter(|levels| !levels.is_empty());
+        match levels {
+            Some(levels) => {
+                if !levels.contains(&self.reasoning_level) {
+                    self.reasoning_level = ReasoningLevel::Off;
+                }
+                self.reasoning_levels = levels;
+            }
+            None => {
+                self.reasoning_levels = vec![ReasoningLevel::Off];
+                self.reasoning_level = ReasoningLevel::Off;
+            }
+        }
     }
 
     /// 处理思考等级内联面板的键盘导航，并在确认后同步 TUI 与共享 Agent。
