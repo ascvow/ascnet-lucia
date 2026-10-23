@@ -2,6 +2,7 @@
 
 use super::App;
 use crate::app::{is_command_modifier, MouseTextSelection, ESC_DOUBLE_PRESS_WINDOW};
+use crate::command::PathInput;
 use crate::session::attachment::{
     attachment_media_type, attachment_modality, clipboard_file_path, copy_to_clipboard,
     looks_like_file_path, pasted_file_path,
@@ -133,6 +134,11 @@ impl App {
                 self.cursor = next_word_boundary(&self.input, self.cursor);
             }
             KeyCode::Enter => {
+                // 整条输入或首段其实是本地文件时转为附件：绝对路径、`~/`、`./` 与裸
+                // 文件名都与命令路由共用 handle_path_input 一处判据，两条入口不各自推断。
+                if self.handle_path_input() == PathInput::Attached {
+                    return;
+                }
                 // 后台命令可能随时替换会话记录，期间禁止并发提交新消息。
                 if self.pending_reload.is_some() {
                     self.messages
@@ -464,7 +470,10 @@ impl App {
     }
 
     /// 完成一次输入内容修改后的统一清理。
-    fn finish_input_edit(&mut self) {
+    ///
+    /// 供命令路由在改写输入后复用（例如把路径输入转成附件标签），
+    /// 保证历史游标、Esc 计时与附件回收与普通编辑一致。
+    pub(crate) fn finish_input_edit(&mut self) {
         self.input_history_cursor = None;
         self.last_escape_at = None;
         self.prune_attachments();

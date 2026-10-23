@@ -803,13 +803,47 @@ fn native_attach_command_adds_local_file() {
     assert!(app.messages.is_empty());
 }
 
-/// 已有待发送附件时，`/attach` 与其他斜杠命令一样被拒绝并提示先移除。
+/// 已有待发送附件时，`/attach` 与"直接输入路径"一致地继续追加，而不是被
+/// "斜杠命令不能携带附件"误拒；其他斜杠命令仍保持拒绝。
 #[test]
-fn native_attach_command_rejects_when_attachment_pending() {
+fn native_attach_command_appends_when_attachment_pending() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let first = std::env::temp_dir().join(format!(
+        "lucia-attach-pending-a-{}-{}.png",
+        std::process::id(),
+        agent_session::SessionId::generate()
+    ));
+    let second = std::env::temp_dir().join(format!(
+        "lucia-attach-pending-b-{}-{}.png",
+        std::process::id(),
+        agent_session::SessionId::generate()
+    ));
+    std::fs::write(&first, b"\x89PNG\r\n\x1a\n").expect("写入附件命令测试文件");
+    std::fs::write(&second, b"\x89PNG\r\n\x1a\n").expect("写入附件命令测试文件");
+
+    app.input = format!("/attach {}", first.display());
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    assert_eq!(app.attachments.len(), 1);
+
+    app.input = format!("/attach {}", second.display());
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    std::fs::remove_file(&first).ok();
+    std::fs::remove_file(&second).ok();
+
+    assert_eq!(app.attachments.len(), 2, "`/attach` 必须追加而不是拒绝");
+    assert_eq!(app.input, "[IMAGE#1] [IMAGE#2] ");
+}
+
+/// 除 `/attach` 外的斜杠命令仍然拒绝携带既有附件。
+#[test]
+fn native_non_attach_command_rejects_pending_attachment() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let path = std::env::temp_dir().join(format!(
-        "lucia-attach-pending-{}-{}.png",
+        "lucia-attach-reject-{}-{}.png",
         std::process::id(),
         agent_session::SessionId::generate()
     ));
@@ -818,18 +852,242 @@ fn native_attach_command_rejects_when_attachment_pending() {
     app.input = format!("/attach {}", path.display());
     app.cursor = app.input.len();
     assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    std::fs::remove_file(&path).ok();
     assert_eq!(app.attachments.len(), 1);
 
-    app.input = format!("/attach {}", path.display());
+    app.input = "/help".into();
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+
+    assert!(app
+        .messages
+        .last()
+        .is_some_and(|message| message.text.contains("斜杠命令不能携带附件")));
+}
+
+/// 直接输入以 `/` 开头的绝对路径时，不能被当成斜杠命令：存在的文件转为附件。
+#[test]
+fn native_command_route_treats_absolute_path_as_attachment() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = std::env::temp_dir().join(format!(
+        "lucia-path-input-{}-{}.png",
+        std::process::id(),
+        agent_session::SessionId::generate()
+    ));
+    std::fs::write(&path, b"\x89PNG\r\n\x1a\n").expect("写入路径输入测试文件");
+
+    app.input = path.display().to_string();
     app.cursor = app.input.len();
     assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
     std::fs::remove_file(&path).ok();
 
     assert_eq!(app.attachments.len(), 1);
+    assert_eq!(app.attachments[0].media_type, "image/png");
+    assert_eq!(app.input, "[IMAGE#1] ");
+    assert!(app.messages.is_empty(), "不得报未知命令");
+}
+
+/// 已有待发送附件时再直接输入路径应追加第二个附件，而不是被
+/// "斜杠命令不能携带附件"误拒——路径输入不是斜杠命令。
+#[test]
+fn native_command_route_appends_path_input_with_pending_attachment() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let first = std::env::temp_dir().join(format!(
+        "lucia-path-append-a-{}-{}.png",
+        std::process::id(),
+        agent_session::SessionId::generate()
+    ));
+    let second = std::env::temp_dir().join(format!(
+        "lucia-path-append-b-{}-{}.pdf",
+        std::process::id(),
+        agent_session::SessionId::generate()
+    ));
+    std::fs::write(&first, b"\x89PNG\r\n\x1a\n").expect("写入路径输入测试文件");
+    std::fs::write(&second, b"%PDF-1.7").expect("写入路径输入测试文件");
+
+    app.input = format!("/attach {}", first.display());
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    assert_eq!(app.attachments.len(), 1);
+
+    // 真实场景：引用标签还留在输入框里，用户在后面继续输入路径。
+    app.input.push_str(&second.display().to_string());
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    std::fs::remove_file(&first).ok();
+    std::fs::remove_file(&second).ok();
+
+    assert_eq!(app.attachments.len(), 2);
+    assert_eq!(app.attachments[0].media_type, "image/png");
+    assert_eq!(app.attachments[1].media_type, "application/pdf");
+    assert_eq!(
+        app.input, "[IMAGE#1] [PDF#1] ",
+        "追加的标签排在已有标签之后"
+    );
+    assert!(!app
+        .messages
+        .iter()
+        .any(|message| message.text.contains("斜杠命令不能携带附件")));
+}
+
+/// "/路径 + 提问"写法：首段是真实文件时转为附件，余下正文留在输入框继续编辑。
+#[test]
+fn native_command_route_attaches_leading_path_and_keeps_text() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = std::env::temp_dir().join(format!(
+        "lucia-path-with-text-{}-{}.png",
+        std::process::id(),
+        agent_session::SessionId::generate()
+    ));
+    std::fs::write(&path, b"\x89PNG\r\n\x1a\n").expect("写入路径输入测试文件");
+
+    app.input = format!("{} 这张图有什么问题", path.display());
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(app.attachments.len(), 1);
+    assert_eq!(
+        app.input, "[IMAGE#1] 这张图有什么问题",
+        "引用标签插在路径原位置，余下正文必须保留"
+    );
+    assert!(app.messages.is_empty(), "不得报未知命令或文件错误");
+}
+
+/// 以 `/` 开头但其实是正文的句子必须作为普通消息提交，不能被命令路由吞掉。
+#[test]
+fn native_command_route_lets_path_like_sentence_through() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.input = "/usr/bin 应该加入 PATH".into();
+    app.cursor = app.input.len();
+    assert!(
+        !app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None),
+        "带正文的路径句子必须交回主输入区提交"
+    );
+
+    assert!(app.attachments.is_empty());
+    assert!(app.messages.is_empty(), "不得报未知命令或文件错误");
+    assert_eq!(app.input, "/usr/bin 应该加入 PATH", "交回前不得改动输入");
+    assert!(!app.input.is_empty());
+}
+
+/// "`./` 相对路径 + 提问"与绝对路径行为一致：首段转附件、正文留在输入框。
+///
+/// 绝对路径走命令路由，`./` 与 `~/` 走主输入区；两者必须共用同一判据，
+/// 否则同样的"路径 + 提问"写法只在绝对路径下生效。
+#[test]
+fn path_input_supports_relative_path_with_trailing_text() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let dir = std::env::temp_dir().join(format!(
+        "lucia-relative-path-{}-{}",
+        std::process::id(),
+        agent_session::SessionId::generate()
+    ));
+    std::fs::create_dir_all(&dir).expect("创建相对路径测试目录");
+    let path = dir.join("相对图.png");
+    std::fs::write(&path, b"\x89PNG\r\n\x1a\n").expect("写入相对路径测试文件");
+    app.workspace.cwd = dir.clone();
+
+    app.input = "./相对图.png 这张图有什么问题".into();
+    app.cursor = app.input.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
+
+    assert_eq!(app.attachments.len(), 1);
+    assert_eq!(app.attachments[0].media_type, "image/png");
+    assert_eq!(app.input, "[IMAGE#1] 这张图有什么问题");
+    assert!(app.messages.is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 普通单词与自然语言不能被路径判定劫持成"找不到文件"。
+#[test]
+fn path_input_ignores_plain_words() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    for text in ["hello", "看看这个", "notes.md 怎么说"] {
+        app.input = text.into();
+        app.cursor = app.input.len();
+        assert_eq!(
+            app.handle_path_input(),
+            PathInput::NotPath,
+            "`{text}` 不是文件路径"
+        );
+        assert!(app.messages.is_empty(), "`{text}` 不得产生文件错误");
+        assert_eq!(app.input, text, "交回前不得改动输入");
+    }
+}
+
+/// 单段绝对路径与命令名无法区分，按命令处理，不能被当成路径吞掉。
+#[test]
+fn path_input_lets_single_segment_absolute_path_reach_command_route() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.input = "/tmp".into();
+    app.cursor = app.input.len();
+    assert_eq!(app.handle_path_input(), PathInput::NotPath);
+    assert!(app.messages.is_empty());
+}
+
+/// 路径输入时不得弹出命令补全面板。
+#[test]
+fn native_command_panel_hidden_for_path_input() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.input = "/usr/local/bin/lucia".into();
+    app.cursor = app.input.len();
+    assert!(!app.handle_native_command_key(KeyCode::Tab, KeyModifiers::NONE, None));
+    assert_eq!(app.input, "/usr/local/bin/lucia", "Tab 不得改写路径输入");
+
+    // 单独 `/` 仍是补全入口。
+    app.input = "/".into();
+    app.cursor = 1;
+    assert!(app.handle_native_command_key(KeyCode::Tab, KeyModifiers::NONE, None));
+    assert!(app.input.trim_end().contains('/'));
+}
+
+/// 形如路径但文件不存在时报"找不到文件"，而不是让用户以为命令名打错。
+#[test]
+fn native_command_route_reports_missing_path_not_unknown_command() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.input = "/nonexistent/lucia.png".into();
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+
+    assert!(app.attachments.is_empty());
     assert!(app
         .messages
         .last()
-        .is_some_and(|message| message.text.contains("斜杠命令不能携带附件")));
+        .is_some_and(|message| message.text.contains("找不到可读取的文件")));
+    assert!(!app.messages.iter().any(|m| m.text.contains("未知命令")));
+}
+
+/// 不含额外 `/` 的未知命令仍按命令名笔误提示，不被路径判定吞掉。
+#[test]
+fn native_command_route_keeps_unknown_command_hint() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.input = "/modle".into();
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+
+    assert!(app.attachments.is_empty());
+    assert!(app
+        .messages
+        .last()
+        .is_some_and(|message| message.text.contains("未知命令")));
 }
 
 /// `/attach` 找不到文件或缺少参数时必须给出提示，且不创建附件。

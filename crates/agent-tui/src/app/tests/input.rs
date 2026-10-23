@@ -497,6 +497,81 @@ fn pasted_file_path_parses_dropped_paths() {
     assert_eq!(pasted_file_path(&display, &base), None);
 }
 
+/// 直接输入相对路径（`./` 前缀或裸文件名）回车后转为附件，而不是当文本发送。
+#[test]
+fn enter_converts_relative_path_input_to_attachment() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("直接输入的图.png", b"\x89PNG\r\n\x1a\n");
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    app.workspace.cwd = path.parent().unwrap().to_path_buf();
+
+    app.input = format!("./{name}");
+    app.cursor = app.input.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
+
+    assert_eq!(app.attachments.len(), 1);
+    assert_eq!(app.attachments[0].media_type, "image/png");
+    assert_eq!(app.input, "[IMAGE#1] ");
+    assert!(!app.running, "转为附件时不得同时提交消息");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 不是本地文件的输入仍按普通消息发送，不被路径判定吞掉。
+#[test]
+fn enter_sends_non_path_input_as_message() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.input = "看看 ./不存在的图.png 这个".into();
+    app.cursor = app.input.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
+
+    assert!(app.attachments.is_empty());
+    assert!(app.input.is_empty(), "普通消息应被提交并清空输入");
+    assert!(!app.running, "无 Agent 时进入排队而不是直接运行");
+}
+
+/// 以 `/` 开头但其实是正文的句子按普通消息提交，不被路径或命令判定吞掉。
+#[test]
+fn enter_sends_slash_prefixed_sentence_as_message() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.input = "/usr/bin 应该加入 PATH".into();
+    app.cursor = app.input.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
+
+    assert!(app.attachments.is_empty());
+    assert!(app.input.is_empty(), "普通消息应被提交并清空输入");
+    assert!(
+        !app.messages
+            .iter()
+            .any(|message| matches!(message.kind, MsgKind::Error)),
+        "不得报未知命令或文件错误"
+    );
+}
+
+/// 直接输入绝对路径回车后转为附件，不当命令、也不当文本发送。
+#[test]
+fn enter_converts_absolute_path_input_to_attachment() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("绝对路径的图.png", b"\x89PNG\r\n\x1a\n");
+
+    app.input = path.display().to_string();
+    app.cursor = app.input.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
+
+    assert_eq!(app.attachments.len(), 1);
+    assert_eq!(app.attachments[0].media_type, "image/png");
+    assert_eq!(app.input, "[IMAGE#1] ");
+    assert!(!app.running, "转为附件时不得同时提交消息");
+
+    std::fs::remove_file(&path).ok();
+}
+
 /// Finder 复制文件时粘贴的文本只有文件名：应回查剪贴板文件引用并附加该文件。
 #[test]
 fn paste_bare_filename_uses_clipboard_file_reference() {

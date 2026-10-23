@@ -32,6 +32,20 @@ use std::sync::Arc;
 /// 原生命令面板最多展示的候选数。
 const MAX_VISIBLE_COMMANDS: usize = 12;
 
+/// 路径输入在 Enter 时的处理结果，决定是否继续走原生命令路由。
+///
+/// `/` 同时是斜杠命令前缀与绝对路径开头，三种结果把"是命令""已转附件"
+/// "其实是正文"分开，避免任一分支被误当成未知命令。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathInput {
+    /// 输入不是路径，按常规原生命令处理。
+    NotPath,
+    /// 已作为附件消费（含找不到文件时的错误提示），输入处理完毕。
+    Attached,
+    /// 形如路径但带正文，应作为普通消息提交给 Agent。
+    SubmitAsText,
+}
+
 /// 会话对话框一次展示的最大摘要数，避免大型历史目录占满终端。
 const MAX_VISIBLE_SESSIONS: usize = 100;
 
@@ -43,6 +57,17 @@ struct NativeCommandSpec {
     summary: &'static str,
     description: &'static str,
     idle_only: bool,
+}
+
+impl NativeCommandSpec {
+    /// 判断输入令牌是否精确调用了本命令（令牌可带前导 `/`）。
+    ///
+    /// 命令名与别名都不含 `/`，因此文件名、绝对路径不会被误判为命令；
+    /// 这是"命令优先于同名文件"的唯一判定点，命令路由与路径判定都复用它。
+    fn matches_token(&self, token: &str) -> bool {
+        let name = token.strip_prefix('/').unwrap_or(token);
+        self.name == name || self.aliases.contains(&name)
+    }
 }
 
 /// 统一斜杠补全候选；插件仅提供声明式触发前缀，不进入原生命令执行路由。
@@ -369,6 +394,10 @@ impl App {
         if rest.contains(char::is_whitespace) {
             return Vec::new();
         }
+        // 绝对路径与斜杠命令共享 `/` 前缀，路径输入不能弹出命令补全面板。
+        if Self::looks_like_path(rest) {
+            return Vec::new();
+        }
         let mut matches = NATIVE_COMMANDS
             .iter()
             .filter(|command| {
@@ -528,7 +557,7 @@ impl App {
         {
             return false;
         }
-        if !self.input.starts_with('/') || !modifiers.is_empty() {
+        if !self.input_without_labels().trim_start().starts_with('/') || !modifiers.is_empty() {
             return false;
         }
         if self.native_command.dismissed_input.as_deref() == Some(self.input.as_str()) {
@@ -573,6 +602,13 @@ impl App {
                         return true;
                     }
                 }
+                // 路径输入与斜杠命令共享 `/` 前缀：路径转附件，带正文的路径句子交回
+                // 主输入区按普通消息提交，不能被当成未知命令吞掉。
+                match self.handle_path_input() {
+                    PathInput::Attached => return true,
+                    PathInput::SubmitAsText => return false,
+                    PathInput::NotPath => {}
+                }
                 self.execute_native_command(agent);
                 true
             }
@@ -585,21 +621,56 @@ impl App {
         }
     }
 
+    /// 判断斜杠之后的文本是否其实是文件路径，而不是命令名。
+    ///
+    /// 绝对路径 `/Users/me/a.png`、`~/a.png`、`./a.png` 与斜杠命令共享同一个 `/` 前缀，
+    /// 必须在命令状态机之前区分开：前者是消息正文，后者才是命令调用。判定只看是否出现
+    /// 路径分隔符或 `~` 前缀，不做文件系统探测——本函数在逐键输入时被调用，必须保持零
+    /// 系统调用。真正的可读性校验由 `handle_path_input` 在 Enter 时完成。
+    ///
+    /// 单段绝对路径（`/tmp`）不算"形如路径"：它与命令名无法区分，按命令处理更安全。
+    fn looks_like_path(rest: &str) -> bool {
+        let head = rest.split_whitespace().next().unwrap_or_default();
+        if head.is_empty() {
+            // 单独的 `/` 是补全入口，不是路径。
+            return false;
+        }
+        head.contains('/') || head.contains('\\') || head.starts_with('~')
+    }
+
     /// 执行当前输入中的一个原生命令，并保证命令文本不会作为用户消息发送给模型。
     fn execute_native_command(&mut self, agent: Option<&Arc<Agent>>) {
-        if !self.attachments.is_empty() {
+        // `/attach` 与"直接输入路径后回车"一致：已有附件时继续追加，因此不能走
+        // "斜杠命令不能携带附件"的拒绝分支；其余命令保持原有约束。`take_input` 会清空
+        // 附件，所以先把它们移出，取走命令文本后再放回，避免复制大型附件正文。
+        let invoked_token = self
+            .input
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let is_attach = NATIVE_COMMANDS
+            .iter()
+            .any(|command| command.name == "attach" && command.matches_token(&invoked_token));
+        if !is_attach && !self.attachments.is_empty() {
             self.messages.push(Msg::new(
                 MsgKind::Error,
                 "斜杠命令不能携带附件，请先移除附件。",
             ));
             return;
         }
-        let Some(input) = self.take_input() else {
+        let retained = if is_attach {
+            std::mem::take(&mut self.attachments)
+        } else {
+            Vec::new()
+        };
+        let input = self.take_input();
+        self.attachments = retained;
+        let Some(input) = input else {
             return;
         };
         self.native_command.dismissed_input = None;
         let invoked = input.split_whitespace().next().unwrap_or_default();
-        let name = invoked.trim_start_matches('/');
         // 首个空白之后的完整内容作为参数，保留路径里的空格。
         let argument = input
             .split_once(char::is_whitespace)
@@ -607,7 +678,7 @@ impl App {
             .filter(|rest| !rest.is_empty());
         let Some(command) = NATIVE_COMMANDS
             .iter()
-            .find(|command| command.name == name || command.aliases.contains(&name))
+            .find(|command| command.matches_token(invoked))
         else {
             self.messages.push(Msg::new(
                 MsgKind::Error,
@@ -664,6 +735,14 @@ impl App {
     /// 再按空白拆成多个路径，便于一次添加多个附件；无法解析的路径逐个报错，
     /// 已成功的附件不受影响。
     fn execute_attach_command(&mut self, argument: Option<&str>) {
+        // `take_input` 已清空输入；既有附件的引用标签必须放回输入，否则
+        // `prune_attachments` 会把它们当成已被用户删除而回收，追加变成替换。
+        self.input = self
+            .attachments
+            .iter()
+            .map(|attachment| format!("{} ", attachment.label))
+            .collect();
+        self.cursor = self.input.len();
         let Some(argument) = argument else {
             self.messages.push(Msg::new(
                 MsgKind::Info,
@@ -686,6 +765,93 @@ impl App {
                 )),
             }
         }
+    }
+
+    /// 剔除输入中已有的附件引用标签，得到用户实际敲入的正文。
+    ///
+    /// 附件标签（`[IMAGE#1] `）会占据输入开头，使后续敲入的 `/路径` 不以 `/` 打头；
+    /// 路径与命令判定都必须基于剔除标签后的正文，否则"已有附件时继续输入路径"会被
+    /// 入口检查直接挡掉。
+    fn input_without_labels(&self) -> String {
+        let mut text = self.input.clone();
+        for attachment in &self.attachments {
+            text = text.replace(&attachment.label, "");
+        }
+        text
+    }
+
+    /// 把"用户敲入的是本地文件"的输入转为附件，并返回该输入应如何继续处理。
+    ///
+    /// 绝对路径 `/Users/me/a.png`、`~/图.png`、`./图.png` 与当前目录下的裸文件名共用
+    /// 这一处判据：命令路由与主输入区都调用它，两条入口不各自推断路径语义。
+    ///
+    /// 已注册的命令名优先于同名文件，命令不会被文件系统劫持。是否"形如路径"由
+    /// [`Self::looks_like_path`] 判断，因此单个单词与自然语言句子不会被误判为文件错
+    /// 误；只有形如路径且解析不到文件的单段输入才报错。判定前先剔除输入里已有的附件
+    /// 引用标签，因此"已有附件时继续输入路径"仍成立。
+    pub(crate) fn handle_path_input(&mut self) -> PathInput {
+        let candidate = self.input_without_labels();
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            return PathInput::NotPath;
+        }
+        let invoked = trimmed.split_whitespace().next().unwrap_or_default();
+        // 命令优先：`/attach`、`/model` 等必须照常执行，哪怕存在同名文件。
+        if NATIVE_COMMANDS
+            .iter()
+            .any(|command| command.matches_token(invoked))
+        {
+            return PathInput::NotPath;
+        }
+        let name = invoked.trim_start_matches('/');
+        let cwd = self.workspace.cwd.clone();
+        // 整段输入是路径，或首段是路径、后面还跟着消息正文（"路径 + 提问"写法）。
+        let (path, consumed) = match pasted_file_path(trimmed, &cwd) {
+            Some(path) => (path, trimmed),
+            None => match pasted_file_path(invoked, &cwd) {
+                Some(path) => (path, invoked),
+                // 既不是命令也不是文件：普通消息，例如单个单词或自然语言句子。
+                None if !Self::looks_like_path(name) => return PathInput::NotPath,
+                None => {
+                    // 形如路径却解析不到文件：单段输入按路径笔误给出明确提示；带正文的
+                    // 输入交回主输入区按普通消息提交，避免 "/usr/bin 应加入 PATH" 这类
+                    // 句子被当成文件错误。
+                    if trimmed.split_whitespace().count() > 1 {
+                        return PathInput::SubmitAsText;
+                    }
+                    self.messages.push(Msg::new(
+                        MsgKind::Error,
+                        format!("找不到可读取的文件 `{trimmed}`；请确认路径存在且是普通文件。"),
+                    ));
+                    return PathInput::Attached;
+                }
+            },
+        };
+        // 先在原位置替换掉路径文本，再把引用标签插回该位置：这样"路径 + 正文"里
+        // 标签紧贴正文之前，而"追加路径"时标签仍排在已有标签之后。
+        // `consumed` 一定来自输入本身（只是剔除了附件标签），因此找不到时不改写输入，
+        // 直接由 `attach_file` 追加标签，避免越界切片。
+        let mut cursor = self.input.len();
+        if let Some(offset) = self.input.find(consumed) {
+            let mut remaining = self.input.clone();
+            remaining.replace_range(offset..offset + consumed.len(), "");
+            // 路径后紧跟的分隔空格一并去掉，避免标签与正文之间出现两个空格。
+            if remaining[offset..].starts_with(char::is_whitespace) {
+                let tail = remaining[offset..].trim_start().to_string();
+                remaining.truncate(offset);
+                remaining.push_str(&tail);
+            }
+            self.input = remaining;
+            cursor = offset;
+        }
+        // `attach_file` 在光标处插入引用标签，光标必须落在输入范围内。
+        self.cursor = cursor.min(self.input.len());
+        // 顺序不能反：`attach_file` 会回收输入里已不存在的附件标签，
+        // 先清空输入会把已有附件一并回收掉。
+        self.attach_file(&path);
+        self.cursor = self.input.len();
+        self.finish_input_edit();
+        PathInput::Attached
     }
 
     /// 追加一个附件引用标签到输入末尾，符合"继续添加"的直觉。
