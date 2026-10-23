@@ -168,8 +168,13 @@ pub(crate) struct App {
     ///
     /// 网络层按 TCP/SSE 的节奏交付文本，而屏幕需要固定的帧节拍：直接把每个增量写进
     /// 消息会让"屏幕刷新节奏"等于"网络到达节奏"。网络抖动时就表现为一会儿静止、
-    /// 一会儿蹦出一整段。这里把到达与显示分开，由每帧的揭示预算决定上屏多少。
+    /// 一会儿蹦出一整段。这里把到达与显示分开，由 `reveal_pacer` 按帧决定上屏多少。
     pub(crate) pending_stream: String,
+    /// 打字机节拍器：按真实流逝时间把待揭示文本匀速释放到屏幕上。
+    ///
+    /// 与 `pending_stream` 是一对：缓冲解决"到达节奏 ≠ 屏幕节奏"，节拍器解决"每帧吐多少"。
+    /// 只有它能让一次网络突发变成连续若干帧的小步吐字，而不是一帧蹦半屏。
+    pub(crate) reveal_pacer: run::RevealPacer,
     /// 用户取消当前运行后立即关闭可见流，防止已排队的模型或工具增量继续刷新界面。
     pub(crate) run_stream_cancelled: bool,
     /// 当前模型是否处于思考阶段；仅控制状态文案，不保存推理摘要文本。
@@ -481,6 +486,7 @@ impl App {
             spinner_frame: 0,
             streaming_message: None,
             pending_stream: String::new(),
+            reveal_pacer: run::RevealPacer::default(),
             run_stream_cancelled: false,
             model_is_thinking: false,
             #[cfg(feature = "plugins")]

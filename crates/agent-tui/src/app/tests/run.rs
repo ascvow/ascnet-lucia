@@ -889,54 +889,82 @@ fn cancelled_completion_keeps_frozen_visible_history() {
         .any(|message| message.text == "Run cancelled; visible output was frozen"));
 }
 
-/// 小段增量（正常逐 token 流式）必须一帧全出，不能引入额外延迟。
+/// 用虚拟时钟推进一帧揭示。
 ///
-/// 揭示预算的下限远高于真实 token 大小，这是"优化流畅度但不拖慢输出"的关键前提。
+/// 揭示节奏由墙钟决定，测试无法等真实时间，因此每次显式给出"现在是第几帧"，
+/// 相邻两帧间隔正好一个 [`crate::theme::REVEAL_FRAME_INTERVAL_MS`]。
+fn reveal_frame(app: &mut App, frame: u64) -> usize {
+    let now = std::time::Instant::now()
+        + std::time::Duration::from_millis(frame * crate::theme::REVEAL_FRAME_INTERVAL_MS);
+    app.reveal_pending_stream_at(now)
+}
+
+/// 小段增量（正常逐 token 流式）也走统一节拍：每帧一两个字，而不是一次全出。
+///
+/// 这是"打字机"而不是"喷射"的关键：到达量再小，屏幕上也按帧匀速吐字。
 #[test]
-fn trickle_deltas_are_revealed_in_a_single_frame() {
+fn trickle_deltas_are_revealed_at_the_base_pace() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.running = true;
+    let payload = "正在读取配置文件…";
 
-    app.queue_model_delta("正在读取配置文件…");
-    let revealed = app.reveal_pending_stream();
+    app.queue_model_delta(payload);
+    let mut per_frame = Vec::new();
+    for frame in 1..=32 {
+        if !app.has_pending_stream() {
+            break;
+        }
+        per_frame.push(reveal_frame(&mut app, frame));
+    }
 
-    assert_eq!(revealed, "正在读取配置文件…".chars().count());
-    assert!(!app.has_pending_stream(), "小段文本不应滞留在缓冲里");
-    assert!(app
-        .messages
-        .iter()
-        .any(|message| message.text == "正在读取配置文件…"));
+    assert!(!app.has_pending_stream(), "小段文本应在若干帧内铺完");
+    assert!(
+        per_frame.iter().all(|chars| *chars <= 2),
+        "单帧揭示量必须是一两个字，不能整段蹦出：{per_frame:?}"
+    );
+    assert!(
+        per_frame.iter().sum::<usize>() == payload.chars().count(),
+        "逐帧揭示量之和必须等于总字符数：{per_frame:?}"
+    );
 }
 
-/// 网络一次推来的整段文本会被摊平到多帧，而不是一帧整块蹦出。
+/// 网络一次推来的整段文本会被摊平成匀速吐字，而不是一帧整块蹦出。
 ///
-/// 这是"卡顿感"的根因修复：屏幕节奏不再等于网络到达节奏。
+/// 断言的重点不是"分了多少帧"，而是**相邻帧之间没有突跳**：喷射感来自忽大忽小的单帧
+/// 跳跃（一次几十个字、下一帧又是零），而不是来自整体偏快。
 #[test]
-fn burst_text_is_revealed_across_a_few_frames() {
+fn burst_text_is_revealed_at_a_uniform_pace() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.running = true;
     let payload = "字".repeat(500);
 
     app.queue_model_delta(&payload);
-    let mut frames = 0;
     let mut per_frame = Vec::new();
-    while app.has_pending_stream() && frames < 64 {
-        per_frame.push(app.reveal_pending_stream());
-        frames += 1;
+    for frame in 1..=600 {
+        if !app.has_pending_stream() {
+            break;
+        }
+        per_frame.push(reveal_frame(&mut app, frame));
     }
 
-    assert!(frames > 1, "整段突发不应在一帧内全部出现：{per_frame:?}");
-    assert!(frames <= 12, "突发应快速铺完，不能变成慢放：{per_frame:?}");
-    // 最后一帧只揭示剩余量，必然可能低于下限；下限约束的是每帧的预算。
-    let budgeted = &per_frame[..per_frame.len() - 1];
     assert!(
-        budgeted
-            .iter()
-            .all(|chars| *chars >= crate::theme::REVEAL_CHARS_PER_FRAME),
-        "每帧揭示量不应低于下限：{per_frame:?}"
+        per_frame.len() > 4,
+        "整段突发不应在一两帧内全部出现：{per_frame:?}"
     );
+    let largest = *per_frame.iter().max().expect("应有节拍帧");
+    assert!(
+        largest <= 32,
+        "单帧不应揭示超过上限速率的字符数：{per_frame:?}"
+    );
+    // 积压排空时速率先快后慢是允许的（那仍然是连续吐字）；不允许的是相邻帧突变。
+    for pair in per_frame.windows(2) {
+        assert!(
+            pair[0] <= pair[1] + 4,
+            "相邻帧揭示量不允许突跳，否则观感仍是喷射：{per_frame:?}"
+        );
+    }
     let shown = app
         .messages
         .iter()
@@ -977,18 +1005,22 @@ fn reveal_never_splits_a_multibyte_character() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.running = true;
-    // 每个字符占 3 字节，且总量超过单帧下限，逼迫预算落在字符中间。
+    // 每个字符占 3 字节，节拍把单帧配额落在字符中间时最容易切坏。
     let payload = "汉".repeat(97);
 
     app.queue_model_delta(&payload);
-    while app.has_pending_stream() {
-        app.reveal_pending_stream();
+    for frame in 1..=64 {
+        if !app.has_pending_stream() {
+            break;
+        }
+        reveal_frame(&mut app, frame);
         let shown: String = app.messages.iter().map(|m| m.text.as_str()).collect();
         assert!(
             payload.starts_with(&shown),
             "已显示的文本必须是原文的完整前缀（不允许半个字符）：{shown:?}"
         );
     }
+    assert!(!app.has_pending_stream(), "97 个汉字应在几十帧内铺完");
 }
 
 /// 工具开始前必须把待揭示文本补完，否则后续揭示的文字会跑到工具卡片上方。
@@ -1040,6 +1072,7 @@ fn tick_requires_redraw_while_text_is_pending() {
     assert!(app.has_pending_stream());
     assert!(app.tick_requires_redraw(), "有待揭示文本时必须继续出帧");
 
-    app.reveal_pending_stream();
+    // 边界补完会一次清空缓冲（揭示节拍只负责常态，边界必须立即追上）。
+    app.flush_pending_stream();
     assert!(!app.tick_requires_redraw(), "残余清空后回到纯事件驱动");
 }

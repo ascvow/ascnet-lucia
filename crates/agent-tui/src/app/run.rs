@@ -6,11 +6,76 @@ use crate::config::persist_reasoning_level;
 use crate::event::{AgentCompletion, SessionReloadOutcome, UiEvent};
 use crate::session::conversation::{Msg, MsgKind, UserSubmission};
 use crate::session::{restore_session_messages, run_and_persist};
-use crate::theme::{REVEAL_BACKLOG_LIMIT, REVEAL_CHARS_PER_FRAME, REVEAL_SPREAD_FRAMES};
+use crate::theme::{
+    REVEAL_BACKLOG_LIMIT, REVEAL_DRAIN_MS, REVEAL_FRAME_INTERVAL_MS, REVEAL_MAX_CHARS_PER_SEC,
+    REVEAL_MIN_CHARS_PER_SEC,
+};
 use agent_core::model::ReasoningLevel;
 use agent_core::Agent;
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// 打字机节拍器：把"网络到达节奏"换算成"每帧吐字量"。
+///
+/// 关键在于结算口径是**真实流逝时间**，而不是"被调用了几次"。事件循环在收到网络事件后
+/// 会立刻再走一轮揭示，如果按次数结算，吐字速度就重新等于到达速度（一次突发 = 一次
+/// 整段上屏），这正是"喷射感"的来源。这里改成按墙钟累计"字符配额"，不足一个字符的
+/// 余量留到下一帧，于是屏幕节奏只由帧时钟决定。
+#[derive(Default)]
+pub(crate) struct RevealPacer {
+    /// 上一次结算配额的墙钟时间点；`None` 表示缓冲刚被清空，下一次结算只给一帧配额。
+    last_settle: Option<Instant>,
+    /// 尚未满一个字符的剩余配额，单位为千分之一字符。
+    credit_milli: u32,
+}
+
+impl RevealPacer {
+    /// 按当前积压量结算本帧应揭示的字符数。
+    ///
+    /// `backlog_chars` 是缓冲中待显示的字符数，`now` 是本次揭示的墙钟时间点。
+    /// 返回值不会超过 `backlog_chars`：不会揭示不存在的文本。
+    ///
+    /// 停滞过久（审批弹窗、插件对话框阻塞事件循环）后不补偿欠账：一次补上几十帧的配额
+    /// 会让屏幕整块蹦字，宁可让那一瞬间丢掉的节拍白丢。
+    fn settle(&mut self, backlog_chars: usize, now: Instant) -> usize {
+        if backlog_chars == 0 {
+            self.reset();
+            return 0;
+        }
+        let elapsed = match self.last_settle {
+            Some(previous) => now.saturating_duration_since(previous),
+            // 首次结算只看作一帧：运行开始前的等待时间不属于这段文本。
+            None => Duration::from_millis(REVEAL_FRAME_INTERVAL_MS),
+        };
+        self.last_settle = Some(now);
+        let elapsed = elapsed.min(Duration::from_millis(REVEAL_FRAME_INTERVAL_MS * 3));
+        // 速率（字符/秒）× 毫秒 = 千分之一字符，全程整数运算，没有逐帧取整误差。
+        let gain = reveal_rate_chars_per_sec(backlog_chars) as u64 * elapsed.as_millis() as u64;
+        self.credit_milli = self
+            .credit_milli
+            .saturating_add(u32::try_from(gain).unwrap_or(u32::MAX));
+        let quota = usize::try_from(self.credit_milli / 1000).unwrap_or(usize::MAX);
+        self.credit_milli %= 1000;
+        quota.min(backlog_chars)
+    }
+
+    /// 清空节拍状态：缓冲排空或越过一次显式补完的边界后调用。
+    fn reset(&mut self) {
+        self.last_settle = None;
+        self.credit_milli = 0;
+    }
+}
+
+/// 按当前积压量决定揭示速率（字符/秒）。
+///
+/// 取"在 [`REVEAL_DRAIN_MS`] 内排空积压"的反推值：积压越多吐得越快，积压清空则回落到
+/// 最低速率。稳态下积压恒为 `到达速率 × REVEAL_DRAIN_MS`，因此每帧吐出的字符数接近
+/// 常数——这就是"匀速打字机"的来源；网络突发只会让它短暂加速，不会让它一步跳完整段。
+fn reveal_rate_chars_per_sec(backlog_chars: usize) -> usize {
+    let drain_rate = backlog_chars.saturating_mul(1000) / REVEAL_DRAIN_MS as usize;
+    drain_rate.clamp(REVEAL_MIN_CHARS_PER_SEC, REVEAL_MAX_CHARS_PER_SEC)
+}
 
 impl App {
     /// 处理后台会话上下文重载结果：替换会话时保留正在编辑的输入。
@@ -244,52 +309,68 @@ impl App {
         !self.pending_stream.is_empty()
     }
 
-    /// 按本帧预算把待揭示文本铺到屏幕上，返回是否改动了消息内容。
+    /// 按本帧配额把待揭示文本铺到屏幕上，返回是否改动了消息内容。
     ///
-    /// 预算的目标是"网络快时不拖慢、网络抖时不整块蹦"：
+    /// 两条路径决定本帧吐多少字：
     ///
-    /// - 待揭示量在正常流式范围内（几十字符）时，预算远大于它，因此**一次性全部上屏**，
-    ///   不引入任何额外延迟；
-    /// - 网络一次推来几百字符时，按 [`REVEAL_SPREAD_FRAMES`] 摊平到若干帧，观感是连续
-    ///   吐字而不是整段出现；
-    /// - 积压超过 [`REVEAL_BACKLOG_LIMIT`] 时直接清空积压部分，保证模型结束时屏幕上不会
-    ///   还差半屏没显示。
+    /// - **节拍路径**（常态）：由 [`RevealPacer`] 按真实流逝时间结算配额。积压越多速率
+    ///   越高（[`REVEAL_DRAIN_MS`] 内排空），积压清空则回落到每帧一个字符。因为配额按
+    ///   时间累计，网络一秒钟推来一大块与一秒钟推来十小块，屏幕上都是匀速吐字。
+    /// - **背压路径**（兜底）：积压超过 [`REVEAL_BACKLOG_LIMIT`] 时，超出部分一次性上屏，
+    ///   保证模型结束时屏幕上不会还差半屏没显示。
     ///
     /// 返回本帧真正上屏的字符数：主循环用它决定是否需要重绘，诊断探针用它统计吞吐。
     pub(crate) fn reveal_pending_stream(&mut self) -> usize {
+        self.reveal_pending_stream_at(Instant::now())
+    }
+
+    /// 按指定墙钟时间揭示一帧。
+    ///
+    /// 与 [`Self::reveal_pending_stream`] 的唯一差别是时间来源：测试用虚拟时钟驱动，
+    /// 才能断言"每帧吐几个字符"这种与真实时间相关的行为。
+    pub(crate) fn reveal_pending_stream_at(&mut self, now: Instant) -> usize {
         if self.pending_stream.is_empty() {
+            self.reveal_pacer.reset();
             return 0;
         }
         // 运行已结束或已被取消：缓冲里的文本不会再有归属消息，直接丢弃。
         if !self.accepts_run_stream_output() {
             self.pending_stream.clear();
+            self.reveal_pacer.reset();
             return 0;
         }
-        let pending_bytes = self.pending_stream.len();
-        // 两条路径的"预算"单位不同，分开算清楚，避免字节与字符混用导致中文只按三分之一
-        // 速度揭示：
-        // - 背压路径：按字节清空超出上限的积压，再回退到字符边界；
-        // - 常规路径：按字符数决定本帧揭示多少，再换算成字节偏移。
-        let take = if pending_bytes > REVEAL_BACKLOG_LIMIT {
-            let mut end = pending_bytes - REVEAL_BACKLOG_LIMIT;
+        let mut revealed = 0;
+        // 背压路径按字节清空超出上限的积压，再回退到字符边界。
+        if self.pending_stream.len() > REVEAL_BACKLOG_LIMIT {
+            let mut end = self.pending_stream.len() - REVEAL_BACKLOG_LIMIT;
             while end > 0 && !self.pending_stream.is_char_boundary(end) {
                 end -= 1;
             }
-            end
-        } else {
-            let pending_chars = self.pending_stream.chars().count();
-            let budget = (pending_chars / REVEAL_SPREAD_FRAMES).max(REVEAL_CHARS_PER_FRAME);
-            // char_indices 的第 budget 个偏移正好是"前 budget 个字符"的结束位置，
-            // 因此不存在切开多字节字符的可能。
-            self.pending_stream
+            revealed += self.drain_pending_stream(end);
+        }
+        // 节拍路径按字符结算：char_indices 的第 quota 个偏移正好是"前 quota 个字符"的
+        // 结束位置，因此不存在切开多字节字符的可能。
+        let backlog_chars = self.pending_stream.chars().count();
+        let quota = self.reveal_pacer.settle(backlog_chars, now);
+        if quota > 0 {
+            let end = self
+                .pending_stream
                 .char_indices()
-                .nth(budget)
-                .map_or(pending_bytes, |(index, _)| index)
-        };
-        if take == 0 {
+                .nth(quota)
+                .map_or(self.pending_stream.len(), |(index, _)| index);
+            revealed += self.drain_pending_stream(end);
+        }
+        revealed
+    }
+
+    /// 把揭示缓冲前 `bytes` 字节上屏，返回揭示的字符数。
+    ///
+    /// `bytes` 必须落在字符边界上，否则 `drain` 会 panic；两个调用点都保证了这一点。
+    fn drain_pending_stream(&mut self, bytes: usize) -> usize {
+        if bytes == 0 {
             return 0;
         }
-        let chunk: String = self.pending_stream.drain(..take).collect();
+        let chunk: String = self.pending_stream.drain(..bytes).collect();
         let revealed = chunk.chars().count();
         self.append_model_delta(&chunk);
         revealed
@@ -300,7 +381,11 @@ impl App {
     /// 在工具开始、运行结束、用户取消与新一次模型响应这些边界上调用：这些时刻"助手正文"
     /// 的归属会发生变化（后面要插入工具消息，或整份列表会被 Session 重建），把剩余文本
     /// 补完才能保证显示顺序与最终内容一致。
+    ///
+    /// 补完同时清空节拍状态：残余额度不该被下一次响应继承，否则新回答的第一帧会一次
+    /// 蹦出好几个字。
     pub(crate) fn flush_pending_stream(&mut self) {
+        self.reveal_pacer.reset();
         if self.pending_stream.is_empty() {
             return;
         }
@@ -400,5 +485,98 @@ impl App {
                 .push(Msg::new(MsgKind::Error, format!("{error:#}")));
         }
         queue_may_advance && !user_cancelled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 揭示速率必须随积压单调上升，并收在"每帧一个字符"到"每帧三十个字符"之间。
+    ///
+    /// 单调性保证屏幕节奏随网络平滑变化；上下限保证既不长时间静止，也不整屏喷射。
+    #[test]
+    fn reveal_rate_is_monotonic_and_bounded() {
+        assert_eq!(
+            reveal_rate_chars_per_sec(0),
+            crate::theme::REVEAL_MIN_CHARS_PER_SEC,
+            "空积压不应低于基础节拍"
+        );
+        assert_eq!(
+            reveal_rate_chars_per_sec(1),
+            crate::theme::REVEAL_MIN_CHARS_PER_SEC,
+            "极小积压仍按基础节拍吐字"
+        );
+        let huge = reveal_rate_chars_per_sec(1_000_000);
+        assert_eq!(
+            huge,
+            crate::theme::REVEAL_MAX_CHARS_PER_SEC,
+            "超大积压也必须收在上限内"
+        );
+        let mut previous = 0;
+        for backlog in [1usize, 4, 16, 64, 256, 1024, 4096] {
+            let rate = reveal_rate_chars_per_sec(backlog);
+            assert!(rate >= previous, "速率必须随积压单调不减：{backlog}");
+            assert!(rate <= huge, "速率不得超过上限：{backlog}");
+            previous = rate;
+        }
+    }
+
+    /// 配额按流逝时间累计：不足一个字符的余量留到下一帧，长期平均等于设定速率。
+    ///
+    /// 60 字符/秒在 16ms 帧下是 0.96 字符，逐帧取整会丢掉 4%，长期会明显偏慢；
+    /// 余量结转后 10 帧正好吐出 9~10 个字符。
+    #[test]
+    fn pacer_carries_fractional_characters_between_frames() {
+        let mut pacer = RevealPacer::default();
+        let base = Instant::now();
+        let mut total = 0;
+        for frame in 1..=10u64 {
+            let now = base + Duration::from_millis(frame * REVEAL_FRAME_INTERVAL_MS);
+            // 积压只给 10 个字符，速率因此始终停在下限，才能单独验证取整余量。
+            total += pacer.settle(10, now);
+        }
+        // 10 帧 × 16ms = 160ms，60 字符/秒 → 9.6 字符。
+        assert!(
+            (9..=10).contains(&total),
+            "长期吐字量应贴合设定速率：{total}"
+        );
+    }
+
+    /// 停滞很久之后的第一次结算只补一帧配额，绝不把几十帧的欠账一次补上。
+    #[test]
+    fn pacer_does_not_replay_a_long_stall() {
+        let mut pacer = RevealPacer::default();
+        let base = Instant::now();
+        pacer.settle(4096, base + Duration::from_millis(REVEAL_FRAME_INTERVAL_MS));
+        let quota = pacer.settle(4096, base + Duration::from_secs(5));
+
+        let three_frames =
+            crate::theme::REVEAL_MAX_CHARS_PER_SEC as u64 * REVEAL_FRAME_INTERVAL_MS * 3 / 1000;
+        assert!(
+            quota as u64 <= three_frames + 1,
+            "停滞 5 秒后也不应一次吐出多帧的量：{quota}"
+        );
+        assert!(quota > 0, "停滞之后仍要立刻继续吐字：{quota}");
+    }
+
+    /// 缓冲排空后节拍状态归零：下一段文本重新按基础节拍起步。
+    #[test]
+    fn pacer_resets_after_the_buffer_drains() {
+        let mut pacer = RevealPacer::default();
+        let base = Instant::now();
+        pacer.settle(500, base + Duration::from_millis(REVEAL_FRAME_INTERVAL_MS));
+        assert_eq!(
+            pacer.credit_milli, 800,
+            "28.8 个字符应留下 800 千分之一余量"
+        );
+
+        pacer.settle(
+            0,
+            base + Duration::from_millis(2 * REVEAL_FRAME_INTERVAL_MS),
+        );
+
+        assert_eq!(pacer.credit_milli, 0);
+        assert!(pacer.last_settle.is_none());
     }
 }
