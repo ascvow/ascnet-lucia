@@ -13,10 +13,8 @@
 //! 本模块只负责排版，不认识具体插件工具：无法识别的工具退回通用 JSON 摘要，
 //! 因此新增工具不需要改这里就能得到可读的默认呈现。
 
-use crate::theme::{
-    COLOR_DANGER, COLOR_DIFF_ADD_BG, COLOR_DIFF_ADD_FG, COLOR_DIFF_DEL_BG, COLOR_DIFF_DEL_FG,
-    COLOR_LINE_NUMBER, COLOR_MUTED, COLOR_TEXT,
-};
+use crate::theme::{COLOR_DANGER, COLOR_LINE_NUMBER, COLOR_MUTED, COLOR_TEXT};
+use crate::ui::diff::{self, DiffLineKind};
 use crate::ui::highlight::{highlight_line, CodeLanguage};
 use crate::ui::markdown::{summarize_json, truncate_line};
 use agent_tool::{ToolCall, ToolResult};
@@ -165,7 +163,7 @@ pub(crate) fn tool_summary(call: Option<&ToolCall>, result: &ToolResult) -> Opti
     let summary = summary.or_else(|| {
         let text = result_body(result)?;
         let rows: Vec<&str> = text.lines().collect();
-        if looks_like_diff(&rows) {
+        if diff::looks_like_diff(&rows) {
             return Some(diff_summary(&rows));
         }
         let first = rows.iter().find(|line| !line.trim().is_empty())?;
@@ -202,6 +200,21 @@ pub(crate) enum PreviewLine {
     Elided {
         /// 被折叠的行数。
         hidden: usize,
+    },
+    /// 文件级头部：`diff --git`、`index`、`---`、`+++` 等。
+    FileHeader {
+        /// 行正文，原样保留 `+++`/`---` 前缀。
+        text: String,
+    },
+    /// hunk 头，例如 `@@ -10,7 +10,9 @@ fn main() {`。
+    HunkHeader {
+        /// 行正文。
+        text: String,
+    },
+    /// 补丁附注，例如 `\ No newline at end of file`。
+    Meta {
+        /// 附注正文。
+        text: String,
     },
 }
 
@@ -305,26 +318,6 @@ fn collection_preview(result: &ToolResult, max_lines: usize) -> Option<Vec<Previ
     Some(lines)
 }
 
-/// 判断一段文本是否是统一 diff：存在 `+`/`-` 前缀行且不是普通正文。
-fn looks_like_diff(lines: &[&str]) -> bool {
-    // 标准补丁允许上下文行远多于改动行，不能按增删行比例拒绝它。
-    if lines.first().is_some_and(|line| line.starts_with("--- "))
-        && lines.get(1).is_some_and(|line| line.starts_with("+++ "))
-        && lines.iter().any(|line| line.starts_with("@@ "))
-    {
-        return true;
-    }
-    let marked = lines
-        .iter()
-        .filter(|line| {
-            (line.starts_with('+') || line.starts_with('-'))
-                && !line.starts_with("+++")
-                && !line.starts_with("---")
-        })
-        .count();
-    marked > 0 && marked * 2 >= lines.len()
-}
-
 /// 从结构化工具结果中取出可逐行展开的正文。
 ///
 /// 优先读取编辑结果的 `diff`；`content` 覆盖普通正文，`stdout`/`stderr` 覆盖命令类。
@@ -411,25 +404,51 @@ pub(crate) fn preview_lines(
 
     let rows: Vec<&str> = text.lines().collect();
     let total = rows.len();
-    let is_diff = looks_like_diff(&rows);
+    let is_diff = diff::looks_like_diff(&rows);
+    // 分类一次算完整段：hunk 状态必须按原顺序推进，不能只看被保留的前若干行。
+    let kinds = is_diff.then(|| diff::classify_rows(&rows));
     // 只有整段都带行号前缀时才剥离，避免正文里偶然以"数字+制表符"开头的行被误拆。
     let numbered = !is_diff && is_line_numbered(&rows);
     let mut lines: Vec<PreviewLine> = Vec::with_capacity(max_lines);
     for (index, row) in rows.iter().take(max_lines).enumerate() {
-        if is_diff {
-            if let Some(body) = row.strip_prefix('+').filter(|_| !row.starts_with("+++")) {
-                lines.push(PreviewLine::Added {
-                    number: Some(index + 1),
-                    text: body.to_string(),
-                });
-                continue;
-            }
-            if let Some(body) = row.strip_prefix('-').filter(|_| !row.starts_with("---")) {
-                lines.push(PreviewLine::Removed {
-                    number: Some(index + 1),
-                    text: body.to_string(),
-                });
-                continue;
+        if let Some(kind) = kinds.as_ref().map(|kinds| kinds[index]) {
+            match kind {
+                // 结构行原样保留前缀：`+++ b/src/main.rs` 的信息量就在前缀里。
+                DiffLineKind::FileHeader => {
+                    lines.push(PreviewLine::FileHeader {
+                        text: row.trim_end().to_string(),
+                    });
+                    continue;
+                }
+                DiffLineKind::HunkHeader => {
+                    lines.push(PreviewLine::HunkHeader {
+                        text: row.trim_end().to_string(),
+                    });
+                    continue;
+                }
+                DiffLineKind::Meta => {
+                    lines.push(PreviewLine::Meta {
+                        text: row.trim_end().to_string(),
+                    });
+                    continue;
+                }
+                DiffLineKind::Added => {
+                    let body = row.strip_prefix('+').unwrap_or(row);
+                    lines.push(PreviewLine::Added {
+                        number: Some(index + 1),
+                        text: body.to_string(),
+                    });
+                    continue;
+                }
+                DiffLineKind::Removed => {
+                    let body = row.strip_prefix('-').unwrap_or(row);
+                    lines.push(PreviewLine::Removed {
+                        number: Some(index + 1),
+                        text: body.to_string(),
+                    });
+                    continue;
+                }
+                DiffLineKind::Context => {}
             }
         }
         // 统一 diff 的上下文行带一个前导空格标记，展示时应还原为原始缩进。
@@ -457,6 +476,9 @@ pub(crate) fn preview_lines(
 }
 
 /// 把运行期增量输出转换为预览行；只保留最新若干行，不编行号。
+///
+/// 运行中的 `git diff` 同样要按 diff 渲染：否则命令跑完是一个样子、跑的过程中又是另一个
+/// 样子，读者会以为界面在闪烁。分类按完整的已收输出计算，hunk 状态才不会从中间断掉。
 pub(crate) fn output_preview_lines(text: &str, max_lines: usize) -> Vec<PreviewLine> {
     let rows: Vec<&str> = text.lines().collect();
     let start = rows.len().saturating_sub(max_lines);
@@ -464,9 +486,38 @@ pub(crate) fn output_preview_lines(text: &str, max_lines: usize) -> Vec<PreviewL
     if start > 0 {
         lines.push(PreviewLine::Elided { hidden: start });
     }
-    lines.extend(rows[start..].iter().map(|row| PreviewLine::Context {
-        number: None,
-        text: row.trim_end().to_string(),
+    let is_diff = diff::looks_like_diff(&rows);
+    let kinds = is_diff.then(|| diff::classify_rows(&rows));
+    lines.extend(rows[start..].iter().enumerate().map(|(offset, row)| {
+        let kind = kinds.as_ref().map(|kinds| kinds[start + offset]);
+        match kind {
+            Some(DiffLineKind::FileHeader) => PreviewLine::FileHeader {
+                text: row.trim_end().to_string(),
+            },
+            Some(DiffLineKind::HunkHeader) => PreviewLine::HunkHeader {
+                text: row.trim_end().to_string(),
+            },
+            Some(DiffLineKind::Meta) => PreviewLine::Meta {
+                text: row.trim_end().to_string(),
+            },
+            Some(DiffLineKind::Added) => PreviewLine::Added {
+                number: None,
+                text: row.strip_prefix('+').unwrap_or(row).to_string(),
+            },
+            Some(DiffLineKind::Removed) => PreviewLine::Removed {
+                number: None,
+                text: row.strip_prefix('-').unwrap_or(row).to_string(),
+            },
+            // 上下文行去掉 diff 的前导标记空格，正文才与增删行对齐。
+            Some(DiffLineKind::Context) => PreviewLine::Context {
+                number: None,
+                text: row.strip_prefix(' ').unwrap_or(row).trim_end().to_string(),
+            },
+            None => PreviewLine::Context {
+                number: None,
+                text: row.trim_end().to_string(),
+            },
+        }
     }));
     lines
 }
@@ -475,6 +526,13 @@ pub(crate) fn output_preview_lines(text: &str, max_lines: usize) -> Vec<PreviewL
 const GUTTER_WIDTH: usize = 4;
 /// 预览块相对消息左边缘的缩进。
 const PREVIEW_INDENT: &str = "    ";
+/// 行号列与正文之间的标记列宽：一列标记左侧留白加一列标记本身。
+///
+/// 留白的作用是让 `+`/`-` 不直接顶住行号列：标记贴着数字时，整行色块看起来像从行号里
+/// 长出来的，而不是一条独立的改动记录。
+const DIFF_MARKER_PAD: usize = 1;
+/// 标记列总宽（留白 + 标记），用于把正文宽度与行号列一并扣掉。
+const MARKER_COLUMNS: usize = DIFF_MARKER_PAD + 1;
 
 /// 渲染行号列。
 fn gutter(number: Option<usize>, color: Color) -> Span<'static> {
@@ -502,8 +560,8 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
 
 /// 把预览行渲染为终端行。
 ///
-/// `width` 是消息区总宽度；diff 行按它补齐背景。`language` 决定内容行的高亮规则，
-/// `error` 为真时内容统一使用错误色，不做语法着色。
+/// `width` 是消息区总宽度；diff 行的整行底色按它铺满。`language` 决定上下文行的高亮
+/// 规则，`error` 为真时正文统一使用错误色，不做语法着色。
 pub(crate) fn render_preview(
     lines: &[PreviewLine],
     width: u16,
@@ -516,12 +574,26 @@ pub(crate) fn render_preview(
         PreviewLine::Context { number, .. }
         | PreviewLine::Added { number, .. }
         | PreviewLine::Removed { number, .. } => number.is_some(),
-        PreviewLine::Elided { .. } => false,
+        PreviewLine::Elided { .. }
+        | PreviewLine::FileHeader { .. }
+        | PreviewLine::HunkHeader { .. }
+        | PreviewLine::Meta { .. } => false,
+    });
+    // 含 diff 结构行或增删行的块才需要标记列；纯文本预览保持紧凑排版。
+    let diff_block = lines.iter().any(|line| {
+        matches!(
+            line,
+            PreviewLine::Added { .. }
+                | PreviewLine::Removed { .. }
+                | PreviewLine::FileHeader { .. }
+                | PreviewLine::HunkHeader { .. }
+                | PreviewLine::Meta { .. }
+        )
     });
     let gutter_width = if show_gutter { GUTTER_WIDTH } else { 0 };
     // 缩进、行号列与标记列之后剩余的正文宽度。
     let body_width = total_width
-        .saturating_sub(PREVIEW_INDENT.len() + gutter_width + 2)
+        .saturating_sub(PREVIEW_INDENT.len() + gutter_width + MARKER_COLUMNS)
         .max(1);
 
     lines
@@ -531,10 +603,24 @@ pub(crate) fn render_preview(
                 Span::raw(PREVIEW_INDENT),
                 Span::styled(format!("… +{hidden} 行"), Style::new().fg(COLOR_MUTED)),
             ]),
+            PreviewLine::FileHeader { text } => {
+                diff_structure_row(text, DiffLineKind::FileHeader, show_gutter, body_width)
+            }
+            PreviewLine::HunkHeader { text } => {
+                diff_structure_row(text, DiffLineKind::HunkHeader, show_gutter, body_width)
+            }
+            PreviewLine::Meta { text } => {
+                diff_structure_row(text, DiffLineKind::Meta, show_gutter, body_width)
+            }
             PreviewLine::Context { number, text } => {
                 let mut spans = vec![Span::raw(PREVIEW_INDENT)];
                 if show_gutter {
                     spans.push(gutter(*number, COLOR_LINE_NUMBER));
+                }
+                if diff_block {
+                    // 上下文行不显示标记，但标记列必须占住，正文才与增删行逐列对齐。
+                    spans.push(Span::raw(" ".repeat(MARKER_COLUMNS)));
+                } else if show_gutter {
                     spans.push(Span::raw(" "));
                 }
                 let body = truncate_line(text, body_width);
@@ -545,38 +631,95 @@ pub(crate) fn render_preview(
                 }
                 Line::from(spans)
             }
-            PreviewLine::Added { number, text } | PreviewLine::Removed { number, text } => {
-                let added = matches!(line, PreviewLine::Added { .. });
-                let (background, marker_color, marker) = if added {
-                    (COLOR_DIFF_ADD_BG, COLOR_DIFF_ADD_FG, "+")
-                } else {
-                    (COLOR_DIFF_DEL_BG, COLOR_DIFF_DEL_FG, "-")
-                };
-                let row_style = Style::new().bg(background);
-                let mut spans = vec![Span::raw(PREVIEW_INDENT)];
-                if show_gutter {
-                    spans.push(gutter(*number, marker_color).patch_style(row_style));
-                }
-                spans.push(Span::styled(marker.to_string(), row_style.fg(marker_color)));
-                let body = truncate_line(text, body_width);
-                // 增删行正文与标记使用一致的红绿前景，避免语法配色掩盖修改方向。
-                if error {
-                    spans.push(Span::styled(body, row_style.fg(COLOR_DANGER)));
-                } else {
-                    spans.push(Span::styled(body, row_style.fg(marker_color)));
-                }
-                // 缩进不参与背景，因此从行号列开始计算已占宽度。
-                let used = spans_width(&spans) - PREVIEW_INDENT.len();
-                pad_to(
-                    &mut spans,
-                    used,
-                    total_width.saturating_sub(PREVIEW_INDENT.len()),
-                    row_style,
-                );
-                Line::from(spans)
-            }
+            PreviewLine::Added { number, text } => diff_changed_row(
+                text,
+                true,
+                *number,
+                show_gutter,
+                total_width,
+                body_width,
+                error,
+            ),
+            PreviewLine::Removed { number, text } => diff_changed_row(
+                text,
+                false,
+                *number,
+                show_gutter,
+                total_width,
+                body_width,
+                error,
+            ),
         })
         .collect()
+}
+
+/// 渲染一条增删行。
+///
+/// 三个要点决定了它读起来像"改动记录"而不是"一段带色的文字"：
+///
+/// - 整行底色从缩进处开始铺到终端右边界，色块贯穿整宽；
+/// - 标记左侧留一列底色，`+`/`-` 不贴在行号列上；
+/// - 行号降为暗灰，方向只由标记与底色表达。
+fn diff_changed_row(
+    text: &str,
+    added: bool,
+    number: Option<usize>,
+    show_gutter: bool,
+    total_width: usize,
+    body_width: usize,
+    error: bool,
+) -> Line<'static> {
+    let kind = if added {
+        DiffLineKind::Added
+    } else {
+        DiffLineKind::Removed
+    };
+    let palette = diff::style_of(kind);
+    // 增删行必然带底色；取不到时退回终端默认背景，宁可少一块色也不能让预览崩掉。
+    let background = palette.bg.unwrap_or(Color::Reset);
+    let marker = if added { '+' } else { '-' };
+    let row_style = Style::new().bg(background);
+
+    let mut spans = vec![Span::styled(PREVIEW_INDENT, row_style)];
+    if show_gutter {
+        // 行号用暗灰而不是红绿：它是定位坐标，不该比改动本身更抢眼。
+        spans.push(gutter(number, COLOR_LINE_NUMBER).patch_style(row_style));
+    }
+    spans.push(Span::styled(" ".repeat(DIFF_MARKER_PAD), row_style));
+    spans.push(Span::styled(marker.to_string(), row_style.fg(palette.fg)));
+    let body = truncate_line(text, body_width);
+    // 增删行正文与标记使用一致的红绿前景，避免语法配色掩盖修改方向。
+    let body_color = if error { COLOR_DANGER } else { palette.fg };
+    spans.push(Span::styled(body, row_style.fg(body_color)));
+    // 底色一直铺到终端右边界：半截色块比不铺色更难看。
+    let used = spans_width(&spans);
+    pad_to(&mut spans, used, total_width, row_style);
+    Line::from(spans)
+}
+
+/// 渲染 diff 的结构行：文件头、hunk 头与补丁附注。
+///
+/// 这些行不铺底色：它们是"改的是哪个文件、从第几行开始"的坐标，铺底色会和增删行的
+/// 色块争夺注意力。行号列留空但保留宽度，正文才能与增删行逐列对齐。
+fn diff_structure_row(
+    text: &str,
+    kind: DiffLineKind,
+    show_gutter: bool,
+    body_width: usize,
+) -> Line<'static> {
+    let palette = diff::style_of(kind);
+    let mut style = Style::new().fg(palette.fg);
+    if palette.bold {
+        style = style.bold();
+    }
+    let mut spans = vec![Span::raw(PREVIEW_INDENT)];
+    if show_gutter {
+        spans.push(Span::raw(" ".repeat(GUTTER_WIDTH)));
+    }
+    // 结构文本落在标记列上，与原样补丁的列位置一致。
+    spans.push(Span::raw(" ".repeat(DIFF_MARKER_PAD)));
+    spans.push(Span::styled(truncate_line(text, body_width), style));
+    Line::from(spans)
 }
 
 /// 推断工具预览应使用的高亮语言。
@@ -623,6 +766,10 @@ pub(crate) fn tool_title_spans(name: &str, target: Option<&str>) -> Vec<Span<'st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{
+        COLOR_DIFF_ADD_BG, COLOR_DIFF_ADD_FG, COLOR_DIFF_DEL_BG, COLOR_DIFF_DEL_FG,
+        COLOR_DIFF_FILE_HEADER, COLOR_DIFF_HUNK,
+    };
     use serde_json::json;
 
     /// 拼接一行的全部片段文本。
@@ -810,24 +957,280 @@ mod tests {
         assert!(text_of(rendered.last().expect("应有省略行")).contains("… +6 行"));
     }
 
-    /// diff 行必须铺满整行背景，否则终端里会出现半截色块。
+    /// diff 行的底色必须贯穿整行，否则终端里会出现半截色块。
+    ///
+    /// 色块从缩进处起铺、一直铺到终端右边界：只包住文字的底色读起来仍是一段带色的
+    /// 文本，而不是一条独立的改动记录。
     #[test]
     fn diff_rows_fill_the_full_width() {
+        let lines = vec![
+            PreviewLine::Added {
+                number: Some(1),
+                text: "let x = 1;".into(),
+            },
+            PreviewLine::Removed {
+                number: Some(2),
+                text: "let x = 0;".into(),
+            },
+        ];
+
+        let rendered = render_preview(&lines, 40, CodeLanguage::CLike, false);
+        for (index, line) in rendered.iter().enumerate() {
+            let background = line
+                .spans
+                .iter()
+                .filter(|span| span.style.bg.is_some())
+                .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+                .sum::<usize>();
+
+            assert_eq!(background, 40, "第 {index} 行的底色应铺满整宽");
+            assert!(line.spans[0].content.starts_with(PREVIEW_INDENT));
+        }
+    }
+
+    /// 标记左侧留一列底色，`+`/`-` 不顶住行号列。
+    #[test]
+    fn diff_marker_is_padded_away_from_the_gutter() {
         let lines = vec![PreviewLine::Added {
-            number: Some(1),
+            number: Some(7),
             text: "let x = 1;".into(),
         }];
 
         let rendered = render_preview(&lines, 40, CodeLanguage::CLike, false);
-        let line = &rendered[0];
-        let background = line
+        let spans = &rendered[0].spans;
+        let marker_index = spans
+            .iter()
+            .position(|span| span.content == "+")
+            .expect("应包含新增标记");
+        // 标记之前只剩缩进与行号列；行号列之后必须还有一列留白。
+        let before_marker: usize = spans[..marker_index]
+            .iter()
+            .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        assert_eq!(
+            before_marker,
+            PREVIEW_INDENT.len() + GUTTER_WIDTH + DIFF_MARKER_PAD
+        );
+        assert_eq!(
+            text_of(&rendered[0]).find('+'),
+            Some(PREVIEW_INDENT.len() + GUTTER_WIDTH + 1)
+        );
+    }
+
+    /// 行号必须弱化成暗灰，方向只由标记与底色表达。
+    #[test]
+    fn diff_line_numbers_are_dimmed() {
+        let lines = vec![
+            PreviewLine::Added {
+                number: Some(12),
+                text: "let x = 1;".into(),
+            },
+            PreviewLine::Removed {
+                number: Some(13),
+                text: "let x = 0;".into(),
+            },
+        ];
+
+        let rendered = render_preview(&lines, 40, CodeLanguage::CLike, false);
+        for (line, number) in rendered.iter().zip(["12", "13"]) {
+            let gutter = line
+                .spans
+                .iter()
+                .find(|span| span.content.trim() == number)
+                .expect("应包含行号");
+            assert_eq!(gutter.style.fg, Some(COLOR_LINE_NUMBER));
+            // 行号仍带着整行底色，色块才能连贯。
+            assert!(gutter.style.bg.is_some());
+        }
+    }
+
+    /// 真实 `git diff` 输出必须被拆成结构行与增删行，而不是一整段单色正文。
+    ///
+    /// 这是"Shell 里的 diff 全白"的根因：标准补丁的头部行加上下文行远多于改动行，
+    /// 旧的比例判据永远不成立，整个补丁因此退化成普通文本。
+    #[test]
+    fn shell_git_diff_is_detected_and_classified() {
+        let diff = [
+            "diff --git a/src/main.rs b/src/main.rs",
+            "index 83f2a1b..9c31d4e 100644",
+            "--- a/src/main.rs",
+            "+++ b/src/main.rs",
+            "@@ -10,7 +10,9 @@ fn main() {",
+            "     let a = 1;",
+            "-    let c = 3;",
+            "+    let c = 4;",
+            "+    let c5 = 5;",
+            "     let d = 6;",
+            "     let e = 7;",
+            "     let f = 8;",
+        ];
+        let result = ToolResult::success("c", "shell", json!({ "stdout": diff.join("\n") }));
+
+        let lines = preview_lines(None, &result, 20);
+
+        assert!(matches!(lines[0], PreviewLine::FileHeader { .. }));
+        assert!(matches!(lines[2], PreviewLine::FileHeader { .. }));
+        assert!(matches!(lines[4], PreviewLine::HunkHeader { .. }));
+        assert_eq!(
+            lines[6],
+            PreviewLine::Removed {
+                number: Some(7),
+                text: "    let c = 3;".into()
+            }
+        );
+        assert_eq!(
+            lines[7],
+            PreviewLine::Added {
+                number: Some(8),
+                text: "    let c = 4;".into()
+            }
+        );
+    }
+
+    /// 文件头加粗且用青蓝、hunk 头青色加粗，两者都不铺底色；增删行铺满红绿底色。
+    #[test]
+    fn diff_structure_rows_are_colored_without_background() {
+        let lines = vec![
+            PreviewLine::FileHeader {
+                text: "diff --git a/a.rs b/a.rs".into(),
+            },
+            PreviewLine::HunkHeader {
+                text: "@@ -1,2 +1,3 @@".into(),
+            },
+            PreviewLine::Added {
+                number: Some(2),
+                text: "let y = 2;".into(),
+            },
+        ];
+
+        let rendered = render_preview(&lines, 60, CodeLanguage::CLike, false);
+
+        let header = &rendered[0];
+        let header_text = header
             .spans
             .iter()
-            .filter(|span| span.style.bg == Some(COLOR_DIFF_ADD_BG))
-            .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
-            .sum::<usize>();
+            .find(|span| span.content.contains("diff --git"))
+            .expect("应包含文件头文本");
+        assert_eq!(header_text.style.fg, Some(COLOR_DIFF_FILE_HEADER));
+        assert!(header_text.style.add_modifier.contains(Modifier::BOLD));
+        assert!(header.spans.iter().all(|span| span.style.bg.is_none()));
 
-        assert_eq!(background + PREVIEW_INDENT.len(), 40);
+        let hunk = &rendered[1];
+        let hunk_text = hunk
+            .spans
+            .iter()
+            .find(|span| span.content.contains("@@ -1,2"))
+            .expect("应包含 hunk 头文本");
+        assert_eq!(hunk_text.style.fg, Some(COLOR_DIFF_HUNK));
+        assert!(hunk_text.style.add_modifier.contains(Modifier::BOLD));
+        assert!(hunk.spans.iter().all(|span| span.style.bg.is_none()));
+
+        let added = &rendered[2];
+        assert!(added
+            .spans
+            .iter()
+            .any(|span| span.content == "let y = 2;" && span.style.fg == Some(COLOR_DIFF_ADD_FG)));
+    }
+
+    /// diff 上下文行不铺底色，但正文与增删行逐列对齐。
+    #[test]
+    fn diff_context_rows_align_with_changed_rows() {
+        let lines = vec![
+            PreviewLine::Added {
+                number: Some(1),
+                text: "let a = 1;".into(),
+            },
+            PreviewLine::Context {
+                number: Some(2),
+                text: "let b = 2;".into(),
+            },
+        ];
+
+        let rendered = render_preview(&lines, 60, CodeLanguage::Plain, false);
+        let body_column = |line: &Line<'_>| {
+            let mut column = 0;
+            for span in &line.spans {
+                if span.content.contains("let ") {
+                    return column;
+                }
+                column += unicode_width::UnicodeWidthStr::width(span.content.as_ref());
+            }
+            panic!("{}", text_of(line));
+        };
+
+        assert_eq!(body_column(&rendered[0]), body_column(&rendered[1]));
+        assert!(
+            rendered[1].spans.iter().all(|span| span.style.bg.is_none()),
+            "上下文行不应铺底色"
+        );
+    }
+
+    /// hunk 内以 `--` 开头的删除行渲染成 `--- ...`，必须仍是删除行而不是文件头。
+    ///
+    /// 这一行与补丁的 `--- a/file` 文件头逐字节相同，只有"是否已在 hunk 内"能区分：
+    /// 判定错了，删除行会突然变成一行蓝色文件头。
+    #[test]
+    fn dashes_inside_a_hunk_stay_removed_rows() {
+        let diff = [
+            "diff --git a/q.sql b/q.sql",
+            "--- a/q.sql",
+            "+++ b/q.sql",
+            "@@ -1,2 +1,2 @@",
+            "--- 旧注释",
+            "+++ 新注释",
+        ];
+        let result = ToolResult::success("c", "shell", json!({ "stdout": diff.join("\n") }));
+
+        let lines = preview_lines(None, &result, 10);
+
+        assert!(matches!(lines[0], PreviewLine::FileHeader { .. }));
+        assert!(matches!(lines[1], PreviewLine::FileHeader { .. }));
+        assert_eq!(
+            lines[4],
+            PreviewLine::Removed {
+                number: Some(5),
+                text: "-- 旧注释".into()
+            }
+        );
+        assert_eq!(
+            lines[5],
+            PreviewLine::Added {
+                number: Some(6),
+                text: "++ 新注释".into()
+            }
+        );
+    }
+
+    /// 运行中的增量输出同样按 diff 渲染，避免跑完前后观感突变。
+    #[test]
+    fn live_output_of_a_diff_is_classified_too() {
+        let text = [
+            "diff --git a/a.rs b/a.rs",
+            "--- a/a.rs",
+            "+++ b/a.rs",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+        ]
+        .join("\n");
+
+        let lines = output_preview_lines(&text, 10);
+
+        assert!(matches!(lines[0], PreviewLine::FileHeader { .. }));
+        assert_eq!(
+            lines[4],
+            PreviewLine::Removed {
+                number: None,
+                text: "old".into()
+            }
+        );
+        assert_eq!(
+            lines[5],
+            PreviewLine::Added {
+                number: None,
+                text: "new".into()
+            }
+        );
     }
 
     /// 内建工具名映射为动词形式，插件工具保留原名。

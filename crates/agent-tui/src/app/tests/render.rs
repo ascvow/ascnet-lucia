@@ -392,6 +392,78 @@ fn code_blocks_have_card_padding_rows() {
     );
 }
 
+/// ```diff 围栏块按行语义着色：增删行整行换底色，文件头与 hunk 头加粗且不铺底色。
+///
+/// Markdown 与工具预览共用 [`crate::ui::diff`] 的分类，因此同一个补丁在两处呈现一致。
+#[test]
+fn diff_fence_colors_rows_by_meaning() {
+    let lines = markdown_lines(
+        "```diff\ndiff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-let old = 1;\n+let new = 2;\n context();\n```",
+        false,
+        60,
+    );
+
+    let find = |needle: &str| {
+        lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains(needle)))
+            .unwrap_or_else(|| panic!("应包含 {needle} 行"))
+    };
+    // 首个片段是消息行首标记 `● `，卡片内容从第二个片段开始。
+    let card_backgrounds = |line: &Line<'_>| {
+        line.spans
+            .iter()
+            .skip(1)
+            .map(|span| span.style.bg)
+            .collect::<Vec<_>>()
+    };
+
+    // 文件头与 hunk 头：加粗的结构色，底色仍是卡片底色而不是红绿。
+    for (needle, color) in [
+        ("diff --git", crate::theme::COLOR_DIFF_FILE_HEADER),
+        ("@@ -1,2", crate::theme::COLOR_DIFF_HUNK),
+    ] {
+        let line = find(needle);
+        let span = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains(needle))
+            .expect("应包含结构文本");
+        assert_eq!(span.style.fg, Some(color), "{needle}");
+        assert!(span.style.add_modifier.contains(Modifier::BOLD), "{needle}");
+        assert!(card_backgrounds(line)
+            .iter()
+            .all(|bg| *bg == Some(crate::theme::COLOR_CODE_BG)));
+    }
+
+    // 增删行：整行（含左侧竖条与尾部留白）换成 diff 底色。
+    let removed = find("-let old = 1;");
+    assert!(card_backgrounds(removed)
+        .iter()
+        .all(|bg| *bg == Some(crate::theme::COLOR_DIFF_DEL_BG)));
+    assert!(removed
+        .spans
+        .iter()
+        .any(|span| span.content.contains("let old = 1;")
+            && span.style.fg == Some(crate::theme::COLOR_DIFF_DEL_FG)));
+
+    let added = find("+let new = 2;");
+    assert!(card_backgrounds(added)
+        .iter()
+        .all(|bg| *bg == Some(crate::theme::COLOR_DIFF_ADD_BG)));
+    assert!(added
+        .spans
+        .iter()
+        .any(|span| span.content.contains("let new = 2;")
+            && span.style.fg == Some(crate::theme::COLOR_DIFF_ADD_FG)));
+
+    // 上下文行保持卡片底色与正文色，不参与红绿。
+    let context = find(" context();");
+    assert!(card_backgrounds(context)
+        .iter()
+        .all(|bg| *bg == Some(crate::theme::COLOR_CODE_BG)));
+}
+
 /// 多行输入框最多展示六个逻辑行，并自动滚动到光标所在的末行。
 #[test]
 fn multiline_input_renders_six_visible_rows() {

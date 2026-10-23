@@ -22,6 +22,9 @@ pub(crate) enum CodeLanguage {
     CLike,
     /// 使用 `#` 注释的脚本与配置族：Python、Shell、TOML、YAML 等。
     Hash,
+    /// 统一 diff：不按词法上色，改由 [`crate::ui::diff`] 按行语义（增删、文件头、hunk
+    /// 头）着色。词法高亮会把 `+`/`-` 当成运算符，反而抹掉修改方向。
+    Diff,
     /// 无法识别语言时按纯文本处理，只保留正文色。
     Plain,
 }
@@ -41,6 +44,8 @@ impl CodeLanguage {
             | "jsonc" | "css" | "scss" => Self::CLike,
             "py" | "sh" | "bash" | "zsh" | "fish" | "toml" | "yaml" | "yml" | "rb" | "pl" | "r"
             | "ex" | "exs" | "nix" | "dockerfile" | "makefile" | "mk" => Self::Hash,
+            // 补丁文件同样没有词法结构，交给 diff 行分类处理。
+            "diff" | "patch" | "rej" => Self::Diff,
             _ => Self::Plain,
         }
     }
@@ -53,6 +58,7 @@ impl CodeLanguage {
         match tag.trim().to_ascii_lowercase().as_str() {
             "rust" | "javascript" | "typescript" | "js" | "ts" | "jsx" | "tsx" => Self::CLike,
             "python" | "shell" | "bash" | "zsh" | "console" | "shell-session" => Self::Hash,
+            "diff" | "patch" | "udiff" => Self::Diff,
             other => Self::from_path(&format!("file.{other}")),
         }
     }
@@ -158,9 +164,10 @@ const KEYWORDS: &[&str] = &[
 
 /// 将一行代码切分为带颜色的片段。
 ///
-/// 输入应当是单个逻辑行；换行符不会被特殊处理。未识别语言时整行返回正文色。
+/// 输入应当是单个逻辑行；换行符不会被特殊处理。未识别语言与 diff 整行返回正文色：
+/// diff 的着色依赖跨行的 hunk 状态，只能由 [`crate::ui::diff`] 在整段上完成。
 pub(crate) fn highlight_line(text: &str, language: CodeLanguage) -> Vec<Span<'static>> {
-    if language == CodeLanguage::Plain || text.is_empty() {
+    if matches!(language, CodeLanguage::Plain | CodeLanguage::Diff) || text.is_empty() {
         return vec![Span::styled(text.to_string(), Style::new().fg(COLOR_TEXT))];
     }
 

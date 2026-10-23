@@ -74,13 +74,26 @@ pub(crate) const COLOR_INLINE_CODE_BG: Color = Color::Rgb(45, 44, 50);
 /// 引用块的整块底色：比代码块更暗，靠色差而非竖线区分两种卡片。
 pub(crate) const COLOR_QUOTE_BG: Color = Color::Rgb(28, 28, 32);
 /// diff 新增行的整行背景色。
-pub(crate) const COLOR_DIFF_ADD_BG: Color = Color::Rgb(26, 56, 36);
+///
+/// 底色必须远暗于文字：整行色块的作用是"扫一眼看出这里多了一块"，一旦底色接近文字
+/// 亮度，色块就会盖过代码本身的可读性。
+pub(crate) const COLOR_DIFF_ADD_BG: Color = Color::Rgb(30, 50, 30);
 /// diff 删除行的整行背景色。
-pub(crate) const COLOR_DIFF_DEL_BG: Color = Color::Rgb(66, 30, 34);
-/// diff 新增行的行号与标记色。
-pub(crate) const COLOR_DIFF_ADD_FG: Color = Color::Rgb(126, 202, 146);
-/// diff 删除行的行号与标记色。
-pub(crate) const COLOR_DIFF_DEL_FG: Color = Color::Rgb(224, 122, 122);
+pub(crate) const COLOR_DIFF_DEL_BG: Color = Color::Rgb(60, 30, 30);
+/// diff 新增行的文字与标记色。
+pub(crate) const COLOR_DIFF_ADD_FG: Color = Color::Rgb(100, 200, 100);
+/// diff 删除行的文字与标记色。
+pub(crate) const COLOR_DIFF_DEL_FG: Color = Color::Rgb(200, 100, 100);
+/// diff 文件头的文字色：柔和的青蓝。
+///
+/// 文件头是"改的是哪个文件"的定位信息，既不能与 hunk 头的青色混同，也不能用正文色
+/// 淹没在上下文行里。
+pub(crate) const COLOR_DIFF_FILE_HEADER: Color = Color::Rgb(100, 150, 200);
+/// diff hunk 头的文字色：青色。
+///
+/// 与文件头的青蓝拉开色相：hunk 头是"跳到下一段改动"的锚点，需要在整屏 diff 里被
+/// 一眼找到。
+pub(crate) const COLOR_DIFF_HUNK: Color = Color::Rgb(120, 200, 200);
 
 /// 代码高亮：关键字。
 pub(crate) const COLOR_SYNTAX_KEYWORD: Color = Color::Rgb(214, 122, 160);

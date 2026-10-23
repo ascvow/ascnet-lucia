@@ -5,6 +5,7 @@ use crate::theme::{
     COLOR_MUTED, COLOR_QUOTE_BG, COLOR_SEPARATOR, COLOR_TEXT, COLOR_TEXT_SOFT, COLOR_USER,
     COLOR_USER_BG,
 };
+use crate::ui::diff::{self, DiffLineKind};
 use crate::ui::highlight::{highlight_line, CodeLanguage};
 use ratatui::prelude::*;
 use serde_json::Value;
@@ -528,13 +529,17 @@ fn render_quote(text: &str, text_width: usize, out: &mut Vec<Line<'static>>) {
 ///
 /// 整块是一张卡片：上下各留一行只铺底色的内边距，左侧竖条之后还有两列空白，
 /// 语言标签退到元信息色。超宽代码按显示宽度自行折行，避免被 `Paragraph` 折到行首。
+///
+/// `diff` 围栏块走 diff 行分类：增删行把整行（含卡片竖条与尾部留白）换成对应底色，
+/// 文件头与 hunk 头按结构色加粗。判定与配色都取自 [`crate::ui::diff`]，与工具预览
+/// 共用一套规则，同一个补丁不会在两个位置呈现两种颜色。
 fn render_code(language: &str, rows: &[&str], body_width: usize, out: &mut Vec<Line<'static>>) {
     let language = language.trim();
     if out.last().is_some_and(|line| line.width() > 0) {
         out.push(Line::default());
     }
     // 卡片内部的上留白：把代码从上一段正文里"垫"出来。
-    out.push(code_line(Vec::new(), body_width));
+    out.push(code_line(Vec::new(), body_width, COLOR_CODE_BG));
     let code_language = CodeLanguage::from_tag(language);
     if !language.is_empty() {
         // 语言标签属于元信息，降到最暗一档，不与代码正文争夺注意力。
@@ -544,6 +549,7 @@ fn render_code(language: &str, rows: &[&str], body_width: usize, out: &mut Vec<L
                 Style::new().fg(COLOR_META),
             )],
             body_width,
+            COLOR_CODE_BG,
         ));
     }
     let rows: Vec<&str> = if rows.is_empty() {
@@ -555,33 +561,53 @@ fn render_code(language: &str, rows: &[&str], body_width: usize, out: &mut Vec<L
     let available = body_width
         .saturating_sub(unicode_width::UnicodeWidthStr::width(CODE_GUTTER))
         .max(1);
-    for row in rows {
+    let diff_kinds = (code_language == CodeLanguage::Diff).then(|| diff::classify_rows(&rows));
+    for (index, row) in rows.iter().enumerate() {
+        let kind = diff_kinds.as_ref().map(|kinds| kinds[index]);
+        // 增删行用 diff 底色替换卡片底色，色块因此覆盖竖条与右侧留白，整行是一条记录。
+        let background = kind
+            .map(diff::style_of)
+            .and_then(|palette| palette.bg)
+            .unwrap_or(COLOR_CODE_BG);
         for chunk in wrap_display(row, available) {
-            out.push(code_line(highlight_line(&chunk, code_language), body_width));
+            let content = match kind {
+                Some(kind) => diff_spans(&chunk, kind),
+                None => highlight_line(&chunk, code_language),
+            };
+            out.push(code_line(content, body_width, background));
         }
     }
     // 卡片内部的下留白。
-    out.push(code_line(Vec::new(), body_width));
+    out.push(code_line(Vec::new(), body_width, COLOR_CODE_BG));
     out.push(Line::default());
 }
 
+/// 把 diff 的一行包装成单片段：整行同色，方向由底色与加粗表达。
+fn diff_spans(text: &str, kind: DiffLineKind) -> Vec<Span<'static>> {
+    let palette = diff::style_of(kind);
+    let mut style = Style::new().fg(palette.fg);
+    if palette.bold {
+        style = style.bold();
+    }
+    vec![Span::styled(text.to_string(), style)]
+}
+
 /// 构造铺满消息区宽度的一行代码：左侧竖条加内边距、整块底色与尾部补齐。
-fn code_line(content: Vec<Span<'static>>, body_width: usize) -> Line<'static> {
+///
+/// `background` 让 diff 的增删行把整条卡片行换成红绿底色，而不是只给文字上色。
+fn code_line(content: Vec<Span<'static>>, body_width: usize, background: Color) -> Line<'static> {
     let used = spans_width(&content);
     let gutter = unicode_width::UnicodeWidthStr::width(CODE_GUTTER);
     let mut spans = vec![Span::styled(
         CODE_GUTTER,
-        Style::new().fg(COLOR_BORDER_FOCUS).bg(COLOR_CODE_BG),
+        Style::new().fg(COLOR_BORDER_FOCUS).bg(background),
     )];
     spans.extend(content.into_iter().map(|span| {
-        let style = span.style.patch(Style::new().bg(COLOR_CODE_BG));
+        let style = span.style.bg(background);
         Span::styled(span.content, style)
     }));
     let pad = body_width.saturating_sub(used + gutter);
-    spans.push(Span::styled(
-        " ".repeat(pad),
-        Style::new().bg(COLOR_CODE_BG),
-    ));
+    spans.push(Span::styled(" ".repeat(pad), Style::new().bg(background)));
     Line::from(spans)
 }
 
