@@ -18,5 +18,9 @@ tokio.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 
+[[bench]]
+name = "context_prepare"
+harness = false
+
 [lints]
 workspace = true
