@@ -141,6 +141,13 @@ pub struct ToolCall {
     /// Provider、历史消息或 Guest 自报值均不可信；Core 会在每次进入扩展链前覆盖该字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+
+    /// 应用为当前 Agent 绑定的稳定会话 ID，供有状态工具隔离不同会话的数据。
+    ///
+    /// 模型响应或历史消息中的值不可信；Core 会在工具准入前使用当前 Agent 的会话路由键
+    /// 覆盖该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl ToolCall {
@@ -153,6 +160,7 @@ impl ToolCall {
             args,
             permission_scope: ToolPermissionScope::Unknown,
             run_id: None,
+            session_id: None,
         }
     }
 
@@ -643,6 +651,7 @@ mod tests {
         .expect("旧 ToolCall JSON 应继续解析");
         assert_eq!(call.permission_scope, ToolPermissionScope::Unknown);
         assert_eq!(call.run_id, None);
+        assert_eq!(call.session_id, None);
 
         call.bind_permission_scope(ToolPermissionScope::Read);
         call.bind_run_id("run-1");
