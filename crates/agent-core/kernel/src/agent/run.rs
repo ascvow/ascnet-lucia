@@ -120,6 +120,17 @@ enum ToolAdmission {
     Ready(ToolCall),
 }
 
+/// 模型建连阶段的两种返回形态。
+///
+/// 流式与非流式分支共用同一个已固定的建连 future，这样取消通知重试时复用的是
+/// 同一个 future，而不是为重试再克隆一次请求（请求内含完整消息历史与工具定义）。
+enum ModelConnect {
+    /// 已建立流式事件流。
+    Stream(crate::model::ModelEventStream),
+    /// 非流式调用已取得完整响应，包装为单事件流后复用后续处理。
+    Complete(crate::model::ModelResponse),
+}
+
 /// 用一次性审批说明替换最新的完整工具对，不改写持久会话。
 ///
 /// 上下文加载器可以摘要或删除原始工具调用。若目标调用与结果不再成对存在，先清理
@@ -492,10 +503,13 @@ impl Agent {
         let mut used_tool_call_ids = session_tool_call_ids(&session);
         let max_steps = self.effective_max_steps();
         while max_steps.is_none_or(|limit| steps_since_user_input < limit) {
+            // 不在这里回写 `state.session`：`begin_run` 已用运行起点初始化，
+            // 之后每次 `session` 变更（助手块、工具结果、注入消息）都紧跟一次状态同步，
+            // 因此进入本轮时两者已经一致。再克隆一次会把整份历史每步重拷一遍，
+            // 让运行过程退化为 O(n²)。新增会话变更点时必须同时同步状态。
             self.update_state(|state| {
                 state.phase = AgentPhase::Preparing;
                 state.step = step;
-                state.session = session.clone();
                 state.streamed_text.clear();
                 state.thinking_text.clear();
                 state.tool_calls.clear();
@@ -627,51 +641,66 @@ impl Agent {
             }
 
             let mut model_stream = {
+                // 建连 future 只构造一次并固定下来：取消通知重试时复用同一个 future，
+                // 请求本身随之移入，不必为了重试而克隆整份请求。
+                let connect_provider = route.provider.clone();
+                let mut connect: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<ModelConnect>> + Send + '_>,
+                > = if self.options.stream {
+                    Box::pin(async move {
+                        self.gateway
+                            .stream(&connect_provider, req)
+                            .await
+                            .map(ModelConnect::Stream)
+                    })
+                } else {
+                    Box::pin(async move {
+                        self.gateway
+                            .complete(&connect_provider, req)
+                            .await
+                            .map(ModelConnect::Complete)
+                    })
+                };
                 // 把通知 future 限定在建连阶段，成功后立即注销等待者，不能窃取后续取消通知。
                 loop {
                     let cancel_notified = self.cancel_notify.notified();
                     tokio::pin!(cancel_notified);
-                    if self.options.stream {
-                        tokio::select! {
-                            result = self.gateway.stream(&route.provider, req.clone()) => {
-                                let stream = result?;
-                                self.update_state(|state| state.phase = AgentPhase::StreamingModel);
-                                break stream;
-                            }
-                            _ = &mut cancel_notified => {
-                                if self.take_cancelled() {
-                                    return self.finish_cancelled(
-                                        &run_id, step, step + 1, total_usage, session,
-                                    ).await;
+                    tokio::select! {
+                        result = &mut connect => {
+                            match result? {
+                                ModelConnect::Stream(stream) => {
+                                    self.update_state(|state| state.phase = AgentPhase::StreamingModel);
+                                    break stream;
+                                }
+                                ModelConnect::Complete(response) => {
+                                    let (sender, stream) = crate::model::ModelEventStream::channel();
+                                    sender.done(response);
+                                    break stream;
                                 }
                             }
                         }
-                    } else {
-                        tokio::select! {
-                            result = self.gateway.complete(&route.provider, req.clone()) => {
-                                let (sender, stream) = crate::model::ModelEventStream::channel();
-                                sender.done(result?);
-                                break stream;
-                            }
-                            _ = &mut cancel_notified => {
-                                if self.take_cancelled() {
-                                    return self.finish_cancelled(
-                                        &run_id, step, step + 1, total_usage, session,
-                                    ).await;
-                                }
+                        _ = &mut cancel_notified => {
+                            if self.take_cancelled() {
+                                return self.finish_cancelled(
+                                    &run_id, step, step + 1, total_usage, session,
+                                ).await;
                             }
                         }
                     }
                 }
             };
-            // 累积文本增量：取消发生在流中途时，把已生成的部分文本保留进会话。
-            let mut streamed_text = String::new();
+            // 已生成文本只在状态里保留一份：取消发生在流中途时从状态取出写进会话，
+            // 避免每个 token 都往两个 String 各追加一次。
             loop {
                 // 先建立通知监听再读取原子标记，避免取消落在检查与等待之间。
                 let cancel_notified = self.cancel_notify.notified();
                 tokio::pin!(cancel_notified);
                 if self.take_cancelled() {
                     drop(model_stream);
+                    let mut streamed_text = String::new();
+                    self.update_state(|state| {
+                        streamed_text = std::mem::take(&mut state.streamed_text)
+                    });
                     if !streamed_text.is_empty() {
                         session.push_assistant_blocks(vec![crate::model::ContentBlock::Text {
                             text: streamed_text,
@@ -690,7 +719,6 @@ impl Agent {
                 };
                 match event {
                     ModelStreamEvent::TextDelta { index, delta } => {
-                        streamed_text.push_str(&delta);
                         self.update_state(|state| state.streamed_text.push_str(&delta));
                         self.emit(
                             &run_id,
