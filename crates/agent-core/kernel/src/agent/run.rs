@@ -131,6 +131,46 @@ enum ModelConnect {
     Complete(crate::model::ModelResponse),
 }
 
+/// 保证一次门禁预留一定被结算。
+///
+/// 预留发生在建连之前，结算点在模型响应之后；两者之间存在取消、建连失败、流读取
+/// 错误等多条提前返回路径。用 `Drop` 兜底可以避免预留被永久占用——否则一次失败的
+/// 请求会永久吃掉一份输出预算。
+struct ModelRequestSettlement {
+    gate: Arc<dyn ModelRequestGate>,
+    /// 发起请求时按 `max_tokens` 预留的输出 token 数。
+    reserved_output_tokens: usize,
+    settled: bool,
+}
+
+impl ModelRequestSettlement {
+    /// 记录一次已成功完成的预留，等待结算。
+    fn new(gate: Arc<dyn ModelRequestGate>, reserved_output_tokens: usize) -> Self {
+        Self {
+            gate,
+            reserved_output_tokens,
+            settled: false,
+        }
+    }
+
+    /// 以服务商回报的实际输出用量结算；`None` 表示没有拿到用量，按零用量退还。
+    fn settle(&mut self, actual_output_tokens: Option<u64>) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        self.gate
+            .settle_request(self.reserved_output_tokens, actual_output_tokens);
+    }
+}
+
+impl Drop for ModelRequestSettlement {
+    fn drop(&mut self) {
+        // 未显式结算说明本轮提前退出（取消或错误），按零用量退还全部预留。
+        self.settle(None);
+    }
+}
+
 /// 用一次性审批说明替换最新的完整工具对，不改写持久会话。
 ///
 /// 上下文加载器可以摘要或删除原始工具调用。若目标调用与结果不再成对存在，先清理
@@ -606,6 +646,15 @@ impl Agent {
                 gate.before_request(&req)
                     .context("模型请求在 provider 调用前被可信门禁拒绝")?;
             }
+            // 预留成功后才创建结算守卫：失败路径没有预留，不能结算。
+            let mut request_settlement = self.model_request_gate.as_ref().map(|gate| {
+                ModelRequestSettlement::new(
+                    Arc::clone(gate),
+                    req.max_tokens
+                        .filter(|limit| *limit > 0)
+                        .map_or(0, |limit| limit as usize),
+                )
+            });
 
             self.update_state(|state| state.phase = AgentPhase::RequestingModel);
 
@@ -743,6 +792,15 @@ impl Agent {
                 }
             }
             let mut response = model_stream.result().await?;
+            // 立刻按实际输出用量结算预留；后续提前返回路径已由守卫兜底退还。
+            if let Some(settlement) = request_settlement.as_mut() {
+                settlement.settle(
+                    response
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.output_tokens),
+                );
+            }
             clear_untrusted_tool_call_bindings(&mut response);
             let response_text = response.text_content();
             let tool_calls = response.tool_calls.clone();

@@ -60,6 +60,18 @@ pub trait ModelRequestGate: Send + Sync {
     /// `request` 是即将发送的最终请求。实现可以读取其序列化大小、模型和输出上限，
     /// 但不得修改请求。超过可信预算或无法完成原子预留时返回错误。
     fn before_request(&self, request: &ModelRequest) -> Result<()>;
+
+    /// 结算一次 [`Self::before_request`] 已完成的预留。
+    ///
+    /// `reserved_output_tokens` 是发起请求时按 `max_tokens` 预留的输出 token 数，
+    /// `actual_output_tokens` 是服务商回报的实际输出用量；`None` 表示本次请求失败或
+    /// 被取消，没有拿到用量，实现应按零用量退还预留。
+    ///
+    /// Core 保证每次成功的 `before_request` 之后恰好调用一次本方法，覆盖正常完成、
+    /// 取消与错误返回路径。默认实现不做任何事，因此不预留额度的门禁无需关心它。
+    fn settle_request(&self, reserved_output_tokens: usize, actual_output_tokens: Option<u64>) {
+        let _ = (reserved_output_tokens, actual_output_tokens);
+    }
 }
 
 /// 下一次模型请求实际使用的路由。

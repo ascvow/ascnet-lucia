@@ -68,7 +68,10 @@ pub struct RuntimeLimits {
     /// 单个可信 principal 的派生 Agent 允许提交的模型请求累计序列化字节数。
     #[serde(default = "default_max_agent_model_request_bytes_per_principal")]
     pub max_agent_model_request_bytes_per_principal: usize,
-    /// 单个可信 principal 的派生 Agent 允许预留的模型输出 token 累计总数。
+    /// 单个可信 principal 的派生 Agent 允许累计消耗的模型输出 token 总数。
+    ///
+    /// 每次请求按 `max_tokens` 预留，请求结束后按服务商回报的实际用量结算并退还差额；
+    /// 因此该上限约束的是真实消耗，而不是请求次数乘以上限。
     #[serde(default = "default_max_agent_model_output_tokens_per_principal")]
     pub max_agent_model_output_tokens_per_principal: usize,
 }

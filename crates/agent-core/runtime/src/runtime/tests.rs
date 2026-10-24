@@ -3,6 +3,7 @@ use crate::{AgentExecutionResult, RuntimeRunFinalizer, RuntimeRunObservation, To
 use agent_core::{
     Agent, AgentExtension, AgentOptions, ChatModel, ContextLoadRequest, ContextLoader,
     InMemoryEventSink, LoadedContext, ModelGateway, ModelRequest, ModelResponse, ProviderAdapter,
+    TokenUsage,
 };
 use agent_tool::{JsonTool, ToolRegistry, ToolSpec};
 use anyhow::Result;
@@ -97,6 +98,65 @@ impl ChatModel for RecordingModel {
 impl ProviderAdapter for RecordingModel {
     fn name(&self) -> &'static str {
         "recording"
+    }
+}
+
+/// 每次调用都报告"实际用掉等于预留额度"的模型。
+///
+/// 结算语义下，只有实际用量占住预算，累计输出预算才会持续被消耗。并发准入测试要
+/// 验证的是"预算只放行其中一次请求"，与调度顺序无关，因此模型必须如实报告用量。
+struct BudgetConsumingModel {
+    calls: Arc<AtomicUsize>,
+    max_tokens: Arc<Mutex<Vec<Option<u32>>>>,
+}
+
+#[async_trait]
+impl ChatModel for BudgetConsumingModel {
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        let limit = request.max_tokens;
+        self.max_tokens
+            .lock()
+            .expect("模型请求记录锁不应中毒")
+            .push(limit);
+        let mut response = ModelResponse::text("完成");
+        response.usage = Some(TokenUsage {
+            output_tokens: limit.map(u64::from),
+            ..TokenUsage::default()
+        });
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for BudgetConsumingModel {
+    fn name(&self) -> &'static str {
+        "budget-consuming"
+    }
+}
+
+/// 每次只报告少量实际输出的模型，用于验证预算按用量结算而不是按预留计量。
+struct SmallOutputModel {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ChatModel for SmallOutputModel {
+    async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        let mut response = ModelResponse::text("完成");
+        response.usage = Some(TokenUsage {
+            output_tokens: Some(5),
+            ..TokenUsage::default()
+        });
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for SmallOutputModel {
+    fn name(&self) -> &'static str {
+        "small-output"
     }
 }
 
@@ -1316,7 +1376,7 @@ async fn zero_max_tokens_is_rejected_before_provider() {
 async fn concurrent_model_output_token_reservation_is_atomic() {
     let calls = Arc::new(AtomicUsize::new(0));
     let max_tokens = Arc::new(Mutex::new(Vec::new()));
-    let model = Arc::new(RecordingModel {
+    let model = Arc::new(BudgetConsumingModel {
         calls: Arc::clone(&calls),
         max_tokens: Arc::clone(&max_tokens),
     });
@@ -1534,4 +1594,58 @@ async fn gate_rejection_terminal_state_explains_the_reason() {
         error.contains("模型请求累计次数超过上限 0"),
         "终态必须说明真实原因，实际为：{error}"
     );
+}
+
+/// 输出预算必须按实际用量结算，否则一次请求就会吃掉整份上限。
+///
+/// 模型声明的输出上限（`max_tokens`）显著大于真实回答长度：models.dev 同步后可达
+/// 数十万 token，而一次回答通常只有一千上下。若只在发起请求时按上限预留、从不结算，
+/// 默认预算会在几十次请求后耗尽，把"允许 512 次请求"变成"允许 26 次"，派生 Agent
+/// 会在没有日志解释的情况下全部失败。
+///
+/// 这里让每次请求预留 400、实际只用 5：只预留不结算时第 3 次必然超限，按用量结算
+/// 则 8 次请求都应落在 1000 的预算内。
+#[tokio::test]
+async fn output_budget_settles_actual_usage_instead_of_reservation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gateway = ModelGateway::new();
+    gateway
+        .register(
+            "settle",
+            Arc::new(SmallOutputModel {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .expect("注册小输出模型应成功");
+    let mut options = AgentOptions::default().with_model_route("settle", "test-model");
+    options.max_tokens = Some(400);
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_agent_model_requests_per_principal: 8,
+        max_agent_model_output_tokens_per_principal: 1_000,
+        ..RuntimeLimits::default()
+    })
+    .expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            AgentTemplate::from_agent(&Agent::new(gateway, options)),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+
+    for index in 0..8 {
+        let child = api
+            .spawn(AgentSpawnRequest::new(format!("第 {index} 次请求")))
+            .await
+            .expect("派生 Agent");
+        let outcome = api.wait(&child.id).await.expect("等待 Agent");
+        assert_eq!(
+            outcome.status(),
+            AgentStatus::Succeeded,
+            "第 {} 次请求不应因输出预算被拒",
+            index + 1
+        );
+    }
+    assert_eq!(calls.load(Ordering::Acquire), 8, "8 次请求都应到达模型");
 }
