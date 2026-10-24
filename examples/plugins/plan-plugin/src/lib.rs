@@ -471,7 +471,7 @@ impl AgentPlugin for PlanPlugin {
         let empty = PlanState::default();
         let plan = plan.unwrap_or(&empty);
         let mut lines = match request.view_id.as_str() {
-            PLAN_SHELF_VIEW => self.render_shelf(plan, request.width as usize),
+            PLAN_SHELF_VIEW => self.render_shelf(plan, request.width as usize, request.focused),
             PLAN_DETAIL_VIEW => self.render_detail(plan, request.width as usize),
             _ => return None,
         };
@@ -516,13 +516,17 @@ impl AgentPlugin for PlanPlugin {
 
 impl PlanPlugin {
     /// 构造输入区上方的紧凑进度架，最多展示五行并用汇总行收起其余任务。
-    fn render_shelf(&self, plan: &PlanState, width: usize) -> Vec<UiLine> {
+    ///
+    /// 聚焦时在汇总行补上 `Enter` 提示：架子上的唯一动作是打开完整计划，而它也是这条
+    /// 路径唯一的发现入口——不是所有终端都能上报鼠标点击。
+    fn render_shelf(&self, plan: &PlanState, width: usize, focused: bool) -> Vec<UiLine> {
         let completed = completed_steps(plan);
+        let mut headline = format!("Plan  {completed}/{} completed", plan.plan.len());
+        if focused {
+            headline.push_str("  ·  Enter 详情");
+        }
         let mut lines = vec![styled_line(
-            truncate_to_width(
-                &format!("Plan  {completed}/{} completed", plan.plan.len()),
-                width,
-            ),
+            truncate_to_width(&headline, width),
             Some(UiColor::Cyan),
             true,
         )];
@@ -1258,6 +1262,90 @@ mod tests {
         );
     }
 
+    /// 架子上的唯一动作是打开完整计划：回车与鼠标点击都必须触发，其他键不误触。
+    ///
+    /// 宿主只在架子获得焦点后才把按键交给插件，因此这条键盘路径就是没有鼠标时的唯一
+    /// 入口；测试用导航序号判断是否真的发出了导航请求。
+    #[test]
+    fn shelf_opens_details_from_enter_or_click() {
+        let input = |event| UiInput {
+            plugin_id: "plan".into(),
+            view_id: PLAN_SHELF_VIEW.into(),
+            instance_id: None,
+            event,
+        };
+        let mut plugin = PlanPlugin::default();
+
+        for event in [
+            UiInputEvent::Key {
+                code: "enter".into(),
+                modifiers: Vec::new(),
+            },
+            UiInputEvent::Mouse {
+                kind: "down_left".into(),
+                x: 1,
+                y: 0,
+            },
+        ] {
+            let before = plugin.navigation_sequence;
+            plugin.on_ui_input_with_host(&NoopHostApi, input(event));
+            assert!(
+                plugin.navigation_sequence > before,
+                "回车与点击都应请求打开完整计划"
+            );
+        }
+
+        let before = plugin.navigation_sequence;
+        plugin.on_ui_input_with_host(
+            &NoopHostApi,
+            input(UiInputEvent::Key {
+                code: "x".into(),
+                modifiers: Vec::new(),
+            }),
+        );
+        assert_eq!(plugin.navigation_sequence, before, "其他键不应打开详情");
+    }
+
+    /// 聚焦后汇总行要写出 `Enter` 入口，未聚焦时不说这句话。
+    #[test]
+    fn focused_shelf_advertises_the_enter_hint() {
+        let request = |focused| UiRenderRequest {
+            session_id: None,
+            plugin_id: "plan".into(),
+            view_id: PLAN_SHELF_VIEW.into(),
+            instance_id: None,
+            width: 60,
+            height: 8,
+            focused,
+            frame: 1,
+        };
+        let mut plugin = PlanPlugin::default();
+        plugin.book.store(
+            &session_key(None),
+            PlanState {
+                revision: 1,
+                plan: vec![item("检查实现", PlanStatus::Pending)],
+                ..PlanState::default()
+            },
+            None,
+        );
+
+        let headline = |frame: &UiFrame| -> String {
+            frame.lines[0]
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect()
+        };
+
+        let idle = plugin.render_ui(request(false)).expect("计划架应返回帧");
+        assert!(headline(&idle).contains("Plan  0/1 completed"));
+        assert!(!headline(&idle).contains("Enter"));
+
+        let focused = plugin.render_ui(request(true)).expect("计划架应返回帧");
+        assert!(headline(&focused).contains("Enter 详情"), "{focused:?}");
+    }
+
     /// 紧凑计划架最多展示五行，超出项汇总显示，已完成任务稳定沉到末尾。
     #[test]
     fn shelf_limits_rows_and_sinks_completed_items() {
@@ -1278,7 +1366,7 @@ mod tests {
             None,
         );
 
-        let lines = plugin.render_shelf(plugin.book.plan(&session).expect("计划存在"), 80);
+        let lines = plugin.render_shelf(plugin.book.plan(&session).expect("计划存在"), 80, false);
         let text = lines
             .iter()
             .map(|line| line.spans[0].text.as_str())
@@ -1310,7 +1398,8 @@ mod tests {
             },
             None,
         );
-        let overflow = plugin.render_shelf(plugin.book.plan(&session).expect("计划存在"), 80);
+        let overflow =
+            plugin.render_shelf(plugin.book.plan(&session).expect("计划存在"), 80, false);
         assert_eq!(overflow.len(), PLAN_SHELF_CONTENT_LINES);
         assert_eq!(overflow[4].spans[0].text, "+4 Task");
         assert_eq!(plugin.describe_ui()[0].size.height, Some(PLAN_SHELF_HEIGHT));

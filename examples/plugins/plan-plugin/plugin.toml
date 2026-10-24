@@ -1,7 +1,7 @@
 [plugin]
 id = "plan"
 name = "Plan Plugin"
-version = "0.4.0"
+version = "0.4.1"
 api_version = "0.10.0"
 wasm = "target/wasm32-wasip2/release/plan_plugin.wasm"
 description = "为困难或大型任务提供按会话隔离、运行结束自动回收的计划准入、更新、查询与进度视图。"
