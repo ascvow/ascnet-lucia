@@ -34,6 +34,8 @@ Manifest：`examples/plugins/mcp-plugin/plugin.toml`。
 
 Skill 是 TUI 默认原生能力，不经过 Plugin Host，也不需要安装 bundle。普通运行递归扫描 `$LUCIA_HOME/skills`、项目 `skills` 和项目 `.lucia/skills` 中的 `SKILL.md`，解析 YAML frontmatter 的 `name` 与 `description` 并注入轻量索引；模型只有在任务匹配时才通过原生 `skill_read` 读取完整正文。
 
+只有 `$LUCIA_HOME/skills` 由应用创建：`lucia --init` 和普通启动都会幂等创建该目录，使首次安装后就有可直接放入 `SKILL.md` 的入口。项目级 `skills/` 与 `.lucia/skills` 属于用户工作区，存在才扫描，不会自动生成。空目录不改变模型可见行为：不产生索引提示，也不注册 `skill_read`。
+
 
 实现位于 `crates/agent-core/skill`，默认插件版与 `--no-default-features` 纯 Core 版行为一致。
 
@@ -45,7 +47,9 @@ Command 是 TUI 默认原生状态机，负责斜杠命令补全、参数校验�
 
 ## Teammate 插件
 
-Teammate 插件负责成员角色、稳定成员地址、有界邮箱、确认、dispatch 重试与消息注入规则，并通过 `teammate.mailbox@1.0.0` 向其他插件提供 owner 隔离的版本化服务。插件同时声明右侧团队摘要和全屏团队工作台，TUI 只负责通用视图渲染、焦点和导航。
+Teammate 插件负责成员角色、稳定成员地址、有界邮箱、确认、dispatch 重试与消息注入规则，并通过 `teammate.mailbox@1.0.0` 向其他插件提供 owner 隔离的版本化服务。插件声明右侧团队摘要、全屏团队工作台和成员会话的输入路由；团队摘要与工作台由 TUI 通用视图渲染，成员会话则由 TUI **原生渲染**。
+
+成员会话与主 Agent 使用同一套界面组件：面包屑、Markdown、工具卡片与展开、滚动条、输入盒与状态行都复用主界面实现，插件不再为此逐帧生成文本帧，因此长历史不会随每帧重排而变慢。按键、滚动与工具展开都在 TUI 内完成；只有用户提交时，宿主才把一条 `submit` 输入（`view_id` 为插件声明的成员会话视图）回送插件，由插件决定 steering 还是续跑，并在新句柄就绪后用同一实例 ID 重新打开视图。原生视图订阅的是插件 principal 名下的 Agent：目标不属于该插件时 Runtime 会拒绝，宿主只展示错误。成员会话暂不提供跨屏文本选择，也不套用插件工具 renderer；worker 的只读工具由内置工具组件展示。
 
 成员生命周期由插件自己收敛，不依赖模型主动清理：每轮运行结束时，状态已终态、所属 controller 运行已经结束且邮箱没有未读消息的成员会被回收，Runtime 句柄、目录项和邮箱一起释放；仍排队或运行中的成员保留，晚于 controller 结束的成员在后续运行结束时补收。终态结果移入容量 8 条的回收台账，`teammate_result` 仍可读取，`teammate_list` 同时返回 `retired_members`；`teammate_remove` 对已回收成员保持幂等。通过 `teammate.mailbox` 服务创建的成员没有 controller 运行身份，保留到调用方显式 `remove`。
 

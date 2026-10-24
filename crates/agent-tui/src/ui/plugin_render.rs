@@ -7,6 +7,7 @@ use crate::theme::{
     COLOR_ACCENT, COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SEPARATOR, COLOR_SUCCESS,
     COLOR_TEXT, COLOR_USER, COLOR_WARNING,
 };
+use crate::ui::sheet::{palette_sheet_viewport, render_palette_sheet, PaletteSheet};
 use agent_plugin_protocol::UiFrame as PluginUiFrame;
 use agent_plugin_protocol::{UiColor, UiPlacement, UiStyle};
 use ratatui::prelude::*;
@@ -173,80 +174,55 @@ fn render_plugin_view(frame: &mut Frame, view: &mut PluginViewState, area: Rect,
 
 /// 渲染浮在主界面之上的插件对话框。
 ///
-/// 对话框是唯一保留完整边框的插件容器：它悬浮在内容之上，需要一圈边界把自己和
-/// 下方内容分开；停靠视图有布局位置做区分，不需要盒子。
+/// 对话框与命令面板共用一块底板：横向铺满输入盒、只有一条上分隔线，标题画在线上。
+/// 插件声明的 `size.height` 表示可见内容行数，宽度由宿主统一取满——对话框是临时面板，
+/// 与它下方输入盒对齐才不会在屏幕中央割出一块孤立的盒子。
 fn render_plugin_dialog_view(
     frame: &mut Frame,
     view: &mut PluginViewState,
-    area: Rect,
-    focused: bool,
+    anchor: Rect,
+    content_rows: u16,
 ) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(COLOR_SEPARATOR))
-        .title(Span::styled(
-            format!(" {} ", view.declaration.title),
-            Style::new().fg(COLOR_TEXT).bold(),
-        ))
-        .padding(Padding::horizontal(1));
-    let content_area = block.inner(area);
-    view.area = content_area;
     let lines = view
         .frame
         .as_ref()
         .map(plugin_frame_lines)
         .unwrap_or_default();
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-    if focused {
-        set_plugin_cursor(frame, view.frame.as_ref(), content_area);
-    }
+    let title = view.declaration.title.clone();
+    let (height, _) = palette_sheet_viewport(frame, anchor, content_rows, false);
+    let content_area = render_palette_sheet(
+        frame,
+        anchor,
+        height,
+        PaletteSheet {
+            title: &title,
+            lines,
+            hint: None,
+            scroll: 0,
+            wrap: false,
+        },
+    );
+    view.area = content_area;
+    set_plugin_cursor(frame, view.frame.as_ref(), content_area);
 }
 
 /// 在主界面之上渲染最后一个可见对话框。
-pub(crate) fn render_plugin_dialog(frame: &mut Frame, app: &mut App, outer: Rect) {
+pub(crate) fn render_plugin_dialog(frame: &mut Frame, app: &mut App, anchor: Rect) {
     let Some(index) = app.active_dialog_index() else {
         return;
     };
-    let declaration = &app.plugin_views[index].declaration;
-    let width = declaration
-        .size
-        .width
-        .unwrap_or_else(|| default_plugin_width(UiPlacement::Dialog))
-        .min(outer.width.saturating_sub(2));
-    let height = declaration
+    let content_rows = app.plugin_views[index]
+        .declaration
         .size
         .height
-        .unwrap_or_else(|| default_plugin_height(UiPlacement::Dialog))
-        .min(outer.height.saturating_sub(2));
-    let area = Rect::new(
-        outer
-            .x
-            .saturating_add(outer.width.saturating_sub(width) / 2),
-        outer
-            .y
-            .saturating_add(outer.height.saturating_sub(height) / 2),
-        width,
-        height,
-    );
-    if area.is_empty() {
-        return;
-    }
-    frame.render_widget(Clear, area);
-    render_plugin_dialog_view(frame, &mut app.plugin_views[index], area, true);
+        .unwrap_or_else(|| default_plugin_height(UiPlacement::Dialog));
+    render_plugin_dialog_view(frame, &mut app.plugin_views[index], anchor, content_rows);
 }
 
 /// 以全屏内容替换主视图，并保留宿主统一的面包屑与返回交互。
 pub(crate) fn render_plugin_subview(frame: &mut Frame, app: &mut App, outer: Rect) {
     let breadcrumbs = app.view_stack.breadcrumbs().join(" / ");
-    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(outer);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(breadcrumbs, Style::new().fg(COLOR_TEXT).bold()),
-            Span::styled("  Esc Back", Style::new().fg(COLOR_MUTED)),
-        ])),
-        sections[0],
-    );
-
+    render_subview_header(frame, &breadcrumbs, outer);
     let Some(active) = app.view_stack.active_mut() else {
         return;
     };
@@ -255,10 +231,10 @@ pub(crate) fn render_plugin_subview(frame: &mut Frame, app: &mut App, outer: Rec
         .borders(Borders::TOP)
         .border_style(Style::new().fg(COLOR_SEPARATOR))
         .padding(Padding::horizontal(1));
+    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(outer);
     active.area = block.inner(sections[1]);
-    let lines = active
-        .frame
-        .as_ref()
+    let plugin_frame = active.frame();
+    let lines = plugin_frame
         .filter(|plugin_frame| plugin_frame.visible)
         .map(plugin_frame_lines)
         .unwrap_or_else(|| {
@@ -273,7 +249,21 @@ pub(crate) fn render_plugin_subview(frame: &mut Frame, app: &mut App, outer: Rec
             .wrap(Wrap { trim: false }),
         sections[1],
     );
-    set_plugin_cursor(frame, active.frame.as_ref(), active.area);
+    set_plugin_cursor(frame, plugin_frame, active.area);
+}
+
+/// 绘制子视图共用的一行面包屑与返回提示。
+///
+/// 插件视图与宿主原生 Agent 会话共用同一位置和样式，切换视图时顶栏不会跳动。
+pub(crate) fn render_subview_header(frame: &mut Frame, breadcrumbs: &str, outer: Rect) {
+    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(outer);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(breadcrumbs.to_string(), Style::new().fg(COLOR_TEXT).bold()),
+            Span::styled("  Esc Back", Style::new().fg(COLOR_MUTED)),
+        ])),
+        sections[0],
+    );
 }
 
 /// 将插件声明的相对坐标限制在内容区内，并恢复真实终端光标供输入法组合文本使用。
@@ -437,6 +427,40 @@ fn plugin_color(color: UiColor) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::App;
+    use agent_plugin_protocol::{UiDeclaration, UiLine, UiSize, UiSpan};
+    use ratatui::{backend::TestBackend, Terminal};
+    use tokio::sync::mpsc;
+
+    /// 构造一个只用于渲染的插件对话框视图。
+    fn dialog_view() -> PluginViewState {
+        PluginViewState {
+            declaration: UiDeclaration {
+                plugin_id: "test-plugin".into(),
+                view_id: "dialog".into(),
+                title: "插件对话框".into(),
+                placement: UiPlacement::Dialog,
+                size: UiSize {
+                    width: Some(24),
+                    height: Some(4),
+                },
+                focusable: true,
+                input_triggers: Vec::new(),
+            },
+            frame: Some(PluginUiFrame {
+                view_id: "dialog".into(),
+                visible: true,
+                lines: vec![UiLine {
+                    spans: vec![UiSpan {
+                        text: "插件内容".into(),
+                        style: UiStyle::default(),
+                    }],
+                }],
+                cursor: None,
+            }),
+            area: Rect::default(),
+        }
+    }
 
     /// 左右停靠视图应为全局底栏保留一行，使边框底部与主输入框对齐。
     #[test]
@@ -450,5 +474,59 @@ mod tests {
         let (right, right_remaining) = split_plugin_area(area, UiPlacement::Right, 30);
         assert_eq!(right, Rect::new(52, 3, 30, 23));
         assert_eq!(right_remaining, Rect::new(2, 3, 50, 24));
+    }
+
+    /// 对话框与命令面板共用底板：铺满输入盒宽度、标题画在上分隔线上、没有四周圆角框。
+    #[test]
+    fn plugin_dialog_uses_the_command_palette_chrome() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.plugin_views.push(dialog_view());
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).expect("创建测试终端");
+        // 输入盒占据最后三行，锚点取它的上沿。
+        let anchor = Rect::new(0, 13, 40, 1);
+        terminal
+            .draw(|frame| render_plugin_dialog(frame, &mut app, anchor))
+            .expect("渲染插件对话框");
+
+        let lines: Vec<String> = (0..16u16)
+            .map(|row| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .skip(usize::from(row) * 40)
+                    .take(40)
+                    .map(|cell| cell.symbol())
+                    .collect()
+            })
+            .collect();
+        let screen = lines.join("\n");
+        let compact = |text: &str| -> String {
+            text.chars()
+                .filter(|character| !character.is_whitespace())
+                .collect()
+        };
+
+        // 声明的 height 是可见内容行数；宽度由宿主取满输入盒。
+        let area = app.plugin_views[0].area;
+        assert_eq!(area.width, 40);
+        assert_eq!(area.height, 4);
+        assert_eq!(area.bottom(), anchor.y - 1, "面板应与输入盒隔一行");
+        assert!(compact(&screen).contains("插件对话框"), "{screen}");
+        assert!(compact(&screen).contains("插件内容"), "{screen}");
+
+        let title_row = lines
+            .iter()
+            .position(|line| compact(line).contains("插件对话框"))
+            .expect("标题应画在面板上");
+        assert!(
+            lines[title_row].contains('─'),
+            "标题必须画在上分隔线：{screen}"
+        );
+        // 只剩朝向正文的上分隔线：圆角与竖向边框都不应出现。
+        assert!(!screen.contains('╭'), "{screen}");
+        assert!(!screen.contains('│'), "{screen}");
     }
 }

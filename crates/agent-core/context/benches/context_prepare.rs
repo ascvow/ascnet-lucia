@@ -100,6 +100,7 @@ async fn main() -> Result<()> {
     bench_passthrough(config).await?;
     bench_incremental(config).await?;
     bench_transform(config)?;
+    bench_decompose(config)?;
 
     Ok(())
 }
@@ -111,13 +112,7 @@ async fn bench_passthrough(config: BenchmarkConfig) -> Result<()> {
         let measurement = measure_async(config, || {
             let loader = build_loader();
             let messages = history.clone();
-            async move {
-                Ok(loader
-                    .load(request(messages, 1))
-                    .await?
-                    .messages
-                    .len())
-            }
+            async move { Ok(loader.load(request(messages, 1)).await?.messages.len()) }
         })
         .await?;
         report(
@@ -215,11 +210,15 @@ impl IncrementalState {
 
     /// 追加若干消息后执行一次缓存命中的加载。
     async fn round(&mut self) -> Result<usize> {
-        self.messages
-            .extend(history(INCREMENTAL_APPEND_PER_ROUND));
+        self.messages.extend(history(INCREMENTAL_APPEND_PER_ROUND));
         self.step += 1;
         let messages = self.messages.clone();
-        Ok(self.loader.load(request(messages, self.step)).await?.messages.len())
+        Ok(self
+            .loader
+            .load(request(messages, self.step))
+            .await?
+            .messages
+            .len())
     }
 
     /// 当前原始历史的消息数，用于归一化输出。
@@ -275,6 +274,109 @@ fn history(message_count: usize) -> Vec<ModelMessage> {
             ModelMessage::text(role, body.as_str())
         })
         .collect()
+}
+
+/// 临时：分解透传加载各阶段的成本。
+fn bench_decompose(config: BenchmarkConfig) -> Result<()> {
+    for message_count in MESSAGE_COUNTS {
+        let history = history(message_count);
+
+        let measurement = measure_sync(config, || {
+            let loader = build_loader();
+            let messages = history.clone();
+            std::hint::black_box(&loader);
+            Ok(messages.len())
+        })?;
+        report(
+            config,
+            "stage_setup",
+            "decompose",
+            message_count,
+            measurement,
+        );
+
+        let measurement = measure_sync(config, || {
+            let values: Vec<serde_json::Value> = history
+                .iter()
+                .map(|m| serde_json::to_value(m).expect("encode"))
+                .collect();
+            Ok(values.len())
+        })?;
+        report(
+            config,
+            "stage_encode",
+            "decompose",
+            message_count,
+            measurement,
+        );
+
+        let values: Vec<serde_json::Value> = history
+            .iter()
+            .map(|m| serde_json::to_value(m).expect("encode"))
+            .collect();
+
+        let measurement = measure_sync(config, || {
+            let mut total = 0usize;
+            for value in &values {
+                let mut writer = agent_context_bench_counter::Counter::default();
+                serde_json::to_writer(&mut writer, value).expect("serialize");
+                total += writer.tokens();
+            }
+            Ok(total)
+        })?;
+        report(
+            config,
+            "stage_estimate",
+            "decompose",
+            message_count,
+            measurement,
+        );
+
+        let measurement = measure_sync(config, || {
+            let decoded: Vec<agent_core::ModelMessage> = values
+                .iter()
+                .map(|v| serde_json::from_value(v.clone()).expect("decode"))
+                .collect();
+            Ok(decoded.len())
+        })?;
+        report(
+            config,
+            "stage_decode",
+            "decompose",
+            message_count,
+            measurement,
+        );
+    }
+    Ok(())
+}
+
+/// 与原生加载器相同的字节折算写入器，仅用于分解成本。
+mod agent_context_bench_counter {
+    use std::io::{self, Write};
+
+    #[derive(Default)]
+    pub struct Counter {
+        ascii: usize,
+        non_ascii: usize,
+    }
+
+    impl Counter {
+        pub fn tokens(&self) -> usize {
+            self.ascii.div_ceil(4) + self.non_ascii.div_ceil(3)
+        }
+    }
+
+    impl Write for Counter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let non_ascii = buffer.iter().filter(|b| !b.is_ascii()).count();
+            self.non_ascii += non_ascii;
+            self.ascii += buffer.len() - non_ascii;
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 }
 
 /// 执行预热和正式异步迭代；闭包每次返回一个待执行的 future。

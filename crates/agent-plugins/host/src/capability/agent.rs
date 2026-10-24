@@ -111,6 +111,13 @@ impl AgentRuntimeBinding {
         Ok(visible)
     }
 
+    /// 返回与当前插件 principal 绑定的 Runtime API。
+    ///
+    /// 调用方只能凭该 API 访问本插件名下的 Agent；目标属于其他 owner 时 Runtime 会拒绝。
+    pub(crate) fn api(&self) -> Arc<dyn AgentRuntimeApi> {
+        Arc::clone(&self.api)
+    }
+
     /// 撤销当前插件激活 principal，并取消、清理其 controller 与全部后代。
     pub(crate) async fn revoke(&self) -> usize {
         self.host_services.provisioner.revoke(&self.principal).await

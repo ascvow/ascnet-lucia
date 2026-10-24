@@ -224,6 +224,11 @@ pub(super) fn endpoint_url(base_url: &str, path: &str) -> String {
 }
 
 /// 对 URL path 组件做百分号编码；未保留字符保持原样。
+///
+/// 只有 Bedrock 的推理模型 ID 路径需要这个编码，因此与 `bedrock` feature 同生同灭：
+/// `lucia` 以 `default-features = false` 依赖 core 时不带 Bedrock，函数若仍然存在，
+/// 打包构建里会一直报一条 unused 告警。
+#[cfg(feature = "bedrock")]
 pub(super) fn url_encode_component(component: &str) -> String {
     let mut encoded = String::with_capacity(component.len());
     for byte in component.as_bytes() {

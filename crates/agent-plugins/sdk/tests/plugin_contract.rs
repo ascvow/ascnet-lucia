@@ -93,6 +93,8 @@ fn guest_ui_types_match_contract_fixture() {
     assert_round_trip::<UiInput>(&fixture["input"]);
     assert_round_trip::<UiInput>(&fixture["main_input"]);
     assert_round_trip::<UiNavigationRequest>(&fixture["navigation"]);
+    assert_round_trip::<UiNavigationRequest>(&fixture["navigation_agent_session"]);
+    assert_round_trip::<UiInput>(&fixture["input_submit"]);
     assert_round_trip::<UiHostActionRequest>(&fixture["host_action_set_input"]);
     assert_round_trip::<UiHostActionRequest>(&fixture["host_action_reload_context"]);
     assert_round_trip::<UiHostActionRequest>(&fixture["host_action_resume_session"]);

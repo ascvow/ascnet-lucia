@@ -40,14 +40,6 @@ pub(crate) const COLOR_DANGER: Color = Color::Rgb(205, 101, 101);
 /// 只用于错误标记与错误摘要这类"读漏就要付出代价"的信息；正文里的普通失败描述仍用
 /// [`COLOR_DANGER`]，否则整屏都是警报色，警报本身也就不再是警报。
 pub(crate) const COLOR_DANGER_BRIGHT: Color = Color::Rgb(255, 110, 110);
-/// 用户消息块背景色：与绯红强调同系的暗红灰，用于与助手正文区分。
-pub(crate) const COLOR_USER_BG: Color = Color::Rgb(58, 38, 43);
-/// 助手回答卡片的背景色：只比终端底色亮一点点。
-///
-/// 回答需要成为一块"卡片"而不是飘在背景上的字，但底色一旦明显，正文的可读性就会被
-/// 色块压过去；因此取一档极轻微的抬升，远看是一条连续的浅色块，近看与默认底色几乎
-/// 没有差别。代码块与引用块自带更暗的底色，仍然压在这层之上。
-pub(crate) const COLOR_ASSISTANT_BG: Color = Color::Rgb(28, 30, 34);
 
 /// 面板之间分隔线的颜色。
 ///
@@ -81,22 +73,22 @@ pub(crate) const COLOR_PALETTE_COMMAND: Color = Color::Rgb(126, 200, 216);
 pub(crate) const COLOR_LINE_NUMBER: Color = Color::Rgb(92, 90, 86);
 /// 行内代码与围栏代码块的文字颜色：暖色，与正文的中性灰区分开。
 pub(crate) const COLOR_CODE: Color = Color::Rgb(206, 184, 146);
-/// 围栏代码块的整块底色：比消息区略亮的深灰，把代码从正文里垫出来。
-pub(crate) const COLOR_CODE_BG: Color = Color::Rgb(34, 33, 38);
-/// 行内代码的底色：与围栏代码块同族、略亮一档。
+/// 围栏代码块的整块底色：比正文背景略亮的暖灰，把代码从正文里垫出来。
 ///
-/// 行内代码只有几个字符宽，用代码块的底色会显得脏；提高一点亮度后它更像一枚
-/// "标签"，在段落里能被一眼扫到。
-pub(crate) const COLOR_INLINE_CODE_BG: Color = Color::Rgb(45, 44, 50);
+/// 必须**亮于**终端背景，否则代码块看起来像在页面上挖了个洞——终端默认底色普遍是
+/// `#000` 到 `#25262b` 这个区间，取偏暖的炭灰能在两种背景下都读作"抬起的卡片"，
+/// 同时避开冷蓝调与暖色代码文字（[`COLOR_CODE`]）撞色。
+pub(crate) const COLOR_CODE_BG: Color = Color::Rgb(46, 44, 40);
 /// 引用块的整块底色：比代码块更暗，靠色差而非竖线区分两种卡片。
-pub(crate) const COLOR_QUOTE_BG: Color = Color::Rgb(28, 28, 32);
+pub(crate) const COLOR_QUOTE_BG: Color = Color::Rgb(39, 38, 35);
 /// diff 新增行的整行背景色。
 ///
 /// 底色必须远暗于文字：整行色块的作用是"扫一眼看出这里多了一块"，一旦底色接近文字
-/// 亮度，色块就会盖过代码本身的可读性。
-pub(crate) const COLOR_DIFF_ADD_BG: Color = Color::Rgb(30, 50, 30);
+/// 亮度，色块就会盖过代码本身的可读性。它同时要比 [`COLOR_CODE_BG`] 亮，否则在代码
+/// 卡片里会变成一块凹下去的补丁。
+pub(crate) const COLOR_DIFF_ADD_BG: Color = Color::Rgb(42, 58, 40);
 /// diff 删除行的整行背景色。
-pub(crate) const COLOR_DIFF_DEL_BG: Color = Color::Rgb(60, 30, 30);
+pub(crate) const COLOR_DIFF_DEL_BG: Color = Color::Rgb(66, 42, 40);
 /// diff 新增行的文字与标记色。
 pub(crate) const COLOR_DIFF_ADD_FG: Color = Color::Rgb(100, 200, 100);
 /// diff 删除行的文字与标记色。

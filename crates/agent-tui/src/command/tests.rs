@@ -4,8 +4,14 @@ use super::*;
 use crate::demo::build_demo_gateway;
 #[cfg(feature = "plugins")]
 use crate::plugin::management::PluginManagementOutcome;
-use ratatui::{backend::TestBackend, style::Color, Terminal};
+use ratatui::{backend::TestBackend, layout::Rect, style::Color, Frame, Terminal};
 use tokio::sync::mpsc;
+
+/// 构造贴住画布底边的输入盒锚点；浮层管理页以它为底边向上生长。
+#[cfg(feature = "plugins")]
+fn composer_anchor(frame: &Frame) -> Rect {
+    Rect::new(0, frame.area().height, frame.area().width, 1)
+}
 
 /// 为插件页测试补充 Host 当前 ABI 固有授权，避免测试复制另一份权限基线。
 #[cfg(feature = "plugins")]
@@ -102,9 +108,9 @@ fn palette_column(row: &str, needle: char) -> usize {
         .unwrap_or_else(|| panic!("行内应出现 {needle:?}：{row:?}"))
 }
 
-/// 命令补全菜单按两列对齐，条目之间留空行，左侧留出两列空白。
+/// 命令补全菜单按两列对齐，条目逐行紧邻排布，横向铺满整个终端宽度。
 #[test]
-fn slash_panel_aligns_columns_and_spaces_rows() {
+fn slash_panel_aligns_columns_and_stacks_rows() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.input = "/".into();
@@ -115,20 +121,19 @@ fn slash_panel_aligns_columns_and_spaces_rows() {
         .expect("应渲染命令面板");
     let rows = palette_rows(&terminal, 80);
 
-    // 首行是顶部分隔边框，随后每条命令占一行、隔一行空行。
+    // 首行是顶部分隔边框，随后每条命令各占一行，中间不再插空行。
     assert!(rows[0].starts_with('─'), "{:?}", rows[0]);
     assert!(rows[1].contains("/context"), "{:?}", rows[1]);
-    assert!(rows[2].trim().is_empty(), "条目之间应留空行：{:?}", rows[2]);
-    assert!(rows[3].contains("/new"), "{:?}", rows[3]);
+    assert!(rows[2].contains("/new"), "{:?}", rows[2]);
 
-    // 左侧留白两列后接选中指示条，命令名不贴终端边缘。
-    assert!(rows[1].starts_with("  ▌ /context"), "{:?}", rows[1]);
-    assert!(rows[3].starts_with("    /new"), "{:?}", rows[3]);
+    // 指示条直接落在第 1 列，命令名与面板左边界之间只隔一层行内边距。
+    assert!(rows[1].starts_with("▌ /context"), "{:?}", rows[1]);
+    assert!(rows[2].starts_with("  /new"), "{:?}", rows[2]);
 
     // 描述列起点在所有条目上一致，形成表格式对齐。
     // TestBackend 会把全角字符的占位列重置为空格，因此用首个说明字符定位列号。
-    let new_column = palette_column(&rows[3], '新');
-    let resume_column = palette_column(&rows[5], '恢');
+    let new_column = palette_column(&rows[2], '新');
+    let resume_column = palette_column(&rows[3], '恢');
     assert_eq!(new_column, resume_column, "{rows:?}");
 }
 
@@ -165,7 +170,7 @@ fn slash_panel_keeps_column_width_under_filtering() {
     let command_rows = filtered_rows.iter().filter(|row| row.contains('/')).count();
     assert_eq!(command_rows, 1, "{filtered_rows:?}");
     // 列宽取自全部原生命令，因此说明文字仍落在完整列表的同一列。
-    let full_column = palette_column(&full_rows[3], '新');
+    let full_column = palette_column(&full_rows[2], '新');
     let filtered_column = palette_column(&filtered_rows[1], '新');
     assert_eq!(full_column, filtered_column, "过滤不应改变命令列宽");
 }
@@ -183,21 +188,19 @@ fn slash_panel_styles_selection_and_command_names() {
         .expect("应渲染命令面板");
 
     let buffer = terminal.backend().buffer();
-    // 第 1 行是选中项：底色从指示条铺到行尾，命令名保持青蓝。
+    // 第 1 行是选中项：底色从中第 1 列一路铺到行尾，命令名保持青蓝。
     assert_eq!(
-        buffer[(2, 1)].bg,
+        buffer[(0, 1)].bg,
         crate::theme::COLOR_PALETTE_SELECTION_BG,
-        "选中底色应覆盖指示条"
+        "选中底色应从中第 1 列铺起"
     );
-    assert_eq!(buffer[(4, 1)].fg, crate::theme::COLOR_PALETTE_COMMAND);
-    assert_eq!(buffer[(77, 1)].bg, crate::theme::COLOR_PALETTE_SELECTION_BG);
-    // 左侧两列留白属于边框外区域，不应带底色。
-    assert_eq!(buffer[(1, 1)].bg, Color::Reset);
-    // 未选中行不铺底色，但命令名同样可辨识。
-    assert_eq!(buffer[(4, 3)].bg, Color::Reset);
-    assert_eq!(buffer[(4, 3)].fg, crate::theme::COLOR_PALETTE_COMMAND);
-    // 间隔空行完全是空白，不留残余底色。
-    assert_eq!(buffer[(3, 2)].bg, Color::Reset);
+    assert_eq!(buffer[(2, 1)].fg, crate::theme::COLOR_PALETTE_COMMAND);
+    assert_eq!(buffer[(79, 1)].bg, crate::theme::COLOR_PALETTE_SELECTION_BG);
+    // 未选中行不铺底色，但命令名同样可辨识；紧邻选中行，中间没有空行。
+    assert_eq!(buffer[(2, 2)].bg, Color::Reset);
+    assert_eq!(buffer[(2, 2)].fg, crate::theme::COLOR_PALETTE_COMMAND);
+    // 末行空行是列表与输入框之间的唯一留白，不留残余底色。
+    assert_eq!(buffer[(3, 13)].bg, Color::Reset);
 }
 
 /// 面板高度不足时（终端过矮）列表跟随选中项滚动，高亮不会滚出可视区。
@@ -207,7 +210,7 @@ fn slash_panel_scrolls_to_keep_selection_visible() {
     let mut app = App::new(tx, "测试模型".into());
     app.input = "/".into();
     app.native_command.selected = 5;
-    let mut terminal = Terminal::new(TestBackend::new(80, 9)).expect("应创建矮面板终端");
+    let mut terminal = Terminal::new(TestBackend::new(80, 6)).expect("应创建矮面板终端");
 
     terminal
         .draw(|frame| render_native_command_panel(frame, &app, frame.area()))
@@ -226,7 +229,7 @@ fn slash_panel_scrolls_to_keep_selection_visible() {
 
 /// 面板高度必须与行距一致，否则列表底部会被裁掉。
 #[test]
-fn slash_panel_height_matches_spaced_rows() {
+fn slash_panel_height_matches_stacked_rows() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.input = "/".into();
@@ -234,8 +237,8 @@ fn slash_panel_height_matches_spaced_rows() {
     let count = app.slash_command_matches().len();
     assert_eq!(
         app.native_command_panel_height(),
-        u16::try_from(count).unwrap() * 2 + 1,
-        "每条命令占两行，加顶部分隔边框"
+        u16::try_from(count).unwrap() + 2,
+        "每条命令占一行，加顶部分隔边框与底部空行"
     );
 }
 
@@ -322,7 +325,7 @@ fn plugin_page_shows_installed_plugins_and_manual_actions() {
     let mut terminal = Terminal::new(TestBackend::new(112, 32)).expect("应创建测试终端");
 
     terminal
-        .draw(|frame| render_native_plugin_dialog(frame, &mut app, frame.area()))
+        .draw(|frame| render_native_plugin_dialog(frame, &mut app, composer_anchor(frame)))
         .expect("应渲染插件管理页");
     let text = terminal
         .backend()
@@ -371,7 +374,7 @@ fn plugin_page_shows_installed_plugins_and_manual_actions() {
 
     let mut review_terminal = Terminal::new(TestBackend::new(112, 32)).expect("应创建启用审查终端");
     review_terminal
-        .draw(|frame| render_native_plugin_dialog(frame, &mut app, frame.area()))
+        .draw(|frame| render_native_plugin_dialog(frame, &mut app, composer_anchor(frame)))
         .expect("应渲染完整启用审查页");
     let review_text = review_terminal
         .backend()
@@ -405,7 +408,7 @@ fn plugin_page_shows_installed_plugins_and_manual_actions() {
     let mut narrow_terminal =
         Terminal::new(TestBackend::new(36, 10)).expect("应创建窄终端审查视口");
     narrow_terminal
-        .draw(|frame| render_native_plugin_dialog(frame, &mut app, frame.area()))
+        .draw(|frame| render_native_plugin_dialog(frame, &mut app, composer_anchor(frame)))
         .expect("窄终端仍应安全渲染完整审查页");
     let clamped_scroll = app
         .native_command
@@ -586,7 +589,7 @@ fn disabled_capability_owner_requires_two_enable_confirmations() {
 
     let mut terminal = Terminal::new(TestBackend::new(140, 32)).expect("应创建测试终端");
     terminal
-        .draw(|frame| render_native_plugin_dialog(frame, &mut app, frame.area()))
+        .draw(|frame| render_native_plugin_dialog(frame, &mut app, composer_anchor(frame)))
         .expect("应渲染 Owner 启用确认");
     let text = terminal
         .backend()
@@ -689,7 +692,7 @@ fn native_completion_replaces_input_without_plugin_host() {
     assert!(app.handle_native_command_key(KeyCode::Tab, KeyModifiers::NONE, None));
     assert_eq!(app.input, "/resume ");
     assert_eq!(app.cursor, app.input.len());
-    assert!(app.native_command.dialog.is_none());
+    assert!(app.native_command.session_palette.is_none());
 }
 
 /// Enter 必须立即执行当前高亮候选，而不是把命令缩写当作未知命令。
@@ -712,21 +715,21 @@ fn native_sessions_browse_switches_selected_session_on_enter() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let session_id = SessionId::new("selected-session").expect("创建测试会话标识");
-    app.native_command.dialog = Some(NativeSessionDialog {
-        mode: NativeSessionDialogMode::Browse,
+    app.native_command.session_palette = Some(NativeSessionPalette {
+        mode: NativeSessionPaletteMode::Browse,
         selected: 0,
-        status: NativeSessionDialogStatus::Ready(vec![SessionSummary {
+        status: NativeSessionPaletteStatus::Ready(vec![NativeSessionEntry::new(SessionSummary {
             id: session_id.clone(),
             revision: 7,
             created_at_ms: 1,
             updated_at_ms: 2,
             title: Some("待切换会话".into()),
             message_count: 3,
-        }]),
+        })]),
     });
 
     assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
-    assert!(app.native_command.dialog.is_none());
+    assert!(app.native_command.session_palette.is_none());
     assert!(matches!(
         rx.try_recv().expect("应发送原生会话切换请求"),
         UiEvent::NativeResumeRequested {
@@ -734,6 +737,131 @@ fn native_sessions_browse_switches_selected_session_on_enter() {
             revision: 7,
         } if requested_id == session_id
     ));
+}
+
+/// 会话面板的输入框就是搜索框：按词过滤后回车恢复的是命中项，而不是列表首项。
+#[test]
+fn native_session_palette_filters_by_input_words() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut entries = Vec::new();
+    for (id, title, revision) in [
+        ("design-review", "设计评审", 3),
+        ("design-draft", "设计草稿", 4),
+        ("budget-plan", "预算规划", 5),
+    ] {
+        entries.push(NativeSessionEntry::new(SessionSummary {
+            id: SessionId::new(id).expect("创建测试会话标识"),
+            revision,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            title: Some(title.into()),
+            message_count: 1,
+        }));
+    }
+    app.native_command.session_palette = Some(NativeSessionPalette {
+        mode: NativeSessionPaletteMode::Resume,
+        selected: 0,
+        status: NativeSessionPaletteStatus::Ready(entries),
+    });
+
+    // 搜索词直接写进主输入；多个词必须同时命中。
+    app.input = "设计 评审".into();
+    assert_eq!(app.session_palette_rows(), 1);
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    assert!(matches!(
+        rx.try_recv().expect("应发送恢复请求"),
+        UiEvent::NativeResumeRequested { revision: 3, .. }
+    ));
+}
+
+/// 没有命中时回车必须被吞掉：否则搜索词会作为一条普通消息发给模型。
+#[test]
+fn native_session_palette_swallows_enter_without_match() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.native_command.session_palette = Some(NativeSessionPalette {
+        mode: NativeSessionPaletteMode::Resume,
+        selected: 0,
+        status: NativeSessionPaletteStatus::Ready(vec![NativeSessionEntry::new(SessionSummary {
+            id: SessionId::new("only-session").expect("创建测试会话标识"),
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            title: Some("唯一会话".into()),
+            message_count: 2,
+        })]),
+    });
+    app.input = "没有这个会话".into();
+
+    assert_eq!(app.session_palette_rows(), 0);
+    // 回车被面板消费，但因为没有命中，不会发出恢复请求。
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    assert!(rx.try_recv().is_err());
+    assert!(app.native_command.session_palette.is_some());
+}
+
+/// Esc 关闭面板时必须丢弃搜索词，避免残留文本在下一次回车时被发给模型。
+#[test]
+fn native_session_palette_escape_clears_search_input() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.native_command.session_palette = Some(NativeSessionPalette {
+        mode: NativeSessionPaletteMode::Browse,
+        selected: 0,
+        status: NativeSessionPaletteStatus::Loading,
+    });
+    app.input = "设计".into();
+    app.cursor = app.input.len();
+
+    assert!(app.handle_native_command_key(KeyCode::Esc, KeyModifiers::NONE, None));
+    assert!(app.native_command.session_palette.is_none());
+    assert!(app.input.is_empty());
+    assert_eq!(app.cursor, 0);
+}
+
+/// `/resume` 必须打开会话搜索面板，并把输入框交还给搜索框。
+#[tokio::test]
+async fn resume_command_opens_session_palette_with_empty_query() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "/resume".into();
+    app.cursor = app.input.len();
+
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    let palette = app
+        .native_command
+        .session_palette
+        .as_ref()
+        .expect("应打开会话面板");
+    assert!(matches!(palette.mode, NativeSessionPaletteMode::Resume));
+    assert!(matches!(
+        palette.status,
+        NativeSessionPaletteStatus::Loading
+    ));
+    // 命令文本必须清空：残留的 `/resume` 会变成面板的搜索词。
+    assert!(app.input.is_empty());
+    // 行几何固定：顶部分隔边框 + 一行状态文本 + 一行按键提示。
+    assert_eq!(app.native_command_panel_height(), 3);
+    // 内联面板不占用全屏 Dialog 焦点，主编辑器仍接收搜索词。
+    assert!(!app.native_dialog_active());
+}
+
+/// `/sessions` 与 `/resume` 共用面板，只是标题与确认文案不同。
+#[tokio::test]
+async fn sessions_command_opens_palette_in_browse_mode() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "/sessions".into();
+    app.cursor = app.input.len();
+
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    let palette = app
+        .native_command
+        .session_palette
+        .as_ref()
+        .expect("应打开会话面板");
+    assert!(matches!(palette.mode, NativeSessionPaletteMode::Browse));
 }
 
 /// `/context` 在本地打开且可关闭，不向 Agent 发送消息。
@@ -879,9 +1007,31 @@ fn native_reasoning_command_opens_inline_panel() {
         .as_ref()
         .expect("应打开思考等级二级界面");
     assert_eq!(panel.selected, 1);
-    assert_eq!(app.native_command_panel_height(), 3);
+    assert_eq!(app.native_command_panel_height(), 4);
     assert!(!app.native_dialog_active());
     assert!(app.messages.is_empty());
+}
+
+/// 只有一档时滑块没有任何可选位置，`/reasoning` 必须说明原因而不是画出残桩。
+#[test]
+fn native_reasoning_command_reports_missing_levels() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into())
+        .with_reasoning_levels(vec![ReasoningLevel::Off], ReasoningLevel::Off);
+    app.input = "/reasoning".into();
+    app.cursor = app.input.len();
+
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+
+    assert!(app.native_command.reasoning_panel.is_none());
+    assert_eq!(app.native_command_panel_height(), 0);
+    assert!(
+        app.messages
+            .last()
+            .is_some_and(|message| message.text.contains("没有可切换的思考等级")),
+        "应说明等级缺失而不是静默无反应：{:?}",
+        app.messages.last().map(|message| &message.text)
+    );
 }
 
 /// 思考等级二级界面必须支持方向键选择，并在 Enter 后同步共享 Agent。
@@ -898,12 +1048,103 @@ fn native_reasoning_panel_applies_selected_level() {
     app.cursor = app.input.len();
 
     assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
-    assert!(app.handle_native_command_key(KeyCode::Down, KeyModifiers::NONE, Some(&agent)));
+    assert!(app.handle_native_command_key(KeyCode::Right, KeyModifiers::NONE, Some(&agent)));
     assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
 
     assert!(app.native_command.reasoning_panel.is_none());
     assert_eq!(app.reasoning_level, ReasoningLevel::Medium);
     assert_eq!(agent.reasoning_level(), ReasoningLevel::Medium);
+}
+
+/// 滑块两端夹住不回绕：走到头继续按方向键不会跳回另一端。
+#[test]
+fn reasoning_slider_clamps_at_both_ends() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into()).with_reasoning_levels(
+        vec![
+            ReasoningLevel::Off,
+            ReasoningLevel::Low,
+            ReasoningLevel::High,
+        ],
+        ReasoningLevel::Off,
+    );
+    app.input = "/reasoning".into();
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+
+    let selected = |app: &App| {
+        app.native_command
+            .reasoning_panel
+            .as_ref()
+            .expect("滑块应保持打开")
+            .selected
+    };
+    assert_eq!(selected(&app), 0);
+    assert!(app.handle_native_command_key(KeyCode::Left, KeyModifiers::NONE, None));
+    assert_eq!(selected(&app), 0, "已在最左端，不应回绕到最右");
+    for _ in 0..5 {
+        app.handle_native_command_key(KeyCode::Right, KeyModifiers::NONE, None);
+    }
+    assert_eq!(selected(&app), 2, "走到最右端后应停住");
+}
+
+/// 思考强度面板画成横向滑块：旋钮落在当前等级，刻度与标签逐列对齐。
+#[test]
+fn reasoning_panel_renders_horizontal_slider() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into()).with_reasoning_levels(
+        vec![
+            ReasoningLevel::Off,
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+        ],
+        ReasoningLevel::Medium,
+    );
+    app.input = "/reasoning".into();
+    app.cursor = app.input.len();
+    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+
+    let width = 60;
+    let mut terminal = Terminal::new(TestBackend::new(width, 6)).expect("应创建滑块终端");
+    terminal
+        .draw(|frame| render_native_command_panel(frame, &app, frame.area()))
+        .expect("应渲染思考强度滑块");
+    let rows = palette_rows(&terminal, width);
+
+    // 首行是顶部分隔边框，随后是轨道行与刻度标签行。
+    // TestBackend 会把全角字符的占位列重置为空格，因此逐字判断而不是匹配整个词。
+    assert!(rows[0].starts_with('─'), "{rows:?}");
+    assert!(
+        rows[1].contains('思') && rows[1].contains('强'),
+        "轨道行应带标题：{rows:?}"
+    );
+    assert!(rows[1].contains('●'), "轨道上应有旋钮：{rows:?}");
+    assert_eq!(
+        rows[1].matches('○').count(),
+        3,
+        "未选中的三个等级各留一个刻度：{rows:?}"
+    );
+    for label in ['关', '低', '中', '高'] {
+        assert!(rows[2].contains(label), "标签行缺少 {label}：{rows:?}");
+    }
+
+    // 旋钮必须正对「中」的标签中心，否则滑块与刻度会看起来错位。
+    let knob = palette_column(&rows[1], '●');
+    let label_start = palette_column(&rows[2], '中');
+    assert_eq!(knob, label_start + 1, "旋钮应对准标签中心：{rows:?}");
+    // 面板高度与布局算出的一致，底部留一行空行。
+    assert_eq!(app.native_command_panel_height(), 4);
+    assert!(rows[3].trim().is_empty(), "{rows:?}");
+
+    // 窄终端放不下完整轨道时退回单行形式，但行数不变、当前等级仍然可读。
+    let mut narrow = Terminal::new(TestBackend::new(20, 6)).expect("应创建窄滑块终端");
+    narrow
+        .draw(|frame| render_native_command_panel(frame, &app, frame.area()))
+        .expect("窄终端也应渲染滑块");
+    let narrow_rows = palette_rows(&narrow, 20);
+    assert!(narrow_rows[1].contains('中'), "{narrow_rows:?}");
+    assert!(!narrow_rows[1].contains('○'), "{narrow_rows:?}");
 }
 
 /// `/attach` 必须把可读取的本地文件加入附件，一行可添加多个路径。
@@ -999,9 +1240,9 @@ fn native_non_attach_command_rejects_pending_attachment() {
         .is_some_and(|message| message.text.contains("斜杠命令不能携带附件")));
 }
 
-/// 直接输入以 `/` 开头的绝对路径时，不能被当成斜杠命令：存在的文件转为附件。
+/// 直接输入以 `/` 开头的绝对路径时，不能被当成斜杠命令：整条输入原样留给主输入区按文本发送。
 #[test]
-fn native_command_route_treats_absolute_path_as_attachment() {
+fn native_command_route_lets_absolute_path_through_as_text() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let path = std::env::temp_dir().join(format!(
@@ -1013,19 +1254,20 @@ fn native_command_route_treats_absolute_path_as_attachment() {
 
     app.input = path.display().to_string();
     app.cursor = app.input.len();
-    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    let consumed = app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None);
     std::fs::remove_file(&path).ok();
 
-    assert_eq!(app.attachments.len(), 1);
-    assert_eq!(app.attachments[0].media_type, "image/png");
-    assert_eq!(app.input, "[IMAGE#1] ");
+    assert!(!consumed, "绝对路径不能被命令路由消费");
+    assert!(app.attachments.is_empty(), "路径文本不得被转成附件");
+    assert_eq!(app.input, path.display().to_string(), "输入必须原样保留");
     assert!(app.messages.is_empty(), "不得报未知命令");
 }
 
-/// 已有待发送附件时再直接输入路径应追加第二个附件，而不是被
-/// "斜杠命令不能携带附件"误拒——路径输入不是斜杠命令。
+/// 已有待发送附件时再输入路径，路径按正文保留而不是追加第二个附件。
+///
+/// `/attach` 仍是显式附件入口；直接敲入或粘贴路径不再隐式生成附件。
 #[test]
-fn native_command_route_appends_path_input_with_pending_attachment() {
+fn native_command_route_keeps_path_input_after_pending_attachment_as_text() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let first = std::env::temp_dir().join(format!(
@@ -1046,29 +1288,26 @@ fn native_command_route_appends_path_input_with_pending_attachment() {
     assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
     assert_eq!(app.attachments.len(), 1);
 
-    // 真实场景：引用标签还留在输入框里，用户在后面继续输入路径。
+    // 真实场景：引用标签还留在输入框里，用户在后面继续敲入一个路径。
     app.input.push_str(&second.display().to_string());
     app.cursor = app.input.len();
-    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    assert!(
+        !app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None),
+        "路径输入不能被命令路由消费"
+    );
     std::fs::remove_file(&first).ok();
     std::fs::remove_file(&second).ok();
 
-    assert_eq!(app.attachments.len(), 2);
-    assert_eq!(app.attachments[0].media_type, "image/png");
-    assert_eq!(app.attachments[1].media_type, "application/pdf");
-    assert_eq!(
-        app.input, "[IMAGE#1] [PDF#1] ",
-        "追加的标签排在已有标签之后"
+    assert_eq!(app.attachments.len(), 1, "路径文本不得追加成第二个附件");
+    assert!(
+        app.input.ends_with(&second.display().to_string()),
+        "路径应原样留在输入框"
     );
-    assert!(!app
-        .messages
-        .iter()
-        .any(|message| message.text.contains("斜杠命令不能携带附件")));
 }
 
-/// "/路径 + 提问"写法：首段是真实文件时转为附件，余下正文留在输入框继续编辑。
+/// "/路径 + 提问"写法：命令路由必须放行，整句作为普通消息文本提交。
 #[test]
-fn native_command_route_attaches_leading_path_and_keeps_text() {
+fn native_command_route_lets_leading_path_through_as_text() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let path = std::env::temp_dir().join(format!(
@@ -1080,13 +1319,15 @@ fn native_command_route_attaches_leading_path_and_keeps_text() {
 
     app.input = format!("{} 这张图有什么问题", path.display());
     app.cursor = app.input.len();
-    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    let consumed = app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None);
     std::fs::remove_file(&path).ok();
 
-    assert_eq!(app.attachments.len(), 1);
+    assert!(!consumed, "带路径的句子不能被命令路由消费");
+    assert!(app.attachments.is_empty(), "路径文本不得被转成附件");
     assert_eq!(
-        app.input, "[IMAGE#1] 这张图有什么问题",
-        "引用标签插在路径原位置，余下正文必须保留"
+        app.input,
+        format!("{} 这张图有什么问题", path.display()),
+        "输入必须原样留给主输入区"
     );
     assert!(app.messages.is_empty(), "不得报未知命令或文件错误");
 }
@@ -1110,12 +1351,9 @@ fn native_command_route_lets_path_like_sentence_through() {
     assert!(!app.input.is_empty());
 }
 
-/// "`./` 相对路径 + 提问"与绝对路径行为一致：首段转附件、正文留在输入框。
-///
-/// 绝对路径走命令路由，`./` 与 `~/` 走主输入区；两者必须共用同一判据，
-/// 否则同样的"路径 + 提问"写法只在绝对路径下生效。
+/// 相对路径 + 正文与绝对路径走同一判据：都作为普通消息文本提交，不再转附件。
 #[test]
-fn path_input_supports_relative_path_with_trailing_text() {
+fn relative_path_with_trailing_text_is_sent_as_text() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let dir = std::env::temp_dir().join(format!(
@@ -1132,42 +1370,37 @@ fn path_input_supports_relative_path_with_trailing_text() {
     app.cursor = app.input.len();
     app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
 
-    assert_eq!(app.attachments.len(), 1);
-    assert_eq!(app.attachments[0].media_type, "image/png");
-    assert_eq!(app.input, "[IMAGE#1] 这张图有什么问题");
-    assert!(app.messages.is_empty());
+    assert!(app.attachments.is_empty(), "路径文本不得被转成附件");
+    assert!(app.input.is_empty(), "应作为消息提交并清空输入");
+    assert!(!app.running, "无 Agent 时进入排队而不是直接运行");
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// 普通单词与自然语言不能被路径判定劫持成"找不到文件"。
+/// 普通单词与自然语言不能被路径判定劫持成附件或"找不到文件"。
 #[test]
-fn path_input_ignores_plain_words() {
+fn input_path_judgement_ignores_plain_words() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
 
     for text in ["hello", "看看这个", "notes.md 怎么说"] {
         app.input = text.into();
         app.cursor = app.input.len();
-        assert_eq!(
-            app.handle_path_input(),
-            PathInput::NotPath,
-            "`{text}` 不是文件路径"
-        );
+        assert!(!app.input_looks_like_path(), "`{text}` 不是文件路径");
         assert!(app.messages.is_empty(), "`{text}` 不得产生文件错误");
-        assert_eq!(app.input, text, "交回前不得改动输入");
+        assert_eq!(app.input, text, "判定不得改动输入");
     }
 }
 
 /// 单段绝对路径与命令名无法区分，按命令处理，不能被当成路径吞掉。
 #[test]
-fn path_input_lets_single_segment_absolute_path_reach_command_route() {
+fn input_path_judgement_lets_single_segment_absolute_path_reach_command_route() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
 
     app.input = "/tmp".into();
     app.cursor = app.input.len();
-    assert_eq!(app.handle_path_input(), PathInput::NotPath);
+    assert!(!app.input_looks_like_path());
     assert!(app.messages.is_empty());
 }
 
@@ -1189,22 +1422,20 @@ fn native_command_panel_hidden_for_path_input() {
     assert!(app.input.trim_end().contains('/'));
 }
 
-/// 形如路径但文件不存在时报"找不到文件"，而不是让用户以为命令名打错。
+/// 形如路径但不存在的输入放行给主输入区当文本，不报"找不到文件"也不报未知命令。
 #[test]
-fn native_command_route_reports_missing_path_not_unknown_command() {
+fn native_command_route_lets_missing_path_through_without_error() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
 
     app.input = "/nonexistent/lucia.png".into();
     app.cursor = app.input.len();
-    assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+    let consumed = app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None);
 
+    assert!(!consumed, "路径输入不能被命令路由消费");
     assert!(app.attachments.is_empty());
-    assert!(app
-        .messages
-        .last()
-        .is_some_and(|message| message.text.contains("找不到可读取的文件")));
-    assert!(!app.messages.iter().any(|m| m.text.contains("未知命令")));
+    assert_eq!(app.input, "/nonexistent/lucia.png", "输入必须原样保留");
+    assert!(app.messages.is_empty(), "不得产生文件错误或未知命令提示");
 }
 
 /// 不含额外 `/` 的未知命令仍按命令名笔误提示，不被路径判定吞掉。
@@ -1397,4 +1628,92 @@ async fn model_command_switches_shared_agent_upstream() {
     empty.cursor = empty.input.len();
     assert!(empty.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
     assert!(empty.native_command.model_panel.is_none());
+}
+
+/// 插件管理页与命令面板共用一块底板：标题画在上分隔线，列表用指示条与面板底色。
+#[cfg(feature = "plugins")]
+#[test]
+fn plugin_management_page_uses_the_command_palette_chrome() {
+    use crate::command::{NativePluginDialog, NativePluginDialogData, NativePluginDialogStatus};
+    use crate::theme::{COLOR_PALETTE_COMMAND, COLOR_PALETTE_SELECTION_BG};
+    use agent_plugin_manager::InstalledPlugin;
+
+    let plugin = |id: &str, enabled: bool| InstalledPlugin {
+        id: id.into(),
+        name: id.into(),
+        version: "1.0.0".into(),
+        api_version: "0.10.0".into(),
+        enabled,
+        manifest: format!("plugins/{id}/plugin.toml"),
+        sha256: "a".repeat(64),
+        source: "fixture".into(),
+    };
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.native_command.plugin_dialog = Some(NativePluginDialog {
+        selected: 1,
+        status: NativePluginDialogStatus::Ready(NativePluginDialogData {
+            plugins: vec![plugin("alpha", true), plugin("beta", false)],
+            version_history: Vec::new(),
+            authorizations: std::collections::HashMap::new(),
+        }),
+        path_mode: None,
+        path_input: String::new(),
+        remove_confirmation: None,
+        enable_confirmation: None,
+        pending_owner_selection: None,
+        review_scroll: 0,
+    });
+    let (width, height) = (80u16, 24u16);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("应创建测试终端");
+    terminal
+        .draw(|frame| render_native_plugin_dialog(frame, &mut app, composer_anchor(frame)))
+        .expect("应渲染插件管理页");
+    let buffer = terminal.backend().buffer();
+    let lines: Vec<String> = (0..height)
+        .map(|row| {
+            buffer
+                .content()
+                .iter()
+                .skip(usize::from(row) * usize::from(width))
+                .take(usize::from(width))
+                .map(|cell| cell.symbol())
+                .collect()
+        })
+        .collect();
+    let screen = lines.join("\n");
+    let compact = |text: &str| -> String {
+        text.chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    };
+    let row_of = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| compact(line).contains(needle))
+            .unwrap_or_else(|| panic!("应出现 {needle}：{screen}"))
+    };
+
+    // 标题画在上分隔线上；页面不再有圆角与竖向边框。
+    let title_row = row_of("Plugins·人工管理");
+    assert!(lines[title_row].contains('─'), "{screen}");
+    assert!(!screen.contains('╭'), "{screen}");
+    assert!(!screen.contains('│'), "{screen}");
+    assert!(compact(&screen).contains("e启停"), "{screen}");
+
+    // 选中行带指示条并铺面板底色；未选中行的插件 ID 仍用命令面板的强调色。
+    let selected_row = row_of("beta");
+    assert!(lines[selected_row].contains('▌'), "{screen}");
+    assert_eq!(
+        buffer.content()[selected_row * usize::from(width)].bg,
+        COLOR_PALETTE_SELECTION_BG
+    );
+    let alpha_row = row_of("alpha");
+    let alpha_column = lines[alpha_row].find("alpha").expect("应定位插件 ID");
+    assert_eq!(
+        buffer.content()[alpha_row * usize::from(width) + alpha_column]
+            .style()
+            .fg,
+        Some(COLOR_PALETTE_COMMAND)
+    );
 }

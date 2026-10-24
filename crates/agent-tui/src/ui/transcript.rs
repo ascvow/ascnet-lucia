@@ -5,9 +5,9 @@
 //! ```text
 //! ● Write(src/tmp-debug.ts)
 //!   └ 写入 36 行到 src/tmp-debug.ts
-//!       1 /** 临时排查脚本。 */
-//!       2 import { z } from 'zod'
-//!     … +27 行
+//!    1 /** 临时排查脚本。 */
+//!    2 import { z } from 'zod'
+//!       … +27 行
 //! ```
 //!
 //! 本模块只负责排版，不认识具体插件工具：无法识别的工具退回通用 JSON 摘要，
@@ -220,22 +220,42 @@ pub(crate) enum PreviewLine {
 
 /// 剥离工具在正文前附加的行号前缀，返回行号与正文。
 ///
-/// 支持 `12\t正文` 与 `12→正文` 两种写法：前者是原生 `read_file` 的格式，后者是
-/// 常见的插件写法。不匹配时原样返回，避免把正文里恰好以数字开头的行当成行号。
+/// 支持三种写法：`12\t正文`（原生 `read_file`）、`12→正文`（常见插件）与
+/// `12:正文` / `12-正文`（`grep -n` 的匹配行与上下文行）。不匹配时原样返回，避免把
+/// 正文里恰好以数字开头的行当成行号。
+///
+/// 第三种写法存在的意义是**对齐**：前缀留在正文里时，三位行号与四位行号会让代码
+/// 起始列逐行漂移；收进行号列后，所有行的代码都从同一列开始。
 fn split_line_number(text: &str) -> (Option<usize>, &str) {
     let trimmed = text.trim_start();
-    let Some((head, tail)) = trimmed.split_once('\t').or_else(|| trimmed.split_once('→')) else {
+    if let Some((head, tail)) = trimmed.split_once('\t').or_else(|| trimmed.split_once('→')) {
+        if let Ok(number) = head.trim().parse::<usize>() {
+            return (Some(number), tail);
+        }
+    }
+    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
         return (None, text);
+    }
+    let rest = &trimmed[digits..];
+    let body = match rest.chars().next() {
+        Some(':' | '-') => &rest[1..],
+        _ => return (None, text),
     };
-    match head.trim().parse::<usize>() {
-        Ok(number) => (Some(number), tail),
+    // 时间戳一类以数字开头的正文（`12:00:01 ...`）不是行号：分隔符后面紧跟数字时
+    // 一律不认，否则整段日志会被当成"从第 12 行开始的代码"。
+    if body.starts_with(|ch: char| ch.is_ascii_digit()) {
+        return (None, text);
+    }
+    match trimmed[..digits].parse::<usize>() {
+        Ok(number) => (Some(number), body),
         Err(_) => (None, text),
     }
 }
 
 /// 判断整段正文是否都带行号前缀。
 ///
-/// 只有全部非空行都匹配时才剥离，避免把正文中偶然以数字加制表符开头的行误判为行号。
+/// 只有全部非空行都匹配时才剥离，避免把正文中偶然以数字开头的行误判为行号。
 fn is_line_numbered(rows: &[&str]) -> bool {
     let mut numbered = 0;
     for row in rows {
@@ -523,13 +543,18 @@ pub(crate) fn output_preview_lines(text: &str, max_lines: usize) -> Vec<PreviewL
     lines
 }
 
-/// 行号列宽度：右对齐到该宽度，与 Claude Code 的预览观感一致。
-const GUTTER_WIDTH: usize = 4;
-/// 预览块相对消息左边缘的缩进。
+/// 预览块相对消息左边缘的缩进列数。
 ///
-/// 正文与标题行里 `● ` 之后的工具名同列：缩进再宽会让长代码在窄终端里提前折行，而
-/// 这块内容本就是"背景信息"，不值得占掉代码的列数。
-const PREVIEW_INDENT: &str = "  ";
+/// 正文与标题行里 `● ` 之后的工具名同列：工具输出是从属于这次调用的背景信息，顶到
+/// 消息左边缘就与标题行脱开了从属关系，读起来像另起一段正文。缩进也不宜再宽——两列
+/// 正好对齐工具名，长代码在窄终端里不至于提前折行。
+const PREVIEW_INDENT: usize = 2;
+
+/// 行号列的最小宽度：两位行号也需要一列右对齐空间。
+///
+/// 行号列按块内最大行号的位数取宽，不再固定四列：几十行的预览只占两列，正文因此
+/// 紧贴行号列，而不是被一整块空号位推出去。
+const GUTTER_MIN_WIDTH: usize = 2;
 /// 行号列与正文之间的标记列宽：一列标记左侧留白加一列标记本身。
 ///
 /// 留白的作用是让 `+`/`-` 不直接顶住行号列：标记贴着数字时，整行色块看起来像从行号里
@@ -551,12 +576,28 @@ fn truncate_body(text: &str, width: usize) -> String {
     truncate_line(text, width.saturating_sub(1))
 }
 
-/// 渲染行号列。
-fn gutter(number: Option<usize>, color: Color) -> Span<'static> {
-    let text = number.map_or_else(
-        || " ".repeat(GUTTER_WIDTH),
-        |number| format!("{number:>GUTTER_WIDTH$}"),
-    );
+/// 计算行号列宽度：按块内最大行号的位数取，至少 [`GUTTER_MIN_WIDTH`] 列。
+///
+/// 整块共用一个宽度，行号才能逐列右对齐；宽度只取决于这块内容自己的行号，因此
+/// 十几行的预览不会为四位行号预留空间。
+fn preview_gutter_width(lines: &[PreviewLine]) -> usize {
+    lines
+        .iter()
+        .filter_map(|line| match line {
+            PreviewLine::Context { number, .. }
+            | PreviewLine::Added { number, .. }
+            | PreviewLine::Removed { number, .. } => *number,
+            _ => None,
+        })
+        .max()
+        .map_or(GUTTER_MIN_WIDTH, |max| {
+            max.to_string().len().max(GUTTER_MIN_WIDTH)
+        })
+}
+
+/// 渲染行号列，宽度由 [`preview_gutter_width`] 决定。
+fn gutter(number: Option<usize>, color: Color, width: usize) -> Span<'static> {
+    let text = number.map_or_else(|| " ".repeat(width), |number| format!("{number:>width$}"));
     Span::styled(text, Style::new().fg(color))
 }
 
@@ -607,7 +648,11 @@ pub(crate) fn render_preview(
                 | PreviewLine::Meta { .. }
         )
     });
-    let gutter_width = if show_gutter { GUTTER_WIDTH } else { 0 };
+    let gutter_width = if show_gutter {
+        preview_gutter_width(lines)
+    } else {
+        0
+    };
     // 标记列只在真的渲染标记时占位：diff 块留出「留白 + 标记」两列，只有行号的块留一列
     // 与增删行对齐，纯文本预览（shell 输出）不为它留空，把整段宽度让给正文。
     let marker_width = if diff_block {
@@ -617,31 +662,33 @@ pub(crate) fn render_preview(
     } else {
         0
     };
-    // 缩进、行号列与标记列之后剩余的正文宽度。
+    // 缩进、行号列与标记列之后剩余的正文宽度。缩进只占两列（与工具名同列），其余宽度
+    // 全部让给代码与日志。
     let body_width = total_width
-        .saturating_sub(PREVIEW_INDENT.len() + gutter_width + marker_width)
+        .saturating_sub(PREVIEW_INDENT + gutter_width + marker_width)
         .max(1);
 
     lines
         .iter()
         .map(|line| match line {
             PreviewLine::Elided { hidden } => Line::from(vec![
-                Span::raw(PREVIEW_INDENT),
+                // 省略行与正文同列：它标记的是"这里还该有代码"，不是块级提示。
+                Span::raw(" ".repeat(PREVIEW_INDENT + gutter_width + marker_width)),
                 Span::styled(format!("… +{hidden} 行"), Style::new().fg(COLOR_MUTED)),
             ]),
             PreviewLine::FileHeader { text } => {
-                diff_structure_row(text, DiffLineKind::FileHeader, show_gutter, body_width)
+                diff_structure_row(text, DiffLineKind::FileHeader, gutter_width, body_width)
             }
             PreviewLine::HunkHeader { text } => {
-                diff_structure_row(text, DiffLineKind::HunkHeader, show_gutter, body_width)
+                diff_structure_row(text, DiffLineKind::HunkHeader, gutter_width, body_width)
             }
             PreviewLine::Meta { text } => {
-                diff_structure_row(text, DiffLineKind::Meta, show_gutter, body_width)
+                diff_structure_row(text, DiffLineKind::Meta, gutter_width, body_width)
             }
             PreviewLine::Context { number, text } => {
-                let mut spans = vec![Span::raw(PREVIEW_INDENT)];
+                let mut spans = vec![Span::raw(" ".repeat(PREVIEW_INDENT))];
                 if show_gutter {
-                    spans.push(gutter(*number, COLOR_LINE_NUMBER));
+                    spans.push(gutter(*number, COLOR_LINE_NUMBER, gutter_width));
                 }
                 if diff_block {
                     // 上下文行不显示标记，但标记列必须占住，正文才与增删行逐列对齐。
@@ -661,7 +708,7 @@ pub(crate) fn render_preview(
                 text,
                 true,
                 *number,
-                show_gutter,
+                gutter_width,
                 total_width,
                 body_width,
                 error,
@@ -670,7 +717,7 @@ pub(crate) fn render_preview(
                 text,
                 false,
                 *number,
-                show_gutter,
+                gutter_width,
                 total_width,
                 body_width,
                 error,
@@ -683,14 +730,14 @@ pub(crate) fn render_preview(
 ///
 /// 三个要点决定了它读起来像"改动记录"而不是"一段带色的文字"：
 ///
-/// - 整行底色从缩进处开始铺到终端右边界，色块贯穿整宽；
+/// - 整行底色从消息左边缘开始铺到右边界，色块贯穿整宽；
 /// - 标记左侧留一列底色，`+`/`-` 不贴在行号列上；
 /// - 行号降为暗灰，方向只由标记与底色表达。
 fn diff_changed_row(
     text: &str,
     added: bool,
     number: Option<usize>,
-    show_gutter: bool,
+    gutter_width: usize,
     total_width: usize,
     body_width: usize,
     error: bool,
@@ -706,10 +753,12 @@ fn diff_changed_row(
     let marker = if added { '+' } else { '-' };
     let row_style = Style::new().bg(background);
 
-    let mut spans = vec![Span::styled(PREVIEW_INDENT, row_style)];
-    if show_gutter {
+    let mut spans = Vec::new();
+    // 缩进也带底色：色块从消息左边缘一直铺到右边界，中途不断开。
+    spans.push(Span::styled(" ".repeat(PREVIEW_INDENT), row_style));
+    if gutter_width > 0 {
         // 行号用暗灰而不是红绿：它是定位坐标，不该比改动本身更抢眼。
-        spans.push(gutter(number, COLOR_LINE_NUMBER).patch_style(row_style));
+        spans.push(gutter(number, COLOR_LINE_NUMBER, gutter_width).patch_style(row_style));
     }
     spans.push(Span::styled(" ".repeat(DIFF_MARKER_PAD), row_style));
     spans.push(Span::styled(marker.to_string(), row_style.fg(palette.fg)));
@@ -730,7 +779,7 @@ fn diff_changed_row(
 fn diff_structure_row(
     text: &str,
     kind: DiffLineKind,
-    show_gutter: bool,
+    gutter_width: usize,
     body_width: usize,
 ) -> Line<'static> {
     let palette = diff::style_of(kind);
@@ -738,9 +787,9 @@ fn diff_structure_row(
     if palette.bold {
         style = style.bold();
     }
-    let mut spans = vec![Span::raw(PREVIEW_INDENT)];
-    if show_gutter {
-        spans.push(Span::raw(" ".repeat(GUTTER_WIDTH)));
+    let mut spans = vec![Span::raw(" ".repeat(PREVIEW_INDENT))];
+    if gutter_width > 0 {
+        spans.push(Span::raw(" ".repeat(gutter_width)));
     }
     // 结构文本落在标记列上，与原样补丁的列位置一致。
     spans.push(Span::raw(" ".repeat(DIFF_MARKER_PAD)));
@@ -949,20 +998,18 @@ mod tests {
 
         let rendered = render_preview(&lines, 40, CodeLanguage::Plain, false);
 
-        // 40 列减去缩进 2、行号列 4、标记位 1，正文剩 33 列：整行恰好铺满 40 列。
+        // 40 列减去缩进 2、行号列 2（行号 7 只占一位，按最小宽度右对齐）、标记位 1，
+        // 正文剩 35 列：整行恰好铺满 40 列。
         let text = text_of(&rendered[0]);
         assert_eq!(unicode_width::UnicodeWidthStr::width(text.as_str()), 40);
-        assert!(
-            text.starts_with(&format!("{PREVIEW_INDENT}   7 ")),
-            "{text:?}"
-        );
+        assert!(text.starts_with("   7 "), "{text:?}");
         assert!(text.ends_with('…'), "{text:?}");
     }
 
     /// 工具块正文与标题行里的工具名同列：缩进只占两列，宽出的空间留给代码与日志。
     #[test]
     fn tool_preview_is_indented_two_columns() {
-        assert_eq!(PREVIEW_INDENT, "  ");
+        assert_eq!(PREVIEW_INDENT, 2);
         let lines = vec![PreviewLine::Context {
             number: None,
             text: "cargo build".into(),
@@ -1021,6 +1068,65 @@ mod tests {
         );
     }
 
+    /// `grep -n` 的 `172:` / `173-` 前缀同样收进行号列，正文因此从同一列开始。
+    #[test]
+    fn grep_prefix_moves_into_the_gutter() {
+        let result = ToolResult::success(
+            "c",
+            "shell",
+            json!({"content": "172:pub(crate) fn markdown_lines() {\n173-    let body_width = 1;\n174-        .max(1);"}),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        assert_eq!(
+            lines[0],
+            PreviewLine::Context {
+                number: Some(172),
+                text: "pub(crate) fn markdown_lines() {".into()
+            }
+        );
+        assert_eq!(
+            lines[2],
+            PreviewLine::Context {
+                number: Some(174),
+                text: "        .max(1);".into()
+            }
+        );
+        // 渲染后正文列一致：只有源码自身的缩进不同，前缀不再推动正文。
+        let rendered = render_preview(&lines, 40, CodeLanguage::Plain, false);
+        assert!(
+            text_of(&rendered[0]).starts_with("  172 pub(crate)"),
+            "{:?}",
+            text_of(&rendered[0])
+        );
+        assert!(
+            text_of(&rendered[1]).starts_with("  173     let body_width"),
+            "{:?}",
+            text_of(&rendered[1])
+        );
+    }
+
+    /// 以时间戳开头的日志不是行号：冒号后面紧跟数字时保留原样。
+    #[test]
+    fn timestamp_like_lines_are_not_line_numbers() {
+        let result = ToolResult::success(
+            "c",
+            "shell",
+            json!({"content": "12:00:01 starting\n12:00:02 done"}),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        assert_eq!(
+            lines[0],
+            PreviewLine::Context {
+                number: Some(1),
+                text: "12:00:01 starting".into()
+            }
+        );
+    }
+
     /// 超出预览上限时以 `… +N 行` 标注被折叠的行数。
     #[test]
     fn overflow_is_reported_as_hidden_line_count() {
@@ -1039,7 +1145,7 @@ mod tests {
 
     /// diff 行的底色必须贯穿整行，否则终端里会出现半截色块。
     ///
-    /// 色块从缩进处起铺、一直铺到终端右边界：只包住文字的底色读起来仍是一段带色的
+    /// 色块从消息左边缘起铺、一直铺到右边界：只包住文字的底色读起来仍是一段带色的
     /// 文本，而不是一条独立的改动记录。
     #[test]
     fn diff_rows_fill_the_full_width() {
@@ -1064,7 +1170,8 @@ mod tests {
                 .sum::<usize>();
 
             assert_eq!(background, 40, "第 {index} 行的底色应铺满整宽");
-            assert!(line.spans[0].content.starts_with(PREVIEW_INDENT));
+            // 第一段就带底色：色块从第 0 列开始，而不是从某处缩进之后。
+            assert!(line.spans[0].style.bg.is_some(), "第 {index} 行应从头铺色");
         }
     }
 
@@ -1077,6 +1184,8 @@ mod tests {
         }];
 
         let rendered = render_preview(&lines, 40, CodeLanguage::CLike, false);
+        // 行号 7 只占一位，行号列按最小宽度两列右对齐。
+        let gutter_width = GUTTER_MIN_WIDTH;
         let spans = &rendered[0].spans;
         let marker_index = spans
             .iter()
@@ -1089,11 +1198,11 @@ mod tests {
             .sum();
         assert_eq!(
             before_marker,
-            PREVIEW_INDENT.len() + GUTTER_WIDTH + DIFF_MARKER_PAD
+            PREVIEW_INDENT + gutter_width + DIFF_MARKER_PAD
         );
         assert_eq!(
             text_of(&rendered[0]).find('+'),
-            Some(PREVIEW_INDENT.len() + GUTTER_WIDTH + 1)
+            Some(PREVIEW_INDENT + gutter_width + 1)
         );
     }
 
@@ -1556,7 +1665,36 @@ mod result_shape_tests {
                 .collect()
         };
 
-        assert_eq!(text_of(&numbered[0]), format!("{PREVIEW_INDENT}   7 code"));
-        assert_eq!(text_of(&plain[0]), format!("{PREVIEW_INDENT}code"));
+        // 有行号时留出「缩进 + 最小行号列 + 一列间隔」，没有行号时正文只带缩进。
+        assert_eq!(text_of(&numbered[0]), "   7 code");
+        assert_eq!(text_of(&plain[0]), "  code");
+    }
+
+    /// 行号列按块内最大行号的位数取宽，不再固定四列。
+    #[test]
+    fn gutter_width_follows_the_widest_line_number() {
+        let render = |number: usize| {
+            let lines = render_preview(
+                &[PreviewLine::Context {
+                    number: Some(number),
+                    text: "code".into(),
+                }],
+                60,
+                CodeLanguage::Plain,
+                false,
+            );
+            lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+
+        // 一位行号也按最小宽度两列右对齐。
+        assert_eq!(render(7), "   7 code");
+        // 三位行号占满三列，正文紧随其后。
+        assert_eq!(render(174), "  174 code");
+        // 位数继续增长时行号列跟着变宽，行号本身始终完整可见。
+        assert_eq!(render(123_456), "  123456 code");
     }
 }

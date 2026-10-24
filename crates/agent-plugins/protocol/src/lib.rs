@@ -307,6 +307,32 @@ pub enum UiNavigationAction {
     /// Closes the current plugin-owned subview and returns to its parent.
     /// 关闭当前插件子视图，返回上一层。
     Pop,
+    /// Opens a host-native Agent session view for one Agent owned by the requesting plugin.
+    ///
+    /// 以宿主原生界面打开一个属于发起插件的 Agent 会话视图。
+    ///
+    /// 该动作沿用子视图导航栈：`Esc` 返回上一层，重复打开同一 `instance_id` 时只更新
+    /// 目标句柄与说明，不压入重复视图。宿主使用**发起插件自己的可信 principal**读取目标
+    /// Agent；目标不属于该插件时 Runtime 会拒绝，宿主只展示错误，不会跨 owner 读取。
+    /// 视图中的按键由宿主处理，用户提交时宿主向插件发送
+    /// [`UiInputEvent::Submit`]，`view_id` 为这里声明的视图类型。
+    OpenAgentSession {
+        /// 插件声明的子视图 ID；宿主据此把提交输入路由回发起插件。
+        view_id: String,
+        /// 插件内稳定唯一的实例 ID；同一成员续跑后应沿用该 ID。
+        instance_id: String,
+        /// 目标 Agent 句柄；成员续跑产生新句柄时用同一实例 ID 再次打开即可替换目标。
+        target: String,
+        /// 覆盖默认标题的可选实例标题，例如成员角色。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// 创建视图时作为首条用户消息展示的任务正文；重复打开时忽略。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        /// 面向用户的附加说明，例如上一次提交被拒绝的原因。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
+    },
 }
 
 /// An idempotent view navigation request sent by a plugin.
@@ -459,6 +485,14 @@ pub enum UiInputEvent {
         text: String,
         /// UTF-8 字节光标位置。
         cursor: u32,
+    },
+    /// 宿主原生 Agent 会话视图中用户提交的一条消息。
+    ///
+    /// 原生视图的编辑与滚动都由宿主处理；插件只在用户按下提交时收到该事件，并负责把
+    /// 正文交给目标 Agent（steering 或续跑），以及维护自己的成员目录。
+    Submit {
+        /// 用户提交的完整正文。
+        text: String,
     },
 }
 
@@ -758,6 +792,58 @@ mod tests {
             serde_json::from_value(encoded).expect("反序列化导航请求");
 
         assert_eq!(decoded, request);
+    }
+
+    /// 原生 Agent 会话视图的可选说明缺省时必须保持旧形状，不写入空字段。
+    #[test]
+    fn agent_session_navigation_omits_optional_fields() {
+        let request = UiNavigationRequest {
+            request_id: "open-member-1".into(),
+            action: UiNavigationAction::OpenAgentSession {
+                view_id: "member-session".into(),
+                instance_id: "member-1".into(),
+                target: "agent-1".into(),
+                title: None,
+                prompt: None,
+                notice: None,
+            },
+        };
+
+        let encoded = serde_json::to_value(&request).expect("序列化原生视图导航");
+        assert_eq!(
+            encoded,
+            json!({
+                "request_id": "open-member-1",
+                "action": {
+                    "action": "open_agent_session",
+                    "view_id": "member-session",
+                    "instance_id": "member-1",
+                    "target": "agent-1"
+                }
+            })
+        );
+        let decoded: UiNavigationRequest =
+            serde_json::from_value(encoded).expect("解析原生视图导航");
+        assert_eq!(decoded, request);
+    }
+
+    /// 原生视图提交事件必须只携带正文，按键与滚动不应跨进程回传。
+    #[test]
+    fn native_agent_session_submit_round_trips() {
+        let input = UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "member-session".into(),
+            instance_id: Some("member-1".into()),
+            event: UiInputEvent::Submit {
+                text: "继续分析".into(),
+            },
+        };
+
+        let encoded = serde_json::to_value(&input).expect("序列化原生视图提交");
+        assert_eq!(encoded["view_id"], "member-session");
+        assert_eq!(encoded["event"]["type"], "submit");
+        let decoded: UiInput = serde_json::from_value(encoded).expect("解析原生视图提交");
+        assert_eq!(decoded, input);
     }
 
     /// 普通视图与工具 renderer 必须共享同一贡献数组且保持可区分。

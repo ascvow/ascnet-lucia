@@ -71,12 +71,18 @@ impl ToolOutputBuffer {
     }
 }
 
+/// 回答文本（含推理摘要）的共享增量缓冲区。
+type SharedModelDeltas = Arc<std::sync::Mutex<ModelDeltaBuffer>>;
+
+/// 工具运行期输出的共享增量缓冲区。
+type SharedToolOutput = Arc<std::sync::Mutex<ToolOutputBuffer>>;
+
 /// 将 Agent 事件转换为 TUI 事件；高频模型文本通过共享缓冲区合并。
 pub(crate) struct ChannelEventSink {
     tx: mpsc::UnboundedSender<UiEvent>,
-    model_deltas: Arc<std::sync::Mutex<ModelDeltaBuffer>>,
-    thinking_deltas: Arc<std::sync::Mutex<ModelDeltaBuffer>>,
-    tool_output: Arc<std::sync::Mutex<ToolOutputBuffer>>,
+    model_deltas: SharedModelDeltas,
+    thinking_deltas: SharedModelDeltas,
+    tool_output: SharedToolOutput,
     /// 可选的流式诊断探针；只记录到达节奏，不参与 UI 决策。
     probe: Option<StreamProbe>,
 }
@@ -91,12 +97,7 @@ impl ChannelEventSink {
     /// 创建事件 sink，并返回供 UI 消费回答文本、推理摘要与工具输出的共享缓冲区。
     pub(crate) fn new(
         tx: mpsc::UnboundedSender<UiEvent>,
-    ) -> (
-        Self,
-        Arc<std::sync::Mutex<ModelDeltaBuffer>>,
-        Arc<std::sync::Mutex<ModelDeltaBuffer>>,
-        Arc<std::sync::Mutex<ToolOutputBuffer>>,
-    ) {
+    ) -> (Self, SharedModelDeltas, SharedModelDeltas, SharedToolOutput) {
         let model_deltas = Arc::new(std::sync::Mutex::new(ModelDeltaBuffer::default()));
         let thinking_deltas = Arc::new(std::sync::Mutex::new(ModelDeltaBuffer::default()));
         let tool_output = Arc::new(std::sync::Mutex::new(ToolOutputBuffer::default()));

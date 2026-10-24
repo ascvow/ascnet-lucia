@@ -37,7 +37,7 @@ fn long_mixed_reply_keeps_next_user_message_visible() {
     }
 }
 
-/// 跳转提示独占留白行；连续重绘、窗口缩小与回到底部不能截断或残留点击区域。
+/// 跳转提示占用输入框上方那一行留白；连续重绘、窗口缩小与回到底部不能截断或残留点击区域。
 #[test]
 fn jump_hint_uses_separate_row_and_clears_when_hidden() {
     for width in [100, 40, 16] {
@@ -55,8 +55,9 @@ fn jump_hint_uses_separate_row_and_clears_when_hidden() {
             assert_eq!(
                 area.y,
                 1 + app.last_viewport,
-                "提示应在正文视口之后的留白行"
+                "提示应紧接正文视口之后，占正文下方的留白行"
             );
+            assert_eq!(area.right(), width, "提示右对齐：末尾贴齐终端最右一列");
             let text: String = (area.x..area.right())
                 .map(|x| terminal.backend().buffer()[(x, area.y)].symbol())
                 .collect();
@@ -85,6 +86,42 @@ fn jump_hint_uses_separate_row_and_clears_when_hidden() {
     }
 }
 
+/// 活动状态靠左、跳转提示靠右，两者共享输入框上方同一行；翻页不会移动这一行。
+#[test]
+fn status_and_jump_hint_share_the_row_above_the_prompt() {
+    let width = 80;
+    let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages.push(Msg::new(
+        MsgKind::Assistant,
+        "状态行与提示共用的正文测试\n".repeat(80),
+    ));
+    app.running = true;
+    app.start_model_response();
+    app.mark_model_thinking();
+    app.run_started_at = Some(std::time::Instant::now());
+
+    for position in [0, 5, 40] {
+        app.scroll = Some(position);
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        let hint = app.jump_hint_area.expect("滚动时应显示提示");
+        let rows = buffer_rows(&terminal, width);
+        let row = status_row(&rows);
+        assert_eq!(hint.y as usize, row, "提示应与活动状态同一行");
+        assert_eq!(hint.right(), width, "提示应贴齐终端右边界");
+        let text = &rows[row];
+        assert!(text.contains("Thinking"), "{text:?}");
+        assert!(text.contains("click to jump"), "{text:?}");
+        assert!(
+            text.find("Thinking").unwrap() < text.find("click to jump").unwrap(),
+            "活动状态应在左、跳转提示应在右：{text:?}"
+        );
+        // 这一行紧贴输入盒上边框，位置与滚动无关。
+        assert_eq!(prompt_border_row(&rows), row + 1, "{text:?}");
+    }
+}
+
 /// 滚动条只在内容溢出时占用右侧留白列，正文不被覆盖；清空后不得残留轨道。
 #[test]
 fn scrollbar_marks_overflow_and_clears_when_content_fits() {
@@ -101,15 +138,21 @@ fn scrollbar_marks_overflow_and_clears_when_content_fits() {
     assert_eq!(area.width, 1);
     assert_eq!(area.height, app.last_viewport);
     assert_eq!(area.x, 59, "滚动条应贴在终端最右一列");
+    assert_eq!(area.right(), 60, "滚动条右边不得再留任何空白列");
     // 轨道与滑块只用一列宽字符，且不会挤掉正文：正文右边界在滚动条左侧。
     let column: String = (area.y..area.bottom())
         .map(|y| terminal.backend().buffer()[(area.x, y)].symbol())
         .collect();
     assert!(
-        column.chars().all(|glyph| glyph == '│' || glyph == '┃'),
+        column
+            .chars()
+            .all(|glyph| matches!(glyph, '│' | '█' | '▀' | '▄')),
         "滚动条列只应出现轨道或滑块：{column:?}"
     );
-    assert!(column.contains('┃'), "应能看到滑块：{column:?}");
+    assert!(
+        column.chars().any(|glyph| matches!(glyph, '█' | '▀' | '▄')),
+        "应能看到滑块：{column:?}"
+    );
 
     // 内容不再溢出时滚动条消失，上一帧的轨道必须被擦掉。
     app.messages.clear();
@@ -119,6 +162,91 @@ fn scrollbar_marks_overflow_and_clears_when_content_fits() {
         .map(|y| terminal.backend().buffer()[(area.x, y)].symbol())
         .collect();
     assert_eq!(leftover.trim(), "", "残留轨道：{leftover:?}");
+}
+
+/// 鼠标悬停在滚动条上时轨道与滑块各提亮一档，几何位置保持不变。
+///
+/// 横向边距去掉后右侧没有富余列可以向左扩宽，加粗只能靠提亮表达——一旦改宽度就会
+/// 盖住正文最后一列。这条断言守住两件事：几何在悬停前后完全一致，以及轨道与滑块都
+/// 提亮而不是整根轨道变成双线。
+#[test]
+fn scrollbar_brightens_on_hover_without_widening() {
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages.push(Msg::new(
+        MsgKind::Assistant,
+        "滚动条悬停测试正文\n".repeat(40),
+    ));
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+
+    let idle = app.scrollbar_area.expect("内容溢出时应显示滚动条");
+    assert_eq!((idle.x, idle.width), (59, 1), "常态应只占贴边的最后一列");
+    let buffer = terminal.backend().buffer();
+    assert!(
+        (idle.y..idle.bottom())
+            .map(|y| buffer[(59, y)].fg)
+            .all(|color| color == crate::theme::COLOR_SEPARATOR
+                || color == crate::theme::COLOR_MUTED),
+        "常态轨道用分隔线灰、滑块用正文灰"
+    );
+
+    let pointer = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    // 指针停在滚动条上：状态翻转，本帧就该提亮，位置不动。
+    assert!(
+        app.handle_mouse_event(&pointer(MouseEventKind::Moved, 59, idle.y + 2)),
+        "指针移入滚动条应翻转悬停态"
+    );
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let hovered = app.scrollbar_area.expect("悬停时滚动条仍然存在");
+    assert_eq!(
+        (hovered.x, hovered.width),
+        (idle.x, idle.width),
+        "悬停不得改变几何：右侧没有富余列可扩"
+    );
+
+    let buffer = terminal.backend().buffer();
+    let mut thumb_rows = 0;
+    for y in hovered.y..hovered.bottom() {
+        match buffer[(59, y)].symbol() {
+            "█" | "▀" | "▄" => {
+                thumb_rows += 1;
+                assert_eq!(
+                    buffer[(59, y)].fg,
+                    crate::theme::COLOR_TEXT,
+                    "悬停滑块应提亮：第 {y} 行"
+                );
+            }
+            _ => assert_eq!(
+                buffer[(59, y)].fg,
+                crate::theme::COLOR_MUTED,
+                "悬停轨道应提亮：第 {y} 行"
+            ),
+        }
+    }
+    assert!(thumb_rows > 0, "应至少有一行滑块用来验证提亮");
+
+    // 指针移开：恢复常态配色。
+    assert!(
+        app.handle_mouse_event(&pointer(MouseEventKind::Moved, 40, idle.y + 2)),
+        "指针离开滚动条应还原悬停态"
+    );
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let restored = app.scrollbar_area.expect("内容仍溢出，滚动条不应消失");
+    assert_eq!((restored.x, restored.width), (59, 1), "移开后几何不变");
+    let buffer = terminal.backend().buffer();
+    assert!(
+        (restored.y..restored.bottom())
+            .map(|y| buffer[(59, y)].fg)
+            .all(|color| color == crate::theme::COLOR_SEPARATOR
+                || color == crate::theme::COLOR_MUTED),
+        "移开后应回到常态配色"
+    );
 }
 
 /// 短对话与超窄终端都不绘制滚动条，避免为一屏以内的内容添加噪声。
@@ -182,6 +310,41 @@ fn footer_shows_compact_english_reasoning_level() {
     assert!(!text.contains("思考 超高"), "{text:?}");
 }
 
+/// 底栏应常驻上下文用量与配置里的上游名，用量芯片同时是可点击的 `/context` 入口。
+///
+/// 依赖点：芯片的屏幕列必须与绘制位置一致——否则点击热区会与看到的数字错位。
+#[test]
+fn footer_shows_context_usage_and_configured_upstream_name() {
+    let backend = TestBackend::new(100, 16);
+    let mut terminal = Terminal::new(backend).expect("创建上下文用量底栏测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "deepseek-v4-flash".into()).with_context_window(Some(200_000));
+    // 同一模型 ID 可以有多条配置：底栏用配置名把生效的那一条指出来。
+    app.model_upstream_name = Some("deepseek".into());
+    app.context_tokens = Some(50_000);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染上下文用量底栏");
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(text.contains("deepseek-v4-flash [deepseek]"), "{text:?}");
+    // 未在运行中也必须显示：这是随时要确认的数字，不是运行期进度。
+    assert!(!app.running);
+    assert!(text.contains("◔ 25% · 50.0k"), "{text:?}");
+
+    let area = app.context_chip_area.expect("用量芯片应登记点击热区");
+    let row: String = (area.x..area.x + area.width)
+        .map(|x| terminal.backend().buffer()[(x, area.y)].symbol())
+        .collect();
+    assert_eq!(row, "◔ 25% · 50.0k", "热区必须与绘制位置对齐");
+}
+
 /// 左键释放形成可复制选区后，底栏必须展示一次性操作提示。
 #[test]
 fn footer_shows_copy_shortcut_for_released_selection() {
@@ -227,7 +390,7 @@ fn empty_session_renders_pixel_portrait() {
     assert!(portrait_cells >= 80, "像素头像应包含足够的可见终端像素");
 }
 
-/// 输入提示应紧跟输入盒上边框；下边框之前留一行内部空白，之后立即进入状态栏。
+/// 输入提示应紧跟输入盒上边框，下边框之前不再留内部空白，之后立即进入状态栏。
 #[test]
 fn input_editor_starts_immediately_after_rule() {
     let width = 80;
@@ -252,25 +415,24 @@ fn input_editor_starts_immediately_after_rule() {
         .expect("输入盒上边框应存在");
 
     assert!(rows[rule_row + 1].contains("Message Lucia..."));
-    // 编辑行之后是输入盒内部的留白行（只剩左右边框），再往下才是下边框与状态栏。
-    let interior = rows[rule_row + 2].trim().trim_matches('│').trim();
-    assert_eq!(interior, "", "单行输入时输入盒内部应有第二行留白：{rows:?}");
+    // 编辑行之后直接是下边框：框高等于内容高，底部不再多出一行空白。
     assert!(
-        rows[rule_row + 3]
+        rows[rule_row + 2]
             .chars()
             .filter(|character| *character == '─')
             .count()
-            > 20
+            > 20,
+        "输入盒底部不应留空行：{rows:?}"
     );
-    assert!(!rows[rule_row + 4].trim().is_empty());
+    assert!(!rows[rule_row + 3].trim().is_empty());
 }
 
-/// 助手回答渲染为一块连续的卡片底色，并与随后的工具日志隔一行真正的空白。
+/// 助手回答直接落在终端底色上，并且与随后的工具日志隔一行真正的空白。
 ///
-/// 这三件事必须同时成立：回答内部（含段落之间的空行）色块不断；卡片右边界之外回到
-/// 终端底色；卡片与工具日志之间留一行没有底色的空行，两者才不会粘成一片。
+/// 回答不再铺整块卡片底色：一层横贯消息区的色带会把正文压成"色块里的字"，宽终端上
+/// 尤其像一条被拉长的横幅。回答与工具日志之间的空行必须保留，两者才不会粘成一片。
 #[test]
-fn assistant_card_is_continuous_and_separated_from_tool_logs() {
+fn assistant_answer_sits_on_the_terminal_background() {
     let width = 80;
     let backend = TestBackend::new(width, 26);
     let mut terminal = Terminal::new(backend).expect("创建卡片测试终端");
@@ -314,13 +476,11 @@ fn assistant_card_is_continuous_and_separated_from_tool_logs() {
     let (first, second) = (card_rows[0], card_rows[1]);
     assert_eq!(second, first + 2, "段落之间应只隔一行：{rows:?}");
 
-    let card_bg = crate::theme::COLOR_ASSISTANT_BG;
-    // 回答内部（含段落间空行）直到卡片右边界都是卡片底色。
+    // 回答内部（含段落间空行）每一个单元格都没有底色：正文直接画在终端背景上。
     //
     // 只看空白单元格：宽字符的第二列由终端按字形铺满，缓冲里不写样式（写了也没有
-    // 视觉效果），检查它会得到假失败。文字之外的每一列才真正体现卡片底色是否连续。
+    // 视觉效果），检查它会得到假失败。
     for row in first..=second {
-        // 主内容区左右各留两列，卡片右边界就在 width - 2。
         for column in 2..width - 2 {
             let cell = &buffer[(column, row as u16)];
             // 宽字符的续占单元格由终端按字形铺满，缓冲里不写样式，跳过它。
@@ -329,8 +489,9 @@ fn assistant_card_is_continuous_and_separated_from_tool_logs() {
                     == 2;
             if cell.symbol() == " " && !wide_tail {
                 assert_eq!(
-                    cell.bg, card_bg,
-                    "第 {row} 行第 {column} 列应是卡片底色：{rows:?}"
+                    cell.bg,
+                    Color::Reset,
+                    "第 {row} 行第 {column} 列不应有卡片底色：{rows:?}"
                 );
             }
         }
@@ -352,22 +513,23 @@ fn assistant_card_is_continuous_and_separated_from_tool_logs() {
     );
 }
 
-/// 主内容区左右各留 2 列：正文不贴终端边缘，状态栏与正文区左边界对齐。
+/// 主内容区横向不留边距：正文贴住终端第 1 列，输入盒边框铺满整行。
 ///
-/// 助手回答在最外层留白之内还有自己的卡片内边距，因此行首标记整体缩进四列。
+/// 助手回答的行首标记不额外缩进：`●` 与用户消息的 `▌` 落在同一列，两种消息的正文
+/// 都从第二列起笔。那属于消息自身的版式，不是主内容区的外边距。
 #[test]
-fn main_content_keeps_two_column_padding() {
+fn main_content_uses_the_full_width() {
     let width = 80;
     let backend = TestBackend::new(width, 20);
-    let mut terminal = Terminal::new(backend).expect("创建左右留白测试终端");
+    let mut terminal = Terminal::new(backend).expect("创建整宽测试终端");
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.messages
-        .push(Msg::new(MsgKind::Assistant, "左右留白测试正文"));
+        .push(Msg::new(MsgKind::Assistant, "整宽测试正文"));
 
     terminal
         .draw(|frame| render_root(frame, &mut app))
-        .expect("渲染左右留白");
+        .expect("渲染整宽版面");
     let rows = terminal
         .backend()
         .buffer()
@@ -381,21 +543,71 @@ fn main_content_keeps_two_column_padding() {
         .position(|row| row.contains('●'))
         .expect("应展示助手回复");
     assert!(
-        rows[marker_row].starts_with("    ● "),
-        "正文应缩进两列、卡片内边距再缩进两列：{:?}",
+        rows[marker_row].starts_with("● "),
+        "标记应贴住内容区第一列，与用户消息的竖条同列：{:?}",
         rows[marker_row]
     );
-    // 卡片底色从正文区左边界开始铺：内边距本身就带底色，卡片左边缘因此是一条直线。
+    // 回答不铺卡片底色：第 0 列就是标记本身，前面没有任何留白列。
     assert_eq!(
-        terminal.backend().buffer()[(2, marker_row as u16)].bg,
-        crate::theme::COLOR_ASSISTANT_BG,
-        "卡片底色应铺到正文区左边界"
+        terminal.backend().buffer()[(0, marker_row as u16)].bg,
+        Color::Reset,
+        "第 0 列不应属于留白"
     );
     let footer_row = rows.last().expect("底栏应存在");
-    // 底栏不再有品牌前缀，仍必须与正文左对齐，不能留缩进。
+    // 底栏不再有品牌前缀，仍必须从终端第 1 列开始，不能留缩进。
     assert!(
         !footer_row.starts_with(' '),
-        "底栏应与正文左对齐：{footer_row:?}"
+        "底栏应从第 1 列开始：{footer_row:?}"
+    );
+    // 输入盒边框铺满整行：不再有左右边框，上下两条边框直接贴住左右边缘。
+    let prompt_row = rows
+        .iter()
+        .position(|row| row.starts_with('─'))
+        .expect("应展示输入盒上边框");
+    assert!(
+        rows[prompt_row].starts_with('─') && rows[prompt_row].trim_end().ends_with('─'),
+        "输入盒应铺满整行：{:?}",
+        rows[prompt_row]
+    );
+}
+
+/// 连续的工具结果之间留一行空白：两次调用的输出不再连成一片。
+#[test]
+fn consecutive_tool_results_are_separated_by_a_blank_row() {
+    let width = 80;
+    let backend = TestBackend::new(width, 24);
+    let mut terminal = Terminal::new(backend).expect("创建工具间距测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    for (id, command) in [("call-a", "cargo build"), ("call-b", "cargo test")] {
+        let mut tool = Msg::tool_started(ToolCall::new(id, "shell", json!({ "command": command })));
+        tool.append_tool_output("done\n");
+        app.messages.push(tool);
+    }
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染工具间距");
+    let rows = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(usize::from(width))
+        .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>();
+
+    let first = rows
+        .iter()
+        .position(|row| row.contains("cargo build"))
+        .expect("应展示第一次调用");
+    let second = rows
+        .iter()
+        .position(|row| row.contains("cargo test"))
+        .expect("应展示第二次调用");
+    assert!(second > first + 1, "两次调用之间应隔一行：{rows:?}");
+    assert!(
+        rows[second - 1].trim().is_empty(),
+        "两次调用之间应是空行：{rows:?}"
     );
 }
 
@@ -422,10 +634,7 @@ fn prompt_is_separated_from_log_by_blank_row() {
         .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
         .collect::<Vec<_>>();
 
-    let border_row = rows
-        .iter()
-        .position(|row| row.contains('╭'))
-        .expect("输入盒上边框应存在");
+    let border_row = prompt_border_row(&rows);
     assert!(border_row >= 2, "{rows:?}");
     assert_eq!(
         rows[border_row - 1].trim(),
@@ -435,6 +644,207 @@ fn prompt_is_separated_from_log_by_blank_row() {
     assert!(
         !rows[border_row - 2].trim().is_empty(),
         "留白只占一行，再往上应仍有内容：{rows:?}"
+    );
+}
+
+/// 输入框只保留上下两条边框：没有左右竖线，也没有圆角。
+#[test]
+fn prompt_box_has_only_horizontal_borders() {
+    let width = 60;
+    let backend = TestBackend::new(width, 16);
+    let mut terminal = Terminal::new(backend).expect("创建输入框边框测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染输入框边框");
+    let rows = buffer_rows(&terminal, width);
+
+    for corner in ['╭', '╮', '╰', '╯', '│'] {
+        assert!(
+            !rows.iter().any(|row| row.contains(corner)),
+            "输入框不应再出现 `{corner}`：{rows:?}"
+        );
+    }
+
+    // 上下两条边框都是一整排横线，直接铺满左右边缘。
+    let border_rows: Vec<&String> = rows
+        .iter()
+        .filter(|row| row.starts_with('─') && row.ends_with('─'))
+        .collect();
+    assert_eq!(border_rows.len(), 2, "应只有上下两条边框：{rows:?}");
+    assert!(
+        border_rows
+            .iter()
+            .all(|row| row.chars().filter(|c| *c == '─').count() > usize::from(width / 2)),
+        "边框应铺满整行：{rows:?}"
+    );
+}
+
+/// 长文本在输入框内自动折行，框高随之增长而不是把尾部挤出屏幕。
+#[test]
+fn long_prompt_wraps_instead_of_scrolling() {
+    let width = 40;
+    let backend = TestBackend::new(width, 20);
+    let mut terminal = Terminal::new(backend).expect("创建长文本折行终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    // 不含空格的长词：折行只能按字符硬断，拼接结果必须与输入完全一致，才能证明
+    // 尾部没有被截断。内容宽度为 38 列，因此正好折成两行。
+    let token: String = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN"
+        .chars()
+        .take(50)
+        .collect();
+    app.input = token.clone();
+    app.cursor = app.input.len();
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染长文本折行");
+    let rows = buffer_rows(&terminal, width);
+
+    let content_row = rows
+        .iter()
+        .position(|row| row.starts_with("› "))
+        .expect("输入框内容行应存在");
+    // 逐个内容行剥掉提示符与续行缩进，拼回来必须还原原始输入。
+    let mut restored = String::new();
+    for row in &rows[content_row..] {
+        if row.starts_with('─') {
+            break;
+        }
+        let body = row.strip_prefix("› ").or_else(|| row.strip_prefix("  "));
+        restored.push_str(body.unwrap_or(row).trim_end());
+    }
+    assert_eq!(restored, token, "折行不得丢字符：{rows:?}");
+    assert_eq!(
+        rows[content_row..]
+            .iter()
+            .take_while(|row| !row.starts_with('─'))
+            .count(),
+        2,
+        "50 列内容应折成两行：{rows:?}"
+    );
+}
+
+/// 光标跟随折行后的视觉行：长文本行尾的光标落在最后一个内容行。
+#[test]
+fn long_prompt_cursor_follows_wrapped_row() {
+    let width = 40;
+    let backend = TestBackend::new(width, 20);
+    let mut terminal = Terminal::new(backend).expect("创建折行光标终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let token: String = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN".into();
+    app.input = token.clone();
+    app.cursor = app.input.len();
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染折行光标");
+    let rows = buffer_rows(&terminal, width);
+    let content_row = rows
+        .iter()
+        .position(|row| row.starts_with("› "))
+        .expect("输入框内容行应存在");
+
+    let cursor = terminal.get_cursor_position().expect("读取光标位置");
+    assert_eq!(
+        cursor.y,
+        u16::try_from(content_row + 1).expect("内容行号应可转换"),
+        "光标应落到第二个内容行：{rows:?}"
+    );
+    // 内容从区域左边界起算，「› 」占两列，第二行承载剩余的 12 个字符。
+    assert_eq!(cursor.x, 2 + 12, "光标列应跟随折行后的列偏移");
+}
+
+/// 发送后输入框必须清空并回到占位提示，不能留下上一帧的草稿。
+///
+/// 断言只看输入框内容行：发送的正文会出现在消息区，因此整屏文本里当然还能找到它，
+/// 真正要保证的是输入区自己没有残留。缓冲里宽字符的第二格是空白占位，
+/// 因此比较前先去掉所有空白。
+#[tokio::test]
+async fn sending_clears_prompt_back_to_placeholder() {
+    let width = 50;
+    let backend = TestBackend::new(width, 20);
+    let mut terminal = Terminal::new(backend).expect("创建发送清空测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    let draft = "确认发送后会残留草稿";
+
+    app.input = draft.into();
+    app.cursor = app.input.len();
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染发送前草稿");
+    let rows = buffer_rows(&terminal, width);
+    let content = rows
+        .iter()
+        .find(|row| row.starts_with("› "))
+        .expect("输入框内容行应存在");
+    assert!(
+        compact(content).contains(&compact(draft)),
+        "发送前输入框应显示草稿：{content:?}"
+    );
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
+
+    assert!(app.input.is_empty(), "发送后必须清空输入");
+    assert_eq!(app.cursor, 0, "光标应回到行首");
+    assert!(app.attachments.is_empty());
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染发送后输入框");
+    let rows = buffer_rows(&terminal, width);
+    let content = rows
+        .iter()
+        .find(|row| row.starts_with("› "))
+        .expect("输入框内容行应存在");
+    assert!(
+        content.contains("Message Lucia...") || content.contains("Steer the current run..."),
+        "输入框应回到占位提示：{content:?}"
+    );
+    assert!(
+        !compact(content).contains(&compact(draft)),
+        "输入框不得残留已发送的草稿：{content:?}"
+    );
+}
+
+/// 长草稿发送后输入盒收缩回单行，不能保留折行撑开的高度。
+#[tokio::test]
+async fn sending_collapses_wrapped_prompt_back_to_one_row() {
+    let width = 40;
+    let backend = TestBackend::new(width, 20);
+    let mut terminal = Terminal::new(backend).expect("创建发送收缩测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    // 50 列内容在 38 列里必然折成两行。
+    app.input = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN".into();
+    app.cursor = app.input.len();
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染折行草稿");
+    let rows = buffer_rows(&terminal, width);
+    assert_eq!(
+        prompt_content_rows(&rows, width),
+        2,
+        "50 列草稿应折成两行：{rows:?}"
+    );
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染发送后输入框");
+    let rows = buffer_rows(&terminal, width);
+    assert_eq!(
+        prompt_content_rows(&rows, width),
+        1,
+        "发送后输入盒应收缩为一行：{rows:?}"
     );
 }
 
@@ -602,17 +1012,56 @@ fn buffer_rows(terminal: &Terminal<TestBackend>, width: u16) -> Vec<String> {
         .collect()
 }
 
-/// 返回输入盒上边框所在行；边框圆角是唯一可靠的定位锚点。
+/// 定位输入盒上边框所在行。
+///
+/// 输入盒只保留上下两条边框，两行都是一整排 `─`，因此不能按边框字符判断方向；
+/// 改用内容行的「› 」提示符做锚点：上边框就在首个内容行的上一行。
 fn prompt_border_row(rows: &[String]) -> usize {
-    rows.iter()
-        .position(|row| row.contains('╭'))
-        .expect("输入盒上边框应存在")
+    let content = rows
+        .iter()
+        .position(|row| row.starts_with("› "))
+        .expect("输入盒内容行应存在");
+    content.saturating_sub(1)
 }
 
-/// 验证运行状态（含耗时与停止提示）落在输入框边框上，日志区不再重复输出，
+/// 定位输入框上方那行固定状态行：跳过排队消息面板后紧贴输入盒上边框的上一行。
+fn status_row(rows: &[String]) -> usize {
+    let mut row = prompt_border_row(rows);
+    while row > 0 && matches!(rows[row - 1].trim_start().chars().next(), Some('↳' | '▸')) {
+        row -= 1;
+    }
+    row.saturating_sub(1)
+}
+
+/// 统计输入盒里有几行内容：从「› 」行起，直到下一条横边框为止。
+///
+/// 两条边框都是纯框线，但仍然只认"横线占满大半行"的那两行，避免把正文里偶然
+/// 以 `─` 开头的行误判成边框。
+fn prompt_content_rows(rows: &[String], width: u16) -> usize {
+    let threshold = usize::from(width / 2);
+    let is_border =
+        |row: &String| row.chars().filter(|character| *character == '─').count() > threshold;
+    let start = rows
+        .iter()
+        .position(|row| row.starts_with("› "))
+        .expect("输入盒内容行应存在");
+    rows[start..]
+        .iter()
+        .take_while(|row| !is_border(row))
+        .count()
+}
+
+/// 去掉所有空白，用于比较被宽字符占位拆开的行文本。
+fn compact(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+/// 验证运行状态（含耗时与停止提示）只落在输入框上方的状态行，日志区与边框都不重复输出，
 /// 同时窄终端仍隐藏工作目录。
 #[test]
-fn running_activity_renders_on_prompt_border_only() {
+fn running_activity_renders_on_the_fixed_status_row_only() {
     let width = 60;
     let backend = TestBackend::new(width, 16);
     let mut terminal = Terminal::new(backend).expect("创建运行状态测试终端");
@@ -629,18 +1078,27 @@ fn running_activity_renders_on_prompt_border_only() {
         .draw(|frame| render_root(frame, &mut app))
         .expect("渲染运行状态");
     let rows = buffer_rows(&terminal, width);
-    let border_row = prompt_border_row(&rows);
-    let title = &rows[border_row];
+    let status = status_row(&rows);
+    let text = &rows[status];
 
-    assert!(title.contains("Working"), "{title:?}");
-    assert!(title.contains("Esc to stop"), "{title:?}");
-    // 标题与边框之间必须留出空隙，否则状态会贴着圆角。
-    assert!(title.contains(" Working"), "{title:?}");
+    assert!(text.contains("Working"), "{text:?}");
+    assert!(text.contains("Esc to stop"), "{text:?}");
+    // 状态从第 1 列开始，与正文左边界共线：行首是动画星号而不是空格。
+    let first = text.chars().next().expect("状态行不应为空");
+    assert!("✳✶✷✸✹✺✻✼".contains(first), "{text:?}");
     assert!(
-        rows[..border_row]
+        rows[..status]
             .iter()
             .all(|row| !row.contains("Working") && !row.contains("Esc to stop")),
         "日志区不再输出活动状态：{rows:?}"
+    );
+    // 输入盒边框保持纯框线：状态不再占用边框标题。
+    let border = &rows[prompt_border_row(&rows)];
+    assert!(
+        border
+            .chars()
+            .all(|character| character == '─' || character == ' '),
+        "边框不应带状态标题：{border:?}"
     );
     let text: String = rows
         .concat()
@@ -651,14 +1109,14 @@ fn running_activity_renders_on_prompt_border_only() {
     assert!(!text.contains("ascnet-lucia"), "{text:?}");
 }
 
-/// 输入框边框标题中某个片段的单元格颜色，用于验证语义配色。
-fn border_title_color(terminal: &Terminal<TestBackend>, rows: &[String], needle: &str) -> Color {
-    let row = prompt_border_row(rows);
-    let x = rows[row].find(needle).expect("标题片段应存在") as u16;
+/// 状态行中某个片段的单元格颜色，用于验证语义配色。
+fn status_text_color(terminal: &Terminal<TestBackend>, rows: &[String], needle: &str) -> Color {
+    let row = status_row(rows);
+    let x = rows[row].find(needle).expect("状态片段应存在") as u16;
     terminal.backend().buffer()[(x, row as u16)].fg
 }
 
-/// 后台上下文压缩不需要 Agent 运行中：标题显示调用方标签，且不出现运行态尾巴。
+/// 后台上下文压缩不需要 Agent 运行中：状态行显示调用方标签，且不出现运行态尾巴。
 #[test]
 fn maintenance_activity_shows_label_without_run_suffix() {
     let width = 60;
@@ -672,16 +1130,16 @@ fn maintenance_activity_shows_label_without_run_suffix() {
         .draw(|frame| render_root(frame, &mut app))
         .expect("渲染维护状态");
     let rows = buffer_rows(&terminal, width);
-    let title = &rows[prompt_border_row(&rows)];
+    let status = &rows[status_row(&rows)];
 
-    assert!(title.contains("Compacting context"), "{title:?}");
+    assert!(status.contains("Compacting context"), "{status:?}");
     assert!(
-        !title.contains("Esc to stop"),
-        "压缩不是可中断的 Agent 运行：{title:?}"
+        !status.contains("Esc to stop"),
+        "压缩不是可中断的 Agent 运行：{status:?}"
     );
 }
 
-/// 动画帧随 UI tick 推进：相邻两格必须给出不同的星号，否则标题是死画面。
+/// 动画帧随 UI tick 推进：相邻两格必须给出不同的星号，否则状态行是死画面。
 #[test]
 fn activity_spark_advances_with_tick() {
     let width = 60;
@@ -698,15 +1156,15 @@ fn activity_spark_advances_with_tick() {
             .draw(|frame| render_root(frame, &mut app))
             .expect("渲染动画帧");
         let rows = buffer_rows(&terminal, width);
-        let title = rows[prompt_border_row(&rows)].clone();
-        assert!(title.contains("Thinking"), "{title:?}");
-        frames.push(title);
+        let status = rows[status_row(&rows)].clone();
+        assert!(status.contains("Thinking"), "{status:?}");
+        frames.push(status);
     }
 
-    assert_ne!(frames[0], frames[1], "两帧标题应不同：{frames:?}");
+    assert_ne!(frames[0], frames[1], "两帧状态应不同：{frames:?}");
 }
 
-/// 超过一分钟的耗时折算成 `1m05s`，避免标题随秒数无限变宽。
+/// 超过一分钟的耗时折算成 `1m05s`，避免状态行随秒数无限变宽。
 #[test]
 fn activity_elapsed_switches_to_minutes() {
     let width = 60;
@@ -720,46 +1178,50 @@ fn activity_elapsed_switches_to_minutes() {
         .draw(|frame| render_root(frame, &mut app))
         .expect("渲染耗时状态");
     let rows = buffer_rows(&terminal, width);
-    let title = &rows[prompt_border_row(&rows)];
+    let status = &rows[status_row(&rows)];
 
-    assert!(title.contains("2m05s"), "{title:?}");
+    assert!(status.contains("2m05s"), "{status:?}");
 }
 
-/// 边框变窄时标题先按宽度截断，窄到只剩碎片则整体隐藏，始终保持纯框线或可读标题。
+/// 变窄时状态先按宽度截断，窄到只剩碎片则整段隐藏，保持一行留白或只显示跳转提示。
 #[test]
-fn activity_title_degrades_on_narrow_borders() {
+fn activity_status_degrades_on_narrow_rows() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.running = true;
     app.run_started_at = Some(std::time::Instant::now());
 
-    // 中等宽度：标题放不下完整文案，按显示宽度截断并留下省略号。
+    // 中等宽度：状态放不下完整文案，按显示宽度截断并留下省略号。
     let width = 24;
-    let mut terminal = Terminal::new(TestBackend::new(width, 16)).expect("创建窄边框测试终端");
+    let mut terminal = Terminal::new(TestBackend::new(width, 16)).expect("创建窄状态行测试终端");
     terminal
         .draw(|frame| render_root(frame, &mut app))
-        .expect("渲染窄边框");
+        .expect("渲染窄状态行");
     let rows = buffer_rows(&terminal, width);
-    let title = &rows[prompt_border_row(&rows)];
-    assert!(title.contains('…'), "窄边框应截断而不是撑破边框：{title:?}");
-
-    // 极窄宽度：可用宽度不足一行有意义的文字，标题整体隐藏。
-    let width = 14;
-    let mut terminal = Terminal::new(TestBackend::new(width, 16)).expect("创建极窄边框测试终端");
-    terminal
-        .draw(|frame| render_root(frame, &mut app))
-        .expect("渲染极窄边框");
-    let rows = buffer_rows(&terminal, width);
-    let title = &rows[prompt_border_row(&rows)];
+    let status = &rows[status_row(&rows)];
     assert!(
-        title
+        status.contains('…'),
+        "窄状态行应截断而不是撑破行宽：{status:?}"
+    );
+
+    // 极窄宽度：可用宽度不足一行有意义的文字，状态整段隐藏，边框仍是纯框线。
+    let width = 10;
+    let mut terminal = Terminal::new(TestBackend::new(width, 16)).expect("创建极窄状态行测试终端");
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染极窄状态行");
+    let rows = buffer_rows(&terminal, width);
+    assert_eq!(rows[status_row(&rows)].trim(), "", "过窄时状态行应保持留白");
+    let border = &rows[prompt_border_row(&rows)];
+    assert!(
+        border
             .chars()
-            .all(|character| character == ' ' || "╭╮╰╯─│".contains(character)),
-        "过窄时不应绘制标题：{title:?}"
+            .all(|character| character == '─' || character == ' '),
+        "边框只应有框线：{border:?}"
     );
 }
 
-/// 工具执行期间底栏只显示通用运行状态，不暴露工具名、命令或单次调用计时。
+/// 工具执行期间状态行只显示通用运行状态，不暴露工具名、命令或单次调用计时。
 #[test]
 fn tool_activity_falls_back_to_generic_working_title() {
     let width = 72;
@@ -779,27 +1241,27 @@ fn tool_activity_falls_back_to_generic_working_title() {
         .draw(|frame| render_root(frame, &mut app))
         .expect("渲染工具状态");
     let rows = buffer_rows(&terminal, width);
-    let title = &rows[prompt_border_row(&rows)];
+    let status = &rows[status_row(&rows)];
 
-    assert!(title.contains("Working"), "{title:?}");
-    assert!(title.contains("Esc to stop"), "{title:?}");
-    // 工具名、命令与思考文案都不该出现在底栏。
-    assert!(!title.contains("Shell"), "{title:?}");
-    assert!(!title.contains("cargo test"), "{title:?}");
-    assert!(!title.contains("Thinking"), "{title:?}");
+    assert!(status.contains("Working"), "{status:?}");
+    assert!(status.contains("Esc to stop"), "{status:?}");
+    // 工具名、命令与思考文案都不该出现在状态行。
+    assert!(!status.contains("Shell"), "{status:?}");
+    assert!(!status.contains("cargo test"), "{status:?}");
+    assert!(!status.contains("Thinking"), "{status:?}");
     assert_eq!(
-        border_title_color(&terminal, &rows, "Working"),
+        status_text_color(&terminal, &rows, "Working"),
         crate::theme::COLOR_WARNING,
-        "通用运行状态使用警示色：{title:?}"
+        "通用运行状态使用警示色：{status:?}"
     );
-    // 工具结果仍然落在主内容区，只是不再进底栏。
-    let transcript = rows[..prompt_border_row(&rows)].concat();
+    // 工具结果仍然落在主内容区，只是不再进状态行。
+    let transcript = rows[..status_row(&rows)].concat();
     assert!(transcript.contains("Shell(cargo test)"), "{transcript:?}");
 }
 
-/// 空闲时输入框上边框不带任何标题，保持干净。
+/// 空闲时状态行与输入框边框都保持干净：边框是纯框线，上方只剩留白。
 #[test]
-fn idle_prompt_border_has_no_title() {
+fn idle_status_row_and_prompt_border_are_blank() {
     let width = 60;
     let backend = TestBackend::new(width, 16);
     let mut terminal = Terminal::new(backend).expect("创建空闲状态测试终端");
@@ -814,17 +1276,19 @@ fn idle_prompt_border_has_no_title() {
         .draw(|frame| render_root(frame, &mut app))
         .expect("渲染空闲状态");
     let rows = buffer_rows(&terminal, width);
-    let border_row = &rows[prompt_border_row(&rows)];
+    let status = &rows[status_row(&rows)];
+    let border = &rows[prompt_border_row(&rows)];
 
+    assert_eq!(status.trim(), "", "空闲时状态行不应有内容：{status:?}");
     assert!(
-        border_row
+        border
             .chars()
-            .all(|character| character == ' ' || "╭╮╰╯─│".contains(character)),
-        "空闲时边框只应有框线字符：{border_row:?}"
+            .all(|character| character == '─' || character == ' '),
+        "空闲时边框只应有框线：{border:?}"
     );
 }
 
-/// 活动状态只取唯一最高优先级的一项，供边框标题直接使用。
+/// 活动状态只取唯一最高优先级的一项，供状态行直接使用。
 #[test]
 fn prompt_activity_reports_single_highest_priority_state() {
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -879,6 +1343,85 @@ fn prompt_activity_reports_single_highest_priority_state() {
     );
 }
 
+/// 待发送消息显示在输入框上方，并登记可点击的编辑热区。
+#[test]
+fn queued_messages_render_above_input() {
+    let width = 80;
+    let mut terminal = Terminal::new(TestBackend::new(width, 20)).expect("创建排队渲染终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.queued_inputs.push_back("第一条排队消息".into());
+    app.queued_inputs.push_back("第二条排队消息".into());
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染排队消息");
+
+    let rows = buffer_rows(&terminal, width);
+    let border = prompt_border_row(&rows);
+    // 宽字符在缓冲区里占两格，去掉填充空格后再比对文本。
+    let first = rows[border - 2].replace(' ', "");
+    let second = rows[border - 1].replace(' ', "");
+    assert!(
+        first.contains("第一条排队消息"),
+        "第一条应紧贴输入框上方的可视区顶部：{:?}",
+        &rows[border - 3..=border]
+    );
+    assert!(
+        second.contains("第二条排队消息"),
+        "第二条应在输入框正上方：{:?}",
+        &rows[border - 3..=border]
+    );
+    assert_eq!(app.queued_input_areas.len(), 2);
+    assert_eq!(app.queued_input_areas[0].1.y, (border - 2) as u16);
+    assert_eq!(app.queued_input_areas[1].1.y, (border - 1) as u16);
+}
+
+/// 排队面板聚焦时高亮选中行；超过可视高度时窗口跟随选择滚动。
+#[test]
+fn queue_focus_highlights_selection_and_scrolls() {
+    let width = 80;
+    let mut terminal = Terminal::new(TestBackend::new(width, 20)).expect("创建排队焦点终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.queued_inputs = VecDeque::from([
+        "第一条".into(),
+        "第二条".into(),
+        "第三条".into(),
+        "第四条".into(),
+    ]);
+    app.queue_focus = Some(3);
+
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染排队焦点");
+
+    let rows = buffer_rows(&terminal, width);
+    let border = prompt_border_row(&rows);
+    let visible: Vec<String> = (border - 3..border)
+        .map(|row| rows[row].replace(' ', ""))
+        .collect();
+    // 面板高度 3；选中第 4 条时窗口滚到第 2~4 条，最后一行带选中标记。
+    assert!(visible[0].contains("2.第二条"), "{visible:?}");
+    assert!(visible[1].contains("3.第三条"), "{visible:?}");
+    assert!(
+        visible[2].contains("▸4.第四条"),
+        "选中行应有 `▸` 标记：{visible:?}"
+    );
+    assert_eq!(
+        app.queued_input_areas
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    let status = rows[status_row(&rows)].replace(' ', "");
+    assert!(
+        status.contains("Queue4/4"),
+        "状态行应显示队列位置：{status:?}"
+    );
+}
+
 /// 思考阶段只显示状态文案，不渲染服务商返回的推理摘要文本。
 #[test]
 fn render_hides_reasoning_text_and_shows_thinking_status() {
@@ -895,19 +1438,19 @@ fn render_hides_reasoning_text_and_shows_thinking_status() {
         .draw(|frame| render_root(frame, &mut app))
         .expect("渲染思考阶段");
     let rows = buffer_rows(&terminal, 80);
-    let border_row = prompt_border_row(&rows);
-    let title = &rows[border_row];
-    assert!(title.contains("Thinking"), "{title:?}");
-    assert!(title.contains("Esc to stop"), "{title:?}");
-    assert!(!title.contains("Working"), "{title:?}");
+    let row = status_row(&rows);
+    let status = &rows[row];
+    assert!(status.contains("Thinking"), "{status:?}");
+    assert!(status.contains("Esc to stop"), "{status:?}");
+    assert!(!status.contains("Working"), "{status:?}");
     // 推理摘要文本不得进入任何一行，包括状态行与正文。
     let text = rows.concat();
     assert!(!text.contains("thinking("), "{text:?}");
-    assert!(
-        rows[..border_row]
-            .iter()
-            .all(|row| !row.contains("Thinking")),
-        "思考状态只应出现在输入框边框：{rows:?}"
+    // 思考状态只出现在这一行：日志区与输入盒边框都不重复。
+    assert_eq!(
+        rows.iter().filter(|row| row.contains("Thinking")).count(),
+        1,
+        "思考状态只应出现在状态行：{rows:?}"
     );
 }
 
@@ -1010,12 +1553,12 @@ fn tool_lines_accept_empty_result() {
     assert!(!text.contains("null"), "{text:?}");
 }
 
-/// 同一工具组内紧凑排列；组结束后与后续回复之间保留一行空行。
+/// 相邻工具结果之间、工具组与后续回复之间都保留一行空行。
 ///
-/// 工具组内的连续调用属于同一次动作，插入空行会把一次动作拆散；组与助手正文之间
-/// 则是不同逻辑模块，必须留白，否则 Shell 输出与随后的分析会糊成一片。
+/// 每次调用都带一段自己的输出，紧贴着排会让人分不清哪几行属于哪一次调用；工具组与
+/// 助手正文之间同样要留白，否则 Shell 输出与随后的分析会糊成一片。
 #[test]
-fn tool_group_keeps_compact_rows_and_blank_line_before_reply() {
+fn tool_results_are_separated_by_blank_rows() {
     let backend = TestBackend::new(80, 18);
     let mut terminal = Terminal::new(backend).expect("创建工具组间距测试终端");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -1049,7 +1592,8 @@ fn tool_group_keeps_compact_rows_and_blank_line_before_reply() {
         .expect("应展示工具组后的回复");
 
     assert_eq!(tool_rows.len(), 2, "{rows:?}");
-    assert_eq!(tool_rows[1], tool_rows[0] + 1, "{rows:?}");
+    assert_eq!(tool_rows[1], tool_rows[0] + 2, "{rows:?}");
+    assert_eq!(rows[tool_rows[0] + 1].trim(), "", "{rows:?}");
     assert_eq!(reply_row, tool_rows[1] + 2, "{rows:?}");
     assert_eq!(rows[reply_row - 1].trim(), "", "{rows:?}");
 }
@@ -1345,10 +1889,10 @@ fn markdown_renders_emphasis_inside_the_answer_card() {
 
     let no_line_background = lines.iter().all(|line| line.style.bg.is_none());
     assert!(no_line_background);
-    let only_inline_code_paints = lines.iter().flat_map(|line| line.spans.iter()).all(|span| {
-        span.style.bg.is_none() || span.style.bg == Some(crate::theme::COLOR_INLINE_CODE_BG)
-    });
-    assert!(only_inline_code_paints);
+    assert!(lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .all(|span| span.style.bg.is_none()));
 
     let heading = lines
         .iter()
@@ -1371,9 +1915,9 @@ fn markdown_renders_emphasis_inside_the_answer_card() {
     assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
 }
 
-/// 回答卡片左侧留两列内边距，右侧留白交给整块底色。
+/// 回答卡片的 `●` 与用户消息的 `▌` 同列，右侧留白交给整块底色。
 #[test]
-fn assistant_card_indents_and_leaves_room_on_the_right() {
+fn assistant_card_aligns_with_the_user_marker_and_leaves_room_on_the_right() {
     let width = 60;
     let lines = markdown_lines("卡片正文", false, width);
     let body = lines
@@ -1385,14 +1929,14 @@ fn assistant_card_indents_and_leaves_room_on_the_right() {
         })
         .expect("应包含正文行");
 
-    assert_eq!(body.spans[0].content, "  ", "左侧应有两列内边距");
+    assert_eq!(body.spans[0].content, "● ", "标记应贴住第一列");
     assert_eq!(
         body.spans[0].style.bg, None,
-        "内边距不自己铺色：底色由卡片矩形统一铺出"
+        "标记不自己铺色：底色由卡片矩形统一铺出"
     );
-    // 卡片宽度 = 60，左右内边距各两列、消息标记两列，正文最多排到第 54 列。
+    // 卡片宽度 = 60，标记两列 + 右侧留白两列，正文最多排到第 58 列。
     assert!(
-        body.width() <= usize::from(width) - 4,
+        body.width() <= usize::from(width) - crate::ui::markdown::CARD_PADDING,
         "正文不应顶到卡片右边缘：{}",
         body.width()
     );
@@ -1474,7 +2018,7 @@ fn table_columns_expand_with_available_width() {
     );
 }
 
-/// 行内代码去掉反引号、改用代码色，并带一层与代码块同族的标签底色。
+/// 行内代码去掉反引号、改用代码色，并保持与正文一致的背景。
 #[test]
 fn inline_code_drops_backticks_and_gains_chip_background() {
     let lines = markdown_lines("调用 `convert_input_path_to_attachment` 转换", false, 80);
@@ -1491,11 +2035,7 @@ fn inline_code_drops_backticks_and_gains_chip_background() {
         .find(|span| span.content.as_ref() == "convert_input_path_to_attachment")
         .expect("应包含行内代码片段");
     assert_eq!(span.style.fg, Some(crate::theme::COLOR_CODE));
-    assert_eq!(
-        span.style.bg,
-        Some(crate::theme::COLOR_INLINE_CODE_BG),
-        "行内代码应带标签底色"
-    );
+    assert_eq!(span.style.bg, None, "行内代码不应铺背景色");
 }
 
 /// 标题不再输出字面 `#`：层级靠标记块形状与文字权重区分。
@@ -1537,13 +2077,13 @@ fn markdown_lists_use_bullets_with_hanging_indent() {
     let rows = line_texts(&lines);
     let text = rows.join("\n");
 
-    // 卡片内边距两列 + 行首标记两列，圆点正文从第五列开始。
-    assert!(rows[0].starts_with("  ● • 第一项"), "{text:?}");
+    // 行首标记两列，圆点正文从第三列开始。
+    assert!(rows[0].starts_with("● • 第一项"), "{text:?}");
     assert!(!text.contains("- 第一项"), "列表标记不应残留字面 `- `");
     let continuation = rows.get(1).expect("第一项应折行产生续行").clone();
-    // 卡片内边距两列 + 消息前缀两列 + 悬挂缩进两列，正文从第七列开始。
-    assert!(continuation.starts_with("      "), "{text:?}");
-    assert!(!continuation.starts_with("       "), "{text:?}");
+    // 消息前缀两列 + 悬挂缩进两列，正文从第五列开始。
+    assert!(continuation.starts_with("    "), "{text:?}");
+    assert!(!continuation.starts_with("     "), "{text:?}");
     assert!(rows.iter().any(|row| row.contains("• 第二项")), "{text:?}");
 }
 
@@ -1935,12 +2475,12 @@ fn context_status_uses_configured_window_thresholds() {
     );
 }
 
-/// 工具正文紧贴标题下的工具名：内容区只缩进两列，代码与日志因此多出可用宽度。
+/// 工具正文与标题行里的工具名同列：`● ` 之后是工具名，正文从同一列开始。
 ///
-/// 工具块是"背景信息"，缩进再宽会直接吃掉长命令行与代码行的可见列数；这里锁定
-/// 「正文起始列 == 标题行工具名起始列」，缩进一旦被改回去就会失败。
+/// 工具块是从属这次调用的背景信息，与标题同列才看得出归属；缩进同时只有两列，长命令行
+/// 与代码行在窄终端里不至于提前折行。缩进被去掉或加宽都会让这条断言失败。
 #[test]
-fn tool_output_is_indented_under_its_title() {
+fn tool_output_aligns_with_its_title() {
     let width = 80;
     let backend = TestBackend::new(width, 20);
     let mut terminal = Terminal::new(backend).expect("创建工具缩进测试终端");
@@ -1967,7 +2507,7 @@ fn tool_output_is_indented_under_its_title() {
         .position(|row| row.contains("cargo build --release"))
         .expect("应展示工具输出");
 
-    // 主内容区左侧留白两列，标题的 `● ` 之后就是工具名；正文与之同列。
+    // 主内容区不再留左右边距：标题从终端第 1 列画 `●`，工具名紧随其后。
     // `find` 给的是字节偏移，`●` 占 3 字节，因此按显示宽度重新算列号。
     let column = |row: &str, needle: &str| {
         let prefix = &row[..row.find(needle).expect("应包含目标文本")];
@@ -1975,7 +2515,7 @@ fn tool_output_is_indented_under_its_title() {
     };
     let title_column = column(&rows[title], "Shell(cargo build)");
     let output_column = column(&rows[output], "cargo build --release");
-    assert_eq!(title_column, 4, "工具名应从第四列开始：{:?}", rows[title]);
+    assert_eq!(title_column, 2, "工具名应紧跟标记列：{:?}", rows[title]);
     assert_eq!(
         output_column, title_column,
         "工具正文应与工具名同列：{:?} / {:?}",
@@ -2058,22 +2598,264 @@ fn shrinking_window_clears_stale_scrollbar_safely() {
     }
 }
 
-/// 终端比对话框的设计下限还小时，会话对话框仍要落在画布内而不是越界清屏。
+/// 会话搜索面板画在输入框上方，并随终端缩小一起收进画布而不会越界清屏。
 #[test]
-fn session_dialog_survives_tiny_terminal() {
-    use crate::command::{NativeSessionDialog, NativeSessionDialogMode, NativeSessionDialogStatus};
+fn session_palette_renders_inline_and_survives_tiny_terminal() {
+    use crate::command::{
+        NativeSessionEntry, NativeSessionPalette, NativeSessionPaletteMode,
+        NativeSessionPaletteStatus,
+    };
+    use agent_session::SessionSummary;
 
-    for (width, height) in [(1u16, 1u16), (8, 4), (19, 5), (20, 6), (88, 24)] {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut app = App::new(tx, "测试模型".into());
-        app.messages
-            .push(Msg::new(MsgKind::Assistant, "正文".to_string()));
-        app.native_command.dialog = Some(NativeSessionDialog {
-            mode: NativeSessionDialogMode::Resume,
-            selected: 0,
-            status: NativeSessionDialogStatus::Loading,
-        });
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    // 一条固定摘要供三种状态复用；`NativeSessionPaletteStatus` 不要求 `Clone`，
+    // 因此每轮都重新构造面板状态，只克隆不可变的摘要。
+    let summary = SessionSummary {
+        id: SessionId::new("inline-session").expect("创建测试会话标识"),
+        revision: 3,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        title: Some("内联面板会话".into()),
+        message_count: 5,
+    };
+    for status_index in 0..3 {
+        for (width, height) in [(1u16, 1u16), (8, 4), (19, 5), (20, 6), (80, 24)] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(tx, "测试模型".into());
+            app.messages
+                .push(Msg::new(MsgKind::Assistant, "正文".to_string()));
+            let status = match status_index {
+                0 => NativeSessionPaletteStatus::Loading,
+                1 => NativeSessionPaletteStatus::Error("磁盘读取失败".into()),
+                _ => NativeSessionPaletteStatus::Ready(vec![NativeSessionEntry::new(
+                    summary.clone(),
+                )]),
+            };
+            app.native_command.session_palette = Some(NativeSessionPalette {
+                mode: NativeSessionPaletteMode::Resume,
+                selected: 0,
+                status,
+            });
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        }
     }
+
+    // 面板占输入框上方的独立区域：标题、候选与按键提示都必须落在画布内。
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages
+        .push(Msg::new(MsgKind::Assistant, "正文".to_string()));
+    app.native_command.session_palette = Some(NativeSessionPalette {
+        mode: NativeSessionPaletteMode::Resume,
+        selected: 0,
+        status: NativeSessionPaletteStatus::Ready(vec![NativeSessionEntry::new(summary)]),
+    });
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    // 宽字符在缓冲区里各占两格，第二格是空白；比较前去掉空白才能匹配原生文本。
+    let compact: String = screen.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(compact.contains("恢复项目会话"), "screen={screen}");
+    assert!(compact.contains("内联面板会话"), "screen={screen}");
+    assert!(compact.contains("输入即搜索"), "screen={screen}");
+}
+
+/// 面板要把搜索命中与「当前会话」标出来：前者的作用是解释这条为什么被留下，
+/// 后者的作用是避免用户在候选里误选自己正在用的会话。
+#[test]
+fn session_palette_marks_current_session_and_search_hits() {
+    use crate::command::{
+        NativeSessionEntry, NativeSessionPalette, NativeSessionPaletteMode,
+        NativeSessionPaletteStatus,
+    };
+    use crate::theme::COLOR_PALETTE_COMMAND;
+    use agent_session::SessionSummary;
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages
+        .push(Msg::new(MsgKind::Assistant, "正文".to_string()));
+    // 当前会话本身也在候选里：它必须带标记，但不能被当成搜索命中高亮。
+    let current = SessionSummary {
+        id: app.session_record.id.clone(),
+        revision: 3,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        title: Some("clippy 告警清零".into()),
+        message_count: 5,
+    };
+    let other = SessionSummary {
+        id: SessionId::new("budget-plan").expect("创建测试会话标识"),
+        revision: 1,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        title: Some("预算规划".into()),
+        message_count: 2,
+    };
+    app.native_command.session_palette = Some(NativeSessionPalette {
+        mode: NativeSessionPaletteMode::Browse,
+        selected: 0,
+        status: NativeSessionPaletteStatus::Ready(vec![
+            NativeSessionEntry::new(current),
+            NativeSessionEntry::new(other),
+        ]),
+    });
+    // 检索词同时命中两条的检索文本（标题或稳定 ID），才能在一屏里同时校验高亮与否。
+    app.input = "p".into();
+    app.cursor = app.input.len();
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let screen: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+    // 宽字符各占两格、第二格是空白，比较前去掉空白才能匹配原生文本。
+    let compact: String = screen.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(compact.contains("当前"), "当前会话应有标记：{screen}");
+
+    // 中文按单元格查样式要跨过宽字符的第二格，因此先换算成单元格下标。
+    let cell_of = |needle: &str| {
+        let byte = screen
+            .find(needle)
+            .unwrap_or_else(|| panic!("应展示 {needle}：{screen}"));
+        screen[..byte].chars().count()
+    };
+    // 命中词按强调色显示；未命中的候选保持普通文字色，不能整行变强调色。
+    assert_eq!(
+        buffer.content()[cell_of("p")].style().fg,
+        Some(COLOR_PALETTE_COMMAND),
+        "命中词应使用强调色：{screen}"
+    );
+    assert_ne!(
+        buffer.content()[cell_of("预")].style().fg,
+        Some(COLOR_PALETTE_COMMAND),
+        "未命中的标题不应高亮：{screen}"
+    );
+}
+
+/// 临时视觉检查：打印不同宽度下的正文与表格排版。
+#[test]
+fn scratch_dump_widths() {
+    let table = "| 用例 | 耗时 | 结果 | 说明 |\n| --- | --- | --- | --- |\n| renders_a_very_long_test_case_name_without_breaking_the_columns_and_still_keeps_going | 1.2s | ok | 覆盖宽度限制移除后的排版 |\n| short | 3ms | ok | - |\n";
+    for width in [200u16, 120, 80] {
+        eprintln!("===== width {width} =====");
+        for line in markdown_lines(table, false, width) {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            eprintln!("[{:>3}] {text}", line.width());
+        }
+    }
+}
+
+/// 滑块位置必须跟着滚动位置走：滚到顶贴轨道顶端，滚到底贴轨道底端，中间线性移动。
+///
+/// 这条测试守住用户直接看到的现象——"滚动条钉在右下角不动"。滑块一旦退化成固定的一格，
+/// 或位置算错到永远贴底，这里会立刻失败。
+#[test]
+fn scrollbar_thumb_tracks_the_scroll_position() {
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages
+        .push(Msg::new(MsgKind::Assistant, "滑块跟随测试\n".repeat(200)));
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+
+    let area = app.scrollbar_area.expect("内容溢出时应显示滚动条");
+    let max_scroll = app.last_max_scroll;
+    assert!(max_scroll > 10, "测试数据应产生足够长的滚动区间");
+
+    // 读出滑块在轨道内的起止行（相对轨道顶端）。
+    let thumb_rows = |terminal: &Terminal<TestBackend>, area: Rect| -> (u16, u16) {
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<u16> = (0..area.height)
+            .filter(|offset| matches!(buffer[(area.x, area.y + offset)].symbol(), "█" | "▀" | "▄"))
+            .collect();
+        let start = rows.first().copied().expect("应能看到滑块");
+        let end = rows.last().copied().unwrap_or(start);
+        assert_eq!(
+            end - start + 1,
+            rows.len() as u16,
+            "滑块必须连续，不能断成两段"
+        );
+        (start, end)
+    };
+
+    app.scroll = Some(0);
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let (top_start, top_end) = thumb_rows(&terminal, area);
+    assert_eq!(top_start, 0, "滚到顶部时滑块应贴住轨道顶端");
+
+    app.scroll = Some(max_scroll);
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let (bottom_start, bottom_end) = thumb_rows(&terminal, area);
+    assert_eq!(bottom_end, area.height - 1, "滚到底部时滑块应贴住轨道底端");
+    assert!(
+        bottom_start > top_start,
+        "从顶部滚到底部，滑块必须真的移动：{top_start} -> {bottom_start}"
+    );
+
+    // 中间位置严格夹在两端之间，并且随滚动单调下移。
+    let mut previous = top_start;
+    for step in [max_scroll / 4, max_scroll / 2, max_scroll * 3 / 4] {
+        app.scroll = Some(step);
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        let (start, _) = thumb_rows(&terminal, area);
+        assert!(
+            start >= previous,
+            "滚动位置增大时滑块不能上移：{previous} -> {start}"
+        );
+        assert!(
+            start > top_start && start < bottom_start,
+            "中间滚动位置 {step} 的滑块应落在两端之间：{start}"
+        );
+        previous = start;
+    }
+    let _ = (top_end, bottom_start);
+}
+
+/// 长对话里滑块不能被"视口 / 总行数"压成一行——一格滑块看不出任何位置信息。
+#[test]
+fn scrollbar_thumb_keeps_a_visible_height_for_long_content() {
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.messages
+        .push(Msg::new(MsgKind::Assistant, "超长对话\n".repeat(4000)));
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+
+    let area = app.scrollbar_area.expect("内容溢出时应显示滚动条");
+    let buffer = terminal.backend().buffer();
+    // 滑块用整块与上下半块拼成；按半格计数才能同时覆盖"最小高度"和"半行精度"。
+    let mut thumb_half_cells = 0;
+    let mut thumb_rows = 0;
+    let mut track_rows = 0;
+    for offset in 0..area.height {
+        match buffer[(area.x, area.y + offset)].symbol() {
+            "█" => {
+                thumb_half_cells += 2;
+                thumb_rows += 1;
+            }
+            "▀" | "▄" => {
+                thumb_half_cells += 1;
+                thumb_rows += 1;
+            }
+            "│" => track_rows += 1,
+            other => panic!("滚动条列出现意外字符：{other:?}"),
+        }
+    }
+    assert_eq!(
+        thumb_half_cells,
+        usize::from(crate::ui::chat::SCROLLBAR_MIN_THUMB) * 2,
+        "比例算出的滑块低于下限时应补到最小高度"
+    );
+    // 轨道铺满整个内容区：除了滑块以外的每一行都必须是轨道字符。
+    assert_eq!(
+        thumb_rows + track_rows,
+        usize::from(area.height),
+        "轨道应铺满内容区高度，不留空洞"
+    );
 }

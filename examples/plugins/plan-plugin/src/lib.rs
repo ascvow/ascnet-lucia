@@ -993,7 +993,7 @@ mod tests {
             .render_ui(request(Some("session-a")))
             .expect("会话 A 应返回帧");
         assert!(own.visible);
-        assert!(own.lines[0].spans[0].text.contains("0/3 completed"));
+        assert!(own.lines[0].spans[0].text.contains("Plan  0/3 completed"));
 
         for session in [Some("session-b"), None] {
             let other = plugin

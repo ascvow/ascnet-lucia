@@ -68,6 +68,9 @@ impl ModelModality {
 
 #[derive(Deserialize)]
 struct ProviderRecord {
+    /// 服务商对外提供的 API 根地址；用于把配置里的 `base_url` 对到具体服务商。
+    #[serde(default)]
+    api: Option<String>,
     #[serde(default)]
     models: HashMap<String, ModelRecord>,
 }
@@ -108,14 +111,16 @@ struct ModelLimit {
 
 /// 从内置快照按模型 ID 读取能力，并优先使用指定的 models.dev 服务商消歧。
 ///
-/// 指定服务商未命中时会按模型 ID 扫描全部服务商；仅有唯一结果时返回该配置，重复 ID
-/// 必须通过 `models_dev_provider` 显式消歧。快照损坏时返回错误并阻止启动，避免打包
-/// 数据静默失效。输出上限超过 Core 的 `u32` 协议范围时忽略该字段。
+/// 指定服务商未命中时会先用 `base_url` 的主机名匹配服务商的 `api`，再按模型 ID 扫描
+/// 全部服务商；仅有唯一结果时返回该配置，重复 ID 必须通过 `models_dev_provider` 显式
+/// 消歧。快照损坏时返回错误并阻止启动，避免打包数据静默失效。输出上限超过 Core 的
+/// `u32` 协议范围时忽略该字段。
 pub(crate) fn find_model_metadata(
     provider_id: &str,
     model_id: &str,
+    base_url: Option<&str>,
 ) -> Result<Option<ModelMetadata>> {
-    find_model_metadata_in(MODELS_DEV_SNAPSHOT, provider_id, model_id)
+    find_model_metadata_in(MODELS_DEV_SNAPSHOT, provider_id, model_id, base_url)
 }
 
 /// 解析指定 JSON，供打包快照和测试夹具共用同一条严格读取路径。
@@ -123,6 +128,7 @@ fn find_model_metadata_in(
     snapshot: &str,
     provider_id: &str,
     model_id: &str,
+    base_url: Option<&str>,
 ) -> Result<Option<ModelMetadata>> {
     let providers: HashMap<String, ProviderRecord> =
         serde_json::from_str(snapshot).context("解析内置 models.dev 模型快照失败")?;
@@ -130,6 +136,11 @@ fn find_model_metadata_in(
         .get(provider_id)
         .and_then(|provider| provider.models.get(model_id));
     let model = if let Some(model) = exact {
+        model
+    } else if let Some(model) = base_url
+        .and_then(url_host)
+        .and_then(|host| model_of_provider_host(&providers, &host, model_id))
+    {
         model
     } else {
         let mut matches = providers
@@ -150,6 +161,43 @@ fn find_model_metadata_in(
         input_modalities: modalities(&model.modalities.input),
         output_modalities: modalities(&model.modalities.output),
     }))
+}
+
+/// 取出 URL 的主机名，用于把配置的 `base_url` 对到快照里服务商的 `api`。
+///
+/// 只比较主机名：协议、路径与端口都会变——配置常写 `https://api.deepseek.com/v1`，
+/// 快照里记的是 `https://api.deepseek.com`。
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = authority.split(':').next().unwrap_or(authority);
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// 在 `api` 主机等于 `host` 的服务商中查找模型，命中多于一处时按歧义处理。
+///
+/// 同一域名可能同时挂着官方与代理商条目，此时不能任选其一。
+fn model_of_provider_host<'a>(
+    providers: &'a HashMap<String, ProviderRecord>,
+    host: &str,
+    model_id: &str,
+) -> Option<&'a ModelRecord> {
+    let mut found = None;
+    for provider in providers.values() {
+        if provider.api.as_deref().and_then(url_host).as_deref() != Some(host) {
+            continue;
+        }
+        if let Some(model) = provider.models.get(model_id) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(model);
+        }
+    }
+    found
 }
 
 /// 保持快照声明顺序并去重，避免同一能力在 TUI 中重复展示。
@@ -214,7 +262,24 @@ fn reasoning_levels(model: &ModelRecord) -> Vec<ReasoningLevel> {
     if model.reasoning_options.is_empty() {
         push_unique(&mut levels, ReasoningLevel::Medium);
     }
+    // 快照按选项类型分组声明，`toggle` 与 `effort` 混用时插入顺序并不等于强度顺序：
+    // toggle 先补一个 Medium，effort 再追加 low/high/max 就会得到"关闭/中/低/高/最大"。
+    // 滑块按位置表达强弱，顺序必须回到固定阶梯上。
+    levels.sort_by_key(|level| reasoning_rank(*level));
     levels
+}
+
+/// 思考等级在固定阶梯上的序号；只用于排序，不参与能力判断。
+fn reasoning_rank(level: ReasoningLevel) -> u8 {
+    match level {
+        ReasoningLevel::Off => 0,
+        ReasoningLevel::Minimal => 1,
+        ReasoningLevel::Low => 2,
+        ReasoningLevel::Medium => 3,
+        ReasoningLevel::High => 4,
+        ReasoningLevel::XHigh => 5,
+        ReasoningLevel::Max => 6,
+    }
 }
 
 /// 保持 models.dev 声明顺序并去除不同选项类型带来的重复档位。
@@ -235,6 +300,7 @@ mod tests {
             r#"{"openai":{"models":{"gpt-test":{"reasoning":true,"reasoning_options":[{"type":"effort","values":["minimal","low","medium","high","xhigh","max"]}],"modalities":{"input":["text","image","pdf"],"output":["text","image","future"]},"limit":{"context":200000,"output":100000}}}}}"#,
             "openai",
             "gpt-test",
+            None,
         )
         .expect("夹具应可解析")
         .expect("模型应存在");
@@ -277,6 +343,7 @@ mod tests {
             r#"{"openai":{"models":{"image":{"reasoning":false,"limit":{"context":0,"output":0}}}}}"#,
             "openai",
             "image",
+            None,
         )
         .expect("夹具应可解析")
         .expect("模型应存在");
@@ -292,6 +359,7 @@ mod tests {
             r#"{"openai":{"models":{"reasoner":{"reasoning":true}}}}"#,
             "openai",
             "reasoner",
+            None,
         )
         .expect("夹具应可解析")
         .expect("模型应存在");
@@ -309,6 +377,7 @@ mod tests {
             r#"{"ai-router":{"models":{"gpt-luna":{"reasoning":true,"limit":{"context":1050000}}}}}"#,
             "openai",
             "gpt-luna",
+            None,
         )
         .expect("夹具应可解析")
         .expect("唯一模型 ID 应命中");
@@ -327,6 +396,71 @@ mod tests {
             r#"{"first":{"models":{"shared":{"reasoning":true}}},"second":{"models":{"shared":{"reasoning":false}}}}"#,
             "missing",
             "shared",
+            None,
+        )
+        .expect("夹具应可解析");
+
+        assert!(metadata.is_none());
+    }
+
+    /// toggle 与 effort 混用时档位必须回到固定阶梯，不能按声明顺序排。
+    #[test]
+    fn orders_levels_on_the_fixed_ladder() {
+        let metadata = find_model_metadata_in(
+            r#"{"deepseek":{"models":{"flash":{"reasoning":true,"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["low","high","max"]}]}}}}"#,
+            "deepseek",
+            "flash",
+            None,
+        )
+        .expect("夹具应可解析")
+        .expect("模型应存在");
+
+        assert_eq!(
+            metadata.reasoning_levels,
+            vec![
+                ReasoningLevel::Off,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::Max,
+            ]
+        );
+    }
+
+    /// 协议字段只能推出 `openai`，真正区分厂商的是 `base_url` 主机；同名模型挂在多个
+    /// 服务商下时必须靠主机消歧。
+    #[test]
+    fn resolves_provider_by_base_url_host() {
+        let snapshot = r#"{
+            "deepseek":{"api":"https://api.deepseek.com","models":{"flash":{"reasoning":true,"limit":{"context":1048576}}}},
+            "302ai":{"api":"https://api.302.ai/v1","models":{"flash":{"reasoning":false,"limit":{"context":1000000}}}}
+        }"#;
+
+        let metadata = find_model_metadata_in(
+            snapshot,
+            "openai",
+            "flash",
+            Some("https://api.deepseek.com/v1"),
+        )
+        .expect("夹具应可解析")
+        .expect("主机应消歧命中");
+
+        assert_eq!(metadata.context_window, Some(1_048_576));
+    }
+
+    /// 主机不匹配时不得借用其他服务商的同名模型，仍按歧义拒绝。
+    #[test]
+    fn ignores_other_hosts_when_disambiguating() {
+        let snapshot = r#"{
+            "deepseek":{"api":"https://api.deepseek.com","models":{"flash":{"reasoning":true}}},
+            "302ai":{"api":"https://api.302.ai/v1","models":{"flash":{"reasoning":false}}}
+        }"#;
+
+        let metadata = find_model_metadata_in(
+            snapshot,
+            "openai",
+            "flash",
+            Some("https://gateway.example.com/v1"),
         )
         .expect("夹具应可解析");
 

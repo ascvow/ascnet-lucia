@@ -374,6 +374,13 @@ impl AgentExtension for CompositePluginHost {
 
 #[async_trait]
 impl PluginHost for CompositePluginHost {
+    fn agent_runtime_api(
+        &self,
+        plugin_id: &str,
+    ) -> Option<Arc<dyn agent_runtime::AgentRuntimeApi>> {
+        self.get(plugin_id)?.agent_runtime_api(plugin_id)
+    }
+
     async fn load_context(&self, request: &ContextLoadRequest) -> Result<Option<LoadedContext>> {
         let Some(owner) = self.capability_owner(manifest::CONTEXT_LOADER_CAPABILITY) else {
             return Ok(None);

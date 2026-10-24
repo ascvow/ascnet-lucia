@@ -10,9 +10,8 @@
 //!    避免把整段历史拼成一个大 `Paragraph` 再整体滚动。
 
 use crate::session::conversation::{Msg, MsgKind};
-use crate::theme::COLOR_ASSISTANT_BG;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 /// FNV-1a 64 位初始值。
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -127,27 +126,13 @@ impl TranscriptLayout {
                 continue;
             }
             // 消息列表比布局条目短时跳过：没有内容可画，也不该继续推进光标。
-            let Some(message) = messages.get(index) else {
+            if messages.get(index).is_none() {
                 continue;
-            };
+            }
             let width = entry.width;
             let lines = entry.lines.get_or_insert_with(|| {
                 message_lines(messages, index, streaming == Some(index), width)
             });
-
-            // 助手回答是一张卡片：先整块铺上极浅的底色，文字再画在它上面。
-            // 正文片段只带前景色，因此会保留这层底色；工具日志与用户消息不铺。
-            if matches!(message.kind, MsgKind::Assistant) {
-                let blank_tail = lines
-                    .iter()
-                    .rev()
-                    .take_while(|line| line.width() == 0)
-                    .count();
-                // 尾部空行是消息之间的间距，不属于卡片，卡片才能与下一条日志真正隔开。
-                let card_height =
-                    height.saturating_sub(u16::try_from(blank_tail).unwrap_or(u16::MAX));
-                render_card(frame, area, start, card_height);
-            }
 
             // 顶部被裁掉的消息用 Paragraph 自身的滚动跳过整行，底部裁掉的部分由矩形高度截断。
             let clipped_top = start.max(viewport_top);
@@ -198,9 +183,10 @@ impl TranscriptLayout {
             if entry_height == 0 || cursor <= range_top || start >= range_bottom {
                 continue;
             }
-            let Some(message) = messages.get(index) else {
+            // 布局条目比消息列表长时跳过：没有内容可画。
+            if messages.get(index).is_none() {
                 continue;
-            };
+            }
             let width = entry.width;
             let lines = entry
                 .lines
@@ -240,39 +226,10 @@ impl TranscriptLayout {
     }
 }
 
-/// 在消息区按整块矩形铺出助手回答的卡片底色。
-///
-/// `start` 是这条消息在全局行坐标中的起始行，`height` 是卡片高度（不含消息之间的
-/// 尾部空行）。只有与视口相交的部分会被绘制：`Rect` 越界写入会让 ratatui 直接
-/// panic，而滚动到视口外的消息仍然带着完整高度。
-fn render_card(frame: &mut Frame, area: Rect, start: i32, height: u16) {
-    if height == 0 || area.width == 0 {
-        return;
-    }
-    let top = start.max(i32::from(area.y));
-    let bottom = start
-        .saturating_add(i32::from(height))
-        .min(i32::from(area.bottom()));
-    if bottom <= top {
-        return;
-    }
-    let card = Rect {
-        x: area.x,
-        y: u16::try_from(top).unwrap_or(u16::MAX),
-        width: area.width,
-        height: u16::try_from(bottom - top).unwrap_or(0),
-    };
-    frame.render_widget(
-        Block::new().style(Style::new().bg(COLOR_ASSISTANT_BG)),
-        card,
-    );
-}
-
 /// 构造一条消息的渲染行，并处理消息之间的段落空行。
 ///
-/// 同一个工具组里的连续调用保持紧凑——它们属于同一次动作；组结束时（下一条不是
-/// 工具消息）补一行空行，否则 Shell 输出与随后的分析文字会糊成一片。空行计入
-/// 该条消息的高度，因此滚动与点击热区都能保持一致。
+/// 每条工具消息之后都补一行空行：连续的调用各自带一段输出，紧贴着排会让人分不清
+/// 哪几行属于哪一次调用；空行计入该条消息的高度，因此滚动与点击热区都能保持一致。
 fn message_lines(
     messages: &[Msg],
     index: usize,
@@ -281,8 +238,7 @@ fn message_lines(
 ) -> Vec<Line<'static>> {
     let message = &messages[index];
     let mut lines = to_owned_lines(message.to_lines(streaming, width));
-    let next_is_tool = messages.get(index + 1).is_some_and(Msg::is_tool);
-    if message.is_tool() && !next_is_tool {
+    if message.is_tool() {
         lines.push(Line::default());
     }
     lines
@@ -375,12 +331,11 @@ fn write_byte(mut hash: u64, byte: u8) -> u64 {
 /// 后同样的输入降到十分之一量级。指纹只用于判断"内容是否变化"，不做安全用途。
 fn write_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     hash = write_bytes_len(hash, bytes.len());
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        let word = u64::from_le_bytes(chunk.try_into().expect("chunks_exact 保证整块长度"));
-        hash = (hash ^ word).wrapping_mul(FNV_PRIME);
+    let (words, tail) = bytes.as_chunks::<8>();
+    for word in words {
+        hash = (hash ^ u64::from_le_bytes(*word)).wrapping_mul(FNV_PRIME);
     }
-    for byte in chunks.remainder() {
+    for byte in tail {
         hash = write_byte(hash, *byte);
     }
     hash

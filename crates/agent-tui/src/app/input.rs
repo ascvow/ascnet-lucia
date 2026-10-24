@@ -2,15 +2,17 @@
 
 use super::App;
 use crate::app::{is_command_modifier, MouseTextSelection, ESC_DOUBLE_PRESS_WINDOW};
-use crate::command::PathInput;
 use crate::session::attachment::{
-    attachment_media_type, attachment_modality, clipboard_file_path, copy_to_clipboard,
-    looks_like_file_path, pasted_file_path,
+    attachment_media_type, attachment_modality, clipboard_files, copy_to_clipboard,
+    is_clipboard_file_names, looks_like_single_pasted_path, may_be_clipboard_file_names,
+    mentioned_paths, pasted_file_uris, pasted_path, pasted_path_kind, pasted_paths, PastedPathKind,
+    MAX_AUTO_TEXT_ATTACHMENT_BYTES,
 };
 use crate::session::conversation::{
     retained_refs, submission_text, Msg, MsgKind, PendingAttachment, UserSubmission,
 };
 use crate::theme::MAX_ATTACHMENT_BYTES;
+use crate::ui::chat::{scrollbar_thumb, ScrollbarThumb};
 use agent_core::Agent;
 use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::prelude::*;
@@ -93,6 +95,11 @@ impl App {
             }
             return;
         }
+        // Ctrl+O 进入排队面板；点击排队行也会进入，方向键选择后按 Enter 发送。
+        if is_command_modifier(modifiers) && matches!(code, KeyCode::Char('o')) {
+            self.focus_queue();
+            return;
+        }
         // 多行编辑键优先于命令预览，避免补全弹层吞掉换行手势。
         // Shift+Enter 依赖键盘增强协议；Alt+Enter 与 Ctrl+J 在传统终端也可用。
         if (matches!(code, KeyCode::Enter)
@@ -152,11 +159,6 @@ impl App {
                 self.cursor = next_word_boundary(&self.input, self.cursor);
             }
             KeyCode::Enter => {
-                // 整条输入或首段其实是本地文件时转为附件：绝对路径、`~/`、`./` 与裸
-                // 文件名都与命令路由共用 handle_path_input 一处判据，两条入口不各自推断。
-                if self.handle_path_input() == PathInput::Attached {
-                    return;
-                }
                 // 后台命令可能随时替换会话记录，期间禁止并发提交新消息。
                 if self.pending_reload.is_some() {
                     self.messages
@@ -165,9 +167,14 @@ impl App {
                 }
                 if let Some(agent) = agent {
                     if self.running {
-                        // steering 只支持纯文本；带附件的输入排队到本轮结束后整条发送，
-                        // 而不是拒绝用户已经打好的内容。
-                        if self.attachments.is_empty() {
+                        // 正文里点名的图片/PDF 同样要先变成附件，排队后才能整条发送。
+                        self.attach_mentioned_paths();
+                        // 默认排队：消息显示在输入框上方，可在本轮结束前继续修改。
+                        // Ctrl+Enter 才是立即 steering；附件与引用无法 steering，仍排队。
+                        let steer = is_command_modifier(modifiers)
+                            && self.attachments.is_empty()
+                            && self.refs.is_empty();
+                        if steer {
                             self.submit_steering(agent);
                         } else {
                             self.queue_input_until_ready();
@@ -268,6 +275,34 @@ impl App {
                 self.cursor = self.input[self.cursor..]
                     .find('\n')
                     .map_or(self.input.len(), |index| self.cursor + index);
+            }
+            _ => {}
+        }
+    }
+
+    /// 排队面板获得键盘焦点时的按键处理。
+    ///
+    /// 面板聚焦期间吞掉所有按键，避免字符落进输入框：`↑`/`↓` 选择，`Enter` 发送，
+    /// `Ctrl+O` 取回编辑，`Delete` 丢弃，`Esc` 返回输入框。
+    pub(crate) fn handle_queue_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        agent: Option<&Arc<Agent>>,
+    ) {
+        if self.queue_focus.is_none() {
+            return;
+        }
+        match code {
+            KeyCode::Esc => self.queue_focus = None,
+            KeyCode::Up => self.move_queue_selection(-1),
+            KeyCode::Down => self.move_queue_selection(1),
+            KeyCode::Enter => self.send_selected_queued(agent),
+            KeyCode::Delete => self.remove_selected_queued(),
+            KeyCode::Char('o') if is_command_modifier(modifiers) => {
+                if let Some(index) = self.queue_focus {
+                    self.edit_queued_input(index);
+                }
             }
             _ => {}
         }
@@ -411,15 +446,111 @@ impl App {
         true
     }
 
+    /// 处理底栏上下文芯片上的左键点击，返回事件是否已被热区消费。
+    ///
+    /// 芯片是 `/context` 的鼠标入口：点开最近一次请求的分类详情，再点一次收起，
+    /// 效果与命令面板里的 `/context` 完全一致。与其他热区一样必须先于文本拖选判定，
+    /// 否则按下会被当成一次选区起点。
+    pub(crate) fn handle_context_chip_click(&mut self, mouse: &MouseEvent) -> bool {
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        ) {
+            return false;
+        }
+        let Some(area) = self.context_chip_area else {
+            return false;
+        };
+        if !area.contains(Position::new(mouse.column, mouse.row)) {
+            return false;
+        }
+        self.dismiss_text_selection();
+        self.tool_click_candidate = None;
+        if self.native_command.context_open {
+            self.native_command.context_open = false;
+        } else {
+            self.native_command.context_open = true;
+            self.native_command.context_scroll = 0;
+        }
+        true
+    }
+
+    /// 处理排队消息面板上的左键点击：进入面板并选中被点中的消息。
+    ///
+    /// 只有主界面且没有对话框或插件焦点时生效；命中行消费这次点击，避免落到下方的
+    /// 文本选择逻辑。点击面板以外的地方会退出排队焦点。返回事件是否已被消费。
+    pub(crate) fn handle_queued_input_click(&mut self, mouse: &MouseEvent) -> bool {
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        ) {
+            return false;
+        }
+        if self.native_dialog_active() {
+            return false;
+        }
+        #[cfg(feature = "plugins")]
+        if !self.view_stack.is_main()
+            || self.plugin_focus.is_some()
+            || self.active_dialog_index().is_some()
+        {
+            return false;
+        }
+        let position = Position::new(mouse.column, mouse.row);
+        let Some(index) = self
+            .queued_input_areas
+            .iter()
+            .find(|(_, area)| area.contains(position))
+            .map(|(index, _)| *index)
+        else {
+            // 点击面板以外的地方视为离开排队区，把焦点还给输入框。
+            self.queue_focus = None;
+            return false;
+        };
+        self.dismiss_text_selection();
+        self.tool_click_candidate = None;
+        self.queue_focus = Some(index);
+        true
+    }
+
+    /// 更新底栏热点（滚动条、上下文芯片）的悬停态，返回状态是否发生变化。
+    ///
+    /// 只有真正的指针移动（[`MouseEventKind::Moved`]）才会改变悬停态：按下、滚轮、拖拽
+    /// 携带的坐标是"事件发生点"，用它点亮高亮会让鼠标没动时滚动条无故变宽。判定范围就是
+    /// 渲染层上一帧发布的 [`App::scrollbar_area`] 与 [`App::context_chip_area`]，因此
+    /// 悬停区与显示区始终是同一块几何。
+    ///
+    /// 拖拽期间终端上报的是 `Drag` 而不是 `Moved`，于是按住滑块横向甩出时高亮会自然保留，
+    /// 直到松手后的下一次移动才重新判定。
+    pub(crate) fn handle_mouse_event(&mut self, mouse: &MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Moved) {
+            return false;
+        }
+        let position = Position::new(mouse.column, mouse.row);
+        let scrollbar_hovered = self
+            .scrollbar_area
+            .is_some_and(|area| area.contains(position));
+        let chip_hovered = self
+            .context_chip_area
+            .is_some_and(|area| area.contains(position));
+        let previous = (self.is_scrollbar_hovered, self.is_context_chip_hovered);
+        self.is_scrollbar_hovered = scrollbar_hovered;
+        self.is_context_chip_hovered = chip_hovered;
+        previous != (scrollbar_hovered, chip_hovered)
+    }
+
     /// 处理滚动条上的按下与拖拽，返回事件是否已被热区消费。
     ///
     /// 必须排在文本拖选之前：滚动条只占右侧一列，若不先截获，按下会被当作选择起点，
     /// 拖动则会变成选区而永远滚不动。拖到最底部时恢复自动跟随，与键盘滚动语义一致。
+    ///
+    /// 按在滑块内时只记录抓取点、不改变滚动位置；按在轨道空白处才把滑块顶端对齐到
+    /// 指针。拖动阶段按指针位移平移滑块，抓住滑块的任何位置都不会在按下瞬间跳动。
     pub(crate) fn handle_scrollbar_drag(&mut self, mouse: &MouseEvent) -> bool {
         use crossterm::event::MouseButton;
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let Some(area) = self.scrollbar_area else {
+                let Some((area, thumb)) = self.scrollbar_geometry() else {
                     return false;
                 };
                 if !area.contains(Position::new(mouse.column, mouse.row)) {
@@ -428,35 +559,75 @@ impl App {
                 self.dismiss_text_selection();
                 self.tool_click_candidate = None;
                 self.scrollbar_drag = true;
-                self.scrub_to_row(mouse.row);
+                let first = area.y.saturating_add(thumb.first_row());
+                let last = area.y.saturating_add(thumb.last_row());
+                if (first..=last).contains(&mouse.row) {
+                    // 抓住滑块：保留指针相对滑块顶端的半行偏移，按下时刻不滚动。
+                    let grab =
+                        2 * i32::from(mouse.row.saturating_sub(area.y)) - i32::from(thumb.top_half);
+                    self.scrollbar_grab_half = Some(grab);
+                } else {
+                    // 点击轨道空白：滑块顶端对齐指针，随后从零偏移开始拖动。
+                    self.scrollbar_grab_half = Some(0);
+                    self.scrub_to_top_half(2 * i32::from(mouse.row.saturating_sub(area.y)));
+                }
                 true
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if !self.scrollbar_drag {
                     return false;
                 }
-                self.scrub_to_row(mouse.row);
+                let Some(area) = self.scrollbar_area else {
+                    return false;
+                };
+                let grab = self.scrollbar_grab_half.unwrap_or(0);
+                let top_half = 2 * i32::from(mouse.row.saturating_sub(area.y)) - grab;
+                self.scrub_to_top_half(top_half);
                 true
             }
-            MouseEventKind::Up(MouseButton::Left) => std::mem::take(&mut self.scrollbar_drag),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.scrollbar_grab_half = None;
+                std::mem::take(&mut self.scrollbar_drag)
+            }
             _ => false,
         }
     }
 
-    /// 把滚动条上的行号映射为滚动位置；行号越界时按端点处理。
-    fn scrub_to_row(&mut self, row: u16) {
-        let Some(area) = self.scrollbar_area else {
+    /// 计算主滚动条当前帧的轨道与滑块几何。
+    ///
+    /// 渲染层用 `scrollbar_thumb` 画滑块；输入侧用同一函数和相同的滚动几何重算一次，
+    /// 不额外保存屏幕坐标，拖动与显示就不会出现两套判断。内容未溢出或轨道尚未发布时
+    /// 返回 `None`。
+    fn scrollbar_geometry(&self) -> Option<(Rect, ScrollbarThumb)> {
+        let area = self.scrollbar_area?;
+        let viewport = self.last_viewport.max(1);
+        let total = self.last_max_scroll.saturating_add(viewport);
+        if area.height == 0 || total <= viewport {
+            return None;
+        }
+        let scroll = self.scroll.unwrap_or(self.last_max_scroll);
+        let thumb = scrollbar_thumb(area.height, total, viewport, scroll);
+        Some((area, thumb))
+    }
+
+    /// 把滑块顶端的半行位置映射为滚动偏移；越界时按轨道端点处理。
+    ///
+    /// 可动区间取「轨道半行数 - 滑块半行高」，与渲染完全一致；因此拖到轨道首行或末行
+    /// 时滑块顶端正好贴住端点，不会被滑块自身高度截短而"够不到"底边。
+    fn scrub_to_top_half(&mut self, top_half: i32) {
+        let Some((area, thumb)) = self.scrollbar_geometry() else {
             return;
         };
-        if area.height == 0 || self.last_max_scroll == 0 {
+        let span = u32::from(area.height)
+            .saturating_mul(2)
+            .saturating_sub(u32::from(thumb.height_half));
+        if span == 0 || self.last_max_scroll == 0 {
             return;
         }
-        let offset = row.saturating_sub(area.y).min(area.height - 1);
-        // 轨道首行对应顶部、末行对应底部；两端都能精确命中，避免滑块"够不到"边界。
-        let span = u32::from(area.height.saturating_sub(1)).max(1);
-        let scaled = u32::from(offset) * u32::from(self.last_max_scroll);
+        let top = u32::try_from(top_half.max(0)).unwrap_or(u32::MAX).min(span);
+        let scaled = top.saturating_mul(u32::from(self.last_max_scroll));
         let position = u16::try_from((scaled + span / 2) / span).unwrap_or(u16::MAX);
-        if position >= self.last_max_scroll {
+        if top >= span || position >= self.last_max_scroll {
             self.scroll = None;
         } else {
             self.scroll = Some(position);
@@ -565,40 +736,48 @@ impl App {
         self.input_history_cursor = None;
     }
 
-    /// 处理终端粘贴：文件路径转为附件，其余文本折叠为引用标签并保留原文待发送。
+    /// 处理终端粘贴：剪贴板持有文件引用时转为附件，粘贴的是单个本地路径时保留路径并附加
+    /// 该文件，长文本折叠为引用标签，短文本直接落进输入框。
     pub(crate) fn handle_paste(&mut self, pasted: &str) {
-        self.handle_paste_with(pasted, clipboard_file_path);
+        self.handle_paste_with(pasted, clipboard_files);
     }
 
     /// [`App::handle_paste`] 的可测试实现。
     ///
-    /// `clipboard` 注入剪贴板文件引用的读取方式：Finder 复制文件时剪贴板文本只有
-    /// 文件名，必须回查文件引用才能定位；测试传入固定结果，避免依赖本机剪贴板状态。
+    /// `clipboard` 注入剪贴板文件引用的读取方式：文件管理器复制文件时剪贴板的文本
+    /// 表示只有文件名，必须回查文件引用才能定位；测试传入固定结果，避免依赖本机
+    /// 剪贴板状态。只有纯文件名形态才会调用它——路径与长文本一定不是文件管理器给出
+    /// 的名字表示，不值得为它们等待一个系统进程。
+    ///
+    /// 三种手势区别对待：
+    ///
+    /// - **复制文件后粘贴**：剪贴板文本与文件引用一一对应，任何类型都按附件发送；
+    /// - **粘贴单条或多条路径**：能附加的路径只留引用标签，避免输入框同时出现
+    ///   路径与标签；无法附加的路径（目录、超限文本、二进制等）保留路径文本，
+    ///   同时说明原因；
+    /// - **粘贴普通文本**：短文本内联，长到会撑坏输入盒时折叠成标签。
     pub(crate) fn handle_paste_with(
         &mut self,
         pasted: &str,
-        clipboard: impl FnOnce() -> Option<std::path::PathBuf>,
+        clipboard: impl FnOnce() -> Vec<std::path::PathBuf>,
     ) {
-        let cwd = self.workspace.cwd.clone();
-        if let Some(path) = pasted_file_path(pasted, &cwd) {
-            self.attach_file(&path);
+        // 剪贴板只有文件引用、没有文本表示时，终端可能送来一次空粘贴；此时唯一可用的
+        // 线索就是文件引用本身。
+        if pasted.is_empty() {
+            let files = clipboard();
+            if files.is_empty() {
+                return;
+            }
+            self.attach_pasted_paths(&files);
             return;
         }
-        // 文本看起来是附件路径但按工作目录找不到：回查剪贴板文件引用（Finder 复制场景）。
-        if looks_like_file_path(pasted) {
-            match clipboard() {
-                Some(path) => {
-                    self.attach_file(&path);
-                }
-                None => self.messages.push(Msg::new(
-                    MsgKind::Error,
-                    format!(
-                        "无法定位附件 `{}`：请粘贴绝对路径，或重新从文件管理器复制该文件。",
-                        pasted.trim()
-                    ),
-                )),
+        if may_be_clipboard_file_names(pasted) {
+            let files = clipboard();
+            if is_clipboard_file_names(pasted, &files) {
+                // 文件管理器多选复制：按剪贴板顺序逐个附加，标签顺序与用户的选择一致。
+                self.attach_pasted_paths(&files);
+                return;
             }
-            return;
         }
         // 统一平台换行，制表符仍降级为空格以避免不同终端产生不可见差异。
         let text = pasted
@@ -606,6 +785,51 @@ impl App {
             .replace('\r', "\n")
             .replace('\t', " ");
         if text.is_empty() {
+            return;
+        }
+        // 单条路径：保留路径文本，再把可消费的文件内容附加成附件。路径文字不改写成
+        // 标签——同一段文字可能是一条待执行的命令，也可能是模型定位文件所需的线索。
+        // 终端拖入文件有时给的是 `file://` URI 列表：它不是可读的路径文本，直接换成
+        // 附件标签，用户看到的就是"这些文件已附加"。
+        if let Some(paths) = pasted_file_uris(&text) {
+            self.attach_pasted_paths(&paths);
+            return;
+        }
+        // 纯路径粘贴：能附加时输入框只留引用标签，不重复保留路径文本；无法附加
+        // （目录、超限文本、二进制等）才插入原路径并说明原因，供 Agent 用工具访问。
+        if let Some(path) = pasted_path(&text, &self.workspace.cwd) {
+            if let Some(reason) = self.attach_pasted_path(&path) {
+                self.insert_pasted_path_text(text.trim_end());
+                self.messages.push(Msg::new(
+                    MsgKind::Info,
+                    format!("已保留路径，未作为附件发送：{}（{reason}）", path.display()),
+                ));
+            }
+            return;
+        }
+        // 一次粘贴多条路径：文件管理器多选「拷贝为路径名」按行给出路径，终端拖入多个
+        // 文件则用空白分隔并转义空格。附加成功的只留标签，无法附加的保留路径文本。
+        if let Some(paths) = pasted_paths(&text, &self.workspace.cwd) {
+            self.attach_pasted_paths(&paths);
+            return;
+        }
+        // 明确指向本地路径却解析不到文件时给出原因：否则用户只会看到路径变成普通
+        // 文本，无法判断是文件不存在还是附件识别没有生效。
+        if looks_like_single_pasted_path(&text) {
+            self.insert_pasted_path_text(text.trim_end());
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                format!("未找到本地文件，已按文本插入：{}", text.trim()),
+            ));
+            return;
+        }
+        // 短粘贴直接落进输入框：用户能看清原文、能像打字一样继续改。行尾换行去掉——从
+        // 终端或编辑器复制一行常带结尾换行，留着会把光标推到下一行空行。
+        if !paste_needs_label(&text) {
+            let inline = text.trim_end_matches('\n');
+            if !inline.is_empty() {
+                self.insert_input_text(inline);
+            }
             return;
         }
         if let Err(message) =
@@ -622,6 +846,7 @@ impl App {
             data: String::new(),
             is_image: false,
             pasted_text: Some(text),
+            source_path: None,
         });
         let clip = format!("{label} ");
         self.input.insert_str(self.cursor, &clip);
@@ -629,32 +854,197 @@ impl App {
         self.finish_input_edit();
     }
 
+    /// 把一段路径文本插入光标处，必要时与前后文字隔开一列空格。
+    ///
+    /// 路径是模型定位文件的唯一线索，粘在相邻词上会变成另一个路径（`foo/Users/...`）。
+    fn insert_pasted_path_text(&mut self, text: &str) {
+        if self.needs_separating_space() {
+            self.insert_input_text(" ");
+        }
+        self.insert_input_text(text);
+    }
+
+    /// 判断在光标处插入内容前是否需要补一列空格。
+    fn needs_separating_space(&self) -> bool {
+        !self.input.is_empty()
+            && !self
+                .input
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+    }
+
+    /// 逐个附加粘贴来源给出的路径，并把跳过原因合并成一条说明。
+    ///
+    /// 附加成功的路径只留引用标签；无法附加的路径插入原路径文本（必要时加引号），
+    /// 让 Agent 仍能用 `read_file` / `list_directory` 按路径访问。
+    fn attach_pasted_paths(&mut self, files: &[std::path::PathBuf]) {
+        let mut skipped = Vec::new();
+        for path in files {
+            if let Some(reason) = self.attach_pasted_path(path) {
+                self.insert_pasted_path_text(&pasted_path_display(path));
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                skipped.push(format!("{name}（{reason}）"));
+            }
+        }
+        if !skipped.is_empty() {
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                format!("以下文件未作为附件发送：{}", skipped.join("、")),
+            ));
+        }
+    }
+
+    /// 按内容类型决定一个粘贴路径能否变成附件，返回跳过原因。
+    ///
+    /// 只有模型真正能消费的内容才自动附加：图片与 PDF 走原生二进制输入，文本按内容
+    /// 内联（受 [`MAX_AUTO_TEXT_ATTACHMENT_BYTES`] 约束）。目录、音视频与其他二进制
+    /// 附加后模型只会看到一条"内容已省略"的占位说明，因此保留路径交给工具处理。
+    fn attach_pasted_path(&mut self, path: &Path) -> Option<String> {
+        let kind = match pasted_path_kind(path) {
+            Ok(kind) => kind,
+            Err(error) => return Some(format!("无法读取：{error}")),
+        };
+        let too_large = std::fs::metadata(path)
+            .map(|metadata| metadata.len() > MAX_AUTO_TEXT_ATTACHMENT_BYTES)
+            .unwrap_or(false);
+        let reason = match kind {
+            PastedPathKind::Media => None,
+            PastedPathKind::Text if too_large => Some(format!(
+                "超过 {} KiB 的文本会占满上下文；工作区内的文件可让 Agent 用 read_file 分段读取",
+                MAX_AUTO_TEXT_ATTACHMENT_BYTES / 1024
+            )),
+            PastedPathKind::Text => None,
+            PastedPathKind::AudioVideo => Some("当前模型协议尚未支持音频/视频附件".to_string()),
+            PastedPathKind::Binary => Some("二进制文件无法内联给模型".to_string()),
+            PastedPathKind::Directory => Some(
+                "目录不能作为附件；工作区内的目录可让 Agent 用 list_directory 查看".to_string(),
+            ),
+        };
+        if let Some(reason) = reason {
+            return Some(reason);
+        }
+        // 标签前补一列空格：路径粘贴后紧跟 `[FILE#1]` 会读成路径本身的一部分。空输入
+        // 不需要前导空格，否则标签会缩进一列。
+        let before = self.input.len();
+        if self.needs_separating_space() {
+            self.insert_input_text(" ");
+        }
+        match self.try_attach_file(path) {
+            Ok(()) => None,
+            Err(message) => {
+                // 附加失败时不留下多余空格，输入保持粘贴前的样子。
+                self.input.truncate(before);
+                self.cursor = self.cursor.min(self.input.len());
+                self.finish_input_edit();
+                Some(message)
+            }
+        }
+    }
+
     /// 读取文件并加入待发送附件，同时在光标处插入引用标签。
     ///
     /// 读取失败或超过 [`MAX_ATTACHMENT_BYTES`] 时追加错误消息，不修改输入。
     pub(crate) fn attach_file(&mut self, path: &Path) {
+        if let Err(message) = self.try_attach_file(path) {
+            self.messages.push(Msg::new(MsgKind::Error, message));
+        }
+    }
+
+    /// 尝试附加一个文件，失败时把原因交回调用方决定如何展示。
+    ///
+    /// 只有成功后才改动输入与附件列表；失败时编辑器保持原样，调用方可以选择把路径
+    /// 文本留在输入框里继续发送。
+    fn try_attach_file(&mut self, path: &Path) -> std::result::Result<(), String> {
+        let attachment = self.load_attachment(path)?;
+        let clip = format!("{} ", attachment.label);
+        self.attachments.push(attachment);
+        self.input.insert_str(self.cursor, &clip);
+        self.cursor += clip.len();
+        self.finish_input_edit();
+        Ok(())
+    }
+
+    /// 把正文里点名的本地路径登记为只读授权，并按需附加内容。
+    ///
+    /// 用户在消息里写「看这张图 /Users/me/a.png」时，模型只拿到一段路径文本：图片
+    /// 内容永远进不了上下文，模型只能退回 OCR 或猜测。[`mentioned_paths`] 找出真实
+    /// 存在的文件与目录后在这里处理：
+    ///
+    /// - 图片与 PDF 直接读成附件，出现在句子任意位置都附加；
+    /// - 文本文件只在路径独立成行时内联，并与其他自动附加的文本共享
+    ///   [`MAX_AUTO_TEXT_ATTACHMENT_BYTES`] 预算——正文里随手提到的源码每轮都塞进
+    ///   上下文代价太高；
+    /// - 其余路径（大文本、目录、二进制、音视频）登记为只读授权，让 Agent 用
+    ///   `read_file` / `list_directory` 按需访问，工作区外文件因此也能被工具读取。
+    ///
+    /// 路径文本保留原样，不做原位替换：同一段文字可能是一条待执行的命令（
+    /// `cp a.png b.png`），把路径改写成引用标签会损坏用户的消息。附加结果以一条
+    /// 提示告知用户；单个文件读取失败或当前模型不支持该模态时只提示，消息照常发送。
+    pub(crate) fn attach_mentioned_paths(&mut self) {
+        let base = self.workspace.cwd.clone();
+        let mut attached: Vec<String> = Vec::new();
+        let mut text_budget = MAX_AUTO_TEXT_ATTACHMENT_BYTES;
+        for (span, path) in mentioned_paths(&self.input, &base) {
+            // 用户点名的路径一律登记只读授权；工作区内的路径由守卫天然允许。
+            let _ = self.read_path_grants.grant(&path);
+            if self
+                .attachments
+                .iter()
+                .any(|attachment| attachment.source_path.as_deref() == Some(path.as_path()))
+            {
+                continue;
+            }
+            let kind = match pasted_path_kind(&path) {
+                Ok(kind) => kind,
+                Err(_) => continue,
+            };
+            let size = std::fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            let text_attachable = matches!(kind, PastedPathKind::Text)
+                && size <= text_budget
+                && path_is_standalone(&self.input, &span);
+            if !matches!(kind, PastedPathKind::Media) && !text_attachable {
+                continue;
+            }
+            match self.load_attachment(&path) {
+                Ok(attachment) => {
+                    if text_attachable {
+                        text_budget = text_budget.saturating_sub(size);
+                    }
+                    attached.push(format!("{} {}", attachment.label, attachment.name));
+                    self.attachments.push(attachment);
+                }
+                Err(message) => self.messages.push(Msg::new(MsgKind::Error, message)),
+            }
+        }
+        if !attached.is_empty() {
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                format!("正文中的本地文件已附带发送：{}", attached.join("、")),
+            ));
+        }
+    }
+
+    /// 读取并校验一个本地文件，构造待发送附件。
+    ///
+    /// 错误以面向用户的文案返回：`/attach` 会把它当作命令失败展示，正文自动识别
+    /// 则只提示后继续发送。标签编号基于当前附件列表，因此调用期间不得并发改动。
+    fn load_attachment(&self, path: &Path) -> std::result::Result<PendingAttachment, String> {
         use base64::Engine;
 
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                self.messages.push(Msg::new(
-                    MsgKind::Error,
-                    format!("Failed to read attachment ({}): {error}", path.display()),
-                ));
-                return;
-            }
-        };
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("Failed to read attachment ({}): {error}", path.display()))?;
         if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
-            self.messages.push(Msg::new(
-                MsgKind::Error,
-                format!(
-                    "Attachment exceeds the {} MiB limit: {}",
-                    MAX_ATTACHMENT_BYTES / 1024 / 1024,
-                    path.display()
-                ),
+            return Err(format!(
+                "Attachment exceeds the {} MiB limit: {}",
+                MAX_ATTACHMENT_BYTES / 1024 / 1024,
+                path.display()
             ));
-            return;
         }
         let name = path
             .file_name()
@@ -662,23 +1052,16 @@ impl App {
             .unwrap_or_else(|| "attachment".to_string());
         let (media_type, is_image) = attachment_media_type(path, &bytes);
         let modality = attachment_modality(&media_type);
-        if let Err(message) = self.validate_attachment_modality(&modality) {
-            self.messages.push(Msg::new(MsgKind::Error, message));
-            return;
-        }
-        let label = self.next_attachment_label(&modality);
-        self.attachments.push(PendingAttachment {
-            label: label.clone(),
+        self.validate_attachment_modality(&modality)?;
+        Ok(PendingAttachment {
+            label: self.next_attachment_label(&modality),
             name,
             media_type,
             data: base64::engine::general_purpose::STANDARD.encode(&bytes),
             is_image,
             pasted_text: None,
-        });
-        let clip = format!("{label} ");
-        self.input.insert_str(self.cursor, &clip);
-        self.cursor += clip.len();
-        self.finish_input_edit();
+            source_path: Some(path.to_path_buf()),
+        })
     }
 
     /// 校验附件所需的模型输入模态，并隔离 Core 尚未实现的音视频协议。
@@ -847,6 +1230,8 @@ impl App {
         self.mouse_capture = !self.mouse_capture;
         // 挂起处理器靠这份状态决定是否发送禁用序列，切换后必须同步。
         crate::terminal::set_mouse_capture(self.mouse_capture);
+        // 关掉捕获后不会再有指针移动事件，悬停高亮必须立刻收掉，否则会一直亮着。
+        self.is_scrollbar_hovered = false;
         self.dismiss_text_selection();
         let notice = if self.mouse_capture {
             "Mouse capture enabled; press Ctrl+T to restore text selection"
@@ -1123,6 +1508,9 @@ impl App {
 
     /// 取出并清空当前输入与附件；文本和附件都为空时返回 `None`。
     pub(crate) fn take_submission(&mut self) -> Option<UserSubmission> {
+        // 正文里点名了本地图片/PDF 时先把它读成附件：模型拿不到图像内容就只能
+        // 退化成 OCR 或猜测，而用户写下路径的本意就是让模型看到那个文件。
+        self.attach_mentioned_paths();
         // 标签被删掉的引用视为用户主动丢弃，不能因为条目还在列表里就照旧发送。
         let refs = retained_refs(&self.input, &self.refs);
         let visible = submission_text(&self.input, &self.attachments, &refs);
@@ -1152,6 +1540,42 @@ impl App {
     }
 }
 
+/// 把无法附加的路径还原成可再次解析的输入文本。
+///
+/// 含空白的路径用引号包住，确保发送时的正文扫描仍把它当成同一条路径；优先单引号，
+/// 路径本身含单引号时改用双引号，两者都含时退回空格转义。
+fn pasted_path_display(path: &Path) -> String {
+    let text = path.display().to_string();
+    if !text.chars().any(char::is_whitespace) {
+        return text;
+    }
+    if !text.contains('\'') {
+        format!("'{text}'")
+    } else if !text.contains('"') {
+        format!("\"{text}\"")
+    } else {
+        text.replace(' ', "\\ ")
+    }
+}
+
+/// 判断路径片段是否独占一行（或整条输入）。
+///
+/// 只有独立成行的路径才自动内联文本内容：嵌在句子或命令里的路径可能只是参数或
+/// 随手提及，把整份文件附加进去会让后续每一轮请求都背上它的体积。引号、句读与
+/// 不成对的括号属于句子结构，不影响"独占一行"的判定。
+fn path_is_standalone(input: &str, span: &std::ops::Range<usize>) -> bool {
+    let line_start = input[..span.start].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = input[span.end..]
+        .find('\n')
+        .map_or(input.len(), |index| span.end + index);
+    input[line_start..span.start]
+        .trim_matches(crate::session::attachment::is_path_boundary_char)
+        .is_empty()
+        && input[span.end..line_end]
+            .trim_matches(crate::session::attachment::is_path_boundary_char)
+            .is_empty()
+}
+
 /// 判断一段粘贴文本是否长到应该折叠成引用标签。
 ///
 /// 判据是"会不会把输入盒撑坏"：多行必然增加逻辑行数；单行按显示宽度算，宽字符占两列。
@@ -1166,7 +1590,7 @@ fn is_word_separator(ch: char) -> bool {
 }
 
 /// 返回光标左侧一个词的起始字节位置。
-fn previous_word_boundary(input: &str, cursor: usize) -> usize {
+pub(super) fn previous_word_boundary(input: &str, cursor: usize) -> usize {
     let mut position = cursor;
     while let Some(ch) = input[..position].chars().next_back() {
         if !is_word_separator(ch) {
@@ -1217,7 +1641,7 @@ fn byte_at_display_column(line: &str, target: usize) -> usize {
 }
 
 /// 按显示列在相邻逻辑行间移动光标；到达首行或末行时返回 `false`。
-fn move_cursor_vertically(input: &str, cursor: &mut usize, upward: bool) -> bool {
+pub(super) fn move_cursor_vertically(input: &str, cursor: &mut usize, upward: bool) -> bool {
     let line_start = input[..*cursor].rfind('\n').map_or(0, |index| index + 1);
     let line_end = input[*cursor..]
         .find('\n')

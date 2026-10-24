@@ -6,6 +6,7 @@ pub(crate) mod model_metadata;
 use agent_core::config::AgentRootConfig;
 use agent_core::ReasoningLevel;
 use anyhow::{anyhow, Context, Result};
+use model_metadata::{find_model_metadata, ModelMetadata};
 use serde::Deserialize;
 use serde_json::Value;
 #[cfg(unix)]
@@ -178,24 +179,54 @@ pub(crate) fn load_tui_settings(path: &Path) -> Result<TuiSettings> {
         .review_model
         .filter(|model| !model.trim().is_empty());
     settings.context_window = config.model.context_window.filter(|window| *window > 0);
-    let provider_id =
-        config
-            .model
-            .models_dev_provider
-            .or_else(|| match config.model.provider.as_deref() {
-                Some("open-ai") => Some("openai".to_string()),
-                Some("anthropic") => Some("anthropic".to_string()),
-                _ => None,
-            });
-    settings.model_metadata = match (provider_id.as_deref(), config.model.model.as_deref()) {
-        (Some(provider), Some(model)) => {
-            crate::config::model_metadata::find_model_metadata(provider, model)?
-        }
-        _ => None,
-    };
+    settings.model_metadata = resolve_model_metadata(&text, &config.model)?;
     settings.max_tokens_explicit = config.agent.max_tokens.is_some();
     settings.reasoning_explicit = config.agent.reasoning.is_some();
     Ok(settings)
+}
+
+/// 从配置文本解析 TUI 需要的模型能力。
+///
+/// 优先使用 `AgentRootConfig` 解析出的默认上游：`models[]` 多上游配置里没有 `model`
+/// 对象，只看单模型字段会让整份配置都拿不到元数据，思考等级滑块因此退化成单档。解析
+/// 失败或没有上游时退回单模型字段，保证只写展示字段的配置仍能读取。
+fn resolve_model_metadata(text: &str, model: &TuiModelSettings) -> Result<Option<ModelMetadata>> {
+    let root = serde_json::from_str::<AgentRootConfig>(text).ok();
+    let upstream = root.as_ref().and_then(|root| root.default_upstream().ok());
+    let (provider_id, model_id, base_url) = match upstream {
+        Some(upstream) => (
+            model
+                .models_dev_provider
+                .clone()
+                .or_else(|| models_dev_provider_id(upstream.provider.protocol_id())),
+            Some(upstream.model.as_str()),
+            upstream.base_url.as_deref(),
+        ),
+        None => (
+            model
+                .models_dev_provider
+                .clone()
+                .or_else(|| model.provider.as_deref().and_then(models_dev_provider_id)),
+            model.model.as_deref(),
+            None,
+        ),
+    };
+    let (Some(provider_id), Some(model_id)) = (provider_id, model_id) else {
+        return Ok(None);
+    };
+    find_model_metadata(&provider_id, model_id, base_url)
+}
+
+/// 协议类型到 models.dev 官方服务商 ID 的映射。
+///
+/// 协议只说明报文格式，不代表厂商：兼容网关常把 `open-ai` 配到任意服务商，此时由
+/// `models_dev_provider` 或 `base_url` 主机消歧。
+pub(crate) fn models_dev_provider_id(protocol: &str) -> Option<String> {
+    match protocol {
+        "open-ai" | "open-ai-compatible" => Some("openai".to_string()),
+        "anthropic" => Some("anthropic".to_string()),
+        _ => None,
+    }
 }
 
 /// 原子更新 `agent.reasoning`，保留其他字段。
@@ -461,6 +492,42 @@ mod tests {
         assert!(metadata
             .input_modalities
             .contains(&crate::config::model_metadata::ModelModality::Pdf));
+        fs::remove_dir_all(root).expect("清理配置测试目录");
+    }
+
+    /// `models[]` 多上游配置没有 `model` 对象，元数据必须按默认上游解析。
+    ///
+    /// 只读单模型字段时整份配置都拿不到元数据，思考等级滑块会退化成单档。
+    #[test]
+    fn loads_model_metadata_from_default_upstream() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("创建配置测试目录");
+        let path = root.join("config.json");
+        fs::write(
+            &path,
+            r#"{
+  "default_model": "second",
+  "models": [
+    { "name": "first", "provider": "open-ai", "model": "deepseek-v4-pro", "base_url": "https://api.deepseek.com" },
+    { "name": "second", "provider": "open-ai", "model": "deepseek-flash", "base_url": "https://api.deepseek.com/v1" }
+  ]
+}"#,
+        )
+        .expect("写入多上游配置");
+
+        let settings = load_tui_settings(&path).expect("读取多上游配置");
+        let metadata = settings.model_metadata.expect("默认上游应命中快照");
+        assert_eq!(metadata.context_window, Some(1_048_576));
+        assert_eq!(
+            metadata.reasoning_levels,
+            vec![
+                ReasoningLevel::Off,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::Max,
+            ]
+        );
         fs::remove_dir_all(root).expect("清理配置测试目录");
     }
 

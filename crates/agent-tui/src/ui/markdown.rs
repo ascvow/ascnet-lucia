@@ -1,22 +1,21 @@
 //! 会话正文的 Markdown、表格与工具输出行渲染。
 
 use crate::theme::{
-    COLOR_ACCENT, COLOR_BORDER_FOCUS, COLOR_CODE, COLOR_CODE_BG, COLOR_INLINE_CODE_BG, COLOR_META,
-    COLOR_MUTED, COLOR_QUOTE_BG, COLOR_SEPARATOR, COLOR_TEXT, COLOR_TEXT_SOFT, COLOR_USER,
-    COLOR_USER_BG,
+    COLOR_ACCENT, COLOR_BORDER_FOCUS, COLOR_CODE, COLOR_CODE_BG, COLOR_META, COLOR_MUTED,
+    COLOR_QUOTE_BG, COLOR_SEPARATOR, COLOR_TEXT, COLOR_TEXT_SOFT, COLOR_USER,
 };
 use crate::ui::diff::{self, DiffLineKind};
 use crate::ui::highlight::{highlight_line, CodeLanguage};
 use ratatui::prelude::*;
 use serde_json::Value;
 
-/// 构造用户消息块：按显示宽度预换行，每个视觉行都带左侧竖条与统一背景色。
+/// 构造用户消息块：按显示宽度预换行，每个视觉行都带左侧竖条。
 ///
 /// 预换行避免 Paragraph 自动换行时续行丢失竖条，保证消息块边缘连续；
 /// 每行按显示宽度补齐尾部空格，使背景色铺满整个消息区宽度。
 pub(crate) fn user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
-    // 竖条与右侧留白共占 3 列。
-    let max = usize::from(width).saturating_sub(3).max(1);
+    // 左侧竖条占两列；不再把整行铺成底色，短消息不会变成一条横贯屏幕的色带。
+    let max = usize::from(width).saturating_sub(2).max(1);
     let body = if text.is_empty() {
         vec![String::new()]
     } else {
@@ -27,14 +26,9 @@ pub(crate) fn user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = body
         .into_iter()
         .map(|line| {
-            // 补齐到 max 列后再加 1 列右侧留白，整行恰好占满 width。
-            let pad = max.saturating_sub(unicode_width::UnicodeWidthStr::width(line.as_str()));
             Line::from(vec![
-                Span::styled("▌ ", Style::new().fg(COLOR_USER).bg(COLOR_USER_BG)),
-                Span::styled(
-                    format!("{line}{}", " ".repeat(pad + 1)),
-                    Style::new().fg(COLOR_TEXT).bg(COLOR_USER_BG),
-                ),
+                Span::styled("▌ ", Style::new().fg(COLOR_USER)),
+                Span::styled(line, Style::new().fg(COLOR_TEXT)),
             ])
         })
         .collect();
@@ -99,11 +93,11 @@ pub(crate) fn conversation_lines<'a>(
 const PREFIX_WIDTH: usize = 2;
 /// 表格单列最小内容宽度；再窄竖线之间就只剩空白。
 const TABLE_MIN_COLUMN: usize = 4;
-/// 回答卡片左右两侧的内边距（显示列）。
+/// 回答卡片右侧的留白（显示列）。
 ///
-/// 这是全篇唯一一处横向留白：它让文字不贴死卡片与屏幕边缘，同时保持左右对称。
-/// 除它之外没有任何宽度上限——终端多宽，正文、表格与代码块就用多宽。
-/// 跨模块可见是为了让测试能断言"行宽 = 可用宽度 - 这个内边距"。
+/// 左侧不留：用户消息的 `▌` 与回答的 `●` 必须落在同一列，正文才会上下成一条直线。
+/// 右侧这一列留白让长行不贴死屏幕边缘。除它之外没有任何宽度上限——终端多宽，正文、
+/// 表格与代码块就用多宽。
 pub(crate) const CARD_PADDING: usize = 2;
 /// 围栏代码块卡片左侧的竖条与内部左留白（`▎` 后两列空白）。
 ///
@@ -167,12 +161,12 @@ enum ListMarker<'a> {
 /// 被挤成碎块；被压缩成窄盒子的排版只会出现在终端本身变窄的时候。
 ///
 /// 连续空行折叠为一行；`streaming` 为真时在末尾追加光标。整段回答被包进一张卡片，
-/// 卡片宽度等于可用宽度，正文左右各留 [`CARD_PADDING`] 列——这层内边距是唯一的
-/// 横向留白，由绘制层按同一宽度铺出底色。
+/// 卡片宽度等于可用宽度。卡片左侧不留内边距：用户消息的 `▌` 与回答的 `●` 因此落在
+/// 同一列，两种消息的正文都从第 [`PREFIX_WIDTH`] 列起笔，上下读起来是一条直线。
 pub(crate) fn markdown_lines(text: &str, streaming: bool, width: u16) -> Vec<Line<'static>> {
-    // 行首标记与左右内边距从可用宽度里扣除，剩下的全部给正文。
+    // 行首标记与右侧留白从可用宽度里扣除，剩下的全部给正文。
     let body_width = usize::from(width)
-        .saturating_sub(CARD_PADDING * 2 + PREFIX_WIDTH)
+        .saturating_sub(PREFIX_WIDTH + CARD_PADDING)
         .max(1);
     let mut rendered: Vec<Line<'static>> = Vec::new();
     let mut previous_is_list = false;
@@ -219,28 +213,11 @@ pub(crate) fn markdown_lines(text: &str, streaming: bool, width: u16) -> Vec<Lin
             last.push_span(Span::styled(" ▌", Style::new().fg(COLOR_USER)));
         }
     }
-    // 卡片化的最后一步：补左内边距，回答之间再留一行真正的空行（不属于卡片）。
-    let mut card: Vec<Line<'static>> = lines.into_iter().map(card_line).collect();
+    // 卡片化的最后一步：回答之间留一行真正的空行（不属于卡片）。行首不再补内边距，
+    // 否则整段回答会比用户消息右移，两种消息的左边界对不上。
+    let mut card: Vec<Line<'static>> = lines;
     card.push(Line::default());
     card
-}
-
-/// 给一行回答加上卡片左内边距。
-///
-/// 只负责缩进，不铺底色：卡片底色由绘制层按整块矩形铺出（见
-/// [`crate::ui::transcript_layout::TranscriptLayout::render_visible`]），逐行铺色会把
-/// 段落之间的空行变成"只有空格的行"，而 ratatui 的换行器会把这种行算成两行，
-/// 回答里的段落间距于是莫名翻倍。
-///
-/// 空行保持零宽度原样返回：它由卡片底色填满，补上内边距就会多占一行。
-fn card_line(line: Line<'static>) -> Line<'static> {
-    if line.width() == 0 {
-        return line;
-    }
-    let mut spans = Vec::with_capacity(line.spans.len() + 1);
-    spans.push(Span::raw(" ".repeat(CARD_PADDING)));
-    spans.extend(line.spans);
-    Line::from(spans).style(line.style)
 }
 
 /// 卡片左侧竖条字符；只由竖条与空白构成的行属于卡片内边距，不含正文。
@@ -800,12 +777,11 @@ fn spans_width(spans: &[Span<'static>]) -> usize {
 
 /// 把 tui-markdown 的行内样式映射到 Lucia 色板。
 ///
-/// 行内代码在 tui-markdown 里是黑底白字：换成代码色前景并加一层浅淡的"标签底色"，
-/// 让它像一枚色块而不是普通文字。链接去掉下划线改用强调色。粗体、斜体不带前景色，
-/// 原样保留。
+/// 行内代码在 tui-markdown 里是黑底白字：换成代码色前景并移除背景色，避免短代码在
+/// 正文中形成突兀的色块。链接去掉下划线改用强调色。粗体、斜体不带前景色，原样保留。
 fn restyle_inline(style: Style) -> Style {
     if style.bg.is_some() {
-        return Style::new().fg(COLOR_CODE).bg(COLOR_INLINE_CODE_BG);
+        return Style::new().fg(COLOR_CODE);
     }
     if style.fg.is_some() {
         let mut modifiers = style.add_modifier;

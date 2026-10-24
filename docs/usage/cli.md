@@ -20,7 +20,7 @@ lucia --init
 lucia --config ./lucia.json --init
 ```
 
-创建默认配置后退出。别名是 `--init-config`。初始化使用排他创建，不覆盖已有文件；macOS/Linux 下新文件权限为 `0600`。
+创建默认配置后退出。别名是 `--init-config`。初始化使用排他创建，不覆盖已有文件；macOS/Linux 下新文件权限为 `0600`。该命令同时幂等创建 `$LUCIA_HOME/skills`，失败时只输出警告，不撤销已创建的配置文件。
 
 ### `--demo`
 

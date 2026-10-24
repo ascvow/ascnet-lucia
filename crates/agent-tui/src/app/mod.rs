@@ -1,5 +1,7 @@
 //! TUI App 状态机、运行队列、插件视图状态和事件 sink。
 
+#[cfg(feature = "plugins")]
+mod agent_view;
 mod event_sink;
 mod input;
 #[cfg(feature = "plugins")]
@@ -8,6 +10,8 @@ mod run;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "plugins")]
+pub(crate) use agent_view::{AgentSessionView, AgentViewKeyOutcome};
 pub(crate) use event_sink::ChannelEventSink;
 #[cfg(feature = "plugins")]
 pub(crate) use plugin_view::{default_plugin_height, default_plugin_width, plugin_view_visible};
@@ -124,6 +128,8 @@ pub(crate) struct ToolMessageHitRegion {
 pub(crate) struct App {
     /// 本次进程固定使用的项目工作目录。
     pub(crate) workspace: WorkspaceContext,
+    /// 用户在消息里显式引用过的只读路径授权，与 Agent 的只读工具共享。
+    pub(crate) read_path_grants: agent_tool::ReadPathGrants,
     pub(crate) messages: Vec<Msg>,
     pub(crate) input: String,
     /// 等待随下一条消息发送的附件；引用标签内嵌在 `input` 文本中。
@@ -145,6 +151,10 @@ pub(crate) struct App {
     pub(crate) queued_inputs: VecDeque<UserSubmission>,
     /// 当前运行是否来自 FIFO 队首；成功预写后才允许移除对应输入。
     pub(crate) queued_run_active: bool,
+    /// 输入框上方排队消息面板的可点击行；每帧由渲染层重建。
+    pub(crate) queued_input_areas: Vec<(usize, Rect)>,
+    /// 排队面板的键盘焦点与选中下标；`None` 表示焦点在输入框。
+    pub(crate) queue_focus: Option<usize>,
     /// 光标在 input 中的字节偏移。
     pub(crate) cursor: usize,
     /// 最近成功提交的输入，供空输入框使用上下方向键回溯。
@@ -169,6 +179,19 @@ pub(crate) struct App {
     pub(crate) session_record: SessionRecord,
     /// 执行 revision 比较并交换的会话存储。
     pub(crate) session_store: Arc<dyn SessionStore>,
+    /// 会话标题生成器；demo 模式与测试环境为 `None`，此时只保留兜底标题。
+    ///
+    /// 与持久会话绑定：标题属于某个具体会话记录，切换会话后新记录仍复用同一路由。
+    pub(crate) title_generator: Option<Arc<crate::session::title::SessionTitleGenerator>>,
+    /// 本进程已经为该会话请求过标题；用会话 ID 而不是布尔值，避免切换会话后误跳过。
+    ///
+    /// 失败不重试：模型不可用时每次运行都补一次请求，只会把一次故障放大成持续延迟。
+    pub(crate) title_attempted: Option<SessionId>,
+    /// 已生成但尚未写入存储的标题。
+    ///
+    /// 运行中的轮次持有更早的记录副本，此刻保存会与该轮次的 CAS 抢同一个 revision，
+    /// 因此先暂存，由完成态落地后的 `flush_session_title` 应用。
+    pub(crate) pending_session_title: Option<String>,
     /// `/compact` 与模型请求共同使用的原生上下文加载器。
     pub(crate) context_loader: Arc<dyn ContextLoader>,
     /// 共享原生加载器的控制句柄，用于同步热切换后的模型路由与上下文窗口。
@@ -178,6 +201,11 @@ pub(crate) struct App {
     pub(crate) plugin_management: Option<Arc<PluginManagementService>>,
     pub(crate) tx: mpsc::UnboundedSender<UiEvent>,
     pub(crate) model_name: String,
+    /// 当前生效上游在配置文件里的名称，底栏用它区分同一模型 ID 的不同配置项。
+    ///
+    /// 演示模式或配置缺失时为 `None`：此时模型来自应用内置的演示路由，没有对应配置项，
+    /// 显示配置名会让人误以为配置里的上游正在生效。
+    pub(crate) model_upstream_name: Option<String>,
     /// 当前进程实际加载的配置路径；思考等级切换会原子更新该文件。
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) spinner_frame: usize,
@@ -213,12 +241,32 @@ pub(crate) struct App {
     ///
     /// 提示同时是可点击热区：手动翻阅后用鼠标即可回到底部，不必记快捷键。
     pub(crate) jump_hint_area: Option<Rect>,
+    /// 最近一帧底栏上下文用量芯片所占的区域；没有用量数据时为 `None`。
+    ///
+    /// 芯片同时是 `/context` 的鼠标入口：点它直接展开最近一次请求的分类详情。
+    pub(crate) context_chip_area: Option<Rect>,
+    /// 鼠标是否悬停在底栏上下文用量芯片上。
+    ///
+    /// 与滚动条悬停同源：只由鼠标移动更新、不消费事件，悬停时芯片提亮为强调色，
+    /// 让「这个数字可以点」在键盘优先的界面里依然能被发现。
+    pub(crate) is_context_chip_hovered: bool,
     /// 最近一帧滚动条所占的区域；内容未溢出时为 `None`。
     ///
-    /// 该区域同时是可拖拽热区：在滑块轨道上按下或拖动即可定位到对应位置。
+    /// 该区域同时是可拖拽热区与悬停判定区：在滑块轨道上按下或拖动即可定位到对应位置。
+    /// 几何只占贴边的一列，悬停仅提亮配色、不改变宽度，避免盖住正文最后一列。
     pub(crate) scrollbar_area: Option<Rect>,
+    /// 拖动期间指针相对滑块顶端的偏移，单位是半行；未拖动时为 `None`。
+    ///
+    /// 按下滑块时记录它，后续拖动只按指针位移平移滑块，因此抓住滑块的任何位置都不会
+    /// 在按下瞬间跳动。滑块几何由渲染函数与拖动共用，输入侧不额外保存屏幕坐标。
+    pub(crate) scrollbar_grab_half: Option<i32>,
     /// 是否正在拖拽滚动条；拖拽期间只响应左键拖动与释放。
     pub(crate) scrollbar_drag: bool,
+    /// 鼠标是否悬停在滚动条上；悬停时轨道与滑块各提亮一档。
+    ///
+    /// 只由鼠标移动事件在 [`App::handle_mouse_event`] 中更新：悬停是纯视觉状态，不消费
+    /// 事件、也不改变滚动位置。滚动条不再绘制时由渲染层复位，避免高亮残留。
+    pub(crate) is_scrollbar_hovered: bool,
     /// 最近一帧可见且具有详情的工具消息点击区域。
     pub(crate) tool_message_hit_regions: Vec<ToolMessageHitRegion>,
     /// 主事件区的消息布局缓存；只保留可见窗口内的渲染结果。
@@ -315,6 +363,9 @@ pub(crate) struct App {
     /// 主视图之上的插件子视图导航栈。
     #[cfg(feature = "plugins")]
     pub(crate) view_stack: ViewStack,
+    /// 导航栈中宿主原生 Agent 会话视图的运行状态，按成员实例 ID 对齐。
+    #[cfg(feature = "plugins")]
+    pub(crate) agent_views: Vec<AgentSessionView>,
     /// 最近一次会话摘要查询任务；新查询会中止尚未完成的旧查询。
     #[cfg(feature = "plugins")]
     pub(crate) sessions_query_task: Option<tokio::task::JoinHandle<()>>,
@@ -462,6 +513,11 @@ pub(crate) enum PluginKeyRoute {
 ///
 /// 参数是**具体字段**而不是 `&App`：调用方通常还要同时可变借用
 /// `app.transcript_layout`，若这里借用整个 `App`，借用检查会直接拒绝。
+//
+// 生命周期在插件构建下是必需的：`snapshot` 与 `messages` 是两个输入借用，返回值只借用
+// 后者。纯 Core 构建里 `snapshot` 参数被 cfg 掉，只剩一个输入生命周期，clippy 因此认为
+// 它可以省略。
+#[allow(clippy::needless_lifetimes)]
 pub(crate) fn timeline_messages<'a>(
     #[cfg(feature = "plugins")] snapshot: &'a Option<MainEventSnapshot>,
     messages: &'a [Msg],
@@ -481,6 +537,7 @@ impl App {
             .expect("创建进程内默认会话记录");
         Self {
             workspace: WorkspaceContext::capture().expect("当前工作目录应可用"),
+            read_path_grants: agent_tool::ReadPathGrants::new(),
             messages: Vec::new(),
             input: String::new(),
             attachments: Vec::new(),
@@ -494,6 +551,8 @@ impl App {
             context_ref_task: None,
             queued_inputs: VecDeque::new(),
             queued_run_active: false,
+            queued_input_areas: Vec::new(),
+            queue_focus: None,
             cursor: 0,
             input_history: Vec::new(),
             input_history_cursor: None,
@@ -506,12 +565,16 @@ impl App {
             should_quit: false,
             session_record,
             session_store: Arc::new(MemorySessionStore::new()),
+            title_generator: None,
+            title_attempted: None,
+            pending_session_title: None,
             context_loader: Arc::new(agent_core::PassthroughContextLoader),
             native_context_loader: None,
             #[cfg(feature = "plugins")]
             plugin_management: None,
             tx,
             model_name,
+            model_upstream_name: None,
             config_path: None,
             spinner_frame: 0,
             streaming_message: None,
@@ -526,8 +589,12 @@ impl App {
             last_viewport: 0,
             key_inspect: false,
             jump_hint_area: None,
+            context_chip_area: None,
+            is_context_chip_hovered: false,
             scrollbar_area: None,
+            scrollbar_grab_half: None,
             scrollbar_drag: false,
+            is_scrollbar_hovered: false,
             tool_message_hit_regions: Vec::new(),
             transcript_layout: crate::ui::transcript_layout::TranscriptLayout::default(),
             tool_click_candidate: None,
@@ -581,6 +648,8 @@ impl App {
             #[cfg(feature = "plugins")]
             view_stack: ViewStack::default(),
             #[cfg(feature = "plugins")]
+            agent_views: Vec::new(),
+            #[cfg(feature = "plugins")]
             sessions_query_task: None,
             #[cfg(feature = "plugins")]
             applied_host_actions: VecDeque::new(),
@@ -597,11 +666,23 @@ impl App {
         let plugin_activity = self.plugins_loading || self.plugin_status_ticks > 0;
         #[cfg(not(feature = "plugins"))]
         let plugin_activity = false;
+        // 原生会话视图运行中时旋转指示与耗时每秒都在变化，必须继续出帧。
+        #[cfg(feature = "plugins")]
+        let agent_view_activity = self.active_agent_session_view().is_some_and(|view| {
+            !view.closed
+                && matches!(
+                    view.status,
+                    Some(agent_runtime::AgentStatus::Queued | agent_runtime::AgentStatus::Running)
+                )
+        });
+        #[cfg(not(feature = "plugins"))]
+        let agent_view_activity = false;
         // 有待揭示文本时必须继续出帧，否则打字机会停在当前字符上等下一个网络事件。
         self.running
             || self.has_pending_stream()
             || self.pending_reload.is_some()
             || plugin_activity
+            || agent_view_activity
     }
 
     /// 注入启动时读取的渲染模式；缺省为全屏。
@@ -616,9 +697,24 @@ impl App {
         self
     }
 
+    /// 注入与只读工具共享的用户路径授权集合。
+    pub(crate) fn with_read_path_grants(mut self, grants: agent_tool::ReadPathGrants) -> Self {
+        self.read_path_grants = grants;
+        self
+    }
+
     /// 注入本次启动实际读取的配置文件，供交互设置执行原子持久化。
     pub(crate) fn with_config_path(mut self, config_path: PathBuf) -> Self {
         self.config_path = Some(config_path);
+        self
+    }
+
+    /// 注入会话标题生成器；未注入时（demo 模式、测试）保留首条消息兜底标题。
+    pub(crate) fn with_title_generator(
+        mut self,
+        generator: Arc<crate::session::title::SessionTitleGenerator>,
+    ) -> Self {
+        self.title_generator = Some(generator);
         self
     }
 
@@ -682,12 +778,19 @@ impl App {
 
     /// 用完整记录替换当前会话，并清理只属于旧会话的瞬时界面状态。
     pub(crate) fn replace_session(&mut self, session_record: SessionRecord, notice: Option<&str>) {
+        // 压缩等操作会用同一会话的新记录替换内存状态，此时路径授权继续有效。
+        let session_changed = self.session_record.id != session_record.id;
         self.messages = restore_session_messages(&session_record.session);
         self.session_record = session_record;
         self.input.clear();
         self.attachments.clear();
+        if session_changed {
+            self.read_path_grants.clear();
+        }
         self.cursor = 0;
         self.queued_inputs.clear();
+        self.queued_input_areas.clear();
+        self.queue_focus = None;
         self.streaming_message = None;
         self.run_stream_cancelled = false;
         self.model_is_thinking = false;
@@ -703,8 +806,11 @@ impl App {
         self.session_usage = TokenUsage::default();
         self.native_command.context_open = false;
         self.last_escape_at = None;
-        self.native_command.dialog = None;
+        self.native_command.session_palette = None;
         self.native_command.reasoning_panel = None;
+        // 标题属于旧会话：切换后到达的结果会被 ID 校验丢弃，暂存内容也必须一并清掉，
+        // 否则下一个会话可能继承上一个会话的名字。
+        self.pending_session_title = None;
         #[cfg(feature = "plugins")]
         {
             self.native_command.plugin_dialog = None;

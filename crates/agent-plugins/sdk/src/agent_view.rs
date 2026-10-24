@@ -1,4 +1,7 @@
 //! 插件复用的派生 Agent 主界面状态与交互逻辑。
+//!
+//! 支持原生 Agent 会话视图的宿主（例如 Lucia TUI）会用主界面组件直接渲染目标 Agent，
+//! 只把用户提交回送插件；本类型用于没有原生视图能力的宿主自行绘制文本帧。
 
 use crate::{
     AgentContinueRequest, AgentEvent, AgentEventKind, AgentHandle, AgentId, AgentStatus,

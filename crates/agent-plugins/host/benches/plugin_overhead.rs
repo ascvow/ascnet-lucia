@@ -310,6 +310,7 @@ async fn main() -> Result<()> {
     // 在 UI 派发计时前显式建立快照，隔离声明聚合成本和热路径路由成本。
     black_box(PluginHost::ui_declarations(&populated_composite).await?);
     let ui_request = UiRenderRequest {
+        session_id: None,
         plugin_id: routed_plugin.id.clone(),
         view_id: routed_plugin.view_id.clone(),
         instance_id: None,

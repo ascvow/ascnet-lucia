@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use sha2::Digest;
 pub(crate) mod attachment;
 pub(crate) mod conversation;
+pub(crate) mod title;
 
 use crate::app::App;
 use crate::config::resolve_config_relative_path;

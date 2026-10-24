@@ -5,11 +5,11 @@
 
 use agent_plugin::{
     core_events, export_plugin, ActivationContext, AgentHandle, AgentId, AgentOutcome, AgentPlugin,
-    AgentSpawnRequest, AgentStatus, AgentViewSession, EventOutcome, ExtensionEvent, PluginEvent,
-    PluginHostApi, Result, RunFinishEventData, ServiceCall, ServiceSpec, ToolCall,
-    ToolPermissionScope, ToolResult, ToolSpec, UiColor, UiCursor, UiDeclaration, UiFrame, UiInput,
-    UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest,
-    UiSize, UiSpan, UiStyle, UiViewInstance,
+    AgentSpawnRequest, AgentStatus, EventOutcome, ExtensionEvent, PluginEvent, PluginHostApi,
+    Result, RunFinishEventData, ServiceCall, ServiceSpec, ToolCall, ToolPermissionScope,
+    ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
+    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -49,7 +49,7 @@ const MAX_PENDING_COLLECTIONS: usize = 64;
 const TEAM_DOCK_VIEW: &str = "teammate-team-dock";
 /// 替换主界面的团队工作台子视图。
 const TEAM_WORKSPACE_VIEW: &str = "teammate-team-workspace";
-/// 展示单个成员实时执行过程并接收交互消息的子视图。
+/// 成员实时会话视图；实例由宿主原生渲染，声明只用于输入路由与标题。
 const TEAM_SESSION_VIEW: &str = "teammate-member-session";
 
 /// Teammate 消息的可信发送方。
@@ -128,6 +128,8 @@ struct Member {
     /// 成员在运行结束后是否该解散，取决于管理它的那一轮是否已经结束；Service 调用
     /// 没有运行身份，因此保持 `None` 并由调用方显式 remove。
     last_controller_run: Option<String>,
+    /// 最近一次交给该成员的正文；原生会话视图用它补上不进入事件流的首个用户消息。
+    last_input: String,
 }
 
 impl Member {
@@ -203,6 +205,7 @@ impl TeamState {
             status: AgentStatus::Queued,
             error: None,
             last_controller_run: controller_run,
+            last_input: String::new(),
         };
         let snapshot = member.snapshot(&address, 0);
         self.members.insert(address.clone(), member);
@@ -606,7 +609,6 @@ struct TeammatePlugin {
     state: TeamState,
     selected_member: usize,
     navigation_sequence: u64,
-    member_sessions: BTreeMap<AgentId, AgentViewSession>,
     /// 等待 Runtime 回收的已结束句柄；投胎会替换当前句柄，旧句柄的会话与名额需要释放。
     pending_collections: VecDeque<AgentId>,
 }
@@ -656,9 +658,9 @@ impl TeammatePlugin {
             handle,
             controller_run.map(str::to_string),
         )?;
-        let mut session = AgentViewSession::new(member.current_agent_id.clone());
-        session.record_user_message(agent_input);
-        self.member_sessions.insert(member.id.clone(), session);
+        if let Ok(stored) = self.state.member_mut(owner, &member.id) {
+            stored.last_input = agent_input.clone();
+        }
         emit(
             host,
             "teammate.member.spawned",
@@ -805,8 +807,6 @@ impl TeammatePlugin {
             .clone();
         let cancelled = host.cancel_agent(&target)?;
         let member = self.state.remove_member(owner, &request.member_id)?;
-        // 成员移除后同步释放预先创建的 prompt 与历史视图，避免重复派生持续占用内存。
-        self.member_sessions.remove(&request.member_id);
         // 取消是异步收尾：句柄进入待回收队列，由后续帧在终态后释放名额与会话。
         self.schedule_collection(target);
         emit(
@@ -848,7 +848,6 @@ impl TeammatePlugin {
             };
             let outcome = host.agent_result(&target).ok().flatten();
             if let Ok(snapshot) = self.state.retire(&owner, &address, outcome) {
-                self.member_sessions.remove(&address);
                 // 成员已离开活跃目录，Runtime 侧同一投胎的会话与名额也应释放。
                 self.schedule_collection(target);
                 retired.push(snapshot);
@@ -943,12 +942,9 @@ impl TeammatePlugin {
         if let Some(previous) = previous {
             self.schedule_collection(previous);
         }
-        let session = self
-            .member_sessions
-            .entry(request.member_id.clone())
-            .or_insert_with(|| AgentViewSession::new(handle.id.clone()));
-        session.replace_target(handle.id.clone());
-        session.record_user_message(input);
+        if let Ok(member) = self.state.member_mut(owner, &request.member_id) {
+            member.last_input = input.clone();
+        }
         // 旧句柄此刻已经终态，立即尝试回收名额，避免连续派活攒下未回收的投胎。
         self.flush_collections(host);
         emit(
@@ -1272,102 +1268,91 @@ impl TeammatePlugin {
         lines
     }
 
-    /// 渲染与主 Agent 一致的成员会话时间线和可编辑输入框。
-    fn render_member_session(&self, request: &UiRenderRequest) -> Vec<UiLine> {
-        let Some(instance_id) = request.instance_id.as_deref() else {
-            return vec![ui_line(vec![ui_span(
-                "Member session is missing an instance ID",
-                Some(UiColor::Red),
-                false,
-            )])];
-        };
-        let owner = self.plugin_id.as_deref().unwrap_or_default();
-        let Some(member) = self
-            .state
-            .list_members(owner)
-            .into_iter()
-            .find(|member| member.id.as_str() == instance_id)
-        else {
-            // 回收后成员会话视图可能仍停留在导航栈里：说明原因，而不是报“找不到”。
-            let released = self
-                .state
-                .list_retired(owner)
-                .iter()
-                .any(|member| member.id.as_str() == instance_id);
-            return vec![ui_line(vec![ui_span(
-                if released {
-                    "Member completed and was released"
-                } else {
-                    "Member not found"
-                },
-                Some(if released {
-                    UiColor::Gray
-                } else {
-                    UiColor::Red
-                }),
-                false,
-            )])];
-        };
-        let Some(session) = self.member_sessions.get(&member.id) else {
-            return vec![ui_line(vec![ui_span(
-                "Connecting to member session",
-                Some(UiColor::Gray),
-                false,
-            )])];
-        };
-        session.render(request.width, request.height)
-    }
-
-    /// 把共享 Agent 输入光标转换为成员子视图帧内的相对坐标。
-    fn member_session_cursor(&self, request: &UiRenderRequest) -> Option<UiCursor> {
-        let instance_id = request.instance_id.as_deref()?;
-        let owner = self.plugin_id.as_deref().unwrap_or_default();
-        let member = self
-            .state
-            .list_members(owner)
-            .into_iter()
-            .find(|member| member.id.as_str() == instance_id)?;
-        let session = self.member_sessions.get(&member.id)?;
-        session.cursor_position(request.width, request.height)
-    }
-
-    /// 把成员会话的键盘或滚轮输入交给共享 Agent 视图，并在续跑产生新句柄时更新成员映射。
-    fn handle_member_session_input(
+    /// 处理原生成员会话视图提交的一条用户消息。
+    ///
+    /// 排队或运行中的成员接收 steering；成功终态成员创建后续运行，并在新句柄就绪后
+    /// 用同一实例 ID 重新打开视图，让宿主换订阅而不是清空已显示的历史。失败与取消
+    /// 状态不隐式重试，原因写回视图说明。
+    fn submit_member_message(
         &mut self,
         host: &dyn PluginHostApi,
         instance_id: Option<&str>,
-        event: UiInputEvent,
+        text: String,
     ) {
         let Some(instance_id) = instance_id else {
             return;
         };
-        let Some(member_id) = self
-            .member_sessions
-            .keys()
-            .find(|member_id| member_id.as_str() == instance_id)
-            .cloned()
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let owner = self.plugin_id.clone().unwrap_or_default();
+        let Some(address) = self
+            .state
+            .list_members(&owner)
+            .into_iter()
+            .find(|member| member.id.as_str() == instance_id)
+            .map(|member| member.id)
         else {
             return;
         };
-        let continued = self
-            .member_sessions
-            .get_mut(&member_id)
-            .and_then(|session| session.handle_input(host, &event));
-        if let Some(handle) = continued {
-            let owner = self.plugin_id.clone().unwrap_or_default();
-            let mut previous = None;
-            if let Ok(member) = self.state.member_mut(&owner, &member_id) {
-                previous = Some(member.current.id.clone());
-                member.current = handle;
-                member.status = AgentStatus::Queued;
-                member.error = None;
+        let target = match self.state.member(&owner, &address) {
+            Ok(member) => member.current.id.clone(),
+            Err(_) => return,
+        };
+        let snapshot = match host.agent_status(&target) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.open_member_session(
+                    host,
+                    &address,
+                    &target,
+                    Some(format!("读取成员状态失败：{error}")),
+                );
+                return;
             }
-            // 成员会话里的每轮新任务也会投胎，旧句柄同样要回收。
-            if let Some(previous) = previous {
-                self.schedule_collection(previous);
+        };
+        let result = match snapshot.status {
+            AgentStatus::Queued | AgentStatus::Running => {
+                host.steer_agent(&target, &text).map(|_| None)
+            }
+            AgentStatus::Succeeded => host
+                .continue_agent(&agent_plugin::AgentContinueRequest::new(
+                    target.clone(),
+                    text.clone(),
+                ))
+                .map(Some),
+            AgentStatus::Ready | AgentStatus::Failed | AgentStatus::Cancelled => {
+                Err(anyhow!("成员当前状态不能接收消息"))
+            }
+        };
+        match result {
+            Ok(Some(handle)) => {
+                if let Ok(member) = self.state.member_mut(&owner, &address) {
+                    member.current = handle.clone();
+                    member.status = AgentStatus::Queued;
+                    member.error = None;
+                    member.last_input = text.clone();
+                }
+                // 每轮新任务都是一次投胎：旧句柄进入待回收队列，视图改用新句柄。
+                self.schedule_collection(target);
+                self.flush_collections(host);
+                self.open_member_session(host, &address, &handle.id, None);
+            }
+            Ok(None) => {
+                if let Ok(member) = self.state.member_mut(&owner, &address) {
+                    member.status = AgentStatus::Running;
+                }
+            }
+            Err(error) => {
+                self.open_member_session(
+                    host,
+                    &address,
+                    &target,
+                    Some(format!("消息未送达：{error}")),
+                );
             }
         }
-        self.flush_collections(host);
     }
 
     /// 刷新当前工具 owner 名下全部成员的 Runtime 状态缓存。
@@ -1405,30 +1390,6 @@ impl TeammatePlugin {
             };
             if let (Some(error), Ok(member)) = (error, self.state.member_mut(&owner, &address)) {
                 member.error = Some(error);
-            }
-        }
-    }
-
-    /// 让共享 Agent 主界面刷新成员当前句柄的状态与增量事件。
-    fn refresh_member_session(&mut self, host: &dyn PluginHostApi, instance_id: &str) {
-        let owner = self.plugin_id.clone().unwrap_or_default();
-        let Some(member) = self
-            .state
-            .list_members(&owner)
-            .into_iter()
-            .find(|member| member.id.as_str() == instance_id)
-        else {
-            return;
-        };
-        let session = self
-            .member_sessions
-            .entry(member.id.clone())
-            .or_insert_with(|| AgentViewSession::new(member.current_agent_id.clone()));
-        session.replace_target(member.current_agent_id);
-        session.refresh(host);
-        if let Some(status) = session.status() {
-            if let Ok(stored) = self.state.member_mut(&owner, &member.id) {
-                stored.status = status;
             }
         }
     }
@@ -1472,25 +1433,45 @@ impl TeammatePlugin {
         });
     }
 
-    /// 打开当前选中成员的实时会话子视图。
+    /// 请求宿主以原生界面打开选中成员的实时会话。
     fn open_selected_member_session(&mut self, host: &dyn PluginHostApi) {
         let owner = self.plugin_id.clone().unwrap_or_default();
         let members = self.state.list_members(&owner);
         let Some(member) = members.get(self.selected_member) else {
             return;
         };
-        self.member_sessions
-            .entry(member.id.clone())
-            .or_insert_with(|| AgentViewSession::new(member.current_agent_id.clone()));
+        self.open_member_session(host, &member.id, &member.current_agent_id, None);
+    }
+
+    /// 以原生 Agent 会话视图打开成员，携带当前句柄、角色标题与可选说明。
+    ///
+    /// 同一成员续跑后必须沿用实例 ID：宿主据此更新目标句柄而不是压入重复视图，
+    /// 已显示的历史与输入草稿因此不会因为换句柄而丢失。
+    fn open_member_session(
+        &mut self,
+        host: &dyn PluginHostApi,
+        address: &AgentId,
+        target: &AgentId,
+        notice: Option<String>,
+    ) {
+        let owner = self.plugin_id.clone().unwrap_or_default();
+        let (title, prompt) = match self.state.member(&owner, address) {
+            Ok(member) => (
+                member.role.clone(),
+                (!member.last_input.trim().is_empty()).then(|| member.last_input.clone()),
+            ),
+            Err(_) => return,
+        };
         self.navigation_sequence = self.navigation_sequence.saturating_add(1);
         let _ = host.navigate_view(UiNavigationRequest {
             request_id: format!("teammate-member-{}", self.navigation_sequence),
-            action: UiNavigationAction::Push {
-                view: UiViewInstance {
-                    view_id: TEAM_SESSION_VIEW.into(),
-                    instance_id: member.id.as_str().into(),
-                    title: Some(member.role.clone()),
-                },
+            action: UiNavigationAction::OpenAgentSession {
+                view_id: TEAM_SESSION_VIEW.into(),
+                instance_id: address.as_str().to_string(),
+                target: target.as_str().to_string(),
+                title: Some(title),
+                prompt,
+                notice,
             },
         });
     }
@@ -1515,7 +1496,6 @@ impl AgentPlugin for TeammatePlugin {
         self.plugin_id = None;
         self.workspace_root = None;
         self.state = TeamState::default();
-        self.member_sessions.clear();
         Ok(())
     }
 
@@ -1604,7 +1584,10 @@ impl AgentPlugin for TeammatePlugin {
         )
     }
 
-    /// 声明右侧团队入口与可动态打开的全屏工作台。
+    /// 声明右侧团队入口、全屏工作台和成员会话的输入路由。
+    ///
+    /// 成员会话由宿主原生渲染，声明仍然存在：宿主用它校验实例、路由提交的正文
+    /// 并继承默认标题，插件不再为它返回任何文本帧。
     fn describe_ui(&self) -> Vec<UiDeclaration> {
         vec![
             UiDeclaration {
@@ -1645,20 +1628,16 @@ impl AgentPlugin for TeammatePlugin {
     /// 团队摘要在当前 owner 没有成员时返回隐藏帧，子视图不受该条件影响。
     fn render_ui(&mut self, request: UiRenderRequest) -> Option<UiFrame> {
         let visible = request.view_id != TEAM_DOCK_VIEW || !self.ui_members().is_empty();
-        let cursor = (request.view_id == TEAM_SESSION_VIEW)
-            .then(|| self.member_session_cursor(&request))
-            .flatten();
         let lines = match request.view_id.as_str() {
             TEAM_DOCK_VIEW => self.render_team_dock(&request),
             TEAM_WORKSPACE_VIEW => self.render_team_workspace(&request),
-            TEAM_SESSION_VIEW => self.render_member_session(&request),
             _ => return None,
         };
         Some(UiFrame {
             view_id: request.view_id,
             visible,
             lines,
-            cursor,
+            cursor: None,
         })
     }
 
@@ -1670,11 +1649,6 @@ impl AgentPlugin for TeammatePlugin {
     ) -> Option<UiFrame> {
         match request.view_id.as_str() {
             TEAM_DOCK_VIEW | TEAM_WORKSPACE_VIEW => self.refresh_ui_statuses(host),
-            TEAM_SESSION_VIEW => {
-                if let Some(instance_id) = request.instance_id.as_deref() {
-                    self.refresh_member_session(host, instance_id);
-                }
-            }
             _ => {}
         }
         self.render_ui(request)
@@ -1702,19 +1676,8 @@ impl AgentPlugin for TeammatePlugin {
                     _ => {}
                 }
             }
-            UiInputEvent::Key { code, modifiers } if input.view_id == TEAM_SESSION_VIEW => {
-                self.handle_member_session_input(
-                    host,
-                    input.instance_id.as_deref(),
-                    UiInputEvent::Key { code, modifiers },
-                );
-            }
-            UiInputEvent::Mouse { kind, x, y } if input.view_id == TEAM_SESSION_VIEW => {
-                self.handle_member_session_input(
-                    host,
-                    input.instance_id.as_deref(),
-                    UiInputEvent::Mouse { kind, x, y },
-                );
+            UiInputEvent::Submit { text } if input.view_id == TEAM_SESSION_VIEW => {
+                self.submit_member_message(host, input.instance_id.as_deref(), text);
             }
             UiInputEvent::Mouse { kind, y, .. }
                 if input.view_id == TEAM_WORKSPACE_VIEW && kind.starts_with("down_") =>
@@ -2433,7 +2396,11 @@ mod tests {
             .expect("UI 测试成员应登记成功");
 
         let declarations = plugin.describe_ui();
-        assert_eq!(declarations.len(), 3);
+        assert_eq!(
+            declarations.len(),
+            3,
+            "插件声明团队入口、工作台和成员会话的输入路由"
+        );
         assert_eq!(declarations[0].placement, UiPlacement::Right);
         assert_eq!(declarations[0].size.width, Some(36));
         assert!(declarations[0].focusable);
@@ -2516,35 +2483,6 @@ mod tests {
             workspace_text.contains("Open member session"),
             "{workspace_text}"
         );
-
-        let member = plugin.state.list_members("teammate").remove(0);
-        plugin.member_sessions.insert(
-            member.id.clone(),
-            AgentViewSession::new(member.current_agent_id.clone()),
-        );
-        let session = plugin
-            .render_ui(UiRenderRequest {
-                session_id: None,
-                plugin_id: "teammate".into(),
-                view_id: TEAM_SESSION_VIEW.into(),
-                instance_id: Some(member.id.as_str().into()),
-                width: 80,
-                height: 24,
-                focused: true,
-                frame: 3,
-            })
-            .expect("成员会话应返回可见帧");
-        let session_text = session
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.text.as_str())
-            .collect::<String>();
-        assert!(
-            session_text.contains("Waiting for Agent events"),
-            "{session_text}"
-        );
-        assert_eq!(session.cursor, Some(UiCursor { x: 2, y: 22 }));
     }
 
     /// 当前 owner 没有成员时，团队摘要不应占用右侧面板。
@@ -2568,53 +2506,5 @@ mod tests {
             .expect("团队摘要应返回帧");
 
         assert!(!frame.visible);
-    }
-
-    /// 已回收成员的会话视图应说明已完成并释放，而不是报“找不到”。
-    #[test]
-    fn retired_member_session_explains_release() {
-        let mut plugin = TeammatePlugin {
-            plugin_id: Some("teammate".into()),
-            ..TeammatePlugin::default()
-        };
-        let member = plugin
-            .state
-            .add_member(
-                "teammate",
-                "worker".into(),
-                false,
-                handle("released-ui"),
-                None,
-            )
-            .expect("成员应登记成功");
-        plugin
-            .state
-            .member_mut("teammate", &member.id)
-            .expect("成员存在")
-            .status = AgentStatus::Succeeded;
-        plugin
-            .state
-            .retire("teammate", &member.id, None)
-            .expect("完成成员应可回收");
-
-        let frame = plugin
-            .render_ui(UiRenderRequest {
-                session_id: None,
-                plugin_id: "teammate".into(),
-                view_id: TEAM_SESSION_VIEW.into(),
-                instance_id: Some(member.id.as_str().into()),
-                width: 60,
-                height: 10,
-                focused: true,
-                frame: 1,
-            })
-            .expect("回收后的成员会话应返回帧");
-        let text = frame
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.text.as_str())
-            .collect::<String>();
-        assert!(text.contains("completed and was released"), "{text}");
     }
 }

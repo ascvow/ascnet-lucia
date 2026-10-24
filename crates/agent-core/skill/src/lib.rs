@@ -23,6 +23,29 @@ const MAX_SCAN_DEPTH: usize = 8;
 const MAX_SCAN_ENTRIES: usize = 4_096;
 const MAX_SKILL_BYTES: usize = 256 * 1024;
 
+/// 确保用户级 Skill 根目录存在。
+///
+/// 只在目录缺失时递归创建，已有目录原样保留；重复调用不产生副作用。目标已存在但不是
+/// 非符号链接目录时返回错误，避免后续扫描被重定向到目录之外。
+///
+/// # Errors
+///
+/// 目录无法创建，或目标已存在但不是非符号链接目录时返回错误。
+pub fn ensure_skill_root(root: &Path) -> Result<()> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(anyhow!(
+            "Skill 根目录必须是非符号链接目录：{}",
+            root.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(root)
+            .with_context(|| format!("创建 Skill 根目录失败：{}", root.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("读取 Skill 根目录失败：{}", root.display()))
+        }
+    }
+}
+
 /// 原生 Skill 目录；名称唯一且按字典序稳定排列。
 #[derive(Debug, Clone, Default)]
 pub struct SkillCatalog {
@@ -357,6 +380,27 @@ fn validate_skill_name(name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use agent_tool::ToolCall;
+
+    /// 用户级 Skill 根目录必须幂等创建，并拒绝把非目录当成根目录。
+    #[test]
+    fn ensures_user_skill_root_idempotently() {
+        let root = std::env::temp_dir().join(format!("lucia-skill-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+
+        let skill_root = root.join("skills");
+        ensure_skill_root(&skill_root).expect("应创建 Skill 根目录");
+        assert!(skill_root.is_dir());
+        ensure_skill_root(&skill_root).expect("重复调用应保持幂等");
+
+        let file_root = root.join("not-a-dir");
+        fs::write(&file_root, "占位").expect("应写入占位文件");
+        assert!(
+            ensure_skill_root(&file_root).is_err(),
+            "普通文件不能作为 Skill 根目录"
+        );
+
+        fs::remove_dir_all(root).expect("应清理 Skill 测试目录");
+    }
 
     /// 本地 Skill 应进入提示并由原生工具按需读取完整正文。
     #[tokio::test]

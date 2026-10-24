@@ -162,15 +162,172 @@ impl App {
 
     /// Queues one complete input while plugin loading keeps the Agent unavailable.
     ///
-    /// 插件加载导致 Agent 尚不可用时，将一条完整输入加入 FIFO 队列。
+    /// 插件加载导致 Agent 尚不可用时，将一条完整输入加入 FIFO 队列。待发送消息只显示
+    /// 在输入框上方的排队面板里，发送并持久化后才进入会话记录。
     pub(crate) fn queue_input_until_ready(&mut self) {
         let Some(submission) = self.take_submission() else {
             return;
         };
-        self.messages
-            .push(Msg::new(MsgKind::User, submission.text.clone()));
         self.queued_inputs.push_back(submission);
         self.scroll = None;
+    }
+
+    /// 把队列中的一条消息取回输入框继续编辑；返回是否成功。
+    ///
+    /// 输入框已有草稿时先按正常提交规则把草稿排到队尾，保证两边内容都不丢。正在发送
+    /// 的队首不能取回：它已经进入运行，移除会让完成回调找不到对应的 FIFO 输入。
+    pub(crate) fn edit_queued_input(&mut self, index: usize) -> bool {
+        if index >= self.queued_inputs.len() {
+            return false;
+        }
+        if self.queued_run_active && index == 0 {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "该排队消息正在发送，无法取回编辑"));
+            return false;
+        }
+        let has_draft =
+            !self.input.trim().is_empty() || !self.attachments.is_empty() || !self.refs.is_empty();
+        if has_draft {
+            let Some(draft) = self.take_submission() else {
+                return false;
+            };
+            // 追加到队尾不影响待取回条目的下标。
+            self.queued_inputs.push_back(draft);
+        }
+        let Some(queued) = self.queued_inputs.get(index).cloned() else {
+            return false;
+        };
+        self.queued_inputs.remove(index);
+        // 发送时自动附加的附件（正文里点名的图片等）没有对应的输入标签；取回编辑时
+        // 补在正文末尾，否则任何一次编辑都会按"标签已删除"把它回收掉。
+        let mut text = queued.text;
+        for attachment in &queued.attachments {
+            if !text.contains(&attachment.label) {
+                text.push(' ');
+                text.push_str(&attachment.label);
+            }
+        }
+        for entry in &queued.refs {
+            if !text.contains(&entry.label) {
+                text.push(' ');
+                text.push_str(&entry.label);
+            }
+        }
+        self.input = text;
+        self.cursor = self.input.len();
+        self.attachments = queued.attachments;
+        self.refs = queued.refs;
+        self.queue_focus = None;
+        self.finish_input_edit();
+        self.scroll = None;
+        self.messages.push(Msg::new(
+            MsgKind::Info,
+            "已取回排队消息；修改后按 Enter 重新入队，清空输入即取消",
+        ));
+        true
+    }
+
+    /// 把键盘焦点移入排队面板；队列为空时返回 `false`。
+    pub(crate) fn focus_queue(&mut self) -> bool {
+        let len = self.queued_inputs.len();
+        if len == 0 {
+            self.queue_focus = None;
+            return false;
+        }
+        self.queue_focus = Some(self.queue_focus.unwrap_or(0).min(len - 1));
+        true
+    }
+
+    /// 在排队面板内移动选择；越界时停在队首或队尾。
+    pub(crate) fn move_queue_selection(&mut self, delta: isize) {
+        let len = self.queued_inputs.len();
+        if len == 0 {
+            self.queue_focus = None;
+            return;
+        }
+        let current = self.queue_focus.unwrap_or(0).min(len - 1) as isize;
+        let next = (current + delta).clamp(0, len as isize - 1);
+        self.queue_focus = Some(next as usize);
+    }
+
+    /// 发送排队面板中选中的消息。
+    ///
+    /// 空闲时立即作为新一轮发送并移出队列，剩余队列在该轮结束后继续 FIFO；运行中
+    /// 不打断当前轮次，只把选中项移到队首之后（或队首），等本轮结束后发送。
+    pub(crate) fn send_selected_queued(&mut self, agent: Option<&Arc<Agent>>) {
+        let Some(index) = self.queue_focus else {
+            return;
+        };
+        let len = self.queued_inputs.len();
+        if len == 0 {
+            self.queue_focus = None;
+            return;
+        }
+        let index = index.min(len - 1);
+        if self.queued_run_active && index == 0 {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "该排队消息正在发送，无法重复发送"));
+            return;
+        }
+        if self.pending_reload.is_some() {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "上下文压缩仍在进行中，请稍候"));
+            return;
+        }
+        if self.running {
+            let Some(submission) = self.queued_inputs.remove(index) else {
+                return;
+            };
+            // 队首正在发送时不能插到它前面：完成回调要用队首与运行输入做配对校验。
+            let insert_at = usize::from(self.queued_run_active).min(self.queued_inputs.len());
+            self.queued_inputs.insert(insert_at, submission);
+            self.queue_focus = Some(insert_at);
+            self.messages
+                .push(Msg::new(MsgKind::Info, "已置顶，本轮结束后发送"));
+            return;
+        }
+        let Some(agent) = agent else {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "模型尚未就绪，排队消息保持不动"));
+            return;
+        };
+        let Some(submission) = self.queued_inputs.remove(index) else {
+            return;
+        };
+        self.queue_focus = if self.queued_inputs.is_empty() {
+            None
+        } else {
+            Some(index.min(self.queued_inputs.len() - 1))
+        };
+        self.queued_run_active = false;
+        self.start_input_run(agent, submission, true);
+    }
+
+    /// 丢弃排队面板中选中的消息；正在发送的队首不可丢弃。
+    pub(crate) fn remove_selected_queued(&mut self) {
+        let Some(index) = self.queue_focus else {
+            return;
+        };
+        let len = self.queued_inputs.len();
+        if len == 0 {
+            self.queue_focus = None;
+            return;
+        }
+        let index = index.min(len - 1);
+        if self.queued_run_active && index == 0 {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "该排队消息正在发送，无法丢弃"));
+            return;
+        }
+        if self.queued_inputs.remove(index).is_some() {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "已丢弃排队消息"));
+        }
+        self.queue_focus = if self.queued_inputs.is_empty() {
+            None
+        } else {
+            Some(index.min(self.queued_inputs.len() - 1))
+        };
     }
 
     /// 运行中提交 steering 插话：跳过剩余工具，让模型立即响应新指令。
@@ -425,6 +582,10 @@ impl App {
         // 用户取消后保留 Esc 时冻结的界面；Session 仍更新到持久完成态，但不能让迟到内容
         // 在 AgentDone 阶段重新跳回消息列表。其他失败仅在没有完成态 Session 时保留界面。
         let preserve_visible_history = user_cancelled || (run.is_none() && error.is_some());
+        // 只有真正跑完并留下回答的轮次才值得起标题：取消、失败或没有完成态会话时，
+        // 首问首答不完整，生成出来的标题只会是猜测。
+        let run_succeeded =
+            error.is_none() && input_committed && run.as_ref().is_some_and(|run| !run.cancelled);
         self.running = false;
         self.run_started_at = None;
         self.model_is_thinking = false;
@@ -435,17 +596,21 @@ impl App {
                 .pop_front()
                 .expect("队列运行必须对应一个 FIFO 输入");
             debug_assert_eq!(committed_input, input);
+            // 队首已经发送，焦点跟着剩余队列左移；队列清空时退出面板。
+            if let Some(index) = self.queue_focus {
+                self.queue_focus = if self.queued_inputs.is_empty() {
+                    None
+                } else {
+                    Some(index.saturating_sub(1).min(self.queued_inputs.len() - 1))
+                };
+            }
         }
 
         if input_committed {
             self.session_record = session_record;
             if !preserve_visible_history {
+                // 尚未发送的队列项只存在于输入框上方的排队面板，不写入会话正文。
                 self.messages = restore_session_messages(&self.session_record.session);
-                self.messages.extend(
-                    self.queued_inputs
-                        .iter()
-                        .map(|pending| Msg::new(MsgKind::User, pending.text.clone())),
-                );
             }
         } else {
             // 队列首存失败时保留原队列和已展示顺序，等待后续重试同一队首。
@@ -469,11 +634,18 @@ impl App {
         if let Some(run) = run {
             if run.cancelled {
                 if user_cancelled {
+                    let queued = self.queued_inputs.len();
                     if let Some(message) = self.messages.iter_mut().rev().find(|message| {
                         matches!(message.kind, MsgKind::Info)
                             && message.text == "Cancelling the current run..."
                     }) {
-                        message.text = "Run cancelled; visible output was frozen".into();
+                        message.text = if queued == 0 {
+                            "Run cancelled; visible output was frozen".into()
+                        } else {
+                            format!(
+                                "Run cancelled; {queued} queued message(s) paused — Ctrl+O to send or edit"
+                            )
+                        };
                     }
                 } else {
                     self.messages.push(Msg::new(
@@ -486,6 +658,10 @@ impl App {
         if let Some(error) = error {
             self.messages
                 .push(Msg::new(MsgKind::Error, format!("{error:#}")));
+        }
+        // 只有真正产生了回答才值得起标题：被取消或失败的轮次没有可供概括的内容。
+        if run_succeeded && !user_cancelled {
+            self.schedule_session_title();
         }
         queue_may_advance && !user_cancelled
     }

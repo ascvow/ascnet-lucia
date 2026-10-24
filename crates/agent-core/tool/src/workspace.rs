@@ -8,8 +8,10 @@
 
 use crate::policy::{ExecutionPolicy, FilesystemScope};
 use std::{
+    collections::HashSet,
     fmt,
     path::{Component, Path, PathBuf},
+    sync::{Arc, RwLock},
 };
 
 /// 单项文件能力。
@@ -154,6 +156,73 @@ impl WorkspaceError {
     }
 }
 
+/// 用户明确引用、允许只读访问的工作区外路径集合。
+///
+/// 只由宿主在用户提交消息时写入，模型与 Guest 无法自行扩充。集合保存 `canonicalize`
+/// 之后的绝对路径，因此比较时不会再次展开符号链接；授权后目标若被替换成指向别处的
+/// 链接，也不会命中旧授权。
+#[derive(Debug, Clone, Default)]
+pub struct ReadPathGrants {
+    paths: Arc<RwLock<HashSet<PathBuf>>>,
+}
+
+/// 单个会话允许登记的最大路径数。
+///
+/// 正常使用只需要几条到几十条；上限用于防止粘贴长日志时把大量路径长期留在内存里。
+const MAX_READ_GRANTS: usize = 256;
+
+impl ReadPathGrants {
+    /// 创建空的只读授权集合。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 登记一个已存在的路径，返回规范化后的绝对路径。
+    ///
+    /// 文件与目录都可以登记；路径不存在或无法解析时返回 IO 错误。超过上限后新路径
+    /// 被静默忽略，调用方不需要把授权失败当作消息发送失败。
+    pub fn grant(&self, path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+        let resolved = path.as_ref().canonicalize()?;
+        let mut paths = self
+            .paths
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if paths.len() < MAX_READ_GRANTS {
+            paths.insert(resolved.clone());
+        }
+        Ok(resolved)
+    }
+
+    /// 判断规范化路径是否已被用户授权。
+    pub fn contains(&self, resolved: &Path) -> bool {
+        self.paths
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(resolved)
+    }
+
+    /// 清空全部授权；切换会话时必须调用。
+    pub fn clear(&self) {
+        self.paths
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    /// 返回当前授权数量。
+    pub fn len(&self) -> usize {
+        self.paths
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// 判断当前没有任何授权。
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// 原生文件工具共用的路径守卫。
 ///
 /// 每个工具在触碰文件系统之前都必须调用 [`WorkspaceGuard::resolve_existing`] 或
@@ -165,6 +234,8 @@ pub struct WorkspaceGuard {
     /// 策略是否完全禁止文件访问。
     denied: bool,
     capabilities: FileCapabilities,
+    /// 用户显式引用、允许只读访问的工作区外路径；只对读取能力生效。
+    read_grants: Option<ReadPathGrants>,
 }
 
 impl WorkspaceGuard {
@@ -178,6 +249,7 @@ impl WorkspaceGuard {
             root: Some(root.as_ref().canonicalize()?),
             denied: false,
             capabilities: FileCapabilities::read_write(),
+            read_grants: None,
         })
     }
 
@@ -189,6 +261,7 @@ impl WorkspaceGuard {
             root: None,
             denied: false,
             capabilities: FileCapabilities::read_write(),
+            read_grants: None,
         }
     }
 
@@ -198,7 +271,16 @@ impl WorkspaceGuard {
             root: None,
             denied: true,
             capabilities: FileCapabilities::default(),
+            read_grants: None,
         }
+    }
+
+    /// 附加用户显式引用的只读路径集合。
+    ///
+    /// 授权只放宽读取：写入、创建与删除仍受工作区边界约束。
+    pub fn with_read_grants(mut self, grants: ReadPathGrants) -> Self {
+        self.read_grants = Some(grants);
+        self
     }
 
     /// 按执行策略的文件范围构造守卫。
@@ -255,16 +337,30 @@ impl WorkspaceGuard {
         self.absolutize(raw).exists()
     }
 
-    /// 校验解析后的路径确实位于工作区之内。
-    fn ensure_contained(&self, resolved: &Path) -> Result<(), WorkspaceError> {
+    /// 校验解析后的路径位于工作区内，或已被用户显式授权读取。
+    ///
+    /// 授权只对 [`FileCapability::Read`] 生效；写入与创建路径即便出现在授权集合中，
+    /// 仍然必须落在工作区内。
+    fn ensure_contained(
+        &self,
+        resolved: &Path,
+        capability: FileCapability,
+    ) -> Result<(), WorkspaceError> {
         let Some(root) = &self.root else {
             return Ok(());
         };
         if resolved.starts_with(root) {
-            Ok(())
-        } else {
-            Err(WorkspaceError::Escape)
+            return Ok(());
         }
+        if capability == FileCapability::Read
+            && self
+                .read_grants
+                .as_ref()
+                .is_some_and(|grants| grants.contains(resolved))
+        {
+            return Ok(());
+        }
+        Err(WorkspaceError::Escape)
     }
 
     /// 按规范路径检查敏感文件；有根守卫只检查根内相对部分，避免父目录名称误伤。
@@ -311,7 +407,7 @@ impl WorkspaceGuard {
             .absolutize(raw)
             .canonicalize()
             .map_err(|error| WorkspaceError::Unresolvable(error.to_string()))?;
-        self.ensure_contained(&resolved)?;
+        self.ensure_contained(&resolved, capability)?;
         self.ensure_not_sensitive(&resolved)?;
         Ok(resolved)
     }
@@ -337,7 +433,7 @@ impl WorkspaceGuard {
             let resolved = requested
                 .canonicalize()
                 .map_err(|error| WorkspaceError::Unresolvable(error.to_string()))?;
-            self.ensure_contained(&resolved)?;
+            self.ensure_contained(&resolved, capability)?;
             self.ensure_not_sensitive(&resolved)?;
             return Ok(resolved);
         }
@@ -371,7 +467,7 @@ impl WorkspaceGuard {
             resolved.push(name);
         }
 
-        self.ensure_contained(&resolved)?;
+        self.ensure_contained(&resolved, capability)?;
         self.ensure_not_sensitive(&resolved)?;
         Ok(resolved)
     }
@@ -564,6 +660,66 @@ mod tests {
                 .resolve_existing("/etc/hosts", FileCapability::Read)
                 .expect_err("Evaluation 不应读取工作区外文件"),
             WorkspaceError::Escape
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// 用户显式登记的外部路径只放宽读取：写入仍被拒绝，未登记与敏感路径也不放行。
+    #[test]
+    fn read_grants_allow_only_explicit_external_reads() {
+        let base = temp_workspace("grants");
+        let outside = base.join("outside.txt");
+        fs::write(&outside, "外部内容").expect("应写入外部文件");
+        let grants = ReadPathGrants::new();
+        let granted = grants.grant(&outside).expect("应登记外部路径");
+        assert!(grants.contains(&granted));
+        assert_eq!(grants.len(), 1);
+
+        let guard = WorkspaceGuard::rooted(base.join("inside"))
+            .expect("应创建守卫")
+            .with_read_grants(grants);
+        assert_eq!(
+            guard
+                .resolve_existing(
+                    outside.to_str().expect("测试路径应为 UTF-8"),
+                    FileCapability::Read,
+                )
+                .expect("已登记路径应可读"),
+            granted
+        );
+        assert_eq!(
+            guard
+                .resolve_existing("/etc/hosts", FileCapability::Read)
+                .expect_err("未登记的外部路径必须拒绝"),
+            WorkspaceError::Escape
+        );
+        assert_eq!(
+            guard
+                .resolve_new(
+                    outside.to_str().expect("测试路径应为 UTF-8"),
+                    FileCapability::Write,
+                )
+                .expect_err("授权不得放宽写入"),
+            WorkspaceError::Escape
+        );
+
+        // 敏感文件即使被登记也不放行。
+        let sensitive = base.join("outside.pem");
+        fs::write(&sensitive, "TOKEN").expect("应写入敏感文件");
+        let grants = ReadPathGrants::new();
+        grants.grant(&sensitive).expect("登记本身应成功");
+        let guard = WorkspaceGuard::rooted(base.join("inside"))
+            .expect("应创建守卫")
+            .with_read_grants(grants);
+        assert_eq!(
+            guard
+                .resolve_existing(
+                    sensitive.to_str().expect("测试路径应为 UTF-8"),
+                    FileCapability::Read,
+                )
+                .expect_err("敏感文件必须拒绝"),
+            WorkspaceError::Sensitive
         );
 
         let _ = fs::remove_dir_all(&base);

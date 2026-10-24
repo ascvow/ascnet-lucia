@@ -10,13 +10,14 @@ use agent_plugin_host::{
     LivePluginHost, PluginHost, PluginHostServices, PluginServiceCall,
 };
 use agent_runtime::{
-    AgentDeriveConfig, AgentPermissions, AgentProfileId, AgentRuntime, AgentTemplate, RuntimeLimits,
+    AgentDeriveConfig, AgentId, AgentPermissions, AgentProfileId, AgentRuntime, AgentStatus,
+    AgentTemplate, RuntimeLimits,
 };
 use agent_tool::ToolCall;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
 
 /// 测试使用的可信 controller 运行 ID；所有工具调用与运行结束事件共享它。
 const RUN: &str = "controller-run";
@@ -295,241 +296,80 @@ async fn component_runs_mailbox_dispatch_flow() {
     let member_navigation = AgentExtension::drain_events(host.as_ref())
         .await
         .expect("成员会话导航事件应可读取");
-    assert!(member_navigation.iter().any(|event| {
-        event["name"] == UI_NAVIGATION_EVENT
-            && event["data"]["action"]["view"]["view_id"] == "teammate-member-session"
-            && event["data"]["action"]["view"]["instance_id"] == member_id
-    }));
-    let render_started = std::time::Instant::now();
-    let session = PluginHost::render_ui(
-        host.as_ref(),
-        &UiRenderRequest {
-            session_id: None,
-            plugin_id: "teammate".into(),
-            view_id: "teammate-member-session".into(),
-            instance_id: Some(member_id.into()),
-            width: 80,
-            height: 24,
-            focused: true,
-            frame: 2,
-        },
-    )
-    .await
-    .expect("成员实时会话渲染不应失败")
-    .expect("成员实时会话应返回可见帧");
-    let session_text = session
-        .lines
+    let session_target = member_navigation
         .iter()
-        .flat_map(|line| line.spans.iter())
-        .map(|span| span.text.as_str())
-        .collect::<String>();
-    assert!(!session_text.contains("Run completed"), "{session_text}");
-    assert!(!session_text.contains("Analyzing · Step"), "{session_text}");
-    assert!(session_text.contains("Message Agent..."), "{session_text}");
+        .find_map(|event| {
+            let action = &event["data"]["action"];
+            (event["name"] == UI_NAVIGATION_EVENT
+                && action["action"] == "open_agent_session"
+                && action["instance_id"] == member_id)
+                .then(|| action["target"].as_str().map(str::to_string))
+                .flatten()
+        })
+        .expect("选中成员应请求宿主原生会话视图");
     assert!(
-        session_text.contains("teammate 已完成"),
-        "首次渲染必须追上 1500 条增量：{session_text}"
+        member_navigation
+            .iter()
+            .any(|event| event["data"]["action"]["prompt"]
+                .as_str()
+                .is_some_and(|prompt| prompt.contains("检查首轮实现"))),
+        "原生会话视图必须携带首个任务正文：{member_navigation:?}"
     );
-    eprintln!(
-        "1500 条历史增量首次渲染耗时：{:?}",
-        render_started.elapsed()
-    );
-    PluginHost::on_ui_input(
-        host.as_ref(),
-        &UiInput {
-            plugin_id: "teammate".into(),
-            view_id: "teammate-member-session".into(),
-            instance_id: Some(member_id.into()),
-            event: UiInputEvent::Key {
-                code: "home".into(),
-                modifiers: Vec::new(),
-            },
-        },
-    )
-    .await
-    .expect("应可回看任务 prompt");
-    let first = PluginHost::render_ui(
-        host.as_ref(),
-        &UiRenderRequest {
-            session_id: None,
-            plugin_id: "teammate".into(),
-            view_id: "teammate-member-session".into(),
-            instance_id: Some(member_id.into()),
-            width: 80,
-            height: 24,
-            focused: true,
-            frame: 3,
-        },
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let first_text: String = first
-        .lines
-        .iter()
-        .flat_map(|line| &line.spans)
-        .map(|span| span.text.as_str())
-        .collect();
-    assert!(first_text.contains("检查首轮实现"), "{first_text}");
-
-    // 高视口没有溢出时渲染会把滚动位置收敛回底部，重新按 home 回到最早内容。
-    PluginHost::on_ui_input(
-        host.as_ref(),
-        &UiInput {
-            plugin_id: "teammate".into(),
-            view_id: "teammate-member-session".into(),
-            instance_id: Some(member_id.into()),
-            event: UiInputEvent::Key {
-                code: "home".into(),
-                modifiers: Vec::new(),
-            },
-        },
-    )
-    .await
-    .expect("成员会话应可再次回到最早内容");
-
-    // 缩小视口制造确定的溢出，验证真实 Host 会把滚轮事件送到成员会话并改变回看位置。
-    let compact = PluginHost::render_ui(
-        host.as_ref(),
-        &UiRenderRequest {
-            session_id: None,
-            plugin_id: "teammate".into(),
-            view_id: "teammate-member-session".into(),
-            instance_id: Some(member_id.into()),
-            width: 80,
-            height: 12,
-            focused: true,
-            frame: 4,
-        },
-    )
-    .await
-    .expect("窄视口成员会话渲染不应失败")
-    .expect("窄视口成员会话应返回可见帧");
-    let compact_text: String = compact
-        .lines
-        .iter()
-        .flat_map(|line| &line.spans)
-        .map(|span| span.text.as_str())
-        .collect();
     assert!(
-        compact.lines.iter().any(|line| line
-            .spans
-            .last()
-            .is_some_and(|span| matches!(span.text.as_str(), "│" | "┃"))),
-        "溢出成员会话必须显示右侧滚动条\n{compact_text}"
+        member_navigation
+            .iter()
+            .all(|event| event["data"]["action"]["view"]["view_id"] != "teammate-member-session"),
+        "插件不应再渲染成员会话文本帧"
     );
-
-    PluginHost::on_ui_input(
-        host.as_ref(),
-        &UiInput {
-            plugin_id: "teammate".into(),
-            view_id: "teammate-member-session".into(),
-            instance_id: Some(member_id.into()),
-            event: UiInputEvent::Mouse {
-                kind: "scroll_down".into(),
-                x: 10,
-                y: 10,
-            },
-        },
-    )
-    .await
-    .expect("成员会话滚轮向下滚动不应失败");
-    let scrolled = PluginHost::render_ui(
-        host.as_ref(),
-        &UiRenderRequest {
-            session_id: None,
-            plugin_id: "teammate".into(),
-            view_id: "teammate-member-session".into(),
-            instance_id: Some(member_id.into()),
-            width: 80,
-            height: 12,
-            focused: true,
-            frame: 5,
-        },
-    )
-    .await
-    .expect("滚轮滚动后成员会话渲染不应失败")
-    .expect("滚轮滚动后成员会话应返回可见帧");
-    let scrolled_text: String = scrolled
-        .lines
-        .iter()
-        .flat_map(|line| &line.spans)
-        .map(|span| span.text.as_str())
-        .collect();
-    assert_ne!(
-        scrolled_text, compact_text,
-        "滚轮必须改变成员会话的回看位置"
+    // 宿主必须能按插件 principal 取到绑定 API，原生视图据此订阅成员事件。
+    let agent_api = PluginHost::agent_runtime_api(host.as_ref(), "teammate")
+        .expect("Teammate 插件应暴露绑定 principal 的 Agent API");
+    assert!(
+        agent_api
+            .principal()
+            .as_str()
+            .starts_with("plugin:teammate:"),
+        "原生视图必须使用插件自己的 principal：{}",
+        agent_api.principal()
     );
-
-    PluginHost::on_ui_input(
-        host.as_ref(),
-        &UiInput {
-            plugin_id: "teammate".into(),
-            view_id: "teammate-member-session".into(),
-            instance_id: Some(member_id.into()),
-            event: UiInputEvent::Mouse {
-                kind: "scroll_up".into(),
-                x: 10,
-                y: 10,
-            },
-        },
-    )
-    .await
-    .expect("成员会话滚轮向上滚动不应失败");
-    let restored = PluginHost::render_ui(
-        host.as_ref(),
-        &UiRenderRequest {
-            session_id: None,
-            plugin_id: "teammate".into(),
-            view_id: "teammate-member-session".into(),
-            instance_id: Some(member_id.into()),
-            width: 80,
-            height: 12,
-            focused: true,
-            frame: 6,
-        },
-    )
-    .await
-    .expect("滚轮回滚后成员会话渲染不应失败")
-    .expect("滚轮回滚后成员会话应返回可见帧");
-    let restored_text: String = restored
-        .lines
-        .iter()
-        .flat_map(|line| &line.spans)
-        .map(|span| span.text.as_str())
-        .collect();
-    assert_eq!(restored_text, compact_text, "滚轮上下滚动应回到原位置");
-
-    for code in ["r", "e", "v", "i", "e", "w"] {
-        PluginHost::on_ui_input(
-            host.as_ref(),
-            &UiInput {
-                plugin_id: "teammate".into(),
-                view_id: "teammate-member-session".into(),
-                instance_id: Some(member_id.into()),
-                event: UiInputEvent::Key {
-                    code: code.into(),
-                    modifiers: Vec::new(),
-                },
-            },
-        )
+    let snapshot = agent_api
+        .status(&AgentId::from_str(&session_target).expect("目标应是合法 Agent ID"))
         .await
-        .expect("成员会话文本输入不应失败");
-    }
+        .expect("成员状态应可读取");
+    assert_eq!(snapshot.status, AgentStatus::Succeeded);
+
+    // 原生视图的提交事件必须让成员续跑，并用新句柄重新打开同一实例。
     PluginHost::on_ui_input(
         host.as_ref(),
         &UiInput {
             plugin_id: "teammate".into(),
             view_id: "teammate-member-session".into(),
             instance_id: Some(member_id.into()),
-            event: UiInputEvent::Key {
-                code: "enter".into(),
-                modifiers: Vec::new(),
+            event: UiInputEvent::Submit {
+                text: "review".into(),
             },
         },
     )
     .await
-    .expect("成员会话消息发送不应失败");
+    .expect("原生会话提交不应失败");
+    let reopen = AgentExtension::drain_events(host.as_ref())
+        .await
+        .expect("续跑后的视图导航事件应可读取");
+    let next_target = reopen
+        .iter()
+        .find_map(|event| {
+            let action = &event["data"]["action"];
+            (event["name"] == UI_NAVIGATION_EVENT
+                && action["action"] == "open_agent_session"
+                && action["instance_id"] == member_id)
+                .then(|| action["target"].as_str().map(str::to_string))
+                .flatten()
+        })
+        .expect("续跑后应重新打开成员会话视图");
+    assert_ne!(
+        next_target, session_target,
+        "续跑必须换新句柄并通知宿主更新目标"
+    );
     let interactive_result = wait_result(host.as_ref(), RUN, member_id).await;
     assert_eq!(interactive_result["outcome"]["status"], "succeeded");
 

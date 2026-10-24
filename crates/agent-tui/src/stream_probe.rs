@@ -137,7 +137,7 @@ impl Samples {
                 self.frames, average, self.frame_max_us, self.revealed_chars
             ));
             // 平均帧耗时换算成"每秒能出多少帧"，一眼看出是否还有余量。
-            let capacity = if average == 0 { 0 } else { 1_000_000 / average };
+            let capacity = 1_000_000u64.checked_div(average).unwrap_or(0);
             out.push_str(&format!("frame capacity: ~{capacity} fps\n"));
         }
         out

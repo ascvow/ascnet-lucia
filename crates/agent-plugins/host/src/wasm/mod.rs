@@ -978,6 +978,15 @@ impl PluginHost for WasmPluginHost {
         Some(WasmPluginHost::id(self))
     }
 
+    fn agent_runtime_api(
+        &self,
+        plugin_id: &str,
+    ) -> Option<Arc<dyn agent_runtime::AgentRuntimeApi>> {
+        (plugin_id == WasmPluginHost::id(self))
+            .then(|| self.agent_runtime.as_ref().map(|binding| binding.api()))
+            .flatten()
+    }
+
     fn event_subscriptions(&self) -> &[EventSubscription] {
         &self.manifest.events
     }

@@ -559,7 +559,8 @@ pub mod workspace;
 
 pub use policy::{ExecutionPolicy, ExecutionProfile, FilesystemScope, ResourceLimits, ToolAccess};
 pub use workspace::{
-    is_sensitive_path, FileCapabilities, FileCapability, WorkspaceError, WorkspaceGuard,
+    is_sensitive_path, FileCapabilities, FileCapability, ReadPathGrants, WorkspaceError,
+    WorkspaceGuard,
 };
 
 /// Validate a provider-portable tool name.

@@ -3,12 +3,12 @@
 #[cfg(feature = "plugins")]
 use super::*;
 
-/// Startup activation events render in the footer once, then collapse into a plugin count.
+/// Startup activation events render in the footer once, then leave no plugin counter behind.
 ///
-/// 启动激活事件应在底部信息栏右侧展示一次，随后收敛为插件数量。
+/// 启动激活事件应在底部信息栏右侧展示一次，随后彻底收起，不再常驻插件数量。
 #[cfg(feature = "plugins")]
 #[test]
-fn plugin_status_shows_startup_details_then_compact_count() {
+fn plugin_status_shows_startup_details_then_collapses() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app = app.with_loading_plugins(vec!["mcp".into(), "skill".into()]);
@@ -57,7 +57,22 @@ fn plugin_status_shows_startup_details_then_compact_count() {
     for _ in 0..PLUGIN_STATUS_DETAIL_TICKS {
         app.tick_plugin_status();
     }
-    assert_eq!(app.plugin_status_content(), ("◈", "2 plugins".into()));
+    // 收敛后既没有详情也没有计数：稳定运行期右侧完全让位给左侧元数据。
+    assert_eq!(app.plugin_status_content(), ("◈", String::new()));
+
+    // 空状态不占用右侧区域，也不该在底栏留下「◈」这样的空壳。
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染收敛后的插件底栏");
+    let collapsed = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!collapsed.contains("plugins"), "{collapsed:?}");
+    assert!(!collapsed.contains('◈'), "{collapsed:?}");
 }
 
 /// 通用底栏事件必须按 Host 注入的插件来源覆盖状态，并持续显示在底部信息行。
@@ -101,6 +116,43 @@ fn plugin_footer_status_is_trusted_persistent_and_replaceable() {
     assert!(rendered.contains("Permission: allow all"), "{rendered:?}");
 }
 
+/// 底栏插件状态的标签降为元信息灰、值保留插件声明的风险色。
+///
+/// 整句染色会让固定字段名和会变的状态争夺同一份注意力：标签只是「这是什么」，
+/// 真正需要一眼看到的是值。
+#[cfg(feature = "plugins")]
+#[test]
+fn plugin_footer_status_splits_label_and_value_colors() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    // 模型名保持 ASCII，让底栏列坐标与字符下标一一对应，断言才能直接落在目标单元格上。
+    let mut app = App::new(tx, "test-model".into());
+    apply_plugin_footer_event(
+        &mut app,
+        &json!({
+            "source": {"type": "plugin", "id": "permission"},
+            "name": "permission.mode.status",
+            "presentation": {"target": "footer", "text": "Permission: allow all", "tone": "warning"}
+        }),
+    )
+    .expect("应用权限底栏状态");
+
+    let backend = TestBackend::new(100, 18);
+    let mut terminal = Terminal::new(backend).expect("创建底栏分色测试终端");
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染底栏分色状态");
+    let buffer = terminal.backend().buffer();
+    let row = 17;
+    let line: String = (0..100)
+        .map(|x| buffer[(x, row)].symbol())
+        .collect::<String>();
+    let label_x = line.find("Permission:").expect("底栏应显示状态标签") as u16;
+    let value_x = line.find("allow all").expect("底栏应显示状态值") as u16;
+
+    assert_eq!(buffer[(label_x, row)].fg, COLOR_META, "{line:?}");
+    assert_eq!(buffer[(value_x, row)].fg, COLOR_WARNING, "{line:?}");
+}
+
 /// 底栏状态缺少可信插件来源时必须拒绝，避免 Guest 伪造其他插件的常驻状态。
 #[cfg(feature = "plugins")]
 #[test]
@@ -133,9 +185,9 @@ fn plugin_status_reports_progressive_ready_count() {
     assert!(status.contains("1 ready"), "{status}");
 }
 
-/// Partial plugin failures retain successes and remain visible in the compact footer count.
+/// Partial plugin failures retain successes and stay visible without a plugin count.
 ///
-/// 单插件失败应保留成功插件，并在紧凑底栏中持续显示失败数量。
+/// 单插件失败应保留成功插件，并在紧凑底栏中只显示失败数量，不再常驻插件总数。
 #[cfg(feature = "plugins")]
 #[test]
 fn plugin_status_keeps_partial_successes() {
@@ -159,7 +211,7 @@ fn plugin_status_keeps_partial_successes() {
     for _ in 0..PLUGIN_STATUS_DETAIL_TICKS {
         app.tick_plugin_status();
     }
-    assert_eq!(app.plugin_status_content(), ("◈", "1 plugins · ✗ 1".into()));
+    assert_eq!(app.plugin_status_content(), ("◈", "✗ 1 failed".into()));
 }
 
 /// 插件仍在渐进加载时，普通输入应立即启动已有工具快照，不进入等待队列。
@@ -639,6 +691,10 @@ fn plugin_subview_replaces_main_view_and_routes_instance_input() {
         },
     )
     .expect("打开插件子视图");
+    // 子视图覆盖主视图后，周期刷新只应服务当前实例，不再为不可见的停靠视图调用 WASM。
+    let periodic = app.periodic_plugin_render_requests();
+    assert_eq!(periodic.len(), 1);
+    assert_eq!(periodic[0].instance_id.as_deref(), Some("agent-1"));
     // 首次布局之前就必须生成当前实例的优先请求，不能空等下一次周期刷新。
     let initial = app.plugin_render_requests();
     assert_eq!(initial[0].view_id, "subview");
@@ -850,7 +906,11 @@ fn trigger_gestures_route_to_trigger_view() {
 #[cfg(feature = "plugins")]
 fn plugin_slash_command_routes_after_native_commands() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx, "测试模型".into());
+    // `/reasoning` 需要至少两档才会打开滑块，否则会被当成"没有可切换等级"直接拒绝。
+    let mut app = App::new(tx, "测试模型".into()).with_reasoning_levels(
+        vec![ReasoningLevel::Off, ReasoningLevel::Medium],
+        ReasoningLevel::Off,
+    );
     let mut view = test_plugin_view(UiPlacement::InputPanel, "权限模式");
     view.declaration.input_triggers = vec!["/permission".into()];
     app.plugin_views.push(view);

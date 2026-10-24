@@ -1,6 +1,8 @@
 //! TUI 启动组装、运行队列驱动与终端事件循环。
 
 #[cfg(feature = "plugins")]
+use crate::app::AgentViewKeyOutcome;
+#[cfg(feature = "plugins")]
 use crate::app::PluginKeyRoute;
 use crate::app::{is_copy_shortcut, reasoning_level_label, App, ChannelEventSink};
 use crate::cli::Args;
@@ -22,6 +24,7 @@ use crate::plugin::startup::{
     remove_disabled_plugin_manifests, PluginExecutionContext,
 };
 use crate::session::conversation::{Msg, MsgKind};
+use crate::session::title::{flush_session_title, SessionTitleGenerator};
 use crate::session::{
     load_startup_session, print_persisted_sessions, resolve_tui_path, start_session_context_reload,
     LazyFileSessionStore, WorkspaceContext,
@@ -52,21 +55,21 @@ use agent_plugin_host::wasm::{configure_wasm_cache_directory, ProgressivePluginL
 #[cfg(feature = "plugins")]
 use agent_plugin_host::{LivePluginHost, PluginHost};
 #[cfg(feature = "plugins")]
+use agent_plugin_protocol::{UiInput, UiInputEvent};
+#[cfg(feature = "plugins")]
 use agent_runtime::AgentTemplate;
 use agent_session::SessionStore;
 use agent_skill::SkillCatalog;
 use agent_tool::{JsonTool, ToolRegistry};
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{Event, KeyEventKind, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use crossterm::SynchronizedUpdate;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use serde_json::{json, Value};
 #[cfg(feature = "plugins")]
 use std::collections::HashMap;
-use std::path::Path;
-#[cfg(feature = "plugins")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -78,6 +81,32 @@ use tokio::sync::mpsc;
 /// 工作区根目录不存在或无法规范化时返回错误。
 fn native_workspace_guard(workspace_root: &Path) -> Result<agent_tool::WorkspaceGuard> {
     Ok(agent_tool::WorkspaceGuard::rooted(workspace_root)?)
+}
+
+/// 返回用户级 Skill 根目录。
+///
+/// Skill 的安装位置固定在 Lucia Home 下，与配置文件路径无关：`--config` 只改变配置来源，
+/// 不改变用户级能力目录。
+fn user_skill_root(lucia_home: &Path) -> PathBuf {
+    lucia_home.join("skills")
+}
+
+/// 初始化用户级 Skill 根目录，返回本次是否新建。
+///
+/// 只处理 `$LUCIA_HOME/skills`。项目级 `skills/` 与 `.lucia/skills` 位于用户工作区，存在才
+/// 扫描：自动创建会在别人的仓库里凭空生成目录，也可能与项目自有同名目录冲突。
+///
+/// 空目录不改变模型可见行为——不生成索引提示，也不注册 `skill_read`；这里只是把用户
+/// 该往哪里放 `SKILL.md` 变成可直接看到的入口。
+///
+/// # Errors
+///
+/// 目录无法创建或目标不是非符号链接目录时返回错误，由调用方决定是否降级。
+fn initialize_user_skill_root(lucia_home: &Path) -> Result<bool> {
+    let root = user_skill_root(lucia_home);
+    let existed = root.is_dir();
+    agent_skill::ensure_skill_root(&root)?;
+    Ok(!existed)
 }
 
 /// 返回应用插件持久状态目录。
@@ -210,6 +239,17 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     if args.init {
         initialize_config(&config_path)?;
         println!("Created Lucia configuration: {}", config_path.display());
+        // `--init` 同时准备用户级 Skill 入口，使首次安装后就有可放 `SKILL.md` 的目录；
+        // 目录创建失败只提示，不撤销已成功创建的配置文件。
+        let lucia_home = lucia_home_dir()?;
+        match initialize_user_skill_root(&lucia_home) {
+            Ok(true) => println!(
+                "Created Skill directory: {}",
+                user_skill_root(&lucia_home).display()
+            ),
+            Ok(false) => {}
+            Err(error) => eprintln!("Warning: 无法初始化 Skill 目录：{error:#}"),
+        }
         println!("Set model.api_key (or model.api_key_env), confirm model.model, then run lucia");
         return Ok(());
     }
@@ -353,37 +393,48 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let mut options = options;
     let mut reasoning_levels = vec![options.reasoning];
     if !demo_mode {
-        if let Some(metadata) = tui_settings.model_metadata.as_ref() {
-            if let Some(limit) = metadata.max_output_tokens {
-                if tui_settings.max_tokens_explicit {
-                    if let Some(configured) = options.max_tokens {
-                        if configured > limit {
-                            return Err(anyhow!(
-                                "配置的 agent.max_tokens {configured} 超过 models.dev 声明的模型输出上限 {limit}"
-                            ));
-                        }
+        let Some(metadata) = tui_settings.model_metadata.as_ref() else {
+            // 思考强度、输出上限、模态校验全部只来自 models.dev，缺了它就是"不知道这个
+            // 模型能做什么"。继续启动只能猜，猜错会在请求阶段以服务商报错的形式出现，
+            // 比在这里拒绝更难定位。
+            let upstream = configured_agent
+                .as_ref()
+                .and_then(|config| config.default_upstream().ok());
+            let model_id = upstream
+                .map(|upstream| upstream.model.as_str())
+                .unwrap_or("<未知>");
+            let base_url = upstream
+                .and_then(|upstream| upstream.base_url.as_deref())
+                .map(|url| format!("（base_url {url}）"))
+                .unwrap_or_default();
+            return Err(anyhow!(
+                "models.dev 快照中没有模型 `{model_id}`{base_url}；请确认配置里的 model 与 models.dev 声明的模型 ID 一致，或在配置里用 models_dev_provider 指定服务商"
+            ));
+        };
+        if let Some(limit) = metadata.max_output_tokens {
+            if tui_settings.max_tokens_explicit {
+                if let Some(configured) = options.max_tokens {
+                    if configured > limit {
+                        return Err(anyhow!(
+                            "配置的 agent.max_tokens {configured} 超过 models.dev 声明的模型输出上限 {limit}"
+                        ));
                     }
-                } else {
-                    // 未显式配置时直接采用 models.dev 声明的输出上限，避免落回服务商默认值。
-                    options.max_tokens = Some(limit);
                 }
+            } else {
+                // 未显式配置时直接采用 models.dev 声明的输出上限，避免落回服务商默认值。
+                options.max_tokens = Some(limit);
             }
-            reasoning_levels = metadata.reasoning_levels.clone();
-            if tui_settings.reasoning_explicit {
-                if !reasoning_levels.contains(&options.reasoning) {
-                    return Err(anyhow!(
-                        "配置的思考等级 {} 不在 models.dev 声明的模型能力中",
-                        reasoning_level_label(options.reasoning)
-                    ));
-                }
-            } else if !reasoning_levels.contains(&options.reasoning) {
-                options.reasoning = reasoning_levels[0];
+        }
+        reasoning_levels = metadata.reasoning_levels.clone();
+        if tui_settings.reasoning_explicit {
+            if !reasoning_levels.contains(&options.reasoning) {
+                return Err(anyhow!(
+                    "配置的思考等级 {} 不在 models.dev 声明的模型能力中",
+                    reasoning_level_label(options.reasoning)
+                ));
             }
-        } else {
-            startup_notices.push(
-                "内置 models.dev 快照中未找到当前模型，继续使用显式配置且不提供思考等级切换"
-                    .to_string(),
-            );
+        } else if !reasoning_levels.contains(&options.reasoning) {
+            options.reasoning = reasoning_levels[0];
         }
     }
     let context_window = tui_settings.context_window.or_else(|| {
@@ -419,6 +470,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         ));
     }
 
+    // 扫描前先确保用户级 Skill 入口存在：空目录不改变提示与工具注册，但用户能直接看到
+    // 该往哪里放 SKILL.md。创建失败只降级为启动提示，工作区内的 Skill 仍然可用。
+    if let Err(error) = initialize_user_skill_root(&lucia_home) {
+        startup_notices.push(format!("{error:#}"));
+    }
     let skill_catalog = SkillCatalog::load_local([
         lucia_home.join("skills"),
         workspace.cwd.join("skills"),
@@ -434,6 +490,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .session
         .set_system(options.system_prompt.clone());
 
+    // 用户在消息里显式引用的工作区外路径：TUI 在提交时登记，只读工具按需访问。
+    let read_path_grants = agent_tool::ReadPathGrants::new();
     let mut native_tools = ToolRegistry::new();
     if demo_mode {
         native_tools.register(JsonTool::new(echo_spec(), |args| async move {
@@ -447,7 +505,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     } else {
         // 真实模式注入内置工具集：读写文件、列目录、shell、搜索。工作区固定为启动目录。
         let guard = native_workspace_guard(&workspace.cwd)?;
-        agent_tool::builtins::register_builtins(&mut native_tools, guard)?;
+        agent_tool::builtins::register_builtins(
+            &mut native_tools,
+            guard,
+            read_path_grants.clone(),
+        )?;
     }
     skill_catalog.register_tool(&mut native_tools)?;
 
@@ -469,6 +531,17 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     }
 
     let application_events: Arc<dyn EventSink> = Arc::new(sink);
+    // 会话标题复用主 Agent 的模型路由；demo 脚本模型没有语义，起名只会得到固定噪声。
+    let title_generator = if demo_mode {
+        None
+    } else {
+        Some(Arc::new(SessionTitleGenerator::new(
+            gateway.clone(),
+            options.provider.clone(),
+            options.model.clone(),
+            options.stream,
+        )?))
+    };
     // 插件默认路由要按名索引网关里已注册的服务商，先留存实际生效的名称。
     #[cfg(feature = "plugins")]
     let active_provider_name = options.provider.clone();
@@ -539,12 +612,14 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         loop {
             match crossterm::event::read() {
                 Ok(event) => {
-                    if input_tx.send(UiEvent::Input(event)).is_err() {
-                        return;
+                    for event in coalesce_injected_paste(event) {
+                        if input_tx.send(UiEvent::Input(event)).is_err() {
+                            return;
+                        }
                     }
                 }
                 Err(_) => {
-                    // 恢复接管由主循环负责，这里只需退避，避免后台读错误空转。
+                    // 恢复接管由主循环的 tick 负责，这里只需退避，避免后台读错误空转。
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     if input_tx.is_closed() {
                         return;
@@ -574,6 +649,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
 
     let mut app = App::new(tx.clone(), model_name)
         .with_workspace(workspace)
+        .with_read_path_grants(read_path_grants)
         .with_config_path(config_path.clone())
         .with_fullscreen(fullscreen)
         .with_context_window(context_window)
@@ -583,6 +659,18 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     // /model 面板的上游列表来自配置文件；demo 模式没有配置，保持为空。
     if let Some(config) = configured_agent.as_ref() {
         app.model_upstreams = config.upstreams().into_iter().cloned().collect();
+    }
+    // 底栏展示的配置名只在真实上游生效时存在：密钥缺失回退演示模型时配置项并未生效。
+    if !demo_mode {
+        if let Some(upstream) = configured_agent
+            .as_ref()
+            .and_then(|config| config.default_upstream().ok())
+        {
+            app.model_upstream_name = Some(upstream.name.clone());
+        }
+    }
+    if let Some(generator) = title_generator {
+        app = app.with_title_generator(generator);
     }
     if let Some(input) = model_input_modalities {
         app = app.with_model_modalities(input);
@@ -657,6 +745,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let mut needs_redraw = true;
     let mut rendered_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
     loop {
+        // 原生 Agent 会话视图的订阅与导航栈保持一致：新建、换句柄、关闭都只在这里收敛。
+        // 同步是纯内存操作，没有原生视图时立即返回。
+        #[cfg(feature = "plugins")]
+        if let Some(host) = plugin_host.as_ref() {
+            app.sync_agent_views(host.as_ref()).await;
+        }
         // `/tui` 只登记意图，真正的备用屏幕切换在这里完成。
         if let Some(fullscreen) = app.pending_fullscreen.take() {
             apply_fullscreen_switch(&mut terminal, fullscreen)?;
@@ -756,6 +850,69 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     let before_input = app.input.clone();
                     #[cfg(feature = "plugins")]
                     let before_session = app.session_record.id.clone();
+                    // 原生 Agent 会话视图自己处理按键：编辑、滚动与提交都在 TUI 内完成，
+                    // 只有提交时才把一条 Submit 交给发起插件。
+                    #[cfg(feature = "plugins")]
+                    if app.active_agent_session_route().is_some() {
+                        match app.handle_agent_session_key(key.code, key.modifiers) {
+                            AgentViewKeyOutcome::Submit {
+                                plugin_id,
+                                view_id,
+                                instance_id,
+                                text,
+                            } => {
+                                if let Some(host) = plugin_host.as_ref() {
+                                    let input = UiInput {
+                                        plugin_id: plugin_id.clone(),
+                                        view_id,
+                                        instance_id: Some(instance_id),
+                                        event: UiInputEvent::Submit { text },
+                                    };
+                                    if let Err(error) =
+                                        dispatch_plugin_input(host.as_ref(), &input).await
+                                    {
+                                        app.set_plugin_ui_error(
+                                            &input.plugin_id,
+                                            &input.view_id,
+                                            input.instance_id.as_deref(),
+                                            &error,
+                                        );
+                                    } else {
+                                        if let Err(error) =
+                                            drain_plugin_ui_events(&mut app, host).await
+                                        {
+                                            app.messages.push(Msg::new(
+                                                MsgKind::Error,
+                                                format!(
+                                                    "Failed to process plugin UI event: {error}"
+                                                ),
+                                            ));
+                                        }
+                                        refresh_plugin_views_for(
+                                            &mut app,
+                                            host.as_ref(),
+                                            &plugin_id,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            AgentViewKeyOutcome::Exit | AgentViewKeyOutcome::Consumed => {}
+                        }
+                        continue;
+                    }
+                    // 排队面板聚焦时吞掉按键：先于命令补全与插件路由，避免字符落进输入框。
+                    let queue_keys_active =
+                        app.queue_focus.is_some() && !app.native_dialog_active();
+                    #[cfg(feature = "plugins")]
+                    let queue_keys_active = queue_keys_active
+                        && app.view_stack.is_main()
+                        && app.plugin_focus.is_none()
+                        && app.active_dialog_index().is_none();
+                    if queue_keys_active {
+                        app.handle_queue_key(key.code, key.modifiers, agent.as_ref());
+                        continue;
+                    }
                     if app.handle_native_command_key(key.code, key.modifiers, agent.as_ref()) {
                         app.sync_native_command_input(&before_input);
                         #[cfg(feature = "plugins")]
@@ -952,6 +1109,25 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     }
                 }
             }
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::AgentViewEvents {
+                plugin_id,
+                instance_id,
+                target,
+                events,
+            }) => {
+                app.apply_agent_view_events(&plugin_id, &instance_id, &target, events)
+                    .await;
+            }
+            #[cfg(feature = "plugins")]
+            Some(UiEvent::AgentViewClosed {
+                plugin_id,
+                instance_id,
+                target,
+            }) => {
+                app.apply_agent_view_closed(&plugin_id, &instance_id, &target)
+                    .await;
+            }
             Some(UiEvent::ModelStarted) => {
                 if app.accepts_run_stream_output() {
                     app.start_model_response();
@@ -1120,6 +1296,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 app.context_snapshot = Some(snapshot);
                 app.context_tokens = None;
             }
+            Some(UiEvent::SessionTitleReady { session_id, result }) => {
+                app.handle_session_title(session_id, result);
+                flush_session_title(&mut app).await;
+            }
             Some(UiEvent::NativeSessionsLoaded(result)) => {
                 app.handle_native_sessions_loaded(result);
             }
@@ -1157,6 +1337,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 let succeeded = result.error.is_none();
                 let cancelled = result.run.as_ref().is_some_and(|run| run.cancelled);
                 let queue_may_advance = app.handle_agent_done(*result);
+                // 标题只在空闲时写入：排队输入会立刻开启下一轮，那时保存会与该轮的
+                // CAS 抢同一个 revision，把正常保存挤进分叉路径。
+                flush_session_title(&mut app).await;
                 // 会话已持久化、界面状态已更新后再通告，插件据此可安全读取最终会话。
                 if let Some(agent) = agent.as_ref() {
                     agent
@@ -1180,8 +1363,19 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Some(UiEvent::Tick) => {
                 tick_pending.store(false, Ordering::Relaxed);
                 #[cfg(feature = "plugins")]
-                let animate_spinner =
-                    app.running || app.plugins_loading || app.pending_reload.is_some();
+                let animate_spinner = app.running
+                    || app.plugins_loading
+                    || app.pending_reload.is_some()
+                    || app.active_agent_session_view().is_some_and(|view| {
+                        !view.closed
+                            && matches!(
+                                view.status,
+                                Some(
+                                    agent_runtime::AgentStatus::Queued
+                                        | agent_runtime::AgentStatus::Running
+                                )
+                            )
+                    });
                 #[cfg(not(feature = "plugins"))]
                 let animate_spinner = app.running || app.pending_reload.is_some();
                 if animate_spinner {
@@ -1209,11 +1403,28 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             Some(UiEvent::Input(Event::Mouse(mouse))) => {
+                // 原生会话视图独占屏幕：滚轮与工具展开都作用于视图自己的时间线，
+                // 不能再落到主界面的选区与滚动条热区上。
+                #[cfg(feature = "plugins")]
+                if app.active_agent_session_route().is_some() {
+                    app.handle_agent_session_mouse(&mouse);
+                    continue;
+                }
+                // 悬停态先更新：它只影响滚动条的宽度与配色，不消费事件。
+                app.handle_mouse_event(&mouse);
                 // 滚动条与回到底部热区都先于拖选判定：否则按下会被当成一次选择起点。
                 if app.handle_scrollbar_drag(&mouse) {
                     continue;
                 }
                 if app.handle_jump_hint_click(&mouse) {
+                    continue;
+                }
+                // 底栏上下文芯片是 `/context` 的鼠标入口，先于文本选区判定。
+                if app.handle_context_chip_click(&mouse) {
+                    continue;
+                }
+                // 排队消息面板位于输入框上方，点击行把该消息取回编辑；必须先于文本选区。
+                if app.handle_queued_input_click(&mouse) {
                     continue;
                 }
                 app.handle_text_selection(&mouse, &rendered_buffer);
@@ -1268,6 +1479,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     && app.view_stack.is_main();
                 #[cfg(not(feature = "plugins"))]
                 let main_input_focused = !app.native_dialog_active();
+                #[cfg(feature = "plugins")]
+                let agent_session_focused = app.active_agent_session_route().is_some();
                 // 粘贴准入：监听者可以取消粘贴，或改写实际写入主输入区的文本。
                 let pasted = match agent.as_ref() {
                     Some(agent) => {
@@ -1284,6 +1497,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     }
                     None => pasted,
                 };
+                #[cfg(feature = "plugins")]
+                if agent_session_focused {
+                    app.handle_agent_session_paste(&pasted);
+                    continue;
+                }
                 if main_input_focused {
                     let before_input = app.input.clone();
                     app.handle_paste(&pasted);
@@ -1378,6 +1596,73 @@ async fn record_run_failure_event(events_jsonl: Option<&Path>, completion: &Agen
     let _ = JsonlEventSink::new(path).record(&event).await;
 }
 
+/// 注入式粘贴合并所需的最少字符数。
+///
+/// 终端或宿主程序把整段文本直接写进 PTY、不发送 bracketed paste 标记时，
+/// crossterm 会把粘贴拆成逐字符按键。只有同一次读取后立即可读的字符才会被合并，
+/// 而人工打字的间隔远大于读取循环，因此这个阈值不会把正常输入误判成粘贴。
+const INJECTED_PASTE_MIN_CHARS: usize = 4;
+
+/// 把一次连续写入的字符按键合并成粘贴事件，返回按原顺序转发的事件列表。
+///
+/// 部分终端（以及把粘贴路径直接写进 PTY 的宿主程序）不发送 bracketed paste 标记，
+/// 路径粘贴因此退化成逐字符输入，附件识别与长文本折叠都不会触发。这里把同一次
+/// 写入产生的普通字符合并为 [`Event::Paste`]，让它们与终端原生粘贴走同一条处理
+/// 链路；紧随其后的非字符事件（回车、鼠标等）保持在粘贴之后，顺序不变。
+fn coalesce_injected_paste(first: Event) -> Vec<Event> {
+    if plain_char(&first).is_none() {
+        return vec![first];
+    }
+    let mut events = vec![first];
+    // `poll(0)` 只检查已经缓冲的事件：同一次 write 的剩余字符会立即命中，
+    // 人类的下一次按键则尚未到达。
+    while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+        let Ok(event) = crossterm::event::read() else {
+            break;
+        };
+        let is_plain_char = plain_char(&event).is_some();
+        events.push(event);
+        // 非字符事件属于这次写入之后的独立操作，不能并入粘贴正文。
+        if !is_plain_char {
+            break;
+        }
+    }
+    coalesce_event_batch(events)
+}
+
+/// 判断事件是否是可合并的普通字符按键。
+///
+/// 终端上报大写字母时会附带 `SHIFT`，它仍属于路径正文；`Ctrl`/`Alt` 组合则可能
+/// 是快捷键，必须中断合并。
+fn plain_char(event: &Event) -> Option<char> {
+    match event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers,
+            kind: KeyEventKind::Press,
+            ..
+        }) if modifiers.difference(KeyModifiers::SHIFT).is_empty() => Some(*ch),
+        _ => None,
+    }
+}
+
+/// 把一批以普通字符开头的事件合并成一次粘贴，返回按原顺序转发的事件。
+///
+/// 字符不足阈值时原样返回，保持普通逐键输入的语义；末尾若跟着非字符事件，
+/// 它必须排在粘贴之后，不能被吞进粘贴正文。
+fn coalesce_event_batch(mut events: Vec<Event>) -> Vec<Event> {
+    let text: String = events.iter().filter_map(plain_char).collect();
+    if text.chars().count() < INJECTED_PASTE_MIN_CHARS {
+        return events;
+    }
+    let tail = events.pop().expect("至少包含首个字符事件");
+    if plain_char(&tail).is_some() {
+        vec![Event::Paste(text)]
+    } else {
+        vec![Event::Paste(text), tail]
+    }
+}
+
 // ─── Demo 模型 ───
 
 #[cfg(test)]
@@ -1444,6 +1729,39 @@ mod tests {
         assert!(guidance.contains("当前调用未执行"));
     }
 
+    /// 用户级 Skill 目录必须在装配层幂等创建，且空目录不会注册读取工具。
+    #[test]
+    fn initializes_user_skill_root_without_registering_tool() {
+        let home = std::env::temp_dir().join(format!(
+            "lucia-user-skill-root-{}",
+            agent_session::SessionId::generate()
+        ));
+        std::fs::create_dir_all(&home).expect("应创建测试应用目录");
+
+        assert!(
+            initialize_user_skill_root(&home).expect("应创建用户级 Skill 目录"),
+            "首次调用应报告新建"
+        );
+        assert!(user_skill_root(&home).is_dir());
+        assert!(
+            !initialize_user_skill_root(&home).expect("重复调用应保持幂等"),
+            "已存在的目录不应报告新建"
+        );
+
+        let catalog = SkillCatalog::load_local([user_skill_root(&home)]).expect("空目录应加载成功");
+        assert!(catalog.prompt().is_none(), "空目录不应生成索引提示");
+        let mut registry = ToolRegistry::new();
+        catalog
+            .register_tool(&mut registry)
+            .expect("空目录应跳过注册");
+        assert!(
+            registry.get(agent_skill::SKILL_READ_TOOL_NAME).is_none(),
+            "空目录不应注册 skill_read"
+        );
+
+        std::fs::remove_dir_all(home).expect("应清理测试目录");
+    }
+
     /// 原生工具守卫必须固定为 TUI 启动目录。
     #[test]
     fn native_workspace_guard_is_rooted_at_workspace() {
@@ -1461,5 +1779,70 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("应清理测试工作区");
+    }
+
+    /// 构造一个无修饰的普通字符按键事件。
+    fn plain_key(ch: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+    }
+
+    /// 连续写入的字符达到阈值后合并成一次粘贴，附件识别才能拿到完整路径。
+    #[test]
+    fn injected_character_burst_becomes_single_paste() {
+        let events = [
+            plain_key('/'),
+            plain_key('t'),
+            plain_key('m'),
+            plain_key('p'),
+        ];
+        let coalesced = coalesce_event_batch(Vec::from(events));
+        assert_eq!(coalesced.len(), 1);
+        assert!(matches!(&coalesced[0], Event::Paste(text) if text.as_str() == "/tmp"));
+
+        // 终端把大写字母上报为 `Char + SHIFT`，它仍是路径正文。
+        let shifted = [
+            Event::Key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT)),
+            plain_key('s'),
+            plain_key('e'),
+            plain_key('r'),
+        ];
+        let coalesced = coalesce_event_batch(Vec::from(shifted));
+        assert_eq!(coalesced.len(), 1);
+        assert!(matches!(&coalesced[0], Event::Paste(text) if text.as_str() == "User"));
+    }
+
+    /// 不足阈值或带修饰键的输入保持逐键语义，不能把正常打字改写成粘贴。
+    #[test]
+    fn short_or_modified_keys_keep_individual_events() {
+        let short = [plain_key('a'), plain_key('b'), plain_key('c')];
+        assert_eq!(coalesce_event_batch(Vec::from(short)).len(), 3);
+
+        let modified = [
+            plain_key('a'),
+            Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+        ];
+        assert_eq!(coalesce_event_batch(Vec::from(modified)).len(), 2);
+    }
+
+    /// 粘贴之后的回车等非字符事件必须保持独立，并排在粘贴之后。
+    #[test]
+    fn trailing_non_character_event_follows_paste() {
+        let events = [
+            plain_key('/'),
+            plain_key('t'),
+            plain_key('m'),
+            plain_key('p'),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ];
+        let coalesced = coalesce_event_batch(Vec::from(events));
+        assert_eq!(coalesced.len(), 2);
+        assert!(matches!(&coalesced[0], Event::Paste(text) if text.as_str() == "/tmp"));
+        assert!(matches!(
+            &coalesced[1],
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            })
+        ));
     }
 }

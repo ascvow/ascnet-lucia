@@ -25,7 +25,9 @@ use crate::plugin::startup::{
     remove_disabled_plugin_manifests,
 };
 
-use crate::session::attachment::{attachment_media_type, pasted_file_path};
+use crate::session::attachment::{
+    attachment_media_type, pasted_file_path, MAX_AUTO_TEXT_ATTACHMENT_BYTES,
+};
 
 use crate::session::conversation::{Msg, MsgKind, PendingAttachment};
 
@@ -38,6 +40,10 @@ use crate::session::{
 use crate::theme::PLUGIN_STATUS_DETAIL_TICKS;
 
 use crate::theme::{COLOR_DANGER, COLOR_MUTED, COLOR_WARNING};
+
+/// 底栏插件状态的分色断言只在插件构建下生效。
+#[cfg(feature = "plugins")]
+use crate::theme::COLOR_META;
 
 use crate::ui::markdown::{markdown_lines, summarize_json};
 
@@ -344,6 +350,8 @@ fn write_temp_attachment(name: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
+#[cfg(feature = "plugins")]
+mod agent_view;
 mod input;
 mod plugin;
 mod render;

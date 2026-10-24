@@ -1,10 +1,9 @@
 //! `/context` 的只读上下文占用视图，消费 Core 的脱敏模型请求快照。
 
 use crate::app::App;
-use ratatui::{
-    prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
-};
+use crate::ui::sheet::{palette_hint, palette_sheet_viewport, render_palette_sheet, PaletteSheet};
+use ratatui::prelude::*;
+use ratatui::widgets::Paragraph;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -51,25 +50,16 @@ fn segment_widths(values: &[u64], capacity: u64, width: u16) -> Vec<usize> {
 }
 
 /// 绘制可滚动的上下文检查视图；实际用量独立展示，不伪造分类的精确 token 数。
-pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, outer: Rect) {
+///
+/// `anchor` 是下方输入盒的区域：面板与它同宽、贴在它上沿，向上占满能够容纳的行数。
+/// 终端矮到装不下完整内容时靠 `↑`/`↓` 滚动，而不是把行裁成半截。
+pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, anchor: Rect) {
     if !app.native_command.context_open {
         return;
     }
-    let width = outer.width.min(88);
-    let height = outer.height.min(23);
-    let area = Rect::new(
-        outer.x + (outer.width - width) / 2,
-        outer.y + (outer.height - height) / 2,
-        width,
-        height,
-    );
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" 上下文 · /context ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
     let mut lines = vec![Line::from("最近模型请求 · 分类为文本估算")];
+    // 占比色条与逻辑行下标一起保存：它整行都是空格，混在折行段落里会被算成两行。
+    let mut bar: Option<(usize, Line<'static>)> = None;
     if let Some(snapshot) = &app.context_snapshot {
         let values: Vec<u64> = CATEGORIES
             .iter()
@@ -89,7 +79,7 @@ pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, outer: Rec
             ),
             None => format!("约 {total} tokens · 窗口大小未知"),
         }));
-        let widths = segment_widths(&values, window.unwrap_or(total), inner.width);
+        let widths = segment_widths(&values, window.unwrap_or(total), anchor.width);
         let mut spans: Vec<Span> = CATEGORIES
             .iter()
             .zip(&widths)
@@ -101,7 +91,9 @@ pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, outer: Rec
             " ".repeat(widths[8]),
             Style::default().bg(Color::DarkGray),
         ));
-        lines.push(Line::from(spans));
+        bar = Some((lines.len(), Line::from(spans)));
+        // 占位空行保住色条那一行的高度：段落折行与滚动几何仍按一行计算。
+        lines.push(Line::from(""));
         lines.push(Line::from(""));
         for ((_, label, color), value) in CATEGORIES.iter().zip(values) {
             let ratio = if total == 0 {
@@ -151,23 +143,63 @@ pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, outer: Rec
     ));
     let content_height = lines
         .iter()
-        .map(|line| crate::ui::wrapped_line_count(line, inner.width))
+        .map(|line| crate::ui::wrapped_line_count(line, anchor.width))
         .fold(0_u16, u16::saturating_add);
+    // 色条在滚动内容里的视觉行号：它之前每一行的折行结果都要算进去。
+    let bar_row = bar.as_ref().map(|(index, _)| {
+        lines[..*index]
+            .iter()
+            .map(|line| crate::ui::wrapped_line_count(line, anchor.width))
+            .fold(0_u16, u16::saturating_add)
+    });
+    let requested_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let (height, content_rows) = palette_sheet_viewport(frame, anchor, requested_rows, true);
     app.native_command.context_scroll = app
         .native_command
         .context_scroll
-        .min(content_height.saturating_sub(inner.height));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((app.native_command.context_scroll, 0)),
-        inner,
+        .min(content_height.saturating_sub(content_rows));
+    let scroll = app.native_command.context_scroll;
+    let content_area = render_palette_sheet(
+        frame,
+        anchor,
+        height,
+        PaletteSheet {
+            title: "上下文 · /context",
+            lines,
+            hint: Some(palette_hint("↑↓ 滚动 · Esc 关闭")),
+            scroll,
+            wrap: true,
+        },
     );
+    // 色条单独落在占位行上：不折行，因此始终只占一行，也不会吃掉后面一行。
+    if let (Some((_, bar)), Some(row)) = (bar, bar_row) {
+        if row >= scroll && row - scroll < content_rows {
+            frame.render_widget(
+                Paragraph::new(bar),
+                Rect {
+                    x: content_area.x,
+                    y: content_area.y.saturating_add(row - scroll),
+                    width: content_area.width,
+                    height: 1,
+                },
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造贴住画布底部的输入盒锚点；面板据此向上生长。
+    fn anchor(frame: &Frame) -> Rect {
+        Rect {
+            x: 0,
+            y: frame.area().height,
+            width: frame.area().width,
+            height: 1,
+        }
+    }
 
     /// 宽屏和窄屏均绘制完整色条；窄屏可滚动到底，换会话后不得残留旧统计。
     #[test]
@@ -192,7 +224,10 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             app.native_command.context_scroll = 0;
             terminal
-                .draw(|frame| render_context_dialog(frame, &mut app, frame.area()))
+                .draw(|frame| {
+                    let anchor = anchor(frame);
+                    render_context_dialog(frame, &mut app, anchor)
+                })
                 .unwrap();
             let buffer = terminal.backend().buffer();
             for color in [Color::Cyan, Color::Yellow, Color::LightRed, Color::DarkGray] {
@@ -200,7 +235,10 @@ mod tests {
             }
             app.native_command.context_scroll = u16::MAX;
             terminal
-                .draw(|frame| render_context_dialog(frame, &mut app, frame.area()))
+                .draw(|frame| {
+                    let anchor = anchor(frame);
+                    render_context_dialog(frame, &mut app, anchor)
+                })
                 .unwrap();
             assert!(app.native_command.context_scroll < u16::MAX);
         }
@@ -209,6 +247,96 @@ mod tests {
         assert!(app.context_snapshot.is_none());
         assert!(app.session_usage.is_empty());
         assert!(!app.native_command.context_open);
+    }
+
+    /// 上下文面板用命令面板的外形：标题画在上分隔线上，四周没有盒子边框。
+    #[test]
+    fn context_dialog_uses_the_command_palette_chrome() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.native_command.context_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                let anchor = anchor(frame);
+                render_context_dialog(frame, &mut app, anchor)
+            })
+            .unwrap();
+        let lines: Vec<String> = (0..24u16)
+            .map(|row| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .skip(usize::from(row) * 80)
+                    .take(80)
+                    .map(|cell| cell.symbol())
+                    .collect()
+            })
+            .collect();
+        let screen = lines.join("\n");
+        // 宽字符占两格、第二格是空白；去掉空白后再匹配标题与提示。
+        let compact: Vec<String> = lines
+            .iter()
+            .map(|line| line.chars().filter(|ch| !ch.is_whitespace()).collect())
+            .collect();
+        let title_row = compact
+            .iter()
+            .position(|line| line.contains("上下文·/context"))
+            .unwrap_or_else(|| panic!("标题应画在面板上：{screen}"));
+        assert!(
+            lines[title_row].contains('─'),
+            "标题必须画在上分隔线上：{screen}"
+        );
+        assert!(
+            compact.iter().any(|line| line.contains("Esc关闭")),
+            "{screen}"
+        );
+        // 面板不再有左右与下边框：盒子只剩一条朝向正文的上分隔线。
+        assert!(!screen.contains('╭'), "{screen}");
+        assert!(!screen.contains('│'), "{screen}");
+    }
+
+    /// 色条必须只占一行：它多算的那一行会把最后一条说明挤出视口。
+    #[test]
+    fn utilization_bar_does_not_steal_a_row_from_the_caveat() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.native_command.context_open = true;
+        app.context_window = Some(10000);
+        app.context_snapshot = Some(ContextSnapshot {
+            tokens: [
+                ("system".into(), 1000),
+                ("tools".into(), 2000),
+                ("results".into(), 3000),
+            ]
+            .into(),
+            attachments: 0,
+            messages: 12,
+            tools: 5,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                let anchor = anchor(frame);
+                render_context_dialog(frame, &mut app, anchor)
+            })
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let compact: String = screen.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(
+            compact.contains("分类不含协议开销"),
+            "色条多占一行会把这条说明挤出视口：{screen}"
+        );
     }
 
     /// 尚无快照时展示明确空态，不能把未知用量显示成精确的零占用。
@@ -220,7 +348,10 @@ mod tests {
         app.native_command.context_open = true;
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|frame| render_context_dialog(frame, &mut app, frame.area()))
+            .draw(|frame| {
+                let anchor = anchor(frame);
+                render_context_dialog(frame, &mut app, anchor)
+            })
             .unwrap();
         assert!(!terminal
             .backend()

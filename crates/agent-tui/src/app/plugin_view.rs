@@ -11,6 +11,7 @@ use crate::theme::{
     COLOR_DANGER, COLOR_SUCCESS, COLOR_WARNING, PLUGIN_STATUS_DETAIL_TICKS, SPINNER,
 };
 use crate::ui::plugin_bridge::render_plugin_views;
+use crate::ui::view::SubviewBody;
 use agent_plugin_host::wasm::PluginLoadFailure;
 use agent_plugin_host::LivePluginHost;
 use agent_plugin_protocol::UiFrame as PluginUiFrame;
@@ -322,16 +323,10 @@ impl App {
                 text,
             )
         } else if self.plugin_failures.is_empty() {
-            ("◈", format!("{} plugins", self.plugin_ids.len()))
+            // 稳定运行期不再常驻插件数量：数量不变化，占位只会挤掉真正会变的信息。
+            ("◈", String::new())
         } else {
-            (
-                "◈",
-                format!(
-                    "{} plugins · ✗ {}",
-                    self.plugin_ids.len(),
-                    self.plugin_failures.len()
-                ),
-            )
+            ("◈", format!("✗ {} failed", self.plugin_failures.len()))
         }
     }
 
@@ -552,10 +547,15 @@ impl App {
                 return PluginKeyRoute::Consumed;
             }
             let active = self.view_stack.active().expect("子视图已确认存在");
+            // 宿主原生视图的按键由应用自己处理；这里只保留兜底，避免把按键
+            // 误当成插件输入送到错误的插件实例。
+            let Some(view) = active.view() else {
+                return PluginKeyRoute::Consumed;
+            };
             return PluginKeyRoute::Input(UiInput {
                 plugin_id: active.plugin_id.clone(),
-                view_id: active.view.view_id.clone(),
-                instance_id: Some(active.view.instance_id.clone()),
+                view_id: view.view_id.clone(),
+                instance_id: Some(view.instance_id.clone()),
                 event: UiInputEvent::Key {
                     code: plugin_key_code(code),
                     modifiers: plugin_key_modifiers(modifiers),
@@ -615,10 +615,11 @@ impl App {
             if !point_in_rect(mouse.column, mouse.row, active.area) {
                 return None;
             }
+            let view = active.view()?;
             return Some(UiInput {
                 plugin_id: active.plugin_id.clone(),
-                view_id: active.view.view_id.clone(),
-                instance_id: Some(active.view.instance_id.clone()),
+                view_id: view.view_id.clone(),
+                instance_id: Some(view.instance_id.clone()),
                 event: UiInputEvent::Mouse {
                     kind: plugin_mouse_kind(mouse.kind),
                     x: mouse.column.saturating_sub(active.area.x),
@@ -771,28 +772,31 @@ impl App {
             })
             .collect::<Vec<_>>();
         if let Some(active) = self.view_stack.active() {
-            // 首次导航尚未布局时仍发起请求，并优先于同插件的停靠视图取得执行机会。
-            requests.insert(
-                0,
-                UiRenderRequest {
-                    plugin_id: active.plugin_id.clone(),
-                    session_id: session_id.clone(),
-                    view_id: active.view.view_id.clone(),
-                    instance_id: Some(active.view.instance_id.clone()),
-                    width: if active.area.width == 0 {
-                        self.last_message_width.max(40)
-                    } else {
-                        active.area.width
+            // 原生视图由宿主自己绘制，不需要向插件请求任何帧。
+            if let Some(view) = active.view() {
+                // 首次导航尚未布局时仍发起请求，并优先于同插件的停靠视图取得执行机会。
+                requests.insert(
+                    0,
+                    UiRenderRequest {
+                        plugin_id: active.plugin_id.clone(),
+                        session_id: session_id.clone(),
+                        view_id: view.view_id.clone(),
+                        instance_id: Some(view.instance_id.clone()),
+                        width: if active.area.width == 0 {
+                            self.last_message_width.max(40)
+                        } else {
+                            active.area.width
+                        },
+                        height: if active.area.height == 0 {
+                            self.last_viewport.max(12)
+                        } else {
+                            active.area.height
+                        },
+                        focused: true,
+                        frame: self.plugin_frame,
                     },
-                    height: if active.area.height == 0 {
-                        self.last_viewport.max(12)
-                    } else {
-                        active.area.height
-                    },
-                    focused: true,
-                    frame: self.plugin_frame,
-                },
-            );
+                );
+            }
         }
         requests
     }
@@ -818,6 +822,11 @@ impl App {
             })
             .collect::<Vec<_>>();
         let mut requests = self.plugin_render_requests();
+        // 子视图整屏覆盖主视图：停靠视图、对话框和输入面板都不可见，周期刷新不必为它们
+        // 调用 WASM。只保留当前激活的插件子视图请求；原生会话视图一个都不需要。
+        if !self.view_stack.is_main() {
+            requests.retain(|request| request.instance_id.is_some());
+        }
         requests.retain(|request| {
             !inactive_panels.iter().any(|(plugin_id, view_id)| {
                 &request.plugin_id == plugin_id && &request.view_id == view_id
@@ -836,11 +845,17 @@ impl App {
     ) {
         if let Some(instance_id) = instance_id {
             if let Some(active) = self.view_stack.active_mut() {
-                if active.plugin_id == plugin_id
-                    && active.view.view_id == frame.view_id
-                    && active.view.instance_id == instance_id
+                if let SubviewBody::Plugin {
+                    view,
+                    frame: active_frame,
+                } = &mut active.body
                 {
-                    active.frame = Some(frame);
+                    if active.plugin_id == plugin_id
+                        && view.view_id == frame.view_id
+                        && view.instance_id == instance_id
+                    {
+                        *active_frame = Some(frame);
+                    }
                 }
             }
             return;

@@ -125,3 +125,48 @@ impl Tool for ReadFileTool {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ReadPathGrants, Tool, ToolCall, WorkspaceGuard};
+
+    /// 用户显式授权的外部文本文件可以被只读工具读取。
+    #[tokio::test]
+    async fn reads_user_granted_external_file() {
+        let base = std::env::temp_dir().join(format!(
+            "lucia-read-grant-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let inside = base.join("inside");
+        let outside = base.join("outside.txt");
+        std::fs::create_dir_all(&inside).expect("应创建工作区");
+        std::fs::write(&outside, "line one\nline two").expect("应写入外部文件");
+
+        let grants = ReadPathGrants::new();
+        grants.grant(&outside).expect("应登记外部路径");
+        let guard = WorkspaceGuard::rooted(&inside)
+            .expect("应创建守卫")
+            .with_read_grants(grants);
+        let tool = ReadFileTool::new(guard);
+        let call = ToolCall::new(
+            "read-granted",
+            "read_file",
+            json!({ "path": outside.to_str().expect("测试路径应为 UTF-8") }),
+        );
+
+        let result = tool.call(call).await.expect("工具应返回结果");
+        assert!(!result.is_error, "授权路径不应报错：{:?}", result.content);
+        assert!(
+            result.content["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("line two")),
+            "应读取到外部文件内容：{:?}",
+            result.content
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

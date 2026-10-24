@@ -9,7 +9,8 @@ use super::{
 use crate::app::App;
 #[cfg(feature = "plugins")]
 use crate::command::render_native_plugin_dialog;
-use crate::command::render_native_session_dialog;
+#[cfg(feature = "plugins")]
+use crate::ui::agent_view::render_agent_session_view;
 use ratatui::prelude::*;
 
 /// Selects and renders the main view, plugin slots, dialogs, or the active subview.
@@ -26,21 +27,30 @@ pub(crate) fn render_root(frame: &mut Frame, app: &mut App) {
         // 离开主视图后清空主界面热区，避免点击被上一帧的滚动条或跳转提示拦截。
         app.jump_hint_area = None;
         app.scrollbar_area = None;
+        app.scrollbar_grab_half = None;
         app.scrollbar_drag = false;
-        render_plugin_subview(frame, app, outer);
+        app.is_scrollbar_hovered = false;
+        // 底栏不会在子视图里绘制，它的上下文芯片热区同样必须失效。
+        app.context_chip_area = None;
+        app.is_context_chip_hovered = false;
+        if app.active_agent_session_view().is_some() {
+            render_agent_session_view(frame, app, outer);
+        } else {
+            render_plugin_subview(frame, app, outer);
+        }
         return;
     }
     #[cfg(feature = "plugins")]
     let workspace = render_docked_plugin_views(frame, app, outer);
     #[cfg(not(feature = "plugins"))]
     let workspace = outer;
-    render_main(frame, app, workspace);
+    // 输入盒几何是浮层 Dialog 的锚点：它们与命令面板共用同一条底边。
+    let composer = render_main(frame, app, workspace);
     #[cfg(feature = "plugins")]
     render_plugin_input(frame, app, workspace);
     #[cfg(feature = "plugins")]
-    render_plugin_dialog(frame, app, outer);
-    render_native_session_dialog(frame, app, outer);
-    crate::command::render_context_dialog(frame, app, outer);
+    render_plugin_dialog(frame, app, composer);
+    crate::command::render_context_dialog(frame, app, composer);
     #[cfg(feature = "plugins")]
-    render_native_plugin_dialog(frame, app, outer);
+    render_native_plugin_dialog(frame, app, composer);
 }

@@ -25,12 +25,11 @@ fn unavailable_agent_queues_inputs_in_fifo_order() {
             .collect::<Vec<_>>(),
         vec!["第一条任务", "第二条任务"]
     );
-    assert_eq!(
+    assert!(
         app.messages
             .iter()
-            .filter(|message| matches!(message.kind, MsgKind::User))
-            .count(),
-        2
+            .all(|message| !matches!(message.kind, MsgKind::User)),
+        "待发送消息只显示在输入框上方的排队面板"
     );
     let (_, status) = app.plugin_status_content();
     assert!(status.contains("queued 2"), "{status}");
@@ -1075,4 +1074,32 @@ fn tick_requires_redraw_while_text_is_pending() {
     // 边界补完会一次清空缓冲（揭示节拍只负责常态，边界必须立即追上）。
     app.flush_pending_stream();
     assert!(!app.tick_requires_redraw(), "残余清空后回到纯事件驱动");
+}
+
+// TEMP-BENCH-REMOVE
+/// 临时测量：整段 Markdown 在每帧重排的成本。
+#[test]
+fn tmp_bench_markdown_frame_cost() {
+    let mut body = String::new();
+    for index in 0..400 {
+        body.push_str(&format!(
+            "第 {index} 段：流式输出里的一行正文，包含 `code` 与 **粗体**，用来逼近真实回答的排版密度。\n\n"
+        ));
+    }
+    for chars in [2_000usize, 8_000, 20_000, 40_000] {
+        let text: String = body.chars().take(chars).collect();
+        let started = std::time::Instant::now();
+        let rounds = 20;
+        let mut lines = 0;
+        for _ in 0..rounds {
+            lines = markdown_lines(&text, true, 160).len();
+        }
+        let per = started.elapsed() / rounds;
+        eprintln!(
+            "BENCH chars={} lines={} per_render={:?}",
+            text.chars().count(),
+            lines,
+            per
+        );
+    }
 }

@@ -9,13 +9,24 @@ use agent_core::AgentExtension;
 use agent_core::ContextLoadRequest;
 use agent_core::EventContext;
 use agent_core::LoadedContext;
+use agent_runtime::AgentRuntimeApi;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 /// 插件宿主在通用 Agent 扩展能力之上提供的 UI 接口。
 #[async_trait]
 pub trait PluginHost: AgentExtension {
     /// 返回宿主实例的稳定 ID；无独立身份的组合或空宿主返回 `None`。
     fn id(&self) -> Option<&str> {
+        None
+    }
+
+    /// 返回指定插件激活实例绑定的 Agent Runtime API。
+    ///
+    /// 应用用它渲染插件名下 Agent 的原生会话视图。API 由 Host 按该插件自己的可信
+    /// principal 创建，调用方只能访问该插件名下的 Agent；插件未声明 Agent 能力时返回
+    /// `None`。
+    fn agent_runtime_api(&self, _plugin_id: &str) -> Option<Arc<dyn AgentRuntimeApi>> {
         None
     }
 

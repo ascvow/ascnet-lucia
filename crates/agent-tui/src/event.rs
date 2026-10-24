@@ -3,7 +3,7 @@
 use crate::session::conversation::UserSubmission;
 use agent_core::model::TokenUsage;
 use agent_core::AgentRun;
-use agent_session::{SessionId, SessionRecord, SessionStoreError, SessionSummary};
+use agent_session::{SessionId, SessionRecord, SessionStoreError};
 use agent_tool::{ToolCall, ToolResult};
 use anyhow::Result;
 use crossterm::event::Event;
@@ -76,8 +76,20 @@ pub(crate) enum UiEvent {
     ContextSnapshot(crate::command::ContextSnapshot),
     /// Agent 运行结束，携带至少一次持久化后的会话状态。
     AgentDone(Box<AgentCompletion>),
-    /// 原生会话 Dialog 的摘要查询完成。
-    NativeSessionsLoaded(Result<Vec<SessionSummary>, SessionStoreError>),
+    /// 原生会话搜索面板的摘要查询完成。
+    ///
+    /// 载荷已经是可逐帧过滤的候选条目：检索文本在加载时算好一次，避免每次输入都
+    /// 重新小写化整个列表。
+    NativeSessionsLoaded(Result<Vec<crate::command::NativeSessionEntry>, SessionStoreError>),
+    /// 会话标题的模型生成结果。
+    ///
+    /// 失败只携带原因字符串：标题是界面元数据，失败一律静默保留兜底标题，不进入消息流。
+    SessionTitleReady {
+        /// 请求标题的会话；与当前会话不一致时结果被丢弃。
+        session_id: SessionId,
+        /// 清洗后的单行标题。
+        result: Result<String, String>,
+    },
     /// 用户在原生会话 Dialog 中确认恢复一份精确修订。
     NativeResumeRequested {
         /// 待恢复的稳定会话 ID。
@@ -114,6 +126,28 @@ pub(crate) enum UiEvent {
     /// 后台上下文引用快照拉取完成。
     #[cfg(feature = "plugins")]
     ContextRefsLoaded(Vec<ContextRefOutcome>),
+    /// 原生 Agent 会话视图收到一批 Runtime 事件。
+    #[cfg(feature = "plugins")]
+    AgentViewEvents {
+        /// 发起导航的可信插件 ID。
+        plugin_id: String,
+        /// 插件内成员实例 ID。
+        instance_id: String,
+        /// 这批事件的来源句柄；与视图当前目标不一致时整批丢弃。
+        target: agent_runtime::AgentId,
+        /// 本批事件，按到达顺序排列。
+        events: Vec<agent_core::AgentEvent>,
+    },
+    /// 原生 Agent 会话视图的事件流已经结束。
+    #[cfg(feature = "plugins")]
+    AgentViewClosed {
+        /// 发起导航的可信插件 ID。
+        plugin_id: String,
+        /// 插件内成员实例 ID。
+        instance_id: String,
+        /// 结束的句柄；与视图当前目标不一致时忽略。
+        target: agent_runtime::AgentId,
+    },
     /// 后台单个视图已完成，立即展示而不等待整批结束。
     #[cfg(feature = "plugins")]
     PluginFrameLoaded(PluginRenderResult),

@@ -193,8 +193,8 @@ impl AgentPlugin for UiShowcasePlugin {
                 }
             }
             UiInputEvent::Mouse { .. } => {}
-            // 展示插件不声明输入触发前缀，不会收到主输入快照。
-            UiInputEvent::MainInput { .. } => {}
+            // 展示插件不声明输入触发前缀，也不会打开原生 Agent 会话，收不到这两类事件。
+            UiInputEvent::MainInput { .. } | UiInputEvent::Submit { .. } => {}
         }
     }
 

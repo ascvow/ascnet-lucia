@@ -1,0 +1,366 @@
+//! 宿主原生 Agent 会话视图的导航、输入与渲染回归测试。
+
+#[cfg(feature = "plugins")]
+use super::*;
+#[cfg(feature = "plugins")]
+use crate::app::{AgentSessionView, AgentViewKeyOutcome};
+#[cfg(feature = "plugins")]
+use agent_plugin_protocol::{UiDeclaration, UiNavigationAction, UiNavigationRequest, UiPlacement};
+#[cfg(feature = "plugins")]
+use agent_runtime::{
+    AgentEventStream, AgentHandle, AgentId, AgentLineage, AgentOutcome, AgentRuntimeApi,
+    AgentSnapshot, AgentSpawnRequest, AgentStatus, RuntimePrincipal, RuntimeResult,
+};
+use std::str::FromStr;
+
+/// 测试用 Runtime API：只提供路由测试需要的状态与订阅。
+#[cfg(feature = "plugins")]
+struct StubAgentApi {
+    target: AgentId,
+}
+
+/// 构造一个固定成功句柄。
+#[cfg(feature = "plugins")]
+fn stub_handle(id: &str) -> AgentHandle {
+    let id = AgentId::from_str(id).expect("测试 Agent ID 应合法");
+    AgentHandle {
+        id: id.clone(),
+        lineage: AgentLineage {
+            parent: None,
+            root: id,
+            depth: 0,
+        },
+    }
+}
+
+#[cfg(feature = "plugins")]
+#[async_trait::async_trait]
+impl AgentRuntimeApi for StubAgentApi {
+    fn principal(&self) -> RuntimePrincipal {
+        RuntimePrincipal::host()
+    }
+
+    fn identity(&self) -> AgentId {
+        self.target.clone()
+    }
+
+    async fn spawn(&self, _request: AgentSpawnRequest) -> RuntimeResult<AgentHandle> {
+        Ok(stub_handle(&self.target.to_string()))
+    }
+
+    async fn continue_agent(&self, target: &AgentId, _input: String) -> RuntimeResult<AgentHandle> {
+        Ok(stub_handle(&target.to_string()))
+    }
+
+    async fn status(&self, target: &AgentId) -> RuntimeResult<AgentSnapshot> {
+        Ok(AgentSnapshot {
+            id: target.clone(),
+            lineage: AgentLineage {
+                parent: None,
+                root: target.clone(),
+                depth: 0,
+            },
+            status: AgentStatus::Running,
+            permissions: Default::default(),
+        })
+    }
+
+    async fn result(&self, _target: &AgentId) -> RuntimeResult<Option<AgentOutcome>> {
+        Ok(None)
+    }
+
+    async fn wait(&self, _target: &AgentId) -> RuntimeResult<AgentOutcome> {
+        Ok(AgentOutcome::Cancelled)
+    }
+
+    async fn cancel(&self, _target: &AgentId) -> RuntimeResult<bool> {
+        Ok(true)
+    }
+
+    async fn subscribe(&self, _target: &AgentId) -> RuntimeResult<AgentEventStream> {
+        Ok(AgentEventStream::empty())
+    }
+}
+
+/// 打开一个成员原生会话视图，并挂上仅用于渲染的视图状态。
+#[cfg(feature = "plugins")]
+fn open_member_view(app: &mut App, member: &str, target: &str) -> AgentId {
+    let target = AgentId::from_str(target).expect("测试 Agent ID 应合法");
+    app.add_plugin_views(vec![UiDeclaration {
+        plugin_id: "teammate".into(),
+        view_id: "teammate-member-session".into(),
+        title: "Member session".into(),
+        placement: UiPlacement::Subview,
+        size: Default::default(),
+        focusable: true,
+        input_triggers: Vec::new(),
+    }]);
+    app.apply_view_navigation(
+        "teammate",
+        UiNavigationRequest {
+            request_id: "open-member-1".into(),
+            action: UiNavigationAction::OpenAgentSession {
+                view_id: "teammate-member-session".into(),
+                instance_id: member.into(),
+                target: target.to_string(),
+                title: Some("Researcher".into()),
+                prompt: Some("检查首轮实现".into()),
+                notice: None,
+            },
+        },
+    )
+    .expect("原生会话导航应被接受");
+    app.agent_views.push(AgentSessionView::new(
+        "teammate".into(),
+        member.into(),
+        target.clone(),
+        Arc::new(StubAgentApi {
+            target: target.clone(),
+        }),
+        Some("检查首轮实现".into()),
+        None,
+    ));
+    target
+}
+
+/// 原生会话视图沿用导航栈：Esc 返回主界面，重复打开只更新目标句柄。
+#[cfg(feature = "plugins")]
+#[test]
+fn agent_session_navigation_uses_the_shared_stack() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let first = open_member_view(&mut app, "member-1", "3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+
+    let route = app
+        .active_agent_session_route()
+        .expect("原生会话应处于激活状态");
+    assert_eq!(route.plugin_id, "teammate");
+    assert_eq!(route.instance_id, "member-1");
+    assert_eq!(route.target, first);
+
+    // 续跑换了句柄：实例 ID 不变，视图仍只有一个。
+    app.apply_view_navigation(
+        "teammate",
+        UiNavigationRequest {
+            request_id: "open-member-2".into(),
+            action: UiNavigationAction::OpenAgentSession {
+                view_id: "teammate-member-session".into(),
+                instance_id: "member-1".into(),
+                target: "3f2504e0-4f89-11d3-9a0c-0305e82c3302".into(),
+                title: Some("Researcher".into()),
+                prompt: None,
+                notice: None,
+            },
+        },
+    )
+    .expect("换句柄应被接受");
+    assert_eq!(app.agent_session_routes().len(), 1);
+
+    assert!(matches!(
+        app.handle_agent_session_key(KeyCode::Esc, KeyModifiers::NONE),
+        AgentViewKeyOutcome::Exit
+    ));
+    assert!(app.view_stack.is_main());
+}
+
+/// 事件时间线复用主界面组件：助手正文、工具调用与结果都进入消息列表。
+#[cfg(feature = "plugins")]
+#[test]
+fn agent_session_events_build_main_ui_components() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let target = open_member_view(&mut app, "member-1", "3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+    let view = app.active_agent_session_view_mut().expect("视图状态应存在");
+    view.set_status(AgentStatus::Running);
+    let mut push = |kind: AgentEventKind, payload: serde_json::Value| {
+        view.apply_event(&AgentEvent::new("run-1", kind, 0, payload));
+    };
+    push(
+        AgentEventKind::ModelTextDelta,
+        json!({"index": 0, "delta": "我先查看文件"}),
+    );
+    push(
+        AgentEventKind::ToolStarted,
+        json!({"id": "call-1", "name": "read_file", "args": {"path": "src/lib.rs"}}),
+    );
+    push(
+        AgentEventKind::ToolFinished,
+        json!({
+            "call_id": "call-1",
+            "name": "read_file",
+            "content": {"path": "src/lib.rs", "content": "fn main() {}"},
+            "is_error": false,
+            "details": null
+        }),
+    );
+
+    assert!(view.messages.iter().any(|message| {
+        matches!(message.kind, MsgKind::Assistant) && message.text.contains("我先查看文件")
+    }));
+    let tool = view
+        .messages
+        .iter()
+        .find(|message| message.is_tool())
+        .expect("工具调用应成为独立的工具组件");
+    assert_eq!(
+        tool.tool_call.as_ref().map(|call| call.name.as_str()),
+        Some("read_file")
+    );
+    assert!(matches!(tool.kind, MsgKind::ToolOk));
+    assert!(tool.tool_result.is_some());
+
+    let backend = TestBackend::new(90, 20);
+    let mut terminal = Terminal::new(backend).expect("创建原生会话测试终端");
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染原生会话视图");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(rendered.contains("Lucia/Researcher"), "{rendered:?}");
+    assert!(rendered.contains("检查首轮实现"), "{rendered:?}");
+    assert!(rendered.contains("Running"), "{rendered:?}");
+    assert!(rendered.contains("我先查看文件"), "{rendered:?}");
+    assert!(rendered.contains("Read(src/lib.rs)"), "{rendered:?}");
+    assert!(rendered.contains("SteertheAgent…"), "{rendered:?}");
+    let _ = target;
+}
+
+/// 原生会话的输入框由 TUI 编辑，只有提交时才跨越插件边界。
+#[cfg(feature = "plugins")]
+#[test]
+fn agent_session_edits_and_submits_locally() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    open_member_view(&mut app, "member-1", "3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+
+    for character in "继续分析".chars() {
+        app.handle_agent_session_key(KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    assert_eq!(
+        app.active_agent_session_view()
+            .expect("视图状态应存在")
+            .input,
+        "继续分析"
+    );
+    match app.handle_agent_session_key(KeyCode::Enter, KeyModifiers::NONE) {
+        AgentViewKeyOutcome::Submit {
+            plugin_id,
+            view_id,
+            instance_id,
+            text,
+        } => {
+            assert_eq!(plugin_id, "teammate");
+            assert_eq!(view_id, "teammate-member-session");
+            assert_eq!(instance_id, "member-1");
+            assert_eq!(text, "继续分析");
+        }
+        _ => panic!("非空输入提交必须产生 Submit"),
+    }
+    let view = app.active_agent_session_view().expect("视图状态应存在");
+    assert!(view.input.is_empty(), "提交后输入框应清空");
+    assert!(view
+        .messages
+        .iter()
+        .any(|message| matches!(message.kind, MsgKind::User) && message.text == "继续分析"));
+
+    // 空输入上的 Enter 不提交；Shift+Enter 与主输入框一样插入换行。
+    assert!(matches!(
+        app.handle_agent_session_key(KeyCode::Enter, KeyModifiers::NONE),
+        AgentViewKeyOutcome::Consumed
+    ));
+    app.handle_agent_session_key(KeyCode::Char('a'), KeyModifiers::NONE);
+    app.handle_agent_session_key(KeyCode::Enter, KeyModifiers::SHIFT);
+    app.handle_agent_session_key(KeyCode::Char('b'), KeyModifiers::NONE);
+    assert_eq!(
+        app.active_agent_session_view()
+            .expect("视图状态应存在")
+            .input,
+        "a\nb"
+    );
+}
+
+/// 订阅同步只为导航栈中的实例建立状态，关闭视图后立即释放。
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn agent_session_subscriptions_follow_the_navigation_stack() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let target = open_member_view(&mut app, "member-1", "3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+    let api: Arc<dyn AgentRuntimeApi> = Arc::new(StubAgentApi {
+        target: target.clone(),
+    });
+    app.sync_agent_views_with(|_| Some(Arc::clone(&api))).await;
+
+    let view = app
+        .active_agent_session_view()
+        .expect("同步后应建立视图状态");
+    assert_eq!(view.status, Some(AgentStatus::Running));
+    assert!(view.subscribed_for(&target));
+
+    // 事件经后台转发到达后进入同一条时间线。
+    app.apply_agent_view_events(
+        "teammate",
+        "member-1",
+        &target,
+        vec![AgentEvent::new(
+            "run-1",
+            AgentEventKind::ModelTextDelta,
+            0,
+            json!({"index": 0, "delta": "继续"}),
+        )],
+    )
+    .await;
+    assert!(app
+        .active_agent_session_view()
+        .expect("视图状态应存在")
+        .messages
+        .iter()
+        .any(|message| message.text.contains("继续")));
+
+    // 事件流结束后不再逐帧重绘：终态成员不能继续显示旋转指示与耗时。
+    if let Some(view) = app.active_agent_session_view_mut() {
+        view.mark_closed(Some(AgentStatus::Running), None);
+    }
+    assert!(!app.tick_requires_redraw(), "结束的流不应继续驱动帧时钟");
+
+    // 返回主界面后同步必须丢弃旧实例与它的订阅，避免后台任务继续占用通道。
+    app.handle_agent_session_key(KeyCode::Esc, KeyModifiers::NONE);
+    app.sync_agent_views_with(|_| Some(Arc::clone(&api))).await;
+    assert!(app.agent_views.is_empty());
+}
+
+/// 原生会话视图不向插件请求任何帧：成员会话由 TUI 自己渲染。
+#[cfg(feature = "plugins")]
+#[test]
+fn agent_session_view_skips_plugin_frames() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.add_plugin_views(vec![UiDeclaration {
+        plugin_id: "teammate".into(),
+        view_id: "teammate-team-dock".into(),
+        title: "Team".into(),
+        placement: UiPlacement::Right,
+        size: Default::default(),
+        focusable: true,
+        input_triggers: Vec::new(),
+    }]);
+    assert_eq!(
+        app.periodic_plugin_render_requests().len(),
+        1,
+        "主视图可见时停靠视图仍按周期刷新"
+    );
+
+    open_member_view(&mut app, "member-1", "3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+    assert!(
+        app.periodic_plugin_render_requests().is_empty(),
+        "原生会话视图不应让宿主调用插件渲染"
+    );
+}

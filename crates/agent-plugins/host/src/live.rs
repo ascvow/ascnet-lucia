@@ -783,6 +783,13 @@ impl AgentExtension for LivePluginHost {
 
 #[async_trait]
 impl PluginHost for LivePluginHost {
+    fn agent_runtime_api(
+        &self,
+        plugin_id: &str,
+    ) -> Option<Arc<dyn agent_runtime::AgentRuntimeApi>> {
+        self.current_snapshot().ok()?.agent_runtime_api(plugin_id)
+    }
+
     async fn load_context(&self, request: &ContextLoadRequest) -> Result<Option<LoadedContext>> {
         let host = self.run_snapshot(&request.run_id)?.host;
         PluginHost::load_context(&host, request).await

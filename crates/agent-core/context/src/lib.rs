@@ -432,15 +432,15 @@ impl NativeContextLoader {
     }
 
     /// 把压缩事实写入 Agent 事件流；无事件的透传请求不产生记录。
-    async fn emit_event(&self, request: &ContextLoadRequest, event: Option<&Value>) -> Result<()> {
+    async fn emit_event(&self, run_id: &str, step: usize, event: Option<&Value>) -> Result<()> {
         let Some(event) = event else {
             return Ok(());
         };
         self.events
             .record(&AgentEvent::new(
-                request.run_id.clone(),
+                run_id.to_string(),
                 AgentEventKind::Extension,
-                request.step,
+                step,
                 event.clone(),
             ))
             .await
@@ -520,10 +520,15 @@ impl ContextLoader for NativeContextLoader {
             summary_model.context_window,
             summary_model.max_summary_tokens as usize,
         );
+        // 事件只需要 run_id 与 step。先取出这两个字段，就不必为了 `emit_event`
+        // 而深度克隆整份上下文——压缩结果为压缩后形态，与该请求已无引用关系。
+        let run_id = effective.run_id.clone();
+        let step = effective.step;
+        let manual = effective.user_initiated;
         let reuse_original_messages = plan.can_reuse_original_messages();
         let outcome = compress_context_with_tokens(
-            effective.clone(),
-            effective.user_initiated,
+            effective,
+            manual,
             budget,
             summary_model.as_ref(),
             plan.micro_floor(),
@@ -531,7 +536,8 @@ impl ContextLoader for NativeContextLoader {
         )
         .await?;
         self.commit_cache(plan, &outcome)?;
-        self.emit_event(&effective, outcome.event.as_ref()).await?;
+        self.emit_event(&run_id, step, outcome.event.as_ref())
+            .await?;
         if reuse_original_messages && outcome.event.is_none() {
             return Ok(CoreLoadedContext {
                 system: original.system,

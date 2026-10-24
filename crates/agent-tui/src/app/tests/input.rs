@@ -221,12 +221,57 @@ fn pasted_text_uses_clip_label_and_preserves_original_content() {
     assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "第一行\n第二行"));
 }
 
+/// 短粘贴按普通输入插入，不生成引用标签，用户可以接着就地改字。
+#[test]
+fn short_paste_lands_in_the_input_verbatim() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.handle_paste("终端项目是：lucia");
+
+    assert_eq!(app.input, "终端项目是：lucia");
+    assert_eq!(app.cursor, app.input.len());
+    assert!(app.attachments.is_empty(), "短文本不应产生附件");
+    let blocks = app.take_submission().expect("应有文本提交").blocks();
+    assert!(matches!(
+        blocks.as_slice(),
+        [ContentBlock::Text { text }] if text == "终端项目是：lucia"
+    ));
+}
+
+/// 从终端复制的一行常带结尾换行：落进输入框时去掉，光标不该被推到空行。
+#[test]
+fn single_line_paste_drops_the_trailing_newline() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.handle_paste("cargo test -p lucia\r\n");
+
+    assert_eq!(app.input, "cargo test -p lucia");
+    assert_eq!(app.cursor, app.input.len());
+    assert!(app.attachments.is_empty());
+}
+
+/// 单行但超宽的长文本仍然折叠成标签，避免把输入盒撑成一大团。
+#[test]
+fn long_single_line_paste_folds_into_a_label() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let long = "x".repeat(crate::app::input::PASTE_TAG_COLUMNS + 1);
+
+    app.handle_paste(&long);
+
+    assert_eq!(app.input, "[粘贴的文本] ");
+    let blocks = app.take_submission().expect("应有粘贴文本提交").blocks();
+    assert!(matches!(blocks.as_slice(), [ContentBlock::Text { text }] if text == &long));
+}
+
 /// 删除粘贴标签必须同步删除绑定原文，提交时不得残留隐藏正文。
 #[test]
 fn deleting_pasted_text_label_removes_bound_content() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    app.handle_paste("不应发送的正文");
+    app.handle_paste("不应发送的正文\n第二行");
     app.handle_key(KeyCode::Backspace, KeyModifiers::NONE, None);
 
     app.handle_key(KeyCode::Backspace, KeyModifiers::NONE, None);
@@ -424,7 +469,7 @@ fn visible_permission_input_freezes_main_event_timeline() {
     assert!(resumed.contains("审批中正文"), "{resumed:?}");
     assert!(!resumed.contains("审批中思考"), "{resumed:?}");
     assert!(resumed.contains("审批期间工具"), "{resumed:?}");
-    // 审批结束后仍在运行的工具接管边框标题，思考状态不再残留。
+    // 审批结束后仍在运行的工具接管状态行，思考状态不再残留。
     assert!(resumed.contains("Esctostop"), "{resumed:?}");
     assert!(!resumed.contains("Thinking"), "{resumed:?}");
 }
@@ -492,9 +537,12 @@ fn pasted_file_path_parses_dropped_paths() {
     assert_eq!(pasted_file_path(&display, &base), None);
 }
 
-/// 直接输入相对路径（`./` 前缀或裸文件名）回车后转为附件，而不是当文本发送。
+/// 直接输入相对路径回车：路径文本原样发送，媒体文件同时作为附件带给模型。
+///
+/// 路径不被改写成引用标签，因为同一段文字可能是一条待执行的命令；附件是追加的，
+/// 模型既能看到用户原话，也能真正读到图片内容。
 #[test]
-fn enter_converts_relative_path_input_to_attachment() {
+fn enter_sends_relative_media_path_with_attachment() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let path = write_temp_attachment("直接输入的图.png", b"\x89PNG\r\n\x1a\n");
@@ -505,10 +553,508 @@ fn enter_converts_relative_path_input_to_attachment() {
     app.cursor = app.input.len();
     app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
 
+    assert!(app.input.is_empty(), "路径文本应作为消息提交并清空输入");
+    assert!(!app.running, "无 Agent 时进入排队而不是直接运行");
+    let queued = app.queued_inputs.back().expect("应排入一条待发送输入");
+    assert_eq!(queued.text, format!("./{name}"), "正文必须保留用户原话");
+    assert_eq!(queued.attachments.len(), 1, "相对路径指向的图片应转成附件");
+    assert!(queued.attachments[0].is_image);
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 运行中发送带附件的输入：不能当 steering 丢掉附件，必须整条排队。
+#[test]
+fn running_input_with_attachment_queues_instead_of_steering() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    let path = write_temp_attachment("排队图.png", b"\x89PNG\r\n\x1a\n");
+    let display = path.display().to_string();
+
+    app.running = true;
+    app.handle_paste_with(&display, Vec::new);
     assert_eq!(app.attachments.len(), 1);
-    assert_eq!(app.attachments[0].media_type, "image/png");
-    assert_eq!(app.input, "[IMAGE#1] ");
-    assert!(!app.running, "转为附件时不得同时提交消息");
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
+
+    assert!(app.input.is_empty(), "输入应被队列取走");
+    let queued = app.queued_inputs.back().expect("带附件时必须排队");
+    assert_eq!(queued.attachments.len(), 1);
+    assert!(queued.attachments[0].is_image);
+    assert_eq!(queued.text, "[IMAGE#1]", "路径已由标签替换");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 运行中普通回车默认排队：消息显示在输入框上方，可继续修改。
+#[test]
+fn running_plain_text_queues_by_default() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    app.running = true;
+    app.input = "排队中的话".into();
+    app.cursor = app.input.len();
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
+
+    assert_eq!(app.queued_inputs.len(), 1);
+    assert_eq!(app.queued_inputs[0].text, "排队中的话");
+    assert!(app.input.is_empty());
+    assert!(
+        app.messages
+            .iter()
+            .all(|message| !message.text.contains("Steering queued")),
+        "普通回车不应走 steering"
+    );
+}
+
+/// Ctrl+Enter 保留立即插话：纯文本直接作为 steering 发送，不进入排队面板。
+#[test]
+fn ctrl_enter_steers_plain_text() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    app.running = true;
+    app.input = "立即插话".into();
+    app.cursor = app.input.len();
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+
+    assert!(app.queued_inputs.is_empty(), "Ctrl+Enter 不进入队列");
+    assert!(app.input.is_empty());
+    assert!(
+        app.messages
+            .iter()
+            .any(|message| message.text.contains("Steering queued")),
+        "应提示已作为 steering 发送"
+    );
+}
+
+/// 运行中发送带上下文引用的输入：引用同样不能当 steering 丢掉。
+#[test]
+fn running_input_with_refs_queues_instead_of_steering() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+
+    app.refs.push(crate::session::conversation::PendingRef {
+        label: "[REF#1]".into(),
+        provider: "test".into(),
+        id: "ref-1".into(),
+        title: "测试引用".into(),
+        body: "引用正文".into(),
+    });
+    app.input = "[REF#1] 看看这个".into();
+    app.cursor = app.input.len();
+    app.running = true;
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
+
+    assert_eq!(app.queued_inputs.len(), 1, "带引用时必须排队");
+    assert_eq!(app.queued_inputs[0].refs.len(), 1);
+}
+
+/// 从排队面板取回消息：正文与附件回到输入框，队列移除该项。
+#[test]
+fn editing_queued_input_restores_text_and_attachments() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "排队正文 [FILE#1] ".into();
+    app.attachments.push(PendingAttachment {
+        label: "[FILE#1]".into(),
+        name: "a.txt".into(),
+        media_type: "text/plain".into(),
+        data: String::new(),
+        is_image: false,
+        pasted_text: None,
+        source_path: None,
+    });
+    app.queue_input_until_ready();
+    assert_eq!(app.queued_inputs.len(), 1);
+
+    assert!(app.edit_queued_input(0));
+
+    assert_eq!(app.input, "排队正文 [FILE#1]");
+    assert_eq!(app.attachments.len(), 1);
+    assert!(app.queued_inputs.is_empty());
+}
+
+/// 发送时自动附加、正文里没有标签的图片，取回编辑时补上标签并保留附件。
+#[test]
+fn editing_queued_input_keeps_send_time_attachment() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("排队正文图.png", b"\x89PNG");
+    app.input = format!("看 {}", path.display());
+    app.cursor = app.input.len();
+    app.queue_input_until_ready();
+    assert_eq!(app.queued_inputs.len(), 1);
+    assert!(!app.queued_inputs[0].text.contains("[IMAGE#1]"));
+
+    assert!(app.edit_queued_input(0));
+
+    assert!(
+        app.input.contains("[IMAGE#1]"),
+        "取回时应补上附件标签：{:?}",
+        app.input
+    );
+    assert_eq!(app.attachments.len(), 1, "编辑不能丢掉自动附加的附件");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 输入框已有草稿时取回排队消息：草稿排到队尾，两边内容都不丢。
+#[test]
+fn editing_queued_input_keeps_current_draft() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.queued_inputs.push_back("排队一".into());
+    app.input = "当前草稿".into();
+    app.cursor = app.input.len();
+
+    assert!(app.edit_queued_input(0));
+
+    assert_eq!(app.input, "排队一");
+    assert_eq!(
+        app.queued_inputs
+            .back()
+            .map(|submission| submission.text.as_str()),
+        Some("当前草稿")
+    );
+}
+
+/// 正在发送的队首不能取回，避免完成回调找不到对应的 FIFO 输入。
+#[test]
+fn editing_running_queue_head_is_rejected() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.queued_inputs.push_back("排队一".into());
+    app.queued_run_active = true;
+
+    assert!(!app.edit_queued_input(0));
+    assert_eq!(app.queued_inputs.len(), 1);
+    assert!(app.input.is_empty());
+}
+
+/// Ctrl+O 取回最早的一条排队消息。
+#[test]
+fn ctrl_o_focuses_queue() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.queued_inputs.push_back("排队一".into());
+    app.queued_inputs.push_back("排队二".into());
+
+    app.handle_key(KeyCode::Char('o'), KeyModifiers::CONTROL, None);
+
+    assert_eq!(app.queue_focus, Some(0), "应聚焦排队区并选中队首");
+    assert!(app.input.is_empty(), "Ctrl+O 不再直接取回编辑");
+    assert_eq!(app.queued_inputs.len(), 2);
+}
+
+/// 排队面板内方向键移动选择，越界时停住；Esc 返回输入框。
+#[test]
+fn queue_focus_moves_selection_and_escapes() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.queued_inputs = VecDeque::from(["一".into(), "二".into(), "三".into()]);
+    app.queue_focus = Some(0);
+
+    app.handle_queue_key(KeyCode::Down, KeyModifiers::NONE, None);
+    assert_eq!(app.queue_focus, Some(1));
+    app.handle_queue_key(KeyCode::Down, KeyModifiers::NONE, None);
+    assert_eq!(app.queue_focus, Some(2));
+    app.handle_queue_key(KeyCode::Down, KeyModifiers::NONE, None);
+    assert_eq!(app.queue_focus, Some(2), "末尾不应越界");
+    app.handle_queue_key(KeyCode::Up, KeyModifiers::NONE, None);
+    assert_eq!(app.queue_focus, Some(1));
+
+    app.handle_queue_key(KeyCode::Esc, KeyModifiers::NONE, None);
+    assert_eq!(app.queue_focus, None);
+}
+
+/// 空闲时 Enter 发送选中项；剩余队列保持原顺序。
+#[tokio::test]
+async fn queue_enter_idle_sends_selected() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    app.queued_inputs = VecDeque::from(["一".into(), "二".into(), "三".into()]);
+    app.queue_focus = Some(1);
+
+    app.handle_queue_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
+
+    assert!(app.running, "选中的排队消息应立即开始新一轮");
+    let texts: Vec<&str> = app
+        .queued_inputs
+        .iter()
+        .map(|submission| submission.text.as_str())
+        .collect();
+    assert_eq!(texts, ["一", "三"], "其余队列保持原顺序");
+    assert!(
+        app.messages
+            .iter()
+            .any(|message| matches!(message.kind, MsgKind::User) && message.text == "二"),
+        "发送的消息应出现在正文"
+    );
+}
+
+/// 运行中 Enter 只置顶，不打断当前轮次；正在发送的队首不能重复发送。
+#[test]
+fn queue_enter_running_promotes_and_protects_head() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    app.queued_run_active = true;
+    app.queued_inputs = VecDeque::from(["running".into(), "a".into(), "b".into()]);
+    app.queue_focus = Some(2);
+
+    app.handle_queue_key(KeyCode::Enter, KeyModifiers::NONE, None);
+
+    let texts: Vec<&str> = app
+        .queued_inputs
+        .iter()
+        .map(|submission| submission.text.as_str())
+        .collect();
+    assert_eq!(texts, ["running", "b", "a"], "选中项应移到队首之后");
+    assert_eq!(app.queue_focus, Some(1));
+
+    app.queue_focus = Some(0);
+    app.handle_queue_key(KeyCode::Enter, KeyModifiers::NONE, None);
+    let texts: Vec<&str> = app
+        .queued_inputs
+        .iter()
+        .map(|submission| submission.text.as_str())
+        .collect();
+    assert_eq!(texts, ["running", "b", "a"], "正在发送的队首不能重复发送");
+    assert!(app
+        .messages
+        .iter()
+        .any(|message| message.text.contains("正在发送")));
+}
+
+/// 排队面板内 Ctrl+O 取回选中项编辑，焦点回到输入框。
+#[test]
+fn queue_ctrl_o_edits_selected() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.queued_inputs = VecDeque::from(["一".into(), "二".into()]);
+    app.queue_focus = Some(1);
+
+    app.handle_queue_key(KeyCode::Char('o'), KeyModifiers::CONTROL, None);
+
+    assert_eq!(app.input, "二");
+    assert_eq!(app.queued_inputs.len(), 1);
+    assert_eq!(app.queue_focus, None);
+}
+
+/// Delete 丢弃选中项，选择落在下一个条目。
+#[test]
+fn queue_delete_removes_selected() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.queued_inputs = VecDeque::from(["一".into(), "二".into(), "三".into()]);
+    app.queue_focus = Some(1);
+
+    app.handle_queue_key(KeyCode::Delete, KeyModifiers::NONE, None);
+
+    let texts: Vec<&str> = app
+        .queued_inputs
+        .iter()
+        .map(|submission| submission.text.as_str())
+        .collect();
+    assert_eq!(texts, ["一", "三"]);
+    assert_eq!(app.queue_focus, Some(1));
+}
+
+/// 点击排队行只是选中并聚焦，不直接取回编辑；点击面板外退出焦点。
+#[test]
+fn clicking_queued_row_focuses_it() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.queued_inputs.push_back("排队一".into());
+    app.queued_input_areas = vec![(0, Rect::new(0, 5, 80, 1))];
+    let mouse = MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(app.handle_queued_input_click(&mouse));
+    assert_eq!(app.queue_focus, Some(0));
+    assert!(app.input.is_empty(), "点击不再直接取回编辑");
+    assert_eq!(app.queued_inputs.len(), 1);
+
+    let outside = MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 10,
+        row: 8,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(!app.handle_queued_input_click(&outside));
+    assert_eq!(app.queue_focus, None, "点击面板外应退出焦点");
+}
+
+/// 正文中点名的本地图片在提交前自动附加，且同一路径只附加一次。
+#[test]
+fn submit_attaches_mentioned_media() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("正文提到的图.png", b"\x89PNG\r\n\x1a\n");
+    let display = path.display().to_string();
+    app.workspace.cwd = path.parent().unwrap().to_path_buf();
+
+    let message = format!("看这张图，{display}，另外 {display} 也要看");
+    app.input = message.clone();
+    app.cursor = app.input.len();
+    let submission = app.take_submission().expect("应产生一次提交");
+
+    assert_eq!(submission.text, message, "正文不得被改写成引用标签");
+    assert_eq!(submission.attachments.len(), 1, "同一路径只应附加一次");
+    assert_eq!(
+        submission.attachments[0].source_path.as_deref(),
+        Some(path.as_path())
+    );
+    assert!(
+        submission
+            .blocks()
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. })),
+        "附件必须以图片内容块发送给模型"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 嵌在句子里的文本文件路径不内联，但会登记为只读授权供 `read_file` 按需读取。
+#[test]
+fn submit_keeps_text_file_paths_as_text() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("说明.txt", b"hello");
+    app.workspace.cwd = path.parent().unwrap().to_path_buf();
+
+    app.input = format!("看 {} 这个文件", path.display());
+    app.cursor = app.input.len();
+    let submission = app.take_submission().expect("应产生一次提交");
+
+    assert!(
+        submission.attachments.is_empty(),
+        "句子里的文本文件不得被自动附加"
+    );
+    assert!(
+        app.read_path_grants
+            .contains(&path.canonicalize().expect("测试文件应可解析")),
+        "正文里的路径仍应授权只读访问"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 独立成行的文本文件路径在发送时内联为附件。
+#[test]
+fn submit_attaches_standalone_text_path() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("独立文本.txt", b"hello");
+    app.workspace.cwd = path.parent().unwrap().to_path_buf();
+
+    app.input = path.display().to_string();
+    app.cursor = app.input.len();
+    let submission = app.take_submission().expect("应产生一次提交");
+
+    assert_eq!(submission.attachments.len(), 1, "独立路径应内联为附件");
+    assert!(submission.attachments[0].name.ends_with("独立文本.txt"));
+    assert_eq!(submission.attachments[0].media_type, "text/plain");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 目录不能作为附件，但会登记为只读授权，让 Agent 用 list_directory 查看。
+#[test]
+fn submit_grants_standalone_directory_path() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let directory = std::env::temp_dir().join(format!(
+        "lucia-grant-dir-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("系统时间应晚于 Unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).expect("应创建测试目录");
+
+    app.input = directory.display().to_string();
+    app.cursor = app.input.len();
+    let submission = app.take_submission().expect("应产生一次提交");
+
+    assert!(submission.attachments.is_empty(), "目录不能作为附件");
+    assert!(
+        app.read_path_grants
+            .contains(&directory.canonicalize().expect("测试目录应可解析")),
+        "目录路径应授权只读访问"
+    );
+
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+/// 切换会话必须清空路径授权：新会话的用户没有再次引用过这些文件。
+#[test]
+fn switching_session_clears_read_grants() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("旧会话授权.txt", b"hi");
+    app.read_path_grants.grant(&path).expect("应登记授权");
+    let next = SessionRecord::new(SessionId::generate(), Session::new()).expect("应创建新会话记录");
+
+    app.replace_session(next, None);
+
+    assert!(app.read_path_grants.is_empty());
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 压缩等操作替换同一会话的记录时，路径授权不能被误清。
+#[test]
+fn replacing_same_session_keeps_read_grants() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("压缩保留授权.txt", b"hi");
+    app.read_path_grants.grant(&path).expect("应登记授权");
+
+    app.replace_session(app.session_record.clone(), None);
+
+    assert!(!app.read_path_grants.is_empty());
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 已通过 `/attach` 附加的文件不得因为正文里又写出路径而发送两次。
+#[test]
+fn mentioned_media_is_not_attached_twice() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("重复判重图.png", b"\x89PNG\r\n\x1a\n");
+    let display = path.display().to_string();
+    app.workspace.cwd = path.parent().unwrap().to_path_buf();
+
+    app.attach_file(&path);
+    app.input.push_str(&format!("看 {display}"));
+    app.cursor = app.input.len();
+    let submission = app.take_submission().expect("应产生一次提交");
+
+    assert_eq!(
+        submission.attachments.len(),
+        1,
+        "同一来源路径只应作为一份附件发送"
+    );
 
     std::fs::remove_file(&path).ok();
 }
@@ -548,21 +1094,21 @@ fn enter_sends_slash_prefixed_sentence_as_message() {
     );
 }
 
-/// 直接输入绝对路径回车后转为附件，不当命令、也不当文本发送。
+/// 直接输入绝对路径回车后按普通文本发送：只有剪贴板里的文件引用才生成附件。
 #[test]
-fn enter_converts_absolute_path_input_to_attachment() {
+fn enter_sends_absolute_path_input_as_text() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let path = write_temp_attachment("绝对路径的图.png", b"\x89PNG\r\n\x1a\n");
+    let text = path.display().to_string();
 
-    app.input = path.display().to_string();
+    app.input = text.clone();
     app.cursor = app.input.len();
     app.handle_key(KeyCode::Enter, KeyModifiers::NONE, None);
 
-    assert_eq!(app.attachments.len(), 1);
-    assert_eq!(app.attachments[0].media_type, "image/png");
-    assert_eq!(app.input, "[IMAGE#1] ");
-    assert!(!app.running, "转为附件时不得同时提交消息");
+    assert!(app.attachments.is_empty(), "路径文本不得被转成附件");
+    assert!(app.input.is_empty(), "路径文本应作为消息提交并清空输入");
+    assert!(!app.running, "无 Agent 时进入排队而不是直接运行");
 
     std::fs::remove_file(&path).ok();
 }
@@ -575,7 +1121,7 @@ fn paste_bare_filename_uses_clipboard_file_reference() {
     let path = write_temp_attachment("截图.png", b"\x89PNG\r\n\x1a\n");
     let bare = path.file_name().unwrap().to_string_lossy().into_owned();
 
-    app.handle_paste_with(&bare, || Some(path.clone()));
+    app.handle_paste_with(&bare, || vec![path.clone()]);
     std::fs::remove_file(&path).ok();
 
     assert_eq!(app.input, "[IMAGE#1] ");
@@ -584,21 +1130,308 @@ fn paste_bare_filename_uses_clipboard_file_reference() {
     assert_eq!(app.attachments[0].media_type, "image/png");
 }
 
-/// 剪贴板没有文件引用且按工作目录找不到时，必须报错而不是静默折叠成文本附件。
+/// 剪贴板只有文件引用、终端只送来一次空粘贴时，仍按文件引用附加。
 #[test]
-fn paste_unresolvable_attachment_name_reports_error() {
+fn paste_empty_event_attaches_clipboard_files() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("空粘贴图.png", b"\x89PNG");
+
+    app.handle_paste_with("", || vec![path.clone()]);
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(app.attachments.len(), 1);
+    assert_eq!(app.input, "[IMAGE#1] ");
+
+    // 剪贴板也没有文件引用时，空粘贴保持无操作。
+    app.input.clear();
+    app.attachments.clear();
+    app.handle_paste_with("", Vec::new);
+    assert!(app.input.is_empty());
+    assert!(app.attachments.is_empty());
+}
+
+/// 非媒体类型的文件同样按附件发送：判据是"剪贴板有文件引用"，不是扩展名。
+#[test]
+fn paste_bare_source_file_uses_clipboard_file_reference() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("MacTerminalView.swift", b"import AppKit\n");
+    let bare = path.file_name().unwrap().to_string_lossy().into_owned();
+
+    app.handle_paste_with(&bare, || vec![path.clone()]);
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(app.attachments.len(), 1, "任何类型的文件都应能附加");
+    assert!(app.attachments[0].name.ends_with("MacTerminalView.swift"));
+    assert_eq!(app.attachments[0].media_type, "text/plain");
+}
+
+/// 剪贴板没有文件引用时，裸文件名退化为普通文本落进输入框，而不是报错。
+#[test]
+fn paste_bare_filename_without_file_reference_lands_as_text() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
 
-    app.handle_paste_with("不存在的截图.png", || None);
+    app.handle_paste_with("不存在的截图.png", Vec::new);
 
     assert!(app.attachments.is_empty());
-    assert!(app.input.is_empty());
-    assert!(app
+    assert_eq!(app.input, "不存在的截图.png");
+    assert!(
+        app.messages.is_empty(),
+        "找不到剪贴板文件引用时应退化为普通文本，不产生错误"
+    );
+}
+
+/// 粘贴单条文本文件路径：附件替换路径文本，输入框只留引用标签。
+#[test]
+fn paste_existing_text_path_attaches_without_duplicate_path() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("粘贴路径的笔记.txt", "第一行".as_bytes());
+    let text = path.display().to_string();
+
+    // 剪贴板里残留的文件引用不能劫持路径粘贴：含分隔符的文本根本不会回查剪贴板。
+    app.handle_paste_with(&text, || vec![PathBuf::from("/tmp/别的文件.png")]);
+
+    assert_eq!(app.attachments.len(), 1, "文本文件应作为附件发送");
+    assert!(app.attachments[0].name.ends_with("粘贴路径的笔记.txt"));
+    assert_eq!(app.input, "[FILE#1] ", "附加成功后不应重复保留路径文本");
+    assert!(app.messages.is_empty(), "成功附加不应产生提示");
+
+    // 删除标签即丢弃附件。
+    app.input.clear();
+    app.finish_input_edit();
+    assert!(app.attachments.is_empty());
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 粘贴图片路径：内容进附件，输入框只留引用标签。
+#[test]
+fn paste_existing_image_path_attaches_once() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("粘贴路径的图.png", b"\x89PNG\r\n\x1a\n");
+    let text = path.display().to_string();
+
+    app.handle_paste_with(&text, Vec::new);
+    assert_eq!(app.attachments.len(), 1);
+    assert!(app.attachments[0].is_image);
+    assert_eq!(app.input, "[IMAGE#1] ");
+
+    // 提交时同一张图片只发送一次，且不再附带重复的路径正文。
+    let blocks = app.take_submission().expect("应有图片提交").blocks();
+    assert_eq!(
+        blocks
+            .iter()
+            .filter(|block| matches!(block, ContentBlock::Image { .. }))
+            .count(),
+        1,
+        "同一张图片只应附加一次"
+    );
+    assert_eq!(blocks.len(), 1, "附件已替换路径文本，不应再发送路径正文");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 一次粘贴多条路径：按顺序逐个附加，输入框只留引用标签。
+#[test]
+fn paste_multiple_paths_attaches_all_as_labels() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let image = write_temp_attachment("多路径图.png", b"\x89PNG");
+    let notes = write_temp_attachment("多路径笔记.txt", b"hi");
+    let text = format!("{}\n{}", image.display(), notes.display());
+
+    app.handle_paste_with(&text, Vec::new);
+
+    assert_eq!(app.attachments.len(), 2, "两条路径都应成为附件");
+    assert_eq!(app.input, "[IMAGE#1] [FILE#1] ");
+    assert_eq!(app.attachments[0].media_type, "image/png");
+    assert_eq!(app.attachments[1].media_type, "text/plain");
+
+    std::fs::remove_file(&image).ok();
+    std::fs::remove_file(&notes).ok();
+}
+
+/// 粘贴单条不存在的路径：保留文本并说明原因，而不是静默退化成普通文本。
+#[test]
+fn paste_missing_single_path_reports_reason() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.handle_paste_with("/nonexistent/lucia-图.png", Vec::new);
+
+    assert!(app.attachments.is_empty());
+    assert_eq!(
+        app.input, "/nonexistent/lucia-图.png",
+        "路径文本必须原样保留"
+    );
+    let notice = app
         .messages
         .last()
-        .is_some_and(|message| matches!(message.kind, MsgKind::Error)
-            && message.text.contains("不存在的截图.png")));
+        .map(|message| message.text.clone())
+        .unwrap_or_default();
+    assert!(
+        notice.contains("未找到本地文件"),
+        "应说明路径未命中：{notice}"
+    );
+}
+
+/// 大文本与目录、二进制文件保留为路径文本，并说明为什么没有附件。
+#[test]
+fn paste_unattachable_paths_keep_text_with_reason() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let large = write_temp_attachment(
+        "巨大的日志.log",
+        "x".repeat(MAX_AUTO_TEXT_ATTACHMENT_BYTES as usize + 1)
+            .as_bytes(),
+    );
+    let binary = write_temp_attachment("二进制.bin", &[0x00, 0xff, 0xfe, 0x01]);
+    let directory = std::env::temp_dir();
+
+    for (path, expected) in [
+        (&large, "read_file"),
+        (&binary, "二进制"),
+        (&directory, "list_directory"),
+    ] {
+        app.input.clear();
+        app.cursor = 0;
+        app.messages.clear();
+        app.handle_paste_with(&path.display().to_string(), Vec::new);
+
+        assert!(
+            app.attachments.is_empty(),
+            "{} 不应成为附件",
+            path.display()
+        );
+        assert_eq!(
+            app.input,
+            path.display().to_string(),
+            "路径文本必须原样留在输入框"
+        );
+        let notice = app
+            .messages
+            .last()
+            .map(|message| message.text.clone())
+            .unwrap_or_default();
+        assert!(
+            notice.contains(expected),
+            "提示应说明处理方式（期望包含 {expected}）：{notice}"
+        );
+    }
+
+    std::fs::remove_file(&large).ok();
+    std::fs::remove_file(&binary).ok();
+}
+
+/// 文件管理器多选复制：粘贴文本是多行文件名时按剪贴板引用逐个附加。
+#[test]
+fn paste_multiple_clipboard_files_attaches_all() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let image = write_temp_attachment("多选图.png", b"\x89PNG");
+    let notes = write_temp_attachment("多选笔记.txt", b"hi");
+    let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+
+    app.handle_paste_with(&format!("{}\n{}", name(&image), name(&notes)), || {
+        vec![image.clone(), notes.clone()]
+    });
+    std::fs::remove_file(&image).ok();
+    std::fs::remove_file(&notes).ok();
+
+    assert_eq!(app.attachments.len(), 2, "两个文件都应附加");
+    assert_eq!(app.input, "[IMAGE#1] [FILE#1] ");
+    assert_eq!(app.attachments[0].media_type, "image/png");
+    assert_eq!(app.attachments[1].media_type, "text/plain");
+}
+
+/// 终端拖入文件给出的 `file://` URI 列表直接换成附件标签，URI 不留在正文里。
+#[test]
+fn paste_file_uris_attaches_files() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let image = write_temp_attachment("拖入的 图.png", b"\x89PNG");
+    let notes = write_temp_attachment("拖入的 笔记.txt", b"hi");
+    let uri = |path: &Path| format!("file://{}", path.display().to_string().replace(' ', "%20"));
+
+    app.handle_paste_with(&format!("{}\n{}", uri(&image), uri(&notes)), Vec::new);
+    std::fs::remove_file(&image).ok();
+    std::fs::remove_file(&notes).ok();
+
+    assert_eq!(app.input, "[IMAGE#1] [FILE#1] ", "URI 不应留在正文里");
+    assert_eq!(app.attachments.len(), 2);
+
+    // 普通链接或指向不存在文件的 URI 都按文本处理，不能变成附件。
+    app.input.clear();
+    app.cursor = 0;
+    app.handle_paste_with("file:///nonexistent/lucia.png", Vec::new);
+    assert!(app.attachments.is_empty());
+    assert_eq!(app.input, "file:///nonexistent/lucia.png");
+}
+
+/// 多选复制里混入目录时，能附加的照常附加，无法附加的合并成一条说明。
+#[test]
+fn paste_clipboard_files_reports_skipped_entries() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let image = write_temp_attachment("可附加.png", b"\x89PNG");
+    let directory = std::env::temp_dir();
+    let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+
+    app.handle_paste_with(&format!("{}\n{}", name(&image), name(&directory)), || {
+        vec![image.clone(), directory.clone()]
+    });
+    std::fs::remove_file(&image).ok();
+
+    assert_eq!(app.attachments.len(), 1, "只有文件成为附件");
+    assert_eq!(
+        app.input,
+        format!("[IMAGE#1] {}", directory.display()),
+        "附加成功的只留标签，目录保留路径文本"
+    );
+    let notice = app
+        .messages
+        .last()
+        .map(|message| message.text.clone())
+        .unwrap_or_default();
+    assert!(notice.contains("目录"), "应说明目录未附加：{notice}");
+}
+
+/// 光标停在正文中间时粘贴路径：标签与前后文字之间都要断开，不能粘成一个词。
+#[test]
+fn paste_path_separates_from_surrounding_text() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let path = write_temp_attachment("中间粘贴.txt", b"hi");
+    let text = path.display().to_string();
+
+    app.input = "看这个".into();
+    app.cursor = app.input.len();
+    app.handle_paste_with(&text, Vec::new);
+    app.input.push('吧');
+    app.cursor = app.input.len();
+
+    assert_eq!(app.attachments.len(), 1);
+    assert_eq!(app.input, "看这个 [FILE#1] 吧", "标签两侧都必须与正文断开");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 粘贴含目录信息的普通句子时不能回查剪贴板，避免每次粘贴都启动系统进程。
+#[test]
+fn paste_plain_text_skips_clipboard_lookup() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.handle_paste_with("看 /tmp/no-such-file.png 这张", || {
+        panic!("含路径分隔符的文本不应回查剪贴板")
+    });
+
+    assert!(app.attachments.is_empty());
+    assert_eq!(app.input, "看 /tmp/no-such-file.png 这张");
 }
 
 /// 粘贴非路径文本时折叠为标签，提交时保留统一后的逻辑换行。
@@ -879,6 +1712,7 @@ fn input_ref_spans_highlight_labels() {
         data: String::new(),
         is_image: true,
         pasted_text: None,
+        source_path: None,
     }];
 
     let spans = input_ref_spans("看 [IMAGE#1] 这个", &attachments, &[]);
@@ -1042,6 +1876,37 @@ fn word_motion_accepts_ctrl_and_alt() {
     assert_eq!(app.cursor, "alpha ".len());
 }
 
+/// 点击底栏上下文芯片应开关 `/context` 详情面板，再点一次收起。
+#[test]
+fn clicking_context_chip_toggles_context_details() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.context_chip_area = Some(Rect::new(20, 15, 14, 1));
+
+    let inside = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 24,
+        row: 15,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(app.handle_context_chip_click(&inside));
+    assert!(app.native_command.context_open, "点击芯片应展开上下文详情");
+
+    assert!(app.handle_context_chip_click(&inside));
+    assert!(!app.native_command.context_open, "再次点击应收起详情");
+
+    // 芯片之外、芯片不存在的场景都必须把事件交还给其他热区与文本拖选。
+    let outside = MouseEvent {
+        column: 60,
+        ..inside
+    };
+    assert!(!app.handle_context_chip_click(&outside));
+    app.context_chip_area = None;
+    assert!(!app.handle_context_chip_click(&inside));
+}
+
 /// 手动翻阅后点击右下角提示应回到底部，并优先于文本拖选消费该事件。
 #[test]
 fn clicking_jump_hint_returns_to_bottom() {
@@ -1099,7 +1964,10 @@ fn scrollbar_drag_maps_rows_to_scroll_positions() {
 
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    app.last_max_scroll = 100;
+    // 视口 21 行、总内容 521 行：滑块退化成最小高度（3 行 = 6 个半行），
+    // 可动区间是 2*21-6 = 36 个半行，其中点正好对应滚动范围的中点。
+    app.last_max_scroll = 500;
+    app.last_viewport = 21;
     // 轨道覆盖第 2 至 22 行，共 21 行；首行对应顶部、末行对应底部。
     app.scrollbar_area = Some(Rect::new(80, 2, 1, 21));
 
@@ -1114,8 +1982,8 @@ fn scrollbar_drag_maps_rows_to_scroll_positions() {
     assert_eq!(app.scroll, Some(0));
     assert!(app.scrollbar_drag);
 
-    assert!(app.handle_scrollbar_drag(&event(MouseEventKind::Drag(MouseButton::Left), 12)));
-    assert_eq!(app.scroll, Some(50), "轨道中点应落在滚动范围的中点");
+    assert!(app.handle_scrollbar_drag(&event(MouseEventKind::Drag(MouseButton::Left), 11)));
+    assert_eq!(app.scroll, Some(250), "可动区间中点应落在滚动范围的中点");
     assert!(app.scrollbar_drag);
 
     assert!(app.handle_scrollbar_drag(&event(MouseEventKind::Drag(MouseButton::Left), 22)));
@@ -1126,6 +1994,44 @@ fn scrollbar_drag_maps_rows_to_scroll_positions() {
     assert!(!app.scrollbar_drag, "释放后退出拖拽态");
 }
 
+/// 按住滑块本身拖动时保持抓取点：按下不跳、移动一行滑块也只移动一行。
+#[test]
+fn scrollbar_drag_preserves_grab_offset() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.last_max_scroll = 100;
+    app.last_viewport = 21;
+    // 50/100 的滚动位置对应滑块顶端 18 个半行、高 7 个半行，覆盖第 11..=14 行。
+    app.scroll = Some(50);
+    app.scrollbar_area = Some(Rect::new(80, 2, 1, 21));
+
+    let event = |kind, row| MouseEvent {
+        kind,
+        column: 80,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    // 按在滑块中部：只记录抓取点，滚动位置不得在按下瞬间改变。
+    assert!(app.handle_scrollbar_drag(&event(MouseEventKind::Down(MouseButton::Left), 13)));
+    assert_eq!(app.scroll, Some(50), "抓住滑块按下时不应跳转");
+    assert_eq!(app.scrollbar_grab_half, Some(4));
+
+    // 指针下移一行：滑块顶端也下移一行，滚动位置按同一段行程换算。
+    assert!(app.handle_scrollbar_drag(&event(MouseEventKind::Drag(MouseButton::Left), 14)));
+    assert_eq!(app.scroll, Some(57), "拖动一行应只推进一行对应的滚动量");
+
+    // 拖到底部仍能精确命中自动跟随。
+    assert!(app.handle_scrollbar_drag(&event(MouseEventKind::Drag(MouseButton::Left), 22)));
+    assert_eq!(app.scroll, None);
+
+    assert!(app.handle_scrollbar_drag(&event(MouseEventKind::Up(MouseButton::Left), 22)));
+    assert!(!app.scrollbar_drag);
+    assert_eq!(app.scrollbar_grab_half, None, "释放后清空抓取点");
+}
+
 /// 滚动条热区之外的点击、以及未开始的拖拽都必须交还给其他鼠标处理。
 #[test]
 fn scrollbar_ignores_events_outside_track() {
@@ -1134,6 +2040,7 @@ fn scrollbar_ignores_events_outside_track() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.last_max_scroll = 100;
+    app.last_viewport = 21;
     app.scroll = Some(40);
     app.scrollbar_area = Some(Rect::new(80, 2, 1, 21));
 
@@ -1160,6 +2067,44 @@ fn scrollbar_ignores_events_outside_track() {
     app.scrollbar_area = None;
     assert!(!app.handle_scrollbar_drag(&outside));
     assert_eq!(app.scroll, Some(40));
+}
+
+/// 只有指针移动事件才能翻转滚动条悬停态，滚轮与按键携带的坐标不算。
+#[test]
+fn scrollbar_hover_follows_pointer_moves_only() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.scrollbar_area = Some(Rect::new(80, 2, 1, 21));
+
+    let event = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    // 移入轨道：翻转并报告变化，重复上报同一位置则不再算变化。
+    assert!(app.handle_mouse_event(&event(MouseEventKind::Moved, 80, 10)));
+    assert!(app.is_scrollbar_hovered);
+    assert!(!app.handle_mouse_event(&event(MouseEventKind::Moved, 80, 10)));
+
+    // 移出轨道（含首行上方与末行下方）：立刻还原。
+    assert!(app.handle_mouse_event(&event(MouseEventKind::Moved, 79, 10)));
+    assert!(!app.is_scrollbar_hovered);
+    assert!(!app.handle_mouse_event(&event(MouseEventKind::Moved, 80, 23)));
+    assert!(!app.is_scrollbar_hovered);
+
+    // 按下、拖拽与滚轮携带的是事件点而非指针位置，不能凭空点亮高亮。
+    assert!(!app.handle_mouse_event(&event(MouseEventKind::Down(MouseButton::Left), 80, 10)));
+    assert!(!app.handle_mouse_event(&event(MouseEventKind::ScrollUp, 80, 10)));
+    assert!(!app.is_scrollbar_hovered);
+
+    // 滚动条未展示时任何坐标都不算悬停。
+    app.scrollbar_area = None;
+    assert!(!app.handle_mouse_event(&event(MouseEventKind::Moved, 80, 10)));
+    assert!(!app.is_scrollbar_hovered);
 }
 
 /// 命令修饰键必须同时接受 Control 与 Super，覆盖 macOS 重映射后的上报差异。

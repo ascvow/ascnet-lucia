@@ -15,22 +15,29 @@ pub use search::SearchFilesTool;
 pub use shell::ShellTool;
 pub use write_file::WriteFileTool;
 
-use crate::{ToolRegistry, WorkspaceGuard};
+use crate::{ReadPathGrants, ToolRegistry, WorkspaceGuard};
 use anyhow::Result;
 
 /// 在指定工作区内注册全部内置工具。
 ///
 /// `guard` 决定这些工具可以触碰的目录范围与文件能力，所有路径都会经它解析。
 /// 调用方必须显式给出工作区：这是 Host 级的越权防线，不依赖任何插件参与。
+/// `read_grants` 是用户在消息里显式引用的工作区外路径，只附加给只读工具；
+/// 写入、Shell 与搜索仍严格限制在工作区内。
 ///
 /// # Errors
 ///
 /// 工具重名或名称非法时返回错误。
-pub fn register_builtins(registry: &mut ToolRegistry, guard: WorkspaceGuard) -> Result<()> {
-    registry.register(ReadFileTool::new(guard.clone()))?;
+pub fn register_builtins(
+    registry: &mut ToolRegistry,
+    guard: WorkspaceGuard,
+    read_grants: ReadPathGrants,
+) -> Result<()> {
+    let read_guard = guard.clone().with_read_grants(read_grants);
+    registry.register(ReadFileTool::new(read_guard.clone()))?;
+    registry.register(ListDirectoryTool::new(read_guard))?;
     registry.register(WriteFileTool::new(guard.clone()))?;
     registry.register(EditFileTool::new(guard.clone()))?;
-    registry.register(ListDirectoryTool::new(guard.clone()))?;
     registry.register(ShellTool::new(guard.clone()))?;
     registry.register(SearchFilesTool::new(guard))?;
     Ok(())

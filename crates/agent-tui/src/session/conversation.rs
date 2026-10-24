@@ -12,6 +12,7 @@ use agent_core::model::ContentBlock;
 use agent_plugin_protocol::UiFrame as PluginUiFrame;
 use agent_tool::{ToolCall, ToolResult};
 use ratatui::prelude::*;
+use std::path::PathBuf;
 
 /// 输入框中等待随下一条消息发送的附件。
 #[derive(Clone, Debug, PartialEq)]
@@ -28,6 +29,11 @@ pub(crate) struct PendingAttachment {
     pub(crate) is_image: bool,
     /// 从剪贴板折叠展示的原始文本；文件附件为 `None`。
     pub(crate) pasted_text: Option<String>,
+    /// 文件附件的来源路径；粘贴文本与历史恢复的附件为 `None`。
+    ///
+    /// 同一条消息可能既通过 `/attach` 附加过文件，正文里又写出了它的路径；
+    /// 按来源路径判重可以避免同一个文件被发送两次。
+    pub(crate) source_path: Option<PathBuf>,
 }
 
 /// 输入框中等待随下一条消息发送的上下文引用。

@@ -1895,3 +1895,125 @@ async fn dispatch_record(bus: &EventBus, run_id: &str, kind: AgentEventKind, ste
     })
     .await;
 }
+
+/// 暴露固定 Runtime API 的测试宿主，用于验证按插件 ID 的路由。
+struct AgentApiPluginHost {
+    id: &'static str,
+    api: Arc<dyn agent_runtime::AgentRuntimeApi>,
+}
+
+#[async_trait]
+impl AgentExtension for AgentApiPluginHost {}
+
+#[async_trait]
+impl PluginHost for AgentApiPluginHost {
+    fn id(&self) -> Option<&str> {
+        Some(self.id)
+    }
+
+    fn agent_runtime_api(
+        &self,
+        plugin_id: &str,
+    ) -> Option<Arc<dyn agent_runtime::AgentRuntimeApi>> {
+        (plugin_id == self.id).then(|| Arc::clone(&self.api))
+    }
+}
+
+/// 不访问任何 Agent 的测试 API；路由测试只关心对象身份。
+struct NoopAgentApi;
+
+#[async_trait]
+impl agent_runtime::AgentRuntimeApi for NoopAgentApi {
+    fn principal(&self) -> agent_runtime::RuntimePrincipal {
+        agent_runtime::RuntimePrincipal::host()
+    }
+
+    fn identity(&self) -> agent_runtime::AgentId {
+        agent_runtime::AgentId::new()
+    }
+
+    async fn spawn(
+        &self,
+        _request: agent_runtime::AgentSpawnRequest,
+    ) -> agent_runtime::RuntimeResult<agent_runtime::AgentHandle> {
+        Err(agent_runtime::AgentRuntimeError::InteractionUnavailable(
+            self.identity(),
+        ))
+    }
+
+    async fn continue_agent(
+        &self,
+        target: &agent_runtime::AgentId,
+        _input: String,
+    ) -> agent_runtime::RuntimeResult<agent_runtime::AgentHandle> {
+        Err(agent_runtime::AgentRuntimeError::InteractionUnavailable(
+            target.clone(),
+        ))
+    }
+
+    async fn status(
+        &self,
+        target: &agent_runtime::AgentId,
+    ) -> agent_runtime::RuntimeResult<agent_runtime::AgentSnapshot> {
+        Err(agent_runtime::AgentRuntimeError::InteractionUnavailable(
+            target.clone(),
+        ))
+    }
+
+    async fn result(
+        &self,
+        target: &agent_runtime::AgentId,
+    ) -> agent_runtime::RuntimeResult<Option<agent_runtime::AgentOutcome>> {
+        Err(agent_runtime::AgentRuntimeError::InteractionUnavailable(
+            target.clone(),
+        ))
+    }
+
+    async fn wait(
+        &self,
+        target: &agent_runtime::AgentId,
+    ) -> agent_runtime::RuntimeResult<agent_runtime::AgentOutcome> {
+        Err(agent_runtime::AgentRuntimeError::InteractionUnavailable(
+            target.clone(),
+        ))
+    }
+
+    async fn cancel(&self, target: &agent_runtime::AgentId) -> agent_runtime::RuntimeResult<bool> {
+        Err(agent_runtime::AgentRuntimeError::InteractionUnavailable(
+            target.clone(),
+        ))
+    }
+
+    async fn subscribe(
+        &self,
+        target: &agent_runtime::AgentId,
+    ) -> agent_runtime::RuntimeResult<agent_runtime::AgentEventStream> {
+        Err(agent_runtime::AgentRuntimeError::InteractionUnavailable(
+            target.clone(),
+        ))
+    }
+}
+
+/// 原生 Agent 会话视图只能拿到目标插件自己的 principal 绑定 API。
+#[tokio::test]
+async fn live_host_routes_agent_runtime_api_by_plugin_id() {
+    let live = LivePluginHost::new();
+    let api: Arc<dyn agent_runtime::AgentRuntimeApi> = Arc::new(NoopAgentApi);
+    live.publish(Arc::new(AgentApiPluginHost { id: "alpha", api }))
+        .expect("测试宿应发布成功");
+    live.finish_capability_planning()
+        .expect("能力规划应可标记完成");
+
+    assert!(
+        live.agent_runtime_api("alpha").is_some(),
+        "插件应能取到自己绑定的 API"
+    );
+    assert!(
+        live.agent_runtime_api("beta").is_none(),
+        "不能借用其他插件的绑定"
+    );
+    assert!(
+        Arc::new(live).agent_runtime_api("alpha").is_some(),
+        "组合宿主必须把调用路由到具体插件宿主"
+    );
+}

@@ -1,17 +1,17 @@
-//! Lucia TUI 原生斜杠命令、补全面板和会话对话框。
+//! Lucia TUI 原生斜杠命令、补全面板和会话搜索面板。
 
 mod context;
 #[cfg(feature = "plugins")]
 mod plugin_dialog;
 mod render;
 pub(crate) use context::{render_context_dialog, ContextSnapshot};
-mod session_dialog;
+mod session_palette;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use render::render_native_command_panel;
 #[cfg(feature = "plugins")]
 pub(crate) use render::render_native_plugin_dialog;
-pub(crate) use render::{render_native_command_panel, render_native_session_dialog};
 
 use crate::app::App;
 use crate::config::persist_tui_fullscreen;
@@ -31,23 +31,6 @@ use std::sync::Arc;
 
 /// 原生命令面板最多展示的候选数。
 const MAX_VISIBLE_COMMANDS: usize = 12;
-
-/// 路径输入在 Enter 时的处理结果，决定是否继续走原生命令路由。
-///
-/// `/` 同时是斜杠命令前缀与绝对路径开头，三种结果把"是命令""已转附件"
-/// "其实是正文"分开，避免任一分支被误当成未知命令。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PathInput {
-    /// 输入不是路径，按常规原生命令处理。
-    NotPath,
-    /// 已作为附件消费（含找不到文件时的错误提示），输入处理完毕。
-    Attached,
-    /// 形如路径但带正文，应作为普通消息提交给 Agent。
-    SubmitAsText,
-}
-
-/// 会话对话框一次展示的最大摘要数，避免大型历史目录占满终端。
-const MAX_VISIBLE_SESSIONS: usize = 100;
 
 /// 一条稳定的原生命令定义。
 #[derive(Debug, Clone, Copy)]
@@ -211,35 +194,47 @@ pub(crate) fn reasoning_level_command_value(level: ReasoningLevel) -> &'static s
     }
 }
 
-/// 会话对话框的入口用途；两种模式都允许切换至选中的会话。
+/// 会话面板的入口用途；两种模式都允许切换至选中的会话。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativeSessionDialogMode {
+pub(crate) enum NativeSessionPaletteMode {
     /// 选择后恢复完整会话。
     Resume,
     /// 从项目会话列表浏览并切换。
     Browse,
 }
 
-/// 会话列表的异步加载状态。
+/// 会话面板中的一条候选：轻量摘要加上预先算好的小写检索文本。
 #[derive(Debug)]
-pub(crate) enum NativeSessionDialogStatus {
+pub(crate) struct NativeSessionEntry {
+    /// 会话摘要；恢复时使用其中的精确 revision。
+    pub(crate) summary: SessionSummary,
+    /// 标题与稳定 ID 拼接后的小写文本，供逐帧过滤时零分配比较。
+    haystack: String,
+}
+
+/// 会话面板的异步加载状态。
+#[derive(Debug)]
+pub(crate) enum NativeSessionPaletteStatus {
     /// 正在读取项目会话目录。
     Loading,
     /// 会话摘要已经按更新时间降序加载。
-    Ready(Vec<SessionSummary>),
+    Ready(Vec<NativeSessionEntry>),
     /// 会话目录读取失败。
     Error(String),
 }
 
-/// 原生会话 Dialog 的完整交互状态。
+/// 原生会话搜索面板的完整交互状态。
+///
+/// 面板与命令补全共用输入框上方的那块位置，输入框本身就是搜索框，因此这里不保存
+/// 查询文本——查询始终是 [`App::input`]。
 #[derive(Debug)]
-pub(crate) struct NativeSessionDialog {
-    /// 对话框用途。
-    pub(crate) mode: NativeSessionDialogMode,
-    /// 当前高亮摘要下标。
+pub(crate) struct NativeSessionPalette {
+    /// 面板用途，只影响标题与操作提示文案。
+    pub(crate) mode: NativeSessionPaletteMode,
+    /// 当前高亮候选在过滤结果中的下标。
     pub(crate) selected: usize,
     /// 异步列表状态。
-    pub(crate) status: NativeSessionDialogStatus,
+    pub(crate) status: NativeSessionPaletteStatus,
 }
 
 /// 思考等级内联选择面板的交互状态。
@@ -358,8 +353,8 @@ pub(crate) struct NativeCommandState {
     pub(crate) selected: usize,
     /// 用户按 Esc 隐藏面板时的完整输入；输入发生变化后自动失效。
     pub(crate) dismissed_input: Option<String>,
-    /// 当前会话对话框。
-    pub(crate) dialog: Option<NativeSessionDialog>,
+    /// 当前会话搜索面板。
+    pub(crate) session_palette: Option<NativeSessionPalette>,
     /// 当前显示在输入框上方的思考等级选择面板。
     pub(crate) reasoning_panel: Option<NativeReasoningPanel>,
     /// 当前显示在输入框上方的模型上游选择面板。
@@ -371,9 +366,10 @@ pub(crate) struct NativeCommandState {
 
 impl App {
     /// 返回任一原生全屏 Dialog 是否正在占用键盘焦点；内联面板不计入。
+    ///
+    /// 会话搜索面板是内联面板：它出现在输入框上方，输入框仍然是搜索框，因此不在此列。
     pub(crate) fn native_dialog_active(&self) -> bool {
         self.native_command.context_open
-            || self.native_command.dialog.is_some()
             || cfg!(feature = "plugins") && {
                 #[cfg(feature = "plugins")]
                 {
@@ -450,10 +446,12 @@ impl App {
 
     /// 返回当前补全面板所需高度；输入不是命令或面板已被显式隐藏时返回零。
     pub(crate) fn native_command_panel_height(&self) -> u16 {
+        // 会话搜索面板与命令补全争用同一块位置；它一旦打开就独占该区域。
+        if self.native_command.session_palette.is_some() {
+            return render::session_palette_height(self.session_palette_rows());
+        }
         if self.native_command.reasoning_panel.is_some() {
-            return u16::try_from(self.reasoning_levels.len())
-                .unwrap_or(u16::MAX)
-                .saturating_add(1);
+            return render::reasoning_panel_height();
         }
         if self.native_command.model_panel.is_some() {
             return u16::try_from(self.model_upstreams.len().max(1))
@@ -489,12 +487,16 @@ impl App {
             return;
         }
         self.native_command.selected = 0;
+        // 会话面板的查询词就是主输入：搜索词一变，原来的高亮行通常已经不在结果里。
+        if let Some(palette) = self.native_command.session_palette.as_mut() {
+            palette.selected = 0;
+        }
         if self.native_command.dismissed_input.as_deref() != Some(self.input.as_str()) {
             self.native_command.dismissed_input = None;
         }
     }
 
-    /// 优先处理原生命令补全面板或会话 Dialog 的键盘输入。
+    /// 优先处理原生命令补全面板、会话搜索面板或全屏 Dialog 的键盘输入。
     ///
     /// 返回 `true` 表示事件已被原生状态机消费，调用方不得再转发给插件或主编辑器。
     pub(crate) fn handle_native_command_key(
@@ -503,6 +505,12 @@ impl App {
         modifiers: KeyModifiers,
         agent: Option<&Arc<Agent>>,
     ) -> bool {
+        if self.native_command.session_palette.is_some() {
+            if matches!(code, KeyCode::Esc) {
+                self.last_escape_at = None;
+            }
+            return self.handle_native_session_palette_key(code, modifiers);
+        }
         if self.native_command.context_open {
             match code {
                 KeyCode::Esc | KeyCode::Enter => self.native_command.context_open = false,
@@ -521,12 +529,6 @@ impl App {
         }
         if !matches!(code, KeyCode::Esc) {
             self.last_escape_at = None;
-        }
-        if self.native_command.dialog.is_some() {
-            if matches!(code, KeyCode::Esc) {
-                self.last_escape_at = None;
-            }
-            return self.handle_native_session_dialog_key(code, modifiers);
         }
         if self.native_command.reasoning_panel.is_some() {
             if matches!(code, KeyCode::Esc) {
@@ -600,12 +602,10 @@ impl App {
                         return true;
                     }
                 }
-                // 路径输入与斜杠命令共享 `/` 前缀：路径转附件，带正文的路径句子交回
-                // 主输入区按普通消息提交，不能被当成未知命令吞掉。
-                match self.handle_path_input() {
-                    PathInput::Attached => return true,
-                    PathInput::SubmitAsText => return false,
-                    PathInput::NotPath => {}
+                // 路径输入与斜杠命令共享 `/` 前缀：形如路径的输入不能当未知命令吞掉，
+                // 交回主输入区按普通消息提交。
+                if self.input_looks_like_path() {
+                    return false;
                 }
                 self.execute_native_command(agent);
                 true
@@ -624,7 +624,7 @@ impl App {
     /// 绝对路径 `/Users/me/a.png`、`~/a.png`、`./a.png` 与斜杠命令共享同一个 `/` 前缀，
     /// 必须在命令状态机之前区分开：前者是消息正文，后者才是命令调用。判定只看是否出现
     /// 路径分隔符或 `~` 前缀，不做文件系统探测——本函数在逐键输入时被调用，必须保持零
-    /// 系统调用。真正的可读性校验由 `handle_path_input` 在 Enter 时完成。
+    /// 系统调用。真正的附件识别由粘贴流程与发送时的正文路径扫描完成。
     ///
     /// 单段绝对路径（`/tmp`）不算"形如路径"：它与命令名无法区分，按命令处理更安全。
     fn looks_like_path(rest: &str) -> bool {
@@ -700,8 +700,8 @@ impl App {
                 let topic = argument.and_then(|rest| rest.split_whitespace().next());
                 self.show_native_command_help(topic);
             }
-            "resume" => self.open_native_sessions(NativeSessionDialogMode::Resume),
-            "sessions" => self.open_native_sessions(NativeSessionDialogMode::Browse),
+            "resume" => self.open_native_sessions(NativeSessionPaletteMode::Resume),
+            "sessions" => self.open_native_sessions(NativeSessionPaletteMode::Browse),
             #[cfg(feature = "plugins")]
             "plugins" => self.open_native_plugins(),
             "new" | "clear" => {
@@ -778,78 +778,18 @@ impl App {
         text
     }
 
-    /// 把"用户敲入的是本地文件"的输入转为附件，并返回该输入应如何继续处理。
+    /// 判断当前输入的首段是否形如本地路径。
     ///
-    /// 绝对路径 `/Users/me/a.png`、`~/图.png`、`./图.png` 与当前目录下的裸文件名共用
-    /// 这一处判据：命令路由与主输入区都调用它，两条入口不各自推断路径语义。
+    /// `/` 既是斜杠命令前缀又是绝对路径开头。命令路由用这处判据把路径输入交回主输入区
+    /// 按普通消息提交，避免被当成未知命令吞掉；判定前先剔除输入里已有的附件引用标签，
+    /// 因此"已有附件时继续输入路径"同样成立。
     ///
-    /// 已注册的命令名优先于同名文件，命令不会被文件系统劫持。是否"形如路径"由
-    /// [`Self::looks_like_path`] 判断，因此单个单词与自然语言句子不会被误判为文件错
-    /// 误；只有形如路径且解析不到文件的单段输入才报错。判定前先剔除输入里已有的附件
-    /// 引用标签，因此"已有附件时继续输入路径"仍成立。
-    pub(crate) fn handle_path_input(&mut self) -> PathInput {
+    /// 路径不再自动转成附件：只有剪贴板持有文件引用（从文件管理器复制文件）时才生成附件。
+    /// 用户敲入或粘贴一段路径，通常是想在消息里提到它。
+    pub(crate) fn input_looks_like_path(&self) -> bool {
         let candidate = self.input_without_labels();
-        let trimmed = candidate.trim();
-        if trimmed.is_empty() {
-            return PathInput::NotPath;
-        }
-        let invoked = trimmed.split_whitespace().next().unwrap_or_default();
-        // 命令优先：`/attach`、`/model` 等必须照常执行，哪怕存在同名文件。
-        if NATIVE_COMMANDS
-            .iter()
-            .any(|command| command.matches_token(invoked))
-        {
-            return PathInput::NotPath;
-        }
-        let name = invoked.trim_start_matches('/');
-        let cwd = self.workspace.cwd.clone();
-        // 整段输入是路径，或首段是路径、后面还跟着消息正文（"路径 + 提问"写法）。
-        let (path, consumed) = match pasted_file_path(trimmed, &cwd) {
-            Some(path) => (path, trimmed),
-            None => match pasted_file_path(invoked, &cwd) {
-                Some(path) => (path, invoked),
-                // 既不是命令也不是文件：普通消息，例如单个单词或自然语言句子。
-                None if !Self::looks_like_path(name) => return PathInput::NotPath,
-                None => {
-                    // 形如路径却解析不到文件：单段输入按路径笔误给出明确提示；带正文的
-                    // 输入交回主输入区按普通消息提交，避免 "/usr/bin 应加入 PATH" 这类
-                    // 句子被当成文件错误。
-                    if trimmed.split_whitespace().count() > 1 {
-                        return PathInput::SubmitAsText;
-                    }
-                    self.messages.push(Msg::new(
-                        MsgKind::Error,
-                        format!("找不到可读取的文件 `{trimmed}`；请确认路径存在且是普通文件。"),
-                    ));
-                    return PathInput::Attached;
-                }
-            },
-        };
-        // 先在原位置替换掉路径文本，再把引用标签插回该位置：这样"路径 + 正文"里
-        // 标签紧贴正文之前，而"追加路径"时标签仍排在已有标签之后。
-        // `consumed` 一定来自输入本身（只是剔除了附件标签），因此找不到时不改写输入，
-        // 直接由 `attach_file` 追加标签，避免越界切片。
-        let mut cursor = self.input.len();
-        if let Some(offset) = self.input.find(consumed) {
-            let mut remaining = self.input.clone();
-            remaining.replace_range(offset..offset + consumed.len(), "");
-            // 路径后紧跟的分隔空格一并去掉，避免标签与正文之间出现两个空格。
-            if remaining[offset..].starts_with(char::is_whitespace) {
-                let tail = remaining[offset..].trim_start().to_string();
-                remaining.truncate(offset);
-                remaining.push_str(&tail);
-            }
-            self.input = remaining;
-            cursor = offset;
-        }
-        // `attach_file` 在光标处插入引用标签，光标必须落在输入范围内。
-        self.cursor = cursor.min(self.input.len());
-        // 顺序不能反：`attach_file` 会回收输入里已不存在的附件标签，
-        // 先清空输入会把已有附件一并回收掉。
-        self.attach_file(&path);
-        self.cursor = self.input.len();
-        self.finish_input_edit();
-        PathInput::Attached
+        let invoked = candidate.split_whitespace().next().unwrap_or_default();
+        Self::looks_like_path(invoked.trim_start_matches('/'))
     }
 
     /// 追加一个附件引用标签到输入末尾，符合"继续添加"的直觉。
@@ -861,6 +801,19 @@ impl App {
     /// 执行 `/reasoning`：无参数打开二级选择界面，`next` 循环，其余参数精确设置等级。
     fn execute_reasoning_command(&mut self, value: Option<&str>, agent: Option<&Arc<Agent>>) {
         let Some(value) = value else {
+            // 只有一档时滑块画不出可读的轨道：旋钮贴着标签、没有任何可选位置。启动时
+            // 已经要求模型必须出现在 models.dev 里，所以这里只可能是模型自己声明了单一
+            // 等级（例如 reasoning=false）。
+            if self.reasoning_levels.len() < 2 {
+                self.messages.push(Msg::new(
+                    MsgKind::Info,
+                    format!(
+                        "当前模型没有可切换的思考等级；models.dev 只声明了「{}」一档。",
+                        crate::app::reasoning_level_label(self.reasoning_levels[0])
+                    ),
+                ));
+                return;
+            }
             let selected = self
                 .reasoning_levels
                 .iter()
@@ -1038,7 +991,9 @@ impl App {
             return;
         }
         self.model_name = entry.model.clone();
-        self.refresh_model_metadata(entry);
+        // 底栏紧接着展示的配置名必须跟着热切换一起走，否则同一模型 ID 的两条上游无法区分。
+        self.model_upstream_name = Some(entry.name.clone());
+        let declared = self.refresh_model_metadata(entry);
         if let Some(context_loader) = &self.native_context_loader {
             if let Err(error) = context_loader.update_model_route(
                 entry.name.clone(),
@@ -1064,22 +1019,33 @@ impl App {
                 entry.model
             ),
         ));
+        if !declared {
+            // 启动时会直接拒绝未知模型；运行时不阻断已配置的上游（自定义网关别名很常见），
+            // 但必须说清代价：能力校验和思考强度都不再生效。
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                "该模型未在 models.dev 中声明，思考强度已重置为关闭，附件模态不再校验；确认模型 ID 与 models.dev 一致后重启可恢复。",
+            ));
+        }
     }
 
     /// 按切换后的上游重新解析 models.dev 元数据；未命中时恢复缺省展示。
-    fn refresh_model_metadata(&mut self, entry: &agent_core::config::ModelConfig) {
-        let provider_id = match entry.provider.protocol_id() {
-            "open-ai" | "open-ai-compatible" => Some("openai"),
-            "anthropic" => Some("anthropic"),
-            _ => None,
-        };
-        let metadata = provider_id.and_then(|provider| {
-            crate::config::model_metadata::find_model_metadata(provider, &entry.model)
+    ///
+    /// 返回是否在 models.dev 中命中，供调用方决定要不要提示能力信息缺失。
+    fn refresh_model_metadata(&mut self, entry: &agent_core::config::ModelConfig) -> bool {
+        let metadata = crate::config::models_dev_provider_id(entry.provider.protocol_id())
+            .and_then(|provider| {
+                crate::config::model_metadata::find_model_metadata(
+                    &provider,
+                    &entry.model,
+                    entry.base_url.as_deref(),
+                )
                 .ok()
                 .flatten()
-        });
+            });
         self.context_window = metadata.as_ref().and_then(|meta| meta.context_window);
         self.model_input_modalities = metadata.as_ref().map(|meta| meta.input_modalities.clone());
+        let declared = metadata.is_some();
         let levels = metadata
             .map(|meta| meta.reasoning_levels)
             .filter(|levels| !levels.is_empty());
@@ -1095,6 +1061,7 @@ impl App {
                 self.reasoning_level = ReasoningLevel::Off;
             }
         }
+        declared
     }
 
     /// 处理思考等级内联面板的键盘导航，并在确认后同步 TUI 与共享 Agent。
@@ -1113,11 +1080,13 @@ impl App {
         };
         match code {
             KeyCode::Esc => self.native_command.reasoning_panel = None,
-            KeyCode::Up if item_count > 0 => {
-                panel.selected = panel.selected.checked_sub(1).unwrap_or(item_count - 1);
+            // 滑块是横向控件：左右为主，上下作为兼容按键沿用旧手感。两端夹住而不是
+            // 回绕——滑块走到头还跳回另一端，会让人以为选错了。
+            KeyCode::Left | KeyCode::Up if item_count > 0 => {
+                panel.selected = panel.selected.saturating_sub(1).min(item_count - 1);
             }
-            KeyCode::Down if item_count > 0 => {
-                panel.selected = (panel.selected + 1) % item_count;
+            KeyCode::Right | KeyCode::Down if item_count > 0 => {
+                panel.selected = (panel.selected + 1).min(item_count - 1);
             }
             KeyCode::Enter if item_count > 0 => {
                 let level = self.reasoning_levels[panel.selected.min(item_count - 1)];
