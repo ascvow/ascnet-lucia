@@ -48,7 +48,7 @@ async fn component_capability_audit_is_host_owned() -> Result<()> {
             (data (i32.const 0) "{}")
             (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096))
         (core instance $mem (instantiate $mem))
-        (core func $spawn (canon lower (func $spawn) (memory $mem "memory") (realloc (func $mem "realloc"))))
+        (core func $spawn (canon lower (func $spawn) (memory (core memory $mem "memory")) (realloc (core func $mem "realloc"))))
         (core module $guest
             (import "h" "spawn" (func $spawn (param i32 i32 i32)))
             (func (export "run") i32.const 0 i32.const 2 i32.const 2048 call $spawn))
@@ -130,13 +130,13 @@ async fn component_import_enforces_initialization_service_acl() -> Result<()> {
             (data (i32.const 0) "{encoded}")
             (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096))
           (core instance $mem (instantiate $memory))
-          (core func $call (canon lower (func $service) (memory $mem "memory") (realloc (func $mem "realloc"))))
+          (core func $call (canon lower (func $service) (memory (core memory $mem "memory")) (realloc (core func $mem "realloc"))))
           (core module $guest
             (import "host" "call" (func $call (param i32 i32 i32)))
             (func (export "run") (result i32)
               i32.const 0 i32.const {length} i32.const 2048 call $call i32.const 2048))
           (core instance $guest (instantiate $guest (with "host" (instance (export "call" (func $call))))))
-          (func (export "run") (result string) (canon lift (core func $guest "run") (memory $mem "memory"))))
+          (func (export "run") (result string) (canon lift (core func $guest "run") (memory (core memory $mem "memory")))))
     "#, length = request.len())).into_anyhow()?;
     for authorized in [false, true] {
         let dependencies = if authorized {
@@ -205,9 +205,9 @@ async fn component_deadline_retires_pending_store() -> Result<()> {
           (func (export "input") (param i32 i32)))
         (core instance $i (instantiate $m (with "h" (instance (export "wait" (func $wait))))))
         (func (export "run") (canon lift (core func $i "run")))
-        (func (export "json") (param "s" string) (result string) (canon lift (core func $i "json") (memory $i "memory") (realloc (func $i "realloc"))))
-        (func (export "empty") (result string) (canon lift (core func $i "empty") (memory $i "memory")))
-        (func (export "input") (param "s" string) (canon lift (core func $i "input") (memory $i "memory") (realloc (func $i "realloc")))))
+        (func (export "json") (param "s" string) (result string) (canon lift (core func $i "json") (memory (core memory $i "memory")) (realloc (core func $i "realloc"))))
+        (func (export "empty") (result string) (canon lift (core func $i "empty") (memory (core memory $i "memory"))))
+        (func (export "input") (param "s" string) (canon lift (core func $i "input") (memory (core memory $i "memory")) (realloc (core func $i "realloc")))))
     "#).into_anyhow()?;
     let services = Arc::new(ServiceRegistry::default());
     let capabilities = CapabilityState::new(

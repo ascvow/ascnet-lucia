@@ -174,8 +174,17 @@ fn init_terminal(fullscreen: bool) -> Result<ratatui::DefaultTerminal> {
     };
     // 首帧的差分缓冲区默认全空白，不能依赖终端在切入备用屏幕时恰好也已清空。
     // 两种模式都先显式清屏，使真实屏幕与 Ratatui 的初始状态一致；后续仍只输出差分。
-    terminal.clear().context("清空终端失败")?;
+    clear_without_cursor_query(&mut terminal).context("清空终端失败")?;
     Ok(terminal)
+}
+
+/// 两种模式都由应用定位整屏光标；不要调用会等待 DSR 回复的 Terminal::clear。
+/// 重置当前尺寸同时清屏并失效差分缓存，兼容不回应 DSR 的终端和 PTY。
+fn clear_without_cursor_query(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+    let size = terminal.size().context("读取终端尺寸失败")?;
+    terminal
+        .resize(Rect::new(0, 0, size.width, size.height))
+        .context("重置终端视口失败")
 }
 
 /// 在运行期切换全屏渲染。
@@ -194,7 +203,7 @@ fn apply_fullscreen_switch(
     }
     // 挂起处理器按这份状态决定是否退出备用屏幕，切换后必须同步。
     terminal::set_screen(fullscreen);
-    terminal.clear().context("切换渲染模式后清屏失败")?;
+    clear_without_cursor_query(terminal).context("切换渲染模式后清屏失败")?;
     Ok(())
 }
 
@@ -226,7 +235,7 @@ fn resume_terminal(
         && crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).is_ok();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
     terminal.show_cursor().context("恢复光标显示失败")?;
-    terminal.clear().context("恢复后清屏失败")?;
+    clear_without_cursor_query(terminal).context("恢复后清屏失败")?;
     terminal::mark_attached();
     Ok(mouse_capture)
 }

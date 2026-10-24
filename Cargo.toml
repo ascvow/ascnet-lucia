@@ -77,8 +77,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unicode-width = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-wasmtime = { version = "46", features = ["component-model", "async"] }
-wasmtime-wasi = "46"
+wasmtime = { version = "48.0.7", features = ["component-model", "async"] }
+wasmtime-wasi = "48.0.7"
 wit-bindgen = "0.59"
 
 # 静态检查策略：`bun run check` 用 `-D warnings` 把全部告警升级为错误，因此放行清单

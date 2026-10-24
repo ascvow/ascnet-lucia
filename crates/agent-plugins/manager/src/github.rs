@@ -489,7 +489,7 @@ fn extract_bundle(archive: &[u8], destination: &Path) -> Result<()> {
     for index in 0..zip.len() {
         let mut entry = zip.by_index(index).context("读取插件 ZIP 条目失败")?;
         let Some(relative) = entry.enclosed_name() else {
-            bail!("插件 ZIP 包含越界路径：{}", entry.name());
+            bail!("插件 ZIP 包含越界路径：{}", entry.name()?);
         };
         if relative.as_os_str().is_empty() {
             continue;
@@ -497,7 +497,7 @@ fn extract_bundle(archive: &[u8], destination: &Path) -> Result<()> {
         if let Some(mode) = entry.unix_mode() {
             let kind = mode & 0o170000;
             if kind != 0 && kind != 0o100000 && kind != 0o040000 {
-                bail!("插件 ZIP 不允许符号链接或特殊文件：{}", entry.name());
+                bail!("插件 ZIP 不允许符号链接或特殊文件：{}", entry.name()?);
             }
         }
         unpacked = unpacked

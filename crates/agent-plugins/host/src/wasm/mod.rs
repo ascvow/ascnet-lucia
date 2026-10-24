@@ -666,14 +666,9 @@ impl WasmPluginHost {
             // 目录按插件与项目作用域隔离，插件看不到 `/data` 以外的任何路径。
             let data_dir = plugin_data_dir_for(&manifest, &host_services)?;
             if let Some(path) = data_dir.as_ref() {
-                wasi.preopened_dir(
-                    path,
-                    "/data",
-                    wasmtime_wasi::DirPerms::all(),
-                    wasmtime_wasi::FilePerms::all(),
-                )
-                .into_anyhow()
-                .with_context(|| format!("预打开插件数据目录 `{}` 失败", path.display()))?;
+                wasi.preopened_dir(path, "/data", wasmtime_wasi::FsPerms::ReadWrite)
+                    .into_anyhow()
+                    .with_context(|| format!("预打开插件数据目录 `{}` 失败", path.display()))?;
             }
 
             let contributions = Arc::new(ContributionRegistry::default());
