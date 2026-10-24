@@ -303,14 +303,26 @@ struct WasmPluginState {
 struct ComponentCallBudget {
     wait: Duration,
     execute: Duration,
+    retire: bool,
+}
+tokio::task_local! {
+    /// 嵌套服务必须继承父导出的截止时间，不能通过独立任务延长父调用的授权窗口。
+    static COMPONENT_DEADLINE: tokio::time::Instant;
 }
 const UI_CALL_BUDGET: ComponentCallBudget = ComponentCallBudget {
     wait: Duration::from_millis(250),
     execute: Duration::from_secs(2),
+    retire: false,
 };
 const WORK_CALL_BUDGET: ComponentCallBudget = ComponentCallBudget {
     wait: Duration::from_secs(1800),
     execute: Duration::from_secs(1800),
+    retire: false,
+};
+const DEACTIVATE_CALL_BUDGET: ComponentCallBudget = ComponentCallBudget {
+    wait: Duration::from_secs(1800),
+    execute: Duration::from_secs(60),
+    retire: true,
 };
 const INITIALIZATION_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -320,7 +332,11 @@ async fn component_deadline<F: Future>(
     duration: Duration,
     future: F,
 ) -> Result<F::Output> {
-    tokio::time::timeout(duration, future)
+    let deadline = tokio::time::Instant::now() + duration;
+    let deadline = COMPONENT_DEADLINE
+        .try_with(|parent| deadline.min(*parent))
+        .unwrap_or(deadline);
+    tokio::time::timeout_at(deadline, COMPONENT_DEADLINE.scope(deadline, future))
         .await
         .map_err(|_| anyhow!("{operation} deadline 超时（{}ms）", duration.as_millis()))
 }
@@ -365,6 +381,7 @@ where
     T: Send + 'static,
     F: for<'a> FnOnce(&'a mut WasmPluginState) -> BoxFuture<'a, Result<T>> + Send + 'static,
 {
+    let parent_deadline = COMPONENT_DEADLINE.try_with(|deadline| *deadline).ok();
     let mut slot = component_deadline(
         &format!("{operation} 等待实例锁"),
         budget.wait,
@@ -379,18 +396,24 @@ where
         active: Some(active),
     };
     let task_operation = operation.clone();
-    let task = tokio::spawn(inherit_service_call_stack(async move {
-        let outcome = component_deadline(
-            &task_operation,
-            budget.execute,
-            call(lease.active.as_mut().expect("调用守卫持有实例")),
-        )
-        .await;
-        if outcome.is_ok() {
-            lease.restore();
-        }
-        outcome?
-    }));
+    let execution_deadline = tokio::time::Instant::now() + budget.execute;
+    let execution_deadline =
+        parent_deadline.map_or(execution_deadline, |parent| parent.min(execution_deadline));
+    let task = tokio::spawn(inherit_service_call_stack(COMPONENT_DEADLINE.scope(
+        execution_deadline,
+        async move {
+            let outcome = component_deadline(
+                &task_operation,
+                budget.execute,
+                call(lease.active.as_mut().expect("调用守卫持有实例")),
+            )
+            .await;
+            if outcome.is_ok() && !budget.retire {
+                lease.restore();
+            }
+            outcome?
+        },
+    )));
     task.await
         .with_context(|| format!("{operation} 的 Component 调用任务异常结束"))?
 }
@@ -656,6 +679,10 @@ impl WasmPluginHost {
             let contributions = Arc::new(ContributionRegistry::default());
             let store_limits = StoreLimitsBuilder::new()
                 .memory_size(limits.max_memory_bytes)
+                .memories(4)
+                .instances(64)
+                .tables(16)
+                .table_elements(100_000)
                 .trap_on_grow_failure(true)
                 .build();
             let mut store = Store::new(
@@ -864,37 +891,45 @@ impl WasmPluginHost {
     /// 调用 component 的卸载钩子并撤销其全部宿主资源。
     pub async fn deactivate(&self) -> Result<()> {
         let plugin_id = self.id().to_string();
-        let deactivation = complete_component_call(
-            &self.state,
-            format!("plugin `{plugin_id}` deactivate"),
-            WORK_CALL_BUDGET,
-            move |state| {
-                Box::pin(async move {
-                    let deactivate = state.deactivate;
-                    refill_fuel(state)?;
-                    let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
-                    let (deactivation_error,) = deactivate
-                        .call_async(&mut state.store, ())
-                        .await
-                        .into_anyhow()
-                        .with_context(|| format!("plugin `{plugin_id}` deactivate failed"))?;
-                    drop(run_scope);
-                    if deactivation_error.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(anyhow!(
-                            "plugin `{plugin_id}` deactivation failed: {deactivation_error}"
-                        ))
-                    }
-                })
-            },
-        )
-        .await;
-        let unregister = self.services.unregister_plugin(self.id());
-        if let Some(binding) = &self.agent_runtime {
-            binding.revoke().await;
-        }
-        deactivation.and(unregister)
+        let state = Arc::clone(&self.state);
+        let services = Arc::clone(&self.services);
+        let binding = self.agent_runtime.clone();
+        let cleanup_id = plugin_id.clone();
+        let task = tokio::spawn(async move {
+            let deactivation = complete_component_call(
+                &state,
+                format!("plugin `{plugin_id}` deactivate"),
+                DEACTIVATE_CALL_BUDGET,
+                move |state| {
+                    Box::pin(async move {
+                        let deactivate = state.deactivate;
+                        refill_fuel(state)?;
+                        let run_scope =
+                            state.store.data().capabilities.enter_active_run_scope(None);
+                        let (deactivation_error,) = deactivate
+                            .call_async(&mut state.store, ())
+                            .await
+                            .into_anyhow()
+                            .with_context(|| format!("plugin `{plugin_id}` deactivate failed"))?;
+                        drop(run_scope);
+                        if deactivation_error.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(anyhow!(
+                                "plugin `{plugin_id}` deactivation failed: {deactivation_error}"
+                            ))
+                        }
+                    })
+                },
+            )
+            .await;
+            let unregister = services.unregister_plugin(&cleanup_id);
+            if let Some(binding) = binding {
+                binding.revoke().await;
+            }
+            deactivation.and(unregister)
+        });
+        task.await.context("插件卸载任务异常结束")?
     }
 
     /// 向 Guest 投递一次事件分发，并在能力导入期间绑定可信 Agent run。

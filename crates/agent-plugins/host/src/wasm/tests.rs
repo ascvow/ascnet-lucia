@@ -210,6 +210,7 @@ async fn component_deadline_retires_pending_store() -> Result<()> {
     let budget = ComponentCallBudget {
         wait: Duration::from_millis(20),
         execute: Duration::from_millis(40),
+        retire: false,
     };
     let lock = state.lock().await;
     assert!(
@@ -223,16 +224,25 @@ async fn component_deadline_retires_pending_store() -> Result<()> {
     drop(lock);
     let caller_state = state.clone();
     let caller = tokio::spawn(async move {
-        complete_component_call(&caller_state, "pending".into(), budget, |state| {
-            Box::pin(async move {
-                let run = state
-                    .instance
-                    .get_typed_func::<(), ()>(&mut state.store, "run")
-                    .into_anyhow()?;
-                run.call_async(&mut state.store, ()).await.into_anyhow()
-            })
-        })
-        .await
+        COMPONENT_DEADLINE
+            .scope(
+                tokio::time::Instant::now() + Duration::from_millis(40),
+                complete_component_call(
+                    &caller_state,
+                    "pending".into(),
+                    WORK_CALL_BUDGET,
+                    |state| {
+                        Box::pin(async move {
+                            let run = state
+                                .instance
+                                .get_typed_func::<(), ()>(&mut state.store, "run")
+                                .into_anyhow()?;
+                            run.call_async(&mut state.store, ()).await.into_anyhow()
+                        })
+                    },
+                ),
+            )
+            .await
     });
     tokio::time::sleep(Duration::from_millis(10)).await;
     caller.abort();
