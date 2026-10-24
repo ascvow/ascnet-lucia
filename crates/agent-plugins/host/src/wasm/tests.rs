@@ -28,6 +28,98 @@ use super::*;
 use crate::manifest::{PluginDependency, PluginSection, SUPPORTED_PLUGIN_API_VERSION};
 use crate::ui::UiSize;
 
+/// 真实 Component 在首次导出期间发起服务调用，必须走 Guest ACL 而非应用入口。
+#[tokio::test]
+async fn component_import_enforces_initialization_service_acl() -> Result<()> {
+    struct Echo;
+    #[async_trait]
+    impl ServiceHandler for Echo {
+        async fn handle(&self, _call: PluginServiceCall) -> Result<Value> {
+            Ok(json!("allowed"))
+        }
+    }
+    let services = Arc::new(ServiceRegistry::default());
+    services.register_handler("provider", HashSet::new(), Arc::new(Echo))?;
+    services.upsert(
+        "provider",
+        PluginService {
+            plugin_id: String::new(),
+            name: "echo".into(),
+            version: "1.0.0".into(),
+            description: None,
+        },
+    )?;
+    let request = r#"{"plugin_id":"provider","name":"echo","payload":null}"#;
+    let encoded = request
+        .bytes()
+        .map(|byte| format!("\\{byte:02x}"))
+        .collect::<String>();
+    let engine = shared_wasm_engine()?;
+    let component = Component::new(&engine, format!(r#"
+        (component
+          (import "host-service-call" (func $service (param "request" string) (result string)))
+          (core module $memory
+            (memory (export "memory") 1)
+            (data (i32.const 0) "{encoded}")
+            (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096))
+          (core instance $mem (instantiate $memory))
+          (core func $call (canon lower (func $service) (memory $mem "memory") (realloc (func $mem "realloc"))))
+          (core module $guest
+            (import "host" "call" (func $call (param i32 i32 i32)))
+            (func (export "run") (result i32)
+              i32.const 0 i32.const {length} i32.const 2048 call $call i32.const 2048))
+          (core instance $guest (instantiate $guest (with "host" (instance (export "call" (func $call))))))
+          (func (export "run") (result string) (canon lift (core func $guest "run") (memory $mem "memory"))))
+    "#, length = request.len())).into_anyhow()?;
+    for authorized in [false, true] {
+        let dependencies = if authorized {
+            HashSet::from(["provider".into()])
+        } else {
+            HashSet::new()
+        };
+        let _registration = services.begin_plugin_load("loading-guest", dependencies)?;
+        let capabilities = CapabilityState::new(
+            "loading-guest".into(),
+            "fixture".into(),
+            std::path::PathBuf::from("."),
+            Default::default(),
+            Arc::new(ContributionRegistry::default()),
+            services.clone(),
+            CapabilityHostContext::new(
+                None,
+                None,
+                agent_tool::ExecutionPolicy::serve(),
+                None,
+                None,
+                None,
+                None,
+            ),
+        )?;
+        let mut store = Store::new(
+            &engine,
+            PluginWasiState::new(
+                WasiCtxBuilder::new().build(),
+                capabilities,
+                StoreLimitsBuilder::new().build(),
+            ),
+        );
+        store.set_fuel(1_000_000).into_anyhow()?;
+        let mut linker = Linker::new(&engine);
+        add_plugin_host_imports(&mut linker)?;
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .into_anyhow()?;
+        let run = instance
+            .get_typed_func::<(), (String,)>(&mut store, "run")
+            .into_anyhow()?;
+        let (response,) = run.call_async(&mut store, ()).await.into_anyhow()?;
+        let response: Value = serde_json::from_str(&response)?;
+        assert_eq!(response["ok"], authorized, "{response}");
+    }
+    Ok(())
+}
+
 /// 默认运行时限制必须同时约束计算量和线性内存。
 #[test]
 fn default_limits_bound_fuel_and_memory() {

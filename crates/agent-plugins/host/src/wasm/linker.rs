@@ -202,20 +202,24 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     )
     .into_anyhow()
     .context("注册 host-service-call 失败")?;
-    root.func_wrap(
+    root.func_wrap_async(
         "host-fs-read",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            let result = caller.data_mut().capabilities.read_file(&request);
-            Ok((encode_host_response_with_failure(caller.data_mut(), result),))
+            Box::new(async move {
+                let result = caller.data_mut().capabilities.read_file(&request).await;
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
+            })
         },
     )
     .into_anyhow()
     .context("注册 host-fs-read 失败")?;
-    root.func_wrap(
+    root.func_wrap_async(
         "host-fs-list",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            let result = caller.data_mut().capabilities.list_dir(&request);
-            Ok((encode_host_response_with_failure(caller.data_mut(), result),))
+            Box::new(async move {
+                let result = caller.data_mut().capabilities.list_dir(&request).await;
+                Ok((encode_host_response_with_failure(caller.data_mut(), result),))
+            })
         },
     )
     .into_anyhow()

@@ -92,6 +92,28 @@ impl ServiceRegistry {
         }
     }
 
+    /// 在执行任何 Guest 代码前登记可信身份；失败加载或取消时由守卫撤销。
+    #[cfg(feature = "wasm")]
+    pub(crate) fn begin_plugin_load(
+        self: &Arc<Self>,
+        plugin_id: &str,
+        dependencies: HashSet<String>,
+    ) -> Result<PluginRegistrationGuard> {
+        let mut declared = self
+            .declared_dependencies
+            .write()
+            .map_err(|_| anyhow!("插件服务依赖锁已中毒"))?;
+        if declared.contains_key(plugin_id) {
+            return Err(anyhow!("插件 `{plugin_id}` 的服务身份重复注册"));
+        }
+        declared.insert(plugin_id.to_string(), dependencies);
+        Ok(PluginRegistrationGuard {
+            registry: Arc::clone(self),
+            plugin_id: plugin_id.to_string(),
+            armed: true,
+        })
+    }
+
     /// 注册插件实例的调用处理器及其 manifest 声明的服务依赖。
     ///
     /// 依赖集合由 Host 从可信 manifest 注入；Guest 请求不能在运行时扩张该集合。
@@ -113,6 +135,12 @@ impl ServiceRegistry {
             .declared_dependencies
             .write()
             .map_err(|_| anyhow!("插件服务依赖锁已中毒"))?;
+        if dependencies
+            .get(&plugin_id)
+            .is_some_and(|existing| existing != &declared_dependencies)
+        {
+            return Err(anyhow!("插件 `{plugin_id}` 的服务依赖与加载身份不一致"));
+        }
         handlers.insert(plugin_id.clone(), handler);
         dependencies.insert(plugin_id, declared_dependencies);
         Ok(())
@@ -192,7 +220,12 @@ impl ServiceRegistry {
 
     /// 调用目标插件已经注册的服务。
     pub(crate) async fn call(&self, call: PluginServiceCall) -> Result<Value> {
-        let result = self.call_inner(call.clone()).await;
+        self.call_with_origin(call, false).await
+    }
+
+    /// 来源标记只在 Host 内传递，不能由 Guest JSON 自行声明。
+    async fn call_with_origin(&self, call: PluginServiceCall, from_plugin: bool) -> Result<Value> {
+        let result = self.call_inner(call.clone(), from_plugin).await;
         if let Some(observer) = &self.observer {
             let observation = HostServiceCallObservation::from_result(&call, &result);
             let observer = observer.clone();
@@ -204,14 +237,20 @@ impl ServiceRegistry {
         result
     }
 
+    /// Guest 专用入口：即使初始化尚未建立 handler，也必须有可信 manifest 身份。
+    pub(crate) async fn call_from_plugin(&self, call: PluginServiceCall) -> Result<Value> {
+        self.call_with_origin(call, true).await
+    }
+
     /// 执行服务目录校验、循环检测和目标处理器调用。
-    async fn call_inner(&self, call: PluginServiceCall) -> Result<Value> {
-        let caller_is_plugin = self
-            .handlers
-            .read()
-            .map_err(|_| anyhow!("插件服务处理器锁已中毒"))?
-            .contains_key(&call.caller_id);
-        if caller_is_plugin && call.caller_id != call.plugin_id {
+    async fn call_inner(&self, call: PluginServiceCall, from_plugin: bool) -> Result<Value> {
+        let caller_is_plugin = from_plugin
+            || self
+                .declared_dependencies
+                .read()
+                .map_err(|_| anyhow!("插件服务依赖锁已中毒"))?
+                .contains_key(&call.caller_id);
+        if caller_is_plugin {
             let dependencies = self
                 .declared_dependencies
                 .read()
@@ -269,6 +308,31 @@ impl ServiceRegistry {
             .map_err(|_| anyhow!("插件服务目录锁已中毒"))?
             .retain(|(owner, _), _| owner != plugin_id);
         Ok(())
+    }
+}
+
+/// 加载期登记的回滚守卫；成功加载后解除，失败或取消会移除全部服务贡献。
+#[cfg(feature = "wasm")]
+pub(crate) struct PluginRegistrationGuard {
+    registry: Arc<ServiceRegistry>,
+    plugin_id: String,
+    armed: bool,
+}
+
+#[cfg(feature = "wasm")]
+impl PluginRegistrationGuard {
+    /// 将注册生命周期交给成功加载的 Host 实例。
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "wasm")]
+impl Drop for PluginRegistrationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.registry.unregister_plugin(&self.plugin_id);
+        }
     }
 }
 
@@ -468,6 +532,65 @@ mod tests {
             .list_for_plugin("intruder", Some("provider"))
             .expect_err("未声明依赖必须拒绝定向发现");
         assert!(error.to_string().contains("manifest 未声明"));
+    }
+
+    /// 加载期尚无 handler 的 Guest 也不能借应用调用入口绕过依赖校验。
+    #[cfg(feature = "wasm")]
+    #[tokio::test]
+    async fn initializing_guest_is_authorized_and_rolled_back() {
+        let registry = Arc::new(ServiceRegistry::default());
+        registry
+            .register_handler("provider", HashSet::new(), Arc::new(EchoHandler))
+            .unwrap();
+        registry
+            .upsert(
+                "provider",
+                PluginService {
+                    plugin_id: String::new(),
+                    name: "echo".into(),
+                    version: "1.0.0".into(),
+                    description: None,
+                },
+            )
+            .unwrap();
+        let call = |caller: &str| PluginServiceCall {
+            caller_id: caller.into(),
+            plugin_id: "provider".into(),
+            name: "echo".into(),
+            payload: Value::Null,
+        };
+        assert!(registry
+            .call_from_plugin(call("missing"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("尚未注册"));
+        let guard = registry
+            .begin_plugin_load("initializing", HashSet::new())
+            .unwrap();
+        assert!(registry
+            .call_from_plugin(call("initializing"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("manifest 未声明"));
+        drop(guard);
+        let guard = registry
+            .begin_plugin_load("initializing", HashSet::from(["provider".into()]))
+            .unwrap();
+        assert_eq!(
+            registry
+                .call_from_plugin(call("initializing"))
+                .await
+                .unwrap()["caller"],
+            "initializing"
+        );
+        drop(guard);
+        assert!(registry
+            .call_from_plugin(call("initializing"))
+            .await
+            .is_err());
+        assert!(registry.call(call("application")).await.is_ok());
     }
 
     /// 未注册服务不能仅凭存在处理器被调用。

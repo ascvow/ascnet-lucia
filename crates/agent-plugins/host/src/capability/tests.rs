@@ -335,8 +335,8 @@ fn workspace_read_state(workspace_root: Option<&Path>, declared: bool) -> Capabi
 }
 
 /// 声明能力且 Host 注入工作区根后，可以读取文件并得到仓库相对目录项。
-#[test]
-fn workspace_read_accesses_only_injected_root() {
+#[tokio::test]
+async fn workspace_read_accesses_only_injected_root() {
     let root = storage_test_root("workspace-read");
     let source_dir = root.join("src");
     std::fs::create_dir_all(&source_dir).expect("创建工作区测试目录");
@@ -347,10 +347,14 @@ fn workspace_read_accesses_only_injected_root() {
     assert_eq!(
         state
             .read_file(r#"{"path":"src/lib.rs"}"#)
+            .await
             .expect("读取工作区文件"),
         json!("pub fn demo() {}\n")
     );
-    let entries = state.list_dir(r#"{"path":"src"}"#).expect("列出工作区目录");
+    let entries = state
+        .list_dir(r#"{"path":"src"}"#)
+        .await
+        .expect("列出工作区目录");
     assert_eq!(entries[0]["path"], "src/lib.rs");
     assert_eq!(entries[0]["is_dir"], false);
 
@@ -358,19 +362,20 @@ fn workspace_read_accesses_only_injected_root() {
 }
 
 /// Manifest 声明能力但应用未注入工作区根时，调用必须返回清晰拒绝而不是回退到插件目录。
-#[test]
-fn workspace_read_requires_host_workspace_root() {
+#[tokio::test]
+async fn workspace_read_requires_host_workspace_root() {
     let mut state = workspace_read_state(None, true);
 
     let error = state
         .list_dir(r#"{"path":"."}"#)
+        .await
         .expect_err("缺少可信工作区根必须拒绝");
     assert!(error.to_string().contains("工作区根目录"), "{error}");
 }
 
 /// Host 注入路径不能替代 manifest 授权；未声明能力的插件仍不得读取当前项目。
-#[test]
-fn workspace_read_requires_manifest_declaration() {
+#[tokio::test]
+async fn workspace_read_requires_manifest_declaration() {
     let root = storage_test_root("workspace-read-undeclared");
     std::fs::create_dir_all(&root).expect("创建未授权工作区测试目录");
     let canonical_root = root.canonicalize().expect("规范化未授权工作区测试目录");
@@ -378,6 +383,7 @@ fn workspace_read_requires_manifest_declaration() {
 
     let error = state
         .list_dir(r#"{"path":"."}"#)
+        .await
         .expect_err("未声明能力必须拒绝");
     assert!(error.to_string().contains("未声明"), "{error}");
 
@@ -386,8 +392,8 @@ fn workspace_read_requires_manifest_declaration() {
 
 /// 指向工作区外部的符号链接必须在规范化后被拒绝。
 #[cfg(unix)]
-#[test]
-fn workspace_read_rejects_symlink_escape() {
+#[tokio::test]
+async fn workspace_read_rejects_symlink_escape() {
     use std::os::unix::fs::symlink;
 
     let root = storage_test_root("workspace-read-symlink");
@@ -401,11 +407,32 @@ fn workspace_read_rejects_symlink_escape() {
 
     let error = state
         .read_file(r#"{"path":"outside-link/secret.txt"}"#)
+        .await
         .expect_err("越界符号链接必须拒绝");
     assert!(error.to_string().contains("无权读取"), "{error}");
 
     std::fs::remove_dir_all(root).expect("清理符号链接工作区测试目录");
     std::fs::remove_dir_all(outside).expect("清理工作区外测试目录");
+}
+
+/// 文件读取必须在分配正文前拒绝超大文件与非文件目标。
+#[tokio::test]
+async fn workspace_read_rejects_oversized_and_nonregular_files() {
+    let root = storage_test_root("read-bounds");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::File::create(root.join("large.txt"))
+        .unwrap()
+        .set_len(MAX_FILE_READ_BYTES + 1)
+        .unwrap();
+    let mut state = workspace_read_state(Some(&root.canonicalize().unwrap()), true);
+    assert!(state
+        .read_file(r#"{"path":"large.txt"}"#)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("8 MiB"));
+    assert!(state.read_file(r#"{"path":"."}"#).await.is_err());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// 插件实例状态应支持读取、替换和删除。

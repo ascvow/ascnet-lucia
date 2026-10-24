@@ -379,6 +379,9 @@ pub fn snapshot_manifest_capabilities(
     if capabilities.agent.cancel {
         requested.push(capability_request("agent.cancel"));
     }
+    if capabilities.agent.collect {
+        requested.push(capability_request("agent.collect"));
+    }
     if capabilities.model_completion {
         requested.push(capability_request("model_completion"));
     }
@@ -406,6 +409,21 @@ pub fn snapshot_manifest_capabilities(
             capability_id: "http".into(),
             scopes: sorted_unique(http.allow_hosts.clone()),
         });
+    }
+    if let Some(socket) = &capabilities.socket {
+        requested.push(ManifestCapabilityRequest {
+            capability_id: "socket".into(),
+            scopes: sorted_unique(socket.allow_paths.clone()),
+        });
+    }
+    if !capabilities.env_read.is_empty() {
+        requested.push(ManifestCapabilityRequest {
+            capability_id: "env_read".into(),
+            scopes: sorted_unique(capabilities.env_read.clone()),
+        });
+    }
+    if capabilities.data_dir {
+        requested.push(capability_request("data_dir"));
     }
     if capabilities.secrets {
         requested.push(capability_request("secrets"));
@@ -766,7 +784,15 @@ fn capability_request(capability_id: &str) -> ManifestCapabilityRequest {
 
 fn mapped_host_imports(capability_id: &str) -> &'static [&'static str] {
     match capability_id {
-        "agent.spawn" | "agent.observe" | "agent.cancel" => &["host-agent-runtime-call"],
+        "agent.spawn" | "agent.observe" | "agent.cancel" | "agent.collect" => {
+            &["host-agent-runtime-call"]
+        }
+        "socket" => &[
+            "host-socket-connect",
+            "host-socket-send",
+            "host-socket-recv",
+            "host-socket-close",
+        ],
         "model_completion" => &["host-model-complete"],
         "http" => &["host-http-request"],
         "surface_actions" => &["host-agent-emit-event"],
@@ -871,6 +897,51 @@ mod tests {
         );
         assert_eq!(snapshot.requested[0].scopes, ["builder", "reviewer"]);
         assert_eq!(snapshot.requested[1].scopes, ["a", "z"]);
+    }
+
+    /// 环境、数据目录、socket 和 collect 必须进入授权摘要，顺序不影响权限身份。
+    #[test]
+    fn authorization_profile_covers_all_new_capabilities() {
+        let base = manifest_from_toml(
+            r#"
+            [plugin]
+            id = "permissions"
+            name = "Permissions"
+            version = "1.0.0"
+            api_version = "0.10.0"
+            wasm = "plugin.wasm"
+        "#,
+        );
+        let original = snapshot_plugin_authorization_profile(&base).unwrap();
+        for capability in ["env_read", "data_dir", "socket", "agent.collect"] {
+            let mut changed = base.clone();
+            match capability {
+                "env_read" => changed.capabilities.env_read = vec!["EDITOR_SESSION".into()],
+                "data_dir" => changed.capabilities.data_dir = true,
+                "socket" => {
+                    changed.capabilities.socket = Some(crate::manifest::SocketCapabilitySection {
+                        allow_paths: vec!["/tmp/editor.sock".into()],
+                    })
+                }
+                "agent.collect" => changed.capabilities.agent.collect = true,
+                _ => unreachable!(),
+            }
+            let profile = snapshot_plugin_authorization_profile(&changed).unwrap();
+            assert_ne!(original, profile, "{capability} 不能遗漏授权");
+            assert!(profile
+                .manifest
+                .requested
+                .iter()
+                .any(|request| request.capability_id == capability));
+        }
+        let mut first = base.clone();
+        first.capabilities.env_read = vec!["Z".into(), "A".into()];
+        let mut second = first.clone();
+        second.capabilities.env_read.reverse();
+        assert_eq!(
+            snapshot_plugin_authorization_profile(&first).unwrap(),
+            snapshot_plugin_authorization_profile(&second).unwrap()
+        );
     }
 
     /// 跨插件服务依赖必须进入稳定授权快照，并保留版本范围与可选语义。

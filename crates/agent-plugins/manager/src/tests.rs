@@ -425,6 +425,46 @@ fn replace_disables_plugin_when_capability_profile_changes() {
         .is_empty());
 }
 
+/// 新增环境、数据目录、socket 或 collect 权限必须使官方升级等待重新授权。
+#[test]
+fn trusted_upgrade_reviews_previously_omitted_capabilities() {
+    for (tag, capability) in [
+        ("env", "[capabilities]\nenv_read = [\"EDITOR_SESSION\"]\n"),
+        ("data", "[capabilities]\ndata_dir = true\n"),
+        (
+            "socket",
+            "[capabilities.socket]\nallow_paths = [\"/tmp/editor.sock\"]\n",
+        ),
+        ("collect", "[capabilities.agent]\ncollect = true\n"),
+    ] {
+        let directory = TestDirectory::new(&format!("review-{tag}"));
+        let first = create_bundle(&directory.path, "echo", "1.0.0", &[], None);
+        let second = create_bundle(&directory.path, "echo", "2.0.0", &[], None);
+        let path = second.join("plugin.toml");
+        let mut manifest = fs::read_to_string(&path).unwrap();
+        manifest.push_str(&format!("\n{capability}"));
+        fs::write(path, manifest).unwrap();
+        let manager = PluginManager::new(directory.path.join("managed"));
+        manager
+            .install_trusted_startup_with_source(
+                &first,
+                InstallOptions { enabled: true },
+                Some("github:https://github.com/ascvow/echo@v1#echo.zip".into()),
+            )
+            .unwrap();
+        let updated = manager
+            .replace_with_source_policy(
+                &second,
+                InstallOptions { enabled: true },
+                Some("github:https://github.com/ascvow/echo@v2#echo.zip".into()),
+                BundleReplacementPolicy::TrustedOfficialUpgrade,
+            )
+            .unwrap();
+        assert!(!updated.enabled, "{tag} 权限变化不得继承授权");
+        assert!(manager.runtime_config().unwrap().manifest_paths.is_empty());
+    }
+}
+
 /// 官方升级的稳定 manifest 身份变化时不得沿用旧启用授权。
 #[test]
 fn trusted_upgrade_disables_plugin_when_stable_manifest_identity_changes() {

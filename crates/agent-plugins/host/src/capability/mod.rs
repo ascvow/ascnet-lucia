@@ -66,8 +66,7 @@ const MAX_SOCKET_TRANSFER_BYTES: usize = 1024 * 1024;
 
 /// 单条 socket 连接累计允许读取的字节数；超过后必须重连。
 ///
-/// 上限按「一次激活生命周期」而不是「单次调用」计，否则长驻连接可以把一个本地服务的
-/// 全部输出持续搬进 Guest 内存，而每次调用都刚好合规。
+/// 上限按单连接计；重连会创建新预算，不能将其描述为插件激活生命周期总配额。
 const MAX_SOCKET_READ_BUDGET: usize = 16 * 1024 * 1024;
 
 /// socket 单次读取允许等待的毫秒数上限。
@@ -96,6 +95,9 @@ const MAX_PROCESS_ENV_BYTES: usize = 256 * 1024;
 const MAX_PROCESS_CWD_BYTES: usize = 4 * 1024;
 
 const MAX_HOST_CAPABILITY_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+/// Host 搬运文件和目录的单次内存边界，不限制插件私有数据目录的总容量。
+const MAX_FILE_READ_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 
@@ -715,7 +717,7 @@ impl CapabilityState {
     ) -> Result<Value> {
         let request: ServiceCallRequest = parse_request(request_json)?;
         services
-            .call(PluginServiceCall {
+            .call_from_plugin(PluginServiceCall {
                 caller_id,
                 plugin_id: request.plugin_id,
                 name: request.name,
@@ -725,46 +727,68 @@ impl CapabilityState {
     }
 
     /// 在 manifest 允许的目录中读取 UTF-8 文件。
-    pub(crate) fn read_file(&mut self, request_json: &str) -> Result<Value> {
+    pub(crate) async fn read_file(&mut self, request_json: &str) -> Result<Value> {
         let request: PathRequest = parse_request(request_json)?;
         let resolved = self.resolve_read_path(&request.path)?;
-        let content = std::fs::read_to_string(&resolved.path)
-            .with_context(|| format!("读取插件文件失败：{}", resolved.path.display()))?;
-        Ok(json!(content))
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            // 不在打开 FIFO 时等待写端，也不跟随校验后被替换的最终符号链接。
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+            }
+            let file = options.open(&resolved.path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() > MAX_FILE_READ_BYTES {
+                return Err(anyhow!("插件只可读取不超过 8 MiB 的常规文件"));
+            }
+            let mut content = String::new();
+            file.take(MAX_FILE_READ_BYTES + 1)
+                .read_to_string(&mut content)?;
+            if content.len() as u64 > MAX_FILE_READ_BYTES {
+                return Err(anyhow!("插件文件读取超过 8 MiB 限制"));
+            }
+            Ok(json!(content))
+        })
+        .await
+        .context("插件文件读取任务失败")?
     }
 
     /// 在 manifest 允许的目录中列出一层目录项。
-    pub(crate) fn list_dir(&mut self, request_json: &str) -> Result<Value> {
+    pub(crate) async fn list_dir(&mut self, request_json: &str) -> Result<Value> {
         let request: PathRequest = parse_request(request_json)?;
         let resolved = self.resolve_read_path(&request.path)?;
-        if !resolved.path.is_dir() {
-            return Err(anyhow!(
-                "插件请求的路径不是目录：{}",
-                resolved.path.display()
-            ));
-        }
-
-        let mut entries = std::fs::read_dir(&resolved.path)
-            .with_context(|| format!("列出插件目录失败：{}", resolved.path.display()))?
-            .map(|entry| {
-                let entry = entry.context("读取插件目录项失败")?;
+        tokio::task::spawn_blocking(move || {
+            let mut entries = Vec::new();
+            let mut bytes = 0usize;
+            for entry in std::fs::read_dir(&resolved.path)? {
+                if entries.len() >= MAX_DIRECTORY_ENTRIES {
+                    return Err(anyhow!("插件目录超过 {MAX_DIRECTORY_ENTRIES} 项限制"));
+                }
+                let entry = entry?;
                 let entry_path = entry.path();
                 let relative = entry_path
                     .strip_prefix(&resolved.display_root)
                     .unwrap_or(&entry_path)
                     .to_string_lossy()
                     .into_owned();
-                Ok(FileEntry {
+                bytes = bytes.saturating_add(relative.len());
+                if bytes > MAX_FILE_READ_BYTES as usize {
+                    return Err(anyhow!("插件目录路径总量超过 8 MiB 限制"));
+                }
+                entries.push(FileEntry {
                     path: relative,
-                    is_dir: entry
-                        .file_type()
-                        .context("读取插件目录项类型失败")?
-                        .is_dir(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        entries.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(serde_json::to_value(entries)?)
+                    is_dir: entry.file_type()?.is_dir(),
+                });
+            }
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok(serde_json::to_value(entries)?)
+        })
+        .await
+        .context("插件目录读取任务失败")?
     }
 
     /// 将 Guest 路径解析到 manifest 声明的插件文件范围或 Host 注入的当前工作区范围。

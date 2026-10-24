@@ -416,11 +416,11 @@ pub(crate) fn plugin_data_dir(root: &Path, plugin_id: &str, scope_key: &str) -> 
     digest.update(b"lucia-plugin-data-v1\0");
     update_identity_field(&mut digest, plugin_id.as_bytes());
     update_identity_field(&mut digest, scope_key.as_bytes());
-    let path = root
-        .join(DATA_SUBDIRECTORY)
-        .join(format!("{:x}", digest.finalize()));
-    fs::create_dir_all(&path)
-        .with_context(|| format!("创建插件数据目录 `{}` 失败", path.display()))?;
+    ensure_real_state_directory(root)?;
+    let parent = root.join(DATA_SUBDIRECTORY);
+    ensure_real_state_directory(&parent)?;
+    let path = parent.join(format!("{:x}", digest.finalize()));
+    ensure_real_state_directory(&path)?;
     Ok(path)
 }
 
@@ -471,6 +471,30 @@ mod data_dir_tests {
             path.display()
         );
         fs::remove_dir_all(root).expect("清理插件数据测试目录");
+    }
+
+    /// 数据目录不能通过最终目录或数据父目录的符号链接逃逸，且默认不可被其他用户读取。
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_rejects_symlinks_and_is_private() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = temp_root("private");
+        let outside = temp_root("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let path = plugin_data_dir(&root, "demo", "user").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir(&path).unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(plugin_data_dir(&root, "demo", "user").is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(root.join(DATA_SUBDIRECTORY)).unwrap();
+        symlink(&outside, root.join(DATA_SUBDIRECTORY)).unwrap();
+        assert!(plugin_data_dir(&root, "demo", "user").is_err());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     /// 非法输入必须被拒绝而不是落到一个可预测的共享目录上。

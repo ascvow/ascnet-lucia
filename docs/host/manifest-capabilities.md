@@ -97,7 +97,7 @@ ABI 基线混入其中会把“启用即可使用”误报为“当前 Guest 实
 | `env_read` | 可用 | 只注入 manifest 逐个列出的环境变量；默认不继承任何宿主环境；工具权限下限为 `read` |
 | `tool_scopes` | 可用 | Host 按公开工具名绑定 scope；未声明工具降级为 `unknown`，已授 component 能力会进一步抬高风险下限 |
 | `fs_write` | 尚未开放 | manifest 申请会被拒绝 |
-| `http` | 尚未开放 | manifest 申请会被拒绝 |
+| `http` | 可用 | 应用绑定端点和凭证、manifest 主机 allowlist、禁止重定向及有界请求/响应 |
 | `secrets` | 尚未开放 | manifest 申请会被拒绝 |
 
 Host 默认不继承 WASI 环境变量、不预打开目录、不接 stdio。唯一的环境变量入口是 manifest 逐个列出的 `env_read`；其余 I/O 必须使用 `PluginHostApi`。
@@ -260,11 +260,27 @@ profiles = ["worker", "reviewer"]
 - 只向可信插件授予。
 - Host 不经过 shell，`command` 与 `args` 分开传递。
 - 子进程环境先清空，只保留 PATH、HOME、TMPDIR、LANG、LC_ALL，再叠加请求环境。
-- 每个插件实例的进程上限取 Host 硬上限 8 与 `ExecutionPolicy.limits.max_processes` 的较小值。
+- 每个插件实例的进程上限取 Host 硬上限 16 与 `ExecutionPolicy.limits.max_processes` 的较小值（默认 Serve 为 8）。
 - Host 限制启动请求、参数数量、环境变量总量、单次 stdin 写入和单行 stdout 大小，避免高权限入口接收无界载荷。
 - `process_exec` 仍等价于授予插件当前操作系统用户的原生进程权限；上述结构限制不能替代插件来源校验和用户信任决策。
 - stdout 单行限制为 4 MiB，读取超时上限为 120 秒。
 - token 应放在被忽略的本地配置，不写入 manifest 或源码。
+
+## 资源边界与授权复核
+
+服务调用者身份在执行任何 Guest 代码前登记，初始化与 `list-tools` 阶段同样执行 manifest
+依赖校验；Guest 请求不能冒充可信应用调用。加载失败或取消会撤销已登记的身份和服务。
+
+授权快照包含 `socket.allow_paths`、`env_read`、`data_dir` 和 `agent.collect`。旧授权摘要不能
+覆盖新增权限，权限变化后必须重新审查；这不改变 manifest ABI 或 Manager lock schema。
+
+- `host-fs-read` 仅读取常规 UTF-8 文件，单次最多 8 MiB；实际读取也有上限，不仅检查文件长度。
+- `host-fs-list` 最多返回 10,000 项，路径正文合计最多 8 MiB；超限明确报错，不返回伪完整列表。
+- 文件正文读取和目录遍历在阻塞线程执行；这不是对慢文件系统的强制终止保证。
+- 每插件活跃工具最多 1,024 项、提示最多 256 项、排队事件最多 1,024 项。
+  单项最多 1 MiB，各类合计最多 8 MiB；删除或排空后归还预算，不设生命周期累计配额。
+- UI 帧 JSON 最多 1 MiB、4,096 行、每行 1,024 个 span；工具帧还受请求的 `max_height` 约束。
+- 插件私有数据目录拒绝最终目录和数据父目录的符号链接，Unix 权限收紧为 0700；不设数据总容量上限。
 
 ## ABI 兼容
 

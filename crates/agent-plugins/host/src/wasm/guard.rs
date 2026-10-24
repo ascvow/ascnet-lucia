@@ -116,6 +116,18 @@ pub(crate) fn validate_ui_contributions(
     Ok((declarations, tool_renderers))
 }
 
+/// 限制 UI 载荷的字节、行和 span 数量，避免小视口触发无界宿主布局。
+pub(super) fn decode_ui_frame(json: &str) -> Result<crate::ui::UiFrame> {
+    if json.len() > 1024 * 1024 {
+        return Err(anyhow!("插件 UI 帧超过 1 MiB 限制"));
+    }
+    let frame: crate::ui::UiFrame = serde_json::from_str(json)?;
+    if frame.lines.len() > 4096 || frame.lines.iter().any(|line| line.spans.len() > 1024) {
+        return Err(anyhow!("插件 UI 帧超过 4096 行或每行 1024 span 限制"));
+    }
+    Ok(frame)
+}
+
 /// 校验静态视图与动态子视图的实例路由是否匹配。
 pub(crate) fn validate_ui_instance(
     declaration: &UiDeclaration,
@@ -145,6 +157,15 @@ pub(crate) fn validate_ui_instance(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// UI 资源边界不改变旧帧和加法字段兼容性。
+    #[test]
+    fn ui_frame_bounds_preserve_compatible_requests() {
+        assert!(decode_ui_frame(r#"{"view_id":"v","lines":[],"future_field":true}"#).is_ok());
+        assert!(decode_ui_frame(&" ".repeat(1024 * 1024 + 1)).is_err());
+        let oversized = json!({"view_id":"v", "lines": vec![json!({"spans": []}); 4097]});
+        assert!(decode_ui_frame(&oversized.to_string()).is_err());
+    }
 
     /// Guest 上下文必须移除所有不透明推理块，并保留普通可见内容。
     #[test]

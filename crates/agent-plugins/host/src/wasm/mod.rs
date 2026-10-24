@@ -524,6 +524,14 @@ impl WasmPluginHost {
             .context("failed to add WASI Preview 2 imports to linker")?;
         add_plugin_host_imports(&mut linker)?;
 
+        let mut registration = services.begin_plugin_load(
+            &manifest.plugin.id,
+            manifest
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.id.clone())
+                .collect(),
+        )?;
         let agent_runtime =
             provision_agent_runtime(&manifest, host_services.agent_runtime()).await?;
         let mut cleanup_agent_runtime = AgentRuntimeLoadGuard::new(agent_runtime.clone());
@@ -736,6 +744,7 @@ impl WasmPluginHost {
             }
         } else {
             cleanup_agent_runtime.disarm();
+            registration.disarm();
         }
         loading
     }
@@ -1102,7 +1111,7 @@ impl PluginHost for WasmPluginHost {
                 if frame_json.is_empty() {
                     return Ok(None);
                 }
-                let frame = serde_json::from_str::<UiFrame>(&frame_json).with_context(|| {
+                let frame = guard::decode_ui_frame(&frame_json).with_context(|| {
                     format!("plugin `{plugin_id}` returned invalid UiFrame JSON")
                 })?;
                 if frame.view_id != view_id {
@@ -1148,7 +1157,7 @@ impl PluginHost for WasmPluginHost {
                 if frame_json.is_empty() {
                     return Ok(None);
                 }
-                let frame = serde_json::from_str::<UiFrame>(&frame_json).with_context(|| {
+                let frame = guard::decode_ui_frame(&frame_json).with_context(|| {
                     format!("plugin `{plugin_id}` returned invalid UiFrame JSON")
                 })?;
                 if frame.view_id != renderer_id {
