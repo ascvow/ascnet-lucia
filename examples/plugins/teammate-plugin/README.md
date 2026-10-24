@@ -22,7 +22,7 @@
 - `teammate_list`：列出当前 owner 的活跃成员、已回收成员及其当前执行句柄。
 - `teammate_status`、`teammate_result`、`teammate_cancel`：操作成员的当前执行句柄。成员被自动回收后，`teammate_result` 从回收台账返回同样的终态结果。
 - `teammate_remove`：取消并删除成员及其未确认消息，释放成员配额；对已回收成员只清理台账记录。正常流程不需要手动调用，完成态成员会在运行结束时自动回收。
-- `teammate_send`：向成员地址投递消息。
+- `teammate_send`：向成员地址投递消息。主事件列表显示 `@成员角色: 正文`，显式 `captain: true` 的收件成员显示 `@队长: 正文`；`@` 指收件人，不代表发送者、已读或已执行。字符串 payload 直接显示，多行保留换行；其他 JSON 值完整序列化，不猜测对象中的 `text`、`name` 等字段。原 `message` 信封保持不变，结果新增可选 `content` 展示文本，历史工具卡片也能预览正文。
 - `teammate_inbox`：列出未确认消息。
 - `teammate_ack`：显式确认并删除消息。
 - `teammate_dispatch`：把指定消息转换为成功会话的新增输入；调用立即返回新句柄，不等待模型完成。

@@ -569,6 +569,22 @@ async fn component_runs_mailbox_dispatch_flow() {
     )
     .await;
     assert_eq!(sent["message"]["sender"]["kind"], "controller");
+    assert_eq!(sent["content"], "@队长: {\"path\":\"src/lib.rs\"}");
+    let events = AgentExtension::drain_events_for_run(host.as_ref(), RUN)
+        .await
+        .unwrap();
+    let sent_events: Vec<_> = events
+        .iter()
+        .filter(|event| event["name"] == "teammate.message.sent")
+        .collect();
+    assert_eq!(sent_events.len(), 1);
+    let event = sent_events[0];
+    assert_eq!(event["source"]["id"], "teammate");
+    assert_eq!(event["source"]["type"], "plugin");
+    assert_eq!(event["data"], sent["message"]);
+    assert_eq!(event["presentation"]["target"], "main_event_list");
+    assert_eq!(event["presentation"]["variant"], "text");
+    assert_eq!(event["presentation"]["text"], sent["content"]);
     let message_id = sent["message"]["id"].as_u64().expect("send 应返回消息 ID");
 
     let inbox = call_tool(
@@ -592,6 +608,15 @@ async fn component_runs_mailbox_dispatch_flow() {
     assert_ne!(dispatched["handle"]["id"], member_id);
     let second_result = wait_result(host.as_ref(), RUN, member_id).await;
     assert_eq!(second_result["outcome"]["status"], "succeeded");
+    let events = AgentExtension::drain_events_for_run(host.as_ref(), RUN)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["name"] == "teammate.message.sent"),
+        "读取邮箱和续跑不能重复展示发送消息"
+    );
 
     // 队长可以一直派活：每轮投胎后旧句柄都会回收，因此累计名额不会被耗尽。
     for round in 0..4 {
@@ -692,6 +717,51 @@ async fn component_runs_mailbox_dispatch_flow() {
         .as_array()
         .expect("回收台账应返回数组")
         .is_empty());
+
+    // 旧成员已释放后再创建普通成员，不扩大上面的累计配额；多行正文由同一事件协议承载。
+    let ordinary = call_tool(
+        host.as_ref(),
+        "display-run",
+        "teammate_spawn",
+        json!({"role":"渲染审查员","input":"检查正文"}),
+    )
+    .await;
+    let ordinary_id = ordinary["member"]["id"].as_str().unwrap();
+    wait_result(host.as_ref(), "display-run", ordinary_id).await;
+    let sent = call_tool(
+        host.as_ref(),
+        "display-run",
+        "teammate_send",
+        json!({"recipient":ordinary_id,"topic":"review","payload":"第一行\n中文 👩‍💻 第二行"}),
+    )
+    .await;
+    assert_eq!(sent["content"], "@渲染审查员: 第一行\n中文 👩‍💻 第二行");
+    let events = AgentExtension::drain_events_for_run(host.as_ref(), "display-run")
+        .await
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event["presentation"]["text"] == sent["content"]));
+    call_tool_error(
+        host.as_ref(),
+        "display-run",
+        "teammate_send",
+        json!({"recipient":"missing","topic":"review","payload":"不应显示"}),
+    )
+    .await;
+    assert!(
+        AgentExtension::drain_events_for_run(host.as_ref(), "display-run")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    call_tool(
+        host.as_ref(),
+        "display-run",
+        "teammate_remove",
+        json!({"member_id":ordinary_id}),
+    )
+    .await;
 
     host.deactivate().await.expect("插件应正常卸载");
 }

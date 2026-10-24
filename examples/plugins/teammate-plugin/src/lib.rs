@@ -5,7 +5,8 @@
 
 use agent_plugin::{
     core_events, export_plugin, ActivationContext, AgentHandle, AgentId, AgentOutcome, AgentPlugin,
-    AgentSpawnRequest, AgentStatus, EventOutcome, ExtensionEvent, PluginEvent, PluginHostApi,
+    AgentSpawnRequest, AgentStatus, EventOutcome, EventPresentation, EventPresentationTarget,
+    EventPresentationTone, EventPresentationVariant, ExtensionEvent, PluginEvent, PluginHostApi,
     Result, RunFinishEventData, ServiceCall, ServiceSpec, ToolCall, ToolPermissionScope,
     ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
     UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
@@ -897,12 +898,21 @@ impl TeammatePlugin {
         request: SendRequest,
     ) -> Result<Value> {
         let message = self.state.send(owner, sender, request)?;
-        emit(
-            host,
-            "teammate.message.sent",
-            serde_json::to_value(&message)?,
-        );
-        Ok(json!({"message": message}))
+        let recipient = self.state.member(owner, &message.recipient)?;
+        let text = message_display_text(&recipient.role, recipient.captain, &message.payload);
+        // 展示只依赖已入邮箱的消息和成员目录，不接受 payload 自报的名字或队长身份。
+        // 观察事件失败不能回滚投递；结果携带可选正文，历史恢复也能使用通用工具预览。
+        let _ = host.emit_event(&ExtensionEvent {
+            name: "teammate.message.sent".into(),
+            data: serde_json::to_value(&message)?,
+            presentation: Some(EventPresentation {
+                target: EventPresentationTarget::MainEventList,
+                variant: EventPresentationVariant::Text,
+                tone: EventPresentationTone::Info,
+                text: text.clone(),
+            }),
+        });
+        Ok(json!({"message": message, "content": text}))
     }
 
     /// 列出成员未确认的消息。
@@ -1958,6 +1968,23 @@ fn validate_topic(topic: &str) -> Result<()> {
     Ok(())
 }
 
+/// 把已确认的收件人称谓与任意 JSON 正文转成通用展示文本，不改变邮箱载荷。
+/// 字符串原样显示，其他 JSON 完整序列化；`@` 指收件人，不宣称已读或已执行。
+fn message_display_text(role: &str, captain: bool, payload: &Value) -> String {
+    let label = if captain {
+        "队长".to_string()
+    } else {
+        role.chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect()
+    };
+    let body = match payload {
+        Value::String(text) => text.clone(),
+        value => value.to_string(),
+    };
+    format!("@{label}: {body}")
+}
+
 /// 尽力发布结构化 teammate 事件；观察性事件失败不回滚已完成的状态变更。
 fn emit(host: &dyn PluginHostApi, name: &str, data: Value) {
     let _ = host.emit_event(&ExtensionEvent {
@@ -2034,7 +2061,7 @@ fn teammate_tools() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "teammate_send",
-            "以 Host 注入的 controller 身份向成员有界邮箱投递消息。",
+            "以 Host 注入的 controller 身份向成员有界邮箱投递消息。payload 为字符串时直接展示正文，其他值展示 JSON；界面的 @成员角色 或 @队长 指收件人，不代表已读或已执行。",
             json!({
                 "type": "object",
                 "properties": {
@@ -2084,6 +2111,44 @@ export_plugin!(TeammatePlugin);
 mod tests {
     use super::*;
     use agent_plugin::AgentLineage;
+
+    /// 消息展示以收件人目录为准，任意 JSON payload 不能冒充队长或发送者。
+    #[test]
+    fn message_display_keeps_payload_and_uses_recipient_identity() {
+        let text = json!("第一行\n中文 👩‍💻 第二行");
+        assert_eq!(
+            message_display_text("渲染审查员", false, &text),
+            "@渲染审查员: 第一行\n中文 👩‍💻 第二行"
+        );
+        assert_eq!(
+            message_display_text("审查员", true, &text),
+            "@队长: 第一行\n中文 👩‍💻 第二行"
+        );
+        for payload in [
+            json!({"captain":true,"sender":"spoof","text":"正文"}),
+            json!([1, "二"]),
+            Value::Null,
+        ] {
+            assert_eq!(
+                message_display_text("成员", false, &payload),
+                format!("@成员: {payload}")
+            );
+        }
+        assert_eq!(
+            message_display_text("成员\n假标题", false, &json!("正文")),
+            "@成员 假标题: 正文"
+        );
+    }
+
+    /// 旧发送请求与加法字段保持兼容；展示正文不是邮箱协议的必填输入。
+    #[test]
+    fn message_display_preserves_legacy_and_additive_requests() {
+        let legacy: SendRequest =
+            serde_json::from_value(json!({"recipient":"worker-1","topic":"review"})).unwrap();
+        assert_eq!(legacy.payload, Value::Null);
+        let additive: SendRequest = serde_json::from_value(json!({"recipient":"worker-1","topic":"review","payload":"正文","display_hint":"ignored"})).unwrap();
+        assert_eq!(additive.payload, json!("正文"));
+    }
 
     /// 派生与续跑成员保持 unknown，其余短控制面操作才声明为 control。
     #[test]
