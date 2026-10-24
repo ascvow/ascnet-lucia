@@ -22,6 +22,13 @@ use std::sync::Arc;
 /// 上限的作用是让靠近边界时的拖动保持精细：贴边一格只滚一行，拖到屏幕外很远才加速。
 const AUTOSCROLL_MAX_STEP: i32 = 5;
 
+/// 单行粘贴折叠为引用标签的显示宽度门槛。
+///
+/// 输入盒最多长到六行，这个宽度以内的单行内容在常见终端里只占一两行，仍能看清、能就地
+/// 改字；超过它或本身就是多行时，直接铺进输入框只会把内容挤成一团，才收成
+/// `[粘贴的文本]` 标签。
+pub(crate) const PASTE_TAG_COLUMNS: usize = 120;
+
 impl App {
     pub(crate) fn handle_key(
         &mut self,

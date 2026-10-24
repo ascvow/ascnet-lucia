@@ -925,6 +925,7 @@ version = "0.1.0"
 dependencies = [
  "agent-core",
  "agent-plugin-host",
+ "agent-plugin-protocol",
  "agent-tool",
  "anyhow",
  "serde_json",
