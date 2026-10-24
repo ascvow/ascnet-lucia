@@ -1090,6 +1090,11 @@ pub(crate) fn prompt_activity(app: &App) -> Option<PromptActivity> {
     if app.exit_confirmation_pending() {
         return Some(PromptActivity::ExitConfirm);
     }
+    if app.attachment_job.is_some() {
+        return Some(PromptActivity::Maintenance(
+            "正在准备附件 · Esc 取消".into(),
+        ));
+    }
     if let Some(label) = app.pending_reload.as_deref() {
         return Some(PromptActivity::Maintenance(label.to_string()));
     }

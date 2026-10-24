@@ -74,6 +74,11 @@ pub(crate) enum UiEvent {
     ModelUsage(TokenUsage),
     /// 压缩和工具筛选后，实际模型请求的上下文分类快照。
     ContextSnapshot(crate::command::ContextSnapshot),
+    /// 后台附件读取完成；仅由 App 复核请求与编辑代次后提交。
+    AttachmentsPrepared {
+        id: u64,
+        result: Result<crate::app::PreparedAttachments, String>,
+    },
     /// Agent 运行结束，携带至少一次持久化后的会话状态。
     AgentDone(Box<AgentCompletion>),
     /// 原生会话搜索面板的摘要查询完成。

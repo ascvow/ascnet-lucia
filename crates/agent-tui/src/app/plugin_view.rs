@@ -472,6 +472,7 @@ impl App {
     /// 按插件请求替换主输入内容与光标，并保持附件引用一致。
     #[cfg(feature = "plugins")]
     pub(crate) fn set_main_input(&mut self, text: String, cursor: Option<u32>) {
+        self.invalidate_attachment_job();
         self.input = text;
         let cursor = cursor
             .and_then(|cursor| usize::try_from(cursor).ok())

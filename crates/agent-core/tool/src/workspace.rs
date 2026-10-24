@@ -193,6 +193,30 @@ impl ReadPathGrants {
         Ok(resolved)
     }
 
+    /// 提交已在后台规范化的用户只读授权；此处只做集合插入，不再访问文件系统。
+    ///
+    /// 本入口仅供可信应用使用，调用者必须先验证并规范化路径；不得接收模型自报路径。
+    pub fn grant_canonical(&self, resolved: PathBuf) -> std::io::Result<()> {
+        if !resolved.is_absolute()
+            || resolved
+                .components()
+                .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "授权路径必须已规范化",
+            ));
+        }
+        let mut paths = self
+            .paths
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if paths.len() < MAX_READ_GRANTS {
+            paths.insert(resolved);
+        }
+        Ok(())
+    }
+
     /// 判断规范化路径是否已被用户授权。
     pub fn contains(&self, resolved: &Path) -> bool {
         self.paths

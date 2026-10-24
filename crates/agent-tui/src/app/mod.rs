@@ -2,6 +2,8 @@
 
 #[cfg(feature = "plugins")]
 mod agent_view;
+mod attachments;
+pub(crate) use attachments::{AttachmentIntent, AttachmentJob, PreparedAttachments};
 mod event_sink;
 mod input;
 #[cfg(feature = "plugins")]
@@ -132,6 +134,11 @@ pub(crate) struct App {
     pub(crate) read_path_grants: agent_tool::ReadPathGrants,
     pub(crate) messages: Vec<Msg>,
     pub(crate) input: String,
+    pub(crate) async_attachments: bool,
+    pub(crate) attachment_sequence: u64,
+    pub(crate) editor_generation: u64,
+    pub(crate) attachment_job: Option<AttachmentJob>,
+    pub(crate) mentioned_attachments_ready: bool,
     /// 等待随下一条消息发送的附件；引用标签内嵌在 `input` 文本中。
     pub(crate) attachments: Vec<PendingAttachment>,
     /// 等待随下一条消息发送的上下文引用；标签同样内嵌在 `input` 文本中。
@@ -558,6 +565,11 @@ impl App {
             read_path_grants: agent_tool::ReadPathGrants::new(),
             messages: Vec::new(),
             input: String::new(),
+            async_attachments: false,
+            attachment_sequence: 0,
+            editor_generation: 0,
+            attachment_job: None,
+            mentioned_attachments_ready: false,
             attachments: Vec::new(),
             refs: Vec::new(),
             #[cfg(feature = "plugins")]
@@ -697,6 +709,7 @@ impl App {
         let agent_view_activity = false;
         // 有待揭示文本时必须继续出帧，否则打字机会停在当前字符上等下一个网络事件。
         self.running
+            || self.attachment_job.is_some()
             || self.has_pending_stream()
             || self.pending_reload.is_some()
             || plugin_activity
@@ -811,6 +824,7 @@ impl App {
     pub(crate) fn replace_session(&mut self, session_record: SessionRecord, notice: Option<&str>) {
         // 压缩等操作会用同一会话的新记录替换内存状态，此时路径授权继续有效。
         let session_changed = self.session_record.id != session_record.id;
+        self.invalidate_attachment_job();
         self.messages = restore_session_messages(&session_record.session);
         self.session_record = session_record;
         self.input.clear();

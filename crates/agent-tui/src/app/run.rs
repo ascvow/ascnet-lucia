@@ -188,6 +188,9 @@ impl App {
     /// 插件加载导致 Agent 尚不可用时，将一条完整输入加入 FIFO 队列。待发送消息只显示
     /// 在输入框上方的排队面板里，发送并持久化后才进入会话记录。
     pub(crate) fn queue_input_until_ready(&mut self) {
+        if self.defer_attachment_submission(None, false) {
+            return;
+        }
         let Some(submission) = self.take_submission() else {
             return;
         };
@@ -370,6 +373,9 @@ impl App {
     ///
     /// 将当前编辑器内容立即提交给已就绪的 Agent。
     pub(crate) fn submit(&mut self, agent: &Arc<Agent>) {
+        if self.defer_attachment_submission(Some(Arc::clone(agent)), false) {
+            return;
+        }
         let Some(submission) = self.take_submission() else {
             return;
         };

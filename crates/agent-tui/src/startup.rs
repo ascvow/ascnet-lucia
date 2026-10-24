@@ -670,6 +670,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     });
 
     let mut app = App::new(tx.clone(), model_name)
+        .with_async_attachments()
         .with_workspace(workspace)
         .with_read_path_grants(read_path_grants)
         .with_config_path(config_path.clone())
@@ -1362,6 +1363,17 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             }
             Some(UiEvent::SessionContextReloaded(result)) => {
                 app.handle_session_context_reloaded(*result);
+            }
+            Some(UiEvent::AttachmentsPrepared { id, result }) => {
+                let before = app.input.clone();
+                app.apply_prepared_attachments(id, result);
+                if before != app.input {
+                    app.sync_native_command_input(&before);
+                    #[cfg(feature = "plugins")]
+                    if let Some(host) = plugin_host.as_ref() {
+                        forward_main_input_snapshot(&mut app, host).await;
+                    }
+                }
             }
             Some(UiEvent::AgentDone(result)) => {
                 record_run_failure_event(events_jsonl.as_deref(), result.as_ref()).await;

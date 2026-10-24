@@ -319,6 +319,29 @@ pub(crate) fn read_attachment_file(path: &Path, limit: u64) -> std::io::Result<V
     Ok(bytes)
 }
 
+/// 读取并编码附件，不分配编辑器标签；仅在后台或显式同步嵌入入口调用。
+pub(crate) fn prepare_file_attachment(
+    path: &Path,
+) -> std::result::Result<crate::session::conversation::PendingAttachment, String> {
+    use base64::Engine;
+    let bytes = read_attachment_file(path, crate::theme::MAX_ATTACHMENT_BYTES)
+        .map_err(|error| format!("Failed to read attachment ({}): {error}", path.display()))?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "attachment".into());
+    let (media_type, is_image) = attachment_media_type(path, &bytes);
+    Ok(crate::session::conversation::PendingAttachment {
+        label: String::new(),
+        name,
+        media_type,
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        is_image,
+        pasted_text: None,
+        source_path: Some(path.to_path_buf()),
+    })
+}
+
 /// 判断一个已存在的路径属于哪一类附件目标。
 ///
 /// 已知扩展名直接查表，不读文件；未知扩展名只嗅探开头 8 KiB，避免为判断类型而把

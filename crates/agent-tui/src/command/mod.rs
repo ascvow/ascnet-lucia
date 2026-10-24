@@ -748,6 +748,10 @@ impl App {
             ));
             return;
         };
+        if self.async_attachments {
+            self.schedule_attachments(crate::app::AttachmentIntent::Command(argument.to_owned()));
+            return;
+        }
         let cwd = self.workspace.cwd.clone();
         // 整段就是一个可读路径（含未加引号的空格）时不再拆分。
         if let Some(path) = pasted_file_path(argument, &cwd) {

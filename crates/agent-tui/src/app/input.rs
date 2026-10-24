@@ -5,15 +5,13 @@ use crate::app::{
     is_command_modifier, ContentPosition, MouseTextSelection, ESC_DOUBLE_PRESS_WINDOW,
 };
 use crate::session::attachment::{
-    attachment_media_type, attachment_modality, clipboard_files, copy_to_clipboard,
-    is_clipboard_file_names, looks_like_single_pasted_path, may_be_clipboard_file_names,
-    mentioned_paths, pasted_file_uris, pasted_path, pasted_path_kind, pasted_paths, PastedPathKind,
-    MAX_AUTO_TEXT_ATTACHMENT_BYTES,
+    attachment_modality, clipboard_files, copy_to_clipboard, is_clipboard_file_names,
+    looks_like_single_pasted_path, may_be_clipboard_file_names, mentioned_paths, pasted_file_uris,
+    pasted_path, pasted_path_kind, pasted_paths, PastedPathKind, MAX_AUTO_TEXT_ATTACHMENT_BYTES,
 };
 use crate::session::conversation::{
     retained_refs, submission_text, Msg, MsgKind, PendingAttachment, UserSubmission,
 };
-use crate::theme::MAX_ATTACHMENT_BYTES;
 use crate::ui::chat::{scrollbar_thumb, ScrollbarThumb};
 use agent_core::Agent;
 use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
@@ -50,6 +48,10 @@ impl App {
         }
         // 退出确认只对连续两次 Ctrl+C 有效，其余按键立即撤销待退出状态。
         if super::is_copy_shortcut(code, modifiers) {
+            if self.attachment_job.is_some() {
+                self.invalidate_attachment_job();
+                return;
+            }
             self.handle_interrupt_or_exit(agent);
             return;
         }
@@ -132,6 +134,12 @@ impl App {
                         .push(Msg::new(MsgKind::Info, "上下文压缩仍在进行中，请稍候"));
                     return;
                 }
+                if self.defer_attachment_submission(
+                    agent.cloned(),
+                    self.running && is_command_modifier(modifiers),
+                ) {
+                    return;
+                }
                 if let Some(agent) = agent {
                     if self.running {
                         // 正文里点名的图片/PDF 同样要先变成附件，排队后才能整条发送。
@@ -154,6 +162,12 @@ impl App {
                 }
             }
             KeyCode::Esc => {
+                if self.attachment_job.is_some() {
+                    self.invalidate_attachment_job();
+                    self.messages
+                        .push(Msg::new(MsgKind::Info, "已取消附件准备；草稿保持不变。"));
+                    return;
+                }
                 // 运行中优先中断；空闲输入必须连续双按才清空，Esc 永不直接退出。
                 if self.running {
                     self.last_escape_at = None;
@@ -512,6 +526,7 @@ impl App {
     /// 供命令路由在改写输入后复用（例如把路径输入转成附件标签），
     /// 保证历史游标、Esc 计时与附件回收与普通编辑一致。
     pub(crate) fn finish_input_edit(&mut self) {
+        self.invalidate_attachment_job();
         self.input_history_cursor = None;
         self.last_escape_at = None;
         self.prune_attachments();
@@ -526,6 +541,7 @@ impl App {
         ) else {
             return;
         };
+        self.invalidate_attachment_job();
         self.input_history_cursor = Some(index);
         self.input.clone_from(&self.input_history[index]);
         self.cursor = self.input.len();
@@ -535,6 +551,7 @@ impl App {
 
     /// 向较新的输入回溯；越过最新记录时恢复空编辑器。
     fn recall_newer_input(&mut self) {
+        self.invalidate_attachment_job();
         let Some(current) = self.input_history_cursor else {
             return;
         };
@@ -566,6 +583,10 @@ impl App {
     /// 处理终端粘贴：剪贴板持有文件引用时转为附件，粘贴的是单个本地路径时保留路径并附加
     /// 该文件，长文本折叠为引用标签，短文本直接落进输入框。
     pub(crate) fn handle_paste(&mut self, pasted: &str) {
+        if self.async_attachments {
+            self.schedule_attachments(super::AttachmentIntent::Paste(pasted.to_string()));
+            return;
+        }
         self.handle_paste_with(pasted, clipboard_files);
     }
 
@@ -650,9 +671,14 @@ impl App {
             ));
             return;
         }
+        self.insert_plain_paste(&text);
+    }
+
+    /// 已在后台完成路径判定的纯文本，只处理编辑器标签，不再访问文件系统。
+    pub(super) fn insert_plain_paste(&mut self, text: &str) {
         // 短粘贴直接落进输入框：用户能看清原文、能像打字一样继续改。行尾换行去掉——从
         // 终端或编辑器复制一行常带结尾换行，留着会把光标推到下一行空行。
-        if !paste_needs_label(&text) {
+        if !paste_needs_label(text) {
             let inline = text.trim_end_matches('\n');
             if !inline.is_empty() {
                 self.insert_input_text(inline);
@@ -672,7 +698,7 @@ impl App {
             media_type: "text/plain".to_string(),
             data: String::new(),
             is_image: false,
-            pasted_text: Some(text),
+            pasted_text: Some(text.to_string()),
             source_path: None,
         });
         let clip = format!("{label} ");
@@ -684,7 +710,7 @@ impl App {
     /// 把一段路径文本插入光标处，必要时与前后文字隔开一列空格。
     ///
     /// 路径是模型定位文件的唯一线索，粘在相邻词上会变成另一个路径（`foo/Users/...`）。
-    fn insert_pasted_path_text(&mut self, text: &str) {
+    pub(super) fn insert_pasted_path_text(&mut self, text: &str) {
         if self.needs_separating_space() {
             self.insert_input_text(" ");
         }
@@ -774,8 +800,12 @@ impl App {
 
     /// 读取文件并加入待发送附件，同时在光标处插入引用标签。
     ///
-    /// 读取失败或超过 [`MAX_ATTACHMENT_BYTES`] 时追加错误消息，不修改输入。
+    /// 读取失败或超过 [`crate::theme::MAX_ATTACHMENT_BYTES`] 时追加错误消息，不修改输入。
     pub(crate) fn attach_file(&mut self, path: &Path) {
+        if self.async_attachments {
+            self.schedule_attachments(super::AttachmentIntent::Files(vec![path.to_path_buf()]));
+            return;
+        }
         if let Err(message) = self.try_attach_file(path) {
             self.messages.push(Msg::new(MsgKind::Error, message));
         }
@@ -812,6 +842,9 @@ impl App {
     /// `cp a.png b.png`），把路径改写成引用标签会损坏用户的消息。附加结果以一条
     /// 提示告知用户；单个文件读取失败或当前模型不支持该模态时只提示，消息照常发送。
     pub(crate) fn attach_mentioned_paths(&mut self) {
+        if self.async_attachments {
+            return;
+        }
         let base = self.workspace.cwd.clone();
         let mut attached: Vec<String> = Vec::new();
         let mut text_budget = MAX_AUTO_TEXT_ATTACHMENT_BYTES;
@@ -862,37 +895,15 @@ impl App {
     /// 错误以面向用户的文案返回：`/attach` 会把它当作命令失败展示，正文自动识别
     /// 则只提示后继续发送。标签编号基于当前附件列表，因此调用期间不得并发改动。
     fn load_attachment(&self, path: &Path) -> std::result::Result<PendingAttachment, String> {
-        use base64::Engine;
-
-        let bytes = crate::session::attachment::read_attachment_file(path, MAX_ATTACHMENT_BYTES)
-            .map_err(|error| format!("Failed to read attachment ({}): {error}", path.display()))?;
-        if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
-            return Err(format!(
-                "Attachment exceeds the {} MiB limit: {}",
-                MAX_ATTACHMENT_BYTES / 1024 / 1024,
-                path.display()
-            ));
-        }
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "attachment".to_string());
-        let (media_type, is_image) = attachment_media_type(path, &bytes);
-        let modality = attachment_modality(&media_type);
+        let mut attachment = crate::session::attachment::prepare_file_attachment(path)?;
+        let modality = attachment_modality(&attachment.media_type);
         self.validate_attachment_modality(&modality)?;
-        Ok(PendingAttachment {
-            label: self.next_attachment_label(&modality),
-            name,
-            media_type,
-            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
-            is_image,
-            pasted_text: None,
-            source_path: Some(path.to_path_buf()),
-        })
+        attachment.label = self.next_attachment_label(&modality);
+        Ok(attachment)
     }
 
     /// 校验附件所需的模型输入模态，并隔离 Core 尚未实现的音视频协议。
-    fn validate_attachment_modality(
+    pub(super) fn validate_attachment_modality(
         &self,
         modality: &crate::config::model_metadata::ModelModality,
     ) -> std::result::Result<(), String> {
@@ -1326,6 +1337,7 @@ impl App {
     /// steering 等纯文本路径不携带附件，残留附件一并清除，
     /// 避免引用标签消失后附件悬挂。
     pub(crate) fn take_input(&mut self) -> Option<String> {
+        self.invalidate_attachment_job();
         let input = self.input.trim().to_string();
         self.input.clear();
         self.attachments.clear();
@@ -1341,6 +1353,9 @@ impl App {
 
     /// 取出并清空当前输入与附件；文本和附件都为空时返回 `None`。
     pub(crate) fn take_submission(&mut self) -> Option<UserSubmission> {
+        if self.async_attachments && !self.mentioned_attachments_ready {
+            return None;
+        }
         // 正文里点名了本地图片/PDF 时先把它读成附件：模型拿不到图像内容就只能
         // 退化成 OCR 或猜测，而用户写下路径的本意就是让模型看到那个文件。
         self.attach_mentioned_paths();
@@ -1357,6 +1372,7 @@ impl App {
         }
         let text = self.input.trim().to_string();
         let attachments = std::mem::take(&mut self.attachments);
+        self.invalidate_attachment_job();
         self.input.clear();
         self.refs.clear();
         self.cursor = 0;
@@ -1377,7 +1393,7 @@ impl App {
 ///
 /// 含空白的路径用引号包住，确保发送时的正文扫描仍把它当成同一条路径；优先单引号，
 /// 路径本身含单引号时改用双引号，两者都含时退回空格转义。
-fn pasted_path_display(path: &Path) -> String {
+pub(super) fn pasted_path_display(path: &Path) -> String {
     let text = path.display().to_string();
     if !text.chars().any(char::is_whitespace) {
         return text;
@@ -1396,7 +1412,7 @@ fn pasted_path_display(path: &Path) -> String {
 /// 只有独立成行的路径才自动内联文本内容：嵌在句子或命令里的路径可能只是参数或
 /// 随手提及，把整份文件附加进去会让后续每一轮请求都背上它的体积。引号、句读与
 /// 不成对的括号属于句子结构，不影响"独占一行"的判定。
-fn path_is_standalone(input: &str, span: &std::ops::Range<usize>) -> bool {
+pub(super) fn path_is_standalone(input: &str, span: &std::ops::Range<usize>) -> bool {
     let line_start = input[..span.start].rfind('\n').map_or(0, |index| index + 1);
     let line_end = input[span.end..]
         .find('\n')
