@@ -395,6 +395,22 @@ fn is_edit_diff_result(result: &ToolResult) -> bool {
     text_field(&result.content, "diff").is_some()
 }
 
+/// 从 Agent Runtime 的 `outcome` 信封里取出成员正文或失败原因。
+///
+/// 插件拿到的终态是 `{"status":"succeeded","result":{"final_text":…}}`、`{"status":"failed","error":…}`
+/// 或 `{"status":"cancelled"}`（`status` 是 tag 字段）。通用 JSON 摘要会把整个信封压成
+/// `outcome: {…}`，成员跑出的报告一行也看不到；这里只认终态形状，其余返回 `None`。
+fn outcome_body(value: &Value) -> Option<&str> {
+    let outcome = value.get("outcome")?;
+    match text_field(outcome, "status")? {
+        "succeeded" => outcome
+            .get("result")
+            .and_then(|result| text_field(result, "final_text")),
+        "failed" => text_field(outcome, "error"),
+        _ => None,
+    }
+}
+
 /// 从结构化工具结果中取出可逐行展开的正文。
 ///
 /// 优先读取编辑结果的 `diff`；`content` 覆盖普通正文，`stdout`/`stderr` 覆盖命令类。
@@ -408,6 +424,11 @@ fn result_body(result: &ToolResult) -> Option<String> {
                 if let Some(text) = text_field(&result.content, key) {
                     return Some(text.to_string());
                 }
+            }
+            // 信封式正文（成员结果、子 Agent 结果）按正文展开：预览取前若干行，
+            // 展开后看全文，与内建工具的观感一致。
+            if let Some(body) = outcome_body(&result.content) {
+                return Some(body.to_string());
             }
             let stdout = text_field(&result.content, "stdout").unwrap_or_default();
             let stderr = text_field(&result.content, "stderr").unwrap_or_default();
@@ -1638,6 +1659,14 @@ mod result_shape_tests {
     use super::*;
     use serde_json::json;
 
+    /// 取出正文行的文本；断言用，其它行型直接失败。
+    fn body_of(line: &PreviewLine) -> &str {
+        match line {
+            PreviewLine::Context { text, .. } => text,
+            other => panic!("该行不是正文行：{other:?}"),
+        }
+    }
+
     /// `read_file` 用 `N\t` 前缀编号，必须还原为行号列而不是留在正文里重复出现。
     #[test]
     fn tab_numbered_content_becomes_the_gutter() {
@@ -1875,6 +1904,95 @@ mod result_shape_tests {
         assert_eq!(texts[0], "  src/bus.rs");
         assert_eq!(texts[1], "    12 pub struct EventBus {");
         assert_eq!(texts[2], "  1041 impl EventBus {");
+    }
+
+    /// 成员结果按「预览若干行 + 展开看全文」呈现，而不是把整段报告塞进卡片。
+    #[test]
+    fn member_result_is_previewed_like_a_tool_result() {
+        let report = (1..=30)
+            .map(|line| format!("第 {line} 行审查结论"))
+            .collect::<Vec<_>>();
+        let result = ToolResult::success(
+            "c",
+            "teammate_result",
+            json!({
+                "completed": true,
+                "retired": false,
+                "outcome": {
+                    "status": "succeeded",
+                    "result": {
+                        "run_id": "run-1",
+                        "final_text": report.join("\n"),
+                        "steps_used": 4,
+                        "usage": {}
+                    }
+                }
+            }),
+        );
+
+        // 收起态：8 行预览 + 一行省略提示（可展开）。
+        let collapsed = preview_lines(None, &result, 8);
+        assert_eq!(collapsed.len(), 9);
+        // 正文行与其它文本类结果一样进号位列，展开后翻看时能对上行号。
+        assert_eq!(
+            collapsed[0],
+            PreviewLine::Context {
+                number: Some(1),
+                text: "第 1 行审查结论".into()
+            }
+        );
+        assert_eq!(body_of(&collapsed[7]), "第 8 行审查结论");
+        assert_eq!(collapsed[8], PreviewLine::Elided { hidden: 22 });
+
+        // 展开态：整段报告都进预览，不再有省略提示。
+        let expanded = preview_lines(None, &result, 40);
+        assert_eq!(expanded.len(), 30);
+        assert!(expanded.iter().all(|line| !line.is_elided()));
+
+        // 摘要行取结果首行，让收起态也知道成员回了什么。
+        assert_eq!(
+            tool_summary(None, &result).as_deref(),
+            Some("第 1 行审查结论")
+        );
+    }
+
+    /// 失败的成员结果要显示失败原因，而不是 `outcome: {…}`。
+    #[test]
+    fn failed_member_result_previews_the_error() {
+        let result = ToolResult::success(
+            "c",
+            "teammate_result",
+            json!({
+                "completed": true,
+                "retired": true,
+                "outcome": {"status": "failed", "error": "provider 返回 429：请求过于频繁"}
+            }),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        assert_eq!(
+            lines,
+            vec![PreviewLine::Context {
+                number: Some(1),
+                text: "provider 返回 429：请求过于频繁".into()
+            }]
+        );
+    }
+
+    /// 成员仍在运行时没有正文可展开，退回 JSON 摘要而不是空白卡片。
+    #[test]
+    fn running_member_result_falls_back_to_json_summary() {
+        let result = ToolResult::success(
+            "c",
+            "teammate_result",
+            json!({"completed": false, "retired": false, "outcome": null}),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        let text = body_of(&lines[0]);
+        assert!(text.contains("completed: false"), "{text}");
     }
 
     /// 整块没有行号时收起号位，条目不应白占一列缩进。

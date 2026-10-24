@@ -268,7 +268,16 @@ async fn component_runs_mailbox_dispatch_flow() {
     let member_id = spawned["member"]["id"]
         .as_str()
         .expect("spawn 应返回稳定成员地址");
-    wait_result(host.as_ref(), RUN, member_id).await;
+    let outcome = wait_result(host.as_ref(), RUN, member_id).await;
+    // TUI 依赖这个信封取出成员正文做「预览 + 展开」；形状变了会静默退化成 JSON 摘要，
+    // 因此在这里钉住成功终态的路径。
+    assert_eq!(outcome["outcome"]["status"], "succeeded", "{outcome:?}");
+    assert!(
+        outcome["outcome"]["result"]["final_text"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
+        "成员结果必须把正文放在 outcome.result.final_text：{outcome:?}"
+    );
 
     let dock = PluginHost::render_ui(
         host.as_ref(),
