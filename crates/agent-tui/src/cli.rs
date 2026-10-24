@@ -98,14 +98,14 @@ mod tests {
     /// 插件恢复命令必须按稳定层级解析，避免退化为 TUI 启动参数。
     #[test]
     fn parses_plugin_disable_recovery_command() {
-        let args = Args::try_parse_from(["lucia", "plugins", "disable", "workflow"])
+        let args = Args::try_parse_from(["lucia", "plugins", "disable", "teammate"])
             .expect("插件恢复命令应可解析");
 
         assert!(matches!(
             args.command,
             Some(Command::Plugins(PluginsArgs {
                 command: PluginsCommand::Disable { plugin_id }
-            })) if plugin_id == "workflow"
+            })) if plugin_id == "teammate"
         ));
     }
 }

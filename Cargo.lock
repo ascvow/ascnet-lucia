@@ -4084,32 +4084,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "workflow-plugin"
-version = "0.2.0"
-dependencies = [
- "agent-plugin",
- "anyhow",
- "serde",
- "serde_json",
- "unicode-width 0.2.0",
- "wit-bindgen",
-]
-
-[[package]]
-name = "workflow-plugin-smoke-tests"
-version = "0.1.0"
-dependencies = [
- "agent-core",
- "agent-plugin-host",
- "agent-runtime",
- "agent-tool",
- "anyhow",
- "async-trait",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

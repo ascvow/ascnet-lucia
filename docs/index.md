@@ -55,7 +55,6 @@ Lucia 同时提供可直接使用的终端 Agent 和可嵌入、可扩展的 Rus
 | 命令与 Dialog | `crates/agent-tui/src/native_command.rs` |
 | Agent 派生与续跑 | `examples/plugins/agent-runtime-plugin` |
 | 多 Agent 协作 | `examples/plugins/teammate-plugin` |
-| 工作流 | `examples/plugins/workflow-plugin` |
 | 结构化计划 | `examples/plugins/plan-plugin` |
 | 跨会话记忆 | `examples/plugins/memory-plugin` |
 | 对话知识库 | `examples/plugins/knowledge-plugin` |

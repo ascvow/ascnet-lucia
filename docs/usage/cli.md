@@ -106,7 +106,7 @@ lucia doctor --network
 
 ```bash
 lucia plugins list
-lucia plugins disable workflow
+lucia plugins disable teammate
 ```
 
 - `list`：读取受管理插件锁，显示插件 ID、版本、有效启用状态和 `api_version`，不加载或执行 WASM。

@@ -20,8 +20,6 @@ members = [
     "examples/plugins/agent-runtime-plugin",
     "examples/plugins/agent-runtime-plugin/smoke-tests",
     "examples/plugins/ui-showcase-plugin",
-    "examples/plugins/workflow-plugin",
-    "examples/plugins/workflow-plugin/smoke-tests",
     "examples/plugins/plan-plugin",
     "examples/plugins/plan-plugin/smoke-tests",
     "examples/plugins/memory-plugin",
