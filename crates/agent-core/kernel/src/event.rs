@@ -335,29 +335,12 @@ impl JsonlEventSink {
         Ok(())
     }
 
-    /// 以追加方式打开事件文件；文件不存在时创建。
-    fn open_append(&self) -> std::io::Result<std::fs::File> {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-    }
-}
-
-#[async_trait]
-impl EventSink for JsonlEventSink {
-    async fn record(&self, event: &AgentEvent) -> Result<()> {
-        let _guard = self.lock.lock().await;
-
+    /// 调用者先持有顺序锁；每次重新打开以继续支持应用侧日志轮转。
+    fn append_line(&self, line: &[u8]) -> Result<()> {
         self.ensure_directory()?;
-
-        // 每个事件独立打开是刻意的：文档约定由调用方在应用层轮转日志，
-        // 常驻句柄会让外部轮转后的写入落到已被移走的旧文件上。
         let mut file = match self.open_append() {
             Ok(file) => file,
             Err(_) => {
-                // 目录可能在运行期间被外部删除。缓存标志会让这里直接失败，
-                // 因此复位后重建并重试一次，保持与"每次创建目录"相同的自愈能力。
                 self.directory_ready.store(false, Ordering::Relaxed);
                 self.ensure_directory()?;
                 self.open_append().with_context(|| {
@@ -365,10 +348,41 @@ impl EventSink for JsonlEventSink {
                 })?
             }
         };
-        let line = serde_json::to_string(event).context("failed to serialize agent event")?;
-        writeln!(file, "{line}")
-            .with_context(|| format!("failed to write event jsonl: {}", self.path.display()))?;
-        Ok(())
+        file.write_all(line)
+            .with_context(|| format!("failed to write event jsonl: {}", self.path.display()))
+    }
+
+    /// 以追加方式打开事件文件；文件不存在时创建。
+    fn open_append(&self) -> std::io::Result<std::fs::File> {
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(&self.path)
+    }
+}
+
+#[async_trait]
+impl EventSink for JsonlEventSink {
+    async fn record(&self, event: &AgentEvent) -> Result<()> {
+        // 先取得顺序锁再提交，避免 blocking 池积压无限写任务；取消等待不撤销已提交写入。
+        let guard = Arc::clone(&self.lock).lock_owned().await;
+        let mut line = serde_json::to_vec(event).context("failed to serialize agent event")?;
+        line.push(b'\n');
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return self.append_line(&line);
+        };
+        let sink = self.clone();
+        runtime
+            .spawn_blocking(move || {
+                let _guard = guard;
+                sink.append_line(&line)
+            })
+            .await
+            .context("event jsonl blocking task failed")?
     }
 }
 
@@ -384,6 +398,42 @@ fn unix_timestamp_ms() -> u64 {
 mod tests {
     use super::{AgentEvent, AgentEventKind, EventSink, JsonlEventSink};
     use serde_json::json;
+
+    /// 写入完成才返回，轮转后不会继续写旧 inode。
+    #[tokio::test]
+    async fn jsonl_sink_preserves_order_and_rotation() {
+        let root = std::env::temp_dir().join(format!("lucia-jsonl-{}", uuid::Uuid::new_v4()));
+        let path = root.join("events.jsonl");
+        let sink = JsonlEventSink::new(&path);
+        for step in 0..3 {
+            sink.record(&AgentEvent::new(
+                "run",
+                AgentEventKind::TurnStarted,
+                step,
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        }
+        let data = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            data.lines()
+                .map(|line| serde_json::from_str::<AgentEvent>(line).unwrap().step)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        std::fs::rename(&path, root.join("old.jsonl")).unwrap();
+        sink.record(&AgentEvent::new(
+            "run",
+            AgentEventKind::RunFinished,
+            3,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// 事件按 JSON Lines 追加；目录被外部删除后必须自动重建而不是永久失败。
     ///

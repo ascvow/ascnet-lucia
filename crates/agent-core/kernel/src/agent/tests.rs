@@ -1474,6 +1474,44 @@ fn agent_with_script(responses: Vec<ModelResponse>) -> Agent {
     )
 }
 
+/// 已确认的快照在事件点仍与事实会话一致，steering/follow-up 不丢消息。
+#[tokio::test]
+async fn incremental_snapshot_keeps_confirmed_event_prefixes() {
+    let mut agent = agent_with_script(vec![
+        ModelResponse::tool_calls(vec![ToolCall::new("snap", "echo", json!({"value":"ok"}))]),
+        ModelResponse::text("done"),
+        ModelResponse::text("followed"),
+    ]);
+    agent.tools_mut().register(echo_tool()).unwrap();
+    agent.follow_up("continue");
+    let observer = Arc::new(StateObserver::new(agent.control()));
+    agent.set_event_sink(observer.clone());
+    let run = agent.run("start").await.unwrap();
+    for (_, state) in observer.observed.lock().unwrap().iter() {
+        let count = state.session.messages().len();
+        assert_eq!(
+            state.session,
+            Session::from_parts(
+                run.session.system().cloned(),
+                run.session.messages()[..count].to_vec()
+            )
+        );
+    }
+    assert_eq!(
+        observer
+            .state_for(AgentEventKind::ToolFinished)
+            .session
+            .messages()
+            .len(),
+        2
+    );
+    assert_eq!(
+        observer.state_for(AgentEventKind::RunFinished).session,
+        run.session
+    );
+    assert_eq!(agent.state().session, run.session);
+}
+
 /// 只返回空正文且没有工具调用的模型响应必须自动纠偏一次，不能静默结束会话。
 #[tokio::test]
 async fn empty_model_response_retries_once() {

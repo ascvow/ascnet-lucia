@@ -2,6 +2,47 @@
 
 use super::*;
 
+/// 不保存正文的序列化计数器；按整个值取整而不是按 write 分块取整。
+#[derive(Default)]
+struct ContextTokenCounter {
+    ascii: usize,
+    wide: usize,
+}
+impl std::io::Write for ContextTokenCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let wide = bytes.iter().filter(|byte| !byte.is_ascii()).count();
+        self.ascii += bytes.len() - wide;
+        self.wide += wide;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn estimate_context_json(value: &impl Serialize) -> u64 {
+    let mut counter = ContextTokenCounter::default();
+    // Core 的 Value/ToolCall 都可序列化，计数 writer 不执行 I/O。
+    let _ = serde_json::to_writer(&mut counter, value);
+    (counter.ascii.div_ceil(4) + counter.wide.div_ceil(3)) as u64
+}
+
+/// 仅由明确执行了 push_* 的确认点调用；长度检查不能替代前缀未改写的控制流保证。
+fn append_session_snapshot(snapshot: &mut Session, session: &Session, previous_len: usize) {
+    if snapshot.messages().len() != previous_len
+        || previous_len > session.messages().len()
+        || snapshot.system() != session.system()
+    {
+        *snapshot = session.clone();
+        return;
+    }
+    if previous_len == session.messages().len() {
+        return;
+    }
+    let (system, mut messages) = std::mem::take(snapshot).into_parts();
+    messages.extend_from_slice(&session.messages()[previous_len..]);
+    *snapshot = Session::from_parts(system, messages);
+}
+
 /// 为实际模型请求生成不含正文的上下文分类快照；文本按 ASCII 四字节、其他三字节估算。
 /// 多模态与不透明推理载荷无法由文本估算，单独计数；结果不作为服务商计费依据。
 fn request_context_snapshot(req: &ModelRequest) -> Value {
@@ -17,7 +58,7 @@ fn request_context_snapshot(req: &ModelRequest) -> Value {
         // 权限元数据由宿主消费，不进入模型上下文。
         *tokens.entry("tools").or_default() += estimate(&tool.name)
             + estimate(&tool.description)
-            + estimate(&tool.input_schema.to_string());
+            + estimate_context_json(&tool.input_schema);
     }
     for message in &req.messages {
         for block in &message.content {
@@ -32,10 +73,14 @@ fn request_context_snapshot(req: &ModelRequest) -> Value {
                     },
                     estimate(text),
                 ),
-                ContentBlock::ToolCall { call } => ("calls", estimate(&json!(call).to_string())),
-                ContentBlock::ToolResult { result } => {
-                    ("results", estimate(&result.content_text()))
-                }
+                ContentBlock::ToolCall { call } => ("calls", estimate_context_json(call)),
+                ContentBlock::ToolResult { result } => (
+                    "results",
+                    result
+                        .content
+                        .as_str()
+                        .map_or_else(|| estimate_context_json(&result.content), estimate),
+                ),
                 ContentBlock::Thinking {
                     thinking,
                     signature,
@@ -746,15 +791,16 @@ impl Agent {
                 tokio::pin!(cancel_notified);
                 if self.take_cancelled() {
                     drop(model_stream);
-                    let mut streamed_text = String::new();
                     self.update_state(|state| {
-                        streamed_text = std::mem::take(&mut state.streamed_text)
+                        let streamed_text = std::mem::take(&mut state.streamed_text);
+                        if !streamed_text.is_empty() {
+                            let previous_len = session.messages().len();
+                            session.push_assistant_blocks(vec![crate::model::ContentBlock::Text {
+                                text: streamed_text,
+                            }]);
+                            append_session_snapshot(&mut state.session, &session, previous_len);
+                        }
                     });
-                    if !streamed_text.is_empty() {
-                        session.push_assistant_blocks(vec![crate::model::ContentBlock::Text {
-                            text: streamed_text,
-                        }]);
-                    }
                     return self
                         .finish_cancelled(&run_id, step, step + 1, total_usage, session)
                         .await;
@@ -809,11 +855,12 @@ impl Agent {
             let empty_response = response_text.trim().is_empty() && tool_calls.is_empty();
             let usage = response.usage.clone();
             let provider_billing = response.billing.clone();
+            let previous_len = session.messages().len();
             if !empty_response {
                 session.push_assistant_blocks(response.content.clone());
             }
             self.update_state(|state| {
-                state.session = session.clone();
+                append_session_snapshot(&mut state.session, &session, previous_len);
                 state.streamed_text.clear();
                 state.tool_calls = tool_calls
                     .iter()
@@ -917,8 +964,11 @@ impl Agent {
                 if let Some((kind, message)) = injected {
                     self.emit(&run_id, kind, step, json!({ "text_len": message.len() }))
                         .await?;
+                    let previous_len = session.messages().len();
                     session.push_user(message);
-                    self.update_state(|state| state.session = session.clone());
+                    self.update_state(|state| {
+                        append_session_snapshot(&mut state.session, &session, previous_len)
+                    });
                     step += 1;
                     steps_since_user_input = 0;
                     continue;
@@ -1067,8 +1117,11 @@ impl Agent {
                 }
                 index += 1;
             }
+            let previous_len = session.messages().len();
             session.push_tool_results(results);
-            self.update_state(|state| state.session = session.clone());
+            self.update_state(|state| {
+                append_session_snapshot(&mut state.session, &session, previous_len)
+            });
 
             if run_cancelled {
                 return self
@@ -1084,8 +1137,11 @@ impl Agent {
                     json!({ "text_len": message.len() }),
                 )
                 .await?;
+                let previous_len = session.messages().len();
                 session.push_user(message);
-                self.update_state(|state| state.session = session.clone());
+                self.update_state(|state| {
+                    append_session_snapshot(&mut state.session, &session, previous_len)
+                });
                 steps_since_user_input = 0;
             } else {
                 steps_since_user_input += 1;
@@ -1838,6 +1894,46 @@ mod one_time_guidance_tests {
         assert_eq!(snapshot["attachments"], 1);
         assert_eq!(snapshot["messages"], 2);
         assert!(!snapshot.to_string().contains("sensitive-base64"));
+    }
+
+    /// 直接计数与原先 JSON 文本化估算一致，包括 Unicode、转义和数值。
+    #[test]
+    fn json_counter_matches_text_estimate() {
+        for value in [
+            serde_json::json!({"中":"é🙂\\\"\n"}),
+            serde_json::json!([true, 1.25, null]),
+            serde_json::json!("a"),
+        ] {
+            let text = value.to_string();
+            let wide = text.bytes().filter(|byte| !byte.is_ascii()).count();
+            assert_eq!(
+                super::estimate_context_json(&value),
+                ((text.len() - wide).div_ceil(4) + wide.div_ceil(3)) as u64
+            );
+        }
+    }
+
+    /// 明确追加时保留旧正文分配；基线不一致时回退完整同步。
+    #[test]
+    fn incremental_snapshot_reuses_prefix() {
+        use crate::{model::ContentBlock, Session};
+        let mut source = Session::new();
+        source.push_user("history");
+        let mut snapshot = source.clone();
+        let before = match &snapshot.messages()[0].content[0] {
+            ContentBlock::Text { text } => text.as_ptr(),
+            _ => unreachable!(),
+        };
+        source.push_assistant_text("answer");
+        super::append_session_snapshot(&mut snapshot, &source, 1);
+        assert_eq!(source, snapshot);
+        let after = match &snapshot.messages()[0].content[0] {
+            ContentBlock::Text { text } => text.as_ptr(),
+            _ => unreachable!(),
+        };
+        assert_eq!(before, after);
+        super::append_session_snapshot(&mut snapshot, &Session::new(), 2);
+        assert!(snapshot.messages().is_empty());
     }
 
     /// 扩展文本不得通过闭合标签或换行伪造 Core 提供的可信结构边界。
