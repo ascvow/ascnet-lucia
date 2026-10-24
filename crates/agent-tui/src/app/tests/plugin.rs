@@ -862,6 +862,49 @@ fn composer_shelf_obeys_input_priority() {
     assert!(app.visible_composer_panels().is_empty());
 }
 
+/// 常驻架靠自己的帧显隐：没有内容行时不占布局高度，隐藏时连 Tab 轮转都不参与。
+///
+/// 插件用这条规则实现「没有内容就自动消失」「聚焦才展开」，宿主只负责让高度跟着内容
+/// 走，因此这里锁的是布局契约本身。
+#[test]
+#[cfg(feature = "plugins")]
+fn composer_shelf_without_content_lines_takes_no_space() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let shelf = test_plugin_view(UiPlacement::ComposerShelf, "Team");
+    app.plugin_views.push(shelf);
+    // 一行内容 = 一行顶部分隔线 + 一行正文。
+    assert_eq!(app.composer_panel_height_at(0), 2);
+
+    // 折叠到零行：宿主收回全部高度，输入区不会再被空架子顶走。
+    app.plugin_views[0]
+        .frame
+        .as_mut()
+        .expect("测试视图应包含帧")
+        .lines
+        .clear();
+    assert_eq!(app.composer_panel_height_at(0), 0);
+    assert_eq!(app.composer_panel_height(), 0);
+
+    // 帧整体隐藏时视图不参与布局；聚焦中的视图消失后焦点也必须还给主输入。
+    let frame = app.plugin_views[0]
+        .frame
+        .as_mut()
+        .expect("测试视图应包含帧");
+    frame.lines = vec![UiLine {
+        spans: vec![UiSpan {
+            text: "Team".into(),
+            style: UiStyle::default(),
+        }],
+    }];
+    app.plugin_focus = Some(0);
+    let mut hidden = frame.clone();
+    hidden.visible = false;
+    app.update_plugin_frame("test-plugin", None, hidden);
+    assert!(app.visible_composer_panels().is_empty());
+    assert_eq!(app.plugin_focus, None);
+}
+
 /// 常驻架获得焦点后接管方向键与 Enter，点击成员行给出视图内的相对行号。
 ///
 /// 成员架是插件的通用外形：宿主只负责把按键和相对坐标交给它，具体是"选中成员"
