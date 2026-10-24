@@ -71,11 +71,14 @@ fn open_cross_process_lock_file_blocking(path: &Path) -> Result<std::fs::File, S
         Err(source) => return Err(io_error("检查会话存储锁文件", path, source)),
     }
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
         .open(path)
         .map_err(|source| io_error("打开会话存储锁文件", path, source))?;
     let path_metadata = std::fs::symlink_metadata(path)

@@ -178,7 +178,7 @@ impl FileSessionStore {
         ensure_safe_root(self.root()).await?;
         let destination = self.summary_index_path();
         safe_regular_file_metadata(&destination).await?;
-        let data = serde_json::to_vec_pretty(&StoredSessionSummaryIndex {
+        let data = serde_json::to_vec(&StoredSessionSummaryIndex {
             schema_version: CURRENT_SUMMARY_INDEX_SCHEMA_VERSION,
             summaries: summaries.to_vec(),
         })?;
@@ -189,9 +189,11 @@ impl FileSessionStore {
         ));
 
         let result = async {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options
                 .open(&temporary)
                 .await
                 .map_err(|source| io_error("创建会话摘要索引临时文件", &temporary, source))?;

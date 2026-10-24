@@ -56,6 +56,59 @@ fn file_store_cross_process_lock_holder_helper() {
     file.unlock().expect("子进程应该可以释放跨进程锁");
 }
 
+/// 新存储权限与紧凑写入不改变旧 pretty JSON 读取及 CAS 语义。
+#[cfg(unix)]
+#[tokio::test]
+async fn private_files_remain_compatible_with_legacy_json() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = test_directory();
+    let store = FileSessionStore::open(&root).await.unwrap();
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&root), 0o700);
+    let saved = store.save(record("private"), None).await.unwrap();
+    assert_eq!(mode(&store.record_path(&saved.id)), 0o600);
+    assert_eq!(mode(&store.summary_index_path()), 0o600);
+    assert_eq!(mode(&store.lock_path()), 0o600);
+    let path = store.record_path(&saved.id);
+    fs::write(&path, serde_json::to_vec_pretty(&saved).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(store.load(&saved.id).await.unwrap(), Some(saved.clone()));
+    let next = store
+        .save(saved.clone(), Some(saved.revision))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read(path).await.unwrap(),
+        serde_json::to_vec(&next).unwrap()
+    );
+    assert!(matches!(
+        store.save(saved, Some(1)).await,
+        Err(SessionStoreError::RevisionConflict { .. })
+    ));
+    remove_test_directory(&root).await;
+}
+
+/// 已有调用方目录与其无关文件不应被存储初始化递归 chmod。
+#[cfg(unix)]
+#[tokio::test]
+async fn opening_existing_root_does_not_change_unrelated_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = test_directory();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let store = FileSessionStore::open(&root).await.unwrap();
+    assert_eq!(
+        std::fs::metadata(store.root())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    remove_test_directory(&root).await;
+}
+
 #[test]
 fn generated_session_ids_are_valid_and_unique() {
     let first = SessionId::generate();

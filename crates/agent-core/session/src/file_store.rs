@@ -163,15 +163,17 @@ impl FileSessionStore {
         ensure_safe_root(self.root()).await?;
         let destination = self.record_path(&record.id);
         safe_regular_file_metadata(&destination).await?;
-        let data = serde_json::to_vec_pretty(record)?;
+        let data = serde_json::to_vec(record)?;
         let temporary = self
             .root
             .join(format!(".{}.{}.tmp", record.id, Uuid::new_v4().simple()));
 
         let result = async {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options
                 .open(&temporary)
                 .await
                 .map_err(|source| io_error("创建会话临时文件", &temporary, source))?;
@@ -288,9 +290,22 @@ async fn ensure_safe_root(root: &Path) -> Result<(), SessionStoreError> {
         Err(source) => return Err(io_error("检查会话存储目录", root, source)),
     }
 
-    fs::create_dir_all(root)
-        .await
-        .map_err(|source| io_error("创建会话存储目录", root, source))?;
+    let create_root = root.to_path_buf();
+    let error_root = create_root.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&create_root)
+            .map_err(|source| io_error("创建会话存储目录", &create_root, source))
+    })
+    .await
+    .map_err(|source| blocking_task_error("创建会话存储目录", error_root, source))??;
     let metadata = fs::symlink_metadata(root)
         .await
         .map_err(|source| io_error("检查新建会话存储目录", root, source))?;
