@@ -109,6 +109,41 @@ pub fn transform_messages_for_route(
     transform_messages_for_target(messages, Some((provider, model)))
 }
 
+/// 已拥有消息时，只有确认无需任何清洗的普通路径直接移动；其他情况复用原转换规则。
+/// 不绕过私有推理隔离、孤立调用补全或 ID 规范化。
+pub(crate) fn transform_owned_messages_for_route(
+    messages: Vec<ModelMessage>,
+    provider: &str,
+    model: &str,
+) -> Vec<ModelMessage> {
+    let result_ids: HashSet<&str> = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { result } => Some(result.call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let unchanged = messages.iter().all(|message| {
+        !(message.role == MessageRole::Assistant && message.content.is_empty())
+            && message.content.iter().all(|block| match block {
+                ContentBlock::Thinking { .. } => false,
+                ContentBlock::ToolCall { call } => {
+                    call.id.len() <= MAX_TOOL_CALL_ID_LEN
+                        && (message.role != MessageRole::Assistant
+                            || result_ids.contains(call.id.as_str()))
+                }
+                ContentBlock::ToolResult { result } => result.call_id.len() <= MAX_TOOL_CALL_ID_LEN,
+                _ => true,
+            })
+    });
+    if unchanged {
+        messages
+    } else {
+        transform_messages_for_route(&messages, provider, model)
+    }
+}
+
 /// 执行共享消息清洗；目标逻辑路由只做私有推理块的第一层候选过滤。
 fn transform_messages_for_target(
     messages: &[ModelMessage],
@@ -259,6 +294,48 @@ fn transform_messages_for_target(
 mod tests {
     use super::*;
     use agent_tool::{ToolCall, ToolResult};
+
+    /// 有所有权的快路与旧转换等价，正常文本不重新分配，危险形态仍回退正式规则。
+    #[test]
+    fn owned_transform_preserves_rules_and_reuses_plain_text() {
+        let plain = vec![ModelMessage::text(MessageRole::User, "long history")];
+        let pointer = match &plain[0].content[0] {
+            ContentBlock::Text { text } => text.as_ptr(),
+            _ => unreachable!(),
+        };
+        let moved = transform_owned_messages_for_route(plain, "p", "m");
+        let moved_pointer = match &moved[0].content[0] {
+            ContentBlock::Text { text } => text.as_ptr(),
+            _ => unreachable!(),
+        };
+        assert_eq!(pointer, moved_pointer);
+        for messages in [
+            moved,
+            vec![ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![],
+            }],
+            vec![ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    call: ToolCall::new("x".repeat(100), "t", serde_json::json!({})),
+                }],
+            }],
+            vec![ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Thinking {
+                    thinking: "private".into(),
+                    signature: Some("foreign".into()),
+                }],
+            }],
+        ] {
+            let expected = transform_messages_for_route(&messages, "p", "m");
+            assert_eq!(
+                expected,
+                transform_owned_messages_for_route(messages, "p", "m")
+            );
+        }
+    }
 
     /// 读取测试消息中指定位置的 tool call ID，并在结构不符合预期时立即失败。
     fn tool_call_id(message: &ModelMessage, index: usize) -> &str {

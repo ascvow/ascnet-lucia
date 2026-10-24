@@ -126,13 +126,14 @@ fn encode_core_request(
     ))
 }
 
-fn decode_core_context(context: LoadedContext) -> Result<CoreLoadedContext> {
+fn decode_core_context(context: &LoadedContext) -> Result<CoreLoadedContext> {
+    use serde::Deserialize;
     Ok(CoreLoadedContext {
-        system: context.system,
+        system: context.system.clone(),
         messages: context
             .messages
-            .into_iter()
-            .map(serde_json::from_value)
+            .iter()
+            .map(agent_core::model::ModelMessage::deserialize)
             .collect::<serde_json::Result<Vec<_>>>()
             .context("解码原生压缩上下文消息失败")?,
     })
@@ -393,7 +394,18 @@ impl NativeContextLoader {
     }
 
     /// 提交本轮压缩结果；模型调用期间不持有缓存锁。
+    #[cfg(test)]
     fn commit_cache(&self, plan: CachePlan, outcome: &CompressionOutcome) -> Result<()> {
+        self.commit_cache_messages(plan, outcome, outcome.context.messages.clone())
+    }
+
+    /// 正式调用移交已解码结果的 JSON 所有权，避免为回填缓存深克隆整棵树。
+    fn commit_cache_messages(
+        &self,
+        plan: CachePlan,
+        outcome: &CompressionOutcome,
+        messages: Vec<Value>,
+    ) -> Result<()> {
         // 先在锁外构造新缓存；路由比对仍在提交锁内，旧请求不能覆盖新配置。
         let summary_model = Arc::clone(plan.summary_model());
         let next = match plan {
@@ -416,7 +428,7 @@ impl NativeContextLoader {
                 source_messages_digest: source_messages_digest
                     .ok_or_else(|| anyhow!("原生上下文压缩缓存缺少原始消息摘要"))?,
                 micro_cleared: outcome.micro_cleared,
-                loaded_messages: outcome.context.messages.clone(),
+                loaded_messages: messages,
             })),
             CachePlan::Automatic { .. } => None,
         };
@@ -559,7 +571,7 @@ impl ContextLoader for NativeContextLoader {
         let step = effective.step;
         let manual = effective.user_initiated;
         let reuse_original_messages = plan.can_reuse_original_messages();
-        let outcome = compress_context_with_tokens(
+        let mut outcome = compress_context_with_tokens(
             effective,
             manual,
             budget,
@@ -568,16 +580,19 @@ impl ContextLoader for NativeContextLoader {
             plan.estimated_tokens(),
         )
         .await?;
-        self.commit_cache(plan, &outcome)?;
-        self.emit_event(&run_id, step, outcome.event.as_ref())
-            .await?;
-        if reuse_original_messages && outcome.event.is_none() {
-            return Ok(CoreLoadedContext {
+        let decoded = if reuse_original_messages && outcome.event.is_none() {
+            CoreLoadedContext {
                 system: original.system,
                 messages: original.messages,
-            });
-        }
-        decode_core_context(outcome.context)
+            }
+        } else {
+            decode_core_context(&outcome.context)?
+        };
+        let cache_messages = std::mem::take(&mut outcome.context.messages);
+        self.commit_cache_messages(plan, &outcome, cache_messages)?;
+        self.emit_event(&run_id, step, outcome.event.as_ref())
+            .await?;
+        Ok(decoded)
     }
 }
 

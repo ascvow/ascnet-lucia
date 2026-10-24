@@ -668,8 +668,8 @@ impl Agent {
             let req = ModelRequest {
                 model: route.model.clone(),
                 system: loaded_context.system,
-                messages: crate::model::transform::transform_messages_for_route(
-                    &loaded_context.messages,
+                messages: crate::model::transform::transform_owned_messages_for_route(
+                    loaded_context.messages,
                     &route.provider,
                     &route.model,
                 ),
