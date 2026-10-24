@@ -35,7 +35,7 @@ impl Tool for ListDirectoryTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "list_directory",
-            "List the direct children of a directory without recursing, returning each entry's name, type, and file size. Use this to inspect a known directory. To locate files recursively by content, use search_files instead.",
+            "List the direct children of a directory without recursing, returning each entry's name, type, and file size. Directories above 4096 entries are rejected, not truncated. To locate files recursively by content, use search_files instead.",
             json!({
                 "type": "object",
                 "properties": {
@@ -75,7 +75,19 @@ impl Tool for ListDirectoryTool {
         };
 
         let mut entries = Vec::new();
-        while let Ok(Some(entry)) = dir.next_entry().await {
+        loop {
+            let entry = match dir.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => return Ok(ToolResult::error(call.id, call.name, error.to_string())),
+            };
+            if entries.len() >= 4096 {
+                return Ok(ToolResult::error(
+                    call.id,
+                    call.name,
+                    "directory exceeds 4096 entries; no partial listing returned",
+                ));
+            }
             let name = entry.file_name().to_string_lossy().to_string();
             let (kind, size) = match entry.metadata().await {
                 Ok(meta) => {

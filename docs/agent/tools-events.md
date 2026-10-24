@@ -42,7 +42,17 @@ agent.set_tools(tools);
 
 Core 不知道监听者由原生对象还是 WASM component 实现。使用一次性审批指导时，可信应用 `EventSink` 接收完整展示原因，`core.tool.result` 与 `core.agent.event` 只接收脱敏工具结果，防止无关监听者把原因重新注入后续模型上下文。
 
+## 原生读取边界
+
+`read_file` 只接受常规 UTF-8 文件，文件最多 8 MiB、单行最多 256 KiB、单页 JSON 最多 1 MiB；
+超限返回错误，不返回不准确的总行数。`list_directory` 最多 4,096 项，超限不返回部分成功列表。
+这些文件工具的路径保护不是 Shell 沙箱；授权 Shell 或 `process_exec` 等于授予原生进程信任。
+
 ## 模型流的资源边界
+
+内置 HTTP provider 保留 TLS 验证，连接超时 30 秒、读取空闲超时 120 秒，不自动跟随重定向。
+单次 JSON/SSE 传输累计最多 32 MiB；HTTP 错误只读取最多 2 KiB 前缀并显示最多 500 字符。
+没有给整次 Agent 任务增加总超时。非本机 `http://` 端点会明文传输凭证和内容，应由用户改用 HTTPS。
 
 `ModelEventSender::send` 保持同步接口。单个流尚未消费的事件最多 4,096 项、计量正文最多
 32 MiB；超过任一限额后发送明确的终止错误并取消已绑定的网络任务，不静默丢弃增量或工具参数。
@@ -55,7 +65,8 @@ Core 不知道监听者由原生对象还是 WASM component 实现。使用一�
 
 - `NoopEventSink`：丢弃事件。
 - `InMemoryEventSink`：测试和嵌入式读取。
-- `JsonlEventSink`：按行追加 JSON。
+- `JsonlEventSink`：按行追加 JSON；Tokio 内在取得顺序锁后交给阻塞线程，返回前完成该行写入，
+  取消等待不撤销已提交写入；每次重新打开以兼容应用侧轮转。Unix 新文件为 0600，不提供 fsync 保证。
 - `CompositeEventSink`：按顺序转发给多个 sink。
 
 ```rust
