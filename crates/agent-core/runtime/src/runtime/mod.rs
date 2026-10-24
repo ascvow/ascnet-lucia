@@ -434,7 +434,7 @@ impl AgentRuntime {
             principal_usage,
             source.template.clone(),
             source.permissions.clone(),
-            source.run_options.clone(),
+            source.run_options(),
             AgentStatus::Queued,
         );
         agents.insert(id.clone(), entry.clone());
@@ -498,6 +498,10 @@ impl AgentRuntime {
             return Err(AgentRuntimeError::NotRunnable(target.clone()));
         }
         loop {
+            // 回收会释放结果，此时不会再有新的终态通知；必须先于等待判断，避免永久挂起。
+            if entry.is_collected() {
+                return Err(AgentRuntimeError::AgentCollected(target.clone()));
+            }
             let notified = entry.finished.notified();
             if let Some(outcome) = entry.outcome() {
                 return Ok(outcome);
@@ -516,6 +520,28 @@ impl AgentRuntime {
             .ensure_manageable(principal, caller, target)
             .await?;
         Ok(self.inner.entry(target).await?.subscribe())
+    }
+
+    async fn collect_for(
+        &self,
+        principal: &RuntimePrincipal,
+        caller: &AgentId,
+        target: &AgentId,
+    ) -> RuntimeResult<bool> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.inner
+            .ensure_manageable(principal, caller, target)
+            .await?;
+        let entry = self.inner.entry(target).await?;
+        if !entry.status().is_terminal() {
+            return Err(AgentRuntimeError::AgentStillActive(target.clone()));
+        }
+        if !entry.collect_resources() {
+            return Ok(false);
+        }
+        // 只有首次回收才归还名额，避免重复记账把 owner 的累计用量减成负数。
+        RuntimeInner::release_principal_agent_reservation(&entry.principal_usage);
+        Ok(true)
     }
 
     async fn steer_for(
@@ -614,6 +640,12 @@ impl AgentRuntimeApi for BoundAgentRuntime {
     async fn subscribe(&self, target: &AgentId) -> RuntimeResult<AgentEventStream> {
         self.runtime
             .subscribe_for(&self.principal, &self.identity, target)
+            .await
+    }
+
+    async fn collect(&self, target: &AgentId) -> RuntimeResult<bool> {
+        self.runtime
+            .collect_for(&self.principal, &self.identity, target)
             .await
     }
 }
@@ -967,7 +999,8 @@ struct AgentEntry {
     principal_usage: Arc<Mutex<PrincipalUsage>>,
     template: AgentTemplate,
     permissions: AgentPermissions,
-    run_options: AgentOptionsPatch,
+    /// 本次运行使用的选项覆盖；回收后清空以释放可能较大的 provider options。
+    run_options: RwLock<AgentOptionsPatch>,
     status: RwLock<AgentStatus>,
     outcome: RwLock<Option<AgentOutcome>>,
     session: RwLock<Option<Session>>,
@@ -978,6 +1011,8 @@ struct AgentEntry {
     control: Mutex<Option<AgentControl>>,
     pending_steering: Mutex<VecDeque<String>>,
     child_count: AtomicUsize,
+    /// 是否已由 owner 回收；回收后会话、结果与事件历史都已释放，且只执行一次。
+    collected: AtomicBool,
     /// 当前事件订阅者；运行任务通过 [`SubscriberEventSink`] 共享此列表，
     /// 终态时清空以结束所有订阅流。
     subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<AgentEvent>>>>,
@@ -1008,7 +1043,7 @@ impl AgentEntry {
             principal_usage,
             template,
             permissions,
-            run_options,
+            run_options: RwLock::new(run_options),
             status: RwLock::new(status),
             outcome: RwLock::new(None),
             session: RwLock::new(None),
@@ -1018,6 +1053,7 @@ impl AgentEntry {
             control: Mutex::new(None),
             pending_steering: Mutex::new(VecDeque::new()),
             child_count: AtomicUsize::new(0),
+            collected: AtomicBool::new(false),
             subscribers: Arc::new(Mutex::new(Vec::new())),
             event_history: Arc::new(Mutex::new(VecDeque::new())),
         })
@@ -1056,6 +1092,50 @@ impl AgentEntry {
 
     fn outcome(&self) -> Option<AgentOutcome> {
         self.outcome.read().expect("Agent 结果锁不应中毒").clone()
+    }
+
+    /// 返回回收后仍应保留的选项覆盖，未回收时返回当前运行选项。
+    fn run_options(&self) -> AgentOptionsPatch {
+        self.run_options
+            .read()
+            .expect("Agent 运行选项锁不应中毒")
+            .clone()
+    }
+
+    /// 释放终态 Agent 的会话、结果与事件历史，并把可复用名额让回 owner。
+    ///
+    /// 只接受终态且尚未回收的条目；重复回收返回 `false`，调用方据此避免重复记账。
+    /// 条目不从注册表移除：它是后续派生链的谱系锚点，`ensure_manageable` 依赖父指针
+    /// 追溯 controller。释放后条目只剩身份与轻量权限，不再持有会话正文。
+    fn collect_resources(&self) -> bool {
+        if !self.status().is_terminal() {
+            return false;
+        }
+        if self.collected.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        *self.session.write().expect("Agent 私有会话锁不应中毒") = None;
+        *self.outcome.write().expect("Agent 结果锁不应中毒") = None;
+        *self.run_options.write().expect("Agent 运行选项锁不应中毒") = AgentOptionsPatch::default();
+        self.pending_steering
+            .lock()
+            .expect("Agent 待处理消息锁不应中毒")
+            .clear();
+        self.event_history
+            .lock()
+            .expect("Agent 事件历史锁不应中毒")
+            .clear();
+        // 丢弃订阅发送端，让仍在等待的观察者立即结束，而不是停留在旧历史里。
+        self.subscribers
+            .lock()
+            .expect("事件订阅者锁不应中毒")
+            .clear();
+        true
+    }
+
+    /// 判断条目是否已回收。
+    fn is_collected(&self) -> bool {
+        self.collected.load(Ordering::Acquire)
     }
 
     fn continuation_session(&self) -> Option<Session> {
@@ -1244,7 +1324,7 @@ async fn run_agent_task(
     let (mut agent, _) = match entry.template.instantiate(
         &entry.permissions,
         &AgentDeriveConfig {
-            options: entry.run_options.clone(),
+            options: entry.run_options(),
             permissions: AgentPermissions::default(),
         },
     ) {

@@ -79,6 +79,7 @@ Host 注册 profile
   -> provision 得到 controller 与绑定 API
   -> AgentRuntimeApi::spawn / continue_agent
   -> status / result / subscribe / cancel
+  -> collect（终态后释放会话与累计名额）
 ```
 
 ## 继续阅读

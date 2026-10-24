@@ -122,6 +122,7 @@ pub(crate) trait AgentCapabilityChecks {
     fn require_spawn(&self) -> Result<()>;
     fn require_observe(&self) -> Result<()>;
     fn require_cancel(&self) -> Result<()>;
+    fn require_collect(&self) -> Result<()>;
 }
 
 impl CapabilityState {
@@ -346,6 +347,18 @@ impl CapabilityState {
                     .await
                     .map_err(|error| anyhow!(error.to_string()))?;
                 Ok(json!(cancelled))
+            }
+            "collect" => {
+                permissions.require_collect()?;
+                let target = parse_agent_target(request.request)?;
+                let collected = binding
+                    .api
+                    .collect(&target)
+                    .await
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                // 目标已回收，缓存的订阅流不再有意义；一并释放以免长期占用内存。
+                binding.event_streams.lock().await.remove(&target);
+                Ok(json!(collected))
             }
             operation => Err(anyhow!("未知 Agent Runtime 操作：`{operation}`")),
         }

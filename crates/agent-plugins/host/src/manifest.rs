@@ -366,6 +366,54 @@ mod tests {
         assert!(!manifest.capabilities.agent.allows_profile("admin"));
     }
 
+    /// collect 与其它 Agent Runtime 权限一样从 manifest 解析，且默认关闭。
+    ///
+    /// 回收会释放目标的私有会话与终态结果，因此必须是显式授权；旧 manifest 未声明
+    /// 该字段时保持关闭，不因升级而获得新权限。
+    #[test]
+    fn agent_collect_permission_parses_and_defaults_off() {
+        let manifest: PluginManifest = toml::from_str(
+            r#"
+                [plugin]
+                id = "teammate"
+                name = "Teammate"
+                version = "1.0.0"
+                api_version = "0.10.0"
+                wasm = "teammate.wasm"
+
+                [capabilities.agent]
+                spawn = true
+                collect = true
+                profiles = ["worker"]
+            "#,
+        )
+        .expect("含 collect 的 manifest 应可解析");
+        manifest.validate().expect("collect 不影响 profile 校验");
+        assert!(manifest.capabilities.agent.collect);
+
+        let legacy: PluginManifest = toml::from_str(
+            r#"
+                [plugin]
+                id = "legacy"
+                name = "Legacy"
+                version = "1.0.0"
+                api_version = "0.10.0"
+                wasm = "legacy.wasm"
+
+                [capabilities.agent]
+                spawn = true
+                observe = true
+                cancel = true
+                profiles = ["worker"]
+            "#,
+        )
+        .expect("旧 manifest 应保持兼容");
+        assert!(
+            !legacy.capabilities.agent.collect,
+            "未声明 collect 时必须保持关闭"
+        );
+    }
+
     /// Host 必须从 manifest 绑定工具 scope，未授权工具降级为 unknown，自报不一致直接拒绝。
     #[test]
     fn manifest_tool_scopes_are_authoritative() {
@@ -1423,6 +1471,11 @@ pub struct AgentCapabilitySection {
     /// 允许级联取消 controller 的后代任务。
     #[serde(default)]
     pub cancel: bool,
+    /// 允许回收已终态后代任务的 Runtime 资源并归还累计名额。
+    ///
+    /// 该能力会释放目标的私有会话与终态结果，因此回收后不能续跑，也不能再读取结果。
+    #[serde(default)]
+    pub collect: bool,
     /// 允许 Guest 在 spawn 请求中引用的派生策略名称。
     #[serde(default)]
     pub profiles: Vec<String>,
@@ -1431,7 +1484,7 @@ pub struct AgentCapabilitySection {
 impl AgentCapabilitySection {
     /// 判断插件是否请求了任何 Agent Runtime 权限。
     pub fn is_requested(&self) -> bool {
-        self.spawn || self.observe || self.cancel || !self.profiles.is_empty()
+        self.spawn || self.observe || self.cancel || self.collect || !self.profiles.is_empty()
     }
 
     /// 判断 manifest 是否允许指定 spawn profile。

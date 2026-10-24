@@ -166,6 +166,7 @@ Host 对单次 `recv` 的等待有硬上限，插件需要更长等待时应循�
 | `agent_status(target)` | 查询 controller 或其后代的状态、谱系和有效权限 |
 | `agent_result(target)` | 非阻塞读取终态结果；未完成时返回 `None` |
 | `cancel_agent(target)` | 幂等、级联取消指定后代 |
+| `collect_agent(target)` | 回收已终态后代的会话与名额；返回是否本次完成回收 |
 
 Guest 的 `AgentSpawnRequest` 只包含 profile 名称和任务输入；`AgentContinueRequest` 只包含目标 ID 和新增输入。模型、provider、工具权限与派生参数由应用注册的 profile 或目标运行决定，插件不能提交 owner、parent、sender、原始 Session、API key 或 provider options。
 

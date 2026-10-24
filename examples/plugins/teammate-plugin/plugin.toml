@@ -10,6 +10,7 @@ description = "使用 Agent Runtime 句柄管理成员，并提供有界、可�
 spawn = true
 observe = true
 cancel = true
+collect = true
 profiles = ["worker"]
 
 [capabilities.tool_scopes]

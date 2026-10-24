@@ -197,6 +197,10 @@ impl AgentRuntimeApi for MockAgentRuntime {
     async fn subscribe(&self, _target: &AgentId) -> RuntimeResult<agent_runtime::AgentEventStream> {
         Ok(agent_runtime::AgentEventStream::empty())
     }
+
+    async fn collect(&self, _target: &AgentId) -> RuntimeResult<bool> {
+        Ok(true)
+    }
 }
 
 struct NoopProvisioner;
@@ -266,6 +270,7 @@ fn agent_runtime_fixture() -> (
             spawn: true,
             observe: true,
             cancel: true,
+            collect: true,
             profiles: vec!["reviewer".into()],
         },
         binding,
@@ -1311,6 +1316,31 @@ async fn agent_runtime_dispatches_short_operations() {
     .await
     .expect("取消派生 Agent");
     assert_eq!(cancelled, json!(true));
+}
+
+/// collect 是独立的 manifest 权限：未声明时必须在调用 Runtime 前被拒绝。
+#[tokio::test]
+async fn agent_runtime_requires_collect_permission() {
+    let (mut permissions, binding, _, child) = agent_runtime_fixture();
+    permissions.collect = false;
+    let request = json!({
+        "operation": "collect",
+        "request": {"target": child.to_string()},
+    })
+    .to_string();
+    let error =
+        CapabilityState::call_agent_runtime_with(permissions, Some(binding.clone()), &request)
+            .await
+            .expect_err("未授权 collect 必须失败");
+    assert!(error.to_string().contains("capabilities.agent.collect"));
+    assert!(is_capability_denied(&error));
+
+    // 声明权限后同一请求应到达 Runtime 并返回回收结果。
+    let (permissions, _, _, _) = agent_runtime_fixture();
+    let collected = CapabilityState::call_agent_runtime_with(permissions, Some(binding), &request)
+        .await
+        .expect("授权后应执行回收");
+    assert_eq!(collected, json!(true));
 }
 
 /// Manifest 未授权的 profile 必须在调用 Runtime 前被 Host 拒绝。

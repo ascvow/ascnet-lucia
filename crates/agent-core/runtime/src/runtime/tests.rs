@@ -557,6 +557,157 @@ async fn continue_agent_reuses_private_session_and_preserves_permissions() {
     ));
 }
 
+/// 回收终态 Agent 必须归还 principal 名额，使反复投胎不受累计数量限制。
+///
+/// 队员是长期身份但每次派活都是新的执行实例；只要完成后回收，投胎次数就不应被
+/// 128 个累计名额卡住。
+#[tokio::test]
+async fn collecting_terminal_agents_frees_principal_slots() {
+    // 只给 controller 与一个活跃成员留名额：不回收时第二次投胎就会被拒绝。
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_agents_per_principal: 2,
+        ..RuntimeLimits::default()
+    })
+    .expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(Arc::new(FixedModel), "fixed", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+
+    for round in 0..16 {
+        let member = api
+            .spawn(AgentSpawnRequest::new(format!("第 {round} 次投胎")))
+            .await
+            .expect("回收后应能继续派生新成员");
+        api.wait(&member.id).await.expect("等待成员完成");
+        assert!(
+            api.collect(&member.id).await.expect("回收终态成员"),
+            "首次回收应成功"
+        );
+        assert!(
+            !api.collect(&member.id).await.expect("重复回收"),
+            "重复回收应返回 false"
+        );
+    }
+}
+
+/// 回收只接受终态：运行中的 Agent 不能被释放。
+#[tokio::test]
+async fn collecting_running_agent_is_rejected() {
+    let release = Arc::new(Semaphore::new(0));
+    let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(
+                Arc::new(ConcurrencyModel {
+                    current: Arc::new(AtomicUsize::new(0)),
+                    maximum: Arc::new(AtomicUsize::new(0)),
+                    release: Arc::clone(&release),
+                }),
+                "collect-running",
+                &[],
+            ),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let member = api
+        .spawn(AgentSpawnRequest::new("保持运行"))
+        .await
+        .expect("派生成员");
+
+    let error = api
+        .collect(&member.id)
+        .await
+        .expect_err("运行中的 Agent 不能回收");
+    assert!(matches!(
+        error,
+        AgentRuntimeError::AgentStillActive(id) if id == member.id
+    ));
+
+    release.add_permits(1);
+    api.wait(&member.id).await.expect("等待成员完成");
+    assert!(api.collect(&member.id).await.expect("终态后可回收"));
+}
+
+/// 回收后私有会话与结果一并释放，不能再用它续跑。
+#[tokio::test]
+async fn collected_agent_cannot_be_continued() {
+    let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(Arc::new(FixedModel), "fixed", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let member = api
+        .spawn(AgentSpawnRequest::new("首次任务"))
+        .await
+        .expect("派生成员");
+    api.wait(&member.id).await.expect("等待成员完成");
+    assert!(api.collect(&member.id).await.expect("回收成员"));
+
+    assert!(
+        api.result(&member.id)
+            .await
+            .expect("查询结果不应失败")
+            .is_none(),
+        "回收后不再保留终态结果"
+    );
+    let error = api
+        .continue_agent(&member.id, "回收后继续".to_string())
+        .await
+        .expect_err("回收后不能续跑");
+    assert!(matches!(
+        error,
+        AgentRuntimeError::SessionUnavailable(id) if id == member.id
+    ));
+}
+
+/// 回收链上的上一跳不得破坏后代的可管理性：投胎链需要沿父指针追溯到 controller。
+#[tokio::test]
+async fn collecting_ancestor_keeps_descendants_manageable() {
+    let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(Arc::new(FixedModel), "fixed", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let first = api
+        .spawn(AgentSpawnRequest::new("首次任务"))
+        .await
+        .expect("派生成员");
+    api.wait(&first.id).await.expect("等待首次任务");
+
+    let second = api
+        .continue_agent(&first.id, "继续任务".to_string())
+        .await
+        .expect("投胎出第二个实例");
+    api.wait(&second.id).await.expect("等待继续任务");
+    assert!(api.collect(&first.id).await.expect("回收上一跳"));
+
+    // 上一跳已回收，但它仍是谱系锚点：后续续跑与查询必须照常工作。
+    let third = api
+        .continue_agent(&second.id, "再继续".to_string())
+        .await
+        .expect("后代仍可继续派活");
+    api.wait(&third.id).await.expect("等待第三轮");
+    assert_eq!(
+        api.status(&third.id).await.expect("查询状态").status,
+        AgentStatus::Succeeded
+    );
+}
+
 /// 会话续跑不能消耗派生深度，否则长期协作的队员在若干轮后会永久失去后续任务。
 #[tokio::test]
 async fn continue_agent_does_not_grow_derivation_depth() {

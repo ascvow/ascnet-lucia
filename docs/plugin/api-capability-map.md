@@ -51,7 +51,7 @@ Host API 的目标不是预先实现所有插件，而是提供可复用、可�
 
 P0 表示大量插件无法可靠自行实现且必须由 Host 掌握权限边界；P1 表示现有原语可绕行，但统一契约能避免生态分裂；P2 应先通过版本化插件服务试验，确认通用语义后再进入 ABI。
 
-一次性 sub-agent、workflow fan-out 和由插件显式驱动的长期 Agent 续跑已经可实现。teammate 插件以 Runtime 的 `AgentId` 作为地址，自行实现邮箱、消息主题、队列、背压、重试和上下文注入；Runtime 和 Core 都不持有 teammate 邮箱。
+一次性 sub-agent、workflow fan-out 和由插件显式驱动的长期 Agent 续跑已经可实现。长期成员按“每次派活一个新实例、完成后 `collect` 回收名额”运行，因此累积分派次数不受生命周期配额限制。teammate 插件以 Runtime 的 `AgentId` 作为地址，自行实现邮箱、消息主题、队列、背压、重试和上下文注入；Runtime 和 Core 都不持有 teammate 邮箱。
 
 ## API 设计规则
 

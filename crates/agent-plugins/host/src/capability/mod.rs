@@ -328,6 +328,16 @@ impl AgentCapabilityChecks for AgentCapabilitySection {
             ))
         }
     }
+
+    fn require_collect(&self) -> Result<()> {
+        if self.collect {
+            Ok(())
+        } else {
+            Err(capability_denied(
+                "插件 manifest 未声明 capabilities.agent.collect",
+            ))
+        }
+    }
 }
 
 /// 把宿主能力调用结果编码成稳定的 JSON 信封。

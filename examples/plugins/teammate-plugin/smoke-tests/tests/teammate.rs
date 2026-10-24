@@ -120,7 +120,12 @@ async fn component_runs_mailbox_dispatch_flow() {
         AgentOptions::default().with_model_route("fixed", "test-model"),
     );
 
-    let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("Runtime 应创建成功");
+    // 只留 controller 与一个活跃成员的累计名额：投胎后若不回收，第二次派活就会失败。
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_agents_per_principal: 3,
+        ..RuntimeLimits::default()
+    })
+    .expect("Runtime 应创建成功");
     let controller_profile = AgentProfileId::new("controller").expect("profile 应合法");
     runtime
         .register_profile(
@@ -559,9 +564,39 @@ async fn component_runs_mailbox_dispatch_flow() {
     )
     .await;
     assert_eq!(dispatched["acked"], true);
+    // 投胎会得到新的执行句柄，成员地址保持不变。
     assert_ne!(dispatched["handle"]["id"], member_id);
     let second_result = wait_result(host.as_ref(), RUN, member_id).await;
     assert_eq!(second_result["outcome"]["status"], "succeeded");
+
+    // 队长可以一直派活：每轮投胎后旧句柄都会回收，因此累计名额不会被耗尽。
+    for round in 0..4 {
+        let sent = call_tool(
+            host.as_ref(),
+            RUN,
+            "teammate_send",
+            json!({
+                "recipient": member_id,
+                "topic": "review.followup",
+                "payload": {"round": round}
+            }),
+        )
+        .await;
+        let message_id = sent["message"]["id"].as_u64().expect("send 应返回消息 ID");
+        let dispatched = call_tool(
+            host.as_ref(),
+            RUN,
+            "teammate_dispatch",
+            json!({"member_id": member_id, "message_id": message_id}),
+        )
+        .await;
+        assert_ne!(
+            dispatched["handle"]["id"], member_id,
+            "第 {round} 轮应投胎出新的执行句柄"
+        );
+        let result = wait_result(host.as_ref(), RUN, member_id).await;
+        assert_eq!(result["outcome"]["status"], "succeeded");
+    }
 
     let empty_inbox = call_tool(
         host.as_ref(),

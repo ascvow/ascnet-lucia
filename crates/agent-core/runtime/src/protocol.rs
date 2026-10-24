@@ -437,6 +437,19 @@ pub trait AgentRuntimeApi: Send + Sync {
     /// 也不消耗父节点的累计子配额，因此长期协作的成员可以反复接收新任务。
     async fn continue_agent(&self, target: &AgentId, input: String) -> RuntimeResult<AgentHandle>;
 
+    /// 回收自身或后代 Agent 已释放的资源，并把累计名额让回 owner。
+    ///
+    /// 目标必须已进入终态；回收会释放私有会话、终态结果、事件历史与运行选项覆盖，
+    /// 因此回收后不能再续跑，也不再有终态结果可读。返回 `true` 表示本次完成回收，
+    /// 重复回收返回 `false`。
+    ///
+    /// 派生链上的身份锚点保留：后续派生仍要沿父指针追溯到 controller，因此回收只
+    /// 释放重状态，不移除谱系。
+    async fn collect(&self, target: &AgentId) -> RuntimeResult<bool> {
+        let _ = target;
+        Ok(false)
+    }
+
     /// 向排队或运行中的自身/后代 Agent 注入一条用户消息。
     async fn steer(&self, target: &AgentId, input: String) -> RuntimeResult<()> {
         let _ = input;

@@ -888,6 +888,14 @@ pub trait PluginHostApi {
     fn cancel_agent(&self, _target: &AgentId) -> Result<bool> {
         Err(anyhow!("宿主未提供 Agent Runtime API"))
     }
+
+    /// 回收已终态后代 Agent 的 Runtime 资源并归还累计名额。
+    ///
+    /// 回收会释放目标的私有会话与终态结果，因此调用方应先读取结果再回收；回收后
+    /// 该目标不能再续跑。返回 `true` 表示本次完成回收，重复回收返回 `false`。
+    fn collect_agent(&self, _target: &AgentId) -> Result<bool> {
+        Err(anyhow!("宿主未提供 Agent Runtime API"))
+    }
 }
 
 /// Trait implemented by a WASM plugin.
@@ -1523,6 +1531,16 @@ world plugin {
                 fn cancel_agent(&self, target: &$crate::AgentId) -> $crate::Result<bool> {
                     let request = $crate::__serde_json::json!({
                         "operation": "cancel",
+                        "request": {"target": target},
+                    });
+                    $crate::decode_host_response(&host_agent_runtime_call(
+                        &$crate::to_json_string(&request),
+                    ))
+                }
+
+                fn collect_agent(&self, target: &$crate::AgentId) -> $crate::Result<bool> {
+                    let request = $crate::__serde_json::json!({
+                        "operation": "collect",
                         "request": {"target": target},
                     });
                     $crate::decode_host_response(&host_agent_runtime_call(

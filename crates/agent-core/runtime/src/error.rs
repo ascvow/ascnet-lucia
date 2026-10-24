@@ -134,6 +134,14 @@ pub enum AgentRuntimeError {
     #[error("Agent 当前不能接收实时消息：{0}")]
     InteractionUnavailable(AgentId),
 
+    /// 目标 Agent 仍在运行，不能回收。
+    #[error("Agent 仍在运行，不能回收：{0}")]
+    AgentStillActive(AgentId),
+
+    /// 目标 Agent 已被回收，会话与终态结果均已释放。
+    #[error("Agent 已被回收：{0}")]
+    AgentCollected(AgentId),
+
     /// 排队 Agent 尚未启动，暂存的交互消息已达到上限。
     #[error("Agent 待处理实时消息已达到上限 {limit}：{agent}")]
     PendingInteractionsExceeded {

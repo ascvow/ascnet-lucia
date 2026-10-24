@@ -39,6 +39,12 @@ const MAX_DISPATCH_ATTEMPTS: u32 = 5;
 const MAX_RETIRED_MEMBERS: usize = 8;
 /// 插件记住的最近结束运行数；用于判断成员所属 controller 运行是否已经结束。
 const MAX_FINISHED_RUNS: usize = 64;
+
+/// 待重试回收的 Runtime 句柄上限。
+///
+/// 回收只在目标终态后成功；刚取消或仍在收尾的句柄会先留在队列里，由后续帧重试。
+/// 上限防止异常情况下队列无限增长。
+const MAX_PENDING_COLLECTIONS: usize = 64;
 /// 主界面右侧的团队摘要入口。
 const TEAM_DOCK_VIEW: &str = "teammate-team-dock";
 /// 替换主界面的团队工作台子视图。
@@ -480,24 +486,28 @@ impl TeamState {
         }
     }
 
-    /// 在续跑成功入队后更新当前句柄并自动确认消息。
+    /// 在续跑成功入队后更新当前句柄并自动确认消息，返回被替换的旧句柄。
+    ///
+    /// 投胎会替换成员当前句柄；旧句柄已是终态，调用方应请 Runtime 回收它的会话与
+    /// 名额，否则反复派活会持续累积 principal 的累计 Agent 数量。
     fn finish_dispatch(
         &mut self,
         owner: &str,
         address: &AgentId,
         message_id: u64,
         handle: AgentHandle,
-    ) -> Result<()> {
+    ) -> Result<Option<AgentId>> {
         self.ack(owner, address, message_id)?;
         let member = self
             .members
             .get_mut(address)
             .ok_or_else(|| anyhow!("Teammate 成员不存在：{}", address.as_str()))?;
+        let previous = member.current.id.clone();
         member.current = handle;
         member.status = AgentStatus::Queued;
         // 新一次运行开始后，旧的失败原因已经不能代表当前句柄。
         member.error = None;
-        Ok(())
+        Ok(Some(previous))
     }
 }
 
@@ -597,6 +607,8 @@ struct TeammatePlugin {
     selected_member: usize,
     navigation_sequence: u64,
     member_sessions: BTreeMap<AgentId, AgentViewSession>,
+    /// 等待 Runtime 回收的已结束句柄；投胎会替换当前句柄，旧句柄的会话与名额需要释放。
+    pending_collections: VecDeque<AgentId>,
 }
 
 impl TeammatePlugin {
@@ -795,6 +807,8 @@ impl TeammatePlugin {
         let member = self.state.remove_member(owner, &request.member_id)?;
         // 成员移除后同步释放预先创建的 prompt 与历史视图，避免重复派生持续占用内存。
         self.member_sessions.remove(&request.member_id);
+        // 取消是异步收尾：句柄进入待回收队列，由后续帧在终态后释放名额与会话。
+        self.schedule_collection(target);
         emit(
             host,
             "teammate.member.removed",
@@ -835,6 +849,8 @@ impl TeammatePlugin {
             let outcome = host.agent_result(&target).ok().flatten();
             if let Ok(snapshot) = self.state.retire(&owner, &address, outcome) {
                 self.member_sessions.remove(&address);
+                // 成员已离开活跃目录，Runtime 侧同一投胎的会话与名额也应释放。
+                self.schedule_collection(target);
                 retired.push(snapshot);
             }
         }
@@ -845,6 +861,7 @@ impl TeammatePlugin {
                 json!({"owner": owner, "member": member}),
             );
         }
+        self.flush_collections(host);
         retired
     }
 
@@ -917,18 +934,23 @@ impl TeammatePlugin {
                 )));
             }
         };
-        self.state.finish_dispatch(
+        let previous = self.state.finish_dispatch(
             owner,
             &request.member_id,
             request.message_id,
             handle.clone(),
         )?;
+        if let Some(previous) = previous {
+            self.schedule_collection(previous);
+        }
         let session = self
             .member_sessions
             .entry(request.member_id.clone())
             .or_insert_with(|| AgentViewSession::new(handle.id.clone()));
         session.replace_target(handle.id.clone());
         session.record_user_message(input);
+        // 旧句柄此刻已经终态，立即尝试回收名额，避免连续派活攒下未回收的投胎。
+        self.flush_collections(host);
         emit(
             host,
             "teammate.message.dispatched",
@@ -1333,12 +1355,19 @@ impl TeammatePlugin {
             .and_then(|session| session.handle_input(host, &event));
         if let Some(handle) = continued {
             let owner = self.plugin_id.clone().unwrap_or_default();
+            let mut previous = None;
             if let Ok(member) = self.state.member_mut(&owner, &member_id) {
+                previous = Some(member.current.id.clone());
                 member.current = handle;
                 member.status = AgentStatus::Queued;
                 member.error = None;
             }
+            // 成员会话里的每轮新任务也会投胎，旧句柄同样要回收。
+            if let Some(previous) = previous {
+                self.schedule_collection(previous);
+            }
         }
+        self.flush_collections(host);
     }
 
     /// 刷新当前工具 owner 名下全部成员的 Runtime 状态缓存。
@@ -1347,6 +1376,7 @@ impl TeammatePlugin {
     /// 团队面板只能显示 `failed`，用户无法判断是模型预算、provider 还是工具问题。
     /// 原因只取一次，已记录的成员不会在后续帧重复查询。
     fn refresh_ui_statuses(&mut self, host: &dyn PluginHostApi) {
+        self.flush_collections(host);
         let owner = self.plugin_id.clone().unwrap_or_default();
         let targets = self
             .state
@@ -1399,6 +1429,30 @@ impl TeammatePlugin {
         if let Some(status) = session.status() {
             if let Ok(stored) = self.state.member_mut(&owner, &member.id) {
                 stored.status = status;
+            }
+        }
+    }
+
+    /// 请求 Runtime 回收一个已终态句柄；尚未终态时留待后续帧重试。
+    ///
+    /// 回收会释放该次投胎的私有会话与累计名额，因此每次替换或删除成员都必须登记，
+    /// 否则长会话里的反复派活会不断累积 principal 的累计 Agent 数量。
+    fn schedule_collection(&mut self, target: AgentId) {
+        if self.pending_collections.len() >= MAX_PENDING_COLLECTIONS {
+            self.pending_collections.pop_front();
+        }
+        self.pending_collections.push_back(target);
+    }
+
+    /// 逐帧重试待回收句柄，把成功或已回收的条目移出队列。
+    fn flush_collections(&mut self, host: &dyn PluginHostApi) {
+        let pending = std::mem::take(&mut self.pending_collections);
+        for target in pending {
+            // 错误表示目标仍在运行或已不可管理；两者都保留一次重试机会。
+            if host.collect_agent(&target).is_err()
+                && self.pending_collections.len() < MAX_PENDING_COLLECTIONS
+            {
+                self.pending_collections.push_back(target);
             }
         }
     }

@@ -243,10 +243,13 @@ Host 会解析每个 `ui.host.action` 并按动作种类复核 allowlist；授�
 spawn = true
 observe = true
 cancel = true
+collect = true
 profiles = ["worker", "reviewer"]
 ```
 
-三个布尔字段分别控制派生与续跑、查询和取消。声明 `spawn = true` 时必须至少配置一个 profile；未声明 spawn 时不能配置 profiles。Manifest 只描述插件请求的上限，应用还必须通过 `PluginHostServices` 注册同名 profile 并向当前 principal 授权，二者任一缺失都会拒绝加载或调用。
+四个布尔字段分别控制派生与续跑、查询、取消和回收。声明 `spawn = true` 时必须至少配置一个 profile；未声明 spawn 时不能配置 profiles。Manifest 只描述插件请求的上限，应用还必须通过 `PluginHostServices` 注册同名 profile 并向当前 principal 授权，二者任一缺失都会拒绝加载或调用。
+
+`collect = true` 允许插件在目标进入终态后请 Runtime 释放该实例的私有会话、终态结果、事件历史与运行选项，并把它的累计名额归还 principal。回收不移除谱系锚点，因此后续派生仍能沿父指针追溯到 controller；回收后该实例不能再续跑，也读不到终态结果，调用方应先读取结果再回收。这使“每次派活都是一个新实例、完成后回收”的长期协作模式不消耗生命周期配额。
 
 每次插件激活使用唯一 principal。Host 注入 owner 和 controller，并在激活失败或卸载时撤销该 principal 的全部 Agent Runtime 资源。teammate 消息权限由 teammate 插件自己的 manifest、服务和配置定义。旧 ABI 插件不能申请 Agent Runtime 权限。
 
