@@ -408,14 +408,37 @@ impl AgentRuntime {
         self.inner
             .ensure_manageable(principal, caller, target)
             .await?;
-        let entry = self.inner.entry(target).await?;
-        // 队员或子 Agent 是长期身份：续跑只开启下一次运行，复用同一 AgentId、谱系和
-        // 私有会话。这样既不登记新 Agent、不占用父节点子配额，也不增加派生深度，
-        // 队长可以一直派活、队员可以一直接活；上下文由它自己的 Context Loader 压缩。
-        let session = entry
-            .reopen_for_continuation()
+        let source = self.inner.entry(target).await?;
+        let session = source
+            .continuation_session()
             .ok_or_else(|| AgentRuntimeError::SessionUnavailable(target.clone()))?;
-        let lineage = entry.lineage.clone();
+
+        // 会话续跑是同一个 Agent 的后续运行，不是新的派生层：`continue` 沿用源节点的
+        // 深度，也不消耗父节点的累计子配额。否则长期协作的队员会在若干次 dispatch
+        // 之后撞到派生深度或子配额上限，表现为「跑一段时间后再也接不了新任务」。
+        // 登记的 Agent 总数仍计入 principal 账本，作为内存与结果保留的硬边界。
+        let depth = source.lineage.depth;
+        let id = AgentId::new();
+        let lineage = AgentLineage {
+            parent: Some(target.clone()),
+            root: source.lineage.root.clone(),
+            depth,
+        };
+        // 预留 principal 名额后不再 await，保证取消不能留下未登记的累计用量。
+        let mut agents = self.inner.agents.write().await;
+        let principal_usage = self.inner.reserve_principal_agent(principal)?;
+        let entry = AgentEntry::new(
+            id.clone(),
+            lineage.clone(),
+            principal.clone(),
+            principal_usage,
+            source.template.clone(),
+            source.permissions.clone(),
+            source.run_options.clone(),
+            AgentStatus::Queued,
+        );
+        agents.insert(id.clone(), entry.clone());
+        drop(agents);
 
         let inner = self.inner.clone();
         let task_entry = entry.clone();
@@ -433,10 +456,7 @@ impl AgentRuntime {
             }
         });
 
-        Ok(AgentHandle {
-            id: entry.id.clone(),
-            lineage,
-        })
+        Ok(AgentHandle { id, lineage })
     }
 
     async fn snapshot_for(
@@ -1038,37 +1058,14 @@ impl AgentEntry {
         self.outcome.read().expect("Agent 结果锁不应中毒").clone()
     }
 
-    /// 为同一身份开启下一次运行，返回复用的私有会话。
-    ///
-    /// 会话续跑是长期 Agent 的下一次运行，不是新的派生节点：身份、谱系和子节点计数
-    /// 全部保持不变，只重置运行态。因此队员可以一直接活，队长可以一直派活，登记数量
-    /// 只随真实身份（controller 与成员）增长。
-    ///
-    /// 只接受成功终态：失败或取消没有可复用的会话。重置在状态写锁内完成，避免与并发
-    /// 续跑或旧的监督任务交错。
-    fn reopen_for_continuation(&self) -> Option<Session> {
-        let mut status = self.status.write().expect("Agent 状态锁不应中毒");
-        if *status != AgentStatus::Succeeded {
+    fn continuation_session(&self) -> Option<Session> {
+        if self.status() != AgentStatus::Succeeded {
             return None;
         }
-        let session = self
-            .session
+        self.session
             .read()
             .expect("Agent 私有会话锁不应中毒")
-            .clone()?;
-        // 下一次运行必须从头开始：旧结果、旧取消请求和上一轮事件历史都不能泄漏进来。
-        *self.outcome.write().expect("Agent 结果锁不应中毒") = None;
-        self.cancel_requested.store(false, Ordering::Release);
-        self.pending_steering
-            .lock()
-            .expect("Agent 待处理消息锁不应中毒")
-            .clear();
-        self.event_history
-            .lock()
-            .expect("Agent 事件历史锁不应中毒")
-            .clear();
-        *status = AgentStatus::Queued;
-        Some(session)
+            .clone()
     }
 
     fn finish(&self, outcome: AgentOutcome) -> bool {

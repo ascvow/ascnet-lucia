@@ -546,107 +546,15 @@ async fn continue_agent_reuses_private_session_and_preserves_permissions() {
         .continue_agent(&child.id, "后续任务".to_string())
         .await
         .expect("创建后续运行");
-    // 续跑复用同一身份与谱系：队员是长期存在的 Agent，不是每次派活都新建节点。
-    assert_eq!(continued.id, child.id);
-    assert_eq!(continued.lineage, child.lineage);
+    assert_eq!(continued.lineage.parent.as_ref(), Some(&child.id));
+    // 续跑是同一个 Agent 的后续运行，不构成新的派生层。
+    assert_eq!(continued.lineage.depth, child.lineage.depth);
     let snapshot = api.status(&continued.id).await.expect("查询后续运行");
     assert_eq!(snapshot.permissions, permissions);
     assert!(matches!(
         api.wait(&continued.id).await.expect("等待后续运行"),
         AgentOutcome::Succeeded { .. }
     ));
-}
-
-/// 队员可以一直接活：续跑不登记新 Agent，也不受派生配额限制。
-///
-/// 队长反复派活时，成员身份与谱系必须保持不变；登记数量只随真实身份增长，
-/// 否则长会话会在某个不可见的时间点开始拒绝新任务。
-#[tokio::test]
-async fn continuation_reuses_identity_without_consuming_agent_slots() {
-    let runtime = AgentRuntime::new(RuntimeLimits {
-        // 只允许 controller 与一个成员：如果续跑登记新 Agent，第二轮就会失败。
-        max_agents_per_principal: 2,
-        max_children_per_agent: 1,
-        max_depth: 1,
-        ..RuntimeLimits::default()
-    })
-    .expect("创建 Runtime");
-    let root = runtime
-        .attach_root(
-            template(Arc::new(FixedModel), "fixed", &[]),
-            AgentPermissions::default(),
-        )
-        .await
-        .expect("挂载根 Agent");
-    let api = runtime.api(&root.id).await.expect("绑定根 API");
-    let member = api
-        .spawn(AgentSpawnRequest::new("首次任务"))
-        .await
-        .expect("派生成员");
-    api.wait(&member.id).await.expect("等待首次任务");
-
-    let mut current = member.clone();
-    for round in 0..32 {
-        current = api
-            .continue_agent(&current.id, format!("第 {round} 轮任务"))
-            .await
-            .expect("成员应能一直接活");
-        assert_eq!(current.id, member.id, "续跑必须复用同一成员身份");
-        assert_eq!(current.lineage, member.lineage, "续跑不得改变谱系");
-        assert!(matches!(
-            api.wait(&current.id).await.expect("等待后续任务"),
-            AgentOutcome::Succeeded { .. }
-        ));
-    }
-}
-
-/// 订阅只能看到当前这次运行的已保留事件。
-///
-/// 续跑会清空上一轮的事件历史：否则每次派活后重新订阅都会重放旧事件，成员视图会
-/// 不断出现重复条目。
-#[tokio::test]
-async fn continuation_event_history_is_scoped_to_current_run() {
-    let runtime = AgentRuntime::new(RuntimeLimits::default()).expect("创建 Runtime");
-    let root = runtime
-        .attach_root(
-            template(Arc::new(FixedModel), "fixed", &[]),
-            AgentPermissions::default(),
-        )
-        .await
-        .expect("挂载根 Agent");
-    let api = runtime.api(&root.id).await.expect("绑定根 API");
-    let member = api
-        .spawn(AgentSpawnRequest::new("首次任务"))
-        .await
-        .expect("派生成员");
-    api.wait(&member.id).await.expect("等待首次任务");
-
-    let mut first_runs = Vec::new();
-    let mut stream = api.subscribe(&member.id).await.expect("首次订阅");
-    while let Some(event) = stream.next().await {
-        if !first_runs.contains(&event.run_id) {
-            first_runs.push(event.run_id.clone());
-        }
-    }
-    assert_eq!(first_runs.len(), 1, "一次运行只应有一个 run_id");
-
-    api.continue_agent(&member.id, "第二轮任务".to_string())
-        .await
-        .expect("续跑成员");
-    api.wait(&member.id).await.expect("等待第二轮任务");
-
-    let mut second_runs = Vec::new();
-    let mut stream = api.subscribe(&member.id).await.expect("续跑后订阅");
-    while let Some(event) = stream.next().await {
-        if !second_runs.contains(&event.run_id) {
-            second_runs.push(event.run_id.clone());
-        }
-    }
-    assert_eq!(second_runs.len(), 1, "续跑后只应回放本轮事件");
-    assert_ne!(
-        second_runs[0], first_runs[0],
-        "续跑必须开启新的 run，而不是重放上一轮事件"
-    );
 }
 
 /// 会话续跑不能消耗派生深度，否则长期协作的队员在若干轮后会永久失去后续任务。
@@ -1186,9 +1094,9 @@ async fn subscribe_is_descendant_scoped() {
     assert!(matches!(error, AgentRuntimeError::PermissionDenied { .. }));
 }
 
-/// controller 与成员身份共同消耗 principal 名额，续跑不额外登记。
+/// controller、首次派生与会话续跑必须共同消耗 principal 的累计 Agent 名额。
 #[tokio::test]
-async fn principal_agent_limit_counts_identities_not_continuations() {
+async fn principal_agent_limit_counts_controller_spawn_and_continue() {
     let runtime = AgentRuntime::new(RuntimeLimits {
         max_agents_per_principal: 3,
         ..RuntimeLimits::default()
@@ -1207,26 +1115,16 @@ async fn principal_agent_limit_counts_identities_not_continuations() {
         .await
         .expect("派生 Agent");
     api.wait(&child.id).await.expect("等待首次任务");
-    // 续跑复用成员身份，因此不占用名额，成员可以反复接活。
-    for round in 0..4 {
-        let continued = api
-            .continue_agent(&child.id, format!("后续任务 {round}"))
-            .await
-            .expect("续跑不应消耗 principal 名额");
-        assert_eq!(continued.id, child.id);
-        api.wait(&continued.id).await.expect("等待后续运行");
-    }
-
-    // 第二个成员占用最后的名额，第三个真实身份才被拒绝。
-    let second = api
-        .spawn(AgentSpawnRequest::new("第二个成员"))
+    let continued = api
+        .continue_agent(&child.id, "后续任务".to_string())
         .await
-        .expect("第二个成员应成功");
-    api.wait(&second.id).await.expect("等待第二个成员");
+        .expect("创建后续运行");
+    api.wait(&continued.id).await.expect("等待后续运行");
+
     let error = api
         .spawn(AgentSpawnRequest::new("超过累计名额"))
         .await
-        .expect_err("第四个真实身份应被拒绝");
+        .expect_err("第四个 Agent 应被拒绝");
     assert!(matches!(
         error,
         AgentRuntimeError::MaxAgentsPerPrincipalExceeded { limit: 3 }

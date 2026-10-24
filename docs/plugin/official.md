@@ -51,7 +51,7 @@ Teammate 插件负责成员角色、稳定成员地址、有界邮箱、确认�
 
 成员失败时，插件在下一次状态刷新中读取一次幂等的终态结果，并把原因写入成员快照的可选 `error` 字段：`teammate_list`、`teammate_status`、团队工作台的成员详情和回收台账都能直接看到具体失败原因（例如单次输出上限、provider 报错或连接中断），不需要再额外调用 `teammate_result` 猜原因。
 
-Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置；worker 模板继承同一个动态 Plugin Host，因此只读工具仍会经过权限插件与 Host 启动期门禁。worker 不覆盖步数，队员与主会话一样可以一直运行到任务完成；`dispatch` 复用同一成员身份、谱系与私有会话，队长可以一直派活、队员可以一直接活，上下文不足时由队员自己继承的 Context Loader 压缩。
+Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置；worker 模板继承同一个动态 Plugin Host，因此只读工具仍会经过权限插件与 Host 启动期门禁。worker 不覆盖步数，队员与主会话一样可以一直运行到任务完成；连续 dispatch 也不增加派生深度，因此长期协作的成员不会在若干轮后失去后续任务。
 
 ## Plan 插件
 
