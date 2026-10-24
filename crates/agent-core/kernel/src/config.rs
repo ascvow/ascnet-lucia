@@ -22,10 +22,16 @@ pub struct AgentRootConfig {
     pub model: Option<ModelConfig>,
 
     /// 多上游配置；每个元素按 `name` 注册为一个逻辑 provider，支持任意协议混配。
+    ///
+    /// 同一个 `name` 可以挂在多个条目上（一个服务商多个可选模型），这些条目必须共用
+    /// 同一份连接配置，只有 `model` 允许不同。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelConfig>,
 
-    /// 默认使用的上游名称；缺省取 `model` 或 `models` 的第一个元素。
+    /// 默认使用的上游；缺省取 `model` 或 `models` 的第一个元素。
+    ///
+    /// 先按上游名匹配，再按模型 ID 匹配；同名上游挂了多个模型时，只能用模型 ID 选中
+    /// 其中一条。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
 
@@ -59,45 +65,62 @@ impl AgentRootConfig {
 
     /// 返回默认上游配置。
     ///
-    /// 解析顺序：`default_model` 按名称匹配 → `model` 字段 → `models` 第一个。
-    /// 错误：没有任何上游、`default_model` 未匹配或上游重名时返回。
+    /// 解析顺序：`default_model` 按上游名匹配（同名取第一个条目）→ 按模型 ID 匹配
+    /// （必须唯一）→ `model` 字段 → `models` 第一个。
+    ///
+    /// # Errors
+    ///
+    /// 没有任何上游、`default_model` 既不匹配上游名也不匹配模型 ID、或模型 ID 匹配到
+    /// 多条条目时返回。
     pub fn default_upstream(&self) -> Result<&ModelConfig> {
         let upstreams = self.upstreams();
         if upstreams.is_empty() {
             anyhow::bail!("config requires a `model` object or at least one `models` entry");
         }
-        for (index, config) in upstreams.iter().enumerate() {
-            if upstreams[..index]
-                .iter()
-                .any(|other| other.name == config.name)
-            {
-                anyhow::bail!("duplicated model upstream name `{}`", config.name);
+        if let Some(default) = &self.default_model {
+            // 名字优先：同名上游挂着的其余模型只能用模型 ID 选中，名字匹配固定取第一条。
+            if let Some(matched) = upstreams.iter().find(|config| &config.name == default) {
+                return Ok(matched);
             }
-        }
-        if let Some(default_name) = &self.default_model {
-            let matched = upstreams
-                .iter()
-                .find(|config| &config.name == default_name)
-                .ok_or_else(|| {
-                    anyhow!("default_model `{default_name}` does not match any configured upstream")
-                })?;
-            return Ok(matched);
+            let mut by_model = upstreams.iter().filter(|config| &config.model == default);
+            if let Some(first) = by_model.next() {
+                if by_model.next().is_some() {
+                    anyhow::bail!("default_model `{default}` 匹配到多个模型条目，请改用上游名指定");
+                }
+                return Ok(first);
+            }
+            anyhow::bail!(
+                "default_model `{default}` does not match any configured upstream name or model id"
+            );
         }
         Ok(upstreams[0])
     }
 
     /// 校验上游配置的整体一致性。
+    ///
+    /// 同名条目是合法的（一个服务商挂多个可选模型），但它们必须共用同一份连接配置：
+    /// 若同名条目的地址或凭据不同，网关里只会留下其中一份，另一条的请求会静默发往
+    /// 错误的端点或凭据。
     fn validate(&self) -> Result<()> {
         let upstreams = self.upstreams();
         for (index, config) in upstreams.iter().enumerate() {
             for other in &upstreams[index + 1..] {
-                if config.name == other.name {
-                    anyhow::bail!("duplicated model upstream name `{}`", config.name);
+                if config.name != other.name {
+                    continue;
+                }
+                if let Some(field) = conflicting_connection_field(config, other) {
+                    anyhow::bail!(
+                        "model upstream `{}` 重复定义且 `{field}` 不一致：同名上游只能共用同一份连接配置，只有 `model` 可以不同",
+                        config.name
+                    );
                 }
             }
         }
         if let Some(default_name) = &self.default_model {
-            if !upstreams.iter().any(|config| &config.name == default_name) {
+            // 名字与模型 ID 都是 `default_model` 的合法写法，与 default_upstream 保持一致。
+            if !upstreams.iter().any(|config| &config.name == default_name)
+                && !upstreams.iter().any(|config| &config.model == default_name)
+            {
                 anyhow::bail!(
                     "default_model `{default_name}` does not match any configured upstream"
                 );
@@ -109,10 +132,16 @@ impl AgentRootConfig {
     /// Build a model gateway from the config.
     ///
     /// 根据配置构建模型网关，注册全部上游；默认上游按 [`Self::default_upstream`] 解析。
+    /// 同名上游共用同一份连接配置（见 [`Self::validate`]），因此每个名字只注册一次。
     pub fn build_gateway(&self) -> Result<ModelGateway> {
         let gateway = ModelGateway::new();
+        let mut registered: Vec<&str> = Vec::new();
         for upstream in self.upstreams() {
+            if registered.contains(&upstream.name.as_str()) {
+                continue;
+            }
             gateway.register_from_config(upstream.to_provider_config()?)?;
+            registered.push(upstream.name.as_str());
         }
         Ok(gateway)
     }
@@ -188,7 +217,9 @@ impl AgentRootConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Logical provider name.
-    /// 逻辑服务商名称。
+    ///
+    /// 逻辑服务商名称，同时是网关注册名与 `/model <名称>` 的切换键。同一个名字可以挂在
+    /// 多个条目上（同一服务商的多个可选模型），这些条目必须共用同一份连接配置。
     #[serde(default = "default_provider_name")]
     pub name: String,
 
@@ -279,6 +310,44 @@ impl ModelConfig {
 
 fn default_provider_name() -> String {
     "default".to_string()
+}
+
+/// 返回两个同名上游之间第一处不一致的连接字段名。
+///
+/// 同名上游必须指向同一份连接：只有 `model` 可以不同。这里显式逐列比较而不给
+/// [`ModelConfig`] 派生 `PartialEq`，是为了在错误里指出到底是哪个字段冲突，
+/// 而不是只说"两条配置不一样"。
+fn conflicting_connection_field(left: &ModelConfig, right: &ModelConfig) -> Option<&'static str> {
+    for (field, differs) in [
+        ("provider", left.provider != right.provider),
+        ("base_url", left.base_url != right.base_url),
+        (
+            "openai_protocol",
+            left.openai_protocol != right.openai_protocol,
+        ),
+        ("gateway", left.gateway != right.gateway),
+        ("extra_headers", left.extra_headers != right.extra_headers),
+        ("api_key", left.api_key != right.api_key),
+        ("api_key_env", left.api_key_env != right.api_key_env),
+        ("aws_region", left.aws_region != right.aws_region),
+        (
+            "aws_access_key_id",
+            left.aws_access_key_id != right.aws_access_key_id,
+        ),
+        (
+            "aws_secret_access_key",
+            left.aws_secret_access_key != right.aws_secret_access_key,
+        ),
+        (
+            "aws_session_token",
+            left.aws_session_token != right.aws_session_token,
+        ),
+    ] {
+        if differs {
+            return Some(field);
+        }
+    }
+    None
 }
 
 /// Agent-level options from JSON.
@@ -378,9 +447,9 @@ mod tests {
         );
     }
 
-    /// 重名上游与未知 default_model 必须被拒绝。
+    /// 同名上游只能共用同一份连接：地址或协议冲突必须被拒绝，并指出冲突字段。
     #[test]
-    fn rejects_duplicated_names_and_unknown_default() {
+    fn rejects_conflicting_duplicated_names_and_unknown_default() {
         let duplicated = parse(
             r#"{
   "models": [
@@ -389,7 +458,8 @@ mod tests {
   ]
 }"#,
         );
-        assert!(duplicated.is_err());
+        let error = duplicated.expect_err("同名但协议不同的上游必须被拒绝");
+        assert!(error.to_string().contains("provider"), "{error}");
 
         let unknown_default = parse(
             r#"{
@@ -400,6 +470,62 @@ mod tests {
 }"#,
         );
         assert!(unknown_default.is_err());
+    }
+
+    /// 一个服务商挂多个模型：同名条目只要求连接一致，网关按名注册一次，
+    /// default_model 用模型 ID 选中其中一条。
+    #[test]
+    fn allows_one_provider_with_several_models() {
+        let config = parse(
+            r#"{
+  "default_model": "gpt-5.6-luna",
+  "models": [
+    { "name": "ascnet", "provider": "open-ai", "base_url": "https://ai.example.test/v1", "model": "gpt-6.1-sol", "api_key": "k" },
+    { "name": "ascnet", "provider": "open-ai", "base_url": "https://ai.example.test/v1", "model": "gpt-5.6-luna", "api_key": "k" }
+  ]
+}"#,
+        )
+        .expect("同名多模型配置应可解析");
+        assert_eq!(config.upstreams().len(), 2);
+        let gateway = config.build_gateway().expect("同名上游只应注册一次");
+        assert!(gateway.contains("ascnet"));
+        let default = config.default_upstream().expect("应有默认上游");
+        assert_eq!(default.name, "ascnet");
+        assert_eq!(default.model, "gpt-5.6-luna");
+        // 只写名字时取第一条：同名上游的第一个模型条目就是它的名字代表。
+        let by_name: AgentRootConfig = serde_json::from_str(
+            r#"{
+  "default_model": "ascnet",
+  "models": [
+    { "name": "ascnet", "provider": "open-ai", "model": "gpt-6.1-sol", "api_key": "k" },
+    { "name": "ascnet", "provider": "open-ai", "model": "gpt-5.6-luna", "api_key": "k" }
+  ]
+}"#,
+        )
+        .expect("配置应可解析");
+        by_name.validate().expect("同名同连接应通过校验");
+        assert_eq!(
+            by_name.default_upstream().expect("应有默认上游").model,
+            "gpt-6.1-sol"
+        );
+    }
+
+    /// 模型 ID 跨上游重名时不能靠模型 ID 选默认，必须报错而不是随便挑一条。
+    #[test]
+    fn rejects_ambiguous_default_model_id() {
+        let error = parse(
+            r#"{
+  "default_model": "shared",
+  "models": [
+    { "name": "a", "provider": "open-ai", "model": "shared", "api_key": "a" },
+    { "name": "b", "provider": "anthropic", "model": "shared", "api_key": "b" }
+  ]
+}"#,
+        )
+        .expect("配置本身应可解析")
+        .default_upstream()
+        .expect_err("模型 ID 重名时不能自动选择");
+        assert!(error.to_string().contains("多个模型条目"), "{error}");
     }
 
     /// 没有任何上游时必须给出可诊断错误。

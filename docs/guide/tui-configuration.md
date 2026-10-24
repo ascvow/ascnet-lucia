@@ -29,7 +29,7 @@ lucia
 
 ### 多上游配置与模型切换
 
-除单 `model` 对象外，可以用 `models` 数组配置任意数量的上游，并混用协议；`default_model` 指定启动默认（缺省取 `model` 或 `models` 第一个元素）。`name` 在全部上游中必须唯一。
+除单 `model` 对象外，可以用 `models` 数组配置任意数量的上游，并混用协议；`default_model` 指定启动默认（缺省取 `model` 或 `models` 第一个元素）。`name` 是逻辑上游名而不是模型名：同一个服务商的多个模型可以共用一个 `name`，这些条目的 `provider`、`base_url`、协议、网关、凭据与 `extra_headers` 必须完全一致，只有 `model` 允许不同——同名条目在网关里只注册一份，若地址或凭据不一致，另一条的请求会静默发往错误的端点。`default_model` 先按上游名匹配（同名取第一个条目），再按模型 ID 匹配，模型 ID 匹配到多条时要求改用上游名。
 
 ```json
 {
@@ -60,7 +60,7 @@ lucia
 }
 ```
 
-`provider` 支持内置协议 `open-ai`（Responses）、`open-ai-compatible`（Chat Completions）、`anthropic`（Messages）、`google`（Generative AI `generateContent`）与 `bedrock`（Converse）；第三方可通过应用层注册自定义协议工厂扩展新的协议 ID。TUI 内输入 `/model` 打开上游选择面板，面板每行按 `模型 ID [上游名]` 显示，行首 `●` 标记当前上游，方括号里的上游名就是 `/model <名称>` 的切换键；也可以用 `/model <名称>` 直接切换。切换只在当前会话生效（会话级），重启后回到 `default_model`。网关注册表使用内部读写锁，运行期切换对派生 Agent 与插件模型路由同样生效。
+`provider` 支持内置协议 `open-ai`（Responses）、`open-ai-compatible`（Chat Completions）、`anthropic`（Messages）、`google`（Generative AI `generateContent`）与 `bedrock`（Converse）；第三方可通过应用层注册自定义协议工厂扩展新的协议 ID。TUI 内输入 `/model` 打开上游选择面板，面板每行按 `模型 ID [上游名]` 显示，行首 `●` 标记当前正在使用的那一条（同名上游下只标中当前名下的那一条），方括号里的上游名就是 `/model <名称>` 的切换键；也可以用 `/model <名称>` 直接切换。一个名字挂了多个模型时，`/model <名称>` 会列出该名下的模型并提示改用 `/model <模型ID>` 选中具体模型。切换只在当前会话生效（会话级），重启后回到 `default_model`。网关注册表使用内部读写锁，运行期切换对派生 Agent 与插件模型路由同样生效。
 
 ### 模型协议映射
 

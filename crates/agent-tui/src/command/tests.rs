@@ -1630,6 +1630,70 @@ async fn model_command_switches_shared_agent_upstream() {
     assert!(empty.native_command.model_panel.is_none());
 }
 
+/// 同一个上游名可以挂多个模型：`/model <上游名>` 必须列出可选模型，`/model <模型ID>` 才能选中。
+#[test]
+fn model_command_resolves_duplicated_upstream_names() {
+    use agent_core::config::ModelConfig;
+    use agent_core::model::{OpenAiProtocol, ProviderKind};
+
+    /// 构造同一条连接下的上游条目，只有模型 ID 不同。
+    fn upstream(name: &str, model: &str) -> ModelConfig {
+        ModelConfig {
+            name: name.into(),
+            provider: ProviderKind::OpenAi,
+            model: model.into(),
+            api_key: Some("test-key".into()),
+            api_key_env: None,
+            base_url: Some("https://api.example.test/v1".into()),
+            openai_protocol: OpenAiProtocol::Responses,
+            extra_headers: Default::default(),
+            gateway: Default::default(),
+            aws_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_session_token: None,
+        }
+    }
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "gpt-6.1-sol".into());
+    app.model_upstreams = vec![
+        upstream("ascnet", "gpt-6.1-sol"),
+        upstream("ascnet", "gpt-5.6-luna"),
+        upstream("deepseek", "deepseek-v4-flash"),
+    ];
+
+    // 模型 ID 是同名上游下唯一能选中具体模型的键。
+    let resolved = app
+        .match_model_upstream("gpt-5.6-luna")
+        .expect("模型 ID 应选中同名上游下的那个模型");
+    assert_eq!(resolved.name, "ascnet");
+    assert_eq!(resolved.model, "gpt-5.6-luna");
+
+    // 只写上游名时必须列出候选模型，而不是默默切到第一条。
+    let ambiguous = app
+        .match_model_upstream("ascnet")
+        .expect_err("同名上游必须要求模型 ID");
+    assert!(
+        ambiguous.contains("gpt-6.1-sol") && ambiguous.contains("gpt-5.6-luna"),
+        "{ambiguous}"
+    );
+
+    // 上游名唯一时名字仍然是切换键。
+    assert_eq!(
+        app.match_model_upstream("deepseek")
+            .expect("唯一上游名应可直接选中")
+            .model,
+        "deepseek-v4-flash"
+    );
+
+    // 未知名字的提示里上游名去重，不重复列出同名条目。
+    let unknown = app
+        .match_model_upstream("missing")
+        .expect_err("未知名字必须报错");
+    assert!(unknown.contains("ascnet、deepseek"), "{unknown}");
+}
+
 /// 插件管理页与命令面板共用一块底板：标题画在上分隔线，列表用指示条与面板底色。
 #[cfg(feature = "plugins")]
 #[test]

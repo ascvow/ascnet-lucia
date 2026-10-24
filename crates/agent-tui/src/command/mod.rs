@@ -900,34 +900,72 @@ impl App {
             return;
         }
         if let Some(value) = value {
-            let matched = self
-                .model_upstreams
-                .iter()
-                .find(|entry| entry.name == value)
-                .cloned();
-            let Some(entry) = matched else {
-                self.messages.push(Msg::new(
-                    MsgKind::Error,
-                    format!(
-                        "未知上游 `{value}`；可用上游：{}",
-                        self.model_upstreams
-                            .iter()
-                            .map(|entry| entry.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join("、")
-                    ),
-                ));
-                return;
-            };
-            self.switch_to_upstream(&entry, agent);
+            match self.match_model_upstream(value) {
+                Ok(entry) => self.switch_to_upstream(&entry, agent),
+                Err(message) => self.messages.push(Msg::new(MsgKind::Error, message)),
+            }
             return;
         }
         let selected = self
             .model_upstreams
             .iter()
-            .position(|entry| entry.model == self.model_name)
+            .position(|entry| self.is_current_upstream(entry))
             .unwrap_or(0);
         self.native_command.model_panel = Some(NativeModelPanel { selected });
+    }
+
+    /// 把 `/model <值>` 的参数解析成具体上游条目。
+    ///
+    /// 上游名唯一时名字就是切换键；同一个名字挂了多个模型时只能用模型 ID 选中其中一条，
+    /// 否则同名上游永远只能切到第一条。错误信息直接交给调用方展示，避免把"未知上游"与
+    /// "名字歧义"混成一句无法操作的提示。
+    fn match_model_upstream(&self, value: &str) -> Result<agent_core::config::ModelConfig, String> {
+        let by_name: Vec<&agent_core::config::ModelConfig> = self
+            .model_upstreams
+            .iter()
+            .filter(|entry| entry.name == value)
+            .collect();
+        if let [entry] = by_name.as_slice() {
+            return Ok((*entry).clone());
+        }
+        let by_model: Vec<&agent_core::config::ModelConfig> = self
+            .model_upstreams
+            .iter()
+            .filter(|entry| entry.model == value)
+            .collect();
+        if let [entry] = by_model.as_slice() {
+            return Ok((*entry).clone());
+        }
+        if by_name.len() > 1 {
+            return Err(format!(
+                "上游 `{value}` 下有多个模型：{}；用 `/model <模型ID>` 指定要用的那个。",
+                by_name
+                    .iter()
+                    .map(|entry| entry.model.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ));
+        }
+        if by_model.len() > 1 {
+            return Err(format!(
+                "模型 ID `{value}` 在多个上游下都有：{}；用 `/model <上游名>` 指定。",
+                by_model
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ));
+        }
+        let mut names: Vec<&str> = Vec::new();
+        for entry in &self.model_upstreams {
+            if !names.contains(&entry.name.as_str()) {
+                names.push(entry.name.as_str());
+            }
+        }
+        Err(format!(
+            "未知上游或模型 `{value}`；可用上游：{}。输入 `/model` 打开面板查看全部条目。",
+            names.join("、")
+        ))
     }
 
     /// 处理模型上游内联面板的键盘导航，并在确认后热切换共享 Agent。

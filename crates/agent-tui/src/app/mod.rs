@@ -735,6 +735,19 @@ impl App {
         self
     }
 
+    /// 判断某个配置条目是不是当前正在使用的上游。
+    ///
+    /// 同一个上游名可以挂多个模型，因此「当前」必须同时比对模型 ID 与上游名：只看模型 ID
+    /// 会把不同上游下相同模型的条目一起标成当前项。上游名未知时（演示模式）退化为只比
+    /// 模型 ID。
+    pub(crate) fn is_current_upstream(&self, entry: &agent_core::config::ModelConfig) -> bool {
+        entry.model == self.model_name
+            && self
+                .model_upstream_name
+                .as_deref()
+                .is_none_or(|name| name == entry.name)
+    }
+
     /// 注入 models.dev 声明的输入模态；匹配到模型后附件入口会严格校验能力。
     pub(crate) fn with_model_modalities(
         mut self,

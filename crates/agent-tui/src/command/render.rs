@@ -521,7 +521,7 @@ fn render_native_model_panel(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            let current = if entry.model == app.model_name {
+            let current = if app.is_current_upstream(entry) {
                 "●"
             } else {
                 " "
@@ -1134,6 +1134,42 @@ mod model_panel_tests {
 
         assert!(screen.contains("gpt-5.6-sol [default]"), "{screen}");
         assert!(screen.contains("gpt-6-astra [gpt-6-astra]"), "{screen}");
+    }
+
+    /// 同一模型 ID 挂在多个上游名下时，只有当前上游那一条带 `●`：只比模型 ID 会把两条
+    /// 都标成当前项。
+    #[test]
+    fn model_panel_marks_only_the_active_upstream_entry() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "gpt-6-astra".into());
+        app.model_upstreams = vec![
+            upstream("ascnet", "gpt-6-astra"),
+            upstream("mirror", "gpt-6-astra"),
+        ];
+        app.model_upstream_name = Some("mirror".into());
+        app.native_command.model_panel = Some(NativeModelPanel { selected: 0 });
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).expect("创建测试终端");
+        terminal
+            .draw(|frame| render_native_model_panel(frame, &app, frame.area()))
+            .expect("渲染模型面板");
+        let rows: Vec<String> = (0..6u16)
+            .map(|row| {
+                terminal.backend().buffer().content()[usize::from(row) * 60..]
+                    .iter()
+                    .take(60)
+                    .map(|cell| cell.symbol())
+                    .collect()
+            })
+            .collect();
+
+        let marked: Vec<&String> = rows.iter().filter(|row| row.contains('●')).collect();
+        assert_eq!(marked.len(), 1, "{rows:?}");
+        assert!(marked[0].contains("gpt-6-astra [mirror]"), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.contains("gpt-6-astra [ascnet]")),
+            "{rows:?}"
+        );
     }
 }
 
