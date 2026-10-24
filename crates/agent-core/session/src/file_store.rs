@@ -143,20 +143,28 @@ impl FileSessionStore {
         let data = fs::read(&path)
             .await
             .map_err(|source| io_error("读取会话文件", &path, source))?;
-        let record: SessionRecord =
-            serde_json::from_slice(&data).map_err(|source| SessionStoreError::InvalidRecord {
-                path: path.clone(),
-                source,
+        let expected_id = id.clone();
+        let decode_path = path.clone();
+        // 解码保留全部字段验证，不能用 IgnoredAny 跳过可能损坏的正文来缩短 CAS。
+        tokio::task::spawn_blocking(move || {
+            let record: SessionRecord = serde_json::from_slice(&data).map_err(|source| {
+                SessionStoreError::InvalidRecord {
+                    path: decode_path.clone(),
+                    source,
+                }
             })?;
-        validate_record(&record)?;
-        if &record.id != id {
-            return Err(SessionStoreError::RecordIdMismatch {
-                path,
-                file_id: id.clone(),
-                record_id: record.id,
-            });
-        }
-        Ok(Some(record))
+            validate_record(&record)?;
+            if record.id != expected_id {
+                return Err(SessionStoreError::RecordIdMismatch {
+                    path: decode_path,
+                    file_id: expected_id,
+                    record_id: record.id,
+                });
+            }
+            Ok(Some(record))
+        })
+        .await
+        .map_err(|source| blocking_task_error("解析会话文件", path, source))?
     }
 
     async fn write_unlocked(&self, record: &SessionRecord) -> Result<(), SessionStoreError> {
@@ -213,6 +221,7 @@ impl SessionStore for FileSessionStore {
         let _guard = self.acquire_operation_lock().await?;
         let current = self.load_unlocked(&record.id).await?;
         let saved = prepare_saved_record(record, current.as_ref(), expected_revision)?;
+        drop(current);
         let (mut summaries, index_was_valid) =
             self.load_summary_index_for_update_unlocked().await?;
         if index_was_valid {
@@ -235,6 +244,7 @@ impl SessionStore for FileSessionStore {
         let _guard = self.acquire_operation_lock().await?;
         let current = self.load_unlocked(id).await?;
         verify_revision(id, current.as_ref(), Some(expected_revision))?;
+        drop(current);
         let (mut summaries, index_was_valid) =
             self.load_summary_index_for_update_unlocked().await?;
         if index_was_valid {

@@ -109,6 +109,34 @@ async fn opening_existing_root_does_not_change_unrelated_permissions() {
     remove_test_directory(&root).await;
 }
 
+/// 损坏正文或 schema/ID 不得被 CAS 覆盖，错误不失效已有摘要索引。
+#[tokio::test]
+async fn cas_rejects_invalid_payload_before_writing() {
+    let root = test_directory();
+    let store = FileSessionStore::open(&root).await.unwrap();
+    let saved = store.save(record("damaged"), None).await.unwrap();
+    let path = store.record_path(&saved.id);
+    let index = fs::read(store.summary_index_path()).await.unwrap();
+    for case in 0..4 {
+        let mut value = serde_json::to_value(&saved).unwrap();
+        match case {
+            0 => value["session"]["messages"] = serde_json::json!([null]),
+            1 => value["schema_version"] = serde_json::json!(u32::MAX),
+            2 => value["id"] = serde_json::json!("different"),
+            _ => value["behavior_binding"] = serde_json::json!({"kind":"../bad","revision":"r"}),
+        }
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &bytes).await.unwrap();
+        assert!(store
+            .save(saved.clone(), Some(saved.revision))
+            .await
+            .is_err());
+        assert_eq!(fs::read(&path).await.unwrap(), bytes);
+        assert_eq!(fs::read(store.summary_index_path()).await.unwrap(), index);
+    }
+    remove_test_directory(&root).await;
+}
+
 #[test]
 fn generated_session_ids_are_valid_and_unique() {
     let first = SessionId::generate();
