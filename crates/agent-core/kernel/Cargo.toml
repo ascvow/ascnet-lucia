@@ -33,3 +33,7 @@ uuid.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "react_loop"
+harness = false
