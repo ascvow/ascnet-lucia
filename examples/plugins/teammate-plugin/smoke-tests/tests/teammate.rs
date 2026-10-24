@@ -179,7 +179,9 @@ async fn component_runs_mailbox_dispatch_flow() {
         .await
         .expect("团队 UI 声明应可读取");
     assert_eq!(declarations.len(), 3);
-    assert_eq!(declarations[0].placement, UiPlacement::Right);
+    // 成员架贴在输入框上方，右侧不再保留团队面板。
+    assert_eq!(declarations[0].placement, UiPlacement::ComposerShelf);
+    assert_eq!(declarations[0].size.height, Some(9));
     assert_eq!(declarations[1].placement, UiPlacement::Subview);
     let dock = PluginHost::render_ui(
         host.as_ref(),
@@ -253,9 +255,19 @@ async fn component_runs_mailbox_dispatch_flow() {
     .expect("成员创建后团队摘要渲染不应失败")
     .expect("成员创建后团队摘要应返回帧");
     assert!(dock.visible);
-    assert!(dock.lines[1].spans.iter().any(|span| {
-        span.text.contains("Captain") && span.style.foreground == Some(UiColor::Magenta)
-    }));
+    // 一行一个成员：汇总行之后就是队长本人的成员行。
+    let captain_row = dock
+        .lines
+        .iter()
+        .find(|line| line.spans.iter().any(|span| span.text.contains("reviewer")))
+        .expect("成员架应逐行列出成员");
+    assert!(
+        captain_row
+            .spans
+            .iter()
+            .any(|span| span.style.foreground == Some(UiColor::Magenta)),
+        "队长行必须保留洋红强调色：{captain_row:?}"
+    );
     PluginHost::on_ui_input(
         host.as_ref(),
         &UiInput {
@@ -269,15 +281,68 @@ async fn component_runs_mailbox_dispatch_flow() {
         },
     )
     .await
-    .expect("团队入口按键路由不应失败");
+    .expect("成员架回车路由不应失败");
     let navigation_events = AgentExtension::drain_events(host.as_ref())
         .await
         .expect("团队导航事件应可读取");
-    assert!(navigation_events.iter().any(|event| {
+    // 回车直接打开选中成员的会话，成员架不再绕行工作台。
+    assert!(
+        navigation_events.iter().any(|event| {
+            event["name"] == UI_NAVIGATION_EVENT
+                && event["data"]["action"]["action"] == "open_agent_session"
+                && event["data"]["action"]["instance_id"] == member_id
+        }),
+        "{navigation_events:?}"
+    );
+    PluginHost::on_ui_input(
+        host.as_ref(),
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-team-dock".into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: "w".into(),
+                modifiers: Vec::new(),
+            },
+        },
+    )
+    .await
+    .expect("成员架工作台快捷键不应失败");
+    let workspace_events = AgentExtension::drain_events(host.as_ref())
+        .await
+        .expect("工作台导航事件应可读取");
+    assert!(workspace_events.iter().any(|event| {
         event["name"] == UI_NAVIGATION_EVENT
             && event["data"]["action"]["action"] == "push"
             && event["data"]["action"]["view"]["view_id"] == "teammate-team-workspace"
     }));
+    // 点击成员行等价于选中并打开：第 0 行是汇总行，成员从第 1 行开始。
+    PluginHost::on_ui_input(
+        host.as_ref(),
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-team-dock".into(),
+            instance_id: None,
+            event: UiInputEvent::Mouse {
+                kind: "down_left".into(),
+                x: 4,
+                y: 1,
+            },
+        },
+    )
+    .await
+    .expect("成员架点击路由不应失败");
+    let click_events = AgentExtension::drain_events(host.as_ref())
+        .await
+        .expect("点击后的导航事件应可读取");
+    assert!(
+        click_events.iter().any(|event| {
+            event["name"] == UI_NAVIGATION_EVENT
+                && event["data"]["action"]["action"] == "open_agent_session"
+                && event["data"]["action"]["instance_id"] == member_id
+        }),
+        "{click_events:?}"
+    );
 
     PluginHost::on_ui_input(
         host.as_ref(),

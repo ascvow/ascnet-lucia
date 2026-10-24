@@ -862,6 +862,70 @@ fn composer_shelf_obeys_input_priority() {
     assert!(app.visible_composer_panels().is_empty());
 }
 
+/// 常驻架获得焦点后接管方向键与 Enter，点击成员行给出视图内的相对行号。
+///
+/// 成员架是插件的通用外形：宿主只负责把按键和相对坐标交给它，具体是"选中成员"
+/// 还是别的语义由插件决定，这里断言的是这条路由契约。
+#[test]
+#[cfg(feature = "plugins")]
+fn composer_shelf_takes_arrows_and_reports_relative_rows() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("创建测试终端");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let mut shelf = test_plugin_view(UiPlacement::ComposerShelf, "Team");
+    // 汇总行 + 两个成员行：架按内容行数长高，点击才有第 2 行可命中。
+    let frame = shelf.frame.as_mut().expect("测试视图应包含帧");
+    frame.lines = (0..3)
+        .map(|index| UiLine {
+            spans: vec![UiSpan {
+                text: format!("member-{index}"),
+                style: UiStyle::default(),
+            }],
+        })
+        .collect();
+    app.plugin_views.push(shelf);
+    terminal
+        .draw(|frame| render_root(frame, &mut app))
+        .expect("渲染主界面");
+    let area = app.plugin_views[0].area;
+    assert_eq!(area.height, 3, "常驻架应按内容行数占据三行");
+
+    // 未聚焦时方向键仍归主界面，Tab 之后才交给成员架。
+    assert!(matches!(
+        app.route_plugin_key(KeyCode::Up, KeyModifiers::NONE),
+        PluginKeyRoute::Main
+    ));
+    assert!(matches!(
+        app.route_plugin_key(KeyCode::Tab, KeyModifiers::NONE),
+        PluginKeyRoute::Consumed
+    ));
+    assert_eq!(app.plugin_focus, Some(0));
+    for code in [KeyCode::Up, KeyCode::Down, KeyCode::Enter] {
+        let PluginKeyRoute::Input(input) = app.route_plugin_key(code, KeyModifiers::NONE) else {
+            panic!("聚焦后按键应交给成员架");
+        };
+        assert_eq!(input.view_id, "composershelf");
+        assert!(matches!(input.event, UiInputEvent::Key { .. }));
+    }
+
+    // 点击第 2 行：相对坐标从视图区域左上角算起，插件据此换算成员。
+    let routed = app
+        .route_plugin_mouse(&MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: area.x.saturating_add(1),
+            row: area.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("点击成员行应路由给插件");
+    assert_eq!(app.plugin_focus, Some(0));
+    assert_eq!(routed.view_id, "composershelf");
+    assert!(matches!(
+        routed.event,
+        UiInputEvent::Mouse { ref kind, x: 1, y: 1 } if kind == "down_left"
+    ));
+}
+
 /// 验证触发手势键按面板可见性路由给触发视图。
 #[test]
 #[cfg(feature = "plugins")]

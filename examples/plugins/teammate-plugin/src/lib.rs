@@ -45,12 +45,19 @@ const MAX_FINISHED_RUNS: usize = 64;
 /// 回收只在目标终态后成功；刚取消或仍在收尾的句柄会先留在队列里，由后续帧重试。
 /// 上限防止异常情况下队列无限增长。
 const MAX_PENDING_COLLECTIONS: usize = 64;
-/// 主界面右侧的团队摘要入口。
+/// 主输入框上方的成员架；`teammate-team-dock` 是已发布的视图 ID，改版后保持不变。
 const TEAM_DOCK_VIEW: &str = "teammate-team-dock";
 /// 替换主界面的团队工作台子视图。
 const TEAM_WORKSPACE_VIEW: &str = "teammate-team-workspace";
 /// 成员实时会话视图；实例由宿主原生渲染，声明只用于输入路由与标题。
 const TEAM_SESSION_VIEW: &str = "teammate-member-session";
+/// 成员架最多渲染的内容行数（不含宿主画在架顶部的那条分隔线）。
+///
+/// 宿主按「内容行 + 1」算面板高度，并把分隔线以下的区域当视图高度交回来；
+/// 声明里的 `size.height` 必须与它对齐，否则多出来的行会被裁掉。
+const SHELF_ROWS: usize = 8;
+/// 成员架一行里角色名允许的字符数：留出状态标记、状态词与未读数。
+const SHELF_ROLE_CHARS: usize = 24;
 
 /// Teammate 消息的可信发送方。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -608,6 +615,11 @@ struct TeammatePlugin {
     workspace_root: Option<PathBuf>,
     state: TeamState,
     selected_member: usize,
+    /// 成员架上次渲染时窗口的起点行在成员列表中的下标。
+    ///
+    /// 鼠标点击只带视图内的行号，必须用同一份开窗偏移换算成成员，否则成员多于
+    /// 可见行时点击会落到错误的成员上。
+    shelf_window_start: usize,
     navigation_sequence: u64,
     /// 等待 Runtime 回收的已结束句柄；投胎会替换当前句柄，旧句柄的会话与名额需要释放。
     pending_collections: VecDeque<AgentId>,
@@ -1042,8 +1054,12 @@ impl TeammatePlugin {
         members
     }
 
-    /// 渲染主界面右侧的紧凑团队入口。
-    fn render_team_dock(&mut self, request: &UiRenderRequest) -> Vec<UiLine> {
+    /// 渲染输入框上方的成员架：一行一个成员，选中行带指示条。
+    ///
+    /// 内容行预算固定为 [`SHELF_ROWS`]：宿主把声明高度当上限，多出来的行会被裁掉，
+    /// 因此这里自己按选中项开窗，当前成员永远可见。成员多于可显示行时用最后一行
+    /// 报出被折叠的数量，而不是把架撑高。
+    fn render_team_shelf(&mut self, request: &UiRenderRequest) -> Vec<UiLine> {
         let members = self.ui_members();
         let unread = members
             .iter()
@@ -1053,103 +1069,101 @@ impl TeammatePlugin {
             .iter()
             .filter(|member| matches!(member.status, AgentStatus::Queued | AgentStatus::Running))
             .count();
-        let content_height = usize::from(request.height).max(1);
-        let mut lines = vec![
-            ui_line(vec![
-                ui_span(format!("{} members", members.len()), None, true),
-                ui_span(
-                    format!("  {active} running"),
-                    Some(if active > 0 {
-                        UiColor::Cyan
-                    } else {
-                        UiColor::Gray
-                    }),
-                    active > 0,
-                ),
-                ui_span(
-                    format!("  {unread} messages"),
-                    Some(if unread > 0 {
-                        UiColor::Yellow
-                    } else {
-                        UiColor::Gray
-                    }),
-                    unread > 0,
-                ),
-            ]),
-            render_captain_summary(members.iter().find(|member| member.captain)),
-            ui_line(Vec::new()),
-            ui_line(vec![ui_span("Members", Some(UiColor::Gray), true)]),
-        ];
-        let member_capacity = content_height.saturating_sub(5);
-        let visible_members = if members.len() > member_capacity {
-            member_capacity.saturating_sub(1)
+        let mut lines = vec![ui_line(vec![
+            ui_span("Team", Some(UiColor::Cyan), true),
+            ui_span(
+                format!("  {} members", members.len()),
+                Some(UiColor::Gray),
+                false,
+            ),
+            ui_span(
+                format!("  {active} running"),
+                Some(if active > 0 {
+                    UiColor::Cyan
+                } else {
+                    UiColor::Gray
+                }),
+                active > 0,
+            ),
+            ui_span(
+                format!("  {unread} messages"),
+                Some(if unread > 0 {
+                    UiColor::Yellow
+                } else {
+                    UiColor::Gray
+                }),
+                unread > 0,
+            ),
+        ])];
+        // 聚焦时才显示按键提示：未聚焦的架只报状态，不占输入区高度。
+        let hint_rows = usize::from(request.focused);
+        let budget = SHELF_ROWS
+            .saturating_sub(1)
+            .saturating_sub(hint_rows)
+            .max(1);
+        let truncated = members.len() > budget;
+        // 折叠提示自己占一行，因此真正能放成员的只有 budget - 1 行。
+        let visible = if truncated {
+            budget.saturating_sub(1).max(1)
         } else {
             members.len()
         };
-        for member in members
-            .iter()
-            .filter(|member| !member.captain)
-            .take(visible_members)
-        {
-            lines.push(ui_line(vec![
+        let window_start = shelf_window_start(members.len(), visible, self.selected_member);
+        self.shelf_window_start = window_start;
+        for (index, member) in members.iter().enumerate().skip(window_start).take(visible) {
+            let selected = index == self.selected_member;
+            let mut spans = vec![
+                // 选中行的指示条与列表行同宽，鼠标点上来看到的也是这一行。
+                ui_span(
+                    if selected { "▌ " } else { "  " },
+                    Some(UiColor::Cyan),
+                    selected,
+                ),
                 ui_span(
                     status_marker(member.status),
                     Some(member_color(member)),
                     true,
                 ),
-                ui_span(format!(" {}", clipped(&member.role, 14)), None, false),
+                ui_span(
+                    format!(" {}", clipped(&member.role, SHELF_ROLE_CHARS)),
+                    {
+                        Some(if selected {
+                            UiColor::Cyan
+                        } else {
+                            member_color(member)
+                        })
+                    },
+                    selected || member.captain,
+                ),
                 ui_span(
                     format!("  {}", status_label(member.status)),
                     Some(UiColor::Gray),
                     false,
                 ),
-                ui_span(
-                    if member.unread_messages > 0 {
-                        format!("  {}", member.unread_messages)
-                    } else {
-                        String::new()
-                    },
+            ];
+            if member.unread_messages > 0 {
+                spans.push(ui_span(
+                    format!("  {} messages", member.unread_messages),
                     Some(UiColor::Yellow),
                     false,
-                ),
-            ]));
+                ));
+            }
+            lines.push(ui_line(spans));
         }
-        let hidden_members = members.len().saturating_sub(visible_members);
-        if hidden_members > 0 {
+        if truncated {
             lines.push(ui_line(vec![ui_span(
-                format!("+{hidden_members} members"),
+                format!("… +{} members", members.len().saturating_sub(visible)),
                 Some(UiColor::Gray),
                 false,
             )]));
         }
-        while lines.len().saturating_add(1) < content_height {
-            lines.push(ui_line(Vec::new()));
+        if hint_rows > 0 {
+            lines.push(ui_line(vec![ui_span(
+                "↑↓ 选择 · Enter 打开会话 · w 团队工作台 · Esc 返回输入",
+                Some(UiColor::Gray),
+                false,
+            )]));
         }
-        lines.push(ui_line(vec![
-            ui_span(
-                if request.focused { "› " } else { "  " },
-                Some(if request.focused {
-                    UiColor::Cyan
-                } else {
-                    UiColor::Gray
-                }),
-                request.focused,
-            ),
-            ui_action_span("Team workspace", request.focused),
-            ui_span(
-                if request.focused {
-                    "  Enter"
-                } else {
-                    "  Click → Enter"
-                },
-                Some(if request.focused {
-                    UiColor::Cyan
-                } else {
-                    UiColor::Gray
-                }),
-                request.focused,
-            ),
-        ]));
         lines
     }
 
@@ -1584,8 +1598,10 @@ impl AgentPlugin for TeammatePlugin {
         )
     }
 
-    /// 声明右侧团队入口、全屏工作台和成员会话的输入路由。
+    /// 声明输入框上方的成员架、全屏工作台和成员会话的输入路由。
     ///
+    /// 成员架不再是右侧停靠面板：它贴在输入框上方逐行列出成员，用方向键选择、
+    /// `Enter` 打开选中成员的会话，点击行等价于选中并打开。
     /// 成员会话由宿主原生渲染，声明仍然存在：宿主用它校验实例、路由提交的正文
     /// 并继承默认标题，插件不再为它返回任何文本帧。
     fn describe_ui(&self) -> Vec<UiDeclaration> {
@@ -1594,10 +1610,11 @@ impl AgentPlugin for TeammatePlugin {
                 plugin_id: String::new(),
                 view_id: TEAM_DOCK_VIEW.into(),
                 title: "Team".into(),
-                placement: UiPlacement::Right,
+                placement: UiPlacement::ComposerShelf,
                 size: UiSize {
-                    width: Some(36),
-                    height: None,
+                    // 宿主按「内容行 + 顶部分隔线」布局，声明值要含这一行。
+                    height: Some(SHELF_ROWS.saturating_add(1) as u16),
+                    width: None,
                 },
                 focusable: true,
                 input_triggers: Vec::new(),
@@ -1623,13 +1640,13 @@ impl AgentPlugin for TeammatePlugin {
         ]
     }
 
-    /// 根据宿主分配尺寸渲染团队摘要或全屏工作台。
+    /// 根据宿主分配尺寸渲染成员架或全屏工作台。
     ///
-    /// 团队摘要在当前 owner 没有成员时返回隐藏帧，子视图不受该条件影响。
+    /// 成员架在当前 owner 没有成员时返回隐藏帧，子视图不受该条件影响。
     fn render_ui(&mut self, request: UiRenderRequest) -> Option<UiFrame> {
         let visible = request.view_id != TEAM_DOCK_VIEW || !self.ui_members().is_empty();
         let lines = match request.view_id.as_str() {
-            TEAM_DOCK_VIEW => self.render_team_dock(&request),
+            TEAM_DOCK_VIEW => self.render_team_shelf(&request),
             TEAM_WORKSPACE_VIEW => self.render_team_workspace(&request),
             _ => return None,
         };
@@ -1654,14 +1671,23 @@ impl AgentPlugin for TeammatePlugin {
         self.render_ui(request)
     }
 
-    /// 处理团队入口、成员选择和状态刷新输入，并通过通用导航 API 打开工作台。
+    /// 处理成员架与工作台的输入：选择、打开会话与打开工作台。
     fn on_ui_input_with_host(&mut self, host: &dyn PluginHostApi, input: UiInput) {
         match input.event {
-            UiInputEvent::Key { code, .. }
-                if input.view_id == TEAM_DOCK_VIEW && code == "enter" =>
-            {
-                // 状态由进入后的视图刷新统一读取，导航本身不重复查询全部成员。
-                self.open_team_workspace(host);
+            UiInputEvent::Key { code, .. } if input.view_id == TEAM_DOCK_VIEW => {
+                let member_count = self.ui_members().len();
+                match code.as_str() {
+                    "up" => self.selected_member = self.selected_member.saturating_sub(1),
+                    "down" => {
+                        self.selected_member =
+                            (self.selected_member + 1).min(member_count.saturating_sub(1));
+                    }
+                    // 架上直接打开选中成员的会话：查看成员状态时不该先跳一层工作台。
+                    "enter" => self.open_selected_member_session(host),
+                    "w" => self.open_team_workspace(host),
+                    "r" => self.refresh_ui_statuses(host),
+                    _ => {}
+                }
             }
             UiInputEvent::Key { code, .. } if input.view_id == TEAM_WORKSPACE_VIEW => {
                 let member_count = self.ui_members().len();
@@ -1680,6 +1706,18 @@ impl AgentPlugin for TeammatePlugin {
                 self.submit_member_message(host, input.instance_id.as_deref(), text);
             }
             UiInputEvent::Mouse { kind, y, .. }
+                if input.view_id == TEAM_DOCK_VIEW && kind.starts_with("down_") =>
+            {
+                // 第 0 行是汇总行，成员从第 1 行开始；行号要加上开窗偏移才是成员下标。
+                let row = usize::from(y).saturating_sub(1);
+                let index = self.shelf_window_start.saturating_add(row);
+                let member_count = self.ui_members().len();
+                if row < member_count && index < member_count {
+                    self.selected_member = index;
+                    self.open_selected_member_session(host);
+                }
+            }
+            UiInputEvent::Mouse { kind, y, .. }
                 if input.view_id == TEAM_WORKSPACE_VIEW && kind.starts_with("down_") =>
             {
                 let member_count = self.ui_members().len();
@@ -1696,6 +1734,18 @@ fn ui_line(spans: Vec<UiSpan>) -> UiLine {
     UiLine { spans }
 }
 
+/// 计算成员架窗口的起始下标：让选中成员尽量停在可见区中部，贴近列表两端时再收口。
+///
+/// 返回的起点既能保证选中项可见，也不会让窗口越过列表尾部留出空行。
+fn shelf_window_start(total: usize, visible: usize, selected: usize) -> usize {
+    if visible == 0 || total <= visible {
+        return 0;
+    }
+    selected
+        .saturating_sub(visible / 2)
+        .min(total.saturating_sub(visible))
+}
+
 /// 构造带可选前景色和粗体的终端文本片段。
 fn ui_span(text: impl Into<String>, foreground: Option<UiColor>, bold: bool) -> UiSpan {
     UiSpan {
@@ -1703,23 +1753,6 @@ fn ui_span(text: impl Into<String>, foreground: Option<UiColor>, bold: bool) -> 
         style: UiStyle {
             foreground,
             bold,
-            ..UiStyle::default()
-        },
-    }
-}
-
-/// 构造团队入口操作文本；聚焦时切换为高亮选中态，未聚焦时保留可点击链接语义。
-fn ui_action_span(text: impl Into<String>, focused: bool) -> UiSpan {
-    UiSpan {
-        text: text.into(),
-        style: UiStyle {
-            foreground: Some(if focused {
-                UiColor::Cyan
-            } else {
-                UiColor::Green
-            }),
-            bold: true,
-            underlined: true,
             ..UiStyle::default()
         },
     }
@@ -1768,22 +1801,6 @@ fn member_color(member: &MemberSnapshot) -> UiColor {
     } else {
         status_color(member.status)
     }
-}
-
-/// 渲染独立队长成员摘要；未创建队长时不再把主 Agent 伪装为队长。
-fn render_captain_summary(captain: Option<&MemberSnapshot>) -> UiLine {
-    let Some(captain) = captain else {
-        return ui_line(vec![ui_span("◇ No captain", Some(UiColor::Gray), false)]);
-    };
-    ui_line(vec![
-        ui_span("● Captain  ", Some(UiColor::Magenta), true),
-        ui_span(clipped(&captain.role, 10), Some(UiColor::Magenta), true),
-        ui_span(
-            format!("  {}", status_label(captain.status)),
-            Some(UiColor::Gray),
-            false,
-        ),
-    ])
 }
 
 /// 按字符数量截断紧凑列表文本，避免窄终端换行破坏对齐。
@@ -2373,9 +2390,9 @@ mod tests {
         );
     }
 
-    /// 插件必须声明可聚焦团队入口和全屏工作台，并在摘要中渲染成员状态。
+    /// 插件必须声明可聚焦的输入框成员架和全屏工作台，并逐行渲染成员状态。
     #[test]
-    fn team_ui_declares_entry_and_renders_members() {
+    fn team_ui_declares_shelf_and_renders_each_member() {
         let mut plugin = TeammatePlugin {
             plugin_id: Some("teammate".into()),
             ..TeammatePlugin::default()
@@ -2399,10 +2416,11 @@ mod tests {
         assert_eq!(
             declarations.len(),
             3,
-            "插件声明团队入口、工作台和成员会话的输入路由"
+            "插件声明成员架、工作台和成员会话的输入路由"
         );
-        assert_eq!(declarations[0].placement, UiPlacement::Right);
-        assert_eq!(declarations[0].size.width, Some(36));
+        // 成员架贴在输入框上方，不再占用右侧停靠位。
+        assert_eq!(declarations[0].placement, UiPlacement::ComposerShelf);
+        assert_eq!(declarations[0].size.height, Some(SHELF_ROWS as u16 + 1));
         assert!(declarations[0].focusable);
         assert_eq!(declarations[1].placement, UiPlacement::Subview);
 
@@ -2412,36 +2430,37 @@ mod tests {
                 plugin_id: "teammate".into(),
                 view_id: TEAM_DOCK_VIEW.into(),
                 instance_id: None,
-                width: 30,
-                height: 16,
+                width: 60,
+                height: 3,
                 focused: false,
                 frame: 1,
             })
-            .expect("团队摘要应返回可见帧");
+            .expect("成员架应返回可见帧");
         let text = frame
             .lines
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.text.as_str())
             .collect::<String>();
-        assert!(text.contains("members"), "{text}");
+        assert!(text.contains("Team"), "{text}");
+        assert!(text.contains("2 members"), "{text}");
+        assert!(text.contains("2 running"), "{text}");
+        assert!(text.contains("lead"), "{text}");
         assert!(text.contains("reviewer"), "{text}");
-        assert!(text.contains('◌'), "{text}");
-        assert!(text.contains("Captain  lead  Queued"), "{text}");
-        assert!(text.contains("Queued"), "{text}");
-        assert!(text.contains("Team workspace  Click → Enter"), "{text}");
-        assert_eq!(frame.lines.len(), 16);
-        assert!(frame.lines[3]
+        // 未聚焦时不占按键提示那一行：方向键与 Enter 的说明只在聚焦后出现。
+        assert!(!text.contains("Enter"), "{text}");
+        assert_eq!(frame.lines.len(), 3);
+        // 一行一个成员，队长在最前面，选中行带指示条。
+        assert!(frame.lines[1]
             .spans
             .iter()
-            .any(|span| span.text == "Members"));
-        assert!(frame.lines[4]
+            .any(|span| span.text.contains("lead")));
+        assert!(frame.lines[1].spans[0].text == "▌ ");
+        assert!(frame.lines[2]
             .spans
             .iter()
             .any(|span| span.text.contains("reviewer")));
-        assert!(frame.lines[1].spans.iter().any(|span| {
-            span.text.contains("Captain") && span.style.foreground == Some(UiColor::Magenta)
-        }));
+        assert!(frame.lines[2].spans[0].text == "  ");
 
         let focused = plugin
             .render_ui(UiRenderRequest {
@@ -2449,16 +2468,20 @@ mod tests {
                 plugin_id: "teammate".into(),
                 view_id: TEAM_DOCK_VIEW.into(),
                 instance_id: None,
-                width: 30,
-                height: 16,
+                width: 60,
+                height: 3,
                 focused: true,
                 frame: 2,
             })
-            .expect("聚焦团队摘要应返回可见帧");
-        let action = focused.lines.last().expect("团队摘要应包含入口行");
-        assert_eq!(action.spans[0].text, "› ");
-        assert_eq!(action.spans[2].text, "  Enter");
-        assert!(action.spans[1].style.underlined);
+            .expect("聚焦成员架应返回可见帧");
+        let hint = focused.lines.last().expect("聚焦后应有按键提示行");
+        let hint_text = hint
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(hint_text.contains("Enter 打开会话"), "{hint_text}");
+        assert!(hint_text.contains("w 团队工作台"), "{hint_text}");
 
         let workspace = plugin
             .render_ui(UiRenderRequest {
@@ -2485,7 +2508,17 @@ mod tests {
         );
     }
 
-    /// 当前 owner 没有成员时，团队摘要不应占用右侧面板。
+    /// 成员多于可见行时按选中项开窗，点击行依据同一份偏移换算成员下标。
+    #[test]
+    fn shelf_window_follows_the_selected_member() {
+        assert_eq!(shelf_window_start(2, 6, 0), 0);
+        assert_eq!(shelf_window_start(20, 6, 0), 0);
+        assert_eq!(shelf_window_start(20, 6, 10), 7);
+        // 选中项在尾部时窗口贴到底，不越界。
+        assert_eq!(shelf_window_start(20, 6, 19), 14);
+    }
+
+    /// 当前 owner 没有成员时，成员架不应占用输入框上方的空间。
     #[test]
     fn team_dock_is_hidden_without_members() {
         let mut plugin = TeammatePlugin {
