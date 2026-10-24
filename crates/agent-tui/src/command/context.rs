@@ -12,7 +12,10 @@ use crate::theme::{
     COLOR_ACCENT, COLOR_DANGER_BRIGHT, COLOR_META, COLOR_MUTED, COLOR_SEPARATOR, COLOR_SUCCESS,
     COLOR_TEXT, COLOR_TEXT_SOFT, COLOR_USER, COLOR_WARNING,
 };
-use crate::ui::sheet::{palette_hint, palette_sheet_viewport, render_palette_sheet, PaletteSheet};
+use crate::ui::sheet::{
+    palette_hint, palette_sheet_content_width, palette_sheet_viewport, render_palette_sheet,
+    PaletteSheet, SheetShape,
+};
 use agent_core::model::TokenUsage;
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
@@ -375,9 +378,15 @@ pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, anchor: Re
     if !app.native_command.context_open {
         return;
     }
-    let mut lines = vec![note_line("当前会话上下文占用 · 分类为文本估算")];
+    let mut lines = vec![
+        // 带框面板里文字直接从边框下一行开始会显得顶头，先空一行做上内边距。
+        Line::from(""),
+        note_line("当前会话上下文占用 · 分类为文本估算"),
+    ];
     // 占比色条与逻辑行下标一起保存：它整行都是空格，混在折行段落里会被算成两行。
     let mut bar: Option<(usize, Line<'static>)> = None;
+    // 内容按带框外形的内宽排版：色条与明细表都要正好铺到右边框，而不是用锚点整宽。
+    let content_width = palette_sheet_content_width(anchor, SheetShape::Boxed);
     if let Some(snapshot) = &app.context_snapshot {
         let values: Vec<u64> = CATEGORIES
             .iter()
@@ -401,8 +410,8 @@ pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, anchor: Re
         if let Some(remaining) = remaining {
             token_width = token_width.max(group_thousands(remaining).len());
         }
-        let columns = Columns::for_width(usize::from(anchor.width), label_max, token_width);
-        let widths = segment_widths(&values, window.unwrap_or(total), anchor.width);
+        let columns = Columns::for_width(usize::from(content_width), label_max, token_width);
+        let widths = segment_widths(&values, window.unwrap_or(total), content_width);
         let mut spans: Vec<Span> = CATEGORIES
             .iter()
             .zip(&widths)
@@ -415,8 +424,8 @@ pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, anchor: Re
             Style::new().bg(COLOR_SEPARATOR),
         ));
         bar = Some((lines.len(), Line::from(spans)));
-        // 占位空行保住色条那一行的高度：段落折行与滚动几何仍按一行计算。
-        lines.push(Line::from(""));
+        // 占位空行保住色条那一行的高度：段落折行与滚动几何仍按一行计算；它同时是
+        // 色条与明细表之间的唯一一行留白，再空一行会让色条飘在标题下面。
         lines.push(Line::from(""));
         lines.push(column_header(&columns));
         for ((_, label, color), value) in CATEGORIES.iter().zip(values) {
@@ -459,17 +468,18 @@ pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, anchor: Re
     ));
     let content_height = lines
         .iter()
-        .map(|line| crate::ui::wrapped_line_count(line, anchor.width))
+        .map(|line| crate::ui::wrapped_line_count(line, content_width))
         .fold(0_u16, u16::saturating_add);
     // 色条在滚动内容里的视觉行号：它之前每一行的折行结果都要算进去。
     let bar_row = bar.as_ref().map(|(index, _)| {
         lines[..*index]
             .iter()
-            .map(|line| crate::ui::wrapped_line_count(line, anchor.width))
+            .map(|line| crate::ui::wrapped_line_count(line, content_width))
             .fold(0_u16, u16::saturating_add)
     });
     let requested_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let (height, content_rows) = palette_sheet_viewport(frame, anchor, requested_rows, true);
+    let (height, content_rows) =
+        palette_sheet_viewport(frame, anchor, requested_rows, true, SheetShape::Boxed);
     app.native_command.context_scroll = app
         .native_command
         .context_scroll
@@ -485,6 +495,7 @@ pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, anchor: Re
             hint: Some(palette_hint("↑↓ 滚动 · Esc 关闭")),
             scroll,
             wrap: true,
+            shape: SheetShape::Boxed,
         },
     );
     // 色条单独落在占位行上：不折行，因此始终只占一行，也不会吃掉后面一行。
@@ -575,7 +586,7 @@ mod tests {
         assert!(!app.native_command.context_open);
     }
 
-    /// 上下文面板用命令面板的外形：标题画在上分隔线上，四周没有盒子边框。
+    /// 上下文面板四面围框：标题画在顶部边框上，内容与提示留在框内。
     #[test]
     fn context_dialog_uses_the_command_palette_chrome() {
         use ratatui::{backend::TestBackend, Terminal};
@@ -631,9 +642,85 @@ mod tests {
             !compact.iter().any(|line| line.contains("最近模型请求")),
             "{screen}"
         );
-        // 面板不再有左右与下边框：盒子只剩一条朝向正文的上分隔线。
-        assert!(!screen.contains('╭'), "{screen}");
-        assert!(!screen.contains('│'), "{screen}");
+        // 面板四面围框：与输入盒上方的分隔线式面板不同，它是独立的带框视图。
+        assert!(screen.contains('╭'), "{screen}");
+        assert!(screen.contains('╮'), "{screen}");
+        assert!(screen.contains('╰'), "{screen}");
+        assert!(screen.contains('╯'), "{screen}");
+        assert!(screen.contains('│'), "{screen}");
+    }
+
+    /// 色条与明细表的占比条都按内容区宽度自动铺满，右端顶到边框，不会在宽终端里半途而废。
+    #[test]
+    fn usage_bar_and_table_fill_the_content_width() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(tx, "测试模型".into());
+        app.native_command.context_open = true;
+        // 窗口取与占用同量级：分段才够宽，色条首格才能确定属于第一个分类。
+        app.context_window = Some(8000);
+        app.context_snapshot = Some(ContextSnapshot {
+            tokens: [
+                ("system".into(), 1000),
+                ("tools".into(), 2000),
+                ("results".into(), 3000),
+            ]
+            .into(),
+            attachments: 0,
+            messages: 12,
+            tools: 5,
+        });
+        let width = 100u16;
+        let height = 30u16;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let anchor = anchor(frame);
+                render_context_dialog(frame, &mut app, anchor)
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let cell = |x: u16, y: u16| buffer.cell((x, y)).expect("单元格应在画布内");
+        // 内容区左右各让出两列（边框 + 一列内边距），右端一列是竖边框。
+        let left = 2u16;
+        let right = width - 3;
+        let rows: Vec<String> = (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|x| cell(x, row).symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        // 分段色条：整行都有底色，最右一格是剩余容量的暗色轨道。
+        let bar_row = (0..height)
+            .find(|row| cell(left, *row).bg == COLOR_ACCENT)
+            .unwrap_or_else(|| panic!("应画出分段色条：{}", rows.join("\n")));
+        for x in left..=right {
+            assert_ne!(
+                cell(x, bar_row).bg,
+                Color::Reset,
+                "色条在 {x} 列断开了：{}",
+                rows[usize::from(bar_row)]
+            );
+        }
+        assert_eq!(cell(right, bar_row).bg, COLOR_SEPARATOR);
+        // 明细行同样铺满：占比条的轨道一直画到内容区最右列。
+        // 宽字符在缓冲区里各占两格，第二格是空白，比较前要先去掉空白。
+        let system_row = rows
+            .iter()
+            .position(|line| {
+                line.chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .collect::<String>()
+                    .contains("系统提示")
+            })
+            .expect("应画出系统提示行");
+        assert_eq!(
+            cell(right, u16::try_from(system_row).unwrap()).bg,
+            COLOR_SEPARATOR,
+            "{}",
+            rows[system_row]
+        );
     }
 
     /// 色条必须只占一行：它多算的那一行会把最后一条说明挤出视口。

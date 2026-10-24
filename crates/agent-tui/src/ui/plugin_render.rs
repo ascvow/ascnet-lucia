@@ -7,7 +7,7 @@ use crate::theme::{
     COLOR_ACCENT, COLOR_BORDER_FOCUS, COLOR_DANGER, COLOR_MUTED, COLOR_SEPARATOR, COLOR_SUCCESS,
     COLOR_TEXT, COLOR_USER, COLOR_WARNING,
 };
-use crate::ui::sheet::{palette_sheet_viewport, render_palette_sheet, PaletteSheet};
+use crate::ui::sheet::{palette_sheet_viewport, render_palette_sheet, PaletteSheet, SheetShape};
 use agent_plugin_protocol::UiFrame as PluginUiFrame;
 use agent_plugin_protocol::{UiColor, UiPlacement, UiStyle};
 use ratatui::prelude::*;
@@ -189,7 +189,8 @@ fn render_plugin_dialog_view(
         .map(plugin_frame_lines)
         .unwrap_or_default();
     let title = view.declaration.title.clone();
-    let (height, _) = palette_sheet_viewport(frame, anchor, content_rows, false);
+    let (height, _) =
+        palette_sheet_viewport(frame, anchor, content_rows, false, SheetShape::Composer);
     let content_area = render_palette_sheet(
         frame,
         anchor,
@@ -200,6 +201,7 @@ fn render_plugin_dialog_view(
             hint: None,
             scroll: 0,
             wrap: false,
+            shape: SheetShape::Composer,
         },
     );
     view.area = content_area;

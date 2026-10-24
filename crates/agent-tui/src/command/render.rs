@@ -17,7 +17,9 @@ use crate::theme::{COLOR_USER, COLOR_WARNING};
 use crate::ui::markdown::truncate_line;
 // 插件对话框专用：纯 Core 构建里 `render_native_plugin_dialog` 不存在，这些符号也就没有使用者。
 #[cfg(feature = "plugins")]
-use crate::ui::sheet::{palette_hint, palette_sheet_viewport, render_palette_sheet, PaletteSheet};
+use crate::ui::sheet::{
+    palette_hint, palette_sheet_viewport, render_palette_sheet, PaletteSheet, SheetShape,
+};
 use crate::ui::sheet::{palette_plain_row, palette_row};
 #[cfg(feature = "plugins")]
 use crate::ui::wrapped_line_count;
@@ -742,7 +744,8 @@ pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &mut App, anch
         u16::try_from(fixed.len() + list.len().min(MAX_VISIBLE_PLUGIN_ROWS) + extras.len())
             .unwrap_or(u16::MAX)
     };
-    let (height, content_rows) = palette_sheet_viewport(frame, anchor, requested_rows, true);
+    let (height, content_rows) =
+        palette_sheet_viewport(frame, anchor, requested_rows, true, SheetShape::Composer);
     let mut lines = fixed;
     if !reviewing_enable && !list.is_empty() {
         let visible = usize::from(content_rows)
@@ -776,6 +779,7 @@ pub(crate) fn render_native_plugin_dialog(frame: &mut Frame, app: &mut App, anch
             hint: Some(hint),
             scroll: dialog.review_scroll,
             wrap: reviewing_enable,
+            shape: SheetShape::Composer,
         },
     );
 }

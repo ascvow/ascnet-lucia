@@ -1,15 +1,18 @@
-//! 命令面板风格的浮层面板：单条上分隔线、画在线上的标题、底部按键提示与列表行。
+//! 浮层面板：标题线、内容视口、底部按键提示与列表行。
 //!
 //! 原生 Dialog 与插件 Dialog 共用这套外形。它们像命令补全面板一样贴在输入盒上方、
-//! 横向铺满，而不是用四面包围的盒子悬浮在屏幕正中：临时面板只保留一种视觉语言，
-//! 用户不必为每块面板重新辨认"这里是列表、那里是对话框"。
+//! 横向铺满，而不是悬浮在屏幕正中：临时面板只保留一种视觉语言，用户不必为每块面板
+//! 重新辨认"这里是列表、那里是对话框"。
+//!
+//! 外形分两种（[`SheetShape`]）：选择类临时列表只画朝上一条分隔线，与下方输入盒连成
+//! 一块；信息型视图四面围框，用一条明确边界把自己与身后的正文分开。
 
 use crate::theme::{
     COLOR_BORDER_FOCUS, COLOR_META, COLOR_PALETTE_COMMAND, COLOR_PALETTE_SELECTION_BG,
     COLOR_SELECTION_MARK, COLOR_TEXT, COLOR_TEXT_SOFT,
 };
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
 /// 面板提示行与输入盒之间保留的空行数。
 ///
@@ -22,6 +25,40 @@ const PALETTE_ROW_INSET: usize = 1;
 
 /// 名称列与说明列之间的固定间距。
 const PALETTE_COLUMN_GAP: usize = 2;
+
+/// 面板外形。
+///
+/// 两种外形都横向铺满锚点宽度，区别只在外框与内容留白；高度与内容宽度的换算集中在
+/// 这里，调用方据此构造内容行，布局与绘制才不会各算一套。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SheetShape {
+    /// 只有朝上的一条分隔线：面板下沿就是输入盒，四面包围会与它叠成双层框。
+    ///
+    /// 纯 Core 构建里只剩上下文面板这一位使用者，而它是带框的；变体仍由插件对话框
+    /// 与测试构造，因此这里按构建裁剪不影响语义。
+    #[cfg_attr(not(feature = "plugins"), allow(dead_code))]
+    Composer,
+    /// 四面圆角边框：信息型面板需要一条边界把内容与身后的正文分开。
+    Boxed,
+}
+
+impl SheetShape {
+    /// 外框占用的行数（不含底部空行）：两种外形都有上沿，带框时再多一条下沿。
+    fn border_rows(self) -> u16 {
+        match self {
+            Self::Composer => 1,
+            Self::Boxed => 2,
+        }
+    }
+
+    /// 内容区相对锚点的横向缩进：带框时让出边框与一列内边距。
+    fn horizontal_inset(self) -> u16 {
+        match self {
+            Self::Composer => 0,
+            Self::Boxed => 2,
+        }
+    }
+}
 
 /// 一块命令面板风格面板的完整内容。
 ///
@@ -38,23 +75,34 @@ pub(crate) struct PaletteSheet<'a> {
     pub(crate) scroll: u16,
     /// 是否按面板宽度折行；插件帧自带断行，不应二次折行。
     pub(crate) wrap: bool,
+    /// 外框外形；决定额外行数与内容缩进。
+    pub(crate) shape: SheetShape,
 }
 
-/// 面板占用的完整高度：顶部分隔线 + 内容行 + 可选提示行 + 底部空行。
-pub(crate) fn palette_sheet_height(content_rows: u16, has_hint: bool) -> u16 {
+/// 面板占用的完整高度：外框 + 内容行 + 可选提示行 + 底部空行。
+pub(crate) fn palette_sheet_height(content_rows: u16, has_hint: bool, shape: SheetShape) -> u16 {
     content_rows
-        // 顶部分隔线；标题画在它上面，不额外占行。
-        .saturating_add(1)
+        // 上分隔线或上边框；标题画在它上面，不额外占行。
+        .saturating_add(shape.border_rows())
         .saturating_add(u16::from(has_hint))
         .saturating_add(SHEET_BOTTOM_GAP)
 }
 
 /// 给定面板总高度时真正能显示的内容行数。
-pub(crate) fn palette_sheet_content_rows(height: u16, has_hint: bool) -> u16 {
+pub(crate) fn palette_sheet_content_rows(height: u16, has_hint: bool, shape: SheetShape) -> u16 {
     height
-        .saturating_sub(1)
+        .saturating_sub(shape.border_rows())
         .saturating_sub(u16::from(has_hint))
         .saturating_sub(SHEET_BOTTOM_GAP)
+}
+
+/// 内容区宽度：调用方按它构造不折行的行，折行估算与实际绘制因此落在同一条基准上。
+///
+/// 带宽边框的外形要扣掉左右边框与内边距，否则色条会顶穿右边框。
+pub(crate) fn palette_sheet_content_width(anchor: Rect, shape: SheetShape) -> u16 {
+    anchor
+        .width
+        .saturating_sub(shape.horizontal_inset().saturating_mul(2))
 }
 
 /// 输入盒上方的可用高度：面板向上生长，但不能越过画布顶部。
@@ -71,10 +119,11 @@ pub(crate) fn palette_sheet_viewport(
     anchor: Rect,
     content_rows: u16,
     has_hint: bool,
+    shape: SheetShape,
 ) -> (u16, u16) {
-    let height =
-        palette_sheet_height(content_rows, has_hint).min(palette_sheet_capacity(frame, anchor));
-    (height, palette_sheet_content_rows(height, has_hint))
+    let height = palette_sheet_height(content_rows, has_hint, shape)
+        .min(palette_sheet_capacity(frame, anchor));
+    (height, palette_sheet_content_rows(height, has_hint, shape))
 }
 
 /// 绘制一块命令面板风格的面板，返回实际的内容区矩形。
@@ -89,18 +138,22 @@ pub(crate) fn render_palette_sheet(
     sheet: PaletteSheet<'_>,
 ) -> Rect {
     let has_hint = sheet.hint.is_some();
+    let shape = sheet.shape;
+    let inset = shape.horizontal_inset();
     let height = height.min(palette_sheet_capacity(frame, anchor));
-    let content_rows = palette_sheet_content_rows(height, has_hint);
+    let content_rows = palette_sheet_content_rows(height, has_hint, shape);
     let area = Rect {
         x: anchor.x,
         y: anchor.y.saturating_sub(height),
         width: anchor.width,
         height,
     };
+    // 内容与世界之间留出边框宽度再加一列内边距：文字贴着竖线会显得被挤在框里。
+    let inner_width = area.width.saturating_sub(inset.saturating_mul(2));
     let content_area = Rect {
-        x: area.x,
+        x: area.x.saturating_add(inset),
         y: area.y.saturating_add(1),
-        width: area.width,
+        width: inner_width,
         height: content_rows,
     };
     if area.is_empty() {
@@ -121,24 +174,33 @@ pub(crate) fn render_palette_sheet(
         frame.render_widget(
             Paragraph::new(hint),
             Rect {
-                x: area.x,
+                x: area.x.saturating_add(inset),
                 y: area.y.saturating_add(1).saturating_add(content_rows),
-                width: area.width,
+                width: inner_width,
                 height: 1,
             },
         );
     }
-    // 只画朝上的一条分隔线：面板下方就是输入盒，四面包围会与它的边框叠成双层框。
-    frame.render_widget(
-        Block::new()
-            .borders(Borders::TOP)
-            .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
-            .title(Span::styled(
-                format!(" {} ", sheet.title),
-                Style::new().fg(COLOR_TEXT_SOFT),
-            )),
-        area,
-    );
+    let border = Block::new()
+        .border_style(Style::new().fg(COLOR_BORDER_FOCUS))
+        .title(Span::styled(
+            format!(" {} ", sheet.title),
+            Style::new().fg(COLOR_TEXT_SOFT),
+        ));
+    match shape {
+        // 只画朝上的一条分隔线：面板下方就是输入盒，四面包围会与它的边框叠成双层框。
+        SheetShape::Composer => frame.render_widget(border.borders(Borders::TOP), area),
+        // 下边框画在底部空行之上一行，边框与输入盒之间因此仍留一行空白，不会连成双线。
+        SheetShape::Boxed => frame.render_widget(
+            border
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+            Rect {
+                height: height.saturating_sub(SHEET_BOTTOM_GAP),
+                ..area
+            },
+        ),
+    }
     content_area
 }
 
@@ -259,13 +321,15 @@ mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 
-    /// 内容行、提示行与顶部线的加减必须闭合，否则布局与渲染会算出不同高度。
+    /// 内容行、提示行与外框的加减必须闭合，否则布局与渲染会算出不同高度。
     #[test]
     fn sheet_height_round_trips_content_rows() {
-        for has_hint in [false, true] {
-            for rows in [0u16, 1, 7, 40] {
-                let height = palette_sheet_height(rows, has_hint);
-                assert_eq!(palette_sheet_content_rows(height, has_hint), rows);
+        for shape in [SheetShape::Composer, SheetShape::Boxed] {
+            for has_hint in [false, true] {
+                for rows in [0u16, 1, 7, 40] {
+                    let height = palette_sheet_height(rows, has_hint, shape);
+                    assert_eq!(palette_sheet_content_rows(height, has_hint, shape), rows);
+                }
             }
         }
     }
@@ -277,7 +341,8 @@ mod tests {
         let anchor = Rect::new(2, 15, 30, 3);
         terminal
             .draw(|frame| {
-                let (height, rows) = palette_sheet_viewport(frame, anchor, 4, true);
+                let (height, rows) =
+                    palette_sheet_viewport(frame, anchor, 4, true, SheetShape::Composer);
                 let content_area = render_palette_sheet(
                     frame,
                     anchor,
@@ -288,6 +353,7 @@ mod tests {
                         hint: Some(palette_hint("Esc 关闭")),
                         scroll: 0,
                         wrap: false,
+                        shape: SheetShape::Composer,
                     },
                 );
                 assert_eq!(rows, 4);
@@ -309,6 +375,74 @@ mod tests {
         assert!(compact.contains("Esc关闭"), "{screen}");
     }
 
+    /// 带框面板四面都有边框，内容按左右各两列缩进，下边框与输入盒之间仍留一行空白。
+    #[test]
+    fn boxed_sheet_draws_four_borders_and_insets_content() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        let anchor = Rect::new(0, 12, 40, 2);
+        let mut geometry = None;
+        terminal
+            .draw(|frame| {
+                let (height, rows) =
+                    palette_sheet_viewport(frame, anchor, 3, true, SheetShape::Boxed);
+                let content_area = render_palette_sheet(
+                    frame,
+                    anchor,
+                    height,
+                    PaletteSheet {
+                        title: "上下文",
+                        lines: vec![Line::from("正文")],
+                        hint: Some(palette_hint("Esc 关闭")),
+                        scroll: 0,
+                        wrap: true,
+                        shape: SheetShape::Boxed,
+                    },
+                );
+                geometry = Some((height, rows, content_area));
+            })
+            .unwrap();
+        let (height, rows, content_area) = geometry.expect("应记录面板几何");
+        // 带框外形比只有分隔线的外形多一条下边框。
+        assert_eq!(height, 3 + 2 + 1 + 1);
+        assert_eq!(rows, 3);
+        assert_eq!(content_area.x, anchor.x + 2);
+        assert_eq!(content_area.width, anchor.width - 4);
+        assert_eq!(content_area.y, anchor.y - height + 1);
+
+        let buffer = terminal.backend().buffer();
+        let top = anchor.y - height;
+        let bottom = top + height - SHEET_BOTTOM_GAP - 1;
+        let cell = |x: u16, y: u16| buffer.cell((x, y)).expect("单元格应在画布内");
+        // 四个角都是圆角边框字符，说明四面都画到了。
+        for (x, y, expected) in [
+            (0, top, "╭"),
+            (anchor.width - 1, top, "╮"),
+            (0, bottom, "╰"),
+            (anchor.width - 1, bottom, "╯"),
+        ] {
+            assert_eq!(cell(x, y).symbol(), expected, "({x},{y})");
+        }
+        // 内容比边框多让一列：左竖线之后还有一列内边距。
+        assert_eq!(cell(content_area.x - 1, content_area.y).symbol(), " ");
+        assert_eq!(cell(content_area.x, content_area.y).symbol(), "正");
+        // 下边框与输入盒之间那一行保持空白，不会与输入盒上边框连成双线。
+        assert_eq!(cell(0, bottom + 1).symbol(), " ");
+    }
+
+    /// 内容宽度换算与渲染一致：带宽边框的外形要扣掉边框与内边距。
+    #[test]
+    fn boxed_sheet_content_width_matches_the_rendered_area() {
+        let anchor = Rect::new(3, 10, 60, 2);
+        assert_eq!(
+            palette_sheet_content_width(anchor, SheetShape::Composer),
+            60
+        );
+        assert_eq!(palette_sheet_content_width(anchor, SheetShape::Boxed), 56);
+        // 极窄终端不能让减法回绕。
+        let narrow = Rect::new(0, 10, 3, 1);
+        assert_eq!(palette_sheet_content_width(narrow, SheetShape::Boxed), 0);
+    }
+
     /// 输入盒以上空间不足时面板整体收进画布，不能出现越界写入。
     #[test]
     fn sheet_never_escapes_the_canvas() {
@@ -316,7 +450,8 @@ mod tests {
         let anchor = Rect::new(0, 1, 6, 1);
         terminal
             .draw(|frame| {
-                let (height, rows) = palette_sheet_viewport(frame, anchor, 30, true);
+                let (height, rows) =
+                    palette_sheet_viewport(frame, anchor, 30, true, SheetShape::Composer);
                 assert_eq!(height, 1, "画布只剩一行时面板只能占这一行");
                 assert_eq!(rows, 0);
                 render_palette_sheet(
@@ -329,6 +464,7 @@ mod tests {
                         hint: Some(palette_hint("Esc")),
                         scroll: 0,
                         wrap: true,
+                        shape: SheetShape::Composer,
                     },
                 );
             })
