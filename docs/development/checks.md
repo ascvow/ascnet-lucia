@@ -40,6 +40,22 @@ bun run check --from test         # 从指定步骤开始，执行其后全部�
 
 `--only` 优先于 `--from`。引用不存在的步骤 id 会直接报错，避免检查被静默跳过。
 
+## 依赖安全扫描（单独联网步骤）
+
+CI `.github/workflows/security-audit.yml` 使用固定 cargo-audit 0.22.2，对所有已跟踪 Cargo.lock
+（含独立 Guest workspace）执行 RustSec 扫描并拒绝 warning，每周和依赖 PR 自动运行。
+本地可隔离安装到构建目录，不覆盖全局 cargo 工具或用户 lucia：
+
+```bash
+cargo install cargo-audit --version 0.22.2 --locked --root target/audit-tools
+for lock in $(git ls-files '*Cargo.lock'); do
+  target/audit-tools/bin/cargo-audit audit --file "$lock" --deny warnings
+done
+```
+
+数据库需要联网更新，记录实际提交和时间；一次零告警不等于没有漏洞，不能以编译和测试代替扫描。
+默认离线检查不含本步骤，不为通过检查盲目忽略 RustSec 条目。
+
 ## 不包含的内容
 
 以下测试需要显式触发，不属于标准离线检查：
