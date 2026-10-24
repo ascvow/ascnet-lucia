@@ -1212,10 +1212,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 if !app.accepts_run_stream_output() {
                     continue;
                 }
-                // 工具消息要插在助手正文之后：先把待揭示文本补完，否则后续揭示的文字
-                // 会出现在工具卡片上方，视觉顺序与真实发生顺序相反。
-                app.flush_pending_stream();
-                app.finish_model_thinking();
+                // 工具卡片是正文结束边界：先补完当前批次，再收起光标，后续轮次另起消息。
+                app.start_model_response();
                 #[cfg(feature = "plugins")]
                 let call_id = call.id.clone();
                 app.messages.push(Msg::tool_started(call));
@@ -1237,7 +1235,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         .rev()
                         .find(|message| message.tool_call_id() == Some(delta.call_id.as_str()))
                     {
-                        message.append_tool_output(&delta.delta);
+                        message.append_tool_stream(delta.stream, &delta.delta);
                     }
                 }
             }
@@ -1270,6 +1268,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 if !app.accepts_run_stream_output() {
                     continue;
                 }
+                app.start_model_response();
                 #[cfg(feature = "plugins")]
                 let call_id = call.id.clone();
                 let mut message = Msg::tool_started(call);

@@ -2178,32 +2178,23 @@ fn inline_code_drops_backticks_and_gains_chip_background() {
     assert_eq!(span.style.bg, None, "行内代码不应铺背景色");
 }
 
-/// 标题不再输出字面 `#`：层级靠标记块形状与文字权重区分。
+/// 标题用默认文字色与粗体表达层级，不插入红色方块或额外装饰字符。
 #[test]
 fn markdown_headings_render_without_hash_marks() {
     let lines = markdown_lines("# 一级\n\n## 二级\n\n### 三级", false, 60);
-    let rows = line_texts(&lines);
-    let text = rows.join("\n");
-
-    assert!(!text.contains('#'), "标题不应残留 `#`：{text:?}");
-    assert!(rows[0].contains("■ 一级"), "{text:?}");
-    let second = rows
-        .iter()
-        .find(|row| row.contains("二级"))
-        .expect("二级标题");
-    let third = rows
-        .iter()
-        .find(|row| row.contains("三级"))
-        .expect("三级标题");
-    // 层级越深方块越小：一级实心方块、二级小方块、三级空心方块。
-    assert!(second.contains("▪ 二级"), "{text:?}");
-    assert!(third.contains("▫ 三级"), "{text:?}");
-    let first_mark = lines
-        .iter()
-        .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "■ ")
-        .and_then(|span| span.style.fg);
-    assert_eq!(first_mark, Some(crate::theme::COLOR_USER));
+    let text = line_texts(&lines).join("\n");
+    assert!(!text.contains(['#', '■', '▪', '▫']));
+    for heading in ["一级", "二级", "三级"] {
+        let span = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == heading)
+            .unwrap();
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(span.style.fg, Some(crate::theme::COLOR_TEXT));
+    }
+    let empty = line_texts(&markdown_lines("#", true, 30)).join("\n");
+    assert!(!empty.contains(['■', '#']));
 }
 
 /// 列表项渲染为圆点并带悬挂缩进：续行对齐正文首列，而不是回到行首。
@@ -2225,6 +2216,109 @@ fn markdown_lists_use_bullets_with_hanging_indent() {
     assert!(continuation.starts_with("    "), "{text:?}");
     assert!(!continuation.starts_with("     "), "{text:?}");
     assert!(rows.iter().any(|row| row.contains("• 第二项")), "{text:?}");
+}
+
+/// 围栏长度、类型与完整闭合条件不能让示例代码泄漏为 Markdown 标题。
+#[test]
+fn markdown_nested_and_tilde_fences_keep_code_inside() {
+    for (open, close, inner) in [
+        ("````md", "````", "```rust\n# list_dir: comment\n```"),
+        ("~~~python", "~~~", "# list_dir: comment\n```"),
+        (
+            "```rust",
+            "```",
+            "```not-a-closing-fence\n# list_dir: comment",
+        ),
+    ] {
+        for complete in [false, true] {
+            let input = format!("{open}\n{inner}\n{}", if complete { close } else { "" });
+            let lines = markdown_lines(&input, !complete, 60);
+            let rows = line_texts(&lines);
+            let comment = rows.iter().find(|row| row.contains("# list_dir")).unwrap();
+            assert!(comment.contains('▎'), "{rows:?}");
+            assert!(!rows.join("\n").contains('■'));
+        }
+    }
+}
+
+/// 工具的两个输出流各自拼接，控制序列可跨 chunk，但不能跨流污染正文。
+#[test]
+fn shell_streams_keep_partial_diagnostics_separate() {
+    use agent_tool::ToolOutputStream::{Stderr, Stdout};
+    let mut msg = Msg::tool_started(ToolCall::new(
+        "diagnostic",
+        "shell",
+        json!({"command": "build"}),
+    ));
+    msg.append_tool_stream(Stderr, "\x1b[3");
+    msg.append_tool_stream(Stdout, "Build step 2\n");
+    msg.append_tool_stream(Stderr, "6m788 | DispatchQueue.");
+    msg.append_tool_stream(Stderr, "global(qos: .userInitiated).async {\x1b[0m\n");
+    let rows = line_texts(&msg.to_lines(false, 100));
+    let text = rows.join("\n");
+    assert!(rows.iter().any(|row| row == "  Build step 2"), "{rows:?}");
+    assert!(
+        rows.iter()
+            .any(|row| row == "  788 | DispatchQueue.global(qos: .userInitiated).async {"),
+        "{rows:?}"
+    );
+    assert!(!text.contains("[36m"));
+    assert!(msg.tool_stderr.contains("\x1b[36m"), "原始输出必须保留");
+}
+
+/// 连续日志更新、收起/展开与 resize 后，差分帧必须等于同状态的全新帧，不能残留旧诊断。
+#[test]
+fn diagnostic_redraw_matches_fresh_frame_after_resize() {
+    use crate::theme::{apply_terminal_theme, TerminalColors};
+    use crate::ui::sanitize_terminal_buffer;
+    fn draw(terminal: &mut Terminal<TestBackend>, app: &mut App) {
+        terminal
+            .draw(|frame| {
+                render_root(frame, app);
+                apply_terminal_theme(frame.buffer_mut(), TerminalColors::Ansi);
+                sanitize_terminal_buffer(frame.buffer_mut());
+            })
+            .unwrap();
+    }
+    let (tx, _) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let call = ToolCall::new("diagnostic-redraw", "shell", json!({"command":"build"}));
+    app.messages.push(Msg::tool_started(call));
+    let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+    for (width, completed, expanded) in [
+        (100, false, false),
+        (40, false, true),
+        (16, true, false),
+        (100, true, true),
+    ] {
+        let message = &mut app.messages[0];
+        message.tool_expanded = expanded;
+        if completed {
+            message.kind = MsgKind::ToolOk;
+            message.tool_result = Some(ToolResult::success(
+                "diagnostic-redraw",
+                "shell",
+                json!({"stdout":"done\n","stderr":"","exit_code":0}),
+            ));
+        } else {
+            message.append_tool_stream(agent_tool::ToolOutputStream::Stderr,
+                "\x1b[36m788 |\x1b[0m DispatchQueue.global(qos: .userInitiated).async {\n    | \x1b[33mwarning: capture self\x1b[0m\n中文 e\u{301} 👩‍💻\n");
+        }
+        terminal.backend_mut().resize(width, 32);
+        terminal.resize(Rect::new(0, 0, width, 32)).unwrap();
+        draw(&mut terminal, &mut app);
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut fresh_app = App::new(tx, "测试模型".into());
+        fresh_app.messages = app.messages.clone();
+        let mut fresh = Terminal::new(TestBackend::new(width, 32)).unwrap();
+        draw(&mut fresh, &mut fresh_app);
+        assert_eq!(terminal.backend().buffer(), fresh.backend().buffer());
+        let text = buffer_rows(&terminal, width).join("\n");
+        assert!(!text.contains("[36m") && !text.contains("[33m"));
+        if completed {
+            assert!(!text.contains("DispatchQueue") && !text.contains("capture self"));
+        }
+    }
 }
 
 /// 验证围栏代码块隐藏围栏、保留语言标签、整行铺底色，并且不干扰相邻表格。

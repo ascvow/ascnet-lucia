@@ -391,6 +391,7 @@ fn fingerprint(message: &Msg, streaming: bool) -> u64 {
     hash = write_byte(hash, u8::from(message.tool_expanded));
     hash = write_bytes(hash, message.text.as_bytes());
     hash = write_bytes(hash, message.tool_output.as_bytes());
+    hash = write_bytes(hash, message.tool_stderr.as_bytes());
     if let Some(reason) = message.skip_reason.as_deref() {
         hash = write_bytes(hash, reason.as_bytes());
     }

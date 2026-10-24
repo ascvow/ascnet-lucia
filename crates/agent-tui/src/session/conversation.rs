@@ -183,8 +183,10 @@ pub(crate) struct Msg {
     pub(crate) tool_call: Option<ToolCall>,
     /// 工具消息关联的完整结果；运行中或普通消息为 `None`。
     pub(crate) tool_result: Option<ToolResult>,
-    /// 工具运行期间已收到的增量输出；完成后由结构化结果接管展示。
+    /// 运行期标准输出；与标准错误分开拼接，避免不同 pipe 的半行互相插入。
     pub(crate) tool_output: String,
+    /// 运行期标准错误；展示时在标准输出之后另起一行，与完成态的顺序一致。
+    pub(crate) tool_stderr: String,
     /// 工具未执行时的原因；其他消息为 `None`。
     pub(crate) skip_reason: Option<String>,
     /// 工具详情是否展开；新消息默认收起，只保留标题与结果摘要。
@@ -216,6 +218,7 @@ impl Msg {
             tool_call: None,
             tool_result: None,
             tool_output: String::new(),
+            tool_stderr: String::new(),
             skip_reason: None,
             tool_expanded: false,
             #[cfg(feature = "plugins")]
@@ -291,21 +294,42 @@ impl Msg {
             Some(result) => {
                 preview_lines(self.tool_call.as_ref(), result, TOOL_RESULT_PREVIEW_LINES)
             }
-            None if self.tool_output.is_empty() => return false,
-            None => output_preview_lines(&self.tool_output, TOOL_RESULT_PREVIEW_LINES),
+            None if self.tool_output.is_empty() && self.tool_stderr.is_empty() => return false,
+            None => output_preview_lines(&self.live_tool_output(), TOOL_RESULT_PREVIEW_LINES),
         };
         preview.iter().any(PreviewLine::is_elided)
     }
 
-    /// 向运行中的工具消息追加输出；调用 ID 的匹配由上层状态机负责。
+    /// 测试用标准输出入口；生产事件必须携带输出流来源。
+    #[cfg(test)]
     pub(crate) fn append_tool_output(&mut self, delta: &str) {
-        self.tool_output.push_str(delta);
-        if self.tool_output.len() > TOOL_LIVE_OUTPUT_BYTES {
-            let mut start = self.tool_output.len() - TOOL_LIVE_OUTPUT_BYTES;
-            while !self.tool_output.is_char_boundary(start) {
+        self.append_tool_stream(agent_tool::ToolOutputStream::Stdout, delta);
+    }
+
+    /// 按来源追加运行期日志，两个 pipe 的不完整行和 ANSI 序列不能互相拼接。
+    pub(crate) fn append_tool_stream(&mut self, stream: agent_tool::ToolOutputStream, delta: &str) {
+        let output = match stream {
+            agent_tool::ToolOutputStream::Stdout => &mut self.tool_output,
+            agent_tool::ToolOutputStream::Stderr => &mut self.tool_stderr,
+        };
+        output.push_str(delta);
+        if output.len() > TOOL_LIVE_OUTPUT_BYTES / 2 {
+            let mut start = output.len() - TOOL_LIVE_OUTPUT_BYTES / 2;
+            while !output.is_char_boundary(start) {
                 start += 1;
             }
-            self.tool_output = format!("… [较早输出已省略]\n{}", &self.tool_output[start..]);
+            *output = format!("… [较早输出已省略]\n{}", &output[start..]);
+        }
+    }
+
+    /// 各流先独立清洗再合成显示副本，末尾未完成控制序列不能吞掉另一条流。
+    fn live_tool_output(&self) -> String {
+        let stdout = crate::ui::plain_terminal_text(&self.tool_output);
+        let stderr = crate::ui::plain_terminal_text(&self.tool_stderr);
+        match (stdout.is_empty(), stderr.is_empty()) {
+            (true, _) => stderr.into_owned(),
+            (_, true) => stdout.into_owned(),
+            _ => format!("{}\n{}", stdout.trim_end_matches('\n'), stderr),
         }
     }
 
@@ -317,6 +341,7 @@ impl Msg {
             tool_call: None,
             tool_result: None,
             tool_output: String::new(),
+            tool_stderr: String::new(),
             skip_reason: None,
             tool_expanded: false,
             #[cfg(feature = "plugins")]
@@ -362,13 +387,18 @@ impl Msg {
                 } else {
                     self.text.clone()
                 };
-                vec![
-                    Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(text, Style::new().fg(color).bold()),
-                    ]),
-                    Line::default(),
-                ]
+                let text = crate::ui::plain_terminal_text(&text);
+                let mut lines: Vec<_> = text
+                    .lines()
+                    .map(|row| {
+                        Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(row.to_owned(), Style::new().fg(color).bold()),
+                        ])
+                    })
+                    .collect();
+                lines.push(Line::default());
+                lines
             }
         }
     }
@@ -440,7 +470,7 @@ impl Msg {
                     preview_language(call, result),
                 ),
                 None => (
-                    output_preview_lines(&self.tool_output, limit),
+                    output_preview_lines(&self.live_tool_output(), limit),
                     CodeLanguage::Plain,
                 ),
             }

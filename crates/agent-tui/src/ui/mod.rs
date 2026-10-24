@@ -46,6 +46,81 @@ pub(crate) fn sanitize_terminal_buffer(buffer: &mut ratatui::buffer::Buffer) {
     }
 }
 
+/// 将日志中的终端命令降为纯文本，必须在测量、截断与 diff 分类之前调用。
+///
+/// 只清洗显示副本：CSI/OSC/DCS 等序列（包括未收完的尾部）整段丢弃，不解释光标、
+/// 剪贴板或颜色指令；CRLF 归一为换行，单独 CR 作为日志行边界，不模拟终端覆盖。
+/// 制表符留给行号识别与代码缩进处理，Unicode 组合符与 ZWJ 原样保留。
+pub(crate) fn plain_terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if !text
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+    {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let command = match ch {
+            '\x1b' => match chars.next() {
+                Some(next) => next,
+                None => break,
+            },
+            '\u{009b}' => '[',
+            '\u{009d}' => ']',
+            '\u{0090}' => 'P',
+            '\u{0098}' => 'X',
+            '\u{009e}' => '^',
+            '\u{009f}' => '_',
+            '\r' => {
+                if chars.peek() != Some(&'\n') {
+                    out.push('\n');
+                }
+                continue;
+            }
+            '\n' | '\t' => {
+                out.push(ch);
+                continue;
+            }
+            ch if ch.is_control() => continue,
+            ch => {
+                out.push(ch);
+                continue;
+            }
+        };
+        match command {
+            '[' => {
+                for next in chars.by_ref() {
+                    if ('\u{0040}'..='\u{007e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            ']' | 'P' | 'X' | '^' | '_' => {
+                while let Some(next) = chars.next() {
+                    if next == '\u{009c}' || (command == ']' && next == '\x07') {
+                        break;
+                    }
+                    if next == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            '\u{0020}'..='\u{002f}' => {
+                for next in chars.by_ref() {
+                    if !('\u{0020}'..='\u{002f}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// 把一条带样式的逻辑行按显示宽度折成多条视觉行。
 ///
 /// 折行优先落在空格处，只有单词长于一整行时才按字符硬断；宽度按 Unicode 显示宽度计算，
@@ -188,6 +263,32 @@ mod wrap_tests {
         buffer[(0, 0)].set_symbol("\x1b]52;test\x07");
         sanitize_terminal_buffer(&mut buffer);
         assert_eq!(buffer[(0, 0)].symbol(), "]52;test");
+    }
+
+    /// 带颜色的诊断在排版前完整去掉控制序列，未完成序列不泄漏可打印残片。
+    #[test]
+    fn terminal_log_sequences_are_removed_before_layout() {
+        let text = "\x1b[36m788 |\x1b[0m code\r\n\x1b[33mwarning\x1b[0m\n";
+        assert_eq!(plain_terminal_text(text), "788 | code\nwarning\n");
+        assert_eq!(plain_terminal_text("old\rnew\n"), "old\nnew\n");
+        assert_eq!(
+            plain_terminal_text("a\x1b]52;c;secret\x07b\x1bPprivate\x1b\\c"),
+            "abc"
+        );
+        assert_eq!(
+            plain_terminal_text("a\u{009b}31mb\u{009d}secret\u{009c}c"),
+            "abc"
+        );
+        for tail in [
+            "\x1b",
+            "\x1b[38;2;",
+            "\x1b]8;;unfinished",
+            "\x1bPunfinished",
+        ] {
+            assert_eq!(plain_terminal_text(&format!("正文{tail}")), "正文");
+        }
+        let unicode = "中 e\u{301} 👩\u{200d}💻 ✈\u{fe0f} العربية\tend";
+        assert_eq!(plain_terminal_text(unicode), unicode);
     }
 
     /// 折行优先落在空格处，不把单词切成两半。

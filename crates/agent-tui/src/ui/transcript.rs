@@ -51,20 +51,7 @@ fn relative_path(path: &str) -> &str {
 
 /// 把绝对路径压缩为相对当前工作目录的短路径，便于在窄终端阅读。
 fn shorten_path(path: &str) -> String {
-    let relative = relative_path(path);
-    if unicode_width::UnicodeWidthStr::width(relative) <= MAX_TARGET_WIDTH {
-        return relative.to_string();
-    }
-    // 超长路径保留末尾的文件名部分，前缀折叠为省略号：定位文件时文件名比目录更关键。
-    let tail: String = relative
-        .chars()
-        .rev()
-        .take(MAX_TARGET_WIDTH - 1)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("…{tail}")
+    elide_path(relative_path(path), MAX_TARGET_WIDTH)
 }
 
 /// 返回工具标题括号中展示的目标。
@@ -430,8 +417,12 @@ fn result_body(result: &ToolResult) -> Option<String> {
             if let Some(body) = outcome_body(&result.content) {
                 return Some(body.to_string());
             }
-            let stdout = text_field(&result.content, "stdout").unwrap_or_default();
-            let stderr = text_field(&result.content, "stderr").unwrap_or_default();
+            let stdout = crate::ui::plain_terminal_text(
+                text_field(&result.content, "stdout").unwrap_or_default(),
+            );
+            let stderr = crate::ui::plain_terminal_text(
+                text_field(&result.content, "stderr").unwrap_or_default(),
+            );
             let combined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
                 (true, true) => return None,
                 (false, true) => stdout.to_string(),
@@ -504,6 +495,7 @@ pub(crate) fn preview_lines(
         };
     }
 
+    let text = crate::ui::plain_terminal_text(&text);
     let rows: Vec<&str> = text.lines().collect();
     let total = rows.len();
     let is_diff = diff::looks_like_diff(&rows);
@@ -565,7 +557,7 @@ pub(crate) fn preview_lines(
             (None, row as &str)
         };
         lines.push(PreviewLine::Context {
-            number: number.or(Some(index + 1)),
+            number: number.or_else(|| (result.name != "shell").then_some(index + 1)),
             text: body.trim_end().to_string(),
         });
     }
@@ -582,6 +574,7 @@ pub(crate) fn preview_lines(
 /// 运行中的 `git diff` 同样要按 diff 渲染：否则命令跑完是一个样子、跑的过程中又是另一个
 /// 样子，读者会以为界面在闪烁。分类按完整的已收输出计算，hunk 状态才不会从中间断掉。
 pub(crate) fn output_preview_lines(text: &str, max_lines: usize) -> Vec<PreviewLine> {
+    let text = crate::ui::plain_terminal_text(text);
     let rows: Vec<&str> = text.lines().collect();
     let start = rows.len().saturating_sub(max_lines);
     let mut lines: Vec<PreviewLine> = Vec::with_capacity(max_lines + 1);
@@ -663,7 +656,11 @@ fn truncate_body(text: &str, width: usize) -> String {
 /// 与正文用的尾部截断相反：定位一条命中时文件名才是关键，先被丢掉的不该是它。这里从
 /// 右往左拼回目录段，拼不下的部分统一折叠为一个 `…/` 前缀。
 fn elide_path(text: &str, width: usize) -> String {
-    let width = width.max(1);
+    if width == 0 {
+        return String::new();
+    }
+    let clean = crate::ui::plain_terminal_text(text).replace(['\n', '\t'], " ");
+    let text = clean.as_str();
     if unicode_width::UnicodeWidthStr::width(text) <= width {
         return text.to_string();
     }
@@ -681,18 +678,24 @@ fn elide_path(text: &str, width: usize) -> String {
         tail = candidate;
     }
     if tail.is_empty() {
-        // 连文件名都放不下：退回按字符保留尾部，至少留下可辨识的后缀。
-        let mut kept = String::new();
-        let mut used = 0usize;
-        for character in text.chars().rev() {
-            let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
-            if used + character_width + 1 > width {
+        // 连文件名都放不下时按完整字素保留尾部，不能拆开重音、ZWJ 或变体选择符。
+        let line = Line::raw(text);
+        let graphemes: Vec<_> = line.styled_graphemes(Style::default()).collect();
+        let mut start = graphemes.len();
+        let mut used = 1;
+        while start > 0 {
+            let cells = unicode_width::UnicodeWidthStr::width(graphemes[start - 1].symbol);
+            if used + cells > width {
                 break;
             }
-            used += character_width;
-            kept.insert(0, character);
+            used += cells;
+            start -= 1;
         }
-        return format!("…{kept}");
+        let mut kept = String::from("…");
+        for grapheme in &graphemes[start..] {
+            kept.push_str(grapheme.symbol);
+        }
+        return kept;
     }
     format!("…/{tail}")
 }
@@ -747,7 +750,10 @@ pub(crate) fn render_preview(
     language: CodeLanguage,
     error: bool,
 ) -> Vec<Line<'static>> {
-    let total_width = usize::from(width).max(1);
+    if width == 0 {
+        return Vec::new();
+    }
+    let total_width = usize::from(width);
     // 目录、搜索一类的条目没有行号，整块都没有时收起号位，避免白占一列缩进。
     let show_gutter = lines.iter().any(|line| match line {
         PreviewLine::Context { number, .. }
@@ -852,6 +858,22 @@ pub(crate) fn render_preview(
                 body_width,
                 error,
             ),
+        })
+        .map(|line| {
+            // 极窄区域宁可裁掉不可见尾部，也不能让固定号位引发第二次自动折行。
+            if line.width() <= total_width {
+                return line;
+            }
+            let mut used = 0;
+            let spans: Vec<_> = line
+                .styled_graphemes(Style::default())
+                .take_while(|g| {
+                    used += unicode_width::UnicodeWidthStr::width(g.symbol);
+                    used <= total_width
+                })
+                .map(|g| Span::styled(g.symbol.to_owned(), g.style))
+                .collect();
+            Line::from(spans)
         })
         .collect()
 }
@@ -973,6 +995,70 @@ mod tests {
     use super::*;
     use crate::theme::{COLOR_DIFF_ADD_FG, COLOR_DIFF_FILE_HEADER, COLOR_DIFF_HUNK};
     use serde_json::json;
+
+    /// 路径按字素保留文件尾部；极窄区域不能产生额外折行。
+    #[test]
+    fn path_elision_and_preview_respect_grapheme_width() {
+        assert_eq!(elide_path("dir/e\u{301}.rs", 4), "….rs");
+        assert_eq!(elide_path("dir/👩\u{200d}💻.rs", 6), "…👩\u{200d}💻.rs");
+        let path = format!("{}/manager.rs", "中".repeat(60));
+        let short = shorten_path(&path);
+        assert!(short.ends_with("manager.rs"));
+        assert!(unicode_width::UnicodeWidthStr::width(short.as_str()) <= MAX_TARGET_WIDTH);
+        let result = ToolResult::success(
+            "s",
+            "search_files",
+            json!({"matches":[
+                {"file": path, "line": 123456, "content": "let code = 1;"}
+            ]}),
+        );
+        let preview = preview_lines(None, &result, 8);
+        for width in [0, 1, 2, 5, 8, 16, 32, 80] {
+            let lines = render_preview(&preview, width, CodeLanguage::Plain, false);
+            assert!(lines.iter().all(|line| line.width() <= usize::from(width)));
+            if width >= 32 {
+                let text = lines
+                    .iter()
+                    .map(Line::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    text.contains("manager.rs")
+                        && text.contains("123456")
+                        && text.contains("let code"),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    /// 带 ANSI 的编译日志在运行态和完成态都不泄漏控制残片，也不添加第二套行号。
+    #[test]
+    fn shell_diagnostics_are_plain_and_keep_compiler_gutters() {
+        let output = "\x1b[36m788 |\x1b[0m let code = 1;\n    | \x1b[33mwarning: capture\x1b[0m\n";
+        let result = ToolResult::success("c", "shell", json!({"stdout":output,"exit_code":0}));
+        let before = result.clone();
+        let live = render_preview(
+            &output_preview_lines(output, 8),
+            60,
+            CodeLanguage::Plain,
+            false,
+        );
+        let done = render_preview(
+            &preview_lines(None, &result, 8),
+            60,
+            CodeLanguage::Plain,
+            false,
+        );
+        assert_eq!(live, done);
+        assert_eq!(done[0].to_string(), "  788 | let code = 1;");
+        assert_eq!(done[1].to_string(), "      | warning: capture");
+        assert_eq!(result.content, before.content);
+        assert_eq!(
+            tool_summary(None, &result).as_deref(),
+            Some("788 | let code = 1;")
+        );
+    }
 
     /// 拼接一行的全部片段文本。
     fn text_of(line: &Line<'_>) -> String {
@@ -1253,7 +1339,7 @@ mod tests {
         assert_eq!(
             lines[0],
             PreviewLine::Context {
-                number: Some(1),
+                number: None,
                 text: "12:00:01 starting".into()
             }
         );
@@ -1708,7 +1794,7 @@ mod result_shape_tests {
         assert_eq!(
             lines[1],
             PreviewLine::Context {
-                number: Some(2),
+                number: None,
                 text: "42\t被误判的一行".into()
             }
         );

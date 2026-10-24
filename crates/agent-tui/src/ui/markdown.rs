@@ -245,12 +245,10 @@ fn split_markdown_blocks(text: &str) -> Vec<MdBlock<'_>> {
     let mut blocks = Vec::new();
     let mut index = 0;
     while index < rows.len() {
-        let trimmed = rows[index].trim_start();
-        if let Some(language) = trimmed.strip_prefix("```") {
-            let language = language.trim();
+        if let Some((marker, length, language)) = opening_fence(rows[index]) {
             index += 1;
             let mut code = Vec::new();
-            while index < rows.len() && !rows[index].trim_start().starts_with("```") {
+            while index < rows.len() && !closing_fence(rows[index], marker, length) {
                 code.push(rows[index]);
                 index += 1;
             }
@@ -281,6 +279,28 @@ fn split_markdown_blocks(text: &str) -> Vec<MdBlock<'_>> {
         index += 1;
     }
     blocks
+}
+
+/// 识别反引号或波浪号围栏；记录长度，避免内层示例的短围栏提前结束外层代码块。
+fn opening_fence(line: &str) -> Option<(char, usize, &str)> {
+    let line = line.trim_start();
+    let marker = line.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let length = line.chars().take_while(|ch| *ch == marker).count();
+    let info = &line[length..];
+    if length < 3 || (marker == '`' && info.contains('`')) {
+        return None;
+    }
+    Some((marker, length, info.trim()))
+}
+
+/// 闭合围栏必须同型、不短于开头，且尾部只有空白；流式未闭合时继续按代码呈现。
+fn closing_fence(line: &str, marker: char, length: usize) -> bool {
+    let line = line.trim_start();
+    let count = line.chars().take_while(|ch| *ch == marker).count();
+    count >= length && line[count..].trim().is_empty()
 }
 
 /// 把单行文本归类为对应的 Markdown 块，无法识别的按正文处理。
@@ -434,20 +454,17 @@ fn soften_spans(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// 渲染标题：终端没有字号，层级靠标记形状与颜色区分。
-///
-/// 标记刻意不用竖条：竖条已被代码块（`▎`）与引用（`▏`）占用，标题再用会让三种
-/// 结构混在一起。层级越深方块越小、颜色越次要。
+/// 渲染标题：使用文字权重与块间距，不插入易被误认成异常字符的红色方块。
 fn render_heading(level: u8, text: &str, body_width: usize, out: &mut Vec<Line<'static>>) {
+    if text.is_empty() {
+        return;
+    }
     if out.last().is_some_and(|line| line.width() > 0) {
         out.push(Line::default());
     }
-    let (mark, mark_color, text_style) = match level {
-        1 => ("■", COLOR_USER, Style::new().fg(COLOR_TEXT).bold()),
-        2 => ("▪", COLOR_MUTED, Style::new().fg(COLOR_TEXT).bold()),
-        3 => ("▫", COLOR_MUTED, Style::new().fg(COLOR_TEXT).bold()),
-        _ => ("·", COLOR_SEPARATOR, Style::new().fg(COLOR_MUTED).bold()),
-    };
+    let text_style = Style::new()
+        .fg(if level <= 3 { COLOR_TEXT } else { COLOR_MUTED })
+        .bold();
     let spans: Vec<Span<'static>> = inline_spans(text)
         .into_iter()
         .map(|span| {
@@ -455,12 +472,8 @@ fn render_heading(level: u8, text: &str, body_width: usize, out: &mut Vec<Line<'
             Span::styled(span.content, style)
         })
         .collect();
-    let chunks = wrap_inline(spans, body_width.saturating_sub(2).max(1));
-    let first = vec![Span::styled(
-        format!("{mark} "),
-        Style::new().fg(mark_color).bold(),
-    )];
-    push_wrapped(out, chunks, first, 2);
+    let chunks = wrap_inline(spans, body_width);
+    push_wrapped(out, chunks, Vec::new(), 0);
 }
 
 /// 渲染列表项：无序列表用圆点，续行与正文首列对齐形成悬挂缩进。
@@ -953,22 +966,18 @@ pub(crate) fn summarize_json(value: &Value, max_width: usize) -> String {
 
 /// 将文本压平为单行并按显示宽度截断，超出部分以省略号结尾。
 pub(crate) fn truncate_line(text: &str, max_width: usize) -> String {
+    let clean = crate::ui::plain_terminal_text(text).replace(['\n', '\r', '\t'], " ");
+    let line = Line::raw(clean);
     let mut output = String::new();
     let mut width = 0;
-    for ch in text.chars() {
-        // 换行与制表符替换为空格，保证摘要始终是单行。
-        let ch = if ch == '\n' || ch == '\r' || ch == '\t' {
-            ' '
-        } else {
-            ch
-        };
-        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_width > max_width {
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let cells = unicode_width::UnicodeWidthStr::width(grapheme.symbol);
+        if width + cells > max_width {
             output.push('…');
             break;
         }
-        output.push(ch);
-        width += ch_width;
+        output.push_str(grapheme.symbol);
+        width += cells;
     }
     output
 }

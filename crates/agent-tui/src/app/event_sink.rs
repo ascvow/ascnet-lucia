@@ -18,26 +18,37 @@ use tokio::sync::mpsc;
 /// 合并模型文本增量，避免慢速终端为每个 token 累积一个无界通道事件。
 #[derive(Default)]
 pub(crate) struct ModelDeltaBuffer {
-    text: String,
+    batches: std::collections::VecDeque<String>,
     notification_pending: bool,
 }
 
 impl ModelDeltaBuffer {
     /// 追加文本，并返回是否需要向 UI 发送新的就绪通知。
     fn push(&mut self, delta: &str) -> bool {
-        self.text.push_str(delta);
-        if self.notification_pending {
-            false
-        } else {
+        let notify = !self.notification_pending;
+        if notify {
+            self.batches.push_back(String::new());
             self.notification_pending = true;
-            true
         }
+        self.batches
+            .back_mut()
+            .expect("增量已有对应批次")
+            .push_str(delta);
+        notify
     }
 
-    /// 取出当前全部文本并允许生产者发送下一次就绪通知。
-    pub(crate) fn take(&mut self) -> String {
+    /// 关闭当前合批窗口；已排队通知仍只消费自己的批次，不能跨过结构事件读走未来正文。
+    fn seal(&mut self) {
         self.notification_pending = false;
-        std::mem::take(&mut self.text)
+    }
+
+    /// 按通知顺序取出一个批次；后续轮次即使已经到达，也必须等它自己的通知。
+    pub(crate) fn take(&mut self) -> String {
+        let text = self.batches.pop_front().unwrap_or_default();
+        if self.batches.is_empty() {
+            self.notification_pending = false;
+        }
+        text
     }
 }
 
@@ -48,26 +59,37 @@ impl ModelDeltaBuffer {
 /// 路径。这里按到达顺序保留全部 chunk，UI 一次取走并顺序拼接，保证输出不乱序、不丢失。
 #[derive(Default)]
 pub(crate) struct ToolOutputBuffer {
-    deltas: Vec<ToolOutputDelta>,
+    batches: std::collections::VecDeque<Vec<ToolOutputDelta>>,
     notification_pending: bool,
 }
 
 impl ToolOutputBuffer {
     /// 追加一段输出，并返回是否需要向 UI 发送新的就绪通知。
     fn push(&mut self, delta: ToolOutputDelta) -> bool {
-        self.deltas.push(delta);
-        if self.notification_pending {
-            false
-        } else {
+        let notify = !self.notification_pending;
+        if notify {
+            self.batches.push_back(Vec::new());
             self.notification_pending = true;
-            true
         }
+        self.batches
+            .back_mut()
+            .expect("工具输出已有对应批次")
+            .push(delta);
+        notify
     }
 
-    /// 取出当前积累的全部输出片段并允许生产者发送下一次就绪通知。
-    pub(crate) fn take(&mut self) -> Vec<ToolOutputDelta> {
+    /// 工具生命周期事件关闭当前批次，防止消费时读到尚未创建消息的下一次调用输出。
+    fn seal(&mut self) {
         self.notification_pending = false;
-        std::mem::take(&mut self.deltas)
+    }
+
+    /// 按通知顺序取走一批输出，不能跨过工具开始或结束事件。
+    pub(crate) fn take(&mut self) -> Vec<ToolOutputDelta> {
+        let deltas = self.batches.pop_front().unwrap_or_default();
+        if self.batches.is_empty() {
+            self.notification_pending = false;
+        }
+        deltas
     }
 }
 
@@ -119,6 +141,35 @@ impl ChannelEventSink {
 #[async_trait]
 impl EventSink for ChannelEventSink {
     async fn record(&self, event: &AgentEvent) -> Result<()> {
+        if matches!(
+            event.kind,
+            AgentEventKind::ToolStarted
+                | AgentEventKind::ToolFinished
+                | AgentEventKind::ToolSkipped
+                | AgentEventKind::RunFinished
+        ) {
+            self.tool_output
+                .lock()
+                .expect("工具输出缓冲区锁不应中毒")
+                .seal();
+        }
+        if matches!(
+            event.kind,
+            AgentEventKind::ModelRequest
+                | AgentEventKind::ModelResponse
+                | AgentEventKind::ToolStarted
+                | AgentEventKind::ToolSkipped
+                | AgentEventKind::RunFinished
+        ) {
+            self.model_deltas
+                .lock()
+                .expect("模型增量缓冲区锁不应中毒")
+                .seal();
+            self.thinking_deltas
+                .lock()
+                .expect("推理摘要增量缓冲区锁不应中毒")
+                .seal();
+        }
         match event.kind {
             AgentEventKind::ModelRequest => {
                 if let Some(snapshot) = event

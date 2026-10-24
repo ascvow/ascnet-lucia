@@ -270,7 +270,7 @@ impl AgentSessionView {
                         .rev()
                         .find(|message| message.tool_call_id() == Some(delta.call_id.as_str()))
                     {
-                        message.append_tool_output(&delta.delta);
+                        message.append_tool_stream(delta.stream, &delta.delta);
                     }
                 }
             }

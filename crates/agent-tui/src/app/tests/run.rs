@@ -335,6 +335,141 @@ async fn channel_event_sink_coalesces_model_text_notifications() {
     assert!(matches!(rx.recv().await, Some(UiEvent::ModelTextReady)));
 }
 
+/// UI 延迟消费时，不同模型轮次必须保持正文—工具—正文顺序，不能合进同一缓冲批次。
+#[tokio::test]
+async fn channel_event_sink_separates_text_at_model_and_tool_boundaries() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, model_deltas, _, _) = ChannelEventSink::new(tx);
+    let call = ToolCall::new("edit-boundary", "edit_file", json!({"path":"a.rs"}));
+    for (kind, step, payload) in [
+        (AgentEventKind::ModelRequest, 0, json!({})),
+        (
+            AgentEventKind::ModelTextDelta,
+            0,
+            json!({"delta":"先编辑。"}),
+        ),
+        (
+            AgentEventKind::ToolStarted,
+            0,
+            serde_json::to_value(&call).unwrap(),
+        ),
+        (AgentEventKind::ModelRequest, 1, json!({})),
+        (
+            AgentEventKind::ModelTextDelta,
+            1,
+            json!({"delta":"```rust\nfn done() {}\n```"}),
+        ),
+    ] {
+        sink.record(&AgentEvent::new("batched", kind, step, payload))
+            .await
+            .unwrap();
+    }
+    let (tx, _) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.running = true;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            UiEvent::ModelStarted => app.start_model_response(),
+            UiEvent::ModelTextReady => app.queue_model_delta(&model_deltas.lock().unwrap().take()),
+            UiEvent::ToolStarted(call) => {
+                app.start_model_response();
+                assert!(app.streaming_message.is_none());
+                app.messages.push(Msg::tool_started(call));
+            }
+            _ => {}
+        }
+    }
+    app.flush_pending_stream();
+    assert_eq!(app.messages.len(), 3);
+    assert_eq!(app.messages[0].text, "先编辑。");
+    assert!(app.messages[1].is_tool());
+    assert_eq!(app.messages[2].text, "```rust\nfn done() {}\n```");
+}
+
+/// 慢速消费者不能在第二条工具消息创建前提前取走它的输出。
+#[tokio::test]
+async fn tool_output_batches_do_not_cross_call_start_events() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, _, _, output) = ChannelEventSink::new(tx);
+    for id in ["first", "second"] {
+        let call = ToolCall::new(id, "shell", json!({"command":"build"}));
+        sink.record(&AgentEvent::new(
+            "tools",
+            AgentEventKind::ToolStarted,
+            0,
+            serde_json::to_value(call).unwrap(),
+        ))
+        .await
+        .unwrap();
+        sink.record(&AgentEvent::new(
+            "tools",
+            AgentEventKind::ToolOutputDelta,
+            0,
+            json!({"call_id":id,"stream":"stdout","delta":format!("{id}\n")}),
+        ))
+        .await
+        .unwrap();
+    }
+    let mut messages: Vec<Msg> = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            UiEvent::ToolStarted(call) => messages.push(Msg::tool_started(call)),
+            UiEvent::ToolOutputReady => {
+                for delta in output.lock().unwrap().take() {
+                    let message = messages
+                        .iter_mut()
+                        .find(|msg| msg.tool_call_id() == Some(delta.call_id.as_str()))
+                        .expect("输出不得提前于工具开始事件");
+                    message.append_tool_stream(delta.stream, &delta.delta);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(messages[0].tool_output, "first\n");
+    assert_eq!(messages[1].tool_output, "second\n");
+}
+
+/// 扩展展示只读取通用 presentation，不解析插件 payload；多行与终端控制序列安全呈现。
+#[tokio::test]
+async fn extension_presentation_preserves_multiline_text() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, _, _, _) = ChannelEventSink::new(tx);
+    sink.record(&AgentEvent::new("extension", AgentEventKind::Extension, 0, json!({
+        "name":"example.message.sent", "data":{"text":"不应显示"},
+        "presentation":{"target":"main_event_list","text":"@审查员: 第一行\n第二行 👩‍💻\n\u{001b}[36m第三行\u{001b}[0m"}
+    }))).await.unwrap();
+    let Some(UiEvent::Extension {
+        text,
+        color,
+        divider,
+    }) = rx.recv().await
+    else {
+        panic!("缺少展示事件");
+    };
+    let msg = Msg::extension(text, color, divider);
+    let lines = msg.to_lines(false, 40);
+    assert_eq!(lines[0].to_string(), "  @审查员: 第一行");
+    assert_eq!(lines[1].to_string(), "  第二行 👩‍💻");
+    assert_eq!(lines[2].to_string(), "  第三行");
+    for width in [12, 40, 80] {
+        let mut layout = crate::ui::transcript_layout::TranscriptLayout::default();
+        let height = layout.sync(std::slice::from_ref(&msg), None, width);
+        assert!(height >= 4);
+        let buffer = layout.render_range(
+            ratatui::layout::Rect::new(0, 0, width, 20),
+            std::slice::from_ref(&msg),
+            None,
+            0,
+            20,
+        );
+        assert!(buffer
+            .content
+            .iter()
+            .all(|cell| !cell.symbol().chars().any(char::is_control)));
+    }
+}
+
 /// 新请求的分类快照通过事件边界传递，缺少该字段的旧请求仍可启动显示。
 #[tokio::test]
 async fn channel_event_sink_accepts_context_snapshot_and_legacy_requests() {
