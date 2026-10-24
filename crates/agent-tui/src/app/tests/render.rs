@@ -392,8 +392,9 @@ fn main_content_keeps_two_column_padding() {
         "卡片底色应铺到正文区左边界"
     );
     let footer_row = rows.last().expect("底栏应存在");
+    // 底栏不再有品牌前缀，仍必须与正文左对齐，不能留缩进。
     assert!(
-        footer_row.starts_with("  lucia"),
+        !footer_row.starts_with(' '),
         "底栏应与正文左对齐：{footer_row:?}"
     );
 }
@@ -1443,7 +1444,12 @@ fn table_columns_expand_with_available_width() {
     let table = format!("| 测试 | 结果 |\n| --- | --- |\n| {CASE} | ok |\n");
     let narrow = line_texts(&markdown_lines(&table, false, 60));
     let wide = line_texts(&markdown_lines(&table, false, 180));
-    let widest = |rows: &[String]| rows.iter().map(|row| row.chars().count()).max().unwrap_or(0);
+    let widest = |rows: &[String]| {
+        rows.iter()
+            .map(|row| row.chars().count())
+            .max()
+            .unwrap_or(0)
+    };
 
     assert!(
         widest(&wide) > widest(&narrow),

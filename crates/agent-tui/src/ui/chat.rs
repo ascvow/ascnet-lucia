@@ -354,11 +354,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) {
         }
     }
 
-    // 底部信息行：品牌标识、模型、工作目录与当前上下文 token 数，窄终端时隐藏目录。
-    // 层级：品牌与模型是主动作信息，其余（思考强度、目录、分支、分隔符）退到元信息灰。
+    // 底部信息行：模型、工作目录与当前上下文 token 数，窄终端时隐藏目录。
+    // 层级：模型是主动作信息，其余（思考强度、目录、分支、分隔符）退到元信息灰。
     let mut footer = vec![
-        Span::styled("lucia", Style::new().fg(COLOR_USER).bold()),
-        Span::raw("  "),
         Span::styled(app.model_name.as_str(), Style::new().fg(COLOR_TEXT)),
         Span::styled("  |  ", Style::new().fg(COLOR_META)),
         Span::styled(
