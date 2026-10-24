@@ -14,8 +14,9 @@ mod search;
 use agent_plugin::{
     export_plugin, ActivationContext, AgentPlugin, EventOutcome, PluginEvent, PluginHostApi,
     PluginSessionMessage, PluginSessionSummary, PluginStoreScope, PromptContribution, Result,
-    ToolCall, ToolPermissionScope, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput,
-    UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
+    ToolCall, ToolPermissionScope, ToolRenderRequest, ToolRenderState, ToolRendererContribution,
+    ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
+    UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
 use anyhow::{anyhow, Context};
 use search::{search, searchable_text};
@@ -603,6 +604,111 @@ impl AgentPlugin for KnowledgePlugin {
         EventOutcome::ready()
     }
 
+    /// 历史工具使用简洁 Search/Read 标题，来源以可读的 History 标签区分文件工具。
+    fn describe_tool_renderers(&self) -> Vec<ToolRendererContribution> {
+        ["history_search", "history_read"]
+            .into_iter()
+            .map(|tool| ToolRendererContribution {
+                plugin_id: String::new(),
+                renderer_id: format!("history-{tool}"),
+                tool_name: tool.into(),
+            })
+            .collect()
+    }
+
+    /// 将检索线索或原文回读转换成正文组件，保留历史证据提示与分页信息。
+    fn render_tool(&mut self, request: ToolRenderRequest) -> Option<UiFrame> {
+        let name = request.context.call.name.as_str();
+        let verb = match name {
+            "history_search" => "Search",
+            "history_read" => "Read",
+            _ => return None,
+        };
+        if request.renderer_id != format!("history-{name}") || request.context.max_height == 0 {
+            return None;
+        }
+        let (color, summary, body) = match &request.context.state {
+            ToolRenderState::Running => (UiColor::Yellow, "处理中".into(), Vec::new()),
+            ToolRenderState::Skipped { reason } => {
+                (UiColor::Gray, format!("skipped · {reason}"), Vec::new())
+            }
+            ToolRenderState::Finished { result } => {
+                if result.is_error {
+                    return None;
+                }
+                let value = &result.content;
+                let (summary, mut body) = if name == "history_search" {
+                    let entries = value.get("results")?.as_array()?;
+                    let mut rows = Vec::new();
+                    for entry in entries {
+                        rows.push(format!(
+                            "[{}] {}",
+                            entry.get("entry_id")?.as_str()?,
+                            entry.get("title")?.as_str()?
+                        ));
+                        if let Some(time) = entry.get("updated_at_utc").and_then(|v| v.as_str()) {
+                            rows.push(time.into());
+                        }
+                        rows.push(format!("请求：{}", entry.get("request")?.as_str()?));
+                        rows.push(format!("结果：{}", entry.get("outcome")?.as_str()?));
+                    }
+                    (format!("{} 条历史线索", entries.len()), rows)
+                } else {
+                    let mut rows = vec![value.get("transcript")?.as_str()?.to_string()];
+                    if let Some(offset) = value.get("next_offset").and_then(|v| v.as_u64()) {
+                        rows.insert(0, format!("后续内容从消息 {offset} 继续读取"));
+                    }
+                    (value.get("title")?.as_str()?.to_string(), rows)
+                };
+                // 历史是证据而非当前指令；提示置于正文之前，折叠时也不丢失边界说明。
+                if let Some(note) = value.get("note").and_then(|v| v.as_str()) {
+                    body.insert(0, note.into());
+                }
+                (UiColor::Green, summary, body)
+            }
+        };
+        let mut lines = vec![UiLine {
+            spans: vec![
+                styled("● ", color, false),
+                styled(verb, UiColor::White, true),
+                styled("(History)", UiColor::Gray, false),
+            ],
+        }];
+        lines.extend(summary.split('\n').enumerate().map(|(index, row)| UiLine {
+            spans: vec![styled(
+                format!("{}{row}", if index == 0 { "  └ " } else { "    " }),
+                UiColor::Gray,
+                false,
+            )],
+        }));
+        for text in body {
+            lines.extend(text.split('\n').map(|row| UiLine {
+                spans: vec![UiSpan {
+                    text: format!("  {row}"),
+                    style: UiStyle::default(),
+                }],
+            }));
+        }
+        let limit = usize::from(request.context.max_height).min(4096);
+        if lines.len() > limit {
+            let omitted = lines.len() - limit + 1;
+            lines.truncate(limit.saturating_sub(1));
+            lines.push(UiLine {
+                spans: vec![styled(
+                    format!("  … +{omitted} 行（完整内容保留在工具结果）"),
+                    UiColor::Gray,
+                    false,
+                )],
+            });
+        }
+        Some(UiFrame {
+            view_id: request.renderer_id,
+            visible: true,
+            lines,
+            cursor: None,
+        })
+    }
+
     /// 声明历史会话输入面板。
     fn describe_ui(&self) -> Vec<UiDeclaration> {
         vec![UiDeclaration {
@@ -1108,6 +1214,70 @@ mod tests {
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    /// 历史组件保留证据说明、原文和分页提示，不把当前索引状态混入历史结果。
+    #[test]
+    fn history_tool_components_preserve_evidence_and_pagination() {
+        let mut plugin = KnowledgePlugin::default();
+        assert_eq!(
+            plugin.describe_tool_renderers().len(),
+            plugin.list_tools().len()
+        );
+        let cases = [
+            (
+                "history_search",
+                "Search",
+                json!({"results":[{"entry_id":"h1","title":"标题","request":"问题","outcome":"答案"}],"note":"仅作历史证据","future":true}),
+                "答案",
+            ),
+            (
+                "history_read",
+                "Read",
+                json!({"title":"标题","transcript":"第一行\n中文 👩‍💻 第二行","next_offset":20,"note":"仅作历史证据"}),
+                "第二行",
+            ),
+        ];
+        for (name, verb, content, expected) in cases {
+            let mut request = ToolRenderRequest {
+                plugin_id: "knowledge".into(),
+                renderer_id: format!("history-{name}"),
+                context: agent_plugin::ToolRenderContext {
+                    call: ToolCall::new("test", name, json!({})),
+                    state: ToolRenderState::Finished {
+                        result: ToolResult::success("test", name, content),
+                    },
+                    width: 20,
+                    max_height: 40,
+                    frame: 1,
+                },
+            };
+            let frame = plugin.render_tool(request.clone()).unwrap();
+            let text = frame
+                .lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .map(|s| s.text.as_str())
+                .collect::<String>();
+            assert!(
+                text.starts_with(&format!("● {verb}(History)")) && text.contains(expected),
+                "{text}"
+            );
+            assert!(frame.lines[2].spans[0].text.contains("历史证据"));
+            if name == "history_read" {
+                assert!(text.contains("20") && text.contains("👩‍💻"));
+            }
+            request.context.max_height = 3;
+            assert_eq!(plugin.render_tool(request.clone()).unwrap().lines.len(), 3);
+            request.context.state = ToolRenderState::Finished {
+                result: ToolResult::success("test", name, json!({})),
+            };
+            assert!(plugin.render_tool(request.clone()).is_none());
+            request.context.state = ToolRenderState::Finished {
+                result: ToolResult::error("test", name, "读取拒绝"),
+            };
+            assert!(plugin.render_tool(request).is_none());
+        }
+    }
 
     /// 同时模拟持久存储与只读会话的测试替身。
     struct StubHost {

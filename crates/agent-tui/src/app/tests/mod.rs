@@ -286,6 +286,11 @@ impl PluginHost for ToolMessagePluginHost {
     }
 
     async fn render_tool(&self, request: &ToolRenderRequest) -> Result<Option<PluginUiFrame>> {
+        assert_eq!(
+            usize::from(request.context.max_height),
+            crate::session::conversation::TOOL_FRAME_DETAIL_LINES,
+            "工具帧应允许展开详情，不受当前视口高度限制"
+        );
         let state = match &request.context.state {
             ToolRenderState::Running => "运行中",
             ToolRenderState::Finished { .. } => "已完成",

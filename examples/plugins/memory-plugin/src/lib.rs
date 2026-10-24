@@ -23,9 +23,9 @@
 
 use agent_plugin::{
     export_plugin, ActivationContext, AgentPlugin, PluginHostApi, PluginStoreScope,
-    PromptContribution, Result, ToolCall, ToolPermissionScope, ToolResult, ToolSpec, UiColor,
-    UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize,
-    UiSpan, UiStyle,
+    PromptContribution, Result, ToolCall, ToolPermissionScope, ToolRenderRequest, ToolRenderState,
+    ToolRendererContribution, ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput,
+    UiInputEvent, UiLine, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -385,6 +385,122 @@ impl AgentPlugin for MemoryPlugin {
         }
     }
 
+    /// 记忆工具以简洁动词呈现，UI 解释保留在记忆插件内。
+    fn describe_tool_renderers(&self) -> Vec<ToolRendererContribution> {
+        ["memory_record", "memory_list", "memory_forget"]
+            .into_iter()
+            .map(|tool| ToolRendererContribution {
+                plugin_id: String::new(),
+                renderer_id: format!("memory-{tool}"),
+                tool_name: tool.into(),
+            })
+            .collect()
+    }
+
+    /// 按工具结果显示记忆摘要，历史渲染不读取当前可变记忆库。
+    fn render_tool(&mut self, request: ToolRenderRequest) -> Option<UiFrame> {
+        let name = request.context.call.name.as_str();
+        let verb = match name {
+            "memory_record" => "Record",
+            "memory_list" => "List",
+            "memory_forget" => "Forget",
+            _ => return None,
+        };
+        if request.renderer_id != format!("memory-{name}") || request.context.max_height == 0 {
+            return None;
+        }
+        let (color, summary, body) = match &request.context.state {
+            ToolRenderState::Running => (UiColor::Yellow, "处理中".into(), Vec::new()),
+            ToolRenderState::Skipped { reason } => {
+                (UiColor::Gray, format!("skipped · {reason}"), Vec::new())
+            }
+            ToolRenderState::Finished { result } => {
+                if result.is_error {
+                    return None;
+                }
+                let value = &result.content;
+                let (summary, body) = match name {
+                    "memory_list" => {
+                        let entries = value.get("memories")?.as_array()?;
+                        let mut rows = Vec::new();
+                        for entry in entries {
+                            rows.push(format!(
+                                "[{} · {}] {}",
+                                entry.get("id")?.as_str()?,
+                                entry.get("scope")?.as_str()?,
+                                entry.get("text")?.as_str()?
+                            ));
+                        }
+                        (format!("{} 条记忆", entries.len()), rows)
+                    }
+                    "memory_record" | "memory_forget" => {
+                        let status = match (name, value.get("status")?.as_str()?) {
+                            ("memory_record", "recorded") => "已记录",
+                            ("memory_record", "already_recorded") => "已存在，未重复记录",
+                            ("memory_forget", "forgotten") => "已删除",
+                            _ => return None,
+                        };
+                        let body = if name == "memory_record" {
+                            vec![request.context.call.args.get("text")?.as_str()?.into()]
+                        } else {
+                            Vec::new()
+                        };
+                        (
+                            format!(
+                                "{status} · {} · {}",
+                                value.get("scope")?.as_str()?,
+                                value.get("id")?.as_str()?
+                            ),
+                            body,
+                        )
+                    }
+                    _ => return None,
+                };
+                (UiColor::Green, summary, body)
+            }
+        };
+        let mut lines = vec![UiLine {
+            spans: vec![
+                styled("● ", color, false),
+                styled(verb, UiColor::White, true),
+                styled("(Memory)", UiColor::Gray, false),
+            ],
+        }];
+        lines.extend(summary.split('\n').enumerate().map(|(index, row)| UiLine {
+            spans: vec![styled(
+                format!("{}{row}", if index == 0 { "  └ " } else { "    " }),
+                UiColor::Gray,
+                false,
+            )],
+        }));
+        for text in body {
+            lines.extend(text.split('\n').map(|row| UiLine {
+                spans: vec![UiSpan {
+                    text: format!("  {row}"),
+                    style: UiStyle::default(),
+                }],
+            }));
+        }
+        let limit = usize::from(request.context.max_height).min(4096);
+        if lines.len() > limit {
+            let omitted = lines.len() - limit + 1;
+            lines.truncate(limit.saturating_sub(1));
+            lines.push(UiLine {
+                spans: vec![styled(
+                    format!("  … +{omitted} 行（完整内容保留在工具结果）"),
+                    UiColor::Gray,
+                    false,
+                )],
+            });
+        }
+        Some(UiFrame {
+            view_id: request.renderer_id,
+            visible: true,
+            lines,
+            cursor: None,
+        })
+    }
+
     fn describe_ui(&self) -> Vec<UiDeclaration> {
         vec![UiDeclaration {
             plugin_id: String::new(),
@@ -682,6 +798,81 @@ mod tests {
     use agent_plugin::NoopHostApi;
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    /// 全部记忆工具都有组件；记录/去重/删除语义来自结果，正文与旧结果回退保持。
+    #[test]
+    fn memory_tool_components_cover_all_operations() {
+        let mut plugin = MemoryPlugin::default();
+        assert_eq!(
+            plugin.describe_tool_renderers().len(),
+            plugin.list_tools().len()
+        );
+        let cases = [
+            (
+                "memory_record",
+                "Record",
+                json!({"id":"p1","scope":"project","status":"recorded","future":true}),
+                "已记录",
+            ),
+            (
+                "memory_record",
+                "Record",
+                json!({"id":"p1","scope":"project","status":"already_recorded"}),
+                "未重复记录",
+            ),
+            (
+                "memory_list",
+                "List",
+                json!({"memories":[{"id":"p1","scope":"project","text":"中文 👩‍💻"}]}),
+                "中文 👩‍💻",
+            ),
+            (
+                "memory_forget",
+                "Forget",
+                json!({"id":"p1","scope":"project","status":"forgotten"}),
+                "已删除",
+            ),
+        ];
+        for (name, verb, content, expected) in cases {
+            let mut request = ToolRenderRequest {
+                plugin_id: "memory".into(),
+                renderer_id: format!("memory-{name}"),
+                context: agent_plugin::ToolRenderContext {
+                    call: ToolCall::new("test", name, json!({"text":"用户偏好"})),
+                    state: ToolRenderState::Finished {
+                        result: ToolResult::success("test", name, content),
+                    },
+                    width: 20,
+                    max_height: 40,
+                    frame: 1,
+                },
+            };
+            let frame = plugin.render_tool(request.clone()).unwrap();
+            let text = frame
+                .lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .map(|s| s.text.as_str())
+                .collect::<String>();
+            assert!(
+                text.starts_with(&format!("● {verb}(Memory)")) && text.contains(expected),
+                "{text}"
+            );
+            assert!(!text.contains(name));
+            request.context.max_height = 1;
+            assert_eq!(plugin.render_tool(request.clone()).unwrap().lines.len(), 1);
+            request.context.state = ToolRenderState::Running;
+            assert!(plugin.render_tool(request.clone()).is_some());
+            request.context.state = ToolRenderState::Finished {
+                result: ToolResult::success("test", name, json!({})),
+            };
+            assert!(plugin.render_tool(request.clone()).is_none());
+            request.context.state = ToolRenderState::Finished {
+                result: ToolResult::error("test", name, "拒绝"),
+            };
+            assert!(plugin.render_tool(request).is_none());
+        }
+    }
 
     /// 在内存中模拟宿主持久存储的测试替身。
     #[derive(Default)]

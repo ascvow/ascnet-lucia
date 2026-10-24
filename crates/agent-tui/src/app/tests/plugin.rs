@@ -788,6 +788,44 @@ fn long_tool_renderer_supports_collapsed_details() {
     assert!(expanded.contains("Click to collapse"), "{expanded:?}");
 }
 
+/// 插件标题和摘要不能挤掉原有四十行正文，展开后必须能看到最后一行。
+#[test]
+#[cfg(feature = "plugins")]
+fn tool_frame_chrome_does_not_consume_body_detail_budget() {
+    let mut message = Msg::tool_started(ToolCall::new("body-40", "example_result", json!({})));
+    let mut lines = vec![
+        UiLine {
+            spans: vec![UiSpan {
+                text: "Result".into(),
+                style: UiStyle::default()
+            }]
+        };
+        2
+    ];
+    lines.extend(
+        (1..=crate::session::conversation::TOOL_RESULT_DETAIL_LINES).map(|index| UiLine {
+            spans: vec![UiSpan {
+                text: format!("正文-{index}"),
+                style: UiStyle::default(),
+            }],
+        }),
+    );
+    message.tool_frame = Some(PluginUiFrame {
+        view_id: "result".into(),
+        visible: true,
+        lines,
+        cursor: None,
+    });
+    message.tool_expanded = true;
+    let text = message
+        .to_lines(false, 80)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<String>();
+    assert!(text.contains("正文-40"), "{text}");
+    assert!(!text.contains("… +"), "不能丢失原有正文：{text}");
+}
+
 /// 晚到的旧 revision 不得覆盖较新的工具消息帧。
 #[test]
 #[cfg(feature = "plugins")]

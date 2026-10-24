@@ -99,6 +99,7 @@ Manifest：`examples/plugins/plan-plugin/plugin.toml`。
 
 三个工具：`memory_record` 记录、`memory_list` 查询完整清单、`memory_forget` 删除过时结论。
 单条记忆有字数上限，同作用域内正文相同的记忆不重复记录，每个作用域有条数上限。
+时间线使用 `Record(Memory)`、`List(Memory)`、`Forget(Memory)`：显示记录/去重/删除摘要、短 ID、作用域及正文，不直接输出结果 JSON；历史卡片不重新读取当前记忆库。
 
 插件不注册常驻提示，使用时机全部写在工具描述里；只有记忆正文本身会被注入，没有记忆时不注入
 任何内容。注入有硬预算：超出时优先保留最近的记忆并提示用 `memory_list` 查看全部，而不是让记忆
@@ -111,6 +112,7 @@ Manifest：`examples/plugins/plan-plugin/plugin.toml`。
 ```bash
 bun run build:plugin:memory
 bun run test:plugin:memory
+cargo test --offline -p memory-plugin-smoke-tests
 ```
 
 Manifest：`examples/plugins/memory-plugin/plugin.toml`。
@@ -163,11 +165,14 @@ Manifest：`examples/plugins/memory-plugin/plugin.toml`。
 `history_search` 与 `history_read`；提示同时要求继续工作前核对当前代码和运行状态。工具返回
 会话级 `created_at_ms`、`updated_at_ms`、UTC 时间和相对时间；消息本身没有独立时间戳。
 
+时间线使用 `Search(History)`、`Read(History)`，保留片段标题、请求/结果、历史证据提示及回读分页位置，不把索引或会话标识的 JSON 展开成摘要。未知旧结果和失败诊断回退宿主原展示。
+
 `/history` 打开历史会话面板查看片段数、会话数和最近更新时间；`/kb` 作为兼容入口保留。
 
 ```bash
 bun run build:plugin:knowledge
 bun run test:plugin:knowledge
+cargo test --offline -p knowledge-plugin-smoke-tests
 ```
 
 Manifest：`examples/plugins/knowledge-plugin/plugin.toml`。

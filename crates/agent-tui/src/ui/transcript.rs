@@ -66,6 +66,7 @@ pub(crate) fn tool_target(call: &ToolCall) -> Option<String> {
         }
         "search_files" => text_field(args, "pattern").map(str::to_string),
         "shell" => text_field(args, "command").map(str::to_string),
+        "skill_read" => text_field(args, "name").map(|name| format!("Skill: {name}")),
         _ => None,
     };
     let target = target.or_else(|| {
@@ -97,6 +98,7 @@ pub(crate) fn tool_summary(call: Option<&ToolCall>, result: &ToolResult) -> Opti
     let content = &result.content;
     let args = call.map(|call| &call.args);
     let summary = match result.name.as_str() {
+        "skill_read" => text_field(content, "name").map(|name| format!("已读取 Skill：{name}")),
         "write_file" => {
             let path = text_field(content, "path").map(shorten_path).or_else(|| {
                 args.and_then(|args| text_field(args, "path"))
@@ -969,6 +971,7 @@ pub(crate) fn tool_display_name(name: &str) -> &str {
         "list_directory" => "List",
         "search_files" => "Search",
         "shell" => "Shell",
+        "skill_read" => "Read",
         other => other,
     }
 }
@@ -995,6 +998,25 @@ mod tests {
     use super::*;
     use crate::theme::{COLOR_DIFF_ADD_FG, COLOR_DIFF_FILE_HEADER, COLOR_DIFF_HUNK};
     use serde_json::json;
+
+    /// 原生 Skill 使用 Read 标题并保留技能名和正文，不影响第三方工具的原始命名。
+    #[test]
+    fn skill_uses_read_title_without_changing_plugin_names() {
+        let call = ToolCall::new("skill", "skill_read", json!({"name":"tui-design"}));
+        let result = ToolResult::success(
+            "skill",
+            "skill_read",
+            json!({"name":"tui-design","content":"技能正文"}),
+        );
+        assert_eq!(tool_display_name(&call.name), "Read");
+        assert_eq!(tool_target(&call).as_deref(), Some("Skill: tui-design"));
+        assert_eq!(
+            tool_summary(Some(&call), &result).as_deref(),
+            Some("已读取 Skill：tui-design")
+        );
+        assert_eq!(result_body(&result).as_deref(), Some("技能正文"));
+        assert_eq!(tool_display_name("mcp_fetch"), "mcp_fetch");
+    }
 
     /// 路径按字素保留文件尾部；极窄区域不能产生额外折行。
     #[test]

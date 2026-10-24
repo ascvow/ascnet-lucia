@@ -6,7 +6,7 @@ use crate::bus::{plugin_key_code, plugin_key_modifiers};
 use crate::event::UiEvent;
 use crate::plugin::host_actions::sessions_page;
 use crate::plugin::startup::plugin_startup_details;
-use crate::session::conversation::MsgKind;
+use crate::session::conversation::{MsgKind, TOOL_FRAME_DETAIL_LINES};
 use crate::theme::{
     COLOR_DANGER, COLOR_SUCCESS, COLOR_WARNING, PLUGIN_STATUS_DETAIL_TICKS, SPINNER,
 };
@@ -41,7 +41,8 @@ impl App {
     #[cfg(feature = "plugins")]
     pub(crate) fn schedule_tool_render(&mut self, host: Arc<LivePluginHost>, call_id: &str) {
         let width = self.last_message_width.max(1);
-        let max_height = self.last_viewport.max(1);
+        // 工具正文在时间线中可滚动，不应被当前屏幕高度提前裁掉；预算与展开详情一致。
+        let max_height = u16::try_from(TOOL_FRAME_DETAIL_LINES).unwrap_or(u16::MAX);
         let Some(index) = self
             .messages
             .iter()

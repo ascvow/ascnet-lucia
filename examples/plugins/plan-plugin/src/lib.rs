@@ -2,9 +2,10 @@
 
 use agent_plugin::{
     core_events, export_plugin, ActivationContext, AgentPlugin, EventOutcome, PluginEvent,
-    PluginHostApi, Result, RunFinishEventData, ToolCall, ToolPermissionScope, ToolResult, ToolSpec,
-    UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
-    UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
+    PluginHostApi, Result, RunFinishEventData, ToolCall, ToolPermissionScope, ToolRenderRequest,
+    ToolRenderState, ToolRendererContribution, ToolResult, ToolSpec, UiColor, UiDeclaration,
+    UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement,
+    UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -433,6 +434,121 @@ impl AgentPlugin for PlanPlugin {
         }
     }
 
+    /// 工具标题由插件声明，不让宿主解析计划协议或显示内部函数名。
+    fn describe_tool_renderers(&self) -> Vec<ToolRendererContribution> {
+        [UPDATE_PLAN_TOOL, GET_PLAN_TOOL]
+            .into_iter()
+            .map(|tool| ToolRendererContribution {
+                plugin_id: String::new(),
+                renderer_id: format!("plan-{tool}"),
+                tool_name: tool.into(),
+            })
+            .collect()
+    }
+
+    /// 用调用结果快照呈现计划历史，不读当前计划以免回收/切换会话后串内容。
+    fn render_tool(&mut self, request: ToolRenderRequest) -> Option<UiFrame> {
+        let verb = match request.context.call.name.as_str() {
+            UPDATE_PLAN_TOOL => "Update",
+            GET_PLAN_TOOL => "Get",
+            _ => return None,
+        };
+        if request.renderer_id != format!("plan-{}", request.context.call.name)
+            || request.context.max_height == 0
+        {
+            return None;
+        }
+        let (color, summary, plan) = match &request.context.state {
+            ToolRenderState::Running => (UiColor::Yellow, "处理中".into(), None),
+            ToolRenderState::Skipped { reason } => {
+                (UiColor::Gray, format!("skipped · {reason}"), None)
+            }
+            ToolRenderState::Finished { result } => {
+                if result.is_error {
+                    return None;
+                }
+                result.content.get("plan")?.as_array()?;
+                let plan: PlanState = serde_json::from_value(result.content.clone()).ok()?;
+                plan.validate().ok()?;
+                let summary = if plan.plan.is_empty() {
+                    if request.context.call.name == UPDATE_PLAN_TOOL {
+                        "计划已清空".into()
+                    } else {
+                        "暂无计划".into()
+                    }
+                } else {
+                    format!("{}/{} completed", completed_steps(&plan), plan.plan.len())
+                };
+                (UiColor::Green, summary, Some(plan))
+            }
+        };
+        let mut lines = vec![
+            UiLine {
+                spans: vec![
+                    UiSpan {
+                        text: "● ".into(),
+                        style: UiStyle {
+                            foreground: Some(color),
+                            ..UiStyle::default()
+                        },
+                    },
+                    UiSpan {
+                        text: verb.into(),
+                        style: UiStyle {
+                            foreground: Some(UiColor::White),
+                            bold: true,
+                            ..UiStyle::default()
+                        },
+                    },
+                    UiSpan {
+                        text: "(Plan)".into(),
+                        style: UiStyle {
+                            foreground: Some(UiColor::Gray),
+                            ..UiStyle::default()
+                        },
+                    },
+                ],
+            },
+            styled_line(format!("  └ {summary}"), Some(UiColor::Gray), false),
+        ];
+        if let Some(plan) = plan {
+            if let Some(note) = plan.explanation {
+                lines.extend(
+                    note.lines()
+                        .map(|row| styled_line(format!("  {row}"), None, false)),
+                );
+            }
+            for item in plan.plan {
+                let marker = match item.status {
+                    PlanStatus::Completed => "✓",
+                    PlanStatus::InProgress => "→",
+                    PlanStatus::Pending => "○",
+                };
+                lines.push(styled_line(
+                    format!("  {marker} {}", item.step),
+                    None,
+                    false,
+                ));
+            }
+        }
+        let limit = usize::from(request.context.max_height).min(4096);
+        if lines.len() > limit {
+            let omitted = lines.len() - limit + 1;
+            lines.truncate(limit.saturating_sub(1));
+            lines.push(styled_line(
+                format!("  … +{omitted} 行（完整内容保留在工具结果）"),
+                Some(UiColor::Gray),
+                false,
+            ));
+        }
+        Some(UiFrame {
+            view_id: request.renderer_id,
+            visible: true,
+            lines,
+            cursor: None,
+        })
+    }
+
     /// 声明输入区上方的紧凑计划架和按需打开的完整计划子视图。
     fn describe_ui(&self) -> Vec<UiDeclaration> {
         vec![
@@ -787,6 +903,59 @@ export_plugin!(PlanPlugin);
 mod tests {
     use super::*;
     use agent_plugin::{NoopHostApi, PluginEventEnvelope};
+
+    /// 计划工具完整覆盖标题/快照/空计划，兼容加法字段；失败不可隐藏宿主诊断。
+    #[test]
+    fn plan_tool_components_use_snapshot_and_preserve_fallbacks() {
+        let mut plugin = PlanPlugin::default();
+        assert_eq!(
+            plugin.describe_tool_renderers().len(),
+            plugin.list_tools().len()
+        );
+        for (name, verb) in [(UPDATE_PLAN_TOOL, "Update"), (GET_PLAN_TOOL, "Get")] {
+            let content = json!({"plan":[{"step":"中文 👩‍💻","status":"completed"}],"future":true});
+            let mut request = ToolRenderRequest {
+                plugin_id: "plan".into(),
+                renderer_id: format!("plan-{name}"),
+                context: agent_plugin::ToolRenderContext {
+                    call: ToolCall::new("test", name, json!({})),
+                    state: ToolRenderState::Finished {
+                        result: ToolResult::success("test", name, content),
+                    },
+                    width: 20,
+                    max_height: 40,
+                    frame: 1,
+                },
+            };
+            let frame = plugin.render_tool(request.clone()).unwrap();
+            let text = frame
+                .lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .map(|s| s.text.as_str())
+                .collect::<String>();
+            assert!(text.starts_with(&format!("● {verb}(Plan)")));
+            assert!(text.contains("1/1 completed") && text.contains("中文 👩‍💻"));
+            for height in [1, 2, 8] {
+                request.context.max_height = height;
+                assert!(
+                    plugin.render_tool(request.clone()).unwrap().lines.len() <= height as usize
+                );
+            }
+            request.context.state = ToolRenderState::Finished {
+                result: ToolResult::success("test", name, json!({"future":true})),
+            };
+            assert!(plugin.render_tool(request.clone()).is_none());
+            request.context.state = ToolRenderState::Finished {
+                result: ToolResult::success("test", name, json!({"plan":[]})),
+            };
+            assert!(plugin.render_tool(request.clone()).is_some());
+            request.context.state = ToolRenderState::Finished {
+                result: ToolResult::error("test", name, "权限拒绝"),
+            };
+            assert!(plugin.render_tool(request).is_none());
+        }
+    }
 
     /// Plan 工具只修改插件内计划状态，必须声明为无需资源审批的控制面 scope。
     #[test]

@@ -56,6 +56,18 @@ const TEAM_SESSION_VIEW: &str = "teammate-member-session";
 const MESSAGE_RENDERER: &str = "teammate-message";
 /// 消息确认使用与原生工具一致的简洁动词标题，不展示内部工具名和成员地址。
 const ACK_RENDERER: &str = "teammate-ack";
+/// 每个自有工具使用唯一 renderer 路由，标题统一为简洁动作，不修改模型可见工具名。
+const CONTROL_RENDERERS: &[(&str, &str, &str)] = &[
+    ("teammate_spawn", "teammate-spawn", "Spawn"),
+    ("teammate_list", "teammate-list", "List"),
+    ("teammate_status", "teammate-status", "Status"),
+    ("teammate_result", "teammate-result", "Result"),
+    ("teammate_cancel", "teammate-cancel", "Cancel"),
+    ("teammate_remove", "teammate-remove", "Remove"),
+    ("teammate_inbox", "teammate-inbox", "Inbox"),
+    ("teammate_ack", ACK_RENDERER, "Ack"),
+    ("teammate_dispatch", "teammate-dispatch", "Dispatch"),
+];
 /// 成员架最多渲染的内容行数（不含宿主画在架顶部的那条分隔线）。
 ///
 /// 宿主按「内容行 + 1」算面板高度，并把分隔线以下的区域当视图高度交回来；
@@ -1597,6 +1609,23 @@ impl AgentPlugin for TeammatePlugin {
     ) -> Result<ToolResult> {
         let owner = self.owner()?.to_string();
         let operation = call.name.clone();
+        // UI 快照随结果保存，成员回收或插件重启后仍能显示角色；身份只取可信目录。
+        let recipient_label = call
+            .args
+            .get("member_id")
+            .and_then(Value::as_str)
+            .and_then(|id| AgentId::parse(id).ok())
+            .and_then(|id| {
+                self.state
+                    .member(&owner, &id)
+                    .ok()
+                    .map(|member| message_recipient_label(&member.role, member.captain))
+                    .or_else(|| {
+                        self.state.retired_member(&owner, &id).map(|member| {
+                            message_recipient_label(&member.snapshot.role, member.snapshot.captain)
+                        })
+                    })
+            });
         let controller_run = call.run_id.as_deref();
         let content = match operation.as_str() {
             "teammate_spawn" => {
@@ -1630,7 +1659,11 @@ impl AgentPlugin for TeammatePlugin {
                 ))
             }
         };
-        Ok(ToolResult::success(call.id, call.name, content))
+        let result = ToolResult::success(call.id, call.name, content);
+        Ok(match recipient_label {
+            Some(label) => result.with_details(json!({"recipient_label":label})),
+            None => result,
+        })
     }
 
     /// 按 Host 注入的 caller ID 隔离并执行版本化 service 请求。
@@ -1697,18 +1730,21 @@ impl AgentPlugin for TeammatePlugin {
 
     /// 使用现有工具消息组件取代重复的参数、摘要、行号预览和扩展事件行。
     fn describe_tool_renderers(&self) -> Vec<ToolRendererContribution> {
-        vec![
-            ToolRendererContribution {
-                plugin_id: String::new(),
-                renderer_id: MESSAGE_RENDERER.into(),
-                tool_name: "teammate_send".into(),
-            },
-            ToolRendererContribution {
-                plugin_id: String::new(),
-                renderer_id: ACK_RENDERER.into(),
-                tool_name: "teammate_ack".into(),
-            },
-        ]
+        std::iter::once(ToolRendererContribution {
+            plugin_id: String::new(),
+            renderer_id: MESSAGE_RENDERER.into(),
+            tool_name: "teammate_send".into(),
+        })
+        .chain(
+            CONTROL_RENDERERS
+                .iter()
+                .map(|(tool, renderer, _)| ToolRendererContribution {
+                    plugin_id: String::new(),
+                    renderer_id: (*renderer).into(),
+                    tool_name: (*tool).into(),
+                }),
+        )
+        .collect()
     }
 
     /// 渲染消息投递与确认；失败和未知旧结果退回宿主错误/通用样式。
@@ -1716,8 +1752,10 @@ impl AgentPlugin for TeammatePlugin {
     /// 完成态优先使用结果中的展示快照，不依赖仍然存活的成员目录。正文只显示一次，
     /// 收件人适度强调，其余文本继承终端正文色；自动换行交给宿主显示宽度布局。
     fn render_tool(&mut self, request: ToolRenderRequest) -> Option<UiFrame> {
-        if request.renderer_id == ACK_RENDERER && request.context.call.name == "teammate_ack" {
-            return render_ack(&request);
+        if let Some((_, _, title)) = CONTROL_RENDERERS.iter().find(|(tool, renderer, _)| {
+            *tool == request.context.call.name && *renderer == request.renderer_id
+        }) {
+            return render_control(&request, title);
         }
         if request.renderer_id != MESSAGE_RENDERER
             || request.context.call.name != "teammate_send"
@@ -1727,8 +1765,8 @@ impl AgentPlugin for TeammatePlugin {
         }
         let lines = match &request.context.state {
             ToolRenderState::Running => vec![ui_line(vec![
-                ui_span("◌ ", Some(UiColor::Yellow), false),
-                ui_span("团队消息", Some(UiColor::Cyan), true),
+                ui_span("● ", Some(UiColor::Yellow), false),
+                ui_span("Send", Some(UiColor::White), true),
                 ui_span(" · 投递中", Some(UiColor::Gray), false),
             ])],
             ToolRenderState::Finished { result } if !result.is_error => {
@@ -1749,7 +1787,7 @@ impl AgentPlugin for TeammatePlugin {
                             .as_deref()
                             .and_then(|owner| self.state.member(owner, &message.recipient).ok())
                             .map(|member| message_recipient_label(&member.role, member.captain))
-                            .unwrap_or_else(|| message.recipient.as_str().to_string())
+                            .unwrap_or_else(|| "成员".to_string())
                     });
                 message_card_lines(&label, &body, usize::from(request.context.max_height))
             }
@@ -1865,65 +1903,253 @@ impl AgentPlugin for TeammatePlugin {
     }
 }
 
-/// 将确认消息呈现为原生工具同款的「状态圆点 + Ack(消息号)」，不输出内部参数 JSON。
-/// 只有成功结果才能显示已确认；失败退回宿主，保留错误正文和权限诊断等完整反馈。
-fn render_ack(request: &ToolRenderRequest) -> Option<UiFrame> {
-    let max_height = usize::from(request.context.max_height);
+/// 控制面统一使用「状态圆点 + 动词(对象) + 摘要/正文」，不展示不透明成员地址。
+/// 失败交给宿主保留完整权限诊断；未识别的旧结果也不能伪装成成功摘要。
+fn render_control(request: &ToolRenderRequest, verb: &str) -> Option<UiFrame> {
+    let max_height = usize::from(request.context.max_height).min(4096);
     if max_height == 0 {
         return None;
     }
-    let requested_id = request
+    let name = request.context.call.name.as_str();
+    let message_id = request
         .context
         .call
         .args
         .get("message_id")
         .and_then(Value::as_u64);
-    let (color, note, id, detail) = match &request.context.state {
-        ToolRenderState::Running => (UiColor::Yellow, "", requested_id, "确认中".to_string()),
-        ToolRenderState::Finished { result } if result.is_error => return None,
+    let mut target = match name {
+        "teammate_list" => Some("Team".to_string()),
+        "teammate_ack" | "teammate_dispatch" => message_id.map(|id| format!("#{id}")),
+        "teammate_spawn" => request
+            .context
+            .call
+            .args
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    };
+    let (color, note, summary, body) = match &request.context.state {
+        ToolRenderState::Running => (
+            UiColor::Yellow,
+            "",
+            if name == "teammate_ack" {
+                "确认中"
+            } else {
+                "处理中"
+            }
+            .into(),
+            Vec::new(),
+        ),
+        ToolRenderState::Skipped { reason } => {
+            (UiColor::Gray, "skipped", reason.clone(), Vec::new())
+        }
         ToolRenderState::Finished { result } => {
-            if result.content.get("acked").and_then(Value::as_bool) != Some(true) {
+            if result.is_error {
                 return None;
             }
-            (
-                UiColor::Green,
-                "",
-                result.content.get("message_id").and_then(Value::as_u64),
-                "已确认消息".to_string(),
-            )
+            let value = &result.content;
+            let recipient_label = result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("recipient_label"))
+                .and_then(Value::as_str)
+                .filter(|label| !label.trim().is_empty());
+            // 旧结果没有称谓快照时保留原展示，不能把多个成员的历史卡片都变成无归属标题。
+            if matches!(
+                name,
+                "teammate_status" | "teammate_result" | "teammate_cancel" | "teammate_inbox"
+            ) && recipient_label.is_none()
+            {
+                return None;
+            }
+            if let Some(label) = recipient_label {
+                if !matches!(name, "teammate_ack" | "teammate_dispatch") {
+                    target = Some(format!("@{label}"));
+                }
+            }
+            let (summary, body) = match name {
+                "teammate_spawn" | "teammate_remove" => {
+                    let member = value.get("member")?;
+                    target = Some(format!(
+                        "@{}",
+                        message_recipient_label(
+                            member.get("role")?.as_str()?,
+                            member
+                                .get("captain")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                        )
+                    ));
+                    if name == "teammate_spawn" {
+                        ("已创建成员 · 任务尚未完成".into(), Vec::new())
+                    } else {
+                        value.get("removed")?.as_bool().filter(|removed| *removed)?;
+                        ("已移除成员".into(), Vec::new())
+                    }
+                }
+                "teammate_list" => {
+                    let members = value.get("members")?.as_array()?;
+                    let retired = value
+                        .get("retired_members")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    let mut rows = Vec::new();
+                    for (member, retired) in members
+                        .iter()
+                        .map(|m| (m, false))
+                        .chain(retired.iter().map(|m| (m, true)))
+                    {
+                        let label = message_recipient_label(
+                            member.get("role")?.as_str()?,
+                            member
+                                .get("captain")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        );
+                        let status: AgentStatus =
+                            serde_json::from_value(member.get("status")?.clone()).ok()?;
+                        let unread = member
+                            .get("unread_messages")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        rows.push(format!(
+                            "{} @{label} · {} · {unread} 条未确认{}",
+                            status_marker(status),
+                            status_label(status),
+                            if retired { " · 已回收" } else { "" }
+                        ));
+                        if let Some(error) = member.get("error").and_then(Value::as_str) {
+                            rows.push(error.into());
+                        }
+                    }
+                    (
+                        format!("{} 名活跃成员 · {} 名已回收", members.len(), retired.len()),
+                        rows,
+                    )
+                }
+                "teammate_status" => {
+                    let status: AgentStatus =
+                        serde_json::from_value(value.pointer("/snapshot/status")?.clone()).ok()?;
+                    (
+                        status_label(status).into(),
+                        value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(|e| vec![e.into()])
+                            .unwrap_or_default(),
+                    )
+                }
+                "teammate_result" => {
+                    if !value.get("completed")?.as_bool()? {
+                        ("任务尚未完成".into(), Vec::new())
+                    } else {
+                        match value.pointer("/outcome/status")?.as_str()? {
+                            "succeeded" => (
+                                "已完成".into(),
+                                vec![value
+                                    .pointer("/outcome/result/final_text")?
+                                    .as_str()?
+                                    .into()],
+                            ),
+                            "failed" => (
+                                "成员任务失败".into(),
+                                vec![value.pointer("/outcome/error")?.as_str()?.into()],
+                            ),
+                            "cancelled" => ("成员任务已取消".into(), Vec::new()),
+                            _ => return None,
+                        }
+                    }
+                }
+                "teammate_cancel" => (
+                    if value.get("cancelled")?.as_bool()? {
+                        "已请求取消"
+                    } else {
+                        "未执行取消"
+                    }
+                    .into(),
+                    Vec::new(),
+                ),
+                "teammate_inbox" => {
+                    let messages = value.get("messages")?.as_array()?;
+                    let mut rows = Vec::new();
+                    for message in messages {
+                        rows.push(format!(
+                            "#{} · {}",
+                            message.get("id")?.as_u64()?,
+                            message.get("topic")?.as_str()?
+                        ));
+                        rows.push(message_body(message.get("payload")?));
+                    }
+                    (format!("{} 条未确认消息", messages.len()), rows)
+                }
+                "teammate_ack" => {
+                    value.get("acked")?.as_bool().filter(|acked| *acked)?;
+                    target = value
+                        .get("message_id")
+                        .and_then(Value::as_u64)
+                        .map(|id| format!("#{id}"));
+                    ("已确认消息".into(), Vec::new())
+                }
+                "teammate_dispatch" => {
+                    value.get("handle")?;
+                    value.get("acked")?.as_bool().filter(|acked| *acked)?;
+                    ("已启动续跑 · 消息已确认".into(), Vec::new())
+                }
+                _ => return None,
+            };
+            (UiColor::Green, "", summary, body)
         }
-        ToolRenderState::Skipped { reason } => {
-            (UiColor::Gray, "skipped", requested_id, reason.clone())
-        }
+    };
+    // 失败成员的结果读取本身成功，也不能用绿色圆点掩盖被读取任务的失败状态。
+    let color = if matches!(&request.context.state, ToolRenderState::Finished { result }
+        if result.content.pointer("/outcome/status").and_then(Value::as_str) == Some("failed")
+        || result.content.pointer("/snapshot/status").and_then(Value::as_str) == Some("failed"))
+    {
+        UiColor::Red
+    } else {
+        color
     };
     let mut title = vec![
         ui_span("● ", Some(color), false),
-        ui_span("Ack", Some(UiColor::White), true),
+        ui_span(verb, Some(UiColor::White), true),
     ];
-    if let Some(id) = id {
-        title.push(ui_span(format!("(#{id})"), Some(UiColor::Gray), false));
+    if let Some(target) = target {
+        title.push(ui_span(
+            format!("({})", message_recipient_label(&target, false)),
+            Some(UiColor::Gray),
+            false,
+        ));
     }
     if !note.is_empty() {
         title.push(ui_span(format!("  {note}"), Some(color), false));
     }
     let mut lines = vec![ui_line(title)];
-    let rows = detail.split('\n').collect::<Vec<_>>();
-    for (index, row) in rows.iter().take(max_height.saturating_sub(1)).enumerate() {
-        let prefix = if index == 0 { "  └ " } else { "    " };
+    for (index, row) in summary.split('\n').enumerate() {
         lines.push(ui_line(vec![ui_span(
-            format!("{prefix}{row}"),
+            format!("{}{row}", if index == 0 { "  └ " } else { "    " }),
             Some(UiColor::Gray),
             false,
         )]));
     }
-    if rows.len() >= max_height && max_height > 1 {
-        lines
-            .last_mut()?
-            .spans
-            .push(ui_span(" …", Some(UiColor::Gray), false));
+    for text in body {
+        lines.extend(
+            text.split('\n')
+                .map(|row| ui_line(vec![ui_span(format!("  {row}"), None, false)])),
+        );
+    }
+    if lines.len() > max_height {
+        let hidden = lines.len() - max_height + 1;
+        lines.truncate(max_height.saturating_sub(1));
+        lines.push(ui_line(vec![ui_span(
+            format!("  … +{hidden} 行（完整内容保留在工具结果）"),
+            Some(UiColor::Gray),
+            false,
+        )]));
     }
     Some(UiFrame {
-        view_id: ACK_RENDERER.into(),
+        view_id: request.renderer_id.clone(),
         visible: true,
         lines,
         cursor: None,
@@ -2141,8 +2367,8 @@ fn message_display_text(role: &str, captain: bool, payload: &Value) -> String {
 fn message_card_lines(label: &str, body: &str, max_height: usize) -> Vec<UiLine> {
     let label = message_recipient_label(label, false);
     let mut lines = vec![ui_line(vec![
-        ui_span("✓ ", Some(UiColor::Green), false),
-        ui_span("团队消息", Some(UiColor::Cyan), true),
+        ui_span("● ", Some(UiColor::Green), false),
+        ui_span("Send", Some(UiColor::White), true),
         ui_span(" · 已投递", Some(UiColor::Gray), false),
     ])];
     for (index, row) in body.split('\n').enumerate() {
@@ -2361,9 +2587,22 @@ mod tests {
     fn message_renderer_uses_result_snapshot_once() {
         let mut plugin = TeammatePlugin::default();
         let declarations = plugin.describe_tool_renderers();
-        assert_eq!(declarations.len(), 2);
+        assert_eq!(declarations.len(), plugin.list_tools().len());
         assert_eq!(declarations[0].tool_name, "teammate_send");
-        assert_eq!(declarations[1].tool_name, "teammate_ack");
+        for tool in plugin.list_tools() {
+            assert_eq!(
+                declarations
+                    .iter()
+                    .filter(|renderer| renderer.tool_name == tool.name)
+                    .count(),
+                1
+            );
+        }
+        let routes: std::collections::BTreeSet<_> = declarations
+            .iter()
+            .map(|renderer| &renderer.renderer_id)
+            .collect();
+        assert_eq!(routes.len(), declarations.len());
         assert!(declarations
             .iter()
             .all(|declaration| declaration.plugin_id.is_empty()));
@@ -2480,12 +2719,151 @@ mod tests {
         request.context.max_height = 2;
         let frame = plugin.render_tool(request.clone()).unwrap();
         assert_eq!(frame.lines.len(), 2);
-        assert_eq!(frame.lines[1].spans.last().unwrap().text, " …");
+        assert!(frame.lines[1]
+            .spans
+            .last()
+            .unwrap()
+            .text
+            .contains("完整内容保留"));
         request.context.call.name = "teammate_send".into();
         assert!(plugin.render_tool(request).is_none());
     }
 
-    /// 旧结果以稳定地址兜底，不从任意 JSON 中猜角色；大载荷不突破宿主高度限制。
+    /// 全部团队工具都提供组件；正文、等待/取消/失败语义及未知结果回退必须保持。
+    #[test]
+    fn all_teammate_tools_render_semantic_results() {
+        let member = json!({"role":"审查员","captain":false,"status":"succeeded","unread_messages":2,"id":"opaque-id"});
+        let cases = [
+            (
+                "teammate_spawn",
+                json!({"member":member,"completed":false}),
+                "任务尚未完成",
+            ),
+            (
+                "teammate_list",
+                json!({"members":[member],"retired_members":[]}),
+                "审查员",
+            ),
+            (
+                "teammate_status",
+                json!({"snapshot":{"status":"failed"},"error":"模型断开"}),
+                "模型断开",
+            ),
+            (
+                "teammate_result",
+                json!({"completed":true,"outcome":{"status":"succeeded","result":{"final_text":"第一行\n第二行 👩‍💻"}}}),
+                "第二行 👩‍💻",
+            ),
+            ("teammate_cancel", json!({"cancelled":false}), "未执行取消"),
+            (
+                "teammate_remove",
+                json!({"removed":true,"member":member}),
+                "已移除成员",
+            ),
+            (
+                "teammate_inbox",
+                json!({"messages":[{"id":1,"topic":"review","payload":"邮箱正文"}]}),
+                "邮箱正文",
+            ),
+            (
+                "teammate_ack",
+                json!({"acked":true,"message_id":1}),
+                "已确认消息",
+            ),
+            (
+                "teammate_dispatch",
+                json!({"handle":{"id":"opaque-id"},"acked":true,"completed":false}),
+                "已启动续跑",
+            ),
+        ];
+        let mut plugin = TeammatePlugin::default();
+        for (name, mut content, expected) in cases {
+            content["future_field"] = json!(true);
+            let (_, renderer, verb) = CONTROL_RENDERERS
+                .iter()
+                .find(|(tool, _, _)| *tool == name)
+                .unwrap();
+            let mut request = message_render_request(content);
+            request.renderer_id = (*renderer).into();
+            request.context.call = ToolCall::new(
+                "test",
+                name,
+                json!({"member_id":"opaque-id","role":"审查员","message_id":1}),
+            );
+            if let ToolRenderState::Finished { result } = &mut request.context.state {
+                result.name = name.into();
+                result.details = Some(json!({"recipient_label":"审查员"}));
+            }
+            let frame = plugin.render_tool(request.clone()).expect(name);
+            let text = frame
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            assert!(text.starts_with(&format!("● {verb}")), "{text}");
+            assert!(text.contains(expected), "{text}");
+            assert!(
+                !text.contains("opaque-id") && !text.contains("teammate_"),
+                "{text}"
+            );
+            request.context.state = ToolRenderState::Running;
+            assert!(plugin.render_tool(request.clone()).is_some());
+            request.context.state = ToolRenderState::Finished {
+                result: ToolResult::success("test", name, json!({"future":true})),
+            };
+            assert!(
+                plugin.render_tool(request.clone()).is_none(),
+                "未知结果不能假报成功：{name}"
+            );
+            request.context.state = ToolRenderState::Finished {
+                result: ToolResult::error("test", name, "拒绝执行"),
+            };
+            assert!(plugin.render_tool(request).is_none());
+        }
+    }
+
+    /// 旧结果没有称谓时保留宿主归属，新的失败结果不能被绿色完成圆点掩盖。
+    #[test]
+    fn result_renderer_preserves_legacy_identity_and_full_body_budget() {
+        let mut plugin = TeammatePlugin::default();
+        let body = (1..=40)
+            .map(|index| format!("正文-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut request = message_render_request(
+            json!({"completed":true,"outcome":{"status":"succeeded","result":{"final_text":body}}}),
+        );
+        request.renderer_id = "teammate-result".into();
+        request.context.call.name = "teammate_result".into();
+        request.context.max_height = 43;
+        assert!(plugin.render_tool(request.clone()).is_none());
+        if let ToolRenderState::Finished { result } = &mut request.context.state {
+            result.details = Some(json!({"recipient_label":"审查员","future":true}));
+        }
+        let frame = plugin.render_tool(request.clone()).unwrap();
+        assert_eq!(frame.lines.len(), 42);
+        assert!(frame.lines.last().unwrap().spans[0]
+            .text
+            .ends_with("正文-40"));
+        if let ToolRenderState::Finished { result } = &mut request.context.state {
+            result.content =
+                json!({"completed":true,"outcome":{"status":"failed","error":"模型中断"}});
+        }
+        let frame = plugin.render_tool(request.clone()).unwrap();
+        assert_eq!(frame.lines[0].spans[0].style.foreground, Some(UiColor::Red));
+        assert!(frame.lines.last().unwrap().spans[0]
+            .text
+            .contains("模型中断"));
+        for label in [Value::Null, json!(""), json!(" ")] {
+            if let ToolRenderState::Finished { result } = &mut request.context.state {
+                result.details = Some(json!({"recipient_label":label}));
+            }
+            assert!(plugin.render_tool(request.clone()).is_none());
+        }
+    }
+
+    /// 旧结果以中性成员称谓兜底，不显示不透明地址；大载荷不突破宿主高度限制。
     #[test]
     fn message_renderer_preserves_legacy_payloads_and_height_limit() {
         let mut plugin = TeammatePlugin::default();
@@ -2503,7 +2881,7 @@ mod tests {
                 .iter()
                 .map(|span| span.text.as_str())
                 .collect::<String>();
-            assert_eq!(row, format!("  @member-1: {}", message_body(&payload)));
+            assert_eq!(row, format!("  @成员: {}", message_body(&payload)));
         }
         let body = (1..=30)
             .map(|index| format!("正文 {index}"))

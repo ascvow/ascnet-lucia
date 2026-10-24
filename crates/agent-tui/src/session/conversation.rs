@@ -418,7 +418,7 @@ impl Msg {
             let frame_lines = crate::ui::plugin_frame_lines(frame);
             let expandable = self.is_tool_expandable();
             let visible_lines = if self.tool_expanded {
-                TOOL_RESULT_DETAIL_LINES
+                TOOL_FRAME_DETAIL_LINES
             } else {
                 TOOL_RESULT_PREVIEW_LINES
             };
@@ -550,5 +550,8 @@ pub(crate) const TOOL_RESULT_PREVIEW_LINES: usize = 8;
 
 /// 单条工具消息展开后最多展示的详情行数，避免超大结果拖慢每帧布局。
 pub(crate) const TOOL_RESULT_DETAIL_LINES: usize = 40;
+/// 插件帧额外包含标题、摘要和省略提示，不挤占原有正文详情预算。
+#[cfg(feature = "plugins")]
+pub(crate) const TOOL_FRAME_DETAIL_LINES: usize = TOOL_RESULT_DETAIL_LINES + 3;
 /// 单个运行中工具在 TUI 内保留的最大文本量，防止第三方工具无限推送。
 const TOOL_LIVE_OUTPUT_BYTES: usize = 200 * 1024;

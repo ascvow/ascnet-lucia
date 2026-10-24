@@ -70,11 +70,52 @@ impl ProviderAdapter for FixedModel {
 async fn call_tool(host: &WasmPluginHost, run: &str, name: &str, args: Value) -> Value {
     let mut call = ToolCall::new("smoke-call", name, args);
     call.run_id = Some(run.to_string());
-    let result = AgentExtension::call_tool(host, call)
+    let result = AgentExtension::call_tool(host, call.clone())
         .await
         .expect("插件工具路由不应失败")
         .expect("Teammate 插件应处理自己的工具");
     assert!(!result.is_error, "插件工具返回错误：{}", result.content);
+    // 每个实际成功调用都走一次真实 renderer，避免只测 Ack/Send 而漏掉其他控制面工具。
+    let renderer = host
+        .tool_renderers()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|renderer| renderer.tool_name == name)
+        .expect(name);
+    let frame = host
+        .render_tool(&agent_plugin_host::ui::ToolRenderRequest {
+            plugin_id: "teammate".into(),
+            renderer_id: renderer.renderer_id,
+            context: ToolRenderContext {
+                call: call.clone(),
+                state: ToolRenderState::Finished {
+                    result: result.clone(),
+                },
+                width: 40,
+                max_height: 40,
+                frame: 1,
+            },
+        })
+        .await
+        .unwrap()
+        .expect(name);
+    let text = shelf_text(&frame);
+    assert!(
+        !text.contains(&format!("{name}(")),
+        "内部名不应作为标题：{text}"
+    );
+    if let Some(id) = call.args.get("member_id").and_then(Value::as_str) {
+        assert!(!text.contains(id), "不透明成员地址不应直接展示：{text}");
+        assert!(
+            result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("recipient_label"))
+                .is_some(),
+            "历史展示应携带可信称谓快照"
+        );
+    }
     result.content
 }
 
@@ -100,7 +141,7 @@ async fn wait_result(host: &WasmPluginHost, run: &str, member_id: &str) -> Value
 async fn call_tool_error(host: &WasmPluginHost, run: &str, name: &str, args: Value) -> String {
     let mut call = ToolCall::new("smoke-call", name, args);
     call.run_id = Some(run.to_string());
-    let result = AgentExtension::call_tool(host, call)
+    let result = AgentExtension::call_tool(host, call.clone())
         .await
         .expect("插件工具路由不应失败")
         .expect("Teammate 插件应处理自己的工具");
@@ -108,6 +149,32 @@ async fn call_tool_error(host: &WasmPluginHost, run: &str, name: &str, args: Val
         result.is_error,
         "预期工具错误，实际成功：{}",
         result.content
+    );
+    let renderer = host
+        .tool_renderers()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|renderer| renderer.tool_name == name)
+        .unwrap();
+    assert!(
+        host.render_tool(&agent_plugin_host::ui::ToolRenderRequest {
+            plugin_id: "teammate".into(),
+            renderer_id: renderer.renderer_id,
+            context: ToolRenderContext {
+                call,
+                state: ToolRenderState::Finished {
+                    result: result.clone()
+                },
+                width: 40,
+                max_height: 40,
+                frame: 1
+            },
+        })
+        .await
+        .unwrap()
+        .is_none(),
+        "失败必须保留宿主诊断"
     );
     result.content.to_string()
 }
@@ -273,6 +340,13 @@ async fn component_runs_mailbox_dispatch_flow() {
         .as_str()
         .expect("spawn 应返回稳定成员地址");
     let outcome = wait_result(host.as_ref(), RUN, member_id).await;
+    call_tool(
+        host.as_ref(),
+        RUN,
+        "teammate_status",
+        json!({"member_id":member_id}),
+    )
+    .await;
     // TUI 依赖这个信封取出成员正文做「预览 + 展开」；形状变了会静默退化成 JSON 摘要，
     // 因此在这里钉住成功终态的路径。
     assert_eq!(outcome["outcome"]["status"], "succeeded", "{outcome:?}");
@@ -864,6 +938,13 @@ async fn component_runs_mailbox_dispatch_flow() {
         events.iter().all(|event| event["presentation"].is_null()),
         "确认不应追加第二条事件文本"
     );
+    call_tool(
+        host.as_ref(),
+        "display-run",
+        "teammate_cancel",
+        json!({"member_id":ordinary_id}),
+    )
+    .await;
     call_tool(
         host.as_ref(),
         "display-run",

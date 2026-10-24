@@ -32,11 +32,48 @@ async fn call_tool(
     let mut call = ToolCall::new(format!("plan-smoke-{name}"), name, args);
     call.session_id = session.map(str::to_string);
     call.run_id = run.map(str::to_string);
-    let result = AgentExtension::call_tool(host, call)
+    let result = AgentExtension::call_tool(host, call.clone())
         .await
         .expect("插件工具路由不应失败")
         .expect("Plan 插件应处理自己的工具");
     assert!(!result.is_error, "Plan 插件返回错误：{}", result.content);
+    let renderer = host
+        .tool_renderers()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|renderer| renderer.tool_name == name)
+        .expect(name);
+    let frame = host
+        .render_tool(&agent_plugin_host::ui::ToolRenderRequest {
+            plugin_id: "plan".into(),
+            renderer_id: renderer.renderer_id,
+            context: agent_plugin_host::ui::ToolRenderContext {
+                call,
+                state: agent_plugin_host::ui::ToolRenderState::Finished {
+                    result: result.clone(),
+                },
+                width: 40,
+                max_height: 40,
+                frame: 1,
+            },
+        })
+        .await
+        .unwrap()
+        .expect(name);
+    let title = frame.lines[0]
+        .spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    assert_eq!(
+        title,
+        if name == "update_plan" {
+            "● Update(Plan)"
+        } else {
+            "● Get(Plan)"
+        }
+    );
     result.content
 }
 
