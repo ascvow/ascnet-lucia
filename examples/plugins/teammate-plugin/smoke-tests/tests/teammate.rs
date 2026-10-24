@@ -6,7 +6,8 @@ use agent_core::{
 };
 use agent_plugin_host::{
     ui::{
-        UiColor, UiFrame, UiInput, UiInputEvent, UiPlacement, UiRenderRequest, UI_NAVIGATION_EVENT,
+        ToolRenderContext, ToolRenderState, UiColor, UiFrame, UiInput, UiInputEvent, UiPlacement,
+        UiRenderRequest, UI_NAVIGATION_EVENT,
     },
     wasm::WasmPluginHost,
     LivePluginHost, PluginHost, PluginHostServices, PluginServiceCall,
@@ -185,6 +186,9 @@ async fn component_runs_mailbox_dispatch_flow() {
     let live = LivePluginHost::new();
     live.publish(host.clone() as Arc<dyn PluginHost>)
         .expect("发布真实 Teammate 宿主");
+    live.ui_declarations()
+        .await
+        .expect("建立可信 UI 与工具 renderer 路由");
     live.finish_capability_planning().expect("标记能力规划完成");
     let bus = EventBus::new();
     live.attach_bus(bus.clone()).expect("挂载事件总线");
@@ -582,9 +586,33 @@ async fn component_runs_mailbox_dispatch_flow() {
     assert_eq!(event["source"]["id"], "teammate");
     assert_eq!(event["source"]["type"], "plugin");
     assert_eq!(event["data"], sent["message"]);
-    assert_eq!(event["presentation"]["target"], "main_event_list");
-    assert_eq!(event["presentation"]["variant"], "text");
-    assert_eq!(event["presentation"]["text"], sent["content"]);
+    assert!(
+        event["presentation"].is_null(),
+        "工具组件外不能再出现第二条主列表消息"
+    );
+    let captain_message_result = sent.clone();
+    let frame = live
+        .render_tool_message(&ToolRenderContext {
+            call: ToolCall::new("smoke-call", "teammate_send", json!({})),
+            state: ToolRenderState::Finished {
+                result: agent_tool::ToolResult::success(
+                    "smoke-call",
+                    "teammate_send",
+                    sent.clone(),
+                ),
+            },
+            width: 80,
+            max_height: 20,
+            frame: 30,
+        })
+        .await
+        .expect("消息 renderer 应通过真实 Host 路由")
+        .expect("插件应返回消息组件");
+    assert_eq!(frame.view_id, "teammate-message");
+    assert_eq!(shelf_text(&frame).matches("@队长:").count(), 1);
+    assert_eq!(shelf_text(&frame).matches("src/lib.rs").count(), 1);
+    assert!(!shelf_text(&frame).contains("teammate_send"));
+    assert_eq!(frame.lines[1].spans.last().unwrap().style.foreground, None);
     let message_id = sent["message"]["id"].as_u64().expect("send 应返回消息 ID");
 
     let inbox = call_tool(
@@ -741,7 +769,33 @@ async fn component_runs_mailbox_dispatch_flow() {
         .unwrap();
     assert!(events
         .iter()
-        .any(|event| event["presentation"]["text"] == sent["content"]));
+        .any(|event| event["name"] == "teammate.message.sent"));
+    assert!(events.iter().all(|event| event["presentation"].is_null()));
+    // 普通成员多行组件，以及目录/回收台账均已清理后的队长历史组件，都能按结果重建。
+    for (content, expected, rows) in [
+        (sent.clone(), "@渲染审查员: 第一行", 3),
+        (
+            captain_message_result,
+            "@队长: {\"path\":\"src/lib.rs\"}",
+            2,
+        ),
+    ] {
+        let frame = live
+            .render_tool_message(&ToolRenderContext {
+                call: ToolCall::new("smoke-call", "teammate_send", json!({})),
+                state: ToolRenderState::Finished {
+                    result: agent_tool::ToolResult::success("smoke-call", "teammate_send", content),
+                },
+                width: 24,
+                max_height: 20,
+                frame: 31,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.lines.len(), rows);
+        assert_eq!(shelf_text(&frame).matches(expected).count(), 1);
+    }
     call_tool_error(
         host.as_ref(),
         "display-run",

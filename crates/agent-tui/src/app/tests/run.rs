@@ -430,6 +430,52 @@ async fn tool_output_batches_do_not_cross_call_start_events() {
     assert_eq!(messages[1].tool_output, "second\n");
 }
 
+/// 显式无展示的观察事件不产生额外时间线行，旧事件和新增字段仍保持兼容。
+#[tokio::test]
+async fn extension_without_presentation_does_not_duplicate_tool_component() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, _, _, _) = ChannelEventSink::new(tx);
+    sink.record(&AgentEvent::new(
+        "extension",
+        AgentEventKind::Extension,
+        0,
+        json!({
+            "source":{"type":"plugin","id":"example"},
+            "name":"example.message.sent", "data":{"text":"已由工具组件显示"},
+            "presentation":null, "future_field":true
+        }),
+    ))
+    .await
+    .unwrap();
+    assert!(rx.try_recv().is_err(), "观察事件不能重复显示正文或协议名");
+
+    sink.record(&AgentEvent::new(
+        "legacy",
+        AgentEventKind::Extension,
+        0,
+        json!({"name":"legacy.notice"}),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        matches!(rx.try_recv(), Ok(UiEvent::Extension { text, .. }) if text == "legacy.notice")
+    );
+
+    sink.record(&AgentEvent::new(
+        "extension",
+        AgentEventKind::Extension,
+        0,
+        json!({
+            "name":"example.notice", "presentation":{
+                "target":"main_event_list", "text":"显式展示", "future_field":true
+            }
+        }),
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(rx.try_recv(), Ok(UiEvent::Extension { text, .. }) if text == "显式展示"));
+}
+
 /// 扩展展示只读取通用 presentation，不解析插件 payload；多行与终端控制序列安全呈现。
 #[tokio::test]
 async fn extension_presentation_preserves_multiline_text() {

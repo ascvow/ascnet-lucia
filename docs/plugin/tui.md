@@ -160,7 +160,7 @@ TUI 会在每个插件 Ready 时立即消费其激活事件，并在底部信息
 }
 ```
 
-Lucia TUI 支持 `text` 与 `divider`，tone 支持 `info`、`success`、`warning`、`error`、`muted`。无界面消费者可以忽略 `presentation`，仍保留 name 和 data。
+Lucia TUI 支持 `text` 与 `divider`，tone 支持 `info`、`success`、`warning`、`error`、`muted`。无界面消费者可以忽略 `presentation`，仍保留 name 和 data。Host 输出的 `presentation: null` 表示仅观察、不追加时间线行；工具已用 renderer 展示结果时应使用它，避免重复显示正文或协议名。缺少该字段的旧式运行事件仍保留名称回退。
 
 需要常驻展示插件当前模式时使用 `target = "footer"` 与 `text` 形态。底栏状态不进入对话消息或 Session；Rust 插件可用 `EventPresentation::footer(...)` 构造。
 

@@ -294,7 +294,12 @@ pub(crate) fn plugin_frame_lines(plugin_frame: &PluginUiFrame) -> Vec<Line<'stat
             Line::from(
                 line.spans
                     .iter()
-                    .map(|span| Span::styled(span.text.clone(), plugin_style(&span.style)))
+                    .map(|span| {
+                        Span::styled(
+                            crate::ui::plain_terminal_text(&span.text).into_owned(),
+                            plugin_style(&span.style),
+                        )
+                    })
                     .collect::<Vec<_>>(),
             )
         })
@@ -454,6 +459,78 @@ mod tests {
     use agent_plugin_protocol::{UiDeclaration, UiLine, UiSize, UiSpan};
     use ratatui::{backend::TestBackend, Terminal};
     use tokio::sync::mpsc;
+
+    /// 工具组件完全替代默认参数/摘要，Unicode、多行与终端控制序列安全进入窄屏布局。
+    #[test]
+    fn tool_component_is_single_safe_multiline_block() {
+        use crate::session::conversation::{Msg, MsgKind};
+        use crate::ui::transcript_layout::TranscriptLayout;
+        use agent_tool::{ToolCall, ToolResult};
+        let mut message = Msg::tool_started(ToolCall::new(
+            "send-1",
+            "example_send",
+            serde_json::json!({"payload":"不应重复"}),
+        ));
+        message.kind = MsgKind::ToolOk;
+        message.tool_result = Some(ToolResult::success(
+            "send-1",
+            "example_send",
+            serde_json::json!({"content":"不应重复"}),
+        ));
+        message.tool_frame = Some(PluginUiFrame {
+            view_id: "example-message".into(),
+            visible: true,
+            lines: [
+                "✓ 消息 · 已投递",
+                "  @审查员: 第一行",
+                "  中文 👩‍💻 e\u{301}",
+                "  \u{001b}[31m第二行\u{001b}[0m",
+            ]
+            .into_iter()
+            .map(|text| UiLine {
+                spans: vec![UiSpan {
+                    text: text.into(),
+                    style: UiStyle::default(),
+                }],
+            })
+            .collect(),
+            cursor: None,
+        });
+        let lines = message.to_lines(false, 80);
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.matches("@审查员:").count(), 1);
+        assert!(!text.contains("example_send"));
+        assert!(!text.contains("不应重复"));
+        assert!(!text.contains("[31m"));
+        assert!(text.contains("👩‍💻 e\u{301}"));
+        assert!(!message.is_tool_expandable());
+        for width in [12, 40, 80] {
+            let mut layout = TranscriptLayout::default();
+            let height = layout.sync(std::slice::from_ref(&message), None, width);
+            let buffer = layout.render_range(
+                Rect::new(0, 0, width, height as u16),
+                std::slice::from_ref(&message),
+                None,
+                0,
+                height as u16,
+            );
+            let rendered = buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .replace(' ', "");
+            assert!(rendered.contains("第二行"), "{rendered}");
+            assert!(buffer
+                .content
+                .iter()
+                .all(|cell| !cell.symbol().chars().any(char::is_control)));
+        }
+    }
 
     /// 插件默认文字跟随终端；显式前景/背景必须成对保留色板槽位，不能变成黑底黑字。
     #[test]

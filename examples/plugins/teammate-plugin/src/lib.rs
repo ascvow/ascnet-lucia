@@ -8,9 +8,9 @@ use agent_plugin::{
     AgentSpawnRequest, AgentStatus, EventOutcome, EventPresentation, EventPresentationTarget,
     EventPresentationTone, EventPresentationVariant, ExtensionEvent, PluginEvent, PluginHostApi,
     Result, RunFinishEventData, ServiceCall, ServiceSpec, ToolCall, ToolPermissionScope,
-    ToolResult, ToolSpec, UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine,
-    UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle,
-    UiViewInstance,
+    ToolRenderRequest, ToolRenderState, ToolRendererContribution, ToolResult, ToolSpec, UiColor,
+    UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest,
+    UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,8 @@ const TEAM_DOCK_VIEW: &str = "teammate-team-dock";
 const TEAM_WORKSPACE_VIEW: &str = "teammate-team-workspace";
 /// 成员实时会话视图；实例由宿主原生渲染，声明只用于输入路由与标题。
 const TEAM_SESSION_VIEW: &str = "teammate-member-session";
+/// 发送消息在时间线中的唯一组件，替换宿主的参数、摘要和行号预览。
+const MESSAGE_RENDERER: &str = "teammate-message";
 /// 成员架最多渲染的内容行数（不含宿主画在架顶部的那条分隔线）。
 ///
 /// 宿主按「内容行 + 1」算面板高度，并把分隔线以下的区域当视图高度交回来；
@@ -901,17 +903,20 @@ impl TeammatePlugin {
         let recipient = self.state.member(owner, &message.recipient)?;
         let text = message_display_text(&recipient.role, recipient.captain, &message.payload);
         // 展示只依赖已入邮箱的消息和成员目录，不接受 payload 自报的名字或队长身份。
-        // 观察事件失败不能回滚投递；结果携带可选正文，历史恢复也能使用通用工具预览。
+        // 工具调用只由消息组件展示；服务调用没有对应工具卡片，仍发布一次正文提示。
+        let presentation =
+            matches!(message.sender, MessageSender::Plugin { .. }).then(|| EventPresentation {
+                target: EventPresentationTarget::MainEventList,
+                variant: EventPresentationVariant::Text,
+                tone: EventPresentationTone::Muted,
+                text: text.clone(),
+            });
         let _ = host.emit_event(&ExtensionEvent {
             name: "teammate.message.sent".into(),
             data: serde_json::to_value(&message)?,
-            presentation: Some(EventPresentation {
-                target: EventPresentationTarget::MainEventList,
-                variant: EventPresentationVariant::Text,
-                tone: EventPresentationTone::Info,
-                text: text.clone(),
-            }),
+            presentation,
         });
+        // 保留展示快照：成员已回收或插件重载后，历史卡片仍能恢复当时的收件称谓。
         Ok(json!({"message": message, "content": text}))
     }
 
@@ -1688,6 +1693,64 @@ impl AgentPlugin for TeammatePlugin {
         ]
     }
 
+    /// 使用现有工具消息组件取代重复的参数、摘要、行号预览和扩展事件行。
+    fn describe_tool_renderers(&self) -> Vec<ToolRendererContribution> {
+        vec![ToolRendererContribution {
+            plugin_id: String::new(),
+            renderer_id: MESSAGE_RENDERER.into(),
+            tool_name: "teammate_send".into(),
+        }]
+    }
+
+    /// 渲染一次发送的投递状态与正文；失败和未知旧结果退回宿主错误/通用样式。
+    ///
+    /// 完成态优先使用结果中的展示快照，不依赖仍然存活的成员目录。正文只显示一次，
+    /// 收件人适度强调，其余文本继承终端正文色；自动换行交给宿主显示宽度布局。
+    fn render_tool(&mut self, request: ToolRenderRequest) -> Option<UiFrame> {
+        if request.renderer_id != MESSAGE_RENDERER
+            || request.context.call.name != "teammate_send"
+            || request.context.max_height == 0
+        {
+            return None;
+        }
+        let lines = match &request.context.state {
+            ToolRenderState::Running => vec![ui_line(vec![
+                ui_span("◌ ", Some(UiColor::Yellow), false),
+                ui_span("团队消息", Some(UiColor::Cyan), true),
+                ui_span(" · 投递中", Some(UiColor::Gray), false),
+            ])],
+            ToolRenderState::Finished { result } if !result.is_error => {
+                let message: TeammateMessage =
+                    serde_json::from_value(result.content.get("message")?.clone()).ok()?;
+                let body = message_body(&message.payload);
+                // 用完整正文剥离前缀而非按冒号切分，角色自身包含冒号时也不会误切。
+                let label = result
+                    .content
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .and_then(|text| text.strip_suffix(&body))
+                    .and_then(|prefix| prefix.strip_prefix('@'))
+                    .and_then(|prefix| prefix.strip_suffix(": "))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        self.plugin_id
+                            .as_deref()
+                            .and_then(|owner| self.state.member(owner, &message.recipient).ok())
+                            .map(|member| message_recipient_label(&member.role, member.captain))
+                            .unwrap_or_else(|| message.recipient.as_str().to_string())
+                    });
+                message_card_lines(&label, &body, usize::from(request.context.max_height))
+            }
+            _ => return None,
+        };
+        Some(UiFrame {
+            view_id: MESSAGE_RENDERER.into(),
+            visible: true,
+            lines,
+            cursor: None,
+        })
+    }
+
     /// 根据宿主分配尺寸渲染成员架或全屏工作台。
     ///
     /// 成员架在当前 owner 没有成员时返回隐藏帧，子视图不受该条件影响。
@@ -1968,21 +2031,61 @@ fn validate_topic(topic: &str) -> Result<()> {
     Ok(())
 }
 
-/// 把已确认的收件人称谓与任意 JSON 正文转成通用展示文本，不改变邮箱载荷。
-/// 字符串原样显示，其他 JSON 完整序列化；`@` 指收件人，不宣称已读或已执行。
-fn message_display_text(role: &str, captain: bool, payload: &Value) -> String {
-    let label = if captain {
+/// 返回稳定的收件人称谓，不允许角色里的控制符伪造新标题。
+fn message_recipient_label(role: &str, captain: bool) -> String {
+    if captain {
         "队长".to_string()
     } else {
         role.chars()
             .map(|ch| if ch.is_control() { ' ' } else { ch })
             .collect()
-    };
-    let body = match payload {
+    }
+}
+
+/// 字符串原样显示，其他 JSON 完整序列化；不猜测载荷中的 text 或身份字段。
+fn message_body(payload: &Value) -> String {
+    match payload {
         Value::String(text) => text.clone(),
         value => value.to_string(),
-    };
-    format!("@{label}: {body}")
+    }
+}
+
+/// 把已确认的收件人称谓与任意 JSON 正文转成展示快照，不改变邮箱载荷。
+/// `@` 指收件人，不宣称已读或已执行。
+fn message_display_text(role: &str, captain: bool, payload: &Value) -> String {
+    format!(
+        "@{}: {}",
+        message_recipient_label(role, captain),
+        message_body(payload)
+    )
+}
+
+/// 构造仅包含一次正文的消息卡片；行数受 Host 上限约束，超出时显式标记而非静默截断。
+fn message_card_lines(label: &str, body: &str, max_height: usize) -> Vec<UiLine> {
+    let label = message_recipient_label(label, false);
+    let mut lines = vec![ui_line(vec![
+        ui_span("✓ ", Some(UiColor::Green), false),
+        ui_span("团队消息", Some(UiColor::Cyan), true),
+        ui_span(" · 已投递", Some(UiColor::Gray), false),
+    ])];
+    for (index, row) in body.split('\n').enumerate() {
+        let mut spans = vec![ui_span("  ", None, false)];
+        if index == 0 {
+            spans.push(ui_span(format!("@{label}: "), Some(UiColor::Cyan), true));
+        }
+        spans.push(ui_span(row, None, false));
+        lines.push(ui_line(spans));
+    }
+    if lines.len() > max_height {
+        let omitted = lines.len().saturating_sub(max_height.saturating_sub(1));
+        lines.truncate(max_height.saturating_sub(1));
+        lines.push(ui_line(vec![ui_span(
+            format!("  … +{omitted} 行（完整内容保留在工具结果）"),
+            Some(UiColor::Gray),
+            false,
+        )]));
+    }
+    lines
 }
 
 /// 尽力发布结构化 teammate 事件；观察性事件失败不回滚已完成的状态变更。
@@ -2148,6 +2251,137 @@ mod tests {
         assert_eq!(legacy.payload, Value::Null);
         let additive: SendRequest = serde_json::from_value(json!({"recipient":"worker-1","topic":"review","payload":"正文","display_hint":"ignored"})).unwrap();
         assert_eq!(additive.payload, json!("正文"));
+    }
+
+    /// 构造工具 renderer 请求；结果不需要活跃成员目录，模拟会话恢复。
+    fn message_render_request(content: Value) -> ToolRenderRequest {
+        ToolRenderRequest {
+            plugin_id: "teammate".into(),
+            renderer_id: MESSAGE_RENDERER.into(),
+            context: agent_plugin::ToolRenderContext {
+                call: ToolCall::new("send-1", "teammate_send", json!({"payload":"伪造请求正文"})),
+                state: ToolRenderState::Finished {
+                    result: ToolResult::success("send-1", "teammate_send", content),
+                },
+                width: 40,
+                max_height: 20,
+                frame: 1,
+            },
+        }
+    }
+
+    /// 生成旧格式消息信封，新增展示快照由各测试按需附加。
+    fn message_result(payload: Value) -> Value {
+        json!({"message":{
+            "id":1, "sender":{"kind":"controller","agent_id":"controller-1"},
+            "recipient":"member-1", "topic":"review", "payload":payload,
+            "dispatch_attempts":0
+        }})
+    }
+
+    /// 组件必须只出现一次收件人/正文，完成态不依赖已回收的成员或原调用参数。
+    #[test]
+    fn message_renderer_uses_result_snapshot_once() {
+        let mut plugin = TeammatePlugin::default();
+        let declarations = plugin.describe_tool_renderers();
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].tool_name, "teammate_send");
+        assert!(declarations[0].plugin_id.is_empty());
+        for label in ["队长", "审查员: 前端"] {
+            let body = "第一行\n\n中文 👩‍💻 第二行";
+            let mut content = message_result(json!(body));
+            content["content"] = json!(format!("@{label}: {body}"));
+            content["future_field"] = json!(true);
+            let frame = plugin.render_tool(message_render_request(content)).unwrap();
+            assert_eq!(frame.view_id, MESSAGE_RENDERER);
+            assert_eq!(frame.lines.len(), 4);
+            let text = frame
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            assert_eq!(text.matches(&format!("@{label}:")).count(), 1);
+            assert_eq!(text.matches("第一行").count(), 1);
+            assert_eq!(text.matches("中文 👩‍💻 第二行").count(), 1);
+            assert!(!text.contains("teammate_send"));
+            assert!(!text.contains("伪造请求正文"));
+            assert!(!text.contains("已读"));
+            assert!(text.contains("已投递"));
+            assert_eq!(
+                frame.lines[1].spans.last().unwrap().style,
+                UiStyle::default()
+            );
+            assert!(frame
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.foreground != Some(UiColor::Red)));
+        }
+    }
+
+    /// 旧结果以稳定地址兜底，不从任意 JSON 中猜角色；大载荷不突破宿主高度限制。
+    #[test]
+    fn message_renderer_preserves_legacy_payloads_and_height_limit() {
+        let mut plugin = TeammatePlugin::default();
+        for payload in [
+            json!({"captain":true,"text":"正文"}),
+            json!([1, "二"]),
+            Value::Null,
+            json!(""),
+        ] {
+            let frame = plugin
+                .render_tool(message_render_request(message_result(payload.clone())))
+                .unwrap();
+            let row = frame.lines[1]
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            assert_eq!(row, format!("  @member-1: {}", message_body(&payload)));
+        }
+        let body = (1..=30)
+            .map(|index| format!("正文 {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for height in [1, 2, 8, 20, 40] {
+            let mut request = message_render_request(message_result(json!(body)));
+            request.context.max_height = height;
+            let frame = plugin.render_tool(request).unwrap();
+            assert!(frame.lines.len() <= usize::from(height));
+            if height < 31 {
+                assert!(frame.lines.last().unwrap().spans[0]
+                    .text
+                    .contains("完整内容保留"));
+            }
+        }
+    }
+
+    /// 运行态不假报已送达，错误、跳过和不属于本 renderer 的请求保留宿主原始反馈。
+    #[test]
+    fn message_renderer_preserves_failure_and_routing_fallbacks() {
+        let mut plugin = TeammatePlugin::default();
+        let mut request = message_render_request(message_result(json!("正文")));
+        request.context.state = ToolRenderState::Running;
+        let frame = plugin.render_tool(request.clone()).unwrap();
+        assert!(frame.lines[0].spans.last().unwrap().text.contains("投递中"));
+        for state in [
+            ToolRenderState::Finished {
+                result: ToolResult::error("send-1", "teammate_send", "邮箱已满"),
+            },
+            ToolRenderState::Skipped {
+                reason: "用户拒绝".into(),
+            },
+        ] {
+            request.context.state = state;
+            assert!(plugin.render_tool(request.clone()).is_none());
+        }
+        request.context.state = ToolRenderState::Running;
+        request.renderer_id = "other".into();
+        assert!(plugin.render_tool(request.clone()).is_none());
+        request.renderer_id = MESSAGE_RENDERER.into();
+        request.context.max_height = 0;
+        assert!(plugin.render_tool(request).is_none());
     }
 
     /// 派生与续跑成员保持 unknown，其余短控制面操作才声明为 control。

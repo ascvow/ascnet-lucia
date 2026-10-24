@@ -281,6 +281,11 @@ impl EventSink for ChannelEventSink {
                     return Ok(());
                 }
                 let presentation = event.payload.get("presentation");
+                // Host 显式写入 null 表示仅供观察，不再把协议名当第二条可见消息。
+                // 未携带该字段的旧事件仍保留名称回退，与插件 UI 事件消费保持一致。
+                if presentation.is_some_and(Value::is_null) {
+                    return Ok(());
+                }
                 let target = presentation
                     .and_then(|value| value.get("target"))
                     .and_then(Value::as_str)
