@@ -427,6 +427,26 @@ fn read_archive_u64(archive: &[u8], cursor: &mut usize) -> Result<u64> {
 ///
 /// 根目录不是普通目录、存在不安全条目、路径无法规范化或文件读取失败时返回错误。
 pub fn hash_plugin_bundle(root: &Path) -> Result<String> {
+    hash_plugin_bundle_impl(root, false).map(|(digest, _)| digest)
+}
+
+/// 返回参与同次完整摘要的 manifest 原文，防止解析与校验读取不同版本的文件。
+pub(crate) fn hash_plugin_bundle_with_manifest(root: &Path) -> Result<(String, String)> {
+    let (digest, manifest) = hash_plugin_bundle_impl(root, true)?;
+    Ok((
+        digest,
+        String::from_utf8(manifest.ok_or_else(|| anyhow!("bundle 缺少 plugin.toml"))?)
+            .context("manifest 不是 UTF-8")?,
+    ))
+}
+
+#[cfg(test)]
+std::thread_local! { pub(crate) static HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+fn hash_plugin_bundle_impl(root: &Path, capture: bool) -> Result<(String, Option<Vec<u8>>)> {
+    #[cfg(test)]
+    HASH_CALLS.with(|count| count.set(count.get() + 1));
+    let mut manifest = None;
     let entries = scan_bundle(root)?;
     let mut digest = Sha256::new();
     digest.update(BUNDLE_ARCHIVE_DOMAIN);
@@ -445,16 +465,23 @@ pub fn hash_plugin_bundle(root: &Path) -> Result<String> {
             digest.update(metadata.len().to_be_bytes());
             let mut file = File::open(&entry.source)
                 .with_context(|| format!("无法读取 bundle 文件：{}", entry.source.display()))?;
+            let mut captured = (capture && entry.normalized == "plugin.toml").then(Vec::new);
             loop {
                 let read = file.read(&mut buffer).context("无法计算 bundle SHA-256")?;
                 if read == 0 {
                     break;
                 }
                 digest.update(&buffer[..read]);
+                if let Some(bytes) = captured.as_mut() {
+                    bytes.extend_from_slice(&buffer[..read]);
+                }
+            }
+            if captured.is_some() {
+                manifest = captured;
             }
         }
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok((format!("{:x}", digest.finalize()), manifest))
 }
 
 pub(crate) fn load_and_validate_manifest(

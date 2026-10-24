@@ -73,6 +73,62 @@ fn create_bundle(
     bundle
 }
 
+/// 单次启动各校验一次当前/历史 Bundle；不同操作重新校验，不能信任相同 mtime。
+#[test]
+fn startup_reuses_bundle_checks_only_within_operation() {
+    let directory = TestDirectory::new("startup-check-reuse");
+    let manager = PluginManager::new(directory.path.join("managed"));
+    manager
+        .install(create_bundle(&directory.path, "echo", "1.0.0", &[], None))
+        .unwrap();
+    manager
+        .replace(create_bundle(&directory.path, "echo", "2.0.0", &[], None))
+        .unwrap();
+    enable_reviewed(&manager, "echo").unwrap();
+    manager
+        .install(create_bundle(
+            &directory.path,
+            "disabled",
+            "1.0.0",
+            &[],
+            None,
+        ))
+        .unwrap();
+    for _ in 0..2 {
+        let before = crate::bundle::HASH_CALLS.with(|count| count.get());
+        assert_eq!(manager.runtime_config().unwrap().manifest_paths.len(), 1);
+        assert_eq!(
+            crate::bundle::HASH_CALLS.with(|count| count.get()) - before,
+            3
+        );
+    }
+    let path = manager.root().join("plugins/echo/2.0.0/plugin.wasm");
+    let time = fs::metadata(&path).unwrap().modified().unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] ^= 1;
+    fs::write(&path, bytes).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(time))
+        .unwrap();
+    assert!(manager.runtime_config().is_err());
+}
+
+/// 捕获的 manifest 与实际进入 hash 的原文相同，摘要格式保持兼容。
+#[test]
+fn bundle_digest_returns_matching_manifest_bytes() {
+    let directory = TestDirectory::new("hash-manifest-bytes");
+    let bundle = create_bundle(&directory.path, "echo", "1.0.0", &[], None);
+    let (digest, manifest) = crate::bundle::hash_plugin_bundle_with_manifest(&bundle).unwrap();
+    assert_eq!(digest, crate::bundle::hash_plugin_bundle(&bundle).unwrap());
+    assert_eq!(
+        manifest,
+        fs::read_to_string(bundle.join("plugin.toml")).unwrap()
+    );
+}
+
 /// 测试基线通过明确的可信启动入口构造已启用插件，不经过人工安装 API。
 fn install_enabled_for_startup(
     manager: &PluginManager,

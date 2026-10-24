@@ -673,7 +673,22 @@ impl PluginManager {
     ///
     /// 可归因于单个插件的问题会收集到报告中；锁文件无法解析等全局错误直接返回。
     pub fn doctor(&self) -> Result<DoctorReport> {
-        let lock = self.load_lock()?;
+        self.doctor_with_lock().map(|(_, report)| report)
+    }
+
+    /// 同次操作复用完整校验，不跨操作缓存，也不在诊断后换读另一份锁。
+    fn doctor_with_lock(&self) -> Result<(PluginLock, DoctorReport)> {
+        let mut lock = self.read_lock_snapshot()?;
+        let bundles = lock
+            .plugins
+            .iter()
+            .map(|plugin| self.inspect_locked_bundle(plugin))
+            .collect::<Vec<_>>();
+        Self::normalize_authorization_state(&mut lock, |index, _| {
+            let manifest = bundles[index].as_ref().ok()?;
+            manifest.validate().ok()?;
+            authorization_profile_digest(manifest).ok()
+        });
         let mut report = DoctorReport {
             checked_plugins: lock.plugins.len(),
             issues: Vec::new(),
@@ -681,7 +696,7 @@ impl PluginManager {
         let mut ids = HashSet::new();
         let mut enabled_manifests = Vec::new();
 
-        for plugin in &lock.plugins {
+        for (plugin, bundle) in lock.plugins.iter().zip(bundles) {
             if !ids.insert(plugin.id.clone()) {
                 push_issue(
                     &mut report,
@@ -690,7 +705,7 @@ impl PluginManager {
                 );
                 continue;
             }
-            let manifest = match self.inspect_locked_bundle(plugin) {
+            let manifest = match bundle {
                 Ok(manifest) => manifest,
                 Err(error) => {
                     push_issue(
@@ -779,14 +794,14 @@ impl PluginManager {
             );
         }
         self.inspect_unmanaged_entries(&lock, &mut report)?;
-        Ok(report)
+        Ok((lock, report))
     }
 
     /// 返回经过完整性、依赖和能力检查的 Host 运行时配置。
     ///
     /// 该 API 是插件管理层与 Plugin Host 的边界；它不会实例化插件。
     pub fn runtime_config(&self) -> Result<PluginRuntimeConfig> {
-        let report = self.doctor()?;
+        let (lock, report) = self.doctor_with_lock()?;
         if !report.is_healthy() {
             let messages = report
                 .issues
@@ -797,7 +812,6 @@ impl PluginManager {
                 .join("；");
             bail!("插件目录诊断失败：{messages}");
         }
-        let lock = self.load_lock()?;
         let manifest_paths = lock
             .plugins
             .iter()
@@ -860,8 +874,7 @@ impl PluginManager {
         let bundle_path = manifest_path
             .parent()
             .ok_or_else(|| anyhow!("锁定 manifest 缺少父目录"))?;
-        let text = fs::read_to_string(&manifest_path)
-            .with_context(|| format!("无法读取插件 manifest：{}", manifest_path.display()))?;
+        let (actual_sha256, text) = crate::bundle::hash_plugin_bundle_with_manifest(bundle_path)?;
         let manifest: PluginManifest = toml::from_str(&text)
             .with_context(|| format!("无法解析插件 manifest：{}", manifest_path.display()))?;
         if manifest.plugin.id != plugin.id
@@ -871,7 +884,6 @@ impl PluginManager {
         {
             bail!("manifest 身份与锁文件记录不一致");
         }
-        let actual_sha256 = hash_plugin_bundle(bundle_path)?;
         if actual_sha256 != plugin.sha256 {
             bail!(
                 "SHA-256 不匹配：锁定值 `{}`，实际值 `{actual_sha256}`",
@@ -891,13 +903,17 @@ impl PluginManager {
     ///
     /// 该规范化只改变当前读取到的有效视图；任一后续写事务会用 v2 schema 持久化结果。
     /// Bundle 完整性错误仍由 doctor 单独报告，不能借降级隐藏损坏文件。
-    fn normalize_authorization_state(&self, lock: &mut PluginLock) {
+    fn normalize_authorization_state(
+        lock: &mut PluginLock,
+        mut digest: impl FnMut(usize, &InstalledPlugin) -> Option<String>,
+    ) {
         let authorized = lock
             .plugins
             .iter()
-            .filter(|plugin| plugin.enabled)
-            .filter_map(|plugin| {
-                let expected = self.authorization_digest_for_locked_plugin(plugin).ok()?;
+            .enumerate()
+            .filter(|(_, plugin)| plugin.enabled)
+            .filter_map(|(index, plugin)| {
+                let expected = digest(index, plugin)?;
                 lock.authorization_grants
                     .get(&plugin.id)
                     .is_some_and(|approved| approved == &expected)
@@ -1165,6 +1181,15 @@ impl PluginManager {
     }
 
     fn load_lock(&self) -> Result<PluginLock> {
+        let mut lock = self.read_lock_snapshot()?;
+        Self::normalize_authorization_state(&mut lock, |_, plugin| {
+            self.authorization_digest_for_locked_plugin(plugin).ok()
+        });
+        Ok(lock)
+    }
+
+    /// 仅解析锁快照，使用启用位前必须完成授权规范化。
+    fn read_lock_snapshot(&self) -> Result<PluginLock> {
         let path = self.lock_path();
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -1189,7 +1214,6 @@ impl PluginManager {
                 bail!("不支持插件锁文件版本 `{unsupported}`，当前版本 `{LOCK_SCHEMA_VERSION}`");
             }
         }
-        self.normalize_authorization_state(&mut lock);
         Ok(lock)
     }
 
