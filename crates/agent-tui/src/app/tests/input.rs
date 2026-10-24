@@ -901,6 +901,21 @@ fn ctrl_c_requires_confirmation_before_quitting() {
     assert!(app.should_quit);
 }
 
+/// Ctrl+Z 在 raw mode 下收不到终端信号，只能登记挂起意图交给主循环处理。
+#[test]
+fn ctrl_z_requests_suspend_without_touching_input() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.input = "未发送的草稿".into();
+    app.cursor = app.input.len();
+
+    app.handle_key(KeyCode::Char('z'), KeyModifiers::CONTROL, None);
+
+    assert!(app.pending_suspend, "Ctrl+Z 应登记挂起意图");
+    assert_eq!(app.input, "未发送的草稿", "挂起不得动输入框内容");
+    assert!(!app.should_quit);
+}
+
 /// 两次 Ctrl+C 之间出现其他按键时必须重新计数，避免误退出。
 #[test]
 fn ctrl_c_confirmation_is_reset_by_other_keys() {

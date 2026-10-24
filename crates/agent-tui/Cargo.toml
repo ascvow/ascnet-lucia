@@ -45,5 +45,9 @@ toml.workspace = true
 tui-markdown = { version = "=0.3.3", default-features = false }
 unicode-width = "0.2"
 
+# 作业控制的信号处理器需要用 async-signal-safe 的 write/tcsetattr 直接恢复终端。
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

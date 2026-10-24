@@ -16,6 +16,7 @@ mod plugin;
 mod session;
 mod startup;
 mod stream_probe;
+mod terminal;
 mod theme;
 mod ui;
 

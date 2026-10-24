@@ -69,6 +69,12 @@ impl App {
             self.toggle_mouse_capture();
             return;
         }
+        // raw mode 让终端不再把 Ctrl+Z 变成 SIGTSTP，这里登记意图：由主循环先恢复
+        // 终端状态再真正挂起，否则外层 shell 会一直收到鼠标上报序列。
+        if is_command_modifier(modifiers) && matches!(code, KeyCode::Char('z')) {
+            self.pending_suspend = true;
+            return;
+        }
         if is_command_modifier(modifiers) && matches!(code, KeyCode::Char('r')) {
             self.cycle_reasoning_level(agent);
             return;
@@ -839,6 +845,8 @@ impl App {
             return;
         }
         self.mouse_capture = !self.mouse_capture;
+        // 挂起处理器靠这份状态决定是否发送禁用序列，切换后必须同步。
+        crate::terminal::set_mouse_capture(self.mouse_capture);
         self.dismiss_text_selection();
         let notice = if self.mouse_capture {
             "Mouse capture enabled; press Ctrl+T to restore text selection"

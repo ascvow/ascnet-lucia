@@ -253,6 +253,8 @@ pub(crate) struct App {
     pub(crate) fullscreen: bool,
     /// 等待主循环应用的渲染模式切换；终端句柄由主循环持有，应用只登记意图。
     pub(crate) pending_fullscreen: Option<bool>,
+    /// 等待主循环执行的挂起；raw mode 关闭了终端自身的 `SIGTSTP` 生成，必须先恢复终端再停止。
+    pub(crate) pending_suspend: bool,
     /// 当前屏幕文本选择；鼠标释放只保留高亮，不主动写入系统剪贴板。
     ///
     /// 选区坐标以**内容行号**为基准，而不是屏幕行：滚轮滚动或拖到屏幕外自动滚动后，
@@ -542,6 +544,7 @@ impl App {
             mouse_capture: true,
             fullscreen: true,
             pending_fullscreen: None,
+            pending_suspend: false,
             text_selection: None,
             text_selection_content: None,
             content_area: None,

@@ -27,6 +27,7 @@ use crate::session::{
     LazyFileSessionStore, WorkspaceContext,
 };
 use crate::stream_probe::StreamProbe;
+use crate::terminal;
 #[cfg(feature = "plugins")]
 use crate::theme::PLUGIN_REFRESH_TICKS;
 use crate::theme::{REVEAL_FRAME_INTERVAL_MS, UI_TICK_INTERVAL_MS};
@@ -113,6 +114,8 @@ struct TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // 先注销接管状态：退出途中到达的挂起信号若再写一遍恢复序列，会和下面的清理交叉。
+        terminal::release();
         if self.keyboard_enhanced {
             let _ = crossterm::execute!(
                 std::io::stdout(),
@@ -158,8 +161,43 @@ fn apply_fullscreen_switch(
     } else {
         crossterm::execute!(std::io::stdout(), LeaveAlternateScreen).context("退出备用屏幕失败")?;
     }
+    // 挂起处理器按这份状态决定是否退出备用屏幕，切换后必须同步。
+    terminal::set_screen(fullscreen);
     terminal.clear().context("切换渲染模式后清屏失败")?;
     Ok(())
+}
+
+/// 从挂起或后台作业重新接管终端。
+///
+/// 挂起时处理器已经退出备用屏幕并交还终端属性，这里按启动时的能力集合原样重建：
+/// raw mode、备用屏幕、键盘增强、鼠标捕获与括号粘贴，最后清屏让下一帧整屏重绘。
+/// 返回鼠标捕获的实际状态：终端可能拒绝该能力，`Ctrl+T` 需要据此重试。
+fn resume_terminal(
+    terminal: &mut ratatui::DefaultTerminal,
+    fullscreen: bool,
+    keyboard_enhanced: bool,
+    mouse_capture: bool,
+) -> Result<bool> {
+    use crossterm::terminal::EnterAlternateScreen;
+    crossterm::terminal::enable_raw_mode().context("恢复终端原始模式失败")?;
+    if fullscreen {
+        crossterm::execute!(std::io::stdout(), EnterAlternateScreen).context("恢复备用屏幕失败")?;
+    }
+    if keyboard_enhanced {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        );
+    }
+    let mouse_capture = mouse_capture
+        && crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).is_ok();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    terminal.show_cursor().context("恢复光标显示失败")?;
+    terminal.clear().context("恢复后清屏失败")?;
+    terminal::mark_attached();
+    Ok(mouse_capture)
 }
 
 pub(crate) async fn run(args: Args) -> Result<()> {
@@ -466,10 +504,15 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     #[cfg(feature = "plugins")]
     let loading_plugin_ids = plugin_manifest_ids(&plugin_manifests);
 
-    let mut terminal = init_terminal(tui_settings.fullscreen.unwrap_or(true))?;
+    // 作业控制处理器必须先于 raw mode 安装：原始终端属性只有那时读得到，挂起后的
+    // 恢复也只能靠这份快照，不能用 crossterm 的全局状态。
+    let fullscreen = tui_settings.fullscreen.unwrap_or(true);
+    terminal::install(fullscreen);
+    let mut terminal = init_terminal(fullscreen)?;
     // 键盘增强协议让 Shift+Enter 等修饰组合可被区分（传统协议下它就是裸 Enter）。
     // 该查询会读取终端应答，必须在输入读取线程启动前完成，否则应答被线程吞掉。
     let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    terminal::set_keyboard_enhanced(keyboard_enhanced);
     if keyboard_enhanced {
         let _ = crossterm::execute!(
             std::io::stdout(),
@@ -483,14 +526,30 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     // 默认捕获鼠标：滚轮与拖选由 TUI 分别处理，避免终端把滚轮转换为输入框 Up/Down。
     let mouse_capture =
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).is_ok();
+    terminal::set_mouse_capture(mouse_capture);
     // 启用 bracketed paste，将拖入的文件路径识别为附件。
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    // 协议全部就绪后登记接管：此前的挂起信号没有终端状态需要恢复。
+    terminal::mark_attached();
 
     let input_tx = tx.clone();
     std::thread::spawn(move || {
-        while let Ok(ev) = crossterm::event::read() {
-            if input_tx.send(UiEvent::Input(ev)).is_err() {
-                break;
+        // 读失败可能是挂起/恢复期间的 EINTR、EIO（后台读终端），不能就此退出：
+        // 否则恢复后键盘彻底失效。只有事件通道关闭才代表应用结束。
+        loop {
+            match crossterm::event::read() {
+                Ok(event) => {
+                    if input_tx.send(UiEvent::Input(event)).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    // 恢复接管由主循环负责，这里只需退避，避免后台读错误空转。
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    if input_tx.is_closed() {
+                        return;
+                    }
+                }
             }
         }
     });
@@ -516,7 +575,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let mut app = App::new(tx.clone(), model_name)
         .with_workspace(workspace)
         .with_config_path(config_path.clone())
-        .with_fullscreen(tui_settings.fullscreen.unwrap_or(true))
+        .with_fullscreen(fullscreen)
         .with_context_window(context_window)
         .with_reasoning_levels(reasoning_levels, reasoning_level)
         .with_persistent_session(Arc::clone(&session_store), session_record)
@@ -603,13 +662,33 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             apply_fullscreen_switch(&mut terminal, fullscreen)?;
             needs_redraw = true;
         }
+        // 挂起恢复：处理器交还过终端，这里按启动时的能力集合重新接管并整屏重绘。
+        if terminal::take_resume_request() {
+            app.mouse_capture = resume_terminal(
+                &mut terminal,
+                app.fullscreen,
+                keyboard_enhanced,
+                app.mouse_capture,
+            )?;
+            terminal::set_mouse_capture(app.mouse_capture);
+            needs_redraw = true;
+        }
+        // Ctrl+Z 在 raw mode 下不会触发终端自己的 SIGTSTP：先由处理器恢复终端，再真正停止。
+        if std::mem::take(&mut app.pending_suspend) {
+            terminal::suspend();
+            // 返回即代表已被继续，但终端此刻仍在 shell 手里：重新接管由下一轮的
+            // resume 分支完成。这里必须直接回到循环顶部，否则这一帧会画进用户
+            // shell 的主屏幕（交还期间写入的任何内容都会留在 scrollback 里）。
+            needs_redraw = true;
+            continue;
+        }
         // 打字机揭示：先按本帧预算把已收到但未显示的文本铺上屏，再决定是否重绘。
         // 这一步让"屏幕节奏"由帧时钟决定，而不是由网络到达节奏决定。
         let revealed = app.reveal_pending_stream();
         if revealed > 0 {
             needs_redraw = true;
         }
-        if needs_redraw {
+        if needs_redraw && !terminal::is_detached() {
             // 同步更新事务：终端在收到结束标记前不刷新画面，避免一帧内的多次写入被
             // 逐条呈现（高帧率下表现为闪烁/撕裂）。不支持该扩展的终端会忽略它。
             let frame_started = std::time::Instant::now();

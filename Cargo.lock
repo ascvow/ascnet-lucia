@@ -1733,6 +1733,7 @@ dependencies = [
  "clap",
  "crossterm",
  "futures-util",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
