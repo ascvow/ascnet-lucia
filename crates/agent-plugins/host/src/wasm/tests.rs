@@ -262,6 +262,31 @@ async fn component_deadline_retires_pending_store() -> Result<()> {
     Ok(())
 }
 
+/// 多线性内存 component 不能把单内存上限倍增为无界总量。
+#[test]
+fn store_rejects_excess_memory_count() -> Result<()> {
+    let engine = shared_wasm_engine()?;
+    let component = Component::new(
+        &engine,
+        r#"(component
+        (core module $m (memory 1) (memory 1) (memory 1) (memory 1) (memory 1))
+        (core instance $i (instantiate $m)))"#,
+    )
+    .into_anyhow()?;
+    let mut store = Store::new(
+        &engine,
+        StoreLimitsBuilder::new()
+            .memory_size(64 * 1024 * 1024)
+            .memories(4)
+            .build(),
+    );
+    store.limiter(|limits| limits);
+    store.set_fuel(1_000_000).into_anyhow()?;
+    let linker = Linker::new(&engine);
+    assert!(linker.instantiate(&mut store, &component).is_err());
+    Ok(())
+}
+
 /// 默认运行时限制必须同时约束计算量和线性内存。
 #[test]
 fn default_limits_bound_fuel_and_memory() {
