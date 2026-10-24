@@ -163,7 +163,7 @@ struct CompressionState {
     /// 路由与窗口由同一快照承载，防止热切换时读取到不同模型的参数。
     summary_model: Arc<NativeSummaryModel>,
     /// 最近一次自动压缩结果，用于增量追加后续消息，避免重复处理同一历史前缀。
-    cache: Option<CompressionCache>,
+    cache: Option<Arc<CompressionCache>>,
 }
 
 /// 最近一次自动压缩的追加边界与有效模型上下文。
@@ -377,7 +377,8 @@ impl NativeContextLoader {
             cache_hit,
         };
         if let Some(cache) = cache.filter(|_| cache_hit) {
-            let mut messages = cache.loaded_messages;
+            // 共享快照在锁内仅克隆 Arc，正文复制在锁外进行。
+            let mut messages = cache.loaded_messages.clone();
             messages.extend_from_slice(&request.messages[cache.source_message_count..]);
             Ok((
                 ContextLoadRequest {
@@ -393,16 +394,10 @@ impl NativeContextLoader {
 
     /// 提交本轮压缩结果；模型调用期间不持有缓存锁。
     fn commit_cache(&self, plan: CachePlan, outcome: &CompressionOutcome) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?;
-        // 切换会替换配置快照；旧加载即使稍后完成，也不能恢复已失效的缓存。
-        if !Arc::ptr_eq(&state.summary_model, plan.summary_model()) {
-            return Ok(());
-        }
-        match plan {
-            CachePlan::Manual { .. } => state.cache = None,
+        // 先在锁外构造新缓存；路由比对仍在提交锁内，旧请求不能覆盖新配置。
+        let summary_model = Arc::clone(plan.summary_model());
+        let next = match plan {
+            CachePlan::Manual { .. } => None,
             CachePlan::Automatic {
                 run_id,
                 provider,
@@ -412,22 +407,29 @@ impl NativeContextLoader {
                 source_messages_digest,
                 cache_hit,
                 ..
-            } if cache_hit || outcome.event.is_some() => {
-                let source_messages_digest = source_messages_digest
-                    .ok_or_else(|| anyhow!("原生上下文压缩缓存缺少原始消息摘要"))?;
-                state.cache = Some(CompressionCache {
-                    run_id,
-                    provider,
-                    model,
-                    system,
-                    source_message_count,
-                    source_messages_digest,
-                    micro_cleared: outcome.micro_cleared,
-                    loaded_messages: outcome.context.messages.clone(),
-                });
-            }
-            CachePlan::Automatic { .. } => state.cache = None,
+            } if cache_hit || outcome.event.is_some() => Some(Arc::new(CompressionCache {
+                run_id,
+                provider,
+                model,
+                system,
+                source_message_count,
+                source_messages_digest: source_messages_digest
+                    .ok_or_else(|| anyhow!("原生上下文压缩缓存缺少原始消息摘要"))?,
+                micro_cleared: outcome.micro_cleared,
+                loaded_messages: outcome.context.messages.clone(),
+            })),
+            CachePlan::Automatic { .. } => None,
+        };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?;
+        if !Arc::ptr_eq(&state.summary_model, &summary_model) {
+            return Ok(());
         }
+        let previous = std::mem::replace(&mut state.cache, next);
+        drop(state);
+        drop(previous);
         Ok(())
     }
 
@@ -513,6 +515,37 @@ impl ContextLoader for NativeContextLoader {
     ///
     /// 手动请求跳过自动水位并清空增量缓存；摘要失败或事件持久化失败时关闭本轮模型请求。
     async fn load(&self, request: CoreContextLoadRequest) -> Result<CoreLoadedContext> {
+        // 无缓存且未达水位时直接统计强类型消息，不构造 Value 树或无用前缀摘要。
+        // 有缓存/手动请求仍走完整校验路径，不能绕过历史改写检测。
+        let summary = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?;
+            (!request.user_initiated && state.cache.is_none())
+                .then(|| Arc::clone(&state.summary_model))
+        };
+        if let Some(summary) = summary {
+            let mut tokens = request.system.as_deref().map_or(0, estimate_text_tokens);
+            let threshold =
+                compaction_budget(summary.context_window, summary.max_summary_tokens as usize)
+                    .micro;
+            for message in &request.messages {
+                let mut counter = TokenCountingWriter::default();
+                serde_json::to_writer(&mut counter, message)
+                    .context("计算 Core 消息 token 失败")?;
+                tokens = tokens.saturating_add(counter.tokens());
+                if tokens >= threshold {
+                    break;
+                }
+            }
+            if tokens < threshold {
+                return Ok(CoreLoadedContext {
+                    system: request.system,
+                    messages: request.messages,
+                });
+            }
+        }
         let (original, encoded) = encode_core_request(request)?;
         let (effective, plan) = self.prepare_request(encoded)?;
         let summary_model = plan.summary_model();
@@ -1033,6 +1066,27 @@ fn micro_compact_tool_results(
         return (None, 0);
     }
 
+    // 已清理到目标时不构造无变化的整树副本；仍按同一顺序计算成功结果边界。
+    // remaining_to_clear 由后续遍历更新，预检仅决定是否值得克隆。
+    let changed = messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .filter_map(|block| block.get("result"))
+        .filter(|result| {
+            !result
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|result| result.get("content"))
+        .take(clear_target)
+        .any(|content| content.as_str() != Some(CLEARED_TOOL_RESULT));
+    if !changed {
+        return (None, 0);
+    }
+
     let mut cleared = 0;
     let compacted = messages
         .iter()
@@ -1102,18 +1156,29 @@ fn has_oversized_tool_result(messages: &[Value], max_chars: usize) -> bool {
 /// 保留首尾而不是只留开头：巨型日志和堆栈的中段几乎不携带增量信息，但开头决定
 /// "这是什么"，结尾决定"最终怎么了"，只留其一都会让结果失去判断价值。
 fn truncate_middle(text: &str, max_chars: usize) -> Option<String> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_chars {
+    let count = text.chars().count();
+    if count <= max_chars {
         return None;
     }
-    // 首段多留一些：工具结果的开头通常是路径、命令或错误类型。
-    let head = max_chars * 2 / 3;
+    let head = max_chars / 3 * 2 + max_chars % 3 * 2 / 3;
     let tail = max_chars - head;
-    let omitted = chars.len() - head - tail;
+    let head_byte = text
+        .char_indices()
+        .nth(head)
+        .map_or(text.len(), |(index, _)| index);
+    let tail_byte = if tail == 0 {
+        text.len()
+    } else {
+        text.char_indices()
+            .rev()
+            .nth(tail - 1)
+            .map_or(0, |(index, _)| index)
+    };
+    let omitted = count - max_chars;
     Some(format!(
         "{}\n… [{omitted} characters elided] …\n{}",
-        chars[..head].iter().collect::<String>(),
-        chars[chars.len() - tail..].iter().collect::<String>(),
+        &text[..head_byte],
+        &text[tail_byte..]
     ))
 }
 
@@ -1359,6 +1424,45 @@ fn remove_tagged_section(text: &str, open: &str, close: &str) -> String {
 mod tests {
     use super::*;
     use agent_core::model::{ChatModel, ModelEventStream, ModelResponse, ProviderAdapter};
+
+    /// 快速透传的强类型计数必须与先编码 Value 再计数一致。
+    #[test]
+    fn typed_count_matches_encoded_message_count() {
+        use agent_core::model::{ContentBlock, MessageRole, ModelMessage};
+        let mut message = ModelMessage::text(MessageRole::User, "中é🙂\\\"\n");
+        message.content.push(serde_json::from_value::<ContentBlock>(json!({"type":"tool_result","result":{"call_id":"c","name":"t","content":{"x":[1.25,true,null]},"is_error":false}})).unwrap());
+        let mut writer = TokenCountingWriter::default();
+        serde_json::to_writer(&mut writer, &message).unwrap();
+        assert_eq!(
+            writer.tokens(),
+            estimate_value_tokens(&serde_json::to_value(message).unwrap())
+        );
+    }
+
+    /// 无需变化的微压缩返回 None，Unicode 首尾截断保持字符边界和旧结果。
+    #[test]
+    fn compaction_avoids_unchanged_tree_and_char_vector() {
+        let mut message = tool_result_message(1, 5);
+        message["content"][0]["result"]["content"] = json!(CLEARED_TOOL_RESULT);
+        assert_eq!(micro_compact_tool_results(&[message], 1), (None, 0));
+        let text = "a中🙂é尾";
+        for max in 0..=6 {
+            let chars: Vec<_> = text.chars().collect();
+            let expected = if chars.len() <= max {
+                None
+            } else {
+                let head = max * 2 / 3;
+                let tail = max - head;
+                Some(format!(
+                    "{}\n… [{} characters elided] …\n{}",
+                    chars[..head].iter().collect::<String>(),
+                    chars.len() - max,
+                    chars[chars.len() - tail..].iter().collect::<String>()
+                ))
+            };
+            assert_eq!(truncate_middle(text, max), expected);
+        }
+    }
 
     /// 记录收到的模型请求并返回固定摘要的测试 provider。
     struct CapturingSummaryModel(Arc<Mutex<Vec<ModelRequest>>>);
