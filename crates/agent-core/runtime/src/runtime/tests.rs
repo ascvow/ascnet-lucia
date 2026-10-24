@@ -1496,3 +1496,42 @@ async fn queued_steering_buffer_rejects_the_thirty_third_message() {
     api.wait(&running.id).await.expect("等待运行 Agent");
     api.wait(&queued.id).await.expect("等待排队 Agent");
 }
+
+/// 门禁拒绝的终态必须带上真实原因，而不是只剩一层外层 context。
+///
+/// `error.to_string()` 只打印 anyhow 的最外层，会把"为什么被拒绝"（次数/字节数/
+/// 输出预算超限）整条丢掉，让派生 Agent 的失败无法自行诊断。这里把请求次数上限
+/// 设为 0 强制触发拒绝，断言终态里同时出现外层说明与真实原因。
+#[tokio::test]
+async fn gate_rejection_terminal_state_explains_the_reason() {
+    let limits = RuntimeLimits {
+        max_agent_model_requests_per_principal: 0,
+        ..RuntimeLimits::default()
+    };
+    let runtime = AgentRuntime::new(limits).expect("创建零请求额度的 Runtime");
+    let root = runtime
+        .attach_root(
+            template(Arc::new(FixedModel), "fixed", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let child = api
+        .spawn(AgentSpawnRequest::new("触发门禁拒绝"))
+        .await
+        .expect("派生 Agent");
+
+    let outcome = api.wait(&child.id).await.expect("等待子 Agent");
+    let AgentOutcome::Failed { error } = outcome else {
+        panic!("门禁拒绝必须以失败终态收敛，实际为 {outcome:?}");
+    };
+    assert!(
+        error.contains("可信门禁拒绝"),
+        "终态应保留外层说明，实际为：{error}"
+    );
+    assert!(
+        error.contains("模型请求累计次数超过上限 0"),
+        "终态必须说明真实原因，实际为：{error}"
+    );
+}

@@ -1223,7 +1223,9 @@ async fn run_agent_task(
         Err(error) => {
             return AgentTaskCompletion {
                 outcome: AgentOutcome::Failed {
-                    error: error.to_string(),
+                    // 用 `{error:#}` 保留整条 anyhow 上下文链。`to_string()` 只打印
+                    // 最外层 context，会把"为什么被拒绝"这类关键原因全部丢掉。
+                    error: format!("{error:#}"),
                 },
                 session: None,
             };
@@ -1258,7 +1260,7 @@ async fn run_agent_task(
             Err(error) => {
                 return AgentTaskCompletion {
                     outcome: AgentOutcome::Failed {
-                        error: error.to_string(),
+                        error: format!("{error:#}"),
                     },
                     session: None,
                 };
@@ -1381,8 +1383,8 @@ async fn run_agent_task(
                         (Some(cleanup_error), Some(observation_error)) => {
                             format!("{cleanup_error:#}；同时发生运行观察错误：{observation_error}")
                         }
-                        (Some(cleanup_error), None) => cleanup_error.to_string(),
-                        (None, Some(observation_error)) => observation_error.to_string(),
+                        (Some(cleanup_error), None) => format!("{cleanup_error:#}"),
+                        (None, Some(observation_error)) => format!("{observation_error:#}"),
                         (None, None) => unreachable!("无错误的取消分支已提前处理"),
                     },
                 },
@@ -1400,7 +1402,7 @@ async fn run_agent_task(
         },
         (RuntimeCoreCompletion::Finished(Ok(_)), Some(error)) => AgentTaskCompletion {
             outcome: AgentOutcome::Failed {
-                error: error.to_string(),
+                error: format!("{error:#}"),
             },
             session: None,
         },
@@ -1410,7 +1412,7 @@ async fn run_agent_task(
                     Some(observation_error) => {
                         format!("{error:#}；同时发生运行观察错误：{observation_error}")
                     }
-                    None => error.to_string(),
+                    None => format!("{error:#}"),
                 },
             },
             session: None,
