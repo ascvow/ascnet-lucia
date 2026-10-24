@@ -189,6 +189,7 @@ impl App {
         for path in prepared.grants {
             let _ = self.read_path_grants.grant_canonical(path);
         }
+        let mut rejected = false;
         for item in prepared.items {
             match item {
                 PreparedItem::File {
@@ -197,6 +198,7 @@ impl App {
                 } => {
                     let modality = attachment::attachment_modality(&attachment.media_type);
                     if let Err(error) = self.validate_attachment_modality(&modality) {
+                        rejected = true;
                         self.messages.push(Msg::new(MsgKind::Error, error));
                         continue;
                     }
@@ -231,16 +233,28 @@ impl App {
                         .map(|a| a.data.len() + a.pasted_text.as_ref().map_or(0, String::len))
                         .sum::<usize>();
                     if text.len() > MAX_BATCH_BYTES.saturating_sub(used) {
+                        rejected = true;
                         self.messages
                             .push(Msg::new(MsgKind::Error, "粘贴正文超过 32 MiB 预算"));
                     } else {
                         self.insert_plain_paste(&text);
                     }
                 }
-                PreparedItem::Error(error) => self.messages.push(Msg::new(MsgKind::Error, error)),
+                PreparedItem::Error(error) => {
+                    rejected = true;
+                    self.messages.push(Msg::new(MsgKind::Error, error));
+                }
             }
         }
         drop(completion_permit);
+        if rejected {
+            self.finish_input_edit();
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                "部分附件未准备成功，已保留草稿；确认后重新发送。",
+            ));
+            return;
+        }
         if let AttachmentIntent::Submit { agent, steering } = job.intent {
             self.mentioned_attachments_ready = true;
             match agent {
@@ -494,6 +508,26 @@ mod tests {
         app.apply_prepared_attachments(id, result);
         assert!(!app.fullscreen, "异步粘贴后立即 Enter 仍须先经过命令路由");
         assert_eq!(app.queued_inputs.len(), 2);
+        app.input = "do not send partial".into();
+        app.cursor = app.input.len();
+        app.schedule_attachments(AttachmentIntent::Files(vec![root.join("missing.txt")]));
+        app.queue_input_until_ready();
+        let (id, result) = receive(&mut rx).await;
+        app.apply_prepared_attachments(id, result);
+        assert_eq!(app.queued_inputs.len(), 2, "失败不能发送缺少附件的草稿");
+        assert_eq!(app.input, "do not send partial");
+        app.input = "/new".into();
+        app.cursor = app.input.len();
+        let session = app.session_record.id.clone();
+        app.handle_paste(" suffix");
+        assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, None));
+        assert_eq!(
+            app.session_record.id, session,
+            "粘贴未完成不得提前执行旧命令"
+        );
+        app.invalidate_attachment_job();
+        let (id, result) = receive(&mut rx).await;
+        app.apply_prepared_attachments(id, result);
         std::fs::remove_dir_all(root).unwrap();
     }
 

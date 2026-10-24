@@ -1387,7 +1387,15 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             }
             Some(UiEvent::AttachmentsPrepared { id, result }) => {
                 let before = app.input.clone();
+                #[cfg(feature = "plugins")]
+                let before_session = app.session_record.id.clone();
                 app.apply_prepared_attachments(id, result);
+                #[cfg(feature = "plugins")]
+                if app.session_record.id != before_session {
+                    if let Some(host) = plugin_host.as_ref() {
+                        app.schedule_plugin_views_refresh(Arc::clone(host));
+                    }
+                }
                 if before != app.input {
                     app.sync_native_command_input(&before);
                     #[cfg(feature = "plugins")]

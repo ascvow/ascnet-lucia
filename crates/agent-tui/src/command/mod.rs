@@ -557,6 +557,10 @@ impl App {
         {
             return false;
         }
+        if self.attachment_job.is_some() && code == KeyCode::Enter && modifiers.is_empty() {
+            self.defer_attachment_submission(agent.cloned(), false);
+            return true;
+        }
         if !self.input_without_labels().trim_start().starts_with('/') || !modifiers.is_empty() {
             return false;
         }
