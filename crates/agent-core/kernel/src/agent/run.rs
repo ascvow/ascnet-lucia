@@ -936,6 +936,7 @@ impl Agent {
                     steps_used: step + 1,
                     cancelled: false,
                     usage: total_usage.clone(),
+                    session_id: self.session_id(),
                 })
                 .await;
                 return Ok(AgentRun {
@@ -1137,6 +1138,7 @@ impl Agent {
             steps_used,
             cancelled: true,
             usage: total_usage.clone(),
+            session_id: self.session_id(),
         })
         .await;
         Ok(AgentRun {

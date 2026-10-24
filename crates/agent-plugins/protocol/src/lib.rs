@@ -671,6 +671,27 @@ mod tests {
         assert!(encoded.get("canceller").is_none());
     }
 
+    /// 旧宿主不会在运行结束负载里发送会话键，省略时必须按无会话处理。
+    #[test]
+    fn run_finish_payload_accepts_missing_session() {
+        let legacy = json!({"run_id": "run-1", "steps_used": 2, "cancelled": false});
+        let data: RunFinishEventData = serde_json::from_value(legacy).expect("旧负载应保持可解析");
+        assert_eq!(data.session_id, None);
+
+        let current = RunFinishEventData {
+            run_id: "run-1".into(),
+            steps_used: 2,
+            cancelled: false,
+            session_id: Some("session-a".into()),
+        };
+        let encoded = serde_json::to_value(&current).expect("序列化运行结束负载");
+        assert_eq!(encoded["session_id"], "session-a");
+        assert_eq!(
+            serde_json::from_value::<RunFinishEventData>(encoded).expect("还原运行结束负载"),
+            current
+        );
+    }
+
     /// 放行应答不携带补丁，避免宿主对空对象做无谓的白名单合并。
     #[test]
     fn allow_response_carries_no_patch() {
@@ -972,6 +993,12 @@ pub struct RunFinishEventData {
     pub steps_used: usize,
     /// 是否因取消请求提前收尾。
     pub cancelled: bool,
+    /// 运行绑定的会话路由键；旧宿主或未绑定会话的运行省略该字段。
+    ///
+    /// 插件回收会话级状态时需要它：只按 `run_id` 无法判断该运行属于哪个会话，
+    /// 并发会话会互相清理对方的计划或成员。缺省时插件应退回不区分会话的处理方式。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// `core.run.start` 的事件负载。

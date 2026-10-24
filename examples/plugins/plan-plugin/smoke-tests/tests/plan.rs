@@ -3,15 +3,17 @@
 //! 这里走真实的 Host → component 路由，重点验证会话隔离依赖的两条可信通道：
 //! 工具调用携带的 `ToolCall.session_id` 与渲染请求携带的 `UiRenderRequest.session_id`。
 
-use agent_core::AgentExtension;
+use agent_core::{
+    AgentEvent, AgentEventKind, AgentExtension, AgentRecordEvent, EventBus, RunFinishEvent,
+};
 use agent_plugin_host::{
     ui::{UiFrame, UiPlacement, UiRenderRequest},
     wasm::WasmPluginHost,
-    PluginHost,
+    LivePluginHost, PluginHost,
 };
 use agent_tool::ToolCall;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 const SHELF_VIEW: &str = "plan-shelf";
 const DETAIL_VIEW: &str = "plan-detail";
@@ -177,4 +179,120 @@ async fn component_isolates_plans_between_sessions() {
     assert!(!cleared.visible, "清空后不应显示计划架：{cleared_text}");
 
     host.deactivate().await.expect("插件应正常卸载");
+}
+
+/// 运行结束应通过真实事件总线收敛并回收计划，而不是把旧进度留在进度架上。
+#[tokio::test]
+async fn component_recycles_plan_on_run_finish() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
+    let host = Arc::new(
+        WasmPluginHost::load_from_manifest(manifest)
+            .await
+            .expect("Plan component 应加载成功"),
+    );
+    let live = LivePluginHost::new();
+    live.publish(host.clone() as Arc<dyn PluginHost>)
+        .expect("发布真实 Plan 宿主");
+    live.finish_capability_planning().expect("标记能力规划完成");
+    let bus = EventBus::new();
+    live.attach_bus(bus.clone()).expect("挂载事件总线");
+
+    // 打开运行快照后才能接收 core.run.finish，和 Core 的真实顺序一致。
+    bus.dispatch(AgentRecordEvent {
+        record: AgentEvent::new("run-a", AgentEventKind::RunStarted, 0, json!({})),
+    })
+    .await;
+    call_tool(
+        host.as_ref(),
+        Some("session-a"),
+        Some("run-a"),
+        "update_plan",
+        three_step_plan("运行 A 的第一步"),
+    )
+    .await;
+
+    // 本轮更新过计划：in_progress 收敛为 completed，剩余步骤保留给后续轮次。
+    let finished = bus
+        .dispatch(RunFinishEvent {
+            run_id: "run-a".into(),
+            steps_used: 2,
+            cancelled: false,
+            usage: Default::default(),
+            session_id: Some("session-a".into()),
+        })
+        .await;
+    assert!(finished.errors.is_empty(), "{:?}", finished.errors);
+    let converged = call_tool(
+        host.as_ref(),
+        Some("session-a"),
+        None,
+        "get_plan",
+        json!({}),
+    )
+    .await;
+    assert_eq!(converged["plan"][0]["status"], "completed");
+    assert_eq!(converged["plan"][1]["status"], "pending");
+    let (shelf, shelf_text) = render_text(host.as_ref(), Some("session-a"), SHELF_VIEW).await;
+    assert!(shelf.visible, "{shelf_text}");
+
+    // 下一轮没有更新计划：视为已废弃并回收，进度架不再显示遗留步骤。
+    bus.dispatch(AgentRecordEvent {
+        record: AgentEvent::new("run-b", AgentEventKind::RunStarted, 0, json!({})),
+    })
+    .await;
+    let finished = bus
+        .dispatch(RunFinishEvent {
+            run_id: "run-b".into(),
+            steps_used: 1,
+            cancelled: false,
+            usage: Default::default(),
+            session_id: Some("session-a".into()),
+        })
+        .await;
+    assert!(finished.errors.is_empty(), "{:?}", finished.errors);
+    let cleared = call_tool(
+        host.as_ref(),
+        Some("session-a"),
+        None,
+        "get_plan",
+        json!({}),
+    )
+    .await;
+    assert_eq!(cleared["plan"], json!([]), "未维护的计划应被回收");
+    let (shelf, shelf_text) = render_text(host.as_ref(), Some("session-a"), SHELF_VIEW).await;
+    assert!(!shelf.visible, "回收后进度架应隐藏：{shelf_text}");
+
+    // 取消的运行不参与收敛与回收：中断后计划仍保留，用户可继续原任务。
+    bus.dispatch(AgentRecordEvent {
+        record: AgentEvent::new("run-c", AgentEventKind::RunStarted, 0, json!({})),
+    })
+    .await;
+    call_tool(
+        host.as_ref(),
+        Some("session-b"),
+        Some("run-c"),
+        "update_plan",
+        three_step_plan("会话 B 的第一步"),
+    )
+    .await;
+    bus.dispatch(RunFinishEvent {
+        run_id: "run-c".into(),
+        steps_used: 1,
+        cancelled: true,
+        usage: Default::default(),
+        session_id: Some("session-b".into()),
+    })
+    .await;
+    let kept = call_tool(
+        host.as_ref(),
+        Some("session-b"),
+        None,
+        "get_plan",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        kept["plan"][0]["status"], "in_progress",
+        "取消的运行不能推进或回收计划"
+    );
 }

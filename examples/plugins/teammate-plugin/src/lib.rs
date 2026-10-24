@@ -4,11 +4,12 @@
 //! 身份、受限 Agent 派生及生命周期操作。
 
 use agent_plugin::{
-    export_plugin, ActivationContext, AgentHandle, AgentId, AgentOutcome, AgentPlugin,
-    AgentSpawnRequest, AgentStatus, AgentViewSession, ExtensionEvent, PluginHostApi, Result,
-    ServiceCall, ServiceSpec, ToolCall, ToolPermissionScope, ToolResult, ToolSpec, UiColor,
-    UiCursor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
-    UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
+    core_events, export_plugin, ActivationContext, AgentHandle, AgentId, AgentOutcome, AgentPlugin,
+    AgentSpawnRequest, AgentStatus, AgentViewSession, EventOutcome, ExtensionEvent, PluginEvent,
+    PluginHostApi, Result, RunFinishEventData, ServiceCall, ServiceSpec, ToolCall,
+    ToolPermissionScope, ToolResult, ToolSpec, UiColor, UiCursor, UiDeclaration, UiFrame, UiInput,
+    UiInputEvent, UiLine, UiNavigationAction, UiNavigationRequest, UiPlacement, UiRenderRequest,
+    UiSize, UiSpan, UiStyle, UiViewInstance,
 };
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,10 @@ const MAILBOX_CAPACITY: usize = 64;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 /// 单条消息转换为续跑输入的最大尝试次数。
 const MAX_DISPATCH_ATTEMPTS: u32 = 5;
+/// 回收台账最多保留的已结束成员结果数，保证终态结果仍可读取而不无限增长。
+const MAX_RETIRED_MEMBERS: usize = 8;
+/// 插件记住的最近结束运行数；用于判断成员所属 controller 运行是否已经结束。
+const MAX_FINISHED_RUNS: usize = 64;
 /// 主界面右侧的团队摘要入口。
 const TEAM_DOCK_VIEW: &str = "teammate-team-dock";
 /// 替换主界面的团队工作台子视图。
@@ -104,6 +109,11 @@ struct Member {
     captain: bool,
     current: AgentHandle,
     status: AgentStatus,
+    /// 最近一次通过工具调用管理该成员的 controller 运行 ID。
+    ///
+    /// 成员在运行结束后是否该解散，取决于管理它的那一轮是否已经结束；Service 调用
+    /// 没有运行身份，因此保持 `None` 并由调用方显式 remove。
+    last_controller_run: Option<String>,
 }
 
 impl Member {
@@ -120,11 +130,23 @@ impl Member {
     }
 }
 
+/// 已回收成员的终态结果，供 controller 在本轮结束后仍能读取队友产出。
+#[derive(Debug, Clone)]
+struct RetiredMember {
+    owner: String,
+    snapshot: MemberSnapshot,
+    outcome: Option<AgentOutcome>,
+}
+
 /// 单个 WASM 实例内的成员目录和短期邮箱。
 #[derive(Default)]
 struct TeamState {
     members: BTreeMap<AgentId, Member>,
     mailboxes: BTreeMap<AgentId, VecDeque<TeammateMessage>>,
+    /// 按回收顺序保存的终态结果；超出上限时淘汰最早的条目。
+    retired: Vec<RetiredMember>,
+    /// 最近结束的运行 ID，按到达顺序排列。
+    finished_runs: VecDeque<String>,
     next_message_id: u64,
 }
 
@@ -136,6 +158,7 @@ impl TeamState {
         role: String,
         captain: bool,
         handle: AgentHandle,
+        controller_run: Option<String>,
     ) -> Result<MemberSnapshot> {
         if self
             .members
@@ -163,6 +186,7 @@ impl TeamState {
             captain,
             current: handle,
             status: AgentStatus::Queued,
+            last_controller_run: controller_run,
         };
         let snapshot = member.snapshot(&address, 0);
         self.members.insert(address.clone(), member);
@@ -191,12 +215,112 @@ impl TeamState {
         Ok(snapshot)
     }
 
+    /// 判断 owner 名下是否存在该活跃成员。
+    fn contains_member(&self, owner: &str, address: &AgentId) -> bool {
+        self.members
+            .get(address)
+            .is_some_and(|member| member.owner == owner)
+    }
+
+    /// 记录一次已结束的运行；只保留最近若干条，避免长期运行无限增长。
+    fn remember_finished_run(&mut self, run_id: &str) {
+        if self.finished_runs.iter().any(|finished| finished == run_id) {
+            return;
+        }
+        while self.finished_runs.len() >= MAX_FINISHED_RUNS {
+            self.finished_runs.pop_front();
+        }
+        self.finished_runs.push_back(run_id.to_string());
+    }
+
+    /// 判断指定运行是否已经成功结束。
+    fn run_finished(&self, run_id: &str) -> bool {
+        self.finished_runs.iter().any(|finished| finished == run_id)
+    }
+
+    /// 把成员最近一次被管理的 controller 运行更新为 `run_id`。
+    fn note_controller_run(&mut self, owner: &str, address: &AgentId, run_id: Option<&str>) {
+        let Some(run_id) = run_id else {
+            return;
+        };
+        if let Ok(member) = self.member_mut(owner, address) {
+            member.last_controller_run = Some(run_id.to_string());
+        }
+    }
+
+    /// 返回当前可以回收的成员地址。
+    ///
+    /// 只回收同时满足以下条件的成员：状态已进入终态、所属 controller 运行已经结束、
+    /// 邮箱没有未确认消息。未读消息是 controller 尚未消费的数据，不能随回收一起丢弃。
+    fn retirement_candidates(&self, owner: &str) -> Vec<AgentId> {
+        self.members
+            .iter()
+            .filter(|(_, member)| member.owner == owner)
+            .filter(|(address, member)| {
+                member.status.is_terminal()
+                    && member
+                        .last_controller_run
+                        .as_deref()
+                        .is_some_and(|run_id| self.run_finished(run_id))
+                    && self.mailboxes.get(*address).map_or(0, VecDeque::len) == 0
+            })
+            .map(|(address, _)| address.clone())
+            .collect()
+    }
+
+    /// 把成员移出活跃目录并登记终态结果，返回回收后的快照。
+    fn retire(
+        &mut self,
+        owner: &str,
+        address: &AgentId,
+        outcome: Option<AgentOutcome>,
+    ) -> Result<MemberSnapshot> {
+        let unread = self.mailboxes.get(address).map_or(0, VecDeque::len);
+        let snapshot = self.member(owner, address)?.snapshot(address, unread);
+        self.members.remove(address);
+        self.mailboxes.remove(address);
+        while self.retired.len() >= MAX_RETIRED_MEMBERS {
+            self.retired.remove(0);
+        }
+        self.retired.push(RetiredMember {
+            owner: owner.to_string(),
+            snapshot: snapshot.clone(),
+            outcome,
+        });
+        Ok(snapshot)
+    }
+
+    /// 查找回收台账中的终态结果。
+    fn retired_member(&self, owner: &str, address: &AgentId) -> Option<&RetiredMember> {
+        self.retired
+            .iter()
+            .find(|retired| retired.owner == owner && &retired.snapshot.id == address)
+    }
+
+    /// 删除一条回收记录的 owner 视图，返回其快照。
+    fn remove_retired(&mut self, owner: &str, address: &AgentId) -> Option<MemberSnapshot> {
+        let index = self
+            .retired
+            .iter()
+            .position(|retired| retired.owner == owner && &retired.snapshot.id == address)?;
+        Some(self.retired.remove(index).snapshot)
+    }
+
+    /// 返回 owner 名下已回收成员的快照，顺序按回收顺序排列。
+    fn list_retired(&self, owner: &str) -> Vec<MemberSnapshot> {
+        self.retired
+            .iter()
+            .filter(|retired| retired.owner == owner)
+            .map(|retired| retired.snapshot.clone())
+            .collect()
+    }
+
     /// 查找并校验 owner 对成员的访问权。
     fn member(&self, owner: &str, address: &AgentId) -> Result<&Member> {
         let member = self
             .members
             .get(address)
-            .ok_or_else(|| anyhow!("Teammate 成员不存在：{}", address.as_str()))?;
+            .ok_or_else(|| self.missing_member_error(owner, address))?;
         if member.owner != owner {
             return Err(anyhow!(
                 "owner `{owner}` 无权访问成员 `{}`",
@@ -208,17 +332,38 @@ impl TeamState {
 
     /// 可变查找并校验 owner 对成员的访问权。
     fn member_mut(&mut self, owner: &str, address: &AgentId) -> Result<&mut Member> {
-        let member = self
-            .members
-            .get_mut(address)
-            .ok_or_else(|| anyhow!("Teammate 成员不存在：{}", address.as_str()))?;
-        if member.owner != owner {
-            return Err(anyhow!(
+        let retired = self.retired_member(owner, address).is_some();
+        match self.members.get_mut(address) {
+            Some(member) if member.owner == owner => Ok(member),
+            Some(_) => Err(anyhow!(
                 "owner `{owner}` 无权访问成员 `{}`",
                 address.as_str()
-            ));
+            )),
+            None => Err(Self::member_error(owner, address, retired)),
         }
-        Ok(member)
+    }
+
+    /// 生成统一的缺失成员错误；已回收成员给出可继续读取结果的提示。
+    fn missing_member_error(&self, owner: &str, address: &AgentId) -> anyhow::Error {
+        Self::member_error(
+            owner,
+            address,
+            self.retired_member(owner, address).is_some(),
+        )
+    }
+
+    /// 按是否已回收构造成员缺失错误。
+    fn member_error(owner: &str, address: &AgentId, retired: bool) -> anyhow::Error {
+        if retired {
+            return anyhow!(
+                "成员 `{}` 已回收：运行结果仍可用 teammate_result 读取，需要继续协作请重新 spawn",
+                address.as_str()
+            );
+        }
+        anyhow!(
+            "Teammate 成员不存在：{}（owner `{owner}`）",
+            address.as_str()
+        )
     }
 
     /// 向 owner 名下成员的有界邮箱追加消息。
@@ -447,11 +592,14 @@ impl TeammatePlugin {
     }
 
     /// 创建成员并登记首次派生句柄。
+    ///
+    /// `controller_run` 是发起派生的 controller 运行：它结束时应解散已经完成的成员。
     fn spawn(
         &mut self,
         host: &dyn PluginHostApi,
         owner: &str,
         request: SpawnRequest,
+        controller_run: Option<&str>,
     ) -> Result<Value> {
         let role = validated_text(request.role, "role", 128)?;
         let input = validated_text(request.input, "input", 32 * 1024)?;
@@ -473,9 +621,13 @@ impl TeammatePlugin {
             worker_agent_input(identity, &role, &input, self.workspace_root.as_deref());
         let handle =
             host.spawn_agent(&AgentSpawnRequest::new(WORKER_PROFILE, agent_input.clone()))?;
-        let member = self
-            .state
-            .add_member(owner, role, request.captain, handle)?;
+        let member = self.state.add_member(
+            owner,
+            role,
+            request.captain,
+            handle,
+            controller_run.map(str::to_string),
+        )?;
         let mut session = AgentViewSession::new(member.current_agent_id.clone());
         session.record_user_message(agent_input);
         self.member_sessions.insert(member.id.clone(), session);
@@ -487,9 +639,12 @@ impl TeammatePlugin {
         Ok(json!({"member": member, "completed": false}))
     }
 
-    /// 返回 owner 的成员目录。
+    /// 返回 owner 的成员目录；活跃成员与已回收成员分开列出。
     fn list(&self, owner: &str) -> Value {
-        json!({"members": self.state.list_members(owner)})
+        json!({
+            "members": self.state.list_members(owner),
+            "retired_members": self.state.list_retired(owner),
+        })
     }
 
     /// 查询成员当前 Agent 句柄的 Runtime 状态。
@@ -498,7 +653,10 @@ impl TeammatePlugin {
         host: &dyn PluginHostApi,
         owner: &str,
         request: MemberRequest,
+        controller_run: Option<&str>,
     ) -> Result<Value> {
+        self.state
+            .note_controller_run(owner, &request.member_id, controller_run);
         let target = self
             .state
             .member(owner, &request.member_id)?
@@ -511,12 +669,24 @@ impl TeammatePlugin {
     }
 
     /// 查询成员当前 Agent 句柄的幂等终态结果。
+    ///
+    /// 成员在 controller 运行结束时已回收时，结果从有界台账返回，仍然幂等可读。
     fn result(
         &mut self,
         host: &dyn PluginHostApi,
         owner: &str,
         request: MemberRequest,
+        controller_run: Option<&str>,
     ) -> Result<Value> {
+        if let Some(retired) = self.state.retired_member(owner, &request.member_id) {
+            return Ok(json!({
+                "completed": true,
+                "retired": true,
+                "outcome": retired.outcome.clone(),
+            }));
+        }
+        self.state
+            .note_controller_run(owner, &request.member_id, controller_run);
         let target = self
             .state
             .member(owner, &request.member_id)?
@@ -531,7 +701,11 @@ impl TeammatePlugin {
                 AgentOutcome::Cancelled => AgentStatus::Cancelled,
             };
         }
-        Ok(json!({"completed": outcome.is_some(), "outcome": outcome}))
+        Ok(json!({
+            "completed": outcome.is_some(),
+            "retired": false,
+            "outcome": outcome,
+        }))
     }
 
     /// 级联取消成员当前 Agent 句柄。
@@ -540,7 +714,10 @@ impl TeammatePlugin {
         host: &dyn PluginHostApi,
         owner: &str,
         request: MemberRequest,
+        controller_run: Option<&str>,
     ) -> Result<Value> {
+        self.state
+            .note_controller_run(owner, &request.member_id, controller_run);
         let target = self
             .state
             .member(owner, &request.member_id)?
@@ -555,12 +732,24 @@ impl TeammatePlugin {
     }
 
     /// 先取消成员当前执行，再删除成员目录项和全部未确认消息。
+    ///
+    /// 对已经自动回收的成员保持幂等：只清理台账记录，不重复操作 Runtime。
     fn remove(
         &mut self,
         host: &dyn PluginHostApi,
         owner: &str,
         request: MemberRequest,
     ) -> Result<Value> {
+        if !self.state.contains_member(owner, &request.member_id) {
+            if let Some(member) = self.state.remove_retired(owner, &request.member_id) {
+                return Ok(json!({
+                    "removed": true,
+                    "cancelled": false,
+                    "retired": true,
+                    "member": member,
+                }));
+            }
+        }
         let target = self
             .state
             .member(owner, &request.member_id)?
@@ -576,7 +765,52 @@ impl TeammatePlugin {
             "teammate.member.removed",
             json!({"owner": owner, "member": member, "cancelled": cancelled}),
         );
-        Ok(json!({"removed": true, "cancelled": cancelled, "member": member}))
+        Ok(json!({
+            "removed": true,
+            "cancelled": cancelled,
+            "retired": false,
+            "member": member,
+        }))
+    }
+
+    /// 回收终态成员并登记结果，返回本轮回收的成员快照。
+    ///
+    /// 只处理状态已终态、所属 controller 运行已经结束、且没有未读消息的成员：运行中的
+    /// 成员需要继续工作，未读消息是 controller 尚未消费的数据，都不能随回收丢弃。
+    /// Runtime 状态是权威值，先用它刷新缓存再判断，避免缓存停留在 `Running` 而漏收。
+    fn retire_finished_members(&mut self, host: &dyn PluginHostApi) -> Vec<MemberSnapshot> {
+        let owner = self.plugin_id.clone().unwrap_or_default();
+        for member in self.state.list_members(&owner) {
+            if let Ok(snapshot) = host.agent_status(&member.current_agent_id) {
+                if let Ok(stored) = self.state.member_mut(&owner, &member.id) {
+                    stored.status = snapshot.status;
+                }
+            }
+        }
+        let mut retired = Vec::new();
+        for address in self.state.retirement_candidates(&owner) {
+            let Some(target) = self
+                .state
+                .members
+                .get(&address)
+                .map(|member| member.current.id.clone())
+            else {
+                continue;
+            };
+            let outcome = host.agent_result(&target).ok().flatten();
+            if let Ok(snapshot) = self.state.retire(&owner, &address, outcome) {
+                self.member_sessions.remove(&address);
+                retired.push(snapshot);
+            }
+        }
+        for member in &retired {
+            emit(
+                host,
+                "teammate.member.retired",
+                json!({"owner": owner, "member": member}),
+            );
+        }
+        retired
     }
 
     /// 以 Host 已确认的发送者向 owner 的成员邮箱投递消息。
@@ -674,6 +908,7 @@ impl TeammatePlugin {
         host: &dyn PluginHostApi,
         owner: &str,
         sender: MessageSender,
+        controller_run: Option<&str>,
         request: ServiceRequest,
     ) -> Result<Value> {
         match request {
@@ -689,16 +924,17 @@ impl TeammatePlugin {
                     input,
                     captain,
                 },
+                controller_run,
             ),
             ServiceRequest::List => Ok(self.list(owner)),
             ServiceRequest::Status { member_id } => {
-                self.status(host, owner, MemberRequest { member_id })
+                self.status(host, owner, MemberRequest { member_id }, controller_run)
             }
             ServiceRequest::Result { member_id } => {
-                self.result(host, owner, MemberRequest { member_id })
+                self.result(host, owner, MemberRequest { member_id }, controller_run)
             }
             ServiceRequest::Cancel { member_id } => {
-                self.cancel(host, owner, MemberRequest { member_id })
+                self.cancel(host, owner, MemberRequest { member_id }, controller_run)
             }
             ServiceRequest::Remove { member_id } => {
                 self.remove(host, owner, MemberRequest { member_id })
@@ -987,9 +1223,23 @@ impl TeammatePlugin {
             .into_iter()
             .find(|member| member.id.as_str() == instance_id)
         else {
+            // 回收后成员会话视图可能仍停留在导航栈里：说明原因，而不是报“找不到”。
+            let released = self
+                .state
+                .list_retired(owner)
+                .iter()
+                .any(|member| member.id.as_str() == instance_id);
             return vec![ui_line(vec![ui_span(
-                "Member not found",
-                Some(UiColor::Red),
+                if released {
+                    "Member completed and was released"
+                } else {
+                    "Member not found"
+                },
+                Some(if released {
+                    UiColor::Gray
+                } else {
+                    UiColor::Red
+                }),
                 false,
             )])];
         };
@@ -1151,6 +1401,23 @@ impl AgentPlugin for TeammatePlugin {
         Ok(())
     }
 
+    /// 每轮 Agent 运行结束时回收已经完成且不再被管理的成员。
+    ///
+    /// 运行结束是"本轮工作已交付"的可靠信号：成员结果已写入 Runtime，controller 不会
+    /// 在同一轮里再对它 dispatch 后续任务。仍处于排队或运行中的成员继续保留，避免中断
+    /// 正在执行的工作；成员自身的运行晚于 controller 结束时，会在下一次运行时补收。
+    fn on_event(&mut self, host: &dyn PluginHostApi, event: &mut PluginEvent) -> EventOutcome {
+        if event.name() != core_events::RUN_FINISH {
+            return EventOutcome::ready();
+        }
+        let Ok(data) = event.parse::<RunFinishEventData>() else {
+            return EventOutcome::ready();
+        };
+        self.state.remember_finished_run(&data.run_id);
+        self.retire_finished_members(host);
+        EventOutcome::ready()
+    }
+
     /// 返回模型可调用的 teammate 控制面工具。
     fn list_tools(&self) -> Vec<ToolSpec> {
         teammate_tools()
@@ -1164,12 +1431,21 @@ impl AgentPlugin for TeammatePlugin {
     ) -> Result<ToolResult> {
         let owner = self.owner()?.to_string();
         let operation = call.name.clone();
+        let controller_run = call.run_id.as_deref();
         let content = match operation.as_str() {
-            "teammate_spawn" => self.spawn(host, &owner, decode(call.args.clone())?)?,
+            "teammate_spawn" => {
+                self.spawn(host, &owner, decode(call.args.clone())?, controller_run)?
+            }
             "teammate_list" => self.list(&owner),
-            "teammate_status" => self.status(host, &owner, decode(call.args.clone())?)?,
-            "teammate_result" => self.result(host, &owner, decode(call.args.clone())?)?,
-            "teammate_cancel" => self.cancel(host, &owner, decode(call.args.clone())?)?,
+            "teammate_status" => {
+                self.status(host, &owner, decode(call.args.clone())?, controller_run)?
+            }
+            "teammate_result" => {
+                self.result(host, &owner, decode(call.args.clone())?, controller_run)?
+            }
+            "teammate_cancel" => {
+                self.cancel(host, &owner, decode(call.args.clone())?, controller_run)?
+            }
             "teammate_remove" => self.remove(host, &owner, decode(call.args.clone())?)?,
             "teammate_send" => {
                 let sender = MessageSender::Controller {
@@ -1204,6 +1480,8 @@ impl AgentPlugin for TeammatePlugin {
             MessageSender::Plugin {
                 plugin_id: owner.clone(),
             },
+            // Service 调用没有 controller 运行身份，成员保留到调用方显式 remove。
+            None,
             request,
         )
     }
@@ -1564,7 +1842,7 @@ fn teammate_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
             "teammate_spawn",
-            "用于复杂项目中两个或更多相互独立、互不阻塞且适合并行推进的子任务，或确实需要与主任务解耦的独立审查。只有并行收益明显高于协调成本时，才用受限 worker profile 创建带角色的 teammate，并提供完整可执行的任务输入。普通单点需求、单一路径代码审查、强顺序依赖任务，以及当前 Agent 可连续完成的工作通常不需要 teammate。可将独立成员指定为唯一队长；调用立即返回成员地址，完成后用 teammate_result 取回结果。",
+            "用于复杂项目中两个或更多相互独立、互不阻塞且适合并行推进的子任务，或确实需要与主任务解耦的独立审查。只有并行收益明显高于协调成本时，才用受限 worker profile 创建带角色的 teammate，并提供完整可执行的任务输入。普通单点需求、单一路径代码审查、强顺序依赖任务，以及当前 Agent 可连续完成的工作通常不需要 teammate。可将独立成员指定为唯一队长；调用立即返回成员地址。成员完成后先在本轮内用 teammate_result 取回结果；本轮结束时仍处于完成态的成员会被自动回收（结果保留在回收台账里仍可读取），运行中的成员继续保留。",
             json!({
                 "type": "object",
                 "properties": {
@@ -1582,7 +1860,7 @@ fn teammate_tools() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "teammate_list",
-            "列出当前 controller 拥有的 teammate 成员及当前执行句柄。",
+            "列出当前 controller 的活跃成员、已回收成员及其当前执行句柄。",
             json!({"type": "object", "properties": {}, "additionalProperties": false}),
         ),
         ToolSpec::new(
@@ -1592,7 +1870,7 @@ fn teammate_tools() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "teammate_result",
-            "读取成员当前执行句柄的幂等终态结果。",
+            "读取成员当前执行句柄的幂等终态结果；成员被自动回收后仍可从回收台账读取。",
             member_schema(),
         ),
         ToolSpec::new(
@@ -1602,7 +1880,7 @@ fn teammate_tools() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "teammate_remove",
-            "取消并删除成员及其全部未确认消息，释放成员配额。",
+            "立即取消并删除成员及其全部未确认消息，释放成员配额；已回收成员只清理台账记录。正常情况下不需要手动调用，完成态成员会在本轮运行时结束时自动回收。",
             member_schema(),
         ),
         ToolSpec::new(
@@ -1691,6 +1969,14 @@ mod tests {
         assert!(description.contains("并行收益明显高于协调成本"));
         assert!(description.contains("普通单点需求"));
         assert!(description.contains("当前 Agent 可连续完成"));
+        assert!(
+            description.contains("自动回收"),
+            "工具描述必须说明完成即解散"
+        );
+        assert!(
+            description.contains("回收台账"),
+            "工具描述必须说明结果仍可读取"
+        );
     }
 
     /// 派生成员输入必须把当前工作区绝对路径转换为相对路径，并保留外部路径原文。
@@ -1729,7 +2015,13 @@ mod tests {
     fn mailbox_preserves_sender_and_requires_ack() {
         let mut state = TeamState::default();
         let member = state
-            .add_member("owner-a", "reviewer".into(), false, handle("member-a"))
+            .add_member(
+                "owner-a",
+                "reviewer".into(),
+                false,
+                handle("member-a"),
+                None,
+            )
             .expect("成员应登记成功");
         let message = state
             .send(
@@ -1765,7 +2057,7 @@ mod tests {
     fn owner_isolation_rejects_cross_namespace_access() {
         let mut state = TeamState::default();
         let member = state
-            .add_member("owner-a", "worker".into(), false, handle("member-a"))
+            .add_member("owner-a", "worker".into(), false, handle("member-a"), None)
             .expect("成员应登记成功");
 
         let error = state
@@ -1780,7 +2072,7 @@ mod tests {
     fn dispatch_attempts_are_bounded() {
         let mut state = TeamState::default();
         let member = state
-            .add_member("owner", "worker".into(), false, handle("member"))
+            .add_member("owner", "worker".into(), false, handle("member"), None)
             .expect("成员应登记成功");
         let message = state
             .send(
@@ -1810,16 +2102,158 @@ mod tests {
     fn captain_is_unique_teammate_member() {
         let mut state = TeamState::default();
         let captain = state
-            .add_member("owner", "lead".into(), true, handle("captain"))
+            .add_member("owner", "lead".into(), true, handle("captain"), None)
             .expect("首个队长应登记成功");
         assert!(captain.captain);
         let error = state
-            .add_member("owner", "backup".into(), true, handle("backup"))
+            .add_member("owner", "backup".into(), true, handle("backup"), None)
             .expect_err("同一 owner 不应登记第二个队长");
         assert!(error.to_string().contains("已存在队长 Agent"));
         state
-            .add_member("other", "lead".into(), true, handle("other-captain"))
+            .add_member("other", "lead".into(), true, handle("other-captain"), None)
             .expect("不同 owner 可拥有各自队长");
+    }
+
+    /// 只有终态、所属 controller 运行已结束且没有未读消息的成员才可被回收。
+    #[test]
+    fn retirement_requires_terminal_finished_and_acked() {
+        let mut state = TeamState::default();
+        let done = state
+            .add_member(
+                "owner",
+                "reviewer".into(),
+                false,
+                handle("done"),
+                Some("run-a".into()),
+            )
+            .expect("成员应登记成功");
+        let fresh = state
+            .add_member(
+                "owner",
+                "reviewer-2".into(),
+                false,
+                handle("fresh"),
+                Some("run-b".into()),
+            )
+            .expect("成员应登记成功");
+        let service = state
+            .add_member("owner", "service".into(), false, handle("service"), None)
+            .expect("service 成员应登记成功");
+        for address in [&done.id, &fresh.id, &service.id] {
+            state.member_mut("owner", address).expect("成员存在").status = AgentStatus::Succeeded;
+        }
+
+        // controller 运行尚未结束：不能回收任何成员。
+        assert!(state.retirement_candidates("owner").is_empty());
+        state.remember_finished_run("run-a");
+        assert_eq!(
+            state.retirement_candidates("owner"),
+            vec![done.id.clone()],
+            "只回收运行已结束的终态成员"
+        );
+
+        // 未读消息是尚未消费的数据，必须阻止回收。
+        state
+            .send(
+                "owner",
+                MessageSender::Controller {
+                    agent_id: AgentId::parse("controller").expect("测试 ID 应合法"),
+                },
+                SendRequest {
+                    recipient: done.id.clone(),
+                    topic: "review.requested".into(),
+                    payload: Value::Null,
+                },
+            )
+            .expect("消息应发送成功");
+        assert!(state.retirement_candidates("owner").is_empty());
+        let message = state
+            .inbox("owner", &done.id, 20)
+            .expect("邮箱应可读")
+            .remove(0);
+        state
+            .ack("owner", &done.id, message.id)
+            .expect("消息应确认成功");
+        assert_eq!(state.retirement_candidates("owner"), vec![done.id.clone()]);
+    }
+
+    /// 回收后台账保留终态结果，缺失成员错误应指向残留结果。
+    #[test]
+    fn retired_member_keeps_outcome_and_reports_recycle() {
+        let mut state = TeamState::default();
+        let member = state
+            .add_member(
+                "owner",
+                "worker".into(),
+                false,
+                handle("retired"),
+                Some("run".into()),
+            )
+            .expect("成员应登记成功");
+        state
+            .member_mut("owner", &member.id)
+            .expect("成员存在")
+            .status = AgentStatus::Failed;
+        let outcome = Some(AgentOutcome::Failed {
+            error: "boom".into(),
+        });
+
+        state
+            .retire("owner", &member.id, outcome.clone())
+            .expect("终态成员应可回收");
+
+        assert!(state.list_members("owner").is_empty());
+        assert_eq!(state.list_retired("owner").len(), 1);
+        assert_eq!(
+            state
+                .retired_member("owner", &member.id)
+                .expect("台账应保留结果")
+                .outcome,
+            outcome
+        );
+        let error = state
+            .member("owner", &member.id)
+            .expect_err("活跃目录不应再有该成员");
+        assert!(error.to_string().contains("已回收"), "{error}");
+        assert_eq!(
+            state
+                .remove_retired("owner", &member.id)
+                .expect("台账记录应可删除")
+                .id,
+            member.id
+        );
+        assert!(state.remove_retired("owner", &member.id).is_none());
+    }
+
+    /// 回收台账必须有界，超出上限时淘汰最早的终态结果。
+    #[test]
+    fn retired_ledger_is_bounded() {
+        let mut state = TeamState::default();
+        for index in 0..MAX_RETIRED_MEMBERS + 2 {
+            let id = format!("member-{index}");
+            let address = AgentId::parse(&id).expect("测试 ID 应合法");
+            state
+                .add_member("owner", "worker".into(), false, handle(&id), None)
+                .expect("成员应登记成功");
+            state
+                .member_mut("owner", &address)
+                .expect("成员存在")
+                .status = AgentStatus::Succeeded;
+            state
+                .retire("owner", &address, None)
+                .expect("终态成员应可回收");
+        }
+
+        assert_eq!(state.retired.len(), MAX_RETIRED_MEMBERS);
+        assert!(state
+            .retired_member("owner", &AgentId::parse("member-0").expect("测试 ID"))
+            .is_none());
+        assert!(state
+            .retired_member(
+                "owner",
+                &AgentId::parse(format!("member-{}", MAX_RETIRED_MEMBERS + 1)).expect("测试 ID")
+            )
+            .is_some());
     }
 
     /// 插件必须声明可聚焦团队入口和全屏工作台，并在摘要中渲染成员状态。
@@ -1831,11 +2265,17 @@ mod tests {
         };
         plugin
             .state
-            .add_member("teammate", "lead".into(), true, handle("captain-ui"))
+            .add_member("teammate", "lead".into(), true, handle("captain-ui"), None)
             .expect("UI 测试队长应登记成功");
         plugin
             .state
-            .add_member("teammate", "reviewer".into(), false, handle("member-ui"))
+            .add_member(
+                "teammate",
+                "reviewer".into(),
+                false,
+                handle("member-ui"),
+                None,
+            )
             .expect("UI 测试成员应登记成功");
 
         let declarations = plugin.describe_ui();
@@ -1974,5 +2414,53 @@ mod tests {
             .expect("团队摘要应返回帧");
 
         assert!(!frame.visible);
+    }
+
+    /// 已回收成员的会话视图应说明已完成并释放，而不是报“找不到”。
+    #[test]
+    fn retired_member_session_explains_release() {
+        let mut plugin = TeammatePlugin {
+            plugin_id: Some("teammate".into()),
+            ..TeammatePlugin::default()
+        };
+        let member = plugin
+            .state
+            .add_member(
+                "teammate",
+                "worker".into(),
+                false,
+                handle("released-ui"),
+                None,
+            )
+            .expect("成员应登记成功");
+        plugin
+            .state
+            .member_mut("teammate", &member.id)
+            .expect("成员存在")
+            .status = AgentStatus::Succeeded;
+        plugin
+            .state
+            .retire("teammate", &member.id, None)
+            .expect("完成成员应可回收");
+
+        let frame = plugin
+            .render_ui(UiRenderRequest {
+                session_id: None,
+                plugin_id: "teammate".into(),
+                view_id: TEAM_SESSION_VIEW.into(),
+                instance_id: Some(member.id.as_str().into()),
+                width: 60,
+                height: 10,
+                focused: true,
+                frame: 1,
+            })
+            .expect("回收后的成员会话应返回帧");
+        let text = frame
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("completed and was released"), "{text}");
     }
 }

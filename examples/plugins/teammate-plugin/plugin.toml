@@ -1,10 +1,10 @@
 [plugin]
 id = "teammate"
 name = "Teammate 协作插件"
-version = "0.1.0"
+version = "0.2.0"
 api_version = "0.10.0"
 wasm = "target/wasm32-wasip2/release/teammate_plugin.wasm"
-description = "使用 Agent Runtime 句柄管理成员，并提供有界、可确认的短期邮箱。"
+description = "使用 Agent Runtime 句柄管理成员，并提供有界、可确认的短期邮箱与终态成员回收。"
 
 [capabilities.agent]
 spawn = true
@@ -23,3 +23,8 @@ teammate_send = "control"
 teammate_inbox = "control"
 teammate_ack = "control"
 teammate_dispatch = "unknown"
+
+# 只观察运行结束：把已完成且不再被管理的成员移入回收台账，仍运行中的成员保持原样。
+# 该订阅不参与任何工具准入或运行取消决策。
+[[events]]
+name = "core.run.finish"

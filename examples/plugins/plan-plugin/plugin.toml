@@ -1,10 +1,10 @@
 [plugin]
 id = "plan"
 name = "Plan Plugin"
-version = "0.3.0"
+version = "0.4.0"
 api_version = "0.10.0"
 wasm = "target/wasm32-wasip2/release/plan_plugin.wasm"
-description = "为困难或大型任务提供按会话隔离的计划准入、更新、查询、紧凑进度架和完整计划视图。"
+description = "为困难或大型任务提供按会话隔离、运行结束自动回收的计划准入、更新、查询与进度视图。"
 
 [capabilities]
 # 计划插件只使用实例内状态和声明式 UI，不申请文件、网络、进程或密钥能力。

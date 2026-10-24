@@ -12,13 +12,14 @@
 - 消息不设置时间过期；确认、取消成员或插件卸载前一直保留。当前版本只使用实例内存，不提供跨重启持久化。
 - 版本化服务名为 `teammate.mailbox`，版本为 `1.0.0`。不同 `caller_id` 的成员和邮箱相互隔离。
 - 插件不注入常驻 developer 提示，使用时机由 `teammate_spawn` 的模型可见工具描述约束：仅在复杂项目存在互不阻塞的并行子任务，或独立审查确有收益时创建成员。
+- 已完成的成员在所属 controller 运行结束时自动回收：只回收状态已终态、所属运行已经结束且邮箱没有未读消息的成员，仍排队或运行中的成员继续保留。回收后 Runtime 句柄、成员目录项和邮箱一起释放，终态结果移入有界回收台账（最多 8 条），`teammate_result` 仍可读取，`teammate_list` 会同时返回 `retired_members`。运行中晚于 controller 结束的成员会在后续运行结束时补收。通过 `teammate.mailbox` 服务创建的成员没有 controller 运行身份，保留到调用方显式 `remove`；需要跨轮继续同一成员的工作时应在当轮内 dispatch，否则重新 spawn。
 
 ## 工具
 
 - `teammate_spawn`：为复杂项目中确有并行收益的独立子任务创建带角色的成员并异步执行首个任务；普通单点需求和单一路径审查不应派生。设置 `captain: true` 可将该独立成员指定为队长，每个 owner 最多一个队长，主 Agent 不能作为队长。派生输入会要求文件工具使用工作区相对路径，并在 Host 提供根目录时转换任务中的当前工作区绝对路径。
-- `teammate_list`：列出当前 owner 的成员地址和当前执行句柄。
-- `teammate_status`、`teammate_result`、`teammate_cancel`：操作成员的当前执行句柄。
-- `teammate_remove`：取消并删除成员及其未确认消息，释放成员配额。
+- `teammate_list`：列出当前 owner 的活跃成员、已回收成员及其当前执行句柄。
+- `teammate_status`、`teammate_result`、`teammate_cancel`：操作成员的当前执行句柄。成员被自动回收后，`teammate_result` 从回收台账返回同样的终态结果。
+- `teammate_remove`：取消并删除成员及其未确认消息，释放成员配额；对已回收成员只清理台账记录。正常流程不需要手动调用，完成态成员会在运行结束时自动回收。
 - `teammate_send`：向成员地址投递消息。
 - `teammate_inbox`：列出未确认消息。
 - `teammate_ack`：显式确认并删除消息。

@@ -247,27 +247,66 @@ impl PlanBook {
         }
     }
 
-    /// 在指定运行成功结束时完成其所属会话的进行中步骤，返回是否发生变化。
+    /// 处理一次成功结束的运行：收敛或回收该运行对应的会话计划，返回集合是否变化。
     ///
-    /// 只处理 `last_run_id` 与该运行一致的会话：run ID 全局唯一，因此并发会话不会
-    /// 互相推进对方的计划。
-    fn converge_run(&mut self, run_id: &str) -> bool {
-        let Some(entry) = self
-            .sessions
-            .values_mut()
-            .find(|entry| entry.last_run_id.as_deref() == Some(run_id))
-        else {
-            return false;
+    /// 会话优先取事件携带的可信 `session_id`；旧宿主没有该字段时退回按 `last_run_id`
+    /// 匹配。两种回收规则：
+    ///
+    /// - 本轮更新过计划（`last_run_id` 匹配）：把 `in_progress` 收敛为 `completed`；
+    ///   全部完成后直接移除，避免已完成计划长期占用集合。
+    /// - 本轮没有更新过计划：说明该轮已经不再维护它，整份计划回收，避免进度架继续
+    ///   展示上一轮遗留的步骤。
+    ///
+    /// 只有一个会话会受影响：并发运行结束时不会清掉其他会话仍在使用的计划。
+    fn finish_run(&mut self, run_id: &str, session: Option<&str>) -> bool {
+        let sessions = match session {
+            Some(session) => vec![session_key(Some(session))],
+            None => self
+                .sessions
+                .iter()
+                .filter(|(_, entry)| entry.last_run_id.as_deref() == Some(run_id))
+                .map(|(key, _)| key.clone())
+                .collect(),
         };
         let mut changed = false;
-        for item in &mut entry.plan.plan {
-            if item.status == PlanStatus::InProgress {
-                item.status = PlanStatus::Completed;
+        for session in sessions {
+            let Some(entry) = self.sessions.get(&session) else {
+                continue;
+            };
+            let touched = entry.last_run_id.as_deref() == Some(run_id);
+            // 没有运行归属的计划无法证明本轮是否维护过它（非 Core 宿主可能不注入 run ID），
+            // 此时只收敛不回收，避免误删仍在使用的计划。
+            let untracked = entry.last_run_id.is_none();
+            if !touched && !untracked {
+                self.sessions.remove(&session);
+                changed = true;
+                continue;
+            }
+            let Some(mut entry) = self.sessions.remove(&session) else {
+                continue;
+            };
+            let mut converged = false;
+            for item in &mut entry.plan.plan {
+                if item.status == PlanStatus::InProgress {
+                    item.status = PlanStatus::Completed;
+                    converged = true;
+                }
+            }
+            if converged {
+                entry.plan.revision = entry.plan.revision.saturating_add(1);
                 changed = true;
             }
-        }
-        if changed {
-            entry.plan.revision = entry.plan.revision.saturating_add(1);
+            // 全部完成即回收：计划架已经无事可做，保留状态只会让集合无限增长。
+            let finished = entry
+                .plan
+                .plan
+                .iter()
+                .all(|item| item.status == PlanStatus::Completed);
+            if finished {
+                changed = true;
+            } else {
+                self.sessions.insert(session, entry);
+            }
         }
         changed
     }
@@ -349,12 +388,13 @@ impl AgentPlugin for PlanPlugin {
         vec![update_plan_tool(), get_plan_tool()]
     }
 
-    /// 正常运行结束时收敛该运行所属会话的执行项，避免最终回复与计划面板状态不一致。
+    /// 正常运行结束时收敛并回收该运行所属会话的计划。
     ///
-    /// 取消运行时保留原状态，防止把中断任务误标为完成。运行结束事件没有会话身份，
-    /// 因此按最近一次计划更新登记的 run ID 定位会话：只有真正更新过计划的运行才会推进
-    /// 计划，并发会话之间不会互相收敛。本插件只订阅 `core.run.finish`，不参与准入决策。
-    fn on_event(&mut self, _host: &dyn PluginHostApi, event: &mut PluginEvent) -> EventOutcome {
+    /// 取消运行时保留原状态，防止把中断任务误标为完成。运行结束事件不带 Agent 身份，
+    /// 因此只处理事件明确指向的会话（旧宿主按最近一次计划更新的 run ID 匹配），并发
+    /// 会话之间不会互相回收。收敛结果立即写回 Host：否则重新激活会读到收敛前的旧状态，
+    /// 进度架又会出现“已完成却仍显示进行中”的幻觉。
+    fn on_event(&mut self, host: &dyn PluginHostApi, event: &mut PluginEvent) -> EventOutcome {
         if event.name() != core_events::RUN_FINISH {
             return EventOutcome::ready();
         }
@@ -364,7 +404,15 @@ impl AgentPlugin for PlanPlugin {
         if data.cancelled {
             return EventOutcome::ready();
         }
-        self.book.converge_run(&data.run_id);
+        let mut book = self.book.clone();
+        if !book.finish_run(&data.run_id, data.session_id.as_deref()) {
+            return EventOutcome::ready();
+        }
+        if let Ok(value) = serde_json::to_value(&book) {
+            if host.set_state(PLAN_STATE_KEY, &value).is_ok() {
+                self.book = book;
+            }
+        }
         EventOutcome::ready()
     }
 
@@ -560,7 +608,12 @@ impl PlanPlugin {
             }
         };
         let mut book = self.book.clone();
-        book.store(&session, next.clone(), call.run_id.clone());
+        if next.plan.is_empty() {
+            // 清空即回收：不保留空条目，避免会话集合被已结束的计划长期占用。
+            book.sessions.remove(&session);
+        } else {
+            book.store(&session, next.clone(), call.run_id.clone());
+        }
         host.set_state(PLAN_STATE_KEY, &serde_json::to_value(&book)?)?;
         self.book = book;
         Ok(ToolResult::success(
@@ -619,7 +672,7 @@ fn ordered_plan_items(plan: &PlanState) -> impl Iterator<Item = &PlanItem> {
 /// 最小步骤数直接取自 [`MIN_TRACKED_STEPS`]，描述与准入策略不会各自漂移。
 fn update_plan_tool() -> ToolSpec {
     let description = format!(
-        "仅为困难或较大的任务创建或更新计划；默认不要创建。满足以下任一条件才使用：改动跨多个模块或多个文件且顺序有依赖；任务能拆成 {MIN_TRACKED_STEPS} 个以上可独立验证的阶段；预计多轮长时执行，可能中途暂停或需要持续向用户汇报进度；用户明确要求维护计划。以下情况不要创建计划：直接问答与代码解释、代码阅读与初步探索、单文件小改动、单条命令或单次测试、格式化与重命名、窄范围修复，以及一次连续执行就能完成的任务。计划至少 {MIN_TRACKED_STEPS} 个步骤，每步必须是独立可验证的成果，不要把同一个动作拆成多步凑数；使用后及时把完成项标记为 completed，始终提交包含已完成项的完整计划，且最多一个步骤为 in_progress。"
+        "仅为困难或较大的任务创建或更新计划；默认不要创建。满足以下任一条件才使用：改动跨多个模块或多个文件且顺序有依赖；任务能拆成 {MIN_TRACKED_STEPS} 个以上可独立验证的阶段；预计多轮长时执行，可能中途暂停或需要持续向用户汇报进度；用户明确要求维护计划。以下情况不要创建计划：直接问答与代码解释、代码阅读与初步探索、单文件小改动、单条命令或单次测试、格式化与重命名、窄范围修复，以及一次连续执行就能完成的任务。计划至少 {MIN_TRACKED_STEPS} 个步骤，每步必须是独立可验证的成果，不要把同一个动作拆成多步凑数；始终提交包含已完成项的完整计划，且最多一个步骤为 in_progress。每完成一个步骤就立即调用本工具把它标记为 completed 并开始下一步，不要等整轮结束再补；插件会在每轮结束时自动完成仍为 in_progress 的步骤，并在计划全部完成或该轮没有更新过计划时直接回收计划（进度架随之消失）。"
     );
     ToolSpec::new(
         UPDATE_PLAN_TOOL,
@@ -755,6 +808,9 @@ mod tests {
         assert!(description.contains("一次连续执行就能完成"));
         assert!(description.contains("计划至少 3 个步骤"));
         assert!(description.contains("不要把同一个动作拆成多步凑数"));
+        assert!(description.contains("每完成一个步骤就立即调用本工具"));
+        assert!(description.contains("自动完成仍为 in_progress"));
+        assert!(description.contains("回收计划"));
     }
 
     /// 不足三步的计划会被拒绝，并明确提示直接执行任务。
@@ -1282,7 +1338,10 @@ mod tests {
             &session,
             PlanState {
                 revision: 1,
-                plan: vec![item("汇总评价", PlanStatus::InProgress)],
+                plan: vec![
+                    item("汇总评价", PlanStatus::InProgress),
+                    item("整理结论", PlanStatus::Pending),
+                ],
                 ..PlanState::default()
             },
             Some("run".into()),
@@ -1297,6 +1356,109 @@ mod tests {
         let converged = plugin.book.plan(&session).expect("计划存在");
         assert_eq!(converged.plan[0].status, PlanStatus::Completed);
         assert_eq!(converged.revision, 2);
+    }
+
+    /// 会话内全部完成或整轮没有维护过的计划，都应在运行结束时回收。
+    #[test]
+    fn run_finish_recycles_completed_and_untouched_plans() {
+        let mut book = PlanBook::default();
+        let completed = session_key(Some("session-a"));
+        book.store(
+            &completed,
+            PlanState {
+                revision: 1,
+                plan: vec![
+                    item("第一步", PlanStatus::Completed),
+                    item("第二步", PlanStatus::Completed),
+                ],
+                ..PlanState::default()
+            },
+            Some("run-a".into()),
+        );
+        let untouched = session_key(Some("session-b"));
+        book.store(
+            &untouched,
+            PlanState {
+                revision: 1,
+                plan: vec![item("旧步骤", PlanStatus::Pending)],
+                ..PlanState::default()
+            },
+            Some("run-b".into()),
+        );
+
+        // 会话 A 的本轮计划已全部完成：回收。
+        assert!(book.finish_run("run-a", Some("session-a")));
+        assert!(book.plan(&completed).is_none(), "完成的计划应被回收");
+        // 会话 B 本轮没有更新计划：旧计划回收，避免进度架继续显示遗留步骤。
+        assert!(book.finish_run("run-b-2", Some("session-b")));
+        assert!(book.plan(&untouched).is_none(), "未维护的计划应被回收");
+        // 没有变化时不应写回 Host。
+        assert!(!book.finish_run("run-a", Some("session-a")));
+    }
+
+    /// 没有运行归属的计划只收敛不回收：非 Core 宿主可能不注入 run ID。
+    #[test]
+    fn untracked_plan_survives_run_finish() {
+        let mut book = PlanBook::default();
+        let session = session_key(Some("session-x"));
+        book.store(
+            &session,
+            PlanState {
+                revision: 1,
+                plan: vec![
+                    item("第一步", PlanStatus::InProgress),
+                    item("第二步", PlanStatus::Pending),
+                    item("第三步", PlanStatus::Pending),
+                ],
+                ..PlanState::default()
+            },
+            None,
+        );
+
+        assert!(book.finish_run("run-x", Some("session-x")));
+
+        let plan = book.plan(&session).expect("无运行归属的计划不应被回收");
+        assert_eq!(plan.plan[0].status, PlanStatus::Completed);
+        assert_eq!(plan.plan[1].status, PlanStatus::Pending);
+    }
+
+    /// 运行结束只回收事件指向的会话，其他会话的计划保持原样。
+    #[test]
+    fn run_finish_leaves_other_sessions_alone() {
+        let mut book = PlanBook::default();
+        for (session, run, first) in [
+            ("session-a", "run-a", "会话 A 第一步"),
+            ("session-b", "run-b", "会话 B 第一步"),
+        ] {
+            book.store(
+                &session_key(Some(session)),
+                PlanState {
+                    revision: 1,
+                    plan: vec![
+                        item(first, PlanStatus::InProgress),
+                        item("第二步", PlanStatus::Pending),
+                        item("第三步", PlanStatus::Pending),
+                    ],
+                    ..PlanState::default()
+                },
+                Some(run.into()),
+            );
+        }
+
+        book.finish_run("run-a", Some("session-a"));
+
+        let a = book
+            .plan(&session_key(Some("session-a")))
+            .expect("会话 A 计划仍存在");
+        assert_eq!(a.plan[0].status, PlanStatus::Completed);
+        let b = book
+            .plan(&session_key(Some("session-b")))
+            .expect("会话 B 计划仍存在");
+        assert_eq!(
+            b.plan[0].status,
+            PlanStatus::InProgress,
+            "其他会话的计划不能被顺手回收或推进"
+        );
     }
 
     /// 验证计划面板遵守 Host 分配的宽高限制。

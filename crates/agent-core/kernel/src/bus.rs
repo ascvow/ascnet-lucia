@@ -79,6 +79,13 @@ pub struct RunFinishEvent {
     pub cancelled: bool,
     /// 本次运行汇总的 token 用量。
     pub usage: TokenUsage,
+    /// 运行所绑定的会话路由键。
+    ///
+    /// 运行结束是插件回收会话级状态的唯一时机，但 `run_id` 本身不携带会话身份。
+    /// Core 在这里带上应用绑定的可信值，插件才能把回收范围限定在对应会话；未绑定
+    /// 会话的运行（例如纯 CLI）保持 `None`，插件应退回不区分会话的处理方式。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 declare_event!(RunFinishEvent, "core.run.finish");
