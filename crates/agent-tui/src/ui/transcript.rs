@@ -13,7 +13,7 @@
 //! 本模块只负责排版，不认识具体插件工具：无法识别的工具退回通用 JSON 摘要，
 //! 因此新增工具不需要改这里就能得到可读的默认呈现。
 
-use crate::theme::{COLOR_DANGER, COLOR_LINE_NUMBER, COLOR_MUTED, COLOR_TEXT};
+use crate::theme::{COLOR_DANGER, COLOR_LINE_NUMBER, COLOR_MUTED, COLOR_TEXT, COLOR_TEXT_SOFT};
 use crate::ui::diff::{self, DiffLineKind};
 use crate::ui::highlight::{highlight_line, CodeLanguage};
 use crate::ui::markdown::{summarize_json, truncate_line};
@@ -36,17 +36,24 @@ fn number_field(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(Value::as_u64)
 }
 
+/// 把绝对路径还原为相对当前工作目录的形式；不在工作目录之下时原样返回。
+///
+/// 工具结果回传的是绝对路径，这类路径动辄七八十列，放到正文里会把真正要读的内容挤到
+/// 行尾。展示层统一按工作目录改写：读者就在这个目录里，前缀是纯噪音。
+fn relative_path(path: &str) -> &str {
+    let Ok(cwd) = std::env::current_dir() else {
+        return path;
+    };
+    let mut prefix = cwd.to_string_lossy().to_string();
+    prefix.push('/');
+    path.strip_prefix(prefix.as_str()).unwrap_or(path)
+}
+
 /// 把绝对路径压缩为相对当前工作目录的短路径，便于在窄终端阅读。
 fn shorten_path(path: &str) -> String {
-    let relative = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| {
-            let cwd = cwd.to_string_lossy().to_string();
-            path.strip_prefix(&format!("{cwd}/")).map(str::to_string)
-        })
-        .unwrap_or_else(|| path.to_string());
-    if unicode_width::UnicodeWidthStr::width(relative.as_str()) <= MAX_TARGET_WIDTH {
-        return relative;
+    let relative = relative_path(path);
+    if unicode_width::UnicodeWidthStr::width(relative) <= MAX_TARGET_WIDTH {
+        return relative.to_string();
     }
     // 超长路径保留末尾的文件名部分，前缀折叠为省略号：定位文件时文件名比目录更关键。
     let tail: String = relative
@@ -201,6 +208,14 @@ pub(crate) enum PreviewLine {
         /// 被折叠的行数。
         hidden: usize,
     },
+    /// 搜索结果的文件分组头。
+    ///
+    /// 同一文件的命中共用一次路径，下面的命中行只带行号与正文；路径已改写为相对工作
+    /// 目录的形式，`text` 仍是原始相对路径（超宽时由渲染按当前宽度折叠前缀）。
+    FileGroup {
+        /// 组头文本，通常是相对工作目录的路径。
+        text: String,
+    },
     /// 文件级头部：`diff --git`、`index`、`---`、`+++` 等。
     FileHeader {
         /// 行正文，原样保留 `+++`/`---` 前缀。
@@ -292,47 +307,79 @@ fn format_bytes(bytes: u64) -> String {
 /// 条目本身（`entries: [3 项]` 对用户毫无信息量）。这里按已知形状逐条展开；
 /// 形状不匹配时返回 `None`，由调用方退回通用路径。
 fn collection_preview(result: &ToolResult, max_lines: usize) -> Option<Vec<PreviewLine>> {
-    let rows: Vec<String> = match result.name.as_str() {
-        "list_directory" => result
-            .content
-            .get("entries")?
-            .as_array()?
-            .iter()
-            .map(|entry| {
-                let name = text_field(entry, "name").unwrap_or("?");
-                let kind = text_field(entry, "type").unwrap_or("file");
-                // 目录以 `/` 结尾，与 shell 的列目录习惯一致；文件补上体积。
-                match (kind, number_field(entry, "size")) {
-                    ("dir", _) => format!("{name}/"),
-                    (_, Some(size)) => format!("{name}  {}", format_bytes(size)),
-                    _ => name.to_string(),
-                }
-            })
-            .collect(),
-        "search_files" => result
-            .content
-            .get("matches")?
-            .as_array()?
-            .iter()
-            .map(|item| {
-                let file = text_field(item, "file").unwrap_or("?");
-                let line = number_field(item, "line").unwrap_or_default();
-                let content = text_field(item, "content").unwrap_or_default().trim_end();
-                format!("{file}:{line}  {content}")
-            })
-            .collect(),
-        _ => return None,
-    };
+    match result.name.as_str() {
+        "list_directory" => {
+            let rows: Vec<String> = result
+                .content
+                .get("entries")?
+                .as_array()?
+                .iter()
+                .map(|entry| {
+                    let name = text_field(entry, "name").unwrap_or("?");
+                    let kind = text_field(entry, "type").unwrap_or("file");
+                    // 目录以 `/` 结尾，与 shell 的列目录习惯一致；文件补上体积。
+                    match (kind, number_field(entry, "size")) {
+                        ("dir", _) => format!("{name}/"),
+                        (_, Some(size)) => format!("{name}  {}", format_bytes(size)),
+                        _ => name.to_string(),
+                    }
+                })
+                .collect();
+            let total = rows.len();
+            let mut lines: Vec<PreviewLine> = rows
+                .into_iter()
+                .take(max_lines)
+                .map(|text| PreviewLine::Context { number: None, text })
+                .collect();
+            if total > max_lines {
+                lines.push(PreviewLine::Elided {
+                    hidden: total - max_lines,
+                });
+            }
+            Some(lines)
+        }
+        "search_files" => search_preview(result, max_lines),
+        _ => None,
+    }
+}
 
-    let total = rows.len();
-    let mut lines: Vec<PreviewLine> = rows
-        .into_iter()
-        .take(max_lines)
-        .map(|text| PreviewLine::Context { number: None, text })
-        .collect();
-    if total > max_lines {
+/// 按文件分组展开搜索命中。
+///
+/// 每条命中都自带完整路径时，路径列会吃掉半行宽度，命中正文被推到右边缘且每行起止
+/// 位置互不相同，一列命中读不出对齐关系。搜索本来就按文件逐个遍历，同一文件的命中
+/// 天然相邻，因此路径只在文件切换时输出一次组头，行号回到号位列，其余宽度全部让给
+/// 命中正文。
+fn search_preview(result: &ToolResult, max_lines: usize) -> Option<Vec<PreviewLine>> {
+    let matches = result.content.get("matches")?.as_array()?;
+    let mut lines: Vec<PreviewLine> = Vec::with_capacity(max_lines + 1);
+    let mut current: Option<&str> = None;
+    let mut shown = 0usize;
+    for item in matches {
+        let file = text_field(item, "file").unwrap_or("?");
+        let new_group = current != Some(file);
+        // 组头自己占一行：只剩一行时不再新开组，避免出现只有路径没有命中的空组。
+        let cost = if new_group { 2 } else { 1 };
+        if lines.len() + cost > max_lines {
+            break;
+        }
+        if new_group {
+            lines.push(PreviewLine::FileGroup {
+                text: relative_path(file).to_string(),
+            });
+            current = Some(file);
+        }
+        let line = number_field(item, "line").unwrap_or_default();
+        let content = text_field(item, "content").unwrap_or_default();
+        lines.push(PreviewLine::Context {
+            // 行号进号位列：1-based 行号 0 只可能是缺失字段，按无号处理。
+            number: usize::try_from(line).ok().filter(|line| *line > 0),
+            text: content.trim_end().to_string(),
+        });
+        shown += 1;
+    }
+    if shown < matches.len() {
         lines.push(PreviewLine::Elided {
-            hidden: total - max_lines,
+            hidden: matches.len() - shown,
         });
     }
     Some(lines)
@@ -590,6 +637,45 @@ fn truncate_body(text: &str, width: usize) -> String {
     truncate_line(text, width.saturating_sub(1))
 }
 
+/// 把路径裁到 `width` 列，超出时按目录段折叠前缀，保留文件名。
+///
+/// 与正文用的尾部截断相反：定位一条命中时文件名才是关键，先被丢掉的不该是它。这里从
+/// 右往左拼回目录段，拼不下的部分统一折叠为一个 `…/` 前缀。
+fn elide_path(text: &str, width: usize) -> String {
+    let width = width.max(1);
+    if unicode_width::UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    let mut tail = String::new();
+    for segment in text.split('/').rev() {
+        let candidate = if tail.is_empty() {
+            segment.to_string()
+        } else {
+            format!("{segment}/{tail}")
+        };
+        // 省略号前缀本身占两列，必须一并算进预算，否则折叠后仍超宽、还要再被截一次。
+        if unicode_width::UnicodeWidthStr::width(candidate.as_str()) + 2 > width {
+            break;
+        }
+        tail = candidate;
+    }
+    if tail.is_empty() {
+        // 连文件名都放不下：退回按字符保留尾部，至少留下可辨识的后缀。
+        let mut kept = String::new();
+        let mut used = 0usize;
+        for character in text.chars().rev() {
+            let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+            if used + character_width + 1 > width {
+                break;
+            }
+            used += character_width;
+            kept.insert(0, character);
+        }
+        return format!("…{kept}");
+    }
+    format!("…/{tail}")
+}
+
 /// 计算行号列宽度：按块内最大行号的位数取，至少 [`GUTTER_MIN_WIDTH`] 列。
 ///
 /// 整块共用一个宽度，行号才能逐列右对齐；宽度只取决于这块内容自己的行号，因此
@@ -647,6 +733,7 @@ pub(crate) fn render_preview(
         | PreviewLine::Added { number, .. }
         | PreviewLine::Removed { number, .. } => number.is_some(),
         PreviewLine::Elided { .. }
+        | PreviewLine::FileGroup { .. }
         | PreviewLine::FileHeader { .. }
         | PreviewLine::HunkHeader { .. }
         | PreviewLine::Meta { .. } => false,
@@ -689,6 +776,14 @@ pub(crate) fn render_preview(
                 // 省略行与正文同列：它标记的是"这里还该有代码"，不是块级提示。
                 Span::raw(" ".repeat(PREVIEW_INDENT + gutter_width + marker_width)),
                 Span::styled(format!("… +{hidden} 行"), Style::new().fg(COLOR_MUTED)),
+            ]),
+            // 组头落在缩进列上，命中行再向右缩进一个号位：路径是这一组的标题，不是正文。
+            PreviewLine::FileGroup { text } => Line::from(vec![
+                Span::raw(" ".repeat(PREVIEW_INDENT)),
+                Span::styled(
+                    elide_path(text, total_width.saturating_sub(PREVIEW_INDENT).max(1)),
+                    Style::new().fg(COLOR_TEXT_SOFT),
+                ),
             ]),
             PreviewLine::FileHeader { text } => {
                 diff_structure_row(text, DiffLineKind::FileHeader, gutter_width, body_width)
@@ -1628,9 +1723,97 @@ mod result_shape_tests {
         );
     }
 
-    /// 搜索命中必须展示文件、行号与命中正文。
+    /// 搜索命中按文件分组：路径只出现一次，行号进号位列，命中正文同列开始。
     #[test]
-    fn search_matches_show_file_line_and_content() {
+    fn search_matches_group_under_the_file_path() {
+        let result = ToolResult::success(
+            "c",
+            "search_files",
+            json!({
+                "count": 3,
+                "truncated": false,
+                "matches": [
+                    {"file": "src/bus.rs", "line": 12, "content": "pub struct EventBus {"},
+                    {"file": "src/bus.rs", "line": 41, "content": "impl EventBus {"},
+                    {"file": "src/lib.rs", "line": 3, "content": "pub use bus::EventBus;"}
+                ]
+            }),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        assert_eq!(
+            lines,
+            vec![
+                PreviewLine::FileGroup {
+                    text: "src/bus.rs".into()
+                },
+                PreviewLine::Context {
+                    number: Some(12),
+                    text: "pub struct EventBus {".into()
+                },
+                PreviewLine::Context {
+                    number: Some(41),
+                    text: "impl EventBus {".into()
+                },
+                PreviewLine::FileGroup {
+                    text: "src/lib.rs".into()
+                },
+                PreviewLine::Context {
+                    number: Some(3),
+                    text: "pub use bus::EventBus;".into()
+                },
+            ]
+        );
+    }
+
+    /// 绝对路径在组头里改写成相对工作目录的形式，前缀不再占掉整行宽度。
+    #[test]
+    fn search_group_header_is_relative_to_the_working_directory() {
+        let cwd = std::env::current_dir().expect("测试进程需要工作目录");
+        let absolute = cwd.join("src/bus.rs").to_string_lossy().to_string();
+        let result = ToolResult::success(
+            "c",
+            "search_files",
+            json!({
+                "count": 1,
+                "truncated": false,
+                "matches": [{"file": absolute, "line": 12, "content": "pub struct EventBus {"}]
+            }),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        assert_eq!(
+            lines[0],
+            PreviewLine::FileGroup {
+                text: "src/bus.rs".into()
+            }
+        );
+    }
+
+    /// 组头也占预览行：宁可少显示一条命中，也不让某一行超出上限。
+    #[test]
+    fn search_preview_counts_group_headers_against_the_limit() {
+        let matches: Vec<serde_json::Value> = (1..=10)
+            .map(|line| json!({"file": "src/bus.rs", "line": line, "content": "x"}))
+            .collect();
+        let result = ToolResult::success(
+            "c",
+            "search_files",
+            json!({"count": 10, "truncated": false, "matches": matches}),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        // 1 行组头 + 7 行命中用满 8 行上限，剩余 3 条进省略行。
+        assert_eq!(lines.len(), 9);
+        assert_eq!(lines.last(), Some(&PreviewLine::Elided { hidden: 3 }));
+    }
+
+    /// 上限只够一行时不再新开组，避免出现只有路径、没有命中的空组头。
+    #[test]
+    fn search_preview_drops_the_group_header_when_it_alone_fills_the_budget() {
         let result = ToolResult::success(
             "c",
             "search_files",
@@ -1641,15 +1824,57 @@ mod result_shape_tests {
             }),
         );
 
-        let lines = preview_lines(None, &result, 8);
+        let lines = preview_lines(None, &result, 1);
 
+        assert_eq!(lines, vec![PreviewLine::Elided { hidden: 1 }]);
+    }
+
+    /// 超宽路径按目录段折叠前缀，文件名必须留住。
+    #[test]
+    fn elided_paths_keep_the_file_name() {
+        let path = "crates/agent-plugins/host/src/capability/mod.rs";
+
+        assert_eq!(elide_path(path, 120), path);
         assert_eq!(
-            lines[0],
-            PreviewLine::Context {
-                number: None,
-                text: "src/bus.rs:12  pub struct EventBus {".into()
-            }
+            elide_path(path, 24),
+            "…/src/capability/mod.rs",
+            "折叠后仍要落在预算内"
         );
+        // 连文件名都放不下时至少留下可辨识的后缀，不会退化成空串。
+        assert!(unicode_width::UnicodeWidthStr::width(elide_path(path, 4).as_str()) <= 4);
+    }
+
+    /// 分组后的命中正文逐列对齐：宽度只由号位列决定。
+    #[test]
+    fn grouped_search_hits_share_one_content_column() {
+        let lines = vec![
+            PreviewLine::FileGroup {
+                text: "src/bus.rs".into(),
+            },
+            PreviewLine::Context {
+                number: Some(12),
+                text: "pub struct EventBus {".into(),
+            },
+            PreviewLine::Context {
+                number: Some(1041),
+                text: "impl EventBus {".into(),
+            },
+        ];
+
+        let rendered = render_preview(&lines, 60, CodeLanguage::Plain, false);
+        let texts: Vec<String> = rendered
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert_eq!(texts[0], "  src/bus.rs");
+        assert_eq!(texts[1], "    12 pub struct EventBus {");
+        assert_eq!(texts[2], "  1041 impl EventBus {");
     }
 
     /// 整块没有行号时收起号位，条目不应白占一列缩进。
