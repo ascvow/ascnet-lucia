@@ -547,13 +547,47 @@ async fn continue_agent_reuses_private_session_and_preserves_permissions() {
         .await
         .expect("创建后续运行");
     assert_eq!(continued.lineage.parent.as_ref(), Some(&child.id));
-    assert_eq!(continued.lineage.depth, child.lineage.depth + 1);
+    // 续跑是同一个 Agent 的后续运行，不构成新的派生层。
+    assert_eq!(continued.lineage.depth, child.lineage.depth);
     let snapshot = api.status(&continued.id).await.expect("查询后续运行");
     assert_eq!(snapshot.permissions, permissions);
     assert!(matches!(
         api.wait(&continued.id).await.expect("等待后续运行"),
         AgentOutcome::Succeeded { .. }
     ));
+}
+
+/// 会话续跑不能消耗派生深度，否则长期协作的队员在若干轮后会永久失去后续任务。
+#[tokio::test]
+async fn continue_agent_does_not_grow_derivation_depth() {
+    let runtime = AgentRuntime::new(RuntimeLimits {
+        max_depth: 1,
+        ..RuntimeLimits::default()
+    })
+    .expect("创建 Runtime");
+    let root = runtime
+        .attach_root(
+            template(Arc::new(FixedModel), "fixed", &[]),
+            AgentPermissions::default(),
+        )
+        .await
+        .expect("挂载根 Agent");
+    let api = runtime.api(&root.id).await.expect("绑定根 API");
+    let mut current = api
+        .spawn(AgentSpawnRequest::new("首次任务"))
+        .await
+        .expect("派生 Agent");
+    api.wait(&current.id).await.expect("等待首次任务");
+
+    // 深度上限为 1 时仍应能连续续跑：续跑沿用深度，不再派生新的层级。
+    for round in 0..8 {
+        current = api
+            .continue_agent(&current.id, format!("第 {round} 轮后续任务"))
+            .await
+            .expect("续跑不应受派生深度限制");
+        assert_eq!(current.lineage.depth, 1, "续跑必须保持源节点深度");
+        api.wait(&current.id).await.expect("等待后续运行");
+    }
 }
 
 /// 深度和累计子节点限制必须在启动模型任务前生效。
@@ -1197,7 +1231,7 @@ async fn model_request_limit_is_shared_across_agents() {
         max_tokens: Arc::new(Mutex::new(Vec::new())),
     });
     let runtime = AgentRuntime::new(RuntimeLimits {
-        max_agent_model_requests_per_principal: 1,
+        max_agent_model_requests_per_principal: Some(1),
         ..RuntimeLimits::default()
     })
     .expect("创建 Runtime");
@@ -1232,7 +1266,7 @@ async fn model_request_limit_is_shared_across_agents() {
 async fn failed_provider_call_does_not_refund_model_request_budget() {
     let calls = Arc::new(AtomicUsize::new(0));
     let runtime = AgentRuntime::new(RuntimeLimits {
-        max_agent_model_requests_per_principal: 1,
+        max_agent_model_requests_per_principal: Some(1),
         ..RuntimeLimits::default()
     })
     .expect("创建 Runtime");
@@ -1275,7 +1309,7 @@ async fn failed_provider_call_does_not_refund_model_request_budget() {
 async fn model_request_bytes_limit_rejects_before_provider() {
     let calls = Arc::new(AtomicUsize::new(0));
     let runtime = AgentRuntime::new(RuntimeLimits {
-        max_agent_model_request_bytes_per_principal: 1,
+        max_agent_model_request_bytes_per_principal: Some(1),
         ..RuntimeLimits::default()
     })
     .expect("创建 Runtime");
@@ -1390,8 +1424,8 @@ async fn concurrent_model_output_token_reservation_is_atomic() {
         barrier: Arc::new(Barrier::new(2)),
     }));
     let runtime = AgentRuntime::new(RuntimeLimits {
-        max_agent_model_requests_per_principal: 2,
-        max_agent_model_output_tokens_per_principal: 64,
+        max_agent_model_requests_per_principal: Some(2),
+        max_agent_model_output_tokens_per_principal: Some(64),
         ..RuntimeLimits::default()
     })
     .expect("创建 Runtime");
@@ -1565,7 +1599,7 @@ async fn queued_steering_buffer_rejects_the_thirty_third_message() {
 #[tokio::test]
 async fn gate_rejection_terminal_state_explains_the_reason() {
     let limits = RuntimeLimits {
-        max_agent_model_requests_per_principal: 0,
+        max_agent_model_requests_per_principal: Some(0),
         ..RuntimeLimits::default()
     };
     let runtime = AgentRuntime::new(limits).expect("创建零请求额度的 Runtime");
@@ -1620,8 +1654,8 @@ async fn output_budget_settles_actual_usage_instead_of_reservation() {
     let mut options = AgentOptions::default().with_model_route("settle", "test-model");
     options.max_tokens = Some(400);
     let runtime = AgentRuntime::new(RuntimeLimits {
-        max_agent_model_requests_per_principal: 8,
-        max_agent_model_output_tokens_per_principal: 1_000,
+        max_agent_model_requests_per_principal: Some(8),
+        max_agent_model_output_tokens_per_principal: Some(1_000),
         ..RuntimeLimits::default()
     })
     .expect("创建 Runtime");

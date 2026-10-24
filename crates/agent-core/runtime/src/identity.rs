@@ -120,6 +120,9 @@ pub struct AgentLineage {
     pub parent: Option<AgentId>,
     /// 整棵派生树的根节点。
     pub root: AgentId,
-    /// 当前节点深度；根节点为零。
+    /// 当前派生深度；根节点为零。
+    ///
+    /// 会话续跑沿用源节点的深度：续跑是同一个 Agent 的后续运行，不构成新的派生层，
+    /// 因此深度只反映派生拓扑，不随运行次数增长。
     pub depth: usize,
 }

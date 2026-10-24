@@ -119,14 +119,14 @@ mod tests {
         assert_eq!(clamped.max_children_per_agent, 4);
         assert_eq!(clamped.max_concurrent_agents, 2);
         assert_eq!(clamped.max_agents_per_principal, 16);
-        assert_eq!(clamped.max_agent_model_requests_per_principal, 128);
+        assert_eq!(clamped.max_agent_model_requests_per_principal, Some(128));
         assert_eq!(
             clamped.max_agent_model_request_bytes_per_principal,
-            16 * 1024 * 1024
+            Some(16 * 1024 * 1024)
         );
         assert_eq!(
             clamped.max_agent_model_output_tokens_per_principal,
-            128 * 4096
+            Some(128 * 4096)
         );
         clamped.validate().expect("收紧后的限额仍应合法");
     }
@@ -151,9 +151,12 @@ mod tests {
         assert_eq!(clamped, defaults);
     }
 
-    /// 旧版 JSON 缺少累计资源字段时必须补入有限默认值，不能退化为无限制。
+    /// 旧版 JSON 缺少可选成本字段时必须保持兼容，且不引入隐藏配额。
+    ///
+    /// 这三项是应用可选的累计成本上限；旧版 JSON 没有它们时按「不设上限」处理，
+    /// 交互式长会话不会因为升级前后的默认值不同而突然拒绝请求。
     #[test]
-    fn legacy_runtime_limits_json_uses_safe_resource_defaults() {
+    fn legacy_runtime_limits_json_keeps_optional_cost_limits_unset() {
         let decoded: RuntimeLimits = serde_json::from_value(serde_json::json!({
             "max_depth": 3,
             "max_children_per_agent": 4,
@@ -166,18 +169,9 @@ mod tests {
             decoded.max_agents_per_principal,
             defaults.max_agents_per_principal
         );
-        assert_eq!(
-            decoded.max_agent_model_requests_per_principal,
-            defaults.max_agent_model_requests_per_principal
-        );
-        assert_eq!(
-            decoded.max_agent_model_request_bytes_per_principal,
-            defaults.max_agent_model_request_bytes_per_principal
-        );
-        assert_eq!(
-            decoded.max_agent_model_output_tokens_per_principal,
-            defaults.max_agent_model_output_tokens_per_principal
-        );
+        assert_eq!(decoded.max_agent_model_requests_per_principal, None);
+        assert_eq!(decoded.max_agent_model_request_bytes_per_principal, None);
+        assert_eq!(decoded.max_agent_model_output_tokens_per_principal, None);
     }
 
     /// 派生配置应能显式关闭基础 Agent 默认启用的流式模式。

@@ -13,7 +13,7 @@
 - 版本化服务名为 `teammate.mailbox`，版本为 `1.0.0`。不同 `caller_id` 的成员和邮箱相互隔离。
 - 插件不注入常驻 developer 提示，使用时机由 `teammate_spawn` 的模型可见工具描述约束：仅在复杂项目存在互不阻塞的并行子任务，或独立审查确有收益时创建成员。
 - 已完成的成员在所属 controller 运行结束时自动回收：只回收状态已终态、所属运行已经结束且邮箱没有未读消息的成员，仍排队或运行中的成员继续保留。回收后 Runtime 句柄、成员目录项和邮箱一起释放，终态结果移入有界回收台账（最多 8 条），`teammate_result` 仍可读取，`teammate_list` 会同时返回 `retired_members`。运行中晚于 controller 结束的成员会在后续运行结束时补收。通过 `teammate.mailbox` 服务创建的成员没有 controller 运行身份，保留到调用方显式 `remove`；需要跨轮继续同一成员的工作时应在当轮内 dispatch，否则重新 spawn。
-- 成员失败时，下一次状态刷新会读取一次幂等的终态结果并把原因写入快照的可选 `error` 字段；`teammate_list`、`teammate_status`、团队工作台成员详情和回收台账都能直接看到失败原因（例如撞到哪个 principal 预算），不需要再额外调用 `teammate_result` 排查。
+- 成员失败时，下一次状态刷新会读取一次幂等的终态结果并把原因写入快照的可选 `error` 字段；`teammate_list`、`teammate_status`、团队工作台成员详情和回收台账都能直接看到具体失败原因（例如单次输出上限、provider 报错或连接中断），不需要再额外调用 `teammate_result` 排查。
 
 ## 工具
 

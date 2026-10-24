@@ -49,9 +49,9 @@ Teammate 插件负责成员角色、稳定成员地址、有界邮箱、确认�
 
 成员生命周期由插件自己收敛，不依赖模型主动清理：每轮运行结束时，状态已终态、所属 controller 运行已经结束且邮箱没有未读消息的成员会被回收，Runtime 句柄、目录项和邮箱一起释放；仍排队或运行中的成员保留，晚于 controller 结束的成员在后续运行结束时补收。终态结果移入容量 8 条的回收台账，`teammate_result` 仍可读取，`teammate_list` 同时返回 `retired_members`；`teammate_remove` 对已回收成员保持幂等。通过 `teammate.mailbox` 服务创建的成员没有 controller 运行身份，保留到调用方显式 `remove`。
 
-成员失败时，插件在下一次状态刷新中读取一次幂等的终态结果，并把原因写入成员快照的可选 `error` 字段：`teammate_list`、`teammate_status`、团队工作台的成员详情和回收台账都能直接看到「撞到哪个预算或 provider 错误」，不需要再额外调用 `teammate_result` 猜原因。
+成员失败时，插件在下一次状态刷新中读取一次幂等的终态结果，并把原因写入成员快照的可选 `error` 字段：`teammate_list`、`teammate_status`、团队工作台的成员详情和回收台账都能直接看到具体失败原因（例如单次输出上限、provider 报错或连接中断），不需要再额外调用 `teammate_result` 猜原因。
 
-Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置；worker 模板继承同一个动态 Plugin Host，因此只读工具仍会经过权限插件与 Host 启动期门禁。worker 单次运行有 64 步 ReAct 上限（主会话配置了更小值时取更小值），避免一次成员运行把 principal 的累计模型预算一次耗尽。
+Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置；worker 模板继承同一个动态 Plugin Host，因此只读工具仍会经过权限插件与 Host 启动期门禁。worker 不覆盖步数，队员与主会话一样可以一直运行到任务完成；连续 dispatch 也不增加派生深度，因此长期协作的成员不会在若干轮后失去后续任务。
 
 ## Plan 插件
 

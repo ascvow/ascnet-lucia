@@ -18,49 +18,23 @@ use tokio::sync::mpsc;
 /// 单个 Agent 为实时观察者保留的最近事件数量。
 const AGENT_EVENT_HISTORY_LIMIT: usize = 512;
 
-/// Serve 平面单 principal 默认允许登记的 Agent 累计总数。
+/// 单 principal 默认允许登记的 Agent 累计总数。
 const DEFAULT_MAX_AGENTS_PER_PRINCIPAL: usize = 128;
-
-/// 单 principal 默认允许发起的 Agent 模型请求累计次数。
-///
-/// 该额度是失控保护，而不是交互会话的寿命配额。派生根身份默认上限为 128，
-/// worker profile 的单次运行步数上限为 64，128 × 64 = 8192 正好覆盖一个
-/// 满载拓扑；额度低于此值时，长会话会在某个不可见的时间点开始永久拒绝新请求，
-/// 表现为「成员先运行一段时间再整体失败」。
-const DEFAULT_MAX_AGENT_MODEL_REQUESTS_PER_PRINCIPAL: usize = 8_192;
-
-/// 单 principal 默认允许提交的 Agent 模型请求累计序列化字节数。
-///
-/// 与请求次数同量级：按平均每次 128 KiB 的 provider-neutral 请求估算，
-/// 8192 × 128 KiB = 1 GiB。它的职责是拦住超大上下文反复上传，而不是限制
-/// 一次会话能工作多久。
-const DEFAULT_MAX_AGENT_MODEL_REQUEST_BYTES_PER_PRINCIPAL: usize = 1024 * 1024 * 1024;
-
-/// 单 principal 默认允许消耗的 Agent 模型输出 token 累计总数。
-///
-/// 请求结束后按服务商回报的实际用量结算，因此这里约束真实输出成本。
-/// 按每次请求平均 4K 实际输出估算，8192 × 4K = 32M token；常见编码任务
-/// 每次请求只有 1K 上下，正常长会话不会触顶。
-const DEFAULT_MAX_AGENT_MODEL_OUTPUT_TOKENS_PER_PRINCIPAL: usize = 32 * 1024 * 1024;
 
 /// 为旧版 RuntimeLimits JSON 补充安全的单 principal Agent 总数默认值。
 const fn default_max_agents_per_principal() -> usize {
     DEFAULT_MAX_AGENTS_PER_PRINCIPAL
 }
 
-/// 为旧版 RuntimeLimits JSON 补充安全的单 principal 模型请求次数默认值。
-const fn default_max_agent_model_requests_per_principal() -> usize {
-    DEFAULT_MAX_AGENT_MODEL_REQUESTS_PER_PRINCIPAL
-}
-
-/// 为旧版 RuntimeLimits JSON 补充安全的单 principal 模型请求字节默认值。
-const fn default_max_agent_model_request_bytes_per_principal() -> usize {
-    DEFAULT_MAX_AGENT_MODEL_REQUEST_BYTES_PER_PRINCIPAL
-}
-
-/// 为旧版 RuntimeLimits JSON 补充安全的单 principal 模型输出 token 默认值。
-const fn default_max_agent_model_output_tokens_per_principal() -> usize {
-    DEFAULT_MAX_AGENT_MODEL_OUTPUT_TOKENS_PER_PRINCIPAL
+/// 取两个可选累计限额中更严格的一个，`None` 视为不设上限。
+///
+/// 该组合满足「只能收缩」：策略给出上限时收紧，策略未设上限时保持当前值。
+fn tighter_limit(current: Option<usize>, requested: Option<usize>) -> Option<usize> {
+    match (current, requested) {
+        (Some(current), Some(requested)) => Some(current.min(requested)),
+        (Some(current), None) => Some(current),
+        (None, requested) => requested,
+    }
 }
 
 /// Agent Runtime 的资源与拓扑限额。
@@ -81,17 +55,24 @@ pub struct RuntimeLimits {
     #[serde(default = "default_max_agents_per_principal")]
     pub max_agents_per_principal: usize,
     /// 单个可信 principal 的派生 Agent 允许发起的模型请求累计次数。
-    #[serde(default = "default_max_agent_model_requests_per_principal")]
-    pub max_agent_model_requests_per_principal: usize,
+    ///
+    /// `None` 表示不设累计上限。交互式 Serve 平面默认不设上限：队员可以一直运行到
+    /// 任务完成，模型请求次数不应成为会话寿命配额。Evaluation 与 Mutation 等受限
+    /// 平面必须显式设置该上限，用于阻断失控候选。
+    #[serde(default)]
+    pub max_agent_model_requests_per_principal: Option<usize>,
     /// 单个可信 principal 的派生 Agent 允许提交的模型请求累计序列化字节数。
-    #[serde(default = "default_max_agent_model_request_bytes_per_principal")]
-    pub max_agent_model_request_bytes_per_principal: usize,
+    ///
+    /// `None` 表示不设累计上限，此时 Runtime 也不为计费序列化请求，避免为不生效的
+    /// 限额复制完整请求。受限平面用该维度限制超大上下文反复上传。
+    #[serde(default)]
+    pub max_agent_model_request_bytes_per_principal: Option<usize>,
     /// 单个可信 principal 的派生 Agent 允许累计消耗的模型输出 token 总数。
     ///
-    /// 每次请求按 `max_tokens` 预留，请求结束后按服务商回报的实际用量结算并退还差额；
-    /// 因此该上限约束的是真实消耗，而不是请求次数乘以上限。
-    #[serde(default = "default_max_agent_model_output_tokens_per_principal")]
-    pub max_agent_model_output_tokens_per_principal: usize,
+    /// `None` 表示不设累计上限。设置时按 `max_tokens` 预留，请求结束后按服务商回报的
+    /// 实际用量结算并退还差额，因此约束的是真实消耗而不是请求次数乘以上限。
+    #[serde(default)]
+    pub max_agent_model_output_tokens_per_principal: Option<usize>,
 }
 
 impl Default for RuntimeLimits {
@@ -101,11 +82,10 @@ impl Default for RuntimeLimits {
             max_children_per_agent: 128,
             max_concurrent_agents: 8,
             max_agents_per_principal: DEFAULT_MAX_AGENTS_PER_PRINCIPAL,
-            max_agent_model_requests_per_principal: DEFAULT_MAX_AGENT_MODEL_REQUESTS_PER_PRINCIPAL,
-            max_agent_model_request_bytes_per_principal:
-                DEFAULT_MAX_AGENT_MODEL_REQUEST_BYTES_PER_PRINCIPAL,
-            max_agent_model_output_tokens_per_principal:
-                DEFAULT_MAX_AGENT_MODEL_OUTPUT_TOKENS_PER_PRINCIPAL,
+            // 原生 Runtime 只提供机制；是否给模型成本设累计上限由应用策略决定。
+            max_agent_model_requests_per_principal: None,
+            max_agent_model_request_bytes_per_principal: None,
+            max_agent_model_output_tokens_per_principal: None,
         }
     }
 }
@@ -116,7 +96,8 @@ impl RuntimeLimits {
     /// 逐维度取较小值，策略未设该维度上限时保持原值，因此结果不会放宽任何一项。
     /// `max_children_per_agent`、`max_concurrent_agents` 与 `max_agents_per_principal`
     /// 至少保留 1，以维持 [`RuntimeLimits::validate`] 要求的正数不变量并容纳 controller；
-    /// 真正阻断派生依靠 `max_depth`。
+    /// 真正阻断派生依靠 `max_depth`。三项模型成本预算的 `None` 表示不设上限，策略给出
+    /// 上限时才会收紧。
     pub fn clamped_by(&self, limits: &ResourceLimits) -> Self {
         Self {
             max_depth: limits
@@ -137,21 +118,18 @@ impl RuntimeLimits {
                 .map_or(self.max_agents_per_principal, |limit| {
                     self.max_agents_per_principal.min(limit).max(1)
                 }),
-            max_agent_model_requests_per_principal: limits
-                .max_agent_model_requests_per_principal
-                .map_or(self.max_agent_model_requests_per_principal, |limit| {
-                    self.max_agent_model_requests_per_principal.min(limit)
-                }),
-            max_agent_model_request_bytes_per_principal: limits
-                .max_agent_model_request_bytes_per_principal
-                .map_or(self.max_agent_model_request_bytes_per_principal, |limit| {
-                    self.max_agent_model_request_bytes_per_principal.min(limit)
-                }),
-            max_agent_model_output_tokens_per_principal: limits
-                .max_agent_model_output_tokens_per_principal
-                .map_or(self.max_agent_model_output_tokens_per_principal, |limit| {
-                    self.max_agent_model_output_tokens_per_principal.min(limit)
-                }),
+            max_agent_model_requests_per_principal: tighter_limit(
+                self.max_agent_model_requests_per_principal,
+                limits.max_agent_model_requests_per_principal,
+            ),
+            max_agent_model_request_bytes_per_principal: tighter_limit(
+                self.max_agent_model_request_bytes_per_principal,
+                limits.max_agent_model_request_bytes_per_principal,
+            ),
+            max_agent_model_output_tokens_per_principal: tighter_limit(
+                self.max_agent_model_output_tokens_per_principal,
+                limits.max_agent_model_output_tokens_per_principal,
+            ),
         }
     }
 
@@ -455,7 +433,8 @@ pub trait AgentRuntimeApi: Send + Sync {
     /// 从自身或后代 Agent 的成功终态会话创建后续运行，并立即返回新句柄。
     ///
     /// Runtime 只复用目标的私有会话、运行模板和有效权限，不向调用方返回原始会话，
-    /// 新运行的权限也不会超过目标 Agent 已经持有的范围。
+    /// 新运行的权限也不会超过目标 Agent 已经持有的范围。续跑沿用源节点的派生深度，
+    /// 也不消耗父节点的累计子配额，因此长期协作的成员可以反复接收新任务。
     async fn continue_agent(&self, target: &AgentId, input: String) -> RuntimeResult<AgentHandle>;
 
     /// 向排队或运行中的自身/后代 Agent 注入一条用户消息。
@@ -531,30 +510,48 @@ pub trait AgentRuntimeProvisioner: Send + Sync {
 mod tests {
     use super::*;
 
-    /// 默认拓扑配额必须覆盖满载派生，不能变成会话寿命配额。
+    /// 默认限额只约束拓扑，不把模型成本变成会话寿命配额。
     ///
-    /// 默认拓扑允许 128 个派生 Agent；按 worker 单次运行 64 步计算，满载需要
-    /// 8192 次请求。配额小于该值时，正常的长会话会在中途永久拒绝新请求，
-    /// 表现为「成员先运行一段时间再整体失败」，而状态里没有可解释的原因。
+    /// Runtime 只提供机制：应用未显式设置成本上限时，长期运行的队员不应在某次
+    /// 请求后永久失败。受限平面必须自行通过 `clamped_by` 显式收紧。
     #[test]
-    fn default_limits_cover_full_derivation_topology() {
+    fn default_limits_have_no_lifetime_model_cost_quota() {
         let limits = RuntimeLimits::default();
 
         assert!(
             limits.max_children_per_agent >= limits.max_agents_per_principal,
             "父节点子配额不能先于 principal 的 Agent 总数耗尽"
         );
-        assert!(
-            limits.max_agent_model_requests_per_principal >= limits.max_agents_per_principal * 64,
-            "请求预算必须覆盖默认拓扑允许的全部 Agent 运行"
+        assert_eq!(limits.max_agent_model_requests_per_principal, None);
+        assert_eq!(limits.max_agent_model_request_bytes_per_principal, None);
+        assert_eq!(limits.max_agent_model_output_tokens_per_principal, None);
+    }
+
+    /// 策略只能收紧可选成本上限，不能借 `None` 放宽已有硬上限。
+    #[test]
+    fn policy_clamps_optional_cost_limits_without_widening() {
+        let current = RuntimeLimits::default();
+        let restricted = ResourceLimits {
+            max_agent_model_requests_per_principal: Some(8),
+            max_agent_model_request_bytes_per_principal: Some(2048),
+            max_agent_model_output_tokens_per_principal: Some(1024),
+            ..ResourceLimits::default()
+        };
+
+        let clamped = current.clamped_by(&restricted);
+        assert_eq!(clamped.max_agent_model_requests_per_principal, Some(8));
+        assert_eq!(
+            clamped.max_agent_model_request_bytes_per_principal,
+            Some(2048)
         );
-        assert!(
-            limits.max_agent_model_request_bytes_per_principal >= 1024 * 1024 * 1024,
-            "字节预算必须容纳 8192 次 128 KiB 请求"
+        assert_eq!(
+            clamped.max_agent_model_output_tokens_per_principal,
+            Some(1024)
         );
-        assert!(
-            limits.max_agent_model_output_tokens_per_principal >= 32 * 1024 * 1024,
-            "输出预算必须容纳 8192 次 4K 实际输出"
-        );
+
+        // 反向组合：策略不设上限时必须保持调用方已有的硬上限。
+        let already_limited = clamped.clone();
+        let kept = already_limited.clamped_by(&ResourceLimits::default());
+        assert_eq!(kept, already_limited);
     }
 }

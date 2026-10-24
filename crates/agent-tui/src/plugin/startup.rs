@@ -12,8 +12,8 @@ use agent_plugin_host::manifest::PluginManifest;
 use agent_plugin_host::wasm::load_wasm_plugins_progressively_with_selection_and_services;
 use agent_plugin_host::{LivePluginHost, PluginHostServices};
 use agent_runtime::{
-    AgentDeriveConfig, AgentOptionsPatch, AgentPermissions, AgentProfileId, AgentRuntime,
-    AgentTemplate, RuntimeLimits, ToolAccess,
+    AgentDeriveConfig, AgentPermissions, AgentProfileId, AgentRuntime, AgentTemplate,
+    RuntimeLimits, ToolAccess,
 };
 use agent_session::SessionStore;
 use anyhow::{Context, Result};
@@ -33,37 +33,16 @@ const WORKER_READ_ONLY_TOOLS: [&str; 4] = [
     agent_skill::SKILL_READ_TOOL_NAME,
 ];
 
-/// 派生 worker 单次运行允许的 ReAct 步数上限。
-///
-/// 交互主会话可以配置 `max_steps = 0`（不设总步数上限），但 worker 在后台无人值守运行：
-/// 一次无界的成员运行会连续占用 principal 的累计模型预算，最终让整个会话里后续的所有
-/// 成员都在中途失败。取 Core 对单条用户指令的默认步数，既覆盖编码与审查任务，又让单次
-/// 运行的资源消耗可预测。
-const WORKER_MAX_REACT_STEPS: usize = 64;
-
-/// 把交互主会话的步数配置收缩到 worker 上限。
-///
-/// `0` 表示主会话不设上限，worker 仍然使用固定上限；配置了更小正数时保持更严格的值，
-/// 不会因为派生而放宽用户已经收紧的限制。
-fn worker_step_budget(interactive_max_steps: usize) -> usize {
-    match interactive_max_steps {
-        0 => WORKER_MAX_REACT_STEPS,
-        configured => configured.min(WORKER_MAX_REACT_STEPS),
-    }
-}
-
 /// 构造 TUI 授予插件 worker profile 的显式只读派生策略。
 ///
-/// `max_steps` 由调用方按主会话配置收缩后传入，worker 不允许无限步数运行。
-fn worker_agent_derive_config(max_steps: usize) -> AgentDeriveConfig {
+/// 只收缩工具权限，不覆盖步数：worker 与主会话一样允许长时间运行，交互式主会话的
+/// `max_steps = 0`（不设上限）会原样继承，队员因此可以一直跑到任务完成。
+fn worker_agent_derive_config() -> AgentDeriveConfig {
     AgentDeriveConfig {
-        options: AgentOptionsPatch {
-            max_steps: Some(max_steps),
-            ..AgentOptionsPatch::default()
-        },
         permissions: AgentPermissions {
             tools: ToolAccess::allowlist(WORKER_READ_ONLY_TOOLS),
         },
+        ..AgentDeriveConfig::default()
     }
 }
 
@@ -376,9 +355,6 @@ pub(crate) async fn load_plugins_for_tui(
     let workspace_root = workspace_root_path.to_string_lossy().into_owned();
     let controller_profile =
         AgentProfileId::new("tui-controller").context("创建 TUI controller profile 失败")?;
-    // 主会话允许 `max_steps = 0` 的交互式无限循环，但派生 worker 必须有界；在执行
-    // register_profile 移动模板前先按主配置收缩出 worker 的步数预算。
-    let worker_max_steps = worker_step_budget(agent_template.options().max_steps);
     runtime
         .register_profile(
             controller_profile.clone(),
@@ -483,10 +459,7 @@ pub(crate) async fn load_plugins_for_tui(
     let host_services = host_services.with_agent_runtime(
         Arc::new(runtime),
         controller_profile,
-        HashMap::from([(
-            "worker".to_string(),
-            worker_agent_derive_config(worker_max_steps),
-        )]),
+        HashMap::from([("worker".to_string(), worker_agent_derive_config())]),
     )?;
     load_wasm_plugins_progressively_with_selection_and_services(
         &prepared_manifests,
@@ -533,7 +506,7 @@ mod tests {
     /// worker profile 必须保持显式只读，不能因默认 `All` 或未来新增工具获得副作用能力。
     #[test]
     fn worker_profile_exposes_only_explicit_read_tools() {
-        let config = worker_agent_derive_config(WORKER_MAX_REACT_STEPS);
+        let config = worker_agent_derive_config();
 
         for allowed in WORKER_READ_ONLY_TOOLS {
             assert!(
@@ -554,21 +527,18 @@ mod tests {
         }
     }
 
-    /// 交互主会话的 `max_steps = 0` 不能原样传给后台 worker。
+    /// 队员允许长期运行，worker 不得被注入步数上限。
     ///
-    /// 无界成员运行会持续消耗 principal 的累计模型预算，耗尽后同一会话里的所有成员都会
-    /// 中途失败；worker 必须始终有有限步数，同时不得放宽用户已经收紧的更小值。
+    /// 交互主会话可以配置 `max_steps = 0`（不设上限）；worker 若被覆盖成有限步数，
+    /// 大任务会在中途被截断，与「队员一直跑到完成」的产品语义冲突。
     #[test]
-    fn worker_step_budget_stays_bounded_for_interactive_sessions() {
-        assert_eq!(worker_step_budget(0), WORKER_MAX_REACT_STEPS);
-        assert_eq!(worker_step_budget(7), 7);
-        assert_eq!(
-            worker_step_budget(WORKER_MAX_REACT_STEPS * 4),
-            WORKER_MAX_REACT_STEPS
-        );
+    fn worker_inherits_unbounded_step_budget() {
+        let config = worker_agent_derive_config();
 
-        let config = worker_agent_derive_config(worker_step_budget(0));
-        assert_eq!(config.options.max_steps, Some(WORKER_MAX_REACT_STEPS));
+        assert_eq!(
+            config.options.max_steps, None,
+            "worker 不得覆盖主会话的步数配置"
+        );
     }
 
     /// 不装任何插件时工具必须照常放行。

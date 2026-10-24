@@ -413,25 +413,20 @@ impl AgentRuntime {
             .continuation_session()
             .ok_or_else(|| AgentRuntimeError::SessionUnavailable(target.clone()))?;
 
-        let depth = source.lineage.depth + 1;
-        if depth > self.inner.limits.max_depth {
-            return Err(AgentRuntimeError::MaxDepthExceeded {
-                limit: self.inner.limits.max_depth,
-            });
-        }
+        // 会话续跑是同一个 Agent 的后续运行，不是新的派生层：`continue` 沿用源节点的
+        // 深度，也不消耗父节点的累计子配额。否则长期协作的队员会在若干次 dispatch
+        // 之后撞到派生深度或子配额上限，表现为「跑一段时间后再也接不了新任务」。
+        // 登记的 Agent 总数仍计入 principal 账本，作为内存与结果保留的硬边界。
+        let depth = source.lineage.depth;
         let id = AgentId::new();
         let lineage = AgentLineage {
             parent: Some(target.clone()),
             root: source.lineage.root.clone(),
             depth,
         };
-        // 预留 principal 与父节点名额后不再 await，保证取消不能留下未登记的累计用量。
+        // 预留 principal 名额后不再 await，保证取消不能留下未登记的累计用量。
         let mut agents = self.inner.agents.write().await;
         let principal_usage = self.inner.reserve_principal_agent(principal)?;
-        if let Err(error) = source.reserve_child(self.inner.limits.max_children_per_agent) {
-            RuntimeInner::release_principal_agent_reservation(&principal_usage);
-            return Err(error);
-        }
         let entry = AgentEntry::new(
             id.clone(),
             lineage.clone(),
@@ -679,11 +674,14 @@ struct PrincipalUsage {
 }
 
 /// Core provider 调用前执行的 principal 模型预算门禁。
+///
+/// 每一项都是可选上限：`None` 表示该维度不设累计配额，交互式 Serve 平面默认全部为
+/// `None`，长期运行的队员不会因为会话累计用量而被拒绝。受限平面显式设置为 `Some`。
 struct PrincipalModelRequestGate {
     usage: Arc<Mutex<PrincipalUsage>>,
-    max_requests: usize,
-    max_request_bytes: usize,
-    max_output_tokens: usize,
+    max_requests: Option<usize>,
+    max_request_bytes: Option<usize>,
+    max_output_tokens: Option<usize>,
 }
 
 /// 只统计序列化字节且在达到剩余预算时中止，避免为门禁复制完整请求缓冲。
@@ -731,77 +729,92 @@ impl ModelRequestGate for PrincipalModelRequestGate {
             .ok_or(AgentRuntimeError::AgentModelRequestMaxTokensRequired)?
             as usize;
         let mut usage = self.usage.lock().expect("principal 资源账本锁不应中毒");
-        if usage.model_requests >= self.max_requests {
-            return Err(
-                AgentRuntimeError::MaxAgentModelRequestsPerPrincipalExceeded {
-                    limit: self.max_requests,
-                }
-                .into(),
-            );
-        }
-        let remaining_request_bytes = self
-            .max_request_bytes
-            .saturating_sub(usage.model_request_bytes);
-        let mut request_size = BoundedRequestSizeCounter::new(remaining_request_bytes);
-        if let Err(error) = serde_json::to_writer(&mut request_size, request) {
-            if request_size.exceeded {
+        if let Some(max_requests) = self.max_requests {
+            if usage.model_requests >= max_requests {
                 return Err(
-                    AgentRuntimeError::MaxAgentModelRequestBytesPerPrincipalExceeded {
-                        limit: self.max_request_bytes,
+                    AgentRuntimeError::MaxAgentModelRequestsPerPrincipalExceeded {
+                        limit: max_requests,
                     }
                     .into(),
                 );
             }
-            return Err(anyhow::anyhow!("序列化模型请求以执行资源门禁失败：{error}"));
         }
-        let request_bytes = request_size.bytes;
-        let Some(next_bytes) = usage.model_request_bytes.checked_add(request_bytes) else {
-            return Err(
-                AgentRuntimeError::MaxAgentModelRequestBytesPerPrincipalExceeded {
-                    limit: self.max_request_bytes,
+        // 不设字节上限时跳过序列化：门禁不应为不生效的配额复制整份请求。
+        let request_bytes = match self.max_request_bytes {
+            Some(max_request_bytes) => {
+                let remaining_request_bytes =
+                    max_request_bytes.saturating_sub(usage.model_request_bytes);
+                let mut request_size = BoundedRequestSizeCounter::new(remaining_request_bytes);
+                if let Err(error) = serde_json::to_writer(&mut request_size, request) {
+                    if request_size.exceeded {
+                        return Err(
+                            AgentRuntimeError::MaxAgentModelRequestBytesPerPrincipalExceeded {
+                                limit: max_request_bytes,
+                            }
+                            .into(),
+                        );
+                    }
+                    return Err(anyhow::anyhow!("序列化模型请求以执行资源门禁失败：{error}"));
                 }
-                .into(),
-            );
+                let Some(next_bytes) = usage.model_request_bytes.checked_add(request_size.bytes)
+                else {
+                    return Err(
+                        AgentRuntimeError::MaxAgentModelRequestBytesPerPrincipalExceeded {
+                            limit: max_request_bytes,
+                        }
+                        .into(),
+                    );
+                };
+                if next_bytes > max_request_bytes {
+                    return Err(
+                        AgentRuntimeError::MaxAgentModelRequestBytesPerPrincipalExceeded {
+                            limit: max_request_bytes,
+                        }
+                        .into(),
+                    );
+                }
+                Some(next_bytes)
+            }
+            None => None,
         };
-        if next_bytes > self.max_request_bytes {
-            return Err(
-                AgentRuntimeError::MaxAgentModelRequestBytesPerPrincipalExceeded {
-                    limit: self.max_request_bytes,
-                }
-                .into(),
-            );
-        }
-        let Some(next_output_tokens) = usage
-            .model_output_tokens
-            .checked_add(requested_output_tokens)
-        else {
-            return Err(
-                AgentRuntimeError::MaxAgentModelOutputTokensPerPrincipalExceeded {
-                    limit: self.max_output_tokens,
-                }
-                .into(),
-            );
-        };
-        if next_output_tokens > self.max_output_tokens {
-            return Err(
-                AgentRuntimeError::MaxAgentModelOutputTokensPerPrincipalExceeded {
-                    limit: self.max_output_tokens,
-                }
-                .into(),
-            );
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            let Some(next_output_tokens) = usage
+                .model_output_tokens
+                .checked_add(requested_output_tokens)
+            else {
+                return Err(
+                    AgentRuntimeError::MaxAgentModelOutputTokensPerPrincipalExceeded {
+                        limit: max_output_tokens,
+                    }
+                    .into(),
+                );
+            };
+            if next_output_tokens > max_output_tokens {
+                return Err(
+                    AgentRuntimeError::MaxAgentModelOutputTokensPerPrincipalExceeded {
+                        limit: max_output_tokens,
+                    }
+                    .into(),
+                );
+            }
         }
         usage.model_requests += 1;
-        usage.model_request_bytes = next_bytes;
-        usage.model_output_tokens = next_output_tokens;
+        if let Some(next_bytes) = request_bytes {
+            usage.model_request_bytes = next_bytes;
+        }
+        // 预留量始终记账，结算时才能按实际用量替换；未设上限时该值只用于对账。
+        usage.model_output_tokens = usage
+            .model_output_tokens
+            .saturating_add(requested_output_tokens);
         Ok(())
     }
 
     /// 退还预留与实际用量的差额，让账本记录真实消耗。
     ///
     /// `before_request` 按 `max_tokens` 预留，而实际输出通常远小于这个上限（模型声明
-    /// 的上限可达数十万 token，一次回答只有一千上下）。若只预留不结算，默认预算会在
-    /// 几十次请求后被耗尽，把"允许 8192 次请求"变成"允许几十次"。本方法把预留替换为
-    /// 实际用量，使请求次数上限重新成为真正起作用的约束。
+    /// 的上限可达数十万 token，一次回答只有一千上下）。设置输出上限时若只预留不结算，
+    /// 预算会在几十次请求后被耗尽，把配额变成远小于声明值的实际请求数。本方法把预留
+    /// 替换为实际用量，使输出上限只约束真实成本。
     fn settle_request(&self, reserved_output_tokens: usize, actual_output_tokens: Option<u64>) {
         let actual = actual_output_tokens.unwrap_or(0).min(usize::MAX as u64) as usize;
         let mut usage = self.usage.lock().expect("principal 资源账本锁不应中毒");

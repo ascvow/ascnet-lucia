@@ -163,15 +163,21 @@ pub struct ResourceLimits {
     #[serde(default)]
     pub max_agents_per_principal: Option<usize>,
     /// 单个可信 principal 的派生 Agent 允许发起的模型请求累计次数。
+    ///
+    /// `None` 表示不设累计上限；交互式 Serve 平面保持 `None`，队员可以一直运行到任务
+    /// 完成。受限平面应显式设置该上限。
     #[serde(default)]
     pub max_agent_model_requests_per_principal: Option<usize>,
     /// 单个可信 principal 的派生 Agent 允许提交的模型请求累计序列化字节数。
+    ///
+    /// `None` 表示不设累计上限，Runtime 也不为计费序列化请求。
     #[serde(default)]
     pub max_agent_model_request_bytes_per_principal: Option<usize>,
     /// 单个可信 principal 的派生 Agent 允许累计消耗的模型输出 token 总数。
     ///
-    /// 每次请求按 `max_tokens` 预留，请求结束后按服务商回报的实际用量结算并退还差额；
-    /// 因此该上限约束的是真实消耗，而不是请求次数乘以上限。
+    /// `None` 表示不设累计上限。设置时每次请求按 `max_tokens` 预留，请求结束后按
+    /// 服务商回报的实际用量结算并退还差额；因此该上限约束的是真实消耗，而不是
+    /// 请求次数乘以上限。
     #[serde(default)]
     pub max_agent_model_output_tokens_per_principal: Option<usize>,
     /// 单次运行的墙钟时间上限，单位毫秒。
@@ -315,7 +321,8 @@ impl ExecutionPolicy {
     /// Serve 平面策略：保持现有功能，不额外收紧。
     ///
     /// 授权由 Host 的工具门禁与工具策略插件共同决定；长期驻留插件默认不设模型调用累计
-    /// 限额，调用方可以通过策略收缩显式设置次数与输入预算。
+    /// 限额，调用方可以通过策略收缩显式设置次数与输入预算。Agent 的模型成本累计配额同理：
+    /// 交互式队员可以一直运行到任务完成，成本上限只应由需要硬性预算的受限平面声明。
     pub fn serve() -> Self {
         Self {
             profile: ExecutionProfile::Serve,
@@ -331,14 +338,12 @@ impl ExecutionPolicy {
                 // 拒绝新成员。并发扇出仍由 max_concurrent_agents 限制。
                 max_children_per_agent: Some(128),
                 max_agents_per_principal: Some(128),
-                // 这三项是失控保护，不是交互会话的寿命配额：额度按「128 个派生 Agent ×
-                // worker 单次运行 64 步」估算（8192 次请求），字节按每次 128 KiB
-                // （1 GiB）、输出按每次 4K 实际用量（32M token）估算。额度小于拓扑上限
-                // 时，长会话会在某个不可见的时间点开始永久拒绝新请求，且用户很难从
-                // 「成员先运行一段时间再失败」判断原因。
-                max_agent_model_requests_per_principal: Some(8_192),
-                max_agent_model_request_bytes_per_principal: Some(1024 * 1024 * 1024),
-                max_agent_model_output_tokens_per_principal: Some(32 * 1024 * 1024),
+                // 交互式 Serve 平面不设模型成本累计配额：队员可以一直运行到任务完成，
+                // 请求次数、请求字节和实际输出量都不应成为会话寿命上限。受限平面
+                // （Evaluation/Mutation）仍显式设置这三项用于阻断失控候选。
+                max_agent_model_requests_per_principal: None,
+                max_agent_model_request_bytes_per_principal: None,
+                max_agent_model_output_tokens_per_principal: None,
                 // 交互插件长期驻留，审核次数与累计输入不应随使用时间耗尽；调用方仍可显式收紧。
                 max_plugin_model_completions: None,
                 max_plugin_model_input_bytes: None,
@@ -563,39 +568,31 @@ mod tests {
         assert!(policy.permits_process_execution());
     }
 
-    /// Serve 的拓扑配额必须覆盖一个满载派生拓扑，而不是变成会话寿命配额。
+    /// Serve 平面不得把模型成本变成会话寿命配额。
     ///
-    /// 128 个派生 Agent × worker 单次运行 64 步 = 8192 次请求；配额低于它时，
-    /// 正常的长会话会在中途撞到累计上限，之后所有派生 Agent 都只能失败。
+    /// 队员允许一直运行到任务完成，因此交互式 Serve 的三项累计成本上限必须为
+    /// `None`（不设上限）；受限平面仍由 Evaluation/Mutation 显式收紧。
     #[test]
-    fn serve_limits_cover_full_derivation_topology() {
+    fn serve_has_no_lifetime_model_cost_quota() {
         let policy = ExecutionPolicy::serve();
         let limits = &policy.limits;
-        let agents = limits
-            .max_agents_per_principal
-            .expect("Serve 必须声明 principal 的 Agent 上限");
 
+        assert_eq!(limits.max_agent_model_requests_per_principal, None);
+        assert_eq!(limits.max_agent_model_request_bytes_per_principal, None);
+        assert_eq!(limits.max_agent_model_output_tokens_per_principal, None);
         assert!(
-            limits.max_children_per_agent.unwrap_or(0) >= agents,
-            "父节点子配额必须至少覆盖 {agents} 个派生 Agent"
+            ExecutionPolicy::evaluation("/tmp/fixture")
+                .limits
+                .max_agent_model_requests_per_principal
+                .is_some(),
+            "Evaluation 必须保留硬上限"
         );
         assert!(
-            limits.max_agent_model_requests_per_principal.unwrap_or(0) >= agents * 64,
-            "请求预算必须覆盖 {agents} 个 Agent 各 64 步"
-        );
-        assert!(
-            limits
-                .max_agent_model_request_bytes_per_principal
-                .unwrap_or(0)
-                >= 1024 * 1024 * 1024,
-            "字节预算至少容纳 8192 次 128 KiB 请求"
-        );
-        assert!(
-            limits
+            ExecutionPolicy::mutation()
+                .limits
                 .max_agent_model_output_tokens_per_principal
-                .unwrap_or(0)
-                >= 32 * 1024 * 1024,
-            "输出预算至少容纳 8192 次 4K 实际输出"
+                .is_some(),
+            "Mutation 必须保留硬上限"
         );
     }
 
