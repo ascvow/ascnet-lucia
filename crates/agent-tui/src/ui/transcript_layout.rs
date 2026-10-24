@@ -24,10 +24,12 @@ struct LayoutEntry {
     width: u16,
     /// 内容指纹；与当前消息不一致时重新测量。
     fingerprint: u64,
-    /// 换行后的视觉行数。
-    height: u16,
+    /// 换行后的视觉行数，逻辑高度不能使用终端的 u16 坐标。
+    height: usize,
     /// 展开当前工具消息是否能多看到内容；点击热区只对这类消息开放。
     expandable: bool,
+    /// 可见窗口内的逻辑行累计视觉终点，滚出窗口后释放。
+    row_ends: Vec<usize>,
     /// 可见窗口内保留的渲染结果；滚出窗口后释放。
     lines: Option<Vec<Line<'static>>>,
 }
@@ -40,6 +42,7 @@ impl LayoutEntry {
             fingerprint: 0,
             height: 0,
             expandable: false,
+            row_ends: Vec::new(),
             lines: None,
         }
     }
@@ -63,7 +66,7 @@ impl TranscriptLayout {
     /// 同步布局到当前消息列表，返回全部消息的视觉行数之和。
     ///
     /// 只有宽度或内容指纹变化的条目会重新排版；其余条目直接复用缓存的高度。
-    pub(crate) fn sync(&mut self, messages: &[Msg], streaming: Option<usize>, width: u16) -> u16 {
+    pub(crate) fn sync(&mut self, messages: &[Msg], streaming: Option<usize>, width: u16) -> usize {
         let width = width.max(1);
         if self.width != width {
             // 宽度变化会让全部换行结果失效，逐条重新测量。
@@ -76,7 +79,7 @@ impl TranscriptLayout {
             self.entries.resize_with(messages.len(), LayoutEntry::empty);
         }
 
-        let mut total = 0u16;
+        let mut total = 0usize;
         for (index, message) in messages.iter().enumerate() {
             let is_streaming = streaming == Some(index);
             let fingerprint = fingerprint(message, is_streaming);
@@ -85,7 +88,8 @@ impl TranscriptLayout {
                 let lines = message_lines(messages, index, is_streaming, width);
                 entry.width = width;
                 entry.fingerprint = fingerprint;
-                entry.height = measure(&lines, width);
+                entry.row_ends = line_row_ends(&lines, width);
+                entry.height = entry.row_ends.last().copied().unwrap_or(0);
                 entry.expandable = message.is_tool_expandable();
                 entry.lines = Some(lines);
             }
@@ -104,26 +108,27 @@ impl TranscriptLayout {
         area: Rect,
         messages: &[Msg],
         streaming: Option<usize>,
-        scroll: u16,
+        scroll: usize,
     ) {
         if area.height == 0 || area.width == 0 {
             for entry in &mut self.entries {
                 entry.lines = None;
+                entry.row_ends = Vec::new();
             }
             return;
         }
-        let viewport_top = i32::from(area.y);
-        let viewport_bottom = i32::from(area.bottom());
-        let mut cursor = viewport_top - i32::from(scroll);
+        let viewport_bottom = scroll.saturating_add(usize::from(area.height));
+        let mut cursor = 0usize;
 
         for (index, entry) in self.entries.iter_mut().enumerate() {
             let height = entry.height;
             let start = cursor;
-            cursor = cursor.saturating_add(i32::from(height));
-            let visible = height > 0 && cursor > viewport_top && start < viewport_bottom;
+            cursor = cursor.saturating_add(height);
+            let visible = height > 0 && cursor > scroll && start < viewport_bottom;
             if !visible {
                 // 视口外的消息只需要高度，行内容立即释放。
                 entry.lines = None;
+                entry.row_ends = Vec::new();
                 continue;
             }
             // 消息列表比布局条目短时跳过：没有内容可画，也不该继续推进光标。
@@ -131,25 +136,27 @@ impl TranscriptLayout {
                 continue;
             }
             let width = entry.width;
-            let lines = entry.lines.get_or_insert_with(|| {
-                message_lines(messages, index, streaming == Some(index), width)
-            });
+            if entry.lines.is_none() {
+                let lines = message_lines(messages, index, streaming == Some(index), width);
+                entry.row_ends = line_row_ends(&lines, width);
+                entry.lines = Some(lines);
+            }
+            let lines = entry.lines.as_ref().expect("可见行已构建");
 
-            // 顶部被裁掉的消息用 Paragraph 自身的滚动跳过整行，底部裁掉的部分由矩形高度截断。
-            let clipped_top = start.max(viewport_top);
+            let clipped_top = start.max(scroll);
             let clipped_bottom = cursor.min(viewport_bottom);
-            let skip = u16::try_from(clipped_top - start).unwrap_or(u16::MAX);
             let target = Rect {
                 x: area.x,
-                y: u16::try_from(clipped_top).unwrap_or(u16::MAX),
+                y: area.y + u16::try_from(clipped_top - scroll).unwrap_or(0),
                 width: area.width,
                 height: u16::try_from(clipped_bottom - clipped_top).unwrap_or(0),
             };
-            frame.render_widget(
-                Paragraph::new(borrowed_lines(lines))
-                    .wrap(Wrap { trim: false })
-                    .scroll((skip, 0)),
+            render_lines_window(
+                lines,
+                &entry.row_ends,
                 target,
+                clipped_top - start,
+                frame.buffer_mut(),
             );
         }
     }
@@ -157,7 +164,7 @@ impl TranscriptLayout {
     /// 把内容行区间 `[top, top + height)` 渲染到一个独立缓冲区，供跨屏选区提取纯文本。
     ///
     /// 选区存在内容坐标里，因此滚出屏幕的历史也要能被复制；这里按内容行号重新排版
-    /// 选中的那几行，坐标与屏幕上的内容行一一对应（缓冲区 `area.y == top`）。
+    /// 选中的那几行；缓冲区始终以零为纵向原点，调用方用 `top` 映射逻辑行号。
     /// 视口外的消息按需重建行、但不写回缓存——缓存的"只保留可见窗口"策略不受影响。
     ///
     /// 助手卡片的底色不铺：提取纯文本只关心字符，多画一层底色没有意义。
@@ -166,19 +173,19 @@ impl TranscriptLayout {
         area: Rect,
         messages: &[Msg],
         streaming: Option<usize>,
-        top: u16,
+        top: usize,
         height: u16,
     ) -> Buffer {
-        let mut buffer = Buffer::empty(Rect::new(area.x, top, area.width, height));
+        let mut buffer = Buffer::empty(Rect::new(area.x, 0, area.width, height));
         if area.width == 0 || height == 0 {
             return buffer;
         }
-        let range_top = i32::from(top);
-        let range_bottom = range_top.saturating_add(i32::from(height));
-        let mut cursor = 0i32;
+        let range_top = top;
+        let range_bottom = top.saturating_add(usize::from(height));
+        let mut cursor = 0usize;
 
         for (index, entry) in self.entries.iter().enumerate() {
-            let entry_height = i32::from(entry.height);
+            let entry_height = entry.height;
             let start = cursor;
             cursor = cursor.saturating_add(entry_height);
             if entry_height == 0 || cursor <= range_top || start >= range_bottom {
@@ -199,28 +206,31 @@ impl TranscriptLayout {
             };
             let clipped_top = start.max(range_top);
             let clipped_bottom = cursor.min(range_bottom);
-            let skip = u16::try_from(clipped_top.saturating_sub(start)).unwrap_or(u16::MAX);
             let target = Rect {
                 x: area.x,
-                y: u16::try_from(clipped_top).unwrap_or(u16::MAX),
+                y: u16::try_from(clipped_top - top).unwrap_or(0),
                 width: area.width,
                 height: u16::try_from(clipped_bottom.saturating_sub(clipped_top)).unwrap_or(0),
             };
             if target.height == 0 {
                 continue;
             }
-            Paragraph::new(borrowed_lines(lines))
-                .wrap(Wrap { trim: false })
-                .scroll((skip, 0))
-                .render(target, &mut buffer);
+            let measured;
+            let row_ends = if entry.lines.is_some() {
+                &entry.row_ends
+            } else {
+                measured = line_row_ends(lines, width);
+                &measured
+            };
+            render_lines_window(lines, row_ends, target, clipped_top - start, &mut buffer);
         }
         buffer
     }
 
     /// 返回可点击工具消息的 `(消息索引, 起始行, 高度)`；起始行相对全部消息顶部。
-    pub(crate) fn tool_rows(&self) -> Vec<(usize, u16, u16)> {
+    pub(crate) fn tool_rows(&self) -> Vec<(usize, usize, usize)> {
         let mut rows = Vec::new();
-        let mut start = 0u16;
+        let mut start = 0usize;
         for (index, entry) in self.entries.iter().enumerate() {
             if entry.expandable && entry.height > 0 {
                 rows.push((index, start, entry.height));
@@ -242,23 +252,100 @@ fn message_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let message = &messages[index];
-    let mut lines = to_owned_lines(message.to_lines(streaming, width));
+    // 极端单逻辑行也需先变成有界视觉行，Paragraph 自身的 scroll 只有 u16。
+    let mut lines = normalize_long_lines(to_owned_lines(message.to_lines(streaming, width)), width);
     if message.is_tool() {
         lines.push(Line::default());
     }
     lines
 }
 
-/// 计算整条消息换行后的视觉行数。
-///
-/// 整条消息只构造一个 `Paragraph`，避免逐行调用 `line_count` 的重复开销。
-fn measure(lines: &[Line<'static>], width: u16) -> u16 {
-    u16::try_from(
-        Paragraph::new(borrowed_lines(lines))
+/// 只有超过 Paragraph 行内偏移范围的极端逻辑行才按字素硬折行；普通换行语义不变。
+/// 使用 Ratatui 自身的字素迭代，保留宽字符、组合音标和 ZWJ 序列。
+fn normalize_long_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let mut result = Vec::new();
+    for line in lines {
+        if line
+            .spans
+            .iter()
+            .map(|span| span.content.len())
+            .sum::<usize>()
+            <= usize::from(u16::MAX)
+        {
+            result.push(line);
+            continue;
+        }
+        let height = Paragraph::new(borrowed_lines(std::slice::from_ref(&line)))
             .wrap(Wrap { trim: false })
-            .line_count(width),
-    )
-    .unwrap_or(u16::MAX)
+            .line_count(width);
+        if height <= usize::from(u16::MAX) {
+            result.push(line);
+            continue;
+        }
+        let mut row = Vec::new();
+        let mut columns = 0;
+        for grapheme in line.styled_graphemes(Style::default()) {
+            let cells = unicode_width::UnicodeWidthStr::width(grapheme.symbol);
+            if columns + cells > usize::from(width) && !row.is_empty() {
+                result.push(Line {
+                    spans: std::mem::take(&mut row),
+                    style: line.style,
+                    alignment: line.alignment,
+                });
+                columns = 0;
+            }
+            row.push(Span::styled(grapheme.symbol.to_owned(), grapheme.style));
+            columns += cells;
+        }
+        if !row.is_empty() {
+            result.push(Line {
+                spans: row,
+                style: line.style,
+                alignment: line.alignment,
+            });
+        }
+    }
+    result
+}
+
+/// 缓存每条逻辑行的视觉终点；只在内容或宽度变化时测量。
+fn line_row_ends(lines: &[Line<'_>], width: u16) -> Vec<usize> {
+    let mut total = 0usize;
+    lines
+        .iter()
+        .map(|line| {
+            total = total.saturating_add(
+                Paragraph::new(borrowed_lines(std::slice::from_ref(line)))
+                    .wrap(Wrap { trim: false })
+                    .line_count(width),
+            );
+            total
+        })
+        .collect()
+}
+
+/// 二分跳过离屏逻辑行，再让 Paragraph 只排可见段，行内偏移已由正规化保证可表达。
+fn render_lines_window(
+    lines: &[Line<'_>],
+    row_ends: &[usize],
+    target: Rect,
+    skip: usize,
+    buffer: &mut Buffer,
+) {
+    let first = row_ends.partition_point(|end| *end <= skip);
+    if first == lines.len() {
+        return;
+    }
+    let end_row = skip.saturating_add(usize::from(target.height));
+    let end = (row_ends.partition_point(|end| *end < end_row) + 1).min(lines.len());
+    let previous = first.checked_sub(1).map_or(0, |index| row_ends[index]);
+    Paragraph::new(borrowed_lines(&lines[first..end]))
+        .wrap(Wrap { trim: false })
+        .scroll((
+            u16::try_from(skip - previous).expect("超长逻辑行已正规化"),
+            0,
+        ))
+        .render(target, buffer);
 }
 
 /// 为 Paragraph 分配行描述但借用正文，保留样式/对齐，不跨帧保存借用。
@@ -385,7 +472,12 @@ mod tests {
     }
 
     /// 渲染一帧，返回布局在该帧保留的可见消息数量。
-    fn render(layout: &mut TranscriptLayout, messages: &[Msg], height: u16, scroll: u16) -> usize {
+    fn render(
+        layout: &mut TranscriptLayout,
+        messages: &[Msg],
+        height: u16,
+        scroll: usize,
+    ) -> usize {
         let mut terminal = Terminal::new(TestBackend::new(40, height)).expect("创建布局测试终端");
         terminal
             .draw(|frame| {
@@ -437,6 +529,43 @@ mod tests {
         messages[0].text.replace_range(..1, "M");
         layout.sync(&messages, None, 40);
         assert_ne!(layout.entries[0].fingerprint, previous);
+    }
+
+    /// 单条超长消息及跨消息历史都能到达 65535 行之后，离屏页使用局部原点。
+    #[test]
+    fn long_timeline_renders_tail_without_saturating() {
+        let body = (0..70_010)
+            .map(|index| format!("row-{index}\n"))
+            .collect::<String>();
+        let messages = vec![
+            Msg::new(MsgKind::User, body),
+            Msg::new(MsgKind::Info, "FINAL-MARKER"),
+        ];
+        let mut layout = TranscriptLayout::default();
+        let total = layout.sync(&messages, None, 40);
+        assert!(total > 70_010);
+        let page = layout.render_range(Rect::new(0, 0, 40, 8), &messages, None, total - 8, 8);
+        assert_eq!(page.area.y, 0);
+        let text = page
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("FINAL-MARKER"), "{text}");
+        assert!(text.contains("row-70009"));
+        render(&mut layout, &messages, 8, total - 8);
+    }
+
+    /// 极长单行超过 Paragraph 的行内滚动范围时仍能显示最后的标记。
+    #[test]
+    fn huge_single_line_keeps_tail_reachable() {
+        let text = format!("{}Z", "x".repeat(70_000));
+        let lines = normalize_long_lines(vec![Line::from(text)], 1);
+        let ends = line_row_ends(&lines, 1);
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buffer = Buffer::empty(area);
+        render_lines_window(&lines, &ends, area, 70_000, &mut buffer);
+        assert_eq!(buffer[(0, 0)].symbol(), "Z");
     }
 
     /// 视口之外的消息只保留高度，渲染结果随滚动释放，内存不随对话增长。

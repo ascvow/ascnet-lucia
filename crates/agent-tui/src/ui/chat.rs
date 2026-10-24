@@ -654,19 +654,19 @@ pub(crate) struct TranscriptPane<'a> {
     /// 消息布局缓存。
     pub(crate) layout: &'a mut TranscriptLayout,
     /// 手动滚动偏移；`None` 表示贴底跟随。
-    pub(crate) scroll: &'a mut Option<u16>,
+    pub(crate) scroll: &'a mut Option<usize>,
     /// 本帧可点击的工具消息热区。
     pub(crate) hit_regions: &'a mut Vec<ToolMessageHitRegion>,
     /// 本帧最大滚动偏移。
-    pub(crate) last_max_scroll: &'a mut u16,
+    pub(crate) last_max_scroll: &'a mut usize,
     /// 本帧消息区高度。
     pub(crate) last_viewport: &'a mut u16,
     /// 消息区屏幕矩形，供鼠标选区与滚轮换算。
     pub(crate) content_area: &'a mut Option<Rect>,
     /// 本帧实际滚动偏移。
-    pub(crate) content_scroll: &'a mut u16,
+    pub(crate) content_scroll: &'a mut usize,
     /// 逻辑总行数。
-    pub(crate) content_rows: &'a mut u16,
+    pub(crate) content_rows: &'a mut usize,
     /// 滚动条热区。
     pub(crate) scrollbar_area: &'a mut Option<Rect>,
     /// 滚动条是否悬停。
@@ -678,12 +678,12 @@ pub(crate) struct TranscriptPane<'a> {
 /// 一帧时间线渲染后的可见结果。
 pub(crate) struct TranscriptViewport {
     /// 正文下方还有多少行没有显示；已在底部时为 `None`。
-    pub(crate) below: Option<u16>,
+    pub(crate) below: Option<usize>,
 }
 
 /// 绘制可见时间线、滚动条与工具热区，返回本帧的滚动几何。
 ///
-/// 只有与视口相交的消息会被构建成行，因此对话再长，每帧成本也只与视口高度相关。
+/// 绘制只处理与视口相交的消息；内容校验仍遍历消息，宽度变化时重新测量。
 pub(crate) fn render_transcript_pane(
     frame: &mut Frame,
     chat_area: Rect,
@@ -695,7 +695,7 @@ pub(crate) fn render_transcript_pane(
     let inner_width = chat_area.width.max(1);
     let total_height = pane.layout.sync(pane.messages, pane.streaming, inner_width);
     let viewport = chat_area.height;
-    let max_scroll = total_height.saturating_sub(viewport);
+    let max_scroll = total_height.saturating_sub(usize::from(viewport));
     *pane.last_max_scroll = max_scroll;
     *pane.last_viewport = viewport;
     // 手动滚动位置到达底部后恢复自动跟随。
@@ -721,7 +721,7 @@ pub(crate) fn render_transcript_pane(
     );
 
     if pane.record_hit_regions && !chat_area.is_empty() {
-        let viewport_end = scroll.saturating_add(viewport);
+        let viewport_end = scroll.saturating_add(usize::from(viewport));
         *pane.hit_regions = pane
             .layout
             .tool_rows()
@@ -734,9 +734,11 @@ pub(crate) fn render_transcript_pane(
                     message_index,
                     area: Rect {
                         x: chat_area.x,
-                        y: chat_area.y + visible_start.saturating_sub(scroll),
+                        y: chat_area.y
+                            + u16::try_from(visible_start.saturating_sub(scroll)).unwrap_or(0),
                         width: chat_area.width,
-                        height: visible_end.saturating_sub(visible_start),
+                        height: u16::try_from(visible_end.saturating_sub(visible_start))
+                            .unwrap_or(0),
                     },
                 })
             })
@@ -775,7 +777,7 @@ pub(super) fn prompt_status_row(section: Rect, padded: Rect) -> Option<Rect> {
 /// 再重画：上一帧的状态和提示都可能比这一帧长，靠覆盖写无法保证不残留。
 ///
 /// `below` 是正文下方还有多少行没有显示；`None` 表示已在底部，右侧留空。
-fn render_prompt_status_row(frame: &mut Frame, app: &mut App, area: Rect, below: Option<u16>) {
+fn render_prompt_status_row(frame: &mut Frame, app: &mut App, area: Rect, below: Option<usize>) {
     render_session_status_row(
         frame,
         area,
@@ -790,7 +792,7 @@ pub(super) fn render_session_status_row(
     frame: &mut Frame,
     area: Rect,
     activity: Option<(String, Color)>,
-    below: Option<u16>,
+    below: Option<usize>,
     jump_hint_area: &mut Option<Rect>,
 ) {
     *jump_hint_area = None;
@@ -857,7 +859,7 @@ pub(super) fn render_session_status_row(
 /// 全都放不下时返回 `None`：此时保留状态，不把提示压成看不懂的碎片。
 ///
 /// `below` 是正文下方隐藏的行数，`width` 是状态行总宽度。
-fn jump_hint_spans(below: u16, width: u16, reserved: u16) -> Option<(Vec<(String, Style)>, u16)> {
+fn jump_hint_spans(below: usize, width: u16, reserved: u16) -> Option<(Vec<(String, Style)>, u16)> {
     // 行数与可视操作分成两种颜色：行数属元信息，`click to jump` 才是交互重点。
     let dim = Style::new().fg(COLOR_META);
     let hot = Style::new().fg(COLOR_WARNING).bold();
@@ -903,14 +905,14 @@ fn jump_hint_spans(below: u16, width: u16, reserved: u16) -> Option<(Vec<(String
 fn render_scrollbar(
     frame: &mut Frame,
     chat_area: Rect,
-    total_height: u16,
+    total_height: usize,
     viewport: u16,
-    scroll: u16,
+    scroll: usize,
     scrollbar_area: &mut Option<Rect>,
     is_scrollbar_hovered: &mut bool,
 ) {
     // 内容不足一屏时没有滚动条；正文宽度为零时同样不画，避免竖条飘在空白里。
-    if chat_area.width == 0 || chat_area.height < 3 || total_height <= viewport {
+    if chat_area.width == 0 || chat_area.height < 3 || total_height <= usize::from(viewport) {
         *is_scrollbar_hovered = false;
         return;
     }
@@ -1020,29 +1022,29 @@ impl ScrollbarThumb {
 /// `scroll == max_scroll` 时贴底，中间任何一点都能看出移动。
 pub(crate) fn scrollbar_thumb(
     track: u16,
-    total_height: u16,
+    total_height: usize,
     viewport: u16,
-    scroll: u16,
+    scroll: usize,
 ) -> ScrollbarThumb {
-    // 比例用 u32 中间量：u16 下 `track * viewport` 在长对话里会溢出。
-    let track_half = u32::from(track).saturating_mul(2);
+    // 使用 u128 中间比例，逻辑总行数不受终端坐标范围约束。
+    let track_half = u128::from(track).saturating_mul(2);
     let scaled = track_half
-        .saturating_mul(u32::from(viewport))
-        .checked_div(u32::from(total_height))
+        .saturating_mul(u128::from(viewport))
+        .checked_div(total_height as u128)
         .unwrap_or(0);
     let height_half = scaled
-        .max(u32::from(SCROLLBAR_MIN_THUMB).saturating_mul(2))
+        .max(u128::from(SCROLLBAR_MIN_THUMB).saturating_mul(2))
         .min(track_half);
     let span_half = track_half.saturating_sub(height_half);
-    let max_scroll = total_height.saturating_sub(viewport);
+    let max_scroll = total_height.saturating_sub(usize::from(viewport));
     let top_half = if span_half == 0 || max_scroll == 0 {
         // 滑块占满轨道（或内容刚好一屏）时没有可动空间，贴顶即可。
         0
     } else {
-        let moved = u32::from(scroll.min(max_scroll))
+        let moved = (scroll.min(max_scroll) as u128)
             .saturating_mul(span_half)
-            .saturating_add(u32::from(max_scroll) / 2)
-            / u32::from(max_scroll);
+            .saturating_add((max_scroll as u128) / 2)
+            / (max_scroll as u128);
         moved.min(span_half)
     };
     ScrollbarThumb {
@@ -1573,6 +1575,17 @@ mod hero_portrait_tests {
 mod scrollbar_geometry_tests {
     use super::*;
 
+    /// 逻辑总量超过 u16 甚至接近 usize 上限时，滑块首尾仍精确对应轨道。
+    #[test]
+    fn large_timeline_scrollbar_does_not_overflow() {
+        for total in [100_000usize, usize::MAX - 100] {
+            let top = scrollbar_thumb(40, total, 40, 0);
+            let bottom = scrollbar_thumb(40, total, 40, total - 40);
+            assert_eq!(top.top_half, 0);
+            assert_eq!(bottom.top_half + bottom.height_half, 80);
+        }
+    }
+
     /// 一次滚轮（3 行）在长对话里只推进半行：位置不再攒够一整行才跳。
     #[test]
     fn thumb_moves_in_half_rows() {
@@ -1590,7 +1603,7 @@ mod scrollbar_geometry_tests {
     #[test]
     fn half_rows_double_the_usable_positions() {
         let (track, viewport, total) = (34, 34, 400);
-        let max_scroll = total - viewport;
+        let max_scroll = total - usize::from(viewport);
         let mut positions = Vec::new();
         for scroll in 0..=max_scroll {
             let top = scrollbar_thumb(track, total, viewport, scroll).top_half;
@@ -1611,7 +1624,7 @@ mod scrollbar_geometry_tests {
     #[test]
     fn thumb_stays_inside_track() {
         let (track, viewport, total) = (34, 34, 400);
-        let max_scroll = total - viewport;
+        let max_scroll = total - usize::from(viewport);
         for scroll in [0, 1, max_scroll / 2, max_scroll - 1, max_scroll] {
             let thumb = scrollbar_thumb(track, total, viewport, scroll);
             assert!(thumb.top_half + thumb.height_half <= track * 2);

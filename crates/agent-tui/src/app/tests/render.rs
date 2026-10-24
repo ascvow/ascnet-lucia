@@ -2313,7 +2313,7 @@ fn drag_past_bottom_edge_autoscrolls_and_extends_selection() {
         "拖动越过下边界后视口应向前滚动"
     );
     assert!(
-        selection.current.y >= area.height,
+        selection.current.y >= usize::from(area.height),
         "选区终点应扩展到首屏之外：{:?}（视口高 {}）",
         selection.current,
         area.height

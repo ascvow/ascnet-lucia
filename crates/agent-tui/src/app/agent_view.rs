@@ -50,21 +50,21 @@ pub(crate) struct AgentSessionView {
     pub(crate) input: String,
     pub(crate) cursor: usize,
     /// 手动滚动偏移；`None` 表示贴底跟随。
-    pub(crate) scroll: Option<u16>,
+    pub(crate) scroll: Option<usize>,
     /// 可见窗口的消息布局缓存。
     pub(crate) layout: TranscriptLayout,
     /// 最近一帧可点击的工具消息热区。
     pub(crate) hit_regions: Vec<ToolMessageHitRegion>,
     /// 最近一帧的最大滚动偏移。
-    pub(crate) last_max_scroll: u16,
+    pub(crate) last_max_scroll: usize,
     /// 最近一帧的消息区高度。
     pub(crate) last_viewport: u16,
     /// 正文区在屏幕上的矩形，供滚轮与工具点击换算。
     pub(crate) content_area: Option<Rect>,
     /// 本帧实际滚动偏移。
-    pub(crate) content_scroll: u16,
+    pub(crate) content_scroll: usize,
     /// 逻辑总行数。
-    pub(crate) content_rows: u16,
+    pub(crate) content_rows: usize,
     /// 滚动条热区。
     pub(crate) scrollbar_area: Option<Rect>,
     /// 滚动条是否悬停。

@@ -230,9 +230,9 @@ pub(crate) struct App {
     #[cfg(feature = "plugins")]
     pub(crate) main_event_snapshot: Option<MainEventSnapshot>,
     /// 手动滚动偏移；None 表示跟随底部自动滚动。
-    pub(crate) scroll: Option<u16>,
+    pub(crate) scroll: Option<usize>,
     /// 上一帧计算出的最大滚动偏移，供滚动操作作为起点。
-    pub(crate) last_max_scroll: u16,
+    pub(crate) last_max_scroll: usize,
     /// 最近一次渲染得到的消息区高度，用于整页滚动。
     pub(crate) last_viewport: u16,
     /// 是否处于按键诊断模式；开启后按键只回显不执行，`Esc` 退出。
@@ -315,9 +315,9 @@ pub(crate) struct App {
     /// 由 `ui::chat` 在每帧布局后写入；`None` 表示本帧没有可选择的正文区域。
     pub(crate) content_area: Option<Rect>,
     /// 上一帧消息区实际使用的滚动偏移（内容行），换算选区行号时使用。
-    pub(crate) content_scroll: u16,
+    pub(crate) content_scroll: usize,
     /// 消息内容的逻辑总行数；滚出屏幕的历史同样在可选范围内。
-    pub(crate) content_rows: u16,
+    pub(crate) content_rows: usize,
     /// 插件声明的视图及宿主缓存的最近一帧。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_views: Vec<PluginViewState>,
@@ -385,6 +385,21 @@ pub(crate) struct PluginViewState {
     pub(crate) area: Rect,
 }
 
+/// 内容行与屏幕列分离；逻辑行号可超过终端的 65535 行范围。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ContentPosition {
+    x: u16,
+    y: usize,
+}
+impl From<Position> for ContentPosition {
+    fn from(position: Position) -> Self {
+        Self {
+            x: position.x,
+            y: usize::from(position.y),
+        }
+    }
+}
+
 /// 应用内鼠标文本选择的**内容坐标**范围。
 ///
 /// `y` 不是终端屏幕行，而是整段消息内容的逻辑行号（0 为内容顶部）：滚轮滚动只改变
@@ -392,16 +407,17 @@ pub(crate) struct PluginViewState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MouseTextSelection {
     /// 拖动起点，对应内容坐标。
-    anchor: Position,
+    anchor: ContentPosition,
     /// 最近一次拖动或释放位置。
-    current: Position,
+    current: ContentPosition,
     /// 是否已经离开起点；普通点击不会触发复制或高亮。
     dragged: bool,
 }
 
 impl MouseTextSelection {
     /// 从鼠标按下位置创建尚未发生拖动的选择。
-    pub(crate) fn new(anchor: Position) -> Self {
+    pub(crate) fn new(anchor: impl Into<ContentPosition>) -> Self {
+        let anchor = anchor.into();
         Self {
             anchor,
             current: anchor,
@@ -410,13 +426,14 @@ impl MouseTextSelection {
     }
 
     /// 更新选择终点，并记录是否形成了非空拖动范围。
-    pub(crate) fn update(&mut self, current: Position) {
+    pub(crate) fn update(&mut self, current: impl Into<ContentPosition>) {
+        let current = current.into();
         self.current = current;
         self.dragged |= current != self.anchor;
     }
 
     /// 选区覆盖的内容行范围（已排序，含端点）。
-    pub(crate) fn row_span(self) -> (u16, u16) {
+    pub(crate) fn row_span(self) -> (usize, usize) {
         let (start, end) = if (self.anchor.y, self.anchor.x) <= (self.current.y, self.current.x) {
             (self.anchor, self.current)
         } else {
@@ -425,37 +442,33 @@ impl MouseTextSelection {
         (start.y, end.y)
     }
 
-    /// 按终端线性选择顺序遍历范围内坐标，越界端点会收窄到缓冲区。
-    fn for_each_position(self, area: Rect, mut visit: impl FnMut(Position)) {
+    /// 只遍历当前缓冲区窗口；`top` 指定它的首行对应的逻辑内容行。
+    fn for_each_position(self, area: Rect, top: usize, mut visit: impl FnMut(Position)) {
         if area.is_empty() {
             return;
         }
-        let clamp = |position: Position| {
-            Position::new(
-                position
-                    .x
-                    .clamp(area.left(), area.right().saturating_sub(1)),
-                position
-                    .y
-                    .clamp(area.top(), area.bottom().saturating_sub(1)),
-            )
-        };
-        let anchor = clamp(self.anchor);
-        let current = clamp(self.current);
-        let (start, end) = if (anchor.y, anchor.x) <= (current.y, current.x) {
-            (anchor, current)
+        let (start, end) = if (self.anchor.y, self.anchor.x) <= (self.current.y, self.current.x) {
+            (self.anchor, self.current)
         } else {
-            (current, anchor)
+            (self.current, self.anchor)
         };
-        for y in start.y..=end.y {
-            let first = if y == start.y { start.x } else { area.left() };
-            let last = if y == end.y {
-                end.x
+        let bottom = top.saturating_add(usize::from(area.height));
+        for row in start.y.max(top)..end.y.saturating_add(1).min(bottom) {
+            let first = if row == start.y {
+                start.x.clamp(area.left(), area.right() - 1)
             } else {
-                area.right().saturating_sub(1)
+                area.left()
+            };
+            let last = if row == end.y {
+                end.x.clamp(area.left(), area.right() - 1)
+            } else {
+                area.right() - 1
             };
             for x in first..=last {
-                visit(Position::new(x, y));
+                visit(Position::new(
+                    x,
+                    area.y + u16::try_from(row - top).unwrap_or(0),
+                ));
             }
         }
     }
@@ -464,11 +477,16 @@ impl MouseTextSelection {
     ///
     /// 中文等宽字符的后续占位单元格不会重复写入返回值；越界端点按缓冲区范围收窄。
     pub(crate) fn extract(self, buffer: &Buffer) -> String {
+        self.extract_window(buffer, usize::from(buffer.area.y), true)
+    }
+
+    /// 局部缓冲与逻辑坐标分离；分页提取时保留中间空行，最后一页才裁掉尾部空白行。
+    fn extract_window(self, buffer: &Buffer, top: usize, trim_trailing: bool) -> String {
         let mut rows = Vec::<String>::new();
         let mut row = String::new();
         let mut previous_y = None;
         let mut trailing_columns = 0usize;
-        self.for_each_position(buffer.area, |position| {
+        self.for_each_position(buffer.area, top, |position| {
             if previous_y.is_some_and(|y| y != position.y) {
                 rows.push(row.trim_end().to_string());
                 row.clear();
@@ -488,7 +506,7 @@ impl MouseTextSelection {
         if previous_y.is_some() {
             rows.push(row.trim_end().to_string());
         }
-        while rows.last().is_some_and(String::is_empty) {
+        while trim_trailing && rows.last().is_some_and(String::is_empty) {
             rows.pop();
         }
         rows.join("\n")

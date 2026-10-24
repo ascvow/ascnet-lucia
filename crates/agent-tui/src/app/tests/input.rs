@@ -1582,9 +1582,51 @@ fn mouse_release_preserves_selection_in_content_coordinates() {
     let selection = app.text_selection.expect("释放后应保留拖选高亮");
     assert!(selection.dragged);
     // 屏幕第 2 行 - 内容区顶部第 1 行 + 滚动 5 行 = 内容第 6 行。
-    assert_eq!(selection.anchor, Position::new(1, 6));
-    assert_eq!(selection.current, Position::new(4, 6));
+    assert_eq!(selection.anchor, Position::new(1, 6).into());
+    assert_eq!(selection.current, Position::new(4, 6).into());
     assert_eq!(selection.row_span(), (6, 6));
+}
+
+/// 65535 行后的选区按逻辑坐标提取，高亮只遍历当前视口。
+#[test]
+fn selection_beyond_terminal_coordinate_limit() {
+    use crate::app::ContentPosition;
+    use crossterm::event::MouseButton;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "test".into());
+    let body = (0..70_000)
+        .map(|index| format!("row-{index}\n"))
+        .collect::<String>();
+    app.messages.push(Msg::new(MsgKind::User, body));
+    let total = app.transcript_layout.sync(&app.messages, None, 40);
+    app.content_rows = total;
+    app.content_area = Some(Rect::new(0, 2, 40, 10));
+    app.content_scroll = 69_990;
+    let mut selection = MouseTextSelection::new(ContentPosition { x: 2, y: 69_990 });
+    selection.update(ContentPosition { x: 12, y: 69_992 });
+    let empty = Buffer::empty(Rect::new(0, 0, 40, 14));
+    app.text_selection = Some(selection);
+    app.scroll = Some(69_990);
+    app.handle_text_selection(
+        &MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+        &empty,
+    );
+    let text = app
+        .text_selection_content
+        .as_deref()
+        .expect("必须捕获跨范围选区");
+    assert!(text.contains("row-69990"), "{text}");
+    assert!(text.contains("row-69992"), "{text}");
+    app.text_selection = Some(selection);
+    let mut frame = empty;
+    app.render_text_selection(&mut frame);
+    assert!(frame[(2, 2)].modifier.contains(Modifier::REVERSED));
+    assert!(!frame[(2, 8)].modifier.contains(Modifier::REVERSED));
 }
 
 /// 显式复制使用的选区文本必须保留换行和中文宽字符，并移除行尾布局空白。

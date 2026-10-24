@@ -177,7 +177,7 @@ fn render_status_row(
     area: Rect,
     view: &mut AgentSessionView,
     spinner_frame: usize,
-    below: Option<u16>,
+    below: Option<usize>,
 ) {
     let (mut label, color) = status_label(view);
     if !view.closed

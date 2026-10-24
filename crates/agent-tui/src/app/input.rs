@@ -1,7 +1,9 @@
 //! 主输入区的按键编辑、附件引用、滚动与文本选择。
 
 use super::App;
-use crate::app::{is_command_modifier, MouseTextSelection, ESC_DOUBLE_PRESS_WINDOW};
+use crate::app::{
+    is_command_modifier, ContentPosition, MouseTextSelection, ESC_DOUBLE_PRESS_WINDOW,
+};
 use crate::session::attachment::{
     attachment_media_type, attachment_modality, clipboard_files, copy_to_clipboard,
     is_clipboard_file_names, looks_like_single_pasted_path, may_be_clipboard_file_names,
@@ -118,7 +120,7 @@ impl App {
 
         match code {
             KeyCode::Home if is_command_modifier(modifiers) => {
-                self.scroll_up(u16::MAX);
+                self.scroll = Some(0);
             }
             KeyCode::End if is_command_modifier(modifiers) => {
                 self.scroll = None;
@@ -1123,21 +1125,25 @@ impl App {
     ///
     /// 滚动偏移取**当前**值而不是上一帧渲染时记下的 `content_scroll`：拖动自动滚动会
     /// 在两次绘制之间改变偏移，用旧值会让选区永远落后一步、拖不出屏幕。
-    fn content_position(&self, area: Rect, mouse: &MouseEvent) -> Position {
+    fn content_position(&self, area: Rect, mouse: &MouseEvent) -> ContentPosition {
         let column = mouse
             .column
             .clamp(area.left(), area.right().saturating_sub(1));
-        let scroll = i32::from(self.scroll.unwrap_or(self.last_max_scroll));
-        let row = i32::from(mouse.row) - i32::from(area.y) + scroll;
-        // 首屏没有消息内容（`content_rows == 0`）：此时可选范围就是消息区本身，
-        // 按内容行数夹取会把整块区域压成一行。
-        let last_row = if self.content_rows == 0 {
-            i32::from(area.height.saturating_sub(1))
+        let scroll = self.scroll.unwrap_or(self.last_max_scroll);
+        let row = if mouse.row >= area.y {
+            scroll.saturating_add(usize::from(mouse.row - area.y))
         } else {
-            i32::from(self.content_rows.saturating_sub(1))
+            scroll.saturating_sub(usize::from(area.y - mouse.row))
         };
-        let row = row.clamp(0, last_row.max(0));
-        Position::new(column, u16::try_from(row).unwrap_or(0))
+        let rows = if self.content_rows == 0 {
+            usize::from(area.height)
+        } else {
+            self.content_rows
+        };
+        ContentPosition {
+            x: column,
+            y: row.min(rows.saturating_sub(1)),
+        }
     }
 
     /// 拖动越过内容区上下边界时滚动视图，让选区可以延伸到一屏之外。
@@ -1163,16 +1169,16 @@ impl App {
     /// 历史同样能被复制。
     fn extract_selection_text(&mut self, selection: MouseTextSelection, buffer: &Buffer) -> String {
         if self.content_rows == 0 {
-            let offset = self.content_area.map_or(0, |area| area.y);
+            let offset = usize::from(self.content_area.map_or(0, |area| area.y));
             let translated = MouseTextSelection {
-                anchor: Position::new(
-                    selection.anchor.x,
-                    selection.anchor.y.saturating_add(offset),
-                ),
-                current: Position::new(
-                    selection.current.x,
-                    selection.current.y.saturating_add(offset),
-                ),
+                anchor: ContentPosition {
+                    x: selection.anchor.x,
+                    y: selection.anchor.y.saturating_add(offset),
+                },
+                current: ContentPosition {
+                    x: selection.current.x,
+                    y: selection.current.y.saturating_add(offset),
+                },
                 dragged: selection.dragged,
             };
             return translated.extract(buffer);
@@ -1192,10 +1198,21 @@ impl App {
             &self.messages,
             self.streaming_message,
         );
-        let rendered = self
-            .transcript_layout
-            .render_range(area, messages, streaming, start, height);
-        selection.extract(&rendered)
+        // 离屏页固定局部原点，按 128 行提取，避免按整段逻辑高度分配终端 Buffer。
+        let mut text = String::new();
+        let mut top = start;
+        while top <= end {
+            let rows = (end - top + 1).min(128) as u16;
+            let rendered = self
+                .transcript_layout
+                .render_range(area, messages, streaming, top, rows);
+            if top != start {
+                text.push('\n');
+            }
+            text.push_str(&selection.extract_window(&rendered, top, false));
+            top = top.saturating_add(usize::from(rows));
+        }
+        text.trim_end_matches('\n').to_string()
     }
 
     /// 处理工具消息的左键点击，并在未发生文本拖选时切换详情展开状态。
@@ -1296,18 +1313,9 @@ impl App {
         if area.is_empty() {
             return;
         }
-        // 内容行 0 对应屏幕上的 area.y - content_scroll：滚动越大，内容越靠上。
-        let content_bounds = Rect::new(area.x, 0, area.width, self.content_rows.max(area.height));
-        let scroll = i32::from(self.content_scroll);
-        selection.for_each_position(content_bounds, |position| {
-            let screen_y = i32::from(position.y) - scroll + i32::from(area.y);
-            let Ok(screen_y) = u16::try_from(screen_y) else {
-                return;
-            };
-            if screen_y < area.top() || screen_y >= area.bottom() {
-                return;
-            }
-            if let Some(cell) = buffer.cell_mut(Position::new(position.x, screen_y)) {
+        // 只遍历可见窗口，选择再长也不会逐帧扫描整段离屏内容。
+        selection.for_each_position(area, self.content_scroll, |position| {
+            if let Some(cell) = buffer.cell_mut(position) {
                 cell.modifier.insert(Modifier::REVERSED);
             }
         });
@@ -1418,12 +1426,16 @@ pub(super) enum ScrollAction {
 }
 
 /// 应用共享的滚动语义；`None` 表示自动跟随底部。
-pub(super) fn scroll_transcript(scroll: &mut Option<u16>, max_scroll: u16, action: ScrollAction) {
+pub(super) fn scroll_transcript(
+    scroll: &mut Option<usize>,
+    max_scroll: usize,
+    action: ScrollAction,
+) {
     let current = scroll.unwrap_or(max_scroll).min(max_scroll);
     match action {
-        ScrollAction::Up(lines) => *scroll = Some(current.saturating_sub(lines)),
+        ScrollAction::Up(lines) => *scroll = Some(current.saturating_sub(usize::from(lines))),
         ScrollAction::Down(lines) => {
-            let next = current.saturating_add(lines);
+            let next = current.saturating_add(usize::from(lines));
             *scroll = (next < max_scroll).then_some(next);
         }
     }
@@ -1432,9 +1444,9 @@ pub(super) fn scroll_transcript(scroll: &mut Option<u16>, max_scroll: u16, actio
 /// 借用当前会话自己的几何与拖拽状态；只共享算法，不交换主/子会话数据。
 pub(super) struct TranscriptScroll<'a> {
     /// 当前偏移，`None` 表示跟随底部。
-    pub(super) scroll: &'a mut Option<u16>,
+    pub(super) scroll: &'a mut Option<usize>,
     /// 最近绘制帧发布的最大偏移。
-    pub(super) max_scroll: u16,
+    pub(super) max_scroll: usize,
     /// 最近绘制帧的正文高度。
     pub(super) viewport: u16,
     /// 与显示一致的单列轨道热区。
@@ -1488,8 +1500,8 @@ impl TranscriptScroll<'_> {
     fn geometry(&self) -> Option<(Rect, ScrollbarThumb)> {
         let area = self.area?;
         let viewport = self.viewport.max(1);
-        let total = self.max_scroll.saturating_add(viewport);
-        if area.is_empty() || total <= viewport {
+        let total = self.max_scroll.saturating_add(usize::from(viewport));
+        if area.is_empty() || total <= usize::from(viewport) {
             return None;
         }
         let thumb = scrollbar_thumb(
@@ -1510,8 +1522,9 @@ impl TranscriptScroll<'_> {
             return;
         }
         let top = u32::try_from(top_half.max(0)).unwrap_or(u32::MAX).min(span);
-        let scaled = top.saturating_mul(u32::from(self.max_scroll));
-        let position = u16::try_from((scaled + span / 2) / span).unwrap_or(u16::MAX);
+        let scaled = u128::from(top) * self.max_scroll as u128;
+        let position = usize::try_from((scaled + u128::from(span) / 2) / u128::from(span))
+            .unwrap_or(usize::MAX);
         *self.scroll = (top < span && position < self.max_scroll).then_some(position);
     }
 }
