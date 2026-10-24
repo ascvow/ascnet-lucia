@@ -87,21 +87,43 @@ struct LoadedContext {
     messages: Vec<Value>,
 }
 
-fn encode_core_request(request: CoreContextLoadRequest) -> Result<ContextLoadRequest> {
-    Ok(ContextLoadRequest {
-        run_id: request.run_id,
-        step: request.step,
-        provider: request.provider,
-        model: request.model,
-        system: request.system,
-        messages: request
-            .messages
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<serde_json::Result<Vec<_>>>()
-            .context("编码 Core 上下文消息失败")?,
-        user_initiated: request.user_initiated,
-    })
+fn encode_core_request(
+    request: CoreContextLoadRequest,
+) -> Result<(CoreContextLoadRequest, ContextLoadRequest)> {
+    let CoreContextLoadRequest {
+        run_id,
+        step,
+        provider,
+        model,
+        system,
+        messages,
+        user_initiated,
+    } = request;
+    let encoded = messages
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<serde_json::Result<Vec<_>>>()
+        .context("编码 Core 上下文消息失败")?;
+    Ok((
+        CoreContextLoadRequest {
+            run_id: run_id.clone(),
+            step,
+            provider: provider.clone(),
+            model: model.clone(),
+            system: system.clone(),
+            messages,
+            user_initiated,
+        },
+        ContextLoadRequest {
+            run_id,
+            step,
+            provider,
+            model,
+            system,
+            messages: encoded,
+            user_initiated,
+        },
+    ))
 }
 
 fn decode_core_context(context: LoadedContext) -> Result<CoreLoadedContext> {
@@ -431,6 +453,17 @@ impl CachePlan {
             Self::Automatic { micro_floor, .. } => *micro_floor,
         }
     }
+
+    /// 判断本轮是否仍然使用原始请求消息；缓存命中后的上下文不能直接复用原始值。
+    fn can_reuse_original_messages(&self) -> bool {
+        matches!(
+            self,
+            Self::Automatic {
+                cache_hit: false,
+                ..
+            }
+        )
+    }
 }
 
 #[async_trait]
@@ -439,12 +472,14 @@ impl ContextLoader for NativeContextLoader {
     ///
     /// 手动请求跳过自动水位并清空增量缓存；摘要失败或事件持久化失败时关闭本轮模型请求。
     async fn load(&self, request: CoreContextLoadRequest) -> Result<CoreLoadedContext> {
-        let (effective, plan) = self.prepare_request(encode_core_request(request)?)?;
+        let (original, encoded) = encode_core_request(request)?;
+        let (effective, plan) = self.prepare_request(encoded)?;
         let summary_model = plan.summary_model();
         let budget = compaction_budget(
             summary_model.context_window,
             summary_model.max_summary_tokens as usize,
         );
+        let reuse_original_messages = plan.can_reuse_original_messages();
         let outcome = compress_context(
             effective.clone(),
             effective.user_initiated,
@@ -455,6 +490,12 @@ impl ContextLoader for NativeContextLoader {
         .await?;
         self.commit_cache(plan, &outcome)?;
         self.emit_event(&effective, outcome.event.as_ref()).await?;
+        if reuse_original_messages && outcome.event.is_none() {
+            return Ok(CoreLoadedContext {
+                system: original.system,
+                messages: original.messages,
+            });
+        }
         decode_core_context(outcome.context)
     }
 }
@@ -480,7 +521,8 @@ struct CompactedMessages {
 
 /// 完整摘要前可直接应用的确定性工具结果收缩候选。
 struct MicroCompaction {
-    messages: Vec<Value>,
+    /// 没有任何可改写内容时保持 `None`，避免为原始消息深拷贝一份无变化的 JSON 树。
+    messages: Option<Vec<Value>>,
     cleared_results: usize,
     capped_results: usize,
     clear_target: usize,
@@ -540,9 +582,20 @@ async fn compress_context(
         let clear_target = micro_clear_target(&request.messages, micro_floor, manual);
         let (messages, cleared_results) =
             micro_compact_tool_results(&request.messages, clear_target);
-        let (messages, capped_results) =
-            cap_tool_results(&messages, MAX_RETAINED_TOOL_RESULT_CHARS);
-        let estimated_tokens = estimate_context_tokens(request.system.as_deref(), &messages);
+        let (messages, capped_results) = if let Some(messages) = messages {
+            let (messages, capped_results) =
+                cap_tool_results(&messages, MAX_RETAINED_TOOL_RESULT_CHARS);
+            (Some(messages), capped_results)
+        } else if has_oversized_tool_result(&request.messages, MAX_RETAINED_TOOL_RESULT_CHARS) {
+            let (messages, capped_results) =
+                cap_tool_results(&request.messages, MAX_RETAINED_TOOL_RESULT_CHARS);
+            (Some(messages), capped_results)
+        } else {
+            (None, 0)
+        };
+        let estimated_tokens = messages.as_deref().map_or(before_tokens, |messages| {
+            estimate_context_tokens(request.system.as_deref(), messages)
+        });
         Some(MicroCompaction {
             messages,
             cleared_results,
@@ -618,7 +671,9 @@ async fn compress_context(
             return Ok(CompressionOutcome {
                 context: LoadedContext {
                     system: request.system,
-                    messages: micro.messages,
+                    messages: micro
+                        .messages
+                        .expect("微压缩发生变化时必须保留改写后的消息"),
                 },
                 event: Some(json!({
                     "name": "context.micro_compaction.completed",
@@ -645,7 +700,7 @@ async fn compress_context(
             return Ok(CompressionOutcome {
                 context: LoadedContext {
                     system: request.system,
-                    messages: micro.messages,
+                    messages: micro.messages.unwrap_or(request.messages),
                 },
                 event: None,
                 micro_cleared: micro.clear_target,
@@ -847,10 +902,13 @@ fn micro_clear_target(messages: &[Value], floor: usize, manual: bool) -> usize {
 /// `clear_target` 是从头计数、应处于清空态的成功工具结果条数，由
 /// [`micro_clear_target`] 推导；返回值中的计数只统计本轮新清空的条数，已是占位符的
 /// 结果不重复计入。
-fn micro_compact_tool_results(messages: &[Value], clear_target: usize) -> (Vec<Value>, usize) {
+fn micro_compact_tool_results(
+    messages: &[Value],
+    clear_target: usize,
+) -> (Option<Vec<Value>>, usize) {
     let mut remaining_to_clear = clear_target;
     if remaining_to_clear == 0 {
-        return (messages.to_vec(), 0);
+        return (None, 0);
     }
 
     let mut cleared = 0;
@@ -891,7 +949,30 @@ fn micro_compact_tool_results(messages: &[Value], clear_target: usize) -> (Vec<V
             message
         })
         .collect();
-    (compacted, cleared)
+    (Some(compacted), cleared)
+}
+
+/// 判断是否存在需要截断的工具结果；没有候选时避免复制整段消息树。
+fn has_oversized_tool_result(messages: &[Value], max_chars: usize) -> bool {
+    messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                        return false;
+                    }
+                    let Some(text) = block.pointer("/result/content").and_then(Value::as_str)
+                    else {
+                        return false;
+                    };
+                    text != CLEARED_TOOL_RESULT
+                        && text.len() > max_chars
+                        && text.chars().count() > max_chars
+                })
+            })
+    })
 }
 
 /// 把超长文本折叠为首尾片段，中段替换为省略标记。
@@ -1629,6 +1710,36 @@ mod tests {
             .is_some_and(|tokens| tokens < test_budget().compact as u64));
         assert_eq!(event["data"]["cleared_tool_results"], 3);
         assert_eq!(event["data"]["capped_tool_results"], 3);
+    }
+
+    /// 没有可清理的旧结果时，单条超长结果仍应走截断路径而不是复制原始消息。
+    #[tokio::test]
+    async fn oversized_tool_result_is_capped_without_clearable_results() {
+        let outcome = compress_for_test(
+            ContextLoadRequest {
+                run_id: "cap-only".into(),
+                user_initiated: false,
+                step: 1,
+                provider: "test".into(),
+                model: "test-model".into(),
+                system: None,
+                messages: vec![tool_result_message(
+                    0,
+                    chars_to_exceed(test_budget().micro, 1),
+                )],
+            },
+            false,
+        )
+        .await;
+
+        let event = outcome.event.expect("超长工具结果应发布微压缩事件");
+        assert_eq!(event["name"], "context.micro_compaction.completed");
+        assert_eq!(event["data"]["cleared_tool_results"], 0);
+        assert_eq!(event["data"]["capped_tool_results"], 1);
+        let content = outcome.context.messages[0]["content"][0]["result"]["content"]
+            .as_str()
+            .expect("截断后的工具结果应为文本");
+        assert!(content.chars().count() <= MAX_RETAINED_TOOL_RESULT_CHARS * 2);
     }
 
     /// 水位必须随真实上下文窗口伸缩，而不是按模型名猜测。
