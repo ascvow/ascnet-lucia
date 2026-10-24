@@ -5,7 +5,9 @@ use agent_core::{
     EventBus, ModelGateway, ModelRequest, ModelResponse, ProviderAdapter, RunFinishEvent,
 };
 use agent_plugin_host::{
-    ui::{UiColor, UiInput, UiInputEvent, UiPlacement, UiRenderRequest, UI_NAVIGATION_EVENT},
+    ui::{
+        UiColor, UiFrame, UiInput, UiInputEvent, UiPlacement, UiRenderRequest, UI_NAVIGATION_EVENT,
+    },
     wasm::WasmPluginHost,
     LivePluginHost, PluginHost, PluginHostServices, PluginServiceCall,
 };
@@ -107,6 +109,36 @@ async fn call_tool_error(host: &WasmPluginHost, run: &str, name: &str, args: Val
         result.content
     );
     result.content.to_string()
+}
+
+/// 渲染一次成员架：只变动帧号与聚焦态，其余请求字段在测试里保持一致。
+async fn render_shelf(host: &WasmPluginHost, focused: bool, frame: u64) -> UiFrame {
+    PluginHost::render_ui(
+        host,
+        &UiRenderRequest {
+            session_id: None,
+            plugin_id: "teammate".into(),
+            view_id: "teammate-team-dock".into(),
+            instance_id: None,
+            width: 30,
+            height: 16,
+            focused,
+            frame,
+        },
+    )
+    .await
+    .expect("成员架渲染不应失败")
+    .expect("成员架应返回帧")
+}
+
+/// 把成员架帧的文本拼成一串，便于断言摘要行与成员行。
+fn shelf_text(frame: &UiFrame) -> String {
+    frame
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.text.as_str())
+        .collect()
 }
 
 /// 验证派生、可信发送、邮箱、dispatch 自动确认和续跑句柄更新链路。
@@ -343,6 +375,84 @@ async fn component_runs_mailbox_dispatch_flow() {
         }),
         "{click_events:?}"
     );
+
+    // 折叠/展开不能只有鼠标：空格键等价于点摘要行，方向键也能先把收起的架摊开。
+    PluginHost::on_ui_input(
+        host.as_ref(),
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-team-dock".into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: " ".into(),
+                modifiers: Vec::new(),
+            },
+        },
+    )
+    .await
+    .expect("成员架折叠快捷键不应失败");
+    let collapsed = render_shelf(host.as_ref(), true, 20).await;
+    assert_eq!(
+        collapsed.lines.len(),
+        2,
+        "收起后只剩摘要行和按键提示：{:?}",
+        collapsed.lines
+    );
+    let collapsed_text = shelf_text(&collapsed);
+    assert!(collapsed_text.contains("Tab 展开"), "{collapsed_text}");
+    assert!(
+        collapsed_text.contains("Space 展开"),
+        "收起态的提示行要写明键盘入口：{collapsed_text}"
+    );
+    assert!(!collapsed_text.contains("reviewer"), "{collapsed_text}");
+
+    // 收起状态下按方向键先展开，选中项不动。
+    PluginHost::on_ui_input(
+        host.as_ref(),
+        &UiInput {
+            plugin_id: "teammate".into(),
+            view_id: "teammate-team-dock".into(),
+            instance_id: None,
+            event: UiInputEvent::Key {
+                code: "down".into(),
+                modifiers: Vec::new(),
+            },
+        },
+    )
+    .await
+    .expect("成员架方向键不应失败");
+    let expanded = render_shelf(host.as_ref(), true, 21).await;
+    assert!(
+        shelf_text(&expanded).contains("reviewer"),
+        "方向键应把收起的架展开：{:?}",
+        expanded.lines
+    );
+
+    // 点击第 0 行（摘要行）与空格等价，再点一次回到展开。
+    for frame in [22, 23] {
+        PluginHost::on_ui_input(
+            host.as_ref(),
+            &UiInput {
+                plugin_id: "teammate".into(),
+                view_id: "teammate-team-dock".into(),
+                instance_id: None,
+                event: UiInputEvent::Mouse {
+                    kind: "down_left".into(),
+                    x: 2,
+                    y: 0,
+                },
+            },
+        )
+        .await
+        .expect("点击摘要行不应失败");
+        let toggled = render_shelf(host.as_ref(), true, frame).await;
+        let text = shelf_text(&toggled);
+        if frame == 22 {
+            assert!(!text.contains("reviewer"), "第一次点击应收起：{text}");
+        } else {
+            assert!(text.contains("reviewer"), "第二次点击应展开：{text}");
+        }
+    }
 
     PluginHost::on_ui_input(
         host.as_ref(),

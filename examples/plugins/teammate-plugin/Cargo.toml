@@ -1,6 +1,6 @@
 [package]
 name = "teammate-plugin"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "MIT"
 description = "提供受限 Agent 成员管理与有界邮箱的官方 WASM 插件。"

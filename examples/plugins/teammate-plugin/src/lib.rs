@@ -615,11 +615,23 @@ struct TeammatePlugin {
     workspace_root: Option<PathBuf>,
     state: TeamState,
     selected_member: usize,
+    /// 成员架上一帧是否处于聚焦状态。
+    ///
+    /// 宿主每帧把 `focused` 一起交回来，插件据此识别聚焦跳变并自动展开/收起架子，
+    /// 不需要额外的焦点事件。
+    shelf_focused: bool,
+    /// 成员架是否展开为逐个成员的列表。
+    ///
+    /// 默认收起，只留一行摘要：成员架常驻输入框上方，展开态会一直占着输入区高度。
+    /// 聚焦时自动展开、失焦时自动收起，用户也可以在聚焦时用 `Space` 或点击摘要行切换。
+    shelf_expanded: bool,
     /// 成员架上次渲染时窗口的起点行在成员列表中的下标。
     ///
     /// 鼠标点击只带视图内的行号，必须用同一份开窗偏移换算成成员，否则成员多于
     /// 可见行时点击会落到错误的成员上。
     shelf_window_start: usize,
+    /// 上次渲染时成员区实际画出的行数；点击超出行数的位置不算命中。
+    shelf_visible_rows: usize,
     navigation_sequence: u64,
     /// 等待 Runtime 回收的已结束句柄；投胎会替换当前句柄，旧句柄的会话与名额需要释放。
     pending_collections: VecDeque<AgentId>,
@@ -1054,12 +1066,21 @@ impl TeammatePlugin {
         members
     }
 
-    /// 渲染输入框上方的成员架：一行一个成员，选中行带指示条。
+    /// 渲染输入框上方的成员架：收起时一行摘要，展开时一行一个成员。
+    ///
+    /// 展开/收起由聚焦驱动：`Tab` 进来就展开列表供方向键选择，`Esc` 回到输入后自动
+    /// 收起，常驻多行不会一直顶着输入区。用户也能用 `Space` 或点击摘要行手动切换，
+    /// 因此折叠不是只有鼠标能做的动作。
     ///
     /// 内容行预算固定为 [`SHELF_ROWS`]：宿主把声明高度当上限，多出来的行会被裁掉，
-    /// 因此这里自己按选中项开窗，当前成员永远可见。成员多于可显示行时用最后一行
-    /// 报出被折叠的数量，而不是把架撑高。
+    /// 因此这里自己按选中项开窗，当前成员永远可见。成员多于可显示行时用最后一行报出
+    /// 被折叠的数量，而不是把架撑高。
     fn render_team_shelf(&mut self, request: &UiRenderRequest) -> Vec<UiLine> {
+        // 聚焦跳变即收放：进来自动展开，离开自动收起。
+        if request.focused != self.shelf_focused {
+            self.shelf_expanded = request.focused;
+            self.shelf_focused = request.focused;
+        }
         let members = self.ui_members();
         let unread = members
             .iter()
@@ -1095,6 +1116,21 @@ impl TeammatePlugin {
                 unread > 0,
             ),
         ])];
+        if !self.shelf_expanded {
+            // 收起时把展开入口写在摘要行尾：不是所有终端都能点击，键位也要看得见。
+            lines[0]
+                .spans
+                .push(ui_span("  ·  Tab 展开", Some(UiColor::Gray), false));
+            self.shelf_visible_rows = 0;
+            if request.focused {
+                lines.push(ui_line(vec![ui_span(
+                    "↑↓ 或 Space 展开 · w 团队工作台 · Esc 返回输入",
+                    Some(UiColor::Gray),
+                    false,
+                )]));
+            }
+            return lines;
+        }
         // 聚焦时才显示按键提示：未聚焦的架只报状态，不占输入区高度。
         let hint_rows = usize::from(request.focused);
         let budget = SHELF_ROWS
@@ -1150,6 +1186,7 @@ impl TeammatePlugin {
             }
             lines.push(ui_line(spans));
         }
+        self.shelf_visible_rows = lines.len().saturating_sub(1);
         if truncated {
             lines.push(ui_line(vec![ui_span(
                 format!("… +{} members", members.len().saturating_sub(visible)),
@@ -1159,7 +1196,7 @@ impl TeammatePlugin {
         }
         if hint_rows > 0 {
             lines.push(ui_line(vec![ui_span(
-                "↑↓ 选择 · Enter 打开会话 · w 团队工作台 · Esc 返回输入",
+                "↑↓ 选择 · Enter 打开会话 · w 工作台 · Space 折叠 · Esc 返回输入",
                 Some(UiColor::Gray),
                 false,
             )]));
@@ -1601,7 +1638,8 @@ impl AgentPlugin for TeammatePlugin {
     /// 声明输入框上方的成员架、全屏工作台和成员会话的输入路由。
     ///
     /// 成员架不再是右侧停靠面板：它贴在输入框上方逐行列出成员，用方向键选择、
-    /// `Enter` 打开选中成员的会话，点击行等价于选中并打开。
+    /// `Enter` 打开选中成员的会话，点击行等价于选中并打开。成员架平时收起成一行摘要，
+    /// 聚焦时自动展开、失焦自动收起，`Space` 或点击摘要行也能手动切换。
     /// 成员会话由宿主原生渲染，声明仍然存在：宿主用它校验实例、路由提交的正文
     /// 并继承默认标题，插件不再为它返回任何文本帧。
     fn describe_ui(&self) -> Vec<UiDeclaration> {
@@ -1671,17 +1709,24 @@ impl AgentPlugin for TeammatePlugin {
         self.render_ui(request)
     }
 
-    /// 处理成员架与工作台的输入：选择、打开会话与打开工作台。
+    /// 处理成员架与工作台的输入：选择、打开会话、打开工作台与折叠切换。
+    ///
+    /// 成员架上每个鼠标动作都有等价按键：点成员行 = `↑`/`↓` + `Enter`，点摘要行 =
+    /// `Space`；不支持鼠标上报的终端因此也能完整操作。
     fn on_ui_input_with_host(&mut self, host: &dyn PluginHostApi, input: UiInput) {
         match input.event {
             UiInputEvent::Key { code, .. } if input.view_id == TEAM_DOCK_VIEW => {
                 let member_count = self.ui_members().len();
                 match code.as_str() {
+                    // 收起状态下按方向键先展开列表：用户想选成员，而不是空转。
+                    "up" | "down" if !self.shelf_expanded => self.shelf_expanded = true,
                     "up" => self.selected_member = self.selected_member.saturating_sub(1),
                     "down" => {
                         self.selected_member =
                             (self.selected_member + 1).min(member_count.saturating_sub(1));
                     }
+                    // 空格与点击摘要行等价：折叠/展开不需要鼠标。
+                    " " => self.shelf_expanded = !self.shelf_expanded,
                     // 架上直接打开选中成员的会话：查看成员状态时不该先跳一层工作台。
                     "enter" => self.open_selected_member_session(host),
                     "w" => self.open_team_workspace(host),
@@ -1708,13 +1753,19 @@ impl AgentPlugin for TeammatePlugin {
             UiInputEvent::Mouse { kind, y, .. }
                 if input.view_id == TEAM_DOCK_VIEW && kind.starts_with("down_") =>
             {
-                // 第 0 行是汇总行，成员从第 1 行开始；行号要加上开窗偏移才是成员下标。
-                let row = usize::from(y).saturating_sub(1);
-                let index = self.shelf_window_start.saturating_add(row);
-                let member_count = self.ui_members().len();
-                if row < member_count && index < member_count {
-                    self.selected_member = index;
-                    self.open_selected_member_session(host);
+                // 第 0 行是摘要行，点它等同于 Space：折叠状态不该只能靠键盘切换。
+                if y == 0 {
+                    self.shelf_expanded = !self.shelf_expanded;
+                } else if self.shelf_expanded {
+                    // 成员从第 1 行开始；行号要加上开窗偏移才是成员下标，且只有真正画出
+                    // 的行才算命中——点空白区不该打开一个看不见的成员。
+                    let row = usize::from(y).saturating_sub(1);
+                    let index = self.shelf_window_start.saturating_add(row);
+                    let member_count = self.ui_members().len();
+                    if row < self.shelf_visible_rows && index < member_count {
+                        self.selected_member = index;
+                        self.open_selected_member_session(host);
+                    }
                 }
             }
             UiInputEvent::Mouse { kind, y, .. }
@@ -2391,6 +2442,8 @@ mod tests {
     }
 
     /// 插件必须声明可聚焦的输入框成员架和全屏工作台，并逐行渲染成员状态。
+    ///
+    /// 成员架只在聚焦时展开：未聚焦时一行摘要就够，成员列表要 `Tab` 进来才占高度。
     #[test]
     fn team_ui_declares_shelf_and_renders_each_member() {
         let mut plugin = TeammatePlugin {
@@ -2424,6 +2477,7 @@ mod tests {
         assert!(declarations[0].focusable);
         assert_eq!(declarations[1].placement, UiPlacement::Subview);
 
+        // 未聚焦时收起为一行摘要：架子不再常驻成员列表。
         let frame = plugin
             .render_ui(UiRenderRequest {
                 session_id: None,
@@ -2445,23 +2499,12 @@ mod tests {
         assert!(text.contains("Team"), "{text}");
         assert!(text.contains("2 members"), "{text}");
         assert!(text.contains("2 running"), "{text}");
-        assert!(text.contains("lead"), "{text}");
-        assert!(text.contains("reviewer"), "{text}");
-        // 未聚焦时不占按键提示那一行：方向键与 Enter 的说明只在聚焦后出现。
-        assert!(!text.contains("Enter"), "{text}");
-        assert_eq!(frame.lines.len(), 3);
-        // 一行一个成员，队长在最前面，选中行带指示条。
-        assert!(frame.lines[1]
-            .spans
-            .iter()
-            .any(|span| span.text.contains("lead")));
-        assert!(frame.lines[1].spans[0].text == "▌ ");
-        assert!(frame.lines[2]
-            .spans
-            .iter()
-            .any(|span| span.text.contains("reviewer")));
-        assert!(frame.lines[2].spans[0].text == "  ");
+        // 收起时要把展开入口写在摘要行上：没有鼠标的终端也能找到键盘入口。
+        assert!(text.contains("Tab 展开"), "{text}");
+        assert!(!text.contains("lead"), "收起时不应列出成员：{text}");
+        assert_eq!(frame.lines.len(), 1, "摘要一行");
 
+        // 聚焦后自动展开：一行一个成员，队长在最前面，选中行带指示条。
         let focused = plugin
             .render_ui(UiRenderRequest {
                 session_id: None,
@@ -2474,14 +2517,43 @@ mod tests {
                 frame: 2,
             })
             .expect("聚焦成员架应返回可见帧");
-        let hint = focused.lines.last().expect("聚焦后应有按键提示行");
-        let hint_text = hint
+        assert_eq!(focused.lines.len(), 4, "摘要 + 两个成员 + 提示行");
+        assert!(focused.lines[1]
+            .spans
+            .iter()
+            .any(|span| span.text.contains("lead")));
+        assert!(focused.lines[1].spans[0].text == "▌ ");
+        assert!(focused.lines[2]
+            .spans
+            .iter()
+            .any(|span| span.text.contains("reviewer")));
+        assert!(focused.lines[2].spans[0].text == "  ");
+        let hint_text = focused
+            .lines
+            .last()
+            .expect("聚焦后应有按键提示行")
             .spans
             .iter()
             .map(|span| span.text.as_str())
             .collect::<String>();
         assert!(hint_text.contains("Enter 打开会话"), "{hint_text}");
-        assert!(hint_text.contains("w 团队工作台"), "{hint_text}");
+        assert!(hint_text.contains("w 工作台"), "{hint_text}");
+        assert!(hint_text.contains("Space 折叠"), "{hint_text}");
+
+        // 失焦再自动收起：Esc 返回输入后架子不继续占着成员列表的高度。
+        let collapsed = plugin
+            .render_ui(UiRenderRequest {
+                session_id: None,
+                plugin_id: "teammate".into(),
+                view_id: TEAM_DOCK_VIEW.into(),
+                instance_id: None,
+                width: 60,
+                height: 3,
+                focused: false,
+                frame: 3,
+            })
+            .expect("成员架应返回可见帧");
+        assert_eq!(collapsed.lines.len(), 1, "失焦后自动收起");
 
         let workspace = plugin
             .render_ui(UiRenderRequest {
