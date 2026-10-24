@@ -23,7 +23,10 @@ use std::{
     env,
     future::Future,
     hint::black_box,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -35,6 +38,7 @@ const MESSAGE_COUNTS: [usize; 3] = [64, 256, 1_024];
 const MESSAGE_BODY_CHARS: usize = 400;
 /// 增量场景使用的窗口：取值足够小，使压缩水位落在几千 token，便于稳定触发缓存。
 const INCREMENTAL_CONTEXT_WINDOW: u64 = 8_000;
+const PASSTHROUGH_CONTEXT_WINDOW: u64 = 1_000_000;
 /// 增量场景建立缓存时使用的初始历史长度。
 const INCREMENTAL_PRIME_MESSAGES: usize = 512;
 /// 增量场景每轮追加的消息数，模拟模型回复后累积尚未压缩的历史。
@@ -77,11 +81,14 @@ impl Measurement {
 }
 
 /// 返回固定摘要的离线 provider，避免基准触碰真实网络。
-struct FixedSummaryModel;
+struct FixedSummaryModel {
+    calls: Arc<AtomicUsize>,
+}
 
 #[async_trait]
 impl ChatModel for FixedSummaryModel {
     async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(ModelResponse::text("<summary>基准摘要</summary>"))
     }
 }
@@ -109,12 +116,18 @@ async fn main() -> Result<()> {
 async fn bench_passthrough(config: BenchmarkConfig) -> Result<()> {
     for message_count in MESSAGE_COUNTS {
         let history = history(message_count);
+        let calls = Arc::new(AtomicUsize::new(0));
         let measurement = measure_async(config, || {
-            let loader = build_loader();
+            let loader = build_loader(PASSTHROUGH_CONTEXT_WINDOW, calls.clone());
             let messages = history.clone();
-            async move { Ok(loader.load(request(messages, 1)).await?.messages.len()) }
+            async move {
+                let loaded = loader.load(request(messages, 1)).await?;
+                assert_eq!(loaded.messages.len(), message_count);
+                Ok(loaded.messages.len())
+            }
         })
         .await?;
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "透传基准不得调用摘要模型");
         report(
             config,
             "context_load_passthrough",
@@ -184,6 +197,7 @@ fn bench_transform(config: BenchmarkConfig) -> Result<()> {
 /// 增量场景的可复用状态：一个已建立缓存的加载器与不断增长的原始历史。
 struct IncrementalState {
     loader: NativeContextLoader,
+    calls: Arc<AtomicUsize>,
     messages: Vec<ModelMessage>,
     step: usize,
 }
@@ -191,8 +205,10 @@ struct IncrementalState {
 impl IncrementalState {
     /// 构造空的增量状态；缓存由 [`Self::prime`] 建立。
     fn new() -> Self {
+        let calls = Arc::new(AtomicUsize::new(0));
         Self {
-            loader: build_loader(),
+            loader: build_loader(INCREMENTAL_CONTEXT_WINDOW, calls.clone()),
+            calls,
             messages: history(INCREMENTAL_PRIME_MESSAGES),
             step: 0,
         }
@@ -202,6 +218,10 @@ impl IncrementalState {
     async fn prime(&mut self) -> Result<()> {
         let messages = std::mem::take(&mut self.messages);
         let loaded = self.loader.load(request(messages.clone(), 0)).await?;
+        assert!(
+            self.calls.load(Ordering::Relaxed) > 0,
+            "增量场景必须真正建立摘要缓存"
+        );
         black_box(loaded.messages.len());
         // 压缩后的上下文由加载器缓存，这里保留原始历史作为下一轮的前缀来源。
         self.messages = messages;
@@ -228,12 +248,12 @@ impl IncrementalState {
 }
 
 /// 构造启用缓存、注册了离线 provider 的上下文加载器。
-fn build_loader() -> NativeContextLoader {
+fn build_loader(window: u64, calls: Arc<AtomicUsize>) -> NativeContextLoader {
     let gateway = ModelGateway::new();
     gateway
         .register(
             "bench-provider",
-            Arc::new(FixedSummaryModel) as Arc<dyn ProviderAdapter>,
+            Arc::new(FixedSummaryModel { calls }) as Arc<dyn ProviderAdapter>,
         )
         .expect("注册基准 provider");
     NativeContextLoader::new(
@@ -245,7 +265,7 @@ fn build_loader() -> NativeContextLoader {
         Arc::new(NoopEventSink),
     )
     .expect("构造上下文加载器")
-    .with_context_window(Some(INCREMENTAL_CONTEXT_WINDOW))
+    .with_context_window(Some(window))
 }
 
 /// 构造一次自动（非用户发起）上下文加载请求。
@@ -282,7 +302,7 @@ fn bench_decompose(config: BenchmarkConfig) -> Result<()> {
         let history = history(message_count);
 
         let measurement = measure_sync(config, || {
-            let loader = build_loader();
+            let loader = build_loader(PASSTHROUGH_CONTEXT_WINDOW, Arc::new(AtomicUsize::new(0)));
             let messages = history.clone();
             std::hint::black_box(&loader);
             Ok(messages.len())
