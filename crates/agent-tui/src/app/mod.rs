@@ -21,6 +21,7 @@ use crate::session::{restore_session_messages, WorkspaceContext};
 use crate::theme::{COLOR_TEXT, COLOR_WARNING};
 #[cfg(feature = "plugins")]
 use crate::ui::view::ViewStack;
+use agent_context::NativeContextLoader;
 use agent_core::model::{ReasoningLevel, TokenUsage};
 use agent_core::{ContextLoader, Session};
 #[cfg(feature = "plugins")]
@@ -170,6 +171,8 @@ pub(crate) struct App {
     pub(crate) session_store: Arc<dyn SessionStore>,
     /// `/compact` 与模型请求共同使用的原生上下文加载器。
     pub(crate) context_loader: Arc<dyn ContextLoader>,
+    /// 共享原生加载器的控制句柄，用于同步热切换后的模型路由与上下文窗口。
+    pub(crate) native_context_loader: Option<Arc<NativeContextLoader>>,
     /// TUI 人工插件控制面；只在插件构建中存在。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_management: Option<Arc<PluginManagementService>>,
@@ -502,6 +505,7 @@ impl App {
             session_record,
             session_store: Arc::new(MemorySessionStore::new()),
             context_loader: Arc::new(agent_core::PassthroughContextLoader),
+            native_context_loader: None,
             #[cfg(feature = "plugins")]
             plugin_management: None,
             tx,
@@ -615,7 +619,7 @@ impl App {
         self
     }
 
-    /// 注入模型上下文窗口；该值只影响状态栏展示。
+    /// 注入状态栏使用的模型上下文窗口；压缩器在启动时同步接收同一窗口。
     pub(crate) fn with_context_window(mut self, context_window: Option<u64>) -> Self {
         self.context_window = context_window;
         self
@@ -653,9 +657,13 @@ impl App {
         self
     }
 
-    /// 注入应用默认的原生上下文加载器。
-    pub(crate) fn with_context_loader(mut self, context_loader: Arc<dyn ContextLoader>) -> Self {
-        self.context_loader = context_loader;
+    /// 注入与 Agent 共用的原生上下文加载器，并保留模型热切换控制句柄。
+    pub(crate) fn with_native_context_loader(
+        mut self,
+        context_loader: Arc<NativeContextLoader>,
+    ) -> Self {
+        self.context_loader = context_loader.clone();
+        self.native_context_loader = Some(context_loader);
         self
     }
 

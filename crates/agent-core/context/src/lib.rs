@@ -19,19 +19,10 @@ use std::sync::{Arc, Mutex};
 ///
 /// 只在既没有配置也没有 models.dev 元数据时兜底；正常路径应由调用方传入真实窗口。
 const ASSUMED_CONTEXT_WINDOW_TOKENS: usize = 200_000;
-/// 触发完整压缩前为下一轮请求预留的缓冲。
+/// 自动压缩相对当前模型最大上下文窗口的触发比例。
 ///
-/// 压缩本身要发一次模型请求，压缩后还要立刻发起真正的那一轮；不留缓冲会在压缩
-/// 完成的同一步就再次越界。
-const NEXT_TURN_BUFFER_TOKENS: usize = 13_000;
-/// 完整压缩水位相对窗口的下限比例。
-///
-/// 小窗口模型减去固定预留后可能归零，此时改用窗口比例，避免每一轮都触发压缩。
-const MIN_COMPACT_THRESHOLD_RATIO: usize = 55;
-/// 微压缩水位相对完整压缩水位的比例。
-///
-/// 先用无损代价更低的手段清理旧工具结果，尽量把完整摘要推迟到真正需要时。
-const MICRO_COMPACT_THRESHOLD_RATIO: usize = 72;
+/// 微压缩与完整摘要共用该水位，避免未达到 80% 时提前改写上下文。
+const COMPACT_THRESHOLD_RATIO: usize = 80;
 /// 完整压缩后保留的近期上下文占窗口的比例。
 ///
 /// 固定 40k 在小窗口上会吃掉整个预算、在百万窗口上又过于吝啬，因此按窗口比例伸缩。
@@ -128,8 +119,15 @@ fn decode_core_context(context: LoadedContext) -> Result<CoreLoadedContext> {
 /// Lucia 默认原生上下文加载器。
 ///
 /// 加载器在每次模型请求前按水位执行微压缩或模型摘要，并维护同一 Run 内的追加缓存。
-/// 它只使用应用固定的模型路由，摘要请求禁用工具与推理。
+/// 它使用应用当前配置的模型路由，摘要请求禁用工具与推理。
 pub struct NativeContextLoader {
+    events: Arc<dyn EventSink>,
+    state: Mutex<CompressionState>,
+}
+
+/// 一次上下文加载固定使用的模型路由、窗口与摘要调用参数。
+#[derive(Clone)]
+struct NativeSummaryModel {
     gateway: ModelGateway,
     provider: String,
     model: String,
@@ -137,12 +135,11 @@ pub struct NativeContextLoader {
     max_summary_tokens: u32,
     /// 目标模型的真实上下文窗口；`None` 时按假定窗口推导水位。
     context_window: Option<usize>,
-    events: Arc<dyn EventSink>,
-    state: Mutex<CompressionState>,
 }
 
-#[derive(Default)]
 struct CompressionState {
+    /// 路由与窗口由同一快照承载，防止热切换时读取到不同模型的参数。
+    summary_model: Arc<NativeSummaryModel>,
     /// 最近一次自动压缩结果，用于增量追加后续消息，避免重复处理同一历史前缀。
     cache: Option<CompressionCache>,
 }
@@ -190,14 +187,18 @@ impl NativeContextLoader {
             return Err(anyhow!("原生上下文压缩的摘要 token 上限必须大于零"));
         }
         Ok(Self {
-            gateway,
-            provider,
-            model,
-            stream,
-            max_summary_tokens,
-            context_window: None,
             events,
-            state: Mutex::new(CompressionState::default()),
+            state: Mutex::new(CompressionState {
+                summary_model: Arc::new(NativeSummaryModel {
+                    gateway,
+                    provider,
+                    model,
+                    stream,
+                    max_summary_tokens,
+                    context_window: None,
+                }),
+                cache: None,
+            }),
         })
     }
 
@@ -206,10 +207,45 @@ impl NativeContextLoader {
     /// 未声明时按 200k 假定窗口推导水位；真实窗口更大时会过早压缩，更小时会越界。
     /// 调用方应把配置或 models.dev 元数据里的窗口传进来。
     pub fn with_context_window(mut self, context_window: Option<u64>) -> Self {
-        self.context_window = context_window
-            .filter(|window| *window > 0)
-            .map(|window| usize::try_from(window).unwrap_or(usize::MAX));
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        Arc::make_mut(&mut state.summary_model).context_window =
+            normalize_context_window(context_window);
+        state.cache = None;
         self
+    }
+
+    /// 原子更新当前摘要模型路由和上下文窗口，并使已有压缩缓存失效。
+    ///
+    /// `context_window` 为零或未提供时按 200k 假定窗口推导水位。已经开始的加载继续使用
+    /// 原路由与窗口快照，其结果不会回填到新路由的缓存。
+    ///
+    /// # 错误
+    ///
+    /// 模型路由为空或内部状态锁已损坏时返回错误，保留原配置。
+    pub fn update_model_route(
+        &self,
+        provider: String,
+        model: String,
+        context_window: Option<u64>,
+    ) -> Result<()> {
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return Err(anyhow!("原生上下文压缩的模型路由不能为空"));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?;
+        state.summary_model = Arc::new(NativeSummaryModel {
+            provider,
+            model,
+            context_window: normalize_context_window(context_window),
+            ..state.summary_model.as_ref().clone()
+        });
+        state.cache = None;
+        Ok(())
     }
 
     /// 在不持有锁的情况下构造本轮有效请求及缓存更新元数据。
@@ -217,21 +253,19 @@ impl NativeContextLoader {
         &self,
         request: ContextLoadRequest,
     ) -> Result<(ContextLoadRequest, CachePlan)> {
-        if request.user_initiated {
+        let (summary_model, cache) = {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?;
-            state.cache = None;
-            return Ok((request, CachePlan::Manual));
-        }
+            let summary_model = Arc::clone(&state.summary_model);
+            if request.user_initiated {
+                state.cache = None;
+                return Ok((request, CachePlan::Manual { summary_model }));
+            }
+            (summary_model, state.cache.clone())
+        };
         // 大历史的摘要计算不应占用缓存锁，否则并行请求会被纯 CPU 工作串行阻塞。
-        let cache = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?
-            .cache
-            .clone();
         let cache_candidate = cache.as_ref().filter(|cache| {
             cache.run_id == request.run_id
                 && cache.provider == request.provider
@@ -259,7 +293,11 @@ impl NativeContextLoader {
             Some(cache.source_messages_digest)
         } else if cache_hit
             || estimate_context_tokens(request.system.as_deref(), &request.messages)
-                >= compaction_budget(self.context_window, self.max_summary_tokens as usize).micro
+                >= compaction_budget(
+                    summary_model.context_window,
+                    summary_model.max_summary_tokens as usize,
+                )
+                .micro
         {
             match prefix_len {
                 Some(prefix_len) => {
@@ -277,6 +315,7 @@ impl NativeContextLoader {
             .filter(|_| cache_hit)
             .map_or(0, |cache| cache.micro_cleared);
         let plan = CachePlan::Automatic {
+            summary_model,
             run_id: request.run_id.clone(),
             provider: request.provider.clone(),
             model: request.model.clone(),
@@ -307,8 +346,12 @@ impl NativeContextLoader {
             .state
             .lock()
             .map_err(|_| anyhow!("原生上下文压缩缓存锁已损坏"))?;
+        // 切换会替换配置快照；旧加载即使稍后完成，也不能恢复已失效的缓存。
+        if !Arc::ptr_eq(&state.summary_model, plan.summary_model()) {
+            return Ok(());
+        }
         match plan {
-            CachePlan::Manual => state.cache = None,
+            CachePlan::Manual { .. } => state.cache = None,
             CachePlan::Automatic {
                 run_id,
                 provider,
@@ -355,8 +398,11 @@ impl NativeContextLoader {
 }
 
 enum CachePlan {
-    Manual,
+    Manual {
+        summary_model: Arc<NativeSummaryModel>,
+    },
     Automatic {
+        summary_model: Arc<NativeSummaryModel>,
         run_id: String,
         provider: String,
         model: String,
@@ -371,10 +417,17 @@ enum CachePlan {
 }
 
 impl CachePlan {
+    /// 返回本轮固定使用的路由与窗口快照。
+    fn summary_model(&self) -> &Arc<NativeSummaryModel> {
+        match self {
+            Self::Manual { summary_model } | Self::Automatic { summary_model, .. } => summary_model,
+        }
+    }
+
     /// 返回本轮微压缩可以沿用的清理边界；手动压缩不继承任何边界。
     fn micro_floor(&self) -> usize {
         match self {
-            Self::Manual => 0,
+            Self::Manual { .. } => 0,
             Self::Automatic { micro_floor, .. } => *micro_floor,
         }
     }
@@ -387,12 +440,16 @@ impl ContextLoader for NativeContextLoader {
     /// 手动请求跳过自动水位并清空增量缓存；摘要失败或事件持久化失败时关闭本轮模型请求。
     async fn load(&self, request: CoreContextLoadRequest) -> Result<CoreLoadedContext> {
         let (effective, plan) = self.prepare_request(encode_core_request(request)?)?;
-        let budget = compaction_budget(self.context_window, self.max_summary_tokens as usize);
+        let summary_model = plan.summary_model();
+        let budget = compaction_budget(
+            summary_model.context_window,
+            summary_model.max_summary_tokens as usize,
+        );
         let outcome = compress_context(
             effective.clone(),
             effective.user_initiated,
             budget,
-            self,
+            summary_model.as_ref(),
             plan.micro_floor(),
         )
         .await?;
@@ -654,19 +711,20 @@ fn compaction_budget(context_window: Option<usize>, summary_tokens: usize) -> Co
     let window = context_window
         .filter(|window| *window > 0)
         .unwrap_or(ASSUMED_CONTEXT_WINDOW_TOKENS);
-    // 摘要输出与下一轮请求都要占用同一个窗口，先扣掉再决定何时压缩。
-    let reserved = summary_tokens.saturating_add(NEXT_TURN_BUFFER_TOKENS);
-    // 小窗口扣完预留可能归零，此时用窗口比例兜底，避免每轮都压缩。
-    let compact = window
-        .saturating_sub(reserved)
-        .max(percentage_of(window, MIN_COMPACT_THRESHOLD_RATIO))
-        .max(1);
+    let compact = percentage_of(window, COMPACT_THRESHOLD_RATIO).max(1);
     CompactionBudget {
         compact,
-        micro: percentage_of(compact, MICRO_COMPACT_THRESHOLD_RATIO).max(1),
+        micro: compact,
         recent_target: percentage_of(window, RECENT_CONTEXT_TARGET_RATIO).max(1),
         summary_max_tokens: u32::try_from(summary_tokens).unwrap_or(u32::MAX).max(1),
     }
+}
+
+/// 将配置与元数据中的窗口转换为当前平台可表达的正数 token 数。
+fn normalize_context_window(context_window: Option<u64>) -> Option<usize> {
+    context_window
+        .filter(|window| *window > 0)
+        .map(|window| usize::try_from(window).unwrap_or(usize::MAX))
 }
 
 /// 计算不超过百分之百的整数比例，并在极大上下文窗口下避免乘法溢出。
@@ -1005,7 +1063,7 @@ fn recent_tail_start(
 
 /// 通过 Host 固定路由调用模型生成摘要；Guest 无法指定 provider、model 或工具。
 #[async_trait]
-impl ContextSummarizer for NativeContextLoader {
+impl ContextSummarizer for NativeSummaryModel {
     /// 使用应用固定的 provider/model 生成摘要；调用强制禁用工具、推理和 provider 逃生参数。
     ///
     /// 摘要是一次性请求：它的前缀在压缩完成后就不复存在，写进去的缓存条目永远读不到，
@@ -1580,10 +1638,10 @@ mod tests {
         let small = compaction_budget(Some(200_000), summary);
         let large = compaction_budget(Some(1_000_000), summary);
 
-        // 200k 扣掉 20k 摘要输出与 13k 下一轮缓冲。
-        assert_eq!(small.compact, 167_000);
-        assert_eq!(large.compact, 967_000);
-        assert!(small.micro < small.compact);
+        assert_eq!(small.compact, 160_000);
+        assert_eq!(large.compact, 800_000);
+        assert_eq!(small.micro, small.compact);
+        assert_eq!(large.micro, large.compact);
         assert!(large.recent_target > small.recent_target);
 
         // 未声明窗口时按 200k 假定值兜底，与显式传入 200k 等价。
@@ -1591,12 +1649,12 @@ mod tests {
         assert_eq!(compaction_budget(Some(0), summary), small);
     }
 
-    /// 小窗口扣除固定预留后不得归零，否则每一轮都会触发压缩。
+    /// 小窗口也按 80% 触发压缩，不受固定摘要输出上限影响。
     #[test]
-    fn small_window_budget_falls_back_to_window_ratio() {
+    fn small_window_budget_uses_same_window_ratio() {
         let budget = compaction_budget(Some(32_000), DEFAULT_MAX_SUMMARY_TOKENS as usize);
 
-        assert_eq!(budget.compact, 32_000 * MIN_COMPACT_THRESHOLD_RATIO / 100);
+        assert_eq!(budget.compact, 25_600);
         assert!(budget.compact > 0);
         assert!(budget.micro > 0);
         assert!(budget.recent_target > 0);
@@ -1611,7 +1669,11 @@ mod tests {
             budget.recent_target,
             percentage_of(usize::MAX, RECENT_CONTEXT_TARGET_RATIO)
         );
-        assert!(budget.micro < budget.compact);
+        assert_eq!(
+            budget.compact,
+            percentage_of(usize::MAX, COMPACT_THRESHOLD_RATIO)
+        );
+        assert_eq!(budget.micro, budget.compact);
     }
 
     /// 英文与中文按不同字节率折算，避免英文会话被高估而提前压缩。
@@ -1752,6 +1814,161 @@ mod tests {
             outcome.event.expect("应发布压缩事件")["data"]["trigger"],
             "manual"
         );
+    }
+
+    /// 热切换必须同时更新摘要路由和窗口，并清除旧路由的压缩缓存。
+    #[tokio::test]
+    async fn model_route_update_changes_budget_and_invalidates_cache() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let gateway = ModelGateway::new();
+        gateway
+            .register(
+                "new-provider",
+                Arc::new(CapturingSummaryModel(Arc::clone(&requests))),
+            )
+            .expect("应注册切换后的摘要 provider");
+        let loader = NativeContextLoader::new(
+            gateway,
+            "old-provider",
+            "old-model",
+            false,
+            DEFAULT_MAX_SUMMARY_TOKENS,
+            Arc::new(agent_core::InMemoryEventSink::new()),
+        )
+        .expect("应创建原生上下文加载器")
+        .with_context_window(Some(200_000));
+        let messages = vec![
+            agent_core::model::ModelMessage::text(
+                agent_core::MessageRole::User,
+                "x".repeat(110_000),
+            ),
+            agent_core::model::ModelMessage::text(agent_core::MessageRole::Assistant, "已分析历史"),
+            agent_core::model::ModelMessage::text(agent_core::MessageRole::User, "继续处理"),
+            agent_core::model::ModelMessage::text(agent_core::MessageRole::Assistant, "正在处理"),
+        ];
+        let request = |provider: &str, model: &str| CoreContextLoadRequest {
+            run_id: "route-update".into(),
+            step: 0,
+            provider: provider.into(),
+            model: model.into(),
+            system: None,
+            messages: messages.clone(),
+            user_initiated: false,
+        };
+
+        let original = loader
+            .load(request("old-provider", "old-model"))
+            .await
+            .expect("低于原窗口水位时应保持原文");
+        assert_eq!(original.messages, messages);
+        assert!(requests.lock().expect("请求记录锁不应损坏").is_empty());
+
+        loader
+            .update_model_route("new-provider".into(), "new-model".into(), Some(32_000))
+            .expect("应更新模型路由与窗口");
+        let compacted = loader
+            .load(request("new-provider", "new-model"))
+            .await
+            .expect("切换到小窗口后应使用新路由压缩");
+        assert_ne!(compacted.messages, messages);
+        {
+            let captured = requests.lock().expect("请求记录锁不应损坏");
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].model, "new-model");
+        }
+        assert!(loader.state.lock().expect("状态锁不应损坏").cache.is_some());
+
+        loader
+            .update_model_route("new-provider".into(), "new-model".into(), Some(200_000))
+            .expect("同一路由的窗口更新也应清除缓存");
+        let restored = loader
+            .load(request("new-provider", "new-model"))
+            .await
+            .expect("恢复大窗口后不应复用旧压缩结果");
+        assert_eq!(restored.messages, messages);
+        assert_eq!(requests.lock().expect("请求记录锁不应损坏").len(), 1);
+        assert!(loader
+            .update_model_route(" ".into(), "invalid".into(), Some(1))
+            .is_err());
+        assert_eq!(
+            loader
+                .state
+                .lock()
+                .expect("状态锁不应损坏")
+                .summary_model
+                .context_window,
+            Some(200_000)
+        );
+    }
+
+    /// 切换前已经准备的加载沿用同一配置快照，且不能在完成后回填旧缓存。
+    #[tokio::test]
+    async fn prepared_request_keeps_route_snapshot_and_rejects_stale_cache() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let gateway = ModelGateway::new();
+        gateway
+            .register(
+                "old-provider",
+                Arc::new(CapturingSummaryModel(Arc::clone(&requests))),
+            )
+            .expect("应注册原摘要 provider");
+        let loader = NativeContextLoader::new(
+            gateway,
+            "old-provider",
+            "old-model",
+            false,
+            DEFAULT_MAX_SUMMARY_TOKENS,
+            Arc::new(agent_core::InMemoryEventSink::new()),
+        )
+        .expect("应创建原生上下文加载器")
+        .with_context_window(Some(32_000));
+        let (prepared, plan) = loader
+            .prepare_request(ContextLoadRequest {
+                run_id: "route-snapshot".into(),
+                step: 0,
+                provider: "old-provider".into(),
+                model: "old-model".into(),
+                system: None,
+                messages: vec![
+                    text_message("user", "x".repeat(110_000)),
+                    text_message("assistant", "已分析历史"),
+                    text_message("user", "继续处理"),
+                    text_message("assistant", "正在处理"),
+                ],
+                user_initiated: false,
+            })
+            .expect("应准备原路由加载");
+        loader
+            .update_model_route("new-provider".into(), "new-model".into(), Some(200_000))
+            .expect("应切换到新路由与大窗口");
+
+        let summary_model = plan.summary_model();
+        let budget = compaction_budget(
+            summary_model.context_window,
+            summary_model.max_summary_tokens as usize,
+        );
+        assert_eq!(budget.compact, 25_600);
+        let outcome = compress_context(
+            prepared,
+            false,
+            budget,
+            summary_model.as_ref(),
+            plan.micro_floor(),
+        )
+        .await
+        .expect("原加载应沿用旧路由和小窗口完成摘要");
+        assert!(outcome.event.is_some());
+        assert_eq!(
+            requests.lock().expect("请求记录锁不应损坏")[0].model,
+            "old-model"
+        );
+        loader
+            .commit_cache(plan, &outcome)
+            .expect("过期加载应跳过缓存回填");
+        let state = loader.state.lock().expect("状态锁不应损坏");
+        assert!(state.cache.is_none());
+        assert_eq!(state.summary_model.provider, "new-provider");
+        assert_eq!(state.summary_model.context_window, Some(200_000));
     }
 
     /// 自动压缩后新增消息应复用已压缩前缀，且不重复发布压缩事件。

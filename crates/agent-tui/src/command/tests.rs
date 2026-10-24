@@ -1245,11 +1245,32 @@ fn native_attach_command_reports_missing_file_and_usage() {
     }));
 }
 
-/// `/model` 必须热切换共享 Agent 上游，并同步状态栏模型名；无上游时给出提示。
-#[test]
-fn model_command_switches_shared_agent_upstream() {
+/// `/model` 必须同步 Agent 与两条压缩路径的路由和窗口；无上游时给出提示。
+#[tokio::test]
+async fn model_command_switches_shared_agent_upstream() {
+    use agent_context::{NativeContextLoader, DEFAULT_MAX_SUMMARY_TOKENS};
     use agent_core::config::ModelConfig;
-    use agent_core::Agent;
+    use agent_core::model::{ChatModel, MessageRole, ModelMessage, ModelRequest, ModelResponse};
+    use agent_core::{Agent, ContextLoadRequest, InMemoryEventSink};
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    /// 记录摘要请求，防止热切换回归测试访问真实模型服务。
+    struct CapturingSummaryModel(Arc<Mutex<Vec<ModelRequest>>>);
+
+    #[async_trait]
+    impl ChatModel for CapturingSummaryModel {
+        async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+            self.0.lock().expect("摘要请求记录锁不应损坏").push(request);
+            Ok(ModelResponse::text("保留用户任务、已完成步骤与下一步。"))
+        }
+    }
+
+    impl agent_core::model::ProviderAdapter for CapturingSummaryModel {
+        fn name(&self) -> &'static str {
+            "capturing-summary"
+        }
+    }
 
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "gpt-5".into());
@@ -1270,12 +1291,12 @@ fn model_command_switches_shared_agent_upstream() {
             aws_session_token: None,
         },
         ModelConfig {
-            name: "deepseek".into(),
+            name: "openai-compatible-secondary".into(),
             provider: agent_core::model::ProviderKind::OpenAiCompatible,
-            model: "deepseek-chat".into(),
+            model: "gpt-4o".into(),
             api_key: Some("test-key".into()),
             api_key_env: None,
-            base_url: Some("https://api.deepseek.com/v1".into()),
+            base_url: Some("https://compatible.example.test/v1".into()),
             openai_protocol: agent_core::model::OpenAiProtocol::ChatCompletions,
             extra_headers: Default::default(),
             gateway: Default::default(),
@@ -1286,7 +1307,23 @@ fn model_command_switches_shared_agent_upstream() {
         },
     ];
     let (gateway, options) = build_demo_gateway();
-    let agent = Arc::new(Agent::new(gateway, options));
+    let native_context_loader = Arc::new(
+        NativeContextLoader::new(
+            gateway.clone(),
+            options.provider.clone(),
+            options.model.clone(),
+            false,
+            DEFAULT_MAX_SUMMARY_TOKENS,
+            Arc::new(InMemoryEventSink::new()),
+        )
+        .expect("应创建原生上下文加载器")
+        .with_context_window(Some(2_000_000)),
+    );
+    app = app
+        .with_context_window(Some(2_000_000))
+        .with_native_context_loader(native_context_loader.clone());
+    let agent =
+        Arc::new(Agent::new(gateway.clone(), options).with_context_loader(native_context_loader));
 
     // 面板打开后按 Enter 切换到当前高亮项。
     app.input = "/model".into();
@@ -1296,16 +1333,62 @@ fn model_command_switches_shared_agent_upstream() {
     assert!(app.handle_native_command_key(KeyCode::Down, KeyModifiers::NONE, Some(&agent)));
     assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
     assert!(app.native_command.model_panel.is_none());
-    assert_eq!(app.model_name, "deepseek-chat");
+    assert_eq!(app.model_name, "gpt-4o");
     let route = agent.active_route();
-    assert_eq!(route.provider, "deepseek");
-    assert_eq!(route.model, "deepseek-chat");
+    assert_eq!(route.provider, "openai-compatible-secondary");
+    assert_eq!(route.model, "gpt-4o");
+
+    let context_window = app.context_window.expect("切换后的模型应声明窗口");
+    assert!(context_window < 2_000_000);
+    assert!(Arc::ptr_eq(&app.context_loader, &agent.context_loader()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    gateway
+        .upsert(
+            "openai-compatible-secondary",
+            Arc::new(CapturingSummaryModel(Arc::clone(&requests))),
+        )
+        .expect("应替换为不联网的摘要模型");
+    // 约占新窗口的 85%，仍远低于旧窗口水位；只有窗口和路由一起更新才会调用新模型。
+    let history_chars = usize::try_from(context_window).expect("测试窗口应可表示") * 4 * 85 / 100;
+    let messages = vec![
+        ModelMessage::text(MessageRole::User, "h".repeat(history_chars)),
+        ModelMessage::text(MessageRole::Assistant, "历史任务已处理"),
+        ModelMessage::text(MessageRole::User, "继续处理"),
+        ModelMessage::text(MessageRole::Assistant, "正在处理"),
+    ];
+    for (context_loader, user_initiated, provider) in [
+        (agent.context_loader(), false, "openai-compatible-secondary"),
+        (app.context_loader.clone(), true, "native"),
+    ] {
+        let loaded = context_loader
+            .load(ContextLoadRequest {
+                run_id: format!("switched-model-{user_initiated}"),
+                step: 0,
+                provider: provider.into(),
+                model: "gpt-4o".into(),
+                system: None,
+                messages: messages.clone(),
+                user_initiated,
+            })
+            .await
+            .expect("自动与手动压缩都应使用切换后的摘要模型");
+        let summary = loaded.messages.first().expect("压缩后应保留摘要");
+        assert_eq!(summary.role, MessageRole::Developer);
+        assert!(summary
+            .text_content()
+            .contains("保留用户任务、已完成步骤与下一步。"));
+        assert_eq!(loaded.messages.last(), messages.last());
+    }
+    let captured = requests.lock().expect("摘要请求记录锁不应损坏");
+    assert_eq!(captured.len(), 2);
+    assert!(captured.iter().all(|request| request.model == "gpt-4o"));
+    drop(captured);
 
     // 按名称切换未知上游必须报错而不改变当前路由。
     app.input = "/model missing".into();
     app.cursor = app.input.len();
     assert!(app.handle_native_command_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent)));
-    assert_eq!(agent.active_route().provider, "deepseek");
+    assert_eq!(agent.active_route().provider, "openai-compatible-secondary");
 
     // 无上游配置时给出可读提示。
     let (tx2, _rx2) = mpsc::unbounded_channel();

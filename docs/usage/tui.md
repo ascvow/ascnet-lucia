@@ -60,7 +60,7 @@ lucia
 - `model.model`：实际发送给服务商的模型 ID，不是本地显示别名。
 - `model.api_key_env`：保存密钥的环境变量名。也可使用 `api_key` 明文字段；两者同时存在时 `api_key` 优先。
 - `model.openai_protocol`：OpenAI 类服务使用 `responses` 或 `chat-completions`。
-- `model.context_window`：只用于底栏上下文占比展示，不改变请求上限。
+- `model.context_window`：用于底栏上下文占比展示和原生自动压缩水位；估算上下文达到窗口的 80% 时开始压缩。未显式配置时使用当前模型的 models.dev 元数据，切换模型时同步更新压缩器。
 - `agent.max_steps`：一条用户指令连续执行的 ReAct 步数；交互主会话中 `0` 表示不设置总步数上限。
 - `agent.max_tokens`：单次模型响应的最大输出 token 数，是否支持由服务商决定。
 - `agent.stream`：是否使用模型流式接口，默认 `true`；设为 `false` 时等待完整响应。

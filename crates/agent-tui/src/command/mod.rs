@@ -1039,6 +1039,22 @@ impl App {
         }
         self.model_name = entry.model.clone();
         self.refresh_model_metadata(entry);
+        if let Some(context_loader) = &self.native_context_loader {
+            if let Err(error) = context_loader.update_model_route(
+                entry.name.clone(),
+                entry.model.clone(),
+                self.context_window,
+            ) {
+                self.messages.push(Msg::new(
+                    MsgKind::Error,
+                    format!(
+                        "模型已切换为 {}，但上下文压缩配置更新失败：{error}",
+                        entry.name
+                    ),
+                ));
+                return;
+            }
+        }
         self.messages.push(Msg::new(
             MsgKind::Info,
             format!(

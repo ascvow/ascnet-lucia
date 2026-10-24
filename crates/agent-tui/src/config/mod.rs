@@ -48,7 +48,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct TuiSettings {
-    /// 模型上下文窗口，仅供状态栏计算占比，不传入模型请求。
+    /// 模型上下文窗口，用于状态栏占比和原生上下文压缩水位，不传入模型请求。
     #[serde(skip)]
     pub(crate) context_window: Option<u64>,
     /// 内置 models.dev 快照中匹配到的模型能力。
@@ -84,7 +84,7 @@ struct TuiConfigEnvelope {
     tui: TuiSettings,
 }
 
-/// TUI 从 `model` 对象读取的展示元数据，不参与 Core 模型网关配置。
+/// TUI 从 `model` 对象读取的模型元数据，不参与 Core 模型网关配置。
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct TuiModelSettings {
@@ -378,9 +378,9 @@ mod tests {
         fs::remove_dir_all(root).expect("清理兼容配置测试目录");
     }
 
-    /// 模型上下文窗口由 TUI 作为展示元数据读取，零值按未配置处理。
+    /// 模型上下文窗口供状态栏与原生压缩器共用，零值按未配置处理。
     #[test]
-    fn loads_model_context_window_for_status_display() {
+    fn loads_model_context_window_for_display_and_compaction() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("创建配置测试目录");
         let path = root.join("config.json");

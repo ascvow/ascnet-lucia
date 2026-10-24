@@ -43,7 +43,7 @@ use agent_core::event::{
 };
 #[cfg(feature = "plugins")]
 use agent_core::model::ModelProviderConfig;
-use agent_core::{Agent, ContextLoader};
+use agent_core::Agent;
 #[cfg(feature = "plugins")]
 use agent_plugin_host::manifest::load_plugin_runtime_config;
 #[cfg(feature = "plugins")]
@@ -437,10 +437,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let base_agent = Agent::new(gateway, options)
         .with_tools(native_tools)
         .with_event_sink(Arc::clone(&application_events));
-    // 手动压缩发生在 Agent Run 之外，只写应用事件；两条路径使用相同模型路由和策略实现，
-    // 且都不经过 Plugin Host。
+    // 手动与自动压缩共用加载器，确保模型热切换同时更新两条路径的路由与窗口。
+    // 手动压缩发生在 Agent Run 之外，仍只写应用事件，不经过 Plugin Host。
     // 压缩水位由真实上下文窗口推导；窗口未知时压缩器按 200k 假定值兜底。
-    let manual_context_loader: Arc<dyn ContextLoader> = Arc::new(
+    let native_context_loader = Arc::new(
         NativeContextLoader::new(
             base_agent.gateway().clone(),
             base_agent.options().provider.clone(),
@@ -451,18 +451,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         )?
         .with_context_window(context_window),
     );
-    let agent_context_loader: Arc<dyn ContextLoader> = Arc::new(
-        NativeContextLoader::new(
-            base_agent.gateway().clone(),
-            base_agent.options().provider.clone(),
-            base_agent.options().model.clone(),
-            base_agent.options().stream,
-            DEFAULT_MAX_SUMMARY_TOKENS,
-            base_agent.event_sink(),
-        )?
-        .with_context_window(context_window),
-    );
-    let base_agent = base_agent.with_context_loader(agent_context_loader);
+    let base_agent = base_agent.with_context_loader(native_context_loader.clone());
     #[cfg(feature = "plugins")]
     let live_plugin_host = Arc::new(LivePluginHost::new());
     #[cfg(feature = "plugins")]
@@ -531,7 +520,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .with_context_window(context_window)
         .with_reasoning_levels(reasoning_levels, reasoning_level)
         .with_persistent_session(Arc::clone(&session_store), session_record)
-        .with_context_loader(manual_context_loader);
+        .with_native_context_loader(native_context_loader);
     // /model 面板的上游列表来自配置文件；demo 模式没有配置，保持为空。
     if let Some(config) = configured_agent.as_ref() {
         app.model_upstreams = config.upstreams().into_iter().cloned().collect();
