@@ -338,6 +338,16 @@ fn collection_preview(result: &ToolResult, max_lines: usize) -> Option<Vec<Previ
     Some(lines)
 }
 
+/// 判断工具结果携带的是否为编辑类工具的结构化 diff。
+///
+/// 内建 `edit_file` 这类工具在 `content.diff` 里回传统一 diff，它是给界面看的附属
+/// 细节，不是模型回答的正文；摘要行已经报出增删行数，因此这份 diff 不再展开预览。
+/// 命令输出（`shell` 的 `stdout`/`stderr`）不在此列：那是用户主动要的内容，仍按
+/// diff 渲染。
+fn is_edit_diff_result(result: &ToolResult) -> bool {
+    text_field(&result.content, "diff").is_some()
+}
+
 /// 从结构化工具结果中取出可逐行展开的正文。
 ///
 /// 优先读取编辑结果的 `diff`；`content` 覆盖普通正文，`stdout`/`stderr` 覆盖命令类。
@@ -393,6 +403,10 @@ pub(crate) fn preview_lines(
     result: &ToolResult,
     max_lines: usize,
 ) -> Vec<PreviewLine> {
+    // 编辑结果的补丁正文不进预览：行数已经在摘要行里，展开整段只会在看代码时刷屏。
+    if is_edit_diff_result(result) {
+        return Vec::new();
+    }
     // 写入类工具的结果只回传路径与字节数，真正值得预览的是写进去的内容。
     let written = (result.name == "write_file" && !result.is_error)
         .then(|| call.and_then(|call| text_field(&call.args, "content")))
@@ -841,10 +855,7 @@ pub(crate) fn tool_title_spans(name: &str, target: Option<&str>) -> Vec<Span<'st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{
-        COLOR_DIFF_ADD_BG, COLOR_DIFF_ADD_FG, COLOR_DIFF_DEL_BG, COLOR_DIFF_DEL_FG,
-        COLOR_DIFF_FILE_HEADER, COLOR_DIFF_HUNK,
-    };
+    use crate::theme::{COLOR_DIFF_ADD_FG, COLOR_DIFF_FILE_HEADER, COLOR_DIFF_HUNK};
     use serde_json::json;
 
     /// 拼接一行的全部片段文本。
@@ -919,9 +930,9 @@ mod tests {
         );
     }
 
-    /// 真实文件编辑的结构化结果必须显示红色删除、绿色新增及正确摘要。
+    /// 真实文件编辑只报增删行数，不再把补丁正文展开到工具卡片里。
     #[tokio::test]
-    async fn real_file_edit_renders_red_deletion_and_green_addition() {
+    async fn real_file_edit_only_reports_the_change_summary() {
         use agent_tool::{builtins::EditFileTool, Tool, WorkspaceGuard};
         let root = std::env::temp_dir().join(format!(
             "lucia-diff-ui-{}-{:?}",
@@ -942,30 +953,35 @@ mod tests {
         );
         let result = tool.call(call.clone()).await.unwrap();
         assert!(!result.is_error);
-        let lines = preview_lines(Some(&call), &result, 8);
-        assert!(lines.iter().any(
-            |line| matches!(line, PreviewLine::Removed { text, .. } if text == "let old = 1;")
-        ));
-        assert!(lines
-            .iter()
-            .any(|line| matches!(line, PreviewLine::Added { text, .. } if text == "let new = 2;")));
-        let rendered = render_preview(&lines, 80, CodeLanguage::CLike, false);
-        for (text, foreground, background) in [
-            ("let old = 1;", COLOR_DIFF_DEL_FG, COLOR_DIFF_DEL_BG),
-            ("let new = 2;", COLOR_DIFF_ADD_FG, COLOR_DIFF_ADD_BG),
-        ] {
-            assert!(rendered
-                .iter()
-                .flat_map(|line| &line.spans)
-                .any(|span| span.content == text
-                    && span.style.fg == Some(foreground)
-                    && span.style.bg == Some(background)));
-        }
+        // 结果里确实带着 diff，只是界面不再展开它。
+        assert!(result.content["diff"].as_str().is_some_and(|diff| {
+            diff.contains("+let new = 2;") && diff.contains("-let old = 1;")
+        }));
+        assert!(preview_lines(Some(&call), &result, 8).is_empty());
         assert_eq!(
             tool_summary(Some(&call), &result).as_deref(),
             Some("新增 1 行，删除 1 行")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 编辑结果的结构化 `diff` 不进预览，摘要行仍然是增删行数。
+    #[test]
+    fn structured_edit_diff_is_not_previewed() {
+        let result = ToolResult::success(
+            "c",
+            "edit_file",
+            json!({
+                "path": "a.rs",
+                "diff": "--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line"
+            }),
+        );
+
+        assert!(preview_lines(None, &result, 8).is_empty());
+        assert_eq!(
+            tool_summary(None, &result).as_deref(),
+            Some("新增 1 行，删除 1 行")
+        );
     }
 
     /// 纯文本预览（shell 输出）不为标记列留空：省下的列全部让给正文。
