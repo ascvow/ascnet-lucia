@@ -25,8 +25,8 @@ const ASSUMED_CONTEXT_WINDOW_TOKENS: usize = 200_000;
 const COMPACT_THRESHOLD_RATIO: usize = 80;
 /// 完整压缩后保留的近期上下文占窗口的比例。
 ///
-/// 固定 40k 在小窗口上会吃掉整个预算、在百万窗口上又过于吝啬，因此按窗口比例伸缩。
-const RECENT_CONTEXT_TARGET_RATIO: usize = 20;
+/// 提高到 30% 以保留更多最近 API 轮次；摘要输出仍会预留最多一半的压缩预算。
+const RECENT_CONTEXT_TARGET_RATIO: usize = 30;
 /// 保留区内单个工具结果允许的最大字符数。
 ///
 /// 超过该长度的结果保留首尾片段：巨型日志和堆栈的中段几乎不携带增量信息，
@@ -295,6 +295,11 @@ impl NativeContextLoader {
                 && cache.system == request.system
                 && request.messages.len() >= cache.source_message_count
         });
+        let micro_budget = compaction_budget(
+            summary_model.context_window,
+            summary_model.max_summary_tokens as usize,
+        )
+        .micro;
         // 缓存命中判定只覆盖已压缩前缀。需要为新缓存计算全量摘要时从同一哈希状态
         // 继续追加剩余消息，避免把整段历史重复扫描两遍。
         let mut prefix_digest = Sha256::new();
@@ -309,27 +314,50 @@ impl NativeContextLoader {
             }
             None => false,
         };
+        let mut estimated_tokens = None;
         let source_messages_digest = if let Some(cache) = cache_candidate
             .filter(|cache| cache_hit && request.messages.len() == cache.source_message_count)
         {
             Some(cache.source_messages_digest)
-        } else if cache_hit
-            || estimate_context_tokens(request.system.as_deref(), &request.messages)
-                >= compaction_budget(
-                    summary_model.context_window,
-                    summary_model.max_summary_tokens as usize,
-                )
-                .micro
-        {
+        } else if cache_hit {
             match prefix_len {
                 Some(prefix_len) => {
                     hash_messages_into(&mut prefix_digest, &request.messages[prefix_len..])?;
                     Some(<[u8; 32]>::from(prefix_digest.finalize()))
                 }
-                None => Some(message_digest(&request.messages)?),
+                None => unreachable!("缓存命中时必须存在有效的缓存前缀"),
             }
         } else {
-            None
+            let (before_tokens, full_digest) = if cache_candidate.is_none() {
+                let metrics = message_metrics(&request.messages)?;
+                (
+                    request
+                        .system
+                        .as_deref()
+                        .map_or(0, estimate_text_tokens)
+                        .saturating_add(metrics.tokens),
+                    Some(metrics.digest),
+                )
+            } else {
+                (
+                    estimate_context_tokens(request.system.as_deref(), &request.messages),
+                    None,
+                )
+            };
+            estimated_tokens = Some(before_tokens);
+            if before_tokens < micro_budget {
+                None
+            } else if let Some(full_digest) = full_digest {
+                Some(full_digest)
+            } else {
+                match prefix_len {
+                    Some(prefix_len) => {
+                        hash_messages_into(&mut prefix_digest, &request.messages[prefix_len..])?;
+                        Some(<[u8; 32]>::from(prefix_digest.finalize()))
+                    }
+                    None => unreachable!("未命中缓存时必须使用完整消息摘要"),
+                }
+            }
         };
         // 缓存未命中说明前缀不是上一轮的延续，清理边界必须从零重新推导。
         let micro_floor = cache
@@ -344,6 +372,7 @@ impl NativeContextLoader {
             system: request.system.clone(),
             source_message_count: request.messages.len(),
             source_messages_digest,
+            estimated_tokens,
             micro_floor,
             cache_hit,
         };
@@ -432,6 +461,8 @@ enum CachePlan {
         source_message_count: usize,
         /// 本轮原始消息的稳定摘要；未达到压缩水位且没有旧缓存时延迟计算。
         source_messages_digest: Option<[u8; 32]>,
+        /// 无缓存透传路径已经计算出的原始 token 估算，避免压缩阶段再次序列化。
+        estimated_tokens: Option<usize>,
         /// 本轮允许沿用的微压缩清理边界下限。
         micro_floor: usize,
         cache_hit: bool,
@@ -451,6 +482,16 @@ impl CachePlan {
         match self {
             Self::Manual { .. } => 0,
             Self::Automatic { micro_floor, .. } => *micro_floor,
+        }
+    }
+
+    /// 返回可直接传给压缩决策的原始 token 估算；缓存命中时必须重新估算有效上下文。
+    fn estimated_tokens(&self) -> Option<usize> {
+        match self {
+            Self::Manual { .. } => None,
+            Self::Automatic {
+                estimated_tokens, ..
+            } => *estimated_tokens,
         }
     }
 
@@ -480,12 +521,13 @@ impl ContextLoader for NativeContextLoader {
             summary_model.max_summary_tokens as usize,
         );
         let reuse_original_messages = plan.can_reuse_original_messages();
-        let outcome = compress_context(
+        let outcome = compress_context_with_tokens(
             effective.clone(),
             effective.user_initiated,
             budget,
             summary_model.as_ref(),
             plan.micro_floor(),
+            plan.estimated_tokens(),
         )
         .await?;
         self.commit_cache(plan, &outcome)?;
@@ -560,6 +602,7 @@ trait ContextSummarizer: Send + Sync {
 ///
 /// `micro_floor` 是上一轮已生效的微压缩清理边界；本轮只在积压足够时才向后推进，
 /// 使多数轮次的上下文前缀保持稳定。
+#[cfg(test)]
 async fn compress_context(
     request: ContextLoadRequest,
     manual: bool,
@@ -567,8 +610,21 @@ async fn compress_context(
     summarizer: &dyn ContextSummarizer,
     micro_floor: usize,
 ) -> Result<CompressionOutcome> {
+    compress_context_with_tokens(request, manual, budget, summarizer, micro_floor, None).await
+}
+
+/// 使用调用方已经完成的 token 估算执行压缩，避免透传路径重复序列化消息。
+async fn compress_context_with_tokens(
+    request: ContextLoadRequest,
+    manual: bool,
+    budget: CompactionBudget,
+    summarizer: &dyn ContextSummarizer,
+    micro_floor: usize,
+    estimated_tokens: Option<usize>,
+) -> Result<CompressionOutcome> {
     let before_messages = request.messages.len();
-    let before_tokens = estimate_context_tokens(request.system.as_deref(), &request.messages);
+    let before_tokens = estimated_tokens
+        .unwrap_or_else(|| estimate_context_tokens(request.system.as_deref(), &request.messages));
     let CompactionBudget {
         compact: compact_threshold,
         micro: micro_threshold,
@@ -767,10 +823,14 @@ fn compaction_budget(context_window: Option<usize>, summary_tokens: usize) -> Co
         .filter(|window| *window > 0)
         .unwrap_or(ASSUMED_CONTEXT_WINDOW_TOKENS);
     let compact = percentage_of(window, COMPACT_THRESHOLD_RATIO).max(1);
+    let summary_reserve = summary_tokens.min(compact / 2);
+    let recent_target = percentage_of(window, RECENT_CONTEXT_TARGET_RATIO)
+        .min(compact.saturating_sub(summary_reserve))
+        .max(1);
     CompactionBudget {
         compact,
         micro: compact,
-        recent_target: percentage_of(window, RECENT_CONTEXT_TARGET_RATIO).max(1),
+        recent_target,
         summary_max_tokens: u32::try_from(summary_tokens).unwrap_or(u32::MAX).max(1),
     }
 }
@@ -812,6 +872,7 @@ fn hash_messages_into(digest: &mut Sha256, messages: &[Value]) -> Result<()> {
 }
 
 /// 计算消息序列的稳定摘要；零字节分隔符用于保留消息边界。
+#[cfg(test)]
 fn message_digest(messages: &[Value]) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
     hash_messages_into(&mut digest, messages)?;
@@ -834,6 +895,61 @@ impl TokenCountingWriter {
     fn tokens(&self) -> usize {
         self.ascii_bytes.div_ceil(4) + self.non_ascii_bytes.div_ceil(3)
     }
+}
+
+/// 单次消息序列化同时产出的摘要和 token 估算。
+#[derive(Debug, Clone, Copy)]
+struct MessageMetrics {
+    digest: [u8; 32],
+    tokens: usize,
+}
+
+/// 把序列化字节同时写入摘要器并统计 ASCII / 非 ASCII 字节数。
+struct TokenDigestWriter<'a> {
+    digest: &'a mut Sha256,
+    ascii_bytes: usize,
+    non_ascii_bytes: usize,
+}
+
+impl TokenDigestWriter<'_> {
+    /// 返回当前消息的粗略 token 数。
+    fn tokens(&self) -> usize {
+        self.ascii_bytes.div_ceil(4) + self.non_ascii_bytes.div_ceil(3)
+    }
+}
+
+impl Write for TokenDigestWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.digest.update(buffer);
+        let non_ascii_bytes = buffer.iter().filter(|byte| !byte.is_ascii()).count();
+        self.non_ascii_bytes += non_ascii_bytes;
+        self.ascii_bytes += buffer.len() - non_ascii_bytes;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 单次遍历消息，取得完整摘要和 token 估算，避免两次序列化同一批 JSON。
+fn message_metrics(messages: &[Value]) -> Result<MessageMetrics> {
+    let mut digest = Sha256::new();
+    let mut tokens = 0usize;
+    for message in messages {
+        let mut writer = TokenDigestWriter {
+            digest: &mut digest,
+            ascii_bytes: 0,
+            non_ascii_bytes: 0,
+        };
+        serde_json::to_writer(&mut writer, message).context("计算上下文消息指标失败")?;
+        tokens = tokens.saturating_add(writer.tokens());
+        digest.update([0]);
+    }
+    Ok(MessageMetrics {
+        digest: digest.finalize().into(),
+        tokens,
+    })
 }
 
 impl Write for TokenCountingWriter {
@@ -1113,7 +1229,7 @@ fn api_round_group_starts(messages: &[Value]) -> Vec<usize> {
     starts
 }
 
-/// 自动模式保留约 40k 尾部；手动模式只保留最新完整轮次以确保实际发生压缩。
+/// 自动模式保留窗口约 30% 的近期尾部；手动模式只保留最新完整轮次以确保实际发生压缩。
 fn recent_tail_start(
     messages: &[Value],
     group_starts: &[usize],
@@ -1406,6 +1522,12 @@ mod tests {
             estimate_context_tokens(None, &messages),
             expected_total,
             "整体估算必须等于逐条字符串折算之和"
+        );
+        let metrics = message_metrics(&messages).expect("消息指标应可一次计算");
+        assert_eq!(metrics.tokens, expected_total);
+        assert_eq!(
+            metrics.digest,
+            message_digest(&messages).expect("摘要应可重复计算")
         );
     }
 
