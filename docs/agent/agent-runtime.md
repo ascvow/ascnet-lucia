@@ -71,15 +71,17 @@ let follow_up = provisioned
 
 Host 为每次受限组件激活创建唯一 `RuntimePrincipal`。principal 拥有独立 controller 和派生树；插件请求不能填写 owner 或 parent。插件卸载时，Host 通过 provisioner 撤销 principal，取消并清理其全部 Runtime 资源。
 
-每个 controller、首次派生和 `continue_agent` 创建的后续 Agent 都计入该 principal 的累计 Agent 总数。Agent 进入终态不会返还名额，避免通过快速创建并结束任务绕过生命周期预算；只有撤销 principal 才会清理整份账本。父节点深度或子节点数检查失败时，尚未形成 Agent 的临时预留会回滚。
+每个 controller、首次派生和 `continue_agent` 创建的后续 Agent 都计入该 principal 的累计 Agent 总数。Agent 进入终态不会返还名额，避免通过快速创建并结束任务绕过生命周期预算；只有撤销 principal 才会清理整份账本。父节点深度或子节点数检查失败时，尚未形成 Agent 的临时预留会回滚。每个父节点的累计子节点配额与 principal 的 Agent 总数对齐（默认 128），否则长期交互 controller 会在第 16 次顺序派生成员后永久失败；并发扇出仍由 `max_concurrent_agents` 限制，需要更严格扇出的部署可通过执行策略显式收紧子配额。
 
 派生 Agent 的每个最终 `ModelRequest` 在 provider 调用前原子预留三项累计资源：请求次数、provider-neutral 请求的 JSON 序列化字节数和 `max_tokens` 声明的输出 token。字节预算统计的是 adapter 转换前的可信请求，不等同于最终网络 body；计数使用有界 writer，超限时不会先复制完整请求。任一维度超限时 provider 不会收到请求；provider 随后失败也不返还预留，防止失败重试绕过预算。执行策略或 Agent 已设置的单次输出上限优先；两者都未设置时 Runtime 为派生 Agent 注入 20,000 token 的有限默认值。
+
+三项累计预算按「一次失控的派生树」而不是「一次交互会话的寿命」设定：默认值按 128 个派生 Agent × worker 单次运行 64 步估算为 8192 次请求，字节按每次 128 KiB 估算为 1 GiB，输出按每次 4K 实际用量估算为 32M token。额度小于派生拓扑上限时，长会话会在某个不可见的时间点开始永久拒绝新请求，表现为成员先运行一段时间再整体失败；需要更严格成本的部署应同时收紧拓扑上限，而不是只压低累计预算。
 
 内置 OpenAI 与 Anthropic adapter 把这个 `max_tokens` 继续作为最终 wire 输出硬上限：合并 `provider_options` 后重新覆盖主 token 字段，把已出现的常见顶层 token 别名收窄到同一上限，并把多候选参数固定为一。Anthropic extended thinking 也必须在该总上限内分配思考与可见输出，预算不足时直接拒绝，不会隐式扩容。第三方 adapter 若要保留 Runtime 的累计输出保证，也必须把 `ModelRequest.max_tokens` 作为不可放宽的最终请求上限。
 
 Runtime 的 controller profile 由应用注册，决定基础模型、工具和权限。Plugin Host 还会把 Guest 可见的 spawn profile 映射为受控的 `AgentDeriveConfig`。Guest 只能提交 profile 名称和任务输入，不能直接传入 provider、API key、provider options 或工具权限。
 
-Lucia TUI 的 `worker` profile 使用显式只读 allowlist：`list_directory`、`search_files`、`read_file` 和 `skill_read`。它不继承 `shell`、`write_file` 或未来新增工具；需要副作用的工作必须回到经过主 Agent 权限策略的调用链。
+Lucia TUI 的 `worker` profile 使用显式只读 allowlist：`list_directory`、`search_files`、`read_file` 和 `skill_read`。它不继承 `shell`、`write_file` 或未来新增工具；需要副作用的工作必须回到经过主 Agent 权限策略的调用链。worker 单次运行的 ReAct 步数始终有界：主会话配置为 `0`（不设上限）时使用 64，配置了更小正数时保持该值。无界成员运行会连续占用 principal 的累计模型预算，最终让同一会话里后续的所有成员都在中途失败。
 
 应用通过可选宿主服务把 Runtime 注入 WASM loader：
 

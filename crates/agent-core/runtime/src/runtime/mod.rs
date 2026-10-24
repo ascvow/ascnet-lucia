@@ -800,7 +800,7 @@ impl ModelRequestGate for PrincipalModelRequestGate {
     ///
     /// `before_request` 按 `max_tokens` 预留，而实际输出通常远小于这个上限（模型声明
     /// 的上限可达数十万 token，一次回答只有一千上下）。若只预留不结算，默认预算会在
-    /// 几十次请求后被耗尽，把"允许 512 次请求"变成"允许 26 次"。本方法把预留替换为
+    /// 几十次请求后被耗尽，把"允许 8192 次请求"变成"允许几十次"。本方法把预留替换为
     /// 实际用量，使请求次数上限重新成为真正起作用的约束。
     fn settle_request(&self, reserved_output_tokens: usize, actual_output_tokens: Option<u64>) {
         let actual = actual_output_tokens.unwrap_or(0).min(usize::MAX as u64) as usize;

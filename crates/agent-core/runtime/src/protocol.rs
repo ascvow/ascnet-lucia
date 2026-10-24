@@ -21,14 +21,27 @@ const AGENT_EVENT_HISTORY_LIMIT: usize = 512;
 /// Serve 平面单 principal 默认允许登记的 Agent 累计总数。
 const DEFAULT_MAX_AGENTS_PER_PRINCIPAL: usize = 128;
 
-/// Serve 平面单 principal 默认允许发起的 Agent 模型请求累计次数。
-const DEFAULT_MAX_AGENT_MODEL_REQUESTS_PER_PRINCIPAL: usize = 512;
+/// 单 principal 默认允许发起的 Agent 模型请求累计次数。
+///
+/// 该额度是失控保护，而不是交互会话的寿命配额。派生根身份默认上限为 128，
+/// worker profile 的单次运行步数上限为 64，128 × 64 = 8192 正好覆盖一个
+/// 满载拓扑；额度低于此值时，长会话会在某个不可见的时间点开始永久拒绝新请求，
+/// 表现为「成员先运行一段时间再整体失败」。
+const DEFAULT_MAX_AGENT_MODEL_REQUESTS_PER_PRINCIPAL: usize = 8_192;
 
-/// Serve 平面单 principal 默认允许提交的 Agent 模型请求累计序列化字节数。
-const DEFAULT_MAX_AGENT_MODEL_REQUEST_BYTES_PER_PRINCIPAL: usize = 64 * 1024 * 1024;
+/// 单 principal 默认允许提交的 Agent 模型请求累计序列化字节数。
+///
+/// 与请求次数同量级：按平均每次 128 KiB 的 provider-neutral 请求估算，
+/// 8192 × 128 KiB = 1 GiB。它的职责是拦住超大上下文反复上传，而不是限制
+/// 一次会话能工作多久。
+const DEFAULT_MAX_AGENT_MODEL_REQUEST_BYTES_PER_PRINCIPAL: usize = 1024 * 1024 * 1024;
 
-/// Serve 平面单 principal 默认允许预留的 Agent 模型输出 token 累计总数。
-const DEFAULT_MAX_AGENT_MODEL_OUTPUT_TOKENS_PER_PRINCIPAL: usize = 512 * 20_000;
+/// 单 principal 默认允许消耗的 Agent 模型输出 token 累计总数。
+///
+/// 请求结束后按服务商回报的实际用量结算，因此这里约束真实输出成本。
+/// 按每次请求平均 4K 实际输出估算，8192 × 4K = 32M token；常见编码任务
+/// 每次请求只有 1K 上下，正常长会话不会触顶。
+const DEFAULT_MAX_AGENT_MODEL_OUTPUT_TOKENS_PER_PRINCIPAL: usize = 32 * 1024 * 1024;
 
 /// 为旧版 RuntimeLimits JSON 补充安全的单 principal Agent 总数默认值。
 const fn default_max_agents_per_principal() -> usize {
@@ -56,6 +69,11 @@ pub struct RuntimeLimits {
     /// 根节点以下允许的最大派生深度。
     pub max_depth: usize,
     /// 单个父节点在其生命周期内允许创建的累计子节点数量。
+    ///
+    /// 与 `max_agents_per_principal` 对齐：长期交互 controller 会在一生中顺序派生
+    /// 多批成员，容量小于 principal 的 Agent 总数时，会话会在第 16 次派生后永久
+    /// 拒绝新成员；真正限制并发扇出的是 `max_concurrent_agents`。需要更严格扇出的
+    /// 部署应通过执行策略显式收紧该值。
     pub max_children_per_agent: usize,
     /// 同时执行模型循环的最大 Agent 数量；额外任务保持排队状态。
     pub max_concurrent_agents: usize,
@@ -80,7 +98,7 @@ impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
             max_depth: 8,
-            max_children_per_agent: 16,
+            max_children_per_agent: 128,
             max_concurrent_agents: 8,
             max_agents_per_principal: DEFAULT_MAX_AGENTS_PER_PRINCIPAL,
             max_agent_model_requests_per_principal: DEFAULT_MAX_AGENT_MODEL_REQUESTS_PER_PRINCIPAL,
@@ -507,4 +525,36 @@ pub trait AgentRuntimeProvisioner: Send + Sync {
 
     /// 撤销 principal，取消并清理其全部 controller 和派生任务。
     async fn revoke(&self, principal: &RuntimePrincipal) -> usize;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 默认拓扑配额必须覆盖满载派生，不能变成会话寿命配额。
+    ///
+    /// 默认拓扑允许 128 个派生 Agent；按 worker 单次运行 64 步计算，满载需要
+    /// 8192 次请求。配额小于该值时，正常的长会话会在中途永久拒绝新请求，
+    /// 表现为「成员先运行一段时间再整体失败」，而状态里没有可解释的原因。
+    #[test]
+    fn default_limits_cover_full_derivation_topology() {
+        let limits = RuntimeLimits::default();
+
+        assert!(
+            limits.max_children_per_agent >= limits.max_agents_per_principal,
+            "父节点子配额不能先于 principal 的 Agent 总数耗尽"
+        );
+        assert!(
+            limits.max_agent_model_requests_per_principal >= limits.max_agents_per_principal * 64,
+            "请求预算必须覆盖默认拓扑允许的全部 Agent 运行"
+        );
+        assert!(
+            limits.max_agent_model_request_bytes_per_principal >= 1024 * 1024 * 1024,
+            "字节预算必须容纳 8192 次 128 KiB 请求"
+        );
+        assert!(
+            limits.max_agent_model_output_tokens_per_principal >= 32 * 1024 * 1024,
+            "输出预算必须容纳 8192 次 4K 实际输出"
+        );
+    }
 }

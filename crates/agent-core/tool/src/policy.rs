@@ -326,10 +326,19 @@ impl ExecutionPolicy {
             allow_process: true,
             limits: ResourceLimits {
                 max_processes: Some(8),
+                // 长期交互 controller 会顺序派生多批成员；每个父节点的累计子配额必须
+                // 至少覆盖 principal 的 Agent 总数，否则会话在第 16 次派生后就会永久
+                // 拒绝新成员。并发扇出仍由 max_concurrent_agents 限制。
+                max_children_per_agent: Some(128),
                 max_agents_per_principal: Some(128),
-                max_agent_model_requests_per_principal: Some(512),
-                max_agent_model_request_bytes_per_principal: Some(64 * 1024 * 1024),
-                max_agent_model_output_tokens_per_principal: Some(512 * 20_000),
+                // 这三项是失控保护，不是交互会话的寿命配额：额度按「128 个派生 Agent ×
+                // worker 单次运行 64 步」估算（8192 次请求），字节按每次 128 KiB
+                // （1 GiB）、输出按每次 4K 实际用量（32M token）估算。额度小于拓扑上限
+                // 时，长会话会在某个不可见的时间点开始永久拒绝新请求，且用户很难从
+                // 「成员先运行一段时间再失败」判断原因。
+                max_agent_model_requests_per_principal: Some(8_192),
+                max_agent_model_request_bytes_per_principal: Some(1024 * 1024 * 1024),
+                max_agent_model_output_tokens_per_principal: Some(32 * 1024 * 1024),
                 // 交互插件长期驻留，审核次数与累计输入不应随使用时间耗尽；调用方仍可显式收紧。
                 max_plugin_model_completions: None,
                 max_plugin_model_input_bytes: None,
@@ -552,6 +561,42 @@ mod tests {
         assert!(policy.permits_network_access());
         assert!(policy.permits_secret_access());
         assert!(policy.permits_process_execution());
+    }
+
+    /// Serve 的拓扑配额必须覆盖一个满载派生拓扑，而不是变成会话寿命配额。
+    ///
+    /// 128 个派生 Agent × worker 单次运行 64 步 = 8192 次请求；配额低于它时，
+    /// 正常的长会话会在中途撞到累计上限，之后所有派生 Agent 都只能失败。
+    #[test]
+    fn serve_limits_cover_full_derivation_topology() {
+        let policy = ExecutionPolicy::serve();
+        let limits = &policy.limits;
+        let agents = limits
+            .max_agents_per_principal
+            .expect("Serve 必须声明 principal 的 Agent 上限");
+
+        assert!(
+            limits.max_children_per_agent.unwrap_or(0) >= agents,
+            "父节点子配额必须至少覆盖 {agents} 个派生 Agent"
+        );
+        assert!(
+            limits.max_agent_model_requests_per_principal.unwrap_or(0) >= agents * 64,
+            "请求预算必须覆盖 {agents} 个 Agent 各 64 步"
+        );
+        assert!(
+            limits
+                .max_agent_model_request_bytes_per_principal
+                .unwrap_or(0)
+                >= 1024 * 1024 * 1024,
+            "字节预算至少容纳 8192 次 128 KiB 请求"
+        );
+        assert!(
+            limits
+                .max_agent_model_output_tokens_per_principal
+                .unwrap_or(0)
+                >= 32 * 1024 * 1024,
+            "输出预算至少容纳 8192 次 4K 实际输出"
+        );
     }
 
     /// Serve 平面显式收紧为零进程时，工具暴露和真实进程入口都必须拒绝。

@@ -103,10 +103,10 @@ pub enum AgentRuntimeError {
         limit: usize,
     },
 
-    /// 单个 principal 的派生 Agent 模型输出 token 累计预留量超过上限。
-    #[error("principal 的 Agent 模型输出 token 累计预留量超过上限 {limit}")]
+    /// 单个 principal 的派生 Agent 模型输出 token 累计用量超过上限。
+    #[error("principal 的 Agent 模型输出 token 累计用量超过上限 {limit}")]
     MaxAgentModelOutputTokensPerPrincipalExceeded {
-        /// 当前激活生命周期允许预留的最大模型输出 token 数。
+        /// 当前激活生命周期允许消耗的最大模型输出 token 数。
         limit: usize,
     },
 

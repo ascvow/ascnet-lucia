@@ -98,6 +98,12 @@ struct MemberSnapshot {
     status: AgentStatus,
     /// 当前成员尚未确认的消息数量。
     unread_messages: usize,
+    /// 成员失败时的终态原因；仅失败后出现，属于加法字段。
+    ///
+    /// 没有它时列表只显示 `failed`，用户无法判断是模型预算、provider 还是工具问题，
+    /// 只能再额外调用一次 `teammate_result`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// 插件维护的成员状态。
@@ -109,6 +115,8 @@ struct Member {
     captain: bool,
     current: AgentHandle,
     status: AgentStatus,
+    /// 最近一次观察到的失败终态原因；成功或运行中保持 `None`。
+    error: Option<String>,
     /// 最近一次通过工具调用管理该成员的 controller 运行 ID。
     ///
     /// 成员在运行结束后是否该解散，取决于管理它的那一轮是否已经结束；Service 调用
@@ -126,6 +134,7 @@ impl Member {
             captain: self.captain,
             status: self.status,
             unread_messages,
+            error: self.error.clone(),
         }
     }
 }
@@ -186,6 +195,7 @@ impl TeamState {
             captain,
             current: handle,
             status: AgentStatus::Queued,
+            error: None,
             last_controller_run: controller_run,
         };
         let snapshot = member.snapshot(&address, 0);
@@ -276,7 +286,11 @@ impl TeamState {
         outcome: Option<AgentOutcome>,
     ) -> Result<MemberSnapshot> {
         let unread = self.mailboxes.get(address).map_or(0, VecDeque::len);
-        let snapshot = self.member(owner, address)?.snapshot(address, unread);
+        let mut snapshot = self.member(owner, address)?.snapshot(address, unread);
+        // 回收时补齐失败原因：终态结果已经拿到，不需要 controller 再查询一次。
+        if let Some(AgentOutcome::Failed { error }) = &outcome {
+            snapshot.error = Some(error.clone());
+        }
         self.members.remove(address);
         self.mailboxes.remove(address);
         while self.retired.len() >= MAX_RETIRED_MEMBERS {
@@ -481,6 +495,8 @@ impl TeamState {
             .ok_or_else(|| anyhow!("Teammate 成员不存在：{}", address.as_str()))?;
         member.current = handle;
         member.status = AgentStatus::Queued;
+        // 新一次运行开始后，旧的失败原因已经不能代表当前句柄。
+        member.error = None;
         Ok(())
     }
 }
@@ -648,6 +664,9 @@ impl TeammatePlugin {
     }
 
     /// 查询成员当前 Agent 句柄的 Runtime 状态。
+    ///
+    /// 状态为失败时顺带读取一次终态结果，把原因存入成员快照并在响应中返回，
+    /// 避免调用方在状态里只能看到 `failed`。
     fn status(
         &mut self,
         host: &dyn PluginHostApi,
@@ -664,8 +683,24 @@ impl TeammatePlugin {
             .id
             .clone();
         let snapshot = host.agent_status(&target)?;
-        self.state.member_mut(owner, &request.member_id)?.status = snapshot.status;
-        Ok(json!({"snapshot": snapshot}))
+        let failure_reason = if snapshot.status == AgentStatus::Failed {
+            match host.agent_result(&target) {
+                Ok(Some(AgentOutcome::Failed { error })) => Some(error),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let member = self.state.member_mut(owner, &request.member_id)?;
+        member.status = snapshot.status;
+        if let Some(error) = &failure_reason {
+            member.error = Some(error.clone());
+        }
+        let mut response = json!({ "snapshot": snapshot });
+        if let Some(error) = failure_reason {
+            response["error"] = json!(error);
+        }
+        Ok(response)
     }
 
     /// 查询成员当前 Agent 句柄的幂等终态结果。
@@ -1188,6 +1223,14 @@ impl TeammatePlugin {
                 Some(status_color(member.status)),
                 false,
             )]));
+            if let Some(error) = &member.error {
+                // 失败原因可能是预算或 provider 的完整错误链，截断到一行避免把面板撑开。
+                lines.push(ui_line(vec![ui_span(
+                    format!("Error  {}", clipped(error, 60)),
+                    Some(UiColor::Red),
+                    false,
+                )]));
+            }
             lines.push(ui_line(vec![ui_span(
                 format!("{}  {}", "Address", member.id.as_str()),
                 Some(UiColor::Gray),
@@ -1293,24 +1336,45 @@ impl TeammatePlugin {
             if let Ok(member) = self.state.member_mut(&owner, &member_id) {
                 member.current = handle;
                 member.status = AgentStatus::Queued;
+                member.error = None;
             }
         }
     }
 
     /// 刷新当前工具 owner 名下全部成员的 Runtime 状态缓存。
+    ///
+    /// 状态进入失败终态时顺带读取一次幂等的终态结果，把原因记到成员快照里；否则
+    /// 团队面板只能显示 `failed`，用户无法判断是模型预算、provider 还是工具问题。
+    /// 原因只取一次，已记录的成员不会在后续帧重复查询。
     fn refresh_ui_statuses(&mut self, host: &dyn PluginHostApi) {
         let owner = self.plugin_id.clone().unwrap_or_default();
         let targets = self
             .state
             .list_members(&owner)
             .into_iter()
-            .map(|member| (member.id, member.current_agent_id))
+            .map(|member| (member.id, member.current_agent_id, member.error.is_some()))
             .collect::<Vec<_>>();
-        for (address, target) in targets {
+        for (address, target, has_error) in targets {
             if let Ok(snapshot) = host.agent_status(&target) {
                 if let Ok(member) = self.state.member_mut(&owner, &address) {
                     member.status = snapshot.status;
                 }
+            }
+            let failed_without_reason = !has_error
+                && self
+                    .state
+                    .members
+                    .get(&address)
+                    .is_some_and(|member| member.status == AgentStatus::Failed);
+            if !failed_without_reason {
+                continue;
+            }
+            let error = match host.agent_result(&target) {
+                Ok(Some(AgentOutcome::Failed { error })) => Some(error),
+                _ => None,
+            };
+            if let (Some(error), Ok(member)) = (error, self.state.member_mut(&owner, &address)) {
+                member.error = Some(error);
             }
         }
     }
@@ -2211,6 +2275,16 @@ mod tests {
                 .outcome,
             outcome
         );
+        assert_eq!(
+            state
+                .retired_member("owner", &member.id)
+                .expect("台账应保留快照")
+                .snapshot
+                .error
+                .as_deref(),
+            Some("boom"),
+            "回收快照必须携带失败原因"
+        );
         let error = state
             .member("owner", &member.id)
             .expect_err("活跃目录不应再有该成员");
@@ -2254,6 +2328,32 @@ mod tests {
                 &AgentId::parse(format!("member-{}", MAX_RETIRED_MEMBERS + 1)).expect("测试 ID")
             )
             .is_some());
+    }
+
+    /// 成员快照的失败原因必须是加法字段：正常成员不输出空字段，失败后可直接看到。
+    #[test]
+    fn member_snapshot_serializes_optional_failure_reason() {
+        let mut state = TeamState::default();
+        let member = state
+            .add_member("owner", "worker".into(), false, handle("member"), None)
+            .expect("成员应登记成功");
+
+        let running = serde_json::to_value(&member).expect("快照应可序列化");
+        assert!(
+            running.get("error").is_none(),
+            "运行中的成员不应输出空 error 字段"
+        );
+
+        state
+            .member_mut("owner", &member.id)
+            .expect("成员存在")
+            .error = Some("principal 的 Agent 模型请求累计次数超过上限".into());
+        let failed = state.list_members("owner").remove(0);
+        let value = serde_json::to_value(&failed).expect("快照应可序列化");
+        assert_eq!(
+            value["error"],
+            "principal 的 Agent 模型请求累计次数超过上限"
+        );
     }
 
     /// 插件必须声明可聚焦团队入口和全屏工作台，并在摘要中渲染成员状态。
