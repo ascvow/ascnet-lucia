@@ -457,6 +457,23 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         );
     }
 
+    #[cfg(not(feature = "plugins"))]
+    startup_notices.push("纯 Core 模式未配置工具审批策略；Shell 属于完整原生进程信任。".into());
+    if let Some(config) = configured_agent.as_ref() {
+        for upstream in config.upstreams() {
+            if upstream
+                .base_url
+                .as_deref()
+                .is_some_and(|url| url.trim().starts_with("http://"))
+            {
+                // 不回显 URL 或凭证，只提示传输语义；本地端点也不冒充 TLS。
+                startup_notices
+                    .push("注意：模型端点使用明文 HTTP，凭证和会话内容不受 TLS 保护。".into());
+                break;
+            }
+        }
+    }
+
     // 项目约定并入系统提示：模型从第一次请求就知道本项目的规矩，且随 system 段进入
     // 提示缓存前缀，不会每轮重复计费。
     let project_instructions =
@@ -796,11 +813,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 terminal.draw(|frame| {
                     render_root(frame, &mut app);
                     app.render_text_selection(frame.buffer_mut());
+                    crate::ui::sanitize_terminal_buffer(frame.buffer_mut());
                 })
             })??;
             // 复制一份帧缓冲区：鼠标选择需要读取刚绘制的内容，而终端在下一次绘制时
             // 会复用同一块缓冲区，跨迭代持有借用会与可变借用冲突。
             rendered_buffer.clone_from(rendered.buffer);
+            needs_redraw = false;
             if let Some(probe) = probe.as_ref() {
                 probe.record_frame(frame_started.elapsed(), revealed);
             }
@@ -822,8 +841,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         } else {
             rx.recv().await
         };
-        // 任何事件都可能改变界面；只有 tick 需要按动画状态判断是否值得刷新。
-        needs_redraw = !matches!(event, Some(UiEvent::Tick)) || app.tick_requires_redraw();
+        // 普通移动由实际悬停变化及插件路由标脏，不丢弃输入事件。
+        needs_redraw |= event_requires_redraw(event.as_ref(), app.tick_requires_redraw());
 
         match event {
             Some(UiEvent::Input(Event::Key(key))) => {
@@ -1068,20 +1087,27 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
             }
             #[cfg(feature = "plugins")]
-            Some(UiEvent::PluginsLoaded(result)) => match *result {
-                Ok(()) => {
-                    app.finish_progressive_plugin_loading();
-                }
-                Err(error) => {
-                    app.set_progressive_plugin_load_error(&error);
-                    app.messages.push(Msg::new(
+            Some(UiEvent::PluginsLoaded(result)) => {
+                match *result {
+                    Ok(()) => {
+                        app.finish_progressive_plugin_loading();
+                        if plugin_host.as_ref().is_some_and(|host| {
+                            matches!(host.planned_capability_owner("agent.tool-policy"), Ok(None))
+                        }) {
+                            app.messages.push(Msg::new(MsgKind::Info, "未配置工具审批策略；文件工具边界仍生效，Shell 属于完整原生进程信任。"));
+                        }
+                    }
+                    Err(error) => {
+                        app.set_progressive_plugin_load_error(&error);
+                        app.messages.push(Msg::new(
                         MsgKind::Error,
                         format!(
                             "Plugin load planning failed; currently ready plugins were retained: {error}"
                         ),
                     ));
+                    }
                 }
-            },
+            }
             #[cfg(feature = "plugins")]
             Some(UiEvent::SessionsQueryDone {
                 plugin_id,
@@ -1412,11 +1438,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 // 不能再落到主界面的选区与滚动条热区上。
                 #[cfg(feature = "plugins")]
                 if app.active_agent_session_route().is_some() {
+                    needs_redraw |= app.handle_mouse_event(&mouse);
                     app.handle_agent_session_mouse(&mouse);
                     continue;
                 }
                 // 悬停态先更新：它只影响滚动条的宽度与配色，不消费事件。
-                app.handle_mouse_event(&mouse);
+                needs_redraw |= app.handle_mouse_event(&mouse);
                 // 滚动条与回到底部热区都先于拖选判定：否则按下会被当成一次选择起点。
                 if app.handle_scrollbar_drag(&mouse) {
                     continue;
@@ -1432,7 +1459,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 if app.handle_queued_input_click(&mouse) {
                     continue;
                 }
+                let selection_before = (app.text_selection, app.has_copyable_text_selection());
                 app.handle_text_selection(&mouse, &rendered_buffer);
+                needs_redraw |=
+                    selection_before != (app.text_selection, app.has_copyable_text_selection());
                 if app.handle_tool_message_click(&mouse) {
                     continue;
                 }
@@ -1440,6 +1470,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 {
                     let dialog_active = app.active_dialog_index().is_some();
                     if let Some(input) = app.route_plugin_mouse(&mouse) {
+                        needs_redraw = true;
                         if let Some(host) = plugin_host.as_ref() {
                             if let Err(error) = dispatch_plugin_input(host.as_ref(), &input).await {
                                 app.set_plugin_ui_error(
@@ -1670,6 +1701,17 @@ fn coalesce_event_batch(mut events: Vec<Event>) -> Vec<Event> {
 
 // ─── Demo 模型 ───
 
+/// 普通移动完整路由但不预先标脏；点击、拖动、滚轮保守重绘。
+fn event_requires_redraw(event: Option<&UiEvent>, tick: bool) -> bool {
+    match event {
+        Some(UiEvent::Tick) => tick,
+        Some(UiEvent::Input(Event::Mouse(mouse))) => mouse.kind != MouseEventKind::Moved,
+        Some(UiEvent::Input(Event::Key(key))) => key.kind == KeyEventKind::Press,
+        None => false,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1732,6 +1774,42 @@ mod tests {
         let guidance = dispatched.event.agent_guidance.expect("应附带一次性指导");
         assert!(reason.contains("能力归属仍在解析"));
         assert!(guidance.contains("当前调用未执行"));
+    }
+
+    /// 非热点移动不重绘，悬停改变仍会标脏；其他鼠标输入不丢。
+    #[test]
+    fn pointer_redraw_preserves_hover_and_interactions() {
+        use crossterm::event::{MouseButton, MouseEvent};
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "test".into());
+        app.scrollbar_area = Some(Rect::new(80, 2, 1, 20));
+        for (column, expected) in [(40, false), (80, true), (80, false), (40, true)] {
+            let mouse = MouseEvent {
+                kind: MouseEventKind::Moved,
+                column,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(!event_requires_redraw(
+                Some(&UiEvent::Input(Event::Mouse(mouse))),
+                false
+            ));
+            assert_eq!(app.handle_mouse_event(&mouse), expected);
+        }
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+        ] {
+            let event = UiEvent::Input(Event::Mouse(MouseEvent {
+                kind,
+                column: 40,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(event_requires_redraw(Some(&event), false));
+        }
     }
 
     /// 用户级 Skill 目录必须在装配层幂等创建，且空目录不会注册读取工具。

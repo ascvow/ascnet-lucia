@@ -31,6 +31,21 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+/// 在交给终端后端前清除 Cell 文本中的控制字符，阻断模型或插件注入 ESC/OSC。
+/// 仅修改显示缓冲，不改会话、模型内容或字素中的 ZWJ/组合符/变体选择符。
+pub(crate) fn sanitize_terminal_buffer(buffer: &mut ratatui::buffer::Buffer) {
+    for cell in &mut buffer.content {
+        if cell.symbol().chars().any(char::is_control) {
+            let text: String = cell
+                .symbol()
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .collect();
+            cell.set_symbol(if text.is_empty() { " " } else { &text });
+        }
+    }
+}
+
 /// 把一条带样式的逻辑行按显示宽度折成多条视觉行。
 ///
 /// 折行优先落在空格处，只有单词长于一整行时才按字符硬断；宽度按 Unicode 显示宽度计算，
@@ -129,6 +144,50 @@ mod wrap_tests {
             .iter()
             .map(|line| line.to_string())
             .collect()
+    }
+
+    /// 实际 Paragraph 单元格不得携带终端控制符；Unicode 字素保持原逻辑文本。
+    #[test]
+    fn terminal_controls_do_not_reach_rendered_cells() {
+        use crate::session::conversation::{Msg, MsgKind};
+        use ratatui::prelude::*;
+        let payload = "中 e\u{301} 👩\u{200d}💻 \x1b[2J \x1b]52;c;dGVzdA==\x07 \u{009b}2J end";
+        for kind in [
+            MsgKind::User,
+            MsgKind::Assistant,
+            MsgKind::Info,
+            MsgKind::Error,
+            MsgKind::Extension,
+        ] {
+            let message = Msg::new(kind, payload);
+            let area = Rect::new(0, 0, 120, 20);
+            let mut buffer = Buffer::empty(area);
+            Paragraph::new(message.to_lines(false, 120))
+                .wrap(Wrap { trim: false })
+                .render(area, &mut buffer);
+            sanitize_terminal_buffer(&mut buffer);
+            assert_eq!(message.text, payload, "只清洗显示，不改变原始消息");
+            assert!(buffer
+                .content
+                .iter()
+                .all(|cell| !cell.symbol().chars().any(char::is_control)));
+        }
+    }
+
+    /// 显示清洗必须保留组合符、ZWJ、变体选择符和 RTL 逻辑文本。
+    #[test]
+    fn terminal_sanitizer_preserves_unicode_graphemes() {
+        use ratatui::prelude::*;
+        let area = Rect::new(0, 0, 120, 4);
+        let mut buffer = Buffer::empty(area);
+        let text = "中 e\u{301} 👩\u{200d}💻 ✈\u{fe0f} 🇨🇳 العربية";
+        Paragraph::new(text).render(area, &mut buffer);
+        let before = buffer.clone();
+        sanitize_terminal_buffer(&mut buffer);
+        assert_eq!(buffer, before);
+        buffer[(0, 0)].set_symbol("\x1b]52;test\x07");
+        sanitize_terminal_buffer(&mut buffer);
+        assert_eq!(buffer[(0, 0)].symbol(), "]52;test");
     }
 
     /// 折行优先落在空格处，不把单词切成两半。

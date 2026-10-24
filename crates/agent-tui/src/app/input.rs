@@ -1037,7 +1037,7 @@ impl App {
     fn load_attachment(&self, path: &Path) -> std::result::Result<PendingAttachment, String> {
         use base64::Engine;
 
-        let bytes = std::fs::read(path)
+        let bytes = crate::session::attachment::read_attachment_file(path, MAX_ATTACHMENT_BYTES)
             .map_err(|error| format!("Failed to read attachment ({}): {error}", path.display()))?;
         if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
             return Err(format!(

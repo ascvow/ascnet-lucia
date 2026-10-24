@@ -217,6 +217,20 @@ impl LivePluginHost {
         Ok(())
     }
 
+    /// 查询规划后的通用独占能力 owner；用于装配层显示，不作为运行授权决策。
+    ///
+    /// 未完成规划时返回错误；完成但未配置 owner 时返回 None。实际调用仍使用运行冻结快照。
+    pub fn planned_capability_owner(&self, capability_id: &str) -> Result<Option<String>> {
+        let state = self.read_state()?;
+        if !state.capability_plan_ready {
+            return Err(anyhow!("插件能力归属仍在解析"));
+        }
+        Ok(state
+            .current
+            .capability_owner(capability_id)
+            .map(str::to_string))
+    }
+
     /// 返回指定插件是否已经 Ready。
     pub fn is_ready(&self, plugin_id: &str) -> Result<bool> {
         Ok(self.read_state()?.current.get(plugin_id).is_some())
@@ -848,6 +862,27 @@ impl ContextLoader for LivePluginHost {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+
+    /// 未规划、未配置和 owner 尚未 Ready 必须区分，不以插件 ID 猜审批状态。
+    #[test]
+    fn planned_owner_distinguishes_loading_and_unconfigured() {
+        let host = LivePluginHost::new();
+        assert!(host.planned_capability_owner("agent.tool-policy").is_err());
+        host.finish_capability_planning().unwrap();
+        assert_eq!(
+            host.planned_capability_owner("agent.tool-policy").unwrap(),
+            None
+        );
+        host.set_capability_owner("agent.tool-policy", "custom-policy")
+            .unwrap();
+        assert_eq!(
+            host.planned_capability_owner("agent.tool-policy")
+                .unwrap()
+                .as_deref(),
+            Some("custom-policy")
+        );
+        assert!(!host.is_ready("custom-policy").unwrap());
+    }
 
     /// 扇出快照的克隆必须共享冻结正文而不是按 token 深克隆。
     #[tokio::test]

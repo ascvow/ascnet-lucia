@@ -273,6 +273,52 @@ pub(crate) enum PastedPathKind {
     Directory,
 }
 
+/// 打开普通附件文件；前后均校验类型，Unix 非阻塞打开防止 FIFO 等待写端。
+/// 允许指向普通文件的符号链接；不承诺慢文件系统的墙钟硬上限。
+pub(crate) fn open_regular_attachment(path: &Path) -> std::io::Result<std::fs::File> {
+    let reject = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Attachment is not a regular file",
+        )
+    };
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(reject());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(reject());
+    }
+    Ok(file)
+}
+
+/// 读取附件的有界入口；超过上限明确报错，不把巨文件完整载入内存。
+pub(crate) fn read_attachment_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let file = open_regular_attachment(path)?;
+    let too_large = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Attachment exceeds the {} MiB limit", limit / 1024 / 1024),
+        )
+    };
+    if file.metadata()?.len() > limit {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
 /// 判断一个已存在的路径属于哪一类附件目标。
 ///
 /// 已知扩展名直接查表，不读文件；未知扩展名只嗅探开头 8 KiB，避免为判断类型而把
@@ -281,6 +327,12 @@ pub(crate) fn pasted_path_kind(path: &Path) -> std::io::Result<PastedPathKind> {
     let metadata = std::fs::metadata(path)?;
     if metadata.is_dir() {
         return Ok(PastedPathKind::Directory);
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Attachment is not a regular file",
+        ));
     }
     let extension = path
         .extension()
@@ -298,7 +350,7 @@ pub(crate) fn pasted_path_kind(path: &Path) -> std::io::Result<PastedPathKind> {
         );
     }
     let mut prefix = Vec::new();
-    std::fs::File::open(path)?
+    open_regular_attachment(path)?
         .take(8 * 1024)
         .read_to_end(&mut prefix)?;
     Ok(if looks_like_text(&prefix) {
@@ -863,6 +915,31 @@ mod tests {
         ));
         std::fs::write(&path, bytes).expect("写入测试文件");
         path
+    }
+
+    /// 附件读取拒绝超限和非普通文件，恰好上限不改变内容。
+    #[test]
+    fn attachment_read_is_bounded() {
+        let path = write_temp_file("bounded.txt", b"abcd");
+        assert_eq!(read_attachment_file(&path, 4).unwrap(), b"abcd");
+        assert!(read_attachment_file(&path, 3).is_err());
+        assert!(read_attachment_file(&std::env::temp_dir(), 4).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// 无写端 FIFO 必须在分类前拒绝，不能卡在 File::open。
+    #[cfg(unix)]
+    #[test]
+    fn attachment_rejects_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = write_temp_file("fifo.unknown", b"");
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: CString 在调用期间存活，只在测试独占路径创建 FIFO。
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(pasted_path_kind(&path).is_err());
+        assert!(read_attachment_file(&path, 10).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 
     /// 正文里的本地路径能被正确切分，句读标点与句子括号不进入路径。

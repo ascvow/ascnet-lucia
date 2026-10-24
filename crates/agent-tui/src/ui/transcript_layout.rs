@@ -45,8 +45,8 @@ impl LayoutEntry {
     }
 
     /// 判断缓存是否可以复用于当前消息。
-    fn matches(&self, message: &Msg, streaming: bool, width: u16) -> bool {
-        self.width == width && self.fingerprint == fingerprint(message, streaming)
+    fn matches(&self, fingerprint: u64, width: u16) -> bool {
+        self.width == width && self.fingerprint == fingerprint
     }
 }
 
@@ -79,11 +79,12 @@ impl TranscriptLayout {
         let mut total = 0u16;
         for (index, message) in messages.iter().enumerate() {
             let is_streaming = streaming == Some(index);
+            let fingerprint = fingerprint(message, is_streaming);
             let entry = &mut self.entries[index];
-            if !entry.matches(message, is_streaming, width) {
+            if !entry.matches(fingerprint, width) {
                 let lines = message_lines(messages, index, is_streaming, width);
                 entry.width = width;
-                entry.fingerprint = fingerprint(message, is_streaming);
+                entry.fingerprint = fingerprint;
                 entry.height = measure(&lines, width);
                 entry.expandable = message.is_tool_expandable();
                 entry.lines = Some(lines);
@@ -145,7 +146,7 @@ impl TranscriptLayout {
                 height: u16::try_from(clipped_bottom - clipped_top).unwrap_or(0),
             };
             frame.render_widget(
-                Paragraph::new(lines.clone())
+                Paragraph::new(borrowed_lines(lines))
                     .wrap(Wrap { trim: false })
                     .scroll((skip, 0)),
                 target,
@@ -188,10 +189,14 @@ impl TranscriptLayout {
                 continue;
             }
             let width = entry.width;
-            let lines = entry
-                .lines
-                .clone()
-                .unwrap_or_else(|| message_lines(messages, index, streaming == Some(index), width));
+            let rebuilt;
+            let lines = match entry.lines.as_deref() {
+                Some(lines) => lines,
+                None => {
+                    rebuilt = message_lines(messages, index, streaming == Some(index), width);
+                    &rebuilt
+                }
+            };
             let clipped_top = start.max(range_top);
             let clipped_bottom = cursor.min(range_bottom);
             let skip = u16::try_from(clipped_top.saturating_sub(start)).unwrap_or(u16::MAX);
@@ -204,7 +209,7 @@ impl TranscriptLayout {
             if target.height == 0 {
                 continue;
             }
-            Paragraph::new(lines)
+            Paragraph::new(borrowed_lines(lines))
                 .wrap(Wrap { trim: false })
                 .scroll((skip, 0))
                 .render(target, &mut buffer);
@@ -249,11 +254,27 @@ fn message_lines(
 /// 整条消息只构造一个 `Paragraph`，避免逐行调用 `line_count` 的重复开销。
 fn measure(lines: &[Line<'static>], width: u16) -> u16 {
     u16::try_from(
-        Paragraph::new(lines.to_vec())
+        Paragraph::new(borrowed_lines(lines))
             .wrap(Wrap { trim: false })
             .line_count(width),
     )
     .unwrap_or(u16::MAX)
+}
+
+/// 为 Paragraph 分配行描述但借用正文，保留样式/对齐，不跨帧保存借用。
+fn borrowed_lines<'a>(lines: &'a [Line<'_>]) -> Vec<Line<'a>> {
+    lines
+        .iter()
+        .map(|line| Line {
+            spans: line
+                .spans
+                .iter()
+                .map(|span| Span::styled(span.content.as_ref(), span.style))
+                .collect(),
+            style: line.style,
+            alignment: line.alignment,
+        })
+        .collect()
 }
 
 /// 把借用消息文本的行转换为可独立保存的行。
@@ -377,6 +398,45 @@ mod tests {
             .iter()
             .filter(|entry| entry.lines.is_some())
             .count()
+    }
+
+    /// 借用文本的 Paragraph 保持 Unicode、样式、对齐与实际绘制结果。
+    #[test]
+    fn borrowed_paragraph_matches_owned_render() {
+        let lines = vec![Line::from(Span::styled(
+            "中文 e\u{301} 👩\u{200d}💻".to_string(),
+            Style::default().fg(Color::Green),
+        ))
+        .alignment(Alignment::Right)];
+        let borrowed = borrowed_lines(&lines);
+        assert!(std::ptr::eq(
+            lines[0].spans[0].content.as_ref(),
+            borrowed[0].spans[0].content.as_ref()
+        ));
+        for width in [1, 7, 40] {
+            let area = Rect::new(0, 0, width, 10);
+            let mut expected = Buffer::empty(area);
+            let mut actual = Buffer::empty(area);
+            Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .render(area, &mut expected);
+            Paragraph::new(borrowed_lines(&lines))
+                .wrap(Wrap { trim: false })
+                .render(area, &mut actual);
+            assert_eq!(expected, actual);
+        }
+    }
+
+    /// 同长历史编辑仍必须使指纹失效，不能以指针或长度代替内容判定。
+    #[test]
+    fn same_length_history_edit_invalidates_layout() {
+        let mut layout = TranscriptLayout::default();
+        let mut messages = messages(20);
+        layout.sync(&messages, None, 40);
+        let previous = layout.entries[0].fingerprint;
+        messages[0].text.replace_range(..1, "M");
+        layout.sync(&messages, None, 40);
+        assert_ne!(layout.entries[0].fingerprint, previous);
     }
 
     /// 视口之外的消息只保留高度，渲染结果随滚动释放，内存不随对话增长。
