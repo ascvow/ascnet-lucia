@@ -835,6 +835,16 @@ impl PluginHost for LivePluginHost {
     }
 }
 
+#[async_trait]
+impl ContextLoader for LivePluginHost {
+    async fn load(&self, request: ContextLoadRequest) -> Result<LoadedContext> {
+        match PluginHost::load_context(self, &request).await? {
+            Some(context) => Ok(context),
+            None => Ok(LoadedContext::passthrough(request)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
@@ -848,15 +858,5 @@ mod snapshot_tests {
         let second = host.run_snapshot_for_fanout("snapshot", true).unwrap();
         assert!(Arc::ptr_eq(&first.tools, &second.tools));
         assert!(Arc::ptr_eq(&first.prompts, &second.prompts));
-    }
-}
-
-#[async_trait]
-impl ContextLoader for LivePluginHost {
-    async fn load(&self, request: ContextLoadRequest) -> Result<LoadedContext> {
-        match PluginHost::load_context(self, &request).await? {
-            Some(context) => Ok(context),
-            None => Ok(LoadedContext::passthrough(request)),
-        }
     }
 }

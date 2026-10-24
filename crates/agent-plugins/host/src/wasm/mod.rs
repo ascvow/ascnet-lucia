@@ -55,6 +55,7 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -64,6 +65,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::time::Duration;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 use wasmtime::component::Component;
@@ -238,7 +240,7 @@ pub struct WasmPluginHost {
     known_ui: Vec<UiDeclaration>,
     known_tool_renderers: Vec<ToolRendererContribution>,
     agent_runtime: Option<AgentRuntimeBinding>,
-    state: Arc<Mutex<WasmPluginState>>,
+    state: Arc<Mutex<Option<WasmPluginState>>>,
 }
 
 /// 单个插件在一次事件分发上允许累计等待的最长毫秒数。
@@ -296,22 +298,99 @@ struct WasmPluginState {
     limits: WasmPluginLimits,
 }
 
-/// 在取得实例独占锁后，把一次 Component 导出调用交给独立任务完整执行。
-///
-/// Wasmtime 不允许丢弃已经进入 Component 的异步调用；调用方取消等待时，独立任务仍会
-/// 运行到导出返回并释放实例锁，避免后续调用收到 `cannot enter component instance`。
-async fn complete_component_call<T, F, Fut>(
-    state: &Arc<Mutex<WasmPluginState>>,
+/// UI 不应被业务调用的长等待拖住；排队超时不销毁健康实例。
+#[derive(Clone, Copy)]
+struct ComponentCallBudget {
+    wait: Duration,
+    execute: Duration,
+}
+const UI_CALL_BUDGET: ComponentCallBudget = ComponentCallBudget {
+    wait: Duration::from_millis(250),
+    execute: Duration::from_secs(2),
+};
+const WORK_CALL_BUDGET: ComponentCallBudget = ComponentCallBudget {
+    wait: Duration::from_secs(1800),
+    execute: Duration::from_secs(1800),
+};
+const INITIALIZATION_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 协作式 deadline，不能抢占阻塞系统调用；超时后调用者必须销毁而非复用 Store。
+async fn component_deadline<F: Future>(
+    operation: &str,
+    duration: Duration,
+    future: F,
+) -> Result<F::Output> {
+    tokio::time::timeout(duration, future)
+        .await
+        .map_err(|_| anyhow!("{operation} deadline 超时（{}ms）", duration.as_millis()))
+}
+
+/// 调用期间从共享槽取走 Store，panic/超时只销毁，不允许进入被取消过的实例。
+struct ComponentCallLease {
+    slot: OwnedMutexGuard<Option<WasmPluginState>>,
+    active: Option<WasmPluginState>,
+}
+impl ComponentCallLease {
+    fn restore(&mut self) {
+        *self.slot = self.active.take();
+    }
+}
+impl Drop for ComponentCallLease {
+    fn drop(&mut self) {
+        if let Some(state) = self.active.take() {
+            let capabilities = &state.store.data().capabilities;
+            let (id, services) = capabilities.service_context();
+            let (_, binding) = capabilities.agent_runtime_context();
+            let _ = services.unregister_plugin(&id);
+            drop(state);
+            if let Some(binding) = binding {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        binding.revoke().await;
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 独立任务持锁执行并负责 deadline；外部取消只解除等待，不会遗留可重入的半执行 Store。
+async fn complete_component_call<T, F>(
+    state: &Arc<Mutex<Option<WasmPluginState>>>,
     operation: String,
+    budget: ComponentCallBudget,
     call: F,
 ) -> Result<T>
 where
     T: Send + 'static,
-    F: FnOnce(OwnedMutexGuard<WasmPluginState>) -> Fut,
-    Fut: Future<Output = Result<T>> + Send + 'static,
+    F: for<'a> FnOnce(&'a mut WasmPluginState) -> BoxFuture<'a, Result<T>> + Send + 'static,
 {
-    let state = Arc::clone(state).lock_owned().await;
-    let task = tokio::spawn(inherit_service_call_stack(call(state)));
+    let mut slot = component_deadline(
+        &format!("{operation} 等待实例锁"),
+        budget.wait,
+        Arc::clone(state).lock_owned(),
+    )
+    .await?;
+    let active = slot
+        .take()
+        .ok_or_else(|| anyhow!("{operation} Store 已隔离，必须重新加载"))?;
+    let mut lease = ComponentCallLease {
+        slot,
+        active: Some(active),
+    };
+    let task_operation = operation.clone();
+    let task = tokio::spawn(inherit_service_call_stack(async move {
+        let outcome = component_deadline(
+            &task_operation,
+            budget.execute,
+            call(lease.active.as_mut().expect("调用守卫持有实例")),
+        )
+        .await;
+        if outcome.is_ok() {
+            lease.restore();
+        }
+        outcome?
+    }));
     task.await
         .with_context(|| format!("{operation} 的 Component 调用任务异常结束"))?
 }
@@ -319,7 +398,7 @@ where
 /// 服务目录持有的弱引用端点，避免服务注册表与 WASM store 形成引用环。
 struct WasmServiceEndpoint {
     plugin_id: String,
-    state: Weak<Mutex<WasmPluginState>>,
+    state: Weak<Mutex<Option<WasmPluginState>>>,
 }
 
 #[derive(Deserialize)]
@@ -352,26 +431,29 @@ impl ServiceHandler for WasmServiceEndpoint {
         complete_component_call(
             &state,
             format!("插件 `{plugin_id}` 服务"),
-            move |mut state| async move {
-                refill_fuel(&mut state)?;
-                let handle_service = state.handle_service;
-                let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
-                let (response_json,) = handle_service
-                    .call_async(&mut state.store, (request,))
-                    .await
-                    .into_anyhow()
-                    .with_context(|| format!("插件 `{plugin_id}` 服务调用失败"))?;
-                drop(run_scope);
-                let response: GuestServiceResponse = serde_json::from_str(&response_json)
-                    .with_context(|| format!("插件 `{plugin_id}` 返回了无效服务响应"))?;
-                if response.ok {
-                    Ok(response.value)
-                } else {
-                    Err(anyhow!(
-                        "{}",
-                        response.error.unwrap_or_else(|| "插件服务调用失败".into())
-                    ))
-                }
+            WORK_CALL_BUDGET,
+            move |state| {
+                Box::pin(async move {
+                    refill_fuel(state)?;
+                    let handle_service = state.handle_service;
+                    let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
+                    let (response_json,) = handle_service
+                        .call_async(&mut state.store, (request,))
+                        .await
+                        .into_anyhow()
+                        .with_context(|| format!("插件 `{plugin_id}` 服务调用失败"))?;
+                    drop(run_scope);
+                    let response: GuestServiceResponse = serde_json::from_str(&response_json)
+                        .with_context(|| format!("插件 `{plugin_id}` 返回了无效服务响应"))?;
+                    if response.ok {
+                        Ok(response.value)
+                    } else {
+                        Err(anyhow!(
+                            "{}",
+                            response.error.unwrap_or_else(|| "插件服务调用失败".into())
+                        ))
+                    }
+                })
             },
         )
         .await
@@ -503,20 +585,26 @@ impl WasmPluginHost {
     ) -> Result<Self> {
         manifest.validate()?;
 
-        let engine = shared_wasm_engine()?;
-        let wasm_path = wasm_path.as_ref();
-        let canonical_wasm_path = wasm_path
-            .canonicalize()
-            .with_context(|| format!("无法解析插件 Component 路径：{}", wasm_path.display()))?;
-        let component_bytes = fs::read(wasm_path)
-            .with_context(|| format!("无法读取插件 Component：{}", wasm_path.display()))?;
-        let state_identity =
-            derive_plugin_state_identity(&manifest, &canonical_wasm_path, &component_bytes)?;
-        let component = Component::new(&engine, &component_bytes)
-            .into_anyhow()
-            .with_context(|| {
-                format!("failed to compile wasm component: {}", wasm_path.display())
-            })?;
+        let wasm_path = wasm_path.as_ref().to_path_buf();
+        let identity_manifest = manifest.clone();
+        // 许可由实际 blocking 任务持有；等待方取消不会使残留编译失去并发约束。
+        static COMPILE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
+        let permit = COMPILE_SLOTS.acquire().await.context("插件编译槽已关闭")?;
+        let (engine, component, state_identity) = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let engine = shared_wasm_engine()?;
+            let canonical = wasm_path
+                .canonicalize()
+                .context("无法解析插件 Component 路径")?;
+            let bytes = fs::read(&wasm_path).context("无法读取插件 Component")?;
+            let identity = derive_plugin_state_identity(&identity_manifest, &canonical, &bytes)?;
+            let component = Component::new(&engine, &bytes)
+                .into_anyhow()
+                .context("failed to compile wasm component")?;
+            Ok::<_, anyhow::Error>((engine, component, identity))
+        })
+        .await
+        .context("插件编译任务失败")??;
 
         let mut linker = Linker::<PluginWasiState>::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
@@ -607,18 +695,24 @@ impl WasmPluginHost {
                 .set_fuel(limits.fuel)
                 .into_anyhow()
                 .context("failed to set plugin fuel")?;
-            if let Some(interval) = limits.fuel_yield_interval {
-                store
-                    .fuel_async_yield_interval(Some(interval))
-                    .into_anyhow()
-                    .context("failed to configure plugin fuel yield interval")?;
-            }
-
-            let instance = linker
-                .instantiate_async(&mut store, &component)
-                .await
+            store
+                .fuel_async_yield_interval(Some(
+                    limits
+                        .fuel_yield_interval
+                        .unwrap_or(250_000)
+                        .clamp(1, 250_000),
+                ))
                 .into_anyhow()
-                .context("failed to instantiate wasm component")?;
+                .context("failed to configure plugin fuel yield interval")?;
+
+            let instance = component_deadline(
+                "plugin instantiate",
+                INITIALIZATION_CALL_TIMEOUT,
+                linker.instantiate_async(&mut store, &component),
+            )
+            .await?
+            .into_anyhow()
+            .context("failed to instantiate wasm component")?;
 
             let list_tools =
                 get_required_func::<(), (String,)>(&instance, &mut store, "list-tools")?;
@@ -641,11 +735,14 @@ impl WasmPluginHost {
             let on_ui_input =
                 get_required_func::<(String,), ()>(&instance, &mut store, "on-ui-input")?;
 
-            let (tools_json,) = list_tools
-                .call_async(&mut store, ())
-                .await
-                .into_anyhow()
-                .context("plugin `list-tools` failed")?;
+            let (tools_json,) = component_deadline(
+                "plugin list-tools",
+                INITIALIZATION_CALL_TIMEOUT,
+                list_tools.call_async(&mut store, ()),
+            )
+            .await?
+            .into_anyhow()
+            .context("plugin `list-tools` failed")?;
             let mut static_tools: Vec<ToolSpec> = serde_json::from_str(&tools_json)
                 .with_context(|| "plugin `list-tools` returned invalid ToolSpec JSON")?;
             for tool in &mut static_tools {
@@ -654,7 +751,7 @@ impl WasmPluginHost {
             contributions.upsert_static_tools(static_tools)?;
 
             let plugin_id = manifest.plugin.id.clone();
-            let state = Arc::new(Mutex::new(WasmPluginState {
+            let mut state = WasmPluginState {
                 store,
                 instance,
                 call_tool,
@@ -665,7 +762,55 @@ impl WasmPluginHost {
                 render_ui,
                 on_ui_input,
                 limits,
-            }));
+            };
+
+            let initialization = async {
+                refill_fuel(&mut state)?;
+                let mut activation_metadata = manifest.metadata.clone();
+                activation_metadata.extend(host_services.activation_metadata(&plugin_id));
+                let context_json = serde_json::to_string(&serde_json::json!({
+                    "plugin_id": &plugin_id,
+                    "metadata": activation_metadata,
+                }))?;
+                let activation_scope = state.store.data().capabilities.enter_active_run_scope(None);
+                let (activation_error,) = component_deadline(
+                    "plugin activate",
+                    WORK_CALL_BUDGET.execute,
+                    activate.call_async(&mut state.store, (context_json,)),
+                )
+                .await?
+                .into_anyhow()
+                .with_context(|| format!("plugin `{plugin_id}` activate failed"))?;
+                drop(activation_scope);
+                if !activation_error.is_empty() {
+                    return Err(anyhow!(
+                        "plugin `{plugin_id}` activation failed: {activation_error}"
+                    ));
+                }
+
+                refill_fuel(&mut state)?;
+                let describe_scope = state.store.data().capabilities.enter_active_run_scope(None);
+                let (declarations_json,) = component_deadline(
+                    "plugin describe-ui",
+                    INITIALIZATION_CALL_TIMEOUT,
+                    describe_ui.call_async(&mut state.store, ()),
+                )
+                .await?
+                .into_anyhow()
+                .context("plugin `describe-ui` failed")?;
+                drop(describe_scope);
+                let ui_contributions: Vec<UiContribution> =
+                    serde_json::from_str(&declarations_json).with_context(|| {
+                        format!("plugin `{plugin_id}` returned invalid UI contribution JSON")
+                    })?;
+                let owned_tools = contributions.tools()?;
+                let (declarations, tool_renderers) =
+                    validate_ui_contributions(&plugin_id, ui_contributions, &owned_tools)?;
+                Ok((declarations, tool_renderers))
+            }
+            .await;
+            let (known_ui, known_tool_renderers) = initialization?;
+            let state = Arc::new(Mutex::new(Some(state)));
             services.register_handler(
                 plugin_id.clone(),
                 manifest
@@ -679,54 +824,6 @@ impl WasmPluginHost {
                 }),
             )?;
 
-            let initialization = async {
-                let mut state = state.lock().await;
-                refill_fuel(&mut state)?;
-                let mut activation_metadata = manifest.metadata.clone();
-                activation_metadata.extend(host_services.activation_metadata(&plugin_id));
-                let context_json = serde_json::to_string(&serde_json::json!({
-                    "plugin_id": &plugin_id,
-                    "metadata": activation_metadata,
-                }))?;
-                let activation_scope = state.store.data().capabilities.enter_active_run_scope(None);
-                let (activation_error,) = activate
-                    .call_async(&mut state.store, (context_json,))
-                    .await
-                    .into_anyhow()
-                    .with_context(|| format!("plugin `{plugin_id}` activate failed"))?;
-                drop(activation_scope);
-                if !activation_error.is_empty() {
-                    return Err(anyhow!(
-                        "plugin `{plugin_id}` activation failed: {activation_error}"
-                    ));
-                }
-
-                refill_fuel(&mut state)?;
-                let describe_scope = state.store.data().capabilities.enter_active_run_scope(None);
-                let (declarations_json,) = describe_ui
-                    .call_async(&mut state.store, ())
-                    .await
-                    .into_anyhow()
-                    .context("plugin `describe-ui` failed")?;
-                drop(describe_scope);
-                let ui_contributions: Vec<UiContribution> =
-                    serde_json::from_str(&declarations_json).with_context(|| {
-                        format!("plugin `{plugin_id}` returned invalid UI contribution JSON")
-                    })?;
-                let owned_tools = contributions.tools()?;
-                let (declarations, tool_renderers) =
-                    validate_ui_contributions(&plugin_id, ui_contributions, &owned_tools)?;
-                Ok((declarations, tool_renderers))
-            }
-            .await;
-            let (known_ui, known_tool_renderers) = match initialization {
-                Ok(contributions) => contributions,
-                Err(error) => {
-                    services.unregister_plugin(&plugin_id)?;
-                    return Err(error);
-                }
-            };
-
             Ok(Self {
                 manifest,
                 contributions,
@@ -739,8 +836,13 @@ impl WasmPluginHost {
         }
         .await;
         if loading.is_err() {
+            drop(registration);
             if let Some(binding) = cleanup_agent_runtime.take() {
-                binding.revoke().await;
+                // 取消等待不能取消撤销；JoinHandle 超时后仅 detach，任务继续清理。
+                let task = tokio::spawn(async move {
+                    binding.revoke().await;
+                });
+                let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
             }
         } else {
             cleanup_agent_runtime.disarm();
@@ -765,23 +867,26 @@ impl WasmPluginHost {
         let deactivation = complete_component_call(
             &self.state,
             format!("plugin `{plugin_id}` deactivate"),
-            move |mut state| async move {
-                let deactivate = state.deactivate;
-                refill_fuel(&mut state)?;
-                let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
-                let (deactivation_error,) = deactivate
-                    .call_async(&mut state.store, ())
-                    .await
-                    .into_anyhow()
-                    .with_context(|| format!("plugin `{plugin_id}` deactivate failed"))?;
-                drop(run_scope);
-                if deactivation_error.is_empty() {
-                    Ok(())
-                } else {
-                    Err(anyhow!(
-                        "plugin `{plugin_id}` deactivation failed: {deactivation_error}"
-                    ))
-                }
+            WORK_CALL_BUDGET,
+            move |state| {
+                Box::pin(async move {
+                    let deactivate = state.deactivate;
+                    refill_fuel(state)?;
+                    let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
+                    let (deactivation_error,) = deactivate
+                        .call_async(&mut state.store, ())
+                        .await
+                        .into_anyhow()
+                        .with_context(|| format!("plugin `{plugin_id}` deactivate failed"))?;
+                    drop(run_scope);
+                    if deactivation_error.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "plugin `{plugin_id}` deactivation failed: {deactivation_error}"
+                        ))
+                    }
+                })
             },
         )
         .await;
@@ -812,8 +917,9 @@ impl WasmPluginHost {
             let response = complete_component_call(
                 &self.state,
                 format!("plugin `{plugin_id}` on-event `{event_name}`"),
-                move |mut state| async move {
-                    refill_fuel(&mut state)?;
+                WORK_CALL_BUDGET,
+            move |state| Box::pin(async move {
+                    refill_fuel(state)?;
                     let run_scope = state
                         .store
                         .data()
@@ -837,7 +943,7 @@ impl WasmPluginHost {
                             "plugin `{plugin_id}` returned invalid PluginEventResponse JSON for `{event_name}`"
                         )
                     })
-                },
+                }),
             )
             .await?;
 
@@ -884,24 +990,35 @@ impl AgentExtension for WasmPluginHost {
         complete_component_call(
             &self.state,
             format!("plugin `{plugin_id}` call-tool"),
-            move |mut state| async move {
-                refill_fuel(&mut state)?;
-                // 前一个 Hook 的故障不能污染本次工具调用；每个导出调用只消费自己的 Host 观察。
-                state.store.data_mut().take_plugin_failure();
-                let run_scope = state
-                    .store
-                    .data()
-                    .capabilities
-                    .enter_active_run_scope(run_id.as_deref());
-                let call_tool = state.call_tool;
-                let invocation = call_tool.call_async(&mut state.store, (call_json,)).await;
-                drop(run_scope);
-                let capability_failure = state.store.data_mut().take_plugin_failure();
-                let (result_json,) = match invocation {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let failure = capability_failure
-                            .unwrap_or_else(|| classify_wasm_plugin_failure(&error));
+            WORK_CALL_BUDGET,
+            move |state| {
+                Box::pin(async move {
+                    refill_fuel(state)?;
+                    // 前一个 Hook 的故障不能污染本次工具调用；每个导出调用只消费自己的 Host 观察。
+                    state.store.data_mut().take_plugin_failure();
+                    let run_scope = state
+                        .store
+                        .data()
+                        .capabilities
+                        .enter_active_run_scope(run_id.as_deref());
+                    let call_tool = state.call_tool;
+                    let invocation = call_tool.call_async(&mut state.store, (call_json,)).await;
+                    drop(run_scope);
+                    let capability_failure = state.store.data_mut().take_plugin_failure();
+                    let (result_json,) = match invocation {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let failure = capability_failure
+                                .unwrap_or_else(|| classify_wasm_plugin_failure(&error));
+                            return Ok(Some(plugin_host_failure_result(
+                                &call,
+                                &public_name,
+                                &plugin_id,
+                                failure,
+                            )));
+                        }
+                    };
+                    if let Some(failure) = capability_failure {
                         return Ok(Some(plugin_host_failure_result(
                             &call,
                             &public_name,
@@ -909,28 +1026,20 @@ impl AgentExtension for WasmPluginHost {
                             failure,
                         )));
                     }
-                };
-                if let Some(failure) = capability_failure {
-                    return Ok(Some(plugin_host_failure_result(
-                        &call,
-                        &public_name,
-                        &plugin_id,
-                        failure,
-                    )));
-                }
-                let mut result = match serde_json::from_str::<ToolResult>(&result_json) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        return Ok(Some(plugin_host_failure_result(
-                            &call,
-                            &public_name,
-                            &plugin_id,
-                            PluginHostFailureKind::ContractViolation,
-                        )));
-                    }
-                };
-                bind_guest_tool_result(&mut result, &call, &public_name);
-                Ok(Some(result))
+                    let mut result = match serde_json::from_str::<ToolResult>(&result_json) {
+                        Ok(result) => result,
+                        Err(_) => {
+                            return Ok(Some(plugin_host_failure_result(
+                                &call,
+                                &public_name,
+                                &plugin_id,
+                                PluginHostFailureKind::ContractViolation,
+                            )));
+                        }
+                    };
+                    bind_guest_tool_result(&mut result, &call, &public_name);
+                    Ok(Some(result))
+                })
             },
         )
         .await
@@ -1038,34 +1147,37 @@ impl PluginHost for WasmPluginHost {
         complete_component_call(
             &self.state,
             format!("plugin `{plugin_id}` load-context"),
-            move |mut state| async move {
-                let fuel = context_fuel_budget(&state.limits, request_json.len());
-                set_fuel(&mut state, fuel)?;
-                let run_scope = state
-                    .store
-                    .data()
-                    .capabilities
-                    .enter_active_run_scope(Some(&run_id));
-                let load_context = state.load_context;
-                let invocation = load_context
-                    .call_async(&mut state.store, (request_json,))
-                    .await
-                    .into_anyhow();
-                drop(run_scope);
-                let (response_json,) = invocation
-                    .with_context(|| format!("plugin `{plugin_id}` load-context failed"))?;
-                let response: GuestContextLoadResponse = serde_json::from_str(&response_json)
-                    .with_context(|| {
+            WORK_CALL_BUDGET,
+            move |state| {
+                Box::pin(async move {
+                    let fuel = context_fuel_budget(&state.limits, request_json.len());
+                    set_fuel(state, fuel)?;
+                    let run_scope = state
+                        .store
+                        .data()
+                        .capabilities
+                        .enter_active_run_scope(Some(&run_id));
+                    let load_context = state.load_context;
+                    let invocation = load_context
+                        .call_async(&mut state.store, (request_json,))
+                        .await
+                        .into_anyhow();
+                    drop(run_scope);
+                    let (response_json,) = invocation
+                        .with_context(|| format!("plugin `{plugin_id}` load-context failed"))?;
+                    let response: GuestContextLoadResponse = serde_json::from_str(&response_json)
+                        .with_context(|| {
                         format!("plugin `{plugin_id}` returned invalid context response")
                     })?;
-                if let Some(error) = response.error {
-                    return Err(anyhow!("plugin `{plugin_id}` context load failed: {error}"));
-                }
-                let mut context = response.context;
-                if let Some(context) = context.as_mut() {
-                    redact_guest_context_messages(&mut context.messages);
-                }
-                Ok(context)
+                    if let Some(error) = response.error {
+                        return Err(anyhow!("plugin `{plugin_id}` context load failed: {error}"));
+                    }
+                    let mut context = response.context;
+                    if let Some(context) = context.as_mut() {
+                        redact_guest_context_messages(&mut context.messages);
+                    }
+                    Ok(context)
+                })
             },
         )
         .await
@@ -1098,29 +1210,32 @@ impl PluginHost for WasmPluginHost {
         complete_component_call(
             &self.state,
             format!("plugin `{plugin_id}` render-ui"),
-            move |mut state| async move {
-                refill_fuel(&mut state)?;
-                let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
-                let render_ui = state.render_ui;
-                let (frame_json,) = render_ui
-                    .call_async(&mut state.store, (request_json,))
-                    .await
-                    .into_anyhow()
-                    .with_context(|| format!("plugin `{plugin_id}` render-ui failed"))?;
-                drop(run_scope);
-                if frame_json.is_empty() {
-                    return Ok(None);
-                }
-                let frame = guard::decode_ui_frame(&frame_json).with_context(|| {
-                    format!("plugin `{plugin_id}` returned invalid UiFrame JSON")
-                })?;
-                if frame.view_id != view_id {
-                    return Err(anyhow!(
-                        "plugin `{plugin_id}` rendered view `{}` for request `{view_id}`",
-                        frame.view_id
-                    ));
-                }
-                Ok(Some(frame))
+            UI_CALL_BUDGET,
+            move |state| {
+                Box::pin(async move {
+                    refill_fuel(state)?;
+                    let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
+                    let render_ui = state.render_ui;
+                    let (frame_json,) = render_ui
+                        .call_async(&mut state.store, (request_json,))
+                        .await
+                        .into_anyhow()
+                        .with_context(|| format!("plugin `{plugin_id}` render-ui failed"))?;
+                    drop(run_scope);
+                    if frame_json.is_empty() {
+                        return Ok(None);
+                    }
+                    let frame = guard::decode_ui_frame(&frame_json).with_context(|| {
+                        format!("plugin `{plugin_id}` returned invalid UiFrame JSON")
+                    })?;
+                    if frame.view_id != view_id {
+                        return Err(anyhow!(
+                            "plugin `{plugin_id}` rendered view `{}` for request `{view_id}`",
+                            frame.view_id
+                        ));
+                    }
+                    Ok(Some(frame))
+                })
             },
         )
         .await
@@ -1144,8 +1259,9 @@ impl PluginHost for WasmPluginHost {
         complete_component_call(
             &self.state,
             format!("plugin `{plugin_id}` tool renderer"),
-            move |mut state| async move {
-                refill_fuel(&mut state)?;
+            UI_CALL_BUDGET,
+            move |state| Box::pin(async move {
+                refill_fuel(state)?;
                 let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
                 let render_ui = state.render_ui;
                 let (frame_json,) = render_ui
@@ -1173,7 +1289,7 @@ impl PluginHost for WasmPluginHost {
                     ));
                 }
                 Ok(Some(frame))
-            },
+            }),
         )
         .await
     }
@@ -1196,17 +1312,21 @@ impl PluginHost for WasmPluginHost {
         complete_component_call(
             &self.state,
             format!("plugin `{plugin_id}` on-ui-input"),
-            move |mut state| async move {
-                refill_fuel(&mut state)?;
-                let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
-                let on_ui_input = state.on_ui_input;
-                let invocation = on_ui_input
-                    .call_async(&mut state.store, (input_json,))
-                    .await
-                    .into_anyhow();
-                drop(run_scope);
-                invocation.with_context(|| format!("plugin `{plugin_id}` on-ui-input failed"))?;
-                Ok(())
+            UI_CALL_BUDGET,
+            move |state| {
+                Box::pin(async move {
+                    refill_fuel(state)?;
+                    let run_scope = state.store.data().capabilities.enter_active_run_scope(None);
+                    let on_ui_input = state.on_ui_input;
+                    let invocation = on_ui_input
+                        .call_async(&mut state.store, (input_json,))
+                        .await
+                        .into_anyhow();
+                    drop(run_scope);
+                    invocation
+                        .with_context(|| format!("plugin `{plugin_id}` on-ui-input failed"))?;
+                    Ok(())
+                })
             },
         )
         .await

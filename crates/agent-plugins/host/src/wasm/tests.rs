@@ -120,6 +120,138 @@ async fn component_import_enforces_initialization_service_acl() -> Result<()> {
     Ok(())
 }
 
+/// 真实异步 Host import 超时后销毁 Store，不能把半执行实例放回共享槽。
+#[tokio::test]
+async fn component_deadline_retires_pending_store() -> Result<()> {
+    let engine = shared_wasm_engine()?;
+    let component = Component::new(&engine, r#"
+      (component
+        (import "wait" (func $wait))
+        (core func $wait (canon lower (func $wait)))
+        (core module $m
+          (import "h" "wait" (func $wait))
+          (memory (export "memory") 1)
+          (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 16)
+          (func (export "run") call $wait)
+          (func (export "json") (param i32 i32) (result i32) i32.const 0)
+          (func (export "empty") (result i32) i32.const 0)
+          (func (export "input") (param i32 i32)))
+        (core instance $i (instantiate $m (with "h" (instance (export "wait" (func $wait))))))
+        (func (export "run") (canon lift (core func $i "run")))
+        (func (export "json") (param "s" string) (result string) (canon lift (core func $i "json") (memory $i "memory") (realloc (func $i "realloc"))))
+        (func (export "empty") (result string) (canon lift (core func $i "empty") (memory $i "memory")))
+        (func (export "input") (param "s" string) (canon lift (core func $i "input") (memory $i "memory") (realloc (func $i "realloc")))))
+    "#).into_anyhow()?;
+    let services = Arc::new(ServiceRegistry::default());
+    let capabilities = CapabilityState::new(
+        "deadline".into(),
+        "test".into(),
+        PathBuf::from("."),
+        Default::default(),
+        Arc::new(ContributionRegistry::default()),
+        services,
+        CapabilityHostContext::new(
+            None,
+            None,
+            agent_tool::ExecutionPolicy::serve(),
+            None,
+            None,
+            None,
+            None,
+        ),
+    )?;
+    let mut store = Store::new(
+        &engine,
+        PluginWasiState::new(
+            WasiCtxBuilder::new().build(),
+            capabilities,
+            StoreLimitsBuilder::new().build(),
+        ),
+    );
+    store.set_fuel(1_000_000).into_anyhow()?;
+    let mut linker = Linker::new(&engine);
+    linker
+        .root()
+        .func_wrap_async(
+            "wait",
+            |_caller: wasmtime::StoreContextMut<'_, PluginWasiState>, (): ()| {
+                Box::new(async {
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+            },
+        )
+        .into_anyhow()?;
+    let instance = linker
+        .instantiate_async(&mut store, &component)
+        .await
+        .into_anyhow()?;
+    let json = instance
+        .get_typed_func::<(String,), (String,)>(&mut store, "json")
+        .into_anyhow()?;
+    let empty = instance
+        .get_typed_func::<(), (String,)>(&mut store, "empty")
+        .into_anyhow()?;
+    let input = instance
+        .get_typed_func::<(String,), ()>(&mut store, "input")
+        .into_anyhow()?;
+    let state = Arc::new(Mutex::new(Some(WasmPluginState {
+        store,
+        instance,
+        call_tool: json,
+        on_event: json,
+        load_context: json,
+        handle_service: json,
+        deactivate: empty,
+        render_ui: json,
+        on_ui_input: input,
+        limits: WasmPluginLimits::default(),
+    })));
+    let budget = ComponentCallBudget {
+        wait: Duration::from_millis(20),
+        execute: Duration::from_millis(40),
+    };
+    let lock = state.lock().await;
+    assert!(
+        complete_component_call(&state, "queue".into(), budget, |_| Box::pin(async {
+            Ok(())
+        }))
+        .await
+        .is_err()
+    );
+    assert!(lock.is_some(), "排队超时不能销毁健康实例");
+    drop(lock);
+    let caller_state = state.clone();
+    let caller = tokio::spawn(async move {
+        complete_component_call(&caller_state, "pending".into(), budget, |state| {
+            Box::pin(async move {
+                let run = state
+                    .instance
+                    .get_typed_func::<(), ()>(&mut state.store, "run")
+                    .into_anyhow()?;
+                run.call_async(&mut state.store, ()).await.into_anyhow()
+            })
+        })
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    caller.abort();
+    let _ = caller.await;
+    let lock = tokio::time::timeout(Duration::from_secs(2), state.lock()).await?;
+    assert!(lock.is_none(), "调用者取消后 deadline 仍须完成隔离");
+    drop(lock);
+    assert!(
+        complete_component_call(&state, "retry".into(), budget, |_| Box::pin(async {
+            Ok(())
+        }))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("隔离")
+    );
+    Ok(())
+}
+
 /// 默认运行时限制必须同时约束计算量和线性内存。
 #[test]
 fn default_limits_bound_fuel_and_memory() {

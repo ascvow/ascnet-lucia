@@ -198,7 +198,8 @@ pub struct WasmPluginLimits {
     /// 分配给插件 store 的 fuel。
     pub fuel: u64,
 
-    /// 协作式 async yield 的 fuel 间隔。
+    /// 协作式 async yield 的 fuel 间隔；None 使用 250,000，Host 收窄到 1..=250,000，
+    /// 保证墙钟 deadline 始终有机会被轮询，不能通过此字段关闭安全调度点。
     pub fuel_yield_interval: Option<u64>,
 
     /// 单个线性内存允许增长到的最大字节数。
