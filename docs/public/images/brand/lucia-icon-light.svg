@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="1024" height="1024" role="img" aria-label="Lucia">
+  <title>Lucia</title>
+  <!-- 模块 L：三个圆角模块拼出 L，右下模块为朱红强调色。 -->
+  <defs>
+    <linearGradient id="light-bg" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#F7F3EC"/>
+      <stop offset="1" stop-color="#E7DFD2"/>
+    </linearGradient>
+    <linearGradient id="light-first" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#44403D"/>
+      <stop offset="1" stop-color="#26221F"/>
+    </linearGradient>
+    <linearGradient id="light-second" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#44403D"/>
+      <stop offset="1" stop-color="#26221F"/>
+    </linearGradient>
+    <linearGradient id="light-accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#E55467"/>
+      <stop offset="1" stop-color="#CB374A"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="7.5" fill="url(#light-bg)"/>
+  <rect x="6.50" y="6.50" width="8.6" height="8.6" rx="2.0" fill="url(#light-first)"/>
+  <rect x="6.50" y="16.90" width="8.6" height="8.6" rx="2.0" fill="url(#light-second)"/>
+  <rect x="16.90" y="16.90" width="8.6" height="8.6" rx="2.0" fill="url(#light-accent)"/>
+  <rect x="0.5" y="0.5" width="31" height="31" rx="7" fill="none"
+        stroke="#2A2622" stroke-opacity="0.10" stroke-width="1"/>
+</svg>
