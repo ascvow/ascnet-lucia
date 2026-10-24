@@ -57,9 +57,13 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-agent-upsert-tool",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.upsert_tool(&request),
-            ),))
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-agent-upsert-tool");
+            let result = caller.data_mut().capabilities.upsert_tool(&request);
+            audit.finish(&result);
+            Ok((encode_host_response(result),))
         },
     )
     .into_anyhow()
@@ -67,9 +71,13 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-agent-remove-tool",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.remove_tool(&request),
-            ),))
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-agent-remove-tool");
+            let result = caller.data_mut().capabilities.remove_tool(&request);
+            audit.finish(&result);
+            Ok((encode_host_response(result),))
         },
     )
     .into_anyhow()
@@ -77,9 +85,13 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-agent-upsert-prompt",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.upsert_prompt(&request),
-            ),))
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-agent-upsert-prompt");
+            let result = caller.data_mut().capabilities.upsert_prompt(&request);
+            audit.finish(&result);
+            Ok((encode_host_response(result),))
         },
     )
     .into_anyhow()
@@ -87,9 +99,13 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-agent-remove-prompt",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.remove_prompt(&request),
-            ),))
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-agent-remove-prompt");
+            let result = caller.data_mut().capabilities.remove_prompt(&request);
+            audit.finish(&result);
+            Ok((encode_host_response(result),))
         },
     )
     .into_anyhow()
@@ -97,7 +113,12 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-agent-emit-event",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-agent-emit-event");
             let result = caller.data_mut().capabilities.emit_event(&request);
+            audit.finish(&result);
             Ok((encode_host_response_with_failure(caller.data_mut(), result),))
         },
     )
@@ -106,9 +127,13 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-state-get",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.get_state(&request),
-            ),))
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-state-get");
+            let result = caller.data_mut().capabilities.get_state(&request);
+            audit.finish(&result);
+            Ok((encode_host_response(result),))
         },
     )
     .into_anyhow()
@@ -116,9 +141,13 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-state-set",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.set_state(&request),
-            ),))
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-state-set");
+            let result = caller.data_mut().capabilities.set_state(&request);
+            audit.finish(&result);
+            Ok((encode_host_response(result),))
         },
     )
     .into_anyhow()
@@ -126,9 +155,13 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-state-remove",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.remove_state(&request),
-            ),))
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-state-remove");
+            let result = caller.data_mut().capabilities.remove_state(&request);
+            audit.finish(&result);
+            Ok((encode_host_response(result),))
         },
     )
     .into_anyhow()
@@ -153,7 +186,10 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         root.func_wrap(
             name,
             move |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-                Ok((encode_host_response(handler(caller.data_mut(), &request)),))
+                let audit = caller.data().capabilities.begin_capability_audit(name);
+                let result = handler(caller.data_mut(), &request);
+                audit.finish(&result);
+                Ok((encode_host_response(result),))
             },
         )
         .into_anyhow()
@@ -162,9 +198,13 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-service-upsert",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.upsert_service(&request),
-            ),))
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-service-upsert");
+            let result = caller.data_mut().capabilities.upsert_service(&request);
+            audit.finish(&result);
+            Ok((encode_host_response(result),))
         },
     )
     .into_anyhow()
@@ -172,9 +212,13 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-service-remove",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.remove_service(&request),
-            ),))
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-service-remove");
+            let result = caller.data_mut().capabilities.remove_service(&request);
+            audit.finish(&result);
+            Ok((encode_host_response(result),))
         },
     )
     .into_anyhow()
@@ -182,9 +226,13 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-service-list",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
-            Ok((encode_host_response(
-                caller.data_mut().capabilities.list_services(&request),
-            ),))
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-service-list");
+            let result = caller.data_mut().capabilities.list_services(&request);
+            audit.finish(&result);
+            Ok((encode_host_response(result),))
         },
     )
     .into_anyhow()
@@ -192,10 +240,15 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap_async(
         "host-service-call",
         |caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-service-call");
             let (caller_id, services) = caller.data().capabilities.service_context();
             Box::new(async move {
                 let result =
                     CapabilityState::call_service_with(caller_id, services, &request).await;
+                audit.finish(&result);
                 Ok((encode_host_response(result),))
             })
         },

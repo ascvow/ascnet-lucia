@@ -58,8 +58,11 @@ impl RotatingCapabilityAudit {
                             "timestamp_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
                             "record": record,
                         }));
+                        if line.as_ref().is_err() || line.as_ref().is_ok_and(|line| line.len() > 4096) {
+                            lost.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         let result = line.map_err(anyhow::Error::from).and_then(|mut line| {
-                            if line.len() > 4096 { bail!("审计单条超过 4096 字节"); }
                             line.push(b'\n');
                             if file.as_ref().context("审计已停用")?.metadata()?.len() + line.len() as u64 > FILE_LIMIT {
                                 file.take();
@@ -201,6 +204,43 @@ mod tests {
     use super::*;
     use crate::audit::HostCapabilityCallResult;
 
+    /// 超大单条仅丢该记录，后续正常记录及实际写线程轮转仍可工作。
+    #[test]
+    fn oversized_record_does_not_disable_writer() {
+        let root =
+            std::env::temp_dir().join(format!("lucia-audit-oversize-{}", uuid::Uuid::new_v4()));
+        let sink = RotatingCapabilityAudit::open(&root).unwrap();
+        let record = |id: String| HostCapabilityCallObservation {
+            schema_version: 1,
+            plugin_id: id,
+            operation: "host-state-get",
+            result: HostCapabilityCallResult::ReturnedOk,
+        };
+        sink.observe_capability(record("x".repeat(5000)));
+        sink.observe_capability(record("healthy".into()));
+        sink.flush(Duration::from_secs(2)).unwrap();
+        assert_eq!(sink.dropped_count(), 1);
+        let path = root.join("capabilities.jsonl");
+        assert!(fs::read_to_string(&path).unwrap().contains("healthy"));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(FILE_LIMIT)
+            .unwrap();
+        sink.observe_capability(record("after-rotation".into()));
+        sink.flush(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            fs::metadata(root.join("capabilities.1.jsonl"))
+                .unwrap()
+                .len(),
+            FILE_LIMIT
+        );
+        assert!(fs::read_to_string(path).unwrap().contains("after-rotation"));
+        drop(sink);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// 文件出口有序且不记录正文，创建权限和轮转保留数受控。
     #[test]
     fn audit_file_is_private_ordered_and_rotated() {
@@ -215,6 +255,11 @@ mod tests {
             });
         }
         sink.flush(Duration::from_secs(2)).unwrap();
+        let expected = root.canonicalize().unwrap();
+        assert!(
+            RotatingCapabilityAudit::open(&expected).is_err(),
+            "同一目录不能有两个写入者"
+        );
         let log = root.join("capabilities.jsonl");
         let values = fs::read_to_string(&log)
             .unwrap()
