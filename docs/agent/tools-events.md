@@ -42,6 +42,13 @@ agent.set_tools(tools);
 
 Core 不知道监听者由原生对象还是 WASM component 实现。使用一次性审批指导时，可信应用 `EventSink` 接收完整展示原因，`core.tool.result` 与 `core.agent.event` 只接收脱敏工具结果，防止无关监听者把原因重新注入后续模型上下文。
 
+## 模型流的资源边界
+
+`ModelEventSender::send` 保持同步接口。单个流尚未消费的事件最多 4,096 项、计量正文最多
+32 MiB；超过任一限额后发送明确的终止错误并取消已绑定的网络任务，不静默丢弃增量或工具参数。
+消费事件会归还预算，这不是 Agent 步数或会话累计输出限额。`next()` 后继续调用 `result()`
+仍能取得相同终态，保持混合消费兼容性。
+
 ## EventSink
 
 内置 sink：
