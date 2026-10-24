@@ -614,6 +614,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         keyboard_enhanced: false,
     };
     let mut terminal = init_terminal(fullscreen)?;
+    let terminal_colors = crate::theme::TerminalColors::from_env();
     // 键盘增强协议让 Shift+Enter 等修饰组合可被区分（传统协议下它就是裸 Enter）。
     // 该查询会读取终端应答，必须在输入读取线程启动前完成，否则应答被线程吞掉。
     let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -835,6 +836,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 terminal.draw(|frame| {
                     render_root(frame, &mut app);
                     app.render_text_selection(frame.buffer_mut());
+                    crate::theme::apply_terminal_theme(frame.buffer_mut(), terminal_colors);
                     crate::ui::sanitize_terminal_buffer(frame.buffer_mut());
                 })
             })??;

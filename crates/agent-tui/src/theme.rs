@@ -1,6 +1,11 @@
-//! TUI 统一使用的配色与动画节奏常量。
+//! TUI 的语义色标、终端主题适配与动画节奏常量。
+//!
+//! 下方 RGB 值仅作为缓存中的语义色标，不直接交给终端。最终帧由 [`apply_terminal_theme`]
+//! 统一转为终端默认前景/背景与 ANSI 调色板；切换终端主题无需重启，也无需探测操作系统
+//! 主题或读取 OSC 回复。头像像素不是界面主题色，支持真彩色时保留原画色。
 
-use ratatui::style::Color;
+use ratatui::buffer::Buffer;
+use ratatui::style::{Color, Modifier};
 
 /// 底部状态栏的旋转进度点；只有插件启动计数使用，纯 Core 构建不需要。
 #[cfg(feature = "plugins")]
@@ -16,16 +21,11 @@ pub(crate) const ACTIVITY_SPARK: &[&str] = &["✳", "✶", "✷", "✸", "✹", 
 pub(crate) const COLOR_BORDER_FOCUS: Color = Color::Rgb(112, 110, 104);
 /// 主要文字颜色。
 pub(crate) const COLOR_TEXT: Color = Color::Rgb(224, 222, 216);
-/// 正文明细文字颜色：偏灰而非纯白。
-///
-/// 长段落整屏用 [`COLOR_TEXT`] 会把界面拉成一片高亮，读者找不到落点；解释性正文降一档
-/// 亮度后，标题、标记与错误信息才真正"跳"出来。
+/// 正文明细色标；最终沿用终端前景，标题和标记通过粗体建立层级。
 pub(crate) const COLOR_TEXT_SOFT: Color = Color::Rgb(180, 180, 180);
 /// 次要文字和边框颜色。
 pub(crate) const COLOR_MUTED: Color = Color::Rgb(124, 122, 116);
-/// 元信息颜色：行号、路径、Git 状态与状态栏分隔符。
-///
-/// 比 [`COLOR_MUTED`] 再暗一档，让这些只在需要时被查找的信息退到背景里。
+/// 元信息色标：行号、路径、Git 状态与状态栏分隔符；最终以默认前景加 DIM 显示。
 pub(crate) const COLOR_META: Color = Color::Rgb(100, 100, 100);
 /// 用户消息强调色：露西亚主题绯红。
 pub(crate) const COLOR_USER: Color = Color::Rgb(226, 61, 82);
@@ -35,33 +35,23 @@ pub(crate) const COLOR_SUCCESS: Color = Color::Rgb(104, 190, 126);
 pub(crate) const COLOR_WARNING: Color = Color::Rgb(197, 164, 103);
 /// 错误状态颜色。
 pub(crate) const COLOR_DANGER: Color = Color::Rgb(205, 101, 101);
-/// 必须一眼看到的失败提示颜色：比 [`COLOR_DANGER`] 更亮。
+/// 必须一眼看到的失败提示色标；最终使用终端红色并加粗。
 ///
-/// 只用于错误标记与错误摘要这类"读漏就要付出代价"的信息；正文里的普通失败描述仍用
-/// [`COLOR_DANGER`]，否则整屏都是警报色，警报本身也就不再是警报。
+/// 只用于错误标记与摘要，普通失败描述仍用 [`COLOR_DANGER`]。
 pub(crate) const COLOR_DANGER_BRIGHT: Color = Color::Rgb(255, 110, 110);
 
-/// 面板之间分隔线的颜色。
-///
-/// 比次要文字更暗：分隔线只需要"这里换区域了"这一点信息，与正文同亮度会把界面
-/// 切得很碎。
+/// 面板分隔线色标；最终以默认前景加 DIM 降低装饰线的视觉权重。
 pub(crate) const COLOR_SEPARATOR: Color = Color::Rgb(68, 66, 72);
 
 /// 信息强调色：用于插件语义色中的"提示、正在进行"一类状态。
 pub(crate) const COLOR_ACCENT: Color = Color::Rgb(122, 172, 196);
 
-/// 列表与菜单中选中项的背景色。
-///
-/// 中性抬升色而非强调色：选中态需要的是"这一行被拎出来了"，用强调色会和语义色
-/// （成功、危险）争夺含义，反色则在深色主题下过于刺眼。
+/// 列表选中背景色标；最终转换为默认前景/背景反色，不依赖固定深灰底色。
 pub(crate) const COLOR_SELECTION_BG: Color = Color::Rgb(56, 54, 60);
 /// 选中项左侧的指示条颜色。
 pub(crate) const COLOR_SELECTION_MARK: Color = Color::Rgb(226, 61, 82);
 
-/// 命令补全菜单中选中项的背景色。
-///
-/// 比通用 [`COLOR_SELECTION_BG`] 再暗一档：补全菜单紧贴输入框，行距与留白已经把选中
-/// 行拎出来了，底色只需一层极浅的抬升，过亮会像一块糊在输入框上的色板。
+/// 命令补全选中背景色标；与通用选中项一样在最终帧中使用反色。
 pub(crate) const COLOR_PALETTE_SELECTION_BG: Color = Color::Rgb(45, 45, 52);
 
 /// 命令补全菜单中命令名的颜色。
@@ -73,19 +63,11 @@ pub(crate) const COLOR_PALETTE_COMMAND: Color = Color::Rgb(126, 200, 216);
 pub(crate) const COLOR_LINE_NUMBER: Color = Color::Rgb(92, 90, 86);
 /// 行内代码与围栏代码块的文字颜色：暖色，与正文的中性灰区分开。
 pub(crate) const COLOR_CODE: Color = Color::Rgb(206, 184, 146);
-/// 围栏代码块的整块底色：比正文背景略亮的暖灰，把代码从正文里垫出来。
-///
-/// 必须**亮于**终端背景，否则代码块看起来像在页面上挖了个洞——终端默认底色普遍是
-/// `#000` 到 `#25262b` 这个区间，取偏暖的炭灰能在两种背景下都读作"抬起的卡片"，
-/// 同时避开冷蓝调与暖色代码文字（[`COLOR_CODE`]）撞色。
+/// 围栏代码背景色标；输出时还原终端底色，以竖线、内边距和语法色区分代码。
 pub(crate) const COLOR_CODE_BG: Color = Color::Rgb(46, 44, 40);
-/// 引用块的整块底色：比代码块更暗，靠色差而非竖线区分两种卡片。
+/// 引用背景色标；输出时还原终端底色，保留引用竖线。
 pub(crate) const COLOR_QUOTE_BG: Color = Color::Rgb(39, 38, 35);
-/// diff 新增行的整行背景色。
-///
-/// 底色必须远暗于文字：整行色块的作用是"扫一眼看出这里多了一块"，一旦底色接近文字
-/// 亮度，色块就会盖过代码本身的可读性。它同时要比 [`COLOR_CODE_BG`] 亮，否则在代码
-/// 卡片里会变成一块凹下去的补丁。
+/// diff 新增背景色标；输出时还原终端底色，新增语义由绿色和 `+` 保留。
 pub(crate) const COLOR_DIFF_ADD_BG: Color = Color::Rgb(42, 58, 40);
 /// diff 删除行的整行背景色。
 pub(crate) const COLOR_DIFF_DEL_BG: Color = Color::Rgb(66, 42, 40);
@@ -116,6 +98,124 @@ pub(crate) const COLOR_SYNTAX_NUMBER: Color = Color::Rgb(214, 168, 118);
 pub(crate) const COLOR_SYNTAX_TYPE: Color = Color::Rgb(210, 180, 120);
 /// 代码高亮：标点与运算符。
 pub(crate) const COLOR_SYNTAX_PUNCT: Color = Color::Rgb(150, 148, 142);
+/// 终端输出能力；只影响最终帧，不改变消息与插件渲染缓存中的语义色标。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalColors {
+    /// 使用默认前景/背景，保留粗体、反色等非颜色提示。
+    Monochrome,
+    /// 使用终端可配置的基础 ANSI 色板，不发送固定 RGB 值。
+    Ansi,
+    /// 语义色仍使用终端色板，仅头像等非主题图像允许 RGB。
+    TrueColor,
+}
+
+impl TerminalColors {
+    /// 启动时读取颜色能力；不探测操作系统主题、不读终端输入，也不会发起阻塞查询。
+    pub(crate) fn from_env() -> Self {
+        Self::detect(
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("COLORTERM").ok().as_deref(),
+            std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+        )
+    }
+
+    /// 显式禁色优先；缺失能力信息时按基础 ANSI 终端降级。
+    fn detect(term: Option<&str>, colorterm: Option<&str>, no_color: bool) -> Self {
+        if no_color || term == Some("dumb") {
+            Self::Monochrome
+        } else if matches!(colorterm, Some("truecolor" | "24bit"))
+            || term.is_some_and(|term| term.ends_with("-direct"))
+        {
+            Self::TrueColor
+        } else {
+            Self::Ansi
+        }
+    }
+}
+
+/// 在帧提交给终端前把语义色标解析成终端色板；原生与插件 UI 共用这一出口。
+///
+/// 必须在完整视图与选区绘制后、Ratatui 差分之前调用一次。正文和卡片使用终端默认底色，
+/// 次要信息以 DIM 降级；选中行使用默认前景/背景反色，避免浅色终端出现黑底黑字。
+/// 不修改文本、几何或缓存；终端主题切换直接重解释默认色和 ANSI 槽位，不需要重建历史消息。
+pub(crate) fn apply_terminal_theme(buffer: &mut Buffer, colors: TerminalColors) {
+    for cell in &mut buffer.content {
+        if matches!(cell.bg, COLOR_SELECTION_BG | COLOR_PALETTE_SELECTION_BG) {
+            cell.fg = Color::Reset;
+            cell.bg = Color::Reset;
+            cell.modifier.remove(Modifier::DIM);
+            cell.modifier.insert(Modifier::REVERSED);
+        } else {
+            if matches!(
+                cell.fg,
+                COLOR_MUTED
+                    | COLOR_META
+                    | COLOR_SEPARATOR
+                    | COLOR_LINE_NUMBER
+                    | COLOR_SYNTAX_COMMENT
+            ) {
+                cell.modifier.insert(Modifier::DIM);
+            }
+            if cell.fg == COLOR_DANGER_BRIGHT {
+                cell.modifier.insert(Modifier::BOLD);
+            }
+            cell.fg = terminal_color(cell.fg, colors);
+            // 卡片以现有竖线、缩进和 diff 的 +/- 区分，不假定用户使用深色背景。
+            cell.bg = match cell.bg {
+                COLOR_CODE_BG | COLOR_QUOTE_BG | COLOR_DIFF_ADD_BG | COLOR_DIFF_DEL_BG => {
+                    Color::Reset
+                }
+                background => terminal_color(background, colors),
+            };
+        }
+        cell.underline_color = terminal_color(cell.underline_color, colors);
+    }
+}
+
+/// 只解析本模块拥有的语义色；未知颜色属于图像，按终端能力保留或量化。
+fn terminal_color(color: Color, colors: TerminalColors) -> Color {
+    if colors == TerminalColors::Monochrome {
+        return Color::Reset;
+    }
+    match color {
+        COLOR_TEXT | COLOR_TEXT_SOFT | COLOR_BORDER_FOCUS | COLOR_MUTED | COLOR_META
+        | COLOR_SEPARATOR | COLOR_LINE_NUMBER | COLOR_SYNTAX_COMMENT | COLOR_SYNTAX_PUNCT => {
+            Color::Reset
+        }
+        COLOR_USER | COLOR_DANGER | COLOR_DANGER_BRIGHT | COLOR_DIFF_DEL_FG => Color::Red,
+        COLOR_SUCCESS | COLOR_DIFF_ADD_FG | COLOR_SYNTAX_STRING => Color::Green,
+        COLOR_WARNING | COLOR_CODE | COLOR_SYNTAX_NUMBER | COLOR_SYNTAX_TYPE => Color::Yellow,
+        COLOR_ACCENT | COLOR_PALETTE_COMMAND | COLOR_DIFF_HUNK => Color::Cyan,
+        COLOR_DIFF_FILE_HEADER => Color::Blue,
+        COLOR_SYNTAX_KEYWORD => Color::Magenta,
+        Color::Rgb(red, green, blue) if colors == TerminalColors::Ansi => {
+            // 仅图像使用最近基础色量化；语义色始终走上方显式映射，不随图像算法漂移。
+            let palette = [
+                (Color::Black, [0, 0, 0]),
+                (Color::Red, [170, 0, 0]),
+                (Color::Green, [0, 170, 0]),
+                (Color::Yellow, [170, 85, 0]),
+                (Color::Blue, [0, 0, 170]),
+                (Color::Magenta, [170, 0, 170]),
+                (Color::Cyan, [0, 170, 170]),
+                (Color::Gray, [170, 170, 170]),
+            ];
+            palette
+                .into_iter()
+                .min_by_key(|(_, rgb)| {
+                    [red, green, blue]
+                        .into_iter()
+                        .zip(rgb)
+                        .map(|(value, target)| (i32::from(value) - target).pow(2))
+                        .sum::<i32>()
+                })
+                .unwrap()
+                .0
+        }
+        color => color,
+    }
+}
+
 /// Number of 80 ms UI ticks before startup plugin details collapse into the compact counter.
 /// 启动插件详情收敛为紧凑计数前保留的 80 毫秒 UI tick 数。
 #[cfg(feature = "plugins")]
@@ -156,3 +256,251 @@ pub(crate) const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 /// 周期插件视图刷新间隔，约为一秒。
 #[cfg(feature = "plugins")]
 pub(crate) const PLUGIN_REFRESH_TICKS: u8 = 12;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::Rect;
+    use ratatui::style::Style;
+    use ratatui::widgets::{Paragraph, Widget};
+
+    /// 显式禁色优先，缺失能力声明时保守降级；不依赖 COLORFGBG 或操作系统主题。
+    #[test]
+    fn detects_terminal_color_capabilities_without_theme_queries() {
+        assert_eq!(
+            TerminalColors::detect(Some("dumb"), Some("truecolor"), false),
+            TerminalColors::Monochrome
+        );
+        assert_eq!(
+            TerminalColors::detect(Some("xterm"), Some("truecolor"), true),
+            TerminalColors::Monochrome
+        );
+        assert_eq!(
+            TerminalColors::detect(Some("xterm-direct"), None, false),
+            TerminalColors::TrueColor
+        );
+        assert_eq!(
+            TerminalColors::detect(None, Some("24bit"), false),
+            TerminalColors::TrueColor
+        );
+        assert_eq!(
+            TerminalColors::detect(Some("xterm-256color"), None, false),
+            TerminalColors::Ansi
+        );
+        assert_eq!(
+            TerminalColors::detect(None, None, false),
+            TerminalColors::Ansi
+        );
+    }
+
+    /// 所有界面色标最终都落在终端默认色或基础色板，而不是残留固定的深色 RGB。
+    #[test]
+    fn semantic_colors_use_terminal_palette_even_with_truecolor() {
+        for (semantic, expected) in [
+            (COLOR_BORDER_FOCUS, Color::Reset),
+            (COLOR_TEXT, Color::Reset),
+            (COLOR_TEXT_SOFT, Color::Reset),
+            (COLOR_MUTED, Color::Reset),
+            (COLOR_META, Color::Reset),
+            (COLOR_SEPARATOR, Color::Reset),
+            (COLOR_LINE_NUMBER, Color::Reset),
+            (COLOR_SYNTAX_COMMENT, Color::Reset),
+            (COLOR_SYNTAX_PUNCT, Color::Reset),
+            (COLOR_USER, Color::Red),
+            (COLOR_DANGER, Color::Red),
+            (COLOR_DANGER_BRIGHT, Color::Red),
+            (COLOR_SELECTION_MARK, Color::Red),
+            (COLOR_DIFF_DEL_FG, Color::Red),
+            (COLOR_SUCCESS, Color::Green),
+            (COLOR_DIFF_ADD_FG, Color::Green),
+            (COLOR_SYNTAX_STRING, Color::Green),
+            (COLOR_WARNING, Color::Yellow),
+            (COLOR_CODE, Color::Yellow),
+            (COLOR_SYNTAX_NUMBER, Color::Yellow),
+            (COLOR_SYNTAX_TYPE, Color::Yellow),
+            (COLOR_ACCENT, Color::Cyan),
+            (COLOR_PALETTE_COMMAND, Color::Cyan),
+            (COLOR_DIFF_HUNK, Color::Cyan),
+            (COLOR_DIFF_FILE_HEADER, Color::Blue),
+            (COLOR_SYNTAX_KEYWORD, Color::Magenta),
+        ] {
+            for colors in [TerminalColors::Ansi, TerminalColors::TrueColor] {
+                assert_eq!(terminal_color(semantic, colors), expected);
+            }
+        }
+    }
+
+    /// 正文使用默认色，深浅主题切换仅更换终端色板；选中项始终是默认色反色的高对比配对。
+    #[test]
+    fn text_surfaces_and_selection_follow_light_and_dark_defaults() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        for (index, background) in [
+            Color::Reset,
+            COLOR_CODE_BG,
+            COLOR_QUOTE_BG,
+            COLOR_DIFF_ADD_BG,
+            COLOR_DIFF_DEL_BG,
+            COLOR_SELECTION_BG,
+            COLOR_PALETTE_SELECTION_BG,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            buffer[(index as u16, 0)]
+                .set_symbol("x")
+                .set_style(Style::new().fg(COLOR_TEXT).bg(background));
+        }
+        buffer[(7, 0)].set_style(Style::new().fg(COLOR_MUTED));
+        apply_terminal_theme(&mut buffer, TerminalColors::TrueColor);
+        for (foreground, background) in [(0xdddddd, 0x181818), (0x202020, 0xfafafa)] {
+            for index in 0..7 {
+                let cell = &buffer[(index, 0)];
+                assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset));
+                let selected = cell.modifier.contains(Modifier::REVERSED);
+                assert_eq!(selected, index >= 5);
+                let (visible_fg, visible_bg) = if selected {
+                    (background, foreground)
+                } else {
+                    (foreground, background)
+                };
+                assert_ne!(visible_fg, visible_bg);
+            }
+        }
+        assert!(buffer[(7, 0)].modifier.contains(Modifier::DIM));
+    }
+
+    /// 真实代码/引用/diff 渲染保持文字与结构，移除深色底板但保留语义色及 +/- 标记。
+    #[test]
+    fn markdown_surfaces_keep_structure_with_terminal_background() {
+        let lines = crate::ui::markdown::markdown_lines(
+            "> quoted\n\n```rust\nlet value = 42;\n```\n\n```diff\n-old\n+new\n```",
+            false,
+            60,
+        );
+        let area = Rect::new(0, 0, 60, 24);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(lines).render(area, &mut buffer);
+        let original: Vec<_> = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        apply_terminal_theme(&mut buffer, TerminalColors::TrueColor);
+        assert_eq!(
+            buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol().to_string())
+                .collect::<Vec<_>>(),
+            original
+        );
+        assert!(buffer.content.iter().all(|cell| cell.bg == Color::Reset));
+        assert!(buffer
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "+" && cell.fg == Color::Green));
+        assert!(buffer
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "-" && cell.fg == Color::Red));
+        assert!(buffer.content.iter().any(|cell| cell.symbol() == "▎"));
+        assert!(buffer.content.iter().any(|cell| cell.symbol() == "▏"));
+    }
+
+    /// 单色模式清除前景、背景与下划线颜色，但不丢掉选中态、文字及字形提示。
+    #[test]
+    fn monochrome_keeps_non_color_cues_and_text() {
+        let area = Rect::new(0, 0, 3, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer[(0, 0)]
+            .set_symbol("!")
+            .set_style(Style::new().fg(COLOR_DANGER_BRIGHT).underlined());
+        buffer[(0, 0)].underline_color = Color::Red;
+        buffer[(1, 0)]
+            .set_symbol("▌")
+            .set_style(Style::new().fg(COLOR_TEXT).bg(COLOR_SELECTION_BG));
+        buffer[(2, 0)].set_symbol("▀").set_style(
+            Style::new()
+                .fg(Color::Rgb(10, 20, 30))
+                .bg(Color::Rgb(40, 50, 60)),
+        );
+        apply_terminal_theme(&mut buffer, TerminalColors::Monochrome);
+        assert!(buffer.content.iter().all(|cell| cell.fg == Color::Reset
+            && cell.bg == Color::Reset
+            && cell.underline_color == Color::Reset));
+        assert!(buffer[(0, 0)]
+            .modifier
+            .contains(Modifier::BOLD | Modifier::UNDERLINED));
+        assert!(buffer[(1, 0)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buffer[(2, 0)].symbol(), "▀");
+    }
+
+    /// 原生命令菜单和历史正文经过最终出口后不携带深色 RGB，选中行仍铺满反色。
+    #[test]
+    fn full_frame_theme_keeps_menu_selection_and_cached_history_readable() {
+        use crate::app::App;
+        use crate::session::conversation::{Msg, MsgKind};
+        use ratatui::{backend::TestBackend, Terminal};
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(tx, "theme-test".into());
+        app.messages.push(Msg::new(
+            MsgKind::Assistant,
+            "# Heading\n\nBody\n\n```rust\nlet n = 42;\n```",
+        ));
+        app.input = "/".into();
+        app.cursor = 1;
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        for colors in [
+            TerminalColors::TrueColor,
+            TerminalColors::Ansi,
+            TerminalColors::Monochrome,
+        ] {
+            terminal
+                .draw(|frame| {
+                    crate::ui::root::render_root(frame, &mut app);
+                    apply_terminal_theme(frame.buffer_mut(), colors);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(buffer
+                .content
+                .iter()
+                .all(|cell| !matches!(cell.fg, Color::Rgb(..)) && cell.bg == Color::Reset));
+            let selected = buffer
+                .content
+                .chunks(100)
+                .find(|row| {
+                    row.iter().any(|cell| {
+                        cell.symbol() == "▌" && cell.modifier.contains(Modifier::REVERSED)
+                    })
+                })
+                .unwrap();
+            for (column, cell) in selected.iter().enumerate() {
+                // 宽字符的续占格由 Ratatui 清空，不独立输出样式。
+                if column > 0
+                    && unicode_width::UnicodeWidthStr::width(selected[column - 1].symbol()) > 1
+                {
+                    continue;
+                }
+                assert!(
+                    cell.modifier.contains(Modifier::REVERSED) && cell.fg == Color::Reset,
+                    "column={column}: {cell:?}"
+                );
+            }
+            if colors == TerminalColors::Monochrome {
+                assert!(buffer.content.iter().all(|cell| cell.fg == Color::Reset));
+            }
+        }
+    }
+
+    /// 头像颜色不冒充主题色，只有声明真彩色能力时保留；否则落在基础终端色板。
+    #[test]
+    fn image_pixels_follow_color_capability_not_semantic_mapping() {
+        let pixel = Color::Rgb(255, 210, 202);
+        assert_eq!(terminal_color(pixel, TerminalColors::TrueColor), pixel);
+        assert!(!matches!(
+            terminal_color(pixel, TerminalColors::Ansi),
+            Color::Rgb(..) | Color::Indexed(_)
+        ));
+    }
+}

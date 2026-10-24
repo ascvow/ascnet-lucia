@@ -34,7 +34,7 @@ PASTE_OFF = b"\x1b[?2004l"
 class TerminalProcess:
     """管理一个有控制终端的隔离进程，退出或断言失败时都回收资源。"""
 
-    def __init__(self, root, fullscreen, term):
+    def __init__(self, root, fullscreen, term, color_env=None):
         self.master, self.slave = pty.openpty()
         self.output = bytearray()
         self.resize(100, 24)
@@ -42,6 +42,9 @@ class TerminalProcess:
         config.write_text(json.dumps({"tui": {"fullscreen": fullscreen}}), encoding="utf-8")
         env = os.environ.copy()
         env.update(LUCIA_HOME=root, TERM=term, COLORTERM="truecolor")
+        env.pop("NO_COLOR", None)
+        if color_env is not None:
+            env.update(color_env)
 
         def attach_terminal():
             os.setsid()
@@ -123,6 +126,49 @@ class TerminalProcess:
 class RenderProtocolTests(unittest.TestCase):
     """实际二进制的协议检查；同一脚本适用于默认插件版和纯 Core 版。"""
 
+    def test_terminal_palette_and_monochrome_output(self):
+        """检查真实后端输出的颜色协议；不把色板声明测试冒充图形主题截图验收。"""
+        for term, color_env, monochrome in [
+            ("xterm", {"COLORTERM": ""}, False),
+            ("xterm-256color", {"NO_COLOR": "1"}, True),
+            ("dumb", {}, True),
+        ]:
+            with (
+                self.subTest(term=term, color_env=color_env),
+                tempfile.TemporaryDirectory(prefix="lucia-colors-") as root,
+            ):
+                job = TerminalProcess(root, True, term, color_env)
+                try:
+                    job.wait_for(END_FRAME)
+                    # 菜单选择必须保留非颜色提示，单色也能看见当前候选。
+                    mark = len(job.output)
+                    job.paste("/")
+                    job.wait_for(b"/context", mark)
+                    menu = job.output.index(b"/context", mark)
+                    job.wait_for(END_FRAME, menu)
+                    output = bytes(job.output)
+                    sgr = re.findall(rb"\x1b\[([0-9;:]*)m", output)
+                    self.assertNotRegex(output, rb"\x1b\[[0-9;:]*(?:38|48|58);2;")
+                    self.assertTrue(any(b"7" in code.split(b";") for code in sgr), "菜单应保留反色选中态")
+                    has_palette_color = any(
+                        value in {b"38", b"48", b"58"}
+                        or (value.isdigit() and (30 <= int(value) <= 37 or 40 <= int(value) <= 47 or 90 <= int(value) <= 107))
+                        for code in sgr for value in code.split(b";")
+                    )
+                    if monochrome:
+                        self.assertFalse(has_palette_color, "单色模式不应发送显式颜色")
+                    else:
+                        self.assertTrue(has_palette_color, "基础终端应使用可配置的 ANSI 色板")
+                        self.assertNotIn(b"\x1b]10;?", output)
+                        self.assertNotIn(b"\x1b]11;?", output)
+                    mark = len(job.output)
+                    os.write(job.master, b"\x15")
+                    job.wait_for(END_FRAME, mark)
+                    os.write(job.master, b"\x04")
+                    self.assertEqual(job.wait_exit(), 0)
+                finally:
+                    job.close()
+
     def test_startup_resize_paste_switch_and_exit(self):
         for term, fullscreen in [
             ("xterm-256color", True),
@@ -158,9 +204,10 @@ class RenderProtocolTests(unittest.TestCase):
                     job.wait_for(b"END", mark)
                     end = job.output.index(b"END", mark)
                     job.wait_for(END_FRAME, end)
-                    # 宽字符之后后端会插入绝对光标定位；只检查文本原样输出，不声称验证了字形。
-                    text = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", job.output[mark:])
-                    self.assertIn(pasted.encode(), text)
+                    # 差分可能跳过上一帧已存在的空格；宽字符后也会插入绝对光标定位。
+                    # 此处验证非空白文本/字素原样输出，空格几何由 TestBackend 渲染测试覆盖。
+                    text = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", job.output[mark:]).decode("utf-8")
+                    self.assertIn("".join(pasted.split()), "".join(text.split()))
                     self.assertNotIn(CLEAR, job.output[mark:], "普通输入仍应只输出差分")
                     mark = len(job.output)
                     os.write(job.master, b"\x15")  # Ctrl+U 清掉草稿，不向 demo 提交。

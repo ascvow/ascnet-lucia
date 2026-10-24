@@ -387,10 +387,15 @@ pub(crate) fn render_plugin_input(
 fn plugin_style(plugin_style: &UiStyle) -> Style {
     let mut style = Style::new();
     if let Some(color) = plugin_style.foreground {
-        style = style.fg(plugin_color(color));
+        // 显式底色通常与前景配成一对；不能只把 White 前景替换成终端默认黑字。
+        style = style.fg(if plugin_style.background.is_some() {
+            plugin_palette_color(color)
+        } else {
+            plugin_color(color)
+        });
     }
     if let Some(color) = plugin_style.background {
-        style = style.bg(plugin_color(color));
+        style = style.bg(plugin_palette_color(color));
     }
     if plugin_style.bold {
         style = style.add_modifier(Modifier::BOLD);
@@ -407,12 +412,25 @@ fn plugin_style(plugin_style: &UiStyle) -> Style {
     style
 }
 
+/// 显式前景/背景配对保持终端色板槽位，避免把其中一侧错误地替换为默认色。
+fn plugin_palette_color(color: UiColor) -> Color {
+    match color {
+        UiColor::Black => Color::Black,
+        UiColor::Red => Color::Red,
+        UiColor::Green => Color::Green,
+        UiColor::Yellow => Color::Yellow,
+        UiColor::Blue => Color::Blue,
+        UiColor::Magenta => Color::Magenta,
+        UiColor::Cyan => Color::Cyan,
+        UiColor::White => Color::White,
+        UiColor::Gray => Color::Gray,
+    }
+}
+
 /// 将插件便携颜色映射到 Lucia 色板。
 ///
-/// 刻意不直接落到终端 16 色：`Color::DarkGray` 之类的原始 ANSI 值在深色主题下比
-/// 应用自身的次要色暗得多，插件面板会明显比原生面板"发灰"，同一个界面里出现两套
-/// 观感。这里把插件的语义色收敛到与原生组件相同的色板，插件只需表达"这是次要文字"
-/// 或"这是危险状态"，具体呈现由宿主主题统一决定。
+/// 插件只声明语义色，沿用原生组件的色标；最终由 `theme::apply_terminal_theme` 一并
+/// 映射到终端默认色和 ANSI 色板，不维护一套深色专用的插件配色。
 fn plugin_color(color: UiColor) -> Color {
     match color {
         UiColor::Black => Color::Black,
@@ -434,6 +452,59 @@ mod tests {
     use agent_plugin_protocol::{UiDeclaration, UiLine, UiSize, UiSpan};
     use ratatui::{backend::TestBackend, Terminal};
     use tokio::sync::mpsc;
+
+    /// 插件默认文字跟随终端；显式前景/背景必须成对保留色板槽位，不能变成黑底黑字。
+    #[test]
+    fn plugin_theme_preserves_explicit_color_pairs_and_modifiers() {
+        use crate::theme::{apply_terminal_theme, TerminalColors};
+        let styles = [
+            UiStyle {
+                foreground: Some(UiColor::White),
+                ..UiStyle::default()
+            },
+            UiStyle {
+                foreground: Some(UiColor::White),
+                background: Some(UiColor::Black),
+                ..UiStyle::default()
+            },
+            UiStyle {
+                foreground: Some(UiColor::Black),
+                background: Some(UiColor::White),
+                reversed: true,
+                ..UiStyle::default()
+            },
+            UiStyle {
+                foreground: Some(UiColor::Red),
+                underlined: true,
+                ..UiStyle::default()
+            },
+        ];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        for (index, style) in styles.iter().enumerate() {
+            buffer[(index as u16, 0)]
+                .set_symbol("x")
+                .set_style(plugin_style(style));
+        }
+        apply_terminal_theme(&mut buffer, TerminalColors::TrueColor);
+        assert_eq!(buffer[(0, 0)].fg, Color::Reset);
+        assert_eq!(
+            (buffer[(1, 0)].fg, buffer[(1, 0)].bg),
+            (Color::White, Color::Black)
+        );
+        assert_eq!(
+            (buffer[(2, 0)].fg, buffer[(2, 0)].bg),
+            (Color::Black, Color::White)
+        );
+        assert!(buffer[(2, 0)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buffer[(3, 0)].fg, Color::Red);
+        assert!(buffer[(3, 0)].modifier.contains(Modifier::UNDERLINED));
+        apply_terminal_theme(&mut buffer, TerminalColors::Monochrome);
+        assert!(buffer
+            .content
+            .iter()
+            .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
+        assert!(buffer[(2, 0)].modifier.contains(Modifier::REVERSED));
+    }
 
     /// 构造一个只用于渲染的插件对话框视图。
     fn dialog_view() -> PluginViewState {
