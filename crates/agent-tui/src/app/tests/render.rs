@@ -390,11 +390,98 @@ fn footer_shows_context_usage_and_configured_upstream_name() {
     assert!(!app.running);
     assert!(text.contains("◔ 25% · 50.0k"), "{text:?}");
 
-    let area = app.context_chip_area.expect("用量芯片应登记点击热区");
+    assert_eq!(app.context_chip_areas.len(), 1, "宽窗口芯片保持一行");
+    let area = app.context_chip_areas[0];
     let row: String = (area.x..area.x + area.width)
         .map(|x| terminal.backend().buffer()[(x, area.y)].symbol())
         .collect();
     assert_eq!(row, "◔ 25% · 50.0k", "热区必须与绘制位置对齐");
+}
+
+/// 底栏随真实 resize 增减行数，目录/分支/插件状态不再消失，输入和芯片热区跟着移动。
+#[test]
+fn footer_reflows_on_resize_without_hiding_status_items() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app =
+        App::new(tx, "model-abcdefghijklmnopqrstuvwxyz".into()).with_context_window(Some(200_000));
+    app.model_upstream_name = Some("upstream".into());
+    app.context_tokens = Some(50_000);
+    app.workspace.cwd = PathBuf::from("/workspace/a-very-long-project-directory");
+    app.workspace.git_branch = Some("feature/long-branch-name-that-must-stay-visible".into());
+    app.messages.push(Msg::new(MsgKind::User, "READY"));
+    app.input = "draft".into();
+    app.cursor = app.input.len();
+    #[cfg(feature = "plugins")]
+    {
+        app.plugin_footer_statuses.insert(
+            "test-plugin".into(),
+            (
+                "Permission: ask before running every tool".into(),
+                COLOR_WARNING,
+            ),
+        );
+    }
+    let mut terminal = Terminal::new(TestBackend::new(240, 40)).unwrap();
+    let mut heights = Vec::new();
+    for width in [240, 40, 16, 240] {
+        terminal.backend_mut().resize(width, 40);
+        terminal.autoresize().unwrap();
+        let frame = terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        let rows: Vec<String> = frame
+            .buffer
+            .content()
+            .chunks(usize::from(width))
+            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let input_row = rows.iter().position(|row| row.contains("draft")).unwrap();
+        assert!(rows[input_row - 1].chars().all(|ch| ch == '─'));
+        assert!(rows[input_row + 1].chars().all(|ch| ch == '─'));
+        let footer = &rows[input_row + 2..];
+        heights.push(footer.len());
+        let text: String = footer.iter().map(|row| row.trim_end()).collect();
+        for expected in [
+            "model-abcdefghijklmnopqrstuvwxyz [upstream]",
+            "◔ 25% · 50.0k",
+            "/workspace/a-very-long-project-directory",
+            "feature/long-branch-name-that-must-stay-visible",
+        ] {
+            assert!(text.contains(expected), "width={width}: {footer:?}");
+        }
+        #[cfg(feature = "plugins")]
+        assert!(
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+                .contains("Permission:askbeforerunningeverytool"),
+            "{footer:?}"
+        );
+        assert!(footer
+            .iter()
+            .all(|row| !row.trim().starts_with('|') && !row.trim().ends_with('|')));
+        let chip: String = app
+            .context_chip_areas
+            .iter()
+            .map(|area| {
+                assert!(usize::from(area.y) > input_row + 1);
+                (area.x..area.right())
+                    .map(|x| frame.buffer[(x, area.y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(chip, "◔ 25% · 50.0k", "width={width}");
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!(usize::from(cursor.y), input_row);
+    }
+    assert_eq!(heights[0], 1);
+    assert!(heights[1] > heights[0]);
+    assert!(heights[2] > heights[1]);
+    assert_eq!(heights[3], heights[0]);
+
+    app.context_tokens = None;
+    app.is_context_chip_hovered = true;
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    assert!(app.context_chip_areas.is_empty());
+    assert!(!app.is_context_chip_hovered);
 }
 
 /// 左键释放形成可复制选区后，底栏必须展示一次性操作提示。
@@ -1111,7 +1198,7 @@ fn compact(text: &str) -> String {
 }
 
 /// 验证运行状态（含耗时与停止提示）只落在输入框上方的状态行，日志区与边框都不重复输出，
-/// 同时窄终端仍隐藏工作目录。
+/// 同时窄终端中的工作目录改为在底栏折行。
 #[test]
 fn running_activity_renders_on_the_fixed_status_row_only() {
     let width = 60;
@@ -1158,7 +1245,8 @@ fn running_activity_renders_on_the_fixed_status_row_only() {
         .filter(|character| !character.is_whitespace())
         .collect();
     assert!(text.contains("Steerthecurrentrun..."), "{text:?}");
-    assert!(!text.contains("ascnet-lucia"), "{text:?}");
+    // 窄窗口中的目录现在折到底栏下一行，不再被整项隐藏。
+    assert!(text.contains("ascnet-lucia"), "{text:?}");
 }
 
 /// 状态行中某个片段的单元格颜色，用于验证语义配色。

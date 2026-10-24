@@ -362,10 +362,11 @@ impl App {
         ) {
             return false;
         }
-        let Some(area) = self.context_chip_area else {
-            return false;
-        };
-        if !area.contains(Position::new(mouse.column, mouse.row)) {
+        if !self
+            .context_chip_areas
+            .iter()
+            .any(|area| area.contains(Position::new(mouse.column, mouse.row)))
+        {
             return false;
         }
         self.dismiss_text_selection();
@@ -421,7 +422,7 @@ impl App {
     ///
     /// 只有真正的指针移动（[`MouseEventKind::Moved`]）才会改变悬停态：按下、滚轮、拖拽
     /// 携带的坐标是"事件发生点"，用它点亮高亮会让鼠标没动时滚动条无故变宽。判定范围就是
-    /// 渲染层上一帧发布的 [`App::scrollbar_area`] 与 [`App::context_chip_area`]，因此
+    /// 渲染层上一帧发布的 [`App::scrollbar_area`] 与 [`App::context_chip_areas`]，因此
     /// 悬停区与显示区始终是同一块几何。
     ///
     /// 拖拽期间终端上报的是 `Drag` 而不是 `Moved`，于是按住滑块横向甩出时高亮会自然保留，
@@ -447,8 +448,9 @@ impl App {
             .scrollbar_area
             .is_some_and(|area| area.contains(position));
         let chip_hovered = self
-            .context_chip_area
-            .is_some_and(|area| area.contains(position));
+            .context_chip_areas
+            .iter()
+            .any(|area| area.contains(position));
         let previous = (self.is_scrollbar_hovered, self.is_context_chip_hovered);
         self.is_scrollbar_hovered = scrollbar_hovered;
         self.is_context_chip_hovered = chip_hovered;

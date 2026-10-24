@@ -140,7 +140,17 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
         &app.refs,
         input_text_width,
     );
-    let input_height = conversation_sections(workspace, input_rows, 0, 0)[3].height;
+    // 底栏与输入框一样先折行再布局；同一份视觉行同时决定高度、绘制内容和点击区域。
+    let cwd = app.workspace.cwd.display().to_string();
+    let cwd_display = match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => cwd.replacen(&home, "~", 1),
+        _ => cwd,
+    };
+    let footer = main_footer(app, &cwd_display, workspace.width);
+    let footer_rows = u16::try_from(footer.lines.len()).unwrap_or(u16::MAX);
+    let initial_sections = conversation_sections(workspace, input_rows, 0, 0, footer_rows);
+    let input_height = initial_sections[3].height;
+    let footer_height = initial_sections[4].height;
     #[cfg(feature = "plugins")]
     let timeline_uses_snapshot = app.main_event_snapshot.is_some();
     #[cfg(feature = "plugins")]
@@ -160,7 +170,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
     #[cfg(not(feature = "plugins"))]
     let plugin_panel_height = 0;
     let supplemental_height = if workspace.height >= 10 {
-        workspace.height.saturating_sub(input_height + 5)
+        workspace
+            .height
+            .saturating_sub(input_height.saturating_add(footer_height).saturating_add(4))
     } else {
         0
     };
@@ -172,10 +184,16 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
         .min(
             workspace
                 .height
-                .saturating_sub(input_height.saturating_add(5)),
+                .saturating_sub(input_height.saturating_add(footer_height).saturating_add(4)),
         );
     let [chat_section, panel_section, queued_section, input_section, footer_section] =
-        conversation_sections(workspace, input_rows, panel_height, queued_height);
+        conversation_sections(
+            workspace,
+            input_rows,
+            panel_height,
+            queued_height,
+            footer_rows,
+        );
     // 每帧重建排队消息的点击热区；面板不存在时不能让上一帧的矩形继续响应点击。
     app.queued_input_areas.clear();
 
@@ -205,12 +223,6 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
     {
         app.last_message_width = chat_area.width.max(1);
     }
-    // 首屏与底栏共用的工作目录缩写。
-    let cwd = app.workspace.cwd.display().to_string();
-    let cwd_display = match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => cwd.replacen(&home, "~", 1),
-        _ => cwd,
-    };
     if timeline_messages.is_empty() && !app.running {
         // 空会话时以首屏替代消息流，首条消息或运行开始后自动消失。
         app.last_max_scroll = 0;
@@ -290,28 +302,39 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
     };
     render_input_pane(frame, input_section, &input_pane);
 
-    // 底部信息行：模型（含配置里的上游名）、思考强度、上下文用量、权限模式、目录与分支。
-    // 层级：模型是主动作信息，其余（上游名、思考强度、目录、分支、分隔符）退到元信息灰。
-    app.context_chip_area = None;
-    let mut footer: Vec<Span> = vec![Span::styled(
+    app.context_chip_areas = footer.context_areas(footer_section);
+    if app.context_chip_areas.is_empty() {
+        app.is_context_chip_hovered = false;
+    }
+    frame.render_widget(Paragraph::new(footer.lines), footer_section);
+    input_section
+}
+
+/// 收集底栏条目后按宽度折行；插件状态与原生元信息共用布局，不再挤占各自的一半宽度。
+fn main_footer(app: &App, cwd_display: &str, width: u16) -> FooterLayout {
+    let mut footer = FooterLayout::default();
+    let mut model = vec![Span::styled(
         app.model_name.clone(),
         Style::new().fg(COLOR_TEXT),
     )];
     if let Some(name) = app.model_upstream_name.as_deref() {
         // 同一模型 ID 可以对应多条配置（不同 base_url 或协议），底栏必须能指出生效的是哪一条。
-        footer.push(Span::styled(
+        model.push(Span::styled(
             format!(" [{name}]"),
             Style::new().fg(COLOR_META),
         ));
     }
-    push_footer_item(
-        &mut footer,
-        reasoning_level_command_value(app.reasoning_level).to_string(),
-        COLOR_META,
+    footer.push(model, width, false);
+    footer.push(
+        vec![Span::styled(
+            reasoning_level_command_value(app.reasoning_level),
+            Style::new().fg(COLOR_META),
+        )],
+        width,
+        false,
     );
     // 上下文用量常驻：它是最需要随手确认的数字，芯片同时是 `/context` 的点击入口。
     // 只有存在真实用量或分类快照时才出现，空会话不摆空指标。
-    let mut context_chip = None;
     if let Some(tokens) = footer_context_tokens(app) {
         let (label, tone) = context_status(tokens, app.context_window);
         // 悬停提亮是「这里可以点」的唯一提示，比常驻文案更安静。
@@ -320,147 +343,116 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
         } else {
             tone
         };
-        let text = format!("◔ {label}");
-        // 偏移按显示宽度累加：前置条目与分隔符都可能含宽字符，用字符数会把命中区算偏。
-        let offset = footer_display_width(&footer)
-            + if footer.is_empty() {
-                0
-            } else {
-                UnicodeWidthStr::width(FOOTER_SEPARATOR)
-            };
-        push_footer_item(&mut footer, text.clone(), color);
-        context_chip = Some((offset, UnicodeWidthStr::width(text.as_str())));
-    } else {
-        // 芯片不再绘制时悬停态必须跟着复位，否则下一次出现会带着高亮。
-        app.is_context_chip_hovered = false;
+        footer.push(
+            vec![Span::styled(format!("◔ {label}"), Style::new().fg(color))],
+            width,
+            true,
+        );
     }
-    // 缓存命中率只在运行中提示：它是排查提示缓存是否生效的过程指标，结束后交给 /context。
-    if app.running && workspace.width >= 72 {
+    // 缓存命中率只在运行中提示；窄窗口换行显示，不再按宽度隐藏。
+    if app.running {
         if let Some((label, color)) = cache_hit_status(&app.session_usage) {
-            push_footer_item(&mut footer, label, color);
+            footer.push(
+                vec![Span::styled(label, Style::new().fg(color))],
+                width,
+                false,
+            );
         }
     }
     #[cfg(feature = "plugins")]
     for (text, color) in app.plugin_footer_statuses.values() {
         // 插件状态通常是「标签: 值」：标签是固定字段名，只有值会变，风险色只给值。
-        let text = truncate_line(text, 28);
-        let (label, value) = split_status_value(&text);
-        let (label, value) = (label.to_string(), value.map(str::to_string));
-        match value {
-            Some(value) => {
-                if !footer.is_empty() {
-                    footer.push(Span::styled(FOOTER_SEPARATOR, Style::new().fg(COLOR_META)));
-                }
-                footer.push(Span::styled(
-                    format!("{label}:"),
-                    Style::new().fg(COLOR_META),
-                ));
-                footer.push(Span::styled(format!(" {value}"), Style::new().fg(*color)));
-            }
+        let (label, value) = split_status_value(text);
+        let spans = match value {
+            Some(value) => vec![
+                Span::styled(format!("{label}:"), Style::new().fg(COLOR_META)),
+                Span::styled(format!(" {value}"), Style::new().fg(*color)),
+            ],
             // 整段只有值、没有标签时保持插件给的风险色：底栏不替插件重新分级。
-            None => push_footer_item(&mut footer, label, *color),
-        }
+            None => vec![Span::styled(label.to_string(), Style::new().fg(*color))],
+        };
+        footer.push(spans, width, false);
     }
     if app.has_copyable_text_selection() {
-        push_footer_item(
-            &mut footer,
-            "Selection · Ctrl+C copy".to_string(),
-            COLOR_SUCCESS,
+        footer.push(
+            vec![Span::styled(
+                "Selection · Ctrl+C copy",
+                Style::new().fg(COLOR_SUCCESS),
+            )],
+            width,
+            false,
         );
     }
-    if workspace.width >= 96 {
-        push_footer_item(&mut footer, cwd_display, COLOR_META);
-    }
-    if workspace.width >= 64 {
-        if let Some(branch) = app.workspace.git_branch.as_deref() {
-            push_footer_item(
-                &mut footer,
-                format!("⎇ {}", truncate_line(branch, 24)),
-                COLOR_META,
+    // 稳定运行后收起启动详情；加载/失败提示也参与折行，不再压住左侧状态。
+    #[cfg(feature = "plugins")]
+    if app.plugins_loading
+        || app.plugin_load_error.is_some()
+        || app.plugin_status_ticks > 0
+        || !app.plugin_failures.is_empty()
+    {
+        let (icon, status) = app.plugin_status_content();
+        if !status.is_empty() {
+            footer.push(
+                vec![
+                    Span::styled(
+                        format!("{icon} "),
+                        Style::new().fg(app.plugin_status_color()),
+                    ),
+                    Span::styled(status, Style::new().fg(COLOR_MUTED)),
+                ],
+                width,
+                false,
             );
         }
     }
-    // 底栏与正文同列：左侧品牌名与正文、输入盒边框共线。
-    let footer_area = footer_section;
-    // 稳定运行期右侧完全让位：只有加载中、启动详情、失败值得占用这块位置。
-    #[cfg(feature = "plugins")]
-    let (metadata_area, plugin_footer) = {
-        let visible = app.plugins_loading
-            || app.plugin_load_error.is_some()
-            || app.plugin_status_ticks > 0
-            || !app.plugin_failures.is_empty();
-        // 空文本的状态没有信息量，不能为它切走左侧元数据的位置。
-        let status = visible
-            .then(|| app.plugin_status_content())
-            .filter(|(_, text)| !text.is_empty());
-        if let Some((icon, status)) = status {
-            let color = app.plugin_status_color();
-            let desired_width =
-                unicode_width::UnicodeWidthStr::width(format!("{icon} {status}").as_str())
-                    .saturating_add(2);
-            let plugin_width = u16::try_from(desired_width)
-                .unwrap_or(u16::MAX)
-                .min(footer_area.width / 2);
-            let columns =
-                Layout::horizontal([Constraint::Min(0), Constraint::Length(plugin_width)])
-                    .split(footer_area);
-            (columns[0], Some((columns[1], icon, status, color)))
-        } else {
-            (footer_area, None)
-        }
-    };
-    #[cfg(not(feature = "plugins"))]
-    let metadata_area = footer_area;
-    // 底栏与正文同列：品牌名从终端第 1 列开始，不再额外缩进。
-    frame.render_widget(Paragraph::new(Line::from(footer)), metadata_area);
-    // 上下文芯片的热区取自绘制用的同一份偏移量：显示与命中区不会各算一套。
-    // 只在左半区可见时登记，被插件状态挤掉的部分不再响应点击。
-    if let Some((offset, chip_width)) = context_chip {
-        let left = metadata_area
-            .x
-            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
-        let chip_width = u16::try_from(chip_width).unwrap_or(u16::MAX);
-        let visible = metadata_area.right().saturating_sub(left).min(chip_width);
-        if visible > 0 {
-            app.context_chip_area = Some(Rect::new(left, footer_area.y, visible, 1));
-        }
-    }
-    // 在底栏右侧为插件详情预留独立区域，避免覆盖左侧元数据。
-    #[cfg(feature = "plugins")]
-    if let Some((plugin_area, plugin_icon, plugin_status, plugin_color)) = plugin_footer {
-        let status = truncate_line(
-            &plugin_status,
-            usize::from(plugin_area.width.saturating_sub(4).max(1)),
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{plugin_icon} "), Style::new().fg(plugin_color)),
-                Span::styled(status, Style::new().fg(COLOR_MUTED)),
-            ]))
-            .alignment(Alignment::Right),
-            plugin_area,
+    footer.push(
+        vec![Span::styled(
+            cwd_display.to_string(),
+            Style::new().fg(COLOR_META),
+        )],
+        width,
+        false,
+    );
+    if let Some(branch) = app.workspace.git_branch.as_deref() {
+        footer.push(
+            vec![Span::styled(
+                format!("⎇ {branch}"),
+                Style::new().fg(COLOR_META),
+            )],
+            width,
+            false,
         );
     }
-    input_section
+    footer
 }
 
 /// 分配共享会话的正文、面板、队列、输入框与底栏矩形。
 ///
-/// 高度紧张时先牺牲面板与正文，保留完整输入框；插件原生会话传零面板/队列高度，
-/// 不借用主会话的插件状态。返回顺序固定，极小区域允许零高矩形。
+/// 高度紧张时先牺牲面板与正文，保留完整输入框；`footer_rows` 来自底栏实际折行数，
+/// 同时为常规窗口保留至少四行正文空间。原生子会话传单行底栏，不借用主会话的插件状态。
+/// 返回顺序固定，极小区域允许零高矩形。
 pub(crate) fn conversation_sections(
     area: Rect,
     input_rows: u16,
     panel_height: u16,
     queued_height: u16,
+    footer_rows: u16,
 ) -> [Rect; 5] {
-    let footer = u16::from(area.height >= 4);
-    let reserve = if area.height >= 8 { 5 } else { footer };
+    let minimum_footer = u16::from(area.height >= 4 && footer_rows > 0);
+    let minimum_chat = if area.height >= 8 { 4 } else { 0 };
+    let reserve = minimum_chat + minimum_footer;
     let input = input_rows
         .clamp(1, 6)
         .saturating_add(2)
         .min(area.height.saturating_sub(reserve))
         .min(area.height);
+    // 折行底栏尽量留下三行正文（另含上下两行留白），但不挤掉输入框与首行底栏。
+    let footer_chat_reserve = if area.height.saturating_sub(input + minimum_footer) >= 5 {
+        5
+    } else {
+        minimum_chat
+    };
+    let footer = footer_rows.min(area.height.saturating_sub(input + footer_chat_reserve));
     let available = area.height.saturating_sub(input + footer);
     let extra = available.saturating_sub(4);
     let panel = panel_height.min(extra);
@@ -1284,25 +1276,84 @@ pub(crate) fn context_status(tokens: u64, context_window: Option<u64>) -> (Strin
 /// 底栏条目之间的分隔符：元信息灰的竖线，只负责分组，不参与信息层级。
 const FOOTER_SEPARATOR: &str = "  |  ";
 
-/// 向底栏追加一个条目：非首条时先补分隔符。
-///
-/// 底栏所有条目都走这一个入口，分隔符的位置与颜色就不会各写一遍、也不会漏。
-fn push_footer_item(footer: &mut Vec<Span<'static>>, text: String, color: Color) {
-    if !footer.is_empty() {
-        footer.push(Span::styled(FOOTER_SEPARATOR, Style::new().fg(COLOR_META)));
-    }
-    footer.push(Span::styled(text, Style::new().fg(color)));
+/// 底栏折行结果；上下文热区保存相对视觉行坐标，最后只发布实际可见的部分。
+#[derive(Default)]
+struct FooterLayout {
+    lines: Vec<Line<'static>>,
+    context_segments: Vec<(usize, usize, usize)>,
 }
 
-/// 统计底栏已有条目的显示宽度。
-///
-/// 用于把上下文芯片的命中区对齐到屏幕列：必须按显示宽度累加，宽字符或中文目录名不会
-/// 把热区算偏。
-fn footer_display_width(footer: &[Span<'_>]) -> usize {
-    footer
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .fold(0, usize::saturating_add)
+impl FooterLayout {
+    /// 优先整项换行；超长单项按 Ratatui 的字素边界折行，不拆开 CJK、组合符或 emoji。
+    /// 分隔符只出现在同一行的相邻条目之间，不在换行处留下孤立竖线。
+    fn push(&mut self, spans: Vec<Span<'static>>, width: u16, context: bool) {
+        let width = usize::from(width);
+        let item = Line::from(spans);
+        if width == 0 || item.width() == 0 {
+            return;
+        }
+        let used = self.lines.last().map_or(0, Line::width);
+        if used > 0 && used + FOOTER_SEPARATOR.width() + item.width() <= width {
+            self.lines
+                .last_mut()
+                .unwrap()
+                .spans
+                .push(Span::styled(FOOTER_SEPARATOR, Style::new().fg(COLOR_META)));
+        } else if self.lines.is_empty() || used > 0 {
+            self.lines.push(Line::default());
+        }
+        let mut column = self.lines.last().map_or(0, Line::width);
+        for grapheme in item.styled_graphemes(Style::default()) {
+            let cells = grapheme.symbol.width();
+            // 一列终端放不下宽字素时与 Ratatui 一致忽略它，不发布越界热区。
+            if cells > width {
+                continue;
+            }
+            if column + cells > width {
+                self.lines.push(Line::default());
+                column = 0;
+            }
+            let row = self.lines.len() - 1;
+            let line = &mut self.lines[row];
+            match line.spans.last_mut() {
+                Some(last) if last.style == grapheme.style => {
+                    last.content.to_mut().push_str(grapheme.symbol);
+                }
+                _ => line
+                    .spans
+                    .push(Span::styled(grapheme.symbol.to_string(), grapheme.style)),
+            }
+            if context && cells > 0 {
+                match self.context_segments.last_mut() {
+                    Some((last_row, start, length))
+                        if *last_row == row && *start + *length == column =>
+                    {
+                        *length += cells
+                    }
+                    _ => self.context_segments.push((row, column, cells)),
+                }
+            }
+            column += cells;
+        }
+    }
+
+    /// 把同一份折行坐标平移到屏幕并裁剪；高度不足的隐藏行不得响应点击。
+    fn context_areas(&self, area: Rect) -> Vec<Rect> {
+        self.context_segments
+            .iter()
+            .filter_map(|&(row, column, width)| {
+                if row >= usize::from(area.height) || column >= usize::from(area.width) {
+                    return None;
+                }
+                Some(Rect::new(
+                    area.x + column as u16,
+                    area.y + row as u16,
+                    (width as u16).min(area.width - column as u16),
+                    1,
+                ))
+            })
+            .collect()
+    }
 }
 
 /// 把插件发布的状态文本拆成「标签」与「值」：`Permission: allow all` → (`Permission`, `allow all`)。
@@ -1477,6 +1528,93 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
 }
 
 #[cfg(test)]
+mod footer_layout_tests {
+    use super::*;
+
+    /// 条目优先整体换行；足够宽时保持一行，换行处没有孤立分隔符。
+    #[test]
+    fn footer_wraps_items_without_dangling_separators() {
+        for (width, expected) in [
+            (24, vec!["model  |  high  |  50%"]),
+            (16, vec!["model  |  high", "50%"]),
+            (8, vec!["model", "high", "50%"]),
+        ] {
+            let mut footer = FooterLayout::default();
+            for item in ["model", "high", "50%"] {
+                footer.push(vec![Span::raw(item)], width, false);
+            }
+            assert_eq!(
+                footer.lines.iter().map(Line::to_string).collect::<Vec<_>>(),
+                expected
+            );
+            assert!(footer
+                .lines
+                .iter()
+                .all(|line| line.width() <= usize::from(width)));
+        }
+    }
+
+    /// 中文、组合符、旗帜、ZWJ emoji 和混排 RTL 均按字素折行且保留原文及样式。
+    #[test]
+    fn footer_preserves_unicode_graphemes_and_styles() {
+        let text = "中文e\u{301}👩‍💻🇨🇳 العربية/path/long-model-name";
+        let style = Style::new().fg(COLOR_WARNING).bold();
+        for width in [2, 3, 4, 7, 12, 40] {
+            let mut footer = FooterLayout::default();
+            footer.push(vec![Span::styled(text, style)], width, true);
+            assert_eq!(
+                footer.lines.iter().map(Line::to_string).collect::<String>(),
+                text
+            );
+            assert!(footer
+                .lines
+                .iter()
+                .all(|line| line.width() <= usize::from(width)));
+            let spans: Vec<_> = footer.lines.iter().flat_map(|line| &line.spans).collect();
+            assert!(spans.iter().all(|span| span.style == style));
+            for grapheme in ["e\u{301}", "👩‍💻", "🇨🇳"] {
+                assert!(spans.iter().any(|span| span.content.contains(grapheme)));
+            }
+        }
+    }
+
+    /// 热区按视觉行平移，仅包含可见文本，不把行尾留白或已裁剪的行纳入。
+    #[test]
+    fn footer_context_regions_follow_wrapping_and_clipping() {
+        let mut footer = FooterLayout::default();
+        footer.push(vec![Span::raw("model")], 8, false);
+        footer.push(vec![Span::raw("◔ 25% · 50.0k")], 8, true);
+        assert_eq!(
+            footer.context_areas(Rect::new(3, 7, 8, 3)),
+            vec![Rect::new(3, 8, 8, 1), Rect::new(3, 9, 5, 1)]
+        );
+        assert_eq!(
+            footer.context_areas(Rect::new(3, 7, 8, 2)),
+            vec![Rect::new(3, 8, 8, 1)]
+        );
+        assert!(footer.context_areas(Rect::new(3, 7, 8, 1)).is_empty());
+        assert!(footer.context_areas(Rect::new(3, 7, 0, 3)).is_empty());
+    }
+
+    /// 零宽或放不下宽字素的极窄窗口不生成越界行或可点击空白。
+    #[test]
+    fn footer_handles_zero_and_single_column_widths() {
+        for width in [0, 1] {
+            let mut footer = FooterLayout::default();
+            footer.push(vec![Span::raw("中a🙂b")], width, true);
+            assert!(footer
+                .lines
+                .iter()
+                .all(|line| line.width() <= usize::from(width)));
+            assert_eq!(
+                footer.lines.iter().map(Line::to_string).collect::<String>(),
+                if width == 0 { "" } else { "ab" }
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod conversation_layout_tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
@@ -1487,15 +1625,25 @@ mod conversation_layout_tests {
         for height in 0..40 {
             for rows in 1..=9 {
                 let area = Rect::new(2, 1, 32, height);
-                for panel in [0, 6] {
-                    let sections = conversation_sections(area, rows, panel, 3);
+                for (panel, footer) in [0, 6].into_iter().flat_map(|panel| {
+                    [0, 1, 2, 6, u16::MAX]
+                        .into_iter()
+                        .map(move |footer| (panel, footer))
+                }) {
+                    let sections = conversation_sections(area, rows, panel, 3, footer);
                     assert_eq!(sections.iter().map(|rect| rect.height).sum::<u16>(), height);
                     for rect in sections {
                         assert!(rect.bottom() <= area.bottom());
                     }
                     if height >= 4 {
                         assert!(sections[3].height >= 3);
-                        assert_eq!(sections[4].height, 1);
+                        assert!(sections[4].height <= footer);
+                        if footer == 1 {
+                            assert_eq!(sections[4].height, 1);
+                        }
+                    }
+                    if height >= 8 {
+                        assert!(sections[0].height >= 4, "底栏不能吞掉整个正文区");
                     }
                 }
             }
@@ -1516,7 +1664,7 @@ mod conversation_layout_tests {
                 &[],
                 usize::from(width.saturating_sub(2)),
             );
-            let sections = conversation_sections(area, rows, 0, 0);
+            let sections = conversation_sections(area, rows, 0, 0, 1);
             terminal
                 .draw(|frame| {
                     render_input_pane(

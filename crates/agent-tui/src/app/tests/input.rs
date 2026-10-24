@@ -1925,7 +1925,7 @@ fn clicking_context_chip_toggles_context_details() {
 
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    app.context_chip_area = Some(Rect::new(20, 15, 14, 1));
+    app.context_chip_areas = vec![Rect::new(20, 15, 14, 1), Rect::new(0, 16, 5, 1)];
 
     let inside = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -1945,7 +1945,31 @@ fn clicking_context_chip_toggles_context_details() {
         ..inside
     };
     assert!(!app.handle_context_chip_click(&outside));
-    app.context_chip_area = None;
+    // 折到下一行的片段也能点击和悬停；片段右侧空白不能命中。
+    let wrapped = MouseEvent {
+        column: 2,
+        row: 16,
+        ..inside
+    };
+    assert!(app.handle_context_chip_click(&wrapped));
+    assert!(app.native_command.context_open);
+    assert!(app.handle_mouse_event(&MouseEvent {
+        kind: MouseEventKind::Moved,
+        ..wrapped
+    }));
+    assert!(app.is_context_chip_hovered);
+    let blank = MouseEvent {
+        column: 6,
+        ..wrapped
+    };
+    assert!(!app.handle_context_chip_click(&blank));
+    assert!(app.handle_mouse_event(&MouseEvent {
+        kind: MouseEventKind::Moved,
+        ..blank
+    }));
+    assert!(!app.is_context_chip_hovered);
+
+    app.context_chip_areas.clear();
     assert!(!app.handle_context_chip_click(&inside));
 }
 

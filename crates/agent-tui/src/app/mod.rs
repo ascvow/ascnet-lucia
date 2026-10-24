@@ -248,10 +248,10 @@ pub(crate) struct App {
     ///
     /// 提示同时是可点击热区：手动翻阅后用鼠标即可回到底部，不必记快捷键。
     pub(crate) jump_hint_area: Option<Rect>,
-    /// 最近一帧底栏上下文用量芯片所占的区域；没有用量数据时为 `None`。
+    /// 最近一帧底栏上下文用量芯片各视觉行的可见区域；没有用量或被裁剪时为空。
     ///
-    /// 芯片同时是 `/context` 的鼠标入口：点它直接展开当前会话上下文的分类明细。
-    pub(crate) context_chip_area: Option<Rect>,
+    /// 芯片同时是 `/context` 的鼠标入口：折行后的每一段都能展开分类明细，行尾留白不响应。
+    pub(crate) context_chip_areas: Vec<Rect>,
     /// 鼠标是否悬停在底栏上下文用量芯片上。
     ///
     /// 与滚动条悬停同源：只由鼠标移动更新、不消费事件，悬停时芯片提亮为强调色，
@@ -619,7 +619,7 @@ impl App {
             last_viewport: 0,
             key_inspect: false,
             jump_hint_area: None,
-            context_chip_area: None,
+            context_chip_areas: Vec::new(),
             is_context_chip_hovered: false,
             scrollbar_area: None,
             scrollbar_grab_half: None,

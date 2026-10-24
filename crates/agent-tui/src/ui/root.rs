@@ -31,7 +31,7 @@ pub(crate) fn render_root(frame: &mut Frame, app: &mut App) {
         app.scrollbar_drag = false;
         app.is_scrollbar_hovered = false;
         // 底栏不会在子视图里绘制，它的上下文芯片热区同样必须失效。
-        app.context_chip_area = None;
+        app.context_chip_areas.clear();
         app.is_context_chip_hovered = false;
         if app.active_agent_session_view().is_some() {
             render_agent_session_view(frame, app, outer);
@@ -47,7 +47,7 @@ pub(crate) fn render_root(frame: &mut Frame, app: &mut App) {
     // 输入盒几何是浮层 Dialog 的锚点：它们与命令面板共用同一条底边。
     let composer = render_main(frame, app, workspace);
     #[cfg(feature = "plugins")]
-    render_plugin_input(frame, app, workspace);
+    render_plugin_input(frame, app, workspace, composer);
     #[cfg(feature = "plugins")]
     render_plugin_dialog(frame, app, composer);
     crate::command::render_context_dialog(frame, app, composer);

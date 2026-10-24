@@ -65,7 +65,7 @@ pub(crate) fn render_agent_session_view(frame: &mut Frame, app: &mut App, outer:
     let text_width = usize::from(body.width.saturating_sub(2)).max(1);
     let input_rows = input_pane_rows(&view.input, view.cursor, &[], &[], text_width);
     let [chat_section, _, _, input_area, footer_area] =
-        conversation_sections(body, input_rows, 0, 0);
+        conversation_sections(body, input_rows, 0, 0, 1);
     let transcript_section = chat_section.inner(Margin {
         horizontal: 0,
         vertical: SESSION_PADDING_Y,

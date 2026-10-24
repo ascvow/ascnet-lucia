@@ -142,7 +142,14 @@ fn plugin_footer_status_splits_label_and_value_colors() {
         .draw(|frame| render_root(frame, &mut app))
         .expect("渲染底栏分色状态");
     let buffer = terminal.backend().buffer();
-    let row = 17;
+    let row = (0..18)
+        .find(|&row| {
+            (0..100)
+                .map(|x| buffer[(x, row)].symbol())
+                .collect::<String>()
+                .contains("Permission:")
+        })
+        .expect("折行后的底栏应显示状态标签");
     let line: String = (0..100)
         .map(|x| buffer[(x, row)].symbol())
         .collect::<String>();

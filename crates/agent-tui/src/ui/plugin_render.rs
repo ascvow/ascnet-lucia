@@ -336,8 +336,13 @@ pub(crate) fn render_composer_panels(frame: &mut Frame, app: &mut App, area: Rec
     }
 }
 
-/// 用带标题边框的可见 Input 插件视图替换主文本输入区。
-pub(crate) fn render_plugin_input(frame: &mut Frame, app: &mut App, workspace: Rect) {
+/// 用带标题边框的可见 Input 插件视图替换主文本输入区；底边以实际输入盒为锚点，避开多行底栏。
+pub(crate) fn render_plugin_input(
+    frame: &mut Frame,
+    app: &mut App,
+    workspace: Rect,
+    composer: Rect,
+) {
     let Some(index) = app.visible_plugin_input() else {
         return;
     };
@@ -347,13 +352,11 @@ pub(crate) fn render_plugin_input(frame: &mut Frame, app: &mut App, workspace: R
         .height
         .unwrap_or(3)
         .max(3)
-        .min(workspace.height.saturating_sub(1));
+        .min(composer.bottom().saturating_sub(workspace.y));
     let area = Rect::new(
-        workspace.x,
-        workspace
-            .y
-            .saturating_add(workspace.height.saturating_sub(requested_height + 1)),
-        workspace.width,
+        composer.x,
+        composer.bottom().saturating_sub(requested_height),
+        composer.width,
         requested_height,
     );
     if area.is_empty() {
@@ -462,7 +465,40 @@ mod tests {
         }
     }
 
-    /// 左右停靠视图应为全局底栏保留一行，使边框底部与主输入框对齐。
+    /// 独占输入卡片跟随实际输入盒底边，不能覆盖折行后的底栏或它的点击区域。
+    #[test]
+    fn plugin_input_stays_above_wrapped_footer() {
+        let mut view = dialog_view();
+        view.declaration.placement = UiPlacement::Input;
+        view.declaration.title = "Approval".into();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "long-model-name-that-wraps".into());
+        app.context_tokens = Some(50_000);
+        app.context_window = Some(200_000);
+        app.plugin_views.push(view);
+        let mut terminal = Terminal::new(TestBackend::new(24, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::root::render_root(frame, &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let footer_row = buffer
+            .content
+            .chunks(24)
+            .position(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .starts_with("long-model")
+            })
+            .unwrap();
+        assert!(app.plugin_views[0].area.bottom() < footer_row as u16);
+        for area in &app.context_chip_areas {
+            assert!(usize::from(area.y) >= footer_row);
+        }
+        assert_eq!(buffer[(0, footer_row as u16 - 1)].symbol(), "╰");
+    }
+
+    /// 左右停靠视图保留一行原有外侧空白；主会话在自己的剩余区域内分配多行底栏。
     #[test]
     fn side_docks_leave_one_footer_row() {
         let area = Rect::new(2, 3, 80, 24);
