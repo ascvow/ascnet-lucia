@@ -70,7 +70,7 @@ const NATIVE_COMMANDS: &[NativeCommandSpec] = &[
         name: "context",
         aliases: &[],
         summary: "查看上下文占用",
-        description: "查看最近模型请求的上下文分类、窗口占用和当前会话用量。",
+        description: "查看当前会话占用的上下文分类、窗口占用和本次打开会话的累计用量。",
         idle_only: false,
     },
     NativeCommandSpec {

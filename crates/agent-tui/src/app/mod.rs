@@ -243,7 +243,7 @@ pub(crate) struct App {
     pub(crate) jump_hint_area: Option<Rect>,
     /// 最近一帧底栏上下文用量芯片所占的区域；没有用量数据时为 `None`。
     ///
-    /// 芯片同时是 `/context` 的鼠标入口：点它直接展开最近一次请求的分类详情。
+    /// 芯片同时是 `/context` 的鼠标入口：点它直接展开当前会话上下文的分类明细。
     pub(crate) context_chip_area: Option<Rect>,
     /// 鼠标是否悬停在底栏上下文用量芯片上。
     ///
@@ -276,9 +276,9 @@ pub(crate) struct App {
     /// 最近一次渲染得到的消息区宽度，用于工具消息 renderer 分配尺寸。
     #[cfg(feature = "plugins")]
     pub(crate) last_message_width: u16,
-    /// 最近一次模型请求消耗的上下文 token 数。
+    /// 最近一次请求时当前会话占用的上下文 token 数（服务商实际输入）。
     pub(crate) context_tokens: Option<u64>,
-    /// 最近实际模型请求的脱敏分类估算；切换会话后失效。
+    /// 当前会话占用的上下文的脱敏分类估算；切换会话后失效。
     pub(crate) context_snapshot: Option<crate::command::ContextSnapshot>,
     /// 本次打开当前会话期间累计的模型用量，切换或重载会话时清零。
     ///

@@ -1,4 +1,8 @@
-//! `/context` 的只读上下文占用视图，消费 Core 的脱敏模型请求快照。
+//! `/context` 的只读上下文占用视图：展示当前会话占用的上下文规模与分类构成。
+//!
+//! 明细来自 Core 在同一份 `ModelRequest` 上的脱敏分类估算——请求带的就是整个会话的上下文，
+//! 所以这些数字描述的是"当前会话此刻占了多少"，而不是某一次请求的流水账。请求发出之后
+//! 才产生的消息要等下一次请求进入上下文，页脚因此点明这一点。
 //!
 //! 明细按列对齐而不是把数字串成一句话：这张表的意义是横向比较"哪一类在吃容量"，
 //! 数字左对齐、每行再跟一段长短不一的说明，会让同名列落在不同位置，读表退化成逐行读句。
@@ -16,7 +20,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use unicode_width::UnicodeWidthStr;
 
-/// 最近一次实际请求的分类估算，不保留提示正文或附件数据。
+/// 当前会话上下文在最近一次请求时的分类估算，不保留提示正文或附件数据。
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ContextSnapshot {
     /// 按内容类别统计的文本 token 估算。
@@ -363,7 +367,7 @@ fn segment_widths(values: &[u64], capacity: u64, width: u16) -> Vec<usize> {
     widths
 }
 
-/// 绘制可滚动的上下文检查视图；实际用量独立展示，不伪造分类的精确 token 数。
+/// 绘制可滚动的当前会话上下文占用视图；实际用量独立展示，不伪造分类的精确 token 数。
 ///
 /// `anchor` 是下方输入盒的区域：面板与它同宽、贴在它上沿，向上占满能够容纳的行数。
 /// 终端矮到装不下完整内容时靠 `↑`/`↓` 滚动，而不是把行裁成半截。
@@ -371,7 +375,7 @@ pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, anchor: Re
     if !app.native_command.context_open {
         return;
     }
-    let mut lines = vec![note_line("最近模型请求 · 分类为文本估算")];
+    let mut lines = vec![note_line("当前会话上下文占用 · 分类为文本估算")];
     // 占比色条与逻辑行下标一起保存：它整行都是空格，混在折行段落里会被算成两行。
     let mut bar: Option<(usize, Line<'static>)> = None;
     if let Some(snapshot) = &app.context_snapshot {
@@ -445,13 +449,13 @@ pub(crate) fn render_context_dialog(frame: &mut Frame, app: &mut App, anchor: Re
             )));
         }
     } else {
-        lines.push(note_line("本次打开会话后尚无模型请求快照。"));
+        lines.push(note_line("本次打开会话后还没有请求，暂无可分类的上下文。"));
     }
     let usage = &app.session_usage;
     lines.push(Line::from(""));
     lines.push(session_usage_line(usage));
     lines.push(note_line(
-        "分类不含协议开销；尚未发送的消息不在最近请求内。",
+        "分类不含协议开销；请求之后新增的消息要到下一次请求才计入。",
     ));
     let content_height = lines
         .iter()
@@ -614,6 +618,17 @@ mod tests {
         );
         assert!(
             compact.iter().any(|line| line.contains("Esc关闭")),
+            "{screen}"
+        );
+        // 面板描述的是当前会话的占用，不是某一次请求的流水账：措辞必须对应。
+        assert!(
+            compact
+                .iter()
+                .any(|line| line.contains("当前会话上下文占用")),
+            "{screen}"
+        );
+        assert!(
+            !compact.iter().any(|line| line.contains("最近模型请求")),
             "{screen}"
         );
         // 面板不再有左右与下边框：盒子只剩一条朝向正文的上分隔线。
