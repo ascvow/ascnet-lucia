@@ -107,11 +107,11 @@ async fn read_bounded_file(path: &std::path::Path) -> Result<String> {
     if !before.is_file() || before.file_type().is_symlink() {
         anyhow::bail!("read_file requires a regular file");
     }
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    let file = options.open(path).await?;
+    let owned = path.to_owned();
+    let opened_file =
+        tokio::task::spawn_blocking(move || crate::workspace::open_canonical_file_read(&owned))
+            .await??;
+    let file = tokio::fs::File::from_std(opened_file);
     let opened = file.metadata().await?;
     if !opened.is_file() {
         anyhow::bail!("read_file requires a regular file");
@@ -211,6 +211,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_READ_BYTES as u64 + 1)
             .unwrap();
+        let path = path.canonicalize().unwrap();
         assert!(read_bounded_file(&path)
             .await
             .unwrap_err()

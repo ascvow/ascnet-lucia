@@ -166,9 +166,84 @@ pub struct ReadPathGrants {
     paths: Arc<RwLock<HashSet<PathBuf>>>,
 }
 
-/// 单个会话允许登记的最大路径数。
+/// 沿已规范化绝对路径逐段打开，Unix 上每段都拒绝符号链接并用目录句柄锚定下一段。
 ///
-/// 正常使用只需要几条到几十条；上限用于防止粘贴长日志时把大量路径长期留在内存里。
+/// 此函数不执行业务授权；调用者必须先用工作区/manifest 策略确认路径。返回只读常规文件，
+/// 特殊文件、点路径或任一符号链接返回错误。Windows 回退为前后元数据校验，不承诺同等竞态隔离。
+/// 同 UID 的恶意目录重命名、硬链接或挂载替换仍需操作系统权限边界。
+pub fn open_canonical_file_read(path: &Path) -> std::io::Result<std::fs::File> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "读取路径必须是规范化绝对常规文件",
+        )
+    };
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        return Err(invalid());
+    }
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::CString,
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::ffi::OsStrExt,
+            },
+        };
+        let mut parent = std::fs::File::open("/")?;
+        let parts = path
+            .components()
+            .filter_map(|part| {
+                if let Component::Normal(name) = part {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            return Err(invalid());
+        }
+        for (index, part) in parts.iter().enumerate() {
+            let name = CString::new(part.as_bytes()).map_err(|_| invalid())?;
+            let directory = index + 1 < parts.len();
+            let flags = libc::O_RDONLY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | libc::O_NOCTTY
+                | if directory { libc::O_DIRECTORY } else { 0 };
+            // SAFETY: parent 是活跃文件描述符，name 为有效 CString；成功返回的 fd 独占转交 File。
+            let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: fd 是本次 openat 新建且尚未转移所有权的描述符。
+            parent = unsafe { std::fs::File::from_raw_fd(fd) };
+        }
+        if !parent.metadata()?.is_file() {
+            return Err(invalid());
+        }
+        Ok(parent)
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(invalid());
+        }
+        let file = std::fs::File::open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(invalid());
+        }
+        Ok(file)
+    }
+}
+
 const MAX_READ_GRANTS: usize = 256;
 
 impl ReadPathGrants {
@@ -541,6 +616,28 @@ mod tests {
         fs::create_dir_all(base.join("inside")).expect("应创建工作区");
         fs::write(base.join("inside/file.txt"), "内部文件").expect("应写入内部文件");
         base
+    }
+
+    /// 校验后父目录被替换为外部符号链接时，逐段 openat 必须拒绝而不是跟随。
+    #[cfg(unix)]
+    #[test]
+    fn canonical_open_rejects_parent_substitution() {
+        use std::io::Read;
+        use std::os::unix::fs::symlink;
+        let base = temp_workspace("parent-open").canonicalize().unwrap();
+        fs::create_dir(base.join("outside")).unwrap();
+        fs::write(base.join("outside/file.txt"), "secret").unwrap();
+        let resolved = base.join("inside/file.txt").canonicalize().unwrap();
+        let mut file = open_canonical_file_read(&resolved).unwrap();
+        fs::rename(base.join("inside"), base.join("moved")).unwrap();
+        symlink(base.join("outside"), base.join("inside")).unwrap();
+        assert!(open_canonical_file_read(&resolved).is_err());
+        let mut data = String::new();
+        file.read_to_string(&mut data).unwrap();
+        assert_eq!(data, "内部文件", "已打开句柄不随路径替换改变");
+        assert!(open_canonical_file_read(Path::new("relative")).is_err());
+        assert!(open_canonical_file_read(&base).is_err());
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

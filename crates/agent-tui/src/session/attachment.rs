@@ -285,18 +285,7 @@ pub(crate) fn open_regular_attachment(path: &Path) -> std::io::Result<std::fs::F
     if !std::fs::metadata(path)?.is_file() {
         return Err(reject());
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
-    }
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(reject());
-    }
-    Ok(file)
+    agent_tool::workspace::open_canonical_file_read(&path.canonicalize()?)
 }
 
 /// 读取附件的有界入口；超过上限明确报错，不把巨文件完整载入内存。

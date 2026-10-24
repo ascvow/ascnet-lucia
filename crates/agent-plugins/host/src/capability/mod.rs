@@ -790,15 +790,7 @@ impl CapabilityState {
         let resolved = self.resolve_read_path(&request.path)?;
         tokio::task::spawn_blocking(move || {
             use std::io::Read;
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true);
-            // 不在打开 FIFO 时等待写端，也不跟随校验后被替换的最终符号链接。
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-            }
-            let file = options.open(&resolved.path)?;
+            let file = agent_tool::workspace::open_canonical_file_read(&resolved.path)?;
             let metadata = file.metadata()?;
             if !metadata.is_file() || metadata.len() > MAX_FILE_READ_BYTES {
                 return Err(anyhow!("插件只可读取不超过 8 MiB 的常规文件"));
