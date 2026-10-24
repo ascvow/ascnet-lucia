@@ -116,7 +116,7 @@ impl HttpHostServices {
         if !body.is_empty() {
             request = request.body(body);
         }
-        let response = request.send().await.context("插件 HTTP 请求失败")?;
+        let mut response = request.send().await.context("插件 HTTP 请求失败")?;
         let status = response.status().as_u16();
         let response_headers =
             crate::capability::http::sanitize_response_headers(response.headers());
@@ -129,15 +129,18 @@ impl HttpHostServices {
                 ));
             }
         }
-        let bytes = response.bytes().await.context("读取插件 HTTP 响应失败")?;
-        // 分块响应没有 Content-Length，必须在读完后再校验一次。
-        if bytes.len() > self.max_response_bytes {
-            return Err(anyhow!(
-                "HTTP 响应超过 {} 字节限制",
-                self.max_response_bytes
-            ));
+        let mut bytes = Vec::new();
+        // 分块响应必须在每次扩容之前计量，不能先无限读完再检查长度。
+        while let Some(chunk) = response.chunk().await.context("读取插件 HTTP 响应失败")? {
+            if chunk.len() > self.max_response_bytes.saturating_sub(bytes.len()) {
+                return Err(anyhow!(
+                    "HTTP 响应超过 {} 字节限制",
+                    self.max_response_bytes
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
         }
-        let body = String::from_utf8(bytes.to_vec())
+        let body = String::from_utf8(bytes)
             .context("插件 HTTP 响应不是合法 UTF-8；二进制响应需由插件自行约定编码")?;
         Ok(crate::capability::http::encode_http_response(
             status,
@@ -180,6 +183,9 @@ impl ModelCompletionHostServices {
 
     /// 预留一次插件模型调用预算；失败时不增加任何计数。
     pub(crate) fn reserve(&self, input_bytes: usize) -> std::result::Result<(), String> {
+        if !self.execution_policy.permits_network_access() {
+            return Err("当前执行策略禁止插件模型请求访问网络".to_string());
+        }
         let limits = &self.execution_policy.limits;
         if !try_reserve(
             &self.submitted_input_bytes,
@@ -691,6 +697,78 @@ impl AgentRuntimeHostServices {
     /// 返回应用注册的派生策略；不存在时表示应用没有授权该名称。
     pub(crate) fn spawn_profile(&self, profile: &str) -> Option<AgentDeriveConfig> {
         self.spawn_profiles.get(profile).cloned()
+    }
+}
+
+#[cfg(all(test, feature = "wasm"))]
+mod resource_tests {
+    use super::*;
+
+    /// 没有 Content-Length 的分块响应也必须在读到超限块时拒绝，而不是等 EOF。
+    #[tokio::test]
+    async fn chunked_http_response_is_bounded_before_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n12345\r\n")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let service = HttpHostServices {
+            base_url: format!("http://{address}/").parse().unwrap(),
+            injected_headers: Arc::new(Vec::new()),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            max_request_bytes: 1024,
+            max_response_bytes: 4,
+            execution_policy: ExecutionPolicy::serve(),
+            completed_calls: Arc::new(AtomicUsize::new(0)),
+            submitted_input_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service.execute(
+                "GET".into(),
+                service.base_url.clone(),
+                Vec::new(),
+                String::new(),
+            ),
+        )
+        .await;
+        server.abort();
+        assert!(result
+            .expect("超限后不应等待 EOF")
+            .unwrap_err()
+            .to_string()
+            .contains("超过"));
+    }
+
+    /// 限额不是网络授权，受限执行平面在预留预算之前就拒绝模型入口。
+    #[test]
+    fn model_completion_respects_network_policy() {
+        let service = ModelCompletionHostServices {
+            gateway: ModelGateway::new(),
+            config: AgentModelConfig::new(
+                agent_core::model::ModelProviderConfig::new(
+                    "test",
+                    agent_core::model::ProviderKind::OpenAi,
+                    "",
+                ),
+                "test",
+            ),
+            max_output_tokens: 128,
+            execution_policy: ExecutionPolicy::evaluation("."),
+            completed_calls: Arc::new(AtomicUsize::new(0)),
+            submitted_input_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        assert!(service.reserve(32).is_err());
+        assert_eq!(service.completed_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(service.submitted_input_bytes.load(Ordering::Relaxed), 0);
     }
 }
 

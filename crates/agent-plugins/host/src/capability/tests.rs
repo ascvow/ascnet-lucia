@@ -842,6 +842,29 @@ fn plugin_tool_alias_cannot_bypass_process_policy() {
     assert!(state.processes.is_empty());
 }
 
+/// 没有换行的进程输出超过上限时立即拒绝并回收句柄，而不是等待 EOF 后才检查。
+#[cfg(unix)]
+#[tokio::test]
+async fn process_line_limit_is_enforced_before_newline() {
+    let mut state = process_state(true, ExecutionPolicy::serve());
+    let handle = state
+        .spawn_process(
+            &json!({"command":"sh", "args":["-c", "head -c 4194307 /dev/zero; sleep 20"]})
+                .to_string(),
+        )
+        .unwrap()
+        .as_u64()
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        state.read_process_line(&json!({"handle":handle,"timeout_ms":10000}).to_string()),
+    )
+    .await
+    .expect("必须在超限时结束");
+    assert!(result.unwrap_err().to_string().contains("超过"));
+    assert!(!state.processes.contains_key(&handle));
+}
+
 /// 所有 JSON 宿主能力入口必须共享请求大小上限。
 #[test]
 fn host_capability_request_size_is_bounded() {

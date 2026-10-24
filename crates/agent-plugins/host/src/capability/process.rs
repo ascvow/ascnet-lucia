@@ -14,14 +14,16 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::time::timeout;
 pub(crate) struct ManagedProcess {
     child: Child,
     stdin: ChildStdin,
-    stdout: Lines<BufReader<ChildStdout>>,
+    stdout: BufReader<ChildStdout>,
+    /// 超时重试保留已接收前缀，超限后关闭句柄，避免剩余字节伪装为下一条完整消息。
+    pending_line: Vec<u8>,
     /// Unix 下由子进程 PID 建立的独立进程组，用于回收命令启动的全部后代。
     #[cfg(unix)]
     process_group: u32,
@@ -103,7 +105,8 @@ impl CapabilityState {
             ManagedProcess {
                 child,
                 stdin,
-                stdout: BufReader::new(stdout).lines(),
+                stdout: BufReader::new(stdout),
+                pending_line: Vec::new(),
                 #[cfg(unix)]
                 process_group,
             },
@@ -124,16 +127,13 @@ impl CapabilityState {
             .processes
             .get_mut(&request.handle)
             .ok_or_else(|| anyhow!("未知插件进程句柄：{}", request.handle))?;
-        process
-            .stdin
-            .write_all(request.data.as_bytes())
-            .await
-            .context("写入插件进程 stdin 失败")?;
-        process
-            .stdin
-            .flush()
-            .await
-            .context("刷新插件进程 stdin 失败")?;
+        timeout(Duration::from_millis(MAX_READ_TIMEOUT_MS), async {
+            process.stdin.write_all(request.data.as_bytes()).await?;
+            process.stdin.flush().await
+        })
+        .await
+        .map_err(|_| anyhow!("写入插件进程 stdin 超时"))?
+        .context("写入插件进程 stdin 失败")?;
         Ok(Value::Null)
     }
 
@@ -146,23 +146,54 @@ impl CapabilityState {
             .get_mut(&request.handle)
             .ok_or_else(|| anyhow!("未知插件进程句柄：{}", request.handle))?;
         let timeout_ms = request.timeout_ms.clamp(1, MAX_READ_TIMEOUT_MS);
-        let line = timeout(
-            Duration::from_millis(timeout_ms),
-            process.stdout.next_line(),
-        )
+        let line = timeout(Duration::from_millis(timeout_ms), async {
+            loop {
+                let buffer = process.stdout.fill_buf().await?;
+                if buffer.is_empty() {
+                    if process.pending_line.is_empty() {
+                        return Ok(None);
+                    }
+                    break;
+                }
+                let newline = buffer.iter().position(|byte| *byte == b'\n');
+                let take = newline.map_or(buffer.len(), |position| position + 1);
+                if process.pending_line.len().saturating_add(take) > MAX_PROCESS_LINE_BYTES + 2 {
+                    return Err(anyhow!(
+                        "插件进程单行输出超过 {MAX_PROCESS_LINE_BYTES} 字节限制"
+                    ));
+                }
+                process.pending_line.extend_from_slice(&buffer[..take]);
+                process.stdout.consume(take);
+                if newline.is_some() {
+                    break;
+                }
+            }
+            let mut line = std::mem::take(&mut process.pending_line);
+            if line.last() == Some(&b'\n') {
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+            }
+            if line.len() > MAX_PROCESS_LINE_BYTES {
+                return Err(anyhow!(
+                    "插件进程单行输出超过 {MAX_PROCESS_LINE_BYTES} 字节限制"
+                ));
+            }
+            Ok(Some(
+                String::from_utf8(line).context("插件进程 stdout 不是 UTF-8")?,
+            ))
+        })
         .await
-        .map_err(|_| anyhow!("读取插件进程 stdout 超时：{timeout_ms}ms"))?
-        .context("读取插件进程 stdout 失败")?;
-        let Some(line) = line else {
-            return Ok(Value::Null);
-        };
-        if line.len() > MAX_PROCESS_LINE_BYTES {
-            return Err(anyhow!(
-                "插件进程单行输出超过 {} 字节限制",
-                MAX_PROCESS_LINE_BYTES
-            ));
+        .map_err(|_| anyhow!("读取插件进程 stdout 超时：{timeout_ms}ms"))?;
+        match line {
+            Ok(Some(line)) => Ok(json!(line)),
+            Ok(None) => Ok(Value::Null),
+            Err(error) => {
+                self.processes.remove(&request.handle);
+                Err(error)
+            }
         }
-        Ok(json!(line))
     }
 
     /// 终止并移除指定子进程。

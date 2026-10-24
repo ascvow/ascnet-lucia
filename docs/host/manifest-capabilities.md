@@ -263,7 +263,8 @@ profiles = ["worker", "reviewer"]
 - 每个插件实例的进程上限取 Host 硬上限 16 与 `ExecutionPolicy.limits.max_processes` 的较小值（默认 Serve 为 8）。
 - Host 限制启动请求、参数数量、环境变量总量、单次 stdin 写入和单行 stdout 大小，避免高权限入口接收无界载荷。
 - `process_exec` 仍等价于授予插件当前操作系统用户的原生进程权限；上述结构限制不能替代插件来源校验和用户信任决策。
-- stdout 单行限制为 4 MiB，读取超时上限为 120 秒。
+- stdout 单行限制为 4 MiB，读取和写入超时上限为 120 秒。读取会在扩容前检查长度；
+  超大行会回收句柄，超时保留已读取前缀供重试，避免将半条消息误作新消息。
 - token 应放在被忽略的本地配置，不写入 manifest 或源码。
 
 ## 资源边界与授权复核
