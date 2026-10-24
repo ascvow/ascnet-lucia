@@ -38,7 +38,7 @@ impl GoogleGenerativeAdapter {
     /// 创建适配器。
     pub fn new(config: ModelProviderConfig) -> Result<Self> {
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: super::support::http_client()?,
             provider_name: config.name,
             base_url: config
                 .base_url
@@ -118,8 +118,7 @@ impl GoogleGenerativeAdapter {
         let status = response.status();
         if !status.is_success() {
             let url = response.url().clone();
-            let text = response
-                .text()
+            let text = super::support::read_response_text(response, "Google Generative AI", true)
                 .await
                 .unwrap_or_else(|_| "<unreadable body>".to_string());
             anyhow::bail!(
@@ -128,8 +127,6 @@ impl GoogleGenerativeAdapter {
             );
         }
 
-        let mut byte_stream = response.bytes_stream();
-        let mut buffer = String::new();
         let mut text = String::new();
         let mut thinking = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
@@ -137,36 +134,29 @@ impl GoogleGenerativeAdapter {
         let mut usage: Option<TokenUsage> = None;
         let mut raw: Vec<Value> = Vec::new();
 
-        while let Some(chunk) = byte_stream.next().await {
-            buffer.push_str(
-                std::str::from_utf8(&chunk?)
-                    .context("Google Generative AI SSE 包含非 UTF-8 字节")?,
-            );
-            while let Some(line_end) = buffer.find('\n') {
-                let line: String = buffer.drain(..=line_end).collect();
-                let line = line.trim();
-                let Some(payload) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                let payload = payload.trim();
-                if payload.is_empty() || payload == "[DONE]" {
-                    continue;
-                }
-                let Ok(value) = serde_json::from_str::<Value>(payload) else {
-                    continue;
-                };
-                if let Some(chunk_usage) = parse_usage(&value) {
-                    usage = Some(chunk_usage);
-                }
-                if let Some(reason) = parse_finish_reason(&value) {
-                    finish = Some(reason);
-                }
-                for event in parse_stream_parts(&value, &mut text, &mut thinking, &mut calls) {
-                    tx.send(event);
-                }
-                raw.push(value);
+        let chunks = response
+            .bytes_stream()
+            .map(|chunk| chunk.context("failed to read Google SSE chunk"));
+        super::support::for_each_sse_data(chunks, |payload| {
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                return Ok(());
             }
-        }
+            let value =
+                serde_json::from_str::<Value>(payload).context("invalid Google SSE JSON")?;
+            if let Some(chunk_usage) = parse_usage(&value) {
+                usage = Some(chunk_usage);
+            }
+            if let Some(reason) = parse_finish_reason(&value) {
+                finish = Some(reason);
+            }
+            for event in parse_stream_parts(&value, &mut text, &mut thinking, &mut calls) {
+                tx.send(event);
+            }
+            raw.push(value);
+            Ok(())
+        })
+        .await?;
 
         let response = assemble_response(text, thinking, calls, finish, usage, raw);
         Ok(response)

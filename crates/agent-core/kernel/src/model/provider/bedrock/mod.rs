@@ -63,7 +63,7 @@ impl BedrockConverseAdapter {
             .base_url
             .unwrap_or_else(|| format!("https://bedrock-runtime.{region}.amazonaws.com"));
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: super::support::http_client()?,
             provider_name: config.name,
             base_url,
             region,
@@ -176,23 +176,7 @@ impl BedrockConverseAdapter {
     async fn complete_once(&self, req: ModelRequest) -> Result<ModelResponse> {
         let (model_id, body) = build_converse_request(req)?;
         let response = self.converse(&model_id, &body).await?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .context("failed to read Bedrock response body")?;
-        if !status.is_success() {
-            anyhow::bail!(
-                "Bedrock Converse returned an error status (status: {status}, body preview: {})",
-                super::support::response_body_preview(&text)
-            );
-        }
-        let value: Value = serde_json::from_str(&text).with_context(|| {
-            format!(
-                "failed to decode Bedrock Converse JSON (body preview: {})",
-                super::support::response_body_preview(&text)
-            )
-        })?;
+        let value = super::support::decode_json_response(response, "Bedrock Converse").await?;
         parse_converse_response(value)
     }
 }

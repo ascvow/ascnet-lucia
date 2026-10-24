@@ -71,7 +71,7 @@ pub(super) fn spawn_openai_stream(
     stream.with_request_task(request_task)
 }
 
-/// 检查流式请求状态码，并在失败时保留服务商返回的错误正文。
+/// 检查状态码，错误只保留短前缀，避免远程正文撑满错误通道。
 async fn require_successful_stream_response(
     response: reqwest::Response,
 ) -> Result<reqwest::Response> {
@@ -79,65 +79,24 @@ async fn require_successful_stream_response(
     if status.is_success() {
         return Ok(response);
     }
-    let body = response.text().await.unwrap_or_default();
+    let body = super::super::support::read_response_text(response, "OpenAI streaming", true)
+        .await
+        .unwrap_or_else(|_| "<unreadable body>".into());
     Err(anyhow!(
-        "OpenAI streaming request failed with status {status}: {body}"
+        "OpenAI streaming request failed with status {status}: {}",
+        super::super::support::response_body_preview(&body)
     ))
 }
 
-/// 按 SSE 行边界增量读取响应，避免网络分块截断 UTF-8 字符或事件。
-async fn for_each_sse_data<F>(response: reqwest::Response, mut handler: F) -> Result<()>
+/// 共享线性解帧器处理跨块 UTF-8 并限制累计响应大小。
+async fn for_each_sse_data<F>(response: reqwest::Response, handler: F) -> Result<()>
 where
     F: FnMut(&str) -> Result<()>,
 {
-    let mut bytes = response.bytes_stream();
-    let mut pending = Vec::new();
-    let mut data_lines = Vec::new();
-
-    while let Some(chunk) = bytes.next().await {
-        pending.extend_from_slice(&chunk.context("failed to read OpenAI SSE chunk")?);
-        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-            let mut line = pending.drain(..=newline).collect::<Vec<_>>();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            process_sse_line(&line, &mut data_lines, &mut handler)?;
-        }
-    }
-
-    if !pending.is_empty() {
-        process_sse_line(&pending, &mut data_lines, &mut handler)?;
-    }
-    dispatch_sse_data(&mut data_lines, &mut handler)
-}
-
-/// 处理一行 SSE 内容，并在空行处提交完整 data 事件。
-fn process_sse_line<F>(line: &[u8], data_lines: &mut Vec<String>, handler: &mut F) -> Result<()>
-where
-    F: FnMut(&str) -> Result<()>,
-{
-    if line.is_empty() {
-        return dispatch_sse_data(data_lines, handler);
-    }
-    if let Some(data) = line.strip_prefix(b"data:") {
-        let data = data.strip_prefix(b" ").unwrap_or(data);
-        data_lines.push(String::from_utf8(data.to_vec()).context("OpenAI SSE data 不是 UTF-8")?);
-    }
-    Ok(())
-}
-
-/// 合并 SSE 的多行 data 字段并交给协议解析器。
-fn dispatch_sse_data<F>(data_lines: &mut Vec<String>, handler: &mut F) -> Result<()>
-where
-    F: FnMut(&str) -> Result<()>,
-{
-    if data_lines.is_empty() {
-        return Ok(());
-    }
-    let data = data_lines.join("\n");
-    data_lines.clear();
-    handler(&data)
+    let chunks = response
+        .bytes_stream()
+        .map(|chunk| chunk.context("failed to read OpenAI SSE chunk"));
+    super::super::support::for_each_sse_data(chunks, handler).await
 }
 
 /// Responses API SSE 的聚合状态。
@@ -244,11 +203,11 @@ pub(super) fn handle_responses_sse_data(
                 .unwrap_or_default();
             let index = responses_output_index(&event);
             if let Some(item) = state.function_items.get_mut(&index) {
-                let arguments = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                item["arguments"] = Value::String(format!("{arguments}{delta}"));
+                if let Some(Value::String(arguments)) = item.get_mut("arguments") {
+                    arguments.push_str(delta);
+                } else {
+                    item["arguments"] = Value::String(delta.to_owned());
+                }
             }
             sender.send(ModelStreamEvent::ToolCallDelta {
                 index,
@@ -298,7 +257,9 @@ pub(super) fn handle_responses_sse_data(
                 .or_else(|| event.pointer("/response/error/message"))
                 .and_then(Value::as_str)
                 .unwrap_or("OpenAI Responses stream failed");
-            return Err(anyhow!(message.to_string()));
+            return Err(anyhow!(super::super::support::response_body_preview(
+                message
+            )));
         }
         _ => {}
     }
@@ -480,7 +441,9 @@ pub(super) fn handle_chat_completions_sse_data(
     let event: Value =
         serde_json::from_str(data).context("failed to parse OpenAI Chat Completions SSE")?;
     if let Some(message) = event.pointer("/error/message").and_then(Value::as_str) {
-        return Err(anyhow!(message.to_string()));
+        return Err(anyhow!(super::super::support::response_body_preview(
+            message
+        )));
     }
     if let Some(usage) = event.get("usage").filter(|usage| !usage.is_null()) {
         state.usage = Some(usage.clone());
@@ -508,7 +471,12 @@ pub(super) fn handle_chat_completions_sse_data(
     }
     if let Some(tool_deltas) = delta.get("tool_calls").and_then(Value::as_array) {
         for tool_delta in tool_deltas {
-            let index = tool_delta.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let raw_index = tool_delta.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let index = usize::try_from(raw_index).context("tool index exceeds address space")?;
+            // 稀疏索引不能用几个输入字节驱动无界 Vec 扩容。
+            if index >= 4096 {
+                return Err(anyhow!("tool stream index exceeds 4096 slots"));
+            }
             if state.tools.len() <= index {
                 state
                     .tools

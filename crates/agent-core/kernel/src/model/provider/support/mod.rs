@@ -8,8 +8,136 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use serde_json::{Map, Value};
 use std::str::FromStr;
 
+use futures_util::StreamExt;
+
 /// 响应体预览的最大字符数，避免过长正文淹没错误信息。
 const RESPONSE_BODY_PREVIEW_CHARS: usize = 500;
+/// 单次传输的正文上限，不是 Agent 生命周期累计配额。
+pub(super) const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const ERROR_BODY_BYTES: usize = 2048;
+
+/// 保留 TLS 验证；连接 30 秒、读取空闲 120 秒，不自动转发凭证到重定向目标。
+pub(super) fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build provider HTTP client")
+}
+
+/// 成功正文逐块校验大小，错误正文达到短预览上限后立即停止读取。
+pub(super) async fn read_response_text(
+    response: reqwest::Response,
+    protocol: &str,
+    error_preview: bool,
+) -> Result<String> {
+    let limit = if error_preview {
+        ERROR_BODY_BYTES
+    } else {
+        MAX_RESPONSE_BYTES
+    };
+    let chunks = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(anyhow::Error::from));
+    let bytes = read_bounded_chunks(chunks, limit, error_preview)
+        .await
+        .with_context(|| format!("failed to read {protocol} response body"))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn read_bounded_chunks<S, B>(mut chunks: S, limit: usize, preview: bool) -> Result<Vec<u8>>
+where
+    S: futures_util::Stream<Item = Result<B>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let mut body = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        let chunk = chunk.as_ref();
+        let remaining = limit - body.len();
+        if !preview && chunk.len() > remaining {
+            return Err(anyhow!("provider response exceeds {limit} bytes"));
+        }
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if preview && body.len() == limit {
+            break;
+        }
+    }
+    Ok(body)
+}
+
+/// 按新到达字节解帧，避免逐行搬移剩余缓冲；累计输入含注释和未闭合行。
+#[cfg(any(feature = "openai", feature = "google", test))]
+pub(super) async fn for_each_sse_data<S, B, F>(chunks: S, handler: F) -> Result<()>
+where
+    S: futures_util::Stream<Item = Result<B>> + Unpin,
+    B: AsRef<[u8]>,
+    F: FnMut(&str) -> Result<()>,
+{
+    consume_sse_chunks(chunks, MAX_RESPONSE_BYTES, handler).await
+}
+
+#[cfg(any(feature = "openai", feature = "google", test))]
+async fn consume_sse_chunks<S, B, F>(mut chunks: S, limit: usize, mut handler: F) -> Result<()>
+where
+    S: futures_util::Stream<Item = Result<B>> + Unpin,
+    B: AsRef<[u8]>,
+    F: FnMut(&str) -> Result<()>,
+{
+    let mut received = 0usize;
+    let mut pending = Vec::new();
+    let mut event = None;
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        let chunk = chunk.as_ref();
+        if chunk.len() > limit - received {
+            return Err(anyhow!("SSE response exceeds {limit} bytes"));
+        }
+        received += chunk.len();
+        let mut start = 0;
+        for (index, byte) in chunk.iter().enumerate() {
+            if *byte == b'\n' {
+                pending.extend_from_slice(&chunk[start..index]);
+                process_sse_line(&pending, &mut event, &mut handler)?;
+                pending.clear();
+                start = index + 1;
+            }
+        }
+        pending.extend_from_slice(&chunk[start..]);
+    }
+    if !pending.is_empty() {
+        process_sse_line(&pending, &mut event, &mut handler)?;
+    }
+    if let Some(data) = event {
+        handler(&data)?;
+    }
+    Ok(())
+}
+
+/// 完整行到齐后才解码 UTF-8；多行 data 保持顺序并以换行连接。
+#[cfg(any(feature = "openai", feature = "google", test))]
+fn process_sse_line<F>(line: &[u8], event: &mut Option<String>, handler: &mut F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.is_empty() {
+        if let Some(data) = event.take() {
+            handler(&data)?;
+        }
+    } else if let Some(data) = line.strip_prefix(b"data:") {
+        let data = data.strip_prefix(b" ").unwrap_or(data);
+        let data = std::str::from_utf8(data).context("SSE data 不是 UTF-8")?;
+        if let Some(buffer) = event.as_mut() {
+            buffer.push('\n');
+            buffer.push_str(data);
+        } else {
+            *event = Some(data.to_owned());
+        }
+    }
+    Ok(())
+}
 
 /// 解码 HTTP JSON 响应，并在 HTTP 或 JSON 错误时保留可诊断的响应摘要。
 ///
@@ -26,10 +154,7 @@ pub(super) async fn decode_json_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("<missing>")
         .to_string();
-    let body = response
-        .text()
-        .await
-        .with_context(|| format!("failed to read {protocol} response body"))?;
+    let body = read_response_text(response, protocol, !status.is_success()).await?;
 
     if !status.is_success() {
         return Err(anyhow!(

@@ -7,6 +7,18 @@ use super::stream::{
 use super::*;
 use crate::model::{GatewayKind, ModelStreamEvent, PromptCacheRetention};
 
+/// 稀疏工具索引必须在 Vec 分配之前拒绝。
+#[test]
+fn sparse_tool_index_cannot_expand_stream_state() {
+    for index in [4096, u64::MAX] {
+        let (sender, _stream) = ModelEventStream::channel();
+        let mut state = ChatCompletionsStreamState::default();
+        let data = json!({"choices":[{"delta":{"tool_calls":[{"index":index}]}}]}).to_string();
+        assert!(handle_chat_completions_sse_data(&data, &sender, &mut state).is_err());
+        assert!(state.tools.is_empty());
+    }
+}
+
 /// 构造带文本、图片和 PDF 的用户消息，覆盖附件转换路径。
 fn attachment_message() -> crate::model::ModelMessage {
     crate::model::ModelMessage {

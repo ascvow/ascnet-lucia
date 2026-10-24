@@ -46,7 +46,7 @@ impl AnthropicMessagesAdapter {
             .base_url
             .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string());
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: super::support::http_client()?,
             provider_name: config.name,
             route_scope: anthropic_route_scope(&base_url)?,
             base_url,

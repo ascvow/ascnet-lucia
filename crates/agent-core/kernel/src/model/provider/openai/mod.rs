@@ -177,7 +177,7 @@ impl OpenAiResponsesAdapter {
         let base_url = normalize_openai_base_url(config.base_url)?;
         let allowed_params = responses_allowed_params(&config.kind, &base_url);
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: super::support::http_client()?,
             base_url,
             api_key: config.api_key,
             extra_headers: header_map(config.extra_headers)?,
@@ -261,7 +261,7 @@ impl OpenAiChatCompletionsAdapter {
     /// 创建适配器。
     pub fn new(config: ModelProviderConfig) -> Result<Self> {
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: super::support::http_client()?,
             base_url: normalize_openai_base_url(config.base_url)?,
             api_key: config.api_key,
             extra_headers: header_map(config.extra_headers)?,
