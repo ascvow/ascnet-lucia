@@ -217,6 +217,26 @@ lucia --session-id design-review
 
 使用 `/exit`、`/quit`、空输入上的 `Ctrl+D`，或没有文本选区时连按两次 `Ctrl+C` 显式退出。Lucia 会在正常退出、错误和 panic 展开时恢复 raw mode、备用屏幕和 bracketed paste 状态。
 
+启动时主屏与备用屏幕都会显式清屏，再绘制首帧；运行中仍使用差分绘制，不会逐帧全屏清空。
+侧栏显示、隐藏或窗口缩放时，滚动条热区按当前布局重建，旧位置由帧差分擦除。
+
+如果出现残影，可先改变窗口尺寸触发整屏重绘。重绘后消失只能说明屏幕与帧状态曾不一致，
+不能单凭这一点判定是 TUI 还是终端问题。反馈时请同时提供 `lucia` 的实际路径、构建版本、
+终端名称，以及是否在侧栏变化、缩放或挂起恢复后出现。
+
+开发时可在隔离的本地 demo 会话中检查启动清屏、缩放、括号粘贴、模式切换和退出序列：
+
+```bash
+cargo build -p lucia --locked
+python3 scripts/pty-render-check.py
+cargo build -p lucia --locked --no-default-features
+python3 scripts/pty-render-check.py
+```
+
+该检查需要 POSIX PTY 和 Python 3，仅使用临时配置与本地演示模型；可通过 `LUCIA_BIN`
+指定待测二进制。它验证终端输出协议，不验证终端 GPU/字形渲染；`TERM=dumb` 用例也只确认
+该环境变量下能完成协议交互，不表示无 ANSI 能力的终端支持全屏 TUI。
+
 模型或工具问题需要完整事件时使用：
 
 ```bash

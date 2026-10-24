@@ -165,13 +165,15 @@ impl Drop for TerminalGuard {
 /// 全屏模式进入终端备用屏幕（类似 vim），退出后恢复原屏幕内容；关闭时直接在主屏绘制，
 /// 退出后保留最后一帧。两种模式都启用 raw mode，按键与鼠标处理保持一致。
 fn init_terminal(fullscreen: bool) -> Result<ratatui::DefaultTerminal> {
-    if fullscreen {
-        return Ok(ratatui::init());
-    }
-    crossterm::terminal::enable_raw_mode().context("启用终端原始模式失败")?;
-    let mut terminal =
+    let mut terminal = if fullscreen {
+        ratatui::init()
+    } else {
+        crossterm::terminal::enable_raw_mode().context("启用终端原始模式失败")?;
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-            .context("初始化终端失败")?;
+            .context("初始化终端失败")?
+    };
+    // 首帧的差分缓冲区默认全空白，不能依赖终端在切入备用屏幕时恰好也已清空。
+    // 两种模式都先显式清屏，使真实屏幕与 Ratatui 的初始状态一致；后续仍只输出差分。
     terminal.clear().context("清空终端失败")?;
     Ok(terminal)
 }
@@ -581,6 +583,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     // 恢复也只能靠这份快照，不能用 crossterm 的全局状态。
     let fullscreen = tui_settings.fullscreen.unwrap_or(true);
     terminal::install(fullscreen);
+    // 初始化和首次清屏也可能失败；必须在接管之前建立守卫，覆盖这些提前返回路径。
+    let mut terminal_guard = TerminalGuard {
+        keyboard_enhanced: false,
+    };
     let mut terminal = init_terminal(fullscreen)?;
     // 键盘增强协议让 Shift+Enter 等修饰组合可被区分（传统协议下它就是裸 Enter）。
     // 该查询会读取终端应答，必须在输入读取线程启动前完成，否则应答被线程吞掉。
@@ -594,8 +600,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             )
         );
     }
-    // 守卫覆盖所有退出路径，包括 draw 失败的 `?` 提前返回。
-    let terminal_guard = TerminalGuard { keyboard_enhanced };
+    terminal_guard.keyboard_enhanced = keyboard_enhanced;
     // 默认捕获鼠标：滚轮与拖选由 TUI 分别处理，避免终端把滚轮转换为输入框 Up/Down。
     let mouse_capture =
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).is_ok();

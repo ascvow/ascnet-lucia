@@ -212,16 +212,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
     let mut jump_below = None;
     // 每帧重置热区，空会话和窗口缩小时不能保留上一帧的跳转按钮。
     app.jump_hint_area = None;
-    // 滚动条同理：内容不再溢出时先擦掉上一帧的轨道，避免最右一列残留竖线。
-    //
-    // 这一块记录的是上一帧的几何尺寸，拖动缩放后可能落在新画布之外；`Clear` 直接
-    // 按坐标写单元格、不做裁剪，越界就会 panic，所以先与当前画布求交集。
-    if let Some(previous) = app.scrollbar_area.take() {
-        let stale = frame.area().intersection(previous);
-        if !stale.is_empty() {
-            frame.render_widget(Clear, stale);
-        }
-    }
+    // 每帧缓冲区由 Ratatui 重置；旧轨道的擦除由帧差分负责。
+    // 这里只失效热区：旧坐标可能已属于本帧先画好的侧栏，不能再按它执行 Clear。
+    app.scrollbar_area = None;
     #[cfg(feature = "plugins")]
     {
         app.last_message_width = chat_area.width.max(1);
@@ -675,13 +668,8 @@ pub(crate) fn render_transcript_pane(
     chat_area: Rect,
     pane: TranscriptPane<'_>,
 ) -> TranscriptViewport {
-    // 上一帧的滚动条可能落在新画布之外；`Clear` 不做裁剪，越界写单元格会 panic。
-    if let Some(previous) = pane.scrollbar_area.take() {
-        let stale = frame.area().intersection(previous);
-        if !stale.is_empty() {
-            frame.render_widget(Clear, stale);
-        }
-    }
+    // 共享时间线同样只重建热区；不要用上一帧的坐标清除本帧已绘制的其他区域。
+    *pane.scrollbar_area = None;
     pane.hit_regions.clear();
     let inner_width = chat_area.width.max(1);
     let total_height = pane.layout.sync(pane.messages, pane.streaming, inner_width);

@@ -476,6 +476,97 @@ mod tests {
         assert_eq!(right_remaining, Rect::new(2, 3, 50, 24));
     }
 
+    /// 侧栏变化后的第一帧必须与全新绘制一致；旧滚动条不能擦掉新侧栏的边线或文字。
+    #[test]
+    fn right_dock_remains_intact_across_layout_changes() {
+        let mut dock = dialog_view();
+        dock.declaration.placement = UiPlacement::Right;
+        dock.declaration.title = "Team".into();
+        dock.frame.as_mut().unwrap().lines = vec![
+            UiLine {
+                spans: vec![UiSpan {
+                    text: "✓ 中文成员 · Ready".into(),
+                    style: UiStyle::default(),
+                }],
+            },
+            UiLine::default(),
+            UiLine {
+                spans: vec![UiSpan {
+                    text: "0123456789abcdef".into(),
+                    style: UiStyle::default(),
+                }],
+            },
+        ];
+        let new_app = || {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(tx, "test-model".into());
+            app.messages.push(crate::session::conversation::Msg::new(
+                crate::session::conversation::MsgKind::Assistant,
+                "```rust\n    render(frame, &app); // 中文\n```\n".repeat(30),
+            ));
+            app.plugin_views.push(PluginViewState {
+                declaration: dock.declaration.clone(),
+                frame: dock.frame.clone(),
+                area: Rect::default(),
+            });
+            app
+        };
+        let mut app = new_app();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // 先让旧滚动条落到新边线，再落到新内容区；随后覆盖隐藏、重现与连续缩放。
+        for (width, height, dock_width, visible, empty) in [
+            (100, 24, 28, true, false),
+            (100, 24, 29, true, false),
+            (100, 24, 37, true, false),
+            (92, 20, 37, true, false),
+            (92, 20, 37, false, false),
+            (92, 20, 37, true, false),
+            (56, 12, 28, true, false),
+            (12, 8, 28, true, false),
+            (110, 26, 28, true, false),
+            (110, 26, 36, true, true),
+        ] {
+            let configure = |app: &mut App| {
+                app.plugin_views[0].declaration.size.width = Some(dock_width);
+                app.plugin_views[0].frame.as_mut().unwrap().visible = visible;
+                if empty {
+                    app.messages.clear();
+                }
+            };
+            configure(&mut app);
+            terminal.backend_mut().resize(width, height);
+            let rendered = terminal
+                .draw(|frame| crate::ui::root::render_root(frame, &mut app))
+                .unwrap()
+                .buffer
+                .clone();
+
+            let mut fresh = new_app();
+            configure(&mut fresh);
+            let mut expected = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let expected_frame = expected
+                .draw(|frame| crate::ui::root::render_root(frame, &mut fresh))
+                .unwrap();
+            assert_eq!(
+                &rendered,
+                expected_frame.buffer,
+                "首帧不能依赖旧几何：{width}x{height}, dock={dock_width}, visible={visible}, empty={empty}"
+            );
+            // TestBackend 只接收差分，不模拟终端覆盖双宽字后清掉延续格的行为。
+            // 逐一比较可见格，跳过当前字素占用的延续格；完整布局已由上面的帧断言验证。
+            for y in 0..height {
+                let mut x = 0;
+                while x < width {
+                    let cell = &rendered[(x, y)];
+                    assert_eq!(terminal.backend().buffer()[(x, y)], *cell);
+                    x += unicode_width::UnicodeWidthStr::width(cell.symbol()).max(1) as u16;
+                }
+            }
+            assert_eq!(app.scrollbar_area, fresh.scrollbar_area);
+            assert_eq!(app.plugin_views[0].area, fresh.plugin_views[0].area);
+        }
+    }
+
     /// 对话框与命令面板共用底板：铺满输入盒宽度、标题画在上分隔线上、没有四周圆角框。
     #[test]
     fn plugin_dialog_uses_the_command_palette_chrome() {

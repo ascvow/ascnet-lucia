@@ -164,6 +164,58 @@ fn scrollbar_marks_overflow_and_clears_when_content_fits() {
     assert_eq!(leftover.trim(), "", "残留轨道：{leftover:?}");
 }
 
+/// 共享时间线缩窄时只更新自己的热区，不得清除本帧已经画好的相邻组件。
+#[test]
+fn transcript_resize_preserves_already_rendered_neighbor() {
+    use crate::ui::chat::{render_transcript_pane, TranscriptPane};
+    use ratatui::widgets::Paragraph;
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "test-model".into());
+    app.messages
+        .push(Msg::new(MsgKind::Assistant, "长正文\n".repeat(40)));
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    let neighbor = Rect::new(40, 0, 20, 10);
+    for width in [59, 39] {
+        terminal
+            .draw(|frame| {
+                if width == 39 {
+                    frame.render_widget(
+                        Paragraph::new("01234567890123456789\n".repeat(10)),
+                        neighbor,
+                    );
+                }
+                render_transcript_pane(
+                    frame,
+                    Rect::new(0, 0, width, 10),
+                    TranscriptPane {
+                        messages: &app.messages,
+                        streaming: None,
+                        layout: &mut app.transcript_layout,
+                        scroll: &mut app.scroll,
+                        hit_regions: &mut app.tool_message_hit_regions,
+                        last_max_scroll: &mut app.last_max_scroll,
+                        last_viewport: &mut app.last_viewport,
+                        content_area: &mut app.content_area,
+                        content_scroll: &mut app.content_scroll,
+                        content_rows: &mut app.content_rows,
+                        scrollbar_area: &mut app.scrollbar_area,
+                        is_scrollbar_hovered: &mut app.is_scrollbar_hovered,
+                        record_hit_regions: true,
+                    },
+                );
+            })
+            .unwrap();
+        assert_eq!(app.scrollbar_area, Some(Rect::new(width, 0, 1, 10)));
+    }
+    for y in neighbor.y..neighbor.bottom() {
+        let row: String = (neighbor.x..neighbor.right())
+            .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+            .collect();
+        assert_eq!(row, "01234567890123456789", "相邻组件第 {y} 行被旧轨道擦除");
+    }
+}
+
 /// 鼠标悬停在滚动条上时轨道与滑块各提亮一档，几何位置保持不变。
 ///
 /// 横向边距去掉后右侧没有富余列可以向左扩宽，加粗只能靠提亮表达——一旦改宽度就会
@@ -2579,7 +2631,7 @@ fn short_tool_message_is_neither_marked_nor_clickable() {
     assert!(!app.messages[0].tool_expanded);
 }
 
-/// 内容溢出时缩小窗口：上一帧的滚动条轨道会被新画布裁掉，清屏必须按交集处理。
+/// 内容溢出时缩小窗口：即使旧滚动条已在画布之外，也只失效热区而不按旧坐标清屏。
 #[test]
 fn shrinking_window_clears_stale_scrollbar_safely() {
     let (tx, _rx) = mpsc::unbounded_channel();
