@@ -64,8 +64,9 @@ struct LivePluginState {
 #[derive(Clone)]
 struct ActivePluginRun {
     host: CompositePluginHost,
-    tools: Vec<ToolSpec>,
-    prompts: Vec<ModelMessage>,
+    /// 冻结贡献只在实际请求工具/提示时复制，逐 token 的事件扇出共享同一份内容。
+    tools: Arc<Vec<ToolSpec>>,
+    prompts: Arc<Vec<ModelMessage>>,
     capability_plan_ready: bool,
     state: PluginRunState,
     /// 本次运行的 `RunFinished` 是否有插件未成功接收。
@@ -426,8 +427,8 @@ impl LivePluginHost {
             run_id.to_string(),
             ActivePluginRun {
                 host: snapshot,
-                tools,
-                prompts,
+                tools: Arc::new(tools),
+                prompts: Arc::new(prompts),
                 capability_plan_ready,
                 state: PluginRunState::Active,
                 finish_delivery_failed: false,
@@ -520,6 +521,12 @@ struct PluginFanout {
 impl PluginFanout {
     /// 读取事件快照中 Core 绑定的运行 ID。
     fn run_id(ctx: &EventContext<'_>) -> Result<String> {
+        // 高频增量记录已有强类型身份，不为取一个 ID 序列化整份事件正文。
+        if let Some(event) = ctx.event::<AgentRecordEvent>() {
+            if !event.record.run_id.is_empty() {
+                return Ok(event.record.run_id.clone());
+            }
+        }
         let data = ctx.snapshot()?;
         data.get("run_id")
             .and_then(|value| value.as_str())
@@ -646,24 +653,24 @@ impl EventListener for PluginFanout {
 impl AgentExtension for LivePluginHost {
     async fn prompt_messages(&self) -> Result<Vec<ModelMessage>> {
         if let Some(run) = self.legacy_run_snapshot()? {
-            return Ok(run.prompts);
+            return Ok(run.prompts.as_ref().clone());
         }
         AgentExtension::prompt_messages(&self.current_snapshot()?).await
     }
 
     async fn prompt_messages_for_run(&self, run_id: &str) -> Result<Vec<ModelMessage>> {
-        Ok(self.run_snapshot(run_id)?.prompts)
+        Ok(self.run_snapshot(run_id)?.prompts.as_ref().clone())
     }
 
     async fn list_tools(&self) -> Result<Vec<ToolSpec>> {
         if let Some(run) = self.legacy_run_snapshot()? {
-            return Ok(run.tools);
+            return Ok(run.tools.as_ref().clone());
         }
         AgentExtension::list_tools(&self.current_snapshot()?).await
     }
 
     async fn list_tools_for_run(&self, run_id: &str) -> Result<Vec<ToolSpec>> {
-        Ok(self.run_snapshot(run_id)?.tools)
+        Ok(self.run_snapshot(run_id)?.tools.as_ref().clone())
     }
 
     async fn call_tool(&self, call: ToolCall) -> Result<Option<ToolResult>> {
@@ -825,6 +832,22 @@ impl PluginHost for LivePluginHost {
 
     async fn shutdown(&self) -> Result<()> {
         PluginHost::shutdown(&self.current_snapshot()?).await
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    /// 扇出快照的克隆必须共享冻结正文而不是按 token 深克隆。
+    #[tokio::test]
+    async fn fanout_snapshot_shares_frozen_contributions() {
+        let host = LivePluginHost::new();
+        host.open_run_snapshot("snapshot").await.unwrap();
+        let first = host.run_snapshot("snapshot").unwrap();
+        let second = host.run_snapshot_for_fanout("snapshot", true).unwrap();
+        assert!(Arc::ptr_eq(&first.tools, &second.tools));
+        assert!(Arc::ptr_eq(&first.prompts, &second.prompts));
     }
 }
 
