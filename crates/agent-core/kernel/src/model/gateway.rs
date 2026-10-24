@@ -259,12 +259,14 @@ pub trait ProviderAdapterFactory: Send + Sync {
 }
 
 /// OpenAI 系协议适配器工厂，覆盖官方 OpenAI 与 OpenAI 兼容网关。
+#[cfg(feature = "openai")]
 #[derive(Debug, Clone)]
 struct OpenAiAdapterFactory {
     /// 工厂注册时声明的协议类型；同一实现按两种协议 ID 分别注册。
     kind: ProviderKind,
 }
 
+#[cfg(feature = "openai")]
 impl ProviderAdapterFactory for OpenAiAdapterFactory {
     fn kind(&self) -> ProviderKind {
         self.kind.clone()
@@ -291,9 +293,11 @@ impl ProviderAdapterFactory for OpenAiAdapterFactory {
 }
 
 /// Anthropic Messages 协议适配器工厂。
+#[cfg(feature = "anthropic")]
 #[derive(Debug, Clone, Copy, Default)]
 struct AnthropicAdapterFactory;
 
+#[cfg(feature = "anthropic")]
 impl ProviderAdapterFactory for AnthropicAdapterFactory {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Anthropic

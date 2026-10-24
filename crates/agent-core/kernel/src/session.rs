@@ -127,6 +127,7 @@ mod tests {
     use super::*;
 
     /// 本次变更前公开给外部 crate 的推理内容块结构。
+    #[cfg(feature = "anthropic")]
     #[derive(serde::Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     enum LegacyReasoningBlock {

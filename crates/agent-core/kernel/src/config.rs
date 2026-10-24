@@ -406,8 +406,29 @@ mod tests {
         );
     }
 
+    /// 配置解析/默认选择不依赖任何协议适配器，最小 feature 同样覆盖。
+    #[test]
+    fn validates_models_without_provider_features() {
+        let mut config = parse(r#"{"default_model":"b","models":[{"name":"shared","provider":"open-ai","model":"a","api_key":"k"},{"name":"shared","provider":"open-ai","model":"b","api_key":"k"},{"name":"other","provider":"google","model":"c","api_key":"k"}]}"#).unwrap();
+        assert_eq!(config.default_upstream().unwrap().model, "b");
+        assert_eq!(config.agent_options().provider, "shared");
+        config.default_model = Some("other".into());
+        config.validate().unwrap();
+        assert_eq!(config.default_upstream().unwrap().model, "c");
+        config.default_model = Some("missing".into());
+        assert!(config.validate().is_err());
+        config.default_model = None;
+        config.models[1].api_key = Some("other-key".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("api_key"));
+    }
+
     /// 多上游必须全部注册进网关，default_model 决定默认上游。
     #[test]
+    #[cfg(all(feature = "openai", feature = "google"))]
     fn registers_all_upstreams_and_honors_default() {
         let config = parse(
             r#"{
@@ -475,6 +496,7 @@ mod tests {
     /// 一个服务商挂多个模型：同名条目只要求连接一致，网关按名注册一次，
     /// default_model 用模型 ID 选中其中一条。
     #[test]
+    #[cfg(feature = "openai")]
     fn allows_one_provider_with_several_models() {
         let config = parse(
             r#"{

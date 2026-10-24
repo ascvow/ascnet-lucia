@@ -2853,6 +2853,7 @@ fn with_execution_policy_only_narrows() {
 
 /// 共享 Agent 热切换必须覆盖 active_route，且未切换时回落到静态选项。
 #[test]
+#[cfg(feature = "google")]
 fn switch_model_upstream_overrides_active_route() {
     let agent = Agent::new(ModelGateway::new(), AgentOptions::default());
     let fallback = agent.active_route();

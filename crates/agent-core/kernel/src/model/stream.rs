@@ -235,6 +235,7 @@ impl ModelEventStream {
     ///
     /// 流被取消或提前丢弃时会中止该任务，避免 HTTP 请求继续占用连接与 token；正常消费到
     /// 终态后，已完成任务的中止操作没有副作用。
+    #[cfg(any(feature = "openai", test))]
     pub(crate) fn with_request_task(mut self, task: tokio::task::JoinHandle<()>) -> Self {
         {
             let mut budget = self
