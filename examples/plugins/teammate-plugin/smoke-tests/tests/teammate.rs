@@ -559,9 +559,36 @@ async fn component_runs_mailbox_dispatch_flow() {
     )
     .await;
     assert_eq!(dispatched["acked"], true);
-    assert_ne!(dispatched["handle"]["id"], member_id);
+    // 队员是长期身份：派活复用同一 Agent ID，不产生新的执行句柄。
+    assert_eq!(dispatched["handle"]["id"], member_id);
     let second_result = wait_result(host.as_ref(), RUN, member_id).await;
     assert_eq!(second_result["outcome"]["status"], "succeeded");
+
+    // 队长可以一直派活：连续多轮 dispatch 不应消耗任何派生配额或改变成员身份。
+    for round in 0..2 {
+        let sent = call_tool(
+            host.as_ref(),
+            RUN,
+            "teammate_send",
+            json!({
+                "recipient": member_id,
+                "topic": "review.followup",
+                "payload": {"round": round}
+            }),
+        )
+        .await;
+        let message_id = sent["message"]["id"].as_u64().expect("send 应返回消息 ID");
+        let dispatched = call_tool(
+            host.as_ref(),
+            RUN,
+            "teammate_dispatch",
+            json!({"member_id": member_id, "message_id": message_id}),
+        )
+        .await;
+        assert_eq!(dispatched["handle"]["id"], member_id);
+        let result = wait_result(host.as_ref(), RUN, member_id).await;
+        assert_eq!(result["outcome"]["status"], "succeeded");
+    }
 
     let empty_inbox = call_tool(
         host.as_ref(),

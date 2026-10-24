@@ -281,28 +281,57 @@ pub struct AgentSnapshot {
 #[derive(Debug)]
 pub struct AgentEventStream {
     receiver: mpsc::UnboundedReceiver<AgentEvent>,
+    /// 结束探测已经取出但尚未交付的事件。
+    pending: Option<AgentEvent>,
 }
 
 impl AgentEventStream {
     /// 从 Runtime 内部订阅通道创建事件流，不向外暴露接收端控制权。
     pub(crate) fn new(receiver: mpsc::UnboundedReceiver<AgentEvent>) -> Self {
-        Self { receiver }
+        Self {
+            receiver,
+            pending: None,
+        }
     }
 
     /// 创建立即结束的空事件流，供无历史的 Runtime 适配器返回。
     pub fn empty() -> Self {
         let (_sender, receiver) = mpsc::unbounded_channel();
-        Self { receiver }
+        Self::new(receiver)
     }
 
     /// 取出下一条事件；目标终态且缓冲耗尽后返回 `None`。
     pub async fn next(&mut self) -> Option<AgentEvent> {
+        if let Some(event) = self.pending.take() {
+            return Some(event);
+        }
         self.receiver.recv().await
     }
 
     /// 非阻塞取出一条已缓冲事件；当前没有可用事件时返回 `None`。
     pub fn try_next(&mut self) -> Option<AgentEvent> {
+        if let Some(event) = self.pending.take() {
+            return Some(event);
+        }
         self.receiver.try_recv().ok()
+    }
+
+    /// 判断本次运行的流是否已经结束且没有待取事件。
+    ///
+    /// 同一 Agent 身份可以被反复续跑：一次运行结束后发送端全部丢弃，流随即结束，
+    /// 观察者需要据此为下一次运行重新订阅。判断过程取到的事件会暂存，不会丢失。
+    pub fn is_finished(&mut self) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        match self.receiver.try_recv() {
+            Ok(event) => {
+                self.pending = Some(event);
+                false
+            }
+            Err(mpsc::error::TryRecvError::Empty) => false,
+            Err(mpsc::error::TryRecvError::Disconnected) => true,
+        }
     }
 }
 
@@ -430,11 +459,11 @@ pub trait AgentRuntimeApi: Send + Sync {
     /// 启动一个独立派生 Agent 并立即返回句柄，不等待模型运行完成。
     async fn spawn(&self, request: AgentSpawnRequest) -> RuntimeResult<AgentHandle>;
 
-    /// 从自身或后代 Agent 的成功终态会话创建后续运行，并立即返回新句柄。
+    /// 从自身或后代 Agent 的成功终态会话创建后续运行，并立即返回同一身份的句柄。
     ///
     /// Runtime 只复用目标的私有会话、运行模板和有效权限，不向调用方返回原始会话，
-    /// 新运行的权限也不会超过目标 Agent 已经持有的范围。续跑沿用源节点的派生深度，
-    /// 也不消耗父节点的累计子配额，因此长期协作的成员可以反复接收新任务。
+    /// 新运行的权限也不会超过目标 Agent 已经持有的范围。续跑复用同一 `AgentId`、
+    /// 谱系和子节点计数，不登记新 Agent：队长可以一直派活，队员可以一直接活。
     async fn continue_agent(&self, target: &AgentId, input: String) -> RuntimeResult<AgentHandle>;
 
     /// 向排队或运行中的自身/后代 Agent 注入一条用户消息。
@@ -462,8 +491,9 @@ pub trait AgentRuntimeApi: Send + Sync {
 
     /// 订阅自身或后代 Agent 的生命周期事件流。
     ///
-    /// 先回放 Runtime 保留的最近事件，再投递实时事件；目标已处于终态时在历史耗尽后结束。
-    /// 实时事件通道不限量缓冲，订阅方应及时消费，避免长时间滞留占用内存。
+    /// 每次运行先回放 Runtime 保留的最近事件，再投递实时事件；本次运行结束且历史
+    /// 耗尽后流结束。续跑会清空上一轮历史并开启新的运行，观察者可重新订阅而不重复
+    /// 收到旧事件。
     async fn subscribe(&self, target: &AgentId) -> RuntimeResult<AgentEventStream>;
 }
 

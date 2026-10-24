@@ -56,7 +56,53 @@ pub(crate) struct AgentRuntimeBinding {
     principal: RuntimePrincipal,
     api: Arc<dyn AgentRuntimeApi>,
     host_services: AgentRuntimeHostServices,
-    event_streams: Arc<tokio::sync::Mutex<HashMap<AgentId, AgentEventStream>>>,
+    event_streams: Arc<tokio::sync::Mutex<HashMap<AgentId, AgentEventSubscription>>>,
+}
+
+/// 一个目标的事件订阅与已交付游标。
+///
+/// Agent 身份可以反复续跑，每次运行结束都会结束上一份事件流；重订阅会回放 Runtime
+/// 保留的最近事件。Runtime 在续跑时清空事件历史，因此回放要么是同一轮已交付过的
+/// 历史（应整段跳过），要么是新一轮事件（应正常交付），只需记录上一轮 run_id 即可
+/// 判定，无需为每条事件分配去重键。
+struct AgentEventSubscription {
+    stream: AgentEventStream,
+    /// 最近一次已交付事件所属的运行。
+    last_run_id: Option<String>,
+    /// 重订阅回放中确认重复、正在跳过的运行。
+    skip_run_id: Option<String>,
+}
+
+impl AgentEventSubscription {
+    /// 为已建立的订阅创建交付游标，继承上一份订阅已交付的运行。
+    fn new(stream: AgentEventStream, last_run_id: Option<String>) -> Self {
+        Self {
+            stream,
+            skip_run_id: last_run_id.clone(),
+            last_run_id,
+        }
+    }
+
+    /// 判断当前事件是否属于应整段跳过的重复回放。
+    ///
+    /// 第一个不属于待跳过运行的事件会清除跳过状态，后续事件正常交付。
+    fn should_skip(&mut self, run_id: &str) -> bool {
+        match self.skip_run_id.as_deref() {
+            Some(skip) if skip == run_id => true,
+            Some(_) => {
+                self.skip_run_id = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 记录本次交付事件所属的运行，避免每条事件都重复分配。
+    fn note_delivered(&mut self, run_id: &str) {
+        if self.last_run_id.as_deref() != Some(run_id) {
+            self.last_run_id = Some(run_id.to_string());
+        }
+    }
 }
 
 impl AgentRuntimeBinding {
@@ -74,22 +120,40 @@ impl AgentRuntimeBinding {
         }
     }
 
-    /// 复用目标订阅流并非阻塞取出一批已到达事件。
+    /// 复用目标订阅流并非阻塞取出一批新到达事件。
+    ///
+    /// 同一 Agent 身份可被反复续跑，每次运行结束都会结束上一份事件流，这里随即重新
+    /// 订阅。Runtime 在续跑时清空事件历史，因此重订阅的回放要么是同一轮已交付过的
+    /// 历史（整段跳过），要么是新一轮事件；据此保持成员视图连续且不重复。
     async fn poll_events(
         &self,
         target: &AgentId,
         limit: usize,
     ) -> agent_runtime::RuntimeResult<Vec<AgentEvent>> {
-        let needs_subscription = !self.event_streams.lock().await.contains_key(target);
+        let (needs_subscription, last_run_id) = {
+            let mut streams = self.event_streams.lock().await;
+            match streams.get_mut(target) {
+                Some(subscription) => {
+                    if subscription.stream.is_finished() {
+                        let last_run_id = subscription.last_run_id.clone();
+                        streams.remove(target);
+                        (true, last_run_id)
+                    } else {
+                        (false, None)
+                    }
+                }
+                None => (true, None),
+            }
+        };
         if needs_subscription {
             let stream = self.api.subscribe(target).await?;
-            self.event_streams
-                .lock()
-                .await
-                .insert(target.clone(), stream);
+            self.event_streams.lock().await.insert(
+                target.clone(),
+                AgentEventSubscription::new(stream, last_run_id),
+            );
         }
         let mut streams = self.event_streams.lock().await;
-        let stream = streams
+        let subscription = streams
             .get_mut(target)
             .expect("已创建的 Agent 事件订阅必须存在");
         let mut visible = Vec::with_capacity(limit);
@@ -101,9 +165,13 @@ impl AgentRuntimeBinding {
             if visible.len() >= limit {
                 break;
             }
-            let Some(event) = stream.try_next() else {
+            let Some(event) = subscription.stream.try_next() else {
                 break;
             };
+            if subscription.should_skip(&event.run_id) {
+                continue;
+            }
+            subscription.note_delivered(&event.run_id);
             if let Some(event) = sanitize_guest_visible_agent_event(event) {
                 visible.push(event);
             }
@@ -349,5 +417,39 @@ impl CapabilityState {
             }
             operation => Err(anyhow!("未知 Agent Runtime 操作：`{operation}`")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 重订阅只跳过已交付过的同一轮历史，新一轮事件仍会交付。
+    ///
+    /// 同一 Agent 身份会跨多轮运行复用；续跑时 Runtime 清空历史，因此按 run_id
+    /// 整段判定即可，不必为每条事件维护去重集合。
+    #[test]
+    fn replay_skips_only_the_previously_delivered_run() {
+        let mut subscription =
+            AgentEventSubscription::new(AgentEventStream::empty(), Some("run-a".into()));
+
+        assert!(subscription.should_skip("run-a"), "已交付历史必须跳过");
+        assert!(subscription.should_skip("run-a"));
+        // 新一轮事件不属于待跳过运行：清除跳过状态并正常交付。
+        assert!(!subscription.should_skip("run-b"));
+        assert!(!subscription.should_skip("run-b"));
+
+        subscription.note_delivered("run-b");
+        assert_eq!(subscription.last_run_id.as_deref(), Some("run-b"));
+    }
+
+    /// 首次订阅没有历史交付记录，因此不得跳过任何事件。
+    #[test]
+    fn first_subscription_delivers_every_event() {
+        let mut subscription = AgentEventSubscription::new(AgentEventStream::empty(), None);
+
+        assert!(!subscription.should_skip("run-a"));
+        subscription.note_delivered("run-a");
+        assert_eq!(subscription.last_run_id.as_deref(), Some("run-a"));
     }
 }

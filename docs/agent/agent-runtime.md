@@ -27,9 +27,9 @@
 Queued -> Running -> Succeeded | Failed | Cancelled
 ```
 
-终态不可覆盖。取消父节点会级联取消后代；重复取消保持幂等。`RuntimeLimits` 约束最大深度、每个父节点的累计子节点数、全局模型运行并发，以及单个 principal 的累计 Agent 总数与可选的累计模型资源上限。会话续跑不增加派生深度，也不消耗父节点的子配额。
+终态不可覆盖。取消父节点会级联取消后代；重复取消保持幂等。`RuntimeLimits` 约束最大深度、每个父节点的累计子节点数、全局模型运行并发，以及单个 principal 的累计 Agent 总数与可选的累计模型资源上限。续跑让同一 Agent 从成功终态回到排队，不增加派生深度，也不消耗父节点的子配额。
 
-`steer` 只接受排队或运行中的自身/后代 Agent。排队阶段与 Core Agent 运行阶段的待注入队列都最多保留 32 条消息，启动后按顺序注入；目标进入终态后拒绝实时消息。`subscribe` 为晚加入观察者回放最近 512 条事件，再持续发送实时事件，终态且缓冲耗尽后自然结束。
+`steer` 只接受排队或运行中的自身/后代 Agent。排队阶段与 Core Agent 运行阶段的待注入队列都最多保留 32 条消息，启动后按顺序注入；目标进入终态后拒绝实时消息。`subscribe` 在每次运行内为晚加入观察者回放最近 512 条事件，再持续发送实时事件，本次运行结束且缓冲耗尽后自然结束；续跑会开启新的事件历史，重新订阅不会重复交付上一轮。
 
 ## 原生调用
 
@@ -71,7 +71,9 @@ let follow_up = provisioned
 
 Host 为每次受限组件激活创建唯一 `RuntimePrincipal`。principal 拥有独立 controller 和派生树；插件请求不能填写 owner 或 parent。插件卸载时，Host 通过 provisioner 撤销 principal，取消并清理其全部 Runtime 资源。
 
-每个 controller、首次派生和 `continue_agent` 创建的后续 Agent 都计入该 principal 的累计 Agent 总数。Agent 进入终态不会返还名额，避免通过快速创建并结束任务绕过生命周期预算；只有撤销 principal 才会清理整份账本。父节点深度或子节点数检查失败时，尚未形成 Agent 的临时预留会回滚。每个父节点的累计子节点配额与 principal 的 Agent 总数对齐（默认 128），否则长期交互 controller 会在第 16 次顺序派生成员后永久失败；并发扇出仍由 `max_concurrent_agents` 限制，需要更严格扇出的部署可通过执行策略显式收紧子配额。
+每个 controller 与首次派生的成员都计入该 principal 的累计 Agent 总数。Agent 进入终态不会返还名额，避免通过快速创建并结束任务绕过生命周期预算；只有撤销 principal 才会清理整份账本。父节点深度或子节点数检查失败时，尚未形成 Agent 的临时预留会回滚。每个父节点的累计子节点配额与 principal 的 Agent 总数对齐（默认 128），否则长期交互 controller 会在第 16 次顺序派生成员后永久失败；并发扇出仍由 `max_concurrent_agents` 限制，需要更严格扇出的部署可通过执行策略显式收紧子配额。
+
+`continue_agent` 不登记新 Agent：它复用目标身份、谱系和私有会话，只把该 Agent 从成功终态切回排队并开启下一次运行。因此队长可以一直派活、队员可以一直接活，反复续跑不消耗任何派生配额；上下文不足时由该 Agent 继承的 Context Loader 自行压缩。
 
 派生 Agent 的每个最终 `ModelRequest` 在 provider 调用前可以原子预留三项累计资源：请求次数、provider-neutral 请求的 JSON 序列化字节数和 `max_tokens` 声明的输出 token。三项都是**可选上限**，`None` 表示不设累计配额；交互式 Serve 平面默认全部为 `None`，因为队员需要一直运行到任务完成，模型请求次数不应成为会话寿命上限。设置上限时，字节预算统计的是 adapter 转换前的可信请求，不等同于最终网络 body；计数使用有界 writer，超限时不会先复制完整请求。任一维度超限时 provider 不会收到请求；provider 随后失败也不返还预留，防止失败重试绕过预算。执行策略或 Agent 已设置的单次输出上限优先；两者都未设置时 Runtime 为派生 Agent 注入 20,000 token 的有限默认值。
 
@@ -81,7 +83,7 @@ Evaluation 与 Mutation 等受限平面必须显式设置这三项上限，用�
 
 Runtime 的 controller profile 由应用注册，决定基础模型、工具和权限。Plugin Host 还会把 Guest 可见的 spawn profile 映射为受控的 `AgentDeriveConfig`。Guest 只能提交 profile 名称和任务输入，不能直接传入 provider、API key、provider options 或工具权限。
 
-Lucia TUI 的 `worker` profile 使用显式只读 allowlist：`list_directory`、`search_files`、`read_file` 和 `skill_read`。它不继承 `shell`、`write_file` 或未来新增工具；需要副作用的工作必须回到经过主 Agent 权限策略的调用链。worker 不覆盖主会话的 `max_steps`：主会话配置为 `0`（不设上限）时队员可以一直运行到任务完成。`continue_agent` 沿用源节点的派生深度，也不消耗父节点的累计子配额，因此同一成员可以反复接收新任务；登记的 Agent 总数仍受 principal 账本约束，作为内存与结果保留边界。
+Lucia TUI 的 `worker` profile 使用显式只读 allowlist：`list_directory`、`search_files`、`read_file` 和 `skill_read`。它不继承 `shell`、`write_file` 或未来新增工具；需要副作用的工作必须回到经过主 Agent 权限策略的调用链。worker 不覆盖主会话的 `max_steps`：主会话配置为 `0`（不设上限）时队员可以一直运行到任务完成。续跑复用同一身份与谱系，队员因此可以反复接活；上下文不足时沿用主会话注入的 Context Loader 自行压缩。
 
 应用通过可选宿主服务把 Runtime 注入 WASM loader：
 

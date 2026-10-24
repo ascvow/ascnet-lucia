@@ -162,7 +162,7 @@ Host 对单次 `recv` 的等待有硬上限，插件需要更长等待时应循�
 | --- | --- |
 | `agent_identity()` | 返回 Host 分配给当前插件实例的 controller Agent ID |
 | `spawn_agent(request)` | 使用已授权 profile 入队一个派生 Agent |
-| `continue_agent(request)` | 基于可管理目标的成功终态私有会话入队后续运行 |
+| `continue_agent(request)` | 基于可管理目标的成功终态私有会话入队后续运行；复用同一 Agent 身份与谱系 |
 | `agent_status(target)` | 查询 controller 或其后代的状态、谱系和有效权限 |
 | `agent_result(target)` | 非阻塞读取终态结果；未完成时返回 `None` |
 | `cancel_agent(target)` | 幂等、级联取消指定后代 |
