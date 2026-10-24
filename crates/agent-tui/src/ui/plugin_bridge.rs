@@ -68,6 +68,7 @@ pub(crate) type PluginRenderResult = (
     String,
     String,
     Option<String>,
+    u64,
     Result<Option<PluginUiFrame>>,
 );
 
@@ -83,28 +84,15 @@ pub(crate) async fn render_plugin_views(
         .collect::<FuturesUnordered<_>>();
     // 单帧完成即可提交，当前视图不等待同批次中其他插件的慢调用。
     while let Some(rendered) = pending.next().await {
-        if tx
-            .send(crate::event::UiEvent::PluginFrameLoaded(rendered))
-            .is_err()
-        {
-            break;
-        }
+        // 即使接收端已关闭也排空整批 WASM 调用，不能丢弃仍在执行的 component future。
+        let _ = tx.send(crate::event::UiEvent::PluginFrameLoaded(rendered));
     }
 }
 
 /// 把后台完成的插件视图帧提交到 App 缓存。
 pub(crate) fn apply_plugin_frames(app: &mut App, rendered: Vec<PluginRenderResult>) {
-    for (plugin_id, view_id, instance_id, result) in rendered {
-        match result {
-            Ok(Some(frame)) => {
-                app.update_plugin_frame(&plugin_id, instance_id.as_deref(), frame);
-                sync_visible_input_focus(app);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                app.set_plugin_ui_error(&plugin_id, &view_id, instance_id.as_deref(), &error)
-            }
-        }
+    for rendered in rendered {
+        apply_rendered_request(app, rendered);
     }
 }
 
@@ -122,7 +110,35 @@ pub(crate) async fn refresh_plugin_view(
     let Some(request) = request else {
         return;
     };
+    app.mark_plugin_render_requests(std::slice::from_ref(&request));
     apply_rendered_request(app, render_plugin_request(plugin_host, request).await);
+}
+
+/// 焦点切换后只刷新失焦和获焦视图，让布局在下一次绘制前更新，不等待周期 tick。
+/// 返回是否发生焦点切换；不调用无关插件，也不取消已在后台执行的 WASM 请求。
+pub(crate) async fn refresh_changed_plugin_focus(
+    app: &mut App,
+    plugin_host: &dyn PluginHost,
+    previous: Option<usize>,
+) -> bool {
+    if previous == app.plugin_focus {
+        return false;
+    }
+    let views = [previous, app.plugin_focus]
+        .into_iter()
+        .flatten()
+        .filter_map(|index| app.plugin_views.get(index))
+        .map(|view| {
+            (
+                view.declaration.plugin_id.clone(),
+                view.declaration.view_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (plugin_id, view_id) in views {
+        refresh_plugin_view(app, plugin_host, &plugin_id, &view_id).await;
+    }
+    true
 }
 
 /// 刷新单个插件的全部视图；插件可在输入处理中开关自己的对话框或面板。
@@ -136,6 +152,7 @@ pub(crate) async fn refresh_plugin_views_for(
         .into_iter()
         .filter(|request| request.plugin_id == plugin_id)
         .collect::<Vec<_>>();
+    app.mark_plugin_render_requests(&requests);
     for request in requests {
         apply_rendered_request(app, render_plugin_request(plugin_host, request).await);
     }
@@ -143,7 +160,11 @@ pub(crate) async fn refresh_plugin_views_for(
 
 /// 把一次定向渲染结果提交到视图缓存，并同步 Input 视图焦点。
 fn apply_rendered_request(app: &mut App, rendered: PluginRenderResult) {
-    let (plugin_id, view_id, instance_id, result) = rendered;
+    let (plugin_id, view_id, instance_id, frame_id, result) = rendered;
+    let key = (plugin_id.clone(), view_id.clone(), instance_id.clone());
+    if app.plugin_view_requests.get(&key) != Some(&frame_id) {
+        return;
+    }
     match result {
         Ok(Some(frame)) => {
             app.update_plugin_frame(&plugin_id, instance_id.as_deref(), frame);
@@ -191,7 +212,7 @@ async fn render_plugin_request(
     let instance_id = request.instance_id.clone();
     // WASM component 调用不可通过丢弃 future 取消，否则后续调用和卸载无法重新进入实例。
     let result = plugin_host.render_ui(&request).await;
-    (plugin_id, view_id, instance_id, result)
+    (plugin_id, view_id, instance_id, request.frame, result)
 }
 
 /// 向焦点插件发送输入；执行资源由 WASM Host 的运行限额约束。

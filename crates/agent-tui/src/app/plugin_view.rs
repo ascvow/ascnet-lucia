@@ -239,6 +239,7 @@ impl App {
         if requests.is_empty() {
             return;
         }
+        self.mark_plugin_render_requests(&requests);
         let tx = self.tx.clone();
         self.plugin_refresh_task = Some(tokio::spawn(async move {
             render_plugin_views(host, requests, tx.clone()).await;
@@ -834,6 +835,36 @@ impl App {
             })
         });
         requests
+    }
+
+    /// 只登记实际派发的请求，不能让定向刷新误作废同批生成但未派发的其他视图。
+    pub(crate) fn mark_plugin_render_requests(&mut self, requests: &[UiRenderRequest]) {
+        // 动态实例只保留当前栈顶条目，插件卸载后的旧帧同样不能重新进入缓存。
+        self.plugin_view_requests
+            .retain(|(plugin, view, instance), _| {
+                if let Some(instance) = instance {
+                    self.view_stack.active().is_some_and(|entry| {
+                        entry.plugin_id == *plugin
+                            && entry.view().is_some_and(|active| {
+                                active.view_id == *view && active.instance_id == *instance
+                            })
+                    })
+                } else {
+                    self.plugin_views.iter().any(|entry| {
+                        entry.declaration.plugin_id == *plugin && entry.declaration.view_id == *view
+                    })
+                }
+            });
+        for request in requests {
+            self.plugin_view_requests.insert(
+                (
+                    request.plugin_id.clone(),
+                    request.view_id.clone(),
+                    request.instance_id.clone(),
+                ),
+                request.frame,
+            );
+        }
     }
 
     /// 用插件返回的新帧更新对应视图缓存。

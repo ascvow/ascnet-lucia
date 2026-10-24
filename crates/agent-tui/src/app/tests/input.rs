@@ -390,12 +390,16 @@ fn visible_permission_input_freezes_main_event_timeline() {
     let mut approval = test_plugin_view(UiPlacement::Input, "Permission");
     approval.frame.as_mut().expect("审批帧应存在").visible = false;
     app.plugin_views.push(approval);
+    let requests = app.plugin_render_requests();
+    app.mark_plugin_render_requests(&requests);
+    let frame_id = requests[0].frame;
     apply_plugin_frames(
         &mut app,
         vec![(
             "test-plugin".into(),
             "input".into(),
             None,
+            frame_id,
             Ok(Some(PluginUiFrame {
                 view_id: "input".into(),
                 visible: true,
@@ -438,12 +442,16 @@ fn visible_permission_input_freezes_main_event_timeline() {
     assert!(!frozen.contains("审批期间工具"), "{frozen:?}");
     assert_eq!(app.messages.len(), 2, "后台事件仍应更新真实状态");
 
+    let requests = app.plugin_render_requests();
+    app.mark_plugin_render_requests(&requests);
+    let frame_id = requests[0].frame;
     apply_plugin_frames(
         &mut app,
         vec![(
             "test-plugin".into(),
             "input".into(),
             None,
+            frame_id,
             Ok(Some(PluginUiFrame {
                 view_id: "input".into(),
                 visible: false,
@@ -483,12 +491,16 @@ fn hidden_permission_input_returns_escape_to_main() {
     app.plugin_views
         .push(test_plugin_view(UiPlacement::Input, "Permission"));
     app.plugin_focus = Some(0);
+    let requests = app.plugin_render_requests();
+    app.mark_plugin_render_requests(&requests);
+    let frame_id = requests[0].frame;
     apply_plugin_frames(
         &mut app,
         vec![(
             "test-plugin".into(),
             "input".into(),
             None,
+            frame_id,
             Ok(Some(PluginUiFrame {
                 view_id: "input".into(),
                 visible: false,

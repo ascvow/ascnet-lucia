@@ -467,6 +467,14 @@ async fn component_runs_mailbox_dispatch_flow() {
         }
     }
 
+    // 焦点变更直接渲染，不依赖任何周期 tick；展开/失焦收起均在这一帧生效。
+    let unfocused = render_shelf(host.as_ref(), false, 24).await;
+    assert_eq!(unfocused.lines.len(), 1);
+    let focused = render_shelf(host.as_ref(), true, 25).await;
+    assert!(shelf_text(&focused).contains("reviewer"));
+    let unfocused = render_shelf(host.as_ref(), false, 26).await;
+    assert_eq!(unfocused.lines.len(), 1);
+
     PluginHost::on_ui_input(
         host.as_ref(),
         &UiInput {

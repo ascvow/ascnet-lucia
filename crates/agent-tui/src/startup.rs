@@ -37,7 +37,8 @@ use crate::theme::{REVEAL_FRAME_INTERVAL_MS, UI_TICK_INTERVAL_MS};
 #[cfg(feature = "plugins")]
 use crate::ui::plugin_bridge::{
     apply_plugin_footer_event, apply_plugin_frames, apply_plugin_navigation_event,
-    dispatch_plugin_input, drain_plugin_ui_events, refresh_plugin_view, refresh_plugin_views_for,
+    dispatch_plugin_input, drain_plugin_ui_events, refresh_changed_plugin_focus,
+    refresh_plugin_view, refresh_plugin_views_for,
 };
 use crate::ui::root::render_root;
 use agent_context::{NativeContextLoader, DEFAULT_MAX_SUMMARY_TOKENS};
@@ -980,6 +981,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         continue;
                     }
                     #[cfg(feature = "plugins")]
+                    let previous_plugin_focus = app.plugin_focus;
+                    #[cfg(feature = "plugins")]
                     match app.route_plugin_key(key.code, key.modifiers) {
                         PluginKeyRoute::Main => {
                             let before = (app.input.clone(), app.cursor);
@@ -996,7 +999,16 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                 }
                             }
                         }
-                        PluginKeyRoute::Consumed => {}
+                        PluginKeyRoute::Consumed => {
+                            if let Some(host) = plugin_host.as_ref() {
+                                refresh_changed_plugin_focus(
+                                    &mut app,
+                                    host.as_ref(),
+                                    previous_plugin_focus,
+                                )
+                                .await;
+                            }
+                        }
                         PluginKeyRoute::Input(input) => {
                             if let Some(host) = plugin_host.as_ref() {
                                 if let Err(error) =
@@ -1524,6 +1536,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 #[cfg(feature = "plugins")]
                 {
                     let dialog_active = app.active_dialog_index().is_some();
+                    let previous_plugin_focus = app.plugin_focus;
                     if let Some(input) = app.route_plugin_mouse(&mouse) {
                         needs_redraw = true;
                         if let Some(host) = plugin_host.as_ref() {
@@ -1544,8 +1557,31 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                                 refresh_plugin_views_for(&mut app, host.as_ref(), &input.plugin_id)
                                     .await;
                             }
+                            if previous_plugin_focus != app.plugin_focus {
+                                if let Some(previous) = previous_plugin_focus
+                                    .and_then(|index| app.plugin_views.get(index))
+                                {
+                                    let plugin_id = previous.declaration.plugin_id.clone();
+                                    let view_id = previous.declaration.view_id.clone();
+                                    refresh_plugin_view(
+                                        &mut app,
+                                        host.as_ref(),
+                                        &plugin_id,
+                                        &view_id,
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                     } else if !dialog_active {
+                        if let Some(host) = plugin_host.as_ref() {
+                            needs_redraw |= refresh_changed_plugin_focus(
+                                &mut app,
+                                host.as_ref(),
+                                previous_plugin_focus,
+                            )
+                            .await;
+                        }
                         match mouse.kind {
                             MouseEventKind::ScrollUp => app.scroll_up(3),
                             MouseEventKind::ScrollDown => app.scroll_down(3),

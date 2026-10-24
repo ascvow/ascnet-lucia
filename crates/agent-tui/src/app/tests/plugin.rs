@@ -401,6 +401,270 @@ async fn plugin_view_refresh_coalesces_pending_requests() {
         .expect("后台刷新任务不应 panic");
 }
 
+/// 模拟由焦点与输入驱动的折叠视图，不包含任何具体插件协议。
+#[cfg(feature = "plugins")]
+#[derive(Default)]
+struct FocusShelfHost {
+    state: std::sync::Mutex<(bool, bool)>,
+}
+
+#[cfg(feature = "plugins")]
+#[async_trait]
+impl agent_core::AgentExtension for FocusShelfHost {}
+
+#[cfg(feature = "plugins")]
+#[async_trait]
+impl PluginHost for FocusShelfHost {
+    async fn render_ui(
+        &self,
+        request: &agent_plugin_protocol::UiRenderRequest,
+    ) -> Result<Option<PluginUiFrame>> {
+        let mut state = self.state.lock().unwrap();
+        if state.0 != request.focused {
+            *state = (request.focused, request.focused);
+        }
+        let rows = if state.1 { 3 } else { 1 };
+        Ok(Some(PluginUiFrame {
+            view_id: request.view_id.clone(),
+            visible: true,
+            cursor: None,
+            lines: (0..rows)
+                .map(|row| UiLine {
+                    spans: vec![UiSpan {
+                        text: format!("row-{row}"),
+                        style: UiStyle::default(),
+                    }],
+                })
+                .collect(),
+        }))
+    }
+
+    async fn on_ui_input(&self, input: &agent_plugin_protocol::UiInput) -> Result<()> {
+        if matches!(&input.event, UiInputEvent::Key { code, .. } if code == " ")
+            || matches!(&input.event, UiInputEvent::Mouse { kind, .. } if kind == "down_left")
+        {
+            let mut state = self.state.lock().unwrap();
+            state.1 = !state.1;
+        }
+        Ok(())
+    }
+}
+
+/// 不注入 tick、不 sleep：焦点和折叠输入必须在下一次绘制前改变架的内容高度。
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn shelf_interactions_refresh_without_periodic_tick() {
+    use crate::ui::plugin_bridge::{
+        dispatch_plugin_input, refresh_changed_plugin_focus, refresh_plugin_views_for,
+    };
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.plugin_views
+        .push(test_plugin_view(UiPlacement::ComposerShelf, "架"));
+    app.plugin_views[0].area = Rect::new(1, 15, 60, 6);
+    let host = FocusShelfHost::default();
+    assert_eq!(app.composer_panel_height(), 2);
+    for key in [KeyCode::Tab, KeyCode::Esc, KeyCode::BackTab, KeyCode::Tab] {
+        let before = app.plugin_focus;
+        assert!(matches!(
+            app.route_plugin_key(key, KeyModifiers::NONE),
+            PluginKeyRoute::Consumed
+        ));
+        assert!(refresh_changed_plugin_focus(&mut app, &host, before).await);
+        assert_eq!(
+            app.composer_panel_height(),
+            if app.plugin_focus.is_some() { 4 } else { 2 }
+        );
+    }
+    let before = app.plugin_focus;
+    app.route_plugin_key(KeyCode::Tab, KeyModifiers::NONE);
+    refresh_changed_plugin_focus(&mut app, &host, before).await;
+    for expected in [2, 4] {
+        let PluginKeyRoute::Input(input) =
+            app.route_plugin_key(KeyCode::Char(' '), KeyModifiers::NONE)
+        else {
+            panic!("空格交插件处理")
+        };
+        dispatch_plugin_input(&host, &input).await.unwrap();
+        refresh_plugin_views_for(&mut app, &host, &input.plugin_id).await;
+        assert_eq!(app.composer_panel_height(), expected);
+    }
+    for expected in [2, 4] {
+        let input = app
+            .route_plugin_mouse(&MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 2,
+                row: 15,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+        dispatch_plugin_input(&host, &input).await.unwrap();
+        refresh_plugin_views_for(&mut app, &host, &input.plugin_id).await;
+        assert_eq!(app.composer_panel_height(), expected);
+    }
+    let before = app.plugin_focus;
+    assert!(app
+        .route_plugin_mouse(&MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 2,
+            row: 22,
+            modifiers: KeyModifiers::NONE
+        })
+        .is_none());
+    assert!(refresh_changed_plugin_focus(&mut app, &host, before).await);
+    assert_eq!(app.composer_panel_height(), 2);
+    assert!(app.plugin_focus.is_none());
+    assert!(app.plugin_refresh_task.is_none());
+}
+
+/// 后台旧成功/失败都不能覆盖交互后的新帧；只刷新 A 时不得误作废 B 的在途结果。
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn stale_view_frames_cannot_undo_interactive_refresh() {
+    use crate::ui::plugin_bridge::refresh_plugin_view;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.plugin_views
+        .push(test_plugin_view(UiPlacement::ComposerShelf, "A"));
+    app.plugin_views
+        .push(test_plugin_view(UiPlacement::Top, "B"));
+    let old = app.plugin_render_requests();
+    app.mark_plugin_render_requests(&old);
+    app.plugin_focus = Some(0);
+    refresh_plugin_view(
+        &mut app,
+        &FocusShelfHost::default(),
+        "test-plugin",
+        "composershelf",
+    )
+    .await;
+    let fresh = app.plugin_views[0].frame.clone();
+    for result in [
+        Ok(Some(PluginUiFrame {
+            view_id: "composershelf".into(),
+            visible: false,
+            lines: Vec::new(),
+            cursor: None,
+        })),
+        Err(anyhow!("stale error")),
+    ] {
+        apply_plugin_frames(
+            &mut app,
+            vec![(
+                "test-plugin".into(),
+                "composershelf".into(),
+                None,
+                old[0].frame,
+                result,
+            )],
+        );
+        assert_eq!(app.plugin_views[0].frame, fresh);
+        assert_eq!(app.plugin_focus, Some(0));
+    }
+    let mut other = app.plugin_views[1].frame.clone().unwrap();
+    other.lines[0].spans[0].text = "B 已完成".into();
+    apply_plugin_frames(
+        &mut app,
+        vec![(
+            "test-plugin".into(),
+            "top".into(),
+            None,
+            old[1].frame,
+            Ok(Some(other.clone())),
+        )],
+    );
+    assert_eq!(app.plugin_views[1].frame, Some(other));
+}
+
+/// 同类型子视图切换实例时，已关闭实例的旧帧不能污染当前实例缓存。
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn stale_subview_frame_is_scoped_to_its_instance() {
+    use crate::ui::plugin_bridge::refresh_plugin_view;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.plugin_views
+        .push(test_plugin_view(UiPlacement::Subview, "详情"));
+    for id in ["instance-a", "instance-b"] {
+        app.apply_view_navigation(
+            "test-plugin",
+            UiNavigationRequest {
+                request_id: id.into(),
+                action: UiNavigationAction::Push {
+                    view: UiViewInstance {
+                        view_id: "subview".into(),
+                        instance_id: id.into(),
+                        title: None,
+                    },
+                },
+            },
+        )
+        .unwrap();
+        refresh_plugin_view(
+            &mut app,
+            &FocusShelfHost::default(),
+            "test-plugin",
+            "subview",
+        )
+        .await;
+    }
+    let fresh = app.view_stack.active().unwrap().frame().cloned();
+    apply_plugin_frames(
+        &mut app,
+        vec![(
+            "test-plugin".into(),
+            "subview".into(),
+            Some("instance-a".into()),
+            1,
+            Err(anyhow!("旧实例错误")),
+        )],
+    );
+    assert_eq!(app.view_stack.active().unwrap().frame(), fresh.as_ref());
+    assert_eq!(app.plugin_view_requests.len(), 1);
+}
+
+/// 接收端提前关闭时仍须完成同批其他渲染，不能通过丢弃 future 取消 WASM。
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn closed_ui_channel_still_drains_pending_plugin_renders() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct SlowFrameHost(Arc<AtomicUsize>);
+    #[async_trait]
+    impl agent_core::AgentExtension for SlowFrameHost {}
+    #[async_trait]
+    impl PluginHost for SlowFrameHost {
+        fn id(&self) -> Option<&str> {
+            Some("test-plugin")
+        }
+        async fn ui_declarations(&self) -> Result<Vec<UiDeclaration>> {
+            Ok([UiPlacement::Top, UiPlacement::ComposerShelf]
+                .into_iter()
+                .map(|placement| test_plugin_view(placement, "测试").declaration)
+                .collect())
+        }
+        async fn render_ui(
+            &self,
+            request: &agent_plugin_protocol::UiRenderRequest,
+        ) -> Result<Option<PluginUiFrame>> {
+            if request.view_id == "composershelf" {
+                tokio::task::yield_now().await;
+            }
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(rx);
+    let mut app = App::new(tx.clone(), "测试模型".into());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let host = Arc::new(LivePluginHost::new());
+    host.publish(Arc::new(SlowFrameHost(completed.clone())))
+        .unwrap();
+    app.add_plugin_views(host.ui_declarations().await.unwrap());
+    crate::ui::plugin_bridge::render_plugin_views(host, app.plugin_render_requests(), tx).await;
+    assert_eq!(completed.load(Ordering::SeqCst), 2);
+}
+
 /// 工具 renderer 返回的帧必须替换默认工具行并保持消息调用身份。
 #[tokio::test]
 #[cfg(feature = "plugins")]

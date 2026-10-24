@@ -337,6 +337,9 @@ pub(crate) struct App {
     /// 控制插件 UI 刷新频率的主循环 tick 计数。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_tick: u8,
+    /// 每个视图/实例最后实际派发的请求序号；防止旧后台帧覆盖用户操作后的新帧。
+    #[cfg(feature = "plugins")]
+    pub(crate) plugin_view_requests: BTreeMap<(String, String, Option<String>), u64>,
     /// 当前唯一的后台插件视图刷新任务。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_refresh_task: Option<tokio::task::JoinHandle<()>>,
@@ -655,6 +658,8 @@ impl App {
             plugin_frame: 0,
             #[cfg(feature = "plugins")]
             plugin_tick: 0,
+            #[cfg(feature = "plugins")]
+            plugin_view_requests: BTreeMap::new(),
             #[cfg(feature = "plugins")]
             plugin_refresh_task: None,
             #[cfg(feature = "plugins")]
