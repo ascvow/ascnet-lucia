@@ -6,7 +6,10 @@
 
 ## 决策
 
-Lucia 不会自主修改、生成、组合、升级或重新配置插件。插件系统、WASM Host、SDK、Manager、权限强制、人工安装更新、签名验证、Smoke Test、日志和 Incident 由人工流程维护。
+Lucia 不会自主修改、生成、组合、升级或重新配置插件。插件系统、WASM Host、SDK、Manager、权限强制、人工安装更新、制品校验、Smoke Test、日志和 Incident 由人工流程维护。
+
+当前 Manager 提供 SHA-256 完整性校验与授权摘要，不提供发布者数字签名认证。同来源的 checksum
+不是独立信任根；启用插件前仍需人工审查来源与能力。签名方案需要另外定义信任根、轮换和撤销。
 
 每个 Session 在启动时绑定一份插件环境：插件集合、版本、Bundle Digest、Manifest Digest、配置 Digest、Capability Profile Digest、加载顺序、Hook 顺序和 Capability Owner。人工插件写操作只影响后续新 Session，活动 Session 与已实例化的 Host 保持不变。
 
