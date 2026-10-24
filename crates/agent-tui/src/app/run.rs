@@ -60,8 +60,31 @@ impl RevealPacer {
         quota.min(backlog_chars)
     }
 
+    /// 按共享节拍取出一帧文本，超限积压先按 UTF-8 边界释放；主/子会话各自持有缓冲。
+    pub(super) fn take_chunk(&mut self, pending: &mut String, now: Instant) -> String {
+        if pending.is_empty() {
+            self.reset();
+            return String::new();
+        }
+        let mut forced = pending.len().saturating_sub(REVEAL_BACKLOG_LIMIT);
+        while !pending.is_char_boundary(forced) {
+            forced -= 1;
+        }
+        let remaining = &pending[forced..];
+        let quota = self.settle(remaining.chars().count(), now);
+        let paced = remaining
+            .char_indices()
+            .nth(quota)
+            .map_or(remaining.len(), |(index, _)| index);
+        let chunk = pending.drain(..forced + paced).collect();
+        if pending.is_empty() {
+            self.reset();
+        }
+        chunk
+    }
+
     /// 清空节拍状态：缓冲排空或越过一次显式补完的边界后调用。
-    fn reset(&mut self) {
+    pub(super) fn reset(&mut self) {
         self.last_settle = None;
         self.credit_milli = 0;
     }
@@ -465,6 +488,13 @@ impl App {
     ///
     /// 主循环据此决定要不要启用帧时钟：没有待揭示文本时保持纯事件驱动，不空转。
     pub(crate) fn has_pending_stream(&self) -> bool {
+        #[cfg(feature = "plugins")]
+        if self
+            .active_agent_session_view()
+            .is_some_and(|view| view.has_pending_stream())
+        {
+            return true;
+        }
         !self.pending_stream.is_empty()
     }
 
@@ -488,6 +518,14 @@ impl App {
     /// 与 [`Self::reveal_pending_stream`] 的唯一差别是时间来源：测试用虚拟时钟驱动，
     /// 才能断言"每帧吐几个字符"这种与真实时间相关的行为。
     pub(crate) fn reveal_pending_stream_at(&mut self, now: Instant) -> usize {
+        #[cfg(feature = "plugins")]
+        if self.active_agent_session_route().is_some() {
+            // 主会话在后台继续归档，不为不可见内容逐帧重绘。
+            self.flush_pending_stream();
+            return self
+                .active_agent_session_view_mut()
+                .map_or(0, |view| view.reveal_pending_stream_at(now));
+        }
         if self.pending_stream.is_empty() {
             self.reveal_pacer.reset();
             return 0;
@@ -498,38 +536,7 @@ impl App {
             self.reveal_pacer.reset();
             return 0;
         }
-        let mut revealed = 0;
-        // 背压路径按字节清空超出上限的积压，再回退到字符边界。
-        if self.pending_stream.len() > REVEAL_BACKLOG_LIMIT {
-            let mut end = self.pending_stream.len() - REVEAL_BACKLOG_LIMIT;
-            while end > 0 && !self.pending_stream.is_char_boundary(end) {
-                end -= 1;
-            }
-            revealed += self.drain_pending_stream(end);
-        }
-        // 节拍路径按字符结算：char_indices 的第 quota 个偏移正好是"前 quota 个字符"的
-        // 结束位置，因此不存在切开多字节字符的可能。
-        let backlog_chars = self.pending_stream.chars().count();
-        let quota = self.reveal_pacer.settle(backlog_chars, now);
-        if quota > 0 {
-            let end = self
-                .pending_stream
-                .char_indices()
-                .nth(quota)
-                .map_or(self.pending_stream.len(), |(index, _)| index);
-            revealed += self.drain_pending_stream(end);
-        }
-        revealed
-    }
-
-    /// 把揭示缓冲前 `bytes` 字节上屏，返回揭示的字符数。
-    ///
-    /// `bytes` 必须落在字符边界上，否则 `drain` 会 panic；两个调用点都保证了这一点。
-    fn drain_pending_stream(&mut self, bytes: usize) -> usize {
-        if bytes == 0 {
-            return 0;
-        }
-        let chunk: String = self.pending_stream.drain(..bytes).collect();
+        let chunk = self.reveal_pacer.take_chunk(&mut self.pending_stream, now);
         let revealed = chunk.chars().count();
         self.append_model_delta(&chunk);
         revealed

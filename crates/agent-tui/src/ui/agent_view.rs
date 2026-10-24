@@ -9,13 +9,14 @@ use crate::theme::{
     COLOR_WARNING, SPINNER,
 };
 use crate::ui::chat::{
-    input_pane_rows, render_input_pane, render_transcript_pane, InputPane, TranscriptPane,
+    conversation_sections, input_pane_rows, prompt_status_row, render_input_pane,
+    render_session_status_row, render_transcript_pane, InputPane, TranscriptPane,
 };
 use crate::ui::markdown::truncate_line;
 use crate::ui::plugin_render::render_subview_header;
 use agent_runtime::AgentStatus;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 /// 正文区上下留白行数，与主界面保持一致。
 const SESSION_PADDING_Y: u16 = 1;
@@ -27,12 +28,11 @@ pub(crate) fn render_agent_session_view(frame: &mut Frame, app: &mut App, outer:
     let spinner_frame = app.spinner_frame;
     let breadcrumbs = app.view_stack.breadcrumbs().join(" / ");
     render_subview_header(frame, &breadcrumbs, outer);
-    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(outer);
+    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(outer);
     // 与插件子视图一致：整屏只保留一条顶部分隔线，不额外包盒子。
     let block = Block::new()
         .borders(Borders::TOP)
-        .border_style(Style::new().fg(COLOR_SEPARATOR))
-        .padding(Padding::horizontal(1));
+        .border_style(Style::new().fg(COLOR_SEPARATOR));
     let body = block.inner(sections[1]);
     frame.render_widget(block, sections[1]);
 
@@ -63,17 +63,10 @@ pub(crate) fn render_agent_session_view(frame: &mut Frame, app: &mut App, outer:
         }
     };
     let text_width = usize::from(body.width.saturating_sub(2)).max(1);
-    let input_rows = input_pane_rows(&view.input, view.cursor, &[], &[], text_width)
-        .min(body.height.saturating_sub(6).clamp(1, 6));
-    let input_height = input_rows + 2;
-    let parts = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(1),
-        Constraint::Length(input_height),
-        Constraint::Length(1),
-    ])
-    .split(body);
-    let transcript_section = parts[0].inner(Margin {
+    let input_rows = input_pane_rows(&view.input, view.cursor, &[], &[], text_width);
+    let [chat_section, _, _, input_area, footer_area] =
+        conversation_sections(body, input_rows, 0, 0);
+    let transcript_section = chat_section.inner(Margin {
         horizontal: 0,
         vertical: SESSION_PADDING_Y,
     });
@@ -81,12 +74,13 @@ pub(crate) fn render_agent_session_view(frame: &mut Frame, app: &mut App, outer:
         width: transcript_section.width.saturating_sub(SCROLLBAR_WIDTH),
         ..transcript_section
     };
-    let status_area = parts[1];
-    let input_area = parts[2];
-    let footer_area = parts[3];
+    let status_area = prompt_status_row(chat_section, transcript_section);
 
     let mut below = None;
+    view.jump_hint_area = None;
+    view.scrollbar_area = None;
     if view.messages.is_empty() {
+        view.is_scrollbar_hovered = false;
         view.hit_regions.clear();
         view.last_max_scroll = 0;
         view.last_viewport = chat_area.height;
@@ -113,7 +107,9 @@ pub(crate) fn render_agent_session_view(frame: &mut Frame, app: &mut App, outer:
         let viewport = render_transcript_pane(frame, chat_area, pane);
         below = viewport.below;
     }
-    render_status_row(frame, status_area, view, spinner_frame, below);
+    if let Some(status_area) = status_area {
+        render_status_row(frame, status_area, view, spinner_frame, below);
+    }
 
     let input_pane = InputPane {
         input: &view.input,
@@ -179,11 +175,10 @@ fn render_empty_state(frame: &mut Frame, area: Rect, view: &AgentSessionView) {
 fn render_status_row(
     frame: &mut Frame,
     area: Rect,
-    view: &AgentSessionView,
+    view: &mut AgentSessionView,
     spinner_frame: usize,
     below: Option<u16>,
 ) {
-    frame.render_widget(Clear, area);
     let (mut label, color) = status_label(view);
     if !view.closed
         && matches!(
@@ -198,30 +193,16 @@ fn render_status_row(
             format_elapsed(elapsed)
         );
     }
-    let mut left = label.clone();
     if view.closed {
-        left.push_str("  · stream ended");
+        label.push_str("  · stream ended");
     }
-    let left_width = unicode_width::UnicodeWidthStr::width(left.as_str());
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(left, Style::new().fg(color)))),
+    render_session_status_row(
+        frame,
         area,
+        Some((label, color)),
+        below,
+        &mut view.jump_hint_area,
     );
-    if let Some(below) = below {
-        // 只在左侧状态之后确实还留得下提示时绘制，避免两段文字在窄终端里互相覆盖。
-        let available = usize::from(area.width).saturating_sub(left_width + 2);
-        if available >= 8 {
-            let hint = truncate_line(&format!("↓ {below} lines · End"), available);
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    hint,
-                    Style::new().fg(COLOR_WARNING),
-                )))
-                .alignment(Alignment::Right),
-                area,
-            );
-        }
-    }
 }
 
 /// 绘制底栏：目标 Agent 身份与操作提示。

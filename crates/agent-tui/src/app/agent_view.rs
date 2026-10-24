@@ -3,6 +3,7 @@
 //! 视图只承载**通用 Agent 语义**：显示目标 Agent 的事件时间线、编辑一条待提交正文、
 //! 提交后交给发起插件处理。成员目录、续跑与配额回收仍由插件负责，TUI 不复制这些规则。
 
+use super::input::{edit_text_input, scroll_transcript, ScrollAction, TranscriptScroll};
 use super::{App, ToolMessageHitRegion};
 use crate::event::UiEvent;
 use crate::session::conversation::{Msg, MsgKind};
@@ -42,6 +43,9 @@ pub(crate) struct AgentSessionView {
     pub(crate) messages: Vec<Msg>,
     /// 正在接收增量文本的助手消息索引。
     pub(crate) streaming_message: Option<usize>,
+    /// 揭示节拍和缓冲属于当前会话，不使用主会话的运行状态。
+    pending_stream: String,
+    reveal_pacer: super::run::RevealPacer,
     /// 待提交正文与 UTF-8 字节光标。
     pub(crate) input: String,
     pub(crate) cursor: usize,
@@ -65,6 +69,12 @@ pub(crate) struct AgentSessionView {
     pub(crate) scrollbar_area: Option<Rect>,
     /// 滚动条是否悬停。
     pub(crate) is_scrollbar_hovered: bool,
+    /// 当前视图的拖拽状态，不能借用主会话的抓取点。
+    pub(crate) scrollbar_drag: bool,
+    scrollbar_grab_half: Option<i32>,
+    /// 回到底部提示的点击热区。
+    pub(crate) jump_hint_area: Option<Rect>,
+    tool_click_candidate: Option<usize>,
     /// Runtime 侧的当前状态。
     pub(crate) status: Option<AgentStatus>,
     /// 状态最近一次变化的时间，用于显示运行耗时。
@@ -142,6 +152,8 @@ impl AgentSessionView {
             api,
             messages: Vec::new(),
             streaming_message: None,
+            pending_stream: String::new(),
+            reveal_pacer: super::run::RevealPacer::default(),
             input: String::new(),
             cursor: 0,
             scroll: None,
@@ -154,6 +166,10 @@ impl AgentSessionView {
             content_rows: 0,
             scrollbar_area: None,
             is_scrollbar_hovered: false,
+            scrollbar_drag: false,
+            scrollbar_grab_half: None,
+            jump_hint_area: None,
+            tool_click_candidate: None,
             status: None,
             status_since: Instant::now(),
             last_notice: None,
@@ -178,6 +194,11 @@ impl AgentSessionView {
         if self.target == target {
             return;
         }
+        self.flush_pending_stream();
+        self.streaming_message = None;
+        self.scrollbar_drag = false;
+        self.scrollbar_grab_half = None;
+        self.tool_click_candidate = None;
         self.target = target;
         self.closed = false;
         self.status = None;
@@ -213,8 +234,17 @@ impl AgentSessionView {
         }
     }
 
-    /// 把事件追加进时间线；未知事件类型直接忽略，保持前向兼容。
+    /// 应用事件；正文进入揭示缓冲，结构边界先补完正文，未知事件仍可前向兼容。
     pub(crate) fn apply_event(&mut self, event: &AgentEvent) {
+        if matches!(
+            event.kind,
+            AgentEventKind::ModelRequest
+                | AgentEventKind::ToolStarted
+                | AgentEventKind::ToolSkipped
+                | AgentEventKind::RunFinished
+        ) {
+            self.flush_pending_stream();
+        }
         match event.kind {
             AgentEventKind::ModelRequest => {
                 // 新一轮模型请求：上一段助手正文已经结束，后续增量写入新消息。
@@ -222,7 +252,7 @@ impl AgentSessionView {
             }
             AgentEventKind::ModelTextDelta => {
                 if let Some(delta) = event.payload.get("delta").and_then(Value::as_str) {
-                    self.append_assistant(delta);
+                    self.pending_stream.push_str(delta);
                 }
             }
             AgentEventKind::ToolStarted => {
@@ -287,6 +317,26 @@ impl AgentSessionView {
         }
     }
 
+    /// 返回是否需要启用显示帧时钟，空缓冲不空转。
+    pub(crate) fn has_pending_stream(&self) -> bool {
+        !self.pending_stream.is_empty()
+    }
+
+    /// 使用与主会话相同的墙钟配额揭示文本，返回本帧显示的字符数。
+    pub(crate) fn reveal_pending_stream_at(&mut self, now: Instant) -> usize {
+        let chunk = self.reveal_pacer.take_chunk(&mut self.pending_stream, now);
+        let count = chunk.chars().count();
+        self.append_assistant(&chunk);
+        count
+    }
+
+    /// 在结构边界或隐藏时直接补完；不改变滚动位置，也不丢弃已收到的事件。
+    pub(crate) fn flush_pending_stream(&mut self) {
+        self.reveal_pacer.reset();
+        let chunk = std::mem::take(&mut self.pending_stream);
+        self.append_assistant(&chunk);
+    }
+
     /// 追加一段助手正文；需要时创建新的助手消息。
     fn append_assistant(&mut self, delta: &str) {
         if delta.is_empty() {
@@ -325,6 +375,7 @@ impl AgentSessionView {
 
     /// 追加一条本地用户消息，表示用户已提交给该 Agent。
     pub(crate) fn record_user_message(&mut self, text: String) {
+        self.flush_pending_stream();
         self.streaming_message = None;
         self.messages.push(Msg::new(MsgKind::User, text));
         self.scroll = None;
@@ -338,12 +389,14 @@ impl AgentSessionView {
         if self.last_notice.as_deref() == Some(notice.as_str()) {
             return;
         }
+        self.flush_pending_stream();
         self.messages.push(Msg::new(MsgKind::Error, notice.clone()));
         self.last_notice = Some(notice);
     }
 
     /// 追加一条仅用于本视图的状态说明。
     pub(crate) fn push_info(&mut self, text: impl Into<String>) {
+        self.flush_pending_stream();
         self.messages.push(Msg::new(MsgKind::Info, text));
     }
 
@@ -352,6 +405,7 @@ impl AgentSessionView {
         if self.closed {
             return;
         }
+        self.flush_pending_stream();
         self.closed = true;
         self.streaming_message = None;
         if let Some(status) = status {
@@ -362,14 +416,10 @@ impl AgentSessionView {
         }
     }
 
-    /// 按行调整回看位置；正值向更早内容回看。
-    pub(crate) fn scroll_by(&mut self, lines: i32) {
-        let current = i32::from(self.scroll.unwrap_or(self.last_max_scroll));
-        let next = (current + lines).clamp(0, i32::from(self.last_max_scroll));
-        self.scroll = Some(u16::try_from(next).unwrap_or(0));
-        if next >= i32::from(self.last_max_scroll) {
-            self.scroll = None;
-        }
+    /// 按共享动作调整回看位置，不影响其他会话。
+    pub(super) fn scroll_transcript(&mut self, action: ScrollAction) {
+        self.tool_click_candidate = None;
+        scroll_transcript(&mut self.scroll, self.last_max_scroll, action);
     }
 
     /// 跳到内容顶部。
@@ -484,6 +534,18 @@ impl App {
                 route.plugin_id == view.plugin_id && route.instance_id == view.instance_id
             })
         });
+        let active = self.active_agent_session_route();
+        for view in &mut self.agent_views {
+            if !active.as_ref().is_some_and(|route| {
+                route.plugin_id == view.plugin_id && route.instance_id == view.instance_id
+            }) {
+                view.flush_pending_stream();
+                view.scrollbar_drag = false;
+                view.scrollbar_grab_half = None;
+                view.tool_click_candidate = None;
+                view.is_scrollbar_hovered = false;
+            }
+        }
         for route in routes {
             let existing = self.agent_views.iter().position(|view| {
                 view.plugin_id == route.plugin_id && view.instance_id == route.instance_id
@@ -585,6 +647,9 @@ impl App {
         target: &AgentId,
         events: Vec<AgentEvent>,
     ) {
+        let visible = self
+            .active_agent_session_route()
+            .is_some_and(|route| route.plugin_id == plugin_id && route.instance_id == instance_id);
         let Some(view) = self.agent_view_mut(plugin_id, instance_id) else {
             return;
         };
@@ -594,8 +659,19 @@ impl App {
         for event in &events {
             view.apply_event(event);
         }
-        if let Ok(snapshot) = view.api().status(target).await {
-            view.set_status(snapshot.status);
+        if !visible {
+            view.flush_pending_stream();
+        }
+        // 运行状态只在结构边界刷新，不为每批文本额外调用 Runtime。
+        if events.iter().any(|event| {
+            matches!(
+                event.kind,
+                AgentEventKind::RunStarted | AgentEventKind::RunFinished
+            )
+        }) {
+            if let Ok(snapshot) = view.api().status(target).await {
+                view.set_status(snapshot.status);
+            }
         }
     }
 
@@ -643,12 +719,8 @@ impl App {
             // 状态尚未建立时吞掉其余按键，避免落到主输入框。
             return AgentViewKeyOutcome::Consumed;
         };
-        // 多行编辑键与主输入框保持一致，避免用户在两处得到不同手感。
-        if (matches!(code, KeyCode::Enter)
-            && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
-            || (super::is_command_modifier(modifiers) && matches!(code, KeyCode::Char('j')))
-        {
-            view.insert_text("\n");
+        // 只共享纯文本编辑；提交/返回仍路由给发起插件，不调用主 Agent。
+        if edit_text_input(&mut view.input, &mut view.cursor, code, modifiers).is_some() {
             return AgentViewKeyOutcome::Consumed;
         }
         match code {
@@ -675,82 +747,68 @@ impl App {
                     return AgentViewKeyOutcome::Consumed;
                 }
             }
-            KeyCode::Char('a') if super::is_command_modifier(modifiers) => {
-                view.cursor = view.current_line_start();
-                return AgentViewKeyOutcome::Consumed;
-            }
-            KeyCode::Char('e') if super::is_command_modifier(modifiers) => {
-                view.cursor = view.current_line_end();
-                return AgentViewKeyOutcome::Consumed;
-            }
-            KeyCode::Char('w') if super::is_command_modifier(modifiers) => {
-                view.delete_previous_word();
-                return AgentViewKeyOutcome::Consumed;
-            }
-            KeyCode::Char('u') if super::is_command_modifier(modifiers) => {
-                let start = view.current_line_start();
-                view.input.replace_range(start..view.cursor, "");
-                view.cursor = start;
-                return AgentViewKeyOutcome::Consumed;
-            }
-            KeyCode::Char(character) if !super::is_command_modifier(modifiers) => {
-                // 只接收无命令修饰键的可打印字符；Alt/Option 组合留给终端自己处理。
-                if !modifiers.contains(KeyModifiers::ALT) {
-                    view.insert_text(&character.to_string());
-                }
-                return AgentViewKeyOutcome::Consumed;
-            }
-            KeyCode::Backspace => view.delete_previous_char(),
-            KeyCode::Delete => view.delete_next_char(),
-            KeyCode::Left => view.cursor = view.previous_boundary(),
-            KeyCode::Right => view.cursor = view.next_boundary(),
-            // 多行草稿优先按视觉行移动光标；单行时退化为滚动一屏的行数。
-            KeyCode::Up => {
-                if !(view.input.contains('\n')
-                    && super::input::move_cursor_vertically(&view.input, &mut view.cursor, true))
-                {
-                    view.scroll_by(1);
-                }
-            }
-            KeyCode::Down => {
-                if !(view.input.contains('\n')
-                    && super::input::move_cursor_vertically(&view.input, &mut view.cursor, false))
-                {
-                    view.scroll_by(-1);
-                }
-            }
             // 与主界面一致：Home/End 编辑光标，Ctrl+Home/End 回到内容首尾。
             KeyCode::Home if super::is_command_modifier(modifiers) => view.scroll_to_top(),
             KeyCode::End if super::is_command_modifier(modifiers) => view.scroll_to_bottom(),
-            KeyCode::Home => view.cursor = view.current_line_start(),
-            KeyCode::End => view.cursor = view.current_line_end(),
-            KeyCode::PageUp => view.scroll_by(i32::from(view.last_viewport.max(1))),
-            KeyCode::PageDown => view.scroll_by(-i32::from(view.last_viewport.max(1))),
+            KeyCode::PageUp => view.scroll_transcript(ScrollAction::Up(
+                view.last_viewport.saturating_sub(1).max(1),
+            )),
+            KeyCode::PageDown => view.scroll_transcript(ScrollAction::Down(
+                view.last_viewport.saturating_sub(1).max(1),
+            )),
             _ => {}
         }
         AgentViewKeyOutcome::Consumed
     }
 
-    /// 处理原生会话视图内的鼠标事件：滚轮滚动与工具消息展开。
+    /// 处理原生会话鼠标事件；与主会话共享轨道几何和滚动动作。
     pub(crate) fn handle_agent_session_mouse(&mut self, mouse: &MouseEvent) {
         let Some(view) = self.active_agent_session_view_mut() else {
             return;
         };
+        let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+        let consumed = TranscriptScroll {
+            scroll: &mut view.scroll,
+            max_scroll: view.last_max_scroll,
+            viewport: view.last_viewport,
+            area: view.scrollbar_area,
+            dragging: &mut view.scrollbar_drag,
+            grab_half: &mut view.scrollbar_grab_half,
+        }
+        .handle_mouse(mouse);
+        if consumed {
+            view.tool_click_candidate = None;
+            return;
+        }
+        let tool_at_pointer = view
+            .hit_regions
+            .iter()
+            .find(|region| region.area.contains(position))
+            .map(|region| region.message_index);
         match mouse.kind {
-            MouseEventKind::ScrollUp => view.scroll_by(3),
-            MouseEventKind::ScrollDown => view.scroll_by(-3),
+            MouseEventKind::ScrollUp => view.scroll_transcript(ScrollAction::Up(3)),
+            MouseEventKind::ScrollDown => view.scroll_transcript(ScrollAction::Down(3)),
             MouseEventKind::Down(MouseButton::Left) => {
-                let hit = view.hit_regions.iter().find(|region| {
-                    mouse.column >= region.area.x
-                        && mouse.column < region.area.right()
-                        && mouse.row >= region.area.y
-                        && mouse.row < region.area.bottom()
-                });
-                if let Some(region) = hit {
-                    if let Some(message) = view.messages.get_mut(region.message_index) {
+                if view
+                    .jump_hint_area
+                    .is_some_and(|area| area.contains(position))
+                {
+                    view.scroll_to_bottom();
+                    view.tool_click_candidate = None;
+                } else {
+                    view.tool_click_candidate = tool_at_pointer;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => view.tool_click_candidate = None,
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(index) = view
+                    .tool_click_candidate
+                    .take()
+                    .filter(|index| Some(*index) == tool_at_pointer)
+                {
+                    if let Some(message) = view.messages.get_mut(index) {
                         message.tool_expanded = !message.tool_expanded;
-                        // 展开会改变高度：滚动位置回到贴底，避免停留在中间内容上。
-                        view.scroll = None;
+                        // 只切换展开状态；回看历史时不强行恢复贴底。
                     }
                 }
             }
@@ -772,63 +830,6 @@ impl AgentSessionView {
     fn insert_text(&mut self, text: &str) {
         self.input.insert_str(self.cursor, text);
         self.cursor += text.len();
-    }
-
-    /// 删除光标前一个字符。
-    fn delete_previous_char(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let previous = self.previous_boundary();
-        self.input.replace_range(previous..self.cursor, "");
-        self.cursor = previous;
-    }
-
-    /// 删除光标前一个单词。
-    fn delete_previous_word(&mut self) {
-        let start = super::input::previous_word_boundary(&self.input, self.cursor);
-        if start < self.cursor {
-            self.input.replace_range(start..self.cursor, "");
-            self.cursor = start;
-        }
-    }
-
-    /// 删除光标后一个字符。
-    fn delete_next_char(&mut self) {
-        let next = self.next_boundary();
-        if next > self.cursor {
-            self.input.replace_range(self.cursor..next, "");
-        }
-    }
-
-    /// 返回光标前一个字符边界。
-    fn previous_boundary(&self) -> usize {
-        self.input[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map_or(0, |(index, _)| index)
-    }
-
-    /// 返回光标后一个字符边界。
-    fn next_boundary(&self) -> usize {
-        self.input[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map_or(self.input.len(), |(index, _)| self.cursor + index)
-    }
-
-    /// 返回当前逻辑行行首。
-    fn current_line_start(&self) -> usize {
-        self.input[..self.cursor]
-            .rfind('\n')
-            .map_or(0, |index| index + 1)
-    }
-
-    /// 返回当前逻辑行行尾。
-    fn current_line_end(&self) -> usize {
-        self.input[self.cursor..]
-            .find('\n')
-            .map_or(self.input.len(), |index| self.cursor + index)
     }
 }
 

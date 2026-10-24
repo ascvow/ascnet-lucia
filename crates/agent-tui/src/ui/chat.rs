@@ -139,9 +139,8 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
         &app.attachments,
         &app.refs,
         input_text_width,
-    )
-    .min(workspace.height.saturating_sub(6).clamp(1, 6));
-    let input_height = input_rows + 2;
+    );
+    let input_height = conversation_sections(workspace, input_rows, 0, 0)[3].height;
     #[cfg(feature = "plugins")]
     let timeline_uses_snapshot = app.main_event_snapshot.is_some();
     #[cfg(feature = "plugins")]
@@ -175,21 +174,8 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
                 .height
                 .saturating_sub(input_height.saturating_add(5)),
         );
-    let sections = Layout::vertical([
-        Constraint::Min(4),
-        Constraint::Length(panel_height),
-        Constraint::Length(queued_height),
-        Constraint::Length(input_height),
-        Constraint::Length(1),
-    ])
-    .split(workspace);
-    let (chat_section, panel_section, queued_section, input_section, footer_section) = (
-        sections[0],
-        sections[1],
-        sections[2],
-        sections[3],
-        sections[4],
-    );
+    let [chat_section, panel_section, queued_section, input_section, footer_section] =
+        conversation_sections(workspace, input_rows, panel_height, queued_height);
     // 每帧重建排队消息的点击热区；面板不存在时不能让上一帧的矩形继续响应点击。
     app.queued_input_areas.clear();
 
@@ -458,6 +444,36 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
     input_section
 }
 
+/// 分配共享会话的正文、面板、队列、输入框与底栏矩形。
+///
+/// 高度紧张时先牺牲面板与正文，保留完整输入框；插件原生会话传零面板/队列高度，
+/// 不借用主会话的插件状态。返回顺序固定，极小区域允许零高矩形。
+pub(crate) fn conversation_sections(
+    area: Rect,
+    input_rows: u16,
+    panel_height: u16,
+    queued_height: u16,
+) -> [Rect; 5] {
+    let footer = u16::from(area.height >= 4);
+    let reserve = if area.height >= 8 { 5 } else { footer };
+    let input = input_rows
+        .clamp(1, 6)
+        .saturating_add(2)
+        .min(area.height.saturating_sub(reserve))
+        .min(area.height);
+    let available = area.height.saturating_sub(input + footer);
+    let extra = available.saturating_sub(4);
+    let panel = panel_height.min(extra);
+    let queued = queued_height.min(extra.saturating_sub(panel));
+    let heights = [available - panel - queued, panel, queued, input, footer];
+    let mut y = area.y;
+    heights.map(|height| {
+        let rect = Rect::new(area.x, y, area.width, height);
+        y = y.saturating_add(height);
+        rect
+    })
+}
+
 /// 输入盒的可编辑状态；主界面与原生 Agent 会话视图共用同一份渲染输入。
 pub(crate) struct InputPane<'a> {
     /// 完整输入文本。
@@ -540,7 +556,12 @@ fn render_queued_inputs(frame: &mut Frame, area: Rect, app: &mut App) {
     app.queued_input_areas = areas;
 }
 
+/// 渲染共享输入框并返回内容区域；空间不足以容纳边框时显示尺寸提示，不发布越界光标。
 pub(crate) fn render_input_pane(frame: &mut Frame, area: Rect, pane: &InputPane<'_>) -> Rect {
+    if area.height < 3 || area.width < 4 {
+        frame.render_widget(Paragraph::new("Window too small"), area);
+        return Rect::new(area.x, area.y, 0, 0);
+    }
     let text_width = usize::from(area.width.saturating_sub(2)).max(1);
     let (wrapped_input, input_cursor) = wrap_input(
         pane.input,
@@ -735,7 +756,7 @@ pub(crate) fn render_transcript_pane(
 /// 取正文区与输入盒之间那一行留白：位置只由布局决定，日志滚动与输入框长高都不会移动它。
 /// 宽度铺满整行（含让给滚动条的那一列），右对齐的提示才能与输入盒右边框齐平。
 /// 正文区高度不足、没有留白行时返回 `None`，此时状态与提示都不绘制。
-fn prompt_status_row(section: Rect, padded: Rect) -> Option<Rect> {
+pub(super) fn prompt_status_row(section: Rect, padded: Rect) -> Option<Rect> {
     (padded.height > 0 && padded.bottom() < section.bottom()).then_some(Rect {
         x: padded.x,
         y: padded.bottom(),
@@ -755,8 +776,25 @@ fn prompt_status_row(section: Rect, padded: Rect) -> Option<Rect> {
 ///
 /// `below` 是正文下方还有多少行没有显示；`None` 表示已在底部，右侧留空。
 fn render_prompt_status_row(frame: &mut Frame, app: &mut App, area: Rect, below: Option<u16>) {
+    render_session_status_row(
+        frame,
+        area,
+        prompt_status_text(app),
+        below,
+        &mut app.jump_hint_area,
+    );
+}
+
+/// 绘制当前会话的状态和跳转提示，并发布与显示一致的点击热区；不读取主会话业务状态。
+pub(super) fn render_session_status_row(
+    frame: &mut Frame,
+    area: Rect,
+    activity: Option<(String, Color)>,
+    below: Option<u16>,
+    jump_hint_area: &mut Option<Rect>,
+) {
+    *jump_hint_area = None;
     frame.render_widget(Clear, area);
-    let activity = prompt_status_text(app);
     let min_status_width = if activity.is_some() {
         u16::try_from(MIN_STATUS_WIDTH).unwrap_or(u16::MAX)
     } else {
@@ -787,7 +825,7 @@ fn render_prompt_status_row(frame: &mut Frame, app: &mut App, area: Rect, below:
                 )),
                 hint_area,
             );
-            app.jump_hint_area = Some(hint_area);
+            *jump_hint_area = Some(hint_area);
             used = width;
         }
     }
@@ -1429,6 +1467,77 @@ fn render_hero(frame: &mut Frame, area: Rect, cwd: &str) {
         Paragraph::new(lines).alignment(Alignment::Center),
         hero_area,
     );
+}
+
+#[cfg(test)]
+mod conversation_layout_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// 主/子会话使用同一分区算法，小窗口先保留完整输入框而不是切掉底边。
+    #[test]
+    fn conversation_sections_preserve_composer_and_bounds() {
+        for height in 0..40 {
+            for rows in 1..=9 {
+                let area = Rect::new(2, 1, 32, height);
+                for panel in [0, 6] {
+                    let sections = conversation_sections(area, rows, panel, 3);
+                    assert_eq!(sections.iter().map(|rect| rect.height).sum::<u16>(), height);
+                    for rect in sections {
+                        assert!(rect.bottom() <= area.bottom());
+                    }
+                    if height >= 4 {
+                        assert!(sections[3].height >= 3);
+                        assert_eq!(sections[4].height, 1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 中文/emoji/多行输入在不同高度下始终保持光标与上下边框可见。
+    #[test]
+    fn shared_composer_keeps_unicode_cursor_inside_borders() {
+        for (width, height) in [(20, 4), (32, 8), (80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let text = "第一行🙂很长很长的中文文本\n第二行\n第三行末尾";
+            let area = Rect::new(0, 0, width, height);
+            let rows = input_pane_rows(
+                text,
+                text.len(),
+                &[],
+                &[],
+                usize::from(width.saturating_sub(2)),
+            );
+            let sections = conversation_sections(area, rows, 0, 0);
+            terminal
+                .draw(|frame| {
+                    render_input_pane(
+                        frame,
+                        sections[3],
+                        &InputPane {
+                            input: text,
+                            cursor: text.len(),
+                            attachments: &[],
+                            refs: &[],
+                            placeholder: "输入",
+                            focused: true,
+                            running: true,
+                            confirmation_pending: false,
+                        },
+                    );
+                })
+                .unwrap();
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert!(cursor.y > sections[3].y && cursor.y < sections[3].bottom() - 1);
+            assert!(cursor.x < width);
+            let buffer = terminal.backend().buffer();
+            for x in 0..width {
+                assert_eq!(buffer[(x, sections[3].y)].symbol(), "─");
+                assert_eq!(buffer[(x, sections[3].bottom() - 1)].symbol(), "─");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

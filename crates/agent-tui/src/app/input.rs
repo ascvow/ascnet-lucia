@@ -53,14 +53,12 @@ impl App {
         }
         self.last_exit_request_at = None;
         // Ctrl+D 是终端约定的 EOF：空输入直接退出，有内容时按 readline 语义前向删除。
-        if is_command_modifier(modifiers) && matches!(code, KeyCode::Char('d')) {
-            if self.input.is_empty() && self.attachments.is_empty() {
-                self.should_quit = true;
-            } else if let Some(next) = self.input[self.cursor..].chars().next() {
-                let end = self.cursor + next.len_utf8();
-                self.input.replace_range(self.cursor..end, "");
-                self.finish_input_edit();
-            }
+        if is_command_modifier(modifiers)
+            && matches!(code, KeyCode::Char('d'))
+            && self.input.is_empty()
+            && self.attachments.is_empty()
+        {
+            self.should_quit = true;
             return;
         }
         if is_command_modifier(modifiers) && matches!(code, KeyCode::Char('y')) {
@@ -100,63 +98,30 @@ impl App {
             self.focus_queue();
             return;
         }
-        // 多行编辑键优先于命令预览，避免补全弹层吞掉换行手势。
-        // Shift+Enter 依赖键盘增强协议；Alt+Enter 与 Ctrl+J 在传统终端也可用。
-        if (matches!(code, KeyCode::Enter)
-            && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
-            || (is_command_modifier(modifiers) && matches!(code, KeyCode::Char('j')))
-        {
-            self.insert_input_text("\n");
+        // 历史与附件归主会话所有；其余纯文本编辑与插件原生会话共用。
+        let history_key = matches!(code, KeyCode::Up | KeyCode::Down)
+            && (self.input_history_cursor.is_some() || self.input.is_empty());
+        if code == KeyCode::Backspace && self.remove_attachment_before_cursor() {
+            self.finish_input_edit();
             return;
+        }
+        if !history_key {
+            if let Some(changed) =
+                edit_text_input(&mut self.input, &mut self.cursor, code, modifiers)
+            {
+                if changed {
+                    self.finish_input_edit();
+                }
+                return;
+            }
         }
 
         match code {
-            KeyCode::Char('w') if is_command_modifier(modifiers) => {
-                let start = previous_word_boundary(&self.input, self.cursor);
-                if start < self.cursor {
-                    self.input.replace_range(start..self.cursor, "");
-                    self.cursor = start;
-                    self.finish_input_edit();
-                }
-            }
-            // readline 行内编辑：终端用户的肌肉记忆，缺失时只能靠退格逐字删。
-            KeyCode::Char('a') if is_command_modifier(modifiers) => {
-                self.cursor = self.current_line_start();
-            }
-            KeyCode::Char('e') if is_command_modifier(modifiers) => {
-                self.cursor = self.current_line_end();
-            }
-            KeyCode::Char('u') if is_command_modifier(modifiers) => {
-                let start = self.current_line_start();
-                if start < self.cursor {
-                    self.input.replace_range(start..self.cursor, "");
-                    self.cursor = start;
-                    self.finish_input_edit();
-                }
-            }
-            KeyCode::Char('k') if is_command_modifier(modifiers) => {
-                let end = self.current_line_end();
-                if end > self.cursor {
-                    self.input.replace_range(self.cursor..end, "");
-                    self.finish_input_edit();
-                }
-            }
             KeyCode::Home if is_command_modifier(modifiers) => {
                 self.scroll_up(u16::MAX);
             }
             KeyCode::End if is_command_modifier(modifiers) => {
                 self.scroll = None;
-            }
-            // Alt 与 Ctrl 都映射为按词移动：不同终端对这两个修饰键的上报并不一致。
-            KeyCode::Left
-                if modifiers.contains(KeyModifiers::ALT) || is_command_modifier(modifiers) =>
-            {
-                self.cursor = previous_word_boundary(&self.input, self.cursor);
-            }
-            KeyCode::Right
-                if modifiers.contains(KeyModifiers::ALT) || is_command_modifier(modifiers) =>
-            {
-                self.cursor = next_word_boundary(&self.input, self.cursor);
             }
             KeyCode::Enter => {
                 // 后台命令可能随时替换会话记录，期间禁止并发提交新消息。
@@ -211,71 +176,8 @@ impl App {
             }
             KeyCode::PageUp => self.scroll_up(self.last_viewport.saturating_sub(1).max(1)),
             KeyCode::PageDown => self.scroll_down(self.last_viewport.saturating_sub(1).max(1)),
-            KeyCode::Up => {
-                if self.input_history_cursor.is_some() {
-                    self.recall_older_input();
-                } else if !(self.input.contains('\n')
-                    && move_cursor_vertically(&self.input, &mut self.cursor, true))
-                {
-                    // 空输入框直接回填最近一次提交；非空单行草稿不得被历史覆盖。
-                    if self.input.is_empty() {
-                        self.recall_older_input();
-                    }
-                }
-            }
-            KeyCode::Down => {
-                if self.input_history_cursor.is_some() {
-                    self.recall_newer_input();
-                } else if !(self.input.contains('\n')
-                    && move_cursor_vertically(&self.input, &mut self.cursor, false))
-                {
-                    // 未处于历史回溯态时向下键不修改当前草稿。
-                }
-            }
-            KeyCode::Char(c) => {
-                let mut encoded = [0; 4];
-                self.insert_input_text(c.encode_utf8(&mut encoded));
-            }
-            KeyCode::Backspace => {
-                // 光标紧跟附件引用标签时整体删除标签与附件。
-                if !self.remove_attachment_before_cursor() {
-                    if let Some(prev) = self.input[..self.cursor].chars().last() {
-                        self.cursor -= prev.len_utf8();
-                        self.input.remove(self.cursor);
-                    }
-                    self.prune_attachments();
-                }
-                self.finish_input_edit();
-            }
-            KeyCode::Delete => {
-                if let Some(next) = self.input[self.cursor..].chars().next() {
-                    let end = self.cursor + next.len_utf8();
-                    self.input.replace_range(self.cursor..end, "");
-                    self.finish_input_edit();
-                }
-            }
-            KeyCode::Left => {
-                if let Some(prev) = self.input[..self.cursor].chars().last() {
-                    self.cursor -= prev.len_utf8();
-                }
-            }
-            KeyCode::Right => {
-                if let Some(next) = self.input[self.cursor..].chars().next() {
-                    self.cursor += next.len_utf8();
-                }
-            }
-            KeyCode::Home => {
-                // 多行输入时回到当前逻辑行行首；单行输入等价于整段开头。
-                self.cursor = self.input[..self.cursor]
-                    .rfind('\n')
-                    .map_or(0, |index| index + 1);
-            }
-            KeyCode::End => {
-                // 多行输入时到当前逻辑行行尾；单行输入等价于整段末尾。
-                self.cursor = self.input[self.cursor..]
-                    .find('\n')
-                    .map_or(self.input.len(), |index| self.cursor + index);
-            }
+            KeyCode::Up => self.recall_older_input(),
+            KeyCode::Down => self.recall_newer_input(),
             _ => {}
         }
     }
@@ -348,20 +250,6 @@ impl App {
             MsgKind::Info,
             format!("按键：{combination} · {recognized}"),
         ));
-    }
-
-    /// 返回光标所在逻辑行的起始字节位置。
-    fn current_line_start(&self) -> usize {
-        self.input[..self.cursor]
-            .rfind('\n')
-            .map_or(0, |index| index + 1)
-    }
-
-    /// 返回光标所在逻辑行的结束字节位置。
-    fn current_line_end(&self) -> usize {
-        self.input[self.cursor..]
-            .find('\n')
-            .map_or(self.input.len(), |index| self.cursor + index)
     }
 
     /// 中断当前运行：关闭可见流、标记未完成工具为跳过，并通知 Agent 取消。
@@ -527,6 +415,18 @@ impl App {
             return false;
         }
         let position = Position::new(mouse.column, mouse.row);
+        #[cfg(feature = "plugins")]
+        if self.active_agent_session_route().is_some() {
+            let Some(view) = self.active_agent_session_view_mut() else {
+                return false;
+            };
+            let hovered = view
+                .scrollbar_area
+                .is_some_and(|area| area.contains(position));
+            let changed = hovered != view.is_scrollbar_hovered;
+            view.is_scrollbar_hovered = hovered;
+            return changed;
+        }
         let scrollbar_hovered = self
             .scrollbar_area
             .is_some_and(|area| area.contains(position));
@@ -547,91 +447,20 @@ impl App {
     /// 按在滑块内时只记录抓取点、不改变滚动位置；按在轨道空白处才把滑块顶端对齐到
     /// 指针。拖动阶段按指针位移平移滑块，抓住滑块的任何位置都不会在按下瞬间跳动。
     pub(crate) fn handle_scrollbar_drag(&mut self, mouse: &MouseEvent) -> bool {
-        use crossterm::event::MouseButton;
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                let Some((area, thumb)) = self.scrollbar_geometry() else {
-                    return false;
-                };
-                if !area.contains(Position::new(mouse.column, mouse.row)) {
-                    return false;
-                }
-                self.dismiss_text_selection();
-                self.tool_click_candidate = None;
-                self.scrollbar_drag = true;
-                let first = area.y.saturating_add(thumb.first_row());
-                let last = area.y.saturating_add(thumb.last_row());
-                if (first..=last).contains(&mouse.row) {
-                    // 抓住滑块：保留指针相对滑块顶端的半行偏移，按下时刻不滚动。
-                    let grab =
-                        2 * i32::from(mouse.row.saturating_sub(area.y)) - i32::from(thumb.top_half);
-                    self.scrollbar_grab_half = Some(grab);
-                } else {
-                    // 点击轨道空白：滑块顶端对齐指针，随后从零偏移开始拖动。
-                    self.scrollbar_grab_half = Some(0);
-                    self.scrub_to_top_half(2 * i32::from(mouse.row.saturating_sub(area.y)));
-                }
-                true
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if !self.scrollbar_drag {
-                    return false;
-                }
-                let Some(area) = self.scrollbar_area else {
-                    return false;
-                };
-                let grab = self.scrollbar_grab_half.unwrap_or(0);
-                let top_half = 2 * i32::from(mouse.row.saturating_sub(area.y)) - grab;
-                self.scrub_to_top_half(top_half);
-                true
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                self.scrollbar_grab_half = None;
-                std::mem::take(&mut self.scrollbar_drag)
-            }
-            _ => false,
+        let consumed = TranscriptScroll {
+            scroll: &mut self.scroll,
+            max_scroll: self.last_max_scroll,
+            viewport: self.last_viewport,
+            area: self.scrollbar_area,
+            dragging: &mut self.scrollbar_drag,
+            grab_half: &mut self.scrollbar_grab_half,
         }
-    }
-
-    /// 计算主滚动条当前帧的轨道与滑块几何。
-    ///
-    /// 渲染层用 `scrollbar_thumb` 画滑块；输入侧用同一函数和相同的滚动几何重算一次，
-    /// 不额外保存屏幕坐标，拖动与显示就不会出现两套判断。内容未溢出或轨道尚未发布时
-    /// 返回 `None`。
-    fn scrollbar_geometry(&self) -> Option<(Rect, ScrollbarThumb)> {
-        let area = self.scrollbar_area?;
-        let viewport = self.last_viewport.max(1);
-        let total = self.last_max_scroll.saturating_add(viewport);
-        if area.height == 0 || total <= viewport {
-            return None;
+        .handle_mouse(mouse);
+        if consumed {
+            self.dismiss_text_selection();
+            self.tool_click_candidate = None;
         }
-        let scroll = self.scroll.unwrap_or(self.last_max_scroll);
-        let thumb = scrollbar_thumb(area.height, total, viewport, scroll);
-        Some((area, thumb))
-    }
-
-    /// 把滑块顶端的半行位置映射为滚动偏移；越界时按轨道端点处理。
-    ///
-    /// 可动区间取「轨道半行数 - 滑块半行高」，与渲染完全一致；因此拖到轨道首行或末行
-    /// 时滑块顶端正好贴住端点，不会被滑块自身高度截短而"够不到"底边。
-    fn scrub_to_top_half(&mut self, top_half: i32) {
-        let Some((area, thumb)) = self.scrollbar_geometry() else {
-            return;
-        };
-        let span = u32::from(area.height)
-            .saturating_mul(2)
-            .saturating_sub(u32::from(thumb.height_half));
-        if span == 0 || self.last_max_scroll == 0 {
-            return;
-        }
-        let top = u32::try_from(top_half.max(0)).unwrap_or(u32::MAX).min(span);
-        let scaled = top.saturating_mul(u32::from(self.last_max_scroll));
-        let position = u16::try_from((scaled + span / 2) / span).unwrap_or(u16::MAX);
-        if top >= span || position >= self.last_max_scroll {
-            self.scroll = None;
-        } else {
-            self.scroll = Some(position);
-        }
+        consumed
     }
 
     /// 向上滚动 n 行，进入手动滚动模式。
@@ -640,8 +469,7 @@ impl App {
     /// 文字上。这正是"滚动着选中一屏以上内容再复制"的前提。
     pub(crate) fn scroll_up(&mut self, n: u16) {
         self.tool_click_candidate = None;
-        let current = self.scroll.unwrap_or(self.last_max_scroll);
-        self.scroll = Some(current.saturating_sub(n));
+        scroll_transcript(&mut self.scroll, self.last_max_scroll, ScrollAction::Up(n));
     }
 
     /// 向下滚动 n 行；到达底部时恢复自动跟随。
@@ -649,14 +477,11 @@ impl App {
     /// 与 [`Self::scroll_up`] 相同，保留现有选区。
     pub(crate) fn scroll_down(&mut self, n: u16) {
         self.tool_click_candidate = None;
-        if let Some(current) = self.scroll {
-            let next = current.saturating_add(n);
-            if next >= self.last_max_scroll {
-                self.scroll = None;
-            } else {
-                self.scroll = Some(next);
-            }
-        }
+        scroll_transcript(
+            &mut self.scroll,
+            self.last_max_scroll,
+            ScrollAction::Down(n),
+        );
     }
 
     /// 按符号滚动若干行：正数向上（查看更早内容），负数向下。
@@ -1582,6 +1407,211 @@ fn path_is_standalone(input: &str, span: &std::ops::Range<usize>) -> bool {
 /// 短内容返回 `false`，由调用方按普通输入插入。
 fn paste_needs_label(text: &str) -> bool {
     text.lines().count() > 1 || unicode_width::UnicodeWidthStr::width(text) > PASTE_TAG_COLUMNS
+}
+
+/// 主会话和插件原生会话的滚动动作，避免方向依赖隐式正负号。
+pub(super) enum ScrollAction {
+    /// 查看更早的内容，保持手动定位。
+    Up(u16),
+    /// 查看更新的内容，到底部后恢复跟随。
+    Down(u16),
+}
+
+/// 应用共享的滚动语义；`None` 表示自动跟随底部。
+pub(super) fn scroll_transcript(scroll: &mut Option<u16>, max_scroll: u16, action: ScrollAction) {
+    let current = scroll.unwrap_or(max_scroll).min(max_scroll);
+    match action {
+        ScrollAction::Up(lines) => *scroll = Some(current.saturating_sub(lines)),
+        ScrollAction::Down(lines) => {
+            let next = current.saturating_add(lines);
+            *scroll = (next < max_scroll).then_some(next);
+        }
+    }
+}
+
+/// 借用当前会话自己的几何与拖拽状态；只共享算法，不交换主/子会话数据。
+pub(super) struct TranscriptScroll<'a> {
+    /// 当前偏移，`None` 表示跟随底部。
+    pub(super) scroll: &'a mut Option<u16>,
+    /// 最近绘制帧发布的最大偏移。
+    pub(super) max_scroll: u16,
+    /// 最近绘制帧的正文高度。
+    pub(super) viewport: u16,
+    /// 与显示一致的单列轨道热区。
+    pub(super) area: Option<Rect>,
+    /// 是否正抓住当前会话的滑块。
+    pub(super) dragging: &'a mut bool,
+    /// 指针相对滑块顶端的半行偏移，避免按下跳动。
+    pub(super) grab_half: &'a mut Option<i32>,
+}
+
+impl TranscriptScroll<'_> {
+    /// 处理轨道点击和滑块拖动；命中返回 `true`，失去轨道时清理拖拽状态。
+    pub(super) fn handle_mouse(&mut self, mouse: &MouseEvent) -> bool {
+        use crossterm::event::MouseButton;
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            *self.grab_half = None;
+            return std::mem::take(self.dragging);
+        }
+        let Some((area, thumb)) = self.geometry() else {
+            *self.grab_half = None;
+            *self.dragging = false;
+            return false;
+        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if area.contains(Position::new(mouse.column, mouse.row)) =>
+            {
+                *self.dragging = true;
+                let first = area.y.saturating_add(thumb.first_row());
+                let last = area.y.saturating_add(thumb.last_row());
+                let pointer = 2 * (i32::from(mouse.row) - i32::from(area.y));
+                if (first..=last).contains(&mouse.row) {
+                    *self.grab_half = Some(pointer - i32::from(thumb.top_half));
+                } else {
+                    *self.grab_half = Some(0);
+                    self.scrub(area, thumb, pointer);
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if *self.dragging => {
+                let top =
+                    2 * (i32::from(mouse.row) - i32::from(area.y)) - self.grab_half.unwrap_or(0);
+                self.scrub(area, thumb, top);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // 与绘制层使用同一半行滑块算法，输入热区不能另算一套比例。
+    fn geometry(&self) -> Option<(Rect, ScrollbarThumb)> {
+        let area = self.area?;
+        let viewport = self.viewport.max(1);
+        let total = self.max_scroll.saturating_add(viewport);
+        if area.is_empty() || total <= viewport {
+            return None;
+        }
+        let thumb = scrollbar_thumb(
+            area.height,
+            total,
+            viewport,
+            self.scroll.unwrap_or(self.max_scroll).min(self.max_scroll),
+        );
+        Some((area, thumb))
+    }
+
+    // 把越界指针夹到轨道端点，拖到底部即恢复跟随。
+    fn scrub(&mut self, area: Rect, thumb: ScrollbarThumb, top_half: i32) {
+        let span = u32::from(area.height)
+            .saturating_mul(2)
+            .saturating_sub(u32::from(thumb.height_half));
+        if span == 0 {
+            return;
+        }
+        let top = u32::try_from(top_half.max(0)).unwrap_or(u32::MAX).min(span);
+        let scaled = top.saturating_mul(u32::from(self.max_scroll));
+        let position = u16::try_from((scaled + span / 2) / span).unwrap_or(u16::MAX);
+        *self.scroll = (top < span && position < self.max_scroll).then_some(position);
+    }
+}
+
+/// 编辑主会话和插件原生会话共有的纯文本输入；不处理提交、退出、历史或附件。
+///
+/// `cursor` 必须位于 UTF-8 边界；返回 `None` 表示交给调用方路由，`Some(true)`
+/// 表示正文有变化、调用方需更新自己的附件/历史等状态，`Some(false)` 仅移动光标。
+pub(super) fn edit_text_input(
+    input: &mut String,
+    cursor: &mut usize,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> Option<bool> {
+    let command = is_command_modifier(modifiers);
+    let start = input[..*cursor].rfind('\n').map_or(0, |index| index + 1);
+    let end = input[*cursor..]
+        .find('\n')
+        .map_or(input.len(), |index| *cursor + index);
+    let range = match code {
+        KeyCode::Enter if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            input.insert(*cursor, '\n');
+            *cursor += 1;
+            return Some(true);
+        }
+        KeyCode::Char('j') if command => {
+            input.insert(*cursor, '\n');
+            *cursor += 1;
+            return Some(true);
+        }
+        KeyCode::Char('a') if command => {
+            *cursor = start;
+            return Some(false);
+        }
+        KeyCode::Char('e') if command => {
+            *cursor = end;
+            return Some(false);
+        }
+        KeyCode::Char('w') if command => previous_word_boundary(input, *cursor)..*cursor,
+        KeyCode::Char('u') if command => start..*cursor,
+        KeyCode::Char('k') if command => *cursor..end,
+        KeyCode::Left if command || modifiers.contains(KeyModifiers::ALT) => {
+            *cursor = previous_word_boundary(input, *cursor);
+            return Some(false);
+        }
+        KeyCode::Right if command || modifiers.contains(KeyModifiers::ALT) => {
+            *cursor = next_word_boundary(input, *cursor);
+            return Some(false);
+        }
+        KeyCode::Left => {
+            if let Some(ch) = input[..*cursor].chars().next_back() {
+                *cursor -= ch.len_utf8();
+            }
+            return Some(false);
+        }
+        KeyCode::Right => {
+            if let Some(ch) = input[*cursor..].chars().next() {
+                *cursor += ch.len_utf8();
+            }
+            return Some(false);
+        }
+        KeyCode::Home if !command => {
+            *cursor = start;
+            return Some(false);
+        }
+        KeyCode::End if !command => {
+            *cursor = end;
+            return Some(false);
+        }
+        KeyCode::Up | KeyCode::Down => {
+            move_cursor_vertically(input, cursor, code == KeyCode::Up);
+            return Some(false);
+        }
+        KeyCode::Backspace => {
+            let previous = input[..*cursor]
+                .chars()
+                .next_back()
+                .map_or(*cursor, |ch| *cursor - ch.len_utf8());
+            previous..*cursor
+        }
+        KeyCode::Delete | KeyCode::Char('d') if code == KeyCode::Delete || command => {
+            let next = input[*cursor..]
+                .chars()
+                .next()
+                .map_or(*cursor, |ch| *cursor + ch.len_utf8());
+            *cursor..next
+        }
+        KeyCode::Char(ch) if !command && !modifiers.contains(KeyModifiers::ALT) => {
+            input.insert(*cursor, ch);
+            *cursor += ch.len_utf8();
+            return Some(true);
+        }
+        _ => return None,
+    };
+    if range.is_empty() {
+        return Some(false);
+    }
+    *cursor = range.start;
+    input.replace_range(range, "");
+    Some(true)
 }
 
 /// 判断字符是否为按词移动与删除使用的分隔符。
