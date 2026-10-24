@@ -184,11 +184,13 @@ impl TranscriptLayout {
         let range_bottom = top.saturating_add(usize::from(height));
         let mut cursor = 0usize;
 
-        for (index, entry) in self.entries.iter().enumerate() {
+        for (index, entry) in self.entries.iter_mut().enumerate() {
             let entry_height = entry.height;
             let start = cursor;
             cursor = cursor.saturating_add(entry_height);
             if entry_height == 0 || cursor <= range_top || start >= range_bottom {
+                entry.lines = None;
+                entry.row_ends = Vec::new();
                 continue;
             }
             // 布局条目比消息列表长时跳过：没有内容可画。
@@ -196,14 +198,12 @@ impl TranscriptLayout {
                 continue;
             }
             let width = entry.width;
-            let rebuilt;
-            let lines = match entry.lines.as_deref() {
-                Some(lines) => lines,
-                None => {
-                    rebuilt = message_lines(messages, index, streaming == Some(index), width);
-                    &rebuilt
-                }
-            };
+            if entry.lines.is_none() {
+                let lines = message_lines(messages, index, streaming == Some(index), width);
+                entry.row_ends = line_row_ends(&lines, width);
+                entry.lines = Some(lines);
+            }
+            let lines = entry.lines.as_ref().expect("页内消息已构建");
             let clipped_top = start.max(range_top);
             let clipped_bottom = cursor.min(range_bottom);
             let target = Rect {
@@ -215,14 +215,13 @@ impl TranscriptLayout {
             if target.height == 0 {
                 continue;
             }
-            let measured;
-            let row_ends = if entry.lines.is_some() {
-                &entry.row_ends
-            } else {
-                measured = line_row_ends(lines, width);
-                &measured
-            };
-            render_lines_window(lines, row_ends, target, clipped_top - start, &mut buffer);
+            render_lines_window(
+                lines,
+                &entry.row_ends,
+                target,
+                clipped_top - start,
+                &mut buffer,
+            );
         }
         buffer
     }
