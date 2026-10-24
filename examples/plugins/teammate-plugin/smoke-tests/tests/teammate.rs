@@ -817,6 +817,53 @@ async fn component_runs_mailbox_dispatch_flow() {
             .unwrap()
             .is_empty()
     );
+    let acknowledged_id = sent["message"]["id"].as_u64().unwrap();
+    let ack_args = json!({"member_id":ordinary_id,"message_id":acknowledged_id});
+    let acked = call_tool(
+        host.as_ref(),
+        "display-run",
+        "teammate_ack",
+        ack_args.clone(),
+    )
+    .await;
+    assert_eq!(acked, json!({"acked":true,"message_id":acknowledged_id}));
+    for width in [12, 80] {
+        let frame = live
+            .render_tool_message(&ToolRenderContext {
+                call: ToolCall::new("ack-display", "teammate_ack", ack_args.clone()),
+                state: ToolRenderState::Finished {
+                    result: agent_tool::ToolResult::success(
+                        "ack-display",
+                        "teammate_ack",
+                        acked.clone(),
+                    ),
+                },
+                width,
+                max_height: 8,
+                frame: 32,
+            })
+            .await
+            .unwrap()
+            .expect("Ack 应通过真实 WASM renderer 路由");
+        assert_eq!(frame.view_id, "teammate-ack");
+        assert_eq!(
+            shelf_text(&frame),
+            format!("● Ack(#{acknowledged_id})  └ 已确认消息")
+        );
+        assert_eq!(frame.lines.len(), 2);
+        assert!(!shelf_text(&frame).contains("teammate_ack"));
+        assert!(!shelf_text(&frame).contains(ordinary_id));
+    }
+    let events = AgentExtension::drain_events_for_run(host.as_ref(), "display-run")
+        .await
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event["name"] == "teammate.message.acked"));
+    assert!(
+        events.iter().all(|event| event["presentation"].is_null()),
+        "确认不应追加第二条事件文本"
+    );
     call_tool(
         host.as_ref(),
         "display-run",
