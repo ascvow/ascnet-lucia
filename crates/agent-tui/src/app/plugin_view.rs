@@ -732,10 +732,14 @@ impl App {
     }
 
     /// 为每个插件视图构造下一次异步渲染请求。
+    ///
+    /// 请求携带当前活动会话的可信路由键：插件据此只展示本会话的状态，切换会话后的
+    /// 下一帧就会改写视图，不需要插件自行猜测或清空缓存。
     #[cfg(feature = "plugins")]
     pub(crate) fn plugin_render_requests(&mut self) -> Vec<UiRenderRequest> {
         self.plugin_frame = self.plugin_frame.wrapping_add(1);
         let active_dialog = self.active_dialog_index();
+        let session_id = Some(self.session_record.id.to_string());
         let mut requests = self
             .plugin_views
             .iter()
@@ -743,6 +747,7 @@ impl App {
             .filter(|(_, view)| view.declaration.placement != UiPlacement::Subview)
             .map(|(index, view)| UiRenderRequest {
                 plugin_id: view.declaration.plugin_id.clone(),
+                session_id: session_id.clone(),
                 view_id: view.declaration.view_id.clone(),
                 instance_id: None,
                 width: if view.area.width == 0 {
@@ -771,6 +776,7 @@ impl App {
                 0,
                 UiRenderRequest {
                     plugin_id: active.plugin_id.clone(),
+                    session_id: session_id.clone(),
                     view_id: active.view.view_id.clone(),
                     instance_id: Some(active.view.instance_id.clone()),
                     width: if active.area.width == 0 {

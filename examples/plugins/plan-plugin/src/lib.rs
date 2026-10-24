@@ -6,7 +6,7 @@ use agent_plugin::{
     UiColor, UiDeclaration, UiFrame, UiInput, UiInputEvent, UiLine, UiNavigationAction,
     UiNavigationRequest, UiPlacement, UiRenderRequest, UiSize, UiSpan, UiStyle, UiViewInstance,
 };
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -14,10 +14,19 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const UPDATE_PLAN_TOOL: &str = "update_plan";
 const GET_PLAN_TOOL: &str = "get_plan";
-const PLAN_STATE_KEY: &str = "current_plan";
+/// 按会话隔离的计划集合键；它同时是持久化到宿主状态中的字段名。
+const PLAN_STATE_KEY: &str = "plans";
+/// 早期版本保存的单个会话无关计划键，激活时显式清理。
+const LEGACY_PLAN_STATE_KEY: &str = "current_plan";
 const PLAN_SHELF_VIEW: &str = "plan-shelf";
 const PLAN_DETAIL_VIEW: &str = "plan-detail";
 const PLAN_SCHEMA_VERSION: u32 = 1;
+/// 计划集合的结构版本；旧版本的单个计划无法归属到任何会话，因此升级时重置。
+const PLAN_BOOK_SCHEMA_VERSION: u32 = 2;
+/// 插件最多保留的会话计划数，超出时淘汰最久未更新的会话。
+const MAX_SESSION_PLANS: usize = 32;
+/// 宿主未提供会话路由键时使用的统一作用域，与不使用会话隔离的宿主语义一致。
+const DEFAULT_SESSION_KEY: &str = "default";
 /// 紧凑计划架最多展示的内容行数，不包含宿主绘制的顶部分隔线。
 const PLAN_SHELF_CONTENT_LINES: usize = 5;
 /// 紧凑计划架的总布局高度，包含一行宿主顶部分隔线。
@@ -163,25 +172,170 @@ fn default_schema_version() -> u32 {
     PLAN_SCHEMA_VERSION
 }
 
-/// 管理当前 Agent 计划，并提供紧凑进度架与完整计划视图。
+/// 单个会话拥有的计划快照及其运行归属。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct SessionPlan {
+    /// 本会话最近一次计划更新所在的 run ID。
+    ///
+    /// 运行结束事件只携带 run ID，没有会话身份；登记它才能在并发会话中精确收敛
+    /// “哪一次运行结束该完成这个会话的进行中步骤”。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_run_id: Option<String>,
+    /// 插件内单调递增的写入序号，用于有界淘汰时找出最久未更新的会话。
+    #[serde(default)]
+    last_used: u64,
+    /// 本会话的计划快照。
+    plan: PlanState,
+}
+
+/// 按可信会话路由键隔离的计划集合。
+///
+/// 计划是会话级界面状态：不同会话各自拥有独立计划，切换会话后只展示对应计划的进度；
+/// 集合本身有界，避免长期运行的应用为每个历史会话无限保留计划。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct PlanBook {
+    /// 集合结构版本，用于拒绝不兼容的未来数据。
+    #[serde(default = "default_book_schema_version")]
+    schema_version: u32,
+    /// 下一次写入使用的序号。
+    #[serde(default)]
+    next_sequence: u64,
+    /// 会话路由键到计划快照的映射。
+    #[serde(default)]
+    sessions: std::collections::BTreeMap<String, SessionPlan>,
+}
+
+impl Default for PlanBook {
+    fn default() -> Self {
+        Self {
+            schema_version: PLAN_BOOK_SCHEMA_VERSION,
+            next_sequence: 0,
+            sessions: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl PlanBook {
+    /// 返回指定会话的计划；没有计划时返回 `None`。
+    fn plan(&self, session: &str) -> Option<&PlanState> {
+        self.sessions.get(session).map(|entry| &entry.plan)
+    }
+
+    /// 写入一份会话计划，并淘汰超出上限的最久未用会话。
+    fn store(&mut self, session: &str, plan: PlanState, run_id: Option<String>) {
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let sequence = self.next_sequence;
+        self.sessions.insert(
+            session.to_string(),
+            SessionPlan {
+                last_run_id: run_id,
+                last_used: sequence,
+                plan,
+            },
+        );
+        while self.sessions.len() > MAX_SESSION_PLANS {
+            let Some(victim) = self
+                .sessions
+                .iter()
+                .filter(|(key, _)| key.as_str() != session)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.sessions.remove(&victim);
+        }
+    }
+
+    /// 在指定运行成功结束时完成其所属会话的进行中步骤，返回是否发生变化。
+    ///
+    /// 只处理 `last_run_id` 与该运行一致的会话：run ID 全局唯一，因此并发会话不会
+    /// 互相推进对方的计划。
+    fn converge_run(&mut self, run_id: &str) -> bool {
+        let Some(entry) = self
+            .sessions
+            .values_mut()
+            .find(|entry| entry.last_run_id.as_deref() == Some(run_id))
+        else {
+            return false;
+        };
+        let mut changed = false;
+        for item in &mut entry.plan.plan {
+            if item.status == PlanStatus::InProgress {
+                item.status = PlanStatus::Completed;
+                changed = true;
+            }
+        }
+        if changed {
+            entry.plan.revision = entry.plan.revision.saturating_add(1);
+        }
+        changed
+    }
+
+    /// 校验集合版本和每个会话的计划状态。
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != PLAN_BOOK_SCHEMA_VERSION {
+            return Err(anyhow!("不支持的计划集合版本：{}", self.schema_version));
+        }
+        for (session, entry) in &self.sessions {
+            if session.is_empty() {
+                return Err(anyhow!("计划集合包含空的会话路由键"));
+            }
+            entry.plan.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// 默认计划集合结构版本。
+fn default_book_schema_version() -> u32 {
+    PLAN_BOOK_SCHEMA_VERSION
+}
+
+/// 把宿主或工具绑定提供的会话路由键归一化为计划集合内的稳定键。
+///
+/// 宿主不区分会话时使用统一作用域，保持与单会话宿主一致的行为；真实会话键加前缀，
+/// 避免与会话 ID 恰好等于默认键时发生碰撞。
+fn session_key(session_id: Option<&str>) -> String {
+    match session_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => format!("session:{id}"),
+        None => DEFAULT_SESSION_KEY.to_string(),
+    }
+}
+
+/// 把宿主保存的计划集合解析为可用状态。
+///
+/// 旧版存的是单个会话无关计划，没有会话身份可归属；不兼容的未来版本同样无法安全读取。
+/// 两者都退回空集合而不是报错：计划是可重建的界面状态，不值得让插件因此拒绝激活。
+fn restore_book(value: Option<serde_json::Value>) -> PlanBook {
+    let Some(value) = value else {
+        return PlanBook::default();
+    };
+    match serde_json::from_value::<PlanBook>(value) {
+        Ok(book) if book.validate().is_ok() => book,
+        _ => PlanBook::default(),
+    }
+}
+
+/// 管理按会话隔离的计划，并提供紧凑进度架与完整计划视图。
 #[derive(Default)]
 struct PlanPlugin {
-    /// 当前插件实例持有的计划快照。
-    state: PlanState,
+    /// 当前插件实例持有的全部会话计划。
+    book: PlanBook,
     /// 生成插件实例内唯一的导航请求 ID。
     navigation_sequence: u64,
 }
 
 impl AgentPlugin for PlanPlugin {
-    /// 恢复 Host 中同一插件实例的状态、注册计划提示，并拒绝不兼容或损坏的数据。
+    /// 恢复 Host 中的会话计划集合，并丢弃无法归属到会话的旧版单计划状态。
+    ///
+    /// 旧版把计划存成与会话无关的单份快照，继续沿用正是“新会话显示上个会话计划”的
+    /// 来源；它不携带会话身份，无法安全归属，因此显式删除而不是猜测。
     fn activate(&mut self, host: &dyn PluginHostApi, _context: ActivationContext) -> Result<()> {
-        if let Some(value) = host.get_state(PLAN_STATE_KEY)? {
-            let state: PlanState = serde_json::from_value(value).context("解析计划状态失败")?;
-            state.validate()?;
-            self.state = state;
-        } else {
-            host.set_state(PLAN_STATE_KEY, &serde_json::to_value(&self.state)?)?;
-        }
+        host.remove_state(LEGACY_PLAN_STATE_KEY)?;
+        self.book = restore_book(host.get_state(PLAN_STATE_KEY)?);
+        // 回写归一化后的集合：清掉旧数据或不可读结构后，磁盘与内存保持一致。
+        host.set_state(PLAN_STATE_KEY, &serde_json::to_value(&self.book)?)?;
         Ok(())
     }
 
@@ -195,10 +349,11 @@ impl AgentPlugin for PlanPlugin {
         vec![update_plan_tool(), get_plan_tool()]
     }
 
-    /// 正常运行结束时收敛当前执行项，避免最终回复与计划面板状态不一致。
+    /// 正常运行结束时收敛该运行所属会话的执行项，避免最终回复与计划面板状态不一致。
     ///
-    /// 取消运行时保留原状态，防止把中断任务误标为完成。本插件只订阅
-    /// `core.run.finish`，不参与任何准入决策。
+    /// 取消运行时保留原状态，防止把中断任务误标为完成。运行结束事件没有会话身份，
+    /// 因此按最近一次计划更新登记的 run ID 定位会话：只有真正更新过计划的运行才会推进
+    /// 计划，并发会话之间不会互相收敛。本插件只订阅 `core.run.finish`，不参与准入决策。
     fn on_event(&mut self, _host: &dyn PluginHostApi, event: &mut PluginEvent) -> EventOutcome {
         if event.name() != core_events::RUN_FINISH {
             return EventOutcome::ready();
@@ -209,16 +364,7 @@ impl AgentPlugin for PlanPlugin {
         if data.cancelled {
             return EventOutcome::ready();
         }
-        let mut changed = false;
-        for item in &mut self.state.plan {
-            if item.status == PlanStatus::InProgress {
-                item.status = PlanStatus::Completed;
-                changed = true;
-            }
-        }
-        if changed {
-            self.state.revision = self.state.revision.saturating_add(1);
-        }
+        self.book.converge_run(&data.run_id);
         EventOutcome::ready()
     }
 
@@ -266,30 +412,31 @@ impl AgentPlugin for PlanPlugin {
         ]
     }
 
-    /// 按宿主分配的宽高渲染紧凑进度或完整步骤列表。
+    /// 按宿主分配的宽高渲染当前会话的紧凑进度或完整步骤列表。
     ///
-    /// 没有计划或全部步骤完成时返回隐藏帧，使宿主自动收回布局空间。
+    /// 只展示请求所绑定会话的计划：切换会话后宿主会带着新的 `session_id` 重新请求，
+    /// 上一个会话的计划不会出现在新会话里。紧凑计划架在没有计划或全部步骤完成时返回
+    /// 隐藏帧，让宿主收回布局空间；完整子视图是用户显式打开的，始终可见并给出明确提示。
     fn render_ui(&mut self, request: UiRenderRequest) -> Option<UiFrame> {
-        let completed = self
-            .state
-            .plan
-            .iter()
-            .filter(|item| item.status == PlanStatus::Completed)
-            .count();
+        let session = session_key(request.session_id.as_deref());
+        let plan = self.book.plan(&session);
+        let empty = PlanState::default();
+        let plan = plan.unwrap_or(&empty);
         let mut lines = match request.view_id.as_str() {
-            PLAN_SHELF_VIEW => self.render_shelf(completed, request.width as usize),
-            PLAN_DETAIL_VIEW => self.render_detail(completed, request.width as usize),
+            PLAN_SHELF_VIEW => self.render_shelf(plan, request.width as usize),
+            PLAN_DETAIL_VIEW => self.render_detail(plan, request.width as usize),
             _ => return None,
         };
         lines.truncate(request.height as usize);
+        let incomplete = plan
+            .plan
+            .iter()
+            .any(|item| item.status != PlanStatus::Completed);
+        let visible = incomplete || request.view_id == PLAN_DETAIL_VIEW;
 
         Some(UiFrame {
             view_id: request.view_id,
-            visible: self
-                .state
-                .plan
-                .iter()
-                .any(|item| item.status != PlanStatus::Completed),
+            visible,
             lines,
             cursor: None,
         })
@@ -321,16 +468,17 @@ impl AgentPlugin for PlanPlugin {
 
 impl PlanPlugin {
     /// 构造输入区上方的紧凑进度架，最多展示五行并用汇总行收起其余任务。
-    fn render_shelf(&self, completed: usize, width: usize) -> Vec<UiLine> {
+    fn render_shelf(&self, plan: &PlanState, width: usize) -> Vec<UiLine> {
+        let completed = completed_steps(plan);
         let mut lines = vec![styled_line(
             truncate_to_width(
-                &format!("Plan  {completed}/{} completed", self.state.plan.len()),
+                &format!("Plan  {completed}/{} completed", plan.plan.len()),
                 width,
             ),
             Some(UiColor::Cyan),
             true,
         )];
-        let ordered = self.ordered_plan_items().collect::<Vec<_>>();
+        let ordered = ordered_plan_items(plan).collect::<Vec<_>>();
         let task_capacity = PLAN_SHELF_CONTENT_LINES.saturating_sub(1);
         let visible_tasks = if ordered.len() > task_capacity {
             task_capacity.saturating_sub(1)
@@ -355,16 +503,24 @@ impl PlanPlugin {
     }
 
     /// 构造完整计划子视图，展示说明和全部步骤状态。
-    fn render_detail(&self, completed: usize, width: usize) -> Vec<UiLine> {
+    fn render_detail(&self, plan: &PlanState, width: usize) -> Vec<UiLine> {
+        if plan.plan.is_empty() {
+            return vec![styled_line(
+                truncate_to_width("No plan in this session", width),
+                Some(UiColor::Gray),
+                false,
+            )];
+        }
+        let completed = completed_steps(plan);
         let mut lines = vec![styled_line(
             truncate_to_width(
-                &format!("Progress  {completed} / {}", self.state.plan.len()),
+                &format!("Progress  {completed} / {}", plan.plan.len()),
                 width,
             ),
             Some(UiColor::Cyan),
             true,
         )];
-        if let Some(explanation) = &self.state.explanation {
+        if let Some(explanation) = &plan.explanation {
             lines.push(styled_line(
                 truncate_to_width(&format!("Note: {explanation}"), width),
                 Some(UiColor::Gray),
@@ -372,29 +528,16 @@ impl PlanPlugin {
             ));
             lines.push(styled_line(String::new(), None, false));
         }
-        lines.extend(
-            self.ordered_plan_items()
-                .map(|item| render_plan_item(item, width)),
-        );
+        lines.extend(ordered_plan_items(plan).map(|item| render_plan_item(item, width)));
         lines
     }
 
-    /// 按显示顺序遍历计划项：未完成项保持原顺序，已完成项稳定移动到末尾。
-    fn ordered_plan_items(&self) -> impl Iterator<Item = &PlanItem> {
-        self.state
-            .plan
-            .iter()
-            .filter(|item| item.status != PlanStatus::Completed)
-            .chain(
-                self.state
-                    .plan
-                    .iter()
-                    .filter(|item| item.status == PlanStatus::Completed),
-            )
-    }
-
-    /// 解析、校验并保存一次完整计划更新；Host 写入失败时保留旧状态。
+    /// 解析、校验并保存一次完整计划更新；Host 写入失败时保留旧计划。
+    ///
+    /// 计划按 `ToolCall.session_id` 归入发起调用的会话；宿主未提供会话键时退回统一
+    /// 作用域。写入前先克隆集合，宿主持久化失败时内存状态与磁盘保持一致。
     fn update_plan(&mut self, host: &dyn PluginHostApi, call: ToolCall) -> Result<ToolResult> {
+        let session = session_key(call.session_id.as_deref());
         let args: UpdatePlanArgs = match call.args_as() {
             Ok(args) => args,
             Err(error) => {
@@ -405,22 +548,32 @@ impl PlanPlugin {
                 ));
             }
         };
-        let next = match PlanState::from_update(args, self.state.revision.saturating_add(1)) {
+        let revision = self
+            .book
+            .plan(&session)
+            .map_or(0, |plan| plan.revision)
+            .saturating_add(1);
+        let next = match PlanState::from_update(args, revision) {
             Ok(state) => state,
             Err(error) => {
                 return Ok(ToolResult::error(call.id, call.name, error.to_string()));
             }
         };
-        host.set_state(PLAN_STATE_KEY, &serde_json::to_value(&next)?)?;
-        self.state = next;
+        let mut book = self.book.clone();
+        book.store(&session, next.clone(), call.run_id.clone());
+        host.set_state(PLAN_STATE_KEY, &serde_json::to_value(&book)?)?;
+        self.book = book;
         Ok(ToolResult::success(
             call.id,
             call.name,
-            serde_json::to_value(&self.state)?,
+            serde_json::to_value(&next)?,
         ))
     }
 
-    /// 返回当前计划快照，并严格拒绝意外参数。
+    /// 返回调用方会话的计划快照，并严格拒绝意外参数。
+    ///
+    /// 会话没有计划时返回空计划，而不是其他会话的快照，避免模型把上一个会话的进度
+    /// 当成当前任务。
     fn get_plan(&self, call: ToolCall) -> Result<ToolResult> {
         if let Err(error) = call.args_as::<EmptyArgs>() {
             return Ok(ToolResult::error(
@@ -429,12 +582,34 @@ impl PlanPlugin {
                 format!("查询参数无效：{error}"),
             ));
         }
+        let session = session_key(call.session_id.as_deref());
+        let plan = self.book.plan(&session).cloned().unwrap_or_default();
         Ok(ToolResult::success(
             call.id,
             call.name,
-            serde_json::to_value(&self.state)?,
+            serde_json::to_value(plan)?,
         ))
     }
+}
+
+/// 统计已完成步骤数，供进度架与详情共用。
+fn completed_steps(plan: &PlanState) -> usize {
+    plan.plan
+        .iter()
+        .filter(|item| item.status == PlanStatus::Completed)
+        .count()
+}
+
+/// 按显示顺序遍历计划项：未完成项保持原顺序，已完成项稳定移动到末尾。
+fn ordered_plan_items(plan: &PlanState) -> impl Iterator<Item = &PlanItem> {
+    plan.plan
+        .iter()
+        .filter(|item| item.status != PlanStatus::Completed)
+        .chain(
+            plan.plan
+                .iter()
+                .filter(|item| item.status == PlanStatus::Completed),
+        )
 }
 
 /// 构建整体替换当前计划的工具定义。
@@ -641,18 +816,27 @@ mod tests {
     #[test]
     fn rejected_update_keeps_existing_plan() {
         let mut plugin = PlanPlugin::default();
-        plugin.state.plan = vec![
-            item("定位问题", PlanStatus::Completed),
-            item("修复实现", PlanStatus::InProgress),
-            item("补充测试", PlanStatus::Pending),
-        ];
-        let before = plugin.state.clone();
+        plugin.book.store(
+            &session_key(None),
+            PlanState {
+                revision: 1,
+                plan: vec![
+                    item("定位问题", PlanStatus::Completed),
+                    item("修复实现", PlanStatus::InProgress),
+                    item("补充测试", PlanStatus::Pending),
+                ],
+                ..PlanState::default()
+            },
+            None,
+        );
+        let before = plugin.book.clone();
 
         let result = plugin
             .call_tool_with_host(
                 &NoopHostApi,
-                ToolCall::new(
-                    "call-small-plan",
+                plan_call(
+                    None,
+                    None,
                     UPDATE_PLAN_TOOL,
                     json!({"plan": [{"step": "只做一件小事", "status": "in_progress"}]}),
                 ),
@@ -660,7 +844,224 @@ mod tests {
             .expect("准入策略应返回工具结果而不是插件错误");
 
         assert!(result.is_error, "小计划必须以工具错误形式返回");
-        assert_eq!(plugin.state, before, "被拒绝的更新不能改变当前计划");
+        assert_eq!(plugin.book, before, "被拒绝的更新不能改变当前计划");
+    }
+
+    /// 构造带会话路由键和运行 ID 的计划工具调用。
+    fn plan_call(
+        session: Option<&str>,
+        run: Option<&str>,
+        name: &str,
+        args: serde_json::Value,
+    ) -> ToolCall {
+        let mut call = ToolCall::new(format!("call-{name}"), name, args);
+        call.session_id = session.map(str::to_string);
+        call.run_id = run.map(str::to_string);
+        call
+    }
+
+    /// 构造一份三步未完成计划，供会话隔离用例复用。
+    fn three_step_plan(first: &str) -> serde_json::Value {
+        json!({
+            "plan": [
+                {"step": first, "status": "in_progress"},
+                {"step": "实现改动", "status": "pending"},
+                {"step": "补回归测试", "status": "pending"},
+            ]
+        })
+    }
+
+    /// 计划必须按工具调用绑定的会话隔离：新会话看不到上一个会话的计划。
+    #[test]
+    fn plans_are_isolated_between_sessions() {
+        let mut plugin = PlanPlugin::default();
+        let updated = plugin
+            .call_tool_with_host(
+                &NoopHostApi,
+                plan_call(
+                    Some("session-a"),
+                    Some("run-a"),
+                    UPDATE_PLAN_TOOL,
+                    three_step_plan("会话 A 的第一步"),
+                ),
+            )
+            .expect("会话 A 的计划更新应成功");
+        assert!(!updated.is_error, "{}", updated.content);
+
+        let read = |plugin: &mut PlanPlugin, session: &str| {
+            plugin
+                .call_tool_with_host(
+                    &NoopHostApi,
+                    plan_call(Some(session), None, GET_PLAN_TOOL, json!({})),
+                )
+                .expect("读取计划不应失败")
+                .content
+        };
+
+        let own = read(&mut plugin, "session-a");
+        assert_eq!(own["plan"][0]["step"], "会话 A 的第一步");
+        assert_eq!(own["revision"], 1);
+
+        let other = read(&mut plugin, "session-b");
+        assert_eq!(other["plan"], json!([]), "其他会话必须看到空计划");
+        assert_eq!(other["revision"], 0);
+    }
+
+    /// 渲染只展示请求绑定会话的计划：切换会话后进度架立即隐藏。
+    #[test]
+    fn render_uses_request_session() {
+        let mut plugin = PlanPlugin::default();
+        plugin
+            .call_tool_with_host(
+                &NoopHostApi,
+                plan_call(
+                    Some("session-a"),
+                    None,
+                    UPDATE_PLAN_TOOL,
+                    three_step_plan("会话 A 的第一步"),
+                ),
+            )
+            .expect("计划更新应成功");
+        let request = |session: Option<&str>| UiRenderRequest {
+            session_id: session.map(str::to_string),
+            plugin_id: "plan".into(),
+            view_id: PLAN_SHELF_VIEW.into(),
+            instance_id: None,
+            width: 40,
+            height: 8,
+            focused: false,
+            frame: 1,
+        };
+
+        let own = plugin
+            .render_ui(request(Some("session-a")))
+            .expect("会话 A 应返回帧");
+        assert!(own.visible);
+        assert!(own.lines[0].spans[0].text.contains("0/3 completed"));
+
+        for session in [Some("session-b"), None] {
+            let other = plugin
+                .render_ui(request(session))
+                .expect("其他会话应返回帧");
+            assert!(!other.visible, "其他会话不应显示计划进度架");
+        }
+
+        // 不区分会话的宿主退回统一作用域，保持单会话语义。
+        plugin
+            .call_tool_with_host(
+                &NoopHostApi,
+                plan_call(
+                    None,
+                    None,
+                    UPDATE_PLAN_TOOL,
+                    three_step_plan("共享作用域的第一步"),
+                ),
+            )
+            .expect("共享作用域计划更新应成功");
+        assert!(
+            plugin
+                .render_ui(request(None))
+                .expect("共享作用域应返回帧")
+                .visible
+        );
+    }
+
+    /// 运行结束只收敛该运行更新过的会话，其他会话的进行中步骤保持不变。
+    #[test]
+    fn run_finish_converges_only_the_owning_session() {
+        let mut plugin = PlanPlugin::default();
+        for (session, run, step) in [
+            ("session-a", "run-a", "会话 A 的第一步"),
+            ("session-b", "run-b", "会话 B 的第一步"),
+        ] {
+            plugin
+                .call_tool_with_host(
+                    &NoopHostApi,
+                    plan_call(
+                        Some(session),
+                        Some(run),
+                        UPDATE_PLAN_TOOL,
+                        three_step_plan(step),
+                    ),
+                )
+                .expect("计划更新应成功");
+        }
+        let finish = |run: &str| {
+            PluginEvent::new(PluginEventEnvelope {
+                event: core_events::RUN_FINISH.into(),
+                cancelled: false,
+                canceller: None,
+                subscriber: "plan".into(),
+                data: json!({"run_id": run, "steps_used": 2, "cancelled": false}),
+            })
+        };
+
+        plugin.on_event(&NoopHostApi, &mut finish("run-a"));
+
+        let a = plugin
+            .book
+            .plan(&session_key(Some("session-a")))
+            .expect("会话 A 计划存在");
+        assert_eq!(a.plan[0].status, PlanStatus::Completed);
+        let b = plugin
+            .book
+            .plan(&session_key(Some("session-b")))
+            .expect("会话 B 计划存在");
+        assert_eq!(
+            b.plan[0].status,
+            PlanStatus::InProgress,
+            "其他会话的进行中步骤不能被无辜推进"
+        );
+    }
+
+    /// 会话计划集合必须有界，超出上限时淘汰最久未更新的会话。
+    #[test]
+    fn session_plans_are_bounded() {
+        let mut book = PlanBook::default();
+        for index in 0..MAX_SESSION_PLANS + 3 {
+            book.store(
+                &format!("session:{index}"),
+                PlanState {
+                    revision: 1,
+                    plan: vec![item("步骤", PlanStatus::Pending)],
+                    ..PlanState::default()
+                },
+                None,
+            );
+        }
+
+        assert_eq!(book.sessions.len(), MAX_SESSION_PLANS);
+        assert!(book.plan("session:0").is_none(), "最早写入的会话应被淘汰");
+        assert!(book
+            .plan(&format!("session:{}", MAX_SESSION_PLANS + 2))
+            .is_some());
+    }
+
+    /// 旧版单个计划没有会话身份，恢复时丢弃而不是猜测归属；有效集合照常恢复。
+    #[test]
+    fn restore_book_drops_legacy_and_incompatible_state() {
+        let legacy = json!({
+            "schema_version": PLAN_SCHEMA_VERSION,
+            "revision": 3,
+            "plan": [{"step": "上个会话的步骤", "status": "pending"}],
+        });
+        assert_eq!(restore_book(Some(legacy)), PlanBook::default());
+
+        let future = json!({"schema_version": 99, "sessions": {}});
+        assert_eq!(restore_book(Some(future)), PlanBook::default());
+
+        let mut book = PlanBook::default();
+        book.store(
+            &session_key(Some("session-a")),
+            PlanState {
+                revision: 2,
+                plan: vec![item("保留的步骤", PlanStatus::Pending)],
+                ..PlanState::default()
+            },
+            None,
+        );
+        let restored = restore_book(Some(serde_json::to_value(&book).expect("序列化集合")));
+        assert_eq!(restored, book);
     }
 
     /// 创建测试计划项，减少状态校验用例中的重复结构。
@@ -757,6 +1158,7 @@ mod tests {
     #[test]
     fn panel_is_visible_only_while_plan_is_incomplete() {
         let request = || UiRenderRequest {
+            session_id: None,
             plugin_id: "plan".into(),
             view_id: PLAN_SHELF_VIEW.into(),
             instance_id: None,
@@ -768,14 +1170,30 @@ mod tests {
         let mut plugin = PlanPlugin::default();
 
         assert!(!plugin.render_ui(request()).expect("空计划应返回帧").visible);
-        plugin.state.plan = vec![item("检查实现", PlanStatus::Pending)];
+        let session = session_key(None);
+        plugin.book.store(
+            &session,
+            PlanState {
+                revision: 1,
+                plan: vec![item("检查实现", PlanStatus::Pending)],
+                ..PlanState::default()
+            },
+            None,
+        );
         assert!(
             plugin
                 .render_ui(request())
                 .expect("未完成计划应返回帧")
                 .visible
         );
-        plugin.state.plan[0].status = PlanStatus::Completed;
+        plugin
+            .book
+            .sessions
+            .get_mut(&session)
+            .expect("计划已写入")
+            .plan
+            .plan[0]
+            .status = PlanStatus::Completed;
         assert!(
             !plugin
                 .render_ui(request())
@@ -787,15 +1205,24 @@ mod tests {
     /// 紧凑计划架最多展示五行，超出项汇总显示，已完成任务稳定沉到末尾。
     #[test]
     fn shelf_limits_rows_and_sinks_completed_items() {
+        let session = session_key(None);
         let mut plugin = PlanPlugin::default();
-        plugin.state.plan = vec![
-            item("已完成一", PlanStatus::Completed),
-            item("待处理", PlanStatus::Pending),
-            item("已完成二", PlanStatus::Completed),
-            item("处理中", PlanStatus::InProgress),
-        ];
+        plugin.book.store(
+            &session,
+            PlanState {
+                revision: 1,
+                plan: vec![
+                    item("已完成一", PlanStatus::Completed),
+                    item("待处理", PlanStatus::Pending),
+                    item("已完成二", PlanStatus::Completed),
+                    item("处理中", PlanStatus::InProgress),
+                ],
+                ..PlanState::default()
+            },
+            None,
+        );
 
-        let lines = plugin.render_shelf(2, 80);
+        let lines = plugin.render_shelf(plugin.book.plan(&session).expect("计划存在"), 80);
         let text = lines
             .iter()
             .map(|line| line.spans[0].text.as_str())
@@ -816,10 +1243,18 @@ mod tests {
         assert_eq!(lines[3].spans[0].style.foreground, Some(UiColor::Gray));
         assert_eq!(lines[4].spans[0].style.foreground, Some(UiColor::Gray));
 
-        plugin.state.plan = (1..=7)
-            .map(|index| item(&format!("任务 {index}"), PlanStatus::Pending))
-            .collect();
-        let overflow = plugin.render_shelf(0, 80);
+        plugin.book.store(
+            &session,
+            PlanState {
+                revision: 2,
+                plan: (1..=7)
+                    .map(|index| item(&format!("任务 {index}"), PlanStatus::Pending))
+                    .collect(),
+                ..PlanState::default()
+            },
+            None,
+        );
+        let overflow = plugin.render_shelf(plugin.book.plan(&session).expect("计划存在"), 80);
         assert_eq!(overflow.len(), PLAN_SHELF_CONTENT_LINES);
         assert_eq!(overflow[4].spans[0].text, "+4 Task");
         assert_eq!(plugin.describe_ui()[0].size.height, Some(PLAN_SHELF_HEIGHT));
@@ -841,21 +1276,36 @@ mod tests {
                 }),
             })
         };
+        let session = session_key(None);
         let mut plugin = PlanPlugin::default();
-        plugin.state.plan = vec![item("汇总评价", PlanStatus::InProgress)];
+        plugin.book.store(
+            &session,
+            PlanState {
+                revision: 1,
+                plan: vec![item("汇总评价", PlanStatus::InProgress)],
+                ..PlanState::default()
+            },
+            Some("run".into()),
+        );
 
         plugin.on_event(&NoopHostApi, &mut event(true));
-        assert_eq!(plugin.state.plan[0].status, PlanStatus::InProgress);
+        assert_eq!(
+            plugin.book.plan(&session).expect("计划存在").plan[0].status,
+            PlanStatus::InProgress
+        );
         plugin.on_event(&NoopHostApi, &mut event(false));
-        assert_eq!(plugin.state.plan[0].status, PlanStatus::Completed);
-        assert_eq!(plugin.state.revision, 1);
+        let converged = plugin.book.plan(&session).expect("计划存在");
+        assert_eq!(converged.plan[0].status, PlanStatus::Completed);
+        assert_eq!(converged.revision, 2);
     }
 
     /// 验证计划面板遵守 Host 分配的宽高限制。
     #[test]
     fn panel_respects_render_bounds() {
-        let mut plugin = PlanPlugin {
-            state: PlanState {
+        let mut plugin = PlanPlugin::default();
+        plugin.book.store(
+            &session_key(None),
+            PlanState {
                 revision: 1,
                 plan: vec![item(
                     "实现一个包含很长中文描述的计划插件步骤",
@@ -863,10 +1313,11 @@ mod tests {
                 )],
                 ..PlanState::default()
             },
-            ..PlanPlugin::default()
-        };
+            None,
+        );
         let frame = plugin
             .render_ui(UiRenderRequest {
+                session_id: None,
                 plugin_id: "plan".into(),
                 view_id: PLAN_DETAIL_VIEW.into(),
                 instance_id: None,

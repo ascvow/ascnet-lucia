@@ -1223,6 +1223,7 @@ mod tests {
     /// 构造固定尺寸的插件 UI 渲染请求。
     fn request(view_id: &str, instance_id: Option<&str>) -> UiRenderRequest {
         UiRenderRequest {
+            session_id: None,
             plugin_id: "workflow".into(),
             view_id: view_id.into(),
             instance_id: instance_id.map(str::to_string),

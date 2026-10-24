@@ -588,6 +588,7 @@ impl PluginHost for CountingUiPluginHost {
 /// 构造指向指定插件视图的稳定渲染请求。
 fn ui_render_request(plugin_id: &str, view_id: &str) -> UiRenderRequest {
     UiRenderRequest {
+        session_id: None,
         plugin_id: plugin_id.to_string(),
         view_id: view_id.to_string(),
         instance_id: None,

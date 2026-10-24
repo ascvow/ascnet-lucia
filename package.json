@@ -42,7 +42,7 @@
     "test:plugin:manager": "cargo test -p agent-plugin-manager",
     "test:plugin:mcp": "cargo test --offline -p mcp-plugin && bun run build:plugin:mcp && cargo test --offline -p mcp-plugin-smoke-tests -- --ignored --nocapture",
     "test:plugin:teammate": "cargo test --offline -p teammate-plugin && bun run build:plugin:teammate && cargo test --offline -p teammate-plugin-smoke-tests",
-    "test:plugin:plan": "cargo test --offline -p plan-plugin && bun run build:plugin:plan",
+    "test:plugin:plan": "cargo test --offline -p plan-plugin && bun run build:plugin:plan && cargo test --offline -p plan-plugin-smoke-tests",
     "test:plugin:memory": "cargo test --offline -p memory-plugin && bun run build:plugin:memory",
     "test:plugin:knowledge": "cargo test --offline -p knowledge-plugin && bun run build:plugin:knowledge",
     "test:plugin:eden": "cargo test --offline -p eden-plugin && bun run build:plugin:eden && cargo test --offline -p eden-plugin-smoke-tests",

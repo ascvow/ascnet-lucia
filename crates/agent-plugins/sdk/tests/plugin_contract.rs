@@ -86,6 +86,8 @@ fn guest_ui_types_match_contract_fixture() {
     assert_round_trip::<UiDeclaration>(&fixture["shelf_declaration"]);
     assert_round_trip::<ToolRendererContribution>(&fixture["tool_renderer"]);
     assert_round_trip::<UiRenderRequest>(&fixture["render_request"]);
+    // Guest 与 Host 共享同一份样本：`session_id` 省略时必须保持旧形状。
+    assert_round_trip::<UiRenderRequest>(&fixture["render_request_without_session"]);
     assert_round_trip::<ToolRenderRequest>(&fixture["tool_render_request"]);
     assert_round_trip::<UiFrame>(&fixture["frame"]);
     assert_round_trip::<UiInput>(&fixture["input"]);

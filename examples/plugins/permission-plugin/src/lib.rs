@@ -1810,6 +1810,7 @@ mod tests {
 
         let frame = plugin
             .render_ui(UiRenderRequest {
+                session_id: None,
                 plugin_id: "permission".into(),
                 view_id: APPROVAL_VIEW.into(),
                 instance_id: None,
@@ -1854,6 +1855,7 @@ mod tests {
 
         let frame = plugin
             .render_ui(UiRenderRequest {
+                session_id: None,
                 plugin_id: "permission".into(),
                 view_id: MODE_VIEW.into(),
                 instance_id: None,
@@ -1966,6 +1968,7 @@ mod tests {
         assert_eq!(plugin.mode, PermissionMode::ModelReview);
         let frame = plugin
             .render_ui(UiRenderRequest {
+                session_id: None,
                 plugin_id: "permission".into(),
                 view_id: MODE_VIEW.into(),
                 instance_id: None,

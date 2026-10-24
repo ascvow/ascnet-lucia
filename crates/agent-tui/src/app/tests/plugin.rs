@@ -585,6 +585,33 @@ fn plugin_dialog_is_modal() {
     ));
 }
 
+/// 渲染请求必须携带当前会话的可信路由键，切换会话后立即改指向新会话。
+#[test]
+#[cfg(feature = "plugins")]
+fn plugin_render_requests_carry_active_session() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    app.plugin_views
+        .push(test_plugin_view(UiPlacement::ComposerShelf, "计划"));
+
+    let session = app.session_record.id.to_string();
+    let requests = app.plugin_render_requests();
+    assert!(requests
+        .iter()
+        .all(|request| request.session_id.as_deref() == Some(session.as_str())));
+
+    let next = SessionRecord::new(
+        SessionId::new("next-session").expect("创建测试会话标识"),
+        Session::new(),
+    )
+    .expect("创建测试会话");
+    app.replace_session(next, None);
+    let requests = app.plugin_render_requests();
+    assert!(requests
+        .iter()
+        .all(|request| request.session_id.as_deref() == Some("next-session")));
+}
+
 /// A dynamic subview replaces the main view while preserving instance input routing.
 /// 动态子视图应替换主视图，并保留实例化输入路由。
 #[test]

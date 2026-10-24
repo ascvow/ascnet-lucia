@@ -169,6 +169,7 @@ async fn wasm_host_routes_permission_approval() {
         loop {
             if let Some(frame) = host
                 .render_ui(&UiRenderRequest {
+                    session_id: None,
                     plugin_id: "permission".into(),
                     view_id: APPROVAL_VIEW.into(),
                     instance_id: None,
@@ -331,6 +332,7 @@ async fn wasm_host_restores_persisted_permission_mode() {
         .expect("打开默认权限模式面板");
     let default_frame = first
         .render_ui(&UiRenderRequest {
+            session_id: None,
             plugin_id: "permission".into(),
             view_id: MODE_VIEW.into(),
             instance_id: None,

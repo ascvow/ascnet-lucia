@@ -39,6 +39,8 @@ fn host_ui_types_match_contract_fixture() {
     assert_round_trip::<UiDeclaration>(&fixture["shelf_declaration"]);
     assert_round_trip::<ToolRendererContribution>(&fixture["tool_renderer"]);
     assert_round_trip::<UiRenderRequest>(&fixture["render_request"]);
+    // 旧宿主不会发送 `session_id`，省略时仍必须与契约样本逐字段一致。
+    assert_round_trip::<UiRenderRequest>(&fixture["render_request_without_session"]);
     assert_round_trip::<ToolRenderRequest>(&fixture["tool_render_request"]);
     assert_round_trip::<UiFrame>(&fixture["frame"]);
     assert_round_trip::<UiInput>(&fixture["input"]);

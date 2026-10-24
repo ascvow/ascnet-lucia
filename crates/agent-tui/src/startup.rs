@@ -686,12 +686,22 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     }
                     app.dismiss_text_selection();
                     let before_input = app.input.clone();
+                    #[cfg(feature = "plugins")]
+                    let before_session = app.session_record.id.clone();
                     if app.handle_native_command_key(key.code, key.modifiers, agent.as_ref()) {
                         app.sync_native_command_input(&before_input);
                         #[cfg(feature = "plugins")]
                         if app.input != before_input {
                             if let Some(host) = plugin_host.as_ref() {
                                 forward_main_input_snapshot(&mut app, host).await;
+                            }
+                        }
+                        // `/new`、`/clear` 与恢复会话会在这里切换会话，插件视图必须立即
+                        // 按新会话重绘，否则会继续展示上一个会话的会话级状态。
+                        #[cfg(feature = "plugins")]
+                        if app.session_record.id != before_session {
+                            if let Some(host) = plugin_host.as_ref() {
+                                app.schedule_plugin_views_refresh(Arc::clone(host));
                             }
                         }
                         continue;
@@ -1052,6 +1062,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 if let Err(error) = resume_native_session(&mut app, session_id, revision).await {
                     app.messages
                         .push(Msg::new(MsgKind::Error, format!("恢复会话失败：{error}")));
+                } else {
+                    // 会话级插件状态（例如计划进度架）必须立刻切换，不能等周期刷新。
+                    #[cfg(feature = "plugins")]
+                    if let Some(host) = plugin_host.as_ref() {
+                        app.schedule_plugin_views_refresh(Arc::clone(host));
+                    }
                 }
             }
             Some(UiEvent::NativeCompactRequested) => {

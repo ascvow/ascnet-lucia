@@ -136,6 +136,7 @@ async fn component_runs_mailbox_dispatch_flow() {
     let dock = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
+            session_id: None,
             plugin_id: "teammate".into(),
             view_id: "teammate-team-dock".into(),
             instance_id: None,
@@ -189,6 +190,7 @@ async fn component_runs_mailbox_dispatch_flow() {
     let dock = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
+            session_id: None,
             plugin_id: "teammate".into(),
             view_id: "teammate-team-dock".into(),
             instance_id: None,
@@ -254,6 +256,7 @@ async fn component_runs_mailbox_dispatch_flow() {
     let session = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
+            session_id: None,
             plugin_id: "teammate".into(),
             view_id: "teammate-member-session".into(),
             instance_id: Some(member_id.into()),
@@ -300,6 +303,7 @@ async fn component_runs_mailbox_dispatch_flow() {
     let first = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
+            session_id: None,
             plugin_id: "teammate".into(),
             view_id: "teammate-member-session".into(),
             instance_id: Some(member_id.into()),
@@ -340,6 +344,7 @@ async fn component_runs_mailbox_dispatch_flow() {
     let compact = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
+            session_id: None,
             plugin_id: "teammate".into(),
             view_id: "teammate-member-session".into(),
             instance_id: Some(member_id.into()),
@@ -384,6 +389,7 @@ async fn component_runs_mailbox_dispatch_flow() {
     let scrolled = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
+            session_id: None,
             plugin_id: "teammate".into(),
             view_id: "teammate-member-session".into(),
             instance_id: Some(member_id.into()),
@@ -425,6 +431,7 @@ async fn component_runs_mailbox_dispatch_flow() {
     let restored = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
+            session_id: None,
             plugin_id: "teammate".into(),
             view_id: "teammate-member-session".into(),
             instance_id: Some(member_id.into()),

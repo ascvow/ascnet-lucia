@@ -56,12 +56,21 @@
   },
   "render_request": {
     "plugin_id": "fixture-plugin",
+    "session_id": "session-fixture",
     "view_id": "detail",
     "instance_id": "task-1",
     "width": 72,
     "height": 24,
     "focused": true,
     "frame": 9
+  },
+  "render_request_without_session": {
+    "plugin_id": "fixture-plugin",
+    "view_id": "status",
+    "width": 40,
+    "height": 8,
+    "focused": false,
+    "frame": 3
   },
   "tool_render_request": {
     "plugin_id": "fixture-plugin",

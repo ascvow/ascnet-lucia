@@ -193,6 +193,13 @@ pub struct ToolRendererContribution {
 pub struct UiRenderRequest {
     /// 目标插件 ID。
     pub plugin_id: String,
+    /// 应用为当前会话绑定的稳定路由键。
+    ///
+    /// 与 [`ToolCall::session_id`] 是同一个可信值，供插件把界面状态隔离到会话。会话切换
+    /// 后宿主会在下一次渲染中给出新值，插件据此切换展示内容；不区分会话的宿主可以省略，
+    /// 此时插件应退回单一共享作用域。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// 目标视图 ID。
     pub view_id: String,
     /// Dynamic subview instance ID; docked views and dialogs use `None`.
@@ -754,6 +761,7 @@ mod tests {
     #[test]
     fn render_request_envelope_routes_view_and_tool_shapes() {
         let view = serde_json::to_value(UiRenderRequest {
+            session_id: None,
             plugin_id: "demo".into(),
             view_id: "panel".into(),
             instance_id: None,

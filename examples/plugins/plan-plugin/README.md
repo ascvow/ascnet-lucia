@@ -7,7 +7,9 @@ Plan 插件向 Agent 提供两个工具：
 - `update_plan`：整体替换当前计划，允许附带本次调整说明。
 - `get_plan`：读取当前计划及修订号。
 
-计划项状态为 `pending`、`in_progress` 或 `completed`。插件会拒绝空步骤、重复步骤以及同时存在多个 `in_progress` 项；传入空计划可清空当前计划。计划保存在插件实例状态中，卸载插件后不会写入磁盘。
+计划项状态为 `pending`、`in_progress` 或 `completed`。插件会拒绝空步骤、重复步骤以及同时存在多个 `in_progress` 项；传入空计划可清空当前计划。计划按会话隔离并保存在插件实例状态中，卸载插件后不会写入磁盘。
+
+每个会话只看到自己的计划：`update_plan`、`get_plan` 按 `ToolCall.session_id` 归档，进度架按 `UiRenderRequest.session_id` 渲染当前会话的进度。新建或切换到另一个会话后，上一个会话的计划不会继续显示；切回原会话仍能看到它自己的计划，插件最多保留最近 32 个会话的计划，超出时淘汰最久未更新的会话。宿主不提供会话路由键时退回单一共享作用域，行为与单会话环境一致。升级前保存的旧版单计划没有会话身份，激活时会被丢弃而不是猜测归属。
 
 插件不注入常驻 developer 提示，使用时机由 `update_plan` 的模型可见工具描述与插件准入策略共同约束：计划只服务困难或较大的任务，默认不要创建。满足以下任一条才值得建立计划：改动跨多个模块或多个文件且顺序有依赖；任务能拆成 3 个以上可独立验证的阶段；预计多轮长时执行、可能中断或需要持续汇报进度；用户明确要求维护计划。直接问答、代码阅读、单文件小改动、单条命令或单次测试、格式化与重命名、窄范围修复等一次连续执行即可完成的任务不开计划。
 
@@ -19,7 +21,9 @@ Plan 插件向 Agent 提供两个工具：
 
 ```bash
 cargo test --offline --manifest-path examples/plugins/plan-plugin/Cargo.toml
-bun run build:plugin:plan
+bun run test:plugin:plan
 ```
+
+`test:plugin:plan` 会先构建 WASM，再通过真实 Host 运行 `plan-plugin-smoke-tests`：验证两个会话的计划互不可见、切换会话后进度架按会话隐藏或显示，以及不提供会话键的旧宿主退回统一作用域。
 
 构建完成后，可通过 `examples/plugins/plan-plugin/plugin.toml` 加载生成的 WASM component。

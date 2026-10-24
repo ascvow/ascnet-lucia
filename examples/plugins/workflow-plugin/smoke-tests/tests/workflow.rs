@@ -173,6 +173,7 @@ async fn component_runs_dynamic_task_list() {
     let shelf = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
+            session_id: None,
             plugin_id: "workflow".into(),
             view_id: "workflow-shelf".into(),
             instance_id: None,
@@ -216,6 +217,7 @@ async fn component_runs_dynamic_task_list() {
     let workspace = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
+            session_id: None,
             plugin_id: "workflow".into(),
             view_id: "workflow-workspace".into(),
             instance_id: Some("tasks".into()),
@@ -285,6 +287,7 @@ async fn component_runs_dynamic_task_list() {
     let settled_shelf = PluginHost::render_ui(
         &host,
         &UiRenderRequest {
+            session_id: None,
             plugin_id: "workflow".into(),
             view_id: "workflow-shelf".into(),
             instance_id: None,

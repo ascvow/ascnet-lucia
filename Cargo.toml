@@ -23,6 +23,7 @@ members = [
     "examples/plugins/workflow-plugin",
     "examples/plugins/workflow-plugin/smoke-tests",
     "examples/plugins/plan-plugin",
+    "examples/plugins/plan-plugin/smoke-tests",
     "examples/plugins/memory-plugin",
     "examples/plugins/knowledge-plugin",
     "examples/plugins/eden-plugin",

@@ -1847,6 +1847,7 @@ mod tests {
 
         let frame = plugin
             .render_ui(UiRenderRequest {
+                session_id: None,
                 plugin_id: "teammate".into(),
                 view_id: TEAM_DOCK_VIEW.into(),
                 instance_id: None,
@@ -1883,6 +1884,7 @@ mod tests {
 
         let focused = plugin
             .render_ui(UiRenderRequest {
+                session_id: None,
                 plugin_id: "teammate".into(),
                 view_id: TEAM_DOCK_VIEW.into(),
                 instance_id: None,
@@ -1899,6 +1901,7 @@ mod tests {
 
         let workspace = plugin
             .render_ui(UiRenderRequest {
+                session_id: None,
                 plugin_id: "teammate".into(),
                 view_id: TEAM_WORKSPACE_VIEW.into(),
                 instance_id: Some("team".into()),
@@ -1927,6 +1930,7 @@ mod tests {
         );
         let session = plugin
             .render_ui(UiRenderRequest {
+                session_id: None,
                 plugin_id: "teammate".into(),
                 view_id: TEAM_SESSION_VIEW.into(),
                 instance_id: Some(member.id.as_str().into()),
@@ -1958,6 +1962,7 @@ mod tests {
         };
         let frame = plugin
             .render_ui(UiRenderRequest {
+                session_id: None,
                 plugin_id: "teammate".into(),
                 view_id: TEAM_DOCK_VIEW.into(),
                 instance_id: None,
