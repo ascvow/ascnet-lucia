@@ -706,6 +706,7 @@ impl WasmPluginHost {
                             host_services.workspace_root(),
                         )
                         .with_http(host_services.http_for(&manifest.plugin.id))
+                        .with_call_observer(host_services.service_call_observer())
                         .with_provided_capabilities(
                             manifest
                                 .provides

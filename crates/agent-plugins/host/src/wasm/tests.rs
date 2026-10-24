@@ -28,6 +28,73 @@ use super::*;
 use crate::manifest::{PluginDependency, PluginSection, SUPPORTED_PLUGIN_API_VERSION};
 use crate::ui::UiSize;
 
+/// Guest 即使忽略未授权进程结果，真实 linker 仍记录 Denied 且不含参数。
+#[tokio::test]
+async fn component_capability_audit_is_host_owned() -> Result<()> {
+    #[derive(Default)]
+    struct Probe(std::sync::Mutex<Vec<crate::audit::HostCapabilityCallObservation>>);
+    impl crate::audit::HostServiceCallObserver for Probe {
+        fn observe(&self, _: crate::audit::HostServiceCallObservation) {}
+        fn observe_capability(&self, event: crate::audit::HostCapabilityCallObservation) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    let observer = Arc::new(Probe::default());
+    let engine = shared_wasm_engine()?;
+    let component = Component::new(&engine, r#"(component
+        (import "host-process-spawn" (func $spawn (param "s" string) (result string)))
+        (core module $mem
+            (memory (export "memory") 1)
+            (data (i32.const 0) "{}")
+            (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096))
+        (core instance $mem (instantiate $mem))
+        (core func $spawn (canon lower (func $spawn) (memory $mem "memory") (realloc (func $mem "realloc"))))
+        (core module $guest
+            (import "h" "spawn" (func $spawn (param i32 i32 i32)))
+            (func (export "run") i32.const 0 i32.const 2 i32.const 2048 call $spawn))
+        (core instance $guest (instantiate $guest (with "h" (instance (export "spawn" (func $spawn))))))
+        (func (export "run") (canon lift (core func $guest "run"))))"#).into_anyhow()?;
+    let capabilities = CapabilityState::new(
+        "trusted".into(),
+        "audit".into(),
+        PathBuf::from("."),
+        Default::default(),
+        Arc::new(ContributionRegistry::default()),
+        Arc::new(ServiceRegistry::default()),
+        CapabilityHostContext::default().with_call_observer(Some(observer.clone())),
+    )?;
+    let mut store = Store::new(
+        &engine,
+        PluginWasiState::new(
+            WasiCtxBuilder::new().build(),
+            capabilities,
+            StoreLimitsBuilder::new().build(),
+        ),
+    );
+    store.set_fuel(1_000_000).into_anyhow()?;
+    let mut linker = Linker::new(&engine);
+    add_plugin_host_imports(&mut linker)?;
+    let instance = linker
+        .instantiate_async(&mut store, &component)
+        .await
+        .into_anyhow()?;
+    instance
+        .get_typed_func::<(), ()>(&mut store, "run")
+        .into_anyhow()?
+        .call_async(&mut store, ())
+        .await
+        .into_anyhow()?;
+    let events = observer.0.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].plugin_id, "trusted");
+    assert_eq!(events[0].operation, "host-process-spawn");
+    assert_eq!(
+        events[0].result,
+        crate::audit::HostCapabilityCallResult::Denied
+    );
+    Ok(())
+}
+
 /// 真实 Component 在首次导出期间发起服务调用，必须走 Guest ACL 而非应用入口。
 #[tokio::test]
 async fn component_import_enforces_initialization_service_acl() -> Result<()> {

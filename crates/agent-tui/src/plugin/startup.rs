@@ -62,6 +62,7 @@ pub(crate) struct PluginExecutionContext {
     pub(crate) model_provider: ModelProviderConfig,
     /// Serve 平面使用的应用插件状态目录；受限平面必须保持为 `None`。
     pub(crate) persistent_state_dir: Option<PathBuf>,
+    pub(crate) audit: Option<Arc<agent_plugin_host::audit::RotatingCapabilityAudit>>,
 }
 
 #[cfg(feature = "plugins")]
@@ -89,6 +90,7 @@ impl PluginExecutionContext {
             model,
             model_provider,
             persistent_state_dir,
+            audit: None,
         })
     }
 
@@ -341,6 +343,7 @@ pub(crate) async fn load_plugins_for_tui(
         model,
         model_provider,
         persistent_state_dir,
+        audit,
     } = execution;
     let model_gateway = agent_template.gateway().clone();
     let model_name = model
@@ -381,6 +384,9 @@ pub(crate) async fn load_plugins_for_tui(
             .with_context(|| format!("注册插件 `{plugin_id}` 的专属模型路由失败"))?;
     }
     let mut host_services = PluginHostServices::new().restrict_execution_policy(&execution_policy);
+    if let Some(audit) = audit {
+        host_services = host_services.with_service_call_observer(audit);
+    }
     let mut activation_metadata = plugin_settings
         .iter()
         .map(|(plugin_id, settings)| (plugin_id.clone(), settings.metadata.clone()))

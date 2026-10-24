@@ -11,6 +11,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashSet, sync::Mutex};
+mod file;
+pub use file::RotatingCapabilityAudit;
 
 #[cfg(feature = "wasm")]
 use anyhow::Context;
@@ -292,6 +294,33 @@ impl HostServiceCallObservation {
     }
 }
 
+/// 能力入口的可信结果，不表示 HTTP 状态码、进程退出或派生 Agent 成功。
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCapabilityCallResult {
+    /// Host import 返回 Ok。
+    ReturnedOk,
+    /// Host 的类型化权限拒绝。
+    Denied,
+    /// 其他错误，正文不进入审计。
+    Failed,
+    /// 调用被取消，外部副作用是否发生未知。
+    Interrupted,
+}
+
+/// Host 独立生成的脱敏能力证据，不接受 Guest 反序列化输入。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HostCapabilityCallObservation {
+    /// 独立审计记录版本。
+    pub schema_version: u32,
+    /// 来自可信能力状态的插件身份。
+    pub plugin_id: String,
+    /// Host 固定入口名，不包含 Guest 参数。
+    pub operation: &'static str,
+    /// 真实 Host 返回结果分类。
+    pub result: HostCapabilityCallResult,
+}
+
 /// Host 服务调用的旁路审计观察器。
 ///
 /// 回调在服务调用完成后同步执行，不得阻塞、重入 Host 或抛出 panic。Host 会隔离观察器
@@ -299,6 +328,10 @@ impl HostServiceCallObservation {
 pub trait HostServiceCallObserver: Send + Sync {
     /// 接收一条已经脱敏的真实路由记录。
     fn observe(&self, observation: HostServiceCallObservation);
+
+    /// 接收能力入口的脱敏证据；默认忽略以兼容已有观察器。
+    /// 回调不得阻塞或重入 Host，观察失败不改变真实能力结果。
+    fn observe_capability(&self, _observation: HostCapabilityCallObservation) {}
 }
 
 /// 线程安全的内存服务调用观察器，适合测试和短生命周期审计运行。

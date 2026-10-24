@@ -1,5 +1,8 @@
 //! 插件文件、状态、服务与进程能力的宿主实现。
 
+use crate::audit::{
+    HostCapabilityCallObservation, HostCapabilityCallResult, HostServiceCallObserver,
+};
 use crate::capability::agent::AgentCapabilityChecks;
 use crate::capability::process::ManagedProcess;
 use crate::capability::requests::parse_request;
@@ -111,6 +114,7 @@ const HOST_RESPONSE_SCHEMA_VERSION: u32 = 1;
 
 /// 单个插件实例可访问的受控宿主能力状态。
 pub(crate) struct CapabilityState {
+    call_observer: Option<Arc<dyn HostServiceCallObserver>>,
     plugin_id: String,
     plugin_dir: PathBuf,
     permissions: CapabilitySection,
@@ -215,6 +219,7 @@ pub(crate) fn is_capability_denied(error: &anyhow::Error) -> bool {
 /// 插件声明。
 #[derive(Clone, Default)]
 pub(crate) struct CapabilityHostContext {
+    call_observer: Option<Arc<dyn HostServiceCallObserver>>,
     /// 已绑定可信 principal 的 Agent Runtime；缺失时关闭控制面能力。
     agent_runtime: Option<AgentRuntimeBinding>,
     /// Host 固定模型路由；缺失时关闭模型完成能力。
@@ -238,6 +243,14 @@ pub(crate) struct CapabilityHostContext {
 }
 
 impl CapabilityHostContext {
+    /// 注入应用观察器；Guest 与 manifest 无权替换。
+    pub(crate) fn with_call_observer(
+        mut self,
+        observer: Option<Arc<dyn HostServiceCallObserver>>,
+    ) -> Self {
+        self.call_observer = observer;
+        self
+    }
     /// 组合 Host 已完成身份绑定的服务与只能收紧的执行策略。
     ///
     /// `agent_runtime` 和 `model_completion` 缺失时，对应能力保持关闭；
@@ -261,6 +274,7 @@ impl CapabilityHostContext {
             session_source,
             workspace_root,
             provided_capabilities: Vec::new(),
+            call_observer: None,
         }
     }
 
@@ -360,7 +374,50 @@ pub(crate) fn encode_host_response(result: Result<Value>) -> String {
     }
 }
 
+/// 正常结束记录真实结果，取消记录 Interrupted；审计故障不改变权限或调用返回值。
+pub(crate) struct CapabilityCallAudit(
+    Option<(
+        Arc<dyn HostServiceCallObserver>,
+        HostCapabilityCallObservation,
+    )>,
+);
+impl CapabilityCallAudit {
+    pub(crate) fn finish(mut self, result: &Result<Value>) {
+        if let Some((_, observation)) = self.0.as_mut() {
+            observation.result = match result {
+                Ok(_) => HostCapabilityCallResult::ReturnedOk,
+                Err(error) if is_capability_denied(error) => HostCapabilityCallResult::Denied,
+                Err(_) => HostCapabilityCallResult::Failed,
+            };
+        }
+    }
+}
+impl Drop for CapabilityCallAudit {
+    fn drop(&mut self) {
+        if let Some((observer, observation)) = self.0.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.observe_capability(observation)
+            }));
+        }
+    }
+}
+
 impl CapabilityState {
+    /// 入口名由 linker 固定，身份来自当前实例；无观察器不分配记录。
+    pub(crate) fn begin_capability_audit(&self, operation: &'static str) -> CapabilityCallAudit {
+        CapabilityCallAudit(self.call_observer.as_ref().map(|observer| {
+            (
+                Arc::clone(observer),
+                HostCapabilityCallObservation {
+                    schema_version: 1,
+                    plugin_id: self.plugin_id.clone(),
+                    operation,
+                    result: HostCapabilityCallResult::Interrupted,
+                },
+            )
+        }))
+    }
+
     /// 创建绑定到插件目录、manifest 请求和 Host 可信执行策略的能力状态。
     ///
     /// `state_identity` 必须由 Host 根据真实 Bundle 和 capability profile 生成；
@@ -424,6 +481,7 @@ impl CapabilityState {
             state_store,
             workspace_root: host_context.workspace_root,
             provided_capabilities: host_context.provided_capabilities.into_iter().collect(),
+            call_observer: host_context.call_observer,
         })
     }
 

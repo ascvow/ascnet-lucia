@@ -29,6 +29,38 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[derive(Default)]
+struct CapabilityAuditProbe(std::sync::Mutex<Vec<crate::audit::HostCapabilityCallObservation>>);
+impl HostServiceCallObserver for CapabilityAuditProbe {
+    fn observe(&self, _: crate::audit::HostServiceCallObservation) {}
+    fn observe_capability(&self, observation: crate::audit::HostCapabilityCallObservation) {
+        self.0.lock().unwrap().push(observation);
+    }
+}
+
+/// 权限审计只使用可信身份和类型结果，取消保留未知结果，不收集正文。
+#[test]
+fn capability_audit_redacts_payload_and_records_interruption() {
+    use crate::audit::HostCapabilityCallResult as Outcome;
+    let observer = Arc::new(CapabilityAuditProbe::default());
+    let mut state = test_state();
+    state.call_observer = Some(observer.clone());
+    let audit = state.begin_capability_audit("host-process-spawn");
+    let result = state.spawn_process(r#"{"command":"secret","plugin_id":"forged"}"#);
+    assert!(result.as_ref().is_err_and(is_capability_denied));
+    audit.finish(&result);
+    state
+        .begin_capability_audit("host-http-request")
+        .finish(&Err(anyhow!("secret token")));
+    drop(state.begin_capability_audit("host-model-complete"));
+    let events = observer.0.lock().unwrap();
+    assert_eq!(events[0].result, Outcome::Denied);
+    assert_eq!(events[1].result, Outcome::Failed);
+    assert_eq!(events[2].result, Outcome::Interrupted);
+    let encoded = serde_json::to_string(&*events).unwrap();
+    assert!(!encoded.contains("secret") && !encoded.contains("forged"));
+}
+
 /// Agent Runtime 的 Guest 订阅出口不得暴露服务商私有推理增量。
 #[test]
 fn agent_runtime_guest_events_hide_private_thinking() {

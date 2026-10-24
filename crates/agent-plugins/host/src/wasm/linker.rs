@@ -206,7 +206,12 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         "host-fs-read",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-fs-read");
                 let result = caller.data_mut().capabilities.read_file(&request).await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
@@ -217,7 +222,12 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         "host-fs-list",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-fs-list");
                 let result = caller.data_mut().capabilities.list_dir(&request).await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
@@ -227,7 +237,12 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
     root.func_wrap(
         "host-process-spawn",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
+            let audit = caller
+                .data()
+                .capabilities
+                .begin_capability_audit("host-process-spawn");
             let result = caller.data_mut().capabilities.spawn_process(&request);
+            audit.finish(&result);
             Ok((encode_host_response_with_failure(caller.data_mut(), result),))
         },
     )
@@ -237,7 +252,12 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         "host-process-write",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-process-write");
                 let result = caller.data_mut().capabilities.write_process(&request).await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
@@ -248,11 +268,16 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         "host-process-read-line",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-process-read-line");
                 let result = caller
                     .data_mut()
                     .capabilities
                     .read_process_line(&request)
                     .await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
@@ -263,7 +288,12 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         "host-process-kill",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-process-kill");
                 let result = caller.data_mut().capabilities.kill_process(&request).await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
@@ -299,7 +329,12 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             let (allowlist, binding) = caller.data().capabilities.http_context();
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-http-request");
                 let result = CapabilityState::http_request_with(allowlist, binding, &request).await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
@@ -310,11 +345,16 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         "host-socket-connect",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-socket-connect");
                 let result = caller
                     .data_mut()
                     .capabilities
                     .socket_connect(&request)
                     .await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
@@ -325,7 +365,12 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         "host-socket-send",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-socket-send");
                 let result = caller.data_mut().capabilities.socket_send(&request).await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
@@ -336,7 +381,12 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         "host-socket-recv",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-socket-recv");
                 let result = caller.data_mut().capabilities.socket_recv(&request).await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
@@ -347,7 +397,12 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         "host-socket-close",
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-socket-close");
                 let result = caller.data_mut().capabilities.socket_close(&request).await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
@@ -360,9 +415,14 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
             let (allowed, binding, plugin_id) =
                 caller.data().capabilities.model_completion_context();
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-model-complete");
                 let result =
                     CapabilityState::complete_model_with(allowed, binding, &plugin_id, &request)
                         .await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },
@@ -374,8 +434,13 @@ pub(super) fn add_plugin_host_imports(linker: &mut Linker<PluginWasiState>) -> R
         |mut caller: StoreContextMut<'_, PluginWasiState>, (request,): (String,)| {
             let (permissions, binding) = caller.data().capabilities.agent_runtime_context();
             Box::new(async move {
+                let audit = caller
+                    .data()
+                    .capabilities
+                    .begin_capability_audit("host-agent-runtime-call");
                 let result =
                     CapabilityState::call_agent_runtime_with(permissions, binding, &request).await;
+                audit.finish(&result);
                 Ok((encode_host_response_with_failure(caller.data_mut(), result),))
             })
         },

@@ -724,7 +724,7 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         ),
     };
     #[cfg(feature = "plugins")]
-    let plugin_execution = PluginExecutionContext::new(
+    let mut plugin_execution = PluginExecutionContext::new(
         agent_tool::ExecutionPolicy::serve(),
         None,
         tui_settings.review_model.clone(),
@@ -734,6 +734,18 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             &plugin_workspace_scope,
         )),
     )?;
+    #[cfg(feature = "plugins")]
+    let capability_audit = args
+        .capability_audit_dir
+        .as_ref()
+        .map(|path| agent_plugin_host::audit::RotatingCapabilityAudit::open(path).map(Arc::new))
+        .transpose()?;
+    #[cfg(feature = "plugins")]
+    {
+        plugin_execution.audit = capability_audit.clone();
+    }
+    #[cfg(feature = "plugins")]
+    let mut reported_audit_drops = 0;
     #[cfg(feature = "plugins")]
     let plugin_agent_runtime = plugin_execution.runtime().clone();
     // 插件配置与主配置同源；解析失败直接终止启动，避免带着半套路由进入交互。
@@ -1426,6 +1438,19 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 }
                 #[cfg(feature = "plugins")]
                 {
+                    if let Some(audit) = capability_audit.as_ref() {
+                        let dropped = audit.dropped_count();
+                        if dropped != reported_audit_drops {
+                            reported_audit_drops = dropped;
+                            app.messages.push(Msg::new(
+                                MsgKind::Error,
+                                format!(
+                                    "能力审计记录不完整：已丢失 {dropped} 条，请检查目录或磁盘。"
+                                ),
+                            ));
+                            needs_redraw = true;
+                        }
+                    }
                     app.tick_plugin_status();
                     app.plugin_tick = app.plugin_tick.wrapping_add(1);
                     if app.plugin_tick >= PLUGIN_REFRESH_TICKS {
@@ -1595,6 +1620,15 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     if let Some(probe) = probe.as_ref() {
         if let Some(path) = probe.write_report(&lucia_home) {
             println!("流式诊断报告已写入 {}", path.display());
+        }
+    }
+    #[cfg(feature = "plugins")]
+    if let Some(audit) = capability_audit {
+        if let Err(error) = audit.flush(std::time::Duration::from_secs(2)) {
+            eprintln!("能力审计刷新失败：{error}");
+        }
+        if audit.dropped_count() > 0 {
+            eprintln!("能力审计丢失 {} 条记录", audit.dropped_count());
         }
     }
     #[cfg(feature = "plugins")]

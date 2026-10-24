@@ -42,6 +42,11 @@ pub(crate) struct Args {
     #[arg(long = "list-sessions")]
     pub(crate) list_sessions: bool,
 
+    /// 将脱敏 Host 能力审计写入专用私有目录；有界队列与轮转，不包含正文或密钥。
+    #[cfg(feature = "plugins")]
+    #[arg(long = "capability-audit-dir")]
+    pub(crate) capability_audit_dir: Option<PathBuf>,
+
     /// 插件 manifest 路径；可以重复传入并按参数顺序占用 UI 插槽。
     #[cfg(feature = "plugins")]
     #[arg(long = "plugin-manifest")]
