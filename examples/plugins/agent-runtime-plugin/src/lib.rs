@@ -23,17 +23,17 @@ impl AgentPlugin for AgentRuntimePlugin {
         vec![
             empty_tool(
                 "agent_runtime_identity",
-                "返回当前插件 controller 的可信 Agent ID。",
+                "<tool_usage><purpose>Return the current plugin controller's host-bound Agent ID.</purpose></tool_usage>",
             ),
             ToolSpec::new(
                 "agent_runtime_spawn",
-                "使用受限 worker profile 异步启动派生 Agent。调用立即返回 Agent ID，不等待任务完成；随后使用 agent_runtime_status 和 agent_runtime_result 轮询。",
+                "<tool_usage><purpose>Start a child Agent asynchronously with the restricted worker profile.</purpose><workflow>Provide a complete task and use delegation only when it adds value. The returned ID confirms startup, not completion. Do independent work before checking status; retrieve agent_runtime_result before using the outcome. Avoid tight polling loops.</workflow><constraints>The Host controls the profile, identity, permissions, and resource limits.</constraints></tool_usage>",
                 json!({
                     "type": "object",
                     "properties": {
                         "input": {
                             "type": "string",
-                            "description": "交给派生 Agent 的首次用户输入。",
+                            "description": "Complete initial task for the child Agent, including scope and expected deliverables.",
                             "minLength": 1
                         }
                     },
@@ -44,18 +44,18 @@ impl AgentPlugin for AgentRuntimePlugin {
             .with_permission_scope(ToolPermissionScope::Control),
             ToolSpec::new(
                 "agent_runtime_continue",
-                "从成功终态 Agent 的私有会话异步创建后续运行；调用立即返回新句柄。",
+                "<tool_usage><purpose>Start a continuation from a successfully completed Agent's private session.</purpose><result>Return a new execution handle immediately; retrieve its terminal result before claiming completion.</result><constraints>The target must be manageable by the current controller; inherited permissions remain host-enforced.</constraints></tool_usage>",
                 json!({
                     "type": "object",
                     "properties": {
                         "target": {
                             "type": "string",
-                            "description": "已成功结束且当前 controller 有权管理的 Agent ID。",
+                            "description": "Successfully completed Agent ID manageable by the current controller.",
                             "minLength": 1
                         },
                         "input": {
                             "type": "string",
-                            "description": "追加到目标会话的新用户输入。",
+                            "description": "New user input to append to the target session.",
                             "minLength": 1
                         }
                     },
@@ -66,15 +66,15 @@ impl AgentPlugin for AgentRuntimePlugin {
             .with_permission_scope(ToolPermissionScope::Control),
             target_tool(
                 "agent_runtime_status",
-                "查询 controller 或其后代 Agent 的当前状态、谱系与有效权限。",
+                "<tool_usage><purpose>Inspect the controller or a descendant Agent's status, lineage, and effective permissions.</purpose><constraints>Avoid repeated polling without a reason to expect progress.</constraints></tool_usage>",
             ),
             target_tool(
                 "agent_runtime_result",
-                "读取派生 Agent 的幂等终态结果；任务尚未结束时返回 completed=false。",
+                "<tool_usage><purpose>Read a child Agent's idempotent terminal result.</purpose><result>completed=false means the task is still pending, not successful.</result><workflow>Inspect the outcome and its evidence before reporting completion.</workflow></tool_usage>",
             ),
             target_tool(
                 "agent_runtime_cancel",
-                "级联取消 controller 的指定后代任务，并返回本次是否执行了取消。",
+                "<tool_usage><purpose>Cancel a selected descendant and its subtree; return whether cancellation was performed.</purpose><constraints>Cancellation does not undo completed side effects.</constraints></tool_usage>",
             ),
         ]
     }
@@ -102,7 +102,7 @@ impl AgentPlugin for AgentRuntimePlugin {
                         "handle": handle,
                         "profile": WORKER_PROFILE,
                         "completed": false,
-                        "next": "使用 agent_runtime_status 或 agent_runtime_result 轮询，禁止在插件内阻塞等待。"
+                        "next": "<next_step>Do independent work, then check agent_runtime_status or retrieve agent_runtime_result. Avoid tight polling; do not block inside the plugin.</next_step>"
                     }),
                 )
             }
@@ -115,7 +115,7 @@ impl AgentPlugin for AgentRuntimePlugin {
                     json!({
                         "handle": handle,
                         "completed": false,
-                        "next": "使用 agent_runtime_status 或 agent_runtime_result 轮询后续运行。"
+                        "next": "<next_step>Use the new handle for agent_runtime_status or agent_runtime_result. Avoid tight polling and verify the terminal outcome.</next_step>"
                     }),
                 )
             }
@@ -173,7 +173,7 @@ fn target_tool(name: &str, description: &str) -> ToolSpec {
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "由 Agent Runtime 返回的不透明 Agent ID。",
+                    "description": "Opaque Agent ID returned by Agent Runtime.",
                     "minLength": 1
                 }
             },
@@ -219,6 +219,9 @@ mod tests {
     fn runtime_tools_declare_control_scope() {
         let tools = AgentRuntimePlugin.list_tools();
         assert!(!tools.is_empty());
+        assert!(tools.iter().all(|tool| tool.description.is_ascii()
+            && tool.description.starts_with("<tool_usage>")
+            && tool.description.ends_with("</tool_usage>")));
         assert!(tools
             .iter()
             .all(|tool| tool.permission_scope == ToolPermissionScope::Control));

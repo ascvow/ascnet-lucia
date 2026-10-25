@@ -31,11 +31,11 @@ pub(crate) fn build_demo_gateway() -> (ModelGateway, AgentOptions) {
 pub(crate) fn echo_spec() -> ToolSpec {
     ToolSpec::new(
         "echo",
-        "回显输入文本。",
+        "<tool_usage><purpose>Echo the input text for a local tool-calling demonstration.</purpose><constraints>This tool does not execute commands or change files.</constraints></tool_usage>",
         json!({
             "type": "object",
             "properties": {
-                "text": { "type": "string", "description": "要回显的文本" }
+                "text": { "type": "string", "description": "Text to echo unchanged." }
             },
             "required": ["text"],
             "additionalProperties": false

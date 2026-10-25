@@ -238,7 +238,11 @@ impl Tool for SearchFilesTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "search_files",
-            "Recursively search a directory tree for a case-sensitive literal substring and return the matching file, 1-based line number, and line content. Use this to locate files by known text or identifiers. Regular expressions are not supported. Common dependency and build directories, binary or non-UTF-8 files, and files larger than 1 MiB are skipped.",
+            r#"<tool_usage>
+  <purpose>Find files by a case-sensitive literal substring; return paths, 1-based line numbers, and matching line previews.</purpose>
+  <workflow>Narrow the root and file-name filter when possible. Read relevant matches with read_file before editing; previews may be truncated. A search with skipped files is not proof that content is absent everywhere.</workflow>
+  <constraints>Regular expressions are not supported. Common dependency/build directories, binary or non-UTF-8 files, and files larger than 1 MiB are skipped. Results are bounded by max_results.</constraints>
+</tool_usage>"#,
             json!({
                 "type": "object",
                 "properties": {
@@ -248,7 +252,7 @@ impl Tool for SearchFilesTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Root directory for the recursive search; defaults to the current directory"
+                        "description": "Root directory for the recursive search; defaults to the configured workspace root, or the current directory without a workspace"
                     },
                     "include": {
                         "type": "string",

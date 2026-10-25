@@ -597,7 +597,7 @@ impl EventListener for PluginFanout {
                     event.block_reason = Some(reason);
                     // 一次性指导不暴露具体策略插件 ID，避免模型据此推断绕过路径。
                     event.agent_guidance = Some(
-                        "工具策略尚未就绪，当前调用未执行；请先继续处理无需该工具的部分，必要时稍后再尝试。"
+                        "<tool_admission><status>The tool policy is not ready; this call was not executed.</status><action>Continue work that does not need this tool. Retry only when the policy is ready; do not bypass the gate through another tool.</action></tool_admission>"
                             .into(),
                     );
                 }

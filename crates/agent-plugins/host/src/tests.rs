@@ -1654,7 +1654,10 @@ async fn live_host_blocks_tools_until_selected_policy_is_ready() {
     let guidance = dispatched.event.agent_guidance.expect("应附带一次性指导");
     assert!(reason.contains("仍在加载"));
     assert!(!guidance.contains("permission"));
-    assert!(guidance.contains("稍后再尝试"));
+    assert!(guidance.is_ascii());
+    assert!(guidance.starts_with("<tool_admission>"));
+    assert!(guidance.ends_with("</tool_admission>"));
+    assert!(guidance.contains("Retry only when the policy is ready"));
 }
 
 /// 独占能力归属尚未解析时必须默认阻止工具，避免启动竞态形成策略空窗。
@@ -1675,7 +1678,10 @@ async fn live_host_blocks_tools_while_capability_planning_is_pending() {
     let reason = dispatched.event.block_reason.expect("应给出可解释阻止原因");
     let guidance = dispatched.event.agent_guidance.expect("应附带一次性指导");
     assert!(reason.contains("能力归属仍在解析"));
-    assert!(guidance.contains("稍后再尝试"));
+    assert!(guidance.is_ascii());
+    assert!(guidance.starts_with("<tool_admission>"));
+    assert!(guidance.ends_with("</tool_admission>"));
+    assert!(guidance.contains("Retry only when the policy is ready"));
 }
 
 /// 装配一台挂载总线、已完成能力规划并开启一次运行快照的动态宿主。

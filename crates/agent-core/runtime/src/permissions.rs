@@ -219,7 +219,10 @@ mod tests {
             .expect("拒绝应附带一次性指导");
         assert!(reason.contains("shell"));
         assert!(!guidance.contains("shell"));
-        assert!(guidance.contains("权限范围内"));
+        assert!(guidance.is_ascii());
+        assert!(guidance.starts_with("<tool_access>"));
+        assert!(guidance.ends_with("</tool_access>"));
+        assert!(guidance.contains("permitted capabilities"));
     }
 
     /// allowlist 内的工具不得被门禁取消。
@@ -386,7 +389,7 @@ impl EventListener for ToolAccessListener {
             event.call.name
         ));
         event.agent_guidance = Some(
-            "当前 Agent 无权使用该工具，调用未执行；不要重复相同调用，请改用权限范围内的工具继续。"
+            "<tool_access><status>This Agent is not allowed to use the tool; the call was not executed.</status><action>Do not repeat the call or bypass the restriction. Continue using permitted capabilities, or report the blocker if the task cannot proceed.</action></tool_access>"
                 .to_string(),
         );
         ctx.cancel();

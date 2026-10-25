@@ -792,7 +792,13 @@ fn ordered_plan_items(plan: &PlanState) -> impl Iterator<Item = &PlanItem> {
 /// 最小步骤数直接取自 [`MIN_TRACKED_STEPS`]，描述与准入策略不会各自漂移。
 fn update_plan_tool() -> ToolSpec {
     let description = format!(
-        "仅为困难或较大的任务创建或更新计划；默认不要创建。满足以下任一条件才使用：改动跨多个模块或多个文件且顺序有依赖；任务能拆成 {MIN_TRACKED_STEPS} 个以上可独立验证的阶段；预计多轮长时执行，可能中途暂停或需要持续向用户汇报进度；用户明确要求维护计划。以下情况不要创建计划：直接问答与代码解释、代码阅读与初步探索、单文件小改动、单条命令或单次测试、格式化与重命名、窄范围修复，以及一次连续执行就能完成的任务。计划至少 {MIN_TRACKED_STEPS} 个步骤，每步必须是独立可验证的成果，不要把同一个动作拆成多步凑数；始终提交包含已完成项的完整计划，且最多一个步骤为 in_progress。每完成一个步骤就立即调用本工具把它标记为 completed 并开始下一步，不要等整轮结束再补；插件会在每轮结束时自动完成仍为 in_progress 的步骤，并在计划全部完成或该轮没有更新过计划时直接回收计划（进度架随之消失）。"
+        r#"<tool_usage>
+  <purpose>Maintain a complete progress snapshot for substantial work; do not create a plan by default.</purpose>
+  <when_to_use>Use when work has dependent changes across multiple files or modules, at least {MIN_TRACKED_STEPS} independently verifiable phases, a long execution needing progress tracking, or an explicit user request for a plan.</when_to_use>
+  <constraints>Skip direct questions, initial exploration, small single-file changes, isolated commands or tests, formatting, renaming, narrow fixes, and work you can finish in one continuous action. Require at least {MIN_TRACKED_STEPS} meaningful steps; never pad a simple task to meet the threshold.</constraints>
+  <workflow>Submit the full ordered plan including completed steps, with at most one in_progress step. Immediately mark each finished step completed and start the next; do not wait until the final response. Use an empty plan to clear it.</workflow>
+  <lifecycle>At a non-cancelled run end, the plugin completes remaining in_progress steps and removes the plan if all steps are completed or the plan was not updated in that run. Automatic UI cleanup is not evidence that the work was verified.</lifecycle>
+</tool_usage>"#
     );
     ToolSpec::new(
         UPDATE_PLAN_TOOL,
@@ -802,18 +808,18 @@ fn update_plan_tool() -> ToolSpec {
             "properties": {
                 "explanation": {
                     "type": "string",
-                    "description": "可选的计划调整原因或进度说明。"
+                    "description": "Optional reason for the plan change or progress update."
                 },
                 "plan": {
                     "type": "array",
-                    "description": format!("按执行顺序排列的完整计划，至少 {MIN_TRACKED_STEPS} 步；空数组用于清空计划。"),
+                    "description": format!("Complete ordered plan with at least {MIN_TRACKED_STEPS} steps; an empty array clears the plan."),
                     "items": {
                         "type": "object",
                         "properties": {
                             "step": {
                                 "type": "string",
                                 "minLength": 1,
-                                "description": "具体且可验证的步骤描述。"
+                                "description": "A concrete, independently verifiable outcome."
                             },
                             "status": {
                                 "type": "string",
@@ -836,7 +842,7 @@ fn update_plan_tool() -> ToolSpec {
 fn get_plan_tool() -> ToolSpec {
     ToolSpec::new(
         GET_PLAN_TOOL,
-        "读取当前任务计划、步骤状态和修订号。仅在需要确认现有计划且上下文中没有最新快照时调用。",
+        "<tool_usage><purpose>Read the current plan, step statuses, and revision.</purpose><when_to_use>Only when you need to confirm the plan and the latest snapshot is not already in context.</when_to_use></tool_usage>",
         ToolSpec::empty_object_schema(),
     )
     .with_permission_scope(ToolPermissionScope::Control)
@@ -972,18 +978,26 @@ mod tests {
     fn update_plan_description_requires_real_task_complexity() {
         let description = update_plan_tool().description;
 
-        assert!(description.contains("默认不要创建"));
-        assert!(description.contains("跨多个模块或多个文件"));
-        assert!(description.contains("3 个以上可独立验证的阶段"));
-        assert!(description.contains("用户明确要求维护计划"));
-        assert!(description.contains("直接问答"));
-        assert!(description.contains("单文件小改动"));
-        assert!(description.contains("一次连续执行就能完成"));
-        assert!(description.contains("计划至少 3 个步骤"));
-        assert!(description.contains("不要把同一个动作拆成多步凑数"));
-        assert!(description.contains("每完成一个步骤就立即调用本工具"));
-        assert!(description.contains("自动完成仍为 in_progress"));
-        assert!(description.contains("回收计划"));
+        assert!(description.is_ascii());
+        assert!(description.starts_with("<tool_usage>"));
+        assert!(description.ends_with("</tool_usage>"));
+        for condition in [
+            "do not create a plan by default",
+            "dependent changes across multiple files or modules",
+            "at least 3 independently verifiable phases",
+            "explicit user request",
+            "Skip direct questions",
+            "small single-file changes",
+            "one continuous action",
+            "at least 3 meaningful steps",
+            "never pad a simple task",
+            "Immediately mark each finished step completed",
+            "completes remaining in_progress steps",
+            "removes the plan",
+            "at most one in_progress",
+        ] {
+            assert!(description.contains(condition), "{condition}");
+        }
     }
 
     /// 不足三步的计划会被拒绝，并明确提示直接执行任务。

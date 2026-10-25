@@ -35,7 +35,11 @@ impl Tool for ListDirectoryTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "list_directory",
-            "List the direct children of a directory without recursing, returning each entry's name, type, and file size. Directories above 4096 entries are rejected, not truncated. To locate files recursively by content, use search_files instead.",
+            r#"<tool_usage>
+  <purpose>List a directory's direct children without recursing, including each entry's name, type, and file size.</purpose>
+  <workflow>Use to inspect an unfamiliar directory. To locate files recursively by known content, use search_files instead.</workflow>
+  <constraints>Directories above 4096 entries are rejected, not truncated.</constraints>
+</tool_usage>"#,
             json!({
                 "type": "object",
                 "properties": {

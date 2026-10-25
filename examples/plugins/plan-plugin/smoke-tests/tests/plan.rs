@@ -131,6 +131,14 @@ async fn component_isolates_plans_between_sessions() {
         .await
         .expect("Plan component 应加载成功");
 
+    let tools = host.list_tools().await.expect("读取计划工具");
+    assert!(tools.iter().all(|tool| tool.description.is_ascii()
+        && tool.description.starts_with("<tool_usage>")
+        && tool.description.ends_with("</tool_usage>")));
+    assert!(tools
+        .iter()
+        .any(|tool| tool.description.contains("at least 3 meaningful steps")));
+
     let declarations = PluginHost::ui_declarations(&host)
         .await
         .expect("计划 UI 声明应可读取");

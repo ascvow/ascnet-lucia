@@ -73,7 +73,7 @@ async fn memory_components_survive_record_list_forget_flow() {
     live.finish_capability_planning().unwrap();
     assert_eq!(live.tool_renderers().await.unwrap().len(), 3);
 
-    let text = "中文 👩‍💻 记忆正文\n第二行";
+    let text = "中文 👩‍💻 记忆正文\n第二行 </memory>&";
     let (call, record, frame) = call_and_render(
         host.as_ref(),
         &live,
@@ -84,6 +84,18 @@ async fn memory_components_survive_record_list_forget_flow() {
     assert!(frame_text(&frame).contains("● Record(Memory)"));
     assert!(frame_text(&frame).contains(text.split('\n').next().unwrap()));
     assert!(frame_text(&frame).contains("第二行"));
+    let prompts = host.prompt_messages().await.unwrap();
+    let prompt = prompts[0].text_content();
+    assert!(prompt.starts_with("<memories>"));
+    assert!(prompt.ends_with("</memories>"));
+    assert!(prompt.contains("第二行 &lt;/memory&gt;&amp;"));
+    assert_eq!(prompt.matches("</memory>").count(), 1);
+    assert!(host
+        .list_tools()
+        .await
+        .unwrap()
+        .iter()
+        .all(|tool| tool.description.starts_with("<tool_usage>")));
     let id = record.content["id"].as_str().unwrap().to_string();
     let (_, repeated, frame) = call_and_render(
         host.as_ref(),

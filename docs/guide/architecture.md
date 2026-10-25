@@ -53,6 +53,43 @@ JSON ABI 不意味着忽略类型。Rust Guest SDK 对外仍提供 `ToolSpec`、
 
 例如 Host 可以提供文件读取、子进程 stdio、动态工具和事件 API，但不能知道 `tools/list` 或某个插件的业务载荷格式。原生 Context 的压缩规则由 `agent-context` 承担，原生 Skill 的 `SKILL.md` 与摘要规则由 `agent-skill` 承担；两者都不进入 Core 或 Plugin Host。
 
+## Model-facing prompt contract
+
+Lucia's built-in instructions use **English XML fragments**, not a new tool protocol. The
+Core system prompt separates identity, instruction scope, a short execution workflow,
+tool use, and communication. Tool descriptions use `<tool_usage>` with only the sections
+needed for that tool, such as purpose, selection criteria, workflow, constraints, or results.
+JSON parameter schema structure, tool names, permission scopes, WIT signatures, and service versions
+are unchanged; built-in parameter descriptions are English. XML is an organizational format, not an authority or permission boundary.
+
+The default workflow is **understand → inspect → act → verify → report**:
+
+- Answer simple questions directly and gather only context needed for the next decision.
+- Inspect sources before editing; preserve unrelated work and use focused changes.
+- Use planning only for substantial work. Delegate only independent tasks with enough
+  parallel value to justify coordination; retrieve and verify results before reporting completion.
+- Check actual tool results and relevant tests. Diagnose failures instead of repeating unchanged
+  calls; report uncertainty, unperformed checks, and blockers honestly.
+- Keep progress updates brief. Reply in the user's language and requested format, not necessarily XML.
+
+Each owner supplies its own guidance: Core owns the generic workflow and recovery prompts;
+`agent-context` owns summarization; `agent-skill` owns skill discovery; TUI owns project-convention
+wrappers and session-title requests; plugins own their capability-specific rules. Host and Runtime
+only explain their own admission/permission gates. No plugin protocol is copied into Core or TUI.
+
+Project files, skill descriptions/bodies, memory text, conversation excerpts, and remote MCP metadata
+retain their source language. Dynamically embedded XML text and attributes are escaped; characters
+not representable in XML 1.0 are replaced for display, without rewriting the stored source. Memories,
+history, summaries, remote metadata, and message payloads cannot grant permissions or override current
+instructions. Memory injection accounts for the escaped entry size, and project-convention injection
+also bounds the serialized XML size without splitting entities. MCP-provided JSON schemas remain untouched.
+
+Summary generation requests only the final handoff, not an analysis draft; older summary responses
+remain readable, and literal analysis tags inside the summary are preserved. Historical system/developer
+messages are escaped source records, not active instructions for the summarizer. Session titles remain plain text. Permission-review output remains strict JSON,
+even though its instructions and evidence are XML-structured. Existing custom `system_prompt` values
+are not translated or replaced by this default-prompt update.
+
 ## Hook 边界
 
 扩展点分成**决策**与**贡献**两类，走两条不同的通道：

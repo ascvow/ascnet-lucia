@@ -47,7 +47,12 @@ impl Tool for EditFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "edit_file",
-            "Replace an exact text fragment in an existing file, keeping the rest byte-for-byte unchanged. Prefer this over write_file for any modification to a file that already exists: it avoids resending unchanged content and cannot clobber unrelated parts. Read the file first so old_string matches exactly, including indentation. old_string must appear exactly once unless replace_all is true; a missing or ambiguous match fails without touching the file. Returns a unified diff of the applied change.",
+            r#"<tool_usage>
+  <purpose>Replace an exact text fragment in an existing file, keeping all other bytes unchanged.</purpose>
+  <workflow>Prefer this over write_file for existing files. Read the file first and copy old_string exactly, including whitespace but excluding displayed line numbers. Include enough context for a unique match. Inspect the returned diff and run relevant validation.</workflow>
+  <constraints>old_string must be nonempty and differ from new_string. A missing or ambiguous match fails without changes; use replace_all only when every occurrence should change.</constraints>
+  <result>A unified diff of the applied change, not proof that the change passes tests.</result>
+</tool_usage>"#,
             json!({
                 "type": "object",
                 "properties": {

@@ -112,6 +112,18 @@ async fn history_components_preserve_evidence_and_restored_transcript() {
     live.ui_declarations().await.unwrap();
     live.finish_capability_planning().unwrap();
     assert_eq!(live.tool_renderers().await.unwrap().len(), 2);
+    let prompts = host.prompt_messages().await.unwrap();
+    let prompt = prompts[0].text_content();
+    assert!(prompt.is_ascii());
+    assert!(prompt.starts_with("<history_context>"));
+    assert!(prompt.ends_with("</history_context>"));
+    assert!(prompt.contains("history_read, then verify current"));
+    assert!(host
+        .list_tools()
+        .await
+        .unwrap()
+        .iter()
+        .all(|tool| tool.description.starts_with("<tool_usage>")));
 
     let (_, search, frame) = call_and_render(
         host.as_ref(),

@@ -37,7 +37,12 @@ impl Tool for WriteFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "write_file",
-            "Create or overwrite a file with complete content, creating parent directories when needed. Use this only for a new file or when full replacement is intended. It does not support partial edits or appends, and overwriting discards all existing content. Returns the path and number of bytes written.",
+            r#"<tool_usage>
+  <purpose>Create a file or intentionally replace its complete contents; create parent directories when needed.</purpose>
+  <workflow>Use for new files or deliberate full replacement. For a partial change to an existing file, use edit_file instead.</workflow>
+  <constraints>This tool does not support partial edits or appends. Overwriting discards all previous content; inspect existing files before replacing them.</constraints>
+  <result>The path and number of bytes written.</result>
+</tool_usage>"#,
             json!({
                 "type": "object",
                 "properties": {

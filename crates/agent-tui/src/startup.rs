@@ -1873,7 +1873,9 @@ mod tests {
         let reason = dispatched.event.block_reason.expect("应给出可解释阻止原因");
         let guidance = dispatched.event.agent_guidance.expect("应附带一次性指导");
         assert!(reason.contains("能力归属仍在解析"));
-        assert!(guidance.contains("当前调用未执行"));
+        assert!(guidance.starts_with("<tool_admission>"));
+        assert!(guidance.ends_with("</tool_admission>"));
+        assert!(guidance.contains("this call was not executed"));
     }
 
     /// 非热点移动不重绘，悬停改变仍会标脏；其他鼠标输入不丢。

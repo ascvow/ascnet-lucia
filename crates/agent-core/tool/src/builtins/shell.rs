@@ -260,7 +260,11 @@ impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "shell",
-            "Run a shell command through sh -c and return stdout, stderr, and the exit code. Use this for builds, tests, version-control operations, or tasks without a dedicated tool. Prefer the dedicated tools for reading, writing, listing, and searching files. Each output stream is limited to 100 KiB.",
+            r#"<tool_usage>
+  <purpose>Run a command through sh -c and return stdout, stderr, and the exit code.</purpose>
+  <workflow>Use for builds, tests, version-control operations, or work without a dedicated tool. Prefer the dedicated tools for reading, editing, listing, and searching files. Set the working directory and inspect the exit code before claiming success.</workflow>
+  <constraints>This is native process execution, not a filesystem sandbox; commands may have system-wide side effects. Do not use it to bypass tool permission denials. Each output stream is limited to 100 KiB.</constraints>
+</tool_usage>"#,
             json!({
                 "type": "object",
                 "properties": {
@@ -276,7 +280,7 @@ impl Tool for ShellTool {
                     },
                     "working_directory": {
                         "type": "string",
-                        "description": "Working directory for the command; defaults to the current process directory"
+                        "description": "Working directory for the command; defaults to the configured workspace root, or the current process directory without a workspace"
                     }
                 },
                 "required": ["command"],

@@ -46,7 +46,7 @@ impl AgentPlugin for UiShowcasePlugin {
     fn list_tools(&self) -> Vec<ToolSpec> {
         vec![ToolSpec::new(
             "ui_showcase_control",
-            "控制 UI 展示插件：打开或关闭对话框、调整计数、设置面板消息。",
+            "<tool_usage><purpose>Control the UI showcase: open or close a dialog, adjust the counter, set a panel message, or reset the demonstration.</purpose><when_to_use>Only when interacting with or testing the UI showcase is part of the user's request.</when_to_use></tool_usage>",
             json!({
                 "type": "object",
                 "properties": {
@@ -56,7 +56,7 @@ impl AgentPlugin for UiShowcasePlugin {
                     },
                     "message": {
                         "type": "string",
-                        "description": "set_message 操作使用的新消息。"
+                        "description": "New panel text for the set_message action."
                     }
                 },
                 "required": ["action"],
@@ -464,5 +464,8 @@ mod tests {
     fn ui_showcase_tool_declares_control_scope() {
         let tools = UiShowcasePlugin::default().list_tools();
         assert_eq!(tools[0].permission_scope, ToolPermissionScope::Control);
+        assert!(tools[0].description.is_ascii());
+        assert!(tools[0].description.starts_with("<tool_usage>"));
+        assert!(tools[0].description.ends_with("</tool_usage>"));
     }
 }

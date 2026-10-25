@@ -68,6 +68,23 @@ mod tests {
                 .expect("内置工具定义必须存在")
         };
 
+        for spec in &specs {
+            assert!(spec.description.is_ascii(), "{}", spec.name);
+            assert!(
+                spec.description.starts_with("<tool_usage>"),
+                "{}",
+                spec.name
+            );
+            assert!(spec.description.ends_with("</tool_usage>"), "{}", spec.name);
+            assert!(spec.description.contains("<purpose>"), "{}", spec.name);
+            assert!(spec.description.contains("<constraints>"), "{}", spec.name);
+        }
+        assert!(description("read_file").contains("8 MiB"));
+        assert!(description("read_file").contains("256 KiB"));
+        assert!(description("read_file").contains("1 MiB"));
+        assert!(description("list_directory").contains("4096"));
+        assert!(description("shell").contains("not a filesystem sandbox"));
+        assert!(description("shell").contains("100 KiB"));
         assert!(description("read_file").contains("locate it with search_files first"));
         assert!(description("write_file").contains("does not support partial edits or appends"));
         assert!(description("edit_file").contains("Prefer this over write_file"));

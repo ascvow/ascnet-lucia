@@ -30,7 +30,16 @@ struct BlockingReviewModel {
 #[async_trait]
 impl ChatModel for BlockingReviewModel {
     /// 通知测试模型已经进入，并等待测试显式释放后返回允许结论。
-    async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let system = request.system.as_deref().expect("审核必须携带系统提示");
+        assert!(system.is_ascii());
+        assert!(system.starts_with("<permission_review>"));
+        assert!(system.ends_with("</permission_review>"));
+        assert!(system.contains("Return exactly one line of JSON, not XML"));
+        assert!(request
+            .messages
+            .iter()
+            .any(|message| message.text_content().starts_with("<review_request>")));
         self.entered.notify_one();
         self.release.notified().await;
         Ok(ModelResponse::text(r#"{"decision":"allow"}"#))

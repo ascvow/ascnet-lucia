@@ -44,7 +44,11 @@ impl Tool for ReadFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "read_file",
-            "Read a known regular UTF-8 text file (up to 8 MiB, 256 KiB per line) and return numbered lines with exact pagination metadata. Page JSON is limited to 1 MiB; reduce limit on overflow. if the path is unknown, locate it with search_files first.",
+            r#"<tool_usage>
+  <purpose>Read a known regular UTF-8 file and return numbered lines with exact pagination metadata.</purpose>
+  <workflow>If the path is unknown, locate it with search_files first. Read only the relevant page; increase offset to continue. Displayed line numbers are not part of the file content.</workflow>
+  <constraints>Files are limited to 8 MiB and lines to 256 KiB. Page JSON is limited to 1 MiB; reduce limit on overflow.</constraints>
+</tool_usage>"#,
             json!({
                 "type": "object",
                 "properties": {

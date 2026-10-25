@@ -94,6 +94,9 @@ async fn component_spawns_and_continues_agent() {
         .await
         .expect("插件工具应可读取");
     assert_eq!(tools.len(), 6);
+    assert!(tools.iter().all(|tool| tool.description.is_ascii()
+        && tool.description.starts_with("<tool_usage>")
+        && tool.description.ends_with("</tool_usage>")));
 
     let spawned = call_tool(
         &host,

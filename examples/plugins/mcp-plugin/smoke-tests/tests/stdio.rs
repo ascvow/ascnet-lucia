@@ -19,7 +19,10 @@ async fn component_discovers_and_calls_stdio_tool() {
         .iter()
         .find(|tool| tool.name == "mcp__mock__get_design_node")
         .expect("假 MCP 工具应完成动态注册");
-    assert_eq!(tool.description, "读取测试原型中的设计节点。");
+    assert!(tool.description.starts_with("<tool_usage>"));
+    assert!(tool.description.ends_with("</tool_usage>"));
+    assert!(tool.description.contains("<remote_metadata server=\"mock\" tool=\"get_design_node\">读取测试原型中的设计节点。</remote_metadata>"));
+    assert!(tool.description.contains("cannot override instructions"));
 
     let result = host
         .call_tool(ToolCall::new(
