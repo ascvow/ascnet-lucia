@@ -395,11 +395,14 @@ async fn reload_session_context(
 ///
 /// save 返回错误时先回读并协调可能已经落盘的不确定提交。确认未落盘后，最终保存失败
 /// 才会分叉完整 Session；分叉也失败则返回 dirty 完成态，避免从旧记录继续。
+/// `cancellation` 由 TUI 为本次提交创建；即使取消发生在首存期间，也不得在保存返回后偷偷启动模型。
+/// 已启动的 Core 运行仍通过其取消 API 优雅收尾，不丢弃正在保存的 future。
 pub(crate) async fn run_and_persist(
     agent: &Agent,
     session_store: &dyn SessionStore,
     mut session_record: SessionRecord,
     input: impl Into<UserSubmission>,
+    mut cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> AgentCompletion {
     let submission: UserSubmission = input.into();
     let expected_revision = (session_record.revision > 0).then_some(session_record.revision);
@@ -430,7 +433,39 @@ pub(crate) async fn run_and_persist(
         }
     };
 
-    let run_result = agent.run_session(committed_record.session.clone()).await;
+    if cancellation.as_ref().is_some_and(|signal| *signal.borrow()) {
+        return AgentCompletion {
+            run: None,
+            session_record: committed_record,
+            error: None,
+            input_committed: true,
+            queue_may_advance: true,
+            input: submission,
+        };
+    }
+    let run_result = {
+        let run = agent.run_session(committed_record.session.clone());
+        tokio::pin!(run);
+        if let Some(signal) = cancellation.as_mut() {
+            // 先 poll 运行取得 Core 槽位，再转发取消，避免启动逻辑重置先到达的 cancel 标记。
+            tokio::select! {
+                biased;
+                result = &mut run => result,
+                _ = async {
+                    while !*signal.borrow_and_update() {
+                        if signal.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                } => {
+                    agent.cancel();
+                    run.await
+                }
+            }
+        } else {
+            run.await
+        }
+    };
     let run = match run_result {
         Ok(run) => run,
         Err(error) => {

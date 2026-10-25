@@ -154,10 +154,18 @@ pub(crate) struct App {
     /// 在途的上下文引用拉取任务；任一时刻至多一个。
     #[cfg(feature = "plugins")]
     pub(crate) context_ref_task: Option<tokio::task::JoinHandle<()>>,
-    /// FIFO inputs accepted before the Agent becomes ready. Agent 就绪前接收的 FIFO 输入队列。
+    /// 仅驻留内存的待发送 FIFO；尚未启动的条目不写入模型会话或历史记录。
     pub(crate) queued_inputs: VecDeque<UserSubmission>,
     /// 当前运行是否来自 FIFO 队首；成功预写后才允许移除对应输入。
     pub(crate) queued_run_active: bool,
+    /// 用户取消后保持 FIFO 暂停；显式普通发送恢复，Ctrl+Enter 仅处理指定消息。
+    pub(crate) queue_paused: bool,
+    /// Ctrl+Enter 指定的优先输入；等待旧运行保存收尾后才作为普通用户消息启动。
+    pub(crate) immediate_input: Option<UserSubmission>,
+    /// 当前提交的取消信号，覆盖先行保存阶段，避免 Core 启动时重置取消标记丢失 Esc。
+    pub(crate) run_cancellation: Option<tokio::sync::watch::Sender<bool>>,
+    /// 当前提交在可见历史中的气泡位置；首存失败时只撤销这一条。
+    pub(crate) active_input_message: Option<usize>,
     /// 输入框上方排队消息面板的可点击行；每帧由渲染层重建。
     pub(crate) queued_input_areas: Vec<(usize, Rect)>,
     /// 排队面板的键盘焦点与选中下标；`None` 表示焦点在输入框。
@@ -584,6 +592,10 @@ impl App {
             context_ref_task: None,
             queued_inputs: VecDeque::new(),
             queued_run_active: false,
+            queue_paused: false,
+            immediate_input: None,
+            run_cancellation: None,
+            active_input_message: None,
             queued_input_areas: Vec::new(),
             queue_focus: None,
             cursor: 0,
@@ -839,6 +851,11 @@ impl App {
         }
         self.cursor = 0;
         self.queued_inputs.clear();
+        self.queued_run_active = false;
+        self.queue_paused = false;
+        self.immediate_input = None;
+        self.run_cancellation = None;
+        self.active_input_message = None;
         self.queued_input_areas.clear();
         self.queue_focus = None;
         self.streaming_message = None;

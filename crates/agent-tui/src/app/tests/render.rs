@@ -1560,6 +1560,14 @@ fn queue_focus_highlights_selection_and_scrolls() {
         status.contains("Queue4/4"),
         "状态行应显示队列位置：{status:?}"
     );
+    assert!(
+        status.contains("Ctrl+Enternow"),
+        "队列必须告知立即发送快捷键：{status:?}"
+    );
+    app.running = true;
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let rows = buffer_rows(&terminal, width);
+    assert!(rows[status_row(&rows)].contains("Ctrl+Enter now"));
 }
 
 /// 思考阶段只显示状态文案，不渲染服务商返回的推理摘要文本。

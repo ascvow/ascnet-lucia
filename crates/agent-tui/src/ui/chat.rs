@@ -1143,6 +1143,13 @@ fn fit_status(status: String, max_width: usize) -> String {
 /// 都取自 App 现有字段：`spinner_frame` 由 UI tick 推进，`run_started_at` 是本次运行
 /// 的起点，这里不额外保存计时状态。
 fn prompt_status_text(app: &App) -> Option<(String, Color)> {
+    // 待优先发送的输入尚未持久化，只提供状态提示，不能冒充已发送的用户气泡。
+    if app.immediate_input.is_some() {
+        return Some((
+            "Stopping · send now pending · Esc cancel".into(),
+            COLOR_WARNING,
+        ));
+    }
     let activity = prompt_activity(app)?;
     let mut status = String::with_capacity(64);
     let color = match activity {
@@ -1179,12 +1186,13 @@ fn prompt_status_text(app: &App) -> Option<(String, Color)> {
             if let Some(index) = app.queue_focus {
                 let _ = write!(
                     status,
-                    "Queue {}/{} · ↑↓ select · Enter send · Ctrl+O edit · Esc",
+                    "Queue {}/{} · Ctrl+Enter now · ↑↓ · Enter send · Ctrl+O edit · Del · Esc",
                     index + 1,
                     pending
                 );
             } else {
-                let _ = write!(status, "{pending} queued · Ctrl+O open");
+                let state = if app.queue_paused { "paused" } else { "queued" };
+                let _ = write!(status, "{pending} {state} · Ctrl+O open");
             }
             COLOR_WARNING
         }
@@ -1213,12 +1221,12 @@ fn push_run_suffix(title: &mut String, app: &App) {
             write!(title, " · {}m{:02}s", total / 60, total % 60)
         };
     }
-    title.push_str(" · Esc to stop");
+    title.push_str(" · Ctrl+Enter now · Esc to stop");
     if !app.queued_inputs.is_empty() {
         let _ = write!(title, " · {} queued", app.queued_inputs.len());
     }
     if app.queue_focus.is_some() {
-        title.push_str(" · ↑↓/Enter send");
+        title.push_str(" · ↑↓/Enter next · Ctrl+O edit");
     }
 }
 

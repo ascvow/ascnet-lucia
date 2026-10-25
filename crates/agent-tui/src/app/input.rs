@@ -134,26 +134,11 @@ impl App {
                         .push(Msg::new(MsgKind::Info, "上下文压缩仍在进行中，请稍候"));
                     return;
                 }
-                if self.defer_attachment_submission(
-                    agent.cloned(),
-                    self.running && is_command_modifier(modifiers),
-                ) {
-                    return;
-                }
                 if let Some(agent) = agent {
-                    if self.running {
-                        // 正文里点名的图片/PDF 同样要先变成附件，排队后才能整条发送。
-                        self.attach_mentioned_paths();
-                        // 默认排队：消息显示在输入框上方，可在本轮结束前继续修改。
-                        // Ctrl+Enter 才是立即 steering；附件与引用无法 steering，仍排队。
-                        let steer = is_command_modifier(modifiers)
-                            && self.attachments.is_empty()
-                            && self.refs.is_empty();
-                        if steer {
-                            self.submit_steering(agent);
-                        } else {
-                            self.queue_input_until_ready();
-                        }
+                    if is_command_modifier(modifiers) {
+                        self.submit_immediate(agent);
+                    } else if self.running {
+                        self.queue_input_until_ready();
                     } else {
                         self.submit(agent);
                     }
@@ -200,8 +185,8 @@ impl App {
 
     /// 排队面板获得键盘焦点时的按键处理。
     ///
-    /// 面板聚焦期间吞掉所有按键，避免字符落进输入框：`↑`/`↓` 选择，`Enter` 发送，
-    /// `Ctrl+O` 取回编辑，`Delete` 丢弃，`Esc` 返回输入框。
+    /// 面板聚焦期间吞掉所有按键，避免字符落进输入框：`↑`/`↓` 选择，`Enter` 发送/置顶，
+    /// `Ctrl+Enter` 打断并优先发送，`Ctrl+O` 取回编辑，`Delete` 丢弃，`Esc` 返回输入框。
     pub(crate) fn handle_queue_key(
         &mut self,
         code: KeyCode,
@@ -215,6 +200,9 @@ impl App {
             KeyCode::Esc => self.queue_focus = None,
             KeyCode::Up => self.move_queue_selection(-1),
             KeyCode::Down => self.move_queue_selection(1),
+            KeyCode::Enter if is_command_modifier(modifiers) => {
+                self.send_selected_queued_immediate(agent)
+            }
             KeyCode::Enter => self.send_selected_queued(agent),
             KeyCode::Delete => self.remove_selected_queued(),
             KeyCode::Char('o') if is_command_modifier(modifiers) => {
@@ -271,7 +259,12 @@ impl App {
     /// 中断当前运行：关闭可见流、标记未完成工具为跳过，并通知 Agent 取消。
     ///
     /// 重复调用是幂等的，不会重复推送提示；Esc 与 Ctrl+C 共用同一条路径。
-    fn interrupt_run(&mut self, agent: Option<&Arc<Agent>>) {
+    pub(super) fn interrupt_run(&mut self, agent: Option<&Arc<Agent>>) {
+        self.queue_paused = true;
+        self.pause_immediate_input();
+        if let Some(cancel) = &self.run_cancellation {
+            cancel.send_replace(true);
+        }
         if self.run_stream_cancelled {
             return;
         }
@@ -1336,7 +1329,7 @@ impl App {
 
     /// 取出并清空当前编辑器内容；空白输入返回 `None`。
     ///
-    /// steering 等纯文本路径不携带附件，残留附件一并清除，
+    /// 原生命令等纯文本路径不携带附件，残留附件一并清除，
     /// 避免引用标签消失后附件悬挂。
     pub(crate) fn take_input(&mut self) -> Option<String> {
         self.invalidate_attachment_job();

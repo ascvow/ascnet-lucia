@@ -959,7 +959,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                         && app.plugin_focus.is_none()
                         && app.active_dialog_index().is_none();
                     if queue_keys_active {
+                        #[cfg(feature = "plugins")]
+                        let cancel_was_requested = app.run_stream_cancelled;
                         app.handle_queue_key(key.code, key.modifiers, agent.as_ref());
+                        #[cfg(feature = "plugins")]
+                        if !cancel_was_requested && app.run_stream_cancelled {
+                            plugin_agent_runtime.cancel_active_runs().await;
+                        }
                         continue;
                     }
                     if app.handle_native_command_key(key.code, key.modifiers, agent.as_ref()) {
@@ -1402,7 +1408,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 let before = app.input.clone();
                 #[cfg(feature = "plugins")]
                 let before_session = app.session_record.id.clone();
+                #[cfg(feature = "plugins")]
+                let cancel_was_requested = app.run_stream_cancelled;
                 app.apply_prepared_attachments(id, result);
+                #[cfg(feature = "plugins")]
+                if !cancel_was_requested && app.run_stream_cancelled {
+                    plugin_agent_runtime.cancel_active_runs().await;
+                }
                 #[cfg(feature = "plugins")]
                 if app.session_record.id != before_session {
                     if let Some(host) = plugin_host.as_ref() {
@@ -1420,7 +1432,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Some(UiEvent::AgentDone(result)) => {
                 record_run_failure_event(events_jsonl.as_deref(), result.as_ref()).await;
                 let succeeded = result.error.is_none();
-                let cancelled = result.run.as_ref().is_some_and(|run| run.cancelled);
+                let cancelled = app.run_stream_cancelled
+                    || result.run.as_ref().is_some_and(|run| run.cancelled);
                 let queue_may_advance = app.handle_agent_done(*result);
                 // 标题只在空闲时写入：排队输入会立刻开启下一轮，那时保存会与该轮的
                 // CAS 抢同一个 revision，把正常保存挤进分叉路径。

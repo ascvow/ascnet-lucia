@@ -623,9 +623,9 @@ fn running_plain_text_queues_by_default() {
     );
 }
 
-/// Ctrl+Enter 保留立即插话：纯文本直接作为 steering 发送，不进入排队面板。
+/// Ctrl+Enter 请求取消当前轮次并保留完整优先输入，不使用延迟 steering。
 #[test]
-fn ctrl_enter_steers_plain_text() {
+fn ctrl_enter_interrupts_for_plain_text() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let (gateway, options) = build_demo_gateway();
@@ -638,11 +638,20 @@ fn ctrl_enter_steers_plain_text() {
 
     assert!(app.queued_inputs.is_empty(), "Ctrl+Enter 不进入队列");
     assert!(app.input.is_empty());
+    assert!(app.run_stream_cancelled);
+    assert!(agent.state().cancel_requested);
+    assert_eq!(agent.control().pending_steering(), 0);
+    assert_eq!(
+        app.immediate_input
+            .as_ref()
+            .map(|input| input.text.as_str()),
+        Some("立即插话")
+    );
     assert!(
         app.messages
             .iter()
-            .any(|message| message.text.contains("Steering queued")),
-        "应提示已作为 steering 发送"
+            .all(|message| !matches!(message.kind, MsgKind::User)),
+        "尚未实际发送的优先输入不应冒充历史消息"
     );
 }
 

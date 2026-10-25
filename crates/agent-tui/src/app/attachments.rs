@@ -24,7 +24,7 @@ pub(crate) enum AttachmentIntent {
     Paste(String),
     Submit {
         agent: Option<Arc<Agent>>,
-        steering: bool,
+        immediate: bool,
     },
 }
 
@@ -145,16 +145,28 @@ impl App {
     pub(crate) fn defer_attachment_submission(
         &mut self,
         agent: Option<Arc<Agent>>,
-        steering: bool,
+        immediate: bool,
     ) -> bool {
         if !self.async_attachments || self.mentioned_attachments_ready {
             return false;
         }
         if let Some(job) = self.attachment_job.as_mut() {
-            job.submit_after = Some((agent, steering));
+            if let AttachmentIntent::Submit {
+                agent: target,
+                immediate: priority,
+            } = &mut job.intent
+            {
+                // 普通 Enter 的附件准备尚未完成时，Ctrl+Enter 升级同一提交，不产生第二份消息。
+                if agent.is_some() {
+                    *target = agent;
+                }
+                *priority |= immediate;
+            } else {
+                job.submit_after = Some((agent, immediate));
+            }
             return true;
         }
-        self.schedule_attachments(AttachmentIntent::Submit { agent, steering });
+        self.schedule_attachments(AttachmentIntent::Submit { agent, immediate });
         true
     }
 
@@ -255,16 +267,11 @@ impl App {
             ));
             return;
         }
-        if let AttachmentIntent::Submit { agent, steering } = job.intent {
+        if let AttachmentIntent::Submit { agent, immediate } = job.intent {
             self.mentioned_attachments_ready = true;
             match agent {
-                Some(agent)
-                    if steering
-                        && self.running
-                        && self.attachments.is_empty()
-                        && self.refs.is_empty() =>
-                {
-                    self.submit_steering(&agent)
+                Some(agent) if immediate && self.pending_reload.is_none() => {
+                    self.submit_immediate(&agent)
                 }
                 Some(agent) if !self.running && self.pending_reload.is_none() => {
                     self.submit(&agent)
@@ -273,8 +280,8 @@ impl App {
             }
         } else {
             self.finish_input_edit();
-            if let Some((agent, steering)) = job.submit_after {
-                if !steering
+            if let Some((agent, immediate)) = job.submit_after {
+                if !immediate
                     && self.handle_native_command_key(
                         crossterm::event::KeyCode::Enter,
                         crossterm::event::KeyModifiers::NONE,
@@ -283,7 +290,7 @@ impl App {
                 {
                     return;
                 }
-                self.defer_attachment_submission(agent, steering);
+                self.defer_attachment_submission(agent, immediate);
             }
         }
     }
@@ -528,6 +535,33 @@ mod tests {
         app.invalidate_attachment_job();
         let (id, result) = receive(&mut rx).await;
         app.apply_prepared_attachments(id, result);
+
+        // Ctrl+Enter 必须穿过后台附件准备，完整发送附件和引用，而非退回普通队列。
+        let (gateway, options) = crate::demo::build_demo_gateway();
+        let agent = Arc::new(Agent::new(gateway, options));
+        app.running = true;
+        app.input = format!("[REF#1]\n{}", first.display());
+        app.cursor = app.input.len();
+        app.refs = vec![crate::session::conversation::PendingRef {
+            label: "[REF#1]".into(),
+            provider: "test".into(),
+            id: "ref".into(),
+            title: "引用".into(),
+            body: "引用正文".into(),
+        }];
+        let queued = app.queued_inputs.len();
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
+        app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+        assert!(app.run_stream_cancelled, "附件尚未读完也应停止当前轮次");
+        assert!(app.queue_paused);
+        let (id, result) = receive(&mut rx).await;
+        app.apply_prepared_attachments(id, result);
+        let priority = app.immediate_input.as_ref().expect("准备完成后应优先发送");
+        assert_eq!(priority.attachments.len(), 1);
+        assert_eq!(priority.refs[0].body, "引用正文");
+        assert_eq!(app.queued_inputs.len(), queued);
+        assert!(app.run_stream_cancelled);
+        assert_eq!(agent.control().pending_steering(), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 

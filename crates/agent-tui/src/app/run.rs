@@ -326,7 +326,8 @@ impl App {
             Some(index.min(self.queued_inputs.len() - 1))
         };
         self.queued_run_active = false;
-        self.start_input_run(agent, submission, true);
+        self.queue_paused = false;
+        self.start_input_run(agent, submission);
     }
 
     /// 丢弃排队面板中选中的消息；正在发送的队首不可丢弃。
@@ -356,17 +357,92 @@ impl App {
         };
     }
 
-    /// 运行中提交 steering 插话：跳过剩余工具，让模型立即响应新指令。
-    pub(crate) fn submit_steering(&mut self, agent: &Arc<Agent>) {
-        let Some(input) = self.take_input() else {
+    /// Ctrl+Enter 提交完整输入：取消旧运行并在其持久化收尾后优先启动，不使用延迟 steering。
+    pub(crate) fn submit_immediate(&mut self, agent: &Arc<Agent>) {
+        if self.input.trim().is_empty()
+            && self.attachments.is_empty()
+            && self.refs.is_empty()
+            && self.attachment_job.is_none()
+        {
+            return;
+        }
+        if self.immediate_input.is_some() {
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                "已有立即发送的消息在等待收尾；当前草稿保持不变",
+            ));
+            return;
+        }
+        if self.pending_reload.is_some() {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "上下文压缩仍在进行中，请稍候"));
+            return;
+        }
+        if self.defer_attachment_submission(Some(Arc::clone(agent)), true) {
+            // 接受插队意图时就停当前轮，不能等文件读完再误取消下一条自动派发的任务。
+            if self.attachment_job.is_some() && self.running {
+                self.interrupt_run(Some(agent));
+            }
+            return;
+        }
+        let Some(submission) = self.take_submission() else {
             return;
         };
-        agent.steer(input.clone());
-        self.messages.push(Msg::new(MsgKind::User, input));
-        self.messages.push(Msg::new(
-            MsgKind::Info,
-            "Steering queued; it will be applied after the current tool finishes",
-        ));
+        self.send_immediate_submission(agent, submission);
+    }
+
+    /// 运行中只登记优先输入，绝不在旧 Session 尚未保存时并发启动新 Agent 轮次。
+    fn send_immediate_submission(&mut self, agent: &Arc<Agent>, submission: UserSubmission) {
+        self.queue_paused = true;
+        if self.running {
+            self.interrupt_run(Some(agent));
+            self.immediate_input = Some(submission);
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                "正在停止当前轮次，随后立即发送；Esc 可取消优先发送",
+            ));
+        } else {
+            self.queued_run_active = false;
+            self.start_input_run(agent, submission);
+        }
+    }
+
+    /// 对已排队的选中消息执行 Ctrl+Enter；保留其他条目的顺序和当前编辑器草稿。
+    pub(crate) fn send_selected_queued_immediate(&mut self, agent: Option<&Arc<Agent>>) {
+        let Some(index) = self
+            .queue_focus
+            .filter(|index| *index < self.queued_inputs.len())
+        else {
+            return;
+        };
+        if self.queued_run_active && index == 0 {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "该排队消息正在发送，无法重复发送"));
+            return;
+        }
+        if self.immediate_input.is_some() || self.pending_reload.is_some() {
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                "正在等待上一条发送或上下文操作完成；队列保持不变",
+            ));
+            return;
+        }
+        let Some(agent) = agent else {
+            self.messages
+                .push(Msg::new(MsgKind::Info, "模型尚未就绪，排队消息保持不动"));
+            return;
+        };
+        let submission = self.queued_inputs.remove(index).expect("已校验队列下标");
+        self.queue_focus = None;
+        self.send_immediate_submission(agent, submission);
+    }
+
+    /// 显式取消或保存失败时，把尚未发送的优先输入放回待发送队列，不写入上下文。
+    pub(super) fn pause_immediate_input(&mut self) {
+        if let Some(submission) = self.immediate_input.take() {
+            let index = usize::from(self.queued_run_active).min(self.queued_inputs.len());
+            self.queued_inputs.insert(index, submission);
+        }
     }
 
     /// Submits the current editor value immediately to a ready Agent.
@@ -380,22 +456,18 @@ impl App {
             return;
         };
         self.queued_run_active = false;
-        self.start_input_run(agent, submission, true);
+        self.queue_paused = false;
+        self.start_input_run(agent, submission);
     }
 
-    /// Starts one Agent run and optionally appends the user message to the visible history.
-    ///
-    /// 启动一次 Agent 运行，并按需把用户消息追加到可见历史。
-    pub(crate) fn start_input_run(
-        &mut self,
-        agent: &Arc<Agent>,
-        submission: UserSubmission,
-        show_user_message: bool,
-    ) {
-        if show_user_message {
-            self.messages
-                .push(Msg::new(MsgKind::User, submission.text.clone()));
-        }
+    /// 启动一次完整用户提交；手动发送、FIFO 与优先发送统一展示用户气泡。
+    pub(crate) fn start_input_run(&mut self, agent: &Arc<Agent>, submission: UserSubmission) {
+        self.flush_pending_stream();
+        self.active_input_message = Some(self.messages.len());
+        self.messages
+            .push(Msg::new(MsgKind::User, submission.text.clone()));
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        self.run_cancellation = Some(cancel);
         self.running = true;
         self.run_started_at = Some(std::time::Instant::now());
         self.streaming_message = None;
@@ -417,22 +489,26 @@ impl App {
                 session_store.as_ref(),
                 session_record,
                 submission,
+                Some(cancellation),
             )
             .await;
             let _ = tx.send(UiEvent::AgentDone(Box::new(result)));
         });
     }
 
-    /// Starts the next pre-ready input after the Agent becomes idle.
-    ///
-    /// Agent 就绪且空闲后启动下一条预加载输入。
+    /// 旧运行已持久化收尾后先处理显式优先输入，否则按 FIFO 启动下一条。
     pub(crate) fn run_next_queued(&mut self, agent: &Arc<Agent>) {
-        if self.running {
+        if self.running || self.pending_reload.is_some() {
             return;
         }
-        if let Some(submission) = self.queued_inputs.front().cloned() {
-            self.queued_run_active = true;
-            self.start_input_run(agent, submission, false);
+        if let Some(submission) = self.immediate_input.take() {
+            self.queued_run_active = false;
+            self.start_input_run(agent, submission);
+        } else if !self.queue_paused {
+            if let Some(submission) = self.queued_inputs.front().cloned() {
+                self.queued_run_active = true;
+                self.start_input_run(agent, submission);
+            }
         }
     }
 
@@ -600,6 +676,8 @@ impl App {
         let run_succeeded =
             error.is_none() && input_committed && run.as_ref().is_some_and(|run| !run.cancelled);
         self.running = false;
+        self.run_cancellation = None;
+        let active_input_message = self.active_input_message.take();
         self.run_started_at = None;
         self.model_is_thinking = false;
         let queued_run = std::mem::take(&mut self.queued_run_active);
@@ -627,46 +705,52 @@ impl App {
             }
         } else {
             // 队列首存失败时保留原队列和已展示顺序，等待后续重试同一队首。
-            if !queued_run && self.input.is_empty() && self.attachments.is_empty() {
-                self.input = input.text.clone();
-                self.cursor = self.input.len();
-                self.attachments = input.attachments.clone();
-                self.refs = input.refs.clone();
+            if !queued_run {
+                if self.input.is_empty() && self.attachments.is_empty() && self.refs.is_empty() {
+                    self.input = input.text.clone();
+                    self.cursor = self.input.len();
+                    self.attachments = input.attachments.clone();
+                    self.refs = input.refs.clone();
+                } else {
+                    // 优先发送可能来自队列，期间用户仍在写草稿；首存失败不能覆盖草稿或丢掉输入。
+                    self.queued_inputs.push_front(input.clone());
+                }
             }
-            if !queued_run
-                && self.messages.last().is_some_and(|message| {
+            if let Some(index) = active_input_message.filter(|index| {
+                self.messages.get(*index).is_some_and(|message| {
                     matches!(message.kind, MsgKind::User) && message.text == input.text
                 })
-            {
-                self.messages.pop();
+            }) {
+                self.messages.remove(index);
             }
         }
 
         self.streaming_message = None;
         self.run_stream_cancelled = false;
-        if let Some(run) = run {
-            if run.cancelled {
-                if user_cancelled {
-                    let queued = self.queued_inputs.len();
-                    if let Some(message) = self.messages.iter_mut().rev().find(|message| {
-                        matches!(message.kind, MsgKind::Info)
-                            && message.text == "Cancelling the current run..."
-                    }) {
-                        message.text = if queued == 0 {
-                            "Run cancelled; visible output was frozen".into()
-                        } else {
-                            format!(
-                                "Run cancelled; {queued} queued message(s) paused — Ctrl+O to send or edit"
-                            )
-                        };
-                    }
+        if !queue_may_advance {
+            self.pause_immediate_input();
+        }
+        if user_cancelled {
+            let queued = self.queued_inputs.len();
+            if let Some(message) = self.messages.iter_mut().rev().find(|message| {
+                matches!(message.kind, MsgKind::Info)
+                    && message.text == "Cancelling the current run..."
+            }) {
+                message.text = if self.immediate_input.is_some() && queue_may_advance {
+                    "Run stopped; sending the priority message".into()
+                } else if queued == 0 {
+                    "Run cancelled; visible output was frozen".into()
                 } else {
-                    self.messages.push(Msg::new(
-                        MsgKind::Info,
-                        "Run cancelled; generated content was preserved",
-                    ));
-                }
+                    format!(
+                        "Run cancelled; {queued} queued message(s) paused — Ctrl+O to send or edit"
+                    )
+                };
             }
+        } else if run.as_ref().is_some_and(|run| run.cancelled) {
+            self.messages.push(Msg::new(
+                MsgKind::Info,
+                "Run cancelled; generated content was preserved",
+            ));
         }
         if let Some(error) = error {
             self.messages
@@ -676,7 +760,10 @@ impl App {
         if run_succeeded && !user_cancelled {
             self.schedule_session_title();
         }
-        queue_may_advance && !user_cancelled
+        if user_cancelled || run.as_ref().is_some_and(|run| run.cancelled) || !queue_may_advance {
+            self.queue_paused = true;
+        }
+        queue_may_advance && (self.immediate_input.is_some() || !self.queue_paused)
     }
 }
 

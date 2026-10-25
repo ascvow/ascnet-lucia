@@ -273,7 +273,7 @@ impl App {
 /// 现在保存会与运行自身的 CAS 抢同一个 revision，冲突会把它挤进分叉保存路径。等下一个
 /// 完成态落地后再写，标题只是延后几秒出现。
 pub(crate) async fn flush_session_title(app: &mut App) {
-    if app.running || !app.queued_inputs.is_empty() {
+    if app.running || !app.queued_inputs.is_empty() || app.immediate_input.is_some() {
         return;
     }
     let Some(title) = app.pending_session_title.clone() else {

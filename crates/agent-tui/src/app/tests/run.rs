@@ -2,6 +2,424 @@
 
 use super::*;
 
+/// 队列与立即发送共用的受控模型：首个请求保持挂起，后续请求立即返回，用通知而非睡眠确定时序。
+#[derive(Default)]
+struct QueueBlockingModel {
+    requests: std::sync::Mutex<Vec<agent_core::ModelRequest>>,
+    entered: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl agent_core::ChatModel for QueueBlockingModel {
+    async fn complete(
+        &self,
+        request: agent_core::ModelRequest,
+    ) -> Result<agent_core::ModelResponse> {
+        let first = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            requests.len() == 1
+        };
+        self.entered.notify_one();
+        if first {
+            std::future::pending().await
+        } else {
+            Ok(agent_core::ModelResponse::text("处理完成"))
+        }
+    }
+}
+
+impl agent_core::ProviderAdapter for QueueBlockingModel {
+    fn name(&self) -> &'static str {
+        "queue-test"
+    }
+}
+
+/// 构造不产生额外模型/工具事件的 Agent；完成事件仍经真实运行与持久化路径回投。
+fn queue_test_agent(model: Arc<QueueBlockingModel>) -> Arc<Agent> {
+    let gateway = agent_core::ModelGateway::new();
+    gateway.register("queue-test", model).unwrap();
+    let mut options = agent_core::AgentOptions::default().with_model_route("queue-test", "test");
+    options.stream = false;
+    Arc::new(Agent::new(gateway, options))
+}
+
+/// 等待单次真实提交收尾，超时说明取消或回投链路失效。
+async fn queue_completion(rx: &mut mpsc::UnboundedReceiver<UiEvent>) -> AgentCompletion {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(UiEvent::AgentDone(result)) = rx.recv().await {
+                return *result;
+            }
+        }
+    })
+    .await
+    .expect("提交必须及时收尾")
+}
+
+/// 只取用户可见消息，检查同一提交在运行中、取消后与重启恢复后的身份保持一致。
+fn visible_user_texts(app: &App) -> Vec<&str> {
+    app.messages
+        .iter()
+        .filter(|message| matches!(message.kind, MsgKind::User))
+        .map(|message| message.text.as_str())
+        .collect()
+}
+
+/// 队首开始发送就显示标准用户气泡；Esc 后仅已发送条目落盘，其他队列不得渗入恢复上下文。
+#[tokio::test]
+async fn queued_cancel_restart_keeps_context_and_user_bubbles_in_sync() {
+    let root = std::env::temp_dir().join(format!("lucia-queue-restart-{}", SessionId::generate()));
+    let store = Arc::new(agent_session::FileSessionStore::open(&root).await.unwrap());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "test".into());
+    app.session_store = store.clone();
+    app.queued_inputs = VecDeque::from([
+        "已发送的队首".into(),
+        "仍在排队一".into(),
+        "仍在排队二".into(),
+    ]);
+    let model = Arc::new(QueueBlockingModel::default());
+    let agent = queue_test_agent(model.clone());
+    app.run_next_queued(&agent);
+    assert_eq!(visible_user_texts(&app), ["已发送的队首"]);
+    assert_eq!(
+        app.messages[0].to_lines(false, 60),
+        Msg::new(MsgKind::User, "已发送的队首").to_lines(false, 60)
+    );
+    model.entered.notified().await;
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, Some(&agent));
+    assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
+    assert_eq!(visible_user_texts(&app), ["已发送的队首"]);
+    assert_eq!(
+        app.queued_inputs
+            .iter()
+            .map(|input| input.text.as_str())
+            .collect::<Vec<_>>(),
+        ["仍在排队一", "仍在排队二"]
+    );
+    let id = app.session_record.id.clone();
+    drop(app);
+    drop(store);
+    let reopened = Arc::new(agent_session::FileSessionStore::open(&root).await.unwrap());
+    let record = reopened.load(&id).await.unwrap().unwrap();
+    assert_eq!(
+        record
+            .session
+            .messages()
+            .iter()
+            .filter(|message| message.role == agent_core::MessageRole::User)
+            .map(|message| message.text_content())
+            .collect::<Vec<_>>(),
+        ["已发送的队首"]
+    );
+    let (tx, _) = mpsc::unbounded_channel();
+    let restored = App::new(tx, "test".into()).with_persistent_session(reopened, record);
+    assert_eq!(visible_user_texts(&restored), ["已发送的队首"]);
+    assert!(restored.queued_inputs.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Ctrl+Enter 打断挂起的模型请求，完整携带附件/引用并在旧记录提交后插队；未选条目不进请求。
+#[tokio::test]
+async fn immediate_queue_send_interrupts_and_preserves_payload_and_order() {
+    use crate::session::conversation::{PendingRef, UserSubmission};
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "test".into());
+    let model = Arc::new(QueueBlockingModel::default());
+    let agent = queue_test_agent(model.clone());
+    app.input = "原始任务".into();
+    app.submit(&agent);
+    model.entered.notified().await;
+    let priority = UserSubmission {
+        text: "优先处理 [IMAGE#1] [REF#1]".into(),
+        attachments: vec![PendingAttachment {
+            label: "[IMAGE#1]".into(),
+            name: "test.png".into(),
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+            is_image: true,
+            pasted_text: None,
+            source_path: None,
+        }],
+        refs: vec![PendingRef {
+            label: "[REF#1]".into(),
+            provider: "test".into(),
+            id: "ref".into(),
+            title: "来源".into(),
+            body: "完整引用正文".into(),
+        }],
+    };
+    app.queued_inputs = VecDeque::from(["等待一".into(), priority.clone(), "等待二".into()]);
+    app.queue_focus = Some(1);
+    app.input = "不应覆盖的草稿".into();
+    app.handle_queue_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+    assert!(app.run_stream_cancelled);
+    assert_eq!(app.immediate_input, Some(priority));
+    assert_eq!(app.input, "不应覆盖的草稿");
+    assert_eq!(visible_user_texts(&app), ["原始任务"]);
+    let completion = queue_completion(&mut rx).await;
+    assert!(completion.run.as_ref().unwrap().cancelled);
+    assert!(app.handle_agent_done(completion));
+    app.run_next_queued(&agent);
+    assert_eq!(
+        visible_user_texts(&app),
+        ["原始任务", "优先处理 [IMAGE#1] [REF#1]"]
+    );
+    assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
+    assert!(app.queue_paused, "插队仅发送指定项，普通队列不能自动恢复");
+    app.run_next_queued(&agent);
+    assert!(!app.running);
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let latest = requests[1]
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == agent_core::MessageRole::User)
+        .unwrap();
+    assert!(latest.text_content().contains("完整引用正文"));
+    assert!(latest
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image { data, .. } if data == "aW1hZ2U=")));
+    assert!(!format!("{:?}", requests[1].messages).contains("等待一"));
+    assert_eq!(
+        app.queued_inputs
+            .iter()
+            .map(|input| input.text.as_str())
+            .collect::<Vec<_>>(),
+        ["等待一", "等待二"]
+    );
+    assert_eq!(app.input, "不应覆盖的草稿");
+    assert_eq!(agent.control().pending_steering(), 0);
+}
+
+/// 指定修订的保存屏障；区分首存与最终保存，验证取消不打断 CAS 协调。
+#[derive(Default)]
+struct QueuePausedStore {
+    inner: MemorySessionStore,
+    pause_revision: u64,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl SessionStore for QueuePausedStore {
+    async fn load(&self, id: &SessionId) -> Result<Option<SessionRecord>, SessionStoreError> {
+        self.inner.load(id).await
+    }
+    async fn save(
+        &self,
+        record: SessionRecord,
+        expected: Option<u64>,
+    ) -> Result<SessionRecord, SessionStoreError> {
+        if record.revision == self.pause_revision {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.save(record, expected).await
+    }
+    async fn delete(&self, id: &SessionId, expected: u64) -> Result<(), SessionStoreError> {
+        self.inner.delete(id, expected).await
+    }
+    async fn list(&self) -> Result<Vec<SessionRecord>, SessionStoreError> {
+        self.inner.list().await
+    }
+}
+
+/// Esc 在保存阶段到达也不能被 Core 的运行初始化覆盖，更不能继续派发后续队列。
+#[tokio::test]
+async fn cancel_during_initial_save_does_not_start_model_or_drain_queue() {
+    let store = Arc::new(QueuePausedStore::default());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "test".into());
+    app.session_store = store.clone();
+    app.queued_inputs = VecDeque::from(["保存中的输入".into(), "尚未发送".into()]);
+    let model = Arc::new(QueueBlockingModel::default());
+    let agent = queue_test_agent(model.clone());
+    app.run_next_queued(&agent);
+    store.entered.notified().await;
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, Some(&agent));
+    store.release.notify_one();
+    let completion = queue_completion(&mut rx).await;
+    assert!(completion.input_committed);
+    assert!(completion.run.is_none());
+    assert!(!app.handle_agent_done(completion));
+    assert!(model.requests.lock().unwrap().is_empty());
+    assert_eq!(visible_user_texts(&app), ["保存中的输入"]);
+    assert_eq!(app.queued_inputs.front().unwrap().text, "尚未发送");
+    let saved = store.load(&app.session_record.id).await.unwrap().unwrap();
+    assert_eq!(
+        restore_session_messages(&saved.session)
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        ["保存中的输入"]
+    );
+}
+
+/// 优先发送必须等待旧轮最终 CAS 完成；不能在 Core 已停止、保存仍阻塞时抢用旧 revision。
+#[tokio::test]
+async fn immediate_send_waits_for_previous_final_save() {
+    let store = Arc::new(QueuePausedStore {
+        pause_revision: 1,
+        ..QueuePausedStore::default()
+    });
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "test".into());
+    app.session_store = store.clone();
+    let model = Arc::new(QueueBlockingModel::default());
+    let agent = queue_test_agent(model.clone());
+    app.input = "旧任务".into();
+    app.submit(&agent);
+    model.entered.notified().await;
+    app.input = "优先消息".into();
+    app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+    store.entered.notified().await;
+    assert!(app.running);
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    let before = store.load(&app.session_record.id).await.unwrap().unwrap();
+    assert_eq!(before.revision, 1);
+    assert!(!format!("{:?}", before.session).contains("优先消息"));
+    assert!(rx.try_recv().is_err());
+    store.release.notify_one();
+    assert!(app.handle_agent_done(queue_completion(&mut rx).await));
+    assert_eq!(app.session_record.revision, 2);
+    app.run_next_queued(&agent);
+    assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
+    assert_eq!(app.session_record.revision, 4);
+    assert_eq!(
+        store.list().await.unwrap().len(),
+        1,
+        "不能因抢先预写产生分叉"
+    );
+    assert_eq!(visible_user_texts(&app), ["旧任务", "优先消息"]);
+}
+
+/// 插队等待收尾期间再次 Esc 会把优先消息退回队列；连续 Ctrl+Enter 不覆盖第一条或新草稿。
+#[tokio::test]
+async fn cancelling_immediate_send_pauses_it_without_hidden_context() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "test".into());
+    let model = Arc::new(QueueBlockingModel::default());
+    let agent = queue_test_agent(model.clone());
+    app.input = "原始任务".into();
+    app.submit(&agent);
+    model.entered.notified().await;
+    app.queued_inputs.push_back("普通排队".into());
+    app.input = "优先任务".into();
+    app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+    app.input = "继续编辑的草稿".into();
+    app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+    assert_eq!(app.input, "继续编辑的草稿");
+    assert_eq!(app.immediate_input.as_ref().unwrap().text, "优先任务");
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, Some(&agent));
+    assert!(app.immediate_input.is_none());
+    assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
+    assert_eq!(
+        app.queued_inputs
+            .iter()
+            .map(|input| input.text.as_str())
+            .collect::<Vec<_>>(),
+        ["优先任务", "普通排队"]
+    );
+    assert_eq!(visible_user_texts(&app), ["原始任务"]);
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    assert!(!format!("{:?}", app.session_record.session).contains("优先任务"));
+}
+
+/// 首存失败只撤销本次用户气泡，队列与期间编辑的新草稿都不能丢失。
+#[tokio::test]
+async fn failed_queue_submission_rolls_back_its_bubble_only() {
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    for from_queue in [true, false] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "test".into());
+        app.session_store = Arc::new(ScriptedSaveStore::new(vec![1], ScriptedSaveFailure::Io));
+        app.messages.push(Msg::new(MsgKind::User, "已有消息"));
+        app.queued_inputs.push_back("发送失败".into());
+        if from_queue {
+            app.run_next_queued(&agent);
+        } else {
+            app.queue_focus = Some(0);
+            app.send_selected_queued_immediate(Some(&agent));
+        }
+        app.input = "后来编辑的草稿".into();
+        assert_eq!(visible_user_texts(&app), ["已有消息", "发送失败"]);
+        assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
+        assert_eq!(visible_user_texts(&app), ["已有消息"]);
+        assert_eq!(app.queued_inputs.front().unwrap().text, "发送失败");
+        assert_eq!(app.input, "后来编辑的草稿");
+    }
+}
+
+/// 选中正在发送的队首不能重复插队；模型未就绪、已有优先消息时队列和草稿保持原样。
+#[test]
+fn immediate_queue_send_rejects_unavailable_or_active_targets() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "test".into());
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    app.running = true;
+    app.queued_run_active = true;
+    app.queued_inputs = VecDeque::from(["正在发送".into(), "待发送".into()]);
+    app.input = "草稿".into();
+    for (index, available) in [(0, true), (1, false)] {
+        app.queue_focus = Some(index);
+        app.handle_queue_key(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+            available.then_some(&agent),
+        );
+        assert!(app.immediate_input.is_none());
+        assert!(!app.run_stream_cancelled);
+        assert_eq!(app.queued_inputs.len(), 2);
+        assert_eq!(app.input, "草稿");
+    }
+    app.queue_focus = Some(1);
+    app.handle_queue_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+    assert_eq!(app.queued_inputs.front().unwrap().text, "正在发送");
+    assert_eq!(app.immediate_input.as_ref().unwrap().text, "待发送");
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, Some(&agent));
+    assert!(app.immediate_input.is_none());
+    assert_eq!(
+        app.queued_inputs
+            .iter()
+            .map(|input| input.text.as_str())
+            .collect::<Vec<_>>(),
+        ["正在发送", "待发送"]
+    );
+}
+
+/// 已取消的普通队列不会被任意后续完成事件恢复；用户显式 Enter 才恢复 FIFO。
+#[tokio::test]
+async fn paused_queue_resumes_only_after_explicit_normal_send() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "test".into());
+    let (gateway, options) = build_demo_gateway();
+    let agent = Arc::new(Agent::new(gateway, options));
+    app.queued_inputs = VecDeque::from(["等待一".into(), "等待二".into()]);
+    app.queue_paused = true;
+    app.run_next_queued(&agent);
+    assert!(!app.running);
+    app.queue_focus = Some(1);
+    app.handle_queue_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+    assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
+    assert!(app.queue_paused, "空闲时 Ctrl+Enter 也只发送选中项");
+    assert_eq!(app.queued_inputs.front().unwrap().text, "等待一");
+    app.queued_inputs.push_back("等待三".into());
+    app.queue_focus = Some(0);
+    app.handle_queue_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
+    assert!(!app.queue_paused);
+    assert!(app.handle_agent_done(queue_completion(&mut rx).await));
+    app.run_next_queued(&agent);
+    assert_eq!(visible_user_texts(&app), ["等待二", "等待一", "等待三"]);
+    app.handle_agent_done(queue_completion(&mut rx).await);
+    assert!(app.queued_inputs.is_empty());
+}
+
 /// Agent 引用确实不可用时，输入保持 FIFO 顺序并显示在加载底栏。
 ///
 /// 该路径用于启动装配失败等兜底场景；渐进插件加载的正常路径始终提供 Agent。
@@ -703,14 +1121,14 @@ async fn successful_runs_persist_with_cas_revision() {
     )
     .expect("创建测试会话记录");
 
-    let first_completion = run_and_persist(&agent, &store, record, "第一轮").await;
+    let first_completion = run_and_persist(&agent, &store, record, "第一轮", None).await;
     assert!(first_completion.error.is_none());
     assert!(first_completion.run.is_some());
     let first = first_completion.session_record;
     assert_eq!(first.revision, 2);
     assert_eq!(first.title.as_deref(), Some("第一轮"));
 
-    let second_completion = run_and_persist(&agent, &store, first.clone(), "第二轮").await;
+    let second_completion = run_and_persist(&agent, &store, first.clone(), "第二轮", None).await;
     assert!(second_completion.error.is_none());
     assert!(second_completion.run.is_some());
     let second = second_completion.session_record;
@@ -735,7 +1153,7 @@ async fn reconciles_indeterminate_initial_save_before_running() {
     )
     .expect("创建首次协调测试会话");
 
-    let completion = run_and_persist(&agent, &store, record, "首次提交需要协调").await;
+    let completion = run_and_persist(&agent, &store, record, "首次提交需要协调", None).await;
 
     assert!(completion.error.is_none());
     assert!(completion.run.is_some());
@@ -764,7 +1182,7 @@ async fn reconciles_indeterminate_final_save_without_forking() {
     .expect("创建最终协调测试会话");
     let original_id = record.id.clone();
 
-    let completion = run_and_persist(&agent, &store, record, "最终提交需要协调").await;
+    let completion = run_and_persist(&agent, &store, record, "最终提交需要协调", None).await;
 
     assert!(completion.error.is_none());
     assert!(completion.run.is_some());
@@ -792,7 +1210,7 @@ async fn final_save_conflict_forks_completed_session() {
         .insert("lucia.project_id".into(), Value::String("project-a".into()));
     let original_id = record.id.clone();
 
-    let completion = run_and_persist(&agent, &store, record, "需要完整回复").await;
+    let completion = run_and_persist(&agent, &store, record, "需要完整回复", None).await;
 
     assert!(completion.run.is_some());
     assert!(completion.input_committed);
@@ -831,7 +1249,7 @@ async fn failed_final_and_fork_saves_keep_dirty_completed_session() {
     )
     .expect("创建 dirty 测试会话");
 
-    let completion = run_and_persist(&agent, &store, record, "保留这次回复").await;
+    let completion = run_and_persist(&agent, &store, record, "保留这次回复", None).await;
     let dirty_record = completion.session_record.clone();
     let expected_assistant = restore_session_messages(&dirty_record.session)
         .into_iter()
