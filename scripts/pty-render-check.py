@@ -100,6 +100,20 @@ class TerminalProcess:
             return
         raise AssertionError(f"未等到 {needle!r}；输出尾部：{bytes(self.output[-1500:])!r}")
 
+    def wait_for_text(self, text, since=0, timeout=10):
+        """在已完成的帧中查文字，允许逐键差分在字符之间插入光标定位或样式序列。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            complete = self.output.rfind(END_FRAME, since)
+            if complete >= since:
+                rendered = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", self.output[since:complete])
+                if text.encode() in rendered:
+                    return
+            self.pump()
+            if self.process.poll() is not None:
+                break
+        raise AssertionError(f"未等到完整帧文字 {text!r}；输出尾部：{bytes(self.output[-1500:])!r}")
+
     def paste(self, text):
         """按括号粘贴协议写入，正文不会被当作命令键。"""
         os.write(self.master, b"\x1b[200~" + text.encode() + b"\x1b[201~")
@@ -125,6 +139,89 @@ class TerminalProcess:
 
 class RenderProtocolTests(unittest.TestCase):
     """实际二进制的协议检查；同一脚本适用于默认插件版和纯 Core 版。"""
+
+    def test_burst_typing_preserves_ime_text_edits_and_paths(self):
+        """一次 PTY 写入模拟 IME 提交/积压按键，不得伪造粘贴、折叠或丢掉后续编辑。"""
+        with tempfile.TemporaryDirectory(prefix="lucia-input-") as root:
+            path = Path(root) / "中文输入.txt"
+            path.write_text("only attach on paste or submit", encoding="utf-8")
+            job = TerminalProcess(root, True, "xterm-256color")
+            try:
+                job.wait_for(END_FRAME)
+                for index, text in enumerate([
+                    "中文输入法整词上屏",
+                    "FastEnglishTyping",
+                    "日本語 한글 e\u0301 🙂 مرحبا",
+                    "连续输入" * 17,  # 超过粘贴折叠宽度，普通打字仍须保留原文。
+                    str(path),  # 已存在的路径也不能仅因输入快就被替换成附件。
+                ]):
+                    with self.subTest(text=text):
+                        mark = len(job.output)
+                        os.write(job.master, (text + "x").encode() + b"\x7fEND")
+                        job.wait_for_text("END", mark)
+                        # 强制完整重绘后只检查这一帧，不能把曾显示过但又丢失的文字当作通过。
+                        frame = len(job.output)
+                        job.resize(180 + index, 30)
+                        job.wait_for(CLEAR, frame)
+                        clear = job.output.index(CLEAR, frame)
+                        job.wait_for(END_FRAME, clear)
+                        frame_end = job.output.index(END_FRAME, clear) + len(END_FRAME)
+                        rendered = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", job.output[clear:frame_end]).decode("utf-8")
+                        self.assertIn("".join((text + "END").split()), "".join(rendered.split()))
+                        output_text = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", job.output[mark:]).decode("utf-8")
+                        for unexpected in ["正在准备附件", "[粘贴的文本", "[FILE#", "附件仍在准备"]:
+                            self.assertNotIn(unexpected, output_text)
+                        mark = len(job.output)
+                        os.write(job.master, b"\x15")
+                        job.wait_for(END_FRAME, mark)
+
+                # 快速输入斜杠命令后立即回车仍须走原生命令路由。
+                mark = len(job.output)
+                os.write(job.master, b"/tui default\r")
+                job.wait_for(LEAVE_ALT, mark)
+                job.wait_for(END_FRAME, job.output.index(LEAVE_ALT, mark))
+                command_output = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", job.output[mark:]).decode("utf-8")
+                self.assertNotIn("正在准备附件", command_output)
+
+                # 真正的括号粘贴仍识别文件路径，不把兼容修复变成关闭粘贴能力。
+                mark = len(job.output)
+                job.paste(str(path))
+                job.wait_for(b"[FILE#1]", mark)
+                job.wait_for(END_FRAME, job.output.index(b"[FILE#1]", mark))
+                mark = len(job.output)
+                os.write(job.master, b"\x15")
+                job.wait_for(END_FRAME, mark)
+                os.write(job.master, b"\x04")
+                self.assertEqual(job.wait_exit(), 0)
+            finally:
+                job.close()
+
+    def test_burst_typing_followed_by_enter_submits_exact_text(self):
+        """快速输入、退格、续打和回车在同一批到达时，持久化消息必须完整且顺序不变。"""
+        with tempfile.TemporaryDirectory(prefix="lucia-input-submit-") as root:
+            job = TerminalProcess(root, True, "xterm-256color")
+            try:
+                job.wait_for(END_FRAME)
+                expected = "中文整词上屏FastEnglish继续输入"
+                os.write(job.master, "中文整词上屏FastEnglishx".encode() + b"\x7f" + "继续输入\r".encode())
+                deadline = time.monotonic() + 10
+                users = []
+                while time.monotonic() < deadline:
+                    job.pump()
+                    users = []
+                    for path in Path(root).rglob("*.json"):
+                        record = json.loads(path.read_text(encoding="utf-8"))
+                        for message in record.get("session", {}).get("messages", []):
+                            if message["role"] == "user":
+                                users.append("".join(block.get("text", "") for block in message["content"]))
+                    if users:
+                        break
+                self.assertEqual(users, [expected])
+                # 即使 demo 仍在运行，空草稿上的 Ctrl+D 也应恢复终端并退出。
+                os.write(job.master, b"\x04")
+                self.assertEqual(job.wait_exit(), 0)
+            finally:
+                job.close()
 
     def test_terminal_palette_and_monochrome_output(self):
         """检查真实后端输出的颜色协议；不把色板声明测试冒充图形主题截图验收。"""

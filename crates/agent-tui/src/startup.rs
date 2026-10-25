@@ -63,7 +63,7 @@ use agent_session::SessionStore;
 use agent_skill::SkillCatalog;
 use agent_tool::{JsonTool, ToolRegistry};
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{Event, KeyEventKind, MouseEventKind};
 use crossterm::SynchronizedUpdate;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -689,10 +689,10 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         loop {
             match crossterm::event::read() {
                 Ok(event) => {
-                    for event in coalesce_injected_paste(event) {
-                        if input_tx.send(UiEvent::Input(event)).is_err() {
-                            return;
-                        }
+                    // IME 整词上屏和积压按键也会一次到达；不能按到达速度推断粘贴。
+                    // 只有终端明确上报的 Event::Paste 才能进入附件/粘贴处理链路。
+                    if input_tx.send(UiEvent::Input(event)).is_err() {
+                        return;
                     }
                 }
                 Err(_) => {
@@ -1789,73 +1789,6 @@ async fn record_run_failure_event(events_jsonl: Option<&Path>, completion: &Agen
     let _ = JsonlEventSink::new(path).record(&event).await;
 }
 
-/// 注入式粘贴合并所需的最少字符数。
-///
-/// 终端或宿主程序把整段文本直接写进 PTY、不发送 bracketed paste 标记时，
-/// crossterm 会把粘贴拆成逐字符按键。只有同一次读取后立即可读的字符才会被合并，
-/// 而人工打字的间隔远大于读取循环，因此这个阈值不会把正常输入误判成粘贴。
-const INJECTED_PASTE_MIN_CHARS: usize = 4;
-
-/// 把一次连续写入的字符按键合并成粘贴事件，返回按原顺序转发的事件列表。
-///
-/// 部分终端（以及把粘贴路径直接写进 PTY 的宿主程序）不发送 bracketed paste 标记，
-/// 路径粘贴因此退化成逐字符输入，附件识别与长文本折叠都不会触发。这里把同一次
-/// 写入产生的普通字符合并为 [`Event::Paste`]，让它们与终端原生粘贴走同一条处理
-/// 链路；紧随其后的非字符事件（回车、鼠标等）保持在粘贴之后，顺序不变。
-fn coalesce_injected_paste(first: Event) -> Vec<Event> {
-    if plain_char(&first).is_none() {
-        return vec![first];
-    }
-    let mut events = vec![first];
-    // `poll(0)` 只检查已经缓冲的事件：同一次 write 的剩余字符会立即命中，
-    // 人类的下一次按键则尚未到达。
-    while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
-        let Ok(event) = crossterm::event::read() else {
-            break;
-        };
-        let is_plain_char = plain_char(&event).is_some();
-        events.push(event);
-        // 非字符事件属于这次写入之后的独立操作，不能并入粘贴正文。
-        if !is_plain_char {
-            break;
-        }
-    }
-    coalesce_event_batch(events)
-}
-
-/// 判断事件是否是可合并的普通字符按键。
-///
-/// 终端上报大写字母时会附带 `SHIFT`，它仍属于路径正文；`Ctrl`/`Alt` 组合则可能
-/// 是快捷键，必须中断合并。
-fn plain_char(event: &Event) -> Option<char> {
-    match event {
-        Event::Key(KeyEvent {
-            code: KeyCode::Char(ch),
-            modifiers,
-            kind: KeyEventKind::Press,
-            ..
-        }) if modifiers.difference(KeyModifiers::SHIFT).is_empty() => Some(*ch),
-        _ => None,
-    }
-}
-
-/// 把一批以普通字符开头的事件合并成一次粘贴，返回按原顺序转发的事件。
-///
-/// 字符不足阈值时原样返回，保持普通逐键输入的语义；末尾若跟着非字符事件，
-/// 它必须排在粘贴之后，不能被吞进粘贴正文。
-fn coalesce_event_batch(mut events: Vec<Event>) -> Vec<Event> {
-    let text: String = events.iter().filter_map(plain_char).collect();
-    if text.chars().count() < INJECTED_PASTE_MIN_CHARS {
-        return events;
-    }
-    let tail = events.pop().expect("至少包含首个字符事件");
-    if plain_char(&tail).is_some() {
-        vec![Event::Paste(text)]
-    } else {
-        vec![Event::Paste(text), tail]
-    }
-}
-
 // ─── Demo 模型 ───
 
 /// 普通移动完整路由但不预先标脏；点击、拖动、滚轮保守重绘。
@@ -1872,6 +1805,7 @@ fn event_requires_redraw(event: Option<&UiEvent>, tick: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
 
     /// 插件持久状态目录必须同时按 Lucia Home 和项目作用域隔离。
     #[cfg(feature = "plugins")]
@@ -2405,70 +2339,5 @@ mod tests {
             Err(WorkspaceError::Escape)
         );
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    /// 构造一个无修饰的普通字符按键事件。
-    fn plain_key(ch: char) -> Event {
-        Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
-    }
-
-    /// 连续写入的字符达到阈值后合并成一次粘贴，附件识别才能拿到完整路径。
-    #[test]
-    fn injected_character_burst_becomes_single_paste() {
-        let events = [
-            plain_key('/'),
-            plain_key('t'),
-            plain_key('m'),
-            plain_key('p'),
-        ];
-        let coalesced = coalesce_event_batch(Vec::from(events));
-        assert_eq!(coalesced.len(), 1);
-        assert!(matches!(&coalesced[0], Event::Paste(text) if text.as_str() == "/tmp"));
-
-        // 终端把大写字母上报为 `Char + SHIFT`，它仍是路径正文。
-        let shifted = [
-            Event::Key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT)),
-            plain_key('s'),
-            plain_key('e'),
-            plain_key('r'),
-        ];
-        let coalesced = coalesce_event_batch(Vec::from(shifted));
-        assert_eq!(coalesced.len(), 1);
-        assert!(matches!(&coalesced[0], Event::Paste(text) if text.as_str() == "User"));
-    }
-
-    /// 不足阈值或带修饰键的输入保持逐键语义，不能把正常打字改写成粘贴。
-    #[test]
-    fn short_or_modified_keys_keep_individual_events() {
-        let short = [plain_key('a'), plain_key('b'), plain_key('c')];
-        assert_eq!(coalesce_event_batch(Vec::from(short)).len(), 3);
-
-        let modified = [
-            plain_key('a'),
-            Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
-        ];
-        assert_eq!(coalesce_event_batch(Vec::from(modified)).len(), 2);
-    }
-
-    /// 粘贴之后的回车等非字符事件必须保持独立，并排在粘贴之后。
-    #[test]
-    fn trailing_non_character_event_follows_paste() {
-        let events = [
-            plain_key('/'),
-            plain_key('t'),
-            plain_key('m'),
-            plain_key('p'),
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        ];
-        let coalesced = coalesce_event_batch(Vec::from(events));
-        assert_eq!(coalesced.len(), 2);
-        assert!(matches!(&coalesced[0], Event::Paste(text) if text.as_str() == "/tmp"));
-        assert!(matches!(
-            &coalesced[1],
-            Event::Key(KeyEvent {
-                code: KeyCode::Enter,
-                ..
-            })
-        ));
     }
 }
