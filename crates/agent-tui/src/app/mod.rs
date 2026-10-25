@@ -158,7 +158,7 @@ pub(crate) struct App {
     pub(crate) queued_inputs: VecDeque<UserSubmission>,
     /// 当前运行是否由 FIFO 自动派发；输入已出队，仅在首次保存失败时恢复到队首。
     pub(crate) queued_run_active: bool,
-    /// 用户取消后保持 FIFO 暂停；显式普通发送恢复，Ctrl+Enter 仅处理指定消息。
+    /// 取消或保存失败后保持 FIFO 暂停；新提交实际启动时恢复，插队仅在旧轮收尾期间暂停。
     pub(crate) queue_paused: bool,
     /// Ctrl+Enter 指定的优先输入；等待旧运行保存收尾后才作为普通用户消息启动。
     pub(crate) immediate_input: Option<UserSubmission>,

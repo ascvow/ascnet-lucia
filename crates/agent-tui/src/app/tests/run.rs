@@ -263,24 +263,24 @@ async fn immediate_queue_send_interrupts_and_preserves_payload_and_order() {
         visible_user_texts(&app),
         ["原始任务", "优先处理 [IMAGE#1] [REF#1]"]
     );
-    assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
-    assert!(app.queue_paused, "插队仅发送指定项，普通队列不能自动恢复");
-    app.run_next_queued(&agent);
-    assert!(!app.running);
-    let requests = model.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    let latest = requests[1]
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == agent_core::MessageRole::User)
-        .unwrap();
-    assert!(latest.text_content().contains("完整引用正文"));
-    assert!(latest
-        .content
-        .iter()
-        .any(|block| matches!(block, ContentBlock::Image { data, .. } if data == "aW1hZ2U=")));
-    assert!(!format!("{:?}", requests[1].messages).contains("等待一"));
+    assert!(app.handle_agent_done(queue_completion(&mut rx).await));
+    assert!(!app.queue_paused, "优先任务完成后应自动恢复普通队列");
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let latest = requests[1]
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == agent_core::MessageRole::User)
+            .unwrap();
+        assert!(latest.text_content().contains("完整引用正文"));
+        assert!(latest
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { data, .. } if data == "aW1hZ2U=")));
+        assert!(!format!("{:?}", requests[1].messages).contains("等待一"));
+    }
     assert_eq!(
         app.queued_inputs
             .iter()
@@ -288,6 +288,15 @@ async fn immediate_queue_send_interrupts_and_preserves_payload_and_order() {
             .collect::<Vec<_>>(),
         ["等待一", "等待二"]
     );
+    for expected in ["等待一", "等待二"] {
+        app.run_next_queued(&agent);
+        assert_eq!(visible_user_texts(&app).last(), Some(&expected));
+        assert!(app.handle_agent_done(queue_completion(&mut rx).await));
+    }
+    app.run_next_queued(&agent);
+    assert!(!app.running);
+    assert!(app.queued_inputs.is_empty());
+    assert_eq!(model.requests.lock().unwrap().len(), 4);
     assert_eq!(app.input, "不应覆盖的草稿");
     assert_eq!(agent.control().pending_steering(), 0);
 }
@@ -384,7 +393,8 @@ async fn immediate_send_waits_for_previous_final_save() {
     assert!(app.handle_agent_done(queue_completion(&mut rx).await));
     assert_eq!(app.session_record.revision, 2);
     app.run_next_queued(&agent);
-    assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
+    assert!(app.handle_agent_done(queue_completion(&mut rx).await));
+    assert!(!app.queue_paused);
     assert_eq!(app.session_record.revision, 4);
     assert_eq!(
         store.list().await.unwrap().len(),
@@ -521,31 +531,155 @@ fn immediate_queue_send_accepts_pending_head_and_rejects_unavailable_targets() {
     assert_eq!(app.input, "草稿");
 }
 
-/// 已取消的普通队列不会被任意后续完成事件恢复；用户显式 Enter 才恢复 FIFO。
+/// 手动暂停必须由新提交恢复；普通发送和优先发送、编辑器和队列入口都应一致。
 #[tokio::test]
-async fn paused_queue_resumes_only_after_explicit_normal_send() {
+async fn paused_queue_resumes_after_explicit_send_from_either_entry() {
+    for from_queue in [false, true] {
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut app = App::new(tx, "test".into());
+            let (gateway, options) = build_demo_gateway();
+            let agent = Arc::new(Agent::new(gateway, options));
+            app.queued_inputs = VecDeque::from(["等待一".into(), "等待二".into(), "等待三".into()]);
+            app.queue_paused = true;
+            app.run_next_queued(&agent);
+            assert!(!app.running, "手动暂停不能自行解除");
+
+            let expected = if from_queue {
+                app.queue_focus = Some(1);
+                app.handle_queue_key(KeyCode::Enter, modifiers, Some(&agent));
+                vec!["等待二", "等待一", "等待三"]
+            } else {
+                app.input = "新提交".into();
+                app.handle_key(KeyCode::Enter, modifiers, Some(&agent));
+                vec!["新提交", "等待一", "等待二", "等待三"]
+            };
+            assert!(!app.queue_paused);
+            while app.running {
+                assert!(app.handle_agent_done(queue_completion(&mut rx).await));
+                app.run_next_queued(&agent);
+            }
+            assert!(app.queued_inputs.is_empty());
+            assert_eq!(visible_user_texts(&app), expected);
+        }
+    }
+}
+
+/// 优先任务运行时新排的消息也应在完成后自动执行，不受此前插队的暂停标记影响。
+#[tokio::test]
+async fn messages_queued_during_priority_run_continue_in_fifo_order() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "test".into());
     let (gateway, options) = build_demo_gateway();
     let agent = Arc::new(Agent::new(gateway, options));
-    app.queued_inputs = VecDeque::from(["等待一".into(), "等待二".into()]);
-    app.queue_paused = true;
-    app.run_next_queued(&agent);
-    assert!(!app.running);
-    app.queue_focus = Some(1);
-    app.handle_queue_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
-    assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
-    assert!(app.queue_paused, "空闲时 Ctrl+Enter 也只发送选中项");
-    assert_eq!(app.queued_inputs.front().unwrap().text, "等待一");
-    app.queued_inputs.push_back("等待三".into());
-    app.queue_focus = Some(0);
-    app.handle_queue_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
-    assert!(!app.queue_paused);
-    assert!(app.handle_agent_done(queue_completion(&mut rx).await));
-    app.run_next_queued(&agent);
-    assert_eq!(visible_user_texts(&app), ["等待二", "等待一", "等待三"]);
-    app.handle_agent_done(queue_completion(&mut rx).await);
+    app.input = "优先任务".into();
+    app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+    for input in ["后续一", "后续二"] {
+        app.input = input.into();
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE, Some(&agent));
+    }
+    assert_eq!(visible_user_texts(&app), ["优先任务"]);
+    assert_eq!(app.queued_inputs.len(), 2);
+    while app.running {
+        assert!(app.handle_agent_done(queue_completion(&mut rx).await));
+        app.run_next_queued(&agent);
+    }
+    assert_eq!(visible_user_texts(&app), ["优先任务", "后续一", "后续二"]);
     assert!(app.queued_inputs.is_empty());
+}
+
+/// 优先任务启动后的主动停止仍须暂停 FIFO；不能把恢复标记当作忽略取消的许可。
+#[tokio::test]
+async fn stopping_priority_run_keeps_remaining_queue_paused() {
+    for (code, modifiers) in [
+        (KeyCode::Esc, KeyModifiers::NONE),
+        (KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "test".into());
+        let model = Arc::new(QueueBlockingModel::default());
+        let agent = queue_test_agent(model.clone());
+        app.queued_inputs.push_back("保持等待".into());
+        app.input = "优先任务".into();
+        app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+        model.entered.notified().await;
+        assert!(!app.queue_paused);
+        app.handle_key(code, modifiers, Some(&agent));
+        assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
+        app.run_next_queued(&agent);
+        assert!(!app.running);
+        assert!(app.queue_paused);
+        assert_eq!(app.queued_inputs.front().unwrap().text, "保持等待");
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+}
+
+/// 旧轮保存失败时不启动优先消息；新轮保存失败时也不继续消费剩余队列。
+#[tokio::test]
+async fn immediate_queue_send_stops_on_unrecoverable_save_failure() {
+    for failed_saves in [vec![2, 3], vec![3], vec![4, 5]] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "test".into());
+        app.session_store = Arc::new(ScriptedSaveStore::new(
+            failed_saves.clone(),
+            ScriptedSaveFailure::Io,
+        ));
+        let (gateway, options) = build_demo_gateway();
+        let agent = Arc::new(Agent::new(gateway, options));
+        app.input = "旧任务".into();
+        app.submit(&agent);
+        // 让旧轮生成实际回复，使最终保存失败不能被“原记录内容未变”的回读协调消除。
+        // 完成事件尚未交给 UI 时，Ctrl+Enter 仍应遵守旧轮的保存结果。
+        let completion = queue_completion(&mut rx).await;
+        app.queued_inputs.push_back("保持等待".into());
+        app.input = "优先任务".into();
+        app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+        // 保留新草稿，首存失败时完整优先输入应退回队列而不是覆盖它。
+        app.input = "未发送草稿".into();
+        if failed_saves[0] == 2 {
+            assert!(!app.handle_agent_done(completion));
+        } else {
+            assert!(app.handle_agent_done(completion));
+            app.run_next_queued(&agent);
+            assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
+        }
+        assert!(app.queue_paused);
+        assert!(app.immediate_input.is_none());
+        app.run_next_queued(&agent);
+        assert!(!app.running);
+        assert_eq!(app.input, "未发送草稿");
+        let expected = if failed_saves[0] == 4 {
+            vec!["保持等待"]
+        } else {
+            vec!["优先任务", "保持等待"]
+        };
+        assert_eq!(
+            app.queued_inputs
+                .iter()
+                .map(|input| input.text.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+/// 真正暂停时状态行明确给出恢复动作，而不是只有含糊的 open 提示。
+#[test]
+fn paused_queue_status_explains_how_to_resume() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "test".into());
+    app.queued_inputs.push_back("待恢复".into());
+    app.queue_paused = true;
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(text.contains("1 paused · Ctrl+O → Enter resume"), "{text}");
 }
 
 /// Agent 引用确实不可用时，输入保持 FIFO 顺序并显示在加载底栏。

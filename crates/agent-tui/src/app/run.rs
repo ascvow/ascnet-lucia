@@ -314,7 +314,6 @@ impl App {
             Some(index.min(self.queued_inputs.len() - 1))
         };
         self.queued_run_active = false;
-        self.queue_paused = false;
         self.start_input_run(agent, submission);
     }
 
@@ -375,8 +374,8 @@ impl App {
     }
 
     /// 运行中只登记优先输入，绝不在旧 Session 尚未保存时并发启动新 Agent 轮次。
+    /// 优先消息实际启动时恢复 FIFO，使其完成后继续处理其余待发送消息。
     fn send_immediate_submission(&mut self, agent: &Arc<Agent>, submission: UserSubmission) {
-        self.queue_paused = true;
         if self.running {
             self.interrupt_run(Some(agent));
             self.immediate_input = Some(submission);
@@ -434,13 +433,15 @@ impl App {
             return;
         };
         self.queued_run_active = false;
-        self.queue_paused = false;
         self.start_input_run(agent, submission);
     }
 
-    /// 启动一次完整用户提交；手动发送、FIFO 与优先发送统一展示用户气泡。
+    /// 启动一次完整用户提交；手动发送、FIFO 与优先发送统一展示用户气泡并恢复队列。
     pub(crate) fn start_input_run(&mut self, agent: &Arc<Agent>, submission: UserSubmission) {
         self.flush_pending_stream();
+        // 插队借用取消路径只是为了等旧轮安全收尾；新提交已获准启动，暂停不能泄漏到其后。
+        // 不在完成回调中无条件恢复，避免 Esc 或保存失败后的迟到事件意外重启队列。
+        self.queue_paused = false;
         self.active_input_message = Some(self.messages.len());
         self.messages
             .push(Msg::new(MsgKind::User, submission.text.clone()));

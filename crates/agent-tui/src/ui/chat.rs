@@ -1207,9 +1207,10 @@ fn prompt_status_text(app: &App) -> Option<(String, Color)> {
                     index + 1,
                     pending
                 );
+            } else if app.queue_paused {
+                let _ = write!(status, "{pending} paused · Ctrl+O → Enter resume");
             } else {
-                let state = if app.queue_paused { "paused" } else { "queued" };
-                let _ = write!(status, "{pending} {state} · Ctrl+O open");
+                let _ = write!(status, "{pending} queued · Ctrl+O open");
             }
             COLOR_WARNING
         }
