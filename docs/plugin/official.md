@@ -55,13 +55,13 @@ Teammate 插件负责成员角色、稳定成员地址、有界邮箱、确认�
 
 会话分别持有消息、草稿、光标、滚动位置和揭示缓冲，子视图不会借用主会话的 Plan、附件、上下文用量或权限状态。隐藏但仍在导航栈中的会话继续归档事件，不逐帧播放；关闭视图则释放订阅。成员续跑时稳定实例 ID 不变、目标执行句柄更新，保留该实例草稿和历史，并拒绝旧句柄的迟到事件。
 
-这些编辑与滚动交互由 TUI 本地处理，不向成员视图逐键派发 `UiInput`（通用输入准入事件仍保持原有语义）；用户提交时，宿主才把一条 `submit` 输入（`view_id` 为插件声明的成员会话视图）回送插件，由插件决定 steering 还是续跑，并在新句柄就绪后用同一实例 ID 重新打开视图。原生视图订阅的是插件 principal 名下的 Agent：目标不属于该插件时 Runtime 会拒绝，宿主只展示错误。公共导航与提交协议没有变化。成员会话暂不提供跨屏文本选择、附件提交，也不套用插件工具 renderer；worker 的只读工具由内置工具组件展示。
+这些编辑与滚动交互由 TUI 本地处理，不向成员视图逐键派发 `UiInput`（通用输入准入事件仍保持原有语义）；用户提交时，宿主才把一条 `submit` 输入（`view_id` 为插件声明的成员会话视图）回送插件，由插件决定 steering 还是续跑，并在新句柄就绪后用同一实例 ID 重新打开视图。原生视图订阅的是插件 principal 名下的 Agent：目标不属于该插件时 Runtime 会拒绝，宿主只展示错误。公共导航与提交协议没有变化。成员会话暂不提供跨屏文本选择、附件提交，也不套用插件工具 renderer；worker 的原生读写和 Shell 工具由内置工具组件展示。
 
 成员生命周期由插件自己收敛，不依赖模型主动清理：每轮运行结束时，状态已终态、所属 controller 运行已经结束且邮箱没有未读消息的成员会被回收，Runtime 句柄、目录项和邮箱一起释放；仍排队或运行中的成员保留，晚于 controller 结束的成员在后续运行结束时补收。终态结果移入容量 8 条的回收台账，`teammate_result` 仍可读取，`teammate_list` 同时返回 `retired_members`；`teammate_remove` 对已回收成员保持幂等。通过 `teammate.mailbox` 服务创建的成员没有 controller 运行身份，保留到调用方显式 `remove`。
 
 成员失败时，插件在下一次状态刷新中读取一次幂等的终态结果，并把原因写入成员快照的可选 `error` 字段：`teammate_list`、`teammate_status`、团队工作台的成员详情和回收台账都能直接看到具体失败原因（例如单次输出上限、provider 报错或连接中断），不需要再额外调用 `teammate_result` 猜原因。
 
-Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置；worker 模板继承同一个动态 Plugin Host，因此只读工具仍会经过已启用的工具策略提供者（如手动安装的权限插件）与 Host 启动期门禁。worker 不覆盖步数，队员与主会话一样可以一直运行到任务完成；每次派活都是一次新的投胎，完成后插件会 `collect` 旧实例，队长可以一直派活、队员可以一直接活，上下文不足时由队员自己继承的 Context Loader 压缩。
+Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置；worker 明确获得 `list_directory`、`search_files`、`read_file`、`write_file`、`edit_file`、`shell` 和已发现 Skill 的 `skill_read`，可以自行落盘和运行验证。父级权限仍取交集，文件工具仍受工作区边界约束；Shell 是完整原生进程信任而非沙箱。worker 模板继承同一个动态 Plugin Host，所有工具仍经过已启用的工具策略提供者（如手动安装的权限插件）与 Host 启动期门禁。worker 不覆盖步数，队员与主会话一样可以一直运行到任务完成；每次派活都是一次新的投胎，完成后插件会 `collect` 旧实例，队长可以一直派活、队员可以一直接活，上下文不足时由队员自己继承的 Context Loader 压缩。升级后重启 TUI 并新建成员，旧成员续跑不会凭空扩大其既有权限。
 
 ## Plan 插件
 

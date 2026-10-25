@@ -4,7 +4,7 @@
 
 ## 行为边界
 
-- `worker` profile 由应用注册并授权，Guest 不能选择模型、凭证或扩大工具权限。
+- `worker` profile 由应用注册并授权，Guest 不能选择模型、凭证或扩大工具权限。Lucia TUI 默认明确授予文件读取/搜索、`write_file`、`edit_file`、`shell` 和 `skill_read`，队员可自行落盘与验证；父权限、执行策略、工作区文件守卫与 Host 审批仍生效。Shell 是完整原生进程能力，不是工作区沙箱；并行任务应分配互不重叠的文件。更新 TUI 后重启并新建成员，旧成员续跑不会自动扩权。
 - 首次派生返回的 Agent ID 是稳定成员地址；续跑产生的新 Agent ID 仅作为该成员的当前执行句柄。
 - 每次投胎完成后都会请 Runtime `collect` 旧句柄：释放它的私有会话、终态结果与累计名额，因此反复派活不会耗尽 principal 的累计 Agent 总数。回收只在目标终态后成功，取消中的句柄由后续刷新重试。
 - 工具调用的发送者固定为 Host 注入的 controller Agent ID；服务调用的发送者固定为 Host 注入的 `caller_id`，请求不能自行声明发送者。
@@ -62,3 +62,16 @@ cargo test --offline --manifest-path smoke-tests/Cargo.toml
 ```
 
 应用加载插件前必须向 `PluginHostServices` 注入 Agent Runtime，并注册 controller profile 与 `worker` 派生配置。插件不会在同步 WASM 调用中等待后台 Agent 完成；调用方应轮询 `teammate_result`。
+
+验证 **TUI 实际装配的 worker 权限**（不是只测试默认派生配置）：
+
+```bash
+# 在仓库根目录执行；仅使用临时工作区和本地假模型，不调用外部模型。
+bun run scripts/build-plugin.ts teammate-plugin
+cargo build --offline -p lucia
+python3 -B examples/plugins/teammate-plugin/smoke-tests/tui-worker.py
+```
+
+该 smoke 经真实 TUI、WASM 和 Runtime，让队员依次写文件、读取、精确编辑、运行 Shell 验证，
+再经邮箱 dispatch 续跑。主模型只调用团队控制工具，不能代写；同时断言工作区外文件写入被拒绝、
+非白名单环境未传给 Shell、续跑仍有开发工具。`LUCIA_BIN` 可指定已安装的二进制检查部署是否生效。

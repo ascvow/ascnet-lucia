@@ -83,7 +83,17 @@ Evaluation 与 Mutation 等受限平面必须显式设置这三项上限，用�
 
 Runtime 的 controller profile 由应用注册，决定基础模型、工具和权限。Plugin Host 还会把 Guest 可见的 spawn profile 映射为受控的 `AgentDeriveConfig`。Guest 只能提交 profile 名称和任务输入，不能直接传入 provider、API key、provider options 或工具权限。
 
-Lucia TUI 的 `worker` profile 使用显式只读 allowlist：`list_directory`、`search_files`、`read_file` 和 `skill_read`。它不继承 `shell`、`write_file` 或未来新增工具；需要副作用的工作必须回到经过主 Agent 权限策略的调用链。worker 不覆盖主会话的 `max_steps`：主会话配置为 `0`（不设上限）时队员可以一直运行到任务完成。`continue_agent` 不增加派生深度、不消耗父节点子配额，队员因此可以反复接收新任务；每次投胎的实例完成后由调用方 `collect`，上下文不足时由它继承的 Context Loader 自行压缩。
+Lucia TUI 的 `worker` profile 使用显式开发工具 allowlist：`list_directory`、`search_files`、
+`read_file`、`write_file`、`edit_file`、`shell` 和 `skill_read`（发现 Skill 后才注册）。
+队员可以在共享工作区内独立修改并验证，不需要把代码交回主 Agent 代写；不会自动获得 MCP、
+递归派生或未来新增工具。该集合仍与父权限取交集，继承主会话的 ExecutionPolicy、文件工具的
+WorkspaceGuard，以及已启用的 Host 工具审批/启动门禁。`shell` 是完整原生进程信任，
+工作目录限制不构成进程沙箱；环境白名单、超时和共享工具实例的进程并发限制保持不变。
+
+worker 不覆盖主会话的 `max_steps`：主会话配置为 `0`（不设上限）时队员可以一直运行到任务完成。
+`continue_agent` 不增加派生深度、不消耗父节点子配额，并继承原成员已经收窄的权限；队员因此可以
+反复接收新任务。每次投胎的实例完成后由调用方 `collect`，上下文不足时由它继承的 Context Loader
+自行压缩。旧进程和旧成员的权限不会热升级：更新 TUI 后须重启并新建成员。
 
 应用通过可选宿主服务把 Runtime 注入 WASM loader：
 

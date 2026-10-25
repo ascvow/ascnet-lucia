@@ -113,6 +113,28 @@ shell 的行为。
 Serve 平面仍未提供跨完整用户 Run 的统一墙钟上限；Host 也尚未提供 Secret API。以后
 新增网络或凭据入口时，必须复用上述最终门禁，不能只读取公开布尔字段。
 
+## TUI worker 的开发工具授权
+
+默认 `worker` 由 TUI 可信装配层明确授予七个工具：`list_directory`、`search_files`、`read_file`、
+`write_file`、`edit_file`、`shell`、`skill_read`。这修正了旧版只读 profile 导致队员无法落盘或验证、
+只能让主 Agent 代写的问题；不是把 `ToolAccess` 改成 `All`，MCP、递归派生及新增工具不会自动继承。
+
+这是应用授予的**真实副作用能力扩展**，不是提示词承诺，也不是 Guest 自行声明授权：
+
+- Runtime 仍与父 Agent 权限取交集；子节点不能恢复父级删除的工具。
+- Core 的执行策略门禁在模型可见定义和实际调用处仍生效；Evaluation/Mutation 不能执行 Shell。
+- 原生工具实例与父模板共享，文件工具继续校验工作区与符号链接边界；不扩大文件能力或路径授权。
+- 同一父总线上的 Host 启动期门禁、选定策略 owner 和其他审批规则继续作用于队员调用。
+- Shell 拥有当前用户的完整原生进程权限，**固定 cwd 不是沙箱**，也不能宣称脚本只能读写工作区。
+  子进程环境仍清空后按既有白名单注入，输出/超时限制与共享实例的进程名额不变；不增加
+  Guest `process_exec` 授权、不绕过 manifest 的 Agent profile 检查。
+- 并行队员共享真实工作区，不提供事务或自动合并。控制方必须分配不重叠的文件所有权并核验结果，
+  不能因“队员隔离”而假定写冲突或命令副作用可回滚。
+
+回归必须既验证生产 TUI profile 的允许集合/父权限交集/Host 拒绝链，也通过真实 TUI → WASM
+Teammate → Runtime 队员执行写入、编辑、Shell 验证和续跑；只测试 `AgentDeriveConfig::default()`
+会掩盖 TUI 的错误裁剪。已运行的旧进程和旧成员不会热扩权，更新后二次派生必须从新 TUI 进程开始。
+
 ## 后果
 
 - 授权和文件系统边界的最终判定必须留在可信 Rust 代码内，WASM 插件只能收紧。

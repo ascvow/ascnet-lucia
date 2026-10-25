@@ -25,22 +25,29 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// 插件可请求的默认 worker 只读工具集合；新增原生工具不会自动进入派生 Agent。
-const WORKER_READ_ONLY_TOOLS: [&str; 4] = [
+/// 插件可请求的默认 worker 原生开发工具集合；新增工具不会自动进入派生 Agent。
+///
+/// 文件写入复用父 Agent 的 WorkspaceGuard，Shell 复用完整原生进程授权和环境白名单，
+/// 不是 WASM/文件系统沙箱。父权限、执行策略和 Host 工具准入仍可进一步收窄或拒绝。
+const WORKER_TOOLS: [&str; 7] = [
     "list_directory",
     "search_files",
     "read_file",
+    "write_file",
+    "edit_file",
+    "shell",
     agent_skill::SKILL_READ_TOOL_NAME,
 ];
 
-/// 构造 TUI 授予插件 worker profile 的显式只读派生策略。
+/// 构造 TUI 授予插件 worker profile 的显式开发工具策略。
 ///
+/// 队员可以独立落盘并运行验证，不必把实现交回主 Agent 代写；仍不继承任意插件工具。
 /// 只收缩工具权限，不覆盖步数：worker 与主会话一样允许长时间运行，交互式主会话的
 /// `max_steps = 0`（不设上限）会原样继承，队员因此可以一直跑到任务完成。
 fn worker_agent_derive_config() -> AgentDeriveConfig {
     AgentDeriveConfig {
         permissions: AgentPermissions {
-            tools: ToolAccess::allowlist(WORKER_READ_ONLY_TOOLS),
+            tools: ToolAccess::allowlist(WORKER_TOOLS),
         },
         ..AgentDeriveConfig::default()
     }
@@ -509,27 +516,218 @@ mod tests {
         );
     }
 
-    /// worker profile 必须保持显式只读，不能因默认 `All` 或未来新增工具获得副作用能力。
+    /// worker 具备完整的原生开发工具，但不得因 `All` 或未来新增工具扩大继承范围。
     #[test]
-    fn worker_profile_exposes_only_explicit_read_tools() {
+    fn worker_profile_exposes_explicit_development_tools() {
         let config = worker_agent_derive_config();
 
-        for allowed in WORKER_READ_ONLY_TOOLS {
+        for allowed in [
+            "list_directory",
+            "search_files",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "shell",
+            "skill_read",
+        ] {
             assert!(
                 config.permissions.tools.permits(allowed),
                 "应允许 {allowed}"
             );
         }
+        assert!(
+            matches!(&config.permissions.tools, ToolAccess::Allowlist(names) if names.len() == 7)
+        );
         for denied in [
-            "write_file",
-            "shell",
             "process_exec",
             "future_dangerous_tool",
+            "mcp__server__tool",
+            "teammate_spawn",
         ] {
             assert!(
                 !config.permissions.tools.permits(denied),
                 "worker 不得获得 {denied}"
             );
+        }
+    }
+
+    /// 使用真正的内置工具构造父模板，测试必须经过生产 worker 配置而非默认 All。
+    fn development_template(root: &Path, policy: agent_tool::ExecutionPolicy) -> AgentTemplate {
+        let mut tools = agent_tool::ToolRegistry::new();
+        agent_tool::builtins::register_builtins(
+            &mut tools,
+            agent_tool::WorkspaceGuard::rooted(root).unwrap(),
+            agent_tool::ReadPathGrants::new(),
+        )
+        .unwrap();
+        // 主会话有这个工具也不代表队员自动继承。
+        tools
+            .register(agent_tool::JsonTool::new(
+                agent_tool::ToolSpec::new(
+                    "future_dangerous_tool",
+                    "test",
+                    agent_tool::ToolSpec::empty_object_schema(),
+                ),
+                |_| async { Ok(serde_json::json!({})) },
+            ))
+            .unwrap();
+        let agent = agent_core::Agent::new(
+            agent_core::ModelGateway::new(),
+            agent_core::AgentOptions::default().with_execution_policy(policy),
+        )
+        .with_tools(tools);
+        AgentTemplate::from_agent(&agent)
+    }
+
+    /// 生产 profile 必须实际携带读写/验证工具，且父 allowlist、执行平面仍只能收窄。
+    #[tokio::test]
+    async fn worker_development_tools_respect_parent_and_execution_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "lucia-worker-policy-{}",
+            agent_session::SessionId::generate()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = worker_agent_derive_config();
+        let template = development_template(&root, agent_tool::ExecutionPolicy::serve());
+        let (worker, _) = template
+            .instantiate(&AgentPermissions::default(), &config)
+            .unwrap();
+        let names = worker
+            .tool_specs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<HashSet<_>>();
+        assert_eq!(names.len(), 6, "无 Skill 索引时只注册六项内置工具");
+        for name in ["read_file", "write_file", "edit_file", "shell"] {
+            assert!(names.contains(name));
+        }
+        assert!(!names.contains("future_dangerous_tool"));
+        let parent = AgentPermissions {
+            tools: ToolAccess::allowlist(["read_file"]),
+        };
+        let (restricted, effective) = template.instantiate(&parent, &config).unwrap();
+        assert_eq!(effective, parent);
+        assert_eq!(
+            restricted
+                .tool_specs()
+                .await
+                .unwrap()
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read_file"]
+        );
+        let mut denied =
+            agent_tool::ToolCall::new("denied-write", "write_file", serde_json::json!({}));
+        denied.bind_run_id("parent-restricted");
+        let blocked = restricted
+            .event_bus()
+            .dispatch(agent_core::ToolCallEvent::new(
+                "parent-restricted",
+                0,
+                denied,
+            ))
+            .await;
+        assert!(
+            blocked.is_cancelled(),
+            "父级删掉的写工具不能绕过实际调用门禁"
+        );
+
+        let mut policy = agent_tool::ExecutionPolicy::evaluation(&root);
+        policy.tools = ToolAccess::allowlist(WORKER_TOOLS);
+        let evaluation = development_template(&root, policy);
+        let (worker, _) = evaluation
+            .instantiate(&AgentPermissions::default(), &config)
+            .unwrap();
+        assert!(!worker
+            .tool_specs()
+            .await
+            .unwrap()
+            .iter()
+            .any(|spec| spec.name == "shell"));
+        assert!(!worker
+            .options()
+            .execution_policy
+            .permits_process_execution());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 模拟宿主可信工具准入规则，验证队员扩权不绕过父 Agent 总线。
+    struct DenyWorkerWrite;
+
+    #[async_trait::async_trait]
+    impl agent_core::EventListener for DenyWorkerWrite {
+        async fn handle(&self, ctx: &mut agent_core::EventContext<'_>) -> Result<()> {
+            if ctx
+                .event::<agent_core::ToolCallEvent>()
+                .is_some_and(|event| event.call.name == "write_file")
+            {
+                ctx.cancel();
+            }
+            Ok(())
+        }
+    }
+
+    /// 父总线与 Live Host 的准入仍作用于队员写入和 Shell，不把扩权变成隐式放行。
+    #[tokio::test]
+    async fn worker_development_calls_keep_host_and_parent_gates() {
+        let base = agent_core::Agent::new(
+            agent_core::ModelGateway::new(),
+            agent_core::AgentOptions::default(),
+        );
+        let live = Arc::new(LivePluginHost::new());
+        live.attach_bus(base.event_bus()).unwrap();
+        base.event_bus().subscribe(
+            agent_core::Subscribe::typed::<agent_core::ToolCallEvent>("test-write-policy"),
+            Arc::new(DenyWorkerWrite),
+        );
+        let base = base.with_extension(live.clone());
+        let template = AgentTemplate::from_agent(&base);
+        let (worker, _) = template
+            .instantiate(&AgentPermissions::default(), &worker_agent_derive_config())
+            .unwrap();
+        worker
+            .event_bus()
+            .dispatch(agent_core::AgentRecordEvent {
+                record: agent_core::AgentEvent::new(
+                    "before-ready",
+                    agent_core::AgentEventKind::RunStarted,
+                    0,
+                    serde_json::json!({}),
+                ),
+            })
+            .await;
+        for tool in ["edit_file", "shell"] {
+            let mut call = agent_tool::ToolCall::new("blocked", tool, serde_json::json!({}));
+            call.bind_run_id("before-ready");
+            assert!(worker
+                .event_bus()
+                .dispatch(agent_core::ToolCallEvent::new("before-ready", 0, call))
+                .await
+                .is_cancelled());
+        }
+        live.finish_capability_planning().unwrap();
+        worker
+            .event_bus()
+            .dispatch(agent_core::AgentRecordEvent {
+                record: agent_core::AgentEvent::new(
+                    "after-ready",
+                    agent_core::AgentEventKind::RunStarted,
+                    0,
+                    serde_json::json!({}),
+                ),
+            })
+            .await;
+        for (tool, should_deny) in [("write_file", true), ("edit_file", false), ("shell", false)] {
+            let mut call = agent_tool::ToolCall::new("gated", tool, serde_json::json!({}));
+            call.bind_run_id("after-ready");
+            let result = worker
+                .event_bus()
+                .dispatch(agent_core::ToolCallEvent::new("after-ready", 0, call))
+                .await;
+            assert_eq!(result.is_cancelled(), should_deny, "{tool}");
         }
     }
 
