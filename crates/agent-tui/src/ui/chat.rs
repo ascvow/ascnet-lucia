@@ -301,6 +301,9 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
         },
     };
     render_input_pane(frame, input_section, &input_pane);
+    if app.has_copyable_text_selection() {
+        render_selection_copy_hint(frame, input_section);
+    }
 
     app.context_chip_areas = footer.context_areas(footer_section);
     if app.context_chip_areas.is_empty() {
@@ -308,6 +311,30 @@ pub(crate) fn render_main(frame: &mut Frame, app: &mut App, workspace: Rect) -> 
     }
     frame.render_widget(Paragraph::new(footer.lines), footer_section);
     input_section
+}
+
+/// 在主输入框上边框右侧显示复制提示，不占底栏高度或覆盖上方运行/跳转状态。
+///
+/// 窄窗口依次缩短文案，但保留完整快捷键；放不下时隐藏，不能覆盖尺寸提示或输入正文。
+fn render_selection_copy_hint(frame: &mut Frame, area: Rect) {
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+    let Some(label) = ["Selection · Ctrl+C copy", "Ctrl+C copy", "Ctrl+C"]
+        .into_iter()
+        .find(|label| label.width() + 4 <= usize::from(area.width))
+    else {
+        return;
+    };
+    let width = label.width() as u16 + 2;
+    let hint = Rect::new(area.right() - width - 1, area.y, width, 1);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {label} "),
+            Style::new().fg(COLOR_SUCCESS),
+        )),
+        hint,
+    );
 }
 
 /// 收集底栏条目后按宽度折行；插件状态与原生元信息共用布局，不再挤占各自的一半宽度。
@@ -372,16 +399,6 @@ fn main_footer(app: &App, cwd_display: &str, width: u16) -> FooterLayout {
             None => vec![Span::styled(label.to_string(), Style::new().fg(*color))],
         };
         footer.push(spans, width, false);
-    }
-    if app.has_copyable_text_selection() {
-        footer.push(
-            vec![Span::styled(
-                "Selection · Ctrl+C copy",
-                Style::new().fg(COLOR_SUCCESS),
-            )],
-            width,
-            false,
-        );
     }
     // 稳定运行后收起启动详情；加载/失败提示也参与折行，不再压住左侧状态。
     #[cfg(feature = "plugins")]
@@ -1658,6 +1675,65 @@ mod conversation_layout_tests {
                     }
                     if height >= 8 {
                         assert!(sections[0].height >= 4, "底栏不能吞掉整个正文区");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 窄窗口只缩短复制文案，不截断快捷键；偏移区域与极小尺寸也不能覆盖输入框外部。
+    #[test]
+    fn selection_copy_hint_fits_border_without_clipping_shortcut() {
+        for (width, label) in [
+            (40, Some("Selection · Ctrl+C copy")),
+            (27, Some("Selection · Ctrl+C copy")),
+            (26, Some("Ctrl+C copy")),
+            (15, Some("Ctrl+C copy")),
+            (14, Some("Ctrl+C")),
+            (10, Some("Ctrl+C")),
+            (9, None),
+            (4, None),
+            (0, None),
+        ] {
+            for height in [0, 1, 2, 3] {
+                let mut terminal = Terminal::new(TestBackend::new(48, 8)).unwrap();
+                let area = Rect::new(3, 2, width, height);
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(
+                            Block::new().borders(Borders::TOP | Borders::BOTTOM),
+                            area,
+                        );
+                    })
+                    .unwrap();
+                let before = terminal.backend().buffer().clone();
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(
+                            Block::new().borders(Borders::TOP | Borders::BOTTOM),
+                            area,
+                        );
+                        render_selection_copy_hint(frame, area);
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                if let Some(label) = label.filter(|_| height >= 3) {
+                    let row: String = (area.x..area.right())
+                        .map(|x| buffer[(x, area.y)].symbol())
+                        .collect();
+                    assert!(
+                        row.ends_with(&format!(" {label} ─")),
+                        "width={width}: {row}"
+                    );
+                    assert_eq!(buffer[(area.x, area.y)].symbol(), "─");
+                } else {
+                    assert_eq!(buffer, &before, "width={width}, height={height}");
+                }
+                for y in 0..8 {
+                    for x in 0..48 {
+                        if y != area.y || x < area.x || x >= area.right() {
+                            assert_eq!(buffer[(x, y)], before[(x, y)], "不应改写 ({x}, {y})");
+                        }
                     }
                 }
             }

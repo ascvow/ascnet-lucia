@@ -484,27 +484,56 @@ fn footer_reflows_on_resize_without_hiding_status_items() {
     assert!(!app.is_context_chip_hovered);
 }
 
-/// 左键释放形成可复制选区后，底栏必须展示一次性操作提示。
+/// 复制提示固定在输入框上边框右侧，显隐不能挤动底栏、光标或运行/跳转状态。
 #[test]
-fn footer_shows_copy_shortcut_for_released_selection() {
-    let backend = TestBackend::new(100, 16);
-    let mut terminal = Terminal::new(backend).expect("创建选区操作提示测试终端");
+fn selection_copy_hint_stays_on_composer_top_right() {
+    let width = 100;
+    let mut terminal = Terminal::new(TestBackend::new(width, 26)).unwrap();
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    app.text_selection_content = Some("待复制文本".into());
+    app.running = true;
+    app.model_is_thinking = true;
+    app.messages
+        .push(Msg::new(MsgKind::Assistant, "历史正文\n".repeat(40)));
+    app.scroll = Some(0);
 
-    terminal
-        .draw(|frame| render_root(frame, &mut app))
-        .expect("渲染选区操作提示");
-    let text = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
+    for input in ["draft", "first line\nsecond line"] {
+        app.input = input.into();
+        app.cursor = app.input.len();
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        let before = buffer_rows(&terminal, width);
+        let border = prompt_border_row(&before);
+        let cursor = terminal.get_cursor_position().unwrap();
+        let jump = app.jump_hint_area.expect("手动回看时应显示跳转提示");
+        assert!(before[status_row(&before)].contains("Thinking"));
 
-    assert!(text.contains("Selection · Ctrl+C copy"), "{text:?}");
+        app.text_selection_content = Some("待复制文本".into());
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        let selected = buffer_rows(&terminal, width);
+        assert_eq!(prompt_border_row(&selected), border);
+        let hint = " Selection · Ctrl+C copy ─";
+        assert!(selected[border].ends_with(hint), "{:?}", selected[border]);
+        for (index, (old, new)) in before.iter().zip(&selected).enumerate() {
+            if index != border {
+                assert_eq!(old, new, "复制提示不应改变第 {index} 行");
+            }
+        }
+        assert_eq!(terminal.get_cursor_position().unwrap(), cursor);
+        assert_eq!(app.jump_hint_area, Some(jump));
+        let x = width - unicode_width::UnicodeWidthStr::width(hint) as u16 + 1;
+        assert_eq!(
+            terminal.backend().buffer()[(x, border as u16)].fg,
+            crate::theme::COLOR_SUCCESS
+        );
+
+        app.dismiss_text_selection();
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        assert_eq!(
+            buffer_rows(&terminal, width),
+            before,
+            "取消选区后上边框应恢复，无残留提示"
+        );
+    }
 }
 
 /// 空会话首屏应在常见终端尺寸内绘制压缩后的彩色像素头像。
