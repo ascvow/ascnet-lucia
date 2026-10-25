@@ -37,7 +37,7 @@ const SKIP_DIRS: &[&str] = &[
 /// 在目录树中递归搜索文本内容。
 /// Recursively search for text content in a directory tree.
 ///
-/// 搜索根目录先经 [`WorkspaceGuard`] 解析，且递归过程不会跟随指向工作区外的符号链接。
+/// 搜索根目录与递归条目均经 [`WorkspaceGuard`] 解析，不跟随指向未授权或敏感路径的符号链接。
 pub struct SearchFilesTool {
     /// 默认最大结果数。
     default_max_results: usize,
@@ -107,8 +107,8 @@ fn is_likely_binary(buf: &[u8]) -> bool {
 
 /// 同步递归搜索。
 ///
-/// `boundary` 为工作区根目录。每个条目都以 canonicalize 结果与之比较，因此指向
-/// 工作区外的符号链接不会被跟随；`None` 表示不限制目录。
+/// `guard` 与搜索起点共用同一份授权；每个条目都验证真实路径，避免额外只读目录
+/// 被误判为工作区逃逸，也避免递归绕过敏感路径与符号链接边界。
 fn search_recursive(
     dir: &Path,
     pattern: &str,
@@ -116,7 +116,7 @@ fn search_recursive(
     depth: usize,
     results: &mut Vec<Match>,
     max_results: usize,
-    boundary: Option<&Path>,
+    guard: &WorkspaceGuard,
 ) {
     if depth > MAX_DEPTH || results.len() >= max_results {
         return;
@@ -132,17 +132,16 @@ fn search_recursive(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        // 逐条目校验真实路径，避免经符号链接读取或遍历工作区之外的内容。
-        if let Some(root) = boundary {
-            match path.canonicalize() {
-                Ok(real) if real.starts_with(root) => {}
-                _ => continue,
-            }
-        }
-        if path.is_dir() {
-            dirs.push(path);
-        } else {
-            files.push(path);
+        let Some(raw) = path.to_str() else {
+            continue;
+        };
+        let Ok(resolved) = guard.resolve_existing(raw, FileCapability::Read) else {
+            continue;
+        };
+        if resolved.is_dir() {
+            dirs.push(resolved);
+        } else if resolved.is_file() {
+            files.push(resolved);
         }
     }
 
@@ -218,7 +217,7 @@ fn search_recursive(
             depth + 1,
             results,
             max_results,
-            boundary,
+            guard,
         );
     }
 }
@@ -282,7 +281,7 @@ impl Tool for SearchFilesTool {
         let pattern = args.pattern.clone();
         let include = args.include.clone();
 
-        // 搜索起点必须落在工作区内；解析后的规范路径同时作为递归的包含性基准。
+        // 搜索起点与后代都复用路径守卫，应用只读目录不改变默认工作区。
         let root = match self
             .guard
             .resolve_existing(&base_path, FileCapability::Read)
@@ -297,7 +296,7 @@ impl Tool for SearchFilesTool {
                 ))
             }
         };
-        let boundary = self.guard.root().map(Path::to_path_buf);
+        let guard = self.guard.clone();
 
         let results = tokio::task::spawn_blocking(move || {
             if !root.is_dir() {
@@ -311,7 +310,7 @@ impl Tool for SearchFilesTool {
                 0,
                 &mut matches,
                 max_results,
-                boundary.as_deref(),
+                &guard,
             );
             matches
         })

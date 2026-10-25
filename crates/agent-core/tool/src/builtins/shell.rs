@@ -69,7 +69,7 @@ impl ShellTool {
     ) -> Self {
         Self {
             default_timeout_ms,
-            guard,
+            guard: guard.without_read_overrides(),
             execution_policy,
             active_processes: AtomicUsize::new(0),
         }

@@ -335,6 +335,8 @@ pub struct WorkspaceGuard {
     capabilities: FileCapabilities,
     /// 用户显式引用、允许只读访问的工作区外路径；只对读取能力生效。
     read_grants: Option<ReadPathGrants>,
+    /// 可信应用注入的额外只读目录，保存规范路径并允许读取其后代。
+    read_roots: Vec<PathBuf>,
 }
 
 impl WorkspaceGuard {
@@ -349,6 +351,7 @@ impl WorkspaceGuard {
             denied: false,
             capabilities: FileCapabilities::read_write(),
             read_grants: None,
+            read_roots: Vec::new(),
         })
     }
 
@@ -361,6 +364,7 @@ impl WorkspaceGuard {
             denied: false,
             capabilities: FileCapabilities::read_write(),
             read_grants: None,
+            read_roots: Vec::new(),
         }
     }
 
@@ -371,6 +375,7 @@ impl WorkspaceGuard {
             denied: true,
             capabilities: FileCapabilities::default(),
             read_grants: None,
+            read_roots: Vec::new(),
         }
     }
 
@@ -379,6 +384,37 @@ impl WorkspaceGuard {
     /// 授权只放宽读取：写入、创建与删除仍受工作区边界约束。
     pub fn with_read_grants(mut self, grants: ReadPathGrants) -> Self {
         self.read_grants = Some(grants);
+        self
+    }
+
+    /// 附加可信应用指定的只读目录，允许读取该目录及其后代。
+    ///
+    /// `root` 必须由应用配置或用户授权确定，不得直接采用模型或 Guest 自报的授权范围。
+    /// 返回保存了规范目录路径的守卫；访问时仍校验读取能力、敏感路径和符号链接真实目标，
+    /// 不放宽写入、创建或删除，也不受会话级 [`ReadPathGrants::clear`] 影响。
+    ///
+    /// # Errors
+    ///
+    /// 目录不存在、无法规范化或目标不是目录时返回 IO 错误；不会创建目录。
+    pub fn with_read_root(mut self, root: impl AsRef<Path>) -> std::io::Result<Self> {
+        let resolved = root.as_ref().canonicalize()?;
+        if !resolved.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "只读根路径必须是目录",
+            ));
+        }
+        if !self.read_roots.contains(&resolved) {
+            self.read_roots.push(resolved);
+        }
+        Ok(self)
+    }
+
+    /// Shell 的工作目录不继承文件读取例外，避免把只读目录变成进程工作目录。
+    #[cfg(feature = "builtins")]
+    pub(crate) fn without_read_overrides(mut self) -> Self {
+        self.read_grants = None;
+        self.read_roots.clear();
         self
     }
 
@@ -436,7 +472,7 @@ impl WorkspaceGuard {
         self.absolutize(raw).exists()
     }
 
-    /// 校验解析后的路径位于工作区内，或已被用户显式授权读取。
+    /// 校验目标位于工作区、应用只读目录内，或已被用户显式授权读取。
     ///
     /// 授权只对 [`FileCapability::Read`] 生效；写入与创建路径即便出现在授权集合中，
     /// 仍然必须落在工作区内。
@@ -452,10 +488,14 @@ impl WorkspaceGuard {
             return Ok(());
         }
         if capability == FileCapability::Read
-            && self
-                .read_grants
-                .as_ref()
-                .is_some_and(|grants| grants.contains(resolved))
+            && (self
+                .read_roots
+                .iter()
+                .any(|root| resolved.starts_with(root))
+                || self
+                    .read_grants
+                    .as_ref()
+                    .is_some_and(|grants| grants.contains(resolved)))
         {
             return Ok(());
         }
@@ -784,6 +824,135 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// 应用只读目录覆盖后代，但不扩大到父目录、同名前缀目录、敏感文件或写入能力。
+    #[test]
+    fn read_roots_allow_descendants_without_widening_other_access() {
+        let base = temp_workspace("read-roots");
+        let resources = base.join("resources");
+        fs::create_dir_all(resources.join("skills/demo")).unwrap();
+        let skill = resources.join("skills/demo/SKILL.md");
+        fs::write(&skill, "skill instructions").unwrap();
+        fs::write(resources.join(".env"), "SECRET=test").unwrap();
+        fs::create_dir(base.join("resources-other")).unwrap();
+        let grants = ReadPathGrants::new();
+        let guard = WorkspaceGuard::rooted(base.join("inside"))
+            .unwrap()
+            .with_capabilities(FileCapabilities::all())
+            .with_read_root(&resources)
+            .unwrap()
+            .with_read_grants(grants.clone());
+        grants.clear();
+
+        for path in [&resources, &resources.join("skills"), &skill] {
+            assert_eq!(
+                guard.resolve_existing(path.to_str().unwrap(), FileCapability::Read),
+                Ok(path.canonicalize().unwrap()),
+                "应用目录授权不随会话清空"
+            );
+        }
+        for path in [&base, &base.join("resources-other"), &resources.join("..")] {
+            assert_eq!(
+                guard.resolve_existing(path.to_str().unwrap(), FileCapability::Read),
+                Err(WorkspaceError::Escape)
+            );
+        }
+        for capability in [FileCapability::Write, FileCapability::Delete] {
+            assert_eq!(
+                guard.resolve_existing(skill.to_str().unwrap(), capability),
+                Err(WorkspaceError::Escape)
+            );
+        }
+        assert_eq!(
+            guard.resolve_new(skill.to_str().unwrap(), FileCapability::Write),
+            Err(WorkspaceError::Escape)
+        );
+        assert_eq!(
+            guard.resolve_new(
+                resources.join("new/file.txt").to_str().unwrap(),
+                FileCapability::Create,
+            ),
+            Err(WorkspaceError::Escape)
+        );
+        assert_eq!(
+            guard.resolve_existing(
+                resources.join(".env").to_str().unwrap(),
+                FileCapability::Read,
+            ),
+            Err(WorkspaceError::Sensitive)
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// 只读根必须已经是目录，且不能恢复策略已拒绝的读取能力。
+    #[test]
+    fn read_roots_validate_directories_and_preserve_capability_denials() {
+        let base = temp_workspace("read-root-capability");
+        let guard = WorkspaceGuard::rooted(base.join("inside")).unwrap();
+        assert!(guard.clone().with_read_root(base.join("missing")).is_err());
+        assert!(guard
+            .clone()
+            .with_read_root(base.join("inside/file.txt"))
+            .is_err());
+        let denied_read = guard
+            .with_read_root(&base)
+            .unwrap()
+            .with_capabilities(FileCapabilities::default());
+        assert_eq!(
+            denied_read.resolve_existing(base.to_str().unwrap(), FileCapability::Read),
+            Err(WorkspaceError::Denied(FileCapability::Read))
+        );
+        let denied = WorkspaceGuard::denied().with_read_root(&base).unwrap();
+        assert_eq!(
+            denied.resolve_existing(base.to_str().unwrap(), FileCapability::Read),
+            Err(WorkspaceError::NoFilesystem)
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// 授权根的规范路径固定；后代链接或授权后替换根目录都不能指向未授权内容。
+    #[cfg(unix)]
+    #[test]
+    fn read_roots_reject_symlink_escape_and_root_substitution() {
+        use std::os::unix::fs::symlink;
+        let base = temp_workspace("read-root-symlink");
+        let resources = base.join("resources");
+        let outside = base.join("outside");
+        fs::create_dir(&resources).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file.txt"), "outside").unwrap();
+        fs::write(resources.join(".env"), "SECRET=test").unwrap();
+        symlink(&outside, resources.join("escape")).unwrap();
+        symlink(resources.join(".env"), resources.join("alias.txt")).unwrap();
+        let guard = WorkspaceGuard::rooted(base.join("inside"))
+            .unwrap()
+            .with_read_root(&resources)
+            .unwrap();
+        assert_eq!(
+            guard.resolve_existing(
+                resources.join("escape/file.txt").to_str().unwrap(),
+                FileCapability::Read,
+            ),
+            Err(WorkspaceError::Escape)
+        );
+        assert_eq!(
+            guard.resolve_existing(
+                resources.join("alias.txt").to_str().unwrap(),
+                FileCapability::Read,
+            ),
+            Err(WorkspaceError::Sensitive)
+        );
+        fs::rename(&resources, base.join("moved")).unwrap();
+        symlink(&outside, &resources).unwrap();
+        assert_eq!(
+            guard.resolve_existing(
+                resources.join("file.txt").to_str().unwrap(),
+                FileCapability::Read,
+            ),
+            Err(WorkspaceError::Escape)
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     /// 用户显式登记的外部路径只放宽读取：写入仍被拒绝，未登记与敏感路径也不放行。

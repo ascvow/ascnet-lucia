@@ -75,13 +75,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// 创建以 TUI 启动目录为上界的原生工具工作区守卫。
+/// 创建以 TUI 启动目录为读写边界、附加用户级只读目录的原生工具守卫。
+///
+/// `user_home` 来自宿主 HOME，`lucia_home` 来自应用配置解析；模型与插件不能扩充名单。
+/// 仅放行已存在的 `~/.agents`、`~/.lucia` 和实际 Lucia Home，不创建这些目录。
 ///
 /// # Errors
 ///
-/// 工作区根目录不存在或无法规范化时返回错误。
-fn native_workspace_guard(workspace_root: &Path) -> Result<agent_tool::WorkspaceGuard> {
-    Ok(agent_tool::WorkspaceGuard::rooted(workspace_root)?)
+/// 工作区或已存在的只读目录无法规范化时返回错误。
+fn native_workspace_guard(
+    workspace_root: &Path,
+    user_home: Option<&Path>,
+    lucia_home: &Path,
+) -> Result<agent_tool::WorkspaceGuard> {
+    let mut guard = agent_tool::WorkspaceGuard::rooted(workspace_root)?;
+    let read_roots = user_home
+        .into_iter()
+        .flat_map(|home| [home.join(".agents"), home.join(".lucia")])
+        .chain(std::iter::once(lucia_home.to_path_buf()));
+    for root in read_roots {
+        // 不存在的可选目录不影响启动，也不会授权未来才出现的路径。
+        match std::fs::metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => guard = guard.with_read_root(&root)?,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("读取用户级只读目录失败：{}", root.display()));
+            }
+        }
+    }
+    Ok(guard)
 }
 
 /// 返回用户级 Skill 根目录。
@@ -532,8 +556,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Ok(json!({ "echo": text, "source": "native" }))
         }))?;
     } else {
-        // 真实模式注入内置工具集：读写文件、列目录、shell、搜索。工作区固定为启动目录。
-        let guard = native_workspace_guard(&workspace.cwd)?;
+        // 真实模式注入内置工具集；读写边界固定为启动目录，用户级资源目录仅额外可读。
+        let user_home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let guard = native_workspace_guard(&workspace.cwd, user_home.as_deref(), &lucia_home)?;
         agent_tool::builtins::register_builtins(
             &mut native_tools,
             guard,
@@ -1970,13 +1997,129 @@ mod tests {
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).expect("应创建测试工作区");
 
-        let guard = native_workspace_guard(&workspace).expect("应创建工作区守卫");
+        let guard = native_workspace_guard(&workspace, None, &root.join("missing-lucia-home"))
+            .expect("应创建工作区守卫");
         assert_eq!(
             guard.root(),
             Some(workspace.canonicalize().expect("应规范化工作区").as_path())
         );
 
         std::fs::remove_dir_all(root).expect("应清理测试工作区");
+    }
+
+    /// 生产装配必须放行用户资源目录的完整读取链路，但不能扩大写入或 Shell 工作目录。
+    #[tokio::test]
+    async fn native_tools_allow_user_resource_reads_only() {
+        use agent_tool::{FileCapability, ReadPathGrants, ToolCall, WorkspaceError};
+        let root = std::env::temp_dir().join(format!(
+            "lucia-user-resource-reads-{}",
+            agent_session::SessionId::generate()
+        ));
+        let workspace = root.join("workspace");
+        let home = root.join("home");
+        let lucia_home = root.join("custom-lucia-home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let resource_roots = [
+            home.join(".agents"),
+            home.join(".lucia"),
+            lucia_home.clone(),
+        ];
+        for resource in &resource_roots {
+            std::fs::create_dir_all(resource.join("skills/demo")).unwrap();
+            std::fs::write(resource.join("skills/demo/SKILL.md"), "resource marker").unwrap();
+        }
+        let guard = native_workspace_guard(&workspace, Some(&home), &lucia_home).unwrap();
+        assert_eq!(
+            guard.root(),
+            Some(workspace.canonicalize().unwrap().as_path())
+        );
+        assert_eq!(
+            guard.resolve_existing(home.to_str().unwrap(), FileCapability::Read),
+            Err(WorkspaceError::Escape),
+            "不能授权整个用户主目录"
+        );
+        let grants = ReadPathGrants::new();
+        let mut registry = ToolRegistry::new();
+        agent_tool::builtins::register_builtins(&mut registry, guard, grants.clone()).unwrap();
+        grants.clear();
+
+        for resource in &resource_roots {
+            let skill = resource.join("skills/demo/SKILL.md");
+            for (name, args) in [
+                ("list_directory", json!({"path": resource.join("skills")})),
+                ("read_file", json!({"path": skill})),
+                (
+                    "search_files",
+                    json!({"path": resource, "pattern": "resource marker", "include": "*.md"}),
+                ),
+            ] {
+                let result = registry
+                    .get(name)
+                    .unwrap()
+                    .call(ToolCall::new("read", name, args))
+                    .await
+                    .unwrap();
+                assert!(!result.is_error, "{name}: {:?}", result.content);
+                match name {
+                    "list_directory" => assert_eq!(result.content["entries"][0]["name"], "demo"),
+                    "read_file" => assert!(result.content["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("resource marker")),
+                    "search_files" => assert_eq!(result.content["count"], 1),
+                    _ => unreachable!(),
+                }
+            }
+            for (name, args) in [
+                ("write_file", json!({"path": skill, "content": "modified"})),
+                (
+                    "write_file",
+                    json!({"path": resource.join("new.txt"), "content": "new"}),
+                ),
+                (
+                    "edit_file",
+                    json!({"path": skill, "old_string": "resource marker", "new_string": "modified"}),
+                ),
+                (
+                    "shell",
+                    json!({"working_directory": resource, "command": "pwd"}),
+                ),
+            ] {
+                let result = registry
+                    .get(name)
+                    .unwrap()
+                    .call(ToolCall::new("denied", name, args))
+                    .await
+                    .unwrap();
+                assert!(result.is_error, "{name} 不应继承只读目录权限");
+                assert!(result.content.to_string().contains("超出允许的工作区范围"));
+            }
+            assert_eq!(std::fs::read_to_string(&skill).unwrap(), "resource marker");
+            assert!(!resource.join("new.txt").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 可选目录缺失时不创建目录，也不扩大到其已存在的父目录。
+    #[test]
+    fn native_workspace_guard_skips_missing_user_resource_directories() {
+        use agent_tool::{FileCapability, WorkspaceError};
+        let root = std::env::temp_dir().join(format!(
+            "lucia-missing-resource-roots-{}",
+            agent_session::SessionId::generate()
+        ));
+        let workspace = root.join("workspace");
+        let home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let guard = native_workspace_guard(&workspace, Some(&home), &home.join(".lucia"))
+            .expect("可选目录不存在不影响启动");
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+        assert_eq!(
+            guard.resolve_existing(home.to_str().unwrap(), FileCapability::Read),
+            Err(WorkspaceError::Escape)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// 构造一个无修饰的普通字符按键事件。

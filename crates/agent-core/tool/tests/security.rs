@@ -158,6 +158,46 @@ fn search_does_not_follow_symlink_outside_workspace() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// 应用只读目录递归搜索必须使用同一守卫，敏感文件和外部链接不能因放行根目录而泄漏。
+#[cfg(unix)]
+#[test]
+fn search_read_root_skips_sensitive_paths_and_symlink_escapes() {
+    let base = fixture("search-read-root");
+    let resources = base.join("resources");
+    fs::create_dir_all(resources.join("nested")).unwrap();
+    fs::write(resources.join("nested/guide.md"), "resource marker").unwrap();
+    fs::write(resources.join(".env"), "resource marker secret").unwrap();
+    fs::write(base.join("secret/dataset.json"), "resource marker outside").unwrap();
+    std::os::unix::fs::symlink(base.join("secret"), resources.join("escape")).unwrap();
+    std::os::unix::fs::symlink(resources.join(".env"), resources.join("alias.md")).unwrap();
+    let guard = WorkspaceGuard::rooted(base.join("workspace"))
+        .unwrap()
+        .with_read_root(&resources)
+        .unwrap();
+    let tool = SearchFilesTool::new(guard);
+    let result = run(
+        &tool,
+        ToolCall::new(
+            "c",
+            "search_files",
+            json!({"path": resources, "pattern": "resource marker"}),
+        ),
+    );
+    assert!(!result.is_error);
+    assert_eq!(result.content["count"], 1, "{:?}", result.content);
+    assert_eq!(result.content["matches"][0]["content"], "resource marker");
+    assert_eq!(
+        result.content["matches"][0]["file"],
+        resources
+            .join("nested/guide.md")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn shell_rejects_working_directory_outside_workspace() {
     let base = fixture("shell-cwd");
