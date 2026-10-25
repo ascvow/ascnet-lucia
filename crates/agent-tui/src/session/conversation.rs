@@ -439,7 +439,10 @@ impl Msg {
                 .collect::<Vec<_>>();
             if omitted > 0 {
                 lines.push(Line::from(Span::styled(
-                    format!("  … +{omitted} 行"),
+                    format!(
+                        "{}… +{omitted} 行",
+                        " ".repeat(crate::ui::transcript::PREVIEW_INDENT)
+                    ),
                     Style::new().fg(COLOR_MUTED),
                 )));
             }
@@ -533,10 +536,12 @@ fn tool_toggle_hint(expanded: bool, width: u16) -> Line<'static> {
     } else {
         "Click to expand"
     };
-    // 与工具正文同列（两列缩进），提示不额外右移，窄终端里也不会先被截断。
-    let available = usize::from(width).saturating_sub(2).max(1);
+    // 与工具正文同列，提示不额外右移，窄终端里也不会先被截断。
+    let available = usize::from(width)
+        .saturating_sub(crate::ui::transcript::PREVIEW_INDENT)
+        .max(1);
     Line::from(vec![
-        Span::raw("  "),
+        Span::raw(" ".repeat(crate::ui::transcript::PREVIEW_INDENT)),
         Span::styled(truncate_line(text, available), Style::new().fg(COLOR_MUTED)),
     ])
 }

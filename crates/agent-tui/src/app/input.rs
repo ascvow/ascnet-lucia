@@ -24,11 +24,17 @@ use std::sync::Arc;
 /// 上限的作用是让靠近边界时的拖动保持精细：贴边一格只滚一行，拖到屏幕外很远才加速。
 const AUTOSCROLL_MAX_STEP: i32 = 5;
 
-/// 单行粘贴折叠为引用标签的显示宽度门槛。
+/// 直接铺进输入框的粘贴允许的最大逻辑行数。
 ///
-/// 输入盒最多长到六行，这个宽度以内的单行内容在常见终端里只占一两行，仍能看清、能就地
-/// 改字；超过它或本身就是多行时，直接铺进输入框只会把内容挤成一团，才收成
-/// `[粘贴的文本]` 标签。
+/// 从代码或日志里复制几行是日常操作，铺进输入框才能看清、能就地改字；输入盒自身会把
+/// 内容折行并滚动到光标处，因此几行内容不会失控。超过这个行数才收成 `[粘贴的文本]`
+/// 标签——按「行数」而不是「多行即折叠」判断，普通复制粘贴就不会被变成引用块。
+pub(crate) const PASTE_INLINE_LINES: usize = 8;
+
+/// 单行粘贴内联允许的最大显示宽度。
+///
+/// 宽字符占两列，因此按显示宽度而不是字节数判断；超过它的单行内容才折成标签，避免一行
+/// 正文在输入盒里横向堆成长条。
 pub(crate) const PASTE_TAG_COLUMNS: usize = 120;
 
 impl App {
@@ -1422,10 +1428,19 @@ pub(super) fn path_is_standalone(input: &str, span: &std::ops::Range<usize>) -> 
 
 /// 判断一段粘贴文本是否长到应该折叠成引用标签。
 ///
-/// 判据是"会不会把输入盒撑坏"：多行必然增加逻辑行数；单行按显示宽度算，宽字符占两列。
-/// 短内容返回 `false`，由调用方按普通输入插入。
+/// 判据是「会不会把输入盒撑坏」：逻辑行数超过内联上限，或某一行宽到要横向滚动。短文本
+/// 与几行代码属于正常编辑内容，内联后才能看清并就地修改；只有大段正文值得折叠。
 fn paste_needs_label(text: &str) -> bool {
-    text.lines().count() > 1 || unicode_width::UnicodeWidthStr::width(text) > PASTE_TAG_COLUMNS
+    let mut lines = 0usize;
+    for line in text.lines() {
+        lines += 1;
+        if lines > PASTE_INLINE_LINES
+            || unicode_width::UnicodeWidthStr::width(line) > PASTE_TAG_COLUMNS
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// 主会话和插件原生会话的滚动动作，避免方向依赖隐式正负号。

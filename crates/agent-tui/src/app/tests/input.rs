@@ -206,19 +206,24 @@ fn audio_attachment_is_rejected_until_core_protocol_supports_it() {
         .is_some_and(|message| message.text.contains("协议尚未实现")));
 }
 
-/// 普通粘贴文本在输入框折叠显示，提交内容块仍包含原始文本而非占位标签。
+/// 大段粘贴文本在输入框折叠显示，提交内容块仍包含原始文本而非占位标签。
 #[test]
 fn pasted_text_uses_clip_label_and_preserves_original_content() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
+    let original = (0..=crate::app::input::PASTE_INLINE_LINES)
+        .map(|index| format!("第 {index} 行"))
+        .collect::<Vec<_>>()
+        .join("\r\n");
 
-    app.handle_paste("第一行\r\n第二行");
+    app.handle_paste(&original);
 
     assert_eq!(app.input, "[粘贴的文本] ");
     let submission = app.take_submission().expect("应有粘贴文本提交");
     let blocks = submission.blocks();
     assert_eq!(blocks.len(), 1);
-    assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "第一行\n第二行"));
+    let expected = original.replace("\r\n", "\n");
+    assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == &expected));
 }
 
 /// 短粘贴按普通输入插入，不生成引用标签，用户可以接着就地改字。
@@ -252,6 +257,67 @@ fn single_line_paste_drops_the_trailing_newline() {
     assert!(app.attachments.is_empty());
 }
 
+/// 只复制了几行的粘贴留在输入框里：按行数而不是「多行即折叠」判断。
+#[test]
+fn a_few_pasted_lines_stay_inline() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+
+    app.handle_paste("第一行\n第二行\n第三行");
+
+    assert_eq!(app.input, "第一行\n第二行\n第三行");
+    assert_eq!(app.cursor, app.input.len());
+    assert!(app.attachments.is_empty());
+    assert!(matches!(
+        app.take_submission().expect("应有文本提交").blocks().as_slice(),
+        [ContentBlock::Text { text }] if text == "第一行\n第二行\n第三行"
+    ));
+}
+
+/// 行数上限正好内联，越过一行就折叠成标签。
+#[test]
+fn paste_folds_only_past_the_inline_line_limit() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let inline = (0..crate::app::input::PASTE_INLINE_LINES)
+        .map(|index| format!("行 {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    app.handle_paste(&inline);
+
+    assert_eq!(app.input, inline);
+    assert!(app.attachments.is_empty());
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let folded = (0..=crate::app::input::PASTE_INLINE_LINES)
+        .map(|index| format!("行 {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    app.handle_paste(&folded);
+
+    assert_eq!(app.input, "[粘贴的文本] ");
+    assert_eq!(app.attachments.len(), 1);
+}
+
+/// 内联判定按单行显示宽度，不按整段字节数。
+#[test]
+fn wide_single_line_inside_a_short_paste_still_folds() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    let wide = format!(
+        "补充说明\n{}",
+        "x".repeat(crate::app::input::PASTE_TAG_COLUMNS + 1)
+    );
+
+    app.handle_paste(&wide);
+
+    assert_eq!(app.input, "[粘贴的文本] ");
+    assert_eq!(app.attachments.len(), 1);
+}
+
 /// 单行但超宽的长文本仍然折叠成标签，避免把输入盒撑成一大团。
 #[test]
 fn long_single_line_paste_folds_into_a_label() {
@@ -271,7 +337,12 @@ fn long_single_line_paste_folds_into_a_label() {
 fn deleting_pasted_text_label_removes_bound_content() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
-    app.handle_paste("不应发送的正文\n第二行");
+    // 超过内联上限的大段正文才会折叠成标签。
+    let long = (0..=crate::app::input::PASTE_INLINE_LINES)
+        .map(|index| format!("不应发送的正文 {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.handle_paste(&long);
     app.handle_key(KeyCode::Backspace, KeyModifiers::NONE, None);
 
     app.handle_key(KeyCode::Backspace, KeyModifiers::NONE, None);
@@ -1458,7 +1529,7 @@ fn paste_plain_text_skips_clipboard_lookup() {
     assert_eq!(app.input, "看 /tmp/no-such-file.png 这张");
 }
 
-/// 粘贴非路径文本时折叠为标签，提交时保留统一后的逻辑换行。
+/// 短多行粘贴内联显示，提交时仍保留统一后的逻辑换行。
 #[test]
 fn paste_preserves_multiline_text() {
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -1466,8 +1537,9 @@ fn paste_preserves_multiline_text() {
 
     app.handle_paste("第一行\r\n第二行\t内容");
 
-    assert_eq!(app.input, "[粘贴的文本] ");
+    assert_eq!(app.input, "第一行\n第二行 内容");
     assert_eq!(app.cursor, app.input.len());
+    assert!(app.attachments.is_empty(), "短多行粘贴不应产生附件");
     let blocks = app.take_submission().expect("应保留粘贴正文").blocks();
     assert!(matches!(
         blocks.as_slice(),

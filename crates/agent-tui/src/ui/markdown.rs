@@ -2,20 +2,22 @@
 
 use crate::theme::{
     COLOR_ACCENT, COLOR_BORDER_FOCUS, COLOR_CODE, COLOR_CODE_BG, COLOR_META, COLOR_MUTED,
-    COLOR_QUOTE_BG, COLOR_SEPARATOR, COLOR_TEXT, COLOR_TEXT_SOFT, COLOR_USER,
+    COLOR_QUOTE_BG, COLOR_SEPARATOR, COLOR_TEXT, COLOR_TEXT_SOFT, COLOR_USER, COLOR_USER_BUBBLE_BG,
+    COLOR_USER_BUBBLE_TEXT,
 };
 use crate::ui::diff::{self, DiffLineKind};
 use crate::ui::highlight::{highlight_line, CodeLanguage};
 use ratatui::prelude::*;
 use serde_json::Value;
 
-/// 构造用户消息块：按显示宽度预换行，每个视觉行都带左侧竖条。
+/// 构造用户消息块：按显示宽度预换行，每个视觉行都带左侧竖条与气泡底色。
 ///
 /// 预换行避免 Paragraph 自动换行时续行丢失竖条，保证消息块边缘连续；
 /// 每行按显示宽度补齐尾部空格，使背景色铺满整个消息区宽度。
 pub(crate) fn user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
-    // 左侧竖条占两列；不再把整行铺成底色，短消息不会变成一条横贯屏幕的色带。
-    let max = usize::from(width).saturating_sub(2).max(1);
+    // 左侧竖条占两列；气泡底色铺满整行，短消息才是一块完整的色块而不是断开的色带。
+    let total = usize::from(width).max(1);
+    let max = total.saturating_sub(2).max(1);
     let body = if text.is_empty() {
         vec![String::new()]
     } else {
@@ -23,13 +25,25 @@ pub(crate) fn user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
             .flat_map(|line| wrap_display(line, max))
             .collect::<Vec<_>>()
     };
+    let bubble = Style::new().bg(COLOR_USER_BUBBLE_BG);
     let mut lines: Vec<Line> = body
         .into_iter()
         .map(|line| {
-            Line::from(vec![
-                Span::styled("▌ ", Style::new().fg(COLOR_USER)),
-                Span::styled(line, Style::new().fg(COLOR_TEXT)),
-            ])
+            let used = 2 + unicode_width::UnicodeWidthStr::width(line.as_str());
+            let mut spans = vec![
+                // 竖条与正文共用气泡底色，色块从左边缘一直铺到右边界。
+                Span::styled("▌ ", Style::new().fg(COLOR_USER).bg(COLOR_USER_BUBBLE_BG)),
+                Span::styled(
+                    line,
+                    Style::new()
+                        .fg(COLOR_USER_BUBBLE_TEXT)
+                        .bg(COLOR_USER_BUBBLE_BG),
+                ),
+            ];
+            if used < total {
+                spans.push(Span::styled(" ".repeat(total - used), bubble));
+            }
+            Line::from(spans)
         })
         .collect();
     lines.push(Line::default());

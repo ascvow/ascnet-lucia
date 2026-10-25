@@ -462,16 +462,16 @@ fn diff_summary(rows: &[&str]) -> String {
 
 /// 把工具结果正文转换为预览行。
 ///
-/// 识别三种形态：统一 diff、带 `12→` 前缀的文件内容、以及普通文本；
-/// 结构化但非文本的结果退回单行 JSON 摘要。
+/// 编辑结果只预览改动本身（见 [`edit_diff_preview`]）；其余结果识别三种形态：统一
+/// diff、带 `12→` 前缀的文件内容、以及普通文本；结构化但非文本的结果退回单行 JSON 摘要。
 pub(crate) fn preview_lines(
     call: Option<&ToolCall>,
     result: &ToolResult,
     max_lines: usize,
 ) -> Vec<PreviewLine> {
-    // 编辑结果的补丁正文不进预览：行数已经在摘要行里，展开整段只会在看代码时刷屏。
+    // 编辑结果带结构化补丁：预览只保留改动行，补丁结构行不进卡片。
     if is_edit_diff_result(result) {
-        return Vec::new();
+        return edit_diff_preview(result, max_lines);
     }
     // 写入类工具的结果只回传路径与字节数，真正值得预览的是写进去的内容。
     let written = (result.name == "write_file" && !result.is_error)
@@ -576,6 +576,76 @@ pub(crate) fn preview_lines(
     lines
 }
 
+/// 把编辑结果的补丁转换为只含改动本身的预览行。
+///
+/// 编辑永远只动一个文件，路径已经出现在标题行里，因此补丁的文件头与 hunk 头
+/// （`---`/`+++`/`@@ -a,b +c,d @@`）对读者只是噪音，一律不进预览。行号改由 hunk 头
+/// 解析后逐行推进：删除行给旧文件行号，新增与上下文行给新文件行号；结构行不占行号。
+/// 缺失 `diff` 字段（例如失败结果）时返回空预览，由摘要行承担说明。
+fn edit_diff_preview(result: &ToolResult, max_lines: usize) -> Vec<PreviewLine> {
+    let Some(diff) = text_field(&result.content, "diff") else {
+        return Vec::new();
+    };
+    let text = crate::ui::plain_terminal_text(diff);
+    let rows: Vec<&str> = text.lines().collect();
+    let kinds = diff::classify_rows(&rows);
+    let mut lines: Vec<PreviewLine> = Vec::with_capacity(max_lines);
+    let mut old_next = 0usize;
+    let mut new_next = 0usize;
+    let mut hidden = 0usize;
+    for (row, kind) in rows.iter().zip(kinds.iter()) {
+        match kind {
+            // 结构行既不展示也不占行号，只有 hunk 头要把两侧计数重新对齐。
+            DiffLineKind::HunkHeader => {
+                if let Some((old, new)) = diff::hunk_start(row) {
+                    old_next = old;
+                    new_next = new;
+                }
+                continue;
+            }
+            DiffLineKind::FileHeader | DiffLineKind::Meta => continue,
+            _ => {}
+        }
+        // 行号先推进再决定是否展示：被折叠的行同样占用文件行号，否则后面整段会错位。
+        let line = match kind {
+            DiffLineKind::Added => {
+                let number = Some(new_next);
+                new_next += 1;
+                PreviewLine::Added {
+                    number,
+                    text: row.strip_prefix('+').unwrap_or(row).trim_end().to_string(),
+                }
+            }
+            DiffLineKind::Removed => {
+                let number = Some(old_next);
+                old_next += 1;
+                PreviewLine::Removed {
+                    number,
+                    text: row.strip_prefix('-').unwrap_or(row).trim_end().to_string(),
+                }
+            }
+            _ => {
+                let number = Some(new_next);
+                old_next += 1;
+                new_next += 1;
+                PreviewLine::Context {
+                    number,
+                    text: row.strip_prefix(' ').unwrap_or(row).trim_end().to_string(),
+                }
+            }
+        };
+        if lines.len() < max_lines {
+            lines.push(line);
+        } else {
+            hidden += 1;
+        }
+    }
+    if hidden > 0 {
+        lines.push(PreviewLine::Elided { hidden });
+    }
+    lines
+}
+
 /// 把运行期增量输出转换为预览行；只保留最新若干行，不编行号。
 ///
 /// 运行中的 `git diff` 同样要按 diff 渲染：否则命令跑完是一个样子、跑的过程中又是另一个
@@ -627,10 +697,10 @@ pub(crate) fn output_preview_lines(text: &str, max_lines: usize) -> Vec<PreviewL
 
 /// 预览块相对消息左边缘的缩进列数。
 ///
-/// 正文与标题行里 `● ` 之后的工具名同列：工具输出是从属于这次调用的背景信息，顶到
-/// 消息左边缘就与标题行脱开了从属关系，读起来像另起一段正文。缩进也不宜再宽——两列
-/// 正好对齐工具名，长代码在窄终端里不至于提前折行。
-const PREVIEW_INDENT: usize = 2;
+/// 缩进对齐摘要行 `  └ ` 之后的正文列：工具输出是从属于这次调用的背景信息，与标题行
+/// `● ` 平级就会脱开从属关系，读起来像另起一段正文。四列正好落在 `└ ` 的正文列上，
+/// 既让正文缩进一层形成层级，又不至于让长代码在窄终端里提前折行。
+pub(crate) const PREVIEW_INDENT: usize = 4;
 
 /// 行号列的最小宽度：两位行号也需要一列右对齐空间。
 ///
@@ -797,7 +867,7 @@ pub(crate) fn render_preview(
     } else {
         0
     };
-    // 缩进、行号列与标记列之后剩余的正文宽度。缩进只占两列（与工具名同列），其余宽度
+    // 缩进、行号列与标记列之后剩余的正文宽度。缩进与 `└ ` 的正文同列，其余宽度
     // 全部让给代码与日志。
     let body_width = total_width
         .saturating_sub(PREVIEW_INDENT + gutter_width + marker_width)
@@ -1171,8 +1241,8 @@ mod tests {
             false,
         );
         assert_eq!(live, done);
-        assert_eq!(done[0].to_string(), "  788 | let code = 1;");
-        assert_eq!(done[1].to_string(), "      | warning: capture");
+        assert_eq!(done[0].to_string(), "    788 | let code = 1;");
+        assert_eq!(done[1].to_string(), "        | warning: capture");
         assert_eq!(result.content, before.content);
         assert_eq!(
             tool_summary(None, &result).as_deref(),
@@ -1273,9 +1343,9 @@ mod tests {
         );
     }
 
-    /// 真实文件编辑只报增删行数，不再把补丁正文展开到工具卡片里。
+    /// 真实文件编辑的卡片只展开改动行，补丁的文件头与 hunk 头都不出现。
     #[tokio::test]
-    async fn real_file_edit_only_reports_the_change_summary() {
+    async fn real_file_edit_previews_only_the_change() {
         use agent_tool::{builtins::EditFileTool, Tool, WorkspaceGuard};
         let root = std::env::temp_dir().join(format!(
             "lucia-diff-ui-{}-{:?}",
@@ -1296,11 +1366,31 @@ mod tests {
         );
         let result = tool.call(call.clone()).await.unwrap();
         assert!(!result.is_error);
-        // 结果里确实带着 diff，只是界面不再展开它。
+        // 结果里确实带着 diff，界面只展开其中的改动行。
         assert!(result.content["diff"].as_str().is_some_and(|diff| {
             diff.contains("+let new = 2;") && diff.contains("-let old = 1;")
         }));
-        assert!(preview_lines(Some(&call), &result, 8).is_empty());
+        let preview = preview_lines(Some(&call), &result, 8);
+        assert!(
+            preview.iter().any(
+                |line| matches!(line, PreviewLine::Added { text, .. } if text == "let new = 2;")
+            ),
+            "{preview:?}"
+        );
+        assert!(
+            preview.iter().any(
+                |line| matches!(line, PreviewLine::Removed { text, .. } if text == "let old = 1;")
+            ),
+            "{preview:?}"
+        );
+        // 结构行不进预览：卡片里不该出现 `---`/`+++`/`@@`。
+        assert!(
+            !preview.iter().any(|line| matches!(
+                line,
+                PreviewLine::FileHeader { .. } | PreviewLine::HunkHeader { .. }
+            )),
+            "{preview:?}"
+        );
         assert_eq!(
             tool_summary(Some(&call), &result).as_deref(),
             Some("新增 1 行，删除 1 行")
@@ -1308,22 +1398,100 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// 编辑结果的结构化 `diff` 不进预览，摘要行仍然是增删行数。
+    /// 编辑预览的行号取自 hunk 头，结构行不占行号也不展示。
     #[test]
-    fn structured_edit_diff_is_not_previewed() {
+    fn edit_diff_preview_uses_real_line_numbers() {
         let result = ToolResult::success(
             "c",
             "edit_file",
             json!({
                 "path": "a.rs",
-                "diff": "--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line"
+                "diff": "--- a/a.rs\n+++ b/a.rs\n@@ -9,3 +9,3 @@ fn main() {\n-let old = 1;\n+let new = 2;\n fn tail() {}"
             }),
         );
 
-        assert!(preview_lines(None, &result, 8).is_empty());
+        let lines = preview_lines(None, &result, 8);
+
+        assert_eq!(
+            lines,
+            vec![
+                PreviewLine::Removed {
+                    number: Some(9),
+                    text: "let old = 1;".into()
+                },
+                PreviewLine::Added {
+                    number: Some(9),
+                    text: "let new = 2;".into()
+                },
+                PreviewLine::Context {
+                    number: Some(10),
+                    text: "fn tail() {}".into()
+                },
+            ]
+        );
         assert_eq!(
             tool_summary(None, &result).as_deref(),
             Some("新增 1 行，删除 1 行")
+        );
+    }
+
+    /// 编辑预览渲染后只剩带标记的改动行与对齐的正文，没有补丁结构行。
+    #[test]
+    fn edit_diff_preview_renders_without_structure_rows() {
+        let result = ToolResult::success(
+            "c",
+            "edit_file",
+            json!({
+                "path": "a.rs",
+                "diff": "--- a/a.rs\n+++ b/a.rs\n@@ -4,2 +4,2 @@\n-let old = 1;\n+let new = 2;"
+            }),
+        );
+
+        let rendered = render_preview(
+            &preview_lines(None, &result, 8),
+            40,
+            CodeLanguage::Plain,
+            false,
+        );
+        let text = rendered.iter().map(text_of).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("-let old = 1;"), "{text}");
+        assert!(text.contains("+let new = 2;"), "{text}");
+        for noise in ["@@", "+++", "---"] {
+            assert!(
+                !text.contains(noise),
+                "{noise} 不应出现在编辑预览里：{text}"
+            );
+        }
+    }
+
+    /// 超过预览上限时只统计改动行数，省略行提示不会把结构行算进去。
+    #[test]
+    fn edit_diff_preview_counts_elided_changes_only() {
+        let body = (0..12)
+            .map(|index| format!("+line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = ToolResult::success(
+            "c",
+            "edit_file",
+            json!({
+                "path": "a.rs",
+                "diff": format!("--- a/a.rs\n+++ b/a.rs\n@@ -1,0 +1,12 @@\n{body}")
+            }),
+        );
+
+        let lines = preview_lines(None, &result, 8);
+
+        assert_eq!(lines.len(), 9);
+        assert_eq!(lines[8], PreviewLine::Elided { hidden: 4 });
+        // 折叠不影响行号连续性：第一行的真实位置来自 hunk 头。
+        assert_eq!(
+            lines[0],
+            PreviewLine::Added {
+                number: Some(1),
+                text: "line 0".into()
+            }
         );
     }
 
@@ -1340,10 +1508,10 @@ mod tests {
 
         let rendered = render_preview(&lines, 40, CodeLanguage::Plain, false);
 
-        // 40 列减去两列缩进，正文吃满剩余 38 列：整行恰好铺满 40 列，末列是省略号。
+        // 40 列减去四列缩进，正文吃满剩余 36 列：整行恰好铺满 40 列，末列是省略号。
         let text = text_of(&rendered[0]);
         assert_eq!(unicode_width::UnicodeWidthStr::width(text.as_str()), 40);
-        assert!(text.starts_with("  xxx"), "{text:?}");
+        assert!(text.starts_with("    xxx"), "{text:?}");
         assert!(text.ends_with('…'), "{text:?}");
     }
 
@@ -1357,18 +1525,18 @@ mod tests {
 
         let rendered = render_preview(&lines, 40, CodeLanguage::Plain, false);
 
-        // 40 列减去缩进 2、行号列 2（行号 7 只占一位，按最小宽度右对齐）、标记位 1，
-        // 正文剩 35 列：整行恰好铺满 40 列。
+        // 40 列减去缩进 4、行号列 2（行号 7 只占一位，按最小宽度右对齐）、标记位 1，
+        // 正文剩 33 列：整行恰好铺满 40 列。
         let text = text_of(&rendered[0]);
         assert_eq!(unicode_width::UnicodeWidthStr::width(text.as_str()), 40);
-        assert!(text.starts_with("   7 "), "{text:?}");
+        assert!(text.starts_with("     7 "), "{text:?}");
         assert!(text.ends_with('…'), "{text:?}");
     }
 
-    /// 工具块正文与标题行里的工具名同列：缩进只占两列，宽出的空间留给代码与日志。
+    /// 工具块正文缩进一层，对齐摘要行 `└ ` 之后的正文列。
     #[test]
-    fn tool_preview_is_indented_two_columns() {
-        assert_eq!(PREVIEW_INDENT, 2);
+    fn tool_preview_is_indented_under_the_summary() {
+        assert_eq!(PREVIEW_INDENT, 4);
         let lines = vec![PreviewLine::Context {
             number: None,
             text: "cargo build".into(),
@@ -1376,7 +1544,7 @@ mod tests {
 
         let rendered = render_preview(&lines, 40, CodeLanguage::Plain, false);
 
-        assert_eq!(text_of(&rendered[0]), "  cargo build");
+        assert_eq!(text_of(&rendered[0]), "    cargo build");
     }
 
     /// 统一 diff 必须被识别为增删行，而不是普通正文。
@@ -1455,12 +1623,12 @@ mod tests {
         // 渲染后正文列一致：只有源码自身的缩进不同，前缀不再推动正文。
         let rendered = render_preview(&lines, 40, CodeLanguage::Plain, false);
         assert!(
-            text_of(&rendered[0]).starts_with("  172 pub(crate)"),
+            text_of(&rendered[0]).starts_with("    172 pub(crate)"),
             "{:?}",
             text_of(&rendered[0])
         );
         assert!(
-            text_of(&rendered[1]).starts_with("  173     let body_width"),
+            text_of(&rendered[1]).starts_with("    173     let body_width"),
             "{:?}",
             text_of(&rendered[1])
         );
@@ -2287,9 +2455,9 @@ mod result_shape_tests {
             })
             .collect();
 
-        assert_eq!(texts[0], "  src/bus.rs");
-        assert_eq!(texts[1], "    12 pub struct EventBus {");
-        assert_eq!(texts[2], "  1041 impl EventBus {");
+        assert_eq!(texts[0], "    src/bus.rs");
+        assert_eq!(texts[1], "      12 pub struct EventBus {");
+        assert_eq!(texts[2], "    1041 impl EventBus {");
     }
 
     /// 成员结果按「预览若干行 + 展开看全文」呈现，而不是把整段报告塞进卡片。
@@ -2411,8 +2579,8 @@ mod result_shape_tests {
         };
 
         // 有行号时留出「缩进 + 最小行号列 + 一列间隔」，没有行号时正文只带缩进。
-        assert_eq!(text_of(&numbered[0]), "   7 code");
-        assert_eq!(text_of(&plain[0]), "  code");
+        assert_eq!(text_of(&numbered[0]), "     7 code");
+        assert_eq!(text_of(&plain[0]), "    code");
     }
 
     /// 行号列按块内最大行号的位数取宽，不再固定四列。
@@ -2436,10 +2604,10 @@ mod result_shape_tests {
         };
 
         // 一位行号也按最小宽度两列右对齐。
-        assert_eq!(render(7), "   7 code");
+        assert_eq!(render(7), "     7 code");
         // 三位行号占满三列，正文紧随其后。
-        assert_eq!(render(174), "  174 code");
+        assert_eq!(render(174), "    174 code");
         // 位数继续增长时行号列跟着变宽，行号本身始终完整可见。
-        assert_eq!(render(123_456), "  123456 code");
+        assert_eq!(render(123_456), "    123456 code");
     }
 }

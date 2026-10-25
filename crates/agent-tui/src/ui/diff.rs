@@ -130,6 +130,23 @@ fn is_hunk_header(row: &str) -> bool {
             .all(|ch| ch.is_ascii_digit() || matches!(ch, '-' | '+' | ',' | ' '))
 }
 
+/// 解析 hunk 头携带的起始行号，返回 `(旧文件起始行, 新文件起始行)`。
+///
+/// hunk 头本身不适合出现在预览里，但它携带的行号是预览行号的唯一可信来源：改动行的
+/// 真实位置不能按预览内序号推断，否则折叠或跳行之后整块行号都是错的。不是 hunk 头时
+/// 返回 `None`，调用方沿用原有行号。
+pub(crate) fn hunk_start(row: &str) -> Option<(usize, usize)> {
+    if !is_hunk_header(row) {
+        return None;
+    }
+    let rest = row.strip_prefix("@@ -")?;
+    let (ranges, _context) = rest.split_once(" @@")?;
+    let (old_range, new_range) = ranges.split_once(" +")?;
+    let old_start = old_range.split(',').next()?.parse().ok()?;
+    let new_start = new_range.split(',').next()?.parse().ok()?;
+    Some((old_start, new_start))
+}
+
 /// 只分类 `rows[start..]` 这一段尾部，用于运行期预览这种只渲染末尾若干行的场景。
 ///
 /// hunk 状态必须从缓冲区开头累积：只看尾部会把 hunk 内的 `--- 内容` 误判成文件头。
@@ -283,6 +300,20 @@ mod tests {
             classify("--- 这是被删掉的注释", true),
             DiffLineKind::Removed
         );
+    }
+
+    /// hunk 头里的起始行号可解析；正文里的 `@@` 与文件头都不算 hunk 头。
+    #[test]
+    fn hunk_start_reads_both_range_starts() {
+        assert_eq!(
+            hunk_start("@@ -10,7 +12,9 @@ fn main() {"),
+            Some((10, 12))
+        );
+        // 单行 hunk 省略行数，只写起点。
+        assert_eq!(hunk_start("@@ -3 +5 @@"), Some((3, 5)));
+        assert_eq!(hunk_start("@@ 说明 @@"), None);
+        assert_eq!(hunk_start("--- a/src/main.rs"), None);
+        assert_eq!(hunk_start("    let c = 3;"), None);
     }
 
     /// 增删行与结构行的配色按语义区分：只有增删行铺整行底色。

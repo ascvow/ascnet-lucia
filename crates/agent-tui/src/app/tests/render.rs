@@ -4,6 +4,37 @@ use super::*;
 
 use crate::ui::chat::{prompt_activity, PromptActivity};
 
+/// 用户消息气泡铺满消息区宽度：底色覆盖每一列，正文使用气泡专用前景色。
+#[test]
+fn user_bubble_paints_a_full_width_background() {
+    for width in [24u16, 40, 60] {
+        let message = Msg::new(MsgKind::User, "你好，Lucia；这是一条用来换行的用户消息。");
+        let lines = message.to_lines(false, width);
+        // 末行是块间分隔空行，不铺底色。
+        let bubble = &lines[..lines.len() - 1];
+        assert!(!bubble.is_empty());
+        for line in bubble {
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(line.to_string().as_str()),
+                usize::from(width),
+                "气泡行必须铺满 {width} 列：{:?}",
+                line.to_string()
+            );
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|span| span.style.bg == Some(crate::theme::COLOR_USER_BUBBLE_BG)),
+                "气泡的每一列都要带底色：{line:?}"
+            );
+            assert_eq!(line.spans[0].style.fg, Some(crate::theme::COLOR_USER));
+            assert_eq!(
+                line.spans[1].style.fg,
+                Some(crate::theme::COLOR_USER_BUBBLE_TEXT)
+            );
+        }
+    }
+}
+
 /// 长篇混排回复之后的下一轮用户消息必须立即出现在自动跟随视口中。
 #[test]
 fn long_mixed_reply_keeps_next_user_message_visible() {
@@ -2293,10 +2324,10 @@ fn shell_streams_keep_partial_diagnostics_separate() {
     msg.append_tool_stream(Stderr, "global(qos: .userInitiated).async {\x1b[0m\n");
     let rows = line_texts(&msg.to_lines(false, 100));
     let text = rows.join("\n");
-    assert!(rows.iter().any(|row| row == "  Build step 2"), "{rows:?}");
+    assert!(rows.iter().any(|row| row == "    Build step 2"), "{rows:?}");
     assert!(
         rows.iter()
-            .any(|row| row == "  788 | DispatchQueue.global(qos: .userInitiated).async {"),
+            .any(|row| row == "    788 | DispatchQueue.global(qos: .userInitiated).async {"),
         "{rows:?}"
     );
     assert!(!text.contains("[36m"));
@@ -2746,12 +2777,13 @@ fn context_status_uses_configured_window_thresholds() {
     );
 }
 
-/// 工具正文与标题行里的工具名同列：`● ` 之后是工具名，正文从同一列开始。
+/// 工具正文缩进一层，落在摘要行 `  └ ` 之后的正文列上。
 ///
-/// 工具块是从属这次调用的背景信息，与标题同列才看得出归属；缩进同时只有两列，长命令行
-/// 与代码行在窄终端里不至于提前折行。缩进被去掉或加宽都会让这条断言失败。
+/// 工具块是从属这次调用的背景信息：与标题行 `● ` 平级就脱开了归属，缩进过深又会让长
+/// 命令行与代码行在窄终端里提前折行。四列正是 `└ ` 的正文列，缩进被去掉或加宽都会让
+/// 这条断言失败。
 #[test]
-fn tool_output_aligns_with_its_title() {
+fn tool_output_is_indented_under_its_title() {
     let width = 80;
     let backend = TestBackend::new(width, 20);
     let mut terminal = Terminal::new(backend).expect("创建工具缩进测试终端");
@@ -2787,9 +2819,10 @@ fn tool_output_aligns_with_its_title() {
     let title_column = column(&rows[title], "Shell(cargo build)");
     let output_column = column(&rows[output], "cargo build --release");
     assert_eq!(title_column, 2, "工具名应紧跟标记列：{:?}", rows[title]);
+    // 摘要行画成 `  └ 正文`，正文列因此比工具名再右移两列。
     assert_eq!(
-        output_column, title_column,
-        "工具正文应与工具名同列：{:?} / {:?}",
+        output_column, 4,
+        "工具正文应缩进到 └ 的正文列：{:?} / {:?}",
         rows[title], rows[output]
     );
 }

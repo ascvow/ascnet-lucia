@@ -29,6 +29,16 @@ pub(crate) const COLOR_MUTED: Color = Color::Rgb(124, 122, 116);
 pub(crate) const COLOR_META: Color = Color::Rgb(100, 100, 100);
 /// 用户消息强调色：露西亚主题绯红。
 pub(crate) const COLOR_USER: Color = Color::Rgb(226, 61, 82);
+/// 用户消息气泡的底色。
+///
+/// 气泡是一块自成边界的面：绯红竖条划出归属，底色把这条消息与助手的回复分开。取值比
+/// 页面底色略亮、略偏暖，在深色终端里不会被误读成一块选中区。
+pub(crate) const COLOR_USER_BUBBLE_BG: Color = Color::Rgb(52, 44, 46);
+/// 用户消息气泡内的正文色；最终使用终端白色。
+///
+/// 与气泡底色成对固定：底色不随终端主题变化，正文就必须自带足够对比度，否则浅色主题的
+/// 黑色默认前景会落在深色气泡上看不清。因此这里不用终端默认前景，而是显式取白色。
+pub(crate) const COLOR_USER_BUBBLE_TEXT: Color = Color::Rgb(238, 236, 230);
 /// 成功状态颜色。
 pub(crate) const COLOR_SUCCESS: Color = Color::Rgb(104, 190, 126);
 /// 运行和等待状态颜色。
@@ -160,11 +170,17 @@ pub(crate) fn apply_terminal_theme(buffer: &mut Buffer, colors: TerminalColors) 
                 cell.modifier.insert(Modifier::BOLD);
             }
             cell.fg = terminal_color(cell.fg, colors);
-            // 卡片以现有竖线、缩进和 diff 的 +/- 区分，不假定用户使用深色背景。
+            // 代码、引用与 diff 卡片以竖线、缩进和 +/- 区分，不假定用户使用深色背景。
+            // 用户消息气泡例外：它是一块与正文分离的面，刻意保留底色，因此正文色也固定。
             cell.bg = match cell.bg {
                 COLOR_CODE_BG | COLOR_QUOTE_BG | COLOR_DIFF_ADD_BG | COLOR_DIFF_DEL_BG => {
                     Color::Reset
                 }
+                COLOR_USER_BUBBLE_BG => match colors {
+                    TerminalColors::TrueColor => COLOR_USER_BUBBLE_BG,
+                    TerminalColors::Ansi => Color::DarkGray,
+                    TerminalColors::Monochrome => Color::Reset,
+                },
                 background => terminal_color(background, colors),
             };
         }
@@ -183,6 +199,7 @@ fn terminal_color(color: Color, colors: TerminalColors) -> Color {
             Color::Reset
         }
         COLOR_USER | COLOR_DANGER | COLOR_DANGER_BRIGHT | COLOR_DIFF_DEL_FG => Color::Red,
+        COLOR_USER_BUBBLE_TEXT => Color::White,
         COLOR_SUCCESS | COLOR_DIFF_ADD_FG | COLOR_SYNTAX_STRING => Color::Green,
         COLOR_WARNING | COLOR_CODE | COLOR_SYNTAX_NUMBER | COLOR_SYNTAX_TYPE => Color::Yellow,
         COLOR_ACCENT | COLOR_PALETTE_COMMAND | COLOR_DIFF_HUNK => Color::Cyan,
@@ -327,6 +344,38 @@ mod tests {
             for colors in [TerminalColors::Ansi, TerminalColors::TrueColor] {
                 assert_eq!(terminal_color(semantic, colors), expected);
             }
+        }
+    }
+
+    /// 用户消息气泡的底色与正文色成对降级：真彩色原样保留，ANSI 落到深灰底白字，
+    /// 单色退回默认前景/背景——任何一档都不能出现前景与背景同色。
+    #[test]
+    fn user_bubble_keeps_contrast_when_colors_downgrade() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        for x in 0..2 {
+            buffer[(x, 0)].set_symbol("x").set_style(
+                Style::new()
+                    .fg(COLOR_USER_BUBBLE_TEXT)
+                    .bg(COLOR_USER_BUBBLE_BG),
+            );
+        }
+
+        let mut truecolor = buffer.clone();
+        apply_terminal_theme(&mut truecolor, TerminalColors::TrueColor);
+        for cell in &truecolor.content {
+            assert_eq!((cell.fg, cell.bg), (Color::White, COLOR_USER_BUBBLE_BG));
+        }
+
+        let mut ansi = buffer.clone();
+        apply_terminal_theme(&mut ansi, TerminalColors::Ansi);
+        for cell in &ansi.content {
+            assert_eq!((cell.fg, cell.bg), (Color::White, Color::DarkGray));
+        }
+
+        let mut monochrome = buffer;
+        apply_terminal_theme(&mut monochrome, TerminalColors::Monochrome);
+        for cell in &monochrome.content {
+            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset));
         }
     }
 
