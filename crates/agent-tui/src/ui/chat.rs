@@ -945,6 +945,12 @@ fn render_scrollbar(
         })
         .collect();
     frame.render_widget(Paragraph::new(track), column);
+    // 贴边正文的宽字/字形刷新可能清掉终端中的相邻轨道，但帧快照里的该格没有变化。
+    // 只对这一列强制输出，使每次重绘都补齐轨道和滑块；不增加全屏清屏或空闲重绘。
+    for y in column.y..column.bottom() {
+        frame.buffer_mut()[(column.x, y)]
+            .set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
+    }
     *scrollbar_area = Some(column);
 }
 
@@ -1727,6 +1733,93 @@ mod hero_portrait_tests {
 #[cfg(test)]
 mod scrollbar_geometry_tests {
     use super::*;
+    use ratatui::{
+        backend::{Backend, TestBackend},
+        buffer::Cell,
+        Terminal,
+    };
+
+    /// 终端局部刷新擦掉轨道后，正文变化但滑块位置不变的下一帧也必须补画整列。
+    #[test]
+    fn scrollbar_repaints_track_and_thumb_when_only_text_changes() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(tx, "test".into());
+        app.messages = vec![Msg::new(MsgKind::Assistant, "原有正文。\n".repeat(80))];
+        let mut terminal = Terminal::new(TestBackend::new(30, 16)).unwrap();
+        for hovered in [false, true] {
+            app.messages[0].text = "原有正文。\n".repeat(80);
+            app.is_scrollbar_hovered = hovered;
+            terminal
+                .draw(|frame| crate::ui::root::render_root(frame, &mut app))
+                .unwrap();
+            let area = app.scrollbar_area.unwrap();
+            // 模拟终端在贴边宽字符/局部重绘时清掉该列；Ratatui 的上一帧快照仍保留完整轨道。
+            terminal
+                .backend_mut()
+                .draw((area.y..area.bottom()).map(|y| (area.x, y, &Cell::EMPTY)))
+                .unwrap();
+            app.messages[0].text = "更新正文。\n".repeat(80);
+            terminal
+                .draw(|frame| crate::ui::root::render_root(frame, &mut app))
+                .unwrap();
+            assert_eq!(app.scrollbar_area, Some(area));
+            for y in area.y..area.bottom() {
+                let cell = &terminal.backend().buffer()[(area.x, y)];
+                assert!(
+                    matches!(cell.symbol(), "│" | "█" | "▀" | "▄"),
+                    "hovered={hovered}, y={y}: {cell:?}"
+                );
+            }
+        }
+    }
+
+    /// 紧贴正文右沿的宽字符不能让帧差分漏掉滚动条，尤其是流式更新和滚轮换位之后。
+    #[test]
+    fn scrollbar_stays_continuous_beside_full_width_text() {
+        for width in [12, 13, 20, 21, 60, 61] {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(tx, "test".into());
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            for text in [
+                "视为拒绝条件。".repeat(80),
+                "**视为拒绝条件。**\n".repeat(80),
+                "中文🙂👩‍💻 e\u{301}。".repeat(80),
+                "x".repeat(800),
+            ] {
+                app.messages = vec![Msg::new(MsgKind::Assistant, text)];
+                for scroll in [None, Some(0), Some(3), Some(17), None] {
+                    app.scroll = scroll;
+                    terminal
+                        .draw(|frame| {
+                            crate::ui::root::render_root(frame, &mut app);
+                            crate::theme::apply_terminal_theme(
+                                frame.buffer_mut(),
+                                crate::theme::TerminalColors::TrueColor,
+                            );
+                            crate::ui::sanitize_terminal_buffer(frame.buffer_mut());
+                        })
+                        .unwrap();
+                    let area = app.scrollbar_area.expect("长正文应有滚动条");
+                    for y in area.y..area.bottom() {
+                        let buffer = terminal.backend().buffer();
+                        for x in 0..area.x {
+                            assert!(
+                                usize::from(x) + buffer[(x, y)].symbol().width()
+                                    <= usize::from(area.x),
+                                "正文跨入轨道 width={width} at ({x}, {y}): {:?}",
+                                buffer[(x, y)]
+                            );
+                        }
+                        let cell = &buffer[(area.x, y)];
+                        assert!(
+                            matches!(cell.symbol(), "│" | "█" | "▀" | "▄"),
+                            "width={width}, scroll={scroll:?}, y={y}: {cell:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// 逻辑总量超过 u16 甚至接近 usize 上限时，滑块首尾仍精确对应轨道。
     #[test]
