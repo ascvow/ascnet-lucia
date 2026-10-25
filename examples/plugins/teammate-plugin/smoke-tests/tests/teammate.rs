@@ -24,6 +24,8 @@ use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
 
 /// 测试使用的可信 controller 运行 ID；所有工具调用与运行结束事件共享它。
 const RUN: &str = "controller-run";
+/// 真实成员返回的多行报告，覆盖中文、空行、emoji、缩进和末尾换行。
+const REPORT: &str = "第一行：改动已落盘\n\n中文 👩‍💻 验证通过\n  保留缩进\n";
 
 /// 返回固定文本的离线模型，确保端到端测试不依赖网络。
 struct FixedModel;
@@ -33,7 +35,7 @@ impl ChatModel for FixedModel {
     /// 完成一次确定性的模型调用。
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
         assert_worker_prompt(&request);
-        Ok(ModelResponse::text("teammate 已完成"))
+        Ok(ModelResponse::text(REPORT))
     }
 
     /// 模拟大量 token 增量，验证首次进入视图无需跨多个 UI tick 才追上历史。
@@ -49,12 +51,9 @@ impl ChatModel for FixedModel {
         }
         sender.send(ModelStreamEvent::TextDelta {
             index: 0,
-            delta: "teammate 已完成".into(),
+            delta: REPORT.into(),
         });
-        sender.done(ModelResponse::text(format!(
-            "{}teammate 已完成",
-            "x".repeat(1500)
-        )));
+        sender.done(ModelResponse::text(format!("{}{REPORT}", "x".repeat(1500))));
         stream
     }
 }
@@ -145,6 +144,24 @@ async fn call_tool(host: &WasmPluginHost, run: &str, name: &str, args: Value) ->
                 .is_some(),
             "历史展示应携带可信称谓快照"
         );
+    }
+    if name == "teammate_result"
+        && result
+            .content
+            .pointer("/outcome/status")
+            .and_then(Value::as_str)
+            == Some("succeeded")
+    {
+        let label = result.details.as_ref().unwrap()["recipient_label"]
+            .as_str()
+            .unwrap();
+        let report = result
+            .content
+            .pointer("/outcome/result/final_text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(report.ends_with(REPORT), "必须测试真实成员返回的多行正文");
+        assert_report_card(&frame, label, report);
     }
     result.content
 }
@@ -237,6 +254,233 @@ fn shelf_text(frame: &UiFrame) -> String {
         .flat_map(|line| line.spans.iter())
         .map(|span| span.text.as_str())
         .collect()
+}
+
+/// 成功报告必须作为单张 Message 卡片返回，正文不经摘要、不重复、不丢失空行。
+fn assert_report_card(frame: &UiFrame, label: &str, report: &str) {
+    assert_eq!(frame.view_id, "teammate-result");
+    let rows: Vec<_> = frame
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        })
+        .collect();
+    assert_eq!(rows[0], format!("● Message(@{label})"));
+    assert_eq!(rows.len(), report.split('\n').count() + 1);
+    assert_eq!(
+        rows[1..]
+            .iter()
+            .map(|row| row.strip_prefix("  ").unwrap())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        report
+    );
+    let text = rows.join("\n");
+    assert_eq!(text.matches("第一行：改动已落盘").count(), 1);
+    assert_eq!(text.matches("中文 👩‍💻 验证通过").count(), 1);
+    assert!(!text.contains("已完成") && !text.contains("teammate_result"));
+    assert_eq!(
+        frame.lines[0].spans[0].style.foreground,
+        Some(UiColor::Green)
+    );
+    assert!(frame.lines[1..]
+        .iter()
+        .flat_map(|line| &line.spans)
+        .all(|span| span.style.foreground.is_none()));
+}
+
+/// 真实 WASM 和 Live Host 必须能恢复已移除成员的报告，并为旧结果/失败保留正确回退。
+#[tokio::test]
+async fn component_result_renderer_preserves_reports_and_fallbacks() {
+    let gateway = ModelGateway::new();
+    gateway.register("fixed", Arc::new(FixedModel)).unwrap();
+    let agent = Agent::new(
+        gateway,
+        AgentOptions::default().with_model_route("fixed", "test-model"),
+    );
+    let runtime = AgentRuntime::new(RuntimeLimits::default()).unwrap();
+    let controller_profile = AgentProfileId::new("controller").unwrap();
+    runtime
+        .register_profile(
+            controller_profile.clone(),
+            AgentTemplate::from_agent(&agent),
+            AgentPermissions::default(),
+        )
+        .await
+        .unwrap();
+    let services = PluginHostServices::new()
+        .with_agent_runtime(
+            Arc::new(runtime),
+            controller_profile,
+            HashMap::from([("worker".to_string(), AgentDeriveConfig::default())]),
+        )
+        .unwrap();
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin.toml");
+    let host = Arc::new(
+        WasmPluginHost::load_from_manifest_with_services(manifest, services)
+            .await
+            .unwrap(),
+    );
+    let live = LivePluginHost::new();
+    live.publish(host.clone() as Arc<dyn PluginHost>).unwrap();
+    live.ui_declarations().await.unwrap();
+    live.finish_capability_planning().unwrap();
+
+    let spawned = call_tool(
+        host.as_ref(),
+        RUN,
+        "teammate_spawn",
+        json!({"role":"审查员: 前端","input":"检查报告卡片"}),
+    )
+    .await;
+    let member_id = spawned["member"]["id"].as_str().unwrap();
+    wait_result(host.as_ref(), RUN, member_id).await;
+    let mut call = ToolCall::new(
+        "result-card",
+        "teammate_result",
+        json!({"member_id":member_id}),
+    );
+    call.run_id = Some(RUN.into());
+    let result = AgentExtension::call_tool(host.as_ref(), call.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!result.is_error);
+    assert_eq!(
+        result.details.as_ref().unwrap()["recipient_label"],
+        "审查员: 前端"
+    );
+    let report = result
+        .content
+        .pointer("/outcome/result/final_text")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(report.ends_with(REPORT));
+    call_tool(
+        host.as_ref(),
+        RUN,
+        "teammate_remove",
+        json!({"member_id":member_id}),
+    )
+    .await;
+
+    // 原始调用参数不能覆盖历史结果中的可信归属或正文；目录删除后仍可重建同一卡片。
+    call.args = json!({"member_id":member_id,"role":"伪造角色","recipient_label":"伪造称谓","final_text":"伪造正文"});
+    let mut context = ToolRenderContext {
+        call,
+        state: ToolRenderState::Finished {
+            result: result.clone(),
+        },
+        width: 12,
+        max_height: 40,
+        frame: 1,
+    };
+    for width in [12, 80] {
+        context.width = width;
+        let frame = live
+            .render_tool_message(&context)
+            .await
+            .unwrap()
+            .expect("真实 owner 路由应返回 Message 卡片");
+        assert_report_card(&frame, "审查员: 前端", report);
+        assert!(!shelf_text(&frame).contains("伪造"));
+        assert!(!shelf_text(&frame).contains(member_id));
+    }
+    for height in [0, 1, 2, 4, 40] {
+        context.max_height = height;
+        let frame = live.render_tool_message(&context).await.unwrap();
+        if height == 0 {
+            assert!(frame.is_none());
+        } else {
+            let frame = frame.unwrap();
+            if height < 6 {
+                assert_eq!(frame.lines.len(), usize::from(height));
+                assert!(shelf_text(&frame).contains("完整内容保留在工具结果"));
+            } else {
+                assert_report_card(&frame, "审查员: 前端", report);
+            }
+        }
+    }
+    context.max_height = 40;
+    let mut fallbacks = Vec::new();
+    for details in [None, Some(json!({"recipient_label":" \n\t"}))] {
+        let mut legacy = result.clone();
+        legacy.details = details;
+        // 即使内容和请求夹带称谓，也不能替代 details 中的插件快照。
+        legacy.content["recipient_label"] = json!("伪造称谓");
+        fallbacks.push(legacy);
+    }
+    for content in [
+        json!({"future":true}),
+        json!({"completed":true,"outcome":{"status":"future"}}),
+        json!({"completed":true,"outcome":{"status":"succeeded","result":{}}}),
+        json!({"completed":true,"outcome":{"status":"failed"}}),
+    ] {
+        let mut unknown = result.clone();
+        unknown.content = content;
+        fallbacks.push(unknown);
+    }
+    let mut error = result.clone();
+    error.is_error = true;
+    fallbacks.push(error);
+    fallbacks.push(agent_tool::ToolResult::error(
+        "result-card",
+        "teammate_result",
+        "拒绝读取成员结果",
+    ));
+    for fallback in fallbacks {
+        context.state = ToolRenderState::Finished { result: fallback };
+        assert!(
+            live.render_tool_message(&context).await.unwrap().is_none(),
+            "旧结果与错误必须保留宿主通用诊断"
+        );
+    }
+    for (content, expected) in [
+        (json!({"completed":false,"outcome":null}), "任务尚未完成"),
+        (
+            json!({"completed":true,"outcome":{"status":"failed","error":"模型中断\n请重试"}}),
+            "成员任务失败",
+        ),
+        (
+            json!({"completed":true,"outcome":{"status":"cancelled"}}),
+            "成员任务已取消",
+        ),
+    ] {
+        let mut non_success = result.clone();
+        non_success.content = content;
+        context.state = ToolRenderState::Finished {
+            result: non_success,
+        };
+        let frame = live.render_tool_message(&context).await.unwrap().unwrap();
+        let text = shelf_text(&frame);
+        assert!(text.starts_with("● Result(@审查员: 前端)"));
+        assert!(text.contains(expected));
+        assert!(!text.contains("Message") && !text.contains("已完成"));
+        if expected == "成员任务失败" {
+            assert_eq!(frame.lines[0].spans[0].style.foreground, Some(UiColor::Red));
+            assert_eq!(text.matches("模型中断").count(), 1);
+            assert_eq!(text.matches("请重试").count(), 1);
+        }
+    }
+    for (state, color) in [
+        (ToolRenderState::Running, UiColor::Yellow),
+        (
+            ToolRenderState::Skipped {
+                reason: "用户取消".into(),
+            },
+            UiColor::Gray,
+        ),
+    ] {
+        context.state = state;
+        let frame = live.render_tool_message(&context).await.unwrap().unwrap();
+        assert_eq!(frame.lines[0].spans[1].text, "Result");
+        assert_eq!(frame.lines[0].spans[0].style.foreground, Some(color));
+    }
+    host.deactivate().await.unwrap();
 }
 
 /// 验证派生、可信发送、邮箱、dispatch 自动确认和续跑句柄更新链路。

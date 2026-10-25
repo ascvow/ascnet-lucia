@@ -1904,8 +1904,9 @@ impl AgentPlugin for TeammatePlugin {
 }
 
 /// 控制面统一使用「状态圆点 + 动词(对象) + 摘要/正文」，不展示不透明成员地址。
-/// 失败交给宿主保留完整权限诊断；未识别的旧结果也不能伪装成成功摘要。
+/// 成功报告聚合成 Message 卡片；失败交给宿主保留完整权限诊断，未知旧结果也不冒充成功。
 fn render_control(request: &ToolRenderRequest, verb: &str) -> Option<UiFrame> {
+    let mut verb = verb;
     let max_height = usize::from(request.context.max_height).min(4096);
     if max_height == 0 {
         return None;
@@ -2046,13 +2047,14 @@ fn render_control(request: &ToolRenderRequest, verb: &str) -> Option<UiFrame> {
                         ("任务尚未完成".into(), Vec::new())
                     } else {
                         match value.pointer("/outcome/status")?.as_str()? {
-                            "succeeded" => (
-                                "已完成".into(),
-                                vec![value
-                                    .pointer("/outcome/result/final_text")?
-                                    .as_str()?
-                                    .into()],
-                            ),
+                            "succeeded" => {
+                                // 只有可信终态报告才改称 Message，归属仍取结果快照而非调用参数。
+                                // 不把正文复制到摘要，避免同一报告重复展示或额外占用预览行。
+                                let report =
+                                    value.pointer("/outcome/result/final_text")?.as_str()?;
+                                verb = "Message";
+                                (String::new(), vec![report.into()])
+                            }
                             "failed" => (
                                 "成员任务失败".into(),
                                 vec![value.pointer("/outcome/error")?.as_str()?.into()],
@@ -2126,12 +2128,14 @@ fn render_control(request: &ToolRenderRequest, verb: &str) -> Option<UiFrame> {
         title.push(ui_span(format!("  {note}"), Some(color), false));
     }
     let mut lines = vec![ui_line(title)];
-    for (index, row) in summary.split('\n').enumerate() {
-        lines.push(ui_line(vec![ui_span(
-            format!("{}{row}", if index == 0 { "  └ " } else { "    " }),
-            Some(UiColor::Gray),
-            false,
-        )]));
+    if !summary.is_empty() {
+        for (index, row) in summary.split('\n').enumerate() {
+            lines.push(ui_line(vec![ui_span(
+                format!("{}{row}", if index == 0 { "  └ " } else { "    " }),
+                Some(UiColor::Gray),
+                false,
+            )]));
+        }
     }
     for text in body {
         lines.extend(
@@ -2606,6 +2610,28 @@ mod tests {
         }})
     }
 
+    /// 结果卡片只读取插件生成的称谓快照，调用参数与正文里的身份字段都不可信。
+    fn result_render_request(content: Value) -> ToolRenderRequest {
+        let mut request = message_render_request(content);
+        request.renderer_id = "teammate-result".into();
+        request.context.call = ToolCall::new(
+            "result-1",
+            "teammate_result",
+            json!({
+                "member_id":"opaque-member",
+                "role":"伪造请求角色",
+                "recipient_label":"伪造请求称谓",
+                "final_text":"伪造请求正文"
+            }),
+        );
+        if let ToolRenderState::Finished { result } = &mut request.context.state {
+            result.call_id = "result-1".into();
+            result.name = "teammate_result".into();
+            result.details = Some(json!({"recipient_label":"审查员","future":true}));
+        }
+        request
+    }
+
     /// 组件必须只出现一次收件人/正文，完成态不依赖已回收的成员或原调用参数。
     #[test]
     fn message_renderer_uses_result_snapshot_once() {
@@ -2825,7 +2851,12 @@ mod tests {
                 .flat_map(|line| &line.spans)
                 .map(|span| span.text.as_str())
                 .collect::<String>();
-            assert!(text.starts_with(&format!("● {verb}")), "{text}");
+            let expected_verb = if name == "teammate_result" {
+                "Message"
+            } else {
+                verb
+            };
+            assert!(text.starts_with(&format!("● {expected_verb}")), "{text}");
             assert!(text.contains(expected), "{text}");
             assert!(
                 !text.contains("opaque-id") && !text.contains("teammate_"),
@@ -2847,43 +2878,211 @@ mod tests {
         }
     }
 
-    /// 旧结果没有称谓时保留宿主归属，新的失败结果不能被绿色完成圆点掩盖。
+    /// 成功报告聚合为 Message：中文、多行、空行与缩进完整保留，身份只来自结果快照。
     #[test]
-    fn result_renderer_preserves_legacy_identity_and_full_body_budget() {
+    fn result_renderer_aggregates_successful_report_once() {
         let mut plugin = TeammatePlugin::default();
-        let body = (1..=40)
-            .map(|index| format!("正文-{index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut request = message_render_request(
-            json!({"completed":true,"outcome":{"status":"succeeded","result":{"final_text":body}}}),
-        );
-        request.renderer_id = "teammate-result".into();
-        request.context.call.name = "teammate_result".into();
-        request.context.max_height = 43;
-        assert!(plugin.render_tool(request.clone()).is_none());
-        if let ToolRenderState::Finished { result } = &mut request.context.state {
-            result.details = Some(json!({"recipient_label":"审查员","future":true}));
-        }
-        let frame = plugin.render_tool(request.clone()).unwrap();
-        assert_eq!(frame.lines.len(), 42);
-        assert!(frame.lines.last().unwrap().spans[0]
-            .text
-            .ends_with("正文-40"));
-        if let ToolRenderState::Finished { result } = &mut request.context.state {
-            result.content =
-                json!({"completed":true,"outcome":{"status":"failed","error":"模型中断"}});
-        }
-        let frame = plugin.render_tool(request.clone()).unwrap();
-        assert_eq!(frame.lines[0].spans[0].style.foreground, Some(UiColor::Red));
-        assert!(frame.lines.last().unwrap().spans[0]
-            .text
-            .contains("模型中断"));
-        for label in [Value::Null, json!(""), json!(" ")] {
+        let body = "第一行：改动已落盘\n\n中文 👩‍💻 验证通过\ne\u{301} 与 العربية\n  保留缩进\n";
+        for label in ["审查员: 前端", "队长", "审查员\n假标题"] {
+            let mut request = result_render_request(json!({
+                "completed":true,
+                "retired":true,
+                "recipient_label":"伪造内容称谓",
+                "outcome":{"status":"succeeded","result":{"final_text":body}},
+                "future_field":true
+            }));
             if let ToolRenderState::Finished { result } = &mut request.context.state {
                 result.details = Some(json!({"recipient_label":label}));
             }
-            assert!(plugin.render_tool(request.clone()).is_none());
+            for width in [1, 12, 80] {
+                request.context.width = width;
+                let frame = plugin.render_tool(request.clone()).unwrap();
+                assert_eq!(frame.view_id, "teammate-result");
+                assert!(frame.visible);
+                let rows: Vec<_> = frame
+                    .lines
+                    .iter()
+                    .map(|line| {
+                        line.spans
+                            .iter()
+                            .map(|span| span.text.as_str())
+                            .collect::<String>()
+                    })
+                    .collect();
+                assert_eq!(rows[0], format!("● Message(@{})", label.replace('\n', " ")));
+                assert_eq!(rows.len(), 1 + body.split('\n').count());
+                assert_eq!(
+                    rows[1..]
+                        .iter()
+                        .map(|row| row.strip_prefix("  ").unwrap())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    body,
+                    "报告不能被摘要重复、裁掉空行或按字节截断"
+                );
+                let text = rows.join("\n");
+                assert_eq!(text.matches("第一行：改动已落盘").count(), 1);
+                assert_eq!(text.matches("中文 👩‍💻 验证通过").count(), 1);
+                assert!(!text.contains("已完成") && !text.contains("伪造"));
+                assert!(!text.contains("teammate_result") && !text.contains("opaque-member"));
+                assert_eq!(
+                    frame.lines[0].spans[0].style.foreground,
+                    Some(UiColor::Green)
+                );
+                assert!(frame.lines[1..]
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| span.style == UiStyle::default()));
+            }
+        }
+    }
+
+    /// 收起和展开共用 Host 行预算；超过预算显式提示，展开可恢复原文，硬上限仍为 4096 行。
+    #[test]
+    fn result_renderer_preserves_full_body_and_height_limit() {
+        let mut plugin = TeammatePlugin::default();
+        for count in [40, 4100] {
+            let body = (1..=count)
+                .map(|index| format!("正文-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut request = result_render_request(
+                json!({"completed":true,"outcome":{"status":"succeeded","result":{"final_text":body}}}),
+            );
+            for height in [0, 1, 2, 6, 20, 41, 80, u16::MAX] {
+                request.context.max_height = height;
+                let frame = plugin.render_tool(request.clone());
+                if height == 0 {
+                    assert!(frame.is_none());
+                    continue;
+                }
+                let frame = frame.unwrap();
+                let budget = usize::from(height).min(4096);
+                assert_eq!(frame.lines.len(), (count + 1).min(budget));
+                if budget < count + 1 {
+                    assert_eq!(
+                        frame.lines.last().unwrap().spans[0].text,
+                        format!("  … +{} 行（完整内容保留在工具结果）", count + 2 - budget)
+                    );
+                } else {
+                    let restored = frame.lines[1..]
+                        .iter()
+                        .map(|line| line.spans[0].text.strip_prefix("  ").unwrap())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert_eq!(restored, body);
+                }
+                if budget > 1 {
+                    assert_eq!(frame.lines[0].spans[1].text, "Message");
+                }
+            }
+        }
+    }
+
+    /// 未完成、失败、取消和跳过都不是成员报告；失败原因只展示一次并保留红色状态。
+    #[test]
+    fn result_renderer_preserves_non_success_states() {
+        let mut plugin = TeammatePlugin::default();
+        for (content, expected) in [
+            (json!({"completed":false,"outcome":null}), "任务尚未完成"),
+            (
+                json!({"completed":true,"outcome":{"status":"failed","error":"模型中断\n请重试"}}),
+                "成员任务失败",
+            ),
+            (
+                json!({"completed":true,"outcome":{"status":"cancelled"}}),
+                "成员任务已取消",
+            ),
+        ] {
+            let frame = plugin
+                .render_tool(result_render_request(content.clone()))
+                .unwrap();
+            let text = frame
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            assert!(text.starts_with("● Result(@审查员)"));
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("Message") && !text.contains("已完成"));
+            if content.pointer("/outcome/status") == Some(&json!("failed")) {
+                assert_eq!(frame.lines[0].spans[0].style.foreground, Some(UiColor::Red));
+                assert_eq!(text.matches("模型中断").count(), 1);
+                assert_eq!(text.matches("请重试").count(), 1);
+            }
+        }
+        let mut request = result_render_request(Value::Null);
+        for (state, color, expected) in [
+            (ToolRenderState::Running, UiColor::Yellow, "处理中"),
+            (
+                ToolRenderState::Skipped {
+                    reason: "用户取消\n未执行".into(),
+                },
+                UiColor::Gray,
+                "用户取消",
+            ),
+        ] {
+            request.context.state = state;
+            let frame = plugin.render_tool(request.clone()).unwrap();
+            assert_eq!(frame.lines[0].spans[0].style.foreground, Some(color));
+            assert_eq!(frame.lines[0].spans[1].text, "Result");
+            assert!(frame.lines[1].spans[0].text.contains(expected));
+        }
+    }
+
+    /// 旧结果缺失可信称谓、未知结果形状、工具错误及错误路由均退回宿主，不冒充成功消息。
+    #[test]
+    fn result_renderer_preserves_legacy_and_error_fallbacks() {
+        let mut plugin = TeammatePlugin::default();
+        let request = result_render_request(json!({
+            "completed":true,
+            "recipient_label":"伪造内容称谓",
+            "outcome":{"status":"succeeded","result":{"final_text":"正文"}}
+        }));
+        for details in [
+            None,
+            Some(Value::Null),
+            Some(json!({"role":"审查员"})),
+            Some(json!({"recipient_label":null})),
+            Some(json!({"recipient_label":""})),
+            Some(json!({"recipient_label":" \n\t"})),
+        ] {
+            let mut legacy = request.clone();
+            if let ToolRenderState::Finished { result } = &mut legacy.context.state {
+                result.details = details;
+            }
+            assert!(plugin.render_tool(legacy).is_none());
+        }
+        for content in [
+            json!({"future":true}),
+            json!({"completed":"true","outcome":{"status":"succeeded","result":{"final_text":"正文"}}}),
+            json!({"completed":true,"outcome":null}),
+            json!({"completed":true,"outcome":{"status":"future"}}),
+            json!({"completed":true,"outcome":{"status":"succeeded","result":{}}}),
+            json!({"completed":true,"outcome":{"status":"succeeded","result":{"final_text":42}}}),
+            json!({"completed":true,"outcome":{"status":"failed"}}),
+        ] {
+            assert!(plugin.render_tool(result_render_request(content)).is_none());
+        }
+        let mut error = request.clone();
+        if let ToolRenderState::Finished { result } = &mut error.context.state {
+            result.is_error = true;
+        }
+        assert!(plugin.render_tool(error.clone()).is_none());
+        error.context.state = ToolRenderState::Finished {
+            result: ToolResult::error("result-1", "teammate_result", "拒绝读取成员结果")
+                .with_details(json!({"recipient_label":"审查员"})),
+        };
+        assert!(plugin.render_tool(error).is_none());
+        for (name, renderer) in [
+            ("teammate_send", "teammate-result"),
+            ("teammate_result", MESSAGE_RENDERER),
+        ] {
+            let mut mismatched = request.clone();
+            mismatched.context.call.name = name.into();
+            mismatched.renderer_id = renderer.into();
+            assert!(plugin.render_tool(mismatched).is_none());
         }
     }
 

@@ -140,21 +140,27 @@ fn persistent_plugin_state_dir(lucia_home: &Path, workspace_scope: &str) -> Path
     lucia_home.join("plugin-state").join(workspace_scope)
 }
 
-/// 把动态插件宿主同时装配到主 Agent 和后续派生模板。
+/// 把动态插件宿主装配到主 Agent 和派生模板，再单独挂载主会话的展示出口。
 ///
-/// 模板必须在挂载 Host 后捕获；否则 workflow、teammate 等插件派生的 worker 会绕过
-/// permission 插件和 Host 启动期的 fail-closed 工具门禁。
+/// `base_agent` 只携带诊断 sink 与不写主 UI 的上下文加载器；模板在挂载 Host 后捕获，
+/// 保留 worker 的审批门禁，但不能继承 `main_events` 或 `main_context_loader`，否则
+/// 队员的文本、工具与压缩通知会插入主时间线。成员过程仍由 Runtime 独立订阅。
 #[cfg(feature = "plugins")]
 fn assemble_plugin_agents(
     base_agent: Agent,
     live_plugin_host: Arc<LivePluginHost>,
+    main_events: Arc<dyn EventSink>,
+    main_context_loader: Arc<dyn agent_core::ContextLoader>,
 ) -> Result<(AgentTemplate, Arc<Agent>)> {
     // 插件在总线上参与决策，因此动态宿主必须挂到主 Agent 的总线上；派生 worker 从
     // 该总线派生子总线，从而继承同一套插件监听并叠加自己的 allowlist 门禁。
     live_plugin_host.attach_bus(base_agent.event_bus())?;
     let agent = base_agent.with_extension(live_plugin_host);
     let template = AgentTemplate::from_agent(&agent);
-    Ok((template, Arc::new(agent)))
+    let main = agent
+        .with_event_sink(main_events)
+        .with_context_loader(main_context_loader);
+    Ok((template, Arc::new(main)))
 }
 
 /// 终端状态守卫：正常退出、`?` 提前返回或 panic 展开时都恢复终端。
@@ -575,17 +581,19 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let model_name = options.model.clone();
 
-    // UI 通道 sink 之外，可选叠加 JSONL sink 用于排查请求与工具调用。
-    let mut sink = CompositeEventSink::new();
+    // 诊断出口可由主会话和队员共享；UI 出口只能在捕获派生模板之后挂到主 Agent。
+    let mut diagnostics = CompositeEventSink::new();
+    if let Some(path) = events_jsonl.as_ref() {
+        diagnostics.push(Arc::new(JsonlEventSink::new(path.clone())));
+    }
+    let diagnostic_events: Arc<dyn EventSink> = Arc::new(diagnostics);
     // 流式诊断探针：只有显式设置 LUCIA_STREAM_DEBUG=1 时才创建，默认零开销。
     let probe = StreamProbe::from_env();
     let (ui_sink, model_deltas, thinking_deltas, tool_deltas) = ChannelEventSink::new(tx.clone());
     let ui_sink = ui_sink.with_probe(probe.clone());
+    let mut sink = CompositeEventSink::new();
     sink.push(Arc::new(ui_sink));
-    if let Some(path) = events_jsonl.as_ref() {
-        sink.push(Arc::new(JsonlEventSink::new(path.clone())));
-    }
-
+    sink.push(Arc::clone(&diagnostic_events));
     let application_events: Arc<dyn EventSink> = Arc::new(sink);
     // 会话标题复用主 Agent 的模型路由；demo 脚本模型没有语义，起名只会得到固定噪声。
     let title_generator = if demo_mode {
@@ -603,31 +611,40 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let active_provider_name = options.provider.clone();
     let base_agent = Agent::new(gateway, options)
         .with_tools(native_tools)
-        .with_event_sink(Arc::clone(&application_events));
-    // 手动与自动压缩共用加载器，确保模型热切换同时更新两条路径的路由与窗口。
-    // 手动压缩发生在 Agent Run 之外，仍只写应用事件，不经过 Plugin Host。
-    // 压缩水位由真实上下文窗口推导；窗口未知时压缩器按 200k 假定值兜底。
-    let native_context_loader = Arc::new(
+        .with_event_sink(Arc::clone(&diagnostic_events));
+    // 主会话的手动/自动压缩共用加载器；队员使用相同初始配置但独立展示出口，
+    // 防止共享加载器内持有的 UI sink 绕过主/子 Agent 的事件隔离。
+    let context_loader = |events| {
         NativeContextLoader::new(
             base_agent.gateway().clone(),
             base_agent.options().provider.clone(),
             base_agent.options().model.clone(),
             base_agent.options().stream,
             DEFAULT_MAX_SUMMARY_TOKENS,
-            application_events,
-        )?
-        .with_context_window(context_window),
-    );
-    let base_agent = base_agent.with_context_loader(native_context_loader.clone());
+            events,
+        )
+        .map(|loader| Arc::new(loader.with_context_window(context_window)))
+    };
+    let native_context_loader = context_loader(Arc::clone(&application_events))?;
+    #[cfg(feature = "plugins")]
+    let worker_context_loader = context_loader(diagnostic_events)?;
     #[cfg(feature = "plugins")]
     let live_plugin_host = Arc::new(LivePluginHost::new());
     #[cfg(feature = "plugins")]
-    let (plugin_agent_template, plugin_agent) =
-        assemble_plugin_agents(base_agent, live_plugin_host.clone())?;
+    let (plugin_agent_template, plugin_agent) = assemble_plugin_agents(
+        base_agent.with_context_loader(worker_context_loader),
+        live_plugin_host.clone(),
+        application_events,
+        native_context_loader.clone(),
+    )?;
     #[cfg(feature = "plugins")]
     let agent = Some(plugin_agent);
     #[cfg(not(feature = "plugins"))]
-    let agent = Some(Arc::new(base_agent));
+    let agent = Some(Arc::new(
+        base_agent
+            .with_event_sink(application_events)
+            .with_context_loader(native_context_loader.clone()),
+    ));
     #[cfg(feature = "plugins")]
     let plugin_host = Some(Arc::clone(&live_plugin_host));
     #[cfg(feature = "plugins")]
@@ -1880,8 +1897,11 @@ mod tests {
             agent_core::model::ModelGateway::new(),
             agent_core::AgentOptions::default(),
         );
+        let main_events = base_agent.event_sink();
+        let main_context = base_agent.context_loader();
         let (template, _main_agent) =
-            assemble_plugin_agents(base_agent, live_host.clone()).expect("装配插件 Agent 应成功");
+            assemble_plugin_agents(base_agent, live_host.clone(), main_events, main_context)
+                .expect("装配插件 Agent 应成功");
         let (worker, _) = template
             .instantiate(
                 &agent_runtime::AgentPermissions::default(),
@@ -1916,6 +1936,271 @@ mod tests {
         assert!(guidance.starts_with("<tool_admission>"));
         assert!(guidance.ends_with("</tool_admission>"));
         assert!(guidance.contains("this call was not executed"));
+    }
+
+    /// 队员事件与主回复交错到达时，只能进入队员自己的订阅和诊断，不得切断主文本批次。
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn plugin_worker_events_do_not_interrupt_main_transcript() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (ui, text, thinking, output) = ChannelEventSink::new(tx);
+        let diagnostics = Arc::new(agent_core::event::InMemoryEventSink::new());
+        let mut main_events = CompositeEventSink::new();
+        main_events.push(Arc::new(ui));
+        main_events.push(diagnostics.clone());
+        let main_events: Arc<dyn EventSink> = Arc::new(main_events);
+        let context_loader = |events: Arc<dyn EventSink>| {
+            Arc::new(
+                NativeContextLoader::new(
+                    agent_core::model::ModelGateway::new(),
+                    "test",
+                    "test",
+                    false,
+                    DEFAULT_MAX_SUMMARY_TOKENS,
+                    events,
+                )
+                .expect("创建测试压缩器"),
+            )
+        };
+        let base = Agent::new(
+            agent_core::model::ModelGateway::new(),
+            agent_core::AgentOptions::default(),
+        )
+        .with_event_sink(diagnostics.clone())
+        .with_context_loader(context_loader(diagnostics.clone()));
+        let (template, main) = assemble_plugin_agents(
+            base,
+            Arc::new(LivePluginHost::new()),
+            main_events.clone(),
+            context_loader(main_events),
+        )
+        .expect("装配主会话和派生模板");
+        let (worker, _) = template
+            .instantiate(
+                &agent_runtime::AgentPermissions::default(),
+                &agent_runtime::AgentDeriveConfig::default(),
+            )
+            .expect("派生队员");
+        let main_events = main.event_sink();
+        let worker_events = worker.event_sink();
+        for (kind, payload) in [
+            (AgentEventKind::RunStarted, json!({})),
+            (AgentEventKind::ModelRequest, json!({})),
+            (
+                AgentEventKind::ModelTextDelta,
+                json!({"delta":"旧任务仍会调用当前侧"}),
+            ),
+        ] {
+            main_events
+                .record(&AgentEvent::new("main", kind, 0, payload))
+                .await
+                .unwrap();
+        }
+        for (kind, payload) in [
+            (AgentEventKind::RunStarted, json!({})),
+            (AgentEventKind::ModelRequest, json!({})),
+            (
+                AgentEventKind::ModelThinkingDelta,
+                json!({"delta":"队员推理"}),
+            ),
+            (
+                AgentEventKind::ModelTextDelta,
+                json!({"delta":"队员独立报告"}),
+            ),
+            (
+                AgentEventKind::ToolStarted,
+                json!({"id":"worker-edit","name":"edit_file","args":{"path":"a.rs"}}),
+            ),
+            (
+                AgentEventKind::ToolOutputDelta,
+                json!({"call_id":"worker-edit","stream":"stdout","delta":"队员日志"}),
+            ),
+            (
+                AgentEventKind::ToolFinished,
+                serde_json::to_value(agent_tool::ToolResult::success(
+                    "worker-edit",
+                    "edit_file",
+                    json!({"content":"队员结果"}),
+                ))
+                .unwrap(),
+            ),
+            (
+                AgentEventKind::ModelResponse,
+                json!({"usage":{"input_tokens":999,"output_tokens":99}}),
+            ),
+            (AgentEventKind::RunFinished, json!({})),
+        ] {
+            worker_events
+                .record(&AgentEvent::new("worker", kind, 0, payload))
+                .await
+                .unwrap();
+        }
+        main_events
+            .record(&AgentEvent::new(
+                "main",
+                AgentEventKind::ModelTextDelta,
+                0,
+                json!({"delta":"栏的打开文件回调。"}),
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::ModelStarted)));
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::ModelTextReady)));
+        assert!(
+            rx.try_recv().is_err(),
+            "队员不能向主时间线插入结构事件或用量"
+        );
+        assert_eq!(
+            text.lock().unwrap().take(),
+            "旧任务仍会调用当前侧栏的打开文件回调。"
+        );
+        assert!(thinking.lock().unwrap().take().is_empty());
+        assert!(output.lock().unwrap().take().is_empty());
+        let recorded = diagnostics.events().await;
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| event.run_id == "main")
+                .count(),
+            4
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| event.run_id == "worker")
+                .count(),
+            9
+        );
+
+        // 压缩器内另存的 sink 也必须隔离；手动空历史会稳定产出一条可见跳过通知。
+        let compression_request = |run_id: &str| agent_core::ContextLoadRequest {
+            run_id: run_id.into(),
+            step: 0,
+            provider: "test".into(),
+            model: "test".into(),
+            system: None,
+            messages: Vec::new(),
+            user_initiated: true,
+        };
+        worker
+            .context_loader()
+            .load(compression_request("worker-compact"))
+            .await
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "队员压缩不能借共享加载器写入主时间线"
+        );
+        main.context_loader()
+            .load(compression_request("main-compact"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(rx.try_recv(), Ok(UiEvent::Extension { .. })),
+            "主会话压缩提示应保留"
+        );
+        let recorded = diagnostics.events().await;
+        for run_id in ["worker-compact", "main-compact"] {
+            assert!(recorded.iter().any(|event| event.run_id == run_id));
+        }
+    }
+
+    /// Runtime 订阅仍保留成员完整过程，续跑也不能重新继承主 UI 通道。
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn plugin_worker_runtime_keeps_private_history_across_continuation() {
+        use agent_core::model::{
+            ChatModel, ModelEventStream, ModelRequest, ModelResponse, ModelStreamEvent,
+            ProviderAdapter,
+        };
+
+        // 演示模型默认只返回最终响应；此适配器补上文本增量，以验证真实 Runtime 的流式归属。
+        struct StreamingDemo(agent_core::model::ModelGateway);
+        #[async_trait::async_trait]
+        impl ChatModel for StreamingDemo {
+            async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+                self.0.complete("default", request).await
+            }
+
+            async fn stream(&self, request: ModelRequest) -> ModelEventStream {
+                let (tx, stream) = ModelEventStream::channel();
+                match self.complete(request).await {
+                    Ok(response) => {
+                        let delta = response.text_content();
+                        if !delta.is_empty() {
+                            tx.send(ModelStreamEvent::TextDelta { index: 0, delta });
+                        }
+                        tx.done(response);
+                    }
+                    Err(error) => tx.error(error.to_string()),
+                }
+                stream
+            }
+        }
+        impl ProviderAdapter for StreamingDemo {
+            fn name(&self) -> &'static str {
+                "streaming-demo"
+            }
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (ui, _, _, _) = ChannelEventSink::new(tx);
+        let (demo, options) = build_demo_gateway();
+        let gateway = agent_core::model::ModelGateway::new();
+        gateway
+            .register("default", Arc::new(StreamingDemo(demo)))
+            .unwrap();
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(JsonTool::new(echo_spec(), |args| async move { Ok(args) }))
+            .unwrap();
+        let base = Agent::new(gateway, options).with_tools(tools);
+        let context_loader = base.context_loader();
+        let host = Arc::new(LivePluginHost::new());
+        host.finish_capability_planning().unwrap();
+        let (template, _) =
+            assemble_plugin_agents(base, host, Arc::new(ui), context_loader).unwrap();
+        let runtime =
+            agent_runtime::AgentRuntime::new(agent_runtime::RuntimeLimits::default()).unwrap();
+        let root = runtime
+            .attach_root(template, agent_runtime::AgentPermissions::default())
+            .await
+            .unwrap();
+        let api = runtime.api(&root.id).await.unwrap();
+        let child = api
+            .spawn(agent_runtime::AgentSpawnRequest::new("成员首次任务"))
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), api.wait(&child.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status(), agent_runtime::AgentStatus::Succeeded);
+        let continued = api
+            .continue_agent(&child.id, "成员续跑任务".into())
+            .await
+            .unwrap();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), api.wait(&continued.id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(outcome.status(), agent_runtime::AgentStatus::Succeeded);
+        for target in [&child.id, &continued.id] {
+            let mut events = api.subscribe(target).await.unwrap();
+            let mut kinds = Vec::new();
+            while let Some(event) = events.next().await {
+                kinds.push(event.kind);
+            }
+            assert!(kinds.contains(&AgentEventKind::ModelTextDelta));
+            assert!(kinds.contains(&AgentEventKind::RunFinished));
+            if target == &child.id {
+                assert!(kinds.contains(&AgentEventKind::ToolStarted));
+                assert!(kinds.contains(&AgentEventKind::ToolFinished));
+            }
+        }
+        assert!(rx.try_recv().is_err(), "成员运行与续跑都只发布到独立订阅");
     }
 
     /// 非热点移动不重绘，悬停改变仍会标脏；其他鼠标输入不丢。
