@@ -2457,8 +2457,9 @@ fn teammate_tools() -> Vec<ToolSpec> {
             "teammate_spawn",
             r#"<tool_usage>
   <purpose>Start a role-scoped teammate with the restricted worker profile; return its address immediately.</purpose>
-  <when_to_use>Use for independent, non-blocking subtasks or a genuinely separate review when parallel value clearly exceeds coordination cost. Skip ordinary single-point tasks, sequential work, and work you can complete directly.</when_to_use>
-  <workflow>Provide a self-contained goal, relevant context, file ownership, constraints, expected deliverables, and verification requirements. Do useful independent work while the member runs; avoid repeated status polling. Retrieve teammate_result before relying on its work or reporting completion, and verify the evidence. At most one member may be captain.</workflow>
+  <when_to_use>Default to a single agent. Do not spawn during initial exploration. After inspecting the relevant context, delegate only when the user explicitly requests teammates or the task is substantial and has at least two independent, non-blocking workstreams (including your own), each with a verifiable deliverable, and parallel value clearly exceeds coordination cost. Complexity alone is not enough when the work is sequential.</when_to_use>
+  <constraints>Do ordinary single-point tasks, questions, code reading, small fixes, routine debugging, single-file edits, commands, tests and routine reviews yourself. Do not create a team merely for a second opinion, because several files are involved, or because tools are available. An independent review is justified only for a substantial, high-risk change with a distinct review scope and useful work you can do concurrently, or when the user explicitly requests delegation. If unsure, stay single-agent; do not invent subtasks to qualify.</constraints>
+  <workflow>Before spawning, briefly state the concrete parallel benefit and division of work. Provide a self-contained goal, relevant context, file ownership, constraints, expected deliverables, and verification requirements. Implementation members must make their own changes and run validation, not just return code for you to write. Use only the members needed; do useful independent work while they run rather than duplicating their assignment or immediately waiting. Avoid repeated status polling. Retrieve teammate_result before relying on its work or reporting completion, and verify the evidence. At most one member may be captain.</workflow>
   <lifecycle>Terminal members with empty mailboxes are automatically collected after their controller run ends; running members remain. Results remain readable in a bounded retired ledger, so retrieve them promptly.</lifecycle>
 </tool_usage>"#,
             json!({
@@ -2592,8 +2593,8 @@ mod tests {
             assert_eq!(message.topic, topic);
             assert_eq!(message.payload, Value::Null);
             assert_eq!(
-                state.inbox("owner", &member.id, 1).unwrap(),
-                [message.clone()]
+                state.inbox("owner", &member.id, 1).unwrap().as_slice(),
+                std::slice::from_ref(&message)
             );
             state.ack("owner", &member.id, message.id).unwrap();
         }
@@ -3293,9 +3294,9 @@ mod tests {
         }
     }
 
-    /// 派生工具描述必须要求真实并行收益，普通单点任务不能仅因工具可用而派生成员。
+    /// 默认单 Agent；复杂度、独立并行产出和明确收益必须同时满足，不能用例行审查绕过。
     #[test]
-    fn teammate_spawn_description_requires_parallel_value() {
+    fn teammate_spawn_description_requires_substantial_parallel_work() {
         let description = teammate_tools()
             .into_iter()
             .find(|tool| tool.name == "teammate_spawn")
@@ -3306,10 +3307,24 @@ mod tests {
         assert!(description.starts_with("<tool_usage>"));
         assert!(description.ends_with("</tool_usage>"));
         for condition in [
-            "independent, non-blocking subtasks",
+            "Default to a single agent",
+            "Do not spawn during initial exploration",
+            "user explicitly requests teammates",
+            "task is substantial",
+            "at least two independent, non-blocking workstreams (including your own)",
+            "verifiable deliverable",
             "parallel value clearly exceeds coordination cost",
+            "Complexity alone is not enough",
             "ordinary single-point tasks",
-            "work you can complete directly",
+            "routine debugging",
+            "routine reviews yourself",
+            "Do not create a team merely for a second opinion",
+            "substantial, high-risk change",
+            "If unsure, stay single-agent",
+            "do not invent subtasks",
+            "Before spawning, briefly state the concrete parallel benefit",
+            "Implementation members must make their own changes and run validation",
+            "rather than duplicating their assignment or immediately waiting",
             "automatically collected",
             "bounded retired ledger",
             "Retrieve teammate_result",

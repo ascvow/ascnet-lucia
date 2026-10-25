@@ -557,9 +557,25 @@ async fn component_runs_mailbox_dispatch_flow() {
         .iter()
         .find(|tool| tool.name == "teammate_spawn")
         .expect("应暴露 teammate_spawn");
-    assert!(spawn
-        .description
-        .contains("parallel value clearly exceeds coordination cost"));
+    for condition in [
+        "Default to a single agent",
+        "Do not spawn during initial exploration",
+        "at least two independent, non-blocking workstreams (including your own)",
+        "parallel value clearly exceeds coordination cost",
+        "routine reviews yourself",
+        "If unsure, stay single-agent",
+    ] {
+        assert!(spawn.description.contains(condition), "{condition}");
+    }
+    let send = tools
+        .iter()
+        .find(|tool| tool.name == "teammate_send")
+        .unwrap();
+    assert_eq!(send.input_schema["properties"]["topic"]["maxLength"], 128);
+    assert!(send.input_schema["properties"]["topic"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Unicode characters (not bytes)"));
     assert!(tools
         .iter()
         .all(|tool| tool.description.starts_with("<tool_usage>")
