@@ -50,6 +50,16 @@ const steps: CheckStep[] = [
     command: ['bun', 'run', 'build:plugin:all'],
   },
   {
+    id: 'test:plugin:distribution',
+    description: '验证官方清单和退役插件安装迁移',
+    command: ['bun', 'test', 'scripts/official-plugins.test.ts'],
+  },
+  {
+    id: 'build:plugin:permission-test',
+    description: '仅为可选权限插件的 workspace 冒烟测试构建，不进入分发清单',
+    command: ['bun', 'run', 'build:plugin:permission'],
+  },
+  {
     id: 'test',
     description: '运行 workspace 单元与集成测试',
     command: ['cargo', 'test', '--workspace', '--offline'],

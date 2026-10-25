@@ -1,5 +1,9 @@
 # Permission Plugin
 
+本插件已停止默认分发，不参与官方安装或发布打包；源码和显式 `build:plugin:permission` / `test:plugin:permission` 入口保留。官方安装脚本会将已有 `permission` / `sandbox` bundle 移出自动发现目录并保留备份，不修改手动安装的插件。
+
+停用后，下述审批和敏感路径规则不再执行；原生工作区限制、Host manifest 能力鉴权与 Runtime 权限收缩仍在，Shell 依然具有当前用户的完整原生进程权限。
+
 权限插件在 Agent 工具执行前按 Host 从 manifest 绑定的可信 `ToolPermissionScope` 应用保守策略；手动模式通过模态 TUI 审批触达宿主资源的调用。
 
 - `Control` 只表示 Lucia 内部控制面操作，直接放行；权限插件不维护官方工具名白名单。

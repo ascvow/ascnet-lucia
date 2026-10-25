@@ -11,7 +11,7 @@ lucia
 
 `install:tui` 安装 TUI、原生 Command、原生 Skill 和原生 Context；启动后输入 `/plugins`，官方插件与第三方插件使用相同的 Registry、本地目录或 GitHub Release 人工安装流程，只有用户显式安装且启用的插件才进入新 Session。开发目录也可以通过 `--plugin-manifest` 临时加载。
 
-仓库开发环境执行 `bun run install:all` 时，会把官方清单中的 bundle 更新到 `$LUCIA_HOME/official-plugins`。清单通过 `replaces` 声明插件改名关系，同步时只删除被明确替代的旧官方 bundle，避免新旧插件同时提供同一独占能力。Loader 也会自动扫描该目录和 `$LUCIA_HOME/plugins`，配置中的 `disabled_plugins` 仍可按 ID 排除自动发现的插件。
+仓库开发环境执行 `bun run install:all` 时，会把官方清单中的 bundle 更新到 `$LUCIA_HOME/official-plugins`。清单通过 `replaces` 声明插件改名关系，同步时只删除被明确替代的旧官方 bundle，避免新旧插件同时提供同一独占能力。`retired` 声明停止默认分发的 ID，安装时把对应旧官方 bundle 移入 `$LUCIA_HOME/disabled-official-plugins/<id>-<随机后缀>/<id>`，保留文件和用户设置但不再自动加载。Loader 只自动扫描 `$LUCIA_HOME/official-plugins` 和 `$LUCIA_HOME/plugins`，配置中的 `disabled_plugins` 仍可按 ID 排除自动发现的插件。手动安装和受管理插件不由上述迁移修改。
 
 ## 原生 Context
 
@@ -61,7 +61,7 @@ Teammate 插件负责成员角色、稳定成员地址、有界邮箱、确认�
 
 成员失败时，插件在下一次状态刷新中读取一次幂等的终态结果，并把原因写入成员快照的可选 `error` 字段：`teammate_list`、`teammate_status`、团队工作台的成员详情和回收台账都能直接看到具体失败原因（例如单次输出上限、provider 报错或连接中断），不需要再额外调用 `teammate_result` 猜原因。
 
-Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置；worker 模板继承同一个动态 Plugin Host，因此只读工具仍会经过权限插件与 Host 启动期门禁。worker 不覆盖步数，队员与主会话一样可以一直运行到任务完成；每次派活都是一次新的投胎，完成后插件会 `collect` 旧实例，队长可以一直派活、队员可以一直接活，上下文不足时由队员自己继承的 Context Loader 压缩。
+Manifest：`examples/plugins/teammate-plugin/plugin.toml`。插件版 TUI 为它注入共享 Agent Runtime、controller profile 与受限 `worker` 派生配置；worker 模板继承同一个动态 Plugin Host，因此只读工具仍会经过已启用的工具策略提供者（如手动安装的权限插件）与 Host 启动期门禁。worker 不覆盖步数，队员与主会话一样可以一直运行到任务完成；每次派活都是一次新的投胎，完成后插件会 `collect` 旧实例，队长可以一直派活、队员可以一直接活，上下文不足时由队员自己继承的 Context Loader 压缩。
 
 ## Plan 插件
 
@@ -75,18 +75,22 @@ Plan 插件提供结构化计划的整体更新、只读查询、状态校验、
 
 计划还会在每轮运行结束时自动收敛和回收，不依赖模型记得收尾：`core.run.finish` 携带可信 `session_id`，本轮更新过的计划会把残留 `in_progress` 收敛为 `completed`；计划全部完成、或本轮完全没有维护过计划时直接回收，进度架随之消失。取消的运行不参与收敛或回收，中断后计划仍保留。工具描述同时要求每完成一个步骤就立即调用 `update_plan`。
 
-## 权限插件
+## 权限插件（可选，不再默认分发）
+
+`permission` 及旧版 `sandbox` 已从官方构建、安装与打包清单移除；`build:plugin:all` 和 `test:plugin:official` 也不再包含权限插件。源码及独立构建/测试入口保留，标准 workspace 检查仍单独构建它以运行兼容性测试，但不会生成官方发布包。
+
+不启用该插件时，不提供 `/permission`、审批 UI 或插件的敏感路径策略；原生 `WorkspaceGuard`、Plugin Host manifest 能力鉴权与 Runtime 权限收缩仍生效。Shell 仍是当前系统用户的完整原生进程能力，并非沙箱。以下为手动安装启用后的行为。
 
 权限插件提供 Agent 工具策略与输入区审批 UI。它只读取 Host 绑定的最终权限 scope：纯内部 `Control` 直接放行，`Read`、`Write`、`Shell`、`Network` 与 `Unknown` 进入当前审批模式。Host 会按 component 已授的进程、文件、模型、Agent 和宿主动作能力抬高 manifest `tool_scopes` 下限，高权限插件不能用 `Control` 跳过审批。可信读写 scope 携带路径时只允许工作区内词法相对路径，`.env`、私钥、凭据目录和 `.git` 内容始终拒绝访问。审批卡片按 scope 展示脱敏摘要、原因、作用范围和风险，支持方向键加 `Enter` 及 `A/S/D/Esc` 快捷键；会话级放行只适用于携带可验证顶层路径的同目录只读调用。`/permission` 可切换“手动审批、帮我审批、全部放行”，模式按项目隔离。模型代审只接受无额外字段的最小 JSON：`allow` 不携带原因，`deny` 必须携带非空原因；待审批状态按 Core 绑定的 `(run_id, call_id)` 隔离并发 Agent。拒绝或异常只阻止当前调用，详细原因不写入 Session，一次性说明仅作为下一轮的工具结果让对应 Agent 调整方案继续，不会被提升为 Developer 指令。全部放行下 Shell 仍拥有当前系统用户的完整原生权限，界面会持续警示。
 
 插件声明独占 `agent.tool-policy@1.0.0` 能力，因此 Host 会在其他插件完成工具 Rewrite 后执行最终检查。权限插件不申请文件、进程、HTTP、secret 或 Agent Runtime 能力；模型代审只申请受控 `model_completion`，命令输入清理只申请通用 `surface_actions`。Shell 审批只表示用户或审核模型接受该次完整宿主命令风险，不提供操作系统级隔离。
 
 ```bash
-bun run build:plugin:plan
-bun run test:plugin:plan
+bun run build:plugin:permission
+bun run test:plugin:permission
 ```
 
-Manifest：`examples/plugins/plan-plugin/plugin.toml`。
+Manifest：`examples/plugins/permission-plugin/plugin.toml`。
 
 ## 记忆插件
 

@@ -30,6 +30,8 @@ export interface OfficialPluginCatalog {
   publisher: string
   /** Registry 和插件资产的 Release 位置。 */
   release: OfficialPluginRelease
+  /** 停止默认分发的旧官方 ID；安装时迁移出自动扫描目录，缺省为空。 */
+  retired?: string[]
   /** 官方插件 bundle 列表。 */
   plugins: OfficialPluginBundle[]
 }
@@ -79,6 +81,13 @@ export async function loadOfficialPluginCatalog(): Promise<OfficialPluginCatalog
       }
       replacedIds.add(replacedId)
     }
+  }
+  const retiredIds = new Set<string>()
+  for (const id of catalog.retired ?? []) {
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id) || ids.has(id) || replacedIds.has(id) || retiredIds.has(id)) {
+      throw new Error(`官方插件退役关系无效：${id}`)
+    }
+    retiredIds.add(id)
   }
   return catalog
 }

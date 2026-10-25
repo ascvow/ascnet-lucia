@@ -6,6 +6,7 @@
     "repository": "lucia-plugins",
     "tag": "registry-v1-2026-07-13"
   },
+  "retired": ["permission", "sandbox"],
   "plugins": [
     {
       "id": "mcp",
@@ -28,13 +29,6 @@
       "crate": "plan-plugin",
       "directory": "examples/plugins/plan-plugin",
       "files": ["plugin.toml", "target/wasm32-wasip2/release/plan_plugin.wasm"]
-    },
-    {
-      "id": "permission",
-      "replaces": ["sandbox"],
-      "crate": "permission-plugin",
-      "directory": "examples/plugins/permission-plugin",
-      "files": ["plugin.toml", "target/wasm32-wasip2/release/permission_plugin.wasm"]
     },
     {
       "id": "memory",
