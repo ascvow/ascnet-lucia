@@ -56,8 +56,8 @@ fn shorten_path(path: &str) -> String {
 
 /// 返回工具标题括号中展示的目标。
 ///
-/// 文件类工具用路径，搜索类用模式，命令类用命令本身；未识别的工具退回通用 JSON
-/// 摘要，保证第三方插件工具也有可读标题。
+/// 文件、搜索、命令工具保留有意义的目标；通用工具只取人类可读的目标字段。
+/// 不把整份参数 JSON 或不透明 UUID 塞进标题，原始调用仍完整保留用于执行和恢复。
 pub(crate) fn tool_target(call: &ToolCall) -> Option<String> {
     let args = &call.args;
     let target = match call.name.as_str() {
@@ -70,17 +70,22 @@ pub(crate) fn tool_target(call: &ToolCall) -> Option<String> {
         _ => None,
     };
     let target = target.or_else(|| {
-        // 通用回退：优先用常见的目标型字段，其次压缩整个参数对象。
         for key in [
             "path", "file", "target", "name", "query", "pattern", "command",
         ] {
             if let Some(value) = text_field(args, key) {
-                return Some(value.to_string());
+                let compact = value.replace('-', "");
+                let opaque =
+                    compact.len() == 32 && compact.bytes().all(|byte| byte.is_ascii_hexdigit());
+                if !opaque && !value.trim().is_empty() {
+                    return Some(value.to_string());
+                }
             }
         }
-        let summary = summarize_json(args, MAX_TARGET_WIDTH);
-        (!summary.is_empty()).then_some(summary)
+        None
     })?;
+    let target = crate::ui::plain_terminal_text(&target);
+    let target = target.split_whitespace().collect::<Vec<_>>().join(" ");
     let target = truncate_line(&target, MAX_TARGET_WIDTH);
     (!target.is_empty()).then_some(target)
 }
@@ -959,36 +964,129 @@ pub(crate) fn preview_language(call: Option<&ToolCall>, result: &ToolResult) -> 
     path.map_or(CodeLanguage::Plain, CodeLanguage::from_path)
 }
 
-/// 构造工具标题行的展示名称。
-///
-/// 内建工具映射为首字母大写的动词形式，与 Claude Code 的观感一致；
-/// 插件工具保留注册时的原名，避免宿主猜测第三方命名。
-pub(crate) fn tool_display_name(name: &str) -> &str {
-    match name {
-        "read_file" => "Read",
-        "write_file" => "Write",
-        "edit_file" => "Edit",
-        "list_directory" => "List",
-        "search_files" => "Search",
-        "shell" => "Shell",
-        "skill_read" => "Read",
-        other => other,
+/// 把工具标识符按词界转成标题词，不解析插件参数、owner 或业务协议。
+/// 保留缩写和 Unicode 字素；camelCase 与 snake_case 都只修改显示副本。
+fn tool_name_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = text.chars().peekable();
+    let mut previous = None;
+    while let Some(ch) = chars.next() {
+        if matches!(ch, '_' | '-') || ch.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            previous = None;
+            continue;
+        }
+        let camel_boundary = ch.is_uppercase()
+            && previous.is_some_and(|prev: char| {
+                prev.is_lowercase()
+                    || prev.is_ascii_digit()
+                    || (prev.is_uppercase() && chars.peek().is_some_and(|next| next.is_lowercase()))
+            });
+        if camel_boundary && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        word.push(ch);
+        previous = Some(ch);
     }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+        .into_iter()
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
-/// 渲染工具标题行左侧的正文片段（不含状态圆点）。
+/// 返回简洁标题及弱化命名空间。只识别通用动作词，不为具体插件复制协议分支。
+/// 例如 update_plan → Update(Plan)、teammate_ack → Ack(Teammate)；动态限定名保留来源。
+fn tool_display_parts(name: &str) -> (String, Option<String>) {
+    let builtin = match name {
+        "read_file" => Some("Read"),
+        "write_file" => Some("Write"),
+        "edit_file" => Some("Edit"),
+        "list_directory" => Some("List"),
+        "search_files" => Some("Search"),
+        "shell" => Some("Shell"),
+        "skill_read" => Some("Read"),
+        _ => None,
+    };
+    if let Some(label) = builtin {
+        return (label.into(), None);
+    }
+    let plain = crate::ui::plain_terminal_text(name);
+    let qualified = plain.replace("__", "/");
+    let mut segments = qualified
+        .split(['/', '.', ':'])
+        .map(tool_name_words)
+        .filter(|words| !words.is_empty())
+        .collect::<Vec<_>>();
+    let Some(mut words) = segments.pop() else {
+        return ("Tool".into(), None);
+    };
+    // 这是界面用词表，不赋予能力或执行语义；未知动作保留完整人类可读名称。
+    let actions = [
+        "read", "write", "edit", "list", "search", "get", "set", "update", "add", "delete",
+        "remove", "create", "spawn", "continue", "cancel", "collect", "result", "status",
+        "identity", "send", "inbox", "ack", "dispatch", "record", "forget", "fetch", "open",
+        "close", "run", "exec", "execute", "control", "parallel", "call", "query", "inspect",
+    ];
+    let action = words.iter().position(|word| {
+        actions
+            .iter()
+            .any(|action| word.eq_ignore_ascii_case(action))
+    });
+    let label = action
+        .map(|index| words.remove(index))
+        .unwrap_or_else(|| words.join(" "));
+    let mut context = segments
+        .into_iter()
+        .map(|words| words.join(" "))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    if action.is_some() && !words.is_empty() {
+        if !context.is_empty() {
+            context.push_str(" · ");
+        }
+        context.push_str(&words.join(" "));
+    }
+    (label, (!context.is_empty()).then_some(context))
+}
+
+/// 构造无组件时的工具可读标题；内建工具保留既有动词，插件和限定名使用通用词法格式。
+/// 仅影响 UI，不修改调用、结果、权限检查或持久化中的注册名。
+#[cfg(test)]
+fn tool_display_name(name: &str) -> String {
+    let (label, context) = tool_display_parts(name);
+    context
+        .map(|context| format!("{label}({context})"))
+        .unwrap_or(label)
+}
+
+/// 渲染工具标题左侧片段（不含状态圆点），标题加粗，命名空间和实际目标弱化显示。
+/// 不依赖异步插件帧，因此运行、错误、跳过、历史恢复和成员会话使用同一安全回退。
 pub(crate) fn tool_title_spans(name: &str, target: Option<&str>) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(
-        tool_display_name(name).to_string(),
-        Style::new().fg(COLOR_TEXT).bold(),
-    )];
-    if let Some(target) = target {
-        spans.push(Span::styled("(", Style::new().fg(COLOR_MUTED)));
+    let (label, context) = tool_display_parts(name);
+    let mut spans = vec![Span::styled(label, Style::new().fg(COLOR_TEXT).bold())];
+    let detail = match (context, target.filter(|target| !target.is_empty())) {
+        (Some(context), Some(target)) if context != target => Some(format!("{context} · {target}")),
+        (Some(context), _) => Some(context),
+        (None, Some(target)) => Some(target.to_string()),
+        (None, None) => None,
+    };
+    if let Some(detail) = detail {
         spans.push(Span::styled(
-            target.to_string(),
+            format!("({detail})"),
             Style::new().fg(COLOR_MUTED),
         ));
-        spans.push(Span::styled(")", Style::new().fg(COLOR_MUTED)));
     }
     spans
 }
@@ -999,9 +1097,9 @@ mod tests {
     use crate::theme::{COLOR_DIFF_ADD_FG, COLOR_DIFF_FILE_HEADER, COLOR_DIFF_HUNK};
     use serde_json::json;
 
-    /// 原生 Skill 使用 Read 标题并保留技能名和正文，不影响第三方工具的原始命名。
+    /// 原生 Skill 保留 Read 标题与技能名，动态插件也使用同一可读回退。
     #[test]
-    fn skill_uses_read_title_without_changing_plugin_names() {
+    fn skill_uses_read_title_and_plugin_fallback() {
         let call = ToolCall::new("skill", "skill_read", json!({"name":"tui-design"}));
         let result = ToolResult::success(
             "skill",
@@ -1015,7 +1113,7 @@ mod tests {
             Some("已读取 Skill：tui-design")
         );
         assert_eq!(result_body(&result).as_deref(), Some("技能正文"));
-        assert_eq!(tool_display_name("mcp_fetch"), "mcp_fetch");
+        assert_eq!(tool_display_name("mcp_fetch"), "Fetch(Mcp)");
     }
 
     /// 路径按字素保留文件尾部；极窄区域不能产生额外折行。
@@ -1101,12 +1199,33 @@ mod tests {
         assert_eq!(tool_target(&call).as_deref(), Some("src/main.rs"));
     }
 
-    /// 未识别的插件工具退回通用 JSON 摘要，不会没有标题目标。
+    /// 通用标题不展示原始参数 JSON 或不透明地址，有可读目标时仍保留。
     #[test]
-    fn unknown_tools_fall_back_to_json_summary() {
-        let call = ToolCall::new("c", "custom_tool", json!({"mode": "fast", "retries": 2}));
-        let target = tool_target(&call).expect("未知工具也应有目标摘要");
-        assert!(target.contains("mode"), "{target:?}");
+    fn unknown_tools_keep_targets_without_dumping_arguments() {
+        let id = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+        for args in [
+            json!({"mode":"fast","retries":2}),
+            json!({"target":id}),
+            json!({"member_id":id}),
+            json!({}),
+        ] {
+            let call = ToolCall::new("c", "custom_tool", args.clone());
+            assert!(tool_target(&call).is_none());
+            assert_eq!(call.args, args);
+        }
+        for (args, expected) in [
+            (json!({"query":"中文 👩‍💻"}), "中文 👩‍💻"),
+            (json!({"target":id,"name":"Frontend"}), "Frontend"),
+            (
+                json!({"name":"\u{001b}[31mHello\nworld\u{001b}[0m"}),
+                "Hello world",
+            ),
+        ] {
+            assert_eq!(
+                tool_target(&ToolCall::new("c", "custom_tool", args)).as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     /// 写入结果摘要按实际写入内容统计行数。
@@ -1662,11 +1781,170 @@ mod tests {
         );
     }
 
-    /// 内建工具名映射为动词形式，插件工具保留原名。
+    /// 所有内建、官方/示例插件以及动态命名空间都走通用格式，不依赖 renderer 是否可用。
+    #[test]
+    fn all_tool_sources_have_readable_fallback_titles() {
+        for (name, expected) in [
+            ("read_file", "Read"),
+            ("write_file", "Write"),
+            ("edit_file", "Edit"),
+            ("list_directory", "List"),
+            ("search_files", "Search"),
+            ("shell", "Shell"),
+            ("skill_read", "Read"),
+            ("update_plan", "Update(Plan)"),
+            ("get_plan", "Get(Plan)"),
+            ("memory_record", "Record(Memory)"),
+            ("memory_list", "List(Memory)"),
+            ("memory_forget", "Forget(Memory)"),
+            ("history_search", "Search(History)"),
+            ("history_read", "Read(History)"),
+            ("ui_showcase_control", "Control(Ui Showcase)"),
+            ("echo", "Echo"),
+            ("demo_echo", "Demo Echo"),
+            (
+                "mcp__mock__get_design_node",
+                "Get(Mcp / Mock · Design Node)",
+            ),
+            (
+                "mcp__github__search_issues",
+                "Search(Mcp / Github · Issues)",
+            ),
+            ("functions.update_plan", "Update(Functions · Plan)"),
+            ("multi_tool_use.parallel", "Parallel(Multi Tool Use)"),
+            ("plugin::newAction", "New Action(Plugin)"),
+            ("HTTPServer_getNode", "Get(HTTP Server Node)"),
+            ("未知插件_搜索", "未知插件 搜索"),
+            ("\u{001b}[31mupdate_plan\u{001b}[0m", "Update(Plan)"),
+        ] {
+            assert_eq!(tool_display_name(name), expected, "{name}");
+        }
+        for verb in [
+            "spawn", "list", "status", "result", "cancel", "remove", "send", "inbox", "ack",
+            "dispatch",
+        ] {
+            let title = tool_display_name(&format!("teammate_{verb}"));
+            assert_eq!(title, format!("{}(Teammate)", tool_name_words(verb)[0]));
+        }
+        for verb in [
+            "identity", "spawn", "continue", "status", "result", "cancel",
+        ] {
+            assert_eq!(
+                tool_display_name(&format!("agent_runtime_{verb}")),
+                format!("{}(Agent Runtime)", tool_name_words(verb)[0])
+            );
+        }
+        assert_ne!(
+            tool_display_name("mcp__one__read"),
+            tool_display_name("mcp__two__read")
+        );
+        assert_eq!(tool_display_name("e\u{301}cho_👩‍💻"), "E\u{301}cho 👩‍💻");
+        assert_eq!(tool_display_name("___"), "Tool");
+        let spans = tool_title_spans("mcp__github__search_issues", Some("layout"));
+        assert_eq!(spans[0].content, "Search");
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[1].content, "(Mcp / Github · Issues · layout)");
+        assert_eq!(spans[1].style.fg, Some(COLOR_MUTED));
+    }
+
+    /// 组件未返回、出错或历史仅有结果时，所有生命周期仍显示简洁标题且原始调用不变。
+    #[test]
+    fn fallback_titles_cover_every_state_and_result_only_history() {
+        use crate::session::conversation::{Msg, MsgKind};
+        for name in [
+            "update_plan",
+            "teammate_ack",
+            "memory_record",
+            "history_read",
+            "agent_runtime_spawn",
+            "ui_showcase_control",
+            "mcp__mock__get_design_node",
+        ] {
+            let call = ToolCall::new(
+                "call-1",
+                name,
+                json!({"member_id":"opaque-id","plan":[{"step":"task"}]}),
+            );
+            let before = serde_json::to_value(&call).unwrap();
+            let title = format!("● {}", tool_display_name(name));
+            let mut message = Msg::tool_started(call.clone());
+            for kind in [
+                MsgKind::ToolRunning,
+                MsgKind::ToolOk,
+                MsgKind::ToolError,
+                MsgKind::ToolSkipped,
+            ] {
+                message.kind = kind.clone();
+                message.skip_reason =
+                    matches!(kind, MsgKind::ToolSkipped).then(|| "用户取消".into());
+                message.tool_result = match kind {
+                    MsgKind::ToolOk => Some(ToolResult::success(
+                        "call-1",
+                        name,
+                        json!({"content":"保留正文"}),
+                    )),
+                    MsgKind::ToolError => Some(ToolResult::error("call-1", name, "权限拒绝")),
+                    _ => None,
+                };
+                let lines = message.to_lines(false, 80);
+                assert!(lines[0].to_string().starts_with(&title), "{}", lines[0]);
+                assert!(!lines[0].to_string().contains("opaque-id"));
+                let text = lines.iter().map(ToString::to_string).collect::<String>();
+                if matches!(kind, MsgKind::ToolError) {
+                    assert!(text.contains("权限拒绝"));
+                }
+                if matches!(kind, MsgKind::ToolSkipped) {
+                    assert!(text.contains("用户取消"));
+                }
+                if matches!(kind, MsgKind::ToolOk) {
+                    assert!(text.contains("保留正文"));
+                }
+                assert_eq!(
+                    serde_json::to_value(message.tool_call.as_ref().unwrap()).unwrap(),
+                    before
+                );
+            }
+            let restored = Msg::tool_finished(ToolResult::success(
+                "call-1",
+                name,
+                json!({"content":"历史正文"}),
+            ));
+            assert_eq!(restored.to_lines(false, 80)[0].to_string(), title);
+        }
+    }
+
+    /// 极窄终端换行和完整文本复制都使用显示副本，不把 ANSI/控制字节送进终端。
+    #[test]
+    fn fallback_tool_titles_are_safe_on_narrow_unicode_layouts() {
+        use crate::session::conversation::Msg;
+        use crate::ui::transcript_layout::TranscriptLayout;
+        let message = Msg::tool_started(ToolCall::new(
+            "narrow",
+            "mcp__中文👩‍💻__read_file",
+            json!({"query":"e\u{301} 文本"}),
+        ));
+        for width in [1, 2, 8, 20, 80] {
+            let mut layout = TranscriptLayout::default();
+            let height = layout.sync(std::slice::from_ref(&message), None, width);
+            let buffer = layout.render_range(
+                Rect::new(0, 0, width, height as u16),
+                std::slice::from_ref(&message),
+                None,
+                0,
+                height as u16,
+            );
+            assert!(buffer
+                .content
+                .iter()
+                .all(|cell| !cell.symbol().chars().any(char::is_control)));
+        }
+    }
+
+    /// 内建工具名映射为动词形式，插件和动态工具用通用可读标题。
     #[test]
     fn builtin_tools_use_verb_display_names() {
         assert_eq!(tool_display_name("write_file"), "Write");
-        assert_eq!(tool_display_name("mcp_fetch"), "mcp_fetch");
+        assert_eq!(tool_display_name("mcp_fetch"), "Fetch(Mcp)");
     }
 }
 

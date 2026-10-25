@@ -163,6 +163,59 @@ fn agent_session_navigation_uses_the_shared_stack() {
     assert!(app.view_stack.is_main());
 }
 
+/// 成员会话无插件帧时仍复用通用简洁标题，不能漏出计划或动态工具的注册名。
+#[cfg(feature = "plugins")]
+#[test]
+fn agent_session_tool_fallbacks_use_readable_titles() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    open_member_view(&mut app, "member-1", "3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+    let view = app.active_agent_session_view_mut().unwrap();
+    for (index, name, expected) in [
+        (1, "update_plan", "Update(Plan)"),
+        (
+            2,
+            "mcp__mock__get_design_node",
+            "Get(Mcp / Mock · Design Node)",
+        ),
+    ] {
+        let id = format!("call-{index}");
+        let call = ToolCall::new(&id, name, json!({"payload":"不塞进标题"}));
+        view.apply_event(&AgentEvent::new(
+            "run",
+            AgentEventKind::ToolStarted,
+            0,
+            serde_json::to_value(&call).unwrap(),
+        ));
+        let running = view
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id() == Some(id.as_str()))
+            .unwrap();
+        assert!(running.to_lines(false, 80)[0]
+            .to_string()
+            .starts_with(&format!("● {expected}")));
+        let result = ToolResult::error(&id, name, "权限拒绝");
+        view.apply_event(&AgentEvent::new(
+            "run",
+            AgentEventKind::ToolFinished,
+            0,
+            serde_json::to_value(result).unwrap(),
+        ));
+        let message = view
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id() == Some(id.as_str()))
+            .unwrap();
+        assert_eq!(message.tool_call.as_ref().unwrap(), &call);
+        let lines = message.to_lines(false, 80);
+        assert!(lines[0].to_string().starts_with(&format!("● {expected}")));
+        assert!(lines
+            .iter()
+            .any(|line| line.to_string().contains("权限拒绝")));
+    }
+}
+
 /// 事件时间线复用主界面组件：助手正文、工具调用与结果都进入消息列表。
 #[cfg(feature = "plugins")]
 #[test]

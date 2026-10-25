@@ -856,6 +856,47 @@ fn stale_tool_renderer_frame_is_ignored() {
     );
 }
 
+/// 插件未声明 renderer、返回 None/错误/空帧或帧尚未就绪时，也不能恢复内部工具标题。
+#[test]
+#[cfg(feature = "plugins")]
+fn unavailable_plugin_frames_keep_readable_fallback_titles() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    for result in [
+        Ok(None),
+        Err(anyhow!("renderer failed")),
+        Ok(Some(PluginUiFrame {
+            view_id: "plan".into(),
+            visible: false,
+            lines: Vec::new(),
+            cursor: None,
+        })),
+        Ok(Some(PluginUiFrame {
+            view_id: "plan".into(),
+            visible: true,
+            lines: Vec::new(),
+            cursor: None,
+        })),
+    ] {
+        let mut message = Msg::tool_started(ToolCall::new(
+            "plan-call",
+            "update_plan",
+            json!({"plan":[{"step":"旧参数","status":"pending"}]}),
+        ));
+        message.tool_render_revision = 1;
+        app.messages = vec![message];
+        assert_eq!(
+            app.messages[0].to_lines(false, 80)[0].to_string(),
+            "● Update(Plan)"
+        );
+        app.apply_tool_frame("plan-call", 1, 80, result);
+        assert_eq!(
+            app.messages[0].to_lines(false, 80)[0].to_string(),
+            "● Update(Plan)"
+        );
+    }
+}
+
 /// 独占输入插件必须使用完整圆角边框和声明标题，形成与主输入区分离的审批卡片。
 #[test]
 #[cfg(feature = "plugins")]

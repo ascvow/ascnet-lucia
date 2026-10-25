@@ -1723,7 +1723,7 @@ fn tool_results_are_separated_by_blank_rows() {
         .iter()
         .enumerate()
         .filter_map(|(index, row)| {
-            (row.contains("first_tool") || row.contains("second_tool")).then_some(index)
+            (row.contains("First Tool") || row.contains("Second Tool")).then_some(index)
         })
         .collect::<Vec<_>>();
     let reply_row = rows
