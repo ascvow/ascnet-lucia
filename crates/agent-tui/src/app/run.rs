@@ -186,7 +186,7 @@ impl App {
     /// Queues one complete input while plugin loading keeps the Agent unavailable.
     ///
     /// 插件加载导致 Agent 尚不可用时，将一条完整输入加入 FIFO 队列。待发送消息只显示
-    /// 在输入框上方的排队面板里，发送并持久化后才进入会话记录。
+    /// 在输入框上方的排队面板里；开始发送时移出队列并进入正文，首存失败时再回退。
     pub(crate) fn queue_input_until_ready(&mut self) {
         if self.defer_attachment_submission(None, false) {
             return;
@@ -200,15 +200,10 @@ impl App {
 
     /// 把队列中的一条消息取回输入框继续编辑；返回是否成功。
     ///
-    /// 输入框已有草稿时先按正常提交规则把草稿排到队尾，保证两边内容都不丢。正在发送
-    /// 的队首不能取回：它已经进入运行，移除会让完成回调找不到对应的 FIFO 输入。
+    /// 输入框已有草稿时先按正常提交规则把草稿排到队尾，保证两边内容都不丢。
+    /// 已开始发送的输入不再位于队列中，因此队列内的每一项都可以取回。
     pub(crate) fn edit_queued_input(&mut self, index: usize) -> bool {
         if index >= self.queued_inputs.len() {
-            return false;
-        }
-        if self.queued_run_active && index == 0 {
-            self.messages
-                .push(Msg::new(MsgKind::Info, "该排队消息正在发送，无法取回编辑"));
             return false;
         }
         let has_draft =
@@ -279,7 +274,7 @@ impl App {
     /// 发送排队面板中选中的消息。
     ///
     /// 空闲时立即作为新一轮发送并移出队列，剩余队列在该轮结束后继续 FIFO；运行中
-    /// 不打断当前轮次，只把选中项移到队首之后（或队首），等本轮结束后发送。
+    /// 不打断当前轮次，只把选中项移到待发送队首，等本轮结束后发送。
     pub(crate) fn send_selected_queued(&mut self, agent: Option<&Arc<Agent>>) {
         let Some(index) = self.queue_focus else {
             return;
@@ -290,11 +285,6 @@ impl App {
             return;
         }
         let index = index.min(len - 1);
-        if self.queued_run_active && index == 0 {
-            self.messages
-                .push(Msg::new(MsgKind::Info, "该排队消息正在发送，无法重复发送"));
-            return;
-        }
         if self.pending_reload.is_some() {
             self.messages
                 .push(Msg::new(MsgKind::Info, "上下文压缩仍在进行中，请稍候"));
@@ -304,10 +294,8 @@ impl App {
             let Some(submission) = self.queued_inputs.remove(index) else {
                 return;
             };
-            // 队首正在发送时不能插到它前面：完成回调要用队首与运行输入做配对校验。
-            let insert_at = usize::from(self.queued_run_active).min(self.queued_inputs.len());
-            self.queued_inputs.insert(insert_at, submission);
-            self.queue_focus = Some(insert_at);
+            self.queued_inputs.push_front(submission);
+            self.queue_focus = Some(0);
             self.messages
                 .push(Msg::new(MsgKind::Info, "已置顶，本轮结束后发送"));
             return;
@@ -330,7 +318,7 @@ impl App {
         self.start_input_run(agent, submission);
     }
 
-    /// 丢弃排队面板中选中的消息；正在发送的队首不可丢弃。
+    /// 丢弃排队面板中选中的待发送消息，不影响已经出队的当前运行。
     pub(crate) fn remove_selected_queued(&mut self) {
         let Some(index) = self.queue_focus else {
             return;
@@ -341,11 +329,6 @@ impl App {
             return;
         }
         let index = index.min(len - 1);
-        if self.queued_run_active && index == 0 {
-            self.messages
-                .push(Msg::new(MsgKind::Info, "该排队消息正在发送，无法丢弃"));
-            return;
-        }
         if self.queued_inputs.remove(index).is_some() {
             self.messages
                 .push(Msg::new(MsgKind::Info, "已丢弃排队消息"));
@@ -415,11 +398,6 @@ impl App {
         else {
             return;
         };
-        if self.queued_run_active && index == 0 {
-            self.messages
-                .push(Msg::new(MsgKind::Info, "该排队消息正在发送，无法重复发送"));
-            return;
-        }
         if self.immediate_input.is_some() || self.pending_reload.is_some() {
             self.messages.push(Msg::new(
                 MsgKind::Info,
@@ -440,8 +418,8 @@ impl App {
     /// 显式取消或保存失败时，把尚未发送的优先输入放回待发送队列，不写入上下文。
     pub(super) fn pause_immediate_input(&mut self) {
         if let Some(submission) = self.immediate_input.take() {
-            let index = usize::from(self.queued_run_active).min(self.queued_inputs.len());
-            self.queued_inputs.insert(index, submission);
+            self.queued_inputs.push_front(submission);
+            self.queue_focus = self.queue_focus.map(|index| index + 1);
         }
     }
 
@@ -505,7 +483,12 @@ impl App {
             self.queued_run_active = false;
             self.start_input_run(agent, submission);
         } else if !self.queue_paused {
-            if let Some(submission) = self.queued_inputs.front().cloned() {
+            if let Some(submission) = self.queued_inputs.pop_front() {
+                // 开始发送即离开待发送队列；运行持有完整输入，首存失败时由完成事件恢复。
+                self.queue_focus = self.queue_focus.and_then(|index| {
+                    (!self.queued_inputs.is_empty())
+                        .then(|| index.saturating_sub(1).min(self.queued_inputs.len() - 1))
+                });
                 self.queued_run_active = true;
                 self.start_input_run(agent, submission);
             }
@@ -681,21 +664,6 @@ impl App {
         self.run_started_at = None;
         self.model_is_thinking = false;
         let queued_run = std::mem::take(&mut self.queued_run_active);
-        if queued_run && input_committed {
-            let committed_input = self
-                .queued_inputs
-                .pop_front()
-                .expect("队列运行必须对应一个 FIFO 输入");
-            debug_assert_eq!(committed_input, input);
-            // 队首已经发送，焦点跟着剩余队列左移；队列清空时退出面板。
-            if let Some(index) = self.queue_focus {
-                self.queue_focus = if self.queued_inputs.is_empty() {
-                    None
-                } else {
-                    Some(index.saturating_sub(1).min(self.queued_inputs.len() - 1))
-                };
-            }
-        }
 
         if input_committed {
             self.session_record = session_record;
@@ -704,17 +672,19 @@ impl App {
                 self.messages = restore_session_messages(&self.session_record.session);
             }
         } else {
-            // 队列首存失败时保留原队列和已展示顺序，等待后续重试同一队首。
-            if !queued_run {
-                if self.input.is_empty() && self.attachments.is_empty() && self.refs.is_empty() {
-                    self.input = input.text.clone();
-                    self.cursor = self.input.len();
-                    self.attachments = input.attachments.clone();
-                    self.refs = input.refs.clone();
-                } else {
-                    // 优先发送可能来自队列，期间用户仍在写草稿；首存失败不能覆盖草稿或丢掉输入。
-                    self.queued_inputs.push_front(input.clone());
-                }
+            // 自动派发的输入已出队；首存失败时恢复到队首，既不丢消息也不覆盖新草稿。
+            if queued_run
+                || !self.input.is_empty()
+                || !self.attachments.is_empty()
+                || !self.refs.is_empty()
+            {
+                self.queued_inputs.push_front(input.clone());
+                self.queue_focus = self.queue_focus.map(|index| index + 1);
+            } else {
+                self.input = input.text.clone();
+                self.cursor = self.input.len();
+                self.attachments = input.attachments.clone();
+                self.refs = input.refs.clone();
             }
             if let Some(index) = active_input_message.filter(|index| {
                 self.messages.get(*index).is_some_and(|message| {

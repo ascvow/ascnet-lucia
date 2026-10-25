@@ -749,17 +749,19 @@ fn editing_queued_input_keeps_current_draft() {
     );
 }
 
-/// 正在发送的队首不能取回，避免完成回调找不到对应的 FIFO 输入。
+/// 自动派发的消息已出队，当前待发送队首仍可取回编辑。
 #[test]
-fn editing_running_queue_head_is_rejected() {
+fn editing_pending_queue_head_during_run_is_allowed() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.queued_inputs.push_back("排队一".into());
     app.queued_run_active = true;
+    app.running = true;
 
-    assert!(!app.edit_queued_input(0));
-    assert_eq!(app.queued_inputs.len(), 1);
-    assert!(app.input.is_empty());
+    assert!(app.edit_queued_input(0));
+    assert!(app.queued_inputs.is_empty());
+    assert_eq!(app.input, "排队一");
+    assert!(app.running);
 }
 
 /// Ctrl+O 取回最早的一条排队消息。
@@ -825,15 +827,15 @@ async fn queue_enter_idle_sends_selected() {
     );
 }
 
-/// 运行中 Enter 只置顶，不打断当前轮次；正在发送的队首不能重复发送。
+/// 运行中 Enter 只置顶待发送消息，不打断当前轮次；待发送队首也可正常选择。
 #[test]
-fn queue_enter_running_promotes_and_protects_head() {
+fn queue_enter_running_promotes_pending_message() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     app.running = true;
     app.queued_run_active = true;
-    app.queued_inputs = VecDeque::from(["running".into(), "a".into(), "b".into()]);
-    app.queue_focus = Some(2);
+    app.queued_inputs = VecDeque::from(["a".into(), "b".into()]);
+    app.queue_focus = Some(1);
 
     app.handle_queue_key(KeyCode::Enter, KeyModifiers::NONE, None);
 
@@ -842,21 +844,22 @@ fn queue_enter_running_promotes_and_protects_head() {
         .iter()
         .map(|submission| submission.text.as_str())
         .collect();
-    assert_eq!(texts, ["running", "b", "a"], "选中项应移到队首之后");
-    assert_eq!(app.queue_focus, Some(1));
+    assert_eq!(texts, ["b", "a"], "选中项应移到待发送队首");
+    assert_eq!(app.queue_focus, Some(0));
 
-    app.queue_focus = Some(0);
     app.handle_queue_key(KeyCode::Enter, KeyModifiers::NONE, None);
     let texts: Vec<&str> = app
         .queued_inputs
         .iter()
         .map(|submission| submission.text.as_str())
         .collect();
-    assert_eq!(texts, ["running", "b", "a"], "正在发送的队首不能重复发送");
+    assert_eq!(texts, ["b", "a"], "重复置顶不应复制条目");
+    assert!(app.running);
+    assert!(!app.run_stream_cancelled);
     assert!(app
         .messages
         .iter()
-        .any(|message| message.text.contains("正在发送")));
+        .all(|message| message.text == "已置顶，本轮结束后发送"));
 }
 
 /// 排队面板内 Ctrl+O 取回选中项编辑，焦点回到输入框。

@@ -156,7 +156,7 @@ pub(crate) struct App {
     pub(crate) context_ref_task: Option<tokio::task::JoinHandle<()>>,
     /// 仅驻留内存的待发送 FIFO；尚未启动的条目不写入模型会话或历史记录。
     pub(crate) queued_inputs: VecDeque<UserSubmission>,
-    /// 当前运行是否来自 FIFO 队首；成功预写后才允许移除对应输入。
+    /// 当前运行是否由 FIFO 自动派发；输入已出队，仅在首次保存失败时恢复到队首。
     pub(crate) queued_run_active: bool,
     /// 用户取消后保持 FIFO 暂停；显式普通发送恢复，Ctrl+Enter 仅处理指定消息。
     pub(crate) queue_paused: bool,

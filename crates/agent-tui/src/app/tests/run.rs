@@ -66,6 +66,103 @@ fn visible_user_texts(app: &App) -> Vec<&str> {
         .collect()
 }
 
+/// 自动派发开始后，消息仅保留在正文；队列行、计数、焦点与点击区域立即跟随剩余输入。
+#[tokio::test]
+async fn queued_submission_leaves_pending_panel_when_run_starts() {
+    for (pending, focus) in [(0, Some(0)), (2, None), (2, Some(0)), (2, Some(2))] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, "test".into());
+        let model = Arc::new(QueueBlockingModel::default());
+        let agent = queue_test_agent(model.clone());
+        app.queued_inputs.push_back("本轮已发送".into());
+        for index in 0..pending {
+            app.queued_inputs
+                .push_back(format!("等待发送{index}").into());
+        }
+        app.queue_focus = focus;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        assert_eq!(app.queued_input_areas.len(), pending + 1);
+
+        app.run_next_queued(&agent);
+        model.entered.notified().await;
+        assert!(
+            app.running,
+            "必须在模型仍处理本轮消息时检查，不能等完成后出队"
+        );
+        assert_eq!(visible_user_texts(&app), ["本轮已发送"]);
+        assert_eq!(
+            app.queued_inputs.len(),
+            pending,
+            "运行中的消息不属于待发送队列"
+        );
+        assert_eq!(
+            app.queue_focus,
+            if pending == 0 {
+                None
+            } else {
+                focus.map(|index| index.saturating_sub(1))
+            }
+        );
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert_eq!(screen.matches("本轮已发送").count(), 1, "{screen}");
+        assert_eq!(app.queued_input_areas.len(), pending);
+        if pending == 0 {
+            assert!(
+                !screen.contains("queued"),
+                "空队列不得继续占位或显示计数：{screen}"
+            );
+        } else {
+            assert!(screen.contains(&format!("{pending}queued")), "{screen}");
+        }
+
+        app.interrupt_run(Some(&agent));
+        assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
+        assert_eq!(
+            app.queued_inputs.len(),
+            pending,
+            "完成回调不能再次移除下一条输入"
+        );
+    }
+}
+
+/// 自动派发期间可删除、取回剩余队首；完成事件只收尾当前输入，不能再操作空队列。
+#[tokio::test]
+async fn pending_queue_can_be_edited_while_dispatched_input_runs() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "test".into());
+    let model = Arc::new(QueueBlockingModel::default());
+    let agent = queue_test_agent(model.clone());
+    // 相同正文代表两次独立提交，不能靠文本去重或匹配队首来确认当前运行。
+    app.queued_inputs = VecDeque::from(["重复正文".into(), "重复正文".into(), "取回编辑".into()]);
+    app.run_next_queued(&agent);
+    model.entered.notified().await;
+    app.queue_focus = Some(0);
+    app.handle_queue_key(KeyCode::Delete, KeyModifiers::NONE, Some(&agent));
+    assert_eq!(app.queued_inputs.len(), 1);
+    app.handle_queue_key(KeyCode::Char('o'), KeyModifiers::CONTROL, Some(&agent));
+    assert_eq!(app.input, "取回编辑");
+    assert!(app.queued_inputs.is_empty());
+    assert!(app.running);
+    assert_eq!(visible_user_texts(&app), ["重复正文"]);
+
+    app.interrupt_run(Some(&agent));
+    assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
+    assert!(app.queued_inputs.is_empty());
+    assert_eq!(app.input, "取回编辑");
+    assert_eq!(visible_user_texts(&app), ["重复正文"]);
+}
+
 /// 队首开始发送就显示标准用户气泡；Esc 后仅已发送条目落盘，其他队列不得渗入恢复上下文。
 #[tokio::test]
 async fn queued_cancel_restart_keeps_context_and_user_bubbles_in_sync() {
@@ -339,49 +436,77 @@ async fn failed_queue_submission_rolls_back_its_bubble_only() {
         let mut app = App::new(tx, "test".into());
         app.session_store = Arc::new(ScriptedSaveStore::new(vec![1], ScriptedSaveFailure::Io));
         app.messages.push(Msg::new(MsgKind::User, "已有消息"));
-        app.queued_inputs.push_back("发送失败".into());
+        let submission = crate::session::conversation::UserSubmission {
+            text: "发送失败 [IMAGE#1] [REF#1]".into(),
+            attachments: vec![PendingAttachment {
+                label: "[IMAGE#1]".into(),
+                name: "test.png".into(),
+                media_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+                is_image: true,
+                pasted_text: None,
+                source_path: None,
+            }],
+            refs: vec![crate::session::conversation::PendingRef {
+                label: "[REF#1]".into(),
+                provider: "test".into(),
+                id: "ref".into(),
+                title: "引用来源".into(),
+                body: "完整引用正文".into(),
+            }],
+        };
+        app.queued_inputs = VecDeque::from([submission.clone(), "尚未发送".into()]);
         if from_queue {
             app.run_next_queued(&agent);
         } else {
             app.queue_focus = Some(0);
             app.send_selected_queued_immediate(Some(&agent));
         }
+        assert_eq!(app.queued_inputs.len(), 1);
+        app.queue_focus = Some(0);
         app.input = "后来编辑的草稿".into();
-        assert_eq!(visible_user_texts(&app), ["已有消息", "发送失败"]);
+        assert_eq!(
+            visible_user_texts(&app),
+            ["已有消息", submission.text.as_str()]
+        );
         assert!(!app.handle_agent_done(queue_completion(&mut rx).await));
         assert_eq!(visible_user_texts(&app), ["已有消息"]);
-        assert_eq!(app.queued_inputs.front().unwrap().text, "发送失败");
+        assert_eq!(
+            app.queued_inputs,
+            VecDeque::from([submission, "尚未发送".into()]),
+            "首存失败必须恢复完整输入，不能丢附件、引用或改变剩余顺序"
+        );
+        assert_eq!(app.queue_focus, Some(1));
         assert_eq!(app.input, "后来编辑的草稿");
     }
 }
 
-/// 选中正在发送的队首不能重复插队；模型未就绪、已有优先消息时队列和草稿保持原样。
+/// 模型未就绪或已有优先消息时不改队列；自动派发期间，待发送队首仍可立即插队。
 #[test]
-fn immediate_queue_send_rejects_unavailable_or_active_targets() {
+fn immediate_queue_send_accepts_pending_head_and_rejects_unavailable_targets() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "test".into());
     let (gateway, options) = build_demo_gateway();
     let agent = Arc::new(Agent::new(gateway, options));
     app.running = true;
     app.queued_run_active = true;
-    app.queued_inputs = VecDeque::from(["正在发送".into(), "待发送".into()]);
+    app.messages.push(Msg::new(MsgKind::User, "正在发送"));
+    app.queued_inputs = VecDeque::from(["待发送".into(), "稍后发送".into()]);
     app.input = "草稿".into();
-    for (index, available) in [(0, true), (1, false)] {
-        app.queue_focus = Some(index);
-        app.handle_queue_key(
-            KeyCode::Enter,
-            KeyModifiers::CONTROL,
-            available.then_some(&agent),
-        );
-        assert!(app.immediate_input.is_none());
-        assert!(!app.run_stream_cancelled);
-        assert_eq!(app.queued_inputs.len(), 2);
-        assert_eq!(app.input, "草稿");
-    }
-    app.queue_focus = Some(1);
+    app.queue_focus = Some(0);
+    app.handle_queue_key(KeyCode::Enter, KeyModifiers::CONTROL, None);
+    assert!(app.immediate_input.is_none());
+    assert!(!app.run_stream_cancelled);
+    assert_eq!(app.queued_inputs.len(), 2);
+    assert_eq!(app.input, "草稿");
+
     app.handle_queue_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
-    assert_eq!(app.queued_inputs.front().unwrap().text, "正在发送");
+    assert_eq!(app.queued_inputs.front().unwrap().text, "稍后发送");
     assert_eq!(app.immediate_input.as_ref().unwrap().text, "待发送");
+    app.queue_focus = Some(0);
+    app.handle_queue_key(KeyCode::Enter, KeyModifiers::CONTROL, Some(&agent));
+    assert_eq!(app.immediate_input.as_ref().unwrap().text, "待发送");
+    assert_eq!(app.queued_inputs.len(), 1, "重复插队不能覆盖已有优先输入");
     app.handle_key(KeyCode::Esc, KeyModifiers::NONE, Some(&agent));
     assert!(app.immediate_input.is_none());
     assert_eq!(
@@ -389,8 +514,11 @@ fn immediate_queue_send_rejects_unavailable_or_active_targets() {
             .iter()
             .map(|input| input.text.as_str())
             .collect::<Vec<_>>(),
-        ["正在发送", "待发送"]
+        ["待发送", "稍后发送"]
     );
+    assert_eq!(app.queue_focus, Some(1), "优先输入回退时仍选中原待发送项");
+    assert_eq!(visible_user_texts(&app), ["正在发送"]);
+    assert_eq!(app.input, "草稿");
 }
 
 /// 已取消的普通队列不会被任意后续完成事件恢复；用户显式 Enter 才恢复 FIFO。
@@ -1282,17 +1410,17 @@ async fn failed_final_and_fork_saves_keep_dirty_completed_session() {
     }));
 }
 
-/// FIFO 队首预写失败时不得出队或自动推进，所有待处理输入保持原顺序。
+/// FIFO 队首预写失败时恢复到队首并暂停，焦点仍跟随原待发送消息。
 #[test]
 fn queued_initial_save_failure_preserves_fifo_order() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new(tx, "测试模型".into());
     let original_record = app.session_record.clone();
-    app.queued_inputs = VecDeque::from(["第一条".into(), "第二条".into()]);
-    app.messages.extend([
-        Msg::new(MsgKind::User, "第一条"),
-        Msg::new(MsgKind::User, "第二条"),
-    ]);
+    // 第一条已经移交运行；只有第二条仍然待发送。
+    app.queued_inputs.push_back("第二条".into());
+    app.queue_focus = Some(0);
+    app.messages.push(Msg::new(MsgKind::User, "第一条"));
+    app.active_input_message = Some(0);
     app.queued_run_active = true;
     app.running = true;
     let mut attempted_record = original_record.clone();
@@ -1316,15 +1444,10 @@ fn queued_initial_save_failure_preserves_fifo_order() {
             .collect::<Vec<_>>(),
         vec!["第一条", "第二条"]
     );
-    assert_eq!(
-        app.messages
-            .iter()
-            .filter(|message| matches!(message.kind, MsgKind::User))
-            .map(|message| message.text.as_str())
-            .collect::<Vec<_>>(),
-        vec!["第一条", "第二条"]
-    );
+    assert!(visible_user_texts(&app).is_empty());
+    assert_eq!(app.queue_focus, Some(1));
     assert!(app.input.is_empty());
+    assert!(app.queue_paused);
     assert!(!app.queued_run_active);
 }
 
