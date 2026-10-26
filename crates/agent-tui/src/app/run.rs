@@ -506,6 +506,36 @@ impl App {
         self.model_is_thinking = false;
     }
 
+    /// 重连只丢弃失败尝试的临时正文，不改动工具消息和已持久化会话；等待期间仍可 Esc 取消。
+    pub(crate) fn retry_model_response(
+        &mut self,
+        attempt: u64,
+        max_retries: u64,
+        interval_ms: u64,
+    ) {
+        if !self.accepts_run_stream_output() {
+            return;
+        }
+        self.pending_stream.clear();
+        self.reveal_pacer.reset();
+        self.model_is_thinking = false;
+        if let Some(index) = self.streaming_message.take() {
+            if self
+                .messages
+                .get(index)
+                .is_some_and(|message| matches!(message.kind, MsgKind::Assistant))
+            {
+                self.messages.remove(index);
+            }
+        }
+        self.messages.push(Msg::new(
+            MsgKind::Info,
+            format!(
+                "连接中断，正在重连 {attempt}/{max_retries} · 等待 {interval_ms} ms · Esc 取消"
+            ),
+        ));
+    }
+
     /// 标记模型进入思考阶段；推理摘要文本不会进入界面、消息或持久会话。
     pub(crate) fn mark_model_thinking(&mut self) {
         if self.accepts_run_stream_output() {

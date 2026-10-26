@@ -21,6 +21,8 @@ struct StreamBudget {
     terminal: bool,
     overflowed: bool,
     task: Option<tokio::task::AbortHandle>,
+    /// 保留类型化错误供最终结果判定重试；事件载荷仍为原有诊断字符串。
+    failure: Option<anyhow::Error>,
 }
 
 /// 模型流式输出的事件。
@@ -112,6 +114,11 @@ pub struct ModelEventSender {
 impl ModelEventSender {
     /// 发送一个事件；积压超限时以一个明确的 Error 终止并取消网络任务，不静默丢正文。
     pub fn send(&self, event: ModelStreamEvent) {
+        self.send_with_failure(event, None);
+    }
+
+    /// 错误与终态在同一把锁内提交，避免并发生产者把重试属性绑定到另一条终态。
+    fn send_with_failure(&self, event: ModelStreamEvent, failure: Option<anyhow::Error>) {
         if self.tx.is_closed() {
             return;
         }
@@ -140,6 +147,7 @@ impl ModelEventSender {
             return;
         }
         budget.terminal = event.is_terminal();
+        budget.failure = failure;
         budget.events += 1;
         budget.bytes += bytes;
         let _ = self.tx.send((event, bytes));
@@ -150,7 +158,19 @@ impl ModelEventSender {
         self.send(ModelStreamEvent::Done { response });
     }
 
-    /// 发送终止事件 Error。
+    /// 发送保留错误类型链的终止事件，供 Agent 区分临时网络故障与永久失败。
+    ///
+    /// 观察者仍收到原有 `Error { message }`；`result()` 返回原错误，积压超限时仍优先报资源错误。
+    pub fn fail(&self, error: anyhow::Error) {
+        self.send_with_failure(
+            ModelStreamEvent::Error {
+                message: format!("{error:#}"),
+            },
+            Some(error),
+        );
+    }
+
+    /// 发送终止事件 Error；纯文本错误不自动视为临时故障。
     pub fn error(&self, message: impl Into<String>) {
         self.send(ModelStreamEvent::Error {
             message: message.into(),
@@ -273,7 +293,13 @@ impl ModelEventStream {
                 self.final_result = Some(Ok(response.clone()));
             }
             ModelStreamEvent::Error { message } => {
-                self.final_result = Some(Err(anyhow!("{message}")));
+                let failure = self
+                    .budget
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .failure
+                    .take();
+                self.final_result = Some(Err(failure.unwrap_or_else(|| anyhow!("{message}"))));
             }
             _ => {}
         }
@@ -289,9 +315,12 @@ impl ModelEventStream {
                 break;
             }
         }
-        self.final_result
-            .take()
-            .unwrap_or_else(|| Err(anyhow!("model stream ended without a terminal event")))
+        self.final_result.take().unwrap_or_else(|| {
+            Err(
+                super::TransientModelError::new("model stream ended without a terminal event")
+                    .into(),
+            )
+        })
     }
 }
 
@@ -395,6 +424,26 @@ mod tests {
 
         let response = stream.result().await.expect("终止事件应被缓存");
         assert_eq!(response.text_content(), "hi");
+    }
+
+    /// 类型化错误保留重试语义且不改变公开 JSON；后来的终态不能覆盖已提交错误。
+    #[tokio::test]
+    async fn typed_transient_stream_error_preserves_first_terminal_event() {
+        let (tx, mut stream) = ModelEventStream::channel();
+        tx.fail(super::super::TransientModelError::new("reset").into());
+        tx.error("late permanent error");
+        let event = stream.next().await.unwrap();
+        assert!(matches!(event, ModelStreamEvent::Error { message } if message == "reset"));
+        assert!(super::super::contract::is_retryable_model_error(
+            &stream.result().await.unwrap_err()
+        ));
+        let (tx, mut stream) = ModelEventStream::channel();
+        tx.error("permanent");
+        tx.fail(super::super::TransientModelError::new("late reset").into());
+        stream.next().await.unwrap();
+        assert!(!super::super::contract::is_retryable_model_error(
+            &stream.result().await.unwrap_err()
+        ));
     }
 
     /// Error 事件让 result() 返回错误。

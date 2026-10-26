@@ -24,7 +24,7 @@ pub(super) enum OpenAiStreamProtocol {
 /// 创建一个立即返回错误终止事件的模型流。
 pub(super) fn failed_model_stream(error: anyhow::Error) -> ModelEventStream {
     let (sender, stream) = ModelEventStream::channel();
-    sender.error(format!("{error:#}"));
+    sender.fail(error);
     stream
 }
 
@@ -65,7 +65,7 @@ pub(super) fn spawn_openai_stream(
 
         match result {
             Ok(response) => sender.done(response),
-            Err(error) => sender.error(format!("{error:#}")),
+            Err(error) => sender.fail(error),
         }
     });
     stream.with_request_task(request_task)
@@ -82,9 +82,12 @@ async fn require_successful_stream_response(
     let body = super::super::support::read_response_text(response, "OpenAI streaming", true)
         .await
         .unwrap_or_else(|_| "<unreadable body>".into());
-    Err(anyhow!(
-        "OpenAI streaming request failed with status {status}: {}",
-        super::super::support::response_body_preview(&body)
+    Err(super::super::support::http_status_error(
+        status,
+        format!(
+            "OpenAI streaming request failed with status {status}: {}",
+            super::super::support::response_body_preview(&body)
+        ),
     ))
 }
 
@@ -132,16 +135,10 @@ pub(super) fn finalize_responses_stream_state(
         return parse_responses_response(response);
     }
 
-    let mut output = Vec::new();
-    if !state.text.is_empty() {
-        output.push(json!({
-            "type": "message",
-            "role": "assistant",
-            "content": [{ "type": "output_text", "text": state.text }]
-        }));
-    }
-    output.extend(state.function_items.into_values());
-    parse_responses_response(json!({ "status": "completed", "output": output }))
+    Err(crate::model::TransientModelError::new(
+        "OpenAI Responses stream ended without response.completed event",
+    )
+    .into())
 }
 
 /// 解析一条 Responses API SSE data 事件并更新聚合状态。
@@ -248,22 +245,43 @@ pub(super) fn handle_responses_sse_data(
                 append_completed_responses_text(&event, &text, sender, state);
             }
         }
-        "response.completed" => {
+        "response.completed" | "response.incomplete" => {
+            // 输出长度到限等有终态的响应不是断线，不能重试同一请求来绕过模型上限。
             state.completed_response = event.get("response").cloned();
         }
         "error" | "response.failed" => {
-            let message = event
-                .pointer("/error/message")
-                .or_else(|| event.pointer("/response/error/message"))
-                .and_then(Value::as_str)
-                .unwrap_or("OpenAI Responses stream failed");
-            return Err(anyhow!(super::super::support::response_body_preview(
-                message
-            )));
+            let error = event
+                .get("error")
+                .or_else(|| event.pointer("/response/error"))
+                .unwrap_or(&event);
+            return Err(openai_stream_error(error, "OpenAI Responses stream failed"));
         }
         _ => {}
     }
     Ok(())
+}
+
+/// HTTP 已成功建流时，仍需按结构化错误码识别临时服务故障；自然语言正文不参与分类。
+fn openai_stream_error(error: &Value, fallback: &str) -> anyhow::Error {
+    let message = super::super::support::response_body_preview(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(fallback),
+    );
+    // 明确错误码优先于宽泛的 type，余额不足等永久错误不能被 server_error 类型掩盖。
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("type").and_then(Value::as_str));
+    if matches!(
+        code,
+        Some("server_error" | "internal_server_error" | "rate_limit_exceeded" | "overloaded_error")
+    ) {
+        crate::model::TransientModelError::new(message).into()
+    } else {
+        anyhow!(message)
+    }
 }
 
 /// 追加 Responses 正文并发送对应增量；空文本不会产生事件。
@@ -383,6 +401,13 @@ async fn consume_chat_completions_stream(
         handle_chat_completions_sse_data(data, sender, &mut state)
     })
     .await?;
+    // 没有 finish_reason 的 EOF 不代表完成，尤其不能执行仅收到一半的工具调用。
+    if state.finish_reason.is_none() {
+        return Err(crate::model::TransientModelError::new(
+            "OpenAI Chat Completions stream ended without finish_reason",
+        )
+        .into());
+    }
 
     let mut tool_values = Vec::new();
     for (index, tool) in state.tools.into_iter().enumerate() {
@@ -440,10 +465,11 @@ pub(super) fn handle_chat_completions_sse_data(
     }
     let event: Value =
         serde_json::from_str(data).context("failed to parse OpenAI Chat Completions SSE")?;
-    if let Some(message) = event.pointer("/error/message").and_then(Value::as_str) {
-        return Err(anyhow!(super::super::support::response_body_preview(
-            message
-        )));
+    if let Some(error) = event.get("error") {
+        return Err(openai_stream_error(
+            error,
+            "OpenAI Chat Completions stream failed",
+        ));
     }
     if let Some(usage) = event.get("usage").filter(|usage| !usage.is_null()) {
         state.usage = Some(usage.clone());

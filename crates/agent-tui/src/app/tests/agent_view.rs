@@ -123,6 +123,49 @@ fn open_member_view(app: &mut App, member: &str, target: &str) -> AgentId {
     target
 }
 
+/// 子 Agent 会话同样消费重连元数据，失败增量不应残留到成功回答。
+#[cfg(feature = "plugins")]
+#[test]
+fn agent_session_retry_discards_only_the_partial_answer() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx, "测试模型".into());
+    open_member_view(&mut app, "member-1", "3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+    let view = app.active_agent_session_view_mut().unwrap();
+    view.messages.clear();
+    view.messages.push(Msg::new(MsgKind::ToolOk, "完成的工具"));
+    view.apply_event(&AgentEvent::new(
+        "retry",
+        AgentEventKind::ModelTextDelta,
+        0,
+        json!({"delta":"失败文本"}),
+    ));
+    view.flush_pending_stream();
+    view.apply_event(&AgentEvent::new(
+        "retry",
+        AgentEventKind::ModelTextDelta,
+        0,
+        json!({"delta":"未揭示的失败文本"}),
+    ));
+    view.apply_event(&AgentEvent::new(
+        "retry",
+        AgentEventKind::ModelRequest,
+        0,
+        json!({"retry_attempt":1,"max_retries":5,"retry_interval_ms":2000}),
+    ));
+    assert!(!view.has_pending_stream());
+    view.apply_event(&AgentEvent::new(
+        "retry",
+        AgentEventKind::ModelTextDelta,
+        0,
+        json!({"delta":"恢复成功"}),
+    ));
+    view.flush_pending_stream();
+    assert_eq!(view.messages.len(), 3);
+    assert_eq!(view.messages[0].text, "完成的工具");
+    assert!(view.messages[1].text.contains("1/5"));
+    assert_eq!(view.messages[2].text, "恢复成功");
+}
+
 /// 原生会话视图沿用导航栈：Esc 返回主界面，重复打开只更新目标句柄。
 #[cfg(feature = "plugins")]
 #[test]

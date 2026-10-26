@@ -1196,6 +1196,81 @@ async fn extension_presentation_preserves_multiline_text() {
     }
 }
 
+/// 延迟消费时重连必须隔离失败批次，只清理未完成正文并显示次数和等待时间。
+#[tokio::test]
+async fn channel_event_sink_retry_keeps_completed_messages_and_replaces_partial_answer() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (sink, model_deltas, thinking_deltas, _) = ChannelEventSink::new(tx.clone());
+    let mut app = App::new(tx, "重连测试".into());
+    app.running = true;
+    app.messages.push(Msg::new(MsgKind::Assistant, "历史回答"));
+    app.messages.push(Msg::new(MsgKind::ToolOk, "已执行工具"));
+    let saved = app.session_record.clone();
+    for (kind, payload) in [
+        (AgentEventKind::ModelRequest, json!({})),
+        (
+            AgentEventKind::ModelTextDelta,
+            json!({"delta":"失败的正文"}),
+        ),
+        (
+            AgentEventKind::ModelThinkingDelta,
+            json!({"delta":"失败的思考"}),
+        ),
+        (
+            AgentEventKind::ModelRequest,
+            json!({"retry_attempt":1,"max_retries":5,"retry_interval_ms":2000}),
+        ),
+        (AgentEventKind::ModelTextDelta, json!({"delta":"成功正文"})),
+    ] {
+        sink.record(&AgentEvent::new("retry", kind, 0, payload))
+            .await
+            .unwrap();
+    }
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            UiEvent::ModelStarted => app.start_model_response(),
+            UiEvent::ModelTextReady => {
+                let text = model_deltas.lock().unwrap().take();
+                app.queue_model_delta(&text);
+                if text.contains("失败") {
+                    app.flush_pending_stream();
+                }
+            }
+            UiEvent::ModelThinkingReady => {
+                thinking_deltas.lock().unwrap().take();
+                app.mark_model_thinking();
+            }
+            UiEvent::ModelRetry {
+                attempt,
+                max_retries,
+                interval_ms,
+            } => {
+                assert_eq!((attempt, max_retries, interval_ms), (1, 5, 2000));
+                app.retry_model_response(attempt, max_retries, interval_ms);
+                assert!(!app.model_is_thinking);
+            }
+            _ => panic!("意外事件"),
+        }
+    }
+    app.flush_pending_stream();
+    let texts: Vec<_> = app
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect();
+    assert_eq!(texts.len(), 4);
+    assert_eq!(&texts[..2], &["历史回答", "已执行工具"]);
+    assert!(texts[2].contains("1/5") && texts[2].contains("2000 ms"));
+    assert_eq!(texts[3], "成功正文");
+    assert_eq!(
+        serde_json::to_value(saved).unwrap(),
+        serde_json::to_value(&app.session_record).unwrap()
+    );
+    app.running = false;
+    app.retry_model_response(2, 5, 2000);
+    assert_eq!(app.messages.len(), 4, "终态不接受滞后的重连事件");
+}
+
 /// 新请求的分类快照通过事件边界传递，缺少该字段的旧请求仍可启动显示。
 #[tokio::test]
 async fn channel_event_sink_accepts_context_snapshot_and_legacy_requests() {

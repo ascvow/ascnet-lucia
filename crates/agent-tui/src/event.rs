@@ -21,6 +21,12 @@ pub(crate) enum UiEvent {
     Input(Event),
     Tick,
     ModelStarted,
+    /// 同一轮模型请求正在重连；清除失败尝试的临时正文，保留已完成的工具与历史消息。
+    ModelRetry {
+        attempt: u64,
+        max_retries: u64,
+        interval_ms: u64,
+    },
     /// 共享文本缓冲区已有尚未渲染的模型增量。
     ModelTextReady,
     /// 共享推理摘要缓冲区已有尚未渲染的模型增量。

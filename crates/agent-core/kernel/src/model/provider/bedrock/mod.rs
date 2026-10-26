@@ -204,7 +204,7 @@ impl ProviderAdapter for BedrockConverseAdapter {
         tx.send(ModelStreamEvent::Start);
         match self.complete_once(req).await {
             Ok(response) => tx.done(response),
-            Err(error) => tx.error(format!("{error:#}")),
+            Err(error) => tx.fail(error),
         }
         stream
     }

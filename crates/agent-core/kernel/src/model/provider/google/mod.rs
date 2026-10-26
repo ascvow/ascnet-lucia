@@ -97,7 +97,7 @@ impl ProviderAdapter for GoogleGenerativeAdapter {
         tx.send(ModelStreamEvent::Start);
         match self.stream_once(req, &tx).await {
             Ok(response) => tx.done(response),
-            Err(error) => tx.error(format!("{error:#}")),
+            Err(error) => tx.fail(error),
         }
         stream
     }
@@ -121,10 +121,10 @@ impl GoogleGenerativeAdapter {
             let text = super::support::read_response_text(response, "Google Generative AI", true)
                 .await
                 .unwrap_or_else(|_| "<unreadable body>".to_string());
-            anyhow::bail!(
+            return Err(super::support::http_status_error(status, format!(
                 "Google Generative AI returned an error status (status: {status}, url: {url}, body preview: {})",
                 super::support::response_body_preview(&text)
-            );
+            )));
         }
 
         let mut text = String::new();
@@ -133,6 +133,7 @@ impl GoogleGenerativeAdapter {
         let mut finish: Option<FinishReason> = None;
         let mut usage: Option<TokenUsage> = None;
         let mut raw: Vec<Value> = Vec::new();
+        let mut blocked = false;
 
         let chunks = response
             .bytes_stream()
@@ -144,6 +145,23 @@ impl GoogleGenerativeAdapter {
             }
             let value =
                 serde_json::from_str::<Value>(payload).context("invalid Google SSE JSON")?;
+            if let Some(error) = value.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Google stream failed");
+                let message = super::support::response_body_preview(message);
+                if let Some(status) = error
+                    .get("code")
+                    .and_then(Value::as_u64)
+                    .and_then(|code| u16::try_from(code).ok())
+                    .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
+                {
+                    return Err(super::support::http_status_error(status, message));
+                }
+                anyhow::bail!(message);
+            }
+            blocked |= value.pointer("/promptFeedback/blockReason").is_some();
             if let Some(chunk_usage) = parse_usage(&value) {
                 usage = Some(chunk_usage);
             }
@@ -158,6 +176,16 @@ impl GoogleGenerativeAdapter {
         })
         .await?;
 
+        // EOF 不是成功终态；服务商明确拦截则报永久错误，避免重放安全拒绝。
+        if blocked {
+            anyhow::bail!("Google prompt was blocked by the provider");
+        }
+        if finish.is_none() {
+            return Err(crate::model::TransientModelError::new(
+                "Google stream ended without finishReason",
+            )
+            .into());
+        }
         let response = assemble_response(text, thinking, calls, finish, usage, raw);
         Ok(response)
     }

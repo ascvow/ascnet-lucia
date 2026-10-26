@@ -15,6 +15,8 @@ use agent_tool::{
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod retry;
+
 /// 记录收到的模型请求，供提示注入测试使用。
 struct CapturingModel {
     requests: std::sync::Mutex<Vec<ModelRequest>>,

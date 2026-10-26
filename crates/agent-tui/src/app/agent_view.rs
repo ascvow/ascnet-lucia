@@ -236,6 +236,42 @@ impl AgentSessionView {
 
     /// 应用事件；正文进入揭示缓冲，结构边界先补完正文，未知事件仍可前向兼容。
     pub(crate) fn apply_event(&mut self, event: &AgentEvent) {
+        // 续接同一模型轮次时，已展示的失败增量不能混入下一次成功回答。
+        if event.kind == AgentEventKind::ModelRequest {
+            if let Some(attempt) = event
+                .payload
+                .get("retry_attempt")
+                .and_then(Value::as_u64)
+                .filter(|attempt| *attempt > 0)
+            {
+                self.pending_stream.clear();
+                self.reveal_pacer.reset();
+                if let Some(index) = self.streaming_message.take() {
+                    if self
+                        .messages
+                        .get(index)
+                        .is_some_and(|message| matches!(message.kind, MsgKind::Assistant))
+                    {
+                        self.messages.remove(index);
+                    }
+                }
+                let max_retries = event
+                    .payload
+                    .get("max_retries")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(attempt);
+                let interval_ms = event
+                    .payload
+                    .get("retry_interval_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                self.messages.push(Msg::new(
+                    MsgKind::Info,
+                    format!("正在重连 {attempt}/{max_retries} · 等待 {interval_ms} ms"),
+                ));
+                return;
+            }
+        }
         if matches!(
             event.kind,
             AgentEventKind::ModelRequest

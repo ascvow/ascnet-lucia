@@ -176,6 +176,11 @@ impl AgentRootConfig {
         let mut agent = Agent::from_model_config(self.agent_model_config()?)?;
         let options = agent.options_mut();
         options.max_steps = self.agent.max_steps.unwrap_or(options.max_steps);
+        options.max_retries = self.agent.max_retries.unwrap_or(options.max_retries);
+        options.retry_interval_ms = self
+            .agent
+            .retry_interval_ms
+            .unwrap_or(options.retry_interval_ms);
         if let Some(system_prompt) = &self.agent.system_prompt {
             options.system_prompt = system_prompt.clone();
         }
@@ -197,6 +202,11 @@ impl AgentRootConfig {
         }
         options.max_tokens = self.agent.max_tokens.or(options.max_tokens);
         options.stream = self.agent.stream.unwrap_or(options.stream);
+        options.max_retries = self.agent.max_retries.unwrap_or(options.max_retries);
+        options.retry_interval_ms = self
+            .agent
+            .retry_interval_ms
+            .unwrap_or(options.retry_interval_ms);
         options.temperature = self.agent.temperature.or(options.temperature);
         options.reasoning = self.agent.reasoning.unwrap_or(options.reasoning);
         options.cache_retention = self
@@ -362,6 +372,12 @@ pub struct AgentConfig {
     pub max_tokens: Option<u32>,
     /// 是否使用模型流式接口；`None` 使用默认值 `true`。
     pub stream: Option<bool>,
+    /// 单次模型请求失败后的最大重试次数；`None` 默认 5，首次调用不计入，`0` 禁用。
+    #[serde(default)]
+    pub max_retries: Option<usize>,
+    /// 重试固定间隔毫秒数；`None` 默认 2000，`0` 立即重试，等待可被取消。
+    #[serde(default)]
+    pub retry_interval_ms: Option<u64>,
     /// 模型采样温度；Core 原样传递，合法范围由服务商适配器校验。
     pub temperature: Option<f32>,
     /// 模型推理强度；`None` 保持默认关闭，由应用层能力元数据决定是否补全。
@@ -384,6 +400,39 @@ mod tests {
         let config: AgentRootConfig = serde_json::from_str(text)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// 旧配置沿用重试默认值，加法字段分别覆盖；显式零值不能被当作缺省。
+    #[test]
+    fn agent_retry_defaults_are_backward_compatible_and_overridable() {
+        use serde_json::json;
+        let config =
+            parse(r#"{"model":{"provider":"open-ai","model":"test","api_key":"test"}}"#).unwrap();
+        let defaults = config.agent_options();
+        assert_eq!(
+            (defaults.max_retries, defaults.retry_interval_ms),
+            (5, 2000)
+        );
+        for (agent, expected) in [
+            (json!({}), (5, 2000)),
+            (json!({"max_retries": 2}), (2, 2000)),
+            (json!({"retry_interval_ms": 3500}), (5, 3500)),
+            (json!({"max_retries": 0, "retry_interval_ms": 0}), (0, 0)),
+        ] {
+            let mut value = serde_json::to_value(&config).unwrap();
+            value["agent"] = agent;
+            let configured: AgentRootConfig = serde_json::from_value(value).unwrap();
+            let options = configured.agent_options();
+            assert_eq!((options.max_retries, options.retry_interval_ms), expected);
+            #[cfg(feature = "openai")]
+            {
+                let agent = configured.build_agent().unwrap();
+                let options = agent.options();
+                assert_eq!((options.max_retries, options.retry_interval_ms), expected);
+            }
+        }
+        assert!(serde_json::from_value::<AgentConfig>(json!({"max_retries": -1})).is_err());
+        assert!(serde_json::from_value::<AgentConfig>(json!({"retry_interval_ms": -1})).is_err());
     }
 
     /// 单 `model` 对象必须保持向后兼容，默认上游取该对象。

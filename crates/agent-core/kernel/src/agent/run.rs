@@ -691,166 +691,237 @@ impl Agent {
                 provider_options: self.options.provider_options.clone(),
             };
 
-            if let Some(gate) = &self.model_request_gate {
-                gate.before_request(&req)
-                    .context("模型请求在 provider 调用前被可信门禁拒绝")?;
-            }
-            // 预留成功后才创建结算守卫：失败路径没有预留，不能结算。
-            let mut request_settlement = self.model_request_gate.as_ref().map(|gate| {
-                ModelRequestSettlement::new(
-                    Arc::clone(gate),
-                    req.max_tokens
-                        .filter(|limit| *limit > 0)
-                        .map_or(0, |limit| limit as usize),
-                )
-            });
-
-            self.update_state(|state| state.phase = AgentPhase::RequestingModel);
-
-            self.emit(
-                &run_id,
-                AgentEventKind::ModelRequest,
-                step,
-                json!({
-                    "provider": &route.provider,
-                    "model": &route.model,
-                    "message_count": req.messages.len(),
-                    "tool_count": req.tools.len(),
-                    "context": request_context_snapshot(&req),
-                }),
-            )
-            .await?;
-
-            // 模型请求准入：监听者可以在请求发往 provider 前结束运行。
-            let model_request = self
-                .dispatch_cancellable(ModelRequestEvent::new(&run_id, step, &route.provider, &req))
-                .await;
-            if model_request.is_cancelled() {
-                tracing::info!(
-                    target: "agent_core::bus",
-                    run_id = %run_id,
-                    step,
-                    canceller = model_request.canceller().unwrap_or_default(),
-                    "模型请求被监听者取消"
-                );
-                return self
-                    .finish_cancelled(&run_id, step, step, total_usage, session)
-                    .await;
-            }
-
-            let mut model_stream = {
-                // 建连 future 只构造一次并固定下来：取消通知重试时复用同一个 future，
-                // 请求本身随之移入，不必为了重试而克隆整份请求。
-                let connect_provider = route.provider.clone();
-                let mut connect: std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Result<ModelConnect>> + Send + '_>,
-                > = if self.options.stream {
-                    Box::pin(async move {
-                        self.gateway
-                            .stream(&connect_provider, req)
-                            .await
-                            .map(ModelConnect::Stream)
-                    })
-                } else {
-                    Box::pin(async move {
-                        self.gateway
-                            .complete(&connect_provider, req)
-                            .await
-                            .map(ModelConnect::Complete)
-                    })
-                };
-                // 把通知 future 限定在建连阶段，成功后立即注销等待者，不能窃取后续取消通知。
-                loop {
-                    let cancel_notified = self.cancel_notify.notified();
-                    tokio::pin!(cancel_notified);
-                    tokio::select! {
-                        result = &mut connect => {
-                            match result? {
-                                ModelConnect::Stream(stream) => {
-                                    self.update_state(|state| state.phase = AgentPhase::StreamingModel);
-                                    break stream;
-                                }
-                                ModelConnect::Complete(response) => {
-                                    let (sender, stream) = crate::model::ModelEventStream::channel();
-                                    sender.done(response);
-                                    break stream;
-                                }
-                            }
-                        }
-                        _ = &mut cancel_notified => {
-                            if self.take_cancelled() {
-                                return self.finish_cancelled(
-                                    &run_id, step, step + 1, total_usage, session,
-                                ).await;
-                            }
-                        }
-                    }
-                }
-            };
-            // 已生成文本只在状态里保留一份：取消发生在流中途时从状态取出写进会话，
-            // 避免每个 token 都往两个 String 各追加一次。
-            loop {
-                // 先建立通知监听再读取原子标记，避免取消落在检查与等待之间。
-                let cancel_notified = self.cancel_notify.notified();
-                tokio::pin!(cancel_notified);
+            // 重试只包围当前模型请求，不重新加载上下文或执行已完成的工具。
+            let mut retries = 0;
+            let mut response = loop {
                 if self.take_cancelled() {
-                    drop(model_stream);
-                    self.update_state(|state| {
-                        let streamed_text = std::mem::take(&mut state.streamed_text);
-                        if !streamed_text.is_empty() {
-                            let previous_len = session.messages().len();
-                            session.push_assistant_blocks(vec![crate::model::ContentBlock::Text {
-                                text: streamed_text,
-                            }]);
-                            append_session_snapshot(&mut state.session, &session, previous_len);
-                        }
-                    });
                     return self
-                        .finish_cancelled(&run_id, step, step + 1, total_usage, session)
+                        .finish_cancelled(&run_id, step, step, total_usage, session)
                         .await;
                 }
-                let event = tokio::select! {
-                    event = model_stream.next() => event,
-                    _ = &mut cancel_notified => continue,
-                };
-                let Some(event) = event else {
-                    break;
-                };
-                match event {
-                    ModelStreamEvent::TextDelta { index, delta } => {
-                        self.update_state(|state| state.streamed_text.push_str(&delta));
-                        self.emit(
-                            &run_id,
-                            AgentEventKind::ModelTextDelta,
-                            step,
-                            json!({ "index": index, "delta": delta }),
-                        )
-                        .await?;
+                self.update_state(|state| state.phase = AgentPhase::RequestingModel);
+
+                self.emit(
+                    &run_id,
+                    AgentEventKind::ModelRequest,
+                    step,
+                    json!({
+                        "provider": &route.provider,
+                        "model": &route.model,
+                        "message_count": req.messages.len(),
+                        "tool_count": req.tools.len(),
+                        "context": request_context_snapshot(&req),
+                        "retry_attempt": retries,
+                        "max_retries": self.options.max_retries,
+                        "retry_interval_ms": if retries > 0 { self.options.retry_interval_ms } else { 0 },
+                    }),
+                )
+                .await?;
+
+                if retries > 0 {
+                    // 固定等待只在物理重试前发生；取消通知不重新开始计时，也不发出新请求。
+                    let wait = tokio::time::sleep(std::time::Duration::from_millis(
+                        self.options.retry_interval_ms,
+                    ));
+                    tokio::pin!(wait);
+                    loop {
+                        let notified = self.cancel_notify.notified();
+                        tokio::pin!(notified);
+                        if self.take_cancelled() {
+                            return self
+                                .finish_cancelled(&run_id, step, step + 1, total_usage, session)
+                                .await;
+                        }
+                        tokio::select! {
+                            _ = &mut wait => break,
+                            _ = &mut notified => {}
+                        }
                     }
-                    ModelStreamEvent::ThinkingDelta { index, delta } => {
-                        self.update_state(|state| state.thinking_text.push_str(&delta));
-                        self.emit(
-                            &run_id,
-                            AgentEventKind::ModelThinkingDelta,
-                            step,
-                            json!({ "index": index, "delta": delta }),
-                        )
-                        .await?;
-                    }
-                    event if event.is_terminal() => break,
-                    _ => {}
                 }
-            }
-            let mut response = model_stream.result().await?;
-            // 立刻按实际输出用量结算预留；后续提前返回路径已由守卫兜底退还。
-            if let Some(settlement) = request_settlement.as_mut() {
-                settlement.settle(
-                    response
-                        .usage
-                        .as_ref()
-                        .and_then(|usage| usage.output_tokens),
-                );
-            }
+                // 模型请求准入：每次实际尝试都可由监听者阻止，不重试监听者或可信门禁的拒绝。
+                let model_request = self
+                    .dispatch_cancellable(ModelRequestEvent::new(
+                        &run_id,
+                        step,
+                        &route.provider,
+                        &req,
+                    ))
+                    .await;
+                if model_request.is_cancelled() {
+                    tracing::info!(
+                        target: "agent_core::bus",
+                        run_id = %run_id,
+                        step,
+                        canceller = model_request.canceller().unwrap_or_default(),
+                        "模型请求被监听者取消"
+                    );
+                    return self
+                        .finish_cancelled(&run_id, step, step, total_usage, session)
+                        .await;
+                }
+                if self.take_cancelled() {
+                    return self
+                        .finish_cancelled(&run_id, step, step, total_usage, session)
+                        .await;
+                }
+                // 等待结束后才做可信准入与预留，取消重连等待不能提前消耗下一次请求配额。
+                if let Some(gate) = &self.model_request_gate {
+                    gate.before_request(&req)
+                        .context("模型请求在 provider 调用前被可信门禁拒绝")?;
+                }
+                // 每个实际尝试独立结算；失败与取消均由守卫退还未知输出预留。
+                let mut request_settlement = self.model_request_gate.as_ref().map(|gate| {
+                    ModelRequestSettlement::new(
+                        Arc::clone(gate),
+                        req.max_tokens
+                            .filter(|limit| *limit > 0)
+                            .map_or(0, |limit| limit as usize),
+                    )
+                });
+                let connected = {
+                    // 每次实际重试才新建请求 future；仅被通知唤醒时继续轮询原 future。
+                    let connect_provider = route.provider.clone();
+                    let attempt_request = req.clone();
+                    let mut connect: std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<ModelConnect>> + Send + '_>,
+                    > = if self.options.stream {
+                        Box::pin(async move {
+                            self.gateway
+                                .stream(&connect_provider, attempt_request)
+                                .await
+                                .map(ModelConnect::Stream)
+                        })
+                    } else {
+                        Box::pin(async move {
+                            self.gateway
+                                .complete(&connect_provider, attempt_request)
+                                .await
+                                .map(ModelConnect::Complete)
+                        })
+                    };
+                    // 把通知 future 限定在建连阶段，成功后立即注销等待者，不能窃取后续取消通知。
+                    loop {
+                        let cancel_notified = self.cancel_notify.notified();
+                        tokio::pin!(cancel_notified);
+                        if self.take_cancelled() {
+                            return self
+                                .finish_cancelled(&run_id, step, step + 1, total_usage, session)
+                                .await;
+                        }
+                        tokio::select! {
+                            result = &mut connect => break result,
+                            _ = &mut cancel_notified => {
+                                if self.take_cancelled() {
+                                    return self.finish_cancelled(
+                                        &run_id, step, step + 1, total_usage, session,
+                                    ).await;
+                                }
+                            }
+                        }
+                    }
+                };
+                // 建连失败与流中失败统一收敛，保留类型链给本次请求的重试判断。
+                let mut model_stream = match connected {
+                    Ok(ModelConnect::Stream(stream)) => {
+                        self.update_state(|state| state.phase = AgentPhase::StreamingModel);
+                        stream
+                    }
+                    Ok(ModelConnect::Complete(response)) => {
+                        let (sender, stream) = crate::model::ModelEventStream::channel();
+                        sender.done(response);
+                        stream
+                    }
+                    Err(error) => {
+                        let (sender, stream) = crate::model::ModelEventStream::channel();
+                        sender.fail(error);
+                        stream
+                    }
+                };
+                // 已生成文本只在状态里保留一份：取消发生在流中途时从状态取出写进会话，
+                // 避免每个 token 都往两个 String 各追加一次。
+                loop {
+                    // 先建立通知监听再读取原子标记，避免取消落在检查与等待之间。
+                    let cancel_notified = self.cancel_notify.notified();
+                    tokio::pin!(cancel_notified);
+                    if self.take_cancelled() {
+                        drop(model_stream);
+                        self.update_state(|state| {
+                            let streamed_text = std::mem::take(&mut state.streamed_text);
+                            if !streamed_text.is_empty() {
+                                let previous_len = session.messages().len();
+                                session.push_assistant_blocks(vec![
+                                    crate::model::ContentBlock::Text {
+                                        text: streamed_text,
+                                    },
+                                ]);
+                                append_session_snapshot(&mut state.session, &session, previous_len);
+                            }
+                        });
+                        return self
+                            .finish_cancelled(&run_id, step, step + 1, total_usage, session)
+                            .await;
+                    }
+                    let event = tokio::select! {
+                        event = model_stream.next() => event,
+                        _ = &mut cancel_notified => continue,
+                    };
+                    let Some(event) = event else {
+                        break;
+                    };
+                    match event {
+                        ModelStreamEvent::TextDelta { index, delta } => {
+                            self.update_state(|state| state.streamed_text.push_str(&delta));
+                            self.emit(
+                                &run_id,
+                                AgentEventKind::ModelTextDelta,
+                                step,
+                                json!({ "index": index, "delta": delta }),
+                            )
+                            .await?;
+                        }
+                        ModelStreamEvent::ThinkingDelta { index, delta } => {
+                            self.update_state(|state| state.thinking_text.push_str(&delta));
+                            self.emit(
+                                &run_id,
+                                AgentEventKind::ModelThinkingDelta,
+                                step,
+                                json!({ "index": index, "delta": delta }),
+                            )
+                            .await?;
+                        }
+                        event if event.is_terminal() => break,
+                        _ => {}
+                    }
+                }
+                let response = match model_stream.result().await {
+                    Ok(response) => response,
+                    Err(error)
+                        if retries < self.options.max_retries
+                            && crate::model::contract::is_retryable_model_error(&error) =>
+                    {
+                        retries += 1;
+                        self.update_state(|state| {
+                            state.streamed_text.clear();
+                            state.thinking_text.clear();
+                        });
+                        // 结算守卫在离开本轮时退还未知输出预留；下轮重新消耗请求配额并准入。
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error.context(format!("模型请求失败（已重试 {retries} 次）")))
+                    }
+                };
+                // 立刻按实际输出用量结算预留；后续提前返回路径已由守卫兜底退还。
+                if let Some(settlement) = request_settlement.as_mut() {
+                    settlement.settle(
+                        response
+                            .usage
+                            .as_ref()
+                            .and_then(|usage| usage.output_tokens),
+                    );
+                }
+                break response;
+            };
             clear_untrusted_tool_call_bindings(&mut response);
             let response_text = response.text_content();
             let tool_calls = response.tool_calls.clone();

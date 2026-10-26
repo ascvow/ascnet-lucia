@@ -139,6 +139,15 @@ where
     Ok(())
 }
 
+/// 将 HTTP 状态分类为临时服务错误，保留诊断摘要但不从响应正文推断重试资格。
+pub(super) fn http_status_error(status: reqwest::StatusCode, message: String) -> anyhow::Error {
+    if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+        crate::model::TransientModelError::new(message).into()
+    } else {
+        anyhow!(message)
+    }
+}
+
 /// 解码 HTTP JSON 响应，并在 HTTP 或 JSON 错误时保留可诊断的响应摘要。
 ///
 /// `protocol` 参数用于错误信息中标识请求来源（如 "OpenAI Responses"、"Anthropic Messages"）。
@@ -154,13 +163,20 @@ pub(super) async fn decode_json_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("<missing>")
         .to_string();
-    let body = read_response_text(response, protocol, !status.is_success()).await?;
+    let body = if status.is_success() {
+        read_response_text(response, protocol, false).await?
+    } else {
+        // 状态码已确定失败性质，错误正文读取失败不能把鉴权错误变成可重试网络错误。
+        read_response_text(response, protocol, true)
+            .await
+            .unwrap_or_else(|_| "<unreadable body>".into())
+    };
 
     if !status.is_success() {
-        return Err(anyhow!(
+        return Err(http_status_error(status, format!(
             "{protocol} returned an error status (status: {status}, url: {url}, content-type: {content_type}, body preview: {})",
             response_body_preview(&body)
-        ));
+        )));
     }
 
     // 部分网关无视 `stream: false` 强制返回 SSE；从事件流中提取最终响应对象。

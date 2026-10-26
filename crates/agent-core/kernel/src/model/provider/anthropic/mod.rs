@@ -132,7 +132,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         tx.send(ModelStreamEvent::Start);
         match self.complete_with_route(logical_provider, req).await {
             Ok(response) => tx.done(response),
-            Err(error) => tx.error(format!("{error:#}")),
+            Err(error) => tx.fail(error),
         }
         stream
     }

@@ -179,7 +179,28 @@ impl EventSink for ChannelEventSink {
                 {
                     let _ = self.tx.send(UiEvent::ContextSnapshot(snapshot));
                 }
-                let _ = self.tx.send(UiEvent::ModelStarted);
+                if let Some(attempt) = event
+                    .payload
+                    .get("retry_attempt")
+                    .and_then(Value::as_u64)
+                    .filter(|attempt| *attempt > 0)
+                {
+                    let _ = self.tx.send(UiEvent::ModelRetry {
+                        attempt,
+                        max_retries: event
+                            .payload
+                            .get("max_retries")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(attempt),
+                        interval_ms: event
+                            .payload
+                            .get("retry_interval_ms")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    });
+                } else {
+                    let _ = self.tx.send(UiEvent::ModelStarted);
+                }
             }
             AgentEventKind::ModelResponse => {
                 // 完整分项一并上送：底栏按输入合计显示上下文规模，缓存读写用于累计命中率。

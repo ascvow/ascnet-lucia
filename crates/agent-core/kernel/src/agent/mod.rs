@@ -129,6 +129,12 @@ pub struct AgentOptions {
     /// 是否使用模型流式接口；关闭后等待完整响应再继续处理。
     pub stream: bool,
 
+    /// 单次模型请求失败后最多重试次数；默认 5，`0` 禁用，首次调用不计入重试。
+    pub max_retries: usize,
+
+    /// 重试之间的固定等待毫秒数；默认 2000，`0` 表示立即重试，等待可被取消。
+    pub retry_interval_ms: u64,
+
     /// Sampling temperature.
     /// 采样温度。
     pub temperature: Option<f32>,
@@ -160,6 +166,8 @@ impl Default for AgentOptions {
             tool_choice: ToolChoice::Auto,
             max_tokens: None,
             stream: true,
+            max_retries: 5,
+            retry_interval_ms: 2_000,
             temperature: None,
             reasoning: ReasoningLevel::Off,
             cache_retention: PromptCacheRetention::Short,

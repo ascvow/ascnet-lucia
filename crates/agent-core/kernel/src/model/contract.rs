@@ -5,6 +5,61 @@ use super::{ModelRequest, ModelResponse};
 use anyhow::Result;
 use async_trait::async_trait;
 
+/// 模型服务的临时故障；适配器可用此错误明确允许 Agent 重试当前请求。
+///
+/// 不用于鉴权、请求校验、权限或资源门禁拒绝。消息仅用于诊断，重试判断不解析其文本。
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct TransientModelError {
+    message: String,
+}
+
+impl TransientModelError {
+    /// 创建可重试故障，不发起请求或执行等待；实际次数与间隔由 Agent 运行配置决定。
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// 只识别类型化的临时故障，不从远程正文猜测重试条件，避免鉴权或本地错误被盲目重放。
+pub(crate) fn is_retryable_model_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if cause.is::<TransientModelError>() {
+            return true;
+        }
+        if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+            return matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        #[cfg(any(
+            feature = "openai",
+            feature = "anthropic",
+            feature = "google",
+            feature = "bedrock"
+        ))]
+        if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
+            return error.is_timeout()
+                || error.is_connect()
+                || error.is_body()
+                || error.status().is_some_and(|status| {
+                    status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error()
+                });
+        }
+        false
+    })
+}
+
 /// The minimal interface the ReAct loop needs.
 /// ReAct loop 需要的最小模型接口。
 #[async_trait]
@@ -22,7 +77,7 @@ pub trait ChatModel: Send + Sync {
         tx.send(ModelStreamEvent::Start);
         match self.complete(req).await {
             Ok(response) => tx.done(response),
-            Err(err) => tx.error(format!("{err:#}")),
+            Err(err) => tx.fail(err),
         }
         stream
     }

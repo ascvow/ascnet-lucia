@@ -9,7 +9,7 @@ pub mod types;
 
 #[doc(hidden)]
 pub use contract as adapter;
-pub use contract::{ChatModel, ProviderAdapter};
+pub use contract::{ChatModel, ProviderAdapter, TransientModelError};
 pub use gateway::{
     ModelGateway, ModelProviderConfig, OpenAiProtocol, ProviderAdapterFactory, ProviderKind,
 };

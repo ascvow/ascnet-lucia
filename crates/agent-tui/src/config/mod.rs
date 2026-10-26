@@ -35,7 +35,9 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"{
   },
   "agent": {
     "max_steps": 0,
-    "stream": true
+    "stream": true,
+    "max_retries": 5,
+    "retry_interval_ms": 2000
   },
   "tui": {
     "sessions_dir": "projects",
@@ -368,6 +370,12 @@ mod tests {
         assert_eq!(default_model.api_key.as_deref(), Some(""));
         assert!(default_model.api_key_env.is_none());
         assert_eq!(model_config.agent.max_steps, Some(0));
+        let defaults = agent_core::AgentOptions::default();
+        assert_eq!(model_config.agent.max_retries, Some(defaults.max_retries));
+        assert_eq!(
+            model_config.agent.retry_interval_ms,
+            Some(defaults.retry_interval_ms)
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

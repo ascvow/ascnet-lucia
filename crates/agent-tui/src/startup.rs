@@ -1295,6 +1295,13 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                 app.apply_agent_view_closed(&plugin_id, &instance_id, &target)
                     .await;
             }
+            Some(UiEvent::ModelRetry {
+                attempt,
+                max_retries,
+                interval_ms,
+            }) => {
+                app.retry_model_response(attempt, max_retries, interval_ms);
+            }
             Some(UiEvent::ModelStarted) => {
                 if app.accepts_run_stream_output() {
                     app.start_model_response();

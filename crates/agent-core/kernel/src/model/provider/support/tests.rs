@@ -2,6 +2,57 @@
 
 use super::*;
 
+#[test]
+fn http_retry_classification_does_not_retry_auth_or_bad_requests() {
+    use crate::model::contract::is_retryable_model_error;
+    for status in [408, 429, 500, 502, 503, 504, 529] {
+        let error = http_status_error(
+            reqwest::StatusCode::from_u16(status).unwrap(),
+            "temporary".into(),
+        )
+        .context("outer context");
+        assert!(is_retryable_model_error(&error), "{status}");
+    }
+    for status in [400, 401, 403, 404, 409, 413, 422] {
+        assert!(
+            !is_retryable_model_error(&http_status_error(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                "permanent".into()
+            )),
+            "{status}"
+        );
+    }
+    assert!(!is_retryable_model_error(&anyhow!(
+        "connection timeout text alone is not a retry signal"
+    )));
+}
+
+/// 状态码已经确定时，损坏的错误正文不改变鉴权失败与临时服务错误的类别。
+#[tokio::test]
+async fn malformed_error_bodies_preserve_http_retry_classification() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for (status, retryable) in [(401, false), (503, true)] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 4096]).await.unwrap();
+            socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx").as_bytes()).await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let error = decode_json_response(response, "test").await.unwrap_err();
+        assert_eq!(
+            crate::model::contract::is_retryable_model_error(&error),
+            retryable
+        );
+        server.await.unwrap();
+    }
+}
+
 /// 实际 chunk 限制包含没有 Content-Length 的响应，错误预览不读取尾部。
 #[tokio::test]
 async fn bounded_body_rejects_overflow_and_stops_preview() {
