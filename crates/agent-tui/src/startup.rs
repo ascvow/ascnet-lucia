@@ -41,6 +41,7 @@ use crate::ui::plugin_bridge::{
     refresh_plugin_view, refresh_plugin_views_for,
 };
 use crate::ui::root::render_root;
+use crate::usage_ledger::UsageLedger;
 use agent_context::{NativeContextLoader, DEFAULT_MAX_SUMMARY_TOKENS};
 use agent_core::config::AgentRootConfig;
 use agent_core::event::{
@@ -641,9 +642,15 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let probe = StreamProbe::from_env();
     let (ui_sink, model_deltas, thinking_deltas, tool_deltas) = ChannelEventSink::new(tx.clone());
     let ui_sink = ui_sink.with_probe(probe.clone());
+    // 用量台账只挂在主 Agent 出口上：队员沿用诊断出口，不进入台账。
+    let usage_ledger = Arc::new(UsageLedger::new(
+        workspace.usage_dir(&sessions_root),
+        tx.clone(),
+    ));
     let mut sink = CompositeEventSink::new();
     sink.push(Arc::new(ui_sink));
     sink.push(Arc::clone(&diagnostic_events));
+    sink.push(Arc::clone(&usage_ledger) as Arc<dyn EventSink>);
     let application_events: Arc<dyn EventSink> = Arc::new(sink);
     // 会话标题复用主 Agent 的模型路由；demo 脚本模型没有语义，起名只会得到固定噪声。
     let title_generator = if demo_mode {
@@ -783,7 +790,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         .with_context_window(context_window)
         .with_reasoning_levels(reasoning_levels, reasoning_level)
         .with_persistent_session(Arc::clone(&session_store), session_record)
-        .with_native_context_loader(native_context_loader);
+        .with_native_context_loader(native_context_loader)
+        .with_usage_ledger(usage_ledger);
     // /model 面板的上游列表来自配置文件；demo 模式没有配置，保持为空。
     if let Some(config) = configured_agent.as_ref() {
         app.model_upstreams = config.upstreams().into_iter().cloned().collect();
@@ -1470,6 +1478,12 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Some(UiEvent::ContextSnapshot(snapshot)) => {
                 app.context_snapshot = Some(snapshot);
                 app.context_tokens = None;
+            }
+            Some(UiEvent::UsageLedgerFailed(error)) => {
+                app.messages.push(Msg::new(
+                    MsgKind::Error,
+                    format!("用量台账写入失败，本次启动期间不再记录：{error}"),
+                ));
             }
             Some(UiEvent::SessionTitleReady { session_id, result }) => {
                 app.handle_session_title(session_id, result);

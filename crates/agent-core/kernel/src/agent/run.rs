@@ -100,6 +100,74 @@ fn request_context_snapshot(req: &ModelRequest) -> Value {
         "messages": req.messages.len(), "tools": req.tools.len()})
 }
 
+/// FNV-1a 64 位哈希写入器，只用于判断相邻请求的前缀是否逐字节一致，不承担安全用途。
+///
+/// 不用标准库 `DefaultHasher`：它不保证跨 Rust 版本稳定，而应用层会跨进程比较指纹。
+struct PrefixDigest(u64);
+
+impl PrefixDigest {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+}
+
+impl std::io::Write for PrefixDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(Self::PRIME);
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 返回值序列化字节的 16 位十六进制指纹。
+fn prefix_digest(value: &impl Serialize) -> String {
+    let mut digest = PrefixDigest(PrefixDigest::OFFSET_BASIS);
+    // 被哈希的都是 Core 自有的可序列化类型，写入器本身不会失败。
+    let _ = serde_json::to_writer(&mut digest, value);
+    format!("{:016x}", digest.0)
+}
+
+/// 为实际模型请求生成不含正文的前缀指纹，供应用层定位相邻请求从哪里开始变化。
+///
+/// `settings` 覆盖会改变服务商缓存分区或渲染前缀的请求参数；`messages` 与 `roles`
+/// 按发送顺序逐条对应，角色用单字符编码（s/d/u/a/t）以控制事件体积。
+fn request_digests(req: &ModelRequest) -> Value {
+    use crate::model::MessageRole;
+    let tools = req
+        .tools
+        .iter()
+        .map(|tool| (&tool.name, &tool.description, &tool.input_schema))
+        .collect::<Vec<_>>();
+    let roles = req
+        .messages
+        .iter()
+        .map(|message| match message.role {
+            MessageRole::System => 's',
+            MessageRole::Developer => 'd',
+            MessageRole::User => 'u',
+            MessageRole::Assistant => 'a',
+            MessageRole::Tool => 't',
+        })
+        .collect::<String>();
+    json!({
+        "settings": prefix_digest(&(
+            &req.model,
+            &req.tool_choice,
+            &req.reasoning,
+            &req.cache_retention,
+            &req.session_id,
+            &req.provider_options,
+        )),
+        "system": prefix_digest(&req.system),
+        "tools": prefix_digest(&tools),
+        "messages": req.messages.iter().map(prefix_digest).collect::<Vec<_>>(),
+        "roles": roles,
+    })
+}
+
 /// 模型只返回思考摘要时使用的一次性纠偏提示；该提示只参与下一次请求，不写入会话。
 const EMPTY_RESPONSE_RECOVERY_PROMPT: &str = r#"<response_recovery>
   <observation>The previous response contained no visible answer or tool call.</observation>
@@ -690,6 +758,8 @@ impl Agent {
                 session_id: self.session_id(),
                 provider_options: self.options.provider_options.clone(),
             };
+            // 指纹只取决于请求本身，重试复用同一份。
+            let digests = request_digests(&req);
 
             // 重试只包围当前模型请求，不重新加载上下文或执行已完成的工具。
             let mut retries = 0;
@@ -711,6 +781,7 @@ impl Agent {
                         "message_count": req.messages.len(),
                         "tool_count": req.tools.len(),
                         "context": request_context_snapshot(&req),
+                        "digests": &digests,
                         "retry_attempt": retries,
                         "max_retries": self.options.max_retries,
                         "retry_interval_ms": if retries > 0 { self.options.retry_interval_ms } else { 0 },
@@ -1969,6 +2040,32 @@ mod one_time_guidance_tests {
         assert_eq!(snapshot["attachments"], 1);
         assert_eq!(snapshot["messages"], 2);
         assert!(!snapshot.to_string().contains("sensitive-base64"));
+    }
+
+    /// 前缀指纹不含正文、对同一请求稳定，且只有被改写的那条消息指纹发生变化。
+    #[test]
+    fn request_digests_locate_changed_message_without_content() {
+        use crate::model::{MessageRole, ModelMessage, ModelRequest};
+        let mut req = ModelRequest::new(
+            "test",
+            vec![
+                ModelMessage::text(MessageRole::Developer, "sensitive-plugin-prompt"),
+                ModelMessage::text(MessageRole::User, "sensitive-user-text"),
+            ],
+        );
+        req.system = Some("sensitive-system".into());
+        let before = super::request_digests(&req);
+        assert_eq!(before, super::request_digests(&req));
+        assert_eq!(before["roles"], "du");
+        assert!(!before.to_string().contains("sensitive"));
+
+        req.messages[1] = ModelMessage::text(MessageRole::User, "changed");
+        let after = super::request_digests(&req);
+        assert_eq!(before["messages"][0], after["messages"][0]);
+        assert_ne!(before["messages"][1], after["messages"][1]);
+        assert_eq!(before["system"], after["system"]);
+        assert_eq!(before["settings"], after["settings"]);
+        assert_eq!(before["tools"], after["tools"]);
     }
 
     /// 直接计数与原先 JSON 文本化估算一致，包括 Unicode、转义和数值。

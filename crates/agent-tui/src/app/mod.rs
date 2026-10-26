@@ -211,6 +211,8 @@ pub(crate) struct App {
     pub(crate) context_loader: Arc<dyn ContextLoader>,
     /// 共享原生加载器的控制句柄，用于同步热切换后的模型路由与上下文窗口。
     pub(crate) native_context_loader: Option<Arc<NativeContextLoader>>,
+    /// 主会话的用量台账；运行或上下文重载开始前同步当前会话。
+    pub(crate) usage_ledger: Option<Arc<crate::usage_ledger::UsageLedger>>,
     /// TUI 人工插件控制面；只在插件构建中存在。
     #[cfg(feature = "plugins")]
     pub(crate) plugin_management: Option<Arc<PluginManagementService>>,
@@ -615,6 +617,7 @@ impl App {
             pending_session_title: None,
             context_loader: Arc::new(agent_core::PassthroughContextLoader),
             native_context_loader: None,
+            usage_ledger: None,
             #[cfg(feature = "plugins")]
             plugin_management: None,
             tx,
@@ -824,6 +827,15 @@ impl App {
     ) -> Self {
         self.context_loader = context_loader.clone();
         self.native_context_loader = Some(context_loader);
+        self
+    }
+
+    /// 注入主会话的用量台账；同一个实例已挂在主 Agent 的事件出口上。
+    pub(crate) fn with_usage_ledger(
+        mut self,
+        usage_ledger: Arc<crate::usage_ledger::UsageLedger>,
+    ) -> Self {
+        self.usage_ledger = Some(usage_ledger);
         self
     }
 

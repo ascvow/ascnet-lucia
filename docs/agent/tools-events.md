@@ -77,3 +77,5 @@ agent.set_event_sink(Arc::new(sinks));
 ```
 
 `AgentEventKind::Extension` 的 payload 由扩展定义。Plugin Host 会为 WASM 插件事件注入可信 `source`。
+
+`AgentEventKind::ModelRequest` 的 payload 除路由、`context` 分类估算与重试序号外，还包含 `digests`：`settings`（模型、工具选择、推理、缓存保留、会话 ID 与 `provider_options`）、`system`、`tools` 各一个指纹，`messages` 按发送顺序逐条给出消息指纹，`roles` 用 `s/d/u/a/t` 逐字符标注对应角色。指纹是序列化字节的 FNV-1a 64 位十六进制值，不含正文，只用于比较相邻请求从哪条消息开始变化，不能作为安全校验。

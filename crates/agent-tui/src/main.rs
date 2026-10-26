@@ -19,6 +19,7 @@ mod stream_probe;
 mod terminal;
 mod theme;
 mod ui;
+mod usage_ledger;
 
 use anyhow::Result;
 use clap::Parser;

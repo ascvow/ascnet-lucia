@@ -327,15 +327,22 @@ fn window_line(total: u64, window: Option<u64>, percent: Option<f64>) -> Line<'s
 }
 
 /// 会话累计统计行：标签退成元信息色，数字用正文色，扫数字时不会被文字带走。
+///
+/// 服务商从未回报的分项显示"未上报"而不是 0：排查缓存时，缺失和真实的零含义完全不同。
 fn session_usage_line(usage: &TokenUsage) -> Line<'static> {
     let mut spans = vec![Span::styled(
         "本次打开会话累计：",
         Style::new().fg(COLOR_MUTED),
     )];
+    if usage.is_empty() {
+        spans.push(Span::styled("暂无模型响应", Style::new().fg(COLOR_META)));
+        return Line::from(spans);
+    }
     let items = [
-        ("输出", usage.output_tokens),
+        ("未缓存输入", usage.input_tokens),
         ("缓存读", usage.cache_read_tokens),
-        ("写", usage.cache_write_tokens),
+        ("缓存写", usage.cache_write_tokens),
+        ("输出", usage.output_tokens),
     ];
     for (index, (label, value)) in items.into_iter().enumerate() {
         if index > 0 {
@@ -346,7 +353,7 @@ fn session_usage_line(usage: &TokenUsage) -> Line<'static> {
             Style::new().fg(COLOR_META),
         ));
         spans.push(Span::styled(
-            group_thousands(value.unwrap_or(0)),
+            value.map_or_else(|| "未上报".to_string(), group_thousands),
             Style::new().fg(COLOR_TEXT_SOFT),
         ));
     }

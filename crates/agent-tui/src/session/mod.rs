@@ -76,6 +76,11 @@ impl WorkspaceContext {
     pub(crate) fn sessions_dir(&self, root: &Path) -> PathBuf {
         root.join(&self.project_id).join("sessions")
     }
+
+    /// 返回当前项目的用量台账目录，与会话存储目录相邻。
+    pub(crate) fn usage_dir(&self, root: &Path) -> PathBuf {
+        root.join(&self.project_id).join("usage")
+    }
 }
 
 /// 读取工作目录所属 git 仓库的当前分支；非仓库或读取失败返回 `None`。
@@ -383,6 +388,10 @@ pub(crate) fn start_session_context_reload(app: &mut App, label: String) {
         return;
     }
     app.pending_reload = Some(label);
+    // 重载期间加载器发布的压缩事件同样归属当前会话的台账。
+    if let Some(ledger) = &app.usage_ledger {
+        ledger.set_session(&app.session_record.id);
+    }
     let context_loader = Arc::clone(&app.context_loader);
     let record = app.session_record.clone();
     let model_name = app.model_name.clone();

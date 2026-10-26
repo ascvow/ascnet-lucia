@@ -82,6 +82,8 @@ pub(crate) enum UiEvent {
     ModelUsage(TokenUsage),
     /// 压缩和工具筛选后，实际模型请求的上下文分类快照。
     ContextSnapshot(crate::command::ContextSnapshot),
+    /// 用量台账首次写入失败；台账随后停止写入，载荷是失败原因。
+    UsageLedgerFailed(String),
     /// 后台附件读取完成；仅由 App 复核请求与编辑代次后提交。
     AttachmentsPrepared {
         id: u64,
