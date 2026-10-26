@@ -13,7 +13,7 @@ use serde_json::json;
 /// Write content to a file, creating parent directories as needed.
 ///
 /// 目标路径先经 [`WorkspaceGuard`] 解析：覆盖已有文件需要 `Write` 能力，
-/// 新建文件需要 `Create` 能力，工作区之外的目标一律拒绝。
+/// 新建文件需要 `Create` 能力，目标必须位于工作区或具有对应能力的额外授权目录。
 #[derive(Debug, Clone, Default)]
 pub struct WriteFileTool {
     guard: WorkspaceGuard,

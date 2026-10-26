@@ -75,33 +75,78 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// 创建以 TUI 启动目录为读写边界、附加用户级只读目录的原生工具守卫。
+/// 返回应用默认授权的系统临时目录，不采用环境变量指定的任意根路径。
+///
+/// Unix 使用固定的临时目录；macOS 还允许系统按用户分配的 `/var/folders/*/*/T`。
+/// Windows 使用用户本地 Temp 和系统 Temp 子目录。目录不存在时由装配阶段跳过。
+fn native_temporary_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    #[cfg(unix)]
+    roots.extend([PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]);
+    #[cfg(target_os = "macos")]
+    if let Some(root) = macos_user_temporary_root(&std::env::temp_dir()) {
+        roots.push(root);
+    }
+    #[cfg(windows)]
+    {
+        if let Some(home) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            roots.push(PathBuf::from(home).join("AppData/Local/Temp"));
+        }
+        if let Some(system) = std::env::var_os("SystemRoot").filter(|value| !value.is_empty()) {
+            roots.push(PathBuf::from(system).join("Temp"));
+        }
+    }
+    roots
+}
+
+/// 仅接受 macOS 标准用户临时目录的真实路径，拒绝 TMPDIR 指向系统目录或其父目录。
+#[cfg(target_os = "macos")]
+fn macos_user_temporary_root(candidate: &Path) -> Option<PathBuf> {
+    let root = candidate.canonicalize().ok()?;
+    let relative = root.strip_prefix("/private/var/folders").ok()?;
+    (relative.components().count() == 3 && relative.file_name()? == "T").then_some(root)
+}
+
+/// 创建以 TUI 启动目录和系统临时目录为读写边界、附加用户级只读目录的原生工具守卫。
 ///
 /// `user_home` 来自宿主 HOME，`lucia_home` 来自应用配置解析；模型与插件不能扩充名单。
-/// 仅放行已存在的 `~/.agents`、`~/.lucia` 和实际 Lucia Home，不创建这些目录。
+/// `temporary_roots` 由应用的平台规则提供，仅放行已存在目录的读取、写入和创建。
+/// 另放行已存在的 `~/.agents`、`~/.lucia` 和实际 Lucia Home 的读取，不创建这些目录。
 ///
 /// # Errors
 ///
-/// 工作区或已存在的只读目录无法规范化时返回错误。
+/// 工作区或已存在的授权目录无法规范化时返回错误。
 fn native_workspace_guard(
     workspace_root: &Path,
     user_home: Option<&Path>,
     lucia_home: &Path,
+    temporary_roots: &[PathBuf],
 ) -> Result<agent_tool::WorkspaceGuard> {
+    use agent_tool::FileCapabilities;
     let mut guard = agent_tool::WorkspaceGuard::rooted(workspace_root)?;
     let read_roots = user_home
         .into_iter()
         .flat_map(|home| [home.join(".agents"), home.join(".lucia")])
         .chain(std::iter::once(lucia_home.to_path_buf()));
-    for root in read_roots {
+    let roots = read_roots
+        .map(|root| (root, FileCapabilities::read_only()))
+        .chain(
+            temporary_roots
+                .iter()
+                .cloned()
+                .map(|root| (root, FileCapabilities::read_write())),
+        );
+    for (root, capabilities) in roots {
         // 不存在的可选目录不影响启动，也不会授权未来才出现的路径。
         match std::fs::metadata(&root) {
-            Ok(metadata) if metadata.is_dir() => guard = guard.with_read_root(&root)?,
+            Ok(metadata) if metadata.is_dir() => {
+                guard = guard.with_allowed_root(&root, capabilities)?
+            }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("读取用户级只读目录失败：{}", root.display()));
+                    .with_context(|| format!("读取应用授权目录失败：{}", root.display()));
             }
         }
     }
@@ -562,11 +607,16 @@ pub(crate) async fn run(args: Args) -> Result<()> {
             Ok(json!({ "echo": text, "source": "native" }))
         }))?;
     } else {
-        // 真实模式注入内置工具集；读写边界固定为启动目录，用户级资源目录仅额外可读。
+        // 文件读写允许启动目录和系统临时目录，用户级资源目录仅额外可读；Shell cwd 不扩张。
         let user_home = std::env::var_os("HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
-        let guard = native_workspace_guard(&workspace.cwd, user_home.as_deref(), &lucia_home)?;
+        let guard = native_workspace_guard(
+            &workspace.cwd,
+            user_home.as_deref(),
+            &lucia_home,
+            &native_temporary_roots(),
+        )?;
         agent_tool::builtins::register_builtins(
             &mut native_tools,
             guard,
@@ -2216,7 +2266,7 @@ mod tests {
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).expect("应创建测试工作区");
 
-        let guard = native_workspace_guard(&workspace, None, &root.join("missing-lucia-home"))
+        let guard = native_workspace_guard(&workspace, None, &root.join("missing-lucia-home"), &[])
             .expect("应创建工作区守卫");
         assert_eq!(
             guard.root(),
@@ -2247,7 +2297,7 @@ mod tests {
             std::fs::create_dir_all(resource.join("skills/demo")).unwrap();
             std::fs::write(resource.join("skills/demo/SKILL.md"), "resource marker").unwrap();
         }
-        let guard = native_workspace_guard(&workspace, Some(&home), &lucia_home).unwrap();
+        let guard = native_workspace_guard(&workspace, Some(&home), &lucia_home, &[]).unwrap();
         assert_eq!(
             guard.root(),
             Some(workspace.canonicalize().unwrap().as_path())
@@ -2319,6 +2369,204 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// 生产默认名单应放行真实临时目录的完整工具链路，但不放行系统目录或 Shell cwd。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_tools_allow_system_temporary_files() {
+        use agent_tool::{FileCapability, ReadPathGrants, ToolCall, WorkspaceError};
+        let workspace = std::env::temp_dir().join(format!(
+            "lucia-temp-workspace-{}",
+            agent_session::SessionId::generate()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let roots = native_temporary_roots();
+        assert!(roots.contains(&PathBuf::from("/tmp")));
+        assert!(roots.contains(&PathBuf::from("/var/tmp")));
+        let guard =
+            native_workspace_guard(&workspace, None, &workspace.join("missing"), &roots).unwrap();
+        for system in [
+            "/",
+            "/etc",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/var",
+            "/System",
+            "/Library",
+            "/private",
+            "/private/etc",
+            "/private/var",
+        ] {
+            if !Path::new(system).is_dir() {
+                continue;
+            }
+            for capability in [FileCapability::Read, FileCapability::Write] {
+                assert_eq!(
+                    guard.resolve_existing(system, capability),
+                    Err(WorkspaceError::Escape),
+                    "系统目录不应授权：{system}"
+                );
+            }
+            assert_eq!(
+                guard.resolve_new(
+                    Path::new(system)
+                        .join("lucia-unauthorized-new-file")
+                        .to_str()
+                        .unwrap(),
+                    FileCapability::Create
+                ),
+                Err(WorkspaceError::Escape)
+            );
+        }
+        let grants = ReadPathGrants::new();
+        let mut registry = ToolRegistry::new();
+        agent_tool::builtins::register_builtins(&mut registry, guard.clone(), grants.clone())
+            .unwrap();
+        grants.clear();
+        for root in roots.into_iter().filter(|root| root.is_dir()) {
+            let temporary = root.join(format!(
+                "lucia-temp-tools-{}",
+                agent_session::SessionId::generate()
+            ));
+            let file = temporary.join("nested/lucia-context-eval-unit.log");
+            for (name, args) in [
+                (
+                    "write_file",
+                    json!({"path": file, "content": "temporary marker"}),
+                ),
+                (
+                    "write_file",
+                    json!({"path": file, "content": "replacement marker"}),
+                ),
+                (
+                    "edit_file",
+                    json!({"path": file, "old_string": "replacement", "new_string": "edited"}),
+                ),
+                ("read_file", json!({"path": file})),
+                ("list_directory", json!({"path": file.parent().unwrap()})),
+                (
+                    "search_files",
+                    json!({"path": temporary, "pattern": "edited marker", "include": "*.log"}),
+                ),
+            ] {
+                let result = registry
+                    .get(name)
+                    .unwrap()
+                    .call(ToolCall::new("temp", name, args))
+                    .await
+                    .unwrap();
+                assert!(!result.is_error, "{name}: {:?}", result.content);
+                match name {
+                    "read_file" => assert!(result.content["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("edited marker")),
+                    "list_directory" => assert_eq!(
+                        result.content["entries"][0]["name"],
+                        "lucia-context-eval-unit.log"
+                    ),
+                    "search_files" => assert_eq!(result.content["count"], 1),
+                    _ => {}
+                }
+            }
+            // /tmp 与 /private/tmp 等别名最终落在同一真实授权目录。
+            assert_eq!(
+                guard
+                    .resolve_existing(file.to_str().unwrap(), FileCapability::Read)
+                    .unwrap(),
+                file.canonicalize().unwrap()
+            );
+            for (name, args) in [
+                (
+                    "write_file",
+                    json!({"path": temporary.join(".env"), "content": "blocked"}),
+                ),
+                (
+                    "shell",
+                    json!({"working_directory": temporary, "command": "pwd"}),
+                ),
+            ] {
+                let result = registry
+                    .get(name)
+                    .unwrap()
+                    .call(ToolCall::new("denied", name, args))
+                    .await
+                    .unwrap();
+                assert!(result.is_error, "{name} 不应扩大敏感路径或 Shell cwd 权限");
+            }
+            assert!(!temporary.join(".env").exists());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "edited marker");
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// 只读资源与临时目录并存时仍分别授权，不存在的临时根也不得授权其父目录。
+    #[test]
+    fn native_temporary_and_read_only_roots_keep_separate_capabilities() {
+        use agent_tool::{FileCapability, WorkspaceError};
+        let root = std::env::temp_dir().join(format!(
+            "lucia-temp-scopes-{}",
+            agent_session::SessionId::generate()
+        ));
+        let workspace = root.join("workspace");
+        let temporary = root.join("tmp");
+        let resource = root.join("home/.lucia");
+        for directory in [&workspace, &temporary, &resource] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let missing = root.join("missing");
+        let guard = native_workspace_guard(
+            &workspace,
+            Some(&root.join("home")),
+            &resource,
+            &[temporary.clone(), missing.clone()],
+        )
+        .unwrap();
+        assert!(guard
+            .resolve_new(
+                temporary.join("new.log").to_str().unwrap(),
+                FileCapability::Create
+            )
+            .is_ok());
+        assert!(guard
+            .resolve_existing(resource.to_str().unwrap(), FileCapability::Read)
+            .is_ok());
+        for path in [
+            resource.join("new.log"),
+            missing.join("new.log"),
+            root.join("new.log"),
+        ] {
+            assert_eq!(
+                guard.resolve_new(path.to_str().unwrap(), FileCapability::Create),
+                Err(WorkspaceError::Escape)
+            );
+        }
+        assert!(!missing.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 即使宿主 TMPDIR 配错，也不能把系统目录、临时目录父级或符号链接目标变成临时根。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_temporary_root_rejects_important_paths_and_symlink_targets() {
+        for candidate in ["/", "/etc", "/usr", "/private/var", "/private/var/folders"] {
+            assert!(macos_user_temporary_root(Path::new(candidate)).is_none());
+        }
+        if let Some(root) = macos_user_temporary_root(&std::env::temp_dir()) {
+            assert!(native_temporary_roots().contains(&root));
+            assert!(macos_user_temporary_root(root.parent().unwrap()).is_none());
+        }
+        let root = std::env::temp_dir().join(format!(
+            "lucia-temp-alias-{}",
+            agent_session::SessionId::generate()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("/etc", root.join("T")).unwrap();
+        assert!(macos_user_temporary_root(&root.join("T")).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// 可选目录缺失时不创建目录，也不扩大到其已存在的父目录。
     #[test]
     fn native_workspace_guard_skips_missing_user_resource_directories() {
@@ -2331,7 +2579,7 @@ mod tests {
         let home = root.join("home");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&home).unwrap();
-        let guard = native_workspace_guard(&workspace, Some(&home), &home.join(".lucia"))
+        let guard = native_workspace_guard(&workspace, Some(&home), &home.join(".lucia"), &[])
             .expect("可选目录不存在不影响启动");
         assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
         assert_eq!(

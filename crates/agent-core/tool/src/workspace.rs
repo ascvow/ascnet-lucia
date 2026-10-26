@@ -335,8 +335,8 @@ pub struct WorkspaceGuard {
     capabilities: FileCapabilities,
     /// 用户显式引用、允许只读访问的工作区外路径；只对读取能力生效。
     read_grants: Option<ReadPathGrants>,
-    /// 可信应用注入的额外只读目录，保存规范路径并允许读取其后代。
-    read_roots: Vec<PathBuf>,
+    /// 可信应用注入的额外目录及其能力上限，保存规范路径并覆盖后代。
+    extra_roots: Vec<(PathBuf, FileCapabilities)>,
 }
 
 impl WorkspaceGuard {
@@ -351,7 +351,7 @@ impl WorkspaceGuard {
             denied: false,
             capabilities: FileCapabilities::read_write(),
             read_grants: None,
-            read_roots: Vec::new(),
+            extra_roots: Vec::new(),
         })
     }
 
@@ -364,7 +364,7 @@ impl WorkspaceGuard {
             denied: false,
             capabilities: FileCapabilities::read_write(),
             read_grants: None,
-            read_roots: Vec::new(),
+            extra_roots: Vec::new(),
         }
     }
 
@@ -375,13 +375,13 @@ impl WorkspaceGuard {
             denied: true,
             capabilities: FileCapabilities::default(),
             read_grants: None,
-            read_roots: Vec::new(),
+            extra_roots: Vec::new(),
         }
     }
 
     /// 附加用户显式引用的只读路径集合。
     ///
-    /// 授权只放宽读取：写入、创建与删除仍受工作区边界约束。
+    /// 此授权只放宽读取，不改变写入、创建与删除的既有目录范围。
     pub fn with_read_grants(mut self, grants: ReadPathGrants) -> Self {
         self.read_grants = Some(grants);
         self
@@ -396,25 +396,43 @@ impl WorkspaceGuard {
     /// # Errors
     ///
     /// 目录不存在、无法规范化或目标不是目录时返回 IO 错误；不会创建目录。
-    pub fn with_read_root(mut self, root: impl AsRef<Path>) -> std::io::Result<Self> {
+    pub fn with_read_root(self, root: impl AsRef<Path>) -> std::io::Result<Self> {
+        self.with_allowed_root(root, FileCapabilities::read_only())
+    }
+
+    /// 附加可信应用授权的目录及其能力上限，允许访问该目录及其后代。
+    ///
+    /// `root` 必须由可信应用确定，不能直接采用模型或 Guest 自报的范围。`capabilities`
+    /// 仅限制此目录的授权，不会恢复守卫全局已禁用的能力；敏感路径和真实目标检查仍然生效。
+    /// 本方法不改变默认工作目录，也不创建目录或修改会话级只读授权。
+    ///
+    /// # Errors
+    ///
+    /// 目录不存在、无法规范化或目标不是目录时返回 IO 错误。
+    pub fn with_allowed_root(
+        mut self,
+        root: impl AsRef<Path>,
+        capabilities: FileCapabilities,
+    ) -> std::io::Result<Self> {
         let resolved = root.as_ref().canonicalize()?;
         if !resolved.is_dir() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "只读根路径必须是目录",
+                "授权根路径必须是目录",
             ));
         }
-        if !self.read_roots.contains(&resolved) {
-            self.read_roots.push(resolved);
+        let grant = (resolved, capabilities);
+        if !self.extra_roots.contains(&grant) {
+            self.extra_roots.push(grant);
         }
         Ok(self)
     }
 
-    /// Shell 的工作目录不继承文件读取例外，避免把只读目录变成进程工作目录。
+    /// Shell 的工作目录不继承额外路径授权，避免文件授权扩大进程工作目录。
     #[cfg(feature = "builtins")]
-    pub(crate) fn without_read_overrides(mut self) -> Self {
+    pub(crate) fn without_path_overrides(mut self) -> Self {
         self.read_grants = None;
-        self.read_roots.clear();
+        self.extra_roots.clear();
         self
     }
 
@@ -472,10 +490,9 @@ impl WorkspaceGuard {
         self.absolutize(raw).exists()
     }
 
-    /// 校验目标位于工作区、应用只读目录内，或已被用户显式授权读取。
+    /// 校验目标位于工作区、具有所需能力的额外目录内，或已被用户显式授权读取。
     ///
-    /// 授权只对 [`FileCapability::Read`] 生效；写入与创建路径即便出现在授权集合中，
-    /// 仍然必须落在工作区内。
+    /// 额外目录只能提供显式授予的能力；用户消息中的路径授权仍仅对读取生效。
     fn ensure_contained(
         &self,
         resolved: &Path,
@@ -487,15 +504,16 @@ impl WorkspaceGuard {
         if resolved.starts_with(root) {
             return Ok(());
         }
+        if self.extra_roots.iter().any(|(root, capabilities)| {
+            capabilities.permits(capability) && resolved.starts_with(root)
+        }) {
+            return Ok(());
+        }
         if capability == FileCapability::Read
-            && (self
-                .read_roots
-                .iter()
-                .any(|root| resolved.starts_with(root))
-                || self
-                    .read_grants
-                    .as_ref()
-                    .is_some_and(|grants| grants.contains(resolved)))
+            && self
+                .read_grants
+                .as_ref()
+                .is_some_and(|grants| grants.contains(resolved))
         {
             return Ok(());
         }
@@ -535,7 +553,7 @@ impl WorkspaceGuard {
     ///
     /// # Errors
     ///
-    /// 能力不足、路径不存在，或解析结果落在工作区之外时返回对应的 [`WorkspaceError`]。
+    /// 能力不足、路径不存在，或解析结果不在获准目录范围内时返回对应的 [`WorkspaceError`]。
     pub fn resolve_existing(
         &self,
         raw: &str,
@@ -558,7 +576,7 @@ impl WorkspaceGuard {
     ///
     /// # Errors
     ///
-    /// 能力不足、路径非法，或最终目标落在工作区之外时返回对应的 [`WorkspaceError`]。
+    /// 能力不足、路径非法，或最终目标不在获准目录范围内时返回对应的 [`WorkspaceError`]。
     pub fn resolve_new(
         &self,
         raw: &str,
@@ -567,21 +585,15 @@ impl WorkspaceGuard {
         self.ensure_capability(capability)?;
         let requested = self.absolutize(raw);
 
-        // 已存在的目标直接走 canonicalize 路径，覆盖写入属于这种情况。
-        if requested.exists() {
-            let resolved = requested
-                .canonicalize()
-                .map_err(|error| WorkspaceError::Unresolvable(error.to_string()))?;
-            self.ensure_contained(&resolved, capability)?;
-            self.ensure_not_sensitive(&resolved)?;
-            return Ok(resolved);
-        }
-
         let mut ancestor = requested.as_path();
         let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
         loop {
-            if ancestor.exists() {
-                break;
+            // 悬空链接也属于已存在条目，必须交给 canonicalize 拒绝；不能当作缺失后缀
+            // 拼回路径，否则新建工具可能跟随链接写入授权目录之外。
+            match ancestor.symlink_metadata() {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(WorkspaceError::Unresolvable(error.to_string())),
             }
             let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
                 return Err(WorkspaceError::Unresolvable(
@@ -949,6 +961,181 @@ mod tests {
             guard.resolve_existing(
                 resources.join("file.txt").to_str().unwrap(),
                 FileCapability::Read,
+            ),
+            Err(WorkspaceError::Escape)
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// 额外可写目录覆盖后代，但不放行同前缀兄弟、父目录和敏感文件。
+    #[test]
+    fn allowed_roots_preserve_path_and_capability_boundaries() {
+        let base = temp_workspace("allowed-roots");
+        let temporary = base.join("scratch");
+        let sibling = base.join("scratch-other");
+        fs::create_dir_all(&temporary).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let file = temporary.join("result.log");
+        fs::write(&file, "temporary result").unwrap();
+        fs::write(sibling.join("result.log"), "outside").unwrap();
+        let guard = WorkspaceGuard::rooted(base.join("inside"))
+            .unwrap()
+            .with_allowed_root(&temporary, FileCapabilities::read_write())
+            .unwrap();
+        for capability in [FileCapability::Read, FileCapability::Write] {
+            assert_eq!(
+                guard
+                    .resolve_existing(file.to_str().unwrap(), capability)
+                    .unwrap(),
+                file.canonicalize().unwrap()
+            );
+            assert_eq!(
+                guard.resolve_existing(sibling.join("result.log").to_str().unwrap(), capability),
+                Err(WorkspaceError::Escape)
+            );
+        }
+        assert_eq!(
+            guard
+                .resolve_new(
+                    temporary.join("nested/new.log").to_str().unwrap(),
+                    FileCapability::Create,
+                )
+                .unwrap(),
+            temporary.canonicalize().unwrap().join("nested/new.log")
+        );
+        assert_eq!(
+            guard.resolve_new(
+                temporary.join("../outside.log").to_str().unwrap(),
+                FileCapability::Create,
+            ),
+            Err(WorkspaceError::Escape)
+        );
+        for sensitive in [".env", ".ssh/id_rsa", "credentials", "private.pem"] {
+            let path = temporary.join(sensitive);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "secret").unwrap();
+            for capability in [
+                FileCapability::Read,
+                FileCapability::Write,
+                FileCapability::Create,
+            ] {
+                assert_eq!(
+                    guard.resolve_new(path.to_str().unwrap(), capability),
+                    Err(WorkspaceError::Sensitive)
+                );
+            }
+        }
+
+        let read_only = guard
+            .clone()
+            .with_capabilities(FileCapabilities::read_only());
+        assert_eq!(
+            read_only.resolve_existing(file.to_str().unwrap(), FileCapability::Write),
+            Err(WorkspaceError::Denied(FileCapability::Write))
+        );
+        assert_eq!(
+            read_only.resolve_new(
+                temporary.join("new.log").to_str().unwrap(),
+                FileCapability::Create
+            ),
+            Err(WorkspaceError::Denied(FileCapability::Create))
+        );
+        let create_only = WorkspaceGuard::rooted(base.join("inside"))
+            .unwrap()
+            .with_allowed_root(
+                &temporary,
+                FileCapabilities {
+                    create: true,
+                    ..FileCapabilities::default()
+                },
+            )
+            .unwrap();
+        for capability in [FileCapability::Read, FileCapability::Write] {
+            assert_eq!(
+                create_only.resolve_existing(file.to_str().unwrap(), capability),
+                Err(WorkspaceError::Escape)
+            );
+        }
+        assert!(create_only
+            .resolve_new(
+                temporary.join("new.log").to_str().unwrap(),
+                FileCapability::Create
+            )
+            .is_ok());
+        let denied = WorkspaceGuard::denied()
+            .with_allowed_root(&temporary, FileCapabilities::read_write())
+            .unwrap();
+        assert_eq!(
+            denied.resolve_existing(file.to_str().unwrap(), FileCapability::Read),
+            Err(WorkspaceError::NoFilesystem)
+        );
+        assert!(guard
+            .clone()
+            .with_allowed_root(&file, FileCapabilities::read_write())
+            .is_err());
+        assert!(guard
+            .with_allowed_root(base.join("missing"), FileCapabilities::read_write())
+            .is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// 可写临时目录内的已有链接、悬空链接和目录替换均不得扩大授权范围。
+    #[cfg(unix)]
+    #[test]
+    fn allowed_roots_reject_symlink_escapes_including_dangling_targets() {
+        use std::os::unix::fs::symlink;
+        let base = temp_workspace("allowed-root-links");
+        let temporary = base.join("scratch");
+        let outside = base.join("outside");
+        fs::create_dir_all(&temporary).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("file.log"), "outside").unwrap();
+        symlink(&outside, temporary.join("escape")).unwrap();
+        symlink(outside.join("new.log"), temporary.join("dangling.log")).unwrap();
+        symlink(outside.join("missing"), temporary.join("dangling-dir")).unwrap();
+        let guard = WorkspaceGuard::rooted(base.join("inside"))
+            .unwrap()
+            .with_allowed_root(&temporary, FileCapabilities::read_write())
+            .unwrap();
+        for capability in [FileCapability::Read, FileCapability::Write] {
+            assert_eq!(
+                guard.resolve_existing(
+                    temporary.join("escape/file.log").to_str().unwrap(),
+                    capability
+                ),
+                Err(WorkspaceError::Escape)
+            );
+        }
+        assert_eq!(
+            guard.resolve_new(
+                temporary.join("escape/new.log").to_str().unwrap(),
+                FileCapability::Create
+            ),
+            Err(WorkspaceError::Escape)
+        );
+        for path in ["dangling.log", "dangling-dir/new.log"] {
+            assert!(matches!(
+                guard.resolve_new(
+                    temporary.join(path).to_str().unwrap(),
+                    FileCapability::Create
+                ),
+                Err(WorkspaceError::Unresolvable(_))
+            ));
+        }
+        fs::write(temporary.join("safe.log"), "temporary").unwrap();
+        symlink(temporary.join("safe.log"), temporary.join("alias.log")).unwrap();
+        assert!(guard
+            .resolve_new(
+                temporary.join("alias.log").to_str().unwrap(),
+                FileCapability::Write
+            )
+            .is_ok());
+        fs::rename(&temporary, base.join("moved")).unwrap();
+        symlink(&outside, &temporary).unwrap();
+        assert_eq!(
+            guard.resolve_new(
+                temporary.join("new.log").to_str().unwrap(),
+                FileCapability::Create
             ),
             Err(WorkspaceError::Escape)
         );
