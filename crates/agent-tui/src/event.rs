@@ -20,6 +20,8 @@ use {
 pub(crate) enum UiEvent {
     Input(Event),
     Tick,
+    /// 工作区的 Git 分支已变化；`None` 清除非仓库或不可读 HEAD 的旧分支显示。
+    GitBranchChanged(Option<String>),
     ModelStarted,
     /// 同一轮模型请求正在重连；清除失败尝试的临时正文，保留已完成的工具与历史消息。
     ModelRetry {

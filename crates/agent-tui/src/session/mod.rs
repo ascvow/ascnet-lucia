@@ -40,7 +40,7 @@ pub(crate) struct WorkspaceContext {
     pub(crate) cwd: PathBuf,
     /// 用于隔离项目会话空间的稳定摘要。
     pub(crate) project_id: String,
-    /// 启动时探测到的 git 分支；非仓库为 `None`。
+    /// 最近探测到的 git 分支；运行期间由后台刷新，非仓库为 `None`。
     pub(crate) git_branch: Option<String>,
 }
 
@@ -81,7 +81,7 @@ impl WorkspaceContext {
 /// 读取工作目录所属 git 仓库的当前分支；非仓库或读取失败返回 `None`。
 ///
 /// 自当前目录向上查找 `.git`，兼容 worktree（`.git` 为指向真实 gitdir 的
-/// 文件）；detached HEAD 显示提交短哈希。仅在启动时读取一次。
+/// 文件）；detached HEAD 显示提交短哈希。启动和后台刷新共用，不在渲染路径执行 I/O。
 pub(crate) fn detect_git_branch(cwd: &Path) -> Option<String> {
     let mut dir = cwd;
     let git_path = loop {
@@ -106,9 +106,45 @@ pub(crate) fn detect_git_branch(cwd: &Path) -> Option<String> {
     let head = std::fs::read_to_string(head_path).ok()?;
     let head = head.trim();
     if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
-        return Some(branch.to_string());
+        return (!branch.is_empty()).then(|| branch.to_string());
     }
-    Some(head.chars().take(8).collect())
+    (!head.is_empty()).then(|| head.chars().take(8).collect())
+}
+
+/// 后台每秒重新探测工作区分支；只在变化时通知 UI，不执行 Git 命令或改变项目身份。
+///
+/// 文件读取在阻塞池中串行完成，慢文件系统不会阻塞输入、渲染或积累并行探测任务；
+/// 接收端关闭即结束，调用方也可以在退出时取消返回的任务。
+pub(crate) fn watch_git_branch(
+    workspace: &WorkspaceContext,
+    tx: tokio::sync::mpsc::UnboundedSender<UiEvent>,
+) -> tokio::task::JoinHandle<()> {
+    let cwd = workspace.cwd.clone();
+    let mut previous = workspace.git_branch.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = tx.closed() => break,
+                _ = interval.tick() => {}
+            }
+            let path = cwd.clone();
+            let detected = tokio::select! {
+                _ = tx.closed() => break,
+                result = tokio::task::spawn_blocking(move || detect_git_branch(&path)) => result,
+            };
+            let Ok(branch) = detected else {
+                continue;
+            };
+            if branch != previous {
+                if tx.send(UiEvent::GitBranchChanged(branch.clone())).is_err() {
+                    break;
+                }
+                previous = branch;
+            }
+        }
+    })
 }
 
 /// 使用操作系统原始路径表示生成稳定项目标识，避免有损字符串转换造成目录碰撞。

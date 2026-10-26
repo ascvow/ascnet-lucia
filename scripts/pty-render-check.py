@@ -140,6 +140,48 @@ class TerminalProcess:
 class RenderProtocolTests(unittest.TestCase):
     """实际二进制的协议检查；同一脚本适用于默认插件版和纯 Core 版。"""
 
+    def test_git_branch_refreshes_without_input_in_repository_and_worktree(self):
+        """真正从外部 Git 切分支，空闲 PTY 底栏必须自动变更；HEAD 文件与目录均覆盖。"""
+        for worktree in (False, True):
+            with self.subTest(worktree=worktree), tempfile.TemporaryDirectory(prefix="lucia-git-pty-") as root:
+                root = Path(root)
+                repo = root / "repo"
+                repo.mkdir()
+                git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+                git_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+
+                def git(*args, cwd=repo):
+                    return subprocess.run(["git", *args], cwd=cwd, env=git_env, check=True,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode().strip()
+
+                # 使用等长且逐列不同的标记，避免差分渲染省略未变化字符造成字节断言误报。
+                git("init", "--initial-branch=AAAAAAAA")
+                git("-c", "user.name=Lucia Test", "-c", "user.email=test@example.invalid",
+                    "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "fixture")
+                cwd = repo
+                if worktree:
+                    cwd = root / "worktree"
+                    git("worktree", "add", "-b", "WWWWWWWW", str(cwd))
+                initial = "WWWWWWWW" if worktree else "AAAAAAAA"
+                job = TerminalProcess(str(cwd), True, "xterm-256color")
+                try:
+                    job.wait_for_text(initial)
+                    mark = len(job.output)
+                    git("switch", "-c", "ZZZZZZZZ", cwd=cwd)
+                    job.wait_for_text("ZZZZZZZZ", mark)
+                    mark = len(job.output)
+                    git("switch", "--detach", cwd=cwd)
+                    short_hash = git("rev-parse", "HEAD", cwd=cwd)[:8]
+                    job.wait_for_text(short_hash, mark)
+                    mark = len(job.output)
+                    git("switch", initial, cwd=cwd)
+                    job.wait_for_text(initial, mark)
+                    self.assertIsNone(job.process.poll())
+                    os.write(job.master, b"\x04")
+                    self.assertEqual(job.wait_exit(), 0)
+                finally:
+                    job.close()
+
     def test_burst_typing_preserves_ime_text_edits_and_paths(self):
         """一次 PTY 写入模拟 IME 提交/积压按键，不得伪造粘贴、折叠或丢掉后续编辑。"""
         with tempfile.TemporaryDirectory(prefix="lucia-input-") as root:

@@ -31,6 +31,138 @@ fn workspace_id_hashes_raw_path_bytes() {
     assert_ne!(workspace_project_id(&left), workspace_project_id(&right));
 }
 
+/// 分支探测兼容工作区子目录、worktree 指针重定向、detached HEAD 和仓库创建/移除。
+#[test]
+fn git_branch_detection_follows_repository_and_worktree_changes() {
+    use crate::session::detect_git_branch;
+    let root = std::env::temp_dir().join(format!("lucia-git-detect-{}", SessionId::generate()));
+    let repo = root.join("repo");
+    let nested = repo.join("src/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert_eq!(detect_git_branch(&nested), None);
+
+    std::fs::create_dir(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/master\n").unwrap();
+    assert_eq!(detect_git_branch(&nested).as_deref(), Some("master"));
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/功能/刷新\n").unwrap();
+    assert_eq!(detect_git_branch(&nested).as_deref(), Some("功能/刷新"));
+    std::fs::write(
+        repo.join(".git/HEAD"),
+        "abcdef0123456789abcdef0123456789abcdef01\n",
+    )
+    .unwrap();
+    assert_eq!(detect_git_branch(&nested).as_deref(), Some("abcdef01"));
+    std::fs::write(repo.join(".git/HEAD"), "\n").unwrap();
+    assert_eq!(detect_git_branch(&nested), None);
+    std::fs::remove_dir_all(repo.join(".git")).unwrap();
+    assert_eq!(detect_git_branch(&nested), None);
+
+    let gitdir = root.join("metadata/worktrees/example");
+    std::fs::create_dir_all(&gitdir).unwrap();
+    std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/worktree-branch\n").unwrap();
+    std::fs::write(repo.join(".git"), "gitdir: ../metadata/worktrees/example\n").unwrap();
+    assert_eq!(
+        detect_git_branch(&nested).as_deref(),
+        Some("worktree-branch")
+    );
+    let moved = root.join("moved-metadata");
+    std::fs::create_dir(&moved).unwrap();
+    std::fs::write(moved.join("HEAD"), "ref: refs/heads/moved-branch\n").unwrap();
+    std::fs::write(repo.join(".git"), format!("gitdir: {}\n", moved.display())).unwrap();
+    assert_eq!(detect_git_branch(&nested).as_deref(), Some("moved-branch"));
+    std::fs::remove_file(repo.join(".git")).unwrap();
+    assert_eq!(detect_git_branch(&nested), None);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// 后台刷新不依赖用户按键或 Agent 执行，空闲时只在变化后发事件并更新可见底栏。
+#[tokio::test]
+async fn git_branch_watcher_updates_idle_footer_and_stops_with_receiver() {
+    let root = std::env::temp_dir().join(format!("lucia-git-watch-{}", SessionId::generate()));
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(
+        root.join(".git/HEAD"),
+        "ref: refs/heads/feature/stale-footer\n",
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(tx.clone(), "test".into());
+    app.workspace.cwd = root.clone();
+    app.workspace.git_branch = Some("feature/stale-footer".into());
+    let identity = (
+        app.workspace.cwd.clone(),
+        app.workspace.project_id.clone(),
+        app.session_record.id.clone(),
+    );
+    let mut terminal = Terminal::new(TestBackend::new(240, 20)).unwrap();
+    terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+    let screen = |terminal: &Terminal<TestBackend>| {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    };
+    assert!(screen(&terminal).contains("feature/stale-footer"));
+    let task = crate::session::watch_git_branch(&app.workspace, tx);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(1_100), rx.recv())
+            .await
+            .is_err(),
+        "未变化时不应重复触发重绘"
+    );
+
+    for (head, expected) in [
+        (Some("ref: refs/heads/master\n"), Some("master")),
+        (
+            Some("deadbeef0123456789abcdef0123456789abcdef01\n"),
+            Some("deadbeef"),
+        ),
+        (None, None),
+        (Some("ref: refs/heads/restored\n"), Some("restored")),
+    ] {
+        if let Some(head) = head {
+            std::fs::write(root.join(".git/HEAD.next"), head).unwrap();
+            std::fs::rename(root.join(".git/HEAD.next"), root.join(".git/HEAD")).unwrap();
+        } else {
+            std::fs::remove_file(root.join(".git/HEAD")).unwrap();
+        }
+        let event = tokio::time::timeout(std::time::Duration::from_secs(4), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let UiEvent::GitBranchChanged(branch) = event else {
+            panic!("只应收到分支变化事件")
+        };
+        assert_eq!(branch.as_deref(), expected);
+        app.workspace.git_branch = branch;
+        terminal.draw(|frame| render_root(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(!text.contains("feature/stale-footer"));
+        if let Some(branch) = expected {
+            assert!(text.contains(&format!("⎇ {branch}")), "{text}");
+        } else {
+            assert!(!text.contains('⎇'));
+        }
+        assert_eq!(
+            (
+                &app.workspace.cwd,
+                &app.workspace.project_id,
+                &app.session_record.id
+            ),
+            (&identity.0, &identity.1, &identity.2)
+        );
+    }
+    drop(rx);
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// 普通启动必须创建 Draft，显式参数仍可恢复最近或指定会话。
 #[tokio::test]
 async fn startup_session_respects_explicit_and_latest_priority() {

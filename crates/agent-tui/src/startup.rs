@@ -881,6 +881,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         })
     };
 
+    // 分支在外部终端或工具执行中也可能变化；后台探测只通过事件更新底栏。
+    let git_branch_task = crate::session::watch_git_branch(&app.workspace, tx.clone());
     // 首帧必须绘制；之后只在状态可能变化时重绘，空闲 tick 不再整帧刷新。
     let mut needs_redraw = true;
     let mut rendered_buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
@@ -1559,6 +1561,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
                     }
                 }
             }
+            Some(UiEvent::GitBranchChanged(branch)) => {
+                app.workspace.git_branch = branch;
+            }
             Some(UiEvent::Tick) => {
                 tick_pending.store(false, Ordering::Relaxed);
                 #[cfg(feature = "plugins")]
@@ -1763,6 +1768,8 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         }
     }
 
+    git_branch_task.abort();
+    let _ = git_branch_task.await;
     #[cfg(feature = "plugins")]
     if let Some(refresh_task) = app.plugin_refresh_task.take() {
         let _ = refresh_task.await;
@@ -2192,6 +2199,18 @@ mod tests {
             }
         }
         assert!(rx.try_recv().is_err(), "成员运行与续跑都只发布到独立订阅");
+    }
+
+    /// 分支变化即使发生在空闲状态也必须重绘，普通 tick 仍不触发整帧刷新。
+    #[test]
+    fn git_branch_change_redraws_idle_footer() {
+        for branch in [Some("master".into()), None] {
+            assert!(event_requires_redraw(
+                Some(&UiEvent::GitBranchChanged(branch)),
+                false
+            ));
+        }
+        assert!(!event_requires_redraw(Some(&UiEvent::Tick), false));
     }
 
     /// 非热点移动不重绘，悬停改变仍会标脏；其他鼠标输入不丢。
